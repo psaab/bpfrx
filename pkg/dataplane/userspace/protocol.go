@@ -564,8 +564,23 @@ type StaticNATRuleSnapshot struct {
 	// that axis. Additive wire fields (see SourceNATRuleSnapshot).
 	FromInterface       string `json:"from_interface,omitempty"`
 	FromRoutingInstance string `json:"from_routing_instance,omitempty"`
-	ExternalIP          string `json:"external_ip"`
-	InternalIP          string `json:"internal_ip"`
+	// SourceAddresses carries the static-NAT rule's `match source-address`
+	// constraint (#3435). Junos static NAT `source-address` restricts which
+	// client source IPs the 1:1/DNAT translation fires for; before #3435 the
+	// constraint was parsed but DROPPED at this snapshot boundary, so the
+	// dataplane installed an all-source mapping that exposed the internal
+	// host to ANY source in the from-scope (fail-open, H01) — the static-NAT
+	// analog of the DNAT #2394 fix. Each entry is a CIDR prefix
+	// (198.51.100.0/24) or a bare host IP (198.51.100.42), carried verbatim.
+	// An empty slice means "match any source" (unscoped, unchanged behavior);
+	// a non-empty slice whose entries all fail to parse fails CLOSED (matches
+	// no source) on the Rust side rather than reverting to match-any. The
+	// inbound (DNAT) direction matches the packet SOURCE against this list;
+	// the reverse (SNAT) direction matches the packet DESTINATION (the
+	// original client). Additive wire field (#1961 skew-safe).
+	SourceAddresses []string `json:"source_addresses,omitempty"`
+	ExternalIP      string   `json:"external_ip"`
+	InternalIP      string   `json:"internal_ip"`
 	// MatchDestinationPort is the external (pre-translation) destination port
 	// the inbound packet must carry for this port-mapped static-NAT rule
 	// (Junos `match destination-port`). 0 = match any port (whole-address

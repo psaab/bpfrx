@@ -645,6 +645,23 @@ type compileOpts struct {
 	// so a leniently-loaded bad config is no worse off, now flagged. Same
 	// doctrine as lenientApplicationSetMembers.
 	lenientPolicyMatchApplications bool
+	// lenientNATMatchApplications (#3434, Codex audit 095 H07/H08) downgrades
+	// the source/destination-NAT match-application definedness gate
+	// (validateNATMatchApplicationsStrict) from a hard compile error to a
+	// cfg.Warnings entry. A NAT `match application <name>` token resolving to
+	// no predefined junos-* application, no user-defined application, and no
+	// non-empty application-set was previously unvalidated — yet the DNAT
+	// snapshot builder then fell through to a wildcard match-all term
+	// (protocol="" + destination-port 0) and published the pool VIP for EVERY
+	// flow to the destination (a fail-open wildcard translation; the NAT
+	// sibling of #3144/#3146). The strict commit / commit-check path
+	// hard-rejects so the typo is operator-visible; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config that
+	// an older binary accepted still BOOTS (#1960) — the dataplane now
+	// independently fails such a rule closed (never-match term), so a
+	// leniently-loaded bad config is no worse off, now flagged. Same doctrine
+	// as lenientPolicyMatchApplications.
+	lenientNATMatchApplications bool
 	// lenientPolicyMatchAddressSetMembers (#3149, folds #3147) downgrades the
 	// policy match address-set member / empty-set gate
 	// (validatePolicyMatchAddressSetMembersStrict) from a hard compile error to
@@ -1253,6 +1270,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientSamplingInstanceConflicts:     true,
 		lenientApplicationSetMembers:         true,
 		lenientPolicyMatchApplications:       true,
+		lenientNATMatchApplications:          true,
 		lenientPolicyMatchAddressSetMembers:  true,
 		lenientRibGroupRefs:                  true,
 		lenientDHCPStaticBindings:            true,
@@ -1400,6 +1418,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientSamplingInstanceConflicts:     true,
 		lenientApplicationSetMembers:         true,
 		lenientPolicyMatchApplications:       true,
+		lenientNATMatchApplications:          true,
 		lenientPolicyMatchAddressSetMembers:  true,
 		lenientRibGroupRefs:                  true,
 		lenientDHCPStaticBindings:            true,
@@ -2321,6 +2340,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3446 source/destination-NAT match destination-port gate. The DNAT/SNAT
+	// `match destination-port` parser used a bare strconv.Atoi with no bound
+	// check and the builders cast straight to uint16, so a 0/out-of-range
+	// (70000→4464, -1→65535) or non-numeric (`http`) port wrapped to the wrong
+	// port or collapsed the whole match to the wildcard port (translating every
+	// port). Static NAT already validates its typed destination-port leaf
+	// (#2491); this closes the same gap for the source/destination NAT match
+	// grammar. Strict on commit / commit-check (hard-reject); lenient on load /
+	// peer-sync (downgrade to a warning so a config persisted before this gate
+	// existed still boots — #1960 no-brick; the snapshot builders independently
+	// fail CLOSED). Shares the lenientDestNATAddresses flag (same NAT
+	// silent-drop / wrong-translate doctrine). Runs after the protocol gate.
+	if err := validateNATMatchDestinationPortStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("nat match destination-port (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates
@@ -2375,6 +2415,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientApplicationSpecs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("application syntax (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3366: structural application errors (a direct match body mixed with
+	// `term` sub-blocks, or a duplicate single-valued leaf inside one term) are
+	// rejected for ALL user-defined applications — referenced or not — like the
+	// #3352/#3353 syntactic gate above. Mixing a direct body with terms silently
+	// dropped the direct match (the term-store branch keeps only the terms), and
+	// a repeated scalar term leaf was last-writer-wins; both are Junos config
+	// errors caught at definition. Lenient-downgrade on the tolerant load /
+	// peer-sync path (#1960 no-brick).
+	if err := validateApplicationStructureStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application structure (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
@@ -3073,6 +3130,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyMatchApplications {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy match application (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3434 (Codex audit 095 H07/H08): source/destination-NAT match-application
+	// definedness gate, the NAT analog of validatePolicyMatchApplicationsStrict
+	// (#3144/#3146). A NAT `match application <name>` resolving to no
+	// predefined/user application and no non-empty application-set previously
+	// committed cleanly — yet the DNAT snapshot builder then fell through to a
+	// wildcard match-all term and published the pool VIP for every flow to the
+	// destination (fail-open). Strict on commit / commit-check (hard reject
+	// naming the NAT kind, rule-set, rule, and the undefined app); lenient on
+	// load / peer-sync (warn — #1960; the dataplane now fails such a rule closed
+	// via a never-match term, so a leniently-loaded bad config is no worse off,
+	// now flagged). Resolves via ResolveApplication / ResolveApplicationSet —
+	// the EXACT name set the SNAT/DNAT snapshot builders use — so commit and
+	// runtime cannot diverge. Covers source and destination NAT rule-sets
+	// (static NAT carries no application match).
+	if err := validateNATMatchApplicationsStrict(cfg); err != nil {
+		if opts.lenientNATMatchApplications {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("NAT match application (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

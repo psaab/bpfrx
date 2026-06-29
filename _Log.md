@@ -58,6 +58,80 @@
   pkg/config/host_inbound_per_iface_3362_test.go,
   pkg/dataplane/userspace/host_inbound_per_iface_3362_test.go,
   pkg/daemon/host_inbound_per_iface_3362_test.go
+## 2026-06-29 — #3375 SMR MINOR fold: proto field-7 host_inbound_unmatched doc parity (PR #3542)
+
+- **Timestamp**: 2026-06-29
+- **Action**: SMR MINOR (contract-doc) fold for PR #3542. The #3375 fix
+  made the gRPC `MatchPolicies` host-inbound path populate `action` with
+  the `HostInboundActionString` SSOT (`DisplayAction()`), but the
+  `MatchPoliciesResponse.host_inbound_unmatched` (field 7) doc comment in
+  `proto/xpf/v1/xpf.proto` still claimed "`action` is empty; clients must
+  render <literal>". A client trusting the proto would hard-code the
+  literal and ignore the populated `action`, defeating the SSOT. Updated
+  the field-7 comment to state the server now renders
+  `HostInboundActionString` into `action` (non-empty; clients may use it
+  directly) and that `default_used` is false for the host-inbound case.
+  Regenerated `pkg/grpcapi/xpfv1/xpf.pb.go` via `make proto` — confirmed
+  the ONLY pb.go delta is the `HostInboundUnmatched` doc comment text (no
+  rawDesc / field-number / wire change; comment-only regen).
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  _Log.md
+- **Validation**: `make proto`; `go test ./pkg/grpcapi/ ./pkg/policymatch/
+  ./pkg/api/` green; gofmt clean; `git diff --stat` confirms pb.go change
+  is comment-only.
+## 2026-06-29 — #3434 NAT `match application` undefined/empty fail-closed
+
+- **Timestamp**: 2026-06-29
+- **Action**: A source- or destination-NAT `match application <name>` naming an
+  UNDEFINED application (H07) or a defined-but-EMPTY application-set (H08)
+  resolved to zero application terms and the DNAT builder fell through to its
+  explicit-match fallback (`protocol="" + destination-port 0`), publishing the
+  pool VIP for every flow to the destination — a fail-open wildcard
+  translation (the NAT analog of the policy #3144/#3146 gate). Fix: (1)
+  commit-time strict gate `validateNATMatchApplicationsStrict` (NAT analog of
+  `validatePolicyMatchApplicationsStrict`) rejects the undefined token / empty
+  set on the strict path, warns on the tolerant load/peer-sync path
+  (`lenientNATMatchApplications`, #1960 no-brick); (2) the DNAT snapshot builder
+  now emits a never-match term for a configured-but-unresolvable app, reusing
+  the #3437 source-port never-match sentinel (`natNeverMatchPortRange`) so the
+  installed entry can never satisfy `l4_extra_matches`. The SNAT builder already
+  failed closed via the `natProtoNever` term. No new wire field (reuses the
+  #3437 `MatchSourcePorts`), so `protocol_wire_v1.json` is unchanged and
+  `wire_invariant` stays green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_nat_match_application_3434_test.go,
+  pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_dnat_app_empty_3434_test.go,
+  userspace-dp/src/nat/tests.rs, docs/services-application-identification.md
+- **Validation**: `go test ./pkg/config/... ./pkg/dataplane/userspace/...` green;
+  `cargo test --bin xpf-userspace-dp nat::` 179 pass; `wire_invariant` green;
+  gofmt clean; RED-on-revert verified Go (both the gate dispatch and the DNAT
+  builder branch).
+## 2026-06-29 — #3366 Codex/SMR MINOR fold: pin the value-aware idempotent-accept path (PR #3540)
+
+- **Timestamp**: 2026-06-29
+- **Action**: SMR MINOR fold for PR #3540 (#3366). The duplicate scalar
+  term-leaf rejection in `parseApplicationTerms` is value-AWARE — a
+  repeat with the SAME value is harmless (no value is silently lost) and
+  COMMITS; only a CONFLICTING different-value repeat is rejected. That
+  idempotent-accept path (`if dstPortSet && v != dstPort` etc. at the
+  destination-port / source-port / inactivity-timeout|timeout / alg arms)
+  was correct but had NO committed test pinning it, so a future
+  value-blind refactor (drop the `&& v != …` value comparison) would
+  silently start over-rejecting legitimate idempotent configs undetected.
+  Added `TestApplicationTerm_DuplicateScalarLeaf_Idempotent_Accepted`
+  pinning four idempotent same-value cases — repeated `destination-port
+  22`, repeated `source-port 1024`, repeated `alg ftp`, and the
+  `inactivity-timeout 1800` + `timeout 1800` alias-same-value case (both
+  keywords set the same field). Config built via ParseSetCommand +
+  tree.SetPath (flatTreeFromSets/unrefAppOnly), per CLAUDE.md.
+- **File(s)**: pkg/config/compiler_application_mixed_term_3366_test.go
+- **Validation**: `go test ./pkg/config/` green; gofmt clean. RED-on-
+  revert experiment: flipping all four arms value-blind (`if dstPortSet {`
+  …) turns the new idempotent test RED on all four subcases while
+  `TestApplicationTerm_DuplicateScalarLeaf_Rejected` stays green —
+  confirming the test genuinely guards the idempotent path. Reverted the
+  flip; tree clean.
 
 ## 2026-06-29 — #3363 Codex MEDIUM fold: structured gRPC GetPolicies default-policy parity (PR #3528)
 
@@ -23539,6 +23613,9 @@ top.
 - **Action**: Verified #3385 over-match already structurally fixed on master by #3321 (lookup_directional removed the OR-decomposition). Added a #3385-specific RED-on-revert regression test for the distinct OVERLAPPING-range cross-slot over-match. No behavior change.
 - **File(s)**: userspace-dp/src/policy_tests.rs (app_catalog_overlapping_dual_range_no_cross_slot_overmatch)
 
+- **Timestamp**: 2026-06-29
+- **Action**: #3435 — enforce static-NAT `match source-address` (was parsed but dropped: all-source 1:1/DNAT exposure, H01) + carry the full bracket list (was scalar-truncated, M02). Added SourceAddresses to StaticNATRule + StaticNATRuleSnapshot (Go+Rust, additive wire field, fixture regenerated); compileNATStatic appends Keys[1:]+children; buildStaticNATSnapshots emits the list; static_nat.rs SourceConstraint gates inbound DNAT on packet SOURCE and reverse SNAT on packet DESTINATION (host + #3031 block paths), fail-closed on all-unparseable. RED-on-revert proven (Rust gate + Go M02).
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/nat.go, userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/static_nat.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/config/static_nat_source_address_3435_test.go, pkg/dataplane/userspace/static_nat_source_address_3435_test.go, userspace-dp/src/nat/tests.rs, docs/userspace-dnat-plan.md
 ## #3436 — daemon lo0 nft: normalize protocol aliases + DSCP names through shared resolvers
 - **Timestamp**: 2026-06-29
 - **Action**: nftRuleFromTerm emitted `from protocol` tokens and `dscp`/`traffic-class` tokens RAW (codex-094 H08/M01). Junos protocol aliases (junos-gre, junos-tcp-any, junos-icmp-all, ipip/junos-ip-in-ip) and case-variant / `be` DSCP names are accepted by the commit gate and userspace matcher but are not valid nft tokens, so the atomic lo0 load failed (commit broken) or the kernel mirror matched a different protocol/code point than userspace. Fix: resolve protocols through appid.ProtocolNumber and emit NUMERIC l4proto tokens; resolve DSCP through dataplane.DSCPValues (case-insensitive, numeric 0..63 pass-through) and emit numeric values. Unresolvable protocol dropped with a warning on the lenient path. Added RED-on-revert tests (alias single + multi set, DSCP EF/Af11/be/numeric + multi set); updated existing l4proto/DSCP test expectations to numeric; documented in pkg/daemon/README.md.
@@ -23549,6 +23626,105 @@ top.
 - **Timestamp**: 2026-06-29T11:40Z
   - **Action**: #3442 Codex MERGE-NEEDS-MAJOR fold (PR #3517) — over-rejection risk. Verb-set reconciliation: applyEditLine -> ParseSetVerb replays EXACTLY set/delete/deactivate/activate (everything else hits the bare-path default = the M3 bug); FormatSet (display-set, the loadable artifact) emits only set/deactivate. annotate/copy/insert/rename are interactive-only structural edits (pkg/cli/cli_dispatch.go handlers, distinct multi-clause grammar) NEVER present in a flat-load file and NOT replayable — pre-fix they were silently mangled into junk `set annotate ...` nodes, so rejecting them is the M3 fix, not a regression. Confirmed `hasFlatVerb` recognizes exactly the 4 replayable verbs (option 2). Real fix folded: Codex #3 whitespace — the literal-`verb ` prefix check wrongly rejected a tab between verb and path (lexer treats tabs as whitespace); rewrote hasFlatVerb to match the first whitespace-delimited token (strings.Fields) against the verb set + require >=1 path token. Added TestLoadFlatVerbGate (all 4 verbs accepted in sequence; tab-separated set accepted; annotate/copy/insert/rename + garbage rejected on BOTH LoadSet and LoadMerge-flat). RED-on-revert reconfirmed against true origin/master source (garbage + interactive verbs + TestLoadSet all fail) AND the tab assertion fails under the prior literal-space gate. go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
   - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+- **Timestamp**: 2026-06-29T12:30Z
+  - **Action**: #3327 — REST/gRPC screen inventory omitted port-scan, ip-sweep, limit-session-source/-destination, and icmp-fragment, and exposed no thresholds. Root cause: pkg/api/security.go and pkg/grpcapi/server_helpers.go each carried a byte-identical `screenChecks` string helper (the drift mechanism) listing only 12 checks; ScreenProfile carries PortScanThreshold/IPSweepThreshold/LimitSession.{Source,Destination}IPBased/ICMP.Fragment that buildScreenSnapshots (pkg/dataplane/userspace/screens.go) fully enforces. Fix: introduced single SSOT `config.ScreenChecks` + `config.ScreenThresholds` (pkg/config/screen_inventory.go) consumed by both APIs; both `screenChecks` helpers now delegate. Added the 5 omitted presence checks (set kept superset of enforced set) plus a thresholds map surfacing numeric values (icmp/udp/syn-flood with individually-keyed syn-flood sub-thresholds, port-scan, ip-sweep, session limits). Wire: proto ScreenInfo gained `map<string,int64> thresholds = 3` (regenerated xpf.pb.go via make proto); REST ScreenInfo gained `Thresholds map[string]int json:thresholds,omitempty`. RED-on-revert verified twice (drop the 5 checks -> both API tests fail on each missing check; null the threshold population -> both fail on each missing threshold). go test ./pkg/api/ ./pkg/grpcapi/ ./pkg/config/ ./pkg/dataplane/ ./pkg/logging/ green; go vet + gofmt clean. Cross-package ScreenFlagNames<->ringbuf mirror untouched (runtime event flags, not config inventory) — TestRawEventContractMatchesDataplaneEvent still green.
+  - **File(s)**: pkg/config/screen_inventory.go (new), pkg/api/security.go, pkg/api/types.go, pkg/api/security_screen_inventory_3327_test.go (new), pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_helpers.go, pkg/grpcapi/server_screen_inventory_3327_test.go (new), proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29T14:15Z
+  - **Action**: #3327 Codex MERGE-NEEDS-MAJOR fold (PR #3538). PR #3538 fixed
+    the STRUCTURED REST/gRPC screen inventory and introduced the SSOT
+    config.ScreenChecks / config.ScreenThresholds, but left HAND-BUILT screen
+    inventory lists in the TEXT renderers that still omitted port-scan,
+    ip-sweep, limit-session-source, limit-session-destination, and
+    icmp-fragment and did not delegate to the SSOT — so `show security zones`
+    detail and `show security screen` text output kept drifting from the
+    enforced/structured set (the "no second divergent inventory list remains"
+    gate). Fix: routed the enabled-check inventory through a single shared
+    grpcapi helper `screenEnabledCheckList(profile)` (delegates to
+    config.ScreenChecks / config.ScreenThresholds, annotating threshold-bearing
+    tokens as `name(threshold:N)`, syn-flood keyed on its attack-threshold)
+    consumed by (1) server_show_zones_text.go showZonesDetail "Enabled checks"
+    line and (2) server_show_security_text.go showScreen. The
+    screen-ids-option DETAIL table (showScreenIDSOptionDetail) is a
+    full-universe view (lists every check WITH its value AND default, including
+    disabled), so it cannot be ScreenChecks-driven (enabled-only); instead it
+    was completed with a row for each of the 5 omitted checks so it can no
+    longer drift. While here, the sibling non-detail status table
+    (showScreenIDSOption, a 4th hand-built list with the same omission) was
+    completed too so NO screen-inventory renderer remains divergent. RED-on-
+    revert verified for all three flagged sites (revert each delegation/row
+    block → the matching omitted-check assertion fails). go test ./pkg/grpcapi/
+    ./pkg/api/ ./pkg/config/ ./pkg/cli/ green; go vet ./pkg/grpcapi/ + gofmt
+    clean; regenerated the deterministic golden (server_show_golden.json) for
+    the screen + screen-ids-option-detail topics (deliberate output change).
+  - **File(s)**: pkg/grpcapi/server_show_zones_text.go, pkg/grpcapi/server_show_security_text.go, pkg/grpcapi/server_show_screen_inventory_text_3327_test.go (new), pkg/grpcapi/testdata/server_show_golden.json, _Log.md
+- **Timestamp**: 2026-06-29T16:45Z
+  - **Action**: #3327 Codex MERGE-NEEDS-MAJOR fold #2 (PR #3538). The first
+    text-renderer fold (cc0cd6c28) unified the gRPC text renderers but the
+    "no second divergent screen-inventory list remains" gate was still
+    violated on the LOCAL CLI (entirely untouched) and one gRPC site lacked a
+    tear-drop row. Fixes: (1) promoted the enabled-check rendering to a
+    cross-package SSOT `config.ScreenEnabledCheckList` (moved out of the
+    grpcapi-private helper; the grpcapi `screenEnabledCheckList` now delegates
+    to it, output-identical so the gRPC golden is unchanged). (2) Routed the
+    two enabled-only CLI summary renderers through it: `show security screen`
+    (pkg/cli/cli_show_security_screen.go showScreen) and the `show security
+    zones` detail "Enabled checks" line (pkg/cli/cli_show_security_zones.go) —
+    both previously hand-built lists omitting port-scan, ip-sweep,
+    limit-session-source, limit-session-destination, icmp-fragment. (3)
+    Completed the two value-bearing CLI tables with a row per omitted check
+    (mirroring the gRPC siblings, since the canonical-token list cannot carry
+    their per-check value/default columns): showScreenIdsOption (enabled-only
+    status table; also added the missing tear-drop row) and
+    showScreenIdsOptionDetail (full-universe). (4) Added the missing tear-drop
+    row to the gRPC showScreenIDSOption status table so its enabled-only table
+    is non-divergent too (golden-neutral: the untrust-screen fixture does not
+    enable tear-drop). RED-on-revert: new pkg/cli test drives all four CLI
+    renderers with a maximal profile and asserts each of the five omitted
+    checks appears; reverting any one of the four delegations/row-blocks fails
+    the matching subtest (verified each individually). GOLDEN call (#5): the
+    canonical-token form for `show security screen` (e.g. `syn-flood(threshold
+    :200)`, `land`) loses no essential info vs the prior verbose lines — check
+    identity and thresholds are both preserved and the richer per-check value
+    breakdown remains in `show security screen ids-option [detail]`; KEEP
+    canonical (it also unifies the summary with the structured/zones tokens).
+    No golden regen needed this fold (all changes output-neutral on the
+    fixture). go test ./pkg/cli/ ./pkg/grpcapi/ ./pkg/api/ ./pkg/config/
+    green; gofmt clean; go vet ./pkg/cli ./pkg/grpcapi clean (the lone
+    unreachable-code warning is pre-existing in untouched cli.go).
+  - **File(s)**: pkg/config/screen_inventory.go, pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_zones.go, pkg/grpcapi/server_show_security_text.go, pkg/cli/cli_show_security_screen_inventory_3327_test.go (new), _Log.md
+- **Timestamp**: 2026-06-29T15:30Z
+  - **Action**: #3375 grpcapi MatchPolicies blank-action parity. The gRPC MatchPolicies RPC returned a BLANK `action` for two verdicts where REST returned an explicit string: (1) a `to-zone junos-host` query matching no host-bound policy (HostInboundUnmatched), (2) the no-active-config case (empty response). It also lacked a typed default-used bit. Fix: added SSOT `policymatch.HostInboundActionString` const + `policymatch.Result.DisplayAction()` renderer (host-inbound -> the host string; no-match -> "<action> (default)"; match -> "<action>"); both REST and gRPC now route ALL action rendering through DisplayAction so they cannot diverge. gRPC host-inbound now returns the host string; gRPC nil-config returns "deny (default)" + default_used=true. Added typed `default_used` to proto MatchPoliciesResponse (field 12, regenerated xpf.pb.go) and REST MatchPoliciesResult JSON, populated from policymatch.Result.DefaultUsed. CLI multi-line match-policies output already self-describing -> unchanged. RED-on-revert verified on BOTH surfaces (gRPC: revert -> blank action + default_used unset fail; REST: drop DefaultUsed copy -> default_used assertion fails). go test ./pkg/grpcapi/ ./pkg/policymatch/ ./pkg/api/ ./pkg/cli/ green; gofmt clean; go vet clean on touched packages.
+  - **File(s)**: pkg/policymatch/policymatch.go, pkg/grpcapi/server_cluster.go, pkg/api/security.go, pkg/api/types.go, proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/README.md, pkg/policymatch/display_action_3375_test.go, pkg/grpcapi/server_matchpolicies_action_3375_test.go, pkg/api/security_matchpolicies_action_3375_test.go, _Log.md
+
+- **Timestamp**: 2026-06-29T12:30Z
+  - **Action**: #3446 source/destination-NAT `match destination-port` range validation. Static NAT validated its destination-port leaf (#2491) but the SNAT/DNAT match grammar did not: parser used bare strconv.Atoi (no bounds, non-numeric silently dropped) and builders cast to uint16, so port 0 → wildcard (H12), 70000 → wrap 4464 / -1 → 65535 (H13), `http` → empty list → wildcard (H14). Fix: (1) parseDNATPortList now returns unparseable raw tokens too → stored on NATMatch.InvalidDestinationPorts (skips `to`/`[`/`]`); (2) validateNATMatchDestinationPortStrict hard-rejects 0/out-of-range/non-numeric at commit for BOTH source and destination NAT, lenient-warn on tolerant load (shares lenientDestNATAddresses); (3) DNAT builder fail-closed — filters term ports to 1..65535 and emits NO snapshot (match nothing) when a port was configured but none survives, never wildcard (mirrors source-NAT #3429 natNeverMatchPortRange). No wire change (InvalidDestinationPorts is compiler-internal; builder uses existing destination_port slot). Boundary tests added (config commit gate + dataplane builder). RED-on-revert verified for both the commit gate and the builder fail-closed (70000→4464 wrap reproduced on revert). go test ./pkg/config/... ./pkg/dataplane/userspace/... green; cargo test --no-run nat:: green (no Rust touched); gofmt/vet clean.
+  - **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/dataplane/userspace/nat.go, pkg/config/compiler_nat_match_dport_3446_test.go, pkg/dataplane/userspace/nat_dnat_match_dport_3446_test.go, docs/userspace-dnat-plan.md, _Log.md
+
+## #3421 — REST session pagination/filtering/input-validation gRPC parity
+- **Timestamp**: 2026-06-29
+- **Action**: Brought REST session list pagination/filter/input-validation to gRPC parity. Rebased onto origin/master AFTER #3419 (REST session data parity) landed and FOLDED into #3419's machinery: added cursor pagination (page_size/page_token over a stable cursor via IterateSessionsFrom, next_page_token resume — fixes H4 offset-over-mutable-map skip/dup) reusing #3419's sessionQuery + sessionView + enriched sessionEntryV4/V6 + reverse-counter merge (shared enrichSessionV4/V6 so cursor==offset rows/counters); added source_prefix/destination_prefix/source_port/destination_port INTO #3419's sessionQuery+buildSessionQuery+matchV4/V6 with fail-closed validation (M2, one filter type not two); made limit/offset/page_size parse strict → HTTP 400 (M8); REST clear-all rejects any RawQuery/body with HTTP 400 (H6 — filtered clear + HA peer propagation deferred to sibling #3423). SMR MINOR folded: clear guard tests r.URL.RawQuery (not url.Query(), which drops un-decodable pairs). RED-on-revert verified for H6 + M8; cursor==offset parity asserted.
+- **File(s)**: pkg/api/sessions.go, pkg/api/types.go, pkg/api/README.md, pkg/api/sessions_pagination_test.go
+- **Timestamp**: 2026-06-29T13:30Z
+- **Action**: #3421 Codex MAJOR fold (test-coverage hardening, PR #3533). The
+  H6 clear-sessions guard correctly tests `r.URL.RawQuery != "" || r.ContentLength != 0`
+  (NOT `len(r.URL.Query()) > 0`, which silently swallows the parse error on an
+  un-decodable query and yields an empty map → bypass to clear-all). But
+  TestRESTClearRejectsFilters only exercised `?zone=trust` — a future regression
+  from RawQuery back to url.Query() would still pass while re-opening unsafe
+  full-table clear-all on a `?%zz` request. Added two sub-tests: (a) malformed
+  `?%zz` (set req.URL.RawQuery verbatim; asserts url.Query() parses to len-0 as a
+  precondition, then asserts 400 + ClearAllSessions NOT called) and (b)
+  empty-value `?zone=` (len-1 under url.Query(); confirms RawQuery!="" still
+  rejects and does not under-reject). RED-on-revert: flipping the guard to
+  `len(r.URL.Query()) > 0` makes the malformed `%zz` sub-case FAIL (status 200 +
+  clear-all) — the true RawQuery differentiator; the empty-value sub-case stays
+  green under both guards (url.Query() len==1, as its own case-(b) contract
+  states), so it is a no-under-rejection assertion, not a revert differentiator.
+  Guard restored. go test ./pkg/api/ green (incl #3419 TestRESTSessionParityWithGRPC);
+  gofmt clean. No code or doc change beyond the test.
+- **File(s)**: pkg/api/sessions_pagination_test.go, _Log.md
+
 - **Timestamp**: 2026-06-29T12:00Z
   - **Action**: #3447 strict-parse the CLI `rollback <arg>`. A malformed
     argument (`rollback foo`, `rollback 1x`, `rollback -1`) silently fell
@@ -23574,6 +23750,47 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3361 SMR MERGE-NEEDS-MINOR fold (PR #3523). SMR caught a genuine degraded-boot gap + a self-contradicting doc comment: collectHostInboundKernelDenies was called AFTER the `if dp == nil || !dp.IsLoaded() { return }` gate in Collect, but the kernel `inet xpf_hostinbound` chain is installed and DROPS control-plane traffic independent of dataplane load state — so in a config-only/degraded boot (dp unloaded, deny chain still dropping) xpf_host_inbound_kernel_denies_total silently vanished, the exact blind spot the metric exists to close; the function's own doc comment already (incorrectly) claimed it ran "BEFORE the dataplane gate". Fix: moved the call before the gate, into the control-plane-signal section alongside frr/feeds/flowexport (confirmed ReadHostInboundDenyCounters is netlink-only, no dp dependency); updated the metrics.go placement comment to match. Added a `readHostInboundDenyCounters` package-var seam so the degraded-boot path is unit-testable without a live kernel. RED-on-revert: TestHostInboundKernelDeniesEmittedWhenDataplaneUnloaded builds a Server{} (dp nil), injects fake counts, and asserts the series is emitted — moving the call back below the gate makes it RED (verified); plus TestHostInboundKernelDeniesReadErrorOmitsSeries pins the #3345 omit-series+bump-error contract. Kept bump-counterReadErrors behavior (the error SAMPLE is still emitted by collectGlobalCounters; the bump accumulates and surfaces on the next gate-reaching scrape — documented). Rebased on origin/master first (union _Log.md). go build ./..., go test ./pkg/api/... ./pkg/daemon/... ./pkg/nftables/... green; gofmt clean.
   - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_counters.go, pkg/api/metrics_host_inbound_kernel_test.go, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3290 fix — ICMP error/control packets no longer install fake sessions via the metadata fallback. The XDP shim stamps `meta.flow_src_port = bytes[l4+4..l4+6]` for EVERY ICMP/ICMPv6 type (no query gate), so for a non-query ICMP error/control packet (Dest-Unreachable, Packet-Too-Big, Time-Exceeded, Parameter-Problem, Redirect, ND/MLD) `parse_session_flow_from_bytes` reached the metadata fallback (`frame_flow=None` per the #3067 frame-parser gate, but `metadata_tuple_complete` returns true for non-TCP/UDP) and returned a `SessionFlow` keyed on the control word as a pseudo source port — bypassing #3067 on the metadata path. Fix: factored the #3067 query-type rule into a shared `icmp_identifier_bearing(protocol, icmp_type)` predicate (reused by `parse_flow_ports`), added `meta_icmp_identifier_bearing(frame, meta)` (reads the ICMP type byte from the frame bounded by the IP-declared `declared_end`, fail-closed on truncation/malformed L3), and gated `parse_session_flow_from_bytes` to discard `meta_flow` for non-query ICMP types so the packet stays flowless (route-based, session-less forward). Identifier-bearing query types are unaffected (meta identifier == frame identifier). Added 3 regression tests in inspect_tests.rs: non-query ICMPv4 + ICMPv6 (incl. ND/MLD) with hostile metadata ports assert None; ICMPv4 echo still keys on the identifier. RED-on-revert verified (the two error/control tests return the fake `src_port=0xBEEF` session when the gate is removed). cargo test inspect/icmpv green (39 + 29); go test ./pkg/dataplane/... green; rustfmt clean. NOT session-sync/HA (pure ingress flow-classification on the local fast path) — no test-failover needed.
+  - **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs, userspace-dp/src/afxdp/frame/inspect_tests.rs, userspace-dp/src/afxdp/frame/README.md, _Log.md
+  - **Action**: #3290 Codex MERGE-NEEDS-MAJOR fold (PR #3521). (1 MAJOR) `meta_icmp_identifier_bearing` only bounded the ICMP TYPE byte by `declared_end`, while `parse_flow_ports` separately requires the 2 identifier BYTES at [l4+4..l4+6] to be within `declared_end`; a query packet truncated between the type byte and the identifier passed the meta gate and installed a metadata-keyed session from shim bytes outside the declared datagram. Fix: meta gate now requires the full [l4..l4+6) identifier range inside `declared_end` (frame-equivalent). (2 MAJOR) `forward_request.rs` meta-fallback synthesized a flow key from `parse_session_flow_from_meta` for a non-query/control ICMP packet, propagating a fabricated `src_port`/`dst_port` into TX selection + CoS output-filter evaluation (`cos_classify.rs`). Fix: gate the forward_request meta-fallback with the same `icmp_identifier_bearing` predicate (frame-bounded type read) → None for non-query ICMP. (3 MINOR) ICMPv6 test label said "ND/MLD" but enumerated only 1-4,133-137; added MLD types 130/131/132/143. RED-on-revert verified for both MAJORs. cargo test inspect/icmpv + forwarding/cos green; go test ./pkg/dataplane/... green; rustfmt clean.
+  - **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs, userspace-dp/src/afxdp/frame/inspect_tests.rs, userspace-dp/src/afxdp/forwarding/forward_request.rs, userspace-dp/src/afxdp/frame/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3290 third-fold (PR #3521) — third fail-open ICMP metadata path. Codex MAJOR: the pending-neighbor buffering fallback (poll_descriptor/mod.rs MissingNeighbor handler) gated only on non-first-fragment, then called parse_session_flow_from_meta(meta) and stored the result as PendingNeighPacket.flow_key. For a non-query ICMP error/control packet with an UNRESOLVED next-hop, that buffered the shim's fake pseudo-port (0xBEEF); retry_pending_neigh then fed it into CoS/output-filter classification AND the prepared TX request — the same #3290 bug class as the conntrack path and the immediate forward_request path, but on the deferred-TX route. Fix: extracted pending_neigh_flow_key(flow, raw_frame, meta) into neighbor_dispatch.rs (mirrors the #2375 pending_neigh_admission extraction pattern) and applied the shared meta_icmp_identifier_bearing gate — a non-identifier-bearing ICMP/ICMPv6 (error/control/ND/MLD/truncated query) now buffers flow_key=None, taking the interface-default-queue / no-output-filter path on flush. Also widened meta_icmp_identifier_bearing to require the full [l4..l4+6) identifier range inside declared_end (frame-equivalent to parse_flow_ports — fix from the prior fold). All THREE metadata consumers (conntrack parse_session_flow_from_bytes, immediate build_live_forward_request_from_frame, pending-neigh pending_neigh_flow_key) now gate identically. Added 3 unit tests on the extracted helper: control ICMP -> None (RED on revert, returns fake src_port=0xBEEF), echo query -> Some(identifier), flowless TCP -> Some(meta ports, gate is protocol-scoped). RED-on-revert verified. cargo test inspect/icmpv/forward_request/cos_classify/pending_neigh green; go test ./pkg/dataplane/... — the only failure is a PRE-EXISTING master canary (TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports flags pkg/daemon/daemon_nft.go from #3436, a Go file untouched by this Rust-only change); rebased onto current origin/master to pick up the allowlist follow-up. rustfmt clean on touched files. Still not session-sync/HA — no test-failover required.
+  - **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/frame/README.md, _Log.md
+  - **Action**: #3290 Codex MAJOR fold (PR #3521) — full-suite triage. Codex
+    ran the FULL `cargo test` (not the targeted modules the SMR ran) and found
+    `afxdp::frame::tests::parse_session_flow_prefers_tuple_stamped_in_metadata`
+    failing. Triaged against a pristine-origin/master baseline run (full
+    `cargo test` on both): master baseline = 2 failures, both the KNOWN
+    pre-existing #3457 set (`afxdp::worker_queue::...concurrent_recovery...` +
+    `event_stream::...test_paused_telemetry_eviction_does_not_poison_drain_2875`).
+    Branch had those 2 plus the parse_session_flow one (genuine PR-introduced)
+    plus a one-off `afxdp::umem::tests::tx_latency_hist_cross_thread_snapshot_skew_within_bound`
+    — the latter is a load-sensitive cross-thread statistical timing test NOT in
+    this PR's diff; it passed 3/3 in isolation and did not recur on the re-run,
+    so it is environmental (full-suite CPU contention), not introduced.
+    Disposition of the genuine one: STALE INVARIANT (not over-gating). The old
+    test stamped a 64-byte 0xaa GARBAGE frame with ICMP metadata at offsets=0
+    and expected the metadata pseudo-port admitted — exactly the no-frame-
+    validation fake-session vector #3290 closes; post-fix the gate reads
+    frame[l4]=0xaa (not an identifier-bearing type) and correctly suppresses it
+    to flowless. Updated the test to keep its INTENT (prefer the stamped
+    metadata tuple over the frame-derived identifier) under the new rule: it now
+    builds a LEGITIMATE ICMPv4 Echo Request (type 8, on-wire identifier 0x1234)
+    and stamps a DISTINCT metadata pseudo-port (0x4321); the gate validates the
+    echo type byte, admits the flow, and asserts the stamped 0x4321 wins (IPs
+    agree). This also guards against the dual error — if the gate ever
+    OVER-rejects a legitimate echo query it returns the frame's 0x1234 and the
+    test goes RED. The control/non-query ICMP suppression itself stays covered
+    by the #3290 inspect_tests.rs regressions. After the fix the full
+    `cargo test` failure set on the branch == the pristine-master baseline
+    ({worker_queue, event_stream}); ZERO PR-introduced failures. go test
+    ./pkg/dataplane/... green; touched test region rustfmt-clean (scoped edit,
+    no whole-file reformat of pre-existing dirty byte-array lines).
+  - **File(s)**: userspace-dp/src/afxdp/frame/tests.rs, _Log.md
 
 - **Timestamp**: 2026-06-29T08:45Z
   - **Action**: #3409 event-mode structured / sd-syslog local-file support.
@@ -23609,3 +23826,59 @@ top.
     No code change. Rebased on origin/master first (union _Log.md). go test
     ./pkg/config/ ./pkg/logging/ green; gofmt clean.
   - **File(s)**: pkg/config/compiler.go, _Log.md
+- **Timestamp**: 2026-06-29T12:30Z
+  - **Action**: #3366 application EITHER direct OR term-based; conflicting duplicate term leaf. compileApplications now records a parent that mixes a direct match body (protocol/destination-port/source-port/inactivity-timeout/timeout/icmp-type/icmp-code/alg) with `term` sub-blocks on ApplicationsConfig.MixedDirectTermApps; before, the term-store branch kept only the synthesized term apps and silently DROPPED the direct match (fail-open under-match for a deny app). parseApplicationTerms now records a CONFLICTING (different-value) repeat of a single-valued scalar term leaf (destination-port/source-port/inactivity-timeout/timeout/alg) on Application.DuplicateTermLeaves — was last-writer-wins; idempotent same-value repeats (timeout/inactivity-timeout aliases set equal) and repeated `protocol` (multi-protocol syntax) are not flagged. New gate validateApplicationStructureStrict rejects both at commit over ALL user-defined apps (referenced or not, like the #3352/#3353 syntactic gate); lenient-warn on CompileConfigLenient/peer-sync (#1960). Updated existing over-rejection guard test (it had mixed a direct body with a term and expected acceptance — split into two apps). RED-on-revert verified (disable gate -> mixed + duplicate tests fail). go test ./pkg/config ./pkg/appid ./pkg/dataplane/userspace green; go vet clean; gofmt clean.
+  - **File(s)**: pkg/config/compiler_applications.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/types_security.go, pkg/config/compiler_application_mixed_term_3366_test.go, pkg/config/compiler_application_term_alg_3352_3353_test.go, pkg/config/README.md, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-06-29T13:30Z
+  - **Action**: #3393 Codex MAJOR fix — Go<->Rust commit/apply drift for
+    firewall-filter `from protocol ipv6`. The #3393 appid round-trip change
+    widened the Go filter commit gate (config.filterProtocolResolvable) to
+    accept "ipv6", but the userspace filter snapshot builder
+    (pkg/dataplane/userspace/filters.go) emits the protocol token VERBATIM as
+    the name "ipv6" (unlike the application/NAT lowering paths, which
+    pre-canonicalize to a number). The Rust filter compiler resolves that
+    verbatim token via ip_proto::proto_number, which had no "ipv6" arm and
+    returned None -> UnrepresentableFilterProtocol -> the whole snapshot was
+    rejected. Result: a `from protocol ipv6` filter committed in Go yet failed
+    to apply in the dataplane (the #1961 class). FIX: added "ipv6" => 41
+    (PROTO_IPV6) to Rust ip_proto::proto_number, restoring its documented
+    mirror invariant with appid.ProtocolNumber (which #3393 closed to 41) and
+    keeping the filter path's verbatim-name design consistent (proto_number
+    already resolves esp/ah/sctp/vrrp/junos-* by name). BROADER DRIFT CHECK:
+    enumerated the full filterProtocolResolvable named accept set; "ipv6" was
+    the ONLY drift (numeric 0-255 already aligns: Go n<256, Rust parse::<u8>).
+    GUARD: new Rust filter::tests::filter_protocol_accept_set_subset_of_resolver
+    enumerates the entire gate accept set and asserts proto_number resolves each
+    (Go-commit-accept subset-of Rust-resolvable). RED-on-revert verified: removed
+    the ipv6 arm -> protocol_3393_ipv6_resolves_scoped and the subset guard both
+    FAIL. Added Go-side guard TestFilterSnapshotIPv6ProtocolEmittedAndResolvable
+    (gate accepts "ipv6" AND builder emits it verbatim). cargo test filter::
+    green; go test ./pkg/config ./pkg/appid ./pkg/dataplane/userspace
+    ./pkg/daemon green; gofmt + rustfmt clean.
+  - **File(s)**: userspace-dp/src/ip_proto.rs, userspace-dp/src/filter/tests.rs,
+    pkg/dataplane/userspace/filters_protocol_ipv6_3393_test.go, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3393 follow-up — fold two doc-accuracy items into PR #3537.
+    ITEM 1 (filter mirror guard hardening): the Rust mirror test
+    filter::tests::filter_protocol_accept_set_subset_of_resolver is a HARDCODED
+    list, not a mechanical enumeration — its `for token in [...]` loop only
+    exercises tokens it already lists, so a protocol newly ADDED to the Go gate
+    filterProtocolResolvable would go un-mirrored silently. Corrected its comment
+    to drop the "trips this test" overclaim and state the lockstep requirement,
+    pointing at the new Go pin. Added Go-side mechanical cross-language guard
+    TestFilterProtocolNamedSetMatchesRustMirror (pkg/config) that parses the
+    named token set out of BOTH the Go gate source and the Rust mirror array and
+    asserts set-equality (reuses the host_inbound_rust_parity_test.go helpers).
+    RED-on-mutation verified: adding a "dccp" arm to filterProtocolResolvable
+    makes it FAIL naming dccp as missing from the Rust mirror.
+    ITEM 2 (DNAT comment accuracy): dnatProtocolResolvable is no longer a 1:1
+    mirror of Rust proto_number (proto_number resolves ipv6=41 since #3393; DNAT
+    intentionally rejects it). Updated the gate comment, the exported-wrapper
+    comment, and the TestDNATProtocolResolvableMatchesRustSSOT comment to document
+    the deliberately-tighter SSOT (excludes junos-* AND ipv6), and added "ipv6"
+    to that test's reject list to pin the divergence. go test ./pkg/config
+    ./pkg/appid green; cargo test filter:: green; gofmt + rustfmt clean.
+  - **File(s)**: pkg/config/filter_protocol_rust_mirror_3393_test.go (new),
+    pkg/config/compiler_validate_strict.go, pkg/config/compiler_dnat_protocol_test.go,
+    userspace-dp/src/filter/tests.rs, _Log.md

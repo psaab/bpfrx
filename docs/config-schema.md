@@ -2500,6 +2500,58 @@ constraint, unknown alg rejected top-level + inline-term + unreferenced,
 supported alg names accepted on both paths, predefined-app reference not
 rejected).
 
+### #3366 — application EITHER direct OR term-based; conflicting duplicate term leaf
+
+A custom `applications application <name>` may carry EITHER a direct match body
+(`protocol` / `destination-port` / `source-port` / `inactivity-timeout` /
+`timeout` / `icmp-type` / `icmp-code` / `alg`) OR one or more `term` sub-blocks —
+Junos rejects the mix. Two silent-accept gaps lived in `compileApplications` /
+`parseApplicationTerms` (`compiler_applications.go`):
+
+- **Mixed direct body + `term` dropped the direct match.** The final store is
+  all-or-nothing: `if len(terms) > 0 { /* store only the synthesized term apps +
+  the implicit application-set */ } else { apps.Applications[appName] = app }`.
+  So a shape combining a direct body with a term
+  (`application X { protocol tcp; destination-port 22; term t1 { protocol udp;
+  destination-port 53; } }`) silently DISCARDED the direct `protocol tcp /
+  destination-port 22` match — for a deny application that erased the deny and
+  let traffic fall through to a later permit or the default policy (a fail-OPEN
+  under-match), with no commit error. `compileApplications` now records such a
+  parent on `cfg.Applications.MixedDirectTermApps` (a direct body is any match
+  leaf — `description` is metadata propagated onto each term, not a match
+  constraint, so it does NOT count), and `validateApplicationStructureStrict`
+  (`compiler_validate_strict.go`) rejects it at commit (move the direct match
+  into its own `term`).
+- **Conflicting duplicate scalar leaf inside one `term` was last-writer-wins.**
+  `parseApplicationTerms` parses `destination-port` / `source-port` / `alg` /
+  `inactivity-timeout` / `timeout` into single scalars; the inline `term` is
+  opaque to `SchemaValidate`, so a repeated leaf (via apply-groups, flat-set
+  ordering, or hand authoring) silently overwrote the earlier value by token
+  order with no validation — a repeated `destination-port` in a deny term
+  narrowed the deny to the final value. The parser now records a CONFLICTING
+  repeat (a second occurrence with a DIFFERENT value) on
+  `Application.DuplicateTermLeaves`, and the same gate rejects the first one. An
+  IDEMPOTENT same-value repeat (e.g. the `timeout` / `inactivity-timeout` aliases
+  both set to the same number) is harmless and accepted; a repeated `protocol` is
+  the documented multi-protocol-term syntax (one application per unique protocol,
+  `TestMultiProtocolTerm`) and is NOT flagged.
+
+**Scope — ALL user-defined applications, referenced or not.** Like the
+#3352/#3353 syntactic gate, `validateApplicationStructureStrict` runs over every
+entry rather than the reference-scoped `applicationsToValidateStrict` subset: a
+mixed-shape application and a conflicting duplicate term leaf are STRUCTURAL
+errors Junos rejects at definition regardless of policy wiring. Both checks are
+STRICT on the commit / commit-check path and downgrade to a `cfg.Warnings` entry
+on the tolerant load / HA peer-sync path (`lenientApplicationSpecs`, #1960
+no-brick), the same discipline as the #3320 / #3348 / #3352 / #3353 application
+gates. Distinct from #3339 (implicit-set vs explicit-set collision / duplicate
+term NAMES), #3352 (unknown leaves inside a term), and #3320 (malformed timeout).
+Regression coverage: `pkg/config/compiler_application_mixed_term_3366_test.go`
+(mixed rejected referenced + unreferenced + per-direct-leaf + hierarchical;
+description+term and direct-only / term-only accepted; conflicting duplicate
+leaf rejected per leaf; repeated-protocol multi-protocol term accepted; lenient
+path downgrades to a warning).
+
 ### #2226 — rib-group `import-rib` undefined-reference validation
 
 `routing-options rib-groups <group> import-rib <rib>` was unvalidated: an

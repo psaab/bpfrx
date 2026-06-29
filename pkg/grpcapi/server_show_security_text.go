@@ -450,9 +450,38 @@ func (s *Server) showScreenIDSOption(req *pb.ShowTextRequest, cfg *config.Config
 			if profile.IP.SourceRouteOption {
 				fmt.Fprintf(buf, "  IP source route option                      enabled\n")
 			}
+			if profile.IP.TearDrop {
+				fmt.Fprintf(buf, "  IP teardrop (tear-drop)                     enabled\n")
+			}
 			if profile.UDP.FloodThreshold > 0 {
 				fmt.Fprintf(buf, "  UDP flood threshold                         %d\n",
 					profile.UDP.FloodThreshold)
+			}
+			// #3327: this enabled-only status table is the same class of
+			// hand-built inventory as the detail table — before #3327 it
+			// omitted icmp-fragment, port-scan, ip-sweep, and the
+			// source/destination session limits even though they are enforced.
+			// Surface them so no screen-inventory renderer drifts from the
+			// config.ScreenChecks SSOT. The trailing token matches the
+			// canonical config.ScreenCheck* name.
+			if profile.ICMP.Fragment {
+				fmt.Fprintf(buf, "  ICMP fragment (icmp-fragment)               enabled\n")
+			}
+			if profile.TCP.PortScanThreshold > 0 {
+				fmt.Fprintf(buf, "  TCP port scan (port-scan)                   %d\n",
+					profile.TCP.PortScanThreshold)
+			}
+			if profile.IP.IPSweepThreshold > 0 {
+				fmt.Fprintf(buf, "  IP sweep (ip-sweep)                         %d\n",
+					profile.IP.IPSweepThreshold)
+			}
+			if profile.LimitSession.SourceIPBased > 0 {
+				fmt.Fprintf(buf, "  Session limit source (limit-session-source) %d\n",
+					profile.LimitSession.SourceIPBased)
+			}
+			if profile.LimitSession.DestinationIPBased > 0 {
+				fmt.Fprintf(buf, "  Session limit destination (limit-session-destination) %d\n",
+					profile.LimitSession.DestinationIPBased)
 			}
 			// Show which zones use this profile
 			var zones []string
@@ -623,6 +652,36 @@ func (s *Server) showScreenIDSOptionDetail(req *pb.ShowTextRequest, cfg *config.
 			} else {
 				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "UDP flood threshold", "disabled", "disabled")
 			}
+			// #3327: the detail table is a full-universe view (it lists every
+			// check with its value AND default, including disabled ones), so it
+			// cannot be driven by the enabled-only config.ScreenChecks list the
+			// `show security zones`/`show security screen` summaries use.
+			// Instead it must carry a row for every screen check so it never
+			// drifts from the enforced/SSOT inventory. Before #3327 it omitted
+			// these five rows even though the compiler and userspace dataplane
+			// fully enforce them. The trailing token in each Name matches the
+			// canonical config.ScreenCheck* inventory name.
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "ICMP fragment (icmp-fragment)", enabledS(profile.ICMP.Fragment), "disabled")
+			if profile.TCP.PortScanThreshold > 0 {
+				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "TCP port scan (port-scan)", profile.TCP.PortScanThreshold, "disabled")
+			} else {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP port scan (port-scan)", "disabled", "disabled")
+			}
+			if profile.IP.IPSweepThreshold > 0 {
+				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "IP sweep (ip-sweep)", profile.IP.IPSweepThreshold, "disabled")
+			} else {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "IP sweep (ip-sweep)", "disabled", "disabled")
+			}
+			if profile.LimitSession.SourceIPBased > 0 {
+				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "Session limit source (limit-session-source)", profile.LimitSession.SourceIPBased, "disabled")
+			} else {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "Session limit source (limit-session-source)", "disabled", "disabled")
+			}
+			if profile.LimitSession.DestinationIPBased > 0 {
+				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "Session limit destination (limit-session-destination)", profile.LimitSession.DestinationIPBased, "disabled")
+			} else {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "Session limit destination (limit-session-destination)", "disabled", "disabled")
+			}
 			var zones []string
 			for name, zone := range cfg.Security.Zones {
 				if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
@@ -641,6 +700,21 @@ func (s *Server) showScreenIDSOptionDetail(req *pb.ShowTextRequest, cfg *config.
 		}
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// screenEnabledCheckList renders the enabled screen checks for a profile as a
+// stable, SSOT-sourced list, each threshold-bearing token annotated with its
+// configured value (e.g. "icmp-flood(threshold:1000)"). It is the single
+// rendering of the enabled-screen inventory shared by the `show security zones`
+// and `show security screen` text renderers so neither can drift from
+// config.ScreenChecks / config.ScreenThresholds (#3327). Before #3327 each
+// renderer hand-built its own presence list and silently omitted port-scan,
+// ip-sweep, the source/destination session limits, and icmp-fragment even
+// though the compiler and userspace dataplane fully enforce them.
+func screenEnabledCheckList(profile *config.ScreenProfile) []string {
+	// Delegate to the cross-package SSOT so the gRPC, REST, and local-CLI
+	// enabled-check renderers share one rendering and cannot drift (#3327).
+	return config.ScreenEnabledCheckList(profile)
 }
 
 func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
@@ -670,41 +744,15 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 				continue
 			}
 			fmt.Fprintf(buf, "Screen profile: %s\n", name)
-			if profile.TCP.Land {
-				buf.WriteString("  TCP LAND attack detection: enabled\n")
-			}
-			if profile.TCP.SynFin {
-				buf.WriteString("  TCP SYN+FIN detection: enabled\n")
-			}
-			if profile.TCP.NoFlag {
-				buf.WriteString("  TCP no-flag detection: enabled\n")
-			}
-			if profile.TCP.FinNoAck {
-				buf.WriteString("  TCP FIN-no-ACK detection: enabled\n")
-			}
-			if profile.TCP.WinNuke {
-				buf.WriteString("  TCP WinNuke detection: enabled\n")
-			}
-			if profile.TCP.SynFrag {
-				buf.WriteString("  TCP SYN fragment detection: enabled\n")
-			}
-			if profile.TCP.SynFlood != nil {
-				fmt.Fprintf(buf, "  TCP SYN flood protection: attack-threshold %d\n",
-					profile.TCP.SynFlood.AttackThreshold)
-			}
-			if profile.ICMP.PingDeath {
-				buf.WriteString("  ICMP ping-of-death detection: enabled\n")
-			}
-			if profile.ICMP.FloodThreshold > 0 {
-				fmt.Fprintf(buf, "  ICMP flood protection: threshold %d\n",
-					profile.ICMP.FloodThreshold)
-			}
-			if profile.IP.SourceRouteOption {
-				buf.WriteString("  IP source-route option detection: enabled\n")
-			}
-			if profile.UDP.FloodThreshold > 0 {
-				fmt.Fprintf(buf, "  UDP flood protection: threshold %d\n",
-					profile.UDP.FloodThreshold)
+			// #3327: drive the enabled-check inventory from the shared SSOT
+			// (config.ScreenChecks / config.ScreenThresholds via
+			// screenEnabledCheckList) instead of a hand-built presence list
+			// that omitted port-scan, ip-sweep, the source/destination session
+			// limits, and icmp-fragment — the same drift the structured
+			// REST/gRPC inventory was fixed for. One line per enabled check,
+			// threshold-bearing checks annotated with the configured value.
+			for _, c := range screenEnabledCheckList(profile) {
+				fmt.Fprintf(buf, "  %s\n", c)
 			}
 			if zones, ok := zonesByProfile[name]; ok {
 				sort.Strings(zones)

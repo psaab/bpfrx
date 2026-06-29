@@ -1092,7 +1092,8 @@
     "internal_ip": "",
     "mapped_port": 0,
     "match_destination_port": 0,
-    "name": ""
+    "name": "",
+    "source_addresses": []
   },
   "three_color_policer_snapshot": {
     "color_blind": false,

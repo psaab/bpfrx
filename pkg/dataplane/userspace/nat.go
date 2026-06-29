@@ -485,11 +485,20 @@ func buildStaticNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			if rule == nil || rule.IsNPTv6 {
 				continue
 			}
+			// #3435: carry the `match source-address` constraint into the
+			// snapshot. Prefer the full bracket-list (SourceAddresses); fall
+			// back to the singular SourceAddress for an older typed config.
+			// Empty = match any source (unscoped, pre-#3435 behavior).
+			sourceAddrs := append([]string(nil), rule.SourceAddresses...)
+			if len(sourceAddrs) == 0 && rule.SourceAddress != "" {
+				sourceAddrs = append(sourceAddrs, rule.SourceAddress)
+			}
 			out = append(out, StaticNATRuleSnapshot{
 				Name:                 rule.Name,
 				FromZone:             rs.FromZone,
 				FromInterface:        rs.FromInterface,
 				FromRoutingInstance:  rs.FromRoutingInstance,
+				SourceAddresses:      sourceAddrs,
 				ExternalIP:           rule.Match,
 				InternalIP:           rule.Then,
 				MatchDestinationPort: clampPort(rule.MatchDestinationPort),
@@ -716,23 +725,71 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				}
 			}
 
-			// If no application terms resolved, use explicit match values. DNAT
-			// `match` grammar has no source-port or ICMP type/code, so those axes
-			// stay unconstrained on the explicit-match fallback term.
+			// If no application terms resolved, the behavior depends on WHETHER
+			// an application was configured:
+			//
+			//   - #3434: an application WAS configured (rule.Match.Application !=
+			//     "") but resolved to ZERO terms — a typo / dangling reference or
+			//     a defined-but-EMPTY application-set. Falling through to the
+			//     explicit-match fallback would emit proto="" + dstPort=0 = a
+			//     wildcard match-ALL term and publish the pool VIP for EVERY
+			//     flow to the destination (the H07/H08 fail-open, the DNAT analog
+			//     of the source-NAT buildSourceNATAppTerms natProtoNever guard).
+			//     Emit a never-match term instead, reusing the #3437 source-port
+			//     never-match sentinel (an impossible Low>High range): the entry
+			//     installs but can never satisfy l4_extra_matches, so the rule
+			//     matches NOTHING. The commit-time strict gate
+			//     (validateNATMatchApplicationsStrict, #3434) rejects the
+			//     typo/empty-set so this is only the lenient load / peer-sync
+			//     backstop.
+			//
+			//   - No application configured: use the explicit match grammar
+			//     (protocol + destination-port). DNAT `match` grammar has no
+			//     source-port or ICMP type/code, so those axes stay unconstrained
+			//     on the explicit-match fallback term. #3446: this fallback sets
+			//     explicitFallback so the port-filtering loop below can tell a
+			//     configured-but-unresolved destination-port from a genuine
+			//     wildcard and fail closed.
+			explicitFallback := false
 			if len(appTerms) == 0 {
-				appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+				if rule.Match.Application != "" {
+					appTerms = []appTerm{{srcPorts: []NatPortRangeWire{natNeverMatchPortRange}}}
+				} else {
+					appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+					explicitFallback = true
+				}
 			}
 
 			for _, term := range appTerms {
+				// #3446: a `match destination-port` that was configured but
+				// resolves to NO valid 1..65535 port must match NOTHING (fail
+				// closed) — never widen to the wildcard port (0 = any). Out-of-
+				// range numerics are dropped here (the bare uint16 cast used to
+				// wrap 70000→4464); non-numeric tokens (`http`) were dropped at
+				// parse and surface via Match.InvalidDestinationPorts. The strict
+				// commit gate (validateNATMatchDestinationPortStrict) rejects all
+				// of these at commit; this hardens the lenient / peer-sync path.
 				var dstPorts []uint16
-				if len(term.ports) > 0 {
-					for _, p := range term.ports {
+				for _, p := range term.ports {
+					if p >= 1 && p <= 65535 {
 						dstPorts = append(dstPorts, uint16(p))
 					}
-				} else if rule.Match.DestinationPort != 0 {
-					dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
-				} else {
-					dstPorts = []uint16{0}
+				}
+				// Did this rule CONFIGURE a destination-port at all? A configured
+				// port that survived to no valid value must not become wildcard.
+				portConfigured := len(term.ports) > 0 ||
+					(explicitFallback && (rule.Match.DestinationPort != 0 || len(rule.Match.InvalidDestinationPorts) > 0))
+				if len(dstPorts) == 0 {
+					switch {
+					case rule.Match.DestinationPort >= 1 && rule.Match.DestinationPort <= 65535:
+						dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
+					case portConfigured:
+						// Configured but no valid port → fail closed: emit no
+						// snapshot for this term so the rule matches nothing.
+						continue
+					default:
+						dstPorts = []uint16{0} // genuine wildcard (no port match)
+					}
 				}
 
 				for _, dstPort := range dstPorts {

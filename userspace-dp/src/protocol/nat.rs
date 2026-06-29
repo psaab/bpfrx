@@ -131,6 +131,20 @@ pub(crate) struct StaticNATRuleSnapshot {
     pub from_interface: String,
     #[serde(rename = "from_routing_instance", default)]
     pub from_routing_instance: String,
+    /// #3435: the static-NAT rule's `match source-address` constraint. Junos
+    /// static NAT `source-address` restricts which client source IPs the
+    /// 1:1/DNAT translation applies to; before #3435 the Go snapshot dropped
+    /// it, so the helper built an all-source mapping that exposed the internal
+    /// host to ANY source (fail-open, H01) — the static-NAT analog of the DNAT
+    /// #2394 fix. Each entry is a CIDR prefix (`198.51.100.0/24`) or a bare
+    /// host IP (`198.51.100.42`), carried verbatim. The inbound (DNAT)
+    /// direction matches the packet SOURCE against this list; the reverse
+    /// (SNAT) direction matches the packet DESTINATION (the original client).
+    /// Empty = unscoped (match any source, unchanged behavior). A non-empty
+    /// list whose entries ALL fail to parse fails CLOSED (matches no source)
+    /// rather than reverting to match-any. Additive wire field (#1961).
+    #[serde(rename = "source_addresses", default)]
+    pub source_addresses: Vec<String>,
     #[serde(rename = "external_ip", default)]
     pub external_ip: String,
     #[serde(rename = "internal_ip", default)]

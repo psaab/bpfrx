@@ -196,11 +196,20 @@ type SessionEntry struct {
 }
 
 // SessionListResponse holds paginated session results.
+//
+// Two pagination modes share this shape (#3421 H4):
+//   - Offset mode (default): Total/Limit/Offset describe a best-effort
+//     limit/offset window over a live map traversal.
+//   - Cursor mode (page_size>0): PageSize and NextPageToken describe a
+//     stable cursor page; an empty NextPageToken marks the last page.
+//     Total is omitted in cursor mode (it would require a full scan).
 type SessionListResponse struct {
-	Total    int            `json:"total"`
-	Limit    int            `json:"limit"`
-	Offset   int            `json:"offset"`
-	Sessions []SessionEntry `json:"sessions"`
+	Total         int            `json:"total"`
+	Limit         int            `json:"limit"`
+	Offset        int            `json:"offset"`
+	PageSize      int            `json:"page_size,omitempty"`
+	NextPageToken string         `json:"next_page_token,omitempty"`
+	Sessions      []SessionEntry `json:"sessions"`
 }
 
 // SessionSummary holds session table summary stats.
@@ -271,6 +280,12 @@ type RouteInfo struct {
 type ScreenInfo struct {
 	Name   string   `json:"name"`
 	Checks []string `json:"checks"`
+	// Thresholds carries the configured numeric screen thresholds keyed by
+	// check name (or by a syn-flood-specific key for the several syn-flood
+	// sub-thresholds). Only explicitly-configured positive values appear, so a
+	// consumer can distinguish a default threshold from an intentionally tight
+	// or accidentally clamped one (#3327). Omitted when no threshold is set.
+	Thresholds map[string]int `json:"thresholds,omitempty"`
 }
 
 // TextResponse wraps text output from commands.
@@ -347,6 +362,12 @@ type MatchPoliciesResult struct {
 	// delivery; no transit global/default fallback), so Action is not a
 	// default-policy verdict for this case.
 	HostInboundUnmatched bool `json:"host_inbound_unmatched,omitempty"`
+	// DefaultUsed is true when no policy matched and Action is the configured
+	// default-policy verdict (#3375), including the no-active-config fail-closed
+	// case (deny). It is the typed form of the " (default)" suffix on Action, so
+	// a client can branch on the posture without string-parsing. False for a
+	// concrete policy match and for HostInboundUnmatched.
+	DefaultUsed bool `json:"default_used,omitempty"`
 }
 
 // ClearSessionsResult holds session clear results.

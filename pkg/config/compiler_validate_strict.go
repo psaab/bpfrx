@@ -2175,6 +2175,125 @@ func policyMatchEmptyAppSetError(scope, policyName, name string) error {
 		where, name, name)
 }
 
+// validateNATMatchApplicationsStrict hard-rejects a source- or
+// destination-NAT rule's `match application <name>` token that resolves to
+// NONE of: a predefined junos-* application, a user-defined `applications
+// application <name>`, or a non-empty user-defined `applications
+// application-set <name>` (#3434, Codex audit 095 H07/H08). It is the NAT
+// analog of validatePolicyMatchApplicationsStrict (#3144/#3146).
+//
+// A NAT `match application` consumes the referenced application's
+// protocol/port the same way a policy match does (the SNAT/DNAT snapshot
+// builders in pkg/dataplane/userspace/nat.go resolve it via
+// ResolveApplication / ExpandApplicationSet). When the token is a typo /
+// dangling reference (H07) or a defined-but-EMPTY application-set (H08), the
+// reference resolves to ZERO application terms — and the DNAT builder then
+// fell THROUGH to its explicit-match fallback (protocol="" + destination-port
+// 0), publishing the pool VIP for EVERY flow to the destination (a fail-open
+// wildcard translation). The dataplane backstop now substitutes a never-match
+// term on that path (the source-NAT buildSourceNATAppTerms natProtoNever term,
+// and the destination-NAT natNeverMatchPortRange source-port sentinel), but
+// the operator still got a green commit for a NAT rule that quietly fails
+// closed. Failing the unresolved reference at commit turns that silent break
+// into an operator-visible error.
+//
+// Resolution mirrors the snapshot builders EXACTLY (ResolveApplication, which
+// checks user apps then the predefined table, plus ResolveApplicationSet +
+// ExpandApplicationSet) so the commit gate and the dataplane cannot diverge.
+// The `any` keyword and the empty token are always accepted (they mean
+// "unconstrained" and the builders short-circuit them to no terms). Static NAT
+// carries no application match, so only source and destination NAT rule-sets
+// are walked.
+//
+// Strict on commit / commit-check (hard reject naming the NAT kind, rule-set,
+// rule, and the undefined app); lenient on load / peer-sync (warn — #1960; the
+// dataplane independently fails the rule closed, so a leniently-loaded bad
+// config is no worse off, now flagged). Same doctrine as
+// lenientPolicyMatchApplications.
+func validateNATMatchApplicationsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// appRefError returns nil if the token resolves, or a tailored reject.
+	// Resolution mirrors the SNAT/DNAT snapshot builders: a name resolves only
+	// if it is a predefined / user application OR an application-set that
+	// EXPANDS to >= 1 member. A defined-but-EMPTY application-set resolves by
+	// NAME but expands to zero members -> the builder produces a never-match
+	// term (H08).
+	appRefError := func(natKind, ruleSet, ruleName, name string) error {
+		switch name {
+		case "", "any":
+			return nil
+		}
+		if _, ok := ResolveApplication(name, cfg.Applications.Applications); ok {
+			return nil
+		}
+		if _, ok := ResolveApplicationSet(name, cfg.Applications.ApplicationSets); ok {
+			expanded, err := ExpandApplicationSet(name, &cfg.Applications)
+			if err == nil && len(expanded) == 0 {
+				return natMatchEmptyAppSetError(natKind, ruleSet, ruleName, name)
+			}
+			return nil
+		}
+		return natMatchApplicationError(natKind, ruleSet, ruleName, name)
+	}
+	checkRuleSet := func(natKind string, rs *NATRuleSet) error {
+		if rs == nil {
+			return nil
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if err := appRefError(natKind, rs.Name, rule.Name, rule.Match.Application); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Source {
+		if err := checkRuleSet("source", rs); err != nil {
+			return err
+		}
+	}
+	if cfg.Security.NAT.Destination != nil {
+		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+			if err := checkRuleSet("destination", rs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// natMatchApplicationError formats the #3434 H07 reject for a NAT rule whose
+// `match application` names neither a predefined/user application nor an
+// application-set.
+func natMatchApplicationError(natKind, ruleSet, ruleName, app string) error {
+	return fmt.Errorf(
+		"%s NAT rule-set %q rule %q match application %q resolves to no "+
+			"predefined application, user-defined application, or "+
+			"application-set (a typo or undefined application disarms the NAT "+
+			"match and the dataplane falls open to a wildcard translation) — "+
+			"define the application or fix the reference (#3434)",
+		natKind, ruleSet, ruleName, app)
+}
+
+// natMatchEmptyAppSetError formats the #3434 H08 reject for a NAT rule
+// referencing a DEFINED but EMPTY application-set. The set exists by name but
+// expands to zero members, so the snapshot builder produces a never-match term
+// and the rule quietly matches nothing — the NAT sibling of #3146.
+func natMatchEmptyAppSetError(natKind, ruleSet, ruleName, name string) error {
+	return fmt.Errorf(
+		"%s NAT rule-set %q rule %q match application %q is a defined but "+
+			"EMPTY application-set (it expands to zero applications) — the rule "+
+			"commits but the dataplane installs a never-match term so the "+
+			"translation never fires — add at least one `applications "+
+			"application-set %q application <name>` member or remove the "+
+			"reference (#3434)",
+		natKind, ruleSet, ruleName, name, name)
+}
+
 // policyMatchAddressBookResolves mirrors the runtime address resolver
 // resolveUserspaceAddressBookEntry + expandUserspacePolicyAddresses
 // (pkg/dataplane/userspace/capabilities.go) for a single address-book NAME
@@ -3592,6 +3711,80 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 	return nil
 }
 
+// validateApplicationStructureStrict hard-rejects two STRUCTURAL errors in a
+// user-defined application that Junos rejects at commit regardless of whether
+// the application is wired into a policy (the same all-user-apps scope as
+// validateApplicationSyntaxStrict, NOT the reference-scoped semantic specs):
+//
+//   - #3366 mixed direct + term: an application carrying BOTH a direct match
+//     body (protocol / destination-port / source-port / inactivity-timeout /
+//     timeout / icmp-type / icmp-code / alg) AND one or more `term` sub-blocks.
+//     compileApplications stores only the synthesized term applications for a
+//     term-bearing app (the `if len(terms) > 0` branch), so the direct match was
+//     SILENTLY DROPPED — for a deny application that erases a deny match and lets
+//     traffic fall through to a later permit or the default policy (a fail-open
+//     under-match). Junos requires a custom application to be EITHER scalar OR
+//     term-based; reject the mix at commit. compileApplications records the
+//     parent name on cfg.Applications.MixedDirectTermApps.
+//
+//   - #3366 duplicate scalar term leaf: a single-valued leaf (destination-port /
+//     source-port / inactivity-timeout / timeout / alg) repeated with a
+//     CONFLICTING value inside one inline term. The term is opaque to the
+//     SchemaValidate walk, so the repeat was last-writer-wins — the earlier value
+//     silently overwritten by parse order, narrowing/widening the term with no
+//     commit error. An idempotent same-value repeat is accepted; a repeated
+//     `protocol` is the documented multi-protocol-term syntax and is NOT flagged.
+//     parseApplicationTerms records the offending leaf names on
+//     Application.DuplicateTermLeaves.
+//
+// Strict on the commit / commit-check path; the call site (compiler.go,
+// lenientApplicationSpecs) downgrades a returned error to a warning on the
+// tolerant load / peer-sync path so an already-persisted or older-peer-synced
+// config still BOOTS (#1960 no-brick). Iteration is sorted so the first-reported
+// error is deterministic across runs.
+func validateApplicationStructureStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// #3366 mixed direct + term — reject the parent application by name.
+	if len(cfg.Applications.MixedDirectTermApps) > 0 {
+		mixed := append([]string(nil), cfg.Applications.MixedDirectTermApps...)
+		sort.Strings(mixed)
+		return fmt.Errorf(
+			"application %q: a custom application may define EITHER a direct match "+
+				"body (protocol / destination-port / source-port / "+
+				"inactivity-timeout / timeout / icmp-type / icmp-code / alg) OR one or "+
+				"more `term` sub-blocks, not both — Junos rejects the mix, and the "+
+				"compiler silently dropped the direct match (keeping only the terms), "+
+				"which for a deny application erases the deny and lets traffic fall "+
+				"through. Move the direct match into its own `term`",
+			mixed[0])
+	}
+	// #3366 duplicate scalar leaf inside an inline term.
+	if len(cfg.Applications.Applications) > 0 {
+		names := make([]string, 0, len(cfg.Applications.Applications))
+		for name := range cfg.Applications.Applications {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			app := cfg.Applications.Applications[name]
+			if app == nil || len(app.DuplicateTermLeaves) == 0 {
+				continue
+			}
+			return fmt.Errorf(
+				"application %q: conflicting duplicate %q inside `term`; a single-valued "+
+					"term leaf (destination-port / source-port / inactivity-timeout / "+
+					"timeout / alg) may carry only one value — a repeat with a different "+
+					"value is last-writer-wins and silently overrides the earlier one by "+
+					"token order (use repeated `protocol` only for an intentional "+
+					"multi-protocol term)",
+				name, app.DuplicateTermLeaves[0])
+		}
+	}
+	return nil
+}
+
 // applicationsToValidateStrict returns the set of user-defined application
 // names whose port/protocol spec is validated as a hard COMMIT error rather
 // than a warning. That is every user application referenced (directly, or as a
@@ -4540,6 +4733,7 @@ func filterProtocolResolvable(token string) bool {
 		"gre", "junos-gre",
 		"ospf", "junos-ospf",
 		"junos-ip-in-ip", "junos-ipip", "ipip",
+		"ipv6",
 		"egp",
 		"igmp",
 		"pim",
@@ -5098,20 +5292,26 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 }
 
 // dnatProtocolResolvable reports whether a DNAT `match protocol` token is one
-// the userspace dataplane can resolve. It is the Go mirror of the Rust
-// ip_proto::proto_number SSOT (userspace-dp/src/ip_proto.rs): the DNAT path
-// emits the token VERBATIM (no junos-* pre-resolution), and proto_number
-// accepts ONLY bare protocol names and a 0-255 number — NOT junos-* aliases
-// (those are resolved by the application path, never the raw match-protocol
-// path). Normalization (trim + lower-case) matches proto_number exactly, so
-// the commit gate and the dataplane agree on the accepted set.
+// the userspace dataplane can resolve for the DNAT match path. The DNAT path
+// emits the token VERBATIM (no junos-* pre-resolution); normalization (trim +
+// lower-case) matches proto_number exactly.
 //
-// This is deliberately a TIGHTER set than filterProtocolResolvable /
-// appid.ProtocolNumber (which add junos-* aliases for the filter/application
-// paths): a junos-* token in a DNAT match-protocol would resolve in those
-// supersets but be DROPPED by proto_number, so accepting it here would
-// re-introduce the #2396 silent drop. Empty ("" = any protocol) is the IP-only
-// wildcard and is always resolvable.
+// This is a deliberately-tighter SSOT than the Rust ip_proto::proto_number
+// resolver — it is NOT a 1:1 mirror of it. It is tighter in TWO ways:
+//
+//  1. junos-* aliases: proto_number resolves them (for the filter/application
+//     paths), but the raw DNAT match-protocol path never pre-resolves them, so
+//     accepting a junos-* token here would re-introduce the #2396 silent drop.
+//
+//  2. ipv6 (IANA protocol 41): proto_number was widened in #3393 to resolve the
+//     "ipv6" name (so a firewall filter's `from protocol ipv6` round-trips),
+//     but DNAT match-protocol intentionally EXCLUDES it — matching on the IPv6
+//     encapsulation protocol number is not a meaningful DNAT destination-rule
+//     selector here. So `match protocol ipv6` is rejected at commit even though
+//     proto_number would resolve it. (filterProtocolResolvable / the appid
+//     SSOT accept "ipv6"; DNAT does not — that divergence is by design.)
+//
+// Empty ("" = any protocol) is the IP-only wildcard and is always resolvable.
 func dnatProtocolResolvable(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
 	case "",
@@ -5130,9 +5330,10 @@ func dnatProtocolResolvable(token string) bool {
 }
 
 // DNATProtocolResolvable exposes dnatProtocolResolvable for a cross-package
-// drift-guard test that asserts this acceptance set agrees with the Rust
-// proto_number SSOT (the two INLINE copies cannot drift silently). TEST seam,
-// not a runtime coupling.
+// drift-guard test that pins this acceptance set to its documented,
+// deliberately-tighter relationship to the Rust proto_number SSOT (it excludes
+// the junos-* aliases and "ipv6"/41 that proto_number resolves — see
+// dnatProtocolResolvable). TEST seam, not a runtime coupling.
 func DNATProtocolResolvable(token string) bool {
 	return dnatProtocolResolvable(token)
 }
@@ -5181,6 +5382,84 @@ func validateDestinationNATProtocolStrict(cfg *Config) error {
 						"commit but never translate any traffic",
 					rs.Name, rule.Name, rule.Match.Protocol)
 			}
+		}
+	}
+	return nil
+}
+
+// validateNATMatchDestinationPortStrict (#3446) hard-rejects a source- or
+// destination-NAT rule whose `match destination-port` carries a value the
+// dataplane cannot honor: 0, a negative or >65535 number, or a non-numeric
+// token (`http`). Static NAT already validates its typed `destination-port`
+// leaf (#2491 / validateNATHostMaskStrict 1..65535); this closes the same gap
+// for the source/destination NAT match grammar, whose parser used a bare
+// strconv.Atoi with no bound check and whose builders cast straight to uint16
+// (so 70000 wrapped to 4464, -1 to 65535) or collapsed an unparseable list to
+// the wildcard port (translating EVERY port instead of failing closed).
+//
+// The compiled match carries two signals: DestinationPorts (every numeric
+// token, including out-of-range ones) and InvalidDestinationPorts (the raw
+// tokens that did not parse as integers — preserved by parseDNATPortList for
+// exactly this gate). A 0/out-of-range number or any invalid token is an
+// operator error that can never become a valid L4 port match.
+//
+// Strict on commit / commit-check (hard reject so the bad port is
+// operator-visible); the compiler downgrades this to a warning on the tolerant
+// load / peer-sync path (#1960 no-brick) — the snapshot builders independently
+// fail CLOSED (coalescePortRanges / sourceNATDestPortRanges emit a never-match
+// sentinel; the DNAT builder drops the rule rather than wildcarding), so a
+// leniently-loaded bad rule installs nothing rather than over-translating.
+// Rule-sets are walked in sorted name order, rules in configured order, for a
+// deterministic first-reported offender.
+func validateNATMatchDestinationPortStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(kind string, rulesets []*NATRuleSet) error {
+		sorted := append([]*NATRuleSet(nil), rulesets...)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i] == nil || sorted[j] == nil {
+				return sorted[i] != nil
+			}
+			return sorted[i].Name < sorted[j].Name
+		})
+		for _, rs := range sorted {
+			if rs == nil {
+				continue
+			}
+			for _, rule := range rs.Rules {
+				if rule == nil {
+					continue
+				}
+				for _, p := range rule.Match.DestinationPorts {
+					if p < 1 || p > 65535 {
+						return fmt.Errorf(
+							"%s-nat rule-set %q rule %q: match destination-port %d is out "+
+								"of range (1-65535); the rule would commit but the dataplane "+
+								"cannot install it as an L4 port match (the value wraps on a "+
+								"uint16 cast or collapses to the wildcard port, translating "+
+								"the wrong port or every port)",
+							kind, rs.Name, rule.Name, p)
+					}
+				}
+				if len(rule.Match.InvalidDestinationPorts) > 0 {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: match destination-port %q is not a "+
+							"numeric port (1-65535); the rule would commit but the bad token "+
+							"is dropped and the port match collapses to the wildcard port "+
+							"(translating every port instead of failing closed)",
+						kind, rs.Name, rule.Name, rule.Match.InvalidDestinationPorts[0])
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("source", cfg.Security.NAT.Source); err != nil {
+		return err
+	}
+	if cfg.Security.NAT.Destination != nil {
+		if err := check("destination", cfg.Security.NAT.Destination.RuleSets); err != nil {
+			return err
 		}
 	}
 	return nil

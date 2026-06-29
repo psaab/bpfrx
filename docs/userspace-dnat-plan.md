@@ -407,6 +407,44 @@ expose it).
   (`lenientFirewallRefs`, #1960) and the dataplane backstop fails closed. Mirrors
   the firewall prefix-list / policer reference gates.
 
+### Static-NAT source-address (#3435)
+
+`match source-address` on a **static** NAT rule is the bidirectional 1:1/DNAT
+analog of the DNAT constraint above. It was accepted by the schema and stored
+by the compiler, but dropped before runtime — the static snapshot had no source
+field and the Rust matcher never checked source, so a rule meant to expose an
+internal host only to selected client prefixes installed as an all-source
+mapping (fail-open exposure broadening, H01). Separately the typed value was
+truncated to a single scalar despite the schema's `multi: true`, so
+bracket/repeated lists lost every prefix after the first (M02).
+
+#3435 mirrors #2394 end to end:
+
+- `StaticNATRule.SourceAddresses` (`types_security.go`) holds the full list;
+  `compileNATStatic` (`compiler_nat.go`) appends `m.Keys[1:]` + child names
+  (closing M02) and keeps the singular `SourceAddress` as the first element for
+  back-compat (the NAT64 `::/0` readers, peer sync).
+- `StaticNATRuleSnapshot.SourceAddresses` (Go `protocol.go` /
+  `source_addresses` Rust `protocol/nat.rs`) — a new additive wire field
+  (`json:"source_addresses,omitempty"`, serde `default`). Empty = match any
+  source (unscoped, unchanged). `protocol_wire_v1.json` was regenerated.
+- `buildStaticNATSnapshots` (`nat.go`) populates it from `rule.SourceAddresses`
+  with the singular `SourceAddress` fallback.
+- `static_nat.rs` parses the list into a `SourceConstraint`
+  (`{constrained, v4, v6}`) on each `StaticNatEntry` and `StaticNatBlock`
+  (host AND #3031 block paths). `SourceConstraint::matches`: unconstrained ->
+  match any; constrained but zero entries parsed -> match NOTHING (fail closed,
+  the #2394/#3435 guard); else the peer must fall in a parsed prefix of its
+  family. Bare-host fallback to /32 /128 (IpNet rejects a bare IP) is shared
+  with the DNAT path.
+- **Direction.** The inbound `match_dnat_with_counter_scoped` gates on the
+  packet SOURCE (`flow.forward_key.src_ip`, `poll_descriptor/mod.rs`); the
+  reverse `match_snat_with_counter_scoped` gates on the packet DESTINATION (the
+  original client, `flow.forward_key.dst_ip`, `nat_exception.rs`), symmetric
+  with the #2871 egress-zone gate. The new peer argument is `Option<IpAddr>`;
+  the non-scoped / test wrappers pass `None` (source gate skipped), the
+  production scoped callers pass `Some(..)`.
+
 ## 11. Multiple destination-addresses (#2395)
 
 Junos DNAT `match destination-address [ A B C ]` publishes the SAME
@@ -515,3 +553,49 @@ block registers only its network base and must be ROUTED to the firewall. The
 DNAT MATCH is independent of this set (the pre-routing lookup keys on the packet
 destination directly), so a large block is still translated in full — only
 on-segment proxy-ARP for the whole block is bounded.
+
+## 13. `match destination-port` range validation (#3446)
+
+Source- and destination-NAT `match destination-port` had NO range validation
+(unlike static NAT, which validates its typed `destination-port` leaf 1..65535
+at commit — #2491). The parser (`parseDNATPortList`, `compiler_nat.go`) used a
+bare `strconv.Atoi` with no bound check and dropped a non-numeric token
+silently; the snapshot builders cast the value straight to `uint16`. The result
+was three silent failure modes:
+
+- **H12** — `match destination-port 0` installed the WILDCARD port (Rust treats
+  `dst_port == 0` as "match any"), so the rule translated EVERY port.
+- **H13** — `70000` wrapped to `4464` and `-1` to `65535` on the `uint16` cast,
+  so the rule DNAT'd the wrong external port.
+- **H14** — a non-numeric token (`http`) failed `Atoi`, was dropped, left an
+  empty port list, and fell back to the wildcard port — again translating every
+  port instead of failing closed.
+
+**Commit gate.** `validateNATMatchDestinationPortStrict` (`compiler_validate_strict.go`)
+hard-rejects a source- or destination-NAT rule whose `match destination-port`
+carries a 0/negative/>65535 number or a non-numeric token. It runs after the
+DNAT match-protocol gate and shares the `lenientDestNATAddresses` flag, so on
+the tolerant load / peer-sync path (#1960) it downgrades to a warning rather
+than bricking a config persisted before the gate existed. To see a non-numeric
+token at commit (it never parses to an int), `parseDNATPortList` now returns the
+unparseable raw tokens alongside the numeric ports; the compiler stores them on
+`NATMatch.InvalidDestinationPorts` (the `to` range keyword and `[`/`]`
+bracket-list delimiters are never reported). Out-of-range NUMBERS still flow
+through `DestinationPorts` and are range-checked directly.
+
+**Dataplane fail-closed (lenient backstop).** The source-NAT builder was already
+fail-closed (`coalescePortRanges` / `sourceNATDestPortRanges` skip out-of-range
+values and emit the `natNeverMatchPortRange` sentinel when a configured list
+coalesces to nothing — #3429). The destination-NAT builder
+(`buildDestinationNATSnapshotsWithFeeds`) now matches that doctrine: it filters
+each term's ports to 1..65535, and when a port WAS configured (numeric list
+non-empty, or `InvalidDestinationPorts` non-empty on the explicit-match
+fallback) but no valid port survives, it emits NO snapshot for the term so the
+rule matches NOTHING — it never widens to the wildcard port. A rule with no
+`destination-port` at all still emits the genuine wildcard (`destination_port:
+0`), unchanged.
+
+**Wire.** No new wire field. `InvalidDestinationPorts` is compiler-internal
+(never serialized to the helper); the builder uses the existing
+`destination_port` slot and simply drops a term that would have wildcarded, so
+`protocol_wire_v1.json` is unchanged.

@@ -993,6 +993,9 @@ pub(super) fn poll_binding_process_descriptor(
                             worker_ctx.forwarding.static_nat.match_dnat_with_counter_scoped(
                                 resolution_target,
                                 flow.forward_key.dst_port,
+                                // #3435: gate the inbound static DNAT on the
+                                // packet SOURCE against `match source-address`.
+                                Some(flow.forward_key.src_ip),
                                 ingress_zone_name,
                                 ingress_ifname_dnat,
                                 ingress_ri_dnat,
@@ -4093,17 +4096,24 @@ pub(super) fn poll_binding_process_descriptor(
                                         // only reached when
                                         // `owned_packet_frame.is_none()`, so it
                                         // describes the packet `meta` refers to.
-                                        let pending_flow_key = flow
-                                            .as_ref()
-                                            .map(|flow| flow.forward_key.clone())
-                                            .or_else(|| {
-                                                if frame_is_non_first_fragment(raw_frame, meta) {
-                                                    None
-                                                } else {
-                                                    parse_session_flow_from_meta(meta)
-                                                        .map(|flow| flow.forward_key)
-                                                }
-                                            });
+                                        // #2357/#3290: stored flow_key drives
+                                        // CoS/output-filter selection AND the TX
+                                        // request when retry_pending_neigh later
+                                        // flushes this packet. The helper gates
+                                        // the metadata fallback (non-first
+                                        // fragment, and non-identifier-bearing
+                                        // ICMP) so a fabricated pseudo-port is
+                                        // never buffered — the SAME gate the
+                                        // immediate forward path and the
+                                        // conntrack path apply. `raw_frame` is
+                                        // the UMEM slice for `desc` (this branch
+                                        // is only reached when
+                                        // `owned_packet_frame.is_none()`).
+                                        let pending_flow_key = pending_neigh_flow_key(
+                                            flow.as_ref(),
+                                            raw_frame,
+                                            meta,
+                                        );
                                         binding.pending_neigh.insert(
                                             pending_key,
                                             PendingNeighPacket {

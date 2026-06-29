@@ -138,6 +138,24 @@ pub(super) fn build_live_forward_request_from_frame(
         // `None` arm) — so a fragment is never misclassified by, or
         // spuriously dropped by, a port-matching terminal filter term.
         None
+    } else if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        && !meta_icmp_identifier_bearing(frame, meta)
+    {
+        // #3290: mirror the conntrack-side gate. The XDP shim stamps
+        // `meta.flow_src_port` from bytes [l4+4..l4+6] for EVERY ICMP/ICMPv6
+        // type with no query-type gate, so synthesizing a tuple here for a
+        // non-query ICMP error/control packet (Dest-Unreachable,
+        // Packet-Too-Big, Time-Exceeded, Parameter-Problem, Redirect, ND/MLD)
+        // would feed a fabricated pseudo-port into TX selection AND CoS
+        // output-filter evaluation (`tx/cos_classify.rs` reads
+        // flow_key.src_port/dst_port) — and store it in the pending request's
+        // `flow_key`. A `None` flow_key takes the same default, no-output-filter
+        // path as the fragment case above, matching the flowless verdict
+        // `parse_session_flow_from_bytes` produces for these packets on the
+        // conntrack side. Identifier-bearing query types keep their tuple (and
+        // for those the primary `flow` is already `Some`, so this arm is only
+        // reached for the non-query / truncated case).
+        None
     } else {
         fallback_flow = parse_session_flow_from_meta(meta);
         fallback_flow.as_ref()

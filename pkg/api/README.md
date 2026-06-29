@@ -51,6 +51,25 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     the scoped global's real zones on its `from_zone`/`to_zone` labels
     (#3286) — an unscoped global keeps `*`/`*` — so counter-based
     validation is unambiguous on the canonical metrics surface.
+  - `GET /api/v1/security/screen` enumerates the configured screen
+    profiles. Each `ScreenInfo` carries the profile `name`, a `checks`
+    string list, and a `thresholds` map (keyed by check name). The
+    `checks` list and the shared helper are the single source of truth
+    with gRPC `GetScreen` (`config.ScreenChecks` /
+    `config.ScreenThresholds`, #3327) — before #3327 each API carried a
+    byte-identical copy that omitted `port-scan`, `ip-sweep`,
+    `limit-session-source`, `limit-session-destination`, and
+    `icmp-fragment` even though the compiler and userspace dataplane
+    (`pkg/dataplane/userspace/screens.go`) fully enforce them, so an
+    operator reading structured state saw active protection as absent.
+    The `checks` set is kept a superset of the dataplane-enforced set.
+    `thresholds` surfaces the configured numeric values (icmp/udp/syn
+    flood, port-scan, ip-sweep, session limits) — only explicitly-set
+    positive values appear, so a consumer can tell a default threshold
+    from an intentionally tight or accidentally clamped one. The
+    SYN-flood profile's several sub-thresholds are keyed individually
+    (`syn-flood-attack-threshold`, `-alarm-`, `-source-`,
+    `-destination-`, `-timeout`).
   - `GET /api/v1/statistics/global` — global dataplane counters
     (`GlobalStats`, types.go). The field set mirrors the gRPC
     `GetGlobalStats` reader: as of #3426 it includes `nat64_translations`
@@ -234,8 +253,32 @@ under the daemon's errgroup. Nothing else imports this package.
   `nat_only=true`, and `source_nat_pool=<pool>` (an unresolved pool fails
   CLOSED with HTTP 400, like the gRPC `sessionFilter.validate`). The numeric
   `policy_id`/`ingress_zone`/`egress_zone` fields are retained for
-  compatibility. Pagination/clear (limit/offset cursor, filtered clear) are
-  tracked separately (#3421/#3423). Pinned by `sessions_parity_test.go`.
+  compatibility. Pinned by `sessions_parity_test.go`.
+- Session list pagination and the remaining filter dimensions reach gRPC
+  parity in #3421, folded into the SAME `sessionQuery` + `sessionView` +
+  enriched `sessionEntryV4/V6` machinery above (one filter type, not two).
+  Added filters: `source_prefix`, `destination_prefix`, `source_port`,
+  `destination_port` (prefixes accept a CIDR or a bare IP; mirror the gRPC
+  `matchV4`/`matchV6` predicates), each parsing FAIL-CLOSED — a malformed
+  prefix/port returns HTTP 400 instead of zeroing the predicate and widening
+  the query (#3421 M2). Pagination has two modes: the default best-effort
+  `limit`/`offset` window (now parsed strict — malformed/negative → 400,
+  #3421 M8), and a stable cursor mode selected by `page_size>0`. Cursor mode
+  iterates v4 then v6 from an opaque `page_token`, returning up to
+  `page_size` rows plus a `next_page_token` that resumes exactly after the
+  last row (no skip/duplicate across map mutation, the offset path's hazard);
+  an empty `next_page_token` marks the last page. Both modes share the
+  reverse-counter merge + enrichment, so they report IDENTICAL rows and
+  counters. The token codec mirrors the gRPC page-token format and encodes
+  node-local session-map keys (opaque to clients); when the runtime
+  dataplane lacks cursor iteration the handler falls back to the offset path.
+  Pinned by `sessions_pagination_test.go`.
+- Session clear (`POST /api/v1/security/sessions/clear`) clears ALL local
+  sessions and accepts NO parameters: a non-empty query string
+  (`r.URL.RawQuery`) or request body returns HTTP 400 rather than silently
+  ignoring filter parameters and wiping the whole table (#3421 H6). The
+  gRPC-parity FILTERED clear and HA peer propagation are tracked separately
+  (#3423).
 - `GET /api/v1/security/match` (`matchPoliciesHandler`) is a THIN adapter
   over the single shared policy simulator `pkg/policymatch` (#3042). It only
   validates/parses inputs (400 on a malformed IP/port) and renders the

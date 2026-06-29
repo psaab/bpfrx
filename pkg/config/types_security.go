@@ -420,8 +420,16 @@ type NATMatch struct {
 	DestinationAddressName string   // address-book name (resolved during compilation, #3229)
 	DestinationPort        int      // primary port (first port for BPF rule)
 	DestinationPorts       []int    // all matched ports (for multi-port DNAT rules)
-	Protocol               string   // "tcp", "udp", "icmp6", "gre", or "" (auto)
-	Application            string   // application name (e.g. "junos-http")
+	// InvalidDestinationPorts holds raw `match destination-port` tokens that
+	// did NOT parse as an integer (e.g. "http", "httpp"). The parser used to
+	// silently drop them, which let an all-nonnumeric port list collapse to an
+	// empty DestinationPorts and then widen to the wildcard port (#3446 H14).
+	// They are preserved so validateNATMatchDestinationPortStrict can reject
+	// them at commit and the snapshot builders can fail CLOSED (match nothing)
+	// on the lenient load / peer-sync path.
+	InvalidDestinationPorts []string
+	Protocol                string // "tcp", "udp", "icmp6", "gre", or "" (auto)
+	Application             string // application name (e.g. "junos-http")
 }
 
 // NATThen defines the NAT translation action.
@@ -496,11 +504,23 @@ type DeterministicNATConfig struct {
 
 // StaticNATRule is a 1:1 bidirectional NAT rule.
 type StaticNATRule struct {
-	Name          string
-	Match         string // destination-address (external/public IP)
-	SourceAddress string // source-address match (optional, e.g. "::/0" for NAT64)
-	Then          string // static-nat prefix (internal/private IP), or "inet" for NAT64
-	IsNPTv6       bool   // true if this is an nptv6-prefix rule (RFC 6296)
+	Name  string
+	Match string // destination-address (external/public IP)
+	// SourceAddress is the FIRST configured `match source-address` value,
+	// retained for back-compat (e.g. "::/0" for NAT64). Prefer
+	// SourceAddresses for the full bracket/repeated list — SourceAddress
+	// drops every entry after the first (#3435 M02).
+	SourceAddress string
+	// SourceAddresses is the full `match source-address` list (#3435). Junos
+	// static NAT `match source-address <prefix>` restricts which client
+	// source IPs the 1:1/DNAT translation applies to. Before #3435 the value
+	// was stored as a single scalar (dropping list tail, M02) AND never
+	// carried into the dataplane snapshot (the rule installed as an
+	// all-source mapping, a fail-open exposure, H01). The first element is
+	// mirrored into SourceAddress for back-compat. Empty = match any source.
+	SourceAddresses []string
+	Then            string // static-nat prefix (internal/private IP), or "inet" for NAT64
+	IsNPTv6         bool   // true if this is an nptv6-prefix rule (RFC 6296)
 	// MatchDestinationPort is the external (pre-translation) destination
 	// port the inbound packet must carry for this rule to apply (Junos
 	// `match destination-port`). 0 = match any port (whole-address 1:1,
@@ -628,6 +648,17 @@ type AddressSet struct {
 type ApplicationsConfig struct {
 	Applications    map[string]*Application
 	ApplicationSets map[string]*ApplicationSet
+	// MixedDirectTermApps records the names of user-defined applications that
+	// carried BOTH a direct match body (protocol / destination-port /
+	// source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg)
+	// AND one or more `term` sub-blocks. Junos requires a custom application to
+	// be EITHER scalar/direct OR term-based, never both. compileApplications
+	// stores only the synthesized term applications for a term-bearing app, so
+	// the direct body was SILENTLY DROPPED (a fail-open under-match for a deny
+	// application). The offending parent names are recorded here and the deferred
+	// gate (validateApplicationStructureStrict) hard-rejects them on the strict
+	// commit path / warns on the tolerant load / peer-sync path (#3366).
+	MixedDirectTermApps []string
 }
 
 // ApplicationSet groups multiple applications or nested application-sets.
@@ -688,6 +719,22 @@ type Application struct {
 	// on the strict commit path / warns on the tolerant load / peer-sync path
 	// (#3352).
 	UnknownTermLeaves []string
+	// DuplicateTermLeaves records the names of single-valued (scalar) leaves
+	// (destination-port / source-port / inactivity-timeout / timeout / alg) that
+	// appeared MORE THAN ONCE with a CONFLICTING (different) value inside one
+	// inline `application <a> term <t>`. The inline term is opaque to the
+	// SchemaValidate walk, so a repeated scalar leaf — via apply-groups, flat-set
+	// ordering, or hand authoring — was last-writer-wins: parseApplicationTerms
+	// overwrote the earlier value with no validation, silently narrowing (or
+	// widening) the term to the final token by parse order. An idempotent repeat
+	// (the same value again, e.g. the `timeout` / `inactivity-timeout` aliases
+	// both set to the same number) is harmless and is NOT recorded. `protocol` is
+	// NOT tracked here — a repeated `protocol` is the documented
+	// multi-protocol-term syntax. Mirroring UnknownTermLeaves, the offending leaf
+	// name is recorded and the deferred gate (validateApplicationStructureStrict)
+	// hard-rejects the first one on the strict commit path / warns on the tolerant
+	// load / peer-sync path (#3366).
+	DuplicateTermLeaves []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.
