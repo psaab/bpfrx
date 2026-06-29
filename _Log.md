@@ -1,3 +1,25 @@
+## 2026-06-29 — #3348 (PR #3506 review fold) inline-term edge cases
+
+- **Timestamp**: 2026-06-29
+- **Action**: Codex MERGE-NEEDS-MAJOR on PR #3506 — top-level junos-ping
+  fix correct, two inline-term edge cases folded. (1) Widening inversion:
+  a term listing BOTH junos-ping AND an all-ICMP alias normalizes both to
+  "icmp" and dedups to one term; applying echoByProto narrowed the union
+  to echo-only. Added unconstrainedICMP[proto] tracking — an all-ICMP
+  alias (icmp/icmpv6/junos-icmp-all/junos-icmp6-all) on a normalized proto
+  suppresses the echo default for that proto. (2) Fail-open: a malformed
+  inline-term icmp-type (e.g. 999) was silently dropped (term opaque to
+  schema) → unconstrained all-ICMP. Added Application.UnknownICMP
+  (mirroring UnknownTimeouts), recorded in both inline-term and top-level
+  parse, rejected by validateApplicationSpecsStrict at commit /
+  downgraded to warning on the lenient load/peer-sync path. RED-on-revert
+  tests added for both. go test config/appid/policymatch green; gofmt +
+  vet clean. Rebased on origin/master (clean, no #3332 overlap).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/types_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/config/README.md, docs/config-schema.md
+
 ## 2026-06-29 — #3348 custom protocol junos-ping echo constraint + icmp-type/icmp-code grammar
 
 - **Timestamp**: 2026-06-29

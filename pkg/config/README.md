@@ -821,6 +821,13 @@ non-ICMP protocol (a never-match term, the same #3373 hazard as a port on a
 non-port protocol) and an `icmp-code` without an `icmp-type` (an ambiguous
 half-constraint); both downgrade to a warning on the tolerant load/peer-sync
 path. `protocolIsICMPFamily` mirrors the ICMP arm of `filterProtocolResolvable`.
+Two inline-`term` edge cases (the term is opaque to `SchemaValidate`): a term
+listing BOTH a junos-ping alias AND an unconstrained ICMP alias dedups onto one
+`icmp` term whose union is all-ICMP, so `unconstrainedICMP[proto]` suppresses the
+echo narrowing (a widening INVERSION otherwise); and a malformed inline
+`icmp-type`/`icmp-code` is recorded on `Application.UnknownICMP` (not silently
+dropped, which would leave the term matching all ICMP) for the same strict-reject
+/ lenient-warn gate.
 
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map

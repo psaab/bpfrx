@@ -2290,6 +2290,26 @@ alias to ICMP and carried `app.ICMPType`, which was `nil` for the custom-app pat
   a `cfg.Warnings` entry on the tolerant load / HA peer-sync path
   (`lenientApplicationSpecs`, #1960 no-brick).
 
+Two inline-`term` edge cases (the term shape is opaque to `SchemaValidate`, so
+both are handled in `parseApplicationTerms` + the deferred strict gate):
+
+- **widening inversion** — a term that lists BOTH a junos-ping alias AND an
+  unconstrained ICMP alias (`term t { protocol junos-ping; protocol
+  junos-icmp-all; }`) normalizes both to `icmp` and DEDUPS to one term. The
+  union of echo + all-ICMP is all-ICMP (the Rust matcher ORs separate app
+  terms), so applying the echo type to the collapsed term would spuriously
+  NARROW it. `unconstrainedICMP[proto]` records that an all-ICMP alias landed on
+  the normalized protocol and SUPPRESSES the `echoByProto` default for it — the
+  collapsed term stays unconstrained.
+- **fail-open malformed inline icmp-type/code** — a bad inline `icmp-type`
+  (`term t { protocol icmp; icmp-type 999; }`) is NOT seen by the schema range
+  check (opaque term), so silently dropping it would leave the term matching
+  every ICMP type. `parseApplicationTerms` records the raw token on
+  `Application.UnknownICMP` (mirroring `UnknownTimeouts`) and the strict gate
+  rejects the first one at commit (lenient-warn on load/peer-sync). The
+  top-level path also records `UnknownICMP` so the malformed value is caught on
+  the tolerant load path (which does not run `SchemaValidate`).
+
 No wire/Rust change: the snapshot already carries `ICMPType`/`ICMPCode` and the
 matcher already enforces `icmp_constraints` (#3020). Regression coverage:
 `pkg/config/compiler_application_junos_ping_3348_test.go` (alias echo type top-level

@@ -156,6 +156,79 @@ func TestApplicationICMPCodeWithoutType_Rejected(t *testing.T) {
 	}
 }
 
+// #3348 inline-term edge case 1 (widening INVERSION): an inline term that
+// lists BOTH a junos-ping alias AND an unconstrained ICMP alias normalizes both
+// to "icmp" and dedups to ONE term. The union of "echo" and "all-ICMP" is
+// all-ICMP (the Rust matcher ORs separate app terms), so the collapsed term
+// must stay UNCONSTRAINED — the junos-ping echo type must NOT spuriously narrow
+// it. Fail-on-revert: without the unconstrainedICMP suppression the term gets
+// ICMPType=8 and this assertion goes RED.
+func TestApplicationJunosPing_InlineTerm_MixedAllICMP_StaysUnconstrained(t *testing.T) {
+	cases := []struct {
+		name string
+		term string
+	}{
+		{"ping-then-all", "term t protocol junos-ping protocol junos-icmp-all"},
+		{"all-then-ping", "term t protocol junos-icmp-all protocol junos-ping"},
+		{"ping-then-bare-icmp", "term t protocol junos-ping protocol icmp"},
+		{"pingv6-then-all6", "term t protocol junos-pingv6 protocol junos-icmp6-all"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tree := flatTreeFromSets(t, refApp("mixed", c.term)...)
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("expected commit to accept %q: %v", c.term, err)
+			}
+			app := cfg.Applications.Applications["mixed-t"]
+			if app == nil {
+				t.Fatalf("inline-term application mixed-t missing; have %v", appNames(cfg))
+			}
+			if app.ICMPType != nil {
+				t.Fatalf("a term mixing junos-ping with an all-ICMP alias must stay UNCONSTRAINED (ICMPType nil — union is all-ICMP), got type %d", *app.ICMPType)
+			}
+		})
+	}
+}
+
+// #3348 inline-term edge case 2 (fail-open): a malformed inline-term icmp-type
+// must NOT be silently dropped (which would leave the term matching ALL ICMP).
+// The schema does not validate inside an opaque `term`, so the compiler records
+// it on UnknownICMP and the strict gate rejects it at commit. Fail-on-revert:
+// without the badICMP recording the value is dropped, the term compiles
+// unconstrained, CompileConfig succeeds, and this assertion goes RED.
+func TestApplicationICMPType_InlineTerm_Malformed_Rejected(t *testing.T) {
+	cases := []string{
+		"term t protocol icmp icmp-type 999",
+		"term t protocol icmp icmp-type notanumber",
+		"term t protocol icmp icmp-type 8 icmp-code 300",
+	}
+	for _, term := range cases {
+		t.Run(term, func(t *testing.T) {
+			tree := flatTreeFromSets(t, refApp("badterm", term)...)
+			if _, err := CompileConfig(tree); err == nil {
+				t.Fatalf("expected commit to REJECT malformed inline icmp-type/code %q", term)
+			} else if !strings.Contains(err.Error(), "icmp-type/icmp-code") {
+				t.Fatalf("error should mention icmp-type/icmp-code, got: %v", err)
+			}
+		})
+	}
+}
+
+// A WELL-FORMED inline-term icmp-type still wires through (guards the above
+// against over-rejection).
+func TestApplicationICMPType_InlineTerm_Valid(t *testing.T) {
+	tree := flatTreeFromSets(t, refApp("okterm", "term t protocol icmp icmp-type 8")...)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("expected commit to accept inline icmp-type 8: %v", err)
+	}
+	app := cfg.Applications.Applications["okterm-t"]
+	if app == nil || app.ICMPType == nil || *app.ICMPType != 8 {
+		t.Fatalf("inline term icmp-type 8 must set ICMPType=8, got %+v", app)
+	}
+}
+
 func appNames(cfg *Config) []string {
 	var n []string
 	for name := range cfg.Applications.Applications {

@@ -69,16 +69,26 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				}
 			case "icmp-type":
 				// #3348: explicit ICMP/ICMPv6 message-type constraint for a
-				// custom application. The schema validates the 0..255 range on
-				// the strict commit path (schema_security.go ValidateInteger),
-				// so a malformed token has already been rejected before compile;
-				// drop a stray unparsable value here rather than widening.
-				if t, ok := parseICMPTypeCode(nodeVal(prop)); ok {
-					app.ICMPType = t
+				// custom application. The schema range-validates 0..255 on the
+				// strict commit path (schema_security.go ValidateInteger). The
+				// tolerant load / peer-sync path does NOT run SchemaValidate, so
+				// record a malformed value (mirroring UnknownTimeouts) rather than
+				// silently dropping it — a dropped value would leave an ICMP app
+				// UNCONSTRAINED (matches all types), a fail-open widening.
+				if v := nodeVal(prop); v != "" {
+					if t, ok := parseICMPTypeCode(v); ok {
+						app.ICMPType = t
+					} else {
+						app.UnknownICMP = append(app.UnknownICMP, v)
+					}
 				}
 			case "icmp-code":
-				if c, ok := parseICMPTypeCode(nodeVal(prop)); ok {
-					app.ICMPCode = c
+				if v := nodeVal(prop); v != "" {
+					if c, ok := parseICMPTypeCode(v); ok {
+						app.ICMPCode = c
+					} else {
+						app.UnknownICMP = append(app.UnknownICMP, v)
+					}
 				}
 			case "alg":
 				app.ALG = nodeVal(prop)
@@ -171,12 +181,22 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	var timeout int
 	var badTimeouts []string
 	var icmpType, icmpCode *uint8
+	var badICMP []string
 	// #3348: per normalized-protocol echo-type implied by a junos-ping /
 	// junos-pingv6 alias inside an inline term. normalizeProtocol folds the
 	// alias to "icmp"/"icmpv6" and loses the ping distinction, so capture the
 	// echo type keyed by the normalized protocol before that information is
 	// gone.
 	echoByProto := map[string]*uint8{}
+	// #3348: a normalized protocol for which the SAME term also lists an
+	// unconstrained ICMP alias (icmp / icmpv6 / junos-icmp-all / junos-icmp6-all)
+	// that dedups onto it. Two app terms — one ping, one all-icmp — union to
+	// all-ICMP in the Rust matcher (policy.rs: separate terms OR together), but
+	// because both normalize to "icmp" here they collapse to ONE term. Applying
+	// the junos-ping echo type to that collapsed term would spuriously NARROW the
+	// union to echo-only (a widening INVERSION). Record the poisoning alias so the
+	// echo default is suppressed for that protocol.
+	unconstrainedICMP := map[string]bool{}
 
 	for i := 1; i < len(keys); i++ {
 		switch keys[i] {
@@ -187,6 +207,12 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 				protocols = append(protocols, norm)
 				if t := aliasEchoICMPType(keys[i]); t != nil {
 					echoByProto[norm] = t
+				} else if norm == "icmp" || norm == "icmpv6" {
+					// An unconstrained ICMP alias (icmp / junos-icmp-all / ...)
+					// for this normalized protocol — widens to all types, so the
+					// junos-ping echo narrowing must NOT apply when both land on
+					// the same collapsed term.
+					unconstrainedICMP[norm] = true
 				}
 			}
 		case "icmp-type":
@@ -194,6 +220,12 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 				i++
 				if t, ok := parseICMPTypeCode(keys[i]); ok {
 					icmpType = t
+				} else {
+					// #3348: a malformed inline-term icmp-type. The schema does
+					// NOT validate inside an opaque `term`, so silently dropping
+					// it would leave the term UNCONSTRAINED (matches all ICMP) —
+					// a fail-open widening. Record it for the strict gate.
+					badICMP = append(badICMP, keys[i])
 				}
 			}
 		case "icmp-code":
@@ -201,6 +233,8 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 				i++
 				if c, ok := parseICMPTypeCode(keys[i]); ok {
 					icmpCode = c
+				} else {
+					badICMP = append(badICMP, keys[i])
 				}
 			}
 		case "destination-port":
@@ -258,9 +292,11 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 		}
 		// An explicit inline-term `icmp-type` wins; otherwise fall back to the
 		// echo type implied by a junos-ping / junos-pingv6 protocol alias on
-		// this protocol (#3348).
+		// this protocol (#3348) — UNLESS the same term also lists an
+		// unconstrained ICMP alias that dedups onto this protocol, in which case
+		// the union is all-ICMP and the echo narrowing must be suppressed.
 		it := icmpType
-		if it == nil {
+		if it == nil && !unconstrainedICMP[proto] {
 			it = echoByProto[proto]
 		}
 		result = append(result, &Application{
@@ -273,6 +309,7 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			UnknownTimeouts:   badTimeouts,
 			ICMPType:          it,
 			ICMPCode:          icmpCode,
+			UnknownICMP:       badICMP,
 		})
 	}
 	return result
