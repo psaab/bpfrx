@@ -716,11 +716,34 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				}
 			}
 
-			// If no application terms resolved, use explicit match values. DNAT
-			// `match` grammar has no source-port or ICMP type/code, so those axes
-			// stay unconstrained on the explicit-match fallback term.
+			// If no application terms resolved, the behavior depends on WHETHER
+			// an application was configured:
+			//
+			//   - #3434: an application WAS configured (rule.Match.Application !=
+			//     "") but resolved to ZERO terms — a typo / dangling reference or
+			//     a defined-but-EMPTY application-set. Falling through to the
+			//     explicit-match fallback would emit proto="" + dstPort=0 = a
+			//     wildcard match-ALL term and publish the pool VIP for EVERY
+			//     flow to the destination (the H07/H08 fail-open, the DNAT analog
+			//     of the source-NAT buildSourceNATAppTerms natProtoNever guard).
+			//     Emit a never-match term instead, reusing the #3437 source-port
+			//     never-match sentinel (an impossible Low>High range): the entry
+			//     installs but can never satisfy l4_extra_matches, so the rule
+			//     matches NOTHING. The commit-time strict gate
+			//     (validateNATMatchApplicationsStrict, #3434) rejects the
+			//     typo/empty-set so this is only the lenient load / peer-sync
+			//     backstop.
+			//
+			//   - No application configured: use the explicit match grammar
+			//     (protocol + destination-port). DNAT `match` grammar has no
+			//     source-port or ICMP type/code, so those axes stay unconstrained
+			//     on the explicit-match fallback term.
 			if len(appTerms) == 0 {
-				appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+				if rule.Match.Application != "" {
+					appTerms = []appTerm{{srcPorts: []NatPortRangeWire{natNeverMatchPortRange}}}
+				} else {
+					appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+				}
 			}
 
 			for _, term := range appTerms {

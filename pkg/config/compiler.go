@@ -645,6 +645,23 @@ type compileOpts struct {
 	// so a leniently-loaded bad config is no worse off, now flagged. Same
 	// doctrine as lenientApplicationSetMembers.
 	lenientPolicyMatchApplications bool
+	// lenientNATMatchApplications (#3434, Codex audit 095 H07/H08) downgrades
+	// the source/destination-NAT match-application definedness gate
+	// (validateNATMatchApplicationsStrict) from a hard compile error to a
+	// cfg.Warnings entry. A NAT `match application <name>` token resolving to
+	// no predefined junos-* application, no user-defined application, and no
+	// non-empty application-set was previously unvalidated — yet the DNAT
+	// snapshot builder then fell through to a wildcard match-all term
+	// (protocol="" + destination-port 0) and published the pool VIP for EVERY
+	// flow to the destination (a fail-open wildcard translation; the NAT
+	// sibling of #3144/#3146). The strict commit / commit-check path
+	// hard-rejects so the typo is operator-visible; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config that
+	// an older binary accepted still BOOTS (#1960) — the dataplane now
+	// independently fails such a rule closed (never-match term), so a
+	// leniently-loaded bad config is no worse off, now flagged. Same doctrine
+	// as lenientPolicyMatchApplications.
+	lenientNATMatchApplications bool
 	// lenientPolicyMatchAddressSetMembers (#3149, folds #3147) downgrades the
 	// policy match address-set member / empty-set gate
 	// (validatePolicyMatchAddressSetMembersStrict) from a hard compile error to
@@ -1253,6 +1270,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientSamplingInstanceConflicts:     true,
 		lenientApplicationSetMembers:         true,
 		lenientPolicyMatchApplications:       true,
+		lenientNATMatchApplications:          true,
 		lenientPolicyMatchAddressSetMembers:  true,
 		lenientRibGroupRefs:                  true,
 		lenientDHCPStaticBindings:            true,
@@ -1400,6 +1418,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientSamplingInstanceConflicts:     true,
 		lenientApplicationSetMembers:         true,
 		lenientPolicyMatchApplications:       true,
+		lenientNATMatchApplications:          true,
 		lenientPolicyMatchAddressSetMembers:  true,
 		lenientRibGroupRefs:                  true,
 		lenientDHCPStaticBindings:            true,
@@ -3090,6 +3109,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyMatchApplications {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy match application (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3434 (Codex audit 095 H07/H08): source/destination-NAT match-application
+	// definedness gate, the NAT analog of validatePolicyMatchApplicationsStrict
+	// (#3144/#3146). A NAT `match application <name>` resolving to no
+	// predefined/user application and no non-empty application-set previously
+	// committed cleanly — yet the DNAT snapshot builder then fell through to a
+	// wildcard match-all term and published the pool VIP for every flow to the
+	// destination (fail-open). Strict on commit / commit-check (hard reject
+	// naming the NAT kind, rule-set, rule, and the undefined app); lenient on
+	// load / peer-sync (warn — #1960; the dataplane now fails such a rule closed
+	// via a never-match term, so a leniently-loaded bad config is no worse off,
+	// now flagged). Resolves via ResolveApplication / ResolveApplicationSet —
+	// the EXACT name set the SNAT/DNAT snapshot builders use — so commit and
+	// runtime cannot diverge. Covers source and destination NAT rule-sets
+	// (static NAT carries no application match).
+	if err := validateNATMatchApplicationsStrict(cfg); err != nil {
+		if opts.lenientNATMatchApplications {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("NAT match application (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
