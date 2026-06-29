@@ -219,24 +219,30 @@ func (s *Store) LoadMerge(content string) error {
 	lines := strings.Split(content, "\n")
 	isSetFormat := false
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "set ") ||
-			strings.HasPrefix(trimmed, "delete ") ||
-			strings.HasPrefix(trimmed, "deactivate ") ||
-			strings.HasPrefix(trimmed, "activate ") {
+		if hasFlatVerb(strings.TrimSpace(line)) {
 			isSetFormat = true
 			break
 		}
 	}
 
 	if isSetFormat {
-		for _, line := range lines {
+		// #3442 M3: once flat set-format is selected, every non-comment line
+		// MUST start with a recognized verb. Otherwise ParseSetVerb treats a
+		// typo/free-text line (e.g. "not-a-set-line") as a bare `set` path and
+		// materializes a junk top-level node. Fail loudly on the bad line
+		// instead — the bare-path default in ParseSetVerb is reserved for
+		// internal callers that prepend the verb themselves (SetEdit, Deactivate,
+		// Activate, ...).
+		for i, line := range lines {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 				continue
 			}
+			if !hasFlatVerb(trimmed) {
+				return fmt.Errorf("line %d: %q is not a set/delete/deactivate/activate command", i+1, trimmed)
+			}
 			if err := applyEditLine(s.candidate, trimmed); err != nil {
-				return fmt.Errorf("line %q: %w", trimmed, err)
+				return fmt.Errorf("line %d: %q: %w", i+1, trimmed, err)
 			}
 		}
 	} else {
@@ -273,6 +279,42 @@ func (s *Store) LoadMerge(content string) error {
 // `show | display set` output — which emits `deactivate <path>` for inactive
 // nodes — round-trips back to an inactive node instead of being skipped (and
 // reloaded active) or parsed as a junk path literally starting "deactivate".
+// hasFlatVerb reports whether a line begins with one of the flat config-edit
+// verbs that applyEditLine can actually replay (set/delete/deactivate/
+// activate) followed by at least one path token. It is the fail-closed gate
+// for the service-mode load paths (LoadMerge flat branch + LoadSet): a line
+// that does not start with one of those verbs is malformed input, NOT a bare
+// path.
+//
+// The verb set is deliberately EXACTLY the set applyEditLine -> ParseSetVerb
+// dispatches. The interactive structural-edit verbs annotate/copy/insert/
+// rename (pkg/cli/cli_dispatch.go, pkg/cmdtree ConfigTopLevel) are NOT
+// recognized here on purpose: they have distinct multi-clause grammar
+// (`copy X to Y`, `insert X before Y`, `annotate X "comment"`), are handled
+// only by the interactive CLI, and never appear in a flat-load artifact —
+// `show | display set` (ConfigTree.FormatSet) emits only `set`/`deactivate`
+// lines. Pre-#3442 such a line was silently turned into a junk `set
+// annotate ...` node by the bare-path default, so rejecting it is correct,
+// not a regression of any previously-working load.
+//
+// The first token is matched against the verb set after splitting on any
+// whitespace, so a tab between the verb and the path (the lexer treats tabs
+// as whitespace) is tolerated as well as a space.
+func hasFlatVerb(line string) bool {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		// A blank line or a bare verb with no path is not a replayable
+		// flat command.
+		return false
+	}
+	switch fields[0] {
+	case "set", "delete", "deactivate", "activate":
+		return true
+	default:
+		return false
+	}
+}
+
 func applyEditLine(tree *config.ConfigTree, line string) error {
 	verb, path, err := config.ParseSetVerb(line)
 	if err != nil {
@@ -292,10 +334,13 @@ func applyEditLine(tree *config.ConfigTree, line string) error {
 
 // LoadSet applies multiple flat command lines to the candidate config.
 // Each line starting with a recognized verb — set, delete, deactivate, or
-// activate (#2008 H1) — is parsed and applied; other lines (e.g. comments)
-// are skipped. The deactivate/activate verbs make `show | display set`
-// output round-trippable: previously a `deactivate <path>` line was skipped
-// here, so an inactive node reloaded ACTIVE.
+// activate (#2008 H1) — is parsed and applied. Blank lines and `#` comments
+// are skipped; any other non-empty line is rejected with a line-numbered
+// error (#3442 M4 — silently skipping a malformed line, e.g. "sett system
+// host-name fw", let an operator commit a config missing the intended
+// command). The deactivate/activate verbs make `show | display set` output
+// round-trippable: previously a `deactivate <path>` line was skipped here,
+// so an inactive node reloaded ACTIVE.
 func (s *Store) LoadSet(content string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -303,19 +348,21 @@ func (s *Store) LoadSet(content string) (int, error) {
 		return 0, fmt.Errorf("not in configuration mode")
 	}
 	count := 0
-	for _, line := range strings.Split(content, "\n") {
+	for i, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if !strings.HasPrefix(line, "set ") &&
-			!strings.HasPrefix(line, "delete ") &&
-			!strings.HasPrefix(line, "deactivate ") &&
-			!strings.HasPrefix(line, "activate ") {
-			continue
+		// #3442 M4: a non-blank, non-comment line that is not a recognized
+		// verb is malformed input (e.g. "sett system host-name fw"). Previously
+		// LoadSet silently `continue`d on it, so REST/gRPC/CLI returned OK while
+		// dropping the intended command — the operator could commit a config
+		// missing it. Fail with a line-numbered error instead.
+		if !hasFlatVerb(line) {
+			return count, fmt.Errorf("line %d: %q is not a set/delete/deactivate/activate command", i+1, line)
 		}
 		if err := applyEditLine(s.candidate, line); err != nil {
-			return count, fmt.Errorf("line %q: %w", line, err)
+			return count, fmt.Errorf("line %d: %q: %w", i+1, line, err)
 		}
 		count++
 	}

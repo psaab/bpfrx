@@ -112,6 +112,52 @@ func TestCLIShowPoliciesHitCountHonorsPolicyStats(t *testing.T) {
 	}
 }
 
+// Test_3363_CLIShowPoliciesHitCountDefaultPolicyRow verifies the IMPLICIT
+// default-policy catch-all is rendered as its own hit-count row, with its hit
+// count read through the reserved DefaultPolicySentinelID handle, separated
+// from the configured-rule rows. Before #3363 there was no row and the default
+// verdict was uncounted.
+func Test_3363_CLIShowPoliciesHitCountDefaultPolicyRow(t *testing.T) {
+	store := newPolicyHitCountCLIStore(t, true)
+	cfg := store.ActiveConfig()
+	c := &CLI{
+		store: store,
+		dp: &policyCounterCLIDP{
+			Manager: dataplane.New(),
+			counters: map[uint32]dataplane.CounterValue{
+				0:                                 {Packets: 42, Bytes: 4242},
+				dataplane.DefaultPolicySentinelID: {Packets: 99, Bytes: 9900},
+			},
+		},
+	}
+
+	var callErr error
+	out := captureStdout(t, func() {
+		callErr = c.showPoliciesHitCount(cfg, "", "")
+	})
+	if callErr != nil {
+		t.Fatalf("showPoliciesHitCount() error = %v", callErr)
+	}
+
+	var row string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, dataplane.DefaultPolicyName) {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("default-policy row not found in output:\n%s", out)
+	}
+	if !strings.Contains(row, "99") {
+		t.Fatalf("default-policy row missing live count 99 (read via sentinel):\n%s", row)
+	}
+	// The default config is deny-all (fail-closed), so the action column reads Deny.
+	if !strings.Contains(row, "Deny") {
+		t.Fatalf("default-policy row missing Deny action:\n%s", row)
+	}
+}
+
 // TestCLIShowPoliciesBriefHonorsPolicyStats covers the `show security
 // policies brief` "Hits" column gate (#2118 — the brief view is a
 // separate display surface from the hit-count table).

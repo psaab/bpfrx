@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 // Test_3362_NftScopesPerInterfaceOverride is the kernel-nftables PRIMARY-path
@@ -39,12 +40,13 @@ func Test_3362_NftScopesPerInterfaceOverride(t *testing.T) {
 
 	payload := buildHostInboundFilterPayload(buildAndCheckViews(t, cfg))
 
+	corpDropV4 := "counter name \"" + xnft.HostInboundDenyCounterName("corp", "ip") + "\" drop"
 	mustContain := []string{
-		// uplink: ssh admitted + catch-all drop.
+		// uplink: ssh admitted + catch-all (counted) drop.
 		"ip daddr 172.16.50.8 tcp dport 22 accept",
-		"ip daddr 172.16.50.8 drop",
-		// non-overridden interface: catch-all drop (deny-all).
-		"ip daddr 10.0.61.1 drop",
+		"ip daddr 172.16.50.8 " + corpDropV4,
+		// non-overridden interface: catch-all (counted) drop (deny-all).
+		"ip daddr 10.0.61.1 " + corpDropV4,
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(payload, want) {
@@ -54,5 +56,61 @@ func Test_3362_NftScopesPerInterfaceOverride(t *testing.T) {
 	// The non-overridden interface must NOT admit ssh.
 	if strings.Contains(payload, "ip daddr 10.0.61.1 tcp dport 22 accept") {
 		t.Errorf("non-overridden interface 10.0.61.1 must NOT accept ssh:\n%s", payload)
+	}
+}
+
+// Test_3362_NftDeclaresEachCounterOnce guards the integration bug exposed by
+// merging #3362 onto master's #3361 host-inbound kernel-deny counters: a zone
+// with a per-interface override yields MULTIPLE views sharing the same v.Zone
+// (the override view + the zone-default view), each emitting a catch-all DROP
+// that references the same "<zone>_<fam>" named counter. The counter is keyed
+// only on (zone, family), so buildHostInboundFilterPayload must DECLARE the
+// `counter "<name>" {}` object EXACTLY ONCE — nft rejects a table body that
+// declares the same named counter twice ("File exists"), which would silently
+// break host-inbound apply for exactly the zones this feature targets.
+//
+// Before the dedup fix the pre-pass appended the name once per view, so the
+// declaration count for the multi-view zone was 2 (RED). After the fix it is 1.
+func Test_3362_NftDeclaresEachCounterOnce(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			50: {Number: 50, VlanID: 50, Addresses: []string{"172.16.50.8/24", "2001:db8:50::8/64"}},
+		}},
+		"reth1": {Name: "reth1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.0.61.1/24", "2001:db8:61::1/64"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"corp": {
+			Name:       "corp",
+			Interfaces: []string{"reth0.50", "reth1.0"},
+			InterfaceHostInbound: map[string]*config.HostInboundTraffic{
+				"reth0.50": {SystemServices: []string{"ssh"}},
+			},
+		},
+	}
+
+	views := buildAndCheckViews(t, cfg)
+	// Sanity: the override must actually produce more than one view sharing the
+	// zone, otherwise this test would not exercise the dup-declaration path.
+	corpViews := 0
+	for _, v := range views {
+		if v.Zone == "corp" {
+			corpViews++
+		}
+	}
+	if corpViews < 2 {
+		t.Fatalf("expected >=2 views for zone corp (override + default), got %d", corpViews)
+	}
+
+	payload := buildHostInboundFilterPayload(views)
+
+	// Each named DROP counter for the zone must be DECLARED exactly once.
+	for _, fam := range []string{"ip", "ip6"} {
+		decl := "  counter \"" + xnft.HostInboundDenyCounterName("corp", fam) + "\" {"
+		if n := strings.Count(payload, decl); n != 1 {
+			t.Errorf("counter declaration for (corp,%s) appears %d times, want exactly 1 (nft rejects a duplicate declaration):\n---\n%s", fam, n, payload)
+		}
 	}
 }

@@ -18,18 +18,19 @@ type xpfCollector struct {
 	mu  sync.Mutex
 
 	// Global counters
-	packetsTotal         *prometheus.Desc
-	dropsTotal           *prometheus.Desc
-	sessionsCreatedTotal *prometheus.Desc
-	sessionsClosedTotal  *prometheus.Desc
-	screenDropsTotal     *prometheus.Desc
-	policyDeniesTotal    *prometheus.Desc
-	natAllocFailsTotal   *prometheus.Desc
-	nat64XlateTotal      *prometheus.Desc
-	hostInboundDeny      *prometheus.Desc
-	tcEgressPacketsTotal *prometheus.Desc
-	syncookieTotal       *prometheus.Desc
-	flowCacheTotal       *prometheus.Desc
+	packetsTotal            *prometheus.Desc
+	dropsTotal              *prometheus.Desc
+	sessionsCreatedTotal    *prometheus.Desc
+	sessionsClosedTotal     *prometheus.Desc
+	screenDropsTotal        *prometheus.Desc
+	policyDeniesTotal       *prometheus.Desc
+	natAllocFailsTotal      *prometheus.Desc
+	nat64XlateTotal         *prometheus.Desc
+	hostInboundDeny         *prometheus.Desc
+	hostInboundKernelDenies *prometheus.Desc
+	tcEgressPacketsTotal    *prometheus.Desc
+	syncookieTotal          *prometheus.Desc
+	flowCacheTotal          *prometheus.Desc
 
 	// #3345: monotonic count of global-counter map reads that failed during
 	// a scrape. A failed read SKIPS emitting that counter's sample (so a
@@ -484,6 +485,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.natAllocFailsTotal
 	ch <- c.nat64XlateTotal
 	ch <- c.hostInboundDeny
+	ch <- c.hostInboundKernelDenies
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
@@ -805,6 +807,17 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// BEFORE the dataplane gate. A collector that has gone unreachable must
 	// stay visible even when the dataplane is not loaded.
 	c.collectFlowExportMetrics(ch)
+
+	// #3361: kernel nftables host-inbound DROP counters, per zone/family. The
+	// `inet xpf_hostinbound` chain is installed by the daemon INDEPENDENT of
+	// dataplane load state (applyConfig runs it even in a config-only / degraded
+	// boot), and it actively DROPS host-bound control-plane traffic. So this is a
+	// control-plane signal — emit it BEFORE the dataplane gate so the kernel-deny
+	// series stays visible exactly in the degraded boot where the dataplane is
+	// unloaded but the deny chain is still dropping (the blind spot this metric
+	// exists to close). ReadHostInboundDenyCounters reads nft via netlink and has
+	// no dataplane dependency.
+	c.collectHostInboundKernelDenies(ch)
 
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {

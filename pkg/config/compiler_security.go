@@ -61,6 +61,65 @@ const (
 	defaultIPSweepThreshold  = 10
 )
 
+// synFloodSrcAttackRatioAdvisoryThreshold is the attack-threshold /
+// source-threshold ratio above which the dataplane's per-source count-min
+// sketch (SRC_COLS columns, #3315) can begin to false-throttle legitimate
+// sources under a sub-aggregate spoofed spread. It mirrors the Rust SRC_COLS
+// width (2048) rounded down to a round number; setting source-threshold orders
+// of magnitude below attack-threshold is the only regime where per-source
+// over-count becomes plausible, and even then the cookie-active gate confines
+// it. We advise (never reject) so the config still commits.
+const synFloodSrcAttackRatioAdvisoryThreshold = 1000
+
+// validateScreenSynFloodSubThresholds emits WARNINGS (never a hard reject) for
+// SYN-flood sub-threshold leaves whose enforcement is incomplete or risky
+// (#3315):
+//
+//   - `timeout` parses into SynFloodConfig.Timeout and commits cleanly but is
+//     NOT yet enforced — it maps to the per-zone half-open session window
+//     (tcp_opening_ns), a session-layer surface split to a tracked follow-up.
+//     Without this warning the leaf is silently inert, which is exactly the
+//     configured-but-not-enforced trap #3315 fixes for the other leaves.
+//   - an attack-threshold orders of magnitude above source-threshold is the one
+//     pathological band where the per-source count-min sketch can false-throttle
+//     legitimate sources; advise the operator (per the converged plan §5b).
+//
+// Both fire on BOTH the strict and lenient compile paths: the values are valid
+// and parseable, the dataplane just cannot fully honour them.
+func validateScreenSynFloodSubThresholds(cfg *Config) []string {
+	var warnings []string
+	names := make([]string, 0, len(cfg.Security.Screen))
+	for name := range cfg.Security.Screen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		sp := cfg.Security.Screen[name]
+		if sp == nil || sp.TCP.SynFlood == nil {
+			continue
+		}
+		sf := sp.TCP.SynFlood
+		if sf.Timeout > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"security screen ids-option %s tcp syn-flood timeout %d is accepted "+
+					"but NOT yet enforced by the dataplane (it maps to the per-zone "+
+					"half-open session window, tracked as a follow-up to #3315); the "+
+					"global half-open TCP timeout applies until then",
+				name, sf.Timeout))
+		}
+		if sf.SourceThreshold > 0 && sf.AttackThreshold > 0 &&
+			sf.AttackThreshold/sf.SourceThreshold > synFloodSrcAttackRatioAdvisoryThreshold {
+			warnings = append(warnings, fmt.Sprintf(
+				"security screen ids-option %s tcp syn-flood source-threshold %d is "+
+					"more than %dx below attack-threshold %d; the per-source detector "+
+					"is a count-min sketch and may false-throttle legitimate sources in "+
+					"this regime — consider raising source-threshold",
+				name, sf.SourceThreshold, synFloodSrcAttackRatioAdvisoryThreshold, sf.AttackThreshold))
+		}
+	}
+	return warnings
+}
+
 // validateScreenScanSweepThresholds emits a WARNING (never a hard reject) for
 // any screen profile whose port-scan or ip-sweep threshold exceeds
 // maxScanSweepThreshold. The dataplane clamps the effective threshold to that

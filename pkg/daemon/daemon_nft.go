@@ -11,8 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 // nftApplyPayload runs `nft -f -` with the supplied ruleset payload on stdin.
@@ -210,10 +213,20 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 
 // buildHostInboundFilterPayload assembles the exact `nft -f -` payload for the
 // host-inbound kernel chain. Split out as a pure function so tests can
-// parse-check the full payload without invoking nft. Uses the same atomic
-// create/flush/redefine idiom as buildLo0FilterPayload (a syntax error on any
-// line rejects the WHOLE payload, so the chain fails closed-as-absent rather
-// than half-applied).
+// parse-check the full payload without invoking nft. A syntax error on any line
+// rejects the WHOLE payload (atomic load), so the chain fails closed-as-absent
+// rather than half-applied.
+//
+// Atomic replace idiom: `add table` (create if absent), `delete table` (now
+// always has a target -> removes the old chain AND its stateful objects), then a
+// fresh `table { ... }` body. This replaces the plain create/flush/redefine used
+// by lo0: `flush table` empties rules but does NOT delete named counter objects,
+// so redeclaring the per-zone DROP counters (below) on the next commit would
+// collide ("File exists"). delete+recreate guarantees the named counters are
+// declared exactly once and never leaves a stale counter for a removed zone.
+// (A consequence: the host-inbound deny counters reset to zero on every
+// rebuild — every commit and every DHCP/DHCPv6 address change that re-renders
+// the table. Prometheus rate() handles the reset; documented on the metric.)
 //
 // Layout of `chain input` (type filter hook input priority 0; policy accept):
 //  1. ct state established,related accept   — return/ongoing host traffic.
@@ -232,13 +245,57 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     (and no deny — the operator opened the zone to all services).
 //     - else: one accept per listed service/protocol scoped to the zone addrs
 //     (`protocols all` expands to the routing-protocol set — #3199, NOT a
-//     blanket accept), then a catch-all `<fam> daddr <addrs> drop` (Junos
-//     default-deny to the host is a silent drop).
+//     blanket accept), then a catch-all
+//     `<fam> daddr <addrs> counter name "<n>" drop` (Junos default-deny to the
+//     host is a silent drop). The named counter `<n>` is declared at the top of
+//     the table body and scraped per zone/family into the
+//     xpf_host_inbound_kernel_denies_total metric (#3361) — distinct from the
+//     userspace-dp xpf_host_inbound_denies_total path (#3326).
 func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) string {
+	// Pre-pass: collect the named DROP counters the chain will reference, so they
+	// can be declared at the top of the table body BEFORE the chain. A counter is
+	// emitted exactly when emitHostInboundZone emits a catch-all drop
+	// (hostInboundEmitsDrop) — the two MUST agree on that condition or nft rejects
+	// the load (reference to an undeclared counter / declared-but-unused is fine,
+	// but an undeclared reference is a hard error).
+	//
+	// The counter name is keyed only on (zone, family) — and so is the DROP rule
+	// that references it (emitHostInboundZone). With per-interface host-inbound
+	// overrides (#3362) a single zone can yield MULTIPLE views sharing the same
+	// v.Zone (an override view plus the zone-default view), each emitting its own
+	// catch-all DROP that references the same "<zone>_<fam>" counter. That is the
+	// intended aggregation (one per-zone/family kernel-deny counter the #3361
+	// scraper reads back via ParseHostInboundDenyCounterName), but the declaration
+	// must be emitted EXACTLY ONCE: nft rejects `counter "<name>" {}` declared
+	// twice in the same table body ("File exists"). Dedup the declarations on the
+	// counter NAME so each is declared once no matter how many views share a zone;
+	// the per-view DROP rules below still all reference it.
+	var counters []string
+	seenCounter := map[string]bool{}
+	addCounter := func(name string) {
+		if seenCounter[name] {
+			return
+		}
+		seenCounter[name] = true
+		counters = append(counters, name)
+	}
+	for _, v := range views {
+		if hostInboundEmitsDrop(v, v.V4Addrs) {
+			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip"))
+		}
+		if hostInboundEmitsDrop(v, v.V6Addrs) {
+			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip6"))
+		}
+	}
+
 	var rules []string
-	rules = append(rules, "table inet xpf_hostinbound")
-	rules = append(rules, "flush table inet xpf_hostinbound")
+	rules = append(rules, "add table inet xpf_hostinbound")
+	rules = append(rules, "delete table inet xpf_hostinbound")
 	rules = append(rules, "table inet xpf_hostinbound {")
+	for _, cn := range counters {
+		rules = append(rules, "  counter \""+cn+"\" {")
+		rules = append(rules, "  }")
+	}
 	rules = append(rules, "  chain input {")
 	rules = append(rules, "    type filter hook input priority 0; policy accept;")
 	rules = append(rules, "    ct state established,related accept")
@@ -278,6 +335,16 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 	return strings.Join(rules, "\n") + "\n"
 }
 
+// hostInboundEmitsDrop reports whether emitHostInboundZone will emit a catch-all
+// DROP (and therefore a named DROP counter) for this zone/family. A drop is
+// emitted whenever the family has at least one address AND the zone is not opened
+// to all services (`system-services all`/`any-service`). buildHostInboundFilterPayload
+// uses this to pre-declare the matching counter objects, so the two sites cannot
+// diverge on which (zone, family) pairs get a counter.
+func hostInboundEmitsDrop(v dpuserspace.ZoneHostInboundView, addrs []string) bool {
+	return len(addrs) > 0 && !hostInboundAllowsAll(v)
+}
+
 // emitHostInboundZone appends the accept(+drop) rules for one zone/family to
 // rules. No-op when the zone has no address in this family.
 func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, family string, addrs []string) {
@@ -314,8 +381,12 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 		*rules = append(*rules, "    "+daddr+" "+m+" accept")
 	}
 	// Catch-all deny for anything else destined to this zone's addresses
-	// (Junos default-deny to the host is a silent drop).
-	*rules = append(*rules, "    "+daddr+" drop")
+	// (Junos default-deny to the host is a silent drop). Attach a named counter
+	// (declared at the top of the table body by buildHostInboundFilterPayload) so
+	// the kernel host-inbound drops are scrapeable per zone/family (#3361) — the
+	// drop was previously uncounted and invisible to operators.
+	cn := xnft.HostInboundDenyCounterName(v.Zone, family)
+	*rules = append(*rules, "    "+daddr+" counter name \""+cn+"\" drop")
 }
 
 // hostInboundAllowsAll reports whether the zone's system-services contains
@@ -668,10 +739,35 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 	}
 
 	// Protocol matching (#2545: multi-value — emit an nft set on >1).
-	if len(term.Protocols) == 1 {
-		parts = append(parts, "meta l4proto "+term.Protocols[0])
-	} else if len(term.Protocols) > 1 {
-		parts = append(parts, "meta l4proto { "+strings.Join(term.Protocols, ", ")+" }")
+	//
+	// #3436: resolve every `from protocol` token through the shared
+	// appid.ProtocolNumber SSOT and emit NUMERIC protocol numbers. The commit
+	// gate (filterProtocolResolvable) and the userspace matcher (ip_proto.rs)
+	// accept Junos predefined-protocol aliases — junos-gre, junos-tcp-any,
+	// junos-icmp-all, ipip/junos-ip-in-ip, ... — that nft does NOT understand.
+	// Emitting them raw (`meta l4proto junos-gre`) is an nft parse error that
+	// rejects the WHOLE atomic lo0 table (legitimate commit broken) or, on the
+	// lenient/peer-sync path, mirrors a DIFFERENT protocol than userspace. The
+	// numeric form is unconditionally nft-safe and resolves to the SAME protocol
+	// number the Rust matcher uses. A token outside the SSOT cannot reach a
+	// committed config (the gate rejects it); a leniently-loaded one is dropped
+	// with a warning rather than emitted as unloadable nft (mirroring the
+	// tcp-flags lowering below).
+	if len(term.Protocols) > 0 {
+		protos := make([]string, 0, len(term.Protocols))
+		for _, p := range term.Protocols {
+			if n, ok := appid.ProtocolNumber(p); ok {
+				protos = append(protos, strconv.Itoa(int(n)))
+			} else {
+				slog.Warn("dropping unresolvable protocol from lo0 filter term",
+					"term", term.Name, "protocol", p)
+			}
+		}
+		if len(protos) == 1 {
+			parts = append(parts, "meta l4proto "+protos[0])
+		} else if len(protos) > 1 {
+			parts = append(parts, "meta l4proto { "+strings.Join(protos, ", ")+" }")
+		}
 	}
 
 	// Source port matching
@@ -914,9 +1010,30 @@ func nftIntSet(vals []int) string {
 	return "{ " + strings.Join(strs, ", ") + " }"
 }
 
+// nftDSCPValue converts a firewall-filter DSCP / traffic-class match token to a
+// numeric nft dscp token, resolving code-point NAMES through the
+// dataplane.DSCPValues SSOT (#3436). The pre-fix pass-through was wrong on two
+// counts that nft rejects atomically (failing the whole lo0 load) or that
+// silently stop the kernel mirror matching:
+//
+//   - Case: the commit gate (filterDSCPResolvable) and the userspace matcher
+//     (pkg/dataplane/userspace/filters.go, via strings.ToLower) accept names
+//     case-insensitively, so `from dscp EF` reaches here as "EF" — but nft's
+//     DSCP names are lowercase only, so `ip dscp EF` is a parse error.
+//   - Name coverage: xpf accepts `be` (best-effort) as a code point, but nft
+//     has NO `be` DSCP name at all — `ip dscp be` is unloadable.
+//
+// Resolving to the numeric value yields an unconditionally nft-safe token that
+// matches the SAME code point as userspace (which resolves the identical table).
+// A numeric 0..63 token passes through as-is. An unresolvable token is
+// unreachable for a committed config (filterDSCPResolvable gates it); it is
+// lower-cased as a best-effort fallback rather than emitted with stray case.
 func nftDSCPValue(name string) string {
-	// Junos and nftables use the same naming for standard DSCP values.
-	// Just pass through — nftables accepts ef, af11, af12, af13, af21,
-	// af22, af23, af31, af32, af33, af41, af42, af43, cs0-cs7.
-	return name
+	if val, ok := dataplane.DSCPValues[strings.ToLower(strings.TrimSpace(name))]; ok {
+		return strconv.Itoa(int(val))
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(name)); err == nil && v >= 0 && v <= 63 {
+		return strconv.Itoa(v)
+	}
+	return strings.ToLower(strings.TrimSpace(name))
 }
