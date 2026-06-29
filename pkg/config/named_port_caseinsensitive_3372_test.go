@@ -18,9 +18,12 @@ import (
 // only) to stay in lock-step with each other. If resolveAppPort did not
 // lowercase, a mixed-case alias would pass the case-INSENSITIVE strict commit
 // gate yet reach the case-SENSITIVE userspace gate as a raw name, which rejects
-// it — the commit/apply split #2142/#2124 set out to prevent (one mixed-case
-// alias disarms userspace enforcement for the whole snapshot, a system-level
-// fail-open onto the kernel slow path).
+// it — the commit/apply split #2142/#2124 set out to prevent. The apply failure
+// is the #3261 class-(i) unrepresentable-content path: the snapshot builder
+// emits the __unsupported__ sentinel term and a current preflight-capable helper
+// rejects the whole snapshot while STAYING ARMED (previous-good policy retained;
+// fresh boot = default-deny). So the regression is broken APPLY (the new config
+// silently does not take effect), not a fail-open admit / disarm.
 //
 // RED-on-revert: deleting the strings.ToLower in resolveAppPort makes
 // junosServicePorts["HTTPS"] miss, resolveAppPort returns "HTTPS" verbatim, and

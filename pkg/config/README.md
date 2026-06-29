@@ -802,12 +802,19 @@ literal aliases CASE-SENSITIVELY (lowercase only), while the strict commit gate
 `validatePortSpec` is case-insensitive. Without `resolveAppPort` lowering a
 recognized name to its number first, a mixed-case `destination-port HTTPS` would
 pass commit yet reach the case-sensitive userspace gate as a raw name, which
-rejects it — disarming userspace enforcement for the whole snapshot (a
-commit/apply split, a system-level fail-open onto the kernel slow path). Because
-`resolveAppPort` canonicalizes to the numeric form first, the case-sensitive
-gate never sees a raw alias. The two 15-name backstop tables are pinned
-consistent with `junosServicePorts` by the `TestNamedPortAliasTablesDoNotDrift`
-canary. An unresolvable
+rejects it — a commit/apply split. The apply failure is the #3261 class-(i)
+unrepresentable-content path, NOT a disarm/fail-open: the policy term is
+unrepresentable, `buildOneRuleSnapshot` emits the `__unsupported__` sentinel and
+records `snap.Capabilities.PolicyContentRejected`, and a current
+preflight-capable helper REJECTS the whole snapshot while STAYING ARMED — a
+running node retains its previous-good policy state, a fresh boot lands on
+default-deny (disarm/XDP_PASS-to-kernel is only the narrow
+pre-preflight-protocol-version backstop). So a removed case-fold would break
+APPLY (the new config silently does not take effect), not admit traffic
+fail-open. Because `resolveAppPort` canonicalizes to the numeric form first, the
+case-sensitive gate never sees a raw alias. The two 15-name backstop tables are
+pinned consistent with `junosServicePorts` by the
+`TestNamedPortAliasTablesDoNotDrift` canary. An unresolvable
 name (unknown service, out-of-range/malformed number, inverted/unresolved range)
 is left verbatim so `validatePortSpec` hard-rejects it at the strict commit gate
 and the tolerant load/peer-sync path downgrades it to a warning

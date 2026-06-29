@@ -11,9 +11,11 @@ import (
 // A custom application with a MIXED-CASE named port (`destination-port HTTPS`)
 // referenced by a security policy must lower through the userspace policy
 // snapshot to the numeric port term (443) WITHOUT tripping the #2124 capability
-// gate — i.e. no `__unsupported__` sentinel and no refuse-to-arm. The commit
-// gate accepts the config (Junos service names are case-insensitive); this test
-// pins that apply agrees, closing the commit/apply split the audit reported.
+// gate — i.e. no `__unsupported__` sentinel and no policy-content rejection. The
+// commit gate accepts the config (Junos service names are case-insensitive);
+// this test pins that apply agrees, closing the commit/apply split the audit
+// reported. (Per #3261 the failure mode would be a rejected snapshot at apply —
+// the new config silently not taking effect — not a fail-open admit.)
 //
 // The config is built from flat-set commands and run through CompileConfig so
 // the test exercises the real AST -> typed-struct path (compileApplications ->
@@ -73,7 +75,7 @@ func TestMixedCaseNamedPortNoCommitApplySplit(t *testing.T) {
 			}
 			term := terms[0]
 			if term.Protocol == unsupportedApplicationSentinel {
-				t.Fatalf("mixed-case named port %q emitted the __unsupported__ sentinel — commit/apply split (refuse-to-arm)", tc.spec)
+				t.Fatalf("mixed-case named port %q emitted the __unsupported__ sentinel — commit/apply split (snapshot would be rejected at apply)", tc.spec)
 			}
 			if term.Protocol != "tcp" || term.DestinationPort != tc.port {
 				t.Fatalf("term = {proto:%q dport:%q}, want {tcp %s} for %q", term.Protocol, term.DestinationPort, tc.port, tc.spec)
