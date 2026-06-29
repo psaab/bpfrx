@@ -1127,6 +1127,37 @@ reserved for whole-dataplane selection where a rewrite shim
   (add `to_*` to the snapshot + runtime + a regression that a mismatched
   `to zone` DNAT does not translate). Regression coverage:
   `pkg/config/compiler_nat_dnat_to_3444_test.go`.
+- **#3562 (strict-reject AST walks must iterate EVERY `security` root — the
+  duplicate-block discipline):** `parseStatements` (`parser.go`) APPENDS a
+  repeated top-level block instead of merging it, and `compileExpanded` /
+  `compileSecurity` / `compilePolicies` process EVERY `security` root (and
+  every matching sibling at each level they descend). A strict-reject AST
+  pre-walk that latched onto only the FIRST `security` node (`Name()=="security"`
+  → assign → `break`), and often first-only `FindChild` at deeper levels, was
+  therefore BYPASSABLE: an offending stanza placed in a SECOND duplicate
+  `security {}` (or duplicate `policies {}` / `ipsec {}` / `nat {}` / …) block
+  was still compiled while the gate waved it through — losing the fail-open
+  diagnostic. This is reachable via the hierarchical `LoadOverride` path
+  (`configstore/store_command.go` parses hierarchical input through
+  `NewParser`). The shared `forEachChild(children, name, fn)` primitive
+  (`compiler_nat_dnat_to.go`) is the SSOT walk discipline for this class:
+  it invokes `fn` for EVERY child whose `Name()` matches, at every level the
+  walk descends, so an offending stanza in ANY duplicate block at ANY level is
+  caught. #3561 first applied it to `validateDNATRuleSetToScopeAST`; #3562
+  converted the remaining six gates to descend with `forEachChild` over all
+  `security` roots (and all `policies`/`ipsec` siblings) while leaving each
+  validator's inner narrow leaf check unchanged (scope precision preserved):
+  `validateSecureTunnelBindInterfaceAST` (#2933 — aggregates the if_id
+  collision map across every block), `validatePolicyMatchLeavesStrict` (#3113),
+  `validatePolicyRequiredMatchStrict` (#3044), and the three then-action gates
+  `validatePolicyThenPermitStrict` (#3114) / `validatePolicyThenRejectStrict`
+  (#3115) / `validatePolicyThenDenyStrict` (#3141). RULE OF THUMB: a new
+  strict-reject AST pre-walk MUST descend with `forEachChild` (never a
+  first-match `FindChild`/`break`) so it cannot be bypassed by a duplicate
+  block. Regression coverage:
+  `pkg/config/compiler_dup_security_3562_test.go` (one duplicate-`security`-block
+  RED-on-revert test per validator, built with `NewParser` for the
+  hierarchical / `LoadOverride` path).
 - **#3200 (host-inbound-traffic token validation):** `security zones <z>
   host-inbound-traffic { system-services <tok>; protocols <tok>; }` keeps its
   untyped-container schema shape (the leaves stay `children: nil` so flat-set
