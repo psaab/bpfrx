@@ -74,6 +74,25 @@ node1:
 Filters: `protocol tcp|udp|icmp`, `source-prefix X.X.X.X/N`, `destination-prefix X.X.X.X/N`,
 `destination-port NNN`, `application-firewall`, etc.
 
+**Strict filter validation (#3439).** Both CLI surfaces and the direct
+gRPC `GetSessions` RPC reject malformed filters rather than silently
+dropping the predicate (which would widen the inspected set):
+
+- The remote `cli` parser (`parseFlowSessionArgs`, `cmd/cli/show.go`)
+  mirrors the strict local parser (`pkg/cli/session_filter.go`): an
+  unparseable numeric value (`destination-port abc`), an out-of-range
+  port, a non-numeric `zone`/`limit`, an unknown protocol token
+  (`protocol tcpip`), a missing value, or an unknown filter keyword all
+  fail the command instead of leaving the field at its zero (wildcard)
+  default. Previously these were silently ignored, so a typo widened the
+  query and the two CLI surfaces disagreed on identical command shapes.
+- Direct gRPC `GetSessions` (`pkg/grpcapi/server_sessions.go`) validates
+  the `protocol` token against known names / numeric `0-255`
+  (`appid.ProtocolNumber`) and rejects a negative `offset`; both return
+  `codes.InvalidArgument` so an invalid input is distinguishable from an
+  empty result set. Protocol-name filters with no `protoName()` reverse
+  (e.g. `sctp`, `ospf`) now match their sessions correctly.
+
 ```
 Session ID: 17179902569, Policy name: allow-everything-out-not-logged/270, HA State: Active, Timeout: 18, Session State: Valid
   In: 192.168.99.201/18277 --> 76.214.233.95/722;icmp, Conn Tag: 0x0, If: reth1.1000, Pkts: 1, Bytes: 84,

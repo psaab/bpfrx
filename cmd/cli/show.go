@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/appid"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/policymatch"
 )
@@ -553,82 +554,158 @@ func (c *ctl) showScreen() error {
 	return c.showText("screen")
 }
 
-func (c *ctl) showFlowSession(args []string) error {
-	req := &pb.GetSessionsRequest{Limit: 100, IncludePeer: true}
-	brief := false
+// flowSessionAction marks a parsed-args terminal subcommand of
+// `show security flow session` (summary / sort-by top-talkers), as
+// distinct from the default per-session listing.
+type flowSessionAction int
+
+const (
+	flowSessionList flowSessionAction = iota
+	flowSessionSummary
+	flowSessionSortBy
+)
+
+// flowSessionParse is the strict parse result for the remote
+// `show security flow session` argument vector.
+type flowSessionParse struct {
+	req     *pb.GetSessionsRequest
+	brief   bool
+	action  flowSessionAction
+	sortKey string
+}
+
+// parseFlowSessionArgs strictly parses the remote-CLI session filter
+// tokens. Unlike the historical loop — which used `if ...; err == nil`
+// with no else and had no default case — it surfaces operator-input
+// errors instead of silently dropping the token: a dropped numeric
+// value (e.g. `destination-port abc`) left the field zero (= wildcard)
+// and silently WIDENED the inspected set, and an unknown token fell
+// through and was ignored. This mirrors the strict local parser in
+// pkg/cli/session_filter.go so the two CLI surfaces agree on identical
+// command shapes (#3439 H5).
+func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
+	p := &flowSessionParse{req: &pb.GetSessionsRequest{Limit: 100, IncludePeer: true}}
+	takeValue := func(i *int, kw string) (string, error) {
+		if *i+1 >= len(args) {
+			return "", fmt.Errorf("missing value for %q", kw)
+		}
+		*i++
+		return args[*i], nil
+	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "zone":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.ParseUint(args[i], 10, 32); err == nil {
-					req.Zone = uint32(v)
-				}
+			v, err := takeValue(&i, "zone")
+			if err != nil {
+				return nil, err
 			}
+			n, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid zone %q", v)
+			}
+			p.req.Zone = uint32(n)
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				req.Protocol = strings.ToUpper(args[i])
+			v, err := takeValue(&i, "protocol")
+			if err != nil {
+				return nil, err
 			}
+			if _, ok := appid.ProtocolNumber(v); !ok {
+				return nil, fmt.Errorf("unknown protocol %q", v)
+			}
+			p.req.Protocol = strings.ToUpper(v)
 		case "source-prefix":
-			if i+1 < len(args) {
-				i++
-				req.SourcePrefix = args[i]
+			v, err := takeValue(&i, "source-prefix")
+			if err != nil {
+				return nil, err
 			}
+			p.req.SourcePrefix = v
 		case "destination-prefix":
-			if i+1 < len(args) {
-				i++
-				req.DestinationPrefix = args[i]
+			v, err := takeValue(&i, "destination-prefix")
+			if err != nil {
+				return nil, err
 			}
+			p.req.DestinationPrefix = v
 		case "source-port":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.ParseUint(args[i], 10, 32); err == nil {
-					req.SourcePort = uint32(v)
-				}
+			v, err := takeValue(&i, "source-port")
+			if err != nil {
+				return nil, err
 			}
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 65535 {
+				return nil, fmt.Errorf("invalid source-port %q", v)
+			}
+			p.req.SourcePort = uint32(n)
 		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.ParseUint(args[i], 10, 32); err == nil {
-					req.DestinationPort = uint32(v)
-				}
+			v, err := takeValue(&i, "destination-port")
+			if err != nil {
+				return nil, err
 			}
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 65535 {
+				return nil, fmt.Errorf("invalid destination-port %q", v)
+			}
+			p.req.DestinationPort = uint32(n)
 		case "nat", "nat-only":
-			req.NatOnly = true
+			p.req.NatOnly = true
 		case "limit":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.Limit = int32(v)
-				}
+			v, err := takeValue(&i, "limit")
+			if err != nil {
+				return nil, err
 			}
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return nil, fmt.Errorf("invalid limit %q", v)
+			}
+			p.req.Limit = int32(n)
 		case "application":
-			if i+1 < len(args) {
-				i++
-				req.Application = args[i]
+			v, err := takeValue(&i, "application")
+			if err != nil {
+				return nil, err
 			}
+			p.req.Application = v
 		case "summary":
-			return c.showSessionSummary()
+			p.action = flowSessionSummary
 		case "brief":
-			brief = true
+			p.brief = true
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				req.InterfaceFilter = args[i]
+			v, err := takeValue(&i, "interface")
+			if err != nil {
+				return nil, err
 			}
+			p.req.InterfaceFilter = v
 		case "source-nat-pool":
-			if i+1 < len(args) {
-				i++
-				req.SourceNatPool = args[i]
+			v, err := takeValue(&i, "source-nat-pool")
+			if err != nil {
+				return nil, err
 			}
+			p.req.SourceNatPool = v
 		case "sort-by":
-			if i+1 < len(args) {
-				i++
-				return c.showText("sessions-top:" + args[i])
+			v, err := takeValue(&i, "sort-by")
+			if err != nil {
+				return nil, err
 			}
+			p.action = flowSessionSortBy
+			p.sortKey = v
+		default:
+			return nil, fmt.Errorf("unknown session filter %q", args[i])
 		}
 	}
+	return p, nil
+}
+
+func (c *ctl) showFlowSession(args []string) error {
+	p, err := parseFlowSessionArgs(args)
+	if err != nil {
+		return err
+	}
+	if p.action == flowSessionSummary {
+		return c.showSessionSummary()
+	}
+	if p.action == flowSessionSortBy {
+		return c.showText("sessions-top:" + p.sortKey)
+	}
+	req := p.req
+	brief := p.brief
 
 	resp, err := c.client.GetSessions(c.ctx(), req)
 	if err != nil {
