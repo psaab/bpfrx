@@ -328,6 +328,14 @@ func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.S
 }
 
 func (s *Server) ShowCompare(_ context.Context, req *pb.ShowCompareRequest) (*pb.ShowCompareResponse, error) {
+	// rollback_n is a change-control selector: 0 reserves candidate-vs-active,
+	// positive values select a 1-based rollback slot. A negative value used to
+	// fall through to the candidate-vs-active compare with a success response
+	// (#3443 M6), silently comparing the wrong target. Reject it.
+	if req.RollbackN < 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid rollback_n %d: must be non-negative (0 = candidate vs active)", req.RollbackN)
+	}
 	if req.RollbackN > 0 {
 		diff, err := s.store.ShowCompareRollback(int(req.RollbackN))
 		if err != nil {
