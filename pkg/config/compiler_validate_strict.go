@@ -1755,6 +1755,106 @@ func validateFirewallFilterReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateFilterRoutingInstanceDirectionStrict hard-rejects an OUTPUT-attached
+// firewall filter (`family inet|inet6 filter output <name>`) whose referenced
+// filter carries a `then routing-instance <x>` (FBF / filter-based-forwarding)
+// term — #3432.
+//
+// FBF route override is an INGRESS-only operation in the userspace dataplane.
+// The forwarding route-override path (ingress_route_table_override /
+// interface_filter_affects_route_lookup, userspace-dp/src/afxdp/forwarding/
+// mod.rs) resolves the INGRESS logical ifindex and only consults the INPUT
+// filter's affects_route_lookup flag; the Rust filter compiler
+// (userspace-dp/src/filter/compiler.rs) sets affects_route_lookup ONLY on the
+// input attach branch — the output attach branch never sets it. So a
+// `then routing-instance` term reached only via an output attach is compiled
+// for output evaluation but NEVER influences the route lookup: the configured
+// steering action is silently a no-op. Commit accepted it (the reference and
+// the discard/reject-conflict gates above check the target name and the
+// terminal-action conflict, never the input/output DIRECTION of the
+// attachment).
+//
+// This gate makes the unsupported direction an operator-visible commit error
+// rather than a silent no-op, consistent with the other firewall-filter strict
+// gates. A filter that carries a routing-instance term is rejected on an
+// output attach regardless of which term matches: the operator's intent
+// (policy-based forwarding) cannot be honored on egress, and an output filter
+// that ALSO does legitimate output work (e.g. count / DSCP rewrite) should not
+// silently carry a dead steering action. The same filter remains valid on an
+// INPUT attach.
+//
+// Interfaces are walked in sorted name order, then by ascending unit number,
+// then inet before inet6, for a deterministic first error. lo0 is covered for
+// free (stored as an ordinary interface under cfg.Interfaces.Interfaces["lo0"]),
+// though an output FBF on lo0 is doubly meaningless. On the tolerant load /
+// peer-sync path the caller downgrades the error to a warning (#1960 no-brick);
+// the runtime already treats the output steering term as inert independently,
+// so the config still boots. Mirrors validateFirewallFilterReferencesStrict.
+func validateFilterRoutingInstanceDirectionStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// A filter is an FBF filter if any of its terms names a routing-instance.
+	hasRoutingInstance := func(filters map[string]*FirewallFilter, name string) bool {
+		filter := filters[name]
+		if filter == nil {
+			return false
+		}
+		for _, term := range filter.Terms {
+			if term != nil && term.RoutingInstance != "" {
+				return true
+			}
+		}
+		return false
+	}
+
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil { // tolerant/HA-sync path may carry a nil interface (#3494)
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
+			if unit == nil { // tolerant/HA-sync path may carry a nil unit (#3494)
+				continue
+			}
+			type ref struct {
+				name    string
+				family  string
+				filters map[string]*FirewallFilter
+			}
+			for _, r := range []ref{
+				{unit.FilterOutputV4, "inet", cfg.Firewall.FiltersInet},
+				{unit.FilterOutputV6, "inet6", cfg.Firewall.FiltersInet6},
+			} {
+				if r.name == "" || !hasRoutingInstance(r.filters, r.name) {
+					continue
+				}
+				return fmt.Errorf(
+					"interface %s unit %d family %s filter output %q has a term "+
+						"with `then routing-instance` (filter-based-forwarding), "+
+						"which is only supported on an INPUT-attached filter — FBF "+
+						"route override is evaluated on ingress, so an output attach "+
+						"would silently never steer the traffic; attach this filter "+
+						"with `filter input %s` or remove the routing-instance action",
+					ifName, unitNum, r.family, r.name, r.name)
+			}
+		}
+	}
+	return nil
+}
+
 // validateApplicationSetMembersStrict hard-rejects an `applications
 // application-set <set>` (Finding B, #2217) whose member references neither a
 // defined application (user-defined or junos-* predefined), nor a defined
