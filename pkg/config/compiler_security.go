@@ -1715,14 +1715,28 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 	// Aggressive session aging
 	if agingNode := node.FindChild("aging"); agingNode != nil {
 		for _, opt := range agingNode.Children {
+			name := opt.Name()
+			switch name {
+			case "early-ageout", "high-watermark", "low-watermark":
+			default:
+				// #3440 H2: record an unrecognized aging leaf so
+				// validateFlowAgingStrict can reject it at commit instead of
+				// the pre-#3440 silent drop (which let `set security flow
+				// aging bogus 5` commit cleanly with no effect).
+				sec.Flow.AgingUnknownLeaves = append(sec.Flow.AgingUnknownLeaves, name)
+				continue
+			}
 			if len(opt.Keys) < 2 {
 				continue
 			}
 			val, err := strconv.Atoi(opt.Keys[1])
 			if err != nil {
+				// The schema typed-leaf gate (SchemaValidate) rejects a
+				// non-integer / out-of-range value at commit; on the tolerant
+				// load path it is left at the zero default (disabled).
 				continue
 			}
-			switch opt.Name() {
+			switch name {
 			case "early-ageout":
 				sec.Flow.AgingEarlyAgeout = val
 			case "high-watermark":

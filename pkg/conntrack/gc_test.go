@@ -779,3 +779,27 @@ func TestGCNextSweepDelayDisablesBackoffForSessionLimits(t *testing.T) {
 		t.Fatalf("nextSweepDelayAt() = %v, want %v", got, 10*time.Second)
 	}
 }
+
+// TestSetAgingConfigClampsNegativeEarlyAgeout pins the #3440 H2 defensive
+// clamp: a negative early-ageout (which a peer-synced or already-persisted
+// config from an older binary could still carry on the tolerant load path)
+// must clamp to 0 (disabled), not cast to a huge uint64. FAIL-ON-REVERT:
+// remove the `if earlyAgeout < 0 { earlyAgeout = 0 }` guard in
+// SetAgingConfig and earlyAgeout becomes uint64(-1) == 1<<64-1, so the
+// early-ageout is effectively infinite (never shorter than any per-session
+// timeout) — a silent no-op the operator cannot see.
+func TestSetAgingConfigClampsNegativeEarlyAgeout(t *testing.T) {
+	gc := NewGC(nil, time.Second)
+	gc.SetAgingConfig(-1, 90, 80)
+	if gc.earlyAgeout != 0 {
+		t.Fatalf("negative early-ageout not clamped: earlyAgeout=%d (want 0)", gc.earlyAgeout)
+	}
+	if gc.agingActive {
+		t.Fatalf("aging must be inactive when early-ageout is 0")
+	}
+	// A valid positive value is stored verbatim.
+	gc.SetAgingConfig(20, 90, 80)
+	if gc.earlyAgeout != 20 {
+		t.Fatalf("positive early-ageout not stored: earlyAgeout=%d (want 20)", gc.earlyAgeout)
+	}
+}

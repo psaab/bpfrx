@@ -2567,6 +2567,54 @@ func validateScreenUnknownStrict(cfg *Config) error {
 	return nil
 }
 
+// validateFlowAgingStrict is the #3440 H2 commit-time gate for
+// `security flow aging`. The aging subtree was an opaque untyped schema
+// node, so its values were parsed with a bare strconv.Atoi and stored with
+// no cross-field check. The typed schema leaves (schema_security.go) now
+// bound each individual value (early-ageout >= 0, watermarks 0..100), but
+// two failure modes are cross-field / structural and must be caught here:
+//
+//   - an unknown child leaf (`set security flow aging bogus 5`) — the schema
+//     walker leaves unknown keywords to the compiler, and compileFlow used
+//     to silently drop them; they are now recorded on
+//     FlowConfig.AgingUnknownLeaves and rejected here (mirrors #3318
+//     validateScreenUnknownStrict).
+//   - low-watermark >= high-watermark when both are nonzero — aging
+//     activates at high-watermark and deactivates below low-watermark, so a
+//     low >= high config can never deactivate (it oscillates or latches on),
+//     which is the H2 "high-watermark 90 low-watermark 95" example. Junos
+//     requires low < high.
+//
+// Strict on commit / commit-check; the call site (compiler.go) downgrades
+// to a warning on the tolerant load / peer-sync path so an already-persisted
+// or peer-synced config still boots (#1960 no-brick) — the userspace
+// dataplane does not enforce watermark aging at all (the #3440 H1 warning),
+// so a leniently-loaded bad value is inert anyway.
+func validateFlowAgingStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	flow := cfg.Security.Flow
+	if len(flow.AgingUnknownLeaves) > 0 {
+		return fmt.Errorf(
+			"security flow aging: `%s` is not a supported aging option "+
+				"(it would be silently dropped and have no effect); the "+
+				"supported options are early-ageout, high-watermark, and "+
+				"low-watermark",
+			flow.AgingUnknownLeaves[0])
+	}
+	if flow.AgingHighWatermark > 0 && flow.AgingLowWatermark > 0 &&
+		flow.AgingLowWatermark >= flow.AgingHighWatermark {
+		return fmt.Errorf(
+			"security flow aging: low-watermark %d must be less than "+
+				"high-watermark %d (aging activates at high-watermark and "+
+				"only deactivates below low-watermark; low >= high can never "+
+				"deactivate)",
+			flow.AgingLowWatermark, flow.AgingHighWatermark)
+	}
+	return nil
+}
+
 // policyActionName renders a PolicyAction as its Junos `then` token for
 // operator-facing validator errors.
 func policyActionName(a PolicyAction) string {
