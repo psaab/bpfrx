@@ -132,44 +132,12 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 			// HA-sync config path) must not panic on profile.TCP.Land.
 			if profile, ok := cfg.Security.Screen[zone.ScreenProfile]; ok && profile != nil {
 				fmt.Fprintf(buf, "  Screen profile details (%s):\n", zone.ScreenProfile)
-				var checks []string
-				if profile.TCP.Land {
-					checks = append(checks, "land")
-				}
-				if profile.TCP.SynFin {
-					checks = append(checks, "syn-fin")
-				}
-				if profile.TCP.NoFlag {
-					checks = append(checks, "no-flag")
-				}
-				if profile.TCP.FinNoAck {
-					checks = append(checks, "fin-no-ack")
-				}
-				if profile.TCP.WinNuke {
-					checks = append(checks, "winnuke")
-				}
-				if profile.TCP.SynFrag {
-					checks = append(checks, "syn-frag")
-				}
-				if profile.TCP.SynFlood != nil {
-					checks = append(checks, fmt.Sprintf("syn-flood(threshold:%d)", profile.TCP.SynFlood.AttackThreshold))
-				}
-				if profile.ICMP.PingDeath {
-					checks = append(checks, "ping-death")
-				}
-				if profile.ICMP.FloodThreshold > 0 {
-					checks = append(checks, fmt.Sprintf("icmp-flood(threshold:%d)", profile.ICMP.FloodThreshold))
-				}
-				if profile.IP.SourceRouteOption {
-					checks = append(checks, "source-route-option")
-				}
-				if profile.IP.TearDrop {
-					checks = append(checks, "teardrop")
-				}
-				if profile.UDP.FloodThreshold > 0 {
-					checks = append(checks, fmt.Sprintf("udp-flood(threshold:%d)", profile.UDP.FloodThreshold))
-				}
-				if len(checks) > 0 {
+				// #3327: route the enabled-check inventory through the shared
+				// SSOT (config.ScreenChecks / config.ScreenThresholds via
+				// screenEnabledCheckList) instead of a hand-built list that
+				// omitted port-scan, ip-sweep, the source/destination session
+				// limits, and icmp-fragment.
+				if checks := screenEnabledCheckList(profile); len(checks) > 0 {
 					fmt.Fprintf(buf, "    Enabled checks: %s\n", strings.Join(checks, ", "))
 				}
 			}

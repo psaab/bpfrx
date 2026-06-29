@@ -23564,6 +23564,73 @@ top.
   - **Action**: #3442 Codex MERGE-NEEDS-MAJOR fold (PR #3517) — over-rejection risk. Verb-set reconciliation: applyEditLine -> ParseSetVerb replays EXACTLY set/delete/deactivate/activate (everything else hits the bare-path default = the M3 bug); FormatSet (display-set, the loadable artifact) emits only set/deactivate. annotate/copy/insert/rename are interactive-only structural edits (pkg/cli/cli_dispatch.go handlers, distinct multi-clause grammar) NEVER present in a flat-load file and NOT replayable — pre-fix they were silently mangled into junk `set annotate ...` nodes, so rejecting them is the M3 fix, not a regression. Confirmed `hasFlatVerb` recognizes exactly the 4 replayable verbs (option 2). Real fix folded: Codex #3 whitespace — the literal-`verb ` prefix check wrongly rejected a tab between verb and path (lexer treats tabs as whitespace); rewrote hasFlatVerb to match the first whitespace-delimited token (strings.Fields) against the verb set + require >=1 path token. Added TestLoadFlatVerbGate (all 4 verbs accepted in sequence; tab-separated set accepted; annotate/copy/insert/rename + garbage rejected on BOTH LoadSet and LoadMerge-flat). RED-on-revert reconfirmed against true origin/master source (garbage + interactive verbs + TestLoadSet all fail) AND the tab assertion fails under the prior literal-space gate. go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
   - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
 - **Timestamp**: 2026-06-29T12:30Z
+  - **Action**: #3327 — REST/gRPC screen inventory omitted port-scan, ip-sweep, limit-session-source/-destination, and icmp-fragment, and exposed no thresholds. Root cause: pkg/api/security.go and pkg/grpcapi/server_helpers.go each carried a byte-identical `screenChecks` string helper (the drift mechanism) listing only 12 checks; ScreenProfile carries PortScanThreshold/IPSweepThreshold/LimitSession.{Source,Destination}IPBased/ICMP.Fragment that buildScreenSnapshots (pkg/dataplane/userspace/screens.go) fully enforces. Fix: introduced single SSOT `config.ScreenChecks` + `config.ScreenThresholds` (pkg/config/screen_inventory.go) consumed by both APIs; both `screenChecks` helpers now delegate. Added the 5 omitted presence checks (set kept superset of enforced set) plus a thresholds map surfacing numeric values (icmp/udp/syn-flood with individually-keyed syn-flood sub-thresholds, port-scan, ip-sweep, session limits). Wire: proto ScreenInfo gained `map<string,int64> thresholds = 3` (regenerated xpf.pb.go via make proto); REST ScreenInfo gained `Thresholds map[string]int json:thresholds,omitempty`. RED-on-revert verified twice (drop the 5 checks -> both API tests fail on each missing check; null the threshold population -> both fail on each missing threshold). go test ./pkg/api/ ./pkg/grpcapi/ ./pkg/config/ ./pkg/dataplane/ ./pkg/logging/ green; go vet + gofmt clean. Cross-package ScreenFlagNames<->ringbuf mirror untouched (runtime event flags, not config inventory) — TestRawEventContractMatchesDataplaneEvent still green.
+  - **File(s)**: pkg/config/screen_inventory.go (new), pkg/api/security.go, pkg/api/types.go, pkg/api/security_screen_inventory_3327_test.go (new), pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_helpers.go, pkg/grpcapi/server_screen_inventory_3327_test.go (new), proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29T14:15Z
+  - **Action**: #3327 Codex MERGE-NEEDS-MAJOR fold (PR #3538). PR #3538 fixed
+    the STRUCTURED REST/gRPC screen inventory and introduced the SSOT
+    config.ScreenChecks / config.ScreenThresholds, but left HAND-BUILT screen
+    inventory lists in the TEXT renderers that still omitted port-scan,
+    ip-sweep, limit-session-source, limit-session-destination, and
+    icmp-fragment and did not delegate to the SSOT — so `show security zones`
+    detail and `show security screen` text output kept drifting from the
+    enforced/structured set (the "no second divergent inventory list remains"
+    gate). Fix: routed the enabled-check inventory through a single shared
+    grpcapi helper `screenEnabledCheckList(profile)` (delegates to
+    config.ScreenChecks / config.ScreenThresholds, annotating threshold-bearing
+    tokens as `name(threshold:N)`, syn-flood keyed on its attack-threshold)
+    consumed by (1) server_show_zones_text.go showZonesDetail "Enabled checks"
+    line and (2) server_show_security_text.go showScreen. The
+    screen-ids-option DETAIL table (showScreenIDSOptionDetail) is a
+    full-universe view (lists every check WITH its value AND default, including
+    disabled), so it cannot be ScreenChecks-driven (enabled-only); instead it
+    was completed with a row for each of the 5 omitted checks so it can no
+    longer drift. While here, the sibling non-detail status table
+    (showScreenIDSOption, a 4th hand-built list with the same omission) was
+    completed too so NO screen-inventory renderer remains divergent. RED-on-
+    revert verified for all three flagged sites (revert each delegation/row
+    block → the matching omitted-check assertion fails). go test ./pkg/grpcapi/
+    ./pkg/api/ ./pkg/config/ ./pkg/cli/ green; go vet ./pkg/grpcapi/ + gofmt
+    clean; regenerated the deterministic golden (server_show_golden.json) for
+    the screen + screen-ids-option-detail topics (deliberate output change).
+  - **File(s)**: pkg/grpcapi/server_show_zones_text.go, pkg/grpcapi/server_show_security_text.go, pkg/grpcapi/server_show_screen_inventory_text_3327_test.go (new), pkg/grpcapi/testdata/server_show_golden.json, _Log.md
+- **Timestamp**: 2026-06-29T16:45Z
+  - **Action**: #3327 Codex MERGE-NEEDS-MAJOR fold #2 (PR #3538). The first
+    text-renderer fold (cc0cd6c28) unified the gRPC text renderers but the
+    "no second divergent screen-inventory list remains" gate was still
+    violated on the LOCAL CLI (entirely untouched) and one gRPC site lacked a
+    tear-drop row. Fixes: (1) promoted the enabled-check rendering to a
+    cross-package SSOT `config.ScreenEnabledCheckList` (moved out of the
+    grpcapi-private helper; the grpcapi `screenEnabledCheckList` now delegates
+    to it, output-identical so the gRPC golden is unchanged). (2) Routed the
+    two enabled-only CLI summary renderers through it: `show security screen`
+    (pkg/cli/cli_show_security_screen.go showScreen) and the `show security
+    zones` detail "Enabled checks" line (pkg/cli/cli_show_security_zones.go) —
+    both previously hand-built lists omitting port-scan, ip-sweep,
+    limit-session-source, limit-session-destination, icmp-fragment. (3)
+    Completed the two value-bearing CLI tables with a row per omitted check
+    (mirroring the gRPC siblings, since the canonical-token list cannot carry
+    their per-check value/default columns): showScreenIdsOption (enabled-only
+    status table; also added the missing tear-drop row) and
+    showScreenIdsOptionDetail (full-universe). (4) Added the missing tear-drop
+    row to the gRPC showScreenIDSOption status table so its enabled-only table
+    is non-divergent too (golden-neutral: the untrust-screen fixture does not
+    enable tear-drop). RED-on-revert: new pkg/cli test drives all four CLI
+    renderers with a maximal profile and asserts each of the five omitted
+    checks appears; reverting any one of the four delegations/row-blocks fails
+    the matching subtest (verified each individually). GOLDEN call (#5): the
+    canonical-token form for `show security screen` (e.g. `syn-flood(threshold
+    :200)`, `land`) loses no essential info vs the prior verbose lines — check
+    identity and thresholds are both preserved and the richer per-check value
+    breakdown remains in `show security screen ids-option [detail]`; KEEP
+    canonical (it also unifies the summary with the structured/zones tokens).
+    No golden regen needed this fold (all changes output-neutral on the
+    fixture). go test ./pkg/cli/ ./pkg/grpcapi/ ./pkg/api/ ./pkg/config/
+    green; gofmt clean; go vet ./pkg/cli ./pkg/grpcapi clean (the lone
+    unreachable-code warning is pre-existing in untouched cli.go).
+  - **File(s)**: pkg/config/screen_inventory.go, pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_zones.go, pkg/grpcapi/server_show_security_text.go, pkg/cli/cli_show_security_screen_inventory_3327_test.go (new), _Log.md
+- **Timestamp**: 2026-06-29T15:30Z
   - **Action**: #3375 grpcapi MatchPolicies blank-action parity. The gRPC MatchPolicies RPC returned a BLANK `action` for two verdicts where REST returned an explicit string: (1) a `to-zone junos-host` query matching no host-bound policy (HostInboundUnmatched), (2) the no-active-config case (empty response). It also lacked a typed default-used bit. Fix: added SSOT `policymatch.HostInboundActionString` const + `policymatch.Result.DisplayAction()` renderer (host-inbound -> the host string; no-match -> "<action> (default)"; match -> "<action>"); both REST and gRPC now route ALL action rendering through DisplayAction so they cannot diverge. gRPC host-inbound now returns the host string; gRPC nil-config returns "deny (default)" + default_used=true. Added typed `default_used` to proto MatchPoliciesResponse (field 12, regenerated xpf.pb.go) and REST MatchPoliciesResult JSON, populated from policymatch.Result.DefaultUsed. CLI multi-line match-policies output already self-describing -> unchanged. RED-on-revert verified on BOTH surfaces (gRPC: revert -> blank action + default_used unset fail; REST: drop DefaultUsed copy -> default_used assertion fails). go test ./pkg/grpcapi/ ./pkg/policymatch/ ./pkg/api/ ./pkg/cli/ green; gofmt clean; go vet clean on touched packages.
   - **File(s)**: pkg/policymatch/policymatch.go, pkg/grpcapi/server_cluster.go, pkg/api/security.go, pkg/api/types.go, proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/README.md, pkg/policymatch/display_action_3375_test.go, pkg/grpcapi/server_matchpolicies_action_3375_test.go, pkg/api/security_matchpolicies_action_3375_test.go, _Log.md
 
