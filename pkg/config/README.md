@@ -617,11 +617,12 @@ collapsed deny modifier the compiler cannot enforce is
 or global), the policy, and the offending modifier; a bare `then deny`,
 `then deny log`, and `then deny count` still commit. AST pre-walk in
 `compileExpanded`, both AST shapes, zone-pair and `global` coverage. The gate
-is **parse-shape-agnostic** (#3377): `collapsedDenyModifierTokens`
-(`compiler_policy_then.go`) flattens deny's modifier tokens — `deny.Keys[1:]`
-plus the keys of every descendant node — into the SAME token sequence the
-compiler's `applyCollapsedDenyModifiers` (`compiler_security.go`) acts on, and
-the gate checks EVERY token in that sequence against
+is **parse-shape-agnostic** (#3377): `collapsedThenActionTokens`
+(`compiler_policy_then.go`, shared by the permit/reject/deny gates) flattens an
+action node's modifier tokens — `deny.Keys[1:]` plus the keys of every
+descendant node — into the SAME token sequence the compiler's
+`applyCollapsedDenyModifiers` (`compiler_security.go`) acts on, and the gate
+checks EVERY token in that sequence against
 `recognizedCollapsedDenyToken` (the exact `{log, session-init, session-close,
 count}` set `applyCollapsedDenyModifiers` consumes). Flattening is what makes
 the gate independent of how the flat-set parser grouped the modifiers: once
@@ -650,6 +651,20 @@ path downgrades both the unsupported-modifier and the orphan-sub-token reject
 to a warning (`lenientPolicyThenDeny`) so an already-persisted or peer-synced
 config an older binary silently accepted still boots (#1960 no-brick doctrine,
 same as #3114/#3115).
+
+**All-nodes walk (#3377 review fold):** the permit/reject/deny gates iterate
+EVERY same-named action node under `then` (`FindChildren`, not `FindChild`). A
+flat-set `set ... then permit` followed by `set ... then permit
+application-services X` produces TWO separate `then permit` nodes (a bare leaf
+plus an extended one — the split predates #3377 and is independent of the schema
+change); a FindChild-first gate inspected only the bare first node and missed
+the unsupported modifier on the second. The strict commit path still rejected
+such a config via the #3043 conflicting-terminal-action gate, but with a generic
+message — only the all-nodes walk surfaces the specific #3114/#3115/#3141
+diagnostic (and the matching lenient-path warning, where #3043 is only a
+warning). The deny gate additionally unions `hasLog` across all deny nodes to
+match the compiler's per-node `applyCollapsedDenyModifiers` accumulation onto
+`pol.Log`.
 
 **Security policies missing a required `match` criterion are rejected at commit
 (#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security

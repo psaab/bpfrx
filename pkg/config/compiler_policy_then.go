@@ -117,37 +117,27 @@ func validatePolicyThenPermitStrict(nodes []*Node, lenient bool) ([]string, erro
 		if thenNode == nil {
 			return nil
 		}
-		permitNode := thenNode.FindChild("permit")
-		if permitNode == nil {
-			return nil
-		}
-		// A bare `then permit` (flat-set: a `permit` node with Keys=["permit"]
-		// and no children; hierarchical: an empty `permit` block) is fully
-		// supported. Only `then permit <modifier>` carries an unsupported
-		// child. The modifier appears in TWO AST shapes, mirroring the
-		// dual-shape handling the compiler must do everywhere:
-		//   - Flat set `then permit application-services utm-policy X` collapses
-		//     the whole tail onto the permit node: Keys=["permit",
-		//     "application-services","utm-policy","X"]. The unsupported modifier
-		//     is Keys[1]; Keys[2:] are its arguments.
-		//   - Hierarchical `then { permit { application-services {...} } }`
-		//     nests the modifier as a child node of permit.
-		// Report the first offending modifier in either shape.
-		if len(permitNode.Keys) >= 2 {
-			child := permitNode.Keys[1]
-			if !supportedPolicyThenPermitChildren[child] {
-				if err := emit(scope, policyName, child); err != nil {
+		// A bare `then permit` (a `permit` node with no modifier tokens) is
+		// fully supported. Only `then permit <modifier>` carries an
+		// unsupported modifier. ALL `then permit` nodes are inspected
+		// (FindChildren, not FindChild): a flat-set `set ... then permit`
+		// followed by `set ... then permit application-services X` produces
+		// TWO separate `permit` nodes, and a FindChild-first gate would see
+		// only the (valid) bare node first and miss the unsupported modifier
+		// on the second. collapsedThenActionTokens flattens each node's
+		// modifier tokens across all three parser groupings (flat-onto-permit,
+		// collapsed-child, nested). The supported permit-modifier set is empty
+		// (supportedPolicyThenPermitChildren), so any token is unsupported;
+		// report the first per offending node.
+		for _, permitNode := range thenNode.FindChildren("permit") {
+			for _, tok := range collapsedThenActionTokens(permitNode) {
+				if supportedPolicyThenPermitChildren[tok] {
+					continue
+				}
+				if err := emit(scope, policyName, tok); err != nil {
 					return err
 				}
-			}
-		}
-		for _, c := range permitNode.Children {
-			child := c.Name()
-			if supportedPolicyThenPermitChildren[child] {
-				continue
-			}
-			if err := emit(scope, policyName, child); err != nil {
-				return err
+				break
 			}
 		}
 		return nil
@@ -278,35 +268,26 @@ func validatePolicyThenRejectStrict(nodes []*Node, lenient bool) ([]string, erro
 		if thenNode == nil {
 			return nil
 		}
-		rejectNode := thenNode.FindChild("reject")
-		if rejectNode == nil {
-			return nil
-		}
-		// A bare `then reject` (flat-set: a `reject` node with
-		// Keys=["reject"] and no children; hierarchical: an empty `reject`
-		// block) is fully supported. Only `then reject <modifier>` carries
-		// an unsupported child, in TWO AST shapes:
-		//   - Flat set `then reject profile blocked-web` collapses the tail
-		//     onto the reject node: Keys=["reject","profile","blocked-web"].
-		//     The unsupported modifier is Keys[1]; Keys[2:] are its args.
-		//   - Hierarchical `then { reject { profile {...} } }` nests the
-		//     modifier as a child node of reject.
-		// Report the first offending modifier in either shape.
-		if len(rejectNode.Keys) >= 2 {
-			child := rejectNode.Keys[1]
-			if !supportedPolicyThenRejectChildren[child] {
-				if err := emit(scope, policyName, child); err != nil {
+		// A bare `then reject` (a `reject` node with no modifier tokens) is
+		// fully supported. Only `then reject <modifier>` (a reject profile or
+		// a packet-type reject like tcp-reset) carries an unsupported
+		// modifier. ALL `then reject` nodes are inspected (FindChildren, not
+		// FindChild) for the same two-node split reason as the permit gate:
+		// `set ... then reject` then `set ... then reject profile X` produces
+		// TWO separate `reject` nodes. collapsedThenActionTokens flattens each
+		// node's modifier tokens across all three parser groupings. The
+		// supported reject-modifier set is empty
+		// (supportedPolicyThenRejectChildren), so any token is unsupported;
+		// report the first per offending node.
+		for _, rejectNode := range thenNode.FindChildren("reject") {
+			for _, tok := range collapsedThenActionTokens(rejectNode) {
+				if supportedPolicyThenRejectChildren[tok] {
+					continue
+				}
+				if err := emit(scope, policyName, tok); err != nil {
 					return err
 				}
-			}
-		}
-		for _, c := range rejectNode.Children {
-			child := c.Name()
-			if supportedPolicyThenRejectChildren[child] {
-				continue
-			}
-			if err := emit(scope, policyName, child); err != nil {
-				return err
+				break
 			}
 		}
 		return nil
@@ -353,28 +334,34 @@ func validatePolicyThenRejectStrict(nodes []*Node, lenient bool) ([]string, erro
 	return warnings, nil
 }
 
-// collapsedDenyModifierTokens flattens every modifier token under a
-// `then deny` node into the SAME token sequence the compiler's
-// applyCollapsedDenyModifiers (compiler_security.go) acts on, so the
-// reject gate (validatePolicyThenDenyStrict) and the wiring can never
-// disagree on the modifier set regardless of how the parser grouped it.
+// collapsedThenActionTokens flattens every modifier token under a single
+// `then <action>` node (permit / deny / reject) into one token sequence —
+// the action node's own Keys[1:] plus the keys of every descendant node —
+// regardless of how the flat-set parser grouped them. The parser can
+// produce three shapes: flat-onto-action (action.Keys[1:]), collapsed-child
+// (one child node carrying all tokens on its Keys), and nested (each
+// modifier its own node). Flattening makes the reject gates shape-agnostic.
 //
-// The parser produces three shapes (see checkPolicy for the full table):
-// flat-onto-deny (deny.Keys[1:]), collapsed-child (one child node carrying
-// all tokens on its Keys), and nested (each modifier its own node). This
-// mirrors applyCollapsedDenyModifiers exactly — deny.Keys[1:] plus every
-// key of every descendant node — which is why the two stay in lockstep:
-// any token the compiler would apply is a token the validator examines.
+// For the deny gate this mirrors the compiler's applyCollapsedDenyModifiers
+// (compiler_security.go) exactly — action.Keys[1:] plus every descendant
+// key — so the gate and the wiring can never disagree on the modifier set.
+// For the permit/reject gates the supported modifier set is empty, so any
+// token returned here is an unsupported modifier the compiler silently
+// drops and the gate rejects at commit.
 //
-// The legitimately supported tokens (log with session-init/session-close,
-// and count) are defined by recognizedCollapsedDenyToken; any other token
-// is an unsupported deny modifier the compiler silently drops, so the gate
-// rejects it at commit. Keep recognizedCollapsedDenyToken in lockstep with
-// applyCollapsedDenyModifiers.
-func collapsedDenyModifierTokens(denyNode *Node) []string {
+// Each gate must additionally iterate ALL same-named action nodes under
+// `then` (FindChildren, not FindChild) before calling this: a flat-set
+// `set ... then permit` followed by `set ... then permit application-
+// services X` produces TWO separate `permit` nodes, and a FindChild-first
+// gate would inspect only the (valid) bare node and miss the unsupported
+// modifier on the second. The strict commit path still rejects such a
+// config via the #3043 conflicting-terminal-action gate, but only this
+// all-nodes walk surfaces the specific #3114/#3115 unsupported-modifier
+// diagnostic (and the matching lenient-path warning).
+func collapsedThenActionTokens(actionNode *Node) []string {
 	var toks []string
-	if len(denyNode.Keys) >= 2 {
-		toks = append(toks, denyNode.Keys[1:]...)
+	if len(actionNode.Keys) >= 2 {
+		toks = append(toks, actionNode.Keys[1:]...)
 	}
 	var walk func(n *Node)
 	walk = func(n *Node) {
@@ -383,7 +370,7 @@ func collapsedDenyModifierTokens(denyNode *Node) []string {
 			walk(c)
 		}
 	}
-	for _, c := range denyNode.Children {
+	for _, c := range actionNode.Children {
 		walk(c)
 	}
 	return toks
@@ -480,8 +467,8 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 		if thenNode == nil {
 			return nil
 		}
-		denyNode := thenNode.FindChild("deny")
-		if denyNode == nil {
+		denyNodes := thenNode.FindChildren("deny")
+		if len(denyNodes) == 0 {
 			return nil
 		}
 		// A bare `then deny` (a `deny` node with no modifier tokens) is fully
@@ -499,7 +486,7 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 		//   - Nested (deny + modifiers ARE schema leaves, #3377): each modifier
 		//     is consumed as its own structural node, e.g.
 		//     deny → log → session-init → count.
-		// collapsedDenyModifierTokens flattens all three into the SAME token
+		// collapsedThenActionTokens flattens all three into the SAME token
 		// sequence the compiler's applyCollapsedDenyModifiers acts on
 		// (compiler_security.go: deny.Keys[1:] plus every key of every
 		// descendant node), so the validator and the wiring agree exactly on
@@ -510,7 +497,19 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 		// would otherwise be silently dropped. recognizedCollapsedDenyToken is
 		// the EXACT set applyCollapsedDenyModifiers acts on — the log/count
 		// modifiers plus log's session-init/session-close sub-tokens.
-		toks := collapsedDenyModifierTokens(denyNode)
+		//
+		// ALL `then deny` nodes are unioned (FindChildren, not FindChild): a
+		// split `set ... then deny log` + `set ... then deny session-init`
+		// produces two deny nodes, and the compiler's per-node
+		// applyCollapsedDenyModifiers accumulates BOTH onto the same pol.Log,
+		// so the validator must compute `hasLog` over the union to agree with
+		// the wiring (a per-node check would wrongly flag the session-init
+		// node as an orphan #3374 reject for a config the compiler logs
+		// correctly).
+		var toks []string
+		for _, dn := range denyNodes {
+			toks = append(toks, collapsedThenActionTokens(dn)...)
+		}
 		hasLog := false
 		for _, tok := range toks {
 			if tok == "log" {
