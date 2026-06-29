@@ -611,6 +611,38 @@ func dnatDestinationParts(raw string) (base, prefix string, ok bool) {
 	return ipNet.IP.String(), ipNet.String(), true
 }
 
+// dnatPoolHostIP validates a DNAT pool's translated address and returns the
+// bare host IP the wire carries. The Rust DnatTable parses the pool address as
+// a single host IpAddr, so the pool must resolve to exactly one host: a bare
+// IP, /32, or /128. A non-host CIDR (e.g. 10.0.0.0/24) would otherwise be
+// coerced to its network base (10.0.0.0) with no pool/range semantics (#3450
+// M05), and a non-IP token (e.g. an address-book name) would be dropped by the
+// Rust parser, leaving the VIP untranslated (#3450 M06). ok is false for both
+// so the caller fails CLOSED (skips the rule, installing no entry) rather than
+// translating to the wrong address. The commit-time gate (validateDNATPoolStrict)
+// makes the bad address operator-visible; this is the lenient / peer-sync
+// backstop.
+func dnatPoolHostIP(addr string) (string, bool) {
+	if addr == "" {
+		return "", false
+	}
+	if strings.IndexByte(addr, '/') == -1 {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			return "", false
+		}
+		return ip.String(), true
+	}
+	ip, ipNet, err := net.ParseCIDR(addr)
+	if err != nil {
+		return "", false
+	}
+	if ones, bits := ipNet.Mask.Size(); ones != bits {
+		return "", false // non-host prefix — would coerce to the network base
+	}
+	return ip.String(), true
+}
+
 // buildDestinationNATSnapshots is the static-only convenience wrapper retained
 // for callers without a dynamic-address feed overlay (tests, legacy paths). The
 // production snapshot path uses buildDestinationNATSnapshotsWithFeeds (#3303).
@@ -634,6 +666,24 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			ruleCounterID := natCounterID(natCounterIDs, dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 			pool, ok := cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]
 			if !ok || pool == nil || pool.Address == "" {
+				continue
+			}
+			// #3450 fail-closed (lenient / peer-sync backstop; the commit gate
+			// validateDNATPoolStrict rejects these). A pool with a
+			// configured-but-invalid port (0/out-of-range/non-numeric — PortRaw
+			// set but Port not in 1..65535) or a non-host pool address must
+			// publish NO entry, so the rule matches NOTHING rather than wrapping
+			// the port on a uint16 cast, collapsing to preserve-destination-port,
+			// or coercing a non-host CIDR to its network base.
+			poolAddr, poolAddrOK := dnatPoolHostIP(pool.Address)
+			if !poolAddrOK {
+				slog.Warn("userspace snapshot: skipping DNAT rule with non-host pool address (fail-closed, #3450)",
+					"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "address", pool.Address)
+				continue
+			}
+			if pool.PortRaw != "" && (pool.Port < 1 || pool.Port > 65535) {
+				slog.Warn("userspace snapshot: skipping DNAT rule with out-of-range pool port (fail-closed, #3450)",
+					"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "port_raw", pool.PortRaw, "port", pool.Port)
 				continue
 			}
 			// #2395: a DNAT rule may publish multiple destination addresses
@@ -847,6 +897,10 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				for _, dstPort := range dstPorts {
 					poolPort := dstPort
 					if pool.Port != 0 {
+						// #3450: pool.Port is gated to 1..65535 above (an
+						// invalid configured port skips the whole rule), so this
+						// uint16 cast can no longer wrap. Port == 0 (no `port`
+						// leaf) preserves the destination port, unchanged.
 						poolPort = uint16(pool.Port)
 					}
 
@@ -856,10 +910,9 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 						proto = "tcp" // default for port-based DNAT
 					}
 
-					poolAddr := pool.Address
-					if idx := strings.IndexByte(poolAddr, '/'); idx != -1 {
-						poolAddr = poolAddr[:idx]
-					}
+					// #3450: poolAddr is the validated single-host IP (CIDR
+					// suffix stripped, non-host prefix / non-IP token already
+					// rejected above). Computed once before the rule loop.
 
 					// #2395: emit one snapshot per configured destination so a
 					// bracket-list DNAT installs a table entry for EVERY
