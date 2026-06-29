@@ -170,14 +170,19 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 	}
 	resp.TotalActiveTranslations = counts.total
 
-	// Interface-mode pools
+	// Interface-mode pools. Each interface-mode rule set must report only
+	// the SNAT sessions that traversed its own from/to zone pair, not the
+	// firewall-wide SNAT total — otherwise per-uplink/per-tenant pool usage
+	// is masked by every row showing the global count (#3417). The
+	// per-rule-set breakdown is already computed in counts.ruleSetSessions
+	// (keyed by ingress/egress zone name) and surfaced via resp.RuleSetSessions.
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {
 			if rule.Then.Interface {
 				resp.Pools = append(resp.Pools, &pb.NATPoolStats{
 					Name:        fmt.Sprintf("%s->%s", rs.FromZone, rs.ToZone),
 					Address:     "interface",
-					UsedPorts:   counts.total,
+					UsedPorts:   counts.ruleSetSessions[natRuleSetKey{rs.FromZone, rs.ToZone}],
 					IsInterface: true,
 				})
 			}

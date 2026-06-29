@@ -236,6 +236,21 @@ under the daemon's errgroup. Nothing else imports this package.
   the legacy counter and are the follow-up SSOT surfaces (the Prometheus
   `xpf_userspace_snat_pool_*` family in `metrics_userspace.go` already
   exposes the runtime per-pool view).
+- Interface-mode source-NAT rows (`source-nat interface`, no named pool)
+  report `UsedPorts` as the count of forward SNAT sessions that traversed
+  THAT rule set's own from/to zone pair — not the firewall-wide SNAT total
+  (#3417). `natPoolStatsHandler` iterates sessions once, keying the count by
+  the session's ingress/egress zone (mapped to names via the apply result's
+  `ZoneIDs`), and each `<from>-><to>` row reads only its own bucket. Without
+  the zone map (no apply result yet) attribution is impossible, so rows
+  report 0 rather than a wrong aggregate. The #2469 fail-closed behavior is
+  preserved: a partial session scan returns HTTP 500 rather than a
+  healthy-but-low figure. The gRPC `GetNATPoolStats` mirrors this, setting
+  each interface row from `counts.ruleSetSessions[{from,to}]` (the same
+  per-rule-set breakdown it already surfaces in `RuleSetSessions`); CLI `show
+  security nat source pool` renders the gRPC value directly. Pinned by
+  `TestNATPoolStatsHandlerInterfaceModePerRuleSet` (REST) and
+  `TestGetNATPoolStatsInterfaceModePerRuleSet` (gRPC), both fail-on-revert.
 - Query-filter parsing fails CLOSED, matching the gRPC contract
   (#2934/#2935/#2939). A filter sentinel of `0`/`""` means "no filter",
   so a *malformed* filter value must error rather than silently fall
