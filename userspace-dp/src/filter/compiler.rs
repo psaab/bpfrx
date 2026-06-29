@@ -163,6 +163,17 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 state
                     .iface_filter_v4_fast
                     .insert(iface.ifindex, filter.clone());
+            } else {
+                // #3296: the hook names a filter that is not in the compiled
+                // table. Leaving no _fast entry would fall through to the
+                // default Accept — a fail-open on a typo'd security hook.
+                // Refuse the snapshot (preflight preserves prior good state).
+                return Err(SnapshotIntegrityError::MissingFilterRef {
+                    interface: iface.name.clone(),
+                    family: "inet".to_string(),
+                    direction: "input".to_string(),
+                    filter: iface.filter_input_v4.clone(),
+                });
             }
             state.iface_filter_v4.insert(iface.ifindex, key);
         }
@@ -185,6 +196,16 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 state
                     .iface_filter_out_v4_fast
                     .insert(iface.ifindex, filter.clone());
+            } else {
+                // #3296: missing output filter ref. With no _fast entry AND no
+                // needs_tx_eval flag, the TX evaluator is skipped entirely and
+                // the packet is accepted — a fail-open. Refuse the snapshot.
+                return Err(SnapshotIntegrityError::MissingFilterRef {
+                    interface: iface.name.clone(),
+                    family: "inet".to_string(),
+                    direction: "output".to_string(),
+                    filter: iface.filter_output_v4.clone(),
+                });
             }
             state.iface_filter_out_v4.insert(iface.ifindex, key);
         }
@@ -216,6 +237,14 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 state
                     .iface_filter_v6_fast
                     .insert(iface.ifindex, filter.clone());
+            } else {
+                // #3296: missing input filter ref → fail-open. Refuse.
+                return Err(SnapshotIntegrityError::MissingFilterRef {
+                    interface: iface.name.clone(),
+                    family: "inet6".to_string(),
+                    direction: "input".to_string(),
+                    filter: iface.filter_input_v6.clone(),
+                });
             }
             state.iface_filter_v6.insert(iface.ifindex, key);
         }
@@ -238,6 +267,14 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 state
                     .iface_filter_out_v6_fast
                     .insert(iface.ifindex, filter.clone());
+            } else {
+                // #3296: missing output filter ref → fail-open. Refuse.
+                return Err(SnapshotIntegrityError::MissingFilterRef {
+                    interface: iface.name.clone(),
+                    family: "inet6".to_string(),
+                    direction: "output".to_string(),
+                    filter: iface.filter_output_v6.clone(),
+                });
             }
             state.iface_filter_out_v6.insert(iface.ifindex, key);
         }
@@ -249,12 +286,32 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         qualify_filter_key("inet", lo0_filter_v4)
     };
     state.lo0_filter_v4_fast = state.filters.get(&state.lo0_filter_v4).cloned();
+    if !lo0_filter_v4.is_empty() && state.lo0_filter_v4_fast.is_none() {
+        // #3296: lo0 host-bound input filter names a filter not in the table.
+        // Falling through to the default Accept would leave the routing-engine
+        // protect filter unarmed (the canonical lo0 lockout hook) — fail-open.
+        return Err(SnapshotIntegrityError::MissingFilterRef {
+            interface: "lo0".to_string(),
+            family: "inet".to_string(),
+            direction: "input".to_string(),
+            filter: lo0_filter_v4.to_string(),
+        });
+    }
     state.lo0_filter_v6 = if lo0_filter_v6.is_empty() {
         String::new()
     } else {
         qualify_filter_key("inet6", lo0_filter_v6)
     };
     state.lo0_filter_v6_fast = state.filters.get(&state.lo0_filter_v6).cloned();
+    if !lo0_filter_v6.is_empty() && state.lo0_filter_v6_fast.is_none() {
+        // #3296: lo0 host-bound inet6 input filter missing → fail-open. Refuse.
+        return Err(SnapshotIntegrityError::MissingFilterRef {
+            interface: "lo0".to_string(),
+            family: "inet6".to_string(),
+            direction: "input".to_string(),
+            filter: lo0_filter_v6.to_string(),
+        });
+    }
 
     Ok(state)
 }

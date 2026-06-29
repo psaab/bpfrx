@@ -139,6 +139,33 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 
 // showPoliciesDetail displays an expanded Junos-style detail view of security policies.
 
+// printPolicyMatchAddresses renders a policy's Source/Destination addresses in
+// the detail view. #3336: when `source-address-excluded` /
+// `destination-address-excluded` is set the match sense is INVERTED — the rule
+// matches every address EXCEPT those listed — so the header is annotated
+// "(except)". Without this an operator reading the detail saw the rule's
+// meaning backwards. An un-inverted policy renders bit-identically to before.
+func printPolicyMatchAddresses(cfg *config.Config, pol *config.Policy) {
+	printAddrs := func(label string, addrs []string, excluded bool) {
+		if excluded {
+			fmt.Printf("  %s (except):\n", label)
+		} else {
+			fmt.Printf("  %s:\n", label)
+		}
+		for _, addr := range addrs {
+			if addr == "any" {
+				fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+				fmt.Printf("    any-ipv6(global): ::/0\n")
+			} else {
+				resolved := resolveAddressDetail(cfg, addr)
+				fmt.Printf("    %s(global): %s\n", addr, resolved)
+			}
+		}
+	}
+	printAddrs("Source addresses", pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded)
+	printAddrs("Destination addresses", pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded)
+}
+
 func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) error {
 	schedActive, haveSched := c.policySchedulerActiveState()
 	// #3063: the displayed Index must equal the runtime/RT_FLOW policy ID,
@@ -193,26 +220,7 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 			if pol.Description != "" {
 				fmt.Printf("  Description: %s\n", pol.Description)
 			}
-			fmt.Printf("  Source addresses:\n")
-			for _, addr := range pol.Match.SourceAddresses {
-				if addr == "any" {
-					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
-					fmt.Printf("    any-ipv6(global): ::/0\n")
-				} else {
-					resolved := resolveAddressDetail(cfg, addr)
-					fmt.Printf("    %s(global): %s\n", addr, resolved)
-				}
-			}
-			fmt.Printf("  Destination addresses:\n")
-			for _, addr := range pol.Match.DestinationAddresses {
-				if addr == "any" {
-					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
-					fmt.Printf("    any-ipv6(global): ::/0\n")
-				} else {
-					resolved := resolveAddressDetail(cfg, addr)
-					fmt.Printf("    %s(global): %s\n", addr, resolved)
-				}
-			}
+			printPolicyMatchAddresses(cfg, pol)
 			for _, app := range pol.Match.Applications {
 				fmt.Printf("  Application: %s\n", app)
 				c.printAppDetail(cfg, app)
@@ -275,26 +283,7 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 			if pol.Description != "" {
 				fmt.Printf("  Description: %s\n", pol.Description)
 			}
-			fmt.Printf("  Source addresses:\n")
-			for _, addr := range pol.Match.SourceAddresses {
-				if addr == "any" {
-					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
-					fmt.Printf("    any-ipv6(global): ::/0\n")
-				} else {
-					resolved := resolveAddressDetail(cfg, addr)
-					fmt.Printf("    %s(global): %s\n", addr, resolved)
-				}
-			}
-			fmt.Printf("  Destination addresses:\n")
-			for _, addr := range pol.Match.DestinationAddresses {
-				if addr == "any" {
-					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
-					fmt.Printf("    any-ipv6(global): ::/0\n")
-				} else {
-					resolved := resolveAddressDetail(cfg, addr)
-					fmt.Printf("    %s(global): %s\n", addr, resolved)
-				}
-			}
+			printPolicyMatchAddresses(cfg, pol)
 			for _, app := range pol.Match.Applications {
 				fmt.Printf("  Application: %s\n", app)
 				c.printAppDetail(cfg, app)

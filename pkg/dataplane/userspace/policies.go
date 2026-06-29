@@ -1085,7 +1085,34 @@ func isV6CIDR(s string) bool {
 var _ = hex.EncodeToString
 
 func stablePolicyRuleID(fromZone, toZone, ruleName string) string {
+	return StablePolicyRuleID(fromZone, toZone, ruleName)
+}
+
+// StablePolicyRuleID returns the stable string rule identity
+// ("<from>-><to>/<name>") carried as PolicyRuleSnapshot.RuleID and joined to
+// runtime events. It is exported so the read-only inventory surfaces (REST
+// GetPolicies, gRPC GetPolicies) can emit the identical rule_id the snapshot /
+// event path uses, without re-deriving the format and risking drift (#3336).
+// Global policies pass fromZone == toZone == "junos-global", matching the
+// snapshot builder.
+func StablePolicyRuleID(fromZone, toZone, ruleName string) string {
 	return fmt.Sprintf("%s->%s/%s", fromZone, toZone, ruleName)
+}
+
+// RuntimePolicyIndex returns the span-accumulated runtime/RT_FLOW policy ID for
+// the policy at (policySetID, sliceIndex) from a RuntimePolicyIDs map, falling
+// back to the raw ordinal policySetID*MaxRulesPerPolicy + sliceIndex when the
+// map has no entry (a config the dataplane would reject for MaxRulesPerPolicy
+// overflow — byte-identical to the pre-#3063 ordinal). This is the DISPLAY
+// identity an inventory surface should report as policy_id so it matches the
+// numeric ID the RT_FLOW/event path logs; it is NOT the counter handle passed
+// to ReadPolicyCounters (callers keep passing the raw ordinal). Exported for
+// the REST/gRPC inventory surfaces (#3336); the CLI keeps its own copy.
+func RuntimePolicyIndex(ids map[[2]uint32]uint32, policySetID, sliceIndex uint32) uint32 {
+	if id, ok := ids[[2]uint32{policySetID, sliceIndex}]; ok {
+		return id
+	}
+	return policySetID*dataplane.MaxRulesPerPolicy + sliceIndex
 }
 
 func userspacePolicyRuleExpansionCount(cfg *config.Config, apps []string) uint32 {

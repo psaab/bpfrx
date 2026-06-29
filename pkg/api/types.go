@@ -103,6 +103,29 @@ type PolicyRule struct {
 	// and for ordinary zone-pair rules.
 	MatchFromZone string `json:"match_from_zone,omitempty"`
 	MatchToZone   string `json:"match_to_zone,omitempty"`
+	// SourceAddressExcluded / DestinationAddressExcluded carry the match
+	// inversion (#3336): the rule matches every address EXCEPT those in
+	// src_addresses / dst_addresses (Junos `source-address-excluded` /
+	// `destination-address-excluded`). The flags exist end-to-end (config ->
+	// snapshot -> dataplane) but were never surfaced here, so an audit reading
+	// the address slices saw the rule's meaning INVERTED. Omitted (false) for a
+	// rule without the modifier — no behavior change for existing consumers.
+	SourceAddressExcluded      bool `json:"source_address_excluded,omitempty"`
+	DestinationAddressExcluded bool `json:"destination_address_excluded,omitempty"`
+	// LogSessionInit / LogSessionClose expose the independent `then log
+	// session-init` / `session-close` modes (#3336). The Log bool above
+	// collapses both into one flag, so init-only, close-only, and both rendered
+	// identically. Omitted (false) when unset.
+	LogSessionInit  bool `json:"log_session_init,omitempty"`
+	LogSessionClose bool `json:"log_session_close,omitempty"`
+	// PolicyID / RuleID carry the runtime identity (#3336): PolicyID is the
+	// span-accumulated runtime/RT_FLOW policy ID (the value events expose);
+	// RuleID is the stable "<from>-><to>/<name>" string the snapshot carries.
+	// Together they let automation join a runtime event (policy_id=N) back to
+	// this inventory row. PolicyID is omitted when 0 (the first rule of the
+	// first zone-pair set); RuleID is always populated.
+	PolicyID uint32 `json:"policy_id,omitempty"`
+	RuleID   string `json:"rule_id,omitempty"`
 }
 
 // SessionEntry holds a single session table entry.

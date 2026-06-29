@@ -240,8 +240,10 @@ func TestUnsupportedGateDoesNotMatchDeviceMapMAC(t *testing.T) {
 }
 
 func TestUnsupportedGateDoesNotMatchInterfaceFilter(t *testing.T) {
-	// A unit-level firewall filter binding is supported and must compile.
+	// A unit-level firewall filter binding is supported and must compile
+	// (the referenced filter is defined; #3296 only rejects DANGLING refs).
 	assertCommitAccepts(t, flatTreeFromSets(t,
+		"set firewall family inet filter myfilter term t1 then accept",
 		"set interfaces ge-0/0/0 unit 0 family inet filter input myfilter",
 		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
 	))

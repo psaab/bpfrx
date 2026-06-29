@@ -252,6 +252,27 @@ message PolicyRule {
   // the configured zone scope so a scoped global is not shown as all-zones.
   string match_from_zone = 11;
   string match_to_zone = 12;
+  // #3336: match-inversion flags. source_address_excluded /
+  // destination_address_excluded invert the corresponding address match sense
+  // (Junos `source-address-excluded` / `destination-address-excluded`): the
+  // rule matches every address EXCEPT those listed. The flags exist end-to-end
+  // (config -> snapshot -> dataplane) but were never surfaced on the inventory
+  // API, so an audit reading src_addresses/dst_addresses saw the rule's meaning
+  // INVERTED. Additive; false (omitted) for a rule without the modifier.
+  bool source_address_excluded = 13;
+  bool destination_address_excluded = 14;
+  // #3336: per-policy `then log session-init` / `session-close` selection. The
+  // `log` bool above collapses both to one flag, so init-only, close-only, and
+  // both render identically. These expose the independent modes the config and
+  // snapshot already carry. Additive; false (omitted) when unset.
+  bool log_session_init = 15;
+  bool log_session_close = 16;
+  // #3336: runtime identity. policy_id is the span-accumulated runtime/RT_FLOW
+  // policy ID (matches the ID events expose); rule_id is the stable
+  // "<from>-><to>/<name>" string the snapshot carries. They let automation join
+  // a runtime event (policy_id=N) back to this inventory row.
+  uint32 policy_id = 17;
+  string rule_id = 18;
 }
 
 message GetSessionsRequest {
