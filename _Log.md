@@ -1,3 +1,88 @@
+## 2026-06-29 — #3348 (PR #3506 review fold) inline-term edge cases
+
+- **Timestamp**: 2026-06-29
+- **Action**: Codex MERGE-NEEDS-MAJOR on PR #3506 — top-level junos-ping
+  fix correct, two inline-term edge cases folded. (1) Widening inversion:
+  a term listing BOTH junos-ping AND an all-ICMP alias normalizes both to
+  "icmp" and dedups to one term; applying echoByProto narrowed the union
+  to echo-only. Added unconstrainedICMP[proto] tracking — an all-ICMP
+  alias (icmp/icmpv6/junos-icmp-all/junos-icmp6-all) on a normalized proto
+  suppresses the echo default for that proto. (2) Fail-open: a malformed
+  inline-term icmp-type (e.g. 999) was silently dropped (term opaque to
+  schema) → unconstrained all-ICMP. Added Application.UnknownICMP
+  (mirroring UnknownTimeouts), recorded in both inline-term and top-level
+  parse, rejected by validateApplicationSpecsStrict at commit /
+  downgraded to warning on the lenient load/peer-sync path. RED-on-revert
+  tests added for both. go test config/appid/policymatch green; gofmt +
+  vet clean. Rebased on origin/master (clean, no #3332 overlap).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/types_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/config/README.md, docs/config-schema.md
+
+## 2026-06-29 — #3348 custom protocol junos-ping echo constraint + icmp-type/icmp-code grammar
+
+- **Timestamp**: 2026-06-29
+- **Action**: A user-defined application with `protocol junos-ping` /
+  `junos-pingv6` lowered to bare ICMP with no type constraint, so the
+  projected policy term matched EVERY ICMP type (security widening — a
+  permit term admitted unreachable/redirect/timestamp, not just echo),
+  broader than the predefined junos-ping object (ICMPType=8, #3020). Added
+  `aliasEchoICMPType` to attach echo type 8/128 on both the top-level and
+  inline-term application paths (after the child loop so an explicit
+  icmp-type wins; all-ICMP aliases stay unconstrained). Also added the
+  missing `icmp-type`/`icmp-code` typed-integer (0..255) schema leaves so
+  an operator can author a constrained custom echo/traceroute/ICMP-control
+  app, wired through to Application.ICMPType/ICMPCode on both paths. Added
+  strict guards (validateApplicationSpecsStrict + protocolIsICMPFamily):
+  reject icmp-type/code on a non-ICMP protocol (never-match term, #3373
+  hazard) and icmp-code without icmp-type; both downgrade to a warning on
+  the lenient load/peer-sync path (#1960). No wire/Rust change — the
+  snapshot already carries the constraint and the matcher already enforces
+  it (#3020).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/schema_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/policymatch/app_junos_ping_3348_test.go,
+  pkg/policymatch/icmp_test.go (stale-comment fix), pkg/config/README.md,
+  docs/config-schema.md
+## 2026-06-29 — #3296 undefined interface/lo0 filter reference fail-open
+
+- **Timestamp**: 2026-06-29
+- **Action**: Promote an undefined interface/lo0 firewall filter reference
+  from a commit WARNING to a strict commit error + add a fail-closed
+  dataplane backstop. Before: `interfaces <if> unit <n> family inet|inet6
+  filter input|output <name>` (and lo0 input) naming a filter not defined
+  under `firewall family ... filter` was warn-only at commit, and the Rust
+  snapshot compiler left the per-interface fast-path map (and output
+  needs_tx_eval set) empty for the missing key → hot path returned the
+  default Accept → hook silently disarmed (fail-OPEN on a typo'd security
+  hook). Go: new `validateFirewallFilterReferencesStrict`
+  (compiler_validate_strict.go), wired at the firewall-gate cluster
+  (compiler.go) gated on `opts.lenientFirewallRefs` — strict on commit,
+  downgraded-warn on lenient/peer-sync (#1960). Deleted the superseded
+  warn-only interface filter-reference loop in compiler_validate_warn.go
+  (avoids a duplicate warning on the lenient path). lo0 is covered for free
+  (stored as cfg.Interfaces.Interfaces["lo0"]). Rust: new
+  `SnapshotIntegrityError::MissingFilterRef` raised by `parse_filter_state`
+  (filter/compiler.rs) on a named-but-missing interface/lo0 ref —
+  preflight reject preserves prior good state, never falls open to Accept.
+  Mirrors the policer (#2217) / prefix-list (#2506) strict-reference
+  precedent and the #2505 snapshot-integrity backstop doctrine.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_filter_ref_3296_test.go (new),
+  pkg/config/compiler_interfaces_unsupported_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/parser_services_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md
+- **Validation**: `go test ./pkg/config/...` green (8 new + 5 fixed
+  pre-existing tests that referenced undefined filters); `cargo build`
+  green; new Rust tests `missing_filter_ref_3296_*` /
+  `defined_filter_ref_3296_compiles_cleanly` pass; full Rust suite 3223
+  pass / 2 pre-existing flakes (event_stream/worker_queue, confirmed
+  failing on pristine origin/master, unrelated to filters).
+
 ## 2026-06-28 — #3499 compiler_iface nil zone/interface map-value guards
 
 - **Timestamp**: 2026-06-28
@@ -23213,6 +23298,17 @@ top.
   - **Action**: #3494 round-3 EXHAUSTIVE whole-file nil-deref sweep (both reviewers proved the prior "nil-complete" claim still missed 5 sites). Audited EVERY `for ... range` + indexed deref across the ENTIRE compiler_validate_warn.go (ValidateConfig + all 14 helper funcs). Guarded the 6 remaining unguarded pointer-deref sites: RoutingInstances (ri==nil, L369), Interfaces.Interfaces (ifc==nil, L384), ifc.Units (unit==nil, L385), cc.RedundancyGroups (rg==nil, L465), fm.Version9.Templates + fm.VersionIPFIX.Templates (tmpl==nil, L604/609). Already-guarded (verified, untouched): Login.Users, NAT.Static, the entire CoS block (class/sched/schedMap/classifier/entry/iface/unit), fabric f0/f1, and all helper-func loops (filter/term, routing-window sr/inst, cos-oversub, anySampling, surfaceADDNS provider/ifc/unit, ddns-backend). Non-pointer-safe (no guard needed): all key-only ranges, []string element ranges, comma-ok `[...]` lookups with discarded value. The pass is now genuinely nil-complete. Extended TestValidateConfigNilSlotsNoPanic to inject a nil routing-instance, nil interface, nil interface-unit, nil redundancy-group, and nil v9+ipfix templates; verified EACH of the 6 guards independently RED-on-revert (per-guard strip -> panic).
   - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_nil_3494_test.go, _Log.md
 - **Timestamp**: 2026-06-29
+  - **Action**: #3437 DNAT `match application` source-port (H10) + ICMP type/code (H11) enforcement — the DNAT analog of #3429/#3491 (source-NAT match enforcement). The DNAT snapshot builder reduced an application to protocol + destination-port only, dropping the app's `source-port` constraint and any ICMP type/code (e.g. `match application junos-ping` = ICMP echo-request type 8 translated EVERY ICMP type/error/reply to the VIP — a fail-open NAT widening that regressed the #3020/#3194 policy-path ICMP parity). Fix carries both to the dataplane following the #3429/#3491 pattern: (1) wire (additive, #1961 skew-safe) — DestinationNATRuleSnapshot gains MatchSourcePorts ([]NatPortRangeWire, never-match sentinel {1,0} fail-CLOSED reuse) + MatchICMPType/MatchICMPCode (*uint8); Rust mirror with #[serde(default)]; fixture regenerated (3 default-specimen fields, wire_invariant green). (2) Go builder (pkg/dataplane/userspace/nat.go) — DNAT appTerm carries srcPorts (coalesced w/ sentinel) + icmpType/icmpCode; explicit-match fallback leaves both unconstrained (DNAT `match` has no source-port/ICMP grammar). (3) Rust matcher (nat/destination.rs) — DnatEntry gains match_src_ports/match_icmp_type/match_icmp_code + l4_extra_matches gate AND-ed into match_entries AND match_prefix_slots (LPM path) before translation; src_port + packet_icmp threaded through lookup_with_counter[_scoped]; poll_descriptor supplies flow.forward_key.src_port + policy_packet_icmp(packet_frame, meta). Dedup identity (insert_entry/insert_prefix_slot) extended with the L4-extra fields so two app-set terms sharing (zone,prefix,proto,port) but differing in ICMP type don't collapse. ICMP-constrained entry fails CLOSED for a non-ICMP packet (packet_icmp None). lookup() kept as a 5-arg test convenience wrapper (src_port=0/icmp=None). RED-on-revert verified BOTH sides: Go (4 of 5 tests fail when the MatchSourcePorts/ICMP builder assignment is stripped; unconstrained-guard stays green), Rust (4 of 5 fail when l4_extra_matches is neutered to return true). Confirmed the 2 event_stream test failures are PRE-EXISTING on clean origin/master (d61f531f6), unrelated to NAT. NOTE: did NOT run `cargo fmt` (it mass-reformats ~195 unrelated files — the crate does not gate on it); hand-formatted my added lines to match surrounding style.
+  - **File(s)**: pkg/dataplane/userspace/nat.go, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/nat_dnat_app_match_3437_test.go, userspace-dp/src/nat/destination.rs, userspace-dp/src/protocol/nat.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/services-application-identification.md, _Log.md
+  - **Action**: #3326 host-inbound deny counter. The AF_XDP userspace dataplane silently dropped host-inbound-denied (LocalDelivery) packets and bumped only an internal debug counter, so the exported GlobalCtrHostInboundDeny (REST host_inbound_denies / Prometheus xpf_host_inbound_denies_total / `show security flow statistics`) stayed 0 while enforcement dropped traffic. Added a `host_inbound_denied_packets` counter mirroring `policy_denied_packets` end to end: BindingLiveState atomic + init (umem/mod.rs), BatchCounters field + flush (afxdp/mod.rs), snapshot literal (umem/snapshot.rs), BindingLiveSnapshot (worker/mod.rs), wire BindingStatus serde field (protocol/binding.rs), refresh_bindings copy + reset, reconcile/reset.rs reset, and a bump in BOTH host-inbound `host_inbound_gated_lo0_action == None` deny branches in poll_descriptor (session-HIT also sets counters.touched). Go: BindingStatus.HostInboundDeniedPackets wire field (protocol.go), userspaceCounterSnapshot.hostInboundDenied + sumBindingCounters + the GlobalCtrHostInboundDeny delta push (manager_ha.go). Regenerated protocol_wire_v1.json (single new key). RED-on-revert: poll_descriptor_host_inbound_deny_counts_local_delivery_session_miss (Rust) + admit-all GREEN companion + TestSumBindingCounters extension (Go). Build green (cargo + go test ./pkg/dataplane/...), gofmt clean. Doc: docs/junos-cli-reference.md host-inbound section.
+  - **File(s)**: userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/snapshot.rs, userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/protocol/binding.rs, userspace-dp/src/afxdp/coordinator/refresh_bindings.rs, userspace-dp/src/afxdp/coordinator/reconcile/reset.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager_ha.go, pkg/dataplane/userspace/manager_test.go, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3424 flow-trace size/files bound + enforcement. Added commit-time range gate validateFlowTraceSizeFilesAST (`security flow traceoptions file <name> size <s> files <n>`): size 10240..1073741824 bytes, files 2..1000, matching the interactive `monitor security flow file` CLI limits. Bounds exported as config.FlowTraceMin/MaxFileSize + FlowTraceMin/MaxFileCount (single SSOT for the gate AND the runtime clamp). Strict commit/commit-check rejects out-of-range; lenient load/peer-sync downgrades to a warning (new lenientFlowTraceSizeFiles opt) since NewTraceWriter now clamps to the same bounds at runtime — so a leniently-loaded `size 1 files 1000000000` can no longer rotate on every trace line and run a ~1e9-iteration rename loop under the writer mutex (the per-event CPU storm, codex-review-097 M03). Also fixed a latent #2419-class compiler bug: the flat-set form collapses size/files onto ONE child node's Keys, and compileFlow's old FindChild("files") missed it (read FileSize but dropped FileCount); replaced with shared flowTraceSizeFilesValues token-scan used by both compileFlow and the gate. RED-on-revert verified: neutering the gate call + clamp turns the config reject tests + lenient-downgrade + runtime-clamp tests RED (and the sub-minimum-size test reproduced the storm at ~50s). go test ./pkg/config/... ./pkg/logging/... ./pkg/cli/... ./pkg/grpcapi/... green; gofmt + go vet clean.
+  - **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler.go, pkg/logging/trace.go, pkg/config/flow_traceoptions_size_3424_test.go, pkg/logging/trace_size_3424_test.go, pkg/logging/trace_test.go, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3295 firewall-filter no-match fall-through. Research (docs/research/3295-filter-failopen/plan.md) PLAN-KILLed the runtime flip (implicit-accept -> implicit-discard) on the verified "keep GOOD" wall: the CoS bandwidth-output allowlist attached as `reth0 unit 80 family inet/inet6 filter output` has no final catch-all, so a flip would blackhole all unmatched egress at TX selection (cos_classify.rs drop on action != Accept). Shipped the research-recommended mitigation instead, runtime UNCHANGED: a commit-time WARNING (validateFilterNoCatchAllWarnings) for any filter ATTACHED to an interface/lo0 input/output hook that has no terminal catch-all term (unconstrained `from` + terminating accept/discard/reject, NextTerm=false). Surfaces the deliberate divergence + the explicit-final-`then discard` workaround. WARN-only (never an error; no-brick). Docs: filter README + feature-coverage.md. RED-on-revert verified (strip the call -> 3 warn tests fail).
+  - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/compiler_filter_nocatchall_3295_test.go, userspace-dp/src/filter/README.md, docs/feature-coverage.md, _Log.md
   - **Action**: #3347 — `show security log` argument parsing now fails CLOSED. The parse loop in showSecurityLog silently ignored unknown tokens (a typo `zon trust` fell through Atoi and dumped all 50 events) and filter keywords with no value (`action` with nothing after); M02: a `zone <name>` filter requested while no apply result exists (cr==nil at early startup / after a failed apply) dropped the filter and widened to all zones. Fix: reject unknown tokens and missing filter values with a usage error; refuse a zone filter when cr==nil rather than widening. Added cli_show_security_log_argparse_3347_test.go (unknown token, bogus single token, missing zone/protocol/action value, unknown zone, zone-without-apply-result, plus valid count + valid filters); verified each guard RED-on-revert. gofmt clean, go test ./pkg/cli/... green. Documented filter syntax + fail-closed behavior in docs/junos-cli-reference.md.
   - **File(s)**: pkg/cli/cli_show_security_log.go, pkg/cli/cli_show_security_log_argparse_3347_test.go, docs/junos-cli-reference.md, _Log.md
 
@@ -23220,3 +23316,12 @@ top.
 - **Timestamp**: 2026-06-29
 - **Action**: Surface source/destination-address-excluded, log_session_init/close, and runtime policy_id/rule_id in the REST + gRPC policy inventory; render `(except)` for inverted address sets in CLI `show security policies detail`. Added exported StablePolicyRuleID + RuntimePolicyIndex helpers (SSOT) in pkg/dataplane/userspace. RED-on-revert tests in api/grpcapi/cli.
 - **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (regen), pkg/grpcapi/server_show_zones.go, pkg/api/types.go, pkg/api/security.go, pkg/cli/cli_show_security.go, pkg/dataplane/userspace/policies.go, docs/junos-cli-reference.md, + 3 _3336_test.go files
+  - **Action**: #3439 H5+L2 — live session inspection silently dropped malformed filters and accepted invalid protocol/negative offset. H5 (remote CLI, cmd/cli/show.go): rewrote showFlowSession arg parsing into a strict, unit-testable parseFlowSessionArgs that mirrors the strict local parser (pkg/cli/session_filter.go) — unparseable numeric values, out-of-range ports, non-numeric zone/limit, unknown protocol token, missing values, and unknown filter keywords now FAIL the command instead of leaving the field at zero (wildcard) and silently widening the inspected set. L2 (pkg/grpcapi/server_sessions.go): buildSessionFilter now validates the protocol token via appid.ProtocolNumber (known name or numeric 0-255) -> InvalidArgument for "tcpip"; getSessionsLegacy rejects negative offset -> InvalidArgument; rewrote protoFilterMatches to resolve via appid.ProtocolNumber so name-only tokens (sctp/ospf) match correctly. Removed now-unused strconv import. RED-on-revert verified for all three guards (protocol, offset, remote-CLI strict parse). Docs: docs/junos-cli-reference.md "Strict filter validation (#3439)".
+  - **File(s)**: cmd/cli/show.go, cmd/cli/show_flowsession_3439_test.go, pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_filter_3439_test.go, docs/junos-cli-reference.md, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3439 Codex MERGE-NEEDS-MAJOR fold (3 gaps). (1) Cursor-mode negative-offset bypass: GetSessions routed PageSize>0 to getSessionsCursor which never checked offset; moved the negative-offset rejection UP to GetSessions (before the PageSize branch) so BOTH cursor and legacy paths return InvalidArgument; removed the now-redundant legacy-internal guard. (2) summary/sort-by parse-then-ignore: the remote summary RPC and top-talkers path silently dropped any parsed filter (local CLI APPLIES it — divergence); parseFlowSessionArgs now records hasFilter and REJECTS combining a traffic filter with summary/sort-by (full filter+aggregation parity would need proto/top-talker plumbing changes out of #3439 scope). (3) protocol ipv6 regression: my appid.ProtocolNumber-only guard rejected "ipv6" (ProtocolName(41) renders it but ProtocolNumber is deliberately one-way per #3393, load-bearing in the pkg/config acceptance mirror + server_diag + eventbuf). Added appid.ProtocolNumberLenient (ProtocolNumber OR a ProtocolName reverse-scan) used ONLY by the session-filter validators/matcher — the strict ProtocolNumber SSOT is UNCHANGED, so the #2175 FilterProtocolResolvable drift guard stays green. Refs #3393 (NOT closing). Validation: go test ./pkg/cli/... ./pkg/grpcapi/... ./cmd/cli/... ./pkg/appid/... green; gofmt clean; RED-on-revert verified for all 3 (cursor+legacy offset, filter+summary/sort-by, ipv6 lenient resolve+match across appid/grpcapi/cmd-cli).
+  - **File(s)**: pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_filter_3439_test.go, cmd/cli/show.go, cmd/cli/show_flowsession_3439_test.go, pkg/appid/catalog.go, pkg/appid/protocol_lenient_3439_test.go, docs/junos-cli-reference.md, _Log.md
+  - **Action**: #3332 general flat-set trailing-token arity gate (rescoped from the screen subset #3411 already shipped). A SUPPORTED fixed-arity scalar value leaf (`description`, `host-name`, dynamic-peer/feed `hostname`) silently dropped trailing tokens: flat-set `set interfaces ge-0-0-0 description hello bogus` parks `bogus` as an orphan child the compiler never reads. Added an explicit per-leaf `scalar: true` schemaNode marker + `isScalarValueLeaf` predicate + `validateScalarValueLeaf` (rejects the first Keys token past `1+args` and the first AST child at commit). Opt-in, NOT structural inference: review found `applications application-set <name> { application <member>; }` is `args:1,children:nil` but an OPAQUE CONTAINER whose body lands on Children exactly like a typo — a structural-only gate false-rejected it (caught when the gate fired in pkg/cli Test_3063). The marker is asserted only on audited fixed-value/no-body leaves; belt-and-braces structural guards make a future mis-tag a no-op. Quoted multi-word values are one token (unaffected); only unquoted junk is rejected; minimum arity not enforced (scoped to EXCESS only). RED-on-revert verified (strip the dispatch -> `description hello bogus` silently accepted). go test ./pkg/config/... ./pkg/cli/... ./pkg/configstore/... ./pkg/cmdtree/... all green; gofmt clean.
+  - **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go, pkg/config/schema_interfaces.go, pkg/config/schema_security.go, pkg/config/schema_system.go, pkg/config/schema_routing.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md
+  - **Action**: #3332 Codex MERGE-NEEDS-MAJOR fold (PR #3509). Codex confirmed NO over-rejection (scalar-guard crux clean); the MAJOR was INCOMPLETENESS — supported flat-set/compact forms bypass the schema-walk scalar gate because their leaf lives under a non-scalar-eligible node. Added a compiler-side companion gate validateTrailingTokensStrict (strict commit + lenientTrailingTokens downgrade, mirrors validateScreenUnknownStrict) covering the two unreachable shapes: (1 MAJOR) address-book `address <name> description <text>`/`<prefix>` — the `address` node is multi:true (absorbs the description sub-token onto Keys for the #2419 dual-AST shape), so the multi-exempt scalar gate never reaches the value slot and mergeAddressNode read only Keys[3]/Keys[2], dropping the rest; record leftover on Address.TrailingTokens (global + zone-local books, since resolveZoneLocalAddressBooks copies only Value/Description). (2 MINOR) IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>` — collapses onto the parent `dynamic` node's Keys (compiler_ipsec.go both sites read Keys[2]); record on IPsecGateway.DynamicHostnameExtras. (3 MINOR) dropped scalar:true on address-set description (AddressSet has no Description field — the tag was a no-op-feature; noted unsupported). (4 NIT) fixed the multi-exempt test to use a REAL #2419 bracketed list (`name-server [ a b c ]`). RED-on-revert verified for all 4 reject cases (strip the recording -> token silently dropped). No over-rejection: `address h2 1.2.3.4/32`, quoted `description "web server frontend"`, and compact `dynamic hostname peer.example.com` all still compile + values preserved. go test ./pkg/config/... ./pkg/cli/... ./pkg/configstore/... ./pkg/cmdtree/... green; gofmt clean.
+  - **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/compiler_security.go, pkg/config/compiler_ipsec.go, pkg/config/types_security.go, pkg/config/schema_security.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md

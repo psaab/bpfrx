@@ -5957,6 +5957,9 @@ fn parsed_nat_rules_share_store_counters() {
             protocol: "tcp".to_string(),
             pool_address: "10.0.0.20".to_string(),
             pool_port: 8443,
+            match_source_ports: vec![],
+            match_icmp_type: None,
+            match_icmp_code: None,
         }],
         &store,
     );
@@ -5965,8 +5968,10 @@ fn parsed_nat_rules_share_store_counters() {
             PROTO_TCP,
             "198.51.100.1".parse().unwrap(),
             "203.0.113.20".parse().unwrap(),
+            0,
             443,
             "untrust",
+            None,
         )
         .expect("dnat match");
     assert!(
@@ -6524,13 +6529,13 @@ fn destination_nat_from_interface_scope_matches_only_named_iface() {
     let dst: IpAddr = "203.0.113.10".parse().unwrap();
     assert!(
         table
-            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "ge-0/0/1.0", "")
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 0, 443, "", "ge-0/0/1.0", "", None)
             .is_some(),
         "interface-scoped DNAT must match on the named ingress interface"
     );
     assert!(
         table
-            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "ge-0/0/2.0", "")
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 0, 443, "", "ge-0/0/2.0", "", None)
             .is_none(),
         "interface-scoped DNAT must NOT match on another ingress interface"
     );
@@ -6554,13 +6559,13 @@ fn destination_nat_from_routing_instance_scope_matches_only_named_vrf() {
     let dst: IpAddr = "203.0.113.10".parse().unwrap();
     assert!(
         table
-            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "", "VR1")
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 0, 443, "", "", "VR1", None)
             .is_some(),
         "RI-scoped DNAT must match in the named VRF"
     );
     assert!(
         table
-            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "", "VR2")
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 0, 443, "", "", "VR2", None)
             .is_none(),
         "RI-scoped DNAT must NOT match in another VRF"
     );
@@ -7050,6 +7055,201 @@ fn source_nat_app_protocol_never_vs_any_3429() {
             matches!(lookup(&any, proto), SourceNatLookup::Matched(_)),
             "any-protocol app term must match protocol {}",
             proto
+        );
+    }
+}
+
+// ===========================================================================
+// #3437: DNAT `match application` source-port (H10) + ICMP type/code (H11)
+// enforcement. Before #3437 the DNAT builder reduced an application to
+// protocol + destination-port only, so the published VIP matched any source
+// port and every ICMP type — a fail-open NAT widening. These tests pin the
+// dataplane gate and are RED when the `l4_extra_matches` source-port / ICMP
+// checks are reverted.
+// ===========================================================================
+
+/// Helper: a single-rule DNAT table whose entry carries the given L4 match
+/// constraints. Destination 203.0.113.10, pool 192.168.1.10, unscoped zone.
+fn dnat_table_with_l4(
+    protocol: &str,
+    destination_port: u16,
+    match_source_ports: Vec<NatPortRangeWire>,
+    match_icmp_type: Option<u8>,
+    match_icmp_code: Option<u8>,
+) -> DnatTable {
+    DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "app-scoped".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port,
+            protocol: protocol.to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            match_source_ports,
+            match_icmp_type,
+            match_icmp_code,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    )
+}
+
+#[test]
+fn dnat_match_application_constrains_source_port_3437() {
+    // `match application <app>` with source-port 12345 -> only a flow whose
+    // SOURCE port is 12345 (hitting dest port 80) is DNAT'd.
+    let table = dnat_table_with_l4(
+        "tcp",
+        80,
+        vec![NatPortRangeWire {
+            low: 12345,
+            high: 12345,
+        }],
+        None,
+        None,
+    );
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+
+    // In-range source port: translated.
+    let hit = table
+        .lookup_with_counter(PROTO_TCP, src, dst, 12345, 80, "", None)
+        .map(|(d, _)| d);
+    assert_eq!(
+        hit,
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "DNAT must fire for the application's source port"
+    );
+
+    // Out-of-range source port: NOT translated (RED on revert of the
+    // source-port gate in l4_extra_matches — without it this is Some).
+    let miss = table
+        .lookup_with_counter(PROTO_TCP, src, dst, 55555, 80, "", None)
+        .map(|(d, _)| d);
+    assert_eq!(
+        miss, None,
+        "DNAT must NOT fire for a source port outside the application's range"
+    );
+}
+
+#[test]
+fn dnat_match_application_source_port_never_match_sentinel_3437() {
+    // A configured source-port that coalesced to nothing -> never-match
+    // sentinel ({low:1, high:0}). The entry must match NO source port (fail
+    // closed), not widen to any.
+    let table = dnat_table_with_l4(
+        "tcp",
+        80,
+        vec![NatPortRangeWire { low: 1, high: 0 }],
+        None,
+        None,
+    );
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+    for sp in [0u16, 1, 80, 12345, 65535] {
+        assert!(
+            table
+                .lookup_with_counter(PROTO_TCP, src, dst, sp, 80, "", None)
+                .is_none(),
+            "never-match source-port sentinel must reject source port {sp}"
+        );
+    }
+}
+
+#[test]
+fn dnat_match_application_constrains_icmp_type_3437() {
+    // `match application junos-ping` = ICMP echo-request (type 8). Only ICMP
+    // type 8 to the VIP is DNAT'd; an echo-reply (type 0), a destination-
+    // unreachable (type 3), and a non-ICMP flow must NOT be translated.
+    let table = dnat_table_with_l4("icmp", 0, vec![], Some(8), None);
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+
+    // Echo-request: translated.
+    let hit = table
+        .lookup_with_counter(PROTO_ICMP, src, dst, 0, 0, "", Some((8, 0)))
+        .map(|(d, _)| d);
+    assert_eq!(
+        hit,
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "DNAT must fire for the application's ICMP type (echo-request)"
+    );
+
+    // Echo-reply (type 0): NOT translated (RED on revert of the ICMP gate —
+    // without it this is Some).
+    assert!(
+        table
+            .lookup_with_counter(PROTO_ICMP, src, dst, 0, 0, "", Some((0, 0)))
+            .is_none(),
+        "DNAT must NOT fire for a different ICMP type (echo-reply)"
+    );
+
+    // Destination-unreachable (type 3): NOT translated.
+    assert!(
+        table
+            .lookup_with_counter(PROTO_ICMP, src, dst, 0, 0, "", Some((3, 1)))
+            .is_none(),
+        "DNAT must NOT fire for an ICMP error type"
+    );
+
+    // Non-ICMP flow (no packet_icmp supplied): fail closed.
+    assert!(
+        table
+            .lookup_with_counter(PROTO_ICMP, src, dst, 0, 0, "", None)
+            .is_none(),
+        "an ICMP-type-constrained entry must fail closed when the packet has no ICMP (type, code)"
+    );
+}
+
+#[test]
+fn dnat_match_application_constrains_icmp_type_and_code_3437() {
+    // type 3 + code 1 (host-unreachable). Right type, wrong code must NOT match.
+    let table = dnat_table_with_l4("icmp", 0, vec![], Some(3), Some(1));
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+    assert!(
+        table
+            .lookup_with_counter(PROTO_ICMP, src, dst, 0, 0, "", Some((3, 1)))
+            .is_some(),
+        "DNAT must fire for the exact (type, code)"
+    );
+    assert!(
+        table
+            .lookup_with_counter(PROTO_ICMP, src, dst, 0, 0, "", Some((3, 0)))
+            .is_none(),
+        "DNAT must NOT fire for the right type but wrong code"
+    );
+}
+
+#[test]
+fn dnat_unconstrained_application_still_matches_any_l4_3437() {
+    // Regression guard: an entry with NO source-port and NO ICMP constraint
+    // (the common case) still matches any source port / any ICMP type — the
+    // fix must not narrow the unconstrained path.
+    let table = dnat_table_with_l4("tcp", 80, vec![], None, None);
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+    for sp in [0u16, 1, 1024, 65535] {
+        assert!(
+            table
+                .lookup_with_counter(PROTO_TCP, src, dst, sp, 80, "", None)
+                .is_some(),
+            "unconstrained DNAT must match any source port (got miss at {sp})"
+        );
+    }
+
+    let icmp_any = dnat_table_with_l4("icmp", 0, vec![], None, None);
+    for t in [0u8, 3, 8, 11] {
+        assert!(
+            icmp_any
+                .lookup_with_counter(PROTO_ICMP, src, dst, 0, 0, "", Some((t, 0)))
+                .is_some(),
+            "unconstrained ICMP DNAT must match any ICMP type (got miss at type {t})"
         );
     }
 }

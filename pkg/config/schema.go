@@ -36,6 +36,7 @@ type schemaNode struct {
 	children     map[string]*schemaNode // known container children
 	wildcard     *schemaNode            // matches any keyword not in children (for dynamic names)
 	multi        bool                   // true = multiple leaf values allowed (e.g. source-address); false = replace on set
+	scalar       bool                   // true = fixed-arity scalar value leaf (keyword + exactly `args` value tokens, NO body); rejects trailing tokens at commit (#3332). Opt-in; see isScalarValueLeaf.
 	valueHint    ValueHint              // hint for dynamic value completion (when args > 0)
 	desc         string                 // description shown in completion help
 	placeholder  string                 // Junos-style placeholder (e.g., "<interface-name>")
@@ -96,6 +97,54 @@ type schemaNode struct {
 // its first non-modifier slot.
 func (n *schemaNode) isTypedLeaf() bool {
 	return n != nil && n.valueType != ValueAny
+}
+
+// isScalarValueLeaf reports whether the node is a fixed-arity scalar value
+// leaf: a keyword that consumes EXACTLY `args` value token(s), models no
+// sub-structure, and whose schema node is explicitly tagged `scalar: true`
+// (#3332). For such a leaf the compiler reads only Keys[1:1+args]; any token
+// or AST child beyond that span is operator garbage the schema walk must
+// reject rather than silently drop (the flat-set trailing-token leakage the
+// screen subset, #3411, fixed only for the screen subtree).
+//
+// Why an EXPLICIT `scalar` opt-in rather than structural inference? An
+// `args > 0, children: nil` node is NOT reliably a value leaf: several are
+// deliberately-OPAQUE CONTAINERS whose body is left to the compiler and
+// parsed off the node's AST children (`applications application-set <name> {
+// application <member>; }`, `applications application <name> { ... }`,
+// `system syslog file <name> { ... }`). Their legitimate body lands on
+// Keys/Children exactly like a typo would, so a structural gate would
+// false-reject real config. The `scalar` tag is asserted only on leaves
+// audited to take a fixed value and NO body — the marker is the design pass
+// the #3332 body called for, and the gate is additive per-leaf.
+//
+// The structural guards below are belt-and-braces: a `scalar` tag is only
+// honored on a leaf that is genuinely fixed-arity and bodyless, so a future
+// mis-tag on a multi/typed/container node degrades to a no-op rather than a
+// surprise rejection.
+//
+//   - multi (bracketed lists / value tails, #2419): a multi leaf absorbs
+//     every trailing value onto its Keys by design — exempt.
+//   - children != nil / wildcard != nil (named-instance / modifier
+//     containers, e.g. `address <cidr> { primary; }`): the trailing tokens
+//     are real sub-structure the container path validates — exempt.
+//   - compoundKey / midKeyword: the trailing token is part of the node key
+//     (`family inet6`, `from-zone X to-zone Y`) — exempt.
+//   - isTypedLeaf: validateTypedLeaf already rejects unknown trailing
+//     tokens AND unexpected children, so the typed path owns the arity check.
+//   - args == 0: ambiguous between a presence-only flag (`dhcp`) and an
+//     opaque leaf whose subtree the compiler reads (`tcp-mss <mode>
+//     <value>`, #1979); the screen flag subset is handled by #3411.
+func (n *schemaNode) isScalarValueLeaf() bool {
+	return n != nil &&
+		n.scalar &&
+		n.args > 0 &&
+		n.children == nil &&
+		n.wildcard == nil &&
+		!n.multi &&
+		!n.compoundKey &&
+		n.midKeyword == "" &&
+		!n.isTypedLeaf()
 }
 
 // setSchema defines the Junos configuration tree structure.

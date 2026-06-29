@@ -669,6 +669,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     );
                                     telemetry.dbg.local += 1;
                                     telemetry.dbg.policy_deny += 1;
+                                    // #3326: account the host-inbound deny so
+                                    // `GlobalCtrHostInboundDeny` (REST/Prometheus/
+                                    // `show security flow statistics`) reflects the
+                                    // drop. `touched` must be set so the batch is
+                                    // flushed into BindingLiveState.
+                                    telemetry.counters.touched = true;
+                                    telemetry.counters.host_inbound_denied_packets += 1;
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
@@ -945,15 +952,25 @@ pub(super) fn poll_binding_process_descriptor(
                             .get(&(meta.ingress_ifindex as i32))
                             .map(|s| s.as_str())
                             .unwrap_or("");
+                        // #3437: the DNAT `match application` term may pin a
+                        // source-port (H10) and an ICMP type/code (H11). Supply
+                        // the flow's source port and the packet's ICMP
+                        // (type, code) so an application-scoped DNAT only fires
+                        // for the source-port / ICMP message it intends; a
+                        // non-ICMP packet yields None and never satisfies an
+                        // ICMP-type-constrained entry (fail closed).
+                        let dnat_packet_icmp = policy_packet_icmp(packet_frame, meta);
                         let dnat_decision = if !worker_ctx.forwarding.dnat_table.is_empty() {
                             worker_ctx.forwarding.dnat_table.lookup_with_counter_scoped(
                                 meta.protocol,
                                 flow.forward_key.src_ip,
                                 resolution_target,
+                                flow.forward_key.src_port,
                                 flow.forward_key.dst_port,
                                 ingress_zone_name,
                                 ingress_ifname_dnat,
                                 ingress_ri_dnat,
+                                dnat_packet_icmp,
                             )
                         } else {
                             None
@@ -1522,6 +1539,11 @@ pub(super) fn poll_binding_process_descriptor(
                                     telemetry.dbg.local += 1;
                                     telemetry.dbg.policy_deny += 1;
                                     telemetry.counters.touched = true;
+                                    // #3326: account the host-inbound deny so
+                                    // `GlobalCtrHostInboundDeny` reflects the drop
+                                    // (REST/Prometheus/`show security flow
+                                    // statistics`).
+                                    telemetry.counters.host_inbound_denied_packets += 1;
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }

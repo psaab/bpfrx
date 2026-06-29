@@ -121,10 +121,13 @@ func TestICMPTypeConstraintParity(t *testing.T) {
 // (normalizeUserspaceApplicationProtocol("")=="") → the __unsupported__ sentinel
 // → whole-snapshot reject (#3261), and strict commit hard-rejects a protocol-less
 // app (pkg/config/compiler_validate_strict.go). It is also not constructible via
-// real config: the application compiler (compiler_applications.go) has no
-// `icmp-type` property, so a user app can NEVER set ICMPType — only predefined
-// apps do (junos-ping/junos-pingv6), and those always pin Protocol. So
-// Protocol=="" implies a no-protocol app the runtime drops.
+// real config: as of #3348 a user app CAN carry an ICMP type (via the
+// `icmp-type`/`icmp-code` grammar or a junos-ping/junos-pingv6 protocol alias),
+// but the application compiler (compiler_applications.go) only ever attaches a
+// type alongside a pinned ICMP protocol — and validateApplicationSpecsStrict
+// rejects an icmp-type on a non-ICMP protocol and a protocol-less app outright.
+// So a real config can never produce Protocol=="" with ICMPType set; this case
+// is the hand-built unrepresentable shape the runtime drops.
 //
 // The simulator must therefore report NO concrete match for this app, for EVERY
 // query protocol — mirroring the dataplane reject. Before #3323 the

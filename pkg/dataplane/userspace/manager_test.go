@@ -5602,36 +5602,38 @@ func TestSumBindingCounters(t *testing.T) {
 	status := &ProcessStatus{
 		Bindings: []BindingStatus{
 			{
-				RXPackets:            100,
-				TXPackets:            80,
-				ForwardCandidatePkts: 70,
-				SessionCreates:       10,
-				SessionExpires:       5,
-				PolicyDeniedPackets:  3,
-				ScreenDrops:          2,
-				SYNCookieSynAckSent:  7,
-				SYNCookieAckValid:    11,
-				SYNCookieAckInvalid:  13,
-				SYNCookieBypass:      17,
-				SNATPackets:          20,
-				DNATPackets:          15,
-				Nat64Translations:    9,
+				RXPackets:                100,
+				TXPackets:                80,
+				ForwardCandidatePkts:     70,
+				SessionCreates:           10,
+				SessionExpires:           5,
+				PolicyDeniedPackets:      3,
+				HostInboundDeniedPackets: 6,
+				ScreenDrops:              2,
+				SYNCookieSynAckSent:      7,
+				SYNCookieAckValid:        11,
+				SYNCookieAckInvalid:      13,
+				SYNCookieBypass:          17,
+				SNATPackets:              20,
+				DNATPackets:              15,
+				Nat64Translations:        9,
 			},
 			{
-				RXPackets:            200,
-				TXPackets:            160,
-				ForwardCandidatePkts: 140,
-				SessionCreates:       20,
-				SessionExpires:       10,
-				PolicyDeniedPackets:  7,
-				ScreenDrops:          4,
-				SYNCookieSynAckSent:  17,
-				SYNCookieAckValid:    19,
-				SYNCookieAckInvalid:  23,
-				SYNCookieBypass:      29,
-				SNATPackets:          40,
-				DNATPackets:          30,
-				Nat64Translations:    21,
+				RXPackets:                200,
+				TXPackets:                160,
+				ForwardCandidatePkts:     140,
+				SessionCreates:           20,
+				SessionExpires:           10,
+				PolicyDeniedPackets:      7,
+				HostInboundDeniedPackets: 14,
+				ScreenDrops:              4,
+				SYNCookieSynAckSent:      17,
+				SYNCookieAckValid:        19,
+				SYNCookieAckInvalid:      23,
+				SYNCookieBypass:          29,
+				SNATPackets:              40,
+				DNATPackets:              30,
+				Nat64Translations:        21,
 			},
 		},
 	}
@@ -5653,6 +5655,12 @@ func TestSumBindingCounters(t *testing.T) {
 	}
 	if s.policyDenied != 10 {
 		t.Fatalf("policyDenied = %d, want 10", s.policyDenied)
+	}
+	// #3326: host-inbound admission denies aggregate like policy denies and are
+	// pushed into GlobalCtrHostInboundDeny by syncBPFCountersLocked. RED if the
+	// `s.hostInboundDenied += b.HostInboundDeniedPackets` line is reverted.
+	if s.hostInboundDenied != 20 {
+		t.Fatalf("hostInboundDenied = %d, want 20", s.hostInboundDenied)
 	}
 	if s.screenDrops != 6 {
 		t.Fatalf("screenDrops = %d, want 6", s.screenDrops)

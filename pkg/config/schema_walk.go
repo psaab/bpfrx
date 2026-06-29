@@ -276,6 +276,18 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		return nil
 	}
 
+	// Fixed-arity scalar value leaf (#3332): a keyword that consumes exactly
+	// `args` value token(s) and models no sub-structure. Reject any token or
+	// AST child beyond that span — in the flat-set grammar a recognized
+	// non-multi leaf parks trailing garbage as a CHILD node (SetPath:
+	// `description hello bogus` → Keys=["description","hello"] with child
+	// Keys=["bogus"]), which the compiler never reads and silently drops.
+	// Only applies on an EXACT keyword match: a wildcard match means keyword
+	// is a dynamic instance NAME, not this leaf's value slot.
+	if childSchema.isScalarValueLeaf() && parent.children != nil && parent.children[keyword] == childSchema {
+		return validateScalarValueLeaf(node, childSchema, path)
+	}
+
 	// Container / named-instance node. Consume this node's identity tokens
 	// (keyword + args + compoundKey), then validate its BLOCK CHILDREN at the
 	// resolved child schema.
@@ -414,6 +426,39 @@ func validateModifierChild(node *Node, leafSchema *schemaNode, leafPath []string
 			continue
 		}
 		return typedLeafErrorf(modPath, "unknown modifier %q", c.Keys[0])
+	}
+	return nil
+}
+
+// validateScalarValueLeaf enforces the fixed value-arity of a scalar value
+// leaf (#3332): the leaf legitimately carries its keyword plus exactly
+// leafSchema.args value token(s) on Keys and NO sub-statement. The compiler
+// reads only that span (e.g. compiler_interfaces.go reads description's
+// single value token), so any extra Keys token or AST child is operator
+// garbage that today commits silently and is dropped. We reject the FIRST
+// offending token with a value-arity message distinct from the #3318
+// unknown-KEYWORD gate — here the leaf keyword itself IS supported, only the
+// trailing token is not.
+//
+// Minimum arity is NOT enforced (a missing value is left to the compiler, as
+// before) — the gate is scoped strictly to EXCESS trailing tokens, the
+// silent-drop bug class.
+func validateScalarValueLeaf(node *Node, leafSchema *schemaNode, parentPath []string) error {
+	leafName := node.Keys[0]
+	leafPath := append(append([]string(nil), parentPath...), leafName)
+	allowed := 1 + leafSchema.args
+	if len(node.Keys) > allowed {
+		return typedLeafErrorf(leafPath,
+			"unexpected trailing token %q (this leaf takes %d value token(s); the extra token would be silently dropped)",
+			node.Keys[allowed], leafSchema.args)
+	}
+	for _, c := range node.Children {
+		if c == nil || len(c.Keys) == 0 {
+			continue
+		}
+		return typedLeafErrorf(leafPath,
+			"unexpected trailing token %q (this leaf takes %d value token(s) and no sub-statement; the extra token would be silently dropped)",
+			c.Keys[0], leafSchema.args)
 	}
 	return nil
 }

@@ -44,6 +44,7 @@ pub(super) fn reset_binding_counters(bindings: &mut [BindingStatus]) {
         binding.session_delta_dropped = 0;
         binding.session_delta_drained = 0;
         binding.policy_denied_packets = 0;
+        binding.host_inbound_denied_packets = 0;
         binding.snat_packets = 0;
         binding.dnat_packets = 0;
         binding.nat64_translations = 0;

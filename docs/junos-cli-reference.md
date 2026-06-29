@@ -74,6 +74,40 @@ node1:
 Filters: `protocol tcp|udp|icmp`, `source-prefix X.X.X.X/N`, `destination-prefix X.X.X.X/N`,
 `destination-port NNN`, `application-firewall`, etc.
 
+**Strict filter validation (#3439).** Both CLI surfaces and the direct
+gRPC `GetSessions` RPC reject malformed filters rather than silently
+dropping the predicate (which would widen the inspected set):
+
+- The remote `cli` parser (`parseFlowSessionArgs`, `cmd/cli/show.go`)
+  mirrors the strict local parser (`pkg/cli/session_filter.go`): an
+  unparseable numeric value (`destination-port abc`), an out-of-range
+  port, a non-numeric `zone`/`limit`, an unknown protocol token
+  (`protocol tcpip`), a missing value, or an unknown filter keyword all
+  fail the command instead of leaving the field at its zero (wildcard)
+  default. Previously these were silently ignored, so a typo widened the
+  query and the two CLI surfaces disagreed on identical command shapes.
+- `summary` and `sort-by` are global aggregations on the remote surface
+  (the `GetSessionSummary` RPC takes no filter; the top-talkers path
+  walks the whole table). Combining them with a traffic filter
+  (`protocol`, `zone`, ports, prefixes, `nat`, `application`,
+  `interface`, `source-nat-pool`) is **rejected** rather than silently
+  dropping the filter. Use the filtered per-session listing for a
+  narrowed view, or the interactive local CLI (which applies filters to
+  its summary/top-talkers). `brief` is a display modifier, not a filter,
+  so it may accompany `summary`.
+- Direct gRPC `GetSessions` (`pkg/grpcapi/server_sessions.go`) validates
+  the `protocol` token and rejects a negative `offset` (centrally in
+  `GetSessions`, covering both the cursor and legacy paths); both return
+  `codes.InvalidArgument` so an invalid input is distinguishable from an
+  empty result set. Protocol-name filters with no `protoName()` reverse
+  (e.g. `sctp`, `ospf`) match their sessions correctly. The protocol
+  token is resolved via `appid.ProtocolNumberLenient`, which also accepts
+  a display-only name the strict `appid.ProtocolNumber` does not reverse
+  — notably `ipv6` (IP protocol 41), the one-way mapping of #3393 — so a
+  protocol the system still **displays** is never rejected as an invalid
+  filter. The strict `appid.ProtocolNumber` SSOT used by config
+  compilation / policy matching is unchanged (Refs #3393).
+
 ```
 Session ID: 17179902569, Policy name: allow-everything-out-not-logged/270, HA State: Active, Timeout: 18, Session State: Valid
   In: 192.168.99.201/18277 --> 76.214.233.95/722;icmp, Conn Tag: 0x0, If: reth1.1000, Pkts: 1, Bytes: 84,
@@ -254,6 +288,20 @@ From zone: guest, To zone: lan
   policy-deny RT_FLOW + `reject`/zone-`tcp-rst` reply as a transit deny) and
   tears down any cached host-local session on the next hit. Hit counters for
   these rules now advance.
+  - **Host-inbound deny accounting (#3326):** a host-bound packet dropped by
+    the `host-inbound-traffic` admission gate (a service/protocol not in the
+    ingress zone's set) now increments the host-inbound deny counter, surfaced
+    as `Host-inbound denies` in `show security flow statistics`,
+    `host_inbound_denies` in the REST stats, and
+    `xpf_host_inbound_denies_total` in Prometheus
+    (`dataplane.GlobalCtrHostInboundDeny`). Before #3326 the AF_XDP userspace
+    dataplane silently dropped these denies and bumped only an internal debug
+    counter, so the exported counter sat at 0 even while host-inbound
+    enforcement was dropping traffic — control-plane-protection verification,
+    alerting, and post-incident forensics were blind. The Rust helper counts
+    each host-inbound deny per worker (`host_inbound_denied_packets`) and the Go
+    manager mirrors the per-poll delta into the global counter, identical to the
+    policy-deny plumbing.
   - **Token validation (#3200):** `host-inbound-traffic system-services
     <tok>` / `protocols <tok>` is now validated at commit against the
     recognized-token SSOT (`pkg/config/host_inbound_tokens.go`:
