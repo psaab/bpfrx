@@ -13,6 +13,7 @@ pub(crate) const PROTO_IPIP: u8 = 4;
 pub(crate) const PROTO_TCP: u8 = 6;
 pub(crate) const PROTO_EGP: u8 = 8;
 pub(crate) const PROTO_UDP: u8 = 17;
+pub(crate) const PROTO_IPV6: u8 = 41;
 pub(crate) const PROTO_GRE: u8 = 47;
 pub(crate) const PROTO_ESP: u8 = 50;
 pub(crate) const PROTO_AH: u8 = 51;
@@ -88,6 +89,18 @@ pub(crate) fn proto_number(name: &str) -> Option<u8> {
         "gre" | "junos-gre" => Some(PROTO_GRE),
         "ospf" | "junos-ospf" => Some(PROTO_OSPF),
         "ipip" | "junos-ip-in-ip" | "junos-ipip" => Some(PROTO_IPIP),
+        // #3393: IANA protocol 41 (IPv6 encapsulation). A firewall filter's
+        // `from protocol ipv6` reaches the wire VERBATIM as the name "ipv6"
+        // (filters.go emits term.Protocols unresolved; only the application
+        // policy and NAT paths pre-canonicalize to a number). The Go filter
+        // commit gate (filterProtocolResolvable) was widened to accept "ipv6"
+        // when appid.ProtocolNumber("ipv6") was closed to 41, but proto_number
+        // — the documented Rust mirror of appid.ProtocolNumber — was left
+        // without the arm, so a gate-passing `from protocol ipv6` filter
+        // committed yet failed snapshot compilation here with
+        // UnrepresentableFilterProtocol (commit/apply drift, the #1961 class).
+        // Resolving it restores the mirror invariant and closes the drift.
+        "ipv6" => Some(PROTO_IPV6),
         "egp" => Some(PROTO_EGP),
         "igmp" => Some(PROTO_IGMP),
         "pim" => Some(PROTO_PIM),
