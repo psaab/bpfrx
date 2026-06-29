@@ -214,12 +214,25 @@ func (s *Server) showChassisClusterFabricStatistics(buf *strings.Builder) {
 		fmt.Fprintln(buf, "Dataplane not loaded")
 		return
 	}
-	total, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirect)
-	fab0, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab0)
-	fab1, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab1)
-	zone, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectZone)
-	drops, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricFwdDrop)
+	// #3345: surface a counter-read failure rather than emitting clean zeros
+	// that hide a degraded counter bridge.
+	var readErr error
+	readCtr := func(idx uint32) uint64 {
+		v, err := s.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
+		return v
+	}
+	total := readCtr(dataplane.GlobalCtrFabricRedirect)
+	fab0 := readCtr(dataplane.GlobalCtrFabricRedirectFab0)
+	fab1 := readCtr(dataplane.GlobalCtrFabricRedirectFab1)
+	zone := readCtr(dataplane.GlobalCtrFabricRedirectZone)
+	drops := readCtr(dataplane.GlobalCtrFabricFwdDrop)
 	fmt.Fprintln(buf, "Fabric redirect statistics:")
+	if readErr != nil {
+		fmt.Fprintf(buf, "warning: fabric counter read failed (statistics may be incomplete): %v\n", readErr)
+	}
 	fmt.Fprintf(buf, "    Total redirects:          %d\n", total)
 	fmt.Fprintf(buf, "    fab0 redirects:           %d\n", fab0)
 	fmt.Fprintf(buf, "    fab1 redirects:           %d\n", fab1)

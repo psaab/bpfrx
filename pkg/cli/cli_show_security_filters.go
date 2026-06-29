@@ -34,6 +34,9 @@ func (c *CLI) showFirewallFilters() error {
 	}
 	userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
 
+	// #3408: surface a filter counter read failure as a warning AFTER all
+	// filters, rather than printing clean-zero / omitted hit counts.
+	var readErr error
 	showFilters := func(family string, filters map[string]*config.FirewallFilter, names []string) {
 		for _, name := range names {
 			f := filters[name]
@@ -47,6 +50,8 @@ func (c *CLI) showFirewallFilters() error {
 					if fcfg, err := c.dp.ReadFilterConfig(fid); err == nil {
 						ruleStart = fcfg.RuleStart
 						hasCounters = true
+					} else if readErr == nil {
+						readErr = err
 					}
 				}
 			}
@@ -126,6 +131,8 @@ func (c *CLI) showFirewallFilters() error {
 						if ctrs, err := c.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 							totalPkts += ctrs.Packets
 							totalBytes += ctrs.Bytes
+						} else if readErr == nil {
+							readErr = err
 						}
 					}
 					ruleOffset += numRules
@@ -160,6 +167,9 @@ func (c *CLI) showFirewallFilters() error {
 
 	showFilters("inet", cfg.Firewall.FiltersInet, inetNames)
 	showFilters("inet6", cfg.Firewall.FiltersInet6, inet6Names)
+	if readErr != nil {
+		fmt.Printf("warning: filter counter read failed (hit counts may be incomplete): %v\n", readErr)
+	}
 	return nil
 }
 
@@ -203,7 +213,9 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 		return nil
 	}
 
-	// Resolve filter IDs for counter display
+	// Resolve filter IDs for counter display. #3408: surface a read failure
+	// as a warning AFTER all terms rather than printing clean-zero counts.
+	var readErr error
 	var ruleStart uint32
 	var hasCounters bool
 	if c.dp != nil && c.dp.IsLoaded() {
@@ -212,6 +224,8 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 				if fcfg, err := c.dp.ReadFilterConfig(fid); err == nil {
 					ruleStart = fcfg.RuleStart
 					hasCounters = true
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 		}
@@ -297,6 +311,8 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 				if ctrs, err := c.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 					totalPkts += ctrs.Packets
 					totalBytes += ctrs.Bytes
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			ruleOffset += numRules
@@ -313,6 +329,9 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 		}
 	}
 	fmt.Println()
+	if readErr != nil {
+		fmt.Printf("warning: filter counter read failed (hit counts may be incomplete): %v\n", readErr)
+	}
 	return nil
 }
 

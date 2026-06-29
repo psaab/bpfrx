@@ -191,8 +191,14 @@ func (c *CLI) showSecurityAlarms(args []string) error {
 
 	// Screen drop alarms — any non-zero screen counter indicates detected attacks
 	if c.dp != nil && c.dp.IsLoaded() {
+		// #3345: track a counter-read failure so a degraded counter bridge
+		// is reported as a warning rather than masquerading as "no alarms".
+		var readErr error
 		readCtr := func(idx uint32) uint64 {
-			v, _ := c.dp.ReadGlobalCounter(idx)
+			v, err := c.dp.ReadGlobalCounter(idx)
+			if err != nil && readErr == nil {
+				readErr = err
+			}
 			return v
 		}
 		screenNames := []struct {
@@ -220,6 +226,9 @@ func (c *CLI) showSecurityAlarms(args []string) error {
 					fmt.Printf("Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, s.name, val)
 				}
 			}
+		}
+		if readErr != nil {
+			fmt.Printf("warning: screen counter read failed (alarms may be incomplete): %v\n", readErr)
 		}
 	}
 

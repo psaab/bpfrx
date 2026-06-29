@@ -321,8 +321,14 @@ func (s *Server) showSecurityAlarms(cfg *config.Config, topic string, buf *strin
 	}
 
 	if s.dp != nil && s.dp.IsLoaded() {
+		// #3345: track a counter-read failure so a degraded counter bridge
+		// is reported as a warning rather than masquerading as "no alarms".
+		var readErr error
 		readCtr := func(idx uint32) uint64 {
-			v, _ := s.dp.ReadGlobalCounter(idx)
+			v, err := s.dp.ReadGlobalCounter(idx)
+			if err != nil && readErr == nil {
+				readErr = err
+			}
 			return v
 		}
 		screenNames := []struct {
@@ -350,6 +356,9 @@ func (s *Server) showSecurityAlarms(cfg *config.Config, topic string, buf *strin
 					fmt.Fprintf(buf, "Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, sc.name, val)
 				}
 			}
+		}
+		if readErr != nil {
+			fmt.Fprintf(buf, "warning: screen counter read failed (counters may be incomplete): %v\n", readErr)
 		}
 	}
 
@@ -501,10 +510,16 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 			zones = append(zones, name)
 		}
 		sort.Strings(zones)
+		// #3408: surface a per-zone flood-counter read failure as a warning
+		// AFTER all zones rather than silently dropping the zone.
+		var readErr error
 		for _, zoneName := range zones {
 			zoneID := cr.ZoneIDs[zoneName]
 			fs, err := s.dp.ReadFloodCounters(zoneID)
 			if err != nil {
+				if readErr == nil {
+					readErr = err
+				}
 				continue
 			}
 			screenProfile := ""
@@ -522,6 +537,9 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 			buf.WriteString("\n")
 		}
 		buf.WriteString(s.screenSYNCookieCounterRows())
+		if readErr != nil {
+			fmt.Fprintf(buf, "warning: flood counter read failed (screen statistics may be incomplete): %v\n", readErr)
+		}
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }
@@ -668,8 +686,14 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 		}
 		// Per-type drop counters
 		if s.dp != nil && s.dp.IsLoaded() {
+			// #3345: surface a counter-read failure rather than printing a
+			// clean zero that hides a degraded counter bridge.
+			var readErr error
 			readCtr := func(idx uint32) uint64 {
-				v, _ := s.dp.ReadGlobalCounter(idx)
+				v, err := s.dp.ReadGlobalCounter(idx)
+				if err != nil && readErr == nil {
+					readErr = err
+				}
 				return v
 			}
 			totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
@@ -698,6 +722,11 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 						fmt.Fprintf(buf, "  %-25s %d\n", sc.name+":", v)
 					}
 				}
+			}
+			// #3345: check AFTER all reads (incl. the per-type loop) so a
+			// failure on a late read is surfaced, not just the first.
+			if readErr != nil {
+				fmt.Fprintf(buf, "warning: screen counter read failed (counters may be incomplete): %v\n", readErr)
 			}
 		}
 	}

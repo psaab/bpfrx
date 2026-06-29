@@ -22,6 +22,10 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	cr := s.applyResult()
+	// #3408: a per-zone counter read failure must not be reported as a clean
+	// 0 — surface it as HTTP 500 after building, mirroring the global
+	// /stats/global contract (#3345).
+	var readErr error
 	var zones []ZoneInfo
 	for zoneName, zone := range cfg.Security.Zones {
 		zi := ZoneInfo{
@@ -52,15 +56,24 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 					if ing, err := s.dp.ReadZoneCounters(id, 0); err == nil {
 						zi.IngressPackets = ing.Packets
 						zi.IngressBytes = ing.Bytes
+					} else if readErr == nil {
+						readErr = err
 					}
 					if eg, err := s.dp.ReadZoneCounters(id, 1); err == nil {
 						zi.EgressPackets = eg.Packets
 						zi.EgressBytes = eg.Bytes
+					} else if readErr == nil {
+						readErr = err
 					}
 				}
 			}
 		}
 		zones = append(zones, zi)
+	}
+	if readErr != nil {
+		writeError(w, http.StatusInternalServerError,
+			"zone counter read failed: "+readErr.Error())
+		return
 	}
 	sort.Slice(zones, func(i, j int) bool { return zones[i].Name < zones[j].Name })
 	writeOK(w, zones)
@@ -79,6 +92,9 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	// collector and the CLI/gRPC display surfaces. When the knob is off,
 	// hit_packets/hit_bytes stay 0 (we skip the dataplane read).
 	statsEnabled := cfg.Security.PolicyStatsEnabled
+	// #3408: surface a per-policy counter read failure as HTTP 500 after
+	// building, rather than reporting clean-zero hit counts.
+	var readErr error
 	var policySetID uint32
 	var result []PolicyInfo
 	for _, zpp := range cfg.Security.Policies {
@@ -111,6 +127,8 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			pi.Rules = append(pi.Rules, pr)
@@ -168,6 +186,8 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			pi.Rules = append(pi.Rules, pr)
@@ -178,6 +198,11 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		result = append(result, pi)
 	}
 
+	if readErr != nil {
+		writeError(w, http.StatusInternalServerError,
+			"policy counter read failed: "+readErr.Error())
+		return
+	}
 	writeOK(w, result)
 }
 

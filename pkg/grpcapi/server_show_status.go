@@ -47,8 +47,15 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
+	// #3345: surface a global-counter read failure instead of silently
+	// reporting 0. A degraded counter bridge must not be indistinguishable
+	// from "no events" on the structured stats RPC.
+	var readErr error
 	readCounter := func(idx uint32) uint64 {
-		v, _ := s.dp.ReadGlobalCounter(idx)
+		v, err := s.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 
@@ -84,7 +91,7 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 		}
 	}
 
-	return &pb.GetGlobalStatsResponse{
+	resp := &pb.GetGlobalStatsResponse{
 		RxPackets:          readCounter(dataplane.GlobalCtrRxPackets),
 		TxPackets:          readCounter(dataplane.GlobalCtrTxPackets),
 		Drops:              readCounter(dataplane.GlobalCtrDrops),
@@ -98,7 +105,17 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 		Nat64Translations:  readCounter(dataplane.GlobalCtrNAT64Xlate),
 		HostInboundAllowed: readCounter(dataplane.GlobalCtrHostInbound),
 		ScreenDropDetails:  screenDetails,
-	}, nil
+	}
+
+	// #3345: check readErr AFTER the full struct build so EVERY global read
+	// (incl. RxPackets/HostInbound below the screen loop) is covered — a
+	// failure on any of them must not return a zero-valued field.
+	if readErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"reading global counter: %v", readErr)
+	}
+
+	return resp, nil
 }
 
 func (s *Server) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {

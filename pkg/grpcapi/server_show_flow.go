@@ -140,8 +140,14 @@ func (s *Server) showFlowStatistics(buf *strings.Builder) {
 		buf.WriteString("Flow statistics: dataplane not loaded\n")
 		return
 	}
+	// #3345: surface a counter-read failure rather than emitting clean zeros
+	// that hide a degraded counter bridge.
+	var readErr error
 	readCtr := func(idx uint32) uint64 {
-		v, _ := s.dp.ReadGlobalCounter(idx)
+		v, err := s.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 	sessNew := readCtr(dataplane.GlobalCtrSessionsNew)
@@ -174,6 +180,9 @@ func (s *Server) showFlowStatistics(buf *strings.Builder) {
 			hitRate := float64(cacheHit) / float64(cacheHit+cacheMiss) * 100
 			fmt.Fprintf(buf, "  %-30s %.1f%%\n", "Flow cache hit rate:", hitRate)
 		}
+	}
+	if readErr != nil {
+		fmt.Fprintf(buf, "warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
 	}
 }
 

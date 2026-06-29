@@ -95,8 +95,15 @@ func (c *CLI) showStatistics(detail bool) error {
 		return nil
 	}
 
+	// #3345: surface a counter-read failure rather than printing clean zeros
+	// that hide a degraded counter bridge. This is the canonical operator
+	// global-counter view (`show security flow statistics`).
+	var readErr error
 	readCounter := func(idx uint32) uint64 {
-		v, _ := c.dp.ReadGlobalCounter(idx)
+		v, err := c.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 
@@ -124,6 +131,11 @@ func (c *CLI) showStatistics(detail bool) error {
 	}
 
 	if !detail {
+		// #3345: even in the non-detail path, surface a read failure (the
+		// global loop above is the only read set here).
+		if readErr != nil {
+			fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
+		}
 		return nil
 	}
 
@@ -177,6 +189,13 @@ func (c *CLI) showStatistics(detail bool) error {
 			}
 			fmt.Printf("  %-24s %d/%d (%.1f%%)%s\n", s.Name+":", s.UsedCount, s.MaxEntries, pct, flag)
 		}
+	}
+
+	// #3345: check AFTER all global-counter reads (incl. the detail screen
+	// breakdown) so a failure on a late read is surfaced rather than printing
+	// a stale 0.
+	if readErr != nil {
+		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
 	}
 
 	return nil
@@ -933,8 +952,14 @@ func (c *CLI) showFlowStatistics() error {
 		return nil
 	}
 
+	// #3345: surface a counter-read failure rather than printing clean zeros
+	// that hide a degraded counter bridge.
+	var readErr error
 	readCounter := func(idx uint32) uint64 {
-		v, _ := c.dp.ReadGlobalCounter(idx)
+		v, err := c.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 
@@ -1017,6 +1042,13 @@ func (c *CLI) showFlowStatistics() error {
 				fmt.Printf("    %-28s %d\n", sc.name+":", v)
 			}
 		}
+	}
+
+	// #3345: check AFTER all global-counter reads (incl. the screen breakdown
+	// loop) so a failure on a late read is surfaced rather than printing a
+	// stale 0.
+	if readErr != nil {
+		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
 	}
 
 	return nil

@@ -89,8 +89,14 @@ func (c *CLI) showScreen() error {
 
 	// Show screen drop counters (total + per-type)
 	if c.dp != nil && c.dp.IsLoaded() {
+		// #3345: surface a counter-read failure rather than printing a clean
+		// zero that hides a degraded counter bridge.
+		var readErr error
 		readCtr := func(idx uint32) uint64 {
-			v, _ := c.dp.ReadGlobalCounter(idx)
+			v, err := c.dp.ReadGlobalCounter(idx)
+			if err != nil && readErr == nil {
+				readErr = err
+			}
 			return v
 		}
 
@@ -121,6 +127,12 @@ func (c *CLI) showScreen() error {
 					fmt.Printf("  %-25s %d\n", sc.name+":", v)
 				}
 			}
+		}
+		// #3345: check AFTER all reads (incl. the per-type loop) so a failure
+		// on ANY read — not just the first — is surfaced. An early check
+		// before the loop would let a late read print a stale 0.
+		if readErr != nil {
+			fmt.Printf("warning: screen counter read failed (counters may be incomplete): %v\n", readErr)
 		}
 	}
 
@@ -363,10 +375,17 @@ func (c *CLI) showScreenStatisticsAll() error {
 	}
 	sort.Strings(zones)
 
+	// #3408: surface a per-zone flood-counter read failure as a warning AFTER
+	// all zones, rather than silently dropping the zone (which reads as "no
+	// flood events for that zone").
+	var readErr error
 	for _, zoneName := range zones {
 		zoneID := cr.ZoneIDs[zoneName]
 		fs, err := c.dp.ReadFloodCounters(zoneID)
 		if err != nil {
+			if readErr == nil {
+				readErr = err
+			}
 			continue
 		}
 		screenProfile := ""
@@ -385,6 +404,9 @@ func (c *CLI) showScreenStatisticsAll() error {
 	}
 	if rows := c.screenSYNCookieCounterRows(); rows != "" {
 		fmt.Print(rows)
+	}
+	if readErr != nil {
+		fmt.Printf("warning: flood counter read failed (screen statistics may be incomplete): %v\n", readErr)
 	}
 	return nil
 }

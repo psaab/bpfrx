@@ -46,6 +46,9 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 		}
 	}
 
+	// #3408: surface a filter counter read failure as a warning AFTER all
+	// filters rather than printing clean-zero / omitted hit counts.
+	var readErr error
 	printFilters := func(family string, filters map[string]*config.FirewallFilter) {
 		names := make([]string, 0, len(filters))
 		for name := range filters {
@@ -64,6 +67,8 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 					if fcfg, err := s.dp.ReadFilterConfig(fid); err == nil {
 						ruleStart = fcfg.RuleStart
 						hasCounters = true
+					} else if readErr == nil {
+						readErr = err
 					}
 				}
 			}
@@ -137,6 +142,8 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 						if ctrs, err := s.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 							totalPkts += ctrs.Packets
 							totalBytes += ctrs.Bytes
+						} else if readErr == nil {
+							readErr = err
 						}
 					}
 					ruleOffset += numRules
@@ -157,6 +164,9 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 	}
 	printFilters("inet", cfg.Firewall.FiltersInet)
 	printFilters("inet6", cfg.Firewall.FiltersInet6)
+	if readErr != nil {
+		fmt.Fprintf(buf, "warning: filter counter read failed (hit counts may be incomplete): %v\n", readErr)
+	}
 }
 
 // --- #1700: residual ShowText branches ---
@@ -347,6 +357,9 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 					filterIDs = cr.FilterIDs
 				}
 			}
+			// #3408: surface a filter counter read failure as a warning AFTER
+			// all terms rather than printing clean-zero / omitted hit counts.
+			var readErr error
 			var ruleStart uint32
 			var hasCounters bool
 			if filterIDs != nil {
@@ -354,6 +367,8 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 					if fcfg, err := s.dp.ReadFilterConfig(fid); err == nil {
 						ruleStart = fcfg.RuleStart
 						hasCounters = true
+					} else if readErr == nil {
+						readErr = err
 					}
 				}
 			}
@@ -426,6 +441,8 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 						if ctrs, err := s.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 							totalPkts += ctrs.Packets
 							totalBytes += ctrs.Bytes
+						} else if readErr == nil {
+							readErr = err
 						}
 					}
 					ruleOffset += numRules
@@ -442,6 +459,9 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 				}
 			}
 			buf.WriteString("\n")
+			if readErr != nil {
+				fmt.Fprintf(buf, "warning: filter counter read failed (hit counts may be incomplete): %v\n", readErr)
+			}
 		}
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil

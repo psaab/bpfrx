@@ -11,53 +11,47 @@ import (
 )
 
 func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
-	readCounter := func(idx uint32) float64 {
-		v, _ := dp.ReadGlobalCounter(idx)
-		return float64(v)
+	// #3345: on a counter-read failure, SKIP emitting the sample instead of
+	// reporting a misleading 0, and bump xpf_counter_read_errors_total. A
+	// missing sample is distinguishable from a 0 sample; a clean zero would
+	// make a degraded counter bridge indistinguishable from "no events".
+	emit := func(desc *prometheus.Desc, idx uint32, labels ...string) {
+		v, err := dp.ReadGlobalCounter(idx)
+		if err != nil {
+			c.counterReadErrors.Add(1)
+			return
+		}
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, float64(v), labels...)
 	}
 
-	ch <- prometheus.MustNewConstMetric(c.packetsTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrRxPackets), "rx")
-	ch <- prometheus.MustNewConstMetric(c.packetsTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrTxPackets), "tx")
-	ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrDrops))
-	ch <- prometheus.MustNewConstMetric(c.sessionsCreatedTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrSessionsNew))
-	ch <- prometheus.MustNewConstMetric(c.sessionsClosedTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrSessionsClosed))
-	ch <- prometheus.MustNewConstMetric(c.screenDropsTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrScreenDrops))
-	ch <- prometheus.MustNewConstMetric(c.policyDeniesTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrPolicyDeny))
-	ch <- prometheus.MustNewConstMetric(c.natAllocFailsTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrNATAllocFail))
-	ch <- prometheus.MustNewConstMetric(c.nat64XlateTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrNAT64Xlate))
-	ch <- prometheus.MustNewConstMetric(c.hostInboundDeny, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrHostInboundDeny))
-	ch <- prometheus.MustNewConstMetric(c.tcEgressPacketsTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrTCEgressPackets))
+	emit(c.packetsTotal, dataplane.GlobalCtrRxPackets, "rx")
+	emit(c.packetsTotal, dataplane.GlobalCtrTxPackets, "tx")
+	emit(c.dropsTotal, dataplane.GlobalCtrDrops)
+	emit(c.sessionsCreatedTotal, dataplane.GlobalCtrSessionsNew)
+	emit(c.sessionsClosedTotal, dataplane.GlobalCtrSessionsClosed)
+	emit(c.screenDropsTotal, dataplane.GlobalCtrScreenDrops)
+	emit(c.policyDeniesTotal, dataplane.GlobalCtrPolicyDeny)
+	emit(c.natAllocFailsTotal, dataplane.GlobalCtrNATAllocFail)
+	emit(c.nat64XlateTotal, dataplane.GlobalCtrNAT64Xlate)
+	emit(c.hostInboundDeny, dataplane.GlobalCtrHostInboundDeny)
+	emit(c.tcEgressPacketsTotal, dataplane.GlobalCtrTCEgressPackets)
 
 	// SYN cookie counters
-	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrSyncookieSent), "sent")
-	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrSyncookieValid), "valid")
-	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrSyncookieInvalid), "invalid")
-	ch <- prometheus.MustNewConstMetric(c.syncookieTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrSyncookieBypass), "bypass")
+	emit(c.syncookieTotal, dataplane.GlobalCtrSyncookieSent, "sent")
+	emit(c.syncookieTotal, dataplane.GlobalCtrSyncookieValid, "valid")
+	emit(c.syncookieTotal, dataplane.GlobalCtrSyncookieInvalid, "invalid")
+	emit(c.syncookieTotal, dataplane.GlobalCtrSyncookieBypass, "bypass")
 
 	// Flow cache counters (IPv4 + IPv6)
-	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrFlowCacheHit), "hit")
-	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrFlowCacheMiss), "miss")
-	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrFlowCacheFlush), "flush")
-	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
-		readCounter(dataplane.GlobalCtrFlowCacheInvalidate), "invalidate")
+	emit(c.flowCacheTotal, dataplane.GlobalCtrFlowCacheHit, "hit")
+	emit(c.flowCacheTotal, dataplane.GlobalCtrFlowCacheMiss, "miss")
+	emit(c.flowCacheTotal, dataplane.GlobalCtrFlowCacheFlush, "flush")
+	emit(c.flowCacheTotal, dataplane.GlobalCtrFlowCacheInvalidate, "invalidate")
+
+	// #3345: always emit the scrape-error counter (0 when healthy) so the
+	// signal is present for alerting whether or not any read failed.
+	ch <- prometheus.MustNewConstMetric(c.counterReadErrorsTotal, prometheus.CounterValue,
+		float64(c.counterReadErrors.Load()))
 }
 
 func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
@@ -98,12 +92,17 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 	}
 
 	for zoneName, zoneID := range cr.ZoneIDs {
+		// #3408: a failed per-zone read SKIPS the sample (no misleading 0) and
+		// bumps xpf_counter_read_errors_total — the same contract as the
+		// global counters (#3345).
 		ingress, err := dp.ReadZoneCounters(zoneID, 0)
 		if err != nil {
+			c.counterReadErrors.Add(1)
 			continue
 		}
 		egress, err := dp.ReadZoneCounters(zoneID, 1)
 		if err != nil {
+			c.counterReadErrors.Add(1)
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(c.zonePacketsTotal, prometheus.CounterValue,
@@ -148,6 +147,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 			policyID := policyCounterID(policySetID, i)
 			ctrs, err := dp.ReadPolicyCounters(policyID)
 			if err != nil {
+				c.counterReadErrors.Add(1)
 				continue
 			}
 			ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
@@ -166,6 +166,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		policyID := policyCounterID(policySetID, i)
 		ctrs, err := dp.ReadPolicyCounters(policyID)
 		if err != nil {
+			c.counterReadErrors.Add(1)
 			continue
 		}
 		// #3286: a scoped global policy (#3148 `match from-zone`/`to-zone`)
@@ -212,6 +213,7 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 			}
 			fcfg, err := dp.ReadFilterConfig(fid)
 			if err != nil {
+				c.counterReadErrors.Add(1)
 				continue
 			}
 			ruleOffset := fcfg.RuleStart
@@ -226,14 +228,25 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 				}
 				numRules := uint32(nSrc * nDst)
 				var totalPkts uint64
+				termFailed := false
 				for i := uint32(0); i < numRules; i++ {
 					if ctrs, err := dp.ReadFilterCounters(ruleOffset + i); err == nil {
 						totalPkts += ctrs.Packets
+					} else {
+						c.counterReadErrors.Add(1)
+						termFailed = true
 					}
+				}
+				// Advance the offset regardless so later terms stay aligned.
+				ruleOffset += numRules
+				// #3408: on a read failure SKIP this term's sample (a missing
+				// sample, not a stale/partial 0) — matching the zone/policy
+				// collectors — and rely on the bumped counterReadErrors signal.
+				if termFailed {
+					continue
 				}
 				ch <- prometheus.MustNewConstMetric(c.filterHitsTotal, prometheus.CounterValue,
 					float64(totalPkts), name, family, term.Name)
-				ruleOffset += numRules
 			}
 		}
 	}

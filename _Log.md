@@ -22873,6 +22873,88 @@ top.
     pkg/config/README.md, _Log.md
 
 - **Timestamp**: 2026-06-28
+  - **Action**: #3345 — surface global/dataplane counter read errors across
+    REST/Prometheus/gRPC/CLI instead of swallowing to 0 (a degraded counter
+    bridge must not look identical to "no events"). REST /stats/global → 500;
+    gRPC GetGlobalStats → codes.Internal; Prometheus omits the failed sample
+    and bumps xpf_counter_read_errors_total; text screen/alarms print a warning.
+    Added RED-on-revert tests for each surface.
+  - **File(s)**: pkg/api/stats.go, pkg/api/metrics.go,
+    pkg/api/metrics_descriptors.go, pkg/api/metrics_counters.go,
+    pkg/api/stats_counter_error_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go,
+    pkg/grpcapi/server_show_status.go,
+    pkg/grpcapi/global_stats_counter_error_test.go,
+    pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_log.go,
+    pkg/cli/show_security_counter_error_test.go,
+    pkg/grpcapi/server_show_security_text.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345 fold (Codex MAJOR + SMR) — complete GLOBAL counter-read
+    error surfacing. H1: GetGlobalStats now checks readErr AFTER the full
+    struct build so late reads (RxPackets/HostInbound) are covered. Added
+    warnings to show security flow statistics (CLI showStatistics +
+    showFlowStatistics, gRPC showFlowStatistics) and show chassis cluster
+    fabric statistics (CLI + gRPC). M1: REST test asserts exactly 500.
+    README updated to actual coverage + #3408 for per-zone/policy.
+    RED-on-revert tests added for each new global site.
+  - **File(s)**: pkg/grpcapi/server_show_status.go,
+    pkg/cli/cli_show_flow.go, pkg/grpcapi/server_show_flow.go,
+    pkg/grpcapi/server_show_cluster_text.go, pkg/cli/cli_show_cluster.go,
+    pkg/api/stats_counter_error_test.go,
+    pkg/grpcapi/global_stats_counter_error_test.go,
+    pkg/grpcapi/flow_cluster_counter_error_test.go,
+    pkg/cli/show_security_counter_error_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345 fold round 3 (Codex re-review) — fix early-warn/late-read
+    ordering. The round-2 warnings were placed BEFORE later detail reads (same
+    bug as the H1 GetGlobalStats fix). Moved the readErr check to AFTER all
+    global-counter reads in: cli showScreen, cli showStatistics, cli
+    showFlowStatistics, gRPC showScreen (per-type drop block). Made
+    showNATSource emit an explicit warning on read error (was silent omit).
+    Audited EVERY global-counter read call site (16 total) — all now check
+    readErr after all reads, none swallow silently. Added late-read RED-on-
+    revert tests (lateCounterErrCLIDP fails only a per-type counter).
+  - **File(s)**: pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_flow.go,
+    pkg/cli/cli_show_nat.go, pkg/grpcapi/server_show_security_text.go,
+    pkg/cli/show_security_counter_error_test.go,
+    pkg/grpcapi/global_stats_counter_error_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345 fold round 4 (Codex claim-4 scope) — OWN #3408: extend
+    counter-read error surfacing to per-zone / per-policy / screen-flood /
+    filter sites under the SAME contract (REST 500 / gRPC codes.Internal /
+    Prometheus skip+xpf_counter_read_errors_total / CLI+gRPC-text warning
+    after all reads). Covered REST zonesHandler/policiesHandler, gRPC
+    GetZones/GetPolicies, Prometheus collectZone/Policy/Filter, and the
+    text views (policies hit-count/brief/detail, zones, screen-stats-all,
+    firewall filter). Added RED-on-revert tests per surface. PR now Closes
+    #3345 + #3408; README #3408-deferred note dropped.
+  - **File(s)**: pkg/api/security.go, pkg/api/metrics_counters.go,
+    pkg/api/zones_policies_counter_error_test.go,
+    pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_text.go,
+    pkg/grpcapi/server_show_zones_text.go,
+    pkg/grpcapi/server_show_security_text.go,
+    pkg/grpcapi/server_show_firewall.go,
+    pkg/grpcapi/zones_policies_counter_error_test.go,
+    pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+    pkg/cli/cli_show_security_zones.go, pkg/cli/cli_show_security_screen.go,
+    pkg/cli/cli_show_security_filters.go, pkg/cli/cli_show_nat.go,
+    pkg/cli/show_security_counter_error_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345/#3408 fold round 5 (Codex final) — MAJOR: Prometheus
+    collectFilterCounters must SKIP the xpf_filter_hits_total sample on a
+    filter read error (was bumping counterReadErrors but still emitting a
+    stale 0). Fixed with a termFailed gate (continue before emit; ruleOffset
+    still advances). MINORS: added the 8 missing RED-on-revert tests for the
+    newly-added per-zone/per-policy/filter/flood sites across Prometheus,
+    gRPC text, and CLI text surfaces.
+  - **File(s)**: pkg/api/metrics_counters.go,
+    pkg/api/zones_policies_counter_error_test.go,
+    pkg/grpcapi/text_filter_flood_counter_error_test.go,
+    pkg/cli/show_security_counter_error_test.go, _Log.md
   - **Action**: #3349 — validate security log stream/top-level fields that
     were parsed but committed without enum/range validation (audit fail-open).
     Typed schema leaves for mode/format/severity/facility/category/
