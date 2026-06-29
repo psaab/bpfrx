@@ -20,7 +20,22 @@ the userspace dataplane admission boundary is in
 - **Screen/IDS**: 11 checks (land, SYN flood, ping of death, teardrop,
   SYN-FIN, no-flag, winnuke, FIN-no-ACK, rate-limiting), SYN cookie flood
   protection (userspace-minted/validated SYN-ACK cookies replied through
-  the AF_XDP TX path).
+  the AF_XDP TX path). **SYN-flood sub-thresholds (#3315)**:
+  `source-threshold` / `destination-threshold` are per-source-IP /
+  per-destination-IP SYN/s caps enforced by a per-zone count-min sketch of
+  `RateCounter`s (no eviction, fail-closed over-count). The per-destination
+  cap is primary and spoof-resistant (all SYNs to a victim land in the same
+  sketch cells) and runs even when the zone is SYN-cookie active; the
+  per-source cap is secondary and skipped while the zone is cookie-active
+  (the cookie governs the spoofed-flood regime). `alarm-threshold` raises a
+  log-only, ≤1/sec/zone NOTICE alarm event below `attack-threshold` without
+  dropping. Memory per configured zone per worker is ~192 KiB
+  (`ROWS*DST_COLS + ROWS*SRC_COLS` × 16 B); the Go compiler emits a
+  commit-time advisory if `attack-threshold / source-threshold` exceeds
+  ~1000 (the regime where the sketch can over-throttle). `timeout` parses
+  and commits but is NOT yet enforced — it maps to the per-zone half-open
+  session window (`tcp_opening_ns`), a tracked follow-up; the compiler emits
+  a commit-time warning so the leaf is never silently inert.
 - **Firewall filters**: policer (token bucket + three-color), lo0 filter,
   flexible match, port ranges, hit counters, logging, forwarding-class
   DSCP rewrite.

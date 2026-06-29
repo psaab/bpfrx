@@ -62,7 +62,7 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/daemon/daemon_apply.go":               "apply path still adapts legacy compile/apply metadata",
 	"pkg/daemon/daemon_proxyarp.go":            "#2197: extracted proxy-ARP/NDP reconcile + periodic re-assert still call dataplane.ReconcileProxyARP (control-plane kernel responder reconcile relocated from daemon_apply.go)",
 	"pkg/daemon/daemon_flow.go":                "flow logging still names legacy dataplane.GlobalCtr* counter indices via dataplane.Telemetry",
-	"pkg/daemon/daemon_nft.go":                 "#3436: lo0 nft lowering resolves DSCP names through dataplane.DSCPValues (shared with the userspace matcher) to emit numeric code points; display/lowering only, no legacy enforcement path",
+	"pkg/daemon/daemon_nft.go":                 "#3436: lo0/host-inbound nft generation resolves DSCP names through the dataplane.DSCPValues SSOT to emit numeric nft (avoids unloadable Junos DSCP tokens); generation-only, no legacy enforcement path",
 	"pkg/daemon/daemon_ha.go":                  "HA state updates still call legacy bridge methods",
 	"pkg/daemon/daemon_ha_fabric.go":           "fabric HA updates still call legacy bridge methods",
 	"pkg/daemon/daemon_ha_userspace.go":        "userspace HA control still crosses the legacy bridge",
