@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // maxScanSweepThreshold is the largest port-scan / ip-sweep threshold the
@@ -1380,6 +1382,87 @@ func validateSecurityLogStreamTLSProfileAST(nodes []*Node, prefix string, lenien
 					}
 				}
 			}
+		}
+	}
+	return warnings, nil
+}
+
+// flowTraceFileNameError reports why an operator-supplied
+// `security flow traceoptions file <name>` value is unsafe, or nil if the
+// value is an acceptable bare basename. The persistent flow-trace file always
+// lives directly under /var/log (NewTraceWriter), so only a bare filename is
+// permitted: an absolute path, a path separator, or a "." / ".." component
+// would let a committed config steer root-written flow telemetry (internal
+// addresses, ports, zones, actions, policy IDs) outside the appliance log area
+// — e.g. `file /tmp/x` is kept verbatim and `file ../../tmp/x` cleans to
+// /tmp/x (#3420, Codex audit 097 H02). This is the persistent-config sibling
+// of the interactive `monitor security flow file` hardening (#3378).
+func flowTraceFileNameError(name string) error {
+	if name == "" {
+		// A missing value token is the schema walker's concern, not this gate.
+		return nil
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("%q is not a valid trace filename", name)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("trace filename %q must be a bare name, not a path "+
+			"(the file is written under /var/log)", name)
+	}
+	if filepath.IsAbs(name) || name != filepath.Base(name) {
+		return fmt.Errorf("trace filename %q must be a bare name, not a path "+
+			"(the file is written under /var/log)", name)
+	}
+	return nil
+}
+
+// validateFlowTraceFileAST is the #3420 commit-time path-traversal gate for
+// `security flow traceoptions file <name>`. The compiler stores the filename
+// verbatim (compileFlow traceoptions: to.File = nodeVal(fileNode)) and
+// NewTraceWriter then joins/opens it under /var/log without rejecting an
+// absolute path or a ".." escape, so a committed config can append flow trace
+// records anywhere the daemon user can write. The filename is a single AST
+// value the declarative SchemaValidate walker treats as opaque free text, so —
+// like the syslog port and tls-profile gates — it is checked here on the
+// group-expanded tree, mirroring compileFlow's traversal
+// (FindChild("flow") > FindChild("traceoptions") > FindChild("file")).
+//
+// Strict path (commit / commit-check, lenient=false): an absolute,
+// separator-bearing, or dot-component filename is a hard compile error.
+// Lenient path (load / peer-sync, lenient=true): downgraded to a warning so an
+// already-persisted or peer-synced config an older binary accepted still boots;
+// NewTraceWriter independently refuses the unsafe path at runtime, so a
+// leniently-loaded value simply disables tracing rather than writing outside
+// /var/log (#1960 / #3261 fail-closed-on-load class).
+func validateFlowTraceFileAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, n := range nodes {
+		if n.Name() != "security" {
+			continue
+		}
+		secPath := joinNodePath(prefix, n.Keys)
+		flowNode := n.FindChild("flow")
+		if flowNode == nil {
+			continue
+		}
+		toNode := flowNode.FindChild("traceoptions")
+		if toNode == nil {
+			continue
+		}
+		fileNode := toNode.FindChild("file")
+		if fileNode == nil {
+			continue
+		}
+		name := nodeVal(fileNode)
+		if err := flowTraceFileNameError(name); err != nil {
+			path := joinNodePath(secPath, []string{"flow", "traceoptions", "file"})
+			msg := fmt.Sprintf("%s: %s", path, err.Error())
+			if lenient {
+				warnings = append(warnings, msg+
+					" (ignored: tracing disabled, not written outside /var/log)")
+				continue
+			}
+			return warnings, fmt.Errorf("%s", msg)
 		}
 	}
 	return warnings, nil

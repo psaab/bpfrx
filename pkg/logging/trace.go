@@ -9,15 +9,77 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// traceLogDir is the directory persistent flow-trace files are written to. It
+// is a package var (not a const) only so tests can redirect it to a temp dir;
+// production always writes under /var/log. The persistent
+// `security flow traceoptions file <name>` knob accepts a bare basename and the
+// file always lives directly under this directory.
+var traceLogDir = "/var/log"
+
+// sanitizeTraceFileName validates an operator-supplied flow-trace filename.
+// The trace file always lives directly under traceLogDir, so only a bare
+// basename is accepted: path separators, "." / "..", and absolute paths are
+// rejected. Without this a committed `security flow traceoptions file
+// ../../tmp/x` resolves to /tmp/x and the daemon appends root-written flow
+// telemetry (internal addresses, ports, zones, actions, policy IDs) outside the
+// log directory (#3420). This is the persistent-config sibling of the
+// interactive monitor-path hardening (#3378). The commit-time gate
+// (validateFlowTraceFileAST) rejects such a value loudly; this runtime check is
+// defense-in-depth that fails safe (tracing disabled) on a leniently-loaded or
+// peer-synced config.
+func sanitizeTraceFileName(name string) error {
+	if name == "" {
+		return fmt.Errorf("trace filename must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid trace filename: %q", name)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("trace filename must be a bare name, not a path: %q", name)
+	}
+	if filepath.IsAbs(name) || name != filepath.Base(name) {
+		return fmt.Errorf("trace filename must be a bare name, not a path: %q", name)
+	}
+	return nil
+}
+
+// openTraceFile opens a flow-trace file (the active file or a rotated
+// generation) inside traceLogDir with restrictive semantics: O_NOFOLLOW so a
+// pre-planted symlink under /var/log cannot redirect the root-written telemetry
+// (#3420), the opened descriptor is verified to be a regular file, and it is
+// created mode 0600 rather than world-readable 0644 — flow tuples/zones/policy
+// names are audit-grade telemetry. The caller passes an already-sanitized
+// basename (NewTraceWriter validates once up front).
+func openTraceFile(name string) (*os.File, error) {
+	path := filepath.Join(traceLogDir, name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("trace target %s is not a regular file", path)
+	}
+	return f, nil
+}
 
 // TraceWriter writes matching flow events to a trace file with rotation.
 type TraceWriter struct {
 	mu       sync.Mutex
 	file     *os.File
-	path     string
-	maxSize  int64 // bytes
+	name     string // sanitized basename, written under traceLogDir
+	path     string // traceLogDir/name (rotation suffixes append to this)
+	maxSize  int64  // bytes
 	maxFiles int
 	written  int64
 	filters  []traceFilter
@@ -37,10 +99,15 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 		return nil, fmt.Errorf("no trace file specified")
 	}
 
-	path := opts.File
-	if !filepath.IsAbs(path) {
-		path = filepath.Join("/var/log", path)
+	// Reject a non-basename file value (absolute path, separator, or ".."
+	// escape) so a committed config cannot steer root-written flow telemetry
+	// outside /var/log (#3420). The commit-time gate rejects this loudly; here
+	// we fail safe (no trace writer) for a leniently-loaded / peer-synced value.
+	if err := sanitizeTraceFileName(opts.File); err != nil {
+		return nil, err
 	}
+	name := opts.File
+	path := filepath.Join(traceLogDir, name)
 
 	maxSize := int64(opts.FileSize)
 	if maxSize <= 0 {
@@ -52,6 +119,7 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 	}
 
 	tw := &TraceWriter{
+		name:     name,
 		path:     path,
 		maxSize:  maxSize,
 		maxFiles: maxFiles,
@@ -95,11 +163,11 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 		tw.filters = append(tw.filters, f)
 	}
 
-	// Open trace file
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	// Open trace file under traceLogDir (O_NOFOLLOW, regular-file checked, 0600).
+	if err := os.MkdirAll(traceLogDir, 0755); err != nil {
 		return nil, fmt.Errorf("create trace dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := openTraceFile(name)
 	if err != nil {
 		return nil, fmt.Errorf("open trace file: %w", err)
 	}
@@ -262,8 +330,9 @@ func (tw *TraceWriter) rotate() {
 	excess := fmt.Sprintf("%s.%d", tw.path, tw.maxFiles+1)
 	os.Remove(excess)
 
-	// Open fresh file
-	f, err := os.OpenFile(tw.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Open fresh file (O_NOFOLLOW, regular-file checked, 0600). The active path
+	// was just renamed to .1, so this creates a new empty file.
+	f, err := openTraceFile(tw.name)
 	if err != nil {
 		slog.Warn("failed to open rotated trace file", "err", err)
 		return
