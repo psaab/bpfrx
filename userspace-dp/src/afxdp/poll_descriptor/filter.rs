@@ -400,3 +400,231 @@ pub(super) fn apply_lo0_filter_action(
     }
     result.action
 }
+
+/// #3485: host-inbound zone admission MUST gate the lo0 (host-bound) firewall
+/// filter on the local-delivery path. `host-inbound-traffic` is the first-line
+/// zone control for router self-traffic; a packet it denies is a SILENT drop
+/// (Junos posture) and must NOT incur the lo0 filter's active side-effects: the
+/// term counter bump (`record_filter_counter`), the filter-log event, and — in
+/// the caller — the synthesized TCP RST / ICMP-unreachable reject reply plus the
+/// host-bound session teardown. Before #3485 `apply_lo0_filter_action` ran FIRST
+/// (codex-review-118 M1), so a service host-inbound would have silently denied
+/// still triggered the lo0 reject / RST / teardown / counter / log.
+///
+/// This helper runs the host-inbound gate FIRST; only an ADMITTED packet pays
+/// the lo0 evaluation. It returns:
+///   - `None`         => host-inbound DENIED. The lo0 filter was NOT evaluated
+///                       (no counter, no log). The caller drops the packet
+///                       silently (no reject reply) and tears down any cached
+///                       host-bound session.
+///   - `Some(action)` => host-inbound ADMITTED. `action` is the lo0 verdict the
+///                       caller handles exactly as before: `Accept` => deliver;
+///                       `Discard` => silent drop; `Reject` => drop + reject
+///                       reply.
+///
+/// Both LocalDelivery call sites (session-HIT and session-MISS) route through
+/// this single helper, which keeps the gate ordering unit-testable (vs two
+/// inline blocks that only the un-callable poll loop could exercise). See
+/// `lo0_gate_tests` for the RED-on-revert coverage. `host_inbound_zone` is the
+/// admission zone (the session metadata's recorded ingress zone on the HIT path,
+/// the resolved `from_zone_id` on the MISS path); `lo0_ingress_zone_override` is
+/// the lo0 filter-log ingress-zone hint, preserved per-path unchanged.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn host_inbound_gated_lo0_action(
+    forwarding: &ForwardingState,
+    host_inbound_zone: u16,
+    dst_port: u16,
+    is_v6: bool,
+    icmp_first_l4_byte: u8,
+    extra: TermMatchExtra<'_>,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    lo0_ingress_zone_override: Option<u16>,
+    now_ns: u64,
+) -> Option<crate::filter::FilterAction> {
+    // Host-inbound gate FIRST — a denied packet is a fail-closed silent drop
+    // with NO lo0 side-effects (#3485).
+    if !crate::afxdp::forwarding::host_inbound_admits(
+        forwarding,
+        host_inbound_zone,
+        meta.protocol,
+        dst_port,
+        is_v6,
+        icmp_first_l4_byte,
+    ) {
+        return None;
+    }
+    // Only an admitted packet pays the lo0 evaluation (counter + log).
+    Some(apply_lo0_filter_action(
+        forwarding,
+        extra,
+        event_stream,
+        Some(flow),
+        meta,
+        lo0_ingress_zone_override,
+        now_ns,
+    ))
+}
+
+/// #3485: regression tests for the host-inbound-before-lo0 ordering on the
+/// local-delivery path. They drive `host_inbound_gated_lo0_action` directly —
+/// the single helper both the session-HIT and session-MISS call sites route
+/// through — so they pin the ordering the un-callable poll loop enforces.
+#[cfg(test)]
+mod lo0_gate_tests {
+    use super::*;
+    use crate::filter::FilterAction;
+    use crate::ip_proto::PROTO_TCP;
+    use crate::session::SessionKey;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::Ordering;
+
+    // A configured host-inbound zone with an empty admit set denies TCP/443.
+    const DENY_ZONE: u16 = 1;
+    // A zone absent from the table => admit-all default (pre-#3070 behaviour).
+    const ADMIT_ZONE: u16 = 2;
+
+    /// ForwardingState whose lo0 v4 filter is a single COUNTING REJECT term
+    /// matching TCP/443, with `DENY_ZONE` present-but-empty in the host-inbound
+    /// table (denies) and `ADMIT_ZONE` absent (admit-all).
+    fn forwarding_with_lo0_reject() -> ForwardingState {
+        let mut fw = ForwardingState::default();
+        fw.filter_state = crate::filter::parse_filter_state(
+            &[crate::FirewallFilterSnapshot {
+                name: "protect-re".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "deny-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    count: "lo0-web".into(),
+                    action: "reject".into(),
+                    ..Default::default()
+                }],
+            }],
+            &[],
+            &[],
+            "protect-re",
+            "",
+        )
+        .expect("filter state compiles");
+        // Present-but-empty => the zone IS configured and admits nothing, so a
+        // TCP/443 host-bound packet is denied (Junos posture).
+        fw.zone_host_inbound
+            .insert(DENY_ZONE, crate::afxdp::types::ZoneHostInbound::default());
+        fw
+    }
+
+    /// Packets recorded by the single lo0 term's counter. In `#[cfg(test)]`
+    /// `record_filter_counter` updates this atomic immediately, so a non-zero
+    /// value proves the lo0 filter actually evaluated the packet.
+    fn lo0_term_packets(fw: &ForwardingState) -> u64 {
+        fw.filter_state
+            .lo0_filter_v4_fast
+            .as_ref()
+            .expect("lo0 v4 filter present")
+            .terms[0]
+            .counter
+            .packets
+            .load(Ordering::Relaxed)
+    }
+
+    fn tcp_443_flow_and_meta() -> (SessionFlow, UserspaceDpMeta) {
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let meta = UserspaceDpMeta {
+            protocol: PROTO_TCP,
+            addr_family: libc::AF_INET as u8,
+            l3_offset: 14,
+            l4_offset: 34,
+            tcp_flags: 0x02,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: src,
+            dst_ip: dst,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: src,
+                dst_ip: dst,
+                src_port: 40000,
+                dst_port: 443,
+            },
+        };
+        (flow, meta)
+    }
+
+    fn extra() -> TermMatchExtra<'static> {
+        TermMatchExtra {
+            tcp_flags: 0x02,
+            l4_present: true,
+            ..Default::default()
+        }
+    }
+
+    /// A host-inbound-DENIED packet must return `None` (caller drops silently,
+    /// no reject reply / no session teardown) AND must NOT evaluate the lo0
+    /// filter — its counter stays 0. Reverting the reorder (lo0 first) bumps the
+    /// counter to 1 on the denied packet, turning this RED.
+    #[test]
+    fn host_inbound_deny_skips_lo0_side_effects() {
+        let fw = forwarding_with_lo0_reject();
+        let (flow, meta) = tcp_443_flow_and_meta();
+
+        let action = host_inbound_gated_lo0_action(
+            &fw,
+            DENY_ZONE,
+            443,
+            false,
+            0,
+            extra(),
+            None,
+            &flow,
+            meta,
+            Some(DENY_ZONE),
+            1_000,
+        );
+        assert_eq!(action, None, "host-inbound deny must short-circuit with None");
+        assert_eq!(
+            lo0_term_packets(&fw),
+            0,
+            "lo0 filter must NOT run on a host-inbound-denied packet (#3485)",
+        );
+    }
+
+    /// A host-inbound-ADMITTED packet preserves the prior behaviour exactly:
+    /// the lo0 filter evaluates, returns `Reject`, and its counter bumps.
+    #[test]
+    fn host_inbound_admit_runs_lo0() {
+        let fw = forwarding_with_lo0_reject();
+        let (flow, meta) = tcp_443_flow_and_meta();
+
+        let action = host_inbound_gated_lo0_action(
+            &fw,
+            ADMIT_ZONE,
+            443,
+            false,
+            0,
+            extra(),
+            None,
+            &flow,
+            meta,
+            Some(ADMIT_ZONE),
+            1_000,
+        );
+        assert_eq!(
+            action,
+            Some(FilterAction::Reject),
+            "admitted packet runs the lo0 reject term",
+        );
+        assert_eq!(
+            lo0_term_packets(&fw),
+            1,
+            "lo0 filter must run + count on an admitted packet",
+        );
+    }
+}
