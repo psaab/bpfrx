@@ -1,3 +1,39 @@
+## 2026-06-29 — #3363 Codex MEDIUM fold: structured gRPC GetPolicies default-policy parity (PR #3528)
+
+- **Timestamp**: 2026-06-29
+- **Action**: Codex MEDIUM gap fold for PR #3528. The #3363 implicit
+  default-policy hit counter was surfaced as a synthetic `-`/`-`/
+  `default-policy` row across REST `/policies`, CLI, gRPC TEXT hit-count,
+  and Prometheus — but the STRUCTURED gRPC `GetPolicies` RPC omitted it, so
+  automation reading the structured inventory could not audit the
+  default-deny/permit boundary. FOLD 1: append a synthetic `pb.PolicyInfo`
+  (FromZone/ToZone `-`/`-`) with one `pb.PolicyRule{Name/RuleId=
+  dataplane.DefaultPolicyName, PolicyId=dataplane.DefaultPolicySentinelID}`
+  before the `readErr` check in `GetPolicies`, mirroring the REST surface
+  exactly; counters read via `ReadPolicyCounters(DefaultPolicySentinelID)`
+  under the same `statsEnabled && s.dp != nil && s.dp.IsLoaded()` gate, read
+  errors folded into the existing readErr handling. FOLD 2 (NIT): updated
+  the stale doc comments in `userspace-dp/src/policy.rs` and
+  `session/entry.rs` that claimed the implicit default-policy has no
+  fast-path counter — `0` is reserved for non-policy/no-counter sessions;
+  the default-policy is bound to `DEFAULT_POLICY_COUNTER_IDX==u32::MAX`,
+  resolved to `PolicyState::default_counter` so a default-PERMIT session
+  re-counts on the fast path. RED-on-revert: new
+  `TestGetPoliciesIncludesDefaultPolicyRow` asserts the specific
+  default-policy row + sentinel PolicyId/RuleId + the live 42/4200 counter;
+  stripping the append makes it RED (verified). Merge with origin/master
+  surfaced a PRE-EXISTING master breakage from #3436 (daemon_nft.go added a
+  `pkg/dataplane` import via DSCPValues but never updated the retirement
+  import allowlist / #1451 docs table) — added the missing allowlist entry
+  + docs-table row to keep the suite green. go test ./pkg/grpcapi/
+  ./pkg/dataplane/ ./pkg/config/ ./pkg/cli/ ./pkg/api/ green; cargo build
+  clean; gofmt + go vet ./pkg/grpcapi/ clean.
+- **File(s)**: pkg/grpcapi/server_show_zones.go,
+  pkg/grpcapi/server_show_zones_default_policy_3363_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/session/entry.rs,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
+
 ## 2026-06-29 — #3419 REST session-view parity with gRPC
 
 - **Timestamp**: 2026-06-29

@@ -227,6 +227,37 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 		resp.Policies = append(resp.Policies, pi)
 	}
 
+	// #3363: the IMPLICIT default-policy catch-all has a reserved hit counter
+	// (read via the DefaultPolicySentinelID handle). Surface it as a final
+	// synthetic policy set ("-"/"-") with one rule named
+	// dataplane.DefaultPolicyName so structured automation reading GetPolicies
+	// sees the same default-deny/permit row REST/CLI/text/Prometheus render.
+	// Counts gate on policy-stats like every other rule.
+	{
+		defRule := &pb.PolicyRule{
+			Name:         dataplane.DefaultPolicyName,
+			Action:       policyActionStr(cfg.Security.DefaultPolicy),
+			SrcAddresses: []string{},
+			DstAddresses: []string{},
+			Applications: []string{},
+			PolicyId:     dataplane.DefaultPolicySentinelID,
+			RuleId:       dataplane.DefaultPolicyName,
+		}
+		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+				defRule.HitPackets = ctrs.Packets
+				defRule.HitBytes = ctrs.Bytes
+			} else if readErr == nil {
+				readErr = err
+			}
+		}
+		resp.Policies = append(resp.Policies, &pb.PolicyInfo{
+			FromZone: "-",
+			ToZone:   "-",
+			Rules:    []*pb.PolicyRule{defRule},
+		})
+	}
+
 	if readErr != nil {
 		return nil, status.Errorf(codes.Internal, "reading policy counter: %v", readErr)
 	}

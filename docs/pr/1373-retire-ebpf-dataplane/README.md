@@ -283,6 +283,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/daemon/daemon_apply.go` | Apply path still adapts legacy compile/apply metadata. |
 | `pkg/daemon/daemon_proxyarp.go` | #2197: extracted proxy-ARP/NDP reconcile + periodic re-assert call `dataplane.ReconcileProxyARP` (control-plane kernel responder reconcile relocated from `daemon_apply.go`). |
 | `pkg/daemon/daemon_flow.go` | Flow logging still names legacy `dataplane.GlobalCtr*` counter indices read via `dataplane.Telemetry`. |
+| `pkg/daemon/daemon_nft.go` | #3436: lo0 nft lowering resolves DSCP names through `dataplane.DSCPValues` (shared with the userspace matcher) to emit numeric code points; lowering only, no legacy enforcement path. |
 | `pkg/daemon/daemon_ha.go` | HA state updates still call legacy bridge methods. |
 | `pkg/daemon/daemon_ha_fabric.go` | Fabric HA updates still call legacy bridge methods. |
 | `pkg/daemon/daemon_ha_userspace.go` | Userspace HA control still crosses the legacy bridge. |

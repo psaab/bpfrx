@@ -542,12 +542,16 @@ pub(crate) struct PolicyEvaluationResult {
     /// session-install path can stamp it onto the session metadata. The
     /// established fast path then resolves the counter via
     /// [`PolicyState::hit_counter_by_idx`] and counts every packet of the
-    /// flow (not just the first). `0` means "no per-rule counter" — the
-    /// implicit default-policy result and every non-policy-forwarded session
-    /// (firewall-local / neighbor-seed / fabric / tunnel) — so those flows
-    /// keep counting nothing on the fast path. A 1-based handle is used so
-    /// `0` is an unambiguous sentinel distinct from rule index 0 (the FIRST
-    /// configured rule, which also carries `policy_id` 0).
+    /// flow (not just the first). `0` is reserved for "no counter" — every
+    /// non-policy-forwarded session (firewall-local / neighbor-seed / fabric /
+    /// tunnel) — so those flows keep counting nothing on the fast path. The
+    /// implicit default-policy is NOT `0`: #3363 binds it to the reserved
+    /// `DEFAULT_POLICY_COUNTER_IDX` (`u32::MAX`) sentinel, which
+    /// `hit_counter_by_idx` resolves to `PolicyState::default_counter` so a
+    /// default-PERMIT session re-counts every packet on the fast path. A
+    /// 1-based handle is used so `0` is an unambiguous sentinel distinct from
+    /// rule index 0 (the FIRST configured rule, which also carries `policy_id`
+    /// 0).
     pub(crate) policy_counter_idx: u32,
 }
 
