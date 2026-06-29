@@ -22,42 +22,64 @@ func (c *CLI) showSecurityLog(args []string) error {
 	cr := c.applyResult()
 
 	// Parse arguments: [N] [zone <name>] [protocol <proto>] [action <act>]
+	//
+	// Argument parsing fails CLOSED (#3347): an unknown token or a filter
+	// keyword with no value is a usage error, never silently ignored. A
+	// typo (`show security log zon trust`) or a bare trailing keyword
+	// (`show security log action`) used to fall through to an unfiltered
+	// dump of every event — in incident response, silently widening a
+	// scoped forensic query is worse than refusing it.
+	const usage = "usage: show security log [<count>] [zone <name>] " +
+		"[protocol <proto>] [action <action>]"
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "zone":
-			if i+1 < len(args) {
-				i++
-				zoneName := args[i]
-				if cr != nil {
-					if zid, ok := cr.ZoneIDs[zoneName]; ok {
-						filter.Zone = zid
-					} else {
-						return fmt.Errorf("zone %q not found", zoneName)
-					}
-				}
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for %q\n%s", "zone", usage)
 			}
+			i++
+			zoneName := args[i]
+			// A zone filter is meaningless without the apply result that
+			// maps zone name -> ID. Refuse rather than drop the filter and
+			// widen to all events (M02): during early startup or after a
+			// failed apply, cr == nil and silently honoring the request
+			// would dump every zone's events.
+			if cr == nil {
+				return fmt.Errorf("cannot filter by zone %q: no active dataplane apply result "+
+					"(zone IDs unavailable — retry after a successful commit)", zoneName)
+			}
+			zid, ok := cr.ZoneIDs[zoneName]
+			if !ok {
+				return fmt.Errorf("zone %q not found", zoneName)
+			}
+			filter.Zone = zid
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				filter.Protocol = args[i]
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for %q\n%s", "protocol", usage)
 			}
+			i++
+			filter.Protocol = args[i]
 		case "action":
-			if i+1 < len(args) {
-				i++
-				filter.Action = args[i]
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for %q\n%s", "action", usage)
 			}
+			i++
+			filter.Action = args[i]
 		default:
-			// Try parsing as count. Reject a non-positive count at the
-			// boundary so `show security log -1` is a clean error rather
-			// than a panic — defense in depth alongside the EventBuffer
-			// guard (#3342). A bare non-numeric token is ignored, as
-			// before.
-			if v, err := strconv.Atoi(args[i]); err == nil {
-				if v <= 0 {
-					return fmt.Errorf("event count must be a positive integer, got %d", v)
-				}
-				n = v
+			// The only bare token accepted is the event count. Reject a
+			// non-positive count at the boundary so `show security log -1`
+			// is a clean error rather than a panic — defense in depth
+			// alongside the EventBuffer guard (#3342). Any other unknown
+			// token is a usage error (#3347), not a silently-ignored
+			// fall-open to an unfiltered dump.
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return fmt.Errorf("unknown argument %q\n%s", args[i], usage)
 			}
+			if v <= 0 {
+				return fmt.Errorf("event count must be a positive integer, got %d", v)
+			}
+			n = v
 		}
 	}
 

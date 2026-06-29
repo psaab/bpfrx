@@ -1,3 +1,88 @@
+## 2026-06-29 — #3348 (PR #3506 review fold) inline-term edge cases
+
+- **Timestamp**: 2026-06-29
+- **Action**: Codex MERGE-NEEDS-MAJOR on PR #3506 — top-level junos-ping
+  fix correct, two inline-term edge cases folded. (1) Widening inversion:
+  a term listing BOTH junos-ping AND an all-ICMP alias normalizes both to
+  "icmp" and dedups to one term; applying echoByProto narrowed the union
+  to echo-only. Added unconstrainedICMP[proto] tracking — an all-ICMP
+  alias (icmp/icmpv6/junos-icmp-all/junos-icmp6-all) on a normalized proto
+  suppresses the echo default for that proto. (2) Fail-open: a malformed
+  inline-term icmp-type (e.g. 999) was silently dropped (term opaque to
+  schema) → unconstrained all-ICMP. Added Application.UnknownICMP
+  (mirroring UnknownTimeouts), recorded in both inline-term and top-level
+  parse, rejected by validateApplicationSpecsStrict at commit /
+  downgraded to warning on the lenient load/peer-sync path. RED-on-revert
+  tests added for both. go test config/appid/policymatch green; gofmt +
+  vet clean. Rebased on origin/master (clean, no #3332 overlap).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/types_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/config/README.md, docs/config-schema.md
+
+## 2026-06-29 — #3348 custom protocol junos-ping echo constraint + icmp-type/icmp-code grammar
+
+- **Timestamp**: 2026-06-29
+- **Action**: A user-defined application with `protocol junos-ping` /
+  `junos-pingv6` lowered to bare ICMP with no type constraint, so the
+  projected policy term matched EVERY ICMP type (security widening — a
+  permit term admitted unreachable/redirect/timestamp, not just echo),
+  broader than the predefined junos-ping object (ICMPType=8, #3020). Added
+  `aliasEchoICMPType` to attach echo type 8/128 on both the top-level and
+  inline-term application paths (after the child loop so an explicit
+  icmp-type wins; all-ICMP aliases stay unconstrained). Also added the
+  missing `icmp-type`/`icmp-code` typed-integer (0..255) schema leaves so
+  an operator can author a constrained custom echo/traceroute/ICMP-control
+  app, wired through to Application.ICMPType/ICMPCode on both paths. Added
+  strict guards (validateApplicationSpecsStrict + protocolIsICMPFamily):
+  reject icmp-type/code on a non-ICMP protocol (never-match term, #3373
+  hazard) and icmp-code without icmp-type; both downgrade to a warning on
+  the lenient load/peer-sync path (#1960). No wire/Rust change — the
+  snapshot already carries the constraint and the matcher already enforces
+  it (#3020).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/schema_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/policymatch/app_junos_ping_3348_test.go,
+  pkg/policymatch/icmp_test.go (stale-comment fix), pkg/config/README.md,
+  docs/config-schema.md
+## 2026-06-29 — #3296 undefined interface/lo0 filter reference fail-open
+
+- **Timestamp**: 2026-06-29
+- **Action**: Promote an undefined interface/lo0 firewall filter reference
+  from a commit WARNING to a strict commit error + add a fail-closed
+  dataplane backstop. Before: `interfaces <if> unit <n> family inet|inet6
+  filter input|output <name>` (and lo0 input) naming a filter not defined
+  under `firewall family ... filter` was warn-only at commit, and the Rust
+  snapshot compiler left the per-interface fast-path map (and output
+  needs_tx_eval set) empty for the missing key → hot path returned the
+  default Accept → hook silently disarmed (fail-OPEN on a typo'd security
+  hook). Go: new `validateFirewallFilterReferencesStrict`
+  (compiler_validate_strict.go), wired at the firewall-gate cluster
+  (compiler.go) gated on `opts.lenientFirewallRefs` — strict on commit,
+  downgraded-warn on lenient/peer-sync (#1960). Deleted the superseded
+  warn-only interface filter-reference loop in compiler_validate_warn.go
+  (avoids a duplicate warning on the lenient path). lo0 is covered for free
+  (stored as cfg.Interfaces.Interfaces["lo0"]). Rust: new
+  `SnapshotIntegrityError::MissingFilterRef` raised by `parse_filter_state`
+  (filter/compiler.rs) on a named-but-missing interface/lo0 ref —
+  preflight reject preserves prior good state, never falls open to Accept.
+  Mirrors the policer (#2217) / prefix-list (#2506) strict-reference
+  precedent and the #2505 snapshot-integrity backstop doctrine.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_filter_ref_3296_test.go (new),
+  pkg/config/compiler_interfaces_unsupported_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/parser_services_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md
+- **Validation**: `go test ./pkg/config/...` green (8 new + 5 fixed
+  pre-existing tests that referenced undefined filters); `cargo build`
+  green; new Rust tests `missing_filter_ref_3296_*` /
+  `defined_filter_ref_3296_compiles_cleanly` pass; full Rust suite 3223
+  pass / 2 pre-existing flakes (event_stream/worker_queue, confirmed
+  failing on pristine origin/master, unrelated to filters).
+
 ## 2026-06-28 — #3499 compiler_iface nil zone/interface map-value guards
 
 - **Timestamp**: 2026-06-28
@@ -23216,3 +23301,8 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3424 flow-trace size/files bound + enforcement. Added commit-time range gate validateFlowTraceSizeFilesAST (`security flow traceoptions file <name> size <s> files <n>`): size 10240..1073741824 bytes, files 2..1000, matching the interactive `monitor security flow file` CLI limits. Bounds exported as config.FlowTraceMin/MaxFileSize + FlowTraceMin/MaxFileCount (single SSOT for the gate AND the runtime clamp). Strict commit/commit-check rejects out-of-range; lenient load/peer-sync downgrades to a warning (new lenientFlowTraceSizeFiles opt) since NewTraceWriter now clamps to the same bounds at runtime — so a leniently-loaded `size 1 files 1000000000` can no longer rotate on every trace line and run a ~1e9-iteration rename loop under the writer mutex (the per-event CPU storm, codex-review-097 M03). Also fixed a latent #2419-class compiler bug: the flat-set form collapses size/files onto ONE child node's Keys, and compileFlow's old FindChild("files") missed it (read FileSize but dropped FileCount); replaced with shared flowTraceSizeFilesValues token-scan used by both compileFlow and the gate. RED-on-revert verified: neutering the gate call + clamp turns the config reject tests + lenient-downgrade + runtime-clamp tests RED (and the sub-minimum-size test reproduced the storm at ~50s). go test ./pkg/config/... ./pkg/logging/... ./pkg/cli/... ./pkg/grpcapi/... green; gofmt + go vet clean.
   - **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler.go, pkg/logging/trace.go, pkg/config/flow_traceoptions_size_3424_test.go, pkg/logging/trace_size_3424_test.go, pkg/logging/trace_test.go, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3295 firewall-filter no-match fall-through. Research (docs/research/3295-filter-failopen/plan.md) PLAN-KILLed the runtime flip (implicit-accept -> implicit-discard) on the verified "keep GOOD" wall: the CoS bandwidth-output allowlist attached as `reth0 unit 80 family inet/inet6 filter output` has no final catch-all, so a flip would blackhole all unmatched egress at TX selection (cos_classify.rs drop on action != Accept). Shipped the research-recommended mitigation instead, runtime UNCHANGED: a commit-time WARNING (validateFilterNoCatchAllWarnings) for any filter ATTACHED to an interface/lo0 input/output hook that has no terminal catch-all term (unconstrained `from` + terminating accept/discard/reject, NextTerm=false). Surfaces the deliberate divergence + the explicit-final-`then discard` workaround. WARN-only (never an error; no-brick). Docs: filter README + feature-coverage.md. RED-on-revert verified (strip the call -> 3 warn tests fail).
+  - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/compiler_filter_nocatchall_3295_test.go, userspace-dp/src/filter/README.md, docs/feature-coverage.md, _Log.md
+  - **Action**: #3347 — `show security log` argument parsing now fails CLOSED. The parse loop in showSecurityLog silently ignored unknown tokens (a typo `zon trust` fell through Atoi and dumped all 50 events) and filter keywords with no value (`action` with nothing after); M02: a `zone <name>` filter requested while no apply result exists (cr==nil at early startup / after a failed apply) dropped the filter and widened to all zones. Fix: reject unknown tokens and missing filter values with a usage error; refuse a zone filter when cr==nil rather than widening. Added cli_show_security_log_argparse_3347_test.go (unknown token, bogus single token, missing zone/protocol/action value, unknown zone, zone-without-apply-result, plus valid count + valid filters); verified each guard RED-on-revert. gofmt clean, go test ./pkg/cli/... green. Documented filter syntax + fail-closed behavior in docs/junos-cli-reference.md.
+  - **File(s)**: pkg/cli/cli_show_security_log.go, pkg/cli/cli_show_security_log_argparse_3347_test.go, docs/junos-cli-reference.md, _Log.md
