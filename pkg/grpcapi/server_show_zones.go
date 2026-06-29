@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -278,6 +279,12 @@ func (s *Server) GetScreen(_ context.Context, _ *pb.GetScreenRequest) (*pb.GetSc
 		}
 		if si.Checks == nil {
 			si.Checks = []string{}
+		}
+		if th := config.ScreenThresholds(profile); len(th) > 0 {
+			si.Thresholds = make(map[string]int64, len(th))
+			for k, v := range th {
+				si.Thresholds[k] = int64(v)
+			}
 		}
 		resp.Screens = append(resp.Screens, si)
 	}
