@@ -723,12 +723,28 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 	}
 
 	// ICMP type/code matching (#2545: multi-value).
-	if len(term.ICMPTypes) > 0 {
+	//
+	// #3483: emit the `icmp code` predicate WHENEVER a code is configured,
+	// independent of whether a type is also set. The userspace projections
+	// enforce the code criterion on its own — pkg/dataplane/userspace/filters.go
+	// emits ICMPCodes gated only on len(term.ICMPCodes) > 0, and the Rust matcher
+	// (userspace-dp/src/filter/engine/matching.rs) tests icmp_code_match_enabled
+	// in a block separate from icmp_type_match_enabled. The pre-fix nft mirror
+	// nested the code predicate under `if len(term.ICMPTypes) > 0`, so a
+	// code-only term (`from protocol icmp icmp-code 4 then discard`, no
+	// icmp-type) dropped the code match entirely on the kernel lo0 path. That
+	// made the kernel mirror match BROADER than userspace: a `discard` term
+	// dropped ALL ICMP (fail-closed over-broad), an `accept` term admitted ALL
+	// ICMP (fail-open). Render type and code as independent predicates so a
+	// code-only term matches the same packets in nft as in userspace.
+	if len(term.ICMPTypes) > 0 || len(term.ICMPCodes) > 0 {
 		icmpFamily := "icmp"
 		if family == "ip6" {
 			icmpFamily = "icmpv6"
 		}
-		parts = append(parts, icmpFamily+" type "+nftIntSet(term.ICMPTypes))
+		if len(term.ICMPTypes) > 0 {
+			parts = append(parts, icmpFamily+" type "+nftIntSet(term.ICMPTypes))
+		}
 		if len(term.ICMPCodes) > 0 {
 			parts = append(parts, icmpFamily+" code "+nftIntSet(term.ICMPCodes))
 		}

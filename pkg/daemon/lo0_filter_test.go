@@ -531,6 +531,64 @@ func TestNftRuleFromTermICMPTypeCode(t *testing.T) {
 	}
 }
 
+// TestNftRuleFromTermICMPCodeOnly is the #3483 RED-on-revert guard: an lo0
+// term that specifies an `icmp code` but NO `icmp type` MUST still emit the
+// `code` predicate on the kernel-nft mirror, matching the userspace matcher
+// (pkg/dataplane/userspace/filters.go gates ICMPCodes on len > 0; the Rust
+// matcher's icmp_code_match_enabled is a block separate from
+// icmp_type_match_enabled). Before #3483 the code predicate was nested under
+// `if len(term.ICMPTypes) > 0`, so a code-only discard term dropped the code
+// match entirely and matched ALL ICMP (over-broad / fail-open vs userspace).
+// Reverting the fix (re-nesting code under the type guard) drops the predicate
+// and fails this test in both families.
+func TestNftRuleFromTermICMPCodeOnly(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	// IPv4: code-only, no type. nft must still constrain on the code.
+	v4 := &config.FirewallFilterTerm{
+		Name:      "drop-icmp-code4",
+		Protocols: []string{"icmp"},
+		ICMPCodes: []int{4},
+		Action:    "discard",
+	}
+	ruleV4 := nftRuleFromTerm(v4, "ip", prefixLists)
+	wantV4 := "meta l4proto icmp icmp code 4 drop"
+	if ruleV4 != wantV4 {
+		t.Errorf("v4 code-only:\n  got:  %s\n  want: %s", ruleV4, wantV4)
+	}
+	if !strings.Contains(ruleV4, "icmp code 4") {
+		t.Errorf("v4 code-only rule dropped the code predicate (the #3483 bug): %q", ruleV4)
+	}
+
+	// IPv6: code-only, no type. icmpv6 family, code still emitted.
+	v6 := &config.FirewallFilterTerm{
+		Name:      "drop-icmpv6-code1",
+		Protocols: []string{"icmpv6"},
+		ICMPCodes: []int{1},
+		Action:    "discard",
+	}
+	ruleV6 := nftRuleFromTerm(v6, "ip6", prefixLists)
+	wantV6 := "meta l4proto icmpv6 icmpv6 code 1 drop"
+	if ruleV6 != wantV6 {
+		t.Errorf("v6 code-only:\n  got:  %s\n  want: %s", ruleV6, wantV6)
+	}
+	if !strings.Contains(ruleV6, "icmpv6 code 1") {
+		t.Errorf("v6 code-only rule dropped the code predicate (the #3483 bug): %q", ruleV6)
+	}
+
+	// Multi-value code-only (no type) renders an nft set.
+	multi := &config.FirewallFilterTerm{
+		Name:      "drop-icmp-codes",
+		ICMPCodes: []int{0, 4},
+		Action:    "discard",
+	}
+	ruleMulti := nftRuleFromTerm(multi, "ip", prefixLists)
+	wantMulti := "icmp code { 0, 4 } drop"
+	if ruleMulti != wantMulti {
+		t.Errorf("multi code-only:\n  got:  %s\n  want: %s", ruleMulti, wantMulti)
+	}
+}
+
 func TestNftRuleFromTermDSCP(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 
