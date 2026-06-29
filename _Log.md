@@ -23024,3 +23024,17 @@ top.
   test-pinnable (#1916 pattern). 5 RED-on-revert tests.
 - **File(s)**: pkg/configstore/store.go, store_commit.go, store_persist.go,
   durability_3441_test.go, README.md
+
+## #3441 fold: surface rollback-history degradation via Prometheus + health
+- **Timestamp**: 2026-06-28
+- **Action**: SMR MERGE-NEEDS-MINOR fold. RollbackHistoryDegraded() was
+  exported with a doc promising status/health surfacing but nothing consumed
+  it. Mirrored the ConfigPersistDegraded sibling: added
+  xpf_config_rollback_persist_degraded 0/1 gauge (emitted before the dp gate,
+  like configPersistDegraded) + a non-fatal rollback_history_degraded /health
+  field (NOT 503 — active config is durable, only best-effort text copies
+  failed) + wired RollbackHistoryDegradedFn in daemon_run.go. Gauge + health
+  tests (RED-on-revert).
+- **File(s)**: pkg/api/server.go, metrics.go, metrics_descriptors.go,
+  health.go, daemon/daemon_run.go, pkg/api/metrics_persist_degraded_test.go,
+  pkg/api/health_test.go, pkg/api/README.md

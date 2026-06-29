@@ -169,3 +169,58 @@ func TestHealthHandler_OKWhenConfigPersistHealthy(t *testing.T) {
 		t.Errorf("config_persist_degraded = %v, want false-and-present", data["config_persist_degraded"])
 	}
 }
+
+// TestHealthHandler_ReportsRollbackHistoryDegraded pins #3441: while the
+// configstore reports a degraded rollback history, /health surfaces the
+// rollback_history_degraded field as true — but stays 200/ok, because the
+// active config is durable and only the best-effort text rollback copies
+// failed (a forwarding firewall must not be pulled from rotation over a
+// degraded recovery aid).
+func TestHealthHandler_ReportsRollbackHistoryDegraded(t *testing.T) {
+	s := &Server{
+		rollbackHistoryDegradedFn: func() bool { return true },
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/health", nil)
+	s.healthHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Errorf("status = %d, want 200 (rollback-history degradation is non-fatal)", rr.Code)
+	}
+	var resp Response
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	data, ok := resp.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("data = %T, want map", resp.Data)
+	}
+	if degraded, _ := data["rollback_history_degraded"].(bool); !degraded {
+		t.Error("rollback_history_degraded should be true and reported in /health")
+	}
+}
+
+// TestHealthHandler_RollbackHistoryHealthy pins the complementary half:
+// with the fn wired and reporting healthy, the field is present and false.
+func TestHealthHandler_RollbackHistoryHealthy(t *testing.T) {
+	s := &Server{
+		rollbackHistoryDegradedFn: func() bool { return false },
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/health", nil)
+	s.healthHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	var resp Response
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	data, _ := resp.Data.(map[string]any)
+	if degraded, ok := data["rollback_history_degraded"].(bool); !ok || degraded {
+		t.Errorf("rollback_history_degraded = %v, want false-and-present", data["rollback_history_degraded"])
+	}
+}
