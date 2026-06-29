@@ -21,6 +21,9 @@ func (s *Server) GetInterfaces(_ context.Context, _ *pb.GetInterfacesRequest) (*
 
 	ifZone := make(map[string]string)
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			ifZone[ifName] = zoneName
 		}
@@ -72,6 +75,9 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 	ifaceZone := make(map[string]*config.ZoneConfig)
 	ifaceZoneName := make(map[string]string)
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			ifaceZone[ifName] = zone
 			ifaceZoneName[ifName] = name
@@ -348,6 +354,9 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 	// Build zone mapping: interface name -> zone name
 	ifaceZoneName := make(map[string]string)
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			ifaceZoneName[ifName] = name
 		}

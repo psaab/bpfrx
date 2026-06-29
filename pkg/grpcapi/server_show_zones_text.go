@@ -36,6 +36,9 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 	var readErr error
 	for _, name := range zoneNames {
 		zone := cfg.Security.Zones[name]
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		var zoneID uint16
 		if cr != nil {
 			zoneID = cr.ZoneIDs[name]
@@ -228,6 +231,9 @@ func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *
 	} else {
 		found := false
 		for zoneName, zone := range cfg.Security.Zones {
+			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			for _, iface := range zone.Interfaces {
 				if iface == ifName {
 					fmt.Fprintf(buf, "Interface %s belongs to zone: %s\n", ifName, zoneName)

@@ -1042,6 +1042,131 @@ fn tcp_rst_uses_short_timeout_not_fin_timeout() {
     );
 }
 
+#[test]
+fn closing_flag_is_sticky_across_nonclosing_update() {
+    // #3489 FAIL-ON-REVERT: once a FIN moves a TCP session into the short 30s
+    // TCP_CLOSING_TIMEOUT_NS close window, a subsequent NON-closing segment
+    // (e.g. a reordered data-ACK, flags=0x10) refreshing the entry through
+    // update_session MUST keep `closing` set and keep the 30s window — it must
+    // NOT revert to the 300s established idle window. This is independent of the
+    // in-place-vs-reference parity sweep (which is blinded by the reference
+    // helper mirroring the same flag logic): it asserts the production
+    // update_session path directly. Reverting mod.rs:1040 from `|=` to `=`
+    // makes this test RED.
+    assert!(
+        TCP_CLOSING_TIMEOUT_NS < DEFAULT_TCP_SESSION_TIMEOUT_NS,
+        "close window must be strictly shorter than the established window"
+    );
+    let now = 1_000_000_000u64;
+    let mut table = SessionTable::new();
+    let key = key_v4();
+
+    // 1) Establish the session (carry ACK so it is ESTABLISHED, not OPENING —
+    //    this is the state that would otherwise win the 300s window if closing
+    //    were reverted).
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        TCP_ACK,
+    ));
+    let _ = table.drain_deltas(8);
+
+    // 2) FIN seen on the forward half via update_session -> closing=true, 30s.
+    let fin_req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FIN | TCP_ACK,
+    };
+    assert!(table.update_session(fin_req, false));
+    let after_fin = table.entry_by_key(&key).expect("entry after FIN");
+    assert!(after_fin.closing, "FIN must mark the session closing");
+    assert!(!after_fin.reset, "FIN-only close must not set the reset flag");
+    assert_eq!(
+        after_fin.expires_after_ns, TCP_CLOSING_TIMEOUT_NS,
+        "a FIN'd session must use the 30s close window"
+    );
+
+    // 3) A later NON-closing data-ACK (flags=0x10) refreshes the entry. The
+    //    closing flag must stay sticky and the 30s window must persist. With
+    //    the pre-#3489 non-sticky `=`, closing would flip to false here and the
+    //    expires window would jump to the 300s established timeout.
+    let ack_req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: now + 2_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_ACK,
+    };
+    assert!(table.update_session(ack_req, false));
+    let after_ack = table.entry_by_key(&key).expect("entry after stray ACK");
+    assert!(
+        after_ack.closing,
+        "a non-closing segment after a FIN must NOT clear the sticky closing flag (#3489)"
+    );
+    assert_eq!(
+        after_ack.expires_after_ns, TCP_CLOSING_TIMEOUT_NS,
+        "a FIN'd session refreshed by a stray non-closing segment must keep the \
+         30s close window, not revert to the 300s established window (#3489)"
+    );
+}
+
+/// #3489: the same stickiness must hold on the HA shared-promote path. A
+/// peer-synced FIN'd session promoted to local ownership by a non-closing
+/// forward segment (`update_session(.., ha_activation=true)`) must keep
+/// `closing` and the 30s window — this is the exact production sequence the
+/// bug report describes.
+#[test]
+fn closing_flag_is_sticky_on_ha_promote() {
+    let now = 1_000_000_000u64;
+    let mut table = SessionTable::new();
+    let key = key_v4();
+
+    // Install a peer-synced (standby) session that has already seen a FIN.
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::SyncImport,
+        now,
+        PROTO_TCP,
+        TCP_FIN | TCP_ACK,
+    ));
+    let synced = table.entry_by_key(&key).expect("synced entry");
+    assert!(synced.closing, "peer-synced FIN'd entry must be closing");
+    assert_eq!(synced.expires_after_ns, TCP_CLOSING_TIMEOUT_NS);
+    let _ = table.drain_deltas(8);
+
+    // HA promote: a non-closing forward data-ACK takes local ownership.
+    let promote_req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_ACK,
+    };
+    assert!(table.update_session(promote_req, true));
+    let after = table.entry_by_key(&key).expect("entry after HA promote");
+    assert!(
+        after.closing,
+        "an HA promote by a non-closing segment must keep the sticky closing flag (#3489)"
+    );
+    assert_eq!(
+        after.expires_after_ns, TCP_CLOSING_TIMEOUT_NS,
+        "an HA-promoted FIN'd session must keep the 30s close window (#3489)"
+    );
+}
+
 /// #3152 FAIL-ON-REVERT: a TCP session created by a bare SYN (SYN set, ACK
 /// clear) must start in the OPENING (half-open) state and take the short
 /// `tcp_opening_ns` window, NOT the full established timeout. If the opening
@@ -2279,7 +2404,10 @@ fn reference_update_session(
     // then select the timeout consulting it (RST→short, FIN→30s), so the
     // in-place/reference parity sweeps stay byte-equivalent.
     entry.reset |= matches!(protocol, PROTO_TCP) && (tcp_flags & TCP_RST) != 0;
-    entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+    // #3489: mirror update_session — `closing` is sticky too. If this stayed a
+    // plain `=`, the in-place-vs-reference parity sweep would stay blind to the
+    // #3489 bug (both sides would agree on the wrong non-sticky behavior).
+    entry.closing |= matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
     // #3152: mirror update_session — promote OPENING -> ESTABLISHED on the
     // first ACK-bearing segment, then select the timeout consulting the state.
     entry.established |= matches!(protocol, PROTO_TCP) && has_ack(tcp_flags);

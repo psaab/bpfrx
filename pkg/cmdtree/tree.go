@@ -675,6 +675,9 @@ var OperationalTree = map[string]*Node{
 					}
 					names := make([]string, 0, len(cfg.Security.Zones))
 					for _, z := range cfg.Security.Zones {
+						if z == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+							continue
+						}
 						names = append(names, z.Name)
 					}
 					return names

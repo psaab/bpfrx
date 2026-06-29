@@ -221,6 +221,9 @@ func (c *CLI) showChassisClusterStatus() error {
 	cfg := c.store.ActiveConfig()
 	if cfg != nil && cfg.Security.Zones != nil {
 		for _, zone := range cfg.Security.Zones {
+			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			for _, iface := range zone.Interfaces {
 				ifCfg, ok := cfg.Interfaces.Interfaces[iface]
 				if !ok {

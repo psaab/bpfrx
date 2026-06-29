@@ -22,6 +22,9 @@ func (s *Server) interfacesHandler(w http.ResponseWriter, _ *http.Request) {
 	// Build interface->zone map
 	ifZone := make(map[string]string)
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			ifZone[ifName] = zoneName
 		}
@@ -77,6 +80,9 @@ func (s *Server) interfacesDetailHandler(w http.ResponseWriter, r *http.Request)
 func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config, filterName string) {
 	ifaceZoneName := make(map[string]string)
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			ifaceZoneName[ifName] = name
 		}
@@ -200,6 +206,9 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 func (s *Server) writeInterfacesDetail(w http.ResponseWriter, cfg *config.Config, filterName string) {
 	ifaceZoneName := make(map[string]string)
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			ifaceZoneName[ifName] = name
 		}

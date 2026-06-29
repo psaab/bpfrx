@@ -386,6 +386,9 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 	}
 	if f.cfg != nil && cr != nil {
 		for zoneName, zone := range f.cfg.Security.Zones {
+			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
 				f.zoneIfaces[zid] = zone.Interfaces[0]
 			}

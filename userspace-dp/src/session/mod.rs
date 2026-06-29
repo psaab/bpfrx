@@ -1037,7 +1037,14 @@ impl SessionTable {
             // peer-synced entry that already had reset=true, promoted via a
             // non-RST FIN trigger, would wrongly revert to the 30s FIN window.
             record.entry.reset |= matches!(protocol, PROTO_TCP) && has_rst(tcp_flags);
-            record.entry.closing = matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
+            // #3489: `closing` is sticky, exactly like `reset` (#3046) and
+            // `established` (#3152) and the read-path in lookup.rs. Once a FIN
+            // or RST has moved the session into the short close window, a later
+            // non-closing segment (e.g. a reordered data-ACK, flags=0x10) on
+            // the HA shared-promote path must NOT revert it to the 300s
+            // established window. A plain assignment here let that happen,
+            // leaving a FIN'd session lingering 10× too long (#3489).
+            record.entry.closing |= matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
             // #3152: promote OPENING -> ESTABLISHED on the first ACK-bearing
             // segment after the opening SYN (sticky, mirrors lookup.rs). The
             // SYN-ACK on the reverse half and the completing ACK on the
