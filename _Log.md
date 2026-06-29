@@ -23367,3 +23367,7 @@ top.
 - **Timestamp**: 2026-06-29
   **Action**: #3432 — reject output-attached `then routing-instance` (FBF) at commit; FBF route override is ingress-only so an output attach was a silent no-op. Added validateFilterRoutingInstanceDirectionStrict + call site + RED-on-revert tests + config-schema doc.
   **Files**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/firewall_ri_output_direction_3432_test.go, docs/config-schema.md
+## #3385 — AppCatalog dual-range overlap over-match regression guard
+- **Timestamp**: 2026-06-29
+- **Action**: Verified #3385 over-match already structurally fixed on master by #3321 (lookup_directional removed the OR-decomposition). Added a #3385-specific RED-on-revert regression test for the distinct OVERLAPPING-range cross-slot over-match. No behavior change.
+- **File(s)**: userspace-dp/src/policy_tests.rs (app_catalog_overlapping_dual_range_no_cross_slot_overmatch)

@@ -2430,6 +2430,74 @@ both strict guards) and the end-to-end matcher test
 `pkg/policymatch/app_junos_ping_3348_test.go` (custom `protocol junos-ping` permits
 type 8, denies 13/5).
 
+### #3352 / #3353 — unknown inline-`term` leaf + per-application `alg` validation
+
+An inline `applications application <a> term <t> { ... }` is declared as an
+opaque `args:1` schema leaf (`schemaApplications.application.term`,
+`children:nil`), so `SchemaValidate` cannot reach inside it. Two silent-accept
+gaps lived under that opacity:
+
+- **#3352 — unknown leaf inside a `term`.** `parseApplicationTerms`
+  (`compiler_applications.go`) was a fixed `switch` with no `default` arm, so a
+  typo'd leaf (`term t1 { protocol tcp; destination-poort 22; }`) was silently
+  dropped along with its value token — the term kept only its remaining
+  constraints (`protocol tcp`) and a narrow permit/deny term **widened to
+  all-TCP**, with no commit error. The parser now records every unrecognized
+  token on `Application.UnknownTermLeaves` (mirroring `UnknownTimeouts` /
+  `UnknownICMP`), and `validateApplicationSpecsStrict` rejects the first one at
+  commit. A custom application term accepts only `protocol` / `source-port` /
+  `destination-port` / `inactivity-timeout` / `timeout` / `icmp-type` /
+  `icmp-code` / `alg`.
+- **#3353 — unsupported per-application `alg`.** The `alg` leaf was a raw
+  `args:1` string with no validator, so a typo (`alg ftpp`) committed cleanly
+  and the operator believed an ALG was pinned when none existed (a silent no-op
+  on a security knob). `validateApplicationSpecsStrict` now validates the name
+  against `supportedApplicationALGs` (`compiler_applications.go`) — the SSOT
+  set `dns`/`ftp`/`sip`/`tftp`, MIRRORING the global `security alg <proto>`
+  control (`algDisableFlags`, `pkg/dataplane/userspace/flow.go`). The same gate
+  covers the top-level `app.ALG` and the inline-term `alg` (the term app carries
+  it). The match is case-insensitive.
+
+  **#3353 is VALIDATION only — enforcement is deferred.** A per-application ALG
+  is recorded on `Application.ALG` but is NOT carried into the userspace
+  dataplane snapshot: the only ALG signal on the wire is the *global*
+  `alg_disable_flags` bitfield (`userspace-dp` `snapshot.rs`), with no
+  per-application ALG / custom-port pin. Wiring per-application ALG (e.g. `alg
+  ftp destination-port 2121`) through to enforcement needs a new snapshot field
+  plus Rust session-metadata handling — a genuine dataplane fork that is the
+  per-application slice of the broader ALG parity tracked under **#2008**, and
+  is deliberately not built here. Until then this gate makes an unsupported
+  name an operator-visible commit error instead of a silent no-op.
+
+**Scope — ALL user-defined applications, referenced or not.** These two checks
+live in a SEPARATE pass, `validateApplicationSyntaxStrict`, that iterates every
+entry in `cfg.Applications.Applications`, NOT the reference-scoped
+`applicationsToValidateStrict` subset that `validateApplicationSpecsStrict` uses
+for its port / protocol / icmp / timeout checks. The reference scope is correct
+for those SEMANTIC checks (an unreferenced malformed-port app cannot break a
+live policy decision, so it stays a warning so an operator iterating on a
+not-yet-wired application library is not blocked). But an unknown term statement
+and an unsupported `alg` are SYNTACTIC / enum violations — the config names a
+statement or an ALG that does not exist — which Junos rejects at commit
+regardless of policy wiring; deferring them until reference would let a typo'd
+term-leaf silently widen a term, or a bogus `alg` silently no-op, from the
+moment the app is defined. `cfg.Applications.Applications` holds ONLY
+user-defined applications (and the per-term apps they generate); PREDEFINED
+junos-* apps (`junos-rtsp`, `junos-h323`, ...) live in the separate
+`PredefinedApplications` table and are never in this map, so the `alg` check
+never false-rejects a predefined app that legitimately carries an
+out-of-supported-set ALG.
+
+Both checks are STRICT on the commit / commit-check path and downgrade to a
+`cfg.Warnings` entry on the tolerant load / HA peer-sync path
+(`lenientApplicationSpecs`, #1960 no-brick), the same discipline as the #3320 /
+#3348 application gates. Regression coverage:
+`pkg/config/compiler_application_term_alg_3352_3353_test.go` (unknown term leaf
+rejected referenced AND unreferenced, well-formed term keeps its port
+constraint, unknown alg rejected top-level + inline-term + unreferenced,
+supported alg names accepted on both paths, predefined-app reference not
+rejected).
+
 ### #2226 — rib-group `import-rib` undefined-reference validation
 
 `routing-options rib-groups <group> import-rib <rib>` was unvalidated: an
