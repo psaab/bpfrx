@@ -993,6 +993,9 @@ pub(super) fn poll_binding_process_descriptor(
                             worker_ctx.forwarding.static_nat.match_dnat_with_counter_scoped(
                                 resolution_target,
                                 flow.forward_key.dst_port,
+                                // #3435: gate the inbound static DNAT on the
+                                // packet SOURCE against `match source-address`.
+                                Some(flow.forward_key.src_ip),
                                 ingress_zone_name,
                                 ingress_ifname_dnat,
                                 ingress_ri_dnat,

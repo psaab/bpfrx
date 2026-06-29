@@ -485,11 +485,20 @@ func buildStaticNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			if rule == nil || rule.IsNPTv6 {
 				continue
 			}
+			// #3435: carry the `match source-address` constraint into the
+			// snapshot. Prefer the full bracket-list (SourceAddresses); fall
+			// back to the singular SourceAddress for an older typed config.
+			// Empty = match any source (unscoped, pre-#3435 behavior).
+			sourceAddrs := append([]string(nil), rule.SourceAddresses...)
+			if len(sourceAddrs) == 0 && rule.SourceAddress != "" {
+				sourceAddrs = append(sourceAddrs, rule.SourceAddress)
+			}
 			out = append(out, StaticNATRuleSnapshot{
 				Name:                 rule.Name,
 				FromZone:             rs.FromZone,
 				FromInterface:        rs.FromInterface,
 				FromRoutingInstance:  rs.FromRoutingInstance,
+				SourceAddresses:      sourceAddrs,
 				ExternalIP:           rule.Match,
 				InternalIP:           rule.Then,
 				MatchDestinationPort: clampPort(rule.MatchDestinationPort),

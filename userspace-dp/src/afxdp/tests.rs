@@ -955,6 +955,7 @@ fn static_nat_snat_matches_when_zone_is_empty() {
     // Create a snapshot where from_zone is empty (matches any zone)
     let mut snapshot = static_nat_snapshot();
     snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+        source_addresses: Vec::new(),
         counter_id: 0,
         name: "web-server".to_string(),
         from_zone: String::new(), // matches any zone
@@ -985,6 +986,7 @@ fn static_nat_takes_priority_over_interface_snat() {
     // Create snapshot with both static NAT and interface SNAT
     let mut snapshot = static_nat_snapshot();
     snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+        source_addresses: Vec::new(),
         counter_id: 0,
         name: "static-web".to_string(),
         from_zone: String::new(),
@@ -1023,6 +1025,7 @@ fn static_nat_takes_priority_over_interface_snat() {
 fn static_nat_v6_dnat_and_snat() {
     let mut snapshot = static_nat_snapshot();
     snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+        source_addresses: Vec::new(),
         counter_id: 0,
         name: "v6-server".to_string(),
         from_zone: String::new(),

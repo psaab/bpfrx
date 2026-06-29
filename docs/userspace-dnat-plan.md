@@ -407,6 +407,44 @@ expose it).
   (`lenientFirewallRefs`, #1960) and the dataplane backstop fails closed. Mirrors
   the firewall prefix-list / policer reference gates.
 
+### Static-NAT source-address (#3435)
+
+`match source-address` on a **static** NAT rule is the bidirectional 1:1/DNAT
+analog of the DNAT constraint above. It was accepted by the schema and stored
+by the compiler, but dropped before runtime — the static snapshot had no source
+field and the Rust matcher never checked source, so a rule meant to expose an
+internal host only to selected client prefixes installed as an all-source
+mapping (fail-open exposure broadening, H01). Separately the typed value was
+truncated to a single scalar despite the schema's `multi: true`, so
+bracket/repeated lists lost every prefix after the first (M02).
+
+#3435 mirrors #2394 end to end:
+
+- `StaticNATRule.SourceAddresses` (`types_security.go`) holds the full list;
+  `compileNATStatic` (`compiler_nat.go`) appends `m.Keys[1:]` + child names
+  (closing M02) and keeps the singular `SourceAddress` as the first element for
+  back-compat (the NAT64 `::/0` readers, peer sync).
+- `StaticNATRuleSnapshot.SourceAddresses` (Go `protocol.go` /
+  `source_addresses` Rust `protocol/nat.rs`) — a new additive wire field
+  (`json:"source_addresses,omitempty"`, serde `default`). Empty = match any
+  source (unscoped, unchanged). `protocol_wire_v1.json` was regenerated.
+- `buildStaticNATSnapshots` (`nat.go`) populates it from `rule.SourceAddresses`
+  with the singular `SourceAddress` fallback.
+- `static_nat.rs` parses the list into a `SourceConstraint`
+  (`{constrained, v4, v6}`) on each `StaticNatEntry` and `StaticNatBlock`
+  (host AND #3031 block paths). `SourceConstraint::matches`: unconstrained ->
+  match any; constrained but zero entries parsed -> match NOTHING (fail closed,
+  the #2394/#3435 guard); else the peer must fall in a parsed prefix of its
+  family. Bare-host fallback to /32 /128 (IpNet rejects a bare IP) is shared
+  with the DNAT path.
+- **Direction.** The inbound `match_dnat_with_counter_scoped` gates on the
+  packet SOURCE (`flow.forward_key.src_ip`, `poll_descriptor/mod.rs`); the
+  reverse `match_snat_with_counter_scoped` gates on the packet DESTINATION (the
+  original client, `flow.forward_key.dst_ip`, `nat_exception.rs`), symmetric
+  with the #2871 egress-zone gate. The new peer argument is `Option<IpAddr>`;
+  the non-scoped / test wrappers pass `None` (source gate skipped), the
+  production scoped callers pass `Some(..)`.
+
 ## 11. Multiple destination-addresses (#2395)
 
 Junos DNAT `match destination-address [ A B C ]` publishes the SAME

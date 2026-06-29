@@ -1683,7 +1683,24 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 					case "destination-address":
 						rule.Match = nodeVal(m)
 					case "source-address":
-						rule.SourceAddress = nodeVal(m)
+						// #3435 (M02): support bracket / repeated lists
+						// (`source-address [ a b c ]`) — the schema declares
+						// this leaf `multi: true`, so the values collapse onto
+						// m.Keys[1:] (flat-set) or m.Children (hierarchical).
+						// Reading only nodeVal dropped every prefix after the
+						// first. Mirror the source/destination-NAT loops above.
+						if len(m.Keys) >= 2 {
+							rule.SourceAddresses = append(rule.SourceAddresses, m.Keys[1:]...)
+						} else if len(m.Children) > 0 {
+							for _, child := range m.Children {
+								rule.SourceAddresses = append(rule.SourceAddresses, child.Name())
+							}
+						}
+						if len(rule.SourceAddresses) > 0 {
+							// Back-compat: first element stays in the singular
+							// field (NAT64 "::/0" tests, peer-sync).
+							rule.SourceAddress = rule.SourceAddresses[0]
+						}
 					case "destination-port":
 						// #2491: external (pre-translation) destination
 						// port the inbound packet must carry. Schema
