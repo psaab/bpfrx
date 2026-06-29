@@ -25,7 +25,15 @@ import (
 // matches and emits accept-the-listed / deny-the-rest rules scoped to those
 // addresses.
 type ZoneHostInboundView struct {
-	Zone           string
+	Zone string
+	// Interfaces lists the interface refs whose EFFECTIVE host-inbound token
+	// set (zone-level ∪ interface-level override, #3362) equals this view's
+	// SystemServices/Protocols. A zone with no per-interface override yields a
+	// single view per zone covering all its interfaces (pre-#3362 shape); a zone
+	// with an override yields one view per distinct effective token set, each
+	// scoped to that set's interface addresses. Sorted; informational/test only
+	// (the nft emission keys on the address set, which is per-interface).
+	Interfaces     []string
 	SystemServices []string
 	Protocols      []string
 	V4Addrs        []string // bare host IPv4 addresses (no prefix)
@@ -136,38 +144,103 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	// excluded from host-inbound deny scoping so management / cluster-control
 	// traffic is never denied (#3277).
 	lifelines := hostInboundLifelineSet(cfg)
-	// Gather per-zone host addresses from the resolved interface snapshots,
-	// skipping lifeline interfaces.
-	type addrSet struct {
-		v4    []string
-		v6    []string
-		seen4 map[string]bool
-		seen6 map[string]bool
+	// #3362: per-interface host-inbound override lookup (ref → override, with
+	// physical→unit expansion). The EFFECTIVE token set for an interface is the
+	// UNION of its zone-level set and this override; interfaces in the same zone
+	// with the SAME effective set share one view (one nft address set), so a zone
+	// with NO override produces exactly one view per zone (pre-#3362 shape).
+	overrideByIface := buildInterfaceHostInboundMap(cfg)
+
+	// Each emitted view is a group keyed by (zone, effective-token signature).
+	// Addresses accumulate per group; a group is created lazily on its first
+	// address so a configured-but-address-less interface stays omitted (admit
+	// nothing emitted, self-heals when an address appears) exactly as before.
+	type group struct {
+		zone   string
+		svc    []string
+		proto  []string
+		v4, v6 []string
+		seen4  map[string]bool
+		seen6  map[string]bool
+		ifaces map[string]bool
 	}
-	byZone := make(map[string]*addrSet)
+	groups := make(map[string]*group)
+	getGroup := func(zone string, svc, proto []string, iface string) *group {
+		sig := zone + "\x00" + strings.Join(svc, ",") + "\x00" + strings.Join(proto, ",")
+		g := groups[sig]
+		if g == nil {
+			g = &group{
+				zone: zone, svc: svc, proto: proto,
+				seen4: map[string]bool{}, seen6: map[string]bool{},
+				ifaces: map[string]bool{},
+			}
+			groups[sig] = g
+		}
+		if iface != "" {
+			g.ifaces[iface] = true
+		}
+		return g
+	}
+	addAddr := func(g *group, host string) {
+		if strings.Contains(host, ":") {
+			if !g.seen6[host] {
+				g.seen6[host] = true
+				g.v6 = append(g.v6, host)
+			}
+		} else if !g.seen4[host] {
+			g.seen4[host] = true
+			g.v4 = append(g.v4, host)
+		}
+	}
+	// configured reports whether a zone enforces host-inbound at all: a
+	// zone-level stanza OR any per-interface override (#3362). An unconfigured
+	// zone is skipped entirely (admit-all preserved, no deny emitted).
+	configured := func(zone *config.ZoneConfig) bool {
+		return zone != nil &&
+			(zone.HostInboundTraffic != nil || len(zone.InterfaceHostInbound) > 0)
+	}
+
+	// Seed a zone-default group (zone-level effective tokens, no override) for
+	// every configured zone so each configured zone yields at least one view —
+	// even when its only interface is a lifeline (no address contributed) — the
+	// pre-#3362 "one view per configured zone" contract. Non-overridden
+	// interfaces accumulate their addresses into this same group (identical
+	// signature); fully-overridden / address-less zones keep an empty view (the
+	// daemon emits no deny for it).
+	zoneNamesSorted := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNamesSorted = append(zoneNamesSorted, name)
+	}
+	sort.Strings(zoneNamesSorted)
+	for _, name := range zoneNamesSorted {
+		zone := cfg.Security.Zones[name]
+		if !configured(zone) {
+			continue
+		}
+		svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, nil)
+		getGroup(name, svc, proto, "")
+	}
+
+	// Per-interface static/learned addresses from the resolved snapshots.
 	for _, snap := range ifaceSnaps {
 		if snap.Zone == "" || hostInboundLifelineInterface(snap.Name, lifelines) {
 			continue
 		}
-		set := byZone[snap.Zone]
-		if set == nil {
-			set = &addrSet{seen4: map[string]bool{}, seen6: map[string]bool{}}
-			byZone[snap.Zone] = set
+		zone := cfg.Security.Zones[snap.Zone]
+		if !configured(zone) {
+			continue
 		}
+		svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, overrideByIface[snap.Name])
+		var g *group
 		for _, a := range snap.Addresses {
 			host := hostIPFromCIDR(a.Address)
 			if host == "" {
 				continue
 			}
-			if strings.Contains(host, ":") {
-				if !set.seen6[host] {
-					set.seen6[host] = true
-					set.v6 = append(set.v6, host)
-				}
-			} else if !set.seen4[host] {
-				set.seen4[host] = true
-				set.v4 = append(set.v4, host)
+			if g == nil {
+				g = getGroup(snap.Zone, svc, proto, snap.Name)
 			}
+			addAddr(g, host)
 		}
 	}
 
@@ -184,22 +257,8 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	// live snapshot, so on the master node (where the VIP is already live) the
 	// result is byte-identical. Lifeline interfaces (fxp0/em0/fab*) are excluded,
 	// mirroring the static-address path; standalone (no-VRRP) zones are untouched.
-	addZoneVIP := func(zone, host string) {
-		set := byZone[zone]
-		if set == nil {
-			set = &addrSet{seen4: map[string]bool{}, seen6: map[string]bool{}}
-			byZone[zone] = set
-		}
-		if strings.Contains(host, ":") {
-			if !set.seen6[host] {
-				set.seen6[host] = true
-				set.v6 = append(set.v6, host)
-			}
-		} else if !set.seen4[host] {
-			set.seen4[host] = true
-			set.v4 = append(set.v4, host)
-		}
-	}
+	// The VIP is added to its interface's EFFECTIVE-token group (#3362), so a VIP
+	// on an overridden interface is scoped by that interface's override.
 	zoneByIface := buildInterfaceZoneMap(cfg)
 	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for n := range cfg.Interfaces.Interfaces {
@@ -225,10 +284,15 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 			if hostInboundLifelineInterface(unitName, lifelines) {
 				continue
 			}
-			zone := zoneByIface[unitName]
-			if zone == "" {
+			zoneName := zoneByIface[unitName]
+			if zoneName == "" {
 				continue
 			}
+			zone := cfg.Security.Zones[zoneName]
+			if !configured(zone) {
+				continue
+			}
+			svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, overrideByIface[unitName])
 			vgKeys := make([]string, 0, len(unit.VRRPGroups))
 			for k := range unit.VRRPGroups {
 				vgKeys = append(vgKeys, k)
@@ -241,36 +305,122 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 				}
 				for _, vip := range vg.VirtualAddresses {
 					if host := hostIPFromCIDR(vip); host != "" {
-						addZoneVIP(zone, host)
+						addAddr(getGroup(zoneName, svc, proto, unitName), host)
 					}
 				}
 			}
 		}
 	}
 
-	names := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		names = append(names, name)
+	// Emit groups deterministically: the signature begins with the zone name,
+	// so sorting by signature orders views by zone then by token set. Addresses
+	// within a view are sorted for a reproducible nft payload.
+	sigs := make([]string, 0, len(groups))
+	for sig := range groups {
+		sigs = append(sigs, sig)
 	}
-	sort.Strings(names)
+	sort.Strings(sigs)
+	out := make([]ZoneHostInboundView, 0, len(sigs))
+	for _, sig := range sigs {
+		g := groups[sig]
+		ifaces := make([]string, 0, len(g.ifaces))
+		for name := range g.ifaces {
+			ifaces = append(ifaces, name)
+		}
+		sort.Strings(ifaces)
+		// Addresses are kept in accumulation order (static interface addresses
+		// first, then VRRP VIPs) — NOT sorted — to preserve the pre-#3362 nft
+		// payload ordering. Order is deterministic: snapshots come from
+		// sorted-name iteration and VIPs from sorted interface/unit/group walks.
+		out = append(out, ZoneHostInboundView{
+			Zone:           g.zone,
+			Interfaces:     ifaces,
+			SystemServices: g.svc,
+			Protocols:      g.proto,
+			V4Addrs:        g.v4,
+			V6Addrs:        g.v6,
+		})
+	}
+	return out
+}
 
-	out := make([]ZoneHostInboundView, 0)
-	for _, name := range names {
-		zone := cfg.Security.Zones[name]
-		if zone == nil || zone.HostInboundTraffic == nil {
-			continue // no stanza → admit-all preserved, no deny emitted
+// unionHostInboundTokens returns the EFFECTIVE host-inbound system-service and
+// protocol token sets for an interface (#3362): the zone-level set UNION the
+// per-interface override, lower-cased, trimmed, and de-duplicated, with
+// zone-level tokens kept first in their original order and override-only tokens
+// appended. Either argument may be nil. Junos host-inbound is additive across
+// the two levels, so an interface admits a service when EITHER level lists it.
+func unionHostInboundTokens(zoneHI, ifaceHI *config.HostInboundTraffic) (svc, proto []string) {
+	add := func(dst *[]string, seen map[string]bool, src []string) {
+		for _, t := range src {
+			t = strings.ToLower(strings.TrimSpace(t))
+			if t == "" || seen[t] {
+				continue
+			}
+			seen[t] = true
+			*dst = append(*dst, t)
 		}
-		set := byZone[name]
-		view := ZoneHostInboundView{
-			Zone:           name,
-			SystemServices: lowerTokens(zone.HostInboundTraffic.SystemServices),
-			Protocols:      lowerTokens(zone.HostInboundTraffic.Protocols),
+	}
+	seenS, seenP := map[string]bool{}, map[string]bool{}
+	if zoneHI != nil {
+		add(&svc, seenS, zoneHI.SystemServices)
+		add(&proto, seenP, zoneHI.Protocols)
+	}
+	if ifaceHI != nil {
+		add(&svc, seenS, ifaceHI.SystemServices)
+		add(&proto, seenP, ifaceHI.Protocols)
+	}
+	return svc, proto
+}
+
+// buildInterfaceHostInboundMap resolves per-interface host-inbound overrides
+// (#3362) keyed by the interface ref as it appears on a resolved interface
+// snapshot (InterfaceSnapshot.Name). A ref naming a logical unit (contains
+// ".") maps ONLY itself — never a sibling unit. A ref naming a physical
+// interface (no unit suffix) expands to each of its configured units, mirroring
+// the physical→unit expansion in buildInterfaceZoneMap, so an override authored
+// on the physical applies to every unit's snapshot. Zones and refs are walked
+// in sorted order; the first writer of a given key wins (deterministic).
+func buildInterfaceHostInboundMap(cfg *config.Config) map[string]*config.HostInboundTraffic {
+	if cfg == nil || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	out := make(map[string]*config.HostInboundTraffic)
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zn := range zoneNames {
+		zone := cfg.Security.Zones[zn]
+		if zone == nil || len(zone.InterfaceHostInbound) == 0 {
+			continue
 		}
-		if set != nil {
-			view.V4Addrs = set.v4
-			view.V6Addrs = set.v6
+		refs := make([]string, 0, len(zone.InterfaceHostInbound))
+		for ref := range zone.InterfaceHostInbound {
+			refs = append(refs, ref)
 		}
-		out = append(out, view)
+		sort.Strings(refs)
+		for _, ref := range refs {
+			hib := zone.InterfaceHostInbound[ref]
+			if ref == "" || hib == nil {
+				continue
+			}
+			if _, ok := out[ref]; !ok {
+				out[ref] = hib
+			}
+			if strings.Contains(ref, ".") {
+				continue // logical unit ref: exact match only, never a sibling
+			}
+			if ifCfg := cfg.Interfaces.Interfaces[ref]; ifCfg != nil {
+				for unitNum := range ifCfg.Units {
+					un := fmt.Sprintf("%s.%d", ref, unitNum)
+					if _, ok := out[un]; !ok {
+						out[un] = hib
+					}
+				}
+			}
+		}
 	}
 	return out
 }
@@ -311,10 +461,22 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 		// traffic. A nil HostInboundTraffic means the zone declared no stanza:
 		// HostInboundConfigured stays false and the dataplane preserves
 		// admit-all for that zone.
-		if zone := cfg.Security.Zones[name]; zone != nil && zone.HostInboundTraffic != nil {
+		//
+		// #3362: a zone is also host-inbound-ENFORCING when it carries any
+		// per-interface override even with NO zone-level stanza. The zone-keyed
+		// set then stays the zone-level set (possibly EMPTY → fail-closed
+		// deny-all for any interface in the zone WITHOUT an override), and the
+		// overridden interfaces are admitted via the per-interface ifindex map
+		// (InterfaceSnapshot.HostInbound*). Marking the zone configured here keeps
+		// the Rust XSK secondary path consistent with the kernel-nft primary path,
+		// which denies a non-overridden interface's addresses in such a zone.
+		if zone := cfg.Security.Zones[name]; zone != nil &&
+			(zone.HostInboundTraffic != nil || len(zone.InterfaceHostInbound) > 0) {
 			zs.HostInboundConfigured = true
-			zs.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
-			zs.HostInboundProtocols = lowerTokens(zone.HostInboundTraffic.Protocols)
+			if zone.HostInboundTraffic != nil {
+				zs.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
+				zs.HostInboundProtocols = lowerTokens(zone.HostInboundTraffic.Protocols)
+			}
 		}
 		// #3071: carry the per-zone `tcp-rst` knob to the dataplane so a
 		// denied TCP flow whose ingress (from) zone has tcp-rst enabled

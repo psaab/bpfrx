@@ -388,6 +388,33 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 	}
 }
 
+// parseHostInboundNode parses a `host-inbound-traffic { system-services ...;
+// protocols ...; }` subtree into a HostInboundTraffic. It is the SSOT for both
+// the zone-level stanza and the per-interface override (#3362) so the two parse
+// identically. A present-but-empty stanza returns a non-nil empty struct
+// (preserving the historical zone-level behaviour where an empty stanza means
+// "the operator opened nothing" → host-inbound enforcing, deny-all). A nil node
+// (no stanza) returns nil.
+func parseHostInboundNode(n *Node) *HostInboundTraffic {
+	if n == nil {
+		return nil
+	}
+	hib := &HostInboundTraffic{}
+	for _, hit := range n.Children {
+		switch hit.Name() {
+		case "system-services":
+			for _, svc := range hit.Children {
+				hib.SystemServices = append(hib.SystemServices, svc.Name())
+			}
+		case "protocols":
+			for _, proto := range hit.Children {
+				hib.Protocols = append(hib.Protocols, proto.Name())
+			}
+		}
+	}
+	return hib
+}
+
 func compileZones(node *Node, sec *SecurityConfig) error {
 	for _, inst := range namedInstances(node.FindChildren("security-zone")) {
 		zone := &ZoneConfig{Name: inst.name}
@@ -397,25 +424,21 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 			case "interfaces":
 				for _, iface := range prop.Children {
 					zone.Interfaces = append(zone.Interfaces, iface.Name())
+					// #3362: per-interface host-inbound-traffic override
+					// (`interfaces <if> host-inbound-traffic { ... }`). Same
+					// token grammar as the zone-level stanza; parsed by the
+					// shared parseHostInboundNode so both shapes stay in lockstep.
+					if hib := parseHostInboundNode(iface.FindChild("host-inbound-traffic")); hib != nil {
+						if zone.InterfaceHostInbound == nil {
+							zone.InterfaceHostInbound = make(map[string]*HostInboundTraffic)
+						}
+						zone.InterfaceHostInbound[iface.Name()] = hib
+					}
 				}
 			case "screen":
 				zone.ScreenProfile = nodeVal(prop)
 			case "host-inbound-traffic":
-				zone.HostInboundTraffic = &HostInboundTraffic{}
-				for _, hit := range prop.Children {
-					switch hit.Name() {
-					case "system-services":
-						for _, svc := range hit.Children {
-							zone.HostInboundTraffic.SystemServices = append(
-								zone.HostInboundTraffic.SystemServices, svc.Name())
-						}
-					case "protocols":
-						for _, proto := range hit.Children {
-							zone.HostInboundTraffic.Protocols = append(
-								zone.HostInboundTraffic.Protocols, proto.Name())
-						}
-					}
-				}
+				zone.HostInboundTraffic = parseHostInboundNode(prop)
 			case "tcp-rst":
 				zone.TCPRst = true
 			case "description":

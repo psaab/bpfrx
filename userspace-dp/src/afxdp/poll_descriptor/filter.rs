@@ -446,9 +446,12 @@ pub(super) fn host_inbound_gated_lo0_action(
     now_ns: u64,
 ) -> Option<crate::filter::FilterAction> {
     // Host-inbound gate FIRST — a denied packet is a fail-closed silent drop
-    // with NO lo0 side-effects (#3485).
-    if !crate::afxdp::forwarding::host_inbound_admits(
+    // with NO lo0 side-effects (#3485). #3362: keyed by ingress interface so a
+    // per-interface host-inbound override governs the check where one exists,
+    // falling back to the from-zone set otherwise.
+    if !crate::afxdp::forwarding::host_inbound_admits_iface(
         forwarding,
+        meta.ingress_ifindex as i32,
         host_inbound_zone,
         meta.protocol,
         dst_port,

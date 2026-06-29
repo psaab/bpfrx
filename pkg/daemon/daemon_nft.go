@@ -258,13 +258,33 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 	// (hostInboundEmitsDrop) — the two MUST agree on that condition or nft rejects
 	// the load (reference to an undeclared counter / declared-but-unused is fine,
 	// but an undeclared reference is a hard error).
+	//
+	// The counter name is keyed only on (zone, family) — and so is the DROP rule
+	// that references it (emitHostInboundZone). With per-interface host-inbound
+	// overrides (#3362) a single zone can yield MULTIPLE views sharing the same
+	// v.Zone (an override view plus the zone-default view), each emitting its own
+	// catch-all DROP that references the same "<zone>_<fam>" counter. That is the
+	// intended aggregation (one per-zone/family kernel-deny counter the #3361
+	// scraper reads back via ParseHostInboundDenyCounterName), but the declaration
+	// must be emitted EXACTLY ONCE: nft rejects `counter "<name>" {}` declared
+	// twice in the same table body ("File exists"). Dedup the declarations on the
+	// counter NAME so each is declared once no matter how many views share a zone;
+	// the per-view DROP rules below still all reference it.
 	var counters []string
+	seenCounter := map[string]bool{}
+	addCounter := func(name string) {
+		if seenCounter[name] {
+			return
+		}
+		seenCounter[name] = true
+		counters = append(counters, name)
+	}
 	for _, v := range views {
 		if hostInboundEmitsDrop(v, v.V4Addrs) {
-			counters = append(counters, xnft.HostInboundDenyCounterName(v.Zone, "ip"))
+			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip"))
 		}
 		if hostInboundEmitsDrop(v, v.V6Addrs) {
-			counters = append(counters, xnft.HostInboundDenyCounterName(v.Zone, "ip6"))
+			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip6"))
 		}
 	}
 

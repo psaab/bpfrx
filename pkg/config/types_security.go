@@ -217,7 +217,21 @@ type ZoneConfig struct {
 	Interfaces         []string
 	ScreenProfile      string // reference to screen profile name
 	HostInboundTraffic *HostInboundTraffic
-	TCPRst             bool // send TCP RST for non-SYN packets to closed ports
+	// InterfaceHostInbound holds per-interface host-inbound-traffic overrides
+	// (#3362), keyed by the interface ref exactly as it appears under
+	// `security zones security-zone <z> interfaces <ref>` (e.g. "ge-0/0/0.0").
+	// Junos models host-inbound-traffic at BOTH the zone level (HostInboundTraffic
+	// above, applies to every interface in the zone) and the interface level
+	// (here, applies only to that interface); the EFFECTIVE admission set for an
+	// interface is the UNION of the two (Junos additive semantics). A zone is
+	// host-inbound-ENFORCING if it declares a zone-level stanza OR carries any
+	// interface-level override here — so an operator can expose a service
+	// (e.g. ssh) on one interface of a zone while denying it on the others by
+	// setting the override only on the exposed interface and leaving the
+	// zone-level set empty. nil/empty = no per-interface override (pre-#3362
+	// zone-wide-only behaviour).
+	InterfaceHostInbound map[string]*HostInboundTraffic
+	TCPRst               bool // send TCP RST for non-SYN packets to closed ports
 	// AddressBook is the zone-local address book (#3061). A policy whose
 	// from-zone (source-address) or to-zone (destination-address) is this
 	// zone resolves a name against this book FIRST, then falls back to the

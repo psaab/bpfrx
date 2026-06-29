@@ -83,6 +83,16 @@ pub(in crate::afxdp) struct ForwardingState {
     /// local-delivery admit path (session miss AND session hit) to default-deny
     /// host-bound traffic whose service/protocol is not listed.
     pub(in crate::afxdp) zone_host_inbound: FastMap<u16, ZoneHostInbound>,
+    /// #3362: per-INTERFACE host-inbound-traffic OVERRIDE admission set, keyed by
+    /// ingress ifindex. Populated only for an interface that declared an
+    /// interface-level `host-inbound-traffic` stanza (and is not a lifeline); the
+    /// carried set is the EFFECTIVE union (zone ∪ interface) computed in Go. When
+    /// a packet's ingress ifindex is present here the local-delivery admit path
+    /// uses THIS set instead of the from-zone's `zone_host_inbound` entry, so a
+    /// service exposed on one interface of a zone is admitted there while the
+    /// zone-default set governs the zone's other interfaces. An absent ifindex
+    /// falls back to the zone-keyed check (pre-#3362 behaviour).
+    pub(in crate::afxdp) ifindex_host_inbound: FastMap<i32, ZoneHostInbound>,
     /// #3071: zone IDs (from `ZoneSnapshot.tcp_rst`) with Junos `tcp-rst`
     /// enabled. A TCP flow DENIED by policy/default-deny whose ingress
     /// (from) zone is present here is answered with a TCP RST toward the

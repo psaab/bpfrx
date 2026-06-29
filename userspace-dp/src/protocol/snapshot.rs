@@ -119,6 +119,26 @@ pub(crate) struct InterfaceSnapshot {
     /// consumes it yet.
     #[serde(rename = "cos_priority_low_min_share_bytes", default)]
     pub cos_priority_low_min_share_bytes: u64,
+    /// #3362: per-interface host-inbound-traffic OVERRIDE. Junos models
+    /// host-inbound at both the zone level (`ZoneSnapshot`) and the interface
+    /// level; the EFFECTIVE admission set for an interface is the UNION of the
+    /// two. The control plane carries that already-unioned effective set here,
+    /// populated ONLY for an interface that declared an interface-level stanza
+    /// (and is not a management/cluster-control lifeline). When
+    /// `host_inbound_configured` is true the dataplane keys the host-inbound
+    /// admission check by ingress interface (ifindex) instead of the from-zone,
+    /// so a service exposed on one interface of a zone is admitted there while
+    /// the zone-default set governs the rest. Additive via serde default: an old
+    /// Go binary omits the fields and the dataplane falls back to the zone-keyed
+    /// check (pre-#3362 behaviour). A present-but-empty override
+    /// (`host_inbound_configured` true, empty token vecs) is enforcing
+    /// (fail-closed deny-all), matching the zone-level semantics.
+    #[serde(rename = "host_inbound_configured", default)]
+    pub host_inbound_configured: bool,
+    #[serde(rename = "host_inbound_system_services", default)]
+    pub host_inbound_system_services: Vec<String>,
+    #[serde(rename = "host_inbound_protocols", default)]
+    pub host_inbound_protocols: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -271,6 +271,23 @@ type InterfaceSnapshot struct {
 	// follow-up. Default 0 (no min-share); no hot-path effect
 	// today.
 	CoSPriorityLowMinShareBytes uint64 `json:"cos_priority_low_min_share_bytes,omitempty"`
+	// HostInbound* carry the per-interface host-inbound-traffic OVERRIDE
+	// (#3362). Junos models host-inbound at both the zone level (ZoneSnapshot
+	// above) and the interface level; the EFFECTIVE admission set for an
+	// interface is the UNION of the zone-level set and any interface-level
+	// override. These fields carry that already-unioned effective set and are
+	// populated ONLY for an interface that declared an interface-level stanza
+	// (and is not a management/cluster-control lifeline). When present the Rust
+	// dataplane keys the host-inbound admission check by ingress interface
+	// (ifindex) instead of the from-zone, so a service exposed on one interface
+	// of a zone is admitted there while the zone-default set governs the rest.
+	// Additive: an old Rust helper without the fields ignores them and falls
+	// back to the zone-keyed check (pre-#3362 behaviour); an old Go binary omits
+	// them (omitempty). HostInboundConfigured distinguishes a present-but-empty
+	// override (enforcing, deny-all) from an absent one (zone-keyed fallback).
+	HostInboundConfigured     bool     `json:"host_inbound_configured,omitempty"`
+	HostInboundSystemServices []string `json:"host_inbound_system_services,omitempty"`
+	HostInboundProtocols      []string `json:"host_inbound_protocols,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {

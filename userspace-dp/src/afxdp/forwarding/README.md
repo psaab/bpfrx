@@ -135,6 +135,28 @@ sides per #1961). `forwarding_build::zones::populate_zones` classifies the
 tokens into a `ZoneHostInbound` (`host_inbound.rs`) keyed by the same
 validated zone id and stores it in `ForwardingState::zone_host_inbound`.
 
+**Per-interface override (#3362).** Junos also models `host-inbound-traffic`
+at the INTERFACE level (`security zones <z> interfaces <if>
+host-inbound-traffic { ... }`); the effective admission set for an interface
+is the UNION of the zone-level set and its interface-level override. The Go
+control plane computes that effective union and carries it on
+`InterfaceSnapshot` (`host_inbound_configured` +
+`host_inbound_system_services` / `host_inbound_protocols`), populated only for
+an interface that declared an interface-level stanza and is not a
+management/cluster-control lifeline. `forwarding_build::interfaces`
+classifies it into `ForwardingState::ifindex_host_inbound`, keyed by ingress
+ifindex. The local-delivery admit path calls `host_inbound_admits_iface`,
+which prefers the per-INTERFACE set when the ingress ifindex has one and
+otherwise falls back to the zone-keyed `host_inbound_admits` — so a service
+exposed on one interface of a zone is admitted there while the zone-default
+set (possibly empty → fail-closed deny-all) governs the zone's other
+interfaces. A zone enforcing host-inbound ONLY via an interface override is
+still marked `host_inbound_configured` on its `ZoneSnapshot` (with an empty
+zone-keyed set), so a non-overridden interface in that zone fail-closes —
+matching the kernel-nft primary path, where `BuildZoneHostInboundViews` emits
+one address-scoped view per distinct effective token set (the overridden
+interface's addresses accept its services; the others get a catch-all drop).
+
 Enforcement runs on the **local-delivery admit path only** (transit
 traffic never pays for it), at BOTH sites in `poll_descriptor`:
 

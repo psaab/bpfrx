@@ -1,3 +1,63 @@
+## 2026-06-29 — #3362 rebase fold: dedup host-inbound deny-counter declarations
+
+- **Timestamp**: 2026-06-29
+- **Action**: Rebased fix/3362-per-iface-host-inbound onto origin/master (~39
+  commits; only _Log.md conflicted, union-resolved). Folded a MAJOR integration
+  bug that manifests ONLY on the merged tree: master's #3361 added per-zone
+  host-inbound DROP named counters in pkg/daemon/daemon_nft.go
+  (`buildHostInboundFilterPayload`). Its pre-pass appended
+  `HostInboundDenyCounterName(zone, fam)` once per view and declared each as a
+  `counter "<name>" {}` object. Pre-#3362 there was exactly ONE view per zone, so
+  this was safe. #3362's per-interface grouping emits MULTIPLE views sharing the
+  same v.Zone whenever a zone has a per-interface override (the override view +
+  the zone-default view) — so the pre-pass declared the same named counter TWICE,
+  and nft REJECTS the table load ("File exists"), silently breaking host-inbound
+  apply for exactly the zones this feature targets. The counter name is keyed
+  only on (zone, family) and so is the referencing DROP rule, and the #3361
+  scraper (ParseHostInboundDenyCounterName) reads back per zone/family — so the
+  correct fix is dedup-by-name (approach a): declare each `<zone>_<fam>` counter
+  once, let all per-view DROP rules reference the single counter (kernel
+  aggregates the per-zone/family denies, matching the documented metric). Also
+  updated the existing Test_3362_NftScopesPerInterfaceOverride drop assertions —
+  master's #3361 changed the catch-all drop line to `... counter name "<n>" drop`,
+  so its bare `... drop` Contains checks were red on the merged tree.
+- **Validation**: New Test_3362_NftDeclaresEachCounterOnce asserts each named
+  counter is declared exactly once for the multi-view (per-interface override)
+  zone — RED before the dedup (count==2 per family), green after. go test
+  ./pkg/daemon/ ./pkg/nftables/ ./pkg/config/ ./pkg/dataplane/... green; gofmt
+  clean; go vet ./pkg/daemon/ clean.
+- **File(s)**: pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_per_iface_3362_test.go, _Log.md
+
+## 2026-06-29 — #3362 per-zone-interface host-inbound-traffic override
+
+- **Timestamp**: 2026-06-29
+- **Action**: Added Junos interface-level `host-inbound-traffic` (`security
+  zones <z> interfaces <if> host-inbound-traffic { ... }`). Effective set =
+  zone-level UNION interface-level (additive); a zone enforces host-inbound when
+  it has a zone-level stanza OR any interface override, so a service can be
+  exposed on one interface of a zone and denied on the others. Threaded both
+  enforcement surfaces: kernel-nft primary path (`BuildZoneHostInboundViews` now
+  emits one address-scoped view per distinct effective token set) and the Rust
+  AF_XDP secondary path (new `InterfaceSnapshot.host_inbound_*` wire fields →
+  `ForwardingState::ifindex_host_inbound` → `host_inbound_admits_iface`, keyed by
+  ingress ifindex with zone fallback). Interface-level tokens validated by the
+  same #3200 SSOT. 2-sided additive wire; protocol_wire_v1.json regenerated.
+  RED-on-revert tests on both surfaces.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_security.go, pkg/config/compiler_validate_strict.go,
+  pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/protocol.go, userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/afxdp/forwarding/README.md, docs/junos-cli-reference.md,
+  pkg/config/host_inbound_per_iface_3362_test.go,
+  pkg/dataplane/userspace/host_inbound_per_iface_3362_test.go,
+  pkg/daemon/host_inbound_per_iface_3362_test.go
 ## 2026-06-29 — #3375 SMR MINOR fold: proto field-7 host_inbound_unmatched doc parity (PR #3542)
 
 - **Timestamp**: 2026-06-29

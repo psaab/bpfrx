@@ -90,6 +90,22 @@ pub(super) fn populate_interfaces(
                 }
             }
         }
+        // #3362: per-interface host-inbound OVERRIDE. When the control plane
+        // marked this interface host-inbound-configured, classify its EFFECTIVE
+        // (zone ∪ interface) token set and key it by ifindex so the
+        // local-delivery admit path prefers it over the from-zone's set. A
+        // present-but-empty override classifies to an empty ZoneHostInbound =
+        // fail-closed deny-all (matching the zone-level semantics and the nft
+        // primary path's per-interface drop).
+        if iface.host_inbound_configured {
+            state.ifindex_host_inbound.insert(
+                iface.ifindex,
+                crate::afxdp::forwarding::zone_host_inbound_from_tokens(
+                    &iface.host_inbound_system_services,
+                    &iface.host_inbound_protocols,
+                ),
+            );
+        }
         if iface.tunnel {
             state.tunnel_interfaces.insert(iface.ifindex);
         }
