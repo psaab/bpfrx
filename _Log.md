@@ -23766,3 +23766,56 @@ top.
 - **Timestamp**: 2026-06-29T12:30Z
   - **Action**: #3366 application EITHER direct OR term-based; conflicting duplicate term leaf. compileApplications now records a parent that mixes a direct match body (protocol/destination-port/source-port/inactivity-timeout/timeout/icmp-type/icmp-code/alg) with `term` sub-blocks on ApplicationsConfig.MixedDirectTermApps; before, the term-store branch kept only the synthesized term apps and silently DROPPED the direct match (fail-open under-match for a deny app). parseApplicationTerms now records a CONFLICTING (different-value) repeat of a single-valued scalar term leaf (destination-port/source-port/inactivity-timeout/timeout/alg) on Application.DuplicateTermLeaves — was last-writer-wins; idempotent same-value repeats (timeout/inactivity-timeout aliases set equal) and repeated `protocol` (multi-protocol syntax) are not flagged. New gate validateApplicationStructureStrict rejects both at commit over ALL user-defined apps (referenced or not, like the #3352/#3353 syntactic gate); lenient-warn on CompileConfigLenient/peer-sync (#1960). Updated existing over-rejection guard test (it had mixed a direct body with a term and expected acceptance — split into two apps). RED-on-revert verified (disable gate -> mixed + duplicate tests fail). go test ./pkg/config ./pkg/appid ./pkg/dataplane/userspace green; go vet clean; gofmt clean.
   - **File(s)**: pkg/config/compiler_applications.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/types_security.go, pkg/config/compiler_application_mixed_term_3366_test.go, pkg/config/compiler_application_term_alg_3352_3353_test.go, pkg/config/README.md, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-06-29T13:30Z
+  - **Action**: #3393 Codex MAJOR fix — Go<->Rust commit/apply drift for
+    firewall-filter `from protocol ipv6`. The #3393 appid round-trip change
+    widened the Go filter commit gate (config.filterProtocolResolvable) to
+    accept "ipv6", but the userspace filter snapshot builder
+    (pkg/dataplane/userspace/filters.go) emits the protocol token VERBATIM as
+    the name "ipv6" (unlike the application/NAT lowering paths, which
+    pre-canonicalize to a number). The Rust filter compiler resolves that
+    verbatim token via ip_proto::proto_number, which had no "ipv6" arm and
+    returned None -> UnrepresentableFilterProtocol -> the whole snapshot was
+    rejected. Result: a `from protocol ipv6` filter committed in Go yet failed
+    to apply in the dataplane (the #1961 class). FIX: added "ipv6" => 41
+    (PROTO_IPV6) to Rust ip_proto::proto_number, restoring its documented
+    mirror invariant with appid.ProtocolNumber (which #3393 closed to 41) and
+    keeping the filter path's verbatim-name design consistent (proto_number
+    already resolves esp/ah/sctp/vrrp/junos-* by name). BROADER DRIFT CHECK:
+    enumerated the full filterProtocolResolvable named accept set; "ipv6" was
+    the ONLY drift (numeric 0-255 already aligns: Go n<256, Rust parse::<u8>).
+    GUARD: new Rust filter::tests::filter_protocol_accept_set_subset_of_resolver
+    enumerates the entire gate accept set and asserts proto_number resolves each
+    (Go-commit-accept subset-of Rust-resolvable). RED-on-revert verified: removed
+    the ipv6 arm -> protocol_3393_ipv6_resolves_scoped and the subset guard both
+    FAIL. Added Go-side guard TestFilterSnapshotIPv6ProtocolEmittedAndResolvable
+    (gate accepts "ipv6" AND builder emits it verbatim). cargo test filter::
+    green; go test ./pkg/config ./pkg/appid ./pkg/dataplane/userspace
+    ./pkg/daemon green; gofmt + rustfmt clean.
+  - **File(s)**: userspace-dp/src/ip_proto.rs, userspace-dp/src/filter/tests.rs,
+    pkg/dataplane/userspace/filters_protocol_ipv6_3393_test.go, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3393 follow-up — fold two doc-accuracy items into PR #3537.
+    ITEM 1 (filter mirror guard hardening): the Rust mirror test
+    filter::tests::filter_protocol_accept_set_subset_of_resolver is a HARDCODED
+    list, not a mechanical enumeration — its `for token in [...]` loop only
+    exercises tokens it already lists, so a protocol newly ADDED to the Go gate
+    filterProtocolResolvable would go un-mirrored silently. Corrected its comment
+    to drop the "trips this test" overclaim and state the lockstep requirement,
+    pointing at the new Go pin. Added Go-side mechanical cross-language guard
+    TestFilterProtocolNamedSetMatchesRustMirror (pkg/config) that parses the
+    named token set out of BOTH the Go gate source and the Rust mirror array and
+    asserts set-equality (reuses the host_inbound_rust_parity_test.go helpers).
+    RED-on-mutation verified: adding a "dccp" arm to filterProtocolResolvable
+    makes it FAIL naming dccp as missing from the Rust mirror.
+    ITEM 2 (DNAT comment accuracy): dnatProtocolResolvable is no longer a 1:1
+    mirror of Rust proto_number (proto_number resolves ipv6=41 since #3393; DNAT
+    intentionally rejects it). Updated the gate comment, the exported-wrapper
+    comment, and the TestDNATProtocolResolvableMatchesRustSSOT comment to document
+    the deliberately-tighter SSOT (excludes junos-* AND ipv6), and added "ipv6"
+    to that test's reject list to pin the divergence. go test ./pkg/config
+    ./pkg/appid green; cargo test filter:: green; gofmt + rustfmt clean.
+  - **File(s)**: pkg/config/filter_protocol_rust_mirror_3393_test.go (new),
+    pkg/config/compiler_validate_strict.go, pkg/config/compiler_dnat_protocol_test.go,
+    userspace-dp/src/filter/tests.rs, _Log.md

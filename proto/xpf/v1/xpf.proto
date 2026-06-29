@@ -397,6 +397,13 @@ message GetEventsRequest {
   uint32 zone = 2;
   string action = 3;
   string protocol = 4;
+  // has_zone selects the zone filter explicitly so zone 0 (the "unknown" /
+  // unassigned zone carried by pre-classification / host-inbound events) is
+  // selectable (#3338). Zone IDs are 1-based, so 0 used to be indistinguishable
+  // from "no filter". When has_zone is false a zone>0 value still filters
+  // (backward compatible); set has_zone=true with zone=0 to isolate the
+  // unknown-zone events.
+  bool has_zone = 5;
 }
 message GetEventsResponse {
   repeated EventEntry events = 1;

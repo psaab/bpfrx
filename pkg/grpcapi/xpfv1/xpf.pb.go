@@ -3503,11 +3503,18 @@ func (x *ScreenInfo) GetThresholds() map[string]int64 {
 }
 
 type GetEventsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Limit         int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Zone          uint32                 `protobuf:"varint,2,opt,name=zone,proto3" json:"zone,omitempty"`
-	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
-	Protocol      string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Limit    int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
+	Zone     uint32                 `protobuf:"varint,2,opt,name=zone,proto3" json:"zone,omitempty"`
+	Action   string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
+	Protocol string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	// has_zone selects the zone filter explicitly so zone 0 (the "unknown" /
+	// unassigned zone carried by pre-classification / host-inbound events) is
+	// selectable (#3338). Zone IDs are 1-based, so 0 used to be indistinguishable
+	// from "no filter". When has_zone is false a zone>0 value still filters
+	// (backward compatible); set has_zone=true with zone=0 to isolate the
+	// unknown-zone events.
+	HasZone       bool `protobuf:"varint,5,opt,name=has_zone,json=hasZone,proto3" json:"has_zone,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3568,6 +3575,13 @@ func (x *GetEventsRequest) GetProtocol() string {
 		return x.Protocol
 	}
 	return ""
+}
+
+func (x *GetEventsRequest) GetHasZone() bool {
+	if x != nil {
+		return x.HasZone
+	}
+	return false
 }
 
 type GetEventsResponse struct {
@@ -7435,12 +7449,13 @@ const file_xpf_proto_rawDesc = "" +
 	"thresholds\x1a=\n" +
 	"\x0fThresholdsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\"p\n" +
+	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\"\x8b\x01\n" +
 	"\x10GetEventsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x12\n" +
 	"\x04zone\x18\x02 \x01(\rR\x04zone\x12\x16\n" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x12\x1a\n" +
-	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"?\n" +
+	"\bprotocol\x18\x04 \x01(\tR\bprotocol\x12\x19\n" +
+	"\bhas_zone\x18\x05 \x01(\bR\ahasZone\"?\n" +
 	"\x11GetEventsResponse\x12*\n" +
 	"\x06events\x18\x01 \x03(\v2\x12.xpf.v1.EventEntryR\x06events\"\xa0\x05\n" +
 	"\n" +
