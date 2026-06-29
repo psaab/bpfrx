@@ -29,7 +29,20 @@ reports.
   stream uses them so a typo'd query rejects rather than streaming
   everything (#3383).
 - `LocalLogWriter` — `locallog.go`. File-based writer with
-  facility/severity filters.
+  facility/severity filters. The active file and every rotation reopen go
+  through the shared hardened open (`openHardenedAuditLog`, `trace.go`):
+  `O_NOFOLLOW`, regular-file verified, mode `0600` (not world-readable
+  `0644`), dir `0750` — the event-mode security log carries the same
+  policy/session/NAT forensics the flow-trace writer was hardened for
+  (#3477). The `0600` is *enforced*, not create-only: an existing
+  pre-hardening `0644` file is `fchmod`-tightened on open (on the held
+  O_NOFOLLOW regular-file fd) so an upgrade does not leave it
+  world-readable. Write and rotation failures are observable:
+  `DroppedWrites()` counts lost lines (write error AND nil-file/closed
+  paths), `FailedRotations()` counts incomplete rotations (a generation
+  shift, the active-file rename, or the reopen), and a ≤1/s WARN — with
+  separate clocks per failure class so a write-drop storm cannot suppress
+  the rotation warning — carries both counts (#3478).
 - `SessionAggregator` — `aggregator.go`. Top-N per-IP rollups,
   cardinality-capped (see "Aggregator cardinality cap" below).
 
@@ -164,10 +177,15 @@ if `Handle` runs the re-entrancy guard before the client check.
   absolute path, a path separator, or a `.`/`..` component is rejected
   (`sanitizeTraceFileName`), the file is opened under `traceLogDir`
   (`/var/log` in production; a package var only so tests can redirect it)
-  with `O_NOFOLLOW` and verified to be a regular file, and it is created
-  mode `0600` rather than world-readable — flow tuples/zones/policy IDs are
-  audit-grade telemetry. Rotation reopens through the same `openTraceFile`
-  guard. Before #3420 the value was kept verbatim (absolute) or joined under
+  with `O_NOFOLLOW` and verified to be a regular file, and its mode is
+  enforced to `0600` rather than world-readable — created `0600`, and an
+  existing looser file `fchmod`-tightened on open (#3477) — flow
+  tuples/zones/policy IDs are audit-grade telemetry. Rotation reopens
+  through the same `openTraceFile` guard, which now delegates to the shared
+  `openHardenedAuditLog` helper that `LocalLogWriter` also uses (#3477) —
+  both audit-log writers get identical O_NOFOLLOW / regular-file /
+  enforced-0600 semantics. Before #3420 the value was kept
+  verbatim (absolute) or joined under
   `/var/log` without a `..` check, so a committed config could append
   root-written telemetry anywhere the daemon could write. The committed
   config is also rejected at commit-time (`validateFlowTraceFileAST`,
@@ -195,6 +213,37 @@ if `Handle` runs the re-entrancy guard before the client check.
   `TestFlowTraceFilterLenientDowngrade` (`pkg/config`),
   `TestTraceWriterInvalidFilterMatchesNone` /
   `TestTraceWriterUnknownFlagAppliesDefaults` (`pkg/logging`).
+- **Audit-log write/rotation failures are observable, not silent (#3478).**
+  Both audit-log writers (`TraceWriter`, `LocalLogWriter`) and the session
+  aggregator (`ForwardLogMsg`) previously swallowed write and rotation
+  failures — a bare `return`, a `_ =`, or a production-off `slog.Debug` — so
+  an operator who had enabled `traceoptions` / `security log mode event`
+  could not tell ENOSPC/EIO/closed-fd/failed-rename was dropping audit lines.
+  Each writer now exposes `DroppedWrites()` and `FailedRotations()` as atomic
+  counters, with a ≤1/s WARN carrying both (CLAUDE.md hot-path logging
+  rules — never per-event). The two failure classes use SEPARATE warn clocks
+  so a write-drop storm cannot suppress the rotation warning, and vice versa.
+  `DroppedWrites()` covers EVERY drop path — a failed write AND a
+  nil/closed-file write (a writer wedged by a prior failed reopen would
+  otherwise drop every subsequent event after a single `FailedRotations`
+  bump). `FailedRotations()` covers a failed generation shift (a lost
+  retained generation), a failed active-file rename, and a failed reopen.
+  `rotate()` returns an error on any of those and resets the byte accounting
+  to 0 ONLY when the active file was actually rolled aside; on a failed
+  primary rename it re-syncs `written` to the real file size so the next
+  write retries rotation instead of growing unbounded under a bogus 0. The
+  aggregator surfaces the per-call error at Debug (the writer counter is the
+  aggregate metric). Pins: `TestTraceWriter_WriteFailureObservable`,
+  `TestTraceWriter_RotationFailureObservable`,
+  `TestTraceWriter_GenerationShiftFailureObservable`,
+  `TestTraceWriter_NilFileDropObservable`,
+  `TestTraceWriter_TightensExistingMode`,
+  `TestLocalLogWriter_WriteFailureObservable`,
+  `TestLocalLogWriter_RotationFailureObservable`,
+  `TestLocalLogWriter_GenerationShiftFailureObservable`,
+  `TestLocalLogWriter_NilFileDropObservable`,
+  `TestLocalLogWriter_TightensExistingMode`,
+  `TestLocalLogWriter_HardenedOpen`.
 - **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
   The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
   in its first 8 bytes (LE u64), stamped by the userspace-dp producer at

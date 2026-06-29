@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -8,11 +9,18 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// errFileUnavailable is the cause attributed to a dropped audit-log line when
+// the writer's file handle is nil because a prior rotation reopen failed
+// (#3478 item 1). Shared by TraceWriter and LocalLogWriter.
+var errFileUnavailable = errors.New("audit log file unavailable (failed rotation)")
 
 // traceLogDir is the directory persistent flow-trace files are written to. It
 // is a package var (not a const) only so tests can redirect it to a temp dir;
@@ -48,16 +56,28 @@ func sanitizeTraceFileName(name string) error {
 	return nil
 }
 
-// openTraceFile opens a flow-trace file (the active file or a rotated
-// generation) inside traceLogDir with restrictive semantics: O_NOFOLLOW so a
-// pre-planted symlink under /var/log cannot redirect the root-written telemetry
-// (#3420), the opened descriptor is verified to be a regular file, and it is
-// created mode 0600 rather than world-readable 0644 — flow tuples/zones/policy
-// names are audit-grade telemetry. The caller passes an already-sanitized
-// basename (NewTraceWriter validates once up front).
-func openTraceFile(name string) (*os.File, error) {
-	path := filepath.Join(traceLogDir, name)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|unix.O_NOFOLLOW, 0o600)
+// openHardenedAuditLog opens an audit-grade log file at an absolute path with
+// the symlink/permission hardening shared by the flow-trace writer and the
+// event-mode security-log writer (#3420, #3477): O_NOFOLLOW so a pre-planted
+// symlink at the path cannot redirect root-written telemetry to an arbitrary
+// target, the opened descriptor verified to be a regular file, and mode 0600
+// rather than world-readable 0644 — flow tuples/zones/policy/NAT metadata are
+// audit-grade and must not leak to other local users. The caller supplies the
+// open mode bits (O_APPEND for an existing/active file). O_TRUNC must NOT be
+// passed: with O_NOFOLLOW a symlink open already fails, but truncation of a
+// confirmed file is also undesirable on the rotation path — a fresh file is
+// produced by renaming the old one aside before this open, so O_CREATE alone
+// yields an empty file. This avoids the O_TRUNC-follows-symlink primitive
+// (#3477 M02).
+//
+// The 0600 mode argument to OpenFile only applies when the file is *created*;
+// an existing pre-hardening file (e.g. a 0644 trace/security log written by an
+// older build) keeps its looser mode across upgrade. Since #3477 IS the
+// mode-hardening contract, the descriptor — already confirmed a regular file
+// opened O_NOFOLLOW, so fchmod is safe and cannot be redirected — is tightened
+// to 0600 whenever its current group/other bits are non-zero.
+func openHardenedAuditLog(path string, mode int) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|unix.O_NOFOLLOW|mode, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -68,9 +88,28 @@ func openTraceFile(name string) (*os.File, error) {
 	}
 	if !fi.Mode().IsRegular() {
 		f.Close()
-		return nil, fmt.Errorf("trace target %s is not a regular file", path)
+		return nil, fmt.Errorf("audit log target %s is not a regular file", path)
+	}
+	// Enforce 0600 on an existing file whose mode differs (create-time mode is
+	// a no-op for an already-present file, so a pre-hardening 0644 log would
+	// stay world-readable across upgrade). f.Chmod is an fchmod on the held
+	// regular-file fd, so this cannot be steered to another path (#3477 item 3).
+	if fi.Mode().Perm() != 0o600 {
+		if err := f.Chmod(0o600); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("tighten audit log mode %s: %w", path, err)
+		}
 	}
 	return f, nil
+}
+
+// openTraceFile opens a flow-trace file (the active file or a rotated
+// generation) inside traceLogDir with the shared hardened semantics
+// (O_NOFOLLOW, regular-file verified, 0600 — see openHardenedAuditLog). The
+// caller passes an already-sanitized basename (NewTraceWriter validates once up
+// front).
+func openTraceFile(name string) (*os.File, error) {
+	return openHardenedAuditLog(filepath.Join(traceLogDir, name), os.O_APPEND)
 }
 
 // TraceWriter writes matching flow events to a trace file with rotation.
@@ -84,7 +123,44 @@ type TraceWriter struct {
 	written  int64
 	filters  []traceFilter
 	flags    map[string]bool // which event types to trace
+
+	// Failure observability (#3478). droppedWrites counts trace lines lost
+	// because the file write failed or the file is nil (a prior rotation reopen
+	// failed); failedRotations counts rotations that could not complete (a
+	// generation shift, the active-file rename, or the post-rotation reopen
+	// failed). Both are audit-grade signals: an operator who enabled
+	// traceoptions must be able to tell that telemetry is being lost. The two
+	// failure classes get SEPARATE ≤1/s warn clocks (lastDropWarn /
+	// lastRotWarn, mu-guarded; HandleEvent/rotate run under mu) so a write-drop
+	// storm cannot suppress the rotation warning, and vice versa.
+	droppedWrites   atomic.Uint64
+	failedRotations atomic.Uint64
+	lastDropWarn    time.Time
+	lastRotWarn     time.Time
 }
+
+// warnRateLimited emits a ≤1/s WARN carrying the current failure counters,
+// gated by the supplied per-class clock. Must be called with tw.mu held.
+func (tw *TraceWriter) warnRateLimited(clock *time.Time, msg string, err error) {
+	now := time.Now()
+	if !clock.IsZero() && now.Sub(*clock) < time.Second {
+		return
+	}
+	*clock = now
+	slog.Warn(msg,
+		"err", err,
+		"path", tw.path,
+		"dropped_writes", tw.droppedWrites.Load(),
+		"failed_rotations", tw.failedRotations.Load())
+}
+
+// DroppedWrites reports the number of trace lines lost because the file write
+// failed (#3478). Observability accessor for status/metrics surfaces.
+func (tw *TraceWriter) DroppedWrites() uint64 { return tw.droppedWrites.Load() }
+
+// FailedRotations reports the number of trace-file rotations that could not
+// complete (#3478).
+func (tw *TraceWriter) FailedRotations() uint64 { return tw.failedRotations.Load() }
 
 type traceFilter struct {
 	name   string
@@ -265,18 +341,30 @@ func (tw *TraceWriter) HandleEvent(rec EventRecord, raw []byte) {
 	defer tw.mu.Unlock()
 
 	if tw.file == nil {
+		// #3478 item 1: a nil file means a prior rotation reopen failed and the
+		// writer is wedged. Every subsequent event is lost — count and warn
+		// (rate-limited) instead of returning silently, otherwise the operator
+		// sees a single FailedRotations bump and no further signal.
+		tw.droppedWrites.Add(1)
+		tw.warnRateLimited(&tw.lastDropWarn, "flow-trace write dropped: file unavailable after failed rotation", errFileUnavailable)
 		return
 	}
 
 	n, err := tw.file.WriteString(line)
 	if err != nil {
+		// #3478 H21: a swallowed write error means lost audit telemetry the
+		// operator cannot detect. Count it and emit a rate-limited WARN.
+		tw.droppedWrites.Add(1)
+		tw.warnRateLimited(&tw.lastDropWarn, "flow-trace write failed (audit lines lost)", err)
 		return
 	}
 	tw.written += int64(n)
 
 	// Rotate if needed
 	if tw.written >= tw.maxSize {
-		tw.rotate()
+		if err := tw.rotate(); err != nil {
+			tw.warnRateLimited(&tw.lastRotWarn, "flow-trace rotation failed", err)
+		}
 	}
 }
 
@@ -373,29 +461,62 @@ func (tw *TraceWriter) formatTrace(rec EventRecord) string {
 		rec.PolicyID, rec.InZone, rec.OutZone)
 }
 
-func (tw *TraceWriter) rotate() {
+// rotate rolls the active trace file aside and reopens a fresh one. It returns
+// a non-nil error if the rotation could not complete and bumps failedRotations
+// (#3478 H22). Crucially, tw.written is reset to 0 ONLY when the active file was
+// actually moved aside and a fresh empty file opened; on a failed primary
+// rename the daemon keeps writing to the same (still-full) file, so written is
+// re-synced to the real size to retry rotation on the next write rather than
+// silently growing unbounded with a bogus 0 byte count.
+func (tw *TraceWriter) rotate() error {
 	tw.file.Close()
 	tw.file = nil
 
-	// Shift existing files: .2 -> .3, .1 -> .2, current -> .1
+	// Shift existing files: .2 -> .3, .1 -> .2. A missing generation is normal
+	// (ENOENT); any other rename failure means a retained generation was lost,
+	// so it is counted and surfaced (#3478 item 2) even though the active-file
+	// rotation below can still succeed.
+	var shiftErr error
 	for i := tw.maxFiles - 1; i > 0; i-- {
 		old := fmt.Sprintf("%s.%d", tw.path, i)
-		new := fmt.Sprintf("%s.%d", tw.path, i+1)
-		os.Rename(old, new)
+		next := fmt.Sprintf("%s.%d", tw.path, i+1)
+		if err := os.Rename(old, next); err != nil && !os.IsNotExist(err) {
+			slog.Debug("trace rotate generation shift failed", "from", old, "to", next, "err", err)
+			tw.failedRotations.Add(1)
+			if shiftErr == nil {
+				shiftErr = fmt.Errorf("rotate shift %s->%s: %w", old, next, err)
+			}
+		}
 	}
-	os.Rename(tw.path, tw.path+".1")
+	renameErr := os.Rename(tw.path, tw.path+".1")
 
-	// Remove excess files
+	// Remove excess files (best-effort).
 	excess := fmt.Sprintf("%s.%d", tw.path, tw.maxFiles+1)
-	os.Remove(excess)
+	if err := os.Remove(excess); err != nil && !os.IsNotExist(err) {
+		slog.Debug("trace rotate excess removal failed", "path", excess, "err", err)
+	}
 
-	// Open fresh file (O_NOFOLLOW, regular-file checked, 0600). The active path
-	// was just renamed to .1, so this creates a new empty file.
+	// Open fresh file (O_NOFOLLOW, regular-file checked, 0600). When the
+	// primary rename succeeded the active path no longer exists, so this
+	// creates a new empty file.
 	f, err := openTraceFile(tw.name)
 	if err != nil {
-		slog.Warn("failed to open rotated trace file", "err", err)
-		return
+		tw.failedRotations.Add(1)
+		return fmt.Errorf("reopen after rotate: %w", err)
 	}
 	tw.file = f
+
+	if renameErr != nil {
+		// The active file was NOT rolled aside; we reopened the same full file.
+		tw.failedRotations.Add(1)
+		if info, statErr := f.Stat(); statErr == nil {
+			tw.written = info.Size()
+		}
+		return fmt.Errorf("rotate rename %s: %w", tw.path, renameErr)
+	}
+	// The active file rotated cleanly (fresh empty file); reset the byte count.
+	// shiftErr is non-nil only when a retained generation could not be shifted;
+	// surface it so the caller warns, but the active rotation itself succeeded.
 	tw.written = 0
+	return shiftErr
 }

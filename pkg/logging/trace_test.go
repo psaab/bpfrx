@@ -281,3 +281,180 @@ func TestMatchFiltersProtocolWithPrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestTraceWriter_WriteFailureObservable pins #3478 H21: a swallowed trace
+// write error is now counted in DroppedWrites so lost audit telemetry is
+// detectable.
+//
+// RED-on-revert: remove the `tw.droppedWrites.Add(1)` in HandleEvent and the
+// counter stays 0.
+func TestTraceWriter_WriteFailureObservable(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tw.Close()
+
+	// Close the fd out from under the writer so the next write fails (EBADF)
+	// while tw.file is still non-nil.
+	if err := tw.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tw.HandleEvent(EventRecord{Type: "SESSION_OPEN"}, nil)
+
+	if got := tw.DroppedWrites(); got != 1 {
+		t.Fatalf("DroppedWrites = %d, want 1 (trace write failure not observable)", got)
+	}
+}
+
+// TestTraceWriter_RotationFailureObservable pins #3478 H22 + item 6: a rotation
+// whose primary rename cannot complete (a) returns a non-nil error, (b) bumps
+// FailedRotations, and (c) re-syncs `written` to the real file size rather than
+// resetting to a bogus 0. Calling rotate() directly pins all three.
+//
+// RED-on-revert: make rotate() ignore the rename result and unconditionally set
+// written=0 / return nil — the error-return, the written==realSize, and the
+// FailedRotations assertions all fail.
+func TestTraceWriter_RotationFailureObservable(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	// FileCount=1 so the generation-shift loop does not run and cannot move our
+	// blocking directory aside before the primary rename.
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log", FileSize: 40, FileCount: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tw.Close()
+
+	if _, err := tw.file.WriteString("0123456789012345678901234567890123456789\n"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(tw.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realSize := fi.Size()
+	tw.written = 999 // deliberately wrong to prove rotate() re-syncs to real size
+
+	// Block the primary rename target with a non-empty directory so
+	// os.Rename(path, path+".1") fails.
+	archive := tw.path + ".1"
+	if err := os.Mkdir(archive, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archive, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if rerr := tw.rotate(); rerr == nil {
+		t.Fatal("rotate() returned nil on a failed primary rename, want a non-nil error")
+	}
+	if got := tw.FailedRotations(); got == 0 {
+		t.Fatalf("FailedRotations = 0, want >=1 (failed rename not observable)")
+	}
+	if tw.written != realSize {
+		t.Fatalf("written = %d after a failed rotation, want re-synced to real size %d (not a bogus 0/stale value)", tw.written, realSize)
+	}
+}
+
+// TestTraceWriter_GenerationShiftFailureObservable pins #3478 item 2: a failed
+// retained-generation shift (old->next) is counted and surfaced even when the
+// active-file rotation itself succeeds.
+//
+// RED-on-revert: drop the failedRotations.Add(1)+shiftErr in the shift loop and
+// both assertions fail.
+func TestTraceWriter_GenerationShiftFailureObservable(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	// FileCount=2 so the shift loop runs once: rename .1 -> .2.
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log", FileCount: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tw.Close()
+
+	if err := os.WriteFile(tw.path+".1", []byte("gen1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(tw.path+".2", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tw.path+".2", "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rerr := tw.rotate()
+	if rerr == nil {
+		t.Fatal("rotate() returned nil despite a failed generation shift, want a non-nil error")
+	}
+	if got := tw.FailedRotations(); got == 0 {
+		t.Fatalf("FailedRotations = 0, want >=1 (generation-shift failure not observable)")
+	}
+}
+
+// TestTraceWriter_NilFileDropObservable pins #3478 item 1: a HandleEvent on a
+// writer whose file is nil (here via Close, the state a failed rotation reopen
+// leaves) increments DroppedWrites rather than returning silently.
+//
+// RED-on-revert: restore the bare `return` on the tw.file==nil branch without
+// the droppedWrites.Add(1) and the counter stays 0.
+func TestTraceWriter_NilFileDropObservable(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw.Close() // file = nil
+
+	tw.HandleEvent(EventRecord{Type: "SESSION_OPEN"}, nil)
+	if got := tw.DroppedWrites(); got != 1 {
+		t.Fatalf("DroppedWrites = %d, want 1 (nil-file drop not observable)", got)
+	}
+}
+
+// TestTraceWriter_TightensExistingMode pins #3477 item 3: opening an existing
+// 0644 trace file tightens it to 0600.
+//
+// RED-on-revert: remove the fchmod-on-existing block in openHardenedAuditLog
+// and the mode stays 0644.
+func TestTraceWriter_TightensExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	path := filepath.Join(dir, "flow.log")
+	if err := os.WriteFile(path, []byte("legacy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil { // defeat umask
+		t.Fatal(err)
+	}
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tw.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("existing trace-file mode = %o after open, want tightened to 0600", perm)
+	}
+}
