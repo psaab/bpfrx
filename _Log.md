@@ -1,3 +1,39 @@
+## 2026-06-29 — #3363 Codex MEDIUM fold: structured gRPC GetPolicies default-policy parity (PR #3528)
+
+- **Timestamp**: 2026-06-29
+- **Action**: Codex MEDIUM gap fold for PR #3528. The #3363 implicit
+  default-policy hit counter was surfaced as a synthetic `-`/`-`/
+  `default-policy` row across REST `/policies`, CLI, gRPC TEXT hit-count,
+  and Prometheus — but the STRUCTURED gRPC `GetPolicies` RPC omitted it, so
+  automation reading the structured inventory could not audit the
+  default-deny/permit boundary. FOLD 1: append a synthetic `pb.PolicyInfo`
+  (FromZone/ToZone `-`/`-`) with one `pb.PolicyRule{Name/RuleId=
+  dataplane.DefaultPolicyName, PolicyId=dataplane.DefaultPolicySentinelID}`
+  before the `readErr` check in `GetPolicies`, mirroring the REST surface
+  exactly; counters read via `ReadPolicyCounters(DefaultPolicySentinelID)`
+  under the same `statsEnabled && s.dp != nil && s.dp.IsLoaded()` gate, read
+  errors folded into the existing readErr handling. FOLD 2 (NIT): updated
+  the stale doc comments in `userspace-dp/src/policy.rs` and
+  `session/entry.rs` that claimed the implicit default-policy has no
+  fast-path counter — `0` is reserved for non-policy/no-counter sessions;
+  the default-policy is bound to `DEFAULT_POLICY_COUNTER_IDX==u32::MAX`,
+  resolved to `PolicyState::default_counter` so a default-PERMIT session
+  re-counts on the fast path. RED-on-revert: new
+  `TestGetPoliciesIncludesDefaultPolicyRow` asserts the specific
+  default-policy row + sentinel PolicyId/RuleId + the live 42/4200 counter;
+  stripping the append makes it RED (verified). Merge with origin/master
+  surfaced a PRE-EXISTING master breakage from #3436 (daemon_nft.go added a
+  `pkg/dataplane` import via DSCPValues but never updated the retirement
+  import allowlist / #1451 docs table) — added the missing allowlist entry
+  + docs-table row to keep the suite green. go test ./pkg/grpcapi/
+  ./pkg/dataplane/ ./pkg/config/ ./pkg/cli/ ./pkg/api/ green; cargo build
+  clean; gofmt + go vet ./pkg/grpcapi/ clean.
+- **File(s)**: pkg/grpcapi/server_show_zones.go,
+  pkg/grpcapi/server_show_zones_default_policy_3363_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/session/entry.rs,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
+
 ## 2026-06-29 — #3419 REST session-view parity with gRPC
 
 - **Timestamp**: 2026-06-29
@@ -23387,6 +23423,9 @@ top.
   - **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go, pkg/config/schema_interfaces.go, pkg/config/schema_security.go, pkg/config/schema_system.go, pkg/config/schema_routing.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md
   - **Action**: #3332 Codex MERGE-NEEDS-MAJOR fold (PR #3509). Codex confirmed NO over-rejection (scalar-guard crux clean); the MAJOR was INCOMPLETENESS — supported flat-set/compact forms bypass the schema-walk scalar gate because their leaf lives under a non-scalar-eligible node. Added a compiler-side companion gate validateTrailingTokensStrict (strict commit + lenientTrailingTokens downgrade, mirrors validateScreenUnknownStrict) covering the two unreachable shapes: (1 MAJOR) address-book `address <name> description <text>`/`<prefix>` — the `address` node is multi:true (absorbs the description sub-token onto Keys for the #2419 dual-AST shape), so the multi-exempt scalar gate never reaches the value slot and mergeAddressNode read only Keys[3]/Keys[2], dropping the rest; record leftover on Address.TrailingTokens (global + zone-local books, since resolveZoneLocalAddressBooks copies only Value/Description). (2 MINOR) IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>` — collapses onto the parent `dynamic` node's Keys (compiler_ipsec.go both sites read Keys[2]); record on IPsecGateway.DynamicHostnameExtras. (3 MINOR) dropped scalar:true on address-set description (AddressSet has no Description field — the tag was a no-op-feature; noted unsupported). (4 NIT) fixed the multi-exempt test to use a REAL #2419 bracketed list (`name-server [ a b c ]`). RED-on-revert verified for all 4 reject cases (strip the recording -> token silently dropped). No over-rejection: `address h2 1.2.3.4/32`, quoted `description "web server frontend"`, and compact `dynamic hostname peer.example.com` all still compile + values preserved. go test ./pkg/config/... ./pkg/cli/... ./pkg/configstore/... ./pkg/cmdtree/... green; gofmt clean.
   - **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/compiler_security.go, pkg/config/compiler_ipsec.go, pkg/config/types_security.go, pkg/config/schema_security.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md
+  - **Timestamp**: 2026-06-29
+  - **Action**: #3363 implicit default-policy hit counter (PR fix/3363-default-policy-rule). The IMPLICIT default-policy verdict returned `policy_counter_idx: 0` and incremented nothing, so operators could not answer "how many packets hit the default deny?". Added `PolicyState.default_counter` (`Arc<PolicyRuleCounter>`, persisted in `PolicyCounterStore` under the reserved rule id "default-policy" = `dataplane.DefaultPolicyName`, retained across rebuilds by `reconcile_rules`); the default branch now increments it on the cold path (the only count for default-DENY — denied flows install no session) and stamps the reserved handle `DEFAULT_POLICY_COUNTER_IDX`=`u32::MAX` so a default-PERMIT session re-counts on the established fast path via `hit_counter_by_idx`. `counter_snapshots()` appends the reserved row. Go reads it through the EXISTING `ReadPolicyCounters(dataplane.DefaultPolicySentinelID)` path (`policyRuleIDForCounter` maps the sentinel → "default-policy") — NO new dataplane interface method. Surfaced as a final `-`/`-`/`default-policy` row in CLI `show security policies hit-count`, gRPC text hit-count, REST `/policies`, and the `xpf_policy_hits_total` Prometheus metric, gated on `policy-stats` like every other row. NO wire change (reused the existing `policy_id` u32 sentinel; protocol_wire_v1.json unchanged, wire_invariant green). Part 2 of the issue (a `then log` knob on the implicit default) is a genuine config-grammar fork — the `default-policy` schema leaf is a typed enum that cannot also carry structural `then` children — and is deferred; default-deny audit logging is achievable today via an explicit `from-zone any to-zone any` catch-all with `then { deny; log session-init; }`. RED-on-revert verified (Rust counter increment; Go sentinel resolver). cargo build + `cargo test policy::` (117) green; go test ./pkg/dataplane/... ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/... ./pkg/api/... green (gRPC hit-count golden updated). gofmt clean.
+  - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, pkg/dataplane/userspace/policycounters.go, pkg/dataplane/userspace/default_policy_counter_3363_test.go, pkg/cli/cli_show_security.go, pkg/cli/cli_show_policies_hitcount_gate_test.go, pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/testdata/server_show_golden.json, pkg/api/security.go, pkg/api/metrics_counters.go, docs/userspace-dataplane-gaps.md, _Log.md
 
 ## 2026-06-29 — #3315 SYN-flood sub-thresholds reach userspace
 - **Action**: Wire SYN-flood source/destination/alarm thresholds across the
