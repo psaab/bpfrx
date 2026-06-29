@@ -5478,6 +5478,92 @@ func validateNATMatchDestinationPortStrict(cfg *Config) error {
 	return nil
 }
 
+// validateDNATPoolStrict (#3450) hard-rejects a destination-NAT pool whose
+// translated `port` or `address` the dataplane cannot honor as configured:
+//
+//   - M03/M04 port: the pool `port` parser used a bare strconv.Atoi with no
+//     bound check and the snapshot builder cast straight to uint16, so `port
+//     70000` wrapped to 4464 and `-1` to 65535 (translating to an unintended
+//     backend port), while `port 0` / `port httpp` collapsed to Port==0 — which
+//     the Rust DNAT path treats as "preserve the destination port", silently
+//     no-op'ing the requested rewrite. PortRaw distinguishes a configured port
+//     (which must be 1..65535) from no `port` leaf at all (Port==0 = the
+//     legitimate preserve-port mode, left untouched).
+//
+//   - M05/M06 address: the builder strips any CIDR suffix and the Rust
+//     DnatTable parses the remainder as a single host IpAddr, `continue`-ing
+//     past anything it cannot parse. So `address 10.0.0.0/24` was coerced to
+//     the network base 10.0.0.0 (no pool/range semantics — M05) and `address
+//     web-server` (an address-book name) installed NO table entry, leaving the
+//     VIP silently untranslated (M06). A DNAT pool address must therefore be a
+//     single host the dataplane can install: a bare IP, /32, or /128
+//     (isHostMaskAddress — the same predicate static NAT uses). An empty pool
+//     address is also rejected: the builder skips it, so the rule is inert.
+//
+// Strict on commit / commit-check (hard reject so the bad value is operator-
+// visible); the compiler downgrades this to a warning on the tolerant load /
+// peer-sync path (#1960 no-brick) — the snapshot builder independently fails
+// CLOSED (it skips the rule rather than wrapping the port or coercing the
+// address), so a leniently-loaded bad pool installs nothing rather than
+// translating wrongly. Pools are walked in sorted name order for a
+// deterministic first-reported offender.
+func validateDNATPoolStrict(cfg *Config) error {
+	if cfg == nil || cfg.Security.NAT.Destination == nil {
+		return nil
+	}
+	pools := cfg.Security.NAT.Destination.Pools
+	names := make([]string, 0, len(pools))
+	for name := range pools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		pool := pools[name]
+		if pool == nil {
+			continue
+		}
+		// Port: only validate when a `port` leaf was actually configured.
+		// No leaf (PortRaw == "") leaves Port == 0 = preserve-destination-port,
+		// which is legitimate and untouched.
+		if pool.PortRaw != "" {
+			n, err := strconv.Atoi(pool.PortRaw)
+			if err != nil {
+				return fmt.Errorf(
+					"destination-nat pool %q: port %q is not a numeric port (1-65535); "+
+						"the rule would commit but the bad token is dropped and the pool "+
+						"port collapses to 0 (preserve destination port), silently "+
+						"no-op'ing the requested rewrite",
+					name, pool.PortRaw)
+			}
+			if n < 1 || n > 65535 {
+				return fmt.Errorf(
+					"destination-nat pool %q: port %d is out of range (1-65535); the rule "+
+						"would commit but the value wraps on a uint16 cast (e.g. 70000->4464, "+
+						"-1->65535) or collapses to 0 (preserve destination port), translating "+
+						"to an unintended backend port or silently no-op'ing the rewrite",
+					name, n)
+			}
+		}
+		// Address: the dataplane needs a single host (bare IP, /32, or /128).
+		if pool.Address == "" {
+			return fmt.Errorf(
+				"destination-nat pool %q: no translated address configured; the rule "+
+					"would commit but the dataplane installs no entry, leaving matching "+
+					"traffic untranslated", name)
+		}
+		if host, _ := isHostMaskAddress(pool.Address); !host {
+			return fmt.Errorf(
+				"destination-nat pool %q: address %q is not a single host address "+
+					"(a bare IP, /32, or /128); the rule would commit but the dataplane "+
+					"coerces a non-host CIDR to its network base (no pool/range semantics) "+
+					"or drops an unparseable token (e.g. an address-book name), leaving "+
+					"matching traffic translated to the wrong address or untranslated",
+				name, pool.Address)
+		}
+	}
+	return nil
+}
+
 // validateRouteFilterMatchTypesStrict gates the two route-filter match-types
 // that the FRR prefix-list backend cannot render losslessly (#2525):
 //

@@ -599,3 +599,60 @@ rule matches NOTHING — it never widens to the wildcard port. A rule with no
 (never serialized to the helper); the builder uses the existing
 `destination_port` slot and simply drops a term that would have wildcarded, so
 `protocol_wire_v1.json` is unchanged.
+
+## 14. DNAT pool port/address validation (#3450)
+
+A destination-NAT **pool**'s translated `port` and `address` had NO strict
+commit validation (the analog of §13, which validates the rule's `match`
+ports). The pool parser (`compileNATDestination`, `compiler_nat.go`) used a bare
+`strconv.Atoi` for the port (no bound check, non-numeric silently dropped to
+`Port == 0`) and stored the address verbatim; the snapshot builder
+(`buildDestinationNATSnapshotsWithFeeds`) cast the port to `uint16` and stripped
+any CIDR suffix from the address. Junos expresses the pool port as `address port
+<N>` (nested under the address leaf), which the pre-#3450 parser mis-handled —
+it set `Address` to the literal `"port"` and dropped the port entirely. The
+result was four silent failure modes:
+
+- **M03** — `port 70000` wrapped to `4464` (and `-1` to `65535`) on the `uint16`
+  cast, so traffic was rewritten to an unintended backend port.
+- **M04** — `port 0` / `port httpp` collapsed to `Port == 0`, which the Rust
+  DNAT path treats as "preserve the destination port" — the requested rewrite
+  was silently a no-op.
+- **M05** — `address 10.0.0.0/24` had its CIDR stripped to the network base
+  `10.0.0.0`, so all matching traffic was translated to the network base (no
+  pool/range semantics).
+- **M06** — `address web-server` (an address-book name) committed clean but the
+  Rust `DnatTable` failed to parse it and `continue`d, so the rule installed NO
+  entry and the VIP was silently untranslated.
+
+**Parser.** `parseDNATPoolAddress` now walks every token of an `address`
+statement (and its children for the hierarchical shape), capturing the
+translated address AND a nested `port <N>` separately — so `address 10.0.1.100/32`
+plus `address port 80` yields `Address = 10.0.1.100/32`, `Port = 80` instead of
+`Address = "port"`. The raw port token is preserved on `NATPool.PortRaw` so a
+configured port (which must be 1..65535) is distinguishable from no `port` leaf
+at all (`Port == 0` = the legitimate preserve-destination-port mode). The
+top-level `port <N>` form is still accepted.
+
+**Commit gate.** `validateDNATPoolStrict` (`compiler_validate_strict.go`)
+hard-rejects a DNAT pool whose configured port is 0/negative/>65535/non-numeric
+(only when `PortRaw` is set — no port leaf is left untouched) or whose address
+is empty or not a single host (a bare IP, /32, or /128 — `isHostMaskAddress`,
+the same predicate static NAT uses). It runs after the §13 match-dest-port gate
+and shares the `lenientDestNATAddresses` flag, so on the tolerant load /
+peer-sync path (#1960) it downgrades to a warning rather than bricking a config
+persisted before the gate existed.
+
+**Dataplane fail-closed (lenient backstop).** The builder now resolves the pool
+address through `dnatPoolHostIP` (bare IP / /32 / /128 → the bare host string;
+non-host CIDR or non-IP token → not ok) and skips the whole rule when the
+address is unusable or when a configured pool port is out of 1..65535. So a
+leniently-loaded bad pool installs NO entry (matches nothing) rather than
+wrapping the port, coercing the address to a network base, or emitting an entry
+the Rust side drops. A pool with a valid host address and no port leaf still
+emits the genuine preserve-destination-port entry, unchanged.
+
+**Wire.** No new wire field. `PortRaw` is compiler-internal (never serialized);
+the builder uses the existing `pool_address` / `pool_port` slots and simply
+drops a rule that would have translated wrongly, so `protocol_wire_v1.json` is
+unchanged.

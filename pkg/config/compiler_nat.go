@@ -1423,6 +1423,36 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// parseDNATPoolAddress walks a destination-NAT pool `address` statement and
+// captures the translated address and (optionally nested) `port <N>` token.
+// Junos expresses the DNAT pool port as `address port <N>` (a child of the
+// address leaf), not a top-level `port`. The token stream after "address" may
+// be the bare IP, a `port <N>` pair, both interleaved, or — in the hierarchical
+// shape — split across Children (`address { <ip>; port <N>; }`). A `port` token
+// records PortRaw (and the parsed int) so validateDNATPoolStrict and the
+// snapshot builder can fail closed on an invalid value; everything else is the
+// translated address. PortRaw lets the gate tell a configured port (which must
+// be 1..65535) from no port leaf at all (Port==0 = preserve destination port).
+func parseDNATPoolAddress(pool *NATPool, prop *Node) {
+	toks := append([]string(nil), prop.Keys[1:]...)
+	for _, c := range prop.Children {
+		toks = append(toks, c.Keys...)
+	}
+	for i := 0; i < len(toks); i++ {
+		if toks[i] == "port" {
+			if i+1 < len(toks) {
+				pool.PortRaw = toks[i+1]
+				if n, err := strconv.Atoi(toks[i+1]); err == nil {
+					pool.Port = n
+				}
+				i++
+			}
+			continue
+		}
+		pool.Address = toks[i]
+	}
+}
+
 func compileNATDestination(node *Node, sec *SecurityConfig) error {
 	if sec.NAT.Destination == nil {
 		sec.NAT.Destination = &DestinationNATConfig{
@@ -1437,9 +1467,25 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "address":
-				pool.Address = nodeVal(prop)
+				// DNAT pool address grammar (Junos):
+				//   address <ip|cidr>      translated address
+				//   address port <N>       translated port (nested under address)
+				//   address <ip> port <N>  both on one statement
+				// A hierarchical `address { <ip>; port <N>; }` carries the IP and
+				// the `port <N>` pair in Children. The pre-#3450 parser did a bare
+				// `pool.Address = nodeVal(prop)`, which set Address to the literal
+				// "port" for an `address port 80` statement and dropped the port
+				// entirely. Walk every token so the address and the nested port are
+				// each captured.
+				parseDNATPoolAddress(pool, prop)
 			case "port":
+				// Top-level `port <N>` form (flat-set / older configs).
 				if v := nodeVal(prop); v != "" {
+					// #3450: preserve the raw token so the strict gate and the
+					// snapshot builder can reject a configured-but-invalid port
+					// (0/out-of-range/non-numeric) rather than wrap on a uint16
+					// cast or collapse to the preserve-destination-port default.
+					pool.PortRaw = v
 					if n, err := strconv.Atoi(v); err == nil {
 						pool.Port = n
 					}

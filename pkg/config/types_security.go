@@ -512,12 +512,22 @@ const (
 
 // NATPool is a pool of addresses for NAT.
 type NATPool struct {
-	Name          string
-	Address       string   // single address (DNAT compat)
-	Addresses     []string // multiple addresses (source NAT pools)
-	Port          int      // optional port mapping (DNAT)
-	PortLow       int      // source pool port range low (default 1024)
-	PortHigh      int      // source pool port range high (default 65535)
+	Name      string
+	Address   string   // single address (DNAT compat)
+	Addresses []string // multiple addresses (source NAT pools)
+	Port      int      // optional port mapping (DNAT)
+	// PortRaw is the raw DNAT pool `port` token exactly as configured
+	// (empty when no `port` leaf was set). It lets the strict commit gate
+	// (validateDNATPoolStrict) and the snapshot builder distinguish a
+	// configured-but-invalid port (e.g. "0", "70000", "httpp" — which must
+	// fail closed) from no port leaf at all (Port stays 0 = "preserve the
+	// destination port", a legitimate DNAT mode). Without it a `port 0` or
+	// `port httpp` collapsed to Port==0 and was indistinguishable from the
+	// preserve-port default, silently no-op'ing the requested rewrite (#3450
+	// M04).
+	PortRaw       string
+	PortLow       int // source pool port range low (default 1024)
+	PortHigh      int // source pool port range high (default 65535)
 	PersistentNAT *PersistentNATConfig
 	Deterministic *DeterministicNATConfig
 }
