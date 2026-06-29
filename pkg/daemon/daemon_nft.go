@@ -511,6 +511,21 @@ func hostInboundProtocolMatches(token, family string) []string {
 		return []string{"tcp dport 639"}
 	case "nhrp":
 		return []string{"meta l4proto 54"}
+	case "rsvp":
+		// #3341: RSVP rides directly over IP, protocol 46 (dual-family).
+		return []string{"meta l4proto 46"}
+	case "pgm":
+		// #3341: PGM (Pragmatic General Multicast) rides over IP, protocol 113
+		// (dual-family).
+		return []string{"meta l4proto 113"}
+	case "sap":
+		// #3341: SAP (Session Announcement Protocol) is UDP/9875 (dual-family).
+		return []string{"udp dport 9875"}
+	case "dvmrp":
+		// #3341: DVMRP is carried inside IGMP (IP protocol 2) and is IPv4-only;
+		// the family gate above (config.HostInboundProtocolFamily["dvmrp"]="ip")
+		// restricts it to IPv4, matching igmp.
+		return []string{"meta l4proto 2"}
 	case "isis":
 		// #3311: IS-IS rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT
 		// IP), so it cannot be expressed as an ip/ip6 host-inbound match. It is

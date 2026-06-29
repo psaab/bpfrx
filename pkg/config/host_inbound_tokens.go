@@ -105,6 +105,22 @@ var KnownHostInboundProtocols = map[string]bool{
 	"msdp":             true,
 	"nhrp":             true,
 	"router-discovery": true,
+	// #3341: additional routing-control protocols Junos/vSRX accepts under
+	// host-inbound-traffic. All ride IP (none are L2), so each maps to a
+	// concrete IP host-inbound match on both enforcement surfaces:
+	//   rsvp  — Resource Reservation Protocol, IP protocol 46 (dual-family).
+	//   pgm   — Pragmatic General Multicast, IP protocol 113 (dual-family).
+	//   sap   — Session Announcement Protocol, UDP/9875 (dual-family).
+	//   dvmrp — Distance Vector Multicast Routing Protocol, carried inside IGMP
+	//           (IP protocol 2) and IPv4-only (see HostInboundProtocolFamily).
+	// Before #3341 these were absent, so since #3200 made tokens typed a valid
+	// vSRX config naming them was hard-rejected at commit. Keep in lockstep with
+	// pkg/daemon hostInboundProtocolMatches and the Rust classify_protocol +
+	// KNOWN_ROUTING_PROTOCOL_TOKENS.
+	"rsvp":  true,
+	"pgm":   true,
+	"sap":   true,
+	"dvmrp": true,
 	// #3311: IS-IS is a recognized host-inbound protocol for vSRX parity, but
 	// it rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT IP) — see
 	// HostInboundL2Protocols below. It admits at commit yet produces NO IP
@@ -190,12 +206,17 @@ var HostInboundServiceFamily = map[string]string{
 
 // HostInboundProtocolFamily maps a family-SPECIFIC `protocols` (routing) token
 // to its only valid address family. Dual-family protocols (bgp, pim, vrrp, bfd,
-// ldp, msdp, nhrp, router-discovery) are absent. `ospf`/`ospf3` are split here
-// even though both ride IP protocol 89: OSPFv2 is IPv4, OSPFv3 is IPv6.
+// ldp, msdp, nhrp, router-discovery, rsvp, pgm, sap) are absent. `ospf`/`ospf3`
+// are split here even though both ride IP protocol 89: OSPFv2 is IPv4, OSPFv3 is
+// IPv6.
 var HostInboundProtocolFamily = map[string]string{
 	"ospf":  "ip",
 	"ospf3": "ip6",
 	"rip":   "ip",
 	"ripng": "ip6",
 	"igmp":  "ip",
+	// #3341: DVMRP is carried inside IGMP (IP protocol 2) and is an IPv4-only
+	// multicast routing protocol — like igmp it must not open proto 2 on the v6
+	// path. rsvp/pgm/sap are dual-family (absent here).
+	"dvmrp": "ip",
 }
