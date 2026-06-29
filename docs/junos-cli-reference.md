@@ -308,6 +308,37 @@ From zone: guest, To zone: lan
     `TestHostInboundRoutingProtocolTokenMatches`) + Rust
     (`routing_control_protocol_tokens_classify`) tests guard commit acceptance,
     the nft match/family scoping, and the Rust admit semantics.
+  - **`system-services traceroute` admit contract (UDP-probe-only, #3368):**
+    `host-inbound-traffic system-services traceroute` admits the **UDP probe
+    ports 33434-33523, dual-family (IPv4 + IPv6)** on both enforcement surfaces
+    (nft kernel mirror `udp dport 33434-33523`; Rust classifier inserts
+    `33434..=33523` into the family-agnostic UDP set). This is the **same range
+    as the Junos predefined `junos-traceroute` application** and is a deliberate
+    **superset** of the Junos `traceroute` system-service, which Juniper
+    documents as exactly "Traceroute traffic (UDP port 33434)" — the single base
+    probe port. xpf opens the full Unix default probe window (base 33434 +
+    30 hops × 3 probes − 1 = 33523) so a default `traceroute <xpf-ip>` reaches
+    the box on every probe, on both address families (Junos does not
+    family-scope this token, and neither does xpf).
+    - This token is **UDP-only by design — there is no under-admission** (the
+      #3368 audit premise of a missing "full traceroute admit set" is not borne
+      out against the Junos contract). Per Junos, the **other** traceroute
+      variants are admitted by **other** tokens, not by `traceroute`:
+      - **ICMP-based traceroute** (`mtr`/`traceroute -I`/Windows `tracert`)
+        sends ICMP echo-request, which is admitted by the **`ping`**
+        system-service (v4 type 8 / v6 type 128, see #3201/#3240), exactly as
+        on Junos — Juniper's own troubleshooting guidance is to enable BOTH
+        `traceroute` AND `ping` for full traceroute reachability.
+      - **TCP-based traceroute** (`traceroute -T`) is **not** a Junos
+        host-inbound system-service at all; there is no Junos token that opens
+        it, and folding it into `traceroute` would be a non-parity posture
+        change (silently answering TCP SYN probes on a traceroute-only zone).
+    - Widening `traceroute` to also admit ICMP echo or TCP would therefore
+      DEVIATE from Junos and change a zone's security posture, so it is
+      intentionally NOT done. Sources: Juniper CLI reference *system-services
+      (Security Zones Host Inbound Traffic)* ("traceroute — Traceroute traffic
+      (UDP port 33434)"); Juniper community "Force SRX to use ICMP based
+      traceroute?" (ICMP traceroute requires the `ping` service).
   - **RETH VRRP VIP scoping (#3172):** the kernel host-inbound chain scopes
     its accept/deny rules to each zone's firewall-local addresses. Those
     addresses now include the zone's RETH **VRRP virtual IPs** (the
