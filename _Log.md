@@ -1,3 +1,24 @@
+## 2026-06-29 — #3375 SMR MINOR fold: proto field-7 host_inbound_unmatched doc parity (PR #3542)
+
+- **Timestamp**: 2026-06-29
+- **Action**: SMR MINOR (contract-doc) fold for PR #3542. The #3375 fix
+  made the gRPC `MatchPolicies` host-inbound path populate `action` with
+  the `HostInboundActionString` SSOT (`DisplayAction()`), but the
+  `MatchPoliciesResponse.host_inbound_unmatched` (field 7) doc comment in
+  `proto/xpf/v1/xpf.proto` still claimed "`action` is empty; clients must
+  render <literal>". A client trusting the proto would hard-code the
+  literal and ignore the populated `action`, defeating the SSOT. Updated
+  the field-7 comment to state the server now renders
+  `HostInboundActionString` into `action` (non-empty; clients may use it
+  directly) and that `default_used` is false for the host-inbound case.
+  Regenerated `pkg/grpcapi/xpfv1/xpf.pb.go` via `make proto` — confirmed
+  the ONLY pb.go delta is the `HostInboundUnmatched` doc comment text (no
+  rawDesc / field-number / wire change; comment-only regen).
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  _Log.md
+- **Validation**: `make proto`; `go test ./pkg/grpcapi/ ./pkg/policymatch/
+  ./pkg/api/` green; gofmt clean; `git diff --stat` confirms pb.go change
+  is comment-only.
 ## 2026-06-29 — #3434 NAT `match application` undefined/empty fail-closed
 
 - **Timestamp**: 2026-06-29
@@ -23542,6 +23563,9 @@ top.
 - **Timestamp**: 2026-06-29T11:40Z
   - **Action**: #3442 Codex MERGE-NEEDS-MAJOR fold (PR #3517) — over-rejection risk. Verb-set reconciliation: applyEditLine -> ParseSetVerb replays EXACTLY set/delete/deactivate/activate (everything else hits the bare-path default = the M3 bug); FormatSet (display-set, the loadable artifact) emits only set/deactivate. annotate/copy/insert/rename are interactive-only structural edits (pkg/cli/cli_dispatch.go handlers, distinct multi-clause grammar) NEVER present in a flat-load file and NOT replayable — pre-fix they were silently mangled into junk `set annotate ...` nodes, so rejecting them is the M3 fix, not a regression. Confirmed `hasFlatVerb` recognizes exactly the 4 replayable verbs (option 2). Real fix folded: Codex #3 whitespace — the literal-`verb ` prefix check wrongly rejected a tab between verb and path (lexer treats tabs as whitespace); rewrote hasFlatVerb to match the first whitespace-delimited token (strings.Fields) against the verb set + require >=1 path token. Added TestLoadFlatVerbGate (all 4 verbs accepted in sequence; tab-separated set accepted; annotate/copy/insert/rename + garbage rejected on BOTH LoadSet and LoadMerge-flat). RED-on-revert reconfirmed against true origin/master source (garbage + interactive verbs + TestLoadSet all fail) AND the tab assertion fails under the prior literal-space gate. go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
   - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+- **Timestamp**: 2026-06-29T12:30Z
+  - **Action**: #3375 grpcapi MatchPolicies blank-action parity. The gRPC MatchPolicies RPC returned a BLANK `action` for two verdicts where REST returned an explicit string: (1) a `to-zone junos-host` query matching no host-bound policy (HostInboundUnmatched), (2) the no-active-config case (empty response). It also lacked a typed default-used bit. Fix: added SSOT `policymatch.HostInboundActionString` const + `policymatch.Result.DisplayAction()` renderer (host-inbound -> the host string; no-match -> "<action> (default)"; match -> "<action>"); both REST and gRPC now route ALL action rendering through DisplayAction so they cannot diverge. gRPC host-inbound now returns the host string; gRPC nil-config returns "deny (default)" + default_used=true. Added typed `default_used` to proto MatchPoliciesResponse (field 12, regenerated xpf.pb.go) and REST MatchPoliciesResult JSON, populated from policymatch.Result.DefaultUsed. CLI multi-line match-policies output already self-describing -> unchanged. RED-on-revert verified on BOTH surfaces (gRPC: revert -> blank action + default_used unset fail; REST: drop DefaultUsed copy -> default_used assertion fails). go test ./pkg/grpcapi/ ./pkg/policymatch/ ./pkg/api/ ./pkg/cli/ green; gofmt clean; go vet clean on touched packages.
+  - **File(s)**: pkg/policymatch/policymatch.go, pkg/grpcapi/server_cluster.go, pkg/api/security.go, pkg/api/types.go, proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/README.md, pkg/policymatch/display_action_3375_test.go, pkg/grpcapi/server_matchpolicies_action_3375_test.go, pkg/api/security_matchpolicies_action_3375_test.go, _Log.md
 
 - **Timestamp**: 2026-06-29T12:30Z
   - **Action**: #3446 source/destination-NAT `match destination-port` range validation. Static NAT validated its destination-port leaf (#2491) but the SNAT/DNAT match grammar did not: parser used bare strconv.Atoi (no bounds, non-numeric silently dropped) and builders cast to uint16, so port 0 → wildcard (H12), 70000 → wrap 4464 / -1 → 65535 (H13), `http` → empty list → wildcard (H14). Fix: (1) parseDNATPortList now returns unparseable raw tokens too → stored on NATMatch.InvalidDestinationPorts (skips `to`/`[`/`]`); (2) validateNATMatchDestinationPortStrict hard-rejects 0/out-of-range/non-numeric at commit for BOTH source and destination NAT, lenient-warn on tolerant load (shares lenientDestNATAddresses); (3) DNAT builder fail-closed — filters term ports to 1..65535 and emits NO snapshot (match nothing) when a port was configured but none survives, never wildcard (mirrors source-NAT #3429 natNeverMatchPortRange). No wire change (InvalidDestinationPorts is compiler-internal; builder uses existing destination_port slot). Boundary tests added (config commit gate + dataplane builder). RED-on-revert verified for both the commit gate and the builder fail-closed (70000→4464 wrap reproduced on revert). go test ./pkg/config/... ./pkg/dataplane/userspace/... green; cargo test --no-run nat:: green (no Rust touched); gofmt/vet clean.

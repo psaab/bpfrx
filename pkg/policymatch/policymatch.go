@@ -279,6 +279,36 @@ type Result struct {
 	Applications []string
 }
 
+// HostInboundActionString is the operator-facing verdict rendered for a
+// HostInboundUnmatched result (#3285/#3375). The dataplane host gate returns
+// None for an unmatched `to-zone junos-host` flow — local delivery proceeds,
+// governed by host-inbound-traffic system-services/protocols rather than any
+// transit/global/default security policy. Both the REST and gRPC
+// match-policies surfaces render this exact string (via DisplayAction) so a
+// remote client never sees a blank verdict for the host path and the two
+// transports never diverge.
+const HostInboundActionString = "host-inbound (local delivery; not governed by transit/global/default policy)"
+
+// DisplayAction renders the single operator-facing verdict string for a Result,
+// shared by every match-policies surface (#3375) so the REST and gRPC
+// transports cannot diverge. Before #3375 gRPC returned a BLANK action for the
+// host-inbound and default-deny verdicts while REST returned explicit strings;
+// routing both surfaces through this method keeps them in lockstep.
+//
+//   - HostInboundUnmatched -> HostInboundActionString
+//   - no match (default-policy verdict) -> "<action> (default)"
+//   - concrete policy match -> "<action>"
+func (r Result) DisplayAction() string {
+	switch {
+	case r.HostInboundUnmatched:
+		return HostInboundActionString
+	case !r.Matched:
+		return ActionString(r.Action) + " (default)"
+	default:
+		return ActionString(r.Action)
+	}
+}
+
 // Match runs the simulator against the active config and returns the verdict
 // with the SAME precedence the runtime enforces (userspace-dp/src/policy.rs
 // evaluate_policy_result_with_icmp / try_match_rule), first-match terminating:
