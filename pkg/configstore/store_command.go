@@ -279,17 +279,40 @@ func (s *Store) LoadMerge(content string) error {
 // `show | display set` output — which emits `deactivate <path>` for inactive
 // nodes — round-trips back to an inactive node instead of being skipped (and
 // reloaded active) or parsed as a junk path literally starting "deactivate".
-// hasFlatVerb reports whether a trimmed line begins with one of the
-// recognized flat config-edit verbs followed by a path (set/delete/
-// deactivate/activate). It is the fail-closed gate for the service-mode
-// load paths (LoadMerge flat branch + LoadSet): a line that does not start
-// with a verb is malformed input, NOT a bare path. Lines must already be
-// trimmed of leading whitespace by the caller.
+// hasFlatVerb reports whether a line begins with one of the flat config-edit
+// verbs that applyEditLine can actually replay (set/delete/deactivate/
+// activate) followed by at least one path token. It is the fail-closed gate
+// for the service-mode load paths (LoadMerge flat branch + LoadSet): a line
+// that does not start with one of those verbs is malformed input, NOT a bare
+// path.
+//
+// The verb set is deliberately EXACTLY the set applyEditLine -> ParseSetVerb
+// dispatches. The interactive structural-edit verbs annotate/copy/insert/
+// rename (pkg/cli/cli_dispatch.go, pkg/cmdtree ConfigTopLevel) are NOT
+// recognized here on purpose: they have distinct multi-clause grammar
+// (`copy X to Y`, `insert X before Y`, `annotate X "comment"`), are handled
+// only by the interactive CLI, and never appear in a flat-load artifact —
+// `show | display set` (ConfigTree.FormatSet) emits only `set`/`deactivate`
+// lines. Pre-#3442 such a line was silently turned into a junk `set
+// annotate ...` node by the bare-path default, so rejecting it is correct,
+// not a regression of any previously-working load.
+//
+// The first token is matched against the verb set after splitting on any
+// whitespace, so a tab between the verb and the path (the lexer treats tabs
+// as whitespace) is tolerated as well as a space.
 func hasFlatVerb(line string) bool {
-	return strings.HasPrefix(line, "set ") ||
-		strings.HasPrefix(line, "delete ") ||
-		strings.HasPrefix(line, "deactivate ") ||
-		strings.HasPrefix(line, "activate ")
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		// A blank line or a bare verb with no path is not a replayable
+		// flat command.
+		return false
+	}
+	switch fields[0] {
+	case "set", "delete", "deactivate", "activate":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyEditLine(tree *config.ConfigTree, line string) error {

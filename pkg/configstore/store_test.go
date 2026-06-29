@@ -927,6 +927,62 @@ set security zones security-zone untrust interfaces eth1.0`
 	}
 }
 
+// TestLoadFlatVerbGate pins the #3442 fold: the fail-closed gate recognizes
+// exactly the verbs applyEditLine can replay (set/delete/deactivate/activate),
+// tolerates a tab between verb and path, and rejects the interactive-only
+// structural-edit verbs (annotate/copy/insert/rename) plus genuine garbage —
+// none of which the flat-load replay path can handle.
+func TestLoadFlatVerbGate(t *testing.T) {
+	// All four replayable verbs in sequence must be accepted (count == 4).
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	supported := "set system host-name fw\ndeactivate system host-name\nactivate system host-name\ndelete system host-name"
+	count, err := s.LoadSet(supported)
+	if err != nil {
+		t.Fatalf("LoadSet of supported verbs: %v", err)
+	}
+	if count != 4 {
+		t.Errorf("expected 4 commands, got %d", count)
+	}
+
+	// A tab between the verb and the path must be tolerated (the lexer
+	// treats tabs as whitespace; a literal-space-only gate would wrongly
+	// reject this valid line).
+	s.ExitConfigure()
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadSet("set\tsystem domain-name example.com"); err != nil {
+		t.Fatalf("LoadSet of tab-separated set line: %v", err)
+	}
+
+	// Interactive-only structural-edit verbs and free-text garbage are NOT
+	// replayable on the flat path and must be rejected.
+	for _, bad := range []string{
+		"annotate system \"a comment\"",
+		"copy system to other",
+		"insert system before other",
+		"rename system to other",
+		"not-a-set-line",
+		"sett system host-name fw",
+	} {
+		s.ExitConfigure()
+		if err := s.EnterConfigure(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.LoadSet(bad); err == nil {
+			t.Errorf("LoadSet(%q): expected rejection, got nil", bad)
+		}
+		// LoadMerge flat branch must reject identically (mixed with a valid
+		// set line so isSetFormat is selected).
+		if err := s.LoadMerge("set system host-name fw\n" + bad); err == nil {
+			t.Errorf("LoadMerge with %q: expected rejection, got nil", bad)
+		}
+	}
+}
+
 func TestLoadMergeWithDelete(t *testing.T) {
 	s := newTestStore(t)
 

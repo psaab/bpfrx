@@ -295,17 +295,29 @@ owned by the `journal/` subpackage.
   there is no plaintext fallback.
 - Flat-load fail-closed (#3442 M3/M4): `LoadSet` and the flat-set branch
   of `LoadMerge` (`store_command.go`) reject any non-blank, non-`#` line
-  that does not start with a recognized verb (`set`/`delete`/`deactivate`/
-  `activate`, gate `hasFlatVerb`) with a line-numbered error. Previously
-  `LoadMerge` ran such a line through `applyEditLine` → `ParseSetVerb`,
-  whose bare-path default turned a typo/free-text line (e.g.
-  `not-a-set-line`) into a junk top-level node, and `LoadSet` silently
-  `continue`d on it so REST/gRPC/CLI returned OK while dropping the
-  intended command. The `ParseSetVerb` bare-path default is reserved for
-  internal callers that prepend the verb themselves (`SetEdit`,
-  `Deactivate`, `Activate`). Hierarchical `LoadMerge` is unaffected — it
-  round-trips through `FormatSet()`, which always emits verb-prefixed
-  lines.
+  that does not start with a recognized verb (gate `hasFlatVerb`) with a
+  line-numbered error. Previously `LoadMerge` ran such a line through
+  `applyEditLine` → `ParseSetVerb`, whose bare-path default turned a
+  typo/free-text line (e.g. `not-a-set-line`) into a junk top-level node,
+  and `LoadSet` silently `continue`d on it so REST/gRPC/CLI returned OK
+  while dropping the intended command. The `ParseSetVerb` bare-path default
+  is reserved for internal callers that prepend the verb themselves
+  (`SetEdit`, `Deactivate`, `Activate`).
+  - **Recognized verbs = exactly what `applyEditLine` replays:** `set`,
+    `delete`, `deactivate`, `activate`. The interactive structural-edit
+    verbs `annotate`/`copy`/`insert`/`rename` (handled only in
+    `pkg/cli/cli_dispatch.go`) are intentionally NOT accepted on the flat
+    path — they use distinct multi-clause grammar (`copy X to Y`,
+    `insert X before Y`, `annotate X "comment"`) and never appear in a
+    flat-load artifact, since `show | display set`
+    (`ConfigTree.FormatSet`) emits only `set`/`deactivate` lines. Pre-fix
+    they were already silently mangled into junk `set annotate ...` nodes,
+    so rejecting them is the M3 fix, not a regression.
+  - **Whitespace:** the gate matches the first whitespace-delimited token,
+    so a tab between the verb and the path is tolerated (the lexer treats
+    tabs as whitespace) — not only a literal space.
+  - Hierarchical `LoadMerge` is unaffected — it round-trips through
+    `FormatSet()`, which always emits verb-prefixed lines.
 - Commit atomicity (#846): `pkg/daemon` wraps `Commit()` together with
   `applyConfig()` under a single semaphore. Bypassing the daemon (e.g.
   using `Store` directly) loses that serialization, so concurrent CLI +
