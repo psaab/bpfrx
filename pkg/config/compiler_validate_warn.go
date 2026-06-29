@@ -849,6 +849,16 @@ func ValidateConfig(cfg *Config) []string {
 	// silently accept config the dataplane cannot enforce.
 	warnings = append(warnings, validateFilterLossPriorityWarnings(cfg)...)
 
+	// #3295: a firewall filter attached to an interface/lo0 input/output hook
+	// with no terminal catch-all term relies on xpf's implicit-accept of
+	// unmatched traffic — the deliberate divergence from Junos's implicit final
+	// discard. WARN-only: surface the divergence (and the explicit-final-term
+	// workaround) without changing the runtime default, which would blackhole
+	// the classify-and-pass output-filter idiom ("keep GOOD", #2124/#3261). See
+	// docs/research/3295-filter-failopen/plan.md and
+	// userspace-dp/src/filter/README.md.
+	warnings = append(warnings, validateFilterNoCatchAllWarnings(cfg)...)
+
 	// #2509: `security pre-id-default-policy then log session-init/session-close`
 	// is parsed and stored on PreIDDefaultPolicy.LogSessionInit/LogSessionClose
 	// but has NO consumer in the userspace dataplane after the eBPF retirement
@@ -939,6 +949,172 @@ func validateFilterLossPriorityWarnings(cfg *Config) []string {
 	emit("inet", cfg.Firewall.FiltersInet)
 	emit("inet6", cfg.Firewall.FiltersInet6)
 	return warnings
+}
+
+// validateFilterNoCatchAllWarnings emits a WARN-only commit-time message when a
+// firewall filter ATTACHED to an interface (or lo0) input/output hook has no
+// terminal catch-all term — i.e. it relies on xpf's implicit-accept of any
+// packet that matches no term.
+//
+// Junos stateless firewall filters carry an implicit final DISCARD: a packet
+// matching no explicit term is silently dropped. xpf instead falls through to
+// an implicit ACCEPT (userspace-dp/src/filter/engine/eval.rs: a no-match
+// evaluation returns FilterResult::default(), whose action is Accept). So an
+// imported SRX/Junos allowlist filter (terms that accept specific traffic, no
+// final discard) PERMITS everything it did not explicitly match under xpf,
+// where it would deny under Junos.
+//
+// This divergence is DELIBERATE and is not changed at runtime (#3295). A global
+// flip of the no-match default to discard would blackhole the classify-and-pass
+// OUTPUT filter idiom that rides the implicit accept — concretely the CoS
+// `bandwidth-output` filters attached as `interfaces reth0 unit 80 family
+// inet/inet6 filter output` (a pure dest-port allowlist with no final
+// catch-all), whose unmatched egress would be dropped at TX selection
+// (afxdp/tx/cos_classify.rs gates drop on action != Accept). That violates the
+// project "keep GOOD" doctrine (#2124/#3261). The research record is
+// docs/research/3295-filter-failopen/plan.md; the runtime contract is in
+// userspace-dp/src/filter/README.md.
+//
+// The warning is the operator-visibility mitigation: it surfaces the divergence
+// at commit so an operator who WANTS Junos stateless-discard parity can append
+// an explicit final `term <last> { then discard; }` (the inverse of Junos's
+// "write a final accept"). It is never an error — implicit-accept is the
+// documented, intentional default, and a hard reject would brick a boot on a
+// previously-accepted committed config.
+//
+// Scope: only filters actually attached to an input/output hook are checked
+// (library/unused filters are skipped to avoid noise). lo0 is covered because
+// it is stored as an ordinary interface unit under
+// cfg.Interfaces.Interfaces["lo0"].
+func validateFilterNoCatchAllWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	// Stable order: sorted interface names, then sorted unit numbers, so the
+	// warning set is deterministic across commits (map iteration is randomized).
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil { // #3494: tolerant/HA-sync path may carry a nil interface
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
+			if unit == nil { // #3494: tolerant/HA-sync path may carry a nil unit
+				continue
+			}
+			// (direction label, referenced filter name, resolved filter). The
+			// label mirrors the existing missing-reference warn loop above
+			// (input / input-v6 / output / output-v6). A filter that does not
+			// resolve is left to that loop (missing-reference warning); this
+			// pass only judges a filter that EXISTS and is attached.
+			type hook struct {
+				dir    string
+				name   string
+				filter *FirewallFilter
+			}
+			for _, h := range []hook{
+				{"input", unit.FilterInputV4, cfg.Firewall.FiltersInet[unit.FilterInputV4]},
+				{"input-v6", unit.FilterInputV6, cfg.Firewall.FiltersInet6[unit.FilterInputV6]},
+				{"output", unit.FilterOutputV4, cfg.Firewall.FiltersInet[unit.FilterOutputV4]},
+				{"output-v6", unit.FilterOutputV6, cfg.Firewall.FiltersInet6[unit.FilterOutputV6]},
+			} {
+				if h.name == "" || h.filter == nil {
+					continue
+				}
+				if firewallFilterHasCatchAllTerminator(h.filter) {
+					continue
+				}
+				warnings = append(warnings, fmt.Sprintf(
+					"interface %s unit %d: filter %s %q has no terminal "+
+						"catch-all term; xpf accepts traffic matching no term "+
+						"(Junos stateless filters imply a final discard) — append "+
+						"an explicit final `term { then discard; }` for "+
+						"Junos-style deny-by-default, or `then accept` to make "+
+						"permit-by-default explicit",
+					ifName, unitNum, h.dir, h.name))
+			}
+		}
+	}
+	return warnings
+}
+
+// firewallFilterHasCatchAllTerminator reports whether the filter contains a
+// term that both (a) is a terminating action (`then accept`/`discard`/`reject`
+// with no `then next term`) and (b) has a fully unconstrained `from` (matches
+// every packet). Such a term governs every packet that reaches it, so the
+// filter does not rely on the implicit no-match default. A `then next term` or
+// modifier-only fall-through is NOT a terminator; a `then routing-instance` PBR
+// term terminates but is not accept/discard/reject and so is not a catch-all.
+func firewallFilterHasCatchAllTerminator(f *FirewallFilter) bool {
+	if f == nil {
+		return false
+	}
+	for _, t := range f.Terms {
+		if t == nil {
+			continue
+		}
+		if firewallTermIsTerminatingAction(t) && firewallTermFromUnconstrained(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// firewallTermIsTerminatingAction reports whether the term carries an explicit
+// terminating action (accept/discard/reject) and is not an explicit
+// fall-through (`then next term`). `then routing-instance` (PBR) and
+// modifier-only terms (Action == "") are not terminating for this purpose.
+func firewallTermIsTerminatingAction(t *FirewallFilterTerm) bool {
+	if t.NextTerm {
+		return false
+	}
+	switch t.Action {
+	case "accept", "discard", "reject":
+		return true
+	default:
+		return false
+	}
+}
+
+// firewallTermFromUnconstrained reports whether the term's `from` is empty
+// across EVERY match dimension — it matches any packet. This must enumerate all
+// match fields on FirewallFilterTerm (types_system.go); a term carrying any
+// constraint, including an unresolved/unknown match value (which the dataplane
+// keeps verbatim and fails closed on, #3205/#3203/#3307), is constrained and is
+// therefore NOT a catch-all. Adding a new match field to FirewallFilterTerm
+// requires adding it here.
+func firewallTermFromUnconstrained(t *FirewallFilterTerm) bool {
+	return len(t.SourceAddresses) == 0 &&
+		len(t.DestAddresses) == 0 &&
+		len(t.SourcePrefixLists) == 0 &&
+		len(t.DestPrefixLists) == 0 &&
+		len(t.DSCPs) == 0 &&
+		len(t.Protocols) == 0 &&
+		len(t.DestinationPorts) == 0 &&
+		len(t.SourcePorts) == 0 &&
+		len(t.SourcePortsExcept) == 0 &&
+		len(t.DestPortsExcept) == 0 &&
+		len(t.ICMPTypes) == 0 &&
+		len(t.ICMPCodes) == 0 &&
+		len(t.UnknownICMPTypes) == 0 &&
+		len(t.UnknownICMPCodes) == 0 &&
+		len(t.UnknownPorts) == 0 &&
+		len(t.TCPFlags) == 0 &&
+		!t.IsFragment &&
+		t.FlexMatch == nil &&
+		len(t.UnknownFlexMatch) == 0 &&
+		len(t.UnknownFrom) == 0
 }
 
 // validateDDNSBackendWarnings emits WARN-only commit-time messages for the

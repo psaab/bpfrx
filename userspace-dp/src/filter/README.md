@@ -101,6 +101,39 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   matched count term (the earlier fall-through count terms were silently
   under-counted on the cached path only).
 
+  **No-match default is implicit ACCEPT — a deliberate divergence from
+  Junos (#3295).** When a packet matches NO term in a filter, the
+  evaluation returns `FilterResult::default()`, whose action is
+  `FilterAction::Accept` (`mod.rs`). The same default-Accept applies to a
+  missing filter key and to a cross-family mismatch, and the separate
+  TX-selection path has its own Accept defaults
+  (`TxSelectionFilterResult` / `CachedTxSelectionFilterResult`). Junos
+  stateless firewall filters instead carry an implicit final **discard**:
+  a packet matching no explicit term is silently dropped. xpf keeps
+  implicit-accept as the no-match default ON PURPOSE and does NOT flip it
+  to discard. A global flip would blackhole the classify-and-pass OUTPUT
+  filter idiom that rides the implicit accept — concretely the CoS
+  `bandwidth-output` filters attached as `interfaces reth0 unit 80 family
+  inet/inet6 filter output` (a pure dest-port allowlist with no final
+  catch-all), whose unmatched egress would be dropped at TX selection
+  (`afxdp/tx/cos_classify.rs` gates `drop` on `action != Accept`). That
+  violates the project "keep GOOD" doctrine (#2124/#3261). The research
+  record is `docs/research/3295-filter-failopen/plan.md`.
+
+  **Operator workaround for Junos-style deny-by-default.** An operator
+  who wants Junos stateless-filter parity appends an explicit final
+  unconstrained term: `term <last> { then discard; }` (the inverse of
+  Junos's "write a final accept"). The Go control plane emits a commit
+  WARNING (`validateFilterNoCatchAllWarnings`,
+  `pkg/config/compiler_validate_warn.go`) for any filter attached to an
+  interface/lo0 input/output hook that has no terminal catch-all term, so
+  the divergence and the workaround are surfaced at commit; it is never a
+  commit error (implicit-accept is the documented default and a hard
+  reject would brick a previously-accepted config). A `then next term` /
+  modifier-only fall-through term is NOT a catch-all; a `then
+  routing-instance` PBR term terminates but is not accept/discard/reject
+  and so is also not treated as a catch-all.
+
   **Fall-through log action follows the terminal verdict (#2616).** A
   matched fall-through logging term records its identity
   (`filter_id`/`term_id`) into the accumulated `log_match`, but its
