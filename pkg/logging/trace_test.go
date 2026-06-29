@@ -326,13 +326,19 @@ func TestTraceWriter_RotationFailureObservable(t *testing.T) {
 	traceLogDir = dir
 	defer func() { traceLogDir = old }()
 
-	// FileCount=1 so the generation-shift loop does not run and cannot move our
-	// blocking directory aside before the primary rename.
-	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log", FileSize: 40, FileCount: 1})
+	// FileCount=1 / FileSize=40 so the generation-shift loop does not run and
+	// cannot move our blocking directory aside before the primary rename. These
+	// are below the #3424 commit bounds, so NewTraceWriter clamps them; set the
+	// writer fields directly afterward to exercise rotate() mechanics with the
+	// intended tiny size / single file (the clamp governs the config->writer
+	// path, not this white-box rotate() unit test).
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tw.Close()
+	tw.maxSize = 40
+	tw.maxFiles = 1
 
 	if _, err := tw.file.WriteString("0123456789012345678901234567890123456789\n"); err != nil {
 		t.Fatal(err)

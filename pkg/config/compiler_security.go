@@ -1417,6 +1417,25 @@ func flowTraceFileNameError(name string) error {
 	return nil
 }
 
+// Flow-trace rotation bounds (#3424). The persistent `security flow
+// traceoptions file <name> size <s> files <n>` knob was copied verbatim by the
+// compiler with no range check, so a committed `size 1 files 1000000000` made
+// every matching trace line exceed the threshold and turned each rotation into
+// a ~1e9-iteration rename loop run synchronously from the event callback under
+// the writer mutex (a per-event CPU storm). These bounds match the interactive
+// `monitor security flow file` limits (pkg/cli/monitor.go) so the persistent
+// and on-demand trace paths agree: a minimum size large enough that a normal
+// burst of trace lines does not rotate on every write, a 1 GiB ceiling, and a
+// small generation count whose rename loop is bounded. They are the single
+// source of truth for both the commit-time gate (validateFlowTraceSizeFilesAST)
+// and the runtime fail-safe clamp (logging.NewTraceWriter).
+const (
+	FlowTraceMinFileSize  = 10240      // bytes (10 KiB)
+	FlowTraceMaxFileSize  = 1073741824 // bytes (1 GiB)
+	FlowTraceMinFileCount = 2
+	FlowTraceMaxFileCount = 1000
+)
+
 // validateFlowTraceFileAST is the #3420 commit-time path-traversal gate for
 // `security flow traceoptions file <name>`. The compiler stores the filename
 // verbatim (compileFlow traceoptions: to.File = nodeVal(fileNode)) and
@@ -1586,6 +1605,126 @@ func validateFlowTraceFlagsAndFiltersAST(nodes []*Node, prefix string, lenient b
 							" (ignored: filter set to match-none)")
 						continue
 					}
+					return warnings, fmt.Errorf("%s", msg)
+				}
+			}
+		}
+	}
+	return warnings, nil
+}
+
+// flowTraceSizeFilesValues extracts the configured `size` and `files` raw
+// token strings (and whether each was present) from a
+// `security flow traceoptions file <name>` node, across every AST shape the
+// parser can produce:
+//
+//   - single-line hierarchical (`file foo size 100000 files 2;`, NewParser):
+//     the tokens land directly in fileNode.Keys[2:].
+//   - block hierarchical (`file foo { size 100000; files 2; }`): each token is
+//     a separate child node (Keys=["size","100000"], Keys=["files","2"]).
+//   - flat set (`set ... file foo size 100000 files 2`): the bracket/flat lexer
+//     COLLAPSES the trailing tokens onto ONE child node's Keys
+//     (Keys=["size","100000","files","2"]) — the #2419 multi-value-leaf shape.
+//
+// A single keyword scan over fileNode.Keys[2:] followed by every child node's
+// full Keys covers all three: in each shape the `size`/`files` keyword is
+// immediately followed by its value in the same Keys slice. The last
+// occurrence wins (a child-node value overrides a same-named flat token),
+// matching the original compileFlow ordering (children read after the flat
+// Keys loop). This is the single source of truth shared by compileFlow (what
+// the compiler stores) and validateFlowTraceSizeFilesAST (what the gate
+// checks), so the two cannot diverge.
+func flowTraceSizeFilesValues(fileNode *Node) (size string, sizeSet bool, files string, filesSet bool) {
+	scan := func(keys []string, from int) {
+		for i := from; i+1 < len(keys); i++ {
+			switch keys[i] {
+			case "size":
+				size, sizeSet = keys[i+1], true
+			case "files":
+				files, filesSet = keys[i+1], true
+			}
+		}
+	}
+	scan(fileNode.Keys, 2)
+	for _, child := range fileNode.Children {
+		scan(child.Keys, 0)
+	}
+	return size, sizeSet, files, filesSet
+}
+
+// validateFlowTraceSizeFilesAST is the #3424 commit-time range gate for
+// `security flow traceoptions file <name> size <s> files <n>`. The compiler
+// (compileFlow) parsed both tokens with strconv.Atoi and stored any positive
+// integer with no bounds, so a committed `size 1 files 1000000000` made every
+// matching trace line exceed the rotation threshold and turned each rotation
+// into a ~1e9-iteration rename loop run synchronously from the event callback
+// under the writer mutex — a per-event CPU storm (codex-review-097 M03). Both
+// tokens are single AST values SchemaValidate treats as opaque free text and
+// live in EITHER the file node's flat Keys[2:] or hierarchical size/files
+// children (a dual value-location SchemaValidate cannot express), so — like
+// the file/flag/filter gates above — they are range-checked here on the
+// group-expanded tree, mirroring flowTraceSizeFilesValues / compileFlow.
+//
+// The bounds (FlowTraceMin/MaxFileSize, FlowTraceMin/MaxFileCount) match the
+// interactive `monitor security flow file` limits so the persistent and
+// on-demand trace paths agree.
+//
+// Strict path (commit / commit-check, lenient=false): a non-integer or
+// out-of-range size/files is a hard compile error. Lenient path (load /
+// peer-sync, lenient=true): downgraded to a warning so an already-persisted or
+// peer-synced config an older binary accepted still boots — NewTraceWriter
+// clamps an out-of-range value to the same bounds at runtime, so a
+// leniently-loaded value cannot trigger the CPU storm (#1960 / #3261
+// fail-closed-on-load class).
+func validateFlowTraceSizeFilesAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, n := range nodes {
+		if n.Name() != "security" {
+			continue
+		}
+		secPath := joinNodePath(prefix, n.Keys)
+		flowNode := n.FindChild("flow")
+		if flowNode == nil {
+			continue
+		}
+		toNode := flowNode.FindChild("traceoptions")
+		if toNode == nil {
+			continue
+		}
+		fileNode := toNode.FindChild("file")
+		if fileNode == nil {
+			continue
+		}
+		filePath := joinNodePath(secPath, []string{"flow", "traceoptions", "file"})
+
+		size, sizeSet, files, filesSet := flowTraceSizeFilesValues(fileNode)
+
+		if sizeSet {
+			v, err := strconv.ParseInt(size, 10, 64)
+			if err != nil || v < FlowTraceMinFileSize || v > FlowTraceMaxFileSize {
+				path := joinNodePath(filePath, []string{"size"})
+				msg := fmt.Sprintf("%s: invalid trace file size %q "+
+					"(must be %d..%d bytes)",
+					path, size, FlowTraceMinFileSize, FlowTraceMaxFileSize)
+				if lenient {
+					warnings = append(warnings, msg+
+						" (ignored: clamped to a safe size at runtime)")
+				} else {
+					return warnings, fmt.Errorf("%s", msg)
+				}
+			}
+		}
+		if filesSet {
+			v, err := strconv.Atoi(files)
+			if err != nil || v < FlowTraceMinFileCount || v > FlowTraceMaxFileCount {
+				path := joinNodePath(filePath, []string{"files"})
+				msg := fmt.Sprintf("%s: invalid trace file count %q "+
+					"(must be %d..%d)",
+					path, files, FlowTraceMinFileCount, FlowTraceMaxFileCount)
+				if lenient {
+					warnings = append(warnings, msg+
+						" (ignored: clamped to a safe count at runtime)")
+				} else {
 					return warnings, fmt.Errorf("%s", msg)
 				}
 			}
@@ -1878,31 +2017,21 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		to := &FlowTraceoptions{}
 		if fileNode := toNode.FindChild("file"); fileNode != nil {
 			to.File = nodeVal(fileNode)
-			for i := 2; i < len(fileNode.Keys)-1; i++ {
-				switch fileNode.Keys[i] {
-				case "size":
-					if n, err := strconv.Atoi(fileNode.Keys[i+1]); err == nil {
-						to.FileSize = n
-					}
-				case "files":
-					if n, err := strconv.Atoi(fileNode.Keys[i+1]); err == nil {
-						to.FileCount = n
-					}
+			// Read size/files across every AST shape (single-line hierarchical,
+			// block hierarchical, and the #2419 flat-set collapsed child). The
+			// shared helper is the SSOT with validateFlowTraceSizeFilesAST so the
+			// gate checks exactly what is stored here. A non-integer value is left
+			// at zero (default applied downstream); the strict commit gate rejects
+			// it loudly before reaching here (#3424).
+			sizeStr, sizeSet, filesStr, filesSet := flowTraceSizeFilesValues(fileNode)
+			if sizeSet {
+				if n, err := strconv.Atoi(sizeStr); err == nil {
+					to.FileSize = n
 				}
 			}
-			// Also check children for hierarchical syntax
-			if sNode := fileNode.FindChild("size"); sNode != nil {
-				if v := nodeVal(sNode); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						to.FileSize = n
-					}
-				}
-			}
-			if fNode := fileNode.FindChild("files"); fNode != nil {
-				if v := nodeVal(fNode); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						to.FileCount = n
-					}
+			if filesSet {
+				if n, err := strconv.Atoi(filesStr); err == nil {
+					to.FileCount = n
 				}
 			}
 		}

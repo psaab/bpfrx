@@ -159,6 +159,20 @@ type compileOpts struct {
 	// check does NOT live there. Same doctrine as lenientFlowTraceFile.
 	lenientFlowTraceFilter bool
 
+	// lenientFlowTraceSizeFiles (#3424) downgrades the flow-trace size/files
+	// range gate (validateFlowTraceSizeFilesAST) from a hard compile error to a
+	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths: a
+	// persisted or peer-synced config carrying an out-of-range
+	// `security flow traceoptions file <name> size <s> files <n>` (e.g. the
+	// `size 1 files 1000000000` that an older binary accepted and that turned
+	// each rotation into a ~1e9-iteration rename storm under the writer mutex)
+	// must still boot — NewTraceWriter clamps an out-of-range value to the same
+	// FlowTraceMin/Max bounds at runtime, so a leniently-loaded value is
+	// fail-safe rather than a per-event CPU storm. Like the file/filter gates
+	// the size/files values are AST leaves SchemaValidate treats as opaque, so
+	// the check does NOT live there. Same doctrine as lenientFlowTraceFilter.
+	lenientFlowTraceSizeFiles bool
+
 	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
 	// compatibility gate (validateLogEventModeFormatStrict) from a hard
 	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
@@ -1192,6 +1206,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
 		lenientFlowTraceFilter:               true,
+		lenientFlowTraceSizeFiles:            true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1337,6 +1352,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
 		lenientFlowTraceFilter:               true,
+		lenientFlowTraceSizeFiles:            true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1538,6 +1554,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3424 flow-trace size/files range gate. The compiler stored any positive
+	// `size`/`files` integer verbatim; an absurd `size 1 files 1000000000`
+	// rotates on every trace line and runs a ~1e9-iteration rename loop under
+	// the writer mutex (a per-event CPU storm). Strict (commit / commit-check):
+	// reject an out-of-range value. Lenient (load / peer-sync): warn so a
+	// persisted/peer-synced value still boots — NewTraceWriter clamps to the
+	// same bounds at runtime.
+	flowTraceSizeWarnings, err := validateFlowTraceSizeFilesAST(
+		tree.Children, "", opts.lenientFlowTraceSizeFiles)
+	if err != nil {
+		return nil, err
+	}
+
 	// #2008 H9/H10 interface silent-drop gate. Runs on the group-expanded,
 	// inactive-pruned tree (apply-groups-inherited stanzas covered;
 	// `inactive:` stanzas already stripped upstream) and BEFORE section
@@ -1732,6 +1761,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceFileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceFilterWarnings...)
+	cfg.Warnings = append(cfg.Warnings, flowTraceSizeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)

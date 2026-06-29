@@ -214,6 +214,27 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 	if maxFiles <= 0 {
 		maxFiles = 3
 	}
+	// Clamp size/files to the same bounds the commit-time gate enforces
+	// (#3424). The strict gate rejects an out-of-range value, but a
+	// leniently-loaded or peer-synced config (the #1960 / #3261
+	// fail-closed-on-load class) can still carry one — e.g. the
+	// `size 1 files 1000000000` that turns every trace line into a rotation
+	// and each rotation into a ~1e9-iteration rename loop run synchronously
+	// from the event callback under tw.mu (a per-event CPU storm). Clamping
+	// here makes such a value fail-safe instead: a sub-minimum size cannot
+	// rotate on every line and an absurd file count cannot stall the writer.
+	// The unset defaults above (10MB / 3) already sit inside the bounds, so
+	// this only ever narrows an explicitly out-of-range value.
+	if maxSize < config.FlowTraceMinFileSize {
+		maxSize = config.FlowTraceMinFileSize
+	} else if maxSize > config.FlowTraceMaxFileSize {
+		maxSize = config.FlowTraceMaxFileSize
+	}
+	if maxFiles < config.FlowTraceMinFileCount {
+		maxFiles = config.FlowTraceMinFileCount
+	} else if maxFiles > config.FlowTraceMaxFileCount {
+		maxFiles = config.FlowTraceMaxFileCount
+	}
 
 	tw := &TraceWriter{
 		name:     name,
