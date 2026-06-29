@@ -193,6 +193,127 @@ func TestNATPoolStatsHandlerUsesRuntimeStatus(t *testing.T) {
 	}
 }
 
+// natIfaceSNATSessionsDP yields a fixed set of forward/reverse SNAT and
+// non-SNAT IPv4 sessions across two interface-mode rule-set zone pairs, plus
+// an ApplyResult zone map, so the REST handler can attribute each row.
+//
+// Zone IDs: trust=2, guest=4, wan=5.
+//   - 3 forward SNAT sessions trust(2)->wan(5)
+//   - 1 forward SNAT session  guest(4)->wan(5)
+//   - 1 reverse SNAT session trust->wan (must NOT count)
+//   - 1 forward NON-SNAT session trust->wan (must NOT count)
+type natIfaceSNATSessionsDP struct {
+	*dataplane.Manager
+	result *dataplane.ApplyResult
+}
+
+func (d *natIfaceSNATSessionsDP) IsLoaded() bool { return true }
+
+func (d *natIfaceSNATSessionsDP) LastApplyResult() *dataplane.ApplyResult {
+	return d.result.Clone()
+}
+
+func (d *natIfaceSNATSessionsDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	emit := func(ingress, egress uint16, reverse uint8, flags uint8) {
+		fn(dataplane.SessionKey{Protocol: 6}, dataplane.SessionValue{
+			IsReverse:   reverse,
+			Flags:       flags,
+			IngressZone: ingress,
+			EgressZone:  egress,
+		})
+	}
+	// 3 forward SNAT trust(2)->wan(5)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	// 1 forward SNAT guest(4)->wan(5)
+	emit(4, 5, 0, dataplane.SessFlagSNAT)
+	// reverse SNAT trust->wan: must be excluded
+	emit(5, 2, 1, dataplane.SessFlagSNAT)
+	// forward non-SNAT trust->wan: must be excluded
+	emit(2, 5, 0, dataplane.SessFlagDNAT)
+	return nil
+}
+
+func (d *natIfaceSNATSessionsDP) IterateSessionsV6(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return nil
+}
+
+func newIfaceNATStatsAPIStore(t *testing.T) *configstore.Store {
+	t.Helper()
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if _, err := store.LoadSet(`set security nat source rule-set trust-to-wan from zone trust
+set security nat source rule-set trust-to-wan to zone wan
+set security nat source rule-set trust-to-wan rule r1 match source-address 0.0.0.0/0
+set security nat source rule-set trust-to-wan rule r1 then source-nat interface
+set security nat source rule-set guest-to-wan from zone guest
+set security nat source rule-set guest-to-wan to zone wan
+set security nat source rule-set guest-to-wan rule r1 match source-address 0.0.0.0/0
+set security nat source rule-set guest-to-wan rule r1 then source-nat interface`); err != nil {
+		t.Fatalf("LoadSet() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	return store
+}
+
+// TestNATPoolStatsHandlerInterfaceModePerRuleSet is a FAIL-ON-REVERT guard for
+// #3417: each interface-mode source NAT row must report only the SNAT sessions
+// that traversed its own from/to zone pair, NOT the firewall-wide SNAT total.
+//
+// Fixture: 3 SNAT sessions on trust->wan, 1 on guest->wan, plus a reverse and
+// a non-SNAT session that must not count. The global SNAT total is 4. If the
+// attribution is reverted to counts.total / a global counter, BOTH rows report
+// 4 and the per-row assertions fail.
+func TestNATPoolStatsHandlerInterfaceModePerRuleSet(t *testing.T) {
+	dp := &natIfaceSNATSessionsDP{
+		Manager: dataplane.New(),
+		result: &dataplane.ApplyResult{
+			ZoneIDs: map[string]uint16{"trust": 2, "guest": 4, "wan": 5},
+		},
+	}
+	s := &Server{store: newIfaceNATStatsAPIStore(t), dp: dp}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/security/nat/source/pools", nil)
+	s.natPoolStatsHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Success bool               `json:"success"`
+		Data    []NATPoolStatsInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("success = false; body: %s", rr.Body.String())
+	}
+
+	got := map[string]int{}
+	for _, p := range resp.Data {
+		if !p.IsInterface {
+			t.Errorf("unexpected non-interface row %q", p.Name)
+			continue
+		}
+		got[p.Name] = p.UsedPorts
+	}
+	// trust->wan must report ONLY its 3 sessions; guest->wan ONLY its 1.
+	// The firewall-wide SNAT total is 4 — neither row may report it.
+	if got["trust->wan"] != 3 {
+		t.Errorf("trust->wan UsedPorts = %d, want 3 (per-rule-set, NOT global total 4)", got["trust->wan"])
+	}
+	if got["guest->wan"] != 1 {
+		t.Errorf("guest->wan UsedPorts = %d, want 1 (per-rule-set, NOT global total 4)", got["guest->wan"])
+	}
+}
+
 func TestNATRuleStatsHandlerReadsApplyResultOnce(t *testing.T) {
 	dp := &natApplyResultAPIDP{
 		Manager: dataplane.New(),

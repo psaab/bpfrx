@@ -96,6 +96,78 @@ set security nat source rule-set trust-to-untrust rule r2 then source-nat interf
 	return store
 }
 
+func newIfaceNATStatsGRPCStore(t *testing.T) *configstore.Store {
+	t.Helper()
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if _, err := store.LoadSet(`set security nat source rule-set trust-to-wan from zone trust
+set security nat source rule-set trust-to-wan to zone wan
+set security nat source rule-set trust-to-wan rule r1 match source-address 0.0.0.0/0
+set security nat source rule-set trust-to-wan rule r1 then source-nat interface
+set security nat source rule-set guest-to-wan from zone guest
+set security nat source rule-set guest-to-wan to zone wan
+set security nat source rule-set guest-to-wan rule r1 match source-address 0.0.0.0/0
+set security nat source rule-set guest-to-wan rule r1 then source-nat interface`); err != nil {
+		t.Fatalf("LoadSet() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	return store
+}
+
+// TestGetNATPoolStatsInterfaceModePerRuleSet is a FAIL-ON-REVERT guard for
+// #3417: each interface-mode pool row must report only the SNAT sessions that
+// traversed its own from/to zone pair, NOT the firewall-wide SNAT total.
+//
+// Two distinct interface-mode rule sets: trust->wan (3 SNAT sessions) and
+// guest->wan (1 SNAT session). The global SNAT total is 4. If the row UsedPorts
+// is reverted to counts.total, BOTH rows report 4 and the assertions fail.
+func TestGetNATPoolStatsInterfaceModePerRuleSet(t *testing.T) {
+	dp := &natSessionProviderGRPCDP{
+		Manager: dataplane.New(),
+		result: &dataplane.ApplyResult{
+			ZoneIDs: map[string]uint16{"trust": 2, "guest": 4, "wan": 5},
+		},
+		store: &natSessionGRPCStore{
+			v4: []dataplane.SessionValue{
+				{Flags: dataplane.SessFlagSNAT, IngressZone: 2, EgressZone: 5},
+				{Flags: dataplane.SessFlagSNAT, IngressZone: 2, EgressZone: 5},
+				{Flags: dataplane.SessFlagSNAT, IngressZone: 2, EgressZone: 5},
+				{Flags: dataplane.SessFlagSNAT, IngressZone: 4, EgressZone: 5},
+				// reverse + non-SNAT noise that must not count.
+				{Flags: dataplane.SessFlagSNAT, IsReverse: 1, IngressZone: 5, EgressZone: 2},
+				{Flags: dataplane.SessFlagDNAT, IngressZone: 2, EgressZone: 5},
+			},
+		},
+	}
+	s := &Server{store: newIfaceNATStatsGRPCStore(t), dp: dp}
+
+	resp, err := s.GetNATPoolStats(context.Background(), &pb.GetNATPoolStatsRequest{})
+	if err != nil {
+		t.Fatalf("GetNATPoolStats() error = %v", err)
+	}
+	if resp.TotalActiveTranslations != 4 {
+		t.Fatalf("TotalActiveTranslations = %d, want 4", resp.TotalActiveTranslations)
+	}
+	got := map[string]int32{}
+	for _, pool := range resp.Pools {
+		if !pool.IsInterface {
+			t.Errorf("unexpected non-interface pool %q", pool.Name)
+			continue
+		}
+		got[pool.Name] = pool.UsedPorts
+	}
+	if got["trust->wan"] != 3 {
+		t.Errorf("trust->wan UsedPorts = %d, want 3 (per-rule-set, NOT global total 4)", got["trust->wan"])
+	}
+	if got["guest->wan"] != 1 {
+		t.Errorf("guest->wan UsedPorts = %d, want 1 (per-rule-set, NOT global total 4)", got["guest->wan"])
+	}
+}
+
 func TestGetNATRuleStatsReadsApplyResultOnce(t *testing.T) {
 	dp := &natApplyResultGRPCDP{
 		Manager: dataplane.New(),

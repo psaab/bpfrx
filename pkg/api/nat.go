@@ -190,29 +190,50 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		})
 	}
 
-	// Interface-mode pools
+	// Interface-mode pools. Count forward SNAT sessions ONCE, keyed by the
+	// ingress/egress zone pair, so each interface-mode rule set reports only
+	// the sessions that traversed its own from/to zone — not the firewall-wide
+	// SNAT total attributed to every row (#3417). A partial scan under-counts
+	// interface-mode NAT usage; fail rather than report a healthy-but-low
+	// figure (#2469).
+	hasInterfaceRule := false
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {
 			if rule.Then.Interface {
-				used := 0
-				if s.dp != nil && s.dp.IsLoaded() {
-					// A partial scan under-counts interface-mode NAT
-					// usage; fail rather than report a healthy-but-low
-					// figure (#2469).
-					if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-						if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-							used++
-						}
-						return true
-					}); err != nil {
-						writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
-						return
-					}
-				}
+				hasInterfaceRule = true
+			}
+		}
+	}
+	ruleSetUsed := map[[2]string]int{}
+	if hasInterfaceRule && s.dp != nil && s.dp.IsLoaded() {
+		// Map zone ID -> name so the per-session ingress/egress zone IDs can
+		// be attributed to the configured from/to zone pair. Without the zone
+		// map (no apply result yet) attribution is impossible, so rows report
+		// 0 rather than a wrong aggregate.
+		var zoneByID map[uint16]string
+		if cr != nil {
+			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
+			for name, id := range cr.ZoneIDs {
+				zoneByID[id] = name
+			}
+		}
+		if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 && zoneByID != nil {
+				ruleSetUsed[[2]string{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
+			return
+		}
+	}
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			if rule.Then.Interface {
 				result = append(result, NATPoolStatsInfo{
 					Name:        fmt.Sprintf("%s->%s", rs.FromZone, rs.ToZone),
 					Address:     "interface",
-					UsedPorts:   used,
+					UsedPorts:   ruleSetUsed[[2]string{rs.FromZone, rs.ToZone}],
 					IsInterface: true,
 				})
 			}
