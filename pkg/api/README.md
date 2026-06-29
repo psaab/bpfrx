@@ -51,6 +51,25 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     the scoped global's real zones on its `from_zone`/`to_zone` labels
     (#3286) — an unscoped global keeps `*`/`*` — so counter-based
     validation is unambiguous on the canonical metrics surface.
+  - `GET /api/v1/security/screen` enumerates the configured screen
+    profiles. Each `ScreenInfo` carries the profile `name`, a `checks`
+    string list, and a `thresholds` map (keyed by check name). The
+    `checks` list and the shared helper are the single source of truth
+    with gRPC `GetScreen` (`config.ScreenChecks` /
+    `config.ScreenThresholds`, #3327) — before #3327 each API carried a
+    byte-identical copy that omitted `port-scan`, `ip-sweep`,
+    `limit-session-source`, `limit-session-destination`, and
+    `icmp-fragment` even though the compiler and userspace dataplane
+    (`pkg/dataplane/userspace/screens.go`) fully enforce them, so an
+    operator reading structured state saw active protection as absent.
+    The `checks` set is kept a superset of the dataplane-enforced set.
+    `thresholds` surfaces the configured numeric values (icmp/udp/syn
+    flood, port-scan, ip-sweep, session limits) — only explicitly-set
+    positive values appear, so a consumer can tell a default threshold
+    from an intentionally tight or accidentally clamped one. The
+    SYN-flood profile's several sub-thresholds are keyed individually
+    (`syn-flood-attack-threshold`, `-alarm-`, `-source-`,
+    `-destination-`, `-timeout`).
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
   consumers must drain. `?category=` (and `?severity=` on

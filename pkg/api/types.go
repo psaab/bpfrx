@@ -260,6 +260,12 @@ type RouteInfo struct {
 type ScreenInfo struct {
 	Name   string   `json:"name"`
 	Checks []string `json:"checks"`
+	// Thresholds carries the configured numeric screen thresholds keyed by
+	// check name (or by a syn-flood-specific key for the several syn-flood
+	// sub-thresholds). Only explicitly-configured positive values appear, so a
+	// consumer can distinguish a default threshold from an intentionally tight
+	// or accidentally clamped one (#3327). Omitted when no threshold is set.
+	Thresholds map[string]int `json:"thresholds,omitempty"`
 }
 
 // TextResponse wraps text output from commands.

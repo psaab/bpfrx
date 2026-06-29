@@ -266,6 +266,7 @@ func (s *Server) screenHandler(w http.ResponseWriter, _ *http.Request) {
 		if si.Checks == nil {
 			si.Checks = []string{}
 		}
+		si.Thresholds = config.ScreenThresholds(profile)
 		result = append(result, si)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
@@ -485,51 +486,10 @@ func policyActionStr(a config.PolicyAction) string {
 	}
 }
 
+// screenChecks delegates to config.ScreenChecks, the single source of truth
+// shared with gRPC (#3327). A nil profile (reachable on the tolerant / HA-sync
+// config path the runtime walker pkg/dataplane/userspace/screens.go skips)
+// renders as "no checks" rather than panicking on p.TCP.SynFlood (#3476).
 func screenChecks(p *config.ScreenProfile) []string {
-	// #3476: the Screen map is `map[string]*ScreenProfile`; the tolerant /
-	// HA-sync config path can leave a nil profile value the runtime walker
-	// (pkg/dataplane/userspace/screens.go) skips. Treat a nil profile as
-	// "no checks" so the REST/gRPC inventory renders it absent rather than
-	// panicking on p.TCP.SynFlood.
-	if p == nil {
-		return nil
-	}
-	var checks []string
-	if p.TCP.SynFlood != nil {
-		checks = append(checks, "syn-flood")
-	}
-	if p.TCP.Land {
-		checks = append(checks, "land")
-	}
-	if p.TCP.WinNuke {
-		checks = append(checks, "winnuke")
-	}
-	if p.TCP.SynFrag {
-		checks = append(checks, "syn-frag")
-	}
-	if p.TCP.SynFin {
-		checks = append(checks, "syn-fin")
-	}
-	if p.TCP.NoFlag {
-		checks = append(checks, "tcp-no-flag")
-	}
-	if p.TCP.FinNoAck {
-		checks = append(checks, "fin-no-ack")
-	}
-	if p.ICMP.PingDeath {
-		checks = append(checks, "ping-death")
-	}
-	if p.ICMP.FloodThreshold > 0 {
-		checks = append(checks, "icmp-flood")
-	}
-	if p.UDP.FloodThreshold > 0 {
-		checks = append(checks, "udp-flood")
-	}
-	if p.IP.SourceRouteOption {
-		checks = append(checks, "source-route-option")
-	}
-	if p.IP.TearDrop {
-		checks = append(checks, "tear-drop")
-	}
-	return checks
+	return config.ScreenChecks(p)
 }

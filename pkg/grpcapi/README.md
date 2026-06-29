@@ -139,6 +139,18 @@ contract.
   per-rule `match_from_zone`/`match_to_zone` proto fields (empty for an
   unscoped global). Showing the group `*`/`*` but dropping the per-rule
   scope is the #3286 blind spot.
+- `GetScreen` enumerates the configured screen profiles. `ScreenInfo`
+  carries `name`, the `checks` string list, and a `map<string,int64>
+  thresholds`. The `checks` list and thresholds come from the shared
+  `config.ScreenChecks` / `config.ScreenThresholds` helpers — the same
+  single source of truth the REST `GET /api/v1/security/screen` handler
+  uses (#3327). Before #3327 this RPC and the REST handler each carried a
+  byte-identical copy of the helper that omitted `port-scan`, `ip-sweep`,
+  `limit-session-source`, `limit-session-destination`, and
+  `icmp-fragment` (all enforced by `pkg/dataplane/userspace/screens.go`)
+  and exposed no thresholds — under-reporting active enforcement to a
+  structured-state consumer. The `checks` set is kept a superset of the
+  dataplane-enforced set; the duplicated-helper drift mechanism is gone.
 - Request-supplied numeric fields are signed on the wire and must be
   range-checked before they index/slice/size anything (#2282). `Complete`
   rejects a negative `pos` with `InvalidArgument` before slicing
