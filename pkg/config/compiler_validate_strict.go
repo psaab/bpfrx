@@ -3141,6 +3141,36 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"configured one)",
 				name, app.UnknownTimeouts[0], appTimeoutMin, appTimeoutMax)
 		}
+		// #3348: an icmp-type/icmp-code constraint is only meaningful on an
+		// ICMP/ICMPv6 protocol. The userspace matcher keys icmp_constraints
+		// under the ICMP protocol number (userspace-dp policy.rs), and the
+		// pkg/policymatch simulator only consults app.ICMPType when the query
+		// protocol is ICMP/ICMPv6 — so a type/code on tcp/udp/gre/... compiles a
+		// term that can never match (fail-open for a deny rule, fail-closed for a
+		// permit rule), the same #3373 hazard as a port on a non-port protocol.
+		// Junos couples icmp-type/code to an ICMP application, so reject at COMMIT
+		// (strict-at-commit / #1960 fail-closed). The call site downgrades to a
+		// warning on the tolerant load / peer-sync path.
+		if (app.ICMPType != nil || app.ICMPCode != nil) && !protocolIsICMPFamily(app.Protocol) {
+			return fmt.Errorf(
+				"application %q: icmp-type/icmp-code is set on protocol %q, which is "+
+					"not an ICMP protocol; an ICMP type/code constraint is valid only on "+
+					"icmp/icmpv6 (or the junos-ping/junos-pingv6/junos-icmp-all aliases, "+
+					"or protocol number 1/58) — on any other protocol the term can never "+
+					"match (remove the constraint or change the protocol)",
+				name, app.Protocol)
+		}
+		// A code with no type leaves the matcher constraining the code while
+		// ignoring the type (pkg/policymatch matchSingleApp checks ICMPCode
+		// independently of ICMPType), an ambiguous half-constraint Junos does not
+		// allow. Require a type whenever a code is set.
+		if app.ICMPCode != nil && app.ICMPType == nil {
+			return fmt.Errorf(
+				"application %q: icmp-code is set without icmp-type; an ICMP code is "+
+					"meaningful only together with a type (set icmp-type as well, or "+
+					"remove icmp-code)",
+				name)
+		}
 	}
 	return nil
 }
@@ -4148,6 +4178,25 @@ func protocolIsPortBearing(token string) bool {
 		// ports (ip_proto.rs has_l4_ports).
 		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
 			return n == 6 || n == 17
+		}
+		return false
+	}
+}
+
+// protocolIsICMPFamily reports whether a protocol token names ICMP or ICMPv6 —
+// the only protocols on which an application `icmp-type`/`icmp-code` constraint
+// is enforceable (#3348). It recognizes the canonical names, the junos-*
+// aliases that resolve to ICMP/ICMPv6 (including junos-ping/junos-pingv6, which
+// carry an implicit echo type), and the numeric protocol numbers 1 (ICMP) and
+// 58 (ICMPv6). The set mirrors the ICMP arm of filterProtocolResolvable.
+func protocolIsICMPFamily(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "icmp", "junos-icmp-all", "junos-ping",
+		"icmpv6", "icmp6", "junos-icmp6-all", "junos-pingv6":
+		return true
+	default:
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
+			return n == 1 || n == 58
 		}
 		return false
 	}
