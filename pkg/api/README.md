@@ -202,6 +202,30 @@ under the daemon's errgroup. Nothing else imports this package.
   EXACTLY (case-insensitive), not by substring — `protocol=C` no longer
   over-matches TCP/ICMP/ICMPv6. These contracts are pinned by
   `rest_filter_failclosed_test.go` in this package.
+- The `GET /api/v1/security/sessions` view mirrors the gRPC `GetSessions`
+  session contract (#3419). The REST `SessionEntry` previously diverged from
+  gRPC — `age_seconds` carried IDLE time (now-LastSeen) instead of wall age,
+  a session with both SNAT and DNAT lost the SNAT part (the DNAT branch
+  overwrote the single `nat` string), the reverse entry's counters were not
+  merged into the forward entry, and the application/interface/policy-name/
+  zone-name/session-id/ha-active fields were absent. The handler now:
+  - splits `age_seconds` (now-`Created`) from `idle_seconds` (now-`LastSeen`);
+  - joins BOTH NAT parts in `nat` and exposes structured `nat_src_addr/port`
+    and `nat_dst_addr/port`;
+  - merges the companion reverse entry's counters via `GetSessionV4/V6`
+    (added to `apiRuntimeDataPlane`) so top-talkers/accounting report full
+    bidirectional volume;
+  - resolves `application` (`appid.ResolveSessionName`), `ingress_interface`/
+    `egress_interface` (FIB ifindex+VLAN → unit name), `policy_name`,
+    `ingress_zone_name`/`egress_zone_name`, `session_id`, and `ha_active`
+    (wired from the daemon via `HAActiveFn`, default true standalone).
+
+  It also accepts the gRPC filter set: `application=`, `interface=`,
+  `nat_only=true`, and `source_nat_pool=<pool>` (an unresolved pool fails
+  CLOSED with HTTP 400, like the gRPC `sessionFilter.validate`). The numeric
+  `policy_id`/`ingress_zone`/`egress_zone` fields are retained for
+  compatibility. Pagination/clear (limit/offset cursor, filtered clear) are
+  tracked separately (#3421/#3423). Pinned by `sessions_parity_test.go`.
 - `GET /api/v1/security/match` (`matchPoliciesHandler`) is a THIN adapter
   over the single shared policy simulator `pkg/policymatch` (#3042). It only
   validates/parses inputs (400 on a malformed IP/port) and renders the
