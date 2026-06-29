@@ -1,3 +1,29 @@
+## 2026-06-29 — #3366 Codex/SMR MINOR fold: pin the value-aware idempotent-accept path (PR #3540)
+
+- **Timestamp**: 2026-06-29
+- **Action**: SMR MINOR fold for PR #3540 (#3366). The duplicate scalar
+  term-leaf rejection in `parseApplicationTerms` is value-AWARE — a
+  repeat with the SAME value is harmless (no value is silently lost) and
+  COMMITS; only a CONFLICTING different-value repeat is rejected. That
+  idempotent-accept path (`if dstPortSet && v != dstPort` etc. at the
+  destination-port / source-port / inactivity-timeout|timeout / alg arms)
+  was correct but had NO committed test pinning it, so a future
+  value-blind refactor (drop the `&& v != …` value comparison) would
+  silently start over-rejecting legitimate idempotent configs undetected.
+  Added `TestApplicationTerm_DuplicateScalarLeaf_Idempotent_Accepted`
+  pinning four idempotent same-value cases — repeated `destination-port
+  22`, repeated `source-port 1024`, repeated `alg ftp`, and the
+  `inactivity-timeout 1800` + `timeout 1800` alias-same-value case (both
+  keywords set the same field). Config built via ParseSetCommand +
+  tree.SetPath (flatTreeFromSets/unrefAppOnly), per CLAUDE.md.
+- **File(s)**: pkg/config/compiler_application_mixed_term_3366_test.go
+- **Validation**: `go test ./pkg/config/` green; gofmt clean. RED-on-
+  revert experiment: flipping all four arms value-blind (`if dstPortSet {`
+  …) turns the new idempotent test RED on all four subcases while
+  `TestApplicationTerm_DuplicateScalarLeaf_Rejected` stays green —
+  confirming the test genuinely guards the idempotent path. Reverted the
+  flip; tree clean.
+
 ## 2026-06-29 — #3363 Codex MEDIUM fold: structured gRPC GetPolicies default-policy parity (PR #3528)
 
 - **Timestamp**: 2026-06-29
@@ -23548,3 +23574,6 @@ top.
     No code change. Rebased on origin/master first (union _Log.md). go test
     ./pkg/config/ ./pkg/logging/ green; gofmt clean.
   - **File(s)**: pkg/config/compiler.go, _Log.md
+- **Timestamp**: 2026-06-29T12:30Z
+  - **Action**: #3366 application EITHER direct OR term-based; conflicting duplicate term leaf. compileApplications now records a parent that mixes a direct match body (protocol/destination-port/source-port/inactivity-timeout/timeout/icmp-type/icmp-code/alg) with `term` sub-blocks on ApplicationsConfig.MixedDirectTermApps; before, the term-store branch kept only the synthesized term apps and silently DROPPED the direct match (fail-open under-match for a deny app). parseApplicationTerms now records a CONFLICTING (different-value) repeat of a single-valued scalar term leaf (destination-port/source-port/inactivity-timeout/timeout/alg) on Application.DuplicateTermLeaves — was last-writer-wins; idempotent same-value repeats (timeout/inactivity-timeout aliases set equal) and repeated `protocol` (multi-protocol syntax) are not flagged. New gate validateApplicationStructureStrict rejects both at commit over ALL user-defined apps (referenced or not, like the #3352/#3353 syntactic gate); lenient-warn on CompileConfigLenient/peer-sync (#1960). Updated existing over-rejection guard test (it had mixed a direct body with a term and expected acceptance — split into two apps). RED-on-revert verified (disable gate -> mixed + duplicate tests fail). go test ./pkg/config ./pkg/appid ./pkg/dataplane/userspace green; go vet clean; gofmt clean.
+  - **File(s)**: pkg/config/compiler_applications.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/types_security.go, pkg/config/compiler_application_mixed_term_3366_test.go, pkg/config/compiler_application_term_alg_3352_3353_test.go, pkg/config/README.md, docs/config-schema.md, _Log.md

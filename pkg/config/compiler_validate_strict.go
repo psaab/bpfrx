@@ -3592,6 +3592,80 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 	return nil
 }
 
+// validateApplicationStructureStrict hard-rejects two STRUCTURAL errors in a
+// user-defined application that Junos rejects at commit regardless of whether
+// the application is wired into a policy (the same all-user-apps scope as
+// validateApplicationSyntaxStrict, NOT the reference-scoped semantic specs):
+//
+//   - #3366 mixed direct + term: an application carrying BOTH a direct match
+//     body (protocol / destination-port / source-port / inactivity-timeout /
+//     timeout / icmp-type / icmp-code / alg) AND one or more `term` sub-blocks.
+//     compileApplications stores only the synthesized term applications for a
+//     term-bearing app (the `if len(terms) > 0` branch), so the direct match was
+//     SILENTLY DROPPED — for a deny application that erases a deny match and lets
+//     traffic fall through to a later permit or the default policy (a fail-open
+//     under-match). Junos requires a custom application to be EITHER scalar OR
+//     term-based; reject the mix at commit. compileApplications records the
+//     parent name on cfg.Applications.MixedDirectTermApps.
+//
+//   - #3366 duplicate scalar term leaf: a single-valued leaf (destination-port /
+//     source-port / inactivity-timeout / timeout / alg) repeated with a
+//     CONFLICTING value inside one inline term. The term is opaque to the
+//     SchemaValidate walk, so the repeat was last-writer-wins — the earlier value
+//     silently overwritten by parse order, narrowing/widening the term with no
+//     commit error. An idempotent same-value repeat is accepted; a repeated
+//     `protocol` is the documented multi-protocol-term syntax and is NOT flagged.
+//     parseApplicationTerms records the offending leaf names on
+//     Application.DuplicateTermLeaves.
+//
+// Strict on the commit / commit-check path; the call site (compiler.go,
+// lenientApplicationSpecs) downgrades a returned error to a warning on the
+// tolerant load / peer-sync path so an already-persisted or older-peer-synced
+// config still BOOTS (#1960 no-brick). Iteration is sorted so the first-reported
+// error is deterministic across runs.
+func validateApplicationStructureStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// #3366 mixed direct + term — reject the parent application by name.
+	if len(cfg.Applications.MixedDirectTermApps) > 0 {
+		mixed := append([]string(nil), cfg.Applications.MixedDirectTermApps...)
+		sort.Strings(mixed)
+		return fmt.Errorf(
+			"application %q: a custom application may define EITHER a direct match "+
+				"body (protocol / destination-port / source-port / "+
+				"inactivity-timeout / timeout / icmp-type / icmp-code / alg) OR one or "+
+				"more `term` sub-blocks, not both — Junos rejects the mix, and the "+
+				"compiler silently dropped the direct match (keeping only the terms), "+
+				"which for a deny application erases the deny and lets traffic fall "+
+				"through. Move the direct match into its own `term`",
+			mixed[0])
+	}
+	// #3366 duplicate scalar leaf inside an inline term.
+	if len(cfg.Applications.Applications) > 0 {
+		names := make([]string, 0, len(cfg.Applications.Applications))
+		for name := range cfg.Applications.Applications {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			app := cfg.Applications.Applications[name]
+			if app == nil || len(app.DuplicateTermLeaves) == 0 {
+				continue
+			}
+			return fmt.Errorf(
+				"application %q: conflicting duplicate %q inside `term`; a single-valued "+
+					"term leaf (destination-port / source-port / inactivity-timeout / "+
+					"timeout / alg) may carry only one value — a repeat with a different "+
+					"value is last-writer-wins and silently overrides the earlier one by "+
+					"token order (use repeated `protocol` only for an intentional "+
+					"multi-protocol term)",
+				name, app.DuplicateTermLeaves[0])
+		}
+	}
+	return nil
+}
+
 // applicationsToValidateStrict returns the set of user-defined application
 // names whose port/protocol spec is validated as a hard COMMIT error rather
 // than a warning. That is every user application referenced (directly, or as a
