@@ -22855,3 +22855,29 @@ top.
   - **File(s)**: pkg/config/compiler_applications.go,
     pkg/config/compiler_application_destport_names_3340_test.go,
     pkg/config/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3349 — validate security log stream/top-level fields that
+    were parsed but committed without enum/range validation (audit fail-open).
+    Typed schema leaves for mode/format/severity/facility/category/
+    source-address/source-interface (strict-commit / lenient-load via
+    SchemaValidate); new ValidateSyslogSourceInterface for non-numeric units;
+    new validateSecurityLogStreamPortsAST compiler pass for the dual-location
+    port (direct + nested host{port}), strict on commit / lenient on load.
+    Enum sets pinned to pkg/logging parsers. Added RED-on-revert tests.
+  - **File(s)**: pkg/config/schema_security.go,
+    pkg/config/schema_validators.go, pkg/config/compiler.go,
+    pkg/config/compiler_security.go,
+    pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3349 fold (Codex MAJOR) — event-mode log format silent
+    fallback. Top-level `security log format` feeds the event-mode
+    LocalLogWriter which only honors binary/standard text, so structured/
+    sd-syslog validated then silently fell back. Added cross-field
+    validateLogEventModeFormatStrict (strict commit / lenient load),
+    event-mode format support matrix in docs, tests, filed follow-up #3409
+    for event-mode structured/sd-syslog support.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler.go,
+    pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md

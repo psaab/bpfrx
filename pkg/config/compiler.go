@@ -107,6 +107,29 @@ type compileOpts struct {
 	// SchemaValidate (tcp-mss stays opaque there).
 	lenientTCPMSSRange bool
 
+	// lenientLogStreamPort (#3349) downgrades the security-log stream port
+	// range gate (validateSecurityLogStreamPortsAST) from a hard compile
+	// error to a cfg.Warnings entry. Set ONLY on the tolerant load /
+	// peer-sync paths: a persisted or peer-synced config carrying a
+	// non-numeric / out-of-range `stream port` (or nested `host { port }`)
+	// that an older binary accepted — and that the compiler still maps to the
+	// default 514 — must still boot, not blackout the upgraded node (#1960
+	// fail-closed-on-load class). Like the tcp-mss gate this is an AST-level
+	// compile decision (the port value can live in two positions) and so does
+	// NOT live in SchemaValidate. Same doctrine as lenientTCPMSSRange.
+	lenientLogStreamPort bool
+
+	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
+	// compatibility gate (validateLogEventModeFormatStrict) from a hard
+	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
+	// peer-sync paths: a persisted or peer-synced config carrying
+	// `mode event; format structured|sd-syslog` (which an older binary
+	// accepted and the event writer silently renders as standard text) must
+	// still boot, not blackout the upgraded node (#1960 fail-closed-on-load
+	// class). The runtime already falls back, so a leniently-loaded value is
+	// inert. Same doctrine as lenientLogProfileStreamRef.
+	lenientLogEventModeFormat bool
+
 	// lenientNATPoolAlarmThreshold (#2079) downgrades the
 	// security-nat-source pool-utilization-alarm threshold gate
 	// (validatePoolUtilizationAlarm) from a hard compile error to a
@@ -1085,6 +1108,8 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDeviceMap:                     true,
 		lenientPolicyMatchAddress:            true,
 		lenientTCPMSSRange:                   true,
+		lenientLogStreamPort:                 true,
+		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
 		lenientIPsecGatewayRefs:              true,
@@ -1222,6 +1247,8 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientDeviceMap:                     true,
 		lenientPolicyMatchAddress:            true,
 		lenientTCPMSSRange:                   true,
+		lenientLogStreamPort:                 true,
+		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
 		lenientIPsecGatewayRefs:              true,
@@ -1359,6 +1386,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// Lenient (load / peer-sync): warn + let Layer A coerce so an upgraded
 	// node loading a legacy out-of-range MSS still boots.
 	mssWarnings, err := validateTCPMSSRanges(tree.Children, "", opts.lenientTCPMSSRange)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3349 security-log stream port range gate. The syslog port lives in two
+	// AST locations (direct `stream port` and nested `host { port }`) that the
+	// declarative SchemaValidate walker cannot express, so — like tcp-mss — it
+	// is range-checked here on the group-expanded tree, BEFORE compileLog
+	// swallows a bad value and silently keeps the default 514. Strict (commit
+	// / commit-check): a non-numeric / out-of-range port hard-rejects. Lenient
+	// (load / peer-sync): warn so an already-persisted or peer-synced config
+	// still boots.
+	logStreamPortWarnings, err := validateSecurityLogStreamPortsAST(tree.Children, "", opts.lenientLogStreamPort)
 	if err != nil {
 		return nil, err
 	}
@@ -1533,6 +1573,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, ctrlCharWarnings...)
 	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
+	cfg.Warnings = append(cfg.Warnings, logStreamPortWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
@@ -2366,6 +2407,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientLogProfileStreamRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("security log profile stream reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3349 follow-up: event-mode log-format compatibility. The top-level
+	// `security log format` is schema-validated to a known format in any mode,
+	// but the EVENT-mode local-file writer only honors binary / standard text
+	// — `structured` and `sd-syslog` silently fall back to standard text. That
+	// silent no-op is the exact failure #3349 closes, so reject an
+	// event-incompatible format at commit (cross-field rule the per-leaf
+	// SchemaValidate gate cannot express). Strict on commit / commit-check;
+	// lenient on load / peer-sync (warn — the runtime already falls back, so a
+	// leniently-loaded value is inert rather than bricking the load).
+	if err := validateLogEventModeFormatStrict(cfg); err != nil {
+		if opts.lenientLogEventModeFormat {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("security log event-mode format (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
