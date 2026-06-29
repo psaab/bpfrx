@@ -2380,6 +2380,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3366: structural application errors (a direct match body mixed with
+	// `term` sub-blocks, or a duplicate single-valued leaf inside one term) are
+	// rejected for ALL user-defined applications — referenced or not — like the
+	// #3352/#3353 syntactic gate above. Mixing a direct body with terms silently
+	// dropped the direct match (the term-store branch keeps only the terms), and
+	// a repeated scalar term leaf was last-writer-wins; both are Junos config
+	// errors caught at definition. Lenient-downgrade on the tolerant load /
+	// peer-sync path (#1960 no-brick).
+	if err := validateApplicationStructureStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application structure (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
 	// commit / commit-check (hard-reject a term whose protocol token is not
 	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a

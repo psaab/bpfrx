@@ -174,13 +174,16 @@ func TestApplicationALG_UnknownName_Unreferenced_Rejected(t *testing.T) {
 }
 
 // Guard against over-rejection: an UNREFERENCED user app with only valid leaves
-// and a supported alg still commits cleanly.
+// and a supported alg still commits cleanly. Direct-body and term-based apps are
+// kept SEPARATE — mixing a direct match body with `term` sub-blocks is itself a
+// commit error (#3366), so the over-rejection guard uses two distinct apps.
 func TestApplicationTermALG_Unreferenced_Valid_Accepted(t *testing.T) {
-	tree := flatTreeFromSets(t, unrefAppOnly("lonely",
-		"protocol tcp", "destination-port 22", "alg ftp",
-		"term t protocol udp destination-port 53 alg dns")...)
+	sets := append(
+		unrefAppOnly("directapp", "protocol tcp", "destination-port 22", "alg ftp"),
+		unrefAppOnly("termapp", "term t protocol udp destination-port 53 alg dns")...)
+	tree := flatTreeFromSets(t, sets...)
 	if _, err := CompileConfig(tree); err != nil {
-		t.Fatalf("expected commit to accept a well-formed UNREFERENCED app: %v", err)
+		t.Fatalf("expected commit to accept well-formed UNREFERENCED apps: %v", err)
 	}
 }
 
