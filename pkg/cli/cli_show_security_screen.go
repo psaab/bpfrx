@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 )
@@ -42,48 +43,16 @@ func (c *CLI) showScreen() error {
 		}
 		fmt.Printf("Screen profile: %s\n", name)
 
-		// TCP checks
-		if profile.TCP.Land {
-			fmt.Println("  TCP LAND attack detection: enabled")
-		}
-		if profile.TCP.SynFin {
-			fmt.Println("  TCP SYN+FIN detection: enabled")
-		}
-		if profile.TCP.NoFlag {
-			fmt.Println("  TCP no-flag detection: enabled")
-		}
-		if profile.TCP.FinNoAck {
-			fmt.Println("  TCP FIN-no-ACK detection: enabled")
-		}
-		if profile.TCP.WinNuke {
-			fmt.Println("  TCP WinNuke detection: enabled")
-		}
-		if profile.TCP.SynFrag {
-			fmt.Println("  TCP SYN fragment detection: enabled")
-		}
-		if profile.TCP.SynFlood != nil {
-			fmt.Printf("  TCP SYN flood protection: attack-threshold %d\n",
-				profile.TCP.SynFlood.AttackThreshold)
-		}
-
-		// ICMP checks
-		if profile.ICMP.PingDeath {
-			fmt.Println("  ICMP ping-of-death detection: enabled")
-		}
-		if profile.ICMP.FloodThreshold > 0 {
-			fmt.Printf("  ICMP flood protection: threshold %d\n",
-				profile.ICMP.FloodThreshold)
-		}
-
-		// IP checks
-		if profile.IP.SourceRouteOption {
-			fmt.Println("  IP source-route option detection: enabled")
-		}
-
-		// UDP checks
-		if profile.UDP.FloodThreshold > 0 {
-			fmt.Printf("  UDP flood protection: threshold %d\n",
-				profile.UDP.FloodThreshold)
+		// #3327: drive the enabled-check inventory from the cross-package SSOT
+		// (config.ScreenEnabledCheckList -> config.ScreenChecks /
+		// config.ScreenThresholds) instead of a hand-built presence list that
+		// omitted port-scan, ip-sweep, the source/destination session limits,
+		// and icmp-fragment even though the compiler and userspace dataplane
+		// fully enforce them. One line per enabled check, threshold-bearing
+		// checks annotated with the configured value — the local-CLI peer of
+		// the gRPC showScreen renderer, sharing the same SSOT so neither drifts.
+		for _, c := range config.ScreenEnabledCheckList(profile) {
+			fmt.Printf("  %s\n", c)
 		}
 
 		// Zones using this profile
@@ -203,8 +172,32 @@ func (c *CLI) showScreenIdsOption(name string) error {
 	if profile.IP.SourceRouteOption {
 		fmt.Printf("  %-45s %s\n", "IP source route option", "enabled")
 	}
+	if profile.IP.TearDrop {
+		fmt.Printf("  %-45s %s\n", "IP teardrop (tear-drop)", "enabled")
+	}
 	if profile.UDP.FloodThreshold > 0 {
 		fmt.Printf("  %-45s %d\n", "UDP flood threshold", profile.UDP.FloodThreshold)
+	}
+	// #3327: this enabled-only status table is the same class of hand-built
+	// inventory as the detail table — before #3327 it omitted icmp-fragment,
+	// port-scan, ip-sweep, and the source/destination session limits even
+	// though they are enforced. Surface them (the trailing token matches the
+	// canonical config.ScreenCheck* name) so no screen-inventory renderer
+	// drifts from the config.ScreenChecks SSOT. Mirrors gRPC showScreenIDSOption.
+	if profile.ICMP.Fragment {
+		fmt.Printf("  %-45s %s\n", "ICMP fragment (icmp-fragment)", "enabled")
+	}
+	if profile.TCP.PortScanThreshold > 0 {
+		fmt.Printf("  %-45s %d\n", "TCP port scan (port-scan)", profile.TCP.PortScanThreshold)
+	}
+	if profile.IP.IPSweepThreshold > 0 {
+		fmt.Printf("  %-45s %d\n", "IP sweep (ip-sweep)", profile.IP.IPSweepThreshold)
+	}
+	if profile.LimitSession.SourceIPBased > 0 {
+		fmt.Printf("  %-45s %d\n", "Session limit source (limit-session-source)", profile.LimitSession.SourceIPBased)
+	}
+	if profile.LimitSession.DestinationIPBased > 0 {
+		fmt.Printf("  %-45s %d\n", "Session limit destination (limit-session-destination)", profile.LimitSession.DestinationIPBased)
 	}
 
 	// Show zones using this profile
@@ -309,6 +302,35 @@ func (c *CLI) showScreenIdsOptionDetail(name string) error {
 			profile.UDP.FloodThreshold, "1000")
 	} else {
 		fmt.Printf("  %-45s %-12s %s\n", "UDP flood threshold", "disabled", "disabled")
+	}
+
+	// #3327: this is the full-universe detail view (every check with its value
+	// AND default, including disabled ones), so it cannot be driven by the
+	// enabled-only config.ScreenChecks list; instead it is completed with a row
+	// for each of the five previously-omitted checks (icmp-fragment, port-scan,
+	// ip-sweep, the source/destination session limits) so it can no longer
+	// drift from the enforced set. Mirrors gRPC showScreenIDSOptionDetail.
+	fmt.Printf("  %-45s %-12s %s\n", "ICMP fragment (icmp-fragment)",
+		enabledStr(profile.ICMP.Fragment), "disabled")
+	if profile.TCP.PortScanThreshold > 0 {
+		fmt.Printf("  %-45s %-12d %s\n", "TCP port scan (port-scan)", profile.TCP.PortScanThreshold, "disabled")
+	} else {
+		fmt.Printf("  %-45s %-12s %s\n", "TCP port scan (port-scan)", "disabled", "disabled")
+	}
+	if profile.IP.IPSweepThreshold > 0 {
+		fmt.Printf("  %-45s %-12d %s\n", "IP sweep (ip-sweep)", profile.IP.IPSweepThreshold, "disabled")
+	} else {
+		fmt.Printf("  %-45s %-12s %s\n", "IP sweep (ip-sweep)", "disabled", "disabled")
+	}
+	if profile.LimitSession.SourceIPBased > 0 {
+		fmt.Printf("  %-45s %-12d %s\n", "Session limit source (limit-session-source)", profile.LimitSession.SourceIPBased, "disabled")
+	} else {
+		fmt.Printf("  %-45s %-12s %s\n", "Session limit source (limit-session-source)", "disabled", "disabled")
+	}
+	if profile.LimitSession.DestinationIPBased > 0 {
+		fmt.Printf("  %-45s %-12d %s\n", "Session limit destination (limit-session-destination)", profile.LimitSession.DestinationIPBased, "disabled")
+	} else {
+		fmt.Printf("  %-45s %-12s %s\n", "Session limit destination (limit-session-destination)", "disabled", "disabled")
 	}
 
 	// Zones using this profile

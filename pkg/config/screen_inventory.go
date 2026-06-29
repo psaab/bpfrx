@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // Screen inventory presentation (#3327).
 //
 // REST (`GET /api/v1/security/screen`) and gRPC (`GetScreen`) both expose a
@@ -170,4 +172,38 @@ func ScreenThresholds(p *ScreenProfile) map[string]int {
 		return nil
 	}
 	return thresholds
+}
+
+// ScreenEnabledCheckList renders the enabled screen checks for a profile as a
+// stable, SSOT-sourced list, each threshold-bearing token annotated with its
+// configured value (e.g. "icmp-flood(threshold:1000)"). It is the single
+// rendering of the enabled-screen inventory shared by every enabled-only text
+// renderer — REST/gRPC `show security zones`/`show security screen` and the
+// equivalent local-CLI views — so none of them can drift from ScreenChecks /
+// ScreenThresholds (#3327). Before #3327 each renderer hand-built its own
+// presence list and silently omitted port-scan, ip-sweep, the source/
+// destination session limits, and icmp-fragment even though the compiler and
+// userspace dataplane fully enforce them. A nil profile or one with no enabled
+// check returns nil.
+func ScreenEnabledCheckList(p *ScreenProfile) []string {
+	checks := ScreenChecks(p)
+	if len(checks) == 0 {
+		return nil
+	}
+	thresholds := ScreenThresholds(p)
+	out := make([]string, 0, len(checks))
+	for _, c := range checks {
+		// SYN-flood keys its numeric value under the attack-threshold key
+		// rather than the bare "syn-flood" presence token.
+		key := c
+		if c == ScreenCheckSynFlood {
+			key = ScreenThreshSynFloodAttack
+		}
+		if v, ok := thresholds[key]; ok {
+			out = append(out, fmt.Sprintf("%s(threshold:%d)", c, v))
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }

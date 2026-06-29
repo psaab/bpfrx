@@ -450,6 +450,9 @@ func (s *Server) showScreenIDSOption(req *pb.ShowTextRequest, cfg *config.Config
 			if profile.IP.SourceRouteOption {
 				fmt.Fprintf(buf, "  IP source route option                      enabled\n")
 			}
+			if profile.IP.TearDrop {
+				fmt.Fprintf(buf, "  IP teardrop (tear-drop)                     enabled\n")
+			}
 			if profile.UDP.FloodThreshold > 0 {
 				fmt.Fprintf(buf, "  UDP flood threshold                         %d\n",
 					profile.UDP.FloodThreshold)
@@ -709,26 +712,9 @@ func (s *Server) showScreenIDSOptionDetail(req *pb.ShowTextRequest, cfg *config.
 // ip-sweep, the source/destination session limits, and icmp-fragment even
 // though the compiler and userspace dataplane fully enforce them.
 func screenEnabledCheckList(profile *config.ScreenProfile) []string {
-	checks := config.ScreenChecks(profile)
-	if len(checks) == 0 {
-		return nil
-	}
-	thresholds := config.ScreenThresholds(profile)
-	out := make([]string, 0, len(checks))
-	for _, c := range checks {
-		// SYN-flood keys its numeric value under the attack-threshold key
-		// rather than the bare "syn-flood" presence token.
-		key := c
-		if c == config.ScreenCheckSynFlood {
-			key = config.ScreenThreshSynFloodAttack
-		}
-		if v, ok := thresholds[key]; ok {
-			out = append(out, fmt.Sprintf("%s(threshold:%d)", c, v))
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
+	// Delegate to the cross-package SSOT so the gRPC, REST, and local-CLI
+	// enabled-check renderers share one rendering and cannot drift (#3327).
+	return config.ScreenEnabledCheckList(profile)
 }
 
 func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {

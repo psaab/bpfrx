@@ -23595,6 +23595,41 @@ top.
     clean; regenerated the deterministic golden (server_show_golden.json) for
     the screen + screen-ids-option-detail topics (deliberate output change).
   - **File(s)**: pkg/grpcapi/server_show_zones_text.go, pkg/grpcapi/server_show_security_text.go, pkg/grpcapi/server_show_screen_inventory_text_3327_test.go (new), pkg/grpcapi/testdata/server_show_golden.json, _Log.md
+- **Timestamp**: 2026-06-29T16:45Z
+  - **Action**: #3327 Codex MERGE-NEEDS-MAJOR fold #2 (PR #3538). The first
+    text-renderer fold (cc0cd6c28) unified the gRPC text renderers but the
+    "no second divergent screen-inventory list remains" gate was still
+    violated on the LOCAL CLI (entirely untouched) and one gRPC site lacked a
+    tear-drop row. Fixes: (1) promoted the enabled-check rendering to a
+    cross-package SSOT `config.ScreenEnabledCheckList` (moved out of the
+    grpcapi-private helper; the grpcapi `screenEnabledCheckList` now delegates
+    to it, output-identical so the gRPC golden is unchanged). (2) Routed the
+    two enabled-only CLI summary renderers through it: `show security screen`
+    (pkg/cli/cli_show_security_screen.go showScreen) and the `show security
+    zones` detail "Enabled checks" line (pkg/cli/cli_show_security_zones.go) —
+    both previously hand-built lists omitting port-scan, ip-sweep,
+    limit-session-source, limit-session-destination, icmp-fragment. (3)
+    Completed the two value-bearing CLI tables with a row per omitted check
+    (mirroring the gRPC siblings, since the canonical-token list cannot carry
+    their per-check value/default columns): showScreenIdsOption (enabled-only
+    status table; also added the missing tear-drop row) and
+    showScreenIdsOptionDetail (full-universe). (4) Added the missing tear-drop
+    row to the gRPC showScreenIDSOption status table so its enabled-only table
+    is non-divergent too (golden-neutral: the untrust-screen fixture does not
+    enable tear-drop). RED-on-revert: new pkg/cli test drives all four CLI
+    renderers with a maximal profile and asserts each of the five omitted
+    checks appears; reverting any one of the four delegations/row-blocks fails
+    the matching subtest (verified each individually). GOLDEN call (#5): the
+    canonical-token form for `show security screen` (e.g. `syn-flood(threshold
+    :200)`, `land`) loses no essential info vs the prior verbose lines — check
+    identity and thresholds are both preserved and the richer per-check value
+    breakdown remains in `show security screen ids-option [detail]`; KEEP
+    canonical (it also unifies the summary with the structured/zones tokens).
+    No golden regen needed this fold (all changes output-neutral on the
+    fixture). go test ./pkg/cli/ ./pkg/grpcapi/ ./pkg/api/ ./pkg/config/
+    green; gofmt clean; go vet ./pkg/cli ./pkg/grpcapi clean (the lone
+    unreachable-code warning is pre-existing in untouched cli.go).
+  - **File(s)**: pkg/config/screen_inventory.go, pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_zones.go, pkg/grpcapi/server_show_security_text.go, pkg/cli/cli_show_security_screen_inventory_3327_test.go (new), _Log.md
 - **Timestamp**: 2026-06-29T15:30Z
   - **Action**: #3375 grpcapi MatchPolicies blank-action parity. The gRPC MatchPolicies RPC returned a BLANK `action` for two verdicts where REST returned an explicit string: (1) a `to-zone junos-host` query matching no host-bound policy (HostInboundUnmatched), (2) the no-active-config case (empty response). It also lacked a typed default-used bit. Fix: added SSOT `policymatch.HostInboundActionString` const + `policymatch.Result.DisplayAction()` renderer (host-inbound -> the host string; no-match -> "<action> (default)"; match -> "<action>"); both REST and gRPC now route ALL action rendering through DisplayAction so they cannot diverge. gRPC host-inbound now returns the host string; gRPC nil-config returns "deny (default)" + default_used=true. Added typed `default_used` to proto MatchPoliciesResponse (field 12, regenerated xpf.pb.go) and REST MatchPoliciesResult JSON, populated from policymatch.Result.DefaultUsed. CLI multi-line match-policies output already self-describing -> unchanged. RED-on-revert verified on BOTH surfaces (gRPC: revert -> blank action + default_used unset fail; REST: drop DefaultUsed copy -> default_used assertion fails). go test ./pkg/grpcapi/ ./pkg/policymatch/ ./pkg/api/ ./pkg/cli/ green; gofmt clean; go vet clean on touched packages.
   - **File(s)**: pkg/policymatch/policymatch.go, pkg/grpcapi/server_cluster.go, pkg/api/security.go, pkg/api/types.go, proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/README.md, pkg/policymatch/display_action_3375_test.go, pkg/grpcapi/server_matchpolicies_action_3375_test.go, pkg/api/security_matchpolicies_action_3375_test.go, _Log.md
