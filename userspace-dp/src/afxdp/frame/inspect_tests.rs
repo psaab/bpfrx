@@ -435,8 +435,12 @@ fn meta_fallback_icmpv4_error_control_installs_no_session() {
 #[test]
 fn meta_fallback_icmpv6_error_control_nd_installs_no_session() {
     // Dest-Unreachable (1), Packet-Too-Big (2), Time-Exceeded (3),
-    // Parameter-Problem (4), and the ND/MLD types (133..137).
-    for icmp_type in [1u8, 2u8, 3u8, 4u8, 133u8, 134u8, 135u8, 136u8, 137u8] {
+    // Parameter-Problem (4), the MLD types (130 Query / 131 Report / 132 Done
+    // / 143 MLDv2 Report), and the ND types (133..137 Router/Neighbor
+    // Solicit/Advert + Redirect).
+    for icmp_type in [
+        1u8, 2u8, 3u8, 4u8, 130u8, 131u8, 132u8, 133u8, 134u8, 135u8, 136u8, 137u8, 143u8,
+    ] {
         let frame = v6_frame(PROTO_ICMPV6, 8, &icmp_l4(icmp_type, ICMP_HOSTILE_PORT));
         let meta = UserspaceDpMeta {
             addr_family: libc::AF_INET6 as u8,
@@ -480,4 +484,34 @@ fn meta_fallback_icmpv4_echo_still_keys_on_identifier() {
         assert_eq!(flow.forward_key.src_port, ICMP_IDENT);
         assert_eq!(flow.forward_key.dst_port, 0);
     }
+}
+
+#[test]
+fn meta_fallback_icmpv4_truncated_echo_installs_no_session() {
+    // #3290 (frame-equivalence): an Echo (query) packet truncated between the
+    // type byte and its 2-byte Identifier. `parse_flow_ports` returns None
+    // here because the identifier END lies past the IP-declared datagram, so
+    // the metadata gate must ALSO reject it — otherwise the shim's pseudo-port
+    // (read from bytes outside the declared identifier) would still install a
+    // metadata-keyed session. declared total_len = 24 -> declared end at frame
+    // offset 38: the type byte (offset 34) is inside, the identifier
+    // [38..40) is NOT. Checking only the type byte (the pre-fold behavior)
+    // would wrongly admit the meta fallback -> RED on revert.
+    let frame = v4_frame(PROTO_ICMP, 24, &icmp_l4(8, ICMP_IDENT));
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        l3_offset: 14,
+        l4_offset: V4_ICMP_L4 as u16,
+        flow_src_port: ICMP_HOSTILE_PORT,
+        flow_dst_port: 0,
+        flow_src_addr: [192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        flow_dst_addr: [192, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ..UserspaceDpMeta::default()
+    };
+    assert_eq!(
+        parse_session_flow_from_bytes(&frame, meta),
+        None,
+        "a query packet truncated before its identifier must not install a metadata-keyed session"
+    );
 }

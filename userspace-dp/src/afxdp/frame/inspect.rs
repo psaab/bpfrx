@@ -968,14 +968,26 @@ pub(in crate::afxdp) fn icmp_identifier_bearing(protocol: u8, icmp_type: u8) -> 
     }
 }
 
-/// #3290: read the ICMP/ICMPv6 type byte from the frame, bounded by the
-/// IP-declared datagram end (the #2361 fail-closed invariant), and report
-/// whether it is an identifier-bearing query type. Returns `false` (fail
-/// closed -> suppress the metadata pseudo-port fallback) when the L3 header
-/// is malformed, the type byte is truncated, or it lies past the declared
-/// datagram end (trailing slack is not authoritative). Only used to gate the
-/// metadata fallback; the frame parsers re-derive the type independently.
-fn meta_icmp_identifier_bearing(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+/// #3290: report whether the metadata-stamped ICMP/ICMPv6 pseudo-port may be
+/// trusted as a stateful identifier — frame-EQUIVALENT to the
+/// `parse_flow_ports` gate. Two conditions must hold, both bounded by the
+/// IP-declared datagram end (the #2361 fail-closed invariant, since trailing
+/// slack is not authoritative):
+///
+/// 1. the ICMP type byte at `l4` lies inside the declared datagram AND is an
+///    identifier-bearing query type, and
+/// 2. the full 2-byte Identifier at `[l4+4..l4+6)` ALSO lies inside the
+///    declared datagram.
+///
+/// Condition 2 is what `parse_flow_ports` enforces with its `ident_end >
+/// declared_end` check: a query packet truncated between the type byte and the
+/// identifier yields `None` there, so the meta gate must agree or the shim's
+/// pseudo-port (read from bytes outside the declared datagram) would still
+/// install a metadata-keyed session. Returns `false` (fail closed -> suppress
+/// the metadata pseudo-port fallback) on any malformed/truncated input. Only
+/// gates the metadata fallback; the frame parsers re-derive the type
+/// independently.
+pub(in crate::afxdp) fn meta_icmp_identifier_bearing(frame: &[u8], meta: UserspaceDpMeta) -> bool {
     let l3 = meta.l3_offset as usize;
     let l4 = meta.l4_offset as usize;
     let declared_end = match meta.addr_family as i32 {
@@ -988,6 +1000,12 @@ fn meta_icmp_identifier_bearing(frame: &[u8], meta: UserspaceDpMeta) -> bool {
     };
     if l4 >= declared_end {
         return false;
+    }
+    // Frame-equivalent to parse_flow_ports: the identifier bytes [l4+4..l4+6)
+    // must lie within the IP-declared datagram, not merely the type byte.
+    match l4.checked_add(6) {
+        Some(ident_end) if ident_end <= declared_end => {}
+        _ => return false,
     }
     match frame.get(l4) {
         Some(&icmp_type) => icmp_identifier_bearing(meta.protocol, icmp_type),
