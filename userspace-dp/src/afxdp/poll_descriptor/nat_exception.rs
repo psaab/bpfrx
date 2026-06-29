@@ -57,6 +57,10 @@ pub(super) fn source_nat_decision_for_flow(
     if let Some((decision, counter)) = forwarding.static_nat.match_snat_with_counter_scoped(
         flow.src_ip,
         flow.forward_key.src_port,
+        // #3435: gate the reverse static SNAT on the packet DESTINATION (the
+        // original client) against `match source-address`, symmetric with the
+        // inbound DNAT source gate.
+        Some(flow.forward_key.dst_ip),
         to_zone,
         scope.egress_ifname,
         scope.egress_routing_instance,

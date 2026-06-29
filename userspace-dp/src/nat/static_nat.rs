@@ -2,9 +2,91 @@
 
 use super::{NatCounterStore, NatDecision, NatRuleCounter};
 use crate::StaticNATRuleSnapshot;
+use crate::prefix::{PrefixV4, PrefixV6};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+
+/// #3435: parsed `match source-address` constraint for a static-NAT rule.
+/// Mirrors the DNAT #2394 model. `constrained` records whether the rule HAD a
+/// source-address list at all (snapshot non-empty), independent of how many
+/// entries PARSED, so a scoped rule whose entries ALL failed to parse fails
+/// CLOSED (matches no peer) instead of silently reverting to match-any (the
+/// #3435 H01 fail-open). The inbound (DNAT) direction matches the packet
+/// SOURCE against this constraint; the reverse (SNAT) direction matches the
+/// packet DESTINATION (the original client).
+#[derive(Clone, Debug, Default)]
+struct SourceConstraint {
+    constrained: bool,
+    v4: Vec<PrefixV4>,
+    v6: Vec<PrefixV6>,
+}
+
+impl SourceConstraint {
+    /// Parse the snapshot's `source_addresses` list. Each entry is a CIDR
+    /// prefix or a bare host IP (-> /32 / /128). `IpNet::from_str` rejects a
+    /// bare IP, so fall back to `IpAddr` for that. An unparseable entry is
+    /// skipped but still leaves `constrained = true` (fail-closed semantics).
+    fn from_list(list: &[String]) -> Self {
+        let constrained = !list.is_empty();
+        let mut v4: Vec<PrefixV4> = Vec::new();
+        let mut v6: Vec<PrefixV6> = Vec::new();
+        for prefix in list {
+            match prefix.parse::<IpNet>() {
+                Ok(IpNet::V4(net)) => v4.push(PrefixV4::from_net(net)),
+                Ok(IpNet::V6(net)) => v6.push(PrefixV6::from_net(net)),
+                Err(_) => match prefix.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(a)) => {
+                        if let Ok(net) = Ipv4Net::new(a, 32) {
+                            v4.push(PrefixV4::from_net(net));
+                        }
+                    }
+                    Ok(IpAddr::V6(a)) => {
+                        if let Ok(net) = Ipv6Net::new(a, 128) {
+                            v6.push(PrefixV6::from_net(net));
+                        }
+                    }
+                    Err(_) => {}
+                },
+            }
+        }
+        Self { constrained, v4, v6 }
+    }
+
+    /// Does `peer` satisfy the constraint?
+    /// - Unconstrained (no list): match any.
+    /// - Constrained but no entry parsed: match NOTHING (fail closed).
+    /// - Otherwise: `peer` must fall in one parsed prefix of its own family.
+    fn matches(&self, peer: IpAddr) -> bool {
+        if !self.constrained {
+            return true;
+        }
+        if self.v4.is_empty() && self.v6.is_empty() {
+            // Scoped but no entry parsed -> fail closed (the #3435 / #2394
+            // fail-open guard).
+            return false;
+        }
+        match peer {
+            IpAddr::V4(v4) => self.v4.iter().any(|n| n.contains(v4)),
+            IpAddr::V6(v6) => self.v6.iter().any(|n| n.contains(v6)),
+        }
+    }
+}
+
+/// #3435: evaluate a static-NAT entry's source-address constraint against the
+/// candidate peer. `peer` is `None` only on the test / zone-only non-scoped
+/// wrappers (which carry no peer IP); those paths skip the source gate. The
+/// production transit path always supplies `Some(..)` via the `*_scoped`
+/// variants — the inbound peer is the packet SOURCE, the reverse peer is the
+/// packet DESTINATION.
+#[inline]
+fn source_ok(constraint: &SourceConstraint, peer: Option<IpAddr>) -> bool {
+    match peer {
+        Some(ip) => constraint.matches(ip),
+        None => true,
+    }
+}
 
 /// #3096: does a static-NAT rule's `from` scope (zone + interface +
 /// routing-instance, each empty = wildcard) match the packet's context on the
@@ -42,6 +124,11 @@ pub(crate) struct StaticNatEntry {
     /// #2491: internal (post-translation) destination port to rewrite to.
     /// `None` = no port translation (whole-address 1:1).
     pub(crate) mapped_port: Option<u16>,
+    /// #3435: `match source-address` constraint. Gated against the packet
+    /// SOURCE on the inbound (DNAT) direction and against the packet
+    /// DESTINATION (the original client) on the reverse (SNAT) direction.
+    /// Unconstrained = match any peer (unchanged behavior).
+    source: SourceConstraint,
     /// #2218: per-rule translation hit counter (None for counter_id 0).
     pub(crate) hit_counter: Option<Arc<NatRuleCounter>>,
 }
@@ -85,6 +172,9 @@ pub(crate) struct StaticNatBlock {
     /// #3096: interface-/routing-instance scope, gated like the host entry.
     from_interface: String,
     from_routing_instance: String,
+    /// #3435: `match source-address` constraint, gated like the host entry
+    /// (packet SOURCE on inbound DNAT, packet DESTINATION on reverse SNAT).
+    source: SourceConstraint,
     /// Per-rule translation hit counter (#2218); None for counter_id 0.
     hit_counter: Option<Arc<NatRuleCounter>>,
 }
@@ -264,6 +354,7 @@ impl StaticNatTable {
                     from_zone: snap.from_zone.clone(),
                     from_interface: snap.from_interface.clone(),
                     from_routing_instance: snap.from_routing_instance.clone(),
+                    source: SourceConstraint::from_list(&snap.source_addresses),
                     hit_counter: nat_counters.rule_counter(snap.counter_id),
                 });
                 continue;
@@ -290,6 +381,7 @@ impl StaticNatTable {
                 from_routing_instance: snap.from_routing_instance.clone(),
                 match_dst_port,
                 mapped_port,
+                source: SourceConstraint::from_list(&snap.source_addresses),
                 hit_counter: nat_counters.rule_counter(snap.counter_id),
             };
             // DNAT keyed by the external (pre-translation) destination port.
@@ -354,9 +446,10 @@ impl StaticNatTable {
         ingress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
         // Unscoped wrapper: empty interface/RI scope = wildcard (pre-#3096
-        // behavior). Tests and zone-only callers use this; the production
-        // transit path uses the *_scoped variant.
-        self.match_dnat_with_counter_scoped(dst_ip, dst_port, ingress_zone, "", "")
+        // behavior); `None` source = skip the #3435 source gate (this is the
+        // test / zone-only path that carries no peer IP). The production
+        // transit path uses the *_scoped variant with the real packet source.
+        self.match_dnat_with_counter_scoped(dst_ip, dst_port, None, ingress_zone, "", "")
     }
 
     /// #3096: as [`match_dnat_with_counter`] but additionally gates each
@@ -364,16 +457,24 @@ impl StaticNatTable {
     /// `from routing-instance` scope against the packet's INGRESS interface
     /// config-name and routing-instance. Empty scope fields are wildcards, so
     /// a zone-only or global static-NAT rule is unaffected.
+    ///
+    /// #3435: `src_ip` is the inbound packet's SOURCE address, matched against
+    /// each candidate's `match source-address` constraint. `None` skips the
+    /// source gate (the non-scoped / test wrappers); the production path
+    /// passes `Some(packet source)`. A source-scoped rule whose source list is
+    /// non-empty but parses to nothing matches NO source (fail closed).
     pub(crate) fn match_dnat_with_counter_scoped(
         &self,
         dst_ip: IpAddr,
         dst_port: u16,
+        src_ip: Option<IpAddr>,
         ingress_zone: &str,
         ingress_ifname: &str,
         ingress_routing_instance: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
         // Per-candidate gate: an entry matches only when its zone AND
-        // interface AND routing-instance constraints all hold (empty = any).
+        // interface AND routing-instance constraints all hold (empty = any)
+        // AND its #3435 source-address constraint admits the packet source.
         let zone_ok = |entry: &&StaticNatEntry| {
             static_scope_ok(
                 &entry.from_zone,
@@ -382,7 +483,7 @@ impl StaticNatTable {
                 ingress_zone,
                 ingress_ifname,
                 ingress_routing_instance,
-            )
+            ) && source_ok(&entry.source, src_ip)
         };
         // Port-specific entry takes precedence over the whole-address entry,
         // but only if its OWN zone check passes. On a port miss OR a
@@ -418,7 +519,8 @@ impl StaticNatTable {
                 ingress_zone,
                 ingress_ifname,
                 ingress_routing_instance,
-            ) && blk.external.contains(dst_ip)
+            ) && source_ok(&blk.source, src_ip)
+                && blk.external.contains(dst_ip)
             {
                 if let Some(translated) = remap_addr(dst_ip, &blk.external, &blk.internal) {
                     return Some((
@@ -481,8 +583,9 @@ impl StaticNatTable {
         src_port: u16,
         egress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
-        // Unscoped wrapper: empty interface/RI scope = wildcard (pre-#3096).
-        self.match_snat_with_counter_scoped(src_ip, src_port, egress_zone, "", "")
+        // Unscoped wrapper: empty interface/RI scope = wildcard (pre-#3096);
+        // `None` peer = skip the #3435 source gate (test / zone-only path).
+        self.match_snat_with_counter_scoped(src_ip, src_port, None, egress_zone, "", "")
     }
 
     /// #3096: as [`match_snat_with_counter`] but additionally gates each
@@ -492,10 +595,18 @@ impl StaticNatTable {
     /// DNAT ingress gate (the rule's `from` external context is matched on
     /// egress for the reverse translation, symmetric with #2871's egress-zone
     /// gate). Empty scope fields are wildcards.
+    ///
+    /// #3435: `dst_ip` is the outbound packet's DESTINATION — the original
+    /// client — matched against each candidate's `match source-address`
+    /// constraint (the reverse-direction analog of the inbound source gate, so
+    /// the static mapping's source scoping holds symmetrically on the return
+    /// path). `None` skips the gate (test / non-scoped wrappers); production
+    /// passes `Some(packet destination)`.
     pub(crate) fn match_snat_with_counter_scoped(
         &self,
         src_ip: IpAddr,
         src_port: u16,
+        dst_ip: Option<IpAddr>,
         egress_zone: &str,
         egress_ifname: &str,
         egress_routing_instance: &str,
@@ -503,7 +614,9 @@ impl StaticNatTable {
         // #2871 / #3096: per-candidate egress gate — zone AND interface AND
         // routing-instance must all hold (empty = any). Evaluate PER CANDIDATE
         // so a port-specific entry whose scope does not match falls back to the
-        // whole-address entry rather than short-circuiting to None.
+        // whole-address entry rather than short-circuiting to None. #3435: the
+        // source-address constraint is matched against the DESTINATION (the
+        // original client) on this reverse direction.
         let zone_ok = |entry: &&StaticNatEntry| {
             static_scope_ok(
                 &entry.from_zone,
@@ -512,7 +625,7 @@ impl StaticNatTable {
                 egress_zone,
                 egress_ifname,
                 egress_routing_instance,
-            )
+            ) && source_ok(&entry.source, dst_ip)
         };
         if let Some(entry) = self
             .snat
@@ -546,7 +659,8 @@ impl StaticNatTable {
                 egress_zone,
                 egress_ifname,
                 egress_routing_instance,
-            ) && blk.internal.contains(src_ip)
+            ) && source_ok(&blk.source, dst_ip)
+                && blk.internal.contains(src_ip)
             {
                 if let Some(translated) = remap_addr(src_ip, &blk.internal, &blk.external) {
                     return Some((

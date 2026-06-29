@@ -570,6 +570,7 @@ fn reverse_decision_turns_snat_into_reply_dnat() {
 fn static_nat_dnat_matches_external_ip_v4() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
@@ -597,6 +598,7 @@ fn static_nat_dnat_matches_external_ip_v4() {
 fn static_nat_snat_matches_internal_ip_v4() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "trust".to_string(),
@@ -624,6 +626,7 @@ fn static_nat_snat_matches_internal_ip_v4() {
 fn static_nat_dnat_matches_external_ip_v6() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-v6".to_string(),
             from_zone: "untrust".to_string(),
@@ -651,6 +654,7 @@ fn static_nat_dnat_matches_external_ip_v6() {
 fn static_nat_snat_matches_internal_ip_v6() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-v6".to_string(),
             from_zone: "trust".to_string(),
@@ -680,6 +684,7 @@ fn static_nat_snat_matches_internal_ip_v6() {
 
 fn block_snapshot(ext: &str, int: &str, from_zone: &str) -> StaticNATRuleSnapshot {
     StaticNATRuleSnapshot {
+        source_addresses: Vec::new(),
         counter_id: 0,
         name: "block-1".to_string(),
         from_zone: from_zone.to_string(),
@@ -832,6 +837,7 @@ fn static_nat_host_v4_unchanged_with_block_support() {
     // pre-#3031 (exact 1:1, no offset math). Both directions.
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
@@ -871,6 +877,7 @@ fn static_nat_host_v4_unchanged_with_block_support() {
 fn static_nat_zone_mismatch_returns_none_for_dnat() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
@@ -913,6 +920,7 @@ fn static_nat_zone_mismatch_returns_none_for_dnat() {
 fn static_nat_snat_honors_egress_zone() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "web-server".to_string(),
             // External zone of the rule: reverse SNAT applies only when the
@@ -959,6 +967,7 @@ fn static_nat_snat_honors_egress_zone() {
 fn static_nat_snat_empty_zone_matches_any_egress() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "wildcard".to_string(),
             from_zone: String::new(),
@@ -984,6 +993,7 @@ fn static_nat_snat_empty_zone_matches_any_egress() {
 fn static_nat_empty_zone_matches_any() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-any".to_string(),
             from_zone: String::new(),
@@ -1017,6 +1027,7 @@ fn static_nat_empty_zone_matches_any() {
 fn static_nat_bidirectional_reverse() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
@@ -1062,6 +1073,7 @@ fn static_nat_bidirectional_reverse() {
 fn static_nat_no_match_returns_none() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
@@ -1091,6 +1103,7 @@ fn static_nat_invalid_ip_skipped() {
     let table = StaticNatTable::from_snapshots(
         &[
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "bad".to_string(),
                 from_zone: String::new(),
@@ -1102,6 +1115,7 @@ fn static_nat_invalid_ip_skipped() {
                 mapped_port: 0,
             },
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "good".to_string(),
                 from_zone: String::new(),
@@ -1128,6 +1142,7 @@ fn static_nat_external_ips_iterator() {
     let table = StaticNatTable::from_snapshots(
         &[
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "s1".to_string(),
                 from_zone: String::new(),
@@ -1139,6 +1154,7 @@ fn static_nat_external_ips_iterator() {
                 mapped_port: 0,
             },
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "s2".to_string(),
                 from_zone: String::new(),
@@ -1170,6 +1186,7 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
     // the unfixed code (table is empty, every assertion is None).
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-cidr".to_string(),
             from_zone: "untrust".to_string(),
@@ -1211,6 +1228,7 @@ fn static_nat_canonical_cidr_mask_v6_installs_entry() {
     // IPv6 canonical host form carries /128; same root cause as the v4 case.
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "static-cidr-v6".to_string(),
             from_zone: "untrust".to_string(),
@@ -1250,6 +1268,7 @@ fn static_nat_cidr_and_bare_coexist() {
     let table = StaticNatTable::from_snapshots(
         &[
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "masked".to_string(),
                 from_zone: String::new(),
@@ -1261,6 +1280,7 @@ fn static_nat_cidr_and_bare_coexist() {
                 mapped_port: 0,
             },
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "bare".to_string(),
                 from_zone: String::new(),
@@ -1314,6 +1334,7 @@ fn static_nat_non_host_mask_rejected() {
     ] {
         let table = StaticNatTable::from_snapshots(
             &[StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "bad-mask".to_string(),
                 from_zone: String::new(),
@@ -1338,6 +1359,7 @@ fn static_nat_non_host_mask_rejected() {
 
 fn mapped_port_snapshot() -> StaticNATRuleSnapshot {
     StaticNATRuleSnapshot {
+        source_addresses: Vec::new(),
         counter_id: 0,
         name: "port-map".to_string(),
         from_zone: "untrust".to_string(),
@@ -1412,6 +1434,7 @@ fn static_nat_port_mapped_and_whole_address_coexist() {
         &[
             mapped_port_snapshot(), // 203.0.113.1:8080 -> 10.0.0.5:80
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "whole".to_string(),
                 from_zone: "untrust".to_string(),
@@ -1445,6 +1468,7 @@ fn static_nat_port_mapped_and_whole_address_coexist() {
 fn static_nat_mapped_port_without_match_port_demotes_to_whole_address() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "orphan".to_string(),
             from_zone: "untrust".to_string(),
@@ -1483,6 +1507,7 @@ fn static_nat_mapped_port_without_match_port_demotes_to_whole_address() {
 fn static_nat_match_port_without_mapped_port_scopes_reverse_snat() {
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "port-scoped-1to1".to_string(),
             from_zone: "untrust".to_string(),
@@ -1551,6 +1576,7 @@ fn static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address() {
             // Port-specific entry constrained to a DIFFERENT zone than the
             // packet will arrive on. (203.0.113.1:8080 from "dmz" -> 10.0.0.5:80)
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "port-dmz".to_string(),
                 from_zone: "dmz".to_string(),
@@ -1563,6 +1589,7 @@ fn static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address() {
             },
             // Whole-address entry valid for the packet's actual ingress zone.
             StaticNATRuleSnapshot {
+                source_addresses: Vec::new(),
                 counter_id: 0,
                 name: "whole-untrust".to_string(),
                 from_zone: "untrust".to_string(),
@@ -5919,6 +5946,7 @@ fn parsed_nat_rules_share_store_counters() {
     // Static NAT entry with a counter.
     let static_tbl = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             name: "static-counted".to_string(),
             from_zone: "untrust".to_string(),
             from_interface: String::new(),
@@ -6454,6 +6482,7 @@ fn static_nat_dnat_from_interface_scope_matches_only_named_iface() {
     let counters = NatCounterStore::default();
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             name: "stat".to_string(),
             from_interface: "ge-0/0/1.0".to_string(),
             external_ip: "203.0.113.10".to_string(),
@@ -6466,14 +6495,14 @@ fn static_nat_dnat_from_interface_scope_matches_only_named_iface() {
     // On the named interface -> DNAT applies.
     assert!(
         table
-            .match_dnat_with_counter_scoped(ext, 0, "", "ge-0/0/1.0", "")
+            .match_dnat_with_counter_scoped(ext, 0, None, "", "ge-0/0/1.0", "")
             .is_some(),
         "interface-scoped static DNAT must match on the named ingress interface"
     );
     // On a different interface -> no DNAT.
     assert!(
         table
-            .match_dnat_with_counter_scoped(ext, 0, "", "ge-0/0/2.0", "")
+            .match_dnat_with_counter_scoped(ext, 0, None, "", "ge-0/0/2.0", "")
             .is_none(),
         "interface-scoped static DNAT must NOT match on another ingress interface"
     );
@@ -6486,6 +6515,7 @@ fn static_nat_snat_from_interface_scope_matches_only_named_egress() {
     let counters = NatCounterStore::default();
     let table = StaticNatTable::from_snapshots(
         &[StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             name: "stat".to_string(),
             from_interface: "ge-0/0/1.0".to_string(),
             external_ip: "203.0.113.10".to_string(),
@@ -6497,15 +6527,173 @@ fn static_nat_snat_from_interface_scope_matches_only_named_egress() {
     let int: IpAddr = "192.168.1.10".parse().unwrap();
     assert!(
         table
-            .match_snat_with_counter_scoped(int, 0, "", "ge-0/0/1.0", "")
+            .match_snat_with_counter_scoped(int, 0, None, "", "ge-0/0/1.0", "")
             .is_some(),
         "interface-scoped static SNAT must match on the named egress interface"
     );
     assert!(
         table
-            .match_snat_with_counter_scoped(int, 0, "", "ge-0/0/2.0", "")
+            .match_snat_with_counter_scoped(int, 0, None, "", "ge-0/0/2.0", "")
             .is_none(),
         "interface-scoped static SNAT must NOT match on another egress interface"
+    );
+}
+
+// #3435 (H01): static-NAT `match source-address` must gate the inbound DNAT
+// translation on the packet SOURCE. Before #3435 the constraint was dropped at
+// the snapshot boundary, installing an all-source mapping that exposed the
+// internal host to ANY source. Fail-on-revert: dropping the `source_ok` gate
+// makes the out-of-scope-source assertion (which expects None) match and so RED.
+#[test]
+fn static_nat_dnat_source_address_gates_inbound() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "stat".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            source_addresses: vec!["198.51.100.0/24".to_string()],
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let ext: IpAddr = "203.0.113.10".parse().unwrap();
+    let in_scope: IpAddr = "198.51.100.7".parse().unwrap();
+    let out_scope: IpAddr = "203.0.113.99".parse().unwrap();
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(ext, 0, Some(in_scope), "", "", "")
+            .is_some(),
+        "static DNAT must fire for a source inside `match source-address`"
+    );
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(ext, 0, Some(out_scope), "", "", "")
+            .is_none(),
+        "static DNAT must NOT fire for a source outside `match source-address` (the #3435 fail-open)"
+    );
+}
+
+// #3435 (M02): a bracket / repeated source-address list must honor EVERY prefix
+// (the multi-value scalar loss). Fail-on-revert: if the compiler/snapshot drops
+// every entry after the first, the second-prefix source goes unmatched and the
+// loop assertion RED.
+#[test]
+fn static_nat_dnat_source_address_bracket_list() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "stat".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            source_addresses: vec![
+                "198.51.100.0/24".to_string(),
+                "203.0.113.200".to_string(),
+            ],
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let ext: IpAddr = "203.0.113.10".parse().unwrap();
+    for src in ["198.51.100.7", "203.0.113.200"] {
+        let s: IpAddr = src.parse().unwrap();
+        assert!(
+            table
+                .match_dnat_with_counter_scoped(ext, 0, Some(s), "", "", "")
+                .is_some(),
+            "static DNAT must fire for source {src} in the bracket list"
+        );
+    }
+    let out: IpAddr = "10.0.0.1".parse().unwrap();
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(ext, 0, Some(out), "", "", "")
+            .is_none(),
+        "static DNAT must NOT fire for a source outside the bracket list"
+    );
+}
+
+// #3435: the reverse (SNAT) direction gates on the packet DESTINATION (the
+// original client), symmetric with the inbound source gate. Fail-on-revert:
+// dropping the source gate lets an out-of-scope destination match.
+#[test]
+fn static_nat_snat_source_address_gates_reverse() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "stat".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            source_addresses: vec!["198.51.100.0/24".to_string()],
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let int: IpAddr = "192.168.1.10".parse().unwrap();
+    let in_scope: IpAddr = "198.51.100.7".parse().unwrap();
+    let out_scope: IpAddr = "203.0.113.99".parse().unwrap();
+    assert!(
+        table
+            .match_snat_with_counter_scoped(int, 0, Some(in_scope), "", "", "")
+            .is_some(),
+        "reverse static SNAT must fire toward a client inside `match source-address`"
+    );
+    assert!(
+        table
+            .match_snat_with_counter_scoped(int, 0, Some(out_scope), "", "", "")
+            .is_none(),
+        "reverse static SNAT must NOT fire toward a client outside `match source-address`"
+    );
+}
+
+// #3435: a source-constrained rule whose source list parses to NOTHING (every
+// entry malformed) must match NO source — fail CLOSED, never revert to
+// match-any (the #2394/#3435 fail-open guard). Fail-on-revert: collapsing the
+// unparseable list to "unconstrained" makes the assertion (expecting None) RED.
+#[test]
+fn static_nat_dnat_source_address_unparseable_fails_closed() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "stat".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            source_addresses: vec!["not-an-ip".to_string()],
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let ext: IpAddr = "203.0.113.10".parse().unwrap();
+    let any: IpAddr = "198.51.100.7".parse().unwrap();
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(ext, 0, Some(any), "", "", "")
+            .is_none(),
+        "a source-scoped rule with no parseable prefix must match nothing (fail closed)"
+    );
+}
+
+// #3435: guard against over-gating — an UNscoped static-NAT rule (no `match
+// source-address`) must still translate every source.
+#[test]
+fn static_nat_dnat_no_source_constraint_matches_any() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "stat".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let ext: IpAddr = "203.0.113.10".parse().unwrap();
+    let any: IpAddr = "10.9.8.7".parse().unwrap();
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(ext, 0, Some(any), "", "", "")
+            .is_some(),
+        "an unscoped static DNAT must match any source"
     );
 }
 

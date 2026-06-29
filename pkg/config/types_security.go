@@ -482,11 +482,23 @@ type DeterministicNATConfig struct {
 
 // StaticNATRule is a 1:1 bidirectional NAT rule.
 type StaticNATRule struct {
-	Name          string
-	Match         string // destination-address (external/public IP)
-	SourceAddress string // source-address match (optional, e.g. "::/0" for NAT64)
-	Then          string // static-nat prefix (internal/private IP), or "inet" for NAT64
-	IsNPTv6       bool   // true if this is an nptv6-prefix rule (RFC 6296)
+	Name  string
+	Match string // destination-address (external/public IP)
+	// SourceAddress is the FIRST configured `match source-address` value,
+	// retained for back-compat (e.g. "::/0" for NAT64). Prefer
+	// SourceAddresses for the full bracket/repeated list — SourceAddress
+	// drops every entry after the first (#3435 M02).
+	SourceAddress string
+	// SourceAddresses is the full `match source-address` list (#3435). Junos
+	// static NAT `match source-address <prefix>` restricts which client
+	// source IPs the 1:1/DNAT translation applies to. Before #3435 the value
+	// was stored as a single scalar (dropping list tail, M02) AND never
+	// carried into the dataplane snapshot (the rule installed as an
+	// all-source mapping, a fail-open exposure, H01). The first element is
+	// mirrored into SourceAddress for back-compat. Empty = match any source.
+	SourceAddresses []string
+	Then            string // static-nat prefix (internal/private IP), or "inet" for NAT64
+	IsNPTv6         bool   // true if this is an nptv6-prefix rule (RFC 6296)
 	// MatchDestinationPort is the external (pre-translation) destination
 	// port the inbound packet must carry for this rule to apply (Junos
 	// `match destination-port`). 0 = match any port (whole-address 1:1,

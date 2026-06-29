@@ -757,6 +757,7 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
             preference: 0,
         }],
         static_nat_rules: vec![StaticNATRuleSnapshot {
+            source_addresses: Vec::new(),
             counter_id: 0,
             name: "web-server".to_string(),
             from_zone: "untrust".to_string(),
