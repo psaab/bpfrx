@@ -53,6 +53,18 @@ func (m *Manager) IncrementGlobalCounter(index uint32, delta uint64) error {
 	return nil
 }
 
+// ReadUserspaceCounterOffset returns just the in-memory userspace counter
+// delta accumulated for index via IncrementGlobalCounter, independent of the
+// BPF global_counters map. ReadGlobalCounter merges this offset with the
+// per-CPU map sum; this accessor exposes the userspace half on its own so the
+// userspace-dp counter bridge accounting (e.g. the #3343 per-screen-reason
+// publish path) can be inspected without a loaded BPF map.
+func (m *Manager) ReadUserspaceCounterOffset(index uint32) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.userspaceCounterOffsets[index]
+}
+
 // ReadInterfaceCounters reads the per-CPU interface counter values and sums them.
 // interface_counters is a PERCPU_HASH (#756): a missing key simply means
 // no traffic has traversed the interface yet, which reads as zero.

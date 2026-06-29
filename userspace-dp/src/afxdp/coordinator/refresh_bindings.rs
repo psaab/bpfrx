@@ -107,6 +107,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.policy_denied_packets = snap.policy_denied_packets;
     binding.host_inbound_denied_packets = snap.host_inbound_denied_packets;
     binding.screen_drops = snap.screen_drops;
+    binding.screen_reason_drops = snap.screen_reason_drops;
     binding.syn_cookie_challenges = snap.syn_cookie_challenges;
     binding.syn_cookie_secret_unavailable = snap.syn_cookie_secret_unavailable;
     binding.syn_cookie_syn_ack_sent = snap.syn_cookie_syn_ack_sent;
@@ -298,6 +299,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.policy_denied_packets = 0;
     binding.host_inbound_denied_packets = 0;
     binding.screen_drops = 0;
+    binding.screen_reason_drops = [0; crate::screen::SCREEN_REASON_DROP_COUNT];
     binding.syn_cookie_challenges = 0;
     binding.syn_cookie_secret_unavailable = 0;
     binding.syn_cookie_syn_ack_sent = 0;

@@ -59,34 +59,30 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 		return v
 	}
 
-	// Collect per-screen-type drop counters
+	// Collect per-screen-type drop counters. #3343: the per-reason screen
+	// counters (incl. port-scan / ip-sweep / session-limit, omitted before) now
+	// carry live values from the userspace counter bridge; iterate the shared
+	// dataplane.ScreenReasonCounters table so this RPC and every other
+	// screen-statistics surface agree on the reason set. The SYN-cookie counters
+	// are a distinct set and stay appended.
 	screenDetails := make(map[string]uint64)
-	screenCounters := []struct {
+	for i := range dataplane.ScreenReasonCounters {
+		rc := &dataplane.ScreenReasonCounters[i]
+		if v := readCounter(rc.Index); v > 0 {
+			screenDetails[rc.Reason] = v
+		}
+	}
+	syncookieCounters := []struct {
 		idx  uint32
 		name string
 	}{
-		{dataplane.GlobalCtrScreenSynFlood, "syn-flood"},
-		{dataplane.GlobalCtrScreenICMPFlood, "icmp-flood"},
-		{dataplane.GlobalCtrScreenUDPFlood, "udp-flood"},
-		{dataplane.GlobalCtrScreenPortScan, "port-scan"},
-		{dataplane.GlobalCtrScreenIPSweep, "ip-sweep"},
-		{dataplane.GlobalCtrScreenLandAttack, "land-attack"},
-		{dataplane.GlobalCtrScreenPingOfDeath, "ping-of-death"},
-		{dataplane.GlobalCtrScreenTearDrop, "tear-drop"},
-		{dataplane.GlobalCtrScreenTCPSynFin, "tcp-syn-fin"},
-		{dataplane.GlobalCtrScreenTCPNoFlag, "tcp-no-flag"},
-		{dataplane.GlobalCtrScreenTCPFinNoAck, "tcp-fin-no-ack"},
-		{dataplane.GlobalCtrScreenWinNuke, "winnuke"},
-		{dataplane.GlobalCtrScreenIPSrcRoute, "ip-source-route"},
-		{dataplane.GlobalCtrScreenSynFrag, "syn-fragment"},
 		{dataplane.GlobalCtrSyncookieSent, "syncookie-sent"},
 		{dataplane.GlobalCtrSyncookieValid, "syncookie-valid"},
 		{dataplane.GlobalCtrSyncookieInvalid, "syncookie-invalid"},
 		{dataplane.GlobalCtrSyncookieBypass, "syncookie-bypass"},
 	}
-	for _, sc := range screenCounters {
-		v := readCounter(sc.idx)
-		if v > 0 {
+	for _, sc := range syncookieCounters {
+		if v := readCounter(sc.idx); v > 0 {
 			screenDetails[sc.name] = v
 		}
 	}

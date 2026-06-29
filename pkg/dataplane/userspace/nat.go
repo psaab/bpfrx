@@ -153,7 +153,10 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			// #2416: resolve `match source-address-name` for SNAT too — same
 			// builder gap as DNAT (the source list only carried literal
 			// prefixes). See appendNATSourceAddressName.
-			sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, rule.Match.SourceAddressName)
+			// #3431: resolve EVERY name of a bracket list / repeated leaf.
+			for _, name := range rule.Match.SourceAddressNameList() {
+				sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, name)
+			}
 			destAddrs := append([]string(nil), rule.Match.DestinationAddresses...)
 			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
 				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
@@ -162,7 +165,10 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			// source path resolves source-address-name — without this a
 			// name-scoped destination constraint published an EMPTY list =
 			// match-any destination (fail-open).
-			destAddrs = appendNATDestinationAddressName(cfg, feedOverlay, destAddrs, rule.Match.DestinationAddressName)
+			// #3431: resolve EVERY name of a bracket list / repeated leaf.
+			for _, name := range rule.Match.DestinationAddressNameList() {
+				destAddrs = appendNATDestinationAddressName(cfg, feedOverlay, destAddrs, name)
+			}
 			var poolAddresses []string
 			var portLow, portHigh uint16
 			var persistentNAT bool
@@ -228,7 +234,7 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			// before applying a `then source-nat off` exemption, so a
 			// port/app-scoped rule no longer silently widens to every port.
 			matchDestPorts := sourceNATDestPortRanges(rule.Match.DestinationPorts)
-			matchApps := buildSourceNATAppTerms(cfg, rule.Match.Application)
+			matchApps := buildSourceNATAppTerms(cfg, rule.Match.ApplicationList())
 
 			out = append(out, SourceNATRuleSnapshot{
 				Name:                             rule.Name,
@@ -380,17 +386,34 @@ func natAppProtoNumber(proto string) uint16 {
 	return natProtoNever
 }
 
-// buildSourceNATAppTerms resolves a source-NAT `match application <name>` into
-// (protocol, destination-port range, source-port range) terms for the dataplane
-// match (#3429, #3491). A single user/predefined application yields one term; an
-// application-set yields one term per resolved member. The empty name (or "any")
-// is unconstrained and yields no terms. A term's Ports are the application's
-// destination-port spec coalesced to ranges and SrcPorts its source-port spec;
-// an application with no destination (resp. source) port leaves that axis empty
-// (unconstrained on it). A configured-but-unresolvable reference yields a single
-// never-match term so the rule fails closed (see natProtoNever).
-func buildSourceNATAppTerms(cfg *config.Config, appName string) []NatAppTermWire {
-	if cfg == nil || appName == "" || appName == "any" {
+// buildSourceNATAppTerms resolves a source-NAT `match application [ <name>... ]`
+// into (protocol, destination-port range, source-port range) terms for the
+// dataplane match (#3429, #3491). A single user/predefined application yields
+// one term; an application-set yields one term per resolved member; #3431 a
+// multi-value list yields the UNION of every member's terms (match ANY). The
+// empty list (or a sole "any") is unconstrained and yields no terms. A term's
+// Ports are the application's destination-port spec coalesced to ranges and
+// SrcPorts its source-port spec; an application with no destination (resp.
+// source) port leaves that axis empty (unconstrained on it). When EVERY
+// configured reference resolves to nothing, a single never-match term is
+// emitted so the rule fails closed (see natProtoNever); an unresolvable member
+// in a list that has at least one good member just contributes nothing (the
+// strict commit gate rejects the typo — this is the lenient/peer-sync path).
+func buildSourceNATAppTerms(cfg *config.Config, appNames []string) []NatAppTermWire {
+	if cfg == nil {
+		return nil
+	}
+	// Collapse a list that carries only the unconstrained "any" / empty
+	// tokens to "no constraint" (nil terms). A real app alongside "any" is
+	// kept verbatim — "any" then resolves to nothing per the loop below.
+	configured := false
+	for _, n := range appNames {
+		if n != "" && n != "any" {
+			configured = true
+			break
+		}
+	}
+	if !configured {
 		return nil
 	}
 	userApps := cfg.Applications.Applications
@@ -424,19 +447,24 @@ func buildSourceNATAppTerms(cfg *config.Config, appName string) []NatAppTermWire
 			SrcPorts: srcPorts,
 		})
 	}
-	if app, found := config.ResolveApplication(appName, userApps); found {
-		addApp(app)
-	} else if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
-		if expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications); err == nil {
-			for _, termName := range expanded {
-				if a, ok := config.ResolveApplication(termName, userApps); ok {
-					addApp(a)
+	for _, appName := range appNames {
+		if appName == "" || appName == "any" {
+			continue
+		}
+		if app, found := config.ResolveApplication(appName, userApps); found {
+			addApp(app)
+		} else if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+			if expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications); err == nil {
+				for _, termName := range expanded {
+					if a, ok := config.ResolveApplication(termName, userApps); ok {
+						addApp(a)
+					}
 				}
 			}
 		}
 	}
 	if len(terms) == 0 {
-		// Configured app reference that resolved to nothing -> fail closed.
+		// Every configured app reference resolved to nothing -> fail closed.
 		terms = []NatAppTermWire{{Protocol: natProtoNever}}
 	}
 	return terms
@@ -634,7 +662,10 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// matches NOTHING (fail-closed). The commit-time strict gate
 			// (validateNATSourceAddressNameReferencesStrict) makes the typo
 			// operator-visible.
-			destAddrs = appendNATDestinationAddressName(cfg, feedOverlay, destAddrs, rule.Match.DestinationAddressName)
+			// #3431: resolve EVERY name of a bracket list / repeated leaf.
+			for _, name := range rule.Match.DestinationAddressNameList() {
+				destAddrs = appendNATDestinationAddressName(cfg, feedOverlay, destAddrs, name)
+			}
 			if len(destAddrs) == 0 {
 				continue
 			}
@@ -664,7 +695,10 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// (fail-closed) instead of collapsing back to match-any. A commit-
 			// time strict gate (validateNATSourceAddressNameReferencesStrict)
 			// makes the typo operator-visible; this is the dataplane backstop.
-			sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, rule.Match.SourceAddressName)
+			// #3431: resolve EVERY name of a bracket list / repeated leaf.
+			for _, name := range rule.Match.SourceAddressNameList() {
+				sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, name)
+			}
 
 			// Resolve application match to protocol+ports if specified.
 			//
@@ -706,20 +740,27 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				}
 			}
 
-			if rule.Match.Application != "" {
+			// #3431: expand EVERY application of a bracket list / repeated
+			// `match application [ a b ]` into the union of its terms (match
+			// ANY). Pre-#3431 only the first application was read and the rest
+			// silently dropped, narrowing the rule.
+			appConfigured := len(rule.Match.ApplicationList()) > 0
+			if appConfigured {
 				userApps := cfg.Applications.Applications
-				app, found := config.ResolveApplication(rule.Match.Application, userApps)
-				if found {
-					appTerms = append(appTerms, appTermFor(app))
-				} else if _, isSet := cfg.Applications.ApplicationSets[rule.Match.Application]; isSet {
-					expanded, err := config.ExpandApplicationSet(rule.Match.Application, &cfg.Applications)
-					if err == nil {
-						for _, termName := range expanded {
-							tApp, ok := config.ResolveApplication(termName, userApps)
-							if !ok {
-								continue
+				for _, appName := range rule.Match.ApplicationList() {
+					app, found := config.ResolveApplication(appName, userApps)
+					if found {
+						appTerms = append(appTerms, appTermFor(app))
+					} else if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+						expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
+						if err == nil {
+							for _, termName := range expanded {
+								tApp, ok := config.ResolveApplication(termName, userApps)
+								if !ok {
+									continue
+								}
+								appTerms = append(appTerms, appTermFor(tApp))
 							}
-							appTerms = append(appTerms, appTermFor(tApp))
 						}
 					}
 				}
@@ -752,10 +793,21 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			//     wildcard and fail closed.
 			explicitFallback := false
 			if len(appTerms) == 0 {
-				if rule.Match.Application != "" {
+				if appConfigured {
 					appTerms = []appTerm{{srcPorts: []NatPortRangeWire{natNeverMatchPortRange}}}
 				} else {
-					appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+					// #3431: one explicit-match term per protocol of a bracket
+					// list / repeated `match protocol [ tcp udp ]` (match ANY).
+					// Pre-#3431 only the first protocol was published. With no
+					// protocol configured, ProtocolList() is empty and a single
+					// proto="" wildcard term is emitted (unchanged behavior).
+					protos := rule.Match.ProtocolList()
+					if len(protos) == 0 {
+						protos = []string{""}
+					}
+					for _, proto := range protos {
+						appTerms = append(appTerms, appTerm{proto: proto, ports: rule.Match.DestinationPorts})
+					}
 					explicitFallback = true
 				}
 			}

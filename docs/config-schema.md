@@ -108,6 +108,28 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**NAT `match` axes are multi-value (#3431).** The source/destination NAT rule
+`match` leaves `application`, `protocol` (DNAT), `source-address-name`, and
+`destination-address-name` are all `multi: true` (alongside the already-plural
+`source-address` / `destination-address` / `destination-port`). The source and
+destination NAT parsers (`compiler_nat.go`) accumulate EVERY value via
+`firewallMatchValues` into the `NATMatch` plural slices `Applications`,
+`Protocols`, `SourceAddressNames`, and `DestinationAddressNames`, keeping the
+singular `Application` / `Protocol` / `SourceAddressName` /
+`DestinationAddressName` = the first element for back-compat. Before #3431 these
+four axes used `nodeVal(m)` (first value only), so `match application [ a b ]`,
+`match protocol [ tcp udp ]`, or a multi-name list silently kept ONE value and
+dropped the rest — a NAT rule narrowed unexpectedly with no commit error (Codex
+audit 095 H04/H05/H06). Consumers read through the `NATMatch.{Application,
+Protocol,SourceAddressName,DestinationAddressName}List()` accessors (which fall
+back to the scalar for a config JSON-synced from a pre-#3431 peer): the strict
+commit validators (`compiler_validate_strict.go`) now reject a bad value in ANY
+list position, and the userspace snapshot builders (`pkg/dataplane/userspace/
+nat.go`) expand the union — one DNAT entry per protocol, one app term per
+resolved application (an application-set still expands to its members). Coverage:
+`compiler_nat_match_multivalue_3431_test.go` (both AST shapes, all axes) and
+`nat_match_multivalue_3431_test.go` (snapshot expansion).
+
 ## Trailing-token arity on scalar value leaves (#3332)
 
 The mirror image of the multi-value contract is the **scalar** value leaf: a
