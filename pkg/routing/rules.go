@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -328,13 +329,27 @@ func (rg *ribGroupManager) clear() error {
 // PBRRule describes a single policy-based routing rule derived from a
 // firewall filter term with a routing-instance action.
 type PBRRule struct {
-	Family   int    // unix.AF_INET or unix.AF_INET6
-	TOS      uint8  // TOS byte (DSCP << 2), 0 = no TOS match
-	Src      string // source CIDR, "" = any
-	Dst      string // destination CIDR, "" = any
+	Family int   // unix.AF_INET or unix.AF_INET6
+	TOS    uint8 // TOS byte (DSCP << 2); only meaningful when TOSSet
+	// TOSSet distinguishes "match DSCP 0" (be / cs0 / numeric 0) from
+	// "no DSCP match" (#3430 H2). TOS==0 is a perfectly valid DSCP
+	// (best-effort / class-selector 0); without an explicit presence flag
+	// the applier either skipped the rule (no address predicate) or widened
+	// it to ALL DSCP values (address predicate present). The rule emits a
+	// `tos` selector iff TOSSet is true.
+	TOSSet   bool
+	Src      string // source CIDR, "" = any (no `from` selector)
+	Dst      string // destination CIDR, "" = any (no `to` selector)
 	TableID  int    // target routing table
 	Instance string // routing instance name (for logging)
 }
+
+// maxPBRRules bounds the number of ip rules the PBR builder/applier will
+// install, matching the pbrRulePriority window (clear() scans
+// [pbrRulePriority, pbrRulePriority+1000)). A larger DSCP×src×dst expansion
+// is truncated and reported as a degraded build (#3430 M3) rather than
+// silently dropping later terms' steering.
+const maxPBRRules = 1000
 
 // pbrManager reconciles policy-based routing ip rules. Stateless apart
 // from the borrowed ruleOps.
@@ -356,24 +371,42 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 		slog.Warn("failed to clear old PBR rules", "err", clearErr)
 	}
 
+	// Aggregate every failure (clear, parse, add, overflow) and return it so
+	// the commit/apply outcome reflects a half-installed policy instead of
+	// reporting success after the up-front clear already removed the
+	// previously-working steering (#3430 H3). The clear error, if any, is the
+	// first aggregated entry.
+	var errs []error
+	if clearErr != nil {
+		errs = append(errs, clearErr)
+	}
+
 	if len(rules) == 0 {
-		return clearErr
+		return errors.Join(errs...)
 	}
 
 	prio := pbrRulePriority
 	for _, pbr := range rules {
+		// Cap at the priority window (defense-in-depth; BuildPBRRules already
+		// truncates). Checked at the top so exactly maxPBRRules rules install
+		// without a spurious overflow error (#3430 M3 apply leg).
+		if prio >= pbrRulePriority+maxPBRRules {
+			errs = append(errs, fmt.Errorf("PBR rule limit (%d) reached; remaining rules dropped", maxPBRRules))
+			break
+		}
 		rule := netlink.NewRule()
 		rule.Table = pbr.TableID
 		rule.Priority = prio
 		rule.Family = pbr.Family
 
-		if pbr.TOS != 0 {
+		// Emit a tos selector iff the term actually matched a DSCP (#3430 H2).
+		if pbr.TOSSet {
 			rule.Tos = uint(pbr.TOS)
 		}
 		if pbr.Src != "" {
 			_, src, err := net.ParseCIDR(pbr.Src)
 			if err != nil {
-				slog.Warn("invalid PBR source", "src", pbr.Src, "err", err)
+				errs = append(errs, fmt.Errorf("PBR source %q (instance %s): %w", pbr.Src, pbr.Instance, err))
 				continue
 			}
 			rule.Src = src
@@ -381,30 +414,23 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 		if pbr.Dst != "" {
 			_, dst, err := net.ParseCIDR(pbr.Dst)
 			if err != nil {
-				slog.Warn("invalid PBR destination", "dst", pbr.Dst, "err", err)
+				errs = append(errs, fmt.Errorf("PBR destination %q (instance %s): %w", pbr.Dst, pbr.Instance, err))
 				continue
 			}
 			rule.Dst = dst
 		}
 
 		if err := p.ops.RuleAdd(rule); err != nil {
-			slog.Warn("failed to add PBR rule",
-				"instance", pbr.Instance, "tos", pbr.TOS,
-				"src", pbr.Src, "dst", pbr.Dst,
-				"table", pbr.TableID, "err", err)
+			errs = append(errs, fmt.Errorf("add PBR rule instance %s table %d: %w", pbr.Instance, pbr.TableID, err))
 			continue
 		}
 		slog.Info("PBR rule added",
-			"instance", pbr.Instance, "tos", pbr.TOS,
+			"instance", pbr.Instance, "tos", pbr.TOS, "tos_set", pbr.TOSSet,
 			"src", pbr.Src, "dst", pbr.Dst, "table", pbr.TableID)
 		prio++
-		if prio >= pbrRulePriority+1000 {
-			slog.Warn("PBR rule limit reached")
-			break
-		}
 	}
-	// Desired rules are re-added; surface any clear() list failure.
-	return clearErr
+	// Desired rules are re-added; surface any clear/parse/add/overflow failure.
+	return errors.Join(errs...)
 }
 
 // clear removes all ip rules in the PBR priority range.
@@ -422,8 +448,12 @@ func (p *pbrManager) clear() error {
 		for _, r := range rules {
 			if r.Priority >= pbrRulePriority && r.Priority < pbrRulePriority+1000 {
 				if err := p.ops.RuleDel(&r); err != nil {
-					slog.Debug("failed to delete stale PBR rule",
-						"priority", r.Priority, "err", err)
+					// #3430 H3: a RuleDel failure leaves a STALE PBR rule in the
+					// kernel. Join it into the returned error so Apply does not
+					// report success after the up-front clear could not remove a
+					// stale (now-divergent) rule — the operator must see that the
+					// installed steering may still carry leftover rules.
+					errs = append(errs, fmt.Errorf("delete stale PBR rule prio %d: %w", r.Priority, err))
 				}
 			}
 		}
@@ -431,35 +461,120 @@ func (p *pbrManager) clear() error {
 	return errors.Join(errs...)
 }
 
-// BuildPBRRules extracts policy-based routing rules from firewall filter
-// configuration. Each filter term with a routing-instance action produces
-// one or more PBR rules depending on the match criteria.
-func BuildPBRRules(fw *config.FirewallConfig, instances []*config.RoutingInstanceConfig) []PBRRule {
-	if fw == nil {
-		return nil
+// BuildPBRRules extracts policy-based routing (filter-based-forwarding) ip
+// rules from the firewall configuration, matching Junos FBF semantics.
+//
+// Junos FBF is realized by an INPUT firewall filter attached to an interface;
+// a `then routing-instance <vr>` term steers matching ingress traffic to that
+// instance's routing table. The builder therefore derives rules ONLY from
+// filters actually attached as an interface-unit input filter (#3430 H1) — a
+// defined-but-unattached filter has no dataplane effect in Junos and must not
+// program a global ip rule. Output-attached filters are not FBF and are
+// ignored.
+//
+// Each attached filter is expanded once regardless of how many interfaces
+// reference it: the resulting ip rules carry no incoming-interface selector
+// (a documented widening relative to per-interface Junos FBF — adding an iif
+// selector requires the kernel ifname mapping and is a separate change), so a
+// duplicate per attachment would be redundant.
+//
+// The returned error is non-nil when the build is DEGRADED: a term carries an
+// ip-rule-unrepresentable predicate (a non-empty address `except` set, or a
+// DSCP-0 match the netlink layer cannot express) or the expansion exceeds
+// maxPBRRules. The successfully-built rules are still returned so the caller
+// can install them and surface the degradation.
+func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
+	if cfg == nil {
+		return nil, nil
 	}
+	fw := &cfg.Firewall
 
 	// Build instance name → table ID map
 	tableIDs := make(map[string]int)
-	for _, inst := range instances {
+	for _, inst := range cfg.RoutingInstances {
 		tableIDs[inst.Name] = inst.TableID
 	}
 
+	inetAttached, inet6Attached := collectAttachedInputFilters(&cfg.Interfaces)
+	pls := cfg.PolicyOptions.PrefixLists
+
 	var rules []PBRRule
-	// Process inet filters
-	for _, filter := range fw.FiltersInet {
-		rules = append(rules, buildPBRFromFilter(filter, unix.AF_INET, tableIDs)...)
+	var errs []error
+	build := func(names []string, filters map[string]*config.FirewallFilter, family int) {
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				// Dangling attachment (filter named on an interface but not
+				// defined). The strict commit gate rejects this
+				// (validateFilterAttachmentReferences / warn path); skip here.
+				continue
+			}
+			r, e := buildPBRFromFilter(filter, family, tableIDs, pls)
+			rules = append(rules, r...)
+			errs = append(errs, e...)
+		}
 	}
-	// Process inet6 filters
-	for _, filter := range fw.FiltersInet6 {
-		rules = append(rules, buildPBRFromFilter(filter, unix.AF_INET6, tableIDs)...)
+	build(sortedKeys(inetAttached), fw.FiltersInet, unix.AF_INET)
+	build(sortedKeys(inet6Attached), fw.FiltersInet6, unix.AF_INET6)
+
+	// M3: truncate to the priority window and report the overflow rather than
+	// silently dropping later terms' steering.
+	if len(rules) > maxPBRRules {
+		errs = append(errs, fmt.Errorf(
+			"PBR expansion produced %d ip rules, exceeding the limit of %d; "+
+				"steering for the %d rule(s) beyond the limit is dropped — reduce the "+
+				"DSCP×source×destination cross-product in the routing-instance filter terms",
+			len(rules), maxPBRRules, len(rules)-maxPBRRules))
+		rules = rules[:maxPBRRules]
 	}
-	return rules
+	return rules, errors.Join(errs...)
+}
+
+// collectAttachedInputFilters returns the set of filter names attached as an
+// interface-unit INPUT filter, split by family. These are the only filters
+// whose `then routing-instance` terms take effect as Junos FBF (#3430 H1).
+func collectAttachedInputFilters(ifs *config.InterfacesConfig) (inet, inet6 map[string]struct{}) {
+	inet = make(map[string]struct{})
+	inet6 = make(map[string]struct{})
+	if ifs == nil {
+		return inet, inet6
+	}
+	for _, ifc := range ifs.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		for _, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			if unit.FilterInputV4 != "" {
+				inet[unit.FilterInputV4] = struct{}{}
+			}
+			if unit.FilterInputV6 != "" {
+				inet6[unit.FilterInputV6] = struct{}{}
+			}
+		}
+	}
+	return inet, inet6
+}
+
+// sortedKeys returns the map keys in deterministic (sorted) order so the
+// emitted ip-rule priorities are stable across applies.
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // buildPBRFromFilter extracts PBR rules from a single firewall filter.
-func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[string]int) []PBRRule {
+// The returned error slice carries per-term DEGRADED conditions (an
+// unrepresentable except set); the buildable rules are still returned.
+func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[string]int, pls map[string]*config.PrefixList) ([]PBRRule, []error) {
 	var rules []PBRRule
+	var errs []error
 	for _, term := range filter.Terms {
 		if term.RoutingInstance == "" {
 			continue
@@ -472,53 +587,98 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			continue
 		}
 
-		// Determine TOS byte(s) from the term's DSCP value(s) (#2545:
-		// multi-value). An ip rule carries a SINGLE tos, so a term with
-		// several `from dscp` values expands to one rule per DSCP (plus the
-		// src/dst cross-product). A term with no DSCP yields a single tos=0
-		// sentinel so the address-only case still emits one rule per address.
-		var toses []uint8
+		// DSCP → TOS presence-tracked values (#2545 multi-value, #3430 H2).
+		// An ip rule carries a SINGLE tos, so a term with several `from dscp`
+		// values expands to one rule per DSCP (× the src/dst cross-product).
+		//
+		// DSCP 0 (be / cs0 / numeric 0) is NOT representable as an ip rule: the
+		// netlink layer (vishvananda/netlink) writes the rtmsg tos field only
+		// when non-zero (ruleHandle, rule_linux.go) and exposes no FRA_DSCP
+		// escape hatch, and the kernel treats a zero tos in a fib rule as
+		// "match ANY tos". Emitting a TOS=0 rule would therefore OVER-MATCH
+		// every DSCP — the exact #3430 H2 bug. So a DSCP-0 match value is
+		// DROPPED with a degraded build error (fail-safe under-steer), mirroring
+		// the non-empty `except` handling in resolvePBRDirection. Within a
+		// multi-value set (e.g. `from dscp [ be ef ]`) only the DSCP-0 value is
+		// dropped; the representable values still emit exact rules.
+		type tosEntry struct {
+			tos uint8
+			set bool
+		}
+		var toses []tosEntry
+		hadDSCP := false
 		for _, d := range term.DSCPs {
-			if d != "" {
-				toses = append(toses, dscpToTOS(d))
+			if d == "" {
+				continue
 			}
+			hadDSCP = true
+			tos := dscpToTOS(d)
+			if tos == 0 {
+				errs = append(errs, fmt.Errorf(
+					"PBR filter %s term %s matches DSCP 0 (%q), which an ip rule "+
+						"cannot represent (the netlink layer has no FRA_DSCP and a zero "+
+						"tos matches ANY DSCP); steering for this DSCP-0 match is dropped",
+					filter.Name, term.Name, d))
+				continue
+			}
+			toses = append(toses, tosEntry{tos: tos, set: true})
 		}
-		if len(toses) == 0 {
-			toses = []uint8{0}
+		if hadDSCP {
+			if len(toses) == 0 {
+				// Every DSCP this term matched was DSCP-0 (all dropped above).
+				// Emitting an address-only sentinel rule here would over-match
+				// ALL DSCP, so skip the term entirely — the degraded error is
+				// already recorded.
+				continue
+			}
+		} else {
+			// No DSCP constraint: a single unset entry so the address-only case
+			// still emits one rule (no tos selector).
+			toses = []tosEntry{{tos: 0, set: false}}
 		}
 
-		// If the term has source/dest addresses, create a rule per address.
-		// If it has neither addresses nor DSCP, we can't express it as ip rule.
-		srcs := term.SourceAddresses
-		dsts := term.DestAddresses
-		if len(srcs) == 0 {
-			srcs = []string{""}
+		// Resolve source / destination scope, expanding prefix-lists and
+		// normalizing any/bare-host tokens (#3430 M1, M2). A direction that
+		// matches NOTHING (constrained-but-empty positive set) skips the whole
+		// term; an unrepresentable except set degrades the build.
+		srcs, srcSkip, srcErr := resolvePBRDirection(
+			term.SourceAddresses, term.SourcePrefixLists, pls, filter.Name, term.Name, "source")
+		dsts, dstSkip, dstErr := resolvePBRDirection(
+			term.DestAddresses, term.DestPrefixLists, pls, filter.Name, term.Name, "destination")
+		if srcErr != nil {
+			errs = append(errs, srcErr)
 		}
-		if len(dsts) == 0 {
-			dsts = []string{""}
+		if dstErr != nil {
+			errs = append(errs, dstErr)
+		}
+		if srcErr != nil || dstErr != nil || srcSkip || dstSkip {
+			// Either unrepresentable (already recorded) or matches nothing —
+			// emit no rule for this term in both cases (fail-safe: never widen).
+			continue
 		}
 
-		// Check if we have anything ip rule can match on
 		hasDSCP := false
 		for _, t := range toses {
-			if t != 0 {
+			if t.set {
 				hasDSCP = true
 				break
 			}
 		}
-		hasCriteria := hasDSCP || term.SourceAddresses != nil || term.DestAddresses != nil
-		if !hasCriteria {
+		srcConstrained := !(len(srcs) == 1 && srcs[0] == "")
+		dstConstrained := !(len(dsts) == 1 && dsts[0] == "")
+		if !hasDSCP && !srcConstrained && !dstConstrained {
 			slog.Warn("PBR: filter term has routing-instance but no ip-rule-compatible criteria (dscp, source-address, destination-address)",
 				"filter", filter.Name, "term", term.Name)
 			continue
 		}
 
-		for _, tos := range toses {
+		for _, t := range toses {
 			for _, src := range srcs {
 				for _, dst := range dsts {
 					rules = append(rules, PBRRule{
 						Family:   family,
-						TOS:      tos,
+						TOS:      t.tos,
+						TOSSet:   t.set,
 						Src:      src,
 						Dst:      dst,
 						TableID:  tableID,
@@ -528,7 +688,154 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			}
 		}
 	}
-	return rules
+	return rules, errs
+}
+
+// resolvePBRDirection resolves one direction (source or destination) of a
+// firewall-filter term into the CIDR match strings for ip-rule generation,
+// applying the same prefix-list + empty-set + except semantics as the
+// userspace snapshot builder (resolvePrefixListAddrs) and then mapping them
+// onto what an `ip rule from/to` selector can express (#3430 M1, M2).
+//
+// Returns:
+//   - matches: the CIDRs to emit, one rule each. The single element "" means
+//     "no selector" (match any).
+//   - skip: the direction matches NOTHING (a constrained-but-empty positive
+//     set, e.g. an empty / unresolved positive prefix-list). The caller emits
+//     no rule for the term — omitting the rule is the correct realization of
+//     "steer nothing" for FBF (an omitted rule cannot steer).
+//   - err: the direction cannot be represented as an ip rule (a non-empty
+//     address `except` set; ip rule has no negated from/to). The caller skips
+//     the term (fail-safe: never steer the wrong traffic) and reports degraded.
+func resolvePBRDirection(
+	literal []string,
+	refs []config.PrefixListRef,
+	pls map[string]*config.PrefixList,
+	filterName, termName, direction string,
+) (matches []string, skip bool, err error) {
+	constrained := len(literal) > 0 || len(refs) > 0
+	if !constrained {
+		return []string{""}, false, nil
+	}
+
+	var positive []string
+	hasPositiveRef := false
+	hasExcept := false
+	exceptCount := 0
+	unconstrainedSeen := false
+
+	addNorm := func(tok string) error {
+		cidr, unc, e := normalizePBRAddr(tok)
+		if e != nil {
+			return e
+		}
+		if unc {
+			unconstrainedSeen = true
+			return nil
+		}
+		positive = append(positive, cidr)
+		return nil
+	}
+
+	for _, tok := range literal {
+		if e := addNorm(tok); e != nil {
+			return nil, false, fmt.Errorf("PBR %s address %q (filter %s term %s): %w",
+				direction, tok, filterName, termName, e)
+		}
+	}
+	for _, ref := range refs {
+		pl := pls[ref.Name]
+		if pl == nil {
+			// Unresolved reference. The strict gate rejects this at commit; on
+			// the tolerant/peer-sync path it contributes no prefixes, but the
+			// direction stays constrained so we fail closed (positive) /
+			// match-all (except) per the empty-set semantics below.
+			slog.Warn("PBR: filter prefix-list reference unresolved",
+				"filter", filterName, "term", termName, "direction", direction,
+				"prefix-list", ref.Name)
+			if ref.Except {
+				hasExcept = true
+			} else {
+				hasPositiveRef = true
+			}
+			continue
+		}
+		if ref.Except {
+			hasExcept = true
+			exceptCount += len(pl.Prefixes)
+		} else {
+			hasPositiveRef = true
+			for _, p := range pl.Prefixes {
+				if e := addNorm(p); e != nil {
+					slog.Warn("PBR: skipping unparseable prefix-list entry",
+						"filter", filterName, "term", termName, "direction", direction,
+						"prefix-list", ref.Name, "prefix", p, "err", e)
+				}
+			}
+		}
+	}
+
+	// Pure-except: an `except` set is the SOLE scope for this direction.
+	if hasExcept && len(positive) == 0 && !hasPositiveRef && !unconstrainedSeen {
+		if exceptCount == 0 {
+			// "match every source NOT in {}" = match ALL.
+			return []string{""}, false, nil
+		}
+		// "match every source NOT in <set>" — ip rule has no negated selector.
+		return nil, false, fmt.Errorf(
+			"PBR %s scope of filter %s term %s uses a non-empty `except` prefix-list, "+
+				"which an ip rule cannot represent (no negated from/to); steering for "+
+				"this term is dropped — express the complement explicitly or use the "+
+				"userspace filter path", direction, filterName, termName)
+	}
+
+	if hasExcept {
+		// Mixed positive + except in one direction: commit-rejected
+		// (validateFilterAddressExceptStrict, #3359); reaches here only on the
+		// tolerant/peer-sync path. POSITIVE-WINS — ignore the except prefixes
+		// (mirrors resolvePrefixListAddrs); fail-safe (never widen the steer).
+		slog.Warn("PBR: filter term mixes positive addresses with an except "+
+			"prefix-list in one direction; the except modifier is ignored "+
+			"(positive-wins)",
+			"filter", filterName, "term", termName, "direction", direction)
+	}
+
+	if unconstrainedSeen {
+		// An `any` / 0.0.0.0/0 / ::/0 token widens the direction to match all.
+		return []string{""}, false, nil
+	}
+	if len(positive) == 0 {
+		// Constrained but resolved to no prefixes — matches nothing. For FBF
+		// "steer nothing" is realized by emitting no rule (skip the term).
+		return nil, true, nil
+	}
+	return positive, false, nil
+}
+
+// normalizePBRAddr maps a firewall-filter address token onto an ip-rule CIDR,
+// mirroring the userspace filter compiler (#3430 M1):
+//   - "any" (and 0.0.0.0/0 / ::/0) → unconstrained (no from/to selector).
+//   - a bare host IP → /32 (IPv4) or /128 (IPv6).
+//   - a literal CIDR → passed through unchanged.
+//   - anything else → error (the caller fails closed instead of widening).
+func normalizePBRAddr(tok string) (cidr string, unconstrained bool, err error) {
+	t := strings.TrimSpace(tok)
+	if t == "" || strings.EqualFold(t, "any") {
+		return "", true, nil
+	}
+	if ip := net.ParseIP(t); ip != nil {
+		if ip.To4() != nil {
+			return ip.String() + "/32", false, nil
+		}
+		return ip.String() + "/128", false, nil
+	}
+	if _, n, e := net.ParseCIDR(t); e == nil {
+		if ones, _ := n.Mask.Size(); ones == 0 {
+			return "", true, nil // 0.0.0.0/0 or ::/0 — match all
+		}
+		return t, false, nil
+	}
+	return "", false, fmt.Errorf("unparseable address %q", tok)
 }
 
 // dscpToTOS converts a DSCP name or numeric value to a TOS byte.

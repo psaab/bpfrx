@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -699,6 +700,26 @@ func TestDscpToTOS(t *testing.T) {
 	}
 }
 
+// pbrTestConfig builds a *config.Config that attaches filter as the input
+// filter (#3430 H1: only attached filters program PBR rules) on a single
+// interface unit, with the given routing instances and prefix-lists.
+func pbrTestConfig(family string, filter *config.FirewallFilter, instances []*config.RoutingInstanceConfig, pls map[string]*config.PrefixList) *config.Config {
+	cfg := &config.Config{RoutingInstances: instances}
+	cfg.PolicyOptions.PrefixLists = pls
+	unit := &config.InterfaceUnit{Number: 0}
+	if family == "inet6" {
+		cfg.Firewall.FiltersInet6 = map[string]*config.FirewallFilter{filter.Name: filter}
+		unit.FilterInputV6 = filter.Name
+	} else {
+		cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{filter.Name: filter}
+		unit.FilterInputV4 = filter.Name
+	}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{0: unit}},
+	}
+	return cfg
+}
+
 func TestBuildPBRRules(t *testing.T) {
 	instances := []*config.RoutingInstanceConfig{
 		{Name: "Comcast-GigabitPro", TableID: 100},
@@ -706,33 +727,20 @@ func TestBuildPBRRules(t *testing.T) {
 	}
 
 	t.Run("DSCP-based routing", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet: map[string]*config.FirewallFilter{
-				"inet-source-dscp": {
-					Name: "inet-source-dscp",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:            "dscp-to-gigabitpro",
-							DSCPs:           []string{"ef"},
-							RoutingInstance: "Comcast-GigabitPro",
-						},
-						{
-							Name:            "dscp-to-att",
-							DSCPs:           []string{"af43"},
-							RoutingInstance: "ATT",
-						},
-					},
-				},
+		filter := &config.FirewallFilter{
+			Name: "inet-source-dscp",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "dscp-to-gigabitpro", DSCPs: []string{"ef"}, RoutingInstance: "Comcast-GigabitPro"},
+				{Name: "dscp-to-att", DSCPs: []string{"af43"}, RoutingInstance: "ATT"},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected build error: %v", err)
+		}
 		if len(rules) != 2 {
 			t.Fatalf("expected 2 PBR rules, got %d", len(rules))
 		}
-
-		// Find rules by instance (map iteration order is nondeterministic
-		// but there's only one filter so order is deterministic within terms)
 		var comcast, att *PBRRule
 		for i := range rules {
 			switch rules[i].Instance {
@@ -742,54 +750,36 @@ func TestBuildPBRRules(t *testing.T) {
 				att = &rules[i]
 			}
 		}
-
 		if comcast == nil || att == nil {
 			t.Fatal("expected rules for both Comcast-GigabitPro and ATT")
 		}
-
-		if comcast.TOS != 184 { // ef=46, TOS=46<<2=184=0xB8
-			t.Errorf("Comcast TOS = %d, want 184 (0xB8)", comcast.TOS)
+		if comcast.TOS != 184 || !comcast.TOSSet {
+			t.Errorf("Comcast TOS = %d set=%v, want 184/true", comcast.TOS, comcast.TOSSet)
 		}
-		if comcast.TableID != 100 {
-			t.Errorf("Comcast table = %d, want 100", comcast.TableID)
+		if comcast.TableID != 100 || comcast.Family != unix.AF_INET {
+			t.Errorf("Comcast table/family = %d/%d, want 100/AF_INET", comcast.TableID, comcast.Family)
 		}
-		if comcast.Family != unix.AF_INET {
-			t.Errorf("Comcast family = %d, want AF_INET", comcast.Family)
-		}
-
-		if att.TOS != 152 { // af43=38, TOS=38<<2=152=0x98
-			t.Errorf("ATT TOS = %d, want 152 (0x98)", att.TOS)
-		}
-		if att.TableID != 101 {
-			t.Errorf("ATT table = %d, want 101", att.TableID)
+		if att.TOS != 152 || att.TableID != 101 {
+			t.Errorf("ATT TOS/table = %d/%d, want 152/101", att.TOS, att.TableID)
 		}
 	})
 
 	t.Run("source address routing", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet: map[string]*config.FirewallFilter{
-				"src-routing": {
-					Name: "src-routing",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:            "from-subnet",
-							SourceAddresses: []string{"10.0.1.0/24"},
-							RoutingInstance: "ATT",
-						},
-					},
-				},
+		filter := &config.FirewallFilter{
+			Name: "src-routing",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "from-subnet", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "ATT"},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
 		if len(rules) != 1 {
 			t.Fatalf("expected 1 PBR rule, got %d", len(rules))
 		}
 		if rules[0].Src != "10.0.1.0/24" {
 			t.Errorf("src = %q, want 10.0.1.0/24", rules[0].Src)
 		}
-		if rules[0].TOS != 0 {
-			t.Errorf("TOS = %d, want 0", rules[0].TOS)
+		if rules[0].TOSSet {
+			t.Errorf("TOSSet = true, want false (no DSCP)")
 		}
 		if rules[0].TableID != 101 {
 			t.Errorf("table = %d, want 101", rules[0].TableID)
@@ -797,22 +787,13 @@ func TestBuildPBRRules(t *testing.T) {
 	})
 
 	t.Run("destination address routing", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet: map[string]*config.FirewallFilter{
-				"dst-routing": {
-					Name: "dst-routing",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:            "to-subnet",
-							DestAddresses:   []string{"192.168.0.0/16"},
-							RoutingInstance: "Comcast-GigabitPro",
-						},
-					},
-				},
+		filter := &config.FirewallFilter{
+			Name: "dst-routing",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "to-subnet", DestAddresses: []string{"192.168.0.0/16"}, RoutingInstance: "Comcast-GigabitPro"},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
 		if len(rules) != 1 {
 			t.Fatalf("expected 1 PBR rule, got %d", len(rules))
 		}
@@ -822,22 +803,13 @@ func TestBuildPBRRules(t *testing.T) {
 	})
 
 	t.Run("inet6 filter", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet6: map[string]*config.FirewallFilter{
-				"v6-routing": {
-					Name: "v6-routing",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:            "dscp-route",
-							DSCPs:           []string{"ef"},
-							RoutingInstance: "ATT",
-						},
-					},
-				},
+		filter := &config.FirewallFilter{
+			Name: "v6-routing",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "dscp-route", DSCPs: []string{"ef"}, RoutingInstance: "ATT"},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, _ := BuildPBRRules(pbrTestConfig("inet6", filter, instances, nil))
 		if len(rules) != 1 {
 			t.Fatalf("expected 1 PBR rule, got %d", len(rules))
 		}
@@ -847,71 +819,40 @@ func TestBuildPBRRules(t *testing.T) {
 	})
 
 	t.Run("no criteria skipped", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet: map[string]*config.FirewallFilter{
-				"no-criteria": {
-					Name: "no-criteria",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:            "accept-all",
-							RoutingInstance: "ATT",
-							// No DSCP, no source, no dest — can't express as ip rule
-						},
-					},
-				},
+		filter := &config.FirewallFilter{
+			Name: "no-criteria",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "accept-all", RoutingInstance: "ATT"},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
 		if len(rules) != 0 {
 			t.Errorf("expected 0 PBR rules for no-criteria term, got %d", len(rules))
 		}
 	})
 
 	t.Run("unknown instance skipped", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet: map[string]*config.FirewallFilter{
-				"bad-ref": {
-					Name: "bad-ref",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:            "bad",
-							DSCPs:           []string{"ef"},
-							RoutingInstance: "NonExistent",
-						},
-					},
-				},
+		filter := &config.FirewallFilter{
+			Name: "bad-ref",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "bad", DSCPs: []string{"ef"}, RoutingInstance: "NonExistent"},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
 		if len(rules) != 0 {
 			t.Errorf("expected 0 PBR rules for unknown instance, got %d", len(rules))
 		}
 	})
 
 	t.Run("terms without routing-instance ignored", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet: map[string]*config.FirewallFilter{
-				"mixed": {
-					Name: "mixed",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:   "accept-term",
-							DSCPs:  []string{"ef"},
-							Action: "accept",
-						},
-						{
-							Name:            "route-term",
-							DSCPs:           []string{"af43"},
-							RoutingInstance: "ATT",
-						},
-					},
-				},
+		filter := &config.FirewallFilter{
+			Name: "mixed",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "accept-term", DSCPs: []string{"ef"}, Action: "accept"},
+				{Name: "route-term", DSCPs: []string{"af43"}, RoutingInstance: "ATT"},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
 		if len(rules) != 1 {
 			t.Fatalf("expected 1 PBR rule, got %d", len(rules))
 		}
@@ -921,32 +862,288 @@ func TestBuildPBRRules(t *testing.T) {
 	})
 
 	t.Run("multi-address cross product", func(t *testing.T) {
-		fw := &config.FirewallConfig{
-			FiltersInet: map[string]*config.FirewallFilter{
-				"multi": {
-					Name: "multi",
-					Terms: []*config.FirewallFilterTerm{
-						{
-							Name:            "cross",
-							SourceAddresses: []string{"10.0.1.0/24", "10.0.2.0/24"},
-							DestAddresses:   []string{"192.168.1.0/24", "192.168.2.0/24"},
-							RoutingInstance: "ATT",
-						},
-					},
+		filter := &config.FirewallFilter{
+			Name: "multi",
+			Terms: []*config.FirewallFilterTerm{
+				{
+					Name:            "cross",
+					SourceAddresses: []string{"10.0.1.0/24", "10.0.2.0/24"},
+					DestAddresses:   []string{"192.168.1.0/24", "192.168.2.0/24"},
+					RoutingInstance: "ATT",
 				},
 			},
 		}
-
-		rules := BuildPBRRules(fw, instances)
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
 		if len(rules) != 4 {
 			t.Fatalf("expected 4 PBR rules (2×2 cross product), got %d", len(rules))
 		}
 	})
 
-	t.Run("nil firewall", func(t *testing.T) {
-		rules := BuildPBRRules(nil, instances)
+	t.Run("nil config", func(t *testing.T) {
+		rules, err := BuildPBRRules(nil)
+		if len(rules) != 0 || err != nil {
+			t.Errorf("expected 0 rules / nil err for nil config, got %d / %v", len(rules), err)
+		}
+	})
+
+	// === #3430 RED-on-revert coverage ===
+
+	// H1: a defined-but-unattached filter must program NO ip rule. Pre-fix the
+	// builder walked the global filter catalog and emitted a rule.
+	t.Run("H1 unattached filter ignored", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "staged",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"ef"}, RoutingInstance: "ATT"},
+			},
+		}
+		cfg := &config.Config{RoutingInstances: instances}
+		cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{filter.Name: filter}
+		// No interface attachment.
+		rules, _ := BuildPBRRules(cfg)
 		if len(rules) != 0 {
-			t.Errorf("expected 0 PBR rules for nil config, got %d", len(rules))
+			t.Errorf("unattached filter must emit 0 PBR rules, got %d", len(rules))
+		}
+	})
+
+	// H1: a filter attached only as an OUTPUT filter is not FBF.
+	t.Run("H1 output-only attachment ignored", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "egress",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"ef"}, RoutingInstance: "ATT"},
+			},
+		}
+		cfg := &config.Config{RoutingInstances: instances}
+		cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{filter.Name: filter}
+		cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+			"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0, FilterOutputV4: filter.Name},
+			}},
+		}
+		rules, _ := BuildPBRRules(cfg)
+		if len(rules) != 0 {
+			t.Errorf("output-only attachment must emit 0 PBR rules, got %d", len(rules))
+		}
+	})
+
+	// H2: DSCP 0 (be / cs0 / numeric 0) is NOT representable as an ip rule (the
+	// netlink layer writes the rtmsg tos only when non-zero and has no FRA_DSCP
+	// escape hatch, and a zero tos matches ANY DSCP). The fail-safe disposition
+	// is DROP + degraded build error, NOT a silently over-matching rule.
+	// Pre-fix the builder emitted a TOSSet/TOS=0 rule that reached the wire with
+	// no tos selector and matched all DSCP.
+	t.Run("H2 dscp zero dropped and degraded", func(t *testing.T) {
+		for _, d := range []string{"be", "cs0", "0"} {
+			filter := &config.FirewallFilter{
+				Name: "z",
+				Terms: []*config.FirewallFilterTerm{
+					{Name: "t", DSCPs: []string{d}, RoutingInstance: "ATT"},
+				},
+			}
+			rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+			if len(rules) != 0 {
+				t.Errorf("dscp %q: expected 0 rules (dropped), got %d: %+v", d, len(rules), rules)
+			}
+			if err == nil {
+				t.Errorf("dscp %q: expected a degraded build error", d)
+			}
+		}
+	})
+
+	// H2: DSCP 0 combined with an address must NOT fall back to an address-only
+	// rule (that would over-match all DSCP from that source). Drop entirely.
+	t.Run("H2 dscp zero with address still dropped", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "zaddr",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"be"}, SourceAddresses: []string{"10.0.0.0/8"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 0 {
+			t.Errorf("dscp-0 + address must emit 0 rules (no address-only over-match), got %d: %+v", len(rules), rules)
+		}
+		if err == nil {
+			t.Error("expected a degraded build error")
+		}
+	})
+
+	// H2: within a multi-value DSCP set only the DSCP-0 value is dropped; the
+	// representable values still emit exact rules (with the degraded error).
+	t.Run("H2 multi-value dscp drops only zero", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "zmulti",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"be", "ef"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 1 {
+			t.Fatalf("expected 1 rule (ef kept, be dropped), got %d: %+v", len(rules), rules)
+		}
+		if rules[0].TOS != 184 || !rules[0].TOSSet {
+			t.Errorf("kept rule TOS=%d set=%v, want 184/true (ef)", rules[0].TOS, rules[0].TOSSet)
+		}
+		if err == nil {
+			t.Error("expected a degraded build error for the dropped be value")
+		}
+	})
+
+	// A representable nonzero DSCP reaches the wire: TOSSet true, TOS nonzero.
+	t.Run("H2 nonzero dscp emits tos selector", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "nz",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"ef"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 1 || rules[0].TOS != 184 || !rules[0].TOSSet {
+			t.Fatalf("expected 1 rule TOS=184/set, got %+v", rules)
+		}
+	})
+
+	// M1: `any` source widens to no selector; a bare host promotes to /32//128.
+	t.Run("M1 any and bare host", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "norm",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "anysrc", SourceAddresses: []string{"any"}, DSCPs: []string{"ef"}, RoutingInstance: "ATT"},
+				{Name: "host4", SourceAddresses: []string{"192.0.2.10"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 2 {
+			t.Fatalf("expected 2 rules, got %d", len(rules))
+		}
+		var anyR, hostR *PBRRule
+		for i := range rules {
+			if rules[i].TOSSet {
+				anyR = &rules[i]
+			} else {
+				hostR = &rules[i]
+			}
+		}
+		if anyR == nil || anyR.Src != "" {
+			t.Errorf("any source must yield empty Src (no selector), got %+v", anyR)
+		}
+		if hostR == nil || hostR.Src != "192.0.2.10/32" {
+			t.Errorf("bare host must promote to /32, got %+v", hostR)
+		}
+	})
+
+	t.Run("M1 bare host v6", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "norm6",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "host6", DestAddresses: []string{"2001:db8::1"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, _ := BuildPBRRules(pbrTestConfig("inet6", filter, instances, nil))
+		if len(rules) != 1 || rules[0].Dst != "2001:db8::1/128" {
+			t.Fatalf("bare v6 host must promote to /128, got %+v", rules)
+		}
+	})
+
+	// M2: source-prefix-list must expand to its prefixes.
+	t.Run("M2 prefix-list expansion", func(t *testing.T) {
+		pls := map[string]*config.PrefixList{
+			"corp": {Name: "corp", Prefixes: []string{"10.1.0.0/16", "10.2.0.0/16"}},
+		}
+		filter := &config.FirewallFilter{
+			Name: "pl",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", SourcePrefixLists: []config.PrefixListRef{{Name: "corp"}}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, pls))
+		if len(rules) != 2 {
+			t.Fatalf("expected 2 rules (one per prefix), got %d", len(rules))
+		}
+		got := map[string]bool{rules[0].Src: true, rules[1].Src: true}
+		if !got["10.1.0.0/16"] || !got["10.2.0.0/16"] {
+			t.Errorf("prefix-list not expanded: %+v", rules)
+		}
+	})
+
+	// M2: an empty positive prefix-list is constrained-but-matches-nothing →
+	// emit no rule (NOT a match-all widening).
+	t.Run("M2 empty positive prefix-list emits nothing", func(t *testing.T) {
+		pls := map[string]*config.PrefixList{"empty": {Name: "empty"}}
+		filter := &config.FirewallFilter{
+			Name: "ple",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", SourcePrefixLists: []config.PrefixListRef{{Name: "empty"}}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, pls))
+		if len(rules) != 0 {
+			t.Errorf("empty positive prefix-list must emit 0 rules, got %d: %+v", len(rules), rules)
+		}
+	})
+
+	// M2: an empty `except` prefix-list means "match everything NOT in {}" =
+	// match ALL → one unconstrained rule (Src ""), no degraded error.
+	t.Run("M2 empty except matches all", func(t *testing.T) {
+		pls := map[string]*config.PrefixList{"none": {Name: "none"}}
+		filter := &config.FirewallFilter{
+			Name: "plea",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"ef"}, SourcePrefixLists: []config.PrefixListRef{{Name: "none", Except: true}}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, pls))
+		if err != nil {
+			t.Fatalf("empty except must not degrade, got err: %v", err)
+		}
+		if len(rules) != 1 || rules[0].Src != "" {
+			t.Fatalf("empty except must yield one unconstrained rule (Src \"\"), got %+v", rules)
+		}
+	})
+
+	// M2: a non-empty `except` prefix-list cannot be represented as an ip rule
+	// → degraded build error AND no rule emitted (fail-safe).
+	t.Run("M2 non-empty except degrades", func(t *testing.T) {
+		pls := map[string]*config.PrefixList{"block": {Name: "block", Prefixes: []string{"10.9.0.0/16"}}}
+		filter := &config.FirewallFilter{
+			Name: "plx",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", SourcePrefixLists: []config.PrefixListRef{{Name: "block", Except: true}}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, pls))
+		if len(rules) != 0 {
+			t.Errorf("non-empty except must emit 0 rules, got %d", len(rules))
+		}
+		if err == nil {
+			t.Errorf("non-empty except must return a degraded build error")
+		}
+	})
+
+	// M3: an expansion beyond maxPBRRules truncates and reports degraded.
+	t.Run("M3 truncation degrades", func(t *testing.T) {
+		srcs := make([]string, 0, 40)
+		dsts := make([]string, 0, 40)
+		for i := 0; i < 40; i++ {
+			srcs = append(srcs, fmt.Sprintf("10.%d.0.0/16", i))
+			dsts = append(dsts, fmt.Sprintf("192.168.%d.0/24", i))
+		}
+		filter := &config.FirewallFilter{
+			Name: "big",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", SourceAddresses: srcs, DestAddresses: dsts, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != maxPBRRules {
+			t.Errorf("expected truncation to %d rules, got %d", maxPBRRules, len(rules))
+		}
+		if err == nil {
+			t.Errorf("overflow must return a degraded build error")
 		}
 	})
 }
