@@ -86,10 +86,52 @@ func TestValidateConfigNilSlotsNoPanic(t *testing.T) {
 		nil,                         // #3494: nil static route
 	}
 
+	// #3494 (round 3 — exhaustive whole-file sweep): the warning pass also
+	// derefs routing-instances, interface configs + units, redundancy-groups,
+	// and flow-monitoring template maps — all nil-tolerant pointer
+	// slices/maps. Inject a nil element into each so reverting any added guard
+	// panics.
+	cfg.RoutingInstances = []*RoutingInstanceConfig{
+		{Name: "ri1", Interfaces: []string{"ge-0/0/9.0"}}, // unknown iface -> warning
+		nil, // #3494: nil routing-instance
+	}
+	cfg.Interfaces.Interfaces = map[string]*InterfaceConfig{
+		"ge-0/0/1": {
+			Name: "ge-0/0/1",
+			Units: map[int]*InterfaceUnit{
+				0: {Number: 0, FilterInputV4: "no-such-filter"}, // undefined filter -> warning
+				1: nil,                                          // #3494: nil interface unit
+			},
+		},
+		"zz-nil-ifc": nil, // #3494: nil interface value
+	}
+	cfg.Chassis.Cluster = &ClusterConfig{
+		NoRethVRRP: true, // gate the redundancy-group loop on
+		RedundancyGroups: []*RedundancyGroup{
+			{ID: 1, StrictVIPOwnership: true}, // strict-vip + no-reth-vrrp -> warning
+			nil,                               // #3494: nil redundancy-group
+		},
+	}
+	cfg.Services.FlowMonitoring = &FlowMonitoringConfig{
+		Version9: &NetFlowV9Config{
+			Templates: map[string]*NetFlowV9Template{
+				"t9":          {Name: "t9", ExportExtensions: []string{"app-id"}}, // -> warning
+				"zz-nil-tmpl": nil,                                                // #3494: nil v9 template
+			},
+		},
+		VersionIPFIX: &NetFlowIPFIXConfig{
+			Templates: map[string]*NetFlowIPFIXTemplate{
+				"tx":          {Name: "tx", ExportExtensions: []string{"app-id"}}, // -> warning
+				"zz-nil-tmpl": nil,                                                // #3494: nil ipfix template
+			},
+		},
+	}
+
 	// Must not panic. We don't assert on exact warning text — only that the
 	// pass completes and still emits the warnings for the non-nil slots.
 	warnings := ValidateConfig(cfg)
 	if len(warnings) == 0 {
-		t.Fatalf("expected warnings for the undefined zone/screen/scheduler/NAT/address refs, got none")
+		t.Fatalf("expected warnings for the undefined zone/screen/scheduler/NAT/address/" +
+			"routing-instance/interface/redundancy-group/template refs, got none")
 	}
 }

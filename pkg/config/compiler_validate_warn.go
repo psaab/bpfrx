@@ -367,6 +367,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate routing-instance interface references
 	for _, ri := range cfg.RoutingInstances {
+		if ri == nil { // #3494: tolerant/HA-sync path may carry a nil routing-instance
+			continue
+		}
 		for _, ifName := range ri.Interfaces {
 			base := ifName
 			if idx := strings.Index(ifName, "."); idx > 0 {
@@ -382,7 +385,13 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate firewall filter references on interfaces
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #3494: tolerant/HA-sync path may carry a nil interface
+			continue
+		}
 		for unitNum, unit := range ifc.Units {
+			if unit == nil { // #3494: tolerant/HA-sync path may carry a nil unit
+				continue
+			}
 			if unit.FilterInputV4 != "" {
 				if _, ok := cfg.Firewall.FiltersInet[unit.FilterInputV4]; !ok {
 					warnings = append(warnings, fmt.Sprintf(
@@ -463,6 +472,9 @@ func ValidateConfig(cfg *Config) []string {
 	// Validate strict-vip-ownership requires VRRP (incompatible with no-reth-vrrp / private-rg-election)
 	if cc := cfg.Chassis.Cluster; cc != nil && (cc.NoRethVRRP || cc.PrivateRGElection) {
 		for _, rg := range cc.RedundancyGroups {
+			if rg == nil { // #3494: tolerant/HA-sync path may carry a nil redundancy-group
+				continue
+			}
 			if rg.StrictVIPOwnership {
 				warnings = append(warnings, fmt.Sprintf(
 					"redundancy-group %d: strict-vip-ownership incompatible with no-reth-vrrp (no VRRP instances to gate on)", rg.ID))
@@ -602,11 +614,17 @@ func ValidateConfig(cfg *Config) []string {
 		}
 		if fm.Version9 != nil {
 			for _, tmpl := range fm.Version9.Templates {
+				if tmpl == nil { // #3494: tolerant/HA-sync path may carry a nil template
+					continue
+				}
 				checkExtWarning("version9", tmpl.Name, tmpl.ExportExtensions)
 			}
 		}
 		if fm.VersionIPFIX != nil {
 			for _, tmpl := range fm.VersionIPFIX.Templates {
+				if tmpl == nil { // #3494: tolerant/HA-sync path may carry a nil template
+					continue
+				}
 				checkExtWarning("version-ipfix", tmpl.Name, tmpl.ExportExtensions)
 			}
 		}
