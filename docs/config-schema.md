@@ -175,6 +175,33 @@ trailing tokens, the silent-drop bug class. Pinned by
 `pkg/config/schema_validate_trailing_token_3332_test.go`
 (`TestSchema3332_*`, including the `application-set` opaque-container guard).
 
+**Compiler-side companion gate for the shapes the walker cannot reach.** Two
+silent-drop sites are NOT reachable by the schema-walk scalar gate and are
+caught by `validateTrailingTokensStrict` (`compiler_validate_strict.go`)
+instead, recorded on the typed struct during compile and rejected on the
+strict commit / commit-check path (lenient downgrade to a `cfg.Warnings`
+entry on the tolerant load / peer-sync path, `lenientTrailingTokens`):
+
+- **address-book `address <name> <prefix>` / `address <name> description
+  <text>`** — the `address` schema node is `multi:true` (it must absorb the
+  `description` sub-token onto its Keys to keep the #2419 dual-AST shape), so
+  the scalar gate (which exempts `multi`) never reaches the value slot and
+  `mergeAddressNode` reads only the prefix / `descriptionText` token.
+  `address h2 description web-server bogus` and `address h2 1.2.3.4/32 bogus`
+  now record the leftover on `Address.TrailingTokens` (global AND zone-local
+  books, since `resolveZoneLocalAddressBooks` copies only Value/Description).
+- **IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>`** — the
+  flat-set form lands `hostname <fqdn>` as a scalar CHILD the generic gate
+  covers, but the compact-hierarchical one-liner collapses the tokens onto the
+  parent `dynamic` node's Keys and `compileIPsec` reads only `Keys[2]`. The
+  leftover is recorded on `IPsecGateway.DynamicHostnameExtras`.
+
+The address-book `address-set description` leaf is deliberately NOT tagged
+`scalar: true`: `AddressSet` has no `Description` field and the compiler does
+not read it, so the value is currently unsupported and discarded — an arity
+gate there would assert validation on a no-op feature (tag it only if/when
+`AddressSet.Description` is wired).
+
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 
 `from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above

@@ -58,7 +58,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
 					"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 					"address-set": {desc: "Nested address set to include", args: 1, multi: true, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: nil},
-					"description": {desc: "Address set description", args: 1, scalar: true, placeholder: "<text>", children: nil},
+					// NOT tagged scalar:true (#3332): AddressSet has no Description
+					// field (types_security.go) and parseAddressBookEntries does
+					// not read an address-set `description` child, so the value is
+					// currently unsupported and discarded at compile. An arity gate
+					// here would assert validation on a feature that has no effect;
+					// tag it scalar only if/when AddressSet.Description is wired.
+					"description": {desc: "Address set description", args: 1, placeholder: "<text>", children: nil},
 				}},
 			}},
 		}},
@@ -329,7 +335,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
 				"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 				"address-set": {desc: "Nested address set to include", args: 1, multi: true, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: nil},
-				"description": {desc: "Address set description", args: 1, scalar: true, placeholder: "<text>", children: nil},
+				// NOT tagged scalar:true (#3332): AddressSet has no Description
+				// field (types_security.go) and parseAddressBookEntries does
+				// not read an address-set `description` child, so the value is
+				// currently unsupported and discarded at compile. An arity gate
+				// here would assert validation on a feature that has no effect;
+				// tag it scalar only if/when AddressSet.Description is wired.
+				"description": {desc: "Address set description", args: 1, placeholder: "<text>", children: nil},
 			}},
 		}},
 	}},

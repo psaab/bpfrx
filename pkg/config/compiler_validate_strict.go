@@ -2567,6 +2567,99 @@ func validateScreenUnknownStrict(cfg *Config) error {
 	return nil
 }
 
+// validateTrailingTokensStrict hard-rejects trailing tokens that rode past
+// the legitimate value arity of a config leaf the generic schema-walk scalar
+// gate cannot reach (#3332). Two shapes leak:
+//
+//   - address-book `address <name> <prefix>` / `address <name> description
+//     <text>`: the `address` schema node is `multi:true` (it must absorb the
+//     `description` sub-token onto its Keys to keep the #2419 dual-AST shape),
+//     so the scalar-leaf arity gate skips it, and the compiler reads only the
+//     prefix / description-text slot — `address h2 description web-server
+//     bogus` silently drops `bogus`.
+//   - IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>`: the
+//     flat-set form lands a `hostname` scalar CHILD the generic gate covers,
+//     but the compact form collapses the tokens onto the parent `dynamic`
+//     node's Keys and the compiler reads only Keys[2].
+//
+// Both record the leftover tokens on the typed struct during compile
+// (mergeAddressNode / compileIPsec); this gate makes the silent drop
+// operator-visible. Strict on commit / commit-check; the call site
+// (compiler.go) downgrades to a warning on the tolerant load / peer-sync
+// path so an already-persisted or peer-synced config still boots (#1960
+// no-brick) — the dropped token never reached the dataplane, so a leniently
+// loaded config runs exactly as it did before the gate. The walk is
+// deterministic (entries sorted by name). Mirrors validateScreenUnknownStrict.
+func validateTrailingTokensStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// Address books: the global book plus every zone-local book. The
+	// zone-local originals (sec.Zones[z].AddressBook) carry the recorded
+	// TrailingTokens; resolveZoneLocalAddressBooks copies only Value /
+	// Description into the qualified global entries, so both sources are
+	// walked to catch the leak regardless of attachment point.
+	checkBook := func(scope string, book *AddressBook) error {
+		if book == nil {
+			return nil
+		}
+		names := make([]string, 0, len(book.Addresses))
+		for name := range book.Addresses {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			addr := book.Addresses[name]
+			if addr == nil || len(addr.TrailingTokens) == 0 {
+				continue
+			}
+			return fmt.Errorf(
+				"security %saddress-book address %q: unexpected trailing token "+
+					"%q (an address takes a single prefix or `description "+
+					"<text>`; the extra token would be silently dropped — "+
+					"quote a multi-word description as `\"...\"`)",
+				scope, name, addr.TrailingTokens[0])
+		}
+		return nil
+	}
+	if err := checkBook("", cfg.Security.AddressBook); err != nil {
+		return err
+	}
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zn := range zoneNames {
+		z := cfg.Security.Zones[zn]
+		if z == nil {
+			continue
+		}
+		if err := checkBook(fmt.Sprintf("zones security-zone %s ", zn), z.AddressBook); err != nil {
+			return err
+		}
+	}
+
+	// IKE gateways: compact-hierarchical `dynamic hostname <fqdn> <extra>`.
+	gwNames := make([]string, 0, len(cfg.Security.IPsec.Gateways))
+	for name := range cfg.Security.IPsec.Gateways {
+		gwNames = append(gwNames, name)
+	}
+	sort.Strings(gwNames)
+	for _, gn := range gwNames {
+		gw := cfg.Security.IPsec.Gateways[gn]
+		if gw == nil || len(gw.DynamicHostnameExtras) == 0 {
+			continue
+		}
+		return fmt.Errorf(
+			"security ike gateway %q dynamic hostname: unexpected trailing "+
+				"token %q (the dynamic peer hostname is a single FQDN; the "+
+				"extra token would be silently dropped)",
+			gn, gw.DynamicHostnameExtras[0])
+	}
+	return nil
+}
+
 // validateFlowAgingStrict is the #3440 H2 commit-time gate for
 // `security flow aging`. The aging subtree was an opaque untyped schema
 // node, so its values were parsed with a bare strconv.Atoi and stored with

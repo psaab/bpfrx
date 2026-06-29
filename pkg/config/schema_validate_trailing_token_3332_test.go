@@ -77,13 +77,16 @@ func TestSchema3332_MultiValueLeaf_Accepted(t *testing.T) {
 	if err := SchemaValidate(tree, nil); err != nil {
 		t.Fatalf("unexpected error for multi-value leaf: %v", err)
 	}
-	// And the bracketed-list collapse spelling (a single set line with
-	// several values on one multi leaf).
+	// And a REAL #2419 bracketed-list collapse: one set line whose
+	// `[ ... ]` list collapses every value onto a single multi leaf's Keys
+	// (ParseSetCommand strips the brackets, SetPath absorbs the tail —
+	// Keys=[name-server 8.8.8.8 9.9.9.9 2001:4860:4860::8888]). The arity
+	// gate must NOT trip on the trailing list values of a multi leaf.
 	tree2 := buildSetTree3332(t,
-		"set security zones security-zone trust address-book address web 10.0.0.0/24",
+		"set system name-server [ 8.8.8.8 9.9.9.9 2001:4860:4860::8888 ]",
 	)
 	if err := SchemaValidate(tree2, nil); err != nil {
-		t.Fatalf("unexpected error for multi-value address leaf: %v", err)
+		t.Fatalf("unexpected error for bracketed multi-value list: %v", err)
 	}
 }
 
@@ -114,5 +117,133 @@ func TestSchema3332_NamedInstanceLeaf_Accepted(t *testing.T) {
 	)
 	if err := SchemaValidate(tree, nil); err != nil {
 		t.Fatalf("unexpected error for named-instance address leaf: %v", err)
+	}
+}
+
+// --- address-book `address` (multi:true) trailing tokens (#3332 fold) -------
+//
+// The `address` schema node is multi:true (it absorbs the `description`
+// sub-token onto its Keys to keep the #2419 dual-AST shape), so the generic
+// scalar-leaf gate cannot reach the description / prefix slot. The
+// compiler-side validateTrailingTokensStrict gate catches the leak. These
+// run the STRICT CompileConfig path (the commit / commit-check path).
+
+func TestSchema3332_AddressBookDescriptionTrailing_Rejected(t *testing.T) {
+	tree := buildSetTree3332(t,
+		"set security address-book global address h2 description web-server bogus",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit error for trailing token after address description, got nil (token silently dropped)")
+	}
+	if !strings.Contains(err.Error(), "h2") || !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("error should reference the address + offending token: %v", err)
+	}
+}
+
+func TestSchema3332_AddressBookPrefixTrailing_Rejected(t *testing.T) {
+	tree := buildSetTree3332(t,
+		"set security address-book global address h2 1.2.3.4/32 bogus",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit error for trailing token after address prefix, got nil")
+	}
+	if !strings.Contains(err.Error(), "h2") || !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("error should reference the address + offending token: %v", err)
+	}
+}
+
+// TestSchema3332_AddressBookZoneLocalTrailing_Rejected covers the zone-local
+// address book (#3061): the trailing token rides on the zone-local original
+// Address struct, which resolveZoneLocalAddressBooks does not copy into the
+// qualified global entry — the gate must walk the zone book too.
+func TestSchema3332_AddressBookZoneLocalTrailing_Rejected(t *testing.T) {
+	tree := buildSetTree3332(t,
+		"set security zones security-zone trust address-book address h2 description web-server bogus",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit error for trailing token on zone-local address description, got nil")
+	}
+	if !strings.Contains(err.Error(), "h2") || !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("error should reference the address + offending token: %v", err)
+	}
+}
+
+func TestSchema3332_AddressBookValidForms_Accepted(t *testing.T) {
+	// Bare prefix, and a quoted multi-word description (one token) — neither
+	// carries a trailing token.
+	tree := buildSetTree3332(t,
+		"set security address-book global address h2 1.2.3.4/32",
+		"set security address-book global address h3 description \"web server frontend\"",
+	)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("unexpected error for valid address-book forms: %v", err)
+	}
+	// And confirm the legitimate value/description still compiled through.
+	h2 := cfg.Security.AddressBook.Addresses["h2"]
+	h3 := cfg.Security.AddressBook.Addresses["h3"]
+	if h2 == nil || h2.Value != "1.2.3.4/32" {
+		t.Fatalf("h2 prefix not compiled: %+v", h2)
+	}
+	if h3 == nil || h3.Description != "web server frontend" {
+		t.Fatalf("h3 quoted description not compiled: %+v", h3)
+	}
+}
+
+// --- IKE gateway compact-hierarchical `dynamic hostname` (#3332 fold) -------
+//
+// The compact-hierarchical `dynamic hostname <fqdn> <extra>` collapses the
+// tokens onto the parent `dynamic` node's Keys (NOT a scalar child), so the
+// generic gate cannot see it; the compiler reads only Keys[2] and drops the
+// rest. Built with the hierarchical parser (NewParser is correct for a
+// hierarchical block — the flat-set caveat is about `set` lines).
+
+func parseHier3332(t *testing.T, input string) *ConfigTree {
+	t.Helper()
+	tree, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors for hierarchical input: %v", errs)
+	}
+	return tree
+}
+
+func TestSchema3332_DynamicHostnameCompactTrailing_Rejected(t *testing.T) {
+	tree := parseHier3332(t, `security {
+    ike {
+        gateway dyn-gw {
+            ike-policy pol1;
+            external-interface ge-0-0-0;
+            dynamic hostname peer.example.com bogus;
+        }
+    }
+}`)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit error for trailing token after dynamic hostname, got nil (token silently dropped)")
+	}
+	if !strings.Contains(err.Error(), "dyn-gw") || !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("error should reference the gateway + offending token: %v", err)
+	}
+}
+
+func TestSchema3332_DynamicHostnameCompactValid_Accepted(t *testing.T) {
+	tree := parseHier3332(t, `security {
+    ike {
+        gateway dyn-gw {
+            ike-policy pol1;
+            external-interface ge-0-0-0;
+            dynamic hostname peer.example.com;
+        }
+    }
+}`)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("unexpected error for valid compact dynamic hostname: %v", err)
+	}
+	if gw := cfg.Security.IPsec.Gateways["dyn-gw"]; gw == nil || gw.DynamicHostname != "peer.example.com" {
+		t.Fatalf("dynamic hostname not compiled: %+v", cfg.Security.IPsec.Gateways["dyn-gw"])
 	}
 }
