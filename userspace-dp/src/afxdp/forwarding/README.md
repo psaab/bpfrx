@@ -179,10 +179,20 @@ silently denied still triggered the lo0 reject/RST/teardown/counter/log. The
 `junos-host` security policy (#3019) still runs AFTER host-inbound admission
 (Junos order); the net local-delivery order is host-inbound → lo0 → junos-host.
 
-`host_inbound_admits` returns admit when the zone has **no** stanza (the
-zone is absent from `zone_host_inbound`), preserving the pre-#3070
-admit-all behaviour — a deliberate, zero-regression deviation from strict
-Junos (which denies host-bound traffic to an unconfigured zone). Token
+`host_inbound_admits` **denies by default** for every configured security zone
+(#3405 — Junos/vSRX parity). A zone with **no** `host-inbound-traffic` stanza is
+treated as an empty stanza: the Go control plane marks it
+`host_inbound_configured`, so it enters `zone_host_inbound` with an empty
+admission set and `admits()` returns deny for every service/protocol not
+explicitly permitted. Before #3405 a no-stanza zone was absent from the map and
+`host_inbound_admits` returned admit (`None => true`) — a permit-all
+management-plane exposure on any zone the operator never locked down. `None`
+now means only a genuinely unknown / global ingress zone (id not in the table),
+which keeps the admit default. The global ICMP/ND/PMTUD accepts precede the
+per-zone deny, and lifeline interfaces (fxp0/em0/fab*) never reach this AF_XDP
+classifier (the kernel serves their host-bound traffic and excludes them from
+the deny address sets), so the default-deny cannot strand management or break
+HA. Token
 classification covers the common Junos `system-services` (ssh, ping, dns,
 dhcp/dhcpv6, ike, ntp, snmp, ...) and `protocols` (ospf, bgp,
 router-discovery, ...) names; `system-services all` / `any-service`

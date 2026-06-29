@@ -102,8 +102,9 @@ func hostInboundLifelineInterface(name string, lifelines map[string]bool) bool {
 	return base == "em0" || strings.HasPrefix(base, "fab")
 }
 
-// BuildZoneHostInboundViews returns one ZoneHostInboundView per
-// host-inbound-CONFIGURED zone (#3070), resolving each zone's firewall-local
+// BuildZoneHostInboundViews returns one ZoneHostInboundView per configured
+// security zone (#3070; #3405 default-deny parity — every zone enforces, see
+// below), resolving each zone's firewall-local
 // host addresses via the canonical interface-snapshot builder (the same
 // resolution that populates the dataplane) PLUS each zone's RETH VRRP virtual
 // addresses (#3172, resolved from config so they scope the deny on the backup
@@ -127,8 +128,10 @@ func hostInboundLifelineInterface(name string, lifelines map[string]bool) bool {
 // always carried them — see TestBuildZoneHostInboundViewsScopesKernelLearnedAddr,
 // which exercises this real path with a config-absent kernel address.
 //
-// A zone that declared NO host-inbound-traffic stanza is omitted entirely
-// (admit-all preserved — zero regression). The only no-address case left is a
+// #3405: a zone that declared NO host-inbound-traffic stanza is NOT omitted —
+// it is treated as an empty stanza and gets a catch-all DROP scoped to its
+// firewall-local addresses (Junos default-deny: deny every host-bound
+// service/protocol not explicitly permitted). The only no-address case left is a
 // configured zone whose interfaces have neither a static config address nor any
 // live kernel address yet (e.g. a DHCP WAN before its first lease, or a backup
 // node before VIP install): it yields an empty address set, the daemon emits no
@@ -192,12 +195,21 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 			g.v4 = append(g.v4, host)
 		}
 	}
-	// configured reports whether a zone enforces host-inbound at all: a
-	// zone-level stanza OR any per-interface override (#3362). An unconfigured
-	// zone is skipped entirely (admit-all preserved, no deny emitted).
+	// configured reports whether a zone enforces host-inbound at all. #3405:
+	// EVERY configured security zone enforces host-inbound (Junos/vSRX
+	// default-deny parity) — a zone with interfaces but NO `host-inbound-traffic`
+	// stanza is treated identically to an empty stanza (`host-inbound-traffic
+	// { }`): it scopes a catch-all kernel DROP to its firewall-local addresses,
+	// denying every host-bound service/protocol not explicitly permitted. Before
+	// #3405 a no-stanza zone was skipped entirely (admit-all), a permit-all
+	// management-plane exposure on any zone the operator never locked down. The
+	// management / cluster-control lifeline interfaces (fxp0/em0/fab*) are
+	// excluded from the address sets below, and the established / ESP-AH / ND /
+	// PMTUD accepts precede every drop, so the default-deny can never strand
+	// management or break HA. A zone-level stanza or any per-interface override
+	// (#3362) still further scopes what the zone admits.
 	configured := func(zone *config.ZoneConfig) bool {
-		return zone != nil &&
-			(zone.HostInboundTraffic != nil || len(zone.InterfaceHostInbound) > 0)
+		return zone != nil
 	}
 
 	// Seed a zone-default group (zone-level effective tokens, no override) for
@@ -458,20 +470,28 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 		}
 		// #3070: carry the zone's host-inbound-traffic admission set onto the
 		// wire so the dataplane can enforce it for host-bound (local-delivery)
-		// traffic. A nil HostInboundTraffic means the zone declared no stanza:
-		// HostInboundConfigured stays false and the dataplane preserves
-		// admit-all for that zone.
+		// traffic.
 		//
-		// #3362: a zone is also host-inbound-ENFORCING when it carries any
-		// per-interface override even with NO zone-level stanza. The zone-keyed
-		// set then stays the zone-level set (possibly EMPTY → fail-closed
-		// deny-all for any interface in the zone WITHOUT an override), and the
-		// overridden interfaces are admitted via the per-interface ifindex map
-		// (InterfaceSnapshot.HostInbound*). Marking the zone configured here keeps
-		// the Rust XSK secondary path consistent with the kernel-nft primary path,
-		// which denies a non-overridden interface's addresses in such a zone.
-		if zone := cfg.Security.Zones[name]; zone != nil &&
-			(zone.HostInboundTraffic != nil || len(zone.InterfaceHostInbound) > 0) {
+		// #3405: EVERY configured security zone is host-inbound-ENFORCING (Junos
+		// default-deny parity). A zone with NO `host-inbound-traffic` stanza
+		// carries HostInboundConfigured=true with EMPTY token sets, so the Rust
+		// classifier inserts it into `zone_host_inbound` with an empty
+		// `ZoneHostInbound` -> `admits()` returns false for every
+		// service/protocol -> default-deny, identical to an empty
+		// `host-inbound-traffic { }` stanza and to the kernel-nft catch-all DROP
+		// (BuildZoneHostInboundViews). Before #3405 a no-stanza zone stayed
+		// unconfigured (absent from the table -> `None => true` admit-all), a
+		// permit-all management-plane exposure on any zone the operator never
+		// locked down. The global ICMP/ND/PMTUD accepts (#3171) still precede the
+		// per-zone deny on the Rust path, and lifeline interfaces (fxp0/em0/fab*)
+		// never reach the AF_XDP local-delivery classifier, so the flip cannot
+		// strand management or break HA.
+		//
+		// #3362: the zone-keyed set stays the zone-level set (possibly EMPTY ->
+		// fail-closed deny-all for any interface in the zone WITHOUT an override),
+		// and overridden interfaces are admitted via the per-interface ifindex map
+		// (InterfaceSnapshot.HostInbound*).
+		if zone := cfg.Security.Zones[name]; zone != nil {
 			zs.HostInboundConfigured = true
 			if zone.HostInboundTraffic != nil {
 				zs.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
