@@ -102,6 +102,14 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		if protocol == "" {
 			protocol = "udp"
 		}
+		// #3350: the final *tls.Config is nil — a TLS stream trusts the system
+		// CA roots (pkg/logging/syslog.go dialTLS). A named `transport
+		// tls-profile` is NOT honored here (there is no TLS profile definition
+		// stanza to resolve into a cert/CA/SNI config); it is rejected at commit
+		// by validateSecurityLogStreamTLSProfileAST so it can never silently
+		// degrade the secure-syslog posture. If profile resolution is ever
+		// implemented, build the *tls.Config from stream.Transport.TLSProfile
+		// here and lift that compiler reject.
 		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, srcAddr, protocol, nil)
 		if err != nil {
 			slog.Warn("failed to create syslog client",
