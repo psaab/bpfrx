@@ -307,9 +307,20 @@ var OperationalTree = map[string]*Node{
 								return nil
 							}
 							for _, zpp := range cfg.Security.Policies {
+								// #3476: skip a nil zone-pair set (tolerant /
+								// HA-sync config path the runtime walker skips)
+								// rather than dereferencing zpp.FromZone.
+								if zpp == nil {
+									continue
+								}
 								if zpp.FromZone == fromZone && zpp.ToZone == toZone {
 									names := make([]string, 0, len(zpp.Policies))
 									for _, p := range zpp.Policies {
+										// #3476: skip a nil rule rather than
+										// dereferencing p.Name.
+										if p == nil {
+											continue
+										}
 										names = append(names, p.Name)
 									}
 									return names

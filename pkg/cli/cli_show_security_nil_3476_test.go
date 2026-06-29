@@ -115,6 +115,64 @@ func TestCLIScreenDisplayNilProfileNoPanic(t *testing.T) {
 	})
 }
 
+// nilSlotZonesCLIStore mirrors nilSlotZonesGRPCStore for the local CLI: a zone
+// referencing a screen profile, a policy set, with a nil referenced profile, a
+// nil rule, and a nil zone-pair set injected. Drives the `show security zones`
+// detail renderer's present-but-nil screen lookup and policy-summary derefs.
+func nilSlotZonesCLIStore(t *testing.T) *configstore.Store {
+	t.Helper()
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if err := store.LoadOverride(`
+security {
+    zones {
+        security-zone trust {
+            screen sp;
+        }
+        security-zone untrust;
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            policy p1 {
+                match { source-address any; destination-address any; application any; }
+                then { permit; }
+            }
+        }
+    }
+    screen {
+        ids-option sp {
+            tcp { land; syn-flood; }
+        }
+    }
+}
+`); err != nil {
+		t.Fatalf("LoadOverride() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	cfg := store.ActiveConfig()
+	if cfg == nil || len(cfg.Security.Policies) == 0 {
+		t.Fatalf("fixture missing policies")
+	}
+	cfg.Security.Screen["sp"] = nil
+	cfg.Security.Policies[0].Policies = append(cfg.Security.Policies[0].Policies, nil)
+	cfg.Security.Policies = append(cfg.Security.Policies, nil)
+	return store
+}
+
+func TestCLIShowZonesDetailNilSlotsNoPanic(t *testing.T) {
+	store := nilSlotZonesCLIStore(t)
+	c := &CLI{store: store} // dp nil: skip counters, run screen+summary in detail mode
+	captureStdout(t, func() {
+		if err := c.showZonesDisplay(store.ActiveConfig(), true, ""); err != nil {
+			t.Fatalf("showZonesDisplay(detail): %v", err)
+		}
+	})
+}
+
 func TestCLIValueProviderPolicyNameNilSlotsNoPanic(t *testing.T) {
 	c := &CLI{store: nilSlotCLIStore(t)}
 	_ = c.valueProvider(config.ValueHintPolicyName,
