@@ -645,6 +645,13 @@ message MatchPoliciesResponse {
   // against the session table and the policy-deny/permit audit log even when
   // policy names collide across scopes. Set only when matched is true.
   uint32 policy_id = 11;
+  // default_used is true when no policy matched and `action` is the configured
+  // default-policy verdict (#3375), including the no-active-config fail-closed
+  // case (deny). It is the typed form of the " (default)" suffix on `action`,
+  // so a client can branch on the posture without string-parsing. False for a
+  // concrete policy match and for host_inbound_unmatched (which has no
+  // default-policy fallback).
+  bool default_used = 12;
 }
 
 // --- NAT rule counters ---

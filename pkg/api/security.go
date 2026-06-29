@@ -324,7 +324,11 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
-		writeOK(w, MatchPoliciesResult{Action: "deny (default)"})
+		// #3375: no active config is the deterministic fail-closed default deny.
+		// Surface the explicit string AND the typed default_used bit (same SSOT
+		// renderer the gRPC surface uses).
+		nilRes := policymatch.Result{DefaultUsed: true, Action: config.PolicyDeny}
+		writeOK(w, MatchPoliciesResult{Action: nilRes.DisplayAction(), DefaultUsed: true})
 		return
 	}
 
@@ -450,12 +454,12 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	if res.HostInboundUnmatched {
 		writeOK(w, MatchPoliciesResult{
 			HostInboundUnmatched: true,
-			Action:               "host-inbound (local delivery; not governed by transit/global/default policy)",
+			Action:               res.DisplayAction(),
 		})
 		return
 	}
 	if !res.Matched {
-		writeOK(w, MatchPoliciesResult{Action: policymatch.ActionString(res.Action) + " (default)"})
+		writeOK(w, MatchPoliciesResult{Action: res.DisplayAction(), DefaultUsed: res.DefaultUsed})
 		return
 	}
 	writeOK(w, MatchPoliciesResult{
@@ -465,7 +469,7 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		FromZone:     res.FromZone,
 		ToZone:       res.ToZone,
 		PolicyID:     res.PolicyID,
-		Action:       policymatch.ActionString(res.Action),
+		Action:       res.DisplayAction(),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,
 		Applications: res.Applications,

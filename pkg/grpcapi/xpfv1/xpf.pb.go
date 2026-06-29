@@ -6191,7 +6191,14 @@ type MatchPoliciesResponse struct {
 	// matched policy (#3331), so a match-policies answer can be cross-referenced
 	// against the session table and the policy-deny/permit audit log even when
 	// policy names collide across scopes. Set only when matched is true.
-	PolicyId      uint32 `protobuf:"varint,11,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	PolicyId uint32 `protobuf:"varint,11,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	// default_used is true when no policy matched and `action` is the configured
+	// default-policy verdict (#3375), including the no-active-config fail-closed
+	// case (deny). It is the typed form of the " (default)" suffix on `action`,
+	// so a client can branch on the posture without string-parsing. False for a
+	// concrete policy match and for host_inbound_unmatched (which has no
+	// default-policy fallback).
+	DefaultUsed   bool `protobuf:"varint,12,opt,name=default_used,json=defaultUsed,proto3" json:"default_used,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6301,6 +6308,13 @@ func (x *MatchPoliciesResponse) GetPolicyId() uint32 {
 		return x.PolicyId
 	}
 	return 0
+}
+
+func (x *MatchPoliciesResponse) GetDefaultUsed() bool {
+	if x != nil {
+		return x.DefaultUsed
+	}
+	return false
 }
 
 type GetNATRuleStatsRequest struct {
@@ -7590,7 +7604,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\xf9\x02\n" +
+	"_icmp_code\"\x9c\x03\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -7604,7 +7618,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\tfrom_zone\x18\t \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\n" +
 	" \x01(\tR\x06toZone\x12\x1b\n" +
-	"\tpolicy_id\x18\v \x01(\rR\bpolicyId\"N\n" +
+	"\tpolicy_id\x18\v \x01(\rR\bpolicyId\x12!\n" +
+	"\fdefault_used\x18\f \x01(\bR\vdefaultUsed\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
 	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +
