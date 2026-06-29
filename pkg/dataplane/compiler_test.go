@@ -866,3 +866,92 @@ func TestGREPerformanceAcceleration(t *testing.T) {
 		t.Errorf("GREAccel = %d, want 0", fc2.GREAccel)
 	}
 }
+
+// tunnelHostInboundTestDP records SetZoneConfig calls so the GRE
+// host-inbound auto-flag seam can be asserted on without netlink.
+type tunnelHostInboundTestDP struct {
+	DataPlane
+
+	zoneCfgs map[uint16]ZoneConfig
+}
+
+func (d *tunnelHostInboundTestDP) SetZoneConfig(zoneID uint16, cfg ZoneConfig) error {
+	if d.zoneCfgs == nil {
+		d.zoneCfgs = map[uint16]ZoneConfig{}
+	}
+	d.zoneCfgs[zoneID] = cfg
+	return nil
+}
+
+// greHostInboundCfg builds a config with a GRE tunnel whose source IP is
+// carried by zone "trust" (interface ge-0-0-0.0), plus an injected nil
+// *config.ZoneConfig map slot ("orphaned").
+func greHostInboundCfg() *config.Config {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0-0-0": {
+			Name: "ge-0-0-0",
+			Units: map[int]*config.InterfaceUnit{
+				0: {Addresses: []string{"10.0.0.1/24"}},
+			},
+		},
+		"gr-0-0-0": {
+			Name: "gr-0-0-0",
+			Tunnel: &config.TunnelConfig{
+				Name:        "gr-0-0-0",
+				Mode:        "gre",
+				Source:      "10.0.0.1",
+				Destination: "10.0.0.2",
+			},
+		},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Interfaces: []string{"ge-0-0-0.0"}},
+		// nil *ZoneConfig slot — reachable on the tolerant /
+		// programmatic / HA-peer-sync config paths (#3499).
+		"orphaned": nil,
+	}
+	return cfg
+}
+
+// TestApplyTunnelHostInboundSkipsNilZone covers issue #3499 (sibling of
+// #3492/#3496): a nil *config.ZoneConfig map value is reachable on the
+// tolerant/programmatic and HA-peer-sync config paths.
+// applyTunnelHostInbound — the netlink-free seam carved out of the
+// apply-path interface bring-down reconcile (compileZones), which owns the
+// issue's line ~632 `zone.Interfaces` and line ~662
+// `zone.HostInboundTraffic` derefs — must skip the nil zone, not panic,
+// while still applying the GRE host-inbound flag to the valid zone.
+//
+// RED-on-revert: removing either zone guard in applyTunnelHostInbound
+// (`if zone == nil` in the zone-scan loop or `if zone == nil` after the
+// autoFlags ZoneIDs lookup) makes this test panic with a nil pointer
+// dereference.
+func TestApplyTunnelHostInboundSkipsNilZone(t *testing.T) {
+	cfg := greHostInboundCfg()
+	result := &CompileResult{
+		ZoneIDs: map[string]uint16{"trust": 1, "orphaned": 2},
+	}
+	dp := &tunnelHostInboundTestDP{}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("applyTunnelHostInbound panicked on nil zone: %v", r)
+		}
+	}()
+	applyTunnelHostInbound(dp, cfg, result)
+
+	// The valid zone must still receive the auto GRE host-inbound flag —
+	// proves the nil-slot skips do not also skip real work.
+	zc, ok := dp.zoneCfgs[1]
+	if !ok {
+		t.Fatalf("expected SetZoneConfig for zone trust (id 1); got %#v", dp.zoneCfgs)
+	}
+	if zc.HostInbound&HostInboundGRE == 0 {
+		t.Fatalf("zone trust HostInbound = %#x, missing HostInboundGRE (%#x)",
+			zc.HostInbound, HostInboundGRE)
+	}
+	if _, ok := dp.zoneCfgs[2]; ok {
+		t.Fatalf("nil zone orphaned (id 2) must not be configured")
+	}
+}
