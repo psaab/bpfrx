@@ -1158,6 +1158,27 @@ reserved for whole-dataplane selection where a rewrite shim
   `pkg/config/compiler_dup_security_3562_test.go` (one duplicate-`security`-block
   RED-on-revert test per validator, built with `NewParser` for the
   hierarchical / `LoadOverride` path).
+- **#3566 (the SUB-level sibling of #3562 — descend with `forEachChild` at EVERY
+  container level, not just the top):** the SMR of PR #3565 found that four
+  flow-trace / log-stream gates iterated all top-level `security` roots (the
+  #3562 fix) but then descended with a first-only `FindChild` at the SUB-level,
+  so the same bypass survived ONE level down. `parseStatements` appends a
+  repeated block as a sibling at EVERY level — not just the top — so a duplicate
+  `flow {}` / `traceoptions {}` / `file` / `log {}` sub-block within one
+  `security {}` could still hide the offending stanza (e.g. a benign first
+  `flow { traceoptions { file good.log; } }` followed by a second
+  `flow { traceoptions { file ../../tmp/leak; } }`). The four gates now descend
+  `security > flow > traceoptions > file` (and `security > log`) with
+  `forEachChild` at EVERY level, leaving each inner leaf check + lenient-warn
+  (#1960) unchanged: `validateFlowTraceFileAST` (#3420),
+  `validateFlowTraceFlagsAndFiltersAST` (#3422), `validateFlowTraceSizeFilesAST`
+  (#3424) and `validateSecurityLogStreamTLSProfileAST` (#3350). RULE OF THUMB
+  (restated for descent): use `forEachChild` at EVERY container level a
+  strict-reject walk descends — a first-only `FindChild` at any intermediate
+  level is the bypass in a smaller costume. Regression coverage:
+  `pkg/config/compiler_dup_flow_subblock_3566_test.go` (per-validator
+  RED-on-revert subtests duplicating each descended level — `flow`,
+  `traceoptions`, `file`, `log` — built with `NewParser`).
 - **#3200 (host-inbound-traffic token validation):** `security zones <z>
   host-inbound-traffic { system-services <tok>; protocols <tok>; }` keeps its
   untyped-container schema shape (the leaves stay `children: nil` so flat-set
