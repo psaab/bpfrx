@@ -292,29 +292,73 @@ func resolvePrefixListAddrs(
 	cfg *config.Config,
 	filterName, termName, direction string,
 ) (addrs []string, except bool, constrained bool) {
-	// The direction is constrained iff the operator wrote ANY scope for it —
-	// literal addresses or prefix-list references — regardless of resolution.
-	constrained = len(literal) > 0 || len(refs) > 0
+	var prefixLists map[string]*config.PrefixList
+	if cfg != nil {
+		prefixLists = cfg.PolicyOptions.PrefixLists
+	}
+	return ResolveFilterPrefixListAddrs(literal, refs, prefixLists, filterName, termName, direction)
+}
+
+// filterAddrIsReal mirrors the Rust matcher's addr_is_real (userspace-dp
+// filter/compiler.rs): the empty string and the literal "any" are NO-CONSTRAINT
+// placeholders that parse_address drops, so they must NOT make a direction
+// address-constrained. Otherwise a `from source-address any` would fail closed
+// (constrained + empty-positive = match NOTHING) instead of the Junos match-ALL,
+// a control-plane lockout risk on the lo0 host filter (#3433 H01).
+func filterAddrIsReal(a string) bool { return a != "" && a != "any" }
+
+// ResolveFilterPrefixListAddrs is the SHARED single source of truth for lowering
+// a firewall-filter term's source/destination address + prefix-list scope into
+// the (addrs, except, constrained) triple the matcher consumes. It is exported so
+// the daemon lo0 kernel-nft mirror (pkg/daemon/daemon_nft.go) lowers addresses
+// with EXACTLY these semantics — empty-positive, empty-except, positive-wins on a
+// mixed term, and `any`-as-no-constraint — instead of a divergent raw string
+// concatenation (#3433). resolvePrefixListAddrs delegates here; see the doc on
+// resolvePrefixListAddrs for the full empty-set / except / mixed semantics.
+func ResolveFilterPrefixListAddrs(
+	literal []string,
+	refs []config.PrefixListRef,
+	prefixLists map[string]*config.PrefixList,
+	filterName, termName, direction string,
+) (addrs []string, except bool, constrained bool) {
+	// Drop the no-constraint placeholders ("any" / empty) from the literal list
+	// BEFORE deciding `constrained` so a bare `from source-address any` is
+	// unconstrained (match-ALL), matching the Rust matcher (addr_is_real /
+	// parse_address) and Junos. A real literal alongside `any` keeps its scope —
+	// `[ any 10/8 ]` matches 10/8 (the `any` is ignored), unchanged from the Rust
+	// behavior where parse_address drops only the `any` token.
+	realLiteral := make([]string, 0, len(literal))
+	for _, a := range literal {
+		if filterAddrIsReal(a) {
+			realLiteral = append(realLiteral, a)
+		}
+	}
+
+	// The direction is constrained iff the operator wrote ANY real scope for it —
+	// a real literal address or a prefix-list reference — regardless of
+	// resolution. A prefix-list reference ALWAYS constrains (even when it resolves
+	// empty / is unresolved on the lenient path), so the matcher fails closed.
+	constrained = len(realLiteral) > 0 || len(refs) > 0
 
 	if len(refs) == 0 {
-		// No prefix-lists: copy the literal addresses verbatim (never share the
-		// term's backing slice).
-		if len(literal) == 0 {
+		// No prefix-lists: copy the real literal addresses verbatim (never share
+		// the term's backing slice).
+		if len(realLiteral) == 0 {
 			return nil, false, false
 		}
-		out := make([]string, len(literal))
-		copy(out, literal)
+		out := make([]string, len(realLiteral))
+		copy(out, realLiteral)
 		return out, false, true
 	}
 
 	var positive []string
-	positive = append(positive, literal...)
+	positive = append(positive, realLiteral...)
 	var exceptPrefixes []string
 	hasExcept := false
 	hasPositiveRef := false
 
 	for _, ref := range refs {
-		pl := cfg.PolicyOptions.PrefixLists[ref.Name]
+		pl := prefixLists[ref.Name]
 		if pl == nil {
 			// Undefined reference. The strict gate rejects this at commit; on
 			// the tolerant path it is a warning and we contribute no prefixes
