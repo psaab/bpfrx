@@ -6764,6 +6764,58 @@ fn disposition_counters_hot_screen_drops_accumulate_in_batch() {
     );
 }
 
+// #3343: record_screen_drop bumps BOTH the aggregate and the matching
+// per-reason ordinal, and the per-reason slots flush element-wise into the
+// live atomics + snapshot. FAIL-ON-REVERT: dropping the per-reason bump in
+// record_screen_drop (or the per-reason flush loop) leaves the asserted
+// ordinals at 0.
+#[test]
+fn record_screen_drop_populates_per_reason_counters() {
+    use crate::screen::screen_reason_drop_index;
+    let live = BindingLiveState::new();
+    let mut counters = BatchCounters::default();
+
+    counters.record_screen_drop("syn-flood");
+    counters.record_screen_drop("syn-flood");
+    counters.record_screen_drop("port-scan");
+    counters.record_screen_drop("session-limit-src");
+    counters.record_screen_drop("session-limit-dst");
+    // A reason with no published ordinal bumps only the aggregate.
+    counters.record_screen_drop("syn-cookie");
+
+    let syn_flood = screen_reason_drop_index("syn-flood").unwrap();
+    let port_scan = screen_reason_drop_index("port-scan").unwrap();
+    let session_limit = screen_reason_drop_index("session-limit-src").unwrap();
+    assert_eq!(
+        screen_reason_drop_index("session-limit-dst").unwrap(),
+        session_limit,
+        "both session-limit reasons fold onto one ordinal"
+    );
+    assert!(screen_reason_drop_index("syn-cookie").is_none());
+
+    assert_eq!(counters.screen_drops, 6, "aggregate counts every drop");
+    assert_eq!(counters.screen_reason_drops[syn_flood], 2);
+    assert_eq!(counters.screen_reason_drops[port_scan], 1);
+    assert_eq!(counters.screen_reason_drops[session_limit], 2);
+
+    counters.flush(&live);
+    assert_eq!(
+        counters.screen_reason_drops[syn_flood], 0,
+        "batch per-reason slot clears after flush"
+    );
+    assert_eq!(live.screen_reason_drops[syn_flood].load(Ordering::Relaxed), 2);
+    assert_eq!(live.screen_reason_drops[port_scan].load(Ordering::Relaxed), 1);
+    assert_eq!(
+        live.screen_reason_drops[session_limit].load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(live.screen_drops.load(Ordering::Relaxed), 6);
+
+    let snap = live.snapshot();
+    assert_eq!(snap.screen_reason_drops[syn_flood], 2);
+    assert_eq!(snap.screen_reason_drops[session_limit], 2);
+}
+
 #[test]
 fn syn_cookie_counters_hot_path_accumulate_in_batch() {
     let live = BindingLiveState::new();

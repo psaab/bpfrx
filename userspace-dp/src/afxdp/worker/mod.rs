@@ -1350,6 +1350,10 @@ pub(crate) struct BindingLiveSnapshot {
     /// #3326: host-inbound admission denies on the LocalDelivery path.
     pub(crate) host_inbound_denied_packets: u64,
     pub(crate) screen_drops: u64,
+    /// #3343: per-screen-reason DROP counters (ordinals per
+    /// `screen::screen_reason_drop_index`), threaded from `BindingLiveState`
+    /// to `BindingStatus` so the Go control plane can attribute screen drops.
+    pub(crate) screen_reason_drops: [u64; crate::screen::SCREEN_REASON_DROP_COUNT],
     /// #1374: SYN-cookie challenge decisions selected by userspace screen
     /// runtime.
     pub(crate) syn_cookie_challenges: u64,

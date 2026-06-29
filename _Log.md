@@ -23944,3 +23944,28 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3431 — accumulate ALL values of multi-value NAT `match` leaves (application/protocol/source-address-name/destination-address-name); validate every value; expand union in userspace snapshot build. Added NATMatch plural slices + List() accessors. RED-on-revert tests (both AST shapes + snapshot path). Doc update.
   - **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go, pkg/config/compiler_validate_strict.go, pkg/dataplane/userspace/nat.go, pkg/natshow/{dest,source}.go, docs/config-schema.md, pkg/config/compiler_nat_match_multivalue_3431_test.go, pkg/dataplane/userspace/nat_match_multivalue_3431_test.go
+
+## #3343 — per-screen drop reason counters published (2026-06-29)
+- **Action**: Surface per-screen-reason DROP counters from the Rust AF_XDP
+  dataplane through the Go counter bridge into every screen-statistics surface.
+  Rust: `BatchCounters.record_screen_drop` + `screen_reason_drops` array threaded
+  through BatchCounters/BindingLiveState/snapshot/BindingLiveSnapshot/refresh/
+  BindingStatus; `screen::screen_reason_drop_index` reason→ordinal map.
+  Go: `dataplane.ScreenReasonCounters` SSOT table, `BindingStatus.ScreenReasonDrops`,
+  `sumBindingCounters` element-wise sum, `syncBPFCountersLocked` per-reason push
+  into GlobalCtrScreen* indices; replaced 6 duplicated hardcoded reason lists
+  (added port-scan/ip-sweep/session-limit) in CLI/gRPC/REST/Prometheus; new
+  `xpf_screen_drops_by_reason_total{reason}` metric; `ReadUserspaceCounterOffset`.
+  Regenerated protocol_wire_v1.json.
+- **File(s)**: userspace-dp/src/{screen/mod.rs, afxdp/mod.rs, afxdp/umem/mod.rs,
+  afxdp/umem/snapshot.rs, afxdp/worker/mod.rs, afxdp/coordinator/refresh_bindings.rs,
+  afxdp/poll_stages.rs, afxdp/poll_descriptor/mod.rs, protocol/binding.rs,
+  afxdp/tests.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/{types.go, maps_counters.go}, pkg/dataplane/userspace/{protocol.go,
+  manager_ha.go, manager_test.go}, pkg/grpcapi/{server_show_status.go,
+  server_show_security_text.go}, pkg/cli/{cli_show_flow.go, cli_show_security_screen.go,
+  cli_show_security_log.go}, pkg/api/{metrics.go, metrics_descriptors.go,
+  metrics_counters.go}, docs/junos-cli-reference.md
+- **Timestamp**: 2026-06-29 (review fold)
+  - **Action**: #3343 MERGE-NEEDS-MINOR fold — pin the API-visible screen_drop_details / per-reason key names to the dataplane.ScreenReasonCounters SSOT (canonical Rust ScreenVerdict::Drop strings; the #3343 SSOT routing renamed gRPC keys tear-drop->teardrop, syn-fragment->syn-frag). Added a dataplane SSOT contract test (ordinal->index/reason/label, dup/legacy guards) and a grpcapi GetGlobalStats key-pin test (canonical 15 keys + values, no legacy keys, exact count). Both verified RED on a key re-rename.
+  - **File(s)**: pkg/dataplane/screen_reason_counters_3343_test.go (new), pkg/grpcapi/global_stats_screen_keys_3343_test.go (new), _Log.md

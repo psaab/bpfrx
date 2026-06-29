@@ -150,29 +150,13 @@ func (c *CLI) showStatistics(detail bool) error {
 	screenDrops := readCounter(dataplane.GlobalCtrScreenDrops)
 	if screenDrops > 0 {
 		fmt.Printf("\nScreen drop details:\n")
-		screenCounters := []struct {
-			idx  uint32
-			name string
-		}{
-			{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
-			{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
-			{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
-			{dataplane.GlobalCtrScreenPortScan, "Port scan"},
-			{dataplane.GlobalCtrScreenIPSweep, "IP sweep"},
-			{dataplane.GlobalCtrScreenLandAttack, "Land attack"},
-			{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
-			{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
-			{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
-			{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
-			{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
-			{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
-			{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
-			{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
-		}
-		for _, sc := range screenCounters {
-			v := readCounter(sc.idx)
+		// #3343: shared screen-reason table — adds the previously-omitted
+		// session-limit row and keeps every surface on the same reason set.
+		for i := range dataplane.ScreenReasonCounters {
+			rc := &dataplane.ScreenReasonCounters[i]
+			v := readCounter(rc.Index)
 			if v > 0 {
-				fmt.Printf("  %-25s %d\n", sc.name+":", v)
+				fmt.Printf("  %-25s %d\n", rc.Label+":", v)
 			}
 		}
 	}
@@ -1020,29 +1004,13 @@ func (c *CLI) showFlowStatistics() error {
 		fmt.Println()
 		fmt.Printf("  %-30s %d\n", "Screen drops (total):", screenDrops)
 
-		screenCounters := []struct {
-			idx  uint32
-			name string
-		}{
-			{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
-			{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
-			{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
-			{dataplane.GlobalCtrScreenPortScan, "Port scan"},
-			{dataplane.GlobalCtrScreenIPSweep, "IP sweep"},
-			{dataplane.GlobalCtrScreenLandAttack, "Land attack"},
-			{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
-			{dataplane.GlobalCtrScreenTearDrop, "Tear drop"},
-			{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN-FIN"},
-			{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
-			{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
-			{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
-			{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
-			{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
-		}
-		for _, sc := range screenCounters {
-			v := readCounter(sc.idx)
+		// #3343: shared screen-reason table — session-limit now appears in the
+		// detailed breakdown alongside the rest.
+		for i := range dataplane.ScreenReasonCounters {
+			rc := &dataplane.ScreenReasonCounters[i]
+			v := readCounter(rc.Index)
 			if v > 0 {
-				fmt.Printf("    %-28s %d\n", sc.name+":", v)
+				fmt.Printf("    %-28s %d\n", rc.Label+":", v)
 			}
 		}
 	}

@@ -5683,13 +5683,16 @@ func TestSumBindingCounters(t *testing.T) {
 				PolicyDeniedPackets:      3,
 				HostInboundDeniedPackets: 6,
 				ScreenDrops:              2,
-				SYNCookieSynAckSent:      7,
-				SYNCookieAckValid:        11,
-				SYNCookieAckInvalid:      13,
-				SYNCookieBypass:          17,
-				SNATPackets:              20,
-				DNATPackets:              15,
-				Nat64Translations:        9,
+				// #3343: per-reason screen drops, one element per
+				// dataplane.ScreenReasonCounters ordinal.
+				ScreenReasonDrops:   []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+				SYNCookieSynAckSent: 7,
+				SYNCookieAckValid:   11,
+				SYNCookieAckInvalid: 13,
+				SYNCookieBypass:     17,
+				SNATPackets:         20,
+				DNATPackets:         15,
+				Nat64Translations:   9,
 			},
 			{
 				RXPackets:                200,
@@ -5700,6 +5703,7 @@ func TestSumBindingCounters(t *testing.T) {
 				PolicyDeniedPackets:      7,
 				HostInboundDeniedPackets: 14,
 				ScreenDrops:              4,
+				ScreenReasonDrops:        []uint64{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150},
 				SYNCookieSynAckSent:      17,
 				SYNCookieAckValid:        19,
 				SYNCookieAckInvalid:      23,
@@ -5760,6 +5764,69 @@ func TestSumBindingCounters(t *testing.T) {
 	// snat/dnat and pushed into GlobalCtrNAT64Xlate by syncBPFCountersLocked.
 	if s.nat64Translations != 30 {
 		t.Fatalf("nat64Translations = %d, want 30", s.nat64Translations)
+	}
+	// #3343: per-reason screen drops sum element-wise across bindings. RED if
+	// the `s.screenReasonDrops[i] += b.ScreenReasonDrops[i]` loop is reverted
+	// (the per-reason GlobalCtrScreen* counters would then stay 0).
+	for i := 0; i < dataplane.ScreenReasonDropCount; i++ {
+		want := uint64((i + 1) * 11) // (i+1) + (i+1)*10
+		if s.screenReasonDrops[i] != want {
+			t.Fatalf("screenReasonDrops[%d] (%s) = %d, want %d",
+				i, dataplane.ScreenReasonCounters[i].Reason, s.screenReasonDrops[i], want)
+		}
+	}
+}
+
+// TestSyncBPFCountersPushesPerScreenReason is the #3343 fail-on-revert guard
+// for the publish path: the userspace helper reports per-screen-reason drops in
+// BindingStatus.ScreenReasonDrops, and syncBPFCountersLocked must push each
+// ordinal's delta into its dataplane.GlobalCtrScreen* global counter so the
+// CLI/gRPC/REST/Prometheus screen-statistics surfaces (which read those
+// GlobalCtrScreen* indices) stop reading a permanent 0. Reverting the push loop
+// in syncBPFCountersLocked leaves every per-reason counter at 0 and fails the
+// per-reason ReadGlobalCounter assertions below.
+func TestSyncBPFCountersPushesPerScreenReason(t *testing.T) {
+	m := New()
+
+	// Two bindings, every per-reason ordinal exercised with a distinct value so
+	// a wrong ordinal→index mapping (or a missing reason like port-scan /
+	// ip-sweep / session-limit) is detectable.
+	b0 := make([]uint64, dataplane.ScreenReasonDropCount)
+	b1 := make([]uint64, dataplane.ScreenReasonDropCount)
+	for i := range b0 {
+		b0[i] = uint64(i + 1)
+		b1[i] = uint64((i + 1) * 100)
+	}
+	status := &ProcessStatus{
+		Bindings: []BindingStatus{
+			{Slot: 0, ScreenReasonDrops: b0},
+			{Slot: 1, ScreenReasonDrops: b1},
+		},
+	}
+
+	m.mu.Lock()
+	m.syncBPFCountersLocked(status)
+	m.mu.Unlock()
+
+	// syncBPFCountersLocked pushes each ordinal's delta into its GlobalCtrScreen*
+	// index via IncrementGlobalCounter, which records the userspace offset
+	// independent of any loaded BPF map — so the publish path is assertable
+	// without BPF privileges. Reading the in-memory offset is exactly what
+	// ReadGlobalCounter merges in for the live CLI/gRPC/REST/Prometheus reads.
+	for i := range dataplane.ScreenReasonCounters {
+		rc := &dataplane.ScreenReasonCounters[i]
+		want := uint64((i + 1) * 101) // (i+1) + (i+1)*100
+		got := m.bpfShim.ReadUserspaceCounterOffset(rc.Index)
+		if got != want {
+			t.Fatalf("per-reason counter %s (idx=%d) = %d, want %d (push loop reverted?)",
+				rc.Reason, rc.Index, got, want)
+		}
+	}
+
+	// The aggregate GlobalCtrScreenDrops must not be inflated by the per-reason
+	// push (the helper bumps the aggregate separately via b.ScreenDrops).
+	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrScreenDrops); got != 0 {
+		t.Fatalf("aggregate GlobalCtrScreenDrops = %d, want 0 (per-reason push must not touch it)", got)
 	}
 }
 

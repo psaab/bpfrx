@@ -18,19 +18,24 @@ type xpfCollector struct {
 	mu  sync.Mutex
 
 	// Global counters
-	packetsTotal            *prometheus.Desc
-	dropsTotal              *prometheus.Desc
-	sessionsCreatedTotal    *prometheus.Desc
-	sessionsClosedTotal     *prometheus.Desc
-	screenDropsTotal        *prometheus.Desc
-	policyDeniesTotal       *prometheus.Desc
-	natAllocFailsTotal      *prometheus.Desc
-	nat64XlateTotal         *prometheus.Desc
-	hostInboundDeny         *prometheus.Desc
-	hostInboundKernelDenies *prometheus.Desc
-	tcEgressPacketsTotal    *prometheus.Desc
-	syncookieTotal          *prometheus.Desc
-	flowCacheTotal          *prometheus.Desc
+	packetsTotal         *prometheus.Desc
+	dropsTotal           *prometheus.Desc
+	sessionsCreatedTotal *prometheus.Desc
+	sessionsClosedTotal  *prometheus.Desc
+	screenDropsTotal     *prometheus.Desc
+	// #3343: per-screen-reason drop counter, labeled by reason. The aggregate
+	// xpf_screen_drops_total above cannot answer "which screen fired?"; this
+	// labeled series can, now that the userspace bridge populates the per-reason
+	// GlobalCtrScreen* counters.
+	screenDropsByReasonTotal *prometheus.Desc
+	policyDeniesTotal        *prometheus.Desc
+	natAllocFailsTotal       *prometheus.Desc
+	nat64XlateTotal          *prometheus.Desc
+	hostInboundDeny          *prometheus.Desc
+	hostInboundKernelDenies  *prometheus.Desc
+	tcEgressPacketsTotal     *prometheus.Desc
+	syncookieTotal           *prometheus.Desc
+	flowCacheTotal           *prometheus.Desc
 
 	// #3345: monotonic count of global-counter map reads that failed during
 	// a scrape. A failed read SKIPS emitting that counter's sample (so a
@@ -481,6 +486,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.sessionsCreatedTotal
 	ch <- c.sessionsClosedTotal
 	ch <- c.screenDropsTotal
+	ch <- c.screenDropsByReasonTotal
 	ch <- c.policyDeniesTotal
 	ch <- c.natAllocFailsTotal
 	ch <- c.nat64XlateTotal

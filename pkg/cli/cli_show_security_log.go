@@ -245,29 +245,17 @@ func (c *CLI) showSecurityAlarms(args []string) error {
 			}
 			return v
 		}
-		screenNames := []struct {
-			idx  uint32
-			name string
-		}{
-			{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
-			{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
-			{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
-			{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
-			{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
-			{dataplane.GlobalCtrScreenTearDrop, "Tear-drop"},
-			{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
-			{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no-flag"},
-			{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN-no-ACK"},
-			{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
-			{dataplane.GlobalCtrScreenIPSrcRoute, "IP source-route"},
-			{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
-		}
-		for _, s := range screenNames {
-			val := readCtr(s.idx)
+		// #3343: iterate the shared screen-reason table so port-scan, ip-sweep,
+		// and session-limit raise alarms too (they were omitted before, so an
+		// active scan/sweep/session-limit attack read "No security alarms
+		// currently active"), and the reason set matches the other surfaces.
+		for i := range dataplane.ScreenReasonCounters {
+			rc := &dataplane.ScreenReasonCounters[i]
+			val := readCtr(rc.Index)
 			if val > 0 {
 				alarmCount++
 				if detail {
-					fmt.Printf("Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, s.name, val)
+					fmt.Printf("Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, rc.Label, val)
 				}
 			}
 		}

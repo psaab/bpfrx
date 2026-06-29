@@ -98,6 +98,44 @@ pub(crate) use syncookie::{
     SYN_COOKIE_MSS_MASK, SYN_COOKIE_MSS_SHIFT, SipHash24, SynCookieValidatedCache,
 };
 
+/// #3343: number of per-screen-reason DROP counters published to the Go
+/// control plane. Each ordinal maps 1:1 to a `GlobalCtrScreen*` index on the
+/// Go side (`pkg/dataplane.ScreenReasonCounters`, which is a fixed-size array
+/// of exactly this many entries). The wire array `BindingStatus.screen_reason_drops`
+/// carries one u64 per ordinal; the committed `tests/fixtures/protocol_wire_v1.json`
+/// fixture pins the length so a divergence between the two sides fails the
+/// `wire_invariant_default_specimens` test.
+pub(crate) const SCREEN_REASON_DROP_COUNT: usize = 15;
+
+/// Map a screen DROP reason string to its published per-reason counter ordinal
+/// (#3343), or `None` for reasons that are surfaced only through the aggregate
+/// `screen_drops` counter (SYN-cookie challenge/validation drops,
+/// ICMP-fragment, IP-malformed parse-error). The ordinal order MUST stay in
+/// lockstep with `pkg/dataplane.ScreenReasonCounters`. The two `session-limit-*`
+/// reasons fold onto the single `session-limit` ordinal because the Go side
+/// exposes one combined `GlobalCtrScreenSessionLimit` counter.
+#[inline]
+pub(crate) fn screen_reason_drop_index(reason: &str) -> Option<usize> {
+    Some(match reason {
+        "syn-flood" => 0,
+        "icmp-flood" => 1,
+        "udp-flood" => 2,
+        "port-scan" => 3,
+        "ip-sweep" => 4,
+        "land-attack" => 5,
+        "ping-of-death" => 6,
+        "teardrop" => 7,
+        "tcp-syn-fin" => 8,
+        "tcp-no-flag" => 9,
+        "tcp-fin-no-ack" => 10,
+        "winnuke" => 11,
+        "ip-source-route" => 12,
+        "syn-frag" => 13,
+        "session-limit-src" | "session-limit-dst" => 14,
+        _ => return None,
+    })
+}
+
 use crate::tcp_flags::{is_closing, is_initial_syn};
 use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
 // #2151: production screen no longer references these directly (the

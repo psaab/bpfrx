@@ -773,6 +773,51 @@ var ScreenFlagNames = map[uint32]string{
 	ScreenScanTablePressure: "scan-table pressure",
 }
 
+// ScreenReasonDropCount is the number of published per-screen-reason DROP
+// counters. It MUST equal the userspace-dp Rust constant
+// `screen::SCREEN_REASON_DROP_COUNT` and the length of the
+// `BindingStatus.screen_reason_drops` wire array; the committed wire fixture
+// (`userspace-dp/tests/fixtures/protocol_wire_v1.json`) pins that array length,
+// so a drift between the two sides fails the Rust wire-invariant test.
+const ScreenReasonDropCount = 15
+
+// ScreenReasonCounter describes one published per-screen-reason DROP counter
+// (#3343). Before #3343 the userspace counter bridge surfaced only the
+// aggregate screen_drops, so every per-reason GlobalCtrScreen* counter read a
+// permanent 0 and the CLI/gRPC/REST/Prometheus screen-statistics surfaces could
+// not attribute a drop to a specific screen check. This table is the single
+// source of truth for those surfaces: the ordinal order matches the Rust
+// `BindingStatus.screen_reason_drops` wire array (each ordinal's count is pushed
+// into Index by the userspace manager), and Reason/Label give consistent
+// machine keys (gRPC detail map / Prometheus label) and display strings so the
+// previously-duplicated, reason-omitting hardcoded lists agree.
+type ScreenReasonCounter struct {
+	Index  uint32 // GlobalCtrScreen* global-counter index this reason feeds
+	Reason string // stable machine key (Prometheus label, gRPC detail-map key)
+	Label  string // human display label for CLI / gRPC text surfaces
+}
+
+// ScreenReasonCounters is ordered to match the userspace-dp wire array ordinal
+// for ordinal i. The two Rust session-limit reasons fold onto the single
+// combined GlobalCtrScreenSessionLimit entry here.
+var ScreenReasonCounters = [ScreenReasonDropCount]ScreenReasonCounter{
+	{GlobalCtrScreenSynFlood, "syn-flood", "SYN flood"},
+	{GlobalCtrScreenICMPFlood, "icmp-flood", "ICMP flood"},
+	{GlobalCtrScreenUDPFlood, "udp-flood", "UDP flood"},
+	{GlobalCtrScreenPortScan, "port-scan", "port scan"},
+	{GlobalCtrScreenIPSweep, "ip-sweep", "IP sweep"},
+	{GlobalCtrScreenLandAttack, "land-attack", "LAND attack"},
+	{GlobalCtrScreenPingOfDeath, "ping-of-death", "ping of death"},
+	{GlobalCtrScreenTearDrop, "teardrop", "teardrop"},
+	{GlobalCtrScreenTCPSynFin, "tcp-syn-fin", "TCP SYN+FIN"},
+	{GlobalCtrScreenTCPNoFlag, "tcp-no-flag", "TCP no-flag"},
+	{GlobalCtrScreenTCPFinNoAck, "tcp-fin-no-ack", "TCP FIN-no-ACK"},
+	{GlobalCtrScreenWinNuke, "winnuke", "WinNuke"},
+	{GlobalCtrScreenIPSrcRoute, "ip-source-route", "IP source-route"},
+	{GlobalCtrScreenSynFrag, "syn-frag", "SYN fragment"},
+	{GlobalCtrScreenSessionLimit, "session-limit", "session limit"},
+}
+
 // SessionCountKey mirrors the C struct session_count_key.
 type SessionCountKey struct {
 	IP     uint32
