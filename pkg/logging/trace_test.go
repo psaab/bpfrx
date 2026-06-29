@@ -2,8 +2,95 @@ package logging
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
+
+// TestNewTraceWriterRejectsPathTraversal verifies the #3420 runtime guard:
+// NewTraceWriter refuses an absolute path, a "../" escape, or any
+// separator-bearing file value so a leniently-loaded / peer-synced config
+// cannot write root-owned flow telemetry outside /var/log. The accepted bare
+// basename writes inside the configured trace directory.
+func TestNewTraceWriterRejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	bad := []string{
+		"/tmp/rt-flow-leak",
+		"../../tmp/rt-flow-leak",
+		"sub/dir/x",
+		"..",
+		".",
+		`a\b`,
+	}
+	for _, name := range bad {
+		t.Run("reject/"+name, func(t *testing.T) {
+			tw, err := NewTraceWriter(&config.FlowTraceoptions{File: name})
+			if err == nil {
+				if tw != nil {
+					tw.Close()
+				}
+				t.Fatalf("NewTraceWriter(%q) = nil error, want rejection", name)
+			}
+			// Nothing must have been created outside the trace dir.
+			if _, statErr := os.Stat("/tmp/rt-flow-leak"); statErr == nil {
+				os.Remove("/tmp/rt-flow-leak")
+				t.Fatalf("NewTraceWriter(%q) created /tmp/rt-flow-leak", name)
+			}
+		})
+	}
+
+	t.Run("accept-basename", func(t *testing.T) {
+		tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "rt-flow.log"})
+		if err != nil {
+			t.Fatalf("NewTraceWriter(basename) = %v, want nil", err)
+		}
+		defer tw.Close()
+		want := filepath.Join(dir, "rt-flow.log")
+		if _, err := os.Stat(want); err != nil {
+			t.Fatalf("expected trace file %s: %v", want, err)
+		}
+		// Created mode 0600 (audit-grade telemetry), not world-readable 0644.
+		fi, err := os.Stat(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("trace file mode = %o, want 0600", perm)
+		}
+	})
+}
+
+// TestNewTraceWriterNoFollowSymlink verifies O_NOFOLLOW: a symlink pre-planted
+// at the trace path is not followed, so a writable-/var/log attacker cannot
+// redirect telemetry to an arbitrary target (#3420).
+func TestNewTraceWriterNoFollowSymlink(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	target := filepath.Join(t.TempDir(), "victim")
+	link := filepath.Join(dir, "flow.log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{File: "flow.log"})
+	if err == nil {
+		if tw != nil {
+			tw.Close()
+		}
+		t.Fatalf("NewTraceWriter opened through a symlink, want O_NOFOLLOW rejection")
+	}
+	if _, statErr := os.Stat(target); statErr == nil {
+		t.Fatalf("symlink target %s was created (followed)", target)
+	}
+}
 
 // TestMatchFiltersProtocol verifies the M8 (#2008) traceoptions packet-filter
 // `protocol` match: a filter with protocol set matches only records of that

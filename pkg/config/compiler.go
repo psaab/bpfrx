@@ -132,6 +132,19 @@ type compileOpts struct {
 	// SchemaValidate. Same doctrine as lenientLogStreamPort.
 	lenientLogTLSProfile bool
 
+	// lenientFlowTraceFile (#3420) downgrades the flow-trace file path-traversal
+	// gate (validateFlowTraceFileAST) from a hard compile error to a
+	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths: a
+	// persisted or peer-synced config carrying a non-basename
+	// `security flow traceoptions file` value (an absolute path or a ".."
+	// escape) that an older binary accepted must still boot — NewTraceWriter
+	// independently refuses the unsafe path at runtime, so a leniently-loaded
+	// value just disables tracing instead of writing outside /var/log (#1960
+	// fail-closed-on-load class). Like the port/tls-profile gates the filename
+	// is an AST value SchemaValidate treats as opaque, so the check does NOT
+	// live there. Same doctrine as lenientLogStreamPort.
+	lenientFlowTraceFile bool
+
 	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
 	// compatibility gate (validateLogEventModeFormatStrict) from a hard
 	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
@@ -1138,6 +1151,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientTCPMSSRange:                   true,
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
+		lenientFlowTraceFile:                 true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1279,6 +1293,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientTCPMSSRange:                   true,
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
+		lenientFlowTraceFile:                 true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1446,6 +1461,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// hard-rejects. Lenient (load / peer-sync): warn so an already-persisted or
 	// peer-synced config still boots (the profile was never applied either way).
 	logTLSProfileWarnings, err := validateSecurityLogStreamTLSProfileAST(tree.Children, "", opts.lenientLogTLSProfile)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3420 flow-trace file path-traversal gate. The compiler stores
+	// `security flow traceoptions file <name>` verbatim and NewTraceWriter
+	// opens it under /var/log without rejecting an absolute path or a ".."
+	// escape — a committed config can append root-written flow telemetry
+	// outside the appliance log area. The filename is a single AST value
+	// SchemaValidate treats as opaque, so it is checked here on the
+	// group-expanded tree. Strict (commit / commit-check): a non-basename value
+	// hard-rejects. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config still boots (NewTraceWriter refuses the unsafe path at
+	// runtime, so tracing is simply disabled).
+	flowTraceFileWarnings, err := validateFlowTraceFileAST(tree.Children, "", opts.lenientFlowTraceFile)
 	if err != nil {
 		return nil, err
 	}
@@ -1642,6 +1672,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logStreamPortWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)
+	cfg.Warnings = append(cfg.Warnings, flowTraceFileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)

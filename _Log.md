@@ -23033,3 +23033,17 @@ top.
     host-inbound system-service. No behavior/admit change — docs-only; the
     #3368 under-admission premise is not borne out by the Junos contract.
   - **File(s)**: docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3420 — constrain persistent `security flow traceoptions file`
+    to a basename under /var/log and reject path-traversal. Added commit-time
+    gate `validateFlowTraceFileAST` (strict reject absolute / separator / ".."
+    values; lenient downgrade to a warning on load / peer-sync) plus a
+    `lenientFlowTraceFile` opt wired in compiler.go. Hardened the runtime
+    writer (`NewTraceWriter`/rotate): `sanitizeTraceFileName` basename check,
+    `openTraceFile` with O_NOFOLLOW + regular-file verify + 0600 mode under a
+    `traceLogDir` var. Tests RED-on-revert. Persistent-config sibling of the
+    #3378 monitor-path fix.
+  - **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler.go,
+    pkg/logging/trace.go, pkg/config/flow_traceoptions_file_3420_test.go,
+    pkg/logging/trace_test.go, pkg/logging/README.md, _Log.md
