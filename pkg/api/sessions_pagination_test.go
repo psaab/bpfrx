@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"testing"
 
@@ -27,7 +28,8 @@ func (d *multiSessionDP) IsLoaded() bool { return true }
 
 func newMultiSessionDP() *multiSessionDP {
 	d := &multiSessionDP{Manager: dataplane.New()}
-	// Three TCP v4 sessions, distinct dst ports.
+	// Three TCP v4 sessions, distinct dst ports, with non-zero counters so
+	// the cursor==offset COUNTER parity assertion is meaningful.
 	for i, dport := range []uint16{80, 443, 8080} {
 		d.v4 = append(d.v4, struct {
 			key dataplane.SessionKey
@@ -40,7 +42,15 @@ func newMultiSessionDP() *multiSessionDP {
 				DstPort:  ntohs(dport),
 				Protocol: 6,
 			},
-			val: dataplane.SessionValue{State: dataplane.SessStateEstablished, IngressZone: 2, EgressZone: 3},
+			val: dataplane.SessionValue{
+				State:       dataplane.SessStateEstablished,
+				IngressZone: 2,
+				EgressZone:  3,
+				FwdPackets:  uint64(10 + i),
+				FwdBytes:    uint64(1000 + i),
+				RevPackets:  uint64(5 + i),
+				RevBytes:    uint64(500 + i),
+			},
 		})
 	}
 	// One v6 UDP session.
@@ -55,9 +65,28 @@ func newMultiSessionDP() *multiSessionDP {
 			DstPort:  ntohs(53),
 			Protocol: 17,
 		},
-		val: dataplane.SessionValueV6{State: dataplane.SessStateEstablished, IngressZone: 2, EgressZone: 3},
+		val: dataplane.SessionValueV6{
+			State:       dataplane.SessStateEstablished,
+			IngressZone: 2,
+			EgressZone:  3,
+			FwdPackets:  77,
+			FwdBytes:    7777,
+		},
 	})
 	return d
+}
+
+// GetSessionV4/V6 return a fixed reverse-counter delta for ANY key, so the
+// reverse-counter merge in enrichSessionV4/V6 actually changes the rendered
+// counters. This makes the cursor==offset COUNTER parity test able to detect
+// a cursor path that bypasses the merge (e.g. calling sessionEntryV4 directly
+// instead of the shared enrichSessionV4).
+func (d *multiSessionDP) GetSessionV4(dataplane.SessionKey) (dataplane.SessionValue, error) {
+	return dataplane.SessionValue{RevPackets: 100, RevBytes: 9000, FwdPackets: 1, FwdBytes: 2}, nil
+}
+
+func (d *multiSessionDP) GetSessionV6(dataplane.SessionKeyV6) (dataplane.SessionValueV6, error) {
+	return dataplane.SessionValueV6{RevPackets: 100, RevBytes: 9000, FwdPackets: 1, FwdBytes: 2}, nil
 }
 
 func (d *multiSessionDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
@@ -117,8 +146,9 @@ func (d *multiSessionDP) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, f
 // port filters with gRPC-parity semantics.
 //
 // FAIL-ON-REVERT: removing the srcNet/dstNet/srcPort/dstPort predicates from
-// restSessionFilter.matchV4 makes every filtered case return all three v4
-// rows, flipping the narrowed want counts red.
+// sessionQuery.matchV4 (or dropping their parse in buildSessionQuery) makes
+// every filtered case return all three v4 rows, flipping the narrowed want
+// counts red.
 func TestRESTSessionPrefixPortFilters(t *testing.T) {
 	s := &Server{dp: newMultiSessionDP()}
 
@@ -242,6 +272,72 @@ func TestRESTSessionCursorPagination(t *testing.T) {
 			t.Fatalf("duplicate row across pages: %s", k)
 		}
 		uniq[k] = true
+	}
+}
+
+// TestRESTSessionCursorOffsetParity asserts the #3421 rework contract: the
+// cursor path and the offset path report IDENTICAL rows and counters for the
+// same dataset, because both share #3419's sessionQuery + sessionView +
+// enriched sessionEntryV4/V6 + reverse-counter merge.
+//
+// FAIL-ON-REVERT: wiring the cursor path to a parallel filter/entry builder
+// (the pre-rework restSessionFilter that dropped #3419's enrichment) makes
+// the cursor rows diverge from the offset rows (missing fields/counters),
+// flipping this assertion red.
+func TestRESTSessionCursorOffsetParity(t *testing.T) {
+	s := &Server{dp: newMultiSessionDP()}
+
+	// Offset path: one big page.
+	rr := httptest.NewRecorder()
+	s.sessionsHandler(rr, httptest.NewRequest("GET", "/api/v1/security/sessions?limit=100", nil))
+	if rr.Code != 200 {
+		t.Fatalf("offset: status %d; body: %s", rr.Code, rr.Body.String())
+	}
+	offsetRows := decodeSessions(t, rr.Body.Bytes()).Sessions
+
+	// Cursor path: walk all pages and concatenate.
+	var cursorRows []SessionEntry
+	token := ""
+	for i := 0; ; i++ {
+		url := "/api/v1/security/sessions?page_size=2"
+		if token != "" {
+			url += "&page_token=" + token
+		}
+		crr := httptest.NewRecorder()
+		s.sessionsHandler(crr, httptest.NewRequest("GET", url, nil))
+		if crr.Code != 200 {
+			t.Fatalf("cursor page %d: status %d; body: %s", i, crr.Code, crr.Body.String())
+		}
+		resp := decodeSessions(t, crr.Body.Bytes())
+		cursorRows = append(cursorRows, resp.Sessions...)
+		if resp.NextPageToken == "" {
+			break
+		}
+		token = resp.NextPageToken
+		if i > 10 {
+			t.Fatal("pagination did not terminate")
+		}
+	}
+
+	if len(offsetRows) != len(cursorRows) {
+		t.Fatalf("row count differs: offset=%d cursor=%d", len(offsetRows), len(cursorRows))
+	}
+	// Index both by 5-tuple identity, then assert per-row field+counter equality.
+	idx := func(se SessionEntry) string {
+		return fmt.Sprintf("%s:%d-%s:%d/%s", se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort, se.Protocol)
+	}
+	om := map[string]SessionEntry{}
+	for _, se := range offsetRows {
+		om[idx(se)] = se
+	}
+	for _, c := range cursorRows {
+		o, ok := om[idx(c)]
+		if !ok {
+			t.Fatalf("cursor row %s not present in offset rows", idx(c))
+		}
+		if c != o {
+			t.Fatalf("cursor row %s differs from offset row:\n cursor=%+v\n offset=%+v", idx(c), c, o)
+		}
 	}
 }
 

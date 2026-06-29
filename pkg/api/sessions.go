@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -28,139 +29,16 @@ type sessionCursorIterator interface {
 	IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
 }
 
-// restSessionFilter holds parsed REST session-list filters. It mirrors the
-// gRPC sessionFilter predicate subset REST exposes — zone, protocol,
-// source/destination prefix, and source/destination port. Construction
-// (parseRESTSessionFilter) FAILS CLOSED: a malformed zone/prefix/port is
-// reported so the handler emits HTTP 400 rather than silently zeroing the
-// predicate and widening the query to every session (#3421 M2/M8, matching
-// pkg/grpcapi sessionFilter.validate → InvalidArgument).
-type restSessionFilter struct {
-	zone    uint16
-	proto   string
-	srcNet  *net.IPNet
-	dstNet  *net.IPNet
-	srcPort uint16
-	dstPort uint16
-}
-
-// parseRESTSessionFilter parses the session filter query parameters. On a
-// malformed value it returns the offending parameter name and ok=false so
-// the caller can emit HTTP 400 (fail-closed, #3421 M2/M8). An empty/absent
-// value for any parameter means "no filter" on that dimension.
-func parseRESTSessionFilter(r *http.Request) (f *restSessionFilter, badParam string, ok bool) {
-	f = &restSessionFilter{}
-
-	zone, zok := queryUint16Strict(r, "zone", 0)
-	if !zok {
-		return nil, "zone", false
-	}
-	f.zone = zone
-	f.proto = r.URL.Query().Get("protocol")
-
-	if sp := r.URL.Query().Get("source_prefix"); sp != "" {
-		n, err := parseSessionPrefix(sp)
-		if err != nil {
-			return nil, "source_prefix", false
-		}
-		f.srcNet = n
-	}
-	if dp := r.URL.Query().Get("destination_prefix"); dp != "" {
-		n, err := parseSessionPrefix(dp)
-		if err != nil {
-			return nil, "destination_prefix", false
-		}
-		f.dstNet = n
-	}
-
-	srcPort, spok := queryUint16Strict(r, "source_port", 0)
-	if !spok {
-		return nil, "source_port", false
-	}
-	f.srcPort = srcPort
-	dstPort, dpok := queryUint16Strict(r, "destination_port", 0)
-	if !dpok {
-		return nil, "destination_port", false
-	}
-	f.dstPort = dstPort
-
-	return f, "", true
-}
-
-func (f *restSessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
-	if val.IsReverse != 0 {
-		return false
-	}
-	if f.zone != 0 && val.IngressZone != f.zone && val.EgressZone != f.zone {
-		return false
-	}
-	if f.proto != "" && !protoFilterMatches(key.Protocol, f.proto) {
-		return false
-	}
-	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {
-		return false
-	}
-	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
-		return false
-	}
-	if f.srcPort != 0 && ntohs(key.SrcPort) != f.srcPort {
-		return false
-	}
-	if f.dstPort != 0 && ntohs(key.DstPort) != f.dstPort {
-		return false
-	}
-	return true
-}
-
-func (f *restSessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-	if val.IsReverse != 0 {
-		return false
-	}
-	if f.zone != 0 && val.IngressZone != f.zone && val.EgressZone != f.zone {
-		return false
-	}
-	if f.proto != "" && !protoFilterMatches(key.Protocol, f.proto) {
-		return false
-	}
-	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {
-		return false
-	}
-	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
-		return false
-	}
-	if f.srcPort != 0 && ntohs(key.SrcPort) != f.srcPort {
-		return false
-	}
-	if f.dstPort != 0 && ntohs(key.DstPort) != f.dstPort {
-		return false
-	}
-	return true
-}
-
-// parseSessionPrefix parses an operator prefix filter — a CIDR or a bare IP
-// (bare IPs become host networks). Mirrors pkg/grpcapi parseSessionPrefix.
-func parseSessionPrefix(prefix string) (*net.IPNet, error) {
-	cidr := prefix
-	if !strings.Contains(cidr, "/") {
-		if strings.Contains(cidr, ":") {
-			cidr += "/128"
-		} else {
-			cidr += "/32"
-		}
-	}
-	_, n, err := net.ParseCIDR(cidr)
-	return n, err
-}
-
 func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
 		return
 	}
 
-	filter, badParam, ok := parseRESTSessionFilter(r)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid "+badParam+" filter: "+r.URL.Query().Get(badParam))
+	view := s.buildSessionView()
+	q, errMsg := buildSessionQuery(r, view)
+	if errMsg != "" {
+		writeError(w, http.StatusBadRequest, errMsg)
 		return
 	}
 
@@ -181,7 +59,7 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if pageSize > 0 {
 		if iterDP, cursorOK := s.dp.(sessionCursorIterator); cursorOK {
-			s.sessionsCursor(w, r, iterDP, filter, pageSize)
+			s.sessionsCursor(w, r, iterDP, &q, view, pageSize)
 			return
 		}
 		// Cursor iteration unsupported by this dataplane (test/edge
@@ -189,14 +67,15 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		// request still succeeds, mirroring the gRPC fallback.
 	}
 
-	s.sessionsOffset(w, r, filter)
+	s.sessionsOffset(w, r, &q, view)
 }
 
 // sessionsOffset serves the backward-compatible limit/offset pagination
 // path. limit/offset parse fail-closed on malformed/negative input (#3421
 // M8); an iterator error fails the request rather than returning a partial
-// list as success (#2469).
-func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, filter *restSessionFilter) {
+// list as success (#2469). Rows are enriched and reverse-counter-merged
+// identically to the cursor path (#3419).
+func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessionQuery, view sessionView) {
 	limit, ok := queryIntStrict(r, "limit", 100)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid limit: "+r.URL.Query().Get("limit"))
@@ -219,11 +98,11 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, filter *
 	// mid-scan) must fail the request rather than returning HTTP 200 with
 	// a partial/zero session list as a healthy result (#2469).
 	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
-		if !filter.matchV4(key, val) {
+		if !q.matchV4(key, val) {
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			all = append(all, sessionEntryV4(key, val, now))
+			all = append(all, s.enrichSessionV4(key, val, now, view))
 		}
 		idx++
 		return true
@@ -234,11 +113,11 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, filter *
 
 	// IPv6 sessions
 	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		if !filter.matchV6(key, val) {
+		if !q.matchV6(key, val) {
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			all = append(all, sessionEntryV6(key, val, now))
+			all = append(all, s.enrichSessionV6(key, val, now, view))
 		}
 		idx++
 		return true
@@ -260,8 +139,11 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, filter *
 // emitting up to page_size matching rows and a next_page_token that resumes
 // exactly after the last row. Because IterateSessionsFrom resumes AFTER the
 // cursor key, pages never skip or duplicate rows across map mutation the way
-// the offset path can (#3421 H4). An iterator error fails the request (#2469).
-func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP sessionCursorIterator, filter *restSessionFilter, pageSize int) {
+// the offset path can (#3421 H4). Rows use the SAME #3419 enrichment +
+// reverse-counter merge as the offset path, so cursor and offset modes
+// report identical rows and counters. An iterator error fails the request
+// (#2469).
+func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP sessionCursorIterator, q *sessionQuery, view sessionView, pageSize int) {
 	startV4 := true
 	startV6 := false
 	var cursorV4 *dataplane.SessionKey
@@ -307,10 +189,10 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 			if len(all) >= pageSize {
 				return false
 			}
-			if !filter.matchV4(key, val) {
+			if !q.matchV4(key, val) {
 				return true
 			}
-			all = append(all, sessionEntryV4(key, val, now))
+			all = append(all, s.enrichSessionV4(key, val, now, view))
 			lastV4 = key
 			return true
 		}); err != nil {
@@ -334,10 +216,10 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 			if len(all) >= pageSize {
 				return false
 			}
-			if !filter.matchV6(key, val) {
+			if !q.matchV6(key, val) {
 				return true
 			}
-			all = append(all, sessionEntryV6(key, val, now))
+			all = append(all, s.enrichSessionV6(key, val, now, view))
 			lastV6 = key
 			return true
 		}); err != nil {
@@ -359,6 +241,31 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 		PageSize: pageSize,
 		Sessions: all,
 	})
+}
+
+// enrichSessionV4 merges the companion reverse entry's counters into the
+// forward entry (full bidirectional volume, #3419 H3) and renders the
+// enriched REST row (#3419). Shared by the offset and cursor paths so they
+// report identical rows and counters.
+func (s *Server) enrichSessionV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, view sessionView) SessionEntry {
+	if rev, err := s.dp.GetSessionV4(val.ReverseKey); err == nil {
+		val.RevPackets += rev.RevPackets
+		val.RevBytes += rev.RevBytes
+		val.FwdPackets += rev.FwdPackets
+		val.FwdBytes += rev.FwdBytes
+	}
+	return sessionEntryV4(key, val, now, view)
+}
+
+// enrichSessionV6 is the IPv6 companion to enrichSessionV4.
+func (s *Server) enrichSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, view sessionView) SessionEntry {
+	if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
+		val.RevPackets += rev.RevPackets
+		val.RevBytes += rev.RevBytes
+		val.FwdPackets += rev.FwdPackets
+		val.FwdBytes += rev.FwdBytes
+	}
+	return sessionEntryV6(key, val, now, view)
 }
 
 func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
@@ -429,11 +336,13 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	// client's intended-narrow clear into a full-table wipe — so reject any
 	// query string or request body with HTTP 400 rather than performing an
 	// unexpected clear-all (#3421 H6). A parameterless clear (the documented
-	// contract) proceeds. Filtered REST clear plus HA peer propagation is
-	// tracked separately in #3423; a non-zero ContentLength (including the
-	// chunked-transfer -1 sentinel) also rejects so a body-carrying request
-	// cannot be silently misread as clear-all.
-	if len(r.URL.Query()) > 0 || r.ContentLength != 0 {
+	// contract) proceeds. Test against r.URL.RawQuery (not url.Query(),
+	// which silently drops un-decodable pairs like `?%zz` and could let a
+	// non-empty query proceed to clear-all — SMR); a non-zero ContentLength
+	// (including the chunked-transfer -1 sentinel) also rejects so a
+	// body-carrying request cannot be misread as clear-all. Filtered REST
+	// clear plus HA peer propagation is tracked separately in #3423.
+	if r.URL.RawQuery != "" || r.ContentLength != 0 {
 		writeError(w, http.StatusBadRequest,
 			"filtered clear not supported on this endpoint; it clears all local sessions and accepts no parameters")
 		return
@@ -571,61 +480,409 @@ func uint32ToIP(v uint32) net.IP {
 	return ip
 }
 
-func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64) SessionEntry {
+// sessionEgressKey identifies a FIB-resolved egress interface (ifindex +
+// VLAN), mirroring the gRPC sessionEgressKey used to resolve a session's
+// egress interface name (#3419 M4).
+type sessionEgressKey struct {
+	ifindex uint32
+	vlanID  uint16
+}
+
+// sessionView holds the enrichment context shared across a single session
+// list/iteration: zone/policy/app name maps, the zone->first-interface and
+// FIB->interface resolution tables, the active config, and the local HA
+// active state. It mirrors the maps the gRPC sessionFilter precomputes
+// (#3419 M1/M4/M6) so the REST session view exposes the same fields.
+type sessionView struct {
+	zoneNames    map[uint16]string
+	policyNames  map[uint32]string
+	appNames     map[uint16]string
+	zoneIfaces   map[uint16]string
+	egressIfaces map[sessionEgressKey]string
+	cfg          *config.Config
+	haActive     bool
+}
+
+// buildSessionView precomputes the enrichment maps from the last apply
+// result and the active config, mirroring grpcapi buildSessionFilter
+// (#3419). It is safe to call when the store/apply result is absent (the
+// maps stay empty and the view degrades to numeric ids).
+func (s *Server) buildSessionView() sessionView {
+	v := sessionView{
+		zoneNames:    make(map[uint16]string),
+		zoneIfaces:   make(map[uint16]string),
+		egressIfaces: make(map[sessionEgressKey]string),
+		haActive:     true, // standalone default
+	}
+	if s.store != nil {
+		v.cfg = s.store.ActiveConfig()
+	}
+	if s.haActiveFn != nil {
+		v.haActive = s.haActiveFn()
+	}
+	cr := s.applyResult()
+	if cr != nil {
+		for name, id := range cr.ZoneIDs {
+			v.zoneNames[id] = name
+		}
+		v.policyNames = cr.PolicyNames
+		v.appNames = cr.AppNames
+	}
+	if v.cfg != nil && cr != nil {
+		for zoneName, zone := range v.cfg.Security.Zones {
+			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
+			if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
+				v.zoneIfaces[zid] = zone.Interfaces[0]
+			}
+		}
+		// FIB ifindex+VLAN -> display name, so a session's egress interface
+		// resolves to the configured unit name (mirrors grpcapi).
+		for ifName, ifc := range v.cfg.Interfaces.Interfaces {
+			resolvedParent := config.LinuxIfName(strings.SplitN(v.cfg.ResolveReth(ifName), ".", 2)[0])
+			parentLink, err := net.InterfaceByName(resolvedParent)
+			if err != nil {
+				continue
+			}
+			for _, unit := range ifc.Units {
+				displayName := ifName
+				if unit.Number != 0 || unit.VlanID != 0 {
+					displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
+				}
+				vlanID := uint16(unit.VlanID)
+				if vlanID == 0 && unit.Number > 0 {
+					vlanID = uint16(unit.Number)
+				}
+				key := sessionEgressKey{ifindex: uint32(parentLink.Index), vlanID: vlanID}
+				if _, exists := v.egressIfaces[key]; !exists {
+					v.egressIfaces[key] = displayName
+				}
+			}
+		}
+	}
+	return v
+}
+
+// sessionQuery holds the parsed REST session filter predicates. It mirrors
+// the gRPC sessionFilter subset that applies to the REST surface: zone,
+// protocol, application, interface, nat-only and source-nat-pool (#3419
+// M1/M3/M4). Pagination (limit/offset) is handled by the caller and is out
+// of scope here (separate from #3421/#3423).
+type sessionQuery struct {
+	zone         uint16
+	proto        string
+	natOnly      bool
+	app          string
+	iface        string
+	snatPool     string
+	snatPoolNets []*net.IPNet
+	// source/destination prefix + port filters (#3421 M2), mirroring the
+	// gRPC sessionFilter src/dst predicates. A nil net / zero port means
+	// "no filter" on that dimension.
+	srcNet  *net.IPNet
+	dstNet  *net.IPNet
+	srcPort uint16
+	dstPort uint16
+	view    sessionView
+}
+
+// buildSessionQuery parses and validates the session filter query
+// parameters. A non-empty but malformed/unresolved filter FAILS CLOSED
+// with an error message (the caller emits HTTP 400) rather than silently
+// matching every session — mirroring the gRPC sessionFilter.validate
+// contract (#2934/#3439, and source-nat-pool not-found per #3419 M3).
+func buildSessionQuery(r *http.Request, view sessionView) (sessionQuery, string) {
+	q := sessionQuery{view: view}
+	zoneFilter, ok := queryUint16Strict(r, "zone", 0)
+	if !ok {
+		return q, "invalid zone filter: " + r.URL.Query().Get("zone")
+	}
+	q.zone = zoneFilter
+	q.proto = r.URL.Query().Get("protocol")
+	q.app = r.URL.Query().Get("application")
+	q.iface = r.URL.Query().Get("interface")
+	q.snatPool = r.URL.Query().Get("source_nat_pool")
+	if v := r.URL.Query().Get("nat_only"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return q, "invalid nat_only filter: " + v
+		}
+		q.natOnly = b
+	}
+	if q.snatPool != "" {
+		if view.cfg == nil {
+			return q, "source NAT pool " + q.snatPool + " not found"
+		}
+		nets, ok := config.SourceNATPoolNets(&view.cfg.Security.NAT, q.snatPool)
+		if !ok {
+			return q, "source NAT pool " + q.snatPool + " not found"
+		}
+		q.snatPoolNets = nets
+	}
+
+	// Source/destination prefix + port filters (#3421 M2). These FAIL
+	// CLOSED on a malformed value (HTTP 400) rather than zeroing the
+	// predicate and widening the query — matching the gRPC sessionFilter
+	// contract.
+	if sp := r.URL.Query().Get("source_prefix"); sp != "" {
+		n, err := parseSessionPrefix(sp)
+		if err != nil {
+			return q, "invalid source_prefix filter: " + sp
+		}
+		q.srcNet = n
+	}
+	if dp := r.URL.Query().Get("destination_prefix"); dp != "" {
+		n, err := parseSessionPrefix(dp)
+		if err != nil {
+			return q, "invalid destination_prefix filter: " + dp
+		}
+		q.dstNet = n
+	}
+	srcPort, ok := queryUint16Strict(r, "source_port", 0)
+	if !ok {
+		return q, "invalid source_port filter: " + r.URL.Query().Get("source_port")
+	}
+	q.srcPort = srcPort
+	dstPort, ok := queryUint16Strict(r, "destination_port", 0)
+	if !ok {
+		return q, "invalid destination_port filter: " + r.URL.Query().Get("destination_port")
+	}
+	q.dstPort = dstPort
+
+	return q, ""
+}
+
+// parseSessionPrefix parses an operator prefix filter — a CIDR or a bare IP
+// (bare IPs become host networks). Mirrors pkg/grpcapi parseSessionPrefix.
+func parseSessionPrefix(prefix string) (*net.IPNet, error) {
+	cidr := prefix
+	if !strings.Contains(cidr, "/") {
+		if strings.Contains(cidr, ":") {
+			cidr += "/128"
+		} else {
+			cidr += "/32"
+		}
+	}
+	_, n, err := net.ParseCIDR(cidr)
+	return n, err
+}
+
+func (q *sessionQuery) matchV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	if val.IsReverse != 0 {
+		return false
+	}
+	if q.zone != 0 && val.IngressZone != q.zone && val.EgressZone != q.zone {
+		return false
+	}
+	if q.proto != "" && !protoFilterMatches(key.Protocol, q.proto) {
+		return false
+	}
+	if q.srcNet != nil && !q.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if q.dstNet != nil && !q.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	if q.srcPort != 0 && ntohs(key.SrcPort) != q.srcPort {
+		return false
+	}
+	if q.dstPort != 0 && ntohs(key.DstPort) != q.dstPort {
+		return false
+	}
+	if q.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
+		return false
+	}
+	if q.app != "" && !appid.SessionMatches(q.app, q.view.appNames, q.view.cfg,
+		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
+		return false
+	}
+	if q.iface != "" {
+		inIf := q.view.zoneIfaces[val.IngressZone]
+		outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, q.view.zoneIfaces, q.view.egressIfaces)
+		if !sessionIfaceMatches(q.iface, inIf) && !sessionIfaceMatches(q.iface, outIf) {
+			return false
+		}
+	}
+	if q.snatPool != "" {
+		if val.Flags&dataplane.SessFlagSNAT == 0 || !config.IPInNets(uint32ToIP(val.NATSrcIP), q.snatPoolNets) {
+			return false
+		}
+	}
+	return true
+}
+
+func (q *sessionQuery) matchV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if val.IsReverse != 0 {
+		return false
+	}
+	if q.zone != 0 && val.IngressZone != q.zone && val.EgressZone != q.zone {
+		return false
+	}
+	if q.proto != "" && !protoFilterMatches(key.Protocol, q.proto) {
+		return false
+	}
+	if q.srcNet != nil && !q.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if q.dstNet != nil && !q.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	if q.srcPort != 0 && ntohs(key.SrcPort) != q.srcPort {
+		return false
+	}
+	if q.dstPort != 0 && ntohs(key.DstPort) != q.dstPort {
+		return false
+	}
+	if q.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
+		return false
+	}
+	if q.app != "" && !appid.SessionMatches(q.app, q.view.appNames, q.view.cfg,
+		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
+		return false
+	}
+	if q.iface != "" {
+		inIf := q.view.zoneIfaces[val.IngressZone]
+		outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, q.view.zoneIfaces, q.view.egressIfaces)
+		if !sessionIfaceMatches(q.iface, inIf) && !sessionIfaceMatches(q.iface, outIf) {
+			return false
+		}
+	}
+	if q.snatPool != "" {
+		if val.Flags&dataplane.SessFlagSNAT == 0 || !config.IPInNets(net.IP(val.NATSrcIP[:]), q.snatPoolNets) {
+			return false
+		}
+	}
+	return true
+}
+
+// sessionIfaceMatches matches a session interface against an operator
+// filter, accepting either the exact unit name or a base-interface prefix
+// (mirrors grpcapi).
+func sessionIfaceMatches(filter, ifName string) bool {
+	if ifName == "" {
+		return false
+	}
+	return ifName == filter || strings.HasPrefix(ifName, filter+".")
+}
+
+// resolveSessionEgressIface resolves a session's egress interface from its
+// FIB result, falling back to the egress zone's first interface (mirrors
+// grpcapi).
+func resolveSessionEgressIface(fibIfindex uint32, fibVlanID uint16, egressZone uint16, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string) string {
+	if fibIfindex != 0 {
+		if ifName, ok := egressIfaces[sessionEgressKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+			return ifName
+		}
+	}
+	return zoneIfaces[egressZone]
+}
+
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, view sessionView) SessionEntry {
+	inIf := view.zoneIfaces[val.IngressZone]
+	if inIf == "" {
+		inIf = view.zoneNames[val.IngressZone]
+	}
+	outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, view.zoneIfaces, view.egressIfaces)
+	if outIf == "" {
+		outIf = view.zoneNames[val.EgressZone]
+	}
 	se := SessionEntry{
-		SrcAddr:    net.IP(key.SrcIP[:]).String(),
-		DstAddr:    net.IP(key.DstIP[:]).String(),
-		SrcPort:    ntohs(key.SrcPort),
-		DstPort:    ntohs(key.DstPort),
-		Protocol:   protoName(key.Protocol),
-		State:      sessionStateName(val.State),
-		PolicyID:   val.PolicyID,
-		InZone:     val.IngressZone,
-		OutZone:    val.EgressZone,
-		FwdPackets: val.FwdPackets,
-		FwdBytes:   val.FwdBytes,
-		RevPackets: val.RevPackets,
-		RevBytes:   val.RevBytes,
-		Timeout:    val.Timeout,
+		SrcAddr:          net.IP(key.SrcIP[:]).String(),
+		DstAddr:          net.IP(key.DstIP[:]).String(),
+		SrcPort:          ntohs(key.SrcPort),
+		DstPort:          ntohs(key.DstPort),
+		Protocol:         protoName(key.Protocol),
+		State:            sessionStateName(val.State),
+		PolicyID:         val.PolicyID,
+		PolicyName:       view.policyNames[val.PolicyID],
+		IngressZoneName:  view.zoneNames[val.IngressZone],
+		EgressZoneName:   view.zoneNames[val.EgressZone],
+		InZone:           val.IngressZone,
+		OutZone:          val.EgressZone,
+		IngressInterface: inIf,
+		EgressInterface:  outIf,
+		Application:      appid.ResolveSessionName(view.appNames, view.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
+		FwdPackets:       val.FwdPackets,
+		FwdBytes:         val.FwdBytes,
+		RevPackets:       val.RevPackets,
+		RevBytes:         val.RevBytes,
+		Timeout:          val.Timeout,
+		SessionID:        val.SessionID,
+		HAActive:         view.haActive,
+	}
+	if val.Created > 0 && now > val.Created {
+		se.Age = int64(now - val.Created)
 	}
 	if val.LastSeen > 0 && now > val.LastSeen {
-		se.Age = int64(now - val.LastSeen)
+		se.Idle = int64(now - val.LastSeen)
 	}
+	var natParts []string
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
-		se.NAT = fmt.Sprintf("SNAT %s:%d", uint32ToIP(val.NATSrcIP), ntohs(val.NATSrcPort))
+		natParts = append(natParts, fmt.Sprintf("SNAT %s:%d", uint32ToIP(val.NATSrcIP), ntohs(val.NATSrcPort)))
+		se.NATSrcAddr = uint32ToIP(val.NATSrcIP).String()
+		se.NATSrcPort = ntohs(val.NATSrcPort)
 	}
 	if val.Flags&dataplane.SessFlagDNAT != 0 {
-		se.NAT = fmt.Sprintf("DNAT %s:%d", uint32ToIP(val.NATDstIP), ntohs(val.NATDstPort))
+		natParts = append(natParts, fmt.Sprintf("DNAT %s:%d", uint32ToIP(val.NATDstIP), ntohs(val.NATDstPort)))
+		se.NATDstAddr = uint32ToIP(val.NATDstIP).String()
+		se.NATDstPort = ntohs(val.NATDstPort)
 	}
+	se.NAT = strings.Join(natParts, "; ")
 	return se
 }
 
-func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64) SessionEntry {
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, view sessionView) SessionEntry {
+	inIf := view.zoneIfaces[val.IngressZone]
+	if inIf == "" {
+		inIf = view.zoneNames[val.IngressZone]
+	}
+	outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, view.zoneIfaces, view.egressIfaces)
+	if outIf == "" {
+		outIf = view.zoneNames[val.EgressZone]
+	}
 	se := SessionEntry{
-		SrcAddr:    net.IP(key.SrcIP[:]).String(),
-		DstAddr:    net.IP(key.DstIP[:]).String(),
-		SrcPort:    ntohs(key.SrcPort),
-		DstPort:    ntohs(key.DstPort),
-		Protocol:   protoName(key.Protocol),
-		State:      sessionStateName(val.State),
-		PolicyID:   val.PolicyID,
-		InZone:     val.IngressZone,
-		OutZone:    val.EgressZone,
-		FwdPackets: val.FwdPackets,
-		FwdBytes:   val.FwdBytes,
-		RevPackets: val.RevPackets,
-		RevBytes:   val.RevBytes,
-		Timeout:    val.Timeout,
+		SrcAddr:          net.IP(key.SrcIP[:]).String(),
+		DstAddr:          net.IP(key.DstIP[:]).String(),
+		SrcPort:          ntohs(key.SrcPort),
+		DstPort:          ntohs(key.DstPort),
+		Protocol:         protoName(key.Protocol),
+		State:            sessionStateName(val.State),
+		PolicyID:         val.PolicyID,
+		PolicyName:       view.policyNames[val.PolicyID],
+		IngressZoneName:  view.zoneNames[val.IngressZone],
+		EgressZoneName:   view.zoneNames[val.EgressZone],
+		InZone:           val.IngressZone,
+		OutZone:          val.EgressZone,
+		IngressInterface: inIf,
+		EgressInterface:  outIf,
+		Application:      appid.ResolveSessionName(view.appNames, view.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
+		FwdPackets:       val.FwdPackets,
+		FwdBytes:         val.FwdBytes,
+		RevPackets:       val.RevPackets,
+		RevBytes:         val.RevBytes,
+		Timeout:          val.Timeout,
+		SessionID:        val.SessionID,
+		HAActive:         view.haActive,
+	}
+	if val.Created > 0 && now > val.Created {
+		se.Age = int64(now - val.Created)
 	}
 	if val.LastSeen > 0 && now > val.LastSeen {
-		se.Age = int64(now - val.LastSeen)
+		se.Idle = int64(now - val.LastSeen)
 	}
+	var natParts []string
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
-		se.NAT = fmt.Sprintf("SNAT [%s]:%d", net.IP(val.NATSrcIP[:]).String(), ntohs(val.NATSrcPort))
+		natParts = append(natParts, fmt.Sprintf("SNAT [%s]:%d", net.IP(val.NATSrcIP[:]).String(), ntohs(val.NATSrcPort)))
+		se.NATSrcAddr = net.IP(val.NATSrcIP[:]).String()
+		se.NATSrcPort = ntohs(val.NATSrcPort)
 	}
 	if val.Flags&dataplane.SessFlagDNAT != 0 {
-		se.NAT = fmt.Sprintf("DNAT [%s]:%d", net.IP(val.NATDstIP[:]).String(), ntohs(val.NATDstPort))
+		natParts = append(natParts, fmt.Sprintf("DNAT [%s]:%d", net.IP(val.NATDstIP[:]).String(), ntohs(val.NATDstPort)))
+		se.NATDstAddr = net.IP(val.NATDstIP[:]).String()
+		se.NATDstPort = ntohs(val.NATDstPort)
 	}
+	se.NAT = strings.Join(natParts, "; ")
 	return se
 }
 

@@ -1,3 +1,27 @@
+## 2026-06-29 — #3419 REST session-view parity with gRPC
+
+- **Timestamp**: 2026-06-29
+- **Action**: The REST `GET /api/v1/security/sessions` view diverged from
+  the gRPC `GetSessions` contract (Codex audit 099 H1/H2/H3/M1/M3/M4/M6).
+  Fixed: `age_seconds` is now wall age (now-`Created`) with a separate
+  `idle_seconds` (now-`LastSeen`) — REST previously reported idle time AS
+  age (H1); a session with both SNAT and DNAT now joins both `nat` text
+  parts and exposes structured `nat_src_addr/port` + `nat_dst_addr/port`
+  instead of the DNAT branch overwriting the SNAT string (H2); the
+  companion reverse entry's counters are merged into the forward entry via
+  new `GetSessionV4/V6` on `apiRuntimeDataPlane` (H3); `application`,
+  `ingress_interface`/`egress_interface`, `policy_name`,
+  `ingress_zone_name`/`egress_zone_name`, `session_id`, and `ha_active`
+  are surfaced (M1/M4/M6), and `application=`, `interface=`, `nat_only=`,
+  `source_nat_pool=` filters added (M1/M3/M4) — an unresolved pool fails
+  CLOSED (HTTP 400) like the gRPC `sessionFilter.validate`. `ha_active`
+  is wired from the daemon via a new optional `HAActiveFn` (default true
+  standalone = `cluster.IsLocalPrimary(0)`). Numeric `policy_id`/zone ids
+  retained for compatibility. Pagination/clear out of scope (#3421/#3423).
+- **File(s)**: pkg/api/sessions.go, pkg/api/types.go, pkg/api/api.go,
+  pkg/api/server.go, pkg/api/sessions_parity_test.go, pkg/api/README.md,
+  pkg/daemon/runtime_probes.go, pkg/daemon/daemon_run.go
+
 ## 2026-06-29 — #3322 reorder-stable policy hit-counter handle
 
 - **Timestamp**: 2026-06-29
@@ -23378,7 +23402,18 @@ top.
 - **Action**: Verified #3385 over-match already structurally fixed on master by #3321 (lookup_directional removed the OR-decomposition). Added a #3385-specific RED-on-revert regression test for the distinct OVERLAPPING-range cross-slot over-match. No behavior change.
 - **File(s)**: userspace-dp/src/policy_tests.rs (app_catalog_overlapping_dual_range_no_cross_slot_overmatch)
 
+## #3436 — daemon lo0 nft: normalize protocol aliases + DSCP names through shared resolvers
+- **Timestamp**: 2026-06-29
+- **Action**: nftRuleFromTerm emitted `from protocol` tokens and `dscp`/`traffic-class` tokens RAW (codex-094 H08/M01). Junos protocol aliases (junos-gre, junos-tcp-any, junos-icmp-all, ipip/junos-ip-in-ip) and case-variant / `be` DSCP names are accepted by the commit gate and userspace matcher but are not valid nft tokens, so the atomic lo0 load failed (commit broken) or the kernel mirror matched a different protocol/code point than userspace. Fix: resolve protocols through appid.ProtocolNumber and emit NUMERIC l4proto tokens; resolve DSCP through dataplane.DSCPValues (case-insensitive, numeric 0..63 pass-through) and emit numeric values. Unresolvable protocol dropped with a warning on the lenient path. Added RED-on-revert tests (alias single + multi set, DSCP EF/Af11/be/numeric + multi set); updated existing l4proto/DSCP test expectations to numeric; documented in pkg/daemon/README.md.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go, pkg/daemon/README.md, _Log.md
+- **Timestamp**: 2026-06-29T11:00Z
+  - **Action**: #3442 M3/M4 fail-closed flat-load. Service-mode flat config load paths mishandled malformed lines. M3: `LoadMerge` flipped `isSetFormat` true if any line started with a flat verb, then ran EVERY non-comment line through `applyEditLine`→`ParseSetVerb`, whose bare-path default turned a typo line (e.g. `not-a-set-line`) into a junk top-level node and returned nil. M4: `LoadSet` silently `continue`d on any non-verb, non-comment line, so REST/gRPC/CLI returned OK while dropping the intended command. Fix: added `hasFlatVerb` gate; LoadMerge flat branch + LoadSet now reject any non-blank/non-`#` line lacking a recognized verb with a line-numbered error. Hierarchical LoadMerge unaffected (round-trips through `FormatSet()`, always verb-prefixed). The `ParseSetVerb` bare-path default stays for internal callers that prepend the verb. RED-on-revert verified (revert store_command.go → both TestLoadSet and TestLoadMergeRejectsGarbageLine fail). go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... ./pkg/daemon/... green; gofmt clean.
+  - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+- **Timestamp**: 2026-06-29T11:40Z
+  - **Action**: #3442 Codex MERGE-NEEDS-MAJOR fold (PR #3517) — over-rejection risk. Verb-set reconciliation: applyEditLine -> ParseSetVerb replays EXACTLY set/delete/deactivate/activate (everything else hits the bare-path default = the M3 bug); FormatSet (display-set, the loadable artifact) emits only set/deactivate. annotate/copy/insert/rename are interactive-only structural edits (pkg/cli/cli_dispatch.go handlers, distinct multi-clause grammar) NEVER present in a flat-load file and NOT replayable — pre-fix they were silently mangled into junk `set annotate ...` nodes, so rejecting them is the M3 fix, not a regression. Confirmed `hasFlatVerb` recognizes exactly the 4 replayable verbs (option 2). Real fix folded: Codex #3 whitespace — the literal-`verb ` prefix check wrongly rejected a tab between verb and path (lexer treats tabs as whitespace); rewrote hasFlatVerb to match the first whitespace-delimited token (strings.Fields) against the verb set + require >=1 path token. Added TestLoadFlatVerbGate (all 4 verbs accepted in sequence; tab-separated set accepted; annotate/copy/insert/rename + garbage rejected on BOTH LoadSet and LoadMerge-flat). RED-on-revert reconfirmed against true origin/master source (garbage + interactive verbs + TestLoadSet all fail) AND the tab assertion fails under the prior literal-space gate. go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
+  - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+
 ## #3421 — REST session pagination/filtering/input-validation gRPC parity
 - **Timestamp**: 2026-06-29
-- **Action**: Brought REST session list to gRPC parity. Added cursor pagination (page_size/page_token over a stable cursor, next_page_token resume — fixes H4 offset-over-mutable-map skip/dup); added source_prefix/destination_prefix/source_port/destination_port filters with fail-closed validation (M2); made limit/offset/page_size parse strict → HTTP 400 (M8); rejected any query/body on REST clear-all with HTTP 400 so a filtered-clear attempt cannot silently wipe the whole table (H6 — filtered clear + HA peer propagation deferred to sibling #3423). Refactored sessionsHandler into shared restSessionFilter (matchV4/V6) + sessionsOffset/sessionsCursor paths. RED-on-revert verified for H6 + M8.
+- **Action**: Brought REST session list pagination/filter/input-validation to gRPC parity. Rebased onto origin/master AFTER #3419 (REST session data parity) landed and FOLDED into #3419's machinery: added cursor pagination (page_size/page_token over a stable cursor via IterateSessionsFrom, next_page_token resume — fixes H4 offset-over-mutable-map skip/dup) reusing #3419's sessionQuery + sessionView + enriched sessionEntryV4/V6 + reverse-counter merge (shared enrichSessionV4/V6 so cursor==offset rows/counters); added source_prefix/destination_prefix/source_port/destination_port INTO #3419's sessionQuery+buildSessionQuery+matchV4/V6 with fail-closed validation (M2, one filter type not two); made limit/offset/page_size parse strict → HTTP 400 (M8); REST clear-all rejects any RawQuery/body with HTTP 400 (H6 — filtered clear + HA peer propagation deferred to sibling #3423). SMR MINOR folded: clear guard tests r.URL.RawQuery (not url.Query(), which drops un-decodable pairs). RED-on-revert verified for H6 + M8; cursor==offset parity asserted.
 - **File(s)**: pkg/api/sessions.go, pkg/api/types.go, pkg/api/README.md, pkg/api/sessions_pagination_test.go

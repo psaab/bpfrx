@@ -898,6 +898,91 @@ set security zones security-zone dmz interfaces eth2.0`
 	}
 }
 
+// TestLoadMergeRejectsGarbageLine pins #3442 M3: once flat set-format is
+// detected (any line starts with a verb), a free-text / typo line must FAIL
+// the merge instead of being materialized as a junk top-level node via the
+// ParseSetVerb bare-path default. RED on revert: the pre-fix LoadMerge ran
+// "not-a-set-line" through applyEditLine -> SetPath, creating a node, and
+// returned nil.
+func TestLoadMergeRejectsGarbageLine(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+
+	setConfig := `set security zones security-zone trust interfaces eth0.0
+not-a-set-line
+set security zones security-zone untrust interfaces eth1.0`
+
+	if err := s.LoadMerge(setConfig); err == nil {
+		t.Fatal("expected LoadMerge to reject the garbage line, got nil")
+	} else if !strings.Contains(err.Error(), "not-a-set-line") {
+		t.Errorf("expected error to name the garbage line, got %v", err)
+	}
+
+	// The junk top-level node must NOT have been materialized.
+	if candidate := s.ShowCandidateSet(); strings.Contains(candidate, "not-a-set-line") {
+		t.Errorf("garbage line was materialized into the candidate:\n%s", candidate)
+	}
+}
+
+// TestLoadFlatVerbGate pins the #3442 fold: the fail-closed gate recognizes
+// exactly the verbs applyEditLine can replay (set/delete/deactivate/activate),
+// tolerates a tab between verb and path, and rejects the interactive-only
+// structural-edit verbs (annotate/copy/insert/rename) plus genuine garbage —
+// none of which the flat-load replay path can handle.
+func TestLoadFlatVerbGate(t *testing.T) {
+	// All four replayable verbs in sequence must be accepted (count == 4).
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	supported := "set system host-name fw\ndeactivate system host-name\nactivate system host-name\ndelete system host-name"
+	count, err := s.LoadSet(supported)
+	if err != nil {
+		t.Fatalf("LoadSet of supported verbs: %v", err)
+	}
+	if count != 4 {
+		t.Errorf("expected 4 commands, got %d", count)
+	}
+
+	// A tab between the verb and the path must be tolerated (the lexer
+	// treats tabs as whitespace; a literal-space-only gate would wrongly
+	// reject this valid line).
+	s.ExitConfigure()
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadSet("set\tsystem domain-name example.com"); err != nil {
+		t.Fatalf("LoadSet of tab-separated set line: %v", err)
+	}
+
+	// Interactive-only structural-edit verbs and free-text garbage are NOT
+	// replayable on the flat path and must be rejected.
+	for _, bad := range []string{
+		"annotate system \"a comment\"",
+		"copy system to other",
+		"insert system before other",
+		"rename system to other",
+		"not-a-set-line",
+		"sett system host-name fw",
+	} {
+		s.ExitConfigure()
+		if err := s.EnterConfigure(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.LoadSet(bad); err == nil {
+			t.Errorf("LoadSet(%q): expected rejection, got nil", bad)
+		}
+		// LoadMerge flat branch must reject identically (mixed with a valid
+		// set line so isSetFormat is selected).
+		if err := s.LoadMerge("set system host-name fw\n" + bad); err == nil {
+			t.Errorf("LoadMerge with %q: expected rejection, got nil", bad)
+		}
+	}
+}
+
 func TestLoadMergeWithDelete(t *testing.T) {
 	s := newTestStore(t)
 
@@ -1293,18 +1378,33 @@ func TestLoadSet(t *testing.T) {
 		t.Error("expected interface in candidate config")
 	}
 
-	// Test with comments and blank lines
+	// Comments and blank lines are skipped, but a malformed non-comment line
+	// must FAIL the whole load (#3442 M4) — never silently dropped.
 	s.ExitConfigure()
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
 	input2 := "# comment line\nset system host-name fw2\n\nset system domain-name example.com\nnot-a-set-line"
 	count2, err := s.LoadSet(input2)
-	if err != nil {
+	if err == nil {
+		t.Fatalf("expected error on malformed line, got nil (count=%d)", count2)
+	}
+	if !strings.Contains(err.Error(), "not-a-set-line") {
+		t.Errorf("expected error to name the malformed line, got %v", err)
+	}
+
+	// A clean comment/blank-only-plus-verbs body still succeeds.
+	s.ExitConfigure()
+	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
-	if count2 != 2 {
-		t.Errorf("expected 2 commands, got %d", count2)
+	input3 := "# comment line\nset system host-name fw3\n\nset system domain-name example.com"
+	count3, err := s.LoadSet(input3)
+	if err != nil {
+		t.Fatalf("LoadSet clean body: %v", err)
+	}
+	if count3 != 2 {
+		t.Errorf("expected 2 commands, got %d", count3)
 	}
 
 	// Test outside config mode
