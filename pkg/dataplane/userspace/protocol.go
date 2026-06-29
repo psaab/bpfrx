@@ -710,6 +710,20 @@ type ScreenProfileSnapshot struct {
 	UDPFloodThreshold  uint32 `json:"udp_flood_threshold,omitempty"`
 	SYNFloodThreshold  uint32 `json:"syn_flood_threshold,omitempty"`
 	SYNCookie          bool   `json:"syn_cookie,omitempty"`
+	// #3315: SYN-flood sub-thresholds. The Go compiler parses the full Junos
+	// syn-flood shape (alarm/attack/source/destination/timeout) but only
+	// attack-threshold (SYNFloodThreshold above) used to cross the wire, so the
+	// other controls committed cleanly yet were operationally inert. These three
+	// carry the per-source / per-destination caps and the log-only alarm rate to
+	// the Rust dataplane. `timeout` is deliberately NOT serialized — it maps to
+	// the per-zone half-open session window (tcp_opening_ns), a session-layer
+	// surface split to a tracked follow-up; the compiler emits a commit-time
+	// warning so the leaf is never silently inert. Additive + omitempty: an old
+	// helper missing these decodes them as 0 (disabled), so version skew degrades
+	// safely (#1961 no-transit class).
+	SYNFloodAlarmThreshold uint32 `json:"syn_flood_alarm_threshold,omitempty"`
+	SYNFloodDstThreshold   uint32 `json:"syn_flood_dst_threshold,omitempty"`
+	SYNFloodSrcThreshold   uint32 `json:"syn_flood_src_threshold,omitempty"`
 	// Advanced screen features for userspace dataplane
 	SessionLimitSrc   uint32 `json:"session_limit_src,omitempty"`
 	SessionLimitDst   uint32 `json:"session_limit_dst,omitempty"`

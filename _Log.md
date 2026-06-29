@@ -23363,3 +23363,18 @@ top.
   - **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go, pkg/config/schema_interfaces.go, pkg/config/schema_security.go, pkg/config/schema_system.go, pkg/config/schema_routing.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md
   - **Action**: #3332 Codex MERGE-NEEDS-MAJOR fold (PR #3509). Codex confirmed NO over-rejection (scalar-guard crux clean); the MAJOR was INCOMPLETENESS — supported flat-set/compact forms bypass the schema-walk scalar gate because their leaf lives under a non-scalar-eligible node. Added a compiler-side companion gate validateTrailingTokensStrict (strict commit + lenientTrailingTokens downgrade, mirrors validateScreenUnknownStrict) covering the two unreachable shapes: (1 MAJOR) address-book `address <name> description <text>`/`<prefix>` — the `address` node is multi:true (absorbs the description sub-token onto Keys for the #2419 dual-AST shape), so the multi-exempt scalar gate never reaches the value slot and mergeAddressNode read only Keys[3]/Keys[2], dropping the rest; record leftover on Address.TrailingTokens (global + zone-local books, since resolveZoneLocalAddressBooks copies only Value/Description). (2 MINOR) IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>` — collapses onto the parent `dynamic` node's Keys (compiler_ipsec.go both sites read Keys[2]); record on IPsecGateway.DynamicHostnameExtras. (3 MINOR) dropped scalar:true on address-set description (AddressSet has no Description field — the tag was a no-op-feature; noted unsupported). (4 NIT) fixed the multi-exempt test to use a REAL #2419 bracketed list (`name-server [ a b c ]`). RED-on-revert verified for all 4 reject cases (strip the recording -> token silently dropped). No over-rejection: `address h2 1.2.3.4/32`, quoted `description "web server frontend"`, and compact `dynamic hostname peer.example.com` all still compile + values preserved. go test ./pkg/config/... ./pkg/cli/... ./pkg/configstore/... ./pkg/cmdtree/... green; gofmt clean.
   - **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/compiler_security.go, pkg/config/compiler_ipsec.go, pkg/config/types_security.go, pkg/config/schema_security.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md
+
+## 2026-06-29 — #3315 SYN-flood sub-thresholds reach userspace
+- **Action**: Wire SYN-flood source/destination/alarm thresholds across the
+  userspace-dp boundary and enforce them in the Rust screen runtime
+  (count-min-sketch substrate, no eviction); split `timeout` to a follow-up with
+  a commit-time warning. Per converged plan docs/research/3315 (Option B, R5).
+- **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/screens.go,
+  pkg/config/compiler_security.go, pkg/config/compiler.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/rate.rs, userspace-dp/src/screen/syn_rate.rs (new),
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json (regen, additive),
+  docs/feature-coverage.md, docs/syn-cookie-flood-protection.md, CLAUDE.md,
+  + Go/Rust tests.
