@@ -23091,3 +23091,8 @@ top.
 - **Timestamp**: 2026-06-28
   - **Action**: #3427 fold — routing-instance lo0 term now TERMINATES as accept (mirror userspace continue_term=false + Accept placeholder), not skip. Skip introduced an over-drop when a later deny term matched on the kernel-primary lo0 chain. Fall-through/modifier-only still emit no rule.
   - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go, pkg/daemon/README.md
+
+## #3440 flow aging — typed schema + accepted-only advisory (config-only)
+- **Timestamp**: 2026-06-28
+- **Action**: Verified per-app inactivity-timeout is already enforced (#3227, capabilities.go:334 → expire.rs); the real #3440 gap is watermark aging being inert on userspace (gc.SkipSweep) + opaque schema. Implemented the #2078/#3360 precedent: typed `security flow aging` subtree (early-ageout 0..86400, watermarks 0..100), validateFlowAgingStrict cross-field (low<high) + unknown-leaf reject with lenient no-brick downgrade, #3440 H1 accepted-only commit advisory, defensive negative-early-ageout clamp in SetAgingConfig, doc updates.
+- **File(s)**: pkg/config/schema_security.go, pkg/config/compiler_security.go, pkg/config/types_security.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/compiler_validate_warn.go, pkg/conntrack/gc.go, pkg/config/flow_aging_3440_test.go, pkg/conntrack/gc_test.go, docs/feature-gaps.md, docs/config-schema.md

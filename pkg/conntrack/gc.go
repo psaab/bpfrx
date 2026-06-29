@@ -168,6 +168,16 @@ func NewGCWithDomains(
 func (gc *GC) SetAgingConfig(earlyAgeout, highWM, lowWM int) {
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
+	// #3440 H2: clamp a negative early-ageout to 0 (disabled) instead of
+	// casting it to a huge uint64. The commit-check schema gate now bounds
+	// early-ageout to [0, 86400], but a peer-synced or already-persisted
+	// config from an older binary could still carry a negative value on the
+	// tolerant load path, and uint64(-1) == 18446744073709551615 would make
+	// the early-ageout effectively infinite (never shorter than any
+	// per-session timeout) — a silent no-op the operator cannot see.
+	if earlyAgeout < 0 {
+		earlyAgeout = 0
+	}
 	gc.earlyAgeout = uint64(earlyAgeout)
 	gc.highWatermark = highWM
 	gc.lowWatermark = lowWM

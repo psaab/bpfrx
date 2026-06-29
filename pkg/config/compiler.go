@@ -936,6 +936,18 @@ type compileOpts struct {
 	// the dataplane never represented the leaf, so a leniently-loaded profile
 	// runs without it independently. Same doctrine as lenientFilterFromMatch.
 	lenientScreenUnknown bool
+	// lenientFlowAging (#3440 H2) downgrades the flow-aging gate
+	// (validateFlowAgingStrict) from a hard compile error to a cfg.Warnings
+	// entry. The strict commit / commit-check path hard-rejects an unknown
+	// `security flow aging` leaf or a low-watermark >= high-watermark
+	// cross-field violation. The aging subtree was an opaque untyped node, so
+	// these bad shapes used to commit cleanly and be silently dropped /
+	// oscillate. The tolerant load / peer-sync paths downgrade to a warning
+	// so an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); watermark aging is not enforced on the userspace dataplane
+	// anyway (#3440 H1), so a leniently-loaded bad value is inert. Same
+	// doctrine as lenientScreenUnknown.
+	lenientFlowAging bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1204,6 +1216,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
+		lenientFlowAging:                     true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
 		lenientSecureTunnelBindIface:         true,
@@ -1346,6 +1359,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
+		lenientFlowAging:                     true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
 		lenientSecureTunnelBindIface:         true,
@@ -2059,6 +2073,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientScreenUnknown {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("screen unknown leaf (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3440 H2 flow-aging gate. Strict on commit / commit-check (hard-reject
+	// an unknown `security flow aging` leaf or a low-watermark >=
+	// high-watermark cross-field violation that the opaque untyped subtree
+	// used to accept silently). Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick;
+	// watermark aging is not enforced on the userspace dataplane anyway,
+	// #3440 H1). Runs on the fully-compiled *Config (AgingUnknownLeaves and
+	// the watermark ints populated by compileFlow).
+	if err := validateFlowAgingStrict(cfg); err != nil {
+		if opts.lenientFlowAging {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("flow aging (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

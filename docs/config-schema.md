@@ -1932,6 +1932,22 @@ the value sits in a single typed slot:
     dataplane, #1373/#1476).
   - `security flow udp-session` / `icmp-session` expanded to a container with a
     typed `timeout` (`ValidateInteger(0, MaxDurationSeconds)`).
+  - `security flow aging` expanded from an opaque untyped node (#3440 H2) to a
+    container with three typed integer leaves: `early-ageout`
+    (`ValidateInteger(0, 86400)`, seconds, 0 = disabled), `high-watermark` and
+    `low-watermark` (`ValidateInteger(0, 100)`, percent of max sessions, 0 =
+    disabled). The cross-field rule (`low-watermark < high-watermark` when both
+    nonzero) and unknown-leaf rejection live in `validateFlowAgingStrict`
+    (`compiler_validate_strict.go`, dispatched from `compiler.go` with a
+    `lenientFlowAging` no-brick downgrade) because the schema walker is
+    single-leaf. **#3440 H1:** watermark aging drives only the Go-side
+    conntrack GC hysteresis, which is skipped on the userspace AF_XDP
+    dataplane (the only runtime forwarding path), so setting any aging knob
+    emits an accepted-only commit advisory (`compiler_validate_warn.go`,
+    `security flow aging ... accepted-only`) — typing the schema only stops
+    invalid values from persisting, it does not make the knob enforced.
+    Per-application `inactivity-timeout` (#3227) is a separate, fully-enforced
+    idle-timeout knob and is unaffected.
   - `forwarding-options sampling instance <i> input rate` —
     `ValidateInteger(0, maxWireU32)`. **0 is accepted** (the documented
     `0 = sample all` sentinel, `types_system.go`; Layer A normalizes

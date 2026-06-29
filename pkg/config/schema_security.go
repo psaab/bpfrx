@@ -428,7 +428,29 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 	}},
 	"flow": {desc: "Flow and session settings", children: map[string]*schemaNode{
-		"aging": {desc: "Aggressive session aging thresholds", children: nil},
+		// #3440 H2: `security flow aging` was an opaque untyped node — the
+		// schema walker skipped the whole subtree, so the compiler's
+		// strconv.Atoi parse (compiler_security.go compileFlow) silently
+		// accepted nonsense: a negative `early-ageout` (cast to a huge
+		// uint64 in gc.SetAgingConfig) and an out-of-range watermark (`>100`
+		// percent, which can never trip / never clear). Declaring the three
+		// value-bearing leaves as typed integers makes the commit-check
+		// schema gate (SchemaValidate) bound them: early-ageout is a
+		// non-negative duration in seconds (0 = disabled), each watermark is
+		// a percent in 0..100 (0 = disabled). The cross-field rule
+		// (low-watermark < high-watermark when both nonzero) and unknown-leaf
+		// rejection live in validateFlowAgingStrict (compiler_validate_strict.go)
+		// because the schema walker is single-leaf and leaves unknown
+		// keywords to the compiler. NOTE: aggressive watermark aging is
+		// itself accepted-only on the userspace AF_XDP dataplane (see the
+		// #3440 H1 warning in compiler_validate_warn.go) — typing the schema
+		// only stops invalid values from being persisted, it does not make
+		// the knob enforced.
+		"aging": {desc: "Aggressive session aging thresholds", children: map[string]*schemaNode{
+			"early-ageout":   {desc: "Shortened session timeout applied while aging is active", args: 1, valueType: ValueInteger, valueDesc: "Seconds (0 = disabled)", valueExamples: []string{"20", "60"}, validator: ValidateInteger(0, 86400), placeholder: "<seconds>", children: nil},
+			"high-watermark": {desc: "Session-table utilization percent that activates aging", args: 1, valueType: ValueInteger, valueDesc: "Percent of max sessions (0 = disabled)", valueExamples: []string{"90"}, validator: ValidateInteger(0, 100), placeholder: "<percent>", children: nil},
+			"low-watermark":  {desc: "Session-table utilization percent that deactivates aging", args: 1, valueType: ValueInteger, valueDesc: "Percent of max sessions (0 = disabled)", valueExamples: []string{"80"}, validator: ValidateInteger(0, 100), placeholder: "<percent>", children: nil},
+		}},
 		// #1979 Layer B (Tier 2): expand the opaque session-timeout
 		// containers to real containers whose value-bearing sub-leaves are
 		// typed. The compiler reads tcp-session's four `<kind>-timeout`

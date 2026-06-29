@@ -80,6 +80,12 @@ type FlowConfig struct {
 	AgingEarlyAgeout           int // seconds (0 = disabled)
 	AgingHighWatermark         int // percent of max sessions (0 = disabled)
 	AgingLowWatermark          int // percent of max sessions (0 = disabled)
+	// AgingUnknownLeaves records `security flow aging` child keywords the
+	// compiler does not recognize (#3440 H2). The aging subtree previously
+	// silently dropped any unknown leaf; compileFlow now records them so
+	// validateFlowAgingStrict can reject them at commit (mirrors
+	// ScreenProfile.UnknownLeaves / #3318).
+	AgingUnknownLeaves []string
 }
 
 // FlowTraceoptions holds flow trace debugging configuration.
