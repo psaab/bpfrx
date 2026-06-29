@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"net"
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -330,14 +331,20 @@ func buildOneRuleSnapshot(
 	// is the address analog of the application sentinel below.
 	srcUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.SourceAddresses)
 	dstUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.DestinationAddresses)
+	// #3376: capture the exact offending tokens BEFORE the side collapses to
+	// the sentinel so collectPolicyContentRejections can name them per side.
+	var rejectedSrc, rejectedDst, rejectedApps []string
 	if srcUnrepresentable {
+		rejectedSrc = offendingAddressTokens(addrRepresentable, pol.Match.SourceAddresses)
 		sourceAddresses = []string{unsupportedAddressSentinel}
 	}
 	if dstUnrepresentable {
+		rejectedDst = offendingAddressTokens(addrRepresentable, pol.Match.DestinationAddresses)
 		destinationAddresses = []string{unsupportedAddressSentinel}
 	}
 	applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
 	if !ok {
+		rejectedApps = offendingApplicationTokens(cfg, pol.Match.Applications)
 		// #2124: the rule cites application terms the userspace matcher cannot
 		// honor (unrepresentable protocol or port). Emit a reserved unparseable
 		// sentinel term instead of nil. nil would decode on the Rust side as
@@ -408,7 +415,43 @@ func buildOneRuleSnapshot(
 		// policy pol.Match.FromZone/ToZone are empty, so this is inert.
 		MatchFromZone: pol.Match.FromZone,
 		MatchToZone:   pol.Match.ToZone,
+		// #3376: build-time-only offending-token detail (not serialized).
+		rejectedSourceAddresses: rejectedSrc,
+		rejectedDestAddresses:   rejectedDst,
+		rejectedApplications:    rejectedApps,
 	}
+}
+
+// offendingAddressTokens returns the configured address tokens the userspace
+// matcher cannot represent (#3376). Used to name the exact poisoned object in a
+// fail-closed content-rejection reason rather than the bare "an address". The
+// returned tokens are the operator-configured strings (an undefined book name,
+// or a book that resolves to no representable prefix), in config order.
+func offendingAddressTokens(addrRepresentable func(tok string) bool, addrs []string) []string {
+	var bad []string
+	for _, tok := range addrs {
+		if !addrRepresentable(tok) {
+			bad = append(bad, tok)
+		}
+	}
+	return bad
+}
+
+// offendingApplicationTokens returns the configured application tokens the
+// userspace matcher cannot represent (#3376), identified by re-running the
+// snapshot application expansion on each token individually. A token whose
+// single-element expansion fails (protocol-less app, unrepresentable
+// protocol/port, undefined name, or an application-set with such a member) is
+// reported by its configured name, so the reason names the exact poisoned
+// application rather than the bare "an application".
+func offendingApplicationTokens(cfg *config.Config, apps []string) []string {
+	var bad []string
+	for _, app := range apps {
+		if _, ok := expandUserspacePolicyApplications(cfg, []string{app}); !ok {
+			bad = append(bad, app)
+		}
+	}
+	return bad
 }
 
 // collectPolicyContentRejections scans the BUILT policy rules for the #3261
@@ -431,20 +474,71 @@ func collectPolicyContentRejections(policies []PolicyRuleSnapshot) []string {
 				break
 			}
 		}
-		addrBad := addressListHasSentinel(rule.SourceLiterals) ||
-			addressListHasSentinel(rule.DestinationLiterals) ||
-			addressListHasSentinel(rule.SourceAddresses) ||
-			addressListHasSentinel(rule.DestinationAddresses)
-		switch {
-		case appBad && addrBad:
-			reasons = append(reasons, fmt.Sprintf("policy %q names an unrepresentable application AND address", rule.Name))
-		case appBad:
-			reasons = append(reasons, fmt.Sprintf("policy %q names an application the userspace matcher cannot represent", rule.Name))
-		case addrBad:
-			reasons = append(reasons, fmt.Sprintf("policy %q names an address the userspace matcher cannot represent", rule.Name))
+		srcBad := addressListHasSentinel(rule.SourceLiterals) || addressListHasSentinel(rule.SourceAddresses)
+		dstBad := addressListHasSentinel(rule.DestinationLiterals) || addressListHasSentinel(rule.DestinationAddresses)
+		if !appBad && !srcBad && !dstBad {
+			continue
 		}
+		// #3376: name the stable rule identity (scope-qualified, so duplicate
+		// policy names across distinct zone pairs / global scope are
+		// distinguishable) AND the offending side + configured object(s), so the
+		// operator can jump straight to the poisoned token on the fail-closed
+		// keep-armed path instead of hand-auditing every source/destination/app.
+		var causes []string
+		if srcBad {
+			causes = append(causes, rejectionCause("source-address", rule.rejectedSourceAddresses))
+		}
+		if dstBad {
+			causes = append(causes, rejectionCause("destination-address", rule.rejectedDestAddresses))
+		}
+		if appBad {
+			causes = append(causes, rejectionCause("application", rule.rejectedApplications))
+		}
+		reasons = append(reasons, fmt.Sprintf("policy %s names content the userspace matcher cannot represent: %s",
+			policyRejectionScope(rule), strings.Join(causes, "; ")))
 	}
 	return reasons
+}
+
+// policyRejectionScope returns the stable, scope-qualified rule identity used in
+// a content-rejection reason (#3376). A zone-pair rule renders as
+// "from-zone->to-zone/name"; a global rule (FromZone == ToZone ==
+// "junos-global") renders as "global/name", appending its optional
+// from-zone/to-zone match context ("global(a->b)/name") when present. The bare
+// name alone is ambiguous because duplicate policy names across distinct zone
+// pairs / global scope are valid and common.
+func policyRejectionScope(rule *PolicyRuleSnapshot) string {
+	if rule.FromZone == "junos-global" && rule.ToZone == "junos-global" {
+		if rule.MatchFromZone != "" || rule.MatchToZone != "" {
+			from := rule.MatchFromZone
+			if from == "" {
+				from = "any"
+			}
+			to := rule.MatchToZone
+			if to == "" {
+				to = "any"
+			}
+			return fmt.Sprintf("global(%s->%s)/%s", from, to, rule.Name)
+		}
+		return fmt.Sprintf("global/%s", rule.Name)
+	}
+	return fmt.Sprintf("%s->%s/%s", rule.FromZone, rule.ToZone, rule.Name)
+}
+
+// rejectionCause renders one side's content-rejection cause for #3376, naming
+// the exact offending tokens when known (e.g. `source-address "missing-book"`).
+// It falls back to the bare side label when the offending tokens were not
+// captured (e.g. the snapshot was decoded from the wire, which does not carry
+// the build-time-only detail).
+func rejectionCause(side string, tokens []string) string {
+	if len(tokens) == 0 {
+		return side
+	}
+	quoted := make([]string, len(tokens))
+	for i, t := range tokens {
+		quoted[i] = fmt.Sprintf("%q", t)
+	}
+	return fmt.Sprintf("%s %s", side, strings.Join(quoted, ", "))
 }
 
 func addressListHasSentinel(addrs []string) bool {

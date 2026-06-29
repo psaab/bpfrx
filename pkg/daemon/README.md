@@ -364,6 +364,30 @@ never lock an operator out of a remote box it manages.
   `discard` dropped ALL ICMP fail-closed-over-broad, an `accept` admitted ALL
   ICMP fail-open). Pinned by `TestNftRuleFromTermICMPCodeOnly` (v4 + v6 +
   multi-value, code-only) and `TestNftRuleFromTermICMPTypeCode`.
+
+  **Protocol / DSCP lowering normalizes through the shared resolvers (#3436):**
+  `nftRuleFromTerm` resolves each `from protocol` token through the shared
+  `appid.ProtocolNumber` SSOT (the same resolver the commit gate
+  `filterProtocolResolvable` and the userspace matcher `ip_proto.rs` use) and
+  emits the NUMERIC nft `l4proto` token (`meta l4proto 47`, set form
+  `meta l4proto { 47, 6, 50 }`). It resolves each `dscp` / `traffic-class` token
+  through the `dataplane.DSCPValues` SSOT (case-insensitive, numeric 0..63
+  pass-through) and emits the numeric `ip[6] dscp` value. The pre-fix code
+  emitted both tokens RAW (codex-094 H08/M01): nft does not share the Junos
+  alias table — `meta l4proto junos-gre` / `junos-tcp-any` / `ipip` is a parse
+  error that rejects the whole atomically-loaded lo0 table (legitimate commit
+  broken) or, on the lenient/peer-sync path, leaves the kernel mirror absent
+  while userspace stays armed. Likewise nft's DSCP names are lowercase only and
+  do not cover every xpf code point — an upper-case `EF` (accepted
+  case-insensitively at commit) and `be` (best-effort, which has NO nft name)
+  both failed the atomic load. Emitting numeric values is unconditionally
+  nft-safe and matches the SAME protocol / code point as userspace. An
+  unresolvable token cannot reach a committed config (the commit gate rejects
+  it); on the lenient path an unresolvable protocol is dropped with a warning
+  (mirroring the tcp-flags lowering) and an unresolvable DSCP token falls back
+  to its lower-cased form. Pinned by `TestNftRuleFromTermProtocolAliases`,
+  `TestNftRuleFromTermProtocolMultiAliasSet`, `TestNftRuleFromTermDSCP`, and
+  `TestNftRuleFromTermDSCPNamesAndCase`.
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted
@@ -398,6 +422,26 @@ never lock an operator out of a remote box it manages.
   mirrors the Rust classifier and must stay in sync. Tests:
   `host_inbound_nft_test.go` (accept-listed / deny-rest fail-on-revert,
   no-stanza-no-deny, lifeline-never-denied, `all`-opens-zone).
+  **Counted drops + scrape (#3361):** each per-zone/family catch-all drop is
+  `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =
+  `nftables.HostInboundDenyCounterName(zone, family)` (encoding
+  `xpfhi_<family>_<len>_<zone>`, reversible even when the zone name contains
+  `_`/`-`). The named counter objects are declared at the top of the table body,
+  so the table now uses an `add table` / `delete table` / recreate idiom instead
+  of lo0's plain `flush table`: `flush` keeps named objects, so redeclaring the
+  counters on the next commit would collide ("File exists"). delete+recreate also
+  drops a stale counter for a zone that no longer enforces. A consequence is that
+  these counters reset to zero on every table rebuild (every commit + every
+  DHCP/DHCPv6 address change that re-renders the chain); Prometheus `rate()` reset
+  detection handles this. `pkg/nftables.ReadHostInboundDenyCounters()` reads the
+  counters back via netlink (no nft shell-out) and the API collector
+  (`pkg/api/metrics_counters.go:collectHostInboundKernelDenies`) exports them as
+  `xpf_host_inbound_kernel_denies_total{zone,family}` (REST aggregate
+  `host_inbound_kernel_denies`). This is the PRIMARY host-inbound enforcement
+  path and is DISTINCT from the userspace-dp `xpf_host_inbound_denies_total`
+  (`GlobalCtrHostInboundDeny`, #3326) — they are not double counts. Before #3361
+  these kernel drops were uncounted and `host_inbound_denies` stayed 0 even while
+  the firewall was actively denying control-plane traffic.
 
 ## RPM + ip-monitoring wiring (#1827)
 

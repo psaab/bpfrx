@@ -1606,8 +1606,8 @@ func TestMultiTermApplication(t *testing.T) {
 	input := `applications {
     application ssh-long {
         description "Long SSH sessions";
-        term 22 alg ssh protocol tcp destination-port 22 inactivity-timeout 86400;
-        term 2222 alg ssh protocol tcp destination-port 2222 inactivity-timeout 86400;
+        term 22 alg ftp protocol tcp destination-port 22 inactivity-timeout 86400;
+        term 2222 alg ftp protocol tcp destination-port 2222 inactivity-timeout 86400;
     }
     application FaceTime {
         term 41642_65535 protocol udp source-port 41642-65535 destination-port 3478-3497;
@@ -1644,8 +1644,8 @@ func TestMultiTermApplication(t *testing.T) {
 	if term22.DestinationPort != "22" {
 		t.Errorf("ssh-long-22 dest-port: got %q, want 22", term22.DestinationPort)
 	}
-	if term22.ALG != "ssh" {
-		t.Errorf("ssh-long-22 ALG: got %q, want ssh", term22.ALG)
+	if term22.ALG != "ftp" {
+		t.Errorf("ssh-long-22 ALG: got %q, want ftp", term22.ALG)
 	}
 	if term22.InactivityTimeout != 86400 {
 		t.Errorf("ssh-long-22 timeout: got %d, want 86400", term22.InactivityTimeout)

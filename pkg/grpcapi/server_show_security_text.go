@@ -186,7 +186,14 @@ func (s *Server) showSecurityLog(filter string, buf *strings.Builder) {
 		buf.WriteString("no events recorded\n")
 		return
 	}
-	// Build zone name map
+	// Build the CURRENT-config reverse zone ID → name map. This is only a
+	// fallback for legacy records that lack a resolved-at-event-time name
+	// (#3335): each EventRecord stores InZoneName/OutZoneName as resolved when
+	// the event fired, so a later zone rename / delete / ID reuse (#3075) must
+	// NOT retroactively rewrite an old event's zone name from the live config.
+	// Prefer the stored name; consult this map (then a bare numeric fallback)
+	// only when the record carries no resolved name. This is the showText
+	// "security-log" topic that the remote `cli` binary routes to.
 	evZoneNames := make(map[uint16]string)
 	if s.dp != nil {
 		if cr := s.applyResult(); cr != nil {
@@ -195,7 +202,10 @@ func (s *Server) showSecurityLog(filter string, buf *strings.Builder) {
 			}
 		}
 	}
-	zoneName := func(id uint16) string {
+	zoneName := func(stored string, id uint16) string {
+		if stored != "" {
+			return stored
+		}
 		if n, ok := evZoneNames[id]; ok {
 			return n
 		}
@@ -210,16 +220,16 @@ func (s *Server) showSecurityLog(filter string, buf *strings.Builder) {
 		switch e.Type {
 		case "SCREEN_DROP":
 			fmt.Fprintf(buf, "%s %-14s screen=%-16s %s -> %s %s action=%s zone=%s\n",
-				ts, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, zoneName(e.InZone))
+				ts, e.Type, e.ScreenCheck, e.SrcAddr, e.DstAddr, e.Protocol, e.Action, zoneName(e.InZoneName, e.InZone))
 		case "SESSION_CLOSE":
 			fmt.Fprintf(buf, "%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s client=%d/%d server=%d/%d reason=%q\n",
 				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				policyDisp, zoneName(e.InZone), zoneName(e.OutZone),
+				policyDisp, zoneName(e.InZoneName, e.InZone), zoneName(e.OutZoneName, e.OutZone),
 				e.SessionPkts, e.SessionBytes, e.RevSessionPkts, e.RevSessionBytes, e.CloseReason)
 		default:
 			fmt.Fprintf(buf, "%s %-14s %s -> %s %s action=%-6s policy=%s zone=%s->%s\n",
 				ts, e.Type, e.SrcAddr, e.DstAddr, e.Protocol, e.Action,
-				policyDisp, zoneName(e.InZone), zoneName(e.OutZone))
+				policyDisp, zoneName(e.InZoneName, e.InZone), zoneName(e.OutZoneName, e.OutZone))
 		}
 	}
 	fmt.Fprintf(buf, "(%d events shown)\n", len(events))
