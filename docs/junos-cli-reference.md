@@ -407,6 +407,30 @@ From zone: guest, To zone: lan
     set is byte-identical. Management/cluster-control lifeline interfaces
     (fxp0/em0/fab*) are still excluded — a VIP on em0 is never scoped — and
     standalone (no-VRRP) zones are unchanged.
+  - **Per-interface host-inbound override (#3362):** Junos models
+    `host-inbound-traffic` at BOTH the zone level (`set security zones
+    security-zone <z> host-inbound-traffic ...`, applies to every interface in
+    the zone) AND the interface level (`set security zones security-zone <z>
+    interfaces <if> host-inbound-traffic ...`, applies only to that interface).
+    xpf now supports the interface-level stanza; the EFFECTIVE admission set for
+    an interface is the UNION of the zone-level set and its interface-level
+    override (Junos additive semantics). A zone is host-inbound-ENFORCING when it
+    declares a zone-level stanza OR any interface-level override — so an operator
+    can expose a service (e.g. `ssh`) on one interface of a zone while denying it
+    on the others by setting the override only on the exposed interface and
+    leaving the zone-level set empty (the motivating use case: management/routing
+    protocols on a single uplink/loopback, denied on the rest of the zone).
+    Enforcement on BOTH surfaces: the kernel-nft primary path
+    (`BuildZoneHostInboundViews`) emits one address-scoped view per distinct
+    effective token set, so the overridden interface's addresses accept its
+    services while the zone's other interfaces get a catch-all drop; the Rust
+    AF_XDP secondary (XSK local-delivery) path keys the admit check by ingress
+    interface (`ForwardingState::ifindex_host_inbound` /
+    `host_inbound_admits_iface`), falling back to the zone-keyed check where no
+    override exists. Interface-level tokens are validated at commit by the same
+    SSOT as the zone-level stanza (#3200), and management/cluster-control
+    lifeline interfaces are excluded from the override exactly as from the
+    zone-level deny scoping. (Distinct from #3328, which is the API-display gap.)
   - **Lifeline set derived from cluster config (#3277):** the lifeline
     interfaces excluded from host-inbound deny scoping are no longer a fixed
     fxp0/em0/fab* hardcode. The set is now `fxp0` (always-mgmt) UNION the

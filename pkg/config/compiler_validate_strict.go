@@ -5525,28 +5525,63 @@ func validateHostInboundTokensStrict(cfg *Config) error {
 	sort.Strings(names)
 	for _, name := range names {
 		zone := cfg.Security.Zones[name]
-		if zone == nil || zone.HostInboundTraffic == nil {
+		if zone == nil {
 			continue
 		}
-		for _, svc := range zone.HostInboundTraffic.SystemServices {
-			if !KnownHostInboundSystemServices[svc] {
-				return fmt.Errorf(
-					"security zone %q host-inbound-traffic system-services %q "+
-						"is not a recognized system-service; an unknown token "+
-						"commits but enforces inconsistently (kernel nft path vs "+
-						"Rust dataplane disagree) — fix the typo or remove it",
-					name, svc)
+		if zone.HostInboundTraffic != nil {
+			if err := validateHostInboundStanzaStrict(name, "", zone.HostInboundTraffic); err != nil {
+				return err
 			}
 		}
-		for _, proto := range zone.HostInboundTraffic.Protocols {
-			if !KnownHostInboundProtocols[proto] {
-				return fmt.Errorf(
-					"security zone %q host-inbound-traffic protocols %q is not a "+
-						"recognized protocol; an unknown token commits but "+
-						"enforces inconsistently (kernel nft path vs Rust "+
-						"dataplane disagree) — fix the typo or remove it",
-					name, proto)
+		// #3362: the per-interface override carries the same token grammar and
+		// MUST be validated identically — an unknown token on an interface-level
+		// stanza would otherwise produce the same kernel-nft vs Rust-classifier
+		// split-brain the zone-level gate exists to close. Interfaces are walked
+		// in sorted order so the first-reported error is deterministic.
+		ifNames := make([]string, 0, len(zone.InterfaceHostInbound))
+		for ifName := range zone.InterfaceHostInbound {
+			ifNames = append(ifNames, ifName)
+		}
+		sort.Strings(ifNames)
+		for _, ifName := range ifNames {
+			if err := validateHostInboundStanzaStrict(name, ifName, zone.InterfaceHostInbound[ifName]); err != nil {
+				return err
 			}
+		}
+	}
+	return nil
+}
+
+// validateHostInboundStanzaStrict validates one host-inbound-traffic stanza's
+// system-services / protocols tokens against the recognized SSOT sets. When
+// ifName is non-empty the error message names the per-interface scope (#3362);
+// when empty it names the zone-level stanza.
+func validateHostInboundStanzaStrict(zone, ifName string, hib *HostInboundTraffic) error {
+	if hib == nil {
+		return nil
+	}
+	scope := "host-inbound-traffic"
+	if ifName != "" {
+		scope = fmt.Sprintf("interfaces %q host-inbound-traffic", ifName)
+	}
+	for _, svc := range hib.SystemServices {
+		if !KnownHostInboundSystemServices[svc] {
+			return fmt.Errorf(
+				"security zone %q %s system-services %q "+
+					"is not a recognized system-service; an unknown token "+
+					"commits but enforces inconsistently (kernel nft path vs "+
+					"Rust dataplane disagree) — fix the typo or remove it",
+				zone, scope, svc)
+		}
+	}
+	for _, proto := range hib.Protocols {
+		if !KnownHostInboundProtocols[proto] {
+			return fmt.Errorf(
+				"security zone %q %s protocols %q is not a "+
+					"recognized protocol; an unknown token commits but "+
+					"enforces inconsistently (kernel nft path vs Rust "+
+					"dataplane disagree) — fix the typo or remove it",
+				zone, scope, proto)
 		}
 	}
 	return nil

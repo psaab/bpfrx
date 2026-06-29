@@ -299,6 +299,30 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			})
 		}
 	}
+	// #3362: stamp the per-interface host-inbound OVERRIDE onto each snapshot so
+	// the Rust dataplane can key the host-inbound admission check by ingress
+	// interface. Carried only for an interface that declared an interface-level
+	// stanza and is NOT a management/cluster-control lifeline (matching the nft
+	// primary path, which excludes lifeline addresses from host-inbound deny
+	// scoping). The carried set is the EFFECTIVE union of the zone-level set and
+	// the override, so the Rust side enforces it as-is without re-deriving the
+	// union. HostInboundConfigured marks a present override (even an empty one →
+	// fail-closed) so an old Go binary that omits the field is distinguishable.
+	if overrideByIface := buildInterfaceHostInboundMap(cfg); len(overrideByIface) > 0 {
+		lifelines := hostInboundLifelineSet(cfg)
+		for i := range out {
+			ovr := overrideByIface[out[i].Name]
+			zone := cfg.Security.Zones[out[i].Zone]
+			if ovr == nil || zone == nil ||
+				hostInboundLifelineInterface(out[i].Name, lifelines) {
+				continue
+			}
+			svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, ovr)
+			out[i].HostInboundConfigured = true
+			out[i].HostInboundSystemServices = svc
+			out[i].HostInboundProtocols = proto
+		}
+	}
 	return out
 }
 

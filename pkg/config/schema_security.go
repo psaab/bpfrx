@@ -41,9 +41,26 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 	"zones": {desc: "Security zones", children: map[string]*schemaNode{
 		"security-zone": {desc: "Security zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"description": {desc: "Zone description", args: 1, scalar: true, placeholder: "<text>", children: nil},
-			"interfaces":  {desc: "Interfaces in this zone", children: nil},
-			"tcp-rst":     {desc: "Send TCP RST for denied traffic", children: nil},
-			"screen":      {desc: "Screen profile name", args: 1, placeholder: "<screen-name>", children: nil},
+			// #3362: per-interface host-inbound-traffic override. The interface
+			// name is a wildcard (dynamic) key; under it the SAME token grammar
+			// as the zone-level host-inbound-traffic stanza below (system-services
+			// / protocols as untyped containers — tokens validated by
+			// validateHostInboundTokensStrict, not the schema). A bare
+			// `interfaces <if>` (no body) stays valid (zone membership only). The
+			// effective admission set for an interface is the UNION of the
+			// zone-level set and this interface-level set (Junos additive
+			// semantics).
+			"interfaces": {desc: "Interfaces in this zone", wildcard: &schemaNode{
+				desc: "Interface name", valueHint: ValueHintInterfaceName, placeholder: "<interface-name>",
+				children: map[string]*schemaNode{
+					"host-inbound-traffic": {desc: "Per-interface host inbound traffic", children: map[string]*schemaNode{
+						"system-services": {desc: "System services", children: nil},
+						"protocols":       {desc: "Protocols", children: nil},
+					}},
+				},
+			}},
+			"tcp-rst": {desc: "Send TCP RST for denied traffic", children: nil},
+			"screen":  {desc: "Screen profile name", args: 1, placeholder: "<screen-name>", children: nil},
 			"host-inbound-traffic": {desc: "Host inbound traffic", children: map[string]*schemaNode{
 				"system-services": {desc: "System services", children: nil},
 				"protocols":       {desc: "Protocols", children: nil},

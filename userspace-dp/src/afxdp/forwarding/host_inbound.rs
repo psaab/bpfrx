@@ -37,11 +37,27 @@ const ICMP6_ECHO_REQUEST: u8 = 128;
 /// as the key MUST be the same validated id `populate_zones` accepted (caller
 /// passes it), so the two maps stay aligned.
 pub(in crate::afxdp) fn zone_host_inbound_from_snapshot(zone: &ZoneSnapshot) -> ZoneHostInbound {
+    zone_host_inbound_from_tokens(
+        &zone.host_inbound_system_services,
+        &zone.host_inbound_protocols,
+    )
+}
+
+/// #3362: build a [`ZoneHostInbound`] from raw Junos host-inbound token slices.
+/// Shared by the zone-level path ([`zone_host_inbound_from_snapshot`]) and the
+/// per-interface OVERRIDE path (`InterfaceSnapshot.host_inbound_*`), so the two
+/// classify identically. The interface-level token set carried on the wire is
+/// already the EFFECTIVE union (zone ∪ interface) computed in Go, so this just
+/// classifies it as-is.
+pub(in crate::afxdp) fn zone_host_inbound_from_tokens(
+    services: &[String],
+    protocols: &[String],
+) -> ZoneHostInbound {
     let mut hi = ZoneHostInbound::default();
-    for svc in &zone.host_inbound_system_services {
+    for svc in services {
         classify_system_service(svc.trim().to_ascii_lowercase().as_str(), &mut hi);
     }
-    for proto in &zone.host_inbound_protocols {
+    for proto in protocols {
         classify_protocol(proto.trim().to_ascii_lowercase().as_str(), &mut hi);
     }
     hi
@@ -434,6 +450,34 @@ pub(in crate::afxdp) fn host_inbound_admits(
     }
 }
 
+/// #3362: per-packet host-inbound admit keyed by INGRESS INTERFACE first. When
+/// the ingress interface carries a per-interface host-inbound OVERRIDE
+/// (`state.ifindex_host_inbound`), the packet is matched against that interface's
+/// EFFECTIVE admission set (zone ∪ interface, pre-unioned in Go); otherwise it
+/// falls back to the zone-keyed [`host_inbound_admits`]. The global
+/// ICMP/PMTUD/ND accept (#3171) is applied first in BOTH branches so error / ND
+/// delivery is never broken by a scoped override. This is the entry point the
+/// local-delivery poll path uses; `host_inbound_admits` stays the zone-only
+/// primitive (and the direct test target).
+#[allow(clippy::too_many_arguments)]
+pub(in crate::afxdp) fn host_inbound_admits_iface(
+    state: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_zone_id: u16,
+    protocol: u8,
+    dst_port: u16,
+    is_v6: bool,
+    icmp_type: u8,
+) -> bool {
+    if let Some(hi) = state.ifindex_host_inbound.get(&ingress_ifindex) {
+        if is_icmp_host_inbound_global_accept(protocol, icmp_type) {
+            return true;
+        }
+        return hi.admits(protocol, dst_port, is_v6, icmp_type);
+    }
+    host_inbound_admits(state, ingress_zone_id, protocol, dst_port, is_v6, icmp_type)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +519,62 @@ mod tests {
                 "IP routing protocol {p:?} must remain in the `protocols all` expansion",
             );
         }
+    }
+
+    // #3362: the per-interface host-inbound OVERRIDE keys the admit check by
+    // ingress ifindex. An interface with an override is matched against ITS
+    // effective set; an interface without one falls back to the from-zone set.
+    // Fail-on-revert: make host_inbound_admits_iface ignore ifindex_host_inbound
+    // (i.e. always defer to the zone) and the override-scoped assertions flip.
+    #[test]
+    fn per_interface_override_keys_by_ifindex() {
+        const TCP: u8 = 6;
+        const IFINDEX_UPLINK: i32 = 100; // ssh override
+        const IFINDEX_OTHER: i32 = 200; // no override (zone fallback)
+        const ZONE: u16 = 5; // zone-keyed set = ping only
+
+        let mut state = ForwardingState::default();
+        // Zone-level set: ping (ICMP echo) only — NO ssh.
+        state.zone_host_inbound.insert(
+            ZONE,
+            zone_host_inbound_from_tokens(&["ping".to_string()], &[]),
+        );
+        // Per-interface override on the uplink: ssh only.
+        state.ifindex_host_inbound.insert(
+            IFINDEX_UPLINK,
+            zone_host_inbound_from_tokens(&["ssh".to_string()], &[]),
+        );
+
+        // Uplink (override present): admits ssh, denies https, and does NOT
+        // inherit the zone's ping (the override REPLACES the zone set on this
+        // interface — its set is the Go-side effective union).
+        assert!(
+            host_inbound_admits_iface(&state, IFINDEX_UPLINK, ZONE, TCP, 22, false, 0),
+            "uplink override must admit ssh (tcp/22)",
+        );
+        assert!(
+            !host_inbound_admits_iface(&state, IFINDEX_UPLINK, ZONE, TCP, 443, false, 0),
+            "uplink override (ssh only) must deny https (tcp/443)",
+        );
+
+        // Other interface (no override): falls back to the zone set — denies ssh,
+        // admits the zone's ping echo-request (icmp v4 type 8).
+        assert!(
+            !host_inbound_admits_iface(&state, IFINDEX_OTHER, ZONE, TCP, 22, false, 0),
+            "non-overridden interface must fall back to the zone set (no ssh)",
+        );
+        assert!(
+            host_inbound_admits_iface(&state, IFINDEX_OTHER, ZONE, 1, 0, false, 8),
+            "non-overridden interface must inherit the zone's ping admit",
+        );
+
+        // Global ICMP error/PMTUD accept (#3171) still applies on the override
+        // path: destination-unreachable (v4 type 3) is admitted even though the
+        // override set is ssh-only.
+        assert!(
+            host_inbound_admits_iface(&state, IFINDEX_UPLINK, ZONE, 1, 0, false, 3),
+            "ICMP error/PMTUD must stay globally admitted on the override path",
+        );
     }
 
     // #3311: a zone with `protocols all` must NOT admit IS-IS as an IP protocol

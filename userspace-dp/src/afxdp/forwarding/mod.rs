@@ -4,7 +4,10 @@ mod host_inbound;
 // #3070: re-export into the afxdp scope so the local-delivery admit path
 // (poll_descriptor, via `use self::forwarding::*`) and the forwarding-state
 // builder (forwarding_build::zones) can reach them.
-pub(in crate::afxdp) use host_inbound::{host_inbound_admits, zone_host_inbound_from_snapshot};
+pub(in crate::afxdp) use host_inbound::{
+    host_inbound_admits, host_inbound_admits_iface, zone_host_inbound_from_snapshot,
+    zone_host_inbound_from_tokens,
+};
 
 const DEFAULT_V4_TABLE: &str = "inet.0";
 const DEFAULT_V6_TABLE: &str = "inet6.0";

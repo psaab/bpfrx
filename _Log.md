@@ -1,3 +1,33 @@
+## 2026-06-29 — #3362 per-zone-interface host-inbound-traffic override
+
+- **Timestamp**: 2026-06-29
+- **Action**: Added Junos interface-level `host-inbound-traffic` (`security
+  zones <z> interfaces <if> host-inbound-traffic { ... }`). Effective set =
+  zone-level UNION interface-level (additive); a zone enforces host-inbound when
+  it has a zone-level stanza OR any interface override, so a service can be
+  exposed on one interface of a zone and denied on the others. Threaded both
+  enforcement surfaces: kernel-nft primary path (`BuildZoneHostInboundViews` now
+  emits one address-scoped view per distinct effective token set) and the Rust
+  AF_XDP secondary path (new `InterfaceSnapshot.host_inbound_*` wire fields →
+  `ForwardingState::ifindex_host_inbound` → `host_inbound_admits_iface`, keyed by
+  ingress ifindex with zone fallback). Interface-level tokens validated by the
+  same #3200 SSOT. 2-sided additive wire; protocol_wire_v1.json regenerated.
+  RED-on-revert tests on both surfaces.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_security.go, pkg/config/compiler_validate_strict.go,
+  pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/protocol.go, userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/afxdp/forwarding/README.md, docs/junos-cli-reference.md,
+  pkg/config/host_inbound_per_iface_3362_test.go,
+  pkg/dataplane/userspace/host_inbound_per_iface_3362_test.go,
+  pkg/daemon/host_inbound_per_iface_3362_test.go
+
 ## 2026-06-29 — #3322 reorder-stable policy hit-counter handle
 
 - **Timestamp**: 2026-06-29
