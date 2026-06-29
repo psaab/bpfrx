@@ -101,6 +101,39 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   matched count term (the earlier fall-through count terms were silently
   under-counted on the cached path only).
 
+  **No-match default is implicit ACCEPT — a deliberate divergence from
+  Junos (#3295).** When a packet matches NO term in a filter, the
+  evaluation returns `FilterResult::default()`, whose action is
+  `FilterAction::Accept` (`mod.rs`). The same default-Accept applies to a
+  missing filter key and to a cross-family mismatch, and the separate
+  TX-selection path has its own Accept defaults
+  (`TxSelectionFilterResult` / `CachedTxSelectionFilterResult`). Junos
+  stateless firewall filters instead carry an implicit final **discard**:
+  a packet matching no explicit term is silently dropped. xpf keeps
+  implicit-accept as the no-match default ON PURPOSE and does NOT flip it
+  to discard. A global flip would blackhole the classify-and-pass OUTPUT
+  filter idiom that rides the implicit accept — concretely the CoS
+  `bandwidth-output` filters attached as `interfaces reth0 unit 80 family
+  inet/inet6 filter output` (a pure dest-port allowlist with no final
+  catch-all), whose unmatched egress would be dropped at TX selection
+  (`afxdp/tx/cos_classify.rs` gates `drop` on `action != Accept`). That
+  violates the project "keep GOOD" doctrine (#2124/#3261). The research
+  record is `docs/research/3295-filter-failopen/plan.md`.
+
+  **Operator workaround for Junos-style deny-by-default.** An operator
+  who wants Junos stateless-filter parity appends an explicit final
+  unconstrained term: `term <last> { then discard; }` (the inverse of
+  Junos's "write a final accept"). The Go control plane emits a commit
+  WARNING (`validateFilterNoCatchAllWarnings`,
+  `pkg/config/compiler_validate_warn.go`) for any filter attached to an
+  interface/lo0 input/output hook that has no terminal catch-all term, so
+  the divergence and the workaround are surfaced at commit; it is never a
+  commit error (implicit-accept is the documented default and a hard
+  reject would brick a previously-accepted config). A `then next term` /
+  modifier-only fall-through term is NOT a catch-all; a `then
+  routing-instance` PBR term terminates but is not accept/discard/reject
+  and so is also not treated as a catch-all.
+
   **Fall-through log action follows the terminal verdict (#2616).** A
   matched fall-through logging term records its identity
   (`filter_id`/`term_id`) into the accumulated `log_match`, but its
@@ -445,6 +478,40 @@ terms is the operator workaround, and the structured form is a documented
 follow-up. An undefined prefix-list reference is rejected at commit by
 `validateFirewallPrefixListReferencesStrict` (Go), so the Rust side never has to
 reason about a dangling name.
+
+### Undefined interface/lo0 filter reference (#3296)
+
+A hook that attaches a filter to an interface (`interfaces <if> unit <n> family
+inet|inet6 filter input|output <name>`) or to lo0 (`interfaces lo0 unit 0 family
+inet|inet6 filter input <name>`) can name a filter that does not exist under
+`firewall family inet|inet6 filter <name>` — a typo on a security hook (e.g.
+`filter input WAN-BLOCK` where the defined filter is `WAN_BLOCK`). Before #3296
+this was only a commit WARNING, and the snapshot compiler (`compiler.rs`) left
+the per-interface fast-path map (`iface_filter_*_fast`) and — for output hooks —
+the `iface_filter_out_*_needs_tx_eval` set with NO entry for the missing key, so
+the hot path returned the default `FilterResult` — **Accept**. The hook was
+silently disarmed, indistinguishable from "no filter configured": a fail-OPEN on
+a firewall filter.
+
+Primary defense (Go): `validateFirewallFilterReferencesStrict`
+(`pkg/config/compiler_validate_strict.go`) hard-rejects a dangling interface/lo0
+filter reference at commit / commit-check, downgraded to a warning on the
+tolerant load / peer-sync path (`opts.lenientFirewallRefs`, #1960) so an already-
+persisted or peer-synced config still boots. It supersedes the old warn-only
+interface filter-reference loop in `ValidateConfig`.
+
+Dataplane backstop (Rust): `parse_filter_state` raises
+`SnapshotIntegrityError::MissingFilterRef` when an interface (or lo0) names a
+filter not present in the compiled table. As a preflight snapshot-integrity
+error it aborts the reconcile BEFORE teardown/publish, preserving the prior good
+filter state on a warm reconcile rather than degrading the hook to Accept —
+consistent with the #2124/#2391/#2505 fail-closed family. The Go gate is the
+primary defense (a freshly committed config can never carry a dangling
+reference); this backstop guards against version/snapshot drift on the lenient /
+peer-sync path. An EMPTY reference (no filter on the hook) is the legitimate
+"unfiltered" case and is NOT an error. Covers all four interface directions plus
+both lo0 input families. Tests: `missing_filter_ref_3296_*` /
+`defined_filter_ref_3296_compiles_cleanly` in `filter/tests.rs` (fail-on-revert).
 
 ### Negated port match — `source-port-except` / `destination-port-except` (#2622)
 

@@ -4804,6 +4804,124 @@ fn protocol_2505_empty_list_is_unconstrained() {
     );
 }
 
+// #3296: an interface hook naming a filter NOT present in the compiled table
+// must reject the whole snapshot (fail closed / preflight preserves prior
+// good state), NOT leave the per-interface fast-path empty and fall through to
+// the default Accept. This is the fail-on-revert canary: deleting the `else`
+// arm in compiler.rs that raises MissingFilterRef turns the missing reference
+// back into a silent Accept and flips these asserts.
+#[test]
+fn missing_filter_ref_3296_input_v4_rejects_not_accepts() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "ge-0/0/0.0".into(),
+        ifindex: 5,
+        // typo: the defined filter is WAN_BLOCK; the hook names WAN-BLOCK
+        filter_input_v4: "WAN-BLOCK".into(),
+        ..Default::default()
+    }];
+    let err = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "WAN_BLOCK".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny-all".into(),
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect_err("a missing input filter reference must fail the build closed");
+    match err {
+        SnapshotIntegrityError::MissingFilterRef {
+            interface,
+            family,
+            direction,
+            filter,
+        } => {
+            assert_eq!(interface, "ge-0/0/0.0");
+            assert_eq!(family, "inet");
+            assert_eq!(direction, "input");
+            assert_eq!(filter, "WAN-BLOCK");
+        }
+        other => panic!("expected MissingFilterRef, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_filter_ref_3296_output_v6_rejects_not_accepts() {
+    // The output path is independently fail-open (no needs_tx_eval flag set
+    // for a missing ref), so it must be covered too.
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "ge-0/0/0.0".into(),
+        ifindex: 5,
+        filter_output_v6: "egress6-ghost".into(),
+        ..Default::default()
+    }];
+    let err = parse_filter_state(&[], &[], &ifaces, "", "")
+        .expect_err("a missing output v6 filter reference must fail the build closed");
+    assert!(
+        matches!(
+            err,
+            SnapshotIntegrityError::MissingFilterRef { ref direction, ref family, .. }
+                if direction == "output" && family == "inet6"
+        ),
+        "expected MissingFilterRef output/inet6, got {err:?}"
+    );
+}
+
+#[test]
+fn missing_filter_ref_3296_lo0_input_rejects_not_accepts() {
+    // lo0 host-bound filter (the protect-RE lockout hook) names a filter not
+    // in the table → must reject, not silently leave lo0_filter_v4_fast None
+    // (which falls through to Accept).
+    let err = parse_filter_state(&[], &[], &[], "protect-re-typo", "")
+        .expect_err("a missing lo0 input filter reference must fail the build closed");
+    assert!(
+        matches!(
+            err,
+            SnapshotIntegrityError::MissingFilterRef { ref interface, ref filter, .. }
+                if interface == "lo0" && filter == "protect-re-typo"
+        ),
+        "expected MissingFilterRef lo0/protect-re-typo, got {err:?}"
+    );
+}
+
+#[test]
+fn defined_filter_ref_3296_compiles_cleanly() {
+    // The positive control: a hook whose referenced filter IS defined must
+    // compile (the gate only rejects DANGLING references).
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "ge-0/0/0.0".into(),
+        ifindex: 5,
+        filter_input_v4: "WAN_BLOCK".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "WAN_BLOCK".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny-all".into(),
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("a defined filter reference must compile cleanly");
+    assert!(
+        state.iface_filter_v4_fast.contains_key(&5),
+        "the resolved filter must be installed on the interface fast path"
+    );
+}
+
 // Go->Rust fixture: the exact #2505 reproduction — `from protocol esp; then
 // discard` must discard ONLY ESP, not all protocols. This is the fail-on-
 // revert canary: restoring the stale local parse_protocol (which drops esp)

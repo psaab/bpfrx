@@ -46,6 +46,42 @@
   pkg/policymatch/app_junos_ping_3348_test.go,
   pkg/policymatch/icmp_test.go (stale-comment fix), pkg/config/README.md,
   docs/config-schema.md
+## 2026-06-29 — #3296 undefined interface/lo0 filter reference fail-open
+
+- **Timestamp**: 2026-06-29
+- **Action**: Promote an undefined interface/lo0 firewall filter reference
+  from a commit WARNING to a strict commit error + add a fail-closed
+  dataplane backstop. Before: `interfaces <if> unit <n> family inet|inet6
+  filter input|output <name>` (and lo0 input) naming a filter not defined
+  under `firewall family ... filter` was warn-only at commit, and the Rust
+  snapshot compiler left the per-interface fast-path map (and output
+  needs_tx_eval set) empty for the missing key → hot path returned the
+  default Accept → hook silently disarmed (fail-OPEN on a typo'd security
+  hook). Go: new `validateFirewallFilterReferencesStrict`
+  (compiler_validate_strict.go), wired at the firewall-gate cluster
+  (compiler.go) gated on `opts.lenientFirewallRefs` — strict on commit,
+  downgraded-warn on lenient/peer-sync (#1960). Deleted the superseded
+  warn-only interface filter-reference loop in compiler_validate_warn.go
+  (avoids a duplicate warning on the lenient path). lo0 is covered for free
+  (stored as cfg.Interfaces.Interfaces["lo0"]). Rust: new
+  `SnapshotIntegrityError::MissingFilterRef` raised by `parse_filter_state`
+  (filter/compiler.rs) on a named-but-missing interface/lo0 ref —
+  preflight reject preserves prior good state, never falls open to Accept.
+  Mirrors the policer (#2217) / prefix-list (#2506) strict-reference
+  precedent and the #2505 snapshot-integrity backstop doctrine.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_filter_ref_3296_test.go (new),
+  pkg/config/compiler_interfaces_unsupported_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/parser_services_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md
+- **Validation**: `go test ./pkg/config/...` green (8 new + 5 fixed
+  pre-existing tests that referenced undefined filters); `cargo build`
+  green; new Rust tests `missing_filter_ref_3296_*` /
+  `defined_filter_ref_3296_compiles_cleanly` pass; full Rust suite 3223
+  pass / 2 pre-existing flakes (event_stream/worker_queue, confirmed
+  failing on pristine origin/master, unrelated to filters).
 
 ## 2026-06-28 — #3499 compiler_iface nil zone/interface map-value guards
 
@@ -23262,5 +23298,7 @@ top.
   - **Action**: #3494 round-3 EXHAUSTIVE whole-file nil-deref sweep (both reviewers proved the prior "nil-complete" claim still missed 5 sites). Audited EVERY `for ... range` + indexed deref across the ENTIRE compiler_validate_warn.go (ValidateConfig + all 14 helper funcs). Guarded the 6 remaining unguarded pointer-deref sites: RoutingInstances (ri==nil, L369), Interfaces.Interfaces (ifc==nil, L384), ifc.Units (unit==nil, L385), cc.RedundancyGroups (rg==nil, L465), fm.Version9.Templates + fm.VersionIPFIX.Templates (tmpl==nil, L604/609). Already-guarded (verified, untouched): Login.Users, NAT.Static, the entire CoS block (class/sched/schedMap/classifier/entry/iface/unit), fabric f0/f1, and all helper-func loops (filter/term, routing-window sr/inst, cos-oversub, anySampling, surfaceADDNS provider/ifc/unit, ddns-backend). Non-pointer-safe (no guard needed): all key-only ranges, []string element ranges, comma-ok `[...]` lookups with discarded value. The pass is now genuinely nil-complete. Extended TestValidateConfigNilSlotsNoPanic to inject a nil routing-instance, nil interface, nil interface-unit, nil redundancy-group, and nil v9+ipfix templates; verified EACH of the 6 guards independently RED-on-revert (per-guard strip -> panic).
   - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_nil_3494_test.go, _Log.md
 - **Timestamp**: 2026-06-29
+  - **Action**: #3295 firewall-filter no-match fall-through. Research (docs/research/3295-filter-failopen/plan.md) PLAN-KILLed the runtime flip (implicit-accept -> implicit-discard) on the verified "keep GOOD" wall: the CoS bandwidth-output allowlist attached as `reth0 unit 80 family inet/inet6 filter output` has no final catch-all, so a flip would blackhole all unmatched egress at TX selection (cos_classify.rs drop on action != Accept). Shipped the research-recommended mitigation instead, runtime UNCHANGED: a commit-time WARNING (validateFilterNoCatchAllWarnings) for any filter ATTACHED to an interface/lo0 input/output hook that has no terminal catch-all term (unconstrained `from` + terminating accept/discard/reject, NextTerm=false). Surfaces the deliberate divergence + the explicit-final-`then discard` workaround. WARN-only (never an error; no-brick). Docs: filter README + feature-coverage.md. RED-on-revert verified (strip the call -> 3 warn tests fail).
+  - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/compiler_filter_nocatchall_3295_test.go, userspace-dp/src/filter/README.md, docs/feature-coverage.md, _Log.md
   - **Action**: #3347 — `show security log` argument parsing now fails CLOSED. The parse loop in showSecurityLog silently ignored unknown tokens (a typo `zon trust` fell through Atoi and dumped all 50 events) and filter keywords with no value (`action` with nothing after); M02: a `zone <name>` filter requested while no apply result exists (cr==nil at early startup / after a failed apply) dropped the filter and widened to all zones. Fix: reject unknown tokens and missing filter values with a usage error; refuse a zone filter when cr==nil rather than widening. Added cli_show_security_log_argparse_3347_test.go (unknown token, bogus single token, missing zone/protocol/action value, unknown zone, zone-without-apply-result, plus valid count + valid filters); verified each guard RED-on-revert. gofmt clean, go test ./pkg/cli/... green. Documented filter syntax + fail-closed behavior in docs/junos-cli-reference.md.
   - **File(s)**: pkg/cli/cli_show_security_log.go, pkg/cli/cli_show_security_log_argparse_3347_test.go, docs/junos-cli-reference.md, _Log.md

@@ -111,6 +111,33 @@ pub(crate) enum SnapshotIntegrityError {
         term: String,
         token: String,
     },
+    /// #3296: an interface (or lo0) snapshot named a NON-EMPTY firewall filter
+    /// (`filter_input_v4/v6` / `filter_output_v4/v6`, or the lo0 host-bound
+    /// filter) that is not present in the compiled filter table. The pre-fix
+    /// compiler left the per-interface fast-path map (and, for output hooks,
+    /// the `needs_tx_eval` set) with NO entry for the missing key, so the hot
+    /// path returned the default `FilterResult` — Accept. The security hook
+    /// was silently disarmed, indistinguishable from "no filter configured": a
+    /// fail-OPEN on a typo'd firewall reference (e.g. `filter input WAN-BLOCK`
+    /// where the defined filter is `WAN_BLOCK`). Rejecting the whole snapshot
+    /// (the preflight keeps the previous good filter state on a warm reconcile)
+    /// is the fail-closed backstop, consistent with the
+    /// #2124/#2391/#2505 fail-closed family. The Go STRICT commit gate
+    /// (`validateFirewallFilterReferencesStrict`, #3296) is the primary
+    /// defense — a freshly committed config can never carry a dangling
+    /// reference — so a gate-passing config never reaches this arm in normal
+    /// operation; it guards against version/snapshot drift on the lenient /
+    /// peer-sync path. An EMPTY reference (no filter on the hook) is the
+    /// legitimate "unfiltered" case and is NOT an error.
+    ///
+    /// `family` (inet / inet6) is carried alongside the filter name because
+    /// filter names can be REUSED across families.
+    MissingFilterRef {
+        interface: String,
+        family: String,
+        direction: String,
+        filter: String,
+    },
     /// #2391: an interface snapshot named a NON-EMPTY security zone that is not
     /// present in the zone table (`zone_name_to_id`). The pre-fix code resolved
     /// the missing name to `zone_id == 0` (`unwrap_or(0)`), silently collapsing
@@ -291,6 +318,16 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "firewall family {:?} filter {:?} term {:?} has an unresolvable protocol token {:?} — refusing to fail wide by dropping it (which would make the term match every protocol)",
                 family, filter, term, token
+            ),
+            Self::MissingFilterRef {
+                interface,
+                family,
+                direction,
+                filter,
+            } => write!(
+                f,
+                "interface {:?} family {:?} filter {} references undefined filter {:?} — refusing to fail open by leaving the hook unarmed (which would forward unfiltered, equivalent to no filter)",
+                interface, family, direction, filter
             ),
             Self::InterfaceUnknownZone { interface, zone } => write!(
                 f,
