@@ -1,3 +1,25 @@
+## 2026-06-29 — #3375 SMR MINOR fold: proto field-7 host_inbound_unmatched doc parity (PR #3542)
+
+- **Timestamp**: 2026-06-29
+- **Action**: SMR MINOR (contract-doc) fold for PR #3542. The #3375 fix
+  made the gRPC `MatchPolicies` host-inbound path populate `action` with
+  the `HostInboundActionString` SSOT (`DisplayAction()`), but the
+  `MatchPoliciesResponse.host_inbound_unmatched` (field 7) doc comment in
+  `proto/xpf/v1/xpf.proto` still claimed "`action` is empty; clients must
+  render <literal>". A client trusting the proto would hard-code the
+  literal and ignore the populated `action`, defeating the SSOT. Updated
+  the field-7 comment to state the server now renders
+  `HostInboundActionString` into `action` (non-empty; clients may use it
+  directly) and that `default_used` is false for the host-inbound case.
+  Regenerated `pkg/grpcapi/xpfv1/xpf.pb.go` via `make proto` — confirmed
+  the ONLY pb.go delta is the `HostInboundUnmatched` doc comment text (no
+  rawDesc / field-number / wire change; comment-only regen).
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  _Log.md
+- **Validation**: `make proto`; `go test ./pkg/grpcapi/ ./pkg/policymatch/
+  ./pkg/api/` green; gofmt clean; `git diff --stat` confirms pb.go change
+  is comment-only.
+
 ## 2026-06-29 — #3363 Codex MEDIUM fold: structured gRPC GetPolicies default-policy parity (PR #3528)
 
 - **Timestamp**: 2026-06-29
