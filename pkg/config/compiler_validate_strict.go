@@ -1653,6 +1653,108 @@ func validateFirewallRoutingInstanceReferencesStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFirewallFilterReferencesStrict hard-rejects an interface/unit (and
+// lo0) `family inet|inet6 filter input|output <name>` reference that names a
+// filter not defined under `firewall family inet|inet6 filter <name>` (#3296).
+//
+// A dangling filter reference compiled cleanly: ValidateConfig only WARNED
+// (`compiler_validate_warn.go`, "filter input %q not defined"), and at runtime
+// the userspace filter compiler left the per-interface fast-path map with NO
+// entry for the missing key, so the hot path returned the default
+// FilterResult — Accept. The security hook was silently disarmed,
+// indistinguishable from "no filter configured": a fail-OPEN on a typo'd
+// firewall hook (e.g. `filter input WAN-BLOCK` where the defined filter is
+// `WAN_BLOCK`). This gate makes the typo an operator-visible commit error,
+// consistent with the policer / prefix-list / routing-instance reference
+// gates above.
+//
+// lo0 input/output references are covered for free: lo0 is stored as an
+// ordinary interface under `cfg.Interfaces.Interfaces["lo0"]`
+// (compiler.go:1819), so the interface walk validates the lo0 host-bound
+// filter hooks too.
+//
+// Interfaces are walked in sorted name order, then by ascending unit number,
+// then in a fixed direction order (input-v4, input-v6, output-v4, output-v6),
+// so the first-reported error is deterministic across runs (Go map order is
+// randomized).
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientFirewallRefs) so an already-persisted or peer-synced
+// config carrying the typo still BOOTS (#1960 fail-closed-on-load class); the
+// userspace helper's own snapshot-integrity backstop then refuses to publish a
+// snapshot whose interface references an undefined filter (preserving the
+// prior good state rather than degrading the hook to Accept). Commit /
+// commit-check stay strict. Mirrors validateFirewallPolicerReferencesStrict.
+func validateFirewallFilterReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	inetDefined := func(name string) bool {
+		if cfg.Firewall.FiltersInet == nil {
+			return false
+		}
+		_, ok := cfg.Firewall.FiltersInet[name]
+		return ok
+	}
+	inet6Defined := func(name string) bool {
+		if cfg.Firewall.FiltersInet6 == nil {
+			return false
+		}
+		_, ok := cfg.Firewall.FiltersInet6[name]
+		return ok
+	}
+
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil { // tolerant/HA-sync path may carry a nil interface (#3494)
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
+			if unit == nil { // tolerant/HA-sync path may carry a nil unit (#3494)
+				continue
+			}
+			// Fixed direction order for a deterministic first error.
+			type ref struct {
+				name      string
+				family    string
+				direction string
+				defined   func(string) bool
+			}
+			for _, r := range []ref{
+				{unit.FilterInputV4, "inet", "input", inetDefined},
+				{unit.FilterInputV6, "inet6", "input", inet6Defined},
+				{unit.FilterOutputV4, "inet", "output", inetDefined},
+				{unit.FilterOutputV6, "inet6", "output", inet6Defined},
+			} {
+				if r.name == "" || r.defined(r.name) {
+					continue
+				}
+				return fmt.Errorf(
+					"interface %s unit %d family %s filter %s references "+
+						"undefined filter %q (define `firewall family %s "+
+						"filter %s` or fix the name — the security hook would "+
+						"otherwise be silently disarmed and the interface would "+
+						"forward unfiltered, a fail-open on a firewall filter)",
+					ifName, unitNum, r.family, r.direction, r.name,
+					r.family, r.name)
+			}
+		}
+	}
+	return nil
+}
+
 // validateApplicationSetMembersStrict hard-rejects an `applications
 // application-set <set>` (Finding B, #2217) whose member references neither a
 // defined application (user-defined or junos-* predefined), nor a defined

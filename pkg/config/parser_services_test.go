@@ -304,7 +304,19 @@ func TestVLANInterfaceCompilation(t *testing.T) {
 }
 
 func TestInterfaceFilterAssignment(t *testing.T) {
-	input := `interfaces {
+	input := `firewall {
+    family inet {
+        filter inet-source-dscp {
+            term t1 { then accept; }
+        }
+    }
+    family inet6 {
+        filter inet6-source-dscp {
+            term t1 { then accept; }
+        }
+    }
+}
+interfaces {
     enp6s0 {
         unit 0 {
             family inet {
@@ -350,6 +362,16 @@ func TestInterfaceFilterAssignment(t *testing.T) {
 
 func TestInterfaceSamplingAndFilterOutput(t *testing.T) {
 	input := `
+firewall {
+    family inet {
+        filter ingress-filter { term t1 { then accept; } }
+        filter egress-filter { term t1 { then accept; } }
+    }
+    family inet6 {
+        filter ingress-v6 { term t1 { then accept; } }
+        filter egress-v6 { term t1 { then accept; } }
+    }
+}
 interfaces {
     ge-0/0/0 {
         unit 0 {

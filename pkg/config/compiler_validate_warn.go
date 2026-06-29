@@ -383,45 +383,13 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// Validate firewall filter references on interfaces
-	for ifName, ifc := range cfg.Interfaces.Interfaces {
-		if ifc == nil { // #3494: tolerant/HA-sync path may carry a nil interface
-			continue
-		}
-		for unitNum, unit := range ifc.Units {
-			if unit == nil { // #3494: tolerant/HA-sync path may carry a nil unit
-				continue
-			}
-			if unit.FilterInputV4 != "" {
-				if _, ok := cfg.Firewall.FiltersInet[unit.FilterInputV4]; !ok {
-					warnings = append(warnings, fmt.Sprintf(
-						"interface %s unit %d: filter input %q not defined",
-						ifName, unitNum, unit.FilterInputV4))
-				}
-			}
-			if unit.FilterInputV6 != "" {
-				if _, ok := cfg.Firewall.FiltersInet6[unit.FilterInputV6]; !ok {
-					warnings = append(warnings, fmt.Sprintf(
-						"interface %s unit %d: filter input-v6 %q not defined",
-						ifName, unitNum, unit.FilterInputV6))
-				}
-			}
-			if unit.FilterOutputV4 != "" {
-				if _, ok := cfg.Firewall.FiltersInet[unit.FilterOutputV4]; !ok {
-					warnings = append(warnings, fmt.Sprintf(
-						"interface %s unit %d: filter output %q not defined",
-						ifName, unitNum, unit.FilterOutputV4))
-				}
-			}
-			if unit.FilterOutputV6 != "" {
-				if _, ok := cfg.Firewall.FiltersInet6[unit.FilterOutputV6]; !ok {
-					warnings = append(warnings, fmt.Sprintf(
-						"interface %s unit %d: filter output-v6 %q not defined",
-						ifName, unitNum, unit.FilterOutputV6))
-				}
-			}
-		}
-	}
+	// Firewall filter references on interfaces (and lo0) are validated by the
+	// strict commit gate validateFirewallFilterReferencesStrict (#3296):
+	// hard-reject on commit / commit-check, downgraded to a warning on the
+	// tolerant load / peer-sync path. The strict gate fully subsumes the
+	// warn-only loop that previously lived here (it would otherwise emit a
+	// duplicate warning alongside the downgraded gate warning on the lenient
+	// path).
 
 	// Validate chassis cluster fabric config
 	if cc := cfg.Chassis.Cluster; cc != nil {
