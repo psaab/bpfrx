@@ -118,15 +118,23 @@ implemented as the AND of the per-row results, never OR/MAX). No eviction means
 no Hot-Set-Lockout / Cold-Start-Eviction-Race starvation (a victim is always
 tracked and its cells only increase within the sliding window). Collisions can
 only OVER-count (fail-closed: never a false-negative; the only error is a
-false-positive bounded by `~(load)^ROWS`). The tables are allocated only for
-zones that configure a threshold and freed when removed.
+false-positive bounded by `~(load)^ROWS`). Each sketch is allocated PER
+THRESHOLD, not per zone: the per-destination sketch only when
+`destination-threshold > 0`, the per-source sketch only when
+`source-threshold > 0` (`update_profiles`, `screen/mod.rs` ~333/345), and each
+is freed when its threshold is removed. An **alarm-only** profile
+(`alarm-threshold` set, no source/destination cap) allocates NEITHER sketch —
+only the tiny per-zone `syn_alarm_last_emit_sec` cadence timestamp (~350).
 
-Memory: `RateCounter` ≈ 16 B → per configured zone per worker, per-dest
-`ROWS*DST_COLS*16 = 64 KiB` + per-source `ROWS*SRC_COLS*16 = 128 KiB` =
-**192 KiB/zone**, × num_workers. The Go compiler emits a commit-time advisory
-when `attack-threshold / source-threshold` exceeds ~1000 (the only regime where
-the per-source sketch can false-throttle legitimate sources under a
-sub-aggregate spoofed spread).
+Memory (per worker): `RateCounter` ≈ 16 B. The per-destination sketch costs
+`ROWS*DST_COLS*16 = 64 KiB` and is allocated only when `destination-threshold`
+is set; the per-source sketch costs `ROWS*SRC_COLS*16 = 128 KiB` and is
+allocated only when `source-threshold` is set. A zone that configures BOTH caps
+costs the **192 KiB/zone** worst case × num_workers; a zone with only one cap
+costs just that cap's table; an alarm-only zone costs neither (a single `u64`).
+The Go compiler emits a commit-time advisory when `attack-threshold /
+source-threshold` exceeds ~1000 (the only regime where the per-source sketch can
+false-throttle legitimate sources under a sub-aggregate spoofed spread).
 
 Wire: `ScreenProfileSnapshot` gains `syn_flood_alarm_threshold`,
 `syn_flood_dst_threshold`, `syn_flood_src_threshold` (Go

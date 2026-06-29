@@ -23402,6 +23402,27 @@ top.
   userspace-dp/tests/fixtures/protocol_wire_v1.json (regen, additive),
   docs/feature-coverage.md, docs/syn-cookie-flood-protection.md, CLAUDE.md,
   + Go/Rust tests.
+- **Action**: #3315 Codex MERGE-NEEDS-MAJOR fold (PR #3525) — claims accuracy,
+  no code defect. Codex confirmed the dataplane enforcement is present; the
+  MAJOR was two overstated prose claims. (1) SUBSTANTIATED the Rust RED-on-revert:
+  neutered each of the three hot-path gates in screen/mod.rs in turn and ran
+  `cargo test --bin xpf-userspace-dp screen::` — per-DEST cap (~684) → RED on
+  syn_flood_dest_threshold_trips_under_aggregate + syn_flood_dest_runs_when_cookie_active;
+  per-SOURCE cap (~700) → RED on syn_flood_source_threshold_trips_per_source +
+  syn_flood_source_runs_when_not_cookie_active; log-only alarm gate (~672) → RED
+  on syn_flood_alarm_threshold_raises_event_without_drop; restored → 164/0 green.
+  (2) CORRECTED CLAIMS: the Go TestBuildScreenSnapshotsSynFloodSubThresholds
+  comment now states it guards the WIRE PLUMBING only (screens.go populate +
+  JSON round-trip), NOT enforcement — enforcement RED-on-revert is Rust-side.
+  (3) Fixed the docs/syn-cookie-flood-protection.md memory claim: the sketches
+  allocate PER THRESHOLD (per-dst 64 KiB only when destination-threshold set;
+  per-src 128 KiB only when source-threshold set); an alarm-only profile
+  allocates NEITHER sketch — only the tiny syn_alarm_last_emit_sec cadence u64.
+  192 KiB/zone is the both-caps worst case, not every configured zone. Rebased
+  on origin/master first (union _Log.md). go test ./pkg/config/
+  ./pkg/dataplane/userspace/ green; gofmt clean.
+- **File(s)**: pkg/dataplane/userspace/manager_test.go,
+  docs/syn-cookie-flood-protection.md, _Log.md
 - **Timestamp**: 2026-06-29
   - **Action**: #3294 {feed + concrete} address-set divergence — implemented the converged research plan (PLAN-READY @ d6da7b5d): Option A′ (dataplane set-row feed merge) + the #2008 direct-ref strict-accept one-liner. (1) Dataplane: made expandBookNameRecursive/expandBookNameToCIDRs feed-aware so a feed-bound MEMBER nested in an address-set contributes its live overlay prefixes to the enclosing set's address-book row (closes the feed-portion under-deny; a `deny <set-with-feed>` now enforces the feed). Removed the now-redundant top-level merge + dead splitFeedPrefixesByFamily. nameRepresentability feed-bound branch returns (true, len(feeds)>0): a live feed member is concrete, an empty feed stays representable-match-none (so an empty-feed feed-only set is #3261-rejected fail-closed, NOT silently dropped). (2) Strict #2008: added DynamicAddress.AddressBindings names to validatePolicyMatchAddressesStrict.bookNames so a DIRECT feed reference COMMITS; policyMatchAddressBookResolves (#3149) left feed-UNaware (anti-Option-C: feed-in-set still strict-rejected at fresh commit). (3) Parity: pkg/policymatch expandBookName made overlay-aware to match. (4) NAT left out of scope per plan constraint 5; updated the stale nat.go "#3294 gap" comment to a tracked residual. RED-on-revert verified for all three layers (dataplane merge, #2008 one-liner, policymatch). go test ./pkg/config/... ./pkg/dataplane/... ./pkg/policymatch/... ./pkg/grpcapi/... ./pkg/api/... green; gofmt + go vet clean.
   - **File(s)**: pkg/dataplane/userspace/policies.go, pkg/dataplane/userspace/nat.go, pkg/dataplane/userspace/lenient_keep_armed_3261_test.go, pkg/policymatch/policymatch.go, pkg/policymatch/policymatch_test.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler_feed_address_token_3294_test.go, docs/feature-gaps.md, docs/userspace-dataplane-gaps.md, _Log.md

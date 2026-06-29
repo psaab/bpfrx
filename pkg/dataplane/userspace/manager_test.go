@@ -4079,10 +4079,14 @@ func TestDeriveUserspaceCapabilitiesAllowsBasicScreenProfile(t *testing.T) {
 // TestBuildScreenSnapshotsSynFloodSubThresholds verifies the #3315 SYN-flood
 // sub-thresholds (alarm/source/destination) cross the userspace-dp wire. Before
 // the fix only attack-threshold was published, so the four sub-thresholds
-// committed cleanly yet were operationally inert. This is also the FAIL-ON-
-// REVERT guard: dropping the screens.go populate block makes the three asserts
-// below go zero and the test RED. `timeout` is intentionally NOT on the wire
-// (it maps to the session half-open window, a tracked follow-up).
+// committed cleanly yet were operationally inert. This is the FAIL-ON-REVERT
+// guard for the WIRE PLUMBING only: dropping the screens.go populate block makes
+// the three asserts below go zero and the test RED. It does NOT exercise the
+// hot-path enforcement — the per-destination/per-source cap drops and the
+// log-only alarm gate (and their RED-on-revert) live in the Rust screen runtime
+// tests (`cargo test --bin xpf-userspace-dp screen::`, userspace-dp/src/screen/
+// tests.rs). `timeout` is intentionally NOT on the wire (it maps to the session
+// half-open window, a tracked follow-up).
 func TestBuildScreenSnapshotsSynFloodSubThresholds(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
