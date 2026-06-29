@@ -43,6 +43,22 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 		if sp.TCP.SynFlood != nil && sp.TCP.SynFlood.AttackThreshold > 0 {
 			snap.SYNFloodThreshold = uint32(sp.TCP.SynFlood.AttackThreshold)
 			snap.SYNCookie = cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie"
+			// #3315: carry the SYN-flood sub-thresholds across the wire. The
+			// #3024 default guarantees AttackThreshold > 0 whenever a syn-flood
+			// screen is enabled, so this block is the single publish gate for
+			// every syn-flood control. alarm/source/destination are non-zero only
+			// when the operator configured them; `timeout` is not serialized
+			// (see ScreenProfileSnapshot — it maps to the session half-open
+			// window, a tracked follow-up, and the compiler warns it is inert).
+			if sp.TCP.SynFlood.AlarmThreshold > 0 {
+				snap.SYNFloodAlarmThreshold = uint32(sp.TCP.SynFlood.AlarmThreshold)
+			}
+			if sp.TCP.SynFlood.DestinationThreshold > 0 {
+				snap.SYNFloodDstThreshold = uint32(sp.TCP.SynFlood.DestinationThreshold)
+			}
+			if sp.TCP.SynFlood.SourceThreshold > 0 {
+				snap.SYNFloodSrcThreshold = uint32(sp.TCP.SynFlood.SourceThreshold)
+			}
 		}
 		if sp.LimitSession.SourceIPBased > 0 {
 			snap.SessionLimitSrc = uint32(sp.LimitSession.SourceIPBased)

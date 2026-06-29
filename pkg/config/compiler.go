@@ -645,6 +645,23 @@ type compileOpts struct {
 	// so a leniently-loaded bad config is no worse off, now flagged. Same
 	// doctrine as lenientApplicationSetMembers.
 	lenientPolicyMatchApplications bool
+	// lenientNATMatchApplications (#3434, Codex audit 095 H07/H08) downgrades
+	// the source/destination-NAT match-application definedness gate
+	// (validateNATMatchApplicationsStrict) from a hard compile error to a
+	// cfg.Warnings entry. A NAT `match application <name>` token resolving to
+	// no predefined junos-* application, no user-defined application, and no
+	// non-empty application-set was previously unvalidated — yet the DNAT
+	// snapshot builder then fell through to a wildcard match-all term
+	// (protocol="" + destination-port 0) and published the pool VIP for EVERY
+	// flow to the destination (a fail-open wildcard translation; the NAT
+	// sibling of #3144/#3146). The strict commit / commit-check path
+	// hard-rejects so the typo is operator-visible; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config that
+	// an older binary accepted still BOOTS (#1960) — the dataplane now
+	// independently fails such a rule closed (never-match term), so a
+	// leniently-loaded bad config is no worse off, now flagged. Same doctrine
+	// as lenientPolicyMatchApplications.
+	lenientNATMatchApplications bool
 	// lenientPolicyMatchAddressSetMembers (#3149, folds #3147) downgrades the
 	// policy match address-set member / empty-set gate
 	// (validatePolicyMatchAddressSetMembersStrict) from a hard compile error to
@@ -1253,6 +1270,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientSamplingInstanceConflicts:     true,
 		lenientApplicationSetMembers:         true,
 		lenientPolicyMatchApplications:       true,
+		lenientNATMatchApplications:          true,
 		lenientPolicyMatchAddressSetMembers:  true,
 		lenientRibGroupRefs:                  true,
 		lenientDHCPStaticBindings:            true,
@@ -1400,6 +1418,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientSamplingInstanceConflicts:     true,
 		lenientApplicationSetMembers:         true,
 		lenientPolicyMatchApplications:       true,
+		lenientNATMatchApplications:          true,
 		lenientPolicyMatchAddressSetMembers:  true,
 		lenientRibGroupRefs:                  true,
 		lenientDHCPStaticBindings:            true,
@@ -2401,6 +2420,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3366: structural application errors (a direct match body mixed with
+	// `term` sub-blocks, or a duplicate single-valued leaf inside one term) are
+	// rejected for ALL user-defined applications — referenced or not — like the
+	// #3352/#3353 syntactic gate above. Mixing a direct body with terms silently
+	// dropped the direct match (the term-store branch keeps only the terms), and
+	// a repeated scalar term leaf was last-writer-wins; both are Junos config
+	// errors caught at definition. Lenient-downgrade on the tolerant load /
+	// peer-sync path (#1960 no-brick).
+	if err := validateApplicationStructureStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application structure (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
 	// commit / commit-check (hard-reject a term whose protocol token is not
 	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a
@@ -2711,15 +2747,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
-	// #3349 follow-up: event-mode log-format compatibility. The top-level
-	// `security log format` is schema-validated to a known format in any mode,
-	// but the EVENT-mode local-file writer only honors binary / standard text
-	// — `structured` and `sd-syslog` silently fall back to standard text. That
-	// silent no-op is the exact failure #3349 closes, so reject an
-	// event-incompatible format at commit (cross-field rule the per-leaf
-	// SchemaValidate gate cannot express). Strict on commit / commit-check;
-	// lenient on load / peer-sync (warn — the runtime already falls back, so a
-	// leniently-loaded value is inert rather than bricking the load).
+	// #3349 follow-up, #3409 implemented: event-mode log-format compatibility.
+	// The top-level `security log format` is schema-validated to a known format
+	// in any mode. As of #3409 the EVENT-mode local-file writer honors the full
+	// set — binary, standard/syslog text, `structured` (Junos RT_FLOW), and
+	// `sd-syslog` (RFC 5424 envelope) — so nothing silently falls back, and this
+	// validator accepts the entire schema enum in either mode. It is retained as
+	// a cross-field gate (the per-leaf SchemaValidate walker cannot express a
+	// mode-dependent rule) and default-rejects only a hypothetical future schema
+	// value not yet wired into the writer fanout. Strict on commit / commit-check;
+	// lenient on load / peer-sync — now inert for the four known formats.
 	if err := validateLogEventModeFormatStrict(cfg); err != nil {
 		if opts.lenientLogEventModeFormat {
 			cfg.Warnings = append(cfg.Warnings,
@@ -3098,6 +3135,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3434 (Codex audit 095 H07/H08): source/destination-NAT match-application
+	// definedness gate, the NAT analog of validatePolicyMatchApplicationsStrict
+	// (#3144/#3146). A NAT `match application <name>` resolving to no
+	// predefined/user application and no non-empty application-set previously
+	// committed cleanly — yet the DNAT snapshot builder then fell through to a
+	// wildcard match-all term and published the pool VIP for every flow to the
+	// destination (fail-open). Strict on commit / commit-check (hard reject
+	// naming the NAT kind, rule-set, rule, and the undefined app); lenient on
+	// load / peer-sync (warn — #1960; the dataplane now fails such a rule closed
+	// via a never-match term, so a leniently-loaded bad config is no worse off,
+	// now flagged). Resolves via ResolveApplication / ResolveApplicationSet —
+	// the EXACT name set the SNAT/DNAT snapshot builders use — so commit and
+	// runtime cannot diverge. Covers source and destination NAT rule-sets
+	// (static NAT carries no application match).
+	if err := validateNATMatchApplicationsStrict(cfg); err != nil {
+		if opts.lenientNATMatchApplications {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("NAT match application (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #3149 (folds #3147): policy match address-set member / empty-set
 	// fail-open gate. A security-policy source/destination address naming a
 	// DEFINED address-book entry whose members dangle, or a defined-but-empty
@@ -3295,6 +3355,13 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// preserved unchanged but warned about here — clamp-warn, never reject, so
 	// existing/peer-synced configs keep booting on both compile paths.
 	cfg.Warnings = append(cfg.Warnings, validateScreenScanSweepThresholds(cfg)...)
+
+	// #3315: SYN-flood sub-threshold advisories. `timeout` parses but is not yet
+	// enforced (maps to the half-open session window, a tracked follow-up) and an
+	// attack/source ratio orders of magnitude wide can false-throttle legitimate
+	// sources on the per-source count-min sketch. Warn (never reject) so a config
+	// using these leaves commits and the operator is told what is/ isn't honoured.
+	cfg.Warnings = append(cfg.Warnings, validateScreenSynFloodSubThresholds(cfg)...)
 
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
 	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then

@@ -67,6 +67,84 @@ microsecond time-window value. Feeding 5000 here would be read as a count and
 clamped to the dataplane cap (1023, `maxScanSweepThreshold`) — effectively never
 firing.
 
+### SYN-flood sub-thresholds: source / destination / alarm / timeout (#3315)
+
+The Go compiler parses the full Junos `tcp syn-flood` shape (alarm/attack/
+source/destination/timeout) into `config.SynFloodConfig`, but before #3315 only
+`attack-threshold` crossed the userspace-dp wire — the four sub-thresholds
+committed cleanly yet were operationally inert (the dataplane enforced only the
+aggregate per-zone SYN counter). A config that appeared to cap per-source or
+per-destination SYNs did nothing.
+
+#3315 wires three of them across the boundary and enforces them in the Rust
+screen runtime:
+
+- **`destination-threshold`** — per-destination-IP SYN/s cap. PRIMARY,
+  spoof-resistant: every SYN to a victim lands in the same sketch cells, so a
+  hot destination trips regardless of how the sources are spread (or spoofed).
+  It runs even when the zone is SYN-cookie active (a cookie-completing
+  distributed flood must not evade `destination-threshold`).
+- **`source-threshold`** — per-source-IP SYN/s cap. SECONDARY/best-effort.
+  Skipped while the zone is SYN-cookie active (the cookie governs the
+  high-cardinality spoofed-flood regime, where per-source is spoof-defeated and
+  the sketch would over-throttle); confined this way to the sub-aggregate regime
+  where source cardinality is bounded and the sketch is accurate.
+- **`alarm-threshold`** — log-only rate below `attack-threshold`. Crossing it
+  raises an out-of-band, ≤1/sec/zone screen ALARM event (RT_FLOW PERMIT, NOTICE
+  severity, reason `syn-flood-alarm`) WITHOUT dropping the packet, like the
+  scan-table-pressure alarm.
+- **`timeout`** — accepted and committed but NOT yet enforced. It maps to the
+  per-zone half-open session window (`SessionTimeouts.tcp_opening_ns`), a
+  session-layer surface that couples to session timeouts + HA sync and is split
+  to a tracked follow-up. The compiler emits a commit-time WARNING so the leaf is
+  never silently inert; the global half-open TCP timeout applies until the
+  follow-up lands.
+
+Enforcement order (`screen/mod.rs`, inside the initial-SYN gate, after the
+validated-cookie bypass): (1) the aggregate `attack-threshold` (+
+`alarm-threshold`) ALWAYS counts via a single `RateCounter::increment_and_classify`
+so its cookie-activation side-effect can never be skipped — `attack` keeps the
+existing cookie-mint / Drop behaviour; (2) per-destination cap; (3) per-source
+cap (gated). The aggregate is authoritative — a per-IP cap only ADDS drops for
+IPs under the aggregate radar. A per-IP trip hard-drops with the existing
+`syn-flood` reason id (no Go gRPC/CLI change); per-source vs per-destination is
+distinguished by separate per-worker counters.
+
+Substrate (`userspace-dp/src/screen/syn_rate.rs`): a per-zone **count-min sketch
+of `RateCounter`s** — `ROWS=4` independent seeded-hash rows × `DST_COLS=1024` /
+`SRC_COLS=2048` columns — with **no eviction**. A key always counts in its
+`ROWS` cells and trips ⟺ ALL cells are over threshold (the CMS `min` read,
+implemented as the AND of the per-row results, never OR/MAX). No eviction means
+no Hot-Set-Lockout / Cold-Start-Eviction-Race starvation (a victim is always
+tracked and its cells only increase within the sliding window). Collisions can
+only OVER-count (fail-closed: never a false-negative; the only error is a
+false-positive bounded by `~(load)^ROWS`). Each sketch is allocated PER
+THRESHOLD, not per zone: the per-destination sketch only when
+`destination-threshold > 0`, the per-source sketch only when
+`source-threshold > 0` (`update_profiles`, `screen/mod.rs` ~333/345), and each
+is freed when its threshold is removed. An **alarm-only** profile
+(`alarm-threshold` set, no source/destination cap) allocates NEITHER sketch —
+only the tiny per-zone `syn_alarm_last_emit_sec` cadence timestamp (~350).
+
+Memory (per worker): `RateCounter` ≈ 16 B. The per-destination sketch costs
+`ROWS*DST_COLS*16 = 64 KiB` and is allocated only when `destination-threshold`
+is set; the per-source sketch costs `ROWS*SRC_COLS*16 = 128 KiB` and is
+allocated only when `source-threshold` is set. A zone that configures BOTH caps
+costs the **192 KiB/zone** worst case × num_workers; a zone with only one cap
+costs just that cap's table; an alarm-only zone costs neither (a single `u64`).
+The Go compiler emits a commit-time advisory when `attack-threshold /
+source-threshold` exceeds ~1000 (the only regime where the per-source sketch can
+false-throttle legitimate sources under a sub-aggregate spoofed spread).
+
+Wire: `ScreenProfileSnapshot` gains `syn_flood_alarm_threshold`,
+`syn_flood_dst_threshold`, `syn_flood_src_threshold` (Go
+`pkg/dataplane/userspace/protocol.go`; Rust `userspace-dp/src/protocol/
+security.rs`). All three are additive with `omitempty` (Go) / `#[serde(default)]`
+(Rust), so a control plane / helper missing them decodes 0 (disabled) and version
+skew degrades safely (#1961). `timeout` is intentionally NOT serialized. The
+`protocol_wire_v1.json` fixture was regenerated (`XPF_PROTOCOL_WIRE_REGEN=1`,
+additive-only — three new fields, zero drift on existing).
+
 ## Algorithm
 
 ```

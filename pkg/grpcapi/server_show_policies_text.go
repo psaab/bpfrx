@@ -205,6 +205,33 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 				hcFrom, hcTo, pol.Name, action, pkts, bytes)
 		}
 	}
+	// #3363: the IMPLICIT default-policy catch-all has a reserved hit counter
+	// (read via the DefaultPolicySentinelID handle). Surface it as a final row
+	// — separated from the configured-rule totals — in the unfiltered view so
+	// the operator can see default-deny/permit hits across every zone pair.
+	// Gated on policy-stats like every other row for cross-surface consistency.
+	if filterFrom == "" && filterTo == "" {
+		defAction := "permit"
+		switch cfg.Security.DefaultPolicy {
+		case config.PolicyDeny:
+			defAction = "deny"
+		case config.PolicyReject:
+			defAction = "reject"
+		}
+		var pkts, bytes uint64
+		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if counters, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+				pkts = counters.Packets
+				bytes = counters.Bytes
+			} else if readErr == nil {
+				readErr = err
+			}
+		}
+		totalPkts += pkts
+		totalBytes += bytes
+		fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
+			"-", "-", dataplane.DefaultPolicyName, defAction, pkts, bytes)
+	}
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
 	fmt.Fprintf(buf, "%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
 	if readErr != nil {

@@ -50,10 +50,15 @@ func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 // (duplicates contribute no extra table entry, ordering is irrelevant) — so no
 // re-dedup or family-split is needed here.
 //
-// The recursive case — an address-SET whose member is feed-backed — remains the
-// known #3294 gap (the static expander does not pull feed prefixes for nested
-// set members). A DIRECT `match ...-address-name <feed-name>` reference is fully
-// resolved here, which is the #3303 NAT-side gap.
+// The recursive case — an address-SET whose member is feed-backed — is NOT
+// resolved here (the static resolveUserspaceAddressBookEntry expander poisons
+// the whole set on an unresolvable feed member and never consults the overlay).
+// #3294 closed this for the SECURITY-POLICY path (the feed-aware
+// expandBookNameRecursive now merges nested feed members into the policy
+// address-book row), but the NAT path was deliberately left out of #3294 scope
+// (the converged plan, constraint 5 / open-question 4) and remains a tracked
+// residual. A DIRECT `match ...-address-name <feed-name>` reference is fully
+// resolved here, which was the #3303 NAT-side gap.
 func resolveNATAddressNamePrefixes(cfg *config.Config, feedOverlay map[string][]string, name string) []string {
 	var out []string
 	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok {
@@ -711,13 +716,39 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				}
 			}
 
-			// If no application terms resolved, use explicit match values. DNAT
-			// `match` grammar has no source-port or ICMP type/code, so those axes
-			// stay unconstrained on the explicit-match fallback term.
+			// If no application terms resolved, the behavior depends on WHETHER
+			// an application was configured:
+			//
+			//   - #3434: an application WAS configured (rule.Match.Application !=
+			//     "") but resolved to ZERO terms — a typo / dangling reference or
+			//     a defined-but-EMPTY application-set. Falling through to the
+			//     explicit-match fallback would emit proto="" + dstPort=0 = a
+			//     wildcard match-ALL term and publish the pool VIP for EVERY
+			//     flow to the destination (the H07/H08 fail-open, the DNAT analog
+			//     of the source-NAT buildSourceNATAppTerms natProtoNever guard).
+			//     Emit a never-match term instead, reusing the #3437 source-port
+			//     never-match sentinel (an impossible Low>High range): the entry
+			//     installs but can never satisfy l4_extra_matches, so the rule
+			//     matches NOTHING. The commit-time strict gate
+			//     (validateNATMatchApplicationsStrict, #3434) rejects the
+			//     typo/empty-set so this is only the lenient load / peer-sync
+			//     backstop.
+			//
+			//   - No application configured: use the explicit match grammar
+			//     (protocol + destination-port). DNAT `match` grammar has no
+			//     source-port or ICMP type/code, so those axes stay unconstrained
+			//     on the explicit-match fallback term. #3446: this fallback sets
+			//     explicitFallback so the port-filtering loop below can tell a
+			//     configured-but-unresolved destination-port from a genuine
+			//     wildcard and fail closed.
 			explicitFallback := false
 			if len(appTerms) == 0 {
-				appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
-				explicitFallback = true
+				if rule.Match.Application != "" {
+					appTerms = []appTerm{{srcPorts: []NatPortRangeWire{natNeverMatchPortRange}}}
+				} else {
+					appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+					explicitFallback = true
+				}
 			}
 
 			for _, term := range appTerms {
