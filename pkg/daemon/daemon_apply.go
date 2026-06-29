@@ -1092,9 +1092,16 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		}
 	}
 
-	// 3d. Apply policy-based routing rules (ip rule) for firewall filter routing-instance
+	// 3d. Apply policy-based routing rules (ip rule) for firewall filter
+	// routing-instance (filter-based forwarding). Rules are derived only from
+	// filters attached as an interface input filter (#3430 H1); a degraded
+	// build (unrepresentable except / overflow) is surfaced but does not block
+	// the rest of the apply.
 	if d.routing != nil {
-		pbrRules := routing.BuildPBRRules(&cfg.Firewall, cfg.RoutingInstances)
+		pbrRules, buildErr := routing.BuildPBRRules(cfg)
+		if buildErr != nil {
+			slog.Warn("PBR rule build degraded", "err", buildErr)
+		}
 		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
 			slog.Warn("failed to apply PBR rules", "err", err)
 		}

@@ -28,6 +28,10 @@ type fakeRuleOps struct {
 	// listErr[family] (and a nil slice) when present.
 	listErr map[int]error
 
+	// addErr, when non-nil, makes RuleAdd fail without recording the rule —
+	// used to exercise the #3430 H3 add-failure aggregation in pbrManager.Apply.
+	addErr error
+
 	adds int
 	dels int
 }
@@ -40,6 +44,9 @@ func newFakeRuleOps() *fakeRuleOps {
 }
 
 func (f *fakeRuleOps) RuleAdd(r *netlink.Rule) error {
+	if f.addErr != nil {
+		return f.addErr
+	}
 	f.adds++
 	f.rules[r.Family] = append(f.rules[r.Family], *r)
 	return nil
@@ -438,7 +445,7 @@ func TestPBRRulesApply_Fake(t *testing.T) {
 	p := &pbrManager{ops: ops}
 
 	rules := []PBRRule{
-		{Family: unix.AF_INET, TOS: 46 << 2, TableID: 100, Instance: "vr-a"},
+		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a"},
 		{Family: unix.AF_INET6, Src: "2001:db8::/32", TableID: 100, Instance: "vr-a"},
 		{Family: unix.AF_INET, Dst: "10.5.0.0/16", TableID: 101, Instance: "vr-b"},
 	}
@@ -463,6 +470,26 @@ func TestPBRRulesApply_Fake(t *testing.T) {
 	if ops.count(unix.AF_INET) != 0 || ops.count(unix.AF_INET6) != 0 {
 		t.Errorf("expected all PBR rules cleared, v4=%d v6=%d",
 			ops.count(unix.AF_INET), ops.count(unix.AF_INET6))
+	}
+}
+
+// TestPBRApplyAggregatesAddErrors verifies that pbrManager.Apply surfaces a
+// RuleAdd failure (#3430 H3) instead of swallowing it and reporting success
+// after the up-front clear already removed the previously-working steering.
+func TestPBRApplyAggregatesAddErrors(t *testing.T) {
+	ops := newFakeRuleOps()
+	ops.addErr = errors.New("netlink EPERM")
+	p := &pbrManager{ops: ops}
+
+	rules := []PBRRule{
+		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a"},
+	}
+	err := p.Apply(rules)
+	if err == nil {
+		t.Fatal("Apply must return a non-nil error when RuleAdd fails (#3430 H3)")
+	}
+	if ops.count(unix.AF_INET) != 0 {
+		t.Errorf("no rule should have been recorded, got %d", ops.count(unix.AF_INET))
 	}
 }
 
