@@ -600,13 +600,16 @@ func TestNftRuleFromTermFallThroughNoBareAccept(t *testing.T) {
 	}
 }
 
-// TestNftRuleFromTermRoutingInstanceNoBareAccept pins #3427 M08: a
+// TestNftRuleFromTermRoutingInstanceTerminatesAccept pins #3427 M08: a
 // routing-instance (PBR) term has an empty terminating action but is NOT a
-// fall-through in userspace (filters.go gates NextTerm on RoutingInstance=="").
-// The kernel lo0 input chain cannot perform route-selection, so the pre-fix bare
-// `accept` was a fail-open that also shadowed later terms. Assert it emits no
-// rule (skip + warn), and in particular no `accept`.
-func TestNftRuleFromTermRoutingInstanceNoBareAccept(t *testing.T) {
+// fall-through in userspace. The Rust compiler sets continue_term=false when
+// routing_instance is non-empty and the evaluator RETURNS the matched term's
+// action — the empty-action placeholder Accept — so the packet is ACCEPTED. The
+// kernel lo0 input chain cannot perform route-selection, but the filter VERDICT
+// is accept, so it must emit a TERMINATING accept (mirroring userspace). It must
+// NOT skip the rule: skipping would let a later deny term over-drop legitimate
+// host traffic on the kernel-primary lo0 chain.
+func TestNftRuleFromTermRoutingInstanceTerminatesAccept(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 
 	term := &config.FirewallFilterTerm{
@@ -615,12 +618,14 @@ func TestNftRuleFromTermRoutingInstanceNoBareAccept(t *testing.T) {
 		RoutingInstance: "mgmt",
 	}
 	for _, fam := range []string{"ip", "ip6"} {
-		rule := nftRuleFromTerm(term, fam, prefixLists)
-		if rule != "" {
-			t.Errorf("routing-instance term (%s) emitted a rule %q, want \"\" (skip)", fam, rule)
+		fk := "ip"
+		if fam == "ip6" {
+			fk = "ip6"
 		}
-		if strings.Contains(rule, "accept") {
-			t.Errorf("routing-instance term (%s) emitted a terminating accept (fail-open #3427): %q", fam, rule)
+		want := fk + " saddr 10.0.0.0/8 accept"
+		rule := nftRuleFromTerm(term, fam, prefixLists)
+		if rule != want {
+			t.Errorf("routing-instance term (%s): got %q, want %q (terminate-as-accept, mirror userspace)", fam, rule, want)
 		}
 	}
 }
@@ -650,5 +655,41 @@ func TestLo0PayloadFallThroughDoesNotShadowDiscard(t *testing.T) {
 	}
 	if !strings.Contains(payload, "th dport 22 drop") {
 		t.Errorf("discard term unreachable / missing from lo0 payload:\n%s", payload)
+	}
+}
+
+// TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop is the #3427 M08
+// counterexample the coordinator caught: a routing-instance (PBR) term followed
+// by a deny term. Userspace TERMINATES the matched routing-instance term as
+// Accept (continue_term=false, placeholder Accept), so the packet is ACCEPTED
+// and the later discard never runs. The kernel mirror must therefore emit a
+// terminating `accept` for the steer term — NOT skip it. A skip lets the later
+// `then discard` match and OVER-DROP legitimate host traffic on the
+// kernel-primary lo0 chain. RED-on-revert: with the skip disposition the steer
+// rule is absent and `meta l4proto tcp drop` is the only verdict.
+func TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"lo0-in": {
+			Name: "lo0-in",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "steer", Protocols: []string{"tcp"}, RoutingInstance: "mgmt"},
+				{Name: "deny-rest", Protocols: []string{"tcp"}, Action: "discard"},
+			},
+		},
+	}
+
+	payload := buildLo0FilterPayload(cfg, "lo0-in", "")
+
+	// The steer term must terminate as accept BEFORE the deny term, so the
+	// accept appears in the payload and (first-match-wins) shields tcp traffic
+	// from the drop. The over-drop bug would leave only the drop rule.
+	if !strings.Contains(payload, "meta l4proto tcp accept") {
+		t.Errorf("routing-instance term did not emit a terminating accept (#3427 over-drop): the later discard would over-drop host traffic:\n%s", payload)
+	}
+	acceptIdx := strings.Index(payload, "meta l4proto tcp accept")
+	dropIdx := strings.Index(payload, "meta l4proto tcp drop")
+	if acceptIdx == -1 || (dropIdx != -1 && dropIdx < acceptIdx) {
+		t.Errorf("routing-instance accept must precede the deny term (first-match-wins) so legit traffic is not over-dropped:\n%s", payload)
 	}
 }

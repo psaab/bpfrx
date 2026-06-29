@@ -310,13 +310,19 @@ never lock an operator out of a remote box it manages.
   discard/reject term — a control-plane fail-OPEN diverging from userspace
   (`from protocol tcp then next term` followed by `from destination-port 22 then
   discard` accepted SSH at term 1, leaving the drop unreachable). A
-  `routing-instance` (PBR) term is terminating in userspace but the kernel lo0
-  input chain cannot perform route-selection; it is skipped (emit nothing, warn
-  once) rather than mapped to `accept`, so it neither silently accepts nor
-  shadows later terms — userspace stays authoritative for the route-selection.
-  Pinned by `TestNftRuleFromTermFallThroughNoBareAccept`,
-  `TestNftRuleFromTermRoutingInstanceNoBareAccept`, and the end-to-end
-  `TestLo0PayloadFallThroughDoesNotShadowDiscard`.
+  `routing-instance` (PBR) term is explicitly NOT a fall-through: userspace sets
+  `continue_term=false` when `routing_instance` is non-empty and the evaluator
+  TERMINATES the matched term, returning its action — the empty-action
+  placeholder `Accept` — so the packet is ACCEPTED. The kernel lo0 input chain
+  cannot perform route-selection, but the filter VERDICT is accept, so it emits
+  a TERMINATING `accept` (mirroring userspace); it must NOT be skipped, because a
+  skip lets a later deny term match and OVER-DROP legitimate host traffic on the
+  kernel-primary lo0 chain. Userspace stays authoritative for the actual
+  route-selection. Pinned by `TestNftRuleFromTermFallThroughNoBareAccept`,
+  `TestNftRuleFromTermRoutingInstanceTerminatesAccept`, the end-to-end
+  `TestLo0PayloadFallThroughDoesNotShadowDiscard`, and
+  `TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop` (the over-drop
+  counterexample).
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted

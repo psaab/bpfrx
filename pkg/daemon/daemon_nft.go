@@ -733,24 +733,26 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 	// subsequent terms must run. Returning "" makes buildLo0FilterPayload skip the
 	// rule.
 	//
-	// A routing-instance (PBR) term is terminating in userspace and is explicitly
-	// NOT a fall-through (filters.go gates NextTerm on RoutingInstance==""). The
-	// kernel lo0 input chain cannot perform route-selection, so mirroring it as a
-	// terminating `accept` would again fail open and shadow later terms. Skip it
-	// (emit nothing, warn once) so it neither silently accepts nor shadows later
-	// terms; userspace remains the sole authority for the route-selection itself.
-	if term.RoutingInstance != "" {
-		slog.Warn("lo0 kernel filter cannot mirror a routing-instance term; skipping rule (userspace remains authoritative)",
-			"term", term.Name, "routing_instance", term.RoutingInstance)
-		return ""
-	}
-	if term.NextTerm || term.Action == "" {
+	// A routing-instance (PBR) term is explicitly NOT a fall-through: userspace
+	// sets continue_term=false when routing_instance is non-empty
+	// (pkg/dataplane/userspace compiler.rs) and the evaluator TERMINATES the
+	// matched term, returning its action — the empty-action placeholder Accept
+	// (compiler.rs) — so the packet is ACCEPTED. The kernel lo0 input chain
+	// cannot perform route-selection, but the filter VERDICT is accept, so it
+	// must emit a TERMINATING accept (not skip): skipping would let a later
+	// deny term match and OVER-DROP legitimate host traffic on the
+	// kernel-primary lo0 chain. Userspace remains authoritative for the actual
+	// route-selection. Falls through to the action switch below (empty action ->
+	// default accept).
+	if (term.NextTerm || term.Action == "") && term.RoutingInstance == "" {
 		return ""
 	}
 
 	// Action: discard → drop (silent), reject → reject (ICMP unreachable),
-	// accept → accept. Any other explicit action is unexpected for a committed
-	// config; keep the historical accept default rather than emit garbage.
+	// accept → accept. An empty action with a routing-instance set reaches here
+	// and takes the default accept (terminate-as-accept, mirroring userspace).
+	// Any other explicit action is unexpected for a committed config; keep the
+	// historical accept default rather than emit garbage.
 	action := "accept"
 	switch term.Action {
 	case "discard":
