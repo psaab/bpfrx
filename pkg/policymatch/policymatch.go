@@ -629,10 +629,12 @@ func resolveToken(cfg *config.Config, overlay map[string][]string, tok string) (
 	// static address/address-set OR a feed-overlay address-name is resolved as
 	// a book reference, never as a literal.
 	if isBookName(cfg, overlay, tok) {
-		values := expandBookName(cfg, tok, make(map[string]bool))
-		if feed := overlay[tok]; len(feed) > 0 {
-			values = append(values, feed...)
-		}
+		// #3294: expandBookName is feed-aware — it merges the live feed
+		// prefixes for the token AND for any feed-bound MEMBER nested inside an
+		// address-set, mirroring the dataplane's expandBookNameRecursive. This
+		// keeps the in-process simulator in parity with what the AF_XDP helper
+		// enforces (a `deny <set-containing-a-feed>` denies the feed portion).
+		values := expandBookName(cfg, overlay, tok, make(map[string]bool))
 		for _, val := range values {
 			addCIDRValue(val, &v4nets, &v6nets, &anyV4, &anyV6)
 		}
@@ -712,28 +714,41 @@ func isBookName(cfg *config.Config, overlay map[string][]string, tok string) boo
 // strings (CIDRs / bare IPs / "any"), recursing through address-sets with
 // path-based cycle detection — a direct port of the snapshot builder's
 // expandBookNameRecursive.
-func expandBookName(cfg *config.Config, name string, visited map[string]bool) []string {
-	ab := cfg.Security.AddressBook
-	if ab == nil || visited[name] {
+//
+// #3294: feed-aware. A dynamic-address feed binding name contributes its live
+// overlay prefixes at the top level AND when nested as an address-set member,
+// matching expandBookNameRecursive so the simulator and the dataplane agree
+// (closing the feed-portion under-deny in the simulator too). overlay may be
+// nil; ab may be nil while overlay carries the name (a pure feed binding).
+func expandBookName(cfg *config.Config, overlay map[string][]string, name string, visited map[string]bool) []string {
+	if visited[name] {
 		return nil
 	}
 	visited[name] = true
 	defer delete(visited, name)
 
+	var out []string
+	if feeds := overlay[name]; len(feeds) > 0 {
+		out = append(out, feeds...)
+	}
+	ab := cfg.Security.AddressBook
+	if ab == nil {
+		return out
+	}
 	if addr, ok := ab.Addresses[name]; ok {
-		return []string{addr.Value}
+		out = append(out, addr.Value)
+		return out
 	}
 	if as, ok := ab.AddressSets[name]; ok {
-		var out []string
 		for _, member := range as.Addresses {
-			out = append(out, expandBookName(cfg, member, visited)...)
+			out = append(out, expandBookName(cfg, overlay, member, visited)...)
 		}
 		for _, nested := range as.AddressSets {
-			out = append(out, expandBookName(cfg, nested, visited)...)
+			out = append(out, expandBookName(cfg, overlay, nested, visited)...)
 		}
 		return out
 	}
-	return nil
+	return out
 }
 
 // matchApp replicates policy.rs CompiledApplications.matches fed by the
