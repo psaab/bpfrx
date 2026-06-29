@@ -219,6 +219,26 @@ pub(crate) enum SnapshotIntegrityError {
         forwarding_class: String,
         target_policy: String,
     },
+    /// #3365: a policy rule's `action` field, or the snapshot `default_policy`,
+    /// carried a NON-EMPTY string that is not one of `permit` / `reject` /
+    /// `deny`. The pre-fix `parse_action` mapped any unrecognized string to
+    /// `PolicyAction::Deny` via a catch-all match arm — so a future `reject-*`
+    /// variant, a mixed-version snapshot token, or a corrupt/truncated action
+    /// silently LOST its intended permit/reject/RST semantics and collapsed to a
+    /// plain Deny with no failure surfaced. That is fail-closed for a `permit`
+    /// typo but fail-OPEN for a `reject`: an unrecognized reject downgrades to
+    /// Deny, dropping the RST/ICMP-unreachable behavior the operator configured,
+    /// and it masks wire-contract drift. The Go producer (`policyActionString`
+    /// in `pkg/dataplane/userspace/policies.go`) only ever renders the three
+    /// known tokens, so a normal Go snapshot never trips this; it is the
+    /// helper-boundary backstop for version drift / a corrupt snapshot,
+    /// consistent with the #2124/#3261 fail-closed family. Rejecting the WHOLE
+    /// snapshot (the preflight keeps the previous good state; a fresh boot keeps
+    /// the default-deny `PolicyState`) is action-agnostic. An EMPTY
+    /// `default_policy` is the legitimate `omitempty`/unspecified wire state
+    /// (decodes to the default Deny) and is NOT an error; an empty per-rule
+    /// action IS rejected (every configured rule has a concrete action).
+    UnknownPolicyAction { context: String, action: String },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -330,6 +350,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "cos forwarding-class {:?} has equal-flow-target-policy {:?} that is not one of slowest | mean | ideal-share — refusing to silently map it to the \"slowest\" default (which would change queue fairness with no failure surfaced)",
                 forwarding_class, target_policy
+            ),
+            Self::UnknownPolicyAction { context, action } => write!(
+                f,
+                "{} has action {:?} that is not one of permit | reject | deny — refusing to silently map it to Deny (which fail-OPENs an unrecognized reject by dropping its RST/ICMP-unreachable semantics and masks wire-contract drift)",
+                context, action
             ),
         }
     }
@@ -1343,8 +1368,20 @@ pub(crate) fn parse_policy_state_with_counters(
     address_books: &[AddressBookSnapshot],
     counter_store: &PolicyCounterStore,
 ) -> Result<PolicyState, SnapshotIntegrityError> {
+    // #3365: an EMPTY default_policy is the legitimate `omitempty`/unspecified
+    // wire state and decodes to the default-deny posture. A NON-EMPTY string
+    // that is not permit/reject/deny is rejected (fail closed) rather than
+    // silently collapsing to Deny.
+    let default_action = if default_policy.is_empty() {
+        PolicyAction::Deny
+    } else {
+        parse_action(default_policy).ok_or_else(|| SnapshotIntegrityError::UnknownPolicyAction {
+            context: "default-policy".to_string(),
+            action: default_policy.to_string(),
+        })?
+    };
     let mut state = PolicyState {
-        default_action: parse_action(default_policy),
+        default_action,
         rules: Vec::with_capacity(rules.len()),
         zone_pair_index: FxHashMap::default(),
         from_any_index: FxHashMap::default(),
@@ -1540,7 +1577,15 @@ pub(crate) fn parse_policy_state_with_counters(
             destination_v6_empty,
             applications,
             compiled_apps,
-            action: parse_action(&snap.action),
+            // #3365: every configured rule carries a concrete action; an unknown
+            // (or empty) action is rejected fail-closed rather than silently
+            // mapped to Deny (which would fail-OPEN an unrecognized reject).
+            action: parse_action(&snap.action).ok_or_else(|| {
+                SnapshotIntegrityError::UnknownPolicyAction {
+                    context: format!("rule {:?}", rule_id),
+                    action: snap.action.clone(),
+                }
+            })?,
             // #2508: carry the per-policy SYSLOG log selection.
             log_session_init: snap.log_session_init,
             log_session_close: snap.log_session_close,
@@ -2303,11 +2348,19 @@ fn stable_policy_rule_id(snap: &PolicyRuleSnapshot) -> String {
     format!("{}->{}/{}", snap.from_zone, snap.to_zone, snap.name)
 }
 
-fn parse_action(action: &str) -> PolicyAction {
+/// #3365: parse a wire action token into a `PolicyAction`. Returns `None` for
+/// any string that is not one of the three known tokens so the caller can fail
+/// the snapshot closed instead of silently collapsing an unrecognized action
+/// (e.g. a future `reject-*` variant, a typo, or a corrupt token) to Deny. The
+/// empty string is intentionally NOT recognized here; callers decide whether an
+/// empty value is a legitimate unspecified state (snapshot `default_policy`,
+/// `omitempty` on the wire) or a hard error (a per-rule action).
+fn parse_action(action: &str) -> Option<PolicyAction> {
     match action {
-        "permit" => PolicyAction::Permit,
-        "reject" => PolicyAction::Reject,
-        _ => PolicyAction::Deny,
+        "permit" => Some(PolicyAction::Permit),
+        "reject" => Some(PolicyAction::Reject),
+        "deny" => Some(PolicyAction::Deny),
+        _ => None,
     }
 }
 
