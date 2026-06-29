@@ -4076,6 +4076,79 @@ func TestDeriveUserspaceCapabilitiesAllowsBasicScreenProfile(t *testing.T) {
 	}
 }
 
+// TestBuildScreenSnapshotsSynFloodSubThresholds verifies the #3315 SYN-flood
+// sub-thresholds (alarm/source/destination) cross the userspace-dp wire. Before
+// the fix only attack-threshold was published, so the four sub-thresholds
+// committed cleanly yet were operationally inert. This is the FAIL-ON-REVERT
+// guard for the WIRE PLUMBING only: dropping the screens.go populate block makes
+// the three asserts below go zero and the test RED. It does NOT exercise the
+// hot-path enforcement — the per-destination/per-source cap drops and the
+// log-only alarm gate (and their RED-on-revert) live in the Rust screen runtime
+// tests (`cargo test --bin xpf-userspace-dp screen::`, userspace-dp/src/screen/
+// tests.rs). `timeout` is intentionally NOT on the wire (it maps to the session
+// half-open window, a tracked follow-up).
+func TestBuildScreenSnapshotsSynFloodSubThresholds(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", ScreenProfile: "flood"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"flood": {
+			Name: "flood",
+			TCP: config.TCPScreen{SynFlood: &config.SynFloodConfig{
+				AttackThreshold:      2000,
+				AlarmThreshold:       1000,
+				SourceThreshold:      50,
+				DestinationThreshold: 100,
+				Timeout:              20,
+			}},
+		},
+	}
+	snaps := buildScreenSnapshots(cfg)
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 screen snapshot, got %d", len(snaps))
+	}
+	s := snaps[0]
+	if s.SYNFloodThreshold != 2000 {
+		t.Errorf("SYNFloodThreshold = %d, want 2000", s.SYNFloodThreshold)
+	}
+	if s.SYNFloodAlarmThreshold != 1000 {
+		t.Errorf("SYNFloodAlarmThreshold = %d, want 1000", s.SYNFloodAlarmThreshold)
+	}
+	if s.SYNFloodSrcThreshold != 50 {
+		t.Errorf("SYNFloodSrcThreshold = %d, want 50", s.SYNFloodSrcThreshold)
+	}
+	if s.SYNFloodDstThreshold != 100 {
+		t.Errorf("SYNFloodDstThreshold = %d, want 100", s.SYNFloodDstThreshold)
+	}
+
+	// JSON round-trip: the additive fields serialize and decode unchanged.
+	blob, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back ScreenProfileSnapshot
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.SYNFloodAlarmThreshold != 1000 || back.SYNFloodSrcThreshold != 50 ||
+		back.SYNFloodDstThreshold != 100 {
+		t.Errorf("round-trip lost sub-thresholds: %+v", back)
+	}
+
+	// Skew tolerance: a JSON blob from an OLD Go control plane (no sub-threshold
+	// keys) decodes them to 0 (disabled) rather than failing.
+	old := `{"zone":"trust","syn_flood_threshold":2000}`
+	var legacy ScreenProfileSnapshot
+	if err := json.Unmarshal([]byte(old), &legacy); err != nil {
+		t.Fatalf("legacy decode: %v", err)
+	}
+	if legacy.SYNFloodAlarmThreshold != 0 || legacy.SYNFloodSrcThreshold != 0 ||
+		legacy.SYNFloodDstThreshold != 0 {
+		t.Errorf("legacy snapshot must decode sub-thresholds as 0, got %+v", legacy)
+	}
+}
+
 func TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"

@@ -206,13 +206,17 @@ func TestFeedBackedAddressIsRepresentableNoSentinel(t *testing.T) {
 //     cycle-guard returns representable on revisit, so pre-fix the set was
 //     vacuously representable yet compiles to an empty row (fail-open).
 //   - "feed-only-set": an address-set whose ONLY member is a feed-bound name.
-//     Feed prefixes are merged only for the TOP-LEVEL overlay name, never into
-//     a set member's row (#2049 / Codex MAJOR 1), so the set row is empty —
-//     pre-fix it was deemed representable (the member is a representable feed
-//     name) yet decodes to MatchNone (fail-open).
+//     Historically the feed prefixes were merged only for the TOP-LEVEL overlay
+//     name, never into a set member's row, so the row was empty and the set
+//     was rejected (#3261). Under #3294 (A′) the feed-aware
+//     expandBookNameRecursive now merges the feed prefixes into the set row, so
+//     a LIVE feed-only-set ENFORCES (no sentinel) — see TestFeedOnlySetEnforcesUnderA.
+//     This kind is therefore no longer in the sentinel loop; the cfg builder is
+//     reused by the positive test (and its empty-feed control).
 //
-// All must make the snapshot carry the __unsupported_address__ sentinel and
-// stay armed (#3261). overlay carries the feed binding for "feed-only-set".
+// The remaining kinds must make the snapshot carry the __unsupported_address__
+// sentinel and stay armed (#3261). overlay carries the feed binding for
+// "feed-only-set" (used only by the positive #3294 test now).
 func unrepresentableAddressCfg(kind string) (*config.Config, map[string][]string) {
 	cfg := &config.Config{}
 	cfg.Security.DefaultPolicy = config.PolicyPermit
@@ -295,9 +299,14 @@ func unrepresentableAddressCfg(kind string) (*config.Config, map[string][]string
 }
 
 func TestUnrepresentableAddressKeepsArmedAndCarriesSentinel(t *testing.T) {
+	// NOTE: "feed-only-set" is NO LONGER in this list. Under #3294 (A′) a
+	// feed-only-set with a LIVE feed now ENFORCES the feed prefixes (the
+	// feed-aware expandBookNameRecursive gives it a non-empty row), so it is
+	// representable and carries NO sentinel. That case is covered by
+	// TestFeedOnlySetEnforcesUnderA and the empty-feed control there.
 	for _, kind := range []string{
 		"undefined", "empty-value", "unparseable-value", "partial-set",
-		"empty-set", "cycle-set", "feed-only-set",
+		"empty-set", "cycle-set",
 	} {
 		t.Run(kind, func(t *testing.T) {
 			cfg, overlay := unrepresentableAddressCfg(kind)
@@ -355,13 +364,13 @@ func TestExpandBookNameToCIDRsEmptyValueContributesNothing(t *testing.T) {
 			"dns-book": {Name: "dns-book", Value: ""},
 		},
 	}
-	v4, v6 := expandBookNameToCIDRs(cfg, "dns-book")
+	v4, v6 := expandBookNameToCIDRs(cfg, nil, "dns-book")
 	if len(v4) != 0 || len(v6) != 0 {
 		t.Fatalf("empty-value book expanded to v4=%v v6=%v, want both empty (must NOT widen to 0.0.0.0/0 match-any)", v4, v6)
 	}
 	// Explicit `any` must still widen to the full prefixes (no regression).
 	cfg.Security.AddressBook.Addresses["any-book"] = &config.Address{Name: "any-book", Value: "any"}
-	a4, a6 := expandBookNameToCIDRs(cfg, "any-book")
+	a4, a6 := expandBookNameToCIDRs(cfg, nil, "any-book")
 	if len(a4) != 1 || a4[0] != "0.0.0.0/0" || len(a6) != 1 || a6[0] != "::/0" {
 		t.Fatalf("explicit `any` book expanded to v4=%v v6=%v, want [0.0.0.0/0] / [::/0]", a4, a6)
 	}
@@ -413,15 +422,38 @@ func TestExplicitAnyAddressBookIsMatchAnyNotRejected(t *testing.T) {
 	}
 }
 
-// TestFeedPlusConcreteAddressSetIsRepresentable is the convergent-MAJOR POSITIVE
-// control: an address-set with a feed-bound member ALONGSIDE a concrete CIDR
-// member keeps >=1 concrete contribution, so it stays representable — NO address
-// sentinel, NO content rejection, stays armed. This documents the deferred #2049
-// residual: the feed prefixes are NOT merged into the set row, so a deny over
-// this set under-denies the feed portion; that partial-under-deny is the
-// pre-existing feed-prefixes-not-merged-into-sets limitation and is explicitly
-// OUT OF SCOPE for #3261. Only a set with ZERO concrete members (empty / pure
-// cycle / feed-only) is rejected — see TestUnrepresentableAddressKeepsArmedAndCarriesSentinel.
+// bookRowForID returns the AddressBookSnapshot row carrying the given ID, or
+// nil. Used by the #3294 set-row feed-merge assertions.
+func bookRowForID(snap *ConfigSnapshot, id uint32) *AddressBookSnapshot {
+	for i := range snap.AddressBooks {
+		if snap.AddressBooks[i].ID == id {
+			return &snap.AddressBooks[i]
+		}
+	}
+	return nil
+}
+
+func bookRowHasPrefix(row *AddressBookSnapshot, cidr string) bool {
+	if row == nil {
+		return false
+	}
+	for _, p := range append(append([]string{}, row.PrefixesV4...), row.PrefixesV6...) {
+		if p == cidr {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFeedPlusConcreteAddressSetIsRepresentable is the #3294 RED-on-revert
+// anchor: an address-set with a feed-bound member ALONGSIDE a concrete CIDR
+// member stays representable (NO sentinel, NO content rejection), AND its
+// address-book row now carries BOTH the concrete prefix AND the live feed
+// prefixes (Option A′). Before #3294 the feed prefixes were merged only for a
+// TOP-LEVEL overlay name, never into a containing set's row, so a `deny
+// <mixed-feed-set>` under-denied the feed portion (fail-open on the lenient
+// path). Reverting the feed-aware expandBookNameRecursive drops the feed
+// prefix from the row and turns this RED.
 func TestFeedPlusConcreteAddressSetIsRepresentable(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.DefaultPolicy = config.PolicyPermit
@@ -434,7 +466,8 @@ func TestFeedPlusConcreteAddressSetIsRepresentable(t *testing.T) {
 			"good-host": {Name: "good-host", Value: "172.16.80.200/32"},
 		},
 		AddressSets: map[string]*config.AddressSet{
-			// feed member + concrete member -> >=1 concrete -> representable.
+			// feed member + concrete member -> >=1 concrete -> representable,
+			// and the row now carries BOTH (A′).
 			"mixed-feed-set": {Name: "mixed-feed-set", Addresses: []string{"bad-actors", "good-host"}},
 		},
 	}
@@ -457,15 +490,92 @@ func TestFeedPlusConcreteAddressSetIsRepresentable(t *testing.T) {
 		t.Fatalf("buildSnapshot: %v", err)
 	}
 	if len(snap.Capabilities.PolicyContentRejected) != 0 {
-		t.Fatalf("PolicyContentRejected = %v, want empty: a {feed + concrete} set keeps a concrete prefix and stays representable (#2049 under-deny residual is out of scope)", snap.Capabilities.PolicyContentRejected)
+		t.Fatalf("PolicyContentRejected = %v, want empty: a {feed + concrete} set keeps a concrete prefix and stays representable", snap.Capabilities.PolicyContentRejected)
 	}
 	rule := snap.Policies[0]
 	if addressListHasSentinel(rule.DestinationLiterals) || addressListHasSentinel(rule.DestinationAddresses) {
 		t.Fatalf("{feed + concrete} set must NOT carry the address sentinel: lit=%v addr=%v", rule.DestinationLiterals, rule.DestinationAddresses)
 	}
 	if len(rule.DestinationBookIDs) == 0 {
-		t.Fatal("{feed + concrete} set must route through a book ID (carries the concrete-member prefix)")
+		t.Fatal("{feed + concrete} set must route through a book ID")
 	}
+	// #3294 A′ core: the routed book row must carry BOTH the concrete member
+	// AND the feed prefixes — otherwise the deny silently under-enforces the
+	// feed portion. This is the fail-on-revert assertion.
+	row := bookRowForID(snap, rule.DestinationBookIDs[0])
+	if row == nil {
+		t.Fatalf("no address-book row for destination book ID %d", rule.DestinationBookIDs[0])
+	}
+	if !bookRowHasPrefix(row, "172.16.80.200/32") {
+		t.Fatalf("set row must carry the concrete member 172.16.80.200/32: v4=%v v6=%v", row.PrefixesV4, row.PrefixesV6)
+	}
+	if !bookRowHasPrefix(row, "198.51.100.0/24") {
+		t.Fatalf("#3294: set row must carry the FEED prefix 198.51.100.0/24 (feed-in-set merge); got v4=%v v6=%v — the feed portion is under-denied", row.PrefixesV4, row.PrefixesV6)
+	}
+}
+
+// TestFeedOnlySetEnforcesUnderA covers the #3294 (A′) consequence on a
+// feed-ONLY set (its sole member is a feed binding):
+//
+//   - LIVE feed: the feed-aware expandBookNameRecursive gives the set a
+//     non-empty row, so the feed member is now CONCRETE (concrete = feed has
+//     >= 1 live prefix) -> the top-level r && c gate passes -> the set is
+//     representable and ENFORCES the feed (no sentinel), instead of the
+//     pre-#3294 empty-row reject. This is fail-closed BY ENFORCING the deny.
+//   - EMPTY feed: the row stays empty, so the feed member is (representable,
+//     NOT concrete) and the feed-only set has no concrete contribution -> the
+//     r && c gate REJECTS it via the #3261 sentinel (fail-CLOSED). A `deny`
+//     over an all-empty set is therefore NOT silently dropped — it upgrades to
+//     the whole-snapshot keep-armed reject, exactly as the pre-#3294
+//     feed-only-set case did. (A DIRECT empty-feed token is different: it
+//     short-circuits in addrRepresentable as representable match-none per the
+//     #2049 single-token precedent and never reaches this set gate.)
+//
+// The empty-feed control pins that the concrete bit is gated on LIVE prefix
+// count (NOT set unconditionally), so a transiently/permanently empty feed
+// inside a set stays fail-closed rather than fail-open.
+func TestFeedOnlySetEnforcesUnderA(t *testing.T) {
+	t.Run("live-feed-enforces", func(t *testing.T) {
+		cfg, overlay := unrepresentableAddressCfg("feed-only-set")
+		snap, err := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 1, 0, nil, nil, overlay)
+		if err != nil {
+			t.Fatalf("buildSnapshot: %v", err)
+		}
+		if len(snap.Capabilities.PolicyContentRejected) != 0 {
+			t.Fatalf("PolicyContentRejected = %v, want empty: a LIVE feed-only-set now enforces the feed (A′)", snap.Capabilities.PolicyContentRejected)
+		}
+		rule := snap.Policies[0]
+		if addressListHasSentinel(rule.DestinationLiterals) || addressListHasSentinel(rule.DestinationAddresses) {
+			t.Fatalf("live feed-only-set must NOT carry the sentinel: lit=%v addr=%v", rule.DestinationLiterals, rule.DestinationAddresses)
+		}
+		if len(rule.DestinationBookIDs) == 0 {
+			t.Fatal("live feed-only-set must route through a book ID carrying the feed prefixes")
+		}
+		row := bookRowForID(snap, rule.DestinationBookIDs[0])
+		if !bookRowHasPrefix(row, "198.51.100.0/24") || !bookRowHasPrefix(row, "2001:db8:bad::/48") {
+			t.Fatalf("#3294: live feed-only-set row must carry the feed prefixes; got v4=%v v6=%v", row.PrefixesV4, row.PrefixesV6)
+		}
+	})
+
+	t.Run("empty-feed-rejects-fail-closed", func(t *testing.T) {
+		cfg, _ := unrepresentableAddressCfg("feed-only-set")
+		// Overlay key present but NO live prefixes: the feed member is
+		// representable-but-not-concrete, so the feed-only set has zero concrete
+		// contribution and is rejected via the #3261 sentinel (fail-closed). The
+		// deny is NOT silently dropped.
+		overlay := map[string][]string{"bad-actors": {}}
+		snap, err := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 1, 0, nil, nil, overlay)
+		if err != nil {
+			t.Fatalf("buildSnapshot: %v", err)
+		}
+		if len(snap.Capabilities.PolicyContentRejected) == 0 {
+			t.Fatal("empty-feed feed-only-set must be REJECTED (fail-closed #3261): a deny over an all-empty set must not be silently dropped")
+		}
+		rule := snap.Policies[0]
+		if !addressListHasSentinel(rule.DestinationLiterals) || !addressListHasSentinel(rule.DestinationAddresses) {
+			t.Fatalf("empty-feed feed-only-set must carry the __unsupported_address__ sentinel: lit=%v addr=%v", rule.DestinationLiterals, rule.DestinationAddresses)
+		}
+	})
 }
 
 // TestMutualCycleWithConcreteAddressSetIsRepresentable is the Codex
