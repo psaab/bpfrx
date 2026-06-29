@@ -2380,6 +2380,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3366: structural application errors (a direct match body mixed with
+	// `term` sub-blocks, or a duplicate single-valued leaf inside one term) are
+	// rejected for ALL user-defined applications — referenced or not — like the
+	// #3352/#3353 syntactic gate above. Mixing a direct body with terms silently
+	// dropped the direct match (the term-store branch keeps only the terms), and
+	// a repeated scalar term leaf was last-writer-wins; both are Junos config
+	// errors caught at definition. Lenient-downgrade on the tolerant load /
+	// peer-sync path (#1960 no-brick).
+	if err := validateApplicationStructureStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application structure (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
 	// commit / commit-check (hard-reject a term whose protocol token is not
 	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a
@@ -2690,15 +2707,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
-	// #3349 follow-up: event-mode log-format compatibility. The top-level
-	// `security log format` is schema-validated to a known format in any mode,
-	// but the EVENT-mode local-file writer only honors binary / standard text
-	// — `structured` and `sd-syslog` silently fall back to standard text. That
-	// silent no-op is the exact failure #3349 closes, so reject an
-	// event-incompatible format at commit (cross-field rule the per-leaf
-	// SchemaValidate gate cannot express). Strict on commit / commit-check;
-	// lenient on load / peer-sync (warn — the runtime already falls back, so a
-	// leniently-loaded value is inert rather than bricking the load).
+	// #3349 follow-up, #3409 implemented: event-mode log-format compatibility.
+	// The top-level `security log format` is schema-validated to a known format
+	// in any mode. As of #3409 the EVENT-mode local-file writer honors the full
+	// set — binary, standard/syslog text, `structured` (Junos RT_FLOW), and
+	// `sd-syslog` (RFC 5424 envelope) — so nothing silently falls back, and this
+	// validator accepts the entire schema enum in either mode. It is retained as
+	// a cross-field gate (the per-leaf SchemaValidate walker cannot express a
+	// mode-dependent rule) and default-rejects only a hypothetical future schema
+	// value not yet wired into the writer fanout. Strict on commit / commit-check;
+	// lenient on load / peer-sync — now inert for the four known formats.
 	if err := validateLogEventModeFormatStrict(cfg); err != nil {
 		if opts.lenientLogEventModeFormat {
 			cfg.Warnings = append(cfg.Warnings,
@@ -3274,6 +3292,13 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// preserved unchanged but warned about here — clamp-warn, never reject, so
 	// existing/peer-synced configs keep booting on both compile paths.
 	cfg.Warnings = append(cfg.Warnings, validateScreenScanSweepThresholds(cfg)...)
+
+	// #3315: SYN-flood sub-threshold advisories. `timeout` parses but is not yet
+	// enforced (maps to the half-open session window, a tracked follow-up) and an
+	// attack/source ratio orders of magnitude wide can false-throttle legitimate
+	// sources on the per-source count-min sketch. Warn (never reject) so a config
+	// using these leaves commits and the operator is told what is/ isn't honoured.
+	cfg.Warnings = append(cfg.Warnings, validateScreenSynFloodSubThresholds(cfg)...)
 
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
 	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then

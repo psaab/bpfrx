@@ -999,28 +999,30 @@ reserved for whole-dataplane selection where a rewrite shim
 
   **Event-mode format compatibility (cross-field).** The top-level
   `security log format` value feeds two different runtimes depending on
-  `security log mode`, and they honor different format sets. The schema leaf
-  validates the value to a known format in *any* mode; a second compiler pass
-  (`validateLogEventModeFormatStrict`, post-compile on `cfg.Security.Log`,
-  strict on commit / `lenientLogEventModeFormat`-downgraded on load/peer-sync)
-  rejects an event-mode-incompatible format because the event-mode local-file
-  writer (`pkg/logging` `LocalLogWriter`, driven by the `ringbuf.go`
-  local-writer fanout) only branches on `binary` and otherwise writes standard
-  text — so `structured` / `sd-syslog` would validate at commit and then
-  silently fall back to text (the exact #3349 failure). Support matrix:
+  `security log mode`. As of #3409 BOTH runtimes honor every schema format —
+  the event-mode local-file writer (`pkg/logging` `LocalLogWriter`, driven by
+  the `ringbuf.go` local-writer fanout) implements `structured` (Junos RT_FLOW
+  body) and `sd-syslog` (RFC 5424 envelope) alongside `binary` and the standard
+  default, so nothing silently falls back. The schema leaf validates the value
+  to a known format in *any* mode; `validateLogEventModeFormatStrict`
+  (post-compile on `cfg.Security.Log`, strict on commit /
+  `lenientLogEventModeFormat`-downgraded on load/peer-sync) now accepts the
+  full enum in either mode and only fires defensively if a future schema value
+  is added but not yet honored by the writer. Support matrix:
 
   | `format` | `mode stream` (remote syslog) | `mode event` (local file) |
   |---|---|---|
   | `binary` | binary records | binary records |
-  | `structured` | Junos RT_FLOW | **rejected at commit** (silently fell back to text) |
-  | `sd-syslog` | RFC 5424 envelope | **rejected at commit** (silently fell back to text) |
-  | `syslog` / unset | standard RFC 3164 text | standard RFC 3164 text |
+  | `structured` | Junos RT_FLOW | Junos RT_FLOW (local timestamp+tag prefix) |
+  | `sd-syslog` | RFC 5424 envelope | RFC 5424 envelope |
+  | `syslog` / unset | standard RFC 3164 text | standard text (local timestamp+tag prefix) |
 
-  Event-mode `structured` / `sd-syslog` is a feature gap, not a deliberate
-  exclusion — tracked in #3409 (widen the event-honorable set once the
-  `LocalLogWriter` implements those formats). The event-honorable set in
+  The #3409 follow-up closed the prior event-mode gap (before it, `structured`
+  / `sd-syslog` were rejected at commit because the event-mode writer would
+  silently no-op them to standard text). The event-honorable set in
   `validateLogEventModeFormatStrict` MUST stay in sync with the `ringbuf.go`
-  local-writer fanout.
+  local-writer fanout: a value accepted there but unhonored in the fanout would
+  reintroduce the silent fallback.
 - **#2008 H9/H10 (interface silent-drop reject):** two interface stanzas
   that parsed-accepted and were silently dropped (no schema child, no
   compiler case, no dataplane consumer) are now hard-rejected at commit /
@@ -2497,6 +2499,58 @@ rejected referenced AND unreferenced, well-formed term keeps its port
 constraint, unknown alg rejected top-level + inline-term + unreferenced,
 supported alg names accepted on both paths, predefined-app reference not
 rejected).
+
+### #3366 — application EITHER direct OR term-based; conflicting duplicate term leaf
+
+A custom `applications application <name>` may carry EITHER a direct match body
+(`protocol` / `destination-port` / `source-port` / `inactivity-timeout` /
+`timeout` / `icmp-type` / `icmp-code` / `alg`) OR one or more `term` sub-blocks —
+Junos rejects the mix. Two silent-accept gaps lived in `compileApplications` /
+`parseApplicationTerms` (`compiler_applications.go`):
+
+- **Mixed direct body + `term` dropped the direct match.** The final store is
+  all-or-nothing: `if len(terms) > 0 { /* store only the synthesized term apps +
+  the implicit application-set */ } else { apps.Applications[appName] = app }`.
+  So a shape combining a direct body with a term
+  (`application X { protocol tcp; destination-port 22; term t1 { protocol udp;
+  destination-port 53; } }`) silently DISCARDED the direct `protocol tcp /
+  destination-port 22` match — for a deny application that erased the deny and
+  let traffic fall through to a later permit or the default policy (a fail-OPEN
+  under-match), with no commit error. `compileApplications` now records such a
+  parent on `cfg.Applications.MixedDirectTermApps` (a direct body is any match
+  leaf — `description` is metadata propagated onto each term, not a match
+  constraint, so it does NOT count), and `validateApplicationStructureStrict`
+  (`compiler_validate_strict.go`) rejects it at commit (move the direct match
+  into its own `term`).
+- **Conflicting duplicate scalar leaf inside one `term` was last-writer-wins.**
+  `parseApplicationTerms` parses `destination-port` / `source-port` / `alg` /
+  `inactivity-timeout` / `timeout` into single scalars; the inline `term` is
+  opaque to `SchemaValidate`, so a repeated leaf (via apply-groups, flat-set
+  ordering, or hand authoring) silently overwrote the earlier value by token
+  order with no validation — a repeated `destination-port` in a deny term
+  narrowed the deny to the final value. The parser now records a CONFLICTING
+  repeat (a second occurrence with a DIFFERENT value) on
+  `Application.DuplicateTermLeaves`, and the same gate rejects the first one. An
+  IDEMPOTENT same-value repeat (e.g. the `timeout` / `inactivity-timeout` aliases
+  both set to the same number) is harmless and accepted; a repeated `protocol` is
+  the documented multi-protocol-term syntax (one application per unique protocol,
+  `TestMultiProtocolTerm`) and is NOT flagged.
+
+**Scope — ALL user-defined applications, referenced or not.** Like the
+#3352/#3353 syntactic gate, `validateApplicationStructureStrict` runs over every
+entry rather than the reference-scoped `applicationsToValidateStrict` subset: a
+mixed-shape application and a conflicting duplicate term leaf are STRUCTURAL
+errors Junos rejects at definition regardless of policy wiring. Both checks are
+STRICT on the commit / commit-check path and downgrade to a `cfg.Warnings` entry
+on the tolerant load / HA peer-sync path (`lenientApplicationSpecs`, #1960
+no-brick), the same discipline as the #3320 / #3348 / #3352 / #3353 application
+gates. Distinct from #3339 (implicit-set vs explicit-set collision / duplicate
+term NAMES), #3352 (unknown leaves inside a term), and #3320 (malformed timeout).
+Regression coverage: `pkg/config/compiler_application_mixed_term_3366_test.go`
+(mixed rejected referenced + unreferenced + per-direct-leaf + hierarchical;
+description+term and direct-only / term-only accepted; conflicting duplicate
+leaf rejected per leaf; repeated-protocol multi-protocol term accepted; lenient
+path downgrades to a warning).
 
 ### #2226 — rib-group `import-rib` undefined-reference validation
 

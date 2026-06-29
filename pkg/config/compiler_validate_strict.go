@@ -12,52 +12,56 @@ import (
 // validateLogEventModeFormatStrict rejects a top-level `security log format`
 // that the EVENT-mode writer cannot honor (#3349 follow-up). The top-level
 // format leaf is schema-validated to one of {binary, sd-syslog, structured,
-// syslog} regardless of mode, but the value feeds two different runtimes:
+// syslog} regardless of mode, and BOTH runtimes now honor every one of those
+// values (#3409 closed the event-mode gap):
 //
 //   - stream mode (remote syslog): honors binary (formatBinaryRecord),
 //     structured (formatStructuredMsg), sd-syslog (RFC 5424 envelope in
-//     SyslogClient.Send), and the standard RFC 3164 default — all four.
+//     SyslogClient.Send), and the standard RFC 3164 default.
 //   - event mode (local file, pkg/logging LocalLogWriter via
-//     ringbuf.go ProcessRawEvent local-writer fanout): branches ONLY on
-//     `binary`; every other value writes standard text. So `structured`
-//     and `sd-syslog` SILENTLY fall back to standard text — the exact
-//     silent-config-fallback #3349 exists to eliminate, on the new typed
-//     surface.
+//     ringbuf.go ProcessRawEvent local-writer fanout): honors binary
+//     (formatBinaryRecord), structured (Junos RT_FLOW body), sd-syslog
+//     (RFC 5424 envelope in LocalLogWriter.Send), and the standard default.
 //
-// This is a CROSS-FIELD rule (format validity depends on the sibling mode),
-// which the declarative per-leaf SchemaValidate walker cannot express, so it
-// lives here as a post-compile pass on cfg.Security.Log. When mode is event,
-// only the event-honorable formats are accepted; structured / sd-syslog are
-// rejected at commit instead of silently no-opping. Event-mode structured /
-// sd-syslog support is a feature gap tracked separately (see the follow-up
-// issue cited in docs/config-schema.md); restricting the enum here is the
-// fail-closed half.
+// Before #3409 the event-mode fanout branched ONLY on `binary` and wrote
+// standard text for every other value, so `structured` and `sd-syslog`
+// SILENTLY fell back to standard text — the exact silent-config-fallback #3349
+// exists to eliminate. That gap is closed: each format now produces distinct
+// output, so every schema value is accepted in event mode too.
 //
-// On the tolerant load / peer-sync paths the call site downgrades this to a
-// warning (opts.lenientLogEventModeFormat) so an already-persisted or
-// peer-synced config that an older binary accepted still boots — the runtime
-// already falls back to standard text, so a leniently-loaded value is inert
-// rather than bricking the load (#1960 / #3261). Commit / commit-check stay
-// strict. Mirrors validateLogProfileStreamReferencesStrict.
+// This stays as a CROSS-FIELD validator (format validity in principle depends
+// on the sibling mode, which the declarative per-leaf SchemaValidate walker
+// cannot express) so the contract is documented in one place and a future
+// event-only format remains easy to gate. Today it accepts the full schema
+// enum for either mode.
+//
+// On the tolerant load / peer-sync paths the call site still downgrades any
+// rejection to a warning (opts.lenientLogEventModeFormat); with the full enum
+// accepted this path is now inert for the four known formats and only fires if
+// a future value is added to the schema but not yet honored here.
 //
 // The event-honorable set MUST stay in sync with the LocalLogWriter fanout in
-// pkg/logging/ringbuf.go (binary branch + standard-text default): a value
-// allowed here but unhonored there reintroduces the silent fallback.
+// pkg/logging/ringbuf.go: a value allowed here but unhonored there would
+// reintroduce the silent fallback.
 func validateLogEventModeFormatStrict(cfg *Config) error {
 	if cfg == nil || cfg.Security.Log.Mode != "event" {
 		return nil
 	}
 	switch cfg.Security.Log.Format {
-	case "", "binary", "syslog":
-		// "" / "syslog" => standard RFC 3164 text (what the writer produces
-		// and what the operator named); "binary" => binary records. All
-		// honored by the event-mode LocalLogWriter.
+	case "", "binary", "syslog", "structured", "sd-syslog":
+		// All four schema formats are honored by the event-mode LocalLogWriter
+		// fanout (#3409): "" / "syslog" => standard RFC 3164 text; "binary" =>
+		// binary records; "structured" => Junos RT_FLOW body; "sd-syslog" =>
+		// RFC 5424 envelope. Nothing silently falls back.
 		return nil
 	default:
+		// Defensive: the schema leaf already constrains the value to the set
+		// above. An unknown value reaching here would be emitted as standard
+		// text by the writer, so reject it rather than silently no-op — the
+		// #3349 contract.
 		return fmt.Errorf("security log format %q is not honored in event mode "+
-			"(the local-file writer only emits binary or standard text); use "+
-			"`binary` or `syslog`, or switch to `mode stream` for structured / "+
-			"sd-syslog output", cfg.Security.Log.Format)
+			"(the local-file writer emits binary, structured, sd-syslog, or "+
+			"standard text); use one of those formats", cfg.Security.Log.Format)
 	}
 }
 
@@ -1971,6 +1975,20 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 			bookNames[name] = true
 		}
 	}
+	// #3294: a dynamic-address feed binding NAME is a valid DIRECT policy
+	// address token — the userspace dataplane resolves it via the feed overlay
+	// (#2049) and enforces the live feed prefixes. Recognize it here so a direct
+	// feed reference COMMITS instead of being rejected as an undefined token
+	// (the documented #2049 feed-in-policy feature was un-committable under
+	// strict). Deliberately scoped to THIS top-level gate only:
+	// policyMatchAddressBookResolves (#3149) must stay feed-UNaware so a feed
+	// member nested in an address-set still poisons its set at strict — feeding
+	// it through the shared recursive resolver would strict-accept feed-in-set
+	// (the anti-Option-C guardrail; feed-in-set enforcement on the lenient path
+	// is handled by the dataplane set-row merge, not by strict-accepting it).
+	for name := range cfg.Security.DynamicAddress.AddressBindings {
+		bookNames[name] = true
+	}
 	validToken := func(tok string) bool {
 		switch tok {
 		case "", "any", "any-ipv4", "any-ipv6":
@@ -3569,6 +3587,80 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 					"is not yet enforced by the userspace dataplane — enforcement is "+
 					"deferred to the per-application ALG slice of #2008",
 				name, app.ALG)
+		}
+	}
+	return nil
+}
+
+// validateApplicationStructureStrict hard-rejects two STRUCTURAL errors in a
+// user-defined application that Junos rejects at commit regardless of whether
+// the application is wired into a policy (the same all-user-apps scope as
+// validateApplicationSyntaxStrict, NOT the reference-scoped semantic specs):
+//
+//   - #3366 mixed direct + term: an application carrying BOTH a direct match
+//     body (protocol / destination-port / source-port / inactivity-timeout /
+//     timeout / icmp-type / icmp-code / alg) AND one or more `term` sub-blocks.
+//     compileApplications stores only the synthesized term applications for a
+//     term-bearing app (the `if len(terms) > 0` branch), so the direct match was
+//     SILENTLY DROPPED — for a deny application that erases a deny match and lets
+//     traffic fall through to a later permit or the default policy (a fail-open
+//     under-match). Junos requires a custom application to be EITHER scalar OR
+//     term-based; reject the mix at commit. compileApplications records the
+//     parent name on cfg.Applications.MixedDirectTermApps.
+//
+//   - #3366 duplicate scalar term leaf: a single-valued leaf (destination-port /
+//     source-port / inactivity-timeout / timeout / alg) repeated with a
+//     CONFLICTING value inside one inline term. The term is opaque to the
+//     SchemaValidate walk, so the repeat was last-writer-wins — the earlier value
+//     silently overwritten by parse order, narrowing/widening the term with no
+//     commit error. An idempotent same-value repeat is accepted; a repeated
+//     `protocol` is the documented multi-protocol-term syntax and is NOT flagged.
+//     parseApplicationTerms records the offending leaf names on
+//     Application.DuplicateTermLeaves.
+//
+// Strict on the commit / commit-check path; the call site (compiler.go,
+// lenientApplicationSpecs) downgrades a returned error to a warning on the
+// tolerant load / peer-sync path so an already-persisted or older-peer-synced
+// config still BOOTS (#1960 no-brick). Iteration is sorted so the first-reported
+// error is deterministic across runs.
+func validateApplicationStructureStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// #3366 mixed direct + term — reject the parent application by name.
+	if len(cfg.Applications.MixedDirectTermApps) > 0 {
+		mixed := append([]string(nil), cfg.Applications.MixedDirectTermApps...)
+		sort.Strings(mixed)
+		return fmt.Errorf(
+			"application %q: a custom application may define EITHER a direct match "+
+				"body (protocol / destination-port / source-port / "+
+				"inactivity-timeout / timeout / icmp-type / icmp-code / alg) OR one or "+
+				"more `term` sub-blocks, not both — Junos rejects the mix, and the "+
+				"compiler silently dropped the direct match (keeping only the terms), "+
+				"which for a deny application erases the deny and lets traffic fall "+
+				"through. Move the direct match into its own `term`",
+			mixed[0])
+	}
+	// #3366 duplicate scalar leaf inside an inline term.
+	if len(cfg.Applications.Applications) > 0 {
+		names := make([]string, 0, len(cfg.Applications.Applications))
+		for name := range cfg.Applications.Applications {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			app := cfg.Applications.Applications[name]
+			if app == nil || len(app.DuplicateTermLeaves) == 0 {
+				continue
+			}
+			return fmt.Errorf(
+				"application %q: conflicting duplicate %q inside `term`; a single-valued "+
+					"term leaf (destination-port / source-port / inactivity-timeout / "+
+					"timeout / alg) may carry only one value — a repeat with a different "+
+					"value is last-writer-wins and silently overrides the earlier one by "+
+					"token order (use repeated `protocol` only for an intentional "+
+					"multi-protocol term)",
+				name, app.DuplicateTermLeaves[0])
 		}
 	}
 	return nil

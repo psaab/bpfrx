@@ -68,6 +68,7 @@ mod packet;
 mod rate;
 mod scan;
 mod stateless;
+mod syn_rate;
 mod syncookie;
 
 pub(crate) use extract::extract_screen_info;
@@ -106,6 +107,7 @@ use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
 use packet::{TCP_FIN, TCP_URG};
 use rate::RateCounter;
 use scan::{IpSweepTracker, PortScanTracker};
+use syn_rate::SynRateSketch;
 #[cfg(not(test))]
 use syncookie::SynCookieValidatedCache;
 use syncookie::SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC;
@@ -164,6 +166,38 @@ pub(crate) struct ScreenState {
     /// #3082: count of WARNs actually emitted (post rate-limit). Test seam so a
     /// unit test can assert the WARN path was taken without scraping stderr.
     missing_profile_warn_count: u64,
+    /// #3315: per-zone per-DESTINATION SYN-flood rate sketch. Present (Some) only
+    /// for zones whose `destination-threshold` is configured; `get_mut(zone)`
+    /// returning Some both enables and supplies the limiter (no separate enable
+    /// bool needed). The per-dest control is PRIMARY and spoof-resistant (all
+    /// SYNs to a victim hit the same `d` CMS cells) and runs even when the zone
+    /// is SYN-cookie active.
+    syn_dst_sketch: FxHashMap<String, SynRateSketch>,
+    /// #3315: per-zone per-SOURCE SYN-flood rate sketch. Present only for zones
+    /// whose `source-threshold` is configured. SECONDARY/best-effort: it is
+    /// SKIPPED while the zone is SYN-cookie active (the cookie governs the
+    /// high-cardinality spoofed-flood regime and per-source is spoof-defeated
+    /// there anyway), which confines the sketch to the accurate sub-aggregate
+    /// regime.
+    syn_src_sketch: FxHashMap<String, SynRateSketch>,
+    /// #3315: per-zone last second a SYN-flood alarm event was raised, for the
+    /// ≤1/sec/zone cadence. Populated in `update_profiles` for alarm-enabled
+    /// zones so the hot path never allocates. `u64::MAX` = never emitted.
+    syn_alarm_last_emit_sec: FxHashMap<String, u64>,
+    /// #3315: set when the just-checked packet crossed `alarm-threshold` (below
+    /// attack-threshold) and the per-zone cadence admits a new alarm. Drained by
+    /// `take_syn_alarm_event()` at the poll stage (which has the packet/zone in
+    /// scope to emit the out-of-band alarm event). The verdict is NOT a drop.
+    syn_alarm_pending: bool,
+    /// #3315: sub-attribution test seams (per-worker). The drop verdict reuses
+    /// the existing `"syn-flood"` reason id (no Go gRPC/CLI change), so these
+    /// counters let tests assert WHICH sub-threshold tripped without scraping
+    /// the event stream. Surfacing them on `show security screen` is a tracked
+    /// follow-up; the drops are already counted via `screen_drops` and emit a
+    /// `syn-flood` event, and the alarm emits a `syn-flood-alarm` event.
+    syn_flood_dst_drops: u64,
+    syn_flood_src_drops: u64,
+    syn_flood_alarm_events: u64,
 }
 
 /// #3082: at most one missing-screen-profile WARN per zone per second.
@@ -192,6 +226,13 @@ impl ScreenState {
             missing_profile_refs: FxHashMap::default(),
             missing_profile_warn_counters: FxHashMap::default(),
             missing_profile_warn_count: 0,
+            syn_dst_sketch: FxHashMap::default(),
+            syn_src_sketch: FxHashMap::default(),
+            syn_alarm_last_emit_sec: FxHashMap::default(),
+            syn_alarm_pending: false,
+            syn_flood_dst_drops: 0,
+            syn_flood_src_drops: 0,
+            syn_flood_alarm_events: 0,
         }
     }
 
@@ -281,7 +322,65 @@ impl ScreenState {
                 *zone_gen = zone_gen.wrapping_add(1);
             }
         }
+        // #3315: maintain the per-source / per-destination SYN-rate sketches and
+        // the alarm cadence map. Allocate ONLY for zones whose threshold is
+        // configured (192 KiB/zone for both); drop the table when the threshold
+        // is removed so memory tracks live config. The sketch is allocated ONCE
+        // per zone (not on every reload) — `entry(..).or_insert_with` preserves
+        // an existing sketch's in-flight counters across an unrelated profile
+        // edit; the per-increment threshold means a threshold change needs no
+        // realloc.
+        self.syn_dst_sketch
+            .retain(|k, _| profiles.get(k).is_some_and(|p| p.syn_flood_dst_threshold > 0));
+        self.syn_src_sketch
+            .retain(|k, _| profiles.get(k).is_some_and(|p| p.syn_flood_src_threshold > 0));
+        self.syn_alarm_last_emit_sec
+            .retain(|k, _| profiles.get(k).is_some_and(|p| p.syn_flood_alarm_threshold > 0));
+        for (zone, profile) in &profiles {
+            if profile.syn_flood_dst_threshold > 0 {
+                self.syn_dst_sketch
+                    .entry(zone.clone())
+                    .or_insert_with(SynRateSketch::for_dst);
+            }
+            if profile.syn_flood_src_threshold > 0 {
+                self.syn_src_sketch
+                    .entry(zone.clone())
+                    .or_insert_with(SynRateSketch::for_src);
+            }
+            if profile.syn_flood_alarm_threshold > 0 {
+                self.syn_alarm_last_emit_sec
+                    .entry(zone.clone())
+                    .or_insert(u64::MAX);
+            }
+        }
         self.profiles = profiles;
+    }
+
+    /// #3315: drain a pending SYN-flood alarm. Returns true at most once per
+    /// second per zone (the cadence is enforced at set-time in the SYN check).
+    /// The poll stage calls this immediately after `check_packet_with_zone_id`
+    /// — where the packet/zone are in scope — to emit the out-of-band alarm
+    /// event. The packet still forwards (the alarm is log-only, not a drop).
+    pub fn take_syn_alarm_event(&mut self) -> bool {
+        let pending = self.syn_alarm_pending;
+        self.syn_alarm_pending = false;
+        pending
+    }
+
+    /// #3315: sub-attribution test seams (per-destination / per-source drops,
+    /// alarm events). Used by unit tests to assert WHICH SYN-flood sub-threshold
+    /// tripped without scraping the event stream.
+    #[cfg(test)]
+    pub(crate) fn syn_flood_dst_drops(&self) -> u64 {
+        self.syn_flood_dst_drops
+    }
+    #[cfg(test)]
+    pub(crate) fn syn_flood_src_drops(&self) -> u64 {
+        self.syn_flood_src_drops
+    }
+    #[cfg(test)]
+    pub(crate) fn syn_flood_alarm_events(&self) -> u64 {
+        self.syn_flood_alarm_events
     }
 
     /// #2446: the SYN-cookie-relevant slice of a zone profile. Two profiles
@@ -455,6 +554,13 @@ impl ScreenState {
         let udp_flood_threshold = profile.udp_flood_threshold;
         let syn_flood_threshold = profile.syn_flood_threshold;
         let syn_cookie = profile.syn_cookie;
+        // #3315: SYN-flood sub-thresholds (0 = disabled). Pulled up front with
+        // the other scalars so the immutable `self.profiles` borrow is released
+        // before the per-source/per-destination sketches and the alarm map need
+        // `&mut self`.
+        let syn_alarm_threshold = profile.syn_flood_alarm_threshold;
+        let syn_dst_threshold = profile.syn_flood_dst_threshold;
+        let syn_src_threshold = profile.syn_flood_src_threshold;
         // `profile` borrow ends here (NLL): no further reads of
         // `self.profiles` in this method. Scan/sweep moved to the new-flow
         // hook (`scan_sweep_drop_on_new_flow`), so the advanced trackers are
@@ -482,7 +588,18 @@ impl ScreenState {
             }
         }
 
-        // SYN flood: count TCP SYN (without ACK) per zone
+        // SYN flood: count TCP SYN (without ACK) per zone.
+        //
+        // #3315 enforcement order (aggregate authoritative, per-IP additive):
+        //   1. aggregate `attack-threshold` (+ `alarm-threshold`) — UNCHANGED
+        //      cookie-mint / Drop behaviour; the aggregate ALWAYS counts so its
+        //      cookie-activation side-effect can never be skipped.
+        //   2. per-DESTINATION cap (primary, spoof-resistant) — runs even when
+        //      the zone is cookie-active.
+        //   3. per-SOURCE cap (secondary) — SKIPPED while the zone is cookie-
+        //      active (the cookie governs the spoofed-flood regime; per-source is
+        //      spoof-defeated there and the sketch would over-throttle).
+        // A validated returning SYN-cookie client bypasses ALL of the above.
         if syn_flood_threshold > 0 && pkt.protocol == PROTO_TCP {
             let tf = pkt.tcp_flags;
             if is_initial_syn(tf) {
@@ -498,9 +615,27 @@ impl ScreenState {
                     syn_cookie_bypassed = true;
                 }
                 if !syn_cookie_validated {
-                    if let Some(counter) = self.syn_counters.get_mut(zone)
-                        && counter.increment(now_secs, syn_flood_threshold)
-                    {
+                    // (1) Aggregate dual-threshold in a SINGLE window advance
+                    // (D7): one compare against attack, one against alarm. When
+                    // alarm is disabled, pass u32::MAX so `over_alarm` is always
+                    // false and the alarm branch is dead.
+                    let alarm_arg = if syn_alarm_threshold > 0 {
+                        syn_alarm_threshold
+                    } else {
+                        u32::MAX
+                    };
+                    let (over_attack, over_alarm) = self
+                        .syn_counters
+                        .get_mut(zone)
+                        .map(|counter| {
+                            counter.increment_and_classify(
+                                now_secs,
+                                syn_flood_threshold,
+                                alarm_arg,
+                            )
+                        })
+                        .unwrap_or((false, false));
+                    if over_attack {
                         if syn_cookie {
                             if let Some(active_until) =
                                 self.syn_cookie_active_until_secs.get_mut(zone)
@@ -528,6 +663,46 @@ impl ScreenState {
                                 peer_mss: pkt.tcp_mss,
                             });
                         }
+                        return ScreenVerdict::Drop("syn-flood");
+                    }
+                    // Alarm-threshold crossed but below attack (we returned
+                    // above otherwise): raise a log-only alarm at most once per
+                    // second per zone. The verdict is unaffected — the packet
+                    // continues to the per-IP checks and (if clean) forwards.
+                    if syn_alarm_threshold > 0
+                        && over_alarm
+                        && let Some(last) = self.syn_alarm_last_emit_sec.get_mut(zone)
+                        && *last != now_secs
+                    {
+                        *last = now_secs;
+                        self.syn_alarm_pending = true;
+                        self.syn_flood_alarm_events = self.syn_flood_alarm_events.wrapping_add(1);
+                    }
+                    // (2) per-DESTINATION cap — PRIMARY, always runs (even when
+                    // cookie-active). A trip HARD-DROPS and never flips zone
+                    // cookie state.
+                    if syn_dst_threshold > 0
+                        && let Some(sketch) = self.syn_dst_sketch.get_mut(zone)
+                        && sketch.increment(&pkt.dst_ip, now_secs, syn_dst_threshold)
+                    {
+                        self.syn_flood_dst_drops = self.syn_flood_dst_drops.wrapping_add(1);
+                        return ScreenVerdict::Drop("syn-flood");
+                    }
+                    // (3) per-SOURCE cap — SECONDARY, skipped while the zone is
+                    // SYN-cookie active (D3). The cookie-active window is the
+                    // high-cardinality spoofed-flood regime where per-source is
+                    // both spoof-defeated and prone to sketch over-throttling.
+                    let cookie_active = syn_cookie
+                        && self
+                            .syn_cookie_active_until_secs
+                            .get(zone)
+                            .is_some_and(|&until| until > now_secs);
+                    if syn_src_threshold > 0
+                        && !cookie_active
+                        && let Some(sketch) = self.syn_src_sketch.get_mut(zone)
+                        && sketch.increment(&pkt.src_ip, now_secs, syn_src_threshold)
+                    {
+                        self.syn_flood_src_drops = self.syn_flood_src_drops.wrapping_add(1);
                         return ScreenVerdict::Drop("syn-flood");
                     }
                 }

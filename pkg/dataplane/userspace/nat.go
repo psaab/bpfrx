@@ -50,10 +50,15 @@ func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 // (duplicates contribute no extra table entry, ordering is irrelevant) — so no
 // re-dedup or family-split is needed here.
 //
-// The recursive case — an address-SET whose member is feed-backed — remains the
-// known #3294 gap (the static expander does not pull feed prefixes for nested
-// set members). A DIRECT `match ...-address-name <feed-name>` reference is fully
-// resolved here, which is the #3303 NAT-side gap.
+// The recursive case — an address-SET whose member is feed-backed — is NOT
+// resolved here (the static resolveUserspaceAddressBookEntry expander poisons
+// the whole set on an unresolvable feed member and never consults the overlay).
+// #3294 closed this for the SECURITY-POLICY path (the feed-aware
+// expandBookNameRecursive now merges nested feed members into the policy
+// address-book row), but the NAT path was deliberately left out of #3294 scope
+// (the converged plan, constraint 5 / open-question 4) and remains a tracked
+// residual. A DIRECT `match ...-address-name <feed-name>` reference is fully
+// resolved here, which was the #3303 NAT-side gap.
 func resolveNATAddressNamePrefixes(cfg *config.Config, feedOverlay map[string][]string, name string) []string {
 	var out []string
 	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok {

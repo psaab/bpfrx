@@ -614,6 +614,17 @@ type AddressSet struct {
 type ApplicationsConfig struct {
 	Applications    map[string]*Application
 	ApplicationSets map[string]*ApplicationSet
+	// MixedDirectTermApps records the names of user-defined applications that
+	// carried BOTH a direct match body (protocol / destination-port /
+	// source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg)
+	// AND one or more `term` sub-blocks. Junos requires a custom application to
+	// be EITHER scalar/direct OR term-based, never both. compileApplications
+	// stores only the synthesized term applications for a term-bearing app, so
+	// the direct body was SILENTLY DROPPED (a fail-open under-match for a deny
+	// application). The offending parent names are recorded here and the deferred
+	// gate (validateApplicationStructureStrict) hard-rejects them on the strict
+	// commit path / warns on the tolerant load / peer-sync path (#3366).
+	MixedDirectTermApps []string
 }
 
 // ApplicationSet groups multiple applications or nested application-sets.
@@ -674,6 +685,22 @@ type Application struct {
 	// on the strict commit path / warns on the tolerant load / peer-sync path
 	// (#3352).
 	UnknownTermLeaves []string
+	// DuplicateTermLeaves records the names of single-valued (scalar) leaves
+	// (destination-port / source-port / inactivity-timeout / timeout / alg) that
+	// appeared MORE THAN ONCE with a CONFLICTING (different) value inside one
+	// inline `application <a> term <t>`. The inline term is opaque to the
+	// SchemaValidate walk, so a repeated scalar leaf — via apply-groups, flat-set
+	// ordering, or hand authoring — was last-writer-wins: parseApplicationTerms
+	// overwrote the earlier value with no validation, silently narrowing (or
+	// widening) the term to the final token by parse order. An idempotent repeat
+	// (the same value again, e.g. the `timeout` / `inactivity-timeout` aliases
+	// both set to the same number) is harmless and is NOT recorded. `protocol` is
+	// NOT tracked here — a repeated `protocol` is the documented
+	// multi-protocol-term syntax. Mirroring UnknownTermLeaves, the offending leaf
+	// name is recorded and the deferred gate (validateApplicationStructureStrict)
+	// hard-rejects the first one on the strict commit path / warns on the tolerant
+	// load / peer-sync path (#3366).
+	DuplicateTermLeaves []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.
