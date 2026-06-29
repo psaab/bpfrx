@@ -334,7 +334,17 @@ func (c *CLI) dispatchConfig(line string) error {
 	case "rollback":
 		n := 0
 		if len(parts) >= 2 {
-			fmt.Sscanf(parts[1], "%d", &n)
+			// Strict integer parse: a malformed token (e.g. "foo",
+			// "1x") or a negative value must NOT silently fall through
+			// to rollback 0, which discards the candidate (#3447).
+			v, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return fmt.Errorf("rollback: invalid rollback number %q", parts[1])
+			}
+			if v < 0 {
+				return fmt.Errorf("rollback: rollback number must be >= 0, got %d", v)
+			}
+			n = v
 		}
 		if err := c.store.Rollback(n); err != nil {
 			return err

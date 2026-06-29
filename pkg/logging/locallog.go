@@ -23,7 +23,16 @@ type LocalLogWriter struct {
 	// Filtering (same as SyslogClient)
 	MinSeverity int
 	Categories  uint8
-	Format      string // "structured" or "" (standard)
+	Format      string // "binary" / "structured" / "sd-syslog" / "" (standard)
+
+	// Facility is the syslog facility code used to compute the <PRI> value for
+	// the RFC 5424 envelope when Format == "sd-syslog" (#3409). Defaults to
+	// FacilityLocal0 in NewLocalLogWriter, matching SyslogClient. Ignored for
+	// the standard / structured / binary paths.
+	Facility int
+	// hostname is captured at construction (os.Hostname, "xpf" fallback) for
+	// the RFC 5424 HOSTNAME field, matching SyslogClient.
+	hostname string
 
 	// Failure observability (#3478). droppedWrites counts security-log lines
 	// lost because the file write failed or the file handle is nil (closed, or
@@ -99,11 +108,17 @@ func NewLocalLogWriter(cfg LocalLogConfig) (*LocalLogWriter, error) {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
 
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "xpf"
+	}
 	lw := &LocalLogWriter{
 		file:     f,
 		path:     path,
 		maxSize:  maxSize,
 		maxFiles: maxFiles,
+		Facility: FacilityLocal0,
+		hostname: hostname,
 	}
 	if info, err := f.Stat(); err == nil {
 		lw.written = info.Size()
@@ -114,8 +129,23 @@ func NewLocalLogWriter(cfg LocalLogConfig) (*LocalLogWriter, error) {
 // Send writes a log message to the local file. It matches the SyslogClient.Send
 // signature pattern so it can be used as a drop-in replacement.
 func (lw *LocalLogWriter) Send(severity int, msg string) error {
-	ts := time.Now().Format("2006-01-02T15:04:05.000")
-	line := fmt.Sprintf("%s [%s] %s\n", ts, severityTag(severity), msg)
+	var line string
+	if lw.Format == "sd-syslog" {
+		// RFC 5424 envelope, byte-for-byte identical to SyslogClient.Send's
+		// sd-syslog framing apart from the absence of transport octet-counting
+		// (#3409): <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID SD MSG.
+		// The structured-data and msgid fields are NILVALUE ("-"), matching the
+		// stream path. msg is the standard RT_FLOW body (formatSyslogMsg).
+		priority := lw.Facility*8 + severity
+		ts := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
+		line = fmt.Sprintf("<%d>1 %s %s xpf - - - %s\n", priority, ts, lw.hostname, msg)
+	} else {
+		// Standard ("" / syslog) and structured (Junos RT_FLOW) bodies share the
+		// local-file timestamp+severity-tag prefix; only the msg body differs
+		// (chosen by the ringbuf fanout per Format).
+		ts := time.Now().Format("2006-01-02T15:04:05.000")
+		line = fmt.Sprintf("%s [%s] %s\n", ts, severityTag(severity), msg)
+	}
 
 	lw.mu.Lock()
 	defer lw.mu.Unlock()

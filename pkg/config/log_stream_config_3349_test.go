@@ -141,30 +141,18 @@ func TestLogStream3349_Port_NestedHostReject(t *testing.T) {
 }
 
 // TestLogStream3349_EventModeFormat covers the cross-field event-mode format
-// compatibility gate (validateLogEventModeFormatStrict). The top-level format
-// schema-validates to a known format in any mode, but the event-mode
-// LocalLogWriter only honors binary / standard text — structured / sd-syslog
-// silently fall back to text, the exact silent no-op #3349 closes.
+// compatibility gate (validateLogEventModeFormatStrict). #3409 implemented
+// structured (Junos RT_FLOW) and sd-syslog (RFC 5424) output in the event-mode
+// LocalLogWriter fanout, so all four schema formats are now honored in event
+// mode and must compile clean — no value silently falls back (the #3349
+// contract holds without a hard reject because nothing no-ops any more).
 func TestLogStream3349_EventModeFormat(t *testing.T) {
-	reject := map[string][]string{
-		"event-structured": {"set security log mode event", "set security log format structured"},
-		"event-sd-syslog":  {"set security log mode event", "set security log format sd-syslog"},
-	}
-	for name, cmds := range reject {
-		t.Run("reject/"+name, func(t *testing.T) {
-			_, err := config.CompileConfig(buildTree3349(t, cmds...))
-			if err == nil {
-				t.Fatalf("expected strict compile rejection for %v, got nil", cmds)
-			}
-			if !strings.Contains(err.Error(), "event mode") {
-				t.Fatalf("error should explain event-mode incompatibility, got %v", err)
-			}
-		})
-	}
 	accept := map[string][]string{
 		"event-binary":       {"set security log mode event", "set security log format binary"},
 		"event-syslog":       {"set security log mode event", "set security log format syslog"},
 		"event-no-format":    {"set security log mode event"},
+		"event-structured":   {"set security log mode event", "set security log format structured"},
+		"event-sd-syslog":    {"set security log mode event", "set security log format sd-syslog"},
 		"stream-structured":  {"set security log mode stream", "set security log format structured"},
 		"stream-sd-syslog":   {"set security log mode stream", "set security log format sd-syslog"},
 		"default-structured": {"set security log format structured"}, // no mode => stream default
@@ -175,31 +163,6 @@ func TestLogStream3349_EventModeFormat(t *testing.T) {
 				t.Fatalf("expected %v to compile, got %v", cmds, err)
 			}
 		})
-	}
-}
-
-// TestLogStream3349_EventModeFormat_LenientWarns proves the #1960/#3261
-// doctrine for the event-mode format gate: a persisted/peer-synced
-// `mode event; format structured` must NOT brick the load — it is downgraded
-// to a warning and still compiles (the runtime already falls back to text).
-func TestLogStream3349_EventModeFormat_LenientWarns(t *testing.T) {
-	tree := buildTree3349(t,
-		"set security log mode event",
-		"set security log format structured",
-	)
-	cfg, err := config.CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient compile must not fail on event-mode structured, got %v", err)
-	}
-	found := false
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "event-mode format") && strings.Contains(w, "structured") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected a lenient warning about event-mode format, warnings=%v", cfg.Warnings)
 	}
 }
 
