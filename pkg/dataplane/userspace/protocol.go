@@ -141,7 +141,14 @@ type FlowSnapshot struct {
 	TCPSessionTimeout  int  `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
 	UDPSessionTimeout  int  `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
 	ICMPSessionTimeout int  `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
-	GREAcceleration    bool `json:"gre_acceleration,omitempty"`     // extract GRE key into session ports
+	// GREAcceleration carries `security flow gre-performance-acceleration`
+	// (#3360). On vSRX this extracts the GRE key/call-id into the session tuple
+	// so multiple GRE tunnels between the same endpoints map to distinct
+	// sessions. The userspace dataplane keys GRE flows on the 5-tuple only, so
+	// this threads the operator's intent into ForwardingState (mirroring the
+	// PowerModeDisable plumbing) and is read on the Rust side for parity; it does
+	// not currently alter packet handling (there is no GRE-key extraction path).
+	GREAcceleration bool `json:"gre_acceleration,omitempty"`
 	// PowerModeDisable carries `security flow power-mode-disable` (#2008 H14).
 	// On vSRX power-mode is an express datapath; disabling it forces the
 	// regular flow path. The userspace dataplane has a single forwarding path,

@@ -243,6 +243,11 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // #2008 H14: thread `security flow power-mode-disable` into ForwardingState
     // for config truth/parity (single forwarding path; no behavior switch).
     state.power_mode_disable = snapshot.flow.power_mode_disable;
+    // #3360: thread `security flow gre-performance-acceleration` into
+    // ForwardingState for config truth/parity. The userspace dataplane keys GRE
+    // flows on the 5-tuple only (no GRE key/call-id extraction), so this flag is
+    // held for parity and does not currently alter packet handling.
+    state.gre_acceleration = snapshot.flow.gre_acceleration;
     state.session_timeouts = crate::session::SessionTimeouts::from_seconds(
         snapshot.flow.tcp_session_timeout,
         snapshot.flow.udp_session_timeout,

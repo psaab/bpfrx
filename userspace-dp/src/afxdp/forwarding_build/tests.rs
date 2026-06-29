@@ -3757,3 +3757,25 @@ fn build_forwarding_state_carries_power_mode_disable() {
         "ForwardingState.power_mode_disable must equal snapshot.flow.power_mode_disable"
     );
 }
+
+// #3360: pin the snapshot -> runtime read of `gre_acceleration` in
+// forwarding_build/mod.rs (`state.gre_acceleration =
+// snapshot.flow.gre_acceleration`). MUTATION-VERIFY: dropping that assignment
+// (leaving the ForwardingState default of false) must fail this test. Before
+// #3360 the field was deserialized and shown in `show security flow` but never
+// assigned into runtime state — a silent config-truth gap.
+#[test]
+fn build_forwarding_state_carries_gre_acceleration() {
+    let snapshot = ConfigSnapshot {
+        flow: crate::FlowSnapshot {
+            gre_acceleration: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.gre_acceleration,
+        "ForwardingState.gre_acceleration must equal snapshot.flow.gre_acceleration"
+    );
+}
