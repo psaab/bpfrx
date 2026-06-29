@@ -24,6 +24,19 @@ the userspace dataplane admission boundary is in
 - **Firewall filters**: policer (token bucket + three-color), lo0 filter,
   flexible match, port ranges, hit counters, logging, forwarding-class
   DSCP rewrite.
+  - **No-match default is implicit ACCEPT (deliberate divergence from
+    Junos, #3295).** A packet matching no term in a stateless firewall
+    filter (interface input/output and lo0) is ACCEPTED, whereas Junos
+    stateless filters carry an implicit final discard. xpf keeps
+    implicit-accept on purpose: flipping the no-match default to discard
+    would blackhole the classify-and-pass OUTPUT-filter idiom (the CoS
+    `bandwidth-output` allowlist on `reth0 unit 80 ... filter output`),
+    violating the "keep GOOD" doctrine (#2124/#3261). For Junos-style
+    deny-by-default, append an explicit final `term <last> { then
+    discard; }`. A commit WARNING is emitted for any filter attached to
+    an interface/lo0 hook that has no terminal catch-all term. See
+    `userspace-dp/src/filter/README.md` and
+    `docs/research/3295-filter-failopen/plan.md`.
 
 ## Flow processing
 
