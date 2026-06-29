@@ -259,20 +259,43 @@ type SessionSummary struct {
 	DNATSessions int `json:"dnat_sessions"`
 }
 
-// EventEntry holds a single event record.
+// EventEntry holds a single event record. The forensic fields below the
+// core 5-tuple mirror the gRPC EventEntry (proto/xpf/v1/xpf.proto) and the
+// RT_FLOW record the CLI prints (#3337), so REST/SSE consumers can reproduce
+// the full close record. They are omitempty: an event that does not carry a
+// field (a non-close event, an unNAT'd flow, a screen drop) omits it.
 type EventEntry struct {
-	Time         string `json:"time"`
-	Type         string `json:"type"`
-	SrcAddr      string `json:"src_addr"`
-	DstAddr      string `json:"dst_addr"`
-	Protocol     string `json:"protocol"`
-	Action       string `json:"action"`
-	PolicyID     uint32 `json:"policy_id"`
-	InZone       uint16 `json:"ingress_zone"`
-	OutZone      uint16 `json:"egress_zone"`
-	ScreenCheck  string `json:"screen_check,omitempty"`
-	SessionPkts  uint64 `json:"session_packets,omitempty"`
-	SessionBytes uint64 `json:"session_bytes,omitempty"`
+	Time            string `json:"time"`
+	Type            string `json:"type"`
+	SrcAddr         string `json:"src_addr"`
+	DstAddr         string `json:"dst_addr"`
+	Protocol        string `json:"protocol"`
+	Action          string `json:"action"`
+	PolicyID        uint32 `json:"policy_id"`
+	InZone          uint16 `json:"ingress_zone"`
+	OutZone         uint16 `json:"egress_zone"`
+	InZoneName      string `json:"ingress_zone_name,omitempty"`
+	OutZoneName     string `json:"egress_zone_name,omitempty"`
+	ScreenCheck     string `json:"screen_check,omitempty"`
+	SessionPkts     uint64 `json:"session_packets,omitempty"`
+	SessionBytes    uint64 `json:"session_bytes,omitempty"`
+	RevSessionPkts  uint64 `json:"rev_session_pkts,omitempty"`
+	RevSessionBytes uint64 `json:"rev_session_bytes,omitempty"`
+	PolicyName      string `json:"policy_name,omitempty"`
+	AppName         string `json:"app_name,omitempty"`
+	IngressIface    string `json:"ingress_iface,omitempty"`
+	CloseReason     string `json:"close_reason,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	NATSrcAddr      string `json:"nat_src_addr,omitempty"`
+	NATDstAddr      string `json:"nat_dst_addr,omitempty"`
+	SessionID       uint64 `json:"session_id,omitempty"`
+	ElapsedTime     uint32 `json:"elapsed_time,omitempty"`
+	Created         uint32 `json:"created,omitempty"`
+	CreatedNanos    uint32 `json:"created_nanos,omitempty"`
+	EgressIfindex   uint32 `json:"egress_ifindex,omitempty"`
+	IngressIfindex  uint32 `json:"ingress_ifindex,omitempty"`
+	TOS             uint8  `json:"tos,omitempty"`
+	TCPControlBits  uint8  `json:"tcp_control_bits,omitempty"`
 }
 
 // NATSourceInfo holds source NAT configuration.

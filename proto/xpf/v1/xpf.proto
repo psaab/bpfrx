@@ -464,6 +464,22 @@ message EventEntry {
   string app_name = 18;
   string ingress_iface = 19;
   string close_reason = 20;
+  // #3337 additive forensic fields. These carry the remaining RT_FLOW
+  // record values the CLI prints (cli_show_security_log.go) so a SIEM
+  // consuming GetEvents can reproduce the full close record. All are
+  // additive (new field numbers, no renumber). 0 / "" means the event
+  // did not carry the field (e.g. a non-close event, or no NAT applied).
+  string nat_src_addr = 21;     // post-NAT source "ip:port" ("" = no NAT)
+  string nat_dst_addr = 22;     // post-NAT destination "ip:port"
+  uint64 session_id = 23;       // unique session identifier
+  uint32 elapsed_time = 24;     // seconds since session creation (CLOSE)
+  uint32 created = 25;          // absolute session-creation Unix seconds (CLOSE)
+  uint32 created_nanos = 26;    // sub-second nanosecond remainder of created
+  uint32 egress_ifindex = 27;   // SNMP ifIndex of the resolved output interface
+  uint32 ingress_ifindex = 28;  // SNMP ifIndex of the ingress interface
+  uint32 tos = 29;              // IP ToS byte observed on the forward direction
+  uint32 tcp_control_bits = 30; // OR of every TCP flag byte seen over the flow
+  string reason = 31;           // policy/screen reason (deny/drop events)
 }
 
 message GetInterfacesRequest {}

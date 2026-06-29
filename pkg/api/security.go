@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -373,20 +372,7 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	result := make([]EventEntry, len(events))
 	for i, ev := range events {
-		result[i] = EventEntry{
-			Time:         ev.Time.Format(time.RFC3339),
-			Type:         ev.Type,
-			SrcAddr:      ev.SrcAddr,
-			DstAddr:      ev.DstAddr,
-			Protocol:     ev.Protocol,
-			Action:       ev.Action,
-			PolicyID:     ev.PolicyID,
-			InZone:       ev.InZone,
-			OutZone:      ev.OutZone,
-			ScreenCheck:  ev.ScreenCheck,
-			SessionPkts:  ev.SessionPkts,
-			SessionBytes: ev.SessionBytes,
-		}
+		result[i] = eventEntryFromRecord(ev)
 	}
 	writeOK(w, result)
 }

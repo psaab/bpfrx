@@ -81,7 +81,7 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 	resp := &pb.GetEventsResponse{}
 	for _, ev := range events {
 		resp.Events = append(resp.Events, &pb.EventEntry{
-			Time:            ev.Time.Format(time.RFC3339),
+			Time:            ev.Time.Format(time.RFC3339Nano),
 			Type:            ev.Type,
 			SrcAddr:         ev.SrcAddr,
 			DstAddr:         ev.DstAddr,
@@ -101,6 +101,17 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 			AppName:         ev.AppName,
 			IngressIface:    ev.IngressIface,
 			CloseReason:     ev.CloseReason,
+			NatSrcAddr:      ev.NATSrcAddr,
+			NatDstAddr:      ev.NATDstAddr,
+			SessionId:       ev.SessionID,
+			ElapsedTime:     ev.ElapsedTime,
+			Created:         ev.Created,
+			CreatedNanos:    ev.CreatedNanos,
+			EgressIfindex:   ev.EgressIfindex,
+			IngressIfindex:  ev.IngressIfindex,
+			Tos:             uint32(ev.TOS),
+			TcpControlBits:  uint32(ev.TCPControlBits),
+			Reason:          ev.Reason,
 		})
 	}
 	return resp, nil
