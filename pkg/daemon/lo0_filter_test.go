@@ -9,6 +9,26 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// nftRule renders a term to its single nft rule line, asserting the term lowers
+// to exactly one rule (the common accept / discard / fall-through-skip case) or
+// zero (returns ""). Multi-rule terms — a faithful `reject` (TCP RST + ICMP
+// admin-prohibited) and modifier-only fall-through terms (#3445) — are exercised
+// against nftRulesFromTerm directly. The single-rule assertion also guards
+// against an accidental extra rule slipping into a verdict term.
+func nftRule(t *testing.T, term *config.FirewallFilterTerm, family string, prefixLists map[string]*config.PrefixList) string {
+	t.Helper()
+	rules := nftRulesFromTerm(term, family, prefixLists)
+	switch len(rules) {
+	case 0:
+		return ""
+	case 1:
+		return rules[0]
+	default:
+		t.Fatalf("term %q lowered to %d rules, want <=1: %v", term.Name, len(rules), rules)
+		return ""
+	}
+}
+
 // lo0FilterTestConfig returns a config with a representative lo0 input filter
 // bound for both families, exercising the same buildLo0FilterPayload path that
 // applyLo0Filter uses at commit time.
@@ -54,12 +74,15 @@ func lo0FilterTestConfig() *config.Config {
 	return cfg
 }
 
-// TestLo0FilterPayloadFlushIdiom guards the #2069 fix: the nft `-f -` payload
-// must NOT use the invalid `flush ruleset <table>` form (a parse error that
-// rejected the whole ruleset and made the lo0 filter fail OPEN), and must use
-// the atomic create-if-absent + `flush table` idiom so the prior table is
-// reset before the new rules are installed. This test FAILS against the
-// pre-fix payload that began `flush ruleset inet xpf_lo0`.
+// TestLo0FilterPayloadFlushIdiom guards the #2069 fix and the #3445 idiom switch:
+// the nft `-f -` payload must NOT use the invalid `flush ruleset <table>` form (a
+// parse error that rejected the whole ruleset and made the lo0 filter fail OPEN),
+// and must use the atomic add+delete+recreate idiom (`add table; delete table;
+// table { ... }`). The pre-#3445 `flush table` idiom is gone because flush does
+// not delete named counter objects (#3445 attaches a named counter per `then
+// count`), so the delete+recreate idiom is required to redeclare them without a
+// "File exists" collision. This test FAILS against the pre-fix payload that began
+// `flush ruleset inet xpf_lo0`.
 func TestLo0FilterPayloadFlushIdiom(t *testing.T) {
 	cfg := lo0FilterTestConfig()
 	payload := buildLo0FilterPayload(cfg, cfg.System.Lo0FilterInputV4, cfg.System.Lo0FilterInputV6)
@@ -69,10 +92,10 @@ func TestLo0FilterPayloadFlushIdiom(t *testing.T) {
 		t.Errorf("payload uses invalid `flush ruleset` idiom (#2069 regression); a table name after `flush ruleset` is an nft parse error that rejects the entire payload:\n%s", payload)
 	}
 
-	// The correct atomic reset idiom must be present, in order.
+	// The atomic delete+recreate idiom must be present, in order.
 	wantLines := []string{
-		"table inet xpf_lo0",
-		"flush table inet xpf_lo0",
+		"add table inet xpf_lo0",
+		"delete table inet xpf_lo0",
 		"table inet xpf_lo0 {",
 	}
 	idx := 0
@@ -82,11 +105,15 @@ func TestLo0FilterPayloadFlushIdiom(t *testing.T) {
 		}
 	}
 	if idx != len(wantLines) {
-		t.Errorf("payload missing the create-if-absent + `flush table` idiom (got to line %d/%d):\n%s", idx, len(wantLines), payload)
+		t.Errorf("payload missing the add+delete+recreate idiom (got to line %d/%d):\n%s", idx, len(wantLines), payload)
+	}
+	// `add` must precede `delete` so the delete always has a target.
+	if strings.Index(payload, "add table") > strings.Index(payload, "delete table") {
+		t.Errorf("add must precede delete in the lo0 payload:\n%s", payload)
 	}
 
-	// The real filter rules must still be present (proves the flush idiom did
-	// not displace the rule body).
+	// The real filter rules must still be present (proves the idiom did not
+	// displace the rule body).
 	if !strings.Contains(payload, "th dport 22 accept") {
 		t.Errorf("payload missing the configured v4 allow-ssh rule:\n%s", payload)
 	}
@@ -264,7 +291,7 @@ func TestNftRuleFromTermPrefixListExpansion(t *testing.T) {
 		Action:           "accept",
 	}
 
-	rule := nftRuleFromTerm(term, "ip", prefixLists)
+	rule := nftRule(t, term, "ip", prefixLists)
 	// Should contain expanded CIDRs in nft set syntax
 	want := "ip saddr { 10.0.1.0/24, 10.0.2.0/24, 192.168.1.0/24 } meta l4proto 6 th dport 22 accept"
 	if rule != want {
@@ -290,10 +317,22 @@ func TestNftRuleFromTermPrefixListExcept(t *testing.T) {
 		Action:           "reject",
 	}
 
-	rule := nftRuleFromTerm(term, "ip", prefixLists)
-	want := "ip saddr != { 10.0.1.0/24, 10.0.2.0/24 } meta l4proto 6 th dport 22 reject"
-	if rule != want {
-		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
+	// #3445: a `then reject` now lowers to TWO faithful rules (TCP RST + ICMP
+	// admin-prohibited) mirroring the userspace reject-reply synthesis, so the
+	// except predicate must appear on BOTH.
+	rules := nftRulesFromTerm(term, "ip", prefixLists)
+	match := "ip saddr != { 10.0.1.0/24, 10.0.2.0/24 } meta l4proto 6 th dport 22"
+	want := []string{
+		match + " meta l4proto 6 reject with tcp reset",
+		match + " reject with icmpx type admin-prohibited",
+	}
+	if len(rules) != len(want) {
+		t.Fatalf("reject lowered to %d rules, want %d: %v", len(rules), len(want), rules)
+	}
+	for i := range want {
+		if rules[i] != want[i] {
+			t.Errorf("rule[%d]:\n  got:  %s\n  want: %s", i, rules[i], want[i])
+		}
 	}
 }
 
@@ -305,7 +344,6 @@ func TestNftRuleFromTermRejectVsDiscard(t *testing.T) {
 		wantAction string
 	}{
 		{"accept", "accept"},
-		{"reject", "reject"},
 		{"discard", "drop"},
 		// #3427: an empty action is a Junos fall-through (modifier-only term),
 		// NOT a terminating accept. The kernel mirror must skip it (emit "") so
@@ -319,9 +357,26 @@ func TestNftRuleFromTermRejectVsDiscard(t *testing.T) {
 			Name:   "test",
 			Action: tt.action,
 		}
-		rule := nftRuleFromTerm(term, "ip", prefixLists)
+		rule := nftRule(t, term, "ip", prefixLists)
 		if rule != tt.wantAction {
 			t.Errorf("action %q: got %q, want %q", tt.action, rule, tt.wantAction)
+		}
+	}
+
+	// #3445: `reject` lowers to a faithful TCP-RST + ICMP-admin-prohibited pair,
+	// not the pre-fix bare `reject` (which sent ICMP port-unreachable for ALL
+	// protocols including TCP — a different wire response than userspace).
+	reject := nftRulesFromTerm(&config.FirewallFilterTerm{Name: "test", Action: "reject"}, "ip", prefixLists)
+	wantReject := []string{
+		"meta l4proto 6 reject with tcp reset",
+		"reject with icmpx type admin-prohibited",
+	}
+	if len(reject) != len(wantReject) {
+		t.Fatalf("reject lowered to %d rules, want %d: %v", len(reject), len(wantReject), reject)
+	}
+	for i := range wantReject {
+		if reject[i] != wantReject[i] {
+			t.Errorf("reject rule[%d]: got %q, want %q", i, reject[i], wantReject[i])
 		}
 	}
 }
@@ -336,7 +391,7 @@ func TestNftRuleFromTermMultiplePorts(t *testing.T) {
 		Action:           "accept",
 	}
 
-	rule := nftRuleFromTerm(term, "ip", prefixLists)
+	rule := nftRule(t, term, "ip", prefixLists)
 	want := "meta l4proto 6 th dport { 80, 443 } accept"
 	if rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
@@ -352,7 +407,7 @@ func TestNftRuleFromTermSingleSourceAddr(t *testing.T) {
 		SourceAddresses: []string{"10.0.1.0/24"},
 		Action:          "accept",
 	}
-	if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != "ip saddr 10.0.1.0/24 accept" {
+	if rule := nftRule(t, term, "ip", prefixLists); rule != "ip saddr 10.0.1.0/24 accept" {
 		t.Errorf("v4 literal in ip chain: got %q, want %q", rule, "ip saddr 10.0.1.0/24 accept")
 	}
 }
@@ -373,7 +428,7 @@ func TestNftRuleFromTermWrongFamilyMatchesNothing(t *testing.T) {
 		SourceAddresses: []string{"10.0.1.0/24"},
 		Action:          "accept",
 	}
-	if rule := nftRuleFromTerm(term, "ip6", prefixLists); rule != "" {
+	if rule := nftRule(t, term, "ip6", prefixLists); rule != "" {
 		t.Errorf("wrong-family v4 literal in ip6 chain: got %q, want \"\" (match-nothing, #3433 H02)", rule)
 	}
 
@@ -383,7 +438,7 @@ func TestNftRuleFromTermWrongFamilyMatchesNothing(t *testing.T) {
 		SourceAddresses: []string{"2001:db8::/32"},
 		Action:          "discard",
 	}
-	if rule := nftRuleFromTerm(term6, "ip", prefixLists); rule != "" {
+	if rule := nftRule(t, term6, "ip", prefixLists); rule != "" {
 		t.Errorf("wrong-family v6 literal in ip chain: got %q, want \"\" (match-nothing, #3433 H02)", rule)
 	}
 }
@@ -494,7 +549,7 @@ func TestNftRuleFromTermAddressSemantics3433(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := nftRuleFromTerm(tt.term, tt.fam, pls)
+			got := nftRule(t, tt.term, tt.fam, pls)
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -512,7 +567,7 @@ func TestNftRuleFromTermICMPTypeCode(t *testing.T) {
 		ICMPCodes: []int{0},
 		Action:    "discard",
 	}
-	rule := nftRuleFromTerm(term, "ip6", prefixLists)
+	rule := nftRule(t, term, "ip6", prefixLists)
 	want := "icmpv6 type 134 icmpv6 code 0 drop"
 	if rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
@@ -524,7 +579,7 @@ func TestNftRuleFromTermICMPTypeCode(t *testing.T) {
 		ICMPTypes: []int{5},
 		Action:    "discard",
 	}
-	rule2 := nftRuleFromTerm(term2, "ip", prefixLists)
+	rule2 := nftRule(t, term2, "ip", prefixLists)
 	want2 := "icmp type 5 drop"
 	if rule2 != want2 {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule2, want2)
@@ -551,7 +606,7 @@ func TestNftRuleFromTermICMPCodeOnly(t *testing.T) {
 		ICMPCodes: []int{4},
 		Action:    "discard",
 	}
-	ruleV4 := nftRuleFromTerm(v4, "ip", prefixLists)
+	ruleV4 := nftRule(t, v4, "ip", prefixLists)
 	wantV4 := "meta l4proto 1 icmp code 4 drop"
 	if ruleV4 != wantV4 {
 		t.Errorf("v4 code-only:\n  got:  %s\n  want: %s", ruleV4, wantV4)
@@ -567,7 +622,7 @@ func TestNftRuleFromTermICMPCodeOnly(t *testing.T) {
 		ICMPCodes: []int{1},
 		Action:    "discard",
 	}
-	ruleV6 := nftRuleFromTerm(v6, "ip6", prefixLists)
+	ruleV6 := nftRule(t, v6, "ip6", prefixLists)
 	wantV6 := "meta l4proto 58 icmpv6 code 1 drop"
 	if ruleV6 != wantV6 {
 		t.Errorf("v6 code-only:\n  got:  %s\n  want: %s", ruleV6, wantV6)
@@ -582,7 +637,7 @@ func TestNftRuleFromTermICMPCodeOnly(t *testing.T) {
 		ICMPCodes: []int{0, 4},
 		Action:    "discard",
 	}
-	ruleMulti := nftRuleFromTerm(multi, "ip", prefixLists)
+	ruleMulti := nftRule(t, multi, "ip", prefixLists)
 	wantMulti := "icmp code { 0, 4 } drop"
 	if ruleMulti != wantMulti {
 		t.Errorf("multi code-only:\n  got:  %s\n  want: %s", ruleMulti, wantMulti)
@@ -597,7 +652,7 @@ func TestNftRuleFromTermDSCP(t *testing.T) {
 		DSCPs:  []string{"ef"},
 		Action: "accept",
 	}
-	rule := nftRuleFromTerm(term, "ip", prefixLists)
+	rule := nftRule(t, term, "ip", prefixLists)
 	// #3436: the DSCP name resolves to its numeric value (ef == 46). nft's DSCP
 	// names are lowercase only and do not cover every xpf code point (e.g. `be`),
 	// so emitting the numeric value is unconditionally nft-safe.
@@ -607,7 +662,7 @@ func TestNftRuleFromTermDSCP(t *testing.T) {
 	}
 
 	// IPv6 traffic-class
-	rule6 := nftRuleFromTerm(term, "ip6", prefixLists)
+	rule6 := nftRule(t, term, "ip6", prefixLists)
 	want6 := "ip6 dscp 46 accept"
 	if rule6 != want6 {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule6, want6)
@@ -643,7 +698,7 @@ func TestNftRuleFromTermProtocolAliases(t *testing.T) {
 				Name: "p", Protocols: []string{c.proto}, Action: "accept",
 			}
 			want := c.want + " accept"
-			if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != want {
+			if rule := nftRule(t, term, "ip", prefixLists); rule != want {
 				t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 			}
 		})
@@ -660,7 +715,7 @@ func TestNftRuleFromTermProtocolMultiAliasSet(t *testing.T) {
 		Name: "p", Protocols: []string{"junos-gre", "tcp", "50"}, Action: "accept",
 	}
 	want := "meta l4proto { 47, 6, 50 } accept"
-	if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != want {
+	if rule := nftRule(t, term, "ip", prefixLists); rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 	}
 }
@@ -689,7 +744,7 @@ func TestNftRuleFromTermDSCPNamesAndCase(t *testing.T) {
 				Name: "d", DSCPs: []string{c.dscp}, Action: "accept",
 			}
 			want := c.want + " accept"
-			if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != want {
+			if rule := nftRule(t, term, "ip", prefixLists); rule != want {
 				t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 			}
 		})
@@ -700,7 +755,7 @@ func TestNftRuleFromTermDSCPNamesAndCase(t *testing.T) {
 		Name: "d", DSCPs: []string{"EF", "af21", "0"}, Action: "accept",
 	}
 	want := "ip dscp { 46, 18, 0 } accept"
-	if rule := nftRuleFromTerm(multi, "ip", prefixLists); rule != want {
+	if rule := nftRule(t, multi, "ip", prefixLists); rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 	}
 }
@@ -748,7 +803,7 @@ func TestNftRuleFromTermTCPFlags(t *testing.T) {
 				TCPFlags:  c.flags,
 				Action:    "discard",
 			}
-			rule := nftRuleFromTerm(term, "ip", prefixLists)
+			rule := nftRule(t, term, "ip", prefixLists)
 			if rule != c.want {
 				t.Errorf("flags %v\n got:  %s\n want: %s", c.flags, rule, c.want)
 			}
@@ -774,7 +829,7 @@ func TestNftRuleFromTermPortExcept(t *testing.T) {
 		DestPortsExcept: []string{"22"},
 		Action:          "accept",
 	}
-	rule := nftRuleFromTerm(term, "ip", prefixLists)
+	rule := nftRule(t, term, "ip", prefixLists)
 	want := "meta l4proto 6 th dport != 22 accept"
 	if rule != want {
 		t.Errorf("dest-port-except single:\n got:  %s\n want: %s", rule, want)
@@ -787,7 +842,7 @@ func TestNftRuleFromTermPortExcept(t *testing.T) {
 		DestPortsExcept: []string{"80", "443"},
 		Action:          "accept",
 	}
-	rule2 := nftRuleFromTerm(term2, "ip", prefixLists)
+	rule2 := nftRule(t, term2, "ip", prefixLists)
 	want2 := "meta l4proto 6 th dport != { 80, 443 } accept"
 	if rule2 != want2 {
 		t.Errorf("dest-port-except multi:\n got:  %s\n want: %s", rule2, want2)
@@ -800,7 +855,7 @@ func TestNftRuleFromTermPortExcept(t *testing.T) {
 		SourcePortsExcept: []string{"123"},
 		Action:            "discard",
 	}
-	rule3 := nftRuleFromTerm(term3, "ip", prefixLists)
+	rule3 := nftRule(t, term3, "ip", prefixLists)
 	want3 := "meta l4proto 17 th sport != 123 drop"
 	if rule3 != want3 {
 		t.Errorf("source-port-except:\n got:  %s\n want: %s", rule3, want3)
@@ -821,13 +876,13 @@ func TestNftRuleFromTermFragment(t *testing.T) {
 		Action:     "discard",
 	}
 
-	rule := nftRuleFromTerm(term, "ip", prefixLists)
+	rule := nftRule(t, term, "ip", prefixLists)
 	want := "ip frag-off & 0x1fff != 0 drop"
 	if rule != want {
 		t.Errorf("ip4 fragment:\n got:  %s\n want: %s", rule, want)
 	}
 
-	rule6 := nftRuleFromTerm(term, "ip6", prefixLists)
+	rule6 := nftRule(t, term, "ip6", prefixLists)
 	want6 := "exthdr frag exists drop"
 	if rule6 != want6 {
 		t.Errorf("ip6 fragment:\n got:  %s\n want: %s", rule6, want6)
@@ -842,13 +897,18 @@ func TestNftRuleFromTermFragment(t *testing.T) {
 // NOT emit a terminating kernel verdict that shadows later discard/reject terms.
 // The kernel lo0 chain is the PRIMARY enforcement for host-bound traffic (the
 // XDP shim shunts it to the kernel before userspace), so a bare `accept` here is
-// a real control-plane fail-open. Each case asserts the term emits no rule and,
-// critically, no `accept`. RED before the fix (Action=="" returned "accept";
-// NextTerm was ignored entirely so it also returned "accept").
+// a real control-plane fail-open. A fall-through term WITHOUT a honored modifier
+// emits no rule; a fall-through term carrying `then log`/`then count` (#3445)
+// emits a NON-TERMINATING rule (the modifier statements, no verdict) so the
+// per-term log/count fires while later terms stay reachable. Every case asserts
+// no terminating verdict (no accept / drop / reject) is emitted. RED before the
+// #3427 fix (Action=="" returned "accept"; NextTerm was ignored so it also
+// returned "accept").
 func TestNftRuleFromTermFallThroughNoBareAccept(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 
-	cases := []struct {
+	// Pure fall-through (no honored modifier): emits NO rule.
+	noRule := []struct {
 		name string
 		term *config.FirewallFilterTerm
 	}{
@@ -862,16 +922,6 @@ func TestNftRuleFromTermFallThroughNoBareAccept(t *testing.T) {
 			},
 		},
 		{
-			// H07: modifier-only term (count, no terminating action), scoped by
-			// a match. Action stays "" — the compiler leaves it empty.
-			name: "modifier-only-count",
-			term: &config.FirewallFilterTerm{
-				Name:      "t1",
-				Protocols: []string{"tcp"},
-				Count:     "tcp-seen",
-			},
-		},
-		{
 			// Bare `then next term` with no match — matches everything, falls
 			// through. Must not become an accept-all.
 			name: "next-term-no-match",
@@ -880,16 +930,50 @@ func TestNftRuleFromTermFallThroughNoBareAccept(t *testing.T) {
 				NextTerm: true,
 			},
 		},
+		{
+			// Modifier-only term whose only modifier is unrepresentable on the
+			// kernel mirror (forwarding-class) — nothing is honored, so no rule and
+			// (commit-time) a warning. Must not shadow later terms.
+			name: "modifier-only-unhonored",
+			term: &config.FirewallFilterTerm{
+				Name:            "t1",
+				Protocols:       []string{"tcp"},
+				ForwardingClass: "expedited-forwarding",
+			},
+		},
+	}
+	for _, c := range noRule {
+		for _, fam := range []string{"ip", "ip6"} {
+			rules := nftRulesFromTerm(c.term, fam, prefixLists)
+			if len(rules) != 0 {
+				t.Errorf("%s (%s): fall-through term emitted %v, want no rule", c.name, fam, rules)
+			}
+		}
 	}
 
-	for _, c := range cases {
-		for _, fam := range []string{"ip", "ip6"} {
-			rule := nftRuleFromTerm(c.term, fam, prefixLists)
-			if rule != "" {
-				t.Errorf("%s (%s): fall-through term emitted a rule %q, want \"\" (no terminating verdict)", c.name, fam, rule)
-			}
-			if strings.Contains(rule, "accept") {
-				t.Errorf("%s (%s): fall-through term emitted a terminating accept (fail-open #3427): %q", c.name, fam, rule)
+	// H07 / #3445: a modifier-only term carrying a HONORED modifier (count, log)
+	// emits a single NON-TERMINATING rule (the modifier statements, no verdict),
+	// so later discard/reject terms remain reachable.
+	for _, fam := range []string{"ip", "ip6"} {
+		term := &config.FirewallFilterTerm{
+			Name:      "t1",
+			Protocols: []string{"tcp"},
+			Count:     "tcp-seen",
+			Log:       true,
+		}
+		rules := nftRulesFromTerm(term, fam, prefixLists)
+		if len(rules) != 1 {
+			t.Fatalf("modifier-only-count+log (%s): got %d rules, want 1: %v", fam, len(rules), rules)
+		}
+		got := rules[0]
+		want := `meta l4proto 6 log prefix "xpf-lo0 t1: " counter name "xpflo0_tcp-seen"`
+		if got != want {
+			t.Errorf("modifier-only-count+log (%s):\n  got:  %s\n  want: %s", fam, got, want)
+		}
+		// Critically: no terminating verdict, so the term cannot shadow later terms.
+		for _, verdict := range []string{"accept", "drop", "reject"} {
+			if strings.Contains(got, verdict) {
+				t.Errorf("modifier-only fall-through (%s) emitted a terminating %q (fail-open #3427): %q", fam, verdict, got)
 			}
 		}
 	}
@@ -924,7 +1008,7 @@ func TestNftRuleFromTermRoutingInstanceTerminatesAccept(t *testing.T) {
 			SourceAddresses: []string{c.addr},
 			RoutingInstance: "mgmt",
 		}
-		rule := nftRuleFromTerm(term, c.fam, prefixLists)
+		rule := nftRule(t, term, c.fam, prefixLists)
 		if rule != c.want {
 			t.Errorf("routing-instance term (%s): got %q, want %q (terminate-as-accept, mirror userspace)", c.fam, rule, c.want)
 		}
@@ -992,5 +1076,108 @@ func TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop(t *testing.T) {
 	dropIdx := strings.Index(payload, "meta l4proto 6 drop")
 	if acceptIdx == -1 || (dropIdx != -1 && dropIdx < acceptIdx) {
 		t.Errorf("routing-instance accept must precede the deny term (first-match-wins) so legit traffic is not over-dropped:\n%s", payload)
+	}
+}
+
+// TestNftRuleFromTermLogMirror is the #3445 M02 RED-on-revert: a term carrying
+// `then log` / `then syslog` (both set term.Log) must emit an nft `log`
+// statement on the kernel lo0 mirror, BEFORE the verdict. The pre-fix action
+// switch never read term.Log, so the configured filter log was silently dropped
+// for host-bound traffic the kernel handles. Reverting the fix drops the `log`
+// fragment and fails this test.
+func TestNftRuleFromTermLogMirror(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	// log on a terminating accept: `<match> log prefix "..." accept`.
+	term := &config.FirewallFilterTerm{
+		Name:             "log-ssh",
+		Protocols:        []string{"tcp"},
+		DestinationPorts: []string{"22"},
+		Log:              true,
+		Action:           "accept",
+	}
+	got := nftRule(t, term, "ip", prefixLists)
+	want := `meta l4proto 6 th dport 22 log prefix "xpf-lo0 log-ssh: " accept`
+	if got != want {
+		t.Errorf("log+accept:\n  got:  %s\n  want: %s", got, want)
+	}
+	if !strings.Contains(got, "log prefix") {
+		t.Errorf("term `then log` did not emit nft `log` (#3445 M02 regression): %q", got)
+	}
+
+	// log on a discard: the log fires before the drop.
+	dterm := &config.FirewallFilterTerm{Name: "log-drop", Log: true, Action: "discard"}
+	dgot := nftRule(t, dterm, "ip", prefixLists)
+	dwant := `log prefix "xpf-lo0 log-drop: " drop`
+	if dgot != dwant {
+		t.Errorf("log+discard:\n  got:  %s\n  want: %s", dgot, dwant)
+	}
+}
+
+// TestNftRuleFromTermCountMirror is the #3445 M03 RED-on-revert: a term carrying
+// `then count <name>` must emit a NAMED nft counter (`counter name "<n>"`) on the
+// rule AND the payload must DECLARE that counter object in the table body (nft
+// requires the declaration before the reference). The pre-fix action switch never
+// read term.Count, so the kernel counter stayed stale while the kernel enforced
+// the verdict. Reverting the fix drops the counter reference and the declaration.
+func TestNftRuleFromTermCountMirror(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	term := &config.FirewallFilterTerm{
+		Name:             "count-ssh",
+		Protocols:        []string{"tcp"},
+		DestinationPorts: []string{"22"},
+		Count:            "ssh-hits",
+		Action:           "accept",
+	}
+	got := nftRule(t, term, "ip", prefixLists)
+	want := `meta l4proto 6 th dport 22 counter name "xpflo0_ssh-hits" accept`
+	if got != want {
+		t.Errorf("count+accept:\n  got:  %s\n  want: %s", got, want)
+	}
+
+	// Payload must declare the named counter object (unquoted) before the chain.
+	cfg := &config.Config{}
+	cfg.System.Lo0FilterInputV4 = "lo0-in"
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"lo0-in": {Name: "lo0-in", Terms: []*config.FirewallFilterTerm{term}},
+	}
+	payload := buildLo0FilterPayload(cfg, "lo0-in", "")
+	if !strings.Contains(payload, "  counter xpflo0_ssh-hits {") {
+		t.Errorf("payload missing the named counter DECLARATION (#3445 M03):\n%s", payload)
+	}
+	if !strings.Contains(payload, `counter name "xpflo0_ssh-hits"`) {
+		t.Errorf("payload missing the named counter REFERENCE (#3445 M03):\n%s", payload)
+	}
+	// The declaration must precede the chain reference.
+	declIdx := strings.Index(payload, "counter xpflo0_ssh-hits {")
+	refIdx := strings.Index(payload, `counter name "xpflo0_ssh-hits"`)
+	if declIdx == -1 || refIdx == -1 || declIdx > refIdx {
+		t.Errorf("counter declaration must precede its reference (nft requirement):\n%s", payload)
+	}
+}
+
+// TestLo0PayloadSharedCounterDeclaredOnce pins that a counter object referenced
+// by several terms (or by both the v4 and v6 lo0 filters, which share the inet
+// table) is DECLARED exactly once — a duplicate declaration is an nft "File
+// exists" hard error that rejects the whole atomic load (#3445).
+func TestLo0PayloadSharedCounterDeclaredOnce(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.System.Lo0FilterInputV4 = "v4"
+	cfg.System.Lo0FilterInputV6 = "v6"
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"v4": {Name: "v4", Terms: []*config.FirewallFilterTerm{
+			{Name: "a", Protocols: []string{"tcp"}, Count: "shared", Action: "accept"},
+			{Name: "b", Protocols: []string{"udp"}, Count: "shared", Action: "discard"},
+		}},
+	}
+	cfg.Firewall.FiltersInet6 = map[string]*config.FirewallFilter{
+		"v6": {Name: "v6", Terms: []*config.FirewallFilterTerm{
+			{Name: "c", Count: "shared", Action: "accept"},
+		}},
+	}
+	payload := buildLo0FilterPayload(cfg, "v4", "v6")
+	if n := strings.Count(payload, "counter xpflo0_shared {"); n != 1 {
+		t.Errorf("shared counter declared %d times, want exactly 1 (duplicate is an nft hard error):\n%s", n, payload)
 	}
 }
