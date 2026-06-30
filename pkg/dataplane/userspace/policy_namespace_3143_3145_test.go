@@ -132,6 +132,71 @@ func Test_3143_CounterE2EThroughCallerHandle(t *testing.T) {
 	}
 }
 
+// TestPolicyCounterResolverCountsNilPolicySetsLikeWalkPolicyRuleSlots pins the
+// #3474 contract: a nil zone-pair slot in cfg.Security.Policies consumes a
+// policy-set ID. walkPolicyRuleSlots and every production counter caller
+// (pkg/api/security.go, pkg/api/metrics_counters.go) advance policySetID for a
+// nil element, so the counter resolver MUST advance its set index in lockstep.
+//
+// Fixture: cfg.Security.Policies = [nil, {lan->wan, ...}]. The real zone-pair
+// set therefore lives at policySetID == 1, which is exactly the handle the
+// callers compute (callerCounterID(1, 0/1)).
+//
+// Fail-on-revert: with the resolver's nil branch skipping WITHOUT incrementing
+// (the bug), it under-counts the set index by one, never matches currentSet==1,
+// falls through to the global branch (empty GlobalPolicies here) and returns ""
+// instead of the lan->wan rule IDs — so both assertions go RED.
+func TestPolicyCounterResolverCountsNilPolicySetsLikeWalkPolicyRuleSlots(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Policies = []*config.ZonePairPolicies{
+		nil, // tolerant/HA-sync path can leave a nil zone-pair slot
+		{
+			FromZone: "lan",
+			ToZone:   "wan",
+			Policies: []*config.Policy{
+				{Name: "allow-web", Action: config.PolicyPermit},
+				{Name: "allow-ssh", Action: config.PolicyPermit},
+			},
+		},
+	}
+
+	// The nil slot is policy set 0; the real zone-pair set is policy set 1. The
+	// callers read its rules with handles callerCounterID(1, 0) and
+	// callerCounterID(1, 1) — the resolver must agree.
+	wantWeb := stablePolicyRuleID("lan", "wan", "allow-web")
+	wantSSH := stablePolicyRuleID("lan", "wan", "allow-ssh")
+	if got := policyRuleIDForCounter(cfg, callerCounterID(1, 0)); got != wantWeb {
+		t.Fatalf("policyRuleIDForCounter(set 1, slice 0) = %q, want %q (a preceding nil slot must still consume a policy-set ID)", got, wantWeb)
+	}
+	if got := policyRuleIDForCounter(cfg, callerCounterID(1, 1)); got != wantSSH {
+		t.Fatalf("policyRuleIDForCounter(set 1, slice 1) = %q, want %q", got, wantSSH)
+	}
+
+	// The resolver must agree with walkPolicyRuleSlots on which (set, slice)
+	// every configured policy maps to. Cross-check that the set index the walker
+	// assigns each non-nil policy resolves back to that policy's own rule ID.
+	if err := walkPolicyRuleSlots(cfg, func(slot policyRuleSlot) error {
+		want := stablePolicyRuleID(slot.FromZone, slot.ToZone, slot.Policy.Name)
+		if got := policyRuleIDForCounter(cfg, callerCounterID(slot.PolicySetID, int(slot.SliceIndex))); got != want {
+			t.Fatalf("resolver/walker disagree at set %d slice %d: resolver=%q, walker=%q", slot.PolicySetID, slot.SliceIndex, got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walkPolicyRuleSlots: %v", err)
+	}
+
+	// Control / no-regression: a config with NO leading nil still resolves both
+	// rules at policy set 0 exactly as before.
+	noNil := &config.Config{}
+	noNil.Security.Policies = []*config.ZonePairPolicies{cfg.Security.Policies[1]}
+	if got := policyRuleIDForCounter(noNil, callerCounterID(0, 0)); got != wantWeb {
+		t.Fatalf("control (no nil): policyRuleIDForCounter(set 0, slice 0) = %q, want %q", got, wantWeb)
+	}
+	if got := policyRuleIDForCounter(noNil, callerCounterID(0, 1)); got != wantSSH {
+		t.Fatalf("control (no nil): policyRuleIDForCounter(set 0, slice 1) = %q, want %q", got, wantSSH)
+	}
+}
+
 // Test_3145_SnapshotPolicyIDIsSpanAccumulated documents the OTHER namespace: the
 // dataplane snapshot's PolicyID is span-accumulated (advances by the app-set
 // expansion count), distinct from the slice-index counter handle above. This is
