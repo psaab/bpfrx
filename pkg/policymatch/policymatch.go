@@ -556,16 +556,27 @@ func zoneKnown(cfg *config.Config, zone string) bool {
 // PolicyID 0; the zone scope + name still disambiguate the verdict.
 func matchedResult(ids map[[2]uint32]uint32, pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) Result {
 	return Result{
-		Matched:      true,
-		Global:       global,
-		FromZone:     fromZone,
-		ToZone:       toZone,
-		PolicyID:     ids[[2]uint32{uint32(setIdx), uint32(sliceIdx)}],
-		PolicyName:   pol.Name,
-		Description:  pol.Description,
-		Action:       pol.Action,
-		SrcAddresses: pol.Match.SourceAddresses,
-		DstAddresses: pol.Match.DestinationAddresses,
+		Matched:     true,
+		Global:      global,
+		FromZone:    fromZone,
+		ToZone:      toZone,
+		PolicyID:    ids[[2]uint32{uint32(setIdx), uint32(sliceIdx)}],
+		PolicyName:  pol.Name,
+		Description: pol.Description,
+		Action:      pol.Action,
+		// #3358: a zone-local address book (#3061) is folded into the global
+		// book under the synthetic key zone-local/<zone>/<name>, and
+		// resolveZoneLocalAddressBooks already rewrote pol.Match.* to those
+		// qualified tokens. Result.Src/DstAddresses are DISPLAY-ONLY — every
+		// re-match path (ruleMatches/matchAddr/classifyPolicyAddresses/nameToID)
+		// reads pol.Match directly, never the Result — so unqualifying the
+		// authored name here (the SSOT for all three match-policies transports:
+		// CLI, gRPC MatchPolicies, REST MatchPoliciesResult) cannot affect
+		// matching. The from/to-zone in the verdict keeps the bare name
+		// unambiguous. DisplayAddressNames returns a NEW slice (never mutates
+		// the compiled config) and preserves nil.
+		SrcAddresses: config.DisplayAddressNames(pol.Match.SourceAddresses),
+		DstAddresses: config.DisplayAddressNames(pol.Match.DestinationAddresses),
 		Applications: pol.Match.Applications,
 	}
 }

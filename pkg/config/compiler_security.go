@@ -259,6 +259,53 @@ func zoneLocalQualify(zone, name string) string {
 	return zoneLocalNamePrefix + zone + "/" + name
 }
 
+// ZoneLocalUnqualify reverses zoneLocalQualify. If qualified is a synthetic
+// zone-local key minted by the #3061 fold ("zone-local/<zone>/<name>"), it
+// returns the authored zone and address-book name with ok=true; any other
+// token returns ok=false. validateAddressBookEntryNamesStrict forbids `/` in
+// every operator-typed zone and address-book name, so the single `/` after the
+// prefix always splits zone from name unambiguously.
+func ZoneLocalUnqualify(qualified string) (zone, name string, ok bool) {
+	rest, found := strings.CutPrefix(qualified, zoneLocalNamePrefix)
+	if !found {
+		return "", "", false
+	}
+	z, n, sep := strings.Cut(rest, "/")
+	if !sep || z == "" || n == "" {
+		return "", "", false
+	}
+	return z, n, true
+}
+
+// DisplayAddressName returns the operator-facing name for an address-book
+// token. A synthetic zone-local key (zone-local/<zone>/<name>) is unqualified
+// back to the authored book name the operator configured; any other token is
+// returned unchanged. Use this on inventory surfaces (REST/gRPC list fields,
+// flat name lists) where the zone is already implied by the policy's
+// from/to-zone, so the internal compiler namespace never leaks to the operator.
+func DisplayAddressName(token string) string {
+	if _, name, ok := ZoneLocalUnqualify(token); ok {
+		return name
+	}
+	return token
+}
+
+// DisplayAddressNames maps DisplayAddressName over a token list, returning a
+// NEW slice (it never mutates the caller's slice, which aliases the live
+// compiled config). nil in → nil out so an inventory surface keeps its
+// nil-vs-empty distinction. When no token needs unqualifying the returned slice
+// is element-equal to the input.
+func DisplayAddressNames(tokens []string) []string {
+	if tokens == nil {
+		return nil
+	}
+	out := make([]string, len(tokens))
+	for i, t := range tokens {
+		out[i] = DisplayAddressName(t)
+	}
+	return out
+}
+
 // resolveZoneLocalAddressBooks folds every zone-local address book (#3061)
 // into the global SecurityConfig.AddressBook under zone-qualified internal
 // names and rewrites each policy's match address tokens that resolve

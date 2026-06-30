@@ -193,7 +193,17 @@ func printPolicyMatchAddresses(cfg *config.Config, pol *config.Policy) {
 				fmt.Printf("    any-ipv6(global): ::/0\n")
 			} else {
 				resolved := resolveAddressDetail(cfg, addr)
-				fmt.Printf("    %s(global): %s\n", addr, resolved)
+				// #3358: a zone-local address book (#3061) is folded into the
+				// global book under the synthetic key zone-local/<zone>/<name>.
+				// Render the authored name + zone scope ("web(zone trust)")
+				// instead of leaking the internal token mislabelled "(global)" —
+				// the address is zone-scoped, not global. Resolution still keys
+				// off the qualified token (it is the global-book key).
+				if zone, name, ok := config.ZoneLocalUnqualify(addr); ok {
+					fmt.Printf("    %s(zone %s): %s\n", name, zone, resolved)
+				} else {
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
+				}
 			}
 		}
 	}
