@@ -1429,10 +1429,12 @@ func validateSecurityLogStreamPortsAST(nodes []*Node, prefix string, lenient boo
 // the system CA roots is a legitimate, fully-honored configuration — only the
 // named-but-unapplied profile is rejected.
 //
-// It mirrors compileLog's traversal exactly (FindChild("log") +
-// namedInstances(stream) + the `transport` child loop) so it gates precisely
-// the token the compiler reads. Runs on the group-expanded tree so an
-// apply-groups-inherited tls-profile is covered.
+// It descends compileLog's traversal (log + namedInstances(stream) + the
+// `transport` child loop) with forEachChild at EVERY container level so it
+// gates the token wherever it lives, including a duplicate security/log
+// sub-block (#3566, the sub-level sibling of the #3562 duplicate-top-level
+// class). Runs on the group-expanded tree so an apply-groups-inherited
+// tls-profile is covered.
 //
 // Strict path (commit / commit-check, lenient=false): a present tls-profile is
 // a hard compile error. Lenient path (load / peer-sync, lenient=true):
@@ -1443,12 +1445,13 @@ func validateSecurityLogStreamPortsAST(nodes []*Node, prefix string, lenient boo
 // leniently-loaded value is inert, now flagged.
 func validateSecurityLogStreamTLSProfileAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
 	var warnings []string
-	for _, n := range nodes {
-		if n.Name() != "security" {
-			continue
-		}
+	// Descend security > log with forEachChild at EVERY level (and
+	// namedInstances over every `stream`) so a tls-profile carried by a stream
+	// in a duplicate security/log sub-block is still rejected (#3566); the inner
+	// transport / tls-profile checks are unchanged.
+	walkErr := forEachChild(nodes, "security", func(n *Node) error {
 		secPath := joinNodePath(prefix, n.Keys)
-		for _, logNode := range n.FindChildren("log") {
+		return forEachChild(n.Children, "log", func(logNode *Node) error {
 			logPath := joinNodePath(secPath, []string{"log"})
 			for _, inst := range namedInstances(logNode.FindChildren("stream")) {
 				streamPath := joinNodePath(logPath, []string{"stream", inst.name})
@@ -1473,11 +1476,15 @@ func validateSecurityLogStreamTLSProfileAST(nodes []*Node, prefix string, lenien
 							warnings = append(warnings, msg)
 							continue
 						}
-						return warnings, fmt.Errorf("%s", msg)
+						return fmt.Errorf("%s", msg)
 					}
 				}
 			}
-		}
+			return nil
+		})
+	})
+	if walkErr != nil {
+		return warnings, walkErr
 	}
 	return warnings, nil
 }
@@ -1538,8 +1545,10 @@ const (
 // records anywhere the daemon user can write. The filename is a single AST
 // value the declarative SchemaValidate walker treats as opaque free text, so —
 // like the syslog port and tls-profile gates — it is checked here on the
-// group-expanded tree, mirroring compileFlow's traversal
-// (FindChild("flow") > FindChild("traceoptions") > FindChild("file")).
+// group-expanded tree, descending compileFlow's traversal
+// (flow > traceoptions > file) with forEachChild at EVERY level so an
+// offending value in a duplicate flow/traceoptions/file sub-block is rejected
+// (#3566, the sub-level sibling of the #3562 duplicate-top-level class).
 //
 // Strict path (commit / commit-check, lenient=false): an absolute,
 // separator-bearing, or dot-component filename is a hard compile error.
@@ -1550,34 +1559,34 @@ const (
 // /var/log (#1960 / #3261 fail-closed-on-load class).
 func validateFlowTraceFileAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
 	var warnings []string
-	for _, n := range nodes {
-		if n.Name() != "security" {
-			continue
-		}
+	// Descend security > flow > traceoptions > file with forEachChild at EVERY
+	// level: the parser appends a repeated block as a sibling, and a first-only
+	// FindChild at any level would let an offending `file` value hide in a
+	// duplicate flow/traceoptions/file sub-block (#3566). The inner basename
+	// check is unchanged.
+	walkErr := forEachChild(nodes, "security", func(n *Node) error {
 		secPath := joinNodePath(prefix, n.Keys)
-		flowNode := n.FindChild("flow")
-		if flowNode == nil {
-			continue
-		}
-		toNode := flowNode.FindChild("traceoptions")
-		if toNode == nil {
-			continue
-		}
-		fileNode := toNode.FindChild("file")
-		if fileNode == nil {
-			continue
-		}
-		name := nodeVal(fileNode)
-		if err := flowTraceFileNameError(name); err != nil {
-			path := joinNodePath(secPath, []string{"flow", "traceoptions", "file"})
-			msg := fmt.Sprintf("%s: %s", path, err.Error())
-			if lenient {
-				warnings = append(warnings, msg+
-					" (ignored: tracing disabled, not written outside /var/log)")
-				continue
-			}
-			return warnings, fmt.Errorf("%s", msg)
-		}
+		return forEachChild(n.Children, "flow", func(flowNode *Node) error {
+			return forEachChild(flowNode.Children, "traceoptions", func(toNode *Node) error {
+				return forEachChild(toNode.Children, "file", func(fileNode *Node) error {
+					name := nodeVal(fileNode)
+					if err := flowTraceFileNameError(name); err != nil {
+						path := joinNodePath(secPath, []string{"flow", "traceoptions", "file"})
+						msg := fmt.Sprintf("%s: %s", path, err.Error())
+						if lenient {
+							warnings = append(warnings, msg+
+								" (ignored: tracing disabled, not written outside /var/log)")
+							return nil
+						}
+						return fmt.Errorf("%s", msg)
+					}
+					return nil
+				})
+			})
+		})
+	})
+	if walkErr != nil {
+		return warnings, walkErr
 	}
 	return warnings, nil
 }
@@ -1612,8 +1621,10 @@ var flowTraceImplementedFlags = map[string]bool{
 //
 // Both values are single AST leaves SchemaValidate treats as opaque free text,
 // so — like the file gate above — they are checked here on the group-expanded
-// tree, mirroring compileFlow's traversal (FindChild("flow") >
-// FindChild("traceoptions") > flag / packet-filter children).
+// tree, descending compileFlow's traversal (flow > traceoptions > flag /
+// packet-filter children) with forEachChild at EVERY container level so an
+// offending stanza in a duplicate flow/traceoptions sub-block is rejected
+// (#3566).
 //
 // Strict path (commit / commit-check, lenient=false): an unparseable
 // source/destination prefix or an unimplemented flag is a hard compile error.
@@ -1624,85 +1635,86 @@ var flowTraceImplementedFlags = map[string]bool{
 // fail-safe rather than fail-open (#1960 / #3261 fail-closed-on-load class).
 func validateFlowTraceFlagsAndFiltersAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
 	var warnings []string
-	for _, n := range nodes {
-		if n.Name() != "security" {
-			continue
-		}
+	// Descend security > flow > traceoptions with forEachChild at EVERY level
+	// so a flag / packet-filter stanza in a duplicate flow/traceoptions
+	// sub-block is still checked (#3566); the inner flag and prefix checks are
+	// unchanged.
+	walkErr := forEachChild(nodes, "security", func(n *Node) error {
 		secPath := joinNodePath(prefix, n.Keys)
-		flowNode := n.FindChild("flow")
-		if flowNode == nil {
-			continue
-		}
-		toNode := flowNode.FindChild("traceoptions")
-		if toNode == nil {
-			continue
-		}
-		toPath := joinNodePath(secPath, []string{"flow", "traceoptions"})
+		return forEachChild(n.Children, "flow", func(flowNode *Node) error {
+			return forEachChild(flowNode.Children, "traceoptions", func(toNode *Node) error {
+				toPath := joinNodePath(secPath, []string{"flow", "traceoptions"})
 
-		// flag tokens
-		for _, flagNode := range toNode.FindChildren("flag") {
-			v := nodeVal(flagNode)
-			if v == "" || flowTraceImplementedFlags[v] {
-				continue
-			}
-			path := joinNodePath(toPath, []string{"flag"})
-			msg := fmt.Sprintf("%s: unknown flow trace flag %q "+
-				"(supported: basic-datapath, session)", path, v)
-			if lenient {
-				warnings = append(warnings, msg+
-					" (ignored: unknown flag dropped, defaults apply)")
-				continue
-			}
-			return warnings, fmt.Errorf("%s", msg)
-		}
-
-		// packet-filter source/destination prefixes
-		for _, pf := range namedInstances(toNode.FindChildren("packet-filter")) {
-			pfPath := joinNodePath(toPath, []string{"packet-filter", pf.name})
-			for _, leaf := range []string{"source-prefix", "destination-prefix"} {
-				pn := pf.node.FindChild(leaf)
-				if pn == nil {
-					// Absent prefix: a protocol-only filter is legitimate, so
-					// leave it alone. This is AST-distinguishable from the
-					// present-but-empty case below (node missing vs node
-					// present with an empty value).
-					continue
-				}
-				v := nodeVal(pn)
-				if v == "" {
-					// Present-but-empty (`source-prefix ""`): the node exists
-					// but carries no prefix. Accepting it lets the runtime
-					// append a fully-unconstrained filter (zero srcNet/dstNet,
-					// no proto) that matches EVERY event — the #3422 M01
-					// fail-open in a smaller costume. Reject at strict; downgrade
-					// to a warning on the lenient load / peer-sync path, where
-					// the compiler marks the filter InvalidPrefix and the
-					// runtime fails it closed (match-none).
-					path := joinNodePath(pfPath, []string{leaf})
-					msg := fmt.Sprintf("%s: %s is present but empty; an empty "+
-						"prefix would match every event (omit %s for a "+
-						"protocol-only filter, or set a CIDR prefix)",
-						path, leaf, leaf)
-					if lenient {
-						warnings = append(warnings, msg+
-							" (ignored: filter set to match-none)")
+				// flag tokens
+				for _, flagNode := range toNode.FindChildren("flag") {
+					v := nodeVal(flagNode)
+					if v == "" || flowTraceImplementedFlags[v] {
 						continue
 					}
-					return warnings, fmt.Errorf("%s", msg)
-				}
-				if _, err := netip.ParsePrefix(v); err != nil {
-					path := joinNodePath(pfPath, []string{leaf})
-					msg := fmt.Sprintf("%s: invalid %s %q: %v",
-						path, leaf, v, err)
+					path := joinNodePath(toPath, []string{"flag"})
+					msg := fmt.Sprintf("%s: unknown flow trace flag %q "+
+						"(supported: basic-datapath, session)", path, v)
 					if lenient {
 						warnings = append(warnings, msg+
-							" (ignored: filter set to match-none)")
+							" (ignored: unknown flag dropped, defaults apply)")
 						continue
 					}
-					return warnings, fmt.Errorf("%s", msg)
+					return fmt.Errorf("%s", msg)
 				}
-			}
-		}
+
+				// packet-filter source/destination prefixes
+				for _, pf := range namedInstances(toNode.FindChildren("packet-filter")) {
+					pfPath := joinNodePath(toPath, []string{"packet-filter", pf.name})
+					for _, leaf := range []string{"source-prefix", "destination-prefix"} {
+						pn := pf.node.FindChild(leaf)
+						if pn == nil {
+							// Absent prefix: a protocol-only filter is legitimate, so
+							// leave it alone. This is AST-distinguishable from the
+							// present-but-empty case below (node missing vs node
+							// present with an empty value).
+							continue
+						}
+						v := nodeVal(pn)
+						if v == "" {
+							// Present-but-empty (`source-prefix ""`): the node exists
+							// but carries no prefix. Accepting it lets the runtime
+							// append a fully-unconstrained filter (zero srcNet/dstNet,
+							// no proto) that matches EVERY event — the #3422 M01
+							// fail-open in a smaller costume. Reject at strict; downgrade
+							// to a warning on the lenient load / peer-sync path, where
+							// the compiler marks the filter InvalidPrefix and the
+							// runtime fails it closed (match-none).
+							path := joinNodePath(pfPath, []string{leaf})
+							msg := fmt.Sprintf("%s: %s is present but empty; an empty "+
+								"prefix would match every event (omit %s for a "+
+								"protocol-only filter, or set a CIDR prefix)",
+								path, leaf, leaf)
+							if lenient {
+								warnings = append(warnings, msg+
+									" (ignored: filter set to match-none)")
+								continue
+							}
+							return fmt.Errorf("%s", msg)
+						}
+						if _, err := netip.ParsePrefix(v); err != nil {
+							path := joinNodePath(pfPath, []string{leaf})
+							msg := fmt.Sprintf("%s: invalid %s %q: %v",
+								path, leaf, v, err)
+							if lenient {
+								warnings = append(warnings, msg+
+									" (ignored: filter set to match-none)")
+								continue
+							}
+							return fmt.Errorf("%s", msg)
+						}
+					}
+				}
+				return nil
+			})
+		})
+	})
+	if walkErr != nil {
+		return warnings, walkErr
 	}
 	return warnings, nil
 }
@@ -1757,7 +1769,10 @@ func flowTraceSizeFilesValues(fileNode *Node) (size string, sizeSet bool, files 
 // live in EITHER the file node's flat Keys[2:] or hierarchical size/files
 // children (a dual value-location SchemaValidate cannot express), so — like
 // the file/flag/filter gates above — they are range-checked here on the
-// group-expanded tree, mirroring flowTraceSizeFilesValues / compileFlow.
+// group-expanded tree, descending flowTraceSizeFilesValues / compileFlow's
+// traversal (flow > traceoptions > file) with forEachChild at EVERY level so a
+// duplicate flow/traceoptions/file sub-block cannot hide an out-of-range value
+// (#3566).
 //
 // The bounds (FlowTraceMin/MaxFileSize, FlowTraceMin/MaxFileCount) match the
 // interactive `monitor security flow file` limits so the persistent and
@@ -1772,57 +1787,55 @@ func flowTraceSizeFilesValues(fileNode *Node) (size string, sizeSet bool, files 
 // fail-closed-on-load class).
 func validateFlowTraceSizeFilesAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
 	var warnings []string
-	for _, n := range nodes {
-		if n.Name() != "security" {
-			continue
-		}
+	// Descend security > flow > traceoptions > file with forEachChild at EVERY
+	// level so an out-of-range size/files in a duplicate flow/traceoptions/file
+	// sub-block is range-checked (#3566); the inner bounds checks are unchanged.
+	walkErr := forEachChild(nodes, "security", func(n *Node) error {
 		secPath := joinNodePath(prefix, n.Keys)
-		flowNode := n.FindChild("flow")
-		if flowNode == nil {
-			continue
-		}
-		toNode := flowNode.FindChild("traceoptions")
-		if toNode == nil {
-			continue
-		}
-		fileNode := toNode.FindChild("file")
-		if fileNode == nil {
-			continue
-		}
-		filePath := joinNodePath(secPath, []string{"flow", "traceoptions", "file"})
+		return forEachChild(n.Children, "flow", func(flowNode *Node) error {
+			return forEachChild(flowNode.Children, "traceoptions", func(toNode *Node) error {
+				return forEachChild(toNode.Children, "file", func(fileNode *Node) error {
+					filePath := joinNodePath(secPath, []string{"flow", "traceoptions", "file"})
 
-		size, sizeSet, files, filesSet := flowTraceSizeFilesValues(fileNode)
+					size, sizeSet, files, filesSet := flowTraceSizeFilesValues(fileNode)
 
-		if sizeSet {
-			v, err := strconv.ParseInt(size, 10, 64)
-			if err != nil || v < FlowTraceMinFileSize || v > FlowTraceMaxFileSize {
-				path := joinNodePath(filePath, []string{"size"})
-				msg := fmt.Sprintf("%s: invalid trace file size %q "+
-					"(must be %d..%d bytes)",
-					path, size, FlowTraceMinFileSize, FlowTraceMaxFileSize)
-				if lenient {
-					warnings = append(warnings, msg+
-						" (ignored: clamped to a safe size at runtime)")
-				} else {
-					return warnings, fmt.Errorf("%s", msg)
-				}
-			}
-		}
-		if filesSet {
-			v, err := strconv.Atoi(files)
-			if err != nil || v < FlowTraceMinFileCount || v > FlowTraceMaxFileCount {
-				path := joinNodePath(filePath, []string{"files"})
-				msg := fmt.Sprintf("%s: invalid trace file count %q "+
-					"(must be %d..%d)",
-					path, files, FlowTraceMinFileCount, FlowTraceMaxFileCount)
-				if lenient {
-					warnings = append(warnings, msg+
-						" (ignored: clamped to a safe count at runtime)")
-				} else {
-					return warnings, fmt.Errorf("%s", msg)
-				}
-			}
-		}
+					if sizeSet {
+						v, err := strconv.ParseInt(size, 10, 64)
+						if err != nil || v < FlowTraceMinFileSize || v > FlowTraceMaxFileSize {
+							path := joinNodePath(filePath, []string{"size"})
+							msg := fmt.Sprintf("%s: invalid trace file size %q "+
+								"(must be %d..%d bytes)",
+								path, size, FlowTraceMinFileSize, FlowTraceMaxFileSize)
+							if lenient {
+								warnings = append(warnings, msg+
+									" (ignored: clamped to a safe size at runtime)")
+							} else {
+								return fmt.Errorf("%s", msg)
+							}
+						}
+					}
+					if filesSet {
+						v, err := strconv.Atoi(files)
+						if err != nil || v < FlowTraceMinFileCount || v > FlowTraceMaxFileCount {
+							path := joinNodePath(filePath, []string{"files"})
+							msg := fmt.Sprintf("%s: invalid trace file count %q "+
+								"(must be %d..%d)",
+								path, files, FlowTraceMinFileCount, FlowTraceMaxFileCount)
+							if lenient {
+								warnings = append(warnings, msg+
+									" (ignored: clamped to a safe count at runtime)")
+							} else {
+								return fmt.Errorf("%s", msg)
+							}
+						}
+					}
+					return nil
+				})
+			})
+		})
+	})
+	if walkErr != nil {
+		return warnings, walkErr
 	}
 	return warnings, nil
 }
