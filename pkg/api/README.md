@@ -345,9 +345,12 @@ under the daemon's errgroup. Nothing else imports this package.
   `Manager.PolicySchedulerActiveState`) into `policymatch.Query.PolicyInactiveFn`,
   so a scheduler-inactive policy is SKIPPED exactly like the runtime
   (`policy.rs try_match_rule`) and the verdict falls through to the next active
-  rule / default-policy. When live state is unavailable (no dataplane) the
-  simulator evaluates scheduled policies as-if-active (the #3062 display
-  fallback) — a non-scheduled policy is unaffected either way.
+  rule / default-policy. #3414: when live state is unavailable (no dataplane /
+  early boot) the handler binds the predicate to a nil state map, which
+  `PolicyInactiveFn` treats as fail-closed — scheduled policies are simulated
+  as INACTIVE, matching the snapshot builder (nil scheduler state => dropped)
+  rather than certifying an as-if-active verdict the dataplane is skipping. A
+  non-scheduled policy is unaffected either way.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

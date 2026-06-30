@@ -224,6 +224,21 @@ pub(crate) struct DestinationNATRuleSnapshot {
     /// helper defaults it empty (the pre-#3437 over-match).
     #[serde(rename = "match_source_ports", default)]
     pub match_source_ports: Vec<NatPortRangeWire>,
+    /// #3449: a MULTI-port `match destination-port` range as inclusive
+    /// [low,high] ranges. Empty = no range constraint (the exact/wildcard
+    /// `destination_port` governs — the common single-port and IP-only case,
+    /// unchanged). Non-empty: the entry is keyed under the wildcard port
+    /// (`destination_port == 0`) and the flow's destination port MUST fall in
+    /// one range, otherwise the rule does NOT match. This lets a wide range
+    /// (`destination-port 1 to 65535`) install ONE wildcard-port entry instead
+    /// of 65 535 exact-port entries (the control-plane amplification #3449
+    /// closes). A low>high range is the impossible never-match form, preserved
+    /// verbatim. Additive wire field (#1961): an older control plane omits it;
+    /// this helper defaults it empty, treating a `destination_port == 0` entry
+    /// as match-ANY-port (the pre-#3449 wildcard) — the transient upgrade-skew
+    /// fail-open the source-NAT range fields also carry.
+    #[serde(rename = "match_destination_ports", default)]
+    pub match_destination_ports: Vec<NatPortRangeWire>,
     /// #3437 (H11): the ICMP/ICMPv6 type[,code] constraint of the DNAT rule's
     /// `match application` term (e.g. junos-ping = type 8). None = no ICMP
     /// type/code constraint (match every type/code of the protocol, the

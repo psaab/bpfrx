@@ -155,3 +155,46 @@ func TestSchedulerInactiveSkipsLikeRuntime(t *testing.T) {
 		sameVerdict(Match(cfg, q), "nil active map")
 	})
 }
+
+// TestSchedulerUnavailableStateFailsClosed covers #3414: the live diagnostic
+// surfaces (REST/gRPC/CLI match-policies) bind PolicyInactiveFn even when they
+// cannot obtain live scheduler state, by passing a nil active-state map. That
+// binding MUST be fail-closed — treating a scheduler-bound policy as inactive —
+// so the simulator agrees with the dataplane (snapshot builder: nil scheduler
+// state => Inactive => dropped) instead of certifying an as-if-active verdict.
+//
+// RED-on-revert: making dataplane/userspace.PolicyInactiveFn(nil) return false
+// for a scheduled policy (the pre-#3414 "as-if-active" fallback) lets the
+// scheduled permit match here, so the default-deny assertion fails. This pins
+// the simulator side; the dataplane side is pinned by the snapshot builder test
+// (pkg/dataplane/userspace: "fail-closed true" with nil scheduler state).
+func TestSchedulerUnavailableStateFailsClosed(t *testing.T) {
+	cfg := cfgWith(config.SecurityConfig{
+		DefaultPolicy: config.PolicyDeny,
+		Policies: []*config.ZonePairPolicies{
+			zonePair("trust", "untrust",
+				scheduled(permit("night-allow", config.PolicyMatch{
+					Applications: []string{"any"},
+				}), "after-hours")),
+		},
+	}, config.ApplicationsConfig{})
+
+	// inactiveFnFor(nil) is exactly what the live surfaces thread when
+	// per-scheduler active-state is unavailable (accessor not wired / early
+	// boot). The scheduled permit must be skipped -> default deny.
+	q := Query{
+		FromZone:         "trust",
+		ToZone:           "untrust",
+		Protocol:         "tcp",
+		DstPort:          80,
+		PolicyInactiveFn: inactiveFnFor(nil),
+	}
+	res := Match(cfg, q)
+	if res.Matched {
+		t.Fatalf("scheduled permit matched with unavailable state (PolicyName=%q); want fail-closed default-deny fall-through", res.PolicyName)
+	}
+	if !res.DefaultUsed || res.Action != config.PolicyDeny {
+		t.Fatalf("want fail-closed default deny, got Matched=%v DefaultUsed=%v Action=%v",
+			res.Matched, res.DefaultUsed, res.Action)
+	}
+}

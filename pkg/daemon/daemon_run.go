@@ -1274,8 +1274,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// dataplane disagrees with. Sourced from the same daemon-local
 			// accessor the CLI/gRPC show surfaces use
 			// (Manager.PolicySchedulerActiveState via the dataplane adapter).
-			// ok=false when the dataplane is absent (NoDataplane) so the
-			// simulator falls back to evaluating scheduled policies as-active.
+			// ok=false when the dataplane is absent (NoDataplane); the simulator
+			// then fails closed and treats scheduled policies as inactive (#3414),
+			// matching the dataplane's nil-state behavior rather than certifying
+			// an as-if-active verdict it is skipping.
 			PolicySchedulerActiveStateFn: func() (map[string]bool, bool) {
 				if d.dp == nil {
 					return nil, false

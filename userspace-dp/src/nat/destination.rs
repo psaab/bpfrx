@@ -72,6 +72,18 @@ struct DnatEntry {
     /// translates every source port. A low>high range never matches (the
     /// fail-CLOSED never-match sentinel) and is preserved verbatim.
     match_src_ports: Vec<(u16, u16)>,
+    /// #3449: a MULTI-port `match destination-port` range as inclusive
+    /// (low, high) ranges. Empty = no range constraint — the entry's exact
+    /// `DnatKey.dst_port` (or the wildcard-port=0 catch-all) governs, unchanged.
+    /// Non-empty: the entry is keyed under the wildcard port (dst_port=0) and
+    /// the flow's destination port MUST fall in one of these ranges, otherwise
+    /// the entry does not fire. This lets `destination-port 20000 to 30000`
+    /// install ONE wildcard-port entry with a [20000,30000] range instead of
+    /// 10 001 exact-port entries (the control-plane amplification #3449 closes).
+    /// A low>high range never matches (preserved verbatim), like the source-port
+    /// never-match sentinel. AND-ed with `match_src_ports` and the ICMP
+    /// type/code constraint in `l4_extra_matches`.
+    match_dst_ports: Vec<(u16, u16)>,
     /// #3437 (H11): the ICMP/ICMPv6 type[,code] constraint of the DNAT rule's
     /// `match application` term. `None` = unconstrained (match every type/code
     /// of the protocol). `Some(type)` requires the packet's ICMP type to equal
@@ -128,8 +140,14 @@ impl DnatEntry {
     ///   `Some`, its code to equal that). `packet_icmp == None` (a non-ICMP
     ///   packet) can never satisfy an ICMP-type-constrained entry — fail closed.
     ///
-    /// Both axes are AND-ed (mirroring Junos and the source-NAT path #3429).
-    fn l4_extra_matches(&self, src_port: u16, packet_icmp: Option<(u8, u8)>) -> bool {
+    /// #3449: a non-empty `match_dst_ports` requires `dst_port` to fall in one
+    /// range (the wide-range DNAT representation); empty is a wildcard.
+    ///
+    /// All axes are AND-ed (mirroring Junos and the source-NAT path #3429).
+    fn l4_extra_matches(&self, src_port: u16, dst_port: u16, packet_icmp: Option<(u8, u8)>) -> bool {
+        if !self.match_dst_ports.is_empty() && !port_in_ranges(dst_port, &self.match_dst_ports) {
+            return false;
+        }
         if !self.match_src_ports.is_empty() && !port_in_ranges(src_port, &self.match_src_ports) {
             return false;
         }
@@ -370,6 +388,15 @@ impl DnatTable {
             for r in &snap.match_source_ports {
                 match_src_ports.push((r.low, r.high));
             }
+            // #3449: the multi-port destination-port range constraint. A low>high
+            // range is the impossible never-match form and is preserved verbatim
+            // (it can never satisfy `port_in_ranges`). Empty = no range
+            // constraint — the entry's exact/wildcard `destination_port` governs.
+            let mut match_dst_ports: Vec<(u16, u16)> =
+                Vec::with_capacity(snap.match_destination_ports.len());
+            for r in &snap.match_destination_ports {
+                match_dst_ports.push((r.low, r.high));
+            }
             let entry = DnatEntry {
                 from_zone: snap.from_zone.clone().into_boxed_str(),
                 from_interface: snap.from_interface.clone().into_boxed_str(),
@@ -378,6 +405,7 @@ impl DnatTable {
                 source_v4,
                 source_v6,
                 match_src_ports,
+                match_dst_ports,
                 match_icmp_type: snap.match_icmp_type,
                 match_icmp_code: snap.match_icmp_code,
                 value: DnatValue {
@@ -513,6 +541,7 @@ impl DnatTable {
                 }),
                 src_ip,
                 src_port,
+                dst_port,
                 ingress_zone,
                 ingress_ifname,
                 ingress_routing_instance,
@@ -527,6 +556,7 @@ impl DnatTable {
                     }),
                     src_ip,
                     src_port,
+                    dst_port,
                     ingress_zone,
                     ingress_ifname,
                     ingress_routing_instance,
@@ -549,6 +579,7 @@ impl DnatTable {
                     }),
                     src_ip,
                     src_port,
+                    dst_port,
                     ingress_zone,
                     ingress_ifname,
                     ingress_routing_instance,
@@ -598,6 +629,7 @@ impl DnatTable {
         entries: Option<&Vec<DnatEntry>>,
         src_ip: IpAddr,
         src_port: u16,
+        dst_port: u16,
         ingress_zone: &str,
         ingress_ifname: &str,
         ingress_routing_instance: &str,
@@ -618,7 +650,7 @@ impl DnatTable {
                     && entry.from_zone.as_ref() == ingress_zone
                     && entry.scope_ok(ingress_ifname, ingress_routing_instance)
                     && entry.source_matches(src_ip)
-                    && entry.l4_extra_matches(src_port, packet_icmp)
+                    && entry.l4_extra_matches(src_port, dst_port, packet_icmp)
             })
             .map(|entry| (entry.value, entry.hit_counter.clone()))
             .or_else(|| {
@@ -628,7 +660,7 @@ impl DnatTable {
                         entry.from_zone.is_empty()
                             && entry.scope_ok(ingress_ifname, ingress_routing_instance)
                             && entry.source_matches(src_ip)
-                            && entry.l4_extra_matches(src_port, packet_icmp)
+                            && entry.l4_extra_matches(src_port, dst_port, packet_icmp)
                     })
                     .map(|entry| (entry.value, entry.hit_counter.clone()))
             })
@@ -660,6 +692,7 @@ impl DnatTable {
             dst_ip,
             src_ip,
             src_port,
+            dst_port,
             ingress_zone,
             ingress_ifname,
             ingress_routing_instance,
@@ -674,6 +707,7 @@ impl DnatTable {
                 dst_ip,
                 src_ip,
                 src_port,
+                dst_port,
                 ingress_zone,
                 ingress_ifname,
                 ingress_routing_instance,
@@ -689,6 +723,7 @@ impl DnatTable {
                 dst_ip,
                 src_ip,
                 src_port,
+                dst_port,
                 ingress_zone,
                 ingress_ifname,
                 ingress_routing_instance,
@@ -709,6 +744,7 @@ impl DnatTable {
         dst_ip: IpAddr,
         src_ip: IpAddr,
         src_port: u16,
+        dst_port: u16,
         ingress_zone: &str,
         ingress_ifname: &str,
         ingress_routing_instance: &str,
@@ -728,7 +764,7 @@ impl DnatTable {
                     || !slot.entry.scope_ok(ingress_ifname, ingress_routing_instance)
                     || !slot.contains(dst_ip)
                     || !slot.entry.source_matches(src_ip)
-                    || !slot.entry.l4_extra_matches(src_port, packet_icmp)
+                    || !slot.entry.l4_extra_matches(src_port, dst_port, packet_icmp)
                 {
                     continue;
                 }
@@ -771,6 +807,8 @@ impl DnatTable {
                 // yet differ only in ICMP type (e.g. echo-request vs reply) —
                 // both must be retained, not deduped onto each other.
                 && existing.entry.match_src_ports == new_slot.entry.match_src_ports
+                // #3449: destination-port range is part of the rule identity.
+                && existing.entry.match_dst_ports == new_slot.entry.match_dst_ports
                 && existing.entry.match_icmp_type == new_slot.entry.match_icmp_type
                 && existing.entry.match_icmp_code == new_slot.entry.match_icmp_code
         }) {
@@ -805,6 +843,10 @@ impl DnatTable {
                 // type/code) is part of the rule identity — see
                 // insert_prefix_slot.
                 && existing.match_src_ports == entry.match_src_ports
+                // #3449: the destination-port range is part of the rule
+                // identity — two range rules sharing (zone, dst, proto) but a
+                // different range are distinct entries, both retained.
+                && existing.match_dst_ports == entry.match_dst_ports
                 && existing.match_icmp_type == entry.match_icmp_type
                 && existing.match_icmp_code == entry.match_icmp_code
         }) {

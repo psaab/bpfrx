@@ -1268,9 +1268,17 @@ func PolicyInactive(schedulerName string, activeState map[string]bool) bool {
 // predicate so the operator-side policy simulator skips exactly the rules the
 // dataplane drops (and the #3062 display reports inactive). The snapshot is
 // captured by value at call time; pass the result of
-// Manager.PolicySchedulerActiveState. Callers that cannot obtain live scheduler
-// state must pass nil into the Query instead of calling this, so the simulator
-// stays scheduler-unaware (evaluates scheduled policies as-if-active).
+// Manager.PolicySchedulerActiveState.
+//
+// The returned predicate is fail-closed for the unavailable-state case (#3414):
+// a nil activeState (scheduler state not yet published / accessor not wired)
+// marks every scheduler-bound policy inactive, matching the snapshot builder
+// (policyRuleInactive: nil map => dropped). Live diagnostic surfaces
+// (REST/gRPC/CLI match-policies) therefore bind this predicate ALWAYS — even
+// when they cannot obtain live state — so the simulator never certifies a
+// scheduled policy as active while the dataplane is skipping it. Only a purely
+// offline, dataplane-less config simulator (no runtime to agree with) should
+// leave Query.PolicyInactiveFn nil to stay scheduler-unaware.
 func PolicyInactiveFn(activeState map[string]bool) func(schedulerName string) bool {
 	return func(schedulerName string) bool {
 		return policyRuleInactive(schedulerName, activeState)

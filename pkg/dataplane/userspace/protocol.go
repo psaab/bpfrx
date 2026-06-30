@@ -657,6 +657,25 @@ type DestinationNATRuleSnapshot struct {
 	Protocol    string `json:"protocol,omitempty"`
 	PoolAddress string `json:"pool_address"`
 	PoolPort    uint16 `json:"pool_port,omitempty"`
+	// MatchDestinationPorts carries a MULTI-port `match destination-port` range
+	// as inclusive [Low,High] ranges (#3449) so a wide range is NOT expanded
+	// into one exact-port snapshot per port (a control-plane amplification
+	// hazard: `destination-port 1 to 65535` produced 65 535 table entries). A
+	// single port keeps the exact `DestinationPort` O(1) fast path (this empty,
+	// DestinationPort set); a multi-port range is emitted as ONE wildcard-port
+	// entry (DestinationPort == 0) whose MatchDestinationPorts the Rust
+	// l4_extra_matches AND-checks against the flow's destination port (mirroring
+	// the DNAT MatchSourcePorts and source-NAT MatchDestinationPorts ranges).
+	// Empty = no range constraint — the exact/wildcard DestinationPort governs
+	// (unchanged behaviour for the common single-port and IP-only rules).
+	// Additive wire field (#1961 skew-safe): an older helper that does not know
+	// it treats a DestinationPort==0 entry as match-ANY-port (a transient
+	// fail-OPEN widening of that one entry during the upgrade window — the same
+	// tradeoff the source-NAT range field carries); an older Go binary omits it
+	// (omitempty) and the newer helper falls back to the per-port DestinationPort
+	// expansion such a binary still emits. A range with Low>High is an impossible
+	// (never-match) constraint preserved verbatim, like the source-port sentinel.
+	MatchDestinationPorts []NatPortRangeWire `json:"match_destination_ports,omitempty"`
 	// MatchSourcePorts carries the source-port constraint of the DNAT rule's
 	// `match application <app>` term as inclusive [Low,High] ranges (#3437,
 	// H10). When a DNAT rule matches via an application that pins a
