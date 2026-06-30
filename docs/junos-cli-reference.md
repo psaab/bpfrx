@@ -1040,6 +1040,14 @@ APIs: REST `GET /api/v1/security/events?zone=unknown` (or `?zone=0` /
 (match-all) for backward compatibility; an unfiltered query on any surface
 always includes the zone-0 events.
 
+The full filter grammar (count plus the `zone`/`protocol`/`action` selectors,
+including the `unknown`/`none`/`0` zone-0 sentinel) is honored identically on
+the local CLI and the remote `cli` (gRPC text path). Both share one parser,
+`logging.ParseEventFilterArgs` (#3547); before #3547 the remote `cli`
+forwarded only a numeric count to the daemon and dropped any zone/protocol/
+action selector, so `show security log zone <name>` on the remote client
+silently dumped every event instead of isolating the requested zone.
+
 ---
 
 ## Interfaces: Terse

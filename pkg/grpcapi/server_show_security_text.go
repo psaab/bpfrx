@@ -23,7 +23,6 @@ package grpcapi
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +32,7 @@ import (
 	"github.com/psaab/xpf/pkg/feeds"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/ipmon"
+	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/rpm"
 	"google.golang.org/grpc/codes"
@@ -168,20 +168,42 @@ func (s *Server) showRPM(buf *strings.Builder) {
 }
 
 // showSecurityLog renders recent security events from the daemon's
-// event ring buffer. `filter`, when numeric, sets the event count
-// (default 50).
+// event ring buffer. `filter` carries the full `show security log`
+// argument string forwarded by the remote `cli` (`[<count>] [zone
+// <name>] [protocol <proto>] [action <action>]`), parsed by the shared
+// logging.ParseEventFilterArgs so this path and the local CLI cannot
+// drift (#3547). Before #3547 this handler treated `filter` as a bare
+// count and dropped any zone/protocol/action selector, so the remote
+// CLI silently dumped every event for `show security log zone <name>`
+// (including the unknown/none/0 zone-0 selector #3338) instead of
+// isolating the requested zone.
 func (s *Server) showSecurityLog(filter string, buf *strings.Builder) {
 	if s.eventBuf == nil {
 		buf.WriteString("no events (event buffer not initialized)\n")
 		return
 	}
-	n := 50
-	if filter != "" {
-		if v, err := strconv.Atoi(filter); err == nil && v > 0 {
-			n = v
-		}
+
+	// Resolve zone names through the active apply result, mirroring the local
+	// CLI. Parsing fails CLOSED: a bad token / unknown zone surfaces the same
+	// message the local CLI returns rather than silently widening to all
+	// events.
+	cr := s.applyResult()
+	var zoneIDs map[string]uint16
+	if cr != nil {
+		zoneIDs = cr.ZoneIDs
 	}
-	events := s.eventBuf.Latest(n)
+	n, evFilter, err := logging.ParseEventFilterArgs(strings.Fields(filter), zoneIDs, cr != nil)
+	if err != nil {
+		fmt.Fprintf(buf, "%s\n", err)
+		return
+	}
+
+	var events []logging.EventRecord
+	if evFilter.IsEmpty() {
+		events = s.eventBuf.Latest(n)
+	} else {
+		events = s.eventBuf.LatestFiltered(n, evFilter)
+	}
 	if len(events) == 0 {
 		buf.WriteString("no events recorded\n")
 		return

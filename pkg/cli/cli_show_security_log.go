@@ -3,8 +3,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -18,82 +16,28 @@ func (c *CLI) showSecurityLog(args []string) error {
 		return nil
 	}
 
-	n := 50
-	var filter logging.EventFilter
 	cr := c.applyResult()
 
-	// Parse arguments: [N] [zone <name>] [protocol <proto>] [action <act>]
+	// Parse arguments: [N] [zone <name>] [protocol <proto>] [action <act>].
 	//
-	// Argument parsing fails CLOSED (#3347): an unknown token or a filter
-	// keyword with no value is a usage error, never silently ignored. A
-	// typo (`show security log zon trust`) or a bare trailing keyword
-	// (`show security log action`) used to fall through to an unfiltered
-	// dump of every event — in incident response, silently widening a
-	// scoped forensic query is worse than refusing it.
-	const usage = "usage: show security log [<count>] [zone <name>] " +
-		"[protocol <proto>] [action <action>]"
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "zone":
-			if i+1 >= len(args) {
-				return fmt.Errorf("missing value for %q\n%s", "zone", usage)
-			}
-			i++
-			zoneName := args[i]
-			// The "unknown"/"none"/"0" sentinels select zone 0 — the
-			// unassigned/pre-classification zone carried by host-inbound and
-			// emitted-before-zone-resolution events (#3338). Zone IDs are
-			// 1-based, so this value can never collide with a configured zone
-			// and does not need the apply result to resolve a name -> ID.
-			switch strings.ToLower(zoneName) {
-			case "unknown", "none", "0":
-				filter.Zone = 0
-				filter.HasZone = true
-				continue
-			}
-			// A named zone filter is meaningless without the apply result that
-			// maps zone name -> ID. Refuse rather than drop the filter and
-			// widen to all events (M02): during early startup or after a
-			// failed apply, cr == nil and silently honoring the request
-			// would dump every zone's events.
-			if cr == nil {
-				return fmt.Errorf("cannot filter by zone %q: no active dataplane apply result "+
-					"(zone IDs unavailable — retry after a successful commit)", zoneName)
-			}
-			zid, ok := cr.ZoneIDs[zoneName]
-			if !ok {
-				return fmt.Errorf("zone %q not found", zoneName)
-			}
-			filter.Zone = zid
-			filter.HasZone = true
-		case "protocol":
-			if i+1 >= len(args) {
-				return fmt.Errorf("missing value for %q\n%s", "protocol", usage)
-			}
-			i++
-			filter.Protocol = args[i]
-		case "action":
-			if i+1 >= len(args) {
-				return fmt.Errorf("missing value for %q\n%s", "action", usage)
-			}
-			i++
-			filter.Action = args[i]
-		default:
-			// The only bare token accepted is the event count. Reject a
-			// non-positive count at the boundary so `show security log -1`
-			// is a clean error rather than a panic — defense in depth
-			// alongside the EventBuffer guard (#3342). Any other unknown
-			// token is a usage error (#3347), not a silently-ignored
-			// fall-open to an unfiltered dump.
-			v, err := strconv.Atoi(args[i])
-			if err != nil {
-				return fmt.Errorf("unknown argument %q\n%s", args[i], usage)
-			}
-			if v <= 0 {
-				return fmt.Errorf("event count must be a positive integer, got %d", v)
-			}
-			n = v
-		}
+	// The grammar is owned by logging.ParseEventFilterArgs (#3547) so the
+	// local CLI and the remote `cli` gRPC text path share one parser and
+	// cannot drift. Parsing fails CLOSED (#3347): an unknown token, a filter
+	// keyword with no value, a non-positive count, or an unresolvable named
+	// zone is a usage error — never silently ignored. A typo (`show security
+	// log zon trust`) or a bare trailing keyword (`show security log action`)
+	// used to fall through to an unfiltered dump of every event; in incident
+	// response, silently widening a scoped forensic query is worse than
+	// refusing it. The unknown/none/0 sentinels select the unassigned zone 0
+	// (#3338); a named zone filter requires the apply result for name -> ID
+	// resolution (M02).
+	var zoneIDs map[string]uint16
+	if cr != nil {
+		zoneIDs = cr.ZoneIDs
+	}
+	n, filter, err := logging.ParseEventFilterArgs(args, zoneIDs, cr != nil)
+	if err != nil {
+		return err
 	}
 
 	var events []logging.EventRecord
