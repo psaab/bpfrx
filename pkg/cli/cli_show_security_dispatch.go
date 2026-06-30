@@ -90,6 +90,19 @@ func parsePolicyZoneFilter(args []string) (fromZone, toZone string) {
 	return
 }
 
+// joinDisplayAddressNames joins an address-token list for an operator-facing
+// flat render, unqualifying any synthetic zone-local key (#3061,
+// zone-local/<zone>/<name>) back to the authored book name (#3358). The zone is
+// already shown by the surrounding "From zone:" / "To zone:" header, so the
+// bare name is unambiguous and the internal compiler namespace never leaks.
+func joinDisplayAddressNames(addrs []string) string {
+	out := make([]string, len(addrs))
+	for i, a := range addrs {
+		out[i] = config.DisplayAddressName(a)
+	}
+	return strings.Join(out, ", ")
+}
+
 // resolveAddressDetail looks up the CIDR for a named address in the global
 // address book, falling back to the name itself if not found.
 func resolveAddressDetail(cfg *config.Config, name string) string {
@@ -358,9 +371,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 						fmt.Printf("    Description: %s\n", pol.Description)
 					}
 					fmt.Printf("    Source addresses: %s\n",
-						strings.Join(pol.Match.SourceAddresses, ", "))
+						joinDisplayAddressNames(pol.Match.SourceAddresses))
 					fmt.Printf("    Destination addresses: %s\n",
-						strings.Join(pol.Match.DestinationAddresses, ", "))
+						joinDisplayAddressNames(pol.Match.DestinationAddresses))
 					fmt.Printf("    Applications: %s\n",
 						strings.Join(pol.Match.Applications, ", "))
 					actionStr := action
@@ -426,9 +439,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				fmt.Printf("    From zones: %s\n", globalFromZone)
 				fmt.Printf("    To zones: %s\n", globalToZone)
 				fmt.Printf("    Source addresses: %s\n",
-					strings.Join(pol.Match.SourceAddresses, ", "))
+					joinDisplayAddressNames(pol.Match.SourceAddresses))
 				fmt.Printf("    Destination addresses: %s\n",
-					strings.Join(pol.Match.DestinationAddresses, ", "))
+					joinDisplayAddressNames(pol.Match.DestinationAddresses))
 				fmt.Printf("    Applications: %s\n",
 					strings.Join(pol.Match.Applications, ", "))
 				actionStr := action

@@ -268,7 +268,7 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 	// catch-all DROP that references the same "<zone>_<fam>" counter. That is the
 	// intended aggregation (one per-zone/family kernel-deny counter the #3361
 	// scraper reads back via ParseHostInboundDenyCounterName), but the declaration
-	// must be emitted EXACTLY ONCE: nft rejects `counter "<name>" {}` declared
+	// must be emitted EXACTLY ONCE: nft rejects `counter <name> {}` declared
 	// twice in the same table body ("File exists"). Dedup the declarations on the
 	// counter NAME so each is declared once no matter how many views share a zone;
 	// the per-view DROP rules below still all reference it.
@@ -295,7 +295,13 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 	rules = append(rules, "delete table inet xpf_hostinbound")
 	rules = append(rules, "table inet xpf_hostinbound {")
 	for _, cn := range counters {
-		rules = append(rules, "  counter \""+cn+"\" {")
+		// The DECLARATION must be UNQUOTED (#3578): nft v1.1.6 rejects a quoted
+		// name in a counter declaration (`counter "<n>" {}` -> "syntax error,
+		// unexpected quoted string"), even though it accepts a quoted name in the
+		// REFERENCE below. cn is sanitized to a bare-safe nft identifier by
+		// HostInboundDenyCounterName, so the unquoted declaration always parses and
+		// matches the (quoted) reference object name byte-for-byte.
+		rules = append(rules, "  counter "+cn+" {")
 		rules = append(rules, "  }")
 	}
 	rules = append(rules, "  chain input {")

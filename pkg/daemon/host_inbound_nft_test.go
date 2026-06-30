@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -95,9 +94,10 @@ func TestHostInboundFilterAcceptsListedDeniesRest(t *testing.T) {
 		// catch-all deny for the rest, per family — now carrying a named counter.
 		hiDrop("ip", "172.16.50.8", "wan"),
 		hiDrop("ip6", "2001:db8:50::8", "wan"),
-		// the named counter objects must be declared in the table body.
-		"counter \"" + xnft.HostInboundDenyCounterName("wan", "ip") + "\"",
-		"counter \"" + xnft.HostInboundDenyCounterName("wan", "ip6") + "\"",
+		// the named counter objects must be declared (UNQUOTED, #3578) in the
+		// table body.
+		"counter " + xnft.HostInboundDenyCounterName("wan", "ip") + " {",
+		"counter " + xnft.HostInboundDenyCounterName("wan", "ip6") + " {",
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(payload, want) {
@@ -139,8 +139,9 @@ func TestHostInboundFilterDropRulesCounted(t *testing.T) {
 	} {
 		cn := xnft.HostInboundDenyCounterName("wan", fam.family)
 
-		// The named counter object must be DECLARED in the table body.
-		decl := "counter \"" + cn + "\""
+		// The named counter object must be DECLARED (UNQUOTED, #3578) in the
+		// table body.
+		decl := "counter " + cn + " {"
 		if !strings.Contains(payload, decl) {
 			t.Errorf("missing named counter declaration %q\n---\n%s", decl, payload)
 		}
@@ -746,49 +747,72 @@ func findNft() string {
 	return ""
 }
 
-// hiCounterDeclDequote rewrites the named-counter DECLARATION form
-// `counter "<name>" { ... }` to a bare-identifier `counter <name> { ... }`.
-//
-// Why: this test gates the #3310 reject rule (the FIRST `reject` ever emitted in
-// `inet xpf_hostinbound`). The payload ALSO carries the #3361 named-counter
-// objects, which buildHostInboundFilterPayload declares with a QUOTED name.
-// nft (≥ v1.1.6) accepts a quoted name in a counter REFERENCE
-// (`counter name "<n>" drop`) but NOT in a counter DECLARATION — there it
-// requires a bare identifier — so the raw payload fails `nft -c` on that
-// pre-existing declaration line, swamping the reject-rule syntax this test is
-// about. The host-inbound counter names are always valid bare identifiers
-// (`xpfhi_<family>_<len>_<zone>` with zone separators encoded), so de-quoting the
-// DECLARATION is a behavior-preserving normalization that lets the parse check
-// exercise the reject rule. (The quoted-declaration form itself is a separate
-// pre-existing concern, not #3310.)
-var hiCounterDeclRe = regexp.MustCompile(`counter "([^"]+)" \{`)
-
-func hiCounterDeclDequote(payload string) string {
-	return hiCounterDeclRe.ReplaceAllString(payload, "counter $1 {")
-}
-
 // TestHostInboundFilterIdentResetPayloadParses is the #3310 merge gate (plan
-// §7 / Q7): the host-inbound chain payload — which now contains the FIRST
-// `reject` rule ever emitted in `inet xpf_hostinbound` — must parse on the
-// appliance nft binary. Mirrors the lo0 precedent (TestLo0FilterPayloadNftParses).
-// The named-counter DECLARATION syntax is normalized first (see
-// hiCounterDeclDequote) so this gates the reject rule, not the orthogonal #3361
-// declaration form. A `syntax error` fails the test; a netlink/permission
-// failure (no CAP_NET_ADMIN) occurs only AFTER syntax parsing succeeds and is a
-// pass; nft absent skips.
+// §7 / Q7) AND the #3578 fail-on-revert proof for the named-counter DECLARATION
+// syntax: the EXACT host-inbound payload buildHostInboundFilterPayload emits —
+// the #3310 `reject` rule plus the #3361 named-counter declarations — must parse
+// on the appliance nft binary. Mirrors the lo0 precedent
+// (TestLo0FilterPayloadNftParses).
+//
+// #3578: nft v1.1.6 accepts a quoted name in a counter REFERENCE
+// (`counter name "<n>" drop`) but REJECTS it in a counter DECLARATION
+// (`counter "<n>" {}` -> "syntax error, unexpected quoted string"). The payload
+// must therefore declare counters UNQUOTED (`counter <n> {}`) with an identifier
+// sanitized to the bare-safe nft set. This test runs the RAW payload through
+// `nft -c -f -` (no normalization): reverting the unquoted declaration (or
+// dropping the identifier sanitization) re-introduces a `syntax error` and turns
+// this RED. A netlink/permission failure (no CAP_NET_ADMIN) occurs only AFTER
+// syntax parsing succeeds and is a pass; nft absent skips.
 func TestHostInboundFilterIdentResetPayloadParses(t *testing.T) {
 	nftPath := findNft()
 	if nftPath == "" {
 		t.Skip("nft not found; covered by TestHostInboundFilterIdentResetEmitsReset")
 	}
+	// Extend the ident-reset scenario with zones whose names carry bare-safe nft
+	// identifier bytes that sanitizeNftIdent PRESERVES — a hyphen ("wan-zone")
+	// and a dot ("vlan.50") — so the LIVE `nft -c` parse exercises a bare
+	// `counter xpfhi_..._wan-zone {` / `..._vlan.50 {` declaration. This pins at
+	// CI that nft v1.1.6 accepts those bytes UNQUOTED (#3578): an accidental
+	// narrowing of the sanitize charset that mangled '-'/'.' to '_' is caught by
+	// the "survived sanitization" assertions below, and a true nft rejection of
+	// bare '-'/'.' would surface as a `syntax error` and fail the parse. Both
+	// names commit (only '/' is rejected for zone names).
 	cfg := identResetTestConfig()
+	cfg.Interfaces.Interfaces["reth1"] = &config.InterfaceConfig{Name: "reth1", Units: map[int]*config.InterfaceUnit{
+		60: {Number: 60, VlanID: 60, Addresses: []string{"172.16.60.8/24"}},
+		70: {Number: 70, VlanID: 70, Addresses: []string{"172.16.70.8/24"}},
+	}}
+	cfg.Security.Zones["wan-zone"] = &config.ZoneConfig{
+		Name:               "wan-zone",
+		Interfaces:         []string{"reth1.60"},
+		HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+	}
+	cfg.Security.Zones["vlan.50"] = &config.ZoneConfig{
+		Name:               "vlan.50",
+		Interfaces:         []string{"reth1.70"},
+		HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+	}
 	views := buildAndCheckViews(t, cfg)
-	payload := hiCounterDeclDequote(buildHostInboundFilterPayload(views))
+	payload := buildHostInboundFilterPayload(views)
 
-	// Sanity: the normalized payload must still carry the #3310 reject rule —
-	// otherwise the parse check would be vacuous.
+	// Sanity: the raw payload must still carry the #3310 reject rule and the
+	// #3361 named-counter declaration — otherwise the parse check is vacuous.
 	if !strings.Contains(payload, "tcp dport 113 reject with tcp reset") {
-		t.Fatalf("normalized payload lost the ident-reset reject rule:\n%s", payload)
+		t.Fatalf("payload lost the ident-reset reject rule:\n%s", payload)
+	}
+	if !strings.Contains(payload, "counter "+xnft.HostInboundDenyCounterName("wan", "ip")+" {") {
+		t.Fatalf("payload lost the #3361 named-counter declaration:\n%s", payload)
+	}
+	// The hyphen/dot zone counters must be declared BARE with the byte intact
+	// (sanitizeNftIdent is the identity for '-'/'.'); this is what the live nft
+	// parse below then exercises.
+	for _, want := range []string{
+		"counter xpfhi_ip_8_wan-zone {", // hyphen preserved, bare declaration
+		"counter xpfhi_ip_7_vlan.50 {",  // dot preserved, bare declaration
+	} {
+		if !strings.Contains(payload, want) {
+			t.Fatalf("payload missing bare hyphen/dot counter declaration %q:\n%s", want, payload)
+		}
 	}
 
 	cmd := exec.Command(nftPath, "-c", "-f", "-")
@@ -799,9 +823,44 @@ func TestHostInboundFilterIdentResetPayloadParses(t *testing.T) {
 	}
 	combined := string(out)
 	if strings.Contains(combined, "syntax error") {
-		t.Fatalf("nft -c rejected the ident-reset host-inbound payload with a syntax error:\n%s\npayload:\n%s", combined, payload)
+		t.Fatalf("nft -c rejected the host-inbound payload with a syntax error:\n%s\npayload:\n%s", combined, payload)
 	}
 	t.Logf("nft -c parsed the payload; non-syntax error (expected without CAP_NET_ADMIN): %v\n%s", err, combined)
+}
+
+// TestHostInboundFilterCounterDeclarationUnquoted is the #3578 unit-level
+// fail-on-revert proof (independent of whether nft is installed): every counter
+// DECLARATION the payload emits is UNQUOTED, no QUOTED declaration appears, and
+// the declared identifier is byte-identical to the identifier the catch-all DROP
+// references (so nft never sees a reference to an undeclared counter). Reverting
+// the declaration to the quoted `counter "<n>" {}` form turns the "no quoted
+// declaration" assertion RED.
+func TestHostInboundFilterCounterDeclarationUnquoted(t *testing.T) {
+	cfg := hostInboundTestConfig()
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	// No QUOTED counter declaration may appear (a reference is `counter name
+	// "<n>"`, never `counter "<n>" {`).
+	if strings.Contains(payload, "counter \"") {
+		for _, line := range strings.Split(payload, "\n") {
+			if strings.Contains(line, "counter \"") {
+				t.Errorf("payload carries a quoted counter declaration (nft v1.1.6 rejects it): %q", line)
+			}
+		}
+	}
+
+	for _, fam := range []string{"ip", "ip6"} {
+		cn := xnft.HostInboundDenyCounterName("wan", fam)
+		// The declaration is the unquoted bare-identifier form.
+		if !strings.Contains(payload, "counter "+cn+" {") {
+			t.Errorf("missing unquoted declaration for (wan,%s): want %q\n%s", fam, "counter "+cn+" {", payload)
+		}
+		// The DROP references the SAME identifier (so the counter is defined).
+		if !strings.Contains(payload, "counter name \""+cn+"\" drop") {
+			t.Errorf("catch-all drop must reference the declared counter %q\n%s", cn, payload)
+		}
+	}
 }
 
 // buildAndCheckViews resolves the per-zone views and asserts the table would be

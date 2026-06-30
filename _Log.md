@@ -24093,8 +24093,72 @@ top.
   - **Action**: #3344 — `show security screen-statistics all` no longer silently drops a zone whose flood-counter read fails. The #3408 fix added a trailing aggregate warning but kept the `continue`, so the failing zone vanished from the per-zone listing and the warning could not name WHICH zone was degraded — a fail-open operator diagnostic exactly when explicit degradation is needed. Both the local-CLI path (showScreenStatisticsAll, cli_show_security_screen.go) and the gRPC ShowText path (server_show_security_text.go) now emit a per-zone error row ("Screen statistics for zone 'X':" + "  Error reading flood counters: <err>") for the failing zone, preserving it in the listing and matching the single-zone error wording, while retaining the #3408 trailing aggregate warning. RED-on-revert: one-good-zone + one-read-error-zone tests on both surfaces assert the good zone renders, the failing zone appears with an inline error row, and the aggregate warning still prints; restoring the bare `continue` drops the failing zone's header → RED (verified by reverting both edits). go test ./pkg/cli ./pkg/grpcapi ./pkg/config green; gofmt clean; go vet clean (pre-existing cli.go:503 unreachable-code warning unrelated).
   - **File(s)**: pkg/cli/cli_show_security_screen.go, pkg/cli/show_security_counter_error_test.go, pkg/grpcapi/server_show_security_text.go, pkg/grpcapi/text_filter_flood_counter_error_test.go, _Log.md
 - **Timestamp**: 2026-06-29
+  - **Action**: #3358 — the synthetic zone-local compiler token leaked into
+    operator policy-detail output. A zone-local address book (#3061) is folded
+    into the global book at compile time under an internal key
+    `zone-local/<zone>/<name>` (zoneLocalQualify, compiler_security.go); the
+    detail/inventory surfaces printed that token verbatim and the CLI detail even
+    labelled it `(global)` — so an operator saw `zone-local/trust/web(global)`
+    instead of the authored name `web`, mislabelling a zone-scoped object as
+    global. Fix: added `config.ZoneLocalUnqualify` (inverse of zoneLocalQualify,
+    unambiguous because validateAddressBookEntryNamesStrict forbids `/` in any
+    operator name) + `DisplayAddressName`/`DisplayAddressNames` helpers, and
+    applied them across all five security-policy match-address display sites:
+    CLI detail (`printPolicyMatchAddresses` → `web(zone trust): <cidr>`), the CLI
+    standard `show security policies` view (joinDisplayAddressNames), the gRPC
+    `show security policies` text render (server_show_policies_text.go), and the
+    REST + gRPC structured inventories (security.go / server_show_zones.go →
+    bare authored name; DisplayAddressNames returns a NEW slice so the live
+    compiled config is never mutated, nil→nil preserved). CIDR resolution still
+    keys off the qualified global-book token. RED-on-revert proven: reverted the
+    five display sites to origin/master (keeping helpers+tests) →
+    Test_3358_PolicyDetailUnqualifiesZoneLocalName,
+    TestGetPoliciesUnqualifiesZoneLocalNames,
+    TestShowPoliciesDetailTextUnqualifiesZoneLocalNames,
+    TestPoliciesHandlerUnqualifiesZoneLocalNames all RED; restored → GREEN.
+    Controls (global-book name renders `(global)` / passes through unchanged) and
+    the config helper unit tests stay green. go test ./pkg/config ./pkg/cli
+    ./pkg/policymatch ./pkg/grpcapi ./pkg/api green; gofmt clean; go vet clean
+    (pre-existing cli.go:503 unreachable-code warning unrelated). Docs:
+    docs/junos-cli-reference.md (policy-detail format) + docs/config-schema.md
+    (#3061 section operator-display note).
+  - **File(s)**: pkg/config/compiler_security.go, pkg/config/zone_local_unqualify_3358_test.go, pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go, pkg/cli/cli_show_security_zone_local_3358_test.go, pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_zone_local_3358_test.go, pkg/api/security.go, pkg/api/security_zone_local_3358_test.go, docs/junos-cli-reference.md, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3358 hostile-review fold — a 6th leaking surface the 5-surface
+    review missed. FOLD 1 (MAJOR): `show security match-policies` still leaked
+    the synthetic `zone-local/<zone>/<name>` token across ALL THREE transports
+    (CLI showMatchPolicies cli_show_security.go:531-532, gRPC MatchPolicies
+    server_cluster.go:252-253, REST MatchPoliciesResult api/security.go:572-573)
+    because they all render the shared `policymatch.Result`, whose
+    Src/DstAddresses are populated ONCE at the SSOT `matchedResult`
+    (policymatch.go:567-568) by copying the raw qualified `pol.Match.*` tokens.
+    Fixed at the SSOT: wrapped both with `config.DisplayAddressNames(...)` — one
+    change fixes all three transports. SAFETY re-verified: matchedResult is the
+    SOLE populator of Result.Src/DstAddresses, and every re-match path
+    (ruleMatches/matchAddr/classifyPolicyAddresses/nameToID) reads `pol.Match`
+    directly, never the Result, so unqualifying the display copy cannot affect
+    matching; from/to-zone in the verdict keeps the bare name unambiguous;
+    policymatch already imports config (no cycle); DisplayAddressNames returns a
+    NEW slice (no config mutation). FOLD 2 (MINOR test-gap): added a dedicated
+    RED-on-revert test for the CLI standard flat `show security policies` view
+    (joinDisplayAddressNames) — the only one of the original five surfaces
+    without its own test. RED-on-revert proven: reverted the matchedResult wrap
+    → TestMatchedResultUnqualifiesZoneLocalNames RED
+    (`SrcAddresses=[zone-local/trust/web], want [web]`); reverted
+    joinDisplayAddressNames to raw strings.Join →
+    Test_3358_FlatShowPoliciesUnqualifiesZoneLocalName RED (token leaked);
+    restored both → GREEN, controls (global-book name passes through) green.
+    go test ./pkg/policymatch ./pkg/cli ./pkg/grpcapi ./pkg/api ./pkg/config
+    green; gofmt clean; go vet clean (pre-existing cli.go:503 unreachable-code
+    warning unrelated). Docs: extended the docs/config-schema.md #3358 note with
+    the match-policies SSOT + flat-view surfaces.
+  - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/zone_local_display_3358_test.go, pkg/cli/cli_show_security_flat_zone_local_3358_test.go, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-06-29
   - **Action**: #3546 — source-NAT `match destination-port` all-nonnumeric value no longer widens to match-any-port on the lenient/peer-sync load path. Root cause: the source-NAT snapshot builder (pkg/dataplane/userspace/nat.go) called `sourceNATDestPortRanges(rule.Match.DestinationPorts)` and that helper consulted ONLY the numeric DestinationPorts list, ignoring InvalidDestinationPorts. An all-nonnumeric token (e.g. `match destination-port http`; the NAT match grammar has no service-name resolution, so `http` is genuine garbage surfaced as an invalid token) parses to an EMPTY DestinationPorts list with the raw token on InvalidDestinationPorts. coalescePortRanges([]) returns empty, and with no configured numeric to trip the `len(ports)>0 && len(ranges)==0` fail-closed branch, the helper returned an empty range list = unconstrained match-any-port. A normal `commit` hard-rejects this via validateNATMatchDestinationPortStrict (#3446, already covers both source and destination NAT), so the bug was only reachable on the #1960 tolerant-load / peer-sync path that downgrades the reject to a warning. The DNAT builder already failed closed on this case via InvalidDestinationPorts; SNAT was the residual split out of #3446 (confirmed by SMR + Codex). Fix: `sourceNATDestPortRanges(ports []int, invalid []string)` now treats the constraint as configured when EITHER list is non-empty and emits the natNeverMatchPortRange sentinel when nothing valid survives, so the rule matches NOTHING rather than every port; the builder passes rule.Match.InvalidDestinationPorts. A mix of one valid port and an invalid token (`[ http 8080 ]`) keeps the valid port (8080), mirroring the DNAT lenient path. No wire change (InvalidDestinationPorts is compiler-internal; the helper uses the existing match-range slot). RED-on-revert proven: TestBuildSourceNATSnapshotsAllNonnumericPortFailsClosed + TestBuildSourceNATSnapshotsLenientNonnumericPortFailsClosed (end-to-end via ParseSetCommand+SetPath+CompileConfigLenient) both go RED when the fix is reverted; over-reject controls TestBuildSourceNATSnapshotsValidPortWithInvalidTokenKeepsValid + TestBuildSourceNATSnapshotsLenientValidPortStillCompiles stay green on revert (true controls). go test ./pkg/config ./pkg/dataplane/userspace green; gofmt + go vet clean. Doc: docs/userspace-dnat-plan.md §13 (corrected the "source-NAT builder was already fail-closed" overclaim and added the #3546 InvalidDestinationPorts fix).
   - **File(s)**: pkg/dataplane/userspace/nat.go, pkg/dataplane/userspace/nat_l4_match_3429_test.go, docs/userspace-dnat-plan.md, _Log.md
 - **Timestamp**: 2026-06-29
   - **Action**: #3579 — daemon `applySyslogConfig` (pkg/daemon/daemon_system.go) now closes superseded syslog clients on every re-apply, fixing an fd leak. Root cause: the daemon installed clients via the non-closing `er.SetSyslogClients(...)` (wholesale slice replace, drops old clients without `Close()`), whereas the remote-CLI apply path (pkg/cli/apply.go) already used the closing `er.ReplaceSyslogClients(...)`. Because `applySyslogConfig` rebuilds every `*SyslogClient` from config on each apply (the loop always constructs new objects via `NewSyslogClientTransport`), the prior set is always fully superseded by-object — so a re-apply that changed or removed a CONNECTED TCP/TLS stream dropped the old client from the set but never closed its socket, leaking one fd per commit; over many commits this accumulates open sockets. Fix: switch all three apply branches (event-mode clear, zero-streams teardown, stream install) to `ReplaceSyslogClients`, which installs the new set then `Close()`s the old set AFTER releasing `syslogMu`. Also dropped the `len(clients) > 0` guard on the install path so configured-but-all-failed streams still tear down the old set (matches the CLI's unconditional Replace). Re-entrancy safe (#2285): `SyslogClient.Close` takes only the client's own mutex and emits no slog, so it cannot re-enter the slog->syslog handler under a held lock. RED-on-revert proven: TestApplySyslogConfigClosesSupersededStreamClients (two prior connected clients superseded -> both Closed exactly once) + TestApplySyslogConfigEventModeClosesStreamClients go RED when reverted to SetSyslogClients (got 0 closes = leak); SyslogClientCount controls confirm the freshly-built set is installed. Added pkg/logging contract tests: ReplaceSyslogClients closes the whole old set exactly once and does NOT close the newly-installed client; SetSyslogClients closes none (documents the leak). New test-support constructor `logging.NewSyslogClientWithConn` wraps a recording net.Conn so the daemon-package test can observe teardown with no real network. go test ./pkg/daemon ./pkg/logging green (incl. -race on new tests); gofmt + go vet clean; go build ./pkg/... ./cmd/... green. Doc: pkg/logging/README.md syslog lifecycle section.
   - **File(s)**: pkg/daemon/daemon_system.go, pkg/daemon/syslog_close_3579_test.go, pkg/logging/syslog.go, pkg/logging/syslog_replace_close_3579_test.go, pkg/logging/README.md, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3451 — documented the policy hit-counter packet/byte snapshot relaxed-pair / eventual-consistency semantics. Investigation: the accumulated VALUES are correct on both sides (Rust snapshot maps packets->packets, bytes->bytes; Go PolicyRuleCounterStatus JSON-decodes the same; no double-count, no swap, no reset-on-snapshot, no wrong field — confirmed firsthand and already covered by policy_tests.rs:315-346). The only defect the Codex L01 (Low confidence) finding flags is sub-poll PAIR atomicity: packets/bytes are two independent relaxed AtomicU64s, so a single snapshot can straddle one in-flight update (skew bounded by one per-worker add/add_batch). This is the codebase-wide telemetry-counter convention (filter::FilterTermCounter, ThreeColorPolicerCounter, NAT/WG counters); a seqcount/lock would reintroduce write-side shared-cacheline contention exactly contrary to the #3073 batched add_batch design, and AtomicU128 is not portably lock-free on baseline x86-64. Per the issue's own option D ("if eventual consistency is acceptable, document the relaxed-pair semantics"), documented the relaxed-pair contract on the Rust PolicyRuleCounter type + snapshot(), and on the Go PolicyRuleCounterStatus consumer struct (CLI/REST/Prometheus must treat bytes/packets ratio as approximate at sub-poll granularity; fields reconcile over a poll interval). Added a focused RED-on-revert unit test policy_rule_counter_snapshot_pairs_totals pinning the VALUE contract (add+add_batch accumulate into the right field, no swap, zero-length packet counts but adds no bytes, reset zeroes BOTH) — proven RED by swapping the fields in snapshot() (panic at the packets assertion), restored. cargo test policy:: green (128 passed); go test ./pkg/dataplane/userspace ./pkg/config green; gofmt clean; go vet clean.
+  - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, pkg/dataplane/userspace/protocol.go, _Log.md

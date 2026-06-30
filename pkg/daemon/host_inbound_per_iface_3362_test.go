@@ -108,7 +108,7 @@ func Test_3362_NftDeclaresEachCounterOnce(t *testing.T) {
 
 	// Each named DROP counter for the zone must be DECLARED exactly once.
 	for _, fam := range []string{"ip", "ip6"} {
-		decl := "  counter \"" + xnft.HostInboundDenyCounterName("corp", fam) + "\" {"
+		decl := "  counter " + xnft.HostInboundDenyCounterName("corp", fam) + " {"
 		if n := strings.Count(payload, decl); n != 1 {
 			t.Errorf("counter declaration for (corp,%s) appears %d times, want exactly 1 (nft rejects a duplicate declaration):\n---\n%s", fam, n, payload)
 		}

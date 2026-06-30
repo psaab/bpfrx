@@ -974,6 +974,38 @@ impl Clone for PolicyRule {
     }
 }
 
+/// Per-rule policy hit counter: cumulative `packets`/`bytes` admitted (or
+/// denied, for an explicit deny rule) under one security-policy rule, surfaced
+/// by [`PolicyState::counter_snapshots`] for `show security policies
+/// hit-count`, the REST `/metrics`-counter path, and Prometheus.
+///
+/// #3451 — relaxed-pair / eventual-consistency semantics (deliberate, do NOT
+/// "fix" with a lock or seqcount). `packets` and `bytes` are two INDEPENDENT
+/// relaxed [`AtomicU64`]s. Each [`add`](Self::add) / [`add_batch`](Self::add_batch)
+/// accumulation is correct in isolation — a relaxed `fetch_add` never loses an
+/// increment, so the running TOTAL of each field is always exact, even under
+/// many concurrent worker threads sharing the same `Arc`. What is NOT atomic is
+/// the *pair*: [`snapshot`](Self::snapshot) loads the two fields with separate
+/// relaxed loads, and the hot path stores them with separate relaxed adds, so a
+/// reader can observe `packets` and `bytes` taken at slightly different logical
+/// instants (e.g. a freshly bumped packet count next to a byte count that has
+/// not yet absorbed that packet's length). The skew is bounded by the in-flight
+/// update(s) — at most one `add` per concurrent worker, or one coalesced
+/// `add_batch` of up to `POLICY_HIT_FLUSH_PACKETS` per worker (#3073).
+///
+/// This matches the codebase-wide telemetry-counter convention
+/// (`filter::FilterTermCounter`, `ThreeColorPolicerCounter`, the NAT and
+/// WireGuard counters). It is intentional because the read side is a low-rate
+/// poll (~1/s) while the write side is per-packet across every worker: a
+/// seqcount or lock would reintroduce shared-cacheline contention on the write
+/// side — exactly what the #3073 batched-`add_batch` design exists to avoid —
+/// and a 128-bit combined atomic is not portably lock-free on the baseline
+/// x86-64 target. Counters are advisory telemetry, so eventual consistency is
+/// accepted. CONSUMER CONTRACT: monitoring code MUST treat a single snapshot's
+/// `bytes/packets` ratio as approximate at sub-poll granularity; over any poll
+/// interval the two fields reconcile (each total is exact). Do not assert an
+/// exact `bytes == packets * frame_len` relationship on one instantaneous
+/// snapshot.
 #[derive(Debug, Default)]
 pub(crate) struct PolicyRuleCounter {
     packets: AtomicU64,
@@ -1029,6 +1061,13 @@ impl PolicyRuleCounter {
         self.generation.load(Ordering::Relaxed)
     }
 
+    /// #3451: loads the two fields with INDEPENDENT relaxed loads — see the
+    /// `PolicyRuleCounter` type doc. Each field's total is exact; the pair is
+    /// eventual-consistent (the snapshot may straddle one in-flight update), so
+    /// the returned `bytes/packets` ratio is approximate at sub-poll
+    /// granularity. `packets` always maps to `packets` and `bytes` to `bytes`
+    /// (no swap) — pinned by `policy_rule_counter_snapshot_pairs_totals` in
+    /// `policy_tests.rs`.
     fn snapshot(&self, rule_id: &str) -> PolicyRuleCounterStatus {
         PolicyRuleCounterStatus {
             rule_id: rule_id.to_string(),
