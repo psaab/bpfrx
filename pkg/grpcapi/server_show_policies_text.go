@@ -324,12 +324,20 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			fmt.Fprintf(buf, "      Source addresses:\n")
 			for _, addr := range pol.Match.SourceAddresses {
 				resolved := grpcResolveAddress(cfg, addr)
-				fmt.Fprintf(buf, "        %s%s\n", addr, resolved)
+				// #3358: unqualify a synthetic zone-local key (#3061,
+				// zone-local/<zone>/<name>) to the authored book name so the
+				// internal compiler token never leaks; resolution still keys
+				// off the qualified token (it is the global-book key).
+				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
 			}
 			fmt.Fprintf(buf, "      Destination addresses:\n")
 			for _, addr := range pol.Match.DestinationAddresses {
 				resolved := grpcResolveAddress(cfg, addr)
-				fmt.Fprintf(buf, "        %s%s\n", addr, resolved)
+				// #3358: unqualify a synthetic zone-local key (#3061,
+				// zone-local/<zone>/<name>) to the authored book name so the
+				// internal compiler token never leaks; resolution still keys
+				// off the qualified token (it is the global-book key).
+				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
 			}
 			fmt.Fprintf(buf, "      Applications:\n")
 			for _, app := range pol.Match.Applications {
@@ -403,12 +411,20 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			fmt.Fprintf(buf, "      Source addresses:\n")
 			for _, addr := range pol.Match.SourceAddresses {
 				resolved := grpcResolveAddress(cfg, addr)
-				fmt.Fprintf(buf, "        %s%s\n", addr, resolved)
+				// #3358: unqualify a synthetic zone-local key (#3061,
+				// zone-local/<zone>/<name>) to the authored book name so the
+				// internal compiler token never leaks; resolution still keys
+				// off the qualified token (it is the global-book key).
+				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
 			}
 			fmt.Fprintf(buf, "      Destination addresses:\n")
 			for _, addr := range pol.Match.DestinationAddresses {
 				resolved := grpcResolveAddress(cfg, addr)
-				fmt.Fprintf(buf, "        %s%s\n", addr, resolved)
+				// #3358: unqualify a synthetic zone-local key (#3061,
+				// zone-local/<zone>/<name>) to the authored book name so the
+				// internal compiler token never leaks; resolution still keys
+				// off the qualified token (it is the global-book key).
+				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
 			}
 			fmt.Fprintf(buf, "      Applications:\n")
 			for _, app := range pol.Match.Applications {

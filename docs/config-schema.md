@@ -2075,6 +2075,34 @@ scoped to security-policy match addresses. Regression coverage:
 `TestAddressBookNameSlashNormalConfigUnaffected` — prefix-value anti-over-reject,
 `TestAddressBookNameSlashLenientDowngrades` — tolerant-path warning).
 
+**Operator display (#3358).** The synthetic `zone-local/<zone>/<name>` key is an
+INTERNAL identity, never an operator-facing string. The display surfaces that
+render a policy's match addresses unqualify it back to the authored name via
+`config.ZoneLocalUnqualify` / `config.DisplayAddressName(s)` (the inverse of
+`zoneLocalQualify`, unambiguous because no operator name contains `/`): the CLI
+`show security policies detail` renders `web(zone trust): <prefix>` (NOT the old
+`zone-local/trust/web(global)` — a zone-scoped object must not be mislabelled
+`(global)`), the CLI standard `show security policies` view shows the bare
+authored name (`joinDisplayAddressNames`), the gRPC `show security policies`
+text shows `web (<prefix>)`, and the REST (`GET /api/v1/security/policies`) +
+gRPC (`GetPolicies`) inventories list the bare authored name (`web`), with the
+zone implied by the rule's from/to-zone. `show security match-policies` is
+covered at its SSOT: `policymatch.matchedResult` (the shared simulator feeding
+all three match-policies transports — CLI, gRPC `MatchPolicies`, REST
+`MatchPoliciesResult`) unqualifies `Result.Src/DstAddresses` once, so no
+transport leaks the token. `Result.Src/DstAddresses` are display-only —
+re-matching reads `pol.Match` directly — so the unqualification cannot affect
+the verdict. CIDR resolution still keys off the qualified token (it is the
+global-book key). Regression coverage:
+`pkg/config/zone_local_unqualify_3358_test.go` (helper round-trip + no-op
+fall-through + non-mutation),
+`pkg/cli/cli_show_security_zone_local_3358_test.go` (detail view, source +
+destination, with a global-name control),
+`pkg/cli/cli_show_security_flat_zone_local_3358_test.go` (standard flat view),
+`pkg/grpcapi/server_show_policies_zone_local_3358_test.go` (GetPolicies + text),
+`pkg/api/security_zone_local_3358_test.go` (REST inventory), and
+`pkg/policymatch/zone_local_display_3358_test.go` (match-policies SSOT).
+
 ### #2399 — firewall-filter unknown `then` action + unsupported `from protocol` (commit fail-closed)
 
 Two fail-OPEN behaviors in the firewall-filter compiler, both now rejected
