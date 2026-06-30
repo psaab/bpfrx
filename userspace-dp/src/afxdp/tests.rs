@@ -1107,6 +1107,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
         pool_address: "10.0.61.102".to_string(),
         pool_port: 8443,
         match_source_ports: vec![],
+        match_destination_ports: vec![],
         match_icmp_type: None,
         match_icmp_code: None,
     }];
@@ -10290,6 +10291,7 @@ fn inbound_dnat_snapshot(policy: PolicyRuleSnapshot) -> ConfigSnapshot {
         pool_address: "10.0.61.102".to_string(),
         pool_port: 8443,
         match_source_ports: vec![],
+        match_destination_ports: vec![],
         match_icmp_type: None,
         match_icmp_code: None,
     }];

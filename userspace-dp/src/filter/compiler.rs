@@ -433,6 +433,53 @@ fn parse_term(
             term: snap.name.clone(),
         });
     }
+    // #3406: the Go control plane sets these markers when it could not resolve a
+    // `from icmp-type`/`icmp-code` token to a byte in 0..255, or a `from dscp`
+    // match token to a code-point/0..63. The pre-fix builder dropped the bad token
+    // and emitted only the resolved values; an all-unresolvable list emitted an
+    // EMPTY vector, which the matcher reads as "no constraint" — silently widening
+    // the term (fail-WIDE for a `then discard`/`reject`). Fail the whole snapshot
+    // closed instead, mirroring the #2505/#3367 backstops. Checked before any
+    // mutation so the preflight stays non-mutating.
+    if snap.icmp_type_unrepresentable {
+        return Err(SnapshotIntegrityError::UnrepresentableFilterICMP {
+            family: filter_family.to_string(),
+            filter: filter_name.to_string(),
+            term: snap.name.clone(),
+            dimension: "icmp-type",
+        });
+    }
+    if snap.icmp_code_unrepresentable {
+        return Err(SnapshotIntegrityError::UnrepresentableFilterICMP {
+            family: filter_family.to_string(),
+            filter: filter_name.to_string(),
+            term: snap.name.clone(),
+            dimension: "icmp-code",
+        });
+    }
+    if snap.dscp_match_unrepresentable {
+        return Err(SnapshotIntegrityError::UnrepresentableFilterDSCP {
+            family: filter_family.to_string(),
+            filter: filter_name.to_string(),
+            term: snap.name.clone(),
+        });
+    }
+    // #3406: a present flex_match whose byte length is outside 1..=4 is
+    // unrepresentable (the value/mask wire fields are u32). The pre-fix Go builder
+    // capped an oversized width to 4 and still emitted the term, so only the
+    // truncated window was compared and the match BROADENED (fail-open); the
+    // matcher's `flex_enabled` derivation below would also silently disable an
+    // out-of-range flex (no constraint = match-any). Fail the snapshot closed.
+    if let Some(fm) = snap.flex_match.as_ref() {
+        if !(1..=4).contains(&fm.length) {
+            return Err(SnapshotIntegrityError::UnrepresentableFilterFlexMatch {
+                family: filter_family.to_string(),
+                filter: filter_name.to_string(),
+                term: snap.name.clone(),
+                length: fm.length,
+            });
+        }
+    }
     let mut source_v4 = Vec::new();
     let mut source_v6 = Vec::new();
     for addr in &snap.source_addresses {

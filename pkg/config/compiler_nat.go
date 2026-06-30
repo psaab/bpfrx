@@ -1629,6 +1629,28 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 // reported as an invalid token. Out-of-range numerics (0, -1, 70000) DO parse
 // as integers, so they flow through `ports` and are range-checked downstream
 // (validateNATMatchDestinationPortStrict + the 1..65535 builder filter).
+// appendDNATPortRange expands an inclusive `low to high` destination-port range
+// into individual ports, BOUNDED to the valid 1..65535 port space (#3449). The
+// per-port `for p := low; p <= high` loops below used operator-supplied
+// endpoints with no upper bound, so a huge/garbage range (e.g.
+// `destination-port 1 to 4000000000`) allocated billions of ints at COMPILE
+// time — a control-plane OOM that triggered BEFORE the strict commit gate could
+// reject the out-of-range endpoint. When either endpoint is outside 1..65535
+// the range is NOT expanded; both endpoints are appended verbatim so
+// validateNATMatchDestinationPortStrict (#3446) still sees and rejects the
+// out-of-range value (fail-closed at commit). A valid in-range range expands to
+// at most 65535 ints, which the snapshot builder coalesces back into one
+// compact wire range (no per-port table entry blow-up).
+func appendDNATPortRange(ports []int, low, high int) []int {
+	if low < 1 || low > 65535 || high < 1 || high > 65535 {
+		return append(ports, low, high)
+	}
+	for p := low; p <= high; p++ {
+		ports = append(ports, p)
+	}
+	return ports
+}
+
 func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 	addInvalid := func(tok string) {
 		// `to` is the range keyword; `[`/`]` are bracket-list delimiters that
@@ -1658,9 +1680,7 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 			}
 			if i+2 < len(vals) && vals[i+1] == "to" {
 				if high, err2 := strconv.Atoi(vals[i+2]); err2 == nil && high >= low {
-					for p := low; p <= high; p++ {
-						ports = append(ports, p)
-					}
+					ports = appendDNATPortRange(ports, low, high)
 					i += 2
 					continue
 				}
@@ -1677,9 +1697,7 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 				toChild := m.FindChild("to")
 				if toChild != nil {
 					if high, err2 := strconv.Atoi(nodeVal(toChild)); err2 == nil && high >= low {
-						for p := low; p <= high; p++ {
-							ports = append(ports, p)
-						}
+						ports = appendDNATPortRange(ports, low, high)
 						return ports, invalid
 					}
 				}
@@ -1700,18 +1718,14 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 			// Hierarchical range: "20000 to 30000" → leaf Keys=["20000", "to", "30000"]
 			if len(child.Keys) >= 3 && child.Keys[1] == "to" {
 				if high, err2 := strconv.Atoi(child.Keys[2]); err2 == nil && high >= low {
-					for p := low; p <= high; p++ {
-						ports = append(ports, p)
-					}
+					ports = appendDNATPortRange(ports, low, high)
 					continue
 				}
 			}
 			// Sibling-node range: child[i]="20000", child[i+1]="to", child[i+2]="30000"
 			if i+2 < len(m.Children) && m.Children[i+1].Name() == "to" {
 				if high, err2 := strconv.Atoi(m.Children[i+2].Name()); err2 == nil && high >= low {
-					for p := low; p <= high; p++ {
-						ports = append(ports, p)
-					}
+					ports = appendDNATPortRange(ports, low, high)
 					i += 2
 					continue
 				}

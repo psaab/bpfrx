@@ -600,6 +600,63 @@ rule matches NOTHING — it never widens to the wildcard port. A rule with no
 `destination_port` slot and simply drops a term that would have wildcarded, so
 `protocol_wire_v1.json` is unchanged.
 
+## 13a. `match destination-port` range compaction (#3449)
+
+A DNAT `match destination-port low to high` range was expanded into one
+snapshot/table entry PER PORT, with no bound, on TWO axes — a control-plane
+amplification hazard:
+
+- **M01** — the parser (`parseDNATPortList`) expanded `low to high` with an
+  unbounded `for p := low; p <= high` over operator-supplied endpoints, so
+  `destination-port 1 to 4000000000` allocated billions of ints at COMPILE
+  time (OOM) BEFORE the §13 strict gate could reject the out-of-range value;
+  and a valid `1 to 65535` then produced 65 535 DNAT table entries.
+- **M02** — an `applications application WIDE destination-port 1-65535`
+  referenced by a DNAT rule expanded the same way through `appPortsFromSpec`,
+  multiplied by application-set member count.
+
+The Rust DNAT matcher already supports a port-RANGE match as an `l4_extra_matches`
+AND-filter (the `match_src_ports` / `port_in_ranges` mechanism added for the
+application source-port constraint, §"H10" / #3437). The fix represents a wide
+destination-port range the same way instead of expanding it:
+
+- **Parser bound (`appendDNATPortRange`).** A `low to high` range is expanded
+  only when BOTH endpoints are inside 1..65535 (so the loop is bounded to
+  ≤65535 ints); an out-of-range endpoint is NOT expanded — both endpoints are
+  recorded verbatim on `DestinationPorts` so the §13 strict gate
+  (`validateNATMatchDestinationPortStrict`) still rejects the bad value at
+  commit (fail-closed). This removes the compile-time OOM. (`appPortsFromSpec`
+  was already bounded — it parses endpoints with `ParseUint(..,16)`.)
+
+- **Builder compaction (`buildDestinationNATSnapshotsWithFeeds`).** Each term's
+  valid ports are coalesced with `coalescePortRanges` into inclusive `[Low,High]`
+  wire ranges. A single port (`Low==High`, including the `[0,0]` wildcard) keeps
+  the exact-port `DnatKey` O(1) fast path (`destination_port` set,
+  `match_destination_ports` empty — unchanged for the common single-port and
+  IP-only rules). A multi-port range is emitted as ONE wildcard-port entry
+  (`destination_port == 0`) carrying the range on the NEW
+  `match_destination_ports` wire field — so `destination-port 1 to 65535` is one
+  entry, not 65 535.
+
+- **Matcher (`nat/destination.rs`).** `DnatEntry.match_dst_ports` is checked in
+  `l4_extra_matches(src_port, dst_port, packet_icmp)` via `port_in_ranges`: the
+  wildcard-port (`dst_port=0`) probe tier finds the entry and the range
+  AND-filter confirms the flow's destination port is in range; a port outside
+  the range misses (the range entry is NOT a match-any wildcard). A `Low>High`
+  range never matches (preserved verbatim, like the source-port never-match
+  sentinel). `match_dst_ports` is part of the entry's dedup identity (two range
+  rules differing only in range are distinct). The prefix (#3164 LPM) tier
+  threads `dst_port` the same way.
+
+**Wire.** New ADDITIVE field `DestinationNATRuleSnapshot.match_destination_ports`
+(`[]NatPortRangeWire`, `omitempty`; Rust `#[serde(default)]`), regenerated into
+`protocol_wire_v1.json`. Skew (#1961): an older helper that does not know the
+field treats a `destination_port==0` range entry as match-ANY-port — a transient
+fail-OPEN widening of that ONE entry during the upgrade window, the same tradeoff
+the source-NAT range fields carry; an older Go binary omits it and the newer
+helper falls back to the per-port `destination_port` expansion such a binary
+still emits.
+
 ## 14. DNAT pool port/address validation (#3450)
 
 A destination-NAT **pool**'s translated `port` and `address` had NO strict

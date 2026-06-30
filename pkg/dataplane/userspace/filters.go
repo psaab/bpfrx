@@ -121,7 +121,41 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// separate wire fields; the Rust matcher inverts membership.
 		snap.SourcePortsExcept = append(snap.SourcePortsExcept, term.SourcePortsExcept...)
 		snap.DestPortsExcept = append(snap.DestPortsExcept, term.DestPortsExcept...)
+		// #3406: a single direction carrying BOTH a positive port list and a
+		// `*-port-except` list has no single-inversion representation, so the Rust
+		// filter compiler resolves it POSITIVE-WINS (the except list is ignored —
+		// `source_port_except`/`dest_port_except` only fire when the positive list is
+		// empty, see parse_term in userspace-dp/src/filter/compiler.rs). That is the
+		// fail-safe resolution (it narrows to the positive scope, never widens), but
+		// the pre-#3406 path dropped the except side SILENTLY. This shape is
+		// hard-rejected at commit (validateFilterPortExceptStrict, #2622/#3297/#3302);
+		// it reaches here only on the lenient / peer-sync path. Surface the dropped
+		// except set with a warning so it is operator-visible — symmetric with the
+		// mixed address-except warning in resolvePrefixListAddrs (#3359). Warn (not
+		// fail-closed) because positive-wins narrows rather than widens, so unlike the
+		// ICMP/DSCP/flex cases there is no silent fail-open to backstop.
+		if portsHaveReal(term.SourcePorts) && portsHaveReal(term.SourcePortsExcept) {
+			slog.Warn("firewall filter term mixes a positive source-port list with a "+
+				"source-port-except list; the except list is ignored (positive-wins). "+
+				"Split into separate terms (commit rejects this shape, #2622).",
+				"filter", filterName, "term", term.Name)
+		}
+		if portsHaveReal(term.DestinationPorts) && portsHaveReal(term.DestPortsExcept) {
+			slog.Warn("firewall filter term mixes a positive destination-port list with a "+
+				"destination-port-except list; the except list is ignored (positive-wins). "+
+				"Split into separate terms (commit rejects this shape, #2622).",
+				"filter", filterName, "term", term.Name)
+		}
 		// DSCP (#2545: multi-value — emit every resolved code point).
+		// #3406: a `from dscp` / `from traffic-class` MATCH token that resolves to
+		// neither a known code-point name nor an integer 0..63 is UNREPRESENTABLE.
+		// The strict commit gate (validateFilterDSCPStrict, #3309) rejects it; on
+		// the lenient / peer-sync path it reaches here. The pre-#3406 builder
+		// silently dropped the bad token — when EVERY token was unresolvable the
+		// emitted vector was empty, which the Rust matcher reads as "no DSCP
+		// constraint" → the DSCP dimension is dropped and the term WIDENS
+		// (fail-OPEN). Mark the term so the Rust filter compiler fails the snapshot
+		// CLOSED instead of dropping the constraint.
 		for _, d := range term.DSCPs {
 			if d == "" {
 				continue
@@ -130,9 +164,18 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 				snap.DSCPValues = append(snap.DSCPValues, val)
 			} else if v, err := strconv.Atoi(d); err == nil && v >= 0 && v <= 63 {
 				snap.DSCPValues = append(snap.DSCPValues, uint8(v))
+			} else {
+				snap.DSCPMatchUnrepresentable = true
 			}
 		}
-		// DSCP rewrite
+		// DSCP rewrite. #3406: an unrepresentable `then dscp` / `then traffic-class`
+		// REWRITE token is CoS-only — it changes no match/action semantics, only a
+		// marking side effect — so it does NOT fail the snapshot closed (that would
+		// brick forwarding over a cosmetic marking). The strict commit gate
+		// (validateFilterDSCPStrict) rejects it for fresh configs; on the lenient /
+		// peer-sync path it reaches here. Surface the silent drop with a warning
+		// (the pre-#3406 builder emitted NO rewrite and NO signal) so the lost CoS
+		// marking is operator-visible.
 		if term.DSCPRewrite != "" {
 			if val, ok := dataplane.DSCPValues[strings.ToLower(term.DSCPRewrite)]; ok {
 				rewrite := val
@@ -140,6 +183,10 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			} else if v, err := strconv.Atoi(term.DSCPRewrite); err == nil && v >= 0 && v <= 63 {
 				rewrite := uint8(v)
 				snap.DSCPRewrite = &rewrite
+			} else {
+				slog.Warn("dropping unresolvable filter term dscp/traffic-class rewrite "+
+					"(CoS marking lost — the term still matches and acts)",
+					"filter", filterName, "term", term.Name, "dscp_rewrite", term.DSCPRewrite)
 			}
 		}
 		// Per-packet L4 match conditions (#2362). Previously parsed but
@@ -187,6 +234,22 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 				snap.ICMPCodes = append(snap.ICMPCodes, uint8(c))
 			}
 		}
+		// #3406: a `from icmp-type` / `from icmp-code` token the compiler could not
+		// resolve to a byte in 0..255 (a symbolic name with no mapping, or a
+		// numeric value out of range) is recorded on term.UnknownICMPTypes /
+		// term.UnknownICMPCodes by compileFilterFrom. The strict commit gate
+		// (validateFilterMatchValuesStrict) rejects it; on the lenient / peer-sync
+		// path it reaches here. The loops above emit only the RESOLVED bytes — when
+		// every token was unresolvable the emitted vector is empty, which the Rust
+		// matcher reads as "no ICMP constraint" → the dimension is dropped and the
+		// term WIDENS (fail-OPEN). Mark the term so the Rust filter compiler fails
+		// the snapshot CLOSED rather than silently widening it.
+		if len(term.UnknownICMPTypes) > 0 {
+			snap.ICMPTypeUnrepresentable = true
+		}
+		if len(term.UnknownICMPCodes) > 0 {
+			snap.ICMPCodeUnrepresentable = true
+		}
 		// Flexible-match-range (#3077). Previously parsed + compiled for the
 		// retired legacy dataplane (pkg/dataplane/compiler_filter.go) but
 		// silently dropped here, so the byte-offset constraint never reached the
@@ -209,9 +272,16 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			if length == 0 {
 				length = 4 // default 32-bit, matching compiler_filter.go
 			}
-			if length > 4 {
-				length = 4 // the wire value is a u32; cap defensively
-			}
+			// #3406: do NOT cap an oversized width to 4. The commit gate bounds
+			// bit-length to 1..32 (validateFilterFlexMatchStrict), so ceil(bits/8) is
+			// always 1..4 for a committed config; a length > 4 can only arrive via a
+			// corrupt / hand-built / version-drifted snapshot (BitLength is a u8, so
+			// the max possible is ceil(255/8) = 32 — no uint8 overflow below).
+			// Capping it to 4 and still emitting the term compared only the truncated
+			// 4-byte window, BROADENING the match (fail-open). Carry the real width so
+			// the Rust filter compiler raises
+			// SnapshotIntegrityError::UnrepresentableFilterFlexMatch and rejects the
+			// whole snapshot instead.
 			// #3232: carry the match-start base. layer-3 (default) maps to ""
 			// so the wire stays byte-identical for every pre-#3232 term
 			// (omitempty); only an explicit layer-4 emits a value. The compiler
@@ -310,6 +380,21 @@ func resolvePrefixListAddrs(
 // (constrained + empty-positive = match NOTHING) instead of the Junos match-ALL,
 // a control-plane lockout risk on the lo0 host filter (#3433 H01).
 func filterAddrIsReal(a string) bool { return a != "" && a != "any" }
+
+// portsHaveReal reports whether a port-match list carries at least one real
+// (non-empty) entry, mirroring the Rust matcher's port_is_real
+// (userspace-dp/src/filter/compiler.rs). It backs the #3406 mixed positive +
+// `*-port-except` warning: the Rust compiler resolves a mixed direction
+// positive-wins (the except side is dropped), so the Go builder surfaces the
+// drop only when BOTH sides actually carry a real port.
+func portsHaveReal(ports []string) bool {
+	for _, p := range ports {
+		if p != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // ResolveFilterPrefixListAddrs is the SHARED single source of truth for lowering
 // a firewall-filter term's source/destination address + prefix-list scope into

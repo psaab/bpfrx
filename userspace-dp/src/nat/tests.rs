@@ -5986,6 +5986,7 @@ fn parsed_nat_rules_share_store_counters() {
             pool_address: "10.0.0.20".to_string(),
             pool_port: 8443,
             match_source_ports: vec![],
+            match_destination_ports: vec![],
             match_icmp_type: None,
             match_icmp_code: None,
         }],
@@ -7492,6 +7493,59 @@ fn dnat_undefined_application_never_match_sentinel_fails_closed_3434() {
                 .lookup_with_counter(proto, src, dst, sp, dp, "", icmp)
                 .is_none(),
             "undefined-app never-match sentinel must reject proto={proto} sport={sp} dport={dp}"
+        );
+    }
+}
+
+// #3449: a DNAT `match destination-port low to high` range rides ONE
+// wildcard-port entry (destination_port=0) carrying a match_destination_ports
+// range, instead of one exact-port entry per port. The lookup must translate a
+// flow whose destination port falls in the range and miss one outside it. A
+// pool_port of 0 preserves the destination port (the range maps each port to
+// itself). RED-on-revert: drop the match_dst_ports check in l4_extra_matches
+// and the out-of-range port is wrongly translated (the wildcard entry widens to
+// match-any-port).
+#[test]
+fn dnat_destination_port_range_3449() {
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "range".to_string(),
+            from_zone: "untrust".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 0,
+            match_destination_ports: vec![NatPortRangeWire {
+                low: 20000,
+                high: 30000,
+            }],
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 0,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let src: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+
+    // In-range ports translate the destination (port preserved, pool_port=0).
+    for port in [20000u16, 25000, 30000] {
+        let decision = table.lookup(PROTO_TCP, src, dst, port, "untrust");
+        assert_eq!(
+            decision,
+            Some(NatDecision {
+                rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+                ..NatDecision::default()
+            }),
+            "in-range dport {port} must DNAT to the pool"
+        );
+    }
+
+    // Out-of-range ports must NOT match (the range entry is not a match-any
+    // wildcard).
+    for port in [19999u16, 30001, 80] {
+        assert!(
+            table.lookup(PROTO_TCP, src, dst, port, "untrust").is_none(),
+            "out-of-range dport {port} must NOT match the [20000,30000] range entry"
         );
     }
 }

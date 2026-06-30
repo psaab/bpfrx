@@ -148,6 +148,63 @@ pub(crate) enum SnapshotIntegrityError {
         filter: String,
         term: String,
     },
+    /// #3406: a firewall-filter term carried the `icmp_type_unrepresentable` /
+    /// `icmp_code_unrepresentable` wire marker — the Go control plane could not
+    /// resolve a `from icmp-type` / `from icmp-code` token to a byte in 0..255 (a
+    /// symbolic name with no mapping, or a numeric value out of range). The pre-fix
+    /// Go builder dropped the unresolved token and emitted only the resolved bytes;
+    /// when EVERY token was unresolvable the `icmp_types` / `icmp_codes` vector was
+    /// empty, which the matcher reads as "no ICMP constraint" — silently WIDENING
+    /// the term to match every ICMP(v6) packet (fail-OPEN for a `then
+    /// discard`/`reject` term). The Go commit gate (`validateFilterMatchValuesStrict`)
+    /// is the primary defense — a committed config never sets the marker — so this
+    /// is the helper-boundary backstop for a corrupt / hand-built / version-drifted
+    /// snapshot, consistent with the #2505/#3367 fail-closed family. Rejecting the
+    /// whole snapshot (the reconcile preflight keeps the previous good filter state)
+    /// is action-agnostic. `dimension` is "icmp-type" or "icmp-code". `family`
+    /// (inet / inet6) is carried because filter names can be reused across families.
+    UnrepresentableFilterICMP {
+        family: String,
+        filter: String,
+        term: String,
+        dimension: &'static str,
+    },
+    /// #3406: a firewall-filter term carried the `dscp_match_unrepresentable` wire
+    /// marker — the Go control plane could not resolve a `from dscp` / `from
+    /// traffic-class` MATCH token to a known code-point name or an integer 0..63.
+    /// The pre-fix Go builder dropped the bad token from `dscp_values`; when EVERY
+    /// token was unresolvable the vector was empty, which the matcher reads as "no
+    /// DSCP constraint" — silently WIDENING the term to match all DSCPs (fail-OPEN,
+    /// the documented #3309 gap). The Go commit gate (`validateFilterDSCPStrict`) is
+    /// the primary defense; this is the helper-boundary backstop, consistent with
+    /// the #2505/#3367 fail-closed family. An unrepresentable `then dscp` REWRITE is
+    /// CoS-only (no match/action widening) and is surfaced with a Go builder warning
+    /// rather than this snapshot reject. `family` (inet / inet6) is carried because
+    /// filter names can be reused across families.
+    UnrepresentableFilterDSCP {
+        family: String,
+        filter: String,
+        term: String,
+    },
+    /// #3406: a firewall-filter term's `flex_match` carried a byte `length` outside
+    /// the representable 1..=4 range (the `value` / `mask` wire fields are u32). The
+    /// pre-fix Go builder CAPPED an oversized width to 4 and still emitted the term,
+    /// so only the truncated 4-byte window was compared and the match BROADENED
+    /// (fail-OPEN). The Go commit gate (`validateFilterFlexMatchStrict`) bounds
+    /// bit-length to 1..32 → ceil(bits/8) ≤ 4, so a committed config never produces
+    /// an out-of-range length; this is the helper-boundary backstop for a corrupt /
+    /// hand-built / version-drifted snapshot, consistent with the #2505/#3367
+    /// fail-closed family. A length of 0 with a present `flex_match` is likewise
+    /// rejected (the Go builder defaults an unset bit-length to a 4-byte window, so
+    /// 0 only arrives via drift). Rejecting the whole snapshot keeps the previous
+    /// good filter state. `family` (inet / inet6) is carried because filter names
+    /// can be reused across families.
+    UnrepresentableFilterFlexMatch {
+        family: String,
+        filter: String,
+        term: String,
+        length: u8,
+    },
     /// #3296: an interface (or lo0) snapshot named a NON-EMPTY firewall filter
     /// (`filter_input_v4/v6` / `filter_output_v4/v6`, or the lo0 host-bound
     /// filter) that is not present in the compiled filter table. The pre-fix
@@ -369,6 +426,35 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "firewall family {:?} filter {:?} term {:?} has an unparseable tcp-flags expression — refusing to fail wide by dropping it (which would make the term match every TCP segment)",
                 family, filter, term
+            ),
+            Self::UnrepresentableFilterICMP {
+                family,
+                filter,
+                term,
+                dimension,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} has an unresolvable {} token — refusing to fail wide by dropping it (which would make the term match every ICMP packet)",
+                family, filter, term, dimension
+            ),
+            Self::UnrepresentableFilterDSCP {
+                family,
+                filter,
+                term,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} has an unresolvable from-dscp/traffic-class match token — refusing to fail wide by dropping it (which would make the term match every DSCP)",
+                family, filter, term
+            ),
+            Self::UnrepresentableFilterFlexMatch {
+                family,
+                filter,
+                term,
+                length,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} has a flexible-match-range byte length {} outside the representable 1..=4 range — refusing to truncate it to a 4-byte window (which would broaden the match)",
+                family, filter, term, length
             ),
             Self::MissingFilterRef {
                 interface,
