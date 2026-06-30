@@ -184,7 +184,18 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			}
 
 			if (statsEnabled || rule.Count) && s.dp != nil && s.dp.IsLoaded() {
-				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(len(pi.Rules))
+				// #3474: the counter read handle MUST use the RAW slice index i,
+				// not len(pi.Rules) (the compacted, nil-skipped count). The
+				// resolver (policyRuleIDForCounter) and every other caller —
+				// metrics_counters.go's policyCounterID(policySetID, i),
+				// cli_show_security*.go, server_show_policies_text.go, and this
+				// function's OWN global-policy loop below (+ uint32(i)) — key off
+				// the raw slice index. With a nil rule before a real rule
+				// len(pi.Rules) would lag i and mis-resolve this rule's counter;
+				// using i keeps every counter handle on the one raw-slice-index
+				// SSOT. (Nil rules are not reachable via any production config
+				// path today; this is defensive SSOT-alignment, like #3476/#3494.)
+				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
