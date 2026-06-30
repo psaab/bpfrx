@@ -4960,3 +4960,48 @@ fn store_clear_bumps_generation_for_all_counters_3448() {
         "store clear must invalidate pre-clear pending batches — #3448"
     );
 }
+
+// #3451: lock the per-rule counter VALUE contract that the snapshot path
+// exposes to `show security policies hit-count` / REST / Prometheus: `add` and
+// `add_batch` accumulate into the right field, `snapshot` reports packets as
+// packets and bytes as bytes (NO swap), and `reset` zeroes BOTH fields. These
+// totals are exact regardless of the relaxed-pair semantics documented on
+// `PolicyRuleCounter` (the pair can straddle one in-flight update, but each
+// field's total never tears or double-counts). Reverting the field mapping —
+// e.g. a packets/bytes swap in `snapshot`/`add_batch`, dropping an `add`, or a
+// half-`reset` — makes one of these assertions RED.
+#[test]
+fn policy_rule_counter_snapshot_pairs_totals() {
+    let counter = PolicyRuleCounter::default();
+
+    // Single-packet adds (cold path): packet count +1 each, bytes += len.
+    counter.add(100);
+    counter.add(40);
+    // Coalesced batch (established fast path, #3073): distinct packet and byte
+    // magnitudes so a swap would be caught.
+    counter.add_batch(3, 450);
+
+    let snap = counter.snapshot("trust->untrust/allow-web");
+    assert_eq!(snap.rule_id, "trust->untrust/allow-web");
+    assert_eq!(
+        snap.packets, 5,
+        "packets must accumulate add + add_batch (2 + 3), not bytes"
+    );
+    assert_eq!(
+        snap.bytes, 590,
+        "bytes must accumulate add + add_batch (100 + 40 + 450), not packets"
+    );
+
+    // A zero-length add still counts the packet but adds no bytes.
+    counter.add(0);
+    let snap = counter.snapshot("trust->untrust/allow-web");
+    assert_eq!(snap.packets, 6, "a zero-length packet still increments packets");
+    assert_eq!(snap.bytes, 590, "a zero-length packet adds no bytes");
+
+    // reset must zero BOTH fields (a half-reset leaving one field stale would
+    // make `clear security policies hit-count` lie).
+    counter.reset();
+    let snap = counter.snapshot("trust->untrust/allow-web");
+    assert_eq!(snap.packets, 0, "reset must zero packets");
+    assert_eq!(snap.bytes, 0, "reset must zero bytes");
+}

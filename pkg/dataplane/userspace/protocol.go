@@ -1909,6 +1909,19 @@ type FirewallFilterTermCounterStatus struct {
 	Bytes      uint64 `json:"bytes,omitempty"`
 }
 
+// PolicyRuleCounterStatus is one per-rule security-policy hit counter reported
+// by the userspace dataplane, keyed by the stable RuleID string
+// (`from->to/name`; the reserved "default-policy" id carries the implicit
+// default-policy hits, #3363). Packets/Bytes are cumulative since helper start
+// (or last `clear security policies hit-count`).
+//
+// #3451: Packets and Bytes are read from two independent relaxed atomics in the
+// helper, so each total is exact but the PAIR is only eventually consistent — a
+// single snapshot may pair a freshly bumped packet count with a byte count that
+// has not yet absorbed that packet (skew bounded by one in-flight per-worker
+// batch). Consumers that derive a bytes/packets ratio (CLI, REST, Prometheus)
+// must treat it as approximate at sub-poll granularity; the fields reconcile
+// over any poll interval. See the Rust `PolicyRuleCounter` type doc.
 type PolicyRuleCounterStatus struct {
 	RuleID  string `json:"rule_id,omitempty"`
 	Packets uint64 `json:"packets,omitempty"`

@@ -62,7 +62,7 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 
 	// Event mode: write to local file instead of remote syslog
 	if cfg.Security.Log.Mode == "event" {
-		er.SetSyslogClients(nil) // clear any remote clients
+		er.ReplaceSyslogClients(nil) // close + clear any remote clients (#3579)
 		lw, err := logging.NewLocalLogWriter(logging.LocalLogConfig{})
 		if err != nil {
 			slog.Warn("failed to create local log writer", "err", err)
@@ -89,7 +89,10 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		// matters most after #3351: a down-at-apply TCP/TLS stream is now an
 		// installed RECONNECTING client, so without this it would resume
 		// sending audit logs to a removed receiver once that receiver recovers.
-		er.SetSyslogClients(nil)
+		// ReplaceSyslogClients (not the non-closing SetSyslogClients) also
+		// Closes the superseded clients' connections so a CONNECTED stream's
+		// fd is not leaked when all streams are removed (#3579).
+		er.ReplaceSyslogClients(nil)
 		d.applyAggregator(er, cfg)
 		return
 	}
@@ -157,9 +160,22 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 			"category", stream.Category)
 		clients = append(clients, client)
 	}
-	if len(clients) > 0 {
-		er.SetSyslogClients(clients)
-	}
+	// #3579: install the freshly-built client set AND close the superseded
+	// set in one atomic swap. applySyslogConfig rebuilds every SyslogClient
+	// from config on each apply (the loop above always constructs new
+	// objects via NewSyslogClientTransport), so the prior set is ALWAYS fully
+	// superseded by-object and every old client's connection must be closed —
+	// otherwise a re-apply that changed or dropped a CONNECTED TCP/TLS stream
+	// would leak the old socket (fd). ReplaceSyslogClients (the closing
+	// variant the CLI apply path already uses, pkg/cli/apply.go) closes the
+	// old set AFTER releasing syslogMu, and SyslogClient.Close only takes the
+	// client's own mutex (no slog under it), so the close cannot re-enter the
+	// slog->syslog handler path under a held lock (#2285). The prior
+	// len(clients) > 0 guard is intentionally gone: when streams are
+	// configured but none could be built (all UDP construction failures), the
+	// old clients must still be torn down rather than left forwarding to a
+	// stale destination.
+	er.ReplaceSyslogClients(clients)
 	d.applyAggregator(er, cfg)
 }
 
