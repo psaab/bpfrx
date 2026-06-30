@@ -1010,6 +1010,21 @@ impl Clone for PolicyRule {
 pub(crate) struct PolicyRuleCounter {
     packets: AtomicU64,
     bytes: AtomicU64,
+    /// #3395: the stable rule identity (`stable_policy_rule_id`, the
+    /// `from->to/name` string, or `DEFAULT_POLICY_COUNTER_RULE_ID` for the
+    /// implicit default-policy counter) this counter belongs to. Set once at
+    /// creation in `PolicyCounterStore::rule_hit_counter` and never mutated, so
+    /// a session that BOUND this `Arc` at install (`SessionMetadata::
+    /// policy_counter`, #3322) can recover the stable identity of its admitting
+    /// rule from the bound handle alone — without a new per-session field. Used
+    /// by `PolicyState::reresolve_session_policy_id` to re-resolve the CURRENT
+    /// positional `policy_id` (#3056) of an established session at the local
+    /// publish surfaces (live-row refresh + RT_FLOW SESSION_CLOSE), so a live
+    /// mid-list policy insert/delete no longer mis-attributes the session
+    /// (#3395). The placeholder `Default` counters (`PolicyRule::default()` /
+    /// `PolicyState::default()`) carry an empty id; production counters always
+    /// flow through `rule_hit_counter` and carry the real id.
+    rule_id: Box<str>,
     /// #3448: clear epoch. `clear security policies hit-count` resets the
     /// shared `packets`/`bytes` atomics but cannot reach the per-worker
     /// pending hit-count batches buffered by `record_policy_hit_counter`
@@ -1023,6 +1038,26 @@ pub(crate) struct PolicyRuleCounter {
 }
 
 impl PolicyRuleCounter {
+    /// #3395: construct a counter that remembers the stable `rule_id` it
+    /// belongs to. Used by `PolicyCounterStore::rule_hit_counter` at first
+    /// creation; the store re-hands the same `Arc` for a surviving id across
+    /// snapshot rebuilds, so the id stays valid for the life of any session
+    /// that bound the handle.
+    fn with_rule_id(rule_id: &str) -> Self {
+        Self {
+            packets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            rule_id: Box::from(rule_id),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// #3395: the stable rule identity this counter belongs to (empty for a
+    /// `Default` placeholder). See the `rule_id` field doc.
+    pub(crate) fn rule_id(&self) -> &str {
+        &self.rule_id
+    }
+
     fn add(&self, packet_len: u64) {
         self.packets.fetch_add(1, Ordering::Relaxed);
         if packet_len != 0 {
@@ -1111,7 +1146,10 @@ impl PolicyCounterStore {
             return counter.clone();
         }
 
-        let counter = Arc::new(PolicyRuleCounter::default());
+        // #3395: stamp the stable rule id onto the counter at creation so a
+        // session that binds this Arc can later recover its admitting rule's
+        // identity from the handle alone (see PolicyRuleCounter::rule_id).
+        let counter = Arc::new(PolicyRuleCounter::with_rule_id(rule_id));
         counters.insert(rule_id.to_string(), counter.clone());
         counter
     }
@@ -1715,6 +1753,19 @@ pub(crate) struct PolicyState {
     /// not read it, so the legacy infallible test helper keeps them false.
     pub(crate) default_log_session_init: bool,
     pub(crate) default_log_session_close: bool,
+    /// #3395: O(1) re-resolution map from a rule's stable `rule_id`
+    /// (`stable_policy_rule_id`, or `DEFAULT_POLICY_COUNTER_RULE_ID` for the
+    /// implicit default policy) to its CURRENT positional `policy_id` (#3056)
+    /// in THIS snapshot. Built ONCE per snapshot in
+    /// `parse_policy_state_with_counters` (not per session), so
+    /// `reresolve_session_policy_id` is O(1) per lookup — the CLAUDE.md
+    /// control-socket-contention rule forbids an O(sessions × rules) refresh.
+    /// A bound session whose admitting rule survives the edit re-resolves to
+    /// that rule's NEW positional id; a rule that was DELETED is absent from the
+    /// map and falls back to the unattributed default-policy sentinel (#3395 /
+    /// AGY catch — never the frozen positional id a later reorder could reassign
+    /// to a different rule).
+    rule_id_to_policy_id: FxHashMap<String, u32>,
 }
 
 impl Default for PolicyState {
@@ -1733,6 +1784,9 @@ impl Default for PolicyState {
             default_counter: Arc::new(PolicyRuleCounter::default()),
             default_log_session_init: false,
             default_log_session_close: false,
+            // #3395: empty map — the Default state carries no rules, so there
+            // is nothing to re-resolve.
+            rule_id_to_policy_id: FxHashMap::default(),
         }
     }
 }
@@ -1806,6 +1860,63 @@ impl PolicyState {
         idx: u32,
     ) -> Option<&'a Arc<PolicyRuleCounter>> {
         bound.or_else(|| self.hit_counter_by_idx(idx))
+    }
+
+    /// #3395: re-resolve the CURRENT positional `policy_id` (#3056) for an
+    /// ESTABLISHED session at a local publish surface (the ~1s live-row refresh
+    /// and the RT_FLOW SESSION_CLOSE emit), so a live mid-list policy
+    /// insert/delete no longer mis-attributes the session.
+    ///
+    /// `policy_id` is span-accumulated in config order (`walkPolicyRuleSlots`),
+    /// frozen onto the session at install. A live policy edit that perturbs
+    /// earlier positions renumbers every later rule, so the frozen id resolves
+    /// to a DIFFERENT policy's name afterwards. This is the display/forensic
+    /// sibling of the #3322 hit-counter misattribution, fixed by the same
+    /// bound-handle re-resolution pattern — `policy_id` itself MUST stay
+    /// positional (the #3063 `show security policies` Index contract), so
+    /// stability comes from re-resolving at read time, NOT from making the
+    /// scalar content-stable.
+    ///
+    /// Resolution:
+    /// - `bound = Some(counter)` with a non-empty stable `rule_id` that is still
+    ///   present in this snapshot → the rule's NEW current positional id (#3063
+    ///   Index↔RT_FLOW equality preserved for the re-resolved value).
+    /// - `bound = Some(counter)` whose admitting rule was DELETED (its `rule_id`
+    ///   is absent from the current map) → the unattributed default-policy
+    ///   sentinel ([`DEFAULT_POLICY_SENTINEL_ID`], rendered `default-policy` by
+    ///   the Go log/display planes). Resolving to the FROZEN positional id here
+    ///   would be unsafe: a later reorder can shift a different extant rule into
+    ///   that index, so the session would log under the WRONG policy name (the
+    ///   AGY correctness catch). An honest "no longer attributable to an extant
+    ///   rule" beats a confidently-wrong name.
+    /// - `bound = None` (idx-0 non-policy sessions: host-local / neighbor-seed /
+    ///   fabric / tunnel; or a peer-synced session carrying only the wire
+    ///   scalar) → keep the frozen `stamped` id. There is no local stable
+    ///   identity to re-resolve from, so this preserves pre-#3395 behavior. For
+    ///   a peer-synced session this is the documented, deferred HA-peer-after-
+    ///   reorder residual (P2 — the #3322 "rule-id-on-wire" follow-up).
+    /// - `bound = Some(counter)` with an EMPTY `rule_id` (a `Default`
+    ///   placeholder that never flowed through `rule_hit_counter`; not produced
+    ///   on any production path) → keep the frozen `stamped` id (safe guard).
+    #[inline]
+    pub(crate) fn reresolve_session_policy_id(
+        &self,
+        bound: Option<&Arc<PolicyRuleCounter>>,
+        stamped: u32,
+    ) -> u32 {
+        match bound {
+            Some(counter) => {
+                let rule_id = counter.rule_id();
+                if rule_id.is_empty() {
+                    return stamped;
+                }
+                self.rule_id_to_policy_id
+                    .get(rule_id)
+                    .copied()
+                    .unwrap_or(DEFAULT_POLICY_SENTINEL_ID)
+            }
+            None => stamped,
+        }
     }
 
     /// #1635: the set of concrete `(from_zone_id, to_zone_id)` pairs the
@@ -1893,6 +2004,9 @@ pub(crate) fn parse_policy_state_with_counters(
         // infallible test helper (parse_policy_state) therefore keeps them off.
         default_log_session_init: false,
         default_log_session_close: false,
+        // #3395: populated after the rule loop below (the rules carry both the
+        // stable rule_id and the positional policy_id).
+        rule_id_to_policy_id: FxHashMap::default(),
     };
 
     // #1606: build the dense book table first. Hard-fail on
@@ -2202,6 +2316,25 @@ pub(crate) fn parse_policy_state_with_counters(
             }
         }
     }
+
+    // #3395: build the O(1) `rule_id → current positional policy_id` map once
+    // per snapshot. Each rule carries BOTH its stable `rule_id` and its
+    // positional `policy_id` (#3056), so re-resolution at the live-row refresh
+    // and the RT_FLOW SESSION_CLOSE emit is a single hash lookup per session
+    // (never an O(sessions × rules) scan). The implicit default policy maps to
+    // its reserved sentinel so a bound default-PERMIT session (#3363) re-resolves
+    // stably to `default-policy` instead of falling into the deleted-rule arm.
+    state.rule_id_to_policy_id.reserve(state.rules.len() + 1);
+    for rule in &state.rules {
+        state
+            .rule_id_to_policy_id
+            .insert(rule.rule_id.clone(), rule.policy_id);
+    }
+    state.rule_id_to_policy_id.insert(
+        DEFAULT_POLICY_COUNTER_RULE_ID.to_string(),
+        DEFAULT_POLICY_SENTINEL_ID,
+    );
+
     Ok(state)
 }
 
@@ -2712,6 +2845,35 @@ pub(crate) fn evaluate_junos_host_policy(
     packet_icmp: Option<(u8, u8)>,
     packet_len: u64,
 ) -> Option<PolicyEvaluationResult> {
+    // #3292: flow-backed and test callers carry a real L4 header — delegate
+    // with `l4_present = true`, byte-identical to pre-#3292. Only the flowless
+    // LocalDelivery arm calls `evaluate_junos_host_policy_l3_aware` directly
+    // (mirrors the #3291 `evaluate_policy_result_with_icmp` wrapper split).
+    evaluate_junos_host_policy_l3_aware(
+        state, from_id, src_ip, dst_ip, protocol, src_port, dst_port, packet_icmp,
+        packet_len, true,
+    )
+}
+
+/// #3292: L4-presence-aware `junos-host` policy evaluation. `l4_present = false`
+/// marks a flowless / no-L4 packet (a non-first fragment on the flowless
+/// LocalDelivery arm); port-bearing application terms then fail closed while
+/// `application any` / address / protocol terms still match. The
+/// `evaluate_junos_host_policy` wrapper delegates here with `l4_present = true`,
+/// so the L4 (flow-backed / test) path is byte-identical to before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_junos_host_policy_l3_aware(
+    state: &PolicyState,
+    from_id: u16,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
+    packet_len: u64,
+    l4_present: bool,
+) -> Option<PolicyEvaluationResult> {
     if !state.has_junos_host_rules || from_id == 0 {
         return None;
     }
@@ -2730,9 +2892,10 @@ pub(crate) fn evaluate_junos_host_policy(
                 dst_port,
                 packet_icmp,
                 packet_len,
-                // Host-bound (junos-host) traffic always carries a real L4
-                // header on the current call paths.
-                true,
+                // #3292: `l4_present` is false only on the flowless
+                // LocalDelivery arm (a non-first fragment); port-bearing
+                // application terms then fail closed.
+                l4_present,
             ) {
                 // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
@@ -2762,9 +2925,10 @@ pub(crate) fn evaluate_junos_host_policy(
                 dst_port,
                 packet_icmp,
                 packet_len,
-                // Host-bound (junos-host) traffic always carries a real L4
-                // header on the current call paths.
-                true,
+                // #3292: `l4_present` is false only on the flowless
+                // LocalDelivery arm (a non-first fragment); port-bearing
+                // application terms then fail closed.
+                l4_present,
             ) {
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
                 return Some(result);
