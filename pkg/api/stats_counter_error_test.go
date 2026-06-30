@@ -2,6 +2,11 @@
 // clean 0. REST returns 500; the Prometheus collector SKIPS the affected
 // sample (rather than emitting 0) and bumps xpf_counter_read_errors_total.
 //
+// #3462: collectGlobalCounters no longer EMITS xpf_counter_read_errors_total
+// itself — Collect emits it last via emitCounterReadErrors, after all
+// sub-collectors that can bump it. This test mirrors that order
+// (collectGlobalCounters then emitCounterReadErrors).
+//
 // FAIL-ON-REVERT: restoring `v, _ := dp.ReadGlobalCounter(idx)` in
 // globalStatsHandler / collectGlobalCounters makes REST return 200 with a
 // zero body and Prometheus emit the per-counter families as 0 with the error
@@ -55,6 +60,9 @@ func TestCollectGlobalCountersSkipsAndCountsReadErrors(t *testing.T) {
 
 	ch := make(chan prometheus.Metric, 64)
 	c.collectGlobalCounters(ch, dp)
+	// #3462: the error-total sample is emitted by emitCounterReadErrors (called
+	// last in Collect), not by collectGlobalCounters. Mirror that order here.
+	c.emitCounterReadErrors(ch)
 	close(ch)
 
 	var perCounterEmitted int
