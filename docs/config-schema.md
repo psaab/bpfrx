@@ -2670,6 +2670,51 @@ definition, duplicate term-generated name, distinct-names-commit incl. a
 predefined shadow, lenient-warns). Compiler-side only — not a typed `setSchema`
 leaf (applications stay opaque to `SchemaValidate`).
 
+### #3472 — generated per-term application names join the collision namespace
+
+#3339 above counted only AUTHORED `application` / `application-set` nodes. The
+GENERATED per-term names (`<parent>-<term>`, written into `apps.Applications` by
+`compileApplications`) were invisible to it, so they still silently
+last-write-wins into the map. `validateApplicationNameCollisionsAST` now builds a
+global table of every generated name → the distinct parent applications that
+produce it (`genParents` / `genOrder`) and checks it against the rest of the flat
+namespace (Codex review audit 116, H01/H02/H03 + M03):
+
+- **H01 — a generated name overwrites an authored application.** Multi-term
+  `application app` term `ssh` mints `app-ssh`; an authored `application app-ssh`
+  also exists. Both write `apps.Applications["app-ssh"]`, the later wins, and
+  policy / AppID can enforce or label the wrong application. **HARD reject**
+  (strict) / warn (lenient).
+- **H02 — a generated name collides with an authored application-set.** Generated
+  `app-ssh` (in `apps.Applications`) vs `application-set app-ssh` (in
+  `apps.ApplicationSets`). They share one flat namespace but live in different
+  maps, and the two resolvers diverge (policy expansion application-first, AppID
+  catalog application-set-first), so the token enforces one definition and is
+  attributed to the other. **HARD reject** (strict) / warn (lenient).
+- **H03 — cross-parent generated-name collision.** `application a-b term c` and
+  `application a term b-c` both mint `a-b-c`; #3339's `termSeen` was scoped per
+  parent so the later term silently won across parents. **HARD reject** (strict) /
+  warn (lenient).
+- **M03 — a generated name shadows a predefined `junos-*` application.**
+  `application junos term ssh` mints `junos-ssh`, which shadows the predefined
+  service (`ResolveApplication` prefers user-defined over predefined). This is a
+  **WARNING on BOTH paths**, never a hard reject: a generated name is a user
+  application and an authored shadow of a `junos-*` name is already a documented-
+  legitimate override (the #3339 scope note), so reserving the `junos-*`
+  namespace would be inconsistent and could brick a config an older binary
+  accepted. The warning makes an accidental shadow operator-visible.
+
+The within-parent duplicate-generated-name check (M08, #3339) is unchanged; a
+within-parent duplicate has one distinct parent so it does not trip H03.
+Regression coverage lives alongside the #3339 fixtures in
+`compiler_applications_collision_3339_test.go`
+(`TestGeneratedTermNameOverwritesAuthoredApplicationRejected`,
+`TestGeneratedTermNameCollidesWithApplicationSetRejected`,
+`TestCrossParentGeneratedNameCollisionRejected`,
+`TestGeneratedTermNameShadowsPredefinedWarns`,
+`TestGeneratedTermNameCollisionLenientWarns`,
+`TestGeneratedTermNamesNoCollisionCommit`).
+
 ### #3348 — custom `protocol junos-ping` echo constraint + `icmp-type`/`icmp-code` grammar
 
 A **user-defined** application that set `protocol junos-ping` (or `junos-pingv6`)
