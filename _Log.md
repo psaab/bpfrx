@@ -1,3 +1,31 @@
+## 2026-06-29 — #3418 NAT strict feed-only address-name: pin the carve-out across the full SNAT/DNAT matrix
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3418 (over-reject audit) — the H01 over-reject was already
+    fixed in master by the #3425 PR (commit 505793bed): the `feedBinding`
+    short-circuit in validateNATSourceAddressNameReferencesStrict's `nameError`
+    (compiler_validate_strict.go ~L5809-5831) accepts a NAT
+    `match {source,destination}-address-name` that names a feed-only
+    `security dynamic-address address-name` binding (no static address-book
+    duplicate). Root cause of the original over-reject: the pre-#3425 `defined`
+    closure consulted ONLY the static address book, so a feed-only name was
+    hard-rejected as "undefined" — contradicting the #3303 snapshot resolver
+    that unions feedOverlay[name]. The remaining #3418 L01 gap: the
+    strict-CompileConfig ACCEPT was pinned for only ONE of four combinations
+    (SNAT source, TestNATSourceAddressNameDirectFeedAccepted) — reverting the
+    carve-out would silently re-reject SNAT-dest / DNAT-source / DNAT-dest with
+    no failing test. Closed that gap with three additive feed-only-accept
+    CompileConfig tests. RED-on-revert verified: removing the feedBinding
+    short-circuit fails all four feed-accept tests with the exact #3418
+    "references undefined {source,destination}-address-name" error; the #2416 /
+    #3229 undefined-reference tests STILL pass in the reverted state (accepting
+    feed names is orthogonal to rejecting typos — no fail-open). The #3303
+    pkg/dataplane/userspace tests already cover the "snapshot carries feed
+    prefixes" half for all four paths. Test-only PR (the code fix shipped via
+    #3425). go test ./pkg/config ./pkg/cmdtree green; gofmt + go vet clean.
+  - **File(s)**: pkg/config/compiler_nat_address_name_feed_3418_test.go,
+    docs/config-schema.md, _Log.md
+
 ## 2026-06-29 — #3413 doc accuracy: pre-id-default-policy is Partial/inert, not Implemented
 
 - **Timestamp**: 2026-06-29
