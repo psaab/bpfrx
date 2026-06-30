@@ -24254,3 +24254,42 @@ top.
     pkg/daemon/README.md lo0 + host-inbound bullets document the distinct
     priorities and the ordering rationale.
   - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/nft_chain_priority_test.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-06-30
+  - **Action**: #3445 — lo0 input-filter `then` modifier nft-mirror support
+    policy + faithful reject. `nftRuleFromTerm` (now `nftRulesFromTerm`, returns
+    `[]string`) emitted only match predicates + a terminal verdict, reading only
+    `term.Action`; the non-terminating modifiers `Log`/`Count`/`Policer`/
+    `DSCPRewrite`/`ForwardingClass`/`LossPriority` were NEVER read, so every
+    modifier the compiler parses and userspace honors was silently dropped from
+    the kernel lo0 mirror — the PRIMARY enforcement for host-bound traffic (XDP
+    shim shunts it to the kernel). `reject` was lowered as a bare nft `reject`
+    (ICMP port-unreachable for ALL protocols incl. TCP), diverging from the
+    userspace reply synthesis. EXPLICIT per-modifier policy: HONOR what nft can
+    on a `hook input` chain — `then log`/`then syslog` -> nft `log prefix`,
+    `then count <name>` -> a NAMED nft counter (declared once in the table body;
+    `nftables.Lo0CounterName` sanitizes+prefixes to a bare-safe `xpflo0_*`
+    identifier per #3578 unquoted-decl/quoted-ref). WARN (not silently drop) on
+    what nft cannot faithfully honor on the host-inbound mirror — policer / dscp
+    rewrite / forwarding-class via the new `validateLo0FilterKernelMirror
+    Warnings` (commit-time, scoped to the lo0 input filter only, names
+    family/filter/term/modifier; loss-priority already covered globally by the
+    #2507 warning). REJECT (#3445 H10): faithful 2-rule lowering mirroring
+    userspace `poll_descriptor/reject_reply.rs` — `meta l4proto 6 reject with
+    tcp reset` then family-agnostic `reject with icmpx type admin-prohibited`
+    (icmpx selects ICMP/ICMPv6 from the packet). Fall-through modifier-only terms
+    now emit a NON-TERMINATING modifier rule (honored mods, no verdict) so
+    log/count fire while later terms stay reachable (#3427 reachability
+    preserved). Switched the lo0 payload from the `flush table` idiom to the
+    atomic `add table; delete table; table {...}` idiom (shared with
+    host-inbound) because `flush` does not delete named counter objects (would
+    collide on recommit). Validated nft syntax of every new construct with the
+    repo's nftables v1.1.6 .deb (`nft -c -f -`: parses; only the expected
+    no-CAP_NET_ADMIN netlink error). RED-on-revert proven for log, count,
+    faithful reject, and the commit warning (each reverted -> the matching test
+    goes RED, restored). go test ./pkg/daemon/... ./pkg/config/...
+    ./pkg/nftables/... green; go build ./pkg/... ./cmd/... green; gofmt + go vet
+    clean on changed files. Docs: pkg/daemon/README.md (new modifier-policy
+    bullet + updated #3427 fall-through bullet), docs/config-schema.md (#3445
+    subsection).
+  - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go, pkg/config/compiler_validate_warn.go, pkg/config/compiler_lo0_mirror_modifiers_3445_test.go, pkg/nftables/lo0_counters.go, pkg/daemon/README.md, docs/config-schema.md, _Log.md

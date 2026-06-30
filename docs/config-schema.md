@@ -2213,6 +2213,45 @@ reject still rejects, `TestFilterAction_Unknown_LenientWarns`,
 (`unknown_nonempty_action_fails_closed_discard`,
 `empty_action_falls_through_to_accept`).
 
+### #3445 — lo0 input-filter `then` modifiers: nft-mirror support policy (commit warning)
+
+The lo0.0 input filter (`interfaces lo0 unit 0 family inet[6] filter input
+<name>`) is mirrored onto a kernel nftables chain (`inet xpf_lo0`,
+`pkg/daemon/daemon_nft.go`) because the XDP shim shunts ordinary host-bound
+traffic to the Linux kernel before it reaches userspace-dp — so that chain is the
+PRIMARY enforcement of the lo0 filter for host traffic. Every non-terminating
+`then` modifier now has an explicit policy rather than being silently dropped
+from the mirror (the pre-fix action switch read only `term.Action`):
+
+- **Honored on the kernel mirror:** `then log` / `then syslog` → an nft `log`
+  statement; `then count <name>` → a NAMED nft counter. These commit with no
+  warning.
+- **Warned (cannot be faithfully honored on a `hook input` chain):**
+  `then policer` (Junos bandwidth+burst token bucket with a configurable
+  then-action; nft `limit` cannot reproduce it), `then dscp` (traffic-class
+  rewrite) and `then forwarding-class` (egress CoS selection is meaningless for
+  locally-delivered traffic). **`validateLo0FilterKernelMirrorWarnings`**
+  (`compiler_validate_warn.go`, wired into `ValidateConfig`) emits a commit
+  WARNING naming the family / filter / term / modifier so the operator knows the
+  kernel host-bound path will not enforce them (userspace remains authoritative
+  for whatever lo0-filtered traffic actually reaches the XSK). It is WARN-only —
+  these are valid Junos and a hard reject would brick a boot on a
+  previously-committed config — and SCOPED to the lo0 input filter (the same
+  modifier on an interface filter is userspace-enforced and not warned).
+  `then loss-priority` is already reported globally inert by
+  `validateFilterLossPriorityWarnings` (#2507), which subsumes the mirror gap.
+- **`reject`** is lowered to a faithful TCP-RST + ICMP/ICMPv6
+  administratively-prohibited pair mirroring the userspace reject-reply synthesis
+  (see `pkg/daemon/README.md` "lo0 input filter").
+
+Regression coverage: `pkg/config/compiler_lo0_mirror_modifiers_3445_test.go`
+(warns per modifier, commit-succeeds, scoped-no-false-positive,
+honored-modifiers-no-warn) and, on the nft-generation side,
+`pkg/daemon/lo0_filter_test.go` (`TestNftRuleFromTermLogMirror`,
+`TestNftRuleFromTermCountMirror`, the faithful-reject pair, shared-counter
+single-declaration). Like the other firewall-filter gates these are
+compiler/daemon-side, not typed `setSchema` leaves.
+
 ### #2545 — firewall-filter `from protocol`/`dscp`/`icmp-type`/`icmp-code` are multi-value (match-ANY)
 
 `protocol`, `dscp`/`traffic-class`, `icmp-type`, and `icmp-code` are all

@@ -314,18 +314,22 @@ never lock an operator out of a remote box it manages.
   success-no-error, idempotent add+delete teardown) and
   `daemon_apply_runtime_test.go:TestApplyConfigLockedSurfacesLo0Failure` (the
   commit-level `errors.Join` wiring proof).
-  **Per-term disposition mirrors userspace (#3427):** `nftRuleFromTerm` maps a
+  **Per-term disposition mirrors userspace (#3427):** `nftRulesFromTerm` maps a
   term's `then` action to the kernel verdict the SAME way the userspace lo0
   evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
   (term.NextTerm || term.Action == "") && term.RoutingInstance == ""`). A term
   with NO terminating action is a Junos FALL-THROUGH (explicit `then next term`
-  or a modifier-only term carrying only count/log/forwarding-class/dscp): it
-  emits NO rule (the kernel chain mirrors no counters/log, so the term has no
-  enforcement effect) and the subsequent terms run. The pre-fix code mapped an
-  empty action to a terminating `accept`, which SHADOWED every later
-  discard/reject term — a control-plane fail-OPEN diverging from userspace
-  (`from protocol tcp then next term` followed by `from destination-port 22 then
-  discard` accepted SSH at term 1, leaving the drop unreachable). A
+  or a modifier-only term): it emits no TERMINATING verdict and the subsequent
+  terms run. Pre-#3445 such a term emitted NOTHING; now it emits its honored
+  modifiers (`then log`/`then count`, see the modifier bullet below) as a
+  NON-TERMINATING rule (modifier statements, no verdict) so the per-term log /
+  count fires while the chain still falls through to later terms (nft continues
+  past any rule carrying no verdict). A fall-through term with no honored
+  modifier still emits nothing. The pre-#3427 code mapped an empty action to a
+  terminating `accept`, which SHADOWED every later discard/reject term — a
+  control-plane fail-OPEN diverging from userspace (`from protocol tcp then next
+  term` followed by `from destination-port 22 then discard` accepted SSH at term
+  1, leaving the drop unreachable). A
   `routing-instance` (PBR) term is explicitly NOT a fall-through: userspace sets
   `continue_term=false` when `routing_instance` is non-empty and the evaluator
   TERMINATES the matched term, returning its action — the empty-action
@@ -340,8 +344,51 @@ never lock an operator out of a remote box it manages.
   `TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop` (the over-drop
   counterexample).
 
+  **Non-terminating `then` modifier policy (#3445):** the kernel lo0 chain is
+  the PRIMARY enforcement for host-bound traffic, so a term's non-terminating
+  `then` modifiers must not silently diverge from userspace. The policy is
+  explicit per modifier — implement what nft can honor on a `hook input` chain,
+  and WARN at commit for what it cannot, never silently drop:
+  - **honored in nft:** `then log` / `then syslog` (both compile to `term.Log`)
+    → an nft `log prefix "xpf-lo0 <term>: "` statement (to journald), and
+    `then count <name>` → a NAMED nft counter (`counter name "<n>"`, the object
+    declared once in the table body by `buildLo0FilterPayload`; `nftables.
+    Lo0CounterName` sanitizes + prefixes the Junos name to a bare-safe `xpflo0_*`
+    identifier). nft executes a rule's statements left-to-right and the verdict
+    terminates, so these prepend the verdict; on a fall-through term they form a
+    NON-TERMINATING rule on their own (see the disposition bullet above).
+  - **warned, not mirrored:** `then policer` (a Junos bandwidth+burst token
+    bucket with a configurable then-action — nft `limit` cannot reproduce the
+    rate mapping or the loss-priority action), `then dscp` (traffic-class
+    rewrite) and `then forwarding-class` (egress CoS selection is meaningless for
+    locally-delivered host-bound traffic). `config.validateLo0FilterKernelMirror
+    Warnings` emits a commit WARNING naming the family/filter/term/modifier so the
+    operator knows the kernel host-bound path will not enforce them; userspace
+    stays authoritative for whatever lo0-filtered traffic actually reaches the
+    XSK. `then loss-priority` is already reported globally inert by
+    `validateFilterLossPriorityWarnings` (#2507), which subsumes the mirror gap.
+  - **`reject` (#3445 H10):** faithfully mirrors the userspace reject-reply
+    synthesis (`userspace-dp` `poll_descriptor/reject_reply.rs`) — a TCP RST for
+    TCP, an ICMP/ICMPv6 administratively-prohibited Destination Unreachable for
+    everything else. nft cannot pick the reply protocol within ONE rule, so a
+    reject term emits TWO: a TCP-only `reject with tcp reset`, then a
+    family-agnostic `reject with icmpx type admin-prohibited` (icmpx selects
+    ICMP vs ICMPv6 from the packet, so the same pair is correct in both rendering
+    passes). The pre-fix bare `reject` sent ICMP port-unreachable for ALL
+    protocols (including TCP) — a different wire response than userspace.
+  Because a term can now lower to zero, one, or two rules, the lo0 table uses the
+  atomic `add table; delete table; table { ... }` idiom (shared with the
+  host-inbound table) instead of the prior `flush table`: `flush` does not delete
+  named counter objects, so redeclaring a `then count` counter on the next commit
+  would collide ("File exists"). A consequence is the lo0 counters reset to zero
+  on every rebuild — nothing scrapes them, so there is no metric impact. Pinned by
+  `TestNftRuleFromTermLogMirror`, `TestNftRuleFromTermCountMirror`,
+  `TestLo0PayloadSharedCounterDeclaredOnce`, `TestNftRuleFromTermRejectVsDiscard`,
+  `TestNftRuleFromTermPrefixListExcept`, `TestLo0FilterPayloadFlushIdiom`, and (config
+  side) `compiler_lo0_mirror_modifiers_3445_test.go`.
+
   **Address / prefix-list lowering mirrors userspace (#3433):**
-  `nftRuleFromTerm` lowers each direction's `source-address` /
+  `nftRulesFromTerm` lowers each direction's `source-address` /
   `destination-address` + `source-prefix-list` / `destination-prefix-list`
   scope through the SHARED userspace resolver
   (`dpuserspace.ResolveFilterPrefixListAddrs`) so the kernel mirror uses the
@@ -366,7 +413,7 @@ never lock an operator out of a remote box it manages.
   `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)
   `firewall_address_literal_3433_test.go`.
 
-  **ICMP type/code lowering mirrors userspace (#3483):** `nftRuleFromTerm`
+  **ICMP type/code lowering mirrors userspace (#3483):** `nftRulesFromTerm`
   renders `icmp-type` and `icmp-code` as INDEPENDENT predicates, each gated
   only on its own value list — `icmp[v6] type <set>` when `len(ICMPTypes) > 0`
   and `icmp[v6] code <set>` when `len(ICMPCodes) > 0` (family selects `icmp`
@@ -382,7 +429,7 @@ never lock an operator out of a remote box it manages.
   multi-value, code-only) and `TestNftRuleFromTermICMPTypeCode`.
 
   **Protocol / DSCP lowering normalizes through the shared resolvers (#3436):**
-  `nftRuleFromTerm` resolves each `from protocol` token through the shared
+  `nftRulesFromTerm` resolves each `from protocol` token through the shared
   `appid.ProtocolNumber` SSOT (the same resolver the commit gate
   `filterProtocolResolvable` and the userspace matcher `ip_proto.rs` use) and
   emits the NUMERIC nft `l4proto` token (`meta l4proto 47`, set form
