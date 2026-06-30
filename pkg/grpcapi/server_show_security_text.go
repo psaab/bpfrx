@@ -551,6 +551,13 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 				if readErr == nil {
 					readErr = err
 				}
+				// #3344: emit a per-zone error row naming the affected zone
+				// instead of silently dropping it (mirrors the local CLI
+				// path). The trailing #3408 warning is an aggregate flag and
+				// cannot identify WHICH zone is degraded.
+				fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
+				fmt.Fprintf(buf, "  Error reading flood counters: %v\n", err)
+				buf.WriteString("\n")
 				continue
 			}
 			screenProfile := ""
