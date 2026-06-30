@@ -2004,28 +2004,50 @@ Regression coverage:
 `global_policy_*` tests in `userspace-dp/src/policy_tests.rs`, and
 `pkg/policymatch/scoped_global_zonelocal_test.go` (#3287).
 
-### #2391 — Security-zone count cap (commit fail-closed)
+### #3075 — Stable zone ids (supersedes the #2391 u8 count cap)
 
-Security-zone ids are assigned sequentially `1..N` over the sorted zone names
-(`pkg/dataplane/compiler.go`) and reach the live AF_XDP userspace dataplane two
-ways: as the per-flow ingress/egress zone in the event-stream wire record (a
-**u8** field — `userspace-dp/src/event_stream/codec.rs`, `"[21] IngressZoneID
-u8"`) and as the zone-table key in the forwarding snapshot. The forwarding
-builder (`userspace-dp/src/afxdp/forwarding_build/zones.rs`) rejects any zone id
-`>= ZONE_ID_RESERVED_MIN` (`u16::MAX-1`, reserved for the
-`JUNOS_GLOBAL_ZONE_ID` sentinel) and any id `> u8::MAX`. The binding constraint
-is therefore the **u8 wire field**, not the reserved sentinel: the usable range
-is `[1, min(255, ZONE_ID_RESERVED_MIN-1)] = [1, 255]`, so the cap is
-**`MaxUsableZoneID = 255`**. With more than 255 zones the 256th+ ids overflowed
-the u8 field, the builder dropped those zones, and every interface referencing a
-dropped zone silently collapsed to zone 0 ("unknown") — a silent
-fail-open/fail-closed mis-attribution instead of a commit rejection.
+Security-zone ids are a **stable name-hash** (`config.StableZoneID`, `zoneid.go`):
+FNV-1a/64 xor-folded into `[1, ZoneIDReservedMin-1] = [1, 65533]`, a **pure
+function of the zone NAME** — never of the zone set or compile order. Adding,
+renaming, or removing a zone therefore can never renumber a surviving zone, so
+an established session's stored numeric zone id always reverse-resolves to the
+correct name after a config edit, and both HA nodes plus a cold-booting node
+compute identical ids with zero synced/persisted state. The two duplicated
+positional maps (`pkg/dataplane.assignZoneIDs`, `pkg/daemon.buildZoneIDs`) both
+call this SSOT; an HA-symmetry test pins them byte-identical.
 
-**`validateZoneCountStrict`** (`compiler_validate_strict.go`) is the PRIMARY
-gate: it hard-rejects any config defining more than `MaxUsableZoneID` security
-zones. Bounding `N` at the cap guarantees no out-of-range id is ever produced,
-so the dataplane's defense-in-depth skip path is never reached for a clean
-commit.
+This replaces the legacy sorted `1..N` positional assignment, whose ids shifted
+whenever an earlier-sorting zone was added/removed and mis-mapped in-flight
+session / HA-delta / status metadata carrying an old numeric id (#3075).
+
+The zone id reaches the live AF_XDP userspace dataplane as the per-flow
+ingress/egress zone in the event-stream wire record and as the zone-table key in
+the forwarding snapshot. #3075 widened the three same-host **u8 chokepoints** to
+**u16**: the event-stream SessionOpen/SessionClose delta
+(`userspace-dp/src/event_stream/codec.rs` ↔ `pkg/dataplane/userspace/eventstream.go`),
+the forwarding-snapshot zone table
+(`userspace-dp/src/afxdp/forwarding_build/zones.rs` + the `policy.rs`
+`zone_name_to_id_from_snapshot` SSOT helper), and the fabric zone-encoded MAC
+(`forwarding/mod.rs` encode ↔ `frame/inspect.rs` decode). The widen is
+same-version IPC (xpfd spawns the helper as a child; the #1917 STOP→FLIP→START +
+socket recreate + FullResync drain means no frame straddles the width change), so
+no record-version negotiation is required. The cross-node HA session wire was
+already u16 and name-keyed.
+
+A commit-time **collision gate** (`validateZoneIDCollisionAST`, mirroring the
+#1873 tunnel-id gate) hard-rejects a config whose two zone names fold to the same
+id (strict on commit/commit-check; lenient warning on load/peer-sync), using the
+three-view (View 1 pre-expansion union + node0/node1 `${node}` expansion) union
+discipline so the verdict is identical on both cluster nodes.
+
+**`MaxUsableZoneID`** is now `ZoneIDReservedMin-1` (65533) — the pigeonhole bound
+of the u16 stable-hash space, not the old 255-id u8 wire limit (**#2391
+superseded**). The forwarding builder still rejects any id `>= ZONE_ID_RESERVED_MIN`
+(`u16::MAX-1`, the reserved `JUNOS_GLOBAL_ZONE_ID` / junos-host sentinels), and
+the fold guarantees a configured zone never lands there.
+**`validateZoneCountStrict`** (`compiler_validate_strict.go`) remains as a cheap
+O(1) pigeonhole belt (a config cannot define more distinct zones than ids); the
+collision gate is the PRIMARY duplicate-id protection.
 
 **Rust fail-closed backstop (load-bearing for unknown-name references).**
 `populate_interfaces` / `populate_egress`
