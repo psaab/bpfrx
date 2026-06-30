@@ -50,6 +50,13 @@ func (s *Server) GetInterfaces(_ context.Context, _ *pb.GetInterfacesRequest) (*
 					ii.RxBytes = ctrs.RxBytes
 					ii.TxPackets = ctrs.TxPackets
 					ii.TxBytes = ctrs.TxBytes
+				} else {
+					// #3464: counter read failed — keep the row but set
+					// Unavailable so the clean-0 counters are not mistaken for a
+					// real idle interface. Uniform with REST /stats/interfaces,
+					// REST /interfaces, and the Prometheus
+					// xpf_interface_counter_read_errors_total contract.
+					ii.Unavailable = true
 				}
 			}
 		}

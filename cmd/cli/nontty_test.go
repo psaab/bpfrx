@@ -36,9 +36,11 @@ type fakeBpfrxClient struct {
 	enterConfigureCalls int
 	systemActionCalls   int
 
-	// ShowText recorder (#1434 Increment 1 topic-mapping coverage).
+	// ShowText recorder (#1434 Increment 1 topic-mapping coverage;
+	// #3547 adds the filter to cover the security-log selector wiring).
 	showTextCalls  int
 	showTextTopic  string
+	showTextFilter string
 	showTextOutput string
 
 	// MatchPolicies recorder (#3283/#3284 remote-surface coverage).
@@ -77,6 +79,7 @@ func (f *fakeBpfrxClient) ShowText(
 ) (*pb.ShowTextResponse, error) {
 	f.showTextCalls++
 	f.showTextTopic = in.GetTopic()
+	f.showTextFilter = in.GetFilter()
 	return &pb.ShowTextResponse{Output: f.showTextOutput}, nil
 }
 
