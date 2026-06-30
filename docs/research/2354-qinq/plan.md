@@ -2,14 +2,18 @@
 
 ## 1. Status
 
-`DRAFT v1 — pending adversarial plan review` (Codex + AGY + Claude SMR).
+`v2 — CONVERGED, all three reviewers PLAN-DEFER`. Codex
+(`task-mr0z5z4h-xlhx7i`), AGY (`adversarial-review-mr0z4yi0-l3rsnp`), and Claude
+SMR (`claude-smr-plan-r1.md`) all returned **PLAN-DEFER** on v1. v2 folds every
+round-1 tightening (see §12 review log) so a future `/engineer 2354` starts from
+an accurate, hazard-pinned plan.
 
-Research-only. No production code is touched. The convergent disposition is
-expected to be **PLAN-DEFER (`plan-deferred-research`)**: the design below is
-converged and ready to `/engineer`, but this is a low-demand additive feature
-the issue author explicitly warns must NOT be built speculatively, so it sits
-behind a manual `/engineer 2354` approval gate awaiting concrete operator demand
-for stacked-VLAN transit.
+Research-only. No production code is touched. **Convergent disposition:
+PLAN-DEFER (`plan-deferred-research`)** — the design below is converged and the
+hazards are pinned, but this is a low-demand additive feature the issue author
+explicitly warns must NOT be built speculatively, so it sits behind a manual
+`/engineer 2354` approval gate awaiting concrete operator demand for stacked-VLAN
+transit. PLAN-KILL is also defensible (no recorded demand).
 
 Verified against `origin/master` @ `b3b8b6029` (`Merge pull request #3602`).
 All file:line references below were re-confirmed on this SHA (the prior
@@ -133,6 +137,27 @@ downstream consumes them; the shim hands double-tagged frames to the kernel. The
 feature is parse-only dead config plus a hard XDP_PASS — exactly as the issue
 states.
 
+### 4a. Finding 1 (all three reviewers, r1) — the kernel slow-path policy-bypass window
+
+The single most important phasing constraint, found independently by Codex
+(check 5), AGY (open-question 1), and Claude SMR (Finding 1):
+
+`enableForwarding` (`pkg/daemon/daemon_run.go:1812-1820`) sets
+`net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`. **Today** a
+double-tagged frame XDP_PASSes to the kernel, the kernel has **no** matching
+stacked VLAN device, so it is dropped — no transit, no bypass. **If a stacked
+S/C netdev is created (fork c) BEFORE the AF_XDP fast path delivers double-tagged
+frames to the XSK (PR-B),** the kernel now has a device to receive the XDP_PASSed
+frame and `ip_forward=1` can forward the inner IP flow **with no AF_XDP firewall
+policy, NAT, or session state.** That is a *new* firewall-bypassing forwarding
+path introduced purely by ordering — the device-creation step must come no
+earlier than XSK delivery. **Consequence: stacked-device creation lands in PR-B,
+and PR-A is snapshot-field + additive-TX-wire ONLY (no device, no observable
+forwarding change).** Once PR-B delivers to the XSK (XDP_REDIRECT), the kernel
+netdev only ever sees host-originated traffic — the bypass closes, exactly as it
+already is for single-tag VLAN devices (the shim delivers single-tag frames to
+the XSK, so their kernel netdev never sees transit traffic).
+
 ## 5. Concrete design — the three forks DECIDED
 
 ### Fork (a) — wire: META_VERSION bump + inner-tag layout — DECIDED
@@ -159,17 +184,36 @@ field is the compat gate — an old helper MUST reject a v5 frame, not misread i
   incident) is the single riskiest part of the feature — staying byte-for-byte
   close to today's struct is the conservative choice.
 
-### Fork (b) — classification key — DECIDED
-**`(ifindex, outer, inner)`**, with `inner == 0` meaning "wildcard /
-outer-only / single-tag" (a strict superset — existing single-tag rows stay
-bit-identical). Junos models QinQ as a per-`(S-VLAN, C-VLAN)` logical
-interface; the canonical SP use stacks many C-VLANs under one S-tag, each a
-distinct unit / zone / policy. **Outer-only would collapse all C-VLANs under
-one S-tag into one zone → wrong stateful + policy semantics.** The live snapshot
-zone table is already keyed `(ifindex, vlan)`; QinQ extends it to `(ifindex,
-outer, inner)` with `inner=0` preserving today's behavior bit-for-bit.
+### Fork (b) — classification key — DECIDED (precedence pinned per r1)
+**`(ifindex, outer, inner)`**, with `inner == 0` meaning "single-tag / outer-only
+row". Junos models QinQ as a per-`(S-VLAN, C-VLAN)` logical interface; the
+canonical SP use stacks many C-VLANs under one S-tag, each a distinct unit /
+zone / policy. **Outer-only would collapse all C-VLANs under one S-tag into one
+zone → wrong stateful + policy semantics.**
 
-### Fork (c) — config / zone-binding + networkd — DECIDED
+**Live key today is `FastMap<(i32, u16), i32>`** at
+`userspace-dp/src/afxdp/types/forwarding.rs:102` — built `(bind_ifindex,
+vlan_id)` at `forwarding_build/interfaces.rs:216-225`, probed `(ingress_ifindex,
+ingress_vlan_id)` at `forwarding/mod.rs:583-591`. The Go snapshot carries only
+`VLANID` (`protocol.go:254`); Rust only `vlan_id` (`protocol/snapshot.rs:39-62`).
+
+**Lookup precedence MUST be pinned (Codex + AGY r1 — security-boundary fix):**
+the lookup is NOT a plain wildcard. It is gated on the frame's tag count via
+`STACKED_VLAN_PRESENT`:
+- A **double-tagged** frame (`STACKED_VLAN_PRESENT` set) probes the EXACT
+  `(ifindex, outer, inner)` row FIRST; it must NOT silently fall back to a
+  single-tag `(ifindex, outer, 0)` row (that would leak a C-VLAN's traffic into
+  the parent S-VLAN's zone). If no exact `(outer,inner)` row exists → miss
+  (drop/no-zone), not parent-zone leak.
+- A **single-tagged** frame (`STACKED_VLAN_PRESENT` clear) probes only the
+  `(ifindex, outer, 0)` row — it must NEVER match a `(outer, inner!=0)` QinQ row.
+- This makes `inner=0` a *tag-count-scoped* row, not a true wildcard. Existing
+  single-tag rows stay bit-identical (they ARE `(ifindex, outer, 0)` with the
+  single-tag frame gate). The key widens `(i32, u16)` → `(i32, u16, u16)` with
+  the single-tag path always supplying `inner=0` and the lookup refusing
+  cross-tag-count matches.
+
+### Fork (c) — config / zone-binding + device creation — DECIDED (netlink, per r1)
 **Config:** activate the already-parsed `Unit.InnerVlanID` — emit it
 *additively* into `InterfaceSnapshot` (new `InnerVLANID int json:"inner_vlan_id,
 omitempty"`), populated at `interfaces.go` next to the existing `VLANID:
@@ -178,13 +222,25 @@ unit.VlanID`. Bind the `(outer,inner)` logical interface to its zone via the
 unit (e.g. `ge-0-0-2.100`). No new zone-binding mechanism. Do **not** route
 through retired-eBPF `SetZone`/`IfaceZoneKey`.
 
-**networkd:** generate a stacked netdev pair **only when `InnerVlanID != 0`**:
-outer S-VLAN netdev (`Kind=vlan`, `Id=S`, `Protocol=802.1ad`, parent=physical) →
-inner C-VLAN netdev (`Kind=vlan`, `Id=C`, parent=S-netdev). systemd-networkd
-supports vlan-on-vlan stacking + per-netdev `Protocol=`. The AF_XDP
-strip/re-add fast path does **not** depend on these netdevs (they exist only for
-kernel-slow-path / host consistency), so gate generation behind `InnerVlanID !=
-0` — never speculative, no change to single-tag interfaces.
+**Device creation — NETLINK, not networkd (corrected from v1 per Codex/AGY r1).**
+Single-tag VLAN sub-interface *devices* are created today via **netlink**, not
+networkd: `ensureVLANSubInterface()` at
+`pkg/dataplane/compiler_iface.go:103-131` does `netlink.LinkAdd(&netlink.Vlan{…
+VlanId: vlanID})` (called from `compileZones` at `:352`; the live apply flow
+still runs `compileZones` for device discovery/creation per the comment at
+`pkg/daemon/daemon_apply.go:564`). That builder **does not set `VlanProtocol`**,
+so it always creates an 802.1Q device. networkd writes `.netdev` files ONLY for
+bond/bridge (`networkd.go:140-148`); it does NOT create VLAN devices. **The QinQ
+stacked device must therefore extend the EXISTING netlink mechanism** — set
+`VlanProtocol = unix.ETH_P_8021AD` on the S-tag `netlink.Vlan` and stack a C-tag
+child `netlink.Vlan` (parent = S-device, default 802.1Q) — NOT introduce a
+parallel networkd `.netdev` path. Two competing device-creation mechanisms would
+race (AGY r1 open-question 3). Gate the stacked-device creation behind
+`InnerVlanID != 0`.
+
+**CRITICAL phasing constraint (all three reviewers r1):** the stacked device must
+NOT be created until the AF_XDP fast path owns double-tagged delivery — see
+Finding 1 in §4a below. The device-creation work lands in **PR-B**, not PR-A.
 
 ### 5.4 The resequenced 4-PR plan (each PR independently valuable; ONE verifier gate)
 
@@ -196,53 +252,83 @@ Resequence so the META bump and XSK delivery land together, the Go control-plane
 contract lands first (additive, no `make generate`), and TX stays in the helper
 binary (no `make generate`).
 
-**PR-A — control-plane contract (Go only; additive; NO meta bump; NO make generate)**
+**PR-A — control-plane contract (Go only; additive; NO meta bump; NO make generate; NO device creation)**
 - Add `InnerVLANID` to `InterfaceSnapshot` (`protocol.go` ~:254); populate from
   `unit.InnerVlanID` in `interfaces.go` beside the existing `VLANID`.
 - Zone binding for the `(outer,inner)` unit via existing
   `zoneByInterface[unitName]`.
-- networkd stacked netdev pair, gated on `InnerVlanID != 0` (outer
-  `Protocol=802.1ad` → inner C-VLAN).
 - Add additive `TXInnerVLANID uint16` to the forwarding + session-sync actions
   (`protocol.go:2614` / `:2687`) — wire only; helper ignores until PR-C.
-- *Tests:* Go unit — snapshot carries `InnerVLANID`; networkd writes the stacked
-  pair; `(S,C)` unit binds its zone; `userspaceMetadataVersion` stays 4.
-- *Independently valuable:* control plane fully models QinQ; helper still
-  single-tags; double-tagged frames still safely XDP_PASS — zero regression.
+- **NO stacked-device creation here (Finding 1, §4a).** The netlink stacked
+  device moves to PR-B so it never precedes XSK delivery.
+- *Tests:* Go unit — snapshot carries `InnerVLANID`; `(S,C)` unit binds its zone;
+  `userspaceMetadataVersion` stays 4; assert NO stacked device is created yet.
+- *Independently valuable:* control plane models QinQ in the snapshot; helper
+  still single-tags; double-tagged frames still XDP_PASS-and-drop (no stacked
+  device exists to receive them) — zero regression, no bypass window.
 
-**PR-B — shim two-tag RX + META bump (the ONLY make-generate / verifier-gate PR)**
-- `userspace-xdp/src/lib.rs`: `parse_l2` unwinds a 2nd tag (outer ∈
-  {0x8100,0x88a8}, inner 0x8100 → second `VlanHdr`; `l3_offset = 22`;
-  fail-closed `read_bytes(...)?` on truncation); dispatch DELIVERS double-tagged
-  IP frames to the XSK (no longer XDP_PASS); fill `ingress_inner_tci` +
-  `STACKED_VLAN_PRESENT`/`OUTER_IS_8021AD`; bump `USERSPACE_META_VERSION` 4→5.
+**PR-B — shim two-tag RX + META bump + netlink stacked device (the ONLY make-generate / verifier-gate PR)**
+- `userspace-xdp/src/lib.rs`: `parse_l2` unwinds a 2nd tag using **constant
+  packet offsets** (Codex r1): outer ∈ {0x8100,0x88a8}; accept inner ∈
+  {0x8100,0x88a8} (mirror the first-tag check — do NOT hardcode 0x8100, SMR r1
+  Finding 2, or document the narrowing) → second `VlanHdr`; `l3_offset = 22`;
+  fail-closed `read_bytes(...)?` on truncation. Dispatch DELIVERS double-tagged
+  IP frames to the XSK (no longer XDP_PASS); fill `ingress_inner_tci` (@42) +
+  `STACKED_VLAN_PRESENT`/`OUTER_IS_8021AD` meta_flags. **Single-tag frames MUST
+  keep writing `reserved=0` and `STACKED_VLAN_PRESENT` clear** (lib.rs:690-700).
+  Bump `USERSPACE_META_VERSION` 4→5.
 - Go mirror: `userspaceMetadataVersion` 4→5 + struct mirror + size/offset asserts.
 - Helper RX parsers unwind two tags: `frame/inspect.rs frame_l3_offset`,
   `cos/ecn.rs ethernet_l3`, `parser.rs parse_eth_offsets`, `nat64.rs
   frame_l3_offset`, `icmp.rs`+`icmp_ptb.rs ingress_reply_l2`; extend BOTH
   l2-offset canaries (`parser_tests.rs:344`, `nat64_tests.rs:1199`) with the
   double-tag shape (l3 = 22).
-- Helper builds the `(ifindex,outer,inner)` zone table from PR-A fields.
+- Widen the forwarding key `FastMap<(i32,u16),i32>` → `(i32,u16,u16)`
+  (`types/forwarding.rs:102`, builder `forwarding_build/interfaces.rs:216`,
+  lookup `forwarding/mod.rs:583`); build `(ifindex,outer,inner)` rows from PR-A
+  fields; pin the **tag-count-scoped lookup precedence** (fork b): exact
+  `(outer,inner)` for stacked frames, `(outer,0)` for single-tag, NO
+  cross-tag-count fallback (the security-boundary fix).
+- **netlink stacked device** (fork c): extend `ensureVLANSubInterface`
+  (`compiler_iface.go:103`) to create the S-tag device with
+  `VlanProtocol=ETH_P_8021AD` + stack the C-tag child, gated on `InnerVlanID !=
+  0`. Lands HERE (not PR-A) so it never precedes XSK delivery (§4a).
 - **`make generate` + `cmd/shimverify` verifier gate MUST pass**; commit the
   regenerated `pkg/dataplane/userspace_xdp_bpfel.o`; require a clean
   `git diff --exit-code` on a pinned re-run (bit-reproducible, #1864); cluster
   smoke before merge.
 - *Tests:* shim parity — a double-tagged frame reaches the XSK and classifies to
-  the `(S,C)` unit/zone. *Independently valuable:* RX + local-deliver to a QinQ
-  unit works (transit completes in PR-C).
+  the `(S,C)` unit/zone; the precedence test — a single-tag frame on a port that
+  has a QinQ unit does NOT leak into the QinQ zone, and a double-tag frame does
+  NOT fall back to the parent single-tag zone. *Independently valuable:* RX +
+  local-deliver to a QinQ unit works (transit completes in PR-C).
 
 **PR-C — TX two-tag serialize + transit (userspace-dp only; NO make generate)**
 - `frame/headers.rs`: extend the TX path to a two-tag stack (`TxVlanStack{outer:
   TxVlanTag, inner: TxVlanTag}` or an `Option<TxVlanTag>` inner on the existing
-  writer); `write_eth_header_*_tagged` emits S then C; fix all
-  `header_len`/eth_len sites (18→22 when stacked). S-tag TPID from egress-unit
-  config (per §4.6); C-tag TPID 0x8100.
+  writer); `write_eth_header_*_tagged` emits S then C. **Do NOT route the S-tag
+  through `TxVlanTag::from(vid)`** — it forces `TPID_8021Q` and would silently
+  rewrite the S-tag to 0x8100 (Codex r1 check 4 + §4.6). The S-tag TPID
+  (`TPID_8021AD`) comes from the egress unit's configured encapsulation; C-tag
+  TPID 0x8100. Fix all `header_len`/eth_len sites (18→22 when stacked).
+- **Extend the in-place L2 rewrite** (AGY r1 finding 4): `RewriteEthParams` /
+  `InPlaceL2Rewrite` / `rewrite_prepare_eth_from_parts` (`frame/mod.rs:372,397`)
+  assume a max 18-byte L2 header; a 22-byte double-tag frame would shift the
+  payload upstream and corrupt the IP header. Extend the rewrite to a 22-byte
+  target and verify UMEM headroom (256-byte headroom is ample; the
+  `in_place_vlan_push_no_headroom_packets` memmove path, `umem/mod.rs`, must
+  handle the larger shift).
 - Transit preserving/rewriting both tags; thread the stack through forwarding,
-  NAT, CoS/ECN (`ecn.rs` must now ACCEPT the QinQ shape it rejects today),
-  MSS-clamp, ICMP-reply (extend `ingress_reply_l2` to two tags), GRE, NAT64.
+  NAT, CoS/ECN (`ecn.rs ethernet_l3` flips QinQ-reject→accept — a deliberate
+  behavior change; today's callers `maybe_mark_ecn_ce` `ecn.rs:179-189` map
+  `None=>false`, so the flip only ADDS ECN marking to previously-skipped QinQ
+  frames — pin it with a test), MSS-clamp, ICMP-reply (extend `ingress_reply_l2`
+  to two tags), GRE, NAT64.
 - Consume `TXInnerVLANID` (from PR-A) in the forwarding action.
-- *Tests:* Rust unit — two-tag byte layout; iperf3 transit through a QinQ unit on
-  the loss cluster (both dirs, v4+v6). Completes transit.
+- *Tests:* Rust unit — two-tag byte layout (S then C at [12:20]); the in-place
+  rewrite on a 22-byte header does NOT corrupt the IP header; ecn marks a QinQ
+  frame; iperf3 transit through a QinQ unit on the loss cluster (both dirs,
+  v4+v6, sustained). Completes transit.
 
 **PR-D — push/pop/swap + acceptance + docs**
 - S-tag push/pop + C-tag swap (flexible-vlan-tagging rewrite ops), if in scope.
@@ -275,10 +361,23 @@ pin, verify-then-install, bit-reproducible, cluster smoke).
 1. **Single-tag bit-identity.** `inner = 0` / `STACKED_VLAN_PRESENT` clear must
    produce byte-identical meta, classification, and TX framing to today. The
    `(ifindex, outer, 0)` row must equal today's `(ifindex, vlan)` row.
+1a. **Tag-count-scoped lookup (Finding, fork b).** The classifier MUST NOT do a
+   plain `inner=0` wildcard fallback: a double-tagged frame matches ONLY an exact
+   `(outer,inner)` row, a single-tagged frame matches ONLY an `(outer,0)` row.
+   Cross-tag-count fallback would leak a C-VLAN's traffic into the parent
+   S-VLAN's zone (a security-boundary violation). Pin with the precedence test.
+1b. **No early kernel-bypass window (Finding 1, §4a).** The networkd/netlink
+   stacked device MUST NOT be created before the AF_XDP fast path delivers
+   double-tagged frames to the XSK (`ip_forward=1` would otherwise forward the
+   inner flow unfiltered). Device creation lands no earlier than PR-B.
 2. **Five-parser lockstep (#2150).** All five RX L2 parsers MUST agree on the
    double-tag offset (l3 = 22); both canaries extended or the agreement guard
    is meaningless. cos/ecn's *deliberate* QinQ rejection (§4.5) flips to
    acceptance — that is a behavior change PR-C must test, not an accident.
+2a. **TX in-place rewrite length (AGY r1).** The in-place L2 rewrite
+   (`RewriteEthParams`/`InPlaceL2Rewrite`, `frame/mod.rs`) must be extended from
+   a max 18-byte to a 22-byte L2 header; a 22-byte frame under the 18-byte
+   assumption shifts the payload and corrupts the IP header.
 3. **Fail-closed on truncation.** A frame claiming two tags but too short MUST
    `read_bytes(...)?` → `None` → drop/degraded, never a wild pointer or
    XDP_PASS that re-enters the kernel with a half-parsed frame.
@@ -301,10 +400,10 @@ pin, verify-then-install, bit-reproducible, cluster smoke).
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression | **MED** | Five-parser + dispatch + TX touch the hot L2 path used by 100% of frames. Mitigated by `inner=0` strict-superset bit-identity + extended canaries + fail-on-revert single-tag tests. cos/ecn QinQ-rejection→acceptance is an intentional flip needing its own test. |
-| Lifetime / borrow / verifier | **HIGH** | The shim `.o` regen (PR-B) is the gated, irreversible-per-merge risk: #1864 1M-insn cap, bit-reproducible `.o`, var_off narrowing on the 2nd-tag read. This is why the META bump + delivery is isolated to ONE PR and the layout reuses spare bytes (no struct growth). |
-| Performance regression | **LOW-MED** | One extra 4-byte bounds-checked read + branch per double-tagged frame; single-tag frames take an early-out (outer inner-ethertype not a TPID) → near-zero delta. Must be confirmed by a single-tag iperf3 A/B on the loss cluster (no throughput regression). |
-| Architectural mismatch | **LOW** | The design lands in the live JSON-snapshot path (`interfaces.go`/`protocol.go`), the canonical post-#1476 forwarding model — NOT retired-eBPF `compiler_iface.go`. The `(ifindex,outer,inner)` key matches Junos's per-`(S,C)` logical-interface model. No DPDK/eBPF dead-end. |
+| Behavioral regression | **MED-HIGH** | Five-parser + dispatch + TX touch the hot L2 path used by 100% of frames. Two security-relevant behavior changes: the tag-count-scoped lookup (no zone leak, inv 1a) and the kernel-bypass-window ordering (inv 1b, Finding 1). Mitigated by `inner=0` bit-identity + extended canaries + the precedence test + fail-on-revert single-tag tests. cos/ecn QinQ-reject→accept is an intentional flip needing its own test. |
+| Lifetime / borrow / verifier | **HIGH** | The shim `.o` regen (PR-B) is the gated, irreversible-per-merge risk: #1864 1M-insn cap, bit-reproducible `.o`, constant-offset (not var_off) 2nd-tag read. The META bump + delivery is isolated to ONE PR; the layout reuses spare bytes (no struct growth) to minimize the insn delta. Codex r1: verifier safety is unprovable until `cmd/shimverify` runs — this is the residual unknown. |
+| Performance regression | **LOW-MED** | One extra 4-byte bounds-checked read + branch per double-tagged frame; single-tag frames take an early-out (inner ethertype not a TPID) → near-zero delta. Confirm with a single-tag iperf3 A/B on the loss cluster (no throughput regression). |
+| Architectural mismatch | **LOW** | Classification/zone binding lands in the live JSON-snapshot path (`interfaces.go`/`protocol.go` + helper `types/forwarding.rs`), the canonical post-#1476 model. Device creation reuses the EXISTING netlink VLAN mechanism (`ensureVLANSubInterface`, the device-creation — not eBPF-enforcement — part of `compiler_iface.go`), extended with `VlanProtocol=802.1ad` + stacking, rather than a parallel networkd path. The `(ifindex,outer,inner)` key matches Junos's per-`(S,C)` logical-interface model. No DPDK/eBPF dead-end. |
 
 **Explicit:** this is a FEATURE, not a bug. **PLAN-DEFER is the expected
 honest outcome** given (1) zero recorded operator demand, (2) a four-PR build
@@ -315,11 +414,11 @@ way so a future `/engineer 2354` does not re-litigate the forks.
 
 ## 9. Test plan (RED-on-revert)
 
-- **PR-A (Go):** `go test ./pkg/dataplane/userspace/ ./pkg/networkd/ ./pkg/config/`
-  — snapshot carries `InnerVLANID`; networkd emits the stacked netdev pair ONLY
-  when `InnerVlanID != 0` (RED if the gate is removed → speculative stacked
-  device on single-tag ifaces); `(S,C)` unit binds its zone; assert
-  `userspaceMetadataVersion == 4` (RED if bumped prematurely).
+- **PR-A (Go):** `go test ./pkg/dataplane/userspace/ ./pkg/config/`
+  — snapshot carries `InnerVLANID`; `(S,C)` unit binds its zone; assert
+  `userspaceMetadataVersion == 4` (RED if bumped prematurely); assert NO stacked
+  device is created in PR-A (RED if device creation leaks back into PR-A —
+  Finding 1 ordering guard).
 - **PR-B (shim + canaries):** extend `parser_tests.rs:344
   l2_offset_canary_all_parsers_agree` + `nat64_tests.rs:1199
   nat64_l2_offset_canary` with a double-tagged shape — RED-on-revert if any of
@@ -347,41 +446,71 @@ way so a future `/engineer 2354` does not re-litigate the forks.
   not a Junos QinQ model and are out of scope.
 - **Per-flow S-tag *translation* tables** beyond simple push/pop/swap (PR-D
   covers basic rewrite; programmable S↔C mapping is a separate feature).
-- **Kernel-slow-path QinQ** beyond the networkd stacked netdev pair (the netdevs
-  exist for host consistency; the fast path is AF_XDP strip/re-add).
+- **Kernel-slow-path QinQ** beyond the netlink stacked device (the device exists
+  for host consistency; the fast path is AF_XDP strip/re-add). Note the device
+  is created no earlier than PR-B (Finding 1) to avoid an unfiltered kernel
+  forwarding window.
 - **PR-D push/pop/swap may itself be deferred** to a PR-D-follow-up if PR-A→C
   (transit only) is judged sufficient for the first demand.
 
-## 11. Open questions for adversarial review (each invitable to PLAN-DEFER/KILL)
+## 11. Open questions (r1 resolved many; these remain for the eventual /engineer)
 
-1. **Demand / scope.** Is stacked-VLAN transit in xpf's product scope at all, or
-   is this PLAN-KILL? No operator demand is recorded. Is converging the design
-   now (vs deferring even the design) worth the reviewer cycles?
-2. **Meta layout.** Is storing the full inner TCI in `reserved: u16` @ 42 (vs the
-   prior split-VID-plus-stolen-PCP-byte) correct? Does any consumer need the
-   inner DEI separately? Are two new `meta_flags` bits (STACKED_VLAN_PRESENT,
-   OUTER_IS_8021AD) sufficient, or is an explicit outer-TPID byte needed?
-3. **Egress TPID premise (§4.6).** Is "S-tag TPID is config-derived, not
-   ingress-preserved" actually correct for the *transit* case, or does Junos
-   QinQ transit preserve the ingress S-tag TPID end-to-end (forcing
-   `OUTER_IS_8021AD` to drive every egress, not just swap mode)?
-4. **Verifier gate.** Will adding a second-tag `read_bytes` + branch + two meta
-   writes in `parse_l2`/`try_xdp_userspace` stay under the #1864 1M-insn cap and
-   reproduce bit-identically? Is var_off on the 22-byte-offset read a hazard?
-5. **Classification key.** Is `(ifindex, outer, inner)` with `inner=0`=wildcard a
-   true strict superset, or does it perturb the existing `(ifindex, vlan)`
-   single-tag rows (e.g. a single-tagged frame on a port that ALSO has QinQ
-   units — does it match `(ifindex, outer, 0)` correctly and not a `(outer,
-   inner)` row)?
-6. **cos/ecn flip.** Flipping `ethernet_l3` from QinQ-reject (`None`) to
-   QinQ-accept is a deliberate behavior change — does any current caller rely on
-   the `None`-means-skip-ECN behavior for double-tagged frames in a way that
-   acceptance would break?
-7. **PR-A dead-code check.** Is PR-A (Go control-plane contract, helper still
-   single-tags) genuinely *not* dead code — does anything observable change, or
-   is it inert until PR-B? (It models config + writes networkd devices + emits
-   additive JSON the helper safely ignores — argued non-dead, but challenge it.)
-8. **networkd stacking.** Does systemd-networkd on the Ubuntu 26.04 base
-   actually support `Kind=vlan` on a `Kind=vlan` parent with per-netdev
-   `Protocol=802.1ad`, or is a different netdev kind (e.g. explicit
-   `VLANProtocol=`) required?
+**RESOLVED by r1 review** (folded into the plan, see §12):
+- Classification precedence — RESOLVED: tag-count-scoped, no `inner=0` wildcard
+  fallback (inv 1a, fork b).
+- PR-A dead-code / bypass — RESOLVED: device creation moves to PR-B; PR-A is
+  snapshot+wire only (§4a, Finding 1).
+- Device mechanism — RESOLVED: netlink (`ensureVLANSubInterface` +
+  `VlanProtocol=802.1ad`), not networkd (fork c). The networkd-stacking question
+  is moot.
+- Egress S-tag TPID — RESOLVED-confirmed: config-derived; PR-C must not use
+  `TxVlanTag::from` for the S-tag (§4.6).
+- TX in-place rewrite 18→22 — RESOLVED: extend `InPlaceL2Rewrite` (inv 2a).
+
+**STILL OPEN for the /engineer phase (none block the DEFER disposition):**
+1. **Demand / scope.** Is stacked-VLAN transit in xpf's product scope at all? No
+   operator demand is recorded — this is why the disposition is PLAN-DEFER, not
+   PLAN-READY. If product judges it out of scope, escalate to PLAN-KILL.
+2. **Verifier gate (Codex r1 residual).** Will the second-tag read + branch + two
+   meta writes stay under the #1864 1M-insn cap and reproduce bit-identically?
+   **Unprovable until `cmd/shimverify` actually runs in PR-B** — the single
+   largest implementation risk.
+3. **Inner-tag TPID set.** Accept inner ∈ {0x8100, 0x88a8} (robust) or restrict
+   to 0x8100-C and document the narrowing? (SMR r1 Finding 2.)
+4. **Junos S-tag TPID semantics.** For the *transit* case, does Junos preserve
+   the ingress S-tag TPID end-to-end, or always emit the egress unit's configured
+   TPID? Affects whether `OUTER_IS_8021AD` drives every egress or only swap mode.
+5. **Inner DEI / PCP.** The full inner TCI is preserved in `ingress_inner_tci`;
+   confirm no consumer needs the inner DEI broken out separately.
+
+## 12. Review log
+
+**Round 1 (plan v1 `903f2d2bb`)** — Codex `task-mr0z5z4h-xlhx7i`, AGY
+`adversarial-review-mr0z4yi0-l3rsnp`, Claude SMR `claude-smr-plan-r1.md`. **All
+three returned PLAN-DEFER.** Findings folded into v2:
+- **Finding 1 (all 3): kernel slow-path policy-bypass window.** Creating the
+  stacked device (fork c) before PR-B's XSK delivery, with `ip_forward=1`
+  (daemon_run.go:1817), would forward double-tagged frames unfiltered through the
+  kernel. → device creation moved to PR-B; PR-A is snapshot+wire only (§4a, inv 1b).
+- **Fork (b) precedence (Codex + AGY): zone-leak.** A plain `inner=0` wildcard
+  lets a single-tag frame match a QinQ row (or a double-tag frame fall back to
+  the parent zone). → tag-count-scoped lookup, no cross-count fallback (fork b,
+  inv 1a). Live key is `FastMap<(i32,u16),i32>` `types/forwarding.rs:102`.
+- **Fork (c) mechanism (AGY q3 + verified): netlink not networkd.** Single-tag
+  VLAN devices are netlink-created (`ensureVLANSubInterface`,
+  `compiler_iface.go:103`, no `VlanProtocol` → 802.1Q). → extend that mechanism
+  with `VlanProtocol=802.1ad` + stacking, not a parallel networkd `.netdev` path.
+- **S-tag egress TPID (Codex + SMR): `TxVlanTag::from` forces 0x8100.** → PR-C
+  must build the S-tag with `TPID_8021AD` from egress-unit config, not
+  `TxVlanTag::from` (§4.6, PR-C).
+- **TX in-place rewrite (AGY): 18-byte max corrupts a 22-byte frame.** → extend
+  `InPlaceL2Rewrite`/`rewrite_prepare_eth_from_parts` to 22 bytes + headroom
+  check (inv 2a, PR-C).
+- **Verifier offsets (Codex + SMR): use constant packet offsets, keep single-tag
+  `reserved=0`.** → PR-B spec + inv 5.
+- **Inner-tag TPID (SMR): accept inner ∈ {0x8100,0x88a8} or document.** → PR-B
+  spec + open question 3.
+
+Disposition unchanged across the round: **PLAN-DEFER**. The v2 revisions make the
+deferred plan accurate and hazard-pinned; they do not change the recommendation
+not to build now without demand.
