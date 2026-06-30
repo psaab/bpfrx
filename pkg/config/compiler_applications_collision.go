@@ -68,6 +68,14 @@ import (
 // validateApplicationNameCollisionsAST walks the `applications` subtree of the
 // group-expanded AST and rejects duplicate / cross-namespace application name
 // definitions. See the file-level comment for the doctrine.
+//
+// #3472 extends the gate to the GENERATED per-term application names that #3339
+// ignored: a generated `<parent>-<term>` name that overwrites an authored
+// application (H01), collides cross-namespace with an authored application-set
+// (H02), or collides with another parent's generated name (H03) is rejected
+// under strict commit (warned on the tolerant load / peer-sync path), and a
+// generated name that shadows a predefined junos-* application (M03) is always
+// surfaced as a warning. See section 5 below.
 func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string, error) {
 	// The compiler compiles EVERY top-level `applications` node (compiler.go's
 	// `for _, node := range tree.Children` switch hits `case "applications"`
@@ -187,6 +195,21 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 	//    in first-seen order.
 	termSeen := map[string]map[string]bool{}
 	termDupReported := map[string]map[string]bool{}
+	// #3472: generated per-term application names land in the SAME flat namespace
+	// as authored applications/sets — compileApplications writes each generated
+	// term into apps.Applications[<parent>-<term>] (compiler_applications.go), and a
+	// term-based application additionally mints an implicit set under its own name.
+	// #3339's gate only counted AUTHORED names, so a generated name was invisible to
+	// it and silently last-write-wins into the map. Build a global table of every
+	// generated name -> the distinct parent applications that produce it (in
+	// first-seen order) so the post-loop pass (section 5) can reject a generated
+	// name that overwrites an authored application (H01), collides cross-namespace
+	// with an authored application-set (H02), or collides with another parent's
+	// generated name (H03), and warn on one that shadows a predefined junos-* app
+	// (M03). genParents is populated for EVERY produced name (including a within-
+	// parent duplicate) so the distinct-parent count is exact.
+	genParents := map[string]map[string]bool{}
+	var genOrder []string
 	for _, appsNode := range appsNodes {
 		for _, inst := range namedInstances(appsNode.FindChildren("application")) {
 			appName := inst.name
@@ -211,6 +234,14 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 					allKeys = append(allKeys, c.Keys...)
 				}
 				for _, t := range parseApplicationTerms(appName, allKeys) {
+					// #3472: record this generated name and the parent that
+					// produced it for the global flat-namespace pass below.
+					if genParents[t.Name] == nil {
+						genParents[t.Name] = map[string]bool{}
+						genOrder = append(genOrder, t.Name)
+					}
+					genParents[t.Name][appName] = true
+
 					if seen[t.Name] {
 						if !dupReported[t.Name] {
 							dupReported[t.Name] = true
@@ -230,6 +261,107 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 					seen[t.Name] = true
 				}
 			}
+		}
+	}
+
+	// 5. Generated per-term application names vs the rest of the flat Junos
+	//    namespace (#3472). compileApplications writes every generated
+	//    `<parent>-<term>` into apps.Applications and mints each term-based
+	//    parent's implicit set, but #3339's appCounts/setCounts only enumerated
+	//    AUTHORED `application`/`application-set` nodes — a generated name was in
+	//    neither table, so three collision classes silently last-write-wins:
+	//
+	//      H01 — a generated name equals an authored application. Both write
+	//            apps.Applications[name]; the later write wins, so policy / AppID
+	//            can enforce or label the wrong application.
+	//      H02 — a generated name equals an authored application-set. The two
+	//            live in different maps (Applications vs ApplicationSets), and the
+	//            resolution paths disagree: userspace policy expansion resolves
+	//            application-first (resolveUserspaceApplicationNames) while the
+	//            AppID catalog resolves set-first (pkg/appid/runtime.go), so the
+	//            same token enforces one definition and is attributed to the other.
+	//      H03 — the same generated name is produced by two DIFFERENT parents;
+	//            #3339's termSeen is scoped per parent, so the later term silently
+	//            overwrites the earlier across parents.
+	//
+	//    All three hard-reject under strict commit and downgrade to a warning on
+	//    the tolerant load / peer-sync path (the shared emit helper). Iterated in
+	//    generated-name first-seen order for a deterministic error.
+	for _, g := range genOrder {
+		parents := make([]string, 0, len(genParents[g]))
+		for p := range genParents[g] {
+			parents = append(parents, p)
+		}
+		sort.Strings(parents)
+
+		// 5a. H03 — cross-parent generated-name collision.
+		if len(parents) > 1 {
+			if err := emit(
+				"applications %v each generate the per-term application name %q — "+
+					"the generated name collides across parents and the later term "+
+					"silently overwrites the earlier in apps.Applications (with no "+
+					"commit error); rename a term or parent so the generated %q is "+
+					"unique (#3472)",
+				parents, g, g); err != nil {
+				return nil, err
+			}
+		}
+
+		// 5b. H01 — generated name overwrites an authored application.
+		//     Mechanism-agnostic phrasing: a SIMPLE authored application named %q
+		//     writes apps.Applications[%q] (a direct overwrite of the generated
+		//     term), but a TERM-BASED authored application named %q writes its
+		//     implicit set into apps.ApplicationSets[%q] instead — so the exact
+		//     map collision differs by sub-case. Both share the one flat Junos
+		//     namespace with the generated name and resolve last-write-wins /
+		//     ambiguously, which is the defect; the message describes the namespace
+		//     collision rather than a specific map write that does not always hold.
+		if appCounts[g] > 0 {
+			if err := emit(
+				"generated per-term application name %q (from %v) collides with the "+
+					"authored application name %q in the flat application namespace — "+
+					"generated term names share one namespace with authored "+
+					"applications / application-sets, so this is ambiguous and "+
+					"last-write-wins (with no commit error) and policy / AppID may "+
+					"enforce or label the wrong application; rename one of them (#3472)",
+				g, parents, g); err != nil {
+				return nil, err
+			}
+		}
+
+		// 5c. H02 — generated name collides with an authored application-set.
+		if setCounts[g] > 0 {
+			if err := emit(
+				"generated per-term application name %q (from %v) collides with the "+
+					"authored application-set %q — they share one flat namespace but live "+
+					"in different maps, and policy expansion resolves application-first "+
+					"while the AppID catalog resolves application-set-first, so the same "+
+					"token enforces one definition and is attributed to the other; rename "+
+					"one of them (#3472)",
+				g, parents, g); err != nil {
+				return nil, err
+			}
+		}
+
+		// 5d. M03 — generated name shadows a predefined junos-* application.
+		//     Always a WARNING on both paths (never a hard reject): a generated
+		//     name is a user-defined application, and ResolveApplication prefers
+		//     user-defined over predefined (pkg/config/predefined.go), so the
+		//     generated term silently shadows the predefined service. Unlike
+		//     H01-H03 this does not overwrite another OPERATOR-authored definition,
+		//     and an authored shadow of a junos-* name is already a documented-
+		//     legitimate case (the #3339 scope note), so reserving the junos-*
+		//     namespace would be inconsistent and could brick a config an older
+		//     binary accepted. Surface it so an accidental shadow (e.g.
+		//     `application junos term ssh` minting junos-ssh) is operator-visible.
+		if _, isPredef := PredefinedApplications[g]; isPredef {
+			warnings = append(warnings, fmt.Sprintf(
+				"generated per-term application name %q (from %v) shadows the predefined "+
+					"application %q — a user-defined application wins over the predefined "+
+					"service (ResolveApplication prefers user-defined), so the predefined "+
+					"%q is no longer reachable by that name; rename the term/parent if the "+
+					"shadow is unintended (#3472)",
+				g, parents, g, g))
 		}
 	}
 
