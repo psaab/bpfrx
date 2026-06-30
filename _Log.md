@@ -24226,3 +24226,33 @@ top.
 - **Timestamp**: 2026-06-30
   - **Action**: #3592 — added the gRPC `GetZonePairSummary` RPC and wired `include_peer=true` cross-node fan-out into the REST `/sessions/summary/zone-pairs` endpoint (`sessionZonePairHandler`). Follow-up from #3423 (PR #3591): that change stamped `node_id` on the zone-pair summary but could not fan out to the peer because, unlike `/sessions` and `/sessions/summary` (which forward to gRPC `GetSessions`/`GetSessionSummary`), no gRPC zone-pair-summary RPC existed; approximating the peer's breakdown from a peer session list would duplicate aggregation logic and re-pull the full peer table at the wrong layer. New proto (appended at END of xpf.proto so inserting mid-file does not renumber every later message's generated msgTypes index and bloat the generated diff; regenerated via `make proto` with pinned protoc-gen-go@v1.36.11 + protoc-gen-go-grpc@v1.6.1 — no version bump): `rpc GetZonePairSummary`, `GetZonePairSummaryRequest{include_peer}`, `ZonePairSessionSummary{from_zone,to_zone,tcp,udp,icmp,other,total}`, `GetZonePairSummaryResponse{zone_pairs,node_id,peer}`. Server side (pkg/grpcapi/server_sessions.go): `GetZonePairSummary` computes the LOCAL (ingress-zone,egress-zone) breakdown by protocol class via `computeZonePairSummary` (reverse entries skipped; sorted; a backend iterator error fails the RPC with codes.Internal per #2469, matching GetSessionSummary) and, on `include_peer && !x-peer-forwarded`, fans out through `proxyPeerZonePairSummary` (mirrors proxyPeerSystemAction: stamps `x-peer-forwarded` recursion guard on the outgoing context, wired test seam `peerZonePairSummaryFn` takes precedence, else dials the peer only when alive and returns (nil,nil) for standalone/dead peer so a read summary degrades gracefully). REST side (pkg/api): `sessionZonePairHandler` now takes `r`, validates `include_peer` FAIL-CLOSED (HTTP 400) before any work, and on `include_peer=true` forwards to the new RPC via the `ClusterSessionService` seam, attaching the peer's OWN breakdown under `ZonePairSummaryResponse.Peer` (new field) mapped by `zonePairSummaryFromPB`. No first-page gate — the breakdown is a SUMMARY (not a paginated list), so it mirrors sessionSummaryHandler (whole peer breakdown whenever include_peer is set), NOT the writeSessionList first-page guard. RED-on-revert proven: pkg/grpcapi/zonepair_summary_3592_test.go (local breakdown, iterator-error→Internal, peer fan-out + x-peer-forwarded stamp, recursion guard, no-fan-out-without-include_peer, node_id-from-cluster) — TestGetZonePairSummaryHonorsRecursionGuard goes RED when the `!peerForwardedFromContext(ctx)` guard is removed; pkg/api/sessions_zonepair_peer_3592_test.go (include_peer fan-out, bad value→400, nil-service standalone) — both fan-out and 400 assertions go RED when the respective guard is reverted; all restored green. `go test ./pkg/api ./pkg/grpcapi ./pkg/cluster` green; `go build ./pkg/... ./cmd/...` green; gofmt + go vet clean on changed files. Doc: pkg/api/README.md zone-pairs bullet rewritten (include_peer + cross-node behavior + recursion guard), #3592-pending note removed.
   - **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/xpfv1/xpf_grpc.pb.go, pkg/grpcapi/server.go, pkg/grpcapi/server_sessions.go, pkg/grpcapi/zonepair_summary_3592_test.go, pkg/api/server.go, pkg/api/types.go, pkg/api/sessions.go, pkg/api/sessions_ha_scope_3423_test.go, pkg/api/sessions_zonepair_peer_3592_test.go, pkg/api/README.md, _Log.md
+  - **Action**: #3364 — gave the two daemon-generated local-delivery nftables
+    base chains DISTINCT hook-input priorities so their inter-chain evaluation
+    order is a deterministic product invariant. Both `inet xpf_lo0`
+    (`buildLo0FilterPayload`) and `inet xpf_hostinbound`
+    (`buildHostInboundFilterPayload`) in pkg/daemon/daemon_nft.go registered
+    `type filter hook input priority 0`. Two base chains on the SAME hook at an
+    IDENTICAL priority have implementation-defined inter-chain order in
+    netfilter, so which chain's reject/log/counter fired for a packet both match
+    was order-dependent and could vary silently across nft/kernel versions (a
+    `drop` stays terminal regardless, so this was never a permit bypass — only an
+    observability/determinism gap, audit codex-review-084 H5). Fix: two named
+    constants `nftLo0FilterPriority = 0` and `nftHostInboundPriority = 10`, both
+    still `hook input`. ORDERING DECISION: lo0 evaluates STRICTLY BEFORE
+    host-inbound (lower priority number). The lo0.0 input filter is the
+    operator's explicit, named, RE-wide control-plane firewall (authoritative
+    accept/reject/discard verdicts), so its operator-authored verdicts take
+    observable precedence; the zone host-inbound-traffic admission is the coarser
+    Junos default-deny backstop governing whatever lo0 did not already terminate
+    — the Junos lo0-filter-then-zone ordering the issue specifies. lo0 stays at
+    the conventional `filter` priority 0; host-inbound moves to 10 (well below the
+    conventional `security`=50 band). RED-on-revert proven: equalizing the
+    constants (host-inbound back to 0) turns BOTH
+    TestNftLocalDeliveryChainsDistinctPriority (parses the priority integer out of
+    each rendered payload, asserts lo0 < host-inbound + matches the constants) and
+    TestNftLocalDeliveryPriorityConstantsOrdered (constant-level guard) RED;
+    restored to green. go test ./pkg/daemon/... green; go build ./pkg/...
+    ./cmd/... green; gofmt + go vet clean on changed files. Doc:
+    pkg/daemon/README.md lo0 + host-inbound bullets document the distinct
+    priorities and the ordering rationale.
+  - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/nft_chain_priority_test.go, pkg/daemon/README.md, _Log.md

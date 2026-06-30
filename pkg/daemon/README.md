@@ -283,6 +283,22 @@ never lock an operator out of a remote box it manages.
   name — appending one is an nft parse error that silently dropped the whole
   filter (#2069). `TestLo0FilterPayloadNftParses` parse-checks the real payload
   with `nft -c -f -` when nft is on PATH.
+  **Distinct hook-input priority (#3364):** `xpf_lo0` registers `type filter
+  hook input priority 0` (`nftLo0FilterPriority`) and `xpf_hostinbound`
+  registers the same hook at `priority 10` (`nftHostInboundPriority`). Two base
+  chains on the SAME hook at an IDENTICAL priority have implementation-defined
+  inter-chain evaluation order, so which chain's reject/log/counter fires for a
+  packet both match would be order-dependent (a `drop` stays terminal regardless,
+  so this was never a permit bypass — only an observability/determinism gap). The
+  spread makes `xpf_lo0` evaluate STRICTLY BEFORE `xpf_hostinbound`: the lo0.0
+  input filter is the operator's explicit, named, RE-wide control-plane firewall
+  (authoritative accept/reject/discard verdicts), so it takes observable
+  precedence over the coarser zone host-inbound default-deny backstop — the Junos
+  lo0-filter-then-zone ordering. `nft_chain_priority_test.go`
+  (`TestNftLocalDeliveryChainsDistinctPriority` /
+  `TestNftLocalDeliveryPriorityConstantsOrdered`) pins
+  `nftLo0FilterPriority < nftHostInboundPriority` and goes RED if the two are
+  equalized.
   **Fail-closed (#3392, mirroring host-inbound #3333):** `applyLo0Filter`
   RETURNS the apply/teardown error instead of swallowing it at WARN, and
   `applyConfigLocked` joins it (`lo0Err`) into the commit result alongside
@@ -394,7 +410,11 @@ never lock an operator out of a remote box it manages.
   to the kernel by the XDP shim before reaching userspace-dp, so
   `daemon_nft.go:applyHostInboundFilter` builds an `inet xpf_hostinbound`
   table (same atomic flush idiom as lo0) via `buildHostInboundFilterPayload`,
-  consuming `userspace.BuildZoneHostInboundViews(cfg)`. Per
+  consuming `userspace.BuildZoneHostInboundViews(cfg)`. The chain registers
+  `type filter hook input priority 10` (`nftHostInboundPriority`) — DISTINCT from
+  the `xpf_lo0` chain's `priority 0` so this host-inbound backstop evaluates
+  AFTER the operator's explicit lo0 input filter rather than at an
+  implementation-defined order relative to it (#3364, see the lo0 bullet). Per
   host-inbound-CONFIGURED zone it accepts the listed system-services/protocols
   to that zone's addresses and DROPs the rest; the userspace-dp LocalDelivery
   check (`forwarding/host_inbound.rs`) is the secondary path for the XSK-reaching
