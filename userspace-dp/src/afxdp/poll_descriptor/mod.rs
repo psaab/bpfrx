@@ -79,22 +79,32 @@ fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8,
 /// junos-host policy is configured, none matches, or a matching rule permits —
 /// preserving pre-#3019 host-bound behavior so management traffic is never
 /// newly denied (the lifeline guarantee). Cold path only (LocalDelivery).
+/// #3019/#3292: evaluate the configured `to-zone junos-host` security policy for
+/// a host-bound (LocalDelivery) packet and, on a matching deny/reject, emit the
+/// policy-deny RT_FLOW. This is the reply-FREE core shared by both the
+/// flow-backed [`junos_host_policy_drops`] (which adds the synthesized
+/// reject/tcp-rst reply) and the flowless LocalDelivery arm (#3292, which can
+/// emit no reply — a fragment has no L4 header to build a RST from).
+///
+/// `l4_present = false` routes through the l3-aware junos-host evaluation so a
+/// port-bearing application term fails closed for a flowless packet; the
+/// flow-backed wrapper passes `true` (byte-identical to pre-#3292). Returns
+/// `Some(action)` when a junos-host rule matched deny/reject (caller drops);
+/// `None` when no junos-host policy is configured, none matches, or a match
+/// permits (caller continues local delivery).
 #[allow(clippy::too_many_arguments)]
-fn junos_host_policy_drops(
+fn junos_host_policy_deny_action(
     forwarding: &ForwardingState,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
-    tx_pipeline: &mut crate::afxdp::worker::WorkerTxPipeline,
-    ingress_ifindex: i32,
-    packet_frame: &[u8],
-    counters: &mut BatchCounters,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     from_zone_id: u16,
     packet_len: u64,
     now_ns: u64,
-) -> bool {
-    let policy_icmp = policy_packet_icmp(packet_frame, meta);
-    let Some(result) = crate::policy::evaluate_junos_host_policy(
+    l4_present: bool,
+    packet_icmp: Option<(u8, u8)>,
+) -> Option<PolicyAction> {
+    let result = crate::policy::evaluate_junos_host_policy_l3_aware(
         &forwarding.policy,
         from_zone_id,
         flow.src_ip,
@@ -102,14 +112,13 @@ fn junos_host_policy_drops(
         flow.forward_key.protocol,
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
-        policy_icmp,
+        packet_icmp,
         packet_len,
-    ) else {
-        return false;
-    };
+        l4_present,
+    )?;
     match result.action {
-        PolicyAction::Permit => false,
-        PolicyAction::Deny | PolicyAction::Reject => {
+        PolicyAction::Permit => None,
+        action @ (PolicyAction::Deny | PolicyAction::Reject) => {
             emit_policy_deny_event(
                 event_stream,
                 flow,
@@ -127,7 +136,7 @@ fn junos_host_policy_drops(
                 // Host-local sessions are not policy-forwarded; owner_rg_id 0.
                 0,
                 result.policy_id,
-                result.action,
+                action,
                 resolve_policy_deny_app_id(
                     &forwarding.app_catalog,
                     flow,
@@ -135,6 +144,39 @@ fn junos_host_policy_drops(
                 ),
                 now_ns,
             );
+            Some(action)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn junos_host_policy_drops(
+    forwarding: &ForwardingState,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    tx_pipeline: &mut crate::afxdp::worker::WorkerTxPipeline,
+    ingress_ifindex: i32,
+    packet_frame: &[u8],
+    counters: &mut BatchCounters,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    from_zone_id: u16,
+    packet_len: u64,
+    now_ns: u64,
+) -> bool {
+    let policy_icmp = policy_packet_icmp(packet_frame, meta);
+    match junos_host_policy_deny_action(
+        forwarding,
+        event_stream,
+        flow,
+        meta,
+        from_zone_id,
+        packet_len,
+        now_ns,
+        // Flow-backed host-bound traffic always carries a real L4 header.
+        true,
+        policy_icmp,
+    ) {
+        Some(action) => {
             enqueue_deny_reply(
                 tx_pipeline,
                 forwarding,
@@ -143,12 +185,154 @@ fn junos_host_policy_drops(
                 meta,
                 flow,
                 counters,
-                matches!(result.action, PolicyAction::Reject),
+                matches!(action, PolicyAction::Reject),
                 from_zone_id,
             );
             true
         }
+        None => false,
     }
+}
+
+/// #3292: verdict for the FLOWLESS (no-L4) LocalDelivery security gate. A
+/// host-bound flowless packet — a non-first IPv4/IPv6 fragment, or any
+/// LocalDelivery packet with no readable L4 header (#2344) — MUST traverse the
+/// same management-plane gates the flow-backed LocalDelivery arm applies:
+/// host-inbound admission, the lo0 host-bound filter, and `to-zone junos-host`
+/// policy. Before #3292 the flowless arm reinjected to the host ungated
+/// (fail-open). The synthetic L3 flow carries ports = 0 and is evaluated with
+/// `l4_present = false`, so port-bearing host-inbound / lo0 / junos-host terms
+/// fail CLOSED while protocol/address/`any` terms still admit — fail-closed
+/// without over-gating a legitimately-admitted protocol/address packet.
+///
+/// Extracted (vs inlined in the un-callable poll loop) so the gate decision is
+/// unit-testable; see `flowless_local_delivery_tests`. The poll loop performs
+/// the recycle/counter side-effects keyed on the returned verdict. A flowless
+/// deny is SILENT (no L4 header to synthesize a reject/RST), mirroring the
+/// flowless transit deny — the junos-host deny event is still emitted for parity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlowlessLocalVerdict {
+    /// All gates passed (or none configured): deliver to the host.
+    Deliver,
+    /// Host-inbound denied — silent drop; account `host_inbound_denied_packets`.
+    HostInboundDeny,
+    /// lo0 host-bound filter discard/reject OR `to-zone junos-host` deny/reject —
+    /// silent flowless drop.
+    Filtered,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flowless_local_delivery_verdict(
+    forwarding: &ForwardingState,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    extra: crate::filter::TermMatchExtra<'_>,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    from_zone_id: u16,
+    ingress_zone_override: Option<u16>,
+    packet_len: u64,
+    now_ns: u64,
+) -> FlowlessLocalVerdict {
+    // A flowless packet's post-IP bytes are payload, never an authoritative L4
+    // header, so the ICMP type/code is NOT known (`policy_packet_icmp` returns
+    // None on the flow-backed sibling for the same reason). Derive it from the
+    // frame-extra so a first-fragment that somehow reaches here with a readable
+    // L4 header still supplies its type/code, but a non-first fragment
+    // (l4_present = false) fails the ICMP-constrained terms closed.
+    let packet_icmp = if extra.l4_present {
+        Some((extra.icmp_type, extra.icmp_code))
+    } else {
+        None
+    };
+    // Host-inbound admission FIRST, then the lo0 host-bound filter (#3485
+    // order). dst_port = 0 (no L4) and the frame-derived `extra`
+    // (l4_present = false) so a port-bearing admit / lo0 term cannot match a
+    // fragment; the ICMP first-L4-byte is 0 (absent), so the #3171 ICMP/ND
+    // global accept does not falsely exempt a fragment whose type we cannot read.
+    match host_inbound_gated_lo0_action(
+        forwarding,
+        from_zone_id,
+        0,
+        matches!(flow.dst_ip, IpAddr::V6(_)),
+        0,
+        extra,
+        event_stream,
+        flow,
+        meta,
+        ingress_zone_override,
+        now_ns,
+    ) {
+        None => return FlowlessLocalVerdict::HostInboundDeny,
+        Some(crate::filter::FilterAction::Accept) => {}
+        Some(_) => return FlowlessLocalVerdict::Filtered,
+    }
+    // `to-zone junos-host` policy AFTER host-inbound admission (Junos order),
+    // l4_present = false. A matching deny/reject is a SILENT flowless drop (the
+    // deny event is emitted inside the helper for observability / parity).
+    if junos_host_policy_deny_action(
+        forwarding,
+        event_stream,
+        flow,
+        meta,
+        from_zone_id,
+        packet_len,
+        now_ns,
+        false,
+        packet_icmp,
+    )
+    .is_some()
+    {
+        return FlowlessLocalVerdict::Filtered;
+    }
+    FlowlessLocalVerdict::Deliver
+}
+
+/// #3292 / #3600 review Note 2: compute the base forwarding resolution for a
+/// FLOWLESS (no-L4) packet, mirroring the flow-backed session-miss arm's
+/// ordering. INGRESS-interface and interface-NAT local-delivery resolution are
+/// tried BEFORE the (PBR `then routing-instance` override-aware) route-table
+/// lookup, so a host-bound flowless packet whose destination is a firewall
+/// interface IP reaches `LocalDelivery` instead of being steered into a PBR
+/// override table that has no local route for it (→ `NoRoute` → drop). The PBR
+/// override governs ONLY the fallback table lookup for genuinely transit
+/// packets — exactly as
+/// `ingress_interface_local_resolution_on_session_miss(..).or_else(..)
+/// .unwrap_or_else(table)` orders it on the flow-backed arm. Extracted so the
+/// ordering is unit-testable (the poll loop body itself is un-callable); see
+/// `flowless_local_delivery_tests`.
+#[allow(clippy::too_many_arguments)]
+fn flowless_base_resolution(
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    ingress_ifindex: i32,
+    ingress_vlan_id: u16,
+    protocol: u8,
+    dst: IpAddr,
+    route_override: Option<&str>,
+) -> ForwardingResolution {
+    ingress_interface_local_resolution_on_session_miss(
+        forwarding,
+        ingress_ifindex,
+        ingress_vlan_id,
+        dst,
+        protocol,
+    )
+    .or_else(|| interface_nat_local_resolution_on_session_miss(forwarding, dst, protocol))
+    .unwrap_or_else(|| {
+        enforce_ha_resolution_snapshot(
+            forwarding,
+            ha_state,
+            now_secs,
+            lookup_forwarding_resolution_in_table_with_dynamic(
+                forwarding,
+                dynamic_neighbors,
+                dst,
+                route_override,
+            ),
+        )
+    })
 }
 
 // Per-batch packet processing lifted from `poll_binding` (#678).
@@ -2769,6 +2953,15 @@ pub(super) fn poll_binding_process_descriptor(
                     //     (is-fragment / address / protocol) the route lookup is
                     //     steered to the override table; otherwise fall back to
                     //     the existing default-table resolve.
+                    //
+                    //     #3292 / #3600 review Note 2: try INGRESS-interface and
+                    //     interface-NAT LOCAL-delivery resolution BEFORE applying
+                    //     the PBR override, mirroring the flow-backed session-miss
+                    //     arm. A host-bound flowless packet (dst = a firewall
+                    //     interface IP) that also matches a PBR `routing-instance`
+                    //     term must reach LocalDelivery, NOT be steered into an
+                    //     override table that has no local route (→ NoRoute →
+                    //     drop). The override governs only the transit fallback.
                     let route_override = l3_ctx.as_ref().and_then(|l3_flow| {
                         ingress_route_table_override(
                             worker_ctx.forwarding,
@@ -2780,19 +2973,19 @@ pub(super) fn poll_binding_process_descriptor(
                             now_ns,
                         )
                     });
-                    let base_resolution = match (l3_ctx.as_ref(), route_override.as_deref()) {
-                        (Some(l3_flow), Some(table)) => enforce_ha_resolution_snapshot(
+                    let base_resolution = match l3_ctx.as_ref() {
+                        Some(l3_flow) => flowless_base_resolution(
                             worker_ctx.forwarding,
+                            worker_ctx.dynamic_neighbors,
                             worker_ctx.ha_state,
                             now_secs,
-                            lookup_forwarding_resolution_in_table_with_dynamic(
-                                worker_ctx.forwarding,
-                                worker_ctx.dynamic_neighbors,
-                                l3_flow.dst_ip,
-                                Some(table),
-                            ),
+                            meta.ingress_ifindex as i32,
+                            meta.ingress_vlan_id,
+                            meta.protocol,
+                            l3_flow.dst_ip,
+                            route_override.as_deref(),
                         ),
-                        _ => enforce_ha_resolution_snapshot(
+                        None => enforce_ha_resolution_snapshot(
                             worker_ctx.forwarding,
                             worker_ctx.ha_state,
                             now_secs,
@@ -2879,6 +3072,65 @@ pub(super) fn poll_binding_process_descriptor(
                             telemetry.dbg.policy_deny += 1;
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
+                        }
+                    }
+
+                    // (4) #3292: flowless LocalDelivery (host-bound) enforcement.
+                    //     A host-bound flowless packet (a non-first fragment / no-
+                    //     L4 packet addressed to a firewall interface IP) MUST pass
+                    //     the same gates the flow-backed LocalDelivery arm applies:
+                    //     host-inbound admission, the lo0 host-bound filter, and
+                    //     `to-zone junos-host` policy. Before #3292 this arm
+                    //     reinjected to the host ungated (fail-open). The synthetic
+                    //     L3 flow is evaluated with l4_present = false (ports = 0),
+                    //     so port-bearing terms fail closed while protocol/address/
+                    //     `any` still admit — fail-closed without over-gating. A
+                    //     flowless deny is SILENT (no L4 header to reject).
+                    if final_resolution.disposition == ForwardingDisposition::LocalDelivery
+                        && let Some(l3_flow) = l3_ctx.as_ref()
+                    {
+                        let ingress_logical = resolve_ingress_logical_ifindex(
+                            worker_ctx.forwarding,
+                            meta.ingress_ifindex as i32,
+                            meta.ingress_vlan_id,
+                        )
+                        .unwrap_or(meta.ingress_ifindex as i32);
+                        let from_zone_id = zone_pair_ids_for_flow_with_override(
+                            worker_ctx.forwarding,
+                            ingress_logical,
+                            ingress_zone_override,
+                            final_resolution.egress_ifindex,
+                        )
+                        .0;
+                        match flowless_local_delivery_verdict(
+                            worker_ctx.forwarding,
+                            worker_ctx.event_stream,
+                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
+                            l3_flow,
+                            meta,
+                            from_zone_id,
+                            ingress_zone_override,
+                            desc.len as u64,
+                            now_ns,
+                        ) {
+                            FlowlessLocalVerdict::Deliver => {}
+                            FlowlessLocalVerdict::HostInboundDeny => {
+                                telemetry.dbg.local += 1;
+                                telemetry.dbg.policy_deny += 1;
+                                telemetry.counters.touched = true;
+                                // #3326: account the host-inbound deny so
+                                // `GlobalCtrHostInboundDeny` reflects the drop.
+                                telemetry.counters.host_inbound_denied_packets += 1;
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
+                            FlowlessLocalVerdict::Filtered => {
+                                telemetry.dbg.local += 1;
+                                telemetry.dbg.policy_deny += 1;
+                                telemetry.counters.touched = true;
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
                         }
                     }
                     SessionDecision {
@@ -4624,5 +4876,262 @@ mod new_flow_session_limit_tests {
         }
         assert_eq!(table.session_limit_src_map_len(), 0);
         assert_eq!(table.session_limit_dst_map_len(), 0);
+    }
+}
+
+/// #3292: the flowless (no-L4) LocalDelivery security gate + the #3600 review
+/// Note 2 PBR-vs-local-delivery ordering. The poll loop body is un-callable, so
+/// these drive the two extracted decision helpers directly:
+/// `flowless_local_delivery_verdict` (host-inbound + lo0 + junos-host) and
+/// `flowless_base_resolution` (local-delivery-first resolution ordering).
+#[cfg(test)]
+mod flowless_local_delivery_tests {
+    use super::*;
+    use crate::filter::TermMatchExtra;
+    use crate::ip_proto::PROTO_TCP;
+    use crate::session::SessionKey;
+    use std::collections::BTreeMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    const GRE: u8 = 47;
+    // Ingress zone id used by the host-inbound verdict tests.
+    const ZONE: u16 = 7;
+    // Ingress ifindex + firewall-local interface IP used by the ordering test.
+    const INGRESS_IF: i32 = 6;
+
+    fn flowless_meta(protocol: u8) -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            protocol,
+            addr_family: libc::AF_INET as u8,
+            l3_offset: 14,
+            l4_offset: 34,
+            ingress_ifindex: INGRESS_IF as u32,
+            ..UserspaceDpMeta::default()
+        }
+    }
+
+    // A FLOWLESS host-bound flow: ports = 0 (a non-first fragment / no-L4
+    // packet) destined to a firewall-local interface IP.
+    fn flowless_flow(protocol: u8) -> SessionFlow {
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 99, 1));
+        SessionFlow {
+            src_ip: src,
+            dst_ip: dst,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol,
+                src_ip: src,
+                dst_ip: dst,
+                src_port: 0,
+                dst_port: 0,
+            },
+        }
+    }
+
+    // The frame-extra a non-first fragment yields: L4 header ABSENT, fragment
+    // TRUE (#2344).
+    fn flowless_extra() -> TermMatchExtra<'static> {
+        TermMatchExtra {
+            is_fragment: true,
+            l4_present: false,
+            ..Default::default()
+        }
+    }
+
+    fn fw_with_host_inbound(zone: u16, services: &[&str], protocols: &[&str]) -> ForwardingState {
+        let mut fw = ForwardingState::default();
+        let services: Vec<String> = services.iter().map(|s| s.to_string()).collect();
+        let protocols: Vec<String> = protocols.iter().map(|s| s.to_string()).collect();
+        fw.zone_host_inbound.insert(
+            zone,
+            crate::afxdp::forwarding::zone_host_inbound_from_tokens(&services, &protocols),
+        );
+        fw
+    }
+
+    fn verdict(
+        fw: &ForwardingState,
+        flow: &SessionFlow,
+        meta: UserspaceDpMeta,
+        from_zone_id: u16,
+    ) -> FlowlessLocalVerdict {
+        flowless_local_delivery_verdict(
+            fw,
+            None,
+            flowless_extra(),
+            flow,
+            meta,
+            from_zone_id,
+            Some(from_zone_id),
+            64,
+            1_000,
+        )
+    }
+
+    // (a) #3292: a flowless TCP host-bound packet on an SSH-ONLY zone is host-
+    // inbound DENIED (dst_port = 0 can never match the tcp/22 admit) → NOT
+    // delivered. Reverting the flowless gate (deliver ungated) flips this RED.
+    #[test]
+    fn flowless_host_inbound_deny_not_delivered() {
+        let fw = fw_with_host_inbound(ZONE, &["ssh"], &[]);
+        assert_eq!(
+            verdict(&fw, &flowless_flow(PROTO_TCP), flowless_meta(PROTO_TCP), ZONE),
+            FlowlessLocalVerdict::HostInboundDeny,
+        );
+    }
+
+    // (b) NO over-gating: a flowless packet the zone DOES admit must still be
+    // delivered. `host-inbound-traffic system-services all` admits every host-
+    // bound packet regardless of L4 → Deliver.
+    #[test]
+    fn flowless_admit_all_delivered() {
+        let fw = fw_with_host_inbound(ZONE, &["all"], &[]);
+        assert_eq!(
+            verdict(&fw, &flowless_flow(PROTO_TCP), flowless_meta(PROTO_TCP), ZONE),
+            FlowlessLocalVerdict::Deliver,
+        );
+    }
+
+    // (b) NO over-gating, realistic: a flowless GRE-to-self fragment on a zone
+    // that admits `system-services gre` (IP protocol 47) is delivered — the bare
+    // IP-protocol admit does not depend on a port, so l4_present = false does not
+    // over-gate it.
+    #[test]
+    fn flowless_protocol_admit_delivered() {
+        let fw = fw_with_host_inbound(ZONE, &["gre"], &[]);
+        assert_eq!(
+            verdict(&fw, &flowless_flow(GRE), flowless_meta(GRE), ZONE),
+            FlowlessLocalVerdict::Deliver,
+        );
+    }
+
+    // (a) lo0: an admit-all zone with a host-bound (lo0) `from protocol tcp then
+    // discard` filter discards the flowless TCP packet → NOT delivered. The
+    // protocol-only term matches regardless of L4 presence.
+    #[test]
+    fn flowless_lo0_discard_not_delivered() {
+        let mut fw = fw_with_host_inbound(ZONE, &["all"], &[]);
+        fw.filter_state = crate::filter::parse_filter_state(
+            &[crate::FirewallFilterSnapshot {
+                name: "protect-re".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "drop-tcp".into(),
+                    protocols: vec!["tcp".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                }],
+            }],
+            &[],
+            &[],
+            "protect-re",
+            "",
+        )
+        .expect("lo0 filter compiles");
+        assert_eq!(
+            verdict(&fw, &flowless_flow(PROTO_TCP), flowless_meta(PROTO_TCP), ZONE),
+            FlowlessLocalVerdict::Filtered,
+        );
+    }
+
+    // (a) junos-host: an admit-all zone with `from-zone trust to-zone junos-host
+    // then deny` (application any) denies the flowless host-bound packet → NOT
+    // delivered. `any` / address terms match regardless of L4.
+    #[test]
+    fn flowless_junos_host_deny_not_delivered() {
+        use crate::test_zone_ids::TEST_TRUST_ZONE_ID;
+        let mut fw = fw_with_host_inbound(TEST_TRUST_ZONE_ID, &["all"], &[]);
+        let zone_name_to_id: rustc_hash::FxHashMap<String, u16> =
+            [("trust".to_string(), TEST_TRUST_ZONE_ID)]
+                .into_iter()
+                .collect();
+        fw.policy = crate::policy::parse_policy_state(
+            "permit",
+            &[crate::PolicyRuleSnapshot {
+                name: "host-deny".into(),
+                from_zone: "trust".into(),
+                to_zone: crate::policy::JUNOS_HOST_ZONE_NAME.into(),
+                source_addresses: vec!["any".into()],
+                destination_addresses: vec!["any".into()],
+                applications: vec!["any".into()],
+                application_terms: Vec::new(),
+                action: "deny".into(),
+                ..Default::default()
+            }],
+            &zone_name_to_id,
+        );
+        assert_eq!(
+            verdict(
+                &fw,
+                &flowless_flow(PROTO_TCP),
+                flowless_meta(PROTO_TCP),
+                TEST_TRUST_ZONE_ID,
+            ),
+            FlowlessLocalVerdict::Filtered,
+        );
+    }
+
+    // (c) #3600 review Note 2: a host-bound flowless packet whose dst is the
+    // INGRESS interface's own IP resolves LocalDelivery even when a PBR
+    // `then routing-instance` term steers it into an override table with no
+    // local route. `flowless_base_resolution` tries ingress-local resolution
+    // BEFORE the override table; reverting to override-table-first turns the
+    // first assertion RED (it would become NoRoute — the bug).
+    #[test]
+    fn flowless_local_delivery_beats_pbr_override() {
+        let dst_v4 = Ipv4Addr::new(10, 0, 99, 1);
+        let dst = IpAddr::V4(dst_v4);
+        let mut fw = ForwardingState::default();
+        fw.egress.insert(
+            INGRESS_IF,
+            EgressInterface {
+                bind_ifindex: INGRESS_IF,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone_id: ZONE,
+                redundancy_group: 0,
+                primary_v4: Some(dst_v4),
+                primary_v6: None,
+            },
+        );
+        // local_v4 deliberately does NOT contain dst, so the override-table
+        // lookup alone resolves NoRoute — isolating the ingress-local-first
+        // ordering as the load-bearing fix.
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        let ha_state: BTreeMap<i32, HAGroupRuntime> = BTreeMap::new();
+
+        let resolved = flowless_base_resolution(
+            &fw,
+            &dynamic_neighbors,
+            &ha_state,
+            0,
+            INGRESS_IF,
+            0,
+            PROTO_TCP,
+            dst,
+            Some("vrf-x"),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::LocalDelivery,
+            "ingress-local resolution must win over the PBR override table",
+        );
+
+        // The override-table lookup alone does NOT deliver this host-bound
+        // packet — the bug the ordering fixes.
+        let override_only = lookup_forwarding_resolution_in_table_with_dynamic(
+            &fw,
+            &dynamic_neighbors,
+            dst,
+            Some("vrf-x"),
+        );
+        assert_ne!(
+            override_only.disposition,
+            ForwardingDisposition::LocalDelivery,
+            "override-table-first (the #3600 Note 2 bug) would not deliver",
+        );
     }
 }

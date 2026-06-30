@@ -4025,6 +4025,85 @@ fn junos_host_policy_no_match_falls_through_to_today_behavior() {
     );
 }
 
+// #3292: a `to-zone junos-host` rule with a PORT-BEARING application
+// (`destination-port 22`). The two assertions below hold the 5-tuple IDENTICAL
+// (dst_port = 22) and flip ONLY `l4_present`, so the difference in verdict is
+// attributable solely to the L4-presence gate: a flowless host-bound packet
+// (l4_present = false) MUST fail the port-bearing term closed even when a port
+// byte happens to be supplied, because a non-first fragment's post-IP bytes are
+// payload, never an authoritative L4 header. Reverting
+// `evaluate_junos_host_policy_l3_aware` to ignore `l4_present` (force true) makes
+// the flowless call spuriously MATCH → the flowless assertion flips RED.
+fn junos_host_port_app_snapshot() -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: "host-ssh-port".to_string(),
+        from_zone: "trust".to_string(),
+        to_zone: JUNOS_HOST_ZONE_NAME.to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["host-ssh".to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: "host-ssh".to_string(),
+            protocol: "tcp".to_string(),
+            source_port: String::new(),
+            destination_port: "22".to_string(),
+            icmp_type: None,
+            icmp_code: None,
+            inactivity_timeout: None,
+        }],
+        action: "deny".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn junos_host_l3_aware_fails_port_bearing_term_closed_for_flowless() {
+    let state = parse_policy_state("permit", &[junos_host_port_app_snapshot()], &test_zone_name_to_id());
+    let src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 102));
+    let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1));
+
+    // Flow-backed (l4_present = true, dst_port = 22): the destination-port 22 app
+    // term matches → deny. (Anchors that the port itself matches, so the flowless
+    // non-match below is attributable ONLY to l4_present being false.)
+    assert_eq!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, src, dst, PROTO_TCP, 12345, 22, None, 64, true,
+        )
+        .map(|r| r.action),
+        Some(PolicyAction::Deny),
+        "flow-backed call must match the destination-port 22 junos-host app term",
+    );
+
+    // Flowless (l4_present = false) — SAME tuple, only l4_present flipped: the
+    // port-bearing term fails CLOSED → no match → None → local delivery proceeds
+    // (a fragment's port is not authoritative, so it must not be denied by a
+    // port-specific rule it cannot be classified into).
+    assert!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, src, dst, PROTO_TCP, 12345, 22, None, 64, false,
+        )
+        .is_none(),
+        "flowless call must NOT match a port-bearing junos-host app term (l4_present=false)",
+    );
+}
+
+#[test]
+fn junos_host_l3_aware_any_app_matches_regardless_of_l4_presence() {
+    // An `application any` junos-host deny matches a flowless host-bound packet
+    // (no port required) — the L3-identity rule still enforces.
+    let state = parse_policy_state("permit", &[junos_host_deny_snapshot("deny")], &test_zone_name_to_id());
+    let src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 102));
+    let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1));
+    assert_eq!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, src, dst, PROTO_TCP, 0, 0, None, 64, false,
+        )
+        .map(|r| r.action),
+        Some(PolicyAction::Deny),
+        "an `any` junos-host rule denies a flowless host-bound packet too",
+    );
+}
+
 // ── #3073: established-session policy hit-count (per-packet) ──────────
 //
 // Before #3073 the per-rule packet/byte hit counter was incremented

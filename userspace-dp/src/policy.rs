@@ -2845,6 +2845,35 @@ pub(crate) fn evaluate_junos_host_policy(
     packet_icmp: Option<(u8, u8)>,
     packet_len: u64,
 ) -> Option<PolicyEvaluationResult> {
+    // #3292: flow-backed and test callers carry a real L4 header — delegate
+    // with `l4_present = true`, byte-identical to pre-#3292. Only the flowless
+    // LocalDelivery arm calls `evaluate_junos_host_policy_l3_aware` directly
+    // (mirrors the #3291 `evaluate_policy_result_with_icmp` wrapper split).
+    evaluate_junos_host_policy_l3_aware(
+        state, from_id, src_ip, dst_ip, protocol, src_port, dst_port, packet_icmp,
+        packet_len, true,
+    )
+}
+
+/// #3292: L4-presence-aware `junos-host` policy evaluation. `l4_present = false`
+/// marks a flowless / no-L4 packet (a non-first fragment on the flowless
+/// LocalDelivery arm); port-bearing application terms then fail closed while
+/// `application any` / address / protocol terms still match. The
+/// `evaluate_junos_host_policy` wrapper delegates here with `l4_present = true`,
+/// so the L4 (flow-backed / test) path is byte-identical to before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_junos_host_policy_l3_aware(
+    state: &PolicyState,
+    from_id: u16,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
+    packet_len: u64,
+    l4_present: bool,
+) -> Option<PolicyEvaluationResult> {
     if !state.has_junos_host_rules || from_id == 0 {
         return None;
     }
@@ -2863,9 +2892,10 @@ pub(crate) fn evaluate_junos_host_policy(
                 dst_port,
                 packet_icmp,
                 packet_len,
-                // Host-bound (junos-host) traffic always carries a real L4
-                // header on the current call paths.
-                true,
+                // #3292: `l4_present` is false only on the flowless
+                // LocalDelivery arm (a non-first fragment); port-bearing
+                // application terms then fail closed.
+                l4_present,
             ) {
                 // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
@@ -2895,9 +2925,10 @@ pub(crate) fn evaluate_junos_host_policy(
                 dst_port,
                 packet_icmp,
                 packet_len,
-                // Host-bound (junos-host) traffic always carries a real L4
-                // header on the current call paths.
-                true,
+                // #3292: `l4_present` is false only on the flowless
+                // LocalDelivery arm (a non-first fragment); port-bearing
+                // application terms then fail closed.
+                l4_present,
             ) {
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
                 return Some(result);
