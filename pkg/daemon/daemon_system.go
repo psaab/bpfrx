@@ -82,6 +82,14 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	er.ReplaceLocalWriters(nil)
 
 	if len(cfg.Security.Log.Streams) == 0 {
+		// Tear down any clients a prior config installed: a day-2 commit that
+		// removes ALL streams must not leave lingering clients forwarding to a
+		// deleted destination. This matches the event-mode (line ~65) and
+		// applySystemSyslog teardown paths, which already clear clients. It
+		// matters most after #3351: a down-at-apply TCP/TLS stream is now an
+		// installed RECONNECTING client, so without this it would resume
+		// sending audit logs to a removed receiver once that receiver recovers.
+		er.SetSyslogClients(nil)
 		d.applyAggregator(er, cfg)
 		return
 	}

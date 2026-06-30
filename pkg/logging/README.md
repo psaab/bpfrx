@@ -118,7 +118,13 @@ connectionless and exempt:
   `(nil, err)` — lazy connect is TCP/TLS-only. The daemon
   (`applySyslogConfig`) installs the non-nil client even when the
   constructor returns an error, logging `syslog stream receiver
-  unreachable at apply; installed in reconnecting state`.
+  unreachable at apply; installed in reconnecting state`. Because a
+  reconnecting client now outlives a transient outage, the daemon's
+  zero-streams path tears the clients down (`SetSyslogClients(nil)`) when
+  a day-2 commit removes ALL streams — otherwise a down-at-apply client
+  would resume forwarding audit logs to a deleted receiver once it
+  recovered. `EventReader.SyslogClientCount()` exposes the installed
+  count for that teardown assertion.
 - **Drop warning emitted AFTER the lock is released (#2287).**
   `SyslogClient.Send`/`SendBinary` hold `s.mu` for the whole write +
   reconnect sequence. The rate-limited drop warning (`slog.Warn`) must
