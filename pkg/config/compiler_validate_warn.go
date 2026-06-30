@@ -817,6 +817,15 @@ func ValidateConfig(cfg *Config) []string {
 	// silently accept config the dataplane cannot enforce.
 	warnings = append(warnings, validateFilterLossPriorityWarnings(cfg)...)
 
+	// #3445: an lo0 INPUT filter is mirrored onto a kernel nftables chain
+	// (the PRIMARY enforcement for host-bound traffic the XDP shim shunts to the
+	// kernel). That chain honors match predicates + `then log` + `then count`
+	// but cannot faithfully honor the CoS / rate-control `then` modifiers
+	// (policer, dscp-rewrite, forwarding-class). Warn — naming each term+modifier
+	// — rather than silently dropping them from the kernel mirror. loss-priority
+	// is already covered by validateFilterLossPriorityWarnings above.
+	warnings = append(warnings, validateLo0FilterKernelMirrorWarnings(cfg)...)
+
 	// #3295: a firewall filter attached to an interface/lo0 input/output hook
 	// with no terminal catch-all term relies on xpf's implicit-accept of
 	// unmatched traffic — the deliberate divergence from Junos's implicit final
@@ -965,6 +974,78 @@ func validateFilterLossPriorityWarnings(cfg *Config) []string {
 	}
 	emit("inet", cfg.Firewall.FiltersInet)
 	emit("inet6", cfg.Firewall.FiltersInet6)
+	return warnings
+}
+
+// validateLo0FilterKernelMirrorWarnings emits a WARN-only commit-time message
+// for each term in an lo0 INPUT filter (`interfaces lo0 unit 0 family inet[6]
+// filter input <name>`) that carries a `then` modifier the kernel nftables lo0
+// mirror cannot faithfully honor (#3445).
+//
+// Ordinary host-bound traffic to a firewall interface IP / VRRP VIP is shunted
+// to the Linux kernel by the XDP shim before it reaches userspace-dp, so the
+// `inet xpf_lo0` nftables chain (pkg/daemon/daemon_nft.go) is the PRIMARY
+// enforcement of the lo0 input filter for that traffic. That chain honors the
+// match predicates plus `then log`/`then syslog` (nft `log`) and `then count`
+// (a named nft counter), but a `hook input` chain has no faithful expression for
+// these CoS / rate-control modifiers:
+//   - then policer <name>: a Junos policer is a bandwidth+burst token bucket
+//     with a configurable then-action (discard / loss-priority); nft `limit`
+//     cannot reproduce the bandwidth/burst mapping or the loss-priority action,
+//     so mirroring it would silently rate-limit host-bound traffic by a
+//     DIFFERENT rule than userspace. The kernel mirror does not enforce it.
+//   - then dscp <v> (traffic-class rewrite) / then forwarding-class <fc>: these
+//     select egress CoS, which is meaningless for traffic the kernel delivers
+//     LOCALLY (there is no egress queue for host-bound packets), so the kernel
+//     input mirror performs no rewrite / class selection.
+//
+// loss-priority is intentionally NOT repeated here: validateFilterLossPriority
+// Warnings (#2507) already reports it as globally inert (no per-packet consumer
+// in EITHER dataplane), which subsumes the kernel-mirror gap.
+//
+// It is never an error: these modifiers are valid Junos and a hard reject would
+// brick a boot on a previously-committed config; userspace remains authoritative
+// for whatever lo0-filtered traffic actually reaches the XSK. The warning names
+// the family, filter, term, and modifier so the operator knows the kernel
+// host-bound path will not enforce them.
+func validateLo0FilterKernelMirrorWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	emit := func(family, filterName string, filter *FirewallFilter) {
+		if filterName == "" || filter == nil {
+			return
+		}
+		for _, term := range filter.Terms {
+			if term == nil {
+				continue
+			}
+			// Stable, deterministic per-term modifier order.
+			type mod struct{ kind, val string }
+			var mods []mod
+			if term.Policer != "" {
+				mods = append(mods, mod{"policer", term.Policer})
+			}
+			if term.DSCPRewrite != "" {
+				mods = append(mods, mod{"dscp (traffic-class rewrite)", term.DSCPRewrite})
+			}
+			if term.ForwardingClass != "" {
+				mods = append(mods, mod{"forwarding-class", term.ForwardingClass})
+			}
+			for _, m := range mods {
+				warnings = append(warnings, fmt.Sprintf(
+					"firewall family %s filter %q term %q `then %s %s` is accepted but "+
+						"the kernel lo0 input mirror (nftables xpf_lo0, the PRIMARY "+
+						"enforcement for host-bound traffic) cannot honor it; the modifier "+
+						"applies only to lo0-filtered traffic that reaches the userspace "+
+						"dataplane",
+					family, filterName, term.Name, m.kind, m.val))
+			}
+		}
+	}
+	emit("inet", cfg.System.Lo0FilterInputV4, cfg.Firewall.FiltersInet[cfg.System.Lo0FilterInputV4])
+	emit("inet6", cfg.System.Lo0FilterInputV6, cfg.Firewall.FiltersInet6[cfg.System.Lo0FilterInputV6])
 	return warnings
 }
 
