@@ -126,6 +126,20 @@ share the same per-zone token set; keep the Go nft token→match mapping
 (`hostInboundServiceMatches`/`hostInboundProtocolMatches`) in sync with the
 Rust classifier here.**
 
+**ident-reset (#3310).** `system-services ident-reset` is special-cased: Junos
+does NOT permit the ident (auth/TCP-113) service, it actively RESETS inbound
+ident probes. On the PRIMARY (kernel) path the nft chain emits
+`tcp dport 113 reject with tcp reset` so the kernel synthesizes an RFC-correct
+RST — 113 is never opened to the host. On THIS secondary AF_XDP path the
+`ident-reset` classifier arm is a deliberate NO-OP: it contributes nothing to
+the admit set, so `admits()` returns false for TCP/113 and the rare
+AF_XDP-reached ident packet (DNAT/static-NAT-to-113 — an edge of an edge) is
+DROPPED rather than reset. This is a documented divergence from the kernel
+reset; both layers stop the prior plain-admit of 113. `all` / `any-service`
+precedence still wins (a fully-open zone admits 113). The token set stays in
+sync (ident-reset remains a recognized token on both layers); only the
+secondary-path action diverges (drop vs reset).
+
 The set is parsed and modeled in Go
 (`config.ZoneConfig.HostInboundTraffic`) and crosses the snapshot boundary on
 `ZoneSnapshot`

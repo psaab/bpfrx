@@ -419,9 +419,20 @@ never lock an operator out of a remote box it manages.
   are accepted before any deny; a configured zone that resolves to zero
   recognized matches fails OPEN (no deny) rather than locking the zone out.
   Token→nft mapping (`hostInboundServiceMatches`/`hostInboundProtocolMatches`)
-  mirrors the Rust classifier and must stay in sync. Tests:
-  `host_inbound_nft_test.go` (accept-listed / deny-rest fail-on-revert,
-  no-stanza-no-deny, lifeline-never-denied, `all`-opens-zone).
+  mirrors the Rust classifier and must stay in sync. **ident-reset (#3310):**
+  `system-services ident-reset` is NOT a plain admit — Junos actively RESETS
+  inbound ident (auth/TCP-113) probes. Its nft verdict
+  (`hostInboundServiceAction`) is `reject with tcp reset` (the first `reject`
+  rule in `xpf_hostinbound`), emitted before the catch-all drop, so the kernel
+  synthesizes an RFC-correct RST and 113 is NEVER opened to the host. `all` /
+  `any-service` precedence wins (a fully-open zone admits 113 and emits no
+  ident-reset reject). The Rust AF_XDP secondary path does NOT reset — it simply
+  drops 113 (the classifier ident-reset arm contributes nothing to the admit
+  set), a documented divergence on the near-nonexistent DNAT/static-NAT-to-113
+  path. Tests: `host_inbound_nft_test.go` (accept-listed / deny-rest
+  fail-on-revert, no-stanza-no-deny, lifeline-never-denied, `all`-opens-zone,
+  ident-reset emits-reset / `all`-suppresses-reset / nft-parse-check),
+  `host_inbound_parity_test.go` (ident-reset reject-verdict parity).
   **Counted drops + scrape (#3361):** each per-zone/family catch-all drop is
   `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =
   `nftables.HostInboundDenyCounterName(zone, family)` (encoding
