@@ -59,6 +59,28 @@ func (s *Server) applyResult() *dataplane.ApplyResult {
 	return dataplane.LastApplyResultOf(s.dp)
 }
 
+// nodeID returns this node's cluster id (0 standalone or when unwired),
+// stamped on the REST session responses so an operator knows which node a
+// result was observed on (#3423 M5).
+func (s *Server) nodeID() int {
+	if s.nodeIDFn == nil {
+		return 0
+	}
+	return s.nodeIDFn()
+}
+
+// clusterSession resolves the HA-aware session service the REST handlers
+// delegate to for cross-node clear/list/summary (#3423). It returns nil
+// (local-only fallback) when the provider is unwired or reports no service
+// — the latter guards the typed-nil-in-interface trap for a standalone
+// build whose provider returns a nil *grpcapi.Server.
+func (s *Server) clusterSession() ClusterSessionService {
+	if s.clusterSessionFn == nil {
+		return nil
+	}
+	return s.clusterSessionFn()
+}
+
 func queryInt(r *http.Request, key string, def int) int {
 	v := r.URL.Query().Get(key)
 	if v == "" {

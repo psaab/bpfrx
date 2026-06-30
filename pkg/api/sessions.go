@@ -16,6 +16,7 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 // sessionCursorIterator is the optional cursor-based session iteration
@@ -39,6 +40,15 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	q, errMsg := buildSessionQuery(r, view)
 	if errMsg != "" {
 		writeError(w, http.StatusBadRequest, errMsg)
+		return
+	}
+
+	// include_peer is an opt-in HA flag (#3423 M5): when set the local list
+	// is augmented with the cluster peer's sessions. Validate it here so a
+	// malformed value fails closed (HTTP 400) rather than being silently
+	// ignored — mirroring the other boolean filters.
+	if _, ok := sessionIncludePeer(r); !ok {
+		writeError(w, http.StatusBadRequest, "invalid include_peer: "+r.URL.Query().Get("include_peer"))
 		return
 	}
 
@@ -126,7 +136,7 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessi
 		return
 	}
 
-	writeOK(w, SessionListResponse{
+	s.writeSessionList(w, r, SessionListResponse{
 		Total:    idx,
 		Limit:    limit,
 		Offset:   offset,
@@ -200,7 +210,7 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 			return
 		}
 		if len(all) >= pageSize {
-			writeOK(w, SessionListResponse{
+			s.writeSessionList(w, r, SessionListResponse{
 				PageSize:      pageSize,
 				NextPageToken: encodePageTokenV4(lastV4),
 				Sessions:      all,
@@ -227,7 +237,7 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 			return
 		}
 		if len(all) >= pageSize {
-			writeOK(w, SessionListResponse{
+			s.writeSessionList(w, r, SessionListResponse{
 				PageSize:      pageSize,
 				NextPageToken: encodePageTokenV6(lastV6),
 				Sessions:      all,
@@ -237,7 +247,7 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 	}
 
 	// Both families exhausted — last page, empty next_page_token.
-	writeOK(w, SessionListResponse{
+	s.writeSessionList(w, r, SessionListResponse{
 		PageSize: pageSize,
 		Sessions: all,
 	})
@@ -268,9 +278,175 @@ func (s *Server) enrichSessionV6(key dataplane.SessionKeyV6, val dataplane.Sessi
 	return sessionEntryV6(key, val, now, view)
 }
 
-func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
+// sessionIncludePeer parses the include_peer query flag, returning the value
+// and whether it was well-formed (an absent flag is valid and defaults to
+// false). The handlers fail closed (HTTP 400) on a malformed value rather
+// than silently ignoring an opt-in HA request (#3423 M5).
+func sessionIncludePeer(r *http.Request) (value bool, ok bool) {
+	v := r.URL.Query().Get("include_peer")
+	if v == "" {
+		return false, true
+	}
+	b, err := strconv.ParseBool(v)
+	return b, err == nil
+}
+
+// writeSessionList stamps the local node identity on a REST session list and,
+// when include_peer=true and an HA-aware session service is wired, augments it
+// with the cluster peer's sessions (#3423 M5). The local list reports the
+// LOCAL table only; node_id tells a dashboard which node it observes, and the
+// optional peer set keeps it from understating total HA state.
+//
+// The peer's FULL table is attached only on the FIRST page — cursor mode's
+// first page (no page_token) AND offset mode's first window (offset==0). A
+// client paginating either way and summing peer.sessions across pages would
+// OVER-COUNT the peer if the whole peer table were re-attached on every page
+// (the offset path never sets a page_token, so a page_token-only guard let it
+// through). page_token additionally encodes node-local map keys meaningless to
+// the peer.
+func (s *Server) writeSessionList(w http.ResponseWriter, r *http.Request, resp SessionListResponse) {
+	resp.NodeID = s.nodeID()
+	if includePeer, _ := sessionIncludePeer(r); includePeer && sessionFirstPage(r) {
+		if svc := s.clusterSession(); svc != nil {
+			if pr, err := svc.GetSessions(r.Context(), peerSessionsRequest(r)); err == nil {
+				if peer := pr.GetPeer(); peer != nil {
+					resp.Peer = sessionListFromPB(peer)
+				}
+			}
+		}
+	}
+	writeOK(w, resp)
+}
+
+// sessionFirstPage reports whether this list request is the first page, on
+// BOTH pagination modes: cursor mode's first page carries no page_token, and
+// offset mode's first window has offset==0. A non-first page must NOT re-attach
+// the peer table (#3423 — avoids over-counting the peer across pages). The
+// offset/page_token query values are already validated by the caller
+// (sessionsOffset / sessionsCursor) before writeSessionList runs, so a lenient
+// re-parse here cannot mask a malformed value.
+func sessionFirstPage(r *http.Request) bool {
+	q := r.URL.Query()
+	if q.Get("page_token") != "" {
+		return false
+	}
+	if off, err := strconv.Atoi(q.Get("offset")); err == nil && off > 0 {
+		return false
+	}
+	return true
+}
+
+// peerSessionsRequest maps the REST session filter query parameters onto a
+// protobuf GetSessionsRequest with IncludePeer set, so the peer applies the
+// SAME filters the local list did. Values are read leniently — the caller has
+// already validated them (buildSessionQuery / the include_peer guard) before a
+// peer fetch is attempted, and the peer re-validates on its own surface.
+func peerSessionsRequest(r *http.Request) *pb.GetSessionsRequest {
+	q := r.URL.Query()
+	req := &pb.GetSessionsRequest{
+		IncludePeer:       true,
+		Protocol:          q.Get("protocol"),
+		SourcePrefix:      q.Get("source_prefix"),
+		DestinationPrefix: q.Get("destination_prefix"),
+		Application:       q.Get("application"),
+		InterfaceFilter:   q.Get("interface"),
+		SourceNatPool:     q.Get("source_nat_pool"),
+	}
+	if z, err := strconv.ParseUint(q.Get("zone"), 10, 16); err == nil {
+		req.Zone = uint32(z)
+	}
+	if p, err := strconv.ParseUint(q.Get("source_port"), 10, 16); err == nil {
+		req.SourcePort = uint32(p)
+	}
+	if p, err := strconv.ParseUint(q.Get("destination_port"), 10, 16); err == nil {
+		req.DestinationPort = uint32(p)
+	}
+	if b, err := strconv.ParseBool(q.Get("nat_only")); err == nil {
+		req.NatOnly = b
+	}
+	if l, err := strconv.Atoi(q.Get("limit")); err == nil && l > 0 {
+		req.Limit = int32(l)
+	}
+	return req
+}
+
+// sessionListFromPB maps a protobuf session-list response (the peer node's
+// view) onto the REST SessionListResponse shape (#3423 M5).
+func sessionListFromPB(p *pb.GetSessionsResponse) *SessionListResponse {
+	out := &SessionListResponse{
+		Total:         int(p.GetTotal()),
+		Limit:         int(p.GetLimit()),
+		Offset:        int(p.GetOffset()),
+		NextPageToken: p.GetNextPageToken(),
+		NodeID:        int(p.GetNodeId()),
+		Sessions:      make([]SessionEntry, 0, len(p.GetSessions())),
+	}
+	for _, e := range p.GetSessions() {
+		out.Sessions = append(out.Sessions, sessionEntryFromPB(e))
+	}
+	return out
+}
+
+// sessionEntryFromPB maps one protobuf SessionEntry onto the REST shape.
+func sessionEntryFromPB(e *pb.SessionEntry) SessionEntry {
+	return SessionEntry{
+		SrcAddr:          e.GetSrcAddr(),
+		DstAddr:          e.GetDstAddr(),
+		SrcPort:          uint16(e.GetSrcPort()),
+		DstPort:          uint16(e.GetDstPort()),
+		Protocol:         e.GetProtocol(),
+		State:            e.GetState(),
+		PolicyID:         e.GetPolicyId(),
+		PolicyName:       e.GetPolicyName(),
+		IngressZoneName:  e.GetIngressZoneName(),
+		EgressZoneName:   e.GetEgressZoneName(),
+		InZone:           uint16(e.GetIngressZone()),
+		OutZone:          uint16(e.GetEgressZone()),
+		IngressInterface: e.GetIngressInterface(),
+		EgressInterface:  e.GetEgressInterface(),
+		Application:      e.GetApplication(),
+		FwdPackets:       e.GetFwdPackets(),
+		FwdBytes:         e.GetFwdBytes(),
+		RevPackets:       e.GetRevPackets(),
+		RevBytes:         e.GetRevBytes(),
+		NAT:              e.GetNat(),
+		NATSrcAddr:       e.GetNatSrcAddr(),
+		NATSrcPort:       uint16(e.GetNatSrcPort()),
+		NATDstAddr:       e.GetNatDstAddr(),
+		NATDstPort:       uint16(e.GetNatDstPort()),
+		Age:              e.GetAgeSeconds(),
+		Idle:             e.GetIdleSeconds(),
+		Timeout:          e.GetTimeoutSeconds(),
+		SessionID:        e.GetSessionId(),
+		HAActive:         e.GetHaActive(),
+	}
+}
+
+// sessionSummaryFromPB maps a protobuf session summary (the peer node's view)
+// onto the REST SessionSummary shape (#3423 M5).
+func sessionSummaryFromPB(p *pb.GetSessionSummaryResponse) *SessionSummary {
+	return &SessionSummary{
+		TotalEntries: int(p.GetTotalEntries()),
+		ForwardOnly:  int(p.GetForwardOnly()),
+		Established:  int(p.GetEstablished()),
+		IPv4Sessions: int(p.GetIpv4Sessions()),
+		IPv6Sessions: int(p.GetIpv6Sessions()),
+		SNATSessions: int(p.GetSnatSessions()),
+		DNATSessions: int(p.GetDnatSessions()),
+		NodeID:       int(p.GetNodeId()),
+	}
+}
+
+func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
+		return
+	}
+
+	// include_peer opt-in HA flag (#3423 M5); fail closed on a bad value.
+	includePeer, ok := sessionIncludePeer(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid include_peer: "+r.URL.Query().Get("include_peer"))
 		return
 	}
 
@@ -320,6 +496,22 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
+	summary.NodeID = s.nodeID()
+
+	// Augment with the cluster peer's summary when the operator opted in and
+	// an HA-aware service is wired (#3423 M5): the local summary alone
+	// understates total HA state. A standalone node / unreachable peer
+	// leaves Peer nil.
+	if includePeer {
+		if svc := s.clusterSession(); svc != nil {
+			if pr, err := svc.GetSessionSummary(r.Context(), &pb.GetSessionSummaryRequest{IncludePeer: true}); err == nil {
+				if peer := pr.GetPeer(); peer != nil {
+					summary.Peer = sessionSummaryFromPB(peer)
+				}
+			}
+		}
+	}
+
 	writeOK(w, summary)
 }
 
@@ -340,11 +532,34 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	// which silently drops un-decodable pairs like `?%zz` and could let a
 	// non-empty query proceed to clear-all — SMR); a non-zero ContentLength
 	// (including the chunked-transfer -1 sentinel) also rejects so a
-	// body-carrying request cannot be misread as clear-all. Filtered REST
-	// clear plus HA peer propagation is tracked separately in #3423.
+	// body-carrying request cannot be misread as clear-all.
 	if r.URL.RawQuery != "" || r.ContentLength != 0 {
 		writeError(w, http.StatusBadRequest,
 			"filtered clear not supported on this endpoint; it clears all local sessions and accepts no parameters")
+		return
+	}
+
+	// In an HA cluster the clear MUST also reach the peer: a local-only
+	// clear leaves the peer/synced sessions, which can reappear as active
+	// state on failover (#3423 H5). When the HA-aware session service is
+	// wired (the gRPC server), delegate the clear-all to it so REST shares
+	// the SAME service-layer path gRPC uses: local clear + peer propagation
+	// (clearPeerSessions, x-peer-forwarded recursion guard) + partial-
+	// failure summary. A nil service (standalone build / unit test) falls
+	// back to the local-only clear — the pre-#3423 behavior.
+	if svc := s.clusterSession(); svc != nil {
+		resp, err := svc.ClearSessions(r.Context(), &pb.ClearSessionsRequest{})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeOK(w, ClearSessionsResult{
+			IPv4Cleared:    int(resp.GetIpv4Cleared()),
+			IPv6Cleared:    int(resp.GetIpv6Cleared()),
+			NodeID:         s.nodeID(),
+			Failures:       int(resp.GetFailures()),
+			FailureSummary: resp.GetFailureSummary(),
+		})
 		return
 	}
 
@@ -353,12 +568,19 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeOK(w, ClearSessionsResult{IPv4Cleared: v4, IPv6Cleared: v6})
+	writeOK(w, ClearSessionsResult{IPv4Cleared: v4, IPv6Cleared: v6, NodeID: s.nodeID()})
 }
 
+// sessionZonePairHandler serves the zone-pair session breakdown. Like the
+// /sessions/summary sibling it now stamps node_id so an operator knows which
+// node the counts came from (#3423 M5). It does NOT support include_peer:
+// unlike list/summary there is no gRPC zone-pair-summary RPC to forward to, so
+// cross-node fan-out would need a new RPC. Tracked as a follow-up (#3592,
+// referenced in pkg/api/README.md) rather than approximated client-side from a
+// peer session list.
 func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
-		writeOK(w, []ZonePairSessionSummary{})
+		writeOK(w, ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: []ZonePairSessionSummary{}})
 		return
 	}
 
@@ -433,7 +655,7 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) 
 		}
 		return result[i].ToZone < result[j].ToZone
 	})
-	writeOK(w, result)
+	writeOK(w, ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: result})
 }
 
 // --- Session helper functions ---

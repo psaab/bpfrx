@@ -926,7 +926,9 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 // Uses x-peer-forwarded metadata to prevent infinite recursion. Returns
 // a non-nil error if the peer is unreachable or its clear failed so the
 // caller can report the partial success (#2468) rather than silently
-// leaving the peer holding the sessions.
+// leaving the peer holding the sessions. The error names the PEER NODE so
+// the failure_summary is operator-actionable (#3423) — a bare "dial peer"
+// did not say which node still holds uncleared sessions.
 //
 // A standalone node (no cluster manager) has no peer to clear and
 // returns nil — not a failure.
@@ -934,18 +936,32 @@ func (s *Server) clearPeerSessions(req *pb.ClearSessionsRequest) error {
 	if s.cluster == nil {
 		return nil
 	}
+	peerID := s.peerNodeIDForMsg()
 	conn, err := s.dialPeer()
 	if err != nil {
-		return fmt.Errorf("dial peer: %w", err)
+		return fmt.Errorf("dial peer node %d: %w", peerID, err)
 	}
 	defer conn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
 	if _, err := pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req); err != nil {
-		return fmt.Errorf("peer ClearSessions: %w", err)
+		return fmt.Errorf("peer node %d ClearSessions: %w", peerID, err)
 	}
 	return nil
+}
+
+// peerNodeIDForMsg returns the cluster peer's node id for operator-facing
+// failure messages (#3423). PeerNodeID() is authoritative once a heartbeat
+// has been seen; before that it defaults to the local id, so fall back to the
+// deterministic other node of the two-node cluster (node ids are 0/1). The
+// caller has already guarded s.cluster != nil.
+func (s *Server) peerNodeIDForMsg() int {
+	local := s.cluster.NodeID()
+	if pid := s.cluster.PeerNodeID(); pid != local {
+		return pid
+	}
+	return 1 - local
 }
 
 // clearErrors accumulates per-operation failures across a session clear
