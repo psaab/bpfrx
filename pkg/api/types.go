@@ -57,6 +57,14 @@ type InterfaceStats struct {
 	RxBytes   uint64 `json:"rx_bytes"`
 	TxPackets uint64 `json:"tx_packets"`
 	TxBytes   uint64 `json:"tx_bytes"`
+	// Unavailable is true when the per-interface dataplane counter read
+	// FAILED (#3464). The counter fields above are then left at 0 but are NOT
+	// authoritative, so a real idle 0 stays distinguishable from a degraded
+	// counter bridge. Omitted (false) when counters read successfully. Both
+	// REST surfaces (/stats/interfaces and /interfaces) set it uniformly, and
+	// it mirrors gRPC InterfaceInfo.unavailable + the Prometheus
+	// xpf_interface_counter_read_errors_total counter.
+	Unavailable bool `json:"unavailable,omitempty"`
 }
 
 // ZoneInfo holds zone configuration and counter data.

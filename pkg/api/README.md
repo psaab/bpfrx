@@ -230,8 +230,11 @@ under the daemon's errgroup. Nothing else imports this package.
     on a LATE read is surfaced rather than printing a stale `0` under an
     earlier passed check. The structured APIs follow the same rule (check
     after the full response is built).
-  - **Out of scope**: per-interface and NAT-rule/port counters are not
-    security counters and keep their existing per-read handling.
+  - **Out of scope**: NAT-rule/port counters are not security counters and
+    keep their existing per-read handling. Per-interface counters are also
+    out of the SECURITY-counter contract, but they now carry their OWN
+    uniform unavailable/error contract (#3464, below) so a degraded
+    interface-counter bridge is no longer handled divergently across surfaces.
 
   Pinned by `stats_counter_error_test.go` +
   `zones_policies_counter_error_test.go` (REST + Prometheus),
@@ -241,6 +244,40 @@ under the daemon's errgroup. Nothing else imports this package.
   `pkg/cli/show_security_counter_error_test.go` (incl. late-read ordering
   cases that fail if a warn is moved before the per-type screen-breakdown
   loop). This resolves both #3345 and #3408.
+- Per-interface counter read failures get a uniform unavailable/error
+  contract across all four interface-counter surfaces (#3464). Interface
+  counters are intentionally out of the #3345 SECURITY-counter contract
+  (above), but they used to be handled DIVERGENTLY on a failed
+  `ReadInterfaceCounters`: REST `/stats/interfaces` dropped the whole row
+  (the interface vanished), REST `/interfaces` and gRPC `GetInterfaces` left
+  a clean `0` (indistinguishable from a real idle interface), and the
+  Prometheus collector silently omitted the sample with no error metric. An
+  operator could not tell "interface idle" from "counter bridge unavailable".
+  The uniform contract:
+  - **Structured APIs** KEEP the interface row and set an explicit
+    `unavailable` flag (`InterfaceStats.unavailable` on REST `/stats/interfaces`
+    + `/interfaces`; `InterfaceInfo.unavailable` on gRPC `GetInterfaces`). The
+    counter fields stay `0` but are not authoritative — a real idle `0` is
+    distinguishable from a degraded read. `/stats/interfaces` no longer drops
+    the row (the old `continue`). A read failure does NOT escalate to HTTP 500
+    / `codes.Internal` (unlike the security counters): interface counters are
+    operability telemetry, not a security signal, so per-row degradation is
+    preferred over failing the whole inventory.
+  - **Prometheus** (`metrics_counters.go`) still OMITS the affected
+    `xpf_interface_{packets,bytes}_total` sample (rather than emitting a
+    misleading `0`) and bumps the dedicated
+    `xpf_interface_counter_read_errors_total` monotonic counter — SEPARATE
+    from `xpf_counter_read_errors_total` so interface-counter degradation is
+    alertable without conflating it with security-counter health. The sample
+    is always emitted (0 when healthy) and emitted AFTER
+    `collectInterfaceCounters` (`emitInterfaceCounterReadErrors`) so a failure
+    this scrape is reflected this scrape.
+  - The kernel-link `net.InterfaceByName` "not present" case (a different
+    axis — interface absent from the kernel, not a counter-bridge failure)
+    keeps each surface's existing handling and is NOT flagged `unavailable`.
+
+  Pinned by `interface_counter_error_test.go` (REST + Prometheus) and
+  `pkg/grpcapi/interface_counter_error_test.go` (gRPC). This resolves #3464.
 - Named source-NAT pool stats are sourced from the userspace helper's
   LIVE runtime status, not config text (#2938). `natPoolStatsHandler`
   (`/security/nat/source/pools`) reads `s.runtimeSourceNATPools()` — the
