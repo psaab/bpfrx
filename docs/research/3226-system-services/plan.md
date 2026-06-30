@@ -1,6 +1,6 @@
 # #3226 — `system-services all` / `any-service` host-inbound admission posture
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — Claude-SMR r1 folded (H1-H4); pending Codex + AGY
 **Issue:** #3226 (labels: audit, enhancement). Provenance: codex-review-071 finding 071-04.
 **Branch:** `research/3226-system-services`
 **Verified against:** `origin/master` @ `b3b8b6029` (newer than the e7496acd0 / e8d4cbd9f the prior triage comments referenced — see §4, the #3277 lifeline fix has landed since).
@@ -42,21 +42,36 @@ and unlisted TCP/UDP ports to the firewall's own interface IPs in that zone. It
 brings xpf's `all` token to Junos-strict semantics.
 
 **At absolute scale, the value is bounded by how `all` is actually used:**
-- All three canonical cluster configs use `system-services { all }` **only on
-  the `control` zone**, whose interfaces are **all lifeline interfaces**
-  (em0/fab0/fab1, or fxp1/fab0/fab1) → those zones resolve to an **empty address
-  set** → **no deny rule is ever emitted** for them regardless of scoping (§4).
-  So scoping `all` is a **no-op on every shipped config**.
+- All FOUR canonical cluster configs (`ha-cluster.conf`,
+  `ha-cluster-userspace.conf`, `ha-cluster-loss.conf`, `xpf-cluster-fw0.conf`)
+  use `system-services { all }` **only on the `control` zone**, whose interfaces
+  are **all lifeline interfaces** (em0/fab0/fab1, or fxp1/fab0/fab1) → those
+  zones resolve to an **empty address set** → **no deny rule is ever emitted**
+  for them regardless of scoping (§4). So scoping `all` is a **no-op on every
+  shipped config** (independently confirmed by the AGY review across all four).
 - The real exposure exists only for an operator who put `system-services all` on
   a **data** zone with live firewall-local addresses. That is a config we do not
   ship and (per Junos hygiene) should not be common, but it is the case the
   issue is about.
+
+**Option B only PARTIALLY satisfies the issue's literal example (Claude-SMR
+H1).** The issue's motivating test is "`system-services all` admits
+SSH/HTTPS/SNMP but denies OSPF/**GRE**/VRRP." But `gre` is a *named* xpf
+system-service (proto 47 — §3/§5), so a union-of-named `all` **still admits
+GRE/47**. Option B closes OSPF(89)/PIM(103)/raw-and-future-protos/unlisted
+TCP-UDP ports, but NOT GRE, unless `gre` is also reclassified out of
+system-services (a separate compatibility change, §10 out-of-scope). So even the
+recommended split does not fully match the issue's stated expectation.
 
 **This is fundamentally a posture/parity decision, not a perf change.** If the
 maintainer concludes the current documented broad-alias is the preferred
 posture (zero-surprise-on-upgrade beats Junos-strict-correctness), **PLAN-KILL
 is an acceptable verdict** — the behavior is correct-by-design and documented,
 and the only residual is documentation accuracy (split the two tokens in prose).
+Given that scoping `all` is a **no-op on every shipped config** (Claude-SMR H2)
+AND Option B does not fully close the issue's example (H1), Option A and Option B
+are genuinely **co-equal**; the marginal value is precisely why the posture call
+belongs to the maintainer, not the engineer.
 
 ---
 
@@ -179,12 +194,19 @@ drop apply.
   (family-aware via `HostInboundServiceFamily`). `all` then flows through the
   per-match accept path and gets the per-zone catch-all drop.
 
-### `any-service` → entire TCP+UDP port range (Junos semantic)
-- Add `any_tcp` / `any_udp` bool flags to `ZoneHostInbound`. `admits` returns
-  true for proto 6/17 regardless of port when set, but still drops non-TCP/UDP
-  IP protocols not otherwise permitted.
-- nft mirror: `<fam> daddr <addrs> meta l4proto { tcp, udp } accept` + the
-  catch-all drop.
+### `any-service` → two sub-options (Claude-SMR H3)
+There is no evidence `any-service` is used in any xpf config; distinguishing it
+from `all` adds struct fields + admits branches + an nft rule for a token of
+unproven usage. Two co-equal sub-choices:
+- **B1 (cheaper, recommended):** `any-service` stays the documented full-admit
+  escape hatch (the only token that keeps the `all_services` short-circuit),
+  with an explicit commit warning that it is a non-Junos blanket admit. Only
+  `all` is scoped. Smaller blast radius, fewer new fields.
+- **B2 (strict Junos):** `any-service` → entire TCP+UDP port range. Add
+  `any_tcp` / `any_udp` bool flags to `ZoneHostInbound`; `admits` returns true
+  for proto 6/17 regardless of port but still drops non-TCP/UDP IP protocols not
+  otherwise permitted. nft mirror: `<fam> daddr <addrs> meta l4proto { tcp, udp
+  } accept` + catch-all drop. Adopt only if a real `any-service` use case exists.
 
 ### `gre` classification — a design fork the issue's example test exposes
 `gre` is currently a **system-service** token (`host_inbound.rs:208-209` →
@@ -232,11 +254,16 @@ out of `system-services` (a separate, larger compatibility change). Recommended:
 
 ## 7. Hidden invariants the change must preserve (Option B)
 
-1. **Go↔Rust parity (#3486 / #1961 wire).** The nft `all` expansion and the
-   Rust classifier expansion MUST yield the same admit set, or a host-bound
-   packet is accepted on one path and dropped on the other (split-brain). The
-   existing `TestHostInboundRustClassifierMatchesGoSSOT` must be extended to
-   cover the `all` expansion, not just the per-token arms.
+1. **Go↔Rust parity (#3486 / #1961 wire) (Claude-SMR H4).** The nft `all`
+   expansion and the Rust classifier expansion MUST yield the same admit set, or
+   a host-bound packet is accepted on one path and dropped on the other
+   (split-brain). NOTE the existing `TestHostInboundRustClassifierMatchesGoSSOT`
+   compares the *token-arm sets* (classify arms == SSOT maps) — it would NOT
+   catch a divergence in how Go vs Rust *expand* `all` into ports/protos. The
+   plan must add a SEPARATE assertion that compiles a `system-services all` zone
+   through BOTH layers and compares the resulting concrete admit sets
+   (tcp_ports / udp_ports{,_v4,_v6} / icmp_types{_v4,_v6} / ip_protocols{,_v4,_v6}
+   vs the nft match set), not merely extend the arm-equality test.
 2. **Family-awareness (#3225).** The named-set expansion must route each token
    through `HostInboundServiceFamily`, or `all` re-opens dhcp/67-68 on IPv6
    (the #3225 regression).
@@ -352,8 +379,19 @@ raised is now resolved by #3277 — so the engineering for the Junos-correct spl
 (Option B) is well-understood, low-risk on shipped configs, and ready. What is
 NOT mine to decide is the **posture**: Junos-strict-correctness + tighter
 data-zone box (Option B) vs zero-surprise-on-upgrade + keep the documented alias
-(Option A / PLAN-KILL). Both are defensible; the maintainer picks. Recommended
-default if forced to choose: **Option B**, hard-gated on `make test-failover`,
-because the #3277 prerequisite removed the only real risk and Junos parity is the
-project's stated goal. Fallback: **Option A / PLAN-KILL** with a documentation
-pass making the alias + superset-of-Junos explicit.
+(Option A / PLAN-KILL).
+
+After folding Claude-SMR H1+H2, the two options are **genuinely co-equal**, not
+B-leaning: scoping `all` is a no-op on all four shipped configs, AND Option B
+does not even fully close the issue's literal example (gre/47 stays admitted
+because gre is a named service). So the honest framing is — the engineering is
+ready, but the *value* is marginal and the *cost* (new classifier path,
+parity-set test, mandatory `make test-failover`) is real. If the maintainer
+weights Junos-strict-parity highest, ship **Option B** (with `any-service`
+sub-choice B1 = keep documented escape hatch, the cheaper default), hard-gated on
+`make test-failover`. If the maintainer weights zero-surprise-on-upgrade + churn
+avoidance highest — which, given the no-op-on-shipped-configs reality, is the
+slightly stronger default — take **Option A / PLAN-KILL** with a documentation
+pass making the `all`/`any-service` alias + superset-of-Junos nature explicit in
+`forwarding/README.md` and the struct/`hostInboundAllowsAll` comments. Either way
+the #3277 lifeline derivation stays as the real control-plane safety net.
