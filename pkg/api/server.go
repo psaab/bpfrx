@@ -164,8 +164,10 @@ type Config struct {
 	// (#3104). The `match-policies` simulator consults it so a scheduler-inactive
 	// policy is skipped exactly like the runtime (policy.rs try_match_rule),
 	// instead of reporting a definitive verdict the dataplane disagrees with.
-	// Optional; if nil or it returns ok=false the simulator evaluates scheduled
-	// policies as-if-active (the pre-#3104 behavior / #3062 display fallback).
+	// Optional; if nil or it returns ok=false the simulator fails closed and
+	// treats scheduled policies as inactive (#3414) — matching the snapshot
+	// builder (nil scheduler state => dropped) rather than certifying an
+	// as-if-active verdict the dataplane is skipping.
 	PolicySchedulerActiveStateFn func() (map[string]bool, bool)
 	// HAActiveFn reports whether THIS node is the active cluster member for
 	// the default resource group, surfaced as the session ha_active field

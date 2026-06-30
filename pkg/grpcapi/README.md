@@ -82,8 +82,11 @@ contract.
   thread live per-scheduler active-state (`s.policyInactiveFn()` →
   `policymatch.Query.PolicyInactiveFn`, sourced from the same
   `Manager.PolicySchedulerActiveState` the #3062 policy-detail display uses) so
-  a scheduler-inactive policy is skipped like the runtime; with no live state
-  scheduled policies are simulated as-if-active.
+  a scheduler-inactive policy is skipped like the runtime. #3414: `policyInactiveFn()`
+  is now ALWAYS non-nil — with no live state (no provider / early boot) it binds
+  a nil state map, which fails closed so scheduled policies are simulated as
+  INACTIVE (matching the dataplane's nil-state => dropped) rather than certified
+  as-if-active.
 - #3375: the response `action` is rendered through the shared SSOT
   `policymatch.Result.DisplayAction()` for EVERY verdict, so the gRPC and REST
   surfaces can never diverge. Before #3375 gRPC returned a BLANK `action` for
