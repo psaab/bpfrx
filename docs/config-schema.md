@@ -940,7 +940,12 @@ reserved for whole-dataplane selection where a rewrite shim
     member NESTED in an address-set stays poisoned by the static resolver
     (the anti-Option-C guardrail). Lenient load / peer-sync downgrades to a
     warning so an already-persisted or peer-synced config still boots
-    (#1960); the dataplane fails closed independently.
+    (#1960); the dataplane fails closed independently. **#3418** — the
+    feed carve-out is now pinned through the full `CompileConfig` strict
+    commit path for ALL FOUR SNAT/DNAT source/destination address-name
+    combinations (the #3303 snapshot tests call the builder directly and
+    bypass the strict validator, which is how the over-reject survived for
+    the three combinations the #3425 SNAT-source test did not cover).
   - `protocols router-advertisement interface` — typed the
     second-denominated leaves (`max/min-advertisement-interval`,
     `default-lifetime`, `link-mtu`; the latter was tightened from
@@ -1179,6 +1184,35 @@ reserved for whole-dataplane selection where a rewrite shim
   `pkg/config/compiler_dup_flow_subblock_3566_test.go` (per-validator
   RED-on-revert subtests duplicating each descended level — `flow`,
   `traceoptions`, `file`, `log` — built with `NewParser`).
+- **#3473 (duplicate security-policy names — strict commit gate):**
+  `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
+  hard-rejects two security policies that share a name within the same
+  from/to-zone zone-pair, or within the global rulebase, matching Junos (a
+  policy name must be unique within a context). `compilePolicies` appends every
+  named instance without a uniqueness check, so duplicates compiled silently;
+  because the userspace hit counter is NAME-keyed
+  (`RuleID = "<from>-><to>/<name>"`, `pkg/dataplane/userspace`) the duplicates
+  coalesce onto one `Arc<PolicyRuleCounter>` — `show security policies
+  hit-count` cannot tell them apart, deleting one duplicate hands its
+  accumulated hits to the survivor, and the Go-side `buildPolicyRuleCounterIndex`
+  is last-write-wins on the RuleID. Strict on commit / commit-check;
+  downgraded to a `cfg.Warnings` entry on the tolerant load / peer-sync paths
+  (`lenientDuplicatePolicyNames`, #1960 no-brick — first-match enforcement is
+  still correct on that path, only the shared-counter observability bug
+  remains). This is a TYPED-config validator, NOT a raw-AST pre-walk, so it is
+  duplicate-block-safe by construction: `compileConfig` runs `compileSecurity`
+  for EVERY top-level `security` root and `compilePolicies` appends into the
+  shared `cfg.Security.Policies` / `cfg.Security.GlobalPolicies`, so a duplicate
+  split across two `security {}` blocks already lands in the aggregated typed
+  slices the validator reads (the typed-family analogue of the `forEachChild`
+  descent the #3562/#3566 raw-AST gates use). A duplicate NAME is only
+  expressible via the hierarchical / `NewParser` (and `LoadOverride`) path;
+  flat-set `ParseSetCommand` + `SetPath` MERGES same-name lines into one node,
+  so it is structurally immune. Regression coverage:
+  `pkg/config/compiler_dup_policy_name_3473_test.go` (zone-pair + global
+  RED-on-revert, the cross-`security`-block split for both, the flat-set merge,
+  name-reuse-across-contexts / distinct-names over-reject controls, and the
+  lenient downgrade).
 - **#3200 (host-inbound-traffic token validation):** `security zones <z>
   host-inbound-traffic { system-services <tok>; protocols <tok>; }` keeps its
   untyped-container schema shape (the leaves stay `children: nil` so flat-set

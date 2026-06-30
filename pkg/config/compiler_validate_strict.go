@@ -2745,6 +2745,95 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateDuplicatePolicyNamesStrict hard-rejects two security policies that
+// share a name within the same enforcement context: the same from-zone/to-zone
+// zone-pair, or the global rulebase (#3473). Junos/vSRX require a policy name to
+// be unique within a from/to-zone context (and within `global`); a duplicate is
+// a commit error there.
+//
+// xpf accepted duplicates silently. compilePolicies appends every named instance
+// without a uniqueness check, so two `policy allow` rules in one zone-pair both
+// survive into the compiled config — including when the offending pair is split
+// across two top-level `security {}` blocks: parseStatements APPENDS a repeated
+// block (it never merges), and compileConfig calls compileSecurity for EVERY
+// `security` root, so compilePolicies appends each instance into the shared
+// cfg.Security.Policies / cfg.Security.GlobalPolicies. This validator therefore
+// reads the already-aggregated typed slices and is duplicate-block-safe by
+// construction (the typed family's analogue of the forEachChild discipline that
+// the raw-AST pre-walk gates use, #3562/#3566).
+//
+// First-match enforcement order stays correct even with a duplicate, but the
+// userspace hit counter is NAME-keyed: RuleID = "<from>-><to>/<name>" (globals
+// key on "junos-global->junos-global/<name>", pkg/dataplane/userspace), so the
+// two rules COALESCE onto one Arc<PolicyRuleCounter>. `show security policies
+// hit-count` and the counter APIs cannot tell the duplicates apart (H04/H05),
+// removing one duplicate leaves the shared counter alive so the survivor inherits
+// the removed rule's accumulated hits (M05), and buildPolicyRuleCounterIndex is
+// last-write-wins on the RuleID so the Go side silently collapses the duplicate
+// rows the helper publishes (H07).
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientDuplicatePolicyNames) so an already-persisted or peer-synced config that
+// an older binary accepted still BOOTS (#1960 no-brick). A leniently-loaded
+// duplicate keeps the shared-counter observability bug, but the firewall still
+// enforces first-match correctly; the warning is the operator's only signal.
+//
+// Duplicate names across DIFFERENT zone-pairs stay legal (each pair is its own
+// namespace), as does a zone-pair name reused in the global rulebase. Iteration
+// is in compiled (config) order so the first-reported duplicate is deterministic.
+func validateDuplicatePolicyNamesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// Zone-pair policies: a name must be unique within a (from-zone, to-zone)
+	// context. Multiple ZonePairPolicies may carry the same from/to (a repeated
+	// stanza, or a pair split across two security blocks); accumulate names per
+	// pair across every matching entry so a cross-stanza / cross-block duplicate
+	// is still caught.
+	seenByPair := make(map[string]map[string]struct{})
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		key := zpp.FromZone + "\x00" + zpp.ToZone
+		seen := seenByPair[key]
+		if seen == nil {
+			seen = make(map[string]struct{})
+			seenByPair[key] = seen
+		}
+		for _, p := range zpp.Policies {
+			if p == nil {
+				continue
+			}
+			if _, dup := seen[p.Name]; dup {
+				return fmt.Errorf(
+					"security policies from-zone %q to-zone %q has duplicate policy name %q; policy names must be unique within a zone-pair context — the duplicate shares a name-keyed hit counter so `show security policies hit-count` cannot distinguish the two rules and deleting one transfers its accumulated hits to the survivor; rename one of the duplicate policies (#3473)",
+					zpp.FromZone, zpp.ToZone, p.Name)
+			}
+			seen[p.Name] = struct{}{}
+		}
+	}
+	// Global policies form a single ordered rulebase; names must be unique across
+	// the whole list regardless of any optional from/to-zone match context
+	// (#3148) — the context is an extra match predicate, not a separate
+	// namespace.
+	seenGlobal := make(map[string]struct{})
+	for _, p := range cfg.Security.GlobalPolicies {
+		if p == nil {
+			continue
+		}
+		if _, dup := seenGlobal[p.Name]; dup {
+			return fmt.Errorf(
+				"security policies global has duplicate policy name %q; global policy names must be unique — the duplicate shares a name-keyed hit counter, collapsing hit-count observability for the two rules; rename one of the duplicate policies (#3473)",
+				p.Name)
+		}
+		seenGlobal[p.Name] = struct{}{}
+	}
+	return nil
+}
+
 // validateScreenProfileReferencesStrict hard-rejects a security zone whose
 // `screen <name>` references a screen-ids-option profile the configuration
 // never defines under `set security screen ids-option <name>` (#3066).

@@ -1,3 +1,53 @@
+## 2026-06-29 — #3418 NAT strict feed-only address-name: pin the carve-out across the full SNAT/DNAT matrix
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3418 (over-reject audit) — the H01 over-reject was already
+    fixed in master by the #3425 PR (commit 505793bed): the `feedBinding`
+    short-circuit in validateNATSourceAddressNameReferencesStrict's `nameError`
+    (compiler_validate_strict.go ~L5809-5831) accepts a NAT
+    `match {source,destination}-address-name` that names a feed-only
+    `security dynamic-address address-name` binding (no static address-book
+    duplicate). Root cause of the original over-reject: the pre-#3425 `defined`
+    closure consulted ONLY the static address book, so a feed-only name was
+    hard-rejected as "undefined" — contradicting the #3303 snapshot resolver
+    that unions feedOverlay[name]. The remaining #3418 L01 gap: the
+    strict-CompileConfig ACCEPT was pinned for only ONE of four combinations
+    (SNAT source, TestNATSourceAddressNameDirectFeedAccepted) — reverting the
+    carve-out would silently re-reject SNAT-dest / DNAT-source / DNAT-dest with
+    no failing test. Closed that gap with three additive feed-only-accept
+    CompileConfig tests. RED-on-revert verified: removing the feedBinding
+    short-circuit fails all four feed-accept tests with the exact #3418
+    "references undefined {source,destination}-address-name" error; the #2416 /
+    #3229 undefined-reference tests STILL pass in the reverted state (accepting
+    feed names is orthogonal to rejecting typos — no fail-open). The #3303
+    pkg/dataplane/userspace tests already cover the "snapshot carries feed
+    prefixes" half for all four paths. Test-only PR (the code fix shipped via
+    #3425). go test ./pkg/config ./pkg/cmdtree green; gofmt + go vet clean.
+  - **File(s)**: pkg/config/compiler_nat_address_name_feed_3418_test.go,
+    docs/config-schema.md, _Log.md
+
+## 2026-06-29 — #3413 doc accuracy: pre-id-default-policy is Partial/inert, not Implemented
+
+- **Timestamp**: 2026-06-29
+- **Action**: Corrected `docs/next-features/pre-id-default-policy.md`. The doc
+  claimed `Status: Implemented` and "Session init/close logging is now applied
+  to unknown-app sessions", contradicting the live commit-time WARN and closed
+  #2509. Verified against code: the stanza is PARSED + STORED
+  (pkg/config/compiler_security.go:226-237 → SecurityConfig.PreIDDefaultPolicy,
+  pkg/config/types_security.go:209-213) and schema-completable
+  (pkg/config/schema_security.go:757), but has NO userspace-dp consumer. The
+  only writer was the retired eBPF compiler (pkg/dataplane/compiler.go:1109-1116
+  packs into FlowConfigValue.AppFlags), fed to SetFlowConfig which is a no-op
+  stub on the userspace path (pkg/dataplane/loader.go:400). The legacy wiring
+  bpf/xdp/xdp_policy.c was deleted in #1476 (13fa1009e). A commit-time WARN
+  flags the inertness (pkg/config/compiler_validate_warn.go:859-882). No
+  pre-id/app_id==0 admit consumer exists in userspace-dp (the session-init/close
+  consumers are all the per-policy #2508 path). Changed Status to "Partial —
+  accepted-but-inert (#2509)", removed the false "logging is now applied" claim
+  and the stale eBPF wiring reference, added a "Why It Is Inert" section.
+  Doc-only change; no test needed (no Go/Rust behavior touched).
+- **File(s)**: docs/next-features/pre-id-default-policy.md, _Log.md
+
 ## 2026-06-29 — #3362 rebase fold: dedup host-inbound deny-counter declarations
 
 - **Timestamp**: 2026-06-29
@@ -24012,6 +24062,9 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3566 — follow-up to #3562. The SMR of PR #3565 flagged the SUB-level sibling of the duplicate-block bypass: four flow-trace / log-stream strict-reject validators iterated all top-level `security` roots but then descended with a first-only `FindChild` at the sub-level, so a duplicate `flow {}`/`traceoptions {}`/`file`/`log {}` block within one security block could still hide the offending stanza. Converted all four to descend `security > flow > traceoptions > file` (and `security > log`) with the shared `forEachChild` primitive at EVERY container level, leaving each inner leaf check + lenient-warn (#1960) unchanged: validateFlowTraceFileAST (#3420), validateFlowTraceFlagsAndFiltersAST (#3422), validateFlowTraceSizeFilesAST (#3424), validateSecurityLogStreamTLSProfileAST (#3350). Added per-validator RED-on-revert subtests duplicating each descended level (flow/traceoptions/file/log) with a benign first sibling + offending second sibling; proved RED-on-revert by making forEachChild first-only (clean compile → every subtest fails). go test ./pkg/config ./pkg/cmdtree green; gofmt + go vet clean.
   - **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler_dup_flow_subblock_3566_test.go, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3473 — add a strict commit-time gate rejecting duplicate security-policy names within the same from/to-zone zone-pair (and within the global rulebase), matching Junos. compilePolicies appended every named instance without a uniqueness check; because the userspace hit counter is NAME-keyed (RuleID = "<from>-><to>/<name>", junos-global for globals) the duplicates coalesced onto one Arc<PolicyRuleCounter> — `show security policies hit-count` cannot distinguish them (H04/H05), removing one duplicate transfers its accumulated hits to the survivor (M05), and Go-side buildPolicyRuleCounterIndex is last-write-wins on the RuleID (H07). New validateDuplicatePolicyNamesStrict (typed-config, so duplicate-block-safe by construction: compileSecurity runs for EVERY top-level security root and compilePolicies appends into the shared cfg.Security slices, the typed-family analogue of the #3562/#3566 forEachChild descent). Strict on commit/commit-check; downgraded to a cfg.Warnings entry on the tolerant load/peer-sync paths (lenientDuplicatePolicyNames, #1960 no-brick — first-match enforcement stays correct, only the shared-counter observability remains). A duplicate NAME is only expressible via the hierarchical/NewParser/LoadOverride path; flat-set ParseSetCommand+SetPath MERGES same-name lines into one node (structurally immune). RED-on-revert proven (disabling the gate → all four reject tests + the lenient-warning test go RED): zone-pair + global, single block + cross-security-block split for both. Over-reject negative controls: name reused across different zone-pairs and the global rulebase, and distinct names in one pair, all compile clean. go test ./pkg/config ./pkg/cmdtree ./pkg/dataplane/userspace green; gofmt + go vet clean.
+  - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler_dup_policy_name_3473_test.go, docs/config-schema.md, _Log.md
 - **Timestamp**: 2026-06-29
   - **Action**: #3414 — fix match-policies simulator drift: a scheduler-bound policy was simulated as-if-active when per-scheduler active-state was unavailable (REST accessor not wired, or it returned ok=false during early boot / NoDataplane), while the dataplane snapshot builder treats nil scheduler state as INACTIVE (policyRuleInactive: nil map => Inactive => dropped) — opposite verdicts, a fail-open diagnostic that could certify a permit/deny the dataplane is actually skipping. Fix: the three live diagnostic surfaces (REST matchPoliciesHandler, gRPC/CLI policyInactiveFn) now ALWAYS bind a non-nil policymatch.Query.PolicyInactiveFn, passing whatever state is available (nil when unavailable). dpuserspace.PolicyInactiveFn(nil) already fails closed (scheduled policies inactive), so the simulator now mirrors the dataplane in BOTH directions; a NON-scheduled policy (empty scheduler name) is unaffected. Documented chosen semantics (fail-closed, matching runtime) and reversed the prior "pass nil for as-if-active" guidance in PolicyInactiveFn / Query.PolicyInactiveFn docstrings and the api/grpcapi/cli READMEs; the nil-fn as-if-active path is now reserved only for a purely offline, dataplane-less config simulator. RED-on-revert: pkg/api TestMatchPoliciesRESTScheduledPolicyFailsClosedWhenStateUnavailable (cases A accessor-nil + B ok=false flip to permit/matched on revert; positive controls C scheduler-active=permit and D scheduler-inactive=deny stay green) + pkg/policymatch TestSchedulerUnavailableStateFailsClosed (inactiveFnFor(nil) => default-deny fall-through; goes RED if PolicyInactiveFn(nil) is reverted to as-if-active). go test ./pkg/policymatch ./pkg/grpcapi ./pkg/api ./pkg/cli ./pkg/config ./pkg/dataplane/userspace ./pkg/daemon green; gofmt clean; go vet clean (pre-existing cli.go:503 unreachable-code warning unrelated).
   - **File(s)**: pkg/api/security.go, pkg/api/server.go, pkg/api/README.md, pkg/api/security_matchpolicies_scheduler_3414_test.go, pkg/cli/cli_show_security_dispatch.go, pkg/cli/README.md, pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/README.md, pkg/dataplane/userspace/policies.go, pkg/policymatch/policymatch.go, pkg/policymatch/scheduler_test.go, pkg/daemon/daemon_run.go, _Log.md

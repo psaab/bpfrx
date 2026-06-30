@@ -37,11 +37,15 @@ type xpfCollector struct {
 	syncookieTotal           *prometheus.Desc
 	flowCacheTotal           *prometheus.Desc
 
-	// #3345: monotonic count of global-counter map reads that failed during
-	// a scrape. A failed read SKIPS emitting that counter's sample (so a
-	// degraded counter bridge does NOT report a misleading 0); this metric
-	// is the scrape-error signal an operator alerts on. Persisted on the
-	// collector so it accumulates across scrapes like a real counter.
+	// #3345/#3408: monotonic count of counter reads that failed during a
+	// scrape, across the global, per-zone, per-policy, and per-filter dataplane
+	// collectors AND the kernel-nftables host-inbound collector (#3361). A
+	// failed read SKIPS emitting that counter's sample (so a degraded counter
+	// bridge does NOT report a misleading 0); this metric is the scrape-error
+	// signal an operator alerts on. Persisted on the collector so it accumulates
+	// across scrapes like a real counter. #3462: the SAMPLE is emitted last in
+	// Collect (emitCounterReadErrors), after all collectors that can bump it, so
+	// a failure this scrape is reflected this scrape.
 	counterReadErrorsTotal *prometheus.Desc
 	counterReadErrors      atomic.Uint64
 
@@ -835,6 +839,11 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
 	c.collectFilterCounters(ch, dp)
+	// #3462: emit the scrape-error counter AFTER global/zone/policy/filter
+	// (and the pre-gate host-inbound collector) have run, so a read failure in
+	// any of them is reflected in THIS scrape's xpf_counter_read_errors_total
+	// rather than lagging a scrape behind.
+	c.emitCounterReadErrors(ch)
 	c.collectSessionGauges(ch, dp)
 	c.collectNATPoolMetrics(ch, dp)
 	c.collectDHCPMetrics(ch)

@@ -951,6 +951,21 @@ type compileOpts struct {
 	// is harmless (it logs nothing, the pre-existing behavior). Same doctrine as
 	// lenientPolicyTerminalAction.
 	lenientPolicyLogAction bool
+	// lenientDuplicatePolicyNames (#3473) downgrades the duplicate-policy-name
+	// gate (validateDuplicatePolicyNamesStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects two
+	// security policies that share a name within the same from/to-zone zone-pair
+	// (or within the global rulebase), matching Junos. xpf accepted duplicates
+	// silently and, because the userspace hit counter is name-keyed
+	// (RuleID = "<from>-><to>/<name>"), the duplicates COALESCE onto one counter:
+	// `show security policies hit-count` cannot tell them apart, deleting one
+	// duplicate hands its accumulated hits to the survivor, and the Go-side
+	// buildPolicyRuleCounterIndex is last-write-wins on the RuleID. The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick);
+	// first-match enforcement is still correct on that path (only the shared-
+	// counter observability bug remains). Same doctrine as lenientPolicyLogAction.
+	lenientDuplicatePolicyNames bool
 	// lenientScreenProfileRefs (#3066) downgrades the zone screen-profile
 	// reference gate (validateScreenProfileReferencesStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -1312,6 +1327,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientSNMPTrapGroup:                 true,
 		lenientPolicyTerminalAction:          true,
 		lenientPolicyLogAction:               true,
+		lenientDuplicatePolicyNames:          true,
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
@@ -1461,6 +1477,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientSNMPTrapGroup:                 true,
 		lenientPolicyTerminalAction:          true,
 		lenientPolicyLogAction:               true,
+		lenientDuplicatePolicyNames:          true,
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
@@ -2179,6 +2196,30 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyLogAction {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy log action (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3473 duplicate-policy-name gate. Strict on commit / commit-check
+	// (hard-reject two security policies that share a name within the same
+	// from/to-zone zone-pair, or within the global rulebase — Junos requires
+	// unique policy names within a context). xpf accepted duplicates silently;
+	// the name-keyed userspace hit counter then coalesces the duplicates onto one
+	// counter, so hit-count observability breaks (the two rules cannot be told
+	// apart) and removing one duplicate transfers its accumulated hits to the
+	// survivor. Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960 no-brick; first-match enforcement is
+	// still correct, only the shared-counter observability bug remains). The
+	// validator reads the already-aggregated typed Policies/GlobalPolicies slices,
+	// so a duplicate split across two `security {}` blocks is still caught
+	// (compileSecurity runs for every `security` root). Runs after the policy
+	// log-action gate so an earlier policy-structural error still wins the
+	// first-error slot.
+	if err := validateDuplicatePolicyNamesStrict(cfg); err != nil {
+		if opts.lenientDuplicatePolicyNames {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("duplicate policy name (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
