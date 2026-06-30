@@ -233,7 +233,7 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			// member). The Rust matcher enforces these before translating AND
 			// before applying a `then source-nat off` exemption, so a
 			// port/app-scoped rule no longer silently widens to every port.
-			matchDestPorts := sourceNATDestPortRanges(rule.Match.DestinationPorts)
+			matchDestPorts := sourceNATDestPortRanges(rule.Match.DestinationPorts, rule.Match.InvalidDestinationPorts)
 			matchApps := buildSourceNATAppTerms(cfg, rule.Match.ApplicationList())
 
 			out = append(out, SourceNATRuleSnapshot{
@@ -352,17 +352,35 @@ func coalescePortRanges(ports []int) []NatPortRangeWire {
 
 // sourceNATDestPortRanges coalesces a configured source-NAT `match
 // destination-port` list to wire ranges, failing CLOSED when the constraint was
-// specified but nothing is representable (#3429). An empty input (no constraint
-// configured) stays empty — a legitimate match-any-port wildcard. A non-empty
-// input that coalesces to nothing (every port out of 1..65535) returns the
-// never-match sentinel so the rule matches NOTHING instead of widening to every
-// port (the AGY-found fail-open on PR #3471). NOTE: source NAT has no
-// `match source-port` grammar (the SNAT parser only reads source/destination
-// address(-name), destination-port, and application), so there is no
-// source-port coalesce path to guard symmetrically.
-func sourceNATDestPortRanges(ports []int) []NatPortRangeWire {
+// specified but nothing is representable (#3429, #3546). The two inputs mirror
+// the parser's two signals (parseDNATPortList): `ports` is every numeric token
+// (out-of-range values included, dropped by coalescePortRanges) and `invalid`
+// is the raw non-numeric tokens (`http`, garbage) the parser preserved on
+// NATMatch.InvalidDestinationPorts. A constraint is CONSIDERED CONFIGURED when
+// either list is non-empty. An all-empty input (no constraint configured) stays
+// empty — a legitimate match-any-port wildcard. A configured constraint that
+// coalesces to nothing — every numeric out of 1..65535, OR an all-nonnumeric
+// list whose only tokens are invalid (#3546) — returns the never-match sentinel
+// so the rule matches NOTHING instead of widening to every port. A mix of one
+// valid port and invalid tokens (`[ http 8080 ]`) keeps the valid port (8080),
+// matching the lenient DNAT builder. The strict commit gate
+// (validateNATMatchDestinationPortStrict) rejects both the out-of-range and the
+// nonnumeric case at commit; this guard hardens the #1960 tolerant-load /
+// peer-sync path, where the bad rule would otherwise reach the dataplane.
+//
+// Before #3546 this builder consulted only `ports` and ignored `invalid`, so an
+// all-nonnumeric source-NAT dest-port (e.g. `http`) parsed to an EMPTY `ports`
+// list, coalesced to nothing, and — with no configured-numeric to trip the
+// existing fail-closed branch — returned empty = unconstrained match-any-port
+// (the AGY/Codex fail-open residual split out of #3446). The DNAT builder
+// already failed closed on this case via InvalidDestinationPorts.
+//
+// NOTE: source NAT has no `match source-port` grammar (the SNAT parser only
+// reads source/destination address(-name), destination-port, and application),
+// so there is no source-port coalesce path to guard symmetrically.
+func sourceNATDestPortRanges(ports []int, invalid []string) []NatPortRangeWire {
 	ranges := coalescePortRanges(ports)
-	if len(ports) > 0 && len(ranges) == 0 {
+	if (len(ports) > 0 || len(invalid) > 0) && len(ranges) == 0 {
 		return []NatPortRangeWire{natNeverMatchPortRange}
 	}
 	return ranges

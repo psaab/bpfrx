@@ -583,17 +583,27 @@ unparseable raw tokens alongside the numeric ports; the compiler stores them on
 bracket-list delimiters are never reported). Out-of-range NUMBERS still flow
 through `DestinationPorts` and are range-checked directly.
 
-**Dataplane fail-closed (lenient backstop).** The source-NAT builder was already
-fail-closed (`coalescePortRanges` / `sourceNATDestPortRanges` skip out-of-range
-values and emit the `natNeverMatchPortRange` sentinel when a configured list
-coalesces to nothing — #3429). The destination-NAT builder
-(`buildDestinationNATSnapshotsWithFeeds`) now matches that doctrine: it filters
-each term's ports to 1..65535, and when a port WAS configured (numeric list
-non-empty, or `InvalidDestinationPorts` non-empty on the explicit-match
-fallback) but no valid port survives, it emits NO snapshot for the term so the
-rule matches NOTHING — it never widens to the wildcard port. A rule with no
-`destination-port` at all still emits the genuine wildcard (`destination_port:
-0`), unchanged.
+**Dataplane fail-closed (lenient backstop).** The source-NAT builder
+(`coalescePortRanges` / `sourceNATDestPortRanges`) skips out-of-range values and
+emits the `natNeverMatchPortRange` sentinel when a configured list coalesces to
+nothing (#3429). **#3546** closed a residual hole here: `sourceNATDestPortRanges`
+originally consulted only `DestinationPorts` (the numeric list) and ignored
+`InvalidDestinationPorts`, so an ALL-nonnumeric source-NAT `match
+destination-port` (e.g. `http`) parsed to an empty numeric list, coalesced to
+nothing, and — with no configured numeric to trip the fail-closed branch —
+returned an empty range list = unconstrained match-any-port on the #1960
+tolerant-load / peer-sync path. The builder now passes
+`rule.Match.InvalidDestinationPorts` into `sourceNATDestPortRanges`, which treats
+the constraint as configured when EITHER list is non-empty and emits the
+never-match sentinel when nothing valid survives. A mix of one valid port and an
+invalid token (`[ http 8080 ]`) keeps the valid port, matching the DNAT builder.
+The destination-NAT builder (`buildDestinationNATSnapshotsWithFeeds`) already
+followed that doctrine: it filters each term's ports to 1..65535, and when a port
+WAS configured (numeric list non-empty, or `InvalidDestinationPorts` non-empty on
+the explicit-match fallback) but no valid port survives, it emits NO snapshot for
+the term so the rule matches NOTHING — it never widens to the wildcard port. A
+rule with no `destination-port` at all still emits the genuine wildcard
+(`destination_port: 0`), unchanged.
 
 **Wire.** No new wire field. `InvalidDestinationPorts` is compiler-internal
 (never serialized to the helper); the builder uses the existing

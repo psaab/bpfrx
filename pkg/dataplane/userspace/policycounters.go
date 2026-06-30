@@ -74,6 +74,20 @@ func policyRuleIDForCounter(cfg *config.Config, policyID uint32) string {
 	var currentSet uint32
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil {
+			// #3474: a nil zone-pair slot still consumes a policy-set ID. The
+			// SSOT walker (walkPolicyRuleSlots) and EVERY production counter
+			// caller (pkg/api/security.go, pkg/api/metrics_counters.go) do
+			// `policySetID++` for a nil element of cfg.Security.Policies, so this
+			// resolver advances currentSet in lockstep — it was the lone consumer
+			// that skipped a nil slot WITHOUT incrementing, diverging from the
+			// walker + all callers. This is DEFENSIVE SSOT-alignment, not a
+			// reachable-bug fix: a nil cfg.Security.Policies slot is not produced
+			// by any production config path today (strict and tolerant compile
+			// share a non-nil-only builder; HA ships recompiled config text;
+			// persistence round-trips the tree). Aligning it here matches the
+			// #3476/#3494 defensive nil-guards so the resolver/walker/callers can
+			// never drift if a nil slot ever does arise.
+			currentSet++
 			continue
 		}
 		if currentSet == policySetID {

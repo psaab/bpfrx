@@ -13,6 +13,72 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// snatLenientSnapshots reproduces the issue #3546 path end to end: build a
+// source-NAT rule from FLAT-SET commands (ParseSetCommand + SetPath per
+// CLAUDE.md), lower it through the #1960 TOLERANT load (CompileConfigLenient —
+// the peer-sync / corrupt-active path that downgrades the strict commit reject
+// to a warning), then run the userspace source-NAT snapshot builder. A normal
+// `commit` (CompileConfig) hard-rejects the bad dest-port, so the bug is only
+// reachable here.
+func snatLenientSnapshots(t *testing.T, dportCmd string) []SourceNATRuleSnapshot {
+	t.Helper()
+	tree := &config.ConfigTree{}
+	cmds := []string{
+		"set security nat source rule-set RS from zone lan",
+		"set security nat source rule-set RS to zone wan",
+		dportCmd,
+		"set security nat source rule-set RS rule R1 then source-nat interface",
+	}
+	for _, cmd := range cmds {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	return buildSourceNATSnapshots(cfg, nil)
+}
+
+// #3546 end-to-end: an all-nonnumeric source-NAT `match destination-port` that
+// slips through the tolerant load path must fail CLOSED at the builder (the
+// never-match sentinel), not widen to match-any-port. RED-on-revert: ignore
+// InvalidDestinationPorts in sourceNATDestPortRanges and the empty
+// DestinationPorts list yields empty MatchDestinationPorts = unconstrained.
+func TestBuildSourceNATSnapshotsLenientNonnumericPortFailsClosed(t *testing.T) {
+	snaps := snatLenientSnapshots(t,
+		"set security nat source rule-set RS rule R1 match destination-port http")
+	if len(snaps) != 1 {
+		t.Fatalf("len(snaps) = %d, want 1", len(snaps))
+	}
+	got := snaps[0].MatchDestinationPorts
+	if len(got) != 1 || got[0] != natNeverMatchPortRange {
+		t.Fatalf("MatchDestinationPorts = %+v, want one never-match range %+v (fail closed via lenient path)",
+			got, natNeverMatchPortRange)
+	}
+}
+
+// #3546 over-reject control on the same lenient end-to-end path: a valid numeric
+// dest-port must still compile to its exact wire range (no widening, no
+// over-reject).
+func TestBuildSourceNATSnapshotsLenientValidPortStillCompiles(t *testing.T) {
+	snaps := snatLenientSnapshots(t,
+		"set security nat source rule-set RS rule R1 match destination-port 8080")
+	if len(snaps) != 1 {
+		t.Fatalf("len(snaps) = %d, want 1", len(snaps))
+	}
+	got := snaps[0].MatchDestinationPorts
+	want := []NatPortRangeWire{{Low: 8080, High: 8080}}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("MatchDestinationPorts = %+v, want %+v", got, want)
+	}
+}
+
 func TestBuildSourceNATSnapshotsCarriesDestinationPortMatch(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.NAT.Source = []*config.NATRuleSet{
@@ -94,6 +160,75 @@ func TestBuildSourceNATSnapshotsAllOutOfRangePortFailsClosed(t *testing.T) {
 	if len(got) != 1 || got[0] != natNeverMatchPortRange {
 		t.Fatalf("MatchDestinationPorts = %+v, want one never-match range %+v (fail closed, not empty wildcard)",
 			got, natNeverMatchPortRange)
+	}
+}
+
+// #3546 fail-open residual: an all-nonnumeric source-NAT `match
+// destination-port` (e.g. `http`) parses to an EMPTY DestinationPorts list with
+// the raw token preserved on InvalidDestinationPorts. The builder must read
+// InvalidDestinationPorts and fail CLOSED (the never-match sentinel) so the rule
+// matches NOTHING on the #1960 lenient / peer-sync load path, rather than
+// coalescing to empty = unconstrained match-any-port. RED-on-revert: a builder
+// that consults only DestinationPorts sees an empty list, never trips the
+// fail-closed branch, and emits empty MatchDestinationPorts (widen to any port).
+func TestBuildSourceNATSnapshotsAllNonnumericPortFailsClosed(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name:     "rs",
+			FromZone: "lan",
+			ToZone:   "wan",
+			Rules: []*config.NATRule{{
+				Name: "r1",
+				Match: config.NATMatch{
+					// `match destination-port http`: not numeric, not a service
+					// name (the NAT match grammar has no name resolution), so the
+					// parser surfaces it as an invalid token with no valid ports.
+					DestinationPorts:        nil,
+					InvalidDestinationPorts: []string{"http"},
+				},
+				Then: config.NATThen{Type: config.NATSource, Interface: true},
+			}},
+		},
+	}
+	snaps := buildSourceNATSnapshots(cfg, nil)
+	if len(snaps) != 1 {
+		t.Fatalf("len(snaps) = %d, want 1", len(snaps))
+	}
+	got := snaps[0].MatchDestinationPorts
+	if len(got) != 1 || got[0] != natNeverMatchPortRange {
+		t.Fatalf("MatchDestinationPorts = %+v, want one never-match range %+v (fail closed, not empty wildcard)",
+			got, natNeverMatchPortRange)
+	}
+}
+
+// #3546 over-reject control: a mix of one valid numeric port and an invalid
+// token (`[ http 8080 ]`) must keep the valid port (8080) on the lenient path,
+// mirroring the DNAT builder — the invalid token alone must not poison a rule
+// that still carries a usable constraint. Also guards against over-rejecting a
+// plain valid numeric source-NAT dest-port.
+func TestBuildSourceNATSnapshotsValidPortWithInvalidTokenKeepsValid(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name:     "rs",
+			FromZone: "lan",
+			ToZone:   "wan",
+			Rules: []*config.NATRule{{
+				Name: "r1",
+				Match: config.NATMatch{
+					DestinationPorts:        []int{8080},
+					InvalidDestinationPorts: []string{"http"},
+				},
+				Then: config.NATThen{Type: config.NATSource, Interface: true},
+			}},
+		},
+	}
+	snaps := buildSourceNATSnapshots(cfg, nil)
+	got := snaps[0].MatchDestinationPorts
+	want := []NatPortRangeWire{{Low: 8080, High: 8080}}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("MatchDestinationPorts = %+v, want %+v (valid port kept, invalid token dropped)", got, want)
 	}
 }
 
