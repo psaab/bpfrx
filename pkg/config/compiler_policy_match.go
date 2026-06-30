@@ -125,21 +125,6 @@ var unsupportedPolicyMatchLeaves = map[string]bool{
 // carries a leaf the compiler does not enforce (see file header). Covers
 // both zone-pair and global policies.
 func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, error) {
-	var security *Node
-	for _, n := range nodes {
-		if n.Name() == "security" {
-			security = n
-			break
-		}
-	}
-	if security == nil {
-		return nil, nil
-	}
-	policies := security.FindChild("policies")
-	if policies == nil {
-		return nil, nil
-	}
-
 	var warnings []string
 	emit := func(scope, policyName, leaf string) error {
 		msg := fmt.Sprintf(
@@ -198,45 +183,63 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 		return nil
 	}
 
-	for _, child := range policies.Children {
-		switch child.Name() {
-		case "global":
-			for _, polInst := range namedInstances(child.FindChildren("policy")) {
-				if err := checkPolicy("global", polInst.name, polInst.node, true); err != nil {
-					return nil, err
+	// #3562: iterate EVERY top-level `security` node and EVERY `policies`
+	// sibling, not the first match at any level. parseStatements APPENDS a
+	// repeated top-level block instead of merging it (parser.go) and
+	// compileExpanded compiles every `security` root, so an offending policy in
+	// a SECOND duplicate `security {}` (or duplicate `policies {}`) block would
+	// bypass a first-`security`/first-`policies` walk while the compiler still
+	// compiled it and silently dropped the unsupported match leaf. Descending
+	// with forEachChild at security/policies closes that multi-level
+	// duplicate-block bypass. The inner per-policy match-leaf check (checkPolicy)
+	// is unchanged.
+	walkErr := forEachChild(nodes, "security", func(security *Node) error {
+		return forEachChild(security.Children, "policies", func(policies *Node) error {
+			for _, child := range policies.Children {
+				switch child.Name() {
+				case "global":
+					for _, polInst := range namedInstances(child.FindChildren("policy")) {
+						if err := checkPolicy("global", polInst.name, polInst.node, true); err != nil {
+							return err
+						}
+					}
+				case "from-zone":
+					// Mirror compilePolicies' two AST shapes.
+					type zonePair struct {
+						from, to   string
+						policyNode *Node
+					}
+					var pairs []zonePair
+					if len(child.Keys) >= 4 {
+						// Hierarchical: Keys=["from-zone","trust","to-zone","untrust"]
+						pairs = append(pairs, zonePair{child.Keys[1], child.Keys[3], child})
+					} else {
+						// Flat set: from-zone → <name> → to-zone → <name> → policy ...
+						for _, fzSub := range child.Children {
+							tzNode := fzSub.FindChild("to-zone")
+							if tzNode == nil {
+								continue
+							}
+							for _, tzSub := range tzNode.Children {
+								pairs = append(pairs, zonePair{fzSub.Name(), tzSub.Name(), tzSub})
+							}
+						}
+					}
+					for _, zp := range pairs {
+						scope := fmt.Sprintf("from-zone %s to-zone %s", zp.from, zp.to)
+						for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
+							if err := checkPolicy(scope, polInst.name, polInst.node, false); err != nil {
+								return err
+							}
+						}
+					}
 				}
 			}
-		case "from-zone":
-			// Mirror compilePolicies' two AST shapes.
-			type zonePair struct {
-				from, to   string
-				policyNode *Node
-			}
-			var pairs []zonePair
-			if len(child.Keys) >= 4 {
-				// Hierarchical: Keys=["from-zone","trust","to-zone","untrust"]
-				pairs = append(pairs, zonePair{child.Keys[1], child.Keys[3], child})
-			} else {
-				// Flat set: from-zone → <name> → to-zone → <name> → policy ...
-				for _, fzSub := range child.Children {
-					tzNode := fzSub.FindChild("to-zone")
-					if tzNode == nil {
-						continue
-					}
-					for _, tzSub := range tzNode.Children {
-						pairs = append(pairs, zonePair{fzSub.Name(), tzSub.Name(), tzSub})
-					}
-				}
-			}
-			for _, zp := range pairs {
-				scope := fmt.Sprintf("from-zone %s to-zone %s", zp.from, zp.to)
-				for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
-					if err := checkPolicy(scope, polInst.name, polInst.node, false); err != nil {
-						return nil, err
-					}
-				}
-			}
-		}
+			return nil
+		})
+	})
+	if walkErr != nil {
+		return nil, walkErr
 	}
 	return warnings, nil
 }

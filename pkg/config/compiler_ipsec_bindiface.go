@@ -56,21 +56,6 @@ import (
 // handling; the runtime #2929 routing guard still refuses the colliding
 // devices.
 func validateSecureTunnelBindInterfaceAST(nodes []*Node, lenient bool) ([]string, error) {
-	var security *Node
-	for _, n := range nodes {
-		if n.Name() == "security" {
-			security = n
-			break
-		}
-	}
-	if security == nil {
-		return nil, nil
-	}
-	ipsec := security.FindChild("ipsec")
-	if ipsec == nil {
-		return nil, nil
-	}
-
 	// bindRef tracks the VPN(s) that configured one distinct bind-interface
 	// string (a single string may legitimately be shared by several VPNs).
 	type bindRef struct {
@@ -80,33 +65,54 @@ func validateSecureTunnelBindInterfaceAST(nodes []*Node, lenient bool) ([]string
 	byID := map[uint32]map[string]*bindRef{}
 	order := []uint32{} // first-seen if_id order for deterministic errors
 
-	for _, inst := range namedInstances(ipsec.FindChildren("vpn")) {
-		biNode := inst.node.FindChild("bind-interface")
-		if biNode == nil {
-			continue
-		}
-		bindIface := nodeVal(biNode)
-		if bindIface == "" {
-			continue
-		}
-		_, ifID := XFRMIfNameAndID(bindIface)
-		if ifID == 0 {
-			// Not a recognizable st<N>[.unit] secure-tunnel binding; out of
-			// scope for the if_id-collision gate.
-			continue
-		}
-		group, ok := byID[ifID]
-		if !ok {
-			group = map[string]*bindRef{}
-			byID[ifID] = group
-			order = append(order, ifID)
-		}
-		ref, ok := group[bindIface]
-		if !ok {
-			ref = &bindRef{}
-			group[bindIface] = ref
-		}
-		ref.vpns = append(ref.vpns, inst.name)
+	// #3562: iterate EVERY top-level `security` node and EVERY `ipsec` sibling,
+	// not the first match at any level. parseStatements APPENDS a repeated
+	// top-level block instead of merging it (parser.go) and compileExpanded /
+	// compileSecurity compile every `security` root and every `ipsec` sibling,
+	// so two VPNs that derive a colliding XFRM if_id from distinct
+	// bind-interface aliases could be split across duplicate `security {}` (or
+	// duplicate `ipsec {}`) blocks and bypass a first-`security`/first-`ipsec`
+	// walk while the compiler still compiled both. Aggregating the if_id map
+	// across every block via forEachChild catches the collision wherever the
+	// two distinct bind-interface strings live (the multi-level duplicate-block
+	// class). The inner per-VPN if_id derivation + distinct-string collision
+	// check below is unchanged.
+	collect := forEachChild(nodes, "security", func(security *Node) error {
+		return forEachChild(security.Children, "ipsec", func(ipsec *Node) error {
+			for _, inst := range namedInstances(ipsec.FindChildren("vpn")) {
+				biNode := inst.node.FindChild("bind-interface")
+				if biNode == nil {
+					continue
+				}
+				bindIface := nodeVal(biNode)
+				if bindIface == "" {
+					continue
+				}
+				_, ifID := XFRMIfNameAndID(bindIface)
+				if ifID == 0 {
+					// Not a recognizable st<N>[.unit] secure-tunnel binding;
+					// out of scope for the if_id-collision gate.
+					continue
+				}
+				group, ok := byID[ifID]
+				if !ok {
+					group = map[string]*bindRef{}
+					byID[ifID] = group
+					order = append(order, ifID)
+				}
+				ref, ok := group[bindIface]
+				if !ok {
+					ref = &bindRef{}
+					group[bindIface] = ref
+				}
+				ref.vpns = append(ref.vpns, inst.name)
+			}
+			return nil
+		})
+	})
+	if collect != nil {
+		// The collection closures never return an error; this is defensive.
+		return nil, collect
 	}
 
 	var warnings []string
