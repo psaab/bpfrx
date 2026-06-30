@@ -120,11 +120,25 @@ connectionless and exempt:
   constructor returns an error, logging `syslog stream receiver
   unreachable at apply; installed in reconnecting state`. Because a
   reconnecting client now outlives a transient outage, the daemon's
-  zero-streams path tears the clients down (`SetSyslogClients(nil)`) when
-  a day-2 commit removes ALL streams — otherwise a down-at-apply client
-  would resume forwarding audit logs to a deleted receiver once it
-  recovered. `EventReader.SyslogClientCount()` exposes the installed
-  count for that teardown assertion.
+  zero-streams path tears the clients down when a day-2 commit removes
+  ALL streams — otherwise a down-at-apply client would resume forwarding
+  audit logs to a deleted receiver once it recovered.
+  `EventReader.SyslogClientCount()` exposes the installed count for that
+  teardown assertion.
+- **Daemon syslog-apply CLOSES superseded clients (#3579).**
+  `applySyslogConfig` (pkg/daemon) rebuilds every `SyslogClient` from
+  config on each apply, so the prior set is always fully superseded
+  by-object. It therefore swaps via the closing `ReplaceSyslogClients`
+  (which installs the new set then `Close()`s the old set after releasing
+  `syslogMu`), NOT the non-closing `SetSyslogClients` — matching the CLI
+  apply path (`pkg/cli/apply.go`). Previously `applySyslogConfig` used
+  `SetSyslogClients`, which dropped the old clients from the set without
+  closing them, leaking one TCP/TLS socket (fd) per re-apply that changed
+  or removed a CONNECTED stream. All three apply branches (event-mode,
+  zero-streams teardown, and stream install) close. `SyslogClient.Close`
+  takes only the client's own mutex and emits no slog, so closing from
+  the apply path cannot re-enter the slog->syslog handler under a held
+  lock (#2285).
 - **Drop warning emitted AFTER the lock is released (#2287).**
   `SyslogClient.Send`/`SendBinary` hold `s.mu` for the whole write +
   reconnect sequence. The rate-limited drop warning (`slog.Warn`) must
