@@ -36,17 +36,18 @@ func (p fixedEventStreamProvider) EventStream() *dpuserspace.EventStream { retur
 //	[14:18] EgressIfindex (int32 LE)  — #2467: widened from int16
 //	[18:22] TXIfindex (int32 LE)      — #2467: widened from int16
 //	[22:24] TunnelEndpointID  [24:26] TXVLANID
-//	[26] Flags [27] IngressZone [28] EgressZone [29] Disposition
-//	[30..]  src/dst/nat_src/nat_dst IPs (4 bytes each, v4)
+//	[26] Flags [27:29] IngressZone u16 [29:31] EgressZone u16 [31] Disposition
+//	[32..]  src/dst/nat_src/nat_dst IPs (4 bytes each, v4)
 //	[N..]   NeighborMAC(6) SrcMAC(6) NextHop(4)
 //
-// Total v4 size: 30 + 4*4 + 6 + 6 + 4 = 62 bytes. The three identity
-// fields are seeded with 40000 (> int16 max 32767) so the full daemon
-// wire+ack path round-trips a high ifindex per the #2467 intent — a
-// revert to the old 24-byte/int16 layout makes this payload undersized
-// (decodeSessionEvent rejects it, no ACK is sent, the test times out).
+// Total v4 size: 32 + 4*4 + 6 + 6 + 4 = 64 bytes (#3075: zone fields widened
+// u8->u16, +2). The three identity fields are seeded with 40000 (> int16 max
+// 32767) so the full daemon wire+ack path round-trips a high ifindex per the
+// #2467 intent — a revert to the old 24-byte/int16 layout makes this payload
+// undersized (decodeSessionEvent rejects it, no ACK is sent, the test times
+// out).
 func buildSessionOpenFrameV4PayloadForWiringTest() []byte {
-	buf := make([]byte, 62)
+	buf := make([]byte, 64)
 	buf[0] = 4
 	buf[1] = 6
 	binary.LittleEndian.PutUint16(buf[2:4], 12345)
@@ -54,8 +55,10 @@ func buildSessionOpenFrameV4PayloadForWiringTest() []byte {
 	binary.LittleEndian.PutUint32(buf[10:14], 40000) // OwnerRGID (>int16)
 	binary.LittleEndian.PutUint32(buf[14:18], 40001) // EgressIfindex
 	binary.LittleEndian.PutUint32(buf[18:22], 40002) // TXIfindex
-	copy(buf[30:34], []byte{10, 0, 1, 2})            // SrcIP
-	copy(buf[34:38], []byte{172, 16, 0, 1})          // DstIP
+	binary.LittleEndian.PutUint16(buf[27:29], 1)     // IngressZone u16 (#3075)
+	binary.LittleEndian.PutUint16(buf[29:31], 2)     // EgressZone u16 (#3075)
+	copy(buf[32:36], []byte{10, 0, 1, 2})            // SrcIP
+	copy(buf[36:40], []byte{172, 16, 0, 1})          // DstIP
 	return buf
 }
 

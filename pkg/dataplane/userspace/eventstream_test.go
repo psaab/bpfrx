@@ -210,7 +210,7 @@ func TestDecodeSessionEventV4(t *testing.T) {
 	if d.AddrFamily != dataplane.AFInet {
 		t.Fatalf("AddrFamily = %d, want %d (AFInet)", d.AddrFamily, dataplane.AFInet)
 	}
-	// #919/#922: zone IDs decoded from payload[21]/[22].
+	// #3075: zone IDs decoded as u16 LE from payload[27:29]/[29:31].
 	if d.IngressZoneID != 1 {
 		t.Fatalf("IngressZoneID = %d, want 1", d.IngressZoneID)
 	}
@@ -267,6 +267,51 @@ func TestDecodeSessionEventV4(t *testing.T) {
 	}
 	if d.NextHop != "172.16.80.1" {
 		t.Fatalf("NextHop = %q, want 172.16.80.1", d.NextHop)
+	}
+}
+
+// TestDecodeSessionEventZoneIDAbove255 is the #3075 cross-language fail-on-revert
+// guard for the widened u16 zone wire field. The Rust codec encodes a stable
+// name-hash zone id > 255; the Go decoder must read the full u16 (not truncate
+// to the low byte). Reverting decodeSessionEvent to the u8 [27]/[28] read makes
+// 300/1000 decode as 44/232 and this fails RED.
+func TestDecodeSessionEventZoneIDAbove255(t *testing.T) {
+	payload := buildSessionOpenV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{0, 0, 0, 0}, [4]byte{0, 0, 0, 0},
+		0, 0,
+		1, 12, 11, 0, 0, 0,
+		300, 1000, 0, // ingress/egress zone u16 (#3075), disposition
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+	d, ok := decodeSessionEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false for a zone id > 255")
+	}
+	if d.IngressZoneID != 300 {
+		t.Fatalf("IngressZoneID = %d, want 300 (u16 truncated to u8?)", d.IngressZoneID)
+	}
+	if d.EgressZoneID != 1000 {
+		t.Fatalf("EgressZoneID = %d, want 1000 (u16 truncated to u8?)", d.EgressZoneID)
+	}
+}
+
+// TestDecodeSessionCloseEventZoneIDAbove255 is the close-frame sibling of the
+// above: the +4 u16 zone trailer must round-trip an id > 255.
+func TestDecodeSessionCloseEventZoneIDAbove255(t *testing.T) {
+	payload := buildSessionCloseV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		7, 0,
+		300, 1000, // ingress/egress zone u16 (#3075)
+	)
+	d, ok := decodeSessionCloseEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionCloseEvent returned false for a zone id > 255")
+	}
+	if d.IngressZoneID != 300 || d.EgressZoneID != 1000 {
+		t.Fatalf("close zones = (%d,%d), want (300,1000)", d.IngressZoneID, d.EgressZoneID)
 	}
 }
 

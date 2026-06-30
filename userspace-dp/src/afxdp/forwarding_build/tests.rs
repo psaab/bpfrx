@@ -1670,6 +1670,31 @@ fn build_forwarding_state_enables_tx_selection_when_cos_interfaces_exist() {
     assert!(state.tx_selection_enabled_v6);
 }
 
+/// #3075 fail-on-revert: a stable name-hash zone id > 255 (the common case) MUST
+/// be admitted to the forwarding zone table now that the event-stream wire is
+/// u16 — the former >u8::MAX skip is retired. Restoring that skip drops the zone
+/// from zone_name_to_id / zone_id_to_name and this fails RED. The reserved-range
+/// reject (next test) is unaffected.
+#[test]
+fn build_forwarding_state_admits_zone_id_above_255() {
+    use crate::ZoneSnapshot;
+    let snapshot = ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            // The stable name-hash of "trust" (config.StableZoneID) is 50675.
+            name: "trust".into(),
+            id: 50675,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(state.zone_name_to_id.get("trust").copied(), Some(50675));
+    assert_eq!(
+        state.zone_id_to_name.get(&50675).map(String::as_str),
+        Some("trust")
+    );
+}
+
 /// #919/#922: any zone with id ≥ ZONE_ID_RESERVED_MIN must be
 /// dropped at config-build time so a hostile/buggy snapshot cannot
 /// collide with the JUNOS_GLOBAL_ZONE_ID sentinel (u16::MAX).

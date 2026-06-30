@@ -379,6 +379,55 @@ fn zone_encoded_fabric_redirect_preserves_ingress_zone() {
     );
 }
 
+// #3075 fail-on-revert: the synthetic fabric zone-encoded src MAC must carry a
+// stable name-hash zone id > 255 across BOTH trailing MAC bytes (big-endian).
+// The old u8 scheme hardcoded MAC[4]=0x00 and rejected ids > 255 (returning
+// None / dropping the redirect), so the common-case hashed id failed fabric
+// cross-chassis forwarding. Reverting either the encode (forwarding/mod.rs) or
+// the decode (frame/inspect.rs) makes this RED.
+#[test]
+fn zone_encoded_fabric_redirect_round_trips_zone_id_above_255() {
+    let mut state = build_forwarding_state(&nat_snapshot_with_fabric());
+    let zone_id: u16 = 300; // 0x012c — above the old u8 cap
+    state.zone_id_to_name.insert(zone_id, "highzone".into());
+
+    // Encode: the src MAC carries 300 as 02:bf:72:fe:01:2c.
+    let redirected = resolve_zone_encoded_fabric_redirect_by_id(&state, zone_id)
+        .expect("fabric redirect must resolve for a zone id > 255");
+    assert_eq!(
+        redirected.src_mac,
+        Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x01, 0x2c])
+    );
+
+    // Decode: the same MAC parses back to 300.
+    let mut frame = vec![0u8; 64];
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x01, 0x2c]);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21,
+        ..UserspaceDpMeta::default()
+    };
+    assert_eq!(
+        parse_zone_encoded_fabric_ingress(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &state,
+        ),
+        Some(zone_id)
+    );
+}
+
 #[test]
 fn parse_zone_encoded_fabric_ingress_uses_zone_override() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());

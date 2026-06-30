@@ -652,6 +652,34 @@ fn test_encode_session_open_v4() {
     assert_eq!(p[31], DISP_FORWARD_CANDIDATE); // Disposition
 }
 
+// #3075 fail-on-revert: a stable name-hash zone id > 255 must round-trip on the
+// event-stream SessionOpen wire. Reverting codec.rs to the u8 [27]/[28] encode
+// truncates 300 -> 44 / 1000 -> 232, and these assertions fail RED.
+#[test]
+fn test_encode_session_open_zone_id_above_255() {
+    let zones = test_zone_map();
+    let mut md = test_metadata();
+    md.ingress_zone = 300;
+    md.egress_zone = 1000;
+    let frame =
+        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+    assert_eq!(u16::from_le_bytes([p[27], p[28]]), 300); // IngressZoneID u16
+    assert_eq!(u16::from_le_bytes([p[29], p[30]]), 1000); // EgressZoneID u16
+    assert_eq!(p[31], DISP_FORWARD_CANDIDATE); // Disposition unshifted
+}
+
+// #3075 fail-on-revert: a zone id > 255 must round-trip on the SessionClose
+// (type 2 HA delta) wire too.
+#[test]
+fn test_encode_session_close_zone_id_above_255() {
+    let frame = EventFrame::encode_session_close(7, &test_key_v4(), 1, 0, 300, 1000);
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+    // [14:18] OwnerRGID i32, [18] Flags, [19:21]/[21:23] u16 zones (#3075).
+    assert_eq!(u16::from_le_bytes([p[19], p[20]]), 300);
+    assert_eq!(u16::from_le_bytes([p[21], p[22]]), 1000);
+}
+
 // #2785: the per-policy `then log` selection must ride the open-frame flags
 // byte (bits 1<<3/1<<4) so a synced session logs identically after failover.
 // Reverting the codec.rs encode drops the bits and this fails RED.
