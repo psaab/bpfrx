@@ -8,6 +8,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
@@ -33,8 +34,9 @@ var readHostInboundDenyCounters = xnft.ReadHostInboundDenyCounters
 // On a read failure the series is SKIPPED (no misleading 0) and
 // xpf_counter_read_errors_total is bumped, matching the #3345 contract: a missing
 // sample is distinguishable from a real zero. (The error-counter SAMPLE is
-// emitted by collectGlobalCounters; the bump here accumulates on the collector
-// so it surfaces on the next scrape that reaches the global counters.)
+// emitted last in Collect by emitCounterReadErrors (#3462); the bump here
+// accumulates on the collector and is reflected in the same scrape's emitted
+// value when the dataplane is loaded.)
 func (c *xpfCollector) collectHostInboundKernelDenies(ch chan<- prometheus.Metric) {
 	counts, err := readHostInboundDenyCounters()
 	if err != nil {
@@ -91,9 +93,18 @@ func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp api
 	emit(c.flowCacheTotal, dataplane.GlobalCtrFlowCacheMiss, "miss")
 	emit(c.flowCacheTotal, dataplane.GlobalCtrFlowCacheFlush, "flush")
 	emit(c.flowCacheTotal, dataplane.GlobalCtrFlowCacheInvalidate, "invalidate")
+}
 
-	// #3345: always emit the scrape-error counter (0 when healthy) so the
-	// signal is present for alerting whether or not any read failed.
+// emitCounterReadErrors emits the xpf_counter_read_errors_total scrape-error
+// sample. #3345: always emitted (0 when healthy) so the signal is present for
+// alerting whether or not any read failed. #3462: this MUST run AFTER every
+// sub-collector that can bump counterReadErrors (collectHostInboundKernelDenies,
+// collectGlobalCounters, collectZoneCounters, collectPolicyCounters,
+// collectFilterCounters) — Collect calls it last — so a zone/policy/filter read
+// that fails in THIS scrape is reflected in THIS scrape's value, not lagged by
+// one scrape (which it was when the sample was emitted from collectGlobalCounters
+// before those collectors ran).
+func (c *xpfCollector) emitCounterReadErrors(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.counterReadErrorsTotal, prometheus.CounterValue,
 		float64(c.counterReadErrors.Load()))
 }
@@ -263,10 +274,29 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 	if cfg == nil {
 		return
 	}
-	cr := dataplane.LastApplyResultOf(dp)
-	if cr == nil || cr.FilterIDs == nil {
-		return
+
+	// #3461: merge the userspace helper-published per-term hit counters
+	// (filter_term_counters) into xpf_filter_hits_total, exactly as the CLI
+	// (`show firewall filter`) and gRPC text paths do via
+	// BuildFirewallFilterTermCounterIndex. The userspace-dp runtime publishes
+	// filter hits HERE, not in the retired eBPF map, so without this merge the
+	// canonical metrics path reports 0/stale while the text commands show real
+	// hits. The userspace merge is independent of the eBPF apply result, so it
+	// must NOT be gated on cr/FilterIDs below.
+	var userspaceStatus *dpuserspace.ProcessStatus
+	if provider, ok := dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	}); ok {
+		if status, err := provider.Status(); err == nil {
+			userspaceStatus = &status
+		}
 	}
+	userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
+
+	// The retired-eBPF/map counter path is gated on a compile result carrying
+	// filter IDs; it may be absent (a pure userspace dataplane) without
+	// suppressing the userspace merge above.
+	cr := dataplane.LastApplyResultOf(dp)
 
 	emitFilters := func(family string, filters map[string]*config.FirewallFilter) {
 		names := make([]string, 0, len(filters))
@@ -276,46 +306,66 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 		sort.Strings(names)
 		for _, name := range names {
 			filter := filters[name]
-			fid, ok := cr.FilterIDs[family+":"+name]
-			if !ok {
-				continue
-			}
-			fcfg, err := dp.ReadFilterConfig(fid)
-			if err != nil {
-				c.counterReadErrors.Add(1)
-				continue
-			}
-			ruleOffset := fcfg.RuleStart
-			for _, term := range filter.Terms {
-				nSrc := len(term.SourceAddresses)
-				if nSrc == 0 {
-					nSrc = 1
-				}
-				nDst := len(term.DestAddresses)
-				if nDst == 0 {
-					nDst = 1
-				}
-				numRules := uint32(nSrc * nDst)
-				var totalPkts uint64
-				termFailed := false
-				for i := uint32(0); i < numRules; i++ {
-					if ctrs, err := dp.ReadFilterCounters(ruleOffset + i); err == nil {
-						totalPkts += ctrs.Packets
+
+			// Resolve the map-counter span for this filter, if the compile
+			// result carries it.
+			var ruleOffset uint32
+			var hasMap bool
+			if cr != nil && cr.FilterIDs != nil {
+				if fid, ok := cr.FilterIDs[family+":"+name]; ok {
+					if fcfg, err := dp.ReadFilterConfig(fid); err == nil {
+						ruleOffset = fcfg.RuleStart
+						hasMap = true
 					} else {
+						// Skip the map path for this filter, but still surface
+						// any userspace-published term counters below.
 						c.counterReadErrors.Add(1)
-						termFailed = true
 					}
 				}
-				// Advance the offset regardless so later terms stay aligned.
-				ruleOffset += numRules
-				// #3408: on a read failure SKIP this term's sample (a missing
-				// sample, not a stale/partial 0) — matching the zone/policy
-				// collectors — and rely on the bumped counterReadErrors signal.
-				if termFailed {
+			}
+
+			for _, term := range filter.Terms {
+				// #3459: the per-term counter-slot stride is the shared SSOT
+				// dataplane.FilterTermExpansionCount (full src×dst×dstPort×
+				// srcPort cross-product, with prefix-list prefixes folded into
+				// src/dst) — NOT the old nSrc*nDst that ignored ports and
+				// prefix-lists and drifted later terms onto a neighbouring
+				// term's slots, mis-attributing the hit.
+				numRules := config.FilterTermExpansionCount(term, cfg.PolicyOptions.PrefixLists)
+				var totalPkts uint64
+				mapFailed := false
+				if hasMap {
+					for i := uint32(0); i < numRules; i++ {
+						if ctrs, err := dp.ReadFilterCounters(ruleOffset + i); err == nil {
+							totalPkts += ctrs.Packets
+						} else {
+							c.counterReadErrors.Add(1)
+							mapFailed = true
+						}
+					}
+					// Advance the offset regardless so later terms stay aligned.
+					ruleOffset += numRules
+				}
+
+				userspaceCounter, userspaceOk := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+					Family: family, FilterName: name, TermName: term.Name,
+				}]
+				if userspaceOk {
+					totalPkts += userspaceCounter.Packets
+				}
+
+				// #3408: on a map read failure with NO userspace signal, SKIP
+				// this term's sample (a missing sample, not a stale/partial 0)
+				// — matching the zone/policy collectors — and rely on the
+				// bumped counterReadErrors. A userspace-published counter is a
+				// real signal, so still emit when one is present (#3461).
+				if mapFailed && !userspaceOk {
 					continue
 				}
-				ch <- prometheus.MustNewConstMetric(c.filterHitsTotal, prometheus.CounterValue,
-					float64(totalPkts), name, family, term.Name)
+				if hasMap || userspaceOk {
+					ch <- prometheus.MustNewConstMetric(c.filterHitsTotal, prometheus.CounterValue,
+						float64(totalPkts), name, family, term.Name)
+				}
 			}
 		}
 	}
