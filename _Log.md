@@ -1,3 +1,25 @@
+## 2026-06-29 — #3413 doc accuracy: pre-id-default-policy is Partial/inert, not Implemented
+
+- **Timestamp**: 2026-06-29
+- **Action**: Corrected `docs/next-features/pre-id-default-policy.md`. The doc
+  claimed `Status: Implemented` and "Session init/close logging is now applied
+  to unknown-app sessions", contradicting the live commit-time WARN and closed
+  #2509. Verified against code: the stanza is PARSED + STORED
+  (pkg/config/compiler_security.go:226-237 → SecurityConfig.PreIDDefaultPolicy,
+  pkg/config/types_security.go:209-213) and schema-completable
+  (pkg/config/schema_security.go:757), but has NO userspace-dp consumer. The
+  only writer was the retired eBPF compiler (pkg/dataplane/compiler.go:1109-1116
+  packs into FlowConfigValue.AppFlags), fed to SetFlowConfig which is a no-op
+  stub on the userspace path (pkg/dataplane/loader.go:400). The legacy wiring
+  bpf/xdp/xdp_policy.c was deleted in #1476 (13fa1009e). A commit-time WARN
+  flags the inertness (pkg/config/compiler_validate_warn.go:859-882). No
+  pre-id/app_id==0 admit consumer exists in userspace-dp (the session-init/close
+  consumers are all the per-policy #2508 path). Changed Status to "Partial —
+  accepted-but-inert (#2509)", removed the false "logging is now applied" claim
+  and the stale eBPF wiring reference, added a "Why It Is Inert" section.
+  Doc-only change; no test needed (no Go/Rust behavior touched).
+- **File(s)**: docs/next-features/pre-id-default-policy.md, _Log.md
+
 ## 2026-06-29 — #3362 rebase fold: dedup host-inbound deny-counter declarations
 
 - **Timestamp**: 2026-06-29
