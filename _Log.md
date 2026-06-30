@@ -24123,3 +24123,33 @@ top.
     docs/junos-cli-reference.md (policy-detail format) + docs/config-schema.md
     (#3061 section operator-display note).
   - **File(s)**: pkg/config/compiler_security.go, pkg/config/zone_local_unqualify_3358_test.go, pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go, pkg/cli/cli_show_security_zone_local_3358_test.go, pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_zone_local_3358_test.go, pkg/api/security.go, pkg/api/security_zone_local_3358_test.go, docs/junos-cli-reference.md, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3358 hostile-review fold — a 6th leaking surface the 5-surface
+    review missed. FOLD 1 (MAJOR): `show security match-policies` still leaked
+    the synthetic `zone-local/<zone>/<name>` token across ALL THREE transports
+    (CLI showMatchPolicies cli_show_security.go:531-532, gRPC MatchPolicies
+    server_cluster.go:252-253, REST MatchPoliciesResult api/security.go:572-573)
+    because they all render the shared `policymatch.Result`, whose
+    Src/DstAddresses are populated ONCE at the SSOT `matchedResult`
+    (policymatch.go:567-568) by copying the raw qualified `pol.Match.*` tokens.
+    Fixed at the SSOT: wrapped both with `config.DisplayAddressNames(...)` — one
+    change fixes all three transports. SAFETY re-verified: matchedResult is the
+    SOLE populator of Result.Src/DstAddresses, and every re-match path
+    (ruleMatches/matchAddr/classifyPolicyAddresses/nameToID) reads `pol.Match`
+    directly, never the Result, so unqualifying the display copy cannot affect
+    matching; from/to-zone in the verdict keeps the bare name unambiguous;
+    policymatch already imports config (no cycle); DisplayAddressNames returns a
+    NEW slice (no config mutation). FOLD 2 (MINOR test-gap): added a dedicated
+    RED-on-revert test for the CLI standard flat `show security policies` view
+    (joinDisplayAddressNames) — the only one of the original five surfaces
+    without its own test. RED-on-revert proven: reverted the matchedResult wrap
+    → TestMatchedResultUnqualifiesZoneLocalNames RED
+    (`SrcAddresses=[zone-local/trust/web], want [web]`); reverted
+    joinDisplayAddressNames to raw strings.Join →
+    Test_3358_FlatShowPoliciesUnqualifiesZoneLocalName RED (token leaked);
+    restored both → GREEN, controls (global-book name passes through) green.
+    go test ./pkg/policymatch ./pkg/cli ./pkg/grpcapi ./pkg/api ./pkg/config
+    green; gofmt clean; go vet clean (pre-existing cli.go:503 unreachable-code
+    warning unrelated). Docs: extended the docs/config-schema.md #3358 note with
+    the match-policies SSOT + flat-view surfaces.
+  - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/zone_local_display_3358_test.go, pkg/cli/cli_show_security_flat_zone_local_3358_test.go, docs/config-schema.md, _Log.md
