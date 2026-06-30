@@ -112,9 +112,18 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		// here and lift that compiler reject.
 		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, srcAddr, protocol, nil)
 		if err != nil {
-			slog.Warn("failed to create syslog client",
+			if client == nil {
+				// UDP / unrecoverable construction error: skip the stream.
+				slog.Warn("failed to create syslog client",
+					"stream", name, "host", stream.Host, "protocol", protocol, "err", err)
+				continue
+			}
+			// #3351: a TCP/TLS receiver unreachable at apply returns a usable
+			// but unconnected client. Install it in this reconnecting state so
+			// audit logging resumes when the receiver comes back, instead of
+			// silently dropping the stream for the life of this config.
+			slog.Warn("syslog stream receiver unreachable at apply; installed in reconnecting state",
 				"stream", name, "host", stream.Host, "protocol", protocol, "err", err)
-			continue
 		}
 		if stream.Severity != "" {
 			client.MinSeverity = logging.ParseSeverity(stream.Severity)

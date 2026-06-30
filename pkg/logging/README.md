@@ -102,6 +102,23 @@ connectionless and exempt:
   collector). The clock is cleared only on a FULLY successful reconnect
   (dial AND the retry-write both land), so the legitimate
   single-broken-pipe recovery path is unaffected.
+- **Lazy connect — receiver down at apply does not disable the stream
+  (#3351).** A TCP/TLS receiver that is unreachable at config-apply or
+  boot must NOT permanently silence the stream. `NewSyslogClientTransport`
+  therefore returns a *usable but unconnected* client (`conn==nil`,
+  cooldown pre-armed) PLUS the dial error for the caller to log, rather
+  than `(nil, err)`. The first `Send` sees `conn==nil`, treats it as a
+  non-timeout write failure, and the cooldown-gated reconnect path above
+  dials when the receiver returns — so audit logging resumes on its own.
+  The cooldown is armed at construction (so the first reconnect waits one
+  window instead of dialing under `s.mu` on the very next event, exactly
+  as `reconnect()` arms on a failed dial). UDP is unaffected: a UDP
+  "dial" needs no live peer, so a UDP failure is a genuine construction
+  error (unresolvable host / bad source bind) and still returns
+  `(nil, err)` — lazy connect is TCP/TLS-only. The daemon
+  (`applySyslogConfig`) installs the non-nil client even when the
+  constructor returns an error, logging `syslog stream receiver
+  unreachable at apply; installed in reconnecting state`.
 - **Drop warning emitted AFTER the lock is released (#2287).**
   `SyslogClient.Send`/`SendBinary` hold `s.mu` for the whole write +
   reconnect sequence. The rate-limited drop warning (`slog.Warn`) must
@@ -147,7 +164,11 @@ dial-success-then-write-failure; the re-entrancy test deadlocks (and
 times out) if the drop warning is moved back under `s.mu` or the handler
 guard is removed; the timeout-drop test fails (sees a dial) if a write
 timeout reconnects; the no-client test (#2295) fails (sees `goID` calls)
-if `Handle` runs the re-entrancy guard before the client check.
+if `Handle` runs the re-entrancy guard before the client check. The
+lazy-connect tests (`syslog_lazy_connect_3351_test.go`) fail if the
+constructor reverts to dropping a TCP/TLS client when the receiver is
+down at apply (`got nil` — stream permanently disabled) or if a lazy
+client never reconnects once the receiver returns.
 
 ## Gotchas
 
