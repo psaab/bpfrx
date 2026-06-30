@@ -11352,6 +11352,234 @@ fn fabric_queue_hash_non_first_fragment_is_port_independent_3tuple() {
     );
 }
 
+// ---- #3291: flowless / non-first-fragment transit ENFORCEMENT ------------
+//
+// A non-first IPv4 fragment is flowless (#2344: its post-IP bytes are payload,
+// never L4 ports). Before #3291 the flowless transit arm ran only
+// resolve_forwarding (+ HA + fabric) and forwarded the fragment whenever a route
+// existed — so a `deny-all` zone pair, an interface input filter, and PBR
+// (`then routing-instance`) all silently no-op'd on fragments (fail-open). These
+// tests push a real non-first fragment through poll_binding_process_descriptor
+// and pin the gate that now applies zone policy + input filter + PBR. Reverting
+// the gate flips the deny / input-filter / PBR cases from drop back to forward,
+// turning the asserts RED.
+
+/// Meta for a non-first IPv4 TCP fragment ingressing on `reth1.0` (lan,
+/// ifindex 24) toward 172.16.80.200 (wan). `flow_*_addr` carry the L3 identity
+/// the shim stamps even for a fragment; the stamped ports are deliberately the
+/// hostile payload bytes — the gate forces ports = 0 / l4_present = false and
+/// MUST NOT trust them.
+fn frag_v4_transit_meta() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 28,
+        l3_offset: 14,
+        flow_src_port: 33333,
+        flow_dst_port: 443,
+        flow_src_addr: [10, 0, 61, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        flow_dst_addr: [172, 16, 80, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// A reachable wan neighbor for 172.16.80.200 so the fragment resolves
+/// ForwardCandidate (not MissingNeighbor) and reaches the transit gate.
+fn frag_transit_wan_neighbor() -> NeighborSnapshot {
+    NeighborSnapshot {
+        interface: "ge-0-0-0.80".to_string(),
+        ifindex: 12,
+        family: "inet".to_string(),
+        ip: "172.16.80.200".to_string(),
+        mac: "00:aa:bb:cc:dd:ee".to_string(),
+        state: "reachable".to_string(),
+        router: false,
+        link_local: false,
+    }
+}
+
+/// A non-first IPv4 fragment frame (offset != 0 => flowless per #2344).
+fn frag_v4_transit_frame() -> Vec<u8> {
+    eth_ipv4_frag_frame(0x0001, &[0x82, 0x35, 0x01, 0xbb, 0, 0, 0, 0])
+}
+
+#[test]
+fn flowless_non_first_fragment_transit_dropped_by_deny_all_3291() {
+    // lan->wan is denied (default-deny; only dmz->wan permitted). A non-first
+    // fragment from lan toward a routed wan dst must be DROPPED by zone policy.
+    // RED-on-revert: the flowless arm used to forward it (dbg.forward == 1,
+    // dbg.policy_deny == 0).
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+    let frame = frag_v4_transit_frame();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        frag_v4_transit_meta(),
+    );
+
+    assert_eq!(
+        dbg.policy_deny, 1,
+        "#3291: a deny-all zone pair must DROP a flowless non-first fragment"
+    );
+    assert_eq!(
+        dbg.forward, 0,
+        "#3291: the fragment must NOT forward under deny-all (RED on revert)"
+    );
+}
+
+#[test]
+fn flowless_non_first_fragment_transit_permitted_by_any_policy_3291() {
+    // An address/`application any` permit for lan->wan must still FORWARD a
+    // non-first fragment — the gate must not over-block legitimate flowless
+    // forwarding.
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.policies = vec![PolicyRuleSnapshot {
+        name: "permit-lan-wan".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    }];
+    snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+    let frame = frag_v4_transit_frame();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        frag_v4_transit_meta(),
+    );
+
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "#3291: an `application any` permit must not deny the fragment"
+    );
+    assert_eq!(
+        dbg.forward, 1,
+        "#3291: a permitted non-first fragment must still forward (no over-gating)"
+    );
+}
+
+#[test]
+fn flowless_non_first_fragment_dropped_by_is_fragment_input_filter_3291() {
+    // Interface input filter `from is-fragment then discard` on the ingress
+    // interface must DROP a non-first fragment. Default-permit policy ensures
+    // the drop is the filter's doing, not zone policy. RED-on-revert: the
+    // flowless arm never ran the input filter (dbg.forward == 1).
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.interfaces[0].filter_input_v4 = "drop-frags".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "drop-frags".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "frag".to_string(),
+            is_fragment: true,
+            action: "discard".to_string(),
+            ..Default::default()
+        }],
+    }];
+    snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+    let frame = frag_v4_transit_frame();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        frag_v4_transit_meta(),
+    );
+
+    assert_eq!(
+        dbg.forward, 0,
+        "#3291: `from is-fragment then discard` must drop a non-first fragment (RED on revert)"
+    );
+}
+
+#[test]
+fn flowless_non_first_fragment_steered_by_pbr_routing_instance_3291() {
+    // Firewall-filter PBR `from is-fragment then routing-instance scrub` must
+    // steer the fragment's route lookup to the (empty) `scrub` table -> NoRoute
+    // -> drop. Default-permit policy + a base connected route to 172.16.80.0/24
+    // mean that WITHOUT the gate the fragment forwards via the base table.
+    // RED-on-revert: the flowless arm ignored PBR -> base route -> forward.
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.interfaces[0].filter_input_v4 = "frag-to-scrub".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "frag-to-scrub".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "frag".to_string(),
+            is_fragment: true,
+            action: "accept".to_string(),
+            routing_instance: "scrub".to_string(),
+            ..Default::default()
+        }],
+    }];
+    snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+    let frame = frag_v4_transit_frame();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        frag_v4_transit_meta(),
+    );
+
+    assert_eq!(
+        dbg.forward, 0,
+        "#3291: PBR `then routing-instance scrub` must steer the fragment to the \
+         empty scrub table -> NoRoute -> drop (RED on revert: base-table forward)"
+    );
+    assert_eq!(
+        dbg.no_route, 1,
+        "#3291: the PBR-steered fragment resolves NoRoute in the empty scrub table"
+    );
+}
+
 // ---- #2364: seeded fabric queue hash ------------------------------------
 
 /// Build N attacker-constructible flowless v4 metas differing only in the

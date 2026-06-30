@@ -2710,31 +2710,177 @@ pub(super) fn poll_binding_process_descriptor(
                         decision
                     }
                 } else {
-                    let non_flow_resolution = enforce_ha_resolution_snapshot(
-                        worker_ctx.forwarding,
-                        worker_ctx.ha_state,
-                        now_secs,
-                        resolve_forwarding(
-                            // SAFETY: per the `area` contract in this
-                            // function's header comment.
-                            unsafe { &*area },
-                            desc,
-                            meta,
+                    // #3291: flowless transit enforcement. A non-first fragment
+                    // / no-L4 transit packet (#2344 makes it flowless so payload
+                    // bytes are never read as L4 ports) STILL carries L3 identity
+                    // — src/dst/protocol/zones/ingress interface — so it must be
+                    // subject to the interface input filter, firewall-filter PBR
+                    // (`then routing-instance`), and zone security policy exactly
+                    // like the flow-backed session-miss arm above. Without this a
+                    // `deny-all` zone pair fails OPEN for fragments (it resolves a
+                    // route and forwards). The synthetic L3 flow below carries
+                    // ports = 0 and drives `l4_present = false`, so port-bearing
+                    // application / filter terms FAIL CLOSED; it is used ONLY for
+                    // enforcement + logging and is NEVER inserted into a session
+                    // index (#3290 invariant). Permitted address/protocol/`any`
+                    // policy still forwards the fragment — legitimate flowless
+                    // forwarding is preserved. (L4-specific-PERMITTED fragmented
+                    // flows are the deferred fragment-association-cache stage of
+                    // the #3291 plan; until then their non-first fragments fall to
+                    // the default policy, the documented fail-closed limitation.)
+                    let l3_ctx = crate::afxdp::frame::l3_session_flow_from_meta(meta);
+
+                    // (1) Interface input filter (pre-routing), mirroring the
+                    //     session-miss site above. The frame-derived `extra`
+                    //     carries `is_fragment` + `l4_present = false`, so a
+                    //     `from is-fragment then discard` term matches while
+                    //     tcp-flags / icmp-type / flex predicates fail closed. No
+                    //     filter configured => Accept (no behavior change).
+                    if let Some(l3_flow) = l3_ctx.as_ref() {
+                        let input_eval = evaluate_non_pbr_input_filter(
                             worker_ctx.forwarding,
-                            worker_ctx.dynamic_neighbors,
+                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
+                            Some(l3_flow),
+                            meta,
+                            ingress_zone_override,
+                            true,
+                        );
+                        if let Some(cached_log) = input_eval.cached_log {
+                            emit_input_filter_log_match(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                l3_flow,
+                                meta,
+                                cached_log,
+                                now_ns,
+                            );
+                        }
+                        if input_eval.action != crate::filter::FilterAction::Accept {
+                            // A flowless deny is SILENT: a non-first fragment has
+                            // no L4 header to synthesize a TCP RST / reject from,
+                            // so both `discard` and `reject` drop quietly.
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                    }
+
+                    // (2) PBR `then routing-instance` override + base resolution.
+                    //     When a PBR term matches a flowless predicate
+                    //     (is-fragment / address / protocol) the route lookup is
+                    //     steered to the override table; otherwise fall back to
+                    //     the existing default-table resolve.
+                    let route_override = l3_ctx.as_ref().and_then(|l3_flow| {
+                        ingress_route_table_override(
+                            worker_ctx.forwarding,
+                            packet_frame,
+                            meta,
+                            l3_flow,
+                            ingress_zone_override,
+                            worker_ctx.event_stream,
+                            now_ns,
+                        )
+                    });
+                    let base_resolution = match (l3_ctx.as_ref(), route_override.as_deref()) {
+                        (Some(l3_flow), Some(table)) => enforce_ha_resolution_snapshot(
+                            worker_ctx.forwarding,
+                            worker_ctx.ha_state,
+                            now_secs,
+                            lookup_forwarding_resolution_in_table_with_dynamic(
+                                worker_ctx.forwarding,
+                                worker_ctx.dynamic_neighbors,
+                                l3_flow.dst_ip,
+                                Some(table),
+                            ),
                         ),
-                    );
+                        _ => enforce_ha_resolution_snapshot(
+                            worker_ctx.forwarding,
+                            worker_ctx.ha_state,
+                            now_secs,
+                            resolve_forwarding(
+                                // SAFETY: per the `area` contract in this
+                                // function's header comment.
+                                unsafe { &*area },
+                                desc,
+                                meta,
+                                worker_ctx.forwarding,
+                                worker_ctx.dynamic_neighbors,
+                            ),
+                        ),
+                    };
                     // For non-flow packets (no L4 ports), also attempt fabric
                     // redirect when the egress RG is inactive.
-                    let final_resolution = if non_flow_resolution.disposition
+                    let final_resolution = if base_resolution.disposition
                         == ForwardingDisposition::HAInactive
                         && !packet_fabric_ingress
                     {
-                        resolve_fabric_redirect(worker_ctx.forwarding)
-                            .unwrap_or(non_flow_resolution)
+                        resolve_fabric_redirect(worker_ctx.forwarding).unwrap_or(base_resolution)
                     } else {
-                        non_flow_resolution
+                        base_resolution
                     };
+
+                    // (3) Zone security policy — only for TRANSIT
+                    //     (ForwardCandidate). Local delivery (host-inbound) is
+                    //     #3292; NoRoute drops anyway; MissingNeighbor keeps its
+                    //     own cold-path arm; FabricRedirect is HA peer-owned and
+                    //     enforced on the peer. A non-Permit verdict is a SILENT
+                    //     drop (no L4 header to reject), with a PolicyDeny event
+                    //     for observability — same record the flow-backed deny
+                    //     emits, with ports = 0.
+                    if final_resolution.disposition == ForwardingDisposition::ForwardCandidate
+                        && let Some(l3_flow) = l3_ctx.as_ref()
+                    {
+                        let ingress_logical = resolve_ingress_logical_ifindex(
+                            worker_ctx.forwarding,
+                            meta.ingress_ifindex as i32,
+                            meta.ingress_vlan_id,
+                        )
+                        .unwrap_or(meta.ingress_ifindex as i32);
+                        let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
+                            worker_ctx.forwarding,
+                            ingress_logical,
+                            ingress_zone_override,
+                            final_resolution.egress_ifindex,
+                        );
+                        // #3020: an icmp-type-constrained application term fails
+                        // closed for a non-first fragment (no readable L4 → None).
+                        let policy_icmp = policy_packet_icmp(packet_frame, meta);
+                        let policy_result = crate::policy::evaluate_policy_result_l3_aware(
+                            &worker_ctx.forwarding.policy,
+                            from_zone_id,
+                            to_zone_id,
+                            l3_flow.src_ip,
+                            l3_flow.dst_ip,
+                            meta.protocol,
+                            0,
+                            0,
+                            policy_icmp,
+                            desc.len as u64,
+                            // #3291: L4 header ABSENT — port-bearing app terms
+                            // fail closed; address/protocol/`any` still match.
+                            false,
+                        );
+                        if !matches!(policy_result.action, PolicyAction::Permit) {
+                            let owner_rg_id =
+                                owner_rg_for_resolution(worker_ctx.forwarding, final_resolution);
+                            emit_policy_deny_event(
+                                worker_ctx.event_stream,
+                                l3_flow,
+                                &NatDecision::default(),
+                                meta,
+                                from_zone_id,
+                                to_zone_id,
+                                owner_rg_id,
+                                policy_result.policy_id,
+                                policy_result.action,
+                                // No L4 port for a flowless packet → no AppID.
+                                0,
+                                now_ns,
+                            );
+                            telemetry.dbg.policy_deny += 1;
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                    }
                     SessionDecision {
                         resolution: final_resolution,
                         nat: NatDecision::default(),
