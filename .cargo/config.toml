@@ -1,0 +1,17 @@
+# gcc-15 / recent elfutils + zlib both ship a static `crc32` symbol: it
+# lives in BOTH libelf.a and libz.a. The userspace-dp helper links
+# `-lelf` and `-lz` (transitively, via the static libbpf / libxdp /
+# xsk_bridge archives), so `rust-lld` aborts the final link of the
+# release binary with `duplicate symbol: crc32`. The link-arg tells the
+# linker to take the first definition (benign — they are independent CRC
+# implementations and each library uses its own copy internally).
+#
+# Scoped to the host target so the `bpfel-unknown-none` userspace-xdp
+# shim build — which carries its own `userspace-xdp/.cargo/config.toml`
+# and a pinned toolchain (#1864) — is unaffected (target mismatch = the
+# section is a no-op there). Without this, plain `make build-userspace-dp`
+# / `make cluster-deploy` fail to link on a modern toolchain and must be
+# run with `RUSTFLAGS=-C link-arg=-Wl,--allow-multiple-definition` set
+# out of band. See #3595.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
