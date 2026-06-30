@@ -244,7 +244,7 @@ sync.
     `application junos-https`) has its non-first fragments fall to the
     default policy (fail-closed drop) until the deferred
     fragment-association-cache stage of the #3291 plan carries the first
-    fragment's verdict; see `docs/research/3291-flowless-enforcement/plan.md`.
+    fragment's verdict; tracked as the deferred fragment-association-cache stage of #3291.
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
   `headers.rs` holds the consolidated outer-header serializers (#1440).
