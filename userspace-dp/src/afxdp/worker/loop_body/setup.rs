@@ -125,6 +125,10 @@ pub(super) fn worker_loop_setup(
     screen_state.update_missing_profiles(forwarding.screen_missing_profiles.clone());
     screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key);
     sessions.set_timeouts(forwarding.session_timeouts);
+    // #3527: push the per-screened-zone half-open (`syn-flood timeout`)
+    // overrides next to `set_timeouts`. Empty in the common case (no zone
+    // configures a syn-flood timeout).
+    sessions.set_opening_overrides(forwarding.session_opening_overrides.clone());
     // #2134: drive the per-IP session-limit OFF-gate from the applied
     // screen profiles. Off when no zone configures `limit-session`, so
     // install/remove counter maintenance is skipped for the ~99% case.

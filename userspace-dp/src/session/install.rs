@@ -165,6 +165,11 @@ impl SessionTable {
                     &self.timeouts,
                     // #3227: per-application idle timeout override (None = global).
                     metadata.inactivity_timeout_ns,
+                    // #3527: the ingress zone's `syn-flood timeout` override of
+                    // the half-open window (None = global). Only consulted on
+                    // the OPENING branch, so a bare-SYN session in a screened
+                    // zone reaps on the operator's window.
+                    self.opening_override_for(metadata.ingress_zone),
                 ),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),
@@ -341,6 +346,14 @@ impl SessionTable {
                     &self.timeouts,
                     // #3227: per-application idle timeout override (None = global).
                     metadata.inactivity_timeout_ns,
+                    // #3527: a peer-synced session is imported ESTABLISHED, so
+                    // the OPENING branch is never taken and the per-zone
+                    // half-open override is irrelevant here. Passing `None`
+                    // (rather than re-deriving from this node's config) makes
+                    // explicit that the override never crosses the HA wire — it
+                    // is re-derived per node and only governs locally-received
+                    // bare-SYN floods (§11.1 of the #3315 plan).
+                    None,
                 ),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),

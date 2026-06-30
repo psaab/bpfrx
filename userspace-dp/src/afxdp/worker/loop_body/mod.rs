@@ -401,6 +401,11 @@ pub(crate) fn worker_loop(
             screen_state.update_missing_profiles(new_forwarding.screen_missing_profiles.clone());
             screen_state.update_syn_cookie_master_key(new_forwarding.syn_cookie_master_key);
             sessions.set_timeouts(new_forwarding.session_timeouts);
+            // #3527: re-apply the per-screened-zone half-open overrides on every
+            // runtime forwarding-snapshot rotation. `set_opening_overrides` is a
+            // full replace, so a zone whose `syn-flood timeout` was removed
+            // drops out and reverts to the global default on the next install.
+            sessions.set_opening_overrides(new_forwarding.session_opening_overrides.clone());
             // #2134: re-derive the per-IP session-limit OFF-gate on every
             // runtime forwarding-snapshot rotation. A runtime ON->OFF
             // transition (operator removes `limit-session`) clears the

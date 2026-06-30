@@ -116,6 +116,13 @@ pub(in crate::afxdp) struct ForwardingState {
     /// an old Go binary) — sessions then keep app_id 0 (unknown).
     pub(in crate::afxdp) app_catalog: AppCatalog,
     pub(in crate::afxdp) session_timeouts: crate::session::SessionTimeouts,
+    /// #3527: per-ingress-zone override (zone id → ns) of the global half-open
+    /// (`tcp_opening_ns`) TCP window, built from each screened zone's
+    /// `syn-flood timeout`. Pushed onto the worker `SessionTable` via
+    /// `set_opening_overrides` alongside `session_timeouts`. Empty when no zone
+    /// configures a syn-flood timeout (the common case), byte-identical to
+    /// pre-#3527.
+    pub(in crate::afxdp) session_opening_overrides: FastMap<u16, u64>,
     pub(in crate::afxdp) policy: PolicyState,
     pub(in crate::afxdp) source_nat_rules: Vec<SourceNatRule>,
     pub(in crate::afxdp) static_nat: StaticNatTable,
