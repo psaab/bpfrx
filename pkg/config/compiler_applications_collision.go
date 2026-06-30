@@ -308,13 +308,23 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 		}
 
 		// 5b. H01 — generated name overwrites an authored application.
+		//     Mechanism-agnostic phrasing: a SIMPLE authored application named %q
+		//     writes apps.Applications[%q] (a direct overwrite of the generated
+		//     term), but a TERM-BASED authored application named %q writes its
+		//     implicit set into apps.ApplicationSets[%q] instead — so the exact
+		//     map collision differs by sub-case. Both share the one flat Junos
+		//     namespace with the generated name and resolve last-write-wins /
+		//     ambiguously, which is the defect; the message describes the namespace
+		//     collision rather than a specific map write that does not always hold.
 		if appCounts[g] > 0 {
 			if err := emit(
 				"generated per-term application name %q (from %v) collides with the "+
-					"authored application %q — both write apps.Applications[%q] and the "+
-					"later write silently wins (with no commit error), so policy / AppID "+
-					"may enforce or label the wrong application; rename one of them (#3472)",
-				g, parents, g, g); err != nil {
+					"authored application name %q in the flat application namespace — "+
+					"generated term names share one namespace with authored "+
+					"applications / application-sets, so this is ambiguous and "+
+					"last-write-wins (with no commit error) and policy / AppID may "+
+					"enforce or label the wrong application; rename one of them (#3472)",
+				g, parents, g); err != nil {
 				return nil, err
 			}
 		}

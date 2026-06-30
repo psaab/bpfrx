@@ -425,6 +425,55 @@ func TestGeneratedTermNamesNoCollisionCommit(t *testing.T) {
 	}
 }
 
+// #3472 cross-BLOCK generated-name collision (the #3561/#3562/#3566 duplicate-
+// block discipline). A hierarchical parse can emit MULTIPLE top-level sibling
+// `applications {}` nodes; compileExpanded compiles every one, and the gate's
+// genParents/genOrder table aggregates generated names across ALL of them. Here
+// block A's multi-term `a-b` mints `a-b-c` and block B's multi-term `a` ALSO
+// mints `a-b-c` (term `b-c`), so the two generated names collide across parents
+// AND across blocks (H03). A gate that iterated only the first `applications`
+// block — or did not aggregate genParents across blocks — would see only one
+// producer of `a-b-c`, miss the collision, and compile clean. This pins the
+// iterate-all aggregation against a future first-match regression. Uses NewParser
+// (hierarchical) — ParseSetCommand would merge the blocks into one node.
+func TestCrossParentGeneratedNameCollisionSplitAcrossBlocks(t *testing.T) {
+	tree := parseHier(t, `
+applications {
+    application a-b {
+        term c {
+            protocol tcp;
+            destination-port 22;
+        }
+        term x {
+            protocol tcp;
+            destination-port 81;
+        }
+    }
+}
+applications {
+    application a {
+        term b-c {
+            protocol udp;
+            destination-port 53;
+        }
+        term y {
+            protocol udp;
+            destination-port 54;
+        }
+    }
+}
+`)
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of cross-parent generated name collision split across applications blocks, got nil")
+	}
+	if !strings.Contains(err.Error(), "a-b-c") ||
+		!strings.Contains(err.Error(), "collides across parents") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
 // Lenient path (load / peer-sync) must WARN, not brick: an already-persisted
 // colliding config still compiles, with the collision surfaced as a warning.
 func TestApplicationNameCollisionLenientWarns(t *testing.T) {
