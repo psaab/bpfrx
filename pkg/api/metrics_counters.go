@@ -109,6 +109,18 @@ func (c *xpfCollector) emitCounterReadErrors(ch chan<- prometheus.Metric) {
 		float64(c.counterReadErrors.Load()))
 }
 
+// emitInterfaceCounterReadErrors emits the xpf_interface_counter_read_errors_total
+// scrape-error sample. #3464: always emitted (0 when healthy) so the signal is
+// present for alerting whether or not any interface read failed. Collect calls
+// it AFTER collectInterfaceCounters (the only bumper), so a failure this scrape
+// is reflected in this scrape's value rather than lagging one scrape behind.
+// Kept separate from emitCounterReadErrors because interface counters are out
+// of the #3345 security-counter contract.
+func (c *xpfCollector) emitInterfaceCounterReadErrors(ch chan<- prometheus.Metric) {
+	ch <- prometheus.MustNewConstMetric(c.interfaceCounterReadErrorsTotal, prometheus.CounterValue,
+		float64(c.interfaceCounterReadErrors.Load()))
+}
+
 func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
@@ -123,6 +135,14 @@ func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp 
 		}
 		ctrs, err := dp.ReadInterfaceCounters(iface.Index)
 		if err != nil {
+			// #3464: a per-interface counter-read failure SKIPS this
+			// interface's samples (no misleading 0) and bumps
+			// xpf_interface_counter_read_errors_total — the interface-counter
+			// analogue of the #3345/#3408 security-counter contract (skip, do
+			// not emit a 0). The interface error metric is intentionally
+			// SEPARATE from xpf_counter_read_errors_total (interface counters
+			// are out of the security-counter contract; #3464).
+			c.interfaceCounterReadErrors.Add(1)
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(c.ifacePacketsTotal, prometheus.CounterValue,

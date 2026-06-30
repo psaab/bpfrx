@@ -494,6 +494,14 @@ message InterfaceInfo {
   uint64 rx_bytes = 5;
   uint64 tx_packets = 6;
   uint64 tx_bytes = 7;
+  // unavailable is true when the per-interface dataplane counter read FAILED
+  // for this interface (degraded counter bridge / userspace shim). The
+  // counter fields above are then left at 0 but are NOT authoritative, so a
+  // real idle 0 stays distinguishable from an unavailable read. Omitted
+  // (false) when counters were read successfully. Uniform contract across
+  // REST /stats/interfaces, REST /interfaces, and the Prometheus
+  // xpf_interface_counter_read_errors_total counter (#3464).
+  bool unavailable = 8;
 }
 
 message ShowInterfacesDetailRequest {

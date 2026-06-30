@@ -96,19 +96,27 @@ func (s *Server) ifaceStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		if err != nil {
 			continue
 		}
-		ctrs, err := s.dp.ReadInterfaceCounters(iface.Index)
-		if err != nil {
-			continue
+		is := InterfaceStats{
+			Name:    ifName,
+			Ifindex: iface.Index,
+			Zone:    ifZone[ifName],
 		}
-		result = append(result, InterfaceStats{
-			Name:      ifName,
-			Ifindex:   iface.Index,
-			Zone:      ifZone[ifName],
-			RxPackets: ctrs.RxPackets,
-			RxBytes:   ctrs.RxBytes,
-			TxPackets: ctrs.TxPackets,
-			TxBytes:   ctrs.TxBytes,
-		})
+		// #3464: a per-interface counter read failure used to `continue`,
+		// dropping the whole interface row — so a degraded counter bridge made
+		// the interface VANISH (indistinguishable from "not configured"). Keep
+		// the row with an explicit Unavailable marker (counters left 0 but not
+		// authoritative) so a read failure is distinguishable from a real idle
+		// 0. Uniform with REST /interfaces, gRPC GetInterfaces, and the
+		// Prometheus xpf_interface_counter_read_errors_total contract.
+		if ctrs, err := s.dp.ReadInterfaceCounters(iface.Index); err != nil {
+			is.Unavailable = true
+		} else {
+			is.RxPackets = ctrs.RxPackets
+			is.RxBytes = ctrs.RxBytes
+			is.TxPackets = ctrs.TxPackets
+			is.TxBytes = ctrs.TxBytes
+		}
+		result = append(result, is)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	writeOK(w, result)
