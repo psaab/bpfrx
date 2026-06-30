@@ -1628,6 +1628,51 @@ and `pkg/dataplane/userspace/default_policy_3065_test.go`
 reads is `"deny"` for an unset config, `"permit"`/`"reject"` for the explicit
 overrides).
 
+### #3534 — `default-policy-log session-init|session-close` (implicit default RT_FLOW logging)
+
+Split from #3363 Part 2. Operators want the implicit default-policy verdict to
+emit RT_FLOW session logs like a named policy's `then log` selection. The
+natural Junos-style spelling, `default-policy then log session-init`, is **not**
+expressible: the #3065 `default-policy` leaf is a typed `ValueEnumOf` leaf, and
+the `schema.go` typed-leaf invariant forbids a typed leaf from carrying a
+`children` map (flipping a leaf to a container regresses flat-set SetPath
+grouping). #3363 deferred the knob for exactly this reason. The fix puts the log
+selection in a **sibling container** — `security policies default-policy-log`
+with presence-only flag children `session-init` / `session-close`
+(`schema_security.go`) — so the `default-policy` enum leaf is untouched (its
+replace semantics + enum `commit check` from #3065 are preserved bit-for-bit).
+This mirrors the `pre-id-default-policy` logging-bool model, but unlike
+pre-id-default-policy (#2509, accepted-but-inert) it is **wired**.
+
+**Compile:** `compilePolicies` (`compiler_security.go`) reads the two flags into
+`SecurityConfig.DefaultPolicyLogSessionInit` / `…Close`.
+
+**Dataplane plumbing:** `builder.go` threads them into
+`ConfigSnapshot.DefaultLogSessionInit` / `…Close` (additive wire — `omitempty`
+on the Go side, `#[serde(default)]` on the Rust `ConfigSnapshot`, so an old
+helper or an old Go binary decodes a missing field as `false`). The Rust build
+site (`forwarding_build/mod.rs`) sets `PolicyState.default_log_session_init` /
+`…_close`, and the implicit-default-verdict result (`policy.rs`,
+`evaluate_policy_result_*`) stamps them onto `PolicyEvaluationResult.log_session_*`.
+The session-create hot path already copies those onto the session metadata, so a
+**default-PERMIT** flow installs a session that emits RT_FLOW_SESSION_CREATE /
+RT_FLOW_SESSION_CLOSE exactly like a named policy — riding the #3528
+default-policy verdict path (sentinel `policy_id` → rendered `default-policy`).
+
+**Inert under deny/reject (WARN):** a **default-DENY/REJECT** verdict installs
+no session, so the session-init/close records cannot fire; that verdict is
+already logged unconditionally via the policy-deny RT_FLOW record. Commit emits a
+WARN-only message (`validateDefaultPolicyLogWarnings`, `compiler_validate_warn.go`)
+naming the inert modes and pointing at `permit-all`. Never an error — the stanza
+is valid and a hard reject would brick a boot on a previously-committed value.
+
+Regression coverage: `pkg/config/compiler_default_policy_log_3534_test.go`
+(compile flags + schema accept + inert-warning fail-on-revert),
+`pkg/dataplane/userspace/default_policy_log_3534_test.go` (snapshot wiring),
+and Rust `policy::tests::default_verdict_carries_default_policy_log_flags` +
+`afxdp::tests::build_forwarding_state_threads_default_policy_log_flags` +
+the `wire_invariant_default_specimens` fixture.
+
 ### #2401 — Security-policy undefined-zone references (commit fail-closed)
 
 A `set security policies from-zone <a> to-zone <b> { policy ... }` stanza

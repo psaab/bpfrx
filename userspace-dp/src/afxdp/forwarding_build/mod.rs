@@ -237,6 +237,12 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         &snapshot.address_books,
         policy_counters,
     )?;
+    // #3534: thread the implicit-default-policy RT_FLOW log selection into the
+    // policy state. Set here (not in the parser) so the parser's many test
+    // callers and the discard-only preflight call sites are untouched; the
+    // default-verdict result reads these to stamp a default-PERMIT session.
+    state.policy.default_log_session_init = snapshot.default_log_session_init;
+    state.policy.default_log_session_close = snapshot.default_log_session_close;
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.allow_embedded_icmp = snapshot.flow.allow_embedded_icmp;
     state.alg_disable_flags = snapshot.flow.alg_disable_flags;

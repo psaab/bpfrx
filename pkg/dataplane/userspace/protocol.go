@@ -52,28 +52,42 @@ type ControlResponse struct {
 }
 
 type ConfigSnapshot struct {
-	Version         int                          `json:"version"`
-	Generation      uint64                       `json:"generation"`
-	FIBGeneration   uint32                       `json:"fib_generation,omitempty"`
-	GeneratedAt     time.Time                    `json:"generated_at"`
-	Summary         SnapshotSummary              `json:"summary"`
-	Capabilities    UserspaceCapabilities        `json:"capabilities"`
-	MapPins         UserspaceMapPins             `json:"map_pins"`
-	Zones           []ZoneSnapshot               `json:"zones,omitempty"`
-	Interfaces      []InterfaceSnapshot          `json:"interfaces,omitempty"`
-	Fabrics         []FabricSnapshot             `json:"fabrics,omitempty"`
-	TunnelEndpoints []TunnelEndpointSnapshot     `json:"tunnel_endpoints,omitempty"`
-	Neighbors       []NeighborSnapshot           `json:"neighbors,omitempty"`
-	Routes          []RouteSnapshot              `json:"routes,omitempty"`
-	Flow            FlowSnapshot                 `json:"flow,omitempty"`
-	DefaultPolicy   string                       `json:"default_policy,omitempty"`
-	Policies        []PolicyRuleSnapshot         `json:"policies,omitempty"`
-	SourceNAT       []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
-	StaticNAT       []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
-	DestinationNAT  []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
-	NAT64           []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
-	Nptv6           []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
-	Screens         []ScreenProfileSnapshot      `json:"screens,omitempty"`
+	Version         int                      `json:"version"`
+	Generation      uint64                   `json:"generation"`
+	FIBGeneration   uint32                   `json:"fib_generation,omitempty"`
+	GeneratedAt     time.Time                `json:"generated_at"`
+	Summary         SnapshotSummary          `json:"summary"`
+	Capabilities    UserspaceCapabilities    `json:"capabilities"`
+	MapPins         UserspaceMapPins         `json:"map_pins"`
+	Zones           []ZoneSnapshot           `json:"zones,omitempty"`
+	Interfaces      []InterfaceSnapshot      `json:"interfaces,omitempty"`
+	Fabrics         []FabricSnapshot         `json:"fabrics,omitempty"`
+	TunnelEndpoints []TunnelEndpointSnapshot `json:"tunnel_endpoints,omitempty"`
+	Neighbors       []NeighborSnapshot       `json:"neighbors,omitempty"`
+	Routes          []RouteSnapshot          `json:"routes,omitempty"`
+	Flow            FlowSnapshot             `json:"flow,omitempty"`
+	DefaultPolicy   string                   `json:"default_policy,omitempty"`
+	// DefaultLogSessionInit / DefaultLogSessionClose carry
+	// `security policies default-policy-log session-init|session-close` (#3534).
+	// They request RT_FLOW session logging for the IMPLICIT default-policy
+	// verdict (the result returned when a flow matches no zone-pair, wildcard,
+	// or global policy), mirroring a named policy's `then log` selection. The
+	// Rust default-verdict result stamps these onto the metadata of a
+	// default-PERMIT session so it emits RT_FLOW_SESSION_CREATE/CLOSE; a
+	// default-DENY/REJECT verdict installs no session (already logged via the
+	// policy-deny record), so they are inert there. Additive/skew-tolerant:
+	// omitempty on the Go side + #[serde(default)] on the Rust side, so an old
+	// helper decodes a missing field as false and an old Go binary that does not
+	// emit it leaves the Rust flag false.
+	DefaultLogSessionInit  bool                         `json:"default_log_session_init,omitempty"`
+	DefaultLogSessionClose bool                         `json:"default_log_session_close,omitempty"`
+	Policies               []PolicyRuleSnapshot         `json:"policies,omitempty"`
+	SourceNAT              []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
+	StaticNAT              []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
+	DestinationNAT         []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
+	NAT64                  []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
+	Nptv6                  []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
+	Screens                []ScreenProfileSnapshot      `json:"screens,omitempty"`
 	// ScreenMissingProfiles records zones that REFERENCE a screen profile
 	// which was NOT defined at snapshot-build time (#3082). On the
 	// lenient/HA-sync path (#1960 — older-binary-persisted active.json on

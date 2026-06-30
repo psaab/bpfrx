@@ -11592,3 +11592,35 @@ fn pending_neigh_fragment_buffers_no_flow_key() {
     let ok_key = ok_key.expect("a flowless non-fragmented TCP packet keeps its meta flow_key");
     assert_eq!(ok_key.dst_port, 443, "legit flowless packet keeps its dst port");
 }
+
+// #3534 fail-on-revert: build_forwarding_state must thread the snapshot's
+// implicit-default-policy RT_FLOW log selection
+// (ConfigSnapshot.default_log_session_init/close) onto PolicyState so the
+// default-verdict result can stamp a default-PERMIT session. Reverting the
+// forwarding_build/mod.rs assignment leaves the PolicyState flags false and the
+// "true" assertions go RED. Additive: an omitted field decodes to false.
+#[test]
+fn build_forwarding_state_threads_default_policy_log_flags() {
+    let state = build_forwarding_state(&ConfigSnapshot {
+        default_policy: "permit".into(),
+        default_log_session_init: true,
+        default_log_session_close: true,
+        ..Default::default()
+    });
+    assert!(
+        state.policy.default_log_session_init,
+        "default_log_session_init must reach PolicyState from the snapshot"
+    );
+    assert!(
+        state.policy.default_log_session_close,
+        "default_log_session_close must reach PolicyState from the snapshot"
+    );
+
+    // Omitting the selection leaves both false (the default behaviour).
+    let quiet = build_forwarding_state(&ConfigSnapshot {
+        default_policy: "permit".into(),
+        ..Default::default()
+    });
+    assert!(!quiet.policy.default_log_session_init);
+    assert!(!quiet.policy.default_log_session_close);
+}

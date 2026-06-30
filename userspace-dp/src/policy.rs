@@ -1680,6 +1680,17 @@ pub(crate) struct PolicyState {
     /// survives snapshot rebuilds, and reported as that rule id in
     /// [`PolicyState::counter_snapshots`].
     pub(crate) default_counter: Arc<PolicyRuleCounter>,
+    /// #3534: RT_FLOW session-log selection for the IMPLICIT default-policy
+    /// verdict (`security policies default-policy-log session-init|
+    /// session-close`). Stamped onto the default-verdict
+    /// [`PolicyEvaluationResult`] so a default-PERMIT session carries the flags
+    /// in its metadata and emits RT_FLOW_SESSION_CREATE/CLOSE like a named
+    /// policy. Inert for a default-DENY/REJECT verdict (no session installed —
+    /// the deny is already logged via the policy-deny record). Sourced from the
+    /// snapshot at build time (see `build_forwarding_state_*`); the parser does
+    /// not read it, so the legacy infallible test helper keeps them false.
+    pub(crate) default_log_session_init: bool,
+    pub(crate) default_log_session_close: bool,
 }
 
 impl Default for PolicyState {
@@ -1696,6 +1707,8 @@ impl Default for PolicyState {
             book_id_to_idx: FxHashMap::default(),
             has_junos_host_rules: false,
             default_counter: Arc::new(PolicyRuleCounter::default()),
+            default_log_session_init: false,
+            default_log_session_close: false,
         }
     }
 }
@@ -1850,6 +1863,12 @@ pub(crate) fn parse_policy_state_with_counters(
         // Arc instance is stable across snapshot rebuilds (an in-flight
         // default-permit session's bound counter keeps pointing at it).
         default_counter: counter_store.rule_hit_counter(DEFAULT_POLICY_COUNTER_RULE_ID),
+        // #3534: set by the snapshot build site (build_forwarding_state_*) from
+        // ConfigSnapshot.default_log_session_init/close. Not derived from the
+        // policy rules, so the parser leaves them false here; the legacy
+        // infallible test helper (parse_policy_state) therefore keeps them off.
+        default_log_session_init: false,
+        default_log_session_close: false,
     };
 
     // #1606: build the dense book table first. Hard-fail on
@@ -2557,14 +2576,18 @@ pub(crate) fn evaluate_policy_result_with_icmp(
         // misleading when the first rule is a permit. The sentinel is rendered
         // as `default-policy` by the Go log/display planes.
         policy_id: DEFAULT_POLICY_SENTINEL_ID,
-        // #2508: the implicit default policy has no `then log` selection.
-        // Operators who need default-deny audit logging configure an explicit
-        // `from-zone any to-zone any` catch-all policy with `then { deny; log
-        // session-init; }`, which the wildcard tier above honors (counter +
-        // log selection). Grafting `then log` onto the implicit default's enum
-        // leaf is a config-grammar change tracked separately from #3363.
-        log_session_init: false,
-        log_session_close: false,
+        // #3534 (was #2508 "no selection"): the implicit default policy now
+        // carries the operator's `security policies default-policy-log
+        // session-init|session-close` selection. For a default-PERMIT verdict
+        // these flags are stamped onto the installed session's metadata (the
+        // session-create hot path reads PolicyEvaluationResult.log_session_*),
+        // so the default-permit session emits RT_FLOW_SESSION_CREATE/CLOSE like
+        // a named policy's `then log`. A default-DENY/REJECT verdict installs no
+        // session, so the flags are inert there (the deny is already logged via
+        // the unconditional policy-deny RT_FLOW record). Stamping them
+        // unconditionally is correct: the deny path never reads these fields.
+        log_session_init: state.default_log_session_init,
+        log_session_close: state.default_log_session_close,
         // #3227: the implicit default policy carries no per-app timeout; the
         // session ages on the global per-protocol timeout (today's behavior).
         inactivity_timeout: None,
