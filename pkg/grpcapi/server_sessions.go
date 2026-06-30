@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"time"
 
@@ -753,6 +754,149 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 	}
 
 	return resp, nil
+}
+
+// GetZonePairSummary aggregates the local session table by (ingress-zone,
+// egress-zone) pair with a per-protocol-class breakdown (tcp/udp/icmp/other),
+// the gRPC analog of the REST sessionZonePairHandler. It exists so the REST
+// zone-pair endpoint has an RPC to forward to for cross-node fan-out (#3592);
+// before this RPC the breakdown was computed REST-locally with no peer path.
+//
+// include_peer mirrors GetSessionSummary: when set (and this is not itself a
+// forwarded peer request) the local node fans out to the cluster peer and
+// stamps the peer's OWN breakdown under resp.Peer. The peer request carries
+// the x-peer-forwarded metadata recursion guard (proxyPeerZonePairSummary), so
+// the peer answers from its local table without recursing back. A standalone
+// node, an unreachable peer, or a failed peer RPC leaves resp.Peer nil (a
+// read summary degrades gracefully rather than failing the whole call).
+func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error) {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+
+	resp := &pb.GetZonePairSummaryResponse{}
+	if s.cluster != nil {
+		resp.NodeId = int32(s.cluster.NodeID())
+	}
+
+	pairs, err := s.computeZonePairSummary()
+	if err != nil {
+		return nil, err
+	}
+	resp.ZonePairs = pairs
+
+	// Fan out to the peer when the operator opted in AND this is not itself a
+	// forwarded peer request (recursion guard). proxyPeerZonePairSummary stamps
+	// x-peer-forwarded on the outgoing context and, in production, dials the
+	// peer only when one is alive; a unit test wires peerZonePairSummaryFn.
+	if req.GetIncludePeer() && !peerForwardedFromContext(ctx) {
+		peerResp, perr := s.proxyPeerZonePairSummary(ctx, &pb.GetZonePairSummaryRequest{})
+		if perr != nil {
+			slog.Warn("failed to fetch peer zone-pair summary", "err", perr)
+		} else if peerResp != nil {
+			resp.Peer = peerResp
+		}
+	}
+
+	return resp, nil
+}
+
+// computeZonePairSummary iterates the local v4+v6 session tables and returns
+// the per-zone-pair protocol breakdown, sorted by (from_zone, to_zone). A
+// backend iterator error fails the call rather than returning a partial,
+// healthy-looking breakdown (#2469), matching GetSessionSummary.
+func (s *Server) computeZonePairSummary() ([]*pb.ZonePairSessionSummary, error) {
+	zoneNames := make(map[uint16]string)
+	if cr := s.applyResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			zoneNames[id] = name
+		}
+	}
+
+	type zpKey struct{ from, to uint16 }
+	counts := make(map[zpKey]*pb.ZonePairSessionSummary)
+
+	countSession := func(inZone, outZone uint16, proto uint8) {
+		k := zpKey{inZone, outZone}
+		zp, ok := counts[k]
+		if !ok {
+			zp = &pb.ZonePairSessionSummary{
+				FromZone: zoneNames[inZone],
+				ToZone:   zoneNames[outZone],
+			}
+			if zp.FromZone == "" {
+				zp.FromZone = fmt.Sprintf("zone-%d", inZone)
+			}
+			if zp.ToZone == "" {
+				zp.ToZone = fmt.Sprintf("zone-%d", outZone)
+			}
+			counts[k] = zp
+		}
+		switch proto {
+		case 6:
+			zp.Tcp++
+		case 17:
+			zp.Udp++
+		case 1, dataplane.ProtoICMPv6:
+			zp.Icmp++
+		default:
+			zp.Other++
+		}
+		zp.Total++
+	}
+
+	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse == 0 {
+			countSession(val.IngressZone, val.EgressZone, key.Protocol)
+		}
+		return true
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
+	}
+	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse == 0 {
+			countSession(val.IngressZone, val.EgressZone, key.Protocol)
+		}
+		return true
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+	}
+
+	result := make([]*pb.ZonePairSessionSummary, 0, len(counts))
+	for _, zp := range counts {
+		result = append(result, zp)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].FromZone != result[j].FromZone {
+			return result[i].FromZone < result[j].FromZone
+		}
+		return result[i].ToZone < result[j].ToZone
+	})
+	return result, nil
+}
+
+// proxyPeerZonePairSummary forwards a zone-pair summary request to the cluster
+// peer, stamping x-peer-forwarded so the peer does not fan back out (#3592).
+// It mirrors proxyPeerSystemAction: a wired peerZonePairSummaryFn (test seam)
+// takes precedence; otherwise it dials the peer only when one is alive,
+// returning (nil, nil) for a standalone node / dead peer so the caller leaves
+// resp.Peer nil without logging a spurious failure.
+func (s *Server) proxyPeerZonePairSummary(ctx context.Context, req *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error) {
+	peerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	peerCtx = metadata.AppendToOutgoingContext(peerCtx, "x-peer-forwarded", "1")
+	if s.peerZonePairSummaryFn != nil {
+		return s.peerZonePairSummaryFn(peerCtx, req)
+	}
+	if s.cluster == nil || !s.cluster.PeerAlive() {
+		return nil, nil
+	}
+	conn, err := s.dialPeer()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return pb.NewBpfrxServiceClient(conn).GetZonePairSummary(peerCtx, req)
 }
 
 func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {

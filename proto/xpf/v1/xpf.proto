@@ -30,6 +30,7 @@ service BpfrxService {
   rpc GetPolicies(GetPoliciesRequest) returns (GetPoliciesResponse);
   rpc GetSessions(GetSessionsRequest) returns (GetSessionsResponse);
   rpc GetSessionSummary(GetSessionSummaryRequest) returns (GetSessionSummaryResponse);
+  rpc GetZonePairSummary(GetZonePairSummaryRequest) returns (GetZonePairSummaryResponse);
   rpc GetNATSource(GetNATSourceRequest) returns (GetNATSourceResponse);
   rpc GetNATDestination(GetNATDestinationRequest) returns (GetNATDestinationResponse);
   rpc GetScreen(GetScreenRequest) returns (GetScreenResponse);
@@ -808,4 +809,30 @@ message MonitorInterfaceRequest {
 }
 message MonitorInterfaceResponse {
   string frame = 1;  // pre-formatted text frame
+}
+
+// GetZonePairSummary aggregates the local session table by (from-zone,
+// to-zone) pair, broken down by protocol class. include_peer fans out to
+// the cluster peer (mirrors GetSessionSummary): the peer leg returns its
+// OWN zone-pair breakdown under `peer`. The peer request is gated by the
+// x-peer-forwarded recursion guard so A->B never recurses back into A.
+// These messages are appended at the end of the file deliberately: inserting
+// them mid-file would renumber every later message's generated msgTypes index
+// and bloat the generated diff with pure churn.
+message GetZonePairSummaryRequest {
+  bool include_peer = 1;  // fetch the cluster peer's zone-pair breakdown too
+}
+message ZonePairSessionSummary {
+  string from_zone = 1;
+  string to_zone = 2;
+  int64 tcp = 3;
+  int64 udp = 4;
+  int64 icmp = 5;
+  int64 other = 6;
+  int64 total = 7;
+}
+message GetZonePairSummaryResponse {
+  repeated ZonePairSessionSummary zone_pairs = 1;
+  int32 node_id = 2;                      // cluster node ID (0, 1, ...)
+  GetZonePairSummaryResponse peer = 3;    // peer node breakdown (nil if standalone)
 }

@@ -26,6 +26,9 @@ type fakeClusterSessionService struct {
 	summaryCalled bool
 	summaryReq    *pb.GetSessionSummaryRequest
 	summaryResp   *pb.GetSessionSummaryResponse
+	zpCalled      bool
+	zpReq         *pb.GetZonePairSummaryRequest
+	zpResp        *pb.GetZonePairSummaryResponse
 }
 
 func (f *fakeClusterSessionService) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
@@ -44,6 +47,12 @@ func (f *fakeClusterSessionService) GetSessionSummary(_ context.Context, req *pb
 	f.summaryCalled = true
 	f.summaryReq = req
 	return f.summaryResp, nil
+}
+
+func (f *fakeClusterSessionService) GetZonePairSummary(_ context.Context, req *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error) {
+	f.zpCalled = true
+	f.zpReq = req
+	return f.zpResp, nil
 }
 
 func decodeClearResult(t *testing.T, body []byte) ClearSessionsResult {
