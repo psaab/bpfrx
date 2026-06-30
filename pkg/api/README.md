@@ -319,6 +319,20 @@ under the daemon's errgroup. Nothing else imports this package.
   CLOSED with HTTP 400, like the gRPC `sessionFilter.validate`). The numeric
   `policy_id`/`ingress_zone`/`egress_zone` fields are retained for
   compatibility. Pinned by `sessions_parity_test.go`.
+- HA scope on the session list/summary (#3423 M5). The REST list and summary
+  report the LOCAL node's table only; previously they carried no node identity
+  and no way to include the peer, so a dashboard polling one node could not
+  tell WHICH node it observed and understated total cluster session state. Both
+  now always carry `node_id` (this node's cluster id, 0 standalone; wired from
+  the daemon via `NodeIDFn` → `cluster.NodeID()`), and both accept
+  `include_peer=true` (a malformed value fails CLOSED with HTTP 400). When set,
+  the handler delegates the PEER fetch to the live gRPC server through the
+  `ClusterSessionFn`/`ClusterSessionService` seam and attaches the peer node's
+  list/summary under a nested `peer` field (mirroring gRPC `GetSessions`/
+  `GetSessionSummary` `include_peer`). Peer is fetched only on the first list
+  page (no `page_token`) — tokens encode node-local map keys. A standalone node
+  or unreachable peer leaves `peer` absent. Pinned by
+  `sessions_ha_scope_3423_test.go`.
 - Session list pagination and the remaining filter dimensions reach gRPC
   parity in #3421, folded into the SAME `sessionQuery` + `sessionView` +
   enriched `sessionEntryV4/V6` machinery above (one filter type, not two).
@@ -341,9 +355,21 @@ under the daemon's errgroup. Nothing else imports this package.
 - Session clear (`POST /api/v1/security/sessions/clear`) clears ALL local
   sessions and accepts NO parameters: a non-empty query string
   (`r.URL.RawQuery`) or request body returns HTTP 400 rather than silently
-  ignoring filter parameters and wiping the whole table (#3421 H6). The
-  gRPC-parity FILTERED clear and HA peer propagation are tracked separately
-  (#3423).
+  ignoring filter parameters and wiping the whole table (#3421 H6).
+- HA fan-out on the clear (#3423 H5). In a chassis cluster the clear MUST also
+  reach the peer: a local-only clear left the peer/synced sessions, which could
+  reappear as active state on failover, with no indication to the operator that
+  the clear was local-only. When the HA-aware session service is wired (the
+  daemon's `ClusterSessionFn` → live gRPC server), the handler now delegates the
+  clear-all to it, sharing the SAME service-layer path gRPC uses: local clear +
+  peer propagation (`clearPeerSessions`, the `x-peer-forwarded` recursion guard)
+  + partial-failure summary. The `ClearSessionsResult` carries `node_id` (which
+  node served it) and `failures`/`failure_summary` — a non-zero `failures` with
+  a `peer clear:` summary means the local clear succeeded but the peer's
+  sessions were NOT cleared. A standalone node (no service wired) falls back to
+  the local-only `ClearAllSessions` — the pre-#3423 behavior. Pinned by
+  `sessions_ha_scope_3423_test.go`. The gRPC-parity FILTERED REST clear (clear a
+  narrowed subset) remains a separate, unimplemented follow-up.
 - `GET /api/v1/security/match` (`matchPoliciesHandler`) is a THIN adapter
   over the single shared policy simulator `pkg/policymatch` (#3042). It only
   validates/parses inputs (400 on a malformed IP/port) and renders the

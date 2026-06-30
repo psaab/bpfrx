@@ -29,12 +29,35 @@ import (
 	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fsatomic"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
+
+// ClusterSessionService is the HA-aware session surface the REST session
+// handlers delegate to so REST and gRPC share ONE cross-node session path
+// (#3423). The daemon wires the live *grpcapi.Server, which clears/queries
+// the LOCAL node AND fans out to the cluster peer over the fabric gRPC
+// link (clearPeerSessions / fetchPeerSessions). All three methods already
+// exist on the gRPC server; REST builds the protobuf request and maps the
+// response back to its JSON types. A nil service (standalone build, or a
+// unit test that does not wire it) makes the REST handlers fall back to
+// LOCAL-ONLY behavior — the pre-#3423 contract.
+type ClusterSessionService interface {
+	// ClearSessions clears all sessions on the local node and, in a
+	// cluster, forwards the clear to the peer, returning per-family counts
+	// plus a partial-failure summary (peer unreachable / peer clear failed).
+	ClearSessions(context.Context, *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error)
+	// GetSessions returns the HA-aware session list; with IncludePeer set it
+	// stamps the peer node's sessions onto the response's Peer field.
+	GetSessions(context.Context, *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error)
+	// GetSessionSummary returns the HA-aware summary; with IncludePeer set it
+	// stamps the peer node's summary onto the response's Peer field.
+	GetSessionSummary(context.Context, *pb.GetSessionSummaryRequest) (*pb.GetSessionSummaryResponse, error)
+}
 
 // CompileHealthSnapshot mirrors daemon.CompileHealth without the import.
 // Keeping pkg/api -> pkg/daemon free of a back-edge preserves the layered
@@ -175,6 +198,16 @@ type Config struct {
 	// IsLocalPrimary(0)). Optional; if nil the session view reports
 	// ha_active=true (the standalone default).
 	HAActiveFn func() bool
+	// NodeIDFn returns this node's cluster id (0 standalone), stamped on the
+	// REST session list/summary/clear responses so an operator knows WHICH
+	// node a result came from (#3423 M5). Optional; if nil node_id reports 0.
+	NodeIDFn func() int
+	// ClusterSessionFn returns the HA-aware session service (the live gRPC
+	// server) so the REST clear/list/summary handlers share the gRPC peer
+	// fan-out path (#3423). It is resolved lazily, at request time, so the
+	// daemon can wire a gRPC server constructed AFTER the REST server.
+	// Optional; if nil (or it returns nil) the handlers stay local-only.
+	ClusterSessionFn func() ClusterSessionService
 }
 
 // Server is the HTTP API server.
@@ -207,6 +240,8 @@ type Server struct {
 	feedOverlayFn             func() map[string][]string
 	policySchedActiveFn       func() (map[string]bool, bool)
 	haActiveFn                func() bool
+	nodeIDFn                  func() int
+	clusterSessionFn          func() ClusterSessionService
 	startTime                 time.Time
 }
 
@@ -239,6 +274,8 @@ func NewServer(cfg Config) *Server {
 		feedOverlayFn:             cfg.FeedOverlayFn,
 		policySchedActiveFn:       cfg.PolicySchedulerActiveStateFn,
 		haActiveFn:                cfg.HAActiveFn,
+		nodeIDFn:                  cfg.NodeIDFn,
+		clusterSessionFn:          cfg.ClusterSessionFn,
 		startTime:                 time.Now(),
 	}
 

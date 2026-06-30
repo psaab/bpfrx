@@ -1308,6 +1308,30 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return d.cluster.IsLocalPrimary(0)
 			},
+			// #3423 M5: stamp this node's cluster id on the REST session
+			// list/summary/clear responses so a dashboard knows WHICH node it
+			// observed. Standalone (no cluster) reports node 0.
+			NodeIDFn: func() int {
+				if d.cluster == nil {
+					return 0
+				}
+				return d.cluster.NodeID()
+			},
+			// #3423 H5/M5: hand the REST session handlers the live gRPC
+			// server, which is HA-aware — its ClearSessions fans out the
+			// clear to the cluster peer (clearPeerSessions, x-peer-forwarded
+			// recursion guard) and its GetSessions/GetSessionSummary stamp the
+			// peer's table when include_peer is set. Resolved lazily so the
+			// closure can reference the gRPC server constructed below this
+			// block; guarded so a nil server resolves to a nil interface (not
+			// a non-nil typed-nil), keeping REST local-only until the gRPC
+			// server is up.
+			ClusterSessionFn: func() api.ClusterSessionService {
+				if d.grpcSrv == nil {
+					return nil
+				}
+				return d.grpcSrv
+			},
 		}
 		// Resolve interface bindings from web-management config
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&

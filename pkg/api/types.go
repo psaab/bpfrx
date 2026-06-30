@@ -246,6 +246,17 @@ type SessionListResponse struct {
 	PageSize      int            `json:"page_size,omitempty"`
 	NextPageToken string         `json:"next_page_token,omitempty"`
 	Sessions      []SessionEntry `json:"sessions"`
+	// NodeID is the cluster node this list was observed on (0 standalone),
+	// mirroring the gRPC GetSessionsResponse.node_id. It is always present
+	// so a dashboard polling one node knows WHICH node's table it sees —
+	// the REST list reports the LOCAL table only (#3423 M5).
+	NodeID int `json:"node_id"`
+	// Peer carries the cluster peer's sessions when the request set
+	// include_peer=true and this node is in an HA cluster with a reachable
+	// peer (#3423 M5). Nil for a standalone node, an unreachable peer, or a
+	// request that did not opt in. The local list above understates total
+	// HA state without it.
+	Peer *SessionListResponse `json:"peer,omitempty"`
 }
 
 // SessionSummary holds session table summary stats.
@@ -257,6 +268,11 @@ type SessionSummary struct {
 	IPv6Sessions int `json:"ipv6_sessions"`
 	SNATSessions int `json:"snat_sessions"`
 	DNATSessions int `json:"dnat_sessions"`
+	// NodeID / Peer mirror SessionListResponse (#3423 M5): node identity is
+	// always present; Peer carries the cluster peer's summary when
+	// include_peer=true and a reachable peer exists.
+	NodeID int             `json:"node_id"`
+	Peer   *SessionSummary `json:"peer,omitempty"`
 }
 
 // EventEntry holds a single event record. The forensic fields below the
@@ -430,9 +446,24 @@ type MatchPoliciesResult struct {
 }
 
 // ClearSessionsResult holds session clear results.
+//
+// In an HA cluster the REST clear fans out to the peer (the same
+// service-layer clear gRPC uses), so the counts above are the LOCAL node's
+// and the peer-clear outcome is surfaced via Failures/FailureSummary
+// (#3423 H5). A non-zero Failures with a "peer clear:" FailureSummary means
+// the local clear succeeded but the peer's sessions were NOT cleared and
+// can reappear as active state on failover. NodeID identifies the node the
+// request hit.
 type ClearSessionsResult struct {
 	IPv4Cleared int `json:"ipv4_cleared"`
 	IPv6Cleared int `json:"ipv6_cleared"`
+	// NodeID is the cluster node that served the clear (0 standalone).
+	NodeID int `json:"node_id"`
+	// Failures counts sub-operations (notably the HA peer clear) that
+	// failed; FailureSummary describes them. Zero on a clean standalone or
+	// cluster-wide clear.
+	Failures       int    `json:"failures"`
+	FailureSummary string `json:"failure_summary,omitempty"`
 }
 
 // DHCPClientIdentifierInfo holds DHCP client identifier information.
