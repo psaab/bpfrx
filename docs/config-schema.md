@@ -940,7 +940,12 @@ reserved for whole-dataplane selection where a rewrite shim
     member NESTED in an address-set stays poisoned by the static resolver
     (the anti-Option-C guardrail). Lenient load / peer-sync downgrades to a
     warning so an already-persisted or peer-synced config still boots
-    (#1960); the dataplane fails closed independently.
+    (#1960); the dataplane fails closed independently. **#3418** — the
+    feed carve-out is now pinned through the full `CompileConfig` strict
+    commit path for ALL FOUR SNAT/DNAT source/destination address-name
+    combinations (the #3303 snapshot tests call the builder directly and
+    bypass the strict validator, which is how the over-reject survived for
+    the three combinations the #3425 SNAT-source test did not cover).
   - `protocols router-advertisement interface` — typed the
     second-denominated leaves (`max/min-advertisement-interval`,
     `default-lifetime`, `link-mtu`; the latter was tightened from
