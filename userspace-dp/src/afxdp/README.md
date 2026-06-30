@@ -213,6 +213,38 @@ sync.
     counters, scan/sweep, SYN-cookie) stay gated on the flow-present path
     and are unchanged. A truncated/unparseable header fails CLOSED (drop),
     matching the flow path (`#2146`).
+  - **#3291 — zone policy / input filter / PBR on the flowless TRANSIT
+    arm:** #3064 restored only the *screen* engine on the flowless path;
+    zone security policy, the interface input filter, and firewall-filter
+    PBR (`then routing-instance`) still ran ONLY inside the
+    `if let Some(flow)` arms, so a non-first fragment (or any flowless,
+    no-L4 transit packet) was forwarded the moment a route existed — a
+    `deny-all` zone pair, a `from is-fragment then discard` filter, and a
+    `from is-fragment then routing-instance <ri>` PBR term all silently
+    no-op'd (fail-OPEN). The flowless `else` arm of
+    `poll_binding_process_descriptor` now builds a synthetic L3-only
+    `SessionFlow` (`frame::l3_session_flow_from_meta`, ports forced to 0,
+    NEVER inserted into any session index) and runs, in the same order as
+    the flow-backed session-miss arm: (1) `evaluate_non_pbr_input_filter`
+    (the frame `TermMatchExtra` carries `is_fragment` + `l4_present = false`,
+    so an `is-fragment` term matches while tcp-flags / icmp-type / flex
+    predicates fail closed); (2) `ingress_route_table_override` PBR, then a
+    route lookup against the override table when a PBR term matched;
+    (3) zone policy via `evaluate_policy_result_l3_aware(.., l4_present =
+    false)` — gated to `ForwardCandidate` (transit) so host-inbound
+    (#3292) / NoRoute / MissingNeighbor / fabric arms are untouched. A
+    non-Permit verdict is a SILENT drop (a fragment has no L4 header to
+    synthesize a TCP RST / reject from) plus a `PolicyDeny` event. The
+    `l4_present = false` flag makes PORT-BEARING application/filter terms
+    fail closed (a flowless packet's port 0 can never confirm an
+    `application junos-http` or a `destination-port 80` term), while
+    `application any` / address / protocol / `is-fragment` terms still
+    match — so legitimately-permitted flowless forwarding survives. KNOWN
+    LIMITATION: a flow PERMITTED only by an L4-specific term (e.g.
+    `application junos-https`) has its non-first fragments fall to the
+    default policy (fail-closed drop) until the deferred
+    fragment-association-cache stage of the #3291 plan carries the first
+    fragment's verdict; tracked as the deferred fragment-association-cache stage of #3291.
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
   `headers.rs` holds the consolidated outer-header serializers (#1440).

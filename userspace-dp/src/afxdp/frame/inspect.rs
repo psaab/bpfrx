@@ -1543,6 +1543,52 @@ pub(in crate::afxdp) fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> O
     })
 }
 
+/// #3291: build an L3-only [`SessionFlow`] (ports forced to 0) from the
+/// shim-stamped `meta` L3 addresses, for the flowless transit enforcement gate.
+///
+/// A non-first fragment / no-L4 transit packet carries L3 identity
+/// (src/dst/protocol) but NO L4 header (#2344: its post-IP bytes are payload,
+/// never ports). The returned flow therefore has `src_port = dst_port = 0`;
+/// callers MUST treat it as L4-absent (`l4_present = false`) so port-bearing
+/// policy / filter terms fail CLOSED, and MUST NEVER insert it into any session
+/// index — it exists only to drive zone-policy / input-filter / PBR evaluation
+/// and the deny/log records. Returns `None` when the meta carries no usable L3
+/// address (unspecified or non-IP family), in which case the caller leaves the
+/// packet's existing (resolve-only) flowless behavior unchanged.
+pub(in crate::afxdp) fn l3_session_flow_from_meta(meta: UserspaceDpMeta) -> Option<SessionFlow> {
+    let (src_ip, dst_ip) = match meta.addr_family as i32 {
+        libc::AF_INET => {
+            let src = meta.flow_src_addr.get(..4)?;
+            let dst = meta.flow_dst_addr.get(..4)?;
+            (
+                IpAddr::V4(Ipv4Addr::new(src[0], src[1], src[2], src[3])),
+                IpAddr::V4(Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3])),
+            )
+        }
+        libc::AF_INET6 => (
+            IpAddr::V6(Ipv6Addr::from(meta.flow_src_addr)),
+            IpAddr::V6(Ipv6Addr::from(meta.flow_dst_addr)),
+        ),
+        _ => return None,
+    };
+    if src_ip.is_unspecified() || dst_ip.is_unspecified() {
+        return None;
+    }
+    Some(SessionFlow {
+        src_ip,
+        dst_ip,
+        forward_key: SessionKey {
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            src_ip,
+            dst_ip,
+            // #3291: NO L4 ports — a flowless packet's L4 header is absent.
+            src_port: 0,
+            dst_port: 0,
+        },
+    })
+}
+
 pub(in crate::afxdp) fn parse_ipv4_session_flow_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,

@@ -4828,13 +4828,13 @@ fn app_term_range_listed_before_exact_wins() {
     let apps = vec![range_app(80, 90, Some(200)), exact_app(80, Some(100))];
     let compiled = CompiledApplications::from_matches(&apps);
     assert_eq!(
-        compiled.matches(PROTO_TCP, 12345, 80, None),
+        compiled.matches(PROTO_TCP, 12345, 80, None, true),
         Some(Some(200)),
         "range term listed first must win the timeout for a port both match"
     );
     // Port 85: only the range matches → 200 regardless of order.
     assert_eq!(
-        compiled.matches(PROTO_TCP, 12345, 85, None),
+        compiled.matches(PROTO_TCP, 12345, 85, None, true),
         Some(Some(200))
     );
 }
@@ -4847,13 +4847,13 @@ fn app_term_exact_listed_before_range_wins() {
     let apps = vec![exact_app(80, Some(100)), range_app(80, 90, Some(200))];
     let compiled = CompiledApplications::from_matches(&apps);
     assert_eq!(
-        compiled.matches(PROTO_TCP, 12345, 80, None),
+        compiled.matches(PROTO_TCP, 12345, 80, None, true),
         Some(Some(100)),
         "exact term listed first must win the timeout for a port both match"
     );
     // Port 85: only the range matches → 200.
     assert_eq!(
-        compiled.matches(PROTO_TCP, 12345, 85, None),
+        compiled.matches(PROTO_TCP, 12345, 85, None, true),
         Some(Some(200))
     );
 }
@@ -4883,14 +4883,14 @@ fn app_term_icmp_constrained_before_all_icmp_wins() {
     };
     let compiled = CompiledApplications::from_matches(&vec![ping.clone(), icmp_all.clone()]);
     assert_eq!(
-        compiled.matches(PROTO_ICMP, 0, 0, Some((8, 0))),
+        compiled.matches(PROTO_ICMP, 0, 0, Some((8, 0)), true),
         Some(Some(11)),
         "icmp-type-constrained term listed first must win for an echo packet"
     );
     // Reverse order: junos-icmp-all first → its timeout (22) wins.
     let compiled_rev = CompiledApplications::from_matches(&vec![icmp_all, ping]);
     assert_eq!(
-        compiled_rev.matches(PROTO_ICMP, 0, 0, Some((8, 0))),
+        compiled_rev.matches(PROTO_ICMP, 0, 0, Some((8, 0)), true),
         Some(Some(22)),
         "all-icmp term listed first must win for an echo packet"
     );

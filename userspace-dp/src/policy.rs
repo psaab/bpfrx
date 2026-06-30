@@ -1397,6 +1397,16 @@ impl CompiledApplications {
     /// rule is byte-identical to today. The boolean "does the rule apply?"
     /// verdict (`Some` vs `None`) is unchanged — only WHICH matched term's
     /// timeout is returned.
+    /// #3291: `l4_present` is `false` for a flowless / no-L4 packet (a non-first
+    /// fragment, whose post-IP bytes are payload — #2344). With no L4 header the
+    /// caller cannot supply real ports (`src_port`/`dst_port` are 0), so a
+    /// PORT-BEARING application term MUST fail closed (it can neither be
+    /// confirmed nor allowed to spuriously match `port == 0`, e.g. a custom
+    /// `destination-port 0-1023` range). A PROTOCOL-ONLY term (empty port
+    /// ranges, e.g. an `application any`-of-this-protocol alias / junos-icmp-all)
+    /// still matches on the known protocol so legitimately-permitted protocol/
+    /// address policy keeps forwarding the fragment. Every flow-backed caller
+    /// passes `l4_present = true`, so the L4 path is byte-identical to before.
     #[inline]
     fn matches(
         &self,
@@ -1404,6 +1414,7 @@ impl CompiledApplications {
         src_port: u16,
         dst_port: u16,
         packet_icmp: Option<(u8, u8)>,
+        l4_present: bool,
     ) -> Option<Option<u32>> {
         if self.match_any {
             return Some(None);
@@ -1413,15 +1424,28 @@ impl CompiledApplications {
         // `best` holds `(order, timeout)`; a smaller order wins (first listed).
         let mut best: Option<(u32, Option<u32>)> = None;
         // Exact dst-port term — O(1) accelerator for the common single-port case.
-        if let Some(&(order, timeout)) = terms.exact_dst_ports.get(&dst_port) {
-            best = Some((order, timeout));
+        // #3291: a known L4 port is required; a flowless packet (port 0) never
+        // matches a port-specific term.
+        if l4_present {
+            if let Some(&(order, timeout)) = terms.exact_dst_ports.get(&dst_port) {
+                best = Some((order, timeout));
+            }
         }
         // Range terms (an unconstrained ICMP term, e.g. junos-icmp-all, lives
         // here as an empty-range entry → match-all). Pushed in config order, so
         // the first match in the vector is the lowest-order matching range.
+        // #3291: an empty-range (protocol-only) term matches regardless of L4
+        // presence — we know the protocol; a port-bearing range requires a known
+        // L4 port and so fails closed for a flowless packet.
         if let Some(&(order, _, _, timeout)) = terms.range_terms.iter().find(
             |(_, src_ranges, dst_ranges, _)| {
-                port_ranges_match(src_ranges, src_port) && port_ranges_match(dst_ranges, dst_port)
+                if src_ranges.is_empty() && dst_ranges.is_empty() {
+                    true
+                } else {
+                    l4_present
+                        && port_ranges_match(src_ranges, src_port)
+                        && port_ranges_match(dst_ranges, dst_port)
+                }
             },
         ) {
             if best.map_or(true, |(b, _)| order < b) {
@@ -2422,6 +2446,38 @@ pub(crate) fn evaluate_policy_result_with_icmp(
     packet_icmp: Option<(u8, u8)>,
     packet_len: u64,
 ) -> PolicyEvaluationResult {
+    // Flow-backed callers always carry a real L4 header (the 5-tuple ports are
+    // authoritative), so delegate with `l4_present = true` — byte-identical to
+    // the pre-#3291 behavior.
+    evaluate_policy_result_l3_aware(
+        state, from_id, to_id, src_ip, dst_ip, protocol, src_port, dst_port, packet_icmp,
+        packet_len, true,
+    )
+}
+
+/// #3291: L4-presence-aware policy evaluation. `l4_present = false` marks a
+/// flowless / no-L4 packet (a non-first IPv4/IPv6 fragment, #2344) whose post-IP
+/// bytes are payload, so `src_port`/`dst_port` are 0 and MUST NOT be trusted:
+/// port-bearing application terms fail closed (`try_match_rule` → `matches`),
+/// while address/protocol/`any` terms still evaluate on the L3 identity the
+/// fragment does carry. This is the zone-policy half of the flowless transit
+/// enforcement gate (the input-filter and PBR halves live in the forwarding
+/// path). The synthetic L3 tuple this is called with is used ONLY for evaluation
+/// + logging and is NEVER installed as a session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_policy_result_l3_aware(
+    state: &PolicyState,
+    from_id: u16,
+    to_id: u16,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
+    packet_len: u64,
+    l4_present: bool,
+) -> PolicyEvaluationResult {
     // #3110: zone id 0 is the reserved "unknown / no zone" sentinel
     // (assigned to interfaces not bound to any security zone, and to the
     // over-cap-zone collapse-to-0 path, #2391). A flow whose ingress OR
@@ -2448,6 +2504,7 @@ pub(crate) fn evaluate_policy_result_with_icmp(
                     dst_port,
                     packet_icmp,
                     packet_len,
+                    l4_present,
                 ) {
                     // #3073: 1-based handle so the fast path can re-count
                     // every packet of this flow against the same counter.
@@ -2507,6 +2564,7 @@ pub(crate) fn evaluate_policy_result_with_icmp(
                 dst_port,
                 packet_icmp,
                 packet_len,
+                l4_present,
             ) {
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
                 return result;
@@ -2523,6 +2581,7 @@ pub(crate) fn evaluate_policy_result_with_icmp(
                 dst_port,
                 packet_icmp,
                 packet_len,
+                l4_present,
             ) {
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
                 return result;
@@ -2554,6 +2613,7 @@ pub(crate) fn evaluate_policy_result_with_icmp(
                 dst_port,
                 packet_icmp,
                 packet_len,
+                l4_present,
             ) {
                 // #3073: 1-based handle (see zone-pair branch above).
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
@@ -2670,6 +2730,9 @@ pub(crate) fn evaluate_junos_host_policy(
                 dst_port,
                 packet_icmp,
                 packet_len,
+                // Host-bound (junos-host) traffic always carries a real L4
+                // header on the current call paths.
+                true,
             ) {
                 // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
@@ -2699,6 +2762,9 @@ pub(crate) fn evaluate_junos_host_policy(
                 dst_port,
                 packet_icmp,
                 packet_len,
+                // Host-bound (junos-host) traffic always carries a real L4
+                // header on the current call paths.
+                true,
             ) {
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
                 return Some(result);
@@ -2723,15 +2789,18 @@ fn try_match_rule(
     dst_port: u16,
     packet_icmp: Option<(u8, u8)>,
     packet_len: u64,
+    l4_present: bool,
 ) -> Option<PolicyEvaluationResult> {
     if rule.inactive {
         return None;
     }
     // #3227: `matches` now returns the matched application term's optional
     // inactivity timeout (`None` outer = no app match → rule does not apply).
-    let app_inactivity_timeout = rule
-        .compiled_apps
-        .matches(protocol, src_port, dst_port, packet_icmp)?;
+    // #3291: `l4_present` fails port-bearing application terms closed for a
+    // flowless / no-L4 packet (a non-first fragment) — see `matches`.
+    let app_inactivity_timeout =
+        rule.compiled_apps
+            .matches(protocol, src_port, dst_port, packet_icmp, l4_present)?;
     // #2008 H2: when a side is `*-excluded`, the rule matches every
     // address EXCEPT those in the configured set, so the match-any
     // short-circuit must NOT apply (it would always-match and the

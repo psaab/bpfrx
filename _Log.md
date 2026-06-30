@@ -1,3 +1,51 @@
+## 2026-06-30 — #3291 flowless / non-first-fragment transit policy + input-filter + PBR enforcement
+
+- **Timestamp**: 2026-06-30
+  - **Action**: #3291 — closed the fail-OPEN where the flowless transit arm
+    of `poll_binding_process_descriptor` forwarded a non-first fragment (or
+    any flowless / no-L4 transit packet) the moment a route existed, with NO
+    zone security policy, NO interface input filter, and NO firewall-filter
+    PBR (`then routing-instance`). #2344 made non-first fragments flowless
+    (payload bytes are never read as L4 ports) and #3064 restored only the
+    *screen* engine on that path; policy/filter/PBR still ran exclusively
+    inside the `if let Some(flow)` arms, so a `deny-all` zone pair, a
+    `from is-fragment then discard` filter, and a `from is-fragment then
+    routing-instance <ri>` PBR term all silently no-op'd on fragments.
+    FIX: the flowless `else` arm now builds a synthetic L3-only `SessionFlow`
+    (`frame::l3_session_flow_from_meta`, ports forced to 0, NEVER inserted
+    into any session index) and runs, in the same order as the flow-backed
+    session-miss arm: (1) `evaluate_non_pbr_input_filter` (the frame
+    `TermMatchExtra` carries `is_fragment` + `l4_present=false`, so an
+    is-fragment term matches while tcp-flags/icmp/flex predicates fail
+    closed); (2) `ingress_route_table_override` PBR + a route lookup against
+    the override table when a PBR term matched; (3) zone policy via the new
+    `policy::evaluate_policy_result_l3_aware(.., l4_present=false)` — gated to
+    `ForwardingDisposition::ForwardCandidate` (transit) so host-inbound
+    (#3292) / NoRoute / MissingNeighbor / fabric arms are untouched. A
+    non-Permit verdict is a SILENT drop (a fragment has no L4 header to RST)
+    plus a `PolicyDeny` event. The new `l4_present` flag threads through
+    `evaluate_policy_result_with_icmp` → `try_match_rule` →
+    `CompiledApplications::matches`: PORT-BEARING application terms fail
+    closed for a flowless packet (port 0 never confirms `junos-http`/a
+    `destination-port` range) while `application any` / address / protocol /
+    protocol-only (empty-range) terms still match, so legitimately-permitted
+    flowless forwarding survives. KNOWN LIMITATION (documented): a flow
+    permitted ONLY by an L4-specific term drops its non-first fragments until
+    the deferred fragment-association-cache stage of the #3291 plan. Every
+    pre-existing `evaluate_policy_result_with_icmp` caller is byte-identical
+    (delegates with `l4_present=true`). RED-on-revert proven (temp `l3_ctx =
+    None`): the deny / is-fragment-discard / PBR-routing-instance tests flip
+    from drop back to forward; the `application any` permit test stays green
+    (no over-gating). Full `cargo test --release` green (3297 lib + all
+    integration binaries).
+  - **File(s)**: userspace-dp/src/policy.rs,
+    userspace-dp/src/policy_tests.rs,
+    userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/tests.rs,
+    userspace-dp/src/afxdp/README.md, docs/feature-gaps.md, _Log.md
+
 ## 2026-06-29 — #3457 fix 4 red/flaky userspace-dp tests (forwarding zone gate + 2 timing flakes)
 
 - **Timestamp**: 2026-06-29
