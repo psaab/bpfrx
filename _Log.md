@@ -24092,3 +24092,34 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3344 — `show security screen-statistics all` no longer silently drops a zone whose flood-counter read fails. The #3408 fix added a trailing aggregate warning but kept the `continue`, so the failing zone vanished from the per-zone listing and the warning could not name WHICH zone was degraded — a fail-open operator diagnostic exactly when explicit degradation is needed. Both the local-CLI path (showScreenStatisticsAll, cli_show_security_screen.go) and the gRPC ShowText path (server_show_security_text.go) now emit a per-zone error row ("Screen statistics for zone 'X':" + "  Error reading flood counters: <err>") for the failing zone, preserving it in the listing and matching the single-zone error wording, while retaining the #3408 trailing aggregate warning. RED-on-revert: one-good-zone + one-read-error-zone tests on both surfaces assert the good zone renders, the failing zone appears with an inline error row, and the aggregate warning still prints; restoring the bare `continue` drops the failing zone's header → RED (verified by reverting both edits). go test ./pkg/cli ./pkg/grpcapi ./pkg/config green; gofmt clean; go vet clean (pre-existing cli.go:503 unreachable-code warning unrelated).
   - **File(s)**: pkg/cli/cli_show_security_screen.go, pkg/cli/show_security_counter_error_test.go, pkg/grpcapi/server_show_security_text.go, pkg/grpcapi/text_filter_flood_counter_error_test.go, _Log.md
+- **Timestamp**: 2026-06-29
+  - **Action**: #3358 — the synthetic zone-local compiler token leaked into
+    operator policy-detail output. A zone-local address book (#3061) is folded
+    into the global book at compile time under an internal key
+    `zone-local/<zone>/<name>` (zoneLocalQualify, compiler_security.go); the
+    detail/inventory surfaces printed that token verbatim and the CLI detail even
+    labelled it `(global)` — so an operator saw `zone-local/trust/web(global)`
+    instead of the authored name `web`, mislabelling a zone-scoped object as
+    global. Fix: added `config.ZoneLocalUnqualify` (inverse of zoneLocalQualify,
+    unambiguous because validateAddressBookEntryNamesStrict forbids `/` in any
+    operator name) + `DisplayAddressName`/`DisplayAddressNames` helpers, and
+    applied them across all five security-policy match-address display sites:
+    CLI detail (`printPolicyMatchAddresses` → `web(zone trust): <cidr>`), the CLI
+    standard `show security policies` view (joinDisplayAddressNames), the gRPC
+    `show security policies` text render (server_show_policies_text.go), and the
+    REST + gRPC structured inventories (security.go / server_show_zones.go →
+    bare authored name; DisplayAddressNames returns a NEW slice so the live
+    compiled config is never mutated, nil→nil preserved). CIDR resolution still
+    keys off the qualified global-book token. RED-on-revert proven: reverted the
+    five display sites to origin/master (keeping helpers+tests) →
+    Test_3358_PolicyDetailUnqualifiesZoneLocalName,
+    TestGetPoliciesUnqualifiesZoneLocalNames,
+    TestShowPoliciesDetailTextUnqualifiesZoneLocalNames,
+    TestPoliciesHandlerUnqualifiesZoneLocalNames all RED; restored → GREEN.
+    Controls (global-book name renders `(global)` / passes through unchanged) and
+    the config helper unit tests stay green. go test ./pkg/config ./pkg/cli
+    ./pkg/policymatch ./pkg/grpcapi ./pkg/api green; gofmt clean; go vet clean
+    (pre-existing cli.go:503 unreachable-code warning unrelated). Docs:
+    docs/junos-cli-reference.md (policy-detail format) + docs/config-schema.md
+    (#3061 section operator-display note).
+  - **File(s)**: pkg/config/compiler_security.go, pkg/config/zone_local_unqualify_3358_test.go, pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go, pkg/cli/cli_show_security_zone_local_3358_test.go, pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_zone_local_3358_test.go, pkg/api/security.go, pkg/api/security_zone_local_3358_test.go, docs/junos-cli-reference.md, docs/config-schema.md, _Log.md

@@ -551,6 +551,16 @@ Policy: log-control4, action-type: permit, services-offload:not-configured , Sta
 - **Policy fields:** 2-space indent.
 - **Address entries:** 4-space indent. Format: `<name>(global): <prefix> ` (trailing space).
   - `(global)` suffix for global address-book entries.
+  - **Zone-local address books (#3358 / #3061):** a name defined in a zone's
+    local `address-book` is folded into the global book at compile time under
+    an internal synthetic key `zone-local/<zone>/<name>`. The detail view
+    unqualifies that key back to the authored name and labels its zone scope:
+    `web(zone trust): 10.0.1.100/32`. The internal `zone-local/...` token never
+    leaks to operator output, and a zone-scoped address is no longer mislabelled
+    `(global)`. The REST (`GET /api/v1/security/policies`) and gRPC
+    (`GetPolicies`) inventories, and the gRPC `show security policies` text
+    surface, likewise expose the authored name (e.g. `web`, not
+    `zone-local/trust/web`); the zone is implied by the rule's from/to-zone.
   - **Match inversion (#3336):** when a policy sets
     `source-address-excluded` / `destination-address-excluded`, the
     address header is annotated `Source addresses (except):` /

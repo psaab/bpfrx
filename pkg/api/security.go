@@ -153,11 +153,14 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				continue
 			}
 			pr := PolicyRule{
-				Name:         rule.Name,
-				Description:  rule.Description,
-				Action:       policyActionStr(rule.Action),
-				SrcAddresses: rule.Match.SourceAddresses,
-				DstAddresses: rule.Match.DestinationAddresses,
+				Name:        rule.Name,
+				Description: rule.Description,
+				Action:      policyActionStr(rule.Action),
+				// #3358: unqualify synthetic zone-local keys (#3061) so the
+				// inventory exposes the authored book name, not the internal
+				// compiler token. DisplayAddressNames returns a new slice.
+				SrcAddresses: config.DisplayAddressNames(rule.Match.SourceAddresses),
+				DstAddresses: config.DisplayAddressNames(rule.Match.DestinationAddresses),
 				Applications: rule.Match.Applications,
 				Log:          rule.Log != nil,
 				Count:        rule.Count,
@@ -230,11 +233,14 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				continue
 			}
 			pr := PolicyRule{
-				Name:         rule.Name,
-				Description:  rule.Description,
-				Action:       policyActionStr(rule.Action),
-				SrcAddresses: rule.Match.SourceAddresses,
-				DstAddresses: rule.Match.DestinationAddresses,
+				Name:        rule.Name,
+				Description: rule.Description,
+				Action:      policyActionStr(rule.Action),
+				// #3358: unqualify synthetic zone-local keys (#3061) so the
+				// inventory exposes the authored book name, not the internal
+				// compiler token. DisplayAddressNames returns a new slice.
+				SrcAddresses: config.DisplayAddressNames(rule.Match.SourceAddresses),
+				DstAddresses: config.DisplayAddressNames(rule.Match.DestinationAddresses),
 				Applications: rule.Match.Applications,
 				Log:          rule.Log != nil,
 				Count:        rule.Count,

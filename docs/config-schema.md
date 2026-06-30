@@ -2075,6 +2075,25 @@ scoped to security-policy match addresses. Regression coverage:
 `TestAddressBookNameSlashNormalConfigUnaffected` — prefix-value anti-over-reject,
 `TestAddressBookNameSlashLenientDowngrades` — tolerant-path warning).
 
+**Operator display (#3358).** The synthetic `zone-local/<zone>/<name>` key is an
+INTERNAL identity, never an operator-facing string. The display surfaces that
+render a policy's match addresses unqualify it back to the authored name via
+`config.ZoneLocalUnqualify` / `config.DisplayAddressName(s)` (the inverse of
+`zoneLocalQualify`, unambiguous because no operator name contains `/`): the CLI
+`show security policies detail` renders `web(zone trust): <prefix>` (NOT the old
+`zone-local/trust/web(global)` — a zone-scoped object must not be mislabelled
+`(global)`), the gRPC `show security policies` text shows `web (<prefix>)`, and
+the REST (`GET /api/v1/security/policies`) + gRPC (`GetPolicies`) inventories
+list the bare authored name (`web`), with the zone implied by the rule's
+from/to-zone. CIDR resolution still keys off the qualified token (it is the
+global-book key). Regression coverage:
+`pkg/config/zone_local_unqualify_3358_test.go` (helper round-trip + no-op
+fall-through + non-mutation),
+`pkg/cli/cli_show_security_zone_local_3358_test.go` (detail view, source +
+destination, with a global-name control),
+`pkg/grpcapi/server_show_policies_zone_local_3358_test.go` (GetPolicies + text),
+and `pkg/api/security_zone_local_3358_test.go` (REST inventory).
+
 ### #2399 — firewall-filter unknown `then` action + unsupported `from protocol` (commit fail-closed)
 
 Two fail-OPEN behaviors in the firewall-filter compiler, both now rejected
