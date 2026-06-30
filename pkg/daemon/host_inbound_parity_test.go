@@ -83,6 +83,29 @@ func TestHostInboundNftMatchesKnownTokens(t *testing.T) {
 	}
 }
 
+// TestHostInboundIdentResetIsReject is the #3310 cross-layer parity guard at
+// the SSOT level: `system-services ident-reset` must carry the
+// `reject with tcp reset` nft verdict, and EVERY other recognized service must
+// carry the plain `accept` verdict. This is where the split-brain concern lives
+// (a future revert to a plain admit of TCP/113 re-opens the port), so the check
+// sits beside the token-set parity test. Fail-on-revert: change
+// hostInboundServiceAction("ident-reset") back to accept and the first
+// assertion goes RED; accidentally make another service a reject and the loop
+// catches it.
+func TestHostInboundIdentResetIsReject(t *testing.T) {
+	if got := hostInboundServiceAction("ident-reset"); got != hostInboundReject {
+		t.Errorf("ident-reset must use %q (Junos actively resets ident/TCP-113), got %q", hostInboundReject, got)
+	}
+	for tok := range config.KnownHostInboundSystemServices {
+		if tok == "ident-reset" {
+			continue
+		}
+		if got := hostInboundServiceAction(tok); got != hostInboundAccept {
+			t.Errorf("system-service %q must be a plain %q verdict, got %q (only ident-reset resets)", tok, hostInboundAccept, got)
+		}
+	}
+}
+
 // TestHostInboundBfdAdmitsMultiHop asserts the nft host-inbound rule for
 // `protocols bfd` admits multi-hop BFD control (UDP 4784, RFC 5883) in addition
 // to single-hop control (3784) + echo (3785). Operators running BFD-assisted
