@@ -11,6 +11,12 @@ use super::super::*;
 /// (interfaces addresses pass, interfaces egress pass,
 /// `parse_policy_state_with_counters`).
 pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingState) {
+    // #3402: build the name→id map from the shared SSOT so the apply-time
+    // integrity preflight (which has no live forwarding state yet) resolves
+    // policy zones against the IDENTICAL validated map this build path uses.
+    // The loop below only fills the id-keyed maps (zone_id_to_name /
+    // host-inbound / tcp-rst) and emits the #919/#922 skip diagnostics.
+    state.zone_name_to_id = crate::policy::zone_name_to_id_from_snapshot(&snapshot.zones);
     for zone in &snapshot.zones {
         if zone.id == 0 || zone.name.is_empty() {
             continue;
@@ -40,7 +46,7 @@ pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingSt
             );
             continue;
         }
-        state.zone_name_to_id.insert(zone.name.clone(), zone.id);
+        // zone_name_to_id is populated above by the shared SSOT helper.
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
         // #3070: build the host-inbound admission set for zones that declared a
         // `host-inbound-traffic` stanza, keyed by the SAME validated id. Zones
