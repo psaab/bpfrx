@@ -499,14 +499,22 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	// #3104: thread live per-scheduler active-state so the simulator skips a
 	// scheduler-inactive policy exactly like the runtime (policy.rs
 	// try_match_rule), falling through to the next active rule / default-policy.
-	// When the daemon has not wired the accessor or state is unavailable, the
-	// closure stays nil and scheduled policies are simulated as-if-active.
-	var inactiveFn func(string) bool
+	//
+	// #3414: always bind a non-nil predicate so the unavailable-state path
+	// fails the SAME direction as the dataplane. When the accessor is not
+	// wired or returns ok=false (early boot / NoDataplane), schedState is nil,
+	// and PolicyInactiveFn(nil) treats every scheduler-bound policy as inactive
+	// — exactly as the snapshot builder does (policyRuleInactive: nil map =>
+	// dropped) until live state arrives. Previously the closure stayed nil and
+	// scheduled policies were simulated as-if-active, so the REST diagnostic
+	// could certify a permit/deny the dataplane actually skips (#3414). A
+	// NON-scheduled policy (empty scheduler name) is unaffected: PolicyInactiveFn
+	// returns false for it regardless of the (possibly nil) state map.
+	var schedState map[string]bool
 	if s.policySchedActiveFn != nil {
-		if state, ok := s.policySchedActiveFn(); ok {
-			inactiveFn = dpuserspace.PolicyInactiveFn(state)
-		}
+		schedState, _ = s.policySchedActiveFn()
 	}
+	inactiveFn := dpuserspace.PolicyInactiveFn(schedState)
 	res := policymatch.Match(cfg, policymatch.Query{
 		FromZone:         fromZone,
 		ToZone:           toZone,

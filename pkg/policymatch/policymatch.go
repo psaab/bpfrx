@@ -33,11 +33,15 @@
 // closed on missing scheduler state. This simulator is schedule-aware when the
 // caller threads live per-scheduler active-state into Query.PolicyInactiveFn:
 // it then SKIPS a scheduler-inactive policy exactly like the runtime, falling
-// through to the next active rule / configured default-policy. When
-// PolicyInactiveFn is nil (the caller has no live scheduler state — an offline
-// surface, or the daemon-local dataplane has not published state yet), the
-// simulator falls back to evaluating the configured policy set as-if-active,
-// matching both the pre-#3042 surfaces and the #3062 display fallback. A
+// through to the next active rule / configured default-policy. The live
+// daemon-local surfaces (REST/gRPC/CLI match-policies) ALWAYS thread a non-nil
+// PolicyInactiveFn — even before scheduler state is published — because
+// dataplane/userspace.PolicyInactiveFn fails closed on a nil state map (#3414),
+// so the simulator treats a scheduled policy as inactive exactly as the
+// dataplane does rather than certifying it as-if-active. When PolicyInactiveFn
+// is nil the simulator falls back to evaluating the configured policy set
+// as-if-active; that is reserved for a purely offline, dataplane-less config
+// simulator that has no runtime verdict to agree with. A
 // NON-scheduled policy is unaffected in either case: PolicyInactiveFn is only
 // ever consulted with a policy's scheduler name, and the SSOT predicate
 // (dataplane/userspace.PolicyInactive) reports an empty scheduler name as
@@ -219,10 +223,14 @@ type Query struct {
 	// display surfaces. An empty scheduler name reports active, so a
 	// NON-scheduled policy is never skipped.
 	//
-	// nil is valid and means "no live scheduler state": the simulator evaluates
-	// scheduled policies as-if-active (the pre-#3104 behavior / #3062 display
-	// fallback). The runtime/dataplane callers always supply it when scheduler
-	// state has been published; only offline surfaces leave it nil.
+	// nil is valid and means "scheduler-unaware": the simulator evaluates
+	// scheduled policies as-if-active. This is reserved for a purely offline,
+	// dataplane-less config simulator that has no runtime verdict to agree with.
+	// The live daemon-local surfaces (REST/gRPC/CLI match-policies) ALWAYS
+	// supply a non-nil predicate via dataplane/userspace.PolicyInactiveFn — even
+	// when scheduler state is not yet published — because that predicate fails
+	// closed on a nil state map (#3414), so a scheduled policy is treated as
+	// inactive exactly as the dataplane treats it rather than certified active.
 	PolicyInactiveFn func(schedulerName string) bool
 }
 

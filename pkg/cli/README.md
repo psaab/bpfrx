@@ -62,5 +62,8 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   whether a global policy matched. #3104: `show security match-policies` and
   `test policy` thread live per-scheduler active-state
   (`c.policyInactiveFn()` → `policymatch.Query.PolicyInactiveFn`) so a
-  scheduler-inactive policy is skipped like the runtime; with no live state
-  (offline CLI) scheduled policies are simulated as-if-active.
+  scheduler-inactive policy is skipped like the runtime. #3414: `policyInactiveFn()`
+  is now ALWAYS non-nil — with no live state (no provider / early boot) it binds
+  a nil state map, which fails closed so scheduled policies are simulated as
+  INACTIVE (matching the dataplane's nil-state => dropped) rather than certified
+  as-if-active.

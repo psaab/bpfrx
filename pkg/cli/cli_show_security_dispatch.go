@@ -51,16 +51,17 @@ func (c *CLI) policySchedulerActiveState() (state map[string]bool, ok bool) {
 
 // policyInactiveFn returns a per-policy scheduler-inactivity predicate bound to
 // the live active-state snapshot for use as policymatch.Query.PolicyInactiveFn
-// (#3104), or nil when the runtime scheduler state cannot be queried. When nil
-// the policy simulator treats scheduled policies as active — the pre-#3104
-// behaviour and the same fallback the #3062 display surfaces use when no
-// provider is present — so the verdict never regresses for a surface lacking
-// live state.
+// (#3104). It always returns a non-nil predicate so the simulator agrees with
+// the dataplane in BOTH directions (#3414): when the runtime scheduler state
+// cannot be queried (no provider / early boot), state is nil, and
+// PolicyInactiveFn(nil) marks every scheduler-bound policy inactive — exactly
+// what the snapshot builder does (policyRuleInactive: nil map => dropped) until
+// live state arrives, so the diagnostic never certifies a verdict for a
+// scheduled policy the dataplane is currently skipping. A NON-scheduled policy
+// (empty scheduler name) is always active regardless of the (possibly nil)
+// state map, so its verdict is unchanged.
 func (c *CLI) policyInactiveFn() func(string) bool {
-	state, ok := c.policySchedulerActiveState()
-	if !ok {
-		return nil
-	}
+	state, _ := c.policySchedulerActiveState()
 	return dpuserspace.PolicyInactiveFn(state)
 }
 
