@@ -273,6 +273,125 @@ func TestRESTSessionSummaryNodeIDAndPeer(t *testing.T) {
 	}
 }
 
+// TestRESTSessionListPeerOnlyOnFirstPage asserts the peer table is attached
+// only on the FIRST page in BOTH pagination modes (#3423): the offset path
+// never sets a page_token, so a page_token-only guard re-attached the FULL
+// peer table on every offset page — a client summing peer.sessions across
+// offset pages would over-count the peer. include_peer=true&offset=0 attaches
+// the peer; include_peer=true&offset=<nonzero> must NOT.
+//
+// FAIL-ON-REVERT: reverting writeSessionList to the page_token-only guard
+// attaches the peer on the offset>0 request, flipping the "no peer" assertion.
+func TestRESTSessionListPeerOnlyOnFirstPage(t *testing.T) {
+	newFake := func() *fakeClusterSessionService {
+		return &fakeClusterSessionService{
+			getResp: &pb.GetSessionsResponse{
+				Peer: &pb.GetSessionsResponse{
+					NodeId:   6,
+					Total:    1,
+					Sessions: []*pb.SessionEntry{{SrcAddr: "10.0.9.9", Protocol: "TCP"}},
+				},
+			},
+		}
+	}
+
+	// offset=0 (first window): peer attached.
+	fake := newFake()
+	s := &Server{
+		dp:               &oneSessionDP{Manager: dataplane.New()},
+		eventBuf:         logging.NewEventBuffer(8),
+		clusterSessionFn: func() ClusterSessionService { return fake },
+	}
+	rr := httptest.NewRecorder()
+	s.sessionsHandler(rr, httptest.NewRequest("GET", "/api/v1/security/sessions?include_peer=true&offset=0", nil))
+	if rr.Code != 200 {
+		t.Fatalf("offset=0 status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if resp := decodeSessions(t, rr.Body.Bytes()); resp.Peer == nil {
+		t.Fatal("offset=0 (first page) did not attach the peer list")
+	}
+	if !fake.getCalled {
+		t.Fatal("offset=0 did not fetch the peer")
+	}
+
+	// offset>0 (a later page): peer NOT attached — avoids over-counting.
+	fake = newFake()
+	s.clusterSessionFn = func() ClusterSessionService { return fake }
+	rr = httptest.NewRecorder()
+	s.sessionsHandler(rr, httptest.NewRequest("GET", "/api/v1/security/sessions?include_peer=true&offset=10", nil))
+	if rr.Code != 200 {
+		t.Fatalf("offset=10 status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if resp := decodeSessions(t, rr.Body.Bytes()); resp.Peer != nil {
+		t.Fatal("offset=10 (later page) re-attached the peer table — over-counts the peer across offset pages")
+	}
+	if fake.getCalled {
+		t.Fatal("offset=10 fetched the peer table on a non-first page")
+	}
+}
+
+// TestRESTZonePairsNodeID asserts the zone-pair summary stamps node_id so it is
+// consistent with its /sessions/summary sibling (#3423 M5). Before the fix it
+// returned a bare array with no node identity.
+//
+// FAIL-ON-REVERT: reverting to the bare []ZonePairSessionSummary makes the
+// response decode into ZonePairSummaryResponse with NodeID 0 (want 4).
+func TestRESTZonePairsNodeID(t *testing.T) {
+	s := &Server{
+		dp:       &oneSessionDP{Manager: dataplane.New()},
+		eventBuf: logging.NewEventBuffer(8),
+		nodeIDFn: func() int { return 4 },
+	}
+	rr := httptest.NewRecorder()
+	s.sessionZonePairHandler(rr, httptest.NewRequest("GET", "/api/v1/security/sessions/summary/zone-pairs", nil))
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Success bool                    `json:"success"`
+		Data    ZonePairSummaryResponse `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode zone-pairs response: %v; body=%s", err, rr.Body.String())
+	}
+	if resp.Data.NodeID != 4 {
+		t.Fatalf("zone-pairs node_id = %d, want 4 (which-node identity missing)", resp.Data.NodeID)
+	}
+	if resp.Data.ZonePairs == nil {
+		t.Fatal("zone-pairs response missing zone_pairs array")
+	}
+}
+
+// TestRESTClearSessionsPartialFailureStatus pins the chosen partial-failure
+// contract (#3423 FOLD 3): when the local clear succeeds but the peer clear
+// fails, the endpoint returns HTTP 200 (NOT a 4xx/5xx) and surfaces the
+// failure via failures/failure_summary. The project uses no 207 Multi-Status
+// anywhere, so a status-only client would read 200 — the README documents that
+// clients MUST inspect failures/failure_summary. A HARD local failure still
+// returns 500 (covered by the gRPC ClearSessions error tests).
+func TestRESTClearSessionsPartialFailureStatus(t *testing.T) {
+	fake := &fakeClusterSessionService{
+		clearResp: &pb.ClearSessionsResponse{
+			Ipv4Cleared:    2,
+			Failures:       1,
+			FailureSummary: "peer clear: dial peer node 1: connection refused",
+		},
+	}
+	s := &Server{
+		dp:               &clearAllDP{Manager: dataplane.New()},
+		clusterSessionFn: func() ClusterSessionService { return fake },
+	}
+	rr := httptest.NewRecorder()
+	s.clearSessionsHandler(rr, httptest.NewRequest("POST", "/api/v1/security/sessions/clear", nil))
+	if rr.Code != 200 {
+		t.Fatalf("partial-failure status = %d, want 200 (documented must-read-failures contract)", rr.Code)
+	}
+	got := decodeClearResult(t, rr.Body.Bytes())
+	if got.Failures != 1 || got.FailureSummary == "" {
+		t.Fatalf("partial failure not surfaced on a 200: %+v", got)
+	}
+}
+
 // TestRESTSessionIncludePeerInvalid asserts include_peer fails closed on a
 // malformed value rather than being silently ignored (#3423 M5).
 func TestRESTSessionIncludePeerInvalid(t *testing.T) {

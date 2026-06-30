@@ -295,12 +295,18 @@ func sessionIncludePeer(r *http.Request) (value bool, ok bool) {
 // when include_peer=true and an HA-aware session service is wired, augments it
 // with the cluster peer's sessions (#3423 M5). The local list reports the
 // LOCAL table only; node_id tells a dashboard which node it observes, and the
-// optional peer set keeps it from understating total HA state. Peer is fetched
-// only on the FIRST page (no page_token) — mirroring the gRPC contract, since
-// a page_token encodes local map keys meaningless to the peer.
+// optional peer set keeps it from understating total HA state.
+//
+// The peer's FULL table is attached only on the FIRST page — cursor mode's
+// first page (no page_token) AND offset mode's first window (offset==0). A
+// client paginating either way and summing peer.sessions across pages would
+// OVER-COUNT the peer if the whole peer table were re-attached on every page
+// (the offset path never sets a page_token, so a page_token-only guard let it
+// through). page_token additionally encodes node-local map keys meaningless to
+// the peer.
 func (s *Server) writeSessionList(w http.ResponseWriter, r *http.Request, resp SessionListResponse) {
 	resp.NodeID = s.nodeID()
-	if includePeer, _ := sessionIncludePeer(r); includePeer && r.URL.Query().Get("page_token") == "" {
+	if includePeer, _ := sessionIncludePeer(r); includePeer && sessionFirstPage(r) {
 		if svc := s.clusterSession(); svc != nil {
 			if pr, err := svc.GetSessions(r.Context(), peerSessionsRequest(r)); err == nil {
 				if peer := pr.GetPeer(); peer != nil {
@@ -310,6 +316,24 @@ func (s *Server) writeSessionList(w http.ResponseWriter, r *http.Request, resp S
 		}
 	}
 	writeOK(w, resp)
+}
+
+// sessionFirstPage reports whether this list request is the first page, on
+// BOTH pagination modes: cursor mode's first page carries no page_token, and
+// offset mode's first window has offset==0. A non-first page must NOT re-attach
+// the peer table (#3423 — avoids over-counting the peer across pages). The
+// offset/page_token query values are already validated by the caller
+// (sessionsOffset / sessionsCursor) before writeSessionList runs, so a lenient
+// re-parse here cannot mask a malformed value.
+func sessionFirstPage(r *http.Request) bool {
+	q := r.URL.Query()
+	if q.Get("page_token") != "" {
+		return false
+	}
+	if off, err := strconv.Atoi(q.Get("offset")); err == nil && off > 0 {
+		return false
+	}
+	return true
 }
 
 // peerSessionsRequest maps the REST session filter query parameters onto a
@@ -547,9 +571,16 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, ClearSessionsResult{IPv4Cleared: v4, IPv6Cleared: v6, NodeID: s.nodeID()})
 }
 
+// sessionZonePairHandler serves the zone-pair session breakdown. Like the
+// /sessions/summary sibling it now stamps node_id so an operator knows which
+// node the counts came from (#3423 M5). It does NOT support include_peer:
+// unlike list/summary there is no gRPC zone-pair-summary RPC to forward to, so
+// cross-node fan-out would need a new RPC. Tracked as a follow-up (#3592,
+// referenced in pkg/api/README.md) rather than approximated client-side from a
+// peer session list.
 func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
-		writeOK(w, []ZonePairSessionSummary{})
+		writeOK(w, ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: []ZonePairSessionSummary{}})
 		return
 	}
 
@@ -624,7 +655,7 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) 
 		}
 		return result[i].ToZone < result[j].ToZone
 	})
-	writeOK(w, result)
+	writeOK(w, ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: result})
 }
 
 // --- Session helper functions ---

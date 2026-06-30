@@ -329,9 +329,21 @@ under the daemon's errgroup. Nothing else imports this package.
   the handler delegates the PEER fetch to the live gRPC server through the
   `ClusterSessionFn`/`ClusterSessionService` seam and attaches the peer node's
   list/summary under a nested `peer` field (mirroring gRPC `GetSessions`/
-  `GetSessionSummary` `include_peer`). Peer is fetched only on the first list
-  page (no `page_token`) — tokens encode node-local map keys. A standalone node
-  or unreachable peer leaves `peer` absent. Pinned by
+  `GetSessionSummary` `include_peer`). The peer's FULL table is attached only on
+  the FIRST page — in BOTH pagination modes (cursor mode's first page has no
+  `page_token`; offset mode's first window has `offset==0`). A non-first page
+  must not re-attach the whole peer table or a client summing `peer.sessions`
+  across pages would OVER-COUNT the peer; the offset path never sets a
+  `page_token`, so the `sessionFirstPage` guard checks `offset==0` too. A
+  standalone node or unreachable peer leaves `peer` absent. Pinned by
+  `sessions_ha_scope_3423_test.go`.
+- The zone-pair summary (`GET /api/v1/security/sessions/summary/zone-pairs`,
+  `sessionZonePairHandler`) is the same SUMMARY class and now also carries
+  `node_id` — the response shape changed from a bare array to
+  `ZonePairSummaryResponse {node_id, zone_pairs:[...]}` so it can. It does NOT
+  yet support `include_peer`: there is no gRPC zone-pair-summary RPC to forward
+  to (the breakdown is computed REST-locally), so cross-node fan-out needs a new
+  RPC — tracked in #3592, not approximated client-side. Pinned by
   `sessions_ha_scope_3423_test.go`.
 - Session list pagination and the remaining filter dimensions reach gRPC
   parity in #3421, folded into the SAME `sessionQuery` + `sessionView` +
@@ -365,11 +377,18 @@ under the daemon's errgroup. Nothing else imports this package.
   peer propagation (`clearPeerSessions`, the `x-peer-forwarded` recursion guard)
   + partial-failure summary. The `ClearSessionsResult` carries `node_id` (which
   node served it) and `failures`/`failure_summary` — a non-zero `failures` with
-  a `peer clear:` summary means the local clear succeeded but the peer's
-  sessions were NOT cleared. A standalone node (no service wired) falls back to
-  the local-only `ClearAllSessions` — the pre-#3423 behavior. Pinned by
-  `sessions_ha_scope_3423_test.go`. The gRPC-parity FILTERED REST clear (clear a
-  narrowed subset) remains a separate, unimplemented follow-up.
+  a `peer clear:` summary (now naming the PEER NODE, e.g. `dial peer node 1`,
+  so it is operator-actionable) means the local clear succeeded but the peer's
+  sessions were NOT cleared. **Partial-failure status:** when the local clear
+  succeeds but the peer clear fails the endpoint still returns **HTTP 200** —
+  the project uses no `207 Multi-Status` anywhere, so the failure is surfaced in
+  the body, NOT the status line. **Clients MUST inspect `failures` /
+  `failure_summary`; a status-only check will read a peer-clear failure as
+  success.** A hard LOCAL clear failure still returns HTTP 500. A standalone
+  node (no service wired) falls back to the local-only `ClearAllSessions` — the
+  pre-#3423 behavior. Pinned by `sessions_ha_scope_3423_test.go`. The
+  gRPC-parity FILTERED REST clear (clear a narrowed subset) remains a separate,
+  unimplemented follow-up.
 - `GET /api/v1/security/match` (`matchPoliciesHandler`) is a THIN adapter
   over the single shared policy simulator `pkg/policymatch` (#3042). It only
   validates/parses inputs (400 on a malformed IP/port) and renders the

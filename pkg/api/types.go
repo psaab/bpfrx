@@ -550,6 +550,19 @@ type ZonePairSessionSummary struct {
 	Total    int    `json:"total"`
 }
 
+// ZonePairSummaryResponse wraps the zone-pair breakdown with the local node
+// identity (#3423 M5). This summary class previously returned a bare array, so
+// — unlike its /sessions/summary sibling — it carried no node_id and could not
+// tell an operator WHICH node the counts came from. node_id is now always
+// present. include_peer cross-node fan-out is NOT yet supported here: there is
+// no gRPC zone-pair-summary RPC to forward to, so it is tracked as a follow-up
+// (#3592; see the sessionZonePairHandler comment + pkg/api/README.md) rather
+// than fudged client-side.
+type ZonePairSummaryResponse struct {
+	NodeID    int                      `json:"node_id"`
+	ZonePairs []ZonePairSessionSummary `json:"zone_pairs"`
+}
+
 // BufferInfo holds dataplane buffer utilization information.
 type BufferInfo struct {
 	Name         string  `json:"name"`
