@@ -66,10 +66,10 @@ type EventStream struct {
 	drainCompleteCh chan uint64
 
 	// Stats.
-	FramesRead          atomic.Uint64
-	FramesWritten       atomic.Uint64
-	DecodeErrors        atomic.Uint64
-	SeqGaps             atomic.Uint64
+	FramesRead    atomic.Uint64
+	FramesWritten atomic.Uint64
+	DecodeErrors  atomic.Uint64
+	SeqGaps       atomic.Uint64
 	// SessionSyncResyncs counts how many times a sequence gap on a
 	// correctness-critical session-sync frame (open/close/update) forced a
 	// full bulk re-export + reconnect (#2874). Distinct from SeqGaps, which
@@ -847,10 +847,10 @@ func (es *EventStream) writeFrame(typ uint8, seq uint64, payload []byte) error {
 //	[22:24] TunnelEndpointID (uint16 LE)
 //	[24:26] TXVLANID (uint16 LE)
 //	[26]    Flags
-//	[27]    IngressZoneID
-//	[28]    EgressZoneID
-//	[29]    Disposition
-//	[30..]  IPs (4 bytes each for v4, 16 each for v6): src, dst, nat_src, nat_dst
+//	[27:29] IngressZoneID (uint16 LE)  — #3075: widened from u8
+//	[29:31] EgressZoneID (uint16 LE)   — #3075: widened from u8
+//	[31]    Disposition
+//	[32..]  IPs (4 bytes each for v4, 16 each for v6): src, dst, nat_src, nat_dst
 //	[N..]   NeighborMAC (6 bytes)
 //	[N+6..] SrcMAC (6 bytes)
 //	[N+12..]NextHop (4 or 16 bytes)
@@ -881,9 +881,10 @@ func wireAFToDataplane(wire uint8) uint8 {
 }
 
 func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
-	// #2467: fixed header is 30 bytes (was 24) after widening the three
-	// identity fields at [10:22] from int16 to int32.
-	if len(payload) < 30 {
+	// #2467: fixed header was 30 bytes after widening the three identity fields
+	// at [10:22] from int16 to int32. #3075: now 32 bytes after widening the two
+	// zone fields at [27]/[28] from u8 to u16 (Disposition moved [29]->[31]).
+	if len(payload) < 32 {
 		return SessionDeltaInfo{}, false
 	}
 
@@ -898,8 +899,9 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		return SessionDeltaInfo{}, false
 	}
 
-	// Fixed header (30 bytes) + 4*addrSize + 6+6 + addrSize = 30 + 5*addrSize + 12
-	minLen := 30 + 5*addrSize + 12
+	// Fixed header (32 bytes, #3075) + 4*addrSize + 6+6 + addrSize
+	// = 32 + 5*addrSize + 12.
+	minLen := 32 + 5*addrSize + 12
 	if len(payload) < minLen {
 		return SessionDeltaInfo{}, false
 	}
@@ -926,11 +928,11 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		TXIfindex:        int(int32(binary.LittleEndian.Uint32(payload[18:22]))),
 		TunnelEndpointID: binary.LittleEndian.Uint16(payload[22:24]),
 		TXVLANID:         binary.LittleEndian.Uint16(payload[24:26]),
-		// #919/#922: bytes [27]/[28] are u8 ingress/egress zone IDs
-		// written by the Rust codec. Promote to uint16 for symmetry with
-		// SessionSyncRequest. (#2467: offsets shifted +6 by the int32 widen.)
-		IngressZoneID:  uint16(payload[27]),
-		EgressZoneID:   uint16(payload[28]),
+		// #3075: bytes [27:29]/[29:31] are u16 LE ingress/egress zone IDs
+		// written by the Rust codec (widened from the u8 [27]/[28] of #919/#922
+		// so a stable name-hash zone id > 255 round-trips).
+		IngressZoneID:  binary.LittleEndian.Uint16(payload[27:29]),
+		EgressZoneID:   binary.LittleEndian.Uint16(payload[29:31]),
 		FabricRedirect: flags&SessionEventFlagFabricRedirect != 0,
 		FabricIngress:  flags&SessionEventFlagFabricIngress != 0,
 		// #2785: per-policy log selection from the open-frame flags byte.
@@ -938,14 +940,14 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		LogSessionClose: flags&SessionEventFlagLogSessionClose != 0,
 	}
 
-	// Disposition mapping: 0=Accept, 1=LocalDelivery
-	switch payload[29] {
+	// Disposition mapping: 0=Accept, 1=LocalDelivery. #3075: moved [29]->[31].
+	switch payload[31] {
 	case 1:
 		d.Disposition = "local_delivery"
 	}
 
-	// IP addresses start at offset 30 (#2467: was 24).
-	off := 30
+	// IP addresses start at offset 32 (#3075: was 30 before the u16 zone widen).
+	off := 32
 	d.SrcIP = formatIP(payload[off:off+addrSize], af)
 	off += addrSize
 	d.DstIP = formatIP(payload[off:off+addrSize], af)
@@ -998,10 +1000,10 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 //	[4:6]   DstPort
 //	[6..]   SrcIP (4 or 16 bytes)
 //	[N..]   DstIP (4 or 16 bytes)
-//	[M:M+4] OwnerRGID (int32 LE)  — #2467: widened from int16
-//	[M+4]   Flags
-//	[M+5]   IngressZoneID (#919/#922)
-//	[M+6]   EgressZoneID (#919/#922)
+//	[M:M+4]   OwnerRGID (int32 LE)  — #2467: widened from int16
+//	[M+4]     Flags
+//	[M+5:M+7] IngressZoneID (uint16 LE)  — #3075: widened from u8
+//	[M+7:M+9] EgressZoneID (uint16 LE)   — #3075: widened from u8
 func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	if len(payload) < 6 {
 		return SessionDeltaInfo{}, false
@@ -1019,7 +1021,7 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	}
 
 	// Minimum: 6 (fixed) + 2*addrSize + 4 (OwnerRGID int32, #2467) + 1 (Flags).
-	// Helpers append +2 (ZoneIDs) after that; accept both lengths.
+	// Helpers append +4 (u16 ZoneIDs, #3075) after that; accept both lengths.
 	minLen := 6 + 2*addrSize + 5
 	if len(payload) < minLen {
 		return SessionDeltaInfo{}, false
@@ -1049,13 +1051,13 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	off++
 	d.FabricRedirect = flags&SessionEventFlagFabricRedirect != 0
 	d.FabricIngress = flags&SessionEventFlagFabricIngress != 0
-	// #919/#922: zone IDs are present iff the helper sent the +2-byte
-	// trailer. Older helpers leave them as 0 and the daemon falls back
-	// to the legacy zone-name string (empty for close events, which
-	// drops the close, matching pre-#919 behavior on a malformed close).
-	if len(payload) >= off+2 {
-		d.IngressZoneID = uint16(payload[off])
-		d.EgressZoneID = uint16(payload[off+1])
+	// #3075: zone IDs are u16 LE present iff the helper sent the +4-byte trailer
+	// (widened from the +2-byte u8 trailer of #919/#922). A frame without the
+	// trailer leaves them 0 and the daemon falls back to the legacy zone-name
+	// string (empty for close events, which drops the close).
+	if len(payload) >= off+4 {
+		d.IngressZoneID = binary.LittleEndian.Uint16(payload[off : off+2])
+		d.EgressZoneID = binary.LittleEndian.Uint16(payload[off+2 : off+4])
 	}
 
 	return d, true

@@ -614,8 +614,8 @@ pub(crate) const ZONE_ID_RESERVED_MIN: u16 = u16::MAX - 1;
 /// configured zone can never collide: `forwarding_build::populate_zones`
 /// already skips any snapshot zone whose id is `>= ZONE_ID_RESERVED_MIN`, and
 /// `configured_zone_pairs` excludes both sentinels from the cold-path
-/// histogram. The id is never put on the wire (the event-stream codec writes
-/// zone ids as u8); it exists only as the in-runtime key so a `junos-host`
+/// histogram. The id is never put on the wire (it sits in the reserved range a
+/// configured zone can never occupy); it exists only as the in-runtime key so a `junos-host`
 /// rule is INDEXED in `zone_pair_index` and reachable by the LocalDelivery
 /// policy gate. The Go control plane emits the `junos-host` zone NAME string
 /// in the rule snapshot; `parse_policy_state_with_counters` resolves that name
@@ -625,9 +625,10 @@ pub(crate) const JUNOS_HOST_ZONE_ID: u16 = u16::MAX - 1;
 /// #3402: build the policy-zone resolution map (`zone name → zone id`) from a
 /// snapshot's zone list, applying the SAME #919/#922 validity rules
 /// `forwarding_build::populate_zones` uses for the live forwarding table: an id
-/// of 0, an empty name, an id in the reserved range (`>= ZONE_ID_RESERVED_MIN`),
-/// or an id above the wire u8 max is not addressable and is skipped (silently —
-/// `populate_zones` emits the per-reason diagnostics on the real build path).
+/// of 0, an empty name, or an id in the reserved range (`>= ZONE_ID_RESERVED_MIN`)
+/// is not addressable and is skipped (silently — `populate_zones` emits the
+/// per-reason diagnostics on the real build path). #3075 widened the
+/// event-stream zone field to u16, so the former >u8::MAX skip is retired.
 ///
 /// The apply-time snapshot-integrity preflight MUST resolve a rule's zones
 /// against the INCOMING snapshot's own zones, NOT the live forwarding table.
@@ -648,9 +649,11 @@ pub(crate) fn zone_name_to_id_from_snapshot(zones: &[ZoneSnapshot]) -> FxHashMap
         if zone.id == 0 || zone.name.is_empty() {
             continue;
         }
-        // Reserved-range and >u8::MAX ids are unaddressable (mirrors
-        // populate_zones; the build path logs the diagnostic).
-        if zone.id >= ZONE_ID_RESERVED_MIN || zone.id > u8::MAX as u16 {
+        // Reserved-range ids are unaddressable (mirrors populate_zones; the
+        // build path logs the diagnostic). #3075 widened the event-stream zone
+        // field to u16, so the former >u8::MAX skip is retired and a stable
+        // name-hash id in [1, ZONE_ID_RESERVED_MIN-1] is addressable.
+        if zone.id >= ZONE_ID_RESERVED_MIN {
             continue;
         }
         map.insert(zone.name.clone(), zone.id);

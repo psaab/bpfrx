@@ -1764,10 +1764,11 @@ fn egress_interface_zone_id_set_from_snapshot() {
 }
 
 /// #2391: an interface whose zone snapshot field references a zone that was
-/// DROPPED at config build time (reserved id, > u8 max) must FAIL CLOSED — the
-/// forwarding build returns InterfaceUnknownZone instead of silently collapsing
-/// the interface to zone_id == 0 (which would bypass every zone-pair policy).
+/// DROPPED at config build time (reserved id) must FAIL CLOSED — the forwarding
+/// build returns InterfaceUnknownZone instead of silently collapsing the
+/// interface to zone_id == 0 (which would bypass every zone-pair policy).
 /// fail-on-revert: restoring the `unwrap_or(0)` collapse makes this red.
+/// (#3075 retired the separate >u8::MAX drop; the reserved-range drop remains.)
 #[test]
 fn interface_pointing_at_skipped_zone_fails_closed() {
     use crate::ZoneSnapshot;

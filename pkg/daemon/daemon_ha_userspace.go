@@ -201,8 +201,9 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	key.Protocol = delta.Protocol
 
 	// #919/#922: prefer the u16 zone IDs from the binary event-stream
-	// payload (bytes [21]/[22] in eventstream.go); fall back to legacy
-	// name-string lookup for older helpers that emit JSON deltas only.
+	// payload (decoded by eventstream.go; #3075 widened that wire field to
+	// u16); fall back to legacy name-string lookup for older helpers that
+	// emit JSON deltas only.
 	ingressZone := delta.IngressZoneID
 	if ingressZone == 0 {
 		ingressZone = zoneIDs[delta.IngressZone]

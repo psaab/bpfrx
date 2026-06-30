@@ -29,13 +29,14 @@ func buildSessionOpenV4Payload(
 	egressIfindex, txIfindex int32,
 	tunnelEndpoint, txVLAN uint16,
 	flags uint8,
-	ingressZone, egressZone, disposition uint8,
+	ingressZone, egressZone uint16, disposition uint8,
 	neighborMAC, srcMAC [6]byte,
 	nextHop [4]byte,
 ) []byte {
-	// #2467: 30 fixed + 4*4 IPs + 6+6 MACs + 4 NextHop = 62 bytes
-	// (the three identity fields at [10:22] are int32, not int16).
-	buf := make([]byte, 62)
+	// #3075: 32 fixed (zone fields widened u8->u16, Disposition moved to [31])
+	// + 4*4 IPs + 6+6 MACs + 4 NextHop = 64 bytes. (#2467: the three identity
+	// fields at [10:22] are int32.)
+	buf := make([]byte, 64)
 	buf[0] = 4 // AddrFamily
 	buf[1] = proto
 	binary.LittleEndian.PutUint16(buf[2:4], srcPort)
@@ -48,31 +49,32 @@ func buildSessionOpenV4Payload(
 	binary.LittleEndian.PutUint16(buf[22:24], tunnelEndpoint)
 	binary.LittleEndian.PutUint16(buf[24:26], txVLAN)
 	buf[26] = flags
-	buf[27] = ingressZone
-	buf[28] = egressZone
-	buf[29] = disposition
-	copy(buf[30:34], srcIP[:])
-	copy(buf[34:38], dstIP[:])
-	copy(buf[38:42], natSrcIP[:])
-	copy(buf[42:46], natDstIP[:])
-	copy(buf[46:52], neighborMAC[:])
-	copy(buf[52:58], srcMAC[:])
-	copy(buf[58:62], nextHop[:])
+	binary.LittleEndian.PutUint16(buf[27:29], ingressZone)
+	binary.LittleEndian.PutUint16(buf[29:31], egressZone)
+	buf[31] = disposition
+	copy(buf[32:36], srcIP[:])
+	copy(buf[36:40], dstIP[:])
+	copy(buf[40:44], natSrcIP[:])
+	copy(buf[44:48], natDstIP[:])
+	copy(buf[48:54], neighborMAC[:])
+	copy(buf[54:60], srcMAC[:])
+	copy(buf[60:64], nextHop[:])
 	return buf
 }
 
 // buildSessionCloseV4Payload builds a binary SessionClose payload for IPv4.
-// #919/#922: includes the trailing ingress/egress zone-id u8 bytes.
+// #3075: includes the trailing ingress/egress zone-id u16 LE bytes (widened
+// from u8).
 func buildSessionCloseV4Payload(
 	proto uint8,
 	srcPort, dstPort uint16,
 	srcIP, dstIP [4]byte,
 	ownerRG int32,
 	flags uint8,
-	ingressZoneID, egressZoneID uint8,
+	ingressZoneID, egressZoneID uint16,
 ) []byte {
-	// #2467: 6 + 4+4 + 4 (OwnerRGID int32) + 1 + 2 = 21 bytes
-	buf := make([]byte, 21)
+	// #3075: 6 + 4+4 + 4 (OwnerRGID int32) + 1 (Flags) + 4 (u16 zones) = 23 bytes
+	buf := make([]byte, 23)
 	buf[0] = 4 // AddrFamily
 	buf[1] = proto
 	binary.LittleEndian.PutUint16(buf[2:4], srcPort)
@@ -81,8 +83,8 @@ func buildSessionCloseV4Payload(
 	copy(buf[10:14], dstIP[:])
 	binary.LittleEndian.PutUint32(buf[14:18], uint32(ownerRG))
 	buf[18] = flags
-	buf[19] = ingressZoneID
-	buf[20] = egressZoneID
+	binary.LittleEndian.PutUint16(buf[19:21], ingressZoneID)
+	binary.LittleEndian.PutUint16(buf[21:23], egressZoneID)
 	return buf
 }
 
