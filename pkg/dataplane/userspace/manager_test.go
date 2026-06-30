@@ -4085,8 +4085,9 @@ func TestDeriveUserspaceCapabilitiesAllowsBasicScreenProfile(t *testing.T) {
 // hot-path enforcement — the per-destination/per-source cap drops and the
 // log-only alarm gate (and their RED-on-revert) live in the Rust screen runtime
 // tests (`cargo test --bin xpf-userspace-dp screen::`, userspace-dp/src/screen/
-// tests.rs). `timeout` is intentionally NOT on the wire (it maps to the session
-// half-open window, a tracked follow-up).
+// tests.rs). #3527: `timeout` now ALSO crosses the wire (SYNFloodTimeout) — it
+// maps to the per-zone half-open session window (tcp_opening_ns); the Rust
+// SessionTable opening-override tests guard the enforcement RED-on-revert.
 func TestBuildScreenSnapshotsSynFloodSubThresholds(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
@@ -4121,6 +4122,10 @@ func TestBuildScreenSnapshotsSynFloodSubThresholds(t *testing.T) {
 	if s.SYNFloodDstThreshold != 100 {
 		t.Errorf("SYNFloodDstThreshold = %d, want 100", s.SYNFloodDstThreshold)
 	}
+	// #3527: the half-open `timeout` now crosses the wire too.
+	if s.SYNFloodTimeout != 20 {
+		t.Errorf("SYNFloodTimeout = %d, want 20", s.SYNFloodTimeout)
+	}
 
 	// JSON round-trip: the additive fields serialize and decode unchanged.
 	blob, err := json.Marshal(s)
@@ -4132,7 +4137,7 @@ func TestBuildScreenSnapshotsSynFloodSubThresholds(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if back.SYNFloodAlarmThreshold != 1000 || back.SYNFloodSrcThreshold != 50 ||
-		back.SYNFloodDstThreshold != 100 {
+		back.SYNFloodDstThreshold != 100 || back.SYNFloodTimeout != 20 {
 		t.Errorf("round-trip lost sub-thresholds: %+v", back)
 	}
 
@@ -4144,7 +4149,7 @@ func TestBuildScreenSnapshotsSynFloodSubThresholds(t *testing.T) {
 		t.Fatalf("legacy decode: %v", err)
 	}
 	if legacy.SYNFloodAlarmThreshold != 0 || legacy.SYNFloodSrcThreshold != 0 ||
-		legacy.SYNFloodDstThreshold != 0 {
+		legacy.SYNFloodDstThreshold != 0 || legacy.SYNFloodTimeout != 0 {
 		t.Errorf("legacy snapshot must decode sub-thresholds as 0, got %+v", legacy)
 	}
 }

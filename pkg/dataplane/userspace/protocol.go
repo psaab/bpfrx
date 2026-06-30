@@ -780,15 +780,21 @@ type ScreenProfileSnapshot struct {
 	// attack-threshold (SYNFloodThreshold above) used to cross the wire, so the
 	// other controls committed cleanly yet were operationally inert. These three
 	// carry the per-source / per-destination caps and the log-only alarm rate to
-	// the Rust dataplane. `timeout` is deliberately NOT serialized — it maps to
-	// the per-zone half-open session window (tcp_opening_ns), a session-layer
-	// surface split to a tracked follow-up; the compiler emits a commit-time
-	// warning so the leaf is never silently inert. Additive + omitempty: an old
-	// helper missing these decodes them as 0 (disabled), so version skew degrades
-	// safely (#1961 no-transit class).
+	// the Rust dataplane. Additive + omitempty: an old helper missing these
+	// decodes them as 0 (disabled), so version skew degrades safely (#1961
+	// no-transit class).
 	SYNFloodAlarmThreshold uint32 `json:"syn_flood_alarm_threshold,omitempty"`
 	SYNFloodDstThreshold   uint32 `json:"syn_flood_dst_threshold,omitempty"`
 	SYNFloodSrcThreshold   uint32 `json:"syn_flood_src_threshold,omitempty"`
+	// #3527: the Junos `syn-flood timeout` (SECONDS), the
+	// half-completed-connection queue window. Unlike the sub-thresholds above it
+	// is NOT a screen-rate control — it maps to the per-zone half-open TCP
+	// session window (tcp_opening_ns, 20 s default). The dataplane turns it into
+	// a per-ingress-zone override of tcp_opening_ns so a bare-SYN session in this
+	// zone is reaped on the operator's window instead of the global default. This
+	// closes the #3315 deferred leaf (the compiler no longer warns it is inert).
+	// Additive + omitempty: an old helper missing it decodes 0 (global default).
+	SYNFloodTimeout uint32 `json:"syn_flood_timeout,omitempty"`
 	// Advanced screen features for userspace dataplane
 	SessionLimitSrc   uint32 `json:"session_limit_src,omitempty"`
 	SessionLimitDst   uint32 `json:"session_limit_dst,omitempty"`

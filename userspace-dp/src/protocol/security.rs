@@ -42,17 +42,27 @@ pub(crate) struct ScreenProfileSnapshot {
     /// additions. The Go compiler parses the full Junos syn-flood shape but only
     /// `syn_flood_threshold` (attack-threshold) used to cross the wire; these
     /// carry the log-only alarm rate and the per-destination / per-source SYN
-    /// rate caps so the dataplane can enforce them (`SynRateSketch`). `timeout`
-    /// is intentionally not on the wire (it maps to the session half-open window,
-    /// a tracked follow-up; the Go compiler warns it is inert). `#[serde(default)]`
-    /// keeps wire parity with an older Go control plane that omits the fields
-    /// (decode to 0 = disabled — #1961 skew tolerance).
+    /// rate caps so the dataplane can enforce them (`SynRateSketch`).
+    /// `#[serde(default)]` keeps wire parity with an older Go control plane that
+    /// omits the fields (decode to 0 = disabled — #1961 skew tolerance).
     #[serde(rename = "syn_flood_alarm_threshold", default)]
     pub syn_flood_alarm_threshold: u32,
     #[serde(rename = "syn_flood_dst_threshold", default)]
     pub syn_flood_dst_threshold: u32,
     #[serde(rename = "syn_flood_src_threshold", default)]
     pub syn_flood_src_threshold: u32,
+    /// #3527: the Junos `syn-flood timeout` (SECONDS), the half-completed-
+    /// connection queue window. It does NOT belong to the screen-rate
+    /// substrate above — it maps to the per-zone half-open TCP session window
+    /// (`SessionTimeouts.tcp_opening_ns`, 20 s default). The forwarding builder
+    /// turns it into a per-ingress-zone override of `tcp_opening_ns`
+    /// (`SessionTable::set_opening_overrides`) so a bare-SYN session in this
+    /// zone is reaped on the operator's window instead of the global default.
+    /// 0 = unset (global default). `#[serde(default)]` keeps wire parity with
+    /// an older Go control plane that omits the field (#1961 skew tolerance).
+    /// This closes the #3315 deferred leaf (#3527).
+    #[serde(rename = "syn_flood_timeout", default)]
+    pub syn_flood_timeout: u32,
     #[serde(rename = "session_limit_src", default)]
     pub session_limit_src: u32,
     #[serde(rename = "session_limit_dst", default)]

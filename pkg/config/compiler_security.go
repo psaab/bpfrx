@@ -71,21 +71,21 @@ const (
 // it. We advise (never reject) so the config still commits.
 const synFloodSrcAttackRatioAdvisoryThreshold = 1000
 
-// validateScreenSynFloodSubThresholds emits WARNINGS (never a hard reject) for
-// SYN-flood sub-threshold leaves whose enforcement is incomplete or risky
-// (#3315):
+// validateScreenSynFloodSubThresholds emits a WARNING (never a hard reject) for
+// the one risky SYN-flood sub-threshold band (#3315):
 //
-//   - `timeout` parses into SynFloodConfig.Timeout and commits cleanly but is
-//     NOT yet enforced — it maps to the per-zone half-open session window
-//     (tcp_opening_ns), a session-layer surface split to a tracked follow-up.
-//     Without this warning the leaf is silently inert, which is exactly the
-//     configured-but-not-enforced trap #3315 fixes for the other leaves.
 //   - an attack-threshold orders of magnitude above source-threshold is the one
 //     pathological band where the per-source count-min sketch can false-throttle
 //     legitimate sources; advise the operator (per the converged plan §5b).
 //
-// Both fire on BOTH the strict and lenient compile paths: the values are valid
+// It fires on BOTH the strict and lenient compile paths: the values are valid
 // and parseable, the dataplane just cannot fully honour them.
+//
+// #3527: the `timeout` leaf NO LONGER warns. It is now enforced as a per-zone
+// override of the half-open session window (tcp_opening_ns) — see
+// pkg/dataplane/userspace/screens.go (SYNFloodTimeout) and the dataplane's
+// SessionTable opening overrides. The historical accepted-but-inert advisory
+// is removed now that the leaf is effective.
 func validateScreenSynFloodSubThresholds(cfg *Config) []string {
 	var warnings []string
 	names := make([]string, 0, len(cfg.Security.Screen))
@@ -99,14 +99,6 @@ func validateScreenSynFloodSubThresholds(cfg *Config) []string {
 			continue
 		}
 		sf := sp.TCP.SynFlood
-		if sf.Timeout > 0 {
-			warnings = append(warnings, fmt.Sprintf(
-				"security screen ids-option %s tcp syn-flood timeout %d is accepted "+
-					"but NOT yet enforced by the dataplane (it maps to the per-zone "+
-					"half-open session window, tracked as a follow-up to #3315); the "+
-					"global half-open TCP timeout applies until then",
-				name, sf.Timeout))
-		}
 		if sf.SourceThreshold > 0 && sf.AttackThreshold > 0 &&
 			sf.AttackThreshold/sf.SourceThreshold > synFloodSrcAttackRatioAdvisoryThreshold {
 			warnings = append(warnings, fmt.Sprintf(

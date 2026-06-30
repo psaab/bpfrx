@@ -264,6 +264,33 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         snapshot.flow.udp_session_timeout,
         snapshot.flow.icmp_session_timeout,
     );
+    // #3527: per-screened-zone half-open (`tcp_opening_ns`) overrides from each
+    // zone's `syn-flood timeout`. The leaf maps to the Junos
+    // half-completed-connection queue window, NOT the screen-rate substrate
+    // (#3315 D5), so it is enforced at the session layer: a bare-SYN session in
+    // a screened zone reaps on this window instead of the 20 s default. Keyed
+    // by zone id (the same namespace `SessionMetadata.ingress_zone` carries),
+    // resolved via `zone_name_to_id` (built above). A timeout for a zone with no
+    // resolvable id (never assigned to an interface) is silently dropped — the
+    // override could never match a session anyway. Built only when at least one
+    // zone configures a non-zero timeout, so the common case is an empty map.
+    state.session_opening_overrides = snapshot
+        .screens
+        .iter()
+        .filter(|sp| sp.syn_flood_timeout > 0 && !sp.zone.is_empty())
+        .filter_map(|sp| {
+            state
+                .zone_name_to_id
+                .get(&sp.zone)
+                .copied()
+                .map(|zone_id| {
+                    (
+                        zone_id,
+                        crate::session::secs_to_ns_saturating(u64::from(sp.syn_flood_timeout)),
+                    )
+                })
+        })
+        .collect();
     state.source_nat_rules = parse_source_nat_rules_with_previous(
         &snapshot.source_nat_rules,
         previous.map(|state| state.source_nat_rules.as_slice()),

@@ -194,41 +194,92 @@ fn session_timeout_ns_honors_app_override() {
     let app = 30_000_000_000u64; // 30 s
 
     // ESTABLISHED TCP (ACK, not closing): override wins; None -> global.
-    assert_eq!(session_timeout_ns(PROTO_TCP, 0x10, true, &to, Some(app)), app);
+    // #3527: the opening override (6th arg) never touches the established branch.
+    assert_eq!(session_timeout_ns(PROTO_TCP, 0x10, true, &to, Some(app), None), app);
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, 0x10, true, &to, None),
+        session_timeout_ns(PROTO_TCP, 0x10, true, &to, None, None),
         DEFAULT_TCP_SESSION_TIMEOUT_NS
     );
     // #3152: OPENING TCP (handshake incomplete): the short opening window,
     // regardless of any per-app override (which is the established idle value).
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, Some(app)),
+        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, Some(app), None),
         DEFAULT_TCP_OPENING_TIMEOUT_NS
     );
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, None),
+        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, None, None),
         DEFAULT_TCP_OPENING_TIMEOUT_NS
     );
     // UDP / ICMP: override wins; None -> global. `established` is ignored.
-    assert_eq!(session_timeout_ns(PROTO_UDP, 0, true, &to, Some(app)), app);
+    assert_eq!(session_timeout_ns(PROTO_UDP, 0, true, &to, Some(app), None), app);
     assert_eq!(
-        session_timeout_ns(PROTO_UDP, 0, true, &to, None),
+        session_timeout_ns(PROTO_UDP, 0, true, &to, None, None),
         DEFAULT_UDP_SESSION_TIMEOUT_NS
     );
-    assert_eq!(session_timeout_ns(PROTO_ICMP, 0, true, &to, Some(app)), app);
+    assert_eq!(session_timeout_ns(PROTO_ICMP, 0, true, &to, Some(app), None), app);
     assert_eq!(
-        session_timeout_ns(PROTO_ICMP, 0, true, &to, None),
+        session_timeout_ns(PROTO_ICMP, 0, true, &to, None, None),
         DEFAULT_ICMP_SESSION_TIMEOUT_NS
     );
     // Closing/RST TCP: the override never extends the short reap window
     // (and the closing branch is consulted before the OPENING branch).
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, TCP_RST, false, &to, Some(app)),
+        session_timeout_ns(PROTO_TCP, TCP_RST, false, &to, Some(app), None),
         TCP_RST_TIMEOUT_NS
     );
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, TCP_FIN, false, &to, Some(app)),
+        session_timeout_ns(PROTO_TCP, TCP_FIN, false, &to, Some(app), None),
         TCP_CLOSING_TIMEOUT_NS
+    );
+}
+
+/// #3527 unit: `session_timeout_ns` applies the per-zone half-open override
+/// ONLY on the OPENING branch. An established / closing / RST flow ignores it;
+/// a half-open (bare-SYN) flow reaps on the override, replacing the global
+/// `tcp_opening_ns`. `None` is byte-identical to pre-#3527.
+#[test]
+fn session_timeout_ns_honors_opening_override() {
+    let to = SessionTimeouts::default();
+    let zone_opening = 5_000_000_000u64; // 5 s syn-flood timeout
+    let app = 30_000_000_000u64; // 30 s established idle override
+
+    // OPENING TCP (bare SYN): the per-zone override replaces the 20 s default.
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, None, Some(zone_opening)),
+        zone_opening,
+        "an OPENING half-open session must reap on the per-zone syn-flood timeout"
+    );
+    // The app (established) override does NOT leak into the opening window —
+    // the zone opening override still wins there.
+    assert_eq!(
+        session_timeout_ns(
+            PROTO_TCP,
+            crate::tcp_flags::TCP_SYN,
+            false,
+            &to,
+            Some(app),
+            Some(zone_opening),
+        ),
+        zone_opening
+    );
+    // None -> the global opening window (pre-#3527 behavior).
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, None, None),
+        DEFAULT_TCP_OPENING_TIMEOUT_NS
+    );
+    // ESTABLISHED: the opening override must NOT touch the established window.
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, 0x10, true, &to, None, Some(zone_opening)),
+        DEFAULT_TCP_SESSION_TIMEOUT_NS
+    );
+    // Closing / RST: the opening override must NOT extend the short reap window.
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, TCP_FIN, false, &to, None, Some(zone_opening)),
+        TCP_CLOSING_TIMEOUT_NS
+    );
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, TCP_RST, false, &to, None, Some(zone_opening)),
+        TCP_RST_TIMEOUT_NS
     );
 }
 
@@ -1296,6 +1347,124 @@ fn half_open_session_reaps_at_opening_timeout() {
         table2.expire_stale_entries(advance).is_empty(),
         "an established session must survive past the short opening window on the \
          established timeout"
+    );
+}
+
+/// `metadata()` for a specific ingress zone id — used by the #3527 per-zone
+/// half-open override tests.
+fn metadata_with_zone(zone: u16) -> SessionMetadata {
+    SessionMetadata {
+        ingress_zone: zone,
+        ..metadata()
+    }
+}
+
+/// #3527 FAIL-ON-REVERT: a bare-SYN (half-open) session in a zone with a
+/// configured `syn-flood timeout` must reap on that per-zone window, not the
+/// 20 s global default. The override (5 s) is shorter than the global opening
+/// window, so the half-open reaps by 6 s while a control session in an
+/// un-screened zone (global 20 s window) survives. Revert the enforcement
+/// (`session_timeout_ns` ignores the override, or `set_opening_overrides`
+/// never reaches the install) and the override session inherits the 20 s
+/// default, surviving at 6 s — the `expired.len() == 1` assert goes RED.
+#[test]
+fn per_zone_syn_flood_timeout_reaps_half_open_on_override() {
+    const SCREENED_ZONE: u16 = 7;
+    let override_ns = 5 * WHEEL_TICK_NS; // 5 s syn-flood timeout
+    let install_ns = 1_000_000_000u64;
+    // Past the 5 s per-zone override, far short of the 20 s global default.
+    let advance = install_ns + 6 * WHEEL_TICK_NS;
+
+    let mut overrides = rustc_hash::FxHashMap::default();
+    overrides.insert(SCREENED_ZONE, override_ns);
+
+    // --- screened zone: install stamps the per-zone override at create time ---
+    let mut table = SessionTable::new();
+    table.set_opening_overrides(overrides.clone());
+    let key = key_v4();
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata_with_zone(SCREENED_ZONE),
+        install_ns,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    let entry = table.entry_by_key(&key).expect("opening entry");
+    assert!(!entry.established, "a bare-SYN session must start OPENING");
+    assert_eq!(
+        entry.expires_after_ns, override_ns,
+        "a half-open session in a screened zone must reap on the per-zone \
+         syn-flood timeout, not the 20 s global default"
+    );
+    assert_ne!(
+        entry.expires_after_ns, DEFAULT_TCP_OPENING_TIMEOUT_NS,
+        "the per-zone override must replace the global opening window"
+    );
+    table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    let expired = table.expire_stale_entries(advance);
+    assert_eq!(
+        expired.len(),
+        1,
+        "the half-open session must reap at the 5 s per-zone window by 6 s"
+    );
+    assert_eq!(expired[0].key, key);
+
+    // --- control: a half-open in an UNSCREENED zone survives past 6 s on the
+    //     20 s global default (proves the override is per-zone, not global) ---
+    let mut table2 = SessionTable::new();
+    table2.set_opening_overrides(overrides);
+    let key2 = key_v4();
+    assert!(table2.install_with_protocol(
+        key2.clone(),
+        decision(),
+        metadata_with_zone(SCREENED_ZONE + 1), // no override entry for this zone
+        install_ns,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    assert_eq!(
+        table2.entry_by_key(&key2).expect("opening").expires_after_ns,
+        DEFAULT_TCP_OPENING_TIMEOUT_NS,
+        "an unscreened zone keeps the global opening window"
+    );
+    table2.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    assert!(
+        table2.expire_stale_entries(advance).is_empty(),
+        "a half-open in an unscreened zone must survive past 6 s on the 20 s default"
+    );
+}
+
+/// #3527: a SYN retransmit on a still-half-open session re-stamps the opening
+/// window from the per-zone override (the refresh path in lookup.rs), not the
+/// global default — so a stalled handshake in a screened zone keeps reaping on
+/// the operator's window across retransmits.
+#[test]
+fn per_zone_syn_flood_timeout_applies_on_opening_refresh() {
+    const SCREENED_ZONE: u16 = 9;
+    let override_ns = 5 * WHEEL_TICK_NS;
+    let now = 1_000_000_000u64;
+    let mut overrides = rustc_hash::FxHashMap::default();
+    overrides.insert(SCREENED_ZONE, override_ns);
+
+    let mut table = SessionTable::new();
+    table.set_opening_overrides(overrides);
+    let key = key_v4();
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata_with_zone(SCREENED_ZONE),
+        now,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    // SYN retransmit (still OPENING, no ACK) — the refresh re-stamps the window.
+    assert!(table.lookup(&key, now + 1_000_000, TCP_SYN).is_some());
+    let entry = table.entry_by_key(&key).expect("still opening");
+    assert!(!entry.established, "a SYN retransmit keeps the session OPENING");
+    assert_eq!(
+        entry.expires_after_ns, override_ns,
+        "an OPENING refresh must re-stamp the per-zone override, not the global default"
     );
 }
 
@@ -2426,6 +2595,9 @@ fn reference_update_session(
             entry.established,
             &table.timeouts,
             entry.metadata.inactivity_timeout_ns,
+            // #3527: mirror update_session — resolve the per-zone half-open
+            // override so the reference parity sweep stays faithful.
+            table.opening_override_for(entry.metadata.ingress_zone),
         )
     };
     let created_ns = entry.created_ns;

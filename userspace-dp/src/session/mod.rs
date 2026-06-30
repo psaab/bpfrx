@@ -461,6 +461,21 @@ pub(crate) struct SessionTable {
     last_gc_ns: u64,
     max_sessions: usize,
     timeouts: SessionTimeouts,
+    /// #3527: per-screened-zone override of the global half-open
+    /// (`tcp_opening_ns`) TCP timeout window, keyed by ingress zone id. Built
+    /// from `security screen ids-option <p> tcp syn-flood timeout <N>` (the
+    /// Junos half-completed-connection queue window) and pushed alongside
+    /// `set_timeouts` from the worker's applied forwarding snapshot
+    /// (`set_opening_overrides`). When a bare-SYN OPENING session's ingress
+    /// zone has an entry here, `session_timeout_ns` reaps it at the override
+    /// instead of `DEFAULT_TCP_OPENING_TIMEOUT_NS`, so a per-zone syn-flood
+    /// `timeout` actually bounds how long that zone's half-opens linger. Config
+    /// is identical on both HA nodes, so this is re-derived per node from the
+    /// snapshot — it never crosses the session-sync wire (a synced session is
+    /// imported ESTABLISHED, so the opening branch is never taken for it; see
+    /// `upsert_synced_with_origin`). Empty = no zone configures a syn-flood
+    /// timeout, byte-identical to pre-#3527.
+    opening_overrides: FxHashMap<u16, u64>,
     epoch_counter: u64,
     expired: u64,
     create_drops: u64,
@@ -582,6 +597,9 @@ impl SessionTable {
             last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
             timeouts: SessionTimeouts::default(),
+            // #3527: empty until a forwarding snapshot with a per-zone
+            // syn-flood timeout is applied via `set_opening_overrides`.
+            opening_overrides: FxHashMap::default(),
             epoch_counter: 0,
             expired: 0,
             create_drops: 0,
@@ -609,6 +627,30 @@ impl SessionTable {
     /// Update the configurable session timeouts.
     pub fn set_timeouts(&mut self, timeouts: SessionTimeouts) {
         self.timeouts = timeouts;
+    }
+
+    /// #3527: install the per-screened-zone half-open (`tcp_opening_ns`)
+    /// timeout overrides (zone id → ns), driven from each zone's `syn-flood
+    /// timeout`. Called at worker startup and on every runtime
+    /// forwarding-snapshot rotation, right next to `set_timeouts`. A full
+    /// replace (not a merge): a zone whose timeout was removed from the config
+    /// drops out of the new map and reverts to the global default on the next
+    /// install/refresh. Empty map = no per-zone override (global default for
+    /// every zone), the pre-#3527 behavior.
+    pub fn set_opening_overrides(&mut self, overrides: FxHashMap<u16, u64>) {
+        self.opening_overrides = overrides;
+    }
+
+    /// #3527: resolve the half-open opening-window override for an ingress
+    /// zone, or `None` to use the global `tcp_opening_ns`. The common case
+    /// (no zone configures a syn-flood timeout) is an empty map and a single
+    /// missed lookup.
+    #[inline]
+    fn opening_override_for(&self, ingress_zone: u16) -> Option<u64> {
+        if self.opening_overrides.is_empty() {
+            return None;
+        }
+        self.opening_overrides.get(&ingress_zone).copied()
     }
 
     /// #2134: drive the per-IP session-limit OFF-gate from the worker's
@@ -1020,6 +1062,9 @@ impl SessionTable {
         }
 
         let epoch = self.next_epoch();
+        // #3527: resolve the per-zone half-open override before borrowing the
+        // record mutably (the timeout selection below cannot re-borrow self).
+        let opening_override_ns = self.opening_override_for(metadata.ingress_zone);
         {
             let record = self
                 .entries
@@ -1070,6 +1115,10 @@ impl SessionTable {
                     record.entry.established,
                     &self.timeouts,
                     metadata.inactivity_timeout_ns,
+                    // #3527: opening-window override for an OPENING refresh
+                    // (a SYN retransmit on a still-half-open session). Ignored
+                    // once `established`.
+                    opening_override_ns,
                 )
             };
             // wheel_tick deliberately preserved (parity with restore_entry).
@@ -1660,12 +1709,22 @@ fn remove_owner_rg_index_entry(
 /// idle window. The per-app override and the established timeout apply only
 /// once the session is established. `established` is ignored for non-TCP
 /// protocols and for the closing branch.
+///
+/// #3527: `opening_override_ns` is the ingress zone's `syn-flood timeout`
+/// mapped to the half-open window (ns), or `None` for the global
+/// `tcp_opening_ns`. When `Some`, it replaces the OPENING-branch window ONLY
+/// (it is the half-completed-connection queue window, not an established idle
+/// timeout — it never touches the established / closing / RST branches). A
+/// half-open session in a zone with `syn-flood timeout N` therefore reaps `N`
+/// seconds after install instead of the 20 s default, so a flood that stops is
+/// forgotten on the operator's window. `None` is byte-identical to pre-#3527.
 fn session_timeout_ns(
     protocol: u8,
     tcp_flags: u8,
     established: bool,
     timeouts: &SessionTimeouts,
     app_override_ns: Option<u64>,
+    opening_override_ns: Option<u64>,
 ) -> u64 {
     match protocol {
         PROTO_TCP => {
@@ -1683,8 +1742,10 @@ fn session_timeout_ns(
                 // #3152: handshake-incomplete (OPENING / half-open) — the
                 // short opening window. The per-app override does NOT apply
                 // here (it is the established-session idle timeout); a
-                // half-open session reaps fast regardless.
-                timeouts.tcp_opening_ns
+                // half-open session reaps fast regardless. #3527: a per-zone
+                // `syn-flood timeout` overrides the global opening window for
+                // this zone's half-opens.
+                opening_override_ns.unwrap_or(timeouts.tcp_opening_ns)
             } else {
                 app_override_ns.unwrap_or(timeouts.tcp_established_ns)
             }

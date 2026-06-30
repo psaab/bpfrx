@@ -44,6 +44,15 @@ impl SessionTable {
         // Pre-compute the timeout before borrowing &mut self.entries
         // so the inner block doesn't need to access self.timeouts.
         let timeouts = self.timeouts;
+        // #3527: resolve the per-zone half-open override the same way, by
+        // peeking the entry's ingress zone before the &mut borrow. Only
+        // consulted on the OPENING branch (a SYN retransmit on a still
+        // half-open session); ignored once the session is established.
+        let opening_override_ns = self
+            .entries
+            .get(handle as usize)
+            .map(|r| r.entry.metadata.ingress_zone)
+            .and_then(|zone| self.opening_override_for(zone));
         // Scope the &mut self.entries borrow so it ends BEFORE we
         // touch self.wheel via push_to_wheel. Without this scoping
         // the &mut record would conflict with the second &mut self
@@ -119,6 +128,8 @@ impl SessionTable {
                     entry.established,
                     &timeouts,
                     entry.metadata.inactivity_timeout_ns,
+                    // #3527: per-zone half-open override resolved above.
+                    opening_override_ns,
                 )
             };
             (

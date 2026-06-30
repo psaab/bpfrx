@@ -952,6 +952,7 @@
     "syn_flood_dst_threshold": 0,
     "syn_flood_src_threshold": 0,
     "syn_flood_threshold": 0,
+    "syn_flood_timeout": 0,
     "syn_frag": false,
     "tcp_no_flag": false,
     "teardrop": false,
