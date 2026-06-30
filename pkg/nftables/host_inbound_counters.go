@@ -28,14 +28,67 @@ const hostInboundDenyCounterPrefix = "xpfhi_"
 // catch-all drop before #3361; attaching a named counter makes those drops
 // scrapeable per zone/family.
 //
-// Encoding is xpfhi_<family>_<len(zone)>_<zone>. The length prefix makes the
-// name unambiguously reversible by ParseHostInboundDenyCounterName even when the
-// zone name itself contains '_' or '-' (both legal in a Junos zone name), so the
-// Prometheus collector recovers the zone/family labels straight from the kernel
-// object name without re-deriving them from config. family is one of the two
-// fixed tokens "ip"/"ip6" so the family/length boundary is never ambiguous.
+// Encoding is xpfhi_<family>_<len>_<zone> where <zone> is the zone name passed
+// through sanitizeNftIdent and <len> is its byte length. The length prefix
+// makes the name unambiguously reversible by ParseHostInboundDenyCounterName
+// even when the zone name itself contains '_' or '-' (both legal in a Junos zone
+// name AND in a bare nft identifier), so the Prometheus collector recovers the
+// zone/family labels straight from the kernel object name without re-deriving
+// them from config. family is one of the two fixed tokens "ip"/"ip6" so the
+// family/length boundary is never ambiguous.
+//
+// Sanitization (#3578): this name is emitted both as an nft counter REFERENCE
+// (`counter name "<n>"`, which nft accepts quoted) AND as a counter DECLARATION
+// (`counter <n> { }`, which nft v1.1.6 requires UNQUOTED — a quoted declaration
+// is a hard syntax error). A bare nft identifier accepts only [A-Za-z0-9_.-];
+// the Junos lexer additionally permits ':','+','*','%','=',',','<','>' (and '/',
+// already rejected for zone names at commit) in a zone name, any of which would
+// make the bare declaration fail to parse. sanitizeNftIdent maps every byte
+// outside the bare-safe set to '_'. The mapping is length-preserving so the
+// <len> prefix stays a valid reverse key, and it is the identity for the common
+// zone-name set [A-Za-z0-9_.-] (so existing names/labels are unchanged).
+//
+// Tradeoff for an exotic zone name (bytes outside [A-Za-z0-9_.-]; only '/' is
+// commit-blocked, while ':;+*%=,<>' commit fine): the recovered Prometheus zone
+// LABEL is the lossy sanitized form, and two such zones differing only in their
+// unsafe bytes (e.g. "a:b" and "a+b") COLLIDE onto one counter object. This is a
+// metric-aggregation artifact ONLY — the catch-all DROP rules are per
+// (zone, daddr), so there is no security, forwarding, or counter-dedup
+// mis-routing: the kernel still drops each zone's host-bound traffic correctly;
+// only the two zones' deny COUNTS merge under one label. A hash suffix was
+// deliberately NOT used so the object name stays human-readable and the reverse
+// lookup stays simple; the collision is operator-self-inflicted via exotic
+// naming and bounded to the metric. Without sanitization the zone's ruleset
+// would fail to apply at all (no metric whatsoever), so the lossy label is
+// strictly better.
 func HostInboundDenyCounterName(zone, family string) string {
-	return fmt.Sprintf("%s%s_%d_%s", hostInboundDenyCounterPrefix, family, len(zone), zone)
+	z := sanitizeNftIdent(zone)
+	return fmt.Sprintf("%s%s_%d_%s", hostInboundDenyCounterPrefix, family, len(z), z)
+}
+
+// sanitizeNftIdent maps a string to the byte set nft v1.1.6 accepts in a BARE
+// identifier ([A-Za-z0-9_.-]), replacing every other byte with '_'. It is
+// length-preserving and allocation-free when the input is already bare-safe.
+// See HostInboundDenyCounterName for why declarations cannot be quoted (#3578).
+func sanitizeNftIdent(s string) string {
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '_', c == '-', c == '.':
+			// safe in a bare nft identifier; leave as-is.
+		default:
+			if b == nil {
+				b = []byte(s)
+			}
+			b[i] = '_'
+		}
+	}
+	if b == nil {
+		return s
+	}
+	return string(b)
 }
 
 // ParseHostInboundDenyCounterName reverses HostInboundDenyCounterName. It returns
