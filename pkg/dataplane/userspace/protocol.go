@@ -887,6 +887,40 @@ type FirewallTermSnapshot struct {
 	// kept only the last, dropping the earlier constraint.
 	ICMPTypes WireUint8List `json:"icmp_types,omitempty"`
 	ICMPCodes WireUint8List `json:"icmp_codes,omitempty"`
+	// ICMPTypeUnrepresentable / ICMPCodeUnrepresentable (#3406) are set true when
+	// the term carried at least one `from icmp-type` / `from icmp-code` token the
+	// compiler could NOT resolve to a byte in 0..255 (a symbolic name with no
+	// mapping, or a numeric value outside the range). compileFilterFrom records
+	// such a token on term.UnknownICMPTypes / term.UnknownICMPCodes; the strict
+	// commit gate (validateFilterMatchValuesStrict) rejects it, so a committed
+	// config never sets these. They are the helper-boundary fail-closed marker for
+	// a corrupt / hand-built / version-drifted snapshot. The pre-#3406 builder
+	// dropped the unresolved token entirely and emitted only the resolved bytes;
+	// when EVERY token was unresolvable the emitted vector was empty, which the
+	// Rust matcher reads as "no ICMP constraint" — silently WIDENING the term to
+	// match every ICMP(v6) packet (fail-OPEN for a discard/reject term; leaking the
+	// excepted type for an accept term). With these flags the Rust filter compiler
+	// raises SnapshotIntegrityError::UnrepresentableFilterICMP and rejects the
+	// whole snapshot instead. omitempty + the Rust serde default keep wire parity
+	// with an older control plane that omits the field (#1961).
+	ICMPTypeUnrepresentable bool `json:"icmp_type_unrepresentable,omitempty"`
+	ICMPCodeUnrepresentable bool `json:"icmp_code_unrepresentable,omitempty"`
+	// DSCPMatchUnrepresentable (#3406) is set true when the term carried a
+	// non-empty `from dscp` / `from traffic-class` MATCH token that resolves to
+	// neither a known code-point name nor an integer 0..63. The strict commit gate
+	// (validateFilterDSCPStrict, #3309) rejects it, so a committed config never
+	// sets this. The pre-#3406 builder dropped the unresolved token from
+	// DSCPValues; when EVERY DSCP token was unresolvable the emitted vector was
+	// empty, which the Rust matcher reads as "no DSCP constraint" — silently
+	// WIDENING the term to match all DSCPs (fail-OPEN, a documented #3309 gap). With
+	// this flag the Rust filter compiler raises
+	// SnapshotIntegrityError::UnrepresentableFilterDSCP and rejects the whole
+	// snapshot. Note this covers only the MATCH side; an unrepresentable `then dscp`
+	// REWRITE token is CoS-only (no security widening) and is surfaced with a
+	// builder warning rather than a snapshot reject. omitempty + the Rust serde
+	// default keep wire parity with an older control plane that omits the field
+	// (#1961).
+	DSCPMatchUnrepresentable bool `json:"dscp_match_unrepresentable,omitempty"`
 	// FlexMatch is the Junos `from flexible-match-range` byte-offset match
 	// (#3077). Before this wiring it was parsed + compiled for the retired
 	// legacy dataplane but DROPPED on the userspace wire, so the byte-offset
@@ -912,7 +946,17 @@ type FirewallTermSnapshot struct {
 // (1..4, derived from the Junos bit-length); Value is the expected value AFTER
 // masking; Mask is applied to the read bytes before the equality compare.
 type FlexMatchSnapshot struct {
-	Offset uint8  `json:"offset"`
+	Offset uint8 `json:"offset"`
+	// Length is the match width in BYTES, derived from the Junos bit-length
+	// (ceil(bits/8)). A representable flex match is 1..4 bytes (the Value/Mask
+	// wire fields are u32). #3406: the builder NO LONGER caps an oversized width
+	// to 4 — a length > 4 (only reachable via a corrupt / hand-built /
+	// version-drifted snapshot, since the commit gate bounds bit-length to 1..32 →
+	// ceil ≤ 4) is carried verbatim so the Rust filter compiler raises
+	// SnapshotIntegrityError::UnrepresentableFilterFlexMatch and rejects the whole
+	// snapshot. The pre-#3406 builder capped it to 4 and still emitted the term, so
+	// only the truncated 4-byte window was compared and the match BROADENED
+	// (fail-open).
 	Length uint8  `json:"length"`
 	Value  uint32 `json:"value"`
 	Mask   uint32 `json:"mask"`
