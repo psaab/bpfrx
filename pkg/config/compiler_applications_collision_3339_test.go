@@ -280,6 +280,151 @@ applications {
 	}
 }
 
+// #3472 (Codex review audit 116, H01/H02/H03 + M03): #3339's collision pass
+// only counted AUTHORED application/application-set names, so a GENERATED
+// per-term application name (`<parent>-<term>`, written into apps.Applications)
+// was invisible to it and still silently last-write-wins. These fixtures pin the
+// strict reject for the three generated-name collision classes and the warning
+// for a generated name shadowing a predefined junos-* application.
+
+// H01: a generated per-term application name overwrites an authored top-level
+// application. Multi-term `app` term `ssh` mints `app-ssh`; an authored
+// `application app-ssh` also exists. Both write apps.Applications["app-ssh"];
+// before #3472 the later write silently won with no commit error.
+func TestGeneratedTermNameOverwritesAuthoredApplicationRejected(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set applications application app term ssh protocol tcp destination-port 22",
+		"set applications application app term web protocol tcp destination-port 80",
+		"set applications application app-ssh protocol udp destination-port 53",
+	})
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of generated term name overwriting authored application, got nil")
+	}
+	if !strings.Contains(err.Error(), "app-ssh") ||
+		!strings.Contains(err.Error(), "authored application") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// H02: a generated per-term application name collides with an authored
+// application-set. Generated `app-ssh` (apps.Applications) vs `application-set
+// app-ssh` (apps.ApplicationSets) — the two resolution paths (application-first
+// for policy expansion, set-first for the AppID catalog) then diverge.
+func TestGeneratedTermNameCollidesWithApplicationSetRejected(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set applications application app term ssh protocol tcp destination-port 22",
+		"set applications application app term web protocol tcp destination-port 80",
+		"set applications application-set app-ssh application junos-https",
+	})
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of generated term name colliding with application-set, got nil")
+	}
+	if !strings.Contains(err.Error(), "app-ssh") ||
+		!strings.Contains(err.Error(), "authored application-set") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// H03: two DIFFERENT parents generate the same per-term application name.
+// `application a-b term c` and `application a term b-c` both mint `a-b-c`;
+// #3339's per-parent termSeen bucketed them separately so the later silently won.
+func TestCrossParentGeneratedNameCollisionRejected(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set applications application a-b term c protocol tcp destination-port 22",
+		"set applications application a-b term x protocol tcp destination-port 81",
+		"set applications application a term b-c protocol udp destination-port 53",
+		"set applications application a term y protocol udp destination-port 54",
+	})
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of cross-parent generated name collision, got nil")
+	}
+	if !strings.Contains(err.Error(), "a-b-c") ||
+		!strings.Contains(err.Error(), "collides across parents") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// M03: a generated per-term application name shadows a predefined junos-*
+// application. `application junos term ssh` mints `junos-ssh`, which shadows the
+// predefined junos-ssh service. This is a WARNING on BOTH paths (never a hard
+// reject) — a user-defined application legitimately wins over predefined, so the
+// strict commit must SUCCEED while surfacing the accidental shadow.
+func TestGeneratedTermNameShadowsPredefinedWarns(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set applications application junos term ssh protocol tcp destination-port 22",
+		"set applications application junos term web protocol tcp destination-port 80",
+	})
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: a generated predefined shadow must warn, not reject: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "junos-ssh") && strings.Contains(w, "shadows the predefined") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a #3472 predefined-shadow warning for junos-ssh, got: %v", cfg.Warnings)
+	}
+}
+
+// The three generated-name collision classes must downgrade to a warning on the
+// tolerant load / peer-sync path so an already-persisted config still BOOTS.
+func TestGeneratedTermNameCollisionLenientWarns(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set applications application app term ssh protocol tcp destination-port 22",
+		"set applications application app term web protocol tcp destination-port 80",
+		"set applications application app-ssh protocol udp destination-port 53",
+	})
+
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: generated-name collision must downgrade to a warning, got error: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "app-ssh") && strings.Contains(w, "#3472") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a #3472 generated-name collision warning on the lenient path, got: %v", cfg.Warnings)
+	}
+}
+
+// A multi-term application whose generated names do NOT collide with anything
+// must commit cleanly — the generated-name pass must not over-reject the normal
+// multi-term case.
+func TestGeneratedTermNamesNoCollisionCommit(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set applications application app term ssh protocol tcp destination-port 22",
+		"set applications application app term web protocol tcp destination-port 80",
+		"set applications application other protocol udp destination-port 53",
+		"set applications application-set myset application app",
+		"set applications application-set myset application other",
+	})
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: unexpected error on non-colliding generated names: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#3472") {
+			t.Fatalf("unexpected #3472 warning on a non-colliding config: %q", w)
+		}
+	}
+}
+
 // Lenient path (load / peer-sync) must WARN, not brick: an already-persisted
 // colliding config still compiles, with the collision surfaced as a warning.
 func TestApplicationNameCollisionLenientWarns(t *testing.T) {
