@@ -2650,24 +2650,23 @@ func validateReservedZoneNamesStrict(cfg *Config) error {
 // (`from-zone <a> to-zone <b> { policy ... }`) whose from-zone or to-zone names
 // a security zone the configuration never defines (#2401).
 //
-// Such a stanza is compiled and the rules are KEPT, but the userspace
-// dataplane resolves the unknown zone name to no zone-id and therefore never
-// indexes the rule into its zone-pair lookup table (userspace-dp/src/policy.rs:
-// the unknown-zone branch logs "policy rule references unknown zone(s) ...
-// (rule kept, but not indexed)"). At match time the zone pair has no indexed
-// rule, so evaluation falls through to `state.default_action`: under a permit
-// default this is a silent fail-OPEN (a deny rule the operator wrote against a
-// mistyped/uncreated zone does nothing); under a deny default it blackholes
-// with no operator-visible signal beyond a stderr line. Junos rejects an
-// undefined zone reference at commit; this validator restores that fail-CLOSED
-// parity.
+// Junos rejects an undefined zone reference at commit; this validator restores
+// that fail-CLOSED parity. Without it, such a stanza was compiled and KEPT, but
+// the userspace dataplane resolved the unknown zone name to no zone-id; before
+// #3402 it then silently DROPPED the unindexed rule, so the zone pair fell
+// through to `state.default_action` (a fail-OPEN deny under a permit default, a
+// blackhole under a deny default, with no operator-visible signal beyond a
+// stderr line).
 //
 // ValidateConfig already surfaced this as a warning only (commit succeeded with
 // an unenforceable rule). This is the strict commit / commit-check gate;
 // CompileConfigLenient downgrades it back to a warning (lenientPolicyZoneRefs)
 // so an already-persisted or peer-synced config carrying a stale zone reference
-// still boots — the dataplane drops the unindexed rule on its own, so a
-// leniently-loaded bad config is inert.
+// still boots the daemon. Since #3402 the dataplane no longer silently drops
+// the rule: its integrity preflight rejects the WHOLE snapshot
+// (SnapshotIntegrityError::UnresolvableZoneReference) and retains the previous
+// good state (default-deny on a fresh boot), so a leniently-loaded bad config
+// fails closed rather than silently un-enforcing the rule.
 //
 // Special zone tokens (`any`, `junos-host`, the empty token) are exempt; global
 // policies are not iterated (see policyZoneSpecialTokens). Iteration is in
@@ -2702,11 +2701,13 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 	// #3148: a global policy may carry optional from-zone/to-zone match
 	// context. An empty context means "all zones" (exempt via the "" special
 	// token); a non-empty context that names an undefined zone makes the
-	// dataplane fail CLOSED (GlobalZoneScope::Unresolved → matches nothing,
-	// userspace-dp/src/policy.rs), so the operator's scoped global policy
-	// silently does nothing. Reject it at commit for the same fail-closed
-	// parity as the zone-pair case above; the lenient path downgrades to a
-	// warning so an already-persisted config still boots.
+	// dataplane fail CLOSED — since #3402 it raises
+	// SnapshotIntegrityError::UnresolvableZoneReference (build_global_zone_scope
+	// in userspace-dp/src/policy.rs), rejecting the whole snapshot rather than
+	// silently producing a matches-nothing scope that removes the operator's
+	// scoped global policy. Reject it at commit for the same fail-closed parity
+	// as the zone-pair case above; the lenient path downgrades to a warning so
+	// an already-persisted config still boots the daemon.
 	for _, pol := range cfg.Security.GlobalPolicies {
 		if pol == nil {
 			continue

@@ -724,18 +724,21 @@ type compileOpts struct {
 	// zone-pair reference gate (validatePolicyZoneReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
 	// commit-check path hard-rejects a `from-zone`/`to-zone` policy stanza
-	// that names a security zone the config never defines. Such a rule is
-	// compiled and kept, but the dataplane resolves its from/to zone name to
-	// no zone-id and so never indexes it into the zone-pair lookup
-	// (userspace-dp/src/policy.rs unknown-zone branch — "rule kept, but not
-	// indexed"); the zone pair then falls through to the default action,
-	// silently failing OPEN under a permit default (or blackholing under a
-	// deny default). ValidateConfig only WARNED on this, so the commit
-	// succeeded with an unenforceable rule. The tolerant load / peer-sync
-	// paths downgrade to a warning so an already-persisted or peer-synced
-	// config carrying a stale zone reference still BOOTS (#1960 no-brick) —
-	// the dataplane drops the unindexed rule independently, so a leniently-
-	// loaded bad config is inert. Same doctrine as lenientPolicyMatchAddress.
+	// that names a security zone the config never defines. ValidateConfig
+	// only WARNED on this, so the commit succeeded with an unenforceable
+	// rule. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config carrying a stale zone reference
+	// still BOOTS the daemon (#1960 no-brick: the management plane stays
+	// alive so the operator can fix it). The dataplane is independently
+	// hardened to fail CLOSED on such a snapshot: since #3402 the Rust
+	// integrity preflight rejects the WHOLE snapshot
+	// (SnapshotIntegrityError::UnresolvableZoneReference) rather than dropping
+	// the unindexed rule and letting its zone pair fall through to the default
+	// action (a silent fail-OPEN under permit-all, a blackhole under
+	// deny-all). The previous good dataplane state is retained (a fresh boot
+	// keeps the default-deny PolicyState), so a leniently-loaded bad config
+	// cannot silently un-enforce a configured rule. Same doctrine as
+	// lenientPolicyMatchAddress.
 	lenientPolicyZoneRefs bool
 	// lenientZoneCount (#2391) downgrades the security-zone count cap gate
 	// (validateZoneCountStrict) from a hard compile error to a cfg.Warnings
