@@ -4122,14 +4122,22 @@ func (x *GetInterfacesResponse) GetInterfaces() []*InterfaceInfo {
 }
 
 type InterfaceInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Ifindex       int32                  `protobuf:"varint,2,opt,name=ifindex,proto3" json:"ifindex,omitempty"`
-	Zone          string                 `protobuf:"bytes,3,opt,name=zone,proto3" json:"zone,omitempty"`
-	RxPackets     uint64                 `protobuf:"varint,4,opt,name=rx_packets,json=rxPackets,proto3" json:"rx_packets,omitempty"`
-	RxBytes       uint64                 `protobuf:"varint,5,opt,name=rx_bytes,json=rxBytes,proto3" json:"rx_bytes,omitempty"`
-	TxPackets     uint64                 `protobuf:"varint,6,opt,name=tx_packets,json=txPackets,proto3" json:"tx_packets,omitempty"`
-	TxBytes       uint64                 `protobuf:"varint,7,opt,name=tx_bytes,json=txBytes,proto3" json:"tx_bytes,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Name      string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Ifindex   int32                  `protobuf:"varint,2,opt,name=ifindex,proto3" json:"ifindex,omitempty"`
+	Zone      string                 `protobuf:"bytes,3,opt,name=zone,proto3" json:"zone,omitempty"`
+	RxPackets uint64                 `protobuf:"varint,4,opt,name=rx_packets,json=rxPackets,proto3" json:"rx_packets,omitempty"`
+	RxBytes   uint64                 `protobuf:"varint,5,opt,name=rx_bytes,json=rxBytes,proto3" json:"rx_bytes,omitempty"`
+	TxPackets uint64                 `protobuf:"varint,6,opt,name=tx_packets,json=txPackets,proto3" json:"tx_packets,omitempty"`
+	TxBytes   uint64                 `protobuf:"varint,7,opt,name=tx_bytes,json=txBytes,proto3" json:"tx_bytes,omitempty"`
+	// unavailable is true when the per-interface dataplane counter read FAILED
+	// for this interface (degraded counter bridge / userspace shim). The
+	// counter fields above are then left at 0 but are NOT authoritative, so a
+	// real idle 0 stays distinguishable from an unavailable read. Omitted
+	// (false) when counters were read successfully. Uniform contract across
+	// REST /stats/interfaces, REST /interfaces, and the Prometheus
+	// xpf_interface_counter_read_errors_total counter (#3464).
+	Unavailable   bool `protobuf:"varint,8,opt,name=unavailable,proto3" json:"unavailable,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4211,6 +4219,13 @@ func (x *InterfaceInfo) GetTxBytes() uint64 {
 		return x.TxBytes
 	}
 	return 0
+}
+
+func (x *InterfaceInfo) GetUnavailable() bool {
+	if x != nil {
+		return x.Unavailable
+	}
+	return false
 }
 
 type ShowInterfacesDetailRequest struct {
@@ -7729,7 +7744,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x15GetInterfacesResponse\x125\n" +
 	"\n" +
 	"interfaces\x18\x01 \x03(\v2\x15.xpf.v1.InterfaceInfoR\n" +
-	"interfaces\"\xc5\x01\n" +
+	"interfaces\"\xe7\x01\n" +
 	"\rInterfaceInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aifindex\x18\x02 \x01(\x05R\aifindex\x12\x12\n" +
@@ -7739,7 +7754,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\brx_bytes\x18\x05 \x01(\x04R\arxBytes\x12\x1d\n" +
 	"\n" +
 	"tx_packets\x18\x06 \x01(\x04R\ttxPackets\x12\x19\n" +
-	"\btx_bytes\x18\a \x01(\x04R\atxBytes\"K\n" +
+	"\btx_bytes\x18\a \x01(\x04R\atxBytes\x12 \n" +
+	"\vunavailable\x18\b \x01(\bR\vunavailable\"K\n" +
 	"\x1bShowInterfacesDetailRequest\x12\x16\n" +
 	"\x06filter\x18\x01 \x01(\tR\x06filter\x12\x14\n" +
 	"\x05terse\x18\x02 \x01(\bR\x05terse\"6\n" +

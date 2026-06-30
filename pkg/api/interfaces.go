@@ -50,6 +50,12 @@ func (s *Server) interfacesHandler(w http.ResponseWriter, _ *http.Request) {
 					is.RxBytes = ctrs.RxBytes
 					is.TxPackets = ctrs.TxPackets
 					is.TxBytes = ctrs.TxBytes
+				} else {
+					// #3464: counter read failed — keep the row but flag it
+					// Unavailable so the clean-0 counters are not mistaken for a
+					// real idle interface (uniform with /stats/interfaces, gRPC
+					// GetInterfaces, and xpf_interface_counter_read_errors_total).
+					is.Unavailable = true
 				}
 			}
 		}

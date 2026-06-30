@@ -234,6 +234,8 @@
     },
     "class_of_service": null,
     "config": null,
+    "default_log_session_close": false,
+    "default_log_session_init": false,
     "default_policy": "",
     "defer_workers": false,
     "destination_nat_rules": [],

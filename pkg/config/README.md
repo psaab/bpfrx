@@ -366,6 +366,17 @@ userspace dataplane via the `ConfigSnapshot.DefaultPolicy` string
 the no-match verdict). The `default-policy` leaf is a typed `ValueEnumOf`
 in `schema_security.go`, so a bogus value fails `commit check`. See
 `docs/config-schema.md` "#3065".
+**Implicit default-policy RT_FLOW logging (#3534):** `set security policies
+default-policy-log session-init|session-close` emits RT_FLOW session logs for
+the implicit default verdict, mirroring a named policy's `then log`. It is a
+SIBLING container (not `default-policy then log`) because the `default-policy`
+enum leaf cannot carry `then` children (schema.go typed-leaf invariant). The
+flags compile to `SecurityConfig.DefaultPolicyLogSessionInit/Close` →
+`ConfigSnapshot.DefaultLogSessionInit/Close` → the Rust default-verdict result;
+a default-PERMIT session then emits RT_FLOW_SESSION_CREATE/CLOSE. They are inert
+under default deny-all/reject-all (no session installed — already logged via the
+policy-deny record), which commit flags WARN-only. See `docs/config-schema.md`
+"#3534".
 **Zone screen-profile reference is fail-closed (#3066):** a security zone's
 `screen <name>` that references a screen-ids-option profile the config never
 defines historically committed with a warning only, and at runtime the

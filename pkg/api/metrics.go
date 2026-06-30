@@ -52,6 +52,18 @@ type xpfCollector struct {
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
 	ifaceBytesTotal   *prometheus.Desc
+	// #3464: monotonic count of per-interface counter reads that failed during
+	// a scrape. A failed read SKIPS that interface's xpf_interface_* samples
+	// (so a degraded counter bridge does NOT report a misleading 0); this
+	// metric is the scrape-error signal for interface counters. Kept SEPARATE
+	// from counterReadErrorsTotal because interface counters are intentionally
+	// out of the #3345 security-counter contract (README "Out of scope"), so
+	// an operator can alert on a degraded interface-counter bridge without
+	// conflating it with security-counter health. The SAMPLE is emitted last in
+	// Collect (emitInterfaceCounterReadErrors), after collectInterfaceCounters,
+	// so a failure this scrape is reflected this scrape.
+	interfaceCounterReadErrorsTotal *prometheus.Desc
+	interfaceCounterReadErrors      atomic.Uint64
 
 	// Zone counters
 	zonePacketsTotal *prometheus.Desc
@@ -502,6 +514,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.counterReadErrorsTotal
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
+	ch <- c.interfaceCounterReadErrorsTotal
 	ch <- c.zonePacketsTotal
 	ch <- c.zoneBytesTotal
 	ch <- c.policyHitsTotal
@@ -839,6 +852,11 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
 	c.collectFilterCounters(ch, dp)
+	// #3464: emit the per-interface scrape-error counter AFTER
+	// collectInterfaceCounters has run, so a read failure this scrape is
+	// reflected in THIS scrape's xpf_interface_counter_read_errors_total. Kept
+	// separate from the security-counter total emitted just below.
+	c.emitInterfaceCounterReadErrors(ch)
 	// #3462: emit the scrape-error counter AFTER global/zone/policy/filter
 	// (and the pre-gate host-inbound collector) have run, so a read failure in
 	// any of them is reflected in THIS scrape's xpf_counter_read_errors_total
