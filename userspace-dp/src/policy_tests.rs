@@ -32,6 +32,24 @@ fn scheduled_allow_snapshot(rule_id: &str, inactive: bool) -> PolicyRuleSnapshot
     }
 }
 
+/// #3395: a minimal lan->wan permit rule carrying an explicit positional
+/// `policy_id`. The stable rule_id derives from from/to/name
+/// (`lan->wan/<name>`), independent of `policy_id`, so the same logical rule
+/// keeps its identity across a renumbering edit.
+fn permit_snapshot(name: &str, policy_id: u32) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        policy_id,
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
 fn policy_counter(state: &PolicyState, rule_id: &str) -> PolicyRuleCounterStatus {
     state
         .counter_snapshots()
@@ -642,6 +660,167 @@ fn hit_counters_reset_after_rule_absent_then_readded() {
     let reset_counter = policy_counter(&active_again, &rule_id);
     assert_eq!(reset_counter.packets, 0);
     assert_eq!(reset_counter.bytes, 0);
+}
+
+// ── #3395: positional policy_id re-resolution at the local publish surfaces ──
+//
+// `policy_id` (#3056) is span-accumulated in config order, frozen onto a session
+// at install. A live mid-list policy insert/delete renumbers every later rule,
+// so the frozen id resolves to the WRONG policy's name afterwards (the
+// display/forensic sibling of the #3322 hit-counter bug). The fix re-resolves
+// the CURRENT positional id from the session's BOUND rule handle
+// (`PolicyState::reresolve_session_policy_id`) at the live-row refresh and the
+// RT_FLOW SESSION_CLOSE emit — the exact SSOT both call sites use. These tests
+// pin that SSOT; the close-path wiring is pinned end-to-end by
+// `flush_session_deltas_session_close_reresolves_policy_id_after_reorder`
+// (afxdp/session_glue/tests.rs).
+
+#[test]
+fn policy_id_reresolves_to_current_index_after_mid_list_insert() {
+    // RED-on-revert: an established session admitted by rule "bee" at positional
+    // id 5 must report bee's NEW positional id after a live insert shifts it —
+    // NOT the frozen install-time id 5. Reverting reresolve_session_policy_id to
+    // return the frozen `stamped` argument makes this read 5 → RED.
+    let store = PolicyCounterStore::default();
+    // Snapshot 1: bee is the only rule, positional id 5. The session binds bee's
+    // hit-counter Arc at install (the #3322 handle), which now also carries bee's
+    // stable rule_id.
+    let s1 = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("bee", 5)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("s1");
+    let bound_bee = s1.hit_counter_by_idx(1).cloned().expect("bee bound handle");
+    assert_eq!(bound_bee.rule_id(), "lan->wan/bee");
+
+    // Snapshot 2: rule "aaa" is inserted ABOVE bee, so bee renumbers 5 -> 6.
+    let s2 = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("aaa", 5), permit_snapshot("bee", 6)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("s2");
+
+    assert_eq!(
+        s2.reresolve_session_policy_id(Some(&bound_bee), 5),
+        6,
+        "established session must re-resolve to bee's CURRENT positional id (6), \
+         not the frozen install-time id (5)"
+    );
+}
+
+#[test]
+fn deleted_rule_resolves_to_unattributed_sentinel_not_reassigned_index() {
+    // #3395 / AGY catch RED-on-revert: when the admitting rule is DELETED a
+    // session must resolve to the unattributed default-policy sentinel — NOT the
+    // frozen positional id, which a later reorder can reassign to a DIFFERENT
+    // extant rule (a confident mis-attribution). Reverting the deleted-rule
+    // fallback from `unwrap_or(DEFAULT_POLICY_SENTINEL_ID)` to
+    // `unwrap_or(stamped)` resolves to 5 (now cee) → RED.
+    let store = PolicyCounterStore::default();
+    let s1 = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("bee", 5)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("s1");
+    let bound_bee = s1.hit_counter_by_idx(1).cloned().expect("bee bound handle");
+
+    // Snapshot 3: bee is DELETED; a DIFFERENT rule "cee" now occupies the freed
+    // positional id 5. bee's rule_id is absent from s3.
+    store.reconcile_rules(&[permit_snapshot("cee", 5)]);
+    let s3 = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("cee", 5)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("s3");
+
+    let resolved = s3.reresolve_session_policy_id(Some(&bound_bee), 5);
+    assert_eq!(
+        resolved, DEFAULT_POLICY_SENTINEL_ID,
+        "deleted admitting rule must resolve to the unattributed default-policy \
+         sentinel"
+    );
+    assert_ne!(
+        resolved, 5,
+        "must NOT resolve to the frozen id 5 — cee now occupies that index"
+    );
+}
+
+#[test]
+fn unbound_session_keeps_frozen_policy_id() {
+    // #3395: an unbound session (idx-0 non-policy: host-local / neighbor-seed /
+    // fabric / tunnel; or a peer-synced session carrying only the wire scalar)
+    // has no local stable identity to re-resolve from, so it keeps its frozen id.
+    // A no-policy session must stay 0 (NOT promoted to the default-policy
+    // sentinel — that would regress the "no policy" rendering).
+    let store = PolicyCounterStore::default();
+    let s = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("bee", 5)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("s");
+    assert_eq!(s.reresolve_session_policy_id(None, 7), 7);
+    assert_eq!(s.reresolve_session_policy_id(None, 0), 0);
+}
+
+#[test]
+fn default_policy_session_reresolves_to_sentinel() {
+    // #3395: a default-PERMIT session (#3363) binds the reserved default_counter
+    // (rule_id "default-policy") and is stamped with DEFAULT_POLICY_SENTINEL_ID.
+    // After a reorder it must re-resolve STABLY to the sentinel — NOT fall into
+    // the deleted-rule arm — because the default policy maps to the sentinel in
+    // the per-snapshot map.
+    let store = PolicyCounterStore::default();
+    let s = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("aaa", 5), permit_snapshot("bee", 6)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("s");
+    let bound_default = s
+        .hit_counter_by_idx(DEFAULT_POLICY_COUNTER_IDX)
+        .cloned()
+        .expect("default-policy bound handle");
+    assert_eq!(bound_default.rule_id(), DEFAULT_POLICY_COUNTER_RULE_ID);
+    assert_eq!(
+        s.reresolve_session_policy_id(Some(&bound_default), DEFAULT_POLICY_SENTINEL_ID),
+        DEFAULT_POLICY_SENTINEL_ID,
+    );
+}
+
+#[test]
+fn fresh_flow_policy_id_reresolution_is_noop() {
+    // #3395: a flow freshly admitted under the CURRENT snapshot re-resolves to
+    // exactly its rule's current positional id — re-resolution introduces no
+    // #3063 Index↔RT_FLOW drift for fresh flows.
+    let store = PolicyCounterStore::default();
+    let s = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("aaa", 5), permit_snapshot("bee", 6)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("s");
+    let bee = s.hit_counter_by_idx(2).cloned().expect("bee");
+    assert_eq!(s.rules[1].policy_id, 6);
+    assert_eq!(s.reresolve_session_policy_id(Some(&bee), 6), 6);
 }
 
 #[test]

@@ -5173,6 +5173,125 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
     );
 }
 
+#[test]
+fn flush_session_deltas_session_close_reresolves_policy_id_after_reorder() {
+    // #3395 RED-on-revert (close path, end-to-end): a session admitted by rule
+    // "bee" at positional policy_id 5, then renumbered to 6 by a live insert of
+    // "aaa" above it, must close with bee's NEW positional id (6) in the
+    // SESSION_CLOSE RT_FLOW [136:140] slot — NOT the frozen install-time id (5).
+    // Reverting emit_session_close_rt_flow / the flush re-resolution to read
+    // `delta.metadata.policy_id` makes [136:140] read 5 → RED.
+    let mut zone_map = FastMap::default();
+    zone_map.insert("lan".to_string(), 1u16);
+    zone_map.insert("wan".to_string(), 2u16);
+
+    let store = crate::policy::PolicyCounterStore::default();
+    let permit = |name: &str, policy_id: u32| crate::PolicyRuleSnapshot {
+        name: name.to_string(),
+        policy_id,
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    // Snapshot 1: bee alone at positional id 5; capture its bound counter handle
+    // (the #3322 install-time binding, now carrying bee's stable rule_id).
+    let s1 = crate::policy::parse_policy_state_with_counters(
+        "deny",
+        &[permit("bee", 5)],
+        &zone_map,
+        &[],
+        &store,
+    )
+    .expect("s1");
+    let bound_bee = s1.hit_counter_by_idx(1).cloned().expect("bee bound handle");
+
+    // Snapshot 2 (post-reorder): aaa inserted above bee, bee renumbered 5 -> 6.
+    let mut forwarding = ForwardingState::default();
+    forwarding.policy = crate::policy::parse_policy_state_with_counters(
+        "deny",
+        &[permit("aaa", 5), permit("bee", 6)],
+        &zone_map,
+        &[],
+        &store,
+    )
+    .expect("s2");
+
+    // The closing session carries bee's bound handle and a STALE frozen
+    // policy_id of 5 (its install-time value).
+    let mut metadata = test_metadata();
+    metadata.policy_id = 5;
+    metadata.policy_counter = Some(bound_bee);
+
+    let delta = SessionDelta {
+        kind: SessionDeltaKind::Close,
+        key: test_key(),
+        decision: test_decision(),
+        metadata,
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
+    };
+
+    let (handle, rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-2"),
+        ifindex: 7,
+    };
+    let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
+    flush_session_deltas(
+        &ident,
+        None,
+        -1,
+        -1,
+        -1,
+        &dnat_fds,
+        &[delta],
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &recent_session_deltas,
+        &peer_worker_commands,
+        &Some(handle),
+        &forwarding,
+    );
+    let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let payload = frames
+        .iter()
+        .find_map(|f| f.dataplane_event_payload())
+        .expect("an RT_FLOW dataplane-event frame on the channel");
+    assert_eq!(payload[52], 2, "RT_FLOW frame must be SESSION_CLOSE (2)");
+    assert_eq!(
+        u32::from_le_bytes(payload[136..140].try_into().unwrap()),
+        6,
+        "SESSION_CLOSE RT_FLOW must carry bee's RE-RESOLVED current positional id \
+         (6), not the frozen install-time id (5)"
+    );
+}
+
 /// #2874 FAIL-ON-REVERT: a correctness-critical HA session OPEN delta that
 /// cannot be queued losslessly to the event-stream consumer must be reported as
 /// out-of-sync (flush_session_deltas returns true) so the worker loop forces a

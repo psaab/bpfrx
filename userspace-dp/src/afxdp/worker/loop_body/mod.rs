@@ -759,6 +759,9 @@ pub(crate) fn worker_loop(
                 conntrack_v4_fd,
                 conntrack_v6_fd,
                 &sessions,
+                // #3395: re-resolve each live row's policy_id against the
+                // current rule table from the session's bound rule handle.
+                &forwarding.policy,
                 loop_now_ns,
             );
         }
