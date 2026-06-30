@@ -41,19 +41,19 @@ const (
 
 // Syslog facility codes (RFC 3164).
 const (
-	FacilityKern     = 0
-	FacilityUser     = 1
-	FacilityDaemon   = 3
-	FacilityAuth     = 4
-	FacilitySyslog   = 5
-	FacilityLocal0   = 16
-	FacilityLocal1   = 17
-	FacilityLocal2   = 18
-	FacilityLocal3   = 19
-	FacilityLocal4   = 20
-	FacilityLocal5   = 21
-	FacilityLocal6   = 22
-	FacilityLocal7   = 23
+	FacilityKern   = 0
+	FacilityUser   = 1
+	FacilityDaemon = 3
+	FacilityAuth   = 4
+	FacilitySyslog = 5
+	FacilityLocal0 = 16
+	FacilityLocal1 = 17
+	FacilityLocal2 = 18
+	FacilityLocal3 = 19
+	FacilityLocal4 = 20
+	FacilityLocal5 = 21
+	FacilityLocal6 = 22
+	FacilityLocal7 = 23
 )
 
 // SyslogClient sends syslog messages over UDP, TCP, or TLS.
@@ -65,7 +65,7 @@ type SyslogClient struct {
 	hostname    string
 	remoteAddr  string
 	sourceAddr  string
-	protocol    string     // "udp", "tcp", "tls"
+	protocol    string // "udp", "tcp", "tls"
 	tlsConfig   *tls.Config
 	Facility    int    // syslog facility code (default: FacilityLocal0)
 	MinSeverity int    // 0 = no filter, else SyslogError(3)/SyslogWarning(4)/SyslogInfo(6)
@@ -98,8 +98,8 @@ type SyslogClient struct {
 	droppedCooldown atomic.Uint64
 
 	// Seams for deterministic testing. nil → real implementations.
-	nowFn  func() time.Time          // clock source (default time.Now)
-	dialFn func() (net.Conn, error)  // dial override (default s.dial)
+	nowFn  func() time.Time         // clock source (default time.Now)
+	dialFn func() (net.Conn, error) // dial override (default s.dial)
 }
 
 // now returns the client's clock (overridable in tests).
@@ -194,6 +194,31 @@ func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string
 	}
 	c.conn = conn
 	return c, nil
+}
+
+// NewSyslogClientWithConn wraps an already-established net.Conn in a syslog
+// client. No dial is performed: the connection is treated as already up, and
+// protocol governs any later reconnect. It exists so callers — primarily
+// tests in other packages such as pkg/daemon — can supply a custom net.Conn
+// (an in-memory pipe or a Close-recording fake) and observe connection
+// teardown, since the conn field is unexported. Production code builds
+// clients through NewSyslogClientTransport.
+func NewSyslogClientWithConn(conn net.Conn, protocol string) *SyslogClient {
+	if protocol == "" {
+		protocol = "udp"
+	}
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "xpf"
+	}
+	return &SyslogClient{
+		hostname:          hostname,
+		protocol:          protocol,
+		conn:              conn,
+		Facility:          FacilityLocal0,
+		writeTimeout:      defaultWriteTimeout,
+		reconnectCooldown: defaultReconnectCooldown,
+	}
 }
 
 // dial establishes a connection based on the configured protocol.
