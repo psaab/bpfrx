@@ -52,6 +52,40 @@ var nftDeleteTable = func(family, name string) ([]byte, error) {
 	return nftApplyPayload(payload)
 }
 
+// Base-chain hook-input priorities for the two daemon-generated local-delivery
+// nftables tables (#3364). Both register `type filter hook input`, but at
+// DISTINCT priorities so their inter-chain evaluation order is a deterministic
+// product invariant rather than implementation-defined. With two base chains at
+// an IDENTICAL hook/priority, netfilter's order between them is unspecified, so
+// which chain's reject/log/counter fires for a packet both would act on could
+// vary silently across nft/kernel versions (a `drop` stays terminal regardless,
+// so this was never a permit bypass — only an observability/determinism gap).
+//
+// Ordering: xpf_lo0 evaluates BEFORE xpf_hostinbound (lo0 has the strictly lower
+// priority number). The lo0.0 input filter is the operator's explicit, named,
+// RE-wide control-plane firewall — the authoritative statement of what is
+// permitted to the box, written with explicit accept/reject/discard verdicts.
+// The zone host-inbound-traffic admission is the coarser Junos default-deny
+// backstop. Running the explicit lo0 filter first lets its operator-authored
+// verdicts (and their reject messages / per-term effects) take observable
+// precedence, with host-inbound governing whatever lo0 did not already
+// terminate — the Junos lo0-filter-then-zone ordering. nftApplyPriorityInvariant
+// (nft_chain_priority_test.go) pins nftLo0FilterPriority < nftHostInboundPriority
+// so the spread cannot silently regress back to a shared priority.
+const (
+	// nftLo0FilterPriority is the `hook input` priority of the xpf_lo0 loopback
+	// input-filter base chain. 0 is the conventional `filter` priority (the lo0
+	// chain IS the operator's firewall filter); it is STRICTLY LESS THAN
+	// nftHostInboundPriority so lo0 evaluates first.
+	nftLo0FilterPriority = 0
+	// nftHostInboundPriority is the `hook input` priority of the xpf_hostinbound
+	// base chain. It is STRICTLY GREATER THAN nftLo0FilterPriority so the zone
+	// host-inbound default-deny backstop runs AFTER the lo0 input filter, and is
+	// kept well below the conventional `security` (50) / `srcnat` (100)
+	// priorities so it stays within the input-filter band.
+	nftHostInboundPriority = 10
+)
+
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
 // Implements "interfaces lo0 unit 0 family inet filter input <name>" by
 // generating nftables rules from the named firewall filter.
@@ -114,7 +148,8 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 	rules = append(rules, "flush table inet xpf_lo0")
 	rules = append(rules, "table inet xpf_lo0 {")
 	rules = append(rules, "  chain input {")
-	rules = append(rules, "    type filter hook input priority 0; policy accept;")
+	// #3364: explicit distinct priority so lo0 evaluates BEFORE xpf_hostinbound.
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftLo0FilterPriority))
 
 	prefixLists := cfg.PolicyOptions.PrefixLists
 	if filterV4 != "" {
@@ -230,7 +265,9 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 // rebuild — every commit and every DHCP/DHCPv6 address change that re-renders
 // the table. Prometheus rate() handles the reset; documented on the metric.)
 //
-// Layout of `chain input` (type filter hook input priority 0; policy accept):
+// Layout of `chain input` (type filter hook input priority 10; policy accept —
+// distinct from the xpf_lo0 chain's priority 0 so this host-inbound backstop
+// evaluates AFTER the lo0 input filter, #3364):
 //  1. ct state established,related accept   — return/ongoing host traffic.
 //  2. meta l4proto { 50, 51 } accept — raw ESP/AH exemption for host-terminated
 //     IPsec (mirrors the userspace stage_ipsec_passthrough_check); the kernel
@@ -305,7 +342,8 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 		rules = append(rules, "  }")
 	}
 	rules = append(rules, "  chain input {")
-	rules = append(rules, "    type filter hook input priority 0; policy accept;")
+	// #3364: explicit distinct priority so host-inbound evaluates AFTER xpf_lo0.
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundPriority))
 	rules = append(rules, "    ct state established,related accept")
 	// Raw ESP (50) / AH (51) are exempt from host-inbound enforcement so the
 	// kernel XFRM stack can decrypt host-terminated IPsec — mirroring the

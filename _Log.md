@@ -24223,3 +24223,34 @@ top.
 - **Timestamp**: 2026-06-30
   - **Action**: #3595 — fixed the release-binary link failure on a modern toolchain (gcc-15 / recent elfutils + zlib). Both libelf.a and libz.a ship a static `crc32` symbol; the userspace-dp helper links -lelf and -lz transitively via the static libbpf/libxdp/xsk_bridge archives, so rust-lld aborts the final link of `xpf-userspace-dp` with "duplicate symbol: crc32". The flag was committed nowhere in the tree (git grep allow-multiple-definition empty) — plain `make build-userspace-dp` / `make cluster-deploy` required RUSTFLAGS=-C link-arg=-Wl,--allow-multiple-definition set out of band (surfaced during the Campaign-8 final integration audit when cluster-deploy failed to link). Fix: carry the workaround in version control at repo-root .cargo/config.toml under [target.x86_64-unknown-linux-gnu] so cargo (invoked from repo-root cwd via --manifest-path, cwd-based config discovery) picks it up. Scoped to the host target: the bpfel-unknown-none userspace-xdp shim (its own userspace-xdp/.cargo/config.toml, pinned toolchain #1864) is a guaranteed no-op (target mismatch). The link-arg takes the first crc32 definition — benign, independent CRC implementations each self-contained. VALIDATION: built `cargo build --manifest-path userspace-dp/Cargo.toml --release` from the worktree repo-root with RUSTFLAGS UNSET (env -u RUSTFLAGS) — linked clean, produced the 7MB binary (rc=0); without the config the same invocation fails with duplicate-crc32 (reproduced as the campaign-audit deploy failure). No code change; no test impact (cargo test relinks identically).
   - **File(s)**: .cargo/config.toml, _Log.md
+- **Timestamp**: 2026-06-30
+  - **Action**: #3364 — gave the two daemon-generated local-delivery nftables
+    base chains DISTINCT hook-input priorities so their inter-chain evaluation
+    order is a deterministic product invariant. Both `inet xpf_lo0`
+    (`buildLo0FilterPayload`) and `inet xpf_hostinbound`
+    (`buildHostInboundFilterPayload`) in pkg/daemon/daemon_nft.go registered
+    `type filter hook input priority 0`. Two base chains on the SAME hook at an
+    IDENTICAL priority have implementation-defined inter-chain order in
+    netfilter, so which chain's reject/log/counter fired for a packet both match
+    was order-dependent and could vary silently across nft/kernel versions (a
+    `drop` stays terminal regardless, so this was never a permit bypass — only an
+    observability/determinism gap, audit codex-review-084 H5). Fix: two named
+    constants `nftLo0FilterPriority = 0` and `nftHostInboundPriority = 10`, both
+    still `hook input`. ORDERING DECISION: lo0 evaluates STRICTLY BEFORE
+    host-inbound (lower priority number). The lo0.0 input filter is the
+    operator's explicit, named, RE-wide control-plane firewall (authoritative
+    accept/reject/discard verdicts), so its operator-authored verdicts take
+    observable precedence; the zone host-inbound-traffic admission is the coarser
+    Junos default-deny backstop governing whatever lo0 did not already terminate
+    — the Junos lo0-filter-then-zone ordering the issue specifies. lo0 stays at
+    the conventional `filter` priority 0; host-inbound moves to 10 (well below the
+    conventional `security`=50 band). RED-on-revert proven: equalizing the
+    constants (host-inbound back to 0) turns BOTH
+    TestNftLocalDeliveryChainsDistinctPriority (parses the priority integer out of
+    each rendered payload, asserts lo0 < host-inbound + matches the constants) and
+    TestNftLocalDeliveryPriorityConstantsOrdered (constant-level guard) RED;
+    restored to green. go test ./pkg/daemon/... green; go build ./pkg/...
+    ./cmd/... green; gofmt + go vet clean on changed files. Doc:
+    pkg/daemon/README.md lo0 + host-inbound bullets document the distinct
+    priorities and the ordering rationale.
+  - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/nft_chain_priority_test.go, pkg/daemon/README.md, _Log.md
