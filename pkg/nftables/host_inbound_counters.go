@@ -29,7 +29,7 @@ const hostInboundDenyCounterPrefix = "xpfhi_"
 // scrapeable per zone/family.
 //
 // Encoding is xpfhi_<family>_<len>_<zone> where <zone> is the zone name passed
-// through sanitizeNftIdentByte and <len> is its byte length. The length prefix
+// through sanitizeNftIdent and <len> is its byte length. The length prefix
 // makes the name unambiguously reversible by ParseHostInboundDenyCounterName
 // even when the zone name itself contains '_' or '-' (both legal in a Junos zone
 // name AND in a bare nft identifier), so the Prometheus collector recovers the
@@ -43,13 +43,24 @@ const hostInboundDenyCounterPrefix = "xpfhi_"
 // is a hard syntax error). A bare nft identifier accepts only [A-Za-z0-9_.-];
 // the Junos lexer additionally permits ':','+','*','%','=',',','<','>' (and '/',
 // already rejected for zone names at commit) in a zone name, any of which would
-// make the bare declaration fail to parse. sanitizeNftIdentByte maps every byte
+// make the bare declaration fail to parse. sanitizeNftIdent maps every byte
 // outside the bare-safe set to '_'. The mapping is length-preserving so the
 // <len> prefix stays a valid reverse key, and it is the identity for the common
-// zone-name set [A-Za-z0-9_.-] (so existing names/labels are unchanged). For a
-// zone whose name needs sanitizing the recovered Prometheus label is the
-// sanitized form; without sanitization that zone's ruleset would fail to apply
-// entirely (no metric at all), so the sanitized label is strictly better.
+// zone-name set [A-Za-z0-9_.-] (so existing names/labels are unchanged).
+//
+// Tradeoff for an exotic zone name (bytes outside [A-Za-z0-9_.-]; only '/' is
+// commit-blocked, while ':;+*%=,<>' commit fine): the recovered Prometheus zone
+// LABEL is the lossy sanitized form, and two such zones differing only in their
+// unsafe bytes (e.g. "a:b" and "a+b") COLLIDE onto one counter object. This is a
+// metric-aggregation artifact ONLY — the catch-all DROP rules are per
+// (zone, daddr), so there is no security, forwarding, or counter-dedup
+// mis-routing: the kernel still drops each zone's host-bound traffic correctly;
+// only the two zones' deny COUNTS merge under one label. A hash suffix was
+// deliberately NOT used so the object name stays human-readable and the reverse
+// lookup stays simple; the collision is operator-self-inflicted via exotic
+// naming and bounded to the metric. Without sanitization the zone's ruleset
+// would fail to apply at all (no metric whatsoever), so the lossy label is
+// strictly better.
 func HostInboundDenyCounterName(zone, family string) string {
 	z := sanitizeNftIdent(zone)
 	return fmt.Sprintf("%s%s_%d_%s", hostInboundDenyCounterPrefix, family, len(z), z)

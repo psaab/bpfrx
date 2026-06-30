@@ -768,17 +768,51 @@ func TestHostInboundFilterIdentResetPayloadParses(t *testing.T) {
 	if nftPath == "" {
 		t.Skip("nft not found; covered by TestHostInboundFilterIdentResetEmitsReset")
 	}
+	// Extend the ident-reset scenario with zones whose names carry bare-safe nft
+	// identifier bytes that sanitizeNftIdent PRESERVES — a hyphen ("wan-zone")
+	// and a dot ("vlan.50") — so the LIVE `nft -c` parse exercises a bare
+	// `counter xpfhi_..._wan-zone {` / `..._vlan.50 {` declaration. This pins at
+	// CI that nft v1.1.6 accepts those bytes UNQUOTED (#3578): an accidental
+	// narrowing of the sanitize charset that mangled '-'/'.' to '_' is caught by
+	// the "survived sanitization" assertions below, and a true nft rejection of
+	// bare '-'/'.' would surface as a `syntax error` and fail the parse. Both
+	// names commit (only '/' is rejected for zone names).
 	cfg := identResetTestConfig()
+	cfg.Interfaces.Interfaces["reth1"] = &config.InterfaceConfig{Name: "reth1", Units: map[int]*config.InterfaceUnit{
+		60: {Number: 60, VlanID: 60, Addresses: []string{"172.16.60.8/24"}},
+		70: {Number: 70, VlanID: 70, Addresses: []string{"172.16.70.8/24"}},
+	}}
+	cfg.Security.Zones["wan-zone"] = &config.ZoneConfig{
+		Name:               "wan-zone",
+		Interfaces:         []string{"reth1.60"},
+		HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+	}
+	cfg.Security.Zones["vlan.50"] = &config.ZoneConfig{
+		Name:               "vlan.50",
+		Interfaces:         []string{"reth1.70"},
+		HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+	}
 	views := buildAndCheckViews(t, cfg)
 	payload := buildHostInboundFilterPayload(views)
 
-	// Sanity: the raw payload must still carry the #3310 reject rule and a #3361
-	// named-counter declaration — otherwise the parse check would be vacuous.
+	// Sanity: the raw payload must still carry the #3310 reject rule and the
+	// #3361 named-counter declaration — otherwise the parse check is vacuous.
 	if !strings.Contains(payload, "tcp dport 113 reject with tcp reset") {
 		t.Fatalf("payload lost the ident-reset reject rule:\n%s", payload)
 	}
 	if !strings.Contains(payload, "counter "+xnft.HostInboundDenyCounterName("wan", "ip")+" {") {
 		t.Fatalf("payload lost the #3361 named-counter declaration:\n%s", payload)
+	}
+	// The hyphen/dot zone counters must be declared BARE with the byte intact
+	// (sanitizeNftIdent is the identity for '-'/'.'); this is what the live nft
+	// parse below then exercises.
+	for _, want := range []string{
+		"counter xpfhi_ip_8_wan-zone {", // hyphen preserved, bare declaration
+		"counter xpfhi_ip_7_vlan.50 {",  // dot preserved, bare declaration
+	} {
+		if !strings.Contains(payload, want) {
+			t.Fatalf("payload missing bare hyphen/dot counter declaration %q:\n%s", want, payload)
+		}
 	}
 
 	cmd := exec.Command(nftPath, "-c", "-f", "-")

@@ -437,7 +437,18 @@ never lock an operator out of a remote box it manages.
   `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =
   `nftables.HostInboundDenyCounterName(zone, family)` (encoding
   `xpfhi_<family>_<len>_<zone>`, reversible even when the zone name contains
-  `_`/`-`). The named counter objects are declared at the top of the table body,
+  `_`/`-`). The `<zone>` segment is passed through `sanitizeNftIdent` (maps any
+  byte outside the bare-safe nft set `[A-Za-z0-9_.-]` to `_`, length-preserving),
+  because the counter is emitted both as a REFERENCE (above, quoted — nft accepts
+  it) AND as a DECLARATION. **The DECLARATION is emitted UNQUOTED
+  (`counter <n> { }`, #3578):** nft v1.1.6 rejects a quoted name in declaration
+  position (`counter "<n>" { }` → `syntax error, unexpected quoted string`),
+  which previously aborted the whole atomic `nft -f` load so the host-inbound
+  chain never installed. For an exotic zone name carrying nft-unsafe bytes
+  (commit blocks only `/`) the sanitized form is what surfaces as the Prometheus
+  zone label, and two such zones can collide onto one counter (metric
+  aggregation only — DROP rules stay per `(zone, daddr)`). The named counter
+  objects are declared at the top of the table body,
   so the table now uses an `add table` / `delete table` / recreate idiom instead
   of lo0's plain `flush table`: `flush` keeps named objects, so redeclaring the
   counters on the next commit would collide ("File exists"). delete+recreate also
