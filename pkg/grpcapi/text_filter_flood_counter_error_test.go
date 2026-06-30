@@ -112,3 +112,52 @@ func TestShowScreenStatisticsAllTextWarnsOnReadError(t *testing.T) {
 		t.Fatalf("showScreenStatisticsAll text lacks a flood counter-read warning; got:\n%s", buf.String())
 	}
 }
+
+// partialFloodErrGRPCDP succeeds zone ID 1 and fails zone ID 2, modelling the
+// #3344 partial-failure case for the gRPC ShowText all-zones path.
+type partialFloodErrGRPCDP struct {
+	*dataplane.Manager
+	apply *dataplane.ApplyResult
+}
+
+func (d *partialFloodErrGRPCDP) IsLoaded() bool                          { return true }
+func (d *partialFloodErrGRPCDP) LastApplyResult() *dataplane.ApplyResult { return d.apply }
+func (d *partialFloodErrGRPCDP) ReadFloodCounters(zoneID uint16) (dataplane.FloodState, error) {
+	if zoneID == 2 {
+		return dataplane.FloodState{}, errors.New("counter bridge degraded")
+	}
+	return dataplane.FloodState{SynCount: 7}, nil
+}
+
+// #3344: the gRPC ShowText all-zones path must emit a per-zone error row naming
+// the failing zone instead of silently dropping it.
+//
+// FAIL-ON-REVERT: restoring the bare `continue` removes the
+// "Screen statistics for zone 'untrust'" header for the failing zone -> RED.
+func TestShowScreenStatisticsAllTextSurfacesPerZoneReadError(t *testing.T) {
+	store := newSchedulerCounterGRPCStore(t)
+	s := &Server{
+		store: store,
+		dp: &partialFloodErrGRPCDP{
+			Manager: dataplane.New(),
+			apply:   &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"trust": 1, "untrust": 2}},
+		},
+	}
+	var buf strings.Builder
+	if _, err := s.showScreenStatisticsAll(store.ActiveConfig(), &buf); err != nil {
+		t.Fatalf("showScreenStatisticsAll() error = %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Screen statistics for zone 'trust':") {
+		t.Fatalf("good zone 'trust' missing from output; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Screen statistics for zone 'untrust':") {
+		t.Fatalf("failing zone 'untrust' silently dropped (no per-zone row); got:\n%s", out)
+	}
+	if !strings.Contains(out, "Error reading flood counters") {
+		t.Fatalf("failing zone lacks an inline 'Error reading flood counters' row; got:\n%s", out)
+	}
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("output lacks the trailing aggregate counter-read warning; got:\n%s", out)
+	}
+}

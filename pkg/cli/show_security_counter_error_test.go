@@ -338,6 +338,60 @@ func TestShowScreenStatisticsAllWarnsOnCounterReadError(t *testing.T) {
 	}
 }
 
+// partialFloodErrCLIDP succeeds the flood-counter read for one zone (ID 1) and
+// fails it for another (ID 2), modelling the #3344 partial-failure case.
+type partialFloodErrCLIDP struct {
+	dataplane.DataPlane
+	apply *dataplane.ApplyResult
+}
+
+func (d *partialFloodErrCLIDP) IsLoaded() bool                          { return true }
+func (d *partialFloodErrCLIDP) LastApplyResult() *dataplane.ApplyResult { return d.apply }
+func (d *partialFloodErrCLIDP) ReadFloodCounters(zoneID uint16) (dataplane.FloodState, error) {
+	if zoneID == 2 {
+		return dataplane.FloodState{}, errors.New("counter bridge degraded")
+	}
+	return dataplane.FloodState{SynCount: 7}, nil
+}
+
+// #3344: `show security screen-statistics all` must NOT silently drop a zone
+// whose flood-counter read fails — it must emit a per-zone error row naming the
+// affected zone (the good zone still renders normally).
+//
+// FAIL-ON-REVERT: restoring the bare `continue` (no per-zone row) removes the
+// "Screen statistics for zone 'untrust'" header for the failing zone, so the
+// want-header assertion goes RED. The good zone "trust" still renders, and the
+// trailing #3408 aggregate warning still prints, so neither alone proves the
+// per-zone surfacing.
+func TestShowScreenStatisticsAllSurfacesPerZoneReadError(t *testing.T) {
+	store := newPolicyHitCountCLIStore(t, true) // trust + untrust zones
+	c := &CLI{store: store, dp: &partialFloodErrCLIDP{
+		apply: &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"trust": 1, "untrust": 2}},
+	}}
+
+	out := captureStdout(t, func() {
+		if err := c.showScreenStatisticsAll(); err != nil {
+			t.Fatalf("showScreenStatisticsAll() error = %v", err)
+		}
+	})
+
+	// Good zone renders normally.
+	if !strings.Contains(out, "Screen statistics for zone 'trust':") {
+		t.Fatalf("good zone 'trust' missing from output; got:\n%s", out)
+	}
+	// Failing zone is NOT dropped — it appears with an explicit error row.
+	if !strings.Contains(out, "Screen statistics for zone 'untrust':") {
+		t.Fatalf("failing zone 'untrust' silently dropped (no per-zone row); got:\n%s", out)
+	}
+	if !strings.Contains(out, "Error reading flood counters") {
+		t.Fatalf("failing zone lacks an inline 'Error reading flood counters' row; got:\n%s", out)
+	}
+	// The #3408 aggregate degraded flag is retained.
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("output lacks the trailing aggregate counter-read warning; got:\n%s", out)
+	}
+}
+
 // showNATSource previously OMITTED the NAT alloc-fail line on a read error
 // (acceptable — no stale 0 — but indistinguishable from "no failures"). It now
 // emits an explicit warning. FAIL-ON-REVERT: dropping the else branch removes

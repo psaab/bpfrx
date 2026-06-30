@@ -414,6 +414,14 @@ func (c *CLI) showScreenStatisticsAll() error {
 			if readErr == nil {
 				readErr = err
 			}
+			// #3344: do not silently drop the zone on a read failure — emit
+			// a per-zone error row naming the affected zone. The trailing
+			// #3408 warning is an aggregate "incomplete" flag but cannot say
+			// WHICH zone is degraded; this row preserves the zone in the
+			// listing and matches the single-zone error wording.
+			fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
+			fmt.Printf("  Error reading flood counters: %v\n", err)
+			fmt.Println()
 			continue
 		}
 		screenProfile := ""
