@@ -1397,14 +1397,15 @@ func (c *ctl) showNATDNATRuleStats(ruleSet string) error {
 }
 
 func (c *ctl) showEvents(args []string) error {
-	filter := ""
-	for _, a := range args {
-		if _, err := strconv.Atoi(a); err == nil {
-			filter = a
-			break
-		}
-	}
-	return c.showTextFiltered("security-log", filter)
+	// Forward the FULL argument string — count AND any zone/protocol/action
+	// selector — to the daemon, which parses it through the shared
+	// logging.ParseEventFilterArgs (#3547). Before #3547 this only picked out
+	// a numeric count and dropped every other token, so `show security log
+	// zone <name>` (including the unknown/none/0 zone-0 selector #3338) was a
+	// silent no-op on the remote `cli`: the daemon saw an empty filter and
+	// dumped every event, never isolating the requested zone the way the
+	// local CLI does.
+	return c.showTextFiltered("security-log", strings.Join(args, " "))
 }
 
 func (c *ctl) showStatistics(detail bool) error {
