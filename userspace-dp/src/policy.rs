@@ -2,6 +2,7 @@ use crate::prefix::{PrefixV4, PrefixV6};
 use crate::prefix_set::{PrefixSetV4, PrefixSetV6};
 use crate::{
     AddressBookSnapshot, PolicyApplicationSnapshot, PolicyRuleCounterStatus, PolicyRuleSnapshot,
+    ZoneSnapshot,
 };
 use ipnet::IpNet;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -620,6 +621,42 @@ pub(crate) const ZONE_ID_RESERVED_MIN: u16 = u16::MAX - 1;
 /// in the rule snapshot; `parse_policy_state_with_counters` resolves that name
 /// to this id (Go↔Rust agreement is on the reserved name, not a wire id).
 pub(crate) const JUNOS_HOST_ZONE_ID: u16 = u16::MAX - 1;
+
+/// #3402: build the policy-zone resolution map (`zone name → zone id`) from a
+/// snapshot's zone list, applying the SAME #919/#922 validity rules
+/// `forwarding_build::populate_zones` uses for the live forwarding table: an id
+/// of 0, an empty name, an id in the reserved range (`>= ZONE_ID_RESERVED_MIN`),
+/// or an id above the wire u8 max is not addressable and is skipped (silently —
+/// `populate_zones` emits the per-reason diagnostics on the real build path).
+///
+/// The apply-time snapshot-integrity preflight MUST resolve a rule's zones
+/// against the INCOMING snapshot's own zones, NOT the live forwarding table.
+/// On a fresh boot — and on a new-zone commit or an HA standby's first config
+/// sync — the live table is empty/stale, and `populate_zones(snapshot)` only
+/// runs LATER inside `build_forwarding_state`. Validating a concrete-zone policy
+/// against the empty live table would flag it as `UnresolvableZoneReference`
+/// (#3402) and reject the WHOLE snapshot, bricking essentially every real boot
+/// config. This helper is the single source of truth for the map: the three
+/// preflight sites (snapshot apply, reconcile, runtime refresh) call it on the
+/// incoming snapshot, and `populate_zones` reuses it for `state.zone_name_to_id`
+/// so the preflight and the real build resolve the identical set. A policy
+/// referencing a zone genuinely ABSENT from `snapshot.zones` still fails closed
+/// (the real #3402 fix).
+pub(crate) fn zone_name_to_id_from_snapshot(zones: &[ZoneSnapshot]) -> FxHashMap<String, u16> {
+    let mut map = FxHashMap::default();
+    for zone in zones {
+        if zone.id == 0 || zone.name.is_empty() {
+            continue;
+        }
+        // Reserved-range and >u8::MAX ids are unaddressable (mirrors
+        // populate_zones; the build path logs the diagnostic).
+        if zone.id >= ZONE_ID_RESERVED_MIN || zone.id > u8::MAX as u16 {
+            continue;
+        }
+        map.insert(zone.name.clone(), zone.id);
+    }
+    map
+}
 
 /// #3019: reserved Junos self-traffic zone name, recognized in policy
 /// from/to zone resolution and mapped to [`JUNOS_HOST_ZONE_ID`].
@@ -1716,6 +1753,14 @@ impl PolicyState {
     }
 }
 
+/// Legacy infallible wrapper used by unit tests with hand-built rules and a
+/// matching zone table. It passes NO address books, so the book-ID integrity
+/// errors cannot fire; but it CAN still panic on a rule-level integrity error
+/// (an unknown action #3365, an unrepresentable address/application, or — since
+/// #3402 — a zone name absent from `zone_name_to_id`). Tests that exercise those
+/// rejection paths must call `parse_policy_state_with_counters` and match the
+/// `Err`. Callers here are expected to pass only well-formed rules whose zones
+/// resolve.
 pub(crate) fn parse_policy_state(
     default_policy: &str,
     rules: &[PolicyRuleSnapshot],
@@ -1723,7 +1768,7 @@ pub(crate) fn parse_policy_state(
 ) -> PolicyState {
     let counter_store = PolicyCounterStore::default();
     parse_policy_state_with_counters(default_policy, rules, zone_name_to_id, &[], &counter_store)
-        .expect("legacy parse_policy_state called with no books — cannot raise integrity errors")
+        .expect("parse_policy_state: rules must be well-formed (no books; zones must resolve)")
 }
 
 /// #1606: fallible policy-state parser. Returns

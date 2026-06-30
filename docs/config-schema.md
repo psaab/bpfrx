@@ -1670,11 +1670,28 @@ fresh boot keeps the default-deny state), action-agnostic and consistent with
 the #2124/#3261/#3365/#3367 fail-closed family. The special tokens `any`,
 `junos-host`, and the empty token always resolve, so a clean config never
 trips this. The `GlobalZoneScope::Unresolved` variant was removed: a live
-scope is now only `Any` or a resolved `Zone(id)`. Regression coverage:
-`unknown_zone_pair_fails_closed`, `unknown_single_wildcard_zone_fails_closed`,
-`resolvable_zone_pair_still_compiles` (over-reject guard), and
-`global_policy_unknown_zone_context_fails_closed` in
-`userspace-dp/src/policy_tests.rs`.
+scope is now only `Any` or a resolved `Zone(id)`.
+
+**Preflight zone source (boot-safety).** A `ConfigSnapshot` ships its zones AND
+its policies atomically, but the live forwarding zone table is empty on a fresh
+boot (and stale on a new-zone commit / an HA standby's first sync) — it is only
+populated by `populate_zones(snapshot)` LATER inside `build_forwarding_state`.
+The integrity preflight therefore resolves a rule's zones against the INCOMING
+snapshot's OWN zones via the shared `policy::zone_name_to_id_from_snapshot`
+helper (the same validated `{name → id}` map `populate_zones` installs), NOT
+against the live table. Resolving against the empty live table would flag every
+concrete-zone policy as `UnresolvableZoneReference` and reject the whole boot
+snapshot. A policy referencing a zone genuinely ABSENT from `snapshot.zones`
+still fails closed.
+
+Regression coverage: `unknown_zone_pair_fails_closed`,
+`unknown_single_wildcard_zone_fails_closed`, `resolvable_zone_pair_still_compiles`
+(over-reject guard), `global_policy_unknown_zone_context_fails_closed` in
+`userspace-dp/src/policy_tests.rs`; and the apply-path integration tests
+`reconcile_fresh_boot_concrete_zone_policy_passes_preflight_3402` (fresh boot
+with concrete-zone policy succeeds — RED if the preflight reverts to the live
+table) and `reconcile_policy_references_undefined_zone_still_fails_closed_3402`
+(undefined zone still rejected) in `userspace-dp/src/afxdp/coordinator/tests.rs`.
 
 ### #3300 — Dynamic-address `address-name … feed-name` cross-reference gate
 
