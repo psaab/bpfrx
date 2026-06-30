@@ -40,10 +40,17 @@ pub(super) fn apply(
     // rejected snapshots.
     {
         let preflight_counters = crate::policy::PolicyCounterStore::default();
+        // #3402: resolve policy zones against the INCOMING snapshot's own zones,
+        // NOT the live forwarding table (empty on a fresh boot, stale on a
+        // new-zone apply) — populate_zones(snapshot) runs only later inside
+        // build_forwarding_state. Using the live table here would flag every
+        // concrete-zone policy as UnresolvableZoneReference and reject the whole
+        // boot snapshot.
+        let preflight_zones = crate::policy::zone_name_to_id_from_snapshot(&snapshot.zones);
         if let Err(err) = crate::policy::parse_policy_state_with_counters(
             &snapshot.default_policy,
             &snapshot.policies,
-            guard.afxdp.zone_name_to_id_ref(),
+            &preflight_zones,
             &snapshot.address_books,
             &preflight_counters,
         ) {

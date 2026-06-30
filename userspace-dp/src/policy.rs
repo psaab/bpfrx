@@ -2,6 +2,7 @@ use crate::prefix::{PrefixV4, PrefixV6};
 use crate::prefix_set::{PrefixSetV4, PrefixSetV6};
 use crate::{
     AddressBookSnapshot, PolicyApplicationSnapshot, PolicyRuleCounterStatus, PolicyRuleSnapshot,
+    ZoneSnapshot,
 };
 use ipnet::IpNet;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -360,6 +361,29 @@ pub(crate) enum SnapshotIntegrityError {
     /// (decodes to the default Deny) and is NOT an error; an empty per-rule
     /// action IS rejected (every configured rule has a concrete action).
     UnknownPolicyAction { context: String, action: String },
+    /// #3402: a policy rule names a from/to zone — or a scoped-global (#3148)
+    /// `match from-zone`/`match to-zone` context — that does not resolve in the
+    /// snapshot's zone table (`zone_name_to_id`). The pre-fix code handled this
+    /// as a stderr-only DROP: the zone-pair / single-wildcard build skipped
+    /// indexing the rule ("rule kept, but not indexed"), and the scoped-global
+    /// build produced a `GlobalZoneScope::Unresolved` that matched nothing. In
+    /// BOTH cases the rule never participated in evaluation and the traffic it
+    /// was meant to govern fell through to `default-policy` with no failure
+    /// surfaced to the control plane. Under `default-policy permit-all` a stale
+    /// `deny` silently becomes an ALLOW (fail-OPEN); under `deny-all` a stale
+    /// `permit` silently BLACKHOLES. The Go commit gate
+    /// (`validatePolicyZoneReferencesStrict`, #2401) hard-rejects an undefined
+    /// zone reference for both shapes, so a clean commit never reaches this arm;
+    /// this is the helper-boundary backstop for the lenient / upgrade-state /
+    /// HA-replay / corrupt-snapshot path (`lenientPolicyZoneRefs`), consistent
+    /// with the #3261/#3365/#3367 fail-closed family. Rejecting the WHOLE
+    /// snapshot (the preflight keeps the previous good state; a fresh boot keeps
+    /// the default-deny `PolicyState`) is action-agnostic: it never turns a deny
+    /// into a pass nor a permit into match-any. The empty token and the special
+    /// `any` / `junos-host` zone names always resolve (see
+    /// `resolve_policy_zone_id` / `build_global_zone_scope`) and so never trip
+    /// this.
+    UnresolvableZoneReference { rule_id: String, zone: String },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -530,6 +554,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 "{} has action {:?} that is not one of permit | reject | deny — refusing to silently map it to Deny (which fail-OPENs an unrecognized reject by dropping its RST/ICMP-unreachable semantics and masks wire-contract drift)",
                 context, action
             ),
+            Self::UnresolvableZoneReference { rule_id, zone } => write!(
+                f,
+                "rule {:?} references undefined zone {:?} — refusing to fail open by dropping the unindexed rule (it would fall through to default-policy: a stale deny becomes an allow under permit-all, a stale permit blackholes under deny-all)",
+                rule_id, zone
+            ),
         }
     }
 }
@@ -592,6 +621,42 @@ pub(crate) const ZONE_ID_RESERVED_MIN: u16 = u16::MAX - 1;
 /// in the rule snapshot; `parse_policy_state_with_counters` resolves that name
 /// to this id (Go↔Rust agreement is on the reserved name, not a wire id).
 pub(crate) const JUNOS_HOST_ZONE_ID: u16 = u16::MAX - 1;
+
+/// #3402: build the policy-zone resolution map (`zone name → zone id`) from a
+/// snapshot's zone list, applying the SAME #919/#922 validity rules
+/// `forwarding_build::populate_zones` uses for the live forwarding table: an id
+/// of 0, an empty name, an id in the reserved range (`>= ZONE_ID_RESERVED_MIN`),
+/// or an id above the wire u8 max is not addressable and is skipped (silently —
+/// `populate_zones` emits the per-reason diagnostics on the real build path).
+///
+/// The apply-time snapshot-integrity preflight MUST resolve a rule's zones
+/// against the INCOMING snapshot's own zones, NOT the live forwarding table.
+/// On a fresh boot — and on a new-zone commit or an HA standby's first config
+/// sync — the live table is empty/stale, and `populate_zones(snapshot)` only
+/// runs LATER inside `build_forwarding_state`. Validating a concrete-zone policy
+/// against the empty live table would flag it as `UnresolvableZoneReference`
+/// (#3402) and reject the WHOLE snapshot, bricking essentially every real boot
+/// config. This helper is the single source of truth for the map: the three
+/// preflight sites (snapshot apply, reconcile, runtime refresh) call it on the
+/// incoming snapshot, and `populate_zones` reuses it for `state.zone_name_to_id`
+/// so the preflight and the real build resolve the identical set. A policy
+/// referencing a zone genuinely ABSENT from `snapshot.zones` still fails closed
+/// (the real #3402 fix).
+pub(crate) fn zone_name_to_id_from_snapshot(zones: &[ZoneSnapshot]) -> FxHashMap<String, u16> {
+    let mut map = FxHashMap::default();
+    for zone in zones {
+        if zone.id == 0 || zone.name.is_empty() {
+            continue;
+        }
+        // Reserved-range and >u8::MAX ids are unaddressable (mirrors
+        // populate_zones; the build path logs the diagnostic).
+        if zone.id >= ZONE_ID_RESERVED_MIN || zone.id > u8::MAX as u16 {
+            continue;
+        }
+        map.insert(zone.name.clone(), zone.id);
+    }
+    map
+}
 
 /// #3019: reserved Junos self-traffic zone name, recognized in policy
 /// from/to zone resolution and mapped to [`JUNOS_HOST_ZONE_ID`].
@@ -707,10 +772,6 @@ pub(crate) enum GlobalZoneScope {
     Any,
     /// Constrained to a resolved zone id: the side matches only this zone.
     Zone(u16),
-    /// A zone name was configured but does not resolve to a defined zone.
-    /// Fail-closed: the global policy matches NOTHING (it never silently widens
-    /// to all-zones on a typo'd / undefined zone reference).
-    Unresolved,
 }
 
 impl Default for GlobalZoneScope {
@@ -727,7 +788,6 @@ impl GlobalZoneScope {
         match self {
             GlobalZoneScope::Any => true,
             GlobalZoneScope::Zone(z) => z == id,
-            GlobalZoneScope::Unresolved => false,
         }
     }
 }
@@ -745,9 +805,14 @@ impl GlobalZoneScope {
 ///     explicit-`any` short-circuit eliminates that commit-vs-dataplane
 ///     divergence.
 ///   - Any other name resolves through [`resolve_policy_zone_id`]; an
-///     unresolvable name → `Unresolved` (fail-closed) with a diagnostic,
-///     matching the "rule kept, but not indexed" treatment of an unknown
-///     zone-pair zone. (`"junos-host"` is hard-rejected at commit for these
+///     unresolvable name fails the WHOLE snapshot closed
+///     ([`SnapshotIntegrityError::UnresolvableZoneReference`], #3402) rather
+///     than silently producing a matches-nothing scope, mirroring the
+///     zone-pair path's reject. The Go commit gate
+///     (`validatePolicyZoneReferencesStrict`, #2401) hard-rejects an undefined
+///     match-zone, so a clean commit never reaches here; this is the
+///     helper-boundary backstop for the lenient / upgrade-state / corrupt
+///     snapshot path. (`"junos-host"` is hard-rejected at commit for these
 ///     leaves — see `validatePolicyZoneReferencesStrict` — so on the strict
 ///     path the dataplane never sees it; on the tolerant load path it resolves
 ///     to the reserved host id, which never matches a transit flow, i.e. inert
@@ -755,21 +820,17 @@ impl GlobalZoneScope {
 fn build_global_zone_scope(
     zone_name_to_id: &FxHashMap<String, u16>,
     name: &str,
-    side: &str,
     rule_id: &str,
-) -> GlobalZoneScope {
+) -> Result<GlobalZoneScope, SnapshotIntegrityError> {
     if name.is_empty() || name == "any" {
-        return GlobalZoneScope::Any;
+        return Ok(GlobalZoneScope::Any);
     }
     match resolve_policy_zone_id(zone_name_to_id, name) {
-        Some(id) => GlobalZoneScope::Zone(id),
-        None => {
-            eprintln!(
-                "xpf-userspace-dp: global policy {:?} match {}-zone references unknown zone {:?} (rule kept, matches nothing)",
-                rule_id, side, name
-            );
-            GlobalZoneScope::Unresolved
-        }
+        Some(id) => Ok(GlobalZoneScope::Zone(id)),
+        None => Err(SnapshotIntegrityError::UnresolvableZoneReference {
+            rule_id: rule_id.to_string(),
+            zone: name.to_string(),
+        }),
     }
 }
 
@@ -1692,6 +1753,14 @@ impl PolicyState {
     }
 }
 
+/// Legacy infallible wrapper used by unit tests with hand-built rules and a
+/// matching zone table. It passes NO address books, so the book-ID integrity
+/// errors cannot fire; but it CAN still panic on a rule-level integrity error
+/// (an unknown action #3365, an unrepresentable address/application, or — since
+/// #3402 — a zone name absent from `zone_name_to_id`). Tests that exercise those
+/// rejection paths must call `parse_policy_state_with_counters` and match the
+/// `Err`. Callers here are expected to pass only well-formed rules whose zones
+/// resolve.
 pub(crate) fn parse_policy_state(
     default_policy: &str,
     rules: &[PolicyRuleSnapshot],
@@ -1699,7 +1768,7 @@ pub(crate) fn parse_policy_state(
 ) -> PolicyState {
     let counter_store = PolicyCounterStore::default();
     parse_policy_state_with_counters(default_policy, rules, zone_name_to_id, &[], &counter_store)
-        .expect("legacy parse_policy_state called with no books — cannot raise integrity errors")
+        .expect("parse_policy_state: rules must be well-formed (no books; zones must resolve)")
 }
 
 /// #1606: fallible policy-state parser. Returns
@@ -1923,18 +1992,17 @@ pub(crate) fn parse_policy_state_with_counters(
             to_zone: snap.to_zone.clone(),
             // #3148: resolve the optional global-policy zone context. Empty →
             // Any (all zones). Inert for non-global rules (both fields empty).
+            // #3402: an unresolvable match-zone fails the whole snapshot closed.
             global_from_zone: build_global_zone_scope(
                 zone_name_to_id,
                 &snap.match_from_zone,
-                "from",
                 &rule_id,
-            ),
+            )?,
             global_to_zone: build_global_zone_scope(
                 zone_name_to_id,
                 &snap.match_to_zone,
-                "to",
                 &rule_id,
-            ),
+            )?,
             scheduler_name: snap.scheduler_name.clone(),
             inactive: snap.inactive,
             source_literal_v4,
@@ -2001,22 +2069,26 @@ pub(crate) fn parse_policy_state_with_counters(
                     Some(to_id) => {
                         state.from_any_index.entry(to_id).or_default().push(idx);
                     }
+                    // #3402: an unresolvable to-zone fails the whole snapshot
+                    // closed (was a stderr-only "rule kept, but not indexed"
+                    // drop → silent fall-through to default-policy).
                     None => {
-                        eprintln!(
-                            "xpf-userspace-dp: policy rule from-zone any references unknown to-zone {:?} (rule kept, but not indexed)",
-                            snap.to_zone
-                        );
+                        return Err(SnapshotIntegrityError::UnresolvableZoneReference {
+                            rule_id: rule_id.clone(),
+                            zone: snap.to_zone.clone(),
+                        });
                     }
                 },
                 (false, true) => match resolve_policy_zone_id(zone_name_to_id, &snap.from_zone) {
                     Some(from_id) => {
                         state.to_any_index.entry(from_id).or_default().push(idx);
                     }
+                    // #3402: an unresolvable from-zone fails closed (see above).
                     None => {
-                        eprintln!(
-                            "xpf-userspace-dp: policy rule to-zone any references unknown from-zone {:?} (rule kept, but not indexed)",
-                            snap.from_zone
-                        );
+                        return Err(SnapshotIntegrityError::UnresolvableZoneReference {
+                            rule_id: rule_id.clone(),
+                            zone: snap.from_zone.clone(),
+                        });
                     }
                 },
                 (false, false) => {
@@ -2028,11 +2100,20 @@ pub(crate) fn parse_policy_state_with_counters(
                             let key = zone_pair_key(from_id, to_id);
                             state.zone_pair_index.entry(key).or_default().push(idx);
                         }
-                        _ => {
-                            eprintln!(
-                                "xpf-userspace-dp: policy rule references unknown zone(s): from={:?} to={:?} (rule kept, but not indexed)",
-                                snap.from_zone, snap.to_zone
-                            );
+                        // #3402: either side unresolvable → fail closed. Report
+                        // the from-zone first (matches the Go strict gate order
+                        // in validatePolicyZoneReferencesStrict).
+                        (None, _) => {
+                            return Err(SnapshotIntegrityError::UnresolvableZoneReference {
+                                rule_id: rule_id.clone(),
+                                zone: snap.from_zone.clone(),
+                            });
+                        }
+                        (_, None) => {
+                            return Err(SnapshotIntegrityError::UnresolvableZoneReference {
+                                rule_id: rule_id.clone(),
+                                zone: snap.to_zone.clone(),
+                            });
                         }
                     }
                 }
@@ -2398,7 +2479,10 @@ pub(crate) fn evaluate_policy_result_with_icmp(
             // zone-pair and #3090 from-any/to-any/both-any wildcard tiers), in
             // global config order, so a zone-scoped global policy stays a
             // global policy — it does not get promoted ahead of the wildcard
-            // tiers. An unresolved (typo'd) zone fails closed (matches none).
+            // tiers. A typo'd (unresolvable) match-zone never reaches here: it
+            // fails the whole snapshot closed at parse time (#3402,
+            // SnapshotIntegrityError::UnresolvableZoneReference), so a live
+            // scope is only ever Any or a resolved Zone(id).
             if !rule.global_from_zone.matches(from_id) || !rule.global_to_zone.matches(to_id) {
                 continue;
             }

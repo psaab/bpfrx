@@ -109,10 +109,18 @@ impl Coordinator {
         // leak Arc<PolicyRuleCounter> entries on rejected snapshots.
         if let Some(snap) = snapshot {
             let preflight_counters = crate::policy::PolicyCounterStore::default();
+            // #3402: resolve policy zones against the INCOMING snapshot's own
+            // zones, NOT self.forwarding.zone_name_to_id (the live table is empty
+            // on a fresh boot / HA standby first sync and stale on a new-zone
+            // apply; populate_zones(snapshot) runs only later in
+            // build_forwarding_state). Validating against the live table here
+            // would flag every concrete-zone policy as UnresolvableZoneReference
+            // and reject the whole snapshot.
+            let preflight_zones = crate::policy::zone_name_to_id_from_snapshot(&snap.zones);
             if let Err(err) = crate::policy::parse_policy_state_with_counters(
                 &snap.default_policy,
                 &snap.policies,
-                &self.forwarding.zone_name_to_id,
+                &preflight_zones,
                 &snap.address_books,
                 &preflight_counters,
             ) {

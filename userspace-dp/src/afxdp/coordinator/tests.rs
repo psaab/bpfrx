@@ -3310,6 +3310,144 @@ fn reconcile_all_mandatory_maps_open_advances_published_generation() {
     assert_eq!((**coordinator.shared_validation.load()).config_generation, 2);
 }
 
+/// #3402: a FRESH-BOOT snapshot ships its zones AND a concrete-zone policy in
+/// the SAME atomic ConfigSnapshot, with the coordinator's live forwarding zone
+/// table still EMPTY (populate_zones(snapshot) runs only later inside
+/// build_forwarding_state). The reconcile policy preflight MUST resolve the
+/// rule's zones against the INCOMING snapshot's own zones, so a
+/// `from trust to untrust permit` rule passes and the reconcile advances the
+/// published generation.
+///
+/// Fail-on-revert: the #3402-introduced `UnresolvableZoneReference` reject is
+/// correct, but the preflight previously validated against
+/// `self.forwarding.zone_name_to_id` (empty on a fresh boot). Point the
+/// reconcile preflight back at that live table and this concrete-zone rule
+/// becomes UnresolvableZoneReference → `last_reconcile_stage` =
+/// "snapshot_integrity_error: ..." and the published generation never advances
+/// → both asserts below go RED. This is the boot-bricking regression the
+/// preflight-zone-source fix prevents.
+#[test]
+fn reconcile_fresh_boot_concrete_zone_policy_passes_preflight_3402() {
+    let mut coordinator = Coordinator::new();
+    // Fresh coordinator: the live forwarding zone table is EMPTY (the bug
+    // condition — the snapshot carries the zones, the live table does not yet).
+    assert!(
+        coordinator.forwarding.zone_name_to_id.is_empty(),
+        "precondition: a fresh coordinator has no live zones"
+    );
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 1,
+        fib_generation: 0,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    // All three mandatory pins resolve so the reconcile proceeds to publish.
+    let mut snap = fail_open_snapshot(2);
+    snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
+    // Zones {trust:1, untrust:2} ship in the SAME snapshot as the policy.
+    snap.zones = vec![
+        crate::ZoneSnapshot {
+            name: "trust".into(),
+            id: 1,
+            ..Default::default()
+        },
+        crate::ZoneSnapshot {
+            name: "untrust".into(),
+            id: 2,
+            ..Default::default()
+        },
+    ];
+    snap.default_policy = "deny".into();
+    snap.policies = vec![crate::PolicyRuleSnapshot {
+        rule_id: "p1".into(),
+        name: "allow".into(),
+        from_zone: "trust".into(),
+        to_zone: "untrust".into(),
+        source_addresses: vec!["any".into()],
+        destination_addresses: vec!["any".into()],
+        applications: vec!["any".into()],
+        action: "permit".into(),
+        ..Default::default()
+    }];
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        !coordinator
+            .last_reconcile_stage
+            .starts_with("snapshot_integrity_error"),
+        "fresh-boot concrete-zone policy must pass the integrity preflight, got stage {:?}",
+        coordinator.last_reconcile_stage
+    );
+    assert_eq!(
+        coordinator.validation.config_generation, 2,
+        "preflight passed → reconcile advances the published generation to the snapshot's"
+    );
+}
+
+/// #3402 fail-closed preserved: a policy referencing a zone that is ABSENT from
+/// the snapshot's OWN zones is genuinely unresolvable and MUST still be rejected
+/// (the real bug #3402 fixes). default-policy permit-all makes the dropped-rule
+/// fall-through the dangerous fail-OPEN case. The reconcile aborts in the
+/// preflight, keeping the prior published generation.
+#[test]
+fn reconcile_policy_references_undefined_zone_still_fails_closed_3402() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 5,
+        fib_generation: 2,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    let mut snap = fail_open_snapshot(6);
+    snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
+    // The snapshot defines ONLY `trust`; the rule's to-zone `ghostzone` is
+    // absent from snapshot.zones → unresolvable against the snapshot's own
+    // zones → fail closed (not a stale/empty-live-table false reject).
+    snap.zones = vec![crate::ZoneSnapshot {
+        name: "trust".into(),
+        id: 1,
+        ..Default::default()
+    }];
+    snap.default_policy = "permit".into();
+    snap.policies = vec![crate::PolicyRuleSnapshot {
+        rule_id: "p-bad".into(),
+        name: "deny-ghost".into(),
+        from_zone: "trust".into(),
+        to_zone: "ghostzone".into(),
+        source_addresses: vec!["any".into()],
+        destination_addresses: vec!["any".into()],
+        applications: vec!["any".into()],
+        action: "deny".into(),
+        ..Default::default()
+    }];
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .starts_with("snapshot_integrity_error"),
+        "a policy naming a zone absent from snapshot.zones must fail closed, got stage {:?}",
+        coordinator.last_reconcile_stage
+    );
+    assert!(
+        coordinator.last_reconcile_stage.contains("ghostzone"),
+        "the integrity error must name the unresolvable zone, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    assert_eq!(
+        coordinator.validation.config_generation, 5,
+        "a rejected snapshot keeps the prior published generation"
+    );
+}
+
 /// #2484 (completes the #2440/#2444 fail-open trilogy): a snapshot
 /// INTEGRITY fault must abort the reconcile BEFORE `tear_down`, keeping
 /// the prior generation published AND the prior workers/state live — not

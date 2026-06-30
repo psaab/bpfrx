@@ -62,10 +62,16 @@ impl super::Coordinator {
         // store for the preflight so we don't leak counter
         // registry entries on rejected snapshots.
         let preflight_counters = crate::policy::PolicyCounterStore::default();
+        // #3402: resolve policy zones against the INCOMING snapshot's own zones,
+        // NOT self.forwarding.zone_name_to_id (empty/stale until
+        // populate_zones(snapshot) runs later in build_forwarding_state). The
+        // live table would flag every concrete-zone policy as
+        // UnresolvableZoneReference and falsely reject the snapshot.
+        let preflight_zones = crate::policy::zone_name_to_id_from_snapshot(&snapshot.zones);
         if let Err(err) = crate::policy::parse_policy_state_with_counters(
             &snapshot.default_policy,
             &snapshot.policies,
-            &self.forwarding.zone_name_to_id,
+            &preflight_zones,
             &snapshot.address_books,
             &preflight_counters,
         ) {

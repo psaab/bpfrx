@@ -1613,18 +1613,77 @@ fn unknown_ingress_zone_does_not_match_permit_global() {
     );
 }
 
-/// #919/#922: snapshot rules whose zone names are absent from
-/// `zone_name_to_id` are dropped by `parse_policy_state` (logged
-/// and not indexed). A real `LAN→WAN` lookup therefore finds
-/// nothing and falls through to the default action.
+/// #3402 (was #919/#922): a snapshot zone-pair rule whose from/to zone is
+/// absent from `zone_name_to_id` now fails the WHOLE snapshot closed
+/// (`SnapshotIntegrityError::UnresolvableZoneReference`) instead of being kept
+/// stderr-only and not indexed. The pre-fix behavior silently dropped the rule
+/// so a real `LAN→WAN` lookup found nothing and fell through to default-policy:
+/// under `default-policy permit-all` a stale `deny` became an ALLOW (fail-OPEN)
+/// and under `deny-all` a stale `permit` BLACKHOLED — both invisible to the
+/// control plane. Rejecting the snapshot keeps the previous good state (a fresh
+/// boot keeps the default-deny PolicyState).
+///
+/// Fail-on-revert: restoring the stderr-only "rule kept, but not indexed" drop
+/// makes `parse_policy_state_with_counters` return `Ok`, so the `Err` match arm
+/// below panics → RED. Covers BOTH default postures via the two assertions.
 #[test]
-fn evaluate_policy_unknown_zone_pair_returns_default_action() {
+fn unknown_zone_pair_fails_closed() {
     let zones = test_zone_name_to_id();
-    let state = parse_policy_state(
+    let make = |default_policy: &str, action: &str| {
+        let store = PolicyCounterStore::default();
+        parse_policy_state_with_counters(
+            default_policy,
+            &[PolicyRuleSnapshot {
+                rule_id: "ghost".into(),
+                name: "rule".into(),
+                from_zone: "ghost-from".into(),
+                to_zone: "ghost-to".into(),
+                source_addresses: vec!["any".into()],
+                destination_addresses: vec!["any".into()],
+                applications: vec!["any".into()],
+                application_terms: Vec::new(),
+                action: action.into(),
+                ..Default::default()
+            }],
+            &zones,
+            &[],
+            &store,
+        )
+    };
+    // default-policy permit-all: a stale `deny` against an undefined zone must
+    // NOT silently widen to a fall-through permit.
+    match make("permit", "deny") {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert_eq!(rule_id, "ghost");
+            // from-zone is reported first (matches the Go strict-gate order).
+            assert_eq!(zone, "ghost-from");
+        }
+        other => panic!("expected UnresolvableZoneReference (permit default), got {other:?}"),
+    }
+    // default-policy deny-all: a stale `permit` must NOT silently blackhole.
+    match make("deny", "permit") {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert_eq!(rule_id, "ghost");
+            assert_eq!(zone, "ghost-from");
+        }
+        other => panic!("expected UnresolvableZoneReference (deny default), got {other:?}"),
+    }
+}
+
+/// #3402: a single-wildcard rule (`from-zone any to-zone <undefined>`, or
+/// `from-zone <undefined> to-zone any`) is guarded on the concrete side too —
+/// the concrete zone must resolve or the snapshot fails closed.
+#[test]
+fn unknown_single_wildcard_zone_fails_closed() {
+    let zones = test_zone_name_to_id();
+    let store = PolicyCounterStore::default();
+    // from-zone any to-zone <ghost>: the concrete to-zone is unresolvable.
+    let r = parse_policy_state_with_counters(
         "deny",
         &[PolicyRuleSnapshot {
+            rule_id: "wild-to".into(),
             name: "rule".into(),
-            from_zone: "ghost-from".into(),
+            from_zone: "any".into(),
             to_zone: "ghost-to".into(),
             source_addresses: vec!["any".into()],
             destination_addresses: vec!["any".into()],
@@ -1634,20 +1693,82 @@ fn evaluate_policy_unknown_zone_pair_returns_default_action() {
             ..Default::default()
         }],
         &zones,
+        &[],
+        &store,
     );
-    // Unknown-zone rule was not indexed; LAN→WAN lookup finds nothing → default deny.
+    match r {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert_eq!(rule_id, "wild-to");
+            assert_eq!(zone, "ghost-to");
+        }
+        other => panic!("expected UnresolvableZoneReference (from-any), got {other:?}"),
+    }
+    // from-zone <ghost> to-zone any: the concrete from-zone is unresolvable.
+    let store2 = PolicyCounterStore::default();
+    let r2 = parse_policy_state_with_counters(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: "wild-from".into(),
+            name: "rule".into(),
+            from_zone: "ghost-from".into(),
+            to_zone: "any".into(),
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            application_terms: Vec::new(),
+            action: "deny".into(),
+            ..Default::default()
+        }],
+        &zones,
+        &[],
+        &store2,
+    );
+    match r2 {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert_eq!(rule_id, "wild-from");
+            assert_eq!(zone, "ghost-from");
+        }
+        other => panic!("expected UnresolvableZoneReference (to-any), got {other:?}"),
+    }
+}
+
+/// #3402 over-reject guard: a zone-pair rule whose zones DO resolve still
+/// compiles and is enforced. A resolvable `trust->untrust permit` must match.
+#[test]
+fn resolvable_zone_pair_still_compiles() {
+    let zones = test_zone_name_to_id();
+    let store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: "ok".into(),
+            name: "rule".into(),
+            from_zone: "trust".into(),
+            to_zone: "untrust".into(),
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            application_terms: Vec::new(),
+            action: "permit".into(),
+            ..Default::default()
+        }],
+        &zones,
+        &[],
+        &store,
+    )
+    .expect("resolvable zone-pair rule must compile");
     assert_eq!(
         evaluate_policy(
             &state,
-            TEST_LAN_ZONE_ID,
-            TEST_WAN_ZONE_ID,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
             "10.0.0.1".parse().expect("src"),
             "8.8.8.8".parse().expect("dst"),
             PROTO_TCP,
             12345,
             80,
         ),
-        PolicyAction::Deny
+        PolicyAction::Permit
     );
 }
 
@@ -4334,14 +4455,51 @@ fn global_policy_evaluated_after_wildcard_tiers() {
 
 #[test]
 fn global_policy_unknown_zone_context_fails_closed() {
-    // A global policy whose match zone does not resolve to a defined zone must
-    // match NOTHING (fail-closed), never silently widen to all-zones.
-    let state = parse_policy_state(
+    // #3402: a scoped-global policy whose match-from/to zone does not resolve to
+    // a defined zone now fails the WHOLE snapshot closed
+    // (SnapshotIntegrityError::UnresolvableZoneReference), never silently
+    // producing a matches-nothing scope (which removed the operator's broad
+    // safety net with no surfaced failure). The preflight keeps the previous
+    // good state.
+    //
+    // Fail-on-revert: restoring `GlobalZoneScope::Unresolved` (the pre-#3402
+    // matches-nothing scope) makes `parse_policy_state_with_counters` return
+    // `Ok`, so the `Err` match below panics → RED. Both match-zone sides are
+    // covered.
+    let zones = test_zone_name_to_id();
+    let store = PolicyCounterStore::default();
+    // Unresolvable match from-zone.
+    match parse_policy_state_with_counters(
         "deny",
-        &[global_zone_rule("typo", "nonexistent", "untrust", "permit")],
-        &test_zone_name_to_id(),
-    );
-    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Deny);
+        &[global_zone_rule("typo-from", "nonexistent", "untrust", "permit")],
+        &zones,
+        &[],
+        &store,
+    ) {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            // global_zone_rule sets no explicit rule_id, so stable_policy_rule_id
+            // synthesizes "<from>-><to>/<name>".
+            assert!(rule_id.ends_with("/typo-from"), "rule_id={rule_id}");
+            assert_eq!(zone, "nonexistent");
+        }
+        other => panic!("expected UnresolvableZoneReference (match from-zone), got {other:?}"),
+    }
+    // Unresolvable match to-zone (with a default-permit, where a stale scoped
+    // `deny` silently un-nets the safety net under the old behavior).
+    let store2 = PolicyCounterStore::default();
+    match parse_policy_state_with_counters(
+        "permit",
+        &[global_zone_rule("typo-to", "trust", "ghostzone", "deny")],
+        &zones,
+        &[],
+        &store2,
+    ) {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert!(rule_id.ends_with("/typo-to"), "rule_id={rule_id}");
+            assert_eq!(zone, "ghostzone");
+        }
+        other => panic!("expected UnresolvableZoneReference (match to-zone), got {other:?}"),
+    }
 }
 
 #[test]
@@ -4349,9 +4507,10 @@ fn global_policy_explicit_any_matches_all_zones() {
     // #3148 fold: an EXPLICIT `match from-zone any` is the Junos all-zones
     // default — identical to omitting the leaf. It must resolve to
     // GlobalZoneScope::Any (matches every from-zone), NOT route through
-    // resolve_policy_zone_id("any") -> None -> Unresolved (matches nothing).
-    // Fail-on-revert: drop the `name == "any"` short-circuit in
-    // build_global_zone_scope and these Permit assertions turn into Deny.
+    // resolve_policy_zone_id("any") -> None, which since #3402 fails the whole
+    // snapshot closed (UnresolvableZoneReference). Fail-on-revert: drop the
+    // `name == "any"` short-circuit in build_global_zone_scope and parse now
+    // ERRORS on the explicit `any`, so parse_policy_state panics here.
     let state = parse_policy_state(
         "deny",
         &[global_zone_rule("any-to-untrust", "any", "untrust", "permit")],
