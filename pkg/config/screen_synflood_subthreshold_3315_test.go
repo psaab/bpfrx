@@ -4,13 +4,13 @@ import (
 	"testing"
 )
 
-// TestSynFloodTimeoutEmitsInertWarning asserts the #3315 commit-time advisory
-// for `syn-flood timeout`: the leaf parses and commits cleanly but is not yet
-// enforced by the dataplane (it maps to the per-zone half-open session window,
-// a tracked follow-up), so the compiler warns it is accepted-but-inert. Without
-// this the leaf is silently dead — exactly the configured-but-not-enforced trap
-// #3315 fixes for the source/destination/alarm leaves.
-func TestSynFloodTimeoutEmitsInertWarning(t *testing.T) {
+// TestSynFloodTimeoutNoLongerWarnsWhenEnforced is the #3527 inversion of the
+// retired #3315 inert-warning test. `syn-flood timeout` is now enforced as a
+// per-zone override of the half-open session window (tcp_opening_ns) — see
+// pkg/dataplane/userspace/screens.go (SYNFloodTimeout) and the dataplane's
+// SessionTable opening overrides — so the compiler MUST NOT emit the legacy
+// accepted-but-inert advisory. Reinstate the warning branch and this goes RED.
+func TestSynFloodTimeoutNoLongerWarnsWhenEnforced(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set security screen ids-option p tcp syn-flood attack-threshold 2000",
 		"set security screen ids-option p tcp syn-flood timeout 20",
@@ -19,8 +19,16 @@ func TestSynFloodTimeoutEmitsInertWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("strict commit rejected a valid syn-flood timeout: %v", err)
 	}
-	if !hasWarningContaining(cfg.Warnings, "syn-flood timeout 20 is accepted but NOT yet enforced") {
-		t.Fatalf("expected a syn-flood timeout inert-warning, warnings=%v", cfg.Warnings)
+	if hasWarningContaining(cfg.Warnings, "syn-flood timeout") {
+		t.Fatalf("syn-flood timeout is now enforced (#3527) and must not warn, warnings=%v", cfg.Warnings)
+	}
+	if hasWarningContaining(cfg.Warnings, "NOT yet enforced") {
+		t.Fatalf("the inert-warning must be gone now that timeout is enforced, warnings=%v", cfg.Warnings)
+	}
+	// Sanity: the leaf still parses into the typed config so the snapshot
+	// builder can publish it.
+	if sf := cfg.Security.Screen["p"].TCP.SynFlood; sf == nil || sf.Timeout != 20 {
+		t.Fatalf("expected syn-flood timeout 20 parsed into typed config, got %+v", sf)
 	}
 }
 

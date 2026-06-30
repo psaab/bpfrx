@@ -93,12 +93,25 @@ screen runtime:
   raises an out-of-band, ≤1/sec/zone screen ALARM event (RT_FLOW PERMIT, NOTICE
   severity, reason `syn-flood-alarm`) WITHOUT dropping the packet, like the
   scan-table-pressure alarm.
-- **`timeout`** — accepted and committed but NOT yet enforced. It maps to the
-  per-zone half-open session window (`SessionTimeouts.tcp_opening_ns`), a
-  session-layer surface that couples to session timeouts + HA sync and is split
-  to a tracked follow-up. The compiler emits a commit-time WARNING so the leaf is
-  never silently inert; the global half-open TCP timeout applies until the
-  follow-up lands.
+- **`timeout`** — ENFORCED (#3527; the #3315 tracked follow-up). It is NOT a
+  screen-rate control: it maps to the per-zone half-open TCP session window
+  (`SessionTimeouts.tcp_opening_ns`, 20 s default — the Junos
+  half-completed-connection queue). `timeout N` now crosses the wire
+  (`ScreenProfileSnapshot.syn_flood_timeout`, seconds) and the forwarding
+  builder turns it into a per-ingress-zone override of `tcp_opening_ns`
+  (`ForwardingState.session_opening_overrides` →
+  `SessionTable::set_opening_overrides`). A bare-SYN (OPENING / half-open)
+  session in a screened zone is then reaped on `N` seconds instead of the
+  global 20 s default — so a flood that stops is forgotten on the operator's
+  window, and a half-open never lingers longer than the configured queue
+  bound. `session_timeout_ns` consults the override ONLY on the OPENING branch
+  (never the established / closing / RST windows). HA composition (#3315 plan
+  §11.1): the override is config-derived and re-derived per node from the
+  snapshot — it does NOT travel on the session-sync wire. A peer-synced session
+  is imported ESTABLISHED, so its OPENING branch is never taken, and identical
+  config on both nodes yields the same map independently. The #3315 commit-time
+  "accepted but NOT yet enforced" WARNING is removed now that the leaf is
+  effective.
 
 Enforcement order (`screen/mod.rs`, inside the initial-SYN gate, after the
 validated-cookie bypass): (1) the aggregate `attack-threshold` (+

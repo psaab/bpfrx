@@ -32,10 +32,15 @@ the userspace dataplane admission boundary is in
   dropping. Memory per configured zone per worker is ~192 KiB
   (`ROWS*DST_COLS + ROWS*SRC_COLS` × 16 B); the Go compiler emits a
   commit-time advisory if `attack-threshold / source-threshold` exceeds
-  ~1000 (the regime where the sketch can over-throttle). `timeout` parses
-  and commits but is NOT yet enforced — it maps to the per-zone half-open
-  session window (`tcp_opening_ns`), a tracked follow-up; the compiler emits
-  a commit-time warning so the leaf is never silently inert.
+  ~1000 (the regime where the sketch can over-throttle). `timeout` is
+  ENFORCED (#3527, the #3315 follow-up): it is NOT a screen-rate control —
+  it maps to the per-zone half-open TCP session window (`tcp_opening_ns`,
+  20 s default), crossing the wire as `ScreenProfileSnapshot.syn_flood_timeout`
+  and applied as a per-ingress-zone override (`session_opening_overrides` →
+  `SessionTable::set_opening_overrides`), so a bare-SYN session in a screened
+  zone reaps on the operator's window instead of the global default. It is
+  node-local config-derived state (re-derived per HA node, never on the
+  session-sync wire); the #3315 accepted-but-inert commit warning is removed.
 - **Firewall filters**: policer (token bucket + three-color), lo0 filter,
   flexible match, port ranges, hit counters, logging, forwarding-class
   DSCP rewrite.

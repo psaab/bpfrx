@@ -47,9 +47,7 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 			// #3024 default guarantees AttackThreshold > 0 whenever a syn-flood
 			// screen is enabled, so this block is the single publish gate for
 			// every syn-flood control. alarm/source/destination are non-zero only
-			// when the operator configured them; `timeout` is not serialized
-			// (see ScreenProfileSnapshot — it maps to the session half-open
-			// window, a tracked follow-up, and the compiler warns it is inert).
+			// when the operator configured them.
 			if sp.TCP.SynFlood.AlarmThreshold > 0 {
 				snap.SYNFloodAlarmThreshold = uint32(sp.TCP.SynFlood.AlarmThreshold)
 			}
@@ -58,6 +56,13 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 			}
 			if sp.TCP.SynFlood.SourceThreshold > 0 {
 				snap.SYNFloodSrcThreshold = uint32(sp.TCP.SynFlood.SourceThreshold)
+			}
+			// #3527: carry `syn-flood timeout` (seconds) so the dataplane can
+			// enforce it as a per-zone override of the half-open session window
+			// (tcp_opening_ns). It maps to the session layer, not the screen-rate
+			// substrate above; closing the #3315 deferred leaf.
+			if sp.TCP.SynFlood.Timeout > 0 {
+				snap.SYNFloodTimeout = uint32(sp.TCP.SynFlood.Timeout)
 			}
 		}
 		if sp.LimitSession.SourceIPBased > 0 {

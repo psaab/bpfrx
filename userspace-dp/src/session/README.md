@@ -117,10 +117,27 @@ when configured on the ingress zone; this is the defense-in-depth /
 Junos-parity backstop for zones without it. It is the SYN-flood/half-open
 sibling of the #3046 RST-reap window and composes with the #3227 per-app
 idle timeout (which is the established idle value and never shortens or
-lengthens the opening window). The `tcp_opening_ns` window is not
-operator-configurable yet — held at the default on every construction
-path including `from_seconds` (a future config knob would set it there
-without touching the state machine).
+lengthens the opening window). The global `tcp_opening_ns` window is held
+at the default on every construction path including `from_seconds`; the
+per-zone override below (#3527) is the operator knob.
+
+**Per-zone half-open override (#3527 — Junos `syn-flood timeout`).** The
+Junos `tcp syn-flood timeout N` leaf does NOT belong to the screen-rate
+substrate (#3315 D5); it bounds the half-completed-connection queue, which
+maps to this OPENING window. The Go control plane carries it on the screen
+snapshot (`ScreenProfileSnapshot.syn_flood_timeout`, seconds) and the
+forwarding builder turns each screened zone's timeout into a per-ingress-
+zone override (`ForwardingState.session_opening_overrides`, zone id → ns),
+pushed onto the worker `SessionTable` via `set_opening_overrides` next to
+`set_timeouts` (at startup AND on every runtime snapshot rotation — a full
+replace, so removing the leaf reverts the zone to the global default).
+`session_timeout_ns` takes an `opening_override_ns` consulted ONLY on the
+OPENING branch (never the established / closing / RST windows): a bare-SYN
+session in a zone with `syn-flood timeout N` reaps `N` seconds after
+install instead of the global 20 s default, on all three timeout-selection
+sites (install, lookup-refresh, update_session). The override resolves from
+the entry's `ingress_zone`; an empty override map (no zone configures a
+timeout) is byte-identical to pre-#3527.
 
 **HA-sync interaction (#3152).** The `established` field is node-local
 derived state and is NOT carried on the cross-node session-sync wire (no
@@ -144,6 +161,16 @@ still holds end to end: the primary (the flood target) reaps its
 half-opens at `tcp_opening_ns` and emits a Close delta
 (`session/expire.rs`) that propagates to the standby, removing the synced
 copy promptly without the standby needing its own OPENING window.
+
+The #3527 per-zone opening override composes with this cleanly (the #3315
+plan §11.1 open question). Like `established`, the override is node-local
+derived state and does NOT cross the session-sync wire: it is re-derived
+per node from each node's config snapshot (HA requires identical config,
+so both build the same map). Because a peer-synced session is imported
+ESTABLISHED, its OPENING branch is never taken, so the override is
+irrelevant on the standby for synced sessions — `upsert_synced_with_origin`
+passes `None` explicitly. The override only governs locally-received
+bare-SYN floods on whichever node is forwarding.
 
 **RST vs FIN close (#3046).** A graceful FIN close keeps the full 30 s
 `TCP_CLOSING_TIMEOUT_NS` (TIME_WAIT-style window for half-closed /
