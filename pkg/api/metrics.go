@@ -37,14 +37,15 @@ type xpfCollector struct {
 	syncookieTotal           *prometheus.Desc
 	flowCacheTotal           *prometheus.Desc
 
-	// #3345/#3408: monotonic count of dataplane counter reads that failed
-	// during a scrape, across the global, per-zone, per-policy, and per-filter
-	// collectors. A failed read SKIPS emitting that counter's sample (so a
-	// degraded counter bridge does NOT report a misleading 0); this metric is
-	// the scrape-error signal an operator alerts on. Persisted on the collector
-	// so it accumulates across scrapes like a real counter. #3462: the SAMPLE
-	// is emitted last in Collect (emitCounterReadErrors), after all collectors
-	// that can bump it, so a failure this scrape is reflected this scrape.
+	// #3345/#3408: monotonic count of counter reads that failed during a
+	// scrape, across the global, per-zone, per-policy, and per-filter dataplane
+	// collectors AND the kernel-nftables host-inbound collector (#3361). A
+	// failed read SKIPS emitting that counter's sample (so a degraded counter
+	// bridge does NOT report a misleading 0); this metric is the scrape-error
+	// signal an operator alerts on. Persisted on the collector so it accumulates
+	// across scrapes like a real counter. #3462: the SAMPLE is emitted last in
+	// Collect (emitCounterReadErrors), after all collectors that can bump it, so
+	// a failure this scrape is reflected this scrape.
 	counterReadErrorsTotal *prometheus.Desc
 	counterReadErrors      atomic.Uint64
 

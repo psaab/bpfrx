@@ -326,7 +326,7 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 
 			for _, term := range filter.Terms {
 				// #3459: the per-term counter-slot stride is the shared SSOT
-				// dataplane.FilterTermExpansionCount (full src×dst×dstPort×
+				// config.FilterTermExpansionCount (full src×dst×dstPort×
 				// srcPort cross-product, with prefix-list prefixes folded into
 				// src/dst) — NOT the old nSrc*nDst that ignored ports and
 				// prefix-lists and drifted later terms onto a neighbouring

@@ -200,10 +200,13 @@ under the daemon's errgroup. Nothing else imports this package.
     (rather than emitting a misleading `0`) for global, per-zone,
     per-policy, and per-filter reads, and bumps the monotonic
     `xpf_counter_read_errors_total` scrape-error counter, always emitted
-    (0 when healthy) for alerting. The descriptor Help text names all four
-    read surfaces (#3463), not global-only, so it matches this contract.
-    The error-counter SAMPLE is emitted LAST in `Collect`
-    (`emitCounterReadErrors`), AFTER the global/zone/policy/filter
+    (0 when healthy) for alerting. The same counter is ALSO bumped by the
+    pre-gate kernel-nftables host-inbound collector (`#3361`) when its
+    netlink read fails, so the descriptor Help text names every read surface
+    that increments it — global, zone, policy, and filter dataplane reads
+    PLUS the kernel-nftables host-inbound read (#3463), not global-only, so
+    it matches this contract. The error-counter SAMPLE is emitted LAST in
+    `Collect` (`emitCounterReadErrors`), AFTER the global/zone/policy/filter
     sub-collectors (and the pre-gate host-inbound collector) have run, so a
     read failure in any of them is reflected in THIS scrape's value rather
     than lagging one scrape behind (#3462). The per-filter collector also
@@ -212,7 +215,7 @@ under the daemon's errgroup. Nothing else imports this package.
     the CLI/gRPC text paths use), so the canonical metrics path does not
     report 0/stale while `show firewall filter` shows real hits (#3461); the
     per-term counter-slot stride is the shared
-    `dataplane.FilterTermExpansionCount` SSOT (#3459).
+    `config.FilterTermExpansionCount` SSOT (#3459).
   - **Text commands** print a `warning: ... counter read failed ...` line
     instead of a clean zero: `show security screen` / `show security
     alarms` / `show security flow statistics` / `show chassis cluster

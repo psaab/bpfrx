@@ -21,18 +21,21 @@ func newCollector(srv *Server) *xpfCollector {
 			"Total packets dropped.",
 			nil, nil,
 		),
-		// #3345/#3408: scrape-error signal for dataplane counter reads across
-		// the global, per-zone, per-policy, and per-filter collectors. A failed
-		// read omits the affected counter sample instead of emitting a
-		// misleading 0, and bumps this monotonic counter so a degraded counter
-		// bridge is alertable rather than silently reported as zero. #3463: the
-		// descriptor text covers all four read surfaces (not global-only) so an
-		// operator runbook built on it does not misdiagnose a zone/policy/filter
-		// counter-bridge failure as global-only.
+		// #3345/#3408: scrape-error signal for counter reads across the global,
+		// per-zone, per-policy, and per-filter dataplane collectors AND the
+		// kernel-nftables host-inbound collector (#3361, pre-gate). A failed read
+		// omits the affected counter sample instead of emitting a misleading 0,
+		// and bumps this monotonic counter so a degraded counter bridge is
+		// alertable rather than silently reported as zero. #3463: the descriptor
+		// text names every read surface that increments this counter — including
+		// the host-inbound kernel-nftables read — so an operator runbook built on
+		// it does not misdiagnose a zone/policy/filter or host-inbound counter
+		// failure as global-only.
 		counterReadErrorsTotal: prometheus.NewDesc(
 			"xpf_counter_read_errors_total",
-			"Total dataplane counter read failures during metric scrapes "+
-				"(global, zone, policy, and filter counters).",
+			"Total counter read failures during metric scrapes (global, zone, "+
+				"policy, and filter dataplane reads, plus kernel-nftables "+
+				"host-inbound reads).",
 			nil, nil,
 		),
 		sessionsCreatedTotal: prometheus.NewDesc(

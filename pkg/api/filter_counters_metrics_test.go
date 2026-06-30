@@ -159,6 +159,63 @@ func TestCollectFilterCountersMergesUserspaceCounters(t *testing.T) {
 	}
 }
 
+// filterUserspaceMapErrDP models the REAL userspace-dp production path: the
+// apply result IS populated (LastApplyResult carries FilterIDs), but the shim
+// has no eBPF filter_configs loaded, so ReadFilterConfig fails — hasMap stays
+// false and counterReadErrors is bumped per filter — while the helper status
+// carries the actual per-term hit counters.
+type filterUserspaceMapErrDP struct {
+	*dataplane.Manager
+	apply  *dataplane.ApplyResult
+	status dpuserspace.ProcessStatus
+}
+
+func (d *filterUserspaceMapErrDP) IsLoaded() bool                          { return true }
+func (d *filterUserspaceMapErrDP) LastApplyResult() *dataplane.ApplyResult { return d.apply }
+func (d *filterUserspaceMapErrDP) ReadFilterConfig(uint32) (dataplane.FilterConfig, error) {
+	return dataplane.FilterConfig{}, errors.New("filter_configs not loaded in shim")
+}
+func (d *filterUserspaceMapErrDP) Status() (dpuserspace.ProcessStatus, error) {
+	return d.status, nil
+}
+
+// TestCollectFilterCountersMergesUserspaceCountersWhenMapConfigUnavailable is
+// the #3461 REAL-PATH pin: a populated apply result (FilterIDs present) with a
+// failing ReadFilterConfig — exactly the userspace-dp runtime where the eBPF
+// filter_configs map is not loaded. The per-filter ReadFilterConfig failure
+// bumps counterReadErrors (hasMap=false), and the helper-published term counter
+// must still be emitted on xpf_filter_hits_total.
+//
+// FAIL-ON-REVERT: dropping the userspace merge leaves hasMap=false AND
+// userspaceOk unused, so no sample is emitted for the term — got["t1"] is
+// absent (0) and the value assertion goes RED. (The counterReadErrors bump is
+// the independent #3408 path and is asserted separately.)
+func TestCollectFilterCountersMergesUserspaceCountersWhenMapConfigUnavailable(t *testing.T) {
+	store := newFilterStore(t, []string{
+		"set firewall family inet filter fin term t1 from protocol tcp",
+		"set firewall family inet filter fin term t1 then accept",
+	})
+	c := newCollector(&Server{store: store})
+	dp := &filterUserspaceMapErrDP{
+		Manager: dataplane.New(),
+		apply:   &dataplane.ApplyResult{FilterIDs: map[string]uint32{"inet:fin": 0}},
+		status: dpuserspace.ProcessStatus{
+			FilterTermCounters: []dpuserspace.FirewallFilterTermCounterStatus{
+				{Family: "inet", FilterName: "fin", TermName: "t1", Packets: 555},
+			},
+		},
+	}
+
+	got := filterHitsByTerm(t, c, dp)
+	if got["t1"] != 555 {
+		t.Errorf("term t1 hit count = %v, want 555 (helper-published counter must "+
+			"merge even when the eBPF filter_configs map read fails)", got["t1"])
+	}
+	if c.counterReadErrors.Load() == 0 {
+		t.Error("counterReadErrors not bumped on the per-filter ReadFilterConfig failure")
+	}
+}
+
 // zoneErrScrapeDP reuses the fully-wired descriptorCoverageDP but fails the
 // per-zone counter reads, so a full Collect() bumps counterReadErrors AFTER
 // collectGlobalCounters has already run.
