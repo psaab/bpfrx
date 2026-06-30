@@ -1,3 +1,47 @@
+## 2026-06-29 — #3457 fix 4 red/flaky userspace-dp tests (forwarding zone gate + 2 timing flakes)
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3457 (audit, master CI health) — the full `cargo test
+    --release` userspace-dp binary suite had failing tests on clean
+    origin/master. Reproduced and root-caused each:
+    (1+2) `afxdp::tests::txn_policy_denied_missing_neighbor_is_dropped_not_reinjected`
+    and `..._skips_neg_cache_fast_fail` (afxdp/tests.rs) — DETERMINISTIC
+    panics at forwarding_build/mod.rs:155 (`build_forwarding_state`'s
+    `.expect`). STALE TEST: each overwrote `snapshot.zones` to {lan,wan},
+    dropping the `dmz` zone, but kept `policy_deny_snapshot()`'s
+    `allow-other` policy whose from-zone is `dmz`. Once #3402 added the
+    fail-closed `UnresolvableZoneReference` gate (policy.rs:386/830), the
+    dangling dmz reference makes `try_build_forwarding_state` return Err
+    and the test `.expect` panics. Fix: keep the `dmz` ZoneSnapshot
+    (TEST_DMZ_ZONE_ID) in the override so the fixture's policy resolves;
+    the flow under test is lan->wan so dmz is inert — all real assertions
+    (policy_deny counted, no reinject/buffer/session) untouched.
+    (3) `afxdp::worker_queue::tests::concurrent_recovery_processes_each_command_exactly_once`
+    (worker_queue_tests.rs) — FLAKY under CPU oversubscription (12/40 then
+    repro'd; assertion at L139 `both threads must process some commands
+    (1000 / 0)`). The start Barrier guarantees both threads ENTER
+    `lock_recover` together but cannot guarantee balanced DRAINING — once
+    poison clears, the lock holder may drain all 1000 in one quantum. The
+    `!seen_a.is_empty() && !seen_b.is_empty()` assertion tested an
+    unguaranteed property; removed it. The named exactly-once contract
+    (merged-sorted `all == 0..1000`, poison cleared, queue empty) is
+    fully preserved.
+    (4) `afxdp::wg::engine::engine_internal_tests::reconcile_peers_snapshot_is_atomic_under_concurrent_load`
+    (wg/engine_tests.rs) — FLAKY (6/40 under load; assertion at L587
+    `reader thread observed no snapshots`). Reader-starvation: the writer
+    finishes all 2000 reconciles and stores stop=true before the reader
+    is first scheduled, so a leading `while !stop` takes zero snapshots.
+    Fix: do-while (take >=1 snapshot before consulting stop); the
+    torn-snapshot invariant still runs on every snapshot.
+    Validation: full `cargo test --release` 3290 passed / 0 failed; the 2
+    timing fixes pass 60/60 under the same 28-burner CPU oversubscription
+    that previously failed them 30%/15%. Test-only changes — no production
+    contract changed, so no doc update (afxdp/README.md poison-recovery
+    section documents the lock_recover helpers, which are unchanged).
+  - **File(s)**: userspace-dp/src/afxdp/tests.rs,
+    userspace-dp/src/afxdp/worker_queue_tests.rs,
+    userspace-dp/src/afxdp/wg/engine_tests.rs, _Log.md
+
 ## 2026-06-29 — #3418 NAT strict feed-only address-name: pin the carve-out across the full SNAT/DNAT matrix
 
 - **Timestamp**: 2026-06-29

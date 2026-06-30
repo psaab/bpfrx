@@ -8127,6 +8127,15 @@ fn txn_policy_denied_missing_neighbor_is_dropped_not_reinjected() {
             id: TEST_WAN_ZONE_ID,
             ..Default::default()
         },
+        // #3457: policy_deny_snapshot() carries a dmz->wan permit policy;
+        // the dmz zone must stay in the table or the #3402 fail-closed
+        // gate raises UnresolvableZoneReference and build_forwarding_state
+        // panics. The flow under test is lan->wan, so dmz is inert here.
+        ZoneSnapshot {
+            name: "dmz".to_string(),
+            id: TEST_DMZ_ZONE_ID,
+            ..Default::default()
+        },
     ];
     // No neighbor for 172.16.80.200: the connected WAN route resolves
     // but ARP is unresolved -> MissingNeighbor (the cold path under test).
@@ -8189,6 +8198,14 @@ fn txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail() {
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            ..Default::default()
+        },
+        // #3457: keep the dmz zone so policy_deny_snapshot()'s dmz->wan
+        // permit policy resolves under the #3402 fail-closed gate. The
+        // flow under test is lan->wan; dmz is inert.
+        ZoneSnapshot {
+            name: "dmz".to_string(),
+            id: TEST_DMZ_ZONE_ID,
             ..Default::default()
         },
     ];

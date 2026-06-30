@@ -136,12 +136,18 @@ fn concurrent_recovery_processes_each_command_exactly_once() {
     let seen_a = a.join().expect("drain thread a");
     let seen_b = b.join().expect("drain thread b");
 
-    assert!(
-        !seen_a.is_empty() && !seen_b.is_empty(),
-        "both threads must process some commands ({} / {}) — the race must be real",
-        seen_a.len(),
-        seen_b.len()
-    );
+    // #3457: do NOT assert that BOTH threads pop at least one command. The
+    // start Barrier guarantees both threads enter `lock_recover` on the
+    // poisoned mutex simultaneously (the genuine recovery-time contention PR
+    // #1822's review asked for), but it CANNOT guarantee balanced draining:
+    // once the first recoverer clears the poison, whichever thread holds the
+    // lock may drain the entire queue within a single scheduling quantum,
+    // leaving its peer to observe an already-empty queue. Under CPU contention
+    // (full test-suite load) that is the COMMON outcome — the prior
+    // `!seen_a.is_empty() && !seen_b.is_empty()` assertion failed ~18/20 under
+    // load — so an empty peer slice is a scheduler artifact, not a correctness
+    // violation. The deterministic poison-recovery contract is exactly-once
+    // processing with the poison cleared and the queue drained, asserted below.
     let mut all = seen_a;
     all.extend(seen_b);
     all.sort_unstable();
