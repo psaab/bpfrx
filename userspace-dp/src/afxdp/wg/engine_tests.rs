@@ -557,7 +557,16 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
         let stop = stop.clone();
         thread::spawn(move || {
             let mut observed = 0u64;
-            while !stop.load(AOrd::Relaxed) {
+            // #3457: take at least one snapshot BEFORE consulting `stop`
+            // (do-while). Under heavy CPU oversubscription the writer can
+            // finish all 2000 reconciles and store `stop=true` before this
+            // thread is first scheduled; a leading `while !stop` would then
+            // observe zero snapshots and fail the `n >= 1` sanity check —
+            // a scheduler artifact, not an atomicity violation. The
+            // torn-snapshot invariant below still runs on every real
+            // snapshot, so the safety check is unchanged; only the
+            // reader-starvation flake is removed.
+            loop {
                 let snapshot = engine.load_table();
                 // The invariant: every (pubkey, idx) pair in
                 // the index map must map to a peer in `peers`
@@ -575,15 +584,17 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
                     );
                 }
                 observed += 1;
+                if stop.load(AOrd::Relaxed) {
+                    break;
+                }
             }
             observed
         })
     };
     writer.join().unwrap();
     let n = reader.join().unwrap();
-    // Sanity: the reader must have done at least one full pass.
-    // (On a heavily loaded CI box this could be 1; we don't
-    // tighten it.)
+    // Sanity: the reader must have done at least one full pass. The
+    // do-while above guarantees this deterministically (#3457).
     assert!(n >= 1, "reader thread observed no snapshots");
 }
 
