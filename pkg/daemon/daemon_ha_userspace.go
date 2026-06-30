@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"sort"
 	"strings"
 	"time"
 
@@ -19,17 +18,19 @@ import (
 	"github.com/psaab/xpf/pkg/logging"
 )
 
-// buildZoneIDs replicates the deterministic zone ID assignment from the
-// dataplane compiler (sorted zone names, 1-based sequential IDs).
+// buildZoneIDs replicates the dataplane compiler's STABLE zone ID assignment
+// (#3075): config.StableZoneID(name), a pure FNV-1a fold of the zone NAME into
+// [1, ZoneIDReservedMin-1]. It MUST stay byte-identical to
+// pkg/dataplane.assignZoneIDs so an HA session delta resolves to the same local
+// id the compiler installed (enforced by an HA-symmetry test). The id is a pure
+// function of the name — never of the zone set or compile order — so both nodes
+// agree by construction and an earlier-sorting zone add/remove never renumbers
+// a surviving zone's in-flight session metadata (the sorted-positional defect
+// this replaces).
 func buildZoneIDs(cfg *config.Config) map[string]uint16 {
-	names := make([]string, 0, len(cfg.Security.Zones))
+	ids := make(map[string]uint16, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	ids := make(map[string]uint16, len(names))
-	for i, name := range names {
-		ids[name] = uint16(i + 1)
+		ids[name] = config.StableZoneID(name)
 	}
 	return ids
 }

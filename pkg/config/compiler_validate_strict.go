@@ -3311,39 +3311,37 @@ func validatePolicyLogActionStrict(cfg *Config) error {
 }
 
 // MaxUsableZoneID is the largest security-zone id the live AF_XDP userspace
-// dataplane can carry. Zone ids are assigned sequentially 1..N in
-// pkg/dataplane/compiler.go and reach the dataplane two ways: as the per-flow
-// ingress/egress zone in the event-stream wire record (a u8 field — see
-// userspace-dp/src/event_stream/codec.rs, "[21] IngressZoneID u8"), and as the
-// zone-table key in the forwarding snapshot. The userspace forwarding builder
-// rejects any zone id >= ZONE_ID_RESERVED_MIN (u16::MAX-1, reserved for the
-// JUNOS_GLOBAL_ZONE_ID sentinel) and any id > u8::MAX
-// (userspace-dp/src/afxdp/forwarding_build/zones.rs). The binding constraint is
-// therefore the u8 wire field, NOT the reserved sentinel: the usable range is
-// [1, min(255, ZONE_ID_RESERVED_MIN-1)] = [1, 255]. With more than 255 zones the
-// 256th+ ids exceed the u8 field and were silently dropped by the dataplane,
-// collapsing the referencing interfaces to zone 0 ("unknown") — a silent
-// fail-open/fail-closed mis-attribution rather than a commit-time rejection
-// (#2391).
-const MaxUsableZoneID = 255
+// dataplane can carry, and therefore the maximum number of DISTINCT zones a
+// config may define. #3075 widened the two same-host event-stream u8 chokepoints
+// (event_stream/codec.rs, forwarding_build/zones.rs + the fabric zone MAC) to
+// u16 and replaced the sorted 1..N positional id assignment with a stable
+// name-hash (config.StableZoneID, folded into [1, ZoneIDReservedMin-1]). The
+// binding constraint is therefore no longer the old u8 wire field (#2391, now
+// SUPERSEDED) but the reserved-sentinel range at the top of the u16 space:
+// JUNOS_GLOBAL_ZONE_ID (u16::MAX) and the junos-host zone (u16::MAX-1 =
+// ZoneIDReservedMin). The usable space is [1, ZoneIDReservedMin-1] = [1, 65533],
+// so a config cannot define more than that many distinct zones (pigeonhole: a
+// stable id is a 1:1 function of the name into 65533 slots). The fold guarantees
+// no configured zone ever lands in the reserved range; the StableZoneID
+// collision gate (validateZoneIDCollisionAST) is the PRIMARY duplicate-id guard.
+const MaxUsableZoneID = int(ZoneIDReservedMin) - 1 // 65533
 
 // validateZoneCountStrict hard-rejects a configuration that defines more
-// security zones than the dataplane wire format can address (#2391). Zone ids
-// are assigned 1..N sequentially over the sorted zone names; with N >
-// MaxUsableZoneID the highest ids overflow the u8 event-stream zone field and
-// were silently dropped by the userspace forwarding builder, mapping the
-// affected interfaces to zone 0 instead of failing the commit. This validator is
-// the PRIMARY gate: bounding N at MaxUsableZoneID guarantees no out-of-range id
-// is ever produced, so the dataplane's defense-in-depth skip path is never
-// reached for a clean commit.
+// security zones than the u16 zone-id space can address. After #3075 zone ids
+// are a stable name-hash folded into [1, ZoneIDReservedMin-1]; by the pigeonhole
+// principle a config with more than MaxUsableZoneID distinct zones cannot be
+// assigned distinct ids (and would in practice be rejected far sooner by the
+// StableZoneID collision gate, which fires on the first hash collision). This
+// validator is a cheap O(1) belt against that pathological count; the collision
+// gate (validateZoneIDCollisionAST) is the real duplicate-id protection and the
+// fold itself guarantees no reserved-sentinel id is ever produced. (#2391 is
+// SUPERSEDED: the cap is no longer a 255-id u8 wire limit.)
 //
 // Strict on the commit / commit-check path (CompileConfig — hard-reject);
 // downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
 // (CompileConfigLenient / CompileConfigForNodeLenient, flag lenientZoneCount) so
 // an already-persisted or peer-synced config that an older binary accepted still
-// BOOTS (#1960 fail-closed-on-load doctrine) — the dataplane independently fails
-// closed on every overflowing zone, so a leniently-loaded over-cap config is
-// inert (the overflow zones simply do not forward) rather than mis-attributed.
+// BOOTS (#1960 fail-closed-on-load doctrine).
 func validateZoneCountStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -3351,7 +3349,7 @@ func validateZoneCountStrict(cfg *Config) error {
 	n := len(cfg.Security.Zones)
 	if n > MaxUsableZoneID {
 		return fmt.Errorf(
-			"configuration defines %d security zones, but the dataplane can address at most %d (zone ids are carried in a u8 wire field); reduce the zone count to %d or fewer — zones beyond the limit are dropped by the dataplane and their interfaces silently fall back to the \"unknown\" zone",
+			"configuration defines %d security zones, but the dataplane can address at most %d distinct zones (zone ids are a stable name-hash in a u16 space, top two ids reserved); reduce the zone count to %d or fewer",
 			n, MaxUsableZoneID, MaxUsableZoneID)
 	}
 	return nil
