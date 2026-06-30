@@ -1601,14 +1601,16 @@ whose `from-zone` or `to-zone` names a security zone the configuration
 never defines (a typo, or a zone deleted out from under the policy) was
 historically only a `ValidateConfig` **warning** — the commit succeeded.
 The rule was compiled and KEPT, but the userspace dataplane resolves the
-unknown zone name to no zone-id and so never indexes the rule into its
-zone-pair lookup table (`userspace-dp/src/policy.rs` logs `"policy rule
-references unknown zone(s) ... (rule kept, but not indexed)"`). At match
-time the zone pair has no indexed rule, so evaluation falls through to
-`state.default_action`: under a **permit** default this is a silent
-fail-OPEN (a deny rule the operator wrote against a mistyped zone does
-nothing); under a deny default it blackholes with no operator signal
-beyond a stderr line. Junos rejects an undefined zone reference at commit.
+unknown zone name to no zone-id; before **#3402** it then silently DROPPED
+the unindexed rule, so the zone pair fell through to `state.default_action`:
+under a **permit** default this was a silent fail-OPEN (a deny rule the
+operator wrote against a mistyped zone did nothing); under a deny default it
+blackholed with no operator signal beyond a stderr line. Junos rejects an
+undefined zone reference at commit. As of **#3402** the dataplane no longer
+drops the rule: its integrity preflight rejects the WHOLE snapshot
+(`SnapshotIntegrityError::UnresolvableZoneReference`) and retains the
+previous good `PolicyState` (default-deny on a fresh boot) — see the
+"#3402" entry below.
 
 **`validatePolicyZoneReferencesStrict`** (`compiler_validate_strict.go`)
 restores that fail-CLOSED parity. It hard-rejects any zone-pair policy
@@ -1621,17 +1623,21 @@ names an undefined structural zone. As of **#3148** a global policy MAY carry
 an optional `match from-zone`/`match to-zone` context (all-zones when absent);
 `validatePolicyZoneReferencesStrict` now validates those match zones against the
 same special-token + defined-zone gate. The dataplane fails CLOSED for an
-undefined global match zone (`GlobalZoneScope::Unresolved` matches nothing) — a
-silent never-match rather than a fail-open — but the commit gate rejects it
-anyway for operator-visible parity.
+undefined global match zone — since #3402 `build_global_zone_scope` raises
+`SnapshotIntegrityError::UnresolvableZoneReference` (rejecting the whole
+snapshot) rather than building a matches-nothing scope — and the commit gate
+rejects it anyway for operator-visible parity.
 
 **Strict/lenient split (flag `lenientPolicyZoneRefs`):** strict on the
 commit / commit-check path (`CompileConfig` — hard-reject), downgraded to
 a `cfg.Warnings` entry on the tolerant load / peer-sync paths
 (`CompileConfigLenient` / `CompileConfigForNodeLenient`) so an
 already-persisted or peer-synced config carrying a stale zone reference
-still BOOTS (#1960 fail-closed-on-load doctrine) — the dataplane drops the
-unindexed rule on its own, so a leniently-loaded bad config is inert. The
+still BOOTS the daemon (#1960 fail-closed-on-load doctrine: the management
+plane stays alive so the operator can fix it). Since #3402 the dataplane
+itself fails CLOSED on such a snapshot (whole-snapshot integrity reject,
+previous-good `PolicyState` retained), so a leniently-loaded bad config does
+not silently un-enforce a rule. The
 gate runs AFTER `validatePolicyMatchAddressesStrict`, mirroring the sibling
 fail-open validators, so a structural CoS/policer/device-map error and a
 bad match-address still win the first-error slot.
@@ -1640,6 +1646,35 @@ Regression coverage: `pkg/config/policy_zone_ref_test.go`
 an undefined from-zone and to-zone, `TestPolicySpecialZoneTokensCommit` —
 `any`/`junos-host`/global anti-over-reject, `TestPolicyDefinedZonesCommit`,
 `TestPolicyUndefinedZoneLenientDowngradesToWarning`).
+
+### #3402 — Undefined-zone policy snapshot (dataplane fail-closed backstop)
+
+The #2401 commit gate is the primary defense, but it is downgraded to a
+warning on the lenient / upgrade-state / HA-replay path, and a corrupt or
+version-drifted snapshot can carry an undefined zone name regardless. Before
+#3402 the userspace dataplane handled such a snapshot rule as a stderr-only
+DROP: the zone-pair / single-wildcard index build skipped it ("rule kept, but
+not indexed") and the scoped-global build produced a matches-nothing
+`GlobalZoneScope::Unresolved`. In both cases the rule never participated in
+evaluation and its traffic fell through to `default-policy` — a fail-OPEN
+stale `deny` under `default-policy permit-all`, a blackholing stale `permit`
+under `deny-all` — invisible to the control plane.
+
+`parse_policy_state_with_counters` (`userspace-dp/src/policy.rs`) now raises
+`SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }` for an
+unresolvable from/to zone (zone-pair and single-wildcard paths) and for an
+unresolvable scoped-global `match from-zone`/`match to-zone`
+(`build_global_zone_scope`). The integrity preflight in the apply handler
+rejects the WHOLE snapshot and retains the previous good `PolicyState` (a
+fresh boot keeps the default-deny state), action-agnostic and consistent with
+the #2124/#3261/#3365/#3367 fail-closed family. The special tokens `any`,
+`junos-host`, and the empty token always resolve, so a clean config never
+trips this. The `GlobalZoneScope::Unresolved` variant was removed: a live
+scope is now only `Any` or a resolved `Zone(id)`. Regression coverage:
+`unknown_zone_pair_fails_closed`, `unknown_single_wildcard_zone_fails_closed`,
+`resolvable_zone_pair_still_compiles` (over-reject guard), and
+`global_policy_unknown_zone_context_fails_closed` in
+`userspace-dp/src/policy_tests.rs`.
 
 ### #3300 — Dynamic-address `address-name … feed-name` cross-reference gate
 
