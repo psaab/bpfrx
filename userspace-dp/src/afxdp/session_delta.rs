@@ -230,13 +230,31 @@ pub(super) fn flush_session_deltas(
                     delta.metadata.is_reverse,
                     delta.decision.nat.rewrite_dst_port,
                 );
+                // #3395: re-resolve the admitting policy's CURRENT positional id
+                // from the session's bound rule handle against the live rule
+                // table. A live mid-list policy insert/delete renumbers every
+                // later rule, so the frozen `delta.metadata.policy_id` would name
+                // the wrong policy on the close log; the close path already holds
+                // `forwarding.policy`, so this needs no new plumbing. A deleted
+                // admitting rule resolves to the unattributed default-policy
+                // sentinel (never a reassigned index); an unbound (non-policy /
+                // peer-synced) session keeps its frozen id.
+                let reresolved_policy_id = forwarding.policy.reresolve_session_policy_id(
+                    delta.metadata.policy_counter.as_ref(),
+                    delta.metadata.policy_id,
+                );
                 // #2615: thread the closing binding's ingress ifindex so the
                 // SESSION_CLOSE RT_FLOW record shows the admitting interface
                 // (`packet-incoming-interface`) instead of "N/A". `ident` is
                 // the binding draining this delta; its ifindex is the ingress
                 // interface. A kernel ifindex is always positive, so the
                 // i32 -> u32 cast is loss-free.
-                es.emit_session_close_rt_flow(delta, app_id, ident.ifindex as u32);
+                es.emit_session_close_rt_flow(
+                    delta,
+                    app_id,
+                    ident.ifindex as u32,
+                    reresolved_policy_id,
+                );
             }
             // #2508: a session admitted by a policy configured with
             // `then log session-init` emits an RT_FLOW SESSION_CREATE frame

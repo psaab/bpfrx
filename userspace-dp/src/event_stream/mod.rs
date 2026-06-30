@@ -617,11 +617,19 @@ impl EventStreamWorkerHandle {
     /// `ingress_ifindex` is the closing binding's interface index (#2615); the
     /// Go side resolves it to the RT_FLOW `packet-incoming-interface`. 0 keeps
     /// the prior "N/A" rendering.
+    ///
+    /// #3395: `policy_id` is the RE-RESOLVED admitting policy id, computed by the
+    /// caller (`flush_session_deltas`) from the session's bound rule handle
+    /// against the CURRENT rule table — NOT `delta.metadata.policy_id` (which is
+    /// frozen at install and goes stale after a live policy reorder). The caller
+    /// owns re-resolution because only it holds the `ForwardingState`/`PolicyState`
+    /// the lookup needs.
     pub(crate) fn emit_session_close_rt_flow(
         &self,
         delta: &SessionDelta,
         app_id: u16,
         ingress_ifindex: u32,
+        policy_id: u32,
     ) {
         if delta.kind != SessionDeltaKind::Close {
             return;
@@ -671,12 +679,16 @@ impl EventStreamWorkerHandle {
                     nat.rewrite_dst_port.unwrap_or(0),
                     delta.metadata.ingress_zone,
                     delta.metadata.egress_zone,
-                    // #3056: the admitting policy ID stamped on the session at
-                    // install, so the SESSION_CLOSE RT_FLOW record (and the
-                    // NetFlow/IPFIX close exporters) name the policy that
-                    // admitted the flow instead of policy 0. Rides the trailing
-                    // [136:140] slot because #2853 took [44:48] on a close.
-                    delta.metadata.policy_id,
+                    // #3056: the admitting policy ID, so the SESSION_CLOSE
+                    // RT_FLOW record (and the NetFlow/IPFIX close exporters) name
+                    // the policy that admitted the flow instead of policy 0.
+                    // Rides the trailing [136:140] slot because #2853 took
+                    // [44:48] on a close. #3395: this is the caller's RE-RESOLVED
+                    // id (current positional id of the bound admitting rule),
+                    // not the frozen `delta.metadata.policy_id`, so a live policy
+                    // reorder before the close no longer mis-attributes the
+                    // record.
+                    policy_id,
                     delta.metadata.owner_rg_id as i16,
                     // #2508: per-policy RT_FLOW SYSLOG gate byte. The frame is
                     // sent unconditionally (the Go NetFlow/IPFIX exporter

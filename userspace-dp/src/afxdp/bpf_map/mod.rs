@@ -353,10 +353,22 @@ pub(super) fn delete_bpf_conntrack_entry(
 /// diagnostic accuracy.
 ///
 /// Called from the worker loop piggy-backing on the session GC interval (~1s).
+///
+/// #3395: `policy` is the CURRENT snapshot's `PolicyState`. For every refreshed
+/// forward entry the live-row `policy_id` is RE-RESOLVED from the session's
+/// bound rule handle (`SessionMetadata::policy_counter`, #3322) against the
+/// current rule table, so `show security flow session` (and the REST/gRPC
+/// surfaces that read `val.PolicyID`) attribute an established session to its
+/// admitting rule's CURRENT positional id after a live mid-list policy
+/// insert/delete — instead of the frozen-at-install stale index. A session whose
+/// admitting rule was deleted re-resolves to the unattributed default-policy
+/// sentinel; an unbound (non-policy / peer-synced) session keeps its frozen id.
+/// See `PolicyState::reresolve_session_policy_id`.
 pub(super) fn refresh_bpf_conntrack_last_seen(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
     sessions: &crate::session::SessionTable,
+    policy: &crate::policy::PolicyState,
     now_ns: u64,
 ) {
     let now_secs = now_ns / 1_000_000_000;
@@ -370,6 +382,11 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
         if metadata.is_reverse {
             return;
         }
+        // #3395: re-resolve the live-row policy_id from the bound rule handle
+        // against the current rule table (frozen-at-install id would mis-map
+        // after a live policy reorder).
+        let reresolved_policy_id = policy
+            .reresolve_session_policy_id(metadata.policy_counter.as_ref(), metadata.policy_id);
         match (key.addr_family as i32, &key.src_ip, &key.dst_ip) {
             (libc::AF_INET, IpAddr::V4(src), IpAddr::V4(dst)) if conntrack_v4_fd >= 0 => {
                 let bpf_key = BpfSessionKeyV4 {
@@ -392,6 +409,10 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     // Compute last_seen from session's actual idle, not now.
                     let actual_last_seen = now_secs.saturating_sub(idle_ns / 1_000_000_000);
                     value.last_seen = actual_last_seen;
+                    // #3395: re-stamp the re-resolved current positional policy_id
+                    // so a live policy reorder no longer mis-attributes this
+                    // established session's row.
+                    value.policy_id = reresolved_policy_id;
                     // #2501: surface live per-session volume so `show security
                     // flow session` reports real byte/packet counts.
                     value.fwd_packets = counters.fwd_packets;
@@ -428,6 +449,9 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                 if rc == 0 {
                     let actual_last_seen = now_secs.saturating_sub(idle_ns / 1_000_000_000);
                     value.last_seen = actual_last_seen;
+                    // #3395: re-stamp the re-resolved current positional policy_id
+                    // (see v4 arm).
+                    value.policy_id = reresolved_policy_id;
                     // #2501: surface live per-session volume (see v4 arm).
                     value.fwd_packets = counters.fwd_packets;
                     value.fwd_bytes = counters.fwd_bytes;

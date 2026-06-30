@@ -576,14 +576,59 @@ The ID is consumed at three surfaces:
 (host-local, neighbor-seed, fabric-return, tunnel sync-import, flow-cache
 replay seed).
 
-**Scope — in-process, not on the cross-node sync wire.** `SessionMetadata`
-carries no serde, so `policy_id` rides the shared-session map and sibling-worker
-replicas automatically, but it does NOT cross the cross-node HA
-`SessionDeltaInfo` / `SessionSyncRequest` wire (unlike the #2785 log flags
-above). A peer-PROMOTED session therefore still resolves policy `0` on the new
-active node until a future change adds a `policy_id` wire field (mirroring how
-#2785 added the log-flag fields) — a deliberate follow-up, not a regression
-(the pre-#3056 behavior was policy 0 everywhere).
+#### Re-resolution at the local publish surfaces (#3395)
+
+`policy_id` is **positional**: the Go control plane computes it as
+`PolicySetID * MaxRulesPerPolicy + RuleIndex`, span-accumulated in config order
+(`walkPolicyRuleSlots`). It is pinned to the `show security policies` **Index**
+column by the #3063 cross-reference contract, so it MUST stay positional — it
+cannot be made content-stable without breaking #3063 and the `MaxRulesPerPolicy`
+span model. But a positional id frozen onto a session at install goes **stale**
+after a live mid-list policy insert/delete: every later rule renumbers, so the
+frozen id resolves to a *different* policy's name. This is the display/forensic
+sibling of the #3322 hit-counter mis-attribution, fixed by the same bound-handle
+pattern — re-resolve at READ time instead of making the scalar content-stable.
+
+The admitting rule's stable identity is recovered from the session's already-bound
+hit-counter handle (`SessionMetadata::policy_counter`, #3322): `PolicyRuleCounter`
+now stores its `rule_id` (set once in `PolicyCounterStore::rule_hit_counter`), so
+no new per-session field is needed. `PolicyState::reresolve_session_policy_id`
+maps that `rule_id` to its CURRENT positional id via an O(1) per-snapshot
+`rule_id → policy_id` map and is called at the two LOCAL publish surfaces where
+the value is otherwise frozen:
+
+1. **Live-session rows** — `refresh_bpf_conntrack_last_seen` (~1s GC cadence)
+   re-stamps the BPF conntrack value's `policy_id` from the bound handle against
+   the current `PolicyState`. (SESSION_CREATE is emitted at install, where the
+   positional id is already correct — no re-resolution needed.)
+2. **RT_FLOW SESSION_CLOSE** — `flush_session_deltas` re-resolves and passes the
+   id to `emit_session_close_rt_flow` (the close path already holds
+   `forwarding.policy`, so this needs no new plumbing). The frozen
+   `delta.metadata.policy_id` is NOT used for the close frame's [136:140] slot.
+
+**Deleted-rule fallback → unattributed sentinel.** If the admitting rule was
+DELETED (its `rule_id` is absent from the current snapshot), re-resolution
+returns `DEFAULT_POLICY_SENTINEL_ID` (rendered `default-policy` by the Go
+log/display planes), NOT the frozen positional id. Resolving to the frozen id
+would be unsafe: a later reorder can shift a *different* extant rule into that
+freed index, so the session would log under the wrong policy name. An honest "no
+longer attributable to an extant rule" beats a confidently-wrong name. An
+**unbound** session (idx-0 non-policy: host-local / seed / fabric / tunnel; or a
+peer-synced session carrying only the wire scalar) has no local stable identity
+and keeps its frozen id — preserving the "no policy" rendering for id 0.
+
+**Scope — re-resolution is LOCAL only; the HA peer is the deferred P2.**
+`SessionMetadata` carries no serde, so `policy_id` and the bound `policy_counter`
+handle ride the shared-session map and sibling-worker replicas automatically.
+#3301 carries the (positional) `policy_id` scalar on the cross-node HA
+`SessionDeltaInfo` / `SessionSyncRequest` wire, so a peer-PROMOTED session
+resolves the admitting policy after failover. But the **peer holds no local bound
+handle** (the binding is local derived state, not serialized), so a reorder AFTER
+a session was synced still shows a stale id ON THE PEER until the session ages
+out. Fixing that needs a rule-id-on-wire identity change (three two-sided wire
+growths + a version bump) — explicitly DEFERRED as #3395's P2 (the "future work"
+#3322 named), disproportionate churn for a Medium forensic edge whose severe
+sibling (#3322) is already fixed.
 
 ### Class-of-service + interface attribution on the close frame (#2749)
 
