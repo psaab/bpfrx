@@ -1,6 +1,9 @@
 # #3226 — `system-services all` / `any-service` host-inbound admission posture
 
-**Status:** DRAFT v2 — Claude-SMR r1 folded (H1-H4); pending Codex + AGY
+**Status:** PLAN-DEFER-operator — CONVERGED v3. Claude-SMR + AGY + Codex all
+PLAN-DEFER-operator. (Note: reviewer-cited line numbers vary ±5 from this doc
+— e.g. Codex reads the Rust short-circuit at forwarding.rs:279 and the alias at
+host_inbound.rs:86; both are the same unambiguous code, within range.)
 **Issue:** #3226 (labels: audit, enhancement). Provenance: codex-review-071 finding 071-04.
 **Branch:** `research/3226-system-services`
 **Verified against:** `origin/master` @ `b3b8b6029` (newer than the e7496acd0 / e8d4cbd9f the prior triage comments referenced — see §4, the #3277 lifeline fix has landed since).
@@ -42,13 +45,20 @@ and unlisted TCP/UDP ports to the firewall's own interface IPs in that zone. It
 brings xpf's `all` token to Junos-strict semantics.
 
 **At absolute scale, the value is bounded by how `all` is actually used:**
-- All FOUR canonical cluster configs (`ha-cluster.conf`,
+- The canonical cluster configs (`ha-cluster.conf`,
   `ha-cluster-userspace.conf`, `ha-cluster-loss.conf`, `xpf-cluster-fw0.conf`)
   use `system-services { all }` **only on the `control` zone**, whose interfaces
   are **all lifeline interfaces** (em0/fab0/fab1, or fxp1/fab0/fab1) → those
   zones resolve to an **empty address set** → **no deny rule is ever emitted**
   for them regardless of scoping (§4). So scoping `all` is a **no-op on every
   shipped config** (independently confirmed by the AGY review across all four).
+- **Corroboration (Codex r1):** `test/incus/xpf-cluster-fw1.conf:89-91`
+  (the node-1 counterpart) already uses `system-services { ping }` — NOT `all`
+  — on its control zone, and HA works. That is direct proof that the **lifeline
+  exclusion, not the `all` token, is the control-plane protection**: a control
+  zone with a *scoped* host-inbound set still functions because its lifeline
+  interfaces contribute no address to the deny path. Scoping `all` everywhere
+  would land in exactly that already-proven-safe state.
 - The real exposure exists only for an operator who put `system-services all` on
   a **data** zone with live firewall-local addresses. That is a config we do not
   ship and (per Junos hygiene) should not be common, but it is the case the
