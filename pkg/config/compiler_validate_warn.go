@@ -845,7 +845,56 @@ func ValidateConfig(cfg *Config) []string {
 	// operator knows the logging signal is not produced.
 	warnings = append(warnings, validatePreIDDefaultPolicyLogWarnings(cfg)...)
 
+	// #3534: `security policies default-policy-log session-init/session-close`
+	// emits RT_FLOW session logs for the implicit default-policy verdict, but
+	// only a default-PERMIT verdict installs a session for those records to fire
+	// on. A default-DENY/REJECT verdict installs no session and is already logged
+	// unconditionally via the policy-deny RT_FLOW record, so the session-init/
+	// session-close flags are inert there. WARN-only (the stanza is valid and
+	// must not brick a previously-committed config).
+	warnings = append(warnings, validateDefaultPolicyLogWarnings(cfg)...)
+
 	return warnings
+}
+
+// validateDefaultPolicyLogWarnings emits a WARN-only commit-time message when
+// `security policies default-policy-log session-init/session-close` is
+// configured together with a default-DENY or default-REJECT verdict (#3534).
+// The session-init/session-close RT_FLOW records fire only for a default-PERMIT
+// verdict (which installs a session); a deny/reject verdict installs no session
+// and is already logged via the policy-deny RT_FLOW record, so the flags are
+// accepted-but-inert. It is never an error: the stanza is valid and a hard
+// reject would brick a boot on a previously-committed value.
+func validateDefaultPolicyLogWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	if !cfg.Security.DefaultPolicyLogSessionInit && !cfg.Security.DefaultPolicyLogSessionClose {
+		return nil
+	}
+	// Meaningful for permit-all (a session is installed). deny-all/reject-all
+	// install no session, so the session-init/close records never fire.
+	if cfg.Security.DefaultPolicy == PolicyPermit {
+		return nil
+	}
+	var modes []string
+	if cfg.Security.DefaultPolicyLogSessionInit {
+		modes = append(modes, "session-init")
+	}
+	if cfg.Security.DefaultPolicyLogSessionClose {
+		modes = append(modes, "session-close")
+	}
+	action := "deny-all"
+	if cfg.Security.DefaultPolicy == PolicyReject {
+		action = "reject-all"
+	}
+	return []string{fmt.Sprintf(
+		"security policies default-policy-log `%s` is inert under default-policy "+
+			"%s: a deny/reject verdict installs no session, so no RT_FLOW "+
+			"session-init/session-close record is produced (the default verdict "+
+			"is already logged via the policy-deny RT_FLOW record). These flags "+
+			"take effect only with `default-policy permit-all`",
+		strings.Join(modes, "/"), action)}
 }
 
 // validatePreIDDefaultPolicyLogWarnings emits a WARN-only commit-time message

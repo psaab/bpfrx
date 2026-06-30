@@ -62,6 +62,19 @@ type SecurityConfig struct {
 	SSHKnownHosts      map[string][]SSHKnownHostKey // host -> keys
 	PolicyStatsEnabled bool                         // policy-stats system-wide enable
 	PreIDDefaultPolicy *PreIDDefaultPolicy          // pre-id-default-policy
+	// DefaultPolicyLogSessionInit / DefaultPolicyLogSessionClose carry
+	// `security policies default-policy-log session-init|session-close`
+	// (#3534, split from #3363 Part 2). They request RT_FLOW session logging
+	// for flows that hit the IMPLICIT default-policy verdict (no matching
+	// zone-pair/global/wildcard rule), mirroring a named policy's `then log`
+	// selection. Wired to the dataplane via ConfigSnapshot.DefaultLogSessionInit
+	// /Close → the Rust default-verdict result. The session-init/session-close
+	// records only fire for a default-PERMIT verdict (which installs a session);
+	// a default-DENY/REJECT verdict installs no session and is already logged
+	// unconditionally via the policy-deny RT_FLOW record, so the flags are inert
+	// there (commit emits a WARNING — validateDefaultPolicyLogWarnings).
+	DefaultPolicyLogSessionInit  bool
+	DefaultPolicyLogSessionClose bool
 }
 
 // FlowConfig holds flow/session timeout configuration.

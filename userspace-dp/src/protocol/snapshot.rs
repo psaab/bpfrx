@@ -261,6 +261,17 @@ pub(crate) struct ConfigSnapshot {
     pub flow: FlowSnapshot,
     #[serde(rename = "default_policy", default)]
     pub default_policy: String,
+    /// #3534: RT_FLOW session logging for the IMPLICIT default-policy verdict
+    /// (`security policies default-policy-log session-init|session-close`).
+    /// Stamped onto a default-PERMIT session's metadata so it emits
+    /// RT_FLOW_SESSION_CREATE/CLOSE like a named policy's `then log`; inert for
+    /// a default-DENY/REJECT verdict (no session installed — already logged via
+    /// the policy-deny record). Additive `#[serde(default)]`: a missing field
+    /// (old Go binary) decodes to false.
+    #[serde(rename = "default_log_session_init", default)]
+    pub default_log_session_init: bool,
+    #[serde(rename = "default_log_session_close", default)]
+    pub default_log_session_close: bool,
     #[serde(default)]
     pub policies: Vec<PolicyRuleSnapshot>,
     /// #1606: address-book table (content-hashed deduplication).

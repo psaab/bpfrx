@@ -534,6 +534,23 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 			}
 			continue
 		}
+		// #3534 (split from #3363 Part 2): `default-policy-log
+		// session-init|session-close` requests RT_FLOW session logging for the
+		// implicit default-policy verdict. Mirrors the per-policy `then log`
+		// selection (#2508) — the flags are stamped onto the Rust default-verdict
+		// result and, for a default-PERMIT verdict, onto the installed session so
+		// it emits RT_FLOW_SESSION_CREATE/CLOSE like a named policy. The flag
+		// lives in a sibling container because the `default-policy` enum leaf
+		// cannot carry `then` children (schema.go typed-leaf invariant).
+		if child.Name() == "default-policy-log" {
+			if child.FindChild("session-init") != nil {
+				sec.DefaultPolicyLogSessionInit = true
+			}
+			if child.FindChild("session-close") != nil {
+				sec.DefaultPolicyLogSessionClose = true
+			}
+			continue
+		}
 		// "global { policy ... }" - global policies applied to all zone pairs
 		if child.Name() == "global" {
 			for _, polInst := range namedInstances(child.FindChildren("policy")) {

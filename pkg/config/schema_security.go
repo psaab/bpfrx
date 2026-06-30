@@ -152,6 +152,17 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			validator:     ValidateEnum([]string{"permit-all", "deny-all", "reject-all"}),
 			children:      nil,
 		},
+		// #3534 (split from #3363 Part 2): RT_FLOW session logging for the
+		// IMPLICIT default-policy verdict. The `default-policy` leaf above is a
+		// typed ValueEnumOf leaf that — per the schema.go typed-leaf invariant —
+		// MUST NOT carry structural `then { ... }` children, so the log knob
+		// lives in this sibling container (mirroring pre-id-default-policy's
+		// session-init/session-close model). `session-init`/`session-close` are
+		// presence-only flags wired to ConfigSnapshot.DefaultLogSessionInit/Close.
+		"default-policy-log": {desc: "RT_FLOW session logging for the implicit default-policy verdict", children: map[string]*schemaNode{
+			"session-init":  {desc: "Emit an RT_FLOW session-init log on the default-policy verdict (default permit-all only)", children: nil},
+			"session-close": {desc: "Emit an RT_FLOW session-close log on the default-policy verdict (default permit-all only)", children: nil},
+		}},
 		"from-zone": {desc: "From zone", args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
 				"description": {desc: "Policy description", args: 1, scalar: true, placeholder: "<text>", children: nil},

@@ -206,6 +206,59 @@ fn evaluate_policy_result_unlogged_policy_reports_no_log_flags() {
     assert!(!matched.log_session_close);
 }
 
+// #3534 fail-on-revert: the IMPLICIT default-policy verdict must carry the
+// operator's `security policies default-policy-log session-init/session-close`
+// selection so a default-PERMIT session emits RT_FLOW_SESSION_CREATE/CLOSE like
+// a named policy's `then log`. PolicyState.default_log_session_* is set from the
+// snapshot at build time (build_forwarding_state_*); here we set it directly on
+// a parsed state. Reverting policy.rs to hardcode `log_session_init: false` on
+// the default verdict makes the "selected" assertions RED.
+#[test]
+fn default_verdict_carries_default_policy_log_flags() {
+    // permit default so the no-match flow rides a default-PERMIT verdict.
+    let mut state = parse_policy_state("permit", &[], &test_zone_name_to_id());
+    state.default_log_session_init = true;
+    state.default_log_session_close = true;
+
+    let default_hit = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        443,
+        64,
+    );
+    assert_eq!(default_hit.action, PolicyAction::Permit);
+    assert!(
+        default_hit.log_session_init,
+        "default verdict must carry default-policy-log session-init"
+    );
+    assert!(
+        default_hit.log_session_close,
+        "default verdict must carry default-policy-log session-close"
+    );
+
+    // Gating: a default state WITHOUT the selection reports both flags false
+    // (the historical behaviour — proves the flags are not spuriously set).
+    let quiet = parse_policy_state("permit", &[], &test_zone_name_to_id());
+    let quiet_hit = evaluate_policy_result_with_len(
+        &quiet,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        443,
+        64,
+    );
+    assert!(!quiet_hit.log_session_init);
+    assert!(!quiet_hit.log_session_close);
+}
+
 #[test]
 fn default_deny_applies_without_match() {
     let state = parse_policy_state("deny", &[], &test_zone_name_to_id());
