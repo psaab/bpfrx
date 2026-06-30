@@ -74,6 +74,18 @@ func policyRuleIDForCounter(cfg *config.Config, policyID uint32) string {
 	var currentSet uint32
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil {
+			// #3474: a nil zone-pair slot still consumes a policy-set ID. The
+			// SSOT walker (walkPolicyRuleSlots) and EVERY production counter
+			// caller (pkg/api/security.go, pkg/api/metrics_counters.go) do
+			// `policySetID++` for a nil element of cfg.Security.Policies, so the
+			// resolver MUST advance currentSet in lockstep. Skipping without
+			// incrementing under-counts the set index by one per preceding nil
+			// slot — the resolver then never matches the real set, falls through
+			// to the global/empty branch, and drops (returns "") or mis-keys
+			// that policy's hit counter. Nil slots only arise on the
+			// tolerant/HA-sync config path; the strict compiler appends only
+			// non-nil zone-pair sets.
+			currentSet++
 			continue
 		}
 		if currentSet == policySetID {

@@ -966,13 +966,32 @@ drift) closed in `fix/2008-quickwins-batch1`:
   expanded policy's span) and was reverted; the resolver retains the
   slice-index decode with an expanded comment documenting the dual namespace.
 
+  **#3474 (READ side, nil-slot set-index drift — FIXED):** a SEPARATE,
+  genuine SSOT divergence from the #3143 misdiagnosis. `walkPolicyRuleSlots`
+  and every counter caller advance `policySetID` for a NIL element of
+  `cfg.Security.Policies` (`if zpp == nil { policySetID++; continue }`), but
+  `policyRuleIDForCounter` skipped a nil set WITHOUT incrementing its
+  `currentSet`. For `cfg.Security.Policies = [nil, {lan->wan,...}]` the callers
+  assign the real set `policySetID == 1` while the resolver's set index lagged
+  at 0, never matched `currentSet == 1`, fell through to the global/empty
+  branch, and returned `""` — dropping that policy's hit counter from `show
+  security policies hit-count`, the REST `/policies` inventory, the gRPC text
+  hit-count, and the `xpf_policy_hits_total` Prometheus metric. Nil slots only
+  arise on the tolerant/HA-sync config path (the strict compiler appends only
+  non-nil zone-pair sets), so this never bit a normally-compiled config — but
+  it was a real resolver/walker/caller drift. The fix adds `currentSet++` to
+  the resolver's nil branch so all three agree.
+
   Regression tests in
   `pkg/dataplane/userspace/policy_namespace_3143_3145_test.go`: the 255/256/257
   -term cap boundary plus a literal spill-collision (#3145, fail-on-revert on
   the cap), and an end-to-end counter test combining app-set expansion with a
   per-policy counter assertion through the slice-index caller handle (the
   coverage the suite lacked — fail-on-revert against a span-accumulated
-  resolver).
+  resolver). `TestPolicyCounterResolverCountsNilPolicySetsLikeWalkPolicyRuleSlots`
+  adds the #3474 nil-leading-slot fixture: it pins the resolver/walker/caller
+  agreement on set numbering (fail-on-revert when the nil branch skips without
+  `currentSet++`) with a no-nil control proving no regression.
 - **Per-policy hit-count is PER-PACKET — FIXED (#3073).** Before #3073 the
   per-rule packet/byte counter was incremented exactly once per flow — on the
   cold (session-miss) path inside `policy.rs` `try_match_rule`. The established
