@@ -562,13 +562,21 @@ type ZonePairSessionSummary struct {
 // identity (#3423 M5). This summary class previously returned a bare array, so
 // — unlike its /sessions/summary sibling — it carried no node_id and could not
 // tell an operator WHICH node the counts came from. node_id is now always
-// present. include_peer cross-node fan-out is NOT yet supported here: there is
-// no gRPC zone-pair-summary RPC to forward to, so it is tracked as a follow-up
-// (#3592; see the sessionZonePairHandler comment + pkg/api/README.md) rather
-// than fudged client-side.
+// present.
+//
+// include_peer cross-node fan-out now matches the /sessions/summary sibling
+// (#3592): when an operator sets include_peer=true the handler forwards to the
+// new gRPC GetZonePairSummary RPC and attaches the cluster peer's OWN zone-pair
+// breakdown under Peer. node_id identity is always present; Peer is omitted on
+// a standalone node or an unreachable peer.
 type ZonePairSummaryResponse struct {
 	NodeID    int                      `json:"node_id"`
 	ZonePairs []ZonePairSessionSummary `json:"zone_pairs"`
+	// Peer carries the cluster peer's zone-pair breakdown when the request set
+	// include_peer=true and an HA-aware session service is wired; nil otherwise
+	// (standalone build, unreachable peer, or include_peer absent). Mirrors
+	// SessionSummary.Peer (#3592).
+	Peer *ZonePairSummaryResponse `json:"peer,omitempty"`
 }
 
 // BufferInfo holds dataplane buffer utilization information.

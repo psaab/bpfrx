@@ -57,6 +57,10 @@ type ClusterSessionService interface {
 	// GetSessionSummary returns the HA-aware summary; with IncludePeer set it
 	// stamps the peer node's summary onto the response's Peer field.
 	GetSessionSummary(context.Context, *pb.GetSessionSummaryRequest) (*pb.GetSessionSummaryResponse, error)
+	// GetZonePairSummary returns the HA-aware zone-pair breakdown; with
+	// IncludePeer set it stamps the peer node's breakdown onto the response's
+	// Peer field (#3592).
+	GetZonePairSummary(context.Context, *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error)
 }
 
 // CompileHealthSnapshot mirrors daemon.CompileHealth without the import.
