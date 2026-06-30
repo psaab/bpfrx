@@ -375,13 +375,25 @@ under the daemon's errgroup. Nothing else imports this package.
   standalone node or unreachable peer leaves `peer` absent. Pinned by
   `sessions_ha_scope_3423_test.go`.
 - The zone-pair summary (`GET /api/v1/security/sessions/summary/zone-pairs`,
-  `sessionZonePairHandler`) is the same SUMMARY class and now also carries
-  `node_id` — the response shape changed from a bare array to
-  `ZonePairSummaryResponse {node_id, zone_pairs:[...]}` so it can. It does NOT
-  yet support `include_peer`: there is no gRPC zone-pair-summary RPC to forward
-  to (the breakdown is computed REST-locally), so cross-node fan-out needs a new
-  RPC — tracked in #3592, not approximated client-side. Pinned by
-  `sessions_ha_scope_3423_test.go`.
+  `sessionZonePairHandler`) is the same SUMMARY class and carries `node_id` —
+  the response shape changed from a bare array to
+  `ZonePairSummaryResponse {node_id, zone_pairs:[...]}` so it can (#3423 M5). It
+  now also supports `include_peer=true` cross-node fan-out (#3592), matching its
+  `/sessions/summary` sibling. A malformed `include_peer` value fails CLOSED with
+  HTTP 400 before any work. When set, the handler forwards to the new gRPC
+  `GetZonePairSummary` RPC through the `ClusterSessionFn`/`ClusterSessionService`
+  seam (`IncludePeer` set) and attaches the cluster peer's OWN zone-pair
+  breakdown under a nested `peer` field (`ZonePairSummaryResponse.Peer`, carrying
+  the peer's own `node_id`). Unlike the session LIST there is no first-page gate
+  — the breakdown is a summary, not a paginated list, so the whole peer breakdown
+  attaches whenever `include_peer` is set (just as `/sessions/summary` attaches
+  the whole peer summary). The gRPC RPC computes the peer's breakdown locally and
+  uses the `x-peer-forwarded` metadata recursion guard so A→B never recurses back
+  into A; a standalone node, an unreachable peer, or a failed peer RPC leaves
+  `peer` absent (a read summary degrades gracefully). Pinned by
+  `sessions_ha_scope_3423_test.go` (node_id), `sessions_zonepair_peer_3592_test.go`
+  (REST fan-out + fail-closed), and `zonepair_summary_3592_test.go` (gRPC RPC +
+  recursion guard).
 - Session list pagination and the remaining filter dimensions reach gRPC
   parity in #3421, folded into the SAME `sessionQuery` + `sessionView` +
   enriched `sessionEntryV4/V6` machinery above (one filter type, not two).
