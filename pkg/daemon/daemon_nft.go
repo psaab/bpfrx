@@ -52,6 +52,40 @@ var nftDeleteTable = func(family, name string) ([]byte, error) {
 	return nftApplyPayload(payload)
 }
 
+// Base-chain hook-input priorities for the two daemon-generated local-delivery
+// nftables tables (#3364). Both register `type filter hook input`, but at
+// DISTINCT priorities so their inter-chain evaluation order is a deterministic
+// product invariant rather than implementation-defined. With two base chains at
+// an IDENTICAL hook/priority, netfilter's order between them is unspecified, so
+// which chain's reject/log/counter fires for a packet both would act on could
+// vary silently across nft/kernel versions (a `drop` stays terminal regardless,
+// so this was never a permit bypass — only an observability/determinism gap).
+//
+// Ordering: xpf_lo0 evaluates BEFORE xpf_hostinbound (lo0 has the strictly lower
+// priority number). The lo0.0 input filter is the operator's explicit, named,
+// RE-wide control-plane firewall — the authoritative statement of what is
+// permitted to the box, written with explicit accept/reject/discard verdicts.
+// The zone host-inbound-traffic admission is the coarser Junos default-deny
+// backstop. Running the explicit lo0 filter first lets its operator-authored
+// verdicts (and their reject messages / per-term effects) take observable
+// precedence, with host-inbound governing whatever lo0 did not already
+// terminate — the Junos lo0-filter-then-zone ordering. nftApplyPriorityInvariant
+// (nft_chain_priority_test.go) pins nftLo0FilterPriority < nftHostInboundPriority
+// so the spread cannot silently regress back to a shared priority.
+const (
+	// nftLo0FilterPriority is the `hook input` priority of the xpf_lo0 loopback
+	// input-filter base chain. 0 is the conventional `filter` priority (the lo0
+	// chain IS the operator's firewall filter); it is STRICTLY LESS THAN
+	// nftHostInboundPriority so lo0 evaluates first.
+	nftLo0FilterPriority = 0
+	// nftHostInboundPriority is the `hook input` priority of the xpf_hostinbound
+	// base chain. It is STRICTLY GREATER THAN nftLo0FilterPriority so the zone
+	// host-inbound default-deny backstop runs AFTER the lo0 input filter, and is
+	// kept well below the conventional `security` (50) / `srcnat` (100)
+	// priorities so it stays within the input-filter band.
+	nftHostInboundPriority = 10
+)
+
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
 // Implements "interfaces lo0 unit 0 family inet filter input <name>" by
 // generating nftables rules from the named firewall filter.
@@ -100,43 +134,77 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 // nft or the daemon apply path. Callers pass the already-resolved v4/v6 filter
 // names so the payload reflects exactly what applyLo0Filter would send.
 //
-// The leading three lines are the atomic flush idiom: create the table if it
-// does not yet exist (`table inet xpf_lo0` with no body — idempotent), flush
-// its contents, then redefine it. nft parses an `-f -` payload atomically, so
-// a syntax error on any line rejects the ENTIRE payload. The pre-#2069
-// `flush ruleset inet xpf_lo0` was NOT valid nft — `flush ruleset` takes at
-// most an OPTIONAL family (`flush ruleset [<family>]`), never a table name, so
-// the trailing table token was a parse error that rejected the whole ruleset
-// (incl. the real filter rules) and made the lo0 filter fail OPEN.
+// The leading two lines are the atomic delete+recreate idiom shared with the
+// host-inbound table: `add table` makes the table exist (idempotent), so the
+// following `delete table` always has a target whether or not it pre-existed,
+// removing the old chain AND its named counter OBJECTS; then a fresh
+// `table { ... }` body redeclares everything. This REPLACES the pre-#3445
+// create/`flush table`/redefine idiom because `flush table` empties rules but
+// does NOT delete named counter objects (#3445 attaches a named counter per
+// `then count`), so redeclaring them on the next commit would collide
+// ("File exists"); delete+recreate guarantees each counter is declared exactly
+// once and leaves no stale counter for a removed term. A consequence is that the
+// lo0 counters reset to zero on every rebuild (every commit / DHCP re-render) —
+// nothing scrapes them so there is no metric impact. nft parses an `-f -`
+// payload atomically, so a syntax error on any line rejects the ENTIRE payload.
+// (The pre-#2069 `flush ruleset inet xpf_lo0` was NOT valid nft and made the
+// filter fail OPEN; the delete+recreate idiom is unconditionally valid.)
 func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string {
-	var rules []string
-	rules = append(rules, "table inet xpf_lo0")
-	rules = append(rules, "flush table inet xpf_lo0")
-	rules = append(rules, "table inet xpf_lo0 {")
-	rules = append(rules, "  chain input {")
-	rules = append(rules, "    type filter hook input priority 0; policy accept;")
-
 	prefixLists := cfg.PolicyOptions.PrefixLists
-	if filterV4 != "" {
-		if f, ok := cfg.Firewall.FiltersInet[filterV4]; ok {
-			for _, term := range f.Terms {
-				r := nftRuleFromTerm(term, "ip", prefixLists)
+
+	// Render the per-term rules first so the pre-pass can collect the named
+	// counter objects every `then count` rule references. nft requires each
+	// counter to be DECLARED in the table body before the chain references it, so
+	// the declarations are emitted ahead of the chain (mirroring the host-inbound
+	// table's pre-pass). Dedup on the object name so a counter shared by several
+	// terms (or by both the v4 and v6 lo0 filters, which land in the same inet
+	// table) is declared exactly once.
+	var ruleLines []string
+	var counters []string
+	seenCounter := map[string]bool{}
+	emit := func(f *config.FirewallFilter, family string) {
+		for _, term := range f.Terms {
+			for _, r := range nftRulesFromTerm(term, family, prefixLists) {
 				if r != "" {
-					rules = append(rules, "    "+r)
+					ruleLines = append(ruleLines, "    "+r)
 				}
 			}
+			if term != nil && term.Count != "" {
+				cn := xnft.Lo0CounterName(term.Count)
+				if !seenCounter[cn] {
+					seenCounter[cn] = true
+					counters = append(counters, cn)
+				}
+			}
+		}
+	}
+	if filterV4 != "" {
+		if f, ok := cfg.Firewall.FiltersInet[filterV4]; ok {
+			emit(f, "ip")
 		}
 	}
 	if filterV6 != "" {
 		if f, ok := cfg.Firewall.FiltersInet6[filterV6]; ok {
-			for _, term := range f.Terms {
-				r := nftRuleFromTerm(term, "ip6", prefixLists)
-				if r != "" {
-					rules = append(rules, "    "+r)
-				}
-			}
+			emit(f, "ip6")
 		}
 	}
+
+	var rules []string
+	rules = append(rules, "add table inet xpf_lo0")
+	rules = append(rules, "delete table inet xpf_lo0")
+	rules = append(rules, "table inet xpf_lo0 {")
+	for _, cn := range counters {
+		// The DECLARATION must be UNQUOTED (#3578): nft v1.1.6 rejects a quoted
+		// name in a counter declaration. Lo0CounterName returns a bare-safe nft
+		// identifier, so the unquoted declaration parses and matches the (quoted)
+		// reference object name byte-for-byte.
+		rules = append(rules, "  counter "+cn+" {")
+		rules = append(rules, "  }")
+	}
+	rules = append(rules, "  chain input {")
+	// #3364: explicit distinct priority so lo0 evaluates BEFORE xpf_hostinbound.
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftLo0FilterPriority))
+	rules = append(rules, ruleLines...)
 	rules = append(rules, "  }")
 	rules = append(rules, "}")
 
@@ -230,7 +298,9 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 // rebuild — every commit and every DHCP/DHCPv6 address change that re-renders
 // the table. Prometheus rate() handles the reset; documented on the metric.)
 //
-// Layout of `chain input` (type filter hook input priority 0; policy accept):
+// Layout of `chain input` (type filter hook input priority 10; policy accept —
+// distinct from the xpf_lo0 chain's priority 0 so this host-inbound backstop
+// evaluates AFTER the lo0 input filter, #3364):
 //  1. ct state established,related accept   — return/ongoing host traffic.
 //  2. meta l4proto { 50, 51 } accept — raw ESP/AH exemption for host-terminated
 //     IPsec (mirrors the userspace stage_ipsec_passthrough_check); the kernel
@@ -305,7 +375,8 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 		rules = append(rules, "  }")
 	}
 	rules = append(rules, "  chain input {")
-	rules = append(rules, "    type filter hook input priority 0; policy accept;")
+	// #3364: explicit distinct priority so host-inbound evaluates AFTER xpf_lo0.
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundPriority))
 	rules = append(rules, "    ct state established,related accept")
 	// Raw ESP (50) / AH (51) are exempt from host-inbound enforcement so the
 	// kernel XFRM stack can decrypt host-terminated IPsec — mirroring the
@@ -770,9 +841,24 @@ func nftAddrPredicate(field, family string, addrs []string, except, constrained 
 	return op + nftAddrSet(famAddrs), false
 }
 
-// nftRuleFromTerm converts a firewall filter term to an nftables rule string.
-// prefixLists is used to expand source-prefix-list and destination-prefix-list references.
-func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists map[string]*config.PrefixList) string {
+// nftRulesFromTerm converts a firewall filter term to the nftables rule lines
+// that mirror it onto the kernel lo0 input chain. It returns a slice because a
+// single term can lower to ZERO rules (a match-nothing or a pure fall-through
+// with no honored modifier), ONE rule (the common accept/discard/modifier-only
+// case), or TWO rules (a faithful `reject` — a TCP RST plus an ICMP/ICMPv6
+// admin-prohibited reply, #3445 H10). prefixLists expands source-prefix-list and
+// destination-prefix-list references.
+//
+// #3445 modifier policy: the `then` modifiers nft CAN honor on a `hook input`
+// chain are emitted (`then log`/`then syslog` -> nft `log`; `then count <name>`
+// -> a named nft `counter`). The modifiers nft CANNOT faithfully honor on the
+// host-inbound mirror (policer rate-limit, dscp-rewrite, forwarding-class,
+// loss-priority CoS marking) are NOT silently dropped here — a commit-time
+// WARNING names each such term+modifier (config.validateLo0FilterKernelMirror
+// Warnings for policer/dscp-rewrite/forwarding-class, and the pre-existing #2507
+// loss-priority warning), so the operator knows the kernel path will not enforce
+// them. See pkg/daemon/README.md "lo0 input filter".
+func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixLists map[string]*config.PrefixList) []string {
 	var parts []string
 
 	// Source / destination address + prefix-list lowering (#3433). Route both
@@ -792,7 +878,7 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		term.SourceAddresses, term.SourcePrefixLists, prefixLists, "", term.Name, "source")
 	srcPred, srcMatchesNothing := nftAddrPredicate("saddr", family, srcAddrs, srcExcept, srcConstrained)
 	if srcMatchesNothing {
-		return ""
+		return nil
 	}
 	if srcPred != "" {
 		parts = append(parts, srcPred)
@@ -802,7 +888,7 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		term.DestAddresses, term.DestPrefixLists, prefixLists, "", term.Name, "destination")
 	dstPred, dstMatchesNothing := nftAddrPredicate("daddr", family, dstAddrs, dstExcept, dstConstrained)
 	if dstMatchesNothing {
-		return ""
+		return nil
 	}
 	if dstPred != "" {
 		parts = append(parts, dstPred)
@@ -983,31 +1069,103 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 	// must emit a TERMINATING accept (not skip): skipping would let a later
 	// deny term match and OVER-DROP legitimate host traffic on the
 	// kernel-primary lo0 chain. Userspace remains authoritative for the actual
-	// route-selection. Falls through to the action switch below (empty action ->
-	// default accept).
+	// route-selection. Falls through to the verdict emission below (empty action
+	// -> default accept).
+
+	// #3445: build the NON-TERMINATING modifier statements the kernel lo0 mirror
+	// can honor natively. nft executes a rule's statements left-to-right and the
+	// verdict terminates, so these prepend the verdict: a term renders as
+	// `<matches> log prefix "..." counter name "<n>" <verdict>`.
+	//   - then log / then syslog (both set term.Log) -> nft `log` (to journald),
+	//     with a stable prefix carrying the term name for operator correlation.
+	//   - then count <name> -> a NAMED nft counter so the kernel per-term match
+	//     count is observable (`nft list table inet xpf_lo0`). The object is
+	//     declared in the table body by buildLo0FilterPayload (nft requires the
+	//     declaration before the chain references it); the reference is quoted.
+	// policer / dscp-rewrite / forwarding-class / loss-priority are deliberately
+	// NOT emitted (they cannot be faithfully expressed on a host-inbound chain);
+	// they are surfaced as commit-time warnings instead (see the doc comment).
+	var mods []string
+	if term.Log {
+		mods = append(mods, `log prefix "`+nftLo0LogPrefix(term.Name)+`"`)
+	}
+	if term.Count != "" {
+		mods = append(mods, `counter name "`+xnft.Lo0CounterName(term.Count)+`"`)
+	}
+	match := strings.Join(parts, " ")
+	modStr := strings.Join(mods, " ")
+
+	// Fall-through (#3427): a term with NO terminating action (explicit `then
+	// next term` or a modifier-only term) APPLIES its modifiers and continues to
+	// the next term. Emit the honored modifiers as a NON-TERMINATING rule (no
+	// verdict) so the per-term log/count fires while later discard/reject terms
+	// stay reachable — nft falls through any rule that carries no verdict. With
+	// no honored modifier the term contributes nothing: return no rule (the
+	// pre-#3445 behavior), which keeps the subsequent terms reachable.
 	if (term.NextTerm || term.Action == "") && term.RoutingInstance == "" {
-		return ""
+		if modStr == "" {
+			return nil
+		}
+		return []string{joinNftFields(match, modStr)}
 	}
 
-	// Action: discard → drop (silent), reject → reject (ICMP unreachable),
-	// accept → accept. An empty action with a routing-instance set reaches here
-	// and takes the default accept (terminate-as-accept, mirroring userspace).
+	// reject (#3445 H10): faithfully mirror the userspace reject-reply synthesis
+	// (userspace-dp poll_descriptor/reject_reply.rs) — a TCP RST for TCP and an
+	// ICMP/ICMPv6 "administratively prohibited" Destination Unreachable for every
+	// other protocol. nft cannot select the reply protocol within ONE rule, so
+	// emit two: a TCP-only `reject with tcp reset`, then a family-agnostic
+	// `reject with icmpx type admin-prohibited` (icmpx selects ICMP vs ICMPv6
+	// from the actual packet, so the SAME pair is correct in both the ip and ip6
+	// rendering passes and needs no L3 qualifier). The pre-fix bare `reject` sent
+	// ICMP port-unreachable for ALL protocols (including TCP) — a different wire
+	// response than userspace. The honored modifiers ride BOTH rules; the rules
+	// are mutually exclusive by l4proto, so each matched packet is logged/counted
+	// exactly once.
+	if term.Action == "reject" {
+		return []string{
+			joinNftFields(match, "meta l4proto 6", modStr, "reject with tcp reset"),
+			joinNftFields(match, modStr, "reject with icmpx type admin-prohibited"),
+		}
+	}
+
+	// Terminating verdict: discard -> drop (silent), accept -> accept, and the
+	// empty-action-with-routing-instance PBR term -> terminate-as-accept (#3427).
 	// Any other explicit action is unexpected for a committed config; keep the
 	// historical accept default rather than emit garbage.
 	action := "accept"
-	switch term.Action {
-	case "discard":
+	if term.Action == "discard" {
 		action = "drop"
-	case "reject":
-		action = "reject"
-	case "accept":
-		action = "accept"
 	}
+	return []string{joinNftFields(match, modStr, action)}
+}
 
-	if len(parts) == 0 {
-		return action
+// joinNftFields joins the space-separated fragments of one nft rule (match
+// predicates, non-terminating modifier statements, and the trailing verdict),
+// skipping the empty fragments so a term with no match / no modifier renders as
+// a clean `<verdict>` rather than carrying stray leading spaces.
+func joinNftFields(fields ...string) string {
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f != "" {
+			out = append(out, f)
+		}
 	}
-	return strings.Join(parts, " ") + " " + action
+	return strings.Join(out, " ")
+}
+
+// nftLo0LogPrefix builds the `log prefix` string for a mirrored `then log` /
+// `then syslog` modifier (#3445). It carries the term name so an operator can
+// correlate a kernel lo0-filter log line with the configured term, stripping the
+// quote / backslash bytes that would break the quoted nft string and bounding
+// the length to stay within nft's log-prefix limit.
+func nftLo0LogPrefix(term string) string {
+	const maxLen = 64
+	safe := strings.NewReplacer(`"`, "", `\`, "").Replace(term)
+	p := "xpf-lo0 " + safe + ": "
+	if len(p) > maxLen {
+		p = p[:maxLen]
+	}
+	return p
 }
 
 // nftTCPFlagOrder lists the TCP flag bits in canonical low-to-high bit order

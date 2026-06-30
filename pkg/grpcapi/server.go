@@ -134,6 +134,11 @@ type Server struct {
 	fabricPeerAddrFn      func() []string
 	fabricVRFDevice       string
 	peerSystemActionFn    func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
+	// peerZonePairSummaryFn is a test seam for the GetZonePairSummary peer
+	// fan-out leg (#3592). Production leaves it nil and proxyPeerZonePairSummary
+	// dials the real peer; a unit test wires it to observe the forwarded
+	// request (x-peer-forwarded metadata) without a live peer.
+	peerZonePairSummaryFn func(ctx context.Context, req *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error)
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {

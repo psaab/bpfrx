@@ -572,13 +572,23 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // sessionZonePairHandler serves the zone-pair session breakdown. Like the
-// /sessions/summary sibling it now stamps node_id so an operator knows which
-// node the counts came from (#3423 M5). It does NOT support include_peer:
-// unlike list/summary there is no gRPC zone-pair-summary RPC to forward to, so
-// cross-node fan-out would need a new RPC. Tracked as a follow-up (#3592,
-// referenced in pkg/api/README.md) rather than approximated client-side from a
-// peer session list.
-func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) {
+// /sessions/summary sibling it stamps node_id so an operator knows which node
+// the counts came from (#3423 M5) and now also supports include_peer cross-node
+// fan-out (#3592): when an operator sets include_peer=true the handler forwards
+// to the gRPC GetZonePairSummary RPC and attaches the cluster peer's OWN
+// breakdown under the nested `peer` field. This mirrors sessionSummaryHandler;
+// the breakdown is a SUMMARY (not a paginated list), so there is no first-page
+// gate — the whole peer breakdown attaches whenever include_peer is set, just
+// as /sessions/summary attaches the whole peer summary.
+func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) {
+	// include_peer opt-in HA flag; fail closed on a bad value (HTTP 400) before
+	// any work so a malformed opt-in is never silently ignored (#3592).
+	includePeer, ok := sessionIncludePeer(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid include_peer: "+r.URL.Query().Get("include_peer"))
+		return
+	}
+
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeOK(w, ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: []ZonePairSessionSummary{}})
 		return
@@ -655,7 +665,50 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) 
 		}
 		return result[i].ToZone < result[j].ToZone
 	})
-	writeOK(w, ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: result})
+
+	resp := ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: result}
+
+	// Augment with the cluster peer's zone-pair breakdown when the operator
+	// opted in and an HA-aware service is wired (#3592): the local breakdown
+	// alone understates total HA state. The gRPC RPC computes the peer's OWN
+	// breakdown (x-peer-forwarded recursion guard) and returns it under Peer; a
+	// standalone node / unreachable peer leaves Peer nil. This mirrors
+	// sessionSummaryHandler — the breakdown is not paginated, so there is no
+	// first-page gate.
+	if includePeer {
+		if svc := s.clusterSession(); svc != nil {
+			if pr, err := svc.GetZonePairSummary(r.Context(), &pb.GetZonePairSummaryRequest{IncludePeer: true}); err == nil {
+				if peer := pr.GetPeer(); peer != nil {
+					resp.Peer = zonePairSummaryFromPB(peer)
+				}
+			}
+		}
+	}
+
+	writeOK(w, resp)
+}
+
+// zonePairSummaryFromPB maps a protobuf zone-pair summary (the peer node's
+// view) onto the REST ZonePairSummaryResponse shape (#3592). The peer carries
+// its OWN node_id and zone-pair breakdown; its nested Peer is not recursed
+// (the gRPC peer leg never sets include_peer on the forwarded request).
+func zonePairSummaryFromPB(p *pb.GetZonePairSummaryResponse) *ZonePairSummaryResponse {
+	out := &ZonePairSummaryResponse{
+		NodeID:    int(p.GetNodeId()),
+		ZonePairs: make([]ZonePairSessionSummary, 0, len(p.GetZonePairs())),
+	}
+	for _, zp := range p.GetZonePairs() {
+		out.ZonePairs = append(out.ZonePairs, ZonePairSessionSummary{
+			FromZone: zp.GetFromZone(),
+			ToZone:   zp.GetToZone(),
+			TCP:      int(zp.GetTcp()),
+			UDP:      int(zp.GetUdp()),
+			ICMP:     int(zp.GetIcmp()),
+			Other:    int(zp.GetOther()),
+			Total:    int(zp.GetTotal()),
+		})
+	}
+	return out
 }
 
 // --- Session helper functions ---

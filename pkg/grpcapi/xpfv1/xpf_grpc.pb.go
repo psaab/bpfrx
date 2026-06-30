@@ -40,6 +40,7 @@ const (
 	BpfrxService_GetPolicies_FullMethodName               = "/xpf.v1.BpfrxService/GetPolicies"
 	BpfrxService_GetSessions_FullMethodName               = "/xpf.v1.BpfrxService/GetSessions"
 	BpfrxService_GetSessionSummary_FullMethodName         = "/xpf.v1.BpfrxService/GetSessionSummary"
+	BpfrxService_GetZonePairSummary_FullMethodName        = "/xpf.v1.BpfrxService/GetZonePairSummary"
 	BpfrxService_GetNATSource_FullMethodName              = "/xpf.v1.BpfrxService/GetNATSource"
 	BpfrxService_GetNATDestination_FullMethodName         = "/xpf.v1.BpfrxService/GetNATDestination"
 	BpfrxService_GetScreen_FullMethodName                 = "/xpf.v1.BpfrxService/GetScreen"
@@ -100,6 +101,7 @@ type BpfrxServiceClient interface {
 	GetPolicies(ctx context.Context, in *GetPoliciesRequest, opts ...grpc.CallOption) (*GetPoliciesResponse, error)
 	GetSessions(ctx context.Context, in *GetSessionsRequest, opts ...grpc.CallOption) (*GetSessionsResponse, error)
 	GetSessionSummary(ctx context.Context, in *GetSessionSummaryRequest, opts ...grpc.CallOption) (*GetSessionSummaryResponse, error)
+	GetZonePairSummary(ctx context.Context, in *GetZonePairSummaryRequest, opts ...grpc.CallOption) (*GetZonePairSummaryResponse, error)
 	GetNATSource(ctx context.Context, in *GetNATSourceRequest, opts ...grpc.CallOption) (*GetNATSourceResponse, error)
 	GetNATDestination(ctx context.Context, in *GetNATDestinationRequest, opts ...grpc.CallOption) (*GetNATDestinationResponse, error)
 	GetScreen(ctx context.Context, in *GetScreenRequest, opts ...grpc.CallOption) (*GetScreenResponse, error)
@@ -350,6 +352,16 @@ func (c *bpfrxServiceClient) GetSessionSummary(ctx context.Context, in *GetSessi
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSessionSummaryResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetSessionSummary_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *bpfrxServiceClient) GetZonePairSummary(ctx context.Context, in *GetZonePairSummaryRequest, opts ...grpc.CallOption) (*GetZonePairSummaryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetZonePairSummaryResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_GetZonePairSummary_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -711,6 +723,7 @@ type BpfrxServiceServer interface {
 	GetPolicies(context.Context, *GetPoliciesRequest) (*GetPoliciesResponse, error)
 	GetSessions(context.Context, *GetSessionsRequest) (*GetSessionsResponse, error)
 	GetSessionSummary(context.Context, *GetSessionSummaryRequest) (*GetSessionSummaryResponse, error)
+	GetZonePairSummary(context.Context, *GetZonePairSummaryRequest) (*GetZonePairSummaryResponse, error)
 	GetNATSource(context.Context, *GetNATSourceRequest) (*GetNATSourceResponse, error)
 	GetNATDestination(context.Context, *GetNATDestinationRequest) (*GetNATDestinationResponse, error)
 	GetScreen(context.Context, *GetScreenRequest) (*GetScreenResponse, error)
@@ -819,6 +832,9 @@ func (UnimplementedBpfrxServiceServer) GetSessions(context.Context, *GetSessions
 }
 func (UnimplementedBpfrxServiceServer) GetSessionSummary(context.Context, *GetSessionSummaryRequest) (*GetSessionSummaryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSessionSummary not implemented")
+}
+func (UnimplementedBpfrxServiceServer) GetZonePairSummary(context.Context, *GetZonePairSummaryRequest) (*GetZonePairSummaryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetZonePairSummary not implemented")
 }
 func (UnimplementedBpfrxServiceServer) GetNATSource(context.Context, *GetNATSourceRequest) (*GetNATSourceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNATSource not implemented")
@@ -1302,6 +1318,24 @@ func _BpfrxService_GetSessionSummary_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(BpfrxServiceServer).GetSessionSummary(ctx, req.(*GetSessionSummaryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BpfrxService_GetZonePairSummary_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetZonePairSummaryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).GetZonePairSummary(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_GetZonePairSummary_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).GetZonePairSummary(ctx, req.(*GetZonePairSummaryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1890,6 +1924,10 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSessionSummary",
 			Handler:    _BpfrxService_GetSessionSummary_Handler,
+		},
+		{
+			MethodName: "GetZonePairSummary",
+			Handler:    _BpfrxService_GetZonePairSummary_Handler,
 		},
 		{
 			MethodName: "GetNATSource",
