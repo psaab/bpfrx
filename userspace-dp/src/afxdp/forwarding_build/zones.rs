@@ -1,8 +1,10 @@
 //! Zone-table population for `build_forwarding_state`.
 //!
 //! Populates `state.zone_name_to_id` and `state.zone_id_to_name`
-//! from `snapshot.zones`. Rejects reserved-range and >u8::MAX
-//! zone IDs per #919/#922 wire-format constraints.
+//! from `snapshot.zones`. Rejects reserved-range zone IDs
+//! (>= ZONE_ID_RESERVED_MIN). #3075 widened the event-stream zone
+//! field to u16, so ids up to ZONE_ID_RESERVED_MIN-1 are addressable
+//! (the former >u8::MAX skip is retired).
 
 use super::super::*;
 
@@ -33,19 +35,11 @@ pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingSt
             );
             continue;
         }
-        // #919/#922: defense-in-depth. The event-stream codec writes
-        // zone IDs as u8 (release builds elide the debug_assert). A
-        // hostile or future malformed snapshot with id > 255 would
-        // silently corrupt wire-level zone IDs without this gate.
-        if zone.id > u8::MAX as u16 {
-            eprintln!(
-                "xpf-userspace-dp: zone {:?} has id {} > wire u8 max {}; skipping",
-                zone.name,
-                zone.id,
-                u8::MAX
-            );
-            continue;
-        }
+        // #3075: the event-stream codec now writes zone IDs as u16, so the
+        // former >u8::MAX skip is retired — a stable name-hash zone id in
+        // [1, ZONE_ID_RESERVED_MIN-1] = [1, 65533] is fully addressable. The
+        // reserved-range reject above (>= ZONE_ID_RESERVED_MIN) remains the only
+        // out-of-range guard.
         // zone_name_to_id is populated above by the shared SSOT helper.
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
         // #3070: build the host-inbound admission set for zones that declared a

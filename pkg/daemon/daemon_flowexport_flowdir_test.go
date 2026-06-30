@@ -9,10 +9,11 @@ import (
 )
 
 // flowDirV9Config builds a NetFlow v9 sampling config with `export-extension
-// flow-dir` enabled and a per-zone sampling-direction (#3270): zone "b" (id 2)
-// has sampling input, zone "c" (id 3) has sampling output, zone "a" (id 1) has
-// none. buildZoneIDs sorts zone names → a=1, b=2, c=3. rate=1 so every close
-// is admitted.
+// flow-dir` enabled and a per-zone sampling-direction (#3270): zone "b" has
+// sampling input (via eth1.0), zone "c" has sampling output (via eth2.0), zone
+// "a" has none. The sampling direction is keyed by interface→zone membership,
+// not by the numeric zone id (#3075 made ids a stable name-hash). rate=1 so
+// every close is admitted.
 func flowDirV9Config(addr string, v9Port int) *config.Config {
 	cfg := &config.Config{}
 	cfg.ForwardingOptions.Sampling = &config.SamplingConfig{
@@ -148,14 +149,16 @@ func TestSessionCloseFlowDirectionEgress(t *testing.T) {
 		t.Fatal("v9 exporter must be live")
 	}
 
-	// Ingress zone a (id 1, no sampling), egress zone c (id 3, sampling
-	// output) -> eligible by output, direction = 1 (egress).
+	// Ingress zone a (no sampling), egress zone c (sampling output) ->
+	// eligible by output, direction = 1 (egress). #3075: zone ids are a stable
+	// name-hash, so the SESSION_CLOSE payload must carry the hashed ids of a/c
+	// (the daemon resolves them back to names via the same StableZoneID map).
 	payload := buildSessionCloseRawEventV4(
 		6,
 		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
 		12345, 443,
 		[4]byte{172, 16, 80, 8}, 40000,
-		1, 3,
+		config.StableZoneID("a"), config.StableZoneID("c"),
 	)
 	if !d.eventReader.ProcessRawEvent(payload) {
 		t.Fatal("ProcessRawEvent rejected a valid SESSION_CLOSE payload")

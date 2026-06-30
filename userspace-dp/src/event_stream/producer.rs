@@ -378,7 +378,13 @@ fn kind_index(kind: DataplaneEventKind) -> usize {
 }
 
 fn rate_bucket_index(kind: DataplaneEventKind, ingress_zone_id: u16) -> usize {
-    let zone_bucket = usize::from(ingress_zone_id).min(DATAPLANE_EVENT_ZONE_BUCKETS - 1);
+    // #3075: FOLD the zone id into the bucket space (modulo) rather than
+    // CLAMP it. Stable name-hash zone ids span [1,65533]; a `min(255)`
+    // clamp collapsed ~99.6% of zones into the single last bucket, losing
+    // the per-zone isolation of this HA-delta flood limiter. `% 256`
+    // spreads distinct ids across all buckets (collisions are possible but
+    // graceful — two zones sharing a rate bucket, not all zones sharing one).
+    let zone_bucket = usize::from(ingress_zone_id) % DATAPLANE_EVENT_ZONE_BUCKETS;
     kind_index(kind) * DATAPLANE_EVENT_ZONE_BUCKETS + zone_bucket
 }
 

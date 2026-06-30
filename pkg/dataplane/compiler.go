@@ -150,6 +150,23 @@ func (r *CompileResult) cachedLinkByIndex(idx int) (netlink.Link, error) {
 	return link, nil
 }
 
+// assignZoneIDs populates result.ZoneIDs with a STABLE, name-derived id for
+// every configured security zone (#3075). The id is config.StableZoneID(name)
+// — a pure FNV-1a fold of the zone NAME into [1, ZoneIDReservedMin-1], never a
+// function of the zone set or compile order — so adding, renaming, or removing
+// a zone can never renumber another zone. This replaces the legacy sorted
+// 1..N positional assignment, whose ids shifted whenever an earlier-sorting
+// zone was added/removed and mis-mapped in-flight session/HA/status metadata
+// carrying an old numeric id (#3075). Both HA nodes and a cold-booting node
+// compute identical ids by construction with zero synced/persisted state, and
+// pkg/daemon/daemon_ha_userspace.go:buildZoneIDs MUST stay byte-identical to
+// this (enforced by an HA-symmetry test).
+func assignZoneIDs(result *CompileResult, cfg *config.Config) {
+	for name := range cfg.Security.Zones {
+		result.ZoneIDs[name] = config.StableZoneID(name)
+	}
+}
+
 // CompileConfig translates a typed Config into dataplane table entries.
 // It works with any DataPlane backend (eBPF or DPDK) via the interface.
 // The isRecompile flag triggers FIB generation bump for hitless restarts.
@@ -180,19 +197,8 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		genericXDPIfindexes: make(map[int]bool),
 	}
 
-	// Phase 1: Assign zone IDs (1-based; 0 = unassigned).
-	// Sort names for deterministic IDs across restarts — existing sessions
-	// store zone IDs, so changing them breaks session→policy lookups.
-	zoneID := uint16(1)
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
-	sort.Strings(zoneNames)
-	for _, name := range zoneNames {
-		result.ZoneIDs[name] = zoneID
-		zoneID++
-	}
+	// Phase 1: Assign STABLE zone IDs (#3075).
+	assignZoneIDs(result, cfg)
 
 	// Phase 1.5: Assign screen profile IDs (1-based; 0 = no profile).
 	// Sorted for deterministic IDs.

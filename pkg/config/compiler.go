@@ -740,19 +740,27 @@ type compileOpts struct {
 	// cannot silently un-enforce a configured rule. Same doctrine as
 	// lenientPolicyMatchAddress.
 	lenientPolicyZoneRefs bool
-	// lenientZoneCount (#2391) downgrades the security-zone count cap gate
-	// (validateZoneCountStrict) from a hard compile error to a cfg.Warnings
-	// entry. The strict commit / commit-check path hard-rejects a config that
-	// defines more than MaxUsableZoneID (255) security zones — the 256th+ zone
-	// ids overflow the u8 event-stream wire field and were silently dropped by
-	// the userspace forwarding builder, collapsing the affected interfaces to
-	// zone 0 ("unknown") instead of failing the commit. The tolerant load /
-	// peer-sync paths downgrade to a warning so an already-persisted or peer-
-	// synced config an older binary accepted still BOOTS (#1960 no-brick) — the
-	// dataplane independently fails closed on every overflowing zone, so a
-	// leniently-loaded over-cap config is inert (the overflow zones do not
-	// forward) rather than mis-attributed. Same doctrine as lenientPolicyZoneRefs.
+	// lenientZoneCount (#2391, cap SUPERSEDED by #3075) downgrades the security-
+	// zone count cap gate (validateZoneCountStrict) from a hard compile error to
+	// a cfg.Warnings entry. After #3075 the cap is a pigeonhole belt: a config
+	// cannot define more than MaxUsableZoneID (65533) distinct zones in the u16
+	// stable-name-hash space. The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config an older binary
+	// accepted still BOOTS (#1960 no-brick). Same doctrine as lenientPolicyZoneRefs.
 	lenientZoneCount bool
+	// lenientZoneIDCollision (#3075) downgrades the stable-zone-id collision
+	// gate (validateZoneIDCollisionAST) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// config whose two zone names fold to the same StableZoneID — the later-
+	// sorting zone would otherwise be dropped by the dataplane and its
+	// interfaces fall back to the wrong / unknown zone. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or peer-
+	// synced config still BOOTS (#1960 no-brick) — the dataplane independently
+	// fails closed on the unresolvable later-folding zone, so a leniently-loaded
+	// colliding config is inert on that zone rather than mis-attributed. Same
+	// doctrine as lenientZoneCount; mirrors the #1873 tunnel-id gate's
+	// strict/lenient split.
+	lenientZoneIDCollision bool
 	// lenientAddressBookNames (#3061) downgrades the address-book / zone name
 	// `/`-character gate (validateAddressBookEntryNamesStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -1314,6 +1322,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientWireguardPeers:                true,
 		lenientPolicyZoneRefs:                true,
 		lenientZoneCount:                     true,
+		lenientZoneIDCollision:               true,
 		lenientAddressBookNames:              true,
 		lenientZoneInterfaceMembership:       true,
 		lenientHostInboundTokens:             true,
@@ -1372,6 +1381,16 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, tunnelIDErr
 	}
 
+	// #3075: stable-zone-id collision gate. Like the tunnel gate above it runs
+	// on the PRE-expansion tree and unions zone names across all groups (Views
+	// 1/2/3, see zoneid.go) so both cluster nodes accept/reject identically.
+	// Strict hard-rejects a colliding pair; lenient warns.
+	zoneIDWarnings, zoneIDErr := validateZoneIDCollisionAST(
+		tree, opts.lenientZoneIDCollision)
+	if zoneIDErr != nil {
+		return nil, zoneIDErr
+	}
+
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -1395,6 +1414,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		cfg.Warnings = append(cfg.Warnings, `apply-groups "${node}" resolved using default node0 context during generic compile`)
 	}
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	return cfg, nil
 }
 
@@ -1464,6 +1484,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientWireguardPeers:                true,
 		lenientPolicyZoneRefs:                true,
 		lenientZoneCount:                     true,
+		lenientZoneIDCollision:               true,
 		lenientAddressBookNames:              true,
 		lenientZoneInterfaceMembership:       true,
 		lenientHostInboundTokens:             true,
@@ -1515,6 +1536,15 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, tunnelIDErr
 	}
 
+	// #3075: stable-zone-id collision gate — see compileConfigWithOpts.
+	// Pre-expansion union across all groups so the verdict is identical on both
+	// cluster nodes; read-only, safe on the soon-to-be-expanded copy.
+	zoneIDWarnings, zoneIDErr := validateZoneIDCollisionAST(
+		tree, opts.lenientZoneIDCollision)
+	if zoneIDErr != nil {
+		return nil, zoneIDErr
+	}
+
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)
@@ -1525,6 +1555,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	return cfg, nil
 }
 
@@ -2332,16 +2363,14 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
-	// #2391 security-zone count cap. Strict on commit / commit-check
-	// (hard-reject a config with more than MaxUsableZoneID zones — the overflow
-	// zone ids exceed the u8 event-stream wire field and were silently dropped
-	// by the dataplane, collapsing the affected interfaces to zone 0); lenient
-	// on load / peer-sync (warn so an already-persisted or peer-synced over-cap
-	// config still boots — #1960 no-brick; the dataplane fails closed on every
-	// overflowing zone, so a leniently-loaded over-cap config is inert). This is
-	// the PRIMARY gate: bounding the zone count guarantees no out-of-range id is
-	// ever produced. Runs AFTER the policy zone-reference gate so a structural
-	// error and a bad zone reference still win the first-error slot.
+	// Security-zone count cap (#2391 SUPERSEDED by #3075). After #3075 zone ids
+	// are a stable name-hash in a u16 space, so this is a cheap pigeonhole belt:
+	// a config cannot define more than MaxUsableZoneID (65533) distinct zones.
+	// The StableZoneID collision gate above is the real duplicate-id protection.
+	// Strict on commit / commit-check (hard-reject); lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config still boots — #1960
+	// no-brick). Runs AFTER the policy zone-reference gate so a structural error
+	// and a bad zone reference still win the first-error slot.
 	if err := validateZoneCountStrict(cfg); err != nil {
 		if opts.lenientZoneCount {
 			cfg.Warnings = append(cfg.Warnings,

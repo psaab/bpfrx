@@ -416,11 +416,15 @@ pub(super) fn learn_dynamic_neighbor_from_packet(
     if frame.len() < 12 {
         return;
     }
+    // #3075: skip learning xpf's own synthetic fabric-zone-encoded src MAC
+    // (02:bf:72:fe:HI:LO, where HI:LO is the big-endian u16 zone id). The
+    // discriminator is the 02:bf:72 OUI + the FABRIC_ZONE_MAC_MAGIC byte; the
+    // former frame[10]==0x00 guard is dropped because the zone-id high byte may
+    // now be nonzero (ids > 255).
     if frame[6] == 0x02
         && frame[7] == 0xbf
         && frame[8] == 0x72
         && frame[9] == FABRIC_ZONE_MAC_MAGIC
-        && frame[10] == 0x00
     {
         return;
     }

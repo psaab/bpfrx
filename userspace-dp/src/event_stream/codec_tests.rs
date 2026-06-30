@@ -645,9 +645,39 @@ fn test_encode_session_open_v4() {
     assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 3); // EgressIfindex
     assert_eq!(i32::from_le_bytes([p[18], p[19], p[20], p[21]]), 3); // TXIfindex
     assert_eq!(p[26], 0); // Flags (no fabric redirect, no fabric ingress)
-    assert_eq!(p[27], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
-    assert_eq!(p[28], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
-    assert_eq!(p[29], DISP_FORWARD_CANDIDATE); // Disposition
+    // #3075: IngressZoneID/EgressZoneID are u16 LE at [27:29]/[29:31];
+    // Disposition moved to [31].
+    assert_eq!(u16::from_le_bytes([p[27], p[28]]), TEST_TRUST_ZONE_ID); // IngressZoneID
+    assert_eq!(u16::from_le_bytes([p[29], p[30]]), TEST_UNTRUST_ZONE_ID); // EgressZoneID
+    assert_eq!(p[31], DISP_FORWARD_CANDIDATE); // Disposition
+}
+
+// #3075 fail-on-revert: a stable name-hash zone id > 255 must round-trip on the
+// event-stream SessionOpen wire. Reverting codec.rs to the u8 [27]/[28] encode
+// truncates 300 -> 44 / 1000 -> 232, and these assertions fail RED.
+#[test]
+fn test_encode_session_open_zone_id_above_255() {
+    let zones = test_zone_map();
+    let mut md = test_metadata();
+    md.ingress_zone = 300;
+    md.egress_zone = 1000;
+    let frame =
+        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+    assert_eq!(u16::from_le_bytes([p[27], p[28]]), 300); // IngressZoneID u16
+    assert_eq!(u16::from_le_bytes([p[29], p[30]]), 1000); // EgressZoneID u16
+    assert_eq!(p[31], DISP_FORWARD_CANDIDATE); // Disposition unshifted
+}
+
+// #3075 fail-on-revert: a zone id > 255 must round-trip on the SessionClose
+// (type 2 HA delta) wire too.
+#[test]
+fn test_encode_session_close_zone_id_above_255() {
+    let frame = EventFrame::encode_session_close(7, &test_key_v4(), 1, 0, 300, 1000);
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+    // [14:18] OwnerRGID i32, [18] Flags, [19:21]/[21:23] u16 zones (#3075).
+    assert_eq!(u16::from_le_bytes([p[19], p[20]]), 300);
+    assert_eq!(u16::from_le_bytes([p[21], p[22]]), 1000);
 }
 
 // #2785: the per-policy `then log` selection must ride the open-frame flags
@@ -788,9 +818,9 @@ fn test_encode_session_close_v4() {
     assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 1);
     // p[18] Flags
     assert_eq!(p[18], FLAG_FABRIC_REDIRECT);
-    // #919/#922: p[19] IngressZoneID, p[20] EgressZoneID
-    assert_eq!(p[19], TEST_TRUST_ZONE_ID as u8);
-    assert_eq!(p[20], TEST_UNTRUST_ZONE_ID as u8);
+    // #3075: p[19:21] IngressZoneID u16 LE, p[21:23] EgressZoneID u16 LE.
+    assert_eq!(u16::from_le_bytes([p[19], p[20]]), TEST_TRUST_ZONE_ID);
+    assert_eq!(u16::from_le_bytes([p[21], p[22]]), TEST_UNTRUST_ZONE_ID);
 }
 
 // #2467: high (>32767) ifindexes must survive the wire encode. With the old
@@ -817,10 +847,11 @@ fn test_encode_session_open_high_ifindex_v4() {
     assert_eq!(i32::from_le_bytes([p[10], p[11], p[12], p[13]]), 40000); // OwnerRGID
     assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 70000); // EgressIfindex
     assert_eq!(i32::from_le_bytes([p[18], p[19], p[20], p[21]]), 65536); // TXIfindex
-    // Downstream fields must still land at their shifted offsets.
-    assert_eq!(p[27], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
-    assert_eq!(p[28], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
-    assert_eq!(p[29], DISP_FORWARD_CANDIDATE); // Disposition
+    // Downstream fields must still land at their shifted offsets (#3075: zone
+    // fields are u16 LE at [27:29]/[29:31], Disposition at [31]).
+    assert_eq!(u16::from_le_bytes([p[27], p[28]]), TEST_TRUST_ZONE_ID); // IngressZoneID
+    assert_eq!(u16::from_le_bytes([p[29], p[30]]), TEST_UNTRUST_ZONE_ID); // EgressZoneID
+    assert_eq!(p[31], DISP_FORWARD_CANDIDATE); // Disposition
 }
 
 // #2467: session-close owner RG must also survive the i32 widen. The encoder
@@ -839,8 +870,9 @@ fn test_encode_session_close_high_owner_rg_v4() {
     // p[6..10] SrcIP, p[10..14] DstIP, p[14..18] OwnerRGID i32 LE.
     assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 40000);
     assert_eq!(p[18], FLAG_FABRIC_REDIRECT); // Flags
-    assert_eq!(p[19], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
-    assert_eq!(p[20], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
+    // #3075: p[19:21] IngressZoneID u16 LE, p[21:23] EgressZoneID u16 LE.
+    assert_eq!(u16::from_le_bytes([p[19], p[20]]), TEST_TRUST_ZONE_ID); // IngressZoneID
+    assert_eq!(u16::from_le_bytes([p[21], p[22]]), TEST_UNTRUST_ZONE_ID); // EgressZoneID
 }
 
 #[test]

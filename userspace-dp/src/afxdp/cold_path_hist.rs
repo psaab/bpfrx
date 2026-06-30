@@ -64,42 +64,25 @@ const _: () = assert!(COLD_PATH_PIVOT_NS == 512);
 pub(in crate::afxdp) const POLICY_COLD_PATH_ZONE_PAIR_SLOTS: usize = 256;
 const _: () = assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 256);
 
-/// Maximum number of ASSIGNABLE slots. `u8::MAX` (255) is reserved as
-/// the `flat_table` "unassigned" sentinel, so slot index 255 can never
-/// be handed out; the accumulator arrays are still 256 wide for
-/// alignment and to keep slot indices identity-mapped. Capacity is
-/// therefore 255 active zone-pairs (~21× the largest known deployment).
+/// Maximum number of ASSIGNABLE slots. Slot index 255 (`u8::MAX`) is
+/// never handed out — the accumulator arrays are 256 wide for alignment
+/// and to keep slot indices identity-mapped, and reserving the top index
+/// keeps a `u8` slot id unambiguous. Capacity is therefore 255 active
+/// zone-pairs (~21× the largest known deployment). #3075: overflow past
+/// this capacity (not zone-id magnitude) is the only `overflow_active`
+/// trigger now that the slot map is keyed sparsely by the `(from, to)`
+/// pair (`ColdPathSlotMap::slot_by_pair`) rather than a 65×65 flat table.
 pub(in crate::afxdp) const COLD_PATH_ASSIGNABLE_SLOTS: usize =
     POLICY_COLD_PATH_ZONE_PAIR_SLOTS - 1;
 const _: () = assert!(COLD_PATH_ASSIGNABLE_SLOTS == 255);
 
-/// Number of distinct zone-id values the direct slot-map lookup table
-/// indexes. MUST cover the full configurable zone space INCLUSIVELY:
-/// the Go compiler assigns sequential 1-based zone-ids and `MAX_ZONES`
-/// is 64 (`bpf/headers/xpf_common.h` + `pkg/dataplane/types.go
-/// MaxZones`), so the highest assignable id is 64. The table indexes
-/// ids `0..=64` = 65 rows/cols (Copilot code-r2: a ceiling of 64 used
-/// as an EXCLUSIVE bound dropped the valid 64th zone; Codex code-r1: a
-/// ceiling of 32 dropped 32-63). The index is a MULTIPLY
-/// (`from * 65 + to`), not a bit-shift, since 65 is not a power of two.
-/// Pairs with either id ≥ 65 (e.g. the `junos-global` `u16::MAX`
-/// sentinel) land in `None` — a defensive guard, not an expected case.
-pub(in crate::afxdp) const COLD_PATH_ZONE_DIM: usize = 65;
-const _: () = assert!(COLD_PATH_ZONE_DIM == 65);
-/// Flat lookup-table length = `DIM²` = 65×65 = 4225 bytes (L1d-resident).
-const COLD_PATH_FLAT_TABLE_LEN: usize = COLD_PATH_ZONE_DIM * COLD_PATH_ZONE_DIM;
-const _: () = assert!(COLD_PATH_FLAT_TABLE_LEN == 4225);
-
-/// Flat-table index for `(from, to)`; `None` if either id is out of
-/// range (≥ 65). `from * 65 + to` is injective over the in-range box.
-#[inline]
-fn cold_path_flat_index(from: u16, to: u16) -> Option<usize> {
-    let (from, to) = (from as usize, to as usize);
-    if from >= COLD_PATH_ZONE_DIM || to >= COLD_PATH_ZONE_DIM {
-        return None;
-    }
-    Some(from * COLD_PATH_ZONE_DIM + to)
-}
+// #3075: the old 65×65 flat lookup table (`COLD_PATH_ZONE_DIM` /
+// `cold_path_flat_index`, `from * 65 + to`) was removed. Zone ids are now
+// stable name-hashes spanning [1,65533] (not sequential 1..MaxZones), so a
+// dense table is infeasible and a flat index dropped every pair with an id
+// ≥ 65 — silently dark-ing the #1635 histogram for every real config. The
+// slot map is now keyed sparsely by the `(from, to)` pair itself
+// (`ColdPathSlotMap::slot_by_pair`).
 
 /// Wire/layout version stamped into the status payload (#1635).
 pub(in crate::afxdp) const COLD_PATH_LAYOUT_VERSION: u32 = 3;
@@ -157,19 +140,20 @@ pub(in crate::afxdp) fn zone_pair_packed_key(from_zone_id: u16, to_zone_id: u16)
 /// collided at 88.2% with 8 active zone-pairs (birthday paradox), the
 /// F2 finding in the #1622 PLAN-KILL.
 ///
-/// Lookup is a bounded 2D table indexed by `cold_path_flat_index`
-/// (`from * 65 + to`, ids `0..=64`; 65×65 = 4225 entries, L1d-resident).
-/// A miss (entry == `u8::MAX`) means the pair has no slot assigned
-/// (capacity exhausted or zone-id ≥ 65); the sample is dropped at the
-/// hot path.
+/// Lookup is a sparse `(from, to) → slot` hash map (#3075: stable
+/// name-hash zone ids span [1,65533], so the prior 65×65 flat table was
+/// removed). A miss (pair absent) means no slot assigned (capacity
+/// exhausted); the sample is dropped at the hot path.
 ///
 /// `inverse[slot]` is the reverse map used by the status path to emit
 /// per-zone-pair labels for the sparse wire encoding.
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct ColdPathSlotMap {
-    /// 65×65 flat table indexed by `from * 65 + to`. `u8::MAX` =
-    /// unassigned.
-    pub(in crate::afxdp) flat_table: Box<[u8; COLD_PATH_FLAT_TABLE_LEN]>,
+    /// Sparse `(from_zone_id, to_zone_id) → slot` map (#3075). Replaces
+    /// the old 65×65 flat table: stable name-hash ids span [1,65533], so
+    /// a flat `from*65+to` index dropped every pair with an id ≥ 65. A
+    /// pair absent from the map = no slot assigned.
+    pub(in crate::afxdp) slot_by_pair: std::collections::HashMap<(u16, u16), u8>,
     /// `slot → Some((from, to))` for assigned slots, `None` for free.
     pub(in crate::afxdp) inverse: Vec<Option<(u16, u16)>>,
     /// True if some configured zone-pair could not be assigned a slot
@@ -187,7 +171,7 @@ impl ColdPathSlotMap {
     /// An empty map: every lookup misses.
     pub(in crate::afxdp) fn empty() -> Self {
         Self {
-            flat_table: Box::new([u8::MAX; COLD_PATH_FLAT_TABLE_LEN]),
+            slot_by_pair: std::collections::HashMap::new(),
             inverse: vec![None; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
             overflow_active: false,
         }
@@ -218,7 +202,8 @@ impl ColdPathSlotMap {
         previous: Option<&ColdPathSlotMap>,
         pairs: &[(u16, u16)],
     ) -> (Self, Vec<u8>) {
-        let mut flat_table = Box::new([u8::MAX; COLD_PATH_FLAT_TABLE_LEN]);
+        let mut slot_by_pair: std::collections::HashMap<(u16, u16), u8> =
+            std::collections::HashMap::with_capacity(pairs.len());
         let mut inverse: Vec<Option<(u16, u16)>> =
             vec![None; POLICY_COLD_PATH_ZONE_PAIR_SLOTS];
         let mut used = [false; POLICY_COLD_PATH_ZONE_PAIR_SLOTS];
@@ -229,21 +214,14 @@ impl ColdPathSlotMap {
         // the previous map (so their accumulated histogram is kept).
         let mut pending: Vec<(u16, u16)> = Vec::with_capacity(pairs.len());
         for &(from, to) in pairs {
-            let Some(idx) = cold_path_flat_index(from, to) else {
-                // Unrepresentable in the 65×65 table (zone-id ≥ 65). The
-                // Go compiler assigns 1-based ids up to MaxZones=64, but
-                // the Rust snapshot path accepts ids up to u8::MAX (255)
-                // — so a deployment (or non-Go producer) with an id in
-                // 65..=255 lands here. Surface it via `overflow_active`
-                // rather than silently dropping the pair, so operators
-                // see that a configured zone-pair was not measured
-                // (Copilot code-r4 finding).
-                overflow_active = true;
-                continue;
-            };
+            // #3075: every (u16, u16) pair is representable — the stable
+            // name-hash id space [1,65533] is keyed sparsely by the pair
+            // itself, so there is no id-magnitude "unrepresentable" case.
+            // `overflow_active` is set only when the SLOT capacity is
+            // exhausted (Pass 2).
             let retained = previous.and_then(|p| {
-                let s = p.flat_table[idx];
-                if s != u8::MAX && p.inverse[s as usize] == Some((from, to)) {
+                let s = p.slot_by_pair.get(&(from, to)).copied()?;
+                if p.inverse[s as usize] == Some((from, to)) {
                     Some(s)
                 } else {
                     None
@@ -253,7 +231,7 @@ impl ColdPathSlotMap {
                 Some(s) => {
                     used[s as usize] = true;
                     inverse[s as usize] = Some((from, to));
-                    flat_table[idx] = s;
+                    slot_by_pair.insert((from, to), s);
                 }
                 None => pending.push((from, to)),
             }
@@ -275,11 +253,7 @@ impl ColdPathSlotMap {
             let s = next_free;
             used[s] = true;
             inverse[s] = Some((from, to));
-            // `from`/`to` are in-range here (only in-range pairs reach
-            // `pending`), so the index is always Some.
-            if let Some(idx) = cold_path_flat_index(from, to) {
-                flat_table[idx] = s as u8;
-            }
+            slot_by_pair.insert((from, to), s as u8);
             // Queue zero-out for every newly-assigned slot when a
             // PREVIOUS map existed — the worker may have accumulated
             // counts for an earlier pair in this slot during any prior
@@ -293,7 +267,7 @@ impl ColdPathSlotMap {
 
         (
             Self {
-                flat_table,
+                slot_by_pair,
                 inverse,
                 overflow_active,
             },
@@ -303,18 +277,12 @@ impl ColdPathSlotMap {
 }
 
 /// Look up the slot for `(from, to)` in the direct map. Returns `None`
-/// for unmapped pairs (capacity exhausted) or zone-ids ≥ 65. Hot-path
-/// cost: one bound check, one multiply-add, one L1d-resident array
-/// index, one `!= u8::MAX` predicate.
+/// for unmapped pairs (capacity exhausted). #3075: one sparse hash-map
+/// probe keyed on the `(from, to)` pair (any u16 zone id), replacing the
+/// old 65×65 flat-table index that dropped ids ≥ 65.
 #[inline]
 pub(in crate::afxdp) fn lookup_slot(map: &ColdPathSlotMap, from: u16, to: u16) -> Option<u8> {
-    let idx = cold_path_flat_index(from, to)?;
-    let entry = map.flat_table[idx];
-    if entry == u8::MAX {
-        None
-    } else {
-        Some(entry)
-    }
+    map.slot_by_pair.get(&(from, to)).copied()
 }
 
 /// Read the TSC at the **start** of a measurement window via
@@ -1272,17 +1240,29 @@ mod tests {
     }
 
     #[test]
-    fn lookup_slot_returns_none_for_zone_id_out_of_range() {
-        // The table indexes ids 0..=64 (DIM=65). Id 65+ (and the
-        // junos-global u16::MAX sentinel) is out of range and misses
-        // even when built — Copilot code-r2: the 64th zone (id 64) must
-        // NOT be treated as out of range.
-        let (map, _) = ColdPathSlotMap::build(None, &[(65u16, 2u16), (1, 2)]);
-        assert_eq!(lookup_slot(&map, 65, 2), None);
-        assert_eq!(lookup_slot(&map, 2, 65), None);
-        assert_eq!(lookup_slot(&map, u16::MAX, 1), None);
-        // (1,2) is in-range and was built ⇒ Some.
-        assert!(lookup_slot(&map, 1, 2).is_some());
+    fn build_assigns_slots_for_wide_stable_hash_zone_ids() {
+        // #3075: zone ids are stable name-hashes spanning [1,65533], NOT
+        // the old sequential 1..=64. A pair with an id >= 65 (e.g. 300,
+        // 40000) MUST get a slot — the old 65×65 flat table dropped every
+        // such pair, silently dark-ing the #1635 cold-path histogram for
+        // every real config. RED-on-revert: against the fixed-65 table
+        // these lookups return None and overflow_active is true.
+        let pairs = [(300u16, 400u16), (40000, 1), (1, 65533), (65533, 65533)];
+        let (map, _) = ColdPathSlotMap::build(None, &pairs);
+        for &(from, to) in &pairs {
+            assert!(
+                lookup_slot(&map, from, to).is_some(),
+                "wide stable-hash pair {from}->{to} must get a slot"
+            );
+        }
+        assert!(
+            !map.overflow_active,
+            "wide ids must NOT trip overflow (overflow is now slot-capacity only)"
+        );
+        // Distinct wide pairs get distinct slots.
+        assert_ne!(lookup_slot(&map, 300, 400), lookup_slot(&map, 40000, 1));
+        // An unmapped wide pair still misses.
+        assert_eq!(lookup_slot(&map, 12345, 54321), None);
     }
 
     #[test]
@@ -1312,24 +1292,36 @@ mod tests {
     }
 
     #[test]
-    fn build_skips_out_of_range_pairs_and_flags_overflow() {
-        // A pair with a zone-id >= 65 (the Rust path accepts ids up to
-        // 255 even though the table covers 0..=64) is not assignable.
-        // Copilot code-r4: such a pair MUST set overflow_active so the
-        // operator sees a configured pair went unmeasured — not vanish
-        // silently.
+    fn build_flags_overflow_only_on_slot_capacity_exhaustion() {
+        // #3075: overflow_active is set when the slot CAPACITY
+        // (COLD_PATH_ASSIGNABLE_SLOTS) is exhausted, NOT by zone-id
+        // magnitude — wide stable-hash ids are first-class now. A wide id
+        // within capacity is assigned, not dropped.
         let pairs = [(1u16, 2u16), (200, 5), (3, 4)];
         let (map, _) = ColdPathSlotMap::build(None, &pairs);
-        assert_eq!(lookup_slot(&map, 200, 5), None);
         assert!(
-            map.overflow_active,
-            "an out-of-range (id >= 65) configured pair must trip overflow_active"
+            lookup_slot(&map, 200, 5).is_some(),
+            "a wide id (200) within capacity must be assigned, not dropped"
         );
-        // The two in-range pairs still get slots 0 and 1.
-        assert!(lookup_slot(&map, 1, 2).is_some());
-        assert!(lookup_slot(&map, 3, 4).is_some());
+        assert!(!map.overflow_active, "no capacity pressure ⇒ no overflow");
         let occupied = map.inverse.iter().filter(|s| s.is_some()).count();
-        assert_eq!(occupied, 2);
+        assert_eq!(occupied, 3);
+
+        // Exceed the slot capacity with distinct wide pairs ⇒ overflow.
+        let mut many: Vec<(u16, u16)> = Vec::new();
+        for i in 0..(COLD_PATH_ASSIGNABLE_SLOTS as u16 + 1) {
+            many.push((1000 + i, 2000 + i));
+        }
+        let (full, _) = ColdPathSlotMap::build(None, &many);
+        assert!(
+            full.overflow_active,
+            "exceeding the {COLD_PATH_ASSIGNABLE_SLOTS}-slot capacity must trip overflow_active"
+        );
+        let occupied_full = full.inverse.iter().filter(|s| s.is_some()).count();
+        assert_eq!(
+            occupied_full, COLD_PATH_ASSIGNABLE_SLOTS,
+            "exactly the capacity is assigned; the surplus pair is dropped"
+        );
     }
 
     /// Codex code-r1 finding 1: A assigns slot 0; B frees it (no reuse);

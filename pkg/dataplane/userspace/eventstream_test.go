@@ -29,13 +29,14 @@ func buildSessionOpenV4Payload(
 	egressIfindex, txIfindex int32,
 	tunnelEndpoint, txVLAN uint16,
 	flags uint8,
-	ingressZone, egressZone, disposition uint8,
+	ingressZone, egressZone uint16, disposition uint8,
 	neighborMAC, srcMAC [6]byte,
 	nextHop [4]byte,
 ) []byte {
-	// #2467: 30 fixed + 4*4 IPs + 6+6 MACs + 4 NextHop = 62 bytes
-	// (the three identity fields at [10:22] are int32, not int16).
-	buf := make([]byte, 62)
+	// #3075: 32 fixed (zone fields widened u8->u16, Disposition moved to [31])
+	// + 4*4 IPs + 6+6 MACs + 4 NextHop = 64 bytes. (#2467: the three identity
+	// fields at [10:22] are int32.)
+	buf := make([]byte, 64)
 	buf[0] = 4 // AddrFamily
 	buf[1] = proto
 	binary.LittleEndian.PutUint16(buf[2:4], srcPort)
@@ -48,31 +49,32 @@ func buildSessionOpenV4Payload(
 	binary.LittleEndian.PutUint16(buf[22:24], tunnelEndpoint)
 	binary.LittleEndian.PutUint16(buf[24:26], txVLAN)
 	buf[26] = flags
-	buf[27] = ingressZone
-	buf[28] = egressZone
-	buf[29] = disposition
-	copy(buf[30:34], srcIP[:])
-	copy(buf[34:38], dstIP[:])
-	copy(buf[38:42], natSrcIP[:])
-	copy(buf[42:46], natDstIP[:])
-	copy(buf[46:52], neighborMAC[:])
-	copy(buf[52:58], srcMAC[:])
-	copy(buf[58:62], nextHop[:])
+	binary.LittleEndian.PutUint16(buf[27:29], ingressZone)
+	binary.LittleEndian.PutUint16(buf[29:31], egressZone)
+	buf[31] = disposition
+	copy(buf[32:36], srcIP[:])
+	copy(buf[36:40], dstIP[:])
+	copy(buf[40:44], natSrcIP[:])
+	copy(buf[44:48], natDstIP[:])
+	copy(buf[48:54], neighborMAC[:])
+	copy(buf[54:60], srcMAC[:])
+	copy(buf[60:64], nextHop[:])
 	return buf
 }
 
 // buildSessionCloseV4Payload builds a binary SessionClose payload for IPv4.
-// #919/#922: includes the trailing ingress/egress zone-id u8 bytes.
+// #3075: includes the trailing ingress/egress zone-id u16 LE bytes (widened
+// from u8).
 func buildSessionCloseV4Payload(
 	proto uint8,
 	srcPort, dstPort uint16,
 	srcIP, dstIP [4]byte,
 	ownerRG int32,
 	flags uint8,
-	ingressZoneID, egressZoneID uint8,
+	ingressZoneID, egressZoneID uint16,
 ) []byte {
-	// #2467: 6 + 4+4 + 4 (OwnerRGID int32) + 1 + 2 = 21 bytes
-	buf := make([]byte, 21)
+	// #3075: 6 + 4+4 + 4 (OwnerRGID int32) + 1 (Flags) + 4 (u16 zones) = 23 bytes
+	buf := make([]byte, 23)
 	buf[0] = 4 // AddrFamily
 	buf[1] = proto
 	binary.LittleEndian.PutUint16(buf[2:4], srcPort)
@@ -81,8 +83,8 @@ func buildSessionCloseV4Payload(
 	copy(buf[10:14], dstIP[:])
 	binary.LittleEndian.PutUint32(buf[14:18], uint32(ownerRG))
 	buf[18] = flags
-	buf[19] = ingressZoneID
-	buf[20] = egressZoneID
+	binary.LittleEndian.PutUint16(buf[19:21], ingressZoneID)
+	binary.LittleEndian.PutUint16(buf[21:23], egressZoneID)
 	return buf
 }
 
@@ -208,7 +210,7 @@ func TestDecodeSessionEventV4(t *testing.T) {
 	if d.AddrFamily != dataplane.AFInet {
 		t.Fatalf("AddrFamily = %d, want %d (AFInet)", d.AddrFamily, dataplane.AFInet)
 	}
-	// #919/#922: zone IDs decoded from payload[21]/[22].
+	// #3075: zone IDs decoded as u16 LE from payload[27:29]/[29:31].
 	if d.IngressZoneID != 1 {
 		t.Fatalf("IngressZoneID = %d, want 1", d.IngressZoneID)
 	}
@@ -265,6 +267,51 @@ func TestDecodeSessionEventV4(t *testing.T) {
 	}
 	if d.NextHop != "172.16.80.1" {
 		t.Fatalf("NextHop = %q, want 172.16.80.1", d.NextHop)
+	}
+}
+
+// TestDecodeSessionEventZoneIDAbove255 is the #3075 cross-language fail-on-revert
+// guard for the widened u16 zone wire field. The Rust codec encodes a stable
+// name-hash zone id > 255; the Go decoder must read the full u16 (not truncate
+// to the low byte). Reverting decodeSessionEvent to the u8 [27]/[28] read makes
+// 300/1000 decode as 44/232 and this fails RED.
+func TestDecodeSessionEventZoneIDAbove255(t *testing.T) {
+	payload := buildSessionOpenV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{0, 0, 0, 0}, [4]byte{0, 0, 0, 0},
+		0, 0,
+		1, 12, 11, 0, 0, 0,
+		300, 1000, 0, // ingress/egress zone u16 (#3075), disposition
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+	d, ok := decodeSessionEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false for a zone id > 255")
+	}
+	if d.IngressZoneID != 300 {
+		t.Fatalf("IngressZoneID = %d, want 300 (u16 truncated to u8?)", d.IngressZoneID)
+	}
+	if d.EgressZoneID != 1000 {
+		t.Fatalf("EgressZoneID = %d, want 1000 (u16 truncated to u8?)", d.EgressZoneID)
+	}
+}
+
+// TestDecodeSessionCloseEventZoneIDAbove255 is the close-frame sibling of the
+// above: the +4 u16 zone trailer must round-trip an id > 255.
+func TestDecodeSessionCloseEventZoneIDAbove255(t *testing.T) {
+	payload := buildSessionCloseV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		7, 0,
+		300, 1000, // ingress/egress zone u16 (#3075)
+	)
+	d, ok := decodeSessionCloseEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionCloseEvent returned false for a zone id > 255")
+	}
+	if d.IngressZoneID != 300 || d.EgressZoneID != 1000 {
+		t.Fatalf("close zones = (%d,%d), want (300,1000)", d.IngressZoneID, d.EgressZoneID)
 	}
 }
 

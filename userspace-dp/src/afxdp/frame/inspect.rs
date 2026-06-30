@@ -1674,9 +1674,10 @@ pub(in crate::afxdp) fn parse_zone_encoded_fabric_ingress(
     parse_zone_encoded_fabric_ingress_from_frame(frame, meta, forwarding)
 }
 
-/// #919/#922: returns the encoded zone ID (u8 → u16) directly, no
-/// `zone_id_to_name` lookup or `String` clone. Callers that need a
-/// name resolve via `forwarding.zone_id_to_name` on the slow path.
+/// #919/#922: returns the encoded zone ID directly, no `zone_id_to_name`
+/// lookup or `String` clone. Callers that need a name resolve via
+/// `forwarding.zone_id_to_name` on the slow path. #3075: the id is a u16
+/// carried big-endian across frame[10]/frame[11] of the synthetic fabric MAC.
 pub(in crate::afxdp) fn parse_zone_encoded_fabric_ingress_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
@@ -1692,11 +1693,13 @@ pub(in crate::afxdp) fn parse_zone_encoded_fabric_ingress_from_frame(
         || frame[7] != 0xbf
         || frame[8] != 0x72
         || frame[9] != FABRIC_ZONE_MAC_MAGIC
-        || frame[10] != 0x00
     {
         return None;
     }
-    let id = frame[11] as u16;
+    // #3075: zone id is a u16 carried big-endian in frame[10] (high) /
+    // frame[11] (low). The old u8 scheme hardcoded frame[10]=0x00, which still
+    // decodes correctly here (id < 256 has a 0 high byte).
+    let id = u16::from_be_bytes([frame[10], frame[11]]);
     if id == 0 {
         return None;
     }

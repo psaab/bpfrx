@@ -335,32 +335,22 @@ impl EventFrame {
         buf[pos] = flags;
         pos += 1;
 
-        // [27] IngressZoneID u8
-        // #919/#922: SessionMetadata.ingress_zone is now u16 directly;
-        // no name→id round-trip. Wire format remains u8 — assert this
-        // at debug time. forwarding_build.rs:80 enforces zone IDs
-        // ≤ ZONE_ID_RESERVED_MIN-1 ≪ 256 by construction (Go assigns
-        // i+1 capped at MAX_ZONES=64).
-        debug_assert!(
-            metadata.ingress_zone < 256,
-            "zone id {} exceeds wire u8 capacity",
-            metadata.ingress_zone
-        );
-        let ingress_id = metadata.ingress_zone as u8;
-        buf[pos] = ingress_id;
-        pos += 1;
+        // [27:29] IngressZoneID u16 LE (#3075: widened from u8).
+        // SessionMetadata.ingress_zone is u16; the event-stream now carries the
+        // full u16 so a stable name-hash zone id > 255 (#3075) round-trips
+        // instead of truncating. This is same-host same-version IPC — xpfd
+        // spawns the helper as a child and the #1917 STOP->FLIP->START kills the
+        // helper before the new daemon starts (socket unlinked+recreated, a
+        // FullResync drains the stream), so no frame straddles the width change
+        // and no record-version negotiation is required.
+        buf[pos..pos + 2].copy_from_slice(&metadata.ingress_zone.to_le_bytes());
+        pos += 2;
 
-        // [28] EgressZoneID u8
-        debug_assert!(
-            metadata.egress_zone < 256,
-            "zone id {} exceeds wire u8 capacity",
-            metadata.egress_zone
-        );
-        let egress_id = metadata.egress_zone as u8;
-        buf[pos] = egress_id;
-        pos += 1;
+        // [29:31] EgressZoneID u16 LE (#3075).
+        buf[pos..pos + 2].copy_from_slice(&metadata.egress_zone.to_le_bytes());
+        pos += 2;
 
-        // [29] Disposition u8
+        // [31] Disposition u8
         buf[pos] = encode_disposition(decision.resolution.disposition);
         pos += 1;
 
@@ -419,10 +409,10 @@ impl EventFrame {
     }
 
     /// Encode a SessionClose (type 2) frame -- minimal payload.
-    /// #919/#922: extended with u8 ingress_zone_id + u8 egress_zone_id
-    /// after the flags byte. Old daemons that don't read those bytes
-    /// see them as trailing payload (the frame length lets them
-    /// length-skip), so this is wire-additive within the same MSG type.
+    /// #919/#922: extended with ingress_zone_id + egress_zone_id after the
+    /// flags byte. #3075: widened those two fields from u8 to u16 LE so a stable
+    /// name-hash zone id > 255 round-trips. They are TRAILING fields, so the Go
+    /// decoder length-gates them (a short frame degrades to "no zone ids").
     pub(crate) fn encode_session_close(
         seq: u64,
         key: &SessionKey,
@@ -464,13 +454,11 @@ impl EventFrame {
         buf[pos] = close_flags;
         pos += 1;
 
-        // #919/#922: IngressZoneID u8, EgressZoneID u8.
-        debug_assert!(ingress_zone_id < 256, "zone id {ingress_zone_id} > u8");
-        debug_assert!(egress_zone_id < 256, "zone id {egress_zone_id} > u8");
-        buf[pos] = ingress_zone_id as u8;
-        pos += 1;
-        buf[pos] = egress_zone_id as u8;
-        pos += 1;
+        // #3075: IngressZoneID u16 LE, EgressZoneID u16 LE (widened from u8).
+        buf[pos..pos + 2].copy_from_slice(&ingress_zone_id.to_le_bytes());
+        pos += 2;
+        buf[pos..pos + 2].copy_from_slice(&egress_zone_id.to_le_bytes());
+        pos += 2;
 
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
         write_header(&mut buf, payload_len, MSG_SESSION_CLOSE, seq);

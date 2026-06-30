@@ -6,34 +6,44 @@ import (
 	"testing"
 )
 
-// zoneSetLines returns `set security zones security-zone z<NNNN>` lines for n
-// distinct zones. Names are zero-padded so the deterministic 1..N id assignment
-// (sorted by name in pkg/dataplane/compiler.go) is independent of n.
-func zoneSetLines(n int) []string {
-	lines := make([]string, 0, n)
+// zonesConfig returns a *Config with n distinct security zones, built directly
+// (no set-command parse) so the validateZoneCountStrict unit tests can exercise
+// the pigeonhole cap at scale without paying the parser / collision-gate cost.
+func zonesConfig(n int) *Config {
+	zones := make(map[string]*ZoneConfig, n)
 	for i := 0; i < n; i++ {
-		lines = append(lines, fmt.Sprintf("set security zones security-zone z%04d", i))
+		name := fmt.Sprintf("z%05d", i)
+		zones[name] = &ZoneConfig{Name: name}
 	}
-	return lines
+	return &Config{Security: SecurityConfig{Zones: zones}}
 }
 
-// TestZoneCountOverCapFailsCommit asserts that a configuration defining more
-// than MaxUsableZoneID (255) security zones is HARD-REJECTED at commit (#2391).
-//
-// This is the fail-on-revert guard for the silent-remap bug: zone ids are
-// assigned 1..N sequentially and the dataplane carries them in a u8 wire field,
-// so the 256th+ zone ids overflow and were silently dropped — collapsing the
-// referencing interfaces to zone 0 ("unknown") rather than failing the commit.
-// Remove validateZoneCountStrict (or its dispatch in compiler.go) and this
-// subtest goes green on the over-cap config, which is the regression it guards.
-func TestZoneCountOverCapFailsCommit(t *testing.T) {
-	tree := buildTree(t, zoneSetLines(MaxUsableZoneID+1))
-	_, err := CompileConfig(tree)
-	if err == nil {
-		t.Fatalf("expected commit to reject a config with %d zones (cap is %d), got nil error", MaxUsableZoneID+1, MaxUsableZoneID)
+// TestZoneCountCapValue freezes the post-#3075 cap. #2391's u8 wire limit (255)
+// is SUPERSEDED: zone ids are now a stable name-hash in a u16 space, so the
+// usable space — and therefore the max number of distinct zones — is
+// ZoneIDReservedMin-1 (65533, the top two ids reserved for the global / host
+// sentinels). If this changes you altered the zone-id space; review the wire
+// widen and the collision gate.
+func TestZoneCountCapValue(t *testing.T) {
+	if MaxUsableZoneID != int(ZoneIDReservedMin)-1 {
+		t.Fatalf("MaxUsableZoneID = %d, want ZoneIDReservedMin-1 = %d", MaxUsableZoneID, int(ZoneIDReservedMin)-1)
 	}
-	// The error must name both the offending count and the limit so the
-	// operator can act on it.
+	if MaxUsableZoneID != 65533 {
+		t.Fatalf("MaxUsableZoneID = %d, want 65533 (#3075 supersedes the #2391 u8 cap of 255)", MaxUsableZoneID)
+	}
+}
+
+// TestZoneCountStrictRejectsOverCap asserts the pigeonhole belt: a config with
+// more than MaxUsableZoneID distinct zones cannot be assigned distinct u16
+// stable-hash ids and is hard-rejected. (In practice the StableZoneID collision
+// gate rejects far sooner — at the first hash collision — but the count cap is
+// the cheap O(1) backstop.) Removing validateZoneCountStrict makes the over-cap
+// config pass this direct check, which is the regression it guards.
+func TestZoneCountStrictRejectsOverCap(t *testing.T) {
+	err := validateZoneCountStrict(zonesConfig(MaxUsableZoneID + 1))
+	if err == nil {
+		t.Fatalf("validateZoneCountStrict accepted %d zones (cap is %d)", MaxUsableZoneID+1, MaxUsableZoneID)
+	}
 	for _, want := range []string{
 		fmt.Sprintf("%d security zones", MaxUsableZoneID+1),
 		fmt.Sprintf("at most %d", MaxUsableZoneID),
@@ -44,18 +54,27 @@ func TestZoneCountOverCapFailsCommit(t *testing.T) {
 	}
 }
 
-// TestZoneCountAtCapCommits asserts the boundary is inclusive: a config with
-// EXACTLY MaxUsableZoneID zones still compiles (#2391 anti-over-reject). The
-// 255th id is the largest the u8 wire field can carry.
-func TestZoneCountAtCapCommits(t *testing.T) {
-	tree := buildTree(t, zoneSetLines(MaxUsableZoneID))
-	if _, err := CompileConfig(tree); err != nil {
-		t.Fatalf("strict commit rejected a config at exactly the %d-zone cap: %v", MaxUsableZoneID, err)
+// TestZoneCountStrictAcceptsAtCap asserts the boundary is inclusive: EXACTLY
+// MaxUsableZoneID zones is accepted by the count cap.
+func TestZoneCountStrictAcceptsAtCap(t *testing.T) {
+	if err := validateZoneCountStrict(zonesConfig(MaxUsableZoneID)); err != nil {
+		t.Fatalf("validateZoneCountStrict rejected a config at exactly the %d-zone cap: %v", MaxUsableZoneID, err)
+	}
+}
+
+// TestZoneCountStrictAcceptsSmall asserts the common case and the nil guard.
+func TestZoneCountStrictAcceptsSmall(t *testing.T) {
+	if err := validateZoneCountStrict(nil); err != nil {
+		t.Fatalf("validateZoneCountStrict(nil) = %v, want nil", err)
+	}
+	if err := validateZoneCountStrict(zonesConfig(3)); err != nil {
+		t.Fatalf("validateZoneCountStrict rejected a 3-zone config: %v", err)
 	}
 }
 
 // TestZoneCountNormalConfigUnaffected asserts a small, ordinary zone count
-// commits cleanly — the cap does not perturb the common case (#2391).
+// commits cleanly through the full compile pipeline — neither the cap nor the
+// stable-zone-id collision gate perturb the common case.
 func TestZoneCountNormalConfigUnaffected(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set security zones security-zone trust",
@@ -64,29 +83,5 @@ func TestZoneCountNormalConfigUnaffected(t *testing.T) {
 	})
 	if _, err := CompileConfig(tree); err != nil {
 		t.Fatalf("strict commit rejected an ordinary 3-zone config: %v", err)
-	}
-}
-
-// TestZoneCountOverCapLenientDowngradesToWarning asserts the tolerant load /
-// peer-sync path downgrades the over-cap rejection to a warning instead of
-// failing the compile, so an already-persisted or peer-synced config an older
-// binary accepted still boots (#2391 / #1960 no-brick). The dataplane fails
-// closed on every overflowing zone, so the leniently-loaded over-cap config is
-// inert (the overflow zones do not forward) rather than mis-attributed.
-func TestZoneCountOverCapLenientDowngradesToWarning(t *testing.T) {
-	tree := buildTree(t, zoneSetLines(MaxUsableZoneID+1))
-	cfg, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient compile must not fail on an over-cap zone config: %v", err)
-	}
-	found := false
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "zone count (downgraded to warning on tolerant path)") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected a downgraded zone-count warning, got warnings: %v", cfg.Warnings)
 	}
 }

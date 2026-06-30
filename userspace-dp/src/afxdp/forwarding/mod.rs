@@ -438,10 +438,18 @@ pub(super) fn resolve_zone_encoded_fabric_redirect_by_id(
     zone_id: u16,
 ) -> Option<ForwardingResolution> {
     let mut resolution = resolve_fabric_redirect(forwarding)?;
-    if zone_id == 0 || zone_id > u8::MAX as u16 {
+    // #3075: the zone id is now a stable name-hash u16, so the synthetic fabric
+    // src MAC carries it in TWO bytes — high byte at [4], low byte at [5]
+    // (big-endian), where the old u8 scheme hardcoded [4]=0x00. The decode in
+    // frame/inspect.rs::parse_zone_encoded_fabric_ingress_from_frame and the
+    // skip-learn check in neighbor_dispatch.rs read the full u16 in lock-step.
+    // A reserved-range id is never produced by StableZoneID, so any id != 0 is
+    // a real configured zone.
+    if zone_id == 0 {
         return None;
     }
-    resolution.src_mac = Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, zone_id as u8]);
+    let [hi, lo] = zone_id.to_be_bytes();
+    resolution.src_mac = Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, hi, lo]);
     Some(resolution)
 }
 

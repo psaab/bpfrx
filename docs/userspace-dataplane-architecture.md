@@ -649,8 +649,11 @@ no zone context keeps the historical all-zones behaviour. The Go commit gate
 fails closed (`Unresolved` matches nothing).
 
 **Unknown-zone guard (#3110).** Zone id `0` is the reserved "unknown / no
-zone" sentinel — assigned to interfaces not bound to any security zone and to
-the over-cap-zone collapse-to-0 path (#2391). `evaluate_policy_result_with_len`
+zone" sentinel — assigned to interfaces not bound to any security zone. (The
+former #2391 over-cap collapse-to-0 path is retired: #3075 made zone ids a
+stable u16 name-hash and an interface naming an absent zone now fails the
+snapshot closed via `InterfaceUnknownZone` rather than collapsing to 0.)
+`evaluate_policy_result_with_len`
 evaluates zone-pair rules AND `junos-global` rules only when
 `from_id != 0 && to_id != 0`. A flow whose ingress OR egress zone is unknown
 does not belong to any *defined* zone pair, so it is ineligible for both
