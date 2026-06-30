@@ -327,6 +327,16 @@ func (er *EventReader) SetSyslogClients(clients []*SyslogClient) {
 	er.syslogMu.Unlock()
 }
 
+// SyslogClientCount reports how many syslog clients are currently installed
+// (goroutine-safe). Observability/testability only — lets a caller confirm a
+// teardown actually cleared the clients (e.g. a day-2 commit that removes all
+// streams must not leave lingering clients forwarding to a deleted receiver).
+func (er *EventReader) SyslogClientCount() int {
+	er.syslogMu.RLock()
+	defer er.syslogMu.RUnlock()
+	return len(er.syslogClients)
+}
+
 // SetLocalWriters replaces the set of local log writers (goroutine-safe).
 func (er *EventReader) SetLocalWriters(writers []*LocalLogWriter) {
 	er.localMu.Lock()

@@ -142,6 +142,17 @@ func NewSyslogClientWithSource(host string, port int, sourceAddr string) (*Syslo
 // NewSyslogClientTransport creates a syslog client with the specified transport
 // protocol ("udp", "tcp", or "tls"). For TLS, a *tls.Config is used; if nil,
 // system CA roots are used.
+//
+// A TCP/TLS receiver that is unreachable at construction (down at config-apply
+// or boot) does NOT fail the stream (#3351). The returned client is usable but
+// unconnected: the first Send sees conn==nil, treats it as a (non-timeout)
+// write failure, and the existing cooldown-gated reconnect path dials when the
+// receiver returns. The dial error is returned ALONGSIDE the non-nil client so
+// the caller can log the "unreachable at apply" condition; a caller that wants
+// the stream to recover MUST install the client even when err != nil (only a
+// nil client means the stream cannot be built — see UDP below). UDP has no live
+// peer to "connect" to, so a UDP dial failure is a genuine construction error
+// (unresolvable host / bad source bind) and still returns (nil, err).
 func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string, tlsCfg *tls.Config) (*SyslogClient, error) {
 	if protocol == "" {
 		protocol = "udp"
@@ -165,7 +176,21 @@ func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string
 
 	conn, err := c.dial()
 	if err != nil {
-		return nil, err
+		// UDP "dial" does not require a live peer; a failure here is an
+		// unrecoverable construction error (unresolvable host / bad source
+		// bind), so drop the stream as before.
+		if protocol == "udp" {
+			return nil, err
+		}
+		// #3351: a TCP/TLS receiver down at apply/boot must NOT permanently
+		// disable the stream. Hand back a usable, unconnected client so the
+		// cooldown-gated reconnect path (Send → writeMsg(conn==nil) →
+		// reconnect) brings it up when the receiver returns. Arm the cooldown
+		// clock so the first reconnect waits one cooldown window rather than
+		// dialing under s.mu on the very next event — exactly as reconnect()
+		// arms on a failed dial. Return the error too so the caller logs it.
+		c.lastReconnectFailure = c.now()
+		return c, err
 	}
 	c.conn = conn
 	return c, nil

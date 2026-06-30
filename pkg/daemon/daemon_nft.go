@@ -362,7 +362,7 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 		*rules = append(*rules, "    "+daddr+" accept")
 		return
 	}
-	matches := hostInboundMatchSet(v, family)
+	rulesSet := hostInboundMatchSet(v, family)
 	// Zero recognized service/protocol matches for this configured zone — a zone
 	// with NO `host-inbound-traffic` stanza (#3405 default-deny parity), an empty
 	// `host-inbound-traffic { }` stanza (#3200), or (on the tolerant load path) a
@@ -379,8 +379,17 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 	// management or break HA. The strict commit path rejects unknown tokens
 	// outright (validateHostInboundTokensStrict), so this zero-match branch is
 	// normally reachable only for a genuinely empty stanza.
-	for _, m := range matches {
-		*rules = append(*rules, "    "+daddr+" "+m+" accept")
+	// Each recognized service/protocol match is emitted with its per-token
+	// nft verdict. Almost every host-inbound token is a plain `accept`;
+	// `system-services ident-reset` is the lone exception (#3310): Junos
+	// ident-reset actively RESETS inbound ident (auth/TCP-113) probes rather
+	// than admitting them, so its rule carries `reject with tcp reset`. The
+	// reject rule is emitted here, BEFORE the catch-all drop below, so a fresh
+	// ident SYN (no `established` state) hits it; the leading
+	// `ct state established,related accept` and the global ND/ESP/ICMP accepts
+	// still precede it (a fresh probe is a SYN, so this is fine).
+	for _, m := range rulesSet {
+		*rules = append(*rules, "    "+daddr+" "+m.match+" "+m.action)
 	}
 	// Catch-all deny for anything else destined to this zone's addresses
 	// (Junos default-deny to the host is a silent drop). Attach a named counter
@@ -406,9 +415,46 @@ func hostInboundAllowsAll(v dpuserspace.ZoneHostInboundView) bool {
 	return false
 }
 
-// hostInboundMatchSet returns the de-duplicated nft match fragments (each a
-// match clause WITHOUT the leading daddr or trailing accept) admitted by the
-// zone's system-services + protocols for the given family ("ip" / "ip6").
+// hostInboundReject is the nft verdict for `system-services ident-reset`: a
+// TCP reset (RST) for inbound ident (auth/TCP-113) probes, not an admit (#3310).
+// nftables synthesizes an RFC-correct RST (RST|ACK with seq/ack reflecting the
+// inbound SYN) for the matched TCP packet, exactly Junos ident-reset semantics.
+// This is the only host-inbound token that emits a `reject` rather than
+// `accept`. Validated to parse on the appliance nft (v1.1.x) in an `inet`
+// filter input chain by TestHostInboundFilterIdentResetPayloadParses.
+const hostInboundReject = "reject with tcp reset"
+
+// hostInboundAccept is the default host-inbound verdict (admit the service to
+// the host stack). Every recognized system-service / protocol uses it except
+// ident-reset (see hostInboundServiceAction).
+const hostInboundAccept = "accept"
+
+// hostInboundRule pairs an nft match fragment (WITHOUT the leading daddr) with
+// the nft verdict to apply to it. Almost every host-inbound token is an
+// `accept`; ident-reset resets TCP/113 (#3310), so the verdict must travel with
+// the match rather than being a uniform trailing `accept`.
+type hostInboundRule struct {
+	match  string // nft match fragment, e.g. "tcp dport 22"
+	action string // nft verdict, e.g. "accept" or "reject with tcp reset"
+}
+
+// hostInboundServiceAction returns the nft verdict for a `system-services`
+// token. Junos `ident-reset` actively RESETS inbound ident (TCP/113) probes
+// rather than permitting the service (#3310), so it maps to
+// `reject with tcp reset`; every other recognized service is a plain admit.
+// Protocols (routing) are always admits, so they do not consult this.
+func hostInboundServiceAction(token string) string {
+	if token == "ident-reset" {
+		return hostInboundReject
+	}
+	return hostInboundAccept
+}
+
+// hostInboundMatchSet returns the de-duplicated nft match fragments — each
+// paired with its nft verdict (hostInboundRule) — admitted (or, for
+// ident-reset, reset) by the zone's system-services + protocols for the given
+// family ("ip" / "ip6"). The match clause carries NO leading daddr or trailing
+// verdict; emitHostInboundZone prepends the daddr and appends rule.action.
 //
 // This is the Go/nftables MIRROR of the Rust classifier in
 // userspace-dp/src/afxdp/forwarding/host_inbound.rs — keep the two token sets
@@ -420,24 +466,40 @@ func hostInboundAllowsAll(v dpuserspace.ZoneHostInboundView) bool {
 // classifier). Strict commit-time rejection of unknown tokens lands in
 // validateHostInboundTokensStrict (#3200), so a zero-match zone normally only
 // arises from a genuinely empty `host-inbound-traffic { }` stanza.
-func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []string {
-	var out []string
+//
+// #3310 note: ident-reset carries the `reject with tcp reset` verdict on the
+// kernel (primary) path. The Rust AF_XDP secondary path does NOT admit TCP/113
+// (host_inbound.rs ident-reset arm is a no-op for the admit set), so the rare
+// AF_XDP-reached ident packet is dropped there rather than reset — a documented
+// divergence (the AF_XDP path is reached only by DNAT/static-NAT-to-113, an
+// edge of an edge; the kernel chain carries ~100% of real ident probes). Both
+// layers stop the prior plain-admit of 113.
+func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []hostInboundRule {
+	var out []hostInboundRule
 	seen := map[string]bool{}
-	add := func(m string) {
-		if m == "" || seen[m] {
+	add := func(m, action string) {
+		if m == "" {
+			return
+		}
+		// Dedup on the match fragment: no two host-inbound tokens map to the
+		// same match with different verdicts (ident-reset's `tcp dport 113` is
+		// unique — pgm's proto-113 is `meta l4proto 113`, a different match), so
+		// match-keyed dedup cannot drop or shadow a reject rule.
+		if seen[m] {
 			return
 		}
 		seen[m] = true
-		out = append(out, m)
+		out = append(out, hostInboundRule{match: m, action: action})
 	}
 	for _, s := range v.SystemServices {
+		action := hostInboundServiceAction(s)
 		for _, m := range hostInboundServiceMatches(s, family) {
-			add(m)
+			add(m, action)
 		}
 	}
 	for _, p := range v.Protocols {
 		for _, m := range hostInboundProtocolMatches(p, family) {
-			add(m)
+			add(m, hostInboundAccept)
 		}
 	}
 	return out

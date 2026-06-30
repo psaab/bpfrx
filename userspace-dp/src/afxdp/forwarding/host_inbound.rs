@@ -157,9 +157,23 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         "finger" => {
             hi.tcp_ports.insert(79);
         }
-        "ident-reset" => {
-            hi.tcp_ports.insert(113);
-        }
+        // #3310: Junos `system-services ident-reset` does NOT permit the ident
+        // (auth/TCP-113) service — it actively RESETS inbound ident probes. The
+        // PRIMARY enforcement path for direct host-bound traffic to an interface
+        // IP / VRRP VIP is the kernel nft chain (the XDP shim shunts such
+        // traffic to the kernel before userspace-dp sees it), which emits a
+        // `reject with tcp reset` for TCP/113 (`hostInboundServiceAction`,
+        // pkg/daemon/daemon_nft.go). This AF_XDP local-delivery classifier is
+        // the SECONDARY edge-case path (reached only by DNAT/static-NAT-to-113,
+        // an edge of an edge). It must NOT admit 113 — so this arm contributes
+        // NOTHING to the admit set, and `admits()` returns false for TCP/113,
+        // dropping the rare AF_XDP-reached ident packet (a documented
+        // divergence from the kernel reset; strictly better than the prior plain
+        // admit). The explicit arm is kept (rather than falling into `_ => {}`)
+        // so the token stays recognized by the Go<->Rust parity test
+        // (config.TestHostInboundRustClassifierMatchesGoSSOT) and so a future
+        // secondary-path RST upgrade (plan Option A) has an obvious home.
+        "ident-reset" => {}
         "lsping" => {
             hi.udp_ports.insert(3503);
         }
@@ -555,6 +569,62 @@ mod tests {
         assert!(
             host_inbound_admits(&state, 999, TCP, 22, false, 0),
             "unknown/global zone (absent from table) keeps the admit default",
+        );
+    }
+
+    // #3310: `system-services ident-reset` must NOT admit TCP/113 on the AF_XDP
+    // secondary path — Junos ident-reset resets ident probes, it does not permit
+    // the service. The kernel nft chain emits the actual `reject with tcp reset`
+    // (primary path); this classifier just stops admitting 113 so the rare
+    // AF_XDP-reached ident packet (DNAT/static-NAT-to-113) is dropped. Co-declared
+    // services on the SAME zone (ssh/http) must still admit (no over-removal), and
+    // UDP/113 (not ident) is likewise not admitted. Fail-on-revert: restore
+    // `hi.tcp_ports.insert(113)` in the ident-reset classifier arm and the
+    // tcp/113-denied assertion flips RED.
+    #[test]
+    fn ident_reset_does_not_admit_113() {
+        const TCP: u8 = 6;
+        const UDP: u8 = 17;
+        const ZONE: u16 = 11;
+
+        let mut state = ForwardingState::default();
+        // A zone that declares ident-reset ALONGSIDE ssh + http (so the test
+        // proves ident-reset removes ONLY 113, not the co-declared services —
+        // ssh/http admit only from their own classifier arms).
+        state.zone_host_inbound.insert(
+            ZONE,
+            zone_host_inbound_from_tokens(
+                &[
+                    "ident-reset".to_string(),
+                    "ssh".to_string(),
+                    "http".to_string(),
+                ],
+                &[],
+            ),
+        );
+
+        // TCP/113 is NOT admitted (dropped on the secondary path), v4 and v6.
+        assert!(
+            !host_inbound_admits(&state, ZONE, TCP, 113, false, 0),
+            "ident-reset must NOT admit TCP/113 on v4 (#3310) — it resets, not permits",
+        );
+        assert!(
+            !host_inbound_admits(&state, ZONE, TCP, 113, true, 0),
+            "ident-reset must NOT admit TCP/113 on v6 (#3310)",
+        );
+        // UDP/113 (not ident) is not admitted either.
+        assert!(
+            !host_inbound_admits(&state, ZONE, UDP, 113, false, 0),
+            "UDP/113 must not be admitted (ident is TCP-only)",
+        );
+        // The co-declared services on the same zone still admit (no over-removal).
+        assert!(
+            host_inbound_admits(&state, ZONE, TCP, 22, false, 0),
+            "co-declared ssh (tcp/22) must still admit",
+        );
+        assert!(
+            host_inbound_admits(&state, ZONE, TCP, 80, false, 0),
+            "co-declared http (tcp/80) must still admit",
         );
     }
 

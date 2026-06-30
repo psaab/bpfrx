@@ -82,6 +82,14 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	er.ReplaceLocalWriters(nil)
 
 	if len(cfg.Security.Log.Streams) == 0 {
+		// Tear down any clients a prior config installed: a day-2 commit that
+		// removes ALL streams must not leave lingering clients forwarding to a
+		// deleted destination. This matches the event-mode (line ~65) and
+		// applySystemSyslog teardown paths, which already clear clients. It
+		// matters most after #3351: a down-at-apply TCP/TLS stream is now an
+		// installed RECONNECTING client, so without this it would resume
+		// sending audit logs to a removed receiver once that receiver recovers.
+		er.SetSyslogClients(nil)
 		d.applyAggregator(er, cfg)
 		return
 	}
@@ -112,9 +120,18 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		// here and lift that compiler reject.
 		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, srcAddr, protocol, nil)
 		if err != nil {
-			slog.Warn("failed to create syslog client",
+			if client == nil {
+				// UDP / unrecoverable construction error: skip the stream.
+				slog.Warn("failed to create syslog client",
+					"stream", name, "host", stream.Host, "protocol", protocol, "err", err)
+				continue
+			}
+			// #3351: a TCP/TLS receiver unreachable at apply returns a usable
+			// but unconnected client. Install it in this reconnecting state so
+			// audit logging resumes when the receiver comes back, instead of
+			// silently dropping the stream for the life of this config.
+			slog.Warn("syslog stream receiver unreachable at apply; installed in reconnecting state",
 				"stream", name, "host", stream.Host, "protocol", protocol, "err", err)
-			continue
 		}
 		if stream.Severity != "" {
 			client.MinSeverity = logging.ParseSeverity(stream.Severity)

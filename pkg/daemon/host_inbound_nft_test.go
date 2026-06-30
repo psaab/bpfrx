@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"errors"
+	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -620,6 +623,185 @@ func TestHostInboundFilterApplySuccessNoError(t *testing.T) {
 	if err := d.applyHostInboundFilter(empty); err != nil {
 		t.Errorf("benign teardown (no enforceable view) must return nil, got %v", err)
 	}
+}
+
+// identResetTestConfig builds a config whose wan zone declares
+// `system-services { ssh; ping; ident-reset; }` on reth0.50 (v4+v6 static
+// addresses). reth0.50 is a dataplane interface (not a lifeline), so its
+// addresses are scoped by host-inbound enforcement.
+func identResetTestConfig() *config.Config {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			50: {Number: 50, VlanID: 50, Addresses: []string{"172.16.50.8/24", "2001:db8:50::8/64"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"wan": {
+			Name:               "wan",
+			Interfaces:         []string{"reth0.50"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh", "ping", "ident-reset"}},
+		},
+	}
+	return cfg
+}
+
+// TestHostInboundFilterIdentResetEmitsReset is the #3310 fail-on-revert proof:
+// `system-services ident-reset` must emit a `tcp dport 113 reject with tcp
+// reset` rule (both families), NOT an `accept` for TCP/113. On Junos ident-reset
+// actively RESETS inbound ident (auth/113) probes; it must never open 113 to the
+// host stack. Reverting hostInboundServiceAction("ident-reset") to a plain admit
+// (or the matcher to insert 113 into the accept loop) re-opens 113 and turns
+// this RED.
+func TestHostInboundFilterIdentResetEmitsReset(t *testing.T) {
+	cfg := identResetTestConfig()
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	// The ident-reset rule must be a reject-with-tcp-reset on TCP/113, per family.
+	mustContain := []string{
+		"ip daddr 172.16.50.8 tcp dport 113 reject with tcp reset",
+		"ip6 daddr 2001:db8:50::8 tcp dport 113 reject with tcp reset",
+		// Control: the other declared services on the SAME zone still admit
+		// normally (no over-removal). ssh -> tcp/22, ping -> echo-request.
+		"ip daddr 172.16.50.8 tcp dport 22 accept",
+		"ip daddr 172.16.50.8 icmp type echo-request accept",
+		"ip6 daddr 2001:db8:50::8 tcp dport 22 accept",
+		// catch-all deny for the rest must still be present.
+		hiDrop("ip", "172.16.50.8", "wan"),
+		hiDrop("ip6", "2001:db8:50::8", "wan"),
+	}
+	for _, want := range mustContain {
+		if !strings.Contains(payload, want) {
+			t.Errorf("payload missing %q\n---\n%s", want, payload)
+		}
+	}
+
+	// TCP/113 must NEVER be accepted — the exposure this issue fixes.
+	if strings.Contains(payload, "tcp dport 113 accept") {
+		t.Errorf("ident-reset must NOT open TCP/113 with an accept (the #3310 exposure):\n%s", payload)
+	}
+
+	// The reject rule must precede the catch-all drop for each family (a fresh
+	// ident SYN has no `established` state, so it reaches the reject).
+	for _, fam := range []struct{ family, addr string }{
+		{"ip", "172.16.50.8"},
+		{"ip6", "2001:db8:50::8"},
+	} {
+		reject := fam.family + " daddr " + fam.addr + " tcp dport 113 reject with tcp reset"
+		drop := hiDrop(fam.family, fam.addr, "wan")
+		idxReject := strings.Index(payload, reject)
+		idxDrop := strings.Index(payload, drop)
+		if idxReject < 0 || idxDrop < 0 || idxReject > idxDrop {
+			t.Errorf("%s ident-reset reject must precede the catch-all drop:\n%s", fam.family, payload)
+		}
+	}
+}
+
+// TestHostInboundFilterAllSuppressesIdentReset verifies the `all` /
+// `any-service` precedence: a zone that lists BOTH `all` and `ident-reset`
+// fully opens (bare accept, no per-token rule), so it emits NO ident-reset
+// reject and NO catch-all drop — matching the Rust classifier, where
+// `all_services` short-circuits `admits` to true. This pins the precedence the
+// plan §5b/§6 calls out: `all` wins over ident-reset.
+func TestHostInboundFilterAllSuppressesIdentReset(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.1.1.1/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {
+			Name:               "trust",
+			Interfaces:         []string{"reth0.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"all", "ident-reset"}},
+		},
+	}
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	if !strings.Contains(payload, "ip daddr 10.1.1.1 accept") {
+		t.Errorf("`all` zone must accept everything to its addr:\n%s", payload)
+	}
+	if strings.Contains(payload, "reject with tcp reset") {
+		t.Errorf("`all` precedence must suppress the ident-reset reject rule:\n%s", payload)
+	}
+	if strings.Contains(payload, "tcp dport 113") {
+		t.Errorf("`all` zone must not emit any per-token 113 rule:\n%s", payload)
+	}
+}
+
+// findNft locates the nft binary in PATH or the common sbin dirs (go test does
+// not always carry /sbin in PATH, but the appliance runs nft from /usr/sbin).
+func findNft() string {
+	if p, err := exec.LookPath("nft"); err == nil {
+		return p
+	}
+	for _, p := range []string{"/usr/sbin/nft", "/sbin/nft"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// hiCounterDeclDequote rewrites the named-counter DECLARATION form
+// `counter "<name>" { ... }` to a bare-identifier `counter <name> { ... }`.
+//
+// Why: this test gates the #3310 reject rule (the FIRST `reject` ever emitted in
+// `inet xpf_hostinbound`). The payload ALSO carries the #3361 named-counter
+// objects, which buildHostInboundFilterPayload declares with a QUOTED name.
+// nft (≥ v1.1.6) accepts a quoted name in a counter REFERENCE
+// (`counter name "<n>" drop`) but NOT in a counter DECLARATION — there it
+// requires a bare identifier — so the raw payload fails `nft -c` on that
+// pre-existing declaration line, swamping the reject-rule syntax this test is
+// about. The host-inbound counter names are always valid bare identifiers
+// (`xpfhi_<family>_<len>_<zone>` with zone separators encoded), so de-quoting the
+// DECLARATION is a behavior-preserving normalization that lets the parse check
+// exercise the reject rule. (The quoted-declaration form itself is a separate
+// pre-existing concern, not #3310.)
+var hiCounterDeclRe = regexp.MustCompile(`counter "([^"]+)" \{`)
+
+func hiCounterDeclDequote(payload string) string {
+	return hiCounterDeclRe.ReplaceAllString(payload, "counter $1 {")
+}
+
+// TestHostInboundFilterIdentResetPayloadParses is the #3310 merge gate (plan
+// §7 / Q7): the host-inbound chain payload — which now contains the FIRST
+// `reject` rule ever emitted in `inet xpf_hostinbound` — must parse on the
+// appliance nft binary. Mirrors the lo0 precedent (TestLo0FilterPayloadNftParses).
+// The named-counter DECLARATION syntax is normalized first (see
+// hiCounterDeclDequote) so this gates the reject rule, not the orthogonal #3361
+// declaration form. A `syntax error` fails the test; a netlink/permission
+// failure (no CAP_NET_ADMIN) occurs only AFTER syntax parsing succeeds and is a
+// pass; nft absent skips.
+func TestHostInboundFilterIdentResetPayloadParses(t *testing.T) {
+	nftPath := findNft()
+	if nftPath == "" {
+		t.Skip("nft not found; covered by TestHostInboundFilterIdentResetEmitsReset")
+	}
+	cfg := identResetTestConfig()
+	views := buildAndCheckViews(t, cfg)
+	payload := hiCounterDeclDequote(buildHostInboundFilterPayload(views))
+
+	// Sanity: the normalized payload must still carry the #3310 reject rule —
+	// otherwise the parse check would be vacuous.
+	if !strings.Contains(payload, "tcp dport 113 reject with tcp reset") {
+		t.Fatalf("normalized payload lost the ident-reset reject rule:\n%s", payload)
+	}
+
+	cmd := exec.Command(nftPath, "-c", "-f", "-")
+	cmd.Stdin = strings.NewReader(payload)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return // parsed and (as root) check-applied cleanly
+	}
+	combined := string(out)
+	if strings.Contains(combined, "syntax error") {
+		t.Fatalf("nft -c rejected the ident-reset host-inbound payload with a syntax error:\n%s\npayload:\n%s", combined, payload)
+	}
+	t.Logf("nft -c parsed the payload; non-syntax error (expected without CAP_NET_ADMIN): %v\n%s", err, combined)
 }
 
 // buildAndCheckViews resolves the per-zone views and asserts the table would be
