@@ -122,9 +122,9 @@ func (c *CLI) showFirewallFilters() error {
 				fmt.Printf("    then %s\n", action)
 
 				// Sum counters across all expanded BPF rules for this term.
-				// Must match the cross-product in expandFilterTerm:
-				// nSrc * nDst * nDstPorts * nSrcPorts
-				numRules := filterTermExpansionCount(cfg, term)
+				// Stride comes from the shared SSOT (#3459) so CLI, gRPC, and
+				// Prometheus agree with the compiler's expandFilterTerm layout.
+				numRules := config.FilterTermExpansionCount(term, cfg.PolicyOptions.PrefixLists)
 				var totalPkts, totalBytes uint64
 				if hasCounters {
 					for i := uint32(0); i < numRules; i++ {
@@ -304,7 +304,7 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 		fmt.Printf("    then %s\n", action)
 
 		// Sum counters across all expanded BPF rules for this term
-		numRules := filterTermExpansionCount(cfg, term)
+		numRules := config.FilterTermExpansionCount(term, cfg.PolicyOptions.PrefixLists)
 		var totalPkts, totalBytes uint64
 		if hasCounters {
 			for i := uint32(0); i < numRules; i++ {
@@ -333,38 +333,4 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 		fmt.Printf("warning: filter counter read failed (hit counts may be incomplete): %v\n", readErr)
 	}
 	return nil
-}
-
-func filterTermExpansionCount(cfg *config.Config, term *config.FirewallFilterTerm) uint32 {
-	nSrc := len(term.SourceAddresses)
-	for _, ref := range term.SourcePrefixLists {
-		if !ref.Except {
-			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-				nSrc += len(pl.Prefixes)
-			}
-		}
-	}
-	if nSrc == 0 {
-		nSrc = 1
-	}
-	nDst := len(term.DestAddresses)
-	for _, ref := range term.DestPrefixLists {
-		if !ref.Except {
-			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-				nDst += len(pl.Prefixes)
-			}
-		}
-	}
-	if nDst == 0 {
-		nDst = 1
-	}
-	nDstPorts := len(term.DestinationPorts)
-	if nDstPorts == 0 {
-		nDstPorts = 1
-	}
-	nSrcPorts := len(term.SourcePorts)
-	if nSrcPorts == 0 {
-		nSrcPorts = 1
-	}
-	return uint32(nSrc * nDst * nDstPorts * nSrcPorts)
 }
