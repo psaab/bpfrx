@@ -1,3 +1,25 @@
+## 2026-07-01 — #3697 stale Rust host-inbound hot-path comments (default-deny drift; M06/L07)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3697 — three Rust userspace-dp host-inbound comments still
+    described the pre-#3405 semantics where a configured zone with no
+    `host-inbound-traffic` stanza is left absent from the snapshot and admits
+    all host-bound traffic. Post-#3405/#3653 the Go control plane sends
+    HostInboundConfigured=true for EVERY configured zone (security.go:70,
+    zones.go:448); a no-stanza zone ships an EMPTY token set = default-DENY, so
+    the absent -> admit-all branch now only applies to a zone not present in the
+    snapshot at all (legacy / truly-unconfigured). Corrected the three comments
+    to describe the #3405 default-deny reality (present-empty-set = deny vs
+    absent-entry = legacy admit-all), noted the lifeline-interface exemption
+    (fxp0/em0/fab*, #3682), and added a one-line pointer to the SSOT doc
+    docs/host-inbound-service-matrix.md (folds codex-review-128 L07). COMMENT-
+    ONLY: no logic change (verified via `git diff` — every added and removed
+    line is a comment). Validated with `cargo build --release` (clean, only
+    pre-existing warnings).
+  - **File(s)**: userspace-dp/src/afxdp/forwarding_build/zones.rs (comment),
+    userspace-dp/src/afxdp/types/forwarding.rs (comment),
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs (comment).
+
 ## 2026-07-01 — #3670 synthetic default-policy inventory row omits log state (H06)
 
 - **Timestamp**: 2026-07-01

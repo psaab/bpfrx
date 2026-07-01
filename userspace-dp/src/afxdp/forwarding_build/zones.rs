@@ -42,9 +42,19 @@ pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingSt
         // out-of-range guard.
         // zone_name_to_id is populated above by the shared SSOT helper.
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
-        // #3070: build the host-inbound admission set for zones that declared a
-        // `host-inbound-traffic` stanza, keyed by the SAME validated id. Zones
-        // without a stanza are left absent → admit-all (pre-#3070 behaviour).
+        // #3070/#3405: build the host-inbound admission set keyed by the SAME
+        // validated id for every zone whose snapshot carries
+        // `host_inbound_configured`. Post-#3405 the Go control plane sends
+        // HostInboundConfigured=true for EVERY configured zone (security.go:70,
+        // zones.go:448), so a configured zone with NO `host-inbound-traffic`
+        // stanza is NOT left absent — it ships an EMPTY token set that inserts a
+        // default-`ZoneHostInbound` here (`admits()` -> false for every
+        // service/protocol => default-DENY, Junos parity). The absent-entry
+        // branch (`host_inbound_configured == false`) now only fires for a zone
+        // that is not in the snapshot at all (legacy / truly-unconfigured), for
+        // which the hot path keeps the pre-#3070 admit-all. Lifeline interfaces
+        // (fxp0/em0/fab*) are exempt because they never reach the AF_XDP
+        // local-delivery classifier (#3682). SSOT: docs/host-inbound-service-matrix.md.
         if zone.host_inbound_configured {
             state
                 .zone_host_inbound

@@ -197,12 +197,20 @@ pub(in crate::afxdp) struct ForwardingState {
         std::sync::Arc<crate::afxdp::cold_path_hist::ColdPathSlotMap>,
 }
 
-/// #3070: a zone's compiled host-inbound-traffic admission set. Built from the
-/// raw Junos `system-services` / `protocols` tokens on the wire
+/// #3070/#3405: a zone's compiled host-inbound-traffic admission set. Built from
+/// the raw Junos `system-services` / `protocols` tokens on the wire
 /// (`ZoneSnapshot`) at config-apply time (`zone_host_inbound_from_snapshot`),
-/// then read on the per-packet local-delivery admit path. A `ForwardingState`
-/// only holds a `ZoneHostInbound` for zones that declared a stanza; an absent
-/// entry means admit-all (the pre-#3070 behaviour) for that zone.
+/// then read on the per-packet local-delivery admit path. At the map level an
+/// absent `ZoneHostInbound` still means admit-all (the pre-#3070 behaviour) for
+/// that zone id — but that no longer describes a configured no-stanza zone.
+/// Post-#3405 the Go control plane sends HostInboundConfigured=true for EVERY
+/// configured zone (security.go:70, zones.go:448), so a zone with NO
+/// `host-inbound-traffic` stanza produces a PRESENT entry with an EMPTY token
+/// set (`admits()` -> false for every service/protocol => default-DENY, Junos
+/// parity). The absent-entry admit-all branch therefore now applies only to a
+/// zone not present in the snapshot at all (legacy / truly-unconfigured).
+/// Lifeline interfaces (fxp0/em0/fab*) never reach this classifier (#3682).
+/// SSOT for the token semantics: docs/host-inbound-service-matrix.md.
 ///
 /// Service tokens are classified to L4 signatures: TCP/UDP services contribute
 /// destination ports; ICMP-bearing services (ping, router-discovery) contribute
