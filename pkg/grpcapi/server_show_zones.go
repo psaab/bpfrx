@@ -119,6 +119,13 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	// automation can join a policy_id back to a rule. The raw ordinal stays the
 	// counter handle below.
 	runtimeIDs := dpuserspace.RuntimePolicyIDs(cfg)
+	// #3624: live per-scheduler active-state, the same view the #3062 text
+	// policy-detail surface uses (server_show_policies_text.go). haveSched
+	// gates the lookup: when the provider is unavailable (early boot /
+	// NoDataplane) the inventory reports every rule active (inactive=false),
+	// matching the text surface's fail-open display rather than the
+	// fail-closed match-policies simulator (#3414).
+	schedActive, haveSched := s.policySchedulerActiveState()
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
 		// #3476: skip a nil zone-pair set (tolerant / HA-sync path) while
@@ -164,6 +171,10 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				// the join key survives even at 0.
 				PolicyId: proto.Uint32(dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i))),
 				RuleId:   dpuserspace.StablePolicyRuleID(zpp.FromZone, zpp.ToZone, rule.Name),
+				// #3624: scheduler binding + runtime scheduler state, mirroring
+				// the #3062 text detail (State: inactive, Scheduler: <name>).
+				SchedulerName: rule.SchedulerName,
+				Inactive:      haveSched && dpuserspace.PolicyInactive(rule.SchedulerName, schedActive),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}
@@ -233,6 +244,9 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				// #3623: proto3 explicit presence for the runtime id (see above).
 				PolicyId: proto.Uint32(dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i))),
 				RuleId:   dpuserspace.StablePolicyRuleID("junos-global", "junos-global", rule.Name),
+				// #3624: scheduler binding + runtime scheduler state (see above).
+				SchedulerName: rule.SchedulerName,
+				Inactive:      haveSched && dpuserspace.PolicyInactive(rule.SchedulerName, schedActive),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}

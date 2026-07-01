@@ -60,7 +60,23 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     it, so a consumer joining an RT_FLOW event (`policy_id=0`) to the
     inventory found no row for the highest-priority rule. The gRPC
     `PolicyRule.policy_id` mirror is `optional uint32` (proto3 explicit
-    presence) for the same reason.
+    presence) for the same reason. Each rule also carries `scheduler_name`
+    and `inactive` (#3624) — the structured sibling of the #3062 TEXT
+    policy-detail surface (`State: inactive` + `Scheduler:` lines).
+    `scheduler_name` is the policy's configured `scheduler-name` (empty /
+    omitted for an always-on rule); `inactive` is true when the policy is
+    bound to a scheduler that is currently runtime-inactive — the dataplane
+    is skipping the rule right now. Both are populated for zone-pair AND
+    global policies from the same live-state provider the text surface uses
+    (`Server.policySchedActiveFn` / gRPC `policySchedulerActiveState`), and
+    like that surface they FAIL OPEN on the display: when live scheduler
+    state cannot be queried (accessor not wired, early boot, NoDataplane)
+    `inactive` stays false, so the output is unchanged for existing
+    consumers — this differs deliberately from the `match-policies`
+    simulator, which fails CLOSED (#3414). Without these an audit read a
+    time-gated, currently-dormant permit/deny as an active allow/deny, so
+    the structured API disagreed with effective dataplane behavior. The
+    gRPC mirror is `PolicyRule.scheduler_name` (19) / `inactive` (20).
   - `GET /api/v1/security/zones` enumerates security zones (`ZoneInfo`,
     types.go). The host-inbound admission set is surfaced distinctly
     (#3328): `host_inbound_configured` is the dataplane posture bit

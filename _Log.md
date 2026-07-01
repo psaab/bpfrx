@@ -1,3 +1,42 @@
+## 2026-07-01 — #3624 structured policy inventory exposes scheduler_name + inactive
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3624 — the structured policy inventory (REST
+    `PolicyInfo`/`PolicyRule`, gRPC `GetPolicies` `PolicyRule`) omitted a
+    policy's scheduler binding (`scheduler-name`) and its runtime scheduler
+    state. #3062 exposed both only on the human-readable TEXT policy-detail
+    surface (`State: inactive` + `Scheduler:` lines via
+    `policyDetailState` / `policyDetailStateSuffix`), so a structured audit
+    client displayed a time-gated, currently-dormant permit/deny as an
+    active allow/deny — the structured API disagreed with effective
+    dataplane behavior. FIX: added additive fields `scheduler_name` +
+    `inactive` to REST `PolicyRule` (JSON, both `omitempty`) and gRPC
+    `PolicyRule` (proto3 fields 19/20, regenerated with pinned
+    protoc-gen-go v1.36.11 + protoc-gen-go-grpc v1.6.1, no version bump).
+    Populated for zone-pair AND global policies from the EXISTING #3062
+    provider: `SchedulerName = rule.SchedulerName`;
+    `Inactive = haveSched && dpuserspace.PolicyInactive(rule.SchedulerName,
+    schedActive)` where the live state comes from
+    `Server.policySchedActiveFn` (REST) / `Server.policySchedulerActiveState`
+    (gRPC). Mirrors the text surface's FAIL-OPEN display: when live state
+    is unavailable, `inactive` stays false (unlike the fail-closed
+    match-policies simulator, #3414), keeping output bit-identical for
+    existing consumers. RED-on-revert tests (L10 gap): REST
+    `TestPoliciesHandlerExposesSchedulerBindingAndInactiveState` + gRPC
+    `TestGRPCGetPoliciesExposesSchedulerBindingAndInactiveState`, each with
+    inactive / active / state-unavailable subtests over zone-pair + global +
+    plain rules (plus REST omitempty-contract checks); blanking the
+    population makes `scheduler_name`/`inactive` go RED on both surfaces.
+    Validation: `go test ./pkg/api ./pkg/grpcapi ./pkg/config` green;
+    `go build ./pkg/... ./cmd/...`, gofmt, go vet (scoped) clean. Doc:
+    pkg/api/README.md policies bullet.
+  - **File(s)**: proto/xpf/v1/xpf.proto,
+    pkg/grpcapi/xpfv1/xpf.pb.go, pkg/api/types.go, pkg/api/security.go,
+    pkg/grpcapi/server_show_zones.go,
+    pkg/api/security_policy_scheduler_inventory_3624_test.go,
+    pkg/grpcapi/server_show_zones_scheduler_inventory_3624_test.go,
+    pkg/api/README.md, _Log.md
+
 ## 2026-07-01 — #3625 snapshot summary policy_count counts RULES, not zone-pair sets
 
 - **Timestamp**: 2026-07-01
