@@ -190,6 +190,13 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	// error, distinguishing key-absent from key-empty (M01). An entirely empty
 	// param string (bare `test-policy:`) still falls through to the
 	// missing-from/to-zone diagnostic below rather than reading as malformed.
+	// #3709: reject a DUPLICATE selector key (e.g. `from=trust,from=dmz`). The
+	// switch below re-assigns fromZone/dstPort/... on a repeated key, silently
+	// LAST-WINning, so the gRPC-text simulator answered for a DIFFERENT packet
+	// than the operator typed — and it disagreed with REST (first-win) on WHICH
+	// value survived. There is no correct silent pick, so a repeat is a reported
+	// error, matching the strict CLI parser (policymatch.ParseSelectorArgs).
+	seen := make(map[string]bool)
 	if params != "" {
 		for _, kv := range strings.Split(params, ",") {
 			parts := strings.SplitN(kv, "=", 2)
@@ -199,6 +206,17 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 				}
 				continue
 			}
+			if seen[parts[0]] {
+				// A duplicate KNOWN key last-wins below; a duplicate UNKNOWN key
+				// already recorded an "unknown selector" error on its first
+				// occurrence (parseErr is set-once), so this only overrides when
+				// no earlier grammar error was captured.
+				if parseErr == nil {
+					parseErr = fmt.Errorf("selector %q specified more than once", parts[0])
+				}
+				continue
+			}
+			seen[parts[0]] = true
 			switch parts[0] {
 			case "from":
 				fromZone = parts[1]

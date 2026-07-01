@@ -1,3 +1,47 @@
+## 2026-07-01 — #3709 policy-simulator rejects DUPLICATE selectors (consistent fail-closed across CLI/gRPC/REST) + comma-in-zone round-trip
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3696 hardened the policy-match simulator against missing /
+    empty / unknown / malformed selectors but NONE of the surfaces rejected a
+    DUPLICATE selector. A copy/paste vector (`from-zone trust from-zone dmz`,
+    `source-port 80 source-port 443`) was accepted and one value silently won,
+    so the simulator certified an allow/deny verdict for a DIFFERENT packet than
+    the operator typed — and the surfaces disagreed on WHICH value won (CLI +
+    gRPC text topic last-win, REST first-win). FIX (fail-closed on ambiguity,
+    matching #3696):
+    1. `policymatch.ParseSelectorArgs` — a `seen` set in the shared `takeValue`
+       helper (every selector is value-taking and routes through it exactly
+       once) errors `selector %q specified more than once`. Covers all four CLI
+       surfaces (local + remote `show security match-policies` / `test policy`).
+    2. gRPC `showTestPolicy` (`server_show_firewall.go`) — a seen-key guard in
+       the comma/equals `key=value` loop reports the duplicate as a diagnostic
+       (set-once parseErr preserves an earlier unknown-selector error).
+    3. REST `matchPoliciesHandler` (`pkg/api/security.go`) — a `len(q[key]) > 1`
+       guard over the scalar selector keys returns HTTP 400 (r.URL.Query().Get
+       otherwise silently first-wins).
+    Also (H05/M05/M06) the comma-in-zone-name round-trip: config permits a zone
+    name with a comma/equals but the legacy `test-policy:` text topic cannot
+    carry it, so the REMOTE `test policy` (`cmd/cli/main.go`) now rejects an
+    un-round-trippable zone with a clear error pointing at `show security
+    match-policies` (typed RPC, no delimiter fragility) instead of silently
+    corrupting the query. Also (H06 no-config ordering) REST now validates
+    request grammar BEFORE the `cfg == nil` fail-closed verdict, so a malformed
+    boot-window query returns 400 consistently (was 200 pre-config, 400 post).
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/grpcapi/server_show_firewall.go, pkg/api/security.go, cmd/cli/main.go,
+    docs/junos-cli-reference.md,
+    pkg/policymatch/selector_args_dup_3709_test.go (new),
+    pkg/cli/policymatch_dup_3709_test.go (new),
+    cmd/cli/policymatch_dup_3709_test.go (new),
+    pkg/grpcapi/server_testpolicy_dup_3709_test.go (new),
+    pkg/api/security_matchpolicies_dup_3709_test.go (new), _Log.md
+  - **Validation**: `go test ./pkg/policymatch/... ./pkg/cli/... ./cmd/cli/...
+    ./pkg/grpcapi/... ./pkg/api/...` green; `go build ./...`, gofmt, go vet
+    clean. RED-on-revert proven per guard: neutralizing the parser guard flips
+    the policymatch + pkg/cli + cmd/cli duplicate tests red; the comma-zone
+    guard, the gRPC seen-key guard, the REST duplicate guard, and the REST
+    no-config ordering each flip their surface test red and restore green.
+
 ## 2026-07-01 — #3704 review fold: CLI reloadSyslog zone-map was still positional (4th reverse-map)
 
 - **Timestamp**: 2026-07-01
