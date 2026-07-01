@@ -74,11 +74,15 @@ impl super::Coordinator {
     /// `build_reconcile_forwarding`): build the new forwarding state
     /// FIRST; only AFTER the build succeeds do we bump `self.validation`,
     /// rotate the neighbor-manager keys, swap the forwarding table, and
-    /// publish to the worker-visible Arcs. On ANY integrity error nothing
-    /// is mutated and the error is returned to the control-plane handler,
-    /// which reports `ok=false` and does NOT persist the snapshot — the
-    /// prior good state stays live and consistent (no split-brain, no
-    /// neighbor blackhole).
+    /// publish to the worker-visible Arcs. On ANY integrity error no
+    /// forwarding / validation / worker-visible state is mutated (a LATE
+    /// build failure — NAT64/NPTv6/filter — may leave orphaned
+    /// policy/nat-counter registrations, identical to the full-reconcile
+    /// path: benign, the live policy still references the old counters and
+    /// they self-heal on the next successful apply) and the error is
+    /// returned to the control-plane handler, which reports `ok=false` and
+    /// does NOT persist the snapshot — the prior good state stays live and
+    /// consistent (no split-brain, no neighbor blackhole).
     fn refresh_runtime_snapshot_inner(
         &mut self,
         snapshot: &crate::ConfigSnapshot,
