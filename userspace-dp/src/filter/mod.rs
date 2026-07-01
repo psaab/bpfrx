@@ -48,6 +48,16 @@ pub(crate) enum FilterAction {
     ///
     /// Callers that cannot synthesize the reject packet must fail closed as a
     /// silent drop and must not log that an ICMP/RST reject was generated.
+    ///
+    /// #3615: this contract is enforced at the RT_FLOW / filter-log emit sites.
+    /// The reject reply is enqueued FIRST (`poll_descriptor::filter_terminal` /
+    /// the input-filter reorder), and its ACTUAL outcome is threaded into
+    /// `emit_filter_log_event`. When the reply fail-closes (TX-frame budget,
+    /// reject token bucket empty, unparseable built frame, or an egress
+    /// output-filter drop of the reflected reply) the logged RT_FLOW action is
+    /// downgraded REJECT→DENY, so the event never claims an active reject that
+    /// was not sent. Reply-free paths (flowless fragments, the PBR/output-filter
+    /// forward path, cached-log replay) pass `reject_reply_enqueued = false`.
     Reject,
 }
 

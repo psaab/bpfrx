@@ -79,6 +79,8 @@
     "exception_packets": 0,
     "fabric_redirect_unsendable_drops": 0,
     "fib_gen_mismatches": 0,
+    "filter_reject_output_filter_drops": 0,
+    "filter_reject_reply_budget_drops": 0,
     "filter_reject_sent": 0,
     "flow_cache_capacity": 0,
     "flow_cache_collision_evictions": 0,

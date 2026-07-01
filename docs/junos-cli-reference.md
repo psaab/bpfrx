@@ -288,6 +288,20 @@ From zone: guest, To zone: lan
   policy-deny RT_FLOW + `reject`/zone-`tcp-rst` reply as a transit deny) and
   tears down any cached host-local session on the next hit. Hit counters for
   these rules now advance.
+  - **Reject-event truthfulness (#3615):** the policy/filter-log RT_FLOW
+    record reports `action reject` ONLY when the RST/ICMP-unreachable reply was
+    actually enqueued. If the generated reply fail-closes after the action is
+    decided (TX-frame budget exhausted, reject rate-limit bucket empty, an
+    unparseable built frame, or an egress output-filter that discards the
+    reflected reply), the packet is a silent drop and the event reports the
+    truthful `action deny` — the forensic log never claims an active reject
+    that was not sent. Reply-free deny paths (non-first fragments with no L4
+    header, the forward/output-filter path that has no reply synthesis pending
+    #3608) log `deny` for the same reason. Suppression is counted per source in
+    `show ... status`: `policy_reject`/`filter_reject` under the
+    `Generated-reply drops` line distinguish a policy `then reject` from a
+    firewall-filter `then reject` that was dropped by budget or an output
+    filter.
   - **Default-deny posture (#3405):** EVERY configured security zone denies
     host-bound traffic by default (Junos/vSRX parity). A zone with interfaces
     but NO `host-inbound-traffic` stanza is treated exactly like an empty

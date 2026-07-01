@@ -149,6 +149,9 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	// #2238: locally-generated reply output-classification drops.
 	var timeExceededOutputFilterDrops uint64
 	var policyRejectOutputFilterDrops uint64
+	// #3615 (L05): filter-`reject` output-filter drops, split from the policy
+	// leg so filter-reject troubleshooting is precise.
+	var filterRejectOutputFilterDrops uint64
 	var synCookieOutputFilterDrops uint64
 	var ptbOutputFilterDrops uint64
 	var generatedReplyClassifyParseErrors uint64
@@ -247,6 +250,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		synCookieBypass += binding.SYNCookieBypass
 		timeExceededOutputFilterDrops += binding.TimeExceededOutputFilterDrops
 		policyRejectOutputFilterDrops += binding.PolicyRejectOutputFilterDrops
+		filterRejectOutputFilterDrops += binding.FilterRejectOutputFilterDrops
 		synCookieOutputFilterDrops += binding.SYNCookieOutputFilterDrops
 		ptbOutputFilterDrops += binding.PTBOutputFilterDrops
 		generatedReplyClassifyParseErrors += binding.GeneratedReplyClassifyParseErrors
@@ -463,10 +467,15 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	// parse-error drops when any are non-zero (operator-installed output
 	// filters suppressing a generated control frame, RFC-1812 style).
 	if timeExceededOutputFilterDrops != 0 || policyRejectOutputFilterDrops != 0 ||
+		filterRejectOutputFilterDrops != 0 ||
 		synCookieOutputFilterDrops != 0 || ptbOutputFilterDrops != 0 ||
 		generatedReplyClassifyParseErrors != 0 {
-		fmt.Fprintf(&b, "  Generated-reply drops:     time_exceeded=%d policy_reject=%d syn_cookie=%d ptb=%d classify_parse_errors=%d\n",
+		// #3615 (L05): policy_reject and filter_reject output-filter drops are
+		// reported separately so a firewall-filter `then reject` suppressed by
+		// an egress output filter is not conflated with a policy reject.
+		fmt.Fprintf(&b, "  Generated-reply drops:     time_exceeded=%d policy_reject=%d filter_reject=%d syn_cookie=%d ptb=%d classify_parse_errors=%d\n",
 			timeExceededOutputFilterDrops, policyRejectOutputFilterDrops,
+			filterRejectOutputFilterDrops,
 			synCookieOutputFilterDrops, ptbOutputFilterDrops, generatedReplyClassifyParseErrors)
 	}
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)

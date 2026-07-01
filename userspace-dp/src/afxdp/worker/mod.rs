@@ -1369,14 +1369,24 @@ pub(crate) struct BindingLiveSnapshot {
     /// #2521: firewall-filter `then reject` RST/ICMP-unreachable replies
     /// enqueued. Mirrors `policy_reject_sent`.
     pub(crate) filter_reject_sent: u64,
-    /// #2089: policy-`reject` replies suppressed by TX-frame budget (shared
-    /// with filter reject, #2521).
+    /// #2089: POLICY-`reject` replies suppressed by TX-frame budget. #3615
+    /// (L04): filter-source suppression is now counted separately in
+    /// `filter_reject_reply_budget_drops` so this is policy-reject-only.
     pub(crate) policy_reject_reply_budget_drops: u64,
+    /// #3615 (L04): FILTER-`reject` replies suppressed by TX-frame budget —
+    /// the source-split sibling of `policy_reject_reply_budget_drops`.
+    pub(crate) filter_reject_reply_budget_drops: u64,
     /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
     /// (terminal discard/reject or three-color policer) on the egress
     /// interface, classified by the reply's OWN egress tuple. Per-leg.
     pub(crate) time_exceeded_output_filter_drops: u64,
+    /// #2238/#3615 (L05): POLICY-`reject` replies dropped by an egress output
+    /// filter. Filter-source suppression is now in
+    /// `filter_reject_output_filter_drops` (policy-reject-only here).
     pub(crate) policy_reject_output_filter_drops: u64,
+    /// #3615 (L05): FILTER-`reject` replies dropped by an egress output filter
+    /// — the source-split sibling of `policy_reject_output_filter_drops`.
+    pub(crate) filter_reject_output_filter_drops: u64,
     pub(crate) syn_cookie_output_filter_drops: u64,
     /// #2328: locally-generated egress-MTU PTB / Frag-Needed replies (the
     /// #2301 PMTUD path) dropped by an OUTPUT firewall filter terminal

@@ -516,6 +516,10 @@ pub(in crate::afxdp) struct BatchCounters {
     // synthesis + #2238 output-classification path.
     filter_reject_sent: u64,
     policy_reject_reply_budget_drops: u64,
+    // #3615 (L04): FILTER-`reject` reply TX-frame-budget suppression, split
+    // from `policy_reject_reply_budget_drops` so filter-reject troubleshooting
+    // is precise (both still share the same budget gate).
+    filter_reject_reply_budget_drops: u64,
     // #2238: locally-generated reply output-classification drops. A reply
     // (Time Exceeded, policy-reject RST/ICMP-unreachable, SYN-cookie
     // SYN-ACK/ACK-RST) is now classified by its OWN egress 5-tuple +
@@ -527,6 +531,9 @@ pub(in crate::afxdp) struct BatchCounters {
     // (§6.2) — a builder/parser logic bug, never silent.
     time_exceeded_output_filter_drops: u64,
     policy_reject_output_filter_drops: u64,
+    // #3615 (L05): FILTER-`reject` reply egress-output-filter suppression,
+    // split from `policy_reject_output_filter_drops`.
+    filter_reject_output_filter_drops: u64,
     syn_cookie_output_filter_drops: u64,
     // #2328: egress-MTU PTB / Frag-Needed (the #2301 PMTUD generator) is now
     // classified by its OWN egress tuple like the siblings above, so an
@@ -704,6 +711,11 @@ impl BatchCounters {
                 .fetch_add(self.policy_reject_reply_budget_drops, Ordering::Relaxed);
             self.policy_reject_reply_budget_drops = 0;
         }
+        if self.filter_reject_reply_budget_drops != 0 {
+            live.filter_reject_reply_budget_drops
+                .fetch_add(self.filter_reject_reply_budget_drops, Ordering::Relaxed);
+            self.filter_reject_reply_budget_drops = 0;
+        }
         if self.time_exceeded_output_filter_drops != 0 {
             live.time_exceeded_output_filter_drops
                 .fetch_add(self.time_exceeded_output_filter_drops, Ordering::Relaxed);
@@ -713,6 +725,11 @@ impl BatchCounters {
             live.policy_reject_output_filter_drops
                 .fetch_add(self.policy_reject_output_filter_drops, Ordering::Relaxed);
             self.policy_reject_output_filter_drops = 0;
+        }
+        if self.filter_reject_output_filter_drops != 0 {
+            live.filter_reject_output_filter_drops
+                .fetch_add(self.filter_reject_output_filter_drops, Ordering::Relaxed);
+            self.filter_reject_output_filter_drops = 0;
         }
         if self.syn_cookie_output_filter_drops != 0 {
             live.syn_cookie_output_filter_drops

@@ -1285,6 +1285,10 @@ pub(super) fn ingress_route_table_override(
             FilterLogSource::Pbr,
             // #2520: AppID via the hot-path app_catalog.lookup.
             resolve_flow_app_id(&forwarding.app_catalog, flow),
+            // #3615: the PBR (routing-instance) filter path synthesizes NO
+            // reject reply, so a `then reject` term logs the truthful DENY
+            // (silent drop) rather than claiming an active reject was sent.
+            false,
             now_ns,
         );
     }
