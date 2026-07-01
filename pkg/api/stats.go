@@ -6,12 +6,55 @@ import (
 	"sort"
 
 	"github.com/psaab/xpf/pkg/dataplane"
-	"github.com/psaab/xpf/pkg/nftables"
 )
 
 func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
+	var stats GlobalStats
+
+	// #3681 (H04/H05/L03): the kernel nftables host-inbound DROP counters are
+	// the PRIMARY host-inbound enforcement signal (distinct from the userspace-dp
+	// HostInboundDeny below — not a double count). The `inet xpf_hostinbound`
+	// chain is installed by the daemon INDEPENDENT of dataplane load state and
+	// keeps dropping control-plane traffic in a config-only / degraded boot, so
+	// read it BEFORE the dataplane gate — matching the Prometheus collector
+	// (collectHostInboundKernelDenies runs before its dataplane gate). Otherwise
+	// REST automation loses the host-inbound signal exactly when management-plane
+	// exposure matters most. `readHostInboundDenyCounters` is the same
+	// package-var indirection the collector uses, so this path is unit-testable
+	// without a live kernel.
+	//
+	// #3681 (H05): mirror the #3345 "counter unavailable != zero" contract — on a
+	// netlink read failure mark the aggregate Unavailable (its 0 is NOT
+	// authoritative) instead of silently reporting a misleading "0 denies". The
+	// Prometheus analogue omits the series and bumps xpf_counter_read_errors_total.
+	//
+	// #3681 (L03): keep the per-zone/family breakdown so the aggregate scalar's
+	// [zone, family] dimensions (WAN-v4 vs WAN-v6 vs unexpected-internal-zone —
+	// the incident-response signal) are not lost.
+	if kc, err := readHostInboundDenyCounters(); err != nil {
+		stats.HostInboundKernelDeniesUnavailable = true
+	} else {
+		for _, ctr := range kc {
+			stats.HostInboundKernelDenies += ctr.Packets
+			stats.HostInboundKernelDenyDetail = append(stats.HostInboundKernelDenyDetail,
+				HostInboundKernelDenyCount{
+					Zone:    ctr.Zone,
+					Family:  ctr.Family,
+					Packets: ctr.Packets,
+					Bytes:   ctr.Bytes,
+				})
+		}
+	}
+
+	// #3681 (H04): the userspace-dp global counters below genuinely require a
+	// loaded dataplane. On a degraded / config-only boot return a PARTIAL
+	// response (200) carrying the dataplane-independent kernel host-inbound
+	// counters read above plus an explicit DataplaneDegraded flag, instead of a
+	// blanket 503 that would hide the host-inbound signal. The scope of the gate
+	// is now exactly the counters that depend on the dataplane.
 	if s.dp == nil || !s.dp.IsLoaded() {
-		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
+		stats.DataplaneDegraded = true
+		writeOK(w, stats)
 		return
 	}
 
@@ -28,42 +71,31 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		return v
 	}
 
-	stats := GlobalStats{
-		RxPackets:            readCounter(dataplane.GlobalCtrRxPackets),
-		TxPackets:            readCounter(dataplane.GlobalCtrTxPackets),
-		Drops:                readCounter(dataplane.GlobalCtrDrops),
-		SessionsCreated:      readCounter(dataplane.GlobalCtrSessionsNew),
-		SessionsClosed:       readCounter(dataplane.GlobalCtrSessionsClosed),
-		ScreenDrops:          readCounter(dataplane.GlobalCtrScreenDrops),
-		PolicyDenies:         readCounter(dataplane.GlobalCtrPolicyDeny),
-		NATAllocFails:        readCounter(dataplane.GlobalCtrNATAllocFail),
-		HostInboundDeny:      readCounter(dataplane.GlobalCtrHostInboundDeny),
-		HostInboundAllowed:   readCounter(dataplane.GlobalCtrHostInbound),
-		NAT64Translations:    readCounter(dataplane.GlobalCtrNAT64Xlate),
-		TCEgressPackets:      readCounter(dataplane.GlobalCtrTCEgressPackets),
-		FabricRedirects:      readCounter(dataplane.GlobalCtrFabricRedirect),
-		FabricFwdDrops:       readCounter(dataplane.GlobalCtrFabricFwdDrop),
-		FlowCacheHits:        readCounter(dataplane.GlobalCtrFlowCacheHit),
-		FlowCacheMisses:      readCounter(dataplane.GlobalCtrFlowCacheMiss),
-		FlowCacheFlushes:     readCounter(dataplane.GlobalCtrFlowCacheFlush),
-		FlowCacheInvalidates: readCounter(dataplane.GlobalCtrFlowCacheInvalidate),
-	}
+	stats.RxPackets = readCounter(dataplane.GlobalCtrRxPackets)
+	stats.TxPackets = readCounter(dataplane.GlobalCtrTxPackets)
+	stats.Drops = readCounter(dataplane.GlobalCtrDrops)
+	stats.SessionsCreated = readCounter(dataplane.GlobalCtrSessionsNew)
+	stats.SessionsClosed = readCounter(dataplane.GlobalCtrSessionsClosed)
+	stats.ScreenDrops = readCounter(dataplane.GlobalCtrScreenDrops)
+	stats.PolicyDenies = readCounter(dataplane.GlobalCtrPolicyDeny)
+	stats.NATAllocFails = readCounter(dataplane.GlobalCtrNATAllocFail)
+	stats.HostInboundDeny = readCounter(dataplane.GlobalCtrHostInboundDeny)
+	stats.HostInboundAllowed = readCounter(dataplane.GlobalCtrHostInbound)
+	stats.NAT64Translations = readCounter(dataplane.GlobalCtrNAT64Xlate)
+	stats.TCEgressPackets = readCounter(dataplane.GlobalCtrTCEgressPackets)
+	stats.FabricRedirects = readCounter(dataplane.GlobalCtrFabricRedirect)
+	stats.FabricFwdDrops = readCounter(dataplane.GlobalCtrFabricFwdDrop)
+	stats.FlowCacheHits = readCounter(dataplane.GlobalCtrFlowCacheHit)
+	stats.FlowCacheMisses = readCounter(dataplane.GlobalCtrFlowCacheMiss)
+	stats.FlowCacheFlushes = readCounter(dataplane.GlobalCtrFlowCacheFlush)
+	stats.FlowCacheInvalidates = readCounter(dataplane.GlobalCtrFlowCacheInvalidate)
+
 	if readErr != nil {
 		writeError(w, http.StatusInternalServerError,
 			"global counter read failed: "+readErr.Error())
 		return
 	}
 
-	// #3361: aggregate the kernel nftables host-inbound DROP counters (the
-	// PRIMARY host-inbound enforcement path, distinct from the userspace-dp
-	// HostInboundDeny above). Best-effort: a netlink read failure leaves the
-	// field 0 — the per-zone/family Prometheus metric is the canonical surface
-	// and omits the series on error rather than reporting a misleading 0.
-	if kc, err := nftables.ReadHostInboundDenyCounters(); err == nil {
-		for _, ctr := range kc {
-			stats.HostInboundKernelDenies += ctr.Packets
-		}
-	}
 	writeOK(w, stats)
 }
 

@@ -32,20 +32,56 @@ type GlobalStats struct {
 	// host-inbound DROP counters across all zones/families (#3361). This is the
 	// PRIMARY host-inbound enforcement path and is DISTINCT from
 	// HostInboundDeny (the userspace-dp #3326 path) — they are not double
-	// counts. Best-effort: a netlink read failure leaves this 0 (the canonical
-	// per-zone/family signal is the xpf_host_inbound_kernel_denies_total
-	// Prometheus metric, which omits the series on a read error rather than
-	// reporting a misleading 0).
+	// counts. The kernel `inet xpf_hostinbound` chain is installed by the daemon
+	// INDEPENDENT of userspace-dp load state, so this field is populated even on
+	// a degraded / config-only boot (DataplaneDegraded=true) — matching the
+	// Prometheus xpf_host_inbound_kernel_denies_total series, which is collected
+	// before the dataplane gate (#3681).
 	HostInboundKernelDenies uint64 `json:"host_inbound_kernel_denies"`
-	HostInboundAllowed      uint64 `json:"host_inbound_allowed"`
-	NAT64Translations       uint64 `json:"nat64_translations"`
-	TCEgressPackets         uint64 `json:"tc_egress_packets"`
-	FabricRedirects         uint64 `json:"fabric_redirects"`
-	FabricFwdDrops          uint64 `json:"fabric_fwd_drops"`
-	FlowCacheHits           uint64 `json:"flow_cache_hits"`
-	FlowCacheMisses         uint64 `json:"flow_cache_misses"`
-	FlowCacheFlushes        uint64 `json:"flow_cache_flushes"`
-	FlowCacheInvalidates    uint64 `json:"flow_cache_invalidations"`
+	// HostInboundKernelDeniesUnavailable marks the aggregate above as NOT
+	// authoritative because the kernel nftables read FAILED (#3681 H05). Mirrors
+	// the InterfaceStats.Unavailable (#3464) idiom and the #3345
+	// "counter-unavailable != zero" contract: a netlink read failure must not be
+	// indistinguishable from "kernel host-inbound healthy, saw no denies". When
+	// set, HostInboundKernelDenies / HostInboundKernelDenyDetail are left at
+	// their zero values but do NOT reflect real traffic. Omitted (false) on a
+	// clean read. The Prometheus analogue omits the series and bumps
+	// xpf_counter_read_errors_total.
+	HostInboundKernelDeniesUnavailable bool `json:"host_inbound_kernel_denies_unavailable,omitempty"`
+	// HostInboundKernelDenyDetail is the per-zone/family breakdown of the kernel
+	// host-inbound DROP counters (#3681 L03), preserving the [zone, family]
+	// dimensions the aggregate scalar collapses. Mirrors the Prometheus
+	// xpf_host_inbound_kernel_denies_total {zone, family} labels — for incident
+	// response the WAN-v4 vs WAN-v6 vs unexpected-internal-zone split is the
+	// signal. Omitted when empty (no enforced host-inbound chain, or read
+	// unavailable).
+	HostInboundKernelDenyDetail []HostInboundKernelDenyCount `json:"host_inbound_kernel_deny_detail,omitempty"`
+	// DataplaneDegraded is true when the userspace dataplane is not loaded
+	// (config-only / degraded boot). The response is then PARTIAL (#3681 H04):
+	// the dataplane-independent kernel host-inbound counters above are still
+	// populated, but every userspace-dp global counter below is left at 0 and is
+	// NOT authoritative. Omitted (false) on a normally loaded dataplane, where
+	// the full counter set is returned.
+	DataplaneDegraded    bool   `json:"dataplane_degraded,omitempty"`
+	HostInboundAllowed   uint64 `json:"host_inbound_allowed"`
+	NAT64Translations    uint64 `json:"nat64_translations"`
+	TCEgressPackets      uint64 `json:"tc_egress_packets"`
+	FabricRedirects      uint64 `json:"fabric_redirects"`
+	FabricFwdDrops       uint64 `json:"fabric_fwd_drops"`
+	FlowCacheHits        uint64 `json:"flow_cache_hits"`
+	FlowCacheMisses      uint64 `json:"flow_cache_misses"`
+	FlowCacheFlushes     uint64 `json:"flow_cache_flushes"`
+	FlowCacheInvalidates uint64 `json:"flow_cache_invalidations"`
+}
+
+// HostInboundKernelDenyCount is one zone/family kernel nftables host-inbound
+// DROP counter (#3681 L03), the REST projection of nftables.HostInboundDenyCount
+// and the Prometheus xpf_host_inbound_kernel_denies_total {zone, family} series.
+type HostInboundKernelDenyCount struct {
+	Zone    string `json:"zone"`
+	Family  string `json:"family"` // "ip" or "ip6"
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
 }
 
 // InterfaceStats holds per-interface counter values.

@@ -128,8 +128,36 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     `host_inbound_denies`. Before #3426 REST omitted both, so an automation
     client reading only REST could not see NAT64 translation volume or the
     host-inbound allow count even though gRPC and Prometheus
-    (`xpf_nat64_translations_total`) exposed them. A counter read failure
-    returns HTTP 500 (#3345), not a clean zero.
+    (`xpf_nat64_translations_total`) exposed them. A userspace-dp global
+    counter read failure returns HTTP 500 (#3345), not a clean zero.
+    The kernel nftables host-inbound DROP counters (the PRIMARY
+    host-inbound enforcement signal — `host_inbound_kernel_denies`, its
+    per-zone/family `host_inbound_kernel_deny_detail`, and the
+    `host_inbound_kernel_denies_unavailable` marker) are handled on a path
+    that mirrors the Prometheus collector rather than the userspace-dp
+    counters (#3681):
+    - **H04 (read before the gate):** the `inet xpf_hostinbound` chain is
+      installed by the daemon INDEPENDENT of dataplane load and keeps
+      dropping control-plane traffic on a config-only / degraded boot, so
+      these counters are read BEFORE the `dataplane not loaded` check —
+      matching `metrics_counters.go collectHostInboundKernelDenies`, which
+      runs before its own dataplane gate. On an unloaded dataplane the
+      endpoint returns a PARTIAL 200 with `dataplane_degraded: true` and the
+      kernel host-inbound counters populated, instead of the old blanket
+      503 that hid the host-inbound signal exactly when management-plane
+      exposure matters most. The 503 gate is now scoped to the
+      genuinely dataplane-dependent userspace counters.
+    - **H05 (unavailable != zero):** a netlink read failure sets
+      `host_inbound_kernel_denies_unavailable: true` (leaving the aggregate
+      and detail at their zero values but marked non-authoritative) rather
+      than silently reporting a misleading "0 denies" — the REST analogue of
+      the Prometheus skip-the-series + `xpf_counter_read_errors_total` bump,
+      and the same `Unavailable` idiom as per-interface counters (#3464). An
+      absent chain (no host-inbound stanza enforced) reads as a clean 0 with
+      no marker.
+    - **L03 (zone/family split):** `host_inbound_kernel_deny_detail` carries
+      the per-`{zone, family}` breakdown the aggregate scalar collapses,
+      matching the `xpf_host_inbound_kernel_denies_total` labels.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
   consumers must drain. `?category=` (and `?severity=` on
@@ -229,7 +257,13 @@ under the daemon's errgroup. Nothing else imports this package.
     a read error; gRPC `GetGlobalStats`, `GetZones`, and `GetPolicies`
     return `codes.Internal`. The error is checked AFTER the full response
     is built, so a failure on a late read (e.g. `RxPackets` after the
-    screen-detail loop, or any policy/zone in the loop) is covered.
+    screen-detail loop, or any policy/zone in the loop) is covered. The
+    kernel-nftables host-inbound counters on `/stats/global` are the one
+    exception: because they are dataplane-INDEPENDENT and read before the
+    load gate (#3681), a read failure there does NOT 500 the whole response
+    (which would hide the good userspace counters) — it sets the
+    `host_inbound_kernel_denies_unavailable` marker, the same non-authoritative
+    idiom as per-interface `unavailable` (#3464).
   - **Prometheus** (`metrics_counters.go`) OMITS the affected sample
     (rather than emitting a misleading `0`) for global, per-zone,
     per-policy, and per-filter reads, and bumps the monotonic
