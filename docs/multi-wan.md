@@ -479,9 +479,34 @@ clear can match sessions allocated from the other pool.
 ## Observability
 
 - `show services ip-monitoring status` (local CLI, remote CLI, gRPC).
+  Per-policy `Status:` is `FAIL`, `PASS`, or **`UNKNOWN`** — a policy
+  whose probe has not produced a single result yet reads `UNKNOWN`, not
+  `PASS` (#3761 H7). "No probe has run" is not "the uplink is healthy":
+  reading `PASS` would mask exactly the startup/probe-outage window that
+  needs an alert. Route-Action rows carry a per-route state:
+  - `APPLIED` — live in both the kernel and userspace FIBs.
+  - `PENDING` — desired (this policy won the prefix) but the actuation
+    has not converged yet (or is failing, #3757).
+  - `suppressed by policy <name>` — a resolvable candidate that lost
+    winner resolution to a lower-metric (or lexicographically-earlier)
+    policy for the same prefix (#3761 M10) — distinct from unresolved.
+  - `unresolved (<reason>) — skipped` — an interface-typed candidate
+    with no DHCP-learned next-hop (#1844/#3761 M9), reported with its
+    routing-instance and tracked unit, not just the prefix.
 - Prometheus: `xpf_ipmon_policy_failed{policy}`,
   `xpf_ipmon_policy_transitions_total{policy}`,
-  `xpf_ipmon_routes_applied`.
+  `xpf_ipmon_routes_applied`, `xpf_ipmon_routes_desired`,
+  `xpf_ipmon_unresolved_next_hops`.
+  - `xpf_ipmon_routes_applied` counts routes **actually applied** — the
+    last CONVERGED actuation's overlay live in the FIBs (#3761 H8), NOT
+    the desired set. `xpf_ipmon_routes_desired` counts what the engine
+    WANTS injected. A sustained `desired > applied` gap flags a failover
+    that is desired but has not converged (a stuck FRR reload, snapshot
+    publish, or FIB-generation bump — #3757).
+  - `xpf_ipmon_unresolved_next_hops` counts interface-typed failover
+    routes skipped for a missing DHCP gateway (#1844); non-zero during a
+    failover means the backup uplink's lease is missing and its route is
+    NOT injected.
 - Transitions log at Info; per-probe detail at Debug.
 
 ## HA model (chassis cluster)

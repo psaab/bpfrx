@@ -1,3 +1,85 @@
+## 2026-07-01 — #3761 ip-monitoring: honest status/metrics (UNKNOWN vs PASS, applied vs desired, suppressed vs unresolved)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3761 (MEDIUM, codex-review-160 H7+H8+M9+M10+L12).
+    Status/metrics reported health/success for non-converged states,
+    hiding the failover-failure modes that need alerts. FIXES:
+    - H7: added `PolicyStatus.Known` (true once ≥1 RPM result for the
+      policy's probe is observed). `FormatStatus` renders `Status:
+      UNKNOWN` before any probe result instead of `PASS`.
+    - H8: engine now tracks `appliedOverlay` — the last CONVERGED
+      actuation's overlay (set in run() only when actuate()==true and no
+      newer change landed). `RoutesApplied()` and
+      `xpf_ipmon_routes_applied` report ACTUALLY-applied; added
+      `xpf_ipmon_routes_desired` for the winner-resolved intent.
+      `PolicyStatus.AppliedRoutes` carries the per-policy applied subset.
+    - M9: `UnresolvedRoutes` is now a typed `[]UnresolvedRoute`
+      (routing-instance, destination, tracked unit, metric, reason).
+    - M10: added `SuppressedRoutes []SuppressedRoute` — resolvable
+      candidates that lost winner resolution, shown as "suppressed by
+      policy <name>", distinct from unresolved. computeOverlayLocked
+      refactored to keep all resolvable candidates per key and attribute
+      losers to the winner after selection.
+    - L12: documented routes_applied/routes_desired/unresolved_next_hops
+      + the UNKNOWN/APPLIED/PENDING/suppressed/unresolved status rows in
+      docs/multi-wan.md and pkg/ipmon/README.md.
+    RED-on-revert tests: TestUnknownStatusNotReportedAsPass (H7),
+    TestRoutesAppliedReflectsActuationNotDesired (H8, -race),
+    TestUnresolvedAndSuppressedDetail (M9+M10). Verified RED on revert
+    (display PASS-not-UNKNOWN, applied==desired-while-failing, missing
+    suppressed/unresolved rows). go test ./pkg/ipmon/... (-race),
+    ./pkg/api/, ./pkg/daemon/ green.
+  - **File(s)**: pkg/ipmon/ipmon.go (types, appliedOverlay,
+    computeOverlayLocked refactor, Status, RoutesApplied, run),
+    pkg/ipmon/display.go (UNKNOWN + applied/pending/suppressed/unresolved
+    rows), pkg/api/metrics_system.go (applied-from-AppliedRoutes +
+    routes_desired), pkg/api/metrics.go + metrics_descriptors.go (new
+    gauge), pkg/ipmon/ipmon_test.go, pkg/ipmon/nexthop_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go, docs/multi-wan.md,
+    pkg/ipmon/README.md
+
+## 2026-07-01 — #3763 ip-monitoring: recompute pending-recovery deadline when hold-down changes mid-recovery
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3763 (MEDIUM, codex-review-160 M7+L6). Apply preserved
+    prev.pendingRecoveryAt verbatim whenever (policy name, MatchRPMProbe)
+    survived a commit, ignoring a changed HoldDownSecs. A policy recovering
+    under a 300s hold-down that the operator lowered to 10s during incident
+    response still waited the old 300s deadline — operator intent ignored
+    until a restart. FIX: pendingRecoveryAt encodes recoveryStart + oldHold,
+    so the new deadline = pendingRecoveryAt + (newHold - oldHold) credits the
+    elapsed time. Preserve verbatim only when hold-down is unchanged; recompute
+    when it changed; drop to zero (recover at the next evaluate) when lowered to
+    0. Also kick the run loop when a still-pending deadline moved even if the
+    FAIL/recover state itself did not change, so nextWakeLocked re-arms against
+    the new (possibly shortened) deadline instead of sleeping to the stale one.
+    RED-on-revert test (TestHoldDownRecomputeOnConfigChange, fakeClock): lower
+    below elapsed → recover now; lower to a still-future deadline → recover at
+    the NEW earlier deadline; raise → stay pending past the OLD deadline;
+    unchanged → deadline preserved verbatim.
+  - **File(s)**: pkg/ipmon/ipmon.go (Apply recompute + kick),
+    pkg/ipmon/ipmon_test.go (TestHoldDownRecomputeOnConfigChange)
+
+## 2026-07-01 — #3762 ip-monitoring: idempotent engine lifecycle (double Start no-op, Stop before/without Start safe)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3762 (MEDIUM, codex-review-160 H9+H10). The exported ipmon
+    Engine lifecycle was not idempotent. Start just did `go e.run()` with no
+    guard; run() defers close(e.done), so a second Start spawned a second
+    goroutine and the second deferred close(done) panicked ("close of closed
+    channel") after Stop (H9). Stop closed e.stop then blocked on `<-e.done`
+    unconditionally, so a Stop before/without Start (a common startup
+    error-unwind path) deadlocked forever — no run loop exists to close done
+    (H10). FIX: track `started`/`stopped` under mu. Start is a no-op if already
+    started or stopped (run() spawned at most once). Stop flips stopped and
+    closes e.stop exactly once, and waits on e.done ONLY when a run loop was
+    actually started; a Start after Stop is a no-op. RED-on-revert test
+    (TestLifecycleIdempotent, -race): reverting to `go e.run()` panics on the
+    second Start's close(done); reverting Stop deadlocks the Stop-before-Start
+    goroutine past a 2s timeout.
+  - **File(s)**: pkg/ipmon/ipmon.go (Engine.started/stopped + Start/Stop),
+    pkg/ipmon/ipmon_test.go (TestLifecycleIdempotent)
+
 ## 2026-07-01 — #3760 ip-monitoring: advance the cached desired overlay ONLY after apply_snapshot succeeds (mutate-after-publish)
 
 - **Timestamp**: 2026-07-01

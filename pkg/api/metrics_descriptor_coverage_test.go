@@ -420,9 +420,16 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 				Routes: []config.RouteOverlayEntry{
 					{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
 				},
+				// #3761 H8: an applied route so xpf_ipmon_routes_applied
+				// emits a non-zero value distinct from routes_desired.
+				AppliedRoutes: []config.RouteOverlayEntry{
+					{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
+				},
 				// #1844: a skipped interface-typed route, so the
 				// unresolved-next-hops gauge emits a non-zero value.
-				UnresolvedRoutes: []string{"10.0.0.0/8"},
+				UnresolvedRoutes: []ipmon.UnresolvedRoute{
+					{Destination: "10.0.0.0/8", NextHopInterface: "ge-0-0-3.0", Reason: "no DHCP gateway"},
+				},
 			}}
 		},
 		// #1387 inc-2: wire a non-nil DDNS stats source so the
