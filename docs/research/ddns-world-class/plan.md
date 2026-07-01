@@ -493,6 +493,26 @@ Per-scope state (extends the existing durable store):
 - **Startup seed** (inadyn idea #5): seed the cache from disk; if absent,
   optionally a live DNS lookup of the FQDN to avoid a redundant first-boot
   update (gated by config to avoid a leak in air-gapped setups).
+  - **Surface A seed reads AddrText, baselines publishedAt (#3734/H04).**
+    A Surface A router record stores its published rdata in `AddrText`
+    (`Address` is `""` — Surface A keys ownership on `{scope, fixed
+    identity, ""}`). `seedFromStore` therefore seeds `lastAddr` from
+    `AddrText` (falling back to `Address` only for a legacy lease-shape
+    entry) AND seeds `lastPublished` to the RESTART instant. Seeding
+    `lastAddr` alone is not enough: with `lastPublished` left zero
+    `refreshDue` is immediately true, so every owned scope republishes on
+    the first post-restart pass — a write-storm proportional to the scope
+    count (the exact provider ban/rate-limit risk this cache exists to
+    prevent). Baselining `publishedAt` at the restart makes the first
+    unchanged reconcile a counted skip; the record re-asserts only once the
+    forced-refresh floor elapses FROM the restart. The pre-fix code parsed
+    the empty `Address`, errored, and seeded nothing (both `lastAddr` and
+    `lastPublished` zero) → guaranteed storm.
+  - **Renumber (WAN address change) log reads AddrText (#3734/M02).** The
+    "replaced record address" transition log reads the previous owned
+    record's `AddrText` for the old address (same `""`-Address caveat);
+    reading `Address` yielded `""` so the log never fired and a WAN
+    renumber left no operational trace.
 - **Forced-refresh decoupled from poll** (inadyn idea #7): the existing
   30s reconcile re-asserts *desired state* but MUST NOT send a wire
   update every 30s; a per-scope `forced-refresh` (default e.g. 24h) is the

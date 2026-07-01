@@ -1,3 +1,33 @@
+## 2026-07-01 — #3734 ddns Surface A: seedFromStore + renumber log read AddrText (not the always-empty Address) → no restart republish storm, renumber leaves a trace
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3734 (MEDIUM, folds codex-review-157 H04+M02). A Surface A
+    router record stores its published rdata in `AddrText`; the keying
+    `Address` field is `""` (Surface A keys ownership on `{scope, fixed
+    identity, ""}`, #2691 P2). Two places read the empty `Address`:
+    (H04) `seedFromStore` on restart parsed `r.Address` → `ParseAddr("")`
+    errored → nothing seeded → the first post-restart reconcile saw every
+    owned record as changed (empty→current) and republished — a write-storm
+    proportional to the scope count (provider ban/rate-limit risk).
+    (M02) the WAN-renumber "replaced record address" log read
+    `prevOwned.Address` (always `""`) so it never fired — a renumber left no
+    operational trace.
+    FIX: `seedFromStore` seeds `lastAddr` from `AddrText` (fallback `Address`
+    for a legacy lease-shape entry) AND baselines `lastPublished` at the
+    restart instant — seeding `lastAddr` alone is insufficient because
+    `lastPublished` left zero makes `refreshDue` immediately true and
+    republishes anyway; baselining it makes the first unchanged reconcile a
+    counted skip and measures the forced-refresh floor from the restart. The
+    renumber log now reads `prevOwned.AddrText` (same fallback).
+    Two RED-on-revert tests: `TestSurfaceARestartSeedsFromAddrTextNoRepublishStorm`
+    (restart → 0 upserts on an unchanged record, still 1 on a real change;
+    RED = 1 spurious republish on revert) and `TestSurfaceARenumberLogReadsAddrText`
+    (captures slog, asserts `old=<AddrText>`; RED = empty log on revert).
+    Both verified RED with the fix reverted. `go test ./pkg/ddns/... ./pkg/daemon/`
+    green; build/vet/gofmt clean. Doc: docs/research/ddns-world-class/plan.md §5.5.
+  - **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+    docs/research/ddns-world-class/plan.md, _Log.md
+
 ## 2026-07-01 — #3742 flowexport: build-before-swap reconcile (transient NewExporter failure no longer disables export; no SESSION_CLOSE lost in the swap window)
 
 - **Timestamp**: 2026-07-01
