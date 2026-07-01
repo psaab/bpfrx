@@ -5614,7 +5614,7 @@ func validateDNATPoolStrict(cfg *Config) error {
 		// No leaf (PortRaw == "") leaves Port == 0 = preserve-destination-port,
 		// which is legitimate and untouched.
 		if pool.PortRaw != "" {
-			n, err := strconv.Atoi(pool.PortRaw)
+			n, err := parseCanonicalPort(pool.PortRaw)
 			if err != nil {
 				return fmt.Errorf(
 					"destination-nat pool %q: port %q is not a numeric port (1-65535); "+

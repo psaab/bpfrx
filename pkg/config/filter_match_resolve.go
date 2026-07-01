@@ -224,7 +224,10 @@ func resolveSinglePort(s string) (uint16, bool) {
 	if s == "" {
 		return 0, false
 	}
-	if n, err := strconv.Atoi(s); err == nil {
+	// parseCanonicalPort (not strconv.Atoi) so a non-canonical signed token
+	// ("+80") is treated as unresolved rather than silently coerced to 80 and
+	// shipped as a numeric port the operator never wrote (#3606).
+	if n, err := parseCanonicalPort(s); err == nil {
 		if n >= 1 && n <= 65535 {
 			return uint16(n), true
 		}
