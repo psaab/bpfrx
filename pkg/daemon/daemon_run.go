@@ -1215,6 +1215,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return d.frr.ReloadDegraded()
 			},
+			// #3780: surface scheduler republish-failure so
+			// xpf_scheduler_republish_failed reads 1 (and
+			// xpf_scheduler_republish_stale_seconds climbs) while a
+			// scheduler window transition's republish has not converged —
+			// otherwise stale enforcement past the window is invisible to
+			// monitoring.
+			SchedulerRepublishFailedFn:       d.SchedulerRepublishFailed,
+			SchedulerRepublishStaleSecondsFn: d.SchedulerRepublishStaleSeconds,
 			// #1827: ip-monitoring policy state for the xpf_ipmon_*
 			// metric family.
 			IPMonStatusFn: func() []ipmon.PolicyStatus {

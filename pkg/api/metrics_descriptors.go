@@ -407,6 +407,25 @@ func newCollector(srv *Server) *xpfCollector {
 				"removal is deferred while set (#1880).",
 			nil, nil,
 		),
+		schedulerRepublishFailed: prometheus.NewDesc(
+			"xpf_scheduler_republish_failed",
+			"1 while the most recent scheduler-driven policy republish "+
+				"failed and has not yet converged (#3780): stale "+
+				"enforcement is live past a schedule window — a scheduled "+
+				"permit may still be forwarding after its window closed, or "+
+				"a scheduled block never engaged. The daemon retries the "+
+				"transition autonomously on each scheduler tick; 0 when the "+
+				"enforcement snapshot is in sync with the schedule state.",
+			nil, nil,
+		),
+		schedulerRepublishStale: prometheus.NewDesc(
+			"xpf_scheduler_republish_stale_seconds",
+			"Seconds since the current scheduler-republish failure streak "+
+				"began (#3780); 0 when healthy. A climbing value means "+
+				"enforcement has been out of sync with the schedule window "+
+				"for that long while the daemon retries.",
+			nil, nil,
+		),
 		configPersistDegraded: prometheus.NewDesc(
 			"xpf_daemon_config_persist_degraded",
 			"1 while the running active configuration failed to persist "+

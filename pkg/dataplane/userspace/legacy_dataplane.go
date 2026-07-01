@@ -183,12 +183,15 @@ func (a *LegacyDataPlaneAdapter) Compile(cfg *config.Config) (*dataplane.Compile
 	return m.Compile(cfg)
 }
 
-func (a *LegacyDataPlaneAdapter) UpdatePolicyScheduleState(cfg *config.Config, activeState map[string]bool) {
+func (a *LegacyDataPlaneAdapter) UpdatePolicyScheduleState(cfg *config.Config, activeState map[string]bool) error {
 	m, err := a.managerOrErr()
 	if err != nil {
-		return
+		// #3780: no manager attached — nothing is enforcing, so there
+		// is no stale permit to converge. Report success so the daemon
+		// scheduler self-heal does not spin.
+		return nil
 	}
-	m.UpdatePolicyScheduleState(cfg, activeState)
+	return m.UpdatePolicyScheduleState(cfg, activeState)
 }
 
 func (a *LegacyDataPlaneAdapter) SetPolicySchedulerActiveState(activeState map[string]bool) {

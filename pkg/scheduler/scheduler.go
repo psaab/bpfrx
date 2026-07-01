@@ -15,10 +15,26 @@ type Scheduler struct {
 	mu               sync.RWMutex
 	schedulers       map[string]*config.SchedulerConfig
 	active           map[string]bool
-	updateFn         func(activeState map[string]bool)
+	updateFn         func(activeState map[string]bool) error
 	lastEval         time.Time
 	lastWallUnixNano int64
 	unsafeUntil      time.Time
+
+	// #3780: republish self-heal. A scheduler window transition
+	// republishes the enforcement snapshot via updateFn. When that
+	// republish FAILS the transition has NOT converged — a scheduled
+	// permit whose window just closed would keep forwarding (fail-open),
+	// or a scheduled block would never engage. updateFn returning a
+	// non-nil error latches republishPending so the NEXT evaluate tick
+	// re-fires updateFn even when the active-state map did not change,
+	// retrying the transition on the scheduler's own throttle-paced
+	// 60 s sweep until it converges. republishFirstFail records when the
+	// current failure streak began (for stale-state age); republishFailures
+	// is the cumulative failure count. All guarded by mu.
+	republishPending   bool
+	republishFirstFail time.Time
+	republishFailures  uint64
+	lastRepublishErr   error
 }
 
 const (
@@ -30,7 +46,7 @@ const (
 // returns that map without firing updateFn from inside the constructor. Daemon
 // apply paths use this when they already hold their own serialization lock and
 // must publish the initial state as part of the same apply transaction.
-func NewPrimed(schedulers map[string]*config.SchedulerConfig, updateFn func(activeState map[string]bool), now time.Time) (*Scheduler, map[string]bool) {
+func NewPrimed(schedulers map[string]*config.SchedulerConfig, updateFn func(activeState map[string]bool) error, now time.Time) (*Scheduler, map[string]bool) {
 	s := &Scheduler{
 		schedulers: schedulers,
 		active:     make(map[string]bool),
@@ -43,7 +59,7 @@ func NewPrimed(schedulers map[string]*config.SchedulerConfig, updateFn func(acti
 // New creates a Scheduler with the given scheduler configs and update callback.
 // updateFn is called whenever any scheduler's active state changes, receiving
 // the current active state of all schedulers.
-func New(schedulers map[string]*config.SchedulerConfig, updateFn func(activeState map[string]bool)) *Scheduler {
+func New(schedulers map[string]*config.SchedulerConfig, updateFn func(activeState map[string]bool) error) *Scheduler {
 	s, _ := NewPrimed(schedulers, updateFn, time.Now())
 	// Preserve the historical constructor contract: New notifies on initial
 	// state. NewPrimed is the no-notify variant for callers that publish the
@@ -142,14 +158,60 @@ func (s *Scheduler) evaluate(now time.Time, notify bool) {
 	s.lastEval = now
 	s.lastWallUnixNano = now.UnixNano()
 
-	if !changed || !notify || s.updateFn == nil {
+	// #3780: fire on a state change OR when a prior republish is still
+	// pending. Re-firing on the pending flag is the self-heal: a
+	// window transition whose republish failed is retried on the next
+	// throttle-paced tick with the CURRENT active state, so the stale
+	// enforcement (a permit past its window / a block that never
+	// engaged) converges instead of persisting until the next unrelated
+	// state change hours away.
+	if (!changed && !s.republishPending) || !notify || s.updateFn == nil {
 		s.mu.Unlock()
 		return
 	}
 	cp := copyActiveState(newActive)
 	updateFn := s.updateFn
 	s.mu.Unlock()
-	updateFn(cp)
+	err := updateFn(cp)
+	s.mu.Lock()
+	s.recordRepublishResultLocked(err, now)
+	s.mu.Unlock()
+}
+
+// recordRepublishResultLocked latches or clears the republish self-heal
+// state from an updateFn result (#3780). MUST be called with s.mu held.
+func (s *Scheduler) recordRepublishResultLocked(err error, now time.Time) {
+	if err != nil {
+		if !s.republishPending {
+			s.republishFirstFail = now
+		}
+		s.republishPending = true
+		s.republishFailures++
+		s.lastRepublishErr = err
+		return
+	}
+	s.republishPending = false
+	s.republishFirstFail = time.Time{}
+	s.lastRepublishErr = nil
+}
+
+// RepublishPending reports whether the most recent scheduler-driven
+// republish failed and is awaiting an autonomous retry on the next tick
+// (#3780).
+func (s *Scheduler) RepublishPending() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.republishPending
+}
+
+// RepublishFailureStatus returns the pending flag, the cumulative
+// failure count, and the time the current failure streak began (zero
+// when not pending). Feeds the scheduler_republish_failed metric and
+// its stale-state age (#3780).
+func (s *Scheduler) RepublishFailureStatus() (pending bool, failures uint64, since time.Time) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.republishPending, s.republishFailures, s.republishFirstFail
 }
 
 func (s *Scheduler) wallClockDiscontinuousLocked(now time.Time) bool {
@@ -189,7 +251,10 @@ func (s *Scheduler) notifyActiveState() {
 	cp := copyActiveState(s.active)
 	updateFn := s.updateFn
 	s.mu.RUnlock()
-	updateFn(cp)
+	err := updateFn(cp)
+	s.mu.Lock()
+	s.recordRepublishResultLocked(err, time.Now())
+	s.mu.Unlock()
 }
 
 func copyActiveState(in map[string]bool) map[string]bool {

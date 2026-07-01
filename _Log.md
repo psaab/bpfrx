@@ -1,3 +1,66 @@
+## 2026-07-01 — #3780 policy scheduler: fallible + self-healing republish (fix stale-permit-after-window fail-open)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3780 (MEDIUM-HIGH, security fail-open: a scheduled PERMIT
+    left live after its schedule window closed, or a scheduled block that
+    never engaged). The policy scheduler republished the userspace
+    enforcement snapshot on a time-of-day window flip via a VOID
+    fire-and-forget path: `UpdatePolicyScheduleState` logged a warning and
+    returned on every failure (policy/address-book rebuild, protocol
+    disarm, `apply_snapshot`), the daemon caller ignored the result, and
+    the scheduler only re-fired `updateFn` on the NEXT state CHANGE (hours
+    away) — so a transient republish failure at a window close left the
+    OLD `inactive` bits (the permit) live indefinitely with no retry and
+    no alarm.
+    FIX (fallible + self-healing, no happy-path change):
+    (1) `UpdatePolicyScheduleState` now returns `error` across the
+    `dataplane.DataPlane` interface + both backends
+    (`pkg/dataplane/userspace/manager.go` real path, `maps_policy.go`
+    retired-eBPF best-effort → always nil, `legacy_dataplane.go` adapter).
+    The userspace path returns a wrapped error on each failure that did
+    NOT apply the new snapshot (protocol-refuse, policy rebuild,
+    address-book rebuild, disarm, `apply_snapshot`); no-op paths (no
+    snapshot / no helper) and a post-success status-sync warning return
+    nil.
+    (2) The scheduler (`pkg/scheduler/scheduler.go`) `updateFn` now returns
+    `error`; a non-nil result latches `republishPending`, and `evaluate`
+    re-fires on `changed || republishPending` so the transition is retried
+    on the scheduler's own 60 s tick until it converges (fail-safe toward
+    the schedule's intent). New `RepublishPending` / `RepublishFailureStatus`
+    accessors.
+    (3) The daemon (`daemon_scheduler.go`) `publishPolicyScheduleState` /
+    `updatePolicyScheduleStateLocked` propagate the error;
+    `recordSchedulerRepublishResult` latches a lock-free failure metric
+    (`schedulerRepublishFailing` + first-fail nanos on the Daemon) and logs
+    an ERROR on entry into failure / INFO on recovery; teardown/replace in
+    the reconciler clears it. Stale-epoch / ctx-cancel / nothing-to-publish
+    return nil (no spurious retry).
+    (4) New Prometheus gauges `xpf_scheduler_republish_failed` (0/1) and
+    `xpf_scheduler_republish_stale_seconds` (failure-streak age) wired
+    daemon → api.Config → collector (control-plane signal, emitted before
+    the dataplane gate like frr-reload-degraded).
+    VALIDATION: 3 RED-on-revert test files (scheduler self-heal retry;
+    daemon metric latch/clear + error propagation; userspace manager
+    error-on-publish-failure + no-op-converged). Verified RED on revert for
+    the scheduler re-fire condition and the manager error return (both go
+    FAIL when reverted to fire-and-forget), GREEN restored. go build ./...
+    green; go test ./pkg/scheduler/... ./pkg/daemon/... ./pkg/dataplane/...
+    ./pkg/api/... green; gofmt + vet clean; scheduler README updated
+    (republish self-heal section + metric names).
+  - **File(s)**: pkg/scheduler/scheduler.go, pkg/scheduler/README.md,
+    pkg/scheduler/scheduler_republish_3780_test.go (new),
+    pkg/scheduler/scheduler_test.go (updateFn signature),
+    pkg/dataplane/dataplane.go (interface), pkg/dataplane/maps_policy.go,
+    pkg/dataplane/userspace/manager.go,
+    pkg/dataplane/userspace/legacy_dataplane.go,
+    pkg/dataplane/userspace/manager_republish_3780_test.go (new),
+    pkg/daemon/daemon.go (atomics), pkg/daemon/daemon_scheduler.go,
+    pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go (metric wiring),
+    pkg/daemon/policy_scheduler_apply_test.go +
+    pkg/daemon/daemon_scheduler_test.go (signatures),
+    pkg/daemon/daemon_scheduler_republish_3780_test.go (new),
+    pkg/api/server.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go.
+
 ## 2026-07-01 — #3730 routing/PBR: kernel FBF ip-rule mirror honors L4 predicates + fail-closed on unrepresentable ones
 
 - **Timestamp**: 2026-07-01

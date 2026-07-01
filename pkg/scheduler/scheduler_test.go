@@ -162,9 +162,10 @@ func TestScheduler_InitialState(t *testing.T) {
 		"always-on": {Name: "always-on"}, // no times = always active
 	}
 
-	s := New(schedCfg, func(activeState map[string]bool) {
+	s := New(schedCfg, func(activeState map[string]bool) error {
 		called = true
 		state = activeState
+		return nil
 	})
 
 	if !called {
@@ -184,8 +185,9 @@ func TestScheduler_NewPrimedDoesNotNotifyInitialState(t *testing.T) {
 		"always-on": {Name: "always-on"},
 	}
 
-	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) {
+	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) error {
 		called = true
+		return nil
 	}, time.Date(2026, 2, 12, 14, 30, 0, 0, time.UTC))
 
 	if called {
@@ -209,8 +211,9 @@ func TestScheduler_WallClockBackwardStepFailsClosed(t *testing.T) {
 		},
 	}
 	now := time.Date(2026, 2, 12, 12, 0, 0, 0, time.UTC)
-	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) {
+	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) error {
 		lastState = activeState
+		return nil
 	}, now)
 	if !state["business-hours"] {
 		t.Fatal("initial state should be active")
@@ -238,8 +241,9 @@ func TestScheduler_WallClockBackwardStepStaysFailClosedUntilClockRecovers(t *tes
 		},
 	}
 	now := time.Date(2026, 2, 12, 12, 0, 0, 0, time.UTC)
-	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) {
+	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) error {
 		lastState = activeState
+		return nil
 	}, now)
 	if !state["business-hours"] {
 		t.Fatal("initial state should be active")
@@ -283,7 +287,7 @@ func TestScheduler_MonotonicAdvanceDoesNotFailClosed(t *testing.T) {
 		},
 	}
 	start := time.Now()
-	s, state := NewPrimed(schedCfg, func(map[string]bool) {}, start)
+	s, state := NewPrimed(schedCfg, func(map[string]bool) error { return nil }, start)
 	if !state["business-hours"] {
 		t.Fatal("initial state should be active")
 	}
@@ -303,7 +307,7 @@ func TestScheduler_ActiveState(t *testing.T) {
 	schedCfg := map[string]*config.SchedulerConfig{
 		"always-on": {Name: "always-on"},
 	}
-	s := New(schedCfg, func(activeState map[string]bool) {})
+	s := New(schedCfg, func(activeState map[string]bool) error { return nil })
 
 	state := s.ActiveState()
 	if !state["always-on"] {
@@ -322,8 +326,9 @@ func TestScheduler_Update(t *testing.T) {
 	schedCfg := map[string]*config.SchedulerConfig{
 		"always-on": {Name: "always-on"},
 	}
-	s := New(schedCfg, func(activeState map[string]bool) {
+	s := New(schedCfg, func(activeState map[string]bool) error {
 		lastState = activeState
+		return nil
 	})
 
 	// Update with new schedulers (removes always-on, adds another)

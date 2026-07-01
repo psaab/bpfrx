@@ -13,7 +13,7 @@ import (
 func TestStartPolicySchedulerLoopLockedWaitsForDaemonContext(t *testing.T) {
 	sched, _ := scheduler.NewPrimed(map[string]*config.SchedulerConfig{
 		"always": {Name: "always"},
-	}, func(map[string]bool) {}, time.Now())
+	}, func(map[string]bool) error { return nil }, time.Now())
 
 	d := &Daemon{scheduler: sched}
 	d.startPolicySchedulerLoopLocked()

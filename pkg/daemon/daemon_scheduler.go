@@ -16,7 +16,7 @@ type policySchedulerActiveStateSetter interface {
 }
 
 type policyScheduleStateUpdater interface {
-	UpdatePolicyScheduleState(*config.Config, map[string]bool)
+	UpdatePolicyScheduleState(*config.Config, map[string]bool) error
 }
 
 // reconcilePolicySchedulerLocked runs under applySem. It makes the scheduler
@@ -38,6 +38,11 @@ func (d *Daemon) reconcilePolicySchedulerLockedAt(cfg *config.Config, now time.T
 		d.schedulerCancel = nil
 	}
 	d.scheduler = nil
+	// #3780: the scheduler set is being removed or replaced. Clear any
+	// stale republish-failure metric from the outgoing scheduler; a new
+	// scheduler's initial state is published by the fallible apply path,
+	// and a removed scheduler set has nothing left to converge.
+	d.clearSchedulerRepublishFailure()
 	epoch := d.policySchedulerEpoch.Add(1)
 
 	if !hasSchedulers {
@@ -45,8 +50,8 @@ func (d *Daemon) reconcilePolicySchedulerLockedAt(cfg *config.Config, now time.T
 		return nil
 	}
 
-	sched, activeState := scheduler.NewPrimed(cfg.Schedulers, func(activeState map[string]bool) {
-		d.publishPolicyScheduleState(epoch, activeState)
+	sched, activeState := scheduler.NewPrimed(cfg.Schedulers, func(activeState map[string]bool) error {
+		return d.publishPolicyScheduleState(epoch, activeState)
 	}, now)
 	d.scheduler = sched
 	d.policySchedulerConfigHash = hash
@@ -62,7 +67,7 @@ func (d *Daemon) policySchedulerActiveStateForApplyLocked(cfg *config.Config, no
 	if d.scheduler != nil && hash == d.policySchedulerConfigHash {
 		return d.scheduler.ActiveState()
 	}
-	_, activeState := scheduler.NewPrimed(cfg.Schedulers, func(map[string]bool) {}, now)
+	_, activeState := scheduler.NewPrimed(cfg.Schedulers, func(map[string]bool) error { return nil }, now)
 	return activeState
 }
 
@@ -117,26 +122,38 @@ func (d *Daemon) startPolicySchedulerLoopLocked() {
 	go d.scheduler.Run(ctx)
 }
 
-func (d *Daemon) publishPolicyScheduleState(epoch uint64, activeState map[string]bool) {
+// publishPolicyScheduleState is the scheduler's updateFn. It returns a
+// non-nil error only when a live scheduler-driven republish did NOT
+// converge, which the scheduler uses to retry autonomously on its next
+// tick and which recordSchedulerRepublishResult surfaces as the
+// xpf_scheduler_republish_failed metric (#3780). Shutdown / torn-down /
+// nothing-to-publish cases return nil (no retry, no alarm).
+func (d *Daemon) publishPolicyScheduleState(epoch uint64, activeState map[string]bool) error {
 	ctx := d.daemonCtx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		// Daemon context cancelled — the daemon is shutting down and the
+		// scheduler loop is stopping too. Nothing to retry.
 		slog.Warn("scheduler: failed to acquire apply semaphore", "err", err)
-		return
+		return nil
 	}
 	defer d.applySem.Release(1)
 
 	if epoch != d.policySchedulerEpoch.Load() {
-		return
+		// A reconcile replaced this scheduler instance; the new instance
+		// owns republish. Do not latch a retry on the dead one.
+		return nil
 	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil || d.dp == nil {
-		return
+		return nil
 	}
 	d.seedPolicySchedulerActiveStateLocked(activeState)
-	d.updatePolicyScheduleStateLocked(cfg, activeState)
+	err := d.updatePolicyScheduleStateLocked(cfg, activeState)
+	d.recordSchedulerRepublishResult(err)
+	return err
 }
 
 func (d *Daemon) seedPolicySchedulerActiveStateLocked(activeState map[string]bool) {
@@ -148,9 +165,9 @@ func (d *Daemon) seedPolicySchedulerActiveStateLocked(activeState map[string]boo
 	}
 }
 
-func (d *Daemon) updatePolicyScheduleStateLocked(cfg *config.Config, activeState map[string]bool) {
+func (d *Daemon) updatePolicyScheduleStateLocked(cfg *config.Config, activeState map[string]bool) error {
 	if d.dp == nil {
-		return
+		return nil
 	}
 	// Both in-tree backends satisfy policyScheduleStateUpdater
 	// directly: *dataplane.Manager via UpdatePolicyScheduleState in
@@ -159,6 +176,63 @@ func (d *Daemon) updatePolicyScheduleStateLocked(cfg *config.Config, activeState
 	// pkg/dataplane/userspace/legacy_dataplane.go:161. The legacyDP()
 	// fallback branch was dead code; removed in #1519.
 	if updater, ok := d.dp.(policyScheduleStateUpdater); ok {
-		updater.UpdatePolicyScheduleState(cfg, activeState)
+		return updater.UpdatePolicyScheduleState(cfg, activeState)
 	}
+	return nil
+}
+
+// recordSchedulerRepublishResult latches or clears the scheduler
+// republish-failure metric from a republish result (#3780). This is the
+// observability side of the scheduler self-heal: while a
+// scheduler-driven republish keeps failing, xpf_scheduler_republish_failed
+// reads 1 and xpf_scheduler_republish_stale_seconds climbs, so stale
+// enforcement (a permit still live past its window, or a block that never
+// engaged) is visible to monitoring instead of silent. The transition
+// itself is retried by the scheduler on its next tick.
+func (d *Daemon) recordSchedulerRepublishResult(err error) {
+	if err != nil {
+		if d.schedulerRepublishFailing.CompareAndSwap(false, true) {
+			d.schedulerRepublishFirstFailNanos.Store(time.Now().UnixNano())
+			slog.Error("scheduler: policy schedule republish FAILED; enforcement is stale (a permit may still be live past its window, or a scheduled block never engaged) — retrying on the next scheduler tick until it converges",
+				"err", err)
+		}
+		return
+	}
+	if d.schedulerRepublishFailing.CompareAndSwap(true, false) {
+		d.schedulerRepublishFirstFailNanos.Store(0)
+		slog.Info("scheduler: policy schedule republish recovered; enforcement is back in sync with the schedule window")
+	}
+}
+
+// clearSchedulerRepublishFailure resets the republish-failure metric.
+// Called when the scheduler set is torn down or replaced by a reconcile.
+func (d *Daemon) clearSchedulerRepublishFailure() {
+	if d.schedulerRepublishFailing.Swap(false) {
+		d.schedulerRepublishFirstFailNanos.Store(0)
+	}
+}
+
+// SchedulerRepublishFailed reports whether the most recent
+// scheduler-driven policy republish failed and has not yet converged
+// (#3780). Lock-free; safe for the metrics collector goroutine.
+func (d *Daemon) SchedulerRepublishFailed() bool {
+	return d.schedulerRepublishFailing.Load()
+}
+
+// SchedulerRepublishStaleSeconds returns how long the current
+// scheduler-republish failure streak has gone unconverged, in seconds
+// (0 when healthy) (#3780).
+func (d *Daemon) SchedulerRepublishStaleSeconds() float64 {
+	if !d.schedulerRepublishFailing.Load() {
+		return 0
+	}
+	first := d.schedulerRepublishFirstFailNanos.Load()
+	if first == 0 {
+		return 0
+	}
+	age := time.Now().UnixNano() - first
+	if age < 0 {
+		return 0
+	}
+	return time.Duration(age).Seconds()
 }

@@ -211,32 +211,42 @@ type Daemon struct {
 	// bools distinguish "never reconciled" from "reconciled to the
 	// nil sentinel". The *ReconMu serialize the reconcile swap against
 	// shutdown's stopFlow/IPFIXExporter (both touch the cancel/wg).
-	flowBundle                 atomic.Pointer[exporterBundle]
-	flowHash                   [32]byte
-	flowHashSet                bool
-	flowCBOnce                 sync.Once
-	flowReconMu                sync.Mutex
-	ipfixBundlePtr             atomic.Pointer[ipfixBundle]
-	ipfixHash                  [32]byte
-	ipfixHashSet               bool
-	ipfixCBOnce                sync.Once
-	ipfixReconMu               sync.Mutex
-	dhcpRelay                  *dhcprelay.Manager
-	snmpAgent                  *snmp.Agent
-	lldpMgr                    *lldp.Manager
-	lldpApplied                *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
-	lldpApplyInit              bool             // true once reconcileLLDP has run at least once
-	scheduler                  *scheduler.Scheduler
-	schedulerCancel            context.CancelFunc
-	policySchedulerConfigHash  [32]byte
-	policySchedulerEpoch       atomic.Uint64
-	cluster                    *cluster.Manager
-	sessionSync                *cluster.SessionSync
-	syncBulkPrimed             atomic.Bool
-	syncPeerBulkPrimed         atomic.Bool
-	syncPeerConnected          atomic.Bool
-	lastStandbyNeighborRefresh atomic.Int64
-	neighborWarmupInFlight     atomic.Bool
+	flowBundle                atomic.Pointer[exporterBundle]
+	flowHash                  [32]byte
+	flowHashSet               bool
+	flowCBOnce                sync.Once
+	flowReconMu               sync.Mutex
+	ipfixBundlePtr            atomic.Pointer[ipfixBundle]
+	ipfixHash                 [32]byte
+	ipfixHashSet              bool
+	ipfixCBOnce               sync.Once
+	ipfixReconMu              sync.Mutex
+	dhcpRelay                 *dhcprelay.Manager
+	snmpAgent                 *snmp.Agent
+	lldpMgr                   *lldp.Manager
+	lldpApplied               *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
+	lldpApplyInit             bool             // true once reconcileLLDP has run at least once
+	scheduler                 *scheduler.Scheduler
+	schedulerCancel           context.CancelFunc
+	policySchedulerConfigHash [32]byte
+	policySchedulerEpoch      atomic.Uint64
+	// #3780: scheduler republish-failure observability.
+	// schedulerRepublishFailing is 1 while the most recent
+	// scheduler-driven policy republish failed and has not yet
+	// converged (stale enforcement past a schedule window);
+	// schedulerRepublishFirstFailNanos is the wall-clock start of the
+	// current failure streak (0 when healthy) for the stale-age gauge.
+	// Set in publishPolicyScheduleState, cleared on recovery or
+	// scheduler teardown; read lock-free by the metrics collector.
+	schedulerRepublishFailing        atomic.Bool
+	schedulerRepublishFirstFailNanos atomic.Int64
+	cluster                          *cluster.Manager
+	sessionSync                      *cluster.SessionSync
+	syncBulkPrimed                   atomic.Bool
+	syncPeerBulkPrimed               atomic.Bool
+	syncPeerConnected                atomic.Bool
+	lastStandbyNeighborRefresh       atomic.Int64
+	neighborWarmupInFlight           atomic.Bool
 	// #1780 Path A: per-phase supervision of runPeriodicNeighborResolution.
 	// Each periodic phase runs in a guarded goroutine so a hung netlink/probe
 	// syscall in one phase can never freeze the for-select loop (the observed

@@ -22,6 +22,7 @@ type policySchedulerApplyTestDP struct {
 	deferStates     []bool
 	updateCalls     int
 	updateStateSeen map[string]bool
+	updateErr       error
 }
 
 func (d *policySchedulerApplyTestDP) Compile(*config.Config) (*dataplane.CompileResult, error) {
@@ -49,9 +50,10 @@ func (d *policySchedulerApplyTestDP) SetDeferWorkers(v bool) {
 	d.deferStates = append(d.deferStates, v)
 }
 
-func (d *policySchedulerApplyTestDP) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) {
+func (d *policySchedulerApplyTestDP) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) error {
 	d.updateCalls++
 	d.updateStateSeen = activeState
+	return d.updateErr
 }
 
 type userspacePolicySchedulerApplyTestDP struct {
@@ -124,11 +126,13 @@ type runtimeOnlyPolicyUpdaterTestDP struct {
 	runtimeOnlyApplyTestDP
 	updateCalls int
 	stateSeen   map[string]bool
+	updateErr   error
 }
 
-func (d *runtimeOnlyPolicyUpdaterTestDP) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) {
+func (d *runtimeOnlyPolicyUpdaterTestDP) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) error {
 	d.updateCalls++
 	d.stateSeen = copyPolicySchedulerApplyState(activeState)
+	return d.updateErr
 }
 
 func (d *userspacePolicySchedulerApplyTestDP) SetPolicySchedulerActiveState(activeState map[string]bool) {
@@ -218,7 +222,7 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 			"old": {Name: "old"},
 		},
 	}
-	oldScheduler, oldState := scheduler.NewPrimed(oldCfg.Schedulers, func(map[string]bool) {}, testPolicySchedulerApplyNow())
+	oldScheduler, oldState := scheduler.NewPrimed(oldCfg.Schedulers, func(map[string]bool) error { return nil }, testPolicySchedulerApplyNow())
 	oldHash, _ := policySchedulerConfigHash(oldCfg)
 	dp := &policySchedulerApplyTestDP{
 		compileErr: dpuserspace.ErrPolicySchedulerProtocolIncompatible,

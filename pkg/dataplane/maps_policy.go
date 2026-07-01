@@ -243,14 +243,20 @@ func (m *Manager) SetDefaultPolicy(action uint8) error {
 
 // UpdatePolicyScheduleState iterates policy rules and toggles the Active flag
 // based on scheduler state. Only rules whose scheduler state changed are updated.
-func (m *Manager) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) {
+//
+// #3780: this is the retired eBPF map path (the userspace backend shadows
+// it in pkg/dataplane/userspace/manager.go). It stays best-effort: the map
+// is direct-write, there is nothing to retry, and the eBPF backend never
+// runs at runtime. It always reports success (nil) so the daemon's
+// scheduler self-heal never spins on a dead path.
+func (m *Manager) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) error {
 	zm, ok := m.maps["policy_rules"]
 	if !ok {
-		return
+		return nil
 	}
 	result := m.LastCompileResult()
 	if result == nil {
-		return
+		return nil
 	}
 
 	for _, slot := range result.PolicyScheduleRuleSlots {
@@ -278,6 +284,7 @@ func (m *Manager) UpdatePolicyScheduleState(_ *config.Config, activeState map[st
 				"active", active)
 		}
 	}
+	return nil
 }
 
 // ReadPolicyCounters reads the per-CPU policy counter values and sums them.

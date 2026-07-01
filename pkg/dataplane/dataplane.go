@@ -263,7 +263,12 @@ type DataPlane interface {
 	SetPolicyRule(policySetID uint32, ruleIndex uint32, rule PolicyRule) error
 	ClearZonePairPolicies() error
 	SetDefaultPolicy(action uint8) error
-	UpdatePolicyScheduleState(cfg *config.Config, activeState map[string]bool)
+	// UpdatePolicyScheduleState republishes enforcement for a scheduler
+	// window transition. It returns a non-nil error when the transition
+	// did NOT converge (the new inactive-bit view was not applied) so the
+	// caller can retry and surface the failure — a swallowed failure
+	// leaves stale enforcement live past the window (#3780).
+	UpdatePolicyScheduleState(cfg *config.Config, activeState map[string]bool) error
 
 	// Address book
 	SetAddressBookEntry(cidr string, addressID uint32) error
