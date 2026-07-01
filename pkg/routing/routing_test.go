@@ -1146,6 +1146,261 @@ func TestBuildPBRRules(t *testing.T) {
 			t.Errorf("overflow must return a degraded build error")
 		}
 	})
+
+	// === #3730 L4/per-packet predicate coverage ===
+
+	// #3730 OVER-STEER (the security bug): a term constrained by BOTH an address
+	// AND a destination-port must NOT collapse to an address-only rule that
+	// steers every protocol/port to that host. The emitted ip rule MUST carry the
+	// dport selector. Pre-fix buildPBRFromFilter read only the address and dropped
+	// the port, so this asserted Dport was silently nil (RED on revert).
+	t.Run("3730 dest-port honored not over-steered", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "portsteer",
+			Terms: []*config.FirewallFilterTerm{
+				{
+					Name:             "https-to-att",
+					DestAddresses:    []string{"203.0.113.10/32"},
+					DestinationPorts: []string{"443"},
+					RoutingInstance:  "ATT",
+				},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected degraded error for a representable dport term: %v", err)
+		}
+		if len(rules) != 1 {
+			t.Fatalf("expected 1 PBR rule, got %d: %+v", len(rules), rules)
+		}
+		if rules[0].Dst != "203.0.113.10/32" {
+			t.Errorf("dst = %q, want 203.0.113.10/32", rules[0].Dst)
+		}
+		if rules[0].Dport == nil {
+			t.Fatal("#3730 over-steer: address+dest-port term must emit a dport selector, got nil (would steer ALL ports to the host)")
+		}
+		if rules[0].Dport.Lo != 443 || rules[0].Dport.Hi != 443 {
+			t.Errorf("dport = %s, want 443", rules[0].Dport)
+		}
+	})
+
+	// #3730 UNDER-STEER: a term with ONLY an L4 predicate (destination-port, no
+	// dscp/address) previously hit the "no ip-rule-compatible criteria" branch and
+	// emitted NO rule (silent no-op) even though the operator believed FBF was
+	// active. It must now emit a rule carrying the dport. RED on revert (0 rules).
+	t.Run("3730 port-only term now emits a rule", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "portonly",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "dns", DestinationPorts: []string{"53"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 1 {
+			t.Fatalf("port-only term must emit 1 rule (not a silent no-op), got %d", len(rules))
+		}
+		if rules[0].Dport == nil || rules[0].Dport.Lo != 53 || rules[0].Dport.Hi != 53 {
+			t.Errorf("expected dport 53, got %s", rules[0].Dport)
+		}
+		if rules[0].Src != "" || rules[0].Dst != "" || rules[0].TOSSet {
+			t.Errorf("port-only rule must carry no addr/dscp selector, got %+v", rules[0])
+		}
+	})
+
+	// #3730 protocol honored: `from protocol tcp` → IPProto 6. A multi-protocol
+	// set expands to one rule per protocol.
+	t.Run("3730 protocol honored and expanded", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "protosteer",
+			Terms: []*config.FirewallFilterTerm{
+				{
+					Name:            "tcp-udp",
+					Protocols:       []string{"tcp", "udp"},
+					DestAddresses:   []string{"198.51.100.0/24"},
+					RoutingInstance: "ATT",
+				},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 2 {
+			t.Fatalf("expected 2 rules (tcp + udp), got %d: %+v", len(rules), rules)
+		}
+		gotProto := map[int]bool{rules[0].IPProto: true, rules[1].IPProto: true}
+		if !gotProto[6] || !gotProto[17] {
+			t.Errorf("expected IPProto 6 (tcp) and 17 (udp), got %+v", rules)
+		}
+	})
+
+	// #3730 source-port range honored: `from source-port 1024-2048` → a single
+	// FRA_SPORT_RANGE [1024,2048].
+	t.Run("3730 source-port range honored", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "sportrange",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "ephem", SourcePorts: []string{"1024-2048"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 1 || rules[0].Sport == nil {
+			t.Fatalf("expected 1 rule with an sport range, got %+v", rules)
+		}
+		if rules[0].Sport.Lo != 1024 || rules[0].Sport.Hi != 2048 {
+			t.Errorf("sport = %s, want 1024-2048", rules[0].Sport)
+		}
+	})
+
+	// #3730 named port honored via the shared SSOT resolver (config.junosServicePorts).
+	t.Run("3730 named dest-port resolves", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "named",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "web", DestinationPorts: []string{"https"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 1 || rules[0].Dport == nil || rules[0].Dport.Lo != 443 {
+			t.Fatalf("named port `https` must resolve to 443, got %+v", rules)
+		}
+	})
+
+	// #3730 UNREPRESENTABLE predicates fail closed (degrade + drop, never widen).
+	// Each of these has no ip-rule selector; a rule honoring only the address
+	// would over-steer, so the whole term is dropped and the build is degraded.
+	t.Run("3730 unrepresentable predicates degrade not widen", func(t *testing.T) {
+		cases := []struct {
+			name string
+			term *config.FirewallFilterTerm
+		}{
+			{"tcp-flags", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				TCPFlags: []string{"syn"}, RoutingInstance: "ATT"}},
+			{"is-fragment", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				IsFragment: true, RoutingInstance: "ATT"}},
+			{"icmp-type", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				ICMPTypes: []int{8}, RoutingInstance: "ATT"}},
+			{"icmp-code", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				ICMPCodes: []int{0}, RoutingInstance: "ATT"}},
+			{"dest-port-except", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				DestPortsExcept: []string{"80"}, RoutingInstance: "ATT"}},
+			{"source-port-except", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				SourcePortsExcept: []string{"22"}, RoutingInstance: "ATT"}},
+			{"flex-match", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				FlexMatch: &config.FlexMatchConfig{ByteOffset: 4, BitLength: 8, Value: 1}, RoutingInstance: "ATT"}},
+			{"unknown-from", &config.FirewallFilterTerm{
+				Name: "t", DestAddresses: []string{"10.0.0.0/8"},
+				UnknownFrom: []string{"ttl"}, RoutingInstance: "ATT"}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				filter := &config.FirewallFilter{Name: "u", Terms: []*config.FirewallFilterTerm{tc.term}}
+				rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+				if len(rules) != 0 {
+					t.Errorf("%s: unrepresentable predicate must emit 0 rules (no address-only over-steer), got %d: %+v",
+						tc.name, len(rules), rules)
+				}
+				if err == nil {
+					t.Errorf("%s: unrepresentable predicate must return a degraded build error", tc.name)
+				}
+			})
+		}
+	})
+
+	// #3730 an unparseable port / unknown protocol also fails closed.
+	t.Run("3730 unparseable port degrades", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "badport",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DestinationPorts: []string{"not-a-port"}, DestAddresses: []string{"10.0.0.0/8"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 0 {
+			t.Errorf("unparseable port must emit 0 rules, got %d", len(rules))
+		}
+		if err == nil {
+			t.Error("unparseable port must return a degraded build error")
+		}
+	})
+
+	// #3730 protocol 0 (HOPOPT) is not expressible (FRA_IP_PROTO>0 emit condition)
+	// → fail closed, mirroring the DSCP-0 handling.
+	t.Run("3730 protocol zero degrades", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "proto0",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", Protocols: []string{"0"}, DestAddresses: []string{"10.0.0.0/8"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 0 {
+			t.Errorf("protocol 0 must emit 0 rules, got %d", len(rules))
+		}
+		if err == nil {
+			t.Error("protocol 0 must return a degraded build error")
+		}
+	})
+
+	// #3730 an address-only term still works unchanged (the honor path must not
+	// regress the representable-address case).
+	t.Run("3730 address-only unchanged", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "addronly",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DestAddresses: []string{"10.5.0.0/16"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("address-only term must not degrade, got %v", err)
+		}
+		if len(rules) != 1 || rules[0].Dst != "10.5.0.0/16" {
+			t.Fatalf("expected 1 address-only rule, got %+v", rules)
+		}
+		if rules[0].IPProto != 0 || rules[0].Sport != nil || rules[0].Dport != nil {
+			t.Errorf("address-only rule must carry no L4 selector, got %+v", rules[0])
+		}
+	})
+
+	// #3730 apply leg: a rule carrying L4 selectors reaches the netlink rule with
+	// IPProto/Dport set. This pins the pbrManager.Apply wiring (RED if the Apply
+	// stops copying IPProto/Sport/Dport onto the netlink.Rule).
+	t.Run("3730 apply emits L4 selectors", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		p := &pbrManager{ops: ops}
+		if err := p.Apply([]PBRRule{
+			{Family: unix.AF_INET, IPProto: 6, Dport: &PBRPortRange{Lo: 443, Hi: 443}, TableID: 100, Instance: "vr"},
+		}); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		got := ops.rules[unix.AF_INET]
+		if len(got) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(got))
+		}
+		if got[0].IPProto != 6 {
+			t.Errorf("netlink rule IPProto = %d, want 6", got[0].IPProto)
+		}
+		if got[0].Dport == nil || got[0].Dport.Start != 443 || got[0].Dport.End != 443 {
+			t.Errorf("netlink rule Dport = %+v, want [443,443]", got[0].Dport)
+		}
+	})
 }
 
 // NOTE (#1918): the former TestProbeICMP asserted probeICMP("127.0.0.1")

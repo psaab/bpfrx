@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -337,11 +338,46 @@ type PBRRule struct {
 	// the applier either skipped the rule (no address predicate) or widened
 	// it to ALL DSCP values (address predicate present). The rule emits a
 	// `tos` selector iff TOSSet is true.
-	TOSSet   bool
-	Src      string // source CIDR, "" = any (no `from` selector)
-	Dst      string // destination CIDR, "" = any (no `to` selector)
-	TableID  int    // target routing table
-	Instance string // routing instance name (for logging)
+	TOSSet bool
+	Src    string // source CIDR, "" = any (no `from` selector)
+	Dst    string // destination CIDR, "" = any (no `to` selector)
+	// IPProto, Sport and Dport mirror the L4 predicates a kernel `ip rule` CAN
+	// express (#3730): FRA_IP_PROTO, FRA_SPORT_RANGE and FRA_DPORT_RANGE. Before
+	// #3730 the FBF mirror emitted only the address/DSCP selectors and silently
+	// dropped every L4 predicate, so a port/protocol-constrained
+	// `then routing-instance` term either over-steered ALL address-matching
+	// traffic to the target VRF or no-opped — with no degraded signal. The
+	// builder now honors these; predicates an ip rule cannot represent
+	// (port-except, tcp-flags, icmp-type/code, is-fragment, flexible-match-range)
+	// fail closed (the whole term is dropped and the build is marked degraded)
+	// rather than widening the match.
+	IPProto  int           // IP protocol number, 0 = no protocol selector
+	Sport    *PBRPortRange // source-port range, nil = no source-port selector
+	Dport    *PBRPortRange // destination-port range, nil = no dest-port selector
+	TableID  int           // target routing table
+	Instance string        // routing instance name (for logging)
+}
+
+// PBRPortRange is a numeric [Lo,Hi] port range for the kernel FBF ip-rule
+// mirror. A single port has Lo==Hi. It maps 1:1 onto netlink's RulePortRange
+// (FRA_SPORT_RANGE / FRA_DPORT_RANGE) but stays netlink-free so the builder is
+// unit-testable without the kernel.
+type PBRPortRange struct {
+	Lo uint16
+	Hi uint16
+}
+
+// String renders the range as a single port ("443") or a low-high span
+// ("1024-2048"). A nil receiver renders as "" so it is safe to log an unset
+// selector directly.
+func (r *PBRPortRange) String() string {
+	if r == nil {
+		return ""
+	}
+	if r.Lo == r.Hi {
+		return strconv.Itoa(int(r.Lo))
+	}
+	return fmt.Sprintf("%d-%d", r.Lo, r.Hi)
 }
 
 // maxPBRRules bounds the number of ip rules the PBR builder/applier will
@@ -420,13 +456,28 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 			rule.Dst = dst
 		}
 
+		// Emit the L4 selectors the kernel ip rule supports (#3730). IPProto is
+		// written only when > 0 (the netlink FRA_IP_PROTO emit condition; 0 =
+		// "match any"). Sport/Dport map onto FRA_SPORT_RANGE / FRA_DPORT_RANGE.
+		if pbr.IPProto > 0 {
+			rule.IPProto = pbr.IPProto
+		}
+		if pbr.Sport != nil {
+			rule.Sport = netlink.NewRulePortRange(pbr.Sport.Lo, pbr.Sport.Hi)
+		}
+		if pbr.Dport != nil {
+			rule.Dport = netlink.NewRulePortRange(pbr.Dport.Lo, pbr.Dport.Hi)
+		}
+
 		if err := p.ops.RuleAdd(rule); err != nil {
 			errs = append(errs, fmt.Errorf("add PBR rule instance %s table %d: %w", pbr.Instance, pbr.TableID, err))
 			continue
 		}
 		slog.Info("PBR rule added",
 			"instance", pbr.Instance, "tos", pbr.TOS, "tos_set", pbr.TOSSet,
-			"src", pbr.Src, "dst", pbr.Dst, "table", pbr.TableID)
+			"src", pbr.Src, "dst", pbr.Dst, "ipproto", pbr.IPProto,
+			"sport", pbr.Sport.String(), "dport", pbr.Dport.String(),
+			"table", pbr.TableID)
 		prio++
 	}
 	// Desired rules are re-added; surface any clear/parse/add/overflow failure.
@@ -478,11 +529,30 @@ func (p *pbrManager) clear() error {
 // selector requires the kernel ifname mapping and is a separate change), so a
 // duplicate per attachment would be redundant.
 //
+// Kernel-mirror support matrix (#3730). An `ip rule` can only express a subset
+// of a firewall-filter term's `from` predicates, so the mirror is exact for the
+// representable ones and FAILS CLOSED for the rest:
+//
+//   - REPRESENTABLE (honored): source/destination address + prefix-list (FRA_SRC/
+//     FRA_DST), DSCP (rtmsg tos, DSCP-0 excepted — see below), `protocol`
+//     (FRA_IP_PROTO), `source-port` (FRA_SPORT_RANGE) and `destination-port`
+//     (FRA_DPORT_RANGE). Multi-value protocol/port sets expand to one ip rule per
+//     value; a port range maps to a single [lo,hi] rule range.
+//   - UNREPRESENTABLE (fail-closed, whole term dropped + degraded): a non-empty
+//     address `except` set, a DSCP-0 match (the netlink layer writes tos only when
+//     non-zero and a zero tos matches ANY DSCP), `source-port-except` /
+//     `destination-port-except` (no negated port selector), `tcp-flags`,
+//     `icmp-type` / `icmp-code`, `is-fragment`, `flexible-match-range`, and any
+//     unresolved / unenforceable `from` leaf. Emitting the address/protocol/port
+//     half while silently dropping these would WIDEN the match and steer traffic
+//     the operator constrained away (the #3730 over-steer); dropping the term is
+//     the fail-safe under-steer (steered traffic falls back to the main table),
+//     and the userspace filter path still enforces the term exactly.
+//
 // The returned error is non-nil when the build is DEGRADED: a term carries an
-// ip-rule-unrepresentable predicate (a non-empty address `except` set, or a
-// DSCP-0 match the netlink layer cannot express) or the expansion exceeds
-// maxPBRRules. The successfully-built rules are still returned so the caller
-// can install them and surface the degradation.
+// ip-rule-unrepresentable predicate (per the matrix above) or the expansion
+// exceeds maxPBRRules. The successfully-built rules are still returned so the
+// caller can install them and surface the degradation.
 func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
 	if cfg == nil {
 		return nil, nil
@@ -571,7 +641,8 @@ func sortedKeys(m map[string]struct{}) []string {
 
 // buildPBRFromFilter extracts PBR rules from a single firewall filter.
 // The returned error slice carries per-term DEGRADED conditions (an
-// unrepresentable except set); the buildable rules are still returned.
+// unrepresentable except set, a DSCP-0 match, or an ip-rule-unrepresentable
+// L4/per-packet predicate — #3730); the buildable rules are still returned.
 func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[string]int, pls map[string]*config.PrefixList) ([]PBRRule, []error) {
 	var rules []PBRRule
 	var errs []error
@@ -584,6 +655,25 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			slog.Warn("PBR: routing-instance not found",
 				"filter", filter.Name, "term", term.Name,
 				"instance", term.RoutingInstance)
+			continue
+		}
+
+		// Classify the term's L4/per-packet predicates against what a kernel ip
+		// rule can express (#3730). A predicate an ip rule cannot represent
+		// (port-except / tcp-flags / icmp / is-fragment / flex / unresolved from
+		// leaf, or an unknown protocol / unparseable port) fails CLOSED: the whole
+		// term is dropped so the mirror never widens a constrained steer to
+		// address-only. The representable predicates (protocol, source/destination
+		// port) are honored below via the cross-product.
+		protos, sports, dports, unrep := pbrTermL4(term)
+		if len(unrep) > 0 {
+			errs = append(errs, fmt.Errorf(
+				"PBR filter %s term %s carries filter predicate(s) [%s] that a kernel "+
+					"ip rule cannot represent (the FBF mirror steers on address / DSCP / "+
+					"protocol / port only); steering for this term is dropped (fail-safe "+
+					"under-steer to the main table) rather than widening the match — enforce "+
+					"it on the userspace filter path",
+				filter.Name, term.Name, strings.Join(unrep, ", ")))
 			continue
 		}
 
@@ -666,29 +756,151 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		}
 		srcConstrained := !(len(srcs) == 1 && srcs[0] == "")
 		dstConstrained := !(len(dsts) == 1 && dsts[0] == "")
-		if !hasDSCP && !srcConstrained && !dstConstrained {
-			slog.Warn("PBR: filter term has routing-instance but no ip-rule-compatible criteria (dscp, source-address, destination-address)",
+		// A protocol / source-port / destination-port constraint is now an
+		// ip-rule-compatible criterion (#3730), so a term carrying only an L4
+		// predicate is no longer a no-op under-steer — it emits an ip rule with
+		// the L4 selector.
+		hasL4 := len(protos) > 0 || len(sports) > 0 || len(dports) > 0
+		if !hasDSCP && !srcConstrained && !dstConstrained && !hasL4 {
+			// A truly unconstrained `then routing-instance` term (no dscp, no
+			// address, no L4) would program `from all to all lookup <vr>`, which —
+			// the mirror has no iif selector (H03) — steers ALL traffic globally.
+			// Skip it (fail-safe under-steer), matching the pre-#3730 behavior.
+			slog.Warn("PBR: filter term has routing-instance but no ip-rule-compatible criteria (dscp, address, protocol, port)",
 				"filter", filter.Name, "term", term.Name)
 			continue
 		}
 
+		// Normalize each L4 dimension to a single "unset" entry when the term did
+		// not constrain it, so the cross-product still emits one rule per
+		// dscp × src × dst combination (IPProto 0 / nil port = no selector).
+		if len(protos) == 0 {
+			protos = []int{0}
+		}
+		if len(sports) == 0 {
+			sports = []*PBRPortRange{nil}
+		}
+		if len(dports) == 0 {
+			dports = []*PBRPortRange{nil}
+		}
+
 		for _, t := range toses {
-			for _, src := range srcs {
-				for _, dst := range dsts {
-					rules = append(rules, PBRRule{
-						Family:   family,
-						TOS:      t.tos,
-						TOSSet:   t.set,
-						Src:      src,
-						Dst:      dst,
-						TableID:  tableID,
-						Instance: term.RoutingInstance,
-					})
+			for _, proto := range protos {
+				for _, sp := range sports {
+					for _, dp := range dports {
+						for _, src := range srcs {
+							for _, dst := range dsts {
+								rules = append(rules, PBRRule{
+									Family:   family,
+									TOS:      t.tos,
+									TOSSet:   t.set,
+									IPProto:  proto,
+									Sport:    sp,
+									Dport:    dp,
+									Src:      src,
+									Dst:      dst,
+									TableID:  tableID,
+									Instance: term.RoutingInstance,
+								})
+							}
+						}
+					}
 				}
 			}
 		}
 	}
 	return rules, errs
+}
+
+// pbrTermL4 classifies a routing-instance term's L4 / per-packet `from`
+// predicates against what a kernel `ip rule` can express (#3730).
+//
+// It returns the REPRESENTABLE dimensions the caller folds into the ip-rule
+// cross-product — protos (FRA_IP_PROTO values), sports and dports
+// (FRA_SPORT_RANGE / FRA_DPORT_RANGE) — plus unrep, the list of predicates the
+// term carries that an ip rule CANNOT represent. A non-empty unrep means the
+// caller must FAIL CLOSED (drop the whole term + degrade); honoring the
+// representable half while dropping the rest would widen the steer beyond what
+// the operator authored (the #3730 over-steer). Unknown protocol names,
+// protocol 0 (HOPOPT, which the netlink FRA_IP_PROTO>0 emit condition cannot
+// express), and unparseable ports are also reported as unrep so they fail
+// closed rather than silently narrowing/widening the match.
+func pbrTermL4(term *config.FirewallFilterTerm) (protos []int, sports, dports []*PBRPortRange, unrep []string) {
+	// Predicates an ip rule has no selector for at all.
+	if hasRealString(term.SourcePortsExcept) {
+		unrep = append(unrep, "source-port-except")
+	}
+	if hasRealString(term.DestPortsExcept) {
+		unrep = append(unrep, "destination-port-except")
+	}
+	if len(term.TCPFlags) > 0 {
+		unrep = append(unrep, "tcp-flags")
+	}
+	if term.IsFragment {
+		unrep = append(unrep, "is-fragment")
+	}
+	if len(term.ICMPTypes) > 0 || len(term.UnknownICMPTypes) > 0 {
+		unrep = append(unrep, "icmp-type")
+	}
+	if len(term.ICMPCodes) > 0 || len(term.UnknownICMPCodes) > 0 {
+		unrep = append(unrep, "icmp-code")
+	}
+	if term.FlexMatch != nil || len(term.UnknownFlexMatch) > 0 {
+		unrep = append(unrep, "flexible-match-range")
+	}
+	for _, f := range term.UnknownFrom {
+		unrep = append(unrep, "unsupported from-match "+f)
+	}
+
+	// Representable: `from protocol` → one FRA_IP_PROTO value per protocol.
+	for _, p := range term.Protocols {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		n, ok := appid.ProtocolNumber(p)
+		if !ok || n == 0 {
+			unrep = append(unrep, fmt.Sprintf("protocol %q", p))
+			continue
+		}
+		protos = append(protos, int(n))
+	}
+
+	// Representable: `from source-port` / `from destination-port` → one
+	// FRA_SPORT_RANGE / FRA_DPORT_RANGE per port spec (a range maps to [lo,hi]).
+	for _, spec := range term.SourcePorts {
+		if strings.TrimSpace(spec) == "" {
+			continue
+		}
+		lo, hi, ok := config.ResolveFilterPortRange(spec)
+		if !ok {
+			unrep = append(unrep, fmt.Sprintf("source-port %q", spec))
+			continue
+		}
+		sports = append(sports, &PBRPortRange{Lo: lo, Hi: hi})
+	}
+	for _, spec := range term.DestinationPorts {
+		if strings.TrimSpace(spec) == "" {
+			continue
+		}
+		lo, hi, ok := config.ResolveFilterPortRange(spec)
+		if !ok {
+			unrep = append(unrep, fmt.Sprintf("destination-port %q", spec))
+			continue
+		}
+		dports = append(dports, &PBRPortRange{Lo: lo, Hi: hi})
+	}
+	return protos, sports, dports, unrep
+}
+
+// hasRealString reports whether the slice carries at least one non-empty
+// (trimmed) entry — the "constrained" test for a firewall-filter match list.
+func hasRealString(vals []string) bool {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // resolvePBRDirection resolves one direction (source or destination) of a
