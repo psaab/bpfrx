@@ -3,13 +3,27 @@
 - Issue: psaab/xpf#3627 (part-A / M06 "echo queried zones" already MERGED via PR #3638)
 - Research branch: `research/3627-explain-dimension`
 - Base: origin/master `63d1052e2`
-- Revision: r1
-- Verdict (proposed): **PLAN-DEFER** (`plan-deferred-research`) — design is sound and
-  buildable and is captured here; it is a Low-severity diagnostic nicety with
-  operator workarounds and two real design caveats (SSOT-drift risk for B1,
-  candidate-attribution + sub-dimension ambiguity for B2), so it is not worth
-  scheduling now. If any slice is built, do **B1 first** (higher value, closes a
-  real accuracy gap).
+- Revision: r2 (folds Codex + AGY + Claude-SMR hostile plan review; see §12)
+- Verdict (converged): **PLAN-DEFER** (`plan-deferred-research`) for part-B, split:
+  - **B2 (per-dimension miss explanation): KILL** — unanimous across all three
+    reviewers. Not Junos parity; the OR-over-apps ambiguity forces a coarse
+    `application` dimension that does not deliver the requested
+    protocol/src-port/dst-port answers for the common wrong-port case, so ROI is
+    near-zero. Do not build.
+  - **B1 (host-inbound admitting token + message accuracy): DEFER** — real
+    diagnostic-accuracy value (post-#3405 a no-stanza zone default-DENIES
+    host-inbound, so the current "local delivery proceeds" message is actively
+    misleading, not merely incomplete), but it is a DIAGNOSTIC-tool accuracy gap,
+    NOT a dataplane enforcement bug (the kernel-nft + Rust paths already deny
+    correctly). The r1 design was not implementation-ready (it carried the stale
+    pre-#3405 "no-stanza = open" model and an under-specified classifier); r2
+    corrects the design so a future `/engineer` can pick it up. Build **B1a**
+    (structured SSOT) only — B1b is too weak (all three agree).
+- Reviewer split: 2-of-3 DEFER (Codex + Claude SMR). AGY dissented to
+  PLAN-READY-for-B1 on a "critical security-posture bug" premise that is refuted
+  by #3405 (the enforcement paths deny correctly; only the diagnostic is
+  incomplete) — so the converged disposition is DEFER, not READY. All three agree
+  B2 is KILL and that the r1 plan was not build-ready as written.
 
 ---
 
@@ -185,40 +199,84 @@ options, in preference order:
   strings from this table, and have the new classifier *match* against it. One
   table, three consumers (nft render, Rust parity test, classifier). The
   existing `TestHostInbound*` parity tests continue to guard it.
-- **B1b (lighter, bounded drift):** keep the classifier self-contained in
-  `dpuserspace` but add a parity test asserting its token domain ==
-  `config.KnownHostInboundSystemServices` ∪ `KnownHostInboundProtocols` (minus
-  L2), mirroring the existing domain-parity tests. This bounds *which* tokens are
-  known but not per-token *port* correctness — weaker. Only acceptable if B1a is
-  deemed too heavy for a Low item.
+- **B1b (lighter, bounded drift): REJECTED (all three reviewers).** A
+  self-contained classifier + domain-parity test bounds *which* tokens are known
+  but NOT per-token *port* correctness — so it can claim "ssh admitted tcp/22"
+  while a future nft edit moves ssh to a different port and only nft+Rust get the
+  parity test. For a feature whose entire claim is "this token admitted THIS
+  tuple", port-level drift is disqualifying. B1a is therefore MANDATORY if B1 is
+  ever built: extract the structured `L4Match` SSOT, make the `pkg/daemon` nft
+  builder RENDER from it, add a Rust parity test asserting per-tuple (not just
+  domain) equivalence with `host_inbound.rs`. This is real work on a
+  security-sensitive path (R5) — a core reason B1 DEFERS rather than shipping.
+
+**CORRECTED post-#3405 admission model (Codex catch — r1 was wrong).** r1 said
+"no-stanza zone = admit-all (open)". That is STALE. Since #3405 EVERY configured
+security zone is host-inbound-ENFORCING (Junos default-deny parity): a zone with
+interfaces but NO `host-inbound-traffic` stanza carries
+`HostInboundConfigured=true` with EMPTY token sets → `admits()` returns false for
+every service → default-DENY, identical to an empty `host-inbound-traffic { }`
+(verified `pkg/dataplane/userspace/zones.go:198,475`, RED-on-revert test
+`zones_host_inbound_test.go` `TestNoStanzaZoneDefaultDeniesBothSurfaces`). So the
+current simulator "local delivery proceeds" message is ACTIVELY MISLEADING for a
+no-stanza zone (the box would drop the packet), not merely incomplete. This
+STRENGTHENS B1's rationale but INVALIDATES the r1 "reuse HostInboundConfigured
+open/closed distinction" wiring — there is no open case among configured zones.
+
+**Classifier scoping (Codex + AGY catch — r1 under-specified).** A zone-only
+lookup can LIE. The classifier must, faithfully to the enforcement paths:
+  - key on the **effective per-interface view**, not the zone: #3362
+    `BuildZoneHostInboundViews` can emit MULTIPLE views per zone (zone-level ∪
+    per-interface override), each scoped to that interface's firewall-local
+    addresses. The query has no ingress interface, so the honest model is: report
+    admission if ANY view for the ingress zone admits the tuple, and name the
+    token — with a caveat that a per-interface override may narrow it. (A future
+    surface could accept an optional interface selector.)
+  - honor the **global pre-accepts (#3171)**: ICMP/ND/PMTUD and the ESP/AH data
+    plane are accepted BEFORE any per-zone deny; the classifier must report those
+    as admitted regardless of the zone token set (else it under-reports).
+  - exclude the **lifeline interfaces** (fxp0/em0/fab*) that never reach the
+    classifier (their addresses are dropped from the view).
+  - handle a **missing dst_ip / protocol**: with no protocol the tuple cannot be
+    classified against a port/proto token — return "indeterminate", never a false
+    admit.
 
 **Wiring into the simulator.** `matchJunosHost` gains access to the ingress
-zone's view (build once in `Match`, thread in). `Result` gains:
+zone's view(s) (build once in `Match`, thread in). `Result` gains a
+PRESENCE-SAFE field (Codex catch — a bare `string ""` cannot distinguish "not
+computed" / "no token admits" / "global pre-accept" / "admitted by token"):
 
 ```go
-HostInboundService string // admitting token; "" when none admits
+type HostInboundAdmission struct {
+    Status HostInboundStatus // notComputed | denied | globalAccept | tokenAdmit
+    Token  string            // set only when Status==tokenAdmit
+}
+HostInbound *HostInboundAdmission // nil off the host path
 ```
 
-Populated ONLY on the host path. When `""` and the zone HAS a
-`host-inbound-traffic` stanza, the operator-facing render should say local
-delivery would be DROPPED by host-inbound-traffic (accuracy fix); when the zone
-has NO stanza, admit-all (`HostInboundConfigured` false → open) — reuse the
-existing `HostInboundConfigured` distinction from `pkg/api/security.go` (56-59).
+**Response schema (additive, presence-safe).**
 
-**Response schema (additive only).**
+- REST `MatchPoliciesResult`: `HostInbound *HostInboundAdmission
+  \`json:"host_inbound,omitempty"\`` (nested object with a status string), NOT a
+  bare `host_inbound_service` string.
+- proto `MatchPoliciesResponse`: a new `HostInboundAdmission host_inbound = 15;`
+  message (status enum + token string), so absence and the four states are
+  distinguishable on the wire.
+- CLI host-inbound branch prints the status: `admitted by system-services ssh` /
+  `admitted by global ICMP/ND accept` / `DENIED by host-inbound-traffic (no
+  service admits this tuple; the box would drop it)` / `indeterminate (specify
+  protocol)`.
 
-- REST `MatchPoliciesResult`: `HostInboundService string
-  \`json:"host_inbound_service,omitempty"\``.
-- proto `MatchPoliciesResponse`: `string host_inbound_service = 15;`.
-- CLI host-inbound branch prints `  host-inbound admitted by: system-services
-  ssh` (or `  host-inbound: NO host-inbound-traffic service admits this tuple
-  (would be dropped)`).
+### B2 — per-dimension miss explanation — **VERDICT: KILL** (unanimous)
 
-### B2 — per-dimension miss explanation
+Retained for the record; NOT to be built. All three reviewers agree the
+OR-over-apps coarseness (below) plus non-Junos-parity + Low severity make ROI
+near-zero. The design sketch stays so a future reader understands *why* it was
+killed, not merely that it was.
 
-**Refactor, don't fork (mandatory).** Replace the boolean gate with a
-reason-returning gate; the boolean becomes a trivial wrapper so there is exactly
-ONE matcher:
+**Refactor, don't fork (would have been mandatory).** Replace the boolean gate
+with a reason-returning gate; the boolean becomes a trivial wrapper so there is
+exactly ONE matcher:
 
 ```go
 type MissDim int
@@ -245,10 +303,19 @@ sub-dimension as authoritative. This is a deliberate, documented limitation.
 
 **Candidate attribution.** Do not report a single "the" failing dimension —
 that is arbitrary when candidates fail differently. Instead, when
-`Query.ExplainMiss` is set AND the result is a no-match, walk the SAME tier set
-`Match` would have (exact zone-pair → merged single-wildcard → both-any →
-eligible scoped globals; on the host path, the junos-host tiers) and record one
-entry per candidate policy the query reached:
+`Query.ExplainMiss` is set AND the result is a no-match, walk the candidate tier
+set and record one entry per candidate policy the query reached.
+
+**The tier traversal itself must be FACTORED OUT of `Match`, not re-walked
+alongside it (Codex catch).** A `ruleMissReason` wrapper alone is insufficient:
+if explain re-implements the tier loop (exact zone-pair → merged single-wildcard
+→ both-any → scoped globals → the #3355 zone-id-0 guard → the junos-host path),
+it can drift from `Match`'s exact eligibility/merge/scoping logic — the #3042
+divergence bug one level up. The refactor must extract a single candidate
+iterator that BOTH `Match` (first-hit) and explain (all-candidates-with-reason)
+consume. This is a larger refactor of the core matcher than r1 implied — another
+reason KILL (not DEFER) is right for B2: the SSOT-safe way to build it is
+disproportionate to its value. The per-candidate record shape would have been:
 
 ```go
 type MissExplain struct {
@@ -309,8 +376,10 @@ default path calls `ruleMatches` (unchanged wrapper) and allocates nothing new.
   must join the parity web (B1a) or at least the domain-parity test (B1b) so
   `ident-reset`=reject, L2 (`isis`)=no-op, family scoping (dhcp=v4/dhcpv6=v6,
   ospf=v4/ospf3=v6), and `protocols all` expansion all agree with nft + Rust.
-- **`HostInboundConfigured` semantics.** No-stanza zone = admit-all (open);
-  present-but-no-match = drop. B1 must not conflate them.
+- **Post-#3405 host-inbound default-deny.** EVERY configured zone enforces
+  host-inbound; a no-stanza zone default-DENIES (not open). B1 must model deny as
+  the baseline and report the global pre-accepts (#3171 ICMP/ND/PMTUD, ESP/AH)
+  and lifeline exclusions faithfully, or it will over- or under-report admission.
 - **Fail-closed input validation** (ports/proto/ICMP/IP) stays at the adapter
   boundary; explain adds no new silent-coerce path.
 
@@ -324,6 +393,9 @@ default path calls `ruleMatches` (unchanged wrapper) and allocates nothing new.
 | R4 | Candidate-attribution confuses operators ("which policy is it blaming?") | Med | Low | Per-candidate list, not one blamed dimension; empty list = zone-pair eliminated all |
 | R5 | Scope creep: B1a refactor of the nft builder touches a security-sensitive path | Med | Med | Behavior-preserving render refactor guarded by existing nft golden/parity tests; or choose B1b |
 | R6 | Low ROI — a Low-severity nicety consuming build+quad-review budget with existing workarounds | High | Low | This plan; DEFER unless demand appears |
+| R7 | B1 classifier keys on zone not the #3362 per-interface view / address / global pre-accepts → reports a token that does not actually admit for that interface | Med | Med | Classifier scoping model in §5 (per-view union + #3171 pre-accepts + lifeline exclusion + indeterminate on missing proto) |
+| R8 | B2 explain re-walks the tier set beside `Match` and drifts from its eligibility/merge/scoping (#3042 one level up) | Med | High | Factor a single candidate iterator out of `Match`; but the cost is why B2 is KILLed |
+| R9 | Presence-hostile schema (`string host_inbound_service`) cannot distinguish not-computed / denied / global-accept / token-admit | Med | Med | Nested `HostInboundAdmission{status,token}` object + proto message (§5) |
 
 ## 9. Test plan
 
@@ -393,3 +465,57 @@ If built (per slice):
    unconditional local delivery. Should the "host-inbound-traffic gates this"
    correction ship as a small standalone fix EVEN IF the token-naming feature
    defers/kills? (It is arguably a correctness bug, not a nicety.)
+
+## 12. Adversarial review convergence (r1 → r2)
+
+Three plan reviewers (Copilot joins later at `/engineer` on the code PR, which
+there will be none of unless the user reactivates B1). Verified against
+origin/master `63d1052e2`.
+
+- **Codex (hostile, `codex exec` read-only in the worktree): VERDICT PLAN-DEFER.**
+  "B2 is low-value, non-Junos-parity, and too coarse to justify build budget,
+  while B1 is a real accuracy problem but the written plan is not
+  implementation-ready because it carries stale no-stanza/open semantics and an
+  under-specified host-inbound classifier model. Build nothing from this plan
+  as-is; rewrite B1 around #3405 truth, per-interface/address-selected views, and
+  a real structured/parity story, and leave B2 deferred or killed." Substantive
+  catches folded into r2: (a) the #3405 no-stanza-DENY correction (r1 factual
+  error); (b) B1 classifier must key on the per-interface view/address + global
+  pre-accepts; (c) B2 candidate iterator must be factored out of `Match`, not
+  re-walked; (d) presence-hostile `string host_inbound_service` → nested
+  status+token.
+
+- **AGY (adversarial): VERDICT PLAN-READY for B1 / PLAN-KILL for B2.** Agreed B2
+  is KILL (OR-over-apps coarseness → near-zero value) and that B1a (structured
+  SSOT feeding nft render + classifier + per-tuple Rust parity) is mandatory and
+  B1b too weak. Dissented on B1 urgency, framing the missing host-inbound gating
+  as a "critical security-posture validation bug (false-positive admission)".
+  **Rebuttal (why the converged disposition is DEFER, not READY):** the
+  match-policies simulator is a DIAGNOSTIC tool; it does not enforce. Post-#3405
+  the kernel-nft primary path and the Rust AF_XDP secondary path already
+  default-DENY host-inbound correctly — there is no dataplane false-positive
+  admission. The gap is that the diagnostic TOOL over-states admission, i.e. an
+  accuracy defect in an operator convenience, not a security hole. Combined with
+  Codex's "not implementation-ready as written", B1 is DEFER: correct the design
+  (done in r2), pick it up later if demand appears.
+
+- **Claude SMR (hostile, `claude-smr-plan-r1.md`): VERDICT PLAN-DEFER.** B2
+  KILL-defensible in isolation (coarse `application` near-fatal for the common
+  wrong-port case); B1 real-but-modest value with no cheap-and-safe build option
+  (B1a scope-creep on the nft path, B1b port-drift trap); the one cheap correct
+  extract is a message-completeness one-liner, not the token machinery. Rejected
+  PLAN-READY (ROI too low for a Low item).
+
+**Convergence:** unanimous **B2 = KILL**; **B1 = DEFER** by 2-of-3 (Codex +
+Claude SMR), AGY's lone READY-for-B1 resting on a security-severity premise
+refuted by #3405 (enforcement is correct; only the diagnostic is incomplete) and
+undercut by all three agreeing the r1 plan was not build-ready. Global research
+disposition: **PLAN-DEFER** for part-B, with the corrected B1a design preserved
+here for future pickup and B2 killed.
+
+**If the user wants any near-term motion** (optional, not required by this
+verdict): the cheapest correct slice is a standalone one-line correction of the
+host-inbound verdict string so it no longer implies unconditional local delivery
+(e.g. "governed by this zone's host-inbound-traffic system-services/protocols")
+— shipping accuracy without the structured classifier, per-view scoping, or
+schema changes. That is a `/engineer`-sized micro-fix, not part-B.
