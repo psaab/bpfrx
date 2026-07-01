@@ -516,9 +516,12 @@ type Exporter struct {
 // callback so there is exactly one counter per exporter.
 func NewExporter(cfg *ExportConfig) (*Exporter, error) {
 	e := &Exporter{
-		cfg:          cfg,
-		bootTime:     time.Now(),
-		sourceID:     1,
+		cfg:      cfg,
+		bootTime: time.Now(),
+		// #3740: stable per-group SourceID (RFC 3954 §5.1) derived from the
+		// config identity so two same-collector groups no longer collide on
+		// SourceID=1. HA-symmetric (pure function of config-synced fields).
+		sourceID:     stableExporterID("netflow9", cfg.InstanceName, cfg.TemplateName),
 		fieldsV4:     buildTemplateFieldsV4(cfg.V9TemplateOpts),
 		fieldsV6:     buildTemplateFieldsV6(cfg.V9TemplateOpts),
 		MaskResolver: NewRouteMaskResolver(0),
@@ -594,10 +597,10 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 		DstMask:   dstMask,
 		// #2749: ingress ifindex (SNMP ifIndex) -> NetFlow IE 10; plus the
 		// re-introduced srcTos (IE 5) / tcpFlags (IE 6) / OutputSNMP (IE 14).
-		InIf:       evt.InIf,
-		TOS:        evt.TOS,
-		TCPFlags:   evt.TCPFlags,
-		OutIf:      evt.OutIf,
+		InIf:     evt.InIf,
+		TOS:      evt.TOS,
+		TCPFlags: evt.TCPFlags,
+		OutIf:    evt.OutIf,
 		// #3270: flowDirection (IE 61), derived from sampling-direction in the
 		// daemon callback. Encoded only when the group enabled flow-dir.
 		Direction:  evt.Direction,
