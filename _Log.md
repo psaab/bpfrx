@@ -24879,3 +24879,17 @@ top.
 - **Timestamp**: 2026-07-01
 - **Action**: Add RED-on-revert golden tests for all 6 surfaces; regenerate ShowText golden for the new no-stanza posture line; document the #3654 display fix
 - **File(s)**: pkg/cli/host_inbound_display_3654_test.go (new), pkg/grpcapi/server_show_zones_hostinbound_display_3654_test.go (new), cmd/cli/show_zones_hostinbound_3654_test.go (new), pkg/grpcapi/testdata/server_show_golden.json (regenerated), docs/junos-cli-reference.md
+
+## 2026-07-01 — #3658 zone-detail policy summary tiers (M04/M05)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add SSOT predicate config.GlobalPolicyAppliesToZone (mirrors the runtime AND-combined GlobalZoneScope match) so the zone-detail summary can list the global tier for a zone
+- **File(s)**: pkg/config/types_security.go
+- **Action**: Extend the local-CLI `show security zones detail` policy summary to render all three evaluation tiers — [zone-pair], applicable [global] policies (M04), and the always-present [default] default-policy catch-all (M05) — replacing the bare "(no policies)"; add local policyActionStr + globalZoneScopeLabel helpers
+- **File(s)**: pkg/cli/cli_show_security_zones.go
+- **Action**: Mirror the same three-tier summary on the gRPC text zones-detail surface; add globalZoneScopeLabel helper
+- **File(s)**: pkg/grpcapi/server_show_zones_text.go, pkg/grpcapi/server_helpers.go
+- **Action**: Add RED-on-revert golden tests (CLI + gRPC) — a global-only zone shows the global tier + effective default-policy, scoped globals do not leak into unrelated zones, and the no-applicable-policy note still surfaces the default line
+- **File(s)**: pkg/cli/cli_show_security_zones_policy_tiers_3658_test.go (new), pkg/grpcapi/server_show_zones_policy_tiers_3658_test.go (new)
+- **Action**: Document the detail-mode three-tier policy summary
+- **File(s)**: docs/junos-cli-reference.md, _Log.md
