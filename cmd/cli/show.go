@@ -1143,8 +1143,15 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		fmt.Printf("    Action: %s\n", resp.Action)
 	} else if resp.HostInboundUnmatched {
 		// #3285: host-bound traffic — no transit global/default fallback.
+		// #3655: render the SSOT policymatch.HostInboundShowLine (as the local
+		// CLI / REST / gRPC surfaces already do post-#3647) instead of the old
+		// hard-coded "local delivery proceeds" wording. That literal read as an
+		// unconditional admit even though a no-stanza zone now default-DENIES
+		// host-inbound (#3405); the shared const states delivery is subject to
+		// host-inbound-traffic service admission so remote clients see the same
+		// accurate verdict as every other transport.
 		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", req.FromZone)
-		fmt.Printf("  host-inbound: local delivery proceeds (transit global/default-policy NOT applied)\n")
+		fmt.Printf("  %s\n", policymatch.HostInboundShowLine)
 	} else {
 		// #3283: render the SERVER-provided default verdict (resp.Action carries
 		// "<action> (default)" from the configured default-policy), NOT a
