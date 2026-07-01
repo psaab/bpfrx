@@ -48,7 +48,7 @@ func surfaceAScope(fqdn string, family Family, rg int) SurfaceAScope {
 // fixedObserver returns a single address for every scope.
 func fixedObserver(addr string) AddressObserver {
 	a := netip.MustParseAddr(addr)
-	return func(SurfaceAScope) (AddressObservation, bool) {
+	return func(context.Context, SurfaceAScope) (AddressObservation, bool) {
 		return AddressObservation{Addr: a, Source: AddressSourceDHCP}, true
 	}
 }
@@ -210,7 +210,7 @@ func TestSurfaceATransientObservationDoesNotWithdraw(t *testing.T) {
 	}
 	// Transient observation failure (ok=false): NEVER withdraw (the
 	// never-blackhole rule).
-	transient := func(SurfaceAScope) (AddressObservation, bool) {
+	transient := func(context.Context, SurfaceAScope) (AddressObservation, bool) {
 		return AddressObservation{}, false
 	}
 	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, transient, nil, nil); err != nil {

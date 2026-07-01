@@ -98,7 +98,7 @@ func TestSurfaceAWithdrawBacksOffAddressLoss(t *testing.T) {
 
 	// Observer now reports a definitive "no address" (ok=true, invalid Addr) →
 	// the engine withdraws the previously-published record.
-	lost := func(SurfaceAScope) (AddressObservation, bool) {
+	lost := func(context.Context, SurfaceAScope) (AddressObservation, bool) {
 		return AddressObservation{Source: AddressSourceDHCP}, true
 	}
 

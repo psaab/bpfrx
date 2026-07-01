@@ -232,7 +232,7 @@ func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) []ddns.SurfaceAScope {
 // "definitively no address" (interface down / lease gone) — the engine
 // withdraws.
 func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
-	return func(scope ddns.SurfaceAScope) (ddns.AddressObservation, bool) {
+	return func(ctx context.Context, scope ddns.SurfaceAScope) (ddns.AddressObservation, bool) {
 		ifName := scope.Key.Interface
 		un := scope.Key.Unit
 		af4 := scope.Key.Family == ddns.FamilyV4
@@ -251,7 +251,13 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			if scope.Provider == nil || scope.Provider.CheckIPURL == "" {
 				return ddns.AddressObservation{}, false
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), surfaceACheckIPTimeout)
+			// Bound the single probe by surfaceACheckIPTimeout BUT derive it from
+			// the reconcile ctx, not context.Background() (#3736): a daemon
+			// shutdown / pass-deadline cancel now aborts an in-flight checkip
+			// promptly instead of hanging up to the full 10s. The engine already
+			// runs this observer with the manager mutex released, so a slow probe
+			// no longer blocks StatusViews/Stats/other scopes either.
+			ctx, cancel := context.WithTimeout(ctx, surfaceACheckIPTimeout)
 			defer cancel()
 			allow, badAllow := ddns.ParseAllowlistChecked(scope.Provider.CheckIPAllowlist)
 			if len(badAllow) > 0 {

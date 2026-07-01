@@ -144,7 +144,7 @@ func TestSurfaceAReconcileReapsSupersededHTTPClients(t *testing.T) {
 			t.Fatalf("resolveBackend pass %d: %v", i, err)
 		}
 		catalog := map[string]*config.DDNSProvider{"p": p}
-		err := m.Reconcile(ctx, nil, func(SurfaceAScope) (AddressObservation, bool) {
+		err := m.Reconcile(ctx, nil, func(context.Context, SurfaceAScope) (AddressObservation, bool) {
 			return AddressObservation{}, false
 		}, nil, catalog)
 		if err != nil {

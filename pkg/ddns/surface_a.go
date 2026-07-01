@@ -142,7 +142,14 @@ type AddressObservation struct {
 // memfile parser. ok=false means the address could not be observed this cycle
 // (transient) — the engine then leaves the scope untouched (no withdraw on a
 // transient observation failure, the never-blackhole rule).
-type AddressObserver func(scope SurfaceAScope) (AddressObservation, bool)
+//
+// ctx is the reconcile/pass context (#3736): the checkip address source
+// performs a blocking external HTTP GET, and threading ctx lets that probe
+// inherit the pass deadline and abort promptly on daemon shutdown instead of
+// hanging up to its own fixed timeout. The engine invokes the observer with
+// m.mu RELEASED (see reconcileScopeLocked) so a slow/black-holed checkip
+// endpoint cannot block StatusViews/Stats or serialize other scopes.
+type AddressObserver func(ctx context.Context, scope SurfaceAScope) (AddressObservation, bool)
 
 // surfaceAState is the per-scope runtime engine state (plan §5.5): the
 // last-published address + time (change-detection + forced-refresh) and the
@@ -567,6 +574,27 @@ func (m *SurfaceAManager) providerIO(fn func() error) error {
 	return fn()
 }
 
+// observeIO runs the per-scope address observation with m.mu RELEASED (#3736,
+// the observation residual of #2778). For a checkip source the observer
+// performs a blocking external HTTP GET (up to ~10s); holding the manager mutex
+// across it would block StatusViews/Stats and serialize every OTHER scope's
+// reconcile behind a slow/black-holed checkip endpoint — the exact lock
+// discipline #2778 established for provider Upsert/Delete, which observation was
+// left out of. The observation only READS external state (netlink / DHCP /
+// HTTP), never manager state, so nothing under the lock is needed for the
+// round-trip; the caller re-reads m.state/m.runtime after the lock is
+// re-acquired before making any publish/withdraw decision. The daemon
+// serializes reconcile passes (surfaceAReconcileInFlight), so no concurrent
+// pass mutates m.runtime/m.state while the lock is dropped here — only the
+// read-only StatusViews/Stats callers may run, which is the whole point.
+// Panic-safe: the lock is re-acquired even if fn panics, keeping Reconcile's
+// deferred Unlock balanced.
+func (m *SurfaceAManager) observeIO(fn func()) {
+	m.mu.Unlock()
+	defer m.mu.Lock()
+	fn()
+}
+
 // Reconcile drives one Surface A reconcile pass over the configured scopes
 // (plan §5.5/§5.6). For each scope it: observes the current address; applies
 // the per-RG HA gate; runs change-detection + forced-refresh + error backoff;
@@ -770,7 +798,17 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		return nil
 	}
 
-	obs, ok := observe(sc)
+	// Observe the scope's current address with m.mu RELEASED and the reconcile
+	// ctx threaded (#3736): for a checkip source `observe` is a blocking external
+	// HTTP GET, so holding the mutex across it would block StatusViews/Stats and
+	// serialize other scopes behind a hung endpoint, and ignoring ctx would hang
+	// shutdown behind an in-flight probe. The backoff-window check above already
+	// ran under the lock, so a backed-off scope never reaches this HTTP call.
+	var (
+		obs AddressObservation
+		ok  bool
+	)
+	m.observeIO(func() { obs, ok = observe(ctx, sc) })
 	if !ok {
 		// Transient observation failure: leave the scope untouched (never
 		// withdraw on a transient — the never-blackhole rule, plan §8.2).
