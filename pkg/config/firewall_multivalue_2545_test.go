@@ -13,17 +13,29 @@ import "testing"
 //
 // FAIL-ON-REVERT: with the pre-fix scalar last-write-wins compiler these tests
 // fail — e.g. Protocols would carry only "udp" (length 1), not [tcp, udp].
+//
+// #3723: protocol/dscp accumulation and icmp-type/icmp-code accumulation are
+// split into SEPARATE terms so each is a SATISFIABLE cross-field combination
+// (the cross-field gate rejects a never-match term such as icmp-type on protocol
+// tcp). The multi-value coverage is unchanged — every criterion is still
+// exercised repeated within one `from` block, just on a protocol that carries it.
 
 func TestFirewallFilterMultiValueHierarchical(t *testing.T) {
 	input := `firewall {
     family inet {
         filter mv {
-            term t {
+            term proto {
                 from {
                     protocol tcp;
                     protocol udp;
                     dscp ef;
                     dscp af43;
+                }
+                then discard;
+            }
+            term icmp {
+                from {
+                    protocol icmp;
                     icmp-type 8;
                     icmp-type 0;
                     icmp-code 3;
@@ -43,27 +55,29 @@ func TestFirewallFilterMultiValueHierarchical(t *testing.T) {
 		t.Fatalf("compile error: %v", err)
 	}
 	f := cfg.Firewall.FiltersInet["mv"]
-	if f == nil || len(f.Terms) != 1 {
-		t.Fatalf("expected 1 term, got %#v", f)
+	if f == nil || len(f.Terms) != 2 {
+		t.Fatalf("expected 2 terms, got %#v", f)
 	}
-	term := f.Terms[0]
-	assertStrSet(t, "protocol", term.Protocols, []string{"tcp", "udp"})
-	assertStrSet(t, "dscp", term.DSCPs, []string{"ef", "af43"})
-	assertIntSet(t, "icmp-type", term.ICMPTypes, []int{8, 0})
-	assertIntSet(t, "icmp-code", term.ICMPCodes, []int{3, 4})
+	protoTerm, icmpTerm := f.Terms[0], f.Terms[1]
+	assertStrSet(t, "protocol", protoTerm.Protocols, []string{"tcp", "udp"})
+	assertStrSet(t, "dscp", protoTerm.DSCPs, []string{"ef", "af43"})
+	assertIntSet(t, "icmp-type", icmpTerm.ICMPTypes, []int{8, 0})
+	assertIntSet(t, "icmp-code", icmpTerm.ICMPCodes, []int{3, 4})
 }
 
 func TestFirewallFilterMultiValueFlatSet(t *testing.T) {
 	cmds := []string{
-		"set firewall family inet filter mv term t from protocol tcp",
-		"set firewall family inet filter mv term t from protocol udp",
-		"set firewall family inet filter mv term t from dscp ef",
-		"set firewall family inet filter mv term t from dscp af43",
-		"set firewall family inet filter mv term t from icmp-type 8",
-		"set firewall family inet filter mv term t from icmp-type 0",
-		"set firewall family inet filter mv term t from icmp-code 3",
-		"set firewall family inet filter mv term t from icmp-code 4",
-		"set firewall family inet filter mv term t then discard",
+		"set firewall family inet filter mv term proto from protocol tcp",
+		"set firewall family inet filter mv term proto from protocol udp",
+		"set firewall family inet filter mv term proto from dscp ef",
+		"set firewall family inet filter mv term proto from dscp af43",
+		"set firewall family inet filter mv term proto then discard",
+		"set firewall family inet filter mv term icmp from protocol icmp",
+		"set firewall family inet filter mv term icmp from icmp-type 8",
+		"set firewall family inet filter mv term icmp from icmp-type 0",
+		"set firewall family inet filter mv term icmp from icmp-code 3",
+		"set firewall family inet filter mv term icmp from icmp-code 4",
+		"set firewall family inet filter mv term icmp then discard",
 	}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
@@ -80,14 +94,14 @@ func TestFirewallFilterMultiValueFlatSet(t *testing.T) {
 		t.Fatalf("compile error: %v", err)
 	}
 	f := cfg.Firewall.FiltersInet["mv"]
-	if f == nil || len(f.Terms) != 1 {
-		t.Fatalf("expected 1 term, got %#v", f)
+	if f == nil || len(f.Terms) != 2 {
+		t.Fatalf("expected 2 terms, got %#v", f)
 	}
-	term := f.Terms[0]
-	assertStrSet(t, "protocol", term.Protocols, []string{"tcp", "udp"})
-	assertStrSet(t, "dscp", term.DSCPs, []string{"ef", "af43"})
-	assertIntSet(t, "icmp-type", term.ICMPTypes, []int{8, 0})
-	assertIntSet(t, "icmp-code", term.ICMPCodes, []int{3, 4})
+	protoTerm, icmpTerm := f.Terms[0], f.Terms[1]
+	assertStrSet(t, "protocol", protoTerm.Protocols, []string{"tcp", "udp"})
+	assertStrSet(t, "dscp", protoTerm.DSCPs, []string{"ef", "af43"})
+	assertIntSet(t, "icmp-type", icmpTerm.ICMPTypes, []int{8, 0})
+	assertIntSet(t, "icmp-code", icmpTerm.ICMPCodes, []int{3, 4})
 }
 
 // TestFirewallFilterMultiValueBracketList covers the bracket-list shape

@@ -428,6 +428,22 @@ type compileOpts struct {
 	// constraint, never silently "protocol 0"). Same doctrine as
 	// lenientApplicationSpecs.
 	lenientFilterProtocols bool
+	// lenientFilterCrossField (#3723) downgrades the firewall-filter cross-field
+	// satisfiability gate (validateFilterCrossFieldStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a term whose `from` block combines a port with a non-port
+	// protocol (gre/esp/icmp/...), tcp-flags with a non-TCP protocol, or
+	// icmp-type/icmp-code with a non-ICMP protocol (and an icmp-code with no
+	// icmp-type) — cross-field pairs the dataplane matcher can never satisfy, so
+	// a `then discard`/`reject` term silently NEVER matches and the traffic is
+	// admitted by the implicit accept (fail-OPEN). The tolerant load / peer-sync
+	// paths downgrade to a warning so an already-persisted or peer-synced config
+	// carrying such a term still BOOTS (#1960 no-brick); the Rust snapshot
+	// builder's UnsatisfiableFilterCrossField backstop then rejects the whole
+	// snapshot (fail closed) so the never-match term never silently forwards.
+	// Same doctrine as lenientFilterProtocols; mirrors the application
+	// cross-field gate (#3373/#3348, lenientApplicationSpecs).
+	lenientFilterCrossField bool
 	// lenientFilterActions (#2399 finding 032-16) downgrades the
 	// firewall-filter `then` action gate (validateFilterActionsStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1319,6 +1335,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientApplicationSpecs:              true,
 		lenientApplicationNameCollisions:     true,
 		lenientFilterProtocols:               true,
+		lenientFilterCrossField:              true,
 		lenientFilterActions:                 true,
 		lenientFilterMatchValues:             true,
 		lenientFlexMatch:                     true,
@@ -1482,6 +1499,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientApplicationSpecs:              true,
 		lenientApplicationNameCollisions:     true,
 		lenientFilterProtocols:               true,
+		lenientFilterCrossField:              true,
 		lenientFilterActions:                 true,
 		lenientFilterMatchValues:             true,
 		lenientFlexMatch:                     true,
@@ -2654,6 +2672,30 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterProtocols {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter protocol (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3723 firewall-filter cross-field satisfiability gate. Strict on commit /
+	// commit-check (hard-reject a term whose `from` block combines a port with a
+	// non-port protocol, tcp-flags with a non-TCP protocol, or icmp-type/code with
+	// a non-ICMP protocol — or an icmp-code with no icmp-type). Such a term
+	// compiles cleanly but the dataplane matcher (userspace-dp engine/matching.rs)
+	// can NEVER satisfy the cross-field pair, so a `then discard`/`reject` term
+	// silently never matches and the traffic is admitted by the implicit accept
+	// (fail-OPEN) — the stateless-filter mirror of the application cross-field gate
+	// #3373/#3348. Runs AFTER validateFilterProtocolsStrict so a truly unknown
+	// protocol token is reported by that gate first. Lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config still boots — #1960
+	// no-brick; the Rust UnsatisfiableFilterCrossField backstop then fails the
+	// whole snapshot closed independently). Runs on the fully-compiled *Config so
+	// the typed term list (Protocols + ports + tcp-flags + icmp populated by
+	// compileFilterFrom, covering both `protocol` and `next-header`) is available.
+	if err := validateFilterCrossFieldStrict(cfg); err != nil {
+		if opts.lenientFilterCrossField {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter cross-field (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

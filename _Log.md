@@ -93,6 +93,53 @@
     pkg/daemon/daemon_scheduler_republish_3780_test.go (new),
     pkg/api/server.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go.
 
+## 2026-07-01 — #3723 firewall-filter cross-field gate: reject never-match discard/reject terms (fail-closed)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3723 (HIGH, security fail-open / vSRX-parity; folds
+    codex-review-154 H01/H02/H03/M01/M02/M03). A stateless firewall-filter `from`
+    block could combine a `protocol` (or inet6 `next-header`) with an L4 predicate
+    the dataplane matcher can NEVER satisfy for that protocol — a port on a
+    non-port-bearing protocol (gre/esp/icmp/... — only TCP/UDP carry extracted
+    ports per `ip_proto::has_l4_ports`), tcp-flags on a non-TCP protocol (udp/...),
+    or icmp-type/icmp-code on a non-ICMP protocol (tcp/udp/...). The term compiled
+    cleanly but became a never-match at runtime (`engine/matching.rs`: `port_match`
+    tests port 0 for a non-port proto, `per_packet_l4_matches` gates tcp-flags on
+    protocol==TCP and icmp on ICMP/ICMPv6). Because an xpf filter falls through to
+    the implicit ACCEPT on no-match, a `then discard`/`reject` over such a pair was
+    silently dead → the traffic was admitted (fail-OPEN). The application path had
+    this gate (#3373 port / #3348 icmp / #3506 / #3712 Rust); the stateless-FILTER
+    path never did. FIX: (a) COMMIT gate `validateFilterCrossFieldStrict`
+    (`compiler_validate_strict.go`), the filter mirror of the app gate, reusing the
+    shared `protocolIsPortBearing`/`protocolIsICMPFamily` SSOT + a new
+    `protocolIsTCP` (stricter than port-bearing — UDP is port-bearing but not TCP);
+    rejects ports on any non-port-bearing proto (H01/M01 mixed list/M02
+    next-header), tcp-flags on any non-TCP proto (H02), icmp-type/code on any
+    non-ICMP proto (H03), and icmp-code without icmp-type (M03, mirror #3506). Fires
+    only when a protocol is PRESENT (a port/tcp-flags/icmp with no protocol is
+    enforceable for a FILTER — the matcher self-gates), except M03. Lenient
+    downgrade to a warning on the tolerant load/peer-sync path
+    (`lenientFilterCrossField`, #1960 no-brick). (b) Rust backstop: `parse_term`
+    (`filter/compiler.rs`) rejects the whole snapshot with
+    `SnapshotIntegrityError::UnsatisfiableFilterCrossField` (reconcile preflight
+    keeps prior good state) — defense-in-depth like #2505/#3367/#3406. RED-on-revert
+    verified BOTH sides (neuter the Go call → 6 subtests RED; neuter the parse_term
+    guard → 5 Rust rejection tests RED). Full `cargo test --release` green (3371 lib
+    + 46 + others, 0 failed); `go test ./pkg/config/...` green; `go build ./...`,
+    gofmt, vet clean. The #2545 multi-value test was split into satisfiable
+    per-protocol terms (its synthetic icmp-type-on-tcp term was exactly the
+    never-match shape this gate rejects) with unchanged accumulation coverage.
+  - **File(s)**: pkg/config/compiler_validate_strict.go
+    (validateFilterCrossFieldStrict + firstIncompatibleProtocol + protocolIsTCP),
+    pkg/config/compiler.go (lenientFilterCrossField option + wiring after
+    validateFilterProtocolsStrict), pkg/config/firewall_crossfield_3723_test.go
+    (H01/H02/H03/M01/M02/M03 + lenient-warn + positive controls + L12 cross-package
+    canary), pkg/config/firewall_multivalue_2545_test.go (split into satisfiable
+    terms), userspace-dp/src/policy.rs (UnsatisfiableFilterCrossField variant +
+    Display), userspace-dp/src/filter/compiler.rs (parse_term cross-field backstop),
+    userspace-dp/src/filter/tests.rs (filter_crossfield_3723_* incl. L06 runtime
+    never-match guard), docs/config-schema.md (cross-field satisfiability section)
+
 ## 2026-07-01 — #3730 routing/PBR: kernel FBF ip-rule mirror honors L4 predicates + fail-closed on unrepresentable ones
 
 - **Timestamp**: 2026-07-01

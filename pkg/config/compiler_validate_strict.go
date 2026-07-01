@@ -4076,6 +4076,166 @@ func validateFilterProtocolsStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// firstIncompatibleProtocol returns the first NON-EMPTY protocol token in a
+// firewall-filter term's protocol list for which pred returns false, plus true;
+// or ("", false) when every present token satisfies pred (or none is present).
+// Empty / whitespace-only tokens are skipped — they are placeholders, not a real
+// protocol constraint (mirroring validateFilterProtocolsStrict). Because it
+// reports the FIRST failing token, a mixed bracket list such as
+// `from protocol [ tcp gre ]` is rejected on `gre` (the #3723 M01 partial-
+// enforce case: one configured deny that only enforces on the compatible
+// protocol and silently never-matches the rest).
+func firstIncompatibleProtocol(protocols []string, pred func(string) bool) (string, bool) {
+	for _, p := range protocols {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if !pred(p) {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// validateFilterCrossFieldStrict hard-rejects any firewall-filter term whose
+// `from` block combines a protocol-specific L4 predicate with a `protocol`
+// (or the inet6 `next-header`) that cannot carry it — the stateless-filter
+// mirror of the application cross-field gate #3373/#3348 in
+// validateApplicationSpecsStrict. #3723 (codex-review-154 H01/H02/H03/M01/M02/M03).
+//
+// The firewall-filter matcher (userspace-dp engine/matching.rs) keys each L4
+// predicate on the packet's actual L4 shape:
+//
+//   - port_match tests the constrained port set against the extracted L4 port,
+//     which is 0 for every protocol the dataplane does not extract ports for
+//     (only TCP/UDP — ip_proto.rs has_l4_ports); so `from protocol gre;
+//     destination-port 80` can NEVER match (H01);
+//   - per_packet_l4_matches returns false for a tcp-flags term whenever the
+//     packet protocol is not TCP, so `from protocol udp; tcp-flags syn` can
+//     never match (H02);
+//   - the icmp-type / icmp-code arms return false for a non-ICMP(v6) packet, so
+//     `from protocol tcp; icmp-type echo-request` can never match (H03).
+//
+// A never-match term is a SILENT FAIL-OPEN for a `then discard` / `then reject`:
+// an xpf filter falls through to an implicit ACCEPT on no-match (the #3427
+// no-catchall class), so the drop the operator wrote is dead and the traffic is
+// admitted by a later permit or the implicit accept. Junos rejects these
+// cross-field combinations at commit, so accepting them is also a config-language
+// parity gap — xpf can express a term the dataplane cannot faithfully enforce.
+//
+// The gate reuses the same protocolIsPortBearing / protocolIsICMPFamily SSOT the
+// application gate uses (plus protocolIsTCP for the tcp-flags arm), so the two
+// compatibility gates stay aligned (the TestApplicationAndFilterCrossFieldGates-
+// UseSharedSSOT canary pins that). It fires only when a protocol is PRESENT: a
+// port / tcp-flags / icmp match with NO protocol is legitimate and enforceable
+// for a FILTER (unlike an application, whose matcher keys on protocol+port, a
+// filter matches the port on whatever L4-port-bearing packet arrives and the
+// tcp-flags/icmp arms self-gate on the packet protocol). next-header (the inet6
+// spelling) is covered because compileFilterFrom routes BOTH protocol and
+// next-header into term.Protocols (M02).
+//
+// The one exception that fires WITHOUT a protocol is icmp-code without
+// icmp-type (M03): the matcher constrains the code independently of the type, so
+// a code-only term matches a broader ICMP set than a Junos config implies
+// (icmp-code 0 is common across many types). Junos couples code to type, and the
+// application gate rejects the same shape (#3506), so mirror it here.
+//
+// The walk is deterministic (filters sorted by name, terms in config order) so
+// the first-reported error is stable across runs, matching the other filter
+// strict gates. On the tolerant load / peer-sync path the caller downgrades the
+// returned error to a warning (#1960 no-brick); the Rust snapshot builder's
+// UnsatisfiableFilterCrossField backstop then fails the whole snapshot closed so
+// a leniently-loaded never-match term never silently forwards.
+func validateFilterCrossFieldStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				// H01 / M01 / M02: a source-port / destination-port match (or the
+				// negated *-except lists) requires a port-bearing transport
+				// (TCP/UDP). If ANY protocol token is non-port-bearing the term is a
+				// never-match on that protocol.
+				hasPorts := len(term.SourcePorts) > 0 || len(term.DestinationPorts) > 0 ||
+					len(term.SourcePortsExcept) > 0 || len(term.DestPortsExcept) > 0
+				if hasPorts {
+					if proto, bad := firstIncompatibleProtocol(term.Protocols, protocolIsPortBearing); bad {
+						return fmt.Errorf(
+							"firewall family %s filter %q term %q: a source-port/destination-port "+
+								"match is set with protocol %q, which does not carry L4 ports — "+
+								"source-port/destination-port are valid only on tcp/udp (the "+
+								"dataplane keys port terms on the packet's ports, which are always 0 "+
+								"for a non-port protocol, so the term would never match; a "+
+								"`then discard`/`reject` then fails OPEN. Remove the port or change "+
+								"the protocol)",
+							family, name, term.Name, proto)
+					}
+				}
+				// H02: a tcp-flags match requires TCP. If ANY protocol token is not
+				// TCP the term is a never-match on that protocol.
+				if len(term.TCPFlags) > 0 {
+					if proto, bad := firstIncompatibleProtocol(term.Protocols, protocolIsTCP); bad {
+						return fmt.Errorf(
+							"firewall family %s filter %q term %q: a tcp-flags match is set with "+
+								"protocol %q, which is not TCP — tcp-flags is valid only on tcp (the "+
+								"dataplane matches tcp-flags only when the packet protocol is TCP, so "+
+								"the term would never match; a `then discard`/`reject` then fails "+
+								"OPEN. Remove tcp-flags or set protocol tcp)",
+							family, name, term.Name, proto)
+					}
+				}
+				// H03: an icmp-type / icmp-code match requires ICMP/ICMPv6. If ANY
+				// protocol token is not an ICMP protocol the term is a never-match on
+				// that protocol.
+				if len(term.ICMPTypes) > 0 || len(term.ICMPCodes) > 0 {
+					if proto, bad := firstIncompatibleProtocol(term.Protocols, protocolIsICMPFamily); bad {
+						return fmt.Errorf(
+							"firewall family %s filter %q term %q: an icmp-type/icmp-code match is "+
+								"set with protocol %q, which is not an ICMP protocol — icmp-type/"+
+								"icmp-code are valid only on icmp/icmpv6 (the dataplane matches them "+
+								"only when the packet is ICMP/ICMPv6, so the term would never match; a "+
+								"`then discard`/`reject` then fails OPEN. Remove the constraint or set "+
+								"protocol icmp/icmpv6)",
+							family, name, term.Name, proto)
+					}
+				}
+				// M03: an icmp-code with no icmp-type constrains the code while the
+				// type stays unconstrained — a code-only term matches a broader ICMP
+				// set than a Junos config implies (icmp-code 0 is common across many
+				// types). Junos couples code to type; the application gate rejects the
+				// same shape (#3506). Mirror it here.
+				if len(term.ICMPCodes) > 0 && len(term.ICMPTypes) == 0 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: icmp-code is set without "+
+							"icmp-type; an ICMP code is meaningful only together with a type "+
+							"(icmp-code 0 is common across many types, so a code-only match is "+
+							"broader than a Junos config implies). Set icmp-type as well, or "+
+							"remove icmp-code",
+						family, name, term.Name)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // validateFilterActionsStrict hard-rejects any firewall-filter term whose
 // `then` block carries a token that is neither a recognized terminating action
 // (accept/reject/discard) nor a recognized modifier (count/log/syslog/
@@ -4887,6 +5047,27 @@ func protocolIsPortBearing(token string) bool {
 		// ports (ip_proto.rs has_l4_ports).
 		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
 			return n == 6 || n == 17
+		}
+		return false
+	}
+}
+
+// protocolIsTCP reports whether a protocol token names TCP — the only protocol
+// on which a firewall-filter `from tcp-flags` match is enforceable (#3723). The
+// dataplane matcher (userspace-dp engine/matching.rs per_packet_l4_matches)
+// returns false for a tcp-flags term whenever the packet protocol is not
+// PROTO_TCP, so tcp-flags on any other protocol — including UDP, which IS
+// port-bearing — can never match. It is a stricter predicate than
+// protocolIsPortBearing (which also accepts UDP): tcp-flags implies the TCP
+// family specifically. Recognizes the tcp name, the junos-tcp-any alias, and
+// the numeric protocol number 6.
+func protocolIsTCP(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "tcp", "junos-tcp-any":
+		return true
+	default:
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
+			return n == 6
 		}
 		return false
 	}

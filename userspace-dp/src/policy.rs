@@ -278,6 +278,33 @@ pub(crate) enum SnapshotIntegrityError {
         term: String,
         length: u8,
     },
+    /// #3723: a firewall-filter term combined a resolved `protocol` (or the inet6
+    /// `next-header`) with an L4 predicate the matcher can NEVER satisfy for that
+    /// protocol — a source/destination-port with a non-port-bearing protocol
+    /// (only TCP/UDP carry extracted ports, ip_proto.rs has_l4_ports), a tcp-flags
+    /// match with a non-TCP protocol, or an icmp-type/icmp-code match with a
+    /// non-ICMP(v6) protocol. The matcher (engine/matching.rs) keys ports on the
+    /// extracted L4 port (0 for a non-port protocol), gates tcp-flags on
+    /// protocol==TCP, and gates icmp-type/code on ICMP/ICMPv6, so such a term is a
+    /// NEVER-MATCH. Because a filter falls through to the implicit ACCEPT on
+    /// no-match (the #3427 no-catchall class), a `then discard`/`reject` term over
+    /// such a pair is silently dead and the traffic is admitted — a fail-OPEN.
+    /// The Go commit gate (`validateFilterCrossFieldStrict`, #3723) is the primary
+    /// defense — a freshly committed config can never carry such a term — so this
+    /// is the helper-boundary backstop for a corrupt / hand-built / version-drifted
+    /// or leniently-loaded snapshot, consistent with the #2505/#3367/#3406
+    /// fail-closed family. Rejecting the whole snapshot (the reconcile preflight
+    /// keeps the previous good filter state) is action-agnostic. `predicate` names
+    /// the offending L4 dimension ("port" / "tcp-flags" / "icmp-type/code") and
+    /// `protocol` is the incompatible IANA number. `family` (inet / inet6) is
+    /// carried because filter names can be reused across families.
+    UnsatisfiableFilterCrossField {
+        family: String,
+        filter: String,
+        term: String,
+        predicate: &'static str,
+        protocol: u8,
+    },
     /// #3296: an interface (or lo0) snapshot named a NON-EMPTY firewall filter
     /// (`filter_input_v4/v6` / `filter_output_v4/v6`, or the lo0 host-bound
     /// filter) that is not present in the compiled filter table. The pre-fix
@@ -575,6 +602,17 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "firewall family {:?} filter {:?} term {:?} has a flexible-match-range byte length {} outside the representable 1..=4 range — refusing to truncate it to a 4-byte window (which would broaden the match)",
                 family, filter, term, length
+            ),
+            Self::UnsatisfiableFilterCrossField {
+                family,
+                filter,
+                term,
+                predicate,
+                protocol,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} combines a {} match with protocol {} that cannot carry it — refusing to compile a never-match term (a then discard/reject over it fails open, admitting the traffic via the implicit accept)",
+                family, filter, term, predicate, protocol
             ),
             Self::MissingFilterRef {
                 interface,
