@@ -25744,3 +25744,41 @@ top.
   docs/research/ddns-world-class/plan.md (§5.3 checkip fail-closed invariant)
   **Action**: cluster-setup.sh — VM SR-IOV VFs use nictype:sriov (incus-managed) instead of raw type:pci passthrough with out-of-band host-PF VLAN/trust. Fixes the 2026-07-01 loss-cluster LAN de-isolation outage (host-PF VF VLAN was set once at create and cleared on host reboot / PF reset, reverting fw0/fw1 LAN VFs to an untagged trunk → cluster host cut off from the internet). incus now re-applies vlan=3667 (LAN) + security.mac_filtering=false (WAN trunk, RETH vMAC + guest VLAN tagging) on every VM start — durable across VM reboot AND host reboot, no systemd unit / no ip-link bolt-on. Live loss cluster reconfigured + verified (both nodes, failover both directions, 15.4 Gbps WAN forwarding, host→internet 0% loss).
   **File(s)**: test/incus/cluster-setup.sh
+
+- **Timestamp**: 2026-07-01
+  **Action**: #3751 — event-options within/trigger numeric strict-validation
+  (fail-open fix). compileEventOptions (compiler_services.go) parsed the
+  `within <seconds>` and `trigger (on|until) <count>` numerics with
+  strconv.Atoi and SILENTLY dropped the error → a typo coerced the field to 0,
+  and the engine's withinMatches treated a 0 threshold as an unconditional
+  match → a threshold-gated autonomous remediation silently became ALWAYS-FIRE
+  (H11). Also H12 (negative / huge / zero window; huge risked a time.Duration
+  overflow) and H13 (a single clause carrying both `trigger on` and
+  `trigger until`, ANDed into a nonsensical one-count band). FIX (two halves,
+  mirroring the #2141 attributes-match strict/lenient doctrine):
+  (a) commit-time strict validator validateEventOptionsWithinAST
+  (new pkg/config/event_options_within.go) — an AST pre-walk (the raw typo is
+  lost once coerced to 0; forEachChild over every top-level event-options block
+  per #3562) run inside compileExpanded on the group-expanded, inactive-pruned
+  tree. Rejects non-numeric / negative / zero / out-of-range within (1..86400 s)
+  and trigger count (1..1000000), an unknown trigger keyword (Junos `after`), a
+  within with no trigger, and the on+until combination. Strict on commit /
+  commit-check; downgraded to a cfg.Warnings entry on the tolerant load /
+  peer-sync paths (new compileOpts.lenientEventWithinTrigger, set in
+  CompileConfigLenient + CompileConfigForNodeLenient, #1960 no-brick).
+  (b) engine defense-in-depth — withinMatches (pkg/eventengine/engine.go) now
+  fails CLOSED on a within clause with no usable positive threshold (both
+  trigger on/until <=0) or a non-positive window, so a leftover 0 from an older
+  binary no longer over-fires; a policy with NO within clauses still fires on
+  every match (no temporal filter). RED-on-revert verified for BOTH halves
+  (stubbed validator → commit accepts the typos; stubbed engine guard →
+  0-threshold policy fires 10/10). go test ./pkg/config/... ./pkg/eventengine/...
+  green; downstream ./pkg/configstore/... ./pkg/daemon/... green; go build
+  ./... green; gofmt + vet clean. Schema desc/docs updated.
+  **File(s)**: pkg/config/event_options_within.go (new validator),
+  pkg/config/compiler.go (lenientEventWithinTrigger opt + call site),
+  pkg/config/schema_system.go (within/trigger desc ranges),
+  pkg/eventengine/engine.go (withinMatches fail-closed + header doc),
+  pkg/config/event_options_within_3751_test.go (new, RED-on-revert),
+  pkg/eventengine/engine_within_failclosed_3751_test.go (new, RED-on-revert),
+  docs/config-schema.md (#3751 validator entry)
