@@ -2006,11 +2006,15 @@ reserved special token) and `build_global_zone_scope` (policy.rs) short-circuits
 would route through `resolve_policy_zone_id` → `None` → `Unresolved` and a
 `permit` global would silently over-restrict / a `deny` global silently no-op —
 a commit-vs-dataplane divergence on a security leaf. The reserved `junos-host`
-zone is the one special token that is NOT accepted here: a zone-scoped global
-policy is not evaluated on the host-bound (LocalDelivery) path, so
-`validatePolicyZoneReferencesStrict` hard-rejects `match from-zone junos-host` /
-`to-zone junos-host` at commit (rather than committing a silent never-match);
-real junos-host global-zone-context support is a follow-up.
+zone is direction-split (#3639 / #3611 Piece B): `match to-zone junos-host`
+(host-INBOUND) commits and IS enforced — host-bound traffic traverses the
+AF_XDP LocalDelivery gate and the dataplane consults the global tier there
+(`evaluate_junos_host_policy_l3_aware`, filtered to the junos-host egress
+scope, most-specific-after-exact-and-from-any). `match from-zone junos-host`
+(host-ORIGINATED) is still hard-rejected by `validatePolicyZoneReferencesStrict`
+at commit: locally generated traffic egresses via the kernel TX path, not the
+AF_XDP RX gate, so it could only ever silently never-match (#3611 Piece A,
+documented not built).
 
 **Zone-local address books in a scoped global (#3287).** A scoped global
 (`match from-zone <z>` / `match to-zone <z>`) resolves a zone-local

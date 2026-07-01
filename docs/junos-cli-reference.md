@@ -512,11 +512,15 @@ From zone: guest, To zone: lan
     cannot silently brick management/host traffic that does not match a deny
     rule. (The stricter Junos "any configured junos-host zone-pair implies a
     default-deny for that pair" posture is intentionally deferred.)
-  - **Scope:** `to-zone junos-host` (host-INBOUND) is enforced.
-    `from-zone junos-host` (host-ORIGINATED / locally-generated traffic) rules
-    are accepted and indexed but NOT yet consulted — locally-generated traffic
-    does not traverse the ingress LocalDelivery path; that direction is a
-    documented follow-up.
+  - **Scope:** `to-zone junos-host` (host-INBOUND) is enforced — as an exact
+    `from-zone <ingress> to-zone junos-host` pair, a `from-zone any to-zone
+    junos-host` wildcard, AND a GLOBAL `set security policies global policy <p>
+    match to-zone junos-host` (#3639 / #3611 Piece B). The three are consulted
+    most-specific-first (exact → from-any → global). `from-zone junos-host`
+    (host-ORIGINATED / locally-generated traffic) rules — zone-pair or global —
+    are NOT consulted: locally-generated traffic does not traverse the ingress
+    LocalDelivery path (it egresses via the kernel TX path), so that direction
+    is rejected at commit and remains a documented follow-up (#3611 Piece A).
 
 ### Filtering
 
@@ -669,8 +673,14 @@ Global policies:
   evaluated in the global ordering, AFTER the exact zone-pair and the `from-zone
   any` / `to-zone any` wildcard policies — it does not jump ahead of them. An
   omitted leaf and an explicit `match from-zone any` are identical (all zones);
-  an undefined match zone is rejected at commit, and `match from-zone junos-host`
-  / `to-zone junos-host` is rejected (not supported on a global policy).
+  an undefined match zone is rejected at commit. A `match to-zone junos-host`
+  global (host-INBOUND) commits and IS enforced on the LocalDelivery gate
+  (#3639 / #3611 Piece B) — consulted in the global tier, after the exact
+  `from-zone <ingress> to-zone junos-host` pair and the `from-zone any to-zone
+  junos-host` wildcard. A `match from-zone junos-host` global (host-ORIGINATED)
+  is still rejected: locally generated traffic egresses via the kernel TX path,
+  not the AF_XDP RX gate, so it could only ever silently never-match (#3611
+  Piece A, documented not built).
 - **#3286 — scope shown on EVERY inventory surface.** Before #3286 only the
   dataplane enforced the scope; the show/inventory surfaces dropped it and
   rendered scoped globals as all-zones. All surfaces now reflect the configured

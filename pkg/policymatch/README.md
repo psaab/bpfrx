@@ -189,9 +189,11 @@ the CLI, which already requires both zones (#3355 H06).
 
 A `to-zone junos-host` query takes the separate **host gate** (#3285,
 `matchJunosHost` ↔ `evaluate_junos_host_policy`): exact `from-zone <ingress>
-to-zone junos-host` then `from-zone any to-zone junos-host`, with **no** global
-or default transit fallback (and `to-zone any` / `from-zone any to-zone any` are
-NOT pulled onto the host path). An unmatched host-bound flow returns
+to-zone junos-host`, then `from-zone any to-zone junos-host`, then a GLOBAL
+`policy match to-zone junos-host` (#3639 / #3611 Piece B) — most-specific-first,
+with **no** transit default fallback (and the transit `to-zone any` / `from-zone
+any to-zone any` wildcards are NOT pulled onto the host path; only a global
+explicitly scoped `to-zone junos-host` is). An unmatched host-bound flow returns
 `Result.HostInboundUnmatched` — no security *policy* governs it, never an
 inherited transit verdict. Local delivery is instead gated by
 host-inbound-traffic service admission, which post-#3405 DEFAULT-DENIES a zone

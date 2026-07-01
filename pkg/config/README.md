@@ -442,11 +442,13 @@ to-any merged in config order) → both-any → `junos-global` → default polic
 There is **no N×N hot-path expansion** — the wildcard tiers are FxHashMap O(1)
 probes (or a small Vec scan only when such rules exist), so a config with no
 wildcard policy pays only two empty-slice probes per cold-path evaluation. A
-`from-zone any to-zone junos-host` rule is also enforced on the host
-(LocalDelivery) path (`evaluate_junos_host_policy`); `to-zone any` /
-`from-zone any to-zone any` are intentionally NOT applied to host-bound traffic
-so a broad rule cannot silently brick the management lifeline (mirroring the
-existing no-global-on-host-path rule). Wildcard tiers live inside the
+`from-zone any to-zone junos-host` rule — and a GLOBAL `policy match to-zone
+junos-host` (#3639 / #3611 Piece B) — are also enforced on the host
+(LocalDelivery) path (`evaluate_junos_host_policy`, most-specific-first: exact →
+from-any → global); `to-zone any` / `from-zone any to-zone any` transit
+wildcards are intentionally NOT applied to host-bound traffic so a broad rule
+cannot silently brick the management lifeline (only a global explicitly scoped
+`to-zone junos-host` is consulted). Wildcard tiers live inside the
 `from_id != 0 && to_id != 0` guard, so an unzoned flow still falls through to
 the default action (#3110), exactly like a global policy. This lifts the #3018
 interim commit reject (`validatePolicyWildcardZoneStrict` and its
