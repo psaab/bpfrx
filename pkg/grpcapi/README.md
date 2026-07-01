@@ -175,22 +175,27 @@ contract.
 - `GetZones` enumerates security zones (`ZoneInfo`). The host-inbound
   admission set is surfaced distinctly (#3328): `host_inbound_configured`
   is the dataplane posture bit (mirrors `ZoneSnapshot.HostInboundConfigured`,
-  #3070/#3362) — true when the zone declares a `host-inbound-traffic`
-  stanza OR carries any per-interface override. It lets a controller tell
-  apart the three postures the dataplane models: no stanza
-  (`configured=false` → admit-all for host-bound traffic), explicit empty
-  stanza (`configured=true` with empty lists → deny-all), and a populated
-  set. `host_inbound_system_services` / `host_inbound_protocols` carry the
-  zone-level set split (a service vs a routing protocol);
+  #3070/#3362/#3405). Post-#3405 EVERY configured security zone is
+  host-inbound ENFORCING (Junos default-deny parity), so this bit is `true`
+  for every zone the RPC returns — it reports the dataplane truth, not
+  config shape. A zone with NO `host-inbound-traffic` stanza default-DENIES
+  host-bound traffic exactly like an explicit empty stanza; there is no
+  admit-all posture for a configured zone. The admitted set lives in
+  `host_inbound_system_services` / `host_inbound_protocols` (empty =
+  deny-all; split so a service is distinguishable from a routing protocol);
   `interface_host_inbound` (repeated `InterfaceHostInbound`) carries
   per-interface overrides (#3362), the effective set being the union of
   the zone-level set and the override. The legacy `host_inbound_services`
   flattened list (services + protocols) is kept as a back-compat alias.
   The split projection is the SSOT-shared `ZoneConfig.SortedInterfaceHostInboundRefs`
   iteration the REST `GET /api/v1/security/zones` handler also uses. Before
-  #3328 this RPC exposed only the flattened list and no `configured` flag —
-  a host-inbound / control-plane-protection posture ambiguity for
-  automation.
+  #3653 the bit was re-derived from config shape and reported `false` for a
+  no-stanza zone — the pre-#3405 "false = admit-all" reading, the OPPOSITE
+  of the runtime default-deny, so a controller read the management plane as
+  open when it is fail-closed. (Global ICMP/ND/PMTUD accepts and lifeline
+  interfaces fxp0/em0/fab* still bypass the per-zone host-inbound deny.)
+  Before #3328 this RPC exposed only the flattened list and no `configured`
+  flag at all.
 - `GetScreen` enumerates the configured screen profiles. `ScreenInfo`
   carries `name`, the `checks` string list, and a `map<string,int64>
   thresholds`. The `checks` list and thresholds come from the shared
