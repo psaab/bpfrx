@@ -486,7 +486,11 @@ never lock an operator out of a remote box it manages.
   are accepted before any deny; a configured zone that resolves to zero
   recognized matches fails OPEN (no deny) rather than locking the zone out.
   Token→nft mapping (`hostInboundServiceMatches`/`hostInboundProtocolMatches`)
-  mirrors the Rust classifier and must stay in sync. **ident-reset (#3310):**
+  mirrors the Rust classifier and must stay in sync. The authoritative
+  operator-facing token→port matrix across all three surfaces (Go SSOT allowlist,
+  this nft mirror, the Rust AF_XDP classifier), including the deliberate
+  narrowings and the ident-reset divergence, is
+  `docs/host-inbound-service-matrix.md` (#3619). **ident-reset (#3310):**
   `system-services ident-reset` is NOT a plain admit — Junos actively RESETS
   inbound ident (auth/TCP-113) probes. Its nft verdict
   (`hostInboundServiceAction`) is `reject with tcp reset` (the first `reject`
