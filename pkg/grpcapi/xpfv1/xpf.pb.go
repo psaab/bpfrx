@@ -6564,9 +6564,30 @@ type MatchPoliciesResponse struct {
 	// "junos-global->junos-global/<name>" exactly like the inventory global rows.
 	// Additive; empty (omitted) for the unmatched / host-inbound / default cases.
 	// Set only when matched is true.
-	RuleId        string `protobuf:"bytes,17,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	RuleId string `protobuf:"bytes,17,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
+	// #3685 M05: description is the matched policy's `description` text, the same
+	// field the inventory (GetPolicies) and the local `show security
+	// match-policies` result carry. Descriptions often hold ticket / change-
+	// control context, so a match verdict without it is weaker than the CLI and
+	// inventory answers over the SAME policymatch.Result. Additive; empty
+	// (omitted) for a policy with no description and for the unmatched /
+	// host-inbound / default cases. Set only when matched is true.
+	Description string `protobuf:"bytes,18,opt,name=description,proto3" json:"description,omitempty"`
+	// #3685 M06: scheduler_name / scheduler_active expose the matched policy's
+	// time-gate. scheduler_name is the `scheduler-name` binding (mirroring the
+	// inventory PolicyRule field, #3624); scheduler_active is the explicit
+	// effective-active flag — true when the matched policy is scheduler-gated AND
+	// currently active. A positive match is by construction currently active (the
+	// live simulator threads a fail-closed PolicyInactiveFn that skips a
+	// scheduler-inactive rule before it can match, #3104/#3414), so a matched
+	// scheduled policy always reports scheduler_active=true; it names the gate
+	// that is admitting the rule right now. Additive; both empty/false (omitted)
+	// for a non-scheduled (always-on) policy and for the unmatched / host-inbound
+	// / default cases. Set only when matched is true.
+	SchedulerName   string `protobuf:"bytes,19,opt,name=scheduler_name,json=schedulerName,proto3" json:"scheduler_name,omitempty"`
+	SchedulerActive bool   `protobuf:"varint,20,opt,name=scheduler_active,json=schedulerActive,proto3" json:"scheduler_active,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -6716,6 +6737,27 @@ func (x *MatchPoliciesResponse) GetRuleId() string {
 		return x.RuleId
 	}
 	return ""
+}
+
+func (x *MatchPoliciesResponse) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetSchedulerName() string {
+	if x != nil {
+		return x.SchedulerName
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetSchedulerActive() bool {
+	if x != nil {
+		return x.SchedulerActive
+	}
+	return false
 }
 
 type GetNATRuleStatsRequest struct {
@@ -8247,7 +8289,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\x96\x05\n" +
+	"_icmp_code\"\x8a\x06\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -8267,7 +8309,10 @@ const file_xpf_proto_rawDesc = "" +
 	"\x0fqueried_to_zone\x18\x0e \x01(\tR\rqueriedToZone\x126\n" +
 	"\x17source_address_excluded\x18\x0f \x01(\bR\x15sourceAddressExcluded\x12@\n" +
 	"\x1cdestination_address_excluded\x18\x10 \x01(\bR\x1adestinationAddressExcluded\x12\x17\n" +
-	"\arule_id\x18\x11 \x01(\tR\x06ruleIdB\f\n" +
+	"\arule_id\x18\x11 \x01(\tR\x06ruleId\x12 \n" +
+	"\vdescription\x18\x12 \x01(\tR\vdescription\x12%\n" +
+	"\x0escheduler_name\x18\x13 \x01(\tR\rschedulerName\x12)\n" +
+	"\x10scheduler_active\x18\x14 \x01(\bR\x0fschedulerActiveB\f\n" +
 	"\n" +
 	"_policy_id\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
