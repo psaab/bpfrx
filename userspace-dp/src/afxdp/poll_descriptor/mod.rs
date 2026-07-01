@@ -1816,8 +1816,13 @@ pub(super) fn poll_binding_process_descriptor(
                         // firewall-local interface IP) whose system-service /
                         // protocol is not in the INGRESS zone's host-inbound set
                         // is denied (silent drop, Junos posture) and never cached.
-                        // A zone with no host-inbound stanza admits everything
-                        // (admit-all default), so existing configs are unaffected.
+                        // #3405: a CONFIGURED zone with no host-inbound stanza
+                        // default-DENIES host-bound traffic (it ships an EMPTY
+                        // token set, not admit-all). Admit-all now applies only
+                        // to a zone absent from the snapshot entirely (legacy /
+                        // truly-unconfigured). Lifeline interfaces (fxp0/em0/
+                        // fab*) never reach this local-delivery classifier
+                        // (#3682). SSOT: docs/host-inbound-service-matrix.md.
                         // A host-inbound DENY drops with NO lo0 side-effects (no
                         // reject reply, no lo0 counter/log) — before #3485 the lo0
                         // filter ran first, so a denied service still triggered its
