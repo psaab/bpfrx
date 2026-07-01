@@ -37,6 +37,65 @@ var (
 	syslogCategories = []string{"all", "firewall", "policy", "screen", "session"}
 )
 
+// securitySessionLogModes is the fixed set of session-logging tokens accepted
+// by every session-log LIST surface (#3703): the per-policy `then log`, the
+// deny-collapsed `then deny log`, `default-policy-log`, and
+// `pre-id-default-policy then log`. It is the SSOT shared by the schema
+// (sessionLogModeLeaf below) and the compiler readers (session log values are
+// accumulated via firewallMatchValues and matched against these tokens).
+var securitySessionLogModes = []string{"session-init", "session-close"}
+
+// sessionLogModeLeaf builds the shared multi-value enum leaf for a session-log
+// list surface (#3703). Before this the four surfaces modeled `log` /
+// `default-policy-log` as CONTAINERS with session-init / session-close
+// children, so a bracket / single-line list (`then log [ session-init
+// session-close ]`) mis-nested the tail under the first token and the compiler
+// readers dropped everything after session-init (the #2419 collapse class,
+// unfixed on these leaves). Modeled here as a `multi && children == nil` typed
+// enum leaf so:
+//   - SetPath collapses ALL list values onto the one leaf's Keys (ast_edit.go
+//     absorbs trailing non-sibling tokens for a multi value-tail leaf), and
+//   - SchemaValidate (validateMultiValueLeaf) rejects an UNKNOWN token at
+//     commit-check — strict on the operator commit path, downgraded to a
+//     warning on the tolerant load / peer-sync path (#1960 no-brick) — instead
+//     of the token being silently swallowed.
+//
+// children MUST stay nil: both the SetPath collapse (ast_edit.go:260) and the
+// validateMultiValueLeaf dispatch (schema_walk.go:256) key on children == nil.
+// The value-slot `?` completion surfaces the two modes via valueExamples, so
+// dropping the container children does not lose completion coverage.
+func sessionLogModeLeaf(desc string) *schemaNode {
+	return &schemaNode{
+		desc:          desc,
+		args:          1,
+		multi:         true,
+		valueType:     ValueEnumOf,
+		valueDesc:     "session-logging event",
+		valueExamples: securitySessionLogModes,
+		validator:     ValidateEnum(securitySessionLogModes),
+		placeholder:   "<session-init|session-close>",
+		children:      nil,
+	}
+}
+
+// hostInboundSchemaChildren builds the shared `host-inbound-traffic { ... }`
+// child set used at BOTH the zone level and the per-interface override (#3362,
+// #3703). system-services / protocols are multi-value value-tail leaves: a
+// bracket / single-line / repeated list collapses ALL tokens onto the leaf's
+// Keys (the #2419 contract) instead of dropping the tail, and
+// validateHostInboundTokensStrict rejects an unrecognized token at commit
+// against the host_inbound_tokens.go SSOT (strict on commit, warn on the
+// tolerant load path). children MUST stay nil so the SetPath collapse fires;
+// the leaves are intentionally UNTYPED (no schema validator) because the token
+// allowlist lives in the shared host_inbound_tokens.go SSOT the compiled-slice
+// validator reads, not in the schema.
+func hostInboundSchemaChildren() map[string]*schemaNode {
+	return map[string]*schemaNode{
+		"system-services": {desc: "System services", args: 1, multi: true, placeholder: "<service>", children: nil},
+		"protocols":       {desc: "Protocols", args: 1, multi: true, placeholder: "<protocol>", children: nil},
+	}
+}
+
 // policyThenSchemaChildren builds the `then` action subtree shared by
 // zone-pair (from-zone/to-zone) and global security policies. It is a
 // factory (not a shared package var) so the two scopes get independent
@@ -72,11 +131,13 @@ var (
 // equals the compiler's `then` switch token set for both scopes so a
 // future action leaf cannot drift back out of the schema.
 func policyThenSchemaChildren() map[string]*schemaNode {
+	// #3703: `then log` is a multi-value session-log LIST leaf (see
+	// sessionLogModeLeaf) — a bracket / single-line list must land ALL values
+	// (session-init AND session-close) on the one leaf and reject an unknown
+	// token at commit. It was a container whose bracket tail mis-nested and
+	// dropped everything after session-init.
 	logNode := func() *schemaNode {
-		return &schemaNode{desc: "Log session", children: map[string]*schemaNode{
-			"session-init":  {desc: "Log at session open", children: nil},
-			"session-close": {desc: "Log at session close", children: nil},
-		}}
+		return sessionLogModeLeaf("Log session")
 	}
 	return map[string]*schemaNode{
 		"permit": {desc: "Permit matching traffic", children: nil},
@@ -106,18 +167,12 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"interfaces": {desc: "Interfaces in this zone", wildcard: &schemaNode{
 				desc: "Interface name", valueHint: ValueHintInterfaceName, placeholder: "<interface-name>",
 				children: map[string]*schemaNode{
-					"host-inbound-traffic": {desc: "Per-interface host inbound traffic", children: map[string]*schemaNode{
-						"system-services": {desc: "System services", children: nil},
-						"protocols":       {desc: "Protocols", children: nil},
-					}},
+					"host-inbound-traffic": {desc: "Per-interface host inbound traffic", children: hostInboundSchemaChildren()},
 				},
 			}},
-			"tcp-rst": {desc: "Send TCP RST for denied traffic", children: nil},
-			"screen":  {desc: "Screen profile name", args: 1, placeholder: "<screen-name>", children: nil},
-			"host-inbound-traffic": {desc: "Host inbound traffic", children: map[string]*schemaNode{
-				"system-services": {desc: "System services", children: nil},
-				"protocols":       {desc: "Protocols", children: nil},
-			}},
+			"tcp-rst":              {desc: "Send TCP RST for denied traffic", children: nil},
+			"screen":               {desc: "Screen profile name", args: 1, placeholder: "<screen-name>", children: nil},
+			"host-inbound-traffic": {desc: "Host inbound traffic", children: hostInboundSchemaChildren()},
 			// #3061: zone-local address book. Same entry grammar as the
 			// global book (security address-book global) but attached
 			// directly under the zone (no `global` wrapper). A policy in
@@ -159,10 +214,12 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// lives in this sibling container (mirroring pre-id-default-policy's
 		// session-init/session-close model). `session-init`/`session-close` are
 		// presence-only flags wired to ConfigSnapshot.DefaultLogSessionInit/Close.
-		"default-policy-log": {desc: "RT_FLOW session logging for the implicit default-policy verdict", children: map[string]*schemaNode{
-			"session-init":  {desc: "Emit an RT_FLOW session-init log on the default-policy verdict (default permit-all only)", children: nil},
-			"session-close": {desc: "Emit an RT_FLOW session-close log on the default-policy verdict (default permit-all only)", children: nil},
-		}},
+		// #3703: multi-value session-log LIST leaf (see sessionLogModeLeaf) so a
+		// bracket / single-line `default-policy-log [ session-init session-close ]`
+		// lands BOTH values and rejects an unknown token at commit. It was a
+		// container whose bracket tail mis-nested session-close under session-init
+		// and dropped it — losing the most security-relevant fallback-path audit.
+		"default-policy-log": sessionLogModeLeaf("RT_FLOW session logging for the implicit default-policy verdict"),
 		"from-zone": {desc: "From zone", args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
 				"description": {desc: "Policy description", args: 1, scalar: true, placeholder: "<text>", children: nil},
@@ -767,10 +824,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 	}},
 	"pre-id-default-policy": {desc: "Default policy before application identification", children: map[string]*schemaNode{
 		"then": {desc: "Action", children: map[string]*schemaNode{
-			"log": {desc: "Logging options", children: map[string]*schemaNode{
-				"session-init":  {desc: "Log session creation", children: nil},
-				"session-close": {desc: "Log session close", children: nil},
-			}},
+			// #3703: multi-value session-log LIST leaf (see sessionLogModeLeaf)
+			// so a bracket `then log [ session-init session-close ]` lands BOTH
+			// values and rejects an unknown token at commit. It was a container
+			// whose bracket tail mis-nested and dropped the tail.
+			"log": sessionLogModeLeaf("Logging options"),
 		}},
 	}},
 }}
