@@ -9,14 +9,15 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
-// zoneScopeLabel renders a global policy's optional from/to-zone match scope
-// (#3148) for the zone-detail summary: an empty scope is the historical
-// "all-zones" wildcard and prints as "any" (the idiomatic Junos token). An
-// explicit "any" (#3680) is already "any" and passes through unchanged. This is
-// the SSOT the local CLI and gRPC-text zone-detail renderers share so the scope
-// label cannot drift between the two surfaces (#3684 L10). It mirrors the label
-// the pre-#3684 pkg/cli + pkg/grpcapi hand-rolled copies used.
-func zoneScopeLabel(zone string) string {
+// ZoneScopeLabel renders a global policy's optional from/to-zone match scope
+// (#3148) for a display surface: an empty scope is the historical "all-zones"
+// wildcard and prints as "any" (the idiomatic Junos token). An explicit "any"
+// (#3680) is already "any" and passes through unchanged. It is the SSOT the
+// zone-detail summary (local CLI + gRPC-text, #3684 L10) and the gRPC-text
+// `test policy` global verdict (#3685) share so the scope label cannot drift
+// across surfaces; it mirrors the label the pre-#3684 pkg/cli + pkg/grpcapi
+// hand-rolled copies used.
+func ZoneScopeLabel(zone string) string {
 	if zone == "" {
 		return "any"
 	}
@@ -145,7 +146,7 @@ func ZoneDetailPolicySummary(cfg *config.Config, zone string, schedActive map[st
 		mods := zoneDetailModifiers(id, gp.SchedulerName, inactive, gp.Log,
 			gp.Count, gp.Match.SourceAddressExcluded, gp.Match.DestinationAddressExcluded)
 		lines = append(lines, fmt.Sprintf("    [global] %s -> %s: %s (%s) %s",
-			zoneScopeLabel(gp.Match.FromZone), zoneScopeLabel(gp.Match.ToZone),
+			ZoneScopeLabel(gp.Match.FromZone), ZoneScopeLabel(gp.Match.ToZone),
 			gp.Name, ActionString(gp.Action), mods))
 		globalPolicies++
 	}
