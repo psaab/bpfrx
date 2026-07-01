@@ -1,11 +1,14 @@
 package ddns
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -603,5 +606,105 @@ func TestSurfaceAAbsentStateFirstBootStandaloneWrites(t *testing.T) {
 	}
 	if got := len(fu.upserts); got != 1 {
 		t.Fatalf("first-boot standalone node must publish its record, got %d upserts", got)
+	}
+}
+
+// TestSurfaceARestartSeedsFromAddrTextNoRepublishStorm is the #3734 (H04)
+// fail-on-revert proof. On restart seedFromStore must rebuild the runtime cache
+// from the durable ownership store's AddrText field — where a Surface A record's
+// published rdata lives (Address is "" for a Surface A record, #2691 P2) — AND
+// baseline lastPublished at the restart instant, so the FIRST post-restart
+// reconcile of an UNCHANGED record is a counted SKIP, not a redundant wire
+// republish. Reverting the fix (parse the empty Address, leave lastPublished
+// zero) seeds NOTHING and makes refreshDue immediately true, so every owned
+// scope republishes on the first pass — the restart write-storm proportional to
+// the scope count (provider ban/rate-limit risk) — and this test goes RED. A
+// genuinely CHANGED address must still republish (the seed must not
+// over-suppress a real renumber).
+func TestSurfaceARestartSeedsFromAddrTextNoRepublishStorm(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "iface-ddns.json")
+	now := time.Unix(1_700_000_000, 0)
+	clock := func() time.Time { return now }
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+
+	// Pre-restart: publish 203.0.113.5 so the durable store records an owned
+	// Surface A entry.
+	fu1 := newFakeUpdater()
+	m1 := newSurfaceAManagerForTesting(statePath, fu1, clock)
+	if err := m1.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
+		t.Fatalf("pre-restart publish: %v", err)
+	}
+	if got := len(fu1.upserts); got != 1 {
+		t.Fatalf("pre-restart must publish once, got %d", got)
+	}
+	// Prove the on-disk shape the seed must read: AddrText carries the rdata,
+	// Address is empty. If this shape ever changes, the seed logic must too.
+	owned, ok := m1.state.get(sc.effectiveKey(), surfaceAIdentity, "")
+	if !ok || owned.AddrText != "203.0.113.5" || owned.Address != "" {
+		t.Fatalf("stored record must carry rdata in AddrText with Address empty; got %+v (ok=%v)", owned, ok)
+	}
+
+	// Restart: a fresh manager loads the SAME durable store and seeds the runtime
+	// cache. An UNCHANGED reconcile must NOT touch the wire.
+	fu2 := newFakeUpdater()
+	m2 := newSurfaceAManagerForTesting(statePath, fu2, clock)
+	if err := m2.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
+		t.Fatalf("post-restart unchanged reconcile: %v", err)
+	}
+	if got := len(fu2.upserts); got != 0 {
+		t.Fatalf("post-restart unchanged record must NOT republish (storm); got %d upserts", got)
+	}
+	if st := m2.Stats(); st.Skipped != 1 {
+		t.Fatalf("post-restart unchanged record must be a counted skip; stats=%+v", st)
+	}
+
+	// A genuinely CHANGED address after restart must still republish.
+	if err := m2.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("198.51.100.7"), nil, nil); err != nil {
+		t.Fatalf("post-restart changed reconcile: %v", err)
+	}
+	if got := fu2.upsertNames(); len(got) != 1 || got[0] != "wan.example.net=198.51.100.7" {
+		t.Fatalf("changed address after restart must republish; got %v", got)
+	}
+}
+
+// TestSurfaceARenumberLogReadsAddrText is the #3734 (M02) fail-on-revert proof.
+// On a WAN renumber (same FQDN, new address) publishLocked must log the
+// "replaced record address" transition with the OLD address read from the
+// previous owned record's AddrText. Reverting to prevOwned.Address (always "" for
+// a Surface A record) makes prevAddr "" so the log never fires → this test goes
+// RED (a renumber leaves no operational trace).
+func TestSurfaceARenumberLogReadsAddrText(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "iface-ddns.json")
+	now := time.Unix(1_700_000_000, 0)
+	clock := func() time.Time { return now }
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+
+	fu := newFakeUpdater()
+	m := newSurfaceAManagerForTesting(statePath, fu, clock)
+
+	// Establish ownership at the old address (logs "published record").
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
+		t.Fatalf("initial publish: %v", err)
+	}
+
+	// Capture the default slog output for the renumber pass only.
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer slog.SetDefault(prev)
+
+	// Renumber: same FQDN, new address → replace in place.
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("198.51.100.7"), nil, nil); err != nil {
+		t.Fatalf("renumber publish: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "replaced record address") {
+		t.Fatalf("renumber must log the replacement transition; log=%q", out)
+	}
+	if !strings.Contains(out, "old=203.0.113.5") || !strings.Contains(out, "new=198.51.100.7") {
+		t.Fatalf("renumber log must carry old (from AddrText) + new address; log=%q", out)
 	}
 }

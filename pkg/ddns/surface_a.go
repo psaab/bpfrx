@@ -512,19 +512,45 @@ func newSurfaceARFC2136(p *config.DDNSProvider, _ string) (DNSUpdater, error) {
 
 // seedFromStore rebuilds the in-memory runtime cache from the durable ownership
 // store (inadyn idea #5, plan §5.5): a restart must not blast a redundant
-// update for an address that has not changed. Each owned record seeds
-// lastAddr; lastPublished is left zero so the FIRST post-restart reconcile,
-// if the address is unchanged, still satisfies change-detection (addr matches)
-// and the forced-refresh floor is measured from the restart (a benign at-most-
-// one wire refresh on the first forced interval after a restart). Caller need
-// not hold the mutex (constructor-only).
+// update for an address that has not changed. Each owned record seeds BOTH
+// lastAddr (so change-detection sees the unchanged address as unchanged) AND
+// lastPublished, set to the restart instant, so the forced-refresh floor is
+// measured from the restart: the FIRST post-restart reconcile of an unchanged
+// record is a counted skip (no wire traffic) and the record re-asserts only
+// once the forced-refresh interval elapses from the restart. Leaving
+// lastPublished zero would make refreshDue immediately true and republish
+// every owned scope on the first pass — a restart write-storm proportional to
+// the scope count, the exact provider ban/rate-limit risk the cache exists to
+// avoid (#3734/H04).
+//
+// The published rdata lives in AddrText for a Surface A router record; the
+// keying Address field is "" (Surface A keys ownership on {scope, fixed
+// identity, ""}, #2691 P2). Seed from AddrText and only fall back to the
+// Address field for any legacy lease-shape entry that predates AddrText — a
+// pre-fix restart parsed the empty Address, errored, and seeded NOTHING, which
+// is exactly the storm this fixes. An unparseable/empty value seeds no runtime
+// entry (the scope re-publishes on its first reconcile — safe). Caller need not
+// hold the mutex (constructor-only).
 func (m *SurfaceAManager) seedFromStore() {
+	// Restart baseline for the forced-refresh floor. m.now is set by both
+	// constructors before seedFromStore runs; the nil guard is defensive.
+	var restart time.Time
+	if m.now != nil {
+		restart = m.now()
+	}
 	for _, r := range m.state.all() {
-		a, err := netip.ParseAddr(r.Address)
+		text := r.AddrText
+		if text == "" {
+			text = r.Address
+		}
+		a, err := netip.ParseAddr(text)
 		if err != nil {
 			continue
 		}
-		m.runtime[r.scopeOf().scopePrefix()] = &surfaceAState{lastAddr: a.Unmap()}
+		m.runtime[r.scopeOf().scopePrefix()] = &surfaceAState{
+			lastAddr:      a.Unmap(),
+			lastPublished: restart,
+		}
 	}
 }
 
@@ -935,7 +961,15 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 	prevOwned, hadPrev := m.state.get(key, surfaceAIdentity, "")
 	prevAddr := ""
 	if hadPrev {
-		prevAddr = prevOwned.Address
+		// The previously-published rdata lives in AddrText for a Surface A record
+		// (Address is the "" scope key, #2691 P2). Reading Address here always
+		// yielded "" so the "replaced record address" renumber log below never
+		// fired — a WAN renumber left no operational trace (#3734/M02). Prefer
+		// AddrText; fall back to Address only for a legacy lease-shape entry.
+		prevAddr = prevOwned.AddrText
+		if prevAddr == "" {
+			prevAddr = prevOwned.Address
+		}
 	}
 
 	// Write-ahead the ownership intent BEFORE the wire add (#2662): a crash
