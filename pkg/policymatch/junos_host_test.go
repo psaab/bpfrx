@@ -111,6 +111,55 @@ func TestJunosHostGateNoTransitFallback(t *testing.T) {
 			q:           Query{FromZone: "trust", ToZone: "junos-host"},
 			wantMatched: true, wantName: "trust-host-permit", wantAction: config.PolicyPermit,
 		},
+		{
+			// #3639 / #3611 Piece B: a GLOBAL `match to-zone junos-host deny`
+			// IS applied on the host path (the direction lifted from the #3018
+			// commit reject), matching every ingress that has no exact / from-any
+			// junos-host pair.
+			name: "global to-zone junos-host deny matches host path",
+			cfg: cfgWith(config.SecurityConfig{
+				DefaultPolicy: config.PolicyPermit,
+				Zones:         zones("trust", "dmz"),
+				GlobalPolicies: []*config.Policy{
+					{Name: "g-host-deny", Match: config.PolicyMatch{ToZone: "junos-host"}, Action: config.PolicyDeny},
+				},
+			}, config.ApplicationsConfig{}),
+			q:           Query{FromZone: "dmz", ToZone: "junos-host"},
+			wantMatched: true, wantName: "g-host-deny", wantAction: config.PolicyDeny,
+		},
+		{
+			// Precedence: an exact zone-pair junos-host permit outranks a global
+			// to-zone junos-host deny (specific beats global).
+			name: "exact junos-host outranks global to-zone junos-host",
+			cfg: cfgWith(config.SecurityConfig{
+				DefaultPolicy: config.PolicyDeny,
+				Zones:         zones("trust"),
+				Policies: []*config.ZonePairPolicies{
+					zonePair("trust", "junos-host", permit("trust-host-permit", config.PolicyMatch{})),
+				},
+				GlobalPolicies: []*config.Policy{
+					{Name: "g-host-deny", Match: config.PolicyMatch{ToZone: "junos-host"}, Action: config.PolicyDeny},
+				},
+			}, config.ApplicationsConfig{}),
+			q:           Query{FromZone: "trust", ToZone: "junos-host"},
+			wantMatched: true, wantName: "trust-host-permit", wantAction: config.PolicyPermit,
+		},
+		{
+			// A global scoped `match from-zone dmz to-zone junos-host` is
+			// ingress-scoped: a trust-ingress host query does NOT match it →
+			// local delivery (HostInboundUnmatched), no implicit default-deny.
+			name: "global from-zone-scoped junos-host does not match other ingress",
+			cfg: cfgWith(config.SecurityConfig{
+				DefaultPolicy: config.PolicyPermit,
+				Zones:         zones("trust", "dmz"),
+				GlobalPolicies: []*config.Policy{
+					{Name: "g-dmz-host-deny", Match: config.PolicyMatch{FromZone: "dmz", ToZone: "junos-host"}, Action: config.PolicyDeny},
+				},
+			}, config.ApplicationsConfig{}),
+			q:             Query{FromZone: "trust", ToZone: "junos-host"},
+			wantMatched:   false,
+			wantHostUnmat: true,
+		},
 	}
 
 	for _, tt := range tests {

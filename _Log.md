@@ -1,3 +1,36 @@
+## 2026-07-01 — #3639 enforce to-zone junos-host GLOBAL (from-zone any) host-inbound policy
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3639 (#3611 Piece B) — a GLOBAL `set security policies global
+    policy <p> match to-zone junos-host` (host-INBOUND) was REJECTED at commit
+    and, even if committed, the userspace host gate never consulted the global
+    tier, so the rule was inert. Fixed in ONE coupled change (indexing without
+    lifting is dead; lifting without indexing is a silent fail-open):
+    (1) Go — `validatePolicyZoneReferencesStrict` (compiler_validate_strict.go)
+    now lifts the `match to-zone junos-host` reject (host-INBOUND traverses the
+    AF_XDP LocalDelivery gate); the `match from-zone junos-host` reject
+    (host-ORIGINATED, kernel-TX path, #3611 Piece A) is KEPT.
+    (2) Rust — `evaluate_junos_host_policy_l3_aware` (policy.rs) now consults a
+    GLOBAL tier (global_indices filtered to `global_to_zone ==
+    Zone(JUNOS_HOST_ZONE_ID)`, gated by `global_from_zone.matches(from_id)`)
+    AFTER the exact `from-zone <ingress> to-zone junos-host` pair and the
+    `from-zone any to-zone junos-host` wildcard — most-specific-first, matching
+    transit-policy precedence. A global `match to-zone junos-host` also arms
+    `has_junos_host_rules` (the context rides in `match_to_zone`, not the
+    structural `to_zone`). No wire change (match_from_zone/match_to_zone already
+    flow Go→Rust since #3148). Also mirrored the global tier into the Go CLI
+    simulator `matchJunosHost` (pkg/policymatch) so `show security
+    match-policies` agrees with the dataplane. RED-on-revert tests: Go
+    (commit-accept of to-zone junos-host global), Rust + policymatch (global
+    deny governs host-inbound where no exact pair matches; exact pair still
+    wins over global).
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_policy_global_zone_3148_test.go,
+    userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+    pkg/policymatch/policymatch.go, pkg/policymatch/junos_host_test.go,
+    docs/junos-cli-reference.md, docs/userspace-dataplane-architecture.md,
+    docs/config-schema.md, pkg/config/README.md, pkg/policymatch/README.md
+
 ## 2026-07-01 — #3610 host-inbound denies emit a tuple-rich RT_FLOW event
 
 - **Timestamp**: 2026-07-01

@@ -2712,24 +2712,28 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 		if pol == nil {
 			continue
 		}
-		// The reserved self-traffic zone `junos-host` cannot be honored as a
-		// global-policy from/to-zone match context: the userspace dataplane
-		// does NOT evaluate a zone-scoped global policy on the host-bound
-		// (LocalDelivery) path, so a `match from-zone junos-host` / `to-zone
-		// junos-host` global would commit but silently never match (a
-		// commit-vs-dataplane divergence on a security leaf). Reject it at
-		// commit so the two layers agree; real junos-host global-zone-context
-		// support is a follow-up. (`any` and the empty token stay exempt =
-		// all-zones, matching build_global_zone_scope in policy.rs.)
+		// The reserved self-traffic zone `junos-host` is direction-split for a
+		// global-policy match context (#3639, #3611 Piece B):
+		//
+		//   - `match to-zone junos-host` (host-INBOUND) IS supported and now
+		//     commits. Host-bound traffic traverses the AF_XDP LocalDelivery
+		//     gate, and the userspace dataplane consults the global tier there
+		//     (evaluate_junos_host_policy_l3_aware indexes global-scoped
+		//     junos-host rules — most-specific-after-exact-and-from-any). Commit
+		//     and the dataplane agree, so it is no longer rejected.
+		//   - `match from-zone junos-host` (host-ORIGINATED) stays rejected: the
+		//     firewall's own sockets egress via the kernel TX path, never the
+		//     AF_XDP RX gate, so a from-zone junos-host global would commit but
+		//     silently never match (the #3611 Piece A architectural limitation —
+		//     documented, not built). Reject it at commit so the two layers
+		//     agree.
+		//
+		// (`any` and the empty token stay exempt = all-zones, matching
+		// build_global_zone_scope in policy.rs.)
 		if pol.Match.FromZone == "junos-host" {
 			return fmt.Errorf(
-				"security policies global policy %q match from-zone %q is not supported (a zone-scoped global policy is not evaluated on the host-bound path, so it would silently never match); remove the junos-host match context (#3148)",
+				"security policies global policy %q match from-zone %q is not supported (host-originated traffic egresses via the kernel TX path, not the AF_XDP RX gate, so a from-zone junos-host global would silently never match); remove the junos-host match context (#3611 Piece A)",
 				pol.Name, pol.Match.FromZone)
-		}
-		if pol.Match.ToZone == "junos-host" {
-			return fmt.Errorf(
-				"security policies global policy %q match to-zone %q is not supported (a zone-scoped global policy is not evaluated on the host-bound path, so it would silently never match); remove the junos-host match context (#3148)",
-				pol.Name, pol.Match.ToZone)
 		}
 		if !defined(pol.Match.FromZone) {
 			return fmt.Errorf(

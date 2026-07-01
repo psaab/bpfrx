@@ -501,15 +501,17 @@ func Match(cfg *config.Config, q Query) Result {
 }
 
 // matchJunosHost mirrors the dataplane host gate evaluate_junos_host_policy
-// (policy.rs) for a `to-zone junos-host` query (#3285). It consults ONLY exact
-// `from-zone <ingress> to-zone junos-host` rules, then the
-// `from-zone any to-zone junos-host` wildcard — in that order. There is NO
-// implicit host default-deny and NO global / transit-default fallback: an
-// unmatched host-bound flow falls through to local delivery (the management
-// lifeline guarantee), so the simulator returns HostInboundUnmatched rather
-// than inheriting the transit global/default verdict. `to-zone any` and
-// `from-zone any to-zone any` are deliberately NOT pulled onto the host path,
-// matching the runtime gate.
+// (policy.rs) for a `to-zone junos-host` query (#3285). It consults, in Junos
+// most-specific-first order: exact `from-zone <ingress> to-zone junos-host`
+// rules, then the `from-zone any to-zone junos-host` wildcard, then a GLOBAL
+// policy `match to-zone junos-host` (#3639 / #3611 Piece B). There is NO
+// implicit host default-deny and NO transit-default fallback: an unmatched
+// host-bound flow falls through to local delivery (the management lifeline
+// guarantee), so the simulator returns HostInboundUnmatched rather than
+// inheriting the transit default verdict. `to-zone any` and `from-zone any
+// to-zone any` transit wildcards are deliberately NOT pulled onto the host
+// path, matching the runtime gate — only a global explicitly scoped to
+// `to-zone junos-host` is consulted.
 func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Result {
 	// #3355: evaluate_junos_host_policy returns None for from_id == 0 (the
 	// unknown/undefined ingress zone), mirroring the #3110 unzoned guard. An
@@ -542,8 +544,32 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 			}
 		}
 	}
+	// #3639 / #3611 Piece B: a GLOBAL policy `match to-zone junos-host`
+	// (host-INBOUND) governs host-bound traffic in the GLOBAL tier — consulted
+	// LAST, after the exact `from-zone <ingress> to-zone junos-host` pair and
+	// the `from-zone any to-zone junos-host` wildcard, mirroring the dataplane
+	// (evaluate_junos_host_policy_l3_aware) and transit-policy precedence (a
+	// global policy is least-specific and never jumps ahead of a zone-pair
+	// rule). The optional `match from-zone` scope still restricts by ingress
+	// zone (empty / "any" = every zone). We filter on Match.ToZone directly
+	// rather than globalScopeMatches because junos-host is not a defined zone in
+	// cfg.Security.Zones (globalScopeMatches would fail it closed). A `match
+	// from-zone junos-host` global (host-ORIGINATED) is rejected at commit and
+	// never reaches this host-inbound path (#3611 Piece A).
+	globalSetIdx := len(cfg.Security.Policies)
+	for sliceIdx, pol := range cfg.Security.GlobalPolicies {
+		if pol == nil || pol.Match.ToZone != JunosHostZone {
+			continue
+		}
+		if !globalScopeMatches(cfg, pol.Match.FromZone, q.FromZone) {
+			continue
+		}
+		if ruleMatches(cfg, q, pol) {
+			return matchedResult(ids, pol, true, pol.Match.FromZone, pol.Match.ToZone, globalSetIdx, sliceIdx)
+		}
+	}
 	// No host-bound rule matched: local delivery proceeds. Do NOT fall through
-	// to global/default — the dataplane host gate returns None here.
+	// to the transit default — the dataplane host gate returns None here.
 	return Result{HostInboundUnmatched: true}
 }
 

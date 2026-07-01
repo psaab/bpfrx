@@ -2242,7 +2242,18 @@ pub(crate) fn parse_policy_state_with_counters(
 
         // #3019: arm the LocalDelivery junos-host policy gate iff a rule
         // actually names the reserved self zone on either side.
-        if snap.from_zone == JUNOS_HOST_ZONE_NAME || snap.to_zone == JUNOS_HOST_ZONE_NAME {
+        //
+        // #3639: a GLOBAL policy carries its junos-host context out-of-band in
+        // `match_to_zone` (its structural `to_zone` stays "junos-global"), so a
+        // `global policy ... match to-zone junos-host` must ALSO arm the gate —
+        // otherwise `evaluate_junos_host_policy_l3_aware` short-circuits on
+        // `!has_junos_host_rules` and the global-tier host consult below never
+        // runs. `match_to_zone` is populated only for globals, so this can never
+        // fire for a plain zone-pair rule.
+        if snap.from_zone == JUNOS_HOST_ZONE_NAME
+            || snap.to_zone == JUNOS_HOST_ZONE_NAME
+            || snap.match_to_zone == JUNOS_HOST_ZONE_NAME
+        {
             state.has_junos_host_rules = true;
         }
 
@@ -2812,6 +2823,11 @@ fn resolve_policy_zone_id(
 
 /// #3019: evaluate a configured `to-zone junos-host` security policy for a
 /// host-bound (LocalDelivery) flow whose ingress (from) zone id is `from_id`.
+/// Consulted in Junos most-specific-first precedence: the exact `from-zone
+/// <ingress> to-zone junos-host` pair, then the `from-zone any to-zone
+/// junos-host` wildcard (#3090), then a GLOBAL policy `match to-zone
+/// junos-host` (#3639, least-specific — a scoped global stays a global and is
+/// never promoted ahead of a zone-pair rule).
 ///
 /// Junos ordering: host-inbound-traffic admission runs FIRST in the caller; a
 /// packet only reaches this gate after host-inbound has admitted it, so a
@@ -2832,10 +2848,11 @@ fn resolve_policy_zone_id(
 /// rule. The stricter Junos "configured zone-pair implies default-deny"
 /// posture is intentionally deferred (see docs/junos-cli-reference.md).
 ///
-/// `from-zone junos-host` (host-ORIGINATED) rules are indexed by the same name
-/// resolution but are NOT consulted here: locally-generated traffic does not
-/// traverse the ingress LocalDelivery path. That direction is a documented
-/// follow-up.
+/// `from-zone junos-host` (host-ORIGINATED) rules — whether zone-pair or a
+/// GLOBAL `match from-zone junos-host` — are NOT consulted here: locally
+/// generated traffic egresses via the kernel TX path and does not traverse the
+/// ingress LocalDelivery path. That direction is rejected at commit and is a
+/// documented follow-up (#3611 Piece A).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_junos_host_policy(
     state: &PolicyState,
@@ -2936,6 +2953,43 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
                 return Some(result);
             }
+        }
+    }
+    // #3639: a GLOBAL policy `match to-zone junos-host` (host-INBOUND) governs
+    // host-bound traffic in the GLOBAL tier — evaluated LAST here, AFTER the
+    // exact `from-zone <ingress> to-zone junos-host` pair and the `from-zone any
+    // to-zone junos-host` wildcard, mirroring transit-policy precedence (a
+    // global policy is least-specific and is never promoted ahead of a
+    // zone-pair rule; see evaluate_policy_result_l3_aware). Only globals scoped
+    // to the junos-host EGRESS side are consulted; the optional `match
+    // from-zone` scope still restricts by ingress zone (Any = every zone, the
+    // `from-zone any to-zone junos-host` global the #3639 commit-reject lift
+    // enables). This is the enforcement half the reject lift is coupled with —
+    // lifting the commit reject without consulting here would re-open the exact
+    // silent fail-open the #3018/#3148 reject closed. A `from-zone junos-host`
+    // global (host-ORIGINATED) is NOT consulted: that direction never traverses
+    // the RX LocalDelivery gate and is rejected at commit (#3611 Piece A).
+    for &idx in &state.global_indices {
+        let rule = &state.rules[idx];
+        if rule.global_to_zone != GlobalZoneScope::Zone(JUNOS_HOST_ZONE_ID)
+            || !rule.global_from_zone.matches(from_id)
+        {
+            continue;
+        }
+        if let Some(mut result) = try_match_rule(
+            rule,
+            state,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            packet_icmp,
+            packet_len,
+            l4_present,
+        ) {
+            result.policy_counter_idx = (idx as u32).saturating_add(1);
+            return Some(result);
         }
     }
     None

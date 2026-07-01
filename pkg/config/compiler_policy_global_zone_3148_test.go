@@ -134,25 +134,44 @@ func TestGlobalPolicyZoneContextStrictCommit(t *testing.T) {
 		}
 	})
 
-	// `junos-host` cannot be honored as a global match context (a zone-scoped
-	// global policy is not evaluated on the host-bound path), so it is
-	// hard-rejected at commit so the commit gate and the dataplane agree —
-	// rather than committing into a silent never-match. Fail-on-revert: drop the
-	// junos-host reject in validatePolicyZoneReferencesStrict and this commits.
-	t.Run("junos_host_zone_rejected", func(t *testing.T) {
-		for _, leaf := range []string{"from-zone", "to-zone"} {
-			cmds := append([]string{}, zoneDefs...)
-			cmds = append(cmds,
-				"set security policies global policy hostctx match "+leaf+" junos-host")
-			cmds = append(cmds, matchBody("hostctx")...)
-			tree := build3148Tree(t, cmds...)
-			_, err := CompileConfig(tree)
-			if err == nil {
-				t.Fatalf("CompileConfig accepted a global policy match %s junos-host; want a hard reject", leaf)
-			}
-			if !strings.Contains(err.Error(), "junos-host") || !strings.Contains(err.Error(), "not supported") {
-				t.Fatalf("match %s junos-host error = %v, want an unsupported-junos-host reject", leaf, err)
-			}
+	// #3639 / #3611 Piece B: a global `match from-zone junos-host`
+	// (host-ORIGINATED) stays hard-rejected — locally generated traffic egresses
+	// via the kernel TX path, never the AF_XDP RX gate, so it could only ever
+	// silently never-match. Fail-on-revert: drop the from-zone junos-host reject
+	// in validatePolicyZoneReferencesStrict and this commits.
+	t.Run("junos_host_from_zone_rejected", func(t *testing.T) {
+		cmds := append([]string{}, zoneDefs...)
+		cmds = append(cmds,
+			"set security policies global policy hostctx match from-zone junos-host")
+		cmds = append(cmds, matchBody("hostctx")...)
+		tree := build3148Tree(t, cmds...)
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatal("CompileConfig accepted a global policy match from-zone junos-host; want a hard reject")
+		}
+		if !strings.Contains(err.Error(), "junos-host") || !strings.Contains(err.Error(), "not supported") {
+			t.Fatalf("match from-zone junos-host error = %v, want an unsupported-junos-host reject", err)
+		}
+	})
+
+	// #3639 / #3611 Piece B: a global `match to-zone junos-host` (host-INBOUND)
+	// is now SUPPORTED and commits cleanly — host-bound traffic traverses the
+	// AF_XDP LocalDelivery gate and the userspace dataplane consults the global
+	// tier there (evaluate_junos_host_policy_l3_aware). Fail-on-revert: restore
+	// the to-zone junos-host reject in validatePolicyZoneReferencesStrict and
+	// this commit turns into a hard error, so RED.
+	t.Run("junos_host_to_zone_commits", func(t *testing.T) {
+		cmds := append([]string{}, zoneDefs...)
+		cmds = append(cmds,
+			"set security policies global policy hostctx match to-zone junos-host")
+		cmds = append(cmds, matchBody("hostctx")...)
+		tree := build3148Tree(t, cmds...)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected a global policy match to-zone junos-host; want a clean commit (#3639): %v", err)
+		}
+		if len(cfg.Security.GlobalPolicies) != 1 || cfg.Security.GlobalPolicies[0].Match.ToZone != "junos-host" {
+			t.Fatalf("global match to-zone junos-host not preserved: %+v", cfg.Security.GlobalPolicies)
 		}
 	})
 

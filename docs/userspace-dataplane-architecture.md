@@ -632,10 +632,16 @@ fail-closed for an undefined zone). An OMITTED leaf and an explicit `any` both
 map to `Any` (all zones, the Junos implicit default) — `build_global_zone_scope`
 short-circuits `"any"` so it can never route to `Unresolved` and silently match
 nothing, keeping the dataplane in agreement with the Go commit gate (which
-exempts `any`). The reserved `junos-host` zone is hard-rejected as a global
-match context at commit (a zone-scoped global policy is not evaluated on the
-host-bound path, so it could only ever silently never-match — real junos-host
-global-zone support is a follow-up). The scope is checked as an extra predicate
+exempts `any`). The reserved `junos-host` zone is direction-split as a global
+match context (#3639 / #3611 Piece B): `match to-zone junos-host` (host-INBOUND)
+commits and IS enforced — `evaluate_junos_host_policy_l3_aware` consults the
+`global_indices` tier filtered to `global_to_zone == Zone(JUNOS_HOST_ZONE_ID)`,
+after the exact `from-zone <ingress> to-zone junos-host` pair and the `from-zone
+any to-zone junos-host` wildcard (a scoped global stays least-specific). `match
+from-zone junos-host` (host-ORIGINATED) stays hard-rejected at commit — locally
+generated traffic egresses via the kernel TX path, never the AF_XDP RX gate, so
+it could only ever silently never-match (#3611 Piece A, documented not built).
+The scope is checked as an extra predicate
 inside the `junos-global` tier loop, **in the same tier position** shown above:
 a zone-scoped global policy is NOT promoted ahead of the #3090 wildcard tiers.
 Precedence example — a `from-zone any to-zone untrust` wildcard (zone-pair
