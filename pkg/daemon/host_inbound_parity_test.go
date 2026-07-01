@@ -126,6 +126,44 @@ func TestHostInboundBfdAdmitsMultiHop(t *testing.T) {
 	}
 }
 
+// TestHostInboundSipTftpNarrowPortSet pins the deliberately-narrow port sets for
+// `system-services sip` and `system-services tftp` so the #3619 disposition
+// (verified against vSRX: works-as-intended, no widen) is fail-on-revert and a
+// future audit does not re-derive it from source.
+//
+//   - sip: Junos `junos-sip` is UDP + TCP destination-port 5060; the SRX SIP ALG
+//     signals on 5060 (UDP by default, TCP since 12.3X48-D25 / 17.3R1). Junos
+//     ships NO predefined SIP-over-TLS (SIPS) application on 5061 — SIPS needs a
+//     custom service. So `sip` opens UDP 5060 + TCP 5060 ONLY and must NOT admit
+//     TCP 5061 on either family. See docs/host-inbound-service-matrix.md (M07).
+//   - tftp: Junos `junos-tftp` is UDP/69; the dynamic data ports are an
+//     ALG/transit concern, not a host-inbound listener. So `tftp` opens UDP 69
+//     ONLY (no TCP) on both families. See docs/host-inbound-service-matrix.md (M08).
+//
+// These match sets are mirrored by the Rust AF_XDP classifier (host_inbound.rs
+// `sip` / `tftp` arms); adding 5061 or a TFTP data port here without the Rust
+// side (or vice versa) would silently diverge the two enforcement surfaces.
+func TestHostInboundSipTftpNarrowPortSet(t *testing.T) {
+	for _, fam := range []string{"ip", "ip6"} {
+		sip := strings.Join(hostInboundServiceMatches("sip", fam), " ; ")
+		if !strings.Contains(sip, "udp dport 5060") || !strings.Contains(sip, "tcp dport 5060") {
+			t.Errorf("sip (%s) must admit UDP 5060 + TCP 5060; got %q", fam, sip)
+		}
+		if strings.Contains(sip, "5061") {
+			t.Errorf("sip (%s) must NOT admit 5061 — Junos has no predefined SIP-TLS; SIPS needs a custom service (#3619 M07); got %q", fam, sip)
+		}
+
+		tftp := hostInboundServiceMatches("tftp", fam)
+		joined := strings.Join(tftp, " ; ")
+		if len(tftp) != 1 || !strings.Contains(joined, "udp dport 69") {
+			t.Errorf("tftp (%s) must admit exactly UDP 69 (data ports are ALG/transit, #3619 M08); got %q", fam, joined)
+		}
+		if strings.Contains(joined, "tcp") {
+			t.Errorf("tftp (%s) must NOT admit TCP (TFTP is UDP/69); got %q", fam, joined)
+		}
+	}
+}
+
 // TestHostInboundRoutingProtocolTokenMatches asserts the nft host-inbound rules
 // for the #3341 routing-control tokens emit the correct match fragment and
 // family scoping: rsvp=IP proto 46 (dual), pgm=IP proto 113 (dual), sap=UDP/9875
