@@ -115,7 +115,25 @@ delegate to the owning domain. Exported types:
 - `100–199`: next-table inter-VRF leaking (static routes with
   `next-table` directive). `nextTableRulePriority` in `rules.go`.
 - `31000–31999`: PBR (firewall-filter `routing-instance` action).
-  `pbrRulePriority` in `rules.go`.
+  `pbrRulePriority` in `rules.go`. **Kernel FBF support matrix (#3730):**
+  `BuildPBRRules` mirrors only the term `from` predicates an `ip rule` can
+  express — source/destination address + prefix-list, DSCP (non-zero),
+  `protocol` (`FRA_IP_PROTO`), `source-port` (`FRA_SPORT_RANGE`) and
+  `destination-port` (`FRA_DPORT_RANGE`); multi-value protocol/port sets
+  expand to one rule per value and a port range maps to a single `[lo,hi]`
+  range. A term carrying any predicate an `ip rule` cannot represent —
+  `source-port-except` / `destination-port-except`, `tcp-flags`,
+  `icmp-type` / `icmp-code`, `is-fragment`, `flexible-match-range`, a
+  DSCP-0 match, a non-empty address `except` set, an unknown protocol /
+  unparseable port, or any unresolved `from` leaf — FAILS CLOSED:
+  `buildPBRFromFilter` (via `pbrTermL4`) drops the whole term and records a
+  degraded build error. Honoring the address/protocol/port half while
+  silently dropping the rest would WIDEN the match and steer traffic the
+  operator constrained away (the #3730 over-steer); dropping the term is
+  the fail-safe under-steer (steered traffic falls back to the main table)
+  and the userspace filter path still enforces the term exactly. The
+  degraded error is returned to the daemon (`daemon_apply.go` step 3d) and
+  logged; the buildable rules are still installed.
 - `33000–33099`: rib-group inter-VRF leaking (`from all lookup
   <table>`). `ribGroupManager.Apply` only installs a leak rule when an
   instance's `interface-routes` rib-group imports a rib that resolves to
