@@ -437,7 +437,15 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		// Surface the explicit string AND the typed default_used bit (same SSOT
 		// renderer the gRPC surface uses).
 		nilRes := policymatch.Result{DefaultUsed: true, Action: config.PolicyDeny}
-		writeOK(w, MatchPoliciesResult{Action: nilRes.DisplayAction(), DefaultUsed: true})
+		writeOK(w, MatchPoliciesResult{
+			Action:      nilRes.DisplayAction(),
+			DefaultUsed: true,
+			// #3627 M06: echo the queried zone pair even on the no-config
+			// fail-closed default deny so a stored diagnostic proves which zone
+			// pair produced the verdict.
+			QueriedFromZone: r.URL.Query().Get("from_zone"),
+			QueriedToZone:   r.URL.Query().Get("to_zone"),
+		})
 		return
 	}
 
@@ -572,11 +580,24 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		writeOK(w, MatchPoliciesResult{
 			HostInboundUnmatched: true,
 			Action:               res.DisplayAction(),
+			// #3627 M06: echo the queried zone pair on the host-inbound path so
+			// the diagnostic names the tested zones (the host gate returns no
+			// matched-policy scope to fill FromZone/ToZone).
+			QueriedFromZone: fromZone,
+			QueriedToZone:   toZone,
 		})
 		return
 	}
 	if !res.Matched {
-		writeOK(w, MatchPoliciesResult{Action: res.DisplayAction(), DefaultUsed: res.DefaultUsed})
+		writeOK(w, MatchPoliciesResult{
+			Action:      res.DisplayAction(),
+			DefaultUsed: res.DefaultUsed,
+			// #3627 M06: echo the queried zone pair on the no-match/default path
+			// so a stored default-deny diagnostic proves which zone pair was
+			// tested (FromZone/ToZone carry matched-policy scope, unset here).
+			QueriedFromZone: fromZone,
+			QueriedToZone:   toZone,
+		})
 		return
 	}
 	matchedID := res.PolicyID
@@ -586,6 +607,11 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		Global:     res.Global,
 		FromZone:   res.FromZone,
 		ToZone:     res.ToZone,
+		// #3627 M06: also echo the queried zone pair on a positive match. It is
+		// the query context, distinct from FromZone/ToZone (the matched policy's
+		// declared scope), which can differ for a wildcard-zone or global match.
+		QueriedFromZone: fromZone,
+		QueriedToZone:   toZone,
 		// #3623: set the pointer only on a match (the two early returns above
 		// leave it nil), so a matched first policy (id 0) is emitted as
 		// "policy_id":0 rather than dropped and mistaken for no match.

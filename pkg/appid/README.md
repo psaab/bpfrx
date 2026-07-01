@@ -30,21 +30,28 @@ and resolves session display names from the dataplane's assigned `app_id`.
   `pkg/dataplane/userspace` ships `Entries` to the Rust dataplane as
   the snapshot `app_catalog` field (#2008 M5); the dataplane stamps
   the matched `app_id` on each new session.
-- `ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto uint8, dstPort uint16, appID uint16) string` —
-  `runtime.go`. Lookup order: dataplane `app_id` (authoritative from
+- `ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16) string` —
+  `runtime.go`. `srcPort` is the session source port; it is threaded
+  through so the tuple fallback can honor a configured `source-port`
+  constraint (#3428). Lookup order: dataplane `app_id` (authoritative from
   BPF) → user-configured app tuple match (`resolveTupleFallback` →
   `matchTuple`) → narrow built-in fallback (`junos-http`, `junos-ssh`,
   …). Tuple matching requires the configured protocol to match; if the
-  app also sets a `destination-port` (single or `lo-hi` range), the port
-  must match too. A **protocol-only** custom app — one with a `protocol`
+  app also sets a `source-port` and/or a `destination-port` (single or
+  `lo-hi` range), each configured port constraint must match too — when
+  both are set the session's source AND destination port must satisfy
+  them (#3428; before that fix a `source-port`-scoped app was matched on
+  destination port alone, so any session to that dst-port was mislabeled
+  regardless of its source port). A **protocol-only** custom app — one with a `protocol`
   but no `destination-port`, e.g. a user-defined GRE/ESP/AH application —
   matches on protocol alone (#2548; before that fix `matchTuple`
   rejected an empty port, so protocol-only apps never matched and their
   sessions reported `UNKNOWN`). An app with neither protocol nor port is
   never a match-all. When several configured apps match the same tuple,
   `resolveTupleFallback` resolves deterministically by **specificity**: a
-  port-constrained app (`destination-port` set) wins over a protocol-only
-  app of the same protocol, with remaining ties broken by app name (#2578;
+  port-constrained app (`source-port` and/or `destination-port` set) wins
+  over a protocol-only app of the same protocol, with remaining ties
+  broken by app name (#2578;
   before that the map was iterated first-match, so a port-specific app
   could non-deterministically lose to a protocol-only sibling). This is a
   display-only label path — it does not affect policy enforcement, which

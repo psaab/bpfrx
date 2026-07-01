@@ -22,6 +22,63 @@
     userspace-dp/src/afxdp/tests.rs, pkg/logging/ringbuf.go,
     pkg/logging/host_inbound_deny_3610_test.go,
     docs/pr/1373-retire-ebpf-dataplane/plan-1379-dataplane-events.md
+## 2026-07-01 — #3629 pkg/appid/README stale ResolveSessionName signature
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3629 (Codex review-122 M04, docs-only) — pkg/appid/README.md
+    documented `ResolveSessionName` with a stale signature missing the
+    `srcPort` parameter added in #3428:
+    `ResolveSessionName(appNames, cfg, proto, dstPort, appID)`. The actual
+    function is `ResolveSessionName(appNames map[uint16]string,
+    cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16)
+    string` (pkg/appid/runtime.go:162). srcPort is threaded through so the
+    tuple fallback (`resolveTupleFallback` -> `matchTuple`) can honor a
+    configured `source-port` constraint. FIX: aligned the README signature
+    with source and described the source-port fallback semantics — a
+    configured `source-port` and/or `destination-port` constraint must each
+    match (both when set), and `resolveTupleFallback`'s specificity
+    tie-break treats an app as port-constrained when source-port and/or
+    destination-port is set (matching the actual `app.DestinationPort != ""
+    || app.SourcePort != ""` test, #2578/#3428). Verified the other two
+    documented signatures (`CatalogNames`, `BuildCatalog`) already match
+    source; the `applicationsToValidateStrict` (unexported, commit-time
+    validator) vs `ApplicationsToValidateStrict` (exported, catalog test)
+    references are both correct in context. Pure doc-accuracy change, no
+    code touched. Validation: `go build ./pkg/appid/...` green; README
+    signatures diffed against `func` lines in pkg/appid/*.go.
+  - **File(s)**: pkg/appid/README.md, _Log.md
+
+## 2026-07-01 — #3627 M06 match-policies echoes queried zones on all responses
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3627 M06 (driveable) — the REST `/security/match`
+    handler and the gRPC `MatchPolicies` RPC echoed the queried
+    from-zone/to-zone only INDIRECTLY, via the #3331 `from_zone`/`to_zone`
+    fields that carry the MATCHED policy's SCOPE and are populated ONLY on a
+    positive match. A negative/default verdict (`!res.Matched`), the
+    host-inbound verdict (`HostInboundUnmatched`), and the no-active-config
+    fail-closed deny all OMITTED the queried zones, so a stored JSON/wire
+    diagnostic for a default-deny or host-inbound answer could not prove
+    which zone pair was tested without a separate copy of the request. FIX:
+    added additive `queried_from_zone`/`queried_to_zone` — REST JSON fields
+    on `MatchPoliciesResult` and gRPC `MatchPoliciesResponse` fields 13/14
+    (new numbers, no version bump; regenerated with the pinned toolchain
+    protoc v3.21.12 / protoc-gen-go v1.36.11 / protoc-gen-go-grpc 1.6.1) —
+    populated on EVERY return path (match, no-match/default, host-inbound,
+    nil-config). Kept DISTINCT from the #3331 matched-scope `from_zone`/
+    `to_zone` (they can differ for a wildcard-zone or global match). Part
+    B (M07/L02: per-dimension miss explanation + host-inbound service token)
+    is a design-fork, deferred — #3627 stays open for it. Added RED-on-revert
+    tests on both surfaces (`TestMatchPoliciesRESTEchoesQueriedZones`,
+    `TestMatchPoliciesRESTNilConfigEchoesQueriedZones`,
+    `TestMatchPoliciesEchoesQueriedZones`) and updated pkg/api/README.md +
+    pkg/grpcapi/README.md.
+  - **File(s)**: proto/xpf/v1/xpf.proto,
+    pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/server_cluster.go,
+    pkg/api/types.go, pkg/api/security.go,
+    pkg/api/security_matchpolicies_queried_zones_3627_test.go,
+    pkg/grpcapi/server_matchpolicies_queried_zones_3627_test.go,
+    pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
 
 ## 2026-07-01 — #3626 appid catalog includes NAT-only match-application refs
 

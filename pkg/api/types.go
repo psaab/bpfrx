@@ -478,6 +478,16 @@ type MatchPoliciesResult struct {
 	// a client can branch on the posture without string-parsing. False for a
 	// concrete policy match and for HostInboundUnmatched.
 	DefaultUsed bool `json:"default_used,omitempty"`
+	// QueriedFromZone/QueriedToZone echo the zone pair the caller ASKED about
+	// (#3627 M06). Unlike FromZone/ToZone (the SCOPE of the MATCHED policy, set
+	// only on a positive match), these are populated on EVERY response —
+	// positive match, no-match/default, and host-inbound — so a stored JSON
+	// diagnostic for a default-deny or host-inbound verdict proves which zone
+	// pair was tested without also capturing the request URL. They are the query
+	// context, not a policy attribute; for a wildcard-zone or global match they
+	// can differ from FromZone/ToZone.
+	QueriedFromZone string `json:"queried_from_zone,omitempty"`
+	QueriedToZone   string `json:"queried_to_zone,omitempty"`
 }
 
 // ClearSessionsResult holds session clear results.
