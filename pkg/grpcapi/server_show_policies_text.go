@@ -278,6 +278,32 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	// it must honor the knob for cross-surface consistency.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
 	schedActive, haveSched := s.policySchedulerActiveState()
+	// #3667 (H05): the displayed Index must equal the runtime/RT_FLOW policy ID
+	// so a remote operator can map a policy-deny/RT_FLOW log line (which carries
+	// the numeric policy ID) back to the detail row. RuntimePolicyIDs is the same
+	// SSOT the local CLI detail + REST/gRPC structured inventory key off.
+	runtimeIDs := dpuserspace.RuntimePolicyIDs(cfg)
+	// #3667 (H01, correctness): shared source/destination address renderer.
+	// When the match sense is inverted (source-address-excluded /
+	// destination-address-excluded) the header is annotated "(except)" so the
+	// gRPC text detail shows the SAME security meaning as the rule and the local
+	// CLI — the rule matches every address EXCEPT those listed. Printing the
+	// listed addresses under a plain header showed the OPPOSITE meaning.
+	printAddrs := func(label string, addrs []string, excluded bool) {
+		if excluded {
+			fmt.Fprintf(buf, "      %s (except):\n", label)
+		} else {
+			fmt.Fprintf(buf, "      %s:\n", label)
+		}
+		for _, addr := range addrs {
+			resolved := grpcResolveAddress(cfg, addr)
+			// #3358: unqualify a synthetic zone-local key (#3061,
+			// zone-local/<zone>/<name>) to the authored book name so the
+			// internal compiler token never leaks; resolution still keys off
+			// the qualified token (it is the global-book key).
+			fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
+		}
+	}
 	// #3408: surface a per-policy counter read failure as a warning AFTER all
 	// reads rather than silently omitting the session-statistics block.
 	var readErr error
@@ -313,40 +339,29 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			// the scheduler name. Active/non-scheduled policies stay
 			// bit-identical (no suffix), keeping the gRPC text plane in
 			// agreement with the CLI detail surface.
-			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s%s\n", pol.Name, capAction,
-				policyDetailStateSuffix(pol.SchedulerName, schedActive, haveSched))
+			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s%s, Index: %d\n", pol.Name, capAction,
+				policyDetailStateSuffix(pol.SchedulerName, schedActive, haveSched),
+				dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)))
 			if pol.Description != "" {
 				fmt.Fprintf(buf, "    Description: %s\n", pol.Description)
 			}
 			fmt.Fprintf(buf, "    Match:\n")
 			fmt.Fprintf(buf, "      Source zone: %s\n", zpp.FromZone)
 			fmt.Fprintf(buf, "      Destination zone: %s\n", zpp.ToZone)
-			fmt.Fprintf(buf, "      Source addresses:\n")
-			for _, addr := range pol.Match.SourceAddresses {
-				resolved := grpcResolveAddress(cfg, addr)
-				// #3358: unqualify a synthetic zone-local key (#3061,
-				// zone-local/<zone>/<name>) to the authored book name so the
-				// internal compiler token never leaks; resolution still keys
-				// off the qualified token (it is the global-book key).
-				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
-			}
-			fmt.Fprintf(buf, "      Destination addresses:\n")
-			for _, addr := range pol.Match.DestinationAddresses {
-				resolved := grpcResolveAddress(cfg, addr)
-				// #3358: unqualify a synthetic zone-local key (#3061,
-				// zone-local/<zone>/<name>) to the authored book name so the
-				// internal compiler token never leaks; resolution still keys
-				// off the qualified token (it is the global-book key).
-				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
-			}
+			printAddrs("Source addresses", pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded)
+			printAddrs("Destination addresses", pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded)
 			fmt.Fprintf(buf, "      Applications:\n")
 			for _, app := range pol.Match.Applications {
 				fmt.Fprintf(buf, "        %s\n", app)
 			}
 			fmt.Fprintf(buf, "    Then:\n")
 			fmt.Fprintf(buf, "      %s\n", action)
-			if pol.Log != nil {
-				fmt.Fprintf(buf, "      log\n")
+			// #3667 (H04): surface the independent at-create/at-close session-log
+			// modes instead of a bare "log" so a remote operator can tell whether
+			// session starts, closes, or both are logged (different cost + audit
+			// meaning). SessionLogModes is the SSOT shared with the local CLI.
+			if modes := pol.Log.SessionLogModes(); len(modes) > 0 {
+				fmt.Fprintf(buf, "      Session log: %s\n", strings.Join(modes, ", "))
 			}
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")
@@ -393,8 +408,9 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			capAction := strings.ToUpper(action[:1]) + action[1:]
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			// #3062: scheduler-inactive global policy appends State: inactive.
-			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s%s\n", pol.Name, capAction,
-				policyDetailStateSuffix(pol.SchedulerName, schedActive, haveSched))
+			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s%s, Index: %d\n", pol.Name, capAction,
+				policyDetailStateSuffix(pol.SchedulerName, schedActive, haveSched),
+				dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)))
 			if pol.Description != "" {
 				fmt.Fprintf(buf, "    Description: %s\n", pol.Description)
 			}
@@ -408,32 +424,20 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			if pol.Match.ToZone != "" {
 				fmt.Fprintf(buf, "      Destination zone: %s\n", pol.Match.ToZone)
 			}
-			fmt.Fprintf(buf, "      Source addresses:\n")
-			for _, addr := range pol.Match.SourceAddresses {
-				resolved := grpcResolveAddress(cfg, addr)
-				// #3358: unqualify a synthetic zone-local key (#3061,
-				// zone-local/<zone>/<name>) to the authored book name so the
-				// internal compiler token never leaks; resolution still keys
-				// off the qualified token (it is the global-book key).
-				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
-			}
-			fmt.Fprintf(buf, "      Destination addresses:\n")
-			for _, addr := range pol.Match.DestinationAddresses {
-				resolved := grpcResolveAddress(cfg, addr)
-				// #3358: unqualify a synthetic zone-local key (#3061,
-				// zone-local/<zone>/<name>) to the authored book name so the
-				// internal compiler token never leaks; resolution still keys
-				// off the qualified token (it is the global-book key).
-				fmt.Fprintf(buf, "        %s%s\n", config.DisplayAddressName(addr), resolved)
-			}
+			printAddrs("Source addresses", pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded)
+			printAddrs("Destination addresses", pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded)
 			fmt.Fprintf(buf, "      Applications:\n")
 			for _, app := range pol.Match.Applications {
 				fmt.Fprintf(buf, "        %s\n", app)
 			}
 			fmt.Fprintf(buf, "    Then:\n")
 			fmt.Fprintf(buf, "      %s\n", action)
-			if pol.Log != nil {
-				fmt.Fprintf(buf, "      log\n")
+			// #3667 (H04): surface the independent at-create/at-close session-log
+			// modes instead of a bare "log" so a remote operator can tell whether
+			// session starts, closes, or both are logged (different cost + audit
+			// meaning). SessionLogModes is the SSOT shared with the local CLI.
+			if modes := pol.Log.SessionLogModes(); len(modes) > 0 {
+				fmt.Fprintf(buf, "      Session log: %s\n", strings.Join(modes, ", "))
 			}
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")

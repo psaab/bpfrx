@@ -1206,7 +1206,9 @@ func StablePolicyRuleID(fromZone, toZone, ruleName string) string {
 // identity an inventory surface should report as policy_id so it matches the
 // numeric ID the RT_FLOW/event path logs; it is NOT the counter handle passed
 // to ReadPolicyCounters (callers keep passing the raw ordinal). Exported for
-// the REST/gRPC inventory surfaces (#3336); the CLI keeps its own copy.
+// the REST/gRPC inventory surfaces (#3336), the gRPC text detail renderer, and
+// the local CLI detail renderer (which now delegates here) so the Index column
+// cannot drift across surfaces (#3667).
 func RuntimePolicyIndex(ids map[[2]uint32]uint32, policySetID, sliceIndex uint32) uint32 {
 	if id, ok := ids[[2]uint32{policySetID, sliceIndex}]; ok {
 		return id

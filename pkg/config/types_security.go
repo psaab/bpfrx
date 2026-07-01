@@ -371,6 +371,29 @@ type PolicyLog struct {
 	SessionClose bool
 }
 
+// SessionLogModes returns the enabled session-log trigger tokens in Junos
+// display order: "at-create" when SessionInit is set (log at session start)
+// and "at-close" when SessionClose is set (log at session teardown). A nil
+// receiver, or a log block with neither trigger enabled, returns nil so a
+// caller can gate the "Session log:" line on len()>0.
+//
+// This is the single source of truth for the session-log display token set
+// shared by the local CLI detail renderer and the gRPC text detail renderer
+// (#3667), so the two surfaces cannot drift on the at-create/at-close labels.
+func (l *PolicyLog) SessionLogModes() []string {
+	if l == nil {
+		return nil
+	}
+	var modes []string
+	if l.SessionInit {
+		modes = append(modes, "at-create")
+	}
+	if l.SessionClose {
+		modes = append(modes, "at-close")
+	}
+	return modes
+}
+
 // NATConfig holds NAT configuration.
 type NATConfig struct {
 	Source               []*NATRuleSet
