@@ -25348,3 +25348,14 @@ top.
 - **File(s)**: pkg/policymatch/policymatch.go, pkg/cli/cli_show_security.go,
   pkg/cli/cli_request.go, cmd/cli/show.go, cmd/cli/main.go,
   pkg/grpcapi/server_show_firewall.go, _Log.md
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add RED-on-revert tests for the strict selector parser across all
+  surfaces (primitive + local show/test + remote show/test + gRPC ShowText);
+  document strict failure in the policymatch README and the Junos CLI reference
+  (M08). Verified RED-on-revert: reverting the impl fails the primitive build
+  and the local/remote/gRPC want-error cases.
+- **File(s)**: pkg/policymatch/selector_args_3696_test.go,
+  pkg/cli/query_strictness_3696_test.go, cmd/cli/query_strictness_3696_test.go,
+  pkg/grpcapi/server_testpolicy_strictness_3696_test.go,
+  pkg/policymatch/README.md, docs/junos-cli-reference.md, _Log.md

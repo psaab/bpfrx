@@ -109,6 +109,64 @@ before; only an explicitly-invalid protocol newly errors. Coverage:
 `test-policy:`), `pkg/cli/policymatch_protocol_test.go`, and
 `cmd/cli/testpolicy_protocol_test.go`.
 
+## Selector grammar strictness (#3696)
+
+The value validators above (#3116 port, #3108 protocol, #3284 icmp, #1711 IP)
+are only reached when the OUTER selector grammar actually delivers the token to
+them. Before #3696 each of the four CLI surfaces hand-maintained its own
+`for i := range args { switch args[i] {...} }` loop, and all four shared the two
+fail-OPEN defects the session-filter parser hit and #3439 (H5) fixed strictly:
+
+- a value-taking selector present WITHOUT a following value was guarded by
+  `if i+1 < len(args)` with no else, so a trailing selector left the field at its
+  zero/empty wildcard — `... destination-port` (no value) evaluated ALL
+  destination ports;
+- the switch had no `default:` arm, so an UNKNOWN/misspelled selector token (and
+  its value) were both silently skipped — `... protcol tcp` dropped both tokens
+  and yielded an any-protocol verdict.
+
+Because the shared matcher treats a zero port / empty protocol / nil icmp-type
+as "no constraint", either defect silently WIDENED the query: the operator got a
+permit/deny verdict for a BROADER set of traffic than they typed.
+
+The usage text was already a shared SSOT (#3628); the PARSING is now too:
+
+- `ParseSelectorArgs(args []string) (SelectorArgs, error)` — the single strict
+  grammar for the space-separated `from-zone <z> to-zone <z> [source-ip <ip>]
+  [destination-ip <ip>] [source-port <p>] [destination-port <p>]
+  [protocol <name|number>] [icmp-type <n>] [icmp-code <n>]` token vector. A
+  value-taking selector with no value (or an explicit-empty value — M01) errors
+  `selector "X" requires a value` (a `takeValue` helper mirroring
+  `cmd/cli/show.go` `parseFlowSessionArgs`); an unknown token errors
+  `unknown selector "X"` (default arm); every value routes through the existing
+  `ParsePort` / `ParseICMPValue` / `ValidateProtocol` / `net.ParseIP` validators.
+  A field left at its zero value therefore means the operator OMITTED it (legit
+  wildcard), never "present but silently dropped". `SelectorArgs.Query()` builds
+  a `policymatch.Query` (empty IP → nil `net.IP` wildcard) for the local/gRPC
+  in-process surfaces.
+
+This is applied at ALL FOUR CLI surfaces (mirroring the #3116 / #3108 wiring)
+plus the gRPC text bridge:
+
+- CLI `test policy` + `show security match-policies` (local `pkg/cli`) AND the
+  remote `cli` client (`cmd/cli`) — `ParseSelectorArgs` → a command error before
+  any RPC;
+- gRPC `ShowText` `test-policy:` (`showTestPolicy`) — the server-boundary sibling
+  hardened directly: a comma segment lacking `key=value`, an unknown key, or an
+  explicit-empty typed value (`port=`, indistinguishable from "key absent" under
+  the old `ParsePort("") == (0, nil)`) is reported as a `malformed selector
+  segment` / `unknown selector` diagnostic instead of being silently skipped. A
+  bare `test-policy:` (no params) still falls through to the missing-from/to-zone
+  diagnostic.
+
+A VALID query behaves exactly as before; only a missing value, an unknown
+selector, or an explicit-empty value newly errors. The #3628 usage tail now
+documents the strict failure. Coverage: `selector_args_3696_test.go` (the shared
+primitive), `pkg/cli/query_strictness_3696_test.go`,
+`cmd/cli/query_strictness_3696_test.go`, and
+`pkg/grpcapi/server_testpolicy_strictness_3696_test.go` (red-on-revert on every
+surface).
+
 ## The surface #3042 missed (#3103)
 
 The original #3042 consolidation routed the REST/gRPC `MatchPolicies` and CLI

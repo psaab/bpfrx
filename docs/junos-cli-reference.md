@@ -823,6 +823,44 @@ Global policies:
 
 ---
 
+## Security: Policy Simulator (match-policies / test policy)
+
+**Commands:** `show security match-policies from-zone <z> to-zone <z> [...]`
+and `test policy from-zone <z> to-zone <z> [...]` (both local and remote CLI).
+
+The 5-tuple policy simulator answers "which policy does this flow match?" over
+the same precedence the dataplane enforces. Selectors: `source-ip`,
+`destination-ip`, `source-port`, `destination-port`, `protocol <name|number>`,
+`icmp-type`, `icmp-code`. `from-zone` and `to-zone` are required; an OMITTED
+selector matches any.
+
+**Strict selector validation (#3696).** All four CLI surfaces (local + remote
+`show security match-policies` / `test policy`) and the gRPC `ShowText`
+`test-policy:` bridge reject malformed selector grammar rather than silently
+widening the query — a firewall diagnostic must answer the query the operator
+typed, not a broader one. All four CLI surfaces now share one strict grammar,
+`policymatch.ParseSelectorArgs`, the SSOT sibling of the #3439 (H5)
+session-filter fix:
+
+- a selector present WITHOUT a value (`... destination-port` with nothing after
+  it) is an error `selector "destination-port" requires a value` — previously it
+  left the port at 0 (the wildcard) and evaluated ALL ports;
+- an UNKNOWN / misspelled selector (`... protcol tcp`, or the plausible
+  abbreviation `... proto tcp`) is an error `unknown selector "protcol"` —
+  previously the token and its value were both silently dropped, yielding an
+  any-protocol verdict;
+- an explicit-empty typed value is an error, not the omitted-wildcard (M01);
+- malformed IP / port / protocol / icmp values still error through the shared
+  `ParsePort` / `ValidateProtocol` / `ParseICMPValue` / `net.ParseIP` validators
+  (#3116 / #3108 / #3284 / #1711).
+
+On the gRPC `test-policy:` text bridge a comma segment lacking `key=value`, an
+unknown key, or an explicit-empty typed value (`port=`) is reported as a
+diagnostic instead of being skipped; a bare `test-policy:` still reports the
+missing-from/to-zone message. A VALID query behaves exactly as before.
+
+---
+
 ## Security: Zones
 
 **Command:** `show security zones`
