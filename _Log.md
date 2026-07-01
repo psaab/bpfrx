@@ -1,3 +1,39 @@
+## 2026-07-01 — #3667 gRPC policy-detail text parity (except marker + session-log modes + Index)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3667 — the gRPC-rendered `show security policies detail`
+    text surface (showPoliciesDetail) had drifted from the local CLI
+    detail renderer. H01 (correctness): it printed
+    source-address-excluded / destination-address-excluded sets under a
+    plain `Source/Destination addresses:` header with NO `(except)`
+    marker — the OPPOSITE security meaning. H04: it collapsed the
+    independent session-init/session-close log modes into a bare `log`.
+    H05: it omitted the runtime policy `Index` needed to map an RT_FLOW /
+    policy-deny log line back to the detail row. Fixed all three in BOTH
+    the zone-pair and global blocks: `(except)` header annotation,
+    `Session log: at-create, at-close`, and `, Index: <N>` from the
+    RuntimePolicyIDs SSOT. Lifted shared helpers to prevent re-drift
+    (L04): `config.PolicyLog.SessionLogModes()`, reuse of the existing
+    `dpuserspace.RuntimePolicyIndex` (local CLI now delegates to it), and
+    a single `printAddrs` closure inside showPoliciesDetail.
+  - **File(s)**: pkg/grpcapi/server_show_policies_text.go,
+    pkg/config/types_security.go, pkg/dataplane/userspace/policies.go,
+    pkg/cli/cli_show_security.go
+  - **Action**: Adjust the #3062 scheduler-state gRPC detail test whose
+    active / no-provider assertions matched `action-type: Permit\n` (the
+    new `, Index: N` suffix breaks the trailing-newline match) to
+    `action-type: Permit, Index: `, which still proves no State suffix
+    was inserted between action-type and Index.
+  - **File(s)**: pkg/grpcapi/server_show_policies_scheduler_3062_test.go
+  - **Action**: Add the RED-on-revert golden test — excluded source +
+    excluded destination (zone-pair AND global), session-init-only,
+    session-close-only, both, plus the runtime Index value matched
+    against the SSOT. Verified RED against the origin/master renderer.
+  - **File(s)**: pkg/grpcapi/server_show_policies_text_exclusion_3667_test.go (new)
+  - **Action**: Document the gRPC text detail parity (#3667) under the
+    policy-detail match-inversion / session-log / Index notes.
+  - **File(s)**: docs/junos-cli-reference.md, _Log.md
+
 ## 2026-07-01 — #3661 split reject RATE-LIMIT drop by source (Rust leg, M02 follow-up to #3657)
 
 - **Timestamp**: 2026-07-01
