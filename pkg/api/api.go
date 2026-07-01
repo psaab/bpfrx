@@ -126,18 +126,26 @@ func queryUint16Strict(r *http.Request, key string, def uint16) (uint16, bool) {
 }
 
 // queryIntStrict parses a non-negative int query parameter and FAILS
-// CLOSED on a malformed/negative non-empty value (#2934). An empty value
-// returns (def, true); a bad value returns (0, false) so the caller can
-// emit HTTP 400. Used for filter/predicate parameters (e.g. dst_port in
-// the policy-match simulator) where a bad value silently becoming the
-// default is a wildcard that yields a misleading verdict.
+// CLOSED on a malformed/negative/non-canonical non-empty value (#2934,
+// #3679). An empty value returns (def, true); a bad value returns
+// (0, false) so the caller can emit HTTP 400. Used for filter/predicate
+// parameters (e.g. dst_port in the policy-match simulator) where a bad
+// value silently becoming the default is a wildcard that yields a
+// misleading verdict.
+//
+// #3679: parsing routes through config.ParseCanonicalUint rather than
+// strconv.Atoi so a signed spelling ("+80" — Atoi accepted it as 80,
+// which then simulated port 80) is rejected here exactly as the #3606
+// commit-time and dataplane port parsers reject it. ParseCanonicalUint
+// requires a bare run of ASCII digits (no sign, no whitespace) and never
+// returns a negative value, so the historical n < 0 guard is subsumed.
 func queryIntStrict(r *http.Request, key string, def int) (int, bool) {
 	v := r.URL.Query().Get(key)
 	if v == "" {
 		return def, true
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
+	n, err := config.ParseCanonicalUint(v)
+	if err != nil {
 		return 0, false
 	}
 	return n, true

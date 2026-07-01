@@ -40,6 +40,13 @@ func TestValidatePort(t *testing.T) {
 // FAIL-ON-REVERT: restoring `dstPort, _ = strconv.Atoi(token)` (ignoring the
 // error) makes "abc" and "" both become 0 with no error, flipping the want-error
 // "abc"/"70000"/"-1" cases red.
+//
+// #3679 FAIL-ON-REVERT: restoring strconv.Atoi in place of
+// config.ParseCanonicalUint makes the signed "+80"/"+0"/"+443" tokens parse as
+// 80/0/443 with no error — Atoi accepts a leading '+' — flipping the want-error
+// signed cases red. The CLI `show security match-policies` and `request security
+// test policy` port surfaces both funnel through ParsePort, so this unit case is
+// their RED-on-revert coverage.
 func TestParsePort(t *testing.T) {
 	cases := []struct {
 		in      string
@@ -56,6 +63,9 @@ func TestParsePort(t *testing.T) {
 		{"65536", 0, true},      // one past the top
 		{"-1", 0, true},         // negative
 		{"44a", 0, true},        // partial-numeric garbage
+		{"+80", 0, true},        // #3679 signed spelling (Atoi accepted as 80)
+		{"+443", 0, true},       // #3679 signed spelling
+		{"+0", 0, true},         // #3679 signed zero (Atoi accepted as 0)
 	}
 	for _, tc := range cases {
 		got, err := ParsePort(tc.in)

@@ -32,9 +32,21 @@ across every surface:
   of a silent `strconv.Atoi` drop that coerced a malformed port to the `0`
   wildcard). An
   empty/whitespace token is unspecified `(0, nil)`; a non-empty token must parse
-  and pass `ValidatePort`; a malformed (`abc`), negative, or out-of-range token
-  is rejected. An explicit `0` is accepted as "unspecified" for parity with the
-  gRPC `int32` field, where proto3 cannot distinguish an unset scalar from `0`.
+  and pass `ValidatePort`; a malformed (`abc`), signed (`+80`/`-80`, #3679),
+  or out-of-range token is rejected. An explicit `0` is accepted as
+  "unspecified" for parity with the gRPC `int32` field, where proto3 cannot
+  distinguish an unset scalar from `0`.
+- `ParseICMPValue(string) (*uint8, error)` — for the CLI/REST/gRPC ICMP
+  `type`/`code` selector tokens. Empty/whitespace is unspecified `(nil, nil)`; a
+  non-empty token must be a canonical unsigned decimal in `0..255`; malformed,
+  signed (`+8`/`-8`, #3679), or out-of-range is rejected.
+- #3679: `ParsePort` and `ParseICMPValue` route their non-empty token through
+  `config.ParseCanonicalUint` — the same canonical-form primitive the #3606
+  commit-time and Rust dataplane port parsers use — so a signed spelling
+  (`strconv.Atoi` accepted `+80` as `80`) that the config grammar and dataplane
+  now reject can no longer be accepted on a diagnostic surface. This closes the
+  commit-vs-diagnostic split that made automated policy verification green for a
+  token the platform rejects.
 
 This is applied at ALL FOUR simulator surfaces (matching the thin-adapter list
 above), so "all surfaces validate the port" is literally true:
