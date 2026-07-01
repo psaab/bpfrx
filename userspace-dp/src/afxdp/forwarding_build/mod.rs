@@ -402,28 +402,41 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // breaking inbound firewall delivery for all NAT traffic. (#1342
     // AGY r1 finding #2.)
 
-    // Add static NAT external IPs as local delivery targets so inbound
-    // traffic destined to external IPs is recognized by the firewall.
-    for ext_ip in state.static_nat.external_ips() {
-        match ext_ip {
-            std::net::IpAddr::V4(v4) => {
-                state.local_v4.insert(*v4);
-            }
-            std::net::IpAddr::V6(v6) => {
-                state.local_v6.insert(*v6);
-            }
-        }
+    // Add static NAT external IPs and DNAT destination IPs as local-delivery
+    // targets so inbound traffic destined to those IPs is recognized by the
+    // firewall. #3769: each IP carries its owning rule's `from
+    // routing-instance` scope; record it (converted to a canonical route
+    // table via `connected_route_tables`) in `local_nat_tables_v*` so the
+    // local-delivery shortcut is gated on the RESOLVING table — a packet in
+    // VRF A to a NAT/DNAT address owned only in VRF B no longer short-circuits
+    // to LocalDelivery, it follows the VRF-A FIB + zone/policy. The scoped IPs
+    // are collected into an owned buffer first so the immutable borrow of the
+    // NAT tables ends before the mutable `state.local_*` inserts.
+    let mut nat_local_targets: Vec<(std::net::IpAddr, String)> = Vec::new();
+    for (ip, instance) in state.static_nat.external_ips_scoped() {
+        nat_local_targets.push((ip, instance.to_string()));
     }
-
-    // Add DNAT destination IPs as local delivery targets so traffic
-    // to those IPs is recognized as locally-destined and processed.
-    for dst_ip in state.dnat_table.destination_ips() {
-        match dst_ip {
+    for (ip, instance) in state.dnat_table.destination_ips_scoped() {
+        nat_local_targets.push((ip, instance.to_string()));
+    }
+    for (ip, instance) in nat_local_targets {
+        let (table_v4, table_v6) = interfaces::connected_route_tables(&instance);
+        match ip {
             std::net::IpAddr::V4(v4) => {
                 state.local_v4.insert(v4);
+                state
+                    .local_nat_tables_v4
+                    .entry(v4)
+                    .or_default()
+                    .insert(table_v4);
             }
             std::net::IpAddr::V6(v6) => {
                 state.local_v6.insert(v6);
+                state
+                    .local_nat_tables_v6
+                    .entry(v6)
+                    .or_default()
+                    .insert(table_v6);
             }
         }
     }

@@ -759,4 +759,26 @@ impl StaticNatTable {
             .map(|(ip, _)| ip)
             .chain(self.blocks.iter().map(|b| &b.external.base))
     }
+
+    /// #3769: like [`external_ips`], but pairs each external IP with the
+    /// `from routing-instance` scope of the owning rule ("" = the default
+    /// instance / global). The forwarding-state builder converts the routing
+    /// instance to a canonical route table and records the table attribution
+    /// in `local_nat_tables_v*`, so the local-delivery shortcut is gated on the
+    /// resolving VRF instead of the global `local_v*` membership. A single
+    /// external IP may appear more than once (per port mapping AND per
+    /// split-horizon scope, #3605); every (IP, instance) pair is yielded and
+    /// the builder de-duplicates by inserting into a set.
+    pub(crate) fn external_ips_scoped(&self) -> Vec<(IpAddr, &str)> {
+        let mut out = Vec::new();
+        for ((ip, _port), entries) in &self.dnat {
+            for entry in entries {
+                out.push((*ip, entry.from_routing_instance.as_str()));
+            }
+        }
+        for block in &self.blocks {
+            out.push((block.external.base, block.from_routing_instance.as_str()));
+        }
+        out
+    }
 }

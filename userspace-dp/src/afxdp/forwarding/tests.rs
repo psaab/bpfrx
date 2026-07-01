@@ -2761,6 +2761,278 @@ fn local_delivery_v6_is_table_scoped_no_cross_vrf_leak() {
     assert_eq!(resolved_a.local_ifindex, 301);
 }
 
+/// #3769: the local-delivery DECISION (not merely the ifindex ATTRIBUTION
+/// #3151) must be table-scoped for a static-NAT external IP, which has NO
+/// connected route so its owning routing-instance was previously lost. The
+/// external IP is inserted into the GLOBAL `local_v4` set; before #3769 a
+/// packet resolved in a DIFFERENT VRF hit the global membership and
+/// short-circuited to LocalDelivery (ifindex 0), bypassing that VRF's FIB +
+/// zone/policy + HA-RG owner check. After #3769 only the owning VRF delivers
+/// locally. Revert (remove the `local_nat_tables_v4` table gate on the
+/// membership shortcut) → tenant-a resolves LocalDelivery → RED.
+#[test]
+fn static_nat_local_delivery_is_table_scoped_no_cross_vrf_leak() {
+    let snapshot = crate::ConfigSnapshot {
+        static_nat_rules: vec![crate::StaticNATRuleSnapshot {
+            name: "web".to_string(),
+            from_routing_instance: "tenant-b".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let ext = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+
+    // The external IP is a member of the GLOBAL local set (precondition —
+    // otherwise the shortcut is never reached and the test proves nothing).
+    assert!(
+        state.local_v4.contains(&Ipv4Addr::new(203, 0, 113, 10)),
+        "static-NAT external IP must be a global local-delivery member",
+    );
+
+    // Owning VRF (tenant-b): the NAT subsystem owns the external IP →
+    // LocalDelivery, ifindex 0 (no interface owns a NAT external IP; #3769 L5
+    // gates this ifindex-0 delivery on table ownership).
+    let owner = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        ext,
+        Some("tenant-b.inet.0"),
+    );
+    assert_eq!(
+        owner.disposition,
+        ForwardingDisposition::LocalDelivery,
+        "NAT external IP must local-deliver in its OWN routing-instance",
+    );
+    assert_eq!(
+        owner.local_ifindex, 0,
+        "a NAT-only external IP has no interface → ifindex 0 (gated, counted)",
+    );
+
+    // Cross-VRF (tenant-a): NOT owned here → must NOT leak to LocalDelivery;
+    // it follows the tenant-a FIB (no route → NoRoute).
+    let cross = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        ext,
+        Some("tenant-a.inet.0"),
+    );
+    assert_ne!(
+        cross.disposition,
+        ForwardingDisposition::LocalDelivery,
+        "a VRF-A packet to a NAT address owned only in VRF-B must NOT \
+         short-circuit to LocalDelivery (#3769 cross-VRF leak)",
+    );
+    assert_eq!(
+        cross.disposition,
+        ForwardingDisposition::NoRoute,
+        "tenant-a has no route for the tenant-b NAT external IP",
+    );
+
+    // Default table (None → inet.0): also not the owner → no leak.
+    let dflt =
+        lookup_forwarding_resolution_in_table_with_dynamic(&state, &neighbors, ext, None);
+    assert_ne!(
+        dflt.disposition,
+        ForwardingDisposition::LocalDelivery,
+        "default-table packet to a tenant-b NAT external IP must not leak",
+    );
+}
+
+/// #3769 (DNAT): identical table-scoped local-delivery guarantee for a DNAT
+/// destination IP owned by a rule in tenant-b. Revert the table gate →
+/// tenant-a leaks to LocalDelivery → RED.
+#[test]
+fn dnat_local_delivery_is_table_scoped_no_cross_vrf_leak() {
+    let snapshot = crate::ConfigSnapshot {
+        destination_nat_rules: vec![crate::DestinationNATRuleSnapshot {
+            name: "web-dnat".to_string(),
+            from_routing_instance: "tenant-b".to_string(),
+            destination_address: "198.51.100.20".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "10.0.61.102".to_string(),
+            pool_port: 8443,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+
+    let owner = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        dst,
+        Some("tenant-b.inet.0"),
+    );
+    assert_eq!(
+        owner.disposition,
+        ForwardingDisposition::LocalDelivery,
+        "DNAT destination IP must local-deliver in its owning VRF",
+    );
+
+    let cross = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        dst,
+        Some("tenant-a.inet.0"),
+    );
+    assert_eq!(
+        cross.disposition,
+        ForwardingDisposition::NoRoute,
+        "cross-VRF packet to a DNAT destination owned in tenant-b must \
+         follow the tenant-a FIB, not LocalDelivery (#3769)",
+    );
+}
+
+/// #3769 (v6): a static-NAT external IPv6 owned in tenant-b must not
+/// local-deliver a tenant-a packet. Revert the `local_nat_tables_v6` gate → RED.
+#[test]
+fn nat_local_delivery_v6_is_table_scoped_no_cross_vrf_leak() {
+    let snapshot = crate::ConfigSnapshot {
+        static_nat_rules: vec![crate::StaticNATRuleSnapshot {
+            name: "web6".to_string(),
+            from_routing_instance: "tenant-b".to_string(),
+            external_ip: "2001:db8:ff::10".to_string(),
+            internal_ip: "2001:db8:1::10".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let ext: IpAddr = "2001:db8:ff::10".parse().unwrap();
+
+    let owner = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        ext,
+        Some("tenant-b.inet6.0"),
+    );
+    assert_eq!(owner.disposition, ForwardingDisposition::LocalDelivery);
+    assert_eq!(owner.local_ifindex, 0);
+
+    let cross = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        ext,
+        Some("tenant-a.inet6.0"),
+    );
+    assert_ne!(
+        cross.disposition,
+        ForwardingDisposition::LocalDelivery,
+        "v6 NAT external IP owned in tenant-b must not local-deliver a \
+         tenant-a packet (#3769)",
+    );
+}
+
+/// #3769: default routing-instance (from-routing-instance "") behaviour is
+/// unchanged — a default-VRF NAT external IP still LocalDelivers in inet.0 —
+/// and the ifindex-0 diagnostic counter advances for the NAT-only delivery.
+#[test]
+fn nat_local_delivery_default_vrf_unchanged_and_counts_ifindex0() {
+    let snapshot = crate::ConfigSnapshot {
+        static_nat_rules: vec![crate::StaticNATRuleSnapshot {
+            name: "web-default".to_string(),
+            from_routing_instance: String::new(), // default instance
+            external_ip: "203.0.113.50".to_string(),
+            internal_ip: "192.168.1.50".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let ext = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50));
+
+    let before = LOCAL_DELIVERY_IFINDEX0.load(std::sync::atomic::Ordering::Relaxed);
+    // Default table via explicit inet.0 and via None both deliver locally.
+    for table in [Some("inet.0"), None] {
+        let r = lookup_forwarding_resolution_in_table_with_dynamic(
+            &state, &neighbors, ext, table,
+        );
+        assert_eq!(
+            r.disposition,
+            ForwardingDisposition::LocalDelivery,
+            "default-VRF NAT external IP must local-deliver in the default table",
+        );
+        assert_eq!(r.local_ifindex, 0, "NAT-only external IP → ifindex 0");
+    }
+    let after = LOCAL_DELIVERY_IFINDEX0.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after >= before + 2,
+        "ifindex-0 LocalDelivery counter must advance for NAT-only delivery \
+         (before={before}, after={after})",
+    );
+}
+
+/// #3769: the table-scoped DECISION also fixes the interface-address residual
+/// #3151 left — an interface IP owned in ONLY ONE routing-instance must not
+/// LocalDeliver a packet resolved in a DIFFERENT instance (the #3151 test used
+/// the SAME IP in BOTH VRFs; here it exists in tenant-b only). Before #3769 the
+/// global `local_v4` membership short-circuited the tenant-a packet to
+/// LocalDelivery with ifindex 0; after #3769 it falls through to the tenant-a
+/// FIB. Revert the decision gate → tenant-a LocalDelivery → RED.
+#[test]
+fn interface_local_delivery_single_vrf_no_cross_vrf_leak() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![crate::ZoneSnapshot {
+            name: "zb".to_string(),
+            id: TEST_UNTRUST_ZONE_ID,
+            tcp_rst: false,
+            ..Default::default()
+        }],
+        interfaces: vec![crate::InterfaceSnapshot {
+            name: "ge-0/0/1.90".to_string(),
+            zone: "zb".to_string(),
+            routing_instance: "tenant-b".to_string(),
+            linux_name: "ge-0-0-1.90".to_string(),
+            ifindex: 202,
+            hardware_addr: "02:00:00:00:00:b2".to_string(),
+            addresses: vec![crate::InterfaceAddressSnapshot {
+                family: "inet".to_string(),
+                address: "10.0.0.1/32".to_string(),
+                scope: 0,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+    // Owning VRF (tenant-b): interface owns it → LocalDelivery with the real
+    // ifindex (unchanged #3151 attribution).
+    let owner = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        ip,
+        Some("tenant-b.inet.0"),
+    );
+    assert_eq!(owner.disposition, ForwardingDisposition::LocalDelivery);
+    assert_eq!(owner.local_ifindex, 202);
+
+    // Cross-VRF (tenant-a): the interface IP is not owned here → no leak.
+    let cross = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        ip,
+        Some("tenant-a.inet.0"),
+    );
+    assert_ne!(
+        cross.disposition,
+        ForwardingDisposition::LocalDelivery,
+        "an interface IP owned only in tenant-b must not local-deliver a \
+         tenant-a packet (#3769 generalizes #3151)",
+    );
+}
+
 /// #2389: a static route with two next-hops must retain BOTH in the FIB
 /// (equal-cost), and a dead first next-hop must fall back to a live
 /// alternate. Revert the build to `next_hops.first()` → only one candidate

@@ -14,6 +14,24 @@ use super::*;
 pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) local_v4: FastSet<Ipv4Addr>,
     pub(in crate::afxdp) local_v6: FastSet<Ipv6Addr>,
+    /// #3769: table (VRF) attribution for the NAT/DNAT-only local-delivery
+    /// targets that `local_v4`/`local_v6` also carry. `local_v*` is a GLOBAL
+    /// membership set ("some subsystem answers for this IP somewhere"); an
+    /// interface address's owning table is recoverable from `connected_v*`
+    /// (#2388 table-scoped), but a static-NAT external IP or a DNAT
+    /// destination IP has NO connected route, so before #3769 its owning
+    /// routing-instance was lost — a packet in VRF A destined to a NAT/DNAT
+    /// address owned in VRF B hit the global `local_v*` membership and
+    /// short-circuited to `LocalDelivery`, skipping the VRF-A FIB + zone /
+    /// security-policy + HA-RG owner classification (#3151 fixed only the
+    /// ifindex ATTRIBUTION, not the membership DECISION). These maps record,
+    /// per external IP, the set of canonical route tables (from each NAT/DNAT
+    /// rule's `from routing-instance`) that own it, so the local-delivery
+    /// shortcut in `lookup_forwarding_resolution_inner_ecmp` is gated on the
+    /// resolving table. Built alongside the `local_v*` NAT append in
+    /// `forwarding_build`.
+    pub(in crate::afxdp) local_nat_tables_v4: FastMap<Ipv4Addr, FastSet<String>>,
+    pub(in crate::afxdp) local_nat_tables_v6: FastMap<Ipv6Addr, FastSet<String>>,
     /// #3182: EVERY configured interface address, decoupled from the
     /// NAT-aware `local_v*` exclusion. `local_v4`/`local_v6` drop the IP of
     /// any interface whose zone is an interface-mode-SNAT `to_zone`

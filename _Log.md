@@ -1,3 +1,50 @@
+## 2026-07-01 — #3769 userspace-dp: table-scope the local-delivery DECISION for NAT/DNAT external targets (cross-VRF leak + ifindex-0)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3769 (HIGH, VRF isolation / zone + HA-RG mis-attribution;
+    residual of #3151). Static-NAT external IPs and DNAT destination IPs
+    are inserted into the GLOBAL `local_v4`/`local_v6` sets with no
+    table/VRF attribution (they have no connected route). #3151 made only
+    the local-delivery ifindex ATTRIBUTION table-scoped; the membership
+    DECISION stayed global, so a packet in VRF A destined to a NAT/DNAT
+    address owned in VRF B hit the global `local_v*` membership and
+    short-circuited to `LocalDelivery` (with ifindex 0), bypassing the
+    VRF-A FIB + zone/security-policy + HA-RG owner check
+    (`owner_rg_for_flow(egress_ifindex)`).
+    FIX: carry per-external-IP table ownership. New
+    `ForwardingState.local_nat_tables_v4/v6: FastMap<Ip, FastSet<String>>`
+    populated in `forwarding_build` from each NAT/DNAT rule's `from
+    routing-instance` (converted to a canonical route table via
+    `connected_route_tables`) — via new `StaticNatTable::external_ips_scoped`
+    and `DnatTable::destination_ips_scoped` (the latter now also backs
+    `destination_ips` so the two views cannot drift). The
+    `lookup_forwarding_resolution_inner_ecmp` shortcut now delivers locally
+    ONLY when THIS table owns the address (interface owns it here — the
+    #3151 connected scan matched — OR a NAT/DNAT rule in this
+    routing-instance owns it); an address owned only in another table falls
+    through to the route lookup. This also generalizes #3151 to a
+    single-owner interface IP (present in exactly one VRF). L5: a
+    NAT/DNAT-only external target has no interface, so its LocalDelivery
+    carries ifindex 0 legitimately — now GATED on table ownership and
+    counted by the new `LOCAL_DELIVERY_IFINDEX0` diagnostic atomic.
+  - **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+    userspace-dp/src/afxdp/forwarding/mod.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/src/nat/static_nat.rs,
+    userspace-dp/src/nat/destination.rs,
+    userspace-dp/src/afxdp/forwarding/tests.rs,
+    userspace-dp/src/afxdp/forwarding/README.md
+  - **Tests**: added (forwarding/tests.rs)
+    `static_nat_local_delivery_is_table_scoped_no_cross_vrf_leak`,
+    `dnat_local_delivery_is_table_scoped_no_cross_vrf_leak`,
+    `nat_local_delivery_v6_is_table_scoped_no_cross_vrf_leak`,
+    `nat_local_delivery_default_vrf_unchanged_and_counts_ifindex0`,
+    `interface_local_delivery_single_vrf_no_cross_vrf_leak`. RED-on-revert
+    verified: forcing the pre-#3769 global membership (`if true || ...`)
+    fails the three v4 cross-VRF assertions; the existing #3151 test still
+    passes (it uses the same IP in BOTH VRFs, so its table-scoped ifindex
+    is unaffected — proving the new tests catch what #3151 cannot).
+
 ## 2026-07-01 — #3761 ip-monitoring: honest status/metrics (UNKNOWN vs PASS, applied vs desired, suppressed vs unresolved)
 
 - **Timestamp**: 2026-07-01

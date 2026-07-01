@@ -884,15 +884,40 @@ impl DnatTable {
     /// large block is still fully translated — only on-segment proxy-ARP is
     /// bounded.
     pub(crate) fn destination_ips(&self) -> impl Iterator<Item = IpAddr> {
-        // Deduplicate by collecting unique dst_ip values.
+        // Deduplicate by collecting unique dst_ip values. #3769: implemented
+        // on top of `destination_ips_scoped` so the set of registered local
+        // IPs (and the block-expansion bound) can never drift between the two
+        // views.
         let mut seen: FxHashMap<IpAddr, ()> = FxHashMap::default();
-        for key in self.entries.keys() {
-            seen.entry(key.dst_ip).or_insert(());
+        for (ip, _instance) in self.destination_ips_scoped() {
+            seen.entry(ip).or_insert(());
+        }
+        seen.into_keys()
+    }
+
+    /// #3769: like [`destination_ips`], but pairs each destination IP with the
+    /// `from routing-instance` scope of the owning DNAT rule ("" = the default
+    /// instance / global). The forwarding-state builder converts the routing
+    /// instance to a canonical route table and records the attribution in
+    /// `local_nat_tables_v*`, so the local-delivery shortcut is gated on the
+    /// resolving VRF rather than the global `local_v*` membership (the #3769
+    /// cross-VRF local-delivery leak). Not deduplicated — a destination IP can
+    /// legitimately be owned by DNAT rules in more than one routing-instance;
+    /// the builder inserts into a per-IP set of tables. The same
+    /// `MAX_LOCAL_PREFIX_HOSTS`-bounded prefix expansion as `destination_ips`
+    /// is applied so on-segment proxy-ARP/ND parity is preserved.
+    pub(crate) fn destination_ips_scoped(&self) -> Vec<(IpAddr, &str)> {
+        let mut out: Vec<(IpAddr, &str)> = Vec::new();
+        for (key, entries) in &self.entries {
+            for entry in entries {
+                out.push((key.dst_ip, entry.from_routing_instance.as_ref()));
+            }
         }
         for slots in self.prefix_entries.values() {
             for slot in slots {
+                let instance = slot.entry.from_routing_instance.as_ref();
                 if let Some(net) = slot.network() {
-                    seen.entry(net).or_insert(());
+                    out.push((net, instance));
                 }
                 match (slot.v4, slot.v6) {
                     (Some(p), _) => {
@@ -902,7 +927,7 @@ impl DnatTable {
                                 Ipv4Net::new(p.addr(), p.prefix_len())
                             {
                                 for host in net.hosts() {
-                                    seen.entry(IpAddr::V4(host)).or_insert(());
+                                    out.push((IpAddr::V4(host), instance));
                                 }
                             }
                         }
@@ -916,7 +941,7 @@ impl DnatTable {
                                 Ipv6Net::new(p.addr(), p.prefix_len())
                             {
                                 for host in net.hosts() {
-                                    seen.entry(IpAddr::V6(host)).or_insert(());
+                                    out.push((IpAddr::V6(host), instance));
                                 }
                             }
                         }
@@ -925,7 +950,7 @@ impl DnatTable {
                 }
             }
         }
-        seen.into_keys()
+        out
     }
 }
 
