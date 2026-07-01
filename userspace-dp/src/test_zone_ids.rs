@@ -1,11 +1,15 @@
 //! #919: canonical zone-ID constants for test fixtures.
 //!
-//! Production zone IDs are assigned by the Go config compiler
-//! (`pkg/dataplane/userspace/snapshot.go:183-187`) starting at 1.
-//! These constants give test code stable, named IDs to use in
-//! `SessionMetadata` constructors and `zone_name_to_id` /
-//! `zone_id_to_name` test maps. They mirror the conventional zone
-//! names used across most test fixtures.
+//! Production zone IDs are assigned by the Go control plane as a STABLE
+//! name-hash (`config.StableZoneID`, FNV-1a fold into [1, 65533]) — the
+//! compiler (`pkg/dataplane.assignZoneIDs`), the live wire builder
+//! (`pkg/dataplane/userspace/zones.go:buildZoneSnapshots`, #3704), and the
+//! HA name fallback (`pkg/daemon.buildZoneIDs`) all agree by construction.
+//! These constants are ARBITRARY small ids for test code only; the dataplane
+//! reads whatever id the snapshot carries (name -> id via `zone_name_to_id`),
+//! so tests may use any distinct values. They give test code stable, named IDs
+//! for `SessionMetadata` constructors and `zone_name_to_id` / `zone_id_to_name`
+//! test maps, mirroring the conventional zone names used across most fixtures.
 //!
 //! Tests that construct a custom `ForwardingState` should populate
 //! `zone_name_to_id` and `zone_id_to_name` consistently with these
