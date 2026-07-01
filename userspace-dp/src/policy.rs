@@ -2221,8 +2221,9 @@ pub(crate) fn parse_policy_state_with_counters(
         // the application-term `dropped_any` reject below. Without it the
         // address side would silently collapse to MatchNone and a
         // `deny <unrepresentable-address>` rule would fall through to a later
-        // permit / default-permit (deny fail-open). Checked BEFORE any literal
-        // parsing / book resolution so the preflight stays non-mutating.
+        // permit / default-permit (deny fail-open). Checked BEFORE book
+        // resolution and the malformed-literal rejects below; the v3/legacy
+        // literal parses above are non-mutating local scratch (#3729 review).
         //
         // #3367/#3711: checked BEFORE the malformed-literal rejects below — the
         // sentinel is the more specific cause (an undefined book / non-literal
