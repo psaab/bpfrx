@@ -2,6 +2,7 @@ package flowexport
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,36 +165,134 @@ func TestIPFIXSrcDstMaskPopulated(t *testing.T) {
 	}
 }
 
-// TestRouteMaskCacheResolves checks the cache wrapper returns the lookup's
-// result, caches it (a second call with a deliberately changed lookup still
-// returns the cached value within TTL), and handles a default-route /0 as a
-// successful resolve (ok=true) distinct from a miss (ok=false).
-func TestRouteMaskCacheResolves(t *testing.T) {
-	calls := 0
+// TestRouteMaskResolveMissDoesNotLookupSynchronously is the #3743 fail-on-
+// revert pin at the cache layer: resolve() runs inside the EventReader
+// session-close callback, so a cache MISS must NOT perform the netlink FIB
+// lookup on the caller's goroutine. The injected lookup blocks until the test
+// releases it; resolve() must still return the default (0,false) immediately.
+// Reverting to the pre-#3743 synchronous "lookup inside resolve" makes resolve()
+// block on the channel and return the lookup's sentinel (24,true) instead —
+// flipping this RED (and, end-to-end, blocking the whole callback path, which
+// TestExportSessionCloseDoesNotBlockOnFIBLookup pins).
+func TestRouteMaskResolveMissDoesNotLookupSynchronously(t *testing.T) {
+	release := make(chan struct{})
 	c := &routeMaskCache{
-		ttl:     time.Hour,
-		entries: make(map[string]routeMaskEntry),
+		ttl:         time.Hour,
+		maxInflight: 4,
+		entries:     make(map[string]routeMaskEntry),
+		pending:     make(map[string]struct{}),
 	}
 	c.lookup = func(net.IP) (uint8, bool) {
+		<-release // a synchronous caller would block here
+		return 24, true
+	}
+	got, ok := c.resolve(net.IPv4(192, 0, 2, 1))
+	if got != 0 || ok {
+		t.Fatalf("cache-miss resolve = %d,%v want 0,false (synchronous netlink on the callback path)", got, ok)
+	}
+	close(release) // let the scheduled background lookup finish and exit
+}
+
+// TestRouteMaskCacheAsyncPopulateAndHit checks the two-phase #3743 behaviour:
+// the first resolve to a new prefix misses (returns the default) and schedules
+// a background lookup; once that lookup completes, a subsequent resolve HITS
+// with the real mask without issuing another syscall. It also verifies a
+// default-route /0 is cached as a successful resolve (ok=true), distinct from a
+// miss (ok=false).
+func TestRouteMaskCacheAsyncPopulateAndHit(t *testing.T) {
+	done := make(chan struct{}, 1)
+	var mu sync.Mutex
+	calls := 0
+	c := &routeMaskCache{
+		ttl:         time.Hour,
+		maxInflight: 4,
+		entries:     make(map[string]routeMaskEntry),
+		pending:     make(map[string]struct{}),
+	}
+	c.lookup = func(net.IP) (uint8, bool) {
+		mu.Lock()
 		calls++
+		mu.Unlock()
 		return 16, true
 	}
+	c.afterPopulate = func() { done <- struct{}{} }
+
 	ip := net.IPv4(192, 0, 2, 1)
+	if m, ok := c.resolve(ip); m != 0 || ok {
+		t.Fatalf("first resolve = %d,%v want 0,false (miss default)", m, ok)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background lookup never populated the cache")
+	}
+	// Swap the lookup to a sentinel: a genuine cache HIT must not call it.
+	c.lookup = func(net.IP) (uint8, bool) { mu.Lock(); calls++; mu.Unlock(); return 99, true }
 	if m, ok := c.resolve(ip); m != 16 || !ok {
-		t.Fatalf("first resolve = %d,%v want 16,true", m, ok)
+		t.Fatalf("warm resolve = %d,%v want 16,true (cache not populated / hit path broken)", m, ok)
 	}
-	// Swap the lookup; within TTL the cached value must win (no new call).
-	c.lookup = func(net.IP) (uint8, bool) { calls++; return 99, true }
-	if m, ok := c.resolve(ip); m != 16 || !ok {
-		t.Fatalf("cached resolve = %d,%v want 16,true (cache miss?)", m, ok)
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("lookup called %d times, want 1 (hit path issued a syscall)", got)
 	}
-	if calls != 1 {
-		t.Fatalf("lookup called %d times, want 1 (cache not used)", calls)
+
+	// A default-route match (/0) caches as a successful resolve (ok=true).
+	c.lookup = func(net.IP) (uint8, bool) { return 0, true }
+	dip := net.IPv4(203, 0, 113, 1)
+	if m, ok := c.resolve(dip); m != 0 || ok {
+		t.Fatalf("default-route first resolve = %d,%v want 0,false (miss default)", m, ok)
 	}
-	// nil IP -> miss without a lookup.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("default-route background lookup never populated the cache")
+	}
+	if m, ok := c.resolve(dip); m != 0 || !ok {
+		t.Fatalf("default-route warm resolve = %d,%v want 0,true (default route not cached as a hit)", m, ok)
+	}
+
+	// nil IP -> miss without scheduling a lookup.
 	if m, ok := c.resolve(nil); m != 0 || ok {
 		t.Fatalf("nil IP resolve = %d,%v want 0,false", m, ok)
 	}
+}
+
+// TestExportSessionCloseDoesNotBlockOnFIBLookup is the #3743 end-to-end pin:
+// ExportSessionClose is invoked from the EventReader session-close callback, so
+// it must never block on the route-mask FIB lookup. The exporter is wired to a
+// routeMaskCache whose FIB lookup blocks until released; ExportSessionClose must
+// return promptly regardless. Reverting resolve() to a synchronous lookup makes
+// ExportSessionClose block on the netlink round-trip -> this test times out RED.
+func TestExportSessionCloseDoesNotBlockOnFIBLookup(t *testing.T) {
+	release := make(chan struct{})
+	c := &routeMaskCache{
+		ttl:         time.Hour,
+		maxInflight: 8,
+		entries:     make(map[string]routeMaskEntry),
+		pending:     make(map[string]struct{}),
+	}
+	c.lookup = func(net.IP) (uint8, bool) {
+		<-release
+		return 24, true
+	}
+	e := Exporter{MaskResolver: c.resolve}
+	rec, sd := closeRecordForMask(false)
+
+	done := make(chan struct{})
+	go func() {
+		e.ExportSessionClose(rec, sd)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// good: returned without waiting for the blocked FIB lookup.
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("ExportSessionClose blocked on the synchronous FIB lookup (netlink on the callback path)")
+	}
+	close(release) // let the background lookups finish and exit
 }
 
 // TestRouteMaskCacheBounded is a fail-on-revert pin for the cache size bound.
@@ -204,40 +303,37 @@ func TestRouteMaskCacheResolves(t *testing.T) {
 // the cache (no extra lookup), so the bound does not break the hit path.
 func TestRouteMaskCacheBounded(t *testing.T) {
 	const maxSize = 64
-	calls := 0
 	c := &routeMaskCache{
 		ttl:     time.Hour, // long TTL: entries never expire during the test,
 		maxSize: maxSize,   // so the bound is enforced purely by the size cap.
 		entries: make(map[string]routeMaskEntry),
 	}
-	c.lookup = func(net.IP) (uint8, bool) { calls++; return 24, true }
+	// storeLocked is the map-insert path the background populate goroutine uses
+	// (#3743). Drive it directly so the size bound is exercised deterministically
+	// without goroutines/timing.
+	insert := func(ip net.IP) {
+		c.mu.Lock()
+		c.storeLocked(string(ip.To16()), 24, true, time.Now())
+		c.mu.Unlock()
+	}
 
 	// Insert far more distinct keys than the cap. Each is a fresh IPv4 address.
 	const inserts = maxSize * 10
 	for i := 0; i < inserts; i++ {
 		ip := net.IPv4(10, byte(i>>16), byte(i>>8), byte(i))
-		c.resolve(ip)
+		insert(ip)
 		if got := len(c.entries); got > maxSize {
 			t.Fatalf("after %d inserts len(entries) = %d, want <= %d (cache unbounded — leak)",
 				i+1, got, maxSize)
 		}
 	}
-	if calls != inserts {
-		t.Fatalf("lookup called %d times, want %d (one per distinct insert)", calls, inserts)
-	}
 
-	// A repeated key within TTL must still hit the cache (no new lookup), even
-	// after the churn above evicted older entries.
-	before := calls
+	// A freshly inserted key within TTL must still resolve from the cache (the
+	// hit path returns it without a lookup), even after the churn above.
 	ip := net.IPv4(192, 0, 2, 7)
+	insert(ip)
 	if m, ok := c.resolve(ip); m != 24 || !ok {
-		t.Fatalf("warm insert = %d,%v want 24,true", m, ok)
-	}
-	if m, ok := c.resolve(ip); m != 24 || !ok {
-		t.Fatalf("warm hit = %d,%v want 24,true", m, ok)
-	}
-	if calls != before+1 {
-		t.Fatalf("repeated key triggered %d lookups, want 1 (hit path broken)", calls-before)
+		t.Fatalf("warm resolve = %d,%v want 24,true (hit path broken)", m, ok)
 	}
 	if len(c.entries) > maxSize {
 		t.Fatalf("final len(entries) = %d, want <= %d", len(c.entries), maxSize)
@@ -269,8 +365,12 @@ func TestRouteMaskCacheEvictsExpiredFirst(t *testing.T) {
 	}
 
 	// A new key at the cap should purge the expired entries (not clear the
-	// whole map), leaving the live entry + the newcomer.
-	c.resolve(net.IPv4(203, 0, 113, 9))
+	// whole map), leaving the live entry + the newcomer. Drive storeLocked
+	// directly — the background populate path (#3743) that would call it.
+	newIP := net.IPv4(203, 0, 113, 9)
+	c.mu.Lock()
+	c.storeLocked(string(newIP.To16()), 16, true, time.Now())
+	c.mu.Unlock()
 	if _, ok := c.entries[string(live.To16())]; !ok {
 		t.Fatalf("live entry was wiped — expired-first purge did not run")
 	}
