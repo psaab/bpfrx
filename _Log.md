@@ -1,3 +1,28 @@
+## 2026-07-01 — #3626 appid catalog includes NAT-only match-application refs
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3626 — `appid.CatalogNames(cfg, false)` built the
+    compiled app catalog (application-identification DISABLED) by walking
+    ONLY security policy + global-policy `match application` references,
+    never source/destination-NAT rule `match application`. The strict
+    commit-time validator DOES walk NAT refs
+    (`compiler_validate_strict.go applicationsToValidateStrict`), so an app
+    referenced ONLY by a NAT rule validated fine but was omitted from the
+    runtime catalog — the dataplane could not resolve it and session
+    naming fell back to tuple/numeric. FIX: extended `CatalogNames` with a
+    NAT walk mirroring the strict validator (Source + Destination.RuleSets,
+    skip nil rule-sets/rules, scalar `rule.Match.Application`, static NAT
+    excluded); factored the per-reference resolution into one shared
+    `addAppRef` closure used by both the policy and NAT walks (L04).
+    Preserved the #3622 nil-guards and the appid-disabled footprint (only
+    genuinely-referenced apps, never `includeAll`). Added RED-on-revert
+    test `TestCatalogNamesIncludesNATOnlyAppRefs` and pinned the NAT parity
+    by adding a NAT-only reference to
+    `TestStrictValidationSetMatchesCatalogNames` (resolves the M02 unpinned
+    drift). Updated pkg/appid/README.md catalog-scope docs.
+  - **File(s)**: pkg/appid/runtime.go, pkg/appid/runtime_test.go,
+    pkg/appid/README.md, _Log.md
+
 ## 2026-07-01 — #3624 structured policy inventory exposes scheduler_name + inactive
 
 - **Timestamp**: 2026-07-01
