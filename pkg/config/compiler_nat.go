@@ -1673,13 +1673,13 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 	if len(m.Children) == 0 && len(m.Keys) >= 2 {
 		vals := m.Keys[1:]
 		for i := 0; i < len(vals); i++ {
-			low, err := strconv.Atoi(vals[i])
+			low, err := parseCanonicalPort(vals[i])
 			if err != nil {
 				addInvalid(vals[i])
 				continue
 			}
 			if i+2 < len(vals) && vals[i+1] == "to" {
-				if high, err2 := strconv.Atoi(vals[i+2]); err2 == nil && high >= low {
+				if high, err2 := parseCanonicalPort(vals[i+2]); err2 == nil && high >= low {
 					ports = appendDNATPortRange(ports, low, high)
 					i += 2
 					continue
@@ -1692,11 +1692,11 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 	if len(m.Children) > 0 {
 		// Check for set-syntax port range: Keys=["destination-port","20000"] + child "to 30000"
 		if len(m.Keys) >= 2 {
-			if low, err := strconv.Atoi(m.Keys[1]); err == nil {
+			if low, err := parseCanonicalPort(m.Keys[1]); err == nil {
 				// Look for "to" child indicating a range
 				toChild := m.FindChild("to")
 				if toChild != nil {
-					if high, err2 := strconv.Atoi(nodeVal(toChild)); err2 == nil && high >= low {
+					if high, err2 := parseCanonicalPort(nodeVal(toChild)); err2 == nil && high >= low {
 						ports = appendDNATPortRange(ports, low, high)
 						return ports, invalid
 					}
@@ -1710,21 +1710,21 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 		// Multiple ports/ranges as children: destination-port { 80; 443; 20000 to 30000; }
 		for i := 0; i < len(m.Children); i++ {
 			child := m.Children[i]
-			low, err := strconv.Atoi(child.Name())
+			low, err := parseCanonicalPort(child.Name())
 			if err != nil {
 				addInvalid(child.Name())
 				continue
 			}
 			// Hierarchical range: "20000 to 30000" → leaf Keys=["20000", "to", "30000"]
 			if len(child.Keys) >= 3 && child.Keys[1] == "to" {
-				if high, err2 := strconv.Atoi(child.Keys[2]); err2 == nil && high >= low {
+				if high, err2 := parseCanonicalPort(child.Keys[2]); err2 == nil && high >= low {
 					ports = appendDNATPortRange(ports, low, high)
 					continue
 				}
 			}
 			// Sibling-node range: child[i]="20000", child[i+1]="to", child[i+2]="30000"
 			if i+2 < len(m.Children) && m.Children[i+1].Name() == "to" {
-				if high, err2 := strconv.Atoi(m.Children[i+2].Name()); err2 == nil && high >= low {
+				if high, err2 := parseCanonicalPort(m.Children[i+2].Name()); err2 == nil && high >= low {
 					ports = appendDNATPortRange(ports, low, high)
 					i += 2
 					continue
@@ -1734,7 +1734,7 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 		}
 	} else if v := nodeVal(m); v != "" {
 		// Single port: destination-port 8080;
-		if n, err := strconv.Atoi(v); err == nil {
+		if n, err := parseCanonicalPort(v); err == nil {
 			ports = append(ports, n)
 		} else {
 			addInvalid(v)

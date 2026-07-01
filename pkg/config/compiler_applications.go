@@ -518,6 +518,38 @@ func resolveAppPort(spec string) string {
 	return spec
 }
 
+// parseCanonicalPort parses a canonical unsigned decimal port token. Unlike
+// strconv.Atoi — which accepts a leading '+' ("+80" -> 80) and a leading '-'
+// ("-80" -> -80) — it requires a bare run of ASCII decimal digits, with no sign
+// and no surrounding whitespace.
+//
+// Junos rejects a signed / non-canonical port, and the userspace dataplane's
+// port parsers do NOT agree on the sign, so accepting one at commit is a
+// commit-vs-dataplane divergence (#3606): the Go capability gate
+// userspacePortSpecRepresentable parses with strconv.ParseUint (which rejects
+// "+80"), so an application whose port slips through the old Atoi commit check
+// is then silently downgraded to unsupported at apply; and the Rust
+// parse_port_spec's u16 FromStr ACCEPTS "+80" as 80. The historical Atoi commit
+// gate accepted "+80", the capability gate rejected it, and the simulator
+// (portMatches) said it matched — a three-way split on a security leaf.
+//
+// Callers still apply their own value-range check on the returned int; this
+// helper only enforces canonical FORM. A parsed value that overflows int
+// returns strconv's range error, exactly as Atoi would.
+func parseCanonicalPort(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty port")
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf(
+				"non-canonical port %q: only unsigned decimal digits are allowed "+
+					"(no leading sign or whitespace)", s)
+		}
+	}
+	return strconv.Atoi(s)
+}
+
 // validatePortSpec checks that a port specification is valid.
 // Valid formats: "80", "8080-8090", named ports like "http".
 //
@@ -549,8 +581,8 @@ func validatePortSpec(spec string) error {
 	}
 	if strings.Contains(spec, "-") {
 		parts := strings.SplitN(spec, "-", 2)
-		lo, err1 := strconv.Atoi(parts[0])
-		hi, err2 := strconv.Atoi(parts[1])
+		lo, err1 := parseCanonicalPort(parts[0])
+		hi, err2 := parseCanonicalPort(parts[1])
 		if err1 != nil || err2 != nil {
 			return fmt.Errorf("invalid port range %q: non-numeric", spec)
 		}
@@ -565,7 +597,7 @@ func validatePortSpec(spec string) error {
 		}
 		return nil
 	}
-	port, err := strconv.Atoi(spec)
+	port, err := parseCanonicalPort(spec)
 	if err != nil {
 		return fmt.Errorf("invalid port %q: not a number or known service", spec)
 	}
