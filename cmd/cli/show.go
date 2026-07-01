@@ -495,7 +495,16 @@ func (c *ctl) showZones() error {
 		return fmt.Errorf("%v", err)
 	}
 
-	polResp, _ := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
+	// #3669: do NOT swallow the GetPolicies error. GetZones succeeded, so the
+	// zone bodies are valid and worth printing, but if the policy inventory RPC
+	// failed the per-zone "Policies:" references are silently omitted — which
+	// reads identically to "these zones have no policies". On a firewall a
+	// partial policy view must fail loud: an operator (or automation scraping
+	// exit status) must be able to tell a control-plane degradation apart from
+	// genuinely policy-free zones. We render the zones, then surface the error so
+	// the command exits non-zero (see main.go dispatch) and the degraded state
+	// is visible rather than reported as success.
+	polResp, polErr := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
 
 	for _, z := range resp.Zones {
 		if z.Id > 0 {
@@ -553,6 +562,9 @@ func (c *ctl) showZones() error {
 
 		fmt.Println()
 	}
+	if polErr != nil {
+		return fmt.Errorf("policy inventory unavailable (zone policy references omitted): %w", polErr)
+	}
 	return nil
 }
 
@@ -566,10 +578,58 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 		if rule.Description != "" {
 			fmt.Printf("    Description: %s\n", rule.Description)
 		}
-		fmt.Printf("    Match: src=%v dst=%v app=%v\n",
-			rule.SrcAddresses, rule.DstAddresses, rule.Applications)
+		// #3672 (M01): annotate "(except)" when the match sense is inverted
+		// (source-address-excluded / destination-address-excluded). Without it
+		// an exclusive ("all EXCEPT these") match reads identical to an
+		// inclusive one, inverting the rule's reachability meaning. Mirrors the
+		// local CLI detail "(except)" annotation and the gRPC/REST inventory
+		// booleans.
+		src := fmt.Sprintf("%v", rule.SrcAddresses)
+		if rule.SourceAddressExcluded {
+			src += " (except)"
+		}
+		dst := fmt.Sprintf("%v", rule.DstAddresses)
+		if rule.DestinationAddressExcluded {
+			dst += " (except)"
+		}
+		fmt.Printf("    Match: src=%s dst=%s app=%v\n", src, dst, rule.Applications)
 		fmt.Printf("    Action: %s\n", rule.Action)
-		if rule.HitPackets > 0 || rule.HitBytes > 0 {
+		// #3672 (M02): surface per-rule session logging. The wire carries the
+		// independent init/close modes (#3336); the collapsed `log` bool alone
+		// made a logged permit indistinguishable from an unlogged one and hid
+		// init-only vs close-only. Mirrors the local CLI "Session log:
+		// at-create, at-close".
+		if rule.Log || rule.LogSessionInit || rule.LogSessionClose {
+			var modes []string
+			if rule.LogSessionInit {
+				modes = append(modes, "at-create")
+			}
+			if rule.LogSessionClose {
+				modes = append(modes, "at-close")
+			}
+			if len(modes) > 0 {
+				fmt.Printf("    Log: %s\n", strings.Join(modes, ", "))
+			} else {
+				fmt.Printf("    Log: enabled\n")
+			}
+		}
+		// #3672 (M03): surface scheduler binding and runtime-inactive state
+		// (#3624). A scheduled rule outside its active window prints
+		// "Action: permit" while the dataplane skips/denies it (scheduler
+		// fail-closed) — the inactive annotation makes that visible.
+		switch {
+		case rule.SchedulerName != "" && rule.Inactive:
+			fmt.Printf("    Scheduler: %s (inactive)\n", rule.SchedulerName)
+		case rule.SchedulerName != "":
+			fmt.Printf("    Scheduler: %s\n", rule.SchedulerName)
+		case rule.Inactive:
+			fmt.Printf("    Inactive: true\n")
+		}
+		// #3672 (M04): a "then count" rule prints its hit count even at zero, so
+		// counted-but-idle is distinguishable from not-counted. A rule with hits
+		// prints them regardless (unchanged); an uncounted idle rule prints
+		// nothing (unchanged).
+		if rule.Count || rule.HitPackets > 0 || rule.HitBytes > 0 {
 			fmt.Printf("    Hit count: %d packets, %d bytes\n", rule.HitPackets, rule.HitBytes)
 		}
 	}

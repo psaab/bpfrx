@@ -49,18 +49,24 @@ type fakeBpfrxClient struct {
 	matchPoliciesResp  *pb.MatchPoliciesResponse
 
 	// GetPolicies recorder (#3357 remote filtered/brief scoped-global coverage).
+	// getPoliciesErr injects an RPC failure (#3669 error-surfacing coverage).
 	getPoliciesCalls int
 	getPoliciesResp  *pb.GetPoliciesResponse
+	getPoliciesErr   error
 
 	// GetZones recorder (#3654 remote host-inbound override / posture coverage).
 	getZonesCalls int
 	getZonesResp  *pb.GetZonesResponse
+	getZonesErr   error
 }
 
 func (f *fakeBpfrxClient) GetZones(
 	_ context.Context, _ *pb.GetZonesRequest, _ ...grpc.CallOption,
 ) (*pb.GetZonesResponse, error) {
 	f.getZonesCalls++
+	if f.getZonesErr != nil {
+		return nil, f.getZonesErr
+	}
 	if f.getZonesResp != nil {
 		return f.getZonesResp, nil
 	}
@@ -71,6 +77,9 @@ func (f *fakeBpfrxClient) GetPolicies(
 	_ context.Context, _ *pb.GetPoliciesRequest, _ ...grpc.CallOption,
 ) (*pb.GetPoliciesResponse, error) {
 	f.getPoliciesCalls++
+	if f.getPoliciesErr != nil {
+		return nil, f.getPoliciesErr
+	}
 	if f.getPoliciesResp != nil {
 		return f.getPoliciesResp, nil
 	}
