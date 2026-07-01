@@ -25596,3 +25596,28 @@ top.
   ./pkg/config/ green; go build ./... green; gofmt + vet clean.
 - **File(s)**: pkg/daemon/README.md (lo0 input filter — unknown-action
   fail-closed invariant + routing-instance warning)
+
+## 2026-07-01 — #3732 DDNS Surface A DHCP source runs the IsPublicAddr public-address gate (fail-closed)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Surface A router/interface DDNS applied the ddns.IsPublicAddr
+  globally-routable-unicast gate to the interface (selectInterfaceAddr), static
+  (staticUnitAddr), and checkip (parseCheckIPBody) address sources but NOT to
+  the DHCP source — a WAN handed a non-public DHCP lease (CGNAT 100.64/10,
+  RFC1918, ULA fc00::/7, documentation, other IANA special-purpose ranges)
+  published that unroutable/private address to public DNS, a security fail-open
+  and internal-addressing leak. FIX: the AddressSourceDHCP branch now runs the
+  valid lease address through ddns.IsPublicAddr; a non-public lease is a
+  DEFINITIVE "no publishable address of this family" (Addr invalid, ok=true) so
+  the engine WITHDRAWS any previously-published record rather than leaking a
+  private one, and warns once at slog.Warn (matching staticUnitAddr). A public
+  lease still publishes unchanged (no over-gating). Documented the
+  public-gate-on-all-sources invariant in the DDNS design plan §5.3.
+  RED-on-revert: removing the gate flips the v4-private / v4-CGNAT / v6-ULA
+  cases to publishing the private address (test fails); public cases stay green.
+  go test ./pkg/daemon/ ./pkg/ddns/ green; go build ./... green; gofmt + vet
+  clean.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go (AddressSourceDHCP branch),
+  pkg/daemon/daemon_ddns_surface_a_test.go
+  (TestSurfaceAObserverDHCPPublicGate — RED on revert),
+  docs/research/ddns-world-class/plan.md (§5.3 public-address gate invariant)
