@@ -53,20 +53,21 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 }
 
 // emitRejectObservability exposes the #3657 source-split reject reply
-// telemetry: sent, TX-frame reply-budget drops, and egress output-filter
-// drops, each labeled source=policy|filter. These per-BindingStatus
-// counters (wired by #3615) are summed across bindings. The aggregate
-// xpf_userspace_reject_rate_limited_total is emitted elsewhere and stays
-// for back-compat; the per-source rate-limit bucket itself is still
-// source-neutral in the helper (single global-per-reason bucket) — a
-// source split of the rate-limit leg needs a helper change, tracked
-// separately. All six series are emitted unconditionally so a 0 is a real
-// "no reject activity" signal (alerting can distinguish policy-reject from
-// filter-reject starvation, and success from suppression).
+// telemetry: sent, TX-frame reply-budget drops, egress output-filter drops,
+// and (#3661) rate-limit drops, each labeled source=policy|filter. These
+// per-BindingStatus counters (wired by #3615/#3661) are summed across
+// bindings. The aggregate xpf_userspace_reject_rate_limited_total is emitted
+// elsewhere and stays for back-compat; #3661 splits the rate-limit drop leg
+// by source at the helper consume site (both sources still share the one
+// global-per-reason bucket, so policy+filter sum to the aggregate). All eight
+// series are emitted unconditionally so a 0 is a real "no reject activity"
+// signal (alerting can distinguish policy-reject from filter-reject
+// starvation, and success from suppression).
 func (c *xpfCollector) emitRejectObservability(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
 	var policySent, filterSent uint64
 	var policyBudget, filterBudget uint64
 	var policyOutputFilter, filterOutputFilter uint64
+	var policyRateLimit, filterRateLimit uint64
 	for _, b := range status.Bindings {
 		policySent += b.PolicyRejectSent
 		filterSent += b.FilterRejectSent
@@ -74,6 +75,8 @@ func (c *xpfCollector) emitRejectObservability(ch chan<- prometheus.Metric, stat
 		filterBudget += b.FilterRejectReplyBudgetDrops
 		policyOutputFilter += b.PolicyRejectOutputFilterDrops
 		filterOutputFilter += b.FilterRejectOutputFilterDrops
+		policyRateLimit += b.PolicyRejectRateLimitDrops
+		filterRateLimit += b.FilterRejectRateLimitDrops
 	}
 	emit := func(desc *prometheus.Desc, policy, filter uint64) {
 		ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, float64(policy), "policy")
@@ -82,6 +85,7 @@ func (c *xpfCollector) emitRejectObservability(ch chan<- prometheus.Metric, stat
 	emit(c.userspaceRejectSent, policySent, filterSent)
 	emit(c.userspaceRejectReplyBudgetDrops, policyBudget, filterBudget)
 	emit(c.userspaceRejectOutputFilterDrops, policyOutputFilter, filterOutputFilter)
+	emit(c.userspaceRejectRateLimitedBySource, policyRateLimit, filterRateLimit)
 }
 
 // emitPolicyContentRejected exposes the #3261 0/1 gauge: 1 while the last

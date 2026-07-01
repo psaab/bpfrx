@@ -164,6 +164,12 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	var filterRejectSent uint64
 	var policyRejectReplyBudgetDrops uint64
 	var filterRejectReplyBudgetDrops uint64
+	// #3661 (M02): reject rate-limit drops, split by source. The aggregate
+	// ProcessStatus.RejectRateLimitedTotal stays source-neutral; these break
+	// it down so policy-reject starvation is distinguishable from
+	// filter-reject starvation under a rejected-flow flood.
+	var policyRejectRateLimitDrops uint64
+	var filterRejectRateLimitDrops uint64
 	var snatPackets uint64
 	var dnatPackets uint64
 	var nat64Translations uint64
@@ -267,6 +273,8 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		filterRejectSent += binding.FilterRejectSent
 		policyRejectReplyBudgetDrops += binding.PolicyRejectReplyBudgetDrops
 		filterRejectReplyBudgetDrops += binding.FilterRejectReplyBudgetDrops
+		policyRejectRateLimitDrops += binding.PolicyRejectRateLimitDrops
+		filterRejectRateLimitDrops += binding.FilterRejectRateLimitDrops
 		snatPackets += binding.SNATPackets
 		dnatPackets += binding.DNATPackets
 		nat64Translations += binding.Nat64Translations
@@ -508,6 +516,16 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	if policyRejectReplyBudgetDrops != 0 || filterRejectReplyBudgetDrops != 0 {
 		fmt.Fprintf(&b, "  Generated-reply budget drops: policy_reject=%d filter_reject=%d\n",
 			policyRejectReplyBudgetDrops, filterRejectReplyBudgetDrops)
+	}
+	// #3661 (M02): reject replies dropped because the shared per-reason
+	// rate-limit token bucket was empty, split by source. This is distinct
+	// from a TX-frame budget drop (the line above) and an egress output-filter
+	// drop; the source split tells policy-reject starvation from filter-reject
+	// starvation. The source-neutral aggregate is RejectRateLimitedTotal /
+	// xpf_userspace_reject_rate_limited_total (Prometheus).
+	if policyRejectRateLimitDrops != 0 || filterRejectRateLimitDrops != 0 {
+		fmt.Fprintf(&b, "  Generated-reply rate-limited: policy_reject=%d filter_reject=%d\n",
+			policyRejectRateLimitDrops, filterRejectRateLimitDrops)
 	}
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)

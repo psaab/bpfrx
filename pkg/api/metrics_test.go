@@ -925,6 +925,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			[]string{"source"},
 			nil,
 		),
+		userspaceRejectRateLimitedBySource: prometheus.NewDesc(
+			"xpf_userspace_reject_rate_limited_by_source_total",
+			"reject reply rate-limit drops by source",
+			[]string{"source"},
+			nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"flow-cache active flows",
@@ -993,6 +999,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 				FilterRejectReplyBudgetDrops:  1,
 				PolicyRejectOutputFilterDrops: 7,
 				FilterRejectOutputFilterDrops: 4,
+				// #3661: per-source reject rate-limit drop leg.
+				PolicyRejectRateLimitDrops: 13,
+				FilterRejectRateLimitDrops: 15,
 			},
 			{
 				Slot:                          1,
@@ -1007,6 +1016,8 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 				FilterRejectReplyBudgetDrops:  10,
 				PolicyRejectOutputFilterDrops: 11,
 				FilterRejectOutputFilterDrops: 12,
+				PolicyRejectRateLimitDrops:    17,
+				FilterRejectRateLimitDrops:    19,
 			},
 		},
 	}
@@ -1033,9 +1044,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// gre_decap_checksum_invalid_drops_total counter (= 18) + the #2472
 	// per-reason generated-error rate-limit trio (time_exceeded /
 	// packet_too_big / reject) = 21 + the #3657 source-split reject trio
-	// (sent / reply-budget / output-filter) × 2 sources = 27.
-	if len(got) != 27 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 27 metrics, got %d", len(got))
+	// (sent / reply-budget / output-filter) × 2 sources = 27 + the #3661
+	// source-split reject rate-limit drop leg × 2 sources = 29.
+	if len(got) != 29 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 29 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1081,6 +1093,13 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceRejectReplyBudgetDrops, map[string]string{"source": "filter"}, 11)
 	assertCounterClose(t, got, c.userspaceRejectOutputFilterDrops, map[string]string{"source": "policy"}, 18)
 	assertCounterClose(t, got, c.userspaceRejectOutputFilterDrops, map[string]string{"source": "filter"}, 16)
+	// #3661: source-split reject rate-limit drop leg, summed across the two
+	// bindings. Reverting the source split (rate-limit drop stays
+	// source-neutral) or dropping the descriptor turns these RED — the
+	// per-source series would be absent. rate-limit: policy=13+17=30,
+	// filter=15+19=34.
+	assertCounterClose(t, got, c.userspaceRejectRateLimitedBySource, map[string]string{"source": "policy"}, 30)
+	assertCounterClose(t, got, c.userspaceRejectRateLimitedBySource, map[string]string{"source": "filter"}, 34)
 	// #1861: install-refusal trio emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionCreateDrops, nil, 9)
 	assertCounterClose(t, got, c.userspaceSessionInstallAdmissionRefused, nil, 8)

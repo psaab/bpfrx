@@ -1036,9 +1036,10 @@ func newCollector(srv *Server) *xpfCollector {
 				"ADDITION to the SYN-cookie TX-frame budget gate "+
 				"(which is queue protection, not a rate cap). A nonzero value "+
 				"flags a rejected-flow flood being clamped before it amplifies "+
-				"into unbounded RST/ICMP backscatter (#2472). Source-neutral: "+
-				"the rate-limit bucket is global-per-reason (#3657 M02 note — a "+
-				"per-source split needs a helper change).",
+				"into unbounded RST/ICMP backscatter (#2472). Source-neutral "+
+				"aggregate: the rate-limit bucket is a single global-per-reason "+
+				"bucket. The per-source breakdown is "+
+				"xpf_userspace_reject_rate_limited_by_source_total (#3661).",
 			nil, nil,
 		),
 		// #3657 (H13/H15/M02): source-split reject reply telemetry. #3615
@@ -1079,6 +1080,29 @@ func newCollector(srv *Server) *xpfCollector {
 				"split by source (policy vs firewall-filter). Distinguishes an "+
 				"operator-installed output filter suppressing a reject from a "+
 				"TX-frame budget or rate-limit drop (#3615 L05/#3657 H15/M02).",
+			[]string{"source"}, nil,
+		),
+		// #3661 (M02 Rust follow-up): per-source breakdown of the reject
+		// rate-limit drop leg. The aggregate
+		// xpf_userspace_reject_rate_limited_total stays source-neutral for
+		// back-compat; this attributes each drop (at the consume site, where
+		// the reply source is known) to a security-policy `then reject`
+		// (source=policy) or a firewall-filter `then reject` (source=filter),
+		// so a rejected-flow flood's bucket starvation is attributable. Both
+		// sources share the one global-per-reason bucket, so policy+filter sum
+		// to the aggregate. Summed across bindings, labeled source=policy|
+		// filter, emitted unconditionally (a 0 is a real "no rate-limit drop"
+		// signal).
+		userspaceRejectRateLimitedBySource: prometheus.NewDesc(
+			"xpf_userspace_reject_rate_limited_by_source_total",
+			"Locally-generated `reject` replies (TCP RST or ICMP/ICMPv6 "+
+				"administratively-prohibited unreachable) dropped because the "+
+				"shared per-reason rate-limit token bucket was empty, split by "+
+				"source (policy vs firewall-filter). Distinguishes "+
+				"policy-reject starvation from filter-reject starvation under a "+
+				"rejected-flow flood. The source-neutral aggregate is "+
+				"xpf_userspace_reject_rate_limited_total; policy+filter sum to "+
+				"it (#3661).",
 			[]string{"source"}, nil,
 		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
