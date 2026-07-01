@@ -55,7 +55,27 @@ and resolves session display names from the dataplane's assigned `app_id`.
   before that the map was iterated first-match, so a port-specific app
   could non-deterministically lose to a protocol-only sibling). This is a
   display-only label path — it does not affect policy enforcement, which
-  uses the dataplane-assigned `app_id`. When AppID is **enabled** in
+  uses the dataplane-assigned `app_id`.
+
+  **Single precedence contract across the AppID knob (#3612):** the
+  AppID-ENABLED Rust catalog (`AppCatalog::lookup_directional` in
+  `userspace-dp/src/policy.rs`) resolves overlapping application labels by
+  the *same* binary-specificity rule — **port-constrained beats
+  protocol-only, then lowest `app_id` (== alphabetically-first name) within
+  a tier.** Before #3612 the enabled path tie-broke purely on lowest
+  `app_id` regardless of specificity, so the same 5-tuple could be labeled
+  with a broad protocol-only app when AppID was on but the specific
+  port-based app when AppID was off. Both paths now agree; the shared,
+  self-describing fixture
+  `userspace-dp/tests/fixtures/appid_precedence_v1.json` pins the agreement
+  (`TestAppIDPrecedenceParityFixture` here drives the disabled path;
+  `app_catalog_precedence_parity_fixture` in `policy_tests.rs` drives the
+  enabled path over the same cases). The divergence was
+  display/observability only — enforcement was never affected. Two adjacent
+  divergences are deferred out of #3612: the disabled path's non-user
+  fallback is a narrow hardcoded `builtinFallbacks` set rather than the full
+  predefined catalog the enabled path sees (S1), and the disabled path has
+  no reverse-direction service-slot model (S2). When AppID is **enabled** in
   `services.application-identification` and the dataplane has not
   assigned an `app_id` for the session (`appID == 0`), the function
   returns `UNKNOWN` rather than guessing from port heuristics. Used

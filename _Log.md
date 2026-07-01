@@ -24637,3 +24637,45 @@ top.
   - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/host_inbound_verdict_msg_3627_test.go, pkg/grpcapi/server_show_firewall.go, pkg/cli/cli_show_security.go, pkg/cli/cli_request.go, proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/policymatch/README.md, pkg/grpcapi/README.md, _Log.md
   - **Action**: #3642 — egress interface `filter output` now matches the POST-NAT (on-wire) tuple. Root cause: the TX-selection / CoS output-filter evaluators keyed on the flow's PRE-NAT `forward_key` and selected the v4-vs-v6 filter by the INGRESS `meta.addr_family`. Junos applies an interface output filter AFTER NAT, so a term matching source/destination address or port silently matched the untranslated tuple for any SNAT'd/DNAT'd flow, and a NAT64 flow evaluated the wrong-family filter against a wrong-family key. FIX (2 dimensions): (A) at every TX-selection eval site that owns a NAT decision, pass the egress wire key `forward_wire_key(&flow.forward_key, decision.nat)` instead of the raw pre-NAT key — live forward builder (forward_request.rs), cached descriptor build (flow_cache.rs), ARP/NDP-resolved retransmit (neighbor_dispatch.rs), and the deferred re-resolve (tx/dispatch/cos.rs). `decision.nat` is apply-to-this-packet form (apply_nat_ipv4/6 write the same rewrite_src/dst to the frame regardless of direction), so `forward_wire_key` is correct for BOTH the forward leg and the reverse/reply leg — no separate reverse_wire_key needed (verified against rewrite_forwarded_frame_in_place). (B) `resolve_cos_tx_selection_internal` + `resolve_cached_cos_tx_selection` now derive the output-filter family (and the per-family tx-selection gate) from the (post-NAT) flow_key's addr_family, not meta.addr_family, so a NAT64 v6->v4 flow selects the v4 output filter against the v4 egress tuple. The stored PendingForwardRequest.flow_key stays the PRE-NAT key (CoS flow-bucket hashing / session glue unchanged — consistent with the in-place fast path). Family-from-key is monotone: it differs from meta only for a NAT64 wire key, which only the fixed sites pass. RED-on-revert (proven, restored): 4 tests flip RED when the fix is reverted — output_filter_matches_post_snat_source_forward_leg_3642, output_filter_matches_post_snat_dest_reverse_leg_3642, output_filter_matches_post_dnat_dest_3642 (build_live integration, each carries a pre-NAT counter-factual assert), output_filter_family_selected_by_egress_key_for_nat64_3642 (resolver family selection). FULL cargo test --release green (3341 lib + all integration binaries, 0 failed; NO wire/fixture change — this is match-key selection, not a new wire field). Docs: userspace-dp/src/filter/README.md (new #3642 paragraph), docs/cos-traffic-shaping.md (post-NAT bullet).
   - **File(s)**: userspace-dp/src/afxdp/forward_request.rs, userspace-dp/src/afxdp/tx/cos_classify.rs, userspace-dp/src/afxdp/flow_cache.rs, userspace-dp/src/afxdp/neighbor_dispatch.rs, userspace-dp/src/afxdp/tx/dispatch/cos.rs, userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/tx/cos_classify_tests.rs, userspace-dp/src/filter/README.md, docs/cos-traffic-shaping.md, _Log.md
+- **Timestamp**: 2026-07-01
+  - **Action**: #3612 (Path A, /research-converged) — unified the AppID
+    application-LABEL precedence across the enabled/disabled paths. Root cause:
+    the AppID-ENABLED Rust catalog `AppCatalog::lookup_directional`
+    (userspace-dp/src/policy.rs) resolved overlapping app matches by LOWEST
+    app_id (`exact.min(scan_hit)`), which — because ids are assigned in
+    sorted-name order — means the alphabetically-first NAME wins, an arbitrary
+    tiebreak. The AppID-DISABLED Go fallback `resolveTupleFallback`
+    (pkg/appid/runtime.go, #2578) resolves by SPECIFICITY (port-constrained beats
+    protocol-only, then name). So the same 5-tuple could be labeled with a broad
+    protocol-only `aaa-tcp` when AppID was ON but the specific `zzz-https` when
+    OFF — a display/observability divergence (session show, RT_FLOW,
+    filter/deny logs); enforcement (`CompiledApplications::matches`) was never
+    affected. FIX: tagged `AppScanEntry` with `port_constrained`
+    (`!(dst_low==0 && dst_high==0 && src_low==0 && src_high==0)`, the wire mirror
+    of Go's `portBased = DestinationPort != "" || SourcePort != ""`), and changed
+    the `lookup_directional` tiebreak to the SAME binary specificity as the Go
+    fallback: port-constrained tier (exact_dst is always port-constrained + the
+    lowest-id port-constrained scan hit) wins over the protocol-only tier, lowest
+    id within a tier. Strictly additive for same-tier overlaps (byte-identical to
+    before). Pinned with a shared, self-describing cross-language parity fixture
+    (userspace-dp/tests/fixtures/appid_precedence_v1.json, user apps only per
+    plan scope note S1) consumed by BOTH Go `TestAppIDPrecedenceParityFixture`
+    (drives resolveTupleFallback + validates BuildCatalog reproduces the recorded
+    ids so a sort bug cannot hide) and Rust `app_catalog_precedence_parity_fixture`
+    (drives lookup_directional); both resolve every case to the same NAME. Added
+    Rust unit tests `app_catalog_prefers_port_constrained_over_protocol_only` +
+    `app_catalog_src_port_only_is_port_constrained`; updated the same-tier comment
+    on `app_catalog_overlap_lowest_id_wins`. RED-on-revert PROVEN: reverting the
+    tiebreak to lowest-id-regardless-of-tier turns the 3 new tests RED (parity
+    fixture: "app_id = 1, want 2") while the same-tier + all pre-existing
+    app_catalog tests stay GREEN; restored. OUT OF SCOPE (deferred adjacencies,
+    plan §9): S1 predefined-vs-builtinFallbacks set membership, S2
+    reverse-direction service-slot handling. Validation: FULL cargo test --release
+    green (3343 lib + all integration binaries, 0 failed; NO wire/fixture change —
+    label resolution is not a wire field); go build ./... + go vet
+    (pkg/appid, pkg/dataplane) clean; go test ./pkg/appid/... ./pkg/dataplane/...
+    ./pkg/grpcapi/... ./pkg/api/... green; gofmt clean. Docs: pkg/appid/README.md
+    (single precedence contract + parity fixture + S1/S2 deferrals),
+    docs/services-application-identification.md (session-create precedence note +
+    stale lookup() signature refresh to lookup_directional).
+  - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, userspace-dp/tests/fixtures/appid_precedence_v1.json, pkg/appid/precedence_parity_test.go, pkg/appid/README.md, docs/services-application-identification.md, _Log.md
