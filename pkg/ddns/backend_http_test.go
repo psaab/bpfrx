@@ -108,6 +108,70 @@ func TestDyndns2NameEndpointResolution(t *testing.T) {
 	}
 }
 
+// TestDyndns2ServerEndpointParsing is the #3737 FAIL-ON-REVERT guard for the
+// explicit-`server` endpoint parser. resolveDyndns2Endpoint used to decide
+// full-URL vs bare-host with a case-SENSITIVE HasPrefix on "http://"/"https://"
+// and did no host validation, so an uppercase scheme ("HTTPS://...") was
+// misclassified as a bare host (→ a malformed doubly-suffixed URL) and a
+// hostless URL ("http://") was returned verbatim (→ fails only at publish).
+// The fix parses with url.Parse, compares the scheme with EqualFold, and
+// requires a non-empty host — mirroring validateCheckIPURL (#2842).
+func TestDyndns2ServerEndpointParsing(t *testing.T) {
+	// accept: server → expected resolved endpoint.
+	accept := []struct{ server, want string }{
+		// Uppercase / mixed-case scheme is a full URL (RFC 3986 §3.1), returned
+		// verbatim — NOT treated as a bare host. Goes RED on the case-sensitive
+		// HasPrefix revert (want would become the malformed
+		// "https://HTTPS://updates.example/nic/update/nic/update").
+		{"HTTPS://updates.example/nic/update", "HTTPS://updates.example/nic/update"},
+		{"Http://updates.example/nic/update", "Http://updates.example/nic/update"},
+		// Well-formed lowercase full URL is unchanged.
+		{"https://members.dyndns.org/v3/update", "https://members.dyndns.org/v3/update"},
+		{"http://updates.example/nic/update", "http://updates.example/nic/update"},
+		// Bare host → canonical dyndns2 path over HTTPS (unchanged).
+		{"dynupdate.no-ip.com", "https://dynupdate.no-ip.com/nic/update"},
+		{"host.example:8443", "https://host.example:8443/nic/update"},
+	}
+	for _, tc := range accept {
+		got, err := resolveDyndns2Endpoint(&config.DDNSProvider{
+			Name: "p", Backend: "dyndns2", Server: tc.server,
+		})
+		if err != nil {
+			t.Errorf("resolveDyndns2Endpoint(server=%q) = error %v, want %q", tc.server, err, tc.want)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("resolveDyndns2Endpoint(server=%q) = %q, want %q", tc.server, got, tc.want)
+		}
+	}
+
+	// reject: a hostless or wrong-scheme server must error (manager no-op),
+	// not return a URL that only fails at the first publish (M05/H09).
+	reject := []string{
+		"http://",             // scheme only, no host
+		"https:///nic/update", // host-less but scheme present
+		"HTTPS://",            // uppercase scheme, no host
+		"ftp://host/upd",      // wrong scheme
+		":8080",               // bare, no host (port only)
+		"/nic/update",         // bare, path only, no host
+	}
+	for _, s := range reject {
+		if got, err := resolveDyndns2Endpoint(&config.DDNSProvider{
+			Name: "p", Backend: "dyndns2", Server: s,
+		}); err == nil {
+			t.Errorf("resolveDyndns2Endpoint(server=%q) = %q, want error", s, got)
+		}
+	}
+
+	// newDyndns2Backend must surface the rejection (fall back to no-op at the
+	// manager) rather than construct a backend pointed at a malformed host.
+	if _, err := newDyndns2Backend(&config.DDNSProvider{
+		Name: "p", Backend: "dyndns2", Server: "http://",
+	}, nil); err == nil {
+		t.Fatal("newDyndns2Backend(server=\"http://\") = nil error, want rejection")
+	}
+}
+
 // TestDyndns2DeleteIssuesOfflineRequest is the #2772 FAIL-ON-REVERT guard for
 // the dyndns2 withdraw path. The previous DeleteLease was a no-op that returned
 // nil WITHOUT contacting the provider, so the engine dropped ownership while the

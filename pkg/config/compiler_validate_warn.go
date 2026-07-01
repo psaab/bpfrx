@@ -1348,6 +1348,41 @@ func ddnsKnownDyndns2Provider(name string) bool {
 	return ddnsKnownDyndns2NameSet[strings.ToLower(name)]
 }
 
+// ddnsDyndns2ServerValid mirrors pkg/ddns.resolveDyndns2Endpoint's `server`
+// parsing for the commit-time warning ONLY (config cannot import pkg/ddns). It
+// must stay in sync with that resolver; a divergence only affects whether the
+// operator gets a warning at commit — the runtime resolver in pkg/ddns is
+// authoritative and fails closed (falls back to no-op) regardless (#3737).
+//
+// A dyndns2 `server` is either a full update URL (carrying a scheme) or a bare
+// host that the resolver suffixes with the canonical /nic/update path over
+// HTTPS. URL schemes are case-INSENSITIVE per RFC 3986 §3.1, so a full URL is
+// detected by the "://" delimiter and its scheme compared with EqualFold
+// ("HTTPS://host" is valid), matching ddnsCheckIPURLValid (#2842). Both cases
+// require a non-empty host so a hostless value ("http://", "https:///nic/update",
+// ":8080") is flagged at commit instead of failing only at the first publish.
+// The input is TrimSpace'd first so it stays in lockstep with the runtime
+// resolver, which trims p.Server before parsing; a whitespace-only server is
+// treated as empty (the "no server" completeness branch handles it).
+func ddnsDyndns2ServerValid(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return true
+	}
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		// Hostname() (not Host) so a port-only authority is treated as hostless,
+		// matching the runtime resolver.
+		if err != nil || u.Hostname() == "" {
+			return false
+		}
+		return strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https")
+	}
+	// Bare host → canonical https://<host>/nic/update; validate the host.
+	u, err := url.Parse("https://" + s + "/nic/update")
+	return err == nil && u.Hostname() != ""
+}
+
 // ddnsCheckIPURLValid mirrors pkg/ddns.validateCheckIPURL for the commit-time
 // warning ONLY (config cannot import pkg/ddns). It must stay in sync with that
 // validator; a divergence only affects whether the operator gets a warning at
@@ -1485,10 +1520,19 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 			// dyndns2 needs either a server or a recognizable provider name to
 			// resolve the endpoint (#2691 P3). Credentials are optional (some
 			// token-in-password providers leave the username empty).
-			if p.Server == "" && !ddnsKnownDyndns2Provider(name) {
+			switch {
+			case p.Server == "" && !ddnsKnownDyndns2Provider(name):
 				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
 					"provider %q (backend dyndns2) has no server and no recognized provider "+
 					"name; scopes using it publish nothing (set `server`)", name))
+			case p.Server != "" && !ddnsDyndns2ServerValid(p.Server):
+				// A set `server` that is neither a valid http(s) URL nor a valid bare
+				// host is a config error: an uppercase-scheme misparse or a hostless
+				// value otherwise commits silently and fails only at the first publish
+				// (#3737). The runtime resolver rejects it too (no-op fallback).
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend dyndns2) server %q is not a valid http(s) URL "+
+					"or host; scopes using it publish nothing", name, RedactURL(p.Server)))
 			}
 		case "duckdns":
 			// DuckDNS authenticates by TOKEN passed as a query param (#2960). The

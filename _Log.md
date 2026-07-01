@@ -26304,3 +26304,36 @@ top.
     sets + doc), pkg/api/metrics_system.go (emission + collect doc),
     pkg/api/metrics_flowexport_test.go (2 new RED-on-revert tests),
     docs/feature-coverage.md (instance/template label doc)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3737 — ddns/dyndns2 explicit `server` parser is
+    case-sensitive on the scheme and skips host validation (codex-157
+    H09/M05; sibling of the #2842 checkip / #2841 generic fixes).
+    `resolveDyndns2Endpoint` decided full-URL vs bare-host with a
+    case-SENSITIVE `strings.HasPrefix(s, "http(s)://")` and did no
+    host/scheme parse, so an uppercase-scheme endpoint
+    (`HTTPS://updates.example/nic/update`, valid per RFC 3986 §3.1) was
+    misclassified as a bare host and returned the doubly-suffixed
+    `https://HTTPS://updates.example/nic/update/nic/update` (H09), and a
+    hostless URL (`http://`, `https:///nic/update`) was returned verbatim
+    to fail only at the first publish (M05). Fix mirrors the sibling
+    validators: detect the full-URL case on the `://` delimiter, parse
+    with `url.Parse`, compare the scheme with `strings.EqualFold`, and
+    require a non-empty `Hostname()` in BOTH the full-URL and bare-host
+    cases (Hostname, not Host, so a port-only `:8080` authority is
+    rejected). Added a commit-time mirror `ddnsDyndns2ServerValid` and
+    wired `validateSurfaceADDNSWarnings` to warn (RedactURL'd) when a set
+    `server` is neither a valid http(s) URL nor a valid bare host, the way
+    #2841/#2842 warn for the sibling backends. RED-on-revert verified:
+    reverting the resolver → `TestDyndns2ServerEndpointParsing` fails
+    (uppercase misparse + all hostless/wrong-scheme cases accepted);
+    reverting the commit wiring → `TestP3Dyndns2ServerMalformedWarns`
+    fails. Well-formed lowercase endpoints unchanged. go test
+    ./pkg/ddns/... ./pkg/config/... green; go build ./... green; gofmt +
+    vet clean.
+  - **File(s)**: pkg/ddns/backend_dyndns2.go (resolveDyndns2Endpoint
+    scheme/host validation), pkg/config/compiler_validate_warn.go
+    (ddnsDyndns2ServerValid + dyndns2 server warning), pkg/ddns/
+    backend_http_test.go (TestDyndns2ServerEndpointParsing), pkg/config/
+    compiler_p3_http_providers_test.go (TestP3Dyndns2ServerMalformedWarns
+    + TestDDNSDyndns2ServerValidLockstep), pkg/ddns/README.md (#3737 note)

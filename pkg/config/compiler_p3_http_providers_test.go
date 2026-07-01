@@ -382,3 +382,91 @@ func TestDDNSGenericURLTemplateValidLockstep(t *testing.T) {
 		}
 	}
 }
+
+// TestP3Dyndns2ServerMalformedWarns is the #3737 fail-on-revert gate for the
+// dyndns2 explicit-`server` validator. A malformed server (uppercase-scheme
+// misparse aside — those are VALID — a hostless URL, a wrong scheme, or a
+// hostless bare value) must be flagged at commit instead of failing only at the
+// first publish, the way #2841/#2842 flag the sibling backends. Goes RED if the
+// `p.Server != "" && !ddnsDyndns2ServerValid` wiring is removed. Valid servers
+// (a well-formed full URL, an uppercase-scheme full URL, a bare host) and a
+// built-in provider NAME with no server must NOT warn (no false positives).
+func TestP3Dyndns2ServerMalformedWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		// Malformed: hostless full URL (M05).
+		"set system services dynamic-dns provider no-host backend dyndns2",
+		"set system services dynamic-dns provider no-host server http://",
+		// Malformed: wrong scheme.
+		"set system services dynamic-dns provider bad-scheme backend dyndns2",
+		"set system services dynamic-dns provider bad-scheme server ftp://host/upd",
+		// Malformed: hostless bare value (port only).
+		"set system services dynamic-dns provider bare-nohost backend dyndns2",
+		"set system services dynamic-dns provider bare-nohost server :8080",
+		// VALID: uppercase-scheme full URL is a URL per RFC 3986 §3.1 (H09) — must
+		// NOT warn. RED if ddnsDyndns2ServerValid is made case-sensitive.
+		"set system services dynamic-dns provider up-scheme backend dyndns2",
+		"set system services dynamic-dns provider up-scheme server HTTPS://updates.example/nic/update",
+		// VALID: well-formed lowercase full URL — must NOT warn.
+		"set system services dynamic-dns provider full-url backend dyndns2",
+		"set system services dynamic-dns provider full-url server https://members.dyndns.org/v3/update",
+		// VALID: bare host — must NOT warn.
+		"set system services dynamic-dns provider bare-host backend dyndns2",
+		"set system services dynamic-dns provider bare-host server dyn.example",
+		// VALID: built-in provider NAME with no server — must NOT warn (server branch).
+		"set system services dynamic-dns provider no-ip backend dyndns2",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warns := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warns, "\n")
+
+	for _, badName := range []string{"no-host", "bad-scheme", "bare-nohost"} {
+		want := "provider \"" + badName + "\" (backend dyndns2) server"
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected a dyndns2 server warning for provider %q; got:\n%s", badName, joined)
+		}
+	}
+	for _, okName := range []string{"up-scheme", "full-url", "bare-host", "no-ip"} {
+		if strings.Contains(joined, "provider \""+okName+"\" (backend dyndns2) server") {
+			t.Fatalf("valid dyndns2 server for provider %q should not warn; got:\n%s", okName, joined)
+		}
+	}
+}
+
+// TestDDNSDyndns2ServerValidLockstep is a direct mirror-function test for
+// ddnsDyndns2ServerValid: it must TrimSpace the server before validating
+// (lockstep with the runtime resolveDyndns2Endpoint, which trims p.Server) and
+// judge the scheme case-insensitively. RED if the TrimSpace or the EqualFold
+// scheme compare is removed from the mirror.
+func TestDDNSDyndns2ServerValidLockstep(t *testing.T) {
+	valid := []string{
+		"",                                     // empty → handled by the "no server" branch
+		"   ",                                  // whitespace only → treated as empty
+		"HTTPS://updates.example/nic/update",   // uppercase scheme full URL
+		"Http://updates.example/nic/update",    // mixed-case scheme full URL
+		"https://members.dyndns.org/v3/update", // lowercase full URL
+		"  https://host.example/upd",           // leading whitespace, trimmed
+		"dyn.example",                          // bare host
+		"host.example:8443",                    // bare host with port
+	}
+	for _, s := range valid {
+		if !ddnsDyndns2ServerValid(s) {
+			t.Errorf("ddnsDyndns2ServerValid(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{
+		"http://",             // scheme only, no host
+		"https:///nic/update", // host-less but scheme present
+		"HTTPS://",            // uppercase scheme, no host
+		"ftp://host/upd",      // wrong scheme
+		":8080",               // bare, no host (port only)
+		"/nic/update",         // bare, path only, no host
+	}
+	for _, s := range invalid {
+		if ddnsDyndns2ServerValid(s) {
+			t.Errorf("ddnsDyndns2ServerValid(%q) = true, want false", s)
+		}
+	}
+}
