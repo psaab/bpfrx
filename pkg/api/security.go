@@ -644,7 +644,19 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		// #3668: the stable rule identity (inventory join key) + the
 		// address-exclusion flags so a positive verdict against a
 		// source/destination-address-excluded rule does not read backwards.
-		RuleID:                     res.RuleID,
+		RuleID: res.RuleID,
+		// #3685 M05: carry the matched policy's description (ticket / change
+		// context) so the match verdict is not weaker than the inventory /
+		// local CLI answers over the same policymatch.Result.
+		Description: res.Description,
+		// #3685 M06: name the scheduler time-gate and confirm it is currently
+		// admitting the rule. A positive match here is by construction active
+		// (inactiveFn above already skipped a scheduler-inactive rule, #3414),
+		// so SchedulerActive tracks whether the matched rule is scheduler-gated
+		// at all — true only for a scheduled policy, omitted for an always-on
+		// one.
+		SchedulerName:              res.SchedulerName,
+		SchedulerActive:            res.SchedulerName != "",
 		Action:                     res.DisplayAction(),
 		SrcAddresses:               res.SrcAddresses,
 		DstAddresses:               res.DstAddresses,

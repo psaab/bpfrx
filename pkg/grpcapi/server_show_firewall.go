@@ -289,6 +289,20 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		case res.Matched && res.Global:
 			fmt.Fprintf(buf, "Policy match (global):\n")
 			fmt.Fprintf(buf, "  Policy:    %s\n", res.PolicyName)
+			// #3685 M04: identify WHICH global policy matched (ID + match scope
+			// + description), mirroring `show security match-policies`, so this
+			// gRPC-text `test policy` global verdict is not sparser than the
+			// show path over the SAME policymatch.Result. Before #3685 the
+			// global branch printed only name + action, dropping the policy ID
+			// (session-table / audit join key when global names collide with
+			// zone-pair names), the global match scope, and the description
+			// (ticket / change context).
+			fmt.Fprintf(buf, "  Policy ID: %d\n", res.PolicyID)
+			fmt.Fprintf(buf, "  Scope:     global (match from-zone: %s, to-zone: %s)\n",
+				globalZoneScopeLabel(res.FromZone), globalZoneScopeLabel(res.ToZone))
+			if res.Description != "" {
+				fmt.Fprintf(buf, "  Description: %s\n", res.Description)
+			}
 			fmt.Fprintf(buf, "  Action:    %s\n", policymatch.ActionString(res.Action))
 		case res.Matched:
 			fmt.Fprintf(buf, "Policy match:\n")

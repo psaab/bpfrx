@@ -25174,3 +25174,43 @@ top.
 - **File(s)**: pkg/policymatch/port_test.go, pkg/policymatch/icmp_test.go, pkg/api/rest_filter_failclosed_test.go
 - **Action**: Document the canonical-form guarantee on the diagnostic surfaces
 - **File(s)**: pkg/policymatch/README.md, pkg/api/README.md, _Log.md
+
+## 2026-07-01 — #3685 policy-simulator output parity residuals (M04/M05/M06)
+
+- **Timestamp**: 2026-07-01
+- **Action**: M06 — add `SchedulerName` to `policymatch.Result`, populated from
+  `pol.SchedulerName` in `matchedResult`, so the match-policies verdict names the
+  scheduler time-gate controlling the rule (mirrors the #3624 inventory field). A
+  matched policy is by construction currently active (the live surfaces thread a
+  fail-closed `PolicyInactiveFn`), so a non-empty `SchedulerName` names the gate
+  admitting the rule now
+- **File(s)**: pkg/policymatch/policymatch.go
+- **Action**: M05/M06 — add `description` (field 18), `scheduler_name` (field 19),
+  and `scheduler_active` (field 20) to the proto `MatchPoliciesResponse`
+  (additive, no renumber; regen via pinned protoc 3.21.12 / protoc-gen-go
+  v1.36.11 / protoc-gen-go-grpc v1.6.1, no version bump). `MatchPoliciesResponse`
+  is gRPC-only (no Rust userspace-dp reference / no wire fixture) — confirmed, no
+  regen needed
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (generated)
+- **Action**: M05/M06 — populate `Description` + `SchedulerName` +
+  `SchedulerActive` (= `res.SchedulerName != ""`, effective-active since a match
+  is currently active) on the REST `MatchPoliciesResult` (+ new JSON fields
+  `description`/`scheduler_name`/`scheduler_active`, all `omitempty`) and the gRPC
+  `MatchPoliciesResponse` positive-match paths
+- **File(s)**: pkg/api/types.go, pkg/api/security.go, pkg/grpcapi/server_cluster.go
+- **Action**: M04 — bring the gRPC-text `test policy` GLOBAL branch to parity with
+  `show security match-policies`: print `Policy ID`, `Scope: global (match
+  from-zone/to-zone)`, and `Description` (was name+action only). The gRPC-text
+  sibling of the #3674 local request-path gap (distinct renderer)
+- **File(s)**: pkg/grpcapi/server_show_firewall.go
+- **Action**: RED-on-revert tests — matcher carries Description + SchedulerName
+  (and non-scheduled leaves SchedulerName empty); REST + gRPC responses carry
+  description + scheduler_name + scheduler_active (non-scheduled/undescribed omit
+  them); gRPC-text global `test policy` shows ID + scope + description. Verified
+  each layer goes RED when its population/render is reverted
+- **File(s)**: pkg/policymatch/simulator_output_parity_3685_test.go (new),
+  pkg/api/security_matchpolicies_desc_sched_3685_test.go (new),
+  pkg/grpcapi/server_matchpolicies_desc_sched_3685_test.go (new)
+- **Action**: Document the new response fields (M05/M06) and the gRPC-text global
+  render (M04) in the API/gRPC references
+- **File(s)**: pkg/api/README.md, pkg/grpcapi/README.md, _Log.md

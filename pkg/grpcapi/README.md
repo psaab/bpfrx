@@ -137,6 +137,30 @@ contract.
   `source_address_excluded`/`destination_address_excluded`/`rule_id` JSON
   fields, and both CLI renderers annotate the exclusion as
   `Source addresses (except): ...` plus a `Rule ID:` line.
+- #3685 M05/M06: on a MATCH the response also carries the policy `description`
+  (proto field 18) and the scheduler binding `scheduler_name` (field 19) /
+  effective-active flag `scheduler_active` (field 20). `description` (M05) is the
+  matched policy's `description` text, the same field the inventory
+  (`GetPolicies`) and the local `show security match-policies` result carry over
+  the SAME `policymatch.Result`; a match verdict without it was weaker than the
+  inventory / CLI answer (descriptions often hold ticket / change-control
+  context). `scheduler_name` (M06) mirrors the inventory `PolicyRule` scheduler
+  binding (#3624); `scheduler_active` is the explicit effective-active flag. A
+  positive match is by construction currently active — `s.policyInactiveFn()` is
+  fail-closed (#3414) and SKIPS a scheduler-inactive rule before it can match —
+  so a matched scheduled policy always reports `scheduler_active=true`; it names
+  the gate admitting the rule right now. All three are additive, set only on a
+  positive match, and both scheduler fields are omitted for a non-scheduled
+  policy. The REST `MatchPoliciesResult` carries the same
+  `description`/`scheduler_name`/`scheduler_active` JSON fields.
+- #3685 M04: the gRPC-text `test policy` renderer (`server_show_firewall.go`,
+  the remote `cli` backend) prints the policy ID, the global match scope, and
+  the description for a GLOBAL match, mirroring `show security match-policies`.
+  Before #3685 the global branch printed only `Policy:`/`Action:`, dropping the
+  ID (session-table / audit join key when a global name collides with a
+  zone-pair name), the scope, and the description — the gRPC-text sibling of the
+  local request-path gap tracked in #3674 (`pkg/cli/cli_request.go`, a distinct
+  renderer). The zone-pair branch already printed the from/to zones.
 - The `test policy` operational command (local `pkg/cli` + remote `cmd/cli`
   → ShowText `test-policy:` topic → `showTestPolicy`) carries the same
   source-port input (#3107). The topic adds a `srcport=` key alongside the
