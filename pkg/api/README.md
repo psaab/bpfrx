@@ -541,7 +541,23 @@ under the daemon's errgroup. Nothing else imports this package.
   (the matched policy's declared SCOPE, #3331, set only on a positive match):
   for a wildcard-zone or global match the two can differ. The gRPC
   `MatchPoliciesResponse.queried_from_zone`/`queried_to_zone` (fields 13/14)
-  mirror this.
+  mirror this. #3668: on a MATCH the response also carries
+  `source_address_excluded`/`destination_address_excluded` and the stable
+  `rule_id`. The exclusion flags report whether the matched policy carries Junos
+  `source-address-excluded`/`destination-address-excluded` — the rule matches
+  every address EXCEPT those in `src_addresses`/`dst_addresses`. The shared
+  matcher already inverts the address test correctly; without the flags a
+  positive verdict against a source OUTSIDE an excluded set printed the excluded
+  list as if it were the reason for the match (backwards for an audit tool). The
+  renderers annotate the exclusion as `Source addresses (except): ...`. `rule_id`
+  is the stable `<from>-><to>/<name>` identity the inventory (`GetPolicies`), the
+  snapshot, and the event path carry (`dpuserspace.StablePolicyRuleID`), so a
+  simulator hit joins to the inventory row / logs / tests even after a policy
+  reorder shifts the numeric `policy_id`; a matched global policy uses the
+  `junos-global->junos-global/<name>` form, matching the inventory global rows.
+  All three are additive and set only on a positive match. The gRPC
+  `MatchPoliciesResponse.source_address_excluded`/`destination_address_excluded`
+  (fields 15/16) and `rule_id` (field 17) mirror this.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

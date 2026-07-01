@@ -501,6 +501,11 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	// #3331: identify WHICH scoped/global policy matched so a verdict maps back
 	// to the runtime policy / session-table ID / audit record when names repeat.
 	fmt.Printf("    Policy ID: %d\n", res.PolicyID)
+	// #3668: also print the stable rule identity so a hit joins to the inventory /
+	// logs / tests even after a policy reorder shifts the numeric Policy ID.
+	if res.RuleID != "" {
+		fmt.Printf("    Rule ID: %s\n", res.RuleID)
+	}
 	if res.Global {
 		fmt.Printf("    Scope: global (match from-zone: %s, to-zone: %s)\n",
 			matchScopeZone(res.FromZone), matchScopeZone(res.ToZone))
@@ -510,8 +515,12 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	if res.Description != "" {
 		fmt.Printf("    Description: %s\n", res.Description)
 	}
-	fmt.Printf("    Source addresses: %v\n", res.SrcAddresses)
-	fmt.Printf("    Destination addresses: %v\n", res.DstAddresses)
+	// #3668: annotate "(except)" when the matched rule carries
+	// source-address-excluded / destination-address-excluded — the shared matcher
+	// inverts correctly, but without the label a positive verdict against a
+	// source OUTSIDE an excluded set reads as if the excluded list caused it.
+	fmt.Printf("    Source addresses%s: %v\n", policymatch.ExceptSuffix(res.SourceAddressExcluded), res.SrcAddresses)
+	fmt.Printf("    Destination addresses%s: %v\n", policymatch.ExceptSuffix(res.DestinationAddressExcluded), res.DstAddresses)
 	fmt.Printf("    Applications: %v\n", res.Applications)
 	fmt.Printf("    Action: %s\n", policymatch.ActionString(res.Action))
 	return nil

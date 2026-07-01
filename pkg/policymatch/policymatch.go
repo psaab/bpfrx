@@ -323,12 +323,37 @@ type Result struct {
 	// MaxRulesPerPolicy, which cannot be applied anyway — see RuntimePolicyIDs).
 	PolicyID uint32
 
-	PolicyName   string
-	Description  string
-	Action       config.PolicyAction
+	PolicyName  string
+	Description string
+	Action      config.PolicyAction
+
+	// RuleID is the stable "<from>-><to>/<name>" rule identity the inventory
+	// (REST/gRPC GetPolicies) and the snapshot/event path carry, computed by the
+	// shared dpuserspace.StablePolicyRuleID (#3668). PolicyID above is the
+	// runtime/reorder-fragile numeric id; RuleID lets a match-policies verdict be
+	// joined to the stable identifier used by inventory, logs, and tests even
+	// after a policy reorder. For a matched GLOBAL policy it uses the
+	// "junos-global->junos-global/<name>" form exactly like the inventory global
+	// rows. Meaningful only when Matched is true; empty for the default-policy /
+	// host-inbound verdicts.
+	RuleID string
+
 	SrcAddresses []string
 	DstAddresses []string
-	Applications []string
+	// SourceAddressExcluded / DestinationAddressExcluded report whether the
+	// matched policy carries Junos `source-address-excluded` /
+	// `destination-address-excluded` (#3668): the rule matches every address
+	// EXCEPT those in SrcAddresses/DstAddresses. The shared matcher (ruleMatches
+	// -> matchAddr) already INVERTS the address test correctly for an excluded
+	// side; these flags exist so a positive verdict does not read backwards —
+	// without them a match against a source OUTSIDE an excluded set prints the
+	// excluded list as if it were the reason for the match. DISPLAY-ONLY, like
+	// SrcAddresses/DstAddresses; every re-match path reads pol.Match directly.
+	// Meaningful only when Matched is true; false for the default-policy /
+	// host-inbound verdicts.
+	SourceAddressExcluded      bool
+	DestinationAddressExcluded bool
+	Applications               []string
 }
 
 // HostInboundActionString is the operator-facing verdict rendered for a
@@ -637,15 +662,29 @@ func zoneKnown(cfg *config.Config, zone string) bool {
 // (a config that overflows MaxRulesPerPolicy and so cannot be applied) yields
 // PolicyID 0; the zone scope + name still disambiguate the verdict.
 func matchedResult(ids map[[2]uint32]uint32, pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) Result {
+	// #3668: stamp the stable rule identity, mirroring the inventory EXACTLY. The
+	// inventory keys a zone-pair rule under its surrounding stanza zones and a
+	// GLOBAL rule under the reserved "junos-global"/"junos-global" pair
+	// (pkg/api/security.go, pkg/grpcapi/server_show_zones.go). fromZone/toZone
+	// here carry a global policy's optional match-SCOPE (empty = all zones), NOT
+	// that reserved pair, so a global rule must use the junos-global identity to
+	// join to the same inventory row.
+	ridFrom, ridTo := fromZone, toZone
+	if global {
+		ridFrom, ridTo = "junos-global", "junos-global"
+	}
 	return Result{
-		Matched:     true,
-		Global:      global,
-		FromZone:    fromZone,
-		ToZone:      toZone,
-		PolicyID:    ids[[2]uint32{uint32(setIdx), uint32(sliceIdx)}],
-		PolicyName:  pol.Name,
-		Description: pol.Description,
-		Action:      pol.Action,
+		Matched:                    true,
+		Global:                     global,
+		FromZone:                   fromZone,
+		ToZone:                     toZone,
+		PolicyID:                   ids[[2]uint32{uint32(setIdx), uint32(sliceIdx)}],
+		RuleID:                     dpuserspace.StablePolicyRuleID(ridFrom, ridTo, pol.Name),
+		PolicyName:                 pol.Name,
+		Description:                pol.Description,
+		Action:                     pol.Action,
+		SourceAddressExcluded:      pol.Match.SourceAddressExcluded,
+		DestinationAddressExcluded: pol.Match.DestinationAddressExcluded,
 		// #3358: a zone-local address book (#3061) is folded into the global
 		// book under the synthetic key zone-local/<zone>/<name>, and
 		// resolveZoneLocalAddressBooks already rewrote pol.Match.* to those
@@ -1110,6 +1149,19 @@ func normalizePortAlias(spec string) string {
 	default:
 		return spec
 	}
+}
+
+// ExceptSuffix returns " (except)" when a matched policy's address side carries
+// Junos source-address-excluded / destination-address-excluded, and "" otherwise
+// (#3668). It is the SSOT for the negated-address annotation shared by the local
+// CLI (pkg/cli) and remote CLI (cmd/cli) match-policies renderers, so the label
+// cannot drift between the two surfaces. The shared matcher already inverts the
+// address test correctly; this suffix keeps the DISPLAY from reading backwards.
+func ExceptSuffix(excluded bool) string {
+	if excluded {
+		return " (except)"
+	}
+	return ""
 }
 
 // ActionString renders a policy action token (permit/deny/reject).

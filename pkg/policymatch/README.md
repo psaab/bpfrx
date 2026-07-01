@@ -134,6 +134,25 @@ carries the matched policy's full identity:
   matched policy's `[policySetID, sliceIndex]` coordinates (a global policy's
   `policySetID` is `len(cfg.Security.Policies)`), so a verdict cross-references
   the session table / audit log even when policy names collide across scopes.
+- `RuleID` (#3668) — the stable `<from>-><to>/<name>` rule identity the
+  inventory (`GetPolicies`), the snapshot, and the event path share, computed by
+  the SSOT `dataplane/userspace.StablePolicyRuleID`. `PolicyID` is the runtime,
+  reorder-fragile numeric id; `RuleID` is the stable join key an operator uses to
+  tie a simulator hit to the inventory row / logs / tests even after a policy
+  reorder. A matched GLOBAL policy uses `junos-global->junos-global/<name>`
+  exactly like the inventory global rows — `matchedResult` remaps the global
+  branch's match-SCOPE zones to that reserved pair so the identities line up.
+- `SourceAddressExcluded` / `DestinationAddressExcluded` (#3668) — true when the
+  matched policy carries Junos `source-address-excluded` /
+  `destination-address-excluded`: the rule matches every address EXCEPT those in
+  `SrcAddresses`/`DstAddresses`. The matcher (`matchAddr`) already inverts the
+  address test correctly for the excluded side; these flags exist so the DISPLAY
+  does not read backwards. Before #3668 a positive verdict against a source
+  OUTSIDE an excluded set printed the excluded list with no negation marker,
+  implying the match happened BECAUSE of the excluded address when the real
+  reason is the opposite — unsafe for a Junos-style negated-address audit. The
+  CLI renderers annotate this as `Source addresses (except): ...` via the SSOT
+  `ExceptSuffix` helper.
 
 These are meaningful only on a concrete match (`Matched == true`); the
 default-policy and host-inbound verdicts leave them zero-valued.

@@ -6525,8 +6525,32 @@ type MatchPoliciesResponse struct {
 	// scope).
 	QueriedFromZone string `protobuf:"bytes,13,opt,name=queried_from_zone,json=queriedFromZone,proto3" json:"queried_from_zone,omitempty"`
 	QueriedToZone   string `protobuf:"bytes,14,opt,name=queried_to_zone,json=queriedToZone,proto3" json:"queried_to_zone,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// #3668: match-inversion flags for the MATCHED policy, mirroring the
+	// inventory PolicyRule fields 13/14. source_address_excluded /
+	// destination_address_excluded are true when the matched rule carries
+	// Junos `source-address-excluded` / `destination-address-excluded`: the
+	// rule matches every address EXCEPT those in src_addresses/dst_addresses.
+	// Without them a positive match-policies verdict reads BACKWARDS — it prints
+	// the excluded address list as if the match happened BECAUSE of it, when the
+	// real reason is the opposite (the shared simulator matchAddr already inverts
+	// correctly; only the response omitted the flag). Additive; false (omitted)
+	// for a rule without the modifier and for the unmatched / host-inbound /
+	// default cases (which carry no matched policy). Set only when matched is
+	// true.
+	SourceAddressExcluded      bool `protobuf:"varint,15,opt,name=source_address_excluded,json=sourceAddressExcluded,proto3" json:"source_address_excluded,omitempty"`
+	DestinationAddressExcluded bool `protobuf:"varint,16,opt,name=destination_address_excluded,json=destinationAddressExcluded,proto3" json:"destination_address_excluded,omitempty"`
+	// #3668: rule_id is the stable "<from>-><to>/<name>" rule identity the
+	// inventory PolicyRule (field 18) and the snapshot/event path carry, computed
+	// by the shared dpuserspace.StablePolicyRuleID. policy_id (field 11) is the
+	// runtime/reorder-fragile numeric id; rule_id lets an operator join a
+	// simulator hit to the stable identifier used by inventory, logs, and tests
+	// even after a policy reorder. For a matched GLOBAL policy the identity uses
+	// "junos-global->junos-global/<name>" exactly like the inventory global rows.
+	// Additive; empty (omitted) for the unmatched / host-inbound / default cases.
+	// Set only when matched is true.
+	RuleId        string `protobuf:"bytes,17,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -6653,6 +6677,27 @@ func (x *MatchPoliciesResponse) GetQueriedFromZone() string {
 func (x *MatchPoliciesResponse) GetQueriedToZone() string {
 	if x != nil {
 		return x.QueriedToZone
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetSourceAddressExcluded() bool {
+	if x != nil {
+		return x.SourceAddressExcluded
+	}
+	return false
+}
+
+func (x *MatchPoliciesResponse) GetDestinationAddressExcluded() bool {
+	if x != nil {
+		return x.DestinationAddressExcluded
+	}
+	return false
+}
+
+func (x *MatchPoliciesResponse) GetRuleId() string {
+	if x != nil {
+		return x.RuleId
 	}
 	return ""
 }
@@ -8185,7 +8230,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\x83\x04\n" +
+	"_icmp_code\"\x96\x05\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -8202,7 +8247,10 @@ const file_xpf_proto_rawDesc = "" +
 	"\tpolicy_id\x18\v \x01(\rH\x00R\bpolicyId\x88\x01\x01\x12!\n" +
 	"\fdefault_used\x18\f \x01(\bR\vdefaultUsed\x12*\n" +
 	"\x11queried_from_zone\x18\r \x01(\tR\x0fqueriedFromZone\x12&\n" +
-	"\x0fqueried_to_zone\x18\x0e \x01(\tR\rqueriedToZoneB\f\n" +
+	"\x0fqueried_to_zone\x18\x0e \x01(\tR\rqueriedToZone\x126\n" +
+	"\x17source_address_excluded\x18\x0f \x01(\bR\x15sourceAddressExcluded\x12@\n" +
+	"\x1cdestination_address_excluded\x18\x10 \x01(\bR\x1adestinationAddressExcluded\x12\x17\n" +
+	"\arule_id\x18\x11 \x01(\tR\x06ruleIdB\f\n" +
 	"\n" +
 	"_policy_id\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +

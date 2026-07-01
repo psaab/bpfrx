@@ -778,6 +778,30 @@ message MatchPoliciesResponse {
   // scope).
   string queried_from_zone = 13;
   string queried_to_zone = 14;
+  // #3668: match-inversion flags for the MATCHED policy, mirroring the
+  // inventory PolicyRule fields 13/14. source_address_excluded /
+  // destination_address_excluded are true when the matched rule carries
+  // Junos `source-address-excluded` / `destination-address-excluded`: the
+  // rule matches every address EXCEPT those in src_addresses/dst_addresses.
+  // Without them a positive match-policies verdict reads BACKWARDS — it prints
+  // the excluded address list as if the match happened BECAUSE of it, when the
+  // real reason is the opposite (the shared simulator matchAddr already inverts
+  // correctly; only the response omitted the flag). Additive; false (omitted)
+  // for a rule without the modifier and for the unmatched / host-inbound /
+  // default cases (which carry no matched policy). Set only when matched is
+  // true.
+  bool source_address_excluded = 15;
+  bool destination_address_excluded = 16;
+  // #3668: rule_id is the stable "<from>-><to>/<name>" rule identity the
+  // inventory PolicyRule (field 18) and the snapshot/event path carry, computed
+  // by the shared dpuserspace.StablePolicyRuleID. policy_id (field 11) is the
+  // runtime/reorder-fragile numeric id; rule_id lets an operator join a
+  // simulator hit to the stable identifier used by inventory, logs, and tests
+  // even after a policy reorder. For a matched GLOBAL policy the identity uses
+  // "junos-global->junos-global/<name>" exactly like the inventory global rows.
+  // Additive; empty (omitted) for the unmatched / host-inbound / default cases.
+  // Set only when matched is true.
+  string rule_id = 17;
 }
 
 // --- NAT rule counters ---

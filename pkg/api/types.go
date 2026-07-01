@@ -478,11 +478,29 @@ type MatchPoliciesResult struct {
 	// matched-first-policy answer look unmatched (both encoded as absent/0). A
 	// *uint32 is set only on a match, so its presence means "matched with this
 	// id" (emitted even at 0) and nil (omitted) means "no matched id".
-	PolicyID     *uint32  `json:"policy_id,omitempty"`
+	PolicyID *uint32 `json:"policy_id,omitempty"`
+	// RuleID is the stable "<from>-><to>/<name>" rule identity the inventory
+	// (GetPolicies) carries (#3668). PolicyID is the runtime/reorder-fragile
+	// numeric id; RuleID lets a match-policies hit be joined to the stable
+	// identifier used by inventory, logs, and tests even after a policy reorder.
+	// Present only on a positive match (a matched global policy uses the
+	// "junos-global->junos-global/<name>" form, matching inventory global rows).
+	RuleID       string   `json:"rule_id,omitempty"`
 	Action       string   `json:"action"`
 	SrcAddresses []string `json:"src_addresses,omitempty"`
 	DstAddresses []string `json:"dst_addresses,omitempty"`
-	Applications []string `json:"applications,omitempty"`
+	// SourceAddressExcluded / DestinationAddressExcluded report whether the
+	// matched policy carries Junos `source-address-excluded` /
+	// `destination-address-excluded` (#3668): the rule matches every address
+	// EXCEPT those in SrcAddresses/DstAddresses. Without them a positive verdict
+	// reads BACKWARDS — a match against a source OUTSIDE an excluded set prints
+	// the excluded list as if it were the reason for the match (the shared
+	// matcher already inverts correctly; only the response omitted the flag).
+	// Present (true) only when the modifier is set on a matched policy; false /
+	// omitted otherwise.
+	SourceAddressExcluded      bool     `json:"source_address_excluded,omitempty"`
+	DestinationAddressExcluded bool     `json:"destination_address_excluded,omitempty"`
+	Applications               []string `json:"applications,omitempty"`
 	// HostInboundUnmatched is true for a `to-zone junos-host` query that matched
 	// no host-bound policy (#3285): the dataplane host gate returns None (local
 	// delivery; no transit global/default fallback), so Action is not a

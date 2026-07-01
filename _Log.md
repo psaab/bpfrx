@@ -24999,6 +24999,22 @@ top.
 - **Action**: Document the detail-mode three-tier policy summary
 - **File(s)**: docs/junos-cli-reference.md, _Log.md
 
+## 2026-07-01 — #3668 match-policies exclusion flags + stable rule_id
+
+- **Timestamp**: 2026-07-01
+- **Action**: STEP-0 nuance resolved — the matcher (ruleMatches -> matchAddr) is CORRECT; it already inverts the address test for source/destination-address-excluded rules. Issue is a RESPONSE reporting gap, not a matcher inversion. Fix is additive schema + rendering.
+- **Action**: Add SourceAddressExcluded / DestinationAddressExcluded / RuleID to policymatch.Result; populate in matchedResult (RuleID via dpuserspace.StablePolicyRuleID, global rules remapped to junos-global->junos-global identity like the inventory). Add SSOT ExceptSuffix helper.
+- **File(s)**: pkg/policymatch/policymatch.go
+- **Action**: Add additive proto fields source_address_excluded=15, destination_address_excluded=16, rule_id=17 to MatchPoliciesResponse; regenerate bindings with pinned protoc-gen-go v1.36.11 / protoc-gen-go-grpc v1.6.1 / protoc v3.21.12 (no version bump)
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (regenerated)
+- **Action**: Add RuleID / SourceAddressExcluded / DestinationAddressExcluded to api.MatchPoliciesResult; populate in REST matchPoliciesHandler; populate the gRPC MatchPolicies response
+- **File(s)**: pkg/api/types.go, pkg/api/security.go, pkg/grpcapi/server_cluster.go
+- **Action**: Annotate "(except)" + print the stable Rule ID in the local and remote match-policies renderers
+- **File(s)**: pkg/cli/cli_show_security.go, cmd/cli/show.go
+- **Action**: Add RED-on-revert tests (matcher/gRPC/REST layers) proving the exclusion flags + rule_id are conveyed
+- **File(s)**: pkg/policymatch/excluded_response_3668_test.go (new), pkg/grpcapi/server_matchpolicies_exclusion_3668_test.go (new), pkg/api/security_matchpolicies_exclusion_3668_test.go (new)
+- **Action**: Document the new response fields
+- **File(s)**: pkg/api/README.md, pkg/grpcapi/README.md, pkg/policymatch/README.md, _Log.md
 ## 2026-07-01 — #3669 + #3672 remote CLI show.go fixes
 
 - **Timestamp**: 2026-07-01
