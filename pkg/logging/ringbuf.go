@@ -112,6 +112,14 @@ const (
 	closeReasonTCPRST  = 3
 	closeReasonAgeOut  = 4
 	closeReasonPolicy  = 5
+	// #3610: a host-inbound-traffic admission deny. Carried in the RT_FLOW
+	// reason byte on a POLICY_DENY event (the userspace-dp
+	// emit_host_inbound_deny_event rides the policy-deny wire kind with this
+	// distinct reason). Must equal the Rust RT_FLOW_CLOSE_REASON_HOST_INBOUND
+	// (userspace-dp/src/afxdp/event_emit.rs). Lets the structured
+	// RT_FLOW_SESSION_DENY record and operators tell a control-plane
+	// host-inbound drop apart from a transit security-policy deny.
+	closeReasonHostInbound = 6
 )
 
 const (
@@ -1098,6 +1106,17 @@ func formatStructuredMsg(rec EventRecord, protoNum uint8) string {
 			inIface, appName)
 
 	case "POLICY_DENY":
+		// #3610: render the on-wire reason instead of a hardcoded string. For a
+		// transit security-policy deny the reason byte is closeReasonPolicy, so
+		// rec.Reason is "Rejected by policy" — byte-identical to the prior output.
+		// For a host-inbound-traffic admission deny the byte is
+		// closeReasonHostInbound, so the record shows "Denied by
+		// host-inbound-traffic", letting incident response tell a control-plane
+		// host-inbound drop apart from a transit policy deny (was conflated).
+		reason := rec.Reason
+		if reason == "" {
+			reason = "Rejected by policy"
+		}
 		return fmt.Sprintf("RT_FLOW - RT_FLOW_SESSION_DENY "+
 			"[junos@2636.1.1.1.2.129 "+
 			"source-address=\"%s\" source-port=\"%s\" "+
@@ -1107,12 +1126,12 @@ func formatStructuredMsg(rec EventRecord, protoNum uint8) string {
 			"source-zone-name=\"%s\" destination-zone-name=\"%s\" "+
 			"session-id=\"%d\" "+
 			"packet-incoming-interface=\"%s\" application=\"%s\" "+
-			"reason=\"Rejected by policy\"]",
+			"reason=\"%s\"]",
 			srcIP, srcPort, dstIP, dstPort,
 			protoNum, policyName,
 			rec.InZoneName, rec.OutZoneName,
 			rec.SessionID,
-			inIface, appName)
+			inIface, appName, reason)
 
 	default:
 		return formatSyslogMsg(rec)
@@ -1340,6 +1359,10 @@ func closeReasonName(reason uint8) string {
 		return "aged out"
 	case closeReasonPolicy:
 		return "Rejected by policy"
+	case closeReasonHostInbound:
+		// #3610: a control-plane host-inbound-traffic admission deny (distinct
+		// from a transit security-policy deny).
+		return "Denied by host-inbound-traffic"
 	default:
 		return "N/A"
 	}
