@@ -65,10 +65,6 @@ type xpfCollector struct {
 	interfaceCounterReadErrorsTotal *prometheus.Desc
 	interfaceCounterReadErrors      atomic.Uint64
 
-	// Zone counters
-	zonePacketsTotal *prometheus.Desc
-	zoneBytesTotal   *prometheus.Desc
-
 	// Policy counters
 	policyHitsTotal *prometheus.Desc
 
@@ -515,8 +511,6 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
-	ch <- c.zonePacketsTotal
-	ch <- c.zoneBytesTotal
 	ch <- c.policyHitsTotal
 	ch <- c.filterHitsTotal
 	ch <- c.threeColorPolicerPacketsTotal
@@ -849,7 +843,6 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 
 	c.collectGlobalCounters(ch, dp)
 	c.collectInterfaceCounters(ch, dp)
-	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
 	c.collectFilterCounters(ch, dp)
 	// #3464: emit the per-interface scrape-error counter AFTER

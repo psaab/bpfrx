@@ -75,21 +75,43 @@ func (m *Manager) ClearSessionCounts() error {
 	return nil
 }
 
-// ReadFloodCounters reads the per-CPU flood state for a zone and sums them.
+// ReadFloodCounters returns the userspace-reported per-zone flood-event state
+// for zoneID.
+//
+// #3643: like ReadZoneCounters, this keys a Go-side sparse offset map instead
+// of indexing the dense flood_counters BPF array (MaxZones entries), so a
+// stable-hash zone id >= MaxZones can no longer OOB the bounded Lookup and
+// surface as a hard read failure. The userspace helper does not yet populate
+// per-zone flood counters (POPULATE deferred, #3643 plan §5A), so the map is
+// empty and this reports ErrCounterNotPopulated; surfaces render "not
+// available" rather than a misleading 0.
 func (m *Manager) ReadFloodCounters(zoneID uint16) (FloodState, error) {
-	zm, ok := m.maps["flood_counters"]
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fs, ok := m.floodCounterOffsets[zoneID]
 	if !ok {
-		return FloodState{}, fmt.Errorf("flood_counters map not found")
+		return FloodState{}, ErrCounterNotPopulated
 	}
-	var perCPU []FloodState
-	if err := zm.Lookup(uint32(zoneID), &perCPU); err != nil {
-		return FloodState{}, err
+	return fs, nil
+}
+
+// SetFloodCounterOffset records the absolute cumulative per-zone flood-event
+// counts reported by the userspace dataplane for zoneID (#3643 POPULATE hook,
+// mirroring SetZoneCounterOffset). Once set, ReadFloodCounters returns it (nil
+// error) instead of ErrCounterNotPopulated.
+func (m *Manager) SetFloodCounterOffset(zoneID uint16, fs FloodState) {
+	m.mu.Lock()
+	if m.floodCounterOffsets == nil {
+		m.floodCounterOffsets = make(map[uint16]FloodState)
 	}
-	var total FloodState
-	for _, fs := range perCPU {
-		total.SynCount += fs.SynCount
-		total.ICMPCount += fs.ICMPCount
-		total.UDPCount += fs.UDPCount
-	}
-	return total, nil
+	m.floodCounterOffsets[zoneID] = fs
+	m.mu.Unlock()
+}
+
+// ClearFloodCounterOffsets drops all userspace-reported per-zone flood offsets
+// (#3643). Wired into ClearAllCounters.
+func (m *Manager) ClearFloodCounterOffsets() {
+	m.mu.Lock()
+	m.floodCounterOffsets = nil
+	m.mu.Unlock()
 }

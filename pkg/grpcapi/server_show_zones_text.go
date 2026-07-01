@@ -9,11 +9,13 @@
 package grpcapi
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -72,15 +74,25 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 		if s.dp != nil && s.dp.IsLoaded() && zoneID > 0 {
 			ingress, errIn := s.dp.ReadZoneCounters(zoneID, 0)
 			egress, errOut := s.dp.ReadZoneCounters(zoneID, 1)
-			if errIn == nil && errOut == nil {
+			switch {
+			case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
+				errors.Is(errOut, dataplane.ErrCounterNotPopulated):
+				// #3643 HIDE: per-zone traffic counters are not sourced by the
+				// userspace dataplane. Say so explicitly rather than a
+				// misleading 0.
+				buf.WriteString("  Traffic statistics: not available " +
+					"(per-zone accounting not implemented in the userspace dataplane)\n")
+			case errIn == nil && errOut == nil:
 				buf.WriteString("  Traffic statistics:\n")
 				fmt.Fprintf(buf, "    Input:  %d packets, %d bytes\n", ingress.Packets, ingress.Bytes)
 				fmt.Fprintf(buf, "    Output: %d packets, %d bytes\n", egress.Packets, egress.Bytes)
-			} else if readErr == nil {
-				if errIn != nil {
-					readErr = errIn
-				} else {
-					readErr = errOut
+			default:
+				if readErr == nil {
+					if errIn != nil {
+						readErr = errIn
+					} else {
+						readErr = errOut
+					}
 				}
 			}
 		}

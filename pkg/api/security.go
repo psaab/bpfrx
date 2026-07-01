@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -84,17 +85,31 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 			if id, ok := cr.ZoneIDs[zoneName]; ok {
 				zi.ID = id
 				if s.dp != nil && s.dp.IsLoaded() {
-					if ing, err := s.dp.ReadZoneCounters(id, 0); err == nil {
+					ing, errIn := s.dp.ReadZoneCounters(id, 0)
+					eg, errOut := s.dp.ReadZoneCounters(id, 1)
+					switch {
+					case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
+						errors.Is(errOut, dataplane.ErrCounterNotPopulated):
+						// #3643 HIDE: per-zone traffic counters are not sourced
+						// by the userspace dataplane. Flag them unavailable and
+						// leave the counts unset rather than reporting a
+						// misleading 0 or 500'ing the whole endpoint on the
+						// structural stable-hash-id OOB.
+						zi.PerZoneCountersAvailable = false
+					case errIn != nil:
+						if readErr == nil {
+							readErr = errIn
+						}
+					case errOut != nil:
+						if readErr == nil {
+							readErr = errOut
+						}
+					default:
+						zi.PerZoneCountersAvailable = true
 						zi.IngressPackets = ing.Packets
 						zi.IngressBytes = ing.Bytes
-					} else if readErr == nil {
-						readErr = err
-					}
-					if eg, err := s.dp.ReadZoneCounters(id, 1); err == nil {
 						zi.EgressPackets = eg.Packets
 						zi.EgressBytes = eg.Bytes
-					} else if readErr == nil {
-						readErr = err
 					}
 				}
 			}

@@ -99,8 +99,9 @@ func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp api
 // sample. #3345: always emitted (0 when healthy) so the signal is present for
 // alerting whether or not any read failed. #3462: this MUST run AFTER every
 // sub-collector that can bump counterReadErrors (collectHostInboundKernelDenies,
-// collectGlobalCounters, collectZoneCounters, collectPolicyCounters,
-// collectFilterCounters) — Collect calls it last — so a zone/policy/filter read
+// collectGlobalCounters, collectPolicyCounters,
+// collectFilterCounters; #3643 dropped the per-zone bumper) — Collect calls it
+// last — so a policy/filter read
 // that fails in THIS scrape is reflected in THIS scrape's value, not lagged by
 // one scrape (which it was when the sample was emitted from collectGlobalCounters
 // before those collectors ran).
@@ -156,40 +157,15 @@ func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp 
 	}
 }
 
-func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
-	cfg := c.srv.store.ActiveConfig()
-	if cfg == nil {
-		return
-	}
-	cr := dataplane.LastApplyResultOf(dp)
-	if cr == nil {
-		return
-	}
-
-	for zoneName, zoneID := range cr.ZoneIDs {
-		// #3408: a failed per-zone read SKIPS the sample (no misleading 0) and
-		// bumps xpf_counter_read_errors_total — the same contract as the
-		// global counters (#3345).
-		ingress, err := dp.ReadZoneCounters(zoneID, 0)
-		if err != nil {
-			c.counterReadErrors.Add(1)
-			continue
-		}
-		egress, err := dp.ReadZoneCounters(zoneID, 1)
-		if err != nil {
-			c.counterReadErrors.Add(1)
-			continue
-		}
-		ch <- prometheus.MustNewConstMetric(c.zonePacketsTotal, prometheus.CounterValue,
-			float64(ingress.Packets), zoneName, "ingress")
-		ch <- prometheus.MustNewConstMetric(c.zonePacketsTotal, prometheus.CounterValue,
-			float64(egress.Packets), zoneName, "egress")
-		ch <- prometheus.MustNewConstMetric(c.zoneBytesTotal, prometheus.CounterValue,
-			float64(ingress.Bytes), zoneName, "ingress")
-		ch <- prometheus.MustNewConstMetric(c.zoneBytesTotal, prometheus.CounterValue,
-			float64(egress.Bytes), zoneName, "egress")
-	}
-}
+// #3643: collectZoneCounters was removed. Per-zone traffic counters
+// (xpf_zone_packets_total / xpf_zone_bytes_total) were never populated in the
+// userspace era (the eBPF writers were deleted in #1476) and, worse, every
+// read of a stable-hash zone id >= MaxZones (#3075) OOB'd the dense BPF array
+// and bumped xpf_counter_read_errors_total once per zone per scrape -- a
+// permanent FALSE read-error alert (#3345 signal). The metrics are dropped
+// until the per-zone POPULATE path ships (deferred, see
+// docs/research/3643-dead-counters/plan.md §5A). Global, per-interface,
+// per-policy, and per-screen-reason counters remain live.
 
 func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()

@@ -21,6 +21,7 @@
 package grpcapi
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -527,13 +528,25 @@ func (s *Server) showScreenStatistics(req *pb.ShowTextRequest, cfg *config.Confi
 				fmt.Fprintf(buf, "Zone '%s' not found\n", zoneName)
 			} else {
 				fs, err := s.dp.ReadFloodCounters(zoneID)
-				if err != nil {
-					fmt.Fprintf(buf, "Error reading flood counters: %v\n", err)
-				} else {
-					screenProfile := ""
-					if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
-						screenProfile = z.ScreenProfile
+				screenProfile := ""
+				if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
+					screenProfile = z.ScreenProfile
+				}
+				switch {
+				case errors.Is(err, dataplane.ErrCounterNotPopulated):
+					// #3643 HIDE: per-zone flood counters are not sourced by the
+					// userspace dataplane. Say so explicitly rather than a
+					// misleading 0.
+					fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
+					if screenProfile != "" {
+						fmt.Fprintf(buf, "  Screen profile: %s\n", screenProfile)
 					}
+					buf.WriteString("  Per-zone flood counters: not available " +
+						"(per-zone flood accounting not implemented in the userspace dataplane)\n")
+					buf.WriteString(s.screenSYNCookieCounterRows())
+				case err != nil:
+					fmt.Fprintf(buf, "Error reading flood counters: %v\n", err)
+				default:
 					fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
 					if screenProfile != "" {
 						fmt.Fprintf(buf, "  Screen profile: %s\n", screenProfile)
@@ -569,6 +582,24 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 		for _, zoneName := range zones {
 			zoneID := cr.ZoneIDs[zoneName]
 			fs, err := s.dp.ReadFloodCounters(zoneID)
+			screenProfile := ""
+			if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
+				screenProfile = z.ScreenProfile
+			}
+			if errors.Is(err, dataplane.ErrCounterNotPopulated) {
+				// #3643 HIDE: per-zone flood counters are not sourced by the
+				// userspace dataplane. NOT a read failure -- do not set readErr
+				// (no false #3408 warning) and do not print a misleading 0;
+				// render an explicit "not available" row.
+				fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
+				if screenProfile != "" {
+					fmt.Fprintf(buf, "  Screen profile: %s\n", screenProfile)
+				}
+				buf.WriteString("  Per-zone flood counters: not available " +
+					"(per-zone flood accounting not implemented in the userspace dataplane)\n")
+				buf.WriteString("\n")
+				continue
+			}
 			if err != nil {
 				if readErr == nil {
 					readErr = err
@@ -581,10 +612,6 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 				fmt.Fprintf(buf, "  Error reading flood counters: %v\n", err)
 				buf.WriteString("\n")
 				continue
-			}
-			screenProfile := ""
-			if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
-				screenProfile = z.ScreenProfile
 			}
 			fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
 			if screenProfile != "" {
