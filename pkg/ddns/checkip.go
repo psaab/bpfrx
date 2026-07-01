@@ -66,13 +66,49 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 	return parseCheckIPBody(string(body), wantV4, allowlist)
 }
 
+// CheckIPBound runs the checkip probe through a source-bound HTTP client while
+// enforcing the FAIL-CLOSED source-bind invariant (#3733). bindErr is the
+// source-bind resolution error the caller got when building `client` (via
+// NewCheckIPClient / SurfaceAManager.CheckIPClient) — non-nil when a configured
+// source-address could not be honored, in which case `client` is the UNBOUND
+// default (kernel default route).
+//
+// checkip is an address ORACLE: it discovers the public IP that DNS will point
+// at. Probing through the wrong egress returns a DIFFERENT WAN's public IP, and
+// publishing it republishes exactly the wrong-WAN class #2846 closed. So when a
+// source WAS requested but could not be honored (bindErr != nil), the probe
+// MUST NOT fall back to the default route — it returns (zero, false): a
+// TRANSIENT observation (no publish, never a withdraw), matching CheckIP's own
+// miss semantics. When no source was requested (bindErr == nil — `client` is the
+// intended egress, whether source-bound or unbound-by-config), the probe runs
+// normally.
+//
+// The bindErr gate is exact: the source-bind resolver (resolveProviderBindConfig
+// → resolveBindConfig) returns an error ONLY when a source-address IS configured
+// but does not parse — i.e. a source was requested and could not be honored. A
+// source-address that resolves but is not currently assigned, or a destination-
+// interface / VRF that is down, surfaces later as a DIAL error inside CheckIP,
+// which already returns ok=false (fail-closed) on its own — so this gate is the
+// one residual fall-open the bind-error branch left open.
+func CheckIPBound(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr, bindErr error) (netip.Addr, bool) {
+	if bindErr != nil {
+		// Source requested but not honored: fail closed, never probe via the
+		// default route (would return the wrong WAN's public IP).
+		return netip.Addr{}, false
+	}
+	return CheckIP(ctx, client, urlStr, wantV4, allowlist)
+}
+
 // NewCheckIPClient builds the HTTP client a checkip probe should use, bound to
 // the provider's configured source-address / destination-interface / routing-
 // instance (#2846) so the external "what is my IP" query egresses from the SAME
 // source as the DDNS updates do — not the kernel default route. A malformed
 // source-address returns the unbound default client plus the error so the caller
-// can log it and degrade gracefully (a checkip miss is a transient observation,
-// never a withdraw). A nil provider yields the unbound default client, no error.
+// can log it and degrade gracefully. The caller MUST treat that error as
+// fail-closed for the checkip oracle (route the probe through CheckIPBound, which
+// refuses to fall back to the default route, #3733) — the returned unbound
+// client is only for callers whose fall-open is acceptable (generic HTTP update
+// backends). A nil provider yields the unbound default client, no error.
 func NewCheckIPClient(p *config.DDNSProvider) (*http.Client, error) {
 	return newProviderHTTPClient(p)
 }

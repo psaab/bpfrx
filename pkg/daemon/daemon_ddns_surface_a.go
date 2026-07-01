@@ -269,18 +269,30 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			}
 			// Bind the checkip probe to the provider's configured source-address /
 			// interface / VRF (#2846) so it egresses from the same source as the
-			// DDNS updates — not the kernel default route. A malformed source-
-			// address yields the unbound default client (the commit warning already
-			// fired); the probe is a transient observation, never a withdraw.
-			// Reuse the manager's cached per-binding HTTP client (#2904) so the
-			// recurring checkip probe shares the keep-alive connection pool with the
-			// DNS-update path instead of rebuilding a transport every reconcile pass.
+			// DDNS updates — not the kernel default route. Reuse the manager's
+			// cached per-binding HTTP client (#2904) so the recurring checkip probe
+			// shares the keep-alive connection pool with the DNS-update path instead
+			// of rebuilding a transport every reconcile pass.
 			client, berr := d.surfaceA.CheckIPClient(scope.Provider)
 			if berr != nil {
-				slog.Warn("ddns surface-a: checkip source bind unusable; probing from default route",
-					"provider", scope.Provider.Name, "err", berr)
+				// FAIL-CLOSED (#3733): a source-address/interface/VRF WAS
+				// configured for this provider but could not be honored (e.g. a
+				// malformed source-address). checkip is an address oracle —
+				// falling back to the kernel default route would egress via a
+				// DIFFERENT WAN and return the WRONG WAN's public IP, republishing
+				// the wrong-WAN class #2846 closed. CheckIPBound (below) refuses to
+				// probe when berr != nil and returns ok=false: a TRANSIENT
+				// observation (no publish, never a withdraw). Log once per
+				// (provider, bind-error) so a persistent misconfig surfaces without
+				// flooding the per-tick observer.
+				key := scope.Provider.Name + "\x00" + berr.Error()
+				if _, dup := d.surfaceACheckIPSourceBindWarned.LoadOrStore(key, struct{}{}); !dup {
+					slog.Warn("ddns surface-a: checkip source bind unusable; "+
+						"skipping probe (fail-closed, not falling back to default route)",
+						"provider", scope.Provider.Name, "err", berr)
+				}
 			}
-			a, ok := ddns.CheckIP(ctx, client, scope.Provider.CheckIPURL, af4, allow)
+			a, ok := ddns.CheckIPBound(ctx, client, scope.Provider.CheckIPURL, af4, allow, berr)
 			if !ok {
 				return ddns.AddressObservation{}, false
 			}

@@ -123,6 +123,13 @@ type Daemon struct {
 	// drop must not log every tick. Keyed by "<provider>\x00<allowlist-string>"
 	// so a corrected commit re-arms the warning.
 	surfaceACheckIPAllowlistWarned sync.Map
+	// surfaceACheckIPSourceBindWarned dedups the once-per-(provider,bind-error)
+	// runtime log emitted when the checkip probe fails CLOSED because a
+	// configured source-address/interface/VRF could not be honored (#3733). The
+	// observer runs per poll-tick, so a persistent misconfig must not log every
+	// tick. Keyed by "<provider>\x00<bind-error>" so a corrected commit re-arms
+	// the warning.
+	surfaceACheckIPSourceBindWarned sync.Map
 	// #2239 HA DHCP-server lease sync (PATH C). The push loop runs on the
 	// RG-MASTER, reads the active lease set (Kea control socket → memfile
 	// fallback), and replicates it over the cluster sync channel. The standby
