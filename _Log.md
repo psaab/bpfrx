@@ -1,3 +1,35 @@
+## 2026-07-01 — #3681 REST /statistics/global host-inbound parity with Prometheus (H04/H05/L03/L07)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3681 — the REST /api/v1/statistics/global endpoint diverged
+    from the Prometheus collector on the kernel nftables host-inbound DROP
+    counters (the PRIMARY host-inbound enforcement signal). H04: the handler
+    503-gated on `dp.IsLoaded()` BEFORE reading the kernel counters, so a
+    config-only / degraded boot lost the host-inbound signal entirely, even
+    though the `inet xpf_hostinbound` chain drops control-plane traffic
+    independent of dataplane load (Prometheus reads it before its gate). H05:
+    a netlink read error was swallowed into a clean 0 (indistinguishable from
+    "healthy, no denies"). L03: the aggregate collapsed the per-zone/family
+    split. Fix: read the kernel counters BEFORE the dataplane gate via the same
+    `readHostInboundDenyCounters` package-var the collector uses; on an
+    unloaded dataplane return a PARTIAL 200 with `dataplane_degraded: true`
+    (503 gate now scoped to the userspace-dp counters); on a read failure set
+    `host_inbound_kernel_denies_unavailable` (the #3464 non-authoritative-marker
+    idiom) instead of reporting 0; add `host_inbound_kernel_deny_detail` with
+    the per-{zone,family} breakdown. Dropped the now-unused nftables import from
+    stats.go.
+  - **File(s)**: pkg/api/stats.go, pkg/api/types.go
+- **Action**: RED-on-revert tests (L07 gap): dp-unloaded still reports the
+  aggregate + per-zone/family detail (goes RED — 503 — on revert); an nft read
+  error marks Unavailable on both the unloaded and loaded paths (RED on revert);
+  a clean empty read (absent chain) does NOT mark Unavailable (false-positive
+  guard). Verified RED by reverting stats.go to origin/master.
+  - **File(s)**: pkg/api/stats_global_host_inbound_3681_test.go (new)
+- **Action**: Document the new response fields + the Prometheus-parity rationale
+  (H04 read-before-gate / partial 200, H05 unavailable-marker, L03 zone/family
+  split) and the one exception to the "read error -> HTTP 500" contract.
+  - **File(s)**: pkg/api/README.md, _Log.md
+
 ## 2026-07-01 — #3667 gRPC policy-detail text parity (except marker + session-log modes + Index)
 
 - **Timestamp**: 2026-07-01
