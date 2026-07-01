@@ -25355,3 +25355,44 @@ top.
 - **Action**: Document the new response fields (M05/M06) and the gRPC-text global
   render (M04) in the API/gRPC references
 - **File(s)**: pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
+
+## 2026-07-01 — #3698 addressless host-inbound zone fail-open admit window observability (folds codex-review-128 M02/L02)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3698 — a configured, host-inbound-ENFORCING zone whose
+    non-lifeline interfaces have no resolvable address yet (DHCP WAN before its
+    first lease, backup node before VIP install, or an unaddressed interface)
+    yields an empty address set, so `BuildZoneHostInboundViews` emits no deny
+    and `applyHostInboundFilter` scopes nothing — a transient, self-healing
+    fail-open admit window on host-inbound enforcement that was previously
+    SILENT (no log, no counter). Added observability WITHOUT changing the admit
+    semantics (an address-scoped nft deny cannot exist without an address).
+    Added `dpuserspace.AddresslessEnforcingZones(cfg)` as the SSOT: it reads the
+    scoped/unscoped decision back from `BuildZoneHostInboundViews` (the same
+    builder that drives nft emission, so the signal can never disagree with what
+    is enforced) and reports a zone iff it has a non-lifeline interface but no
+    address; scoped, lifeline-only (fxp0/em0/fab*), and interface-less zones are
+    excluded (low-noise). Daemon emits a state-TRANSITION log
+    (`logHostInboundAddresslessTransitions`): WARN on window entry, INFO on
+    recovery, deduped against the previous apply so repeated commits / DHCP
+    renewals do not flood. Added Prometheus gauge
+    `xpf_host_inbound_addressless_zones{zone}` (=1 per zone in the window,
+    absent when enforced), emitted BEFORE the dataplane gate (config-derived, so
+    it stays visible in a config-only / degraded boot; nil-store guarded).
+  - **File(s)**: pkg/dataplane/userspace/zones.go (AddresslessEnforcingZone type
+    + AddresslessEnforcingZones SSOT; #3698 doc on BuildZoneHostInboundViews),
+    pkg/daemon/daemon.go (hostInboundAddresslessZones state field),
+    pkg/daemon/daemon_nft.go (logHostInboundAddresslessTransitions + call in
+    applyHostInboundFilter), pkg/api/metrics.go (gauge desc field + Describe +
+    Collect before dataplane gate), pkg/api/metrics_descriptors.go (gauge NewDesc),
+    pkg/api/metrics_counters.go (collectHostInboundAddresslessZones, nil-store
+    guarded), docs/host-inbound-service-matrix.md (new "Addressless-zone
+    fail-open window" section)
+  - **Action**: RED-on-revert tests for all three surfaces (verified each goes
+    RED with the detection neutered, then restored green)
+  - **File(s)**: pkg/dataplane/userspace/zones_addressless_3698_test.go (SSOT:
+    addressless reported, scoped/lifeline/interface-less excluded, self-heal,
+    nil/empty), pkg/daemon/host_inbound_addressless_3698_test.go (WARN-once on
+    entry + dedup + INFO recovery via slog capture), pkg/api/
+    metrics_host_inbound_addressless_3698_test.go (gauge emitted with dataplane
+    unloaded, scoped zone absent, nil-store no-panic)

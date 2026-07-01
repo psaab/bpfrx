@@ -100,6 +100,21 @@ func newCollector(srv *Server) *xpfCollector {
 				"xpf_host_inbound_denies_total path).",
 			[]string{"zone", "family"}, nil,
 		),
+		// #3698: 1 while a configured host-inbound-enforcing zone is in the
+		// transient fail-open admit window — it has a non-lifeline interface but
+		// no resolvable address yet (DHCP WAN before first lease, backup node
+		// before VIP install), so the kernel host-inbound chain emits no deny for
+		// it. A control-plane signal (config-derived, independent of dataplane
+		// load), emitted BEFORE the dataplane gate in Collect. The series is
+		// present only for zones currently in the window (absent = enforced), so
+		// `max_over_time(...)` alerts on any zone that ever fails open.
+		hostInboundAddresslessZones: prometheus.NewDesc(
+			"xpf_host_inbound_addressless_zones",
+			"1 while a configured host-inbound-enforcing zone has no resolvable "+
+				"address yet and is therefore omitted from host-inbound deny "+
+				"scoping (transient fail-open admit window), labeled by zone.",
+			[]string{"zone"}, nil,
+		),
 		tcEgressPacketsTotal: prometheus.NewDesc(
 			"xpf_tc_egress_packets_total",
 			"Total TC egress packets processed.",

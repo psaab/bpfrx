@@ -27,15 +27,16 @@ type xpfCollector struct {
 	// xpf_screen_drops_total above cannot answer "which screen fired?"; this
 	// labeled series can, now that the userspace bridge populates the per-reason
 	// GlobalCtrScreen* counters.
-	screenDropsByReasonTotal *prometheus.Desc
-	policyDeniesTotal        *prometheus.Desc
-	natAllocFailsTotal       *prometheus.Desc
-	nat64XlateTotal          *prometheus.Desc
-	hostInboundDeny          *prometheus.Desc
-	hostInboundKernelDenies  *prometheus.Desc
-	tcEgressPacketsTotal     *prometheus.Desc
-	syncookieTotal           *prometheus.Desc
-	flowCacheTotal           *prometheus.Desc
+	screenDropsByReasonTotal    *prometheus.Desc
+	policyDeniesTotal           *prometheus.Desc
+	natAllocFailsTotal          *prometheus.Desc
+	nat64XlateTotal             *prometheus.Desc
+	hostInboundDeny             *prometheus.Desc
+	hostInboundKernelDenies     *prometheus.Desc
+	hostInboundAddresslessZones *prometheus.Desc
+	tcEgressPacketsTotal        *prometheus.Desc
+	syncookieTotal              *prometheus.Desc
+	flowCacheTotal              *prometheus.Desc
 
 	// #3345/#3408: monotonic count of counter reads that failed during a
 	// scrape, across the global, per-zone, per-policy, and per-filter dataplane
@@ -517,6 +518,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.nat64XlateTotal
 	ch <- c.hostInboundDeny
 	ch <- c.hostInboundKernelDenies
+	ch <- c.hostInboundAddresslessZones
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
@@ -852,6 +854,14 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// exists to close). ReadHostInboundDenyCounters reads nft via netlink and has
 	// no dataplane dependency.
 	c.collectHostInboundKernelDenies(ch)
+
+	// #3698: configured host-inbound-enforcing zones currently in the transient
+	// fail-open admit window (a non-lifeline interface but no resolvable address
+	// yet, so no kernel host-inbound deny is scoped to them). Config-derived and
+	// independent of dataplane load, so emit it BEFORE the dataplane gate — the
+	// window can be open in a config-only / degraded boot too, and that is exactly
+	// when it must stay visible.
+	c.collectHostInboundAddresslessZones(ch)
 
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {
