@@ -32,6 +32,14 @@ type fakeRuleOps struct {
 	// used to exercise the #3430 H3 add-failure aggregation in pbrManager.Apply.
 	addErr error
 
+	// addErrFamily injects a per-family RuleAdd failure, simulating a
+	// transient netlink error on one address family while the other
+	// succeeds. RuleAdd fails (without recording the rule) when
+	// addErrFamily[r.Family] is non-nil. Used to exercise the #3731
+	// next-table / rib-group add-failure aggregation with family isolation
+	// (a v4 add can fail while the sibling v6 add still installs).
+	addErrFamily map[int]error
+
 	// delErr, when non-nil, makes RuleDel fail without removing the rule —
 	// used to exercise the #3430 H3 clear-failure aggregation (a stale rule
 	// that cannot be deleted must surface as a non-nil Apply error).
@@ -51,6 +59,11 @@ func newFakeRuleOps() *fakeRuleOps {
 func (f *fakeRuleOps) RuleAdd(r *netlink.Rule) error {
 	if f.addErr != nil {
 		return f.addErr
+	}
+	if f.addErrFamily != nil {
+		if err := f.addErrFamily[r.Family]; err != nil {
+			return err
+		}
 	}
 	f.adds++
 	f.rules[r.Family] = append(f.rules[r.Family], *r)
@@ -90,6 +103,17 @@ func (f *fakeRuleOps) failList(family int, err error) {
 		f.listErr = map[int]error{}
 	}
 	f.listErr[family] = err
+}
+
+// failAdd arms RuleAdd(rule) to return err for rules in the given family
+// (without recording them). Used to recreate a transient per-family netlink
+// add failure so the #3731 aggregation can be exercised with one family
+// failing while the sibling family still installs.
+func (f *fakeRuleOps) failAdd(family int, err error) {
+	if f.addErrFamily == nil {
+		f.addErrFamily = map[int]error{}
+	}
+	f.addErrFamily[family] = err
 }
 
 // count returns the number of rules currently present for a family.
@@ -247,6 +271,68 @@ func TestRibGroupRulesApply_DefinedRibStillLeaks(t *testing.T) {
 	}
 }
 
+// TestRibGroupApplyAggregatesAddErrors is the #3731 fail-on-revert guard for
+// the rib-group reconciler. Each leaked table programs a v4 THEN a v6 ip rule;
+// a RuleAdd failure on either (or both) must be aggregated and returned rather
+// than logged-and-swallowed with Apply reporting nil (the pre-fix clearErr-only
+// return). The subtests pin v4-only, v6-only, and both-family failures — the
+// sibling family that DID install stays installed (forward progress) while
+// Apply still surfaces the error.
+//
+// Reverting ribGroupManager.Apply to the log-only branches + `return clearErr`
+// makes every subtest go RED (Apply returns nil).
+func TestRibGroupApplyAggregatesAddErrors(t *testing.T) {
+	ribGroups := map[string]*config.RibGroup{
+		"dmz-leak": {Name: "dmz-leak", ImportRibs: []string{"inet.0"}}, // main 254 != source
+	}
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "dmz-leak"},
+	}
+
+	t.Run("v4-only", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		ops.failAdd(unix.AF_INET, errors.New("netlink EPERM on v4"))
+		rg := &ribGroupManager{ops: ops}
+		if err := rg.Apply(ribGroups, instances); err == nil {
+			t.Fatal("Apply must return non-nil when the v4 leak rule fails (#3731)")
+		}
+		if ops.hasTable(unix.AF_INET, 101) {
+			t.Errorf("failed v4 leak rule must not be recorded, rules=%v", ops.rules[unix.AF_INET])
+		}
+		if !ops.hasTable(unix.AF_INET6, 101) {
+			t.Errorf("sibling v6 leak rule must still install (forward progress), rules=%v", ops.rules[unix.AF_INET6])
+		}
+	})
+
+	t.Run("v6-only", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		ops.failAdd(unix.AF_INET6, errors.New("netlink EPERM on v6"))
+		rg := &ribGroupManager{ops: ops}
+		if err := rg.Apply(ribGroups, instances); err == nil {
+			t.Fatal("Apply must return non-nil when the v6 leak rule fails (#3731)")
+		}
+		if !ops.hasTable(unix.AF_INET, 101) {
+			t.Errorf("sibling v4 leak rule must still install (forward progress), rules=%v", ops.rules[unix.AF_INET])
+		}
+		if ops.hasTable(unix.AF_INET6, 101) {
+			t.Errorf("failed v6 leak rule must not be recorded, rules=%v", ops.rules[unix.AF_INET6])
+		}
+	})
+
+	t.Run("both-family", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		ops.addErr = errors.New("netlink ENOBUFS")
+		rg := &ribGroupManager{ops: ops}
+		if err := rg.Apply(ribGroups, instances); err == nil {
+			t.Fatal("Apply must return non-nil when both leak rules fail (#3731)")
+		}
+		if ops.count(unix.AF_INET) != 0 || ops.count(unix.AF_INET6) != 0 {
+			t.Errorf("no leak rule should be recorded, v4=%d v6=%d",
+				ops.count(unix.AF_INET), ops.count(unix.AF_INET6))
+		}
+	})
+}
+
 // TestNextTableRulesApply_Fake exercises nextTableManager over a fake,
 // asserting a next-table directive becomes an ip rule pointing at the
 // target instance's table.
@@ -279,6 +365,81 @@ func TestNextTableRulesApply_Fake(t *testing.T) {
 	}
 	if got := ops.count(unix.AF_INET6); got != 1 {
 		t.Errorf("expected 1 IPv6 rule, got %d", got)
+	}
+}
+
+// TestNextTableApplyAggregatesAddErrors is the #3731 fail-on-revert guard for
+// the next-table reconciler. A per-rule RuleAdd failure after the up-front
+// clear() must be aggregated and returned — not logged-and-swallowed with Apply
+// still reporting nil (the pre-fix clearErr-only return). Before the fix a
+// transient netlink add error left the inter-VRF leak DOWN while Apply told the
+// daemon apply loop "success".
+//
+// Reverting nextTableManager.Apply to `continue` + `return clearErr` makes this
+// test go RED (Apply returns nil).
+func TestNextTableApplyAggregatesAddErrors(t *testing.T) {
+	routes := []*config.StaticRoute{
+		{Destination: "10.20.0.0/16", NextTable: "dmz-vr"},
+		{Destination: "2001:db8::/32", NextTable: "dmz-vr"},
+	}
+	instances := []*config.RoutingInstanceConfig{{Name: "dmz-vr", TableID: 101}}
+
+	// Both-family failure: every RuleAdd fails, no rule recorded, Apply
+	// surfaces the aggregated error.
+	ops := newFakeRuleOps()
+	ops.addErr = errors.New("netlink ENOBUFS")
+	nt := &nextTableManager{ops: ops}
+	if err := nt.Apply(routes, instances); err == nil {
+		t.Fatal("Apply must return a non-nil error when RuleAdd fails (#3731)")
+	}
+	if ops.count(unix.AF_INET) != 0 || ops.count(unix.AF_INET6) != 0 {
+		t.Errorf("no rule should have been recorded, v4=%d v6=%d",
+			ops.count(unix.AF_INET), ops.count(unix.AF_INET6))
+	}
+
+	// Single-family failure: forward progress preserved — the v4 add fails
+	// (error aggregated) while the sibling v6 rule still installs, and Apply
+	// still returns the aggregated error rather than swallowing it.
+	ops2 := newFakeRuleOps()
+	ops2.failAdd(unix.AF_INET, errors.New("netlink EPERM on v4"))
+	nt2 := &nextTableManager{ops: ops2}
+	if err := nt2.Apply(routes, instances); err == nil {
+		t.Fatal("Apply must return non-nil when the v4 add fails (#3731)")
+	}
+	if ops2.count(unix.AF_INET) != 0 {
+		t.Errorf("failed v4 rule must not be recorded, got %d", ops2.count(unix.AF_INET))
+	}
+	if ops2.count(unix.AF_INET6) != 1 {
+		t.Errorf("sibling v6 rule must still install (forward progress), got %d", ops2.count(unix.AF_INET6))
+	}
+}
+
+// TestNextTableApplyIdempotentReapply pins that the #3731 aggregation does not
+// regress the clean path: a first apply returns nil, and re-applying the same
+// config (clear-then-add) still returns nil with a stable rule set. The
+// re-apply cannot EEXIST because clear() removes the prior in-window rules
+// before they are re-added — an already-present rule is handled as success, not
+// an error (matching the #3430 PBR path, which likewise clears then re-adds).
+func TestNextTableApplyIdempotentReapply(t *testing.T) {
+	ops := newFakeRuleOps()
+	nt := &nextTableManager{ops: ops}
+	routes := []*config.StaticRoute{
+		{Destination: "10.20.0.0/16", NextTable: "dmz-vr"},
+		{Destination: "2001:db8::/32", NextTable: "dmz-vr"},
+	}
+	instances := []*config.RoutingInstanceConfig{{Name: "dmz-vr", TableID: 101}}
+
+	if err := nt.Apply(routes, instances); err != nil {
+		t.Fatalf("clean Apply must return nil, got %v", err)
+	}
+	if got := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6); got != 2 {
+		t.Fatalf("expected 2 rules after clean apply, got %d", got)
+	}
+	if err := nt.Apply(routes, instances); err != nil {
+		t.Fatalf("idempotent re-apply must return nil, got %v", err)
+	}
+	if got := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6); got != 2 {
+		t.Fatalf("re-apply must keep a stable rule set, got %d", got)
 	}
 }
 
