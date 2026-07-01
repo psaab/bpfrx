@@ -1303,6 +1303,49 @@ reserved for whole-dataplane selection where a rewrite shim
   `pkg/config/host_inbound_tokens_test.go` (commit reject + accept + lenient
   downgrade) and `pkg/daemon/host_inbound_parity_test.go` (nft-matcher-domain
   == SSOT parity + zero-match-zone fail-closed).
+- **#3751 (event-options within/trigger numeric validation — fail-open typo):**
+  `event-options policy <name> within <seconds> { trigger (on|until) <count>; }`
+  gated a remediation on a temporal threshold, but `compileEventOptions`
+  (`compiler_services.go`) parsed the time-interval and the trigger count with
+  `strconv.Atoi` and SILENTLY DROPPED the error — a typo (`within bogus`,
+  `trigger on typo`) coerced the field to 0. The engine's `withinMatches`
+  (`pkg/eventengine`) then skipped both `> 0`-guarded trigger tests and
+  returned true, so the policy fired on EVERY matching event: a typo silently
+  converted a threshold-gated remediation (e.g. "rewrite the default route only
+  after 4 probe failures in 30s") into an UNCONDITIONAL one — the dangerous
+  fail-open direction. This folds H11 (typo→0→always-fire), H12 (negative /
+  absurdly-huge / zero window — the huge case also risked a `time.Duration`
+  overflow when multiplied by `time.Second`) and H13 (a single clause carrying
+  BOTH `trigger on` and `trigger until`, which the engine ANDs into an
+  almost-certainly-unintended narrow one-count band). Like
+  `validateDNATRuleSetToScopeAST` (#3444) this is an AST pre-walk
+  (`validateEventOptionsWithinAST`, `event_options_within.go`), NOT a
+  SchemaValidate typed leaf: the raw typo'd token is lost once the compiler
+  coerces it to 0, and the constraint spans a whole `within` clause (the
+  seconds slot AND the nested trigger keyword/count AND the on/until mutual
+  exclusion) — which a per-leaf validator cannot express, and SchemaValidate
+  returns nil for keywords it does not know so it cannot REJECT a malformed
+  trigger. The walk descends with `forEachChild` over EVERY top-level
+  `event-options` block (the #3562 duplicate-block discipline —
+  `event-options` is a top-level stanza) on the group-expanded, inactive-pruned
+  tree, so an apply-groups-inherited clause is validated and an `inactive:` one
+  is ignored. It rejects a non-numeric / negative / zero / out-of-range
+  `within` (`1..86400` seconds) or `trigger` count (`1..1000000`), an unknown
+  trigger keyword (Junos's unsupported `after`), a within clause with no
+  trigger (gates nothing), and the on+until combination. Strict on commit /
+  commit-check (hard-reject naming the policy + value); downgraded to a
+  `cfg.Warnings` entry on the tolerant load / peer-sync paths
+  (`lenientEventWithinTrigger`, #1960 no-brick) so an older-binary-persisted or
+  peer-synced config that silently accepted a coerced-to-0 clause still boots.
+  Defense-in-depth (#3751 second half): on that legacy boot the engine's
+  `withinMatches` now fails CLOSED (the policy does NOT fire) on a within
+  clause with no usable positive threshold — a leftover 0 no longer over-fires
+  — while a policy with NO within clauses at all still fires on every match
+  (no temporal filter). Regression coverage:
+  `pkg/config/event_options_within_3751_test.go` (both AST shapes: commit
+  reject per error class + accept + H13 + lenient downgrade) and
+  `pkg/eventengine/engine_within_failclosed_3751_test.go` (fire-only-after-N,
+  0-threshold + 0-window fail-closed, no-clause-still-fires).
 - **#1387 (DHCP dynamic-DNS — live rfc2136 backend):** added an opt-in
   `dynamic-dns` subtree under BOTH `services dhcp-local-server` and
   `services dhcpv6-local-server` (a single shared `config.DHCPDynamicDNSConfig`
