@@ -629,6 +629,88 @@ fn apply_snapshot_integrity_preflight_rejects_without_mutating_state() {
     );
 }
 
+/// #3766 fail-closed same-plan refresh at the handler boundary: a
+/// same-plan apply_snapshot that PASSES the policy preflight but whose full
+/// forwarding build FAILS (here an unparseable interface address) must
+/// report ok=false, keep the previously-stored snapshot as the persisted
+/// baseline, and NOT advance the reported generation. The disarmed helper
+/// (default ProcessStatus) takes the fallible refresh_runtime_snapshot_
+/// disarmed leg.
+///
+/// Fail-on-revert: pre-#3766 the disarmed refresh returned () and the
+/// handler unconditionally stored the snapshot, refreshed status, and set
+/// persist_state=true — so response.ok stayed true (M1), the rejected
+/// snapshot overwrote guard.snapshot as the persisted baseline, and
+/// last_snapshot_generation advanced. Every assertion below flips.
+#[test]
+fn apply_snapshot_same_plan_build_failure_rejects_and_keeps_prior_3766() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    // A tunnel interface is excluded from the binding plan, so both applies
+    // share an (empty) binding-plan key -> the second apply takes the
+    // same-plan refresh leg. Only the address differs (NOT a plan-key
+    // input): valid on apply 1, unparseable on apply 2.
+    let iface = |address: &str| crate::protocol::snapshot::InterfaceSnapshot {
+        name: "gr-0/0/0".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 4300,
+        tunnel: true,
+        hardware_addr: "02:00:00:00:43:00".to_string(),
+        addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: address.to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let snapshot = |generation: u64, address: &str| ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation,
+        fib_generation: generation as u32,
+        generated_at: chrono::Utc::now(),
+        interfaces: vec![iface(address)],
+        ..ConfigSnapshot::default()
+    };
+
+    // forwarding_armed defaults false -> the disarmed refresh leg.
+    let state = new_state(ProcessStatus::default());
+
+    // Apply 1 (first apply, NOT same-plan): valid baseline, generation 1.
+    let mut first = req("apply_snapshot");
+    first.snapshot = Some(snapshot(1, "10.0.0.1/24"));
+    let response = run_request(state.clone(), first);
+    assert!(response.ok, "baseline apply must succeed: {}", response.error);
+
+    // Apply 2 (same-plan refresh leg): unparseable address -> build fails.
+    let mut second = req("apply_snapshot");
+    second.snapshot = Some(snapshot(2, "10.0.0.0/33"));
+    let response = run_request(state.clone(), second);
+    assert!(
+        !response.ok,
+        "a same-plan refresh whose forwarding build fails must report ok=false"
+    );
+    assert!(
+        response.error.contains("snapshot integrity error"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    let guard = state.lock().expect("state");
+    assert_eq!(
+        guard.snapshot.as_ref().map(|s| s.generation),
+        Some(1),
+        "the rejected snapshot must not overwrite the persisted baseline"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 1,
+        "rejected same-plan refresh must not bump last_snapshot_generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 1,
+        "rejected same-plan refresh must not bump last_fib_generation"
+    );
+}
+
 // --- set_binding_state / set_queue_state error arms ---------------------
 
 #[test]

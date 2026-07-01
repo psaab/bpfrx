@@ -67,10 +67,19 @@ pub(super) fn apply(
         "CTRL_REQ: apply_snapshot generation={} fib_generation={} forwarding_armed_before={}",
         snapshot.generation, snapshot.fib_generation, guard.status.forwarding_armed
     );
+    // #3766: capture the prior status-reporting fields BEFORE the bump
+    // so the same-plan refresh leg can restore them if the fallible
+    // forwarding build rejects the snapshot (fail closed — a rejected
+    // snapshot must not advance the reported generation/capabilities
+    // against the still-live prior forwarding table).
+    let prev_last_snapshot_generation = guard.status.last_snapshot_generation;
+    let prev_last_fib_generation = guard.status.last_fib_generation;
+    let prev_last_snapshot_at = guard.status.last_snapshot_at;
     guard.status.last_snapshot_generation = snapshot.generation;
     guard.status.last_fib_generation = snapshot.fib_generation;
     guard.status.last_snapshot_at = Some(snapshot.generated_at);
-    guard.status.capabilities = snapshot.capabilities.clone();
+    let prev_capabilities =
+        std::mem::replace(&mut guard.status.capabilities, snapshot.capabilities.clone());
     let existing_bindings = guard.status.bindings.clone();
     let previous_defer_workers = guard
         .snapshot
@@ -107,10 +116,38 @@ pub(super) fn apply(
             // stop check). The disarmed variant refreshes the same
             // forwarding/validation state with the WG spawn pass
             // replaced by a stop, mirroring reconcile_status_bindings.
-            if should_run_afxdp(&guard.status) {
-                guard.afxdp.refresh_runtime_snapshot(&snapshot);
+            // #3766: the same-plan refresh is a FALLIBLE ATOMIC SWAP.
+            // A snapshot that passed the policy preflight above can
+            // still fail the full forwarding build (invalid interface
+            // address, CoS queue, NAT64 / NPTv6 rule, ...). On that
+            // error the coordinator left the prior good state fully
+            // intact (build-first / atomic-swap), so the handler MUST
+            // fail closed too: report ok=false, keep the previously
+            // stored snapshot as the boot baseline, and do NOT set
+            // persist_state. Advancing guard.snapshot / status
+            // generation / persisted state here would report a
+            // rejected snapshot as the running config.
+            let refresh_result = if should_run_afxdp(&guard.status) {
+                guard.afxdp.refresh_runtime_snapshot(&snapshot)
             } else {
-                guard.afxdp.refresh_runtime_snapshot_disarmed(&snapshot);
+                guard.afxdp.refresh_runtime_snapshot_disarmed(&snapshot)
+            };
+            if let Err(err) = refresh_result {
+                // Restore the status reporting fields bumped at the top
+                // of `apply` so `show`/status never advertise the
+                // rejected snapshot's generation against the still-live
+                // prior forwarding table.
+                guard.status.last_snapshot_generation = prev_last_snapshot_generation;
+                guard.status.last_fib_generation = prev_last_fib_generation;
+                guard.status.last_snapshot_at = prev_last_snapshot_at;
+                guard.status.capabilities = prev_capabilities;
+                response.ok = false;
+                response.error = format!("snapshot integrity error: {}", err);
+                eprintln!(
+                    "CTRL_REQ: same-plan apply_snapshot rejected (integrity build): {} — keeping previous state",
+                    err
+                );
+                return;
             }
             guard.snapshot = Some(snapshot);
         }
