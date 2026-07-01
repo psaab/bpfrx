@@ -1936,8 +1936,17 @@ type ZoneInfo struct {
 	// `host-inbound-traffic` stanza; the effective admission set for that
 	// interface is the UNION of the zone-level set above and its override.
 	InterfaceHostInbound []*InterfaceHostInbound `protobuf:"bytes,15,rep,name=interface_host_inbound,json=interfaceHostInbound,proto3" json:"interface_host_inbound,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// lifeline_interfaces (#3682) lists the zone's interfaces that are
+	// management / cluster-control LIFELINES (fxp0 / em0 / fab* / configured
+	// control-interface / fabric-interface) and are therefore EXCLUDED from this
+	// zone's host-inbound deny scoping — their host-bound traffic is always
+	// admitted regardless of the admission set above. Surfaced so the implicit
+	// management-plane exception is operator-visible and auditable rather than a
+	// silent bypass. Sorted, deduplicated; empty for a zone with no lifeline
+	// member. VISIBILITY only — the exemption semantics are unchanged.
+	LifelineInterfaces []string `protobuf:"bytes,16,rep,name=lifeline_interfaces,json=lifelineInterfaces,proto3" json:"lifeline_interfaces,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ZoneInfo) Reset() {
@@ -2071,6 +2080,13 @@ func (x *ZoneInfo) GetHostInboundProtocols() []string {
 func (x *ZoneInfo) GetInterfaceHostInbound() []*InterfaceHostInbound {
 	if x != nil {
 		return x.InterfaceHostInbound
+	}
+	return nil
+}
+
+func (x *ZoneInfo) GetLifelineInterfaces() []string {
+	if x != nil {
+		return x.LifelineInterfaces
 	}
 	return nil
 }
@@ -7850,7 +7866,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\x11\n" +
 	"\x0fGetZonesRequest\":\n" +
 	"\x10GetZonesResponse\x12&\n" +
-	"\x05zones\x18\x01 \x03(\v2\x10.xpf.v1.ZoneInfoR\x05zones\"\xff\x04\n" +
+	"\x05zones\x18\x01 \x03(\v2\x10.xpf.v1.ZoneInfoR\x05zones\"\xb0\x05\n" +
 	"\bZoneInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\rR\x02id\x12%\n" +
@@ -7869,7 +7885,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\x17host_inbound_configured\x18\f \x01(\bR\x15hostInboundConfigured\x12?\n" +
 	"\x1chost_inbound_system_services\x18\r \x03(\tR\x19hostInboundSystemServices\x124\n" +
 	"\x16host_inbound_protocols\x18\x0e \x03(\tR\x14hostInboundProtocols\x12R\n" +
-	"\x16interface_host_inbound\x18\x0f \x03(\v2\x1c.xpf.v1.InterfaceHostInboundR\x14interfaceHostInbound\"\x9b\x01\n" +
+	"\x16interface_host_inbound\x18\x0f \x03(\v2\x1c.xpf.v1.InterfaceHostInboundR\x14interfaceHostInbound\x12/\n" +
+	"\x13lifeline_interfaces\x18\x10 \x03(\tR\x12lifelineInterfaces\"\x9b\x01\n" +
 	"\x14InterfaceHostInbound\x12\x1c\n" +
 	"\tinterface\x18\x01 \x01(\tR\tinterface\x12\x1e\n" +
 	"\n" +

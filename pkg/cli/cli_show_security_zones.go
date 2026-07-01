@@ -91,8 +91,11 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 		// #3654: render the zone-level admitted set, the no-stanza default-deny
 		// posture line, AND any per-interface host-inbound override through the
 		// shared config presenter so this surface can no longer hide overrides
-		// or a default-deny zone (H04/M03).
-		for _, line := range zone.HostInboundView().Render(config.HostInboundLabels{
+		// or a default-deny zone (H04/M03). #3682: the presenter also renders
+		// the management/cluster-control lifeline interfaces excluded from
+		// host-inbound deny scoping, so the implicit exemption is auditable.
+		for _, line := range zone.HostInboundViewWithLifelines(
+			config.HostInboundLifelineSet(cfg)).Render(config.HostInboundLabels{
 			Indent:         "  ",
 			Sep:            " ",
 			ServicesLabel:  "Allowed host-inbound traffic",

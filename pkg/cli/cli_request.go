@@ -476,12 +476,17 @@ func (c *CLI) testSecurityZone(args []string) error {
 				// per-interface admission, so report the EFFECTIVE (zone UNION
 				// interface) set for THIS interface, flag an interface-local
 				// override, and print an explicit default-deny posture line.
-				for _, line := range zone.RenderInterfaceHostInbound(ifName, config.HostInboundLabels{
-					Indent:         "  ",
-					Sep:            ", ",
-					ServicesLabel:  "Host-inbound services",
-					ProtocolsLabel: "Host-inbound protocols",
-				}) {
+				// #3682: also flag when THIS interface is a management /
+				// cluster-control lifeline excluded from host-inbound deny.
+				lifeline := config.HostInboundLifelineInterface(
+					ifName, config.HostInboundLifelineSet(cfg))
+				for _, line := range zone.RenderInterfaceHostInbound(ifName, lifeline,
+					config.HostInboundLabels{
+						Indent:         "  ",
+						Sep:            ", ",
+						ServicesLabel:  "Host-inbound services",
+						ProtocolsLabel: "Host-inbound protocols",
+					}) {
 					fmt.Println(line)
 				}
 				return nil
