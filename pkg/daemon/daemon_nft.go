@@ -241,6 +241,16 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 // nft failure cannot brick startup; the next clean commit re-renders.
 func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	views := dpuserspace.BuildZoneHostInboundViews(cfg)
+	// #3698: surface the transient fail-open admit window. A configured
+	// host-inbound-enforcing zone whose non-lifeline interfaces have no
+	// resolvable address yet (DHCP WAN before its first lease, backup node before
+	// VIP install, or an unaddressed interface) contributes nothing to the deny
+	// scoping below, so host-bound traffic to a freshly-usable address can reach
+	// the kernel input path without the zone default-deny. The window self-heals
+	// once an address appears (the lease-change / commit paths re-render), but it
+	// is otherwise silent. Log only state TRANSITIONS (a zone entering/leaving the
+	// window) so repeated commits / DHCP renewals do not flood.
+	d.logHostInboundAddresslessTransitions(cfg)
 	if !hostInboundHasEnforceableView(views) {
 		// No host-inbound-configured zone with a resolvable address — nothing to
 		// enforce. Remove any stale table. nftDeleteTable is idempotent (an
@@ -261,6 +271,36 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	}
 	slog.Info("host-inbound filter applied", "zones", len(views))
 	return nil
+}
+
+// logHostInboundAddresslessTransitions emits a state-transition log whenever a
+// configured host-inbound-enforcing zone ENTERS or LEAVES the transient
+// fail-open admit window (#3698) — a zone with a non-lifeline interface but no
+// resolvable address yet, for which the kernel host-inbound chain emits no deny.
+// It compares the current addressless set against the set observed on the
+// previous apply (d.hostInboundAddresslessZones) so a zone that stays addressless
+// across repeated commits / DHCP renewals is logged once (on entry), not every
+// apply — the low-noise contract for a self-healing window. Runs under applySem
+// (the sole caller, applyHostInboundFilter, is invoked from applyConfigLocked),
+// so the map access needs no extra locking. The current window is also exported
+// as the xpf_host_inbound_addressless_zones gauge (pkg/api), which is scraped
+// from the active config independently of this log.
+func (d *Daemon) logHostInboundAddresslessTransitions(cfg *config.Config) {
+	current := make(map[string]bool)
+	for _, z := range dpuserspace.AddresslessEnforcingZones(cfg) {
+		current[z.Zone] = true
+		if !d.hostInboundAddresslessZones[z.Zone] {
+			slog.Warn("host-inbound zone has no address yet — host-inbound default-deny NOT enforced for it until an address appears (transient fail-open admit window)",
+				"zone", z.Zone, "interfaces", strings.Join(z.Interfaces, ","))
+		}
+	}
+	for zone := range d.hostInboundAddresslessZones {
+		if !current[zone] {
+			slog.Info("host-inbound zone now has an address — host-inbound default-deny enforced (fail-open admit window closed)",
+				"zone", zone)
+		}
+	}
+	d.hostInboundAddresslessZones = current
 }
 
 // hostInboundHasEnforceableView reports whether at least one view carries a

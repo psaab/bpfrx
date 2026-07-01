@@ -160,6 +160,45 @@ audits do not re-file them.
   near-nonexistent DNAT/static-NAT-to-113 path; both layers stop the prior
   plain-admit of 113.
 
+## Addressless-zone fail-open window (#3698)
+
+Host-inbound default-deny is scoped to a zone's firewall-local **addresses** —
+the nft chain matches `<fam> daddr <zone-addrs> ... drop`. A configured,
+host-inbound-enforcing zone whose non-lifeline interfaces have **no resolvable
+address yet** (a DHCP WAN before its first lease, a backup node before VIP
+install, or an interface the operator has not addressed) yields an EMPTY address
+set, so `BuildZoneHostInboundViews` emits no deny for it and
+`applyHostInboundFilter` scopes nothing. During that window, host-bound packets
+to a freshly-usable address on that interface can reach the kernel input path
+without the intended zone default-deny — a transient fail-open on a security
+boundary. The window **self-heals**: the DHCP lease-change and commit paths
+re-render the chain the moment an address appears (and VRRP VIPs are resolved
+from config, so a VIP-scoped zone is never in the window even on the backup
+node). An address-scoped nft deny cannot be installed without an address, so the
+window itself is accepted as unavoidable; #3698 makes it **observable** rather
+than silent.
+
+The SSOT for "which configured enforcing zones are currently in the window" is
+`dpuserspace.AddresslessEnforcingZones` (`pkg/dataplane/userspace/zones.go`). It
+reads the scoped/unscoped decision back from `BuildZoneHostInboundViews` — the
+same builder that drives the nft emission — so the signal can never disagree with
+what the daemon enforces. It reports a zone iff it has at least one **non-lifeline**
+interface assigned yet resolves no address; zones that are scoped, whose only
+interfaces are management/cluster-control lifelines (fxp0 / em0 / fab*), or that
+have no interfaces are deliberately NOT reported (low-noise).
+
+Two observability surfaces consume it:
+
+- **State-transition log** (`daemon_nft.go`, `logHostInboundAddresslessTransitions`).
+  A `WARN` is logged when a zone ENTERS the window and an `INFO` when it LEAVES
+  (an address appears). It logs only transitions — a zone that stays addressless
+  across repeated commits / DHCP renewals is logged once, not every apply.
+- **Prometheus gauge** `xpf_host_inbound_addressless_zones{zone}` (`pkg/api`).
+  Value `1` per zone currently in the window; the series is absent when the zone
+  is enforced. Emitted BEFORE the dataplane gate (config-derived, so it stays
+  visible in a config-only / degraded boot). Alert with e.g.
+  `max_over_time(xpf_host_inbound_addressless_zones[1h]) > 0`.
+
 ## Adding a new host-inbound service
 
 Adding or changing a token is a coordinated edit across all three surfaces so the
