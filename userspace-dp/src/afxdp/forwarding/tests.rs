@@ -2768,7 +2768,7 @@ fn local_delivery_v6_is_table_scoped_no_cross_vrf_leak() {
 /// packet resolved in a DIFFERENT VRF hit the global membership and
 /// short-circuited to LocalDelivery (ifindex 0), bypassing that VRF's FIB +
 /// zone/policy + HA-RG owner check. After #3769 only the owning VRF delivers
-/// locally. Revert (remove the `local_nat_tables_v4` table gate on the
+/// locally. Revert (remove the `local_tables_v4` table gate on the
 /// membership shortcut) → tenant-a resolves LocalDelivery → RED.
 #[test]
 fn static_nat_local_delivery_is_table_scoped_no_cross_vrf_leak() {
@@ -2891,7 +2891,7 @@ fn dnat_local_delivery_is_table_scoped_no_cross_vrf_leak() {
 }
 
 /// #3769 (v6): a static-NAT external IPv6 owned in tenant-b must not
-/// local-deliver a tenant-a packet. Revert the `local_nat_tables_v6` gate → RED.
+/// local-deliver a tenant-a packet. Revert the `local_tables_v6` gate → RED.
 #[test]
 fn nat_local_delivery_v6_is_table_scoped_no_cross_vrf_leak() {
     let snapshot = crate::ConfigSnapshot {

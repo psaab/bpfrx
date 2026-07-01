@@ -11,22 +11,27 @@
     short-circuited to `LocalDelivery` (with ifindex 0), bypassing the
     VRF-A FIB + zone/security-policy + HA-RG owner check
     (`owner_rg_for_flow(egress_ifindex)`).
-    FIX: carry per-external-IP table ownership. New
-    `ForwardingState.local_nat_tables_v4/v6: FastMap<Ip, FastSet<String>>`
-    populated in `forwarding_build` from each NAT/DNAT rule's `from
-    routing-instance` (converted to a canonical route table via
-    `connected_route_tables`) — via new `StaticNatTable::external_ips_scoped`
-    and `DnatTable::destination_ips_scoped` (the latter now also backs
+    FIX: carry per-address table ownership. New
+    `ForwardingState.local_tables_v4/v6: FastMap<Ip, FastSet<String>>` with
+    an insert paired to EVERY `local_v*` insert — interface HOST addresses
+    in `populate_interfaces` (keyed by `.addr()`, NOT the masked connected
+    prefix), NAT/DNAT externals in `forwarding_build` from each rule's
+    `from routing-instance` (canonical table via `connected_route_tables`),
+    fed by new `StaticNatTable::external_ips_scoped` and
+    `DnatTable::destination_ips_scoped` (the latter now also backs
     `destination_ips` so the two views cannot drift). The
     `lookup_forwarding_resolution_inner_ecmp` shortcut now delivers locally
-    ONLY when THIS table owns the address (interface owns it here — the
-    #3151 connected scan matched — OR a NAT/DNAT rule in this
-    routing-instance owns it); an address owned only in another table falls
-    through to the route lookup. This also generalizes #3151 to a
-    single-owner interface IP (present in exactly one VRF). L5: a
-    NAT/DNAT-only external target has no interface, so its LocalDelivery
-    carries ifindex 0 legitimately — now GATED on table ownership and
-    counted by the new `LOCAL_DELIVERY_IFINDEX0` diagnostic atomic.
+    ONLY when the RESOLVING table is in the address's owning set; an address
+    owned only in another table falls through to the route lookup. The
+    membership DECISION deliberately does NOT use the connected scan — a
+    NAT-only IP has no connected route, and `ConnectedRouteV*` stores the
+    MASKED network so `prefix.addr() == host` matches only a /32 (a non-/32
+    interface IP would wrongly fall through). The connected scan is retained
+    for the ifindex ATTRIBUTION only (the #3151 /32-HA case). This
+    generalizes #3151 to a single-owner interface IP (present in exactly one
+    VRF). L5: a NAT-only external target (or a non-/32 interface IP) has no
+    exact connected match → ifindex 0, now reached ONLY when the table owns
+    the address, counted by the new `LOCAL_DELIVERY_IFINDEX0` diagnostic.
   - **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
     userspace-dp/src/afxdp/forwarding/mod.rs,
     userspace-dp/src/afxdp/forwarding_build/mod.rs,

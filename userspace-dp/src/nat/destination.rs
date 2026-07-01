@@ -899,7 +899,7 @@ impl DnatTable {
     /// `from routing-instance` scope of the owning DNAT rule ("" = the default
     /// instance / global). The forwarding-state builder converts the routing
     /// instance to a canonical route table and records the attribution in
-    /// `local_nat_tables_v*`, so the local-delivery shortcut is gated on the
+    /// `local_tables_v*`, so the local-delivery shortcut is gated on the
     /// resolving VRF rather than the global `local_v*` membership (the #3769
     /// cross-VRF local-delivery leak). Not deduplicated — a destination IP can
     /// legitimately be owned by DNAT rules in more than one routing-instance;

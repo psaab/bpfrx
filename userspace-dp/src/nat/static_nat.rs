@@ -764,7 +764,7 @@ impl StaticNatTable {
     /// `from routing-instance` scope of the owning rule ("" = the default
     /// instance / global). The forwarding-state builder converts the routing
     /// instance to a canonical route table and records the table attribution
-    /// in `local_nat_tables_v*`, so the local-delivery shortcut is gated on the
+    /// in `local_tables_v*`, so the local-delivery shortcut is gated on the
     /// resolving VRF instead of the global `local_v*` membership. A single
     /// external IP may appear more than once (per port mapping AND per
     /// split-horizon scope, #3605); every (IP, instance) pair is yielded and

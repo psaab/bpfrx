@@ -1163,30 +1163,44 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                 // connected scan by the canonical ingress table; the default
                 // routing-instance (inet.0) case still matches default-table
                 // connected routes.
-                let iface_ifindex = state
-                    .connected_v4
-                    .iter()
-                    .find(|entry| entry.table == table && entry.prefix.addr() == ip)
-                    .map(|entry| entry.ifindex);
                 // #3769: the local-delivery DECISION is now table-scoped too,
-                // not just the ifindex attribution. `local_v4` is a GLOBAL
-                // membership set, so a NAT/DNAT external IP owned in VRF B (or
-                // an interface IP owned only in another routing-instance) would
-                // otherwise short-circuit a VRF-A packet to LocalDelivery,
-                // bypassing the VRF-A FIB + zone/policy + HA-RG owner check.
-                // Deliver locally only when THIS table owns the address:
-                //   - an interface owns it here (connected scan matched), OR
-                //   - a static-NAT/DNAT rule in this routing-instance owns it.
-                let nat_owned_in_table = state
-                    .local_nat_tables_v4
+                // not just the #3151 ifindex attribution. `local_v4` is a
+                // GLOBAL membership set, so a NAT/DNAT external IP owned in
+                // VRF B (or an interface IP owned only in another
+                // routing-instance) would otherwise short-circuit a VRF-A
+                // packet to LocalDelivery, bypassing the VRF-A FIB +
+                // zone/policy + HA-RG owner check. `local_tables_v4` records,
+                // per local address, the tables that own it (paired with every
+                // `local_v4` insert); deliver locally only when the RESOLVING
+                // table is one of them. NOTE: the membership DECISION cannot
+                // use the connected scan — `ConnectedRouteV4` stores the MASKED
+                // network address, so `prefix.addr() == host` matches only a
+                // /32 (and never a NAT-only IP, which has no connected route).
+                if !state
+                    .local_tables_v4
                     .get(&ip)
-                    .is_some_and(|tables| tables.contains(&table));
-                if iface_ifindex.is_some() || nat_owned_in_table {
-                    let local_ifindex = iface_ifindex.unwrap_or(0);
+                    .is_some_and(|tables| tables.contains(&table))
+                {
+                    // Owned in a DIFFERENT table only (cross-VRF) — fall
+                    // through to the VRF-A route lookup instead of leaking to
+                    // LocalDelivery.
+                } else {
+                    // #3151: ifindex attribution stays via the table-scoped
+                    // connected scan (the /32-HA case). A NAT-only external IP
+                    // or a non-/32 interface host IP has no exact connected
+                    // match → ifindex 0 (unchanged pre-#3769 behaviour), now
+                    // reached only when the table genuinely owns the address.
+                    let local_ifindex = state
+                        .connected_v4
+                        .iter()
+                        .find(|entry| entry.table == table && entry.prefix.addr() == ip)
+                        .map(|entry| entry.ifindex)
+                        .unwrap_or(0);
                     if local_ifindex == 0 {
-                        // #3769 L5: NAT/DNAT-only local target — no interface
-                        // owns the address, so ifindex 0 is unavoidable but is
-                        // now gated on table ownership. Count it for diagnostics.
+                        // #3769 L5: table-owned local target with no interface
+                        // ifindex (NAT-only, or a non-/32 interface IP whose
+                        // ingress-interface path was bypassed). Gated on table
+                        // ownership; counted for diagnostics.
                         LOCAL_DELIVERY_IFINDEX0
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1202,8 +1216,6 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                         tx_vlan_id: 0,
                     };
                 }
-                // Owned in a DIFFERENT table only (cross-VRF) — fall through to
-                // the VRF-A route lookup instead of leaking to LocalDelivery.
             }
             lookup_forwarding_resolution_v4(
                 state,
@@ -1222,24 +1234,31 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
             if state.local_v6.contains(&ip) {
                 // #3151: table-scoped local-delivery attribution (see the v4
                 // branch above and the #2388 route-path connected scan).
-                let iface_ifindex = state
-                    .connected_v6
-                    .iter()
-                    .find(|entry| entry.table == table && entry.prefix.addr() == ip)
-                    .map(|entry| entry.ifindex);
                 // #3769: table-scoped local-delivery DECISION (see the v4
                 // branch). A NAT/DNAT external IP owned in another VRF, or an
                 // interface IP owned only in another routing-instance, must not
-                // short-circuit a VRF-A packet to LocalDelivery.
-                let nat_owned_in_table = state
-                    .local_nat_tables_v6
+                // short-circuit a VRF-A packet to LocalDelivery. `local_v6`
+                // membership alone is global; gate on `local_tables_v6`.
+                if !state
+                    .local_tables_v6
                     .get(&ip)
-                    .is_some_and(|tables| tables.contains(&table));
-                if iface_ifindex.is_some() || nat_owned_in_table {
-                    let local_ifindex = iface_ifindex.unwrap_or(0);
+                    .is_some_and(|tables| tables.contains(&table))
+                {
+                    // Owned in a DIFFERENT table only (cross-VRF) — fall
+                    // through to the route lookup.
+                } else {
+                    // #3151: ifindex attribution via the table-scoped connected
+                    // scan (matches a /128 host; a NAT-only or non-/128 IP →
+                    // ifindex 0, now reached only when this table owns the IP).
+                    let local_ifindex = state
+                        .connected_v6
+                        .iter()
+                        .find(|entry| entry.table == table && entry.prefix.addr() == ip)
+                        .map(|entry| entry.ifindex)
+                        .unwrap_or(0);
                     if local_ifindex == 0 {
-                        // #3769 L5: NAT/DNAT-only local target, ifindex 0 gated
-                        // on table ownership; counted for diagnostics.
+                        // #3769 L5: table-owned local target, no interface
+                        // ifindex; gated on table ownership, counted.
                         LOCAL_DELIVERY_IFINDEX0
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1255,7 +1274,6 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                         tx_vlan_id: 0,
                     };
                 }
-                // Owned in a DIFFERENT table only (cross-VRF) — fall through.
             }
             lookup_forwarding_resolution_v6(
                 state,

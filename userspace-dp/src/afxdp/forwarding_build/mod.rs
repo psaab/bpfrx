@@ -406,7 +406,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // targets so inbound traffic destined to those IPs is recognized by the
     // firewall. #3769: each IP carries its owning rule's `from
     // routing-instance` scope; record it (converted to a canonical route
-    // table via `connected_route_tables`) in `local_nat_tables_v*` so the
+    // table via `connected_route_tables`) in `local_tables_v*` so the
     // local-delivery shortcut is gated on the RESOLVING table — a packet in
     // VRF A to a NAT/DNAT address owned only in VRF B no longer short-circuits
     // to LocalDelivery, it follows the VRF-A FIB + zone/policy. The scoped IPs
@@ -424,19 +424,11 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         match ip {
             std::net::IpAddr::V4(v4) => {
                 state.local_v4.insert(v4);
-                state
-                    .local_nat_tables_v4
-                    .entry(v4)
-                    .or_default()
-                    .insert(table_v4);
+                state.local_tables_v4.entry(v4).or_default().insert(table_v4);
             }
             std::net::IpAddr::V6(v6) => {
                 state.local_v6.insert(v6);
-                state
-                    .local_nat_tables_v6
-                    .entry(v6)
-                    .or_default()
-                    .insert(table_v6);
+                state.local_tables_v6.entry(v6).or_default().insert(table_v6);
             }
         }
     }
