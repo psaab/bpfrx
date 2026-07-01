@@ -6698,6 +6698,165 @@ fn static_nat_dnat_no_source_constraint_matches_any() {
     );
 }
 
+// === #3605: zone/scope-differentiated static-NAT rules must COEXIST ===
+
+// Split-horizon static DNAT: two rules share the same `(external_ip,
+// match-port)` key but differ by `from zone`, translating the same public
+// address to a DIFFERENT internal host per ingress zone. Both must be
+// installed and matched by scope.
+//
+// Fail-on-revert: with the pre-#3605 single-entry map the second rule
+// OVERWRITES the first (last-write-wins), so the untrust packet — whose only
+// surviving entry is the dmz-scoped rule — fails `zone_ok` and returns None
+// (a silent UNtranslated leak). The untrust assertion below then RED.
+#[test]
+fn static_nat_dnat_scope_differentiated_rules_coexist_3605() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[
+            StaticNATRuleSnapshot {
+                name: "from-untrust".to_string(),
+                from_zone: "untrust".to_string(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+            StaticNATRuleSnapshot {
+                name: "from-dmz".to_string(),
+                from_zone: "dmz".to_string(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "10.0.0.10".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+        ],
+        &counters,
+    );
+    let ext: IpAddr = "203.0.113.10".parse().unwrap();
+    // Packet ingressing untrust -> the untrust rule (192.168.1.10). This is the
+    // rule OVERWRITTEN pre-#3605, so this assertion is the fail-on-revert.
+    let via_untrust = table
+        .match_dnat_with_counter_scoped(ext, 0, None, "untrust", "", "")
+        .map(|(d, _)| d.rewrite_dst);
+    assert_eq!(
+        via_untrust,
+        Some(Some("192.168.1.10".parse().unwrap())),
+        "untrust-scoped static DNAT must survive alongside the dmz-scoped rule (#3605 overwrite)"
+    );
+    // Packet ingressing dmz -> the dmz rule (10.0.0.10).
+    let via_dmz = table
+        .match_dnat_with_counter_scoped(ext, 0, None, "dmz", "", "")
+        .map(|(d, _)| d.rewrite_dst);
+    assert_eq!(
+        via_dmz,
+        Some(Some("10.0.0.10".parse().unwrap())),
+        "dmz-scoped static DNAT must translate to its own internal host"
+    );
+}
+
+// Reverse (SNAT) direction of the same #3605 overwrite: two rules map DIFFERENT
+// external addresses to the SAME internal host, scoped by different egress
+// zones. The SNAT map keys on `(internal_ip, snat_port)`, so both rules collide
+// on one key and the pre-#3605 map kept only the last -> the trust-egress
+// return packet un-NATs to the wrong (or no) external address.
+//
+// Fail-on-revert: the trust assertion RED because its rule was overwritten by
+// the wan-scoped rule.
+#[test]
+fn static_nat_snat_scope_differentiated_rules_coexist_3605() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[
+            StaticNATRuleSnapshot {
+                name: "egress-trust".to_string(),
+                from_zone: "trust".to_string(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+            StaticNATRuleSnapshot {
+                name: "egress-wan".to_string(),
+                from_zone: "wan".to_string(),
+                external_ip: "203.0.113.20".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+        ],
+        &counters,
+    );
+    let int: IpAddr = "192.168.1.10".parse().unwrap();
+    // Return packet egressing trust -> un-NAT to 203.0.113.10 (overwritten rule).
+    let via_trust = table
+        .match_snat_with_counter_scoped(int, 0, None, "trust", "", "")
+        .map(|(d, _)| d.rewrite_src);
+    assert_eq!(
+        via_trust,
+        Some(Some("203.0.113.10".parse().unwrap())),
+        "trust-egress static SNAT must survive alongside the wan-scoped rule (#3605 overwrite)"
+    );
+    // Return packet egressing wan -> un-NAT to 203.0.113.20.
+    let via_wan = table
+        .match_snat_with_counter_scoped(int, 0, None, "wan", "", "")
+        .map(|(d, _)| d.rewrite_src);
+    assert_eq!(
+        via_wan,
+        Some(Some("203.0.113.20".parse().unwrap())),
+        "wan-egress static SNAT must un-NAT to its own external address"
+    );
+}
+
+// #3605 specificity tiering: a zone-SCOPED rule and a zone-WILDCARD rule share
+// the same `(external_ip, match-port)` key. A packet matching the scoped zone
+// must hit the SPECIFIC rule, not the wildcard — regardless of config order
+// (the wildcard is authored FIRST here, the adversarial order). Traffic in any
+// other zone falls through to the wildcard.
+//
+// Fail-on-revert: with the single-entry map the scoped rule (authored second)
+// overwrites the wildcard, so the "other zone" packet — whose only entry is now
+// the trust-scoped rule — returns None instead of the wildcard translation, so
+// the other-zone assertion RED.
+#[test]
+fn static_nat_dnat_scoped_rule_wins_over_coexisting_wildcard_3605() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[
+            StaticNATRuleSnapshot {
+                name: "wildcard".to_string(),
+                from_zone: String::new(), // any zone
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "10.0.0.99".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+            StaticNATRuleSnapshot {
+                name: "trust-specific".to_string(),
+                from_zone: "trust".to_string(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+        ],
+        &counters,
+    );
+    let ext: IpAddr = "203.0.113.10".parse().unwrap();
+    // trust ingress -> the SPECIFIC rule wins over the wildcard.
+    let via_trust = table
+        .match_dnat_with_counter_scoped(ext, 0, None, "trust", "", "")
+        .map(|(d, _)| d.rewrite_dst);
+    assert_eq!(
+        via_trust,
+        Some(Some("192.168.1.10".parse().unwrap())),
+        "the zone-specific rule must win over a coexisting wildcard regardless of order (#3605)"
+    );
+    // any other zone -> the wildcard catch-all (fail-on-revert: overwritten).
+    let via_other = table
+        .match_dnat_with_counter_scoped(ext, 0, None, "untrust", "", "")
+        .map(|(d, _)| d.rewrite_dst);
+    assert_eq!(
+        via_other,
+        Some(Some("10.0.0.99".parse().unwrap())),
+        "an unmatched zone must fall through to the coexisting wildcard rule (#3605 overwrite)"
+    );
+}
+
 // Destination NAT scoped by `from interface`: the DNAT entry fires only for the
 // named ingress interface. Fail-on-revert: dropping the scope_ok gate in
 // match_entries makes the wrong-interface assertion fire and so RED.
