@@ -286,6 +286,16 @@ type Daemon struct {
 	// / commitAndApply paths without standing up the full dataplane.
 	applyBodyForTest func(*config.Config)
 
+	// hostInboundAddresslessZones is the set of configured host-inbound-
+	// enforcing zones observed in the transient fail-open admit window on the
+	// PREVIOUS apply (#3698): a zone with a non-lifeline interface but no
+	// resolvable address yet, so the daemon emits no host-inbound deny for it.
+	// applyHostInboundFilter diffs the current set against this to emit
+	// state-transition logs only (a zone ENTERING or LEAVING the window),
+	// keeping the warning low-noise across repeated commits / DHCP renewals.
+	// Written and read only under applySem in applyHostInboundFilter.
+	hostInboundAddresslessZones map[string]bool
+
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
 	mgmtVRFInterfaces map[string]bool
