@@ -310,13 +310,22 @@ From zone: guest, To zone: lan
       filter applied to the reflected reply's own tuple (`policy_reject` /
       `filter_reject` legs, alongside `time_exceeded` / `syn_cookie` / `ptb`
       / `classify_parse_errors`).
+    - `Generated-reply rate-limited` (#3661) — replies suppressed because the
+      shared per-reason rate-limit token bucket was empty, split
+      `policy_reject`/`filter_reject`. Distinct from a TX-frame budget drop
+      and an egress output-filter drop; the split tells policy-reject
+      starvation from filter-reject starvation under a rejected-flow flood.
 
-    The global reject rate-limit bucket is separate and source-neutral
-    (`reject_rate_limited_total`; a single global-per-reason token bucket).
-    The same source-split legs are exported to Prometheus as
+    The global reject rate-limit bucket itself is a single global-per-reason
+    token bucket; its source-NEUTRAL aggregate is `reject_rate_limited_total`
+    (Prometheus `xpf_userspace_reject_rate_limited_total`), kept for
+    back-compat. #3661 attributes each drop to the reply's source at the
+    consume site, so `policy_reject`+`filter_reject` sum to the aggregate.
+    The source-split legs are exported to Prometheus as
     `xpf_userspace_reject_sent_total`,
-    `xpf_userspace_reject_reply_budget_drops_total`, and
-    `xpf_userspace_reject_output_filter_drops_total`, each labeled
+    `xpf_userspace_reject_reply_budget_drops_total`,
+    `xpf_userspace_reject_output_filter_drops_total`, and
+    `xpf_userspace_reject_rate_limited_by_source_total`, each labeled
     `source="policy"|"filter"`.
   - **Default-deny posture (#3405):** EVERY configured security zone denies
     host-bound traffic by default (Junos/vSRX parity). A zone with interfaces

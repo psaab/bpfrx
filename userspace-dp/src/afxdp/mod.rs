@@ -520,6 +520,17 @@ pub(in crate::afxdp) struct BatchCounters {
     // from `policy_reject_reply_budget_drops` so filter-reject troubleshooting
     // is precise (both still share the same budget gate).
     filter_reject_reply_budget_drops: u64,
+    // #3661: POLICY-`reject` replies dropped because the shared per-reason
+    // REJECT_BUCKET rate-limit token bucket was empty. The aggregate
+    // `reject_rate_limited_total` (bumped inside `allow_generated_error`) stays
+    // source-neutral; this splits the SAME drop by reply source so
+    // policy-reject starvation is distinguishable from filter-reject
+    // starvation under a rejected-flow flood. Sibling of
+    // `policy_reject_reply_budget_drops`.
+    policy_reject_rate_limit_drops: u64,
+    // #3661: FILTER-`reject` reply rate-limit drop — the source-split sibling
+    // of `policy_reject_rate_limit_drops` (both share the one REJECT_BUCKET).
+    filter_reject_rate_limit_drops: u64,
     // #2238: locally-generated reply output-classification drops. A reply
     // (Time Exceeded, policy-reject RST/ICMP-unreachable, SYN-cookie
     // SYN-ACK/ACK-RST) is now classified by its OWN egress 5-tuple +
@@ -715,6 +726,16 @@ impl BatchCounters {
             live.filter_reject_reply_budget_drops
                 .fetch_add(self.filter_reject_reply_budget_drops, Ordering::Relaxed);
             self.filter_reject_reply_budget_drops = 0;
+        }
+        if self.policy_reject_rate_limit_drops != 0 {
+            live.policy_reject_rate_limit_drops
+                .fetch_add(self.policy_reject_rate_limit_drops, Ordering::Relaxed);
+            self.policy_reject_rate_limit_drops = 0;
+        }
+        if self.filter_reject_rate_limit_drops != 0 {
+            live.filter_reject_rate_limit_drops
+                .fetch_add(self.filter_reject_rate_limit_drops, Ordering::Relaxed);
+            self.filter_reject_rate_limit_drops = 0;
         }
         if self.time_exceeded_output_filter_drops != 0 {
             live.time_exceeded_output_filter_drops

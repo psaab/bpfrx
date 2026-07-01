@@ -209,14 +209,16 @@ func TestFormatStatusSummaryShowsNAT64Translations(t *testing.T) {
 	}
 }
 
-// #3657 (H13/H14): the status summary surfaces the per-source reject reply
-// SUCCESS ("Generated-reply sent") and the TX-frame reply-budget suppression
-// ("Generated-reply budget drops") counters wired onto BindingStatus by
-// #3615, alongside the existing egress output-filter "Generated-reply drops"
-// line. Before this the sent/budget legs were aggregated nowhere and never
-// printed — a docs-contract violation (junos-cli-reference.md promises budget
-// pressure is counted per source in `show ... status`). Reverting the
-// formatter drops the two new lines and turns this test RED.
+// #3657 (H13/H14) / #3661 (M02): the status summary surfaces the per-source
+// reject reply SUCCESS ("Generated-reply sent"), the TX-frame reply-budget
+// suppression ("Generated-reply budget drops"), and the rate-limit
+// suppression ("Generated-reply rate-limited") counters wired onto
+// BindingStatus by #3615/#3661, alongside the existing egress output-filter
+// "Generated-reply drops" line. Before this the sent/budget/rate-limit legs
+// were aggregated nowhere and never printed — a docs-contract violation
+// (junos-cli-reference.md promises reject suppression is counted per source in
+// `show ... status`). Reverting the formatter drops the new lines and turns
+// this test RED.
 func TestFormatStatusSummaryShowsRejectObservability(t *testing.T) {
 	status := userspace.ProcessStatus{
 		Bindings: []userspace.BindingStatus{
@@ -228,6 +230,8 @@ func TestFormatStatusSummaryShowsRejectObservability(t *testing.T) {
 				FilterRejectReplyBudgetDrops:  1,
 				PolicyRejectOutputFilterDrops: 7,
 				FilterRejectOutputFilterDrops: 4,
+				PolicyRejectRateLimitDrops:    13,
+				FilterRejectRateLimitDrops:    15,
 			},
 			{
 				Slot:                          1,
@@ -237,6 +241,8 @@ func TestFormatStatusSummaryShowsRejectObservability(t *testing.T) {
 				FilterRejectReplyBudgetDrops:  10,
 				PolicyRejectOutputFilterDrops: 11,
 				FilterRejectOutputFilterDrops: 12,
+				PolicyRejectRateLimitDrops:    17,
+				FilterRejectRateLimitDrops:    19,
 			},
 		},
 	}
@@ -249,6 +255,10 @@ func TestFormatStatusSummaryShowsRejectObservability(t *testing.T) {
 		"Generated-reply sent:      policy_reject=11 filter_reject=10",
 		// #3657 new TX-frame budget suppression line (policy=12 filter=11).
 		"Generated-reply budget drops: policy_reject=12 filter_reject=11",
+		// #3661 new rate-limit drop line (policy=13+17=30 filter=15+19=34).
+		// Reverting the source split (rate-limit drop stays source-neutral)
+		// or dropping the formatter line turns this RED.
+		"Generated-reply rate-limited: policy_reject=30 filter_reject=34",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("summary missing reject observability %q:\n%s", want, out)
@@ -269,6 +279,9 @@ func TestFormatStatusSummaryHidesZeroRejectObservability(t *testing.T) {
 	}
 	if strings.Contains(out, "Generated-reply budget drops:") {
 		t.Fatalf("summary printed reject budget-drop row for all-zero counters:\n%s", out)
+	}
+	if strings.Contains(out, "Generated-reply rate-limited:") {
+		t.Fatalf("summary printed reject rate-limit row for all-zero counters:\n%s", out)
 	}
 }
 

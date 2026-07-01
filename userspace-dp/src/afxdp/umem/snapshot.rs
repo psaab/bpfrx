@@ -107,6 +107,12 @@ impl BindingLiveState {
             filter_reject_reply_budget_drops: self
                 .filter_reject_reply_budget_drops
                 .load(Ordering::Relaxed),
+            policy_reject_rate_limit_drops: self
+                .policy_reject_rate_limit_drops
+                .load(Ordering::Relaxed),
+            filter_reject_rate_limit_drops: self
+                .filter_reject_rate_limit_drops
+                .load(Ordering::Relaxed),
             time_exceeded_output_filter_drops: self
                 .time_exceeded_output_filter_drops
                 .load(Ordering::Relaxed),

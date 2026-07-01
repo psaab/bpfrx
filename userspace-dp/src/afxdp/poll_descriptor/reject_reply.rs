@@ -284,6 +284,21 @@ fn enqueue_reject_reply(
     // rate-limited counter (inside `allow_generated_error`).
     if !allow_generated_error(GeneratedErrorReason::Reject) {
         counters.touched = true;
+        // #3661: attribute the rate-limit drop to the reply's SOURCE so a
+        // firewall-filter `then reject` starvation is not conflated with a
+        // policy `then reject` starvation under a rejected-flow flood. Both
+        // sources still share the single global-per-reason REJECT_BUCKET; the
+        // aggregate `reject_rate_limited_total` (bumped inside
+        // `allow_generated_error`) stays source-NEUTRAL for back-compat, and
+        // these two per-source per-binding counters sum to it exactly (the
+        // Reject bucket has this ONE consume site — #3656 proved the token is
+        // consumed only for a buildable reply, so an unreplyable frame reaches
+        // neither counter). Mirrors the #3615 budget-drop / output-filter
+        // source split a few lines below.
+        match source {
+            RejectReplySource::Policy => counters.policy_reject_rate_limit_drops += 1,
+            RejectReplySource::Filter => counters.filter_reject_rate_limit_drops += 1,
+        }
         return false;
     }
 
@@ -952,6 +967,81 @@ mod tests {
         assert_eq!(
             counters.policy_reject_reply_budget_drops, 0,
             "a rate-limited (buildable) reject must not count a budget drop"
+        );
+        // #3661 fail-on-revert: a POLICY-source rate-limit drop must bump the
+        // policy-source per-binding counter, NOT the filter sibling. Reverting
+        // the source split (dropping the `match source` arms) leaves both at 0
+        // and turns this RED.
+        assert_eq!(
+            counters.policy_reject_rate_limit_drops, 1,
+            "a policy-reject rate-limit drop must bump the policy counter"
+        );
+        assert_eq!(
+            counters.filter_reject_rate_limit_drops, 0,
+            "a policy-reject rate-limit drop must NOT bump the filter counter"
+        );
+        // Restore a full bucket so sibling tests in this binary are unaffected.
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+    }
+
+    /// #3661 fail-on-revert: a FILTER `then reject` reply dropped because the
+    /// shared REJECT_BUCKET rate-limit bucket is empty must bump
+    /// `filter_reject_rate_limit_drops`, NOT the policy sibling. Mirrors
+    /// `reject_reply_rate_limited_when_bucket_empty` (policy source) but drives
+    /// the FILTER entry point. Reverting the source split (the rate-limit drop
+    /// stays source-neutral) leaves the filter counter at 0 → RED. The
+    /// source-neutral aggregate (`rate_limited_count`) still advances for both.
+    #[test]
+    fn filter_reject_rate_limited_uses_filter_counter() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+            rate_limited_count, reset_bucket_for_test,
+        };
+        let _g = global_bucket_test_lock();
+        let (frame, meta, flow) = tcp_v4_syn();
+        // Drain the shared Reject bucket at a far-future epoch (see the policy
+        // sibling test for why): the call site's smaller monotonic `now`
+        // yields zero refill, so the bucket stays empty across the call.
+        let far_future = u64::MAX / 2;
+        reset_bucket_for_test(GeneratedErrorReason::Reject, far_future);
+        while allow_generated_error_at(GeneratedErrorReason::Reject, far_future, 1000, 1000) {}
+        let before = rate_limited_count(GeneratedErrorReason::Reject);
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_filter_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(!sent, "filter reject must fail-closed when rate-limited");
+        assert_eq!(
+            counters.filter_reject_sent, 0,
+            "no filter reject must be counted as sent under rate limit"
+        );
+        assert!(
+            pipeline.pending_tx_local.is_empty(),
+            "no RST may be enqueued under rate limit"
+        );
+        assert!(
+            rate_limited_count(GeneratedErrorReason::Reject) > before,
+            "the source-neutral aggregate rate-limited counter must still advance"
+        );
+        assert_eq!(
+            counters.filter_reject_rate_limit_drops, 1,
+            "a filter-reject rate-limit drop must bump the filter counter"
+        );
+        assert_eq!(
+            counters.policy_reject_rate_limit_drops, 0,
+            "a filter-reject rate-limit drop must NOT bump the policy counter"
         );
         // Restore a full bucket so sibling tests in this binary are unaffected.
         reset_bucket_for_test(GeneratedErrorReason::Reject, 0);

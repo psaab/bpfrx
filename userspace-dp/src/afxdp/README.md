@@ -497,10 +497,15 @@ sync.
   PBR/output-filter forward path — #3608's silent-drop domain — and
   cached-log replay) pass `reject_reply_enqueued = false`. Suppression is
   also counted per SOURCE: `policy_reject_reply_budget_drops` /
-  `policy_reject_output_filter_drops` (policy) vs
-  `filter_reject_reply_budget_drops` / `filter_reject_output_filter_drops`
+  `policy_reject_output_filter_drops` / `policy_reject_rate_limit_drops`
+  (policy) vs `filter_reject_reply_budget_drops` /
+  `filter_reject_output_filter_drops` / `filter_reject_rate_limit_drops`
   (filter); the parse-error leg `generated_reply_classify_parse_errors`
-  stays source-neutral (shared by every generated-reply type).
+  stays source-neutral (shared by every generated-reply type). The
+  rate-limit split (#3661) attributes an empty-bucket drop to the reply's
+  source at the consume site — the shared per-reason `REJECT_BUCKET` is
+  unchanged, so `policy`+`filter` sum to the source-neutral aggregate
+  `reject_rate_limited_total`.
   DSCP-matched input/output filters
   are intentionally not flow-cached because DSCP is packet metadata, not
   part of the session cache key; session hits re-evaluate DSCP-sensitive

@@ -1376,6 +1376,13 @@ pub(crate) struct BindingLiveSnapshot {
     /// #3615 (L04): FILTER-`reject` replies suppressed by TX-frame budget —
     /// the source-split sibling of `policy_reject_reply_budget_drops`.
     pub(crate) filter_reject_reply_budget_drops: u64,
+    /// #3661: POLICY-`reject` replies dropped by the shared per-reason
+    /// rate-limit bucket. Source split of the source-neutral aggregate
+    /// `reject_rate_limited_total`.
+    pub(crate) policy_reject_rate_limit_drops: u64,
+    /// #3661: FILTER-`reject` replies dropped by the rate-limit bucket — the
+    /// source-split sibling of `policy_reject_rate_limit_drops`.
+    pub(crate) filter_reject_rate_limit_drops: u64,
     /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
     /// (terminal discard/reject or three-color policer) on the egress
     /// interface, classified by the reply's OWN egress tuple. Per-leg.

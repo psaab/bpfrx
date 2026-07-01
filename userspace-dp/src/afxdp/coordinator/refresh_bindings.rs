@@ -120,6 +120,8 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.filter_reject_sent = snap.filter_reject_sent;
     binding.policy_reject_reply_budget_drops = snap.policy_reject_reply_budget_drops;
     binding.filter_reject_reply_budget_drops = snap.filter_reject_reply_budget_drops;
+    binding.policy_reject_rate_limit_drops = snap.policy_reject_rate_limit_drops;
+    binding.filter_reject_rate_limit_drops = snap.filter_reject_rate_limit_drops;
     binding.time_exceeded_output_filter_drops = snap.time_exceeded_output_filter_drops;
     binding.policy_reject_output_filter_drops = snap.policy_reject_output_filter_drops;
     binding.filter_reject_output_filter_drops = snap.filter_reject_output_filter_drops;
@@ -314,6 +316,8 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.filter_reject_sent = 0;
     binding.policy_reject_reply_budget_drops = 0;
     binding.filter_reject_reply_budget_drops = 0;
+    binding.policy_reject_rate_limit_drops = 0;
+    binding.filter_reject_rate_limit_drops = 0;
     binding.time_exceeded_output_filter_drops = 0;
     binding.policy_reject_output_filter_drops = 0;
     binding.filter_reject_output_filter_drops = 0;

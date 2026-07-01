@@ -1,3 +1,49 @@
+## 2026-07-01 — #3661 split reject RATE-LIMIT drop by source (Rust leg, M02 follow-up to #3657)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3661 — the reject RATE-LIMIT drop leg was still
+    source-neutral. #3615 split the reject BUDGET + output-filter drops by
+    source and #3657 surfaced them, but when the shared per-reason
+    `REJECT_BUCKET` token bucket is empty (`allow_generated_error(Reject)`
+    false branch in `reject_reply.rs`) only the source-neutral aggregate
+    `reject_rate_limited_total` (bumped inside `allow_generated_error`) moved —
+    an operator could not tell policy-reject starvation from filter-reject
+    starvation under a rejected-flow flood. VERIFIED the `RejectReplySource`
+    is in scope at the consume site (post-#3656 the token is consumed only
+    after reply-build feasibility, with the source known — already used a few
+    lines below for `policy_reject_sent`/`filter_reject_sent`). (1) Rust: at
+    the rate-limit false branch, `match source` bumps new per-binding counters
+    `policy_reject_rate_limit_drops` / `filter_reject_rate_limit_drops`
+    (mirrors the #3615 budget/output-filter splits); aggregate stays neutral
+    for back-compat and policy+filter sum to it (one consume site). Plumbed
+    through BatchCounters -> BindingLiveState -> BindingLiveSnapshot ->
+    BindingStatus (serde rename + `default`) and regenerated
+    `protocol_wire_v1.json` (two keys only). (2) Go: `BindingStatus`
+    (`protocol.go`) two omitempty fields; `format/status.go` new zero-
+    suppressed `Generated-reply rate-limited: policy_reject=N filter_reject=N`
+    line; Prometheus new `xpf_userspace_reject_rate_limited_by_source_total`
+    (source label) via `emitRejectObservability`, aggregate
+    `xpf_userspace_reject_rate_limited_total` kept. (3) RED-on-revert tests:
+    extended `reject_reply_rate_limited_when_bucket_empty` (policy) + new
+    `filter_reject_rate_limited_uses_filter_counter` (Rust);
+    `TestFormatStatusSummaryShowsRejectObservability` + zero-suppress variant
+    + `TestEmitUserspaceDynamicBufferMetrics` (count 27->29) + by-source
+    assertions (Go). (4) Docs: `docs/junos-cli-reference.md`
+    §reject-event-truthfulness + `userspace-dp/src/afxdp/README.md`.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+    userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/mod.rs,
+    userspace-dp/src/afxdp/umem/snapshot.rs,
+    userspace-dp/src/afxdp/worker/mod.rs,
+    userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+    userspace-dp/src/protocol/binding.rs,
+    userspace-dp/tests/fixtures/protocol_wire_v1.json,
+    userspace-dp/src/afxdp/README.md,
+    pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/format/status.go,
+    pkg/dataplane/userspace/format/status_test.go, pkg/api/metrics.go,
+    pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+    pkg/api/metrics_test.go, docs/junos-cli-reference.md, _Log.md
+
 ## 2026-07-01 — #3657 surface source-split reject reply/budget counters (status + Prometheus)
 
 - **Timestamp**: 2026-07-01
