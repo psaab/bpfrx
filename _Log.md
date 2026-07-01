@@ -1,3 +1,35 @@
+## 2026-07-01 — #3673 policy-match tail guard rejects swallowed from-zone/to-zone
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3673 — extended the #3113/#3142 unsupported-match-leaf
+    tail scan (`validatePolicyMatchLeavesStrict`) to reject from-zone/
+    to-zone that collapse onto a supported multi:true leaf's tail
+    (application / source-address / destination-address) under a
+    ZONE-PAIR policy. Verified reachability with ParseSetCommand+SetPath
+    repros: under a zone-pair match from-zone/to-zone are NOT registered
+    siblings, so `match application any from-zone C` and `match
+    application [ from-zone bad ]` collapse the reserved keyword onto the
+    application leaf's tail (#2419), where it is consumed as a bogus
+    application operand. Today #3144 (undefined-app) and the address-
+    definedness gate reject the unknown token ONLY because it is not
+    defined — an operator who defines an application/address literally
+    named from-zone/to-zone satisfies those gates and the reserved
+    keyword commits silently as an operand (fail-open). Added
+    `swallowedStructuralMatchTokens` = {from-zone,to-zone}, a `report`
+    helper, and `emitSwallowed` (strict reject / lenient warn, #1960).
+    Global scope unaffected: there from-zone/to-zone ARE siblings, so the
+    collapse stops at them.
+  - **File(s)**: pkg/config/compiler_policy_match.go,
+    pkg/config/compiler_policy_match_3673_test.go, docs/config-schema.md,
+    _Log.md
+  - **Validation**: RED-on-revert confirmed (removing the guard →
+    "CompileConfig accepted a swallowed structural match keyword" — the
+    config commits; apps named from-zone/to-zone defined so #3144 passes
+    and only the #3673 gate can reject). Legit bracketed app list and
+    legit global from-zone/to-zone match context still commit. Lenient
+    path warns. `go test ./pkg/config/...` green; `go build ./pkg/...
+    ./cmd/...`; gofmt + go vet clean.
+
 ## 2026-07-01 — #3667 gRPC policy-detail text parity (except marker + session-log modes + Index)
 
 - **Timestamp**: 2026-07-01
