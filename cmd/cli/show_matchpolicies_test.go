@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 // TestShowMatchPoliciesRendersServerVerdict covers the #3283 drift on the REMOTE
@@ -40,6 +41,46 @@ func TestShowMatchPoliciesRendersServerVerdict(t *testing.T) {
 	}
 	if strings.Contains(out, "default deny") {
 		t.Fatalf("output still renders hard-coded 'default deny':\n%s", out)
+	}
+}
+
+// TestShowMatchPoliciesHostInboundUsesSSOTString covers the #3655 residual of
+// #3647 on the REMOTE CLI surface: `show security match-policies ... to-zone
+// junos-host` for an unmatched host path previously hard-coded
+// "local delivery proceeds", which read as an unconditional admit even though a
+// no-stanza zone now default-DENIES host-inbound (#3405). The remote client must
+// render the shared SSOT policymatch.HostInboundShowLine — the exact string the
+// local CLI / REST / gRPC surfaces already print post-#3647 — so a remote
+// operator never sees the false-positive verdict on a core troubleshooting
+// workflow.
+//
+// FAIL-ON-REVERT: restoring the hard-coded "local delivery proceeds" line makes
+// the HostInboundShowLine assertion fail (and the no-"local delivery proceeds"
+// assertion fail).
+func TestShowMatchPoliciesHostInboundUsesSSOTString(t *testing.T) {
+	fake := &fakeBpfrxClient{
+		matchPoliciesResp: &pb.MatchPoliciesResponse{
+			Matched:              false,
+			HostInboundUnmatched: true,
+			Action:               policymatch.HostInboundActionString,
+		},
+	}
+	c := &ctl{client: fake}
+
+	out := captureStdout(t, func() {
+		if err := c.showMatchPolicies([]string{"from-zone", "trust", "to-zone", "junos-host"}); err != nil {
+			t.Fatalf("showMatchPolicies: %v", err)
+		}
+	})
+
+	if fake.matchPoliciesCalls != 1 {
+		t.Fatalf("MatchPolicies called %d times, want 1", fake.matchPoliciesCalls)
+	}
+	if !strings.Contains(out, policymatch.HostInboundShowLine) {
+		t.Fatalf("output missing SSOT HostInboundShowLine %q:\n%s", policymatch.HostInboundShowLine, out)
+	}
+	if strings.Contains(out, "local delivery proceeds") {
+		t.Fatalf("output still renders hard-coded 'local delivery proceeds':\n%s", out)
 	}
 }
 

@@ -24732,3 +24732,27 @@ top.
     docs/services-application-identification.md (session-create precedence note +
     stale lookup() signature refresh to lookup_directional).
   - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, userspace-dp/tests/fixtures/appid_precedence_v1.json, pkg/appid/precedence_parity_test.go, pkg/appid/README.md, docs/services-application-identification.md, _Log.md
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fix #3655 — remote cmd/cli `show security match-policies` for an
+    unmatched host-inbound path (`to-zone junos-host`) still hard-coded the old
+    false-positive verdict "host-inbound: local delivery proceeds (transit
+    global/default-policy NOT applied)". #3647 corrected the local CLI / REST /
+    gRPC surfaces via the SSOT const but MISSED the remote client render. The old
+    literal read as an unconditional admit even though a no-stanza zone now
+    default-DENIES host-inbound (#3405). Replaced the hard-coded line in
+    `showMatchPolicies` with the shared `policymatch.HostInboundShowLine` (already
+    imported), so the remote client renders the SAME accurate host-inbound verdict
+    as every other transport ("host-inbound: local delivery subject to
+    host-inbound-traffic service admission (a zone with no host-inbound-traffic
+    stanza denies by default; transit global/default-policy NOT applied)"). Added
+    golden test TestShowMatchPoliciesHostInboundUsesSSOTString (asserts the render
+    uses HostInboundShowLine, not "local delivery proceeds"); RED-on-revert PROVEN
+    (restoring the literal fails the SSOT assertion). No doc change needed — the
+    policymatch/grpcapi READMEs already assert "The CLI / show / request surfaces
+    render the shared policymatch.HostInboundShowLine"; this fix makes the remote
+    client conform to the already-documented contract. Validation: go build
+    ./cmd/... ./pkg/... OK; go test ./cmd/cli/... ./pkg/policymatch/... green;
+    gofmt clean; go vet clean (the pre-existing monitor.go:159 protobuf-mutex-copy
+    warning is unrelated, present on origin/master).
+  - **File(s)**: cmd/cli/show.go, cmd/cli/show_matchpolicies_test.go, _Log.md
