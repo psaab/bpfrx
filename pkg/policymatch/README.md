@@ -192,21 +192,25 @@ A `to-zone junos-host` query takes the separate **host gate** (#3285,
 to-zone junos-host` then `from-zone any to-zone junos-host`, with **no** global
 or default transit fallback (and `to-zone any` / `from-zone any to-zone any` are
 NOT pulled onto the host path). An unmatched host-bound flow returns
-`Result.HostInboundUnmatched` — local delivery proceeds (the management lifeline
-guarantee), never an inherited transit verdict. The surfaces render this as
-"host-inbound: local delivery proceeds (transit global/default-policy NOT
-applied)"; the gRPC `MatchPolicies` response carries it as
-`host_inbound_unmatched`.
+`Result.HostInboundUnmatched` — no security *policy* governs it, never an
+inherited transit verdict. Local delivery is instead gated by
+host-inbound-traffic service admission, which post-#3405 DEFAULT-DENIES a zone
+with no host-inbound-traffic stanza, so an unmatched result does **not** mean
+the packet is delivered (#3627 — the earlier "local delivery proceeds" wording
+was misleading for a no-stanza zone). The CLI / `show` / `request` surfaces
+render the shared `policymatch.HostInboundShowLine`:
+"host-inbound: local delivery subject to host-inbound-traffic service admission
+(a zone with no host-inbound-traffic stanza denies by default; transit
+global/default-policy NOT applied)"; the gRPC `MatchPolicies` response carries
+the bit as `host_inbound_unmatched`.
 
-Surface asymmetry (intentional, not a bug): for a host-inbound-unmatched
-result the REST `match-policies` response fills `action` with the descriptive
-string "host-inbound (local delivery; not governed by transit/global/default
-policy)" so a bare REST consumer reads a meaningful verdict, whereas the gRPC
-`MatchPolicies` response leaves `action` EMPTY and sets `matched=false` +
-`host_inbound_unmatched=true`, delegating the wording to the client (the remote
-CLI formats the two-line host-inbound message above). Both convey the same
-"no transit verdict applies" fact; they differ only in where the human string is
-composed.
+Both the REST and gRPC `match-policies` surfaces fill `action` through the
+shared SSOT `Result.DisplayAction()` (#3375), which returns
+`HostInboundActionString` for a host-inbound-unmatched result:
+"host-inbound (local delivery subject to host-inbound-traffic service admission
+— a zone with no host-inbound-traffic stanza denies by default;
+transit/global/default policy NOT applied)". Routing both transports through one
+method keeps them from diverging and prevents a blank verdict on the host path.
 
 Address matching honors literal CIDRs, address
 books (recursive set expansion), `any`/`any-ipv4`/`any-ipv6`, source/destination
