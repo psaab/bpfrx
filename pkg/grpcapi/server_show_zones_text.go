@@ -60,15 +60,18 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 		if zone.ScreenProfile != "" {
 			fmt.Fprintf(buf, "  Screen: %s\n", zone.ScreenProfile)
 		}
-		if zone.HostInboundTraffic != nil {
-			if len(zone.HostInboundTraffic.SystemServices) > 0 {
-				fmt.Fprintf(buf, "  Host-inbound system-services: %s\n",
-					strings.Join(zone.HostInboundTraffic.SystemServices, ", "))
-			}
-			if len(zone.HostInboundTraffic.Protocols) > 0 {
-				fmt.Fprintf(buf, "  Host-inbound protocols: %s\n",
-					strings.Join(zone.HostInboundTraffic.Protocols, ", "))
-			}
+		// #3654: render the zone-level admitted set, the no-stanza default-deny
+		// posture line, AND any per-interface host-inbound override through the
+		// shared config presenter (H07/M03) so gRPC text stays in lockstep with
+		// the local CLI and the structured inventory.
+		for _, line := range zone.HostInboundView().Render(config.HostInboundLabels{
+			Indent:         "  ",
+			Sep:            ", ",
+			ServicesLabel:  "Host-inbound system-services",
+			ProtocolsLabel: "Host-inbound protocols",
+		}) {
+			buf.WriteString(line)
+			buf.WriteString("\n")
 		}
 		// Traffic counters
 		if s.dp != nil && s.dp.IsLoaded() && zoneID > 0 {
@@ -223,13 +226,18 @@ func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *
 					if zone.ScreenProfile != "" {
 						fmt.Fprintf(buf, "  Screen:      %s\n", zone.ScreenProfile)
 					}
-					if zone.HostInboundTraffic != nil {
-						if len(zone.HostInboundTraffic.SystemServices) > 0 {
-							fmt.Fprintf(buf, "  Host-inbound services: %s\n", strings.Join(zone.HostInboundTraffic.SystemServices, ", "))
-						}
-						if len(zone.HostInboundTraffic.Protocols) > 0 {
-							fmt.Fprintf(buf, "  Host-inbound protocols: %s\n", strings.Join(zone.HostInboundTraffic.Protocols, ", "))
-						}
+					// #3654 (H08/M03): this is the per-interface admission
+					// DIAGNOSTIC, so report the EFFECTIVE (zone UNION interface)
+					// set for THIS interface and flag when it is governed by an
+					// interface-local override rather than only the zone set.
+					for _, line := range zone.RenderInterfaceHostInbound(ifName, config.HostInboundLabels{
+						Indent:         "  ",
+						Sep:            ", ",
+						ServicesLabel:  "Host-inbound services",
+						ProtocolsLabel: "Host-inbound protocols",
+					}) {
+						buf.WriteString(line)
+						buf.WriteString("\n")
 					}
 					found = true
 					break

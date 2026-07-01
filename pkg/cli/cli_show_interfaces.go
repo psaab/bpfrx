@@ -120,6 +120,7 @@ func (c *CLI) showInterfaces(args []string) error {
 	type logicalIface struct {
 		zoneName string
 		zone     *config.ZoneConfig
+		ifaceRef string // zone-interface ref as authored (host-inbound override key, #3654)
 		physName string
 		unitNum  int
 		vlanID   int
@@ -145,6 +146,7 @@ func (c *CLI) showInterfaces(args []string) error {
 		logicals = append(logicals, logicalIface{
 			zoneName: ifaceZoneName[ifaceName],
 			zone:     zone,
+			ifaceRef: ifaceName,
 			physName: physName,
 			unitNum:  unitNum,
 			vlanID:   vlanID,
@@ -298,16 +300,25 @@ func (c *CLI) showInterfaces(args []string) error {
 
 			fmt.Printf("    Security: Zone: %s\n", li.zoneName)
 
-			// Host-inbound traffic services
-			if li.zone != nil && li.zone.HostInboundTraffic != nil {
-				hit := li.zone.HostInboundTraffic
-				if len(hit.SystemServices) > 0 {
-					fmt.Printf("    Allowed host-inbound traffic : %s\n",
-						strings.Join(hit.SystemServices, " "))
+			// Host-inbound traffic services (#3654 H05/M03): show the EFFECTIVE
+			// admitted set for THIS logical interface — the UNION of the zone
+			// set and any per-interface override — flag an interface-local
+			// override, and print an explicit default-deny posture line so a
+			// blank section is never misread as "not enforced".
+			if li.zone != nil {
+				svc, proto, overridden := li.zone.InterfaceHostInboundEffective(li.ifaceRef)
+				if overridden {
+					fmt.Println("    Host-inbound: interface-specific override (effective set below)")
 				}
-				if len(hit.Protocols) > 0 {
-					fmt.Printf("    Allowed host-inbound protocols: %s\n",
-						strings.Join(hit.Protocols, " "))
+				if len(svc) > 0 {
+					fmt.Printf("    Allowed host-inbound traffic : %s\n", strings.Join(svc, " "))
+				}
+				if len(proto) > 0 {
+					fmt.Printf("    Allowed host-inbound protocols: %s\n", strings.Join(proto, " "))
+				}
+				if len(svc) == 0 && len(proto) == 0 {
+					fmt.Printf("    Host-inbound: default deny (%s)\n",
+						config.HostInboundDenyReason(overridden, li.zone.HostInboundTraffic != nil))
 				}
 			}
 

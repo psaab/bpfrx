@@ -51,6 +51,20 @@ type fakeBpfrxClient struct {
 	// GetPolicies recorder (#3357 remote filtered/brief scoped-global coverage).
 	getPoliciesCalls int
 	getPoliciesResp  *pb.GetPoliciesResponse
+
+	// GetZones recorder (#3654 remote host-inbound override / posture coverage).
+	getZonesCalls int
+	getZonesResp  *pb.GetZonesResponse
+}
+
+func (f *fakeBpfrxClient) GetZones(
+	_ context.Context, _ *pb.GetZonesRequest, _ ...grpc.CallOption,
+) (*pb.GetZonesResponse, error) {
+	f.getZonesCalls++
+	if f.getZonesResp != nil {
+		return f.getZonesResp, nil
+	}
+	return &pb.GetZonesResponse{}, nil
 }
 
 func (f *fakeBpfrxClient) GetPolicies(

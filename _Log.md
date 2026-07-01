@@ -24790,3 +24790,11 @@ top.
     gofmt clean; go vet clean (the pre-existing monitor.go:159 protobuf-mutex-copy
     warning is unrelated, present on origin/master).
   - **File(s)**: cmd/cli/show.go, cmd/cli/show_matchpolicies_test.go, _Log.md
+
+## 2026-07-01 — #3654 per-interface host-inbound display
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add shared host-inbound presenter (pkg/config) + wire 6 text surfaces to render per-interface host-inbound overrides, no-stanza default-deny posture (M03), and split system-services/protocols (M06)
+- **File(s)**: pkg/config/host_inbound_view.go (new), pkg/cli/cli_show_security_zones.go (H04), pkg/cli/cli_show_interfaces.go (H05), pkg/cli/cli_request.go (H06), pkg/grpcapi/server_show_zones_text.go (H07/H08), cmd/cli/show.go (H09), cmd/cli/nontty_test.go (GetZones fake stub)
+- **Action**: Add pkg/config presenter unit tests
+- **File(s)**: pkg/config/host_inbound_view_3654_test.go (new)

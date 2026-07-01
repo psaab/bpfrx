@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/diagcmd"
@@ -471,13 +472,17 @@ func (c *CLI) testSecurityZone(args []string) error {
 				if zone.ScreenProfile != "" {
 					fmt.Printf("  Screen:      %s\n", zone.ScreenProfile)
 				}
-				if zone.HostInboundTraffic != nil {
-					if len(zone.HostInboundTraffic.SystemServices) > 0 {
-						fmt.Printf("  Host-inbound services: %s\n", strings.Join(zone.HostInboundTraffic.SystemServices, ", "))
-					}
-					if len(zone.HostInboundTraffic.Protocols) > 0 {
-						fmt.Printf("  Host-inbound protocols: %s\n", strings.Join(zone.HostInboundTraffic.Protocols, ", "))
-					}
+				// #3654 (H06/M03): this DIAGNOSTIC is supposed to explain
+				// per-interface admission, so report the EFFECTIVE (zone UNION
+				// interface) set for THIS interface, flag an interface-local
+				// override, and print an explicit default-deny posture line.
+				for _, line := range zone.RenderInterfaceHostInbound(ifName, config.HostInboundLabels{
+					Indent:         "  ",
+					Sep:            ", ",
+					ServicesLabel:  "Host-inbound services",
+					ProtocolsLabel: "Host-inbound protocols",
+				}) {
+					fmt.Println(line)
 				}
 				return nil
 			}
