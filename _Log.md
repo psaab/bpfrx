@@ -39,6 +39,39 @@
     RED-on-revert verified (all 3 new tests FAIL when build is moved back after
     the gates); FULL `cargo test --release` = 3346 lib + 46/8/16/1 integration
     tests, 0 failed.
+## 2026-07-01 — #3653 align host_inbound_configured posture bit with #3405 dataplane default-deny
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3653 — REST (`pkg/api/security.go`) + gRPC
+    (`pkg/grpcapi/server_show_zones.go`) computed `HostInboundConfigured =
+    HostInboundTraffic != nil || len(InterfaceHostInbound) > 0`, so a no-stanza
+    configured zone reported `host_inbound_configured=false` carrying the
+    pre-#3405 "false = admit-all" semantics. But post-#3405 the dataplane
+    (`pkg/dataplane/userspace/zones.go:495`) sets `HostInboundConfigured=true`
+    UNCONDITIONALLY for every configured zone (a no-stanza zone default-DENIES
+    host-bound traffic). The API therefore reported "admit-all / not governed"
+    while runtime fail-closed default-DENIES — a contract disagreement an
+    auditor reads as an open management plane. FIX: both surfaces now set
+    `zi.HostInboundConfigured = true` (exact parity with the dataplane, which
+    is also gated on `zone != nil`). The admitted set — empty = deny-all —
+    lives in the split `host_inbound_system_services`/`host_inbound_protocols`
+    + per-interface override fields; no new field added (L03 enum deferred,
+    kept minimal per issue). Updated the stale H02 comments (api/types.go,
+    proto/xpf/v1/xpf.proto → regenerated comment-only pb.go with no wire
+    change, protocol.go ZoneSnapshot doc, the #3328 block comments in both
+    handlers) and M09 READMEs (pkg/api, pkg/grpcapi) to describe the
+    default-deny posture. Rewrote H03 tests: the `open` (no-stanza) zone now
+    asserts `configured=true` + empty token sets + no override — the
+    fail-on-revert guard (reverting to the config-shape formula reports false →
+    RED; proven on both surfaces). `go build ./pkg/... ./cmd/...`, `go vet`,
+    `go test ./pkg/api ./pkg/grpcapi ./pkg/config ./pkg/dataplane/userspace`
+    all green; gofmt clean on touched files.
+  - **File(s)**: pkg/api/security.go, pkg/api/types.go,
+    pkg/api/security_zone_hostinbound_3328_test.go, pkg/api/README.md,
+    pkg/grpcapi/server_show_zones.go,
+    pkg/grpcapi/server_show_zones_hostinbound_3328_test.go,
+    pkg/grpcapi/README.md, pkg/grpcapi/xpfv1/xpf.pb.go, proto/xpf/v1/xpf.proto,
+    pkg/dataplane/userspace/protocol.go, _Log.md
 
 ## 2026-07-01 — #3643 HIDE per-zone zone_counters + flood_counters dead surfaces
 
@@ -24774,3 +24807,27 @@ top.
     docs/services-application-identification.md (session-create precedence note +
     stale lookup() signature refresh to lookup_directional).
   - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, userspace-dp/tests/fixtures/appid_precedence_v1.json, pkg/appid/precedence_parity_test.go, pkg/appid/README.md, docs/services-application-identification.md, _Log.md
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fix #3655 — remote cmd/cli `show security match-policies` for an
+    unmatched host-inbound path (`to-zone junos-host`) still hard-coded the old
+    false-positive verdict "host-inbound: local delivery proceeds (transit
+    global/default-policy NOT applied)". #3647 corrected the local CLI / REST /
+    gRPC surfaces via the SSOT const but MISSED the remote client render. The old
+    literal read as an unconditional admit even though a no-stanza zone now
+    default-DENIES host-inbound (#3405). Replaced the hard-coded line in
+    `showMatchPolicies` with the shared `policymatch.HostInboundShowLine` (already
+    imported), so the remote client renders the SAME accurate host-inbound verdict
+    as every other transport ("host-inbound: local delivery subject to
+    host-inbound-traffic service admission (a zone with no host-inbound-traffic
+    stanza denies by default; transit global/default-policy NOT applied)"). Added
+    golden test TestShowMatchPoliciesHostInboundUsesSSOTString (asserts the render
+    uses HostInboundShowLine, not "local delivery proceeds"); RED-on-revert PROVEN
+    (restoring the literal fails the SSOT assertion). No doc change needed — the
+    policymatch/grpcapi READMEs already assert "The CLI / show / request surfaces
+    render the shared policymatch.HostInboundShowLine"; this fix makes the remote
+    client conform to the already-documented contract. Validation: go build
+    ./cmd/... ./pkg/... OK; go test ./cmd/cli/... ./pkg/policymatch/... green;
+    gofmt clean; go vet clean (the pre-existing monitor.go:159 protobuf-mutex-copy
+    warning is unrelated, present on origin/master).
+  - **File(s)**: cmd/cli/show.go, cmd/cli/show_matchpolicies_test.go, _Log.md
