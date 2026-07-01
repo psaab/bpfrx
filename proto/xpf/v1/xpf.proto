@@ -253,6 +253,15 @@ message ZoneInfo {
   // `host-inbound-traffic` stanza; the effective admission set for that
   // interface is the UNION of the zone-level set above and its override.
   repeated InterfaceHostInbound interface_host_inbound = 15;
+  // lifeline_interfaces (#3682) lists the zone's interfaces that are
+  // management / cluster-control LIFELINES (fxp0 / em0 / fab* / configured
+  // control-interface / fabric-interface) and are therefore EXCLUDED from this
+  // zone's host-inbound deny scoping — their host-bound traffic is always
+  // admitted regardless of the admission set above. Surfaced so the implicit
+  // management-plane exception is operator-visible and auditable rather than a
+  // silent bypass. Sorted, deduplicated; empty for a zone with no lifeline
+  // member. VISIBILITY only — the exemption semantics are unchanged.
+  repeated string lifeline_interfaces = 16;
 }
 
 // InterfaceHostInbound (#3328, #3362) is a per-interface host-inbound-traffic
