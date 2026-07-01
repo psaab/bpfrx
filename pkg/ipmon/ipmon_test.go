@@ -164,6 +164,79 @@ func TestRecoveryHoldDown(t *testing.T) {
 	}
 }
 
+// TestHoldDownRecomputeOnConfigChange is the #3763 regression: changing
+// the hold-down value while a recovery is pending must recompute the
+// pending-recovery deadline (crediting the time already elapsed), so a
+// lowered hold-down shortens the pending recovery and a raised one
+// extends it — without a restart. On revert (pendingRecoveryAt preserved
+// verbatim) the old deadline stays in force and each scenario goes RED.
+func TestHoldDownRecomputeOnConfigChange(t *testing.T) {
+	enterRecovery := func(holdSecs int) (*Engine, *fakeClock) {
+		cfg := testPolicyConfig()
+		cfg.Policies["wan-failover"].HoldDownSecs = holdSecs
+		e, clock := newTestEngine(nil)
+		e.Apply(cfg, passResults())
+		e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+		e.HandleTransition(transition("WAN", "wan-a", "pass", passResults()))
+		if e.Status()[0].PendingRecoveryAt.IsZero() {
+			t.Fatalf("setup: no pending recovery under hold-down %ds", holdSecs)
+		}
+		return e, clock
+	}
+	reapply := func(e *Engine, holdSecs int) {
+		cfg := testPolicyConfig()
+		cfg.Policies["wan-failover"].HoldDownSecs = holdSecs
+		e.Apply(cfg, passResults())
+	}
+	evalNow := func(e *Engine) {
+		e.mu.Lock()
+		e.evaluateLocked(e.now())
+		e.mu.Unlock()
+	}
+
+	// Lower below elapsed time → recover immediately (the incident-
+	// response scenario: 300s hold, 50s elapsed, drop to 10s).
+	e, clock := enterRecovery(300)
+	clock.Advance(50 * time.Second)
+	reapply(e, 10)
+	if e.Status()[0].Failed {
+		t.Fatal("hold-down lowered below elapsed time did not recover")
+	}
+
+	// Lower to a still-future deadline → shortens but stays pending, then
+	// recovers at the NEW (earlier) deadline, well before the old one.
+	e, clock = enterRecovery(300)
+	clock.Advance(50 * time.Second) // T0+50
+	reapply(e, 100)                 // new deadline T0+100 (was T0+300)
+	if !e.Status()[0].Failed {
+		t.Fatal("recovered too early after shortening to a still-future deadline")
+	}
+	clock.Advance(51 * time.Second) // T0+101: past the new deadline, before the old
+	evalNow(e)
+	if e.Status()[0].Failed {
+		t.Fatal("did not recover at the shortened deadline (old deadline still in force)")
+	}
+
+	// Raise extends: 10s hold, 5s elapsed, raise to 100s → stays pending
+	// past the OLD 10s deadline.
+	e, clock = enterRecovery(10)
+	clock.Advance(5 * time.Second)
+	reapply(e, 100)                 // new deadline T0+100
+	clock.Advance(10 * time.Second) // T0+15: past the OLD deadline
+	evalNow(e)
+	if !e.Status()[0].Failed {
+		t.Fatal("recovered at the OLD short deadline after hold-down was raised")
+	}
+
+	// Unchanged hold-down preserves the running deadline verbatim.
+	e, _ = enterRecovery(300)
+	before := e.Status()[0].PendingRecoveryAt
+	reapply(e, 300)
+	if got := e.Status()[0].PendingRecoveryAt; !got.Equal(before) {
+		t.Fatalf("unchanged hold-down moved the deadline: %v -> %v", before, got)
+	}
+}
+
 // TestWinnerResolution verifies the §4.1 corrected semantics: among
 // multiple injected routes for the same prefix, lowest preferred-metric
 // wins; tie-break lexicographic policy name; withdrawal of the winner

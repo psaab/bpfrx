@@ -260,6 +260,12 @@ func (e *Engine) Apply(cfg *config.IPMonitoringConfig, results []*rpm.ProbeResul
 	// and after the policy swap — a no-op commit (or any commit with
 	// zero policies) must not schedule a routes-only FRR reload.
 	overlayBefore := e.activeOverlayLocked()
+	// recomputedHold is set when a surviving policy's hold-down value
+	// changed while a recovery was pending (#3763): the run loop must be
+	// kicked even when the FAIL/recover state itself did not change, so it
+	// re-derives its wake timer against the NEW (possibly shortened)
+	// deadline instead of sleeping to the stale one.
+	recomputedHold := false
 	next := make(map[string]*policyState)
 	if cfg != nil {
 		for name, pol := range cfg.Policies {
@@ -270,8 +276,29 @@ func (e *Engine) Apply(cfg *config.IPMonitoringConfig, results []*rpm.ProbeResul
 			if prev, ok := e.policies[name]; ok && prev.cfg.MatchRPMProbe == pol.MatchRPMProbe {
 				st.failed = prev.failed
 				st.since = prev.since
-				st.pendingRecoveryAt = prev.pendingRecoveryAt
 				st.transitions = prev.transitions
+				// #3763: a running recovery hold-down must honor a
+				// hold-down value the operator changes mid-recovery.
+				// pendingRecoveryAt encodes recoveryStart + oldHold, so
+				// the new deadline is recoveryStart + newHold =
+				// pendingRecoveryAt + (newHold - oldHold). Preserve it
+				// verbatim only when hold-down is unchanged; recompute
+				// (crediting elapsed time) when it changed; drop it when
+				// hold-down was lowered to 0 so evaluateLocked recovers
+				// at once. Lowering shortens a pending recovery, raising
+				// extends it — operator intent honored without a restart.
+				if prev.cfg.HoldDownSecs == pol.HoldDownSecs {
+					st.pendingRecoveryAt = prev.pendingRecoveryAt
+				} else if !prev.pendingRecoveryAt.IsZero() {
+					oldHold := time.Duration(prev.cfg.HoldDownSecs) * time.Second
+					newHold := time.Duration(pol.HoldDownSecs) * time.Second
+					if newHold > 0 {
+						st.pendingRecoveryAt = prev.pendingRecoveryAt.Add(newHold - oldHold)
+					}
+					// newHold == 0: leave pendingRecoveryAt zero — the
+					// evaluateLocked below recovers immediately.
+					recomputedHold = true
+				}
 			}
 			next[name] = st
 		}
@@ -287,7 +314,10 @@ func (e *Engine) Apply(cfg *config.IPMonitoringConfig, results []*rpm.ProbeResul
 	}
 	e.markDirtyLocked(changed)
 	e.mu.Unlock()
-	if changed {
+	if changed || recomputedHold {
+		// recomputedHold with changed==false means a still-pending
+		// recovery's deadline moved (typically shortened): wake the loop
+		// so nextWakeLocked re-arms against the new deadline (#3763).
 		e.kickLoop()
 	}
 }

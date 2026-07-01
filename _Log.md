@@ -1,3 +1,25 @@
+## 2026-07-01 — #3763 ip-monitoring: recompute pending-recovery deadline when hold-down changes mid-recovery
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3763 (MEDIUM, codex-review-160 M7+L6). Apply preserved
+    prev.pendingRecoveryAt verbatim whenever (policy name, MatchRPMProbe)
+    survived a commit, ignoring a changed HoldDownSecs. A policy recovering
+    under a 300s hold-down that the operator lowered to 10s during incident
+    response still waited the old 300s deadline — operator intent ignored
+    until a restart. FIX: pendingRecoveryAt encodes recoveryStart + oldHold,
+    so the new deadline = pendingRecoveryAt + (newHold - oldHold) credits the
+    elapsed time. Preserve verbatim only when hold-down is unchanged; recompute
+    when it changed; drop to zero (recover at the next evaluate) when lowered to
+    0. Also kick the run loop when a still-pending deadline moved even if the
+    FAIL/recover state itself did not change, so nextWakeLocked re-arms against
+    the new (possibly shortened) deadline instead of sleeping to the stale one.
+    RED-on-revert test (TestHoldDownRecomputeOnConfigChange, fakeClock): lower
+    below elapsed → recover now; lower to a still-future deadline → recover at
+    the NEW earlier deadline; raise → stay pending past the OLD deadline;
+    unchanged → deadline preserved verbatim.
+  - **File(s)**: pkg/ipmon/ipmon.go (Apply recompute + kick),
+    pkg/ipmon/ipmon_test.go (TestHoldDownRecomputeOnConfigChange)
+
 ## 2026-07-01 — #3762 ip-monitoring: idempotent engine lifecycle (double Start no-op, Stop before/without Start safe)
 
 - **Timestamp**: 2026-07-01
