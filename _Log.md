@@ -1,3 +1,27 @@
+## 2026-07-01 — #3671 host-inbound zone posture survives a partial interface override (H08, #3654 residual; folds L03)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Fix the shared host-inbound presenter — `HostInboundView.Render`
+  gated the zone-level `Host-inbound: default deny (...)` line on
+  `len(v.Interfaces) == 0`, so ANY per-interface override suppressed the zone
+  posture line even though that posture still governs every non-overridden
+  interface in the zone. Dropped the `len(v.Interfaces) == 0` clause so the
+  zone posture line is emitted whenever the zone-level service AND protocol
+  lists are both empty, regardless of overrides; the override block stays and
+  is rendered below the posture line as additional context. Because the fix is
+  in the shared presenter, it propagates to all six #3654 surfaces.
+- **File(s)**: pkg/config/host_inbound_view.go
+- **Action**: Add RED-on-revert tests at the presenter + a discriminating CLI
+  surface. Presenter: a no-stanza zone + an override renders BOTH the
+  default-deny posture line and the override block (and posture precedes the
+  override block); an empty-stanza zone + override shows the "empty stanza"
+  reason. Surface: `show security zones` filtered to the `edge` zone (override,
+  no zone stanza) — discriminating because the pre-existing #3654 test's
+  posture assertion was satisfied by the unrelated `open` zone.
+- **File(s)**: pkg/config/host_inbound_view_3654_test.go, pkg/cli/host_inbound_display_3654_test.go
+- **Action**: Document the #3671 residual fix in the CLI reference
+- **File(s)**: docs/junos-cli-reference.md, _Log.md
+
 ## 2026-07-01 — #3661 split reject RATE-LIMIT drop by source (Rust leg, M02 follow-up to #3657)
 
 - **Timestamp**: 2026-07-01

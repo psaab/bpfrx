@@ -111,6 +111,43 @@ func TestTestSecurityZoneHostInbound3654(t *testing.T) {
 	}
 }
 
+// TestShowSecurityZonesZonePostureWithOverride3671 is the surface-level peer of
+// the presenter test TestHostInboundViewRenderZonePostureWithOverride3671. The
+// `edge` zone in hostInboundCLIStore has an interface override but NO zone-level
+// host-inbound stanza; filtering `show security zones` to just that zone proves
+// the zone-level default-deny posture line is emitted alongside the override
+// block (#3671 / H08).
+//
+// This is discriminating where TestShowSecurityZonesHostInbound3654 is not: that
+// test's "default deny (no stanza)" assertion is satisfied by the unrelated
+// `open` zone, so it passes even with the #3671 bug present. Filtering to `edge`
+// removes that other source, so reverting the fix (the old
+// `&& len(v.Interfaces) == 0` guard) drops the posture line here and fails.
+func TestShowSecurityZonesZonePostureWithOverride3671(t *testing.T) {
+	c := hostInboundCLIStore(t)
+	out := captureStdout(t, func() {
+		if err := c.showZonesDisplay(c.store.ActiveConfig(), false, "edge"); err != nil {
+			t.Fatalf("showZonesDisplay: %v", err)
+		}
+	})
+	if strings.Contains(out, "Security zone: trust") || strings.Contains(out, "Security zone: open") {
+		t.Fatalf("filter to edge leaked another zone into output\n%s", out)
+	}
+	for _, want := range []string{
+		// zone-level default-deny posture — governs the non-overridden
+		// interfaces of edge and MUST remain visible despite the override
+		"Host-inbound: default deny (no stanza)",
+		// override block still rendered
+		"Host-inbound interface overrides:",
+		"ge-0/0/9.0:",
+		"override system-services: https",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("edge zone (override, no zone stanza) output missing %q\n%s", want, out)
+		}
+	}
+}
+
 func TestShowInterfacesHostInbound3654(t *testing.T) {
 	// show interfaces reaches the host-inbound block only for a PRESENT kernel
 	// interface, so bind the override to the always-present loopback.
