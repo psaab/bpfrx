@@ -1,3 +1,37 @@
+## 2026-07-01 — #3653 align host_inbound_configured posture bit with #3405 dataplane default-deny
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3653 — REST (`pkg/api/security.go`) + gRPC
+    (`pkg/grpcapi/server_show_zones.go`) computed `HostInboundConfigured =
+    HostInboundTraffic != nil || len(InterfaceHostInbound) > 0`, so a no-stanza
+    configured zone reported `host_inbound_configured=false` carrying the
+    pre-#3405 "false = admit-all" semantics. But post-#3405 the dataplane
+    (`pkg/dataplane/userspace/zones.go:495`) sets `HostInboundConfigured=true`
+    UNCONDITIONALLY for every configured zone (a no-stanza zone default-DENIES
+    host-bound traffic). The API therefore reported "admit-all / not governed"
+    while runtime fail-closed default-DENIES — a contract disagreement an
+    auditor reads as an open management plane. FIX: both surfaces now set
+    `zi.HostInboundConfigured = true` (exact parity with the dataplane, which
+    is also gated on `zone != nil`). The admitted set — empty = deny-all —
+    lives in the split `host_inbound_system_services`/`host_inbound_protocols`
+    + per-interface override fields; no new field added (L03 enum deferred,
+    kept minimal per issue). Updated the stale H02 comments (api/types.go,
+    proto/xpf/v1/xpf.proto → regenerated comment-only pb.go with no wire
+    change, protocol.go ZoneSnapshot doc, the #3328 block comments in both
+    handlers) and M09 READMEs (pkg/api, pkg/grpcapi) to describe the
+    default-deny posture. Rewrote H03 tests: the `open` (no-stanza) zone now
+    asserts `configured=true` + empty token sets + no override — the
+    fail-on-revert guard (reverting to the config-shape formula reports false →
+    RED; proven on both surfaces). `go build ./pkg/... ./cmd/...`, `go vet`,
+    `go test ./pkg/api ./pkg/grpcapi ./pkg/config ./pkg/dataplane/userspace`
+    all green; gofmt clean on touched files.
+  - **File(s)**: pkg/api/security.go, pkg/api/types.go,
+    pkg/api/security_zone_hostinbound_3328_test.go, pkg/api/README.md,
+    pkg/grpcapi/server_show_zones.go,
+    pkg/grpcapi/server_show_zones_hostinbound_3328_test.go,
+    pkg/grpcapi/README.md, pkg/grpcapi/xpfv1/xpf.pb.go, proto/xpf/v1/xpf.proto,
+    pkg/dataplane/userspace/protocol.go, _Log.md
+
 ## 2026-07-01 — #3643 HIDE per-zone zone_counters + flood_counters dead surfaces
 
 - **Timestamp**: 2026-07-01
