@@ -255,8 +255,10 @@ func (c *CLI) testPolicy(args []string) error {
 	}
 
 	if fromZone == "" || toZone == "" {
-		fmt.Println("usage: test policy from-zone <zone> to-zone <zone>")
-		fmt.Println("       source-ip <ip> destination-ip <ip> source-port <port> destination-port <port> protocol <tcp|udp>")
+		// #3628: shared SSOT selector list (policymatch) so the advertised
+		// selectors match what the parser accepts, including icmp-type/icmp-code
+		// and protocol by name or number.
+		fmt.Println(policymatch.TestPolicyUsage)
 		return nil
 	}
 

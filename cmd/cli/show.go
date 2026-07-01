@@ -1107,8 +1107,10 @@ func (c *ctl) showMatchPolicies(args []string) error {
 	}
 
 	if req.FromZone == "" || req.ToZone == "" {
-		fmt.Println("usage: show security match-policies from-zone <zone> to-zone <zone>")
-		fmt.Println("       source-ip <ip> destination-ip <ip> source-port <port> destination-port <port> protocol <tcp|udp>")
+		// #3628: shared SSOT selector list (policymatch) — advertise every
+		// selector the request parser accepts, including icmp-type/icmp-code and
+		// protocol by name or number.
+		fmt.Println(policymatch.MatchPoliciesUsage)
 		return nil
 	}
 

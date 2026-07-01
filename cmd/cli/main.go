@@ -523,8 +523,9 @@ func (c *ctl) testPolicy(args []string) error {
 	}
 
 	if fromZone == "" || toZone == "" {
-		fmt.Println("usage: test policy from-zone <zone> to-zone <zone>")
-		fmt.Println("       source-ip <ip> destination-ip <ip> source-port <port> destination-port <port> protocol <tcp|udp>")
+		// #3628: shared SSOT selector list (policymatch) so the remote and local
+		// surfaces advertise the same complete selector set the parser accepts.
+		fmt.Println(policymatch.TestPolicyUsage)
 		return nil
 	}
 

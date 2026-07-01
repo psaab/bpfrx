@@ -66,4 +66,11 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   is now ALWAYS non-nil — with no live state (no provider / early boot) it binds
   a nil state map, which fails closed so scheduled policies are simulated as
   INACTIVE (matching the dataplane's nil-state => dropped) rather than certified
-  as-if-active.
+  as-if-active. #3628: the usage/help text these commands print when
+  from-zone/to-zone are missing is the shared SSOT constant
+  `policymatch.MatchPoliciesUsage` / `TestPolicyUsage`, so the four surfaces
+  (local + remote CLI, show + test) advertise the SAME selectors the parsers
+  accept — `source-port`, `destination-port`, `icmp-type`, `icmp-code`, and
+  `protocol` by name OR 0-255 number — instead of the stale, drifted
+  `protocol <tcp|udp>`-only subset that hid the ICMP / source-port / non-TCP-UDP
+  selectors from operators.

@@ -171,6 +171,46 @@ func ValidateProtocol(proto string) error {
 	return nil
 }
 
+// matchPoliciesUsageTail is the SINGLE source of truth for the selector list
+// advertised by the match-policies / test-policy simulators (#3628). It is the
+// text printed after the command-specific "usage: ..." prefix and is shared by
+// all four surfaces: the local CLI (pkg/cli) `show security match-policies` +
+// `test policy`, and the remote CLI (cmd/cli) equivalents.
+//
+// Before #3628 each surface printed its own hard-coded copy. Those copies had
+// already drifted (the local `show security match-policies` advertised only
+// `source-ip destination-ip destination-port protocol <tcp|udp>` while the
+// remote surface also listed `source-port`) and, more importantly, ALL FOUR
+// hid the icmp-type/icmp-code and non-TCP/UDP protocol selectors that every
+// surface actually parses (ParsePort, ParseICMPValue, ValidateProtocol). An
+// operator debugging an ICMP, source-port-constrained, or gre/esp/ospf policy
+// would omit the required selector and read a false no-match / wrong verdict
+// from a firewall debug tool that hid valid inputs.
+//
+// The block lists every selector the parsers accept, with concrete TCP / UDP /
+// ICMP / ICMPv6 examples, and notes that protocol takes a name or a 0-255
+// number. from-zone and to-zone are the only required selectors.
+const matchPoliciesUsageTail = ` from-zone <zone> to-zone <zone>
+       [source-ip <ip>] [destination-ip <ip>]
+       [source-port <0-65535>] [destination-port <0-65535>]
+       [protocol <name|number>]   tcp, udp, icmp, icmp6, gre, esp, ospf, ... or 0-255
+       [icmp-type <0-255>] [icmp-code <0-255>]
+       from-zone and to-zone are required; an omitted selector matches any.
+       examples:
+         ... protocol tcp destination-port 443
+         ... protocol udp source-port 53 destination-port 53
+         ... protocol icmp icmp-type 8 icmp-code 0    (IPv4 echo request)
+         ... protocol icmp6 icmp-type 128             (IPv6 echo request)`
+
+// MatchPoliciesUsage is the full usage/help block printed by `show security
+// match-policies` when the required from-zone/to-zone selectors are missing
+// (#3628).
+const MatchPoliciesUsage = "usage: show security match-policies" + matchPoliciesUsageTail
+
+// TestPolicyUsage is the full usage/help block printed by `test policy` when
+// the required from-zone/to-zone selectors are missing (#3628).
+const TestPolicyUsage = "usage: test policy" + matchPoliciesUsageTail
+
 // Query is a 5-tuple policy-simulation request. A nil SrcIP/DstIP or an empty
 // Protocol means "unspecified" — the corresponding match dimension is not
 // constrained (the established diagnostic behavior). A zero SrcPort/DstPort

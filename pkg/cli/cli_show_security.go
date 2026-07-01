@@ -445,8 +445,11 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	}
 
 	if fromZone == "" || toZone == "" {
-		fmt.Println("usage: show security match-policies from-zone <zone> to-zone <zone>")
-		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		// #3628: the selector list is the shared SSOT in policymatch so all four
+		// match-policies / test-policy surfaces advertise the same selectors the
+		// parser accepts (source-port, icmp-type/icmp-code, protocol by name or
+		// number), not the stale tcp|udp-only subset.
+		fmt.Println(policymatch.MatchPoliciesUsage)
 		return nil
 	}
 
