@@ -25563,3 +25563,30 @@ top.
     entry + dedup + INFO recovery via slog capture), pkg/api/
     metrics_host_inbound_addressless_3698_test.go (gauge emitted with dataplane
     unloaded, scoped zone absent, nil-store no-panic)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3711 fail-closed on malformed v3 policy literals +
+    address-book prefixes (HIGH security fail-open; v3 sibling of #3367).
+    `parse_v3_literal_set` and the address-book builder used a non-reporting
+    family-agnostic parser that SILENTLY dropped an unparseable token → the
+    v3 side / book collapsed to MatchNone → a `deny <malformed>` rule matched
+    nothing and fell through to default-permit (fail-OPEN). Fixed to REPORT
+    and reject the whole snapshot: v3 literals →
+    `SnapshotIntegrityError::UnrepresentableV3Address`; book prefixes →
+    `UnrepresentableAddressBookPrefix` (also ENFORCES declared family, M02 —
+    a wrong-family token is rejected, not routed to the other family).
+    `__unsupported_address__` sentinel (#3261) still checked first. Replaced
+    the non-reporting `parse_literal_cidr_into` with the reporting
+    family-scoped `parse_book_prefix_into`.
+  - **File(s)**: userspace-dp/src/policy.rs (enum variants + Display arms,
+    parse_v3_literal_set reporting, parse_book_prefix_into, book loop +
+    rule loop rejects, doc-comment rewording)
+  - **Action**: RED-on-revert tests — malformed v3 source/dest literal +
+    malformed book prefix + wrong-family (v6-in-v4, v4-in-v6) all reject;
+    sentinel still wins; valid v3 literal + valid book still enforce the
+    deny. Updated 3 pre-existing excluded-empty tests that relied on the
+    now-removed silent-drop to use valid empty-string tokens (M09).
+  - **File(s)**: userspace-dp/src/policy_tests.rs
+  - **Action**: Documented the malformed-address fail-closed family.
+  - **File(s)**: docs/userspace-dataplane-architecture.md,
+    userspace-dp/src/FEATURES.md

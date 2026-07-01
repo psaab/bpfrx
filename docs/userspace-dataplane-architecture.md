@@ -600,6 +600,31 @@ supports protocol + port ranges. `rule.inactive` is the policy-scheduler result
 published by the Go daemon; inactive scheduled rules are skipped before any
 match side effects or counters.
 
+**Malformed-address fail-closed (#3367 legacy, #3711 v3 + books).** Every
+address parse path in the snapshot builder REPORTS an unparseable token and
+fails the WHOLE snapshot closed rather than silently dropping it. Silent-drop is
+a security fail-OPEN: a v3-shaped rule side and a book entry both use the
+`from_v3_literals` factory (empty → `MatchNone`), so an all-dropped side
+collapses to `MatchNone` — a `deny <malformed>` rule then matches nothing and
+evaluation falls through to a later permit / default-permit. The legacy
+`source_addresses` / `destination_addresses` field is reported by
+`parse_legacy_address_set` → `SnapshotIntegrityError::UnrepresentableLegacyAddress`
+(#3367; note the legacy empty→`MatchAny` convention makes an all-malformed
+legacy list widen a deny to match-all — the inverse fail-open, same reject). The
+v3 `source_literals` / `destination_literals` field is reported by
+`parse_v3_literal_set` → `UnrepresentableV3Address` (#3711). The address-book
+`prefixes_v4` / `prefixes_v6` arrays are parsed by `parse_book_prefix_into` →
+`UnrepresentableAddressBookPrefix` (#3711), which additionally ENFORCES the
+declared family (M02): a wrong-family token — e.g. an IPv6 CIDR placed in
+`prefixes_v4` by a corrupt / mixed-version producer — is rejected instead of
+being silently routed into the opposite family's set. The `__unsupported_address__`
+sentinel preflight (`UnrepresentableAddress`, #3261) is checked FIRST, so the
+more-specific "undefined book / non-literal value" diagnostic wins over the
+generic malformed-literal error for the token the Go gate emits. A normal Go
+snapshot only ever emits parseable, family-separated literals / `any` / family
+wildcards, so these rejects guard against a corrupt / hand-built / mixed-version
+HA peer-sync snapshot; the preflight keeps the previous good forwarding state.
+
 **Wildcard zone tiers (#3090).** A policy whose `from-zone` or `to-zone` is the
 Junos wildcard `any` is indexed into one of three dedicated lists alongside the
 exact `zone_pair_index`: **from-any** (key = concrete to-zone id), **to-any**
