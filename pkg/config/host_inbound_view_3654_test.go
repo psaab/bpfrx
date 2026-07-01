@@ -182,7 +182,7 @@ func TestRenderInterfaceHostInbound3654(t *testing.T) {
 		},
 	}
 	// Overridden interface: shows zone-level, the override marker, and effective.
-	out := strings.Join(z.RenderInterfaceHostInbound("ge-0/0/9.0", labels), "\n")
+	out := strings.Join(z.RenderInterfaceHostInbound("ge-0/0/9.0", false, labels), "\n")
 	for _, want := range []string{
 		"Host-inbound services: ssh",
 		"Host-inbound interface override on ge-0/0/9.0:",
@@ -193,7 +193,7 @@ func TestRenderInterfaceHostInbound3654(t *testing.T) {
 		}
 	}
 	// A no-stanza zone interface: default-deny posture line.
-	out = strings.Join((&ZoneConfig{}).RenderInterfaceHostInbound("ge-0/0/0.0", labels), "\n")
+	out = strings.Join((&ZoneConfig{}).RenderInterfaceHostInbound("ge-0/0/0.0", false, labels), "\n")
 	if !strings.Contains(out, "Host-inbound: default deny (no stanza)") {
 		t.Errorf("no-stanza diagnostic missing posture line\n%s", out)
 	}

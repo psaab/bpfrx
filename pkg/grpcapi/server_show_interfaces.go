@@ -277,6 +277,15 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 					fmt.Fprintf(&buf, "    Allowed host-inbound protocols: %s\n", strings.Join(hit.Protocols, " "))
 				}
 			}
+			// #3682: flag a management / cluster-control lifeline interface,
+			// which is EXCLUDED from host-inbound deny scoping, so the implicit
+			// exemption is visible on this surface too.
+			if li.zone != nil {
+				ref := fmt.Sprintf("%s.%d", physName, li.unitNum)
+				if config.HostInboundLifelineInterface(ref, config.HostInboundLifelineSet(cfg)) {
+					fmt.Fprintln(&buf, "    Host-inbound: lifeline-exempt (management/fabric, bypasses host-inbound deny)")
+				}
+			}
 
 			// DHCP annotations
 			var unit *config.InterfaceUnit
