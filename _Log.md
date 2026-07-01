@@ -1,3 +1,40 @@
+## 2026-07-01 — #3704 buildZoneSnapshots wire zone id unified onto StableZoneID (completes #3075)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3704 — #3075 moved the compiler/CLI/API/HA-fallback zone-id
+    namespace to the stable name-hash `config.StableZoneID`, but left the LIVE
+    dataplane wire builder `buildZoneSnapshots` (pkg/dataplane/userspace/zones.go)
+    on the legacy sorted-positional `uint16(i + 1)` — a third id call site the
+    #3075 sweep missed. For any >=2-zone config the wire (and thus every
+    session's stored IngressZone/EgressZone, the event-stream delta, and the
+    fabric zone-encoded MAC) diverged from the name-hash namespace everything
+    else uses, causing (a) wrong session zone-name display (positional session
+    id reverse-mapped through the name-hash map -> "zone-N" fallback) and (b)
+    defeated per-RG active/active session-sync ownership
+    (cluster.ShouldSyncZone queried the name-hash zoneRGMap with a positional
+    IngressZone -> always missed -> collapse to the global primary). Fix: assign
+    `config.StableZoneID(name)` in buildZoneSnapshots so the wire id equals
+    CompileResult.ZoneIDs / buildZoneIDs / buildZoneRGMap key by construction —
+    ONE namespace across the compiler, wire/session/HA path, per-RG map, and the
+    display reverse-map. The id is a pure function of the NAME, so a nil zone on
+    one HA peer can no longer shift another zone's id (Codex C131-M01). The Rust
+    side already consumed the wire id name-keyed
+    (zone_name_to_id_from_snapshot / populate_zones), so no dataplane change was
+    needed. Added three RED-on-revert Go tests (wire-id == StableZoneID,
+    session-display reverse-map, per-RG ownership lookup) + a daemon test tying
+    the real buildZoneRGMap + real cluster.ShouldSyncZone to the StableZoneID
+    key space. Validated: go test ./pkg/dataplane/... ./pkg/cluster/...
+    ./pkg/config/... ./pkg/daemon/... green; full `cargo test --release` green
+    (3347 lib + suites, one pre-existing timing-flaky event_stream backlog test
+    passed on rerun); go build ./... clean; RED-on-revert proven by temporarily
+    restoring uint16(i+1) (all three userspace tests failed). HA session-sync
+    change — PARENT must run `make test-failover` before merge.
+  - **File(s)**: pkg/dataplane/userspace/zones.go,
+    pkg/dataplane/userspace/zones_stable_id_3704_test.go (new),
+    pkg/daemon/per_rg_zoneid_3704_test.go (new),
+    userspace-dp/src/test_zone_ids.rs (doc comment),
+    docs/config-schema.md (#3704 note).
+
 ## 2026-07-01 — #3697 stale Rust host-inbound hot-path comments (default-deny drift; M06/L07)
 
 - **Timestamp**: 2026-07-01
