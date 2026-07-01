@@ -329,9 +329,18 @@ How it lands (the `instance-type forwarding` divergence fix):
   master routing) and the instance's kernel table stayed empty, so
   kernel-path FBF silently no-opped while the dataplane steered.
 - **Kernel steering**: the existing PBR machinery emits `ip rule`s
-  (priority band 31000+) matching the term's DSCP/addresses into the
-  instance's table — now populated, so the kernel slow path agrees
-  with the fast path.
+  (priority band 31000+) matching the term's addresses / DSCP /
+  `protocol` / `source-port` / `destination-port` into the instance's
+  table — now populated, so the kernel slow path agrees with the fast
+  path. Protocol and port predicates map onto `FRA_IP_PROTO`,
+  `FRA_SPORT_RANGE` and `FRA_DPORT_RANGE` (#3730). A term carrying a
+  predicate an `ip rule` cannot express (`*-port-except`, `tcp-flags`,
+  `icmp-type`/`icmp-code`, `is-fragment`, `flexible-match-range`, or a
+  DSCP-0 / non-empty address `except` match) FAILS CLOSED: the kernel
+  mirror drops the whole term (fail-safe under-steer to the main table)
+  and marks the build degraded rather than widening a constrained term
+  to an address-only rule that would steer traffic the operator
+  excluded. The userspace fast path still enforces the term exactly.
 - **Dataplane**: filter evaluation returns the term's
   routing-instance; the route lookup targets `ISP-B.inet.0` /
   `ISP-B.inet6.0`, where the snapshot builder files the instance's

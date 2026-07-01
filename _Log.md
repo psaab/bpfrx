@@ -1,3 +1,45 @@
+## 2026-07-01 — #3730 routing/PBR: kernel FBF ip-rule mirror honors L4 predicates + fail-closed on unrepresentable ones
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3730 (MEDIUM, security fail-open widening on the kernel/XDP_PASS
+    path; folds H01/H02/M01-M07/M08/M10). The kernel filter-based-forwarding
+    ip-rule mirror (`buildPBRFromFilter`) derived rules from ONLY the DSCP +
+    source/destination address of a `then routing-instance` term and silently
+    dropped every L4/per-packet predicate. A port+address term (e.g.
+    `destination-port 443 destination-address 203.0.113.10/32 then
+    routing-instance blue`) collapsed to an address-only `to 203.0.113.10/32
+    lookup blue` rule that steered EVERY protocol/port to that host (over-steer,
+    fail-open); a port-only term hit the "no ip-rule-compatible criteria" branch
+    and emitted NO rule (silent under-steer no-op) — neither with a degraded
+    signal. FIX: (1) HONOR the predicates an `ip rule` CAN express — `protocol`
+    → `FRA_IP_PROTO`, `source-port` → `FRA_SPORT_RANGE`, `destination-port` →
+    `FRA_DPORT_RANGE` (via new `pbrTermL4` + folded into the DSCP × src × dst
+    cross-product; multi-value protocol/port sets expand to one rule per value; a
+    range maps to `[lo,hi]`). (2) DEGRADE-SIGNAL fail-closed for predicates an
+    `ip rule` genuinely cannot represent (`*-port-except`, `tcp-flags`,
+    `icmp-type`/`icmp-code`, `is-fragment`, `flexible-match-range`, unknown
+    protocol/proto-0, unparseable port, any unresolved `from` leaf): DROP the
+    whole term (fail-safe under-steer to the main table, never widen to
+    address-only) + record a degraded build error naming filter/term/predicate,
+    mirroring the #3430 DSCP-0 / except pattern. The daemon (`daemon_apply.go`
+    step 3d) already surfaces the returned error via `slog.Warn` (#3430 channel;
+    M08). Named/ranged ports resolve through a new `config.ResolveFilterPortRange`
+    that reuses the `junosServicePorts` SSOT so the kernel mirror and userspace
+    filter path resolve ports identically. RED-on-revert verified by stubbing
+    `pbrTermL4` to the pre-fix behavior: over-steer (address-only rule for
+    tcp-flags/icmp/frag/flex/except), under-steer (port-only 0 rules), protocol
+    not expanded, ports dropped, no degrade error — all new #3730 tests go RED.
+    go test ./pkg/routing/... ./pkg/config/... green; go build ./... green;
+    gofmt + vet clean.
+  - **File(s)**: pkg/routing/rules.go (PBRRule +IPProto/Sport/Dport, PBRPortRange,
+    pbrTermL4 + hasRealString, buildPBRFromFilter honor/degrade, pbrManager.Apply
+    emits FRA_IP_PROTO/SPORT/DPORT, BuildPBRRules doc support-matrix),
+    pkg/config/filter_match_resolve.go (ResolveFilterPortRange SSOT wrapper),
+    pkg/routing/routing_test.go (13 #3730 subtests, RED-on-revert),
+    pkg/daemon/daemon_apply.go (degraded-warn wording + comment),
+    docs/multi-wan.md (kernel-steering support matrix), pkg/routing/README.md
+    (FBF support-matrix note under the 31000 band)
+
 ## 2026-07-01 — #3712 userspace-dp policy: fail-closed on invalid ICMP application field combos
 
 - **Timestamp**: 2026-07-01
