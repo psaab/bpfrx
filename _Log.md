@@ -25647,3 +25647,7 @@ top.
   pkg/daemon/daemon_ddns_surface_a_test.go
   (TestSurfaceAObserverDHCPPublicGate — RED on revert),
   docs/research/ddns-world-class/plan.md (§5.3 public-address gate invariant)
+
+- **Timestamp**: 2026-07-01
+  **Action**: cluster-setup.sh — VM SR-IOV VFs use nictype:sriov (incus-managed) instead of raw type:pci passthrough with out-of-band host-PF VLAN/trust. Fixes the 2026-07-01 loss-cluster LAN de-isolation outage (host-PF VF VLAN was set once at create and cleared on host reboot / PF reset, reverting fw0/fw1 LAN VFs to an untagged trunk → cluster host cut off from the internet). incus now re-applies vlan=3667 (LAN) + security.mac_filtering=false (WAN trunk, RETH vMAC + guest VLAN tagging) on every VM start — durable across VM reboot AND host reboot, no systemd unit / no ip-link bolt-on. Live loss cluster reconfigured + verified (both nodes, failover both directions, 15.4 Gbps WAN forwarding, host→internet 0% loss).
+  **File(s)**: test/incus/cluster-setup.sh

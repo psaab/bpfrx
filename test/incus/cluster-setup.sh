@@ -95,9 +95,13 @@ IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}}"
 LAN_ADDR="${LAN_ADDR:-}"
 LAN_GW="${LAN_GW:-}"
 
-# SR-IOV: PCI passthrough for VM VFs, nictype=sriov for container VFs
-SRIOV_PARENT="${SRIOV_PARENT:-eno6np1}"
-SRIOV_LAN_PARENT="${SRIOV_LAN_PARENT:-}"   # Container LAN: nictype=sriov parent
+# SR-IOV: nictype=sriov for BOTH VM and container VFs. VMs previously used raw
+# type:pci passthrough with the VF VLAN/trust set out-of-band on the host PF,
+# but that host-PF state is cleared on a host reboot / PF reset and nothing
+# re-applied it (the 2026-07-01 LAN de-isolation outage). nictype:sriov makes
+# incus re-apply vlan=/mac_filtering on every VM start — durable + native.
+SRIOV_PARENT="${SRIOV_PARENT:-eno6np1}"      # WAN SR-IOV parent (nictype:sriov)
+SRIOV_LAN_PARENT="${SRIOV_LAN_PARENT:-}"     # LAN SR-IOV parent (nictype:sriov)
 
 # WAN VF PCI addresses per VM (VF_PCI is legacy alias for VF_WAN_PCI)
 if [[ -z "${VF_WAN_PCI+x}" ]]; then
@@ -354,70 +358,39 @@ create_vm() {
 	incus stop "$(r "$vm")" --force
 	sleep 2
 
-	# WAN VF (always present)
-	local wan_pci="${VF_WAN_PCI[$idx]}"
-	info "Adding WAN SR-IOV VF PCI $wan_pci to $vm..."
-	incus config device add "$(r "$vm")" wan-vf pci address="$wan_pci"
+	# WAN VF: incus-managed SR-IOV nic (nictype:sriov), NOT raw type:pci
+	# passthrough. incus re-applies the VF config on EVERY VM start, so the WAN
+	# trunk survives a VM reboot AND a host reboot / PF reset. (The 2026-07-01
+	# outage was a raw type:pci VF whose host-side VLAN/trust was set
+	# out-of-band once at create and lost on the next host boot; nictype:sriov
+	# makes incus own it — no systemd unit, no `ip link set vf` bolt-on.) No
+	# access vlan = trunk, so the guest tags its own VLAN subinterfaces
+	# (reth0.50/reth0.80); security.mac_filtering=false lets the guest set the
+	# RETH virtual MAC — the incus-native equivalent of `ip link set vf trust
+	# on`. incus allocates a free VF on the parent (VF_WAN_PCI is no longer
+	# needed for the VM path).
+	info "Adding WAN SR-IOV nic (parent=$SRIOV_PARENT) to $vm..."
+	incus config device add "$(r "$vm")" wan-vf nic \
+		nictype=sriov parent="$SRIOV_PARENT" security.mac_filtering=false
 
-	# Allow VLAN-tagged traffic from WAN VF guests. The HA lab uses guest
-	# VLAN subinterfaces (e.g. reth0.50/reth0.80), which requires trust on
-	# the passed-through VF.
-	if [[ "${VF_WAN_TRUST}" == "true" && -n "${SRIOV_PARENT:-}" ]]; then
-		local wan_vf_idx=""
-		for vf_path in /sys/class/net/"${SRIOV_PARENT}"/device/virtfn*; do
-			local vf_pci
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				vf_pci=$(ssh "$INCUS_REMOTE" "readlink -f '$vf_path' | xargs basename")
-			else
-				vf_pci=$(readlink -f "$vf_path" | xargs basename)
-			fi
-			if [[ "$vf_pci" == "$wan_pci" ]]; then
-				wan_vf_idx=$(basename "$vf_path" | sed 's/virtfn//')
-				break
-			fi
-		done
-		if [[ -n "${wan_vf_idx:-}" ]]; then
-			info "Setting host WAN VF trust on $SRIOV_PARENT vf $wan_vf_idx ($wan_pci)..."
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_PARENT vf $wan_vf_idx trust on"
-			else
-				sudo ip link set dev "$SRIOV_PARENT" vf "$wan_vf_idx" trust on
-			fi
+	# LAN VF: incus-managed SR-IOV nic with the access VLAN set via incus
+	# (nictype:sriov vlan=), NOT raw type:pci + out-of-band `ip link set vf
+	# vlan`. incus re-applies vlan= on EVERY VM start so the LAN stays isolated
+	# across a VM reboot AND a host reboot / PF reset — the durable,
+	# incus-native fix for the 2026-07-01 LAN de-isolation outage (a raw
+	# type:pci VF's host-PF VLAN was set once at create and cleared on the next
+	# host boot, reverting fw0/fw1's LAN VFs to an untagged trunk and cutting
+	# off the cluster host). Gated on the LAN parent being set (SR-IOV LAN);
+	# vlan= is added only when VF_LAN_VLAN is set (an untagged LAN omits it).
+	# incus allocates a free VF on the parent (VF_LAN_PCI is no longer needed
+	# for the VM path).
+	if [[ -n "${SRIOV_LAN_PARENT:-}" ]]; then
+		local lan_args=(nictype=sriov parent="$SRIOV_LAN_PARENT")
+		if [[ -n "${VF_LAN_VLAN:-}" ]]; then
+			lan_args+=(vlan="$VF_LAN_VLAN")
 		fi
-	fi
-
-	# LAN VF (optional — only if VF_LAN_PCI is configured)
-	if [[ ${#VF_LAN_PCI[@]} -gt 0 ]]; then
-		local lan_pci="${VF_LAN_PCI[$idx]}"
-		info "Adding LAN SR-IOV VF PCI $lan_pci to $vm..."
-		incus config device add "$(r "$vm")" lan-vf pci address="$lan_pci"
-	fi
-
-	# Set host-level VF VLAN for LAN VFs (PCI passthrough doesn't get incus vlan= option)
-	if [[ -n "${VF_LAN_VLAN:-}" && -n "${SRIOV_LAN_PARENT:-}" && ${#VF_LAN_PCI[@]} -gt 0 ]]; then
-		local lan_pci="${VF_LAN_PCI[$idx]}"
-		# Find VF index from PCI address
-		local vf_idx
-		for vf_path in /sys/class/net/"${SRIOV_LAN_PARENT}"/device/virtfn*; do
-			local vf_pci
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				vf_pci=$(ssh "$INCUS_REMOTE" "readlink -f '$vf_path' | xargs basename")
-			else
-				vf_pci=$(readlink -f "$vf_path" | xargs basename)
-			fi
-			if [[ "$vf_pci" == "$lan_pci" ]]; then
-				vf_idx=$(basename "$vf_path" | sed 's/virtfn//')
-				break
-			fi
-		done
-		if [[ -n "${vf_idx:-}" ]]; then
-			info "Setting host VF VLAN $VF_LAN_VLAN on $SRIOV_LAN_PARENT vf $vf_idx ($lan_pci)..."
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_LAN_PARENT vf $vf_idx vlan $VF_LAN_VLAN"
-			else
-				sudo ip link set dev "$SRIOV_LAN_PARENT" vf "$vf_idx" vlan "$VF_LAN_VLAN"
-			fi
-		fi
+		info "Adding LAN SR-IOV nic (parent=$SRIOV_LAN_PARENT${VF_LAN_VLAN:+ vlan=$VF_LAN_VLAN}) to $vm..."
+		incus config device add "$(r "$vm")" lan-vf nic "${lan_args[@]}"
 	fi
 
 	info "Starting VM with VF(s)..."
