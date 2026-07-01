@@ -14,9 +14,16 @@ Source: Codex review 001, M04 (folds L03). Class: design-fork → /research.
 
 ## 1. Status
 
-**PLAN-READY. Recommended path: PATH A — unify the ENABLED (Rust) catalog
-label path onto the SAME binary specificity rule the DISABLED (Go) fallback
-already uses (#2578), then pin agreement with a cross-language parity test.**
+**PLAN-READY (converged r1, 2-of-3). Recommended path: PATH A — unify the
+ENABLED (Rust) catalog label path onto the SAME binary specificity rule the
+DISABLED (Go) fallback already uses (#2578), then pin agreement with a
+cross-language parity test.**
+
+Reviewer convergence: Claude SMR = PLAN-READY (PATH A, 3 folds applied); AGY =
+PLAN-READY (PATH A); Codex = INFRA-BLOCKED (job `task-mr1uyd5f-m6qis0`
+unretrievable — the known shared-session companion fetch-by-id drop; 2-of-3 per
+the /research Codex-infra exception). Full 4-way (incl. Codex + Copilot) runs at
+`/engineer` on the code PR.
 
 The divergence is **real, reachable, and unintended**. It is a **display /
 observability** inconsistency only — it does NOT affect packet
@@ -161,12 +168,20 @@ whole class of "why does the same flow show two names?" confusion.
   `CompiledApplications::matches` (`policy.rs:1452`), a boolean matcher wholly
   independent of the `AppCatalog` label. PATH A does not touch it.
 
-**Reachability:** requires two configured applications overlapping on the same
-protocol where one is protocol-only and one is port-constrained, both present in
-the catalog. With AppID enabled, `CatalogNames(cfg, includeAll=true)` includes
-all predefined + user apps, so both are catalogued. A realistic operator config
-(e.g. a broad `my-tcp { protocol tcp; }` plus a specific
-`my-svc { protocol tcp; destination-port 8443; }`) hits it.
+**Reachability (proven — no commit gate blocks it):** the divergence requires
+two configured applications overlapping on the same protocol where one is
+protocol-only and one is port-constrained, both present in the catalog. The
+commit-time collision gate
+(`pkg/config/compiler_applications_collision.go:79`,
+`validateApplicationNameCollisionsAST`) rejects only DUPLICATE names and
+cross-namespace name conflicts — it does NOT reject two *distinct-named*
+applications overlapping on the same protocol+port. So the §2.2 config
+(`aaa-tcp` protocol-only + `zzz-https` tcp/443) commits cleanly. With AppID
+enabled, `CatalogNames(cfg, includeAll=true)` includes all predefined + user
+apps, so both are catalogued. A realistic operator config (e.g. a broad
+`my-tcp { protocol tcp; }` plus a specific
+`my-svc { protocol tcp; destination-port 8443; }`) hits it. Reachable →
+not a PLAN-KILL. (Confirmed independently by the Claude SMR and AGY reviews.)
 
 ---
 
@@ -262,9 +277,16 @@ alphabetically-first name.**
   `from_snapshot` + `lookup_directional` with the ids `BuildCatalog` would
   assign). Assert the resolved NAME is identical for every fixture row. This is
   the L03 "parity test asserting both agree" the issue asks for and the guard
-  that keeps them from re-diverging. (Engineer-time detail: the Rust side can
-  reconstruct ids deterministically from sorted-name order; the fixture should
-  record the expected id/name so the test is self-checking.)
+  that keeps them from re-diverging.
+  - **Scope (SMR F2):** the fixture apps MUST all be USER apps (present in
+    `cfg.Applications.Applications`), so both paths consider the same set. The
+    predefined-vs-`builtinFallbacks` set-membership gap (S1) is a DISTINCT
+    divergence PATH A does not close; the "classifies identically appid-on vs
+    appid-off" acceptance is therefore scoped to user-app overlaps. Do not put a
+    predefined-only app in the parity fixture or the test will falsely fail.
+  - **Self-describing (SMR N1):** the fixture MUST record the expected app_id
+    AND name per row, so the Rust test does not re-implement the Go sort — a
+    sort bug must not hide identically in both sides.
 
 ### PATH B (REJECTED) — unify disabled onto lowest-id
 
