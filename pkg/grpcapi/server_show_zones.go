@@ -315,6 +315,17 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			SrcAddresses: []string{},
 			DstAddresses: []string{},
 			Applications: []string{},
+			// #3670: mirror the implicit default-policy's own RT_FLOW log intent
+			// (DefaultPolicyLogSessionInit/Close, threaded to the dataplane via
+			// ConfigSnapshot.DefaultLogSessionInit/Close in the #3534 builder)
+			// onto the synthetic row, using the same Log/LogSessionInit/
+			// LogSessionClose fields the configured rows set (#3336). Without
+			// this, structured automation reading GetPolicies sees the
+			// default-deny/permit boundary as unlogged while the dataplane emits
+			// default-verdict session-init/close records.
+			Log:             cfg.Security.DefaultPolicyLogSessionInit || cfg.Security.DefaultPolicyLogSessionClose,
+			LogSessionInit:  cfg.Security.DefaultPolicyLogSessionInit,
+			LogSessionClose: cfg.Security.DefaultPolicyLogSessionClose,
 			// #3623: presence-wrapped; the default row always carries the sentinel.
 			PolicyId: proto.Uint32(dataplane.DefaultPolicySentinelID),
 			RuleId:   dataplane.DefaultPolicyName,
