@@ -466,26 +466,34 @@ func parseEventZoneFilter(s string) (uint16, bool) {
 }
 
 func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
-	cfg := s.store.ActiveConfig()
-	if cfg == nil {
-		// #3375: no active config is the deterministic fail-closed default deny.
-		// Surface the explicit string AND the typed default_used bit (same SSOT
-		// renderer the gRPC surface uses).
-		nilRes := policymatch.Result{DefaultUsed: true, Action: config.PolicyDeny}
-		writeOK(w, MatchPoliciesResult{
-			Action:      nilRes.DisplayAction(),
-			DefaultUsed: true,
-			// #3627 M06: echo the queried zone pair even on the no-config
-			// fail-closed default deny so a stored diagnostic proves which zone
-			// pair produced the verdict.
-			QueriedFromZone: r.URL.Query().Get("from_zone"),
-			QueriedToZone:   r.URL.Query().Get("to_zone"),
-		})
-		return
+	// #3709: validate request grammar BEFORE the cfg == nil verdict so a
+	// malformed / duplicate / missing-zone query fails the SAME way during the
+	// boot window (no active config) as it does once a config is live. Before
+	// this, the cfg == nil branch returned 200 default-deny before ANY grammar
+	// check ran, so `dst_port=abc` or `?from_zone=a&from_zone=b` returned 200 at
+	// boot but 400 once a config existed — inconsistent validation during the
+	// exact window monitors poll.
+	q := r.URL.Query()
+
+	// #3709: reject a DUPLICATE scalar selector (e.g.
+	// `?from_zone=trust&from_zone=dmz`). r.URL.Query().Get returns the FIRST of
+	// repeated values, so REST silently FIRST-won while the CLI/gRPC surfaces
+	// LAST-won — the three surfaces disagreed on WHICH duplicate the simulator
+	// tested, each certifying a verdict for a packet the operator may not have
+	// typed. There is no correct silent pick, so a repeat is a 400, matching the
+	// strict CLI/gRPC parsers (policymatch.ParseSelectorArgs / showTestPolicy).
+	for _, key := range []string{
+		"from_zone", "to_zone", "src_ip", "dst_ip",
+		"src_port", "dst_port", "protocol", "icmp_type", "icmp_code",
+	} {
+		if len(q[key]) > 1 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("selector %q specified more than once", key))
+			return
+		}
 	}
 
-	fromZone := r.URL.Query().Get("from_zone")
-	toZone := r.URL.Query().Get("to_zone")
+	fromZone := q.Get("from_zone")
+	toZone := q.Get("to_zone")
 
 	// #3355 (H06): the CLI surfaces (show security match-policies / test
 	// policy) require BOTH zones; REST accepted a missing zone and evaluated as
@@ -561,6 +569,27 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	icmpCode, err := policymatch.ParseICMPValue(r.URL.Query().Get("icmp_code"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid icmp_code: "+err.Error())
+		return
+	}
+
+	cfg := s.store.ActiveConfig()
+	if cfg == nil {
+		// #3375: no active config is the deterministic fail-closed default deny.
+		// Surface the explicit string AND the typed default_used bit (same SSOT
+		// renderer the gRPC surface uses). #3709: reached only AFTER the grammar
+		// checks above, so a malformed / duplicate / missing-zone query returns
+		// 400 here too — the boot window is now grammar-consistent with the
+		// config-present path, not a 200 default-deny that skips validation.
+		nilRes := policymatch.Result{DefaultUsed: true, Action: config.PolicyDeny}
+		writeOK(w, MatchPoliciesResult{
+			Action:      nilRes.DisplayAction(),
+			DefaultUsed: true,
+			// #3627 M06: echo the queried zone pair even on the no-config
+			// fail-closed default deny so a stored diagnostic proves which zone
+			// pair produced the verdict.
+			QueriedFromZone: fromZone,
+			QueriedToZone:   toZone,
+		})
 		return
 	}
 
