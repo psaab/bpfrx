@@ -33,6 +33,18 @@ type MaskResolver func(ip net.IP) (mask uint8, ok bool)
 // distinct src/dst prefixes for any realistic flow mix yet a hard ceiling.
 const routeMaskCacheMax = 8192
 
+// defaultRouteMaskInflight bounds the number of concurrent BACKGROUND FIB
+// lookups (#3743). resolve() runs inside the EventReader session-close
+// callback; a synchronous RTM_GETROUTE netlink round-trip there stalls the
+// event reader and every other callback behind it (including the trace writer)
+// under netlink latency, and high destination-IP churn turns close handling
+// into a netlink-bound path. So a cache miss no longer blocks: it schedules the
+// lookup on a background goroutine and returns the default immediately. This
+// ceiling caps how many such lookups run at once, so a slow/loaded netlink
+// socket under churn cannot spawn unbounded goroutines — once it is reached,
+// further misses just return the default and are retried on a later flow.
+const defaultRouteMaskInflight = 32
+
 // routeMaskCache caches FIB-match results for a short TTL so the per-flow
 // session-close export path does not issue an RTM_GETROUTE netlink syscall for
 // every record. Flows to the same destination/source prefix are common
@@ -47,8 +59,19 @@ type routeMaskCache struct {
 	// deterministic resolver without touching the kernel routing table.
 	lookup func(ip net.IP) (uint8, bool)
 
-	mu      sync.Mutex
-	entries map[string]routeMaskEntry
+	// maxInflight bounds concurrent background FIB lookups (#3743). 0 selects
+	// defaultRouteMaskInflight. See scheduleLookupLocked.
+	maxInflight int
+
+	mu       sync.Mutex
+	entries  map[string]routeMaskEntry
+	pending  map[string]struct{} // keys with a background lookup in flight (dedup)
+	inflight int                 // count of background lookups currently running
+
+	// afterPopulate, when non-nil, is invoked after each background lookup has
+	// stored its result. Test-only seam for deterministic assertions; nil in
+	// production (the resolve() fast path never touches it).
+	afterPopulate func()
 }
 
 type routeMaskEntry struct {
@@ -66,15 +89,25 @@ func NewRouteMaskResolver(ttl time.Duration) MaskResolver {
 		ttl = 10 * time.Second
 	}
 	c := &routeMaskCache{
-		ttl:     ttl,
-		maxSize: routeMaskCacheMax,
-		lookup:  fibMatchMask,
-		entries: make(map[string]routeMaskEntry),
+		ttl:         ttl,
+		maxSize:     routeMaskCacheMax,
+		maxInflight: defaultRouteMaskInflight,
+		lookup:      fibMatchMask,
+		entries:     make(map[string]routeMaskEntry),
+		pending:     make(map[string]struct{}),
 	}
 	return c.resolve
 }
 
-// resolve implements MaskResolver with caching.
+// resolve implements MaskResolver with caching. It NEVER issues the netlink
+// FIB lookup on the calling goroutine (#3743): resolve() runs inside the
+// EventReader session-close callback, so a synchronous RTM_GETROUTE round-trip
+// would serialize the event reader (and every callback behind it) behind
+// netlink latency. On a fresh cache hit it returns the cached prefix length; on
+// a miss it schedules a bounded, deduplicated background lookup that warms the
+// cache for the NEXT flow to this prefix and returns the safe default (0,
+// false) now. An approximate mask on the first flow to a new prefix is the
+// accepted trade-off for never blocking the shared event-reader path.
 func (c *routeMaskCache) resolve(ip net.IP) (uint8, bool) {
 	if ip == nil {
 		return 0, false
@@ -88,18 +121,71 @@ func (c *routeMaskCache) resolve(ip net.IP) (uint8, bool) {
 
 	c.mu.Lock()
 	if e, found := c.entries[key]; found && now.Before(e.expires) {
+		mask, ok := e.mask, e.ok
 		c.mu.Unlock()
-		return e.mask, e.ok
+		return mask, ok
 	}
+	// Cache miss (or expired): schedule the FIB lookup off this goroutine and
+	// return the default now — do NOT block the callback on netlink.
+	c.scheduleLookupLocked(key, ip16)
 	c.mu.Unlock()
+	return 0, false
+}
 
+// scheduleLookupLocked starts a background FIB lookup for key (the 16-byte
+// string form of an IP) unless one is already in flight for it (dedup) or the
+// concurrent-lookup cap is reached (backpressure — the miss is retried on a
+// later flow rather than piling up goroutines behind a slow netlink socket).
+// ip16 is copied because the caller's slice may be reused after resolve()
+// returns. The caller holds c.mu. #3743.
+func (c *routeMaskCache) scheduleLookupLocked(key string, ip16 net.IP) {
+	if c.lookup == nil {
+		return
+	}
+	if c.pending == nil {
+		c.pending = make(map[string]struct{})
+	}
+	if _, inFlight := c.pending[key]; inFlight {
+		return
+	}
+	limit := c.maxInflight
+	if limit <= 0 {
+		limit = defaultRouteMaskInflight
+	}
+	if c.inflight >= limit {
+		return
+	}
+	c.pending[key] = struct{}{}
+	c.inflight++
+	ipCopy := append(net.IP(nil), ip16...)
+	go c.populate(key, ipCopy)
+}
+
+// populate runs a single background FIB lookup and stores the result so the
+// next flow to this prefix resolves from the warm cache. It is the goroutine
+// body scheduled by scheduleLookupLocked; the netlink round-trip happens here,
+// entirely off the EventReader callback path. #3743.
+func (c *routeMaskCache) populate(key string, ip net.IP) {
 	mask, ok := c.lookup(ip)
-
+	now := time.Now()
 	c.mu.Lock()
+	c.storeLocked(key, mask, ok, now)
+	delete(c.pending, key)
+	if c.inflight > 0 {
+		c.inflight--
+	}
+	after := c.afterPopulate
+	c.mu.Unlock()
+	if after != nil {
+		after()
+	}
+}
+
+// storeLocked bounds the cache then inserts a resolved entry. The caller holds
+// c.mu.
+func (c *routeMaskCache) storeLocked(key string, mask uint8, ok bool, now time.Time) {
 	c.evictLocked(key, now)
 	c.entries[key] = routeMaskEntry{mask: mask, ok: ok, expires: now.Add(c.ttl)}
-	c.mu.Unlock()
-	return mask, ok
 }
 
 // evictLocked bounds the cache before an insert. It is a no-op until the map is

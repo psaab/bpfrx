@@ -28,6 +28,43 @@
   - **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
     docs/research/ddns-world-class/plan.md, _Log.md
 
+## 2026-07-01 — #3743 flowexport: route-mask FIB lookup moved OFF the EventReader session-close callback (async background populate; no synchronous netlink on the hot path)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3743 (MEDIUM, codex-review-158 H10). Route-mask
+    resolution (#2866) issued an `RTM_GETROUTE` netlink syscall
+    SYNCHRONOUSLY inside the EventReader session-close callback
+    (`flowExportCallback`/`ipfixExportCallback` → `ExportSessionClose` →
+    `resolveMasks` → `routeMaskCache.resolve` → `fibMatchMask` on a cache
+    miss). On a miss the netlink round-trip stalled the event reader and
+    every callback behind it (incl. the trace writer); high destination-IP
+    churn thrashed the cache and turned close handling into a netlink-bound
+    path. FIX: `resolve()` never calls netlink on the caller's goroutine —
+    a fresh cache HIT returns the cached prefix length; a MISS returns the
+    safe default (0,false) IMMEDIATELY and schedules a bounded, deduplicated
+    BACKGROUND lookup (`scheduleLookupLocked` → `populate` → `storeLocked`)
+    that warms the cache for the next flow to that prefix. `pending` dedups
+    concurrent misses per IP; `inflight` caps concurrency at
+    `defaultRouteMaskInflight` (32) so a slow netlink socket cannot spawn
+    unbounded goroutines (over-cap misses just return the default and retry
+    on a later flow). Approximate mask (0) on the FIRST flow to a new prefix
+    is the accepted trade-off vs blocking the shared event reader; the
+    common per-host/per-subnet aggregate resolves correctly on the 2nd flow.
+    #3744 (route-mask VRF/table/source-blindness) is a separate design item,
+    out of scope. Tests: 3 RED-on-revert pins
+    (`TestRouteMaskResolveMissDoesNotLookupSynchronously`,
+    `TestExportSessionCloseDoesNotBlockOnFIBLookup` end-to-end,
+    `TestRouteMaskCacheAsyncPopulateAndHit`); the bound/expired-first evict
+    tests now drive `storeLocked` directly (the background populate path).
+    Verified RED on revert to synchronous lookup (both no-block tests time
+    out / return wrong value); `go test -race ./pkg/flowexport/...` +
+    `go test ./pkg/daemon/` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/flowexport/routemask.go (async off-callback resolve +
+    scheduleLookupLocked/populate/storeLocked + inflight/pending fields +
+    defaultRouteMaskInflight), pkg/flowexport/srcmask_dstmask_test.go (3 new
+    RED-on-revert tests + evict tests via storeLocked), pkg/flowexport/README.md
+    (#3743 async off-callback doc)
+
 ## 2026-07-01 — #3742 flowexport: build-before-swap reconcile (transient NewExporter failure no longer disables export; no SESSION_CLOSE lost in the swap window)
 
 - **Timestamp**: 2026-07-01
