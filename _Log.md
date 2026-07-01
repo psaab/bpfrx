@@ -1,3 +1,33 @@
+## 2026-06-30 — #3605 static NAT: scope-differentiated rules coexist (Vec-per-key)
+
+- **Timestamp**: 2026-06-30
+  - **Action**: #3605 — fixed the silent last-write-wins overwrite where two
+    static-NAT rules sharing the same `(external_ip, match-port)` (DNAT) or
+    `(internal_ip, snat_port)` (SNAT) key but differing only by scope (`from
+    zone` / `from interface` / `from routing-instance` / `match
+    source-address`) clobbered each other in the single-entry
+    `FxHashMap<(IpAddr, Option<u16>), StaticNatEntry>`. A packet hitting the
+    lost rule's scope was forwarded UNtranslated (identity leak) or
+    mis-translated with no commit error. Chose Option B (support the
+    feature): Junos supports zone/interface/source-scoped split-horizon
+    static NAT and all the per-candidate scope-gating machinery
+    (`static_scope_ok`, `source_ok`, the `zone_ok` closure) ALREADY existed —
+    only the storage was single-entry. Converted `dnat`/`snat` to
+    `FxHashMap<(IpAddr, Option<u16>), Vec<StaticNatEntry>>` (mirroring the
+    #3031 `blocks` Vec and the sibling `DnatTable`) and added `pick_scoped`,
+    a two-tier match (zone-scoped entry wins over a coexisting wildcard
+    regardless of config order; finer gates AND-ed per candidate). Preserved
+    the port-specific-over-whole-address key precedence. No Go change: the
+    compiler already emits one snapshot per from-scope with no dedup.
+    Validated: full `cargo test --release` green (3318 + 46 + integration, 0
+    failed); 3 new RED-on-revert tests
+    (`static_nat_dnat_scope_differentiated_rules_coexist_3605`,
+    `static_nat_snat_..._3605`, `static_nat_dnat_scoped_rule_wins_over_..._3605`)
+    proven RED (`left: None`) against the origin/master single-entry map,
+    green with the fix.
+  - **File(s)**: userspace-dp/src/nat/static_nat.rs,
+    userspace-dp/src/nat/tests.rs, docs/feature-coverage.md, _Log.md
+
 ## 2026-06-30 — #3291 flowless / non-first-fragment transit policy + input-filter + PBR enforcement
 
 - **Timestamp**: 2026-06-30
