@@ -160,6 +160,21 @@ pub(super) fn build_live_forward_request_from_frame(
         fallback_flow = parse_session_flow_from_meta(meta);
         fallback_flow.as_ref()
     };
+    // #3642: an interface `filter output` matches the POST-NAT on-wire tuple —
+    // Junos applies output firewall filters on the egress interface AFTER NAT
+    // (DNAT pre-route, SNAT post-policy). Derive the egress wire key from the
+    // pre-NAT session key + THIS packet's NAT decision. `decision.nat` is in
+    // apply-to-this-packet form (`rewrite_forwarded_frame_in_place` /
+    // `apply_nat_ipv4/6` write the same rewrite_src/dst to the frame regardless
+    // of direction), so `forward_wire_key` yields the exact egress tuple for
+    // BOTH the forward leg and the reverse/reply leg. For NAT64 the wire key
+    // also carries the egress address family, driving the correct-family
+    // output-filter selection downstream (`resolve_cos_tx_selection_internal`).
+    // The stored `PendingForwardRequest.flow_key` below stays the PRE-NAT key
+    // (CoS flow-bucket hashing / session glue key it consistently with the
+    // in-place fast path).
+    let tx_selection_wire_key =
+        tx_selection_flow.map(|flow| forward_wire_key(&flow.forward_key, decision.nat));
     let cos = precomputed_tx_selection
         .map(|selection| CoSTxSelection {
             queue_id: selection.queue_id,
@@ -172,7 +187,7 @@ pub(super) fn build_live_forward_request_from_frame(
                 forwarding,
                 decision.resolution.egress_ifindex,
                 meta,
-                tx_selection_flow.map(|flow| &flow.forward_key),
+                tx_selection_wire_key.as_ref(),
                 // #2362 fold B: build the fragment-safe per-packet match inputs
                 // from the live frame so a `from { tcp-flags ... } then
                 // forwarding-class X` (or is-fragment / icmp-type) output filter

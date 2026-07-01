@@ -64,6 +64,33 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   IDs, before deciding whether existing sessions need a conservative
   packet-family purge.
 
+  **Interface `filter output` matches the POST-NAT on-wire tuple (#3642).**
+  Junos applies an egress interface output firewall filter AFTER NAT
+  (DNAT pre-route, SNAT post-policy), so the addresses/ports an output
+  filter sees are the TRANSLATED (on-wire) values. On the TX-selection /
+  CoS leg the transit callers therefore feed the classifier the egress
+  wire key — `forward_wire_key(&flow.forward_key, decision.nat)` (see
+  `session/key.rs`) — instead of the raw pre-NAT `forward_key`. This is
+  applied at every TX-selection eval site that owns a NAT decision: the
+  live forward builder (`afxdp/forward_request.rs`), the cached
+  descriptor build (`afxdp/flow_cache.rs`), the ARP/NDP-resolved
+  retransmit (`afxdp/neighbor_dispatch.rs`), and the deferred re-resolve
+  (`afxdp/tx/dispatch/cos.rs`). `decision.nat` is in apply-to-this-packet
+  form — `rewrite_forwarded_frame_in_place` / `apply_nat_ipv4|6` write the
+  same `rewrite_src`/`rewrite_dst` to the frame regardless of direction —
+  so `forward_wire_key` yields the correct egress tuple for BOTH the
+  forward leg and the reverse/reply leg (no separate `reverse_wire_key`
+  is needed at these sites). For NAT64 the wire key also carries the
+  EGRESS address family, so `resolve_cos_tx_selection_*` selects the
+  correct-family output filter from the (post-NAT) key rather than the
+  ingress `meta.addr_family` — a v6→v4 flow evaluates the v4 output
+  filter against the v4 tuple. The pre-NAT `flow_key` is still stored on
+  the pending request for CoS flow-bucket hashing / session glue, so the
+  hash bucketing is unchanged. (An input-filter forwarding-class /
+  three-color policer carried to the TX leg when NO output filter exists
+  is likewise evaluated on the wire key; this is a rare corner and the
+  policer meters the on-wire egress volume.)
+
   **Fall-through terms (`then next term` / modifier-only) (#2544).**
   "First-match-wins" applies only to TERMINATING terms. A term whose
   `then` carries NO terminating action — an explicit `then next term`

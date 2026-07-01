@@ -2837,6 +2837,65 @@ fn classify_generated_reply_counterfactual_trigger_keying_would_misverdict() {
     );
 }
 
+#[test]
+fn output_filter_family_selected_by_egress_key_for_nat64_3642() {
+    // #3642 NAT64: a v6->v4 flow ingresses as IPv6 (meta.addr_family = v6) but
+    // EGRESSES as IPv4. Junos applies the egress interface's output filter AFTER
+    // NAT, so the v4 (post-NAT64) output filter must be selected and matched
+    // against the v4 egress tuple. Transit callers pass the post-NAT wire key
+    // (`forward_wire_key`), whose addr_family is the egress family (v4). The fix
+    // selects the output-filter family from that key rather than the ingress
+    // meta family.
+    //
+    // Fixture: egress ifindex 202 carries a v4 `then discard from
+    // source-address 192.0.2.8` output filter. The egress wire key is v4 with
+    // src 192.0.2.8; the ingress meta is v6.
+    let forwarding = forwarding_with_v4_output_filter(
+        "drop-nat64-src",
+        FirewallTermSnapshot {
+            name: "drop-nat64-src".into(),
+            protocols: vec!["tcp".into()],
+            source_addresses: vec!["192.0.2.8/32".into()],
+            source_constrained: true,
+            action: "discard".into(),
+            ..Default::default()
+        },
+    );
+    // Post-NAT64 egress wire key: IPv4 family, translated v4 src.
+    let egress_wire_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        src_port: 33000,
+        dst_port: 443,
+    };
+    // Ingress metadata is IPv6 (the pre-NAT64 family).
+    let ingress_v6_meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 80,
+        ..Default::default()
+    };
+
+    let sel = resolve_cos_tx_selection_at(
+        &forwarding,
+        202,
+        ingress_v6_meta,
+        Some(&egress_wire_key),
+        TermMatchExtra::default(),
+        0,
+    );
+    assert!(
+        sel.drop,
+        "NAT64 egress is IPv4: the v4 output filter must be selected by the \
+         egress-key family and match the v4 src 192.0.2.8. Selecting by the \
+         ingress meta family (v6) would look up an absent v6 filter and WRONGLY \
+         admit the packet (#3642)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #2330: the POST-TRANSFORM inner-source PTB (NAT64/GRE/WG) must route
 // through the SAME classify_generated_reply contract as the #2301/#2328

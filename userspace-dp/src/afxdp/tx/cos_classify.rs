@@ -108,7 +108,11 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         };
     };
 
-    let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
+    // #3642: select the output-filter family from the (post-NAT) wire key the
+    // caller passes, not `meta.addr_family`. For a NAT64 flow the egress family
+    // differs from the ingress meta family; `flow_key` is already unwrapped to
+    // the egress wire key here, so its `addr_family` is the correct egress one.
+    let is_v6 = flow_key.addr_family as i32 == libc::AF_INET6;
     let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
         &forwarding.filter_state,
         egress_ifindex,
@@ -285,7 +289,19 @@ fn resolve_cos_tx_selection_internal(
     now_ns: Option<u64>,
 ) -> CoSTxSelection {
     let meta = meta.into();
-    let tx_selection_enabled = if meta.addr_family as i32 == libc::AF_INET6 {
+    // #3642: an interface `filter output` is applied on the EGRESS interface
+    // AFTER NAT, so both the filter FAMILY and the matched tuple must be the
+    // POST-NAT (on-wire) ones. Transit callers now pass the post-NAT wire key
+    // (`forward_wire_key`) as `flow_key`; its `addr_family` is the egress family
+    // — identical to `meta.addr_family` except under NAT64, where the packet
+    // changes family. Select the per-family tx-selection gate and the output-
+    // filter family from that key so a NAT64 flow evaluates the correct-family
+    // output filter against the correct-family tuple. Fall back to the ingress
+    // meta family only on the flowless / default-queue path (`flow_key` None).
+    let is_v6 = flow_key
+        .map(|key| key.addr_family as i32 == libc::AF_INET6)
+        .unwrap_or(meta.addr_family as i32 == libc::AF_INET6);
+    let tx_selection_enabled = if is_v6 {
         forwarding.tx_selection_enabled_v6
     } else {
         forwarding.tx_selection_enabled_v4
@@ -302,7 +318,7 @@ fn resolve_cos_tx_selection_internal(
             filter_log: None,
         };
     };
-    let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
+    // `is_v6` derived above from the (post-NAT) egress key, not `meta` (#3642).
     let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
         &forwarding.filter_state,
         egress_ifindex,

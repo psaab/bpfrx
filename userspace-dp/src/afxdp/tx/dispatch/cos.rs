@@ -141,11 +141,19 @@ pub(super) fn resolve_pending_forward_cos_tx_selection(
     // #2362 fold B: the deferred forward request runs after the UMEM frame may
     // have been recycled, so it consumes the per-packet match inputs snapshotted
     // at build time from the live frame rather than re-reading the frame.
+    // #3642: the egress output filter matches the POST-NAT on-wire tuple. The
+    // stored `flow_key` is the PRE-NAT key (kept for CoS flow-bucket hashing),
+    // so derive the egress wire key here from that key + the request's NAT
+    // decision (apply-to-this-packet form, correct for both directions).
+    let tx_selection_wire_key = request
+        .flow_key
+        .as_ref()
+        .map(|key| crate::session::forward_wire_key(key, request.decision.nat));
     resolve_cos_tx_selection_at(
         forwarding,
         request.decision.resolution.egress_ifindex,
         request.meta,
-        request.flow_key.as_ref(),
+        tx_selection_wire_key.as_ref(),
         request.filter_match_extra,
         now_ns,
     )

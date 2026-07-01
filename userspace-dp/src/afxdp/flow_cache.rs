@@ -419,6 +419,14 @@ impl FlowCacheEntry {
         } else {
             owner_rg_for_resolution(forwarding, decision.resolution)
         };
+        // #3642: the egress output firewall filter matches the POST-NAT on-wire
+        // tuple (Junos applies output filters AFTER NAT). Feed the cached
+        // TX-selection the egress wire key derived from the pre-NAT session key
+        // + this flow's NAT decision, not the raw pre-NAT `forward_key`. NAT64
+        // is never cached (`should_cache` excludes it), so this only rewrites
+        // the SNAT/DNAT address/port fields; the cache LOOKUP `key` below stays
+        // the pre-NAT tuple (matched against the parsed ingress flow).
+        let tx_selection_wire_key = forward_wire_key(&flow.forward_key, decision.nat);
         Some(Self {
             key: flow.forward_key.clone(),
             ingress_ifindex: meta.ingress_ifindex as i32,
@@ -447,7 +455,7 @@ impl FlowCacheEntry {
                     forwarding,
                     decision.resolution.egress_ifindex,
                     meta,
-                    Some(&flow.forward_key),
+                    Some(&tx_selection_wire_key),
                 ),
                 nat64: false,
                 // #2652: carry the NPTv6 flag so the descriptor fast path
