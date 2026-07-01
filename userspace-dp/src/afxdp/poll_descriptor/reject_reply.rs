@@ -222,6 +222,39 @@ fn enqueue_reject_reply(
     counters: &mut BatchCounters,
     source: RejectReplySource,
 ) -> bool {
+    // #3656: determine reply-build FEASIBILITY before consuming the shared
+    // REJECT_BUCKET token OR counting a TX-frame-budget drop. A frame that can
+    // NEVER produce a reply — an inbound TCP RST, an inbound ICMP/ICMPv6 error,
+    // a non-first fragment, an L2 group/broadcast frame, an unparseable frame,
+    // or an ingress without a primary of the inbound family — is a PLAIN drop.
+    // Building the reply first (a pure, side-effect-free reflection of the
+    // inbound frame) means such a frame consumes NEITHER the shared per-reason
+    // rate-limit token (H11: a flood of unreplyable frames must not drain the
+    // REJECT_BUCKET and starve legitimate rejects — a cheap DoS against active
+    // reject behavior) NOR a budget-drop counter (H12: an impossible reply
+    // must not be mis-attributed as TX queue pressure and hide the true attack
+    // shape). The token / budget are consumed only once `Some(bytes)` proves an
+    // actual reply exists. This is the residual of #3615, which reordered the
+    // event emit + per-source counter split but left the bucket/budget consume
+    // AHEAD of the build. Orthogonal to #3618 (per-zone bucket design) — the
+    // shared bucket is unchanged; only the CONSUMPTION ORDERING moves. The
+    // extra build under budget/rate pressure is on the already-cold reject
+    // exception path.
+    let bytes = if meta.protocol == PROTO_TCP {
+        build_reject_rst_frame(packet_frame)
+    } else {
+        build_reject_icmp_unreachable(packet_frame, meta, ingress_ifindex, forwarding)
+    };
+    let Some(bytes) = bytes else {
+        // Unreplyable: fail-closed to the silent drop the caller already
+        // performs. The REJECT_BUCKET token and the *_reject_reply_budget_drops
+        // counters are deliberately left untouched here (#3656 H11/H12).
+        return false;
+    };
+
+    // TX-frame budget gate (queue protection). Reached ONLY for a buildable
+    // reply, so a counted budget drop is truthful TX-frame pressure on a real
+    // reply — never a mis-attributed unreplyable frame (#3656 H12).
     if !syn_cookie_reply_budget_available(tx_pipeline) {
         counters.touched = true;
         // #3615 (L04): attribute the TX-frame-budget suppression to the
@@ -243,26 +276,16 @@ fn enqueue_reject_reply(
     // token bucket bounds the generated-error RATE so a flood of rejected
     // flows cannot be amplified into unbounded RST/ICMP backscatter. Both
     // policy and filter reject share this `Reject` bucket (a single emit
-    // path, per the RejectReplySource doc comment). On bucket-empty we
-    // fail-closed to the silent drop the caller already performs and bump the
-    // observable `Reject` rate-limited counter (inside
-    // `allow_generated_error`).
+    // path, per the RejectReplySource doc comment). #3656: the token is
+    // consumed ONLY for a buildable reply (feasibility is proven above), so a
+    // flood of unreplyable frames can no longer drain the shared bucket and
+    // starve legitimate rejects (H11). On bucket-empty we fail-closed to the
+    // silent drop the caller already performs and bump the observable `Reject`
+    // rate-limited counter (inside `allow_generated_error`).
     if !allow_generated_error(GeneratedErrorReason::Reject) {
         counters.touched = true;
         return false;
     }
-
-    let bytes = if meta.protocol == PROTO_TCP {
-        build_reject_rst_frame(packet_frame)
-    } else {
-        build_reject_icmp_unreachable(packet_frame, meta, ingress_ifindex, forwarding)
-    };
-    let Some(bytes) = bytes else {
-        // Unparseable frame, ingress without a primary of the inbound
-        // family, inbound RST/ICMP-error, or a non-first fragment:
-        // fail-closed to the silent drop the caller already performs.
-        return false;
-    };
 
     // #2238: classify the GENERATED reply (TCP RST or ICMP/ICMPv6
     // unreachable) by its OWN egress 5-tuple + egress interface — the
@@ -923,6 +946,13 @@ mod tests {
             rate_limited_count(GeneratedErrorReason::Reject) > before,
             "the rate-limited drop must bump the observable Reject counter"
         );
+        // #3656 H12: a REPLIABLE reply suppressed by the rate limiter is
+        // counted as rate-limited (above), NOT as TX-frame queue pressure — the
+        // budget gate passed, so no budget drop may be attributed to it.
+        assert_eq!(
+            counters.policy_reject_reply_budget_drops, 0,
+            "a rate-limited (buildable) reject must not count a budget drop"
+        );
         // Restore a full bucket so sibling tests in this binary are unaffected.
         reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
     }
@@ -952,6 +982,197 @@ mod tests {
         assert!(!sent, "inbound RST must not be answered");
         assert_eq!(counters.policy_reject_sent, 0);
         assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #3656 H11 fail-on-revert: a frame that can NEVER produce a reply (an
+    /// inbound TCP RST) must NOT consume a token from the shared REJECT_BUCKET.
+    /// Drives the reject path with the bucket EMPTY and the TX budget plentiful:
+    /// on the fixed code the reply-build feasibility check runs first, returns
+    /// None, and short-circuits BEFORE `allow_generated_error`, so the empty
+    /// bucket is never touched and its rate-limited counter does not advance.
+    /// On a revert (token consumed before feasibility), the empty-bucket deny
+    /// bumps the rate-limited counter — turning this RED. This is the H11 DoS:
+    /// a flood of unreplyable frames draining the shared bucket would silently
+    /// downgrade legitimate rejects to drops.
+    #[test]
+    fn unreplyable_reject_does_not_drain_bucket_3656() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+            rate_limited_count, reset_bucket_for_test,
+        };
+        let _g = global_bucket_test_lock();
+        // Pin the refill epoch to the far future then drain, so the call site's
+        // smaller monotonic `now_ns` yields zero refill and the bucket stays
+        // empty across the call (mirrors reject_reply_rate_limited_when_bucket_-
+        // empty). A denied `try_take` does not advance the epoch, so the empty
+        // state survives.
+        let far_future = u64::MAX / 2;
+        reset_bucket_for_test(GeneratedErrorReason::Reject, far_future);
+        while allow_generated_error_at(GeneratedErrorReason::Reject, far_future, 1000, 1000) {}
+        let before = rate_limited_count(GeneratedErrorReason::Reject);
+
+        // Inbound TCP RST => build_reject_rst_frame returns None (unreplyable).
+        let (mut frame, mut meta, flow) = tcp_v4_syn();
+        frame[14 + 20 + 13] = 0x04;
+        meta.tcp_flags = 0x04;
+        // TX budget plentiful — isolates the token-bucket behavior.
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(!sent, "inbound RST is unreplyable");
+        assert_eq!(counters.policy_reject_sent, 0);
+        assert_eq!(
+            rate_limited_count(GeneratedErrorReason::Reject),
+            before,
+            "an unreplyable frame must not consume a REJECT_BUCKET token (H11)"
+        );
+        // H12: and it must not be mis-attributed as TX-frame budget pressure.
+        assert_eq!(
+            counters.policy_reject_reply_budget_drops, 0,
+            "an unreplyable frame must not count a budget drop"
+        );
+        assert!(pipeline.pending_tx_local.is_empty());
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+    }
+
+    /// #3656 H12 fail-on-revert: a frame that can never produce a reply must
+    /// NOT be counted as a TX-frame-budget drop. Drives the reject path with an
+    /// inbound TCP RST (unreplyable) and the TX budget EXHAUSTED (zero
+    /// max-pending). On the fixed code the reply-build feasibility check runs
+    /// FIRST, returns None, and short-circuits BEFORE the budget gate, so no
+    /// budget drop is counted for a reply that could never have existed. On a
+    /// revert (budget checked before feasibility), the exhausted budget bumps
+    /// `policy_reject_reply_budget_drops` here — hiding the true attack shape
+    /// as queue pressure — turning this RED.
+    #[test]
+    fn unreplyable_reject_does_not_count_budget_drop_3656() {
+        let (mut frame, mut meta, flow) = tcp_v4_syn();
+        // Inbound TCP RST => unreplyable.
+        frame[14 + 20 + 13] = 0x04;
+        meta.tcp_flags = 0x04;
+        // Zero max-pending => TX budget exhausted.
+        let mut pipeline = tx_pipeline(0, 64);
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(!sent, "inbound RST is unreplyable");
+        assert_eq!(
+            counters.policy_reject_reply_budget_drops, 0,
+            "an unreplyable frame must not be mis-attributed as budget pressure (H12)"
+        );
+        assert_eq!(counters.policy_reject_sent, 0);
+        assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #3656 fail-on-revert (non-first-fragment variant): a non-first IPv4
+    /// fragment has no transport header to quote, so `build_reject_icmp_-
+    /// unreachable` (`can_generate_icmp_error_reply`) returns None — the frame
+    /// is unreplyable. It must consume neither the shared REJECT_BUCKET token
+    /// nor a budget drop. Runs with the TX budget EXHAUSTED so a reverted
+    /// budget-before-feasibility order would count a budget drop (RED). The
+    /// FILTER entry point is exercised here to cover both counter families.
+    #[test]
+    fn unreplyable_non_first_fragment_reject_untouched_3656() {
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+            rate_limited_count, reset_bucket_for_test,
+        };
+        let _g = global_bucket_test_lock();
+        // Empty the shared bucket (far-future epoch drain) so a reverted token-
+        // before-feasibility order would deny + bump the rate-limited counter.
+        let far_future = u64::MAX / 2;
+        reset_bucket_for_test(GeneratedErrorReason::Reject, far_future);
+        while allow_generated_error_at(GeneratedErrorReason::Reject, far_future, 1000, 1000) {}
+        let before = rate_limited_count(GeneratedErrorReason::Reject);
+
+        let client = std::net::Ipv4Addr::new(10, 0, 61, 102);
+        let server = std::net::Ipv4Addr::new(1, 1, 1, 1);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]);
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        // IPv4 header with a non-zero fragment offset (0x0001) => non-first
+        // fragment => can_generate_icmp_error_reply() == false => build None.
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x12, 0x34, 0x00, 0x01, 64, PROTO_ICMP, 0, 0,
+        ]);
+        frame.extend_from_slice(&client.octets());
+        frame.extend_from_slice(&server.octets());
+        frame.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // fragment payload
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: std::net::IpAddr::V4(client),
+            dst_ip: std::net::IpAddr::V4(server),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: std::net::IpAddr::V4(client),
+                dst_ip: std::net::IpAddr::V4(server),
+                src_port: 0,
+                dst_port: 0,
+            },
+        };
+        // Zero max-pending => TX budget exhausted (drives the H12 leg too).
+        let mut pipeline = tx_pipeline(0, 64);
+        // An egress primary would be needed to BUILD an ICMP unreachable, but a
+        // non-first fragment is rejected before the family build, so omit it.
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_filter_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(!sent, "a non-first fragment is unreplyable");
+        assert_eq!(counters.filter_reject_sent, 0);
+        assert_eq!(
+            counters.filter_reject_reply_budget_drops, 0,
+            "a non-first fragment must not count a filter budget drop (H12)"
+        );
+        assert_eq!(
+            counters.policy_reject_reply_budget_drops, 0,
+            "a non-first fragment must not count a policy budget drop (H12)"
+        );
+        assert_eq!(
+            rate_limited_count(GeneratedErrorReason::Reject),
+            before,
+            "a non-first fragment must not drain the REJECT_BUCKET (H11)"
+        );
+        assert!(pipeline.pending_tx_local.is_empty());
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
     }
 
     /// #3071: an ICMP echo (non-TCP) frame for the zone-tcp-rst tests. Reused

@@ -1,3 +1,44 @@
+## 2026-07-01 — #3656 reject reply: build-feasibility BEFORE token/budget consume (H11/H12)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3656 — the reject/deny reply path consumed the shared #2472
+    `REJECT_BUCKET` rate-limit token AND counted the TX-frame budget drop
+    BEFORE it knew whether a reply frame could actually be built. So an
+    UNREPLYABLE frame (inbound TCP RST, inbound ICMP/ICMPv6 error, non-first
+    fragment, L2 group/broadcast, unparseable frame, ingress without a primary
+    of the inbound family) still (H11) drained the shared bucket — a flood of
+    such frames silently downgraded legitimate rejects to drops (cheap DoS) —
+    and (H12) counted a `*_reject_reply_budget_drops` for a reply that could
+    never exist, mis-attributing malformed/unreplyable traffic as TX queue
+    pressure. This was the residual of #3615 (which reordered the event emit +
+    per-source counter split but NOT the bucket/budget consume vs build).
+    FIX: reordered `enqueue_reject_reply` so reply-build FEASIBILITY runs first
+    (build → `Some(bytes)`); the TX-frame budget gate and
+    `allow_generated_error(Reject)` token consume are reached ONLY for a
+    buildable reply. An unreplyable frame is now a PLAIN drop consuming neither
+    the token nor a budget-drop counter. #3615's per-source counter attribution
+    (`policy_reject_*` / `filter_reject_*`) and #2238/#3035 output-filter
+    classify are preserved and still run after the gates. Orthogonal to #3618
+    (per-zone bucket design, deferred) — the shared bucket is unchanged; only
+    the CONSUMPTION ORDERING moved. No wire/counter format change (existing
+    counters, reordered increment points) → no fixture regen.
+  - **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs`
+    (reorder + 3 new fail-on-revert tests:
+    `unreplyable_reject_does_not_drain_bucket_3656`,
+    `unreplyable_reject_does_not_count_budget_drop_3656`,
+    `unreplyable_non_first_fragment_reject_untouched_3656`; augmented
+    `reject_reply_rate_limited_when_bucket_empty` to assert a rate-limited
+    buildable reply counts NO budget drop),
+    `userspace-dp/src/afxdp/poll_descriptor/filter.rs`
+    (`filter_terminal_budget_suppressed_reject_logs_deny` now drives a
+    parseable SYN — the old empty-frame case relied on the pre-#3656
+    suppress-before-parse ordering and is now correctly an unreplyable PLAIN
+    drop with no budget drop), `docs/pr/2089-reject-action/plan.md` (§4.2
+    #3656 consumption-ordering update note).
+  - **Validation**: targeted `cargo test --release reject_reply` = 21/21 pass;
+    RED-on-revert verified (all 3 new tests FAIL when build is moved back after
+    the gates); FULL `cargo test --release` = 3346 lib + 46/8/16/1 integration
+    tests, 0 failed.
 ## 2026-07-01 — #3653 align host_inbound_configured posture bit with #3405 dataplane default-deny
 
 - **Timestamp**: 2026-07-01

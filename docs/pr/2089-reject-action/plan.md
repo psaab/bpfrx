@@ -240,6 +240,39 @@ Behavior:
    build/budget failure return `false` (caller still recycles + drops
    — fail-closed).
 
+> **#3656 update (consumption ordering).** Steps 1-2 above are now
+> **reordered**: reply-build FEASIBILITY (step 2) runs BEFORE the
+> TX-frame budget gate and the #2472 `REJECT_BUCKET` token consumption
+> (step 1). The reject/deny path is now:
+>
+>   build (`build_reject_rst_frame` / `build_reject_icmp_unreachable`)
+>   → `Some(bytes)` proves an actual reply exists
+>   → TX-frame budget gate (counts `*_reject_reply_budget_drops`)
+>   → `allow_generated_error(Reject)` token consume
+>   → #2238/#3035 output-filter classify → enqueue.
+>
+> Rationale: a frame that can never produce a reply — an inbound TCP
+> RST, an inbound ICMP/ICMPv6 error, a non-first fragment, an L2
+> group/broadcast frame, an unparseable frame, or an ingress without a
+> primary of the inbound family — is a PLAIN drop. It must consume
+> **neither** the shared per-reason rate-limit token (H11: a flood of
+> unreplyable frames draining the shared `REJECT_BUCKET` would silently
+> downgrade legitimate subsequent rejects to drops — a cheap DoS)
+> **nor** a `*_reject_reply_budget_drops` counter (H12: mis-attributing
+> an impossible reply as TX queue pressure hides the true attack shape).
+> A budget drop / token consume / rate-limited count is now recorded
+> only for a reply that could actually have been built. This is the
+> residual of #3615 (which reordered the event emit + per-source counter
+> split but left the bucket/budget consume ahead of the build) and is
+> orthogonal to #3618 (per-zone bucket design) — the shared bucket is
+> unchanged; only the consumption ORDERING moves. The extra build under
+> budget/rate pressure is on the already-cold reject exception path.
+> Enforced by `enqueue_reject_reply` in
+> `userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs`; fail-on-revert
+> tests: `unreplyable_reject_does_not_drain_bucket_3656`,
+> `unreplyable_reject_does_not_count_budget_drop_3656`,
+> `unreplyable_non_first_fragment_reject_untouched_3656`.
+
 ### 4.3 Trigger sites
 
 There are three policy-deny code paths in

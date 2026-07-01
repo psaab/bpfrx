@@ -886,8 +886,12 @@ mod filter_terminal_tests {
         }
     }
 
-    /// TX-frame budget exhausted → the reject reply is suppressed BEFORE the
-    /// frame is ever parsed, so an empty frame is fine here.
+    /// TX-frame budget exhausted → a BUILDABLE reject reply is suppressed and
+    /// counted as budget pressure. #3656: a budget drop is now attributed only
+    /// once reply-build feasibility is proven, so this must drive a real,
+    /// parseable TCP SYN (an unparseable/empty frame would be an unreplyable
+    /// PLAIN drop that counts NO budget drop — see
+    /// `unreplyable_reject_does_not_count_budget_drop_3656` in reject_reply.rs).
     #[test]
     fn filter_terminal_budget_suppressed_reject_logs_deny() {
         let (handle, rx) = event_handle();
@@ -895,9 +899,35 @@ mod filter_terminal_tests {
         let forwarding = ForwardingState::default();
         let mut counters = BatchCounters::default();
         let flow = v4_flow(PROTO_TCP);
+        // A reflected TCP RST is self-contained (build_reject_rst_frame reflects
+        // the inbound frame), so a minimal parseable SYN suffices to make the
+        // reply FEASIBLE before the budget gate suppresses it.
+        let src = Ipv4Addr::new(192, 0, 2, 10);
+        let dst = Ipv4Addr::new(198, 51, 100, 20);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6, 0x08, 0x00,
+        ]);
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x28, 0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        frame.extend_from_slice(&49152u16.to_be_bytes());
+        frame.extend_from_slice(&22u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xfa, 0xf0, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
         let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 54,
             protocol: PROTO_TCP,
+            tcp_flags: 0x02,
             addr_family: libc::AF_INET as u8,
+            pkt_len: (frame.len() - 14) as u16,
             ..UserspaceDpMeta::default()
         };
         let drop = filter_terminal(
@@ -905,7 +935,7 @@ mod filter_terminal_tests {
             &forwarding,
             Some(&handle),
             5,
-            &[],
+            &frame,
             meta,
             &flow,
             &mut counters,
