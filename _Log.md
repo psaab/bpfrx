@@ -25788,6 +25788,32 @@ top.
   **File(s)**: test/incus/cluster-setup.sh
 
 - **Timestamp**: 2026-07-01
+  **Action**: #3766 — same-plan runtime-snapshot refresh made a FALLIBLE
+  ATOMIC SWAP (fail-closed). The same-plan `apply_snapshot` leg
+  (`refresh_runtime_snapshot{,_disarmed,_inner}`) previously bumped
+  `self.validation` (H2) and rotated/deleted the neighbor-manager keys (H3)
+  BEFORE the fallible `build_forwarding_state`, then swallowed a build error
+  with a bare `return` while the handler still reported `ok=true` (M1) and
+  persisted the rejected snapshot as the boot baseline. Fix mirrors the full-
+  reconcile invariant (#2484 `build_reconcile_forwarding`): build the new
+  forwarding state FIRST; only after it succeeds do the validation bump,
+  neighbor-key rotation, forwarding swap, and shared_validation/ha.forwarding
+  publishes run. `_inner` now returns `Result<(), SnapshotIntegrityError>`; on
+  any integrity error nothing mutates and the error propagates. The handler
+  (`server/handlers/snapshot.rs`) observes the Result, restores the status-
+  reporting generation/capabilities bumped at the top of `apply`, sets
+  `response.ok=false`, and does NOT `persist_state`. All ~40 existing
+  `refresh_runtime_snapshot` test call sites updated to `.expect(...)`.
+  RED-on-revert proven: restoring the pre-build mutation makes
+  `validation.config_generation` publish 9 vs 7 (split-brain), and swallowing
+  the build error (`return Ok(())`) makes the handler report ok=true + persist
+  the reject. Full `cargo test --release` green (3433 tests, 0 failed).
+  **File(s)**: userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/server/handlers/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs (call sites + regression test),
+  userspace-dp/src/afxdp/forwarding/tests.rs (call sites),
+  userspace-dp/src/server/tests.rs (handler regression test),
+  userspace-dp/src/afxdp/coordinator/README.md (fail-closed atomic-swap invariant)
   **Action**: #3757 — ip-monitoring route-overlay actuator: fix the split-FIB
   fail-open (folds M1/H1/H2/H3). ROOT (M1): the ipmon engine cleared its
   `dirtySince` bit BEFORE calling the actuator, and the actuator returned

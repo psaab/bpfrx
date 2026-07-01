@@ -534,17 +534,19 @@ fn manager_neighbor_replace_preserves_packet_learned_entries() {
 fn manager_neighbor_replace_overrides_snapshot_neighbor_entry() {
     let mut coordinator = Coordinator::new();
     let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
-    coordinator.refresh_runtime_snapshot(&ConfigSnapshot {
-        neighbors: vec![NeighborSnapshot {
-            ifindex: 13,
-            family: "inet".to_string(),
-            ip: target.to_string(),
-            mac: "00:11:22:33:44:55".to_string(),
-            state: "reachable".to_string(),
+    coordinator
+        .refresh_runtime_snapshot(&ConfigSnapshot {
+            neighbors: vec![NeighborSnapshot {
+                ifindex: 13,
+                family: "inet".to_string(),
+                ip: target.to_string(),
+                mac: "00:11:22:33:44:55".to_string(),
+                state: "reachable".to_string(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }],
-        ..Default::default()
-    });
+        })
+        .expect("refresh_runtime_snapshot must succeed");
 
     let before = lookup_neighbor_entry(
         &coordinator.forwarding,
@@ -580,17 +582,19 @@ fn manager_neighbor_replace_overrides_snapshot_neighbor_entry() {
 fn manager_neighbor_replace_removes_snapshot_seeded_neighbor_entry() {
     let mut coordinator = Coordinator::new();
     let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
-    coordinator.refresh_runtime_snapshot(&ConfigSnapshot {
-        neighbors: vec![NeighborSnapshot {
-            ifindex: 13,
-            family: "inet".to_string(),
-            ip: target.to_string(),
-            mac: "00:11:22:33:44:55".to_string(),
-            state: "reachable".to_string(),
+    coordinator
+        .refresh_runtime_snapshot(&ConfigSnapshot {
+            neighbors: vec![NeighborSnapshot {
+                ifindex: 13,
+                family: "inet".to_string(),
+                ip: target.to_string(),
+                mac: "00:11:22:33:44:55".to_string(),
+                state: "reachable".to_string(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }],
-        ..Default::default()
-    });
+        })
+        .expect("refresh_runtime_snapshot must succeed");
 
     coordinator.apply_manager_neighbors(true, &[]);
 
@@ -625,7 +629,7 @@ fn refresh_runtime_snapshot_clears_old_manager_neighbor_cache_entries() {
             .contains_key(&(13, target))
     );
 
-    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default()).expect("refresh_runtime_snapshot must succeed");
 
     assert!(
         !coordinator

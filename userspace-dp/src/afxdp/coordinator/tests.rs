@@ -568,7 +568,7 @@ fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
         dscp_rewrite_rules: vec![],
     });
 
-    coordinator.refresh_runtime_snapshot(&snapshot);
+    coordinator.refresh_runtime_snapshot(&snapshot).expect("refresh_runtime_snapshot must succeed");
 
     assert_eq!(
         coordinator.cos_owner_worker_by_queue.get(&(80, 0)),
@@ -2391,12 +2391,12 @@ fn wg1866_wait_tombstone(coordinator: &mut Coordinator, id: u16, timeout_ms: u64
 fn wg1866_removal_refresh_prunes_thread_and_releases_port() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51871;
-    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4242, "wgt1866a", port, WG1866_PRIVKEY_A));
+    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4242, "wgt1866a", port, WG1866_PRIVKEY_A)).expect("refresh_runtime_snapshot must succeed");
     assert!(
         coordinator.wg_control_threads.contains_key(&1),
         "WG control entry created on snapshot with WG endpoint"
     );
-    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default()).expect("refresh_runtime_snapshot must succeed");
     assert!(
         coordinator.wg_control_threads.is_empty(),
         "removal refresh must prune the entry (stop+join)"
@@ -2421,7 +2421,7 @@ fn wg1866_eaddrinuse_tombstone_backoff_and_retry() {
     // for BOTH of bind_wg_socket's attempts (v6 preferred, v4 fallback).
     let blocker = std::net::UdpSocket::bind(("::", port)).expect("pre-bind");
     let snap = wg1866_snapshot(1, 4242, "wgt1866b", port, WG1866_PRIVKEY_A);
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(
         coordinator.wg_control_threads.contains_key(&1),
         "spawn attempt recorded even though bind will fail"
@@ -2469,11 +2469,11 @@ fn wg1866_remove_then_readd_same_identity_respawns() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51873;
     let snap = wg1866_snapshot(1, 4242, "wgt1866c", port, WG1866_PRIVKEY_A);
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.wg_control_threads.contains_key(&1));
-    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default()).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.wg_control_threads.is_empty());
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator
         .wg_control_threads
         .get(&1)
@@ -2489,7 +2489,7 @@ fn wg1866_sweep_cannot_spawn_after_stop() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51874;
     let snap = wg1866_snapshot(1, 4242, "wgt1866d", port, WG1866_PRIVKEY_A);
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.wg_control_threads.contains_key(&1));
     coordinator.stop();
     assert!(coordinator.wg_control_threads.is_empty(), "stop clears entries");
@@ -2510,7 +2510,7 @@ fn wg1866_defer_prune_releases_port_and_sweep_does_not_resurrect() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51875;
     let snap = wg1866_snapshot(1, 4242, "wgt1866e", port, WG1866_PRIVKEY_A);
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.wg_control_threads.contains_key(&1));
     // Defer-branch apply removed the endpoint: narrow prune only.
     let removed = ConfigSnapshot::default();
@@ -2544,7 +2544,7 @@ fn wg1866_sweep_suppresses_stale_identity_respawn_under_defer() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51876;
     let snap_a = wg1866_snapshot(1, 4242, "wgt1866f", port, WG1866_PRIVKEY_A);
-    coordinator.refresh_runtime_snapshot(&snap_a);
+    coordinator.refresh_runtime_snapshot(&snap_a).expect("refresh_runtime_snapshot must succeed");
     assert!(wg1866_wait_tombstone(&mut coordinator, 1, 2_000), "open_tun failure tombstones");
     // Defer window: stored snapshot re-keys id 1 to identity B while
     // forwarding still holds identity A. Force past the backoff.
@@ -2562,7 +2562,7 @@ fn wg1866_sweep_suppresses_stale_identity_respawn_under_defer() {
     );
     // The coherent apply with B then restarts cleanly (engine changed
     // => stale prune => fresh spawn).
-    coordinator.refresh_runtime_snapshot(&snap_b);
+    coordinator.refresh_runtime_snapshot(&snap_b).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator.wg_control_threads.get(&1).expect("entry after B apply");
     assert!(entry.handle.is_some(), "identity B spawns at the coherent apply");
 }
@@ -2575,7 +2575,7 @@ fn wg1866_sweep_suppresses_stale_attachment_respawn_under_defer() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51877;
     let snap_a = wg1866_snapshot(1, 4242, "wgt1866g", port, WG1866_PRIVKEY_A);
-    coordinator.refresh_runtime_snapshot(&snap_a);
+    coordinator.refresh_runtime_snapshot(&snap_a).expect("refresh_runtime_snapshot must succeed");
     assert!(wg1866_wait_tombstone(&mut coordinator, 1, 2_000), "open_tun failure tombstones");
     // Stored snapshot renames the interface (same id + identity).
     let snap_renamed = wg1866_snapshot(1, 4243, "wgt1866h", port, WG1866_PRIVKEY_A);
@@ -2600,12 +2600,12 @@ fn wg1866_sweep_suppresses_stale_attachment_respawn_under_defer() {
 fn wg1866_apply_time_rename_restarts_thread_on_new_attachment() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51878;
-    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4242, "wgt1866i", port, WG1866_PRIVKEY_A));
+    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4242, "wgt1866i", port, WG1866_PRIVKEY_A)).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator.wg_control_threads.get(&1).expect("entry");
     assert_eq!(entry.spawned_tunnel_name, "wgt1866i");
     // Rename (same id, same identity): engine Arc is REUSED, but the
     // attachment-aware stale prune must restart the thread.
-    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4243, "wgt1866j", port, WG1866_PRIVKEY_A));
+    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4243, "wgt1866j", port, WG1866_PRIVKEY_A)).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator.wg_control_threads.get(&1).expect("entry after rename");
     assert_eq!(
         entry.spawned_tunnel_name, "wgt1866j",
@@ -2626,7 +2626,7 @@ fn wg1866_sweep_respawns_with_empty_linux_name_rows() {
     let mut snap = wg1866_snapshot(1, 4244, "wgt1866k", port, WG1866_PRIVKEY_A);
     snap.interfaces[0].linux_name = String::new();
     snap.tunnel_endpoints[0].linux_name = String::new();
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(
         wg1866_wait_tombstone(&mut coordinator, 1, 2_000),
         "open_tun failure tombstones"
@@ -2731,7 +2731,7 @@ fn wg2921_outer_mtu_change_restarts_control_thread() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51890;
     // First apply: peer reachable via ge2921wan @ MTU 1400.
-    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921a", port, 1400));
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921a", port, 1400)).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator.wg_control_threads.get(&1).expect("entry");
     assert_eq!(
         entry.spawned_outer_mtu, 1400,
@@ -2751,7 +2751,7 @@ fn wg2921_outer_mtu_change_restarts_control_thread() {
     // Second apply: SAME WG identity (port/privkey/peer), underlay MTU
     // dropped to 1280. The engine Arc is reused (wg_identity_unchanged),
     // so only the #2921 outer-MTU prune can restart the thread.
-    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921a", port, 1280));
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921a", port, 1280)).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator.wg_control_threads.get(&1).expect("entry after MTU change");
     assert_eq!(
         entry.engine_ptr, engine_ptr_before,
@@ -2774,7 +2774,7 @@ fn wg2921_outer_mtu_change_restarts_control_thread() {
 fn wg2921_unchanged_outer_mtu_keeps_control_thread() {
     let mut coordinator = Coordinator::new();
     let port: u16 = 51891;
-    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921b", port, 1400));
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921b", port, 1400)).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator.wg_control_threads.get(&1).expect("entry");
     assert_eq!(entry.spawned_outer_mtu, 1400, "resolved underlay MTU captured");
     let engine_ptr_before = entry.engine_ptr;
@@ -2788,7 +2788,7 @@ fn wg2921_unchanged_outer_mtu_keeps_control_thread() {
         .last_spawn_attempt_ns = t0;
 
     // Identical underlay MTU — resolve_wg_outer_mtu is unchanged.
-    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921b", port, 1400));
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921b", port, 1400)).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator.wg_control_threads.get(&1).expect("entry after no-op refresh");
     assert_eq!(
         entry.engine_ptr, engine_ptr_before,
@@ -2885,7 +2885,7 @@ fn gre1881_wait_tombstone(coordinator: &mut Coordinator, id: u16, timeout_ms: u6
 #[test]
 fn gre1881_refresh_creates_entry_and_publishes_delivery() {
     let mut coordinator = gre1881_coordinator_with_worker();
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36281, "gre1881a", "198.51.100.7"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36281, "gre1881a", "198.51.100.7")).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator
         .tunnel_sources
         .get(&1)
@@ -2907,9 +2907,9 @@ fn gre1881_refresh_creates_entry_and_publishes_delivery() {
 #[test]
 fn gre1881_removal_refresh_prunes_entry_and_unpublishes() {
     let mut coordinator = gre1881_coordinator_with_worker();
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36282, "gre1881b", "198.51.100.7"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36282, "gre1881b", "198.51.100.7")).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.tunnel_sources.contains_key(&1));
-    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default()).expect("refresh_runtime_snapshot must succeed");
     assert!(
         coordinator.tunnel_sources.is_empty(),
         "removed endpoint prunes the entry"
@@ -2925,7 +2925,7 @@ fn gre1881_removal_refresh_prunes_entry_and_unpublishes() {
 #[test]
 fn gre1881_no_workers_spawn_gate() {
     let mut coordinator = Coordinator::new();
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36283, "gre1881c", "198.51.100.7"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36283, "gre1881c", "198.51.100.7")).expect("refresh_runtime_snapshot must succeed");
     assert!(
         coordinator.tunnel_sources.is_empty(),
         "no spawn without live worker handles (frozen empty captures)"
@@ -2940,13 +2940,13 @@ fn gre1881_no_workers_spawn_gate() {
 #[test]
 fn gre1881_destination_edit_preserves_entry_without_respawn() {
     let mut coordinator = gre1881_coordinator_with_worker();
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36284, "gre1881d", "198.51.100.7"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36284, "gre1881d", "198.51.100.7")).expect("refresh_runtime_snapshot must succeed");
     let stamp = coordinator
         .tunnel_sources
         .get(&1)
         .expect("entry")
         .last_spawn_attempt_ns;
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36284, "gre1881d", "203.0.113.9"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36284, "gre1881d", "203.0.113.9")).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator
         .tunnel_sources
         .get(&1)
@@ -2962,13 +2962,13 @@ fn gre1881_destination_edit_preserves_entry_without_respawn() {
 #[test]
 fn gre1881_attachment_change_restarts_thread() {
     let mut coordinator = gre1881_coordinator_with_worker();
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36285, "gre1881e", "198.51.100.7"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36285, "gre1881e", "198.51.100.7")).expect("refresh_runtime_snapshot must succeed");
     let stamp = coordinator
         .tunnel_sources
         .get(&1)
         .expect("entry")
         .last_spawn_attempt_ns;
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36286, "gre1881e", "198.51.100.7"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36286, "gre1881e", "198.51.100.7")).expect("refresh_runtime_snapshot must succeed");
     let entry = coordinator
         .tunnel_sources
         .get(&1)
@@ -2992,10 +2992,10 @@ fn gre1881_attachment_change_restarts_thread() {
 #[test]
 fn gre1881_mode_flip_to_wireguard_prunes_gre_entry() {
     let mut coordinator = gre1881_coordinator_with_worker();
-    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36287, "gre1881f", "198.51.100.7"));
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36287, "gre1881f", "198.51.100.7")).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.tunnel_sources.contains_key(&1));
     coordinator
-        .refresh_runtime_snapshot(&wg1866_snapshot(1, 36287, "gre1881f", 51899, WG1866_PRIVKEY_A));
+        .refresh_runtime_snapshot(&wg1866_snapshot(1, 36287, "gre1881f", 51899, WG1866_PRIVKEY_A)).expect("refresh_runtime_snapshot must succeed");
     assert!(
         !coordinator.tunnel_sources.contains_key(&1),
         "mode flip prunes the GRE local-origin entry"
@@ -3014,9 +3014,9 @@ fn gre1881_mode_flip_to_wireguard_prunes_gre_entry() {
 fn gre1881_disarmed_refresh_stops_threads() {
     let mut coordinator = gre1881_coordinator_with_worker();
     let snap = gre1881_snapshot(1, 36288, "gre1881g", "198.51.100.7");
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.tunnel_sources.contains_key(&1));
-    coordinator.refresh_runtime_snapshot_disarmed(&snap);
+    coordinator.refresh_runtime_snapshot_disarmed(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(
         coordinator.tunnel_sources.is_empty(),
         "disarmed refresh must not hold TUN reader fds"
@@ -3031,7 +3031,7 @@ fn gre1881_disarmed_refresh_stops_threads() {
 fn gre1881_defer_prune_removes_only_stale_entries() {
     let mut coordinator = gre1881_coordinator_with_worker();
     let snap = gre1881_snapshot(1, 36289, "gre1881h", "198.51.100.7");
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.tunnel_sources.contains_key(&1));
     // Same snapshot: nothing pruned.
     coordinator.prune_local_tunnel_sources_for_snapshot(&snap);
@@ -3048,7 +3048,7 @@ fn gre1881_defer_prune_removes_only_stale_entries() {
     assert!(coordinator.local_tunnel_deliveries.load().is_empty());
 
     // Re-arm an entry and verify full removal still prunes.
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.tunnel_sources.contains_key(&1));
     coordinator.prune_local_tunnel_sources_for_snapshot(&ConfigSnapshot::default());
     assert!(coordinator.tunnel_sources.is_empty());
@@ -3064,7 +3064,7 @@ fn gre1881_defer_prune_removes_only_stale_entries() {
 fn gre1881_exit_tombstones_sweep_unpublishes_and_respawn_is_coherence_gated() {
     let mut coordinator = gre1881_coordinator_with_worker();
     let snap = gre1881_snapshot(1, 36290, "gre1881i", "198.51.100.7");
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(
         gre1881_wait_tombstone(&mut coordinator, 1, 2_000),
         "open_tun failure tombstones the entry"
@@ -3111,7 +3111,7 @@ fn gre1881_exit_tombstones_sweep_unpublishes_and_respawn_is_coherence_gated() {
 fn gre1881_stop_inner_clears_and_sweep_creates_nothing() {
     let mut coordinator = gre1881_coordinator_with_worker();
     let snap = gre1881_snapshot(1, 36291, "gre1881j", "198.51.100.7");
-    coordinator.refresh_runtime_snapshot(&snap);
+    coordinator.refresh_runtime_snapshot(&snap).expect("refresh_runtime_snapshot must succeed");
     assert!(coordinator.tunnel_sources.contains_key(&1));
     coordinator.stop_inner(false);
     assert!(coordinator.tunnel_sources.is_empty(), "stop clears entries");
@@ -3765,5 +3765,148 @@ fn reconcile_present_optional_pins_open_ok_advance_generation() {
     assert_eq!(
         (**coordinator.shared_validation.load()).config_generation,
         61
+    );
+}
+
+/// #3766 fail-closed same-plan refresh (H2 + H3 + M1): a runtime-snapshot
+/// refresh whose POLICY preflight passes but whose full
+/// `build_forwarding_state` FAILS a non-policy integrity check (here an
+/// unparseable interface address) MUST be an atomic no-op — it returns
+/// `Err`, leaves the prior validation generation untouched (H2), and does
+/// not rotate/delete the neighbor-manager keys (H3). The still-live prior
+/// state is never left split-brain (validation ahead of forwarding) and no
+/// live neighbor key is blackholed.
+///
+/// Fail-on-revert: the pre-#3766 code bumped `self.validation` and rotated
+/// the neighbor-manager keys BEFORE the fallible build, then swallowed the
+/// error with a bare `return`. Restore that order and: (a) the refresh
+/// returns `()` so the caller cannot observe the reject (M1), (b)
+/// `validation.config_generation` advances to the rejected snapshot's
+/// generation while forwarding stays at the prior one (split-brain, H2),
+/// and (c) the manager keys rotate to the rejected snapshot's neighbor set
+/// while the old key is deleted (H3) — every assertion below goes RED.
+#[test]
+fn refresh_runtime_snapshot_build_failure_is_atomic_noop_3766() {
+    let mut coordinator = Coordinator::new();
+
+    let good_ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+    let good_snapshot = |generation: u64| ConfigSnapshot {
+        generation,
+        fib_generation: generation as u32,
+        neighbors: vec![crate::NeighborSnapshot {
+            ifindex: 13,
+            family: "inet".to_string(),
+            ip: good_ip.to_string(),
+            mac: "00:11:22:33:44:55".to_string(),
+            state: "reachable".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Install a valid baseline (generation 7) carrying one usable manager
+    // neighbor. This is the "stale-but-correct prior good state".
+    coordinator
+        .refresh_runtime_snapshot(&good_snapshot(7))
+        .expect("valid snapshot must apply");
+    assert_eq!(coordinator.validation.config_generation, 7);
+    assert_eq!(coordinator.validation.fib_generation, 7);
+    assert!(
+        coordinator
+            .neighbors
+            .manager_keys
+            .lock()
+            .expect("manager_keys")
+            .contains(&(13, good_ip)),
+        "baseline manager neighbor key must be installed"
+    );
+
+    // A snapshot that PASSES the policy preflight (no policies) but FAILS
+    // build_forwarding_state on an unparseable interface address, and
+    // carries a DIFFERENT neighbor set so a pre-build key rotation would be
+    // observable.
+    let bad_ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 201));
+    let bad_snapshot = ConfigSnapshot {
+        generation: 9,
+        fib_generation: 9,
+        neighbors: vec![crate::NeighborSnapshot {
+            ifindex: 14,
+            family: "inet".to_string(),
+            ip: bad_ip.to_string(),
+            mac: "00:11:22:33:44:66".to_string(),
+            state: "reachable".to_string(),
+            ..Default::default()
+        }],
+        interfaces: vec![crate::protocol::snapshot::InterfaceSnapshot {
+            name: "ge-0/0/9".to_string(),
+            ifindex: 99,
+            hardware_addr: "02:00:00:00:00:99".to_string(),
+            addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                family: "inet".to_string(),
+                address: "10.0.0.0/33".to_string(), // not a parseable CIDR
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // M1: the build failure is surfaced as an Err (not swallowed).
+    let err = coordinator
+        .refresh_runtime_snapshot(&bad_snapshot)
+        .expect_err("a build_forwarding_state failure must be returned as Err");
+    assert!(
+        matches!(
+            err,
+            crate::policy::SnapshotIntegrityError::InterfaceAddressUnparseable { .. }
+        ),
+        "expected InterfaceAddressUnparseable, got {err:?}"
+    );
+
+    // H2: the rejected snapshot must NOT advance the validation generation
+    // (which would publish config_generation=9 against the still-G7
+    // forwarding table via a later bump_fib_generation / store).
+    assert_eq!(
+        coordinator.validation.config_generation, 7,
+        "rejected snapshot must not bump validation.config_generation (split-brain)"
+    );
+    assert_eq!(
+        coordinator.validation.fib_generation, 7,
+        "rejected snapshot must not bump validation.fib_generation"
+    );
+    assert_eq!(
+        (**coordinator.shared_validation.load()).config_generation,
+        7,
+        "worker-visible published generation must stay at the prior good value"
+    );
+
+    // H3: the neighbor-manager keys must NOT be rotated/deleted by the
+    // rejected snapshot — the prior good key survives, the rejected key is
+    // absent.
+    {
+        let keys = coordinator
+            .neighbors
+            .manager_keys
+            .lock()
+            .expect("manager_keys");
+        assert!(
+            keys.contains(&(13, good_ip)),
+            "prior good neighbor key must survive a rejected snapshot (no blackhole)"
+        );
+        assert!(
+            !keys.contains(&(14, bad_ip)),
+            "rejected snapshot's neighbor key must not be installed"
+        );
+    }
+
+    // Positive control (not over-gating): a valid refresh still applies and
+    // advances the generation after a rejected one.
+    coordinator
+        .refresh_runtime_snapshot(&good_snapshot(11))
+        .expect("valid snapshot must still apply after a rejected one");
+    assert_eq!(coordinator.validation.config_generation, 11);
+    assert_eq!(
+        (**coordinator.shared_validation.load()).config_generation,
+        11
     );
 }

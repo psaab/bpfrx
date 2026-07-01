@@ -22,7 +22,7 @@ the workers share.
 | `inject.rs` | `request inject-packet` RPC handler — synthesizes a packet against the live state, reports disposition. The operator/API-supplied `packet_length` is bounded by `MAX_INJECT_PACKET_LENGTH` (= `UMEM_FRAME_SIZE`, 4096): an injected packet is a single unfragmented frame that must fit in one UMEM frame on TX, and 4096 keeps the IPv4 total-length / IPv6 payload-length wire fields within u16. `check_inject_packet_length` REJECTS an over-max request up front (it is NOT clamped, so an API misuse / DoS attempt surfaces as an error); the 64-byte minimum still applies. The frame builders (`frame/mod.rs`) additionally clamp the allocation to the maximum and use `u16::try_from` for the wire length as a defense-in-depth backstop so a bypassed bound can never emit a wrapped on-wire length. (#2443) |
 | `neighbor_manager.rs` | `NeighborManager` — sharded ARP/NDP cache + netlink monitor for incremental updates. |
 | `session_manager.rs` | Cross-thread session-table state shared between coordinator, HA worker, and packet workers via `Arc<Mutex<...>>`. Holds the synced + nat + forward-wire tables together because they're written and queried as a unit. |
-| `snapshot_refresh.rs` | `refresh_runtime_snapshot{,_disarmed,_inner}` (armed/disarmed snapshot-apply legs: preflight, #1873 tunnel-remap purge, forwarding swap + stores, aux-thread reconcile, CoS owner-map + warm passes) and `refresh_fabric_links`. (#1890 split.) |
+| `snapshot_refresh.rs` | `refresh_runtime_snapshot{,_disarmed,_inner}` (armed/disarmed same-plan snapshot-apply legs: preflight, #1873 tunnel-remap purge, forwarding swap + stores, aux-thread reconcile, CoS owner-map + warm passes) and `refresh_fabric_links`. (#1890 split.) **#3766: `_inner` is a FALLIBLE atomic swap — it returns `Result<(), SnapshotIntegrityError>`, builds the new forwarding state FIRST, and only then bumps `self.validation` + rotates the neighbor-manager keys + publishes; on a build integrity error nothing mutates and the error is returned so the handler fails closed (no split-brain, no persisted reject).** |
 | `status.rs` | Read-side snapshots for `show ...` queries. The exception is `drain_session_deltas`, which mutates per-binding state. |
 | `supervisor.rs` | `spawn_supervised_worker` / `spawn_supervised_aux` — catches panics, marks the worker dead on its `WorkerRuntimeAtomics`, captures a panic message into a per-worker slot. (#925 Phase 1.) |
 | `tunnel_supervision.rs` | GRE local-origin + WG control-thread LIFECYCLE (three-pass reconcile, tombstone backoff, periodic liveness sweeps, defer-branch snapshot prunes — see "Aux tunnel threads" below). The thread bodies live in `wg_control.rs` / `afxdp/tunnel.rs`; the entry maps (`tunnel_sources`, `wg_control_threads`) stay on `Coordinator` in `mod.rs`. (#1890 split.) |
@@ -91,3 +91,19 @@ Differences that matter (#1881):
 - `defer_workers=true` on `apply_snapshot` skips spawn until the next
   reconcile (used during RETH MAC programming so workers don't bind
   to an interface that's about to drop and re-add its MAC).
+- **Same-plan refresh is a fail-closed atomic swap (#3766).** The
+  same-plan `apply_snapshot` leg (binding plan unchanged) runs
+  `refresh_runtime_snapshot{,_disarmed}` instead of a full reconcile.
+  Like the full reconcile's pre-teardown `build_reconcile_forwarding`
+  (#2484), it builds the new `ForwardingState` FIRST and only commits
+  the observable mutations — `self.validation` bump (H2), neighbor-
+  manager key rotation + stale-key delete (H3), forwarding swap, and the
+  `shared_validation` / `ha.forwarding` publishes — AFTER the build
+  succeeds. A non-policy integrity fault (invalid interface address,
+  CoS queue, NAT64 / NPTv6 rule) that only the full build catches now
+  returns `Err(SnapshotIntegrityError)`; the handler reports `ok=false`,
+  restores the bumped status generation, and does NOT persist the
+  rejected snapshot. The prior good state stays live and consistent —
+  no split-brain (validation ahead of a stale forwarding table), no
+  deleted-neighbor blackhole, no `ok=true` on a rejected snapshot.
+  Distinct from #2484 (full-apply teardown) and #2916 (queue replan).

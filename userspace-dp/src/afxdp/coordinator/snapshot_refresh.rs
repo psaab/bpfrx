@@ -36,8 +36,11 @@ impl super::Coordinator {
         }
     }
 
-    pub fn refresh_runtime_snapshot(&mut self, snapshot: &crate::ConfigSnapshot) {
-        self.refresh_runtime_snapshot_inner(snapshot, true);
+    pub fn refresh_runtime_snapshot(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+    ) -> Result<(), crate::policy::SnapshotIntegrityError> {
+        self.refresh_runtime_snapshot_inner(snapshot, true)
     }
 
     /// #1866 (PR-review Codex r2): runtime-snapshot refresh for a
@@ -48,11 +51,43 @@ impl super::Coordinator {
     /// entries are stopped (mirrors `reconcile_status_bindings →
     /// stop()`). Forwarding/validation state still refreshes so a
     /// later arming starts from current state.
-    pub fn refresh_runtime_snapshot_disarmed(&mut self, snapshot: &crate::ConfigSnapshot) {
-        self.refresh_runtime_snapshot_inner(snapshot, false);
+    pub fn refresh_runtime_snapshot_disarmed(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+    ) -> Result<(), crate::policy::SnapshotIntegrityError> {
+        self.refresh_runtime_snapshot_inner(snapshot, false)
     }
 
-    fn refresh_runtime_snapshot_inner(&mut self, snapshot: &crate::ConfigSnapshot, spawn_wg: bool) {
+    /// #3766: same-plan runtime-snapshot refresh, now a FALLIBLE ATOMIC
+    /// SWAP. The previous implementation mutated `self.validation` (H2)
+    /// and rotated/deleted the dynamic neighbor-manager keys (H3) BEFORE
+    /// the fallible `build_forwarding_state`, then swallowed a build
+    /// error with a bare `return` — so an invalid same-plan snapshot
+    /// that passed the POLICY preflight but failed a non-policy
+    /// integrity check (invalid interface address, CoS queue, NAT64 /
+    /// NPTv6 rule, ...) left the live table SPLIT-BRAIN (validation at
+    /// the new generation, forwarding + old neighbor keys deleted)
+    /// while the handler still reported `ok=true` (M1) and persisted
+    /// the rejected snapshot as the boot baseline.
+    ///
+    /// The fix mirrors the full-reconcile invariant (#2484
+    /// `build_reconcile_forwarding`): build the new forwarding state
+    /// FIRST; only AFTER the build succeeds do we bump `self.validation`,
+    /// rotate the neighbor-manager keys, swap the forwarding table, and
+    /// publish to the worker-visible Arcs. On ANY integrity error no
+    /// forwarding / validation / worker-visible state is mutated (a LATE
+    /// build failure — NAT64/NPTv6/filter — may leave orphaned
+    /// policy/nat-counter registrations, identical to the full-reconcile
+    /// path: benign, the live policy still references the old counters and
+    /// they self-heal on the next successful apply) and the error is
+    /// returned to the control-plane handler, which reports `ok=false` and
+    /// does NOT persist the snapshot — the prior good state stays live and
+    /// consistent (no split-brain, no neighbor blackhole).
+    fn refresh_runtime_snapshot_inner(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+        spawn_wg: bool,
+    ) -> Result<(), crate::policy::SnapshotIntegrityError> {
         // #1606: preflight policy validation BEFORE any
         // side-effecting mutation (neighbor manager keys,
         // validation, policy_counters). If integrity errors fire,
@@ -79,9 +114,46 @@ impl super::Coordinator {
                 "xpf-userspace-dp: snapshot integrity error during refresh_runtime_snapshot preflight: {} — keeping previous state",
                 err
             );
-            return;
+            return Err(err);
         }
 
+        // Preserve existing fabric links — they are resolved separately
+        // via refresh_fabric_links (SyncFabricState) and the snapshot
+        // may not include them if the peer MAC wasn't resolved at
+        // snapshot build time. Always keep the better-resolved set.
+        let preserved_fabrics = self.forwarding.fabrics.clone();
+        // #3766: build the new forwarding state FIRST, before ANY
+        // self-mutation. The policy preflight above only validates
+        // POLICY state; a non-policy integrity fault surfaces only here.
+        // Building first means such a fault aborts the refresh with the
+        // previous validation generation, neighbor-manager keys, dynamic
+        // neighbor cache, and forwarding table all still live and
+        // consistent — no split-brain (H2), no neighbor blackhole (H3),
+        // no ok=true on a rejected snapshot (M1). It reads
+        // `Some(&self.forwarding)` (the still-live prior state) for WG
+        // engine reuse / NAT counter carry-over.
+        let new_forwarding = match build_forwarding_state_with_policy_counters_and_previous(
+            snapshot,
+            &self.policy_counters,
+            &self.nat_counters,
+            Some(&self.forwarding),
+        ) {
+            Ok(fwd) => fwd,
+            Err(err) => {
+                eprintln!(
+                    "xpf-userspace-dp: snapshot integrity error during runtime-snapshot refresh: {} — keeping previous forwarding state",
+                    err
+                );
+                return Err(err);
+            }
+        };
+
+        // #3766: the build succeeded. From here on every step is
+        // infallible; this is the atomic commit to the new generation.
+        // The neighbor-manager key rotation + stale-entry removal (H3)
+        // and the validation bump (H2) run ONLY now, so a rejected
+        // snapshot can never have deleted a live neighbor key or
+        // published a newer config generation against the old table.
         let next_manager_keys = snapshot
             .neighbors
             .iter()
@@ -123,28 +195,6 @@ impl super::Coordinator {
             snapshot_installed: true,
             config_generation: snapshot.generation,
             fib_generation: snapshot.fib_generation,
-        };
-        // Preserve existing fabric links — they are resolved separately
-        // via refresh_fabric_links (SyncFabricState) and the snapshot
-        // may not include them if the peer MAC wasn't resolved at
-        // snapshot build time. Always keep the better-resolved set.
-        let preserved_fabrics = self.forwarding.fabrics.clone();
-        // #1606: preflight policy build. If integrity errors fire,
-        // keep the existing forwarding state.
-        let new_forwarding = match build_forwarding_state_with_policy_counters_and_previous(
-            snapshot,
-            &self.policy_counters,
-            &self.nat_counters,
-            Some(&self.forwarding),
-        ) {
-            Ok(fwd) => fwd,
-            Err(err) => {
-                eprintln!(
-                    "xpf-userspace-dp: snapshot integrity error during runtime-snapshot refresh: {} — keeping previous forwarding state",
-                    err
-                );
-                return;
-            }
         };
         self.policy_counters.reconcile_rules(&snapshot.policies);
         // #2218: drop hit counters for NAT rules removed by this config.
@@ -232,5 +282,6 @@ impl super::Coordinator {
         // neighbor cache is hot before the first user flow. Non-forced:
         // the 1s snapshot-level rate-limit coalesces config storms.
         self.queue_warm_pass(false);
+        Ok(())
     }
 }
