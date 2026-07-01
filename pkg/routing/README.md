@@ -161,7 +161,7 @@ delegate to the owning domain. Exported types:
   (lower priority value = higher priority). PBR sits before main as
   well; rib-group sits after.
 
-### clear()/Apply error contract (#2273)
+### clear()/Apply error contract (#2273, #3430, #3731)
 
 Each reconciler's `Apply` is clear-then-re-add: `clear()` removes every
 rule in the manager's own priority window, then `Apply` re-installs the
@@ -184,10 +184,25 @@ desired set. `clear()` walks `[AF_INET, AF_INET6]`, calling `RuleList`
   clear error** so `pkg/daemon` (`daemon_apply.go` steps 3b–3d) observes
   it. The daemon currently logs Apply errors at WARN and continues; the
   change makes the failure visible (and lets a future caller retry)
-  without changing the daemon's apply sequencing. `RuleDel` failures on
-  individual rules remain debug-logged and do not fail `Apply` — a stale
-  rule that survives one delete is swept by the next pass and re-add uses
-  `NLM_F_CREATE|NLM_F_EXCL`, so a still-desired rule stays correct.
+  without changing the daemon's apply sequencing.
+- **Per-rule `RuleAdd` failures are aggregated and returned, never
+  swallowed (#3430 for PBR, #3731 for next-table + rib-group).** Each
+  reconciler collects every add failure with `errors.Join` while still
+  attempting every remaining desired rule (forward progress), then returns
+  the joined error alongside any clear error. Before #3731 the next-table
+  and rib-group `Apply` paths only WARN-logged a `RuleAdd` failure and
+  returned `clearErr` (i.e. `nil` on the common path): a transient netlink
+  add error (EEXIST from stale kernel/udev state, ENOBUFS, a racing
+  reconcile) *after* the up-front `clear()` had already removed the
+  working leak rules left inter-VRF leaking silently DOWN while `Apply`
+  reported success. A clean re-apply is unaffected: `clear()` removes the
+  in-window rules before they are re-added, so an idempotent re-apply does
+  not hit EEXIST — an already-cleared rule is re-added fresh and `Apply`
+  returns `nil`. `RuleDel` failures on individual next-table / rib-group
+  rules remain debug-logged and do not fail `Apply` — a stale rule that
+  survives one delete is swept by the next pass and re-add uses
+  `NLM_F_CREATE|NLM_F_EXCL`, so a still-desired rule stays correct (the
+  PBR `clear()` additionally aggregates its `RuleDel` failures, #3430 H3).
 
 ## Tunnel reconcile-in-place (#1884)
 
