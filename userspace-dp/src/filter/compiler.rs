@@ -548,6 +548,74 @@ fn parse_term(
             }
         }
     }
+    // #3723: cross-field satisfiability backstop. A term whose resolved protocol
+    // constraint is PRESENT but INCOMPATIBLE with a co-configured L4 predicate is
+    // a NEVER-MATCH: the matcher (engine/matching.rs) keys ports on the extracted
+    // L4 port (0 for a non-port protocol — only TCP/UDP carry ports per
+    // ip_proto::has_l4_ports), gates tcp-flags on protocol==TCP, and gates
+    // icmp-type/code on ICMP/ICMPv6. Because a filter falls through to the implicit
+    // ACCEPT on no-match, a `then discard`/`reject` term over such a pair silently
+    // fails OPEN. The Go commit gate (validateFilterCrossFieldStrict, #3723) is the
+    // primary defense — a committed config never carries such a term — so this is
+    // the helper-boundary backstop for a corrupt / hand-built / version-drifted or
+    // leniently-loaded snapshot, consistent with the #2505/#3367/#3406 fail-closed
+    // family. Rejecting the whole snapshot (the reconcile preflight keeps the
+    // previous good filter state) is action-agnostic. An EMPTY protocol list is
+    // the legitimate "no protocol constraint" case: a port / tcp-flags / icmp
+    // predicate with no protocol is enforceable for a FILTER (the matcher matches
+    // the port on whatever port-bearing packet arrives, and the tcp-flags/icmp
+    // arms self-gate on the packet protocol), so it is NOT an error.
+    if !protocols.is_empty() {
+        let ports_present = snap.source_ports.iter().any(|p| port_is_real(p))
+            || snap.destination_ports.iter().any(|p| port_is_real(p))
+            || snap.source_ports_except.iter().any(|p| port_is_real(p))
+            || snap.destination_ports_except.iter().any(|p| port_is_real(p));
+        if ports_present {
+            if let Some(&proto) = protocols
+                .iter()
+                .find(|&&p| !crate::ip_proto::has_l4_ports(p))
+            {
+                return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+                    family: filter_family.to_string(),
+                    filter: filter_name.to_string(),
+                    term: snap.name.clone(),
+                    predicate: "port",
+                    protocol: proto,
+                });
+            }
+        }
+        let tcp_flags_present =
+            snap.tcp_flags.is_some_and(|m| m != 0) || snap.tcp_flags_forbidden.is_some_and(|m| m != 0);
+        if tcp_flags_present {
+            if let Some(&proto) = protocols
+                .iter()
+                .find(|&&p| p != crate::ip_proto::PROTO_TCP)
+            {
+                return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+                    family: filter_family.to_string(),
+                    filter: filter_name.to_string(),
+                    term: snap.name.clone(),
+                    predicate: "tcp-flags",
+                    protocol: proto,
+                });
+            }
+        }
+        let icmp_present = !snap.icmp_types.is_empty() || !snap.icmp_codes.is_empty();
+        if icmp_present {
+            if let Some(&proto) = protocols
+                .iter()
+                .find(|&&p| p != crate::ip_proto::PROTO_ICMP && p != crate::ip_proto::PROTO_ICMPV6)
+            {
+                return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+                    family: filter_family.to_string(),
+                    filter: filter_name.to_string(),
+                    term: snap.name.clone(),
+                    predicate: "icmp-type/code",
+                    protocol: proto,
+                });
+            }
+        }
+    }
     // #2622: a direction's port scope is either the positive `source-port` /
     // `destination-port` list OR the negated `source-port-except` /
     // `destination-port-except` list (Junos treats them as mutually exclusive).

@@ -4929,6 +4929,245 @@ fn tcp_flags_unparseable_error_names_the_family_for_reused_filter_names() {
     }
 }
 
+// =====================================================================
+// #3723: firewall-filter CROSS-FIELD satisfiability backstop. A term whose
+// resolved protocol constraint is PRESENT but incompatible with a
+// co-configured L4 predicate (a port on a non-port-bearing protocol,
+// tcp-flags on a non-TCP protocol, or icmp-type/code on a non-ICMP protocol)
+// is a NEVER-MATCH. Because a filter falls through to the implicit ACCEPT on
+// no-match, a `then discard`/`reject` term over such a pair silently fails
+// OPEN. The Go commit gate (validateFilterCrossFieldStrict) is the primary
+// defense; parse_filter_state is the helper-boundary backstop that rejects the
+// whole snapshot (fail closed) for a leniently-loaded / drifted snapshot.
+// =====================================================================
+
+// Build a single-term `discard` filter with an arbitrary cross-field shape.
+fn crossfield_filter(
+    family: &str,
+    protocols: Vec<String>,
+    dst_ports: Vec<String>,
+    tcp_flags: Option<u8>,
+    icmp_types: Vec<u8>,
+) -> Result<FilterState, SnapshotIntegrityError> {
+    parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: family.into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "x".into(),
+                protocols,
+                destination_ports: dst_ports,
+                tcp_flags,
+                icmp_types,
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[],
+        "",
+        "",
+    )
+}
+
+#[test]
+fn filter_crossfield_3723_port_on_nonport_protocol_rejected() {
+    // H01: a destination-port on a non-port-bearing protocol (gre) is a
+    // never-match. The backstop rejects the whole snapshot rather than compile a
+    // silently-inert discard. Reverting the parse_term guard returns Ok here, so
+    // this is non-tautological.
+    let err = crossfield_filter("inet", vec!["gre".into()], vec!["80".into()], None, vec![])
+        .expect_err("a port on gre must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+            family,
+            filter,
+            term,
+            predicate,
+            protocol,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "x");
+            assert_eq!(predicate, "port");
+            assert_eq!(protocol, crate::ip_proto::PROTO_GRE);
+        }
+        other => panic!("expected UnsatisfiableFilterCrossField, got {other:?}"),
+    }
+}
+
+#[test]
+fn filter_crossfield_3723_tcpflags_on_nontcp_rejected() {
+    // H02: tcp-flags on a non-TCP protocol (udp — port-bearing but NOT TCP) is a
+    // never-match.
+    let err = crossfield_filter("inet", vec!["udp".into()], vec![], Some(0x02), vec![])
+        .expect_err("tcp-flags on udp must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+            predicate, protocol, ..
+        } => {
+            assert_eq!(predicate, "tcp-flags");
+            assert_eq!(protocol, PROTO_UDP);
+        }
+        other => panic!("expected UnsatisfiableFilterCrossField, got {other:?}"),
+    }
+}
+
+#[test]
+fn filter_crossfield_3723_icmp_on_nonicmp_rejected() {
+    // H03: an icmp-type on a non-ICMP protocol (tcp) is a never-match.
+    let err = crossfield_filter("inet", vec!["tcp".into()], vec![], None, vec![8])
+        .expect_err("icmp-type on tcp must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+            predicate, protocol, ..
+        } => {
+            assert_eq!(predicate, "icmp-type/code");
+            assert_eq!(protocol, PROTO_TCP);
+        }
+        other => panic!("expected UnsatisfiableFilterCrossField, got {other:?}"),
+    }
+}
+
+#[test]
+fn filter_crossfield_3723_mixed_list_rejected() {
+    // M01: a mixed protocol list [tcp gre] with a port only enforces on tcp and
+    // silently never-matches gre. The backstop rejects on the incompatible gre.
+    let err = crossfield_filter(
+        "inet",
+        vec!["tcp".into(), "gre".into()],
+        vec!["80".into()],
+        None,
+        vec![],
+    )
+    .expect_err("a mixed port-bearing/non-port list with a port must fail closed");
+    match err {
+        SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+            predicate, protocol, ..
+        } => {
+            assert_eq!(predicate, "port");
+            assert_eq!(protocol, crate::ip_proto::PROTO_GRE);
+        }
+        other => panic!("expected UnsatisfiableFilterCrossField, got {other:?}"),
+    }
+}
+
+#[test]
+fn filter_crossfield_3723_family_named_for_reused_names() {
+    // Filter names can be reused across families; the diagnostic must name the
+    // family carrying the never-match term (M02: next-header lowers into
+    // protocols, so an inet6 esp+port term hits the same backstop).
+    let err = crossfield_filter("inet6", vec!["esp".into()], vec!["80".into()], None, vec![])
+        .expect_err("an inet6 port-on-esp term must fail closed");
+    match err {
+        SnapshotIntegrityError::UnsatisfiableFilterCrossField { family, .. } => {
+            assert_eq!(family, "inet6");
+        }
+        other => panic!("expected UnsatisfiableFilterCrossField, got {other:?}"),
+    }
+}
+
+#[test]
+fn filter_crossfield_3723_satisfiable_compiles() {
+    // Positive controls — a satisfiable same-protocol term must still compile.
+    crossfield_filter("inet", vec!["tcp".into()], vec!["22".into()], None, vec![])
+        .expect("tcp + port compiles");
+    crossfield_filter("inet", vec!["udp".into()], vec!["53".into()], None, vec![])
+        .expect("udp + port compiles");
+    crossfield_filter("inet", vec!["tcp".into()], vec![], Some(0x02), vec![])
+        .expect("tcp + tcp-flags compiles");
+    crossfield_filter("inet", vec!["icmp".into()], vec![], None, vec![8])
+        .expect("icmp + icmp-type compiles");
+    crossfield_filter(
+        "inet",
+        vec!["tcp".into(), "udp".into()],
+        vec!["80".into()],
+        None,
+        vec![],
+    )
+    .expect("a fully port-bearing mixed list compiles");
+}
+
+#[test]
+fn filter_crossfield_3723_no_protocol_is_enforceable() {
+    // A port / tcp-flags / icmp predicate with NO protocol is legitimate and
+    // enforceable for a FILTER (the matcher matches the port on whatever
+    // port-bearing packet arrives, and the tcp-flags/icmp arms self-gate on the
+    // packet protocol). The backstop must NOT reject these.
+    crossfield_filter("inet", vec![], vec!["80".into()], None, vec![])
+        .expect("port with no protocol is enforceable");
+    crossfield_filter("inet", vec![], vec![], Some(0x02), vec![])
+        .expect("tcp-flags with no protocol is enforceable");
+    crossfield_filter("inet", vec![], vec![], None, vec![8])
+        .expect("icmp-type with no protocol is enforceable");
+}
+
+#[test]
+fn filter_crossfield_3723_never_match_fails_open_at_runtime() {
+    // L06 runtime guard: FABRICATE the never-match term the backstop normally
+    // prevents (protocol gre + destination-port 80) and prove it matches NOTHING,
+    // documenting the fail-OPEN #3723 closes — the operator's `then discard` is
+    // dead and the traffic is admitted by the implicit accept. Built by cloning a
+    // valid gre discard term (compiled without a port) and overriding the port
+    // fields, so it exercises the REAL matcher (engine/matching.rs) end to end.
+    let state = filter_for_protocol("gre").expect("gre discard term compiles");
+    let base = state
+        .filters
+        .get("inet:f")
+        .expect("filter compiled")
+        .terms
+        .first()
+        .expect("one term")
+        .clone();
+    let never = FilterTerm {
+        dest_ports: PortMatcher::Single(80),
+        dest_port_constrained: true,
+        counter: Arc::new(FilterTermCounter::default()),
+        ..base
+    };
+    let mut filter: Filter = (**state.filters.get("inet:f").unwrap()).clone();
+    filter.terms = vec![never];
+    let mut st = FilterState::default();
+    st.filters.insert("inet:f".into(), Arc::new(filter));
+
+    // A GRE packet carries no L4 ports (dst_port 0): protocol matches gre, but
+    // port 0 != 80 -> no match -> Accept (the discard never fires).
+    let gre = evaluate_filter(
+        &st,
+        "inet:f",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        crate::ip_proto::PROTO_GRE,
+        0,
+        0,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        gre.action,
+        FilterAction::Accept,
+        "gre+port term never matches a gre packet (port 0) — the discard fails OPEN"
+    );
+
+    // A TCP:80 packet: protocol gre != tcp -> no match -> Accept.
+    let tcp = evaluate_filter(
+        &st,
+        "inet:f",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        tcp.action,
+        FilterAction::Accept,
+        "gre+port term never matches a tcp:80 packet (protocol mismatch) — the discard fails OPEN"
+    );
+}
+
 #[test]
 fn protocol_2505_unresolvable_fails_closed_not_match_all() {
     // A non-empty list with an unresolvable token must reject the whole
