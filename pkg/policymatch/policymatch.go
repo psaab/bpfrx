@@ -339,6 +339,21 @@ type Result struct {
 	Description string
 	Action      config.PolicyAction
 
+	// SchedulerName is the `scheduler-name` binding of the matched policy
+	// (#3685 M06), the same value the inventory (REST/gRPC GetPolicies,
+	// #3624) carries. A matched policy is by construction currently ACTIVE —
+	// the live simulator surfaces always thread a non-nil
+	// Query.PolicyInactiveFn (dataplane/userspace.PolicyInactiveFn) that
+	// SKIPS a scheduler-inactive rule before it can match (#3104/#3414) — so a
+	// non-empty SchedulerName on a matched verdict names the time-gate that is
+	// controlling the rule right now, not a rule that is currently gated off.
+	// Empty for a non-scheduled (always-on) policy and for the
+	// default-policy / host-inbound verdicts. Populated from pol.SchedulerName
+	// in matchedResult; the offline (nil PolicyInactiveFn) simulator may report
+	// a scheduler name for a rule that is not runtime-active, but no live
+	// transport uses that mode.
+	SchedulerName string
+
 	// RuleID is the stable "<from>-><to>/<name>" rule identity the inventory
 	// (REST/gRPC GetPolicies) and the snapshot/event path carry, computed by the
 	// shared dpuserspace.StablePolicyRuleID (#3668). PolicyID above is the
@@ -686,15 +701,18 @@ func matchedResult(ids map[[2]uint32]uint32, pol *config.Policy, global bool, fr
 		ridFrom, ridTo = "junos-global", "junos-global"
 	}
 	return Result{
-		Matched:                    true,
-		Global:                     global,
-		FromZone:                   fromZone,
-		ToZone:                     toZone,
-		PolicyID:                   ids[[2]uint32{uint32(setIdx), uint32(sliceIdx)}],
-		RuleID:                     dpuserspace.StablePolicyRuleID(ridFrom, ridTo, pol.Name),
-		PolicyName:                 pol.Name,
-		Description:                pol.Description,
-		Action:                     pol.Action,
+		Matched:     true,
+		Global:      global,
+		FromZone:    fromZone,
+		ToZone:      toZone,
+		PolicyID:    ids[[2]uint32{uint32(setIdx), uint32(sliceIdx)}],
+		RuleID:      dpuserspace.StablePolicyRuleID(ridFrom, ridTo, pol.Name),
+		PolicyName:  pol.Name,
+		Description: pol.Description,
+		Action:      pol.Action,
+		// #3685 M06: carry the scheduler binding so a match-policies verdict
+		// names the time-gate controlling the rule, mirroring the inventory.
+		SchedulerName:              pol.SchedulerName,
 		SourceAddressExcluded:      pol.Match.SourceAddressExcluded,
 		DestinationAddressExcluded: pol.Match.DestinationAddressExcluded,
 		// #3358: a zone-local address book (#3061) is folded into the global
