@@ -872,8 +872,13 @@ var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*s
 var schemaEventOptions = &schemaNode{desc: "Event policies for automated configuration changes", children: map[string]*schemaNode{
 	"policy": {desc: "Event policy", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
 		"events": {desc: "Events that trigger this policy", children: nil},
-		"within": {desc: "Time window for trigger evaluation", args: 1, placeholder: "<seconds>", children: map[string]*schemaNode{
-			"trigger": {desc: "Trigger condition (on|until <count>)", children: nil},
+		// within/trigger numerics are strict-validated at commit by
+		// validateEventOptionsWithinAST (#3751), not a typed leaf: the
+		// constraint spans the whole clause (seconds + trigger keyword/count +
+		// on/until mutual exclusion). within is 1..86400 s; trigger count is
+		// 1..1000000. A typo previously coerced to 0 and always-fired.
+		"within": {desc: "Time window for trigger evaluation (1..86400 seconds)", args: 1, placeholder: "<seconds>", children: map[string]*schemaNode{
+			"trigger": {desc: "Trigger condition: on|until <count> (exactly one; count 1..1000000)", children: nil},
 		}},
 		"attributes-match": {desc: "Match event attributes (<event>.<attribute> matches <value>)", children: nil},
 		"then": {desc: "Actions when the policy triggers", children: map[string]*schemaNode{

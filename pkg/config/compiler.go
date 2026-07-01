@@ -1253,6 +1253,25 @@ type compileOpts struct {
 	// either way, now flagged. Same doctrine as
 	// lenientUnsupportedInterfaceStanzas.
 	lenientDNATToScope bool
+
+	// lenientEventWithinTrigger (#3751) downgrades the event-options
+	// within/trigger numeric gate (validateEventOptionsWithinAST) from a hard
+	// compile error to a cfg.Warnings entry. A non-numeric / negative / zero /
+	// out-of-range `within <seconds>` or `trigger (on|until) <count>` value,
+	// or a `within` clause carrying BOTH `trigger on` and `trigger until`, was
+	// previously accepted: compileEventOptions dropped the strconv.Atoi error
+	// and coerced the field to 0, and the engine's withinMatches then treated
+	// a 0 threshold as an unconditional match — a typo silently converted a
+	// threshold-gated remediation into an ALWAYS-FIRE one (fail-open). The
+	// strict commit / commit-check path hard-rejects so the operator error is
+	// visible (naming the policy and the exact value); the tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary silently accepted still BOOTS (#1960
+	// fail-closed-on-load class) — on that boot the engine's withinMatches
+	// fails CLOSED (does not fire) on a clause with no usable positive
+	// threshold, so the mis-arrived 0 no longer over-fires. Same doctrine as
+	// lenientEventAttributesMatch (its attributes-match sibling).
+	lenientEventWithinTrigger bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -1353,6 +1372,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyCommunityRef:            true,
 		lenientVRRPVirtualAddress:            true,
 		lenientDNATToScope:                   true,
+		lenientEventWithinTrigger:            true,
 	})
 }
 
@@ -1515,6 +1535,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyCommunityRef:            true,
 		lenientVRRPVirtualAddress:            true,
 		lenientDNATToScope:                   true,
+		lenientEventWithinTrigger:            true,
 	})
 }
 
@@ -2858,6 +2879,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 			return nil, err
 		}
 	}
+
+	// #3751: event-options within/trigger numerics. compileEventOptions
+	// parsed the within time-interval and the trigger count with strconv.Atoi
+	// and SILENTLY dropped the error, so a typo (`within bogus`, `trigger on
+	// typo`) coerced the field to 0. The engine then treated a 0 threshold as
+	// an unconditional match — a threshold-gated remediation silently became
+	// ALWAYS-FIRE (fail-open). This gate rejects a non-numeric / negative /
+	// zero / out-of-range value and a within clause carrying both `trigger on`
+	// and `trigger until` (contradictory). It is an AST pre-walk (the raw
+	// typo'd token is lost once compileEventOptions coerces it to 0) run on
+	// the group-expanded, inactive-pruned tree so an apply-groups-inherited
+	// clause is caught and an inactive one is ignored. Strict (commit /
+	// commit-check): hard-reject naming the policy and value. Lenient (load /
+	// peer-sync): warn so an already-persisted or peer-synced config an older
+	// binary silently accepted still boots (#1960) — the engine's withinMatches
+	// then fails CLOSED on the leftover 0 threshold rather than over-firing.
+	withinWarnings, werr := validateEventOptionsWithinAST(tree.Children, opts.lenientEventWithinTrigger)
+	if werr != nil {
+		return nil, werr
+	}
+	cfg.Warnings = append(cfg.Warnings, withinWarnings...)
 
 	// #2074 IPsec VPN -> IKE gateway cross-reference. A VPN that
 	// references a gateway which is neither a defined gateway object nor a
