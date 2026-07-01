@@ -48,7 +48,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
-func newTestEngine(actuate func()) (*Engine, *fakeClock) {
+func newTestEngine(actuate func() bool) (*Engine, *fakeClock) {
 	e := New(actuate)
 	clock := &fakeClock{now: time.Unix(1000000, 0)}
 	e.now = clock.Now
@@ -233,7 +233,7 @@ func TestWinnerResolution(t *testing.T) {
 // per throttle window (§4.3 coalescing).
 func TestDebounceCoalescing(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() { actuations.Add(1) })
+	e := New(func() bool { actuations.Add(1); return true })
 	e.debounce = 20 * time.Millisecond
 	e.throttle = 60 * time.Millisecond
 	e.Apply(testPolicyConfig(), passResults())
@@ -272,11 +272,78 @@ func TestDebounceCoalescing(t *testing.T) {
 	}
 }
 
+// TestActuationFailureStaysDirtyUntilConverged is the #3757
+// M1/H1/H2/H3 regression: when the actuator reports failure the engine
+// must KEEP the state dirty and retry autonomously (throttle-paced),
+// then go quiescent once the actuation converges. On revert (dirty
+// cleared before/independent of the actuation result) a failing
+// actuator would fire exactly once — attempts stays 1 — and this goes
+// RED.
+func TestActuationFailureStaysDirtyUntilConverged(t *testing.T) {
+	var attempts atomic.Int32
+	var succeed atomic.Bool // false ⇒ actuation fails; flipped to self-heal
+	e := New(func() bool {
+		attempts.Add(1)
+		return succeed.Load()
+	})
+	e.debounce = 5 * time.Millisecond
+	e.throttle = 20 * time.Millisecond
+	e.Apply(testPolicyConfig(), passResults())
+	e.Start()
+	defer e.Stop()
+
+	// A probe failure marks the overlay dirty and actuates — but the
+	// actuator keeps failing, so the engine must retry on the next sweep.
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for attempts.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("attempts = %d while actuation kept failing, want autonomous retry (>=2)", got)
+	}
+
+	// Let the actuation converge; the retry loop must settle once the
+	// dirty bit clears.
+	succeed.Store(true)
+	time.Sleep(80 * time.Millisecond) // a few throttle windows to land + clear
+	settled := attempts.Load()
+	time.Sleep(160 * time.Millisecond) // several more windows
+	if extra := attempts.Load() - settled; extra > 1 {
+		t.Fatalf("actuation kept firing after convergence: +%d attempts, want quiescent", extra)
+	}
+}
+
+// TestSuccessfulActuationClearsDirty: a single stable failure with a
+// succeeding actuator actuates exactly once (the dirty bit clears on the
+// converged actuation and the loop parks) — no retry churn.
+func TestSuccessfulActuationClearsDirty(t *testing.T) {
+	var attempts atomic.Int32
+	e := New(func() bool { attempts.Add(1); return true })
+	e.debounce = 5 * time.Millisecond
+	e.throttle = 20 * time.Millisecond
+	e.Apply(testPolicyConfig(), passResults())
+	e.Start()
+	defer e.Stop()
+
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	time.Sleep(60 * time.Millisecond)
+	first := attempts.Load()
+	if first < 1 {
+		t.Fatal("no actuation after a failure")
+	}
+	time.Sleep(200 * time.Millisecond) // ~10 throttle windows
+	if extra := attempts.Load() - first; extra > 0 {
+		t.Fatalf("converged actuation kept retrying: +%d attempts, want 0 (dirty cleared)", extra)
+	}
+}
+
 // TestPublishGatingBaseline: standby gating returns a nil overlay
 // (baseline) and re-enables on takeover.
 func TestPublishGatingBaseline(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() { actuations.Add(1) })
+	e := New(func() bool { actuations.Add(1); return true })
 	e.Apply(testPolicyConfig(), passResults())
 	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
 	if len(e.ActiveOverlay()) == 0 {
@@ -390,7 +457,7 @@ func TestFilterOverlayForConfig(t *testing.T) {
 // actuation (one spurious frr-reload per commit otherwise).
 func TestApplyWithoutOverlayChangeDoesNotActuate(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() { actuations.Add(1) })
+	e := New(func() bool { actuations.Add(1); return true })
 	e.debounce = 5 * time.Millisecond
 	e.throttle = 5 * time.Millisecond
 	e.Start()

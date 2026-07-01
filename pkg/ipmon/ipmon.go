@@ -25,6 +25,15 @@
 // actuation per throttle window indefinitely — bounded and observable
 // via the per-policy transition counters.
 //
+// The dirty bit is cleared only AFTER the actuator reports a
+// consistent, converged result. A failed consumer (a hard FRR reload
+// error, a snapshot-publish error, or an unconfirmed FIB-generation
+// bump) keeps the state dirty and the loop retries autonomously at the
+// throttle cadence until it converges (#3757). Because a hard FRR
+// reload failure aborts the userspace snapshot publish, the kernel FIB
+// and the userspace FIB never diverge into a split-brain — both stay on
+// the last consistent state until the retry succeeds.
+//
 // The overlay is runtime state, never config: it does not sync to the
 // HA peer and re-derives from fresh probe results within seconds of a
 // takeover.
@@ -102,8 +111,20 @@ type Engine struct {
 
 	dirtySince    time.Time // zero = clean
 	lastActuation time.Time
+	// dirtyGen increments on every marked change (even while already
+	// dirty). The run loop snapshots it before actuating and clears the
+	// dirty bit only when it is unchanged AND the actuation converged —
+	// so a change that lands DURING an actuation (last-writer-wins) is
+	// not lost, and a failed actuation stays dirty for retry (#3757).
+	dirtyGen uint64
 
-	actuate func() // daemon route-overlay actuator; called WITHOUT mu held
+	// actuate is the daemon route-overlay actuator; called WITHOUT mu
+	// held. It returns true when the overlay converged consistently
+	// (kernel FRR AND the userspace snapshot committed together) and
+	// false when any consumer failed — a false return keeps the dirty
+	// bit set so the run loop retries autonomously on the next sweep
+	// (#3757).
+	actuate func() bool
 	// resolveNextHop resolves interface-typed next-hops at overlay
 	// computation (#1844). Set once via SetNextHopResolver before
 	// Start; nil ⇒ interface-typed candidates always skip (defensive —
@@ -121,8 +142,10 @@ type Engine struct {
 // New creates an engine. actuate is the daemon's routes-only actuator;
 // it is invoked from the engine's single run-loop goroutine (never
 // concurrently) and must read ActiveOverlay() itself so it always
-// publishes the freshest overlay.
-func New(actuate func()) *Engine {
+// publishes the freshest overlay. It returns true on a consistent,
+// converged actuation and false when a consumer failed — a false return
+// keeps the state dirty for an autonomous retry (#3757).
+func New(actuate func() bool) *Engine {
 	return &Engine{
 		policies:       make(map[string]*policyState),
 		failedTests:    make(map[string]map[string]bool),
@@ -502,7 +525,15 @@ func (e *Engine) evaluateLocked(now time.Time) bool {
 }
 
 func (e *Engine) markDirtyLocked(changed bool) {
-	if changed && e.dirtySince.IsZero() {
+	if !changed {
+		return
+	}
+	// Bump the generation on EVERY change so a change that lands while an
+	// actuation is in flight is visible to the run loop's post-actuate
+	// clear check (#3757 last-writer-wins), not just the first
+	// clean→dirty transition.
+	e.dirtyGen++
+	if e.dirtySince.IsZero() {
 		e.dirtySince = e.now()
 	}
 }
@@ -528,22 +559,46 @@ func (e *Engine) run() {
 
 		now := e.now()
 		fire := false
+		var actuatingGen uint64
 		if !e.dirtySince.IsZero() &&
 			now.Sub(e.dirtySince) >= e.debounce &&
 			now.Sub(e.lastActuation) >= e.throttle {
 			fire = true
-			e.dirtySince = time.Time{}
+			// #3757 (M1): snapshot the generation being actuated and
+			// advance lastActuation, but do NOT clear the dirty bit yet —
+			// it is cleared only after the actuator reports a consistent,
+			// converged result (below). Advancing lastActuation paces a
+			// failed actuation's retry to at most one per throttle window
+			// (bounded), never a hot loop.
+			actuatingGen = e.dirtyGen
 			e.lastActuation = now
 		}
-		wake := e.nextWakeLocked(now)
 		e.mu.Unlock()
 
-		if fire && e.actuate != nil {
-			// Outside the lock; the actuator reads ActiveOverlay()
-			// itself, so it publishes the freshest state
-			// (last-writer-wins under flap storms).
-			e.actuate()
+		if fire {
+			// Outside the lock; the actuator reads ActiveOverlay() itself,
+			// so it publishes the freshest state (last-writer-wins under
+			// flap storms). A nil actuator (tests that drive the state
+			// machine directly) is a converged no-op.
+			ok := true
+			if e.actuate != nil {
+				ok = e.actuate()
+			}
+			e.mu.Lock()
+			if ok && e.dirtyGen == actuatingGen {
+				// Converged, and no newer change arrived while the
+				// actuator ran: clear the dirty bit. A failed actuation
+				// (ok==false) OR a concurrent re-dirty (dirtyGen advanced)
+				// keeps dirtySince set so the next wake re-actuates
+				// autonomously (#3757 M1/H1/H2/H3).
+				e.dirtySince = time.Time{}
+			}
+			e.mu.Unlock()
 		}
+
+		e.mu.Lock()
+		wake := e.nextWakeLocked(e.now())
+		e.mu.Unlock()
 
 		if !timer.Stop() {
 			select {

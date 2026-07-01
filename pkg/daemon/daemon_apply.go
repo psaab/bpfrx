@@ -1067,7 +1067,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// preserves a still-valid injected failover route and drops
 	// removed/edited entries on the commit itself.
 	if d.frr != nil {
-		d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
+		// The full apply path deliberately warns-and-continues on an FRR
+		// reload error (a transient FRR hiccup must not fail an
+		// otherwise-valid operator commit; a boot-time re-apply
+		// reconverges FRR). The returned error is only consumed by the
+		// ip-monitoring routes-only actuator, which must not publish a
+		// divergent snapshot on a hard failure (#3757).
+		_ = d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
 	}
 
 	// 3b. Apply next-table policy routing rules (ip rule)
