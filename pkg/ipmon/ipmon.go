@@ -137,6 +137,16 @@ type Engine struct {
 	kick chan struct{}
 	stop chan struct{}
 	done chan struct{}
+
+	// started / stopped guard the run-loop lifecycle (#3762). Both are
+	// read and written only under mu. started flips true on the first
+	// Start (a later Start is a no-op — never a second run() goroutine,
+	// which would double-close(done) and panic). stopped flips true on
+	// the first Stop and closes e.stop exactly once; a Stop before Start
+	// returns without waiting on e.done (no run loop exists to close it),
+	// and a Start after Stop is a no-op.
+	started bool
+	stopped bool
 }
 
 // New creates an engine. actuate is the daemon's routes-only actuator;
@@ -204,20 +214,39 @@ func (e *Engine) NotifyNextHopChange() {
 	}
 }
 
-// Start launches the actuation loop.
+// Start launches the actuation loop. It is idempotent (#3762 H9): a
+// second Start — or a Start after Stop — is a no-op, so the run() loop
+// is spawned at most once. A second goroutine would each defer
+// close(e.done) and the second close would panic.
 func (e *Engine) Start() {
+	e.mu.Lock()
+	if e.started || e.stopped {
+		e.mu.Unlock()
+		return
+	}
+	e.started = true
+	e.mu.Unlock()
 	go e.run()
 }
 
-// Stop terminates the actuation loop.
+// Stop terminates the actuation loop. It is safe to call before Start,
+// without Start, or more than once (#3762 H10): the first call closes
+// e.stop exactly once, and only a Stop that follows a real Start waits
+// on e.done — a Stop with no run loop returns immediately instead of
+// blocking forever on a channel nothing will ever close.
 func (e *Engine) Stop() {
-	select {
-	case <-e.stop:
-		return // already stopped
-	default:
+	e.mu.Lock()
+	if e.stopped {
+		e.mu.Unlock()
+		return
 	}
+	e.stopped = true
+	started := e.started
+	e.mu.Unlock()
 	close(e.stop)
-	<-e.done
+	if started {
+		<-e.done
+	}
 }
 
 // Apply installs a new policy set, preserving FAIL state for policies

@@ -1,3 +1,23 @@
+## 2026-07-01 — #3762 ip-monitoring: idempotent engine lifecycle (double Start no-op, Stop before/without Start safe)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3762 (MEDIUM, codex-review-160 H9+H10). The exported ipmon
+    Engine lifecycle was not idempotent. Start just did `go e.run()` with no
+    guard; run() defers close(e.done), so a second Start spawned a second
+    goroutine and the second deferred close(done) panicked ("close of closed
+    channel") after Stop (H9). Stop closed e.stop then blocked on `<-e.done`
+    unconditionally, so a Stop before/without Start (a common startup
+    error-unwind path) deadlocked forever — no run loop exists to close done
+    (H10). FIX: track `started`/`stopped` under mu. Start is a no-op if already
+    started or stopped (run() spawned at most once). Stop flips stopped and
+    closes e.stop exactly once, and waits on e.done ONLY when a run loop was
+    actually started; a Start after Stop is a no-op. RED-on-revert test
+    (TestLifecycleIdempotent, -race): reverting to `go e.run()` panics on the
+    second Start's close(done); reverting Stop deadlocks the Stop-before-Start
+    goroutine past a 2s timeout.
+  - **File(s)**: pkg/ipmon/ipmon.go (Engine.started/stopped + Start/Stop),
+    pkg/ipmon/ipmon_test.go (TestLifecycleIdempotent)
+
 ## 2026-07-01 — #3760 ip-monitoring: advance the cached desired overlay ONLY after apply_snapshot succeeds (mutate-after-publish)
 
 - **Timestamp**: 2026-07-01

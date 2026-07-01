@@ -339,6 +339,42 @@ func TestSuccessfulActuationClearsDirty(t *testing.T) {
 	}
 }
 
+// TestLifecycleIdempotent is the #3762 regression: the exported engine
+// lifecycle must be idempotent. A second Start must be a no-op (H9 — on
+// revert it spawns a second run() goroutine whose deferred close(e.done)
+// panics after Stop), and Stop must be safe before/without Start (H10 —
+// on revert it blocks forever on <-e.done because no run loop exists to
+// close it).
+func TestLifecycleIdempotent(t *testing.T) {
+	// H9: double Start does not spawn a second goroutine (no double
+	// close(done) panic), and repeated Stop is safe.
+	e := New(func() bool { return true })
+	e.debounce = time.Millisecond
+	e.throttle = time.Millisecond
+	e.Start()
+	e.Start() // no-op; on revert a second run() → panic on Stop
+	time.Sleep(10 * time.Millisecond)
+	e.Stop()
+	e.Stop() // idempotent, no panic
+
+	// H10: Stop before Start must return promptly, not deadlock.
+	e2 := New(func() bool { return true })
+	stopReturned := make(chan struct{})
+	go func() {
+		e2.Stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop before Start deadlocked (H10)")
+	}
+	// A Start after Stop must be a no-op (no run loop, no panic) and a
+	// further Stop stays safe.
+	e2.Start()
+	e2.Stop()
+}
+
 // TestPublishGatingBaseline: standby gating returns a nil overlay
 // (baseline) and re-enables on takeover.
 func TestPublishGatingBaseline(t *testing.T) {
