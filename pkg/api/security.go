@@ -640,11 +640,17 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		// #3623: set the pointer only on a match (the two early returns above
 		// leave it nil), so a matched first policy (id 0) is emitted as
 		// "policy_id":0 rather than dropped and mistaken for no match.
-		PolicyID:     &matchedID,
-		Action:       res.DisplayAction(),
-		SrcAddresses: res.SrcAddresses,
-		DstAddresses: res.DstAddresses,
-		Applications: res.Applications,
+		PolicyID: &matchedID,
+		// #3668: the stable rule identity (inventory join key) + the
+		// address-exclusion flags so a positive verdict against a
+		// source/destination-address-excluded rule does not read backwards.
+		RuleID:                     res.RuleID,
+		Action:                     res.DisplayAction(),
+		SrcAddresses:               res.SrcAddresses,
+		DstAddresses:               res.DstAddresses,
+		SourceAddressExcluded:      res.SourceAddressExcluded,
+		DestinationAddressExcluded: res.DestinationAddressExcluded,
+		Applications:               res.Applications,
 	})
 }
 

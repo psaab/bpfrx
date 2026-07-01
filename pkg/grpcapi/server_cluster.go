@@ -273,11 +273,17 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		// first policy (runtime id 0) is distinguishable on the wire from an
 		// unmatched response (field absent). The two early returns above leave
 		// PolicyId unset for the unmatched / host-inbound cases.
-		PolicyId:     proto.Uint32(res.PolicyID),
-		Action:       res.DisplayAction(),
-		SrcAddresses: res.SrcAddresses,
-		DstAddresses: res.DstAddresses,
-		Applications: res.Applications,
+		PolicyId: proto.Uint32(res.PolicyID),
+		// #3668: the stable rule identity (inventory join key) + the
+		// source/destination address-exclusion flags so a positive verdict for a
+		// negated-address rule conveys the exclusion instead of reading backwards.
+		RuleId:                     res.RuleID,
+		SourceAddressExcluded:      res.SourceAddressExcluded,
+		DestinationAddressExcluded: res.DestinationAddressExcluded,
+		Action:                     res.DisplayAction(),
+		SrcAddresses:               res.SrcAddresses,
+		DstAddresses:               res.DstAddresses,
+		Applications:               res.Applications,
 	}, nil
 }
 

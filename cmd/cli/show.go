@@ -1167,14 +1167,23 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		// back to the runtime policy / session-table ID / audit record when the
 		// same policy name repeats across zone pairs or global scope.
 		fmt.Printf("    Policy ID: %d\n", resp.GetPolicyId())
+		// #3668: also print the stable rule identity so a hit joins to the
+		// inventory / logs / tests even after a policy reorder shifts Policy ID.
+		if resp.GetRuleId() != "" {
+			fmt.Printf("    Rule ID: %s\n", resp.GetRuleId())
+		}
 		if resp.Global {
 			fmt.Printf("    Scope: global (match from-zone: %s, to-zone: %s)\n",
 				matchScopeZone(resp.FromZone), matchScopeZone(resp.ToZone))
 		} else {
 			fmt.Printf("    Scope: zone-pair (from-zone: %s, to-zone: %s)\n", resp.FromZone, resp.ToZone)
 		}
-		fmt.Printf("    Source addresses: %v\n", resp.SrcAddresses)
-		fmt.Printf("    Destination addresses: %v\n", resp.DstAddresses)
+		// #3668: annotate "(except)" for a source/destination-address-excluded
+		// rule so a positive verdict conveys the negation instead of reading as
+		// if the printed address list caused the match. Same SSOT suffix helper
+		// the local CLI uses, so the two surfaces cannot drift.
+		fmt.Printf("    Source addresses%s: %v\n", policymatch.ExceptSuffix(resp.GetSourceAddressExcluded()), resp.SrcAddresses)
+		fmt.Printf("    Destination addresses%s: %v\n", policymatch.ExceptSuffix(resp.GetDestinationAddressExcluded()), resp.DstAddresses)
 		fmt.Printf("    Applications: %v\n", resp.Applications)
 		fmt.Printf("    Action: %s\n", resp.Action)
 	} else if resp.HostInboundUnmatched {
