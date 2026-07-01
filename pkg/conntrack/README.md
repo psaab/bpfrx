@@ -58,3 +58,13 @@ sweep body must not reach through raw BPF session/counter methods directly.
 - `SkipSweep=true` saves ~19% CPU on the userspace-dp path. If you reach
   for it on the eBPF path, sessions never expire — the eBPF path has no
   alternative GC.
+- Aggressive-aging / session-limit config (`agingActive`, `earlyAgeout`,
+  `highWatermark`, `lowWatermark`, `sessionLimitEnabled`) is written by the
+  config-commit path via `SetAgingConfig` / `SetSessionLimitEnabled` under
+  `gc.mu`. The sweep goroutine runs on a *different* goroutine, so it snapshots
+  those fields under `gc.mu.RLock()` once at the top of `sweep()` and operates
+  on locals for the rest of the pass. `agingActive` is also runtime state the
+  watermark hysteresis toggles — the sweep publishes any transition back to
+  `gc.agingActive` under `gc.mu.Lock()`. Never read or write these fields from
+  the sweep path without holding `gc.mu`; lock-free access is a data race
+  (#3604) that `go test -race ./pkg/conntrack/` will flag.

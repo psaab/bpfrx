@@ -756,7 +756,7 @@ func TestGCAggressiveAgingHysteresis(t *testing.T) {
 func TestGCNextSweepDelayCapsStablePrimary(t *testing.T) {
 	gc := NewGC(&mockGCDP{}, 10*time.Second)
 
-	got := gc.nextSweepDelayAt(100, 1900, false, true, 2)
+	got := gc.nextSweepDelayAt(100, 1900, false, true, 2, false, 0)
 	if got != 60*time.Second {
 		t.Fatalf("nextSweepDelayAt() = %v, want %v", got, 60*time.Second)
 	}
@@ -765,7 +765,7 @@ func TestGCNextSweepDelayCapsStablePrimary(t *testing.T) {
 func TestGCNextSweepDelayUsesNearestExpiry(t *testing.T) {
 	gc := NewGC(&mockGCDP{}, 10*time.Second)
 
-	got := gc.nextSweepDelayAt(100, 125, false, true, 2)
+	got := gc.nextSweepDelayAt(100, 125, false, true, 2, false, 0)
 	if got != 25*time.Second {
 		t.Fatalf("nextSweepDelayAt() = %v, want %v", got, 25*time.Second)
 	}
@@ -774,7 +774,7 @@ func TestGCNextSweepDelayUsesNearestExpiry(t *testing.T) {
 func TestGCNextSweepDelayDisablesBackoffForSessionLimits(t *testing.T) {
 	gc := NewGC(&mockGCDP{}, 10*time.Second)
 
-	got := gc.nextSweepDelayAt(100, 1900, true, true, 2)
+	got := gc.nextSweepDelayAt(100, 1900, true, true, 2, false, 0)
 	if got != 10*time.Second {
 		t.Fatalf("nextSweepDelayAt() = %v, want %v", got, 10*time.Second)
 	}
@@ -802,4 +802,63 @@ func TestSetAgingConfigClampsNegativeEarlyAgeout(t *testing.T) {
 	if gc.earlyAgeout != 20 {
 		t.Fatalf("positive early-ageout not stored: earlyAgeout=%d (want 20)", gc.earlyAgeout)
 	}
+}
+
+// TestGCSweepConfigRace pins #3604: the GC sweep goroutine read (and, in the
+// watermark-hysteresis block, wrote) the aggressive-aging / session-limit
+// config fields (agingActive, earlyAgeout, highWatermark, lowWatermark,
+// sessionLimitEnabled) with no lock held, while SetAgingConfig /
+// SetSessionLimitEnabled write them under gc.mu. Running the sweep concurrently
+// with the config setters is therefore a data race.
+//
+// FAIL-ON-REVERT: under `go test -race`, revert gc.sweep() to read those fields
+// as gc.agingActive/gc.earlyAgeout/... (i.e. drop the gc.mu-guarded snapshot at
+// the top of sweep and the locked write-back of agingActive) and the race
+// detector aborts this test. With the snapshot/write-back fix it passes.
+func TestGCSweepConfigRace(t *testing.T) {
+	now := monotonicSeconds()
+	// A couple of live (non-expiring) sessions so the sweep takes the full
+	// iteration path and reads the config fields per entry, and lastTotal > 0
+	// so it never short-circuits on the empty-table fast path.
+	fwdKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+	revKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 80, DstPort: 1000}
+	dp := &mockGCDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			fwdKey: {
+				State: dataplane.SessStateEstablished, IsReverse: 0,
+				LastSeen: now, Timeout: 1800, ReverseKey: revKey,
+			},
+			revKey: {
+				State: dataplane.SessStateEstablished, IsReverse: 1,
+				LastSeen: now, Timeout: 1800,
+			},
+		},
+		v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{},
+	}
+
+	gc := NewGC(dp, time.Millisecond)
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Config-commit goroutine: mirrors the daemon apply path
+	// (daemon_apply.go SetAgingConfig / SetSessionLimitEnabled).
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			gc.SetAgingConfig(2, 50, 30)
+			gc.SetSessionLimitEnabled(i%2 == 0)
+		}
+	}()
+
+	// Sweep goroutine: the GC loop body.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			gc.sweep()
+		}
+	}()
+
+	wg.Wait()
 }
