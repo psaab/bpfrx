@@ -396,6 +396,14 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// #3615 (L04): FILTER-`reject` replies suppressed by TX-frame budget —
     /// the source-split sibling of `policy_reject_reply_budget_drops`.
     pub(super) filter_reject_reply_budget_drops: AtomicU64,
+    /// #3661: POLICY-`reject` replies dropped because the shared per-reason
+    /// REJECT_BUCKET rate-limit bucket was empty. Source-split of the
+    /// source-neutral aggregate `reject_rate_limited_total`; filter-source
+    /// drops are in `filter_reject_rate_limit_drops`.
+    pub(super) policy_reject_rate_limit_drops: AtomicU64,
+    /// #3661: FILTER-`reject` replies dropped by the rate-limit bucket — the
+    /// source-split sibling of `policy_reject_rate_limit_drops`.
+    pub(super) filter_reject_rate_limit_drops: AtomicU64,
     /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
     /// terminal `discard`/`reject` (or three-color policer) on the egress
     /// interface, now that the reply is classified by its OWN egress tuple.
@@ -825,6 +833,8 @@ impl BindingLiveState {
             filter_reject_sent: AtomicU64::new(0),
             policy_reject_reply_budget_drops: AtomicU64::new(0),
             filter_reject_reply_budget_drops: AtomicU64::new(0),
+            policy_reject_rate_limit_drops: AtomicU64::new(0),
+            filter_reject_rate_limit_drops: AtomicU64::new(0),
             time_exceeded_output_filter_drops: AtomicU64::new(0),
             policy_reject_output_filter_drops: AtomicU64::new(0),
             filter_reject_output_filter_drops: AtomicU64::new(0),
