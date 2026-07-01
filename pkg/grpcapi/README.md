@@ -117,6 +117,26 @@ contract.
   scope (for a wildcard-zone or global match the two can differ). The REST
   `MatchPoliciesResult` carries the same `queried_from_zone`/`queried_to_zone`
   JSON fields.
+- #3668: on a MATCH the response also carries `source_address_excluded` /
+  `destination_address_excluded` (proto fields 15/16) and the stable `rule_id`
+  (proto field 17), mirroring the inventory `PolicyRule` (fields 13/14/18). The
+  exclusion flags report whether the matched policy carries Junos
+  `source-address-excluded` / `destination-address-excluded` — the rule matches
+  every address EXCEPT those in `src_addresses`/`dst_addresses`. The shared
+  matcher (`matchAddr`) already inverts the address test correctly for the
+  excluded side; the flag is what stops a positive verdict from reading
+  BACKWARDS (before #3668 a hit against a source OUTSIDE an excluded set printed
+  the excluded list as if it caused the match — unsafe for a Junos-style
+  negated-address audit). `rule_id` is the stable `<from>-><to>/<name>` identity
+  the inventory `GetPolicies`, the snapshot, and the event path share
+  (`dpuserspace.StablePolicyRuleID`); a matched GLOBAL policy uses
+  `junos-global->junos-global/<name>` exactly like the inventory global rows, so
+  a simulator hit joins to the inventory / logs / tests even after a policy
+  reorder shifts the numeric `policy_id`. All three are additive, set only on a
+  positive match. The REST `MatchPoliciesResult` carries the same
+  `source_address_excluded`/`destination_address_excluded`/`rule_id` JSON
+  fields, and both CLI renderers annotate the exclusion as
+  `Source addresses (except): ...` plus a `Rule ID:` line.
 - The `test policy` operational command (local `pkg/cli` + remote `cmd/cli`
   → ShowText `test-policy:` topic → `showTestPolicy`) carries the same
   source-port input (#3107). The topic adds a `srcport=` key alongside the
