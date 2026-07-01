@@ -335,6 +335,27 @@ type PolicyMatch struct {
 	ToZone   string
 }
 
+// GlobalPolicyAppliesToZone reports whether a global policy with the given
+// match context can affect security zone `zone` — i.e. the global's from- or
+// to-zone scope can place `zone` on either side of an evaluated zone pair. An
+// empty FromZone/ToZone is the "any zone" wildcard (#3148, unscoped global).
+//
+// It mirrors the runtime AND-combined GlobalZoneScope match in the userspace
+// dataplane (userspace-dp/src/policy.rs: a global matches a packet iff its
+// from-scope matches the packet's from-zone AND its to-scope matches the
+// packet's to-zone): `zone` is a possible SOURCE when the from-scope is
+// any-or-`zone`, and a possible DESTINATION when the to-scope is any-or-`zone`.
+// Either possibility means the global can permit/deny some traffic that
+// involves `zone`, so it belongs in that zone's audit.
+//
+// Used by the zone-detail policy summary (#3658) to list the global tier the
+// runtime evaluates after zone-pair rules. Callers filter nil policies first.
+func GlobalPolicyAppliesToZone(m PolicyMatch, zone string) bool {
+	asSource := m.FromZone == "" || m.FromZone == zone
+	asDest := m.ToZone == "" || m.ToZone == zone
+	return asSource || asDest
+}
+
 // PolicyAction is the action to take when a policy matches.
 type PolicyAction int
 

@@ -803,6 +803,36 @@ Security zone: junos-host
   `Host-inbound system-services:` / `Host-inbound protocols:`.
 - Blank line between zones.
 
+**`show security zones detail` policy summary (#3658).** In `detail` mode
+each zone gains a `Policy summary` block that lists the policies that decide
+the zone's transit, in the SAME precedence order the dataplane evaluates
+them (zone-pair, then global, then the implicit default-policy catch-all):
+
+```
+  Policy summary (evaluation order: zone-pair, global, default-policy):
+    [zone-pair] trust -> untrust: allow-web (permit)
+    [global] any -> untrust: block-bad (deny)
+    [default] default-policy: deny
+```
+
+- `[zone-pair] <from> -> <to>: <name> (<action>)` -- a from-zone/to-zone
+  policy referencing this zone (either side).
+- `[global] <from> -> <to>: <name> (<action>)` -- a GLOBAL policy that can
+  affect this zone (M04). An unscoped global prints `any` for both scopes;
+  a scoped global (`match from-zone`/`to-zone`, #3148) prints its zone scope.
+  A global is listed for a zone only when the zone can appear on either side
+  of a pair the global matches (`config.GlobalPolicyAppliesToZone`).
+- `[default] default-policy: <action>` -- the effective default-policy
+  catch-all is ALWAYS shown (M05), so a zone with no explicit rule reports
+  `default-policy: deny` / `permit` / `reject` rather than a bare
+  `(no policies)`, which hid whether unmatched transit is denied or permitted.
+- When a zone has no zone-pair AND no applicable global policy, the summary
+  prints `(no zone-pair or global policies affecting this zone)` above the
+  always-present `[default]` line.
+- The gRPC text `zones-detail` view renders the identical three-tier block;
+  both mirror the REST inventory global + synthetic default-policy rows
+  (`pkg/api/security.go`) and structured `GetPolicies` (#3363).
+
 ---
 
 ## Security: NAT Source Rule All

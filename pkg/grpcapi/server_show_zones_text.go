@@ -157,9 +157,16 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 				}
 			}
 		}
-		// Policy detail breakdown
-		buf.WriteString("  Policy summary:\n")
-		totalPolicies := 0
+		// Policy detail breakdown. #3658 (M04/M05): span all THREE tiers the
+		// runtime evaluates in order — zone-pair, applicable GLOBAL policies,
+		// then the effective default-policy catch-all — so this gRPC-text peer
+		// of the local-CLI renderer (pkg/cli/cli_show_security_zones.go) can no
+		// longer hide a global rule that affects the zone (M04) nor collapse to
+		// a bare "(no policies)" that obscures the unmatched-transit disposition
+		// (M05). Parity with REST (pkg/api/security.go) + gRPC GetPolicies
+		// (#3363).
+		buf.WriteString("  Policy summary (evaluation order: zone-pair, global, default-policy):\n")
+		zonePairPolicies := 0
 		for _, zpp := range cfg.Security.Policies {
 			// #3476: skip a nil zone-pair set rather than dereferencing
 			// zpp.FromZone.
@@ -173,22 +180,36 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 					if pol == nil {
 						continue
 					}
-					action := "permit"
-					switch pol.Action {
-					case 1:
-						action = "deny"
-					case 2:
-						action = "reject"
-					}
-					fmt.Fprintf(buf, "    %s -> %s: %s (%s)\n",
-						zpp.FromZone, zpp.ToZone, pol.Name, action)
-					totalPolicies++
+					fmt.Fprintf(buf, "    [zone-pair] %s -> %s: %s (%s)\n",
+						zpp.FromZone, zpp.ToZone, pol.Name,
+						policyActionStr(pol.Action))
+					zonePairPolicies++
 				}
 			}
 		}
-		if totalPolicies == 0 {
-			buf.WriteString("    (no policies)\n")
+		globalPolicies := 0
+		for _, gp := range cfg.Security.GlobalPolicies {
+			// #3476-style defensiveness: skip a nil global rule.
+			if gp == nil {
+				continue
+			}
+			if !config.GlobalPolicyAppliesToZone(gp.Match, name) {
+				continue
+			}
+			fmt.Fprintf(buf, "    [global] %s -> %s: %s (%s)\n",
+				globalZoneScopeLabel(gp.Match.FromZone),
+				globalZoneScopeLabel(gp.Match.ToZone),
+				gp.Name, policyActionStr(gp.Action))
+			globalPolicies++
 		}
+		if zonePairPolicies == 0 && globalPolicies == 0 {
+			buf.WriteString("    (no zone-pair or global policies affecting this zone)\n")
+		}
+		// M05: always surface the effective default-policy catch-all instead of
+		// hiding it behind "(no policies)".
+		fmt.Fprintf(buf, "    [default] %s: %s\n",
+			dataplane.DefaultPolicyName,
+			policyActionStr(cfg.Security.DefaultPolicy))
 		buf.WriteString("\n")
 	}
 	if readErr != nil {
