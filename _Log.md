@@ -1,3 +1,31 @@
+## 2026-07-01 — #3704 review fold: CLI reloadSyslog zone-map was still positional (4th reverse-map)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Hostile review of PR #3707 found a fourth zone-id reverse-map
+    the #3704 unification missed: `pkg/cli/apply.go reloadSyslog` built the
+    syslog zone-id→name map POSITIONALLY (`znMap[uint16(i+1)] = name` over
+    sorted names). This is a LIVE display path — the daemon builds the embedded
+    CLI with its own shared `EventReader` (daemon_run.go), and `reloadSyslog`
+    runs UNCONDITIONALLY on every local-console commit/rollback (cli_config.go,
+    cli.go rollback) AFTER the daemon reconcile already published the name-hash
+    map via `applySyslogConfig`/`buildZoneIDs`. The positional write CLOBBERED
+    the shared reader with wrong ids, regressing local-TTY-console RT_FLOW
+    syslog zone-name rendering to `zone-N` (gRPC/remote/API commits were
+    correct). FIX: extract `syslogZoneNameMap(cfg)` keyed by
+    `config.StableZoneID(name)` — byte-identical to the daemon's map and
+    order-independent, so a shared reader always agrees (contrast: dropping the
+    write would depend on the daemon reconcile always running first). Removed
+    the now-unused `sort` import. Added RED-on-revert test
+    (`TestSyslogZoneNameMapUsesStableZoneID`): a 3-zone config → the reverse map
+    resolves each zone at its StableZoneID slot (goes RED — empty at the
+    name-hash key, populated at positional 1..N — on revert; verified by
+    temporarily restoring the positional keying).
+  - **File(s)**: pkg/cli/apply.go,
+    pkg/cli/apply_syslog_zonemap_3704_test.go (new), _Log.md
+  - **Validation**: `go test ./pkg/cli/... ./pkg/daemon/...` green;
+    `go build ./pkg/... ./cmd/...` OK; gofmt clean on changed files (the
+    cli.go:503 vet unreachable-code warning is pre-existing, not in this diff).
+
 ## 2026-07-01 — #3704 buildZoneSnapshots wire zone id unified onto StableZoneID (completes #3075)
 
 - **Timestamp**: 2026-07-01
