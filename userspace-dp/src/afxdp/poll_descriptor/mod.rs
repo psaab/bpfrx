@@ -162,6 +162,33 @@ fn emit_junos_host_deny(
     );
 }
 
+/// #3610: emit the tuple-rich host-inbound-traffic deny event for a host-bound
+/// packet rejected by the ingress zone's `host-inbound-traffic` admission gate.
+/// Resolves the application from the flow's destination (service) port with the
+/// same `resolve_policy_deny_app_id` the transit / junos-host deny path uses,
+/// then delegates to [`emit_host_inbound_deny_event`] (which reuses the #3615
+/// policy-deny event machinery with a distinct host-inbound reason). Shared by
+/// all three host-inbound deny arms: session-hit, session-miss, and the #3292
+/// flowless LocalDelivery arm — so every host-inbound drop emits an identical,
+/// tuple-rich record.
+fn emit_host_inbound_deny(
+    forwarding: &ForwardingState,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    from_zone_id: u16,
+    now_ns: u64,
+) {
+    emit_host_inbound_deny_event(
+        event_stream,
+        flow,
+        meta,
+        from_zone_id,
+        resolve_policy_deny_app_id(&forwarding.app_catalog, flow, flow.forward_key.dst_port),
+        now_ns,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn junos_host_policy_drops(
     forwarding: &ForwardingState,
@@ -286,7 +313,15 @@ fn flowless_local_delivery_verdict(
         meta,
         ingress_zone_override,
     ) {
-        None => return FlowlessLocalVerdict::HostInboundDeny,
+        None => {
+            // #3610: emit the tuple-rich host-inbound deny event before the
+            // silent flowless drop so an operator can see WHICH host-bound
+            // flowless flow (a non-first fragment / no-L4 packet) the zone
+            // host-inbound gate dropped. Reuses the policy-deny event machinery
+            // via the shared helper, identical to the flow-backed arms.
+            emit_host_inbound_deny(forwarding, event_stream, flow, meta, from_zone_id, now_ns);
+            return FlowlessLocalVerdict::HostInboundDeny;
+        }
         Some((action, lo0_log)) => {
             // #3615: flowless — no reply can be synthesized (a fragment has no
             // L4 header to build a RST/ICMP unreachable from), so emit the
@@ -918,7 +953,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         resolved.origin,
                                     );
                                     telemetry.dbg.local += 1;
-                                    telemetry.dbg.policy_deny += 1;
+                                    // #3610/M07: account the host-inbound deny on
+                                    // its OWN debug counter, NOT `policy_deny` —
+                                    // conflating host-inbound drops with security-
+                                    // policy denies sent dataplane investigations
+                                    // down the wrong path.
+                                    telemetry.dbg.host_inbound_deny += 1;
                                     // #3326: account the host-inbound deny so
                                     // `GlobalCtrHostInboundDeny` (REST/Prometheus/
                                     // `show security flow statistics`) reflects the
@@ -926,6 +966,20 @@ pub(super) fn poll_binding_process_descriptor(
                                     // flushed into BindingLiveState.
                                     telemetry.counters.touched = true;
                                     telemetry.counters.host_inbound_denied_packets += 1;
+                                    // #3610: emit the tuple-rich host-inbound deny
+                                    // event so an operator can see WHICH host-bound
+                                    // flow was dropped (src/dst/proto/port + zone +
+                                    // ingress ifindex), not just an aggregate
+                                    // counter. Reuses the #3615 policy-deny event
+                                    // machinery with a distinct host-inbound reason.
+                                    emit_host_inbound_deny(
+                                        worker_ctx.forwarding,
+                                        worker_ctx.event_stream,
+                                        flow,
+                                        meta,
+                                        resolved.metadata.ingress_zone,
+                                        now_ns,
+                                    );
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
@@ -1801,13 +1855,27 @@ pub(super) fn poll_binding_process_descriptor(
                                     // Host-inbound denied: silent drop, never
                                     // cached.
                                     telemetry.dbg.local += 1;
-                                    telemetry.dbg.policy_deny += 1;
+                                    // #3610/M07: own debug counter, not policy_deny.
+                                    telemetry.dbg.host_inbound_deny += 1;
                                     telemetry.counters.touched = true;
                                     // #3326: account the host-inbound deny so
                                     // `GlobalCtrHostInboundDeny` reflects the drop
                                     // (REST/Prometheus/`show security flow
                                     // statistics`).
                                     telemetry.counters.host_inbound_denied_packets += 1;
+                                    // #3610: emit the tuple-rich host-inbound deny
+                                    // event so an operator can see WHICH host-bound
+                                    // flow was dropped, not just an aggregate
+                                    // counter (reuses the policy-deny event
+                                    // machinery with a distinct host-inbound reason).
+                                    emit_host_inbound_deny(
+                                        worker_ctx.forwarding,
+                                        worker_ctx.event_stream,
+                                        flow,
+                                        meta,
+                                        from_zone_id,
+                                        now_ns,
+                                    );
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
@@ -3186,7 +3254,12 @@ pub(super) fn poll_binding_process_descriptor(
                             FlowlessLocalVerdict::Deliver => {}
                             FlowlessLocalVerdict::HostInboundDeny => {
                                 telemetry.dbg.local += 1;
-                                telemetry.dbg.policy_deny += 1;
+                                // #3610/M07: own debug counter, not policy_deny.
+                                // The tuple-rich host-inbound deny event is emitted
+                                // inside `flowless_local_delivery_verdict` (co-
+                                // located with the decision, like the junos-host /
+                                // lo0 emits there).
+                                telemetry.dbg.host_inbound_deny += 1;
                                 telemetry.counters.touched = true;
                                 // #3326: account the host-inbound deny so
                                 // `GlobalCtrHostInboundDeny` reflects the drop.
@@ -5037,6 +5110,55 @@ mod flowless_local_delivery_tests {
             verdict(&fw, &flowless_flow(PROTO_TCP), flowless_meta(PROTO_TCP), ZONE),
             FlowlessLocalVerdict::HostInboundDeny,
         );
+    }
+
+    // #3610 fail-on-revert (flowless): a flowless host-bound packet denied by the
+    // zone host-inbound gate must ALSO emit the tuple-rich host-inbound deny
+    // event (the #3292 flowless LocalDelivery arm), not just return the verdict.
+    // Removing the `emit_host_inbound_deny` call in the `None => HostInboundDeny`
+    // branch drops the event → RED (empty channel).
+    #[test]
+    fn flowless_host_inbound_deny_emits_event() {
+        let (handle, rx) = crate::event_stream::test_worker_handle(
+            8,
+            crate::event_stream::DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        );
+        let fw = fw_with_host_inbound(ZONE, &["ssh"], &[]);
+        let flow = flowless_flow(PROTO_TCP);
+        let v = flowless_local_delivery_verdict(
+            &fw,
+            Some(&handle),
+            flowless_extra(),
+            &flow,
+            flowless_meta(PROTO_TCP),
+            INGRESS_IF,
+            ZONE,
+            Some(ZONE),
+            64,
+            crate::afxdp::neighbor::monotonic_nanos(),
+        );
+        assert_eq!(v, FlowlessLocalVerdict::HostInboundDeny);
+
+        let event = rx
+            .try_recv()
+            .expect("#3610: flowless host-inbound deny must emit a tuple event")
+            .decode_dataplane_event()
+            .expect("host-inbound deny payload");
+        assert_eq!(
+            event.kind,
+            crate::event_stream::codec::DataplaneEventKind::PolicyDeny
+        );
+        // Distinct host-inbound reason (6), NOT the transit policy reason (5).
+        assert_eq!(event.reason, 6);
+        assert_eq!(event.action, 0, "host-inbound is a silent drop → DENY");
+        assert_eq!(event.policy_id, 0);
+        assert_eq!(event.ingress_zone_id, ZONE);
+        assert_eq!(event.src_ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+        assert_eq!(event.dst_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 99, 1)));
+        assert_eq!(handle.dataplane_event_stats().policy_deny.sent, 1);
     }
 
     // (b) NO over-gating: a flowless packet the zone DOES admit must still be

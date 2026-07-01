@@ -10,6 +10,15 @@ const RT_FLOW_ACTION_DENY: u8 = 0;
 const RT_FLOW_ACTION_PERMIT: u8 = 1;
 const RT_FLOW_ACTION_REJECT: u8 = 2;
 const RT_FLOW_CLOSE_REASON_POLICY: u8 = 5;
+// #3610: a host-inbound-traffic admission deny (the ingress zone's
+// `host-inbound-traffic` gate rejecting a host-bound / control-plane packet) is
+// NOT a transit security-policy deny. It rides the SAME `PolicyDeny` event kind
+// / wire path (so it inherits the per-kind rate limiter, queue budget, and Go
+// RT_FLOW rendering — no parallel emit path), but carries this distinct reason
+// byte so the Go structured RT_FLOW_SESSION_DENY record and operators can tell a
+// control-plane host-inbound drop apart from a transit policy deny. Must equal
+// the Go `closeReasonHostInbound` (pkg/logging/ringbuf.go).
+const RT_FLOW_CLOSE_REASON_HOST_INBOUND: u8 = 6;
 const NS_PER_SEC: u64 = 1_000_000_000;
 
 const SCREEN_SYN_FLOOD: u32 = 1 << 0;
@@ -190,6 +199,77 @@ pub(super) fn emit_policy_deny_event(
         // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns)
         // here at emit time so a backlogged Go-side delivery cannot skew the
         // logged event time to consumption time. `now_ns` is CLOCK_MONOTONIC.
+        timestamp_ns: crate::event_stream::mono_ns_to_wall_clock_unix_ns(now_ns),
+    };
+    let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
+}
+
+/// #3610: emit a tuple-rich RT_FLOW deny event for a host-inbound-traffic
+/// admission deny — a host-bound (LocalDelivery) packet rejected by the ingress
+/// zone's `host-inbound-traffic` gate. Before #3610 these drops were accounted
+/// only as aggregate counters (`host_inbound_denied_packets`) with no dataplane
+/// event, so operators could see THAT host-inbound denies happened but not who
+/// hit which control-plane service.
+///
+/// Reuses the #3615 policy-deny event machinery: the SAME
+/// `DataplaneEventKind::PolicyDeny` wire kind, per-kind rate limiter, queue
+/// budget, and Go RT_FLOW renderer / decoder — no parallel emit path is added.
+/// Only the reason byte (`RT_FLOW_CLOSE_REASON_HOST_INBOUND`) distinguishes it
+/// from a transit security-policy deny.
+///
+/// A host-inbound admission deny is ALWAYS a silent drop: there is no admitting/
+/// denying security policy and no reject reply is ever synthesized, so the action
+/// is unconditionally DENY, `policy_id`/`rule_id` are 0 (not a security policy),
+/// the egress "zone" is the firewall host itself (#3110 sentinel 0, matching the
+/// junos-host deny), `owner_rg_id` is 0 (host-local, not policy-forwarded), and
+/// the record carries no NAT translation. The 5-tuple, ingress zone, ingress
+/// ifindex, protocol, and resolved application come from the denied flow so an
+/// operator can see WHICH control-plane flow was dropped (issue #3610 / Codex
+/// H06 + L04). Cold path only (LocalDelivery deny).
+#[inline]
+pub(super) fn emit_host_inbound_deny_event(
+    event_stream: Option<&EventStreamWorkerHandle>,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    ingress_zone_id: u16,
+    app_id: u16,
+    now_ns: u64,
+) {
+    let Some(event_stream) = event_stream else {
+        return;
+    };
+    let event = DataplaneEventPayload {
+        kind: DataplaneEventKind::PolicyDeny,
+        addr_family: flow.forward_key.addr_family,
+        protocol: flow.forward_key.protocol,
+        // Host-inbound admission is a silent drop — never a reject.
+        action: RT_FLOW_ACTION_DENY,
+        src_ip: flow.src_ip,
+        dst_ip: flow.dst_ip,
+        src_port: flow.forward_key.src_port,
+        dst_port: flow.forward_key.dst_port,
+        // LocalDelivery applies no NAT to a host-bound packet.
+        nat_src_ip: None,
+        nat_dst_ip: None,
+        nat_src_port: 0,
+        nat_dst_port: 0,
+        ingress_zone_id,
+        // The egress "zone" is the firewall host itself; carry the #3110
+        // sentinel 0, same as the junos-host deny (see emit_junos_host_deny).
+        egress_zone_id: 0,
+        ingress_ifindex: ingress_ifindex_to_wire(meta.ingress_ifindex),
+        // Host-inbound admission is not a security policy — no policy/rule id.
+        policy_id: 0,
+        rule_id: 0,
+        term_id: 0,
+        reason: RT_FLOW_CLOSE_REASON_HOST_INBOUND,
+        // Host-local sessions are not policy-forwarded; owner_rg_id 0.
+        owner_rg_id: 0,
+        application_id: app_id,
+        filter_id: 0,
+        screen_id: 0,
+        // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns) at
+        // emit time. `now_ns` is CLOCK_MONOTONIC.
         timestamp_ns: crate::event_stream::mono_ns_to_wall_clock_unix_ns(now_ns),
     };
     let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
@@ -747,6 +827,52 @@ mod tests {
             event.action, RT_FLOW_ACTION_DENY,
             "a suppressed reject must log DENY (silent drop), not REJECT"
         );
+    }
+
+    /// #3610 fail-on-revert: the host-inbound deny emitter builds a tuple-rich
+    /// RT_FLOW deny event that rides the `PolicyDeny` wire kind (so it reuses the
+    /// #3615 policy-deny event machinery) but carries the DISTINCT host-inbound
+    /// reason and an unconditional DENY action (host-inbound is always a silent
+    /// drop, never a reject). Reverting the reason back to the policy reason — or
+    /// the action away from DENY — makes these assertions fail; the event would
+    /// then be indistinguishable from a transit security-policy deny (the #3610
+    /// conflation the fix removes).
+    #[test]
+    fn host_inbound_deny_event_carries_host_inbound_reason() {
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        emit_host_inbound_deny_event(Some(&handle), &flow, test_meta(), 7, 0, mono_now_ns());
+
+        let event = rx
+            .try_recv()
+            .expect("host-inbound deny frame")
+            .decode_dataplane_event()
+            .expect("host-inbound deny payload");
+        assert_eq!(event.kind, DataplaneEventKind::PolicyDeny);
+        assert_eq!(event.action, RT_FLOW_ACTION_DENY);
+        assert_eq!(event.reason, RT_FLOW_CLOSE_REASON_HOST_INBOUND);
+        assert_ne!(
+            event.reason, RT_FLOW_CLOSE_REASON_POLICY,
+            "a host-inbound deny must NOT alias the transit policy-deny reason"
+        );
+        // No admitting/denying security policy on a host-inbound deny.
+        assert_eq!(event.policy_id, 0);
+        // Egress "zone" is the firewall host itself (#3110 sentinel 0).
+        assert_eq!(event.egress_zone_id, 0);
+        assert_eq!(event.ingress_zone_id, 7);
+        // Full tuple so an operator sees WHICH control-plane flow was denied.
+        assert_eq!(event.src_ip, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+        assert_eq!(event.dst_ip, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)));
+        assert_eq!(event.src_port, 49152);
+        assert_eq!(event.dst_port, 443);
+        assert_eq!(event.ingress_ifindex, 42);
+        assert!(
+            event.timestamp_ns > 0,
+            "host-inbound deny event must carry a real wall-clock timestamp, got 0"
+        );
+        // Rides the policy-deny per-kind stats/rate-limiter — not a new channel.
+        assert_eq!(handle.dataplane_event_stats().policy_deny.sent, 1);
     }
 
     #[test]
