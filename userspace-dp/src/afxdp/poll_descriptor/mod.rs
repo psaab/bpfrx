@@ -228,6 +228,7 @@ fn flowless_local_delivery_verdict(
     extra: crate::filter::TermMatchExtra<'_>,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
+    logical_ingress_ifindex: i32,
     from_zone_id: u16,
     ingress_zone_override: Option<u16>,
     packet_len: u64,
@@ -251,6 +252,7 @@ fn flowless_local_delivery_verdict(
     // global accept does not falsely exempt a fragment whose type we cannot read.
     match host_inbound_gated_lo0_action(
         forwarding,
+        logical_ingress_ifindex,
         from_zone_id,
         0,
         matches!(flow.dst_ip, IpAddr::V6(_)),
@@ -824,8 +826,20 @@ pub(super) fn poll_binding_process_descriptor(
                         let lo0_action = if resolved.decision.resolution.disposition
                             == ForwardingDisposition::LocalDelivery
                         {
+                            // #3609: the per-interface host-inbound override is
+                            // keyed by the LOGICAL unit ifindex; resolve the
+                            // physical bind port + VLAN to it so a host-bound
+                            // packet on a VLAN sub-interface gets its own
+                            // override (mirrors the input-filter HIT re-eval).
+                            let ingress_logical = resolve_ingress_logical_ifindex(
+                                worker_ctx.forwarding,
+                                meta.ingress_ifindex as i32,
+                                meta.ingress_vlan_id,
+                            )
+                            .unwrap_or(meta.ingress_ifindex as i32);
                             match host_inbound_gated_lo0_action(
                                 worker_ctx.forwarding,
+                                ingress_logical,
                                 resolved.metadata.ingress_zone,
                                 resolved.key.dst_port,
                                 matches!(flow.dst_ip, IpAddr::V6(_)),
@@ -1712,6 +1726,11 @@ pub(super) fn poll_binding_process_descriptor(
                         {
                             match host_inbound_gated_lo0_action(
                                 worker_ctx.forwarding,
+                                // #3609: the host-inbound override is keyed by
+                                // the LOGICAL unit ifindex (already resolved
+                                // above for the zone-pair lookup); pass it, not
+                                // the raw physical `meta.ingress_ifindex`.
+                                ingress_logical,
                                 from_zone_id,
                                 flow.forward_key.dst_port,
                                 matches!(flow.dst_ip, IpAddr::V6(_)),
@@ -3108,6 +3127,10 @@ pub(super) fn poll_binding_process_descriptor(
                             crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
                             l3_flow,
                             meta,
+                            // #3609: the host-inbound override map is keyed by
+                            // the LOGICAL unit ifindex; pass the resolved value,
+                            // not the raw physical bind port.
+                            ingress_logical,
                             from_zone_id,
                             ingress_zone_override,
                             desc.len as u64,
@@ -4963,6 +4986,7 @@ mod flowless_local_delivery_tests {
             flowless_extra(),
             flow,
             meta,
+            meta.ingress_ifindex as i32,
             from_zone_id,
             Some(from_zone_id),
             64,
