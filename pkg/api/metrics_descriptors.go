@@ -1036,8 +1036,50 @@ func newCollector(srv *Server) *xpfCollector {
 				"ADDITION to the SYN-cookie TX-frame budget gate "+
 				"(which is queue protection, not a rate cap). A nonzero value "+
 				"flags a rejected-flow flood being clamped before it amplifies "+
-				"into unbounded RST/ICMP backscatter (#2472).",
+				"into unbounded RST/ICMP backscatter (#2472). Source-neutral: "+
+				"the rate-limit bucket is global-per-reason (#3657 M02 note — a "+
+				"per-source split needs a helper change).",
 			nil, nil,
+		),
+		// #3657 (H13/H15/M02): source-split reject reply telemetry. #3615
+		// wired the per-source sent / TX-frame reply-budget / egress
+		// output-filter legs onto BindingStatus; these expose them so
+		// alerting can tell policy-reject from filter-reject and success from
+		// suppression. Summed across bindings, labeled source=policy|filter,
+		// emitted unconditionally (a 0 is a real "no reject activity" signal).
+		userspaceRejectSent: prometheus.NewDesc(
+			"xpf_userspace_reject_sent_total",
+			"Locally-generated `reject` replies (TCP RST or ICMP/ICMPv6 "+
+				"administratively-prohibited unreachable) actually enqueued, "+
+				"split by source: a security-policy `then reject` "+
+				"(source=policy, includes a zone `tcp-rst`) vs a "+
+				"firewall-filter `then reject` (source=filter). This is the "+
+				"active reject SUCCESS volume — as important as the suppression "+
+				"counters for validating vSRX-style reject under load "+
+				"(#3615/#3657 H13).",
+			[]string{"source"}, nil,
+		),
+		userspaceRejectReplyBudgetDrops: prometheus.NewDesc(
+			"xpf_userspace_reject_reply_budget_drops_total",
+			"Locally-generated `reject` replies suppressed because the "+
+				"per-tick TX-frame budget was exhausted, split by source "+
+				"(policy vs firewall-filter). Budget pressure during a flood is "+
+				"exactly when a `reject` is silently downgraded to a truthful "+
+				"`deny`; the source split tells policy-reject starvation from "+
+				"filter-reject starvation and is distinct from the global "+
+				"rate-limit bucket (xpf_userspace_reject_rate_limited_total) "+
+				"and an egress output-filter drop (#3615 L04/#3657 H14/M02).",
+			[]string{"source"}, nil,
+		),
+		userspaceRejectOutputFilterDrops: prometheus.NewDesc(
+			"xpf_userspace_reject_output_filter_drops_total",
+			"Locally-generated `reject` replies dropped by an egress output "+
+				"firewall filter (terminal discard/reject or three-color "+
+				"policer) applied to the reflected reply's own egress tuple, "+
+				"split by source (policy vs firewall-filter). Distinguishes an "+
+				"operator-installed output filter suppressing a reject from a "+
+				"TX-frame budget or rate-limit drop (#3615 L05/#3657 H15/M02).",
+			[]string{"source"}, nil,
 		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",

@@ -907,6 +907,24 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceRejectSent: prometheus.NewDesc(
+			"xpf_userspace_reject_sent_total",
+			"reject replies sent by source",
+			[]string{"source"},
+			nil,
+		),
+		userspaceRejectReplyBudgetDrops: prometheus.NewDesc(
+			"xpf_userspace_reject_reply_budget_drops_total",
+			"reject reply tx-frame budget drops by source",
+			[]string{"source"},
+			nil,
+		),
+		userspaceRejectOutputFilterDrops: prometheus.NewDesc(
+			"xpf_userspace_reject_output_filter_drops_total",
+			"reject reply output-filter drops by source",
+			[]string{"source"},
+			nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"flow-cache active flows",
@@ -967,14 +985,28 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 				Interface:         "ge-0-0-1",
 				ActiveFlowCount:   9,
 				FlowCacheCapacity: 10,
+				// #3657: per-source reject reply legs, summed across
+				// bindings and emitted with source=policy|filter labels.
+				PolicyRejectSent:              5,
+				FilterRejectSent:              2,
+				PolicyRejectReplyBudgetDrops:  3,
+				FilterRejectReplyBudgetDrops:  1,
+				PolicyRejectOutputFilterDrops: 7,
+				FilterRejectOutputFilterDrops: 4,
 			},
 			{
-				Slot:              1,
-				QueueID:           1,
-				WorkerID:          3,
-				Interface:         "ge-0-0-2",
-				ActiveFlowCount:   3,
-				FlowCacheCapacity: 10,
+				Slot:                          1,
+				QueueID:                       1,
+				WorkerID:                      3,
+				Interface:                     "ge-0-0-2",
+				ActiveFlowCount:               3,
+				FlowCacheCapacity:             10,
+				PolicyRejectSent:              6,
+				FilterRejectSent:              8,
+				PolicyRejectReplyBudgetDrops:  9,
+				FilterRejectReplyBudgetDrops:  10,
+				PolicyRejectOutputFilterDrops: 11,
+				FilterRejectOutputFilterDrops: 12,
 			},
 		},
 	}
@@ -982,6 +1014,11 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	ch := make(chan prometheus.Metric)
 	go func() {
 		c.emitUserspaceDynamicBufferMetrics(ch, status)
+		// #3657: source-split reject reply telemetry is emitted by a
+		// dedicated helper off the same status; collect it here so the
+		// assertions below cover the sent / reply-budget / output-filter
+		// legs alongside the aggregate rate-limit counter.
+		c.emitRejectObservability(ch, status)
 		close(ch)
 	}()
 	var got []prometheus.Metric
@@ -995,9 +1032,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// gre_encap_df_oversize_drops_total counter (= 17) + the #2782
 	// gre_decap_checksum_invalid_drops_total counter (= 18) + the #2472
 	// per-reason generated-error rate-limit trio (time_exceeded /
-	// packet_too_big / reject) = 21.
-	if len(got) != 21 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 21 metrics, got %d", len(got))
+	// packet_too_big / reject) = 21 + the #3657 source-split reject trio
+	// (sent / reply-budget / output-filter) × 2 sources = 27.
+	if len(got) != 27 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 27 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1031,6 +1069,18 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceTimeExceededRateLimited, nil, 11)
 	assertCounterClose(t, got, c.userspacePacketTooBigRateLimited, nil, 12)
 	assertCounterClose(t, got, c.userspaceRejectRateLimited, nil, 13)
+	// #3657 (H15/M02): source-split reject reply telemetry, summed across
+	// the two bindings above and labeled source=policy|filter. Reverting the
+	// emitRejectObservability helper (or dropping the descriptors) turns
+	// these RED — the series would be absent entirely. sent: policy=5+6=11,
+	// filter=2+8=10; reply-budget: policy=3+9=12, filter=1+10=11;
+	// output-filter: policy=7+11=18, filter=4+12=16.
+	assertCounterClose(t, got, c.userspaceRejectSent, map[string]string{"source": "policy"}, 11)
+	assertCounterClose(t, got, c.userspaceRejectSent, map[string]string{"source": "filter"}, 10)
+	assertCounterClose(t, got, c.userspaceRejectReplyBudgetDrops, map[string]string{"source": "policy"}, 12)
+	assertCounterClose(t, got, c.userspaceRejectReplyBudgetDrops, map[string]string{"source": "filter"}, 11)
+	assertCounterClose(t, got, c.userspaceRejectOutputFilterDrops, map[string]string{"source": "policy"}, 18)
+	assertCounterClose(t, got, c.userspaceRejectOutputFilterDrops, map[string]string{"source": "filter"}, 16)
 	// #1861: install-refusal trio emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionCreateDrops, nil, 9)
 	assertCounterClose(t, got, c.userspaceSessionInstallAdmissionRefused, nil, 8)
