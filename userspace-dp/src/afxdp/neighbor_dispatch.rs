@@ -300,11 +300,19 @@ pub(super) fn retry_pending_neigh(
         // inputs from that frame so an output filter's tcp-flags / is-fragment /
         // icmp-type term matches the same packet it would on the immediate path.
         let cos_extra = crate::afxdp::frame::term_match_extra_from_frame(source_frame, pkt.meta);
+        // #3642: this is the ARP/NDP-resolved retransmit of a buffered transit
+        // frame — the egress output filter must match the POST-NAT on-wire tuple.
+        // Derive the egress wire key from the pre-NAT buffered key + this frame's
+        // NAT decision (apply-to-this-packet form, correct for both directions).
+        let tx_selection_wire_key = pkt
+            .flow_key
+            .as_ref()
+            .map(|key| crate::session::forward_wire_key(key, decision.nat));
         let cos = resolve_cos_tx_selection_at(
             forwarding,
             decision.resolution.egress_ifindex,
             pkt.meta,
-            pkt.flow_key.as_ref(),
+            tx_selection_wire_key.as_ref(),
             cos_extra,
             now_ns,
         );

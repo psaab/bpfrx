@@ -821,6 +821,13 @@ Important current behavior:
 
 - shaping is enforced on the **egress** interface
 - queue selection prefers the shaped interface **egress output filter**
+- the egress output filter matches the **post-NAT (on-wire) tuple** (#3642):
+  Junos applies an interface `filter output` AFTER NAT, so a filter term
+  matching source/destination address or port sees the TRANSLATED
+  (SNAT/DNAT) values, and a NAT64 flow is matched by the EGRESS-family
+  output filter. Forwarding-class selection, DSCP rewrite, counters,
+  `then log`, and terminal accept/discard on the output filter are all
+  driven by the on-wire tuple, not the pre-NAT ingress tuple
 - if no egress CoS filter is configured, queue selection falls back to the
   current **ingress interface input filter**
 - if neither filter assigns a forwarding class, queue selection falls back to

@@ -372,6 +372,375 @@ fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
     );
 }
 
+/// #3642 forward leg: a SNAT'd transit flow's egress `filter output` must match
+/// the TRANSLATED (post-NAT) SOURCE address, because Junos applies output
+/// filters AFTER NAT. The filter discards TCP `from source-address 172.16.80.8`
+/// (the SNAT pool address); the pre-NAT source is 10.0.61.100. With the fix,
+/// `build_live_forward_request_from_frame` evaluates the output filter against
+/// the post-NAT wire key (`forward_wire_key`, src 172.16.80.8) so the discard
+/// term matches and the packet is dropped (`req` None). On revert the eval uses
+/// the pre-NAT tuple (src 10.0.61.100), which the term does NOT match -> the
+/// packet forwards -> `req` Some -> RED.
+#[test]
+fn output_filter_matches_post_snat_source_forward_leg_3642() {
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 60,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        // SNAT: source rewritten to the pool address on the wire.
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            ..NatDecision::default()
+        },
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        },
+    };
+    let forwarding = build_forwarding_state(&ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 12,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-drop-src".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-drop-src".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-snat-src".into(),
+                protocols: vec!["tcp".into()],
+                source_addresses: vec!["172.16.80.8/32".into()],
+                source_constrained: true,
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    });
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+
+    // Counter-factual: the PRE-NAT source key does NOT match the discard term.
+    let pre_nat = resolve_cos_tx_selection_at(
+        &forwarding,
+        12,
+        meta,
+        Some(&flow.forward_key),
+        crate::filter::TermMatchExtra::default(),
+        123,
+    );
+    assert!(
+        !pre_nat.drop,
+        "pre-NAT src 10.0.61.100 must NOT match `source-address 172.16.80.8/32` \
+         (documents the #3642 bug the fix removes)"
+    );
+
+    let req = build_live_forward_request_from_frame(
+        &WorkerBindingLookup::default(),
+        2,
+        &frag_test_ingress_ident(),
+        XdpDesc {
+            addr: 0,
+            len: 0,
+            options: 0,
+        },
+        &[],
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        Some(&event_handle),
+        None,
+        None,
+    );
+    assert!(
+        req.is_none(),
+        "SNAT'd flow: the output filter matching the TRANSLATED src 172.16.80.8 \
+         must discard the packet; forwarding means it matched the pre-NAT tuple \
+         (#3642)"
+    );
+}
+
+/// #3642 reverse leg: for the SNAT reply the flow's `forward_key` is the reply's
+/// own ingress tuple (src = responder, dst = the SNAT address). The reverse
+/// `decision.nat` restores the original client address (rewrite_dst =
+/// 10.0.61.100), and `apply_nat_ipv4` writes that to the frame — so
+/// `forward_wire_key` yields the egress reply tuple (dst 10.0.61.100). An egress
+/// (LAN-side) output filter `from destination-address 10.0.61.100` must match
+/// the restored destination. On revert the eval sees the pre-de-NAT dst
+/// (172.16.80.8) and does NOT match -> forwards -> RED. Proves the fix is
+/// direction-correct (no separate reverse_wire_key needed).
+#[test]
+fn output_filter_matches_post_snat_dest_reverse_leg_3642() {
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 60,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100))),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 61,
+        },
+        // Reverse of the SNAT: restore the original client as the wire dst.
+        nat: NatDecision {
+            rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100))),
+            ..NatDecision::default()
+        },
+    };
+    // Reply ingress tuple: responder -> the SNAT pool address.
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            src_port: 443,
+            dst_port: 12345,
+        },
+    };
+    let forwarding = build_forwarding_state(&ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: 12,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "lan-drop-dst".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "lan-drop-dst".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-client-dst".into(),
+                protocols: vec!["tcp".into()],
+                destination_addresses: vec!["10.0.61.100/32".into()],
+                destination_constrained: true,
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    });
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+
+    let pre_nat = resolve_cos_tx_selection_at(
+        &forwarding,
+        12,
+        meta,
+        Some(&flow.forward_key),
+        crate::filter::TermMatchExtra::default(),
+        123,
+    );
+    assert!(
+        !pre_nat.drop,
+        "pre-de-NAT dst 172.16.80.8 must NOT match `destination-address \
+         10.0.61.100/32` (documents the reverse-leg #3642 bug)"
+    );
+
+    let req = build_live_forward_request_from_frame(
+        &WorkerBindingLookup::default(),
+        2,
+        &frag_test_ingress_ident(),
+        XdpDesc {
+            addr: 0,
+            len: 0,
+            options: 0,
+        },
+        &[],
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        Some(&event_handle),
+        None,
+        None,
+    );
+    assert!(
+        req.is_none(),
+        "SNAT reply: the LAN output filter matching the RESTORED dst 10.0.61.100 \
+         must discard; forwarding means it matched the pre-de-NAT dst (#3642 \
+         reverse leg)"
+    );
+}
+
+/// #3642 DNAT: a DNAT'd flow's egress `filter output` must match the TRANSLATED
+/// (post-DNAT) DESTINATION. The filter discards TCP `to destination-address
+/// 10.0.61.50` (the internal server); the pre-NAT dst is the public VIP
+/// 203.0.113.5. With the fix the output filter sees the post-DNAT wire dst
+/// (10.0.61.50) and discards; on revert it sees 203.0.113.5 and forwards -> RED.
+#[test]
+fn output_filter_matches_post_dnat_dest_3642() {
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 60,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 50))),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 61,
+        },
+        // DNAT: destination rewritten to the internal server on the wire.
+        nat: NatDecision {
+            rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 50))),
+            ..NatDecision::default()
+        },
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            src_port: 40000,
+            dst_port: 443,
+        },
+    };
+    let forwarding = build_forwarding_state(&ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: 12,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "lan-drop-dnat".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "lan-drop-dnat".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-internal-dst".into(),
+                protocols: vec!["tcp".into()],
+                destination_addresses: vec!["10.0.61.50/32".into()],
+                destination_constrained: true,
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    });
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+
+    let pre_nat = resolve_cos_tx_selection_at(
+        &forwarding,
+        12,
+        meta,
+        Some(&flow.forward_key),
+        crate::filter::TermMatchExtra::default(),
+        123,
+    );
+    assert!(
+        !pre_nat.drop,
+        "pre-DNAT dst 203.0.113.5 must NOT match `destination-address \
+         10.0.61.50/32` (documents the DNAT #3642 bug)"
+    );
+
+    let req = build_live_forward_request_from_frame(
+        &WorkerBindingLookup::default(),
+        2,
+        &frag_test_ingress_ident(),
+        XdpDesc {
+            addr: 0,
+            len: 0,
+            options: 0,
+        },
+        &[],
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        Some(&event_handle),
+        None,
+        None,
+    );
+    assert!(
+        req.is_none(),
+        "DNAT'd flow: the output filter matching the TRANSLATED dst 10.0.61.50 \
+         must discard; forwarding means it matched the pre-NAT VIP (#3642)"
+    );
+}
+
 #[test]
 fn icmp_reverse_key_keeps_identifier_position() {
     let flow = SessionFlow {
