@@ -537,6 +537,21 @@ routing, and only on double fault).
 - Failover actuation is a differential frr-reload + one snapshot push
   per debounce window; detection time (probe interval × threshold)
   dominates end-to-end failover latency.
+- **Consistency + autonomous self-heal (#3757).** The actuator's two
+  consumers commit together or not at all: the FRR reload runs FIRST,
+  and a HARD FRR reload failure (the manager's "nothing converged"
+  outcome) ABORTS the actuation before the userspace snapshot is
+  published — so the kernel FIB and the dataplane FIB never diverge into
+  a split-brain (kernel on the old route, dataplane on the failover
+  route). A degraded reload (#1880, additive `vtysh -f` applied) is
+  treated as success because the new routes are already live in the
+  kernel. On any consumer failure (FRR reload, snapshot publish, or the
+  FIB-generation bump) the engine keeps the overlay **dirty** and
+  retries on the next throttle-paced sweep until it converges — recovery
+  is autonomous and does not wait for an unrelated commit, lease, or
+  probe transition. The dirty bit clears only after a fully consistent
+  actuation, and a change that lands mid-actuation is preserved
+  (last-writer-wins).
 - **Per-cycle transition evaluation (#2527).** An RPM test's pass/fail
   status is a per-test aggregate, evaluated once across the whole probe
   set (`probe-count` probes per cycle), Junos ip-monitoring style. The

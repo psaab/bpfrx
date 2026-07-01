@@ -43,6 +43,35 @@ apply semaphore as operator commits and bumps the FIB generation ONLY
 after a successful snapshot publish (ordering is load-bearing — see
 `actuateRouteOverlayLocked`).
 
+### Consistency + autonomous self-heal (#3757)
+
+The actuator returns a `bool`; the engine clears its dirty bit **only
+after** the actuator reports a fully consistent, converged actuation.
+Any consumer failure keeps the state dirty and the run loop retries
+autonomously on the next sweep, throttle-paced (at most one
+frr-reload + snapshot per throttle window), until it converges — no
+future config change is required to recover.
+
+- **Hard FRR reload error (H1):** the FRR manager contract guarantees
+  *nothing converged* — the kernel FIB still holds the previous routes
+  — so the actuator **aborts before publishing** the userspace
+  snapshot. Publishing on top would split the FIB (kernel on the old
+  route, dataplane on the failover route). Both FIBs stay on the last
+  consistent state and the retry re-applies once FRR recovers. A
+  **degraded** reload (#1880, additive `vtysh -f` applied) is *not* a
+  hard error: the new routes are live in the kernel, so the matching
+  snapshot publish keeps the two FIBs in agreement while the FRR
+  manager's own retry converges stale-config removal.
+- **Snapshot publish error (H2):** no FIB-generation bump, state stays
+  dirty, retried on the next sweep.
+- **Unconfirmed FIB-generation bump (H3):** `pendingFIBBump` is armed
+  *and* the actuation reports failure, so the bump retries on the next
+  autonomous sweep (not only on a future unrelated actuation).
+- **Dirty cleared only on success (M1):** the run loop snapshots a
+  `dirtyGen` before actuating and clears `dirtySince` only when the
+  actuation converged AND no newer change landed meanwhile
+  (last-writer-wins preserved).
+
 ## HA
 
 Overlay is runtime state, never config: it does not sync to the peer
@@ -88,7 +117,9 @@ FRR DHCP default route; see the RFC 2131 coupling rule in
 
 ## Entry points
 
-- `Engine`, `New(actuate func())`, `Start/Stop` — `ipmon.go`.
+- `Engine`, `New(actuate func() bool)`, `Start/Stop` — `ipmon.go`.
+  The actuator returns `true` on a consistent, converged actuation and
+  `false` to keep the state dirty for an autonomous retry (#3757).
 - `Apply(cfg, results)` — install committed policies, preserving FAIL
   state for surviving (name, probe) pairs.
 - `HandleTransition(rpm.Transition)` — the sensor input (wired to
