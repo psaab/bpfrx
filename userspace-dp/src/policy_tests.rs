@@ -2838,16 +2838,21 @@ fn test_policy_destination_address_excluded_inverts_match() {
 }
 
 // #2008 fail-open hardening: an `*-excluded` side whose configured
-// address set is unexpectedly EMPTY (e.g. a typo'd address that was
-// silently dropped during parse) must fail CLOSED — it must NOT
-// invert into match-ALL. The Go compiler now rejects such typos at
-// commit, but the dataplane is hardened as defense-in-depth.
+// address set is legitimately EMPTY must fail CLOSED — it must NOT
+// invert into match-ALL.
+//
+// #3711: a MALFORMED literal no longer reaches this branch — it now
+// rejects the whole snapshot at parse (see
+// test_malformed_v3_literal_rejected_*). So this test exercises the
+// residual legit-empty path: an empty-string literal token is a valid
+// no-op that yields a fully-empty set. The fail-closed evaluation branch
+// (source_v4_empty + excluded → deny, never match-all) must still hold.
 #[test]
 fn test_empty_excluded_source_fails_closed_v4() {
-    // source_literals=["totally-bogus"] drops to nothing → MatchNone →
+    // source_literals=[""] is a valid no-op token → both families empty →
     // source_v4_empty == true. With source_address_excluded, the side
     // must NOT match any v4 source (fail-closed), not match-all.
-    let mut snap = v3_rule("r-empty-excl-src", &[], &["totally-bogus"]);
+    let mut snap = v3_rule("r-empty-excl-src", &[], &[""]);
     snap.source_address_excluded = true;
     let counter_store = PolicyCounterStore::default();
     let state = parse_policy_state_with_counters(
@@ -2858,11 +2863,11 @@ fn test_empty_excluded_source_fails_closed_v4() {
         &counter_store,
     )
     .expect("parse");
-    // The dropped-typo set leaves the side empty; confirm the
+    // The empty-token set leaves the side empty; confirm the
     // precomputed flag agrees so the fail-closed branch is exercised.
     assert!(
         state.rules[0].source_v4_empty,
-        "an all-dropped excluded source set must be flagged empty"
+        "a legitimately empty excluded source set must be flagged empty"
     );
     // Any v4 source → fail-closed → default-deny (NOT match-all).
     assert_eq!(
@@ -2883,8 +2888,11 @@ fn test_empty_excluded_source_fails_closed_v4() {
 
 #[test]
 fn test_empty_excluded_destination_fails_closed_v6() {
+    // #3711: an empty-string literal is a valid no-op that yields a
+    // fully-empty destination set (a malformed token would now reject the
+    // snapshot outright). The fail-closed branch must still hold.
     let mut snap = v3_rule("r-empty-excl-dst", &[], &["any"]);
-    snap.destination_literals = vec!["not-an-address".to_string()];
+    snap.destination_literals = vec!["".to_string()];
     snap.destination_address_excluded = true;
     let counter_store = PolicyCounterStore::default();
     let state = parse_policy_state_with_counters(
@@ -2897,7 +2905,7 @@ fn test_empty_excluded_destination_fails_closed_v6() {
     .expect("parse");
     assert!(
         state.rules[0].destination_v6_empty,
-        "an all-dropped excluded destination set must be flagged empty (v6)"
+        "a legitimately empty excluded destination set must be flagged empty (v6)"
     );
     assert_eq!(
         evaluate_policy(
@@ -2912,6 +2920,272 @@ fn test_empty_excluded_destination_fails_closed_v6() {
         ),
         PolicyAction::Deny,
         "an empty excluded destination set must fail-closed, not match-all"
+    );
+}
+
+// ===================================================================
+// #3711: malformed v3 literals + address-book prefixes must fail the
+// whole snapshot CLOSED, not silently drop to MatchNone and let a deny
+// fall through to default-permit. These are the v3 siblings of the
+// #3367 legacy-literal reject.
+// ===================================================================
+
+// RED-on-revert: pre-#3711, source_literals=["10.0.0.999"] silently
+// dropped to MatchNone; a `deny` rule then matched nothing and the flow
+// fell through to default-permit — a security fail-OPEN. The whole
+// snapshot must now be rejected.
+#[test]
+fn test_malformed_v3_literal_rejected_source() {
+    let mut snap = v3_rule("deny-malformed-src", &[], &["10.0.0.999"]);
+    snap.rule_id = "deny-malformed-src".to_string();
+    snap.action = "deny".to_string();
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        // default_policy = permit: exactly the issue's fall-through target.
+        "permit",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableV3Address { rule_id, address }) => {
+            assert_eq!(rule_id, "deny-malformed-src");
+            assert_eq!(address, "10.0.0.999");
+        }
+        other => panic!("expected UnrepresentableV3Address, got {other:?}"),
+    }
+}
+
+// RED-on-revert: a malformed DESTINATION v3 literal is caught symmetrically.
+#[test]
+fn test_malformed_v3_literal_rejected_destination() {
+    let mut snap = v3_rule("deny-malformed-dst", &[], &["any"]);
+    snap.rule_id = "deny-malformed-dst".to_string();
+    snap.destination_literals = vec!["2001:db8::/xyz".to_string()];
+    snap.action = "deny".to_string();
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "permit",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableV3Address { rule_id, address }) => {
+            assert_eq!(rule_id, "deny-malformed-dst");
+            assert_eq!(address, "2001:db8::/xyz");
+        }
+        other => panic!("expected UnrepresentableV3Address, got {other:?}"),
+    }
+}
+
+// The sentinel preflight (#3261) still wins over the generic malformed
+// reject: `__unsupported_address__` is not a parseable literal, so it
+// would also trip the #3711 check, but the more-specific sentinel
+// diagnostic must be surfaced first.
+#[test]
+fn test_v3_sentinel_still_reported_before_malformed() {
+    let mut snap = v3_rule("deny-sentinel", &[], &["__unsupported_address__"]);
+    snap.rule_id = "deny-sentinel".to_string();
+    snap.action = "deny".to_string();
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "permit",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableAddress { rule_id }) => {
+            assert_eq!(rule_id, "deny-sentinel");
+        }
+        other => panic!("expected UnrepresentableAddress (sentinel), got {other:?}"),
+    }
+}
+
+// A VALID v3 literal still parses and enforces the deny as before (guards
+// against the reject over-firing on legitimate input).
+#[test]
+fn test_valid_v3_literal_still_enforces_deny() {
+    let mut snap = v3_rule("deny-valid-src", &[], &["10.0.0.0/24"]);
+    snap.action = "deny".to_string();
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "permit",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("a valid v3 literal must parse");
+    // Source inside 10.0.0.0/24 → deny is enforced.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.0.0.5".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a source inside the valid deny literal must be denied"
+    );
+    // Source outside → default-permit (rule does not match).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "192.0.2.5".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "a source outside the deny literal falls through to default-permit"
+    );
+}
+
+// RED-on-revert: a deny rule backed by an address book whose prefix is
+// malformed silently collapsed the book to MatchNone pre-#3711. The whole
+// snapshot must now be rejected, naming the book + offending token.
+#[test]
+fn test_malformed_book_prefix_rejected() {
+    let books = [book(77, "corp", &["10.0.0.999"], &[])];
+    let mut r = v3_rule("deny-book", &[77], &[]);
+    r.action = "deny".to_string();
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "permit",
+        std::slice::from_ref(&r),
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableAddressBookPrefix {
+            book_id,
+            book_name,
+            family,
+            address,
+        }) => {
+            assert_eq!(book_id, 77);
+            assert_eq!(book_name, "corp");
+            assert_eq!(family, "v4");
+            assert_eq!(address, "10.0.0.999");
+        }
+        other => panic!("expected UnrepresentableAddressBookPrefix, got {other:?}"),
+    }
+}
+
+// M02 RED-on-revert: a wrong-family token (an IPv6 CIDR placed in
+// prefixes_v4) was silently routed into the v6 set pre-#3711. It must now
+// be rejected as a family violation.
+#[test]
+fn test_book_wrong_family_v6_in_v4_rejected() {
+    let books = [book(78, "mixed", &["2001:db8::/32"], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "permit",
+        &[],
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableAddressBookPrefix {
+            book_id,
+            family,
+            address,
+            ..
+        }) => {
+            assert_eq!(book_id, 78);
+            assert_eq!(family, "v4", "a v6 token in prefixes_v4 is a v4-array violation");
+            assert_eq!(address, "2001:db8::/32");
+        }
+        other => panic!("expected UnrepresentableAddressBookPrefix, got {other:?}"),
+    }
+}
+
+// M02 mirror: an IPv4 CIDR placed in prefixes_v6 is a v6-array violation.
+#[test]
+fn test_book_wrong_family_v4_in_v6_rejected() {
+    let books = [book(79, "mixed2", &[], &["10.0.0.0/8"])];
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "permit",
+        &[],
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableAddressBookPrefix {
+            book_id,
+            family,
+            address,
+            ..
+        }) => {
+            assert_eq!(book_id, 79);
+            assert_eq!(family, "v6", "a v4 token in prefixes_v6 is a v6-array violation");
+            assert_eq!(address, "10.0.0.0/8");
+        }
+        other => panic!("expected UnrepresentableAddressBookPrefix, got {other:?}"),
+    }
+}
+
+// A book with valid per-family prefixes still parses and enforces a
+// book-backed deny (guards against the family check over-firing).
+#[test]
+fn test_valid_book_prefixes_still_enforce_deny() {
+    let books = [book(80, "ok", &["10.0.0.0/24"], &["2001:db8::/32"])];
+    let mut r = v3_rule("deny-book-ok", &[80], &[]);
+    r.action = "deny".to_string();
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "permit",
+        std::slice::from_ref(&r),
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("a book with valid per-family prefixes must parse");
+    // v4 source inside the book → deny enforced.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.0.0.5".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a v4 source inside the book must be denied"
+    );
+    // v6 source inside the book → deny enforced.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8::5".parse().expect("src"),
+            "2001:4860::8888".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a v6 source inside the book must be denied"
     );
 }
 
@@ -3063,12 +3337,16 @@ fn test_excluded_destination_v4_only_permits_v6_3023() {
 }
 
 // #2008 contract preserved by #3023: when the excluded set is empty
-// across BOTH families (genuine typo/parse-drop), it must STILL
-// fail-closed for v4 AND v6. The one-family relief must not relax the
-// true empty-set case — this stays GREEN before and after the #3023 fix.
+// across BOTH families, it must STILL fail-closed for v4 AND v6. The
+// one-family relief must not relax the true empty-set case.
+//
+// #3711: a malformed token (the former "genuine typo/parse-drop") now
+// rejects the whole snapshot at parse, so this uses a valid empty-string
+// literal (a no-op token that yields a fully-empty set) to still exercise
+// the both-families fail-closed evaluation branch.
 #[test]
 fn test_fully_empty_excluded_source_fails_closed_both_families_3023() {
-    let mut snap = v3_rule("r-fully-empty-excl-src", &[], &["totally-bogus"]);
+    let mut snap = v3_rule("r-fully-empty-excl-src", &[], &[""]);
     snap.source_address_excluded = true;
     let counter_store = PolicyCounterStore::default();
     let state = parse_policy_state_with_counters(
@@ -3081,7 +3359,7 @@ fn test_fully_empty_excluded_source_fails_closed_both_families_3023() {
     .expect("parse");
     assert!(
         state.rules[0].source_v4_empty && state.rules[0].source_v6_empty,
-        "a fully-dropped excluded source set is empty across both families"
+        "a fully-empty excluded source set is empty across both families"
     );
     // v4 packet → fail-closed.
     assert_eq!(
@@ -4036,6 +4314,150 @@ fn icmp_skew_old_snapshot_without_type_matches_all() {
     let state = parse_policy_state("deny", &[snap], &test_zone_name_to_id());
     assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Permit);
     assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 0), PolicyAction::Permit);
+}
+
+// ---------------------------------------------------------------------------
+// #3712 — invalid ICMP application field combinations must FAIL CLOSED at the
+// Rust snapshot boundary. The Go strict commit gate (#3348) rejects both, but
+// the tolerant load / peer-sync path downgrades to a warning, so a corrupt /
+// hand-built / older-peer-synced snapshot can still carry them here — the only
+// enforcement plane. Two combos:
+//   - icmp-code WITHOUT icmp-type (H04): `from_matches` only steers a term into
+//     icmp_constraints when icmp_type.is_some(), so a code-without-type ICMP
+//     term becomes an empty-range range_terms entry = MATCH-ALL ICMP (the code
+//     silently ignored). A permit under default-deny then fails OPEN.
+//   - icmp-type/code on a NON-ICMP protocol (H05): the term is pushed into
+//     icmp_constraints under the non-ICMP protocol (losing any dst-port), and
+//     `matches` skips that arm for a non-ICMP packet → the term NEVER matches,
+//     so a `deny` falls through to default-permit (fail OPEN).
+// ---------------------------------------------------------------------------
+
+/// Build a one-term policy rule carrying arbitrary ICMP fields on `protocol`,
+/// for the #3712 fail-closed tests. `default_permit` traffic is admitted unless
+/// a matching rule denies it; the rule's own action is passed in.
+fn icmp_fields_rule(
+    rule_id: &str,
+    protocol: &str,
+    dst_port: &str,
+    icmp_type: Option<u8>,
+    icmp_code: Option<u8>,
+    action: &str,
+) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        rule_id: rule_id.to_string(),
+        name: rule_id.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec![rule_id.to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: format!("app-{rule_id}"),
+            protocol: protocol.to_string(),
+            source_port: String::new(),
+            destination_port: dst_port.to_string(),
+            icmp_type,
+            icmp_code,
+            inactivity_timeout: None,
+        }],
+        action: action.to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn icmp_code_without_type_rejects_whole_snapshot() {
+    // H04 RED-on-revert: proto icmp, icmp_type=None, icmp_code=Some(3), permit,
+    // default deny. Pre-fix `from_matches` dropped the term into an empty-range
+    // range_terms entry (match-ALL ICMP), so parse succeeded (Ok) and a
+    // type-8/code-0 packet (which should NOT match `code 3`) was Permitted — a
+    // fail-open. The fix rejects the whole snapshot. Reverting the reject returns
+    // Ok(state) here, so this is non-tautological.
+    let store = PolicyCounterStore::default();
+    let bad = icmp_fields_rule("code-no-type", "icmp", "", None, Some(3), "permit");
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::InvalidApplicationIcmpFields {
+            rule_id,
+            application,
+            reason,
+        }) => {
+            assert_eq!(rule_id, "code-no-type");
+            assert_eq!(application, "app-code-no-type");
+            assert_eq!(reason, "icmp-code set without icmp-type");
+        }
+        other => panic!("expected InvalidApplicationIcmpFields, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_icmp_term_with_icmp_type_rejects_whole_snapshot() {
+    // H05 RED-on-revert: proto tcp, dst 80, icmp_type=Some(8), deny, default
+    // permit. Pre-fix the term was pushed into icmp_constraints under TCP (losing
+    // dst-port 80), and `matches` skipped it for a real (non-ICMP) TCP packet →
+    // the deny NEVER matched and default-permit admitted TCP/80 (a security
+    // fail-open). The fix rejects the whole snapshot. Reverting returns Ok(state),
+    // so this is non-tautological.
+    let store = PolicyCounterStore::default();
+    let bad = icmp_fields_rule("tcp-icmp-type", "tcp", "80", Some(8), None, "deny");
+    let result =
+        parse_policy_state_with_counters("permit", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::InvalidApplicationIcmpFields {
+            rule_id,
+            application,
+            reason,
+        }) => {
+            assert_eq!(rule_id, "tcp-icmp-type");
+            assert_eq!(application, "app-tcp-icmp-type");
+            assert_eq!(reason, "icmp-type/icmp-code set on a non-ICMP protocol");
+        }
+        other => panic!("expected InvalidApplicationIcmpFields, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_icmp_term_with_icmp_code_rejects_whole_snapshot() {
+    // H05 sibling: an icmp_code on a non-ICMP protocol (udp) is equally invalid
+    // and is caught by the non-ICMP-protocol arm (which fires for ANY icmp field
+    // on a non-ICMP protocol), before the code-without-type arm.
+    let store = PolicyCounterStore::default();
+    let bad = icmp_fields_rule("udp-icmp-code", "udp", "", None, Some(3), "deny");
+    let result =
+        parse_policy_state_with_counters("permit", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::InvalidApplicationIcmpFields { rule_id, reason, .. }) => {
+            assert_eq!(rule_id, "udp-icmp-code");
+            assert_eq!(reason, "icmp-type/icmp-code set on a non-ICMP protocol");
+        }
+        other => panic!("expected InvalidApplicationIcmpFields, got {other:?}"),
+    }
+}
+
+#[test]
+fn valid_icmp_type_and_code_still_compiles_and_matches() {
+    // Guard: a WELL-FORMED type+code constraint on an ICMP protocol must still
+    // compile AND honor the code (no false reject, no match-all). Rule: icmp
+    // type 3 code 1 permit, default deny.
+    let bad_free = icmp_fields_rule("dest-unreach-host", "icmp", "", Some(3), Some(1), "permit");
+    let state = parse_policy_state("deny", &[bad_free], &test_zone_name_to_id());
+    // Exact type+code → permit.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 1), PolicyAction::Permit);
+    // Same type, DIFFERENT code → must NOT match (proves code is honored, not
+    // ignored the way the H04 match-all bug ignored it) → default deny.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 2), PolicyAction::Deny);
+    // Different type → must NOT match → default deny.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Deny);
+}
+
+#[test]
+fn valid_icmpv6_type_and_code_still_compiles() {
+    // The icmpv6 protocol is equally a valid host for type/code constraints.
+    let store = PolicyCounterStore::default();
+    let good = icmp_fields_rule("v6-param", "icmpv6", "", Some(4), Some(1), "permit");
+    parse_policy_state_with_counters("deny", &[good], &test_zone_name_to_id(), &[], &store)
+        .expect("a well-formed icmpv6 type+code app must compile");
 }
 
 // ---------------------------------------------------------------------------

@@ -464,6 +464,21 @@ func (c *ctl) testPolicy(args []string) error {
 		return nil
 	}
 
+	// #3709: the legacy `test-policy:` ShowText topic is a comma/equals-delimited
+	// key=value string, so a zone name that itself contains a comma or equals
+	// cannot round-trip — the server splits it into bogus segments and rejects
+	// or MISPARSES it. Config permits such a zone name (only exact reserved
+	// tokens are rejected in compiler_validate_strict.go reservedZoneNames), so
+	// rather than silently corrupt the query, fail closed here with a clear
+	// error pointing the operator at `show security match-policies`, which uses
+	// the typed MatchPolicies RPC and has no delimiter fragility. The local
+	// `test policy` (pkg/cli) evaluates such a zone directly and is unaffected.
+	for _, z := range []struct{ label, val string }{{"from-zone", fromZone}, {"to-zone", toZone}} {
+		if strings.ContainsAny(z.val, ",=") {
+			return fmt.Errorf("%s %q contains a comma or equals, which the 'test policy' topic cannot carry; use 'show security match-policies' instead", z.label, z.val)
+		}
+	}
+
 	topic := fmt.Sprintf("test-policy:from=%s,to=%s", fromZone, toZone)
 	if srcIP != "" {
 		topic += ",src=" + srcIP

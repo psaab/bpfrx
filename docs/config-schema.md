@@ -3016,13 +3016,46 @@ both are handled in `parseApplicationTerms` + the deferred strict gate):
   top-level path also records `UnknownICMP` so the malformed value is caught on
   the tolerant load path (which does not run `SchemaValidate`).
 
-No wire/Rust change: the snapshot already carries `ICMPType`/`ICMPCode` and the
-matcher already enforces `icmp_constraints` (#3020). Regression coverage:
+The snapshot already carries `ICMPType`/`ICMPCode` and the matcher already
+enforces `icmp_constraints` (#3020). Regression coverage:
 `pkg/config/compiler_application_junos_ping_3348_test.go` (alias echo type top-level
 + inline term, all-ICMP stays unconstrained, explicit grammar, explicit-over-alias,
 both strict guards) and the end-to-end matcher test
 `pkg/policymatch/app_junos_ping_3348_test.go` (custom `protocol junos-ping` permits
 type 8, denies 13/5).
+
+**#3712 — Rust snapshot-boundary fail-closed backstop for the two invalid ICMP
+combos.** The #3348 strict guards run at COMMIT, but `lenientApplicationSpecs`
+downgrades both to a `cfg.Warnings` entry on the tolerant load / HA peer-sync
+path — so a corrupt / hand-built / older-peer-synced snapshot can still carry an
+invalid combo to the userspace helper, the only enforcement plane. The pre-#3712
+Rust matcher turned each into a WRONG-behaving term rather than rejecting it:
+
+- **`icmp-code` without `icmp-type` → match-ALL ICMP (fail-OPEN).**
+  `CompiledApplications::from_matches` (`userspace-dp/src/policy.rs`) steers a
+  term into `icmp_constraints` ONLY when `icmp_type.is_some()`, so a
+  code-without-type ICMP term fell through to an empty-range `range_terms`
+  entry = protocol-only match-all; the `icmp_code` was silently dropped and a
+  narrow permit widened to every ICMP message.
+- **`icmp-type`/`icmp-code` on a non-ICMP protocol → never-match (fail-OPEN for
+  a deny).** The term was pushed into `icmp_constraints` under the non-ICMP
+  protocol (losing any destination-port), and `matches` skips that arm for a
+  non-ICMP packet, so the term never matched — a `deny tcp/80 icmp-type 8`
+  never applied and default-permit admitted the traffic.
+
+`parse_applications` now records the first offending term and
+`parse_policy_state_with_counters` rejects the whole snapshot with
+`SnapshotIntegrityError::InvalidApplicationIcmpFields { rule_id, application,
+reason }` (the preflight keeps the previous good state; a fresh boot keeps the
+default-deny `PolicyState`), consistent with the #2124/#3367/#3711 fail-closed
+family. The non-ICMP-protocol arm is checked first (any icmp field is
+meaningless there); the code-without-type arm applies once the protocol is
+ICMP/ICMPv6. Regression coverage: `userspace-dp/src/policy_tests.rs`
+(`icmp_code_without_type_rejects_whole_snapshot`,
+`non_icmp_term_with_icmp_type_rejects_whole_snapshot`,
+`non_icmp_term_with_icmp_code_rejects_whole_snapshot`,
+`valid_icmp_type_and_code_still_compiles_and_matches`,
+`valid_icmpv6_type_and_code_still_compiles`).
 
 ### #3352 / #3353 — unknown inline-`term` leaf + per-application `alg` validation
 

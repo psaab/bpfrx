@@ -1,3 +1,74 @@
+## 2026-07-01 — #3712 userspace-dp policy: fail-closed on invalid ICMP application field combos
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3712 (HIGH, security fail-open). The Rust policy snapshot
+    parser accepted two semantically-invalid ICMP application field combos and
+    compiled them into wrong-behaving terms: (A) `icmp-code` WITHOUT `icmp-type`
+    → `from_matches` only steers a term into `icmp_constraints` when
+    `icmp_type.is_some()`, so the term fell through to an empty-range
+    `range_terms` entry = protocol-only MATCH-ALL ICMP (the code silently
+    ignored — a permit widens fail-OPEN); (B) `icmp-type`/`icmp-code` on a
+    non-ICMP protocol → the term is pushed into `icmp_constraints` under the
+    non-ICMP protocol (losing any dst-port) and `matches` skips that arm for a
+    non-ICMP packet → the term NEVER matches, so a deny falls through to
+    default-permit (fail-OPEN). The Go strict commit gate
+    (`validateApplicationSpecsStrict`, #3348) rejects both at commit, but
+    `lenientApplicationSpecs` downgrades to a warning on the tolerant load /
+    HA peer-sync path, so a corrupt / hand-built / older-peer-synced snapshot
+    still reaches this helper — the only enforcement plane. FIX: `parse_applications`
+    records the first offending term; `parse_policy_state_with_counters` rejects
+    the whole snapshot with `SnapshotIntegrityError::InvalidApplicationIcmpFields`
+    (fail-closed, action-agnostic — the #2124/#3367/#3711 family). Non-ICMP-protocol
+    arm checked first; code-without-type arm applies once protocol is ICMP/ICMPv6.
+  - **File(s)**: userspace-dp/src/policy.rs (new SnapshotIntegrityError variant +
+    Display + ParsedApplications.invalid_icmp + parse_applications detection +
+    caller reject), userspace-dp/src/policy_tests.rs (5 tests, 3 RED-on-revert),
+    docs/config-schema.md (#3348 section — #3712 Rust backstop note)
+
+## 2026-07-01 — #3709 policy-simulator rejects DUPLICATE selectors (consistent fail-closed across CLI/gRPC/REST) + comma-in-zone round-trip
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3696 hardened the policy-match simulator against missing /
+    empty / unknown / malformed selectors but NONE of the surfaces rejected a
+    DUPLICATE selector. A copy/paste vector (`from-zone trust from-zone dmz`,
+    `source-port 80 source-port 443`) was accepted and one value silently won,
+    so the simulator certified an allow/deny verdict for a DIFFERENT packet than
+    the operator typed — and the surfaces disagreed on WHICH value won (CLI +
+    gRPC text topic last-win, REST first-win). FIX (fail-closed on ambiguity,
+    matching #3696):
+    1. `policymatch.ParseSelectorArgs` — a `seen` set in the shared `takeValue`
+       helper (every selector is value-taking and routes through it exactly
+       once) errors `selector %q specified more than once`. Covers all four CLI
+       surfaces (local + remote `show security match-policies` / `test policy`).
+    2. gRPC `showTestPolicy` (`server_show_firewall.go`) — a seen-key guard in
+       the comma/equals `key=value` loop reports the duplicate as a diagnostic
+       (set-once parseErr preserves an earlier unknown-selector error).
+    3. REST `matchPoliciesHandler` (`pkg/api/security.go`) — a `len(q[key]) > 1`
+       guard over the scalar selector keys returns HTTP 400 (r.URL.Query().Get
+       otherwise silently first-wins).
+    Also (H05/M05/M06) the comma-in-zone-name round-trip: config permits a zone
+    name with a comma/equals but the legacy `test-policy:` text topic cannot
+    carry it, so the REMOTE `test policy` (`cmd/cli/main.go`) now rejects an
+    un-round-trippable zone with a clear error pointing at `show security
+    match-policies` (typed RPC, no delimiter fragility) instead of silently
+    corrupting the query. Also (H06 no-config ordering) REST now validates
+    request grammar BEFORE the `cfg == nil` fail-closed verdict, so a malformed
+    boot-window query returns 400 consistently (was 200 pre-config, 400 post).
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/grpcapi/server_show_firewall.go, pkg/api/security.go, cmd/cli/main.go,
+    docs/junos-cli-reference.md,
+    pkg/policymatch/selector_args_dup_3709_test.go (new),
+    pkg/cli/policymatch_dup_3709_test.go (new),
+    cmd/cli/policymatch_dup_3709_test.go (new),
+    pkg/grpcapi/server_testpolicy_dup_3709_test.go (new),
+    pkg/api/security_matchpolicies_dup_3709_test.go (new), _Log.md
+  - **Validation**: `go test ./pkg/policymatch/... ./pkg/cli/... ./cmd/cli/...
+    ./pkg/grpcapi/... ./pkg/api/...` green; `go build ./...`, gofmt, go vet
+    clean. RED-on-revert proven per guard: neutralizing the parser guard flips
+    the policymatch + pkg/cli + cmd/cli duplicate tests red; the comma-zone
+    guard, the gRPC seen-key guard, the REST duplicate guard, and the REST
+    no-config ordering each flip their surface test red and restore green.
+
 ## 2026-07-01 — #3704 review fold: CLI reloadSyslog zone-map was still positional (4th reverse-map)
 
 - **Timestamp**: 2026-07-01
@@ -25559,3 +25630,90 @@ top.
   RED-on-revert verified for BOTH new nil-zone test and the flipped legacy-zone
   test (re-gate build-path insert -> both RED). rustfmt not run (repo has
   pre-existing toolchain drift; edits match committed multi-line style).
+- **Timestamp**: 2026-07-01
+  - **Action**: #3711 fail-closed on malformed v3 policy literals +
+    address-book prefixes (HIGH security fail-open; v3 sibling of #3367).
+    `parse_v3_literal_set` and the address-book builder used a non-reporting
+    family-agnostic parser that SILENTLY dropped an unparseable token → the
+    v3 side / book collapsed to MatchNone → a `deny <malformed>` rule matched
+    nothing and fell through to default-permit (fail-OPEN). Fixed to REPORT
+    and reject the whole snapshot: v3 literals →
+    `SnapshotIntegrityError::UnrepresentableV3Address`; book prefixes →
+    `UnrepresentableAddressBookPrefix` (also ENFORCES declared family, M02 —
+    a wrong-family token is rejected, not routed to the other family).
+    `__unsupported_address__` sentinel (#3261) still checked first. Replaced
+    the non-reporting `parse_literal_cidr_into` with the reporting
+    family-scoped `parse_book_prefix_into`.
+  - **File(s)**: userspace-dp/src/policy.rs (enum variants + Display arms,
+    parse_v3_literal_set reporting, parse_book_prefix_into, book loop +
+    rule loop rejects, doc-comment rewording)
+  - **Action**: RED-on-revert tests — malformed v3 source/dest literal +
+    malformed book prefix + wrong-family (v6-in-v4, v4-in-v6) all reject;
+    sentinel still wins; valid v3 literal + valid book still enforce the
+    deny. Updated 3 pre-existing excluded-empty tests that relied on the
+    now-removed silent-drop to use valid empty-string tokens (M09).
+  - **File(s)**: userspace-dp/src/policy_tests.rs
+  - **Action**: Documented the malformed-address fail-closed family.
+  - **File(s)**: docs/userspace-dataplane-architecture.md,
+    userspace-dp/src/FEATURES.md
+## 2026-07-01 — #3724 lo0 kernel nftables mirror fail-closed hardening (M08 + M04)
+
+- **Timestamp**: 2026-07-01
+- **Action**: M08 — make the kernel lo0 nftables mirror FAIL CLOSED for an
+  unknown / unhandled non-empty terminating action. `nftRulesFromTerm` mapped
+  any non-`discard` action to nft `accept` (fail-OPEN); the Rust filter compiler
+  maps an unknown action to `FilterAction::Discard`. On a tolerant load / peer
+  session-sync / mixed-version snapshot a future action string in `term.Action`
+  would be ADMITTED by the kernel-PRIMARY lo0 chain while userspace-dp drops it —
+  a control-plane fail-open. Replaced the default-accept with a switch:
+  discard→drop, accept/""(PBR)→accept, any other non-empty→drop + slog.Warn.
+- **File(s)**: pkg/daemon/daemon_nft.go (nftRulesFromTerm terminating-verdict
+  switch), pkg/daemon/lo0_filter_test.go
+  (TestNftRuleFromTermUnknownActionFailsClosed — RED on revert)
+- **Timestamp**: 2026-07-01
+- **Action**: M04 — emit a commit WARNING for a lo0 input-filter
+  `then routing-instance` (PBR) term. It terminates as accept on the kernel
+  mirror (verdict honored) but the kernel `hook input` chain cannot perform the
+  route selection; the operator was never told. Added a routing-instance append
+  to validateLo0FilterKernelMirrorWarnings.
+- **File(s)**: pkg/config/compiler_validate_warn.go
+  (validateLo0FilterKernelMirrorWarnings), pkg/config/
+  compiler_lo0_mirror_modifiers_3445_test.go
+  (TestLo0FilterKernelMirrorRoutingInstanceWarns — RED on revert)
+- **Timestamp**: 2026-07-01
+- **Action**: Documented the fail-closed invariant + M04 warning in the daemon
+  README lo0 filter section. Left M06/M07/M09 (log rate-limit / nft counter
+  merge / log-prefix control-byte sanitize) as noted follow-ups per issue. Both
+  RED-on-revert proofs verified; go test ./pkg/dataplane/... ./pkg/daemon/
+  ./pkg/config/ green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/daemon/README.md (lo0 input filter — unknown-action
+  fail-closed invariant + routing-instance warning)
+
+## 2026-07-01 — #3732 DDNS Surface A DHCP source runs the IsPublicAddr public-address gate (fail-closed)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Surface A router/interface DDNS applied the ddns.IsPublicAddr
+  globally-routable-unicast gate to the interface (selectInterfaceAddr), static
+  (staticUnitAddr), and checkip (parseCheckIPBody) address sources but NOT to
+  the DHCP source — a WAN handed a non-public DHCP lease (CGNAT 100.64/10,
+  RFC1918, ULA fc00::/7, documentation, other IANA special-purpose ranges)
+  published that unroutable/private address to public DNS, a security fail-open
+  and internal-addressing leak. FIX: the AddressSourceDHCP branch now runs the
+  valid lease address through ddns.IsPublicAddr; a non-public lease is a
+  DEFINITIVE "no publishable address of this family" (Addr invalid, ok=true) so
+  the engine WITHDRAWS any previously-published record rather than leaking a
+  private one, and warns once at slog.Warn (matching staticUnitAddr). A public
+  lease still publishes unchanged (no over-gating). Documented the
+  public-gate-on-all-sources invariant in the DDNS design plan §5.3.
+  RED-on-revert: removing the gate flips the v4-private / v4-CGNAT / v6-ULA
+  cases to publishing the private address (test fails); public cases stay green.
+  go test ./pkg/daemon/ ./pkg/ddns/ green; go build ./... green; gofmt + vet
+  clean.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go (AddressSourceDHCP branch),
+  pkg/daemon/daemon_ddns_surface_a_test.go
+  (TestSurfaceAObserverDHCPPublicGate — RED on revert),
+  docs/research/ddns-world-class/plan.md (§5.3 public-address gate invariant)
+
+- **Timestamp**: 2026-07-01
+  **Action**: cluster-setup.sh — VM SR-IOV VFs use nictype:sriov (incus-managed) instead of raw type:pci passthrough with out-of-band host-PF VLAN/trust. Fixes the 2026-07-01 loss-cluster LAN de-isolation outage (host-PF VF VLAN was set once at create and cleared on host reboot / PF reset, reverting fw0/fw1 LAN VFs to an untagged trunk → cluster host cut off from the internet). incus now re-applies vlan=3667 (LAN) + security.mac_filtering=false (WAN trunk, RETH vMAC + guest VLAN tagging) on every VM start — durable across VM reboot AND host reboot, no systemd unit / no ip-link bolt-on. Live loss cluster reconfigured + verified (both nodes, failover both directions, 15.4 Gbps WAN forwarding, host→internet 0% loss).
+  **File(s)**: test/incus/cluster-setup.sh

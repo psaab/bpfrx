@@ -859,6 +859,42 @@ unknown key, or an explicit-empty typed value (`port=`) is reported as a
 diagnostic instead of being skipped; a bare `test-policy:` still reports the
 missing-from/to-zone message. A VALID query behaves exactly as before.
 
+**Duplicate selectors are rejected (#3709).** A repeated selector (e.g.
+`... source-port 80 source-port 443` or `from-zone trust from-zone dmz`) is an
+error `selector "source-port" specified more than once` on ALL surfaces —
+`ParseSelectorArgs` (local + remote `show security match-policies` / `test
+policy`), the gRPC `test-policy:` bridge (`selector "from" specified more than
+once`), and REST `match-policies` (a repeated query parameter such as
+`?from_zone=trust&from_zone=dmz` returns HTTP 400). Before #3709 a duplicate
+silently WON: the CLI and gRPC surfaces last-won (the second value survived)
+while REST first-won (the first value survived), so the three surfaces returned
+an allow/deny verdict for a DIFFERENT packet than the operator typed, and even
+disagreed with each other on WHICH value applied. A policy simulator must answer
+the exact query, and there is no correct silent pick for a duplicate, so the
+ambiguity is a hard error (the fail-closed posture #3696 set for the rest of the
+grammar).
+
+**Comma-in-zone-name round-trip (#3709).** The config permits a zone name
+containing a comma or equals (only the exact reserved tokens are rejected in
+`compiler_validate_strict.go`). The legacy `test-policy:` ShowText topic is a
+comma/equals-delimited `key=value` string that cannot carry such a name, so the
+REMOTE `test policy` surface now fails closed with a clear error
+(`from-zone "trust,blue" contains a comma or equals, which the 'test policy'
+topic cannot carry; use 'show security match-policies' instead`) rather than
+silently corrupting the query into bogus segments. `show security
+match-policies` uses the typed `MatchPolicies` RPC with no delimiter fragility
+and handles the comma-bearing zone directly; the LOCAL `test policy` (which
+evaluates in-process, no serialization) is likewise unaffected.
+
+**No-config grammar ordering (#3709).** REST `match-policies` now validates
+request grammar (duplicate / missing-zone / malformed IP-port-protocol-icmp)
+BEFORE the no-active-config fail-closed default-deny verdict, so a malformed
+query returns HTTP 400 consistently whether or not a config is loaded. Before
+#3709 the `cfg == nil` branch returned 200 default-deny before any grammar
+check, so a malformed request (e.g. `dst_port=abc`) returned 200 during the
+boot window monitors poll but 400 once a config was active. A well-formed
+boot-window query still returns the 200 fail-closed default-deny.
+
 ---
 
 ## Security: Zones

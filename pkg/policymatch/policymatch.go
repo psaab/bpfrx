@@ -348,10 +348,29 @@ type SelectorArgs struct {
 // value like any other selector.
 func ParseSelectorArgs(args []string) (SelectorArgs, error) {
 	var s SelectorArgs
+	// seen tracks which selector keywords have already been consumed so a
+	// DUPLICATE selector is rejected (#3709). Every simulator selector is
+	// value-taking and routes through takeValue exactly once per occurrence,
+	// so a keyword already in seen is an unambiguous duplicate.
+	seen := make(map[string]bool)
 	// takeValue consumes the token following a value-taking selector, erroring
-	// when it is missing (trailing selector) or empty (present-but-valueless).
-	// Mirrors cmd/cli/show.go parseFlowSessionArgs (#3439 H5).
+	// when the selector is REPEATED (#3709), when its value is missing (trailing
+	// selector), or when its value is empty (present-but-valueless). Mirrors
+	// cmd/cli/show.go parseFlowSessionArgs (#3439 H5).
 	takeValue := func(i *int, kw string) (string, error) {
+		// #3709: fail CLOSED on a duplicate selector (e.g. `source-port 80
+		// source-port 443` or `from-zone trust from-zone dmz`). Before this the
+		// switch below re-assigned the field on the second occurrence, silently
+		// LAST-WINning: the simulator returned an allow/deny verdict for a
+		// DIFFERENT packet than the operator typed. The gRPC text topic also
+		// last-won while REST first-won, so the three surfaces even disagreed on
+		// WHICH value survived. There is no correct silent pick for a duplicate,
+		// so the ambiguity is an error — the fail-closed posture #3696 set for
+		// the rest of this grammar.
+		if seen[kw] {
+			return "", fmt.Errorf("selector %q specified more than once", kw)
+		}
+		seen[kw] = true
 		if *i+1 >= len(args) {
 			return "", fmt.Errorf("selector %q requires a value", kw)
 		}

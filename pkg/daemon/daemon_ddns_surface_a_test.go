@@ -13,6 +13,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/ddns"
+	"github.com/psaab/xpf/pkg/dhcp"
 )
 
 // #2691 P2 daemon-level Surface A tests: scope construction from the committed
@@ -607,4 +608,89 @@ func TestForceDDNSUpdateOwnerGate(t *testing.T) {
 			t.Fatal("a node MASTER for >=1 RG must accept the force-now verb")
 		}
 	})
+}
+
+// TestSurfaceAObserverDHCPPublicGate is the #3732 fail-closed regression: the
+// DHCP address source must run its lease address through the SAME
+// ddns.IsPublicAddr gate the interface / static / checkip sources apply. A
+// non-public DHCP lease (RFC1918, CGNAT 100.64/10, ULA fc00::/7) must NOT be
+// published to public DNS — it becomes a DEFINITIVE "no address of this family"
+// observation (Addr invalid, ok=true) so the engine withdraws any stale record
+// rather than publishing an unroutable/private one. A globally-routable lease
+// still publishes unchanged (no over-gating).
+//
+// RED-on-revert: drop the ddns.IsPublicAddr gate from the DHCP branch and the
+// private / CGNAT / ULA cases below flip to publishing the private address
+// (obs.Addr becomes valid), failing this test.
+func TestSurfaceAObserverDHCPPublicGate(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns hostname wan.example.net",
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns address-source dhcp",
+		"set interfaces ge-0/0/2 unit 0 family inet6 dynamic-dns provider p",
+		"set interfaces ge-0/0/2 unit 0 family inet6 dynamic-dns hostname wan6.example.net",
+		"set interfaces ge-0/0/2 unit 0 family inet6 dynamic-dns address-source dhcp",
+		"set system services dynamic-dns provider p backend rfc2136",
+		"set system services dynamic-dns provider p update-server 192.0.2.53",
+	})
+	cfg := store.ActiveConfig()
+
+	ifc := cfg.Interfaces.Interfaces["ge-0/0/2"]
+	if ifc == nil || ifc.Units[0] == nil {
+		t.Fatalf("test config did not produce ge-0/0/2 unit 0")
+	}
+	linuxName := surfaceALinuxIfName(cfg, "ge-0/0/2", ifc.Units[0])
+
+	cases := []struct {
+		name     string
+		family   ddns.Family
+		af       dhcp.AddressFamily
+		lease    string // lease address (CIDR); "" ⇒ no lease seeded
+		wantPub  bool   // true ⇒ expect the address published
+		wantAddr string // expected published bare address when wantPub
+	}{
+		{"v4 private rfc1918 not published", ddns.FamilyV4, dhcp.AFInet, "192.168.7.10/24", false, ""},
+		{"v4 cgnat not published", ddns.FamilyV4, dhcp.AFInet, "100.64.5.10/24", false, ""},
+		{"v4 public published", ddns.FamilyV4, dhcp.AFInet, "8.8.8.8/24", true, "8.8.8.8"},
+		{"v6 ula not published", ddns.FamilyV6, dhcp.AFInet6, "fd12:3456::1/64", false, ""},
+		{"v6 public published", ddns.FamilyV6, dhcp.AFInet6, "2606:4700:4700::1111/64", true, "2606:4700:4700::1111"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := dhcp.NewManagerForTesting(nil)
+			if tc.lease != "" {
+				mgr.SeedLeaseForTesting(linuxName, tc.af,
+					&dhcp.Lease{Address: netip.MustParsePrefix(tc.lease)})
+			}
+			d := &Daemon{store: store, dhcp: mgr}
+			scope := ddns.SurfaceAScope{
+				Key: ddns.ScopeKey{
+					Family:    tc.family,
+					Interface: "ge-0/0/2",
+					Unit:      0,
+				},
+				Source: ddns.AddressSourceDHCP,
+				FQDN:   "wan.example.net",
+			}
+			obs, ok := d.surfaceAObserver(cfg)(scope)
+			if !ok {
+				t.Fatalf("DHCP observation must be definitive (ok=true); got ok=false")
+			}
+			if tc.wantPub {
+				if !obs.Addr.IsValid() {
+					t.Fatalf("public lease %s must be published; got no address", tc.lease)
+				}
+				if obs.Addr.String() != tc.wantAddr {
+					t.Fatalf("published address = %s, want %s", obs.Addr, tc.wantAddr)
+				}
+			} else {
+				if obs.Addr.IsValid() {
+					t.Fatalf("non-public lease %s must NOT be published; "+
+						"got %s (public gate bypassed — #3732 fail-open)",
+						tc.lease, obs.Addr)
+				}
+			}
+		})
+	}
 }

@@ -304,6 +304,25 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			if !a.IsValid() {
 				return ddns.AddressObservation{Source: ddns.AddressSourceDHCP}, true
 			}
+			// Public-address gate (#3732): a DHCP-learned WAN address is NOT
+			// guaranteed globally routable. CGNAT (100.64/10), RFC1918, ULA
+			// (fc00::/7), documentation, and other IANA special-purpose ranges
+			// are all legitimately handed out over DHCP. Publishing one to a
+			// public DNS provider leaks internal addressing AND points the
+			// A/AAAA record at an unroutable address. The interface
+			// (selectInterfaceAddr), static (staticUnitAddr), and checkip
+			// (parseCheckIPBody) sources all apply this SAME ddns.IsPublicAddr
+			// gate — the DHCP source was the one Surface A source that skipped
+			// it. A non-public lease is a DEFINITIVE "no publishable address of
+			// this family" (matching the interface source's non-public
+			// handling), so the engine WITHDRAWS any previously-published
+			// record rather than leaving a stale public one — never publish a
+			// non-public address, never blackhole.
+			if !ddns.IsPublicAddr(a) {
+				slog.Warn("surface-a: skipping non-public dhcp lease address",
+					"address", a.String(), "interface", linuxName)
+				return ddns.AddressObservation{Source: ddns.AddressSourceDHCP}, true
+			}
 			return ddns.AddressObservation{Addr: a, Source: ddns.AddressSourceDHCP}, true
 
 		default: // interface
