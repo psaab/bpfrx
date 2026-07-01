@@ -26,6 +26,13 @@
 //! reach this AF_XDP local-delivery classifier (their host-bound traffic is
 //! served by the kernel, which excludes them from the deny address sets), so the
 //! default-deny cannot strand management or break HA.
+//!
+//! The authoritative operator-facing token->port matrix across all three
+//! surfaces (the Go SSOT allowlist, the nft kernel mirror, and this Rust
+//! classifier) -- including the deliberate narrowings (sip UDP+TCP 5060 only,
+//! tftp UDP 69 only, traceroute UDP-only, router-discovery v6 global,
+//! ipsec=ike alias) and the ident-reset divergence -- lives in
+//! docs/host-inbound-service-matrix.md (#3619).
 
 use super::*;
 

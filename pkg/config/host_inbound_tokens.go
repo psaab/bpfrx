@@ -41,6 +41,13 @@ import "sort"
 // keywords are lowercase-canonical, so wrong-case input is a typo worth flagging
 // (lenient load only warns, so a persisted/sync'd config is never bricked).
 
+// The authoritative operator-facing token->port matrix across all three
+// surfaces (this SSOT allowlist, the nft kernel mirror, and the Rust AF_XDP
+// classifier), including the deliberate narrowings (sip UDP+TCP 5060 only,
+// tftp UDP 69 only, traceroute UDP-only, router-discovery v6 global,
+// ipsec=ike alias) and the ident-reset divergence, is documented in
+// docs/host-inbound-service-matrix.md (#3619).
+
 // KnownHostInboundSystemServices is the canonical set of recognized
 // host-inbound-traffic `system-services` tokens, including documented aliases
 // (`webapi-clear-text`/`http`, `netconf-ssh`/`ssh-netconf`, `rlogin`/`r-login`,

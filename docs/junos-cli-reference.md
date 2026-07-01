@@ -332,6 +332,14 @@ From zone: guest, To zone: lan
     each host-inbound deny per worker (`host_inbound_denied_packets`) and the Go
     manager mirrors the per-poll delta into the global counter, identical to the
     policy-deny plumbing.
+  - **Service-port matrix (#3619):** the authoritative operator-facing mapping
+    of every `host-inbound-traffic` `system-services` / `protocols` token to the
+    exact ports it opens across all three enforcement surfaces (Go SSOT
+    allowlist, nft kernel mirror, Rust AF_XDP classifier) — including the
+    deliberate narrowings (sip UDP+TCP 5060 only / no SIP-TLS 5061, tftp UDP 69
+    only, traceroute UDP-only, router-discovery v6 global, ipsec=ike alias) and
+    the ident-reset reject-vs-drop divergence — is
+    `docs/host-inbound-service-matrix.md`.
   - **Per-screen-reason drop accounting (#3343):** the per-reason screen/IDS
     drop counters (`syn-flood`, `icmp-flood`, `udp-flood`, `port-scan`,
     `ip-sweep`, `land-attack`, `ping-of-death`, `teardrop`, `tcp-syn-fin`,
