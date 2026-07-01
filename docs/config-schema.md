@@ -292,6 +292,35 @@ Fail-on-revert: `TestFilterICMPTypeNameResolves{V4,V6}_3205`,
 `TestFilterNamedPortExceptResolves_3205` in
 `pkg/config/firewall_symbolic_match_3205_test.go`.
 
+#### Ports must be a canonical unsigned decimal (#3606)
+
+A numeric port token must be a plain unsigned decimal — no leading sign
+(`+80` / `-80`), no surrounding whitespace. Junos rejects a signed port, and
+the two userspace-dataplane parsers historically DISAGREED about it: the Go
+capability gate `userspacePortSpecRepresentable`
+(`pkg/dataplane/userspace/capabilities.go`) parses with `strconv.ParseUint`,
+which rejects the sign, while the Rust `parse_port_spec`
+(`userspace-dp/src/policy.rs`) parses with `u16::from_str`, which ACCEPTS a
+leading `+` (`"+80"` -> `Ok(80)`). The commit-time gates used `strconv.Atoi`,
+which also accepts `+80` (`Atoi("+80") = 80`; `-80` was already caught by the
+`>= 1` bound). So `+80` committed cleanly, the CLI simulator said it matched,
+and the port was then either silently downgraded to unsupported (application
+path — the capability gate rejected it) or silently coerced to `80` (filter /
+NAT paths, which normalize to a number before the wire) — a commit-vs-dataplane
+split on a security leaf.
+
+The single parse authority is now `parseCanonicalPort`
+(`pkg/config/compiler_applications.go`): it requires a bare run of ASCII
+decimal digits and is used by every commit-time port-spec parser —
+`validatePortSpec` (application `source-port` / `destination-port`),
+`resolveSinglePort` (firewall-filter port leaves), `parseDNATPortList` (NAT
+`match destination-port`), and `validateDNATPoolStrict` (destination-NAT pool
+`port`). The Rust `parse_port_spec` was tightened in lock-step (`parse_port_u16`
+rejects the sign) so all three parsers agree. Fail-on-revert:
+`TestSignedPortRejectedAtCommit_3606` / `TestParseCanonicalPort_3606`
+(`pkg/config/compiler_signed_port_3606_test.go`) and
+`parse_port_spec_rejects_signed_3606` (`userspace-dp/src/policy_tests.rs`).
+
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via
 `firewallMatchValues`. Both are `multi:true`; before the second #2419 fold
