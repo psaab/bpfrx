@@ -476,6 +476,10 @@ func zoneHostInboundView(z *pb.ZoneInfo) config.HostInboundView {
 	v := config.HostInboundView{
 		ZoneSystemServices: z.GetHostInboundSystemServices(),
 		ZoneProtocols:      z.GetHostInboundProtocols(),
+		// #3682: carry the lifeline-exempt interface list from the structured
+		// response so the remote CLI renders the same "excluded from
+		// host-inbound deny" line as the local and gRPC-text surfaces.
+		LifelineInterfaces: z.GetLifelineInterfaces(),
 	}
 	for _, ih := range z.GetInterfaceHostInbound() {
 		v.Interfaces = append(v.Interfaces, config.InterfaceHostInboundView{

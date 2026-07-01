@@ -75,6 +75,12 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 				Protocols:      append([]string{}, hib.Protocols...),
 			})
 		}
+		// #3682: surface the management / cluster-control lifeline interfaces
+		// EXCLUDED from this zone's host-inbound deny scoping (always-admitted),
+		// so the remote CLI and any structured consumer can render the implicit
+		// exemption instead of it being an invisible bypass.
+		zi.LifelineInterfaces = zone.HostInboundViewWithLifelines(
+			config.HostInboundLifelineSet(cfg)).LifelineInterfaces
 		if zi.Interfaces == nil {
 			zi.Interfaces = []string{}
 		}

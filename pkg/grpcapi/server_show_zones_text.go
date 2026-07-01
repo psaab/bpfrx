@@ -64,8 +64,11 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 		// #3654: render the zone-level admitted set, the no-stanza default-deny
 		// posture line, AND any per-interface host-inbound override through the
 		// shared config presenter (H07/M03) so gRPC text stays in lockstep with
-		// the local CLI and the structured inventory.
-		for _, line := range zone.HostInboundView().Render(config.HostInboundLabels{
+		// the local CLI and the structured inventory. #3682: the presenter also
+		// renders the management/cluster-control lifeline interfaces excluded
+		// from host-inbound deny scoping so the implicit exemption is auditable.
+		for _, line := range zone.HostInboundViewWithLifelines(
+			config.HostInboundLifelineSet(cfg)).Render(config.HostInboundLabels{
 			Indent:         "  ",
 			Sep:            ", ",
 			ServicesLabel:  "Host-inbound system-services",
@@ -218,12 +221,17 @@ func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *
 					// DIAGNOSTIC, so report the EFFECTIVE (zone UNION interface)
 					// set for THIS interface and flag when it is governed by an
 					// interface-local override rather than only the zone set.
-					for _, line := range zone.RenderInterfaceHostInbound(ifName, config.HostInboundLabels{
-						Indent:         "  ",
-						Sep:            ", ",
-						ServicesLabel:  "Host-inbound services",
-						ProtocolsLabel: "Host-inbound protocols",
-					}) {
+					// #3682: also flag when THIS interface is a management /
+					// cluster-control lifeline excluded from host-inbound deny.
+					lifeline := config.HostInboundLifelineInterface(
+						ifName, config.HostInboundLifelineSet(cfg))
+					for _, line := range zone.RenderInterfaceHostInbound(ifName, lifeline,
+						config.HostInboundLabels{
+							Indent:         "  ",
+							Sep:            ", ",
+							ServicesLabel:  "Host-inbound services",
+							ProtocolsLabel: "Host-inbound protocols",
+						}) {
 						buf.WriteString(line)
 						buf.WriteString("\n")
 					}

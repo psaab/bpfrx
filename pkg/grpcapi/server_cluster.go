@@ -280,10 +280,21 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		RuleId:                     res.RuleID,
 		SourceAddressExcluded:      res.SourceAddressExcluded,
 		DestinationAddressExcluded: res.DestinationAddressExcluded,
-		Action:                     res.DisplayAction(),
-		SrcAddresses:               res.SrcAddresses,
-		DstAddresses:               res.DstAddresses,
-		Applications:               res.Applications,
+		// #3685 M05: the matched policy's description (ticket / change context),
+		// mirroring the inventory and local CLI result over the same
+		// policymatch.Result.
+		Description: res.Description,
+		// #3685 M06: name the scheduler time-gate and confirm it is currently
+		// admitting the rule. A positive match here is by construction active
+		// (policyInactiveFn already skipped a scheduler-inactive rule, #3414), so
+		// SchedulerActive is true only for a scheduled policy and omitted for an
+		// always-on one.
+		SchedulerName:   res.SchedulerName,
+		SchedulerActive: res.SchedulerName != "",
+		Action:          res.DisplayAction(),
+		SrcAddresses:    res.SrcAddresses,
+		DstAddresses:    res.DstAddresses,
+		Applications:    res.Applications,
 	}, nil
 }
 

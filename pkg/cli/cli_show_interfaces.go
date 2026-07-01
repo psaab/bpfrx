@@ -307,6 +307,12 @@ func (c *CLI) showInterfaces(args []string) error {
 			// blank section is never misread as "not enforced".
 			if li.zone != nil {
 				svc, proto, overridden := li.zone.InterfaceHostInboundEffective(li.ifaceRef)
+				// #3682: a management / cluster-control lifeline interface is
+				// EXCLUDED from host-inbound deny scoping; flag it explicitly
+				// so the exemption is visible here rather than being masked by a
+				// (misleading) default-deny line.
+				lifeline := config.HostInboundLifelineInterface(
+					li.ifaceRef, config.HostInboundLifelineSet(cfg))
 				if overridden {
 					fmt.Println("    Host-inbound: interface-specific override (effective set below)")
 				}
@@ -316,7 +322,9 @@ func (c *CLI) showInterfaces(args []string) error {
 				if len(proto) > 0 {
 					fmt.Printf("    Allowed host-inbound protocols: %s\n", strings.Join(proto, " "))
 				}
-				if len(svc) == 0 && len(proto) == 0 {
+				if lifeline {
+					fmt.Println("    Host-inbound: lifeline-exempt (management/fabric, bypasses host-inbound deny)")
+				} else if len(svc) == 0 && len(proto) == 0 {
 					fmt.Printf("    Host-inbound: default deny (%s)\n",
 						config.HostInboundDenyReason(overridden, li.zone.HostInboundTraffic != nil))
 				}

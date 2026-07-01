@@ -40,66 +40,19 @@ type ZoneHostInboundView struct {
 	V6Addrs        []string // bare host IPv6 addresses (no prefix)
 }
 
-// lifelineBaseName strips the unit suffix (".0") and surrounding whitespace from
-// a logical interface name, returning the bare device name used for lifeline
-// matching ("fxp0.0" -> "fxp0", "fab1.0" -> "fab1"). Returns "" for an empty
-// name.
-func lifelineBaseName(name string) string {
-	base := strings.TrimSpace(name)
-	if i := strings.IndexByte(base, '.'); i >= 0 {
-		base = base[:i]
-	}
-	return base
-}
+// The host-inbound LIFELINE matcher is the SSOT in pkg/config (lifeline.go,
+// #3682) so the shared host-inbound presenter can render the exemption on the
+// operator-visible zone views. These thin wrappers keep the dataplane call sites
+// and the #3277 fail-on-revert tests reading against the local names while the
+// matching logic (fxp0 + configured control/fabric + em0/fab* defaults) lives in
+// exactly one place shared with display.
 
-// hostInboundLifelineSet resolves the set of management / cluster-control
-// LIFELINE interface base names that must NEVER be subjected to a host-inbound
-// deny. It is the config-aware superset of the always-on defaults:
-//
-//   - fxp0 (out-of-band management) is always a lifeline.
-//   - The chassis-cluster control-interface and fabric interface(s) are added
-//     from config so an operator-renamed control link (e.g.
-//     `control-interface fxp1`) or a non-default fabric name is excluded too.
-//     This is the #3277 fix: the old matcher hardcoded fxp0/em0/fab* and so left
-//     a configured `control-interface fxp1` SUBJECT to host-inbound deny scoping
-//     -> potential heartbeat drop -> HA split-brain.
-//
-// em0 (the canonical cluster-control default name) and the fabric prefix fab*
-// stay matched unconditionally in hostInboundLifelineInterface so the canonical
-// default-named configs remain byte-identical (#3070/#3172/#3224 behavior is
-// preserved). A standalone config (no chassis-cluster stanza) contributes no
-// extra names here, so its only lifeline is fxp0 (em0/fab* are no-ops because
-// such interfaces are not present) — #1960.
 func hostInboundLifelineSet(cfg *config.Config) map[string]bool {
-	set := map[string]bool{"fxp0": true}
-	if cfg != nil && cfg.Chassis.Cluster != nil {
-		cc := cfg.Chassis.Cluster
-		for _, name := range []string{cc.ControlInterface, cc.FabricInterface, cc.Fabric1Interface} {
-			if base := lifelineBaseName(name); base != "" {
-				set[base] = true
-			}
-		}
-	}
-	return set
+	return config.HostInboundLifelineSet(cfg)
 }
 
-// hostInboundLifelineInterface reports whether the given logical interface name
-// is a management / cluster-control LIFELINE that must NEVER be subjected to a
-// host-inbound deny. The lifeline set is the config-derived set (fxp0 plus the
-// configured chassis-cluster control-interface / fabric interfaces, #3277) UNION
-// the always-on backward-compatible defaults em0 (cluster control plane /
-// heartbeat default name) and the fabric links (fab*). Denying host-bound
-// traffic on these would strand management or break HA. The base name (before
-// the unit suffix) is matched so "fxp0.0" / "em0.0" are caught too.
 func hostInboundLifelineInterface(name string, lifelines map[string]bool) bool {
-	base := lifelineBaseName(name)
-	if base == "" {
-		return false
-	}
-	if lifelines[base] {
-		return true
-	}
-	return base == "em0" || strings.HasPrefix(base, "fab")
+	return config.HostInboundLifelineInterface(name, lifelines)
 }
 
 // BuildZoneHostInboundViews returns one ZoneHostInboundView per configured

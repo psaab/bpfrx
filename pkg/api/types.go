@@ -521,10 +521,30 @@ type MatchPoliciesResult struct {
 	// identifier used by inventory, logs, and tests even after a policy reorder.
 	// Present only on a positive match (a matched global policy uses the
 	// "junos-global->junos-global/<name>" form, matching inventory global rows).
-	RuleID       string   `json:"rule_id,omitempty"`
-	Action       string   `json:"action"`
-	SrcAddresses []string `json:"src_addresses,omitempty"`
-	DstAddresses []string `json:"dst_addresses,omitempty"`
+	RuleID string `json:"rule_id,omitempty"`
+	// Description is the matched policy's `description` text (#3685 M05), the
+	// same field the inventory (GetPolicies) and the local `show security
+	// match-policies` result carry over the SAME policymatch.Result.
+	// Descriptions often hold ticket / change-control context, so a match
+	// verdict without it is weaker than the CLI and inventory answers. Present
+	// only on a positive match with a non-empty description.
+	Description string `json:"description,omitempty"`
+	// SchedulerName / SchedulerActive expose the matched policy's time-gate
+	// (#3685 M06). SchedulerName is the `scheduler-name` binding (mirroring the
+	// inventory PolicyRule field, #3624); SchedulerActive is the explicit
+	// effective-active flag — true when the matched policy is scheduler-gated
+	// AND currently active. A positive match is by construction currently active
+	// (the REST handler always threads a fail-closed PolicyInactiveFn that skips
+	// a scheduler-inactive rule before it can match, #3104/#3414), so a matched
+	// scheduled policy always reports SchedulerActive true; it names the gate
+	// admitting the rule right now. Both empty/false (omitted) for a
+	// non-scheduled (always-on) policy and for the unmatched / host-inbound /
+	// default cases.
+	SchedulerName   string   `json:"scheduler_name,omitempty"`
+	SchedulerActive bool     `json:"scheduler_active,omitempty"`
+	Action          string   `json:"action"`
+	SrcAddresses    []string `json:"src_addresses,omitempty"`
+	DstAddresses    []string `json:"dst_addresses,omitempty"`
 	// SourceAddressExcluded / DestinationAddressExcluded report whether the
 	// matched policy carries Junos `source-address-excluded` /
 	// `destination-address-excluded` (#3668): the rule matches every address

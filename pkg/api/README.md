@@ -595,7 +595,24 @@ under the daemon's errgroup. Nothing else imports this package.
   `junos-global->junos-global/<name>` form, matching the inventory global rows.
   All three are additive and set only on a positive match. The gRPC
   `MatchPoliciesResponse.source_address_excluded`/`destination_address_excluded`
-  (fields 15/16) and `rule_id` (field 17) mirror this.
+  (fields 15/16) and `rule_id` (field 17) mirror this. #3685 M05/M06: on a MATCH
+  the response also carries the policy `description` and the scheduler binding.
+  `description` (M05) is the matched policy's `description` text — the same field
+  the inventory (`GetPolicies`) and the local `show security match-policies`
+  result carry over the SAME `policymatch.Result`; descriptions often hold
+  ticket / change-control context, so a match verdict without it was weaker than
+  the inventory / CLI answer. `scheduler_name`/`scheduler_active` (M06) name the
+  time-gate: `scheduler_name` is the policy's `scheduler-name` binding
+  (mirroring the inventory `PolicyRule` field, #3624), and `scheduler_active` is
+  the explicit effective-active flag. A positive match is by construction
+  currently active — the handler always threads a fail-closed
+  `PolicyInactiveFn` (#3414) that SKIPS a scheduler-inactive rule before it can
+  match — so a matched scheduled policy always reports `scheduler_active=true`;
+  it names the gate admitting the rule right now, not a rule that is gated off.
+  All three are additive and set only on a positive match; both scheduler fields
+  are omitted for a non-scheduled (always-on) policy. The gRPC
+  `MatchPoliciesResponse.description` (field 18), `scheduler_name` (field 19),
+  and `scheduler_active` (field 20) mirror these.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

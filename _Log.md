@@ -37,6 +37,45 @@
     pkg/grpcapi/server_show_zones_metadata_3684_test.go,
     docs/junos-cli-reference.md
 
+## 2026-07-01 — #3682 host-inbound lifeline exemption made operator-visible (M08/L05)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3682 — the host-inbound LIFELINE exemption (fxp0 / em0 / fab* /
+    configured chassis-cluster control+fabric interfaces are excluded from a
+    zone's host-inbound deny scoping and always admit host-bound traffic) was an
+    IMPLICIT policy exception with no operator-visible surface, so a zone-assigned
+    lifeline interface silently dropped out of the default-deny. Fix = VISIBILITY
+    only (exemption semantics unchanged): (1) hoisted the lifeline matcher to a
+    shared SSOT `pkg/config/lifeline.go` (`LifelineBaseName`,
+    `HostInboundLifelineSet`, `HostInboundLifelineInterface`) and made the
+    dataplane path (`pkg/dataplane/userspace/zones.go`) delegate to it, so
+    enforcement and display can never drift; (2) added `LifelineInterfaces` to the
+    shared presenter `HostInboundView` + a `HostInboundViewWithLifelines` builder,
+    and a lifeline-exempt render line in `Render` + a lifeline marker in
+    `RenderInterfaceHostInbound` (in place of the misleading default-deny line);
+    (3) routed the surfaces through it — `show security zones` (local CLI +
+    gRPC-text + remote CLI), `show interfaces` (CLI + gRPC), `test security-zone
+    interface` (CLI + gRPC); (4) added `lifeline_interfaces` to the structured
+    `GetZones` proto (regenerated) so the remote CLI + automation see it too.
+    Design follow-up flagged on the issue: em0/fab* is a base-name PREFIX match
+    (a broader `fab-foo` would be exempted; a standalone config naming an
+    interface em0/fabX gets a silent exception) — whether it should be EXACT /
+    role-gated is left as a design question, NOT changed here.
+  - **File(s)**: pkg/config/lifeline.go (new), pkg/config/host_inbound_view.go,
+    pkg/config/host_inbound_view_lifeline_3682_test.go (new),
+    pkg/config/host_inbound_view_3654_test.go,
+    pkg/dataplane/userspace/zones.go, pkg/cli/cli_show_security_zones.go,
+    pkg/cli/cli_show_interfaces.go, pkg/cli/cli_request.go,
+    pkg/grpcapi/server_show_zones_text.go, pkg/grpcapi/server_show_zones.go,
+    pkg/grpcapi/server_show_interfaces.go, cmd/cli/show.go,
+    proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (regenerated),
+    docs/junos-cli-reference.md
+  - **Validation**: `go build ./pkg/... ./cmd/...` clean; `go test
+    ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/... ./pkg/dataplane/...` green;
+    RED-on-revert proven (neutering the two render blocks fails the three #3682
+    tests); gofmt clean; go vet clean on touched packages (the 2 remaining vet
+    diagnostics are pre-existing, in untouched files, documented in the Makefile).
+
 ## 2026-07-01 — #3680 explicit-`any` global policies hidden from zone-detail
 
 - **Timestamp**: 2026-07-01
@@ -25175,3 +25214,43 @@ top.
 - **File(s)**: pkg/policymatch/port_test.go, pkg/policymatch/icmp_test.go, pkg/api/rest_filter_failclosed_test.go
 - **Action**: Document the canonical-form guarantee on the diagnostic surfaces
 - **File(s)**: pkg/policymatch/README.md, pkg/api/README.md, _Log.md
+
+## 2026-07-01 — #3685 policy-simulator output parity residuals (M04/M05/M06)
+
+- **Timestamp**: 2026-07-01
+- **Action**: M06 — add `SchedulerName` to `policymatch.Result`, populated from
+  `pol.SchedulerName` in `matchedResult`, so the match-policies verdict names the
+  scheduler time-gate controlling the rule (mirrors the #3624 inventory field). A
+  matched policy is by construction currently active (the live surfaces thread a
+  fail-closed `PolicyInactiveFn`), so a non-empty `SchedulerName` names the gate
+  admitting the rule now
+- **File(s)**: pkg/policymatch/policymatch.go
+- **Action**: M05/M06 — add `description` (field 18), `scheduler_name` (field 19),
+  and `scheduler_active` (field 20) to the proto `MatchPoliciesResponse`
+  (additive, no renumber; regen via pinned protoc 3.21.12 / protoc-gen-go
+  v1.36.11 / protoc-gen-go-grpc v1.6.1, no version bump). `MatchPoliciesResponse`
+  is gRPC-only (no Rust userspace-dp reference / no wire fixture) — confirmed, no
+  regen needed
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (generated)
+- **Action**: M05/M06 — populate `Description` + `SchedulerName` +
+  `SchedulerActive` (= `res.SchedulerName != ""`, effective-active since a match
+  is currently active) on the REST `MatchPoliciesResult` (+ new JSON fields
+  `description`/`scheduler_name`/`scheduler_active`, all `omitempty`) and the gRPC
+  `MatchPoliciesResponse` positive-match paths
+- **File(s)**: pkg/api/types.go, pkg/api/security.go, pkg/grpcapi/server_cluster.go
+- **Action**: M04 — bring the gRPC-text `test policy` GLOBAL branch to parity with
+  `show security match-policies`: print `Policy ID`, `Scope: global (match
+  from-zone/to-zone)`, and `Description` (was name+action only). The gRPC-text
+  sibling of the #3674 local request-path gap (distinct renderer)
+- **File(s)**: pkg/grpcapi/server_show_firewall.go
+- **Action**: RED-on-revert tests — matcher carries Description + SchedulerName
+  (and non-scheduled leaves SchedulerName empty); REST + gRPC responses carry
+  description + scheduler_name + scheduler_active (non-scheduled/undescribed omit
+  them); gRPC-text global `test policy` shows ID + scope + description. Verified
+  each layer goes RED when its population/render is reverted
+- **File(s)**: pkg/policymatch/simulator_output_parity_3685_test.go (new),
+  pkg/api/security_matchpolicies_desc_sched_3685_test.go (new),
+  pkg/grpcapi/server_matchpolicies_desc_sched_3685_test.go (new)
+- **Action**: Document the new response fields (M05/M06) and the gRPC-text global
+  render (M04) in the API/gRPC references
+- **File(s)**: pkg/api/README.md, pkg/grpcapi/README.md, _Log.md

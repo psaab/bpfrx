@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // host_inbound_view.go is the shared presentation SSOT for a security zone's
 // host-inbound-traffic admission posture (#3654 L02). Before #3654 every text /
@@ -105,11 +108,54 @@ type HostInboundView struct {
 	ZoneSystemServices []string
 	ZoneProtocols      []string
 	Interfaces         []InterfaceHostInboundView
+	// LifelineInterfaces lists the zone's interfaces that are management /
+	// cluster-control LIFELINES (fxp0 / em0 / fab* / configured
+	// control-interface / fabric-interface) and are therefore EXCLUDED from
+	// host-inbound deny scoping — their host-bound traffic is always admitted
+	// regardless of this zone's host-inbound-traffic set (#3682 observability
+	// L05). Sorted, deduplicated. Empty unless the view is built with the
+	// lifeline set via HostInboundViewWithLifelines. Rendered as an explicit
+	// exemption line so the implicit management-plane exception is auditable
+	// rather than silent.
+	LifelineInterfaces []string
 }
 
 // HostInboundView builds the presentation view for a zone from its typed
-// config. Nil-safe (returns a zero view for a nil zone).
+// config. Nil-safe (returns a zero view for a nil zone). The lifeline-exemption
+// section (#3682) is empty; use HostInboundViewWithLifelines to populate it.
 func (z *ZoneConfig) HostInboundView() HostInboundView {
+	return z.HostInboundViewWithLifelines(nil)
+}
+
+// HostInboundViewWithLifelines builds the zone presentation view and, in
+// addition to HostInboundView, records which of the zone's interfaces are
+// host-inbound LIFELINES (management / cluster-control interfaces excluded from
+// host-inbound deny scoping — #3682). lifelines is the config-derived lifeline
+// base-name set from HostInboundLifelineSet(cfg); a nil set still matches the
+// always-on fxp0/em0/fab* defaults so callers that only need the defaults may
+// pass nil. Nil-safe. The recorded interfaces make the implicit exemption
+// operator-visible on every zone view that routes through this presenter.
+func (z *ZoneConfig) HostInboundViewWithLifelines(lifelines map[string]bool) HostInboundView {
+	v := z.hostInboundViewBase()
+	if z == nil {
+		return v
+	}
+	seen := make(map[string]bool, len(z.Interfaces))
+	for _, ref := range z.Interfaces {
+		if !HostInboundLifelineInterface(ref, lifelines) || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		v.LifelineInterfaces = append(v.LifelineInterfaces, ref)
+	}
+	sort.Strings(v.LifelineInterfaces)
+	return v
+}
+
+// hostInboundViewBase builds the zone-level + per-interface-override view
+// without the lifeline-exemption section. Nil-safe (returns a zero view for a
+// nil zone).
+func (z *ZoneConfig) hostInboundViewBase() HostInboundView {
 	v := HostInboundView{}
 	if z == nil {
 		return v
@@ -143,7 +189,14 @@ func (z *ZoneConfig) HostInboundView() HostInboundView {
 // interface) admitted set for that interface. A default-deny posture line is
 // emitted when the effective set is empty, so a blank section cannot be misread
 // as "not enforced".
-func (z *ZoneConfig) RenderInterfaceHostInbound(ref string, l HostInboundLabels) []string {
+//
+// #3682: lifeline reports whether ref is a management / cluster-control lifeline
+// (from HostInboundLifelineInterface). A lifeline interface is EXCLUDED from
+// host-inbound deny scoping, so in place of the (misleading) default-deny
+// posture line the diagnostic renders an explicit lifeline-exempt marker — the
+// operator sees WHY this interface admits host-bound traffic the zone set would
+// otherwise deny.
+func (z *ZoneConfig) RenderInterfaceHostInbound(ref string, lifeline bool, l HostInboundLabels) []string {
 	var zoneSvc, zoneProto []string
 	zoneConfigured := false
 	if z != nil && z.HostInboundTraffic != nil {
@@ -172,6 +225,15 @@ func (z *ZoneConfig) RenderInterfaceHostInbound(ref string, l HostInboundLabels)
 			l.Indent+"  effective "+strings.ToLower(l.ServicesLabel)+": "+join(effSvc),
 			l.Indent+"  effective "+strings.ToLower(l.ProtocolsLabel)+": "+join(effProto),
 		)
+	}
+	// #3682: a lifeline interface is excluded from host-inbound deny scoping, so
+	// its host-bound traffic is always admitted regardless of the zone/effective
+	// set. Render the exemption explicitly (in place of the default-deny line
+	// that would otherwise be misleading here) so the exception is auditable.
+	if lifeline {
+		lines = append(lines, l.Indent+"Host-inbound: lifeline-exempt "+
+			"(management/fabric, bypasses host-inbound deny)")
+		return lines
 	}
 	if len(effSvc) == 0 && len(effProto) == 0 {
 		lines = append(lines, l.Indent+"Host-inbound: default deny ("+
@@ -240,6 +302,17 @@ func (v HostInboundView) Render(l HostInboundLabels) []string {
 				l.Indent+"    effective protocols: "+join(iface.EffectiveProtocols),
 			)
 		}
+	}
+	// #3682 (L05): make the implicit management/cluster-control lifeline
+	// exemption operator-visible. Any zone interface whose base name is a
+	// lifeline (fxp0 / em0 / fab* / configured control-interface / fabric) is
+	// EXCLUDED from this zone's host-inbound deny scoping — its host-bound
+	// traffic is always admitted. Rendered so the exception is auditable rather
+	// than silently dropping out of default-deny.
+	if len(v.LifelineInterfaces) > 0 {
+		lines = append(lines,
+			l.Indent+"Host-inbound lifeline-exempt interfaces (management/fabric, "+
+				"bypass host-inbound deny): "+strings.Join(v.LifelineInterfaces, l.Sep))
 	}
 	return lines
 }
