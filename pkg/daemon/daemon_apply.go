@@ -1067,7 +1067,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// preserves a still-valid injected failover route and drops
 	// removed/edited entries on the commit itself.
 	if d.frr != nil {
-		d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
+		// The full apply path deliberately warns-and-continues on an FRR
+		// reload error (a transient FRR hiccup must not fail an
+		// otherwise-valid operator commit; a boot-time re-apply
+		// reconverges FRR). The returned error is only consumed by the
+		// ip-monitoring routes-only actuator, which must not publish a
+		// divergent snapshot on a hard failure (#3757).
+		_ = d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
 	}
 
 	// 3b. Apply next-table policy routing rules (ip rule)
@@ -1098,12 +1104,17 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// 3d. Apply policy-based routing rules (ip rule) for firewall filter
 	// routing-instance (filter-based forwarding). Rules are derived only from
 	// filters attached as an interface input filter (#3430 H1); a degraded
-	// build (unrepresentable except / overflow) is surfaced but does not block
-	// the rest of the apply.
+	// build — an unrepresentable except set, a DSCP-0 match, an
+	// ip-rule-unrepresentable L4/per-packet predicate (port-except / tcp-flags /
+	// icmp / is-fragment / flex, #3730), or an overflow — is surfaced but does
+	// not block the rest of the apply. The degraded term is DROPPED (fail-safe
+	// under-steer to the main table), never widened to an address-only over-steer.
 	if d.routing != nil {
 		pbrRules, buildErr := routing.BuildPBRRules(cfg)
 		if buildErr != nil {
-			slog.Warn("PBR rule build degraded", "err", buildErr)
+			slog.Warn("PBR rule build degraded; some routing-instance filter terms "+
+				"are not mirrored to the kernel FBF path and fall back to the main "+
+				"table (userspace filter path still enforces them)", "err", buildErr)
 		}
 		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
 			slog.Warn("failed to apply PBR rules", "err", err)

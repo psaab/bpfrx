@@ -1,3 +1,45 @@
+## 2026-07-01 — #3730 routing/PBR: kernel FBF ip-rule mirror honors L4 predicates + fail-closed on unrepresentable ones
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3730 (MEDIUM, security fail-open widening on the kernel/XDP_PASS
+    path; folds H01/H02/M01-M07/M08/M10). The kernel filter-based-forwarding
+    ip-rule mirror (`buildPBRFromFilter`) derived rules from ONLY the DSCP +
+    source/destination address of a `then routing-instance` term and silently
+    dropped every L4/per-packet predicate. A port+address term (e.g.
+    `destination-port 443 destination-address 203.0.113.10/32 then
+    routing-instance blue`) collapsed to an address-only `to 203.0.113.10/32
+    lookup blue` rule that steered EVERY protocol/port to that host (over-steer,
+    fail-open); a port-only term hit the "no ip-rule-compatible criteria" branch
+    and emitted NO rule (silent under-steer no-op) — neither with a degraded
+    signal. FIX: (1) HONOR the predicates an `ip rule` CAN express — `protocol`
+    → `FRA_IP_PROTO`, `source-port` → `FRA_SPORT_RANGE`, `destination-port` →
+    `FRA_DPORT_RANGE` (via new `pbrTermL4` + folded into the DSCP × src × dst
+    cross-product; multi-value protocol/port sets expand to one rule per value; a
+    range maps to `[lo,hi]`). (2) DEGRADE-SIGNAL fail-closed for predicates an
+    `ip rule` genuinely cannot represent (`*-port-except`, `tcp-flags`,
+    `icmp-type`/`icmp-code`, `is-fragment`, `flexible-match-range`, unknown
+    protocol/proto-0, unparseable port, any unresolved `from` leaf): DROP the
+    whole term (fail-safe under-steer to the main table, never widen to
+    address-only) + record a degraded build error naming filter/term/predicate,
+    mirroring the #3430 DSCP-0 / except pattern. The daemon (`daemon_apply.go`
+    step 3d) already surfaces the returned error via `slog.Warn` (#3430 channel;
+    M08). Named/ranged ports resolve through a new `config.ResolveFilterPortRange`
+    that reuses the `junosServicePorts` SSOT so the kernel mirror and userspace
+    filter path resolve ports identically. RED-on-revert verified by stubbing
+    `pbrTermL4` to the pre-fix behavior: over-steer (address-only rule for
+    tcp-flags/icmp/frag/flex/except), under-steer (port-only 0 rules), protocol
+    not expanded, ports dropped, no degrade error — all new #3730 tests go RED.
+    go test ./pkg/routing/... ./pkg/config/... green; go build ./... green;
+    gofmt + vet clean.
+  - **File(s)**: pkg/routing/rules.go (PBRRule +IPProto/Sport/Dport, PBRPortRange,
+    pbrTermL4 + hasRealString, buildPBRFromFilter honor/degrade, pbrManager.Apply
+    emits FRA_IP_PROTO/SPORT/DPORT, BuildPBRRules doc support-matrix),
+    pkg/config/filter_match_resolve.go (ResolveFilterPortRange SSOT wrapper),
+    pkg/routing/routing_test.go (13 #3730 subtests, RED-on-revert),
+    pkg/daemon/daemon_apply.go (degraded-warn wording + comment),
+    docs/multi-wan.md (kernel-steering support matrix), pkg/routing/README.md
+    (FBF support-matrix note under the 31000 band)
+
 ## 2026-07-01 — #3712 userspace-dp policy: fail-closed on invalid ICMP application field combos
 
 - **Timestamp**: 2026-07-01
@@ -25591,6 +25633,45 @@ top.
     metrics_host_inbound_addressless_3698_test.go (gauge emitted with dataplane
     unloaded, scoped zone absent, nil-store no-panic)
 
+## 2026-07-01 — #3705 host-inbound fail-closed for a tolerant/HA nil zone
+
+- **Timestamp**: 2026-07-01
+- **Action**: Fix #3705 (SECURITY) — a tolerant / HA-loaded config carrying a
+  NIL zone value (Security.Zones[name] == nil, #3493) shipped
+  HostInboundConfigured=false, so the KNOWN configured zone was left absent from
+  the Rust `zone_host_inbound` table and hit the `None => true` admit-all arm,
+  admitting ALL host-bound traffic (reopening #3405 default-deny on the
+  nil-object shape). Fixed BOTH sides fail-closed:
+    - Go: `buildZoneSnapshots` now sets HostInboundConfigured=true
+      UNCONDITIONALLY (only the token sets stay gated on a non-nil zone +
+      stanza). A nil zone ships configured=true + EMPTY token sets ->
+      default-DENY, identical to a no-stanza zone (#3405) / the #3622 nil-guard.
+    - Rust: `forwarding_build::zones::populate_zones` inserts a ZoneHostInbound
+      for EVERY KNOWN zone (valid id, in snapshot) regardless of
+      host_inbound_configured — the dataplane fail-closed backstop for a
+      mismatched-version control plane. `host_inbound_configured` now selects
+      only WHICH tokens a zone admits, never WHETHER it is enforced. The
+      `None => true` arm now fires ONLY for a genuinely unknown/global ingress
+      zone (id 0). Preserves lifeline exemption (fxp0/em0/fab*, #3682).
+- **File(s)**: pkg/dataplane/userspace/zones.go (unconditional
+  HostInboundConfigured), pkg/dataplane/userspace/zones_host_inbound_test.go
+  (TestBuildZoneSnapshotsNilZoneDefaultDenies — Go RED-on-revert),
+  userspace-dp/src/afxdp/forwarding_build/zones.rs (always-insert build path),
+  userspace-dp/src/afxdp/forwarding_build/tests.rs
+  (build_forwarding_state_nil_zone_default_denies new Rust RED-on-revert;
+  build_forwarding_state_enforces_host_inbound_traffic legacy zone flipped from
+  admit-all to default-deny), userspace-dp/src/afxdp/test_fixtures.rs +
+  userspace-dp/src/afxdp/tests.rs (fixture zones declare `system-services all`
+  so local-delivery tests keep their intended admit-all — explicit form of the
+  removed configured=false default),
+  userspace-dp/src/afxdp/forwarding/README.md +
+  docs/host-inbound-service-matrix.md (fail-closed nil-zone invariant).
+- **Validation**: go build ./... green; go test ./pkg/dataplane/...
+  ./pkg/config/... green; go vet green; Go RED-on-revert verified (re-gate ->
+  RED). Full `cargo test --release` green (3419 tests, 0 failed); Rust
+  RED-on-revert verified for BOTH new nil-zone test and the flipped legacy-zone
+  test (re-gate build-path insert -> both RED). rustfmt not run (repo has
+  pre-existing toolchain drift; edits match committed multi-line style).
 - **Timestamp**: 2026-07-01
   - **Action**: #3711 fail-closed on malformed v3 policy literals +
     address-book prefixes (HIGH security fail-open; v3 sibling of #3367).
@@ -25733,3 +25814,111 @@ top.
   userspace-dp/src/afxdp/forwarding/tests.rs (call sites),
   userspace-dp/src/server/tests.rs (handler regression test),
   userspace-dp/src/afxdp/coordinator/README.md (fail-closed atomic-swap invariant)
+  **Action**: #3757 — ip-monitoring route-overlay actuator: fix the split-FIB
+  fail-open (folds M1/H1/H2/H3). ROOT (M1): the ipmon engine cleared its
+  `dirtySince` bit BEFORE calling the actuator, and the actuator returned
+  nothing, so every consumer failure was invisible → no retry. FIX: the
+  actuator (`actuateRouteOverlay`/`actuateRouteOverlayLocked`) now returns a
+  `bool`; the engine `run()` loop clears the dirty bit ONLY after a converged
+  actuation and keeps it dirty (autonomous throttle-paced retry on the next
+  sweep) on any failure. Added a `dirtyGen` counter so a change landing
+  mid-actuation is preserved (last-writer-wins) instead of being cleared. H1
+  (split FIB): `applyFRRConfig` now returns the FRR error, distinguishing a
+  DEGRADED reload (#1880, additive vtysh -f applied — new routes live in the
+  kernel → treated as success, publish proceeds) from a HARD reload error
+  (frr manager contract: nothing converged, kernel still on old routes). On a
+  hard error the actuator ABORTS BEFORE publishing the userspace snapshot, so
+  kernel + dataplane FIB never diverge; it reports failure and stays dirty. H2
+  (publish error) and H3 (unconfirmed FIB bump) likewise report failure → the
+  engine retries autonomously (H3 no longer waits for a future unrelated
+  actuation). The full apply path keeps warn-and-continue on FRR errors
+  (`_ = d.applyFRRConfig(...)`). RED-on-revert PROVEN: neutering the H1 abort
+  makes `TestActuatorAbortsPublishOnHardFRRError` publish a divergent snapshot
+  (fails); reverting the M1 clear-only-on-success makes
+  `TestActuationFailureStaysDirtyUntilConverged` see attempts=1 (no retry,
+  fails). go test ./pkg/ipmon/... ./pkg/daemon/ green (incl. -race);
+  go build ./... green; gofmt + vet clean.
+  **File(s)**: pkg/ipmon/ipmon.go (dirtyGen + run() clear-on-success + actuate
+  func() bool + package doc), pkg/ipmon/ipmon_test.go (2 new self-heal tests +
+  func() bool call sites), pkg/ipmon/nexthop_test.go (func() bool call sites),
+  pkg/ipmon/README.md (consistency + self-heal section), pkg/daemon/daemon_ipmon.go
+  (applyFRRConfig returns error + actuator returns bool + H1 abort + file doc),
+  pkg/daemon/daemon_ipmon_test.go (H1 abort + degraded-publish RED-on-revert
+  tests), pkg/daemon/daemon_apply.go (explicit `_ =` on full-apply FRR error),
+  docs/multi-wan.md (consistency + autonomous self-heal bullet)
+  **Action**: #3751 — event-options within/trigger numeric strict-validation
+  (fail-open fix). compileEventOptions (compiler_services.go) parsed the
+  `within <seconds>` and `trigger (on|until) <count>` numerics with
+  strconv.Atoi and SILENTLY dropped the error → a typo coerced the field to 0,
+  and the engine's withinMatches treated a 0 threshold as an unconditional
+  match → a threshold-gated autonomous remediation silently became ALWAYS-FIRE
+  (H11). Also H12 (negative / huge / zero window; huge risked a time.Duration
+  overflow) and H13 (a single clause carrying both `trigger on` and
+  `trigger until`, ANDed into a nonsensical one-count band). FIX (two halves,
+  mirroring the #2141 attributes-match strict/lenient doctrine):
+  (a) commit-time strict validator validateEventOptionsWithinAST
+  (new pkg/config/event_options_within.go) — an AST pre-walk (the raw typo is
+  lost once coerced to 0; forEachChild over every top-level event-options block
+  per #3562) run inside compileExpanded on the group-expanded, inactive-pruned
+  tree. Rejects non-numeric / negative / zero / out-of-range within (1..86400 s)
+  and trigger count (1..1000000), an unknown trigger keyword (Junos `after`), a
+  within with no trigger, and the on+until combination. Strict on commit /
+  commit-check; downgraded to a cfg.Warnings entry on the tolerant load /
+  peer-sync paths (new compileOpts.lenientEventWithinTrigger, set in
+  CompileConfigLenient + CompileConfigForNodeLenient, #1960 no-brick).
+  (b) engine defense-in-depth — withinMatches (pkg/eventengine/engine.go) now
+  fails CLOSED on a within clause with no usable positive threshold (both
+  trigger on/until <=0) or a non-positive window, so a leftover 0 from an older
+  binary no longer over-fires; a policy with NO within clauses still fires on
+  every match (no temporal filter). RED-on-revert verified for BOTH halves
+  (stubbed validator → commit accepts the typos; stubbed engine guard →
+  0-threshold policy fires 10/10). go test ./pkg/config/... ./pkg/eventengine/...
+  green; downstream ./pkg/configstore/... ./pkg/daemon/... green; go build
+  ./... green; gofmt + vet clean. Schema desc/docs updated.
+  **File(s)**: pkg/config/event_options_within.go (new validator),
+  pkg/config/compiler.go (lenientEventWithinTrigger opt + call site),
+  pkg/config/schema_system.go (within/trigger desc ranges),
+  pkg/eventengine/engine.go (withinMatches fail-closed + header doc),
+  pkg/config/event_options_within_3751_test.go (new, RED-on-revert),
+  pkg/eventengine/engine_within_failclosed_3751_test.go (new, RED-on-revert),
+  docs/config-schema.md (#3751 validator entry)
+
+## 2026-07-01 — #3750 eventengine: revalidate queued remediation before commit (H1/H2/H3 fail-opens)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3750 (MAJOR, security fail-open + documented-invariant
+    violation; folds H1/H2/H3/L14). A pre-classified event-options remediation
+    (`plannedAction`) carried only policyName + typed plan; the worker committed
+    it with ZERO revalidation against live engine state, so under normal config-
+    lock contention (an operator holds the lock while an RPM event fires and the
+    worker retries on ErrConfigLocked) three fail-opens existed. H1: a policy
+    REMOVED by an operator commit while its action was queued still committed the
+    stale batch (Apply(nil) drops runtime/semRev but nothing invalidated the
+    in-flight action). H2: a same-name REDEFINE left the OLD queued command set to
+    commit under the new policy's name (no revision to compare). H3: the 30s
+    cooldown was CHECKED at evaluate but ARMED only after commit, and enqueue
+    dedups only when the queue is FULL — so two events for one policy both queue
+    while the worker is blocked; the worker committed the first, armed the
+    cooldown, then committed the second without re-checking (double-commit,
+    violating the documented "not more than once in any 30s window" invariant).
+    FIX: stamp each action with the policy's semantic revision as of the evaluate
+    that produced it (`plannedAction.semRev`, captured under e.mu in
+    evaluateEvent via new `triggeredPolicy`); revalidate it in `staleReason`
+    inside applyOnce right after EnterConfigure succeeds — while holding the
+    config lock, so no operator Apply can interleave until ExitConfigure. Drop
+    (do not touch the candidate) if the policy is absent (removed), the live
+    semRev mismatches (redefined), or the cooldown is now active; return the
+    `errStaleAction` sentinel. runAction counts it as dropped_stale and does NOT
+    retry. One gate for H1/H2/H3. Observability: new Stats.DroppedStale surfaced
+    on xpf_event_actions_dropped_total{reason="stale"}. VALIDATION: 5 new
+    RED-on-revert tests (removing the gate → H1/H2/H3 commit the stale batch and
+    go RED, verified); go test ./pkg/eventengine/... green (incl -race); go test
+    ./pkg/api/... green; go build ./... green; gofmt + vet clean. README +
+    metric descriptor updated.
+  - **File(s)**: pkg/eventengine/engine.go (plannedAction.semRev +
+    triggeredPolicy, evaluateEvent return type, HandleEvent stamp, runAction
+    stale branch, applyOnce staleReason gate + errStaleAction/staleErr, Stats +
+    counters, header doc), pkg/eventengine/README.md (revalidate-before-commit
+    section + metrics + cooldown gotcha), pkg/api/metrics_system.go (emit
+    reason="stale"), pkg/api/metrics_descriptors.go (dropped help text),
+    pkg/eventengine/engine_stale_revalidate_3750_test.go (new, RED-on-revert)

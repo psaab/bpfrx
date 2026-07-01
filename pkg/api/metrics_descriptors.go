@@ -476,8 +476,13 @@ func newCollector(srv *Server) *xpfCollector {
 				"reason=lock_held: the config lock stayed held past the "+
 				"retry deadline. reason=queue_full: a newer same-policy "+
 				"action superseded this one, or the bounded action queue "+
-				"was full (#2157). A nonzero value means automated "+
-				"remediation was lost — investigate the lock holder.",
+				"was full (#2157). reason=stale: at commit time the policy had "+
+				"been removed or redefined, or its 30s cooldown was now active — "+
+				"the action was revalidated and dropped rather than committing a "+
+				"batch no active policy authorizes (#3750). A nonzero "+
+				"lock_held/queue_full value means automated remediation was "+
+				"lost — investigate the lock holder; stale is expected under "+
+				"operator config churn or duplicate events.",
 			[]string{"reason"}, nil,
 		),
 		eventAttributesInvalid: prometheus.NewDesc(

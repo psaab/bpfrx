@@ -122,6 +122,35 @@ operation or session return traffic. nft: `buildHostInboundFilterPayload`; Rust:
 | ICMPv4 errors/PMTUD | `icmp type { destination-unreachable, time-exceeded, parameter-problem }` | proto 1 types 3, 11, 12 | PMTUD / unreachable / traceroute-to-self signalling. Echo-request is NOT here (gated on `ping`). |
 | ICMPv6 errors + ND | `icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 }` | proto 58 types 1-4, 133-137 | v6 error/PMTUD (1-4) + Neighbor Discovery (133-137). Echo-request (128) is NOT here (gated on `ping`). |
 
+## Fail-closed invariant for a nil / configured=false known zone (#3705)
+
+Every zone the control plane KNOWS about — a zone present in the snapshot with a
+valid, addressable id — is host-inbound **enforcing** (default-deny at minimum),
+and the two layers agree:
+
+- **Go builder (`buildZoneSnapshots`, `pkg/dataplane/userspace/zones.go`).** A
+  tolerant / HA-loaded config can carry a NIL zone value
+  (`Security.Zones[name] == nil`, the #3493 shape). `HostInboundConfigured` is
+  set UNCONDITIONALLY, so a nil zone ships `host_inbound_configured=true` with
+  EMPTY token sets — default-deny, identical to a no-stanza zone (#3405). Before
+  #3705 the flag was gated on `zone != nil`, so a nil zone shipped a valid
+  name+id but `configured=false`.
+- **Rust build path (`forwarding_build::zones::populate_zones`).** The
+  `zone_host_inbound` insert is NOT gated on `host_inbound_configured`: every
+  known zone gets an entry (an empty `ZoneHostInbound` when the flag is false /
+  tokens are empty → default-deny). This is the dataplane fail-closed backstop
+  for a mismatched-version control plane (e.g. an old pre-#3405 Go binary that
+  omits the flag). `host_inbound_configured` now selects only WHICH tokens a
+  zone admits, never WHETHER it is enforced.
+
+Without both, a KNOWN configured zone with `configured=false` was left absent
+from `zone_host_inbound` and hit the `None => true` admit-all arm in
+`host_inbound_admits` — reopening the #3405 default-deny on the nil-object shape
+(a management-plane fail-open on the exact tolerant-load / HA-sync path where nil
+zones arise). `None` now means only a genuinely unknown / global ingress zone
+(id 0, never in the table), which keeps the admit default; lifeline interfaces
+(fxp0/em0/fab*) never reach the AF_XDP classifier (#3682).
+
 ## Deliberate narrowings & the one cross-surface divergence
 
 These are intentional and match vSRX / Junos semantics. Documented here so future

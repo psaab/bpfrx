@@ -46,11 +46,15 @@ const ICMP4_ROUTER_ADVERTISEMENT: u8 = 9;
 const ICMP4_ROUTER_SOLICITATION: u8 = 10;
 const ICMP6_ECHO_REQUEST: u8 = 128;
 
-/// Build the per-zone host-inbound admission table from the snapshot. Only
-/// zones with `host_inbound_configured == true` get an entry — which, since
-/// #3405, is EVERY configured security zone (a no-stanza zone arrives with
-/// empty token sets -> empty `ZoneHostInbound` -> default-deny). The zone id
-/// used as the key MUST be the same validated id `populate_zones` accepted
+/// Build the per-zone host-inbound admission table from the snapshot. Since
+/// #3722 `populate_zones` inserts an entry for EVERY known security zone
+/// regardless of `host_inbound_configured` — a no-stanza / nil / unconfigured
+/// zone arrives with empty token sets -> empty `ZoneHostInbound` -> default-deny
+/// (fail-closed). `host_inbound_configured` now only selects WHICH tokens a zone
+/// admits (the #3405 no-stanza-vs-configured distinction), never WHETHER the
+/// zone is enforced — a missing table entry means only a genuinely unknown /
+/// global (id 0) ingress zone, which the classifier admits by design. The zone
+/// id used as the key MUST be the same validated id `populate_zones` accepted
 /// (caller passes it), so the two maps stay aligned.
 pub(in crate::afxdp) fn zone_host_inbound_from_snapshot(zone: &ZoneSnapshot) -> ZoneHostInbound {
     zone_host_inbound_from_tokens(

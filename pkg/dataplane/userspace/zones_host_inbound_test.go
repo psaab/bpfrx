@@ -80,6 +80,71 @@ func TestBuildZoneSnapshotsCarriesHostInbound(t *testing.T) {
 	}
 }
 
+// TestBuildZoneSnapshotsNilZoneDefaultDenies is the #3705 RED-on-revert guard on
+// the Go builder. A tolerant / HA-loaded config can carry a NIL zone value
+// (Security.Zones[name] == nil, the #3493 shape). buildZoneSnapshots must STILL
+// emit that zone with HostInboundConfigured=true and EMPTY token sets so the Rust
+// classifier default-DENIES it (inserts an empty ZoneHostInbound) — identical to
+// a no-stanza zone (#3405). Before #3705 a nil zone shipped
+// HostInboundConfigured=false, leaving the KNOWN configured zone absent from the
+// dataplane's host-inbound table -> `None => true` admit-all -> management-plane
+// fail-open.
+//
+// Fail-on-revert: restore the `if zone != nil` gate on `zs.HostInboundConfigured`
+// in buildZoneSnapshots and the nil zone flips back to HostInboundConfigured=false
+// (admit-all on the wire), turning the assertion below RED.
+func TestBuildZoneSnapshotsNilZoneDefaultDenies(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		// A configured zone name whose value is NIL — the tolerant / HA-load shape
+		// (#3493). The key exists (the zone is "known"), but the *ZoneConfig is nil.
+		"trust": nil,
+		// A normal configured zone with a stanza, to prove nil handling does not
+		// disturb legit admit sets.
+		"wan": {
+			Name:               "wan",
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+	}
+
+	snaps := buildZoneSnapshots(cfg)
+	byName := make(map[string]ZoneSnapshot, len(snaps))
+	for _, z := range snaps {
+		byName[z.Name] = z
+	}
+
+	// The nil zone is still emitted (known + addressable) but as a default-deny
+	// zone: HostInboundConfigured=true with EMPTY token sets.
+	trust, ok := byName["trust"]
+	if !ok {
+		t.Fatal("nil zone must still emit a snapshot (known zone must be addressable)")
+	}
+	if !trust.HostInboundConfigured {
+		t.Error("nil zone: HostInboundConfigured = false, want true (#3705 fail-closed default-deny)")
+	}
+	if len(trust.HostInboundSystemServices) != 0 || len(trust.HostInboundProtocols) != 0 {
+		t.Errorf("nil zone must carry empty token sets (default-deny), got services=%v protocols=%v",
+			trust.HostInboundSystemServices, trust.HostInboundProtocols)
+	}
+	// The nil zone still gets a valid, addressable id (name-hash, #3704) so
+	// policy/host-inbound resolution can reference it.
+	if trust.ID == 0 {
+		t.Error("nil zone must carry a valid (non-zero) zone id")
+	}
+
+	// The non-nil zone is unaffected — legit admit set preserved.
+	wan, ok := byName["wan"]
+	if !ok {
+		t.Fatal("wan zone snapshot missing")
+	}
+	if !wan.HostInboundConfigured {
+		t.Error("wan: HostInboundConfigured = false, want true")
+	}
+	if got, want := wan.HostInboundSystemServices, []string{"ssh"}; !eqStr(got, want) {
+		t.Errorf("wan system-services = %v, want %v", got, want)
+	}
+}
+
 // TestBuildZoneHostInboundViews verifies the per-zone enforcement view used by
 // the kernel-nftables primary path (#3070): every configured zone resolves its
 // firewall-local host addresses (including no-stanza zones, which default-deny

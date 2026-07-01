@@ -215,7 +215,26 @@ treated as an empty stanza: the Go control plane marks it
 admission set and `admits()` returns deny for every service/protocol not
 explicitly permitted. Before #3405 a no-stanza zone was absent from the map and
 `host_inbound_admits` returned admit (`None => true`) — a permit-all
-management-plane exposure on any zone the operator never locked down. `None`
+management-plane exposure on any zone the operator never locked down.
+
+**Fail-closed for a nil / configured=false known zone (#3705).**
+`forwarding_build::zones::populate_zones` inserts a `ZoneHostInbound` for
+**every KNOWN zone** — a zone present in the snapshot with a valid, addressable
+id — regardless of `host_inbound_configured`. The insert is deliberately NOT
+gated on that flag: a KNOWN zone whose snapshot carries
+`host_inbound_configured == false` — the tolerant / HA nil-zone shape
+(`Security.Zones[name] == nil` ships a valid name+id but configured=false;
+#3493), or an old pre-#3405 Go control plane that omits the field — would
+otherwise be left absent from the table and hit the `None => true` admit-all
+arm, making that known configured zone admit ALL host-bound traffic (reopening
+#3405 on the nil-object shape). A configured=false zone carries empty token
+vecs, so it inserts an empty `ZoneHostInbound` → default-DENY, identical to a
+no-stanza zone. The Go builder also ships configured=true for a nil zone
+(`buildZoneSnapshots`); this insert is the dataplane fail-closed backstop for a
+mismatched-version control plane. `host_inbound_configured` therefore now
+selects only WHICH tokens a zone admits, never WHETHER it is enforced.
+
+Consequently `None`
 now means only a genuinely unknown / global ingress zone (id not in the table),
 which keeps the admit default. The global ICMP/ND/PMTUD accepts precede the
 per-zone deny, and lifeline interfaces (fxp0/em0/fab*) never reach this AF_XDP

@@ -5945,15 +5945,23 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
     let mut snapshot = policy_deny_snapshot();
     snapshot.default_policy = "permit".to_string();
     snapshot.policies.clear();
+    // #3705: host-inbound runs BEFORE the lo0 filter, so the host-bound packet
+    // must be admitted for the lo0 filter to run. Every known zone is now
+    // enforcing, so declare `all` explicitly (pre-#3705 this relied on the
+    // configured=false admit-all default).
     snapshot.zones = vec![
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec!["all".to_string()],
             ..Default::default()
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec!["all".to_string()],
             ..Default::default()
         },
     ];
@@ -6122,15 +6130,23 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
     let mut snapshot = policy_deny_snapshot();
     snapshot.default_policy = "permit".to_string();
     snapshot.policies.clear();
+    // #3705: host-inbound runs BEFORE the lo0 filter, so the host-bound packet
+    // must be admitted for the lo0 filter to run. Every known zone is now
+    // enforcing, so declare `all` explicitly (pre-#3705 this relied on the
+    // configured=false admit-all default).
     snapshot.zones = vec![
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec!["all".to_string()],
             ..Default::default()
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec!["all".to_string()],
             ..Default::default()
         },
     ];
@@ -9301,7 +9317,9 @@ fn poll_descriptor_host_inbound_deny_emits_tuple_event_session_miss() {
     assert_eq!(event_handle.dataplane_event_stats().policy_deny.sent, 1);
 }
 
-/// #3326 GREEN companion: with NO host-inbound restriction (admit-all default),
+/// #3326 GREEN companion: with an admit-all host-inbound zone (the fixture zones
+/// carry `system-services all` since #3705 — every known zone is enforcing, so
+/// admit-all is now explicit rather than the removed configured=false default),
 /// the same host-bound packet is admitted and the host-inbound deny counter
 /// stays 0. Proves the #3326 bump cannot newly over-count admitted host/
 /// management traffic.

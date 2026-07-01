@@ -272,6 +272,35 @@ func resolveFilterPort(spec string) (string, bool) {
 	return strconv.Itoa(int(p)), true
 }
 
+// ResolveFilterPortRange resolves a single `from {source,destination}-port`
+// spec — a number, a Junos service name, or a `lo-hi` range of either — to a
+// numeric [lo,hi] port range for the kernel filter-based-forwarding ip-rule
+// mirror (pkg/routing, #3730). It reuses resolveFilterPort (the SSOT that the
+// compile path uses) so the kernel FBF mirror and the userspace filter path
+// resolve named/ranged ports identically. A single port yields lo==hi.
+//
+// ok=false for an unrecognized name or a malformed range so the caller FAILS
+// CLOSED (drops the steering rule + degrades) rather than widening the match.
+func ResolveFilterPortRange(spec string) (lo, hi uint16, ok bool) {
+	canon, ok := resolveFilterPort(spec)
+	if !ok {
+		return 0, 0, false
+	}
+	if i := strings.IndexByte(canon, '-'); i > 0 {
+		l, e1 := strconv.Atoi(canon[:i])
+		h, e2 := strconv.Atoi(canon[i+1:])
+		if e1 != nil || e2 != nil || l < 0 || h > 65535 || l > h {
+			return 0, 0, false
+		}
+		return uint16(l), uint16(h), true
+	}
+	n, err := strconv.Atoi(canon)
+	if err != nil || n < 0 || n > 65535 {
+		return 0, 0, false
+	}
+	return uint16(n), uint16(n), true
+}
+
 // resolveFilterPortTokens resolves every port token in a `from` port list to a
 // canonical numeric spec. A recognized token is rewritten to its numeric form
 // so the dataplane only ever sees numerics. An UNrecognized token is kept
