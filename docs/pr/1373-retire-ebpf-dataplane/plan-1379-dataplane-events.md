@@ -102,6 +102,21 @@ Current implementation status after the 2026-05-19 closeout slice:
   `MSG_FILTER_LOG`, the RT_FLOW reason byte carries the source label above;
   close events continue to interpret the same byte as a close reason. This is
   event-stream semantics, not a config-snapshot protocol field.
+- #3610 host-inbound deny: a host-bound (LocalDelivery) packet rejected by the
+  ingress zone's `host-inbound-traffic` admission gate now emits a tuple-rich
+  RT_FLOW deny event instead of being accounted only by the aggregate
+  `host_inbound_denied_packets` counter. It reuses the `MSG_POLICY_DENY` wire
+  kind (so it rides the same #3615 per-kind rate limiter, queue budget, and Go
+  RT_FLOW_SESSION_DENY renderer — no parallel emit path), but carries the
+  distinct reason byte `RT_FLOW_CLOSE_REASON_HOST_INBOUND` (6, ==
+  `closeReasonHostInbound`). The Go structured record renders `reason="Denied by
+  host-inbound-traffic"` for it, vs `reason="Rejected by policy"` for a transit
+  policy deny (reason 5). The action is always DENY (host-inbound is a silent
+  drop, never a reject) and `policy_id`/`egress_zone_id`/`owner_rg_id` are 0
+  (host-local, not policy-forwarded). It fires for BOTH flow-backed (session-hit
+  and session-miss) and flowless (#3292 non-first-fragment / no-L4) host-inbound
+  denies. The debug counter was split too: the deny bumps `dbg.host_inbound_deny`
+  rather than being conflated with `dbg.policy_deny` (Codex H06 + M07 + L04).
 - `pkg/dataplane/userspace/eventstream_test.go` includes a deterministic UDP
   syslog harness that feeds raw userspace policy-deny, screen-drop, and
   filter-log frames through the Go event-stream callback, `EventReader`, and

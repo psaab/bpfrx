@@ -1,3 +1,28 @@
+## 2026-07-01 — #3610 host-inbound denies emit a tuple-rich RT_FLOW event
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3610 — host-inbound-traffic admission denies were accounted
+    only by the aggregate `host_inbound_denied_packets` counter (+ conflated
+    with `dbg.policy_deny`), with NO tuple-rich dataplane event, so operators
+    could not see WHICH control-plane flow was denied. Added
+    `emit_host_inbound_deny_event` (reuses the #3615 policy-deny event
+    machinery: same `PolicyDeny` wire kind / rate limiter / Go renderer, with a
+    distinct `RT_FLOW_CLOSE_REASON_HOST_INBOUND`=6 reason, action always DENY,
+    policy_id 0). Wired it into all three host-inbound deny arms (session-hit,
+    session-miss, #3292 flowless LocalDelivery). Split `dbg.policy_deny` →
+    `dbg.host_inbound_deny` at those arms (M07). Go: `closeReasonHostInbound`
+    (6) → "Denied by host-inbound-traffic"; POLICY_DENY structured formatter
+    now renders the on-wire reason (byte-identical "Rejected by policy" for a
+    transit deny). RED-on-revert poll-loop test proven (empty event channel on
+    revert). No wire fixture regen (reuses the existing reason byte, new value).
+  - **File(s)**: userspace-dp/src/afxdp/event_emit.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/types/runtime.rs,
+    userspace-dp/src/afxdp/worker/loop_body/debug_report.rs,
+    userspace-dp/src/afxdp/tests.rs, pkg/logging/ringbuf.go,
+    pkg/logging/host_inbound_deny_3610_test.go,
+    docs/pr/1373-retire-ebpf-dataplane/plan-1379-dataplane-events.md
+
 ## 2026-07-01 — #3626 appid catalog includes NAT-only match-application refs
 
 - **Timestamp**: 2026-07-01
