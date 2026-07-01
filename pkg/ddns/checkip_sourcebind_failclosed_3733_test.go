@@ -67,29 +67,39 @@ func TestCheckIPBoundNoSourceUsesDefaultRoute(t *testing.T) {
 	}
 }
 
-// TestCheckIPBoundAvailableSourceWorks proves that a configured source that
-// resolves cleanly (bindErr == nil, `client` is the bound client) still probes
-// and returns the public IP. This is the multi-WAN happy path #2846 established:
-// the fail-closed gate keys ONLY on the bind error, so an honored source is
-// never suppressed.
+// TestCheckIPBoundAvailableSourceWorks proves the multi-WAN happy path #2846
+// established: a configured source that resolves cleanly (bindErr == nil, and
+// `client` is an ACTUAL source-bound client, not the unbound default) still
+// probes and returns the public IP. The fail-closed gate keys ONLY on the bind
+// error, so an honored source is never suppressed. Distinct from
+// TestCheckIPBoundNoSourceUsesDefaultRoute (which threads the unbound default
+// client): here the probe egresses through a real source-bound *http.Client.
 func TestCheckIPBoundAvailableSourceWorks(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("93.184.216.34\n"))
 	}))
 	defer srv.Close()
 
-	// A provider with a valid source-address resolves WITHOUT a bind error, so
-	// the caller passes bindErr=nil and the probe proceeds. Confirm the honored
-	// source really does resolve clean (the gate keys on the error, not on the
-	// presence of a source). The socket bind itself is covered by
-	// backend_bind_test.go and backend_http_sourcebind_2846_test.go; here the
-	// loopback test server stands in for the bound egress.
-	if _, err := newProviderHTTPClient(&config.DDNSProvider{Name: "p", SourceAddress: "127.0.0.2"}); err != nil {
+	// Build the REAL bound client: source-address 127.0.0.1 is the loopback the
+	// httptest server listens on, so the source-bound socket connects to it
+	// successfully (v4 source, v4 dial — no #2901 family mismatch). A valid
+	// source-address resolves WITHOUT a bind error, so the caller passes
+	// bindErr=nil and the probe must proceed through the bound client.
+	client, err := newProviderHTTPClient(&config.DDNSProvider{Name: "p", SourceAddress: "127.0.0.1"})
+	if err != nil {
 		t.Fatalf("a valid source-address must resolve without error, got %v", err)
 	}
+	// Assert this really IS a source-bound client (installs a DialContext),
+	// unlike the unbound default the no-source test uses — so this case
+	// genuinely exercises "bound client + bindErr==nil still probes".
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok || tr.DialContext == nil {
+		t.Fatalf("expected a source-bound client with a DialContext, got %T (DialContext set=%v)",
+			client.Transport, ok && tr.DialContext != nil)
+	}
 
-	a, ok := CheckIPBound(context.Background(), srv.Client(), srv.URL, true, nil, nil)
+	a, ok := CheckIPBound(context.Background(), client, srv.URL, true, nil, nil)
 	if !ok || a.String() != "93.184.216.34" {
-		t.Fatalf("CheckIPBound(honored source) = %v ok=%v; want 93.184.216.34 true", a, ok)
+		t.Fatalf("CheckIPBound(honored bound source) = %v ok=%v; want 93.184.216.34 true", a, ok)
 	}
 }

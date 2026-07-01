@@ -275,16 +275,20 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			// of rebuilding a transport every reconcile pass.
 			client, berr := d.surfaceA.CheckIPClient(scope.Provider)
 			if berr != nil {
-				// FAIL-CLOSED (#3733): a source-address/interface/VRF WAS
-				// configured for this provider but could not be honored (e.g. a
-				// malformed source-address). checkip is an address oracle —
-				// falling back to the kernel default route would egress via a
-				// DIFFERENT WAN and return the WRONG WAN's public IP, republishing
-				// the wrong-WAN class #2846 closed. CheckIPBound (below) refuses to
-				// probe when berr != nil and returns ok=false: a TRANSIENT
-				// observation (no publish, never a withdraw). Log once per
-				// (provider, bind-error) so a persistent misconfig surfaces without
-				// flooding the per-tick observer.
+				// FAIL-CLOSED (#3733): berr means the provider's configured
+				// source-address failed to parse (netip.ParseAddr) — it is the
+				// ONLY bind-resolution error CheckIPClient returns. A dead
+				// destination-interface / VRF does NOT surface here; that becomes
+				// a DIAL error inside CheckIPBound → CheckIP, already ok=false. So
+				// berr specifically = a malformed configured source-address the
+				// bind could not honor. checkip is an address oracle — falling back
+				// to the kernel default route would egress via a DIFFERENT WAN and
+				// return the WRONG WAN's public IP, republishing the wrong-WAN
+				// class #2846 closed. CheckIPBound (below) refuses to probe when
+				// berr != nil and returns ok=false: a TRANSIENT observation (no
+				// publish, never a withdraw). Log once per (provider, bind-error)
+				// so a persistent misconfig surfaces without flooding the per-tick
+				// observer.
 				key := scope.Provider.Name + "\x00" + berr.Error()
 				if _, dup := d.surfaceACheckIPSourceBindWarned.LoadOrStore(key, struct{}{}); !dup {
 					slog.Warn("ddns surface-a: checkip source bind unusable; "+
