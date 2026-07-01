@@ -555,12 +555,26 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 		// fail-closed deny-all for any interface in the zone WITHOUT an override),
 		// and overridden interfaces are admitted via the per-interface ifindex map
 		// (InterfaceSnapshot.HostInbound*).
-		if zone := cfg.Security.Zones[name]; zone != nil {
-			zs.HostInboundConfigured = true
-			if zone.HostInboundTraffic != nil {
-				zs.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
-				zs.HostInboundProtocols = lowerTokens(zone.HostInboundTraffic.Protocols)
-			}
+		//
+		// #3705: HostInboundConfigured is set UNCONDITIONALLY for every emitted
+		// snapshot — it must NOT be gated on `zone != nil`. A tolerant / HA-loaded
+		// config can carry a NIL zone value (cfg.Security.Zones[name] == nil, the
+		// #3493 shape; api/sessions.go:809 and buildZoneRGMap both guard it). Before
+		// #3705 a nil zone shipped a snapshot with a valid name+id but
+		// HostInboundConfigured=false, so the Rust build path left it ABSENT from
+		// `zone_host_inbound` and the classifier's `None => true` admit-all arm made
+		// that KNOWN configured zone admit ALL host-bound traffic — reopening the
+		// #3405 default-deny guarantee on the nil-object shape (management-plane
+		// fail-open). Emitting configured=true with EMPTY token sets makes a nil zone
+		// default-DENY exactly like a no-stanza zone (#3405): the Rust classifier
+		// inserts an empty ZoneHostInbound -> `admits()` returns false for every
+		// service/protocol. Lifeline interfaces (fxp0/em0/fab*) never reach the
+		// AF_XDP local-delivery classifier (#3682), so the flip cannot strand
+		// management or break HA.
+		zs.HostInboundConfigured = true
+		if zone := cfg.Security.Zones[name]; zone != nil && zone.HostInboundTraffic != nil {
+			zs.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
+			zs.HostInboundProtocols = lowerTokens(zone.HostInboundTraffic.Protocols)
 		}
 		// #3071: carry the per-zone `tcp-rst` knob to the dataplane so a
 		// denied TCP flow whose ingress (from) zone has tcp-rst enabled
