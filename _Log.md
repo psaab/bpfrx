@@ -1,3 +1,37 @@
+## 2026-07-01 — #3769 fold (review MINOR): empty from-routing-instance NAT external = table-agnostic wildcard
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Hostile review of PR #3799 flagged a MINOR attribution
+    asymmetry. The NAT matchers' `scope_ok` treats an EMPTY
+    `from_routing_instance` as a WILDCARD (matches ANY ingress
+    routing-instance; `nat/destination.rs`, `nat/static_nat.rs`,
+    `nat/source.rs`), and the common `from zone` / `from interface`
+    inbound-DNAT rule leaves the routing instance empty
+    (`compiler_nat.go`). My first cut attributed an empty-scope external IP
+    to `inet.0` only (via `connected_route_tables("")`), over-isolating it
+    when its zone lives in a non-default VRF (latent — pre-routing DNAT
+    translates the dst before the table-scoped shortcut, so no happy-path
+    blackhole, but an UN-translated external IP in a non-default VRF was
+    mis-isolated).
+    FIX: new table-agnostic `ForwardingState.local_nat_any_table_v4/v6`
+    sets. `forwarding_build` routes an empty-scope NAT/DNAT external into
+    those (wildcard); a NAMED instance keeps the exact-table attribution in
+    `local_tables_v*` (correct cross-VRF isolation, unchanged). The
+    local-delivery DECISION treats a `local_nat_any_table_v*` member as
+    owned in EVERY resolving table. Interface host addresses are never
+    wildcarded.
+  - **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+    userspace-dp/src/afxdp/forwarding/mod.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/src/afxdp/forwarding/tests.rs,
+    userspace-dp/src/afxdp/forwarding/README.md
+  - **Tests**: added `unscoped_nat_local_delivery_is_wildcard_across_vrfs`
+    (unscoped static-NAT + DNAT externals must LocalDeliver in None /
+    inet.0 / tenant-a.inet.0). RED-on-revert: forcing `wildcard = false`
+    (empty scope → inet.0 only) makes the tenant-a assertion NoRoute →
+    RED, while the named-VRF isolation tests and the default-VRF test still
+    pass. Full `cargo test --release` green.
+
 ## 2026-07-01 — #3769 userspace-dp: table-scope the local-delivery DECISION for NAT/DNAT external targets (cross-VRF leak + ifindex-0)
 
 - **Timestamp**: 2026-07-01

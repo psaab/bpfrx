@@ -1176,11 +1176,16 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                 // use the connected scan — `ConnectedRouteV4` stores the MASKED
                 // network address, so `prefix.addr() == host` matches only a
                 // /32 (and never a NAT-only IP, which has no connected route).
-                if !state
-                    .local_tables_v4
-                    .get(&ip)
-                    .is_some_and(|tables| tables.contains(&table))
-                {
+                // #3769: an UNSCOPED NAT/DNAT external (`local_nat_any_table_v4`)
+                // is table-agnostic (mirrors `scope_ok`'s empty-instance
+                // wildcard); a named-VRF / interface address must match the
+                // resolving table exactly.
+                let owned_here = state.local_nat_any_table_v4.contains(&ip)
+                    || state
+                        .local_tables_v4
+                        .get(&ip)
+                        .is_some_and(|tables| tables.contains(&table));
+                if !owned_here {
                     // Owned in a DIFFERENT table only (cross-VRF) — fall
                     // through to the VRF-A route lookup instead of leaking to
                     // LocalDelivery.
@@ -1238,12 +1243,15 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                 // branch). A NAT/DNAT external IP owned in another VRF, or an
                 // interface IP owned only in another routing-instance, must not
                 // short-circuit a VRF-A packet to LocalDelivery. `local_v6`
-                // membership alone is global; gate on `local_tables_v6`.
-                if !state
-                    .local_tables_v6
-                    .get(&ip)
-                    .is_some_and(|tables| tables.contains(&table))
-                {
+                // membership alone is global; gate on `local_tables_v6` (plus
+                // the unscoped-wildcard `local_nat_any_table_v6`, see the v4
+                // branch).
+                let owned_here = state.local_nat_any_table_v6.contains(&ip)
+                    || state
+                        .local_tables_v6
+                        .get(&ip)
+                        .is_some_and(|tables| tables.contains(&table));
+                if !owned_here {
                     // Owned in a DIFFERENT table only (cross-VRF) — fall
                     // through to the route lookup.
                 } else {

@@ -3033,6 +3033,67 @@ fn interface_local_delivery_single_vrf_no_cross_vrf_leak() {
     );
 }
 
+/// #3769 (review MINOR): an UNSCOPED NAT/DNAT rule (`from routing-instance`
+/// empty — the common `from zone` / `from interface` inbound-DNAT case) is a
+/// WILDCARD that `scope_ok` matches against ANY ingress routing-instance.
+/// Attributing its external IP to `inet.0` only would over-isolate it when the
+/// ingress zone lives in a non-default VRF. The external IP must resolve as
+/// locally-owned in a NAMED VRF too (via `local_nat_any_table_v*`), NOT fall
+/// through to NoRoute. Revert (route the empty scope through
+/// `connected_route_tables("")` → inet.0 only) → this goes NoRoute in
+/// tenant-a → RED. The named-VRF isolation tests above must still hold.
+#[test]
+fn unscoped_nat_local_delivery_is_wildcard_across_vrfs() {
+    let snapshot = crate::ConfigSnapshot {
+        static_nat_rules: vec![crate::StaticNATRuleSnapshot {
+            name: "web-unscoped".to_string(),
+            from_zone: "untrust".to_string(), // zone-scoped → RI left empty
+            from_routing_instance: String::new(),
+            external_ip: "203.0.113.77".to_string(),
+            internal_ip: "192.168.1.77".to_string(),
+            ..Default::default()
+        }],
+        destination_nat_rules: vec![crate::DestinationNATRuleSnapshot {
+            name: "dnat-unscoped".to_string(),
+            from_zone: "untrust".to_string(),
+            from_routing_instance: String::new(),
+            destination_address: "198.51.100.88".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "10.0.61.88".to_string(),
+            pool_port: 8443,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let ext = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+    let dnat = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88));
+
+    // Unscoped externals must local-deliver in EVERY table: the default table
+    // AND a named non-default VRF (mirrors `scope_ok`'s wildcard).
+    for table in [None, Some("inet.0"), Some("tenant-a.inet.0")] {
+        let r = lookup_forwarding_resolution_in_table_with_dynamic(
+            &state, &neighbors, ext, table,
+        );
+        assert_eq!(
+            r.disposition,
+            ForwardingDisposition::LocalDelivery,
+            "unscoped static-NAT external must local-deliver in table {table:?} \
+             (wildcard), not fall through to NoRoute (#3769 review MINOR)",
+        );
+        let d = lookup_forwarding_resolution_in_table_with_dynamic(
+            &state, &neighbors, dnat, table,
+        );
+        assert_eq!(
+            d.disposition,
+            ForwardingDisposition::LocalDelivery,
+            "unscoped DNAT destination must local-deliver in table {table:?} (wildcard)",
+        );
+    }
+}
+
 /// #2389: a static route with two next-hops must retain BOTH in the FIB
 /// (equal-cost), and a dead first next-hop must fall back to a live
 /// alternate. Revert the build to `next_hops.first()` → only one candidate

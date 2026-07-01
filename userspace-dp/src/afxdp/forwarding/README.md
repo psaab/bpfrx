@@ -80,6 +80,16 @@ Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
     also generalizes #3151 to a single-owner interface IP (present in
     exactly one VRF, not the same IP in both). The ifindex ATTRIBUTION
     still uses the table-scoped connected scan (the /32-HA case).
+    **Empty-scope = wildcard:** a NAT/DNAT rule whose `from
+    routing-instance` is empty is a wildcard `scope_ok` matches against
+    ANY ingress routing-instance (and the common `from zone` / `from
+    interface` inbound-DNAT rule leaves it empty — `compiler_nat.go`).
+    Its external IP is recorded in the table-agnostic
+    `local_nat_any_table_v[46]` set (treated as owned in EVERY table by
+    the DECISION), NOT attributed to `inet.0` only — otherwise an external
+    whose zone lives in a non-default VRF would be over-isolated. Interface
+    host addresses are never wildcarded (an interface IP lives in exactly
+    one VRF).
     **L5:** a NAT-only external target (or a non-/32 interface IP whose
     ingress-interface resolution was bypassed) has no exact connected
     match, so its LocalDelivery carries ifindex 0 — now reached ONLY when
