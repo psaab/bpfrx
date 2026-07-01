@@ -53,6 +53,40 @@ func TestLo0FilterKernelMirrorWarns(t *testing.T) {
 	}
 }
 
+// TestLo0FilterKernelMirrorRoutingInstanceWarns pins #3724 M04: a
+// routing-instance (policy-based routing) term on an lo0 input filter commits
+// successfully and terminates as accept on the kernel mirror (daemon_nft.go
+// terminate-as-accept), but the kernel `hook input` chain cannot perform the
+// route selection. It must emit a commit WARNING naming the term and the
+// routing-instance so the operator knows the PBR route selection is silently not
+// honored on the PRIMARY host-bound path.
+//
+// Fail-on-revert: removing the M04 routing-instance append in
+// validateLo0FilterKernelMirrorWarnings removes the warning and this test fails.
+func TestLo0FilterKernelMirrorRoutingInstanceWarns(t *testing.T) {
+	cfg := compileSetLinesT(t, []string{
+		"set system dataplane-type userspace",
+		"set routing-instances mgmt-ri instance-type forwarding",
+		"set firewall family inet filter lo0in term pbr from protocol tcp",
+		"set firewall family inet filter lo0in term pbr then routing-instance mgmt-ri",
+		"set interfaces lo0 unit 0 family inet filter input lo0in",
+	})
+
+	found := false
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "kernel lo0 input mirror") &&
+			strings.Contains(w, `"pbr"`) &&
+			strings.Contains(w, "routing-instance mgmt-ri") &&
+			strings.Contains(w, "route selection") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected lo0 kernel-mirror routing-instance warning for term %q, got: %v", "pbr", ValidateConfig(cfg))
+	}
+}
+
 // TestLo0FilterKernelMirrorCommitSucceeds confirms the warning never fail-closes
 // the commit: these modifiers are valid Junos and must be accepted (warn, never
 // reject) so a previously-committed config is never bricked.

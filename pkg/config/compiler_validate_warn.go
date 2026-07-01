@@ -1042,6 +1042,26 @@ func validateLo0FilterKernelMirrorWarnings(cfg *Config) []string {
 						"dataplane",
 					family, filterName, term.Name, m.kind, m.val))
 			}
+			// #3724 M04: a routing-instance (policy-based routing) term terminates
+			// as ACCEPT on the kernel lo0 input mirror (daemon_nft.go
+			// terminate-as-accept, #3427). The accept VERDICT is honored, but the
+			// kernel `hook input` chain cannot perform the route-selection the term
+			// requests. Warn so the operator knows the PBR route selection is
+			// silently NOT performed on the primary host-bound path; userspace-dp
+			// remains authoritative for lo0-filtered traffic that reaches the XSK.
+			// Not folded into the mods loop above because that loop's message says
+			// the modifier "cannot be honored", whereas here the verdict IS honored
+			// and only the route selection is dropped.
+			if term.RoutingInstance != "" {
+				warnings = append(warnings, fmt.Sprintf(
+					"firewall family %s filter %q term %q `then routing-instance %s` "+
+						"terminates as accept on the kernel lo0 input mirror (nftables "+
+						"xpf_lo0, the PRIMARY enforcement for host-bound traffic): the "+
+						"verdict is honored but the kernel input hook cannot perform the "+
+						"route selection; policy-based routing applies only to "+
+						"lo0-filtered traffic that reaches the userspace dataplane",
+					family, filterName, term.Name, term.RoutingInstance))
+			}
 		}
 	}
 	emit("inet", cfg.System.Lo0FilterInputV4, cfg.Firewall.FiltersInet[cfg.System.Lo0FilterInputV4])
