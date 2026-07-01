@@ -333,6 +333,72 @@ Fail-on-revert: `TestFilterICMPTypeNameResolves{V4,V6}_3205`,
 `TestFilterNamedPortExceptResolves_3205` in
 `pkg/config/firewall_symbolic_match_3205_test.go`.
 
+### `firewall ... from` cross-field satisfiability — port/tcp-flags/icmp must match the protocol (#3723)
+
+A firewall-filter `from` block can combine a `protocol` (or the inet6
+`next-header`) with an L4 predicate the dataplane matcher can never satisfy for
+that protocol. Such a term compiled cleanly but became a **never-match** at
+runtime, and because an xpf filter falls through to an implicit **ACCEPT** on
+no-match, a `then discard` / `then reject` written over such a pair was silently
+dead — the traffic it was meant to drop was admitted by a later permit or the
+implicit accept (a **fail-OPEN**). Junos rejects these combinations at commit,
+so accepting them was also a config-language parity gap. This is the
+stateless-filter mirror of the application cross-field gate (#3373 port /
+#3348 icmp).
+
+The offending pairs (matcher behavior in `userspace-dp/src/filter/engine/
+matching.rs`):
+
+- **port on a non-port-bearing protocol** — `port_match` tests the constrained
+  port set against the extracted L4 port, which is `0` for any protocol the
+  dataplane does not extract ports for (only TCP/UDP — `ip_proto::has_l4_ports`).
+  So `from protocol gre; destination-port 80` (also esp/ah/ospf/vrrp/icmp/...,
+  and numeric 47) never matches (H01).
+- **tcp-flags on a non-TCP protocol** — `per_packet_l4_matches` returns false
+  when the packet protocol is not TCP, so `from protocol udp; tcp-flags syn`
+  never matches. UDP is port-bearing but still not TCP, so the tcp-flags arm
+  uses the stricter `protocolIsTCP` predicate, not `protocolIsPortBearing` (H02).
+- **icmp-type/icmp-code on a non-ICMP protocol** — the icmp arms return false for
+  a non-ICMP(v6) packet, so `from protocol tcp; icmp-type echo-request` never
+  matches (H03).
+
+`validateFilterCrossFieldStrict` (`compiler_validate_strict.go`) **rejects at
+commit** any term that combines these, reusing the same SSOT the application
+gate uses — `protocolIsPortBearing` / `protocolIsICMPFamily` (plus the new
+`protocolIsTCP` for the tcp-flags arm). Handling of the folded findings:
+
+- **mixed protocol list (M01)** — if ANY protocol token in a bracket list such
+  as `from protocol [ tcp gre ]` is incompatible with the predicate, the term is
+  rejected (a single configured deny that only enforces on the compatible
+  protocol and silently never-matches the rest).
+- **inet6 next-header (M02)** — `compileFilterFrom` routes both `protocol` and
+  `next-header` into `term.Protocols`, so the gate covers `family inet6` filters
+  with no extra code.
+- **icmp-code without icmp-type (M03)** — rejected, mirroring the #3348/#3506
+  application reject: a code-only term constrains the code while the type stays
+  unconstrained, matching a broader ICMP set than a Junos config implies
+  (icmp-code 0 is common across many types).
+
+The gate fires **only when a protocol is PRESENT**. A port / tcp-flags / icmp
+match with NO protocol is legitimate and enforceable for a FILTER (unlike an
+application, whose matcher keys on protocol+port): the filter matcher matches
+the port on whatever port-bearing packet arrives, and the tcp-flags/icmp arms
+self-gate on the packet protocol. The only no-protocol exception is M03
+(icmp-code-without-type), which is rejected regardless.
+
+On the tolerant load / peer-sync path the error is downgraded to a warning
+(`lenientFilterCrossField`, #1960 no-brick). The Rust snapshot builder is the
+fail-closed backstop: `parse_term` rejects the whole snapshot with
+`SnapshotIntegrityError::UnsatisfiableFilterCrossField` (the reconcile preflight
+keeps the previous good filter state) so a leniently-loaded / drifted never-match
+term never silently forwards — the same defense-in-depth as the #2505/#3367/#3406
+filter backstops. Fail-on-revert: `pkg/config/firewall_crossfield_3723_test.go`
+(including the L12 cross-package canary that pins the application and filter gates
+to the shared port-bearing / ICMP-family / TCP SSOT) and the
+`filter_crossfield_3723_*` tests in `userspace-dp/src/filter/tests.rs` (including
+an L06 runtime guard that drives the real matcher over a fabricated gre+port term
+to prove it falls through to Accept).
+
 #### Ports must be a canonical unsigned decimal (#3606)
 
 A numeric port token must be a plain unsigned decimal — no leading sign
