@@ -73,6 +73,47 @@ the queue, but the timestamp is written by the worker after a successful
 commit, so a dropped/rejected action does NOT consume the cooldown — the next
 legitimate trigger can retry.
 
+## Revalidate a queued action before commit (#3750)
+
+A pre-classified `plannedAction` sits in the worker queue (and may retry for up
+to 60 s on a held config lock) before it commits. Between enqueue and commit the
+policy set can change under an operator commit, and the cooldown can be armed by
+a sibling commit — so the action must be **revalidated against live engine state
+immediately before it commits**, not applied blind.
+
+Each action is stamped with the policy's **semantic revision as of the evaluate
+that produced it** (`plannedAction.semRev`, captured under `e.mu` in
+`evaluateEvent`). The worker's `applyOnce` calls `staleReason(a)` right after
+`EnterConfigure` succeeds — while it holds the config lock, so **no operator
+commit (hence no `Apply` that could remove or redefine the policy) can
+interleave** until `ExitConfigure`. If the action is stale it is dropped (the
+candidate is never touched), `applyOnce` returns the `errStaleAction` sentinel,
+and `runAction` counts it on `xpf_event_actions_dropped_total{reason="stale"}`
+and does **not** retry (staleness is terminal). Three fail-opens fold into this
+one gate:
+
+- **Policy removed (H1):** `e.semRev` has no entry for the policy. An operator
+  committed a config that dropped this event-options policy while its remediation
+  was queued/retrying; committing the stale batch would mutate config no active
+  policy authorizes. Dropped.
+- **Policy redefined (H2):** the live semantic revision differs from the action's
+  stamped `semRev`. A same-name redefinition changed the policy's meaning; the
+  OLD command set must not commit under the new definition. Dropped.
+- **Cooldown active (H3):** a successful commit of the SAME policy is within the
+  30 s cooldown window. The enqueue-time cooldown check in `evaluateEvent` races
+  the arm-on-commit timing (the cooldown is armed only after a commit, and
+  `enqueue` dedups a same-policy duplicate ONLY when the queue is full), so a
+  duplicate can slip into the queue while the worker is blocked. Re-enforcing the
+  cooldown here at commit time suppresses the within-window duplicate instead of
+  double-committing — restoring the documented "not more than once in any 30 s
+  window" invariant even under lock contention.
+
+Legitimate remediations are unaffected: distinct policies and a re-fire AFTER the
+cooldown elapses pass the gate and commit. Regression-locked (fail-on-revert) by
+`TestStale_*_3750` in `engine_stale_revalidate_3750_test.go` — removing the
+`staleReason` gate makes the removed/redefined/duplicate batches commit and the
+H1/H2/H3 tests go RED.
+
 ## attributes-match (regex, #2008 M7) — fail-closed at runtime (#2141)
 
 `attributes-match "<event>.<attribute> matches <pattern>"` filters policy
@@ -174,14 +215,20 @@ blocks a `commitFn` on `ctx.Done()` and asserts `Close()` aborts it with
 - `xpf_event_actions_committed_total`
 - `xpf_event_actions_rejected_total`
 - `xpf_event_actions_retried_total`
-- `xpf_event_actions_dropped_total{reason="lock_held"|"queue_full"}`
+- `xpf_event_actions_dropped_total{reason="lock_held"|"queue_full"|"stale"}`
+  (`stale` = revalidate-before-commit dropped a removed/redefined-policy or
+  within-cooldown action, #3750)
 - `xpf_event_attributes_match_invalid_total`
 - `xpf_event_action_queue_depth` (gauge)
 
 ## Gotchas
 
 - 30 s policy cooldown (`policyCooldown`, `engine.go`). The same policy will not
-  trigger more than once in any 30 s window. Armed on successful commit.
+  trigger more than once in any 30 s window. Armed on successful commit, CHECKED
+  both at evaluate (`evaluateEvent`) AND re-checked at commit (`staleReason`,
+  #3750) — the commit-time re-check is what holds the invariant when a duplicate
+  slips into the queue during lock contention (the evaluate-time check races the
+  arm-on-commit timing).
 - Temporal `within` clauses keep a sliding window of timestamps per
   (policy, event) pair, **pruned on every append** so a cooldown-suppressed
   event can never grow the window unbounded. This holds for the cases #2216

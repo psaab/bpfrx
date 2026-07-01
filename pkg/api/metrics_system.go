@@ -212,6 +212,8 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 			prometheus.CounterValue, float64(st.DroppedLockHeld), "lock_held")
 		ch <- prometheus.MustNewConstMetric(c.eventActionsDropped,
 			prometheus.CounterValue, float64(st.DroppedQueueFull), "queue_full")
+		ch <- prometheus.MustNewConstMetric(c.eventActionsDropped,
+			prometheus.CounterValue, float64(st.DroppedStale), "stale")
 		ch <- prometheus.MustNewConstMetric(c.eventAttributesInvalid,
 			prometheus.CounterValue, float64(st.AttributesInvalid))
 		ch <- prometheus.MustNewConstMetric(c.eventActionQueueDepth,

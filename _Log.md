@@ -25824,3 +25824,43 @@ top.
   pkg/config/event_options_within_3751_test.go (new, RED-on-revert),
   pkg/eventengine/engine_within_failclosed_3751_test.go (new, RED-on-revert),
   docs/config-schema.md (#3751 validator entry)
+
+## 2026-07-01 — #3750 eventengine: revalidate queued remediation before commit (H1/H2/H3 fail-opens)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3750 (MAJOR, security fail-open + documented-invariant
+    violation; folds H1/H2/H3/L14). A pre-classified event-options remediation
+    (`plannedAction`) carried only policyName + typed plan; the worker committed
+    it with ZERO revalidation against live engine state, so under normal config-
+    lock contention (an operator holds the lock while an RPM event fires and the
+    worker retries on ErrConfigLocked) three fail-opens existed. H1: a policy
+    REMOVED by an operator commit while its action was queued still committed the
+    stale batch (Apply(nil) drops runtime/semRev but nothing invalidated the
+    in-flight action). H2: a same-name REDEFINE left the OLD queued command set to
+    commit under the new policy's name (no revision to compare). H3: the 30s
+    cooldown was CHECKED at evaluate but ARMED only after commit, and enqueue
+    dedups only when the queue is FULL — so two events for one policy both queue
+    while the worker is blocked; the worker committed the first, armed the
+    cooldown, then committed the second without re-checking (double-commit,
+    violating the documented "not more than once in any 30s window" invariant).
+    FIX: stamp each action with the policy's semantic revision as of the evaluate
+    that produced it (`plannedAction.semRev`, captured under e.mu in
+    evaluateEvent via new `triggeredPolicy`); revalidate it in `staleReason`
+    inside applyOnce right after EnterConfigure succeeds — while holding the
+    config lock, so no operator Apply can interleave until ExitConfigure. Drop
+    (do not touch the candidate) if the policy is absent (removed), the live
+    semRev mismatches (redefined), or the cooldown is now active; return the
+    `errStaleAction` sentinel. runAction counts it as dropped_stale and does NOT
+    retry. One gate for H1/H2/H3. Observability: new Stats.DroppedStale surfaced
+    on xpf_event_actions_dropped_total{reason="stale"}. VALIDATION: 5 new
+    RED-on-revert tests (removing the gate → H1/H2/H3 commit the stale batch and
+    go RED, verified); go test ./pkg/eventengine/... green (incl -race); go test
+    ./pkg/api/... green; go build ./... green; gofmt + vet clean. README +
+    metric descriptor updated.
+  - **File(s)**: pkg/eventengine/engine.go (plannedAction.semRev +
+    triggeredPolicy, evaluateEvent return type, HandleEvent stamp, runAction
+    stale branch, applyOnce staleReason gate + errStaleAction/staleErr, Stats +
+    counters, header doc), pkg/eventengine/README.md (revalidate-before-commit
+    section + metrics + cooldown gotcha), pkg/api/metrics_system.go (emit
+    reason="stale"), pkg/api/metrics_descriptors.go (dropped help text),
+    pkg/eventengine/engine_stale_revalidate_3750_test.go (new, RED-on-revert)

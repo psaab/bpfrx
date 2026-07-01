@@ -28,6 +28,16 @@
 //     goroutine (removing the cross-probe EnterConfigure race) with bounded
 //     backoff retry on a held config lock (configstore.ErrConfigLocked) and
 //     drop/retry/commit counters, instead of silently dropping on lock-held.
+//   - #3750 revalidate-before-commit: a pre-classified action carries the
+//     policy's semantic revision AS OF EVALUATE TIME. Immediately before it
+//     commits — under e.mu and while holding the config lock (EnterConfigure),
+//     so no operator commit can interleave — the worker revalidates it against
+//     live engine state and DROPS it (counted dropped_stale) if the policy was
+//     removed, was redefined (semRev mismatch), or is now inside its cooldown.
+//     This folds three fail-opens into one gate: a removed policy's stale batch,
+//     a same-name redefine's OLD command set, and a queued duplicate that raced
+//     the arm-on-commit cooldown all stop firing instead of mutating config no
+//     active policy authorizes.
 package eventengine
 
 import (
@@ -83,6 +93,7 @@ type Stats struct {
 	Retried           uint64 // retry attempts after a held config lock
 	DroppedQueueFull  uint64 // actions superseded/evicted because the queue was full
 	DroppedLockHeld   uint64 // actions dropped after the lock-retry deadline elapsed
+	DroppedStale      uint64 // actions dropped at commit: policy removed/redefined or cooldown active (#3750)
 	AttributesInvalid uint64 // runtime fail-closed: malformed/unknown attributes-match line
 	QueueDepth        int64  // currently queued actions
 }
@@ -94,6 +105,7 @@ type engineCounters struct {
 	retried           atomic.Uint64
 	droppedQueueFull  atomic.Uint64
 	droppedLockHeld   atomic.Uint64
+	droppedStale      atomic.Uint64
 	attributesInvalid atomic.Uint64
 	queueDepth        atomic.Int64
 }
@@ -110,11 +122,30 @@ type plannedOp struct {
 
 // plannedAction is a fully pre-classified remediation enqueued for the worker.
 // It carries no engine lock and no live runtime state — only the policy
-// identity and the typed plan, so the worker can apply it without re-reading
-// engine state (and a stale queued action for a now-removed policy is harmless).
+// identity (name + the semantic revision observed AT EVALUATE TIME) and the
+// typed plan. The worker applies the plan without re-reading it, but it DOES
+// revalidate the identity against live engine state immediately before commit
+// (#3750): a queued action for a policy that was removed, redefined, or is now
+// in its cooldown must NOT commit — it is dropped as stale. Before #3750 the
+// worker committed the batch unconditionally, so a removed/redefined policy's
+// stale command set still mutated config, and a cooldown-window duplicate
+// double-committed.
 type plannedAction struct {
 	policyName string
-	ops        []plannedOp
+	// semRev is the policy's semantic revision (policySemanticRevision) as of
+	// the evaluate that enqueued this action. The worker drops the action if the
+	// live revision no longer matches (policy redefined) or is absent (removed).
+	semRev string
+	ops    []plannedOp
+}
+
+// triggeredPolicy pairs a policy that should fire with the semantic revision its
+// runtime carried at evaluate time (#3750). evaluateEvent returns these so
+// HandleEvent can stamp each enqueued action with the revision the worker
+// revalidates against before committing.
+type triggeredPolicy struct {
+	pol    *config.EventPolicy
+	semRev string
 }
 
 // policyRuntime is the per-policy temporal/cooldown state. It is split from the
@@ -380,8 +411,8 @@ func policySemanticRevision(pol *config.EventPolicy) string {
 func (e *Engine) HandleEvent(ev rpm.Event) {
 	e.startOnce.Do(e.startWorker)
 	triggered := e.evaluateEvent(ev)
-	for _, pol := range triggered {
-		ops, ok := e.classifyPlan(pol)
+	for _, tp := range triggered {
+		ops, ok := e.classifyPlan(tp.pol)
 		if !ok {
 			// Malformed/unknown command: reject the whole batch before it can
 			// take a queue slot or a lock (#2139 pre-classify).
@@ -391,7 +422,10 @@ func (e *Engine) HandleEvent(ev rpm.Event) {
 		if len(ops) == 0 {
 			continue // nothing to do
 		}
-		e.enqueue(plannedAction{policyName: pol.Name, ops: ops})
+		// Stamp the action with the policy's semantic revision as of this
+		// evaluate (#3750) so the worker can revalidate it against live engine
+		// state before committing.
+		e.enqueue(plannedAction{policyName: tp.pol.Name, semRev: tp.semRev, ops: ops})
 	}
 }
 
@@ -424,6 +458,7 @@ func (e *Engine) Stats() Stats {
 		Retried:           e.counters.retried.Load(),
 		DroppedQueueFull:  e.counters.droppedQueueFull.Load(),
 		DroppedLockHeld:   e.counters.droppedLockHeld.Load(),
+		DroppedStale:      e.counters.droppedStale.Load(),
 		AttributesInvalid: e.counters.attributesInvalid.Load(),
 		QueueDepth:        e.counters.queueDepth.Load(),
 	}
@@ -542,6 +577,16 @@ func (e *Engine) runAction(a plannedAction) {
 				"policy", a.policyName, "commands", len(a.ops))
 			return
 		}
+		if errors.Is(err, errStaleAction) {
+			// #3750: the policy was removed/redefined, or a sibling commit armed
+			// the cooldown, while this action waited (on a held lock or in the
+			// queue). Drop it — do NOT commit a batch no active policy authorizes,
+			// and do NOT retry (the staleness is terminal for this action).
+			e.counters.droppedStale.Add(1)
+			slog.Info("event-options: remediation dropped (stale queued action)",
+				"policy", a.policyName, "err", err)
+			return
+		}
 		if errors.Is(err, configstore.ErrConfigLocked) {
 			if e.now().After(deadline) {
 				e.counters.droppedLockHeld.Add(1)
@@ -603,6 +648,19 @@ func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
 		return err
 	}
 	// From here, any early return MUST ExitConfigure to discard the candidate.
+
+	// #3750 revalidate-before-commit: now that we hold the config lock, no
+	// operator commit — and therefore no Apply() that could remove or redefine
+	// the policy — can interleave until we ExitConfigure. Check the action's
+	// identity against live engine state and drop it (do NOT mutate the
+	// candidate) if the policy was removed, was redefined since it was enqueued,
+	// or is now inside its cooldown (a sibling commit armed it after this action
+	// was queued but before it ran). This folds H1/H2/H3 into one gate.
+	if reason := e.staleReason(a); reason != "" {
+		e.store.ExitConfigure()
+		return staleErr(reason)
+	}
+
 	for _, op := range a.ops {
 		if op.isDelete {
 			if err := e.store.Delete(op.delPath); err != nil {
@@ -653,6 +711,53 @@ func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
 // errBatch builds a permanent (non-retryable) batch failure error.
 func errBatch(format string, args ...any) error {
 	return fmt.Errorf(format, args...)
+}
+
+// errStaleAction is the sentinel returned by applyOnce when the pre-classified
+// action is no longer valid to commit (#3750): its policy was removed or
+// redefined, or the policy's cooldown is now active. runAction recognizes it via
+// errors.Is, counts it as dropped_stale, and does NOT retry (staleness is
+// terminal for that action).
+var errStaleAction = errors.New("stale queued remediation")
+
+// staleErr wraps errStaleAction with a human-readable reason for logging.
+func staleErr(reason string) error {
+	return fmt.Errorf("%w: %s", errStaleAction, reason)
+}
+
+// staleReason revalidates a pre-classified action against live engine state
+// under e.mu (#3750) and returns a non-empty reason if it must NOT commit:
+//
+//   - "policy removed"   : e.semRev has no entry for the policy (H1). The
+//     operator committed a config that dropped this event-options policy while
+//     the action was queued/retrying; its stale command batch is unauthorized.
+//   - "policy redefined" : the live semantic revision differs from the one the
+//     action was stamped with at evaluate time (H2). A same-name redefinition
+//     changed the policy's meaning; the OLD command set must not commit.
+//   - "cooldown active"  : a successful commit of the SAME policy is within the
+//     30s cooldown window (H3). The enqueue-time cooldown check in evaluateEvent
+//     races the arm-on-commit timing, so a duplicate can slip into the queue
+//     while the worker is blocked; the cooldown is re-enforced here at commit
+//     time so a within-window duplicate is suppressed, not double-committed.
+//
+// The empty string means the action is safe to commit. Called by applyOnce
+// while it holds the config lock, so the check reflects the last committed Apply
+// and no operator commit can race it until ExitConfigure.
+func (e *Engine) staleReason(a plannedAction) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rev, ok := e.semRev[a.policyName]
+	if !ok {
+		return "policy removed"
+	}
+	if rev != a.semRev {
+		return "policy redefined"
+	}
+	if rt := e.runtime[a.policyName]; rt != nil && !rt.lastTrigger.IsZero() &&
+		e.now().Sub(rt.lastTrigger) < policyCooldown {
+		return "cooldown active"
+	}
+	return ""
 }
 
 // classifyPlan pre-parses a policy's ThenCommands into a typed plan WITHOUT
@@ -711,11 +816,11 @@ func (e *Engine) armCooldown(name string) {
 // perpetually-cooldown-suppressed event can never grow unbounded — SMR finding
 // 1) and CHECKS (does not arm) the cooldown; the cooldown is armed by the
 // worker on a successful commit.
-func (e *Engine) evaluateEvent(ev rpm.Event) []*config.EventPolicy {
+func (e *Engine) evaluateEvent(ev rpm.Event) []triggeredPolicy {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	var triggered []*config.EventPolicy
+	var triggered []triggeredPolicy
 	now := e.now()
 	for _, pol := range e.policies {
 		if pol == nil {
@@ -759,7 +864,9 @@ func (e *Engine) evaluateEvent(ev rpm.Event) []*config.EventPolicy {
 			"test-owner", ev.TestOwner,
 			"test-name", ev.TestName)
 
-		triggered = append(triggered, pol)
+		// Capture the policy's semantic revision under the same lock so the
+		// enqueued action can be revalidated against it before commit (#3750).
+		triggered = append(triggered, triggeredPolicy{pol: pol, semRev: e.semRev[pol.Name]})
 	}
 	return triggered
 }
