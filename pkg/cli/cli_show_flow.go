@@ -1166,7 +1166,14 @@ func (c *CLI) showFlowMonitoring() error {
 					} else if fs.VersionIPFIXTemplate != "" {
 						tmplStr = fmt.Sprintf(" (ipfix template: %s)", fs.VersionIPFIXTemplate)
 					}
-					fmt.Printf("    Collector: %s%s%s\n", fs.Address, portStr, tmplStr)
+					// Per-collector source-address override (#3745): the
+					// effective bind is this value when set, else the
+					// family output-level default shown above.
+					srcStr := ""
+					if fs.SourceAddress != "" {
+						srcStr = fmt.Sprintf(" source %s", fs.SourceAddress)
+					}
+					fmt.Printf("    Collector: %s%s%s%s\n", fs.Address, portStr, srcStr, tmplStr)
 				}
 			}
 			showSamplingFamily("inet", inst.FamilyInet)
@@ -1206,6 +1213,9 @@ func (c *CLI) showFlowMonitoringStatistics() error {
 			state = "DOWN"
 		}
 		line := fmt.Sprintf("  Collector %s (%s)", h.Address, h.Protocol)
+		if h.SourceAddress != "" {
+			line += fmt.Sprintf(" source %s", h.SourceAddress)
+		}
 		if h.Instance != "" {
 			line += fmt.Sprintf(" instance %s", h.Instance)
 		}

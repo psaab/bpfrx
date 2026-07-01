@@ -2724,16 +2724,27 @@ the value sits in a single typed slot:
     (#2605) — the **output-level** flow-export source-address: the standard
     Junos hierarchy where `source-address` is a sibling of `flow-server`
     directly under `output { ... }` (not nested inside a flow-server). It is
-    the per-output default that every flow-server in that family inherits.
-    A `source-address` nested INSIDE an individual flow-server is the
-    per-collector override and **wins** over the output-level default
-    (more-specific precedence); both resolve into the single per-family
-    `SamplingFamily.SourceAddress`, which `pkg/flowexport` applies as the
-    local bind address of every collector in that family. The output-level
-    value also seeds `inline-jflow`'s source when inline-jflow sets none. The
-    output-level form was previously dropped silently (no compile error and no
-    completion entry) — `compileSamplingFamily` only read the
-    flow-server-nested / inline-jflow-nested forms before #2605.
+    the per-output default that every flow-server in that family inherits and
+    is stored on the per-family `SamplingFamily.SourceAddress`. The
+    output-level value also seeds `inline-jflow`'s source when inline-jflow
+    sets none. The output-level form was previously dropped silently (no
+    compile error and no completion entry) — `compileSamplingFamily` only
+    read the flow-server-nested / inline-jflow-nested forms before #2605.
+  - `forwarding-options sampling … output flow-server <addr> source-address
+    <src>` (#3745) — the **per-collector** override, nested inside an
+    individual flow-server. It is stored PER COLLECTOR on
+    `FlowServer.SourceAddress` and **wins** over the output-level default
+    for THAT collector only. `pkg/flowexport` resolves the effective bind
+    per collector (`collectInstanceVersionCollectors`: nested override else
+    the family default else the inline-jflow default), so two collectors of
+    the same family can each pin their own source. Before #3745 the nested
+    value was collapsed into the single family-wide
+    `SamplingFamily.SourceAddress` (last-writer-wins across servers of the
+    same family), so a second same-family collector could not bind its own
+    configured source and dialed with the wrong bind. The resolved
+    per-collector source is surfaced in the health surfaces (CLI `... source
+    <src>`, REST `source_address`, and the `source` label on the
+    `xpf_flow_export_collector_*` Prometheus metrics).
   - `forwarding-options allow-dataplane-sleep` (#2008 H13 Stage 1) — a
     presence-only flag (no value, `children: nil`). Previously accepted via the
     no-schema-match fall-through and silently dropped; now a typed leaf that

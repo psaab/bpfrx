@@ -126,34 +126,38 @@ func (c *xpfCollector) collectSurfaceADDNSMetrics(ch chan<- prometheus.Metric) {
 // protocol {netflow-v9,ipfix} and the collector address — both bounded
 // (one series per configured flow-server). These counters make a
 // silently-unreachable collector observable: write_failures climbs while
-// write_attempts climbs, healthy drops to 0, and last_success ages.
+// write_attempts climbs, healthy drops to 0, and last_success ages. The
+// source label carries the per-collector local bind address (#3745), so
+// two same-family collectors that bind distinct sources are distinct
+// series and a source-bound failure is attributable; it is "" when the OS
+// selected the source.
 func (c *xpfCollector) collectFlowExportMetrics(ch chan<- prometheus.Metric) {
 	if c.srv.flowCollectorHealthFn == nil {
 		return
 	}
 	for _, h := range c.srv.flowCollectorHealthFn() {
 		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorWriteAttemptsTotal,
-			prometheus.CounterValue, float64(h.WriteAttempts), h.Protocol, h.Address)
+			prometheus.CounterValue, float64(h.WriteAttempts), h.Protocol, h.Address, h.SourceAddress)
 		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorWriteFailuresTotal,
-			prometheus.CounterValue, float64(h.WriteFailures), h.Protocol, h.Address)
+			prometheus.CounterValue, float64(h.WriteFailures), h.Protocol, h.Address, h.SourceAddress)
 		healthy := 0.0
 		if h.Healthy {
 			healthy = 1
 		}
 		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorHealthy,
-			prometheus.GaugeValue, healthy, h.Protocol, h.Address)
+			prometheus.GaugeValue, healthy, h.Protocol, h.Address, h.SourceAddress)
 		var lastSuccess float64
 		if !h.LastSuccessTime.IsZero() {
 			lastSuccess = float64(h.LastSuccessTime.Unix())
 		}
 		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorLastSuccessSeconds,
-			prometheus.GaugeValue, lastSuccess, h.Protocol, h.Address)
+			prometheus.GaugeValue, lastSuccess, h.Protocol, h.Address, h.SourceAddress)
 		var lastFailure float64
 		if !h.LastFailureTime.IsZero() {
 			lastFailure = float64(h.LastFailureTime.Unix())
 		}
 		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorLastFailureSeconds,
-			prometheus.GaugeValue, lastFailure, h.Protocol, h.Address)
+			prometheus.GaugeValue, lastFailure, h.Protocol, h.Address, h.SourceAddress)
 	}
 }
 

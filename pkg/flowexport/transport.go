@@ -25,6 +25,11 @@ import (
 type collectorConn struct {
 	conn net.Conn
 	addr string
+	// srcAddr is the local bind (source) address this connection was
+	// dialed with ("" = OS-selected). Surfaced in the health snapshot so
+	// an operator can tell which source-bound connection failed when two
+	// same-family collectors bind distinct sources (#3745).
+	srcAddr string
 
 	attempts atomic.Uint64
 	failures atomic.Uint64
@@ -61,7 +66,13 @@ type ExporterCollectorHealth struct {
 // state, returned by collectorConns.health() and surfaced through the
 // status response, Prometheus metrics, and the show command (#2464).
 type CollectorHealth struct {
-	Address         string    `json:"address"`
+	Address string `json:"address"`
+	// SourceAddress is the local bind (source) address this collector's
+	// connection was dialed with; empty when the OS selected it. It
+	// disambiguates two same-family collectors that bind distinct
+	// sources (#3745) so a source-bound connection failure is
+	// identifiable in the CLI / REST / Prometheus surfaces.
+	SourceAddress   string    `json:"source_address,omitempty"`
 	WriteAttempts   uint64    `json:"write_attempts"`
 	WriteFailures   uint64    `json:"write_failures"`
 	Healthy         bool      `json:"healthy"`
@@ -134,7 +145,7 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 		}
 		// A collector starts healthy (optimistic) so the FIRST failed write
 		// is the unhealthy edge that warns (#2464).
-		cc.conns = append(cc.conns, &collectorConn{conn: conn, addr: c.Address, healthy: true})
+		cc.conns = append(cc.conns, &collectorConn{conn: conn, addr: c.Address, srcAddr: c.SourceAddress, healthy: true})
 	}
 	return cc, nil
 }
@@ -203,6 +214,7 @@ func (cc *collectorConns) health() []CollectorHealth {
 		c.mu.Lock()
 		out = append(out, CollectorHealth{
 			Address:         c.addr,
+			SourceAddress:   c.srcAddr,
 			WriteAttempts:   c.attempts.Load(),
 			WriteFailures:   c.failures.Load(),
 			Healthy:         c.healthy,

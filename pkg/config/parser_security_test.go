@@ -918,8 +918,12 @@ forwarding-options {
 	if !inst.FamilyInet.InlineJflow {
 		t.Error("expected inline-jflow for inet")
 	}
-	if inst.FamilyInet.SourceAddress != "192.168.99.1" {
-		t.Errorf("source-address: got %q, want 192.168.99.1", inst.FamilyInet.SourceAddress)
+	// #3745: a flow-server-nested source-address is tracked PER COLLECTOR
+	// on the FlowServer, not collapsed into the family-wide default. The
+	// family default stays empty (no output-level source configured here);
+	// the nested value is asserted on the flow-server below.
+	if inst.FamilyInet.SourceAddress != "" {
+		t.Errorf("family source-address: got %q, want empty (nested source must not collapse into it)", inst.FamilyInet.SourceAddress)
 	}
 	if len(inst.FamilyInet.FlowServers) != 1 {
 		t.Fatalf("expected 1 flow server for inet, got %d", len(inst.FamilyInet.FlowServers))
@@ -930,6 +934,11 @@ forwarding-options {
 	}
 	if fs.Port != 4739 {
 		t.Errorf("flow-server port: got %d", fs.Port)
+	}
+	// #3745: the flow-server-nested source-address is recorded on the
+	// per-collector FlowServer, not the family-wide SamplingFamily.
+	if fs.SourceAddress != "192.168.99.1" {
+		t.Errorf("flow-server source-address: got %q, want 192.168.99.1", fs.SourceAddress)
 	}
 	if fs.Version9Template != "v9-tmpl" {
 		t.Errorf("flow-server template: got %q", fs.Version9Template)

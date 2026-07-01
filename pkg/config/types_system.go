@@ -879,6 +879,18 @@ type SamplingInstance struct {
 }
 
 // SamplingFamily holds per-AF sampling output configuration.
+//
+// SourceAddress is the OUTPUT-LEVEL default source-address (the
+// `source-address` sibling of `flow-server` under `output { ... }`) —
+// the per-output default every flow-server inherits when it declares no
+// nested source of its own. It is NOT the resolved per-collector bind:
+// a flow-server-nested `source-address` (FlowServer.SourceAddress) is a
+// per-collector override that wins over this default, and the effective
+// bind is computed PER COLLECTOR in the flowexport resolver
+// (collectInstanceVersionCollectors), not collapsed to one family-wide
+// value. Before #3745 the nested source was collapsed into this single
+// field (last-writer-wins across servers of the same family), so two
+// collectors with distinct nested sources both bound the last one.
 type SamplingFamily struct {
 	FlowServers              []*FlowServer
 	SourceAddress            string
@@ -909,6 +921,16 @@ type FlowServer struct {
 	Version              string // "version9" | "version-ipfix" | "" (unbound)
 	Version9Template     string
 	VersionIPFIXTemplate string
+	// SourceAddress is the per-collector local bind address configured as
+	// `flow-server <addr> { source-address <src>; }` (#3745). It is the
+	// per-collector OVERRIDE of the output-level default
+	// (SamplingFamily.SourceAddress): the flowexport resolver binds THIS
+	// collector's socket to this source when set, else falls back to the
+	// family default. Empty ("") means inherit the family/output default.
+	// Before #3745 this value was collapsed into the one family-wide
+	// SamplingFamily.SourceAddress (last-writer-wins), so a second
+	// collector could not bind its own configured source.
+	SourceAddress string
 }
 
 // Flow-server per-collector export version selectors (FlowServer.Version).

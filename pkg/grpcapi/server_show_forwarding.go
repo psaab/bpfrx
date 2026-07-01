@@ -118,6 +118,10 @@ func (s *Server) showForwardingOptions(cfg *config.Config, buf *strings.Builder)
 						if fs.Version9Template != "" {
 							fmt.Fprintf(buf, "      Version 9 template: %s\n", fs.Version9Template)
 						}
+						// Per-collector source-address override (#3745).
+						if fs.SourceAddress != "" {
+							fmt.Fprintf(buf, "      Source address: %s\n", fs.SourceAddress)
+						}
 					}
 					if fam.SourceAddress != "" {
 						fmt.Fprintf(buf, "    Source address: %s\n", fam.SourceAddress)

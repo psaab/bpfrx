@@ -26064,3 +26064,43 @@ top.
     section + metrics + cooldown gotcha), pkg/api/metrics_system.go (emit
     reason="stale"), pkg/api/metrics_descriptors.go (dropped help text),
     pkg/eventengine/engine_stale_revalidate_3750_test.go (new, RED-on-revert)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3745 — flow-server per-collector source-address (was
+    family-wide last-writer-wins); expose source in health surfaces. Root
+    cause: compileSamplingFamily collapsed every flow-server-nested
+    source-address into ONE family-wide SamplingFamily.SourceAddress
+    (last-writer-wins by AST order) and the flowexport resolver applied
+    that single value to every collector — so two same-family collectors
+    could not each bind their own source (wrong/failed dial), and the
+    health surfaces could not identify which source-bound connection
+    failed. FIX: add FlowServer.SourceAddress (per-collector); the compiler
+    stores each nested value on its FlowServer and keeps the output-level
+    `source-address` as the per-family default; the flowexport resolver
+    (collectInstanceVersionCollectors) computes the EFFECTIVE bind per
+    collector (nested override else family default else inline-jflow
+    default). Surface the resolved source: collectorConn.srcAddr +
+    CollectorHealth.SourceAddress (json source_address), CLI/gRPC
+    `show flow-monitoring statistics` `... source <src>`, the config-view
+    collector lines, and a new `source` label on the
+    xpf_flow_export_collector_* Prometheus metrics. Default (no source)
+    behavior unchanged. VALIDATION: RED-on-revert proven by temporarily
+    reverting the manager resolver (both collectors -> "" ) and the
+    compiler collapse (192.168.1.200 LWW overwrote .100 -> RED), then
+    restored. go test -count=1 ./pkg/config/... ./pkg/flowexport/...
+    ./pkg/api/... ./pkg/cli/... ./pkg/grpcapi/... all green; go build ./...
+    green; gofmt clean; vet clean (the one cli.go:503 unreachable-code
+    warning is pre-existing on origin/master, untouched file).
+  - **File(s)**: pkg/config/types_system.go (FlowServer.SourceAddress +
+    SamplingFamily doc), pkg/config/compiler_services.go (per-collector
+    store + output-level default), pkg/flowexport/manager.go (effective
+    per-collector source resolution), pkg/flowexport/transport.go
+    (collectorConn.srcAddr + CollectorHealth.SourceAddress + health()),
+    pkg/cli/cli_show_flow.go, pkg/cli/cli_show_routing.go,
+    pkg/grpcapi/server_show_flow.go, pkg/grpcapi/server_show_forwarding.go
+    (surfaces), pkg/api/metrics_system.go + metrics_descriptors.go (source
+    label), pkg/config/compiler_sampling_source_address_test.go +
+    pkg/config/parser_security_test.go (updated semantics + RED test),
+    pkg/flowexport/per_collector_source_3745_test.go (new RED-on-revert),
+    docs/config-schema.md, docs/feature-coverage.md,
+    pkg/flowexport/README.md (docs)

@@ -1391,17 +1391,20 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 		return sf
 	}
 
-	// Precedence for the per-family flow-server source-address.
-	// Junos accepts `source-address` at TWO hierarchies under
-	// `output`: directly under `output` (the per-output default that
-	// every flow-server inherits) and nested inside an individual
-	// flow-server (the per-collector override). SamplingFamily carries
-	// ONE per-family SourceAddress (manager.go applies fam.SourceAddress
-	// to every collector), so we resolve precedence here: a
-	// flow-server-nested source-address wins over the output-level
-	// default. Tracked separately so the result is independent of the
-	// order the children appear in the AST (#2605).
-	var outputLevelSrc, flowServerSrc string
+	// Junos accepts `source-address` at TWO hierarchies under `output`:
+	// directly under `output` (the per-output default that every
+	// flow-server inherits) and nested inside an individual flow-server
+	// (the per-collector override). The output-level default is tracked
+	// here and stored as the family-wide SamplingFamily.SourceAddress
+	// (#2605); each flow-server-nested value is tracked PER COLLECTOR on
+	// FlowServer.SourceAddress (#3745) so multiple collectors of the same
+	// family each keep their own source. The effective per-collector bind
+	// (nested override else family default) is resolved in the flowexport
+	// manager, not collapsed to one family-wide value here. Before #3745
+	// the nested value overwrote a single family-wide string
+	// (last-writer-wins across servers), so two collectors with distinct
+	// nested sources both bound the last one in AST order.
+	var outputLevelSrc string
 
 	for _, child := range outputNode.Children {
 		switch child.Name() {
@@ -1457,9 +1460,12 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 							}
 						}
 					case "source-address":
-						// Per-collector override (flow-server-nested);
-						// wins over the output-level default below.
-						flowServerSrc = nodeVal(prop)
+						// Per-collector override (flow-server-nested).
+						// Stored PER COLLECTOR (#3745) so multiple
+						// flow-servers of the same family each keep their
+						// own source; the manager resolves the effective
+						// bind (this override else the family default).
+						fs.SourceAddress = nodeVal(prop)
 					}
 				}
 				sf.FlowServers = append(sf.FlowServers, fs)
@@ -1478,12 +1484,12 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 		}
 	}
 
-	// Resolve the flow-server source-address precedence: a
-	// flow-server-nested value (more specific) wins over the
-	// output-level default; the output-level value is the fallback.
-	if flowServerSrc != "" {
-		sf.SourceAddress = flowServerSrc
-	} else if outputLevelSrc != "" {
+	// The output-level source-address is the family-wide default bind
+	// (the per-output default every flow-server inherits). Per-collector
+	// nested overrides live on FlowServer.SourceAddress; the flowexport
+	// manager computes the effective bind per collector (nested override
+	// else this default). #2605 (output-level) + #3745 (per-collector).
+	if outputLevelSrc != "" {
 		sf.SourceAddress = outputLevelSrc
 	}
 
