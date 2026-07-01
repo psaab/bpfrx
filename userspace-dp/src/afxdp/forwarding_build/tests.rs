@@ -1032,7 +1032,11 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
                 host_inbound_protocols: vec![],
                 ..Default::default()
             },
-            // legacy: no host-inbound stanza → admit-all preserved.
+            // #3705: a KNOWN zone in the snapshot with host_inbound_configured=false
+            // (the tolerant / HA nil-zone shape, or an old pre-#3405 Go control
+            // plane that omits the flag) is now default-DENY, NOT admit-all. It
+            // still enters the table (with an empty ZoneHostInbound) so the
+            // classifier fails closed instead of falling into `None => true`.
             ZoneSnapshot {
                 name: "legacy".into(),
                 id: 14,
@@ -1044,12 +1048,13 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
 
     let state = build_forwarding_state(&snapshot);
 
-    // Only the three configured zones populate the table; the unconfigured one
-    // is absent (admit-all path).
+    // #3705: EVERY known zone populates the table — including the legacy
+    // configured=false zone (id 14). Before #3705 id 14 was absent (admit-all);
+    // it is now present with an empty default-deny ZoneHostInbound.
     assert!(state.zone_host_inbound.contains_key(&11));
     assert!(state.zone_host_inbound.contains_key(&12));
     assert!(state.zone_host_inbound.contains_key(&13));
-    assert!(!state.zone_host_inbound.contains_key(&14));
+    assert!(state.zone_host_inbound.contains_key(&14));
 
     // wan (id 11): ping echo-request (icmp type 8) admitted, gre (proto 47)
     // admitted, ssh (tcp/22) DENIED, ospf (proto 89) DENIED. #3201: a non-echo
@@ -1093,19 +1098,123 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
         "control all ospf"
     );
 
-    // legacy (id 14): unconfigured → admit everything (pre-#3070 behaviour).
+    // #3705: legacy (id 14) is a KNOWN configured=false zone → now default-DENY,
+    // NOT admit-all. ssh (tcp/22) and ospf (proto 89) are both denied because its
+    // empty ZoneHostInbound admits nothing. Fail-on-revert: re-gate the insert in
+    // forwarding_build::zones on `zone.host_inbound_configured` and id 14 falls
+    // back to `None => true` admit-all, flipping these two assertions RED.
     assert!(
-        host_inbound_admits(&state, 14, 6, 22, false, 0),
-        "legacy admit-all"
+        !host_inbound_admits(&state, 14, 6, 22, false, 0),
+        "legacy configured=false zone must default-DENY ssh (#3705 fail-closed)"
     );
     assert!(
-        host_inbound_admits(&state, 14, 89, 0, false, 0),
-        "legacy admit-all proto"
+        !host_inbound_admits(&state, 14, 89, 0, false, 0),
+        "legacy configured=false zone must default-DENY ospf (#3705 fail-closed)"
     );
-    // A zone id that does not exist at all also admits (no entry).
+    // The global ICMP error/PMTUD accept still fires even on the default-deny
+    // legacy zone (PMTUD is never black-holed).
+    assert!(
+        host_inbound_admits(&state, 14, 1, 0, false, 3),
+        "ICMPv4 destination-unreachable stays globally admitted on the legacy zone"
+    );
+    // A zone id that does NOT exist in the snapshot at all (genuinely unknown /
+    // global ingress zone) still admits — the `None => true` arm is preserved for
+    // id-not-in-table, which #3405 deliberately kept as the admit default.
     assert!(
         host_inbound_admits(&state, 99, 6, 22, false, 0),
-        "unknown zone admit"
+        "unknown/global zone (absent from snapshot) keeps the admit default"
+    );
+}
+
+// #3705: a KNOWN zone that reaches the dataplane with host_inbound_configured=false
+// — the tolerant / HA nil-zone shape (Security.Zones[name] == nil ships a valid
+// name+id but configured=false; #3493), or an old pre-#3405 Go control plane that
+// omits the flag — must default-DENY host-bound traffic, NOT admit-all. This is
+// the Rust half of the #3705 fix and the defense-in-depth backstop for a
+// mismatched-version control plane (the Go builder now also ships configured=true
+// for a nil zone). The build path inserts an empty ZoneHostInbound for the known
+// zone so the classifier fails closed instead of hitting `None => true`.
+//
+// Fail-on-revert: re-gate the insert in forwarding_build::zones on
+// `zone.host_inbound_configured` and the nil zone (id 21) is left absent from the
+// table -> `None => true` admit-all -> the ssh/https deny assertions flip RED.
+#[test]
+fn build_forwarding_state_nil_zone_default_denies() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            // The nil-zone shape: a known zone (valid name + id) that arrives with
+            // host_inbound_configured=false and NO tokens.
+            ZoneSnapshot {
+                name: "nil-zone".into(),
+                id: 21,
+                host_inbound_configured: false,
+                host_inbound_system_services: vec![],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+            // A normal configured zone to prove the fix does not disturb legit
+            // admit sets.
+            ZoneSnapshot {
+                name: "trust".into(),
+                id: 22,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ssh".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    // #3705: the nil zone is PRESENT in the table (fail-closed), not absent.
+    assert!(
+        state.zone_host_inbound.contains_key(&21),
+        "nil / configured=false known zone must enter the host-inbound table (#3705)"
+    );
+
+    // The nil zone default-DENIES every host-bound service — ssh (tcp/22), https
+    // (tcp/443), and an arbitrary UDP service on v6 are all denied.
+    assert!(
+        !host_inbound_admits(&state, 21, 6, 22, false, 0),
+        "nil zone must deny ssh (tcp/22) — #3705 fail-closed default-deny"
+    );
+    assert!(
+        !host_inbound_admits(&state, 21, 6, 443, false, 0),
+        "nil zone must deny https (tcp/443)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 21, 17, 53, true, 0),
+        "nil zone must deny udp/53 on v6"
+    );
+    // The global ICMP error/PMTUD accept (#3171) still fires on the nil zone, so
+    // PMTUD / unreachable control is never black-holed by the default-deny.
+    assert!(
+        host_inbound_admits(&state, 21, 1, 0, false, 3),
+        "ICMPv4 destination-unreachable stays globally admitted on the nil zone"
+    );
+
+    // The normal configured zone still admits its configured set (no over-removal).
+    assert!(
+        host_inbound_admits(&state, 22, 6, 22, false, 0),
+        "configured trust zone must still admit ssh (tcp/22)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 22, 6, 443, false, 0),
+        "configured trust zone (ssh only) must still deny https (tcp/443)"
+    );
+
+    // A genuinely unknown / global ingress zone (id not in the snapshot at all)
+    // keeps the admit default — the `None => true` arm is preserved for id-not-in-
+    // table (#3405 deliberately scoped it to configured zones only). Lifeline
+    // interfaces (fxp0/em0/fab*) never reach this classifier (#3682).
+    assert!(
+        host_inbound_admits(&state, 900, 6, 22, false, 0),
+        "unknown/global zone (absent from snapshot) keeps the admit default"
     );
 }
 

@@ -25591,6 +25591,45 @@ top.
     metrics_host_inbound_addressless_3698_test.go (gauge emitted with dataplane
     unloaded, scoped zone absent, nil-store no-panic)
 
+## 2026-07-01 — #3705 host-inbound fail-closed for a tolerant/HA nil zone
+
+- **Timestamp**: 2026-07-01
+- **Action**: Fix #3705 (SECURITY) — a tolerant / HA-loaded config carrying a
+  NIL zone value (Security.Zones[name] == nil, #3493) shipped
+  HostInboundConfigured=false, so the KNOWN configured zone was left absent from
+  the Rust `zone_host_inbound` table and hit the `None => true` admit-all arm,
+  admitting ALL host-bound traffic (reopening #3405 default-deny on the
+  nil-object shape). Fixed BOTH sides fail-closed:
+    - Go: `buildZoneSnapshots` now sets HostInboundConfigured=true
+      UNCONDITIONALLY (only the token sets stay gated on a non-nil zone +
+      stanza). A nil zone ships configured=true + EMPTY token sets ->
+      default-DENY, identical to a no-stanza zone (#3405) / the #3622 nil-guard.
+    - Rust: `forwarding_build::zones::populate_zones` inserts a ZoneHostInbound
+      for EVERY KNOWN zone (valid id, in snapshot) regardless of
+      host_inbound_configured — the dataplane fail-closed backstop for a
+      mismatched-version control plane. `host_inbound_configured` now selects
+      only WHICH tokens a zone admits, never WHETHER it is enforced. The
+      `None => true` arm now fires ONLY for a genuinely unknown/global ingress
+      zone (id 0). Preserves lifeline exemption (fxp0/em0/fab*, #3682).
+- **File(s)**: pkg/dataplane/userspace/zones.go (unconditional
+  HostInboundConfigured), pkg/dataplane/userspace/zones_host_inbound_test.go
+  (TestBuildZoneSnapshotsNilZoneDefaultDenies — Go RED-on-revert),
+  userspace-dp/src/afxdp/forwarding_build/zones.rs (always-insert build path),
+  userspace-dp/src/afxdp/forwarding_build/tests.rs
+  (build_forwarding_state_nil_zone_default_denies new Rust RED-on-revert;
+  build_forwarding_state_enforces_host_inbound_traffic legacy zone flipped from
+  admit-all to default-deny), userspace-dp/src/afxdp/test_fixtures.rs +
+  userspace-dp/src/afxdp/tests.rs (fixture zones declare `system-services all`
+  so local-delivery tests keep their intended admit-all — explicit form of the
+  removed configured=false default),
+  userspace-dp/src/afxdp/forwarding/README.md +
+  docs/host-inbound-service-matrix.md (fail-closed nil-zone invariant).
+- **Validation**: go build ./... green; go test ./pkg/dataplane/...
+  ./pkg/config/... green; go vet green; Go RED-on-revert verified (re-gate ->
+  RED). Full `cargo test --release` green (3419 tests, 0 failed); Rust
+  RED-on-revert verified for BOTH new nil-zone test and the flipped legacy-zone
+  test (re-gate build-path insert -> both RED). rustfmt not run (repo has
+  pre-existing toolchain drift; edits match committed multi-line style).
 - **Timestamp**: 2026-07-01
   - **Action**: #3711 fail-closed on malformed v3 policy literals +
     address-book prefixes (HIGH security fail-open; v3 sibling of #3367).
