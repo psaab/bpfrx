@@ -242,6 +242,35 @@ still at the cap, clears the map — a simple hard ceiling rather than
 per-entry LRU bookkeeping for a syscall-amortization cache. The bound is
 pinned by `TestRouteMaskCacheBounded` (inserting >cap distinct keys keeps
 `len(entries)` <= cap; removing the bound flips it RED).
+
+**#3743 — the FIB lookup runs OFF the EventReader callback.** `resolve()`
+is called from `ExportSessionClose`, which runs inside the EventReader
+session-close callback (`daemon_flowexport.go` `flowExportCallback` /
+`ipfixExportCallback`). A *synchronous* `RTM_GETROUTE` there stalls the
+event reader — and every other callback behind it, including the trace
+writer — for the netlink round-trip; under high destination-IP churn the
+cache thrashes and close handling becomes a netlink-bound path. So a cache
+miss no longer blocks: `resolve()` returns the safe default (mask 0,
+`ok=false`) immediately and schedules a bounded, deduplicated **background**
+lookup (`scheduleLookupLocked` → `populate`) that warms the cache for the
+NEXT flow to that prefix. A `pending` set dedups concurrent misses for the
+same IP; `inflight` caps concurrent lookups at `defaultRouteMaskInflight`
+(32) so a slow/loaded netlink socket cannot spawn unbounded goroutines —
+once the cap is hit, further misses just return the default and are retried
+on a later flow. An approximate mask (0) on the first flow to a new prefix
+is the accepted trade-off for never blocking the shared event-reader path;
+the common per-host / per-subnet aggregate resolves correctly from the warm
+cache on the second flow onward. Pinned by
+`TestRouteMaskResolveMissDoesNotLookupSynchronously` (a miss with a blocking
+lookup returns the default, not the lookup's value),
+`TestExportSessionCloseDoesNotBlockOnFIBLookup` (end-to-end: a blocking FIB
+lookup does not stall `ExportSessionClose`) and
+`TestRouteMaskCacheAsyncPopulateAndHit` (miss → default → background
+populate → warm hit). Reverting to the synchronous lookup-in-`resolve`
+flips these RED (the first two by blocking / returning the wrong value).
+Note #3744 (route-mask being VRF/table/source-blind) is a separate design
+item and out of scope here.
+
 `Exporter` / `IPFIXExporter` carry a `MaskResolver` func (defaulted by
 `NewExporter`/`NewIPFIXExporter` to `NewRouteMaskResolver`; nil on a
 zero-value exporter → masks stay 0, the pre-#2866 behaviour and the test
@@ -270,9 +299,13 @@ The package is split by responsibility (#1988):
 - `ipfix.go` — IPFIX (v10) template/record encoding and the
   `IPFIXExporter` that drives it.
 - `routemask.go` — the `MaskResolver` func type and
-  `NewRouteMaskResolver` (#2866): a TTL-cached FIB longest-prefix-match
-  lookup that resolves a flow's `srcMask`/`dstMask` (route prefix length)
-  at export time, plus the `resolveMasks` helper both exporters call.
+  `NewRouteMaskResolver` (#2866): a TTL-cached, size-bounded FIB
+  longest-prefix-match lookup that resolves a flow's `srcMask`/`dstMask`
+  (route prefix length) at export time, plus the `resolveMasks` helper both
+  exporters call. The netlink `RTM_GETROUTE` runs on a bounded background
+  goroutine, never on the EventReader callback that calls `resolve()`
+  (#3743): a cache miss returns the default and warms the cache for the next
+  flow.
 - `transport.go` — shared collector connection management
   (`collectorConns`: dial / fan-out write / close) and the per-family
   batch accumulator (`flowBatch`) used by both exporters. `dialCollectors`
