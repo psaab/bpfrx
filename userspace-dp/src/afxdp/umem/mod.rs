@@ -389,17 +389,26 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// enqueued. Mirrors `policy_reject_sent`; the suppression legs
     /// (budget / output-filter / parse-error) are shared with policy reject.
     pub(super) filter_reject_sent: AtomicU64,
-    /// #2089: policy-`reject` replies suppressed due to TX-frame budget
-    /// exhaustion (the packet is still dropped — fail-closed). Shared with
-    /// filter reject (#2521).
+    /// #2089: POLICY-`reject` replies suppressed due to TX-frame budget
+    /// exhaustion (the packet is still dropped — fail-closed). #3615 (L04):
+    /// filter-source suppression is now `filter_reject_reply_budget_drops`.
     pub(super) policy_reject_reply_budget_drops: AtomicU64,
+    /// #3615 (L04): FILTER-`reject` replies suppressed by TX-frame budget —
+    /// the source-split sibling of `policy_reject_reply_budget_drops`.
+    pub(super) filter_reject_reply_budget_drops: AtomicU64,
     /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
     /// terminal `discard`/`reject` (or three-color policer) on the egress
     /// interface, now that the reply is classified by its OWN egress tuple.
     /// Per-leg so an operator-installed output filter that suppresses a
     /// generated control frame is attributable.
     pub(super) time_exceeded_output_filter_drops: AtomicU64,
+    /// #2238/#3615 (L05): POLICY-`reject` replies dropped by an egress output
+    /// filter. Filter-source suppression is in
+    /// `filter_reject_output_filter_drops`.
     pub(super) policy_reject_output_filter_drops: AtomicU64,
+    /// #3615 (L05): FILTER-`reject` replies dropped by an egress output filter
+    /// — the source-split sibling of `policy_reject_output_filter_drops`.
+    pub(super) filter_reject_output_filter_drops: AtomicU64,
     pub(super) syn_cookie_output_filter_drops: AtomicU64,
     /// #2328: egress-MTU PTB / Frag-Needed (the #2301 PMTUD generator)
     /// dropped by an OUTPUT firewall filter terminal `discard`/`reject` (or
@@ -815,8 +824,10 @@ impl BindingLiveState {
             policy_reject_sent: AtomicU64::new(0),
             filter_reject_sent: AtomicU64::new(0),
             policy_reject_reply_budget_drops: AtomicU64::new(0),
+            filter_reject_reply_budget_drops: AtomicU64::new(0),
             time_exceeded_output_filter_drops: AtomicU64::new(0),
             policy_reject_output_filter_drops: AtomicU64::new(0),
+            filter_reject_output_filter_drops: AtomicU64::new(0),
             syn_cookie_output_filter_drops: AtomicU64::new(0),
             ptb_output_filter_drops: AtomicU64::new(0),
             generated_reply_classify_parse_errors: AtomicU64::new(0),

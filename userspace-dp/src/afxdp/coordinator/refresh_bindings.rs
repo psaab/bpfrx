@@ -119,8 +119,10 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.policy_reject_sent = snap.policy_reject_sent;
     binding.filter_reject_sent = snap.filter_reject_sent;
     binding.policy_reject_reply_budget_drops = snap.policy_reject_reply_budget_drops;
+    binding.filter_reject_reply_budget_drops = snap.filter_reject_reply_budget_drops;
     binding.time_exceeded_output_filter_drops = snap.time_exceeded_output_filter_drops;
     binding.policy_reject_output_filter_drops = snap.policy_reject_output_filter_drops;
+    binding.filter_reject_output_filter_drops = snap.filter_reject_output_filter_drops;
     binding.syn_cookie_output_filter_drops = snap.syn_cookie_output_filter_drops;
     binding.ptb_output_filter_drops = snap.ptb_output_filter_drops;
     binding.generated_reply_classify_parse_errors = snap.generated_reply_classify_parse_errors;
@@ -311,8 +313,10 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.policy_reject_sent = 0;
     binding.filter_reject_sent = 0;
     binding.policy_reject_reply_budget_drops = 0;
+    binding.filter_reject_reply_budget_drops = 0;
     binding.time_exceeded_output_filter_drops = 0;
     binding.policy_reject_output_filter_drops = 0;
+    binding.filter_reject_output_filter_drops = 0;
     binding.syn_cookie_output_filter_drops = 0;
     binding.ptb_output_filter_drops = 0;
     binding.generated_reply_classify_parse_errors = 0;
