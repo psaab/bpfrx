@@ -2,7 +2,10 @@
 
 ## 1. Status
 
-DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR).
+PLAN-DEFER v3 — Claude SMR converged (r1→r2, see §13/§14). Recommendation:
+per-zone Reject buckets via a config-keyed sparse map. Companion (Codex/AGY)
+results did not surface — infra-block documented in §14; verdict rests on the two
+hostile SMR rounds per the 2-of-3 rule. Awaiting manual `/engineer` approval.
 
 Research base: worktree off `origin/master` at `bd2443c5e` (fetched at start).
 Coordinator noted current master had advanced to `ad4d9afb5`; the two files this
@@ -52,10 +55,11 @@ throughput and not a security-critical drop. Concretely:
   drained, so an operator troubleshooting a policy misconfiguration in a
   *trusted/internal* zone never sees that zone's reject diagnostic. The fix
   restores it.
-- Memory cost of the recommended fix is ~1 KiB total (64 zones × 16 B, one
-  process-global array — see §5). Hot-path cost is one array index added to an
-  already-cold (`#[cold] #[inline(never)]`) path. There is no per-forwarded-
-  packet cost.
+- Memory cost of the recommended fix is config-bounded: one 16 B GCRA bucket per
+  configured zone (e.g. 30 zones ≈ 480 B; the implausible 65533-zone cap ≈ 1 MiB,
+  gated by the Go zone-count cap — see §5/§8). Hot-path cost is one hashmap
+  lookup added to an already-cold (`#[cold] #[inline(never)]`) path. There is no
+  per-forwarded-packet cost.
 
 **If reviewers conclude the aggregate cap is acceptable for a diagnostic reply
 and the added surface is not worth it, PLAN-KILL is an acceptable verdict** (the
@@ -129,63 +133,83 @@ the victim.
 
 ## 5. Concrete design
 
-### Recommended: per-zone Reject buckets, process-global array, MAX_ZONES=64
+### Recommended: per-zone Reject buckets in a CONFIG-KEYED MAP (not a dense array)
 
-Zone identity is **config-defined, not attacker-defined**. `MAX_ZONES = 64`
-(`bpf/headers/xpf_common.h:142`); zone ids are `u16` (widened in #3075) but
-practically bounded to `[0, 64)`. So a fixed-size array indexed by zone id has
-**bounded cardinality with no attacker-driven growth** — it satisfies the exact
-constraint that motivated the global model in #2472. Precedent already exists:
-`screen/syn_rate.rs` runs per-zone, per-worker limiter state sized by a Go
-commit-time memory advisory (#3315).
+**Critical correction (SMR r1 change 4 verification → v3):** zone ids are NOT
+dense in `[0, 64)`. `MAX_ZONES = 64` (`bpf/headers/xpf_common.h:142`) is a legacy
+eBPF-map/direct-table constant, but the userspace path does not use those maps
+for zone identity. Post-#3075:
+- Zone ids are a **stable name-hash in a u16 space**, sparse across `[0, 65533]`
+  (`pkg/config/compiler_validate_strict.go:3327` `MaxUsableZoneID = 65533`;
+  `pkg/config/zoneid.go:16` `ZoneIDReservedMin = 0xFFFE`; the top two ids are the
+  global / host sentinels). A config with 3 zones can hold ids like 41337, 9002,
+  60123 — NOT 1, 2, 3.
+- The Rust zone maps are already sparse hashmaps: `zone_name_to_id:
+  FastMap<String, u16>` / `zone_id_to_name: FastMap<u16, String>` /
+  `ifindex_to_zone_id: FastMap<i32, u16>` (`types/forwarding.rs:76-77,75`).
+- A dense `[TokenBucket; 64]` indexed by zone id is therefore **WRONG**: it would
+  collapse almost every real zone id onto bucket[0] (clamp-to-0), giving no
+  fairness at all. The v1/v2 dense-array design is retracted.
 
-**Data structure change (`icmp_ratelimit.rs`):**
+Cardinality is still **config-defined, not attacker-defined** (a reject only ever
+carries a `from_zone_id` from `zone_id_to_name` / `ifindex_to_zone_id`, both
+config-derived), so a per-zone structure keyed by the configured zone set has
+bounded cardinality = number of configured zones (≤ 65533, realistically dozens).
+This is exactly the `screen/syn_rate.rs` precedent (#3315): per-zone limiter
+state allocated at config time for the zones that need it.
 
-Replace the single `REJECT_BUCKET` static with a fixed array. TimeExceeded /
-PacketTooBig stay global for now (see §10 — their generator sites do not carry a
-clean zone id; out of scope):
-
-```rust
-const MAX_ZONES: usize = 64; // mirror bpf/headers/xpf_common.h MAX_ZONES
-
-// One Reject bucket per zone id. Process-global (shared across workers) so the
-// aggregate-per-zone cap semantics are exact and memory is trivial (64 * 16 B).
-static REJECT_BUCKETS: [TokenBucket; MAX_ZONES] =
-    [const { TokenBucket::new() }; MAX_ZONES];
-```
-
-`TokenBucket::new()` is already `const` (`:102`), so the inline-const array
-initializer is valid on the pinned toolchain (confirm at /engineer time; fall
-back to a `once_cell`/manual macro if the const-array form is rejected).
-
-**API change:** thread a `zone_id: u16` through the Reject path only.
+**Data structure (v3): a per-zone Reject bucket map owned by `ForwardingState`,
+rebuilt each config apply.**
 
 ```rust
-pub(in crate::afxdp) fn allow_generated_reject(zone_id: u16) -> bool {
-    allow_generated_reject_at(zone_id, monotonic_nanos(),
-                              DEFAULT_RATE_PER_SEC, DEFAULT_BURST)
-}
-
-fn reject_bucket_for(zone_id: u16) -> &'static TokenBucket {
-    // Fail-safe clamp: an out-of-range / unknown zone (0 or >= MAX_ZONES) maps
-    // to bucket[0]. Zone 0 is the "unknown/unzoned" sentinel already
-    // (forwarding treats zone_id == 0 as none), so collapsing unknown → 0 is
-    // consistent and keeps the index in-bounds without a panic.
-    REJECT_BUCKETS[(zone_id as usize).min(MAX_ZONES - 1)]  // see note below
-}
+// In ForwardingState (types/forwarding.rs), built alongside zone_id_to_name at
+// config apply. One GCRA Reject bucket per configured zone id. Cardinality =
+// configured zones. ~16 B/zone (e.g. 30 zones ≈ 480 B).
+reject_buckets: FastMap<u16, TokenBucket>,   // key = zone id
 ```
 
-Note: the `.min(MAX_ZONES-1)` maps an out-of-range id to the LAST bucket, which
-would merge distinct high ids; prefer a `if (zone_id as usize) < MAX_ZONES { id }
-else { 0 }` clamp so all out-of-range ids share bucket[0] with the unzoned
-sentinel. Final form decided at /engineer; the invariant is **in-bounds, no
-panic, deterministic**.
+- Built in the forwarding-build path (`forwarding_build/interfaces.rs` /
+  wherever `zone_id_to_name` is populated): for each configured zone id, insert a
+  fresh `TokenBucket::new()`.
+- Lookup on the cold reject path:
+  ```rust
+  let bucket = forwarding.reject_buckets
+      .get(&from_zone_id)
+      .unwrap_or(&REJECT_FALLBACK_BUCKET);   // process-global static
+  ```
+  `REJECT_FALLBACK_BUCKET` is a single process-global `TokenBucket` static used
+  for an unzoned (id 0) or otherwise-unknown zone id — a real bucket, so the gate
+  is never fail-open. It is shared, so unzoned/unknown rejects share ONE budget
+  (acceptable: they are the rare/degenerate case, not a per-zone diagnostic).
 
-Keep `GeneratedErrorReason::{TimeExceeded, PacketTooBig}` on
-`allow_generated_error(reason)` unchanged; the Reject variant moves to the
-zone-keyed entry point. (Alternative: keep one `allow_generated_error(reason,
-zone_id)` where zone_id is ignored for TE/PTB — decide at /engineer for the
-smaller diff. Either preserves TE/PTB behavior exactly.)
+**Placement decision — ForwardingState (reset-on-commit) vs process-global lazy
+map.** Two viable homes:
+- (Recommended) **ForwardingState-owned**, rebuilt on each config apply. Workers
+  share `Arc<ForwardingState>` so they share the same per-zone atomics (VERIFY at
+  /engineer that `worker_ctx.forwarding` is one shared Arc, not a per-worker
+  clone — if per-worker, hoist the map into its own `Arc` or make it
+  process-global). Downside: the reject limiter RESETS on `commit`. This is
+  acceptable — a commit is rare and operator-initiated, not attacker-triggerable,
+  and a fresh burst allowance right after a commit is benign for a diagnostic
+  reply.
+- (Alternative) **Process-global lazily-populated concurrent map** (a
+  `Mutex<FastMap<u16, Box<TokenBucket>>>` or sharded map, insert-on-first-use).
+  Survives commits; keys still bounded by configured zones. Costs a mutex on the
+  cold path (fine) and more complexity. Choose this only if reset-on-commit is
+  judged undesirable.
+
+**TE / PTB unchanged.** With a map design there is no 2D array; TimeExceeded and
+PacketTooBig keep their existing single global statics
+(`icmp_ratelimit.rs:163-164`) and the existing `allow_generated_error(reason)`
+entry point. Only the Reject reason moves to the zone-keyed map via a new
+`allow_generated_reject(forwarding, from_zone_id)` (or a `bucket: &TokenBucket`
+passed in). The SMR-r1 "uniform 2D dispatch" (change 2) is moot under the map
+design — the asymmetry is now TE/PTB-static vs Reject-map, which is inherent and
+documented, not an accidental bifurcation.
+
+- TE call site `icmp.rs:191`, PTB `tx/dispatch/mod.rs:577`: unchanged.
+- Reject: `reject_reply.rs:179` calls the zone-keyed variant with the resolved
+  `from_zone_id`.
 
 **Consumer change (`reject_reply.rs`):** thread `from_zone_id` into
 `enqueue_reject_reply`.
@@ -194,30 +218,56 @@ smaller diff. Either preserves TE/PTB behavior exactly.)
   `from_zone_id: u16` parameter.
 - At the four filter-reject call sites (`mod.rs:800/905/1393/1779`) resolve the
   ingress zone: `forwarding.ifindex_to_zone_id.get(&binding.ifindex).copied()
-  .unwrap_or(0)` (field `types/forwarding.rs:75`). Unzoned → 0 → bucket[0].
-- The gate becomes `if !allow_generated_reject(from_zone_id) { ... }`
-  (`reject_reply.rs:179`).
+  .unwrap_or(0)` (field `types/forwarding.rs:75`). Unzoned → 0 → `[Reject][0]`.
+- The gate becomes `if !allow_generated_error(GeneratedErrorReason::Reject,
+  from_zone_id) { ... }` (`reject_reply.rs:179`).
 
-**Observability:** two options, pick one at /engineer (recommend both if cheap):
-- Keep the existing aggregate `reject_rate_limited_total` as
-  `sum(REJECT_BUCKETS[z].rate_limited)` so the Prometheus metric and the wire
-  field (`protocol/control.rs:350`) are unchanged (no protocol break, additive-
-  safe). `rate_limited_count(Reject)` becomes a sum loop over 64 buckets.
-- OPTIONAL per-zone attribution: a `reject_rate_limited_by_zone(zone_id) -> u64`
-  accessor for a future labeled metric / `show` command. Not required to fix the
-  bug; deferrable. If shipped, it must be additive on the wire.
+**Observability — aggregate counter is a SINGLE atomic, NOT a 64-load sum
+(SMR r1 change 1):** keep one process-global `AtomicU64` per reason
+(`REJECT_RATE_LIMITED_TOTAL` etc.) bumped on ANY per-zone deny, exactly where
+`allow_generated_error` bumps today. `rate_limited_count(reason)` stays a single
+atomic load — exact, atomic, O(1), and the `protocol/tests.rs:403-434`
+round-trip + Prometheus contract are untouched. The per-zone `TokenBucket` keeps
+its own `rate_limited` field ONLY for optional per-zone attribution (a future
+`reject_rate_limited_by_zone(zone_id)` accessor / labeled metric); the AGGREGATE
+metric never sums the 64 fields. This removes the torn-read concern entirely.
 
-### Why this does NOT weaken the reflection/amplification cap
+### Why this does NOT weaken the reflection/amplification cap (SMR r1 change 3)
 
 The #2472 limiter exists to bound reflected backscatter (the reply is addressed
-to the trigger's — spoofable — source). Objection: 64 zones × 1000/s = 64000/s
-worst-case backscatter vs 1000/s today. Rebuttal: an attacker can only trigger a
+to the trigger's — spoofable — source). Objection: with N configured zones the
+worst-case aggregate rises to N × 1000/s vs 1000/s today.
+
+**North-south (the reflection threat model):** an attacker can only trigger a
 reject in a zone their packets **ingress on**. The realistic reflection attacker
 floods ONE ingress path (the WAN zone); per-zone buckets cap that path at 1000/s
-— **identical** to today. Reaching 64000/s requires being simultaneously on-link
-to 64 distinct zones, which is not the reflection threat model. So per-zone
-buckets preserve the realistic per-ingress-zone cap while removing the cross-zone
-starvation. This rebuttal is the crux the reviewers should attack.
+— **identical** to today. So per-zone buckets preserve the realistic
+per-ingress-zone cap while removing the cross-zone starvation.
+
+**East-west (SMR r1 pressed this):** reaching the N× worst case requires an
+attacker who can inject rejected flows across many zones AT ONCE — e.g. a
+compromised internal host bridged onto several zone subinterfaces, or a trunk
+carrying many zone VLANs to one physical port with a source that can drive each.
+Assessment: (a) this attacker is already inside the trust boundary and can emit
+far more damaging traffic than reflected RST/ICMP backscatter, so the marginal
+N× backscatter is not the dominant risk; (b) the number of zones one physical
+ingress can drive is bounded by the configured VLAN/zone count on that port (the
+Go zone-count cap ceilings N at 65533, but a real port carries a handful), not
+unbounded; (c) each zone is still individually capped at 1000/s, so no single
+zone is amplified beyond today.
+
+**Decision — flat per-zone, NO mandatory global second gate; keep it as a
+documented OPTIONAL knob.** A global second gate (admit only if BOTH the per-zone
+bucket AND a global cap have a token) would bound the aggregate at 1000/s again,
+but it re-introduces a limited global-drain: the global gate is first-come-first-
+served, so a busy zone can still consume the shared global tokens and partially
+starve others — i.e. it trades some of the fairness we came here to fix. For a
+DIAGNOSTIC reply, bounding each ingress path at 1000/s (north-south safe) while
+accepting a bounded east-west aggregate from an already-inside attacker is the
+right call. If a deployment’s threat model genuinely includes an east-west
+multi-zone amplifier, the two-level gate is a small, well-understood follow-up
+(one extra `try_take` on a global bucket) — filed, not built. Reviewers should
+rule on whether flat-per-zone is acceptable or the two-level gate must ship in v1.
 
 ### Rejected alternatives (see §11 open questions)
 
@@ -225,8 +275,8 @@ starvation. This rebuttal is the crux the reviewers should attack.
   contention, but the reject path is cold (not per-packet), the GCRA CAS is
   already lock-free, and per-worker multiplies the effective cap by num_workers
   (6 → 6000/s per zone), muddying the semantics. Rejected: no hot-path benefit,
-  worse cap clarity. Memory would be 64 × workers × 16 B (~6 KiB @ 6 workers) —
-  still small, but not worth the semantic cost.
+  worse cap clarity. Memory would be num_zones × workers × 16 B — still small,
+  but not worth the semantic cost.
 - **Weighted / hierarchical (per-zone sub-quota under a global cap)** — true
   fairness under a shared global cap needs reserved per-zone floors (DRR/WFQ).
   That is real scheduler complexity for a diagnostic reply. Rejected as
@@ -250,8 +300,8 @@ surface, so no proto/bindings churn required for the core fix.
   `allow_generated_reject(zone_id)` (or a 2-arg overload — decided at /engineer).
 - `rate_limited_count(reason)` preserved (Reject variant returns the sum).
 - Coordinator status accessor `reject_rate_limited_total()`
-  (`coordinator/status.rs:284`) preserved — its body changes to a sum but the
-  signature and the Prometheus metric name are unchanged.
+  (`coordinator/status.rs:284`) preserved — its body reads a single global
+  `AtomicU64` (SMR r1 change 1), signature and Prometheus metric name unchanged.
 - Wire/protocol field `reject_rate_limited_total`
   (`protocol/control.rs:350-351`) unchanged. If per-zone attribution ships, it
   is a NEW additive field — the existing field stays.
@@ -264,41 +314,45 @@ surface, so no proto/bindings churn required for the core fix.
 - **Fail-closed on every failure leg.** Bucket-empty, budget-exhausted,
   unparseable, output-filter-drop all still `return false` and the caller still
   silently drops (`reject_reply.rs:162-165`, `:180-182`, `:189-194`,
-  `:222-231`). The zone key must not introduce a fail-open path (e.g. an
-  out-of-range zone must map to a real bucket, never skip the gate).
-- **No panic on zone index.** `zone_id` is `u16`; the array is 64. The clamp
-  must be branch-safe and in-bounds for any `u16` (0..=65535 → 0..=63). A
-  compile-time `assert!(MAX_ZONES == 64)` mirroring the C header keeps the two
-  in sync.
+  `:222-231`). The zone key must not introduce a fail-open path — a missing
+  zone-id must map to the `REJECT_FALLBACK_BUCKET`, never skip the gate.
+- **No panic on unknown zone.** The `reject_buckets.get(&id)` returns `None` for
+  an unmapped id; the `.unwrap_or(&REJECT_FALLBACK_BUCKET)` guarantees a real
+  bucket for any `u16`. No indexing, so no bounds panic.
 - **GCRA atomicity (#2955) preserved per bucket.** Each per-zone bucket keeps the
-  single-word CAS refill+consume; the array does not reintroduce split state.
-  The `concurrent_hammer_never_over_admits` invariant must still hold per zone.
+  single-word CAS refill+consume; the map holds independent `TokenBucket`s and
+  does not reintroduce split state. `concurrent_hammer_never_over_admits` must
+  still hold per zone.
 - **Reason isolation (#2472) preserved.** Reject per-zone must not touch TE/PTB
-  buckets; `reasons_are_isolated` must still pass.
-- **Counter semantics.** The aggregate `reject_rate_limited_total` must remain
-  monotonic and equal to the sum of per-zone drops so the existing metric and
-  the `protocol/tests.rs:403-434` round-trip stay valid.
+  buckets (which stay their own statics); `reasons_are_isolated` must still pass.
+- **Counter semantics.** The aggregate `reject_rate_limited_total` is a single
+  global `AtomicU64` bumped on any per-zone deny — monotonic, atomic, and the
+  `protocol/tests.rs:403-434` round-trip stays valid unchanged.
 - **Cold-path placement.** The zone lookup must not pull `enqueue_reject_reply`
-  or `allow_generated_reject` out of `.text.unlikely`; keep `#[cold]
+  or the zone-keyed allow-fn out of `.text.unlikely`; keep `#[cold]
   #[inline(never)]` on the reject bodies.
-- **HA / worker portability.** Buckets are process-global (not per-worker), so
-  there is no per-worker sync concern and no HA session-sync interaction (the
-  limiter is local anti-amplification state, not synced). The test-only
-  `global_bucket_test_lock` + `reset_bucket_for_test` must be extended to the
-  array (reset a given zone's bucket) so the existing serialized bucket tests
-  still work.
+- **Shared per-zone atomics across workers.** All workers must gate against the
+  SAME per-zone bucket (one `Arc<ForwardingState>`), else the cap becomes
+  per-worker. VERIFY the forwarding sharing model at /engineer (§8).
+- **Test helpers.** `global_bucket_test_lock` + `reset_bucket_for_test` extend to
+  reset a given zone's bucket (or a test-built map) so the existing serialized
+  bucket tests still work under the parallel runner (#2955).
 
 ## 8. Risk assessment (4-class)
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression | LOW | Fail-closed legs unchanged; only the bucket *selection* changes. Reject semantics (RST/ICMP, counters) identical. The one behavior change is intended: one zone no longer starves another. |
-| Lifetime / borrow-checker | LOW | `&'static TokenBucket` from a `static` array; threading a `u16` param. No new borrows, no lifetimes. Const-array init is the only toolchain risk (fallback noted in §5). |
-| Performance regression | LOW | Reject path is cold (`#[cold] #[inline(never)]`), fires only on policy/filter deny — never per forwarded packet. Adds one array index + clamp. No new allocation. Aggregate counter read becomes a 64-iter sum (called ~1/s from status poll, negligible). |
-| Architectural mismatch | LOW | Mirrors the existing per-zone `screen/syn_rate.rs` precedent and the existing per-reason `bucket_for` dispatch. Not a dead-end: the array generalizes cleanly to TE/PTB later, or to per-zone-per-worker if ever needed. |
+| Behavioral regression | LOW-MED | Fail-closed legs unchanged; the bucket *selection* changes and the limiter now RESETS on config apply (reset-on-commit, §5) if the ForwardingState-owned home is chosen. Intended behavior change: one zone no longer starves another. |
+| Lifetime / borrow-checker | LOW-MED | The reject bucket is borrowed from `Arc<ForwardingState>` for the duration of the cold call — must not outlive the borrow; the fallback is a `&'static`. VERIFY forwarding is one shared Arc across workers (else per-worker clones would give per-worker buckets = cap × num_workers). Flagged as the key /engineer check. |
+| Performance regression | LOW | Reject path is cold (`#[cold] #[inline(never)]`), fires only on policy/filter deny — never per forwarded packet. Adds one hashmap `get`. No per-forwarded-packet cost. Aggregate counter is a single atomic load (SMR r1 change 1), not a sum. |
+| Architectural mismatch | LOW | Mirrors the existing sparse zone maps (`zone_name_to_id`, `ifindex_to_zone_id`) and the per-zone `screen/syn_rate.rs` precedent. Not a dead-end. |
 
-Security note: the change does not weaken the realistic reflection cap (§5) and
-keeps bounded, config-driven cardinality (no attacker-driven map growth).
+Memory / DoS note: cardinality is bounded by the configured zone set (the Go
+zone-count cap enforces ≤ 65533 distinct zones —
+`pkg/config/compiler_validate_strict.go:3327` + `validateZoneCountStrict`), and a
+reject only ever keys on a config-derived zone id, so there is no attacker-driven
+map growth. Security: the change does not weaken the realistic per-ingress-zone
+reflection cap (§5).
 
 ## 9. Test plan
 
@@ -311,10 +365,12 @@ keeps bounded, config-driven cardinality (no attacker-driven map growth).
   is denied and bumps that zone's counter (port the existing
   `burst_beyond_capacity_is_rate_limited`).
 - Refill over time per zone (port `refill_over_time_restores_capacity`).
-- Aggregate counter = sum: drain two zones by K1 and K2 drops; assert
-  `reject_rate_limited_total() == K1 + K2`.
-- Out-of-range / zone-0 clamp: `allow_generated_reject(u16::MAX)` and
-  `allow_generated_reject(0)` are in-bounds, fail-closed on empty, never panic.
+- Aggregate counter: drain two zones by K1 and K2 drops; assert the single
+  global `reject_rate_limited_total() == K1 + K2` (it is bumped on every per-zone
+  deny).
+- Unmapped / unzoned zone: a reject with a `from_zone_id` not in the map uses
+  `REJECT_FALLBACK_BUCKET`, fail-closes on empty, never panics; a zone-0 reject
+  is handled the same way.
 - Preserve `concurrent_hammer_never_over_admits` (per-zone bucket), `reasons_are_isolated`
   (Reject-per-zone vs TE/PTB), `zero_rate_disables_limiter`.
 - Call-site fail-on-revert (`reject_reply.rs`): extend
@@ -373,20 +429,23 @@ this is a no-regression check; `go vet`.
    contention on a hot zone's bucket. On the cold reject path is that ever a
    throughput concern under a flood, or is per-worker (× num_workers cap)
    actually the right call despite the cap-clarity cost?
-4. **Zone-id clamp correctness.** Zone ids are `u16` but MAX_ZONES=64. Is
-   collapsing out-of-range ids to bucket[0] (shared with the unzoned sentinel)
-   the right fail-safe, or does merging distinct-but-out-of-range zones onto one
-   bucket reintroduce a (smaller) starvation? Can a real config ever produce a
-   zone id ≥ 64 (is MAX_ZONES enforced at commit)? — must verify the Go
-   commit-time zone cap.
-5. **Counter/metric compatibility.** Turning `reject_rate_limited_total` into a
-   64-bucket sum: any risk to the `protocol/tests.rs` round-trip, the Prometheus
-   contract, or monotonicity? Should the aggregate be a separate always-summed
-   accumulator instead of a live sum to avoid a torn read across 64 relaxed
-   loads?
-6. **Scope creep.** Should TE/PTB be done in the same change for consistency
-   (near-zero extra memory) despite the messier zone plumbing, or is
-   Reject-only the right minimal fix?
+4. **RESOLVED — zone-id space.** Verified: zone ids are sparse u16 stable
+   name-hashes over `[0, 65533]` (NOT dense `[0,64)`), enforced by the Go
+   zone-count cap (`compiler_validate_strict.go:3327` `MaxUsableZoneID = 65533`,
+   `validateZoneCountStrict`). The dense-64 array is retracted (§5); the design
+   is now a config-keyed sparse map. Remaining sub-question: is the shared
+   `REJECT_FALLBACK_BUCKET` for unzoned/unknown ids acceptable, or should an
+   unzoned reject simply skip the per-zone limiter (still bounded by the TX
+   budget gate)?
+5. **Placement / reset-on-commit.** ForwardingState-owned buckets reset on every
+   `commit`; the process-global lazy map survives. Is reset-on-commit acceptable
+   for a diagnostic reply limiter, or does the added complexity of a
+   process-global concurrent map earn its keep? And is `worker_ctx.forwarding` a
+   single shared `Arc` (so workers share the per-zone atomics) or a per-worker
+   clone (which would make the cap per-worker)? — must verify at /engineer.
+6. **Scope creep.** TE/PTB stay global (they lack a clean zone id at their
+   generator sites — §10). Is Reject-only the right minimal fix, or should TE/PTB
+   also become per-zone (needs zone plumbing into `icmp.rs` / `tx/dispatch`)?
 
 ## 12. Coordination with #3607 (the other rate-limiter research)
 
@@ -405,4 +464,38 @@ this is a no-regression check; `go vet`.
 - **Ordering:** #3618 and #3607 are independent; either can ship first. If both
   ship, a later consolidation PR could unify the token-bucket substrate — a
   separate, optional refactor.
-```
+
+## 13. Changelog
+
+- **v1 (d190d4a5f):** initial plan — per-zone Reject buckets as a process-global
+  dense `[TokenBucket; 64]` array, aggregate counter as a 64-bucket sum.
+- **v2:** folded Claude SMR r1. Change 1: aggregate counter → single global
+  `AtomicU64` (not a 64-load sum). Change 2: uniform 2D `[[TokenBucket;64];3]`
+  dispatch. Change 3: east-west amplification analysis + global-second-gate
+  decision (flat per-zone, optional two-level as a filed follow-up).
+- **v3 (this revision):** **major correction from SMR r1 change-4 verification.**
+  Zone ids are sparse u16 stable name-hashes over `[0, 65533]` (NOT dense
+  `[0,64)`); `MAX_ZONES=64` is a legacy eBPF-map constant, not the userspace zone
+  id space. The dense-array design (v1/v2) is RETRACTED — it would collapse
+  almost every real zone id onto bucket[0] and give no fairness. Replaced with a
+  **config-keyed sparse map** (`FastMap<u16, TokenBucket>`) owned by
+  `ForwardingState`, built from the configured zone set, with a process-global
+  `REJECT_FALLBACK_BUCKET` for unzoned/unknown ids. Updated memory (config-
+  bounded), risk (borrow from `Arc<ForwardingState>`, reset-on-commit, shared-Arc
+  verification), invariants, and open questions accordingly.
+
+## 14. Reviewer status (companion infra note)
+
+Claude SMR ran two hostile rounds (r1 → this convergence). r1 forced the three
+v2 folds AND its change-4 "verify MAX_ZONES enforcement" directive is what
+surfaced the sparse-zone-id correction (v3) — the single most important finding,
+caught by hostile self-review before any code was written.
+
+Codex + AGY companions were dispatched (agents `codex-3618-r1`, `agy-3618-r1`)
+but their results did not surface: the shared AGY job queue repeatedly returned a
+stale, unrelated `#3616` review (a known AGY result-routing infra-drop), and the
+Codex job list came back empty. Per the `/research` 2-of-3 rule
+(`feedback_codex_infra_must_retry`) this is documented as a companion infra-block;
+the verdict rests on the two hostile Claude SMR rounds. At `/engineer` time the
+implementation PR gets the full 4-way (Codex + AGY + Claude SMR + Copilot) on
+real code, which is the higher-value review surface for this change.
