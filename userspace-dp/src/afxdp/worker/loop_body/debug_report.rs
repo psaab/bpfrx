@@ -51,6 +51,9 @@ pub(super) struct DbgCounters {
     /// #1651 B3: dead-host negative-cache fast-fail count.
     pub(super) neg_neigh_fast_fail: u64,
     pub(super) policy_deny: u64,
+    /// #3610/M07: host-inbound-traffic admission denies, distinct from
+    /// `policy_deny` (transit security-policy denies).
+    pub(super) host_inbound_deny: u64,
     pub(super) ha_inactive: u64,
     pub(super) no_egress_binding: u64,
     pub(super) build_fail: u64,
@@ -101,6 +104,7 @@ impl DbgCounters {
         self.missing_neigh += dbg_poll.missing_neigh;
         self.neg_neigh_fast_fail += dbg_poll.neg_neigh_fast_fail;
         self.policy_deny += dbg_poll.policy_deny;
+        self.host_inbound_deny += dbg_poll.host_inbound_deny;
         self.ha_inactive += dbg_poll.ha_inactive;
         self.no_egress_binding += dbg_poll.no_egress_binding;
         self.build_fail += dbg_poll.build_fail;
@@ -156,7 +160,7 @@ pub(super) fn emit_periodic_report(
     let secs = elapsed as f64 / 1_000_000_000.0;
     eprintln!(
         "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
-         no_route={} miss_neigh={} neg_ff={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
+         no_route={} miss_neigh={} neg_ff={} pol_deny={} hib_deny={} ha_inact={} no_egress={} build_fail={} \
          tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
          DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
          SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} \
@@ -176,6 +180,7 @@ pub(super) fn emit_periodic_report(
         dbg.missing_neigh,
         dbg.neg_neigh_fast_fail,
         dbg.policy_deny,
+        dbg.host_inbound_deny,
         dbg.ha_inactive,
         dbg.no_egress_binding,
         dbg.build_fail,

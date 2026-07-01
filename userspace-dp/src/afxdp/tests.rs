@@ -7063,6 +7063,123 @@ fn txn_run_descriptor_with_deliveries(
     (batch, dbg)
 }
 
+/// `txn_run_descriptor` with an event stream wired so a cold-path emit (deny /
+/// filter-log / host-inbound deny) can be observed on the returned receiver.
+/// Returns the batch + debug counters AND the event handle/receiver.
+fn txn_run_descriptor_capturing_events(
+    binding: &mut BindingWorker,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> (
+    BatchCounters,
+    DebugPollCounters,
+    crate::event_stream::EventStreamWorkerHandle,
+    std::sync::mpsc::Receiver<crate::event_stream::codec::EventFrame>,
+) {
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding,
+        ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+    poll_binding_process_descriptor(
+        binding,
+        0,
+        area_ptr,
+        1,
+        sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        crate::afxdp::neighbor::monotonic_nanos(),
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+    (batch, dbg, event_handle, event_rx)
+}
+
 fn txn_flow_cache_entries(binding: &BindingWorker) -> usize {
     binding.flow.flow_cache.entries.iter().flatten().count()
 }
@@ -8730,6 +8847,89 @@ fn poll_descriptor_host_inbound_deny_counts_local_delivery_session_miss() {
         0,
         "no host-local session may be cached for a host-inbound-denied flow"
     );
+}
+
+/// #3610 fail-on-revert (session-MISS, poll loop): a host-bound packet denied by
+/// the zone host-inbound admission gate must emit a tuple-rich RT_FLOW deny event
+/// — the #3615 policy-deny event kind carried with the DISTINCT host-inbound
+/// reason (6), not just the aggregate `host_inbound_denied_packets` counter — so
+/// an operator can see WHICH control-plane flow was dropped. Remove the
+/// `emit_host_inbound_deny` call in the session-MISS host-inbound `None` arm and
+/// this goes RED (empty event channel). Also pins the #3610/M07 debug-counter
+/// split: the deny bumps `dbg.host_inbound_deny`, NOT `dbg.policy_deny`.
+#[test]
+fn poll_descriptor_host_inbound_deny_emits_tuple_event_session_miss() {
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let zone_ids: Vec<u16> = forwarding.zone_id_to_name.keys().copied().collect();
+    assert!(!zone_ids.is_empty(), "fixture must define at least one zone");
+    for id in zone_ids {
+        forwarding
+            .zone_host_inbound
+            .insert(id, crate::afxdp::types::ZoneHostInbound::default());
+    }
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+
+    let (batch, dbg, event_handle, event_rx) = txn_run_descriptor_capturing_events(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(dbg.local, 1, "packet must take the LocalDelivery arm");
+    assert_eq!(
+        batch.host_inbound_denied_packets, 1,
+        "the #3326 aggregate host-inbound deny counter must still fire"
+    );
+    // #3610/M07: the deny is accounted on its own debug counter, not policy_deny.
+    assert_eq!(
+        dbg.host_inbound_deny, 1,
+        "#3610/M07: host-inbound deny must bump dbg.host_inbound_deny"
+    );
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "#3610/M07: host-inbound deny must NOT be conflated with dbg.policy_deny"
+    );
+
+    let event = event_rx
+        .try_recv()
+        .expect("#3610: host-inbound deny must emit a tuple-rich event")
+        .decode_dataplane_event()
+        .expect("host-inbound deny payload");
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::PolicyDeny
+    );
+    // Distinct host-inbound reason (6), NOT the transit policy-deny reason (5).
+    assert_eq!(event.reason, 6, "host-inbound deny reason byte");
+    assert_eq!(event.action, 0, "host-inbound is a silent drop → DENY");
+    assert_eq!(event.protocol, PROTO_TCP);
+    assert_eq!(event.src_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)));
+    assert_eq!(event.dst_ip, IpAddr::V4(Ipv4Addr::new(10, 255, 0, 1)));
+    assert_eq!(event.src_port, 12345);
+    assert_eq!(event.dst_port, 179);
+    assert_eq!(event.ingress_ifindex, 24);
+    assert_eq!(event.policy_id, 0, "host-inbound admission is not a policy");
+    assert!(
+        event.timestamp_ns > 0,
+        "poll-path host-inbound deny event must carry a real wall-clock timestamp"
+    );
+    // Rides the policy-deny per-kind stats, not a new event channel.
+    assert_eq!(event_handle.dataplane_event_stats().policy_deny.sent, 1);
 }
 
 /// #3326 GREEN companion: with NO host-inbound restriction (admit-all default),

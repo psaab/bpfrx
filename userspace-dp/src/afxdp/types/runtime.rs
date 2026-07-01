@@ -354,6 +354,11 @@ pub(in crate::afxdp) struct DebugPollCounters {
     pub(in crate::afxdp) neg_neigh_fast_fail: u64,
     #[allow(dead_code)]
     pub(in crate::afxdp) policy_deny: u64,
+    /// #3610/M07: host-inbound-traffic admission denies, split out of
+    /// `policy_deny` so a control-plane host-inbound drop is not conflated with a
+    /// transit security-policy deny in the periodic debug report.
+    #[allow(dead_code)]
+    pub(in crate::afxdp) host_inbound_deny: u64,
     #[allow(dead_code)]
     pub(in crate::afxdp) ha_inactive: u64,
     #[allow(dead_code)]
