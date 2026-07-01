@@ -95,18 +95,24 @@ func ValidatePort(port int) error {
 
 // ParsePort parses a simulator port token supplied as an operator string (the
 // CLI surface). An empty/whitespace token means "unspecified" and returns
-// (0, nil) — the wildcard behavior, unchanged. A non-empty token must parse to
-// an integer that ValidatePort accepts ([0, MaxPort]); a malformed ("abc"),
-// negative, or >MaxPort token is REJECTED with an error so it can never
-// silently degrade to the 0 wildcard (#3116). An explicit "0" is accepted as
-// "unspecified" for parity with the gRPC int field, where proto3 cannot
-// distinguish an unset scalar from 0.
+// (0, nil) — the wildcard behavior, unchanged. A non-empty token must be a
+// canonical unsigned decimal that ValidatePort accepts ([0, MaxPort]); a
+// malformed ("abc"), signed ("+80"/"-80", #3679), or >MaxPort token is REJECTED
+// with an error so it can never silently degrade to the 0 wildcard (#3116). An
+// explicit "0" is accepted as "unspecified" for parity with the gRPC int field,
+// where proto3 cannot distinguish an unset scalar from 0.
+//
+// #3679: this diagnostic parser routes through config.ParseCanonicalUint — the
+// same canonical-form primitive the #3606 commit-time and dataplane port
+// parsers use — so a signed spelling the config grammar and dataplane now reject
+// can no longer be accepted here (a commit-vs-diagnostic split that made
+// automated policy verification green for a token the platform rejects).
 func ParsePort(s string) (int, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, nil
 	}
-	n, err := strconv.Atoi(s)
+	n, err := config.ParseCanonicalUint(s)
 	if err != nil {
 		return 0, fmt.Errorf("invalid port %q", s)
 	}
@@ -120,16 +126,22 @@ func ParsePort(s string) (int, error) {
 // into a *uint8 the simulator threads into Query.ICMPType / Query.ICMPCode. An
 // empty/whitespace token means "unspecified" and returns (nil, nil) — the
 // dimension is not constrained, the established wildcard behavior. A non-empty
-// token must parse to an integer in [0, 255] (the 8-bit ICMP type/code space);
-// a malformed, negative, or >255 token is REJECTED with an error so it can
-// never silently degrade to the nil wildcard. The pointer return distinguishes
-// "unspecified" from a valid 0 (ICMP type 0 = echo-reply, code 0 is common).
+// token must be a canonical unsigned decimal in [0, 255] (the 8-bit ICMP
+// type/code space); a malformed, signed ("+8"/"-8", #3679), or >255 token is
+// REJECTED with an error so it can never silently degrade to the nil wildcard.
+// The pointer return distinguishes "unspecified" from a valid 0 (ICMP type 0 =
+// echo-reply, code 0 is common).
+//
+// #3679: like ParsePort, this diagnostic parser routes through
+// config.ParseCanonicalUint so a signed spelling (Atoi accepted "+8" as
+// echo-request) is rejected, matching the canonical rule the commit-time and
+// dataplane parsers enforce.
 func ParseICMPValue(s string) (*uint8, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return nil, nil
 	}
-	n, err := strconv.Atoi(s)
+	n, err := config.ParseCanonicalUint(s)
 	if err != nil {
 		return nil, fmt.Errorf("invalid icmp type/code %q", s)
 	}
