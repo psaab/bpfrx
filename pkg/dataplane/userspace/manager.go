@@ -746,7 +746,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 // UpdatePolicyScheduleState republishes the userspace policy snapshot with one
 // coherent inactive-bit view. This shadows the embedded eBPF manager method;
 // scheduled userspace policies must not update the policy_rules BPF map.
-func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[string]bool) {
+func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[string]bool) error {
 	activeCopy := copyPolicySchedulerActiveState(activeState)
 
 	m.mu.Lock()
@@ -755,15 +755,21 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	m.policySchedulerActive = activeCopy
 	if cfg == nil {
 		if m.lastSnapshot == nil {
-			return
+			// #3780: no snapshot ever published — nothing to
+			// republish, and no live enforcement to go stale. The
+			// next full apply publishes the initial state. Converged.
+			return nil
 		}
 		cfg = m.lastSnapshot.Config
 	}
 	if cfg == nil || m.lastSnapshot == nil {
-		return
+		return nil
 	}
 	if m.proc == nil || m.proc.Process == nil {
-		return
+		// #3780: the helper is not running, so no snapshot is being
+		// enforced — there is no stale permit to converge. The helper
+		// restart path re-applies the last snapshot. Converged.
+		return nil
 	}
 
 	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
@@ -772,7 +778,10 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 				"protocol_err", err, "err", disarmErr)
 		}
 		slog.Warn("userspace: refusing snapshot publish to incompatible helper", "err", err)
-		return
+		// #3780: the intended new inactive-bit view was NOT applied.
+		// Report failure so the daemon retries on the next scheduler
+		// tick and surfaces the stale-enforcement metric.
+		return fmt.Errorf("userspace: refusing snapshot publish to incompatible helper: %w", err)
 	}
 	next := *m.lastSnapshot
 	nextGeneration := m.generation + 1
@@ -794,7 +803,10 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	policies, err := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeCopy, feedOverlay)
 	if err != nil {
 		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
-		return
+		// #3780: the prior snapshot is retained, which for a CLOSING
+		// window means the old permit stays live. Report failure so the
+		// transition is retried until the rebuild succeeds and converges.
+		return fmt.Errorf("userspace: policy snapshot rebuild for scheduler republish: %w", err)
 	}
 	next.Policies = policies
 	// #3261: the policies were rebuilt, so recompute the (feed-aware)
@@ -808,7 +820,8 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	books, _, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 	if err != nil {
 		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
-		return
+		// #3780: same fail-safe as the policy rebuild above — retry.
+		return fmt.Errorf("userspace: address-book rebuild for scheduler republish: %w", err)
 	}
 	next.AddressBooks = books
 
@@ -819,11 +832,17 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	// disarmBeforeUnsupportedPublishLocked). cfg is this snapshot's config.
 	if err := m.disarmBeforeUnsupportedPublishLocked(&publishSnap); err != nil {
 		slog.Warn("userspace: failed to disarm before unsupported-config policy scheduler publish", "err", err)
-		return
+		// #3780: disarm failed and the new snapshot was not published —
+		// report failure so the transition retries.
+		return fmt.Errorf("userspace: disarm before unsupported-config policy scheduler publish: %w", err)
 	}
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		slog.Warn("userspace: failed to publish policy scheduler state", "err", err)
-		return
+		// #3780: THE fail-open path from the issue. apply_snapshot did
+		// not land, so the helper keeps the OLD inactive bits — a permit
+		// past its window stays live. Report failure so the daemon
+		// retries autonomously on the next scheduler tick.
+		return fmt.Errorf("userspace: publish policy scheduler snapshot: %w", err)
 	}
 	m.logWgEndpointSetTransitionLocked(&publishSnap, "policy-scheduler")
 	m.generation = nextGeneration
@@ -838,8 +857,13 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 		m.lastSnapshotHash = h
 	}
 	if err := m.applyHelperStatusLocked(&status); err != nil {
+		// #3780: the snapshot DID land (generation bumped, lastSnapshot
+		// updated above) — the schedule transition converged. A status
+		// re-sync failure is observability only; do NOT force a retry
+		// that would churn an identical snapshot.
 		slog.Warn("userspace: failed to sync helper status after policy scheduler publish", "err", err)
 	}
+	return nil
 }
 
 // routeOverlaySnapshot returns a copy of the cached ip-monitoring

@@ -1636,5 +1636,9 @@ func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, ac
 	if _, isUserspace := d.dp.(userspaceRuntimeModeReporter); isUserspace {
 		return
 	}
-	d.updatePolicyScheduleStateLocked(cfg, activeState)
+	// #3780: initial (eBPF-path) publish rides the apply transaction; a
+	// failure here is surfaced via the same republish-failure metric so
+	// it is not silently swallowed. The retired eBPF updater always
+	// reports success, so this is a no-op there today.
+	d.recordSchedulerRepublishResult(d.updatePolicyScheduleStateLocked(cfg, activeState))
 }

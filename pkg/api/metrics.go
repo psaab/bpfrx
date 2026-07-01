@@ -131,6 +131,14 @@ type xpfCollector struct {
 	neighborPeriodicAge *prometheus.Desc
 	frrReloadDegraded   *prometheus.Desc
 
+	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
+	// republish failed and has not yet converged (stale enforcement past
+	// a schedule window: a permit still forwarding, or a scheduled block
+	// that never engaged). schedulerRepublishStale is the age of that
+	// failure streak in seconds (0 when healthy).
+	schedulerRepublishFailed *prometheus.Desc
+	schedulerRepublishStale  *prometheus.Desc
+
 	// #1799: 0/1 gauge — 1 while the running active config failed to
 	// persist to disk and the configstore's background retry has not
 	// yet succeeded (restart would load a stale config).
@@ -572,6 +580,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
+	ch <- c.schedulerRepublishFailed
+	ch <- c.schedulerRepublishStale
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -814,6 +824,23 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
 			prometheus.GaugeValue, v)
+	}
+
+	// #3780: scheduler republish-failure is a control-plane signal (the
+	// policy scheduler runs even in config-only mode) — emit it BEFORE
+	// the dataplane gate so stale enforcement past a schedule window
+	// stays visible even when the dataplane is not loaded.
+	if c.srv.schedulerRepublishFailedFn != nil {
+		v := 0.0
+		if c.srv.schedulerRepublishFailedFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.schedulerRepublishFailed,
+			prometheus.GaugeValue, v)
+	}
+	if c.srv.schedulerRepublishStaleSecondsFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.schedulerRepublishStale,
+			prometheus.GaugeValue, c.srv.schedulerRepublishStaleSecondsFn())
 	}
 
 	// #2050: dynamic-address feed staleness is a control-plane signal (the
