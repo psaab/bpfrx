@@ -414,6 +414,23 @@ SeenAt}` from ordered sources (inadyn idea #6), per configured binding:
 Selection is per-scope config: `address-source interface|dhcp|checkip`
 (default `interface`). v4 and v6 are observed and published independently.
 
+**Public-address gate — invariant across ALL Surface A sources.** Every
+address source runs its observed address through the SAME
+`ddns.IsPublicAddr` globally-routable-unicast predicate before it can be
+published, so a non-public address (RFC1918, CGNAT `100.64/10`, ULA
+`fc00::/7`, loopback, link-local, documentation, and every other IANA
+special-purpose range) is NEVER published to public DNS. The gate lives at:
+`parseCheckIPBody` (checkip, `pkg/ddns/checkip.go`), `selectInterfaceAddr`
+(interface, `pkg/daemon/daemon_ddns_surface_a.go`), and `staticUnitAddr`
+(static fallback, same file). The DHCP-lease source applies the same gate
+inline in the `AddressSourceDHCP` branch (#3732) — a WAN legitimately
+handed a CGNAT/RFC1918/ULA lease must not leak it. A non-public observation
+is treated as a DEFINITIVE "no publishable address of this family" (not a
+transient miss), so the engine WITHDRAWS any stale public record rather than
+leaving one pointing at an unroutable address — never publish a non-public
+address, never blackhole. Adding a new Surface A address source MUST route
+its observation through `ddns.IsPublicAddr` too.
+
 For **Surface B** the observation is the existing Kea-memfile lease parser
 (`pkg/dhcpserver/ddns_leases.go`) — unchanged, just emitting `ScopeKey`-
 tagged records.
