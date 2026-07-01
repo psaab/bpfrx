@@ -25563,3 +25563,36 @@ top.
     entry + dedup + INFO recovery via slog capture), pkg/api/
     metrics_host_inbound_addressless_3698_test.go (gauge emitted with dataplane
     unloaded, scoped zone absent, nil-store no-panic)
+
+## 2026-07-01 — #3724 lo0 kernel nftables mirror fail-closed hardening (M08 + M04)
+
+- **Timestamp**: 2026-07-01
+- **Action**: M08 — make the kernel lo0 nftables mirror FAIL CLOSED for an
+  unknown / unhandled non-empty terminating action. `nftRulesFromTerm` mapped
+  any non-`discard` action to nft `accept` (fail-OPEN); the Rust filter compiler
+  maps an unknown action to `FilterAction::Discard`. On a tolerant load / peer
+  session-sync / mixed-version snapshot a future action string in `term.Action`
+  would be ADMITTED by the kernel-PRIMARY lo0 chain while userspace-dp drops it —
+  a control-plane fail-open. Replaced the default-accept with a switch:
+  discard→drop, accept/""(PBR)→accept, any other non-empty→drop + slog.Warn.
+- **File(s)**: pkg/daemon/daemon_nft.go (nftRulesFromTerm terminating-verdict
+  switch), pkg/daemon/lo0_filter_test.go
+  (TestNftRuleFromTermUnknownActionFailsClosed — RED on revert)
+- **Timestamp**: 2026-07-01
+- **Action**: M04 — emit a commit WARNING for a lo0 input-filter
+  `then routing-instance` (PBR) term. It terminates as accept on the kernel
+  mirror (verdict honored) but the kernel `hook input` chain cannot perform the
+  route selection; the operator was never told. Added a routing-instance append
+  to validateLo0FilterKernelMirrorWarnings.
+- **File(s)**: pkg/config/compiler_validate_warn.go
+  (validateLo0FilterKernelMirrorWarnings), pkg/config/
+  compiler_lo0_mirror_modifiers_3445_test.go
+  (TestLo0FilterKernelMirrorRoutingInstanceWarns — RED on revert)
+- **Timestamp**: 2026-07-01
+- **Action**: Documented the fail-closed invariant + M04 warning in the daemon
+  README lo0 filter section. Left M06/M07/M09 (log rate-limit / nft counter
+  merge / log-prefix control-byte sanitize) as noted follow-ups per issue. Both
+  RED-on-revert proofs verified; go test ./pkg/dataplane/... ./pkg/daemon/
+  ./pkg/config/ green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/daemon/README.md (lo0 input filter — unknown-action
+  fail-closed invariant + routing-instance warning)

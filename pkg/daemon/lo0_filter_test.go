@@ -381,6 +381,54 @@ func TestNftRuleFromTermRejectVsDiscard(t *testing.T) {
 	}
 }
 
+// TestNftRuleFromTermUnknownActionFailsClosed pins #3724 M08: an unknown /
+// unhandled NON-EMPTY terminating action on an lo0 filter term must render to
+// nft `drop`, NOT `accept`. The kernel lo0 chain is the PRIMARY enforcement for
+// host-bound traffic (the XDP shim shunts it to the kernel before userspace),
+// and the Rust filter compiler fails an unknown action CLOSED to
+// FilterAction::Discard (userspace-dp/src/filter/compiler.rs). An unknown
+// action cannot arrive through the CLI commit path (validateFilterActionsStrict
+// / the UnknownActions capture reject it, leaving term.Action == ""), but a
+// tolerant load / peer session-sync / mixed-version snapshot can carry a
+// future action string in term.Action directly. Rendering that to nft `accept`
+// is a mixed-version control-plane fail-open — the kernel would ADMIT host-bound
+// traffic userspace-dp drops. RED on revert: the pre-#3724 default arm rendered
+// `accept` for any non-discard action, so these rows asserted the fail-open and
+// would fail once fixed; they now assert the fail-closed `drop`. The known
+// accept/discard mappings are re-asserted so the fix does not over-drop.
+func TestNftRuleFromTermUnknownActionFailsClosed(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	tests := []struct {
+		name       string
+		action     string
+		wantAction string
+	}{
+		// Known terminating actions still map correctly.
+		{"known-accept", "accept", "accept"},
+		{"known-discard", "discard", "drop"},
+		// Unknown / future action strings a mixed-version snapshot could carry.
+		// All must FAIL CLOSED to drop (mirroring Rust FilterAction::Discard),
+		// never fail open to accept.
+		{"unknown-redirect", "redirect", "drop"},
+		{"unknown-sample", "sample-and-accept", "drop"},
+		{"unknown-garbage", "frobnicate", "drop"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			term := &config.FirewallFilterTerm{
+				Name:   tt.name,
+				Action: tt.action,
+			}
+			rule := nftRule(t, term, "ip", prefixLists)
+			if rule != tt.wantAction {
+				t.Errorf("action %q: got %q, want %q (unknown must fail CLOSED to drop, #3724 M08)", tt.action, rule, tt.wantAction)
+			}
+		})
+	}
+}
+
 func TestNftRuleFromTermMultiplePorts(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 

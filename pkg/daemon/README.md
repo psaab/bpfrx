@@ -343,6 +343,21 @@ never lock an operator out of a remote box it manages.
   `TestLo0PayloadFallThroughDoesNotShadowDiscard`, and
   `TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop` (the over-drop
   counterexample).
+  **Unknown terminating action fails CLOSED (#3724 M08):** the terminating
+  verdict switch mirrors the Rust filter compiler
+  (`userspace-dp/src/filter/compiler.rs`) EXACTLY — `discard` → `drop`,
+  `accept` (and the empty-action routing-instance PBR term) → `accept`, and any
+  OTHER non-empty action → `drop`. An unknown / unhandled action cannot arrive
+  through the CLI commit path (`validateFilterActionsStrict` plus the
+  `UnknownActions` capture in `compileFilterThen` leave `term.Action == ""`), but
+  a tolerant load / peer session-sync / mixed-version snapshot can carry a future
+  action string directly in `term.Action`. The Rust compiler fails such a term
+  CLOSED to `FilterAction::Discard`; the kernel mirror — the PRIMARY host-bound
+  enforcement — MUST match, or it would ADMIT host-bound traffic userspace-dp
+  drops (a mixed-version control-plane fail-OPEN). The pre-#3724 default arm
+  rendered nft `accept` for any non-`discard` action; it now renders `drop` and
+  logs the drift. Pinned by `TestNftRuleFromTermUnknownActionFailsClosed`
+  (known accept/discard still map correctly; unknown actions render `drop`).
 
   **Non-terminating `then` modifier policy (#3445):** the kernel lo0 chain is
   the PRIMARY enforcement for host-bound traffic, so a term's non-terminating
@@ -367,6 +382,13 @@ never lock an operator out of a remote box it manages.
     stays authoritative for whatever lo0-filtered traffic actually reaches the
     XSK. `then loss-priority` is already reported globally inert by
     `validateFilterLossPriorityWarnings` (#2507), which subsumes the mirror gap.
+    **`then routing-instance` (#3724 M04):** a PBR term terminates as `accept` on
+    the kernel mirror (see the disposition bullet) — the verdict IS honored, but
+    the kernel `hook input` chain cannot perform the route selection the term
+    requests. `validateLo0FilterKernelMirrorWarnings` warns at commit that the PBR
+    route selection is silently not performed on the primary host-bound path
+    (userspace-dp stays authoritative for lo0-filtered traffic that reaches the
+    XSK). Pinned by `TestLo0FilterKernelMirrorRoutingInstanceWarns`.
   - **`reject` (#3445 H10):** faithfully mirrors the userspace reject-reply
     synthesis (`userspace-dp` `poll_descriptor/reject_reply.rs`) — a TCP RST for
     TCP, an ICMP/ICMPv6 administratively-prohibited Destination Unreachable for
