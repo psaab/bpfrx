@@ -382,7 +382,7 @@ func TestStatusViewsSurfacesPendingAndPublished(t *testing.T) {
 		TTL:    300,
 		Source: AddressSourceDHCP,
 	}
-	noObserve := func(SurfaceAScope) (AddressObservation, bool) { return AddressObservation{}, false }
+	noObserve := func(context.Context, SurfaceAScope) (AddressObservation, bool) { return AddressObservation{}, false }
 	if err := m.Reconcile(context.Background(), []SurfaceAScope{published, pending}, noObserve, nil, nil); err != nil {
 		t.Fatalf("Reconcile pending: %v", err)
 	}

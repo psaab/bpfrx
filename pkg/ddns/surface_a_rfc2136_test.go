@@ -153,7 +153,7 @@ func TestSurfaceARealBackendWithdrawOnAddressLoss(t *testing.T) {
 		t.Fatal("zone must hold the record before withdraw")
 	}
 	// Address definitively lost.
-	lost := func(SurfaceAScope) (AddressObservation, bool) {
+	lost := func(context.Context, SurfaceAScope) (AddressObservation, bool) {
 		return AddressObservation{Source: AddressSourceInterface}, true
 	}
 	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, lost, nil, catalog); err != nil {

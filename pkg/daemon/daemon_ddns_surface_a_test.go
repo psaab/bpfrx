@@ -1,11 +1,15 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -673,7 +677,7 @@ func TestSurfaceAObserverDHCPPublicGate(t *testing.T) {
 				Source: ddns.AddressSourceDHCP,
 				FQDN:   "wan.example.net",
 			}
-			obs, ok := d.surfaceAObserver(cfg)(scope)
+			obs, ok := d.surfaceAObserver(cfg)(context.Background(), scope)
 			if !ok {
 				t.Fatalf("DHCP observation must be definitive (ok=true); got ok=false")
 			}
@@ -692,5 +696,71 @@ func TestSurfaceAObserverDHCPPublicGate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSurfaceAObserverCheckIPHonorsReconcileContext is the #3736 fail-on-revert
+// proof for the checkip source: the per-probe timeout MUST derive from the
+// reconcile/pass context, not context.Background(). A checkip endpoint that
+// black-holes (accepts the connection but never responds) is probed while the
+// caller's ctx carries a short deadline. With the fix the derived context is
+// context.WithTimeout(ctx, ...), so the parent's deadline fires and the probe
+// aborts promptly (a transient miss, ok=false). Revert to
+// context.WithTimeout(context.Background(), surfaceACheckIPTimeout) and the
+// parent deadline is ignored — the probe blocks on the hung endpoint for the
+// full 10s and the bounded wait below fires t.Fatal.
+func TestSurfaceAObserverCheckIPHonorsReconcileContext(t *testing.T) {
+	// A checkip endpoint that black-holes: it accepts the request and blocks
+	// until the client cancels (the fix) or the test tears down (a revert).
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	// Cleanups run LIFO: close(done) first so any blocked handler unblocks, THEN
+	// srv.Close() (which waits for in-flight handlers) can return.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(done) })
+
+	d := &Daemon{surfaceA: ddns.NewSurfaceAManager()}
+	cfg := &config.Config{}
+	scope := ddns.SurfaceAScope{
+		Key: ddns.ScopeKey{
+			Family:    ddns.FamilyV4,
+			Interface: "ge-0/0/2",
+			Unit:      0,
+		},
+		Source: ddns.AddressSourceCheckIP,
+		FQDN:   "wan.example.net",
+		Provider: &config.DDNSProvider{
+			Name:       "corp",
+			CheckIPURL: srv.URL,
+		},
+	}
+
+	// A reconcile ctx with a short deadline; the in-flight probe must inherit it.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		obs ddns.AddressObservation
+		ok  bool
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		obs, ok := d.surfaceAObserver(cfg)(ctx, scope)
+		resCh <- result{obs, ok}
+	}()
+
+	select {
+	case r := <-resCh:
+		if r.ok {
+			t.Fatalf("a checkip probe aborted by the reconcile ctx must be a transient miss (ok=false); got ok=true addr=%v", r.obs.Addr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("checkip observer ignored the reconcile ctx deadline and blocked on the hung endpoint " +
+			"(context.Background regression, #3736)")
 	}
 }
