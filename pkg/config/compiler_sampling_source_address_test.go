@@ -2,16 +2,18 @@ package config
 
 import "testing"
 
-// #2605: in Junos/vSRX the flow-export `source-address` lives directly
-// under `forwarding-options sampling family <af> output` (a sibling of
-// flow-server) — the standard hierarchy. compileSamplingFamily
-// previously only read `source-address` NESTED inside an individual
-// flow-server (and inside inline-jflow), so an output-level
-// source-address was silently dropped (no compile error). These tests
-// drive the production flat-set path (ParseSetCommand + SetPath via
-// buildTree, never NewParser per CLAUDE.md) and assert the precedence:
-// a flow-server-nested source-address (more specific) wins over the
-// output-level default; the output-level value is the fallback.
+// #2605 + #3745: in Junos/vSRX the flow-export `source-address` lives at
+// TWO hierarchies under `forwarding-options sampling family <af> output`:
+// directly under `output` (a sibling of flow-server — the per-output
+// default, #2605) and nested inside an individual flow-server (the
+// per-collector override, #3745). These tests drive the production
+// flat-set path (ParseSetCommand + SetPath via buildTree, never
+// NewParser per CLAUDE.md) and assert that the output-level default is
+// recorded on SamplingFamily.SourceAddress while each nested override is
+// recorded PER COLLECTOR on FlowServer.SourceAddress — NOT collapsed into
+// one family-wide value (the pre-#3745 last-writer-wins bug). The
+// effective per-collector bind (nested override else family default) is
+// resolved in the flowexport manager (collectInstanceVersionCollectors).
 
 // sampleFamilyInet compiles the given set lines and returns the inet
 // SamplingFamily for instance "i1", failing the test if any layer is
@@ -55,32 +57,48 @@ func TestSamplingOutputLevelSourceAddress(t *testing.T) {
 	}
 }
 
-// TestSamplingFlowServerSourceAddressStillWorks confirms the legacy
-// flow-server-nested source-address path is unchanged.
+// TestSamplingFlowServerSourceAddressStillWorks confirms the
+// flow-server-nested source-address is tracked PER COLLECTOR on the
+// FlowServer (#3745), not collapsed into the family-wide default. With
+// only a nested source configured, the family default stays empty and
+// the per-collector FlowServer.SourceAddress carries the value.
 func TestSamplingFlowServerSourceAddressStillWorks(t *testing.T) {
 	fam := sampleFamilyInet(t, []string{
 		"set forwarding-options sampling instance i1 input rate 100",
 		"set forwarding-options sampling instance i1 family inet output flow-server 192.168.1.100 port 2055",
 		"set forwarding-options sampling instance i1 family inet output flow-server 192.168.1.100 source-address 10.0.0.2",
 	})
-	if fam.SourceAddress != "10.0.0.2" {
-		t.Errorf("flow-server-nested source-address: got %q, want 10.0.0.2", fam.SourceAddress)
+	if len(fam.FlowServers) != 1 {
+		t.Fatalf("expected one flow-server, got %+v", fam.FlowServers)
+	}
+	if fam.FlowServers[0].SourceAddress != "10.0.0.2" {
+		t.Errorf("per-collector flow-server source-address: got %q, want 10.0.0.2", fam.FlowServers[0].SourceAddress)
+	}
+	// The output-level family default is untouched by a nested source.
+	if fam.SourceAddress != "" {
+		t.Errorf("family default source-address: got %q, want empty (nested source must not collapse into it)", fam.SourceAddress)
 	}
 }
 
 // TestSamplingNestedSourceAddressWinsOverOutputDefault asserts the
 // precedence decision: when BOTH an output-level default and a
-// flow-server-nested source-address are present, the more-specific
-// flow-server-nested value wins. The assertion is order-independent —
-// the output-level line is intentionally placed AFTER the nested line.
+// flow-server-nested source-address are present, the family default is
+// recorded on SamplingFamily.SourceAddress and the more-specific nested
+// override is recorded on FlowServer.SourceAddress (#3745). The effective
+// per-collector bind (nested-wins) is resolved in the flowexport manager.
+// The assertion is order-independent — the output-level line is placed
+// AFTER the nested line on purpose.
 func TestSamplingNestedSourceAddressWinsOverOutputDefault(t *testing.T) {
 	fam := sampleFamilyInet(t, []string{
 		"set forwarding-options sampling instance i1 input rate 100",
 		"set forwarding-options sampling instance i1 family inet output flow-server 192.168.1.100 source-address 10.0.0.2",
 		"set forwarding-options sampling instance i1 family inet output source-address 10.0.0.1",
 	})
-	if fam.SourceAddress != "10.0.0.2" {
-		t.Errorf("nested-wins-over-output-default: got %q, want 10.0.0.2", fam.SourceAddress)
+	if fam.SourceAddress != "10.0.0.1" {
+		t.Errorf("output-level family default: got %q, want 10.0.0.1", fam.SourceAddress)
+	}
+	if len(fam.FlowServers) != 1 || fam.FlowServers[0].SourceAddress != "10.0.0.2" {
+		t.Errorf("per-collector nested override: got %+v, want SourceAddress 10.0.0.2", fam.FlowServers)
 	}
 }
 
@@ -129,5 +147,45 @@ func TestSamplingOutputLevelSourceAddressFeedsInlineJflow(t *testing.T) {
 	})
 	if fam2.InlineJflowSourceAddress != "10.0.0.9" {
 		t.Errorf("explicit inline-jflow source-address must win: got %q, want 10.0.0.9", fam2.InlineJflowSourceAddress)
+	}
+}
+
+// TestSamplingPerCollectorSourceAddressNotCollapsed is the #3745
+// fix-confirming RED-on-revert test: two flow-servers of the SAME family,
+// each carrying its OWN nested source-address, must each retain its own
+// source on FlowServer.SourceAddress. Before #3745 the compiler collapsed
+// both nested sources into a single family-wide SamplingFamily.SourceAddress
+// (last-writer-wins by AST order), so both collectors bound the last source.
+//
+// RED-on-revert: reverting compiler_services.go to write flowServerSrc
+// (one string) instead of per-collector fs.SourceAddress makes the two
+// FlowServer.SourceAddress values identical (empty, with the family value
+// holding the last source) and this test fails.
+func TestSamplingPerCollectorSourceAddressNotCollapsed(t *testing.T) {
+	fam := sampleFamilyInet(t, []string{
+		"set forwarding-options sampling instance i1 input rate 100",
+		"set forwarding-options sampling instance i1 family inet output flow-server 192.168.1.100 port 2055",
+		"set forwarding-options sampling instance i1 family inet output flow-server 192.168.1.100 source-address 10.0.0.2",
+		"set forwarding-options sampling instance i1 family inet output flow-server 192.168.1.200 port 2055",
+		"set forwarding-options sampling instance i1 family inet output flow-server 192.168.1.200 source-address 10.0.0.3",
+	})
+	if len(fam.FlowServers) != 2 {
+		t.Fatalf("expected two flow-servers, got %d: %+v", len(fam.FlowServers), fam.FlowServers)
+	}
+	// Index by collector address so the assertion is AST-order-independent.
+	got := map[string]string{}
+	for _, fs := range fam.FlowServers {
+		got[fs.Address] = fs.SourceAddress
+	}
+	if got["192.168.1.100"] != "10.0.0.2" {
+		t.Errorf("collector 192.168.1.100 source: got %q, want 10.0.0.2 (collapsed to family LWW before #3745)", got["192.168.1.100"])
+	}
+	if got["192.168.1.200"] != "10.0.0.3" {
+		t.Errorf("collector 192.168.1.200 source: got %q, want 10.0.0.3 (collapsed to family LWW before #3745)", got["192.168.1.200"])
+	}
+	// The family-wide default must stay empty — neither nested source
+	// leaked into it.
+	if fam.SourceAddress != "" {
+		t.Errorf("family default source-address: got %q, want empty (per-collector sources must not collapse into it)", fam.SourceAddress)
 	}
 }

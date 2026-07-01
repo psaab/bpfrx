@@ -141,6 +141,15 @@ the userspace dataplane admission boundary is in
   (`show flow-monitoring statistics`, REST `/api/v1/services/flow-exporters`,
   `xpf_flow_export_collector_*` Prometheus metrics — a collector going
   unreachable surfaces write_failures + a state-change warn, #2464).
+  Per-collector source-address bind: a `flow-server <addr> {
+  source-address <src>; }` pins THAT collector's local bind independently,
+  so two collectors of the same family can each dial with their own
+  source; a bare `source-address` under `output` is the per-output
+  default every flow-server inherits. The effective source is resolved
+  per collector, not collapsed to one family-wide value (#3745), and is
+  surfaced in every health surface (`... source <src>` in the CLI,
+  `source_address` in the REST JSON, and the `source` label on the
+  `xpf_flow_export_collector_*` metrics).
 - **Prometheus metrics** (`/metrics` endpoint).
 - **SNMP**: system + ifTable MIB.
 - **RPM probes**, dynamic address feeds.

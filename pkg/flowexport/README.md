@@ -276,11 +276,14 @@ The package is split by responsibility (#1988):
 - `transport.go` — shared collector connection management
   (`collectorConns`: dial / fan-out write / close) and the per-family
   batch accumulator (`flowBatch`) used by both exporters. `dialCollectors`
-  surfaces any `SourceAddress`/destination resolve error (a misconfigured
-  source-address is never silently dropped to an OS-chosen bind) and, on
-  any mid-loop resolve or dial failure, closes the connections opened
-  earlier in the loop before returning — no descriptor leak on partial
-  failure.
+  binds each connection to its per-collector `CollectorConfig.SourceAddress`
+  (the resolved bind — #3745), surfaces any `SourceAddress`/destination
+  resolve error (a misconfigured source-address is never silently dropped
+  to an OS-chosen bind) and, on any mid-loop resolve or dial failure,
+  closes the connections opened earlier in the loop before returning — no
+  descriptor leak on partial failure. Each `collectorConn` records its
+  `srcAddr` so the health snapshot can attribute a failure to the specific
+  source-bound connection.
 
 ## Header sequence number — v9 vs IPFIX (#2609)
 
@@ -309,9 +312,12 @@ used to be invisible — every failed UDP write in `writeAll` was
 `slog.Debug`-logged and dropped while the exporter kept counting
 "exported", so an operator got no warning that records were being lost.
 Each `collectorConn` now tracks `WriteAttempts`, `WriteFailures`,
-`LastError`/`LastErrorTime`, `LastFailureTime`, `LastSuccessTime`, and a
-`Healthy` flag (atomic counters + a mutex-guarded snapshot, race-safe
-against a concurrent status reader). The export DATA path is unchanged:
+`LastError`/`LastErrorTime`, `LastFailureTime`, `LastSuccessTime`, a
+`Healthy` flag, and the `SourceAddress` (local bind) the connection was
+dialed with (#3745 — so two same-family collectors that pin distinct
+sources are distinguishable in every surface). These are atomic counters
+plus a mutex-guarded snapshot, race-safe against a concurrent status
+reader. The export DATA path is unchanged:
 writes are still attempted to every collector and failures are still
 non-fatal — this is additive observability.
 
@@ -329,12 +335,16 @@ The snapshot is surfaced through `Exporter.CollectorHealth()` /
 `ExporterCollectorHealth`) on four surfaces:
 - **Prometheus** — `xpf_flow_export_collector_{write_attempts_total,
   write_failures_total,healthy,last_success_timestamp_seconds,
-  last_failure_timestamp_seconds}`, labeled `{protocol,collector}`
-  (emitted before the dataplane gate — exporters are control-plane).
-- **REST** — `GET /api/v1/services/flow-exporters`.
+  last_failure_timestamp_seconds}`, labeled `{protocol,collector,source}`
+  (the `source` label carries the per-collector local bind — #3745 — and
+  is `""` when the OS selected it; emitted before the dataplane gate —
+  exporters are control-plane).
+- **REST** — `GET /api/v1/services/flow-exporters` (the JSON carries
+  `source_address`, omitted when empty).
 - **gRPC / CLI show** — `show flow-monitoring statistics` (gRPC ShowText
   topic `flow-monitoring-statistics`; both the remote `cli` binary and
-  the in-daemon interactive CLI).
+  the in-daemon interactive CLI) — the collector line prints
+  `... source <src>` for a source-bound collector (#3745).
 
 ## Entry points
 
