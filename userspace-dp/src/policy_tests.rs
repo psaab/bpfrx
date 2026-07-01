@@ -4317,6 +4317,150 @@ fn icmp_skew_old_snapshot_without_type_matches_all() {
 }
 
 // ---------------------------------------------------------------------------
+// #3712 — invalid ICMP application field combinations must FAIL CLOSED at the
+// Rust snapshot boundary. The Go strict commit gate (#3348) rejects both, but
+// the tolerant load / peer-sync path downgrades to a warning, so a corrupt /
+// hand-built / older-peer-synced snapshot can still carry them here — the only
+// enforcement plane. Two combos:
+//   - icmp-code WITHOUT icmp-type (H04): `from_matches` only steers a term into
+//     icmp_constraints when icmp_type.is_some(), so a code-without-type ICMP
+//     term becomes an empty-range range_terms entry = MATCH-ALL ICMP (the code
+//     silently ignored). A permit under default-deny then fails OPEN.
+//   - icmp-type/code on a NON-ICMP protocol (H05): the term is pushed into
+//     icmp_constraints under the non-ICMP protocol (losing any dst-port), and
+//     `matches` skips that arm for a non-ICMP packet → the term NEVER matches,
+//     so a `deny` falls through to default-permit (fail OPEN).
+// ---------------------------------------------------------------------------
+
+/// Build a one-term policy rule carrying arbitrary ICMP fields on `protocol`,
+/// for the #3712 fail-closed tests. `default_permit` traffic is admitted unless
+/// a matching rule denies it; the rule's own action is passed in.
+fn icmp_fields_rule(
+    rule_id: &str,
+    protocol: &str,
+    dst_port: &str,
+    icmp_type: Option<u8>,
+    icmp_code: Option<u8>,
+    action: &str,
+) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        rule_id: rule_id.to_string(),
+        name: rule_id.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec![rule_id.to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: format!("app-{rule_id}"),
+            protocol: protocol.to_string(),
+            source_port: String::new(),
+            destination_port: dst_port.to_string(),
+            icmp_type,
+            icmp_code,
+            inactivity_timeout: None,
+        }],
+        action: action.to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn icmp_code_without_type_rejects_whole_snapshot() {
+    // H04 RED-on-revert: proto icmp, icmp_type=None, icmp_code=Some(3), permit,
+    // default deny. Pre-fix `from_matches` dropped the term into an empty-range
+    // range_terms entry (match-ALL ICMP), so parse succeeded (Ok) and a
+    // type-8/code-0 packet (which should NOT match `code 3`) was Permitted — a
+    // fail-open. The fix rejects the whole snapshot. Reverting the reject returns
+    // Ok(state) here, so this is non-tautological.
+    let store = PolicyCounterStore::default();
+    let bad = icmp_fields_rule("code-no-type", "icmp", "", None, Some(3), "permit");
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::InvalidApplicationIcmpFields {
+            rule_id,
+            application,
+            reason,
+        }) => {
+            assert_eq!(rule_id, "code-no-type");
+            assert_eq!(application, "app-code-no-type");
+            assert_eq!(reason, "icmp-code set without icmp-type");
+        }
+        other => panic!("expected InvalidApplicationIcmpFields, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_icmp_term_with_icmp_type_rejects_whole_snapshot() {
+    // H05 RED-on-revert: proto tcp, dst 80, icmp_type=Some(8), deny, default
+    // permit. Pre-fix the term was pushed into icmp_constraints under TCP (losing
+    // dst-port 80), and `matches` skipped it for a real (non-ICMP) TCP packet →
+    // the deny NEVER matched and default-permit admitted TCP/80 (a security
+    // fail-open). The fix rejects the whole snapshot. Reverting returns Ok(state),
+    // so this is non-tautological.
+    let store = PolicyCounterStore::default();
+    let bad = icmp_fields_rule("tcp-icmp-type", "tcp", "80", Some(8), None, "deny");
+    let result =
+        parse_policy_state_with_counters("permit", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::InvalidApplicationIcmpFields {
+            rule_id,
+            application,
+            reason,
+        }) => {
+            assert_eq!(rule_id, "tcp-icmp-type");
+            assert_eq!(application, "app-tcp-icmp-type");
+            assert_eq!(reason, "icmp-type/icmp-code set on a non-ICMP protocol");
+        }
+        other => panic!("expected InvalidApplicationIcmpFields, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_icmp_term_with_icmp_code_rejects_whole_snapshot() {
+    // H05 sibling: an icmp_code on a non-ICMP protocol (udp) is equally invalid
+    // and is caught by the non-ICMP-protocol arm (which fires for ANY icmp field
+    // on a non-ICMP protocol), before the code-without-type arm.
+    let store = PolicyCounterStore::default();
+    let bad = icmp_fields_rule("udp-icmp-code", "udp", "", None, Some(3), "deny");
+    let result =
+        parse_policy_state_with_counters("permit", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::InvalidApplicationIcmpFields { rule_id, reason, .. }) => {
+            assert_eq!(rule_id, "udp-icmp-code");
+            assert_eq!(reason, "icmp-type/icmp-code set on a non-ICMP protocol");
+        }
+        other => panic!("expected InvalidApplicationIcmpFields, got {other:?}"),
+    }
+}
+
+#[test]
+fn valid_icmp_type_and_code_still_compiles_and_matches() {
+    // Guard: a WELL-FORMED type+code constraint on an ICMP protocol must still
+    // compile AND honor the code (no false reject, no match-all). Rule: icmp
+    // type 3 code 1 permit, default deny.
+    let bad_free = icmp_fields_rule("dest-unreach-host", "icmp", "", Some(3), Some(1), "permit");
+    let state = parse_policy_state("deny", &[bad_free], &test_zone_name_to_id());
+    // Exact type+code → permit.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 1), PolicyAction::Permit);
+    // Same type, DIFFERENT code → must NOT match (proves code is honored, not
+    // ignored the way the H04 match-all bug ignored it) → default deny.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 2), PolicyAction::Deny);
+    // Different type → must NOT match → default deny.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Deny);
+}
+
+#[test]
+fn valid_icmpv6_type_and_code_still_compiles() {
+    // The icmpv6 protocol is equally a valid host for type/code constraints.
+    let store = PolicyCounterStore::default();
+    let good = icmp_fields_rule("v6-param", "icmpv6", "", Some(4), Some(1), "permit");
+    parse_policy_state_with_counters("deny", &[good], &test_zone_name_to_id(), &[], &store)
+        .expect("a well-formed icmpv6 type+code app must compile");
+}
+
+// ---------------------------------------------------------------------------
 // #3019: `to-zone junos-host` / `from-zone junos-host` self-traffic policy.
 // ---------------------------------------------------------------------------
 
