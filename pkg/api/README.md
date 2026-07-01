@@ -492,7 +492,16 @@ under the daemon's errgroup. Nothing else imports this package.
   rule has runtime id 0; a plain `uint32`+`omitempty` dropped it, so a
   matched-first-policy answer was indistinguishable from an unmatched one
   (both encoded as absent). The gRPC `MatchPoliciesResponse.policy_id`
-  mirror is `optional uint32` for the same reason.
+  mirror is `optional uint32` for the same reason. #3627 M06: the response
+  ALSO echoes the queried zone pair on `queried_from_zone`/`queried_to_zone`
+  on EVERY answer — positive match, no-match/default, and host-inbound — so a
+  stored JSON diagnostic for a default-deny or host-inbound verdict proves
+  which zone pair produced it without a separate copy of the request URL.
+  These are the query context and are DISTINCT from `from_zone`/`to_zone`
+  (the matched policy's declared SCOPE, #3331, set only on a positive match):
+  for a wildcard-zone or global match the two can differ. The gRPC
+  `MatchPoliciesResponse.queried_from_zone`/`queried_to_zone` (fields 13/14)
+  mirror this.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.
