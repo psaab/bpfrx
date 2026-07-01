@@ -1,3 +1,31 @@
+## 2026-07-01 — #3625 snapshot summary policy_count counts RULES, not zone-pair sets
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3625 — `SnapshotSummary.PolicyCount` was
+    `len(cfg.Security.Policies)`, the number of zone-pair policy SETS, not
+    the number of enforced policy RULES. A config with one zone-pair set
+    holding N rules reported 1, and a global-only config (rules only in
+    `cfg.Security.GlobalPolicies`) reported 0 — a field named `policy_count`
+    that silently under-counted, hiding missing policy publication and
+    weakening cross-plane audits. FIX (Go-only; the Rust
+    `SnapshotSummary.policy_count` consumes the value unchanged, no wire
+    rename): derive `PolicyCount` from `len(policies)`, the built
+    `PolicyRuleSnapshot` slice, which `walkPolicyRuleSlots` populates with
+    one entry per configured rule across every zone-pair set plus global
+    policies (matching what `show security policies` iterates). Deriving it
+    from the built slice also makes the summary count equal the object
+    count the Rust plane decodes (folds L07 snapshot-integrity). RED-on-
+    revert test `TestSnapshotSummaryPolicyCountCountsRulesNotSets` (three
+    subtests): multi-rule-per-set (revert reports 1, want 3), global-only
+    (revert reports 0, want 2), mixed sets+global (revert reports 2, want
+    4); each also asserts `PolicyCount == len(snap.Policies)`. Validation:
+    `go test ./pkg/dataplane/userspace/... ./pkg/config/...` green;
+    `go build ./pkg/... ./cmd/...`, gofmt, go vet clean. No doc update —
+    no operator/protocol doc documents the SnapshotSummary field semantics;
+    the corrected contract is pinned in-code at builder.go.
+  - **File(s)**: pkg/dataplane/userspace/builder.go,
+    pkg/dataplane/userspace/manager_test.go, _Log.md
+
 ## 2026-07-01 — #3622 appid CatalogNames nil-guards (fail-closed on tolerated config)
 
 - **Timestamp**: 2026-07-01

@@ -2255,6 +2255,94 @@ func TestBuildSnapshotSummary(t *testing.T) {
 	}
 }
 
+// TestSnapshotSummaryPolicyCountCountsRulesNotSets pins the #3625 fix:
+// Summary.PolicyCount must reflect the number of enforced policy RULES,
+// not the number of zone-pair policy SETS.
+//
+// RED-on-revert: with the pre-#3625 policyCount := len(cfg.Security.Policies)
+//   - the multi-rule-per-set case reports 1 (one zone-pair set), want 3
+//   - the global-only case reports 0 (no zone-pair sets), want 2
+//
+// The invariant also equals len(snap.Policies), so the summary count never
+// drifts from the object count the Rust dataplane decodes (L07 integrity).
+func TestSnapshotSummaryPolicyCountCountsRulesNotSets(t *testing.T) {
+	mkPol := func(name string, action config.PolicyAction) *config.Policy {
+		return &config.Policy{
+			Name: name,
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+			},
+			Action: action,
+		}
+	}
+
+	t.Run("multiple rules in one zone-pair set", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.Security.Policies = []*config.ZonePairPolicies{{
+			FromZone: "trust",
+			ToZone:   "untrust",
+			Policies: []*config.Policy{
+				mkPol("r1", config.PolicyPermit),
+				mkPol("r2", config.PolicyPermit),
+				mkPol("r3", config.PolicyDeny),
+			},
+		}}
+		snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+		if err != nil {
+			t.Fatalf("buildSnapshot: %v", err)
+		}
+		if snap.Summary.PolicyCount != 3 {
+			t.Fatalf("PolicyCount = %d, want 3 (rules, not the single zone-pair set)", snap.Summary.PolicyCount)
+		}
+		if snap.Summary.PolicyCount != len(snap.Policies) {
+			t.Fatalf("PolicyCount = %d, want == len(Policies) = %d (summary must match decoded objects)",
+				snap.Summary.PolicyCount, len(snap.Policies))
+		}
+	})
+
+	t.Run("global-only config", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.Security.GlobalPolicies = []*config.Policy{
+			mkPol("g1", config.PolicyPermit),
+			mkPol("g2", config.PolicyDeny),
+		}
+		snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+		if err != nil {
+			t.Fatalf("buildSnapshot: %v", err)
+		}
+		if snap.Summary.PolicyCount != 2 {
+			t.Fatalf("PolicyCount = %d, want 2 (global rules; zero zone-pair sets must not report 0)", snap.Summary.PolicyCount)
+		}
+		if snap.Summary.PolicyCount != len(snap.Policies) {
+			t.Fatalf("PolicyCount = %d, want == len(Policies) = %d (summary must match decoded objects)",
+				snap.Summary.PolicyCount, len(snap.Policies))
+		}
+	})
+
+	t.Run("mixed zone-pair sets and global", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.Security.Policies = []*config.ZonePairPolicies{
+			{FromZone: "trust", ToZone: "untrust", Policies: []*config.Policy{mkPol("a1", config.PolicyPermit), mkPol("a2", config.PolicyDeny)}},
+			{FromZone: "dmz", ToZone: "untrust", Policies: []*config.Policy{mkPol("b1", config.PolicyPermit)}},
+		}
+		cfg.Security.GlobalPolicies = []*config.Policy{mkPol("g1", config.PolicyDeny)}
+		snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+		if err != nil {
+			t.Fatalf("buildSnapshot: %v", err)
+		}
+		// 2 + 1 zone-pair rules + 1 global rule = 4 (not 2 zone-pair sets).
+		if snap.Summary.PolicyCount != 4 {
+			t.Fatalf("PolicyCount = %d, want 4 (2+1 zone-pair rules + 1 global)", snap.Summary.PolicyCount)
+		}
+		if snap.Summary.PolicyCount != len(snap.Policies) {
+			t.Fatalf("PolicyCount = %d, want == len(Policies) = %d (summary must match decoded objects)",
+				snap.Summary.PolicyCount, len(snap.Policies))
+		}
+	})
+}
+
 func TestBuildSourceNATSnapshotsPopulatesPoolFields(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.NAT.AddressPersistent = true

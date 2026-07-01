@@ -38,7 +38,6 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 			Userspace:     ucfg,
 		}, nil
 	}
-	policyCount := len(cfg.Security.Policies)
 	interfaces := buildInterfaceSnapshots(cfg)
 	// #2514: the address-book content-ID assignment and the policy
 	// snapshot builder (which consumes the same nameToID map) can return
@@ -116,7 +115,15 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 			DataplaneType:  cfg.System.DataplaneType,
 			InterfaceCount: len(cfg.Interfaces.Interfaces),
 			ZoneCount:      len(cfg.Security.Zones),
-			PolicyCount:    policyCount,
+			// #3625: PolicyCount is the total number of policy RULES the
+			// dataplane will enforce — one per built PolicyRuleSnapshot,
+			// spanning every zone-pair set's rules plus global policies.
+			// It was len(cfg.Security.Policies), the number of zone-pair
+			// policy SETS, so a global-only config reported 0 and a set
+			// holding N rules reported 1. Deriving it from the built
+			// `policies` slice also keeps the summary count equal to the
+			// object count the Rust plane decodes (snapshot-integrity).
+			PolicyCount:    len(policies),
 			SchedulerCount: len(cfg.Schedulers),
 			HAEnabled:      cfg.Chassis.Cluster != nil,
 		},
