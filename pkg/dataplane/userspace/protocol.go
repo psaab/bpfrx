@@ -2300,12 +2300,17 @@ type BindingStatus struct {
 	// and replies suppressed due to TX-frame budget exhaustion.
 	PolicyRejectSent uint64 `json:"policy_reject_sent,omitempty"`
 	// #2521: firewall-filter `then reject` — RST/ICMP-unreachable replies
-	// sent (mirrors PolicyRejectSent). The suppression legs (budget,
-	// output-filter, parse-error) are shared with policy reject because both
-	// run the same synthesis + #2238 classification path. omitempty + Rust
-	// serde `default` keep cross-version wire safety.
+	// sent (mirrors PolicyRejectSent). #3615 (L04/L05): the budget and
+	// output-filter suppression legs are now SPLIT by source
+	// (FilterRejectReplyBudgetDrops / FilterRejectOutputFilterDrops) so a
+	// filter-reject drop is not conflated with a policy-reject drop; the
+	// parse-error leg stays source-neutral. omitempty + Rust serde `default`
+	// keep cross-version wire safety.
 	FilterRejectSent             uint64 `json:"filter_reject_sent,omitempty"`
 	PolicyRejectReplyBudgetDrops uint64 `json:"policy_reject_reply_budget_drops,omitempty"`
+	// #3615 (L04): FILTER-`reject` reply TX-frame-budget suppression, split
+	// from PolicyRejectReplyBudgetDrops (which is now policy-reject-only).
+	FilterRejectReplyBudgetDrops uint64 `json:"filter_reject_reply_budget_drops,omitempty"`
 	// #2238: locally-generated replies (Time Exceeded, policy-reject
 	// RST/ICMP-unreachable, SYN-cookie SYN-ACK/ACK-RST) are now classified by
 	// their OWN egress 5-tuple + egress interface. An output firewall filter
@@ -2316,6 +2321,9 @@ type BindingStatus struct {
 	// (§6.2). omitempty + Rust serde `default` keep cross-version wire safety.
 	TimeExceededOutputFilterDrops uint64 `json:"time_exceeded_output_filter_drops,omitempty"`
 	PolicyRejectOutputFilterDrops uint64 `json:"policy_reject_output_filter_drops,omitempty"`
+	// #3615 (L05): FILTER-`reject` reply egress-output-filter suppression,
+	// split from PolicyRejectOutputFilterDrops (now policy-reject-only).
+	FilterRejectOutputFilterDrops uint64 `json:"filter_reject_output_filter_drops,omitempty"`
 	SYNCookieOutputFilterDrops    uint64 `json:"syn_cookie_output_filter_drops,omitempty"`
 	// #2328: egress-MTU PTB / Frag-Needed replies (#2301 PMTUD path) are now
 	// classified by the PTB's OWN egress tuple like the three siblings above,

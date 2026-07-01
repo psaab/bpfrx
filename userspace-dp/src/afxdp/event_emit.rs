@@ -137,6 +137,12 @@ pub(super) fn emit_policy_deny_event(
     policy_id: u32,
     action: PolicyAction,
     app_id: u16,
+    // #3615: the ACTUAL outcome of the reject-reply enqueue. When `action` is
+    // `Reject` but no reply was enqueued (fail-closed silent drop), the wire
+    // action is downgraded to DENY so the event never claims an active reject
+    // that was not sent. Ignored for `Deny`/`Permit` (a `deny` stays DENY even
+    // when a zone `tcp-rst` RST rode out).
+    reject_reply_enqueued: bool,
     now_ns: u64,
 ) {
     let Some(event_stream) = event_stream else {
@@ -146,7 +152,7 @@ pub(super) fn emit_policy_deny_event(
         kind: DataplaneEventKind::PolicyDeny,
         addr_family: flow.forward_key.addr_family,
         protocol: flow.forward_key.protocol,
-        action: policy_action_to_rt_flow(action),
+        action: policy_action_to_rt_flow(action, reject_reply_enqueued),
         // #3058: the 5-tuple carries the ORIGINAL (received) addresses/ports;
         // the nat_* fields below carry the TRANSLATED values — the SAME
         // convention `emit_session_close_rt_flow` follows for a permitted
@@ -381,6 +387,13 @@ pub(super) fn emit_filter_log_event(
     action: FilterAction,
     source: FilterLogSource,
     app_id: u16,
+    // #3615: the ACTUAL outcome of the reject-reply enqueue for a filter
+    // `then reject`. When `action` is `Reject` but the reply was suppressed
+    // (fail-closed silent drop) the wire action is downgraded to DENY so the
+    // filter-log never claims an active reject that was not sent. Ignored for
+    // `Accept`/`Discard`; callers on a non-reject or reply-free path (accept
+    // `then log`, cached-log replay, flowless fragment) pass `false`.
+    reject_reply_enqueued: bool,
     now_ns: u64,
 ) {
     let Some(event_stream) = event_stream else {
@@ -390,7 +403,7 @@ pub(super) fn emit_filter_log_event(
         kind: DataplaneEventKind::FilterLog,
         addr_family: flow.forward_key.addr_family,
         protocol: flow.forward_key.protocol,
-        action: filter_action_to_rt_flow(action),
+        action: filter_action_to_rt_flow(action, reject_reply_enqueued),
         src_ip: flow.src_ip,
         dst_ip: flow.dst_ip,
         src_port: flow.forward_key.src_port,
@@ -421,33 +434,44 @@ pub(super) fn emit_filter_log_event(
 }
 
 #[inline]
-fn policy_action_to_rt_flow(action: PolicyAction) -> u8 {
+fn policy_action_to_rt_flow(action: PolicyAction, reject_reply_enqueued: bool) -> u8 {
     match action {
         PolicyAction::Permit => RT_FLOW_ACTION_PERMIT,
         PolicyAction::Deny => RT_FLOW_ACTION_DENY,
-        // #2089: the policy-deny path now synthesizes a TCP RST / ICMP
-        // unreachable for `reject` (poll_descriptor reject_reply), so the
-        // RT_FLOW action reports reject, matching the wire behavior and
-        // Junos. (#2521: filter reject — filter_action_to_rt_flow below —
-        // now ALSO synthesizes an active reject reply (RST/ICMP) and maps
-        // to RT_FLOW_ACTION_REJECT, same as policy reject; filter DISCARD
-        // remains the silent-drop → deny case.)
-        PolicyAction::Reject => RT_FLOW_ACTION_REJECT,
+        // #2089: the policy-deny path synthesizes a TCP RST / ICMP
+        // unreachable for `reject` (poll_descriptor reject_reply), so a
+        // reject whose reply was ACTUALLY enqueued reports RT_FLOW_ACTION_-
+        // REJECT, matching the wire behavior and Junos.
+        //
+        // #3615: the reply can fail-close AFTER the action is decided (TX
+        // budget exhausted, reject token bucket empty, unparseable built
+        // frame, or an egress output-filter drop of the reflected reply). In
+        // that case the packet is a SILENT drop, so the truthful RT_FLOW
+        // action is DENY, not REJECT — the event must not claim an active
+        // reject was sent when it was suppressed. The caller passes the real
+        // enqueue outcome (see enqueue_deny_reply / enqueue_filter_reject_-
+        // reply), so a suppressed reject is logged as DENY.
+        PolicyAction::Reject if reject_reply_enqueued => RT_FLOW_ACTION_REJECT,
+        PolicyAction::Reject => RT_FLOW_ACTION_DENY,
     }
 }
 
 #[inline]
-fn filter_action_to_rt_flow(action: FilterAction) -> u8 {
+fn filter_action_to_rt_flow(action: FilterAction, reject_reply_enqueued: bool) -> u8 {
     match action {
         FilterAction::Accept => RT_FLOW_ACTION_PERMIT,
         FilterAction::Discard => RT_FLOW_ACTION_DENY,
-        // #2521: filter `then reject` now synthesizes an active reply (TCP
-        // RST / ICMP unreachable) via the same path as policy reject
-        // (poll_descriptor enqueue_filter_reject_reply), so RT_FLOW reports
-        // reject — matching the wire behavior and Junos, like
-        // policy_action_to_rt_flow above. `discard` stays a silent drop →
-        // deny.
-        FilterAction::Reject => RT_FLOW_ACTION_REJECT,
+        // #2521: filter `then reject` synthesizes an active reply (TCP RST /
+        // ICMP unreachable) via the same path as policy reject
+        // (poll_descriptor enqueue_filter_reject_reply). #3615: report REJECT
+        // only when the reply was actually enqueued; if it fail-closed to a
+        // silent drop (budget/rate/parse/output-filter), report the truthful
+        // DENY — honoring the FilterAction::Reject contract ("callers that
+        // cannot synthesize the reject packet ... must not log that an
+        // ICMP/RST reject was generated"). `discard` is always a silent drop
+        // → deny.
+        FilterAction::Reject if reject_reply_enqueued => RT_FLOW_ACTION_REJECT,
+        FilterAction::Reject => RT_FLOW_ACTION_DENY,
     }
 }
 
@@ -584,6 +608,7 @@ mod tests {
             101,
             PolicyAction::Deny,
             0,
+            false,
             mono_now_ns(),
         );
 
@@ -634,6 +659,7 @@ mod tests {
             crate::policy::DEFAULT_POLICY_SENTINEL_ID,
             PolicyAction::Deny,
             0,
+            false,
             mono_now_ns(),
         );
 
@@ -669,6 +695,8 @@ mod tests {
             101,
             PolicyAction::Reject,
             0,
+            // #3615: the reply WAS enqueued, so REJECT is the truthful action.
+            true,
             123,
         );
 
@@ -681,6 +709,44 @@ mod tests {
         assert_eq!(event.action, RT_FLOW_ACTION_REJECT);
         assert_eq!(event.reason, RT_FLOW_CLOSE_REASON_POLICY);
         assert_eq!(handle.dataplane_event_stats().policy_deny.sent, 1);
+    }
+
+    /// #3615 fail-on-revert: a policy `then reject` whose synthesized reply was
+    /// SUPPRESSED (fail-closed silent drop — reject_reply_enqueued=false) must
+    /// report the truthful RT_FLOW_ACTION_DENY, not REJECT. Reverting
+    /// `policy_action_to_rt_flow` to map Reject→REJECT unconditionally makes the
+    /// event claim an active reject that was never sent — RED here.
+    #[test]
+    fn policy_deny_event_emit_suppressed_reject_reports_deny() {
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            &NatDecision::default(),
+            test_meta(),
+            7,
+            9,
+            3,
+            101,
+            PolicyAction::Reject,
+            0,
+            // Reply fail-closed to a silent drop.
+            false,
+            123,
+        );
+
+        let event = rx
+            .try_recv()
+            .expect("policy event frame")
+            .decode_dataplane_event()
+            .expect("policy event payload");
+        assert_eq!(event.kind, DataplaneEventKind::PolicyDeny);
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_DENY,
+            "a suppressed reject must log DENY (silent drop), not REJECT"
+        );
     }
 
     #[test]
@@ -874,6 +940,7 @@ mod tests {
             FilterAction::Accept,
             FilterLogSource::Input,
             0,
+            false,
             mono_now_ns(),
         );
 
@@ -918,6 +985,8 @@ mod tests {
             FilterAction::Reject,
             FilterLogSource::Lo0,
             0,
+            // #3615: the reply WAS enqueued, so REJECT is the truthful action.
+            true,
             mono_now_ns(),
         );
 
@@ -932,6 +1001,45 @@ mod tests {
         assert_eq!(event.term_id, 6);
         assert_eq!(event.reason, FilterLogSource::Lo0.wire_reason());
         assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
+    }
+
+    /// #3615 fail-on-revert: a firewall-filter `then reject` whose reply was
+    /// SUPPRESSED (fail-closed — reject_reply_enqueued=false) must report the
+    /// truthful RT_FLOW_ACTION_DENY, honoring the FilterAction::Reject contract
+    /// ("must not log that an ICMP/RST reject was generated" when the reply
+    /// cannot be synthesized). Reverting `filter_action_to_rt_flow` to map
+    /// Reject→REJECT unconditionally turns this RED.
+    #[test]
+    fn filter_log_event_emit_suppressed_reject_reports_deny() {
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        emit_filter_log_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            0,
+            23,
+            6,
+            FilterAction::Reject,
+            FilterLogSource::Lo0,
+            0,
+            // Reply fail-closed to a silent drop.
+            false,
+            mono_now_ns(),
+        );
+
+        let event = rx
+            .try_recv()
+            .expect("filter event frame")
+            .decode_dataplane_event()
+            .expect("filter event payload");
+        assert_eq!(event.kind, DataplaneEventKind::FilterLog);
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_DENY,
+            "a suppressed filter reject must log DENY (silent drop), not REJECT"
+        );
     }
 
     /// #2521: `then discard` stays a silent drop → RT_FLOW DENY (the
@@ -952,6 +1060,7 @@ mod tests {
             FilterAction::Discard,
             FilterLogSource::Lo0,
             0,
+            false,
             mono_now_ns(),
         );
 
@@ -999,6 +1108,7 @@ mod tests {
             101,
             PolicyAction::Deny,
             app_id,
+            false,
             mono_now_ns(),
         );
         let deny = rx
@@ -1022,6 +1132,7 @@ mod tests {
             FilterAction::Accept,
             FilterLogSource::Input,
             app_id,
+            false,
             mono_now_ns(),
         );
         let filt = rx
@@ -1089,6 +1200,7 @@ mod tests {
             101,
             PolicyAction::Deny,
             app_id,
+            false,
             mono_now_ns(),
         );
         let event = rx
@@ -1134,6 +1246,7 @@ mod tests {
             101,
             PolicyAction::Deny,
             0,
+            false,
             mono_now_ns(),
         );
         let event = rx
@@ -1170,6 +1283,7 @@ mod tests {
             101,
             PolicyAction::Deny,
             0,
+            false,
             mono_now_ns(),
         );
         let event = rx
@@ -1209,6 +1323,7 @@ mod tests {
             101,
             PolicyAction::Deny,
             0,
+            false,
             t0,
         );
         // A strictly later monotonic instant for the second event.
@@ -1224,6 +1339,7 @@ mod tests {
             FilterAction::Accept,
             FilterLogSource::Input,
             0,
+            false,
             t1,
         );
 

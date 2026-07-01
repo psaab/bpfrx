@@ -39,8 +39,105 @@
 // side-effect ordering, counter increments, or allocation sites change.
 
 use super::*;
+use super::reject_reply::enqueue_filter_reject_reply;
+use super::worker::WorkerTxPipeline;
 use crate::afxdp::frame::term_match_extra_from_frame;
 use crate::filter::TermMatchExtra;
+
+/// #3615: a matched filter-log record whose EMISSION is deferred until AFTER
+/// the reject-reply enqueue outcome is known, so the RT_FLOW action can be
+/// downgraded REJECT→DENY when the reply fail-closed. Carries everything
+/// `emit_filter_log_event` needs beyond (event_stream, flow, meta, now_ns) —
+/// which the caller already holds. Produced by `apply_lo0_filter_action` (the
+/// lo0 host-bound filter) whose emit was previously inline; returning it lets
+/// the flow-backed caller run the reject-reply enqueue FIRST, and the flowless
+/// caller (which can synthesize no reply) emit with `reject_reply_enqueued =
+/// false`.
+#[derive(Clone, Copy)]
+pub(super) struct PendingFilterLog {
+    pub(super) ingress_zone_id: u16,
+    pub(super) egress_zone_id: u16,
+    pub(super) filter_id: u32,
+    pub(super) term_id: u32,
+    pub(super) action: crate::filter::FilterAction,
+    pub(super) source: FilterLogSource,
+    pub(super) app_id: u16,
+}
+
+/// #3615: emit a deferred filter-log record with the ACTUAL reply outcome. Used
+/// by both `filter_terminal` (flow-backed) and the flowless LocalDelivery arm
+/// (which passes `reject_reply_enqueued = false` because a fragment has no L4
+/// header to synthesize a reply from).
+#[inline]
+pub(super) fn emit_pending_filter_log(
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    log: PendingFilterLog,
+    reject_reply_enqueued: bool,
+    now_ns: u64,
+) {
+    emit_filter_log_event(
+        event_stream,
+        flow,
+        meta,
+        log.ingress_zone_id,
+        log.egress_zone_id,
+        log.filter_id,
+        log.term_id,
+        log.action,
+        log.source,
+        log.app_id,
+        reject_reply_enqueued,
+        now_ns,
+    );
+}
+
+/// #3615: run a filter terminal action's reply + log side-effects in the
+/// TRUTHFUL order — enqueue the reject reply FIRST (only for `Reject`), then
+/// emit the matched filter-log (if any) with the ACTUAL reply outcome, so a
+/// suppressed reject is logged as DENY not REJECT (honoring the
+/// `FilterAction::Reject` contract: a caller that cannot synthesize the reject
+/// packet must not log that a reject was generated). Returns `true` iff the
+/// packet must be dropped (`action != Accept`); the poll-loop caller performs
+/// the recycle / host-bound session teardown on a `true` return. An accepted
+/// flow with a `then log` term still emits (reject_reply_enqueued = false, which
+/// Accept→PERMIT ignores). Single testable seam for the poll-loop ordering (the
+/// loop body itself is un-callable) — see `filter_terminal_tests`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn filter_terminal(
+    tx_pipeline: &mut WorkerTxPipeline,
+    forwarding: &ForwardingState,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    ingress_ifindex: i32,
+    packet_frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+    counters: &mut BatchCounters,
+    action: crate::filter::FilterAction,
+    log: Option<PendingFilterLog>,
+    now_ns: u64,
+) -> bool {
+    let reject_reply_enqueued = if matches!(action, crate::filter::FilterAction::Reject) {
+        enqueue_filter_reject_reply(
+            tx_pipeline,
+            forwarding,
+            ingress_ifindex,
+            packet_frame,
+            meta,
+            flow,
+            counters,
+        )
+    } else {
+        false
+    };
+    if let Some(log) = log {
+        emit_pending_filter_log(event_stream, flow, meta, log, reject_reply_enqueued, now_ns);
+    }
+    !matches!(action, crate::filter::FilterAction::Accept)
+}
 
 #[inline]
 pub(super) fn filter_log_ingress_zone_id(
@@ -254,6 +351,12 @@ pub(super) fn emit_input_filter_log_match(
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     cached_log: CachedInputFilterLog,
+    // #3615: ACTUAL reject-reply outcome. A `then reject` input-filter term
+    // whose reply fail-closed (budget/rate/parse/output-filter) — or any
+    // reply-free path (accept `then log`, cached-log replay, flowless
+    // fragment) — passes `false` so the RT_FLOW action is downgraded
+    // REJECT→DENY and never claims an active reject that was not sent.
+    reject_reply_enqueued: bool,
     now_ns: u64,
 ) {
     emit_filter_log_event(
@@ -269,6 +372,7 @@ pub(super) fn emit_input_filter_log_match(
         // #2520: resolve the AppID via the hot-path app_catalog.lookup so the
         // filter-log RT_FLOW record carries the application, not UNKNOWN.
         resolve_flow_app_id(&forwarding.app_catalog, flow),
+        reject_reply_enqueued,
         now_ns,
     );
 }
@@ -285,7 +389,10 @@ pub(super) fn emit_cached_input_filter_log(
     let Some(cached_log) = cached_descriptor.input_filter_log else {
         return;
     };
-    emit_input_filter_log_match(forwarding, event_stream, flow, meta, cached_log, now_ns);
+    // #3615: cache-HIT replay is an established (accepted) flow's `then log`
+    // record — a rejected flow is never cached — so no reply is enqueued here
+    // and reject_reply_enqueued is false.
+    emit_input_filter_log_match(forwarding, event_stream, flow, meta, cached_log, false, now_ns);
 }
 
 #[inline]
@@ -339,6 +446,11 @@ fn emit_cached_output_filter_log_tail(
         FilterLogSource::CachedOutput,
         // #2520: AppID via the hot-path app_catalog.lookup.
         resolve_flow_app_id(&forwarding.app_catalog, flow),
+        // #3615: the TX/forward output-filter path does NOT synthesize a reject
+        // reply (that is #3608's silent-drop domain, deferred). No reply is
+        // enqueued here, so a `then reject` output-filter drop logs the truthful
+        // DENY rather than claiming an active reject was sent.
+        false,
         now_ns,
     );
 }
@@ -355,14 +467,12 @@ fn emit_cached_output_filter_log_tail(
 pub(super) fn apply_lo0_filter_action(
     forwarding: &ForwardingState,
     extra: TermMatchExtra<'_>,
-    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
-    now_ns: u64,
-) -> crate::filter::FilterAction {
+) -> (crate::filter::FilterAction, Option<PendingFilterLog>) {
     let Some(flow) = flow else {
-        return crate::filter::FilterAction::Accept;
+        return (crate::filter::FilterAction::Accept, None);
     };
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
     let result = crate::filter::evaluate_lo0_filter_counted(
@@ -377,28 +487,26 @@ pub(super) fn apply_lo0_filter_action(
         extra,
         meta.pkt_len as u64,
     );
-    if let Some(log_match) = result.log_match {
-        emit_filter_log_event(
-            event_stream,
-            flow,
+    // #3615: DEFER the filter-log emit — return the matched record so the caller
+    // can emit it AFTER the reject-reply enqueue outcome is known (flow-backed)
+    // or with reject_reply_enqueued=false (flowless). This preserves the exact
+    // emit params previously computed inline.
+    let pending = result.log_match.map(|log_match| PendingFilterLog {
+        ingress_zone_id: filter_log_ingress_zone_id(
+            forwarding,
             meta,
-            filter_log_ingress_zone_id(
-                forwarding,
-                meta,
-                ingress_zone_override,
-                meta.ingress_ifindex as i32,
-            ),
-            0,
-            log_match.filter_id,
-            log_match.term_id,
-            log_match.action,
-            FilterLogSource::Lo0,
-            // #2520: AppID via the hot-path app_catalog.lookup.
-            resolve_flow_app_id(&forwarding.app_catalog, flow),
-            now_ns,
-        );
-    }
-    result.action
+            ingress_zone_override,
+            meta.ingress_ifindex as i32,
+        ),
+        egress_zone_id: 0,
+        filter_id: log_match.filter_id,
+        term_id: log_match.term_id,
+        action: log_match.action,
+        source: FilterLogSource::Lo0,
+        // #2520: AppID via the hot-path app_catalog.lookup.
+        app_id: resolve_flow_app_id(&forwarding.app_catalog, flow),
+    });
+    (result.action, pending)
 }
 
 /// #3485: host-inbound zone admission MUST gate the lo0 (host-bound) firewall
@@ -417,10 +525,14 @@ pub(super) fn apply_lo0_filter_action(
 ///                       (no counter, no log). The caller drops the packet
 ///                       silently (no reject reply) and tears down any cached
 ///                       host-bound session.
-///   - `Some(action)` => host-inbound ADMITTED. `action` is the lo0 verdict the
-///                       caller handles exactly as before: `Accept` => deliver;
+///   - `Some((action, log))` => host-inbound ADMITTED. `action` is the lo0
+///                       verdict the caller handles: `Accept` => deliver;
 ///                       `Discard` => silent drop; `Reject` => drop + reject
-///                       reply.
+///                       reply. `log` is the matched lo0 filter-log record
+///                       (#3615), emitted by the caller AFTER the reject-reply
+///                       enqueue so the RT_FLOW action is truthful (a suppressed
+///                       reject logs DENY, not REJECT) — via `filter_terminal`
+///                       (flow-backed) or `emit_pending_filter_log` (flowless).
 ///
 /// Both LocalDelivery call sites (session-HIT and session-MISS) route through
 /// this single helper, which keeps the gate ordering unit-testable (vs two
@@ -440,12 +552,10 @@ pub(super) fn host_inbound_gated_lo0_action(
     is_v6: bool,
     icmp_first_l4_byte: u8,
     extra: TermMatchExtra<'_>,
-    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     lo0_ingress_zone_override: Option<u16>,
-    now_ns: u64,
-) -> Option<crate::filter::FilterAction> {
+) -> Option<(crate::filter::FilterAction, Option<PendingFilterLog>)> {
     // Host-inbound gate FIRST — a denied packet is a fail-closed silent drop
     // with NO lo0 side-effects (#3485). #3362: keyed by ingress interface so a
     // per-interface host-inbound override governs the check where one exists,
@@ -468,15 +578,16 @@ pub(super) fn host_inbound_gated_lo0_action(
     ) {
         return None;
     }
-    // Only an admitted packet pays the lo0 evaluation (counter + log).
+    // Only an admitted packet pays the lo0 evaluation (counter + deferred log).
+    // #3615: the lo0 filter-log is now RETURNED (as the second tuple element),
+    // not emitted here, so the caller can emit it AFTER the reject-reply
+    // enqueue outcome is known and log the truthful action.
     Some(apply_lo0_filter_action(
         forwarding,
         extra,
-        event_stream,
         Some(flow),
         meta,
         lo0_ingress_zone_override,
-        now_ns,
     ))
 }
 
@@ -594,13 +705,14 @@ mod lo0_gate_tests {
             false,
             0,
             extra(),
-            None,
             &flow,
             meta,
             Some(DENY_ZONE),
-            1_000,
         );
-        assert_eq!(action, None, "host-inbound deny must short-circuit with None");
+        assert!(
+            action.is_none(),
+            "host-inbound deny must short-circuit with None"
+        );
         assert_eq!(
             lo0_term_packets(&fw),
             0,
@@ -623,14 +735,12 @@ mod lo0_gate_tests {
             false,
             0,
             extra(),
-            None,
             &flow,
             meta,
             Some(ADMIT_ZONE),
-            1_000,
         );
         assert_eq!(
-            action,
+            action.map(|(a, _)| a),
             Some(FilterAction::Reject),
             "admitted packet runs the lo0 reject term",
         );
@@ -688,14 +798,12 @@ mod lo0_gate_tests {
             false,
             0,
             extra(),
-            None,
             &flow,
             meta,
             Some(ADMIT_ZONE),
-            1_000,
         );
-        assert_eq!(
-            action, None,
+        assert!(
+            action.is_none(),
             "VLAN logical-interface host-inbound override (deny-all) must govern \
              and deny TCP/443 — #3609",
         );
@@ -703,6 +811,319 @@ mod lo0_gate_tests {
             lo0_term_packets(&fw),
             0,
             "lo0 filter must NOT run when the logical override denies (#3609)",
+        );
+    }
+}
+
+/// #3615 M10: poll-loop-path ordering coverage for `filter_terminal` — the
+/// combining helper the lo0 reject sites call. It must enqueue the reject reply
+/// FIRST and emit the filter-log with the ACTUAL reply outcome, so a SUPPRESSED
+/// reject (budget/rate/parse/output-filter) logs the truthful DENY, not REJECT.
+/// Asserts event action + counter + TX queue length together (issue #3615 M10).
+#[cfg(test)]
+mod filter_terminal_tests {
+    use super::*;
+    use crate::ip_proto::{PROTO_ICMP, PROTO_TCP};
+    use crate::session::SessionKey;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // RT_FLOW action bytes (event_emit.rs): DENY = 0, REJECT = 2.
+    const RT_FLOW_ACTION_DENY: u8 = 0;
+    const RT_FLOW_ACTION_REJECT: u8 = 2;
+
+    fn tx_pipeline(max_pending_tx: usize, free_frames: usize) -> WorkerTxPipeline {
+        WorkerTxPipeline {
+            free_tx_frames: (0..free_frames as u64).collect(),
+            pending_tx_prepared: VecDeque::new(),
+            pending_tx_local: VecDeque::new(),
+            max_pending_tx,
+            outstanding_tx: 0,
+            pending_fill_frames: VecDeque::new(),
+            in_flight_prepared_recycles: FastMap::default(),
+            tx_submit_ns: Vec::new().into_boxed_slice(),
+        }
+    }
+
+    fn event_handle() -> (
+        crate::event_stream::EventStreamWorkerHandle,
+        std::sync::mpsc::Receiver<crate::event_stream::EventFrame>,
+    ) {
+        crate::event_stream::test_worker_handle(
+            8,
+            crate::event_stream::DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        )
+    }
+
+    fn reject_log() -> PendingFilterLog {
+        PendingFilterLog {
+            ingress_zone_id: 7,
+            egress_zone_id: 0,
+            filter_id: 23,
+            term_id: 6,
+            action: crate::filter::FilterAction::Reject,
+            source: FilterLogSource::Lo0,
+            app_id: 0,
+        }
+    }
+
+    fn v4_flow(protocol: u8) -> SessionFlow {
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        SessionFlow {
+            src_ip: src,
+            dst_ip: dst,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol,
+                src_ip: src,
+                dst_ip: dst,
+                src_port: 40000,
+                dst_port: 443,
+            },
+        }
+    }
+
+    /// TX-frame budget exhausted → the reject reply is suppressed BEFORE the
+    /// frame is ever parsed, so an empty frame is fine here.
+    #[test]
+    fn filter_terminal_budget_suppressed_reject_logs_deny() {
+        let (handle, rx) = event_handle();
+        let mut pipeline = tx_pipeline(0, 64); // zero budget => suppressed
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let flow = v4_flow(PROTO_TCP);
+        let meta = UserspaceDpMeta {
+            protocol: PROTO_TCP,
+            addr_family: libc::AF_INET as u8,
+            ..UserspaceDpMeta::default()
+        };
+        let drop = filter_terminal(
+            &mut pipeline,
+            &forwarding,
+            Some(&handle),
+            5,
+            &[],
+            meta,
+            &flow,
+            &mut counters,
+            crate::filter::FilterAction::Reject,
+            Some(reject_log()),
+            123,
+        );
+        assert!(drop, "a reject terminal action drops the packet");
+        assert!(
+            pipeline.pending_tx_local.is_empty(),
+            "no reply may be enqueued under budget exhaustion"
+        );
+        assert_eq!(counters.filter_reject_reply_budget_drops, 1);
+        assert_eq!(counters.filter_reject_sent, 0);
+        let event = rx
+            .try_recv()
+            .expect("filter-log event frame")
+            .decode_dataplane_event()
+            .expect("filter-log payload");
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_DENY,
+            "a suppressed filter reject on the poll path must log DENY, not REJECT"
+        );
+    }
+
+    /// Egress OUTPUT filter discards the reflected reply → suppressed → the
+    /// filter-log reports the truthful DENY and the FILTER-source output-filter
+    /// counter increments (not the policy sibling).
+    #[test]
+    fn filter_terminal_output_filter_suppressed_reject_logs_deny() {
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, global_bucket_test_lock, reset_bucket_for_test,
+        };
+        let _g = global_bucket_test_lock();
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+
+        // Inbound ICMP echo on ifindex 5 → the reject path builds an ICMP
+        // unreachable, which the egress output filter (discard icmp) drops.
+        let client = Ipv4Addr::new(10, 0, 61, 102);
+        let server = Ipv4Addr::new(1, 1, 1, 1);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]);
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_ICMP, 0, 0,
+        ]);
+        frame.extend_from_slice(&client.octets());
+        frame.extend_from_slice(&server.octets());
+        frame.extend_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1]); // ICMP echo
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(client),
+            dst_ip: IpAddr::V4(server),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: IpAddr::V4(client),
+                dst_ip: IpAddr::V4(server),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+        let filter_state = crate::filter::parse_filter_state(
+            &[crate::FirewallFilterSnapshot {
+                name: "drop-icmp".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "drop-icmp".into(),
+                    action: "discard".into(),
+                    protocols: vec!["icmp".into()],
+                    ..Default::default()
+                }],
+            }],
+            &[],
+            &[crate::InterfaceSnapshot {
+                name: "ge-0/0/1.0".into(),
+                ifindex: 5,
+                filter_output_v4: "drop-icmp".into(),
+                ..Default::default()
+            }],
+            "",
+            "",
+        )
+        .expect("filter state compiles");
+        let mut forwarding = ForwardingState {
+            filter_state,
+            tx_selection_enabled_v4: true,
+            ..ForwardingState::default()
+        };
+        forwarding.egress.insert(
+            5,
+            EgressInterface {
+                bind_ifindex: 5,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone_id: 0,
+                redundancy_group: 0,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
+        let (handle, rx) = event_handle();
+        let mut pipeline = tx_pipeline(4096, 4096);
+        let mut counters = BatchCounters::default();
+        let mut log = reject_log();
+        log.source = FilterLogSource::Input;
+        let drop = filter_terminal(
+            &mut pipeline,
+            &forwarding,
+            Some(&handle),
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            crate::filter::FilterAction::Reject,
+            Some(log),
+            123,
+        );
+        assert!(drop, "a reject terminal action drops the packet");
+        assert!(
+            pipeline.pending_tx_local.is_empty(),
+            "the reflected reply is discarded by the egress output filter"
+        );
+        assert_eq!(counters.filter_reject_output_filter_drops, 1);
+        assert_eq!(counters.policy_reject_output_filter_drops, 0);
+        assert_eq!(counters.filter_reject_sent, 0);
+        let event = rx
+            .try_recv()
+            .expect("filter-log event frame")
+            .decode_dataplane_event()
+            .expect("filter-log payload");
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_DENY,
+            "an output-filter-suppressed filter reject must log DENY, not REJECT"
+        );
+    }
+
+    /// GREEN companion: a TCP reject whose RST IS enqueued logs the truthful
+    /// REJECT and increments `filter_reject_sent`.
+    #[test]
+    fn filter_terminal_success_logs_reject() {
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, global_bucket_test_lock, reset_bucket_for_test,
+        };
+        let _g = global_bucket_test_lock();
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+        // A reflected TCP RST is self-contained (build_reject_rst_frame reflects
+        // the inbound frame), so a minimal SYN frame suffices.
+        let src = Ipv4Addr::new(192, 0, 2, 10);
+        let dst = Ipv4Addr::new(198, 51, 100, 20);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6, 0x08, 0x00,
+        ]);
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x28, 0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        frame.extend_from_slice(&49152u16.to_be_bytes());
+        frame.extend_from_slice(&22u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xfa, 0xf0, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 54,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x02,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = v4_flow(PROTO_TCP);
+        let (handle, rx) = event_handle();
+        let mut pipeline = tx_pipeline(4096, 4096);
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let mut log = reject_log();
+        log.source = FilterLogSource::Input;
+        let drop = filter_terminal(
+            &mut pipeline,
+            &forwarding,
+            Some(&handle),
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            crate::filter::FilterAction::Reject,
+            Some(log),
+            123,
+        );
+        assert!(drop, "a reject terminal action drops the original packet");
+        assert_eq!(counters.filter_reject_sent, 1, "the RST must be enqueued");
+        assert_eq!(pipeline.pending_tx_local.len(), 1);
+        let event = rx
+            .try_recv()
+            .expect("filter-log event frame")
+            .decode_dataplane_event()
+            .expect("filter-log payload");
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_REJECT,
+            "an enqueued filter reject must log the truthful REJECT"
         );
     }
 }
