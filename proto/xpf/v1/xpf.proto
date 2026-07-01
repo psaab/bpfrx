@@ -756,6 +756,17 @@ message MatchPoliciesResponse {
   // concrete policy match and for host_inbound_unmatched (which has no
   // default-policy fallback).
   bool default_used = 12;
+  // queried_from_zone / queried_to_zone echo the zone pair the caller ASKED
+  // about (#3627 M06). Unlike from_zone/to_zone (which carry the SCOPE of the
+  // MATCHED policy and are set only on a positive match), these are populated on
+  // EVERY response — positive match, no-match/default, and host-inbound — so a
+  // stored diagnostic for a default-deny or host-inbound verdict proves which
+  // zone pair was tested without a separate copy of the request. They are the
+  // query context, not a policy attribute; for a wildcard-zone or global match
+  // they can differ from from_zone/to_zone (the matched policy's declared
+  // scope).
+  string queried_from_zone = 13;
+  string queried_to_zone = 14;
 }
 
 // --- NAT rule counters ---

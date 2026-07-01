@@ -131,6 +131,11 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		return &pb.MatchPoliciesResponse{
 			Action:      nilRes.DisplayAction(),
 			DefaultUsed: true,
+			// #3627 M06: echo the queried zone pair even on the no-config
+			// fail-closed default deny so a stored diagnostic proves which
+			// zone pair produced the verdict.
+			QueriedFromZone: req.FromZone,
+			QueriedToZone:   req.ToZone,
 		}, nil
 	}
 
@@ -233,6 +238,11 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 			Matched:              false,
 			HostInboundUnmatched: true,
 			Action:               res.DisplayAction(),
+			// #3627 M06: echo the queried zone pair on the host-inbound path so
+			// the diagnostic names the tested zones (the host gate returns no
+			// matched-policy scope to fill from_zone/to_zone).
+			QueriedFromZone: req.FromZone,
+			QueriedToZone:   req.ToZone,
 		}, nil
 	}
 	if !res.Matched {
@@ -240,6 +250,11 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 			Matched:     false,
 			Action:      res.DisplayAction(),
 			DefaultUsed: res.DefaultUsed,
+			// #3627 M06: echo the queried zone pair on the no-match/default path
+			// so a stored default-deny diagnostic proves which zone pair was
+			// tested (from_zone/to_zone carry matched-policy scope, unset here).
+			QueriedFromZone: req.FromZone,
+			QueriedToZone:   req.ToZone,
 		}, nil
 	}
 	return &pb.MatchPoliciesResponse{
@@ -248,6 +263,12 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		Global:     res.Global,
 		FromZone:   res.FromZone,
 		ToZone:     res.ToZone,
+		// #3627 M06: also echo the queried zone pair on a positive match. It is
+		// the query context, distinct from from_zone/to_zone (the matched
+		// policy's declared scope), which can differ for a wildcard-zone or
+		// global match.
+		QueriedFromZone: req.FromZone,
+		QueriedToZone:   req.ToZone,
 		// #3623: proto3 explicit presence — set only on a match, so a matched
 		// first policy (runtime id 0) is distinguishable on the wire from an
 		// unmatched response (field absent). The two early returns above leave

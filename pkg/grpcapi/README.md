@@ -103,6 +103,17 @@ contract.
   `MatchPoliciesResult` carries the same `default_used` JSON field. The CLI
   `show security match-policies` renders its own multi-line, self-describing
   host-inbound block, so it never showed a blank verdict and is unchanged.
+- #3627 M06: the response echoes the queried zone pair on
+  `queried_from_zone`/`queried_to_zone` (proto fields 13/14) for EVERY answer —
+  positive match, no-match/default, and host-inbound. Before #3627 the queried
+  zones surfaced only indirectly via the #3331 `from_zone`/`to_zone`, which are
+  the matched policy's declared SCOPE and are set ONLY on a positive match; a
+  negative/default or host-inbound answer omitted them entirely, so a stored
+  diagnostic could not prove which zone pair was tested without a copy of the
+  request. The queried echo is the query context, DISTINCT from the matched
+  scope (for a wildcard-zone or global match the two can differ). The REST
+  `MatchPoliciesResult` carries the same `queried_from_zone`/`queried_to_zone`
+  JSON fields.
 - The `test policy` operational command (local `pkg/cli` + remote `cmd/cli`
   → ShowText `test-policy:` topic → `showTestPolicy`) carries the same
   source-port input (#3107). The topic adds a `srcport=` key alongside the
