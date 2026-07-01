@@ -431,6 +431,31 @@ leaving one pointing at an unroutable address — never publish a non-public
 address, never blackhole. Adding a new Surface A address source MUST route
 its observation through `ddns.IsPublicAddr` too.
 
+**checkip source-bind is FAIL-CLOSED — invariant (#2846 + #3733).** The
+checkip probe binds to the provider's configured source-address /
+destination-interface / routing-instance (#2846) so a multi-WAN scope's
+"what is my IP" query egresses from its OWN uplink, not the kernel default
+route. checkip is an address ORACLE: the IP it returns is published as the
+scope's A/AAAA record, so probing through the wrong egress returns a
+DIFFERENT WAN's public IP and republishes the wrong-WAN class #2846 closed.
+Therefore, when a source WAS requested but could NOT be honored, the probe
+MUST fail closed — never fall back to the default route. The gate lives in
+`ddns.CheckIPBound` (`pkg/ddns/checkip.go`): the daemon threads the
+source-bind resolution error (`SurfaceAManager.CheckIPClient`) through it,
+and a non-nil error yields `(zero, false)` — a TRANSIENT observation (no
+publish, never a withdraw), exactly like a checkip fetch miss. The gate is
+exact: `resolveProviderBindConfig` errors ONLY when a source-address is
+configured but does not parse (a source requested but unhonorable); the
+other "source unavailable" cases (address not currently assigned, dest-
+interface / VRF down) surface as a DIAL error inside `CheckIP`, which
+already returns `ok=false`. A scope with NO source configured is unchanged:
+`bindErr == nil`, so the probe uses the default route as before. The daemon
+rate-limits the fail-closed warning once per (provider, bind-error) via
+`surfaceACheckIPSourceBindWarned` so a persistent misconfig surfaces
+without flooding the per-tick observer. Fail-open to the default route
+remains acceptable for generic HTTP UPDATE backends (they carry a
+credential and target a fixed provider host); the checkip oracle does not.
+
 For **Surface B** the observation is the existing Kea-memfile lease parser
 (`pkg/dhcpserver/ddns_leases.go`) — unchanged, just emitting `ScopeKey`-
 tagged records.

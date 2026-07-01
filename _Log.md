@@ -25715,5 +25715,32 @@ top.
   docs/research/ddns-world-class/plan.md (§5.3 public-address gate invariant)
 
 - **Timestamp**: 2026-07-01
+- **Action**: (#3733) DDNS checkip source-bind FAIL-CLOSED. Residual of #2846:
+  the Surface A checkip probe is bound to the provider's configured
+  source-address/interface/VRF so a multi-WAN scope egresses from its own
+  uplink, but the daemon's bind-error branch only LOGGED the failure and STILL
+  ran the probe with the UNBOUND default client — so the query egressed via the
+  kernel default route and returned the DEFAULT WAN's public IP, which was then
+  published for the wrong scope (the wrong-WAN publication class #2846 closed).
+  checkip is an address oracle → must be fail-closed. FIX: new
+  ddns.CheckIPBound(ctx, client, url, wantV4, allowlist, bindErr) centralizes
+  the invariant — bindErr != nil (a source was requested but could not be
+  honored) returns (zero, false): a TRANSIENT observation (no publish, never a
+  withdraw), never a default-route fallback. bindErr == nil (no source
+  requested) probes exactly as before → default-route deployments unchanged.
+  The gate is exact: resolveProviderBindConfig errors ONLY on a configured but
+  unparseable source-address; the other source-unavailable cases (address not
+  assigned, dest-iface/VRF down) surface as a DIAL error inside CheckIP which
+  already returns ok=false. Daemon threads berr through CheckIPBound and
+  rate-limits the fail-closed warning once per (provider, bind-error) via a new
+  surfaceACheckIPSourceBindWarned sync.Map. RED-on-revert verified: neutering
+  the bindErr gate makes the fail-closed test publish the wrong-WAN IP
+  93.184.216.34 (test fails); no-source + honored-source paths stay green. go
+  test ./pkg/ddns/... green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/ddns/checkip.go (CheckIPBound + NewCheckIPClient doc),
+  pkg/ddns/checkip_sourcebind_failclosed_3733_test.go (RED on revert),
+  pkg/daemon/daemon.go (surfaceACheckIPSourceBindWarned field),
+  pkg/daemon/daemon_ddns_surface_a.go (fail-closed observer wiring),
+  docs/research/ddns-world-class/plan.md (§5.3 checkip fail-closed invariant)
   **Action**: cluster-setup.sh — VM SR-IOV VFs use nictype:sriov (incus-managed) instead of raw type:pci passthrough with out-of-band host-PF VLAN/trust. Fixes the 2026-07-01 loss-cluster LAN de-isolation outage (host-PF VF VLAN was set once at create and cleared on host reboot / PF reset, reverting fw0/fw1 LAN VFs to an untagged trunk → cluster host cut off from the internet). incus now re-applies vlan=3667 (LAN) + security.mac_filtering=false (WAN trunk, RETH vMAC + guest VLAN tagging) on every VM start — durable across VM reboot AND host reboot, no systemd unit / no ip-link bolt-on. Live loss cluster reconfigured + verified (both nodes, failover both directions, 15.4 Gbps WAN forwarding, host→internet 0% loss).
   **File(s)**: test/incus/cluster-setup.sh
