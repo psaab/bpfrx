@@ -58,6 +58,43 @@ Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
     (`owner_rg_for_flow(egress_ifindex)`). The default routing-instance
     (`inet.0`/`inet6.0`) case still matches default-table connected
     routes.
+  - **Local-delivery DECISION is table-scoped too (#3769).** #3151 fixed
+    the ifindex ATTRIBUTION but the membership DECISION stayed global:
+    `local_v[46]` is a global set, and it also carries NAT/DNAT external
+    targets (static-NAT external IPs + DNAT destination IPs). The
+    connected scan cannot recover the owning table for the DECISION —
+    a NAT-only IP has no connected route at all, and `ConnectedRouteV*`
+    stores the MASKED network address so `prefix.addr() == host` matches
+    only a /32/128 interface. A packet in VRF A destined to a local
+    address owned only in VRF B therefore hit the global `local_v[46]`
+    membership and short-circuited to `LocalDelivery`, bypassing the
+    VRF-A FIB + zone/policy + HA-RG owner check. The build now records
+    per-address table ownership in `local_tables_v[46]` (a `FastMap<Ip,
+    FastSet<table>>` with an insert paired to EVERY `local_v*` insert:
+    interface host addresses in `populate_interfaces`, keyed by the host
+    `.addr()`; NAT/DNAT externals in the `forwarding_build` late-stage
+    append, keyed by the rule's `from routing-instance` → canonical table
+    via `connected_route_tables`). The shortcut delivers locally ONLY
+    when the RESOLVING table is in that owning set; an address owned only
+    in another table falls through to the route lookup (VRF-A FIB). This
+    also generalizes #3151 to a single-owner interface IP (present in
+    exactly one VRF, not the same IP in both). The ifindex ATTRIBUTION
+    still uses the table-scoped connected scan (the /32-HA case).
+    **Empty-scope = wildcard:** a NAT/DNAT rule whose `from
+    routing-instance` is empty is a wildcard `scope_ok` matches against
+    ANY ingress routing-instance (and the common `from zone` / `from
+    interface` inbound-DNAT rule leaves it empty — `compiler_nat.go`).
+    Its external IP is recorded in the table-agnostic
+    `local_nat_any_table_v[46]` set (treated as owned in EVERY table by
+    the DECISION), NOT attributed to `inet.0` only — otherwise an external
+    whose zone lives in a non-default VRF would be over-isolated. Interface
+    host addresses are never wildcarded (an interface IP lives in exactly
+    one VRF).
+    **L5:** a NAT-only external target (or a non-/32 interface IP whose
+    ingress-interface resolution was bypassed) has no exact connected
+    match, so its LocalDelivery carries ifindex 0 — now reached ONLY when
+    the table genuinely owns the address, and counted by the
+    `LOCAL_DELIVERY_IFINDEX0` diagnostic atomic.
 - **ECMP: all next-hops retained, dead ones skipped (#2389), per-FLOW
   spread (#2734).** A static route keeps EVERY configured next-hop
   (`RouteEntryV4::next_hops: Vec<RouteNextHopV4>`). `select_route_next_hop`

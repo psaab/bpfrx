@@ -13,6 +13,19 @@ const DEFAULT_V4_TABLE: &str = "inet.0";
 const DEFAULT_V6_TABLE: &str = "inet6.0";
 const MAX_NEXT_TABLE_DEPTH: usize = 8;
 
+/// #3769: count of `LocalDelivery` resolutions returned with `local_ifindex ==
+/// 0` — i.e. a NAT/DNAT-only local target (no interface owns the address, so
+/// the table-scoped connected scan cannot attribute an ifindex). This is
+/// legitimate for a NAT/DNAT external IP owned in the resolving table (the NAT
+/// subsystem owns it, there is no interface), but downstream zone / security-
+/// policy / HA-RG-owner selection then operate on ifindex 0, so the count is
+/// exposed as a diagnostic. A steadily climbing value on a router with per-VRF
+/// NAT is expected; a climbing value that correlates with mis-attributed
+/// sessions is the signal to inspect. `LocalDelivery` for a genuine interface
+/// address always carries the real ifindex and does NOT bump this.
+pub(in crate::afxdp) static LOCAL_DELIVERY_IFINDEX0: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(super) fn classify_metadata(
     meta: UserspaceDpMeta,
     validation: ValidationState,
@@ -1150,23 +1163,64 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                 // connected scan by the canonical ingress table; the default
                 // routing-instance (inet.0) case still matches default-table
                 // connected routes.
-                let local_ifindex = state
-                    .connected_v4
-                    .iter()
-                    .find(|entry| entry.table == table && entry.prefix.addr() == ip)
-                    .map(|entry| entry.ifindex)
-                    .unwrap_or(0);
-                return ForwardingResolution {
-                    disposition: ForwardingDisposition::LocalDelivery,
-                    local_ifindex,
-                    egress_ifindex: local_ifindex,
-                    tx_ifindex: local_ifindex,
-                    tunnel_endpoint_id: 0,
-                    next_hop: None,
-                    neighbor_mac: None,
-                    src_mac: None,
-                    tx_vlan_id: 0,
-                };
+                // #3769: the local-delivery DECISION is now table-scoped too,
+                // not just the #3151 ifindex attribution. `local_v4` is a
+                // GLOBAL membership set, so a NAT/DNAT external IP owned in
+                // VRF B (or an interface IP owned only in another
+                // routing-instance) would otherwise short-circuit a VRF-A
+                // packet to LocalDelivery, bypassing the VRF-A FIB +
+                // zone/policy + HA-RG owner check. `local_tables_v4` records,
+                // per local address, the tables that own it (paired with every
+                // `local_v4` insert); deliver locally only when the RESOLVING
+                // table is one of them. NOTE: the membership DECISION cannot
+                // use the connected scan — `ConnectedRouteV4` stores the MASKED
+                // network address, so `prefix.addr() == host` matches only a
+                // /32 (and never a NAT-only IP, which has no connected route).
+                // #3769: an UNSCOPED NAT/DNAT external (`local_nat_any_table_v4`)
+                // is table-agnostic (mirrors `scope_ok`'s empty-instance
+                // wildcard); a named-VRF / interface address must match the
+                // resolving table exactly.
+                let owned_here = state.local_nat_any_table_v4.contains(&ip)
+                    || state
+                        .local_tables_v4
+                        .get(&ip)
+                        .is_some_and(|tables| tables.contains(&table));
+                if !owned_here {
+                    // Owned in a DIFFERENT table only (cross-VRF) — fall
+                    // through to the VRF-A route lookup instead of leaking to
+                    // LocalDelivery.
+                } else {
+                    // #3151: ifindex attribution stays via the table-scoped
+                    // connected scan (the /32-HA case). A NAT-only external IP
+                    // or a non-/32 interface host IP has no exact connected
+                    // match → ifindex 0 (unchanged pre-#3769 behaviour), now
+                    // reached only when the table genuinely owns the address.
+                    let local_ifindex = state
+                        .connected_v4
+                        .iter()
+                        .find(|entry| entry.table == table && entry.prefix.addr() == ip)
+                        .map(|entry| entry.ifindex)
+                        .unwrap_or(0);
+                    if local_ifindex == 0 {
+                        // #3769 L5: table-owned local target with no interface
+                        // ifindex (NAT-only, or a non-/32 interface IP whose
+                        // ingress-interface path was bypassed). Gated on table
+                        // ownership; counted for diagnostics.
+                        LOCAL_DELIVERY_IFINDEX0
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return ForwardingResolution {
+                        disposition: ForwardingDisposition::LocalDelivery,
+                        local_ifindex,
+                        egress_ifindex: local_ifindex,
+                        tx_ifindex: local_ifindex,
+                        tunnel_endpoint_id: 0,
+                        next_hop: None,
+                        neighbor_mac: None,
+                        src_mac: None,
+                        tx_vlan_id: 0,
+                    };
+                }
             }
             lookup_forwarding_resolution_v4(
                 state,
@@ -1185,23 +1239,49 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
             if state.local_v6.contains(&ip) {
                 // #3151: table-scoped local-delivery attribution (see the v4
                 // branch above and the #2388 route-path connected scan).
-                let local_ifindex = state
-                    .connected_v6
-                    .iter()
-                    .find(|entry| entry.table == table && entry.prefix.addr() == ip)
-                    .map(|entry| entry.ifindex)
-                    .unwrap_or(0);
-                return ForwardingResolution {
-                    disposition: ForwardingDisposition::LocalDelivery,
-                    local_ifindex,
-                    egress_ifindex: local_ifindex,
-                    tx_ifindex: local_ifindex,
-                    tunnel_endpoint_id: 0,
-                    next_hop: None,
-                    neighbor_mac: None,
-                    src_mac: None,
-                    tx_vlan_id: 0,
-                };
+                // #3769: table-scoped local-delivery DECISION (see the v4
+                // branch). A NAT/DNAT external IP owned in another VRF, or an
+                // interface IP owned only in another routing-instance, must not
+                // short-circuit a VRF-A packet to LocalDelivery. `local_v6`
+                // membership alone is global; gate on `local_tables_v6` (plus
+                // the unscoped-wildcard `local_nat_any_table_v6`, see the v4
+                // branch).
+                let owned_here = state.local_nat_any_table_v6.contains(&ip)
+                    || state
+                        .local_tables_v6
+                        .get(&ip)
+                        .is_some_and(|tables| tables.contains(&table));
+                if !owned_here {
+                    // Owned in a DIFFERENT table only (cross-VRF) — fall
+                    // through to the route lookup.
+                } else {
+                    // #3151: ifindex attribution via the table-scoped connected
+                    // scan (matches a /128 host; a NAT-only or non-/128 IP →
+                    // ifindex 0, now reached only when this table owns the IP).
+                    let local_ifindex = state
+                        .connected_v6
+                        .iter()
+                        .find(|entry| entry.table == table && entry.prefix.addr() == ip)
+                        .map(|entry| entry.ifindex)
+                        .unwrap_or(0);
+                    if local_ifindex == 0 {
+                        // #3769 L5: table-owned local target, no interface
+                        // ifindex; gated on table ownership, counted.
+                        LOCAL_DELIVERY_IFINDEX0
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return ForwardingResolution {
+                        disposition: ForwardingDisposition::LocalDelivery,
+                        local_ifindex,
+                        egress_ifindex: local_ifindex,
+                        tx_ifindex: local_ifindex,
+                        tunnel_endpoint_id: 0,
+                        next_hop: None,
+                        neighbor_mac: None,
+                        src_mac: None,
+                        tx_vlan_id: 0,
+                    };
+                }
             }
             lookup_forwarding_resolution_v6(
                 state,

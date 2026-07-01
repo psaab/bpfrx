@@ -151,6 +151,16 @@ pub(super) fn populate_interfaces(
                         state.interface_nat_v4.insert(v4.addr(), iface.ifindex);
                     } else {
                         state.local_v4.insert(v4.addr());
+                        // #3769: record the interface host address's owning
+                        // table for the table-scoped local-delivery DECISION.
+                        // Keyed by the HOST `.addr()`, NOT the (masked)
+                        // connected prefix, so a non-/32 interface IP is
+                        // recognised as locally-owned in its own VRF.
+                        state
+                            .local_tables_v4
+                            .entry(v4.addr())
+                            .or_default()
+                            .insert(connected_table_v4.clone());
                     }
                     state.connected_v4.push(ConnectedRouteV4 {
                         prefix: PrefixV4::from_net(v4),
@@ -167,6 +177,13 @@ pub(super) fn populate_interfaces(
                         state.interface_nat_v6.insert(v6.addr(), iface.ifindex);
                     } else {
                         state.local_v6.insert(v6.addr());
+                        // #3769: record the interface host address's owning
+                        // table (see the v4 arm).
+                        state
+                            .local_tables_v6
+                            .entry(v6.addr())
+                            .or_default()
+                            .insert(connected_table_v6.clone());
                     }
                     state.connected_v6.push(ConnectedRouteV6 {
                         prefix: PrefixV6::from_net(v6),

@@ -14,6 +14,46 @@ use super::*;
 pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) local_v4: FastSet<Ipv4Addr>,
     pub(in crate::afxdp) local_v6: FastSet<Ipv6Addr>,
+    /// #3769: table (VRF) attribution for the local-delivery DECISION.
+    /// `local_v4`/`local_v6` are GLOBAL membership sets ("some subsystem
+    /// answers for this IP somewhere"); before #3769 the local-delivery
+    /// shortcut in `lookup_forwarding_resolution_inner_ecmp` keyed the
+    /// DECISION on that global membership, so a packet in VRF A destined to a
+    /// local address owned only in VRF B short-circuited to `LocalDelivery`,
+    /// skipping the VRF-A FIB + zone/security-policy + HA-RG owner
+    /// classification. #3151 table-scoped only the ifindex ATTRIBUTION, and
+    /// only via the connected-route scan — which cannot recover a NAT/DNAT
+    /// external IP's owning routing-instance (no connected route) nor a
+    /// non-/32 interface host IP (`ConnectedRouteV*` stores the MASKED network
+    /// address, so `prefix.addr() == host` matches only a /32). These maps
+    /// record, for EVERY `local_v*` member (interface host address AND
+    /// static-NAT/DNAT external IP), the set of canonical route tables that
+    /// own it, so the shortcut is gated on the resolving table. Every
+    /// `local_v*` insert has a paired `local_tables_v*` / `local_nat_any_table_v*`
+    /// insert: interface addresses in `populate_interfaces` (keyed by the host
+    /// `.addr()`, not the connected prefix), NAT/DNAT externals in the
+    /// `forwarding_build` late-stage NAT append. The connected scan is still
+    /// used for the ifindex ATTRIBUTION (the #3151 /32-HA case); the membership
+    /// DECISION now uses these maps.
+    ///
+    /// A named-routing-instance NAT/DNAT rule (or an interface) records the
+    /// specific canonical table here — that is the correct cross-VRF
+    /// isolation. An UNSCOPED (`from routing-instance` empty) NAT/DNAT rule is
+    /// a WILDCARD that `scope_ok` matches against ANY ingress routing-instance
+    /// (`nat/destination.rs`, `nat/static_nat.rs`, `nat/source.rs`) — and the
+    /// common `from zone` / `from interface` inbound-DNAT rule leaves the
+    /// routing instance empty (`compiler_nat.go`). Attributing such an external
+    /// IP to `inet.0` only (via `connected_route_tables("")`) would
+    /// over-isolate it when its zone lives in a non-default VRF, so the
+    /// wildcard case goes into `local_nat_any_table_v*` instead — a
+    /// table-agnostic membership set the local-delivery DECISION treats as
+    /// owned in EVERY table, mirroring `scope_ok`'s empty-instance wildcard.
+    /// Interface host addresses are NEVER wildcarded (an interface IP genuinely
+    /// lives in exactly one VRF).
+    pub(in crate::afxdp) local_tables_v4: FastMap<Ipv4Addr, FastSet<String>>,
+    pub(in crate::afxdp) local_tables_v6: FastMap<Ipv6Addr, FastSet<String>>,
+    pub(in crate::afxdp) local_nat_any_table_v4: FastSet<Ipv4Addr>,
+    pub(in crate::afxdp) local_nat_any_table_v6: FastSet<Ipv6Addr>,
     /// #3182: EVERY configured interface address, decoupled from the
     /// NAT-aware `local_v*` exclusion. `local_v4`/`local_v6` drop the IP of
     /// any interface whose zone is an interface-mode-SNAT `to_zone`
