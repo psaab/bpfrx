@@ -1523,9 +1523,12 @@ impl CompiledApplications {
 /// answers a boolean "does this 5-tuple match the policy's app set?"). Lookup is
 /// grouped by protocol, with exact single-destination-port entries in an O(1)
 /// map and everything else (ranges, port-0/"protocol-only" entries) in a
-/// per-protocol scan list. On overlap the first matching entry wins, which is
-/// the lowest `app_id` because the Go builder emits entries in sorted-name /
-/// ascending-id order; deterministic and stable across reloads.
+/// per-protocol scan list. On overlap the winner is chosen by SPECIFICITY first
+/// (a port-constrained entry beats a bare protocol-only one), then by lowest
+/// `app_id` within a tier (#3612). Lowest id == the alphabetically-first name
+/// because the Go builder emits entries in sorted-name / ascending-id order, so
+/// the result is deterministic and stable across reloads and matches the
+/// AppID-disabled Go fallback (`resolveTupleFallback`, #2578).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AppCatalog {
     by_protocol: FxHashMap<u8, AppProtoEntries>,
@@ -1537,8 +1540,10 @@ struct AppProtoEntries {
     /// source-port constraint (the common case).
     exact_dst: FxHashMap<u16, u16>,
     /// Entries needing a scan: a port range, a source-port constraint, or no
-    /// destination-port constraint at all (port-0 protocol-only entries). Kept
-    /// in catalog order so the first (lowest-id) match wins.
+    /// destination-port constraint at all (port-0 protocol-only entries). Each
+    /// entry is tagged `port_constrained` so `lookup_directional` can rank a
+    /// port-constrained overlap above a protocol-only one before falling back to
+    /// lowest app_id within a tier (#3612).
     scan: Vec<AppScanEntry>,
 }
 
@@ -1549,6 +1554,13 @@ struct AppScanEntry {
     dst_high: u16,
     src_low: u16,
     src_high: u16,
+    /// #3612: true iff this entry carries a destination AND/OR source port
+    /// constraint (i.e. it is NOT a bare protocol-only entry). Mirrors the
+    /// AppID-disabled Go fallback's `portBased` predicate
+    /// (`resolveTupleFallback`: `DestinationPort != "" || SourcePort != ""`)
+    /// so `lookup_directional` can rank a port-constrained overlap above a
+    /// protocol-only one identically to that path.
+    port_constrained: bool,
 }
 
 impl AppCatalog {
@@ -1569,12 +1581,21 @@ impl AppCatalog {
                 // "first match wins" rule for overlapping configs.
                 bucket.exact_dst.entry(e.dst_port_low).or_insert(e.app_id);
             } else {
+                // #3612: a scan entry is port-constrained unless ALL four port
+                // bounds are zero (a bare protocol-only entry). This is the wire
+                // mirror of the Go fallback's `portBased` — a `source-port`-only
+                // app (dst (0,0), src set) is port-constrained on both sides.
+                let port_constrained = !(e.dst_port_low == 0
+                    && e.dst_port_high == 0
+                    && e.src_port_low == 0
+                    && e.src_port_high == 0);
                 bucket.scan.push(AppScanEntry {
                     app_id: e.app_id,
                     dst_low: e.dst_port_low,
                     dst_high: e.dst_port_high,
                     src_low: e.src_port_low,
                     src_high: e.src_port_high,
+                    port_constrained,
                 });
             }
         }
@@ -1625,29 +1646,60 @@ impl AppCatalog {
         // (`from_snapshot` only routes src-unconstrained single-dst entries to
         // `exact_dst`), so an exact hit needs only the service port.
         let exact = bucket.exact_dst.get(&service_port).copied();
-        // Scan entries (ranges / source-constrained / protocol-only). Catalog
-        // order = ascending id.
+        // Scan entries (ranges / source-constrained / protocol-only).
+        //
+        // #3612: resolve overlaps by SPECIFICITY TIER first — a port-constrained
+        // entry (a destination and/or source port constraint) outranks a bare
+        // protocol-only entry — then by lowest app_id WITHIN a tier. This is the
+        // exact binary-specificity rule the AppID-disabled Go fallback already
+        // uses (`resolveTupleFallback`, #2578: `portBased` beats protocol-only,
+        // ties broken by name == lowest id in sorted-name order), so the same
+        // 5-tuple resolves to the same application label whether AppID is ON
+        // (this catalog) or OFF (the Go fallback). `exact_dst` entries are always
+        // port-constrained, so they participate in the port-constrained tier.
+        //
+        // Before #3612 the final tiebreak was a flat `exact.min(scan_hit)` —
+        // lowest app_id regardless of tier. Because ids are assigned in
+        // sorted-name order, that meant the alphabetically-first name won an
+        // overlap, letting a broad protocol-only `aaa-tcp` shadow a specific
+        // `zzz-https` on tcp/443. Within a single tier the result is unchanged
+        // (still the lowest id), so this is strictly additive for same-tier
+        // configs.
         let in_range = |low: u16, high: u16, p: u16| -> bool {
             // (0,0) means "no constraint".
             (low == 0 && high == 0) || (p >= low && p <= high)
         };
-        let mut scan_hit: Option<u16> = None;
+        let mut port_scan_hit: Option<u16> = None;
+        let mut proto_only_scan_hit: Option<u16> = None;
         for s in &bucket.scan {
             // Destination constraint is matched against the service slot and
             // the source constraint against the client slot — directional, no
             // cross-slot probing.
             let dst_ok = in_range(s.dst_low, s.dst_high, service_port);
             let src_ok = in_range(s.src_low, s.src_high, client_port);
-            if dst_ok && src_ok {
-                scan_hit = Some(s.app_id);
-                break;
+            if !(dst_ok && src_ok) {
+                continue;
             }
+            let slot = if s.port_constrained {
+                &mut port_scan_hit
+            } else {
+                &mut proto_only_scan_hit
+            };
+            // Keep the lowest app_id per tier. The Go builder emits entries in
+            // ascending-id order, but taking the min makes the tiebreak
+            // independent of scan order.
+            *slot = Some(slot.map_or(s.app_id, |cur| cur.min(s.app_id)));
         }
-        match (exact, scan_hit) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => 0,
-        }
+        // Port-constrained tier wins: combine the always-port-constrained exact
+        // hit with the port-constrained scan hit and take the lowest id. Fall
+        // back to the protocol-only tier only when no port-constrained entry
+        // matched the flow.
+        let port_based = match (exact, port_scan_hit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        port_based.or(proto_only_scan_hit).unwrap_or(0)
     }
 
     /// Forward-keyed convenience wrapper: the service port is the destination.

@@ -63,12 +63,28 @@ upfront what they're getting and not getting.
    catalog is compiled into `ForwardingState.app_catalog`
    (`AppCatalog` in `userspace-dp/src/policy.rs`). When a worker
    creates a new session (`poll_descriptor`), it calls
-   `AppCatalog::lookup(protocol, src_port, dst_port)` and the
-   resolved `app_id` (0 = no match) is stamped on the conntrack
-   session value in `publish_conntrack.rs` (previously hardcoded
-   to 0). The well-known service port is probed on both the src
-   and dst slot so the forward and reverse conntrack entries
-   resolve to the same `app_id`. **Note**: only the local
+   `AppCatalog::lookup_directional(protocol, src_port, dst_port,
+   is_reverse)` and the resolved `app_id` (0 = no match) is stamped
+   on the conntrack session value in `publish_conntrack.rs`
+   (previously hardcoded to 0). The well-known service port is the
+   DESTINATION on a forward-keyed flow and the SOURCE on a
+   reverse-keyed flow (`is_reverse` selects the slot, #3321), so the
+   forward and reverse conntrack entries resolve to the same
+   `app_id` without cross-slot probing. **Overlap precedence
+   (#3612):** when more than one catalogued app matches a tuple, the
+   winner is the more SPECIFIC one — a port-constrained entry
+   (destination and/or source port set) beats a bare protocol-only
+   entry — with ties broken by the lowest `app_id` (==
+   alphabetically-first name) within a tier. This is the SAME
+   binary-specificity rule the AppID-DISABLED Go fallback uses
+   (`resolveTupleFallback`, #2578), so the same 5-tuple is labeled
+   identically whether AppID is on or off; the shared fixture
+   `userspace-dp/tests/fixtures/appid_precedence_v1.json` pins the
+   two paths together (Go `TestAppIDPrecedenceParityFixture` + Rust
+   `app_catalog_precedence_parity_fixture`). Before #3612 the enabled
+   path tie-broke on lowest `app_id` regardless of specificity, so a
+   broad protocol-only app could shadow a specific port-based app on
+   the enabled path only. **Note**: only the local
    session-owner stamps `app_id` in the conntrack map (the same
    property as `alg_type`); an HA-synced session on the standby
    peer is not mirrored into the conntrack map, and a session

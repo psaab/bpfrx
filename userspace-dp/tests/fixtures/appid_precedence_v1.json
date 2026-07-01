@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "description": "Cross-language AppID application-label precedence parity fixture (#3612). Each case is resolved by BOTH the AppID-ENABLED Rust catalog (AppCatalog::lookup_directional in userspace-dp/src/policy.rs) and the AppID-DISABLED Go fallback (resolveTupleFallback in pkg/appid/runtime.go); both MUST agree on the resolved application NAME so the same 5-tuple is labeled identically regardless of the services.application-identification knob. The fixture is self-describing: `apps` is the operator config form (user apps ONLY, per the #3612 plan scope note S1 — do not add a predefined-only app), `catalog` is the expanded (app_id, protocol, port-range) rows appid.BuildCatalog assigns in sorted-name order (the Go test asserts BuildCatalog reproduces these ids so the Rust side does not re-implement the Go sort; a sort bug cannot hide identically in both sides), and `tuple` is a FORWARD-keyed session (is_reverse=false — the Go fallback has no reverse-direction model; reverse handling is the deferred S2 adjacency). expected_app_id 0 / expected_name \"\" means UNKNOWN (no match). Regenerate the Rust view via the code; this JSON is the single source of truth.",
+  "cases": [
+    {
+      "name": "protocol_only_loses_to_exact_port",
+      "note": "The canonical #3612 divergence: a broad protocol-only app (aaa-tcp, lowest id) must NOT shadow a specific dst-port app (zzz-https) on tcp/443. Pre-fix the ENABLED catalog returned the lowest id (aaa-tcp); the DISABLED fallback returned zzz-https. RED-on-revert.",
+      "apps": [
+        {"name": "aaa-tcp", "protocol": "tcp", "destination_port": "", "source_port": ""},
+        {"name": "zzz-https", "protocol": "tcp", "destination_port": "443", "source_port": ""}
+      ],
+      "catalog": [
+        {"name": "aaa-tcp", "app_id": 1, "protocol": 6, "dst_port_low": 0, "dst_port_high": 0, "src_port_low": 0, "src_port_high": 0},
+        {"name": "zzz-https", "app_id": 2, "protocol": 6, "dst_port_low": 443, "dst_port_high": 443, "src_port_low": 0, "src_port_high": 0}
+      ],
+      "tuple": {"protocol": 6, "src_port": 51000, "dst_port": 443, "is_reverse": false},
+      "expected_app_id": 2,
+      "expected_name": "zzz-https"
+    },
+    {
+      "name": "protocol_only_loses_to_range",
+      "note": "A port-RANGE app (mmm-range, higher id) beats a protocol-only app (aaa-any, lower id) on a port inside the range. RED-on-revert (lowest id would pick aaa-any).",
+      "apps": [
+        {"name": "aaa-any", "protocol": "tcp", "destination_port": "", "source_port": ""},
+        {"name": "mmm-range", "protocol": "tcp", "destination_port": "9000-9100", "source_port": ""}
+      ],
+      "catalog": [
+        {"name": "aaa-any", "app_id": 1, "protocol": 6, "dst_port_low": 0, "dst_port_high": 0, "src_port_low": 0, "src_port_high": 0},
+        {"name": "mmm-range", "app_id": 2, "protocol": 6, "dst_port_low": 9000, "dst_port_high": 9100, "src_port_low": 0, "src_port_high": 0}
+      ],
+      "tuple": {"protocol": 6, "src_port": 40000, "dst_port": 9050, "is_reverse": false},
+      "expected_app_id": 2,
+      "expected_name": "mmm-range"
+    },
+    {
+      "name": "same_tier_lowest_id_wins",
+      "note": "Both matches are port-constrained (a range aaa-range in the scan list AND an exact-port zzz-exact in the O(1) map). Within a tier the lowest id (== alphabetically-first name) still wins in BOTH paths — this proves the fix is strictly additive for same-tier overlaps (NOT red-on-revert).",
+      "apps": [
+        {"name": "aaa-range", "protocol": "tcp", "destination_port": "8000-8100", "source_port": ""},
+        {"name": "zzz-exact", "protocol": "tcp", "destination_port": "8050", "source_port": ""}
+      ],
+      "catalog": [
+        {"name": "aaa-range", "app_id": 1, "protocol": 6, "dst_port_low": 8000, "dst_port_high": 8100, "src_port_low": 0, "src_port_high": 0},
+        {"name": "zzz-exact", "app_id": 2, "protocol": 6, "dst_port_low": 8050, "dst_port_high": 8050, "src_port_low": 0, "src_port_high": 0}
+      ],
+      "tuple": {"protocol": 6, "src_port": 40000, "dst_port": 8050, "is_reverse": false},
+      "expected_app_id": 1,
+      "expected_name": "aaa-range"
+    },
+    {
+      "name": "src_port_only_is_port_constrained",
+      "note": "A source-port-only app (zzz-srcport, dst unconstrained) is port-constrained on both sides and beats a protocol-only sibling (aaa-proto, lower id) for a flow whose client source port matches. RED-on-revert (lowest id would pick aaa-proto).",
+      "apps": [
+        {"name": "aaa-proto", "protocol": "tcp", "destination_port": "", "source_port": ""},
+        {"name": "zzz-srcport", "protocol": "tcp", "destination_port": "", "source_port": "5000"}
+      ],
+      "catalog": [
+        {"name": "aaa-proto", "app_id": 1, "protocol": 6, "dst_port_low": 0, "dst_port_high": 0, "src_port_low": 0, "src_port_high": 0},
+        {"name": "zzz-srcport", "app_id": 2, "protocol": 6, "dst_port_low": 0, "dst_port_high": 0, "src_port_low": 5000, "src_port_high": 5000}
+      ],
+      "tuple": {"protocol": 6, "src_port": 5000, "dst_port": 80, "is_reverse": false},
+      "expected_app_id": 2,
+      "expected_name": "zzz-srcport"
+    },
+    {
+      "name": "single_exact_match",
+      "note": "No overlap sanity: only aaa-http matches tcp/80.",
+      "apps": [
+        {"name": "aaa-http", "protocol": "tcp", "destination_port": "80", "source_port": ""},
+        {"name": "bbb-ssh", "protocol": "tcp", "destination_port": "22", "source_port": ""}
+      ],
+      "catalog": [
+        {"name": "aaa-http", "app_id": 1, "protocol": 6, "dst_port_low": 80, "dst_port_high": 80, "src_port_low": 0, "src_port_high": 0},
+        {"name": "bbb-ssh", "app_id": 2, "protocol": 6, "dst_port_low": 22, "dst_port_high": 22, "src_port_low": 0, "src_port_high": 0}
+      ],
+      "tuple": {"protocol": 6, "src_port": 40000, "dst_port": 80, "is_reverse": false},
+      "expected_app_id": 1,
+      "expected_name": "aaa-http"
+    },
+    {
+      "name": "no_match_resolves_unknown",
+      "note": "No user app matches tcp/4321 (4321 is deliberately absent from the Go builtinFallbacks table — the S1 predefined-vs-builtin set gap is out of scope), so both paths resolve UNKNOWN (id 0 / empty name).",
+      "apps": [
+        {"name": "aaa-http", "protocol": "tcp", "destination_port": "80", "source_port": ""}
+      ],
+      "catalog": [
+        {"name": "aaa-http", "app_id": 1, "protocol": 6, "dst_port_low": 80, "dst_port_high": 80, "src_port_low": 0, "src_port_high": 0}
+      ],
+      "tuple": {"protocol": 6, "src_port": 40000, "dst_port": 4321, "is_reverse": false},
+      "expected_app_id": 0,
+      "expected_name": ""
+    }
+  ]
+}

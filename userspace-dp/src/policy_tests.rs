@@ -3638,17 +3638,96 @@ fn app_catalog_skips_zero_app_id() {
     assert_eq!(cat.lookup_forward(6, 51000, 443), 0);
 }
 
-// Overlapping entries: first/lowest app_id wins, deterministically (the Go
-// builder emits ascending ids in sorted-name order).
+// Overlapping entries WITHIN THE SAME specificity tier: the lowest app_id wins,
+// deterministically (the Go builder emits ascending ids in sorted-name order).
+// #3612 changed only the CROSS-tier tiebreak (port-constrained beats
+// protocol-only); same-tier overlaps are byte-identical to before — both cases
+// here are all-port-constrained, so they must stay green.
 #[test]
 fn app_catalog_overlap_lowest_id_wins() {
-    // Two apps both claiming tcp/80 — exact-port path.
+    // Two apps both claiming tcp/80 — exact-port path (both port-constrained).
     let cat = AppCatalog::from_snapshot(&[cat_entry(5, 6, 80, 80), cat_entry(11, 6, 80, 80)]);
     assert_eq!(cat.lookup_forward(6, 40000, 80), 5);
 
-    // Range vs exact overlap — lowest id still wins.
+    // Range vs exact overlap — both port-constrained, so lowest id still wins.
     let cat = AppCatalog::from_snapshot(&[cat_entry(2, 6, 8000, 8100), cat_entry(20, 6, 8050, 8050)]);
     assert_eq!(cat.lookup_forward(6, 40000, 8050), 2);
+}
+
+// #3612: the ENABLED catalog must rank a PORT-CONSTRAINED overlap ABOVE a bare
+// protocol-only one, even when the protocol-only app has the LOWER app_id (==
+// alphabetically-first name). Before the fix the final tiebreak was a flat
+// `exact.min(scan_hit)` (lowest id regardless of tier), so a broad protocol-only
+// `aaa-tcp` (id 1) shadowed a specific `zzz-https` (id 2) on tcp/443 — diverging
+// from the AppID-disabled Go fallback, which prefers the specific app (#2578).
+// Reverting the tier split to lowest-id makes each assertion return the
+// protocol-only id and fails this test.
+#[test]
+fn app_catalog_prefers_port_constrained_over_protocol_only() {
+    // protocol-only id 1 (tcp, no ports) + exact dst-port id 2 (tcp/443).
+    let cat = AppCatalog::from_snapshot(&[cat_entry(1, 6, 0, 0), cat_entry(2, 6, 443, 443)]);
+    assert_eq!(
+        cat.lookup_forward(6, 51000, 443),
+        2,
+        "exact dst-port app (id 2) must beat the protocol-only app (id 1) on tcp/443"
+    );
+    // A tcp flow to a NON-catalogued port still falls back to the protocol-only
+    // app (nothing port-constrained matches).
+    assert_eq!(
+        cat.lookup_forward(6, 51000, 8888),
+        1,
+        "protocol-only app resolves when no port-constrained entry matches"
+    );
+
+    // protocol-only id 1 + port-RANGE id 3 (both live in the scan list). The
+    // range is port-constrained, so it wins on a port inside the range despite
+    // the higher id.
+    let cat = AppCatalog::from_snapshot(&[cat_entry(1, 6, 0, 0), cat_entry(3, 6, 9000, 9100)]);
+    assert_eq!(
+        cat.lookup_forward(6, 40000, 9050),
+        3,
+        "port-range app (id 3) must beat the protocol-only app (id 1) inside the range"
+    );
+    assert_eq!(
+        cat.lookup_forward(6, 40000, 12345),
+        1,
+        "outside the range only the protocol-only app matches"
+    );
+}
+
+// #3612: a `source-port`-only app (destination unconstrained, source port set)
+// is PORT-CONSTRAINED on both the Rust and Go sides — its `port_constrained`
+// predicate mirrors the Go fallback's `portBased`
+// (`DestinationPort != "" || SourcePort != ""`). It must therefore beat a
+// protocol-only sibling with a lower id when the flow's client source port
+// matches. Reverting the tier split returns the protocol-only id.
+#[test]
+fn app_catalog_src_port_only_is_port_constrained() {
+    let cat = AppCatalog::from_snapshot(&[
+        cat_entry(1, 6, 0, 0), // protocol-only tcp
+        crate::AppCatalogEntry {
+            app_id: 2,
+            protocol: 6,
+            dst_port_low: 0,
+            dst_port_high: 0,
+            src_port_low: 5000,
+            src_port_high: 5000,
+        },
+    ]);
+    // Forward flow: client src=5000 (matches the source-port constraint), any
+    // dst. The source-port-only app (id 2) wins over the protocol-only app.
+    assert_eq!(
+        cat.lookup_forward(6, 5000, 80),
+        2,
+        "source-port-only app (id 2) is port-constrained and beats protocol-only (id 1)"
+    );
+    // A flow whose client source port does NOT match the constraint falls back
+    // to the protocol-only app.
+    assert_eq!(
+        cat.lookup_forward(6, 6000, 80),
+        1,
+        "non-matching source port falls back to the protocol-only app"
+    );
 }
 
 #[test]
@@ -3656,6 +3735,96 @@ fn app_catalog_empty_resolves_unknown() {
     let cat = AppCatalog::default();
     assert!(cat.is_empty());
     assert_eq!(cat.lookup_forward(6, 51000, 443), 0);
+}
+
+// #3612: cross-language precedence PARITY. This is the Rust half of the shared
+// fixture (`userspace-dp/tests/fixtures/appid_precedence_v1.json`); the Go half
+// is `pkg/appid.TestAppIDPrecedenceParityFixture`, which drives
+// `resolveTupleFallback` (the AppID-DISABLED path) over the SAME cases and
+// asserts the SAME expected name. This side drives the AppID-ENABLED catalog
+// (`AppCatalog::lookup_directional`). Both MUST resolve every case to the
+// fixture's `expected_name`, so the two paths cannot silently re-diverge.
+//
+// The fixture records each catalog row's `app_id` (the value the Go
+// `BuildCatalog` sort assigns — pinned on the Go side by the same test), so this
+// test does NOT re-implement the sort: it builds the catalog straight from the
+// recorded ids and resolves the id back to a name through the recorded id→name
+// map. A sort bug therefore cannot hide identically in both languages.
+#[test]
+fn app_catalog_precedence_parity_fixture() {
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("appid_precedence_v1.json");
+    let raw = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("read {}: {}", fixture_path.display(), e));
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).expect("appid_precedence_v1.json parses");
+
+    let cases = doc["cases"].as_array().expect("cases array");
+    assert!(!cases.is_empty(), "fixture must carry at least one case");
+
+    let u16f = |v: &serde_json::Value| -> u16 {
+        u16::try_from(v.as_u64().expect("numeric field")).expect("fits u16")
+    };
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+
+        // Build the catalog entries + id→name map straight from the recorded
+        // catalog rows (the Go BuildCatalog output; the Go test pins the ids).
+        let mut entries: Vec<crate::AppCatalogEntry> = Vec::new();
+        let mut id_to_name: std::collections::HashMap<u16, String> =
+            std::collections::HashMap::new();
+        for row in case["catalog"].as_array().expect("catalog array") {
+            let app_id = u16f(&row["app_id"]);
+            entries.push(crate::AppCatalogEntry {
+                app_id,
+                protocol: u8::try_from(row["protocol"].as_u64().expect("protocol"))
+                    .expect("protocol fits u8"),
+                dst_port_low: u16f(&row["dst_port_low"]),
+                dst_port_high: u16f(&row["dst_port_high"]),
+                src_port_low: u16f(&row["src_port_low"]),
+                src_port_high: u16f(&row["src_port_high"]),
+            });
+            if app_id != 0 {
+                id_to_name.insert(app_id, row["name"].as_str().expect("row name").to_string());
+            }
+        }
+
+        let cat = AppCatalog::from_snapshot(&entries);
+
+        let tuple = &case["tuple"];
+        let proto = u8::try_from(tuple["protocol"].as_u64().expect("tuple protocol"))
+            .expect("proto fits u8");
+        let src_port = u16f(&tuple["src_port"]);
+        let dst_port = u16f(&tuple["dst_port"]);
+        let is_reverse = tuple["is_reverse"].as_bool().expect("is_reverse");
+
+        let got_id = cat.lookup_directional(proto, src_port, dst_port, is_reverse);
+        let expected_id = u16f(&case["expected_app_id"]);
+        assert_eq!(
+            got_id, expected_id,
+            "case {name:?}: lookup_directional app_id = {got_id}, want {expected_id}"
+        );
+
+        // Resolve the id back to a name (0 == UNKNOWN == the empty string, which
+        // is how the show path renders a no-match on the disabled side).
+        let got_name = if got_id == 0 {
+            ""
+        } else {
+            id_to_name
+                .get(&got_id)
+                .unwrap_or_else(|| panic!("case {name:?}: id {got_id} absent from id→name map"))
+                .as_str()
+        };
+        let expected_name = case["expected_name"].as_str().expect("expected_name");
+        assert_eq!(
+            got_name, expected_name,
+            "case {name:?}: ENABLED-path label = {got_name:?}, want {expected_name:?} \
+             (must equal the DISABLED-path label the Go parity test asserts)"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
