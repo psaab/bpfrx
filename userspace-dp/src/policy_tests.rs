@@ -4654,6 +4654,152 @@ fn from_zone_any_to_junos_host_blocks_host_inbound_from_any_zone() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// #3639 / #3611 Piece B: a GLOBAL policy `match to-zone junos-host`
+// (host-INBOUND) is enforced on the LocalDelivery gate, consulted in the
+// GLOBAL tier — AFTER the exact `from-zone <ingress> to-zone junos-host` pair
+// and the `from-zone any to-zone junos-host` wildcard. Coupled with the Go
+// commit-reject lift (a global to-zone junos-host now commits); indexing
+// without lifting is dead, lifting without indexing is a silent fail-open.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A global `match to-zone junos-host deny` (no from-zone scope = from-any)
+/// governs host-bound traffic from EVERY ingress zone that no exact zone-pair
+/// junos-host policy matches. Also arms `has_junos_host_rules` (the global
+/// junos-host context rides in `match_to_zone`, not the structural `to_zone`).
+///
+/// RED-on-revert: remove the global-tier consult in
+/// `evaluate_junos_host_policy_l3_aware` (or the `match_to_zone` arming of
+/// `has_junos_host_rules`) and this global deny goes un-enforced → `None`.
+#[test]
+fn global_policy_to_zone_junos_host_denies_host_inbound_from_any_zone() {
+    let state = parse_policy_state(
+        "permit",
+        &[global_zone_rule("host-block", "", "junos-host", "deny")],
+        &test_zone_name_to_id(),
+    );
+    assert!(
+        state.has_junos_host_rules,
+        "a global match to-zone junos-host must arm the host gate"
+    );
+    for from in [TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID] {
+        let res = evaluate_junos_host_policy(
+            &state,
+            from,
+            "10.0.0.1".parse().expect("src"),
+            "10.0.0.2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            22,
+            None,
+            64,
+        );
+        assert_eq!(
+            res.map(|r| r.action),
+            Some(PolicyAction::Deny),
+            "global match to-zone junos-host deny must block host-inbound from zone {from}"
+        );
+    }
+}
+
+/// Precedence: an exact `from-zone trust to-zone junos-host permit` WINS over a
+/// global `match to-zone junos-host deny` for a trust-ingress host-bound flow
+/// (specific beats global, mirroring transit-policy precedence). For an ingress
+/// zone with NO exact junos-host pair (untrust), the global deny governs.
+///
+/// RED-on-revert: without the global-tier consult, the untrust flow returns
+/// `None` instead of the global Deny.
+#[test]
+fn exact_zone_pair_junos_host_wins_over_global_to_zone_junos_host() {
+    let state = parse_policy_state(
+        "permit",
+        &[
+            // Exact pair first in config order — most specific.
+            junos_host_deny_snapshot("permit"), // from-zone trust to-zone junos-host permit
+            global_zone_rule("host-block", "", "junos-host", "deny"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    // trust ingress: the exact permit wins over the global deny.
+    let trust = evaluate_junos_host_policy(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        "10.0.1.102".parse().expect("src"),
+        "10.0.1.1".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        22,
+        None,
+        64,
+    );
+    assert_eq!(
+        trust.map(|r| r.action),
+        Some(PolicyAction::Permit),
+        "exact from-zone trust to-zone junos-host permit must win over the global deny"
+    );
+    // untrust ingress: no exact pair → the global deny governs.
+    let untrust = evaluate_junos_host_policy(
+        &state,
+        TEST_UNTRUST_ZONE_ID,
+        "10.0.2.102".parse().expect("src"),
+        "10.0.2.1".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        22,
+        None,
+        64,
+    );
+    assert_eq!(
+        untrust.map(|r| r.action),
+        Some(PolicyAction::Deny),
+        "no exact junos-host pair for untrust → the global deny must govern"
+    );
+}
+
+/// A global `match from-zone trust to-zone junos-host deny` is ingress-scoped:
+/// it governs ONLY trust-ingress host-bound traffic; an untrust-ingress flow
+/// matches no junos-host rule and falls through (`None`, no implicit
+/// default-deny — the lifeline guarantee).
+#[test]
+fn global_from_zone_scope_restricts_junos_host_ingress() {
+    let state = parse_policy_state(
+        "permit",
+        &[global_zone_rule("host-block", "trust", "junos-host", "deny")],
+        &test_zone_name_to_id(),
+    );
+    let trust = evaluate_junos_host_policy(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        "10.0.1.102".parse().expect("src"),
+        "10.0.1.1".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        22,
+        None,
+        64,
+    );
+    assert_eq!(
+        trust.map(|r| r.action),
+        Some(PolicyAction::Deny),
+        "global match from-zone trust to-zone junos-host must deny trust-ingress host traffic"
+    );
+    let untrust = evaluate_junos_host_policy(
+        &state,
+        TEST_UNTRUST_ZONE_ID,
+        "10.0.2.102".parse().expect("src"),
+        "10.0.2.1".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        22,
+        None,
+        64,
+    );
+    assert!(
+        untrust.is_none(),
+        "an untrust-ingress flow matches no from-zone trust junos-host global → None"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // #3148 global policy from-zone/to-zone match context.
 //
 // A Junos global policy may carry optional `match from-zone`/`match to-zone`
