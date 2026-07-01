@@ -57,6 +57,12 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 
 	addPolicyApps := func(policies []*config.Policy) error {
 		for _, pol := range policies {
+			// #3622: a nil policy entry is admitted by the tolerant-load
+			// path (#1960) and must fail closed, not panic. Match the strict
+			// walker (compiler_validate_strict.go), which skips nil rules.
+			if pol == nil {
+				continue
+			}
 			for _, appName := range pol.Match.Applications {
 				if appName == "" || appName == "any" {
 					continue
@@ -78,6 +84,12 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 	}
 
 	for _, zpp := range cfg.Security.Policies {
+		// #3622: a nil zone-pair entry is admitted by the tolerant-load
+		// path (#1960); skip it rather than deref zpp.Policies and panic.
+		// Matches the strict walker (compiler_validate_strict.go).
+		if zpp == nil {
+			continue
+		}
 		if err := addPolicyApps(zpp.Policies); err != nil {
 			return nil, err
 		}

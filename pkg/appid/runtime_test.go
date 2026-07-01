@@ -369,6 +369,58 @@ func TestBuildCatalogRejectsAppIDOverflow(t *testing.T) {
 	}
 }
 
+// TestCatalogNamesNilEntriesFailClosed is the #3622 RED-on-revert proof: a
+// config carrying a nil *ZonePairPolicies entry, a nil *Policy entry inside a
+// valid zone pair, and a nil *Policy entry in GlobalPolicies — all admitted by
+// the tolerant-load path (#1960) — must NOT panic CatalogNames. Before the
+// nil-guards in runtime.go this fixture panicked on the zpp.Policies /
+// pol.Match deref; the strict walker already skips these nil entries, and
+// CatalogNames must fail closed the same way. Reverting either guard turns this
+// test's recover() into a re-raise (the deferred t.Fatalf fires the panic
+// message), so it is RED-on-revert.
+func TestCatalogNamesNilEntriesFailClosed(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CatalogNames panicked on nil zone-pair/policy entries "+
+				"(must fail closed like the strict walker): %v", r)
+		}
+	}()
+
+	cfg := &config.Config{
+		Applications: config.ApplicationsConfig{
+			Applications: map[string]*config.Application{
+				"custom-web": {Name: "custom-web", Protocol: "tcp", DestinationPort: "8443"},
+			},
+		},
+		Security: config.SecurityConfig{
+			Policies: []*config.ZonePairPolicies{
+				nil, // nil zone-pair entry — must be skipped, not deref'd
+				{
+					Policies: []*config.Policy{
+						nil, // nil policy entry — must be skipped, not deref'd
+						{Match: config.PolicyMatch{Applications: []string{"custom-web"}}},
+					},
+				},
+			},
+			GlobalPolicies: []*config.Policy{
+				nil, // nil global-policy entry — must be skipped, not deref'd
+				{Match: config.PolicyMatch{Applications: []string{"junos-https"}}},
+			},
+		},
+	}
+
+	got, err := CatalogNames(cfg, false)
+	if err != nil {
+		t.Fatalf("CatalogNames() error = %v, want nil", err)
+	}
+	// The valid (non-nil) policy entries still resolve; the nil entries are
+	// silently skipped, so the surviving apps are exactly those two.
+	want := []string{"custom-web", "junos-https"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CatalogNames() = %v, want %v", got, want)
+	}
+}
+
 // catalogConfigWithNApps builds a config with n distinct TCP/80 applications,
 // each referenced by a single policy so CatalogNames(cfg, false) returns exactly
 // n names (AppID disabled keeps the catalog at the policy-referenced set rather
