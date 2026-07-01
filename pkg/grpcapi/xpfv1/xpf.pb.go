@@ -2329,8 +2329,21 @@ type PolicyRule struct {
 	// distinguish "first policy, id 0" from "field unset" and dropped the join
 	// key for the highest-priority rule. `optional` restores presence: the
 	// inventory always sets policy_id, so it is always present (even at 0).
-	PolicyId      *uint32 `protobuf:"varint,17,opt,name=policy_id,json=policyId,proto3,oneof" json:"policy_id,omitempty"`
-	RuleId        string  `protobuf:"bytes,18,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
+	PolicyId *uint32 `protobuf:"varint,17,opt,name=policy_id,json=policyId,proto3,oneof" json:"policy_id,omitempty"`
+	RuleId   string  `protobuf:"bytes,18,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
+	// #3624: scheduler binding + runtime scheduler state, the structured
+	// sibling of the #3062 TEXT policy-detail surface. scheduler_name is the
+	// policy's configured `scheduler-name` (Junos scheduled policy); empty for
+	// an always-on rule. inactive is true when the policy is bound to a
+	// scheduler that is currently runtime-inactive, i.e. the dataplane is
+	// skipping the rule right now (mirrors the text "State: inactive" token).
+	// Without these a structured audit reads a time-gated, currently-dormant
+	// permit/deny as an active allow/deny, disagreeing with effective dataplane
+	// behavior. Both are additive; empty/false for the common always-on rule
+	// and (like the text surface) inactive stays false when live scheduler
+	// state cannot be queried, so the output is unchanged for existing clients.
+	SchedulerName string `protobuf:"bytes,19,opt,name=scheduler_name,json=schedulerName,proto3" json:"scheduler_name,omitempty"`
+	Inactive      bool   `protobuf:"varint,20,opt,name=inactive,proto3" json:"inactive,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2489,6 +2502,20 @@ func (x *PolicyRule) GetRuleId() string {
 		return x.RuleId
 	}
 	return ""
+}
+
+func (x *PolicyRule) GetSchedulerName() string {
+	if x != nil {
+		return x.SchedulerName
+	}
+	return ""
+}
+
+func (x *PolicyRule) GetInactive() bool {
+	if x != nil {
+		return x.Inactive
+	}
+	return false
 }
 
 type GetSessionsRequest struct {
@@ -7776,7 +7803,7 @@ const file_xpf_proto_rawDesc = "" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12(\n" +
-	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\x93\x05\n" +
+	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xd6\x05\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -7798,7 +7825,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\x10log_session_init\x18\x0f \x01(\bR\x0elogSessionInit\x12*\n" +
 	"\x11log_session_close\x18\x10 \x01(\bR\x0flogSessionClose\x12 \n" +
 	"\tpolicy_id\x18\x11 \x01(\rH\x00R\bpolicyId\x88\x01\x01\x12\x17\n" +
-	"\arule_id\x18\x12 \x01(\tR\x06ruleIdB\f\n" +
+	"\arule_id\x18\x12 \x01(\tR\x06ruleId\x12%\n" +
+	"\x0escheduler_name\x18\x13 \x01(\tR\rschedulerName\x12\x1a\n" +
+	"\binactive\x18\x14 \x01(\bR\binactiveB\f\n" +
 	"\n" +
 	"_policy_id\"\x9e\x04\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +

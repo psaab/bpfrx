@@ -318,6 +318,19 @@ message PolicyRule {
   // inventory always sets policy_id, so it is always present (even at 0).
   optional uint32 policy_id = 17;
   string rule_id = 18;
+  // #3624: scheduler binding + runtime scheduler state, the structured
+  // sibling of the #3062 TEXT policy-detail surface. scheduler_name is the
+  // policy's configured `scheduler-name` (Junos scheduled policy); empty for
+  // an always-on rule. inactive is true when the policy is bound to a
+  // scheduler that is currently runtime-inactive, i.e. the dataplane is
+  // skipping the rule right now (mirrors the text "State: inactive" token).
+  // Without these a structured audit reads a time-gated, currently-dormant
+  // permit/deny as an active allow/deny, disagreeing with effective dataplane
+  // behavior. Both are additive; empty/false for the common always-on rule
+  // and (like the text surface) inactive stays false when live scheduler
+  // state cannot be queried, so the output is unchanged for existing clients.
+  string scheduler_name = 19;
+  bool inactive = 20;
 }
 
 message GetSessionsRequest {
