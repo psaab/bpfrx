@@ -189,4 +189,15 @@ func TestParseICMPValue(t *testing.T) {
 	if _, err := ParseICMPValue("abc"); err == nil {
 		t.Error("abc: want parse error")
 	}
+	// #3679 FAIL-ON-REVERT: strconv.Atoi accepts a leading '+', so the old
+	// parser read "+8" as ICMP echo-request (type 8) and "+0" as echo-reply.
+	// Routing through config.ParseCanonicalUint rejects the signed spelling,
+	// matching the canonical rule the commit-time / dataplane parsers enforce.
+	// Restoring Atoi flips these back to accepted and turns the cases red.
+	if _, err := ParseICMPValue("+8"); err == nil {
+		t.Error("+8: want canonical-form error (Atoi accepted it as 8)")
+	}
+	if _, err := ParseICMPValue("+0"); err == nil {
+		t.Error("+0: want canonical-form error (Atoi accepted it as 0)")
+	}
 }

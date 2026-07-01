@@ -36,6 +36,35 @@
     RED-on-revert proven (neutering the two render blocks fails the three #3682
     tests); gofmt clean; go vet clean on touched packages (the 2 remaining vet
     diagnostics are pre-existing, in untouched files, documented in the Makefile).
+## 2026-07-01 — #3680 explicit-`any` global policies hidden from zone-detail
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3680 (H01/H02/L01) — `config.GlobalPolicyAppliesToZone`
+    (the #3658 zone-detail tier predicate) recognised only the empty
+    (omitted) global scope as the all-zones wildcard, not the explicit
+    Junos token `"any"`. So a global written `match from-zone any` /
+    `match to-zone any` (preserved verbatim by the compiler,
+    #3148, and enforced all-zones by the Rust runtime
+    `build_global_zone_scope`) was HIDDEN from every affected zone's
+    `show security zones detail` — a security-audit false negative.
+    H01: `GlobalPolicyAppliesToZone` now treats `""` and `"any"`
+    identically. L01: extracted `config.IsWildcardZone(s) = s=="" ||
+    s=="any"` as the single source of truth, shared by the config helper,
+    `policymatch.globalScopeMatches`, `policymatch.GlobalPolicyAppliesToZonePair`
+    (axis-wildcard arm only), and the `compiler_security.go` address-book
+    resolver — so the display/audit surfaces cannot drift from the runtime
+    again (that drift IS what produced H01). The zone-PAIR wildcard tiers
+    (#3090, `policymatch` lines 474-475) deliberately treat only explicit
+    `any` and are intentionally left untouched. H02: added local-CLI +
+    gRPC-text + config-unit fail-on-revert tests for explicit from-zone
+    any / to-zone any (RED when the `"any"` arm is dropped) plus a
+    no-over-inclusion guard for fully scoped globals.
+  - **File(s)**: pkg/config/types_security.go,
+    pkg/config/compiler_security.go, pkg/policymatch/policymatch.go,
+    pkg/config/global_policy_zone_scope_3680_test.go,
+    pkg/cli/cli_show_security_zones_explicit_any_3680_test.go,
+    pkg/grpcapi/server_show_zones_explicit_any_3680_test.go,
+    docs/junos-cli-reference.md
 
 ## 2026-07-01 — #3681 REST /statistics/global host-inbound parity with Prometheus (H04/H05/L03/L07)
 
@@ -68,6 +97,7 @@
   (H04 read-before-gate / partial 200, H05 unavailable-marker, L03 zone/family
   split) and the one exception to the "read error -> HTTP 500" contract.
   - **File(s)**: pkg/api/README.md, _Log.md
+
 ## 2026-07-01 — #3673 policy-match tail guard rejects swallowed from-zone/to-zone
 
 - **Timestamp**: 2026-07-01
@@ -25130,3 +25160,17 @@ top.
 - **File(s)**: cmd/cli/show_zones_polerr_3669_test.go (new), cmd/cli/show_policies_metadata_3672_test.go (new)
 - **Action**: Document both fixes in the CLI reference (remote non-detail renderer metadata; policy-inventory failure fails loud)
 - **File(s)**: docs/junos-cli-reference.md, _Log.md
+
+## 2026-07-01 — #3679 signed-port `+80`/`+8` residual across DIAGNOSTIC parsers (H06/H07/H08/L08)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add shared `config.ParseCanonicalUint(s)` — the exported canonical-form primitive (non-empty bare ASCII digits, rejects leading sign / whitespace). Refactor the #3606 `parseCanonicalPort` to delegate to it so commit-time and diagnostic parsers share ONE grammar (closes the L08 drift gap)
+- **File(s)**: pkg/config/compiler_applications.go
+- **Action**: H07/H08 — route the CLI/gRPC/test-policy `ParsePort` and `ParseICMPValue` diagnostic parsers through `config.ParseCanonicalUint` instead of `strconv.Atoi` (Atoi accepted `+80`→80 / `+8`→8). Empty/whitespace-unspecified contract preserved; range checks (ValidatePort / 0-255) unchanged
+- **File(s)**: pkg/policymatch/policymatch.go
+- **Action**: H06 — REST match-policies `queryIntStrict` (dst_port/src_port) parses via `config.ParseCanonicalUint`; `+80` (Atoi accepted as 80) now 400s. The historical `n < 0` guard is subsumed (canonical parse never returns negative)
+- **File(s)**: pkg/api/api.go
+- **Action**: L08 — RED-on-revert tests: `+80`/`+443`/`+0` rejected by ParsePort (covers CLI match-policies + test-policy); `+8`/`+0` rejected by ParseICMPValue (ICMP simulator); REST match-policies dst_port/src_port `+80` and icmp_type/icmp_code `+8` 400. Reverting the shared helper to bare Atoi turns all three surfaces (plus the #3606 config path) red — verified
+- **File(s)**: pkg/policymatch/port_test.go, pkg/policymatch/icmp_test.go, pkg/api/rest_filter_failclosed_test.go
+- **Action**: Document the canonical-form guarantee on the diagnostic surfaces
+- **File(s)**: pkg/policymatch/README.md, pkg/api/README.md, _Log.md

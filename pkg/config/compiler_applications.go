@@ -518,10 +518,40 @@ func resolveAppPort(spec string) string {
 	return spec
 }
 
-// parseCanonicalPort parses a canonical unsigned decimal port token. Unlike
+// ParseCanonicalUint parses a canonical unsigned decimal integer token. Unlike
 // strconv.Atoi — which accepts a leading '+' ("+80" -> 80) and a leading '-'
-// ("-80" -> -80) — it requires a bare run of ASCII decimal digits, with no sign
-// and no surrounding whitespace.
+// ("-80" -> -80) — it requires a non-empty bare run of ASCII decimal digits,
+// with no sign and no surrounding whitespace.
+//
+// It is the shared canonical-form primitive behind BOTH the #3606 commit-time
+// port parsers (parseCanonicalPort below) AND the #3679 diagnostic port / ICMP
+// parsers (policymatch.ParsePort / ParseICMPValue and the REST match-policies
+// queryIntStrict helper). Routing every numeric-token parser through this one
+// function keeps the config grammar, the dataplane canonical parser, and the
+// operator simulators from drifting on the sign / whitespace of a numeric token
+// — the residual the diagnostic surfaces carried after #3606 fixed only the
+// commit path.
+//
+// Callers still apply their own value-range check on the returned int; this
+// helper only enforces canonical FORM. A parsed value that overflows int
+// returns strconv's range error, exactly as Atoi would.
+func ParseCanonicalUint(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty numeric token")
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf(
+				"non-canonical numeric token %q: only unsigned decimal digits are "+
+					"allowed (no leading sign or whitespace)", s)
+		}
+	}
+	return strconv.Atoi(s)
+}
+
+// parseCanonicalPort parses a canonical unsigned decimal port token. It is the
+// port-specific spelling of ParseCanonicalUint retained for the #3606
+// commit-time callers.
 //
 // Junos rejects a signed / non-canonical port, and the userspace dataplane's
 // port parsers do NOT agree on the sign, so accepting one at commit is a
@@ -532,22 +562,8 @@ func resolveAppPort(spec string) string {
 // parse_port_spec's u16 FromStr ACCEPTS "+80" as 80. The historical Atoi commit
 // gate accepted "+80", the capability gate rejected it, and the simulator
 // (portMatches) said it matched — a three-way split on a security leaf.
-//
-// Callers still apply their own value-range check on the returned int; this
-// helper only enforces canonical FORM. A parsed value that overflows int
-// returns strconv's range error, exactly as Atoi would.
 func parseCanonicalPort(s string) (int, error) {
-	if s == "" {
-		return 0, fmt.Errorf("empty port")
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return 0, fmt.Errorf(
-				"non-canonical port %q: only unsigned decimal digits are allowed "+
-					"(no leading sign or whitespace)", s)
-		}
-	}
-	return strconv.Atoi(s)
+	return ParseCanonicalUint(s)
 }
 
 // validatePortSpec checks that a port specification is valid.
