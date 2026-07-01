@@ -1128,7 +1128,7 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		// #3331: identify WHICH scoped/global policy matched so a verdict maps
 		// back to the runtime policy / session-table ID / audit record when the
 		// same policy name repeats across zone pairs or global scope.
-		fmt.Printf("    Policy ID: %d\n", resp.PolicyId)
+		fmt.Printf("    Policy ID: %d\n", resp.GetPolicyId())
 		if resp.Global {
 			fmt.Printf("    Scope: global (match from-zone: %s, to-zone: %s)\n",
 				matchScopeZone(resp.FromZone), matchScopeZone(resp.ToZone))

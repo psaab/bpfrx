@@ -50,7 +50,17 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     `xpf_policy_hits_total` collector (metrics_counters.go) likewise emits
     the scoped global's real zones on its `from_zone`/`to_zone` labels
     (#3286) — an unscoped global keeps `*`/`*` — so counter-based
-    validation is unambiguous on the canonical metrics surface.
+    validation is unambiguous on the canonical metrics surface. Each rule
+    also carries the runtime `policy_id` (the RT_FLOW/session-table join
+    key, #3336). #3623: `policy_id` is emitted ALWAYS (no `omitempty`).
+    The first rule of the first zone-pair set legitimately has runtime id
+    0 (`policySetID*MaxRulesPerPolicy + ruleIndex = 0`), and since #3057
+    the implicit default policy uses a distinct sentinel (`0xFFFFFFFF`),
+    so id 0 is UNAMBIGUOUSLY a real policy; `omitempty` previously dropped
+    it, so a consumer joining an RT_FLOW event (`policy_id=0`) to the
+    inventory found no row for the highest-priority rule. The gRPC
+    `PolicyRule.policy_id` mirror is `optional uint32` (proto3 explicit
+    presence) for the same reason.
   - `GET /api/v1/security/zones` enumerates security zones (`ZoneInfo`,
     types.go). The host-inbound admission set is surfaced distinctly
     (#3328): `host_inbound_configured` is the dataplane posture bit
@@ -459,7 +469,14 @@ under the daemon's errgroup. Nothing else imports this package.
   `PolicyInactiveFn` treats as fail-closed — scheduled policies are simulated
   as INACTIVE, matching the snapshot builder (nil scheduler state => dropped)
   rather than certifying an as-if-active verdict the dataplane is skipping. A
-  non-scheduled policy is unaffected either way.
+  non-scheduled policy is unaffected either way. On a MATCH the response
+  carries the matched policy's runtime `policy_id` (#3331 scope/id
+  disambiguation). #3623: this field is a `*uint32` — set (present, even at
+  0) ONLY on a match, omitted otherwise. The first zone-pair set's first
+  rule has runtime id 0; a plain `uint32`+`omitempty` dropped it, so a
+  matched-first-policy answer was indistinguishable from an unmatched one
+  (both encoded as absent). The gRPC `MatchPoliciesResponse.policy_id`
+  mirror is `optional uint32` for the same reason.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.
