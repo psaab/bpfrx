@@ -299,7 +299,7 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			// (ticket / change context).
 			fmt.Fprintf(buf, "  Policy ID: %d\n", res.PolicyID)
 			fmt.Fprintf(buf, "  Scope:     global (match from-zone: %s, to-zone: %s)\n",
-				globalZoneScopeLabel(res.FromZone), globalZoneScopeLabel(res.ToZone))
+				policymatch.ZoneScopeLabel(res.FromZone), policymatch.ZoneScopeLabel(res.ToZone))
 			if res.Description != "" {
 				fmt.Fprintf(buf, "  Description: %s\n", res.Description)
 			}

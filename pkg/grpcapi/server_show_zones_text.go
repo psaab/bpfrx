@@ -17,6 +17,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 // showZonesDetail renders per-zone configuration plus dataplane traffic
@@ -166,53 +167,19 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 		// of the local-CLI renderer (pkg/cli/cli_show_security_zones.go) can no
 		// longer hide a global rule that affects the zone (M04) nor collapse to
 		// a bare "(no policies)" that obscures the unmatched-transit disposition
-		// (M05). Parity with REST (pkg/api/security.go) + gRPC GetPolicies
-		// (#3363).
-		buf.WriteString("  Policy summary (evaluation order: zone-pair, global, default-policy):\n")
-		zonePairPolicies := 0
-		for _, zpp := range cfg.Security.Policies {
-			// #3476: skip a nil zone-pair set rather than dereferencing
-			// zpp.FromZone.
-			if zpp == nil {
-				continue
-			}
-			if zpp.FromZone == name || zpp.ToZone == name {
-				for _, pol := range zpp.Policies {
-					// #3476: skip a nil rule rather than dereferencing
-					// pol.Action / pol.Name.
-					if pol == nil {
-						continue
-					}
-					fmt.Fprintf(buf, "    [zone-pair] %s -> %s: %s (%s)\n",
-						zpp.FromZone, zpp.ToZone, pol.Name,
-						policyActionStr(pol.Action))
-					zonePairPolicies++
-				}
-			}
+		// (M05). #3684: it also threads the per-rule inventory metadata the
+		// name+action summary dropped — runtime policy id (M11), scheduler
+		// binding + runtime-inactive state (H03/#3624), log/count/exclusion
+		// modifiers (M12), and the default-policy log posture + sentinel id
+		// (M13). Rendering is delegated to policymatch.ZoneDetailPolicySummary,
+		// the SSOT shared with the local-CLI renderer (L10) so the two surfaces
+		// stay byte-identical. Parity with REST (pkg/api/security.go) + gRPC
+		// GetPolicies (#3363).
+		schedActive, haveSched := s.policySchedulerActiveState()
+		for _, line := range policymatch.ZoneDetailPolicySummary(cfg, name, schedActive, haveSched) {
+			buf.WriteString(line)
+			buf.WriteString("\n")
 		}
-		globalPolicies := 0
-		for _, gp := range cfg.Security.GlobalPolicies {
-			// #3476-style defensiveness: skip a nil global rule.
-			if gp == nil {
-				continue
-			}
-			if !config.GlobalPolicyAppliesToZone(gp.Match, name) {
-				continue
-			}
-			fmt.Fprintf(buf, "    [global] %s -> %s: %s (%s)\n",
-				globalZoneScopeLabel(gp.Match.FromZone),
-				globalZoneScopeLabel(gp.Match.ToZone),
-				gp.Name, policyActionStr(gp.Action))
-			globalPolicies++
-		}
-		if zonePairPolicies == 0 && globalPolicies == 0 {
-			buf.WriteString("    (no zone-pair or global policies affecting this zone)\n")
-		}
-		// M05: always surface the effective default-policy catch-all instead of
-		// hiding it behind "(no policies)".
-		fmt.Fprintf(buf, "    [default] %s: %s\n",
-			dataplane.DefaultPolicyName,
-			policyActionStr(cfg.Security.DefaultPolicy))
 		buf.WriteString("\n")
 	}
 	if readErr != nil {

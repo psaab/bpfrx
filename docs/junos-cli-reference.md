@@ -904,42 +904,75 @@ Security zone: junos-host
   (`config.GlobalPolicyAppliesToZone` over the wire `match_from_zone`/
   `match_to_zone`, #3148/#3680) and always closing with the `[default]` catch-all.
 
-**`show security zones detail` policy summary (#3658).** In `detail` mode
-each zone gains a `Policy summary` block that lists the policies that decide
-the zone's transit, in the SAME precedence order the dataplane evaluates
-them (zone-pair, then global, then the implicit default-policy catch-all):
+**`show security zones detail` policy summary (#3658, #3684).** In `detail`
+mode each zone gains a `Policy summary` block that lists the policies that
+decide the zone's transit, in the SAME precedence order the dataplane
+evaluates them (zone-pair, then global, then the implicit default-policy
+catch-all). Each row carries a trailing `[...]` annotation that threads the
+per-rule metadata the REST/gRPC inventory already exposes, so a zone-centric
+audit can express scheduler state, join a rule to its telemetry id, and see
+its logging/inversion intent (#3684):
 
 ```
   Policy summary (evaluation order: zone-pair, global, default-policy):
-    [zone-pair] trust -> untrust: allow-web (permit)
-    [global] any -> untrust: block-bad (deny)
-    [default] default-policy: deny
+    [zone-pair] trust -> untrust: allow-web (permit) [id 0, log at-create, count]
+    [zone-pair] trust -> untrust: night-block (deny) [id 1, scheduler off-hours (inactive)]
+    [global] any -> untrust: block-bad (deny) [id 256, source-address (except)]
+    [default] default-policy: deny [id 4294967295, log at-create]
 ```
 
-- `[zone-pair] <from> -> <to>: <name> (<action>)` -- a from-zone/to-zone
-  policy referencing this zone (either side).
-- `[global] <from> -> <to>: <name> (<action>)` -- a GLOBAL policy that can
-  affect this zone (M04). An unscoped global prints `any` for both scopes;
-  a scoped global (`match from-zone`/`to-zone`, #3148) prints its zone scope.
-  A global is listed for a zone only when the zone can appear on either side
-  of a pair the global matches (`config.GlobalPolicyAppliesToZone`). Both the
-  omitted scope and the EXPLICIT Junos token `any` are the all-zones wildcard
-  on an axis -- `config.IsWildcardZone` is the single source of truth shared
-  with the `policymatch` selection helpers and the Rust runtime
+- `[zone-pair] <from> -> <to>: <name> (<action>) [<modifiers>]` -- a
+  from-zone/to-zone policy referencing this zone (either side).
+- `[global] <from> -> <to>: <name> (<action>) [<modifiers>]` -- a GLOBAL
+  policy that can affect this zone (M04). An unscoped global prints `any` for
+  both scopes; a scoped global (`match from-zone`/`to-zone`, #3148) prints its
+  zone scope. A global is listed for a zone only when the zone can appear on
+  either side of a pair the global matches
+  (`config.GlobalPolicyAppliesToZone`). Both the omitted scope and the
+  EXPLICIT Junos token `any` are the all-zones wildcard on an axis --
+  `config.IsWildcardZone` is the single source of truth shared with the
+  `policymatch` selection helpers and the Rust runtime
   (`build_global_zone_scope` maps both `""` and `"any"` to
   `GlobalZoneScope::Any`), so an idiomatic `match from-zone any` / `to-zone
   any` global is no longer hidden from the affected zones' detail (#3680).
-- `[default] default-policy: <action>` -- the effective default-policy
-  catch-all is ALWAYS shown (M05), so a zone with no explicit rule reports
-  `default-policy: deny` / `permit` / `reject` rather than a bare
+- `[default] default-policy: <action> [<modifiers>]` -- the effective
+  default-policy catch-all is ALWAYS shown (M05), so a zone with no explicit
+  rule reports `default-policy: deny` / `permit` / `reject` rather than a bare
   `(no policies)`, which hid whether unmatched transit is denied or permitted.
+- The trailing `[<modifiers>]` annotation (#3684), a comma-separated list:
+  - `id <N>` -- the runtime/RT_FLOW policy id (always present). This is the
+    numeric identity the session/event/RT_FLOW telemetry logs, so the summary
+    can be joined to `policy_id=N`. Ids are span-accumulated exactly as the
+    snapshot builder assigns them, so a multi-application policy that shifts
+    the id namespace still shows the id the dataplane enforces. The global
+    tier's ids continue in the policy-set namespace after the zone-pair sets
+    (e.g. `id 256` == policy-set 1 x `MaxRulesPerPolicy`). The `[default]` row
+    always carries the reserved `DefaultPolicySentinelID` (`4294967295`), the
+    id the implicit default-verdict RT_FLOW record logs (M11/M13).
+  - `scheduler <name>` / `scheduler <name> (inactive)` -- the policy's
+    scheduler binding (#3624) and, when the runtime reports that scheduler
+    currently inactive, an `(inactive)` marker: the dataplane is SKIPPING the
+    rule, so it can no longer read as an active participant (H03). The marker
+    tracks live runtime state -- when the scheduler state cannot be queried no
+    rule is claimed inactive (matching the #3062 policy-detail renderer).
+  - `log <modes>` -- the session-log triggers (`at-create`, `at-close`) via
+    the shared `PolicyLog.SessionLogModes` SSOT (#3667). The `[default]` row
+    reflects `default-policy-log session-init/session-close` (#3534), the log
+    posture for flows that hit the implicit default verdict (M13).
+  - `count` -- the policy has `then count` hit-count accounting.
+  - `source-address (except)` / `destination-address (except)` -- a Junos
+    `source-address-excluded` / `destination-address-excluded` inverted match
+    (M12), using the `policymatch.ExceptSuffix` SSOT shared with the
+    match-policies renderer.
 - When a zone has no zone-pair AND no applicable global policy, the summary
   prints `(no zone-pair or global policies affecting this zone)` above the
   always-present `[default]` line.
 - The gRPC text `zones-detail` view renders the identical three-tier block, and
   the remote (ctl) `show security zones` non-detail summary now renders it too
-  (#3683 M01); all mirror the REST inventory global + synthetic default-policy
-  rows (`pkg/api/security.go`) and structured `GetPolicies` (#3363).
+  (#3683 M01); both the local CLI and gRPC-text surfaces delegate to the single
+  `policymatch.ZoneDetailPolicySummary` presenter (#3684 L10) so they cannot
+  drift, and all mirror the REST inventory global + synthetic default-policy
+  rows (`pkg/api/security.go`) and structured `GetPolicies` (#3363/#3624).
 
 ---
 

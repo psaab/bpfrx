@@ -1,3 +1,41 @@
+## 2026-07-01 — #3684 zone-detail policy summary metadata completeness
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3684 (H03/M11/M12/M13/L06/L10) — the #3658
+    `show security zones detail` policy summary (local CLI + gRPC text)
+    was a name+action-only renderer. It dropped the per-rule inventory
+    metadata the REST/gRPC `GetPolicies` surface already carries, so a
+    zone-centric audit could not express scheduler state, join a rule to
+    its RT_FLOW/session `policy_id`, or see logging/inversion intent.
+    Each summary row now carries a trailing `[...]` annotation:
+    `id <N>` (M11 — the span-accumulated runtime/RT_FLOW id, sentinel
+    `4294967295` on the default row per M13); `scheduler <name>` +
+    `(inactive)` when the runtime reports the scheduler skipped (H03 —
+    a scheduled-off rule no longer reads as active; #3624 state via
+    `dpuserspace.PolicyInactive`); `log <at-create,at-close>` via the
+    `PolicyLog.SessionLogModes` #3667 SSOT, `count`, and
+    `source-address (except)`/`destination-address (except)` via the
+    `policymatch.ExceptSuffix` SSOT (M12); and the `[default]` row now
+    threads `DefaultPolicySentinelID` + the `default-policy-log`
+    posture (M13). L10: the three former hand-rolled renderers are
+    replaced by ONE shared presenter,
+    `policymatch.ZoneDetailPolicySummary`, consumed by both the local CLI
+    and gRPC-text surfaces so their output stays byte-identical and cannot
+    drift; the dead `pkg/cli` `policyActionStr`/`globalZoneScopeLabel` and
+    `pkg/grpcapi` `globalZoneScopeLabel` copies were removed. L06: added
+    fail-on-revert golden tests at all three layers (policymatch unit +
+    local-CLI + gRPC-text) covering a scheduler-inactive zone-pair/global
+    row, a log+count+excluded row, the default log posture, and the
+    haveSched=false "unknown state -> claim nothing inactive" fallback —
+    all RED when the metadata thread is reverted to name+action.
+  - **File(s)**: pkg/policymatch/zone_detail_summary.go,
+    pkg/policymatch/zone_detail_summary_test.go,
+    pkg/cli/cli_show_security_zones.go,
+    pkg/cli/cli_show_security_zones_metadata_3684_test.go,
+    pkg/grpcapi/server_show_zones_text.go,
+    pkg/grpcapi/server_helpers.go,
+    pkg/grpcapi/server_show_zones_metadata_3684_test.go,
+    docs/junos-cli-reference.md
 ## 2026-07-01 — #3683 remote CLI show zones/policies display residuals (M01/M02)
 
 - **Timestamp**: 2026-07-01
@@ -63,6 +101,7 @@
     RED-on-revert proven (neutering the two render blocks fails the three #3682
     tests); gofmt clean; go vet clean on touched packages (the 2 remaining vet
     diagnostics are pre-existing, in untouched files, documented in the Makefile).
+
 ## 2026-07-01 — #3680 explicit-`any` global policies hidden from zone-detail
 
 - **Timestamp**: 2026-07-01
