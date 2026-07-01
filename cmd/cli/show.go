@@ -546,21 +546,70 @@ func (c *ctl) showZones() error {
 			fmt.Printf("    Output: %d packets, %d bytes\n", z.EgressPackets, z.EgressBytes)
 		}
 
+		// #3683 (M01): render all THREE policy tiers the runtime evaluates, in
+		// order — zone-pair, applicable global, then the effective
+		// default-policy catch-all — mirroring the local zone-detail summary
+		// (pkg/cli/cli_show_security_zones.go) and gRPC text
+		// (pkg/grpcapi/server_show_zones_text.go), both from #3658. The old
+		// remote summary listed ONLY zone-pair groups whose group-level zones
+		// matched the zone, so the "*"/"*" global group and the synthetic
+		// default-policy row (#3363) were both hidden — an operator scraping the
+		// ctl binary could miss a global or default-policy rule that governs the
+		// zone's transit.
 		if polResp != nil {
-			var refs []string
+			fmt.Println("  Policy summary (evaluation order: zone-pair, global, default-policy):")
+			zonePairPolicies := 0
+			globalPolicies := 0
+			var defaultName, defaultAction string
 			for _, pi := range polResp.Policies {
-				if pi.FromZone == z.Name || pi.ToZone == z.Name {
-					dir := "from"
-					peer := pi.ToZone
-					if pi.ToZone == z.Name {
-						dir = "to"
-						peer = pi.FromZone
+				switch {
+				case pi.FromZone == "-" && pi.ToZone == "-":
+					// #3363 synthetic default-policy row: from/to zone "-" with a
+					// single rule named dataplane.DefaultPolicyName. Captured here
+					// and printed last so it always closes the summary (M05),
+					// independent of its position in the response.
+					if len(pi.Rules) > 0 {
+						defaultName = pi.Rules[0].Name
+						defaultAction = pi.Rules[0].Action
 					}
-					refs = append(refs, fmt.Sprintf("%s %s (%d rules)", dir, peer, len(pi.Rules)))
+				case pi.FromZone == "*" && pi.ToZone == "*":
+					// #3357 global group: filter PER-RULE by the rule's scope
+					// (#3148 MatchFromZone/MatchToZone). A scoped global narrows
+					// the all-zones group to a zone pair; an unscoped or
+					// explicit-"any" scope is the all-zones wildcard
+					// (config.IsWildcardZone), so the global is listed whenever
+					// the zone can appear on either side of a pair it matches
+					// (config.GlobalPolicyAppliesToZone — the same predicate the
+					// local/gRPC-text tier renderers use).
+					for _, rule := range pi.Rules {
+						if !config.GlobalPolicyAppliesToZone(config.PolicyMatch{
+							FromZone: rule.MatchFromZone,
+							ToZone:   rule.MatchToZone,
+						}, z.Name) {
+							continue
+						}
+						fmt.Printf("    [global] %s -> %s: %s (%s)\n",
+							matchScopeZone(rule.MatchFromZone),
+							matchScopeZone(rule.MatchToZone),
+							rule.Name, rule.Action)
+						globalPolicies++
+					}
+				case pi.FromZone == z.Name || pi.ToZone == z.Name:
+					for _, rule := range pi.Rules {
+						fmt.Printf("    [zone-pair] %s -> %s: %s (%s)\n",
+							pi.FromZone, pi.ToZone, rule.Name, rule.Action)
+						zonePairPolicies++
+					}
 				}
 			}
-			if len(refs) > 0 {
-				fmt.Printf("  Policies: %s\n", strings.Join(refs, ", "))
+			if zonePairPolicies == 0 && globalPolicies == 0 {
+				fmt.Println("    (no zone-pair or global policies affecting this zone)")
+			}
+			// M05: always surface the effective default-policy catch-all when the
+			// inventory carries it, so unmatched-transit disposition is never
+			// hidden behind an absent "(no policies)" line.
+			if defaultName != "" {
+				fmt.Printf("    [default] %s: %s\n", defaultName, defaultAction)
 			}
 		}
 
@@ -644,20 +693,20 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 		// "*"/"*" zones dropped every scoped global from the filtered view — the
 		// exact command an operator uses to prove which rules govern a zone pair.
 		// Detect the global group and filter per-rule, rendering each rule under a
-		// header that shows its effective scope (falling back to "*"/"*").
+		// header that shows its effective scope (an unscoped/explicit-any axis is
+		// normalized to "any" via matchScopeZone — #3683 M02).
 		if pi.FromZone == "*" && pi.ToZone == "*" {
 			for _, rule := range pi.Rules {
 				if !policymatch.GlobalPolicyAppliesToZonePair(rule.MatchFromZone, rule.MatchToZone, fromZone, toZone) {
 					continue
 				}
-				gf, gt := "*", "*"
-				if rule.MatchFromZone != "" {
-					gf = rule.MatchFromZone
-				}
-				if rule.MatchToZone != "" {
-					gt = rule.MatchToZone
-				}
-				fmt.Printf("From zone: %s, To zone: %s\n", gf, gt)
+				// #3683 (M02): render the effective scope through matchScopeZone
+				// (the shared normalizer, empty -> "any") so an unscoped global
+				// prints "From zone: any, To zone: any" — the canonical Junos /
+				// local-CLI / gRPC model — instead of a hand-rolled "*" that reads
+				// like an internal wildcard rather than the explicit policy model.
+				fmt.Printf("From zone: %s, To zone: %s\n",
+					matchScopeZone(rule.MatchFromZone), matchScopeZone(rule.MatchToZone))
 				renderRule(rule)
 				fmt.Println()
 			}

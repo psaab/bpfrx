@@ -83,7 +83,10 @@ func TestShowZonesSucceedsWhenPolicyInventoryOK(t *testing.T) {
 			t.Fatalf("showZones returned error on the happy path: %v", err)
 		}
 	})
-	if !strings.Contains(out, "Policies: from untrust (1 rules)") {
-		t.Errorf("expected policy references rendered for trust zone:\n%s", out)
+	// #3683 (M01): the remote summary now renders the tiered "Policy summary"
+	// block (zone-pair / global / default), replacing the pre-#3683 compact
+	// "Policies: from <peer> (N rules)" refs line.
+	if !strings.Contains(out, "[zone-pair] trust -> untrust: allow-web (permit)") {
+		t.Errorf("expected zone-pair policy tier rendered for trust zone:\n%s", out)
 	}
 }

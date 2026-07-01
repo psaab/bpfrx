@@ -789,6 +789,14 @@ Global policies:
   `... brief` prints the per-rule `match_from_zone`/`match_to_zone` (falling back
   to `*`/`*` only for an unscoped global) instead of the group `*`. The shared
   selection predicate is `policymatch.GlobalPolicyAppliesToZonePair`.
+- **#3683 (M02) — remote FILTERED policy view normalizes the global scope to
+  `any`.** The remote `show security policies` (filtered) `showPoliciesFiltered`
+  (`cmd/cli/show.go`) hand-rolled an all-zones global scope as `*`, so an
+  unscoped global printed `From zone: *, To zone: *` while the local / gRPC /
+  Junos surfaces show `any`. It now renders each axis through the shared
+  `matchScopeZone` normalizer (empty -> `any`), so an unscoped global reads
+  `From zone: any, To zone: any` — the explicit policy model, not an internal
+  wildcard. A scoped global still prints its configured zone(s) unchanged.
 - **#3672 — remote non-detail renderer surfaces per-rule metadata.** The remote
   CLI `show security policies` (non-detail) `renderRule` (`cmd/cli/show.go`)
   previously printed only name / description / raw addresses / action / hits,
@@ -875,14 +883,26 @@ Security zone: junos-host
 - Blank line between zones.
 - **#3669 — policy-inventory failure fails loud (remote CLI).** The remote
   `show security zones` (`cmd/cli/show.go`) issues a second RPC (`GetPolicies`)
-  to render each zone's `Policies:` reference line. It previously discarded that
-  RPC's error (`polResp, _ := ...`) and returned success, so a control-plane
-  degradation rendered the zones as policy-free with exit 0 —
-  indistinguishable from zones that genuinely have no policies. The zone bodies
-  (from the successful `GetZones`) are still printed, but the command now
-  surfaces the `GetPolicies` error (`policy inventory unavailable ...`) and
-  exits non-zero so an operator or automation can tell a degraded partial view
-  apart from a truly empty one.
+  to render each zone's policy summary. It previously discarded that RPC's error
+  (`polResp, _ := ...`) and returned success, so a control-plane degradation
+  rendered the zones as policy-free with exit 0 — indistinguishable from zones
+  that genuinely have no policies. The zone bodies (from the successful
+  `GetZones`) are still printed, but the command now surfaces the `GetPolicies`
+  error (`policy inventory unavailable ...`) and exits non-zero so an operator
+  or automation can tell a degraded partial view apart from a truly empty one.
+- **#3683 (M01) — remote `show security zones` renders all three policy tiers.**
+  The remote (non-detail) summary previously built a compact
+  `Policies: from <peer> (N rules)` reference line from ONLY the zone-pair groups
+  whose group-level zones matched the zone. The global group is exposed by
+  `GetPolicies` with group zones `*`/`*` and the synthetic default-policy row
+  (#3363) with `-`/`-`, so NEITHER appeared in the per-zone summary — an operator
+  scraping the ctl binary could miss an applicable global or default-policy rule.
+  The summary now renders the SAME three-tier `Policy summary` block the local
+  detail view (`pkg/cli/cli_show_security_zones.go`) and gRPC text
+  (`pkg/grpcapi/server_show_zones_text.go`) use (see the block below), filtering
+  the global group PER-RULE by each rule's scope
+  (`config.GlobalPolicyAppliesToZone` over the wire `match_from_zone`/
+  `match_to_zone`, #3148/#3680) and always closing with the `[default]` catch-all.
 
 **`show security zones detail` policy summary (#3658).** In `detail` mode
 each zone gains a `Policy summary` block that lists the policies that decide
@@ -916,9 +936,10 @@ them (zone-pair, then global, then the implicit default-policy catch-all):
 - When a zone has no zone-pair AND no applicable global policy, the summary
   prints `(no zone-pair or global policies affecting this zone)` above the
   always-present `[default]` line.
-- The gRPC text `zones-detail` view renders the identical three-tier block;
-  both mirror the REST inventory global + synthetic default-policy rows
-  (`pkg/api/security.go`) and structured `GetPolicies` (#3363).
+- The gRPC text `zones-detail` view renders the identical three-tier block, and
+  the remote (ctl) `show security zones` non-detail summary now renders it too
+  (#3683 M01); all mirror the REST inventory global + synthetic default-policy
+  rows (`pkg/api/security.go`) and structured `GetPolicies` (#3363).
 
 ---
 

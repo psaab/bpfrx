@@ -1,3 +1,30 @@
+## 2026-07-01 — #3683 remote CLI show zones/policies display residuals (M01/M02)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3683 — fixed two remote-CLI (ctl binary) display residuals left
+    after the local / gRPC-text zone and policy surfaces were upgraded (#3658
+    tiers, #3331 scope labels, #3672 remote-policies).
+    - **M01**: the remote `show security zones` (non-detail) per-zone summary
+      built a compact `Policies: from <peer> (N rules)` line from ONLY the
+      zone-pair groups whose group zones matched the zone. The global group
+      (`GetPolicies` group zones `*`/`*`) and the synthetic default-policy row
+      (`-`/`-`, #3363) were BOTH hidden — an operator scraping the ctl binary
+      could miss an applicable global/default rule. `showZones` now renders the
+      SAME three-tier `Policy summary` block the local detail view
+      (`pkg/cli/cli_show_security_zones.go`) and gRPC text
+      (`pkg/grpcapi/server_show_zones_text.go`) use, filtering the global group
+      PER-RULE via `config.GlobalPolicyAppliesToZone` over the wire
+      `match_from_zone`/`match_to_zone` (#3148/#3680) and always closing with the
+      `[default]` catch-all (M05).
+    - **M02**: the remote FILTERED policy view (`showPoliciesFiltered`) hand-rolled
+      an all-zones global scope as `*`; it now routes both axes through the shared
+      `matchScopeZone` normalizer (empty -> `any`) so an unscoped global reads
+      `From zone: any, To zone: any` — the canonical Junos / local / gRPC model.
+  - **File(s)**: `cmd/cli/show.go` (showZones tiered renderer + showPoliciesFiltered
+    scope normalization), `cmd/cli/show_zones_tiers_3683_test.go` (new
+    RED-on-revert tests), `cmd/cli/show_zones_polerr_3669_test.go` (happy-path
+    assertion updated to the tiered format), `docs/junos-cli-reference.md`.
+
 ## 2026-07-01 — #3682 host-inbound lifeline exemption made operator-visible (M08/L05)
 
 - **Timestamp**: 2026-07-01
