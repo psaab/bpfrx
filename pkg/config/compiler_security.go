@@ -385,7 +385,7 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 	rewrite := func(zone string, tokens []string) {
 		// An empty or wildcard ("any") zone names no single zone-local book to
 		// resolve against, so leave such tokens for the global book.
-		if zone == "" || zone == "any" {
+		if IsWildcardZone(zone) {
 			return
 		}
 		for i, t := range tokens {

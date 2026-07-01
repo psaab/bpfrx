@@ -335,10 +335,33 @@ type PolicyMatch struct {
 	ToZone   string
 }
 
+// IsWildcardZone reports whether a Junos GLOBAL-policy zone-scope token names
+// every zone (the all-zones wildcard). Two spellings are equivalent: the empty
+// string (an omitted `match from-zone`/`to-zone`, the historical unscoped
+// global) AND the explicit reserved token "any" (the idiomatic Junos wildcard).
+//
+// This is the single source of truth for the wildcard-scope test. It mirrors
+// the runtime build_global_zone_scope (userspace-dp/src/policy.rs), which maps
+// BOTH "" and "any" to GlobalZoneScope::Any, and it is shared by
+// GlobalPolicyAppliesToZone here and by the policymatch helpers
+// (globalScopeMatches, GlobalPolicyAppliesToZonePair) so the display/audit
+// surfaces cannot drift from the runtime — the exact drift that hid
+// explicit-"any" globals from zone-detail (#3680, was: only "" treated as
+// wildcard here while policymatch + the runtime also honoured "any").
+//
+// Note: this is the GLOBAL-policy scope wildcard. The zone-PAIR wildcard tiers
+// (#3090, policymatch from/to-any) deliberately treat ONLY the explicit "any"
+// as a wildcard — an empty zone-pair zone is not meaningful there — so those
+// sites do not use this helper.
+func IsWildcardZone(s string) bool {
+	return s == "" || s == "any"
+}
+
 // GlobalPolicyAppliesToZone reports whether a global policy with the given
 // match context can affect security zone `zone` — i.e. the global's from- or
 // to-zone scope can place `zone` on either side of an evaluated zone pair. An
-// empty FromZone/ToZone is the "any zone" wildcard (#3148, unscoped global).
+// empty or explicit-"any" FromZone/ToZone is the "any zone" wildcard (#3148
+// unscoped global, or #3680 idiomatic-Junos explicit any).
 //
 // It mirrors the runtime AND-combined GlobalZoneScope match in the userspace
 // dataplane (userspace-dp/src/policy.rs: a global matches a packet iff its
@@ -351,8 +374,8 @@ type PolicyMatch struct {
 // Used by the zone-detail policy summary (#3658) to list the global tier the
 // runtime evaluates after zone-pair rules. Callers filter nil policies first.
 func GlobalPolicyAppliesToZone(m PolicyMatch, zone string) bool {
-	asSource := m.FromZone == "" || m.FromZone == zone
-	asDest := m.ToZone == "" || m.ToZone == zone
+	asSource := IsWildcardZone(m.FromZone) || m.FromZone == zone
+	asDest := IsWildcardZone(m.ToZone) || m.ToZone == zone
 	return asSource || asDest
 }
 
