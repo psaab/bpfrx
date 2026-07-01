@@ -621,7 +621,7 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 // view shows exactly the globals the runtime enforces for that zone pair.
 func GlobalPolicyAppliesToZonePair(matchFrom, matchTo, filterFrom, filterTo string) bool {
 	axisApplies := func(scope, filter string) bool {
-		if filter == "" || scope == "" || scope == "any" {
+		if filter == "" || config.IsWildcardZone(scope) {
 			return true
 		}
 		return scope == filter
@@ -635,7 +635,7 @@ func GlobalPolicyAppliesToZonePair(matchFrom, matchTo, filterFrom, filterTo stri
 // undefined (typo'd, or reserved like junos-host) scope fails closed — it
 // matches nothing, never silently widening to all-zones.
 func globalScopeMatches(cfg *config.Config, scopeZone, flowZone string) bool {
-	if scopeZone == "" || scopeZone == "any" {
+	if config.IsWildcardZone(scopeZone) {
 		return true
 	}
 	if _, ok := cfg.Security.Zones[scopeZone]; !ok {

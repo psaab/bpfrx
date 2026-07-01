@@ -881,7 +881,13 @@ them (zone-pair, then global, then the implicit default-policy catch-all):
   affect this zone (M04). An unscoped global prints `any` for both scopes;
   a scoped global (`match from-zone`/`to-zone`, #3148) prints its zone scope.
   A global is listed for a zone only when the zone can appear on either side
-  of a pair the global matches (`config.GlobalPolicyAppliesToZone`).
+  of a pair the global matches (`config.GlobalPolicyAppliesToZone`). Both the
+  omitted scope and the EXPLICIT Junos token `any` are the all-zones wildcard
+  on an axis -- `config.IsWildcardZone` is the single source of truth shared
+  with the `policymatch` selection helpers and the Rust runtime
+  (`build_global_zone_scope` maps both `""` and `"any"` to
+  `GlobalZoneScope::Any`), so an idiomatic `match from-zone any` / `to-zone
+  any` global is no longer hidden from the affected zones' detail (#3680).
 - `[default] default-policy: <action>` -- the effective default-policy
   catch-all is ALWAYS shown (M05), so a zone with no explicit rule reports
   `default-policy: deny` / `permit` / `reject` rather than a bare
