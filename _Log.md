@@ -25028,3 +25028,17 @@ top.
 - **File(s)**: cmd/cli/show_zones_polerr_3669_test.go (new), cmd/cli/show_policies_metadata_3672_test.go (new)
 - **Action**: Document both fixes in the CLI reference (remote non-detail renderer metadata; policy-inventory failure fails loud)
 - **File(s)**: docs/junos-cli-reference.md, _Log.md
+
+## 2026-07-01 — #3679 signed-port `+80`/`+8` residual across DIAGNOSTIC parsers (H06/H07/H08/L08)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add shared `config.ParseCanonicalUint(s)` — the exported canonical-form primitive (non-empty bare ASCII digits, rejects leading sign / whitespace). Refactor the #3606 `parseCanonicalPort` to delegate to it so commit-time and diagnostic parsers share ONE grammar (closes the L08 drift gap)
+- **File(s)**: pkg/config/compiler_applications.go
+- **Action**: H07/H08 — route the CLI/gRPC/test-policy `ParsePort` and `ParseICMPValue` diagnostic parsers through `config.ParseCanonicalUint` instead of `strconv.Atoi` (Atoi accepted `+80`→80 / `+8`→8). Empty/whitespace-unspecified contract preserved; range checks (ValidatePort / 0-255) unchanged
+- **File(s)**: pkg/policymatch/policymatch.go
+- **Action**: H06 — REST match-policies `queryIntStrict` (dst_port/src_port) parses via `config.ParseCanonicalUint`; `+80` (Atoi accepted as 80) now 400s. The historical `n < 0` guard is subsumed (canonical parse never returns negative)
+- **File(s)**: pkg/api/api.go
+- **Action**: L08 — RED-on-revert tests: `+80`/`+443`/`+0` rejected by ParsePort (covers CLI match-policies + test-policy); `+8`/`+0` rejected by ParseICMPValue (ICMP simulator); REST match-policies dst_port/src_port `+80` and icmp_type/icmp_code `+8` 400. Reverting the shared helper to bare Atoi turns all three surfaces (plus the #3606 config path) red — verified
+- **File(s)**: pkg/policymatch/port_test.go, pkg/policymatch/icmp_test.go, pkg/api/rest_filter_failclosed_test.go
+- **Action**: Document the canonical-form guarantee on the diagnostic surfaces
+- **File(s)**: pkg/policymatch/README.md, pkg/api/README.md, _Log.md

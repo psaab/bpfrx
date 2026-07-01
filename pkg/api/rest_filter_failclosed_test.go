@@ -196,6 +196,47 @@ func TestRESTPolicyMatchPortRange(t *testing.T) {
 	}
 }
 
+// TestRESTPolicyMatchSignedPort asserts the #3679 contract: a signed /
+// non-canonical port or ICMP token ("+80" / "+8") must 400, not silently parse
+// to the unsigned value the way strconv.Atoi did ("+80" -> 80). #3606 made the
+// commit-time and dataplane port parsers canonical; before #3679 the REST
+// match-policies simulator (queryIntStrict for dst_port/src_port via Atoi, and
+// ParseICMPValue for icmp_type/icmp_code) still accepted the signed spelling —
+// a commit-vs-diagnostic split that would report a verdict for a token the
+// platform rejects. The plain unsigned spelling still proceeds (HTTP 200).
+//
+// FAIL-ON-REVERT: restoring strconv.Atoi in queryIntStrict / ParseICMPValue
+// makes "+80"/"+8" parse and the handler return HTTP 200, flipping the want-400
+// signed cases red.
+func TestRESTPolicyMatchSignedPort(t *testing.T) {
+	s := &Server{store: newPolicyMatchStore(t)}
+
+	base := "/api/v1/security/policies/match?from_zone=trust&to_zone=untrust"
+	cases := []struct {
+		name string
+		url  string
+		want int
+	}{
+		{"dst_port signed", base + "&dst_port=%2B80", 400},
+		{"src_port signed", base + "&src_port=%2B80", 400},
+		{"dst_port signed zero", base + "&dst_port=%2B0", 400},
+		{"icmp_type signed", base + "&protocol=icmp&icmp_type=%2B8", 400},
+		{"icmp_code signed", base + "&protocol=icmp&icmp_code=%2B0", 400},
+		{"dst_port plain", base + "&dst_port=80", 200},
+		{"icmp_type plain", base + "&protocol=icmp&icmp_type=8", 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			s.matchPoliciesHandler(rr, httptest.NewRequest("GET", tc.url, nil))
+			if rr.Code != tc.want {
+				t.Fatalf("%s: status = %d, want %d; body: %s",
+					tc.name, rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+}
+
 // TestRESTPolicyMatchProtocol asserts the #3108 contract for the policy-match
 // simulator: a non-empty but unknown/out-of-range protocol token must 400, not
 // silently become the "any protocol" wildcard (the shared matcher's matchApp

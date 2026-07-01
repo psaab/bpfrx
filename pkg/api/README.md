@@ -391,7 +391,11 @@ under the daemon's errgroup. Nothing else imports this package.
   cross-zone observability leak). `queryUint16Strict`/`queryIntStrict`
   (`api.go`) return `(0, false)` on a malformed non-empty value; the
   sessions/events `zone` filter and the policy-match `dst_port`/`src_port`
-  return HTTP 400 instead of zeroing the predicate. The session `protocol`
+  return HTTP 400 instead of zeroing the predicate. #3679: `queryIntStrict`
+  parses via `config.ParseCanonicalUint` rather than `strconv.Atoi`, so a
+  signed/non-canonical spelling (`dst_port=+80`, which `Atoi` accepted as `80`)
+  is rejected here exactly as the #3606 commit-time and dataplane port parsers
+  reject it — no commit-vs-diagnostic split. The session `protocol`
   filter (`sessions.go` `protoFilterMatches`) is case-insensitive AND
   accepts a numeric IP protocol number (`tcp`/`TCP`/`6` all match TCP),
   mirroring gRPC (`pkg/grpcapi` `protoFilterMatches`) and CLI. The event
