@@ -1984,6 +1984,27 @@ admits them through the #3113 unsupported-leaf gate for global scope and the
 gate still rejects them under a zone-pair policy). `compilePolicy` reads them
 into `Policy.Match.FromZone`/`.ToZone` (empty = all zones).
 
+**#3673 — the zone-context sibling of the #3142 tail escape.** Because
+from-zone/to-zone are NOT registered `match` siblings under a zone-pair policy,
+a flat-set or bracketed list that writes them after a value collapses them onto
+the preceding multi:true leaf's tail (the #2419 collapse) rather than making
+them a direct child — e.g. `match application any from-zone C` yields one
+`application` leaf whose tail carries `from-zone C`, and `match application
+[ from-zone bad ]` does the same. The #3113 direct-child scan never inspects the
+tail, so from-zone/to-zone are consumed as bogus application (or, on a
+source-address/destination-address tail, address) operands. The
+undefined-application gate (#3144) and the address-definedness gate reject the
+unknown token only because it is not defined — an operator who defines an
+application/address literally named `from-zone`/`to-zone` satisfies those gates
+and the reserved keyword commits silently as an operand (a fail-open).
+`validatePolicyMatchLeavesStrict` now also scans the collapsed tail for the
+`swallowedStructuralMatchTokens` set (from-zone/to-zone) and rejects a match
+there (strict on commit, warn on the tolerant load path — #1960), mirroring the
+#3142 `unsupportedPolicyMatchLeaves` tail scan. The global scope is unaffected:
+there from-zone/to-zone ARE siblings, so the collapse stops at them and they
+stay a legitimate direct-child match leaf. Coverage:
+`pkg/config/compiler_policy_match_3673_test.go`.
+
 On the wire the global policy keeps the `junos-global` sentinel on its
 structural from/to-zone (so the dataplane classifier keeps it in the global
 tier and preserves global config order) and carries the context on the additive
