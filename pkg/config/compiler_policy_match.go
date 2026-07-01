@@ -120,14 +120,63 @@ var unsupportedPolicyMatchLeaves = map[string]bool{
 	"source-identity":     true,
 }
 
+// swallowedStructuralMatchTokens are structural policy `match` keywords that
+// are legitimate ONLY as their own match leaf, never as an operand of a
+// multi:true match leaf (application / source-address / destination-address).
+//
+// #3673 closes the sibling of the #3142 escape for the zone-context tokens.
+// Under a ZONE-PAIR policy match, from-zone/to-zone are NOT registered `match`
+// siblings (schema_security.go — the zone pair comes from the surrounding
+// from-zone/to-zone stanza, not a match dimension). A flat-set or bracketed
+// list that writes them after a value therefore collapses them onto the
+// preceding multi-value leaf's tail (the #2419 collapse): e.g.
+//
+//	set ... from-zone A to-zone B policy p match application any from-zone C
+//	set ... from-zone A to-zone B policy p match application [ junos-http from-zone ]
+//
+// both yield one `application` leaf whose tail carries from-zone (and its zone
+// operand). The #3113 direct-child scan sees only the supported `application`
+// leaf; from-zone/C are then consumed as bogus application operands.
+//
+// Today the undefined-application gate (#3144) and, for a source-address /
+// destination-address tail, the address-definedness gate reject the unknown
+// token — but ONLY because it is not a defined application/address. An operator
+// who defines an application (or address-book entry) literally named
+// "from-zone"/"to-zone" satisfies those gates, and the reserved keyword then
+// commits silently as a bogus operand (widening or disarming the policy — a
+// fail-open). from-zone/to-zone are never valid application or address values,
+// so a token from this set in a supported multi-value leaf's collapsed tail is
+// unambiguously a reserved match keyword masquerading as an operand and is
+// rejected exactly as the unsupported leaves above (extending #3113/#3142 to
+// the zone-context tokens).
+//
+// Reachable only under a ZONE-PAIR policy: under a GLOBAL policy match
+// from-zone/to-zone ARE registered siblings (#3148, globalOnlyPolicyMatchLeaves
+// above), so the flat-set/bracket collapse stops at them and they become their
+// own legitimate match leaf — this tail case cannot arise in global scope.
+var swallowedStructuralMatchTokens = map[string]bool{
+	"from-zone": true,
+	"to-zone":   true,
+}
+
 // validatePolicyMatchLeavesStrict walks the `security policies` subtree of
 // the group-expanded AST and rejects any policy whose `match` clause
 // carries a leaf the compiler does not enforce (see file header). Covers
 // both zone-pair and global policies.
 func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, error) {
 	var warnings []string
+	// report routes a formatted rejection through the strict/lenient split: a
+	// hard error on commit / commit-check, a collected warning on load /
+	// peer-sync (#1960 no-brick).
+	report := func(msg string) error {
+		if !lenient {
+			return fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+		return nil
+	}
 	emit := func(scope, policyName, leaf string) error {
-		msg := fmt.Sprintf(
+		return report(fmt.Sprintf(
 			"security policies %s policy %q match %q is not supported "+
 				"(xpf enforces only source-address, destination-address, "+
 				"source-address-excluded, destination-address-excluded, and "+
@@ -136,12 +185,25 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 				"not intend — a fail-open) — remove the %q match criterion "+
 				"(#3113)",
 			scope, policyName, leaf, leaf,
-		)
-		if !lenient {
-			return fmt.Errorf("%s", msg)
-		}
-		warnings = append(warnings, msg)
-		return nil
+		))
+	}
+	// emitSwallowed rejects a structural match keyword (from-zone/to-zone)
+	// absorbed as an operand of a supported multi-value leaf's collapsed tail
+	// (#3673). `leaf` names the multi-value leaf that swallowed the keyword
+	// (application / source-address / destination-address); `tok` is the
+	// reserved keyword.
+	emitSwallowed := func(scope, policyName, leaf, tok string) error {
+		return report(fmt.Sprintf(
+			"security policies %s policy %q match %s absorbed the reserved "+
+				"match keyword %q as an operand (a flat-set or bracketed list "+
+				"collapsed a structural match keyword onto the %s leaf — the "+
+				"#2419 collapse); from-zone/to-zone are match context, never an "+
+				"application or address value, so the keyword is silently "+
+				"consumed as a bogus operand (widening or disarming the policy — "+
+				"a fail-open) — write %q as its own match leaf or remove it "+
+				"(#3673)",
+			scope, policyName, leaf, tok, leaf, tok,
+		))
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node, isGlobal bool) error {
@@ -170,6 +232,17 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 				for _, tok := range firewallMatchValues(m) {
 					if unsupportedPolicyMatchLeaves[tok] {
 						if err := emit(scope, policyName, tok); err != nil {
+							return err
+						}
+					}
+					// #3673: from-zone/to-zone are not zone-pair match siblings,
+					// so they collapse onto this multi-value leaf's tail and are
+					// consumed as bogus application/address operands. Reject them
+					// as a reserved keyword masquerading as a value — the sibling
+					// of the #3142 unsupported-leaf tail escape for the
+					// zone-context tokens.
+					if swallowedStructuralMatchTokens[tok] {
+						if err := emitSwallowed(scope, policyName, leaf, tok); err != nil {
 							return err
 						}
 					}
