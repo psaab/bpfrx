@@ -6502,9 +6502,20 @@ type MatchPoliciesResponse struct {
 	// so a client can branch on the posture without string-parsing. False for a
 	// concrete policy match and for host_inbound_unmatched (which has no
 	// default-policy fallback).
-	DefaultUsed   bool `protobuf:"varint,12,opt,name=default_used,json=defaultUsed,proto3" json:"default_used,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	DefaultUsed bool `protobuf:"varint,12,opt,name=default_used,json=defaultUsed,proto3" json:"default_used,omitempty"`
+	// queried_from_zone / queried_to_zone echo the zone pair the caller ASKED
+	// about (#3627 M06). Unlike from_zone/to_zone (which carry the SCOPE of the
+	// MATCHED policy and are set only on a positive match), these are populated on
+	// EVERY response — positive match, no-match/default, and host-inbound — so a
+	// stored diagnostic for a default-deny or host-inbound verdict proves which
+	// zone pair was tested without a separate copy of the request. They are the
+	// query context, not a policy attribute; for a wildcard-zone or global match
+	// they can differ from from_zone/to_zone (the matched policy's declared
+	// scope).
+	QueriedFromZone string `protobuf:"bytes,13,opt,name=queried_from_zone,json=queriedFromZone,proto3" json:"queried_from_zone,omitempty"`
+	QueriedToZone   string `protobuf:"bytes,14,opt,name=queried_to_zone,json=queriedToZone,proto3" json:"queried_to_zone,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -6619,6 +6630,20 @@ func (x *MatchPoliciesResponse) GetDefaultUsed() bool {
 		return x.DefaultUsed
 	}
 	return false
+}
+
+func (x *MatchPoliciesResponse) GetQueriedFromZone() string {
+	if x != nil {
+		return x.QueriedFromZone
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetQueriedToZone() string {
+	if x != nil {
+		return x.QueriedToZone
+	}
+	return ""
 }
 
 type GetNATRuleStatsRequest struct {
@@ -8149,7 +8174,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\xaf\x03\n" +
+	"_icmp_code\"\x83\x04\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -8164,7 +8189,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\ato_zone\x18\n" +
 	" \x01(\tR\x06toZone\x12 \n" +
 	"\tpolicy_id\x18\v \x01(\rH\x00R\bpolicyId\x88\x01\x01\x12!\n" +
-	"\fdefault_used\x18\f \x01(\bR\vdefaultUsedB\f\n" +
+	"\fdefault_used\x18\f \x01(\bR\vdefaultUsed\x12*\n" +
+	"\x11queried_from_zone\x18\r \x01(\tR\x0fqueriedFromZone\x12&\n" +
+	"\x0fqueried_to_zone\x18\x0e \x01(\tR\rqueriedToZoneB\f\n" +
 	"\n" +
 	"_policy_id\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
