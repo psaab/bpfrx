@@ -1,3 +1,40 @@
+## 2026-07-01 — #3657 surface source-split reject reply/budget counters (status + Prometheus)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3657 (H13/H14/H15/M02/M08) — the #3615 per-source reject
+    counters on the wire (`policy_reject_sent`/`filter_reject_sent`,
+    `*_reply_budget_drops`, `*_output_filter_drops` on `BindingStatus`) were
+    only partially surfaced: `show ... status` printed the output-filter leg
+    but never the SENT nor the TX-frame reply-budget legs (a docs-contract
+    violation — `docs/junos-cli-reference.md` promised budget pressure is
+    counted per source), and Prometheus exposed only the source-neutral
+    aggregate `xpf_userspace_reject_rate_limited_total`. VERIFIED all four
+    SENT+BUDGET counters already exist on the wire and are incremented in
+    `reject_reply.rs` (no Rust change needed — cargo slot held by #3656), so
+    this PR is GO-READ-SIDE only. (1) `format/status.go`: aggregate + print two
+    new zero-suppressed lines — `Generated-reply sent: policy_reject=N
+    filter_reject=N` (H13 active reject SUCCESS volume) and `Generated-reply
+    budget drops: policy_reject=N filter_reject=N` (H14 TX-frame budget
+    suppression), leaving the existing output-filter `Generated-reply drops`
+    line intact. (2) Prometheus (`pkg/api`): new `emitRejectObservability`
+    helper sums per-binding and emits `xpf_userspace_reject_sent_total`,
+    `xpf_userspace_reject_reply_budget_drops_total`,
+    `xpf_userspace_reject_output_filter_drops_total`, each labeled
+    `source="policy"|"filter"`, unconditionally (0 is a real signal);
+    aggregate rate-limit kept for back-compat (H15/M02). (3) RED-on-revert
+    tests: `TestFormatStatusSummaryShowsRejectObservability` (+ zero-suppress
+    variant) and source-split assertions in `TestEmitUserspaceDynamicBufferMetrics`
+    (count 21->27) — both proven RED when the print/emit is neutralized (M08).
+    (4) reconciled `docs/junos-cli-reference.md` §reject-event-truthfulness to
+    describe the three-line split + the Prometheus series. DEFERRED: the reject
+    RATE-LIMIT drop leg itself is still source-neutral (single global-per-reason
+    bucket in `icmp_ratelimit.rs`) — attributing it needs a NEW Rust counter +
+    wire field, filed as #3661 (M02 Rust follow-up; carries the L04 counter-
+    registry note).
+  - **File(s)**: pkg/dataplane/userspace/format/status.go,
+    pkg/dataplane/userspace/format/status_test.go, pkg/api/metrics.go,
+    pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+    pkg/api/metrics_test.go, docs/junos-cli-reference.md, _Log.md
 ## 2026-07-01 — #3656 reject reply: build-feasibility BEFORE token/budget consume (H11/H12)
 
 - **Timestamp**: 2026-07-01

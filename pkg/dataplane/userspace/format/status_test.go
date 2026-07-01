@@ -209,6 +209,69 @@ func TestFormatStatusSummaryShowsNAT64Translations(t *testing.T) {
 	}
 }
 
+// #3657 (H13/H14): the status summary surfaces the per-source reject reply
+// SUCCESS ("Generated-reply sent") and the TX-frame reply-budget suppression
+// ("Generated-reply budget drops") counters wired onto BindingStatus by
+// #3615, alongside the existing egress output-filter "Generated-reply drops"
+// line. Before this the sent/budget legs were aggregated nowhere and never
+// printed — a docs-contract violation (junos-cli-reference.md promises budget
+// pressure is counted per source in `show ... status`). Reverting the
+// formatter drops the two new lines and turns this test RED.
+func TestFormatStatusSummaryShowsRejectObservability(t *testing.T) {
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
+			{
+				Slot:                          0,
+				PolicyRejectSent:              5,
+				FilterRejectSent:              2,
+				PolicyRejectReplyBudgetDrops:  3,
+				FilterRejectReplyBudgetDrops:  1,
+				PolicyRejectOutputFilterDrops: 7,
+				FilterRejectOutputFilterDrops: 4,
+			},
+			{
+				Slot:                          1,
+				PolicyRejectSent:              6,
+				FilterRejectSent:              8,
+				PolicyRejectReplyBudgetDrops:  9,
+				FilterRejectReplyBudgetDrops:  10,
+				PolicyRejectOutputFilterDrops: 11,
+				FilterRejectOutputFilterDrops: 12,
+			},
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	for _, want := range []string{
+		// #3615 output-filter leg (policy=18 filter=16) must remain split.
+		"Generated-reply drops:     time_exceeded=0 policy_reject=18 filter_reject=16 syn_cookie=0 ptb=0 classify_parse_errors=0",
+		// #3657 new SUCCESS line (policy=11 filter=10).
+		"Generated-reply sent:      policy_reject=11 filter_reject=10",
+		// #3657 new TX-frame budget suppression line (policy=12 filter=11).
+		"Generated-reply budget drops: policy_reject=12 filter_reject=11",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summary missing reject observability %q:\n%s", want, out)
+		}
+	}
+}
+
+// #3657: the sent and budget-drop lines are suppressed entirely when their
+// counters are all zero, so a quiet firewall does not print noise rows (same
+// zero-suppression discipline as the SYN-cookie and output-filter lines).
+func TestFormatStatusSummaryHidesZeroRejectObservability(t *testing.T) {
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{{Slot: 0}},
+	}
+	out := FormatStatusSummary(status)
+	if strings.Contains(out, "Generated-reply sent:") {
+		t.Fatalf("summary printed reject sent row for all-zero counters:\n%s", out)
+	}
+	if strings.Contains(out, "Generated-reply budget drops:") {
+		t.Fatalf("summary printed reject budget-drop row for all-zero counters:\n%s", out)
+	}
+}
+
 func TestFormatSYNCookieCounterRows(t *testing.T) {
 	status := userspace.ProcessStatus{
 		Bindings: []userspace.BindingStatus{

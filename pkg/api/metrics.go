@@ -326,6 +326,17 @@ type xpfCollector struct {
 	userspaceTimeExceededRateLimited *prometheus.Desc
 	userspacePacketTooBigRateLimited *prometheus.Desc
 	userspaceRejectRateLimited       *prometheus.Desc
+	// #3657 (H15/M02): source-split reject reply telemetry. The aggregate
+	// userspaceRejectRateLimited above stays for back-compat; these expose
+	// the #3615 per-BindingStatus sent / TX-frame reply-budget /
+	// egress output-filter drop legs, labeled source=policy|filter, so
+	// alerting can attribute reject SUCCESS vs SUPPRESSION to a security
+	// policy `then reject` or a firewall-filter `then reject`. (The
+	// rate-limit bucket itself is still source-neutral in the helper — a
+	// per-source split of it needs a Rust change, tracked separately.)
+	userspaceRejectSent              *prometheus.Desc
+	userspaceRejectReplyBudgetDrops  *prometheus.Desc
+	userspaceRejectOutputFilterDrops *prometheus.Desc
 	userspaceFlowCacheActiveFlows    *prometheus.Desc
 	userspaceFlowCacheCapacity       *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
@@ -647,6 +658,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceTimeExceededRateLimited
 	ch <- c.userspacePacketTooBigRateLimited
 	ch <- c.userspaceRejectRateLimited
+	ch <- c.userspaceRejectSent
+	ch <- c.userspaceRejectReplyBudgetDrops
+	ch <- c.userspaceRejectOutputFilterDrops
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal

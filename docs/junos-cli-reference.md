@@ -297,11 +297,27 @@ From zone: guest, To zone: lan
     truthful `action deny` — the forensic log never claims an active reject
     that was not sent. Reply-free deny paths (non-first fragments with no L4
     header, the forward/output-filter path that has no reply synthesis pending
-    #3608) log `deny` for the same reason. Suppression is counted per source in
-    `show ... status`: `policy_reject`/`filter_reject` under the
-    `Generated-reply drops` line distinguish a policy `then reject` from a
-    firewall-filter `then reject` that was dropped by budget or an output
-    filter.
+    #3608) log `deny` for the same reason. Both SUCCESS and SUPPRESSION are
+    counted per source in `show ... status` (#3657), each split
+    `policy_reject`/`filter_reject` so a security-policy `then reject` is
+    never conflated with a firewall-filter `then reject`:
+
+    - `Generated-reply sent` — replies actually enqueued (active reject
+      volume; a zone `tcp-rst` counts under `policy_reject`).
+    - `Generated-reply budget drops` — replies suppressed because the
+      per-tick TX-frame budget was exhausted.
+    - `Generated-reply drops` — replies dropped by an egress output firewall
+      filter applied to the reflected reply's own tuple (`policy_reject` /
+      `filter_reject` legs, alongside `time_exceeded` / `syn_cookie` / `ptb`
+      / `classify_parse_errors`).
+
+    The global reject rate-limit bucket is separate and source-neutral
+    (`reject_rate_limited_total`; a single global-per-reason token bucket).
+    The same source-split legs are exported to Prometheus as
+    `xpf_userspace_reject_sent_total`,
+    `xpf_userspace_reject_reply_budget_drops_total`, and
+    `xpf_userspace_reject_output_filter_drops_total`, each labeled
+    `source="policy"|"filter"`.
   - **Default-deny posture (#3405):** EVERY configured security zone denies
     host-bound traffic by default (Junos/vSRX parity). A zone with interfaces
     but NO `host-inbound-traffic` stanza is treated exactly like an empty

@@ -155,6 +155,15 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	var synCookieOutputFilterDrops uint64
 	var ptbOutputFilterDrops uint64
 	var generatedReplyClassifyParseErrors uint64
+	// #3657 (H13/H14): per-source reject reply SUCCESS and TX-frame
+	// reply-budget suppression. #3615 wired these onto the BindingStatus
+	// wire struct (policy vs firewall-filter `then reject`) but the
+	// formatter never surfaced them; an operator could not see active
+	// reject volume nor the budget-pressure suppression the docs promise.
+	var policyRejectSent uint64
+	var filterRejectSent uint64
+	var policyRejectReplyBudgetDrops uint64
+	var filterRejectReplyBudgetDrops uint64
 	var snatPackets uint64
 	var dnatPackets uint64
 	var nat64Translations uint64
@@ -254,6 +263,10 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		synCookieOutputFilterDrops += binding.SYNCookieOutputFilterDrops
 		ptbOutputFilterDrops += binding.PTBOutputFilterDrops
 		generatedReplyClassifyParseErrors += binding.GeneratedReplyClassifyParseErrors
+		policyRejectSent += binding.PolicyRejectSent
+		filterRejectSent += binding.FilterRejectSent
+		policyRejectReplyBudgetDrops += binding.PolicyRejectReplyBudgetDrops
+		filterRejectReplyBudgetDrops += binding.FilterRejectReplyBudgetDrops
 		snatPackets += binding.SNATPackets
 		dnatPackets += binding.DNATPackets
 		nat64Translations += binding.Nat64Translations
@@ -477,6 +490,24 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 			timeExceededOutputFilterDrops, policyRejectOutputFilterDrops,
 			filterRejectOutputFilterDrops,
 			synCookieOutputFilterDrops, ptbOutputFilterDrops, generatedReplyClassifyParseErrors)
+	}
+	// #3657 (H13): active reject SUCCESS volume, split policy vs
+	// firewall-filter `then reject` (#3615). As important as the
+	// suppression counters for validating vSRX-style reject under load.
+	if policyRejectSent != 0 || filterRejectSent != 0 {
+		fmt.Fprintf(&b, "  Generated-reply sent:      policy_reject=%d filter_reject=%d\n",
+			policyRejectSent, filterRejectSent)
+	}
+	// #3657 (H14): TX-frame reply-budget suppression, split by source. The
+	// docs (junos-cli-reference.md) promise budget pressure is counted per
+	// source under the generated-reply status — a policy `then reject`
+	// silently downgraded to `deny` because the per-tick TX-frame budget was
+	// exhausted must be attributable, distinct from an egress output-filter
+	// drop (the "Generated-reply drops" line above) and the global reject
+	// rate-limit bucket (RejectRateLimitedTotal).
+	if policyRejectReplyBudgetDrops != 0 || filterRejectReplyBudgetDrops != 0 {
+		fmt.Fprintf(&b, "  Generated-reply budget drops: policy_reject=%d filter_reject=%d\n",
+			policyRejectReplyBudgetDrops, filterRejectReplyBudgetDrops)
 	}
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)
