@@ -26104,3 +26104,27 @@ top.
     pkg/flowexport/per_collector_source_3745_test.go (new RED-on-revert),
     docs/config-schema.md, docs/feature-coverage.md,
     pkg/flowexport/README.md (docs)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3741 — flowexport Prometheus collector metrics
+    under-labeled. The `xpf_flow_export_collector_*` family declared only
+    `{protocol, collector, source}` labels, but FlowCollectorHealth()
+    returns MULTIPLE health rows per (protocol, collector) pair — one per
+    template group, per family-disjoint sampling instance. Two such rows
+    collapsed onto an IDENTICAL labelset, so a PEDANTIC registry rejects
+    the duplicate series (scrape error) and a plain gather silently
+    collapses / hides the failing group. Added the `instance` + `template`
+    labels (ExporterCollectorHealth already carries them) to all five
+    descriptors AND the emission, giving each distinct group a unique
+    labelset. Label set is now `{protocol, instance, template, collector,
+    source}`. Two RED-on-revert tests: distinct-labelset-per-group (two
+    rows sharing protocol+collector+source but differing by
+    instance/template must gather without a duplicate error and both
+    groups' distinct values survive) and a descriptor↔emission label
+    canary (every sample carries exactly the five labels). Verified RED on
+    revert (duplicate-series Gather error + missing-label failures);
+    pkg/api go test green; go build ./... green; gofmt + vet clean.
+  - **File(s)**: pkg/api/metrics_descriptors.go (5 descriptor label
+    sets + doc), pkg/api/metrics_system.go (emission + collect doc),
+    pkg/api/metrics_flowexport_test.go (2 new RED-on-revert tests),
+    docs/feature-coverage.md (instance/template label doc)

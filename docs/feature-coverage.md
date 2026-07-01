@@ -149,7 +149,13 @@ the userspace dataplane admission boundary is in
   per collector, not collapsed to one family-wide value (#3745), and is
   surfaced in every health surface (`... source <src>` in the CLI,
   `source_address` in the REST JSON, and the `source` label on the
-  `xpf_flow_export_collector_*` metrics).
+  `xpf_flow_export_collector_*` metrics). The Prometheus family is also
+  labeled by `instance` and `template` (#3741): the daemon returns one
+  health row per template group / family-disjoint sampling instance, so
+  two groups that share a single collector address stay distinct series —
+  without those labels the rows collide on an identical `{protocol,
+  collector, source}` labelset and Prometheus either rejects the duplicate
+  (scrape error) or silently collapses the failing group.
 - **Prometheus metrics** (`/metrics` endpoint).
 - **SNMP**: system + ifTable MIB.
 - **RPM probes**, dynamic address feeds.

@@ -1725,28 +1725,28 @@ func newCollector(srv *Server) *xpfCollector {
 		// #2464: per-collector flow-export write-health.
 		flowExportCollectorWriteAttemptsTotal: prometheus.NewDesc(
 			"xpf_flow_export_collector_write_attempts_total",
-			"Total NetFlow v9 / IPFIX UDP write attempts per collector.",
-			[]string{"protocol", "collector", "source"}, nil,
+			"Total NetFlow v9 / IPFIX UDP write attempts per collector. Labeled by instance and template as well as collector and source, so two template groups / family-disjoint instances that share one collector address stay distinct series (#3741).",
+			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
 		),
 		flowExportCollectorWriteFailuresTotal: prometheus.NewDesc(
 			"xpf_flow_export_collector_write_failures_total",
-			"Total NetFlow v9 / IPFIX UDP write failures per collector (a climbing value while attempts climb means the collector is unreachable and flow records are being silently dropped).",
-			[]string{"protocol", "collector", "source"}, nil,
+			"Total NetFlow v9 / IPFIX UDP write failures per collector (a climbing value while attempts climb means the collector is unreachable and flow records are being silently dropped). Labeled by instance and template as well as collector and source, so a failing template group sharing a collector address is attributable, not hidden (#3741).",
+			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
 		),
 		flowExportCollectorHealthy: prometheus.NewDesc(
 			"xpf_flow_export_collector_healthy",
-			"1 when the last write to this flow-export collector succeeded, 0 when the last write failed.",
-			[]string{"protocol", "collector", "source"}, nil,
+			"1 when the last write to this flow-export collector succeeded, 0 when the last write failed. Labeled by instance and template as well as collector and source (#3741).",
+			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
 		),
 		flowExportCollectorLastSuccessSeconds: prometheus.NewDesc(
 			"xpf_flow_export_collector_last_success_timestamp_seconds",
-			"Unix timestamp of the last successful write to this flow-export collector (0 if none yet).",
-			[]string{"protocol", "collector", "source"}, nil,
+			"Unix timestamp of the last successful write to this flow-export collector (0 if none yet). Labeled by instance and template as well as collector and source (#3741).",
+			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
 		),
 		flowExportCollectorLastFailureSeconds: prometheus.NewDesc(
 			"xpf_flow_export_collector_last_failure_timestamp_seconds",
-			"Unix timestamp of the last failed write to this flow-export collector (0 if none yet).",
-			[]string{"protocol", "collector", "source"}, nil,
+			"Unix timestamp of the last failed write to this flow-export collector (0 if none yet). Labeled by instance and template as well as collector and source (#3741).",
+			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
 		),
 	}
 }

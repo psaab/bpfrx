@@ -136,3 +136,177 @@ func TestFlowExportCollectorMetricsOmittedWhenUnwired(t *testing.T) {
 		}
 	}
 }
+
+// TestFlowExportCollectorMetricsDistinctLabelsetPerGroup pins #3741: the
+// daemon legitimately returns MULTIPLE FlowCollectorHealth rows for the
+// SAME (protocol, collector, source) triple — one per template group, one
+// per family-disjoint sampling instance. Before this fix the descriptor
+// carried only {protocol, collector, source}, so those rows collapsed to
+// an IDENTICAL labelset: a PEDANTIC registry rejects the duplicate series
+// (scrape error) and a plain gather silently collapses the failing group,
+// hiding a partial flow-export failure. The instance + template labels
+// make each group a distinct series.
+//
+// FAIL-ON-REVERT: drop instance/template from the descriptor + emission
+// and the two rows below share one labelset →
+// prometheus.NewPedanticRegistry().Gather() returns a duplicate-series
+// error and this test fails. It also asserts BOTH groups' distinct values
+// survive (the "silently collapses / hides the failing group" half).
+func TestFlowExportCollectorMetricsDistinctLabelsetPerGroup(t *testing.T) {
+	s := &Server{
+		flowCollectorHealthFn: func() []flowexport.ExporterCollectorHealth {
+			return []flowexport.ExporterCollectorHealth{
+				// Same protocol + collector address + source, different
+				// template group. Group "t-healthy" is up; "t-failing" is
+				// down — the failing group must remain attributable.
+				{
+					Protocol: "netflow-v9",
+					Instance: "sampler",
+					Template: "t-healthy",
+					CollectorHealth: flowexport.CollectorHealth{
+						Address:       "10.0.0.9:2055",
+						SourceAddress: "10.0.0.2",
+						WriteAttempts: 200,
+						WriteFailures: 0,
+						Healthy:       true,
+					},
+				},
+				{
+					Protocol: "netflow-v9",
+					Instance: "sampler",
+					Template: "t-failing",
+					CollectorHealth: flowexport.CollectorHealth{
+						Address:       "10.0.0.9:2055",
+						SourceAddress: "10.0.0.2",
+						WriteAttempts: 200,
+						WriteFailures: 200,
+						Healthy:       false,
+					},
+				},
+			}
+		},
+	}
+	// PEDANTIC registry: this is the instrument that turns a duplicate
+	// labelset into a Gather() error (the scrape-breaking half of #3741).
+	reg := prometheus.NewPedanticRegistry()
+	reg.MustRegister(newCollector(s))
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("pedantic Gather() returned an error — two health rows that "+
+			"share (protocol, collector, source) but differ by "+
+			"instance/template collided on one labelset (the #3741 "+
+			"duplicate-series bug). Error: %v", err)
+	}
+
+	// byTemplate returns the value of `name` for the given template label.
+	byTemplate := func(name, template string) (float64, bool) {
+		for _, mf := range mfs {
+			if mf.GetName() != name {
+				continue
+			}
+			for _, m := range mf.GetMetric() {
+				var tmpl string
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "template" {
+						tmpl = lp.GetValue()
+					}
+				}
+				if tmpl != template {
+					continue
+				}
+				if g := m.GetGauge(); g != nil {
+					return g.GetValue(), true
+				}
+				if ctr := m.GetCounter(); ctr != nil {
+					return ctr.GetValue(), true
+				}
+			}
+		}
+		return 0, false
+	}
+
+	// Both distinct groups must survive as separate series (the failing
+	// group is not collapsed / hidden).
+	if v, ok := byTemplate("xpf_flow_export_collector_healthy", "t-healthy"); !ok || v != 1 {
+		t.Errorf("healthy group healthy = %v (ok=%v), want 1 — the healthy "+
+			"template group is missing or was overwritten", v, ok)
+	}
+	if v, ok := byTemplate("xpf_flow_export_collector_healthy", "t-failing"); !ok || v != 0 {
+		t.Errorf("failing group healthy = %v (ok=%v), want 0 — the FAILING "+
+			"template group is hidden (collapsed onto the healthy row)", v, ok)
+	}
+	if v, ok := byTemplate("xpf_flow_export_collector_write_failures_total", "t-failing"); !ok || v != 200 {
+		t.Errorf("failing group write_failures = %v (ok=%v), want 200", v, ok)
+	}
+}
+
+// TestFlowExportCollectorMetricsLabelSet is the descriptor↔emission label
+// canary for #3741: every sample in the xpf_flow_export_collector_* family
+// must carry EXACTLY {protocol, instance, template, collector, source}.
+// The emitted label NAMES come from the *prometheus.Desc (so a descriptor
+// that drops a label fails here), and MustNewConstMetric would panic if
+// the emission supplied the wrong VALUE arity — so this asserts the two
+// sides agree.
+func TestFlowExportCollectorMetricsLabelSet(t *testing.T) {
+	s := &Server{
+		flowCollectorHealthFn: func() []flowexport.ExporterCollectorHealth {
+			return []flowexport.ExporterCollectorHealth{
+				{
+					Protocol: "ipfix",
+					Instance: "inst",
+					Template: "tmpl",
+					CollectorHealth: flowexport.CollectorHealth{
+						Address:       "10.0.0.1:4739",
+						SourceAddress: "10.0.0.2",
+						WriteAttempts: 1,
+						Healthy:       true,
+					},
+				},
+			}
+		},
+	}
+	reg := prometheus.NewPedanticRegistry()
+	reg.MustRegister(newCollector(s))
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	wantLabels := map[string]bool{
+		"protocol": true, "instance": true, "template": true,
+		"collector": true, "source": true,
+	}
+	families := map[string]bool{
+		"xpf_flow_export_collector_write_attempts_total":           true,
+		"xpf_flow_export_collector_write_failures_total":           true,
+		"xpf_flow_export_collector_healthy":                        true,
+		"xpf_flow_export_collector_last_success_timestamp_seconds": true,
+		"xpf_flow_export_collector_last_failure_timestamp_seconds": true,
+	}
+	seen := map[string]bool{}
+	for _, mf := range mfs {
+		if !families[mf.GetName()] {
+			continue
+		}
+		seen[mf.GetName()] = true
+		for _, m := range mf.GetMetric() {
+			got := map[string]bool{}
+			for _, lp := range m.GetLabel() {
+				got[lp.GetName()] = true
+			}
+			if len(got) != len(wantLabels) {
+				t.Errorf("%s has %d labels %v, want %d %v", mf.GetName(),
+					len(got), got, len(wantLabels), wantLabels)
+			}
+			for l := range wantLabels {
+				if !got[l] {
+					t.Errorf("%s missing label %q (labels=%v)", mf.GetName(), l, got)
+				}
+			}
+		}
+	}
+	for f := range families {
+		if !seen[f] {
+			t.Errorf("family %q not emitted", f)
+		}
+	}
+}
