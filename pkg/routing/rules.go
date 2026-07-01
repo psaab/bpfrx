@@ -69,6 +69,20 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 		slog.Warn("failed to clear old next-table rules", "err", clearErr)
 	}
 
+	// Aggregate every failure (clear + per-rule add) and return it so the
+	// commit/apply outcome reflects a half-installed leak instead of
+	// reporting success after the up-front clear already removed the
+	// previously-working next-table rules (#3731). A per-rule RuleAdd error
+	// used to be logged and swallowed (Apply returned clearErr only), so a
+	// transient netlink failure after clear() left inter-VRF leaking DOWN
+	// with no signal to the daemon apply loop. This mirrors the #3430 PBR
+	// pattern (aggregate + errors.Join) already used below. The clear error,
+	// if any, is the first aggregated entry.
+	var errs []error
+	if clearErr != nil {
+		errs = append(errs, clearErr)
+	}
+
 	prio := nextTableRulePriority
 	for _, sr := range routes {
 		if sr.NextTable == "" {
@@ -112,18 +126,19 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 		rule.Family = family
 
 		if err := n.ops.RuleAdd(rule); err != nil {
-			slog.Warn("failed to add next-table rule",
-				"destination", sr.Destination, "instance", sr.NextTable,
-				"table", tableID, "err", err)
+			errs = append(errs, fmt.Errorf(
+				"add next-table rule destination %s instance %s table %d: %w",
+				sr.Destination, sr.NextTable, tableID, err))
 			continue
 		}
 		slog.Info("next-table rule added",
 			"destination", sr.Destination, "instance", sr.NextTable, "table", tableID)
 		prio++
 	}
-	// Desired rules are re-added; surface any clear() list failure so the
-	// orphaned-rule window is observable rather than silently nil.
-	return clearErr
+	// Desired rules are re-added; surface any clear/add failure so a dropped
+	// leak rule (or the orphaned-rule window) is observable rather than
+	// silently nil (#3731 / #2273).
+	return errors.Join(errs...)
 }
 
 // clear removes all ip rules in the next-table priority range.
@@ -186,8 +201,21 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 		slog.Warn("failed to clear old rib-group rules", "err", clearErr)
 	}
 
+	// Aggregate every failure (clear + per-rule add) and return it so a
+	// dropped leak rule is surfaced instead of reporting success after the
+	// up-front clear already removed the previously-working rules (#3731).
+	// A per-rule RuleAdd error used to be logged and swallowed (Apply
+	// returned clearErr only), so a transient netlink failure after clear()
+	// left inter-VRF leaking DOWN with no signal. This mirrors the #3430 PBR
+	// pattern (aggregate + errors.Join) already used below. The clear error,
+	// if any, is the first aggregated entry.
+	var errs []error
+	if clearErr != nil {
+		errs = append(errs, clearErr)
+	}
+
 	if len(ribGroups) == 0 || len(instances) == 0 {
-		return clearErr
+		return errors.Join(errs...)
 	}
 
 	// Build instance name → table ID map
@@ -271,8 +299,9 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 		rule.Family = unix.AF_INET
 
 		if err := rg.ops.RuleAdd(rule); err != nil {
-			slog.Warn("failed to add rib-group IPv4 rule",
-				"instance", inst.Name, "table", sourceTable, "err", err)
+			errs = append(errs, fmt.Errorf(
+				"add rib-group IPv4 rule instance %s table %d: %w",
+				inst.Name, sourceTable, err))
 		} else {
 			slog.Info("rib-group rule added",
 				"instance", inst.Name, "table", sourceTable,
@@ -287,8 +316,9 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 		rule6.Family = unix.AF_INET6
 
 		if err := rg.ops.RuleAdd(rule6); err != nil {
-			slog.Warn("failed to add rib-group IPv6 rule",
-				"instance", inst.Name, "table", sourceTable, "err", err)
+			errs = append(errs, fmt.Errorf(
+				"add rib-group IPv6 rule instance %s table %d: %w",
+				inst.Name, sourceTable, err))
 		} else {
 			slog.Info("rib-group rule added",
 				"instance", inst.Name, "table", sourceTable,
@@ -296,8 +326,10 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 		}
 		prio++
 	}
-	// Desired rules are re-added; surface any clear() list failure.
-	return clearErr
+	// Desired rules are re-added; surface any clear/add failure so a dropped
+	// leak rule (or the orphaned-rule window) is observable rather than
+	// silently nil (#3731 / #2273).
+	return errors.Join(errs...)
 }
 
 // clear removes all ip rules in the rib-group priority range. Also

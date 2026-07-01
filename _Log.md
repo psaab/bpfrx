@@ -1,3 +1,35 @@
+## 2026-07-01 — #3731 routing: next-table + rib-group Apply aggregate & surface RuleAdd failures (stop swallowing)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3731 (MEDIUM, silent loss of configured inter-VRF
+    forwarding). `nextTableManager.Apply` and `ribGroupManager.Apply`
+    called netlink `RuleAdd` best-effort — a per-rule add failure was
+    WARN-logged and the function returned only `clearErr` (i.e. `nil` on
+    the common path). After the up-front `clear()` had already removed the
+    previously-working leak rules, a transient `RuleAdd` failure (EEXIST /
+    ENOBUFS / racing reconcile) left inter-VRF route-leaking DOWN while
+    Apply reported success to the daemon apply loop. The #3430-hardened PBR
+    path already aggregates add failures with `errors.Join`; the two
+    sibling reconcilers were left swallowing.
+    FIX (mirror the PBR pattern, EEXIST-safe): both paths now collect each
+    `RuleAdd` failure into an `errs []error` (seeded with `clearErr`) while
+    still attempting every remaining desired rule (forward progress), and
+    return `errors.Join(errs...)`. The clean/idempotent re-apply is
+    unaffected — `clear()` removes the in-window rules before they are
+    re-added, so a re-apply never hits EEXIST and returns nil. rib-group
+    increments `prio` per add attempt regardless of success (the v4/v6 pair
+    reserves two slots as a unit — cap logic preserved).
+  - **File(s)**: pkg/routing/rules.go, pkg/routing/rules_test.go,
+    pkg/routing/README.md
+  - **Tests**: added `TestNextTableApplyAggregatesAddErrors`,
+    `TestNextTableApplyIdempotentReapply`, and
+    `TestRibGroupApplyAggregatesAddErrors` (v4-only / v6-only / both-family
+    subtests); added a per-family `addErrFamily` + `failAdd` helper to
+    `fakeRuleOps` so one family can fail while the sibling installs.
+    RED-on-revert verified: stashing the rules.go fix makes all three
+    aggregation tests fail (Apply returns nil). go test ./pkg/routing/...
+    green; go build ./... green; gofmt + vet clean.
+
 ## 2026-07-01 — #3780 policy scheduler: fallible + self-healing republish (fix stale-permit-after-window fail-open)
 
 - **Timestamp**: 2026-07-01
