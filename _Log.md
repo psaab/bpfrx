@@ -24963,3 +24963,17 @@ top.
 - **File(s)**: pkg/cli/cli_show_security_zones_policy_tiers_3658_test.go (new), pkg/grpcapi/server_show_zones_policy_tiers_3658_test.go (new)
 - **Action**: Document the detail-mode three-tier policy summary
 - **File(s)**: docs/junos-cli-reference.md, _Log.md
+
+## 2026-07-01 — #3669 + #3672 remote CLI show.go fixes
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3669 (H03) — stop swallowing the GetPolicies RPC error in remote `show security zones` (showZones). Capture polErr; render zone bodies (GetZones succeeded) then return a wrapped "policy inventory unavailable" error so a control-plane failure exits non-zero instead of rendering zones as policy-free with exit 0
+- **File(s)**: cmd/cli/show.go
+- **Action**: #3672 (M01-M04) — extend the non-detail renderRule to surface the wire fields it dropped: src/dst "(except)" exclusion markers (source/destination_address_excluded), session log modes (Log: at-create, at-close / enabled), scheduler + inactive state (Scheduler: <name> (inactive) / Inactive: true), and count state (Hit count printed even at zero for a `then count` rule). Plain rules render byte-identically to before
+- **File(s)**: cmd/cli/show.go
+- **Action**: Add getPoliciesErr/getZonesErr injection to the fake gRPC client
+- **File(s)**: cmd/cli/nontty_test.go
+- **Action**: Add RED-on-revert tests — #3669 error surfacing + happy path; #3672 all-metadata rendering, inactive-without-scheduler, and plain-rule-unchanged
+- **File(s)**: cmd/cli/show_zones_polerr_3669_test.go (new), cmd/cli/show_policies_metadata_3672_test.go (new)
+- **Action**: Document both fixes in the CLI reference (remote non-detail renderer metadata; policy-inventory failure fails loud)
+- **File(s)**: docs/junos-cli-reference.md, _Log.md

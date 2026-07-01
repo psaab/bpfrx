@@ -759,6 +759,29 @@ Global policies:
   `... brief` prints the per-rule `match_from_zone`/`match_to_zone` (falling back
   to `*`/`*` only for an unscoped global) instead of the group `*`. The shared
   selection predicate is `policymatch.GlobalPolicyAppliesToZonePair`.
+- **#3672 — remote non-detail renderer surfaces per-rule metadata.** The remote
+  CLI `show security policies` (non-detail) `renderRule` (`cmd/cli/show.go`)
+  previously printed only name / description / raw addresses / action / hits,
+  silently dropping security-relevant fields the gRPC `PolicyRule` already
+  carries (#3336 / #3623 / #3624). It now renders, matching the local/gRPC-text
+  surfaces:
+  - **Match inversion (M01):** `src=[...] (except)` / `dst=[...] (except)` when
+    `source_address_excluded` / `destination_address_excluded` is set — an
+    exclusive ("all EXCEPT these") match no longer reads identical to an
+    inclusive one.
+  - **Session logging (M02):** `Log: at-create, at-close` from the independent
+    `log_session_init` / `log_session_close` modes (falls back to `Log: enabled`
+    when only the collapsed `log` bool is set). A logged permit is no longer
+    indistinguishable from an unlogged one.
+  - **Scheduler state (M03):** `Scheduler: <name> (inactive)` (or
+    `Scheduler: <name>` when active), and `Inactive: true` for a rule marked
+    inactive without a scheduler name — a scheduled rule outside its active
+    window is no longer shown as a plain `Action: permit`.
+  - **Count state (M04):** a `then count` rule prints `Hit count: 0 packets,
+    0 bytes` even when idle, so counted-but-idle is distinguishable from
+    not-counted. A plain rule with no metadata bits set renders byte-identically
+    to the pre-#3672 output (no `(except)` / `Log:` / `Scheduler:` /
+    `Inactive:` / zero `Hit count:` lines).
 
 ---
 
@@ -820,6 +843,16 @@ Security zone: junos-host
   post-#3405). The gRPC text view labels the zone-level lines
   `Host-inbound system-services:` / `Host-inbound protocols:`.
 - Blank line between zones.
+- **#3669 — policy-inventory failure fails loud (remote CLI).** The remote
+  `show security zones` (`cmd/cli/show.go`) issues a second RPC (`GetPolicies`)
+  to render each zone's `Policies:` reference line. It previously discarded that
+  RPC's error (`polResp, _ := ...`) and returned success, so a control-plane
+  degradation rendered the zones as policy-free with exit 0 —
+  indistinguishable from zones that genuinely have no policies. The zone bodies
+  (from the successful `GetZones`) are still printed, but the command now
+  surfaces the `GetPolicies` error (`policy inventory unavailable ...`) and
+  exits non-zero so an operator or automation can tell a degraded partial view
+  apart from a truly empty one.
 
 **`show security zones detail` policy summary (#3658).** In `detail` mode
 each zone gains a `Policy summary` block that lists the policies that decide
