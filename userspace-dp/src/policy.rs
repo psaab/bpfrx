@@ -3309,14 +3309,14 @@ fn parse_port_spec(spec: &str) -> Option<Vec<PortRange>> {
         other => other,
     };
     if let Some((low, high)) = normalized.split_once('-') {
-        let low = low.parse::<u16>().ok()?;
-        let high = high.parse::<u16>().ok()?;
+        let low = parse_port_u16(low)?;
+        let high = parse_port_u16(high)?;
         if low == 0 || low > high {
             return None;
         }
         return Some(vec![PortRange { low, high }]);
     }
-    let port = normalized.parse::<u16>().ok()?;
+    let port = parse_port_u16(normalized)?;
     if port == 0 {
         return None;
     }
@@ -3324,6 +3324,21 @@ fn parse_port_spec(spec: &str) -> Option<Vec<PortRange>> {
         low: port,
         high: port,
     }])
+}
+
+// parse_port_u16 parses a canonical unsigned decimal port token. Rust's u16
+// FromStr accepts a leading '+' ("+80" -> Ok(80)), but Junos and the Go commit
+// gate (validatePortSpec -> parseCanonicalPort) reject a signed / non-canonical
+// port, and the Go capability gate userspacePortSpecRepresentable parses with
+// strconv.ParseUint (which also rejects the sign). Accepting "+80" here left
+// parse_port_spec MORE lenient than both Go gates — a parser divergence on a
+// security leaf (#3606). Reject any token that is not a bare run of ASCII
+// decimal digits so all three parsers agree.
+fn parse_port_u16(tok: &str) -> Option<u16> {
+    if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    tok.parse::<u16>().ok()
 }
 
 fn port_ranges_match(ranges: &[PortRange], port: u16) -> bool {

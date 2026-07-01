@@ -5316,3 +5316,50 @@ fn policy_rule_counter_snapshot_pairs_totals() {
     assert_eq!(snap.packets, 0, "reset must zero packets");
     assert_eq!(snap.bytes, 0, "reset must zero bytes");
 }
+
+// #3606: parse_port_spec must reject a non-canonical signed port token. Rust's
+// u16 FromStr accepts a leading '+' ("+80" -> Ok(80)), which left this parser
+// MORE lenient than the Go commit gate (validatePortSpec) and the Go capability
+// gate (userspacePortSpecRepresentable via strconv.ParseUint) — both reject the
+// sign. RED-on-revert: restore `.parse::<u16>().ok()?` in place of
+// parse_port_u16 and "+80" parses to a single-port range again.
+#[test]
+fn parse_port_spec_rejects_signed_3606() {
+    // Signed single ports are rejected outright (None).
+    assert!(parse_port_spec("+80").is_none(), "'+80' must be rejected");
+    assert!(parse_port_spec("-80").is_none(), "'-80' must be rejected");
+    // Signed range endpoints are rejected on either side.
+    assert!(
+        parse_port_spec("+80-90").is_none(),
+        "'+80-90' (signed low) must be rejected"
+    );
+    assert!(
+        parse_port_spec("80-+90").is_none(),
+        "'80-+90' (signed high) must be rejected"
+    );
+    // Whitespace-padded tokens are not canonical either.
+    assert!(parse_port_spec(" 80").is_none(), "' 80' must be rejected");
+
+    // Canonical forms still parse (no over-rejection).
+    assert_eq!(
+        parse_port_spec("80"),
+        Some(vec![PortRange { low: 80, high: 80 }])
+    );
+    assert_eq!(
+        parse_port_spec("1024-2048"),
+        Some(vec![PortRange {
+            low: 1024,
+            high: 2048
+        }])
+    );
+    // Empty means "no constraint".
+    assert_eq!(parse_port_spec(""), Some(Vec::new()));
+    // A named alias still resolves.
+    assert_eq!(
+        parse_port_spec("https"),
+        Some(vec![PortRange {
+            low: 443,
+            high: 443
+        }])
+    );
+}
