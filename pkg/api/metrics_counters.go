@@ -49,6 +49,30 @@ func (c *xpfCollector) collectHostInboundKernelDenies(ch chan<- prometheus.Metri
 	}
 }
 
+// collectHostInboundAddresslessZones emits xpf_host_inbound_addressless_zones
+// (#3698): a 1 per configured host-inbound-enforcing zone currently in the
+// transient fail-open admit window — it has a non-lifeline interface but no
+// resolvable address yet, so BuildZoneHostInboundViews yields an empty address
+// set and applyHostInboundFilter emits no deny for it. The series is present
+// only for zones IN the window (absent = enforced), matching the deny-counter
+// contract where a missing sample is meaningful. Config-derived (no dataplane
+// dependency), so Collect calls this BEFORE the dataplane gate. The SSOT for the
+// window is dpuserspace.AddresslessEnforcingZones, the same builder that drives
+// the daemon's state-transition warning log, so the metric and the log agree.
+func (c *xpfCollector) collectHostInboundAddresslessZones(ch chan<- prometheus.Metric) {
+	if c.srv == nil || c.srv.store == nil {
+		return
+	}
+	cfg := c.srv.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	for _, z := range dpuserspace.AddresslessEnforcingZones(cfg) {
+		ch <- prometheus.MustNewConstMetric(c.hostInboundAddresslessZones,
+			prometheus.GaugeValue, 1, z.Zone)
+	}
+}
+
 func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	// #3345: on a counter-read failure, SKIP emitting the sample instead of
 	// reporting a misleading 0, and bump xpf_counter_read_errors_total. A
