@@ -437,3 +437,71 @@ control-plane, no dataplane path touched.
    callback fires on the event-reader goroutine introduce any
    ordering hazard with `applySyslogConfig` (which mutates the same
    EventReader's zone/policy/if-name maps under their own RW locks)?
+
+---
+
+## #3742 follow-up — build-before-swap reconcile (availability + no callback loss)
+
+**Status:** IMPLEMENTED. Folds codex-review-158 H05 + H06.
+
+### Problem (pre-#3742 ordering)
+
+`reconcileV9Exporter` / `reconcileIPFIXExporter` STOPPED and closed the
+old exporters BEFORE constructing the new set. Two defects followed on
+every flow-export config change:
+
+1. **Availability.** A transient `NewExporter` failure (a pinned
+   source-address bind before the source interface is up, transient
+   collector DNS) tore down the healthy running exporters and left flow
+   export DISABLED until the next commit — an observability outage where
+   the old config could have kept running.
+2. **Silent record loss.** A `SESSION_CLOSE` callback firing in the
+   window between "old Run goroutine stopped" and "new bundle stored"
+   read the OLD bundle, queued the record into the OLD exporter's batch,
+   and that batch was never flushed (its Run goroutine had already
+   returned) — the record was lost. The old bundle stayed published
+   across the whole build, so the window spanned the entire (possibly
+   slow) `dialCollectors` latency.
+
+### Fix
+
+Build-before-swap, matching the #3766/#2484 fail-closed apply pattern:
+
+- Resolve + construct the FULL replacement exporter set FIRST. On any
+  `NewExporter` failure, roll back ONLY the partially-built new set,
+  leave the OLD exporters and the published bundle untouched (export
+  stays UP), do NOT record the config hash (so the next commit retries),
+  and surface the error via `FlowExportError()` / `IPFIXExportError()`.
+  When nothing was running, a well-defined empty bundle is published so
+  the callback always reads a valid set.
+- On success, start the new Run goroutines on a FRESH per-generation
+  `sync.WaitGroup`, then atomically `Store` the new bundle BEFORE
+  cancelling/closing the old set. `d.flowBundle` therefore always points
+  at a live, flushing exporter: before the swap a callback drains into
+  the still-running old exporter (which flushes on cancel during
+  teardown); after the swap it drains into the new one. There is no
+  window where the published bundle points at a stopped exporter.
+- `flowWg` / `ipfixWg` became `*sync.WaitGroup` so the new generation can
+  start on its own WaitGroup while the old generation is waited on
+  separately during teardown (a value WaitGroup cannot be handed off).
+  Teardown is centralised in `teardownV9Locked` / `teardownIPFIXLocked`,
+  reused by the removal path and by shutdown (`stopFlowExporter` /
+  `stopIPFIXExporter`), which unpublish the bundle before teardown.
+
+The removal path (`len(ecs) == 0`) now also swaps the bundle to empty
+BEFORE tearing the old set down, closing the same loss window for the
+"flow export removed" transition.
+
+### Tests (RED on revert)
+
+- `TestReconcileFlowExporterBuildFailureKeepsOldRunning` /
+  `...IPFIXExporterBuildFailureKeepsOldRunning`: a hash-changing reconcile
+  whose `NewExporter` build fails (unassignable pinned source-address)
+  keeps the OLD exporter published + live, retains `flowExporters`, leaves
+  the hash unrecorded, and surfaces the error; a later working commit
+  recovers and swaps cleanly. Reverting to teardown-first empties the
+  bundle → RED.
+- `TestReconcileFlowExporterSwapNoCallbackLoss` (`-race`): session-close
+  callbacks fire continuously while 200 reconciles swap collectors; the
+  published bundle is never observed empty mid-swap and the per-generation
+  cancel/WaitGroup/bundle handoff is race-clean.

@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/sync/semaphore"
@@ -416,5 +418,178 @@ func TestReconcileV9RequiresVersion9Stanza(t *testing.T) {
 	}
 	if b := d.flowBundle.Load(); b == nil || b.firstExp() == nil {
 		t.Fatal("v9 exporter must be live once version9 is configured")
+	}
+}
+
+// ipfixSamplingConfigSrc pins an unassignable source-address on the
+// sampling instance so BOTH the v9 and IPFIX NewExporter builds fail
+// (dialCollectors cannot bind the source), exercising the #3742
+// build-before-swap failure path for the IPFIX family.
+func ipfixSamplingConfigSrc(collector, source string, rate int) *config.Config {
+	cfg := ipfixSamplingConfig(collector, rate)
+	cfg.ForwardingOptions.Sampling.Instances["s"].FamilyInet.SourceAddress = source
+	return cfg
+}
+
+// TestReconcileFlowExporterBuildFailureKeepsOldRunning is the #3742
+// availability fix: a reconcile whose NEW-exporter build fails must KEEP
+// the OLD exporters running (flow export stays UP) rather than tearing the
+// healthy set down and disabling export until the next commit.
+//
+// RED on revert: the pre-#3742 reconcile stopped+closed the old exporters
+// BEFORE building the new set, so a NewExporter failure left flowBundle
+// empty (firstExp() == nil) and flowExporters nil — export disabled — and
+// the assertions below fail.
+func TestReconcileFlowExporterBuildFailureKeepsOldRunning(t *testing.T) {
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+
+	// A healthy exporter is running.
+	if !d.reconcileFlowExporters(flowSamplingConfig("127.0.0.1", 100)) {
+		t.Fatal("initial config must start exporter")
+	}
+	first := d.flowBundle.Load().firstExp()
+	if first == nil {
+		t.Fatal("exporter must be live before the failing reconcile")
+	}
+
+	// A day-2 commit that changes the config hash (so it is NOT gated) but
+	// whose NewExporter build fails: 192.0.2.250 (TEST-NET-1) is not
+	// assigned to this host, so binding it as a UDP source fails.
+	if !d.reconcileFlowExporters(flowSamplingConfigSrc("127.0.0.1", "192.0.2.250", 100)) {
+		t.Fatal("a build-failing reconcile should still report a change")
+	}
+
+	// #3742: the OLD exporter must still be published and live — export is
+	// NOT disabled by the transient build failure.
+	if got := d.flowBundle.Load().firstExp(); got != first {
+		t.Fatal("#3742: a NewExporter build failure must KEEP the old exporter " +
+			"running (export stays up), not tear it down and disable export")
+	}
+	if len(d.flowExporters) == 0 {
+		t.Fatal("#3742: the old exporter set must be retained after a build failure")
+	}
+	// The hash is NOT recorded, so the next commit retries.
+	if d.flowHashSet {
+		t.Fatal("#3742: the hash must NOT be recorded on a build failure " +
+			"(else an identical retry would gate into the failed state)")
+	}
+	// The error is surfaced for observability.
+	if d.FlowExportError() == nil {
+		t.Fatal("#3742: a build failure must surface an error via FlowExportError()")
+	}
+
+	// A session-close callback firing now still resolves to the LIVE old
+	// exporter (not a dead/empty bundle), so the record is queued into a
+	// still-flushing exporter rather than dropped.
+	d.flowExportCallback(logging.EventRecord{
+		Type:     "SESSION_CLOSE",
+		SrcAddr:  "10.0.0.1:1234",
+		DstAddr:  "10.0.0.2:80",
+		Protocol: "tcp",
+	}, nil)
+
+	// A later working commit recovers cleanly and swaps to a NEW exporter.
+	if !d.reconcileFlowExporters(flowSamplingConfig("127.0.0.2", 100)) {
+		t.Fatal("a working config after a build failure must reconcile")
+	}
+	if got := d.flowBundle.Load().firstExp(); got == nil || got == first {
+		t.Fatal("a working reconcile after a failure must swap to a NEW live exporter")
+	}
+	if d.FlowExportError() != nil {
+		t.Fatal("a successful reconcile must clear the export error")
+	}
+}
+
+// TestReconcileIPFIXExporterBuildFailureKeepsOldRunning is the IPFIX
+// equivalent of the #3742 availability fix (the IPFIX reconcile path is
+// structurally identical).
+func TestReconcileIPFIXExporterBuildFailureKeepsOldRunning(t *testing.T) {
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+	t.Cleanup(d.stopIPFIXExporter)
+
+	if !d.reconcileFlowExporters(ipfixSamplingConfig("127.0.0.1", 100)) {
+		t.Fatal("initial config must start the IPFIX exporter")
+	}
+	first := d.ipfixBundlePtr.Load().firstExp()
+	if first == nil {
+		t.Fatal("IPFIX exporter must be live before the failing reconcile")
+	}
+
+	if !d.reconcileFlowExporters(ipfixSamplingConfigSrc("127.0.0.1", "192.0.2.250", 100)) {
+		t.Fatal("a build-failing reconcile should still report a change")
+	}
+
+	if got := d.ipfixBundlePtr.Load().firstExp(); got != first {
+		t.Fatal("#3742: an IPFIX NewExporter build failure must KEEP the old " +
+			"exporter running, not disable export")
+	}
+	if len(d.ipfixExporters) == 0 {
+		t.Fatal("#3742: the old IPFIX exporter set must be retained after a build failure")
+	}
+	if d.ipfixHashSet {
+		t.Fatal("#3742: the IPFIX hash must NOT be recorded on a build failure")
+	}
+	if d.IPFIXExportError() == nil {
+		t.Fatal("#3742: an IPFIX build failure must surface an error via IPFIXExportError()")
+	}
+}
+
+// TestReconcileFlowExporterSwapNoCallbackLoss stresses the #3742
+// build-before-swap ordering: while session-close callbacks fire
+// continuously, repeated reconciles must never publish an empty bundle
+// mid-swap — d.flowBundle must always resolve to a LIVE exporter across
+// every healthy swap (old -> new, never a gap). Run with -race to catch a
+// torn handoff of the per-generation cancel / WaitGroup / bundle triple.
+func TestReconcileFlowExporterSwapNoCallbackLoss(t *testing.T) {
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+
+	if !d.reconcileFlowExporters(flowSamplingConfig("127.0.0.1", 100)) {
+		t.Fatal("initial config must start exporter")
+	}
+
+	stop := make(chan struct{})
+	var sawEmpty atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rec := logging.EventRecord{
+			Type:     "SESSION_CLOSE",
+			SrcAddr:  "10.0.0.1:1",
+			DstAddr:  "10.0.0.2:2",
+			Protocol: "tcp",
+		}
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// The published bundle must always be live during a healthy
+			// swap sequence (#3742): it goes old -> new, never empty.
+			if b := d.flowBundle.Load(); b == nil || b.firstExp() == nil {
+				sawEmpty.Store(true)
+			}
+			d.flowExportCallback(rec, nil)
+		}
+	}()
+
+	// Hammer the reconcile with alternating collectors so each call swaps.
+	for i := 0; i < 200; i++ {
+		coll := "127.0.0.1"
+		if i%2 == 1 {
+			coll = "127.0.0.2"
+		}
+		d.reconcileFlowExporters(flowSamplingConfig(coll, 100))
+	}
+	close(stop)
+	wg.Wait()
+
+	if sawEmpty.Load() {
+		t.Fatal("#3742: the published bundle was empty mid-swap — a session-" +
+			"close callback firing then would be lost")
 	}
 }

@@ -146,32 +146,20 @@ func logFinalStats(ready dataplaneReadyProbe, telemetry dataplane.Telemetry) {
 func (d *Daemon) stopFlowExporter() {
 	d.flowReconMu.Lock()
 	defer d.flowReconMu.Unlock()
-	if d.flowCancel != nil {
-		d.flowCancel()
-	}
-	d.flowWg.Wait()
-	for _, exp := range d.flowExporters {
-		exp.Close()
-	}
-	d.flowExporters = nil
-	d.flowCancel = nil
+	// Unpublish the bundle before teardown (#3742), then cancel + wait +
+	// close via the shared helper (flowWg is now a nil-safe pointer).
 	d.flowBundle.Store(&exporterBundle{})
+	d.teardownV9Locked()
+	d.flowExportErr = nil
 }
 
 // stopIPFIXExporter stops the running IPFIX exporter (shutdown).
 func (d *Daemon) stopIPFIXExporter() {
 	d.ipfixReconMu.Lock()
 	defer d.ipfixReconMu.Unlock()
-	if d.ipfixCancel != nil {
-		d.ipfixCancel()
-	}
-	d.ipfixWg.Wait()
-	for _, exp := range d.ipfixExporters {
-		exp.Close()
-	}
-	d.ipfixExporters = nil
-	d.ipfixCancel = nil
 	d.ipfixBundlePtr.Store(&ipfixBundle{})
+	d.teardownIPFIXLocked()
+	d.ipfixExportErr = nil
 }
 
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.

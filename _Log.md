@@ -1,3 +1,38 @@
+## 2026-07-01 — #3742 flowexport: build-before-swap reconcile (transient NewExporter failure no longer disables export; no SESSION_CLOSE lost in the swap window)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3742 (MEDIUM, folds codex-review-158 H05+H06).
+    `reconcileV9Exporter`/`reconcileIPFIXExporter` stopped+closed the OLD
+    exporters BEFORE building the new set, so (1) a transient `NewExporter`
+    failure (pinned source-address bind before the source iface is up,
+    transient collector DNS) tore down the healthy exporters and left flow
+    export DISABLED until the next commit, and (2) a `SESSION_CLOSE`
+    callback firing in the window between "old Run goroutine stopped" and
+    "new bundle stored" read the OLD (now-dead) bundle and queued into a
+    batch no goroutine would ever flush — the record was silently lost (the
+    old bundle stayed published across the whole build).
+    FIX (build-before-swap, mirroring the #3766/#2484 fail-closed pattern):
+    construct the FULL replacement set FIRST; on a `NewExporter` failure
+    roll back only the new set, keep the OLD exporters + published bundle
+    running (export stays UP), do NOT record the hash (next commit retries),
+    and surface the error via new `FlowExportError()`/`IPFIXExportError()`.
+    On success, start the new Run goroutines on a FRESH per-generation
+    WaitGroup, `Store` the new bundle atomically BEFORE cancelling/closing
+    the old set, so `d.flowBundle` always points at a live, flushing
+    exporter (no loss window). Removal path swaps the bundle to empty first,
+    then tears down. `flowWg`/`ipfixWg` are now `*sync.WaitGroup` (a value
+    WaitGroup cannot be handed off between generations); teardown centralised
+    in `teardownV9Locked`/`teardownIPFIXLocked`, reused by removal + shutdown.
+    VALIDATION: `go test ./pkg/flowexport/... ./pkg/daemon/` green; new tests
+    `-race` clean; `go build ./...`; gofmt + vet clean.
+  - **File(s)**: pkg/daemon/daemon_flowexport.go (build-before-swap v9+IPFIX,
+    teardown helpers, error accessors), pkg/daemon/daemon_flow.go (shutdown
+    via teardown helpers), pkg/daemon/daemon.go (flowWg/ipfixWg -> pointer,
+    flowExportErr/ipfixExportErr fields),
+    pkg/daemon/daemon_flowexport_reconcile_test.go (3 new RED-on-revert
+    tests: v9 + IPFIX build-failure-keeps-old, swap no-loss -race),
+    docs/pr/2075-flowexport-reconcile/plan.md (#3742 follow-up section)
+
 ## 2026-07-01 — #3731 routing: next-table + rib-group Apply aggregate & surface RuleAdd failures (stop swallowing)
 
 - **Timestamp**: 2026-07-01
