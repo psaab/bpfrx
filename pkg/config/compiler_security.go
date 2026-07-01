@@ -218,12 +218,22 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 		case "pre-id-default-policy":
 			sec.PreIDDefaultPolicy = &PreIDDefaultPolicy{}
 			if thenNode := child.FindChild("then"); thenNode != nil {
-				if logNode := thenNode.FindChild("log"); logNode != nil {
-					if logNode.FindChild("session-init") != nil {
-						sec.PreIDDefaultPolicy.LogSessionInit = true
-					}
-					if logNode.FindChild("session-close") != nil {
-						sec.PreIDDefaultPolicy.LogSessionClose = true
+				// #3703: multi-value session-log list leaf. Read every mode via
+				// the firewallMatchValues SSOT (Keys[1:] AND/OR one-per-child)
+				// across EVERY `log` leaf so a bracket `then log [ session-init
+				// session-close ]` keeps BOTH flags AND separate `then log
+				// session-init` / `then log session-close` lines (two sibling
+				// leaves) both land. The prior single FindChild lookup read only
+				// the first leaf and missed the tail (the #2419 collapse bug).
+				// Unknown tokens are rejected at commit by SchemaValidate.
+				for _, logNode := range thenNode.FindChildren("log") {
+					for _, mode := range firewallMatchValues(logNode) {
+						switch mode {
+						case "session-init":
+							sec.PreIDDefaultPolicy.LogSessionInit = true
+						case "session-close":
+							sec.PreIDDefaultPolicy.LogSessionClose = true
+						}
 					}
 				}
 			}
@@ -442,13 +452,16 @@ func parseHostInboundNode(n *Node) *HostInboundTraffic {
 	for _, hit := range n.Children {
 		switch hit.Name() {
 		case "system-services":
-			for _, svc := range hit.Children {
-				hib.SystemServices = append(hib.SystemServices, svc.Name())
-			}
+			// #3703: system-services is a multi-value value-tail leaf. A
+			// bracket / single-line / repeated list carries values as the
+			// leaf's Keys[1:] AND/OR one-per-child; read BOTH via the
+			// firewallMatchValues SSOT so every token reaches the compiled
+			// slice (reading only child.Name()/Keys[0] dropped all but the
+			// first list value — the #2419 collapse bug). The compiled slice
+			// is then token-validated by validateHostInboundTokensStrict.
+			hib.SystemServices = append(hib.SystemServices, firewallMatchValues(hit)...)
 		case "protocols":
-			for _, proto := range hit.Children {
-				hib.Protocols = append(hib.Protocols, proto.Name())
-			}
+			hib.Protocols = append(hib.Protocols, firewallMatchValues(hit)...)
 		}
 	}
 	return hib
@@ -535,11 +548,20 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 		// lives in a sibling container because the `default-policy` enum leaf
 		// cannot carry `then` children (schema.go typed-leaf invariant).
 		if child.Name() == "default-policy-log" {
-			if child.FindChild("session-init") != nil {
-				sec.DefaultPolicyLogSessionInit = true
-			}
-			if child.FindChild("session-close") != nil {
-				sec.DefaultPolicyLogSessionClose = true
+			// #3703: multi-value session-log list leaf. Read every mode via the
+			// firewallMatchValues SSOT (Keys[1:] AND/OR one-per-child) so a
+			// bracket / single-line `default-policy-log [ session-init
+			// session-close ]` keeps BOTH flags; the prior FindChild lookups
+			// missed session-close when the bracket tail mis-nested it under
+			// session-init (the #2419 collapse bug). Unknown tokens are rejected
+			// at commit by SchemaValidate (the enum leaf validator).
+			for _, mode := range firewallMatchValues(child) {
+				switch mode {
+				case "session-init":
+					sec.DefaultPolicyLogSessionInit = true
+				case "session-close":
+					sec.DefaultPolicyLogSessionClose = true
+				}
 			}
 			continue
 		}
@@ -708,9 +730,24 @@ func compilePolicy(polInst struct {
 				pol.Action = PolicyReject
 				pol.terminalActions = append(pol.terminalActions, PolicyReject)
 			case "log":
-				pol.Log = &PolicyLog{}
-				for _, logOpt := range t.Children {
-					switch logOpt.Name() {
+				// #3703: `then log` is a multi-value session-log list leaf. A
+				// bracket / single-line list (`then log [ session-init
+				// session-close ]`) carries the modes as Keys[1:] AND/OR
+				// one-per-child; read BOTH via the firewallMatchValues SSOT so
+				// session-close is not dropped when it trails session-init in a
+				// bracket list (the #2419 collapse bug). Unknown tokens are
+				// rejected at commit by SchemaValidate (the enum leaf validator);
+				// a bare `then log` (no mode) is rejected by
+				// validatePolicyLogActionStrict (#3060). ACCUMULATE (create once,
+				// never reset): a multi-value leaf whose values arrive on SEPARATE
+				// flat-set lines (`then log session-init` + `then log
+				// session-close`) produces TWO sibling `log` leaves, so resetting
+				// pol.Log per node would drop the earlier flag.
+				if pol.Log == nil {
+					pol.Log = &PolicyLog{}
+				}
+				for _, mode := range firewallMatchValues(t) {
+					switch mode {
 					case "session-init":
 						pol.Log.SessionInit = true
 					case "session-close":

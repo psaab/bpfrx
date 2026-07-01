@@ -62,6 +62,39 @@
     pkg/daemon/per_rg_zoneid_3704_test.go (new),
     userspace-dp/src/test_zone_ids.rs (doc comment),
     docs/config-schema.md (#3704 note).
+## 2026-07-01 — #3703 bracket/single-line list collapse on four security surfaces (#2419 class, unfixed leaves)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3703 — the #2419 bracketed/single-line list-collapse bug
+    recurred on four security config surfaces #2419 never converted: host-inbound
+    `system-services`/`protocols` (zone + #3362 per-iface), per-policy
+    `then log`, `default-policy-log`, and `pre-id-default-policy then log`. Each
+    was modeled as a CONTAINER (or nil-children non-multi leaf), so a bracket /
+    single-line list mis-nested the tail under the first token and the compiler
+    readers dropped everything after it — a dropped host-inbound service silently
+    NARROWS admission (can strand SSH/routing); a dropped `session-close` loses
+    audit records; a typo'd token silently no-ops instead of failing fast. FIX:
+    (schema) `hostInboundSchemaChildren` makes system-services/protocols
+    `args:1, multi:true, children:nil` (untyped; validated against the
+    host_inbound_tokens.go SSOT); `sessionLogModeLeaf` makes the three log
+    surfaces `multi:true, children:nil` typed ENUM leaves
+    (ValueEnumOf + ValidateEnum[session-init,session-close]). (compiler) all
+    readers accumulate every value via `firewallMatchValues` (Keys[1:] AND
+    .Children) across ALL sibling log leaves and create the target struct once
+    (never reset) so bracket, repeated-line, and hierarchical shapes all land
+    every value. (strict validation) host-inbound typos now reach the compiled
+    slice → rejected by the existing `validateHostInboundTokensStrict`; log typos
+    rejected at commit by `SchemaValidate`'s `validateMultiValueLeaf` enum check
+    (strict on commit, warn on tolerant load — #1960 no-brick). Value-slot `?`
+    completion preserved via valueExamples. Verified the bug on all six surfaces
+    (both harm directions) before/after; RED-on-revert tests added.
+  - **File(s)**: pkg/config/schema_security.go, pkg/config/compiler_security.go,
+    pkg/config/compiler_security_bracket_list_3703_test.go (new),
+    docs/config-schema.md, _Log.md
+  - **Validation**: `go test ./pkg/config/... ./pkg/configstore/...` green;
+    consumers `go test ./pkg/daemon/... ./pkg/dataplane/... ./pkg/api/...
+    ./pkg/cli/... ./pkg/cmdtree/...` green; `go build ./pkg/... ./cmd/...` OK;
+    gofmt + vet clean on changed files.
 
 ## 2026-07-01 — #3697 stale Rust host-inbound hot-path comments (default-deny drift; M06/L07)
 
