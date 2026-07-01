@@ -94,13 +94,42 @@ func newDyndns2Backend(p *config.DDNSProvider, client *http.Client) (*dyndns2Bac
 }
 
 // resolveDyndns2Endpoint picks the update base URL for a dyndns2 provider.
+//
+// A `server` carrying a URL scheme is a full update URL; anything else is a
+// bare host that is suffixed with the canonical dyndns2 path over HTTPS. URL
+// schemes are case-INSENSITIVE (RFC 3986 §3.1), so "HTTPS://host" is a full
+// URL, not a bare host — the full-URL case is detected by the "://" delimiter
+// and validated with url.Parse + a case-insensitive scheme compare, mirroring
+// validateCheckIPURL (#2842) and validateGenericURLTemplate (#2841). Both the
+// full-URL and bare-host cases require a non-empty host so a hostless value
+// ("http://", "https:///nic/update", ":8080") fails at construction (fall back
+// to no-op at the manager) instead of returning a URL that only fails at the
+// first publish (#3737).
 func resolveDyndns2Endpoint(p *config.DDNSProvider) (string, error) {
 	if s := strings.TrimSpace(p.Server); s != "" {
-		if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		if strings.Contains(s, "://") {
+			u, err := url.Parse(s)
+			if err != nil {
+				return "", fmt.Errorf("ddns dyndns2: provider %q server %q is not a valid URL: %w", p.Name, s, err)
+			}
+			if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+				return "", fmt.Errorf("ddns dyndns2: provider %q server %q must be an http(s) URL", p.Name, s)
+			}
+			// Hostname() (not Host) so a port-only authority ("https://:8080/…")
+			// is rejected as hostless rather than accepted with an empty host.
+			if u.Hostname() == "" {
+				return "", fmt.Errorf("ddns dyndns2: provider %q server %q has no host", p.Name, s)
+			}
 			return s, nil
 		}
-		// Bare host → canonical dyndns2 path over HTTPS.
-		return "https://" + s + "/nic/update", nil
+		// Bare host → canonical dyndns2 path over HTTPS. Validate the host by
+		// parsing the composed URL so a hostless value (":8080", "/path") is
+		// rejected here instead of at the first publish.
+		full := "https://" + s + "/nic/update"
+		if u, err := url.Parse(full); err != nil || u.Hostname() == "" {
+			return "", fmt.Errorf("ddns dyndns2: provider %q server %q is not a valid host", p.Name, s)
+		}
+		return full, nil
 	}
 	// No explicit server: use the built-in endpoint for the named provider. The
 	// `backend` token is "dyndns2"; the provider NAME (or an alias in the table)
