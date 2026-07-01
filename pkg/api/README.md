@@ -77,6 +77,23 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     time-gated, currently-dormant permit/deny as an active allow/deny, so
     the structured API disagreed with effective dataplane behavior. The
     gRPC mirror is `PolicyRule.scheduler_name` (19) / `inactive` (20).
+    A final synthetic `PolicyInfo` row with `from_zone="-"`/`to_zone="-"`
+    carries a single rule named `default-policy` (#3363) — the implicit
+    catch-all — with `policy_id` set to the reserved sentinel
+    (`0xFFFFFFFF`) and, when `policy-stats system-wide enable` is set, the
+    live hit counter read through the `DefaultPolicySentinelID` handle.
+    This row reflects the configured `default-policy` action and, since
+    #3670, its own RT_FLOW log intent: `log` / `log_session_init` /
+    `log_session_close` are populated from `default-policy-log
+    session-init`/`session-close` (compiled to
+    `Security.DefaultPolicyLogSessionInit`/`Close`, threaded to the
+    dataplane via `ConfigSnapshot.DefaultLogSessionInit`/`Close`, #3534) —
+    the same log fields the configured rows expose (#3336). Before #3670
+    the synthetic row omitted these, so audit tooling read the
+    default-deny/permit boundary — the most security-relevant fallback —
+    as unlogged while the dataplane was emitting default-verdict
+    session-init/close records. The gRPC `GetPolicies` default row is
+    identical (`PolicyRule.log` / `log_session_init` / `log_session_close`).
   - `GET /api/v1/security/zones` enumerates security zones (`ZoneInfo`,
     types.go). The host-inbound admission set is surfaced distinctly
     (#3328): `host_inbound_configured` is the dataplane posture bit

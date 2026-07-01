@@ -1,3 +1,28 @@
+## 2026-07-01 — #3670 synthetic default-policy inventory row omits log state (H06)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3670 — the REST `/security/policies` and gRPC `GetPolicies`
+    synthetic default-policy catch-all row (`-`/`-`, named `default-policy`,
+    #3363) omitted the implicit default-policy's own RT_FLOW log intent, so
+    audit tooling read the default-deny/permit boundary as UNLOGGED while the
+    dataplane emits default-verdict session-init/close records. Populated the
+    synthetic row's `Log` / `LogSessionInit` / `LogSessionClose` from
+    `cfg.Security.DefaultPolicyLogSessionInit`/`Close` (compiled from
+    `security policies default-policy-log session-init`/`session-close`,
+    threaded to the dataplane via `ConfigSnapshot.DefaultLogSessionInit`/`Close`,
+    #3534) — the same log fields the configured rows expose (#3336). No proto
+    change (the `Log`/`log_session_init`/`log_session_close` fields already
+    exist on `pb.PolicyRule`).
+  - **File(s)**: pkg/api/security.go (defRule log fields),
+    pkg/grpcapi/server_show_zones.go (defRule log fields),
+    pkg/api/security_default_policy_log_3670_test.go (new RED-on-revert test),
+    pkg/grpcapi/server_show_zones_default_policy_log_3670_test.go (new
+    RED-on-revert test), pkg/api/README.md (default-policy row + log-state doc).
+  - **Validation**: new tests pass with the fix and go RED on source-revert
+    (log=false / omitempty session-mode keys absent); `go test ./pkg/api
+    ./pkg/grpcapi ./pkg/dataplane/userspace` green; `go build ./pkg/...
+    ./cmd/...`, gofmt, go vet clean.
+
 ## 2026-07-01 — #3684 zone-detail policy summary metadata completeness
 
 - **Timestamp**: 2026-07-01

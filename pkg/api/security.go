@@ -343,8 +343,18 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			SrcAddresses: []string{},
 			DstAddresses: []string{},
 			Applications: []string{},
-			PolicyID:     dataplane.DefaultPolicySentinelID,
-			RuleID:       dataplane.DefaultPolicyName,
+			// #3670: the implicit default-policy carries its own RT_FLOW log
+			// intent (DefaultPolicyLogSessionInit/Close, threaded to the
+			// dataplane via ConfigSnapshot.DefaultLogSessionInit/Close in the
+			// #3534 builder). Surface it on the synthetic row exactly as the
+			// configured rows expose Log/LogSessionInit/LogSessionClose (#3336)
+			// so audit tooling does not read the most security-relevant
+			// boundary as unlogged while the dataplane is emitting the records.
+			Log:             cfg.Security.DefaultPolicyLogSessionInit || cfg.Security.DefaultPolicyLogSessionClose,
+			LogSessionInit:  cfg.Security.DefaultPolicyLogSessionInit,
+			LogSessionClose: cfg.Security.DefaultPolicyLogSessionClose,
+			PolicyID:        dataplane.DefaultPolicySentinelID,
+			RuleID:          dataplane.DefaultPolicyName,
 		}
 		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
 			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
