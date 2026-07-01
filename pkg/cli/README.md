@@ -74,3 +74,17 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   `protocol` by name OR 0-255 number — instead of the stale, drifted
   `protocol <tcp|udp>`-only subset that hid the ICMP / source-port / non-TCP-UDP
   selectors from operators.
+- #3674: the local `test policy` (`testPolicy`) output now renders the SAME
+  identity fields `show security match-policies` (`showMatchPolicies`) already
+  prints over the shared `policymatch.Result` — the stable runtime **Policy ID**
+  (the RT_FLOW / session-table / audit ID from the #3667 `RuntimePolicyIDs`
+  SSOT), the **Rule ID** (#3668 stable inventory join key), the **Scope**
+  (`zone-pair (from-zone …, to-zone …)` or `global (match from-zone …, to-zone
+  …)`, rendered through the shared `matchScopeZone` helper so an unset global
+  scope reads `any`), and the policy **Description**. Both are thin adapters over
+  the one simulator, so a `test policy` verdict now correlates with the runtime
+  policy and identifies which scoped/global rule fired — previously the request
+  path printed only name + action (and, for a global match, name + action with no
+  scope), making it the poorest of the four match-policies surfaces. The
+  rendering is shared via `printPolicyMatchIdentity`; it is a display-only change,
+  no schema/wire impact.
