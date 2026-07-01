@@ -105,6 +105,29 @@ fn static_scope_ok(
         && (from_routing_instance.is_empty() || from_routing_instance == routing_instance)
 }
 
+/// #3605: pick the best-matching entry from a per-key `Vec` of scope-differing
+/// static-NAT rules. Two tiers, mirroring the sibling [`super::DnatTable`]:
+///   1. a zone-SCOPED entry (`from_zone` non-empty) that the caller's `admit`
+///      predicate accepts — a split-horizon rule for this ingress/egress
+///      context;
+///   2. otherwise a zone-WILDCARD entry (`from_zone` empty) that `admit`
+///      accepts — the catch-all default.
+/// The specific tier wins over the wildcard tier regardless of config order,
+/// so a coexisting wildcard rule cannot shadow a matching scoped rule. Within
+/// a tier the first accepted entry (config/snapshot order) wins. `admit` folds
+/// in ALL the gates (`static_scope_ok`, i.e. zone/interface/routing-instance,
+/// plus `source_ok`); the tiering here only orders zone-scoped vs wildcard.
+fn pick_scoped<'a>(
+    entries: Option<&'a Vec<StaticNatEntry>>,
+    admit: impl Fn(&&StaticNatEntry) -> bool,
+) -> Option<&'a StaticNatEntry> {
+    let entries = entries?;
+    entries
+        .iter()
+        .find(|e| !e.from_zone.is_empty() && admit(e))
+        .or_else(|| entries.iter().find(|e| e.from_zone.is_empty() && admit(e)))
+}
+
 /// Static 1:1 NAT entry (bidirectional).
 #[derive(Clone, Debug)]
 pub(crate) struct StaticNatEntry {
@@ -138,16 +161,30 @@ pub(crate) struct StaticNatEntry {
 /// (`mapped-port`) AND a port-less whole-address 1:1 mapping, so the key
 /// carries the matched port. The port-less entry uses `None` and is the
 /// fallback when no port-specific entry matches.
+///
+/// #3605: each key holds a `Vec` of entries, NOT a single entry. Junos
+/// supports zone-/interface-/routing-instance-/source-scoped static NAT
+/// (split-horizon: the same public `(external_ip, match-port)` translated
+/// differently per ingress context). Two such rules share the same map key
+/// but differ only by scope; storing one entry per key silently overwrote
+/// the first rule (last-write-wins), so a packet hitting the lost rule's
+/// scope was forwarded UNtranslated (identity leak) or mis-translated. The
+/// `Vec` lets scope-differing rules coexist and be matched per-candidate by
+/// the same `static_scope_ok` / `source_ok` gates used everywhere else,
+/// mirroring the `blocks` Vec and the sibling [`super::DnatTable`] which
+/// already group entries in a `Vec` per key.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StaticNatTable {
-    /// (external_ip, match-port) -> entry (for inbound DNAT). The match-port
+    /// (external_ip, match-port) -> entries (for inbound DNAT). The match-port
     /// is the external destination port (`Some` for a port-mapped rule,
-    /// `None` for a whole-address rule).
-    dnat: FxHashMap<(IpAddr, Option<u16>), StaticNatEntry>,
-    /// (internal_ip, mapped-port) -> entry (for outbound SNAT). The mapped-port
+    /// `None` for a whole-address rule). #3605: a `Vec` so scope-differing
+    /// rules on the same key coexist; matched per-candidate by scope.
+    dnat: FxHashMap<(IpAddr, Option<u16>), Vec<StaticNatEntry>>,
+    /// (internal_ip, mapped-port) -> entries (for outbound SNAT). The mapped-port
     /// is the internal source port of the return packet (`Some` for a
-    /// port-mapped rule, `None` for a whole-address rule).
-    snat: FxHashMap<(IpAddr, Option<u16>), StaticNatEntry>,
+    /// port-mapped rule, `None` for a whole-address rule). #3605: a `Vec`, as
+    /// `dnat`.
+    snat: FxHashMap<(IpAddr, Option<u16>), Vec<StaticNatEntry>>,
     /// #3031: block-to-block (subnet) static-NAT rules. A source prefix maps
     /// 1:1 by offset to an equal-length destination prefix. These cannot be
     /// keyed by exact IP, so they are scanned linearly on the session-miss
@@ -385,7 +422,17 @@ impl StaticNatTable {
                 hit_counter: nat_counters.rule_counter(snap.counter_id),
             };
             // DNAT keyed by the external (pre-translation) destination port.
-            table.dnat.insert((external_ip, match_dst_port), entry.clone());
+            // #3605: push onto the per-key Vec instead of insert() so a
+            // second rule that shares this `(external_ip, match_dst_port)` but
+            // differs by scope (zone/interface/routing-instance/source) no
+            // longer overwrites the first. Preserves config/snapshot order
+            // within the key, which the specificity tiering in the match path
+            // relies on for the wildcard fallback.
+            table
+                .dnat
+                .entry((external_ip, match_dst_port))
+                .or_default()
+                .push(entry.clone());
             // #2769: SNAT key scoping. The reverse key is the internal-host
             // source port of the return packet.
             //   * mapped-port rule:   return packets leave on the `mapped_port`
@@ -401,7 +448,13 @@ impl StaticNatTable {
             //     box, not just the one port that was port-scoped inbound.
             //   * whole-address 1:1 rule: no port match at all, keys on `None`.
             let snat_port = mapped_port.or(match_dst_port);
-            table.snat.insert((internal_ip, snat_port), entry);
+            // #3605: as with `dnat`, push onto the per-key Vec so scope-
+            // differing rules on the same `(internal_ip, snat_port)` coexist.
+            table
+                .snat
+                .entry((internal_ip, snat_port))
+                .or_default()
+                .push(entry);
         }
         table
     }
@@ -485,15 +538,21 @@ impl StaticNatTable {
                 ingress_routing_instance,
             ) && source_ok(&entry.source, src_ip)
         };
+        // #3605: a key now holds a `Vec` of scope-differing rules. Within the
+        // key, prefer a zone-SCOPED entry that admits the packet over a
+        // zone-WILDCARD one (`pick_scoped`, mirroring the sibling `DnatTable`
+        // two-tier match), so a specific split-horizon rule is not shadowed by
+        // a coexisting wildcard rule regardless of config order. All the finer
+        // gates (interface/routing-instance/source) are AND-ed in via
+        // `zone_ok`.
+        //
         // Port-specific entry takes precedence over the whole-address entry,
-        // but only if its OWN zone check passes. On a port miss OR a
-        // port-specific zone mismatch, fall back to the whole-address entry
-        // (which is then zone-checked on its own).
-        if let Some(entry) = self
-            .dnat
-            .get(&(dst_ip, Some(dst_port)))
-            .filter(zone_ok)
-            .or_else(|| self.dnat.get(&(dst_ip, None)).filter(zone_ok))
+        // but only if one of its candidates passes the scope check. On a port
+        // miss OR a port-specific scope mismatch across ALL its candidates,
+        // fall back to the whole-address entries (each scope-checked on its
+        // own).
+        if let Some(entry) = pick_scoped(self.dnat.get(&(dst_ip, Some(dst_port))), &zone_ok)
+            .or_else(|| pick_scoped(self.dnat.get(&(dst_ip, None)), &zone_ok))
         {
             return Some((
                 NatDecision {
@@ -627,11 +686,11 @@ impl StaticNatTable {
                 egress_routing_instance,
             ) && source_ok(&entry.source, dst_ip)
         };
-        if let Some(entry) = self
-            .snat
-            .get(&(src_ip, Some(src_port)))
-            .filter(zone_ok)
-            .or_else(|| self.snat.get(&(src_ip, None)).filter(zone_ok))
+        // #3605: per-key `Vec` with the same two-tier specificity pick as the
+        // DNAT direction — a zone-scoped reverse mapping wins over a coexisting
+        // wildcard one, and port-specific beats whole-address.
+        if let Some(entry) = pick_scoped(self.snat.get(&(src_ip, Some(src_port))), &zone_ok)
+            .or_else(|| pick_scoped(self.snat.get(&(src_ip, None)), &zone_ok))
         {
             // For a port-mapped rule, un-translate the source port back to the
             // external (pre-translation) port; for a whole-address rule this is
