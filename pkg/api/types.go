@@ -87,13 +87,20 @@ type ZoneInfo struct {
 	// protocols concatenated. Kept as a back-compat alias (#3328); new
 	// consumers should read the split fields below.
 	HostInbound []string `json:"host_inbound_services"`
-	// HostInboundConfigured (#3328) records whether the zone is host-inbound
-	// ENFORCING: true when the zone declares a `host-inbound-traffic` stanza OR
-	// carries any per-interface override (#3362). Mirrors the dataplane posture
-	// bit (ZoneSnapshot.HostInboundConfigured): false = no stanza = default
-	// admit-all for host-bound traffic; true with EMPTY service/protocol lists
-	// = explicit deny-all. Without it an operator cannot distinguish "no
-	// stanza" (admit-all) from "empty stanza" (deny-all).
+	// HostInboundConfigured (#3328/#3405) records whether the zone is
+	// host-inbound ENFORCING. Post-#3405 EVERY configured security zone is
+	// enforcing (Junos default-deny parity), so this mirrors the dataplane
+	// posture bit (ZoneSnapshot.HostInboundConfigured) and is TRUE for every
+	// zone the inventory returns. A zone with NO `host-inbound-traffic` stanza
+	// default-DENIES host-bound traffic exactly like an explicit empty stanza
+	// (deny-all) — there is no admit-all posture for a configured zone. The
+	// admitted set lives in HostInboundSystemServices / HostInboundProtocols
+	// (empty = deny-all) plus any per-interface override in
+	// InterfaceHostInbound. Before #3653 this bit was re-derived from config
+	// shape and reported false for a no-stanza zone — the pre-#3405
+	// "false = admit-all" reading, contradicting the runtime default-deny.
+	// (Note: global ICMP/ND/PMTUD accepts and lifeline interfaces fxp0/em0/fab*
+	// still bypass the per-zone host-inbound deny; see zones.go.)
 	HostInboundConfigured bool `json:"host_inbound_configured"`
 	// HostInboundSystemServices / HostInboundProtocols (#3328) carry the
 	// ZONE-LEVEL admission set, kept distinct so automation can tell a

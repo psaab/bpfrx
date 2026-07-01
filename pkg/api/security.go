@@ -45,9 +45,10 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 
 		// Host-inbound services. #3328: surface the admission posture
 		// distinctly. HostInbound stays the flattened back-compat alias, but the
-		// split fields let automation tell a service apart from a protocol and —
-		// via HostInboundConfigured — tell "no stanza" (admit-all) apart from an
-		// explicit empty stanza (deny-all).
+		// split fields let automation tell a service (ssh, ping) apart from a
+		// protocol (ospf, bgp). Post-#3405 the admitted set — empty = deny-all —
+		// is the discriminating signal (HostInboundConfigured is true for every
+		// configured zone; see below).
 		if zone.HostInboundTraffic != nil {
 			zi.HostInbound = append(zi.HostInbound, zone.HostInboundTraffic.SystemServices...)
 			zi.HostInbound = append(zi.HostInbound, zone.HostInboundTraffic.Protocols...)
@@ -55,9 +56,18 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 			zi.HostInboundProtocols = append(zi.HostInboundProtocols, zone.HostInboundTraffic.Protocols...)
 		}
 		// HostInboundConfigured mirrors ZoneSnapshot.HostInboundConfigured
-		// (#3070/#3362): the zone is host-inbound ENFORCING when it declares a
-		// zone-level stanza OR carries any per-interface override.
-		zi.HostInboundConfigured = zone.HostInboundTraffic != nil || len(zone.InterfaceHostInbound) > 0
+		// (#3070/#3362/#3405). Post-#3405 EVERY configured security zone is
+		// host-inbound ENFORCING (Junos default-deny parity): a zone with no
+		// `host-inbound-traffic` stanza default-DENIES host-bound traffic
+		// exactly like an explicit empty stanza. buildZoneSnapshots sets
+		// HostInboundConfigured=true unconditionally for every non-nil zone
+		// (dataplane/userspace/zones.go). Re-deriving the bit from config shape
+		// (stanza-or-override) reported false for a no-stanza zone — the API's
+		// own "false = admit-all" contract, the exact OPPOSITE of the runtime
+		// default-deny (#3653). Report the dataplane truth: enforcing. The
+		// admitted token set (which may be empty = deny-all) lives in the split
+		// fields below.
+		zi.HostInboundConfigured = true
 		for _, ref := range zone.SortedInterfaceHostInboundRefs() {
 			hib := zone.InterfaceHostInbound[ref]
 			zi.InterfaceHostInbound = append(zi.InterfaceHostInbound, ZoneInterfaceHostInbound{

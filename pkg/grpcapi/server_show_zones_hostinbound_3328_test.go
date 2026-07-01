@@ -10,12 +10,18 @@ import (
 )
 
 // #3328: gRPC GetZones flattened the host-inbound admission set into one
-// host_inbound_services repeated field and exposed no host_inbound_configured,
-// so a controller could not distinguish no-stanza (admit-all) from an explicit
-// empty stanza (deny-all), nor a system-service from a routing protocol.
+// host_inbound_services repeated field and exposed no host_inbound_configured.
 // ZoneInfo now carries host_inbound_configured, host_inbound_system_services,
-// host_inbound_protocols, and interface_host_inbound (#3362). These are the
-// fail-on-revert guards.
+// host_inbound_protocols, and interface_host_inbound (#3362).
+//
+// #3405/#3653: EVERY configured security zone is host-inbound ENFORCING (Junos
+// default-deny parity). The dataplane (dataplane/userspace/zones.go) sets
+// HostInboundConfigured=true unconditionally; a zone with NO stanza
+// default-DENIES host-bound traffic exactly like an explicit empty stanza. The
+// RPC bit was re-derived from config shape and reported false for a no-stanza
+// zone — the pre-#3405 "false = admit-all" reading, the OPPOSITE of runtime.
+// The `open` (no-stanza) assertion is the fail-on-revert guard: reverting to
+// the config-shape formula reports configured=false and this test goes RED.
 
 func zoneHostInboundGRPCStore(t *testing.T) *configstore.Store {
 	t.Helper()
@@ -94,24 +100,40 @@ func TestGetZonesSurfacesHostInboundPosture(t *testing.T) {
 		t.Fatalf("trust host_inbound_services (legacy alias) = %v, want 3 entries", got)
 	}
 
+	// locked: explicit empty stanza = deny-all, configured=true. Post-#3405 it
+	// shares the deny-all POSTURE with `open`; the bit no longer distinguishes
+	// them (both true).
 	locked, ok := byName["locked"]
 	if !ok {
 		t.Fatal("locked zone missing")
 	}
 	if !locked.GetHostInboundConfigured() {
-		t.Fatal("locked host_inbound_configured = false, want true (explicit empty stanza = deny-all; the no-stanza-vs-empty-stanza distinction #3328)")
+		t.Fatal("locked host_inbound_configured = false, want true (explicit empty stanza = deny-all)")
 	}
 	if len(locked.GetHostInboundSystemServices()) != 0 || len(locked.GetHostInboundProtocols()) != 0 {
 		t.Fatalf("locked host-inbound lists = %v/%v, want empty (deny-all)",
 			locked.GetHostInboundSystemServices(), locked.GetHostInboundProtocols())
 	}
 
+	// open: NO host-inbound stanza and NO per-interface override. Post-#3405
+	// this zone default-DENIES host-bound traffic just like `locked`, so the
+	// posture bit MUST be true — it mirrors the dataplane, which sets
+	// HostInboundConfigured=true for every configured zone. Fail-on-revert
+	// guard for #3653: the pre-#3405 config-shape formula reports false here
+	// (the "false = admit-all" lie that contradicted runtime), turning this RED.
 	open, ok := byName["open"]
 	if !ok {
 		t.Fatal("open zone missing")
 	}
-	if open.GetHostInboundConfigured() {
-		t.Fatal("open host_inbound_configured = true, want false (no stanza = admit-all; #3328 must not collapse with the empty-stanza deny-all posture)")
+	if !open.GetHostInboundConfigured() {
+		t.Fatal("open host_inbound_configured = false, want true (#3405/#3653: a no-stanza configured zone default-DENIES host-bound traffic; the bit must mirror the dataplane, not the pre-#3405 admit-all reading)")
+	}
+	if len(open.GetHostInboundSystemServices()) != 0 || len(open.GetHostInboundProtocols()) != 0 {
+		t.Fatalf("open host-inbound lists = %v/%v, want empty (no-stanza default-deny)",
+			open.GetHostInboundSystemServices(), open.GetHostInboundProtocols())
+	}
+	if len(open.GetInterfaceHostInbound()) != 0 {
+		t.Fatalf("open interface_host_inbound = %v, want none", open.GetInterfaceHostInbound())
 	}
 
 	edge, ok := byName["edge"]

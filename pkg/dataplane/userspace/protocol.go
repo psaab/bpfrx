@@ -204,13 +204,15 @@ type ZoneSnapshot struct {
 	// SSH, ping, routing protocols on the box itself) was admitted regardless
 	// of the configured set — a security-boundary gap.
 	//
-	// HostInboundConfigured records whether the zone declared a
-	// host-inbound-traffic stanza at all. When false the dataplane preserves
-	// the historical admit-all behaviour for host-bound (local-delivery)
-	// traffic on this zone (a conservative, zero-regression default: zones
-	// that never opted into the feature are unaffected). When true the
-	// dataplane default-denies host-bound traffic whose system-service /
-	// protocol is not in the configured set (Junos host-inbound posture).
+	// HostInboundConfigured marks the zone host-inbound ENFORCING. Post-#3405
+	// buildZoneSnapshots sets it true for EVERY configured zone (Junos
+	// default-deny parity), so the Rust side default-denies host-bound
+	// (local-delivery) traffic whose system-service / protocol is not in the
+	// configured set — a zone with no `host-inbound-traffic` stanza carries an
+	// EMPTY set and thus deny-all. (Pre-#3405 a false here preserved the
+	// historical admit-all for a no-stanza zone; that no-opt-in admit-all was a
+	// management-plane exposure and is gone.) Global ICMP/ND/PMTUD accepts
+	// (#3171) and lifeline interfaces (fxp0/em0/fab*) still bypass this deny.
 	//
 	// The token slices mirror config.HostInboundTraffic verbatim (lower-cased,
 	// order-preserved). The Rust side classifies the tokens to L4 signatures

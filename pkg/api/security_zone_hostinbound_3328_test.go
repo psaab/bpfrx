@@ -11,13 +11,23 @@ import (
 
 // #3328: the REST zone inventory flattened the host-inbound admission set into
 // one host_inbound_services list and never exposed whether a host-inbound
-// stanza was configured at all, so automation could not tell apart the three
-// dataplane postures: no stanza (admit-all), explicit empty stanza (deny-all),
-// and a populated set (split into system-services vs protocols). ZoneInfo now
-// carries host_inbound_configured, host_inbound_system_services,
-// host_inbound_protocols, and per-interface overrides (#3362). These are the
-// fail-on-revert guards: drop the population in zonesHandler and the assertions
-// below go RED.
+// stanza was configured at all. ZoneInfo now carries host_inbound_configured,
+// host_inbound_system_services, host_inbound_protocols, and per-interface
+// overrides (#3362).
+//
+// #3405/#3653: EVERY configured security zone is host-inbound ENFORCING (Junos
+// default-deny parity). The dataplane (dataplane/userspace/zones.go) sets
+// HostInboundConfigured=true unconditionally for every configured zone; a zone
+// with NO host-inbound-traffic stanza default-DENIES host-bound traffic exactly
+// like an explicit empty stanza. The REST/gRPC bit was re-derived from config
+// shape (stanza-or-override) and reported false for a no-stanza zone — the
+// pre-#3405 "false = admit-all" reading, the OPPOSITE of runtime. This test
+// pins four distinct concepts so the fix cannot regress: (1) the zone exists,
+// (2) enforcement posture — always true for a configured zone, (3) the
+// zone-level token set (system-services vs protocols, empty = deny-all), and
+// (4) the per-interface effective override. The `open` (no-stanza) assertion is
+// the fail-on-revert guard: reverting to the config-shape formula reports
+// configured=false for `open` and this test goes RED.
 
 // zoneHostInboundAPIStore builds a config exercising every host-inbound
 // posture:
@@ -28,7 +38,9 @@ import (
 //   - edge: NO zone-level stanza but a per-interface override on ge-0/0/9.0
 //     (enforcing via override → configured=true, empty zone lists, one
 //     interface entry),
-//   - open: NO host-inbound at all (admit-all → configured=false).
+//   - open: NO host-inbound at all. Post-#3405 this default-DENIES host-bound
+//     traffic (configured=true, empty lists) — indistinguishable in POSTURE
+//     from `locked`, matching the dataplane.
 func zoneHostInboundAPIStore(t *testing.T) *configstore.Store {
 	t.Helper()
 
@@ -122,28 +134,45 @@ func TestZonesHandlerSurfacesHostInboundPosture(t *testing.T) {
 		t.Fatalf("trust host_inbound_services (legacy alias) = %v, want 3 entries", got)
 	}
 
-	// locked: explicit empty stanza = deny-all. The whole point of #3328:
-	// configured=true distinguishes it from a zone with no stanza (open).
+	// locked: explicit empty stanza = deny-all, configured=true. Post-#3405 it
+	// has the same POSTURE as `open` (both deny-all); the two are still
+	// distinguishable by config shape only through the token/override fields,
+	// not this bit.
 	locked, ok := byName["locked"]
 	if !ok {
 		t.Fatalf("locked zone missing from REST inventory")
 	}
 	if !locked.HostInboundConfigured {
-		t.Fatalf("locked host_inbound_configured = false, want true (explicit empty stanza = deny-all; #3328 the no-stanza-vs-empty-stanza distinction)")
+		t.Fatalf("locked host_inbound_configured = false, want true (explicit empty stanza = deny-all)")
 	}
 	if len(locked.HostInboundSystemServices) != 0 || len(locked.HostInboundProtocols) != 0 {
 		t.Fatalf("locked host-inbound lists = %v/%v, want empty (deny-all)",
 			locked.HostInboundSystemServices, locked.HostInboundProtocols)
 	}
 
-	// open: no stanza at all = admit-all. configured MUST be false so it is
-	// distinguishable from locked.
+	// open: NO host-inbound stanza and NO per-interface override. Post-#3405
+	// this zone default-DENIES host-bound traffic just like `locked`, so the
+	// posture bit MUST be true — it mirrors the dataplane, which sets
+	// HostInboundConfigured=true for every configured zone. This is the
+	// fail-on-revert guard for #3653: the pre-#3405 config-shape formula
+	// (HostInboundTraffic != nil || len(InterfaceHostInbound) > 0) reports
+	// false here — the "false = admit-all" lie that contradicted runtime — so
+	// reverting the fix turns this RED.
 	open, ok := byName["open"]
 	if !ok {
 		t.Fatalf("open zone missing from REST inventory")
 	}
-	if open.HostInboundConfigured {
-		t.Fatalf("open host_inbound_configured = true, want false (no stanza = admit-all; #3328 must not collapse with the empty-stanza deny-all posture)")
+	if !open.HostInboundConfigured {
+		t.Fatalf("open host_inbound_configured = false, want true (#3405/#3653: a no-stanza configured zone default-DENIES host-bound traffic; the bit must mirror the dataplane, not the pre-#3405 admit-all reading)")
+	}
+	// A no-stanza zone carries no zone-level tokens and no override — the empty
+	// admitted set IS the deny-all, identical in shape to `locked`.
+	if len(open.HostInboundSystemServices) != 0 || len(open.HostInboundProtocols) != 0 {
+		t.Fatalf("open host-inbound lists = %v/%v, want empty (no-stanza default-deny)",
+			open.HostInboundSystemServices, open.HostInboundProtocols)
+	}
+	if len(open.InterfaceHostInbound) != 0 {
+		t.Fatalf("open interface_host_inbound = %v, want none", open.InterfaceHostInbound)
 	}
 
 	// edge: no zone-level stanza but a per-interface override. The zone is

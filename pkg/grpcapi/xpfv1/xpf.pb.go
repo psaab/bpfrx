@@ -1910,13 +1910,19 @@ type ZoneInfo struct {
 	EgressBytes         uint64   `protobuf:"varint,9,opt,name=egress_bytes,json=egressBytes,proto3" json:"egress_bytes,omitempty"`
 	TcpRst              bool     `protobuf:"varint,10,opt,name=tcp_rst,json=tcpRst,proto3" json:"tcp_rst,omitempty"`
 	Description         string   `protobuf:"bytes,11,opt,name=description,proto3" json:"description,omitempty"`
-	// host_inbound_configured (#3328) records whether the zone is host-inbound
-	// ENFORCING: true when the zone declares a `host-inbound-traffic` stanza OR
-	// carries any per-interface override (#3362). This is the dataplane posture
-	// bit (ZoneSnapshot.HostInboundConfigured): false = no stanza = default
-	// admit-all for host-bound traffic; true with EMPTY lists = explicit
-	// deny-all. Without it an operator cannot distinguish "no stanza"
-	// (admit-all) from "empty stanza" (deny-all).
+	// host_inbound_configured (#3328/#3405) records whether the zone is
+	// host-inbound ENFORCING. Post-#3405 EVERY configured security zone is
+	// enforcing (Junos default-deny parity), so this is the dataplane posture
+	// bit (ZoneSnapshot.HostInboundConfigured) and is TRUE for every zone this
+	// RPC returns. A zone with NO `host-inbound-traffic` stanza default-DENIES
+	// host-bound traffic exactly like an explicit empty stanza (deny-all) —
+	// there is no admit-all posture for a configured zone. The admitted set
+	// lives in host_inbound_system_services / host_inbound_protocols (empty =
+	// deny-all) plus any per-interface override in interface_host_inbound.
+	// Before #3653 this was re-derived from config shape and reported false for
+	// a no-stanza zone — the pre-#3405 "false = admit-all" reading, the OPPOSITE
+	// of runtime. (Global ICMP/ND/PMTUD accepts and lifeline interfaces
+	// fxp0/em0/fab* still bypass the per-zone host-inbound deny.)
 	HostInboundConfigured bool `protobuf:"varint,12,opt,name=host_inbound_configured,json=hostInboundConfigured,proto3" json:"host_inbound_configured,omitempty"`
 	// host_inbound_system_services / host_inbound_protocols (#3328) carry the
 	// ZONE-LEVEL admission set, kept distinct so automation can tell a
