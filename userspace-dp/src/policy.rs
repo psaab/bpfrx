@@ -28,6 +28,41 @@ pub(crate) enum SnapshotIntegrityError {
     /// preflight keeps the previous good state) is action-agnostic: it never
     /// turns a deny into a pass nor a permit into match-any.
     UnrepresentableApplicationProtocol { rule_id: String },
+    /// #3712: a policy rule's application term carried a semantically-invalid
+    /// ICMP field combination that the pre-fix compiled matcher silently turned
+    /// into a WRONG-behaving term:
+    ///
+    ///   - `icmp-code` set with NO `icmp-type` (H04): `from_matches` steers a
+    ///     term into `icmp_constraints` ONLY when `icmp_type.is_some()`, so a
+    ///     code-without-type term fell through to a `range_terms` entry with
+    ///     EMPTY port ranges — a protocol-only MATCH-ALL for that ICMP protocol.
+    ///     The `icmp_code` was silently ignored, so an intended narrow rule
+    ///     (`type any, code 3`) widened to match every ICMP message. For a
+    ///     permit under default-deny that is a fail-OPEN (permits more than
+    ///     authored).
+    ///   - `icmp-type` / `icmp-code` set on a NON-ICMP protocol (H05):
+    ///     `from_matches` pushes the term into `icmp_constraints` under the
+    ///     non-ICMP protocol (e.g. TCP) because `icmp_type.is_some()`, and the
+    ///     exact-dst-port / range classification is skipped, so any real
+    ///     destination-port constraint is LOST. `matches` then skips the
+    ///     `icmp_constraints` arm for a non-ICMP packet (`packet_icmp` is None),
+    ///     so the term NEVER matches — a `deny tcp/80 icmp-type 8` never applies
+    ///     and default-permit admits the traffic (a security fail-OPEN).
+    ///
+    /// The Go STRICT commit gate (`validateApplicationSpecsStrict`, #3348) hard-
+    /// rejects BOTH combos at commit, but the tolerant load / peer-sync path
+    /// (`lenientApplicationSpecs`) downgrades them to warnings, so a corrupt /
+    /// hand-built / older-peer-synced snapshot can still carry them to this
+    /// helper — the only enforcement plane in the retired-eBPF world. Rejecting
+    /// the WHOLE snapshot (the preflight keeps the previous good state; a fresh
+    /// boot keeps the default-deny `PolicyState`) is action-agnostic, consistent
+    /// with the #2124/#3261/#3367/#3711 fail-closed family. `application` is the
+    /// term's name; `reason` describes which invalid combo was found.
+    InvalidApplicationIcmpFields {
+        rule_id: String,
+        application: String,
+        reason: &'static str,
+    },
     /// #3261: a policy rule carries the reserved `__unsupported_address__`
     /// sentinel in its source/destination address fields. The Go capability
     /// gate emits it when a policy names an address it cannot represent — an
@@ -439,6 +474,15 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "rule {:?} has an unrepresentable application term (unparseable protocol or port) — refusing to fail open by dropping it",
                 rule_id
+            ),
+            Self::InvalidApplicationIcmpFields {
+                rule_id,
+                application,
+                reason,
+            } => write!(
+                f,
+                "rule {:?} application term {:?} has an invalid ICMP field combination: {} — refusing to compile a wrong-behaving term (icmp-code without icmp-type matches ALL ICMP; icmp-type/code on a non-ICMP protocol never matches, so a deny falls through to default-permit)",
+                rule_id, application, reason
             ),
             Self::UnrepresentableAddress { rule_id } => write!(
                 f,
@@ -2334,6 +2378,20 @@ pub(crate) fn parse_policy_state_with_counters(
                 rule_id: rule_id.clone(),
             });
         }
+        // #3712: fail the whole snapshot closed when an application term carries a
+        // semantically-invalid ICMP field combination (icmp-code without
+        // icmp-type → match-all-ICMP fail-open; icmp-type/code on a non-ICMP
+        // protocol → never-match, letting a deny fall through to default-permit).
+        // The Go strict commit gate (#3348) is the primary defense; this is the
+        // helper-boundary backstop for the lenient / peer-sync / corrupt-snapshot
+        // path, consistent with the #2124/#3367/#3711 fail-closed family.
+        if let Some((application, reason)) = parsed.invalid_icmp {
+            return Err(SnapshotIntegrityError::InvalidApplicationIcmpFields {
+                rule_id: rule_id.clone(),
+                application,
+                reason,
+            });
+        }
         let applications = parsed.matches;
         let compiled_apps = CompiledApplications::from_matches(&applications);
 
@@ -3484,11 +3542,20 @@ fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<Pref
 struct ParsedApplications {
     matches: Vec<ApplicationMatch>,
     dropped_any: bool,
+    /// #3712: the FIRST application term found with a semantically-invalid ICMP
+    /// field combination — `(application name, reason)`. `None` when every term
+    /// is well-formed. The caller fails the whole snapshot closed via
+    /// `SnapshotIntegrityError::InvalidApplicationIcmpFields`, naming the rule
+    /// (which `parse_applications` does not have). Detected regardless of
+    /// `dropped_any` so a rule mixing a bad-ICMP term with an unparseable one
+    /// still surfaces the ICMP diagnostic when protocol/port parse.
+    invalid_icmp: Option<(String, &'static str)>,
 }
 
 fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications {
     let mut out = Vec::with_capacity(terms.len());
     let mut dropped_any = false;
+    let mut invalid_icmp: Option<(String, &'static str)> = None;
     for term in terms {
         let Some(protocol) = parse_protocol(&term.protocol) else {
             dropped_any = true;
@@ -3502,6 +3569,24 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications
             dropped_any = true;
             continue;
         };
+        // #3712: reject the two semantically-invalid ICMP field combinations the
+        // compiled matcher (`from_matches`/`matches`) would otherwise turn into a
+        // wrong-behaving term. Record the FIRST offender; the caller rejects the
+        // whole snapshot fail-closed (see `InvalidApplicationIcmpFields`). The
+        // non-ICMP-protocol case is checked first because on a non-ICMP protocol
+        // ANY icmp field is meaningless (the term can never match), whereas the
+        // code-without-type case is only relevant once the protocol is ICMP.
+        if invalid_icmp.is_none() {
+            let icmp_family = protocol == PROTO_ICMP || protocol == PROTO_ICMPV6;
+            if (term.icmp_type.is_some() || term.icmp_code.is_some()) && !icmp_family {
+                invalid_icmp = Some((
+                    term.name.clone(),
+                    "icmp-type/icmp-code set on a non-ICMP protocol",
+                ));
+            } else if term.icmp_code.is_some() && term.icmp_type.is_none() {
+                invalid_icmp = Some((term.name.clone(), "icmp-code set without icmp-type"));
+            }
+        }
         out.push(ApplicationMatch {
             protocol,
             source_ports,
@@ -3520,6 +3605,7 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications
     ParsedApplications {
         matches: out,
         dropped_any,
+        invalid_icmp,
     }
 }
 

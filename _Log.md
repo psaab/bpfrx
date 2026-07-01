@@ -1,3 +1,30 @@
+## 2026-07-01 — #3712 userspace-dp policy: fail-closed on invalid ICMP application field combos
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3712 (HIGH, security fail-open). The Rust policy snapshot
+    parser accepted two semantically-invalid ICMP application field combos and
+    compiled them into wrong-behaving terms: (A) `icmp-code` WITHOUT `icmp-type`
+    → `from_matches` only steers a term into `icmp_constraints` when
+    `icmp_type.is_some()`, so the term fell through to an empty-range
+    `range_terms` entry = protocol-only MATCH-ALL ICMP (the code silently
+    ignored — a permit widens fail-OPEN); (B) `icmp-type`/`icmp-code` on a
+    non-ICMP protocol → the term is pushed into `icmp_constraints` under the
+    non-ICMP protocol (losing any dst-port) and `matches` skips that arm for a
+    non-ICMP packet → the term NEVER matches, so a deny falls through to
+    default-permit (fail-OPEN). The Go strict commit gate
+    (`validateApplicationSpecsStrict`, #3348) rejects both at commit, but
+    `lenientApplicationSpecs` downgrades to a warning on the tolerant load /
+    HA peer-sync path, so a corrupt / hand-built / older-peer-synced snapshot
+    still reaches this helper — the only enforcement plane. FIX: `parse_applications`
+    records the first offending term; `parse_policy_state_with_counters` rejects
+    the whole snapshot with `SnapshotIntegrityError::InvalidApplicationIcmpFields`
+    (fail-closed, action-agnostic — the #2124/#3367/#3711 family). Non-ICMP-protocol
+    arm checked first; code-without-type arm applies once protocol is ICMP/ICMPv6.
+  - **File(s)**: userspace-dp/src/policy.rs (new SnapshotIntegrityError variant +
+    Display + ParsedApplications.invalid_icmp + parse_applications detection +
+    caller reject), userspace-dp/src/policy_tests.rs (5 tests, 3 RED-on-revert),
+    docs/config-schema.md (#3348 section — #3712 Rust backstop note)
+
 ## 2026-07-01 — #3709 policy-simulator rejects DUPLICATE selectors (consistent fail-closed across CLI/gRPC/REST) + comma-in-zone round-trip
 
 - **Timestamp**: 2026-07-01
