@@ -1,3 +1,46 @@
+## 2026-07-01 — #3736 ddns Surface A: run the checkip address observation UNLOCKED + with the reconcile ctx (observation residual of #2778)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3736 (MEDIUM, folds codex-review-157 H05+H06). #2778 moved
+    provider Upsert/Delete off `m.mu` via `providerIO`, but the per-scope
+    ADDRESS OBSERVATION was left under the lock — and for the checkip source
+    that observation is a blocking external HTTP GET (up to 10s). It also
+    used `context.Background()`, so it ignored the reconcile/shutdown ctx.
+    Impact: N checkip scopes with a black-holed endpoint held `m.mu` up to
+    N*10s, wedging `StatusViews`/`Stats`/other-scope reconcile; shutdown hung
+    behind an in-flight probe.
+    FIX (a): added `SurfaceAManager.observeIO` (mirrors `providerIO`) and
+    `reconcileScopeLocked` now runs `observe(ctx, sc)` with `m.mu` RELEASED —
+    the observation only READS external state (netlink/DHCP/HTTP), reconcile
+    is serialized by the daemon (`surfaceAReconcileInFlight`), and ownership
+    is re-read under the re-acquired lock before any decision; the backoff
+    window is still checked UNDER the lock BEFORE the probe.
+    FIX (b): threaded `context.Context` into the `AddressObserver` signature;
+    the daemon observer's checkip branch now derives its 10s bound from the
+    reconcile ctx (`context.WithTimeout(ctx, ...)`), so a shutdown/pass
+    cancel aborts an in-flight probe promptly (`doRequest` already applies
+    `req.WithContext`).
+    Three RED-on-revert tests: `TestSurfaceALockNotHeldDuringObserve`
+    (concurrent StatusViews/Stats proceed while a blocking observe is in
+    flight; RED = they block under the held lock),
+    `TestSurfaceAObserveHonorsReconcileContextCancel` (engine threads the
+    ctx; RED = Reconcile hangs after cancel), and
+    `TestSurfaceAObserverCheckIPHonorsReconcileContext` (daemon; a
+    short-deadline ctx aborts the probe to a hung httptest endpoint; RED =
+    blocks 10s on `context.Background`). `go test -race ./pkg/ddns/...
+    ./pkg/daemon/` green; `go build ./...`, gofmt, vet clean. Updated the
+    observation lock/ctx invariant in `docs/research/ddns-world-class/plan.md`
+    §5.3.
+  - **File(s)**: pkg/ddns/surface_a.go,
+    pkg/daemon/daemon_ddns_surface_a.go,
+    pkg/ddns/surface_a_observe_lockio_3736_test.go,
+    pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/surface_a_test.go,
+    pkg/ddns/surface_a_rfc2136_test.go,
+    pkg/ddns/surface_a_httpcache_reap_2956_test.go,
+    pkg/ddns/surface_a_http_test.go,
+    pkg/ddns/surface_a_withdraw_backoff_2813_test.go,
+    docs/research/ddns-world-class/plan.md, _Log.md
+
 ## 2026-07-01 — #3734 ddns Surface A: seedFromStore + renumber log read AddrText (not the always-empty Address) → no restart republish storm, renumber leaves a trace
 
 - **Timestamp**: 2026-07-01

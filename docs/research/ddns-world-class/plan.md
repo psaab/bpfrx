@@ -456,6 +456,29 @@ without flooding the per-tick observer. Fail-open to the default route
 remains acceptable for generic HTTP UPDATE backends (they carry a
 credential and target a fixed provider host); the checkip oracle does not.
 
+**Observation runs UNLOCKED, with the reconcile context — invariant
+(#3736, the observation residual of #2778).** The engine invokes the
+`AddressObserver` with the manager mutex `m.mu` RELEASED (via
+`SurfaceAManager.observeIO`, mirroring `providerIO` for provider I/O) and
+threads the reconcile/pass `context.Context` into it. Both matter only for
+the checkip source, whose observation is a blocking external HTTP GET (up
+to `surfaceACheckIPTimeout` = 10s): (1) holding `m.mu` across that probe
+would block `StatusViews`/`Stats` and serialize every OTHER scope's
+reconcile behind a slow/black-holed checkip endpoint — for N checkip
+scopes with a hung endpoint the lock would be held up to N*10s; (2) the
+daemon observer now derives the per-probe timeout from the reconcile ctx
+(`context.WithTimeout(ctx, ...)`, NOT `context.Background()`), so a daemon
+shutdown / pass-deadline cancel aborts an in-flight probe promptly instead
+of hanging behind it. The observation only READS external state (netlink /
+DHCP / HTTP), never manager state, and reconcile passes are serialized by
+the daemon (`surfaceAReconcileInFlight`), so dropping the lock for the
+round-trip is safe: no concurrent pass mutates `m.runtime`/`m.state`, and
+the engine re-reads ownership under the re-acquired lock before any
+publish/withdraw decision. The per-scope error-backoff window is checked
+UNDER the lock BEFORE the observation, so a backed-off scope never issues
+the HTTP probe. Adding a new blocking address source MUST keep the
+observation on this unlocked, ctx-bound path.
+
 For **Surface B** the observation is the existing Kea-memfile lease parser
 (`pkg/dhcpserver/ddns_leases.go`) — unchanged, just emitting `ScopeKey`-
 tagged records.
