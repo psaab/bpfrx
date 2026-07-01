@@ -25356,6 +25356,31 @@ top.
   render (M04) in the API/gRPC references
 - **File(s)**: pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
 
+## 2026-07-01 — #3696 policy-simulator strict selector parser (fail-closed)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add SSOT strict selector parser policymatch.ParseSelectorArgs +
+  SelectorArgs (+ .Query()); route all four CLI surfaces through it; harden the
+  gRPC ShowText test-policy bridge. A value-taking selector present without a
+  value, an unknown selector token, and an explicit-empty typed value are now
+  HARD ERRORS instead of silently widening the query to the wildcard. Value
+  validation (ParsePort/ParseICMPValue/ValidateProtocol/net.IP) folded into the
+  parser so the redundant per-surface checks are removed. Usage text (#3628
+  SSOT tail) documents the strict failure (M08).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, cmd/cli/show.go, cmd/cli/main.go,
+  pkg/grpcapi/server_show_firewall.go, _Log.md
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add RED-on-revert tests for the strict selector parser across all
+  surfaces (primitive + local show/test + remote show/test + gRPC ShowText);
+  document strict failure in the policymatch README and the Junos CLI reference
+  (M08). Verified RED-on-revert: reverting the impl fails the primitive build
+  and the local/remote/gRPC want-error cases.
+- **File(s)**: pkg/policymatch/selector_args_3696_test.go,
+  pkg/cli/query_strictness_3696_test.go, cmd/cli/query_strictness_3696_test.go,
+  pkg/grpcapi/server_testpolicy_strictness_3696_test.go,
+  pkg/policymatch/README.md, docs/junos-cli-reference.md, _Log.md
 ## 2026-07-01 — #3698 addressless host-inbound zone fail-open admit window observability (folds codex-review-128 M02/L02)
 
 - **Timestamp**: 2026-07-01

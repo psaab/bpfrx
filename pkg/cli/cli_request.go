@@ -178,82 +178,20 @@ func (c *CLI) testPolicy(args []string) error {
 		return nil
 	}
 
-	var fromZone, toZone, srcIP, dstIP, proto string
-	var srcPort, dstPort int
-	var icmpType, icmpCode *uint8
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "from-zone":
-			if i+1 < len(args) {
-				i++
-				fromZone = args[i]
-			}
-		case "to-zone":
-			if i+1 < len(args) {
-				i++
-				toZone = args[i]
-			}
-		case "source-ip":
-			if i+1 < len(args) {
-				i++
-				srcIP = args[i]
-			}
-		case "destination-ip":
-			if i+1 < len(args) {
-				i++
-				dstIP = args[i]
-			}
-		case "source-port":
-			if i+1 < len(args) {
-				i++
-				// #3107: the shared matcher supports a source-port term
-				// (policymatch.Query.SrcPort), but the CLI previously had no
-				// way to express it, so a source-port-constrained application
-				// was overmatched. Parse via the shared validator (#3116) so a
-				// malformed/out-of-range value errors instead of silently
-				// coercing to the 0 "any port" wildcard.
-				p, err := policymatch.ParsePort(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid source-port: %w", err)
-				}
-				srcPort = p
-			}
-		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				p, err := policymatch.ParsePort(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid destination-port: %w", err)
-				}
-				dstPort = p
-			}
-		case "protocol":
-			if i+1 < len(args) {
-				i++
-				proto = args[i]
-			}
-		case "icmp-type":
-			if i+1 < len(args) {
-				i++
-				// #3284: thread an ICMP/ICMPv6 type into the shared matcher so a
-				// type-constrained app term (junos-ping = type 8) is honored.
-				v, err := policymatch.ParseICMPValue(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid icmp-type: %w", err)
-				}
-				icmpType = v
-			}
-		case "icmp-code":
-			if i+1 < len(args) {
-				i++
-				v, err := policymatch.ParseICMPValue(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid icmp-code: %w", err)
-				}
-				icmpCode = v
-			}
-		}
+	// #3696: parse through the single strict SSOT selector parser shared by all
+	// four CLI surfaces + the gRPC test-policy bridge. A value-taking selector
+	// with no value, an unknown selector token, an explicit-empty typed value,
+	// and a malformed IP / port / protocol / icmp value are HARD ERRORS instead
+	// of silently degrading to the wildcard — the simulator answers the query
+	// the operator typed, not a broader one. Per-value validation (#3116 /
+	// #3108 / #3284 / #1711) now lives in the parser.
+	sel, err := policymatch.ParseSelectorArgs(args)
+	if err != nil {
+		return err
 	}
+	fromZone, toZone, srcIP, dstIP, proto := sel.FromZone, sel.ToZone, sel.SrcIP, sel.DstIP, sel.Protocol
+	srcPort, dstPort := sel.SrcPort, sel.DstPort
+	icmpType, icmpCode := sel.ICMPType, sel.ICMPCode
 
 	if fromZone == "" || toZone == "" {
 		// #3628: shared SSOT selector list (policymatch) so the advertised
@@ -261,25 +199,6 @@ func (c *CLI) testPolicy(args []string) error {
 		// and protocol by name or number.
 		fmt.Println(policymatch.TestPolicyUsage)
 		return nil
-	}
-
-	// A non-empty but malformed source/destination IP would parse to
-	// nil and be treated as a wildcard by matchPolicyAddr, yielding a
-	// false-positive policy match (#1711). Reject it explicitly. An
-	// empty value still means "unspecified" (match any).
-	if srcIP != "" && net.ParseIP(srcIP) == nil {
-		return fmt.Errorf("invalid source-ip %q", srcIP)
-	}
-	if dstIP != "" && net.ParseIP(dstIP) == nil {
-		return fmt.Errorf("invalid destination-ip %q", dstIP)
-	}
-
-	// #3108: reject a non-empty but unknown/out-of-range protocol token
-	// ("tcpp", "999") instead of letting matchApp short-circuit it to the
-	// "any protocol" wildcard, which would yield a misleading verdict for a
-	// policy using `application any`. An empty value still means "unspecified".
-	if err := policymatch.ValidateProtocol(proto); err != nil {
-		return err
 	}
 
 	parsedSrc := net.ParseIP(srcIP)

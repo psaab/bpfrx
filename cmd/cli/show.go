@@ -1172,95 +1172,43 @@ func (c *ctl) handleShowNAT(args []string) error {
 }
 
 func (c *ctl) showMatchPolicies(args []string) error {
-	req := &pb.MatchPoliciesRequest{}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "from-zone":
-			if i+1 < len(args) {
-				i++
-				req.FromZone = args[i]
-			}
-		case "to-zone":
-			if i+1 < len(args) {
-				i++
-				req.ToZone = args[i]
-			}
-		case "source-ip":
-			if i+1 < len(args) {
-				i++
-				req.SourceIp = args[i]
-			}
-		case "destination-ip":
-			if i+1 < len(args) {
-				i++
-				req.DestinationIp = args[i]
-			}
-		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				// #3354: route through the shared parser so a malformed/
-				// out-of-range port errors instead of silently coercing to the
-				// 0 wildcard (the old assign-on-success-only strconv.Atoi). This
-				// matches the local CLI + `test policy`, which already use
-				// policymatch.ParsePort, and mirrors the #3289 icmp-type fix.
-				v, err := policymatch.ParsePort(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid destination-port: %w", err)
-				}
-				req.DestinationPort = int32(v)
-			}
-		case "source-port":
-			if i+1 < len(args) {
-				i++
-				v, err := policymatch.ParsePort(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid source-port: %w", err)
-				}
-				req.SourcePort = int32(v)
-			}
-		case "protocol":
-			if i+1 < len(args) {
-				i++
-				req.Protocol = args[i]
-			}
-		case "icmp-type":
-			if i+1 < len(args) {
-				i++
-				// #3284: thread an ICMP/ICMPv6 type so a type-constrained app
-				// term (junos-ping = type 8) is honored by the backend matcher.
-				// Route through the shared validator so an invalid/out-of-range
-				// token errors instead of silently dropping to the unconstrained
-				// nil wildcard (mirrors every other surface).
-				v, err := policymatch.ParseICMPValue(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid icmp-type: %w", err)
-				}
-				if v != nil {
-					u := uint32(*v)
-					req.IcmpType = &u
-				}
-			}
-		case "icmp-code":
-			if i+1 < len(args) {
-				i++
-				v, err := policymatch.ParseICMPValue(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid icmp-code: %w", err)
-				}
-				if v != nil {
-					u := uint32(*v)
-					req.IcmpCode = &u
-				}
-			}
-		}
+	// #3696: parse the selector grammar through the single strict SSOT parser
+	// (policymatch.ParseSelectorArgs) shared by the local CLI, the remote CLI,
+	// and the gRPC test-policy bridge. A value-taking selector present WITHOUT a
+	// value, an UNKNOWN selector token, an explicit-empty typed value, and a
+	// malformed IP / port / protocol / icmp value are all HARD ERRORS — the
+	// remote CLI no longer forwards a silently-widened query to the typed
+	// MatchPolicies RPC. Per-value validation (#3354 / #3108 / #3284 / #1711)
+	// now lives in the parser, so this surface fails closed before any RPC.
+	sel, err := policymatch.ParseSelectorArgs(args)
+	if err != nil {
+		return err
 	}
 
-	if req.FromZone == "" || req.ToZone == "" {
+	if sel.FromZone == "" || sel.ToZone == "" {
 		// #3628: shared SSOT selector list (policymatch) — advertise every
 		// selector the request parser accepts, including icmp-type/icmp-code and
 		// protocol by name or number.
 		fmt.Println(policymatch.MatchPoliciesUsage)
 		return nil
+	}
+
+	req := &pb.MatchPoliciesRequest{
+		FromZone:        sel.FromZone,
+		ToZone:          sel.ToZone,
+		SourceIp:        sel.SrcIP,
+		DestinationIp:   sel.DstIP,
+		Protocol:        sel.Protocol,
+		SourcePort:      int32(sel.SrcPort),
+		DestinationPort: int32(sel.DstPort),
+	}
+	if sel.ICMPType != nil {
+		u := uint32(*sel.ICMPType)
+		req.IcmpType = &u
+	}
+	if sel.ICMPCode != nil {
+		u := uint32(*sel.ICMPCode)
+		req.IcmpCode = &u
 	}
 
 	resp, err := c.client.MatchPolicies(c.ctx(), req)
