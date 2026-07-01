@@ -98,8 +98,11 @@ func TestGRPCShowPoliciesDetailReflectsSchedulerInactive(t *testing.T) {
 	if !strings.Contains(out, "Policy: g-sched-off, action-type: Permit, State: inactive, Scheduler: workhours") {
 		t.Fatalf("gRPC detail missing inactive global scheduler-bound policy state:\n%s", out)
 	}
-	// The plain policy header must stay bit-identical (no State suffix).
-	if !strings.Contains(out, "Policy: plain-allow, action-type: Permit\n") {
+	// The plain policy header must stay suffix-free (no State suffix). The
+	// #3667 Index column follows action-type directly for an active policy, so
+	// matching "action-type: Permit, Index: " proves no State suffix was
+	// inserted between them.
+	if !strings.Contains(out, "Policy: plain-allow, action-type: Permit, Index: ") {
 		t.Fatalf("gRPC detail changed plain (active) policy header:\n%s", out)
 	}
 }
@@ -111,7 +114,7 @@ func TestGRPCShowPoliciesDetailActiveSchedulerNoSuffix(t *testing.T) {
 	var buf strings.Builder
 	s.showPoliciesDetail("", &buf)
 	out := buf.String()
-	if !strings.Contains(out, "Policy: sched-off, action-type: Permit\n") {
+	if !strings.Contains(out, "Policy: sched-off, action-type: Permit, Index: ") {
 		t.Fatalf("active scheduler policy should keep bit-identical header:\n%s", out)
 	}
 	if strings.Contains(out, "State: inactive") {
@@ -126,7 +129,7 @@ func TestGRPCShowPoliciesDetailNoProviderNoSuffix(t *testing.T) {
 	var buf strings.Builder
 	s.showPoliciesDetail("", &buf)
 	out := buf.String()
-	if !strings.Contains(out, "Policy: sched-off, action-type: Permit\n") {
+	if !strings.Contains(out, "Policy: sched-off, action-type: Permit, Index: ") {
 		t.Fatalf("no-provider fallback should keep bit-identical header:\n%s", out)
 	}
 	if strings.Contains(out, "State: inactive") {

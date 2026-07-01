@@ -14,16 +14,13 @@ import (
 // runtimePolicyIndex returns the span-accumulated runtime/RT_FLOW policy ID for
 // the policy at (policySetID, sliceIndex), used as the displayed detail `Index`
 // so it matches the numeric policy ID the RT_FLOW/event path logs (#3063). It
-// falls back to the raw ordinal policySetID*MaxRulesPerPolicy + sliceIndex when
-// the lookup has no entry (e.g. a config the dataplane would reject for
-// MaxRulesPerPolicy overflow), which is byte-identical to the pre-#3063 value.
+// delegates to dpuserspace.RuntimePolicyIndex — the SSOT shared with the gRPC
+// text detail renderer (#3667) — which falls back to the raw ordinal
+// policySetID*MaxRulesPerPolicy + sliceIndex when the lookup has no entry.
 // This is a DISPLAY identity only — it is NOT the counter handle passed to
 // ReadPolicyCounters (that stays the raw ordinal; see policyRuleIDForCounter).
 func runtimePolicyIndex(ids map[[2]uint32]uint32, policySetID, sliceIndex uint32) uint32 {
-	if id, ok := ids[[2]uint32{policySetID, sliceIndex}]; ok {
-		return id
-	}
-	return policySetID*dataplane.MaxRulesPerPolicy + sliceIndex
+	return dpuserspace.RuntimePolicyIndex(ids, policySetID, sliceIndex)
 }
 
 func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
@@ -270,17 +267,8 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				fmt.Printf("  Application: %s\n", app)
 				c.printAppDetail(cfg, app)
 			}
-			if pol.Log != nil {
-				parts := []string{}
-				if pol.Log.SessionInit {
-					parts = append(parts, "at-create")
-				}
-				if pol.Log.SessionClose {
-					parts = append(parts, "at-close")
-				}
-				if len(parts) > 0 {
-					fmt.Printf("  Session log: %s\n", strings.Join(parts, ", "))
-				}
+			if modes := pol.Log.SessionLogModes(); len(modes) > 0 {
+				fmt.Printf("  Session log: %s\n", strings.Join(modes, ", "))
 			}
 			seqNum++
 		}
@@ -340,17 +328,8 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				fmt.Printf("  Application: %s\n", app)
 				c.printAppDetail(cfg, app)
 			}
-			if pol.Log != nil {
-				parts := []string{}
-				if pol.Log.SessionInit {
-					parts = append(parts, "at-create")
-				}
-				if pol.Log.SessionClose {
-					parts = append(parts, "at-close")
-				}
-				if len(parts) > 0 {
-					fmt.Printf("  Session log: %s\n", strings.Join(parts, ", "))
-				}
+			if modes := pol.Log.SessionLogModes(); len(modes) > 0 {
+				fmt.Printf("  Session log: %s\n", strings.Join(modes, ", "))
 			}
 			seqNum++
 

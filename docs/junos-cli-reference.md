@@ -650,6 +650,15 @@ Policy: log-control4, action-type: permit, services-offload:not-configured , Sta
     alongside the independent `log_session_init` / `log_session_close`
     modes and the runtime `policy_id` / `rule_id` (the latter joins a
     runtime event back to an inventory row).
+    - **gRPC text parity (#3667):** the gRPC-rendered
+      `show security policies detail` text surface annotates its
+      `      Source addresses (except):` / `      Destination addresses
+      (except):` headers the same way (both the zone-pair and global
+      blocks). Before #3667 that surface printed the excluded set under a
+      plain header — the OPPOSITE security meaning — while also collapsing
+      the log modes into a bare `log` and omitting the Index; it now prints
+      `Session log: at-create, at-close` and `, Index: <N>` (the runtime
+      policy ID) in the per-policy header, matching the local CLI.
 - **Application block:** 2-space indent for app name, 4-space for protocol details, 6-space for ports.
   - `IP protocol: tcp|udp|0, ALG: 0, Inactivity timeout: <seconds>`
   - `Source port range: [<low>-<high>]`
