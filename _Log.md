@@ -1,3 +1,22 @@
+## 2026-07-01 — #3622 appid CatalogNames nil-guards (fail-closed on tolerated config)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3622 — added nil-guards to `appid.CatalogNames` so a nil
+    `*config.ZonePairPolicies` entry or a nil `*config.Policy` entry (both
+    admitted by the tolerant-load path #1960) fails closed instead of
+    panicking the userspace app-catalog build. `runtime.go` now `continue`s
+    on `zpp == nil` in the `cfg.Security.Policies` loop and on `pol == nil`
+    in the `addPolicyApps` inner loop — matching the strict validation
+    walker (`compiler_validate_strict.go`), which already skips these nil
+    entries. Added `TestCatalogNamesNilEntriesFailClosed` (RED-on-revert:
+    reverting either guard makes the test's `recover()` re-raise the nil
+    deref → FAIL). Documented the nil-tolerance contract in
+    `pkg/appid/README.md`. Validation: `go test ./pkg/appid/...
+    ./pkg/config/...` green; `go build ./pkg/... ./cmd/...`, gofmt, go vet
+    clean.
+  - **File(s)**: pkg/appid/runtime.go, pkg/appid/runtime_test.go,
+    pkg/appid/README.md, _Log.md
+
 ## 2026-06-30 — #3605 static NAT: scope-differentiated rules coexist (Vec-per-key)
 
 - **Timestamp**: 2026-06-30

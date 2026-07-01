@@ -68,3 +68,10 @@ and resolves session display names from the dataplane's assigned `app_id`.
   runtime won't actually evaluate).
 - `CatalogNames` calls `config.ExpandApplicationSet` internally to
   flatten `application-set` aliases. Callers don't need to pre-expand.
+- `CatalogNames` is nil-tolerant on the policy walk (#3622): a nil
+  `*config.ZonePairPolicies` entry or a nil `*config.Policy` entry —
+  both admitted by the tolerant-load path (#1960) — is skipped rather
+  than dereferenced, so a partially-broken-but-tolerated config surfaces
+  a fail-closed result instead of panicking the app-catalog build. This
+  matches the strict validation walker (`compiler_validate_strict.go`),
+  which already `continue`s on the same nil entries.
