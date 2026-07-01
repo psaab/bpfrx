@@ -1,3 +1,56 @@
+## 2026-07-01 — #3643 HIDE per-zone zone_counters + flood_counters dead surfaces
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3643 — per-zone traffic (`zone_counters`) + per-zone flood
+    (`flood_counters`) counters are read by CLI/gRPC/REST/Prometheus but never
+    populated in the userspace era (eBPF writers deleted in #1476). STEP 0
+    resolved the prior-agent factual conflict on current origin/master: every
+    caller passes the STABLE-HASH zone id from `cr.ZoneIDs[zoneName]`
+    (`config.StableZoneID` -> `[1,65533]`, compiler.go `assignZoneIDs`), NOT a
+    dense compiled id. The dense per-CPU arrays hold only `MaxZones*2=128` /
+    `MaxZones=64` entries, so `ReadZoneCounters`/`ReadFloodCounters` OOB'd the
+    bounded `Lookup` (ErrKeyNotExist) for any id >= 64 -> REST `/security/zones`
+    HTTP 500 + Prometheus `xpf_counter_read_errors_total` false alert (1x/zone/
+    scrape) + CLI/gRPC error rows. The earlier "returns 0 (dense 1..N)"
+    sparse-audit was STALE (pre-#3075). Implemented HIDE (plan §5B; POPULATE
+    §5A deferred): (1) read-side #2255 clone -- `ReadZoneCounters`/
+    `ReadFloodCounters` key Go-side sparse offset maps
+    (`zoneCounterOffsets`/`floodCounterOffsets` on the Manager, `m.mu`-guarded)
+    and NEVER index the dense array, returning the new distinct sentinel
+    `dataplane.ErrCounterNotPopulated` while unpopulated; added
+    `Set{Zone,Flood}CounterOffset` (POPULATE hook) + `Clear{Zone,Flood}
+    CounterOffsets` wired into `ClearZoneCounters`/`ClearAllCounters`.
+    (2) surfaces recognize the sentinel and render explicit "not available"
+    (never a bare 0, never an error): REST adds `per_zone_counters_available`
+    (200 not 500), CLI `show security zones` + `show security screen ids-option
+    statistics`, gRPC structured (counts unset, no Internal) + text ("not
+    available"). Genuine errors (anything != sentinel) STILL 500/warn/bump ->
+    #3345/#3408/#3344 contract preserved. (3) dropped the always-erroring
+    `xpf_zone_packets_total`/`xpf_zone_bytes_total` Prometheus metrics +
+    `collectZoneCounters`; re-pointed the #3462 ordering-pin test to per-policy
+    reads. RED-on-revert PROVEN by temporarily restoring the dense reads:
+    dataplane test -> "map not found" (not sentinel), REST -> 500 "zone counter
+    read failed". Added #1451 legacy-import allowlist entries for the two new
+    dataplane-importing files. `go test ./pkg/dataplane/... ./pkg/api/...
+    ./pkg/cli/... ./pkg/grpcapi/... ./pkg/logging/...` GREEN; `go build
+    ./pkg/... ./cmd/...` OK; gofmt clean. Docs: pkg/api/README.md counter
+    contract + #1373 legacy-import table. Follow-up POPULATE enhancement issue
+    filed (plan-deferred-research). NO Rust/wire change (Go read-side only).
+  - **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/maps_counters.go,
+    pkg/dataplane/maps_screen.go, pkg/dataplane/zone_flood_counters_hide_test.go,
+    pkg/dataplane/retirement_boundary_canary_test.go, pkg/api/security.go,
+    pkg/api/types.go, pkg/api/metrics.go, pkg/api/metrics_counters.go,
+    pkg/api/metrics_descriptors.go, pkg/api/zone_counters_hide_test.go,
+    pkg/api/zones_policies_counter_error_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go,
+    pkg/api/filter_counters_metrics_test.go,
+    pkg/cli/cli_show_security_zones.go, pkg/cli/cli_show_security_screen.go,
+    pkg/cli/zone_flood_counters_hide_test.go,
+    pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_zones_text.go,
+    pkg/grpcapi/server_show_security_text.go,
+    pkg/grpcapi/zone_flood_counters_hide_test.go, pkg/api/README.md,
+    docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
+
 ## 2026-07-01 — #3639 enforce to-zone junos-host GLOBAL (from-zone any) host-inbound policy
 
 - **Timestamp**: 2026-07-01

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -360,15 +361,29 @@ func (c *CLI) showScreenStatistics(zoneName string) error {
 		return nil
 	}
 	fs, err := c.dp.ReadFloodCounters(zoneID)
+	screenProfile := ""
+	if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
+		screenProfile = z.ScreenProfile
+	}
+	if errors.Is(err, dataplane.ErrCounterNotPopulated) {
+		// #3643 HIDE: per-zone flood-event counters are not sourced by the
+		// userspace dataplane. Say so explicitly rather than printing a
+		// misleading 0. Global/aggregate screen drop visibility remains via
+		// `show security screen` and the #3343 per-reason counters.
+		fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
+		if screenProfile != "" {
+			fmt.Printf("  Screen profile: %s\n", screenProfile)
+		}
+		fmt.Println("  Per-zone flood counters: not available " +
+			"(per-zone flood accounting not implemented in the userspace dataplane)")
+		fmt.Print(c.screenSYNCookieCounterRows())
+		return nil
+	}
 	if err != nil {
 		fmt.Printf("Error reading flood counters: %v\n", err)
 		return nil
 	}
 	totalSyn, totalICMP, totalUDP := fs.SynCount, fs.ICMPCount, fs.UDPCount
-	screenProfile := ""
-	if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
-		screenProfile = z.ScreenProfile
-	}
 	fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
 	if screenProfile != "" {
 		fmt.Printf("  Screen profile: %s\n", screenProfile)
@@ -410,6 +425,24 @@ func (c *CLI) showScreenStatisticsAll() error {
 	for _, zoneName := range zones {
 		zoneID := cr.ZoneIDs[zoneName]
 		fs, err := c.dp.ReadFloodCounters(zoneID)
+		screenProfile := ""
+		if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
+			screenProfile = z.ScreenProfile
+		}
+		if errors.Is(err, dataplane.ErrCounterNotPopulated) {
+			// #3643 HIDE: per-zone flood counters are not sourced by the
+			// userspace dataplane. This is NOT a read failure -- do not set
+			// readErr (no false #3408 warning) and do not print a misleading 0;
+			// render an explicit "not available" row for the zone.
+			fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
+			if screenProfile != "" {
+				fmt.Printf("  Screen profile: %s\n", screenProfile)
+			}
+			fmt.Println("  Per-zone flood counters: not available " +
+				"(per-zone flood accounting not implemented in the userspace dataplane)")
+			fmt.Println()
+			continue
+		}
 		if err != nil {
 			if readErr == nil {
 				readErr = err
@@ -423,10 +456,6 @@ func (c *CLI) showScreenStatisticsAll() error {
 			fmt.Printf("  Error reading flood counters: %v\n", err)
 			fmt.Println()
 			continue
-		}
-		screenProfile := ""
-		if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
-			screenProfile = z.ScreenProfile
 		}
 		fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
 		if screenProfile != "" {

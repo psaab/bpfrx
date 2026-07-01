@@ -166,28 +166,11 @@ func TestCollectFilterCountersSkipsSampleOnConfigReadError(t *testing.T) {
 	}
 }
 
-func TestCollectZoneCountersCountsReadErrors(t *testing.T) {
-	srv := &Server{store: newDescriptorCoverageStore(t)}
-	c := newCollector(srv)
-	dp := &policyZoneErrAPIDP{
-		Manager: dataplane.New(),
-		apply:   &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"trust": 1, "untrust": 2}},
-	}
-
-	ch := make(chan prometheus.Metric, 64)
-	c.collectZoneCounters(ch, dp)
-	close(ch)
-
-	var zoneEmitted int
-	for m := range ch {
-		if strings.Contains(m.Desc().String(), "xpf_zone_") {
-			zoneEmitted++
-		}
-	}
-	if zoneEmitted != 0 {
-		t.Errorf("collectZoneCounters emitted %d zone samples on an all-failing DP; want 0", zoneEmitted)
-	}
-	if c.counterReadErrors.Load() == 0 {
-		t.Error("counterReadErrors not bumped on a per-zone read failure")
-	}
-}
+// #3643: TestCollectZoneCountersCountsReadErrors was removed with the
+// collectZoneCounters collector. Per-zone traffic metrics
+// (xpf_zone_packets_total / xpf_zone_bytes_total) were never populated in the
+// userspace era and every stable-hash zone id >= MaxZones read OOB'd the dense
+// BPF array, bumping xpf_counter_read_errors_total once per zone per scrape --
+// a permanent FALSE alert. The metrics + collector are gone (HIDE) until the
+// per-zone POPULATE path ships. See TestZonesHandlerZoneCountersNotAvailable /
+// TestCollectDoesNotFalseAlertOnZoneReads for the HIDE contract.

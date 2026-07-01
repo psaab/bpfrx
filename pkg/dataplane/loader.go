@@ -46,7 +46,7 @@ type Manager struct {
 	EnableCPUMap            bool // Enable cpumap multi-CPU distribution (adds startup overhead)
 	xdpEntryProg            string
 	VlanSubInterfaces       map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these)
-	mu                      sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets
+	mu                      sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets + zone/flood offsets
 	userspaceCounterOffsets map[uint32]uint64 // userspace counter deltas merged in ReadGlobalCounter
 	// natRuleCounterOffsets holds per-rule NAT translation hit totals reported
 	// by the Rust userspace dataplane (keyed by compiler-assigned counter ID),
@@ -56,6 +56,23 @@ type Manager struct {
 	// existing operator read path. Values are absolute cumulative totals, not
 	// deltas (SetNATRuleCounterOffset overwrites).
 	natRuleCounterOffsets map[uint32]CounterValue
+
+	// zoneCounterOffsets / floodCounterOffsets hold userspace-reported per-zone
+	// traffic + flood counters keyed by the STABLE-HASH zone id (#3075: zone
+	// ids are a name-derived FNV fold in [1,65533], NOT a dense [1,MaxZones]
+	// index). #3643: the legacy dense zone_counters / flood_counters BPF arrays
+	// hold only MaxZones*2 / MaxZones entries, so indexing them by a stable-hash
+	// id >= MaxZones OOBs the bounded Lookup (ErrKeyNotExist). The read surfaces
+	// mis-reported that structural OOB as a hard failure (REST 500, false
+	// Prometheus xpf_counter_read_errors_total alerts, CLI/gRPC error rows).
+	// Read{Zone,Flood}Counters now key these sparse maps and NEVER index the
+	// dense arrays -- the same treatment #2255 gave nat_rule_counters. The
+	// userspace helper does not yet populate per-zone / flood counters (POPULATE
+	// deferred, see docs/research/3643-dead-counters/plan.md §5A), so these maps
+	// stay empty and the reads report ErrCounterNotPopulated; surfaces render
+	// "not available", never a misleading 0. The setters are the POPULATE hook.
+	zoneCounterOffsets  map[uint16][2]CounterValue // [zoneID] -> {ingress, egress}
+	floodCounterOffsets map[uint16]FloodState      // [zoneID]
 
 	// #863: refcount of XDP-attached ifindexes that "claim" the
 	// IFACE_FLAG_XDP_ATTACHED bit on each iface_zone_map entry.

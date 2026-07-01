@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"sort"
 
 	"google.golang.org/grpc/codes"
@@ -75,17 +76,28 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 			if id, ok := cr.ZoneIDs[zoneName]; ok {
 				zi.Id = uint32(id)
 				if s.dp != nil && s.dp.IsLoaded() {
-					if ing, err := s.dp.ReadZoneCounters(id, 0); err == nil {
+					ing, errIn := s.dp.ReadZoneCounters(id, 0)
+					eg, errOut := s.dp.ReadZoneCounters(id, 1)
+					switch {
+					case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
+						errors.Is(errOut, dataplane.ErrCounterNotPopulated):
+						// #3643 HIDE: per-zone traffic counters are not sourced
+						// by the userspace dataplane. Leave the counter fields
+						// unset (proto3 omit) rather than Internal-erroring the
+						// RPC on the structural stable-hash-id OOB.
+					case errIn != nil:
+						if readErr == nil {
+							readErr = errIn
+						}
+					case errOut != nil:
+						if readErr == nil {
+							readErr = errOut
+						}
+					default:
 						zi.IngressPackets = ing.Packets
 						zi.IngressBytes = ing.Bytes
-					} else if readErr == nil {
-						readErr = err
-					}
-					if eg, err := s.dp.ReadZoneCounters(id, 1); err == nil {
 						zi.EgressPackets = eg.Packets
 						zi.EgressBytes = eg.Bytes
-					} else if readErr == nil {
-						readErr = err
 					}
 				}
 			}

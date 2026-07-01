@@ -270,6 +270,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/cli/cli_show_security_dispatch.go` | #1444 — `handleShowSecurity` dispatcher and security helpers relocated from `cli.go`; still uses legacy `MaxRulesPerPolicy` and policy-counter accessors. |
 | `pkg/cli/cli_show_security_log.go` | #2158 — split from `cli_show_security.go`; still reads legacy screen `GlobalCtr*` counter constants. |
 | `pkg/cli/cli_show_security_screen.go` | #2158 — split from `cli_show_security.go`; still reads legacy screen `GlobalCtr*` counter constants. |
+| `pkg/cli/cli_show_security_zones.go` | #3643 — `show security zones` distinguishes `dataplane.ErrCounterNotPopulated` (per-zone traffic counters HIDE) from a genuine counter-read error; still names root `pkg/dataplane` counter types. |
 | `pkg/cli/proto.go` | #1444 — shared session/proto helpers (`sessionStateName`, `ntohs`, `protoNameFromNum`, etc.) relocated from `cli.go`; still names `dataplane.SessState*` enum and `ProtoICMPv6` sentinel. |
 | `pkg/cli/session_filter.go` | #1444 — `sessionFilter` type, matcher methods, and peer-RPC fetchers relocated from `cli.go`; still uses legacy session key/value types and `SessFlag*`. |
 | `pkg/cli/runtime.go` | #1517 — `cliRuntime` interface declares the narrow CLI dataplane surface; still depends on root `pkg/dataplane` type names (`SessionKey`, `CounterValue`, etc.) until those types move to a domain package. |
@@ -301,6 +302,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/grpcapi/server_show_security_text.go` | Security text output still uses legacy counters and filter types. |
 | `pkg/grpcapi/server_show_status.go` | Status output still reads legacy dataplane state. |
 | `pkg/grpcapi/server_show_zones.go` | Zone output still uses legacy dataplane types. |
+| `pkg/grpcapi/server_show_zones_text.go` | #3643 — zone text output distinguishes `dataplane.ErrCounterNotPopulated` (per-zone traffic counters HIDE) from a genuine counter-read error; still names root `pkg/dataplane` counter types. |
 | `pkg/natshow/natshow.go` | #1687 — shared NAT presenter `Reader` interface names root `pkg/dataplane` session/counter types (`SessionKey`, `CounterValue`, `PersistentNATTable`). Net-neutral consolidation: the import moved here from `server_show_nat.go` (which no longer imports root dataplane) and is still named by `cli_show_nat.go`. |
 | `pkg/natshow/source.go` | #1687 — shared source-NAT rule-detail renderer iterates legacy `SessionKey`/`Value` via the `Reader`. |
 | `pkg/natshow/dest.go` | #1687 — shared destination-NAT rule-detail renderer iterates legacy `SessionKey`/`Value` via the `Reader`. |

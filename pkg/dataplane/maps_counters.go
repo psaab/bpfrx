@@ -13,6 +13,16 @@ import (
 // (policy, filter, NAT, flood) live in their own domain files; ClearAllCounters
 // calls those domain clears via same-package method dispatch.
 
+// ErrCounterNotPopulated reports that a counter family is safely readable but
+// is not sourced by the userspace dataplane (#3643). It is DISTINCT from a
+// genuine read failure (a missing map or a degraded IPC bridge, which must
+// still bump the #3345 xpf_counter_read_errors_total signal) and DISTINCT from
+// a real zero. Read surfaces treat it as "not available" -- never a 500, never
+// a false read-error alert, never a bare misleading 0. Per-zone traffic and
+// flood counters currently report this because the eBPF writers were deleted
+// in #1476 and the userspace POPULATE path is deferred (#3643 plan §5A).
+var ErrCounterNotPopulated = errors.New("counter not populated in userspace dataplane")
+
 // ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.
 func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
 	zm, ok := m.maps["global_counters"]
@@ -90,24 +100,53 @@ func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, err
 	return total, nil
 }
 
-// ReadZoneCounters reads the per-CPU zone counter values and sums them.
-// direction: 0 = ingress, 1 = egress.
+// ReadZoneCounters returns the userspace-reported per-zone traffic counter for
+// zoneID in the given direction (0 = ingress, 1 = egress).
+//
+// #3643: zone ids are stable name-hashes in [1,65533] (#3075), but the legacy
+// zone_counters BPF array is a dense MaxZones*2-entry per-CPU array. Indexing it
+// by a stable-hash id >= MaxZones OOBs the bounded Lookup (ErrKeyNotExist),
+// which the read surfaces mis-reported as a hard failure (REST 500, false
+// Prometheus read-error alert, CLI/gRPC error rows). This now keys a Go-side
+// sparse offset map -- the exact treatment #2255 gave nat_rule_counters -- and
+// NEVER indexes the dense array, so an id >= MaxZones can no longer OOB. The
+// userspace helper does not yet populate per-zone traffic counters (POPULATE
+// deferred, #3643 plan §5A), so the map is empty and this reports
+// ErrCounterNotPopulated; surfaces render "not available" rather than a
+// misleading 0.
 func (m *Manager) ReadZoneCounters(zoneID uint16, direction int) (CounterValue, error) {
-	zm, ok := m.maps["zone_counters"]
+	if direction != 0 && direction != 1 {
+		return CounterValue{}, fmt.Errorf("invalid zone counter direction %d", direction)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	vals, ok := m.zoneCounterOffsets[zoneID]
 	if !ok {
-		return CounterValue{}, fmt.Errorf("zone_counters map not found")
+		return CounterValue{}, ErrCounterNotPopulated
 	}
-	idx := uint32(zoneID)*2 + uint32(direction)
-	var perCPU []CounterValue
-	if err := zm.Lookup(idx, &perCPU); err != nil {
-		return CounterValue{}, err
+	return vals[direction], nil
+}
+
+// SetZoneCounterOffset records the absolute cumulative per-zone ingress/egress
+// traffic counters reported by the userspace dataplane for zoneID (#3643
+// POPULATE hook, mirroring SetNATRuleCounterOffset). Values are absolute
+// (overwrite), matching the helper's cumulative-since-launch totals. Once set,
+// ReadZoneCounters returns them (nil error) instead of ErrCounterNotPopulated.
+func (m *Manager) SetZoneCounterOffset(zoneID uint16, ingress, egress CounterValue) {
+	m.mu.Lock()
+	if m.zoneCounterOffsets == nil {
+		m.zoneCounterOffsets = make(map[uint16][2]CounterValue)
 	}
-	var total CounterValue
-	for _, v := range perCPU {
-		total.Packets += v.Packets
-		total.Bytes += v.Bytes
-	}
-	return total, nil
+	m.zoneCounterOffsets[zoneID] = [2]CounterValue{ingress, egress}
+	m.mu.Unlock()
+}
+
+// ClearZoneCounterOffsets drops all userspace-reported per-zone traffic offsets
+// (#3643), mirroring ClearNATRuleCounterOffsets. Wired into ClearZoneCounters.
+func (m *Manager) ClearZoneCounterOffsets() {
+	m.mu.Lock()
+	m.zoneCounterOffsets = nil
+	m.mu.Unlock()
 }
 
 // ClearGlobalCounters zeroes all global counter entries.
@@ -156,9 +195,14 @@ func (m *Manager) ClearInterfaceCounters() error {
 
 // ClearZoneCounters zeroes all zone counter entries.
 func (m *Manager) ClearZoneCounters() error {
+	// #3643: drop the userspace-reported offsets first so an operator clear
+	// takes effect on the read path (the only source of per-zone values today)
+	// even when the legacy dense BPF map is absent, mirroring
+	// ClearNATRuleCounters.
+	m.ClearZoneCounterOffsets()
 	zm, ok := m.maps["zone_counters"]
 	if !ok {
-		return fmt.Errorf("zone_counters map not found")
+		return nil
 	}
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
@@ -179,6 +223,9 @@ func (m *Manager) ClearAllCounters() error {
 	if err := m.ClearZoneCounters(); err != nil {
 		return err
 	}
+	// #3643: drop the userspace-reported per-zone flood offsets too (no dense
+	// map to zero -- flood counters live only in the sparse offset map now).
+	m.ClearFloodCounterOffsets()
 	if err := m.ClearPolicyCounters(); err != nil {
 		return err
 	}

@@ -217,25 +217,27 @@ func TestCollectFilterCountersMergesUserspaceCountersWhenMapConfigUnavailable(t 
 }
 
 // zoneErrScrapeDP reuses the fully-wired descriptorCoverageDP but fails the
-// per-zone counter reads, so a full Collect() bumps counterReadErrors AFTER
-// collectGlobalCounters has already run.
-type zoneErrScrapeDP struct {
+// per-policy counter reads, so a full Collect() bumps counterReadErrors AFTER
+// collectGlobalCounters has already run. (#3643: this pin previously failed the
+// per-zone reads, but the per-zone Prometheus collector was removed with the
+// HIDE fix; policy reads are the next post-global counterReadErrors bumper.)
+type policyErrScrapeDP struct {
 	*descriptorCoverageDP
 }
 
-func (d *zoneErrScrapeDP) ReadZoneCounters(uint16, int) (dataplane.CounterValue, error) {
-	return dataplane.CounterValue{}, errors.New("zone bridge degraded")
+func (d *policyErrScrapeDP) ReadPolicyCounters(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, errors.New("policy bridge degraded")
 }
 
 // TestCollectEmitsCounterReadErrorsAfterSubcollectors is the #3462
-// RED-on-revert pin. Global/interface/policy/filter reads SUCCEED and the
-// pre-gate host-inbound read is neutralized, so the ONLY counterReadErrors
-// bumps in the scrape come from the per-zone reads — which run AFTER
-// collectGlobalCounters. A full Collect() must therefore emit a NON-ZERO
-// xpf_counter_read_errors_total in the SAME scrape.
+// RED-on-revert pin. Global/interface/filter reads SUCCEED and the pre-gate
+// host-inbound read is neutralized, so the ONLY counterReadErrors bumps in the
+// scrape come from the per-policy reads — which run AFTER collectGlobalCounters.
+// A full Collect() must therefore emit a NON-ZERO xpf_counter_read_errors_total
+// in the SAME scrape.
 //
 // FAIL-ON-REVERT: moving the emit back into collectGlobalCounters (before the
-// zone collector) makes the emitted sample read 0 — the zone failures land
+// policy collector) makes the emitted sample read 0 — the policy failures land
 // after the sample was produced — so the > 0 assertion goes RED.
 func TestCollectEmitsCounterReadErrorsAfterSubcollectors(t *testing.T) {
 	// Neutralize the pre-gate kernel host-inbound read so it cannot bump the
@@ -246,7 +248,7 @@ func TestCollectEmitsCounterReadErrorsAfterSubcollectors(t *testing.T) {
 
 	store := newDescriptorCoverageStore(t)
 	srv := &Server{store: store, gc: conntrack.NewGC(nil, time.Minute), startTime: time.Now()}
-	srv.dp = &zoneErrScrapeDP{&descriptorCoverageDP{
+	srv.dp = &policyErrScrapeDP{&descriptorCoverageDP{
 		Manager: dataplane.New(),
 		status:  dpuserspace.ProcessStatus{},
 		apply: &dataplane.ApplyResult{
@@ -285,7 +287,7 @@ func TestCollectEmitsCounterReadErrorsAfterSubcollectors(t *testing.T) {
 		t.Fatal("xpf_counter_read_errors_total was not emitted by Collect()")
 	}
 	if errTotal <= 0 {
-		t.Errorf("xpf_counter_read_errors_total = %v in the scrape whose zone reads "+
+		t.Errorf("xpf_counter_read_errors_total = %v in the scrape whose policy reads "+
 			"failed; want > 0 — the error sample must reflect a late (post-global) "+
 			"sub-collector failure in the SAME scrape (#3462)", errTotal)
 	}

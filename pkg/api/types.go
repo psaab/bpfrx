@@ -112,6 +112,15 @@ type ZoneInfo struct {
 	IngressBytes         uint64                     `json:"ingress_bytes"`
 	EgressPackets        uint64                     `json:"egress_packets"`
 	EgressBytes          uint64                     `json:"egress_bytes"`
+	// PerZoneCountersAvailable (#3643) is false when the per-zone traffic
+	// counters above are NOT sourced by the userspace dataplane. In that case
+	// the four counter fields are meaningless zeros rather than real traffic
+	// volume -- the eBPF per-zone writers were deleted in #1476 and the
+	// userspace POPULATE path is deferred (see docs/research/3643-dead-counters).
+	// It exists so an operator/automation can tell "no per-zone accounting" from
+	// "genuinely zero traffic"; without it the endpoint reported a misleading 0
+	// (or, for a stable-hash zone id >= MaxZones, 500'd the whole response).
+	PerZoneCountersAvailable bool `json:"per_zone_counters_available"`
 }
 
 // ZoneInterfaceHostInbound is a per-interface host-inbound-traffic override

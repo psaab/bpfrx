@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone string) error {
@@ -73,17 +75,28 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 		if c.dp != nil && c.dp.IsLoaded() && zoneID > 0 {
 			ingress, errIn := c.dp.ReadZoneCounters(zoneID, 0)
 			egress, errOut := c.dp.ReadZoneCounters(zoneID, 1)
-			if errIn == nil && errOut == nil {
+			switch {
+			case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
+				errors.Is(errOut, dataplane.ErrCounterNotPopulated):
+				// #3643 HIDE: per-zone traffic counters are not sourced by the
+				// userspace dataplane. Say so explicitly rather than printing a
+				// misleading 0 (or, before #3643, erroring on the stable-hash
+				// zone id OOB).
+				fmt.Println("  Traffic statistics: not available " +
+					"(per-zone accounting not implemented in the userspace dataplane)")
+			case errIn == nil && errOut == nil:
 				fmt.Println("  Traffic statistics:")
 				fmt.Printf("    Input:  %d packets, %d bytes\n",
 					ingress.Packets, ingress.Bytes)
 				fmt.Printf("    Output: %d packets, %d bytes\n",
 					egress.Packets, egress.Bytes)
-			} else if readErr == nil {
-				if errIn != nil {
-					readErr = errIn
-				} else {
-					readErr = errOut
+			default:
+				if readErr == nil {
+					if errIn != nil {
+						readErr = errIn
+					} else {
+						readErr = errOut
+					}
 				}
 			}
 		}

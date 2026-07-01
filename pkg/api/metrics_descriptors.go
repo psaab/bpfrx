@@ -142,16 +142,6 @@ func newCollector(srv *Server) *xpfCollector {
 				"security counters; #3464).",
 			nil, nil,
 		),
-		zonePacketsTotal: prometheus.NewDesc(
-			"xpf_zone_packets_total",
-			"Total packets per zone.",
-			[]string{"zone", "direction"}, nil,
-		),
-		zoneBytesTotal: prometheus.NewDesc(
-			"xpf_zone_bytes_total",
-			"Total bytes per zone.",
-			[]string{"zone", "direction"}, nil,
-		),
 		policyHitsTotal: prometheus.NewDesc(
 			"xpf_policy_hits_total",
 			"Total policy rule hits.",

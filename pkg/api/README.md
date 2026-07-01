@@ -214,7 +214,11 @@ under the daemon's errgroup. Nothing else imports this package.
   filter): a failed counter read is no longer swallowed to `0`, because a
   degraded counter bridge must not be indistinguishable from "no events"
   on a security appliance. The fix covers EVERY global, per-zone,
-  per-policy, screen-flood, and filter read surface:
+  per-policy, screen-flood, and filter read surface (NOTE: per-zone traffic +
+  per-zone flood counters were later HIDE'd as "not available" by #3643 — a
+  structural not-populated state is no longer treated as a read error; the
+  genuine-error handling below still applies to the other surfaces — see the
+  #3643 bullet):
   - **Structured APIs** return an explicit failure instead of clean-zero
     counter fields. REST `/stats/global` (global), `/security/zones`
     (per-zone), and `/security/policies` (per-policy) return HTTP 500 on
@@ -270,6 +274,38 @@ under the daemon's errgroup. Nothing else imports this package.
   `pkg/cli/show_security_counter_error_test.go` (incl. late-read ordering
   cases that fail if a warn is moved before the per-type screen-breakdown
   loop). This resolves both #3345 and #3408.
+- **#3643 — per-zone traffic + flood counters are HIDE'd ("not available"),
+  not errored.** The per-zone traffic counters (`zone_counters`) and per-zone
+  flood counters (`flood_counters`) were never populated in the userspace era
+  (the eBPF writers were deleted in #1476) AND, worse, zone ids are stable
+  name-hashes in `[1,65533]` (#3075) while the backing BPF arrays are dense
+  `MaxZones*2` / `MaxZones`-entry arrays, so every read of a stable-hash id `>=
+  MaxZones` OOB'd the bounded `Lookup` and surfaced as a HARD failure — REST
+  `/security/zones` returned **HTTP 500** for essentially every real config, and
+  the Prometheus per-zone collector bumped `xpf_counter_read_errors_total` once
+  per zone per scrape (a permanent FALSE #3345 alert). The HIDE fix:
+  `dataplane.ReadZoneCounters`/`ReadFloodCounters` now key a Go-side sparse
+  offset map and NEVER index the dense array (the #2255 `nat_rule_counters`
+  treatment), returning the distinct `dataplane.ErrCounterNotPopulated`
+  sentinel while unpopulated. The read surfaces recognize that sentinel and
+  render an explicit **"not available"** — REST `/security/zones` returns 200
+  with `per_zone_counters_available:false` (counts unset, not a misleading 0);
+  `show security zones` and `show security screen ids-option statistics` print a
+  "not available" line; and the always-erroring `xpf_zone_packets_total` /
+  `xpf_zone_bytes_total` Prometheus metrics were **dropped** (there is no
+  per-zone flood Prometheus/REST surface to remove). The #3345/#3408
+  genuine-error contract is UNCHANGED for every other surface (global, policy,
+  filter, interface, host-inbound): a real read failure — anything other than
+  `ErrCounterNotPopulated` — still 500s / warns / bumps
+  `xpf_counter_read_errors_total`. The per-zone POPULATE path (sourcing real
+  per-zone volume + flood-event counts from the Rust helper) is DEFERRED; the
+  sparse offset map's setters are the populate hook. See
+  `docs/research/3643-dead-counters/plan.md` (§5A POPULATE spec, §5B HIDE) and
+  the follow-up enhancement issue. Pinned by
+  `pkg/dataplane/zone_flood_counters_hide_test.go`,
+  `pkg/api/zone_counters_hide_test.go`,
+  `pkg/cli/zone_flood_counters_hide_test.go`, and
+  `pkg/grpcapi/zone_flood_counters_hide_test.go`.
 - Per-interface counter read failures get a uniform unavailable/error
   contract across all four interface-counter surfaces (#3464). Interface
   counters are intentionally out of the #3345 SECURITY-counter contract
