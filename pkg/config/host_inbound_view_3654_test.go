@@ -105,6 +105,74 @@ func TestHostInboundViewRender3654(t *testing.T) {
 	}
 }
 
+// TestHostInboundViewRenderZonePostureWithOverride3671 pins the #3671 residual
+// fix (H08 / folds the L03 test gap): a zone with EMPTY zone-level host-inbound
+// lists but a per-interface override must STILL render the zone-level
+// default-deny posture line, because that posture governs every non-overridden
+// interface in the zone. The override block is additional context printed below
+// it, not a replacement for it.
+//
+// RED-on-revert: restoring the old `&& len(v.Interfaces) == 0` clause on the
+// posture guard suppresses the "Host-inbound: default deny (...)" line whenever
+// any interface override exists, failing the posture assertion here.
+func TestHostInboundViewRenderZonePostureWithOverride3671(t *testing.T) {
+	labels := HostInboundLabels{Indent: "  ", Sep: ", ", ServicesLabel: "Host-inbound system-services", ProtocolsLabel: "Host-inbound protocols"}
+
+	// A zone with no zone-level stanza at all, but an override on ONE interface.
+	// The zone default-deny posture (reason "no stanza") governs the other,
+	// non-overridden interfaces and must remain visible.
+	z := &ZoneConfig{
+		InterfaceHostInbound: map[string]*HostInboundTraffic{
+			"ge-0/0/9.0": {SystemServices: []string{"https"}},
+		},
+	}
+	lines := z.HostInboundView().Render(labels)
+	out := strings.Join(lines, "\n")
+	for _, want := range []string{
+		// zone-level default-deny posture line — MUST survive the override
+		"Host-inbound: default deny (no stanza)",
+		// override block still rendered below the posture line
+		"Host-inbound interface overrides:",
+		"ge-0/0/9.0:",
+		"override system-services: https",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no-stanza zone + override render missing %q\n%s", want, out)
+		}
+	}
+	// Ordering: the zone posture line precedes the override block (posture is the
+	// baseline, overrides are additional context).
+	postureIdx, overrideIdx := -1, -1
+	for i, ln := range lines {
+		if strings.Contains(ln, "Host-inbound: default deny") {
+			postureIdx = i
+		}
+		if strings.Contains(ln, "Host-inbound interface overrides:") {
+			overrideIdx = i
+		}
+	}
+	if postureIdx < 0 || overrideIdx < 0 || postureIdx > overrideIdx {
+		t.Errorf("expected zone posture line before override block; posture=%d override=%d\n%s",
+			postureIdx, overrideIdx, out)
+	}
+
+	// An EXPLICIT-EMPTY zone stanza with an override: posture reason distinguishes
+	// it as "empty stanza" and still renders alongside the override block.
+	z = &ZoneConfig{
+		HostInboundTraffic: &HostInboundTraffic{},
+		InterfaceHostInbound: map[string]*HostInboundTraffic{
+			"ge-0/0/9.0": {SystemServices: []string{"https"}},
+		},
+	}
+	out = strings.Join(z.HostInboundView().Render(labels), "\n")
+	if !strings.Contains(out, "Host-inbound: default deny (empty stanza)") {
+		t.Errorf("empty-stanza zone + override render missing posture line\n%s", out)
+	}
+	if !strings.Contains(out, "Host-inbound interface overrides:") {
+		t.Errorf("empty-stanza zone + override render missing override block\n%s", out)
+	}
+}
+
 func TestRenderInterfaceHostInbound3654(t *testing.T) {
 	labels := HostInboundLabels{Indent: "  ", Sep: ", ", ServicesLabel: "Host-inbound services", ProtocolsLabel: "Host-inbound protocols"}
 	z := &ZoneConfig{
