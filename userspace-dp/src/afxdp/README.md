@@ -103,7 +103,16 @@ sync.
         pre-date #3034 (#2238) and were out of its scope; the physical
         index is still used for the reflected-reply build and the XSK
         transmit (`egress_ifindex`).
-    Untagged ports resolve physical == logical, so all six sites are
+      - **#3609 — per-interface host-inbound override:** the local-delivery
+        host-inbound gate (`poll_descriptor/filter.rs::host_inbound_gated_lo0_action`
+        → `forwarding::host_inbound_admits_iface`) looks up
+        `ifindex_host_inbound` — keyed by the LOGICAL unit ifindex in
+        `forwarding_build/interfaces.rs` — with the resolved logical ingress
+        ifindex threaded in by each caller (session HIT / MISS / flowless).
+        Before #3609 it passed the raw physical `meta.ingress_ifindex`, so a
+        host-bound packet on a VLAN sub-interface missed its per-interface
+        override and silently fell back to the zone set.
+    Untagged ports resolve physical == logical, so all seven sites are
     no-ops there (non-VLAN behavior preserved).
   - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
     NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`

@@ -434,6 +434,7 @@ pub(super) fn apply_lo0_filter_action(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn host_inbound_gated_lo0_action(
     forwarding: &ForwardingState,
+    logical_ingress_ifindex: i32,
     host_inbound_zone: u16,
     dst_port: u16,
     is_v6: bool,
@@ -448,10 +449,17 @@ pub(super) fn host_inbound_gated_lo0_action(
     // Host-inbound gate FIRST — a denied packet is a fail-closed silent drop
     // with NO lo0 side-effects (#3485). #3362: keyed by ingress interface so a
     // per-interface host-inbound override governs the check where one exists,
-    // falling back to the from-zone set otherwise.
+    // falling back to the from-zone set otherwise. #3609: the override map
+    // (`ifindex_host_inbound`) is keyed by the LOGICAL unit ifindex
+    // (`forwarding_build/interfaces.rs`), so the caller passes the resolved
+    // logical ingress ifindex — NOT the raw physical `meta.ingress_ifindex` —
+    // exactly as the sibling input-filter / zone-pair / CoS sites do
+    // (`resolve_ingress_logical_ifindex`). Passing the physical bind port would
+    // miss a VLAN sub-interface's override and silently fall back to the zone
+    // set (the #3609 bug).
     if !crate::afxdp::forwarding::host_inbound_admits_iface(
         forwarding,
-        meta.ingress_ifindex as i32,
+        logical_ingress_ifindex,
         host_inbound_zone,
         meta.protocol,
         dst_port,
@@ -580,6 +588,7 @@ mod lo0_gate_tests {
 
         let action = host_inbound_gated_lo0_action(
             &fw,
+            meta.ingress_ifindex as i32,
             DENY_ZONE,
             443,
             false,
@@ -608,6 +617,7 @@ mod lo0_gate_tests {
 
         let action = host_inbound_gated_lo0_action(
             &fw,
+            meta.ingress_ifindex as i32,
             ADMIT_ZONE,
             443,
             false,
@@ -628,6 +638,71 @@ mod lo0_gate_tests {
             lo0_term_packets(&fw),
             1,
             "lo0 filter must run + count on an admitted packet",
+        );
+    }
+
+    /// #3609 (M10): a host-bound packet on a VLAN LOGICAL sub-interface must get
+    /// its per-interface host-inbound override. The override map
+    /// (`ifindex_host_inbound`) is keyed by the LOGICAL unit ifindex
+    /// (`forwarding_build::interfaces`), NOT the raw physical bind port carried
+    /// in `meta.ingress_ifindex`. `host_inbound_gated_lo0_action` therefore takes
+    /// the caller-resolved logical ingress ifindex (as the sibling input-filter /
+    /// zone-pair / CoS sites already do) and must honour it.
+    ///
+    /// Setup: the LOGICAL unit carries a present-but-empty override (deny-all,
+    /// the #3362 fail-closed shape); the physical bind port has NO override; the
+    /// from-zone is admit-all (absent from `zone_host_inbound`). A TCP/443
+    /// host-bound packet arrives on the physical port (`meta.ingress_ifindex =
+    /// PHYS`) with the resolved LOGICAL ifindex threaded in. The logical override
+    /// governs → DENY (`None`), and the lo0 filter never runs.
+    ///
+    /// Fail-on-revert: pass the raw physical `meta.ingress_ifindex` instead of
+    /// the resolved logical ifindex (the pre-#3609 bug at filter.rs:452-454) and
+    /// the lookup misses the override, falls back to the admit-all zone, the lo0
+    /// reject term runs, and this returns `Some(Reject)` with the counter bumped
+    /// to 1 — RED on BOTH assertions.
+    #[test]
+    fn host_inbound_override_keyed_by_logical_vlan_ifindex() {
+        const PHYS_IFINDEX: u32 = 11;
+        const LOGICAL_IFINDEX: i32 = 3011;
+
+        let mut fw = forwarding_with_lo0_reject();
+        // The LOGICAL VLAN unit's per-interface override admits nothing
+        // (present-but-empty => deny-all). Keyed by the logical unit ifindex,
+        // exactly as `forwarding_build::interfaces` populates it.
+        fw.ifindex_host_inbound
+            .insert(LOGICAL_IFINDEX, crate::afxdp::types::ZoneHostInbound::default());
+
+        let (flow, mut meta) = tcp_443_flow_and_meta();
+        // The frame arrives on the PHYSICAL bind port; the physical ifindex has
+        // NO override, so a raw-physical lookup would fall back to the zone.
+        meta.ingress_ifindex = PHYS_IFINDEX;
+
+        // ADMIT_ZONE is absent from zone_host_inbound (admit-all) — the zone
+        // fallback WOULD admit, so only the logical override can deny here.
+        let action = host_inbound_gated_lo0_action(
+            &fw,
+            LOGICAL_IFINDEX,
+            ADMIT_ZONE,
+            443,
+            false,
+            0,
+            extra(),
+            None,
+            &flow,
+            meta,
+            Some(ADMIT_ZONE),
+            1_000,
+        );
+        assert_eq!(
+            action, None,
+            "VLAN logical-interface host-inbound override (deny-all) must govern \
+             and deny TCP/443 — #3609",
+        );
+        assert_eq!(
+            lo0_term_packets(&fw),
+            0,
+            "lo0 filter must NOT run when the logical override denies (#3609)",
         );
     }
 }
