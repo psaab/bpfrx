@@ -130,6 +130,47 @@ resolved application (an application-set still expands to its members). Coverage
 `compiler_nat_match_multivalue_3431_test.go` (both AST shapes, all axes) and
 `nat_match_multivalue_3431_test.go` (snapshot expansion).
 
+**Security host-inbound and session-log surfaces are multi-value (#3703).** The
+same #2419 collapse class recurred on four security leaves that #2419 never
+converted, all modeled as CONTAINERS (or nil-children non-multi leaves) instead
+of `multi: true` value-tail leaves — so a bracket / single-line list mis-nested
+the tail under the first token and the compiler readers dropped everything after
+it, silently and with the dropped tokens (including typos) bypassing strict
+validation:
+
+- **host-inbound `system-services` / `protocols`** (zone level AND the #3362
+  per-interface override) — `hostInboundSchemaChildren` (`schema_security.go`)
+  makes both `args: 1, multi: true, children: nil` (untyped: the token allowlist
+  is the shared `host_inbound_tokens.go` SSOT). `parseHostInboundNode`
+  (`compiler_security.go`) reads every value via `firewallMatchValues`, so the
+  compiled `HostInboundTraffic.SystemServices/Protocols` slices carry the whole
+  list and `validateHostInboundTokensStrict` (already on the compiled slice)
+  rejects an unknown token at commit. A dropped host-inbound service silently
+  NARROWS admission (`system-services [ ssh netconf ]` → only `ssh`), which can
+  strand SSH / routing.
+- **per-policy `then log`, `default-policy-log`, and `pre-id-default-policy then
+  log`** — the shared `sessionLogModeLeaf` factory (`schema_security.go`) makes
+  each a `multi: true, children: nil` typed ENUM leaf
+  (`valueType: ValueEnumOf`, `validator: ValidateEnum([session-init,
+  session-close])`). Because it is a typed multi leaf, `SchemaValidate`
+  dispatches to `validateMultiValueLeaf`, which validates EVERY token (Keys[1:]
+  plus block-list children) — so an unknown log mode is REJECTED at commit
+  (strict) / warned on the tolerant load path (#1960 no-brick), closing the gap
+  that `validatePolicyLogActionStrict` (both-false only) and the
+  default-policy-log / pre-id WARN-only validators left open. The compiler
+  readers (`compilePolicy` `then log` arm, the `default-policy-log` arm, and the
+  `pre-id-default-policy` reader in `compiler_security.go`) accumulate every mode
+  via `firewallMatchValues` across ALL sibling `log` leaves and only CREATE the
+  target struct once (never reset), so both the bracket form
+  (`then log [ session-init session-close ]`) and the repeated-line form
+  (`then log session-init` + `then log session-close`, two sibling leaves) land
+  both flags. Dropping the container children does not lose `?` completion — the
+  two modes surface via `valueExamples`. A dropped `session-close` loses
+  session-duration / close audit records despite valid syntax. Coverage:
+  `compiler_security_bracket_list_3703_test.go` (all four surfaces, both harm
+  directions — tail-drop and typo-bypass — across bracket / repeated-line /
+  hierarchical shapes, plus the value-slot completion pin).
+
 ## Trailing-token arity on scalar value leaves (#3332)
 
 The mirror image of the multi-value contract is the **scalar** value leaf: a
