@@ -235,6 +235,21 @@ func (gc *GC) sweep() time.Duration {
 		return gc.interval
 	}
 
+	// Snapshot the aggressive-aging / session-limit configuration under the
+	// same lock the setters use (SetAgingConfig / SetSessionLimitEnabled).
+	// These fields are written by the config-commit path on the daemon
+	// goroutine; reading them lock-free from the sweep goroutine was a data
+	// race (#3604). agingActive is also runtime state that the watermark
+	// hysteresis below updates — the sweep operates on the local snapshot and
+	// writes any change back under gc.mu (see the hysteresis block).
+	gc.mu.RLock()
+	agingActive := gc.agingActive
+	earlyAgeout := gc.earlyAgeout
+	highWatermark := gc.highWatermark
+	lowWatermark := gc.lowWatermark
+	sessionLimitEnabled := gc.sessionLimitEnabled
+	gc.mu.RUnlock()
+
 	// Fast path: if no sessions existed on last sweep AND no new sessions
 	// have been created since, skip the entire iteration.  This eliminates
 	// ~25% CPU from empty-table batch lookups on idle firewalls.
@@ -244,7 +259,7 @@ func (gc *GC) sweep() time.Duration {
 		if err1 == nil && err2 == nil &&
 			newCtr == gc.lastSessionCounter &&
 			closedCtr == gc.lastClosedCounter {
-			return gc.nextSweepDelay(0, false, false, 0)
+			return gc.nextSweepDelay(0, false, false, 0, agingActive, earlyAgeout)
 		}
 		// Counters changed — fall through to full sweep.
 		gc.lastSessionCounter = newCtr
@@ -263,7 +278,7 @@ func (gc *GC) sweep() time.Duration {
 	toDelete := gc.toDeleteV4[:0]
 
 	// Per-IP session count accumulators (only used when session limiting is enabled)
-	countSessions := gc.sessionLimitEnabled && gc.sessionCount != nil
+	countSessions := sessionLimitEnabled && gc.sessionCount != nil
 	var srcCounts, dstCounts map[dataplane.SessionCountKey]uint32
 	if countSessions {
 		srcCounts = make(map[dataplane.SessionCountKey]uint32, 1024)
@@ -286,8 +301,8 @@ func (gc *GC) sweep() time.Duration {
 		// Skip on secondary — primary owns session lifetime.
 		if isPrimary {
 			effectiveTimeout := uint64(val.Timeout)
-			if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
-				effectiveTimeout = gc.earlyAgeout
+			if agingActive && earlyAgeout > 0 && earlyAgeout < effectiveTimeout {
+				effectiveTimeout = earlyAgeout
 			}
 			deadline := val.LastSeen + effectiveTimeout
 			if deadline < now {
@@ -360,8 +375,8 @@ func (gc *GC) sweep() time.Duration {
 			// Skip expiry on secondary — primary owns session lifetime.
 			if isPrimary {
 				effectiveTimeout := uint64(val.Timeout)
-				if gc.agingActive && gc.earlyAgeout > 0 && gc.earlyAgeout < effectiveTimeout {
-					effectiveTimeout = gc.earlyAgeout
+				if agingActive && earlyAgeout > 0 && earlyAgeout < effectiveTimeout {
+					effectiveTimeout = earlyAgeout
 				}
 				deadline := val.LastSeen + effectiveTimeout
 				if deadline < now {
@@ -452,21 +467,30 @@ func (gc *GC) sweep() time.Duration {
 
 	// Aggressive aging watermark hysteresis.
 	// total counts both forward+reverse entries; MaxSessions is the map size
-	// which holds both. Compare directly against MaxSessions.
-	if gc.highWatermark > 0 && gc.earlyAgeout > 0 {
+	// which holds both. Compare directly against MaxSessions. Operate on the
+	// local snapshot and publish any transition back under gc.mu (#3604) so
+	// the config-commit path (SetAgingConfig) and the sweep goroutine never
+	// touch agingActive without holding the lock.
+	prevAging := agingActive
+	if highWatermark > 0 && earlyAgeout > 0 {
 		pct := total * 100 / MaxSessions
-		if !gc.agingActive && pct >= gc.highWatermark {
-			gc.agingActive = true
+		if !agingActive && pct >= highWatermark {
+			agingActive = true
 			slog.Info("aggressive session aging activated",
-				"utilization_pct", pct, "high_watermark", gc.highWatermark)
-		} else if gc.agingActive && pct < gc.lowWatermark {
-			gc.agingActive = false
+				"utilization_pct", pct, "high_watermark", highWatermark)
+		} else if agingActive && pct < lowWatermark {
+			agingActive = false
 			slog.Info("aggressive session aging deactivated",
-				"utilization_pct", pct, "low_watermark", gc.lowWatermark)
+				"utilization_pct", pct, "low_watermark", lowWatermark)
 		}
 	}
+	if agingActive != prevAging {
+		gc.mu.Lock()
+		gc.agingActive = agingActive
+		gc.mu.Unlock()
+	}
 
-	nextDelay := gc.nextSweepDelay(earliestDeadline, countSessions, isPrimary, total)
+	nextDelay := gc.nextSweepDelay(earliestDeadline, countSessions, isPrimary, total, agingActive, earlyAgeout)
 
 	gc.mu.Lock()
 	gc.stats = GCStats{
@@ -482,18 +506,18 @@ func (gc *GC) sweep() time.Duration {
 	return nextDelay
 }
 
-func (gc *GC) nextSweepDelay(earliestDeadline uint64, countSessions, isPrimary bool, total int) time.Duration {
-	return gc.nextSweepDelayAt(monotonicSeconds(), earliestDeadline, countSessions, isPrimary, total)
+func (gc *GC) nextSweepDelay(earliestDeadline uint64, countSessions, isPrimary bool, total int, agingActive bool, earlyAgeout uint64) time.Duration {
+	return gc.nextSweepDelayAt(monotonicSeconds(), earliestDeadline, countSessions, isPrimary, total, agingActive, earlyAgeout)
 }
 
-func (gc *GC) nextSweepDelayAt(now, earliestDeadline uint64, countSessions, isPrimary bool, total int) time.Duration {
+func (gc *GC) nextSweepDelayAt(now, earliestDeadline uint64, countSessions, isPrimary bool, total int, agingActive bool, earlyAgeout uint64) time.Duration {
 	if gc.interval <= 0 {
 		return 0
 	}
 	if countSessions {
 		return gc.interval
 	}
-	if gc.agingActive && gc.earlyAgeout > 0 {
+	if agingActive && earlyAgeout > 0 {
 		return gc.interval
 	}
 	if !isPrimary {
