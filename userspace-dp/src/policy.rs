@@ -35,7 +35,7 @@ pub(crate) enum SnapshotIntegrityError {
     /// non-literal (Junos dns-name / wildcard-address / range-address). This is
     /// the ADDRESS analog of `UnrepresentableApplicationProtocol`: without the
     /// reject, the raw address strings reach the matcher, which SILENTLY drops
-    /// an unparseable literal (`parse_literal_cidr_into`) or empties a
+    /// an unparseable literal (the non-reporting matcher parser) or empties a
     /// non-literal book, collapsing the side to `MatchNone`. A
     /// `deny <unrepresentable-address>` rule would then match nothing and fall
     /// through to a later permit / default-permit — a deny fail-OPEN. Rejecting
@@ -50,14 +50,51 @@ pub(crate) enum SnapshotIntegrityError {
     /// the common "empty -> MatchAny" legacy path (no family-scoped wildcard
     /// present) the side then collapsed to an UNCONSTRAINED MatchAny — broadening a
     /// `deny` rule to match every source/destination (fail-OPEN). The v3-shaped
-    /// literal path already fails closed via the `__unsupported_address__` sentinel
-    /// (`UnrepresentableAddress`, #3261); this is the analogous backstop for the
-    /// legacy field, which carries raw literals with no sentinel. A normal Go
-    /// snapshot only ever emits parseable literals / `any` / family wildcards, so
-    /// this guards against a corrupt / hand-built / version-drifted snapshot.
-    /// Rejecting the WHOLE snapshot (the preflight keeps the previous good state)
-    /// is action-agnostic.
+    /// literal path is fixed by the sibling `UnrepresentableV3Address` reject
+    /// (#3711); this is the analogous backstop for the legacy field, which
+    /// carries raw literals with no sentinel. A normal Go snapshot only ever
+    /// emits parseable literals / `any` / family wildcards, so this guards
+    /// against a corrupt / hand-built / version-drifted snapshot. Rejecting the
+    /// WHOLE snapshot (the preflight keeps the previous good state) is
+    /// action-agnostic.
     UnrepresentableLegacyAddress { rule_id: String, address: String },
+    /// #3711: a policy rule's V3-shaped (`source_literals` /
+    /// `destination_literals`) address field carried a token that is non-empty,
+    /// not `any` / `any4` / `any6` / `any-ipv4` / `any-ipv6`, not the
+    /// `__unsupported_address__` sentinel, and does NOT parse as an IP/CIDR
+    /// literal. The pre-fix `parse_v3_literal_set` used a non-reporting
+    /// family-agnostic parser, whose `Err(_)` arm silently DROPPED such a
+    /// token. Because a v3-shaped side uses the `from_v3_literals` factory
+    /// (empty -> MatchNone, NOT MatchAny), an all-dropped side collapsed to
+    /// MatchNone: a `deny <malformed-literal>` rule then matched nothing and
+    /// fell through to a later permit / default-permit — a deny fail-OPEN. This
+    /// is the v3 sibling of `UnrepresentableLegacyAddress` (#3367): the sentinel
+    /// preflight (`UnrepresentableAddress`, #3261) only catches the exact
+    /// `__unsupported_address__` token the Go gate emits, NOT an arbitrary
+    /// malformed literal on a corrupt / hand-built / mixed-version HA peer-sync
+    /// snapshot. Rejecting the WHOLE snapshot (the preflight keeps the previous
+    /// good state) is action-agnostic.
+    UnrepresentableV3Address { rule_id: String, address: String },
+    /// #3711 (M02): an address-book row carried a token in its `prefixes_v4` /
+    /// `prefixes_v6` array that is not a parseable IP/CIDR literal OF THE
+    /// DECLARED FAMILY. The pre-fix book builder parsed BOTH family arrays with
+    /// one family-agnostic non-reporting parser, so (a) a malformed token
+    /// was silently dropped (an all-dropped family collapsed to MatchNone —
+    /// same deny fall-through fail-OPEN as the rule-literal path), and (b) a
+    /// wrong-family token (an IPv6 CIDR placed in `prefixes_v4` by a corrupt /
+    /// mixed-version producer) was accepted into the opposite family's set,
+    /// contradicting the wire contract. The reporting builder now rejects the
+    /// whole snapshot naming the book id/name, the offending token, and the
+    /// declared family. The Go side only ever emits family-separated parseable
+    /// CIDRs, so this guards against a corrupt / hand-built / version-drifted
+    /// snapshot. `family` is the STATIC declared array (`"v4"` / `"v6"`), not
+    /// the token's actual family.
+    UnrepresentableAddressBookPrefix {
+        book_id: u32,
+        book_name: String,
+        family: &'static str,
+        address: String,
+    },
     /// #2212: a NAT64 rule snapshot carried an unparseable field — a prefix
     /// that is empty / malformed / not /96, or a pool address that is neither a
     /// bare IPv4 nor a `/32` host. (A pool that is genuinely UNCONFIGURED — no
@@ -412,6 +449,21 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "rule {:?} has an unparseable legacy address literal {:?} (not an IP/CIDR, `any`, or family wildcard) — refusing to fail open by dropping it (which on the empty->match-any legacy path widens a deny to match everything)",
                 rule_id, address
+            ),
+            Self::UnrepresentableV3Address { rule_id, address } => write!(
+                f,
+                "rule {:?} has an unparseable v3 address literal {:?} (not an IP/CIDR, `any`, or family wildcard, and not the unrepresentable-address sentinel) — refusing to fail open by dropping it (which collapses the side to match-none and lets a deny fall through to a later permit / default-permit)",
+                rule_id, address
+            ),
+            Self::UnrepresentableAddressBookPrefix {
+                book_id,
+                book_name,
+                family,
+                address,
+            } => write!(
+                f,
+                "address book id={} ({:?}) has prefixes_{} entry {:?} that is not a parseable {} IP/CIDR literal (malformed, or a wrong-family token in the {} array) — refusing to fail open by dropping it (which collapses a book-backed deny to match-none) or by silently routing it to the other family",
+                book_id, book_name, family, address, family, family
             ),
             Self::Nat64UnparseableRule { rule_name, field } => write!(
                 f,
@@ -2076,13 +2128,39 @@ pub(crate) fn parse_policy_state_with_counters(
         // Parse v4 / v6 literals using the v3 factory: empty
         // collapses to MatchNone (NOT MatchAny). A v4-only book
         // gets entry.v6 = MatchNone, etc.
+        //
+        // #3711: fail the whole snapshot CLOSED on a malformed OR wrong-family
+        // book prefix. The pre-fix builder used the family-agnostic
+        // non-reporting parser, which (a) silently dropped an unparseable token
+        // — an all-dropped family then collapsed to MatchNone via
+        // `from_v3_literals`, so a book-backed `deny` matched nothing and fell
+        // through to a later permit / default-permit (fail-OPEN, the v3 sibling
+        // of #3367), and (b) routed a wrong-family token into the opposite
+        // family's set (M02, contradicting the family-named wire contract).
+        // `parse_book_prefix_into` enforces the declared family and reports
+        // both failures. Checked in the book loop (before the rule loop) so the
+        // whole preflight stays non-mutating and keeps the previous good state.
         let mut v4: Vec<PrefixV4> = Vec::with_capacity(snap.prefixes_v4.len());
         let mut v6: Vec<PrefixV6> = Vec::with_capacity(snap.prefixes_v6.len());
         for s in &snap.prefixes_v4 {
-            parse_literal_cidr_into(s, &mut v4, &mut v6);
+            if !parse_book_prefix_into(s, true, &mut v4, &mut v6) {
+                return Err(SnapshotIntegrityError::UnrepresentableAddressBookPrefix {
+                    book_id: snap.id,
+                    book_name: snap.name.clone(),
+                    family: "v4",
+                    address: s.clone(),
+                });
+            }
         }
         for s in &snap.prefixes_v6 {
-            parse_literal_cidr_into(s, &mut v4, &mut v6);
+            if !parse_book_prefix_into(s, false, &mut v4, &mut v6) {
+                return Err(SnapshotIntegrityError::UnrepresentableAddressBookPrefix {
+                    book_id: snap.id,
+                    book_name: snap.name.clone(),
+                    family: "v6",
+                    address: s.clone(),
+                });
+            }
         }
         let entry = BookEntry {
             v4: PrefixSetV4::from_v3_literals(v4),
@@ -2100,13 +2178,20 @@ pub(crate) fn parse_policy_state_with_counters(
             || !snap.destination_literals.is_empty();
 
         // Build literal prefix sets per side using the appropriate
-        // factory. #3367: the legacy path also reports a malformed literal
-        // (an unparseable token on the `source_addresses`/`destination_addresses`
-        // field) so the rule can be failed closed below instead of silently
-        // collapsing to MatchAny.
+        // factory. #3367 (legacy path) / #3711 (v3 path): BOTH shapes report a
+        // malformed literal (an unparseable token that is not `any` / a family
+        // wildcard / the sentinel) so the rule can be failed closed below
+        // instead of silently collapsing the side — MatchAny on the empty
+        // legacy path (widening a deny), or MatchNone on the v3 path (letting a
+        // deny fall through to default-permit).
         let mut legacy_malformed: Option<String> = None;
+        let mut v3_malformed: Option<String> = None;
         let (source_literal_v4, source_literal_v6) = if source_is_v3_shaped {
-            parse_v3_literal_set(&snap.source_literals)
+            let (v4, v6, malformed) = parse_v3_literal_set(&snap.source_literals);
+            if v3_malformed.is_none() {
+                v3_malformed = malformed;
+            }
+            (v4, v6)
         } else {
             let (v4, v6, malformed) = parse_legacy_address_set(&snap.source_addresses);
             if legacy_malformed.is_none() {
@@ -2115,7 +2200,11 @@ pub(crate) fn parse_policy_state_with_counters(
             (v4, v6)
         };
         let (destination_literal_v4, destination_literal_v6) = if destination_is_v3_shaped {
-            parse_v3_literal_set(&snap.destination_literals)
+            let (v4, v6, malformed) = parse_v3_literal_set(&snap.destination_literals);
+            if v3_malformed.is_none() {
+                v3_malformed = malformed;
+            }
+            (v4, v6)
         } else {
             let (v4, v6, malformed) = parse_legacy_address_set(&snap.destination_addresses);
             if legacy_malformed.is_none() {
@@ -2135,13 +2224,24 @@ pub(crate) fn parse_policy_state_with_counters(
         // permit / default-permit (deny fail-open). Checked BEFORE any literal
         // parsing / book resolution so the preflight stays non-mutating.
         //
-        // #3367: checked BEFORE the legacy-malformed reject below — the sentinel
-        // is the more specific cause (an undefined book / non-literal value the
-        // Go gate already flagged), and it parses as malformed too, so the
-        // sentinel diagnostic would otherwise be masked by the generic
-        // unparseable-literal error.
+        // #3367/#3711: checked BEFORE the malformed-literal rejects below — the
+        // sentinel is the more specific cause (an undefined book / non-literal
+        // value the Go gate already flagged), and it parses as malformed too on
+        // the v3 path, so the sentinel diagnostic would otherwise be masked by
+        // the generic unparseable-literal error.
         if rule_has_unrepresentable_address_sentinel(snap) {
             return Err(SnapshotIntegrityError::UnrepresentableAddress { rule_id });
+        }
+
+        // #3711: a malformed v3 address literal (an unparseable token on the
+        // `source_literals`/`destination_literals` field that is not `any` / a
+        // family wildcard / the sentinel) is a snapshot-integrity error. Without
+        // this the side would silently drop the token and collapse to MatchNone
+        // (the v3 factory), so a `deny <malformed>` rule would match nothing and
+        // fall through to a later permit / default-permit (deny fail-OPEN).
+        // Checked BEFORE book resolution so the preflight stays non-mutating.
+        if let Some(address) = v3_malformed {
+            return Err(SnapshotIntegrityError::UnrepresentableV3Address { rule_id, address });
         }
 
         // #3367: a malformed legacy address literal (an unparseable token on the
@@ -2477,11 +2577,25 @@ fn parse_legacy_address_set(addresses: &[String]) -> (PrefixSetV4, PrefixSetV6, 
 /// field. "any" token forces MatchAny on BOTH families (Codex r5
 /// F-r5-1 fix); empty input or no-any → MatchNone (via
 /// `from_v3_literals`).
-fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6) {
+///
+/// #3711: the returned `Option<String>` carries the FIRST token that was
+/// non-empty, non-`any`/`any4`/`any6`/`any-ipv4`/`any-ipv6`, and unparseable
+/// as an IP/CIDR. The pre-fix code called a non-reporting family-agnostic
+/// parser, which silently DROPPED such a token; because the v3 side uses
+/// `from_v3_literals` (empty -> MatchNone), an all-dropped side collapsed to
+/// MatchNone and a `deny <malformed>` rule fell through to a later permit /
+/// default-permit (fail-OPEN). The caller fails the whole snapshot closed when
+/// this is `Some`. Mirrors the #3367 legacy path exactly, reusing the reporting
+/// `parse_address` helper (whose per-token semantics — empty / `any` / family
+/// wildcard = OK, everything else must parse — match the pre-fix drop set). The
+/// `__unsupported_address__` sentinel is caught earlier by the caller's
+/// sentinel preflight, so it never reaches here.
+fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6, Option<String>) {
     let mut any_v4 = false;
     let mut any_v6 = false;
     let mut v4: Vec<PrefixV4> = Vec::new();
     let mut v6: Vec<PrefixV6> = Vec::new();
+    let mut malformed: Option<String> = None;
     for tok in literals {
         match tok.as_str() {
             "any" => {
@@ -2496,7 +2610,11 @@ fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6) {
             "any4" | "any-ipv4" => any_v4 = true,
             "any6" | "any-ipv6" => any_v6 = true,
             "" => {}
-            s => parse_literal_cidr_into(s, &mut v4, &mut v6),
+            s => {
+                if !parse_address(s, &mut v4, &mut v6) && malformed.is_none() {
+                    malformed = Some(s.to_string());
+                }
+            }
         }
     }
     let v4_set = if any_v4 {
@@ -2509,43 +2627,90 @@ fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6) {
     } else {
         PrefixSetV6::from_v3_literals(v6)
     };
-    (v4_set, v6_set)
+    (v4_set, v6_set, malformed)
 }
 
-fn parse_literal_cidr_into(
+/// #3711: parse an address-book prefix token that MUST belong to the declared
+/// family (`expect_v4` selects the `prefixes_v4` vs `prefixes_v6` array).
+/// Returns `true` if the token parsed into the EXPECTED family or is a legit
+/// empty / bare-`any` placeholder; `false` if it is malformed OR belongs to the
+/// WRONG family (M02: an IPv6 token in `prefixes_v4` is rejected, not silently
+/// routed into the v6 set — and vice versa). This is the reporting,
+/// family-enforcing replacement for the pre-fix family-agnostic parser: the
+/// book builder fails the whole snapshot CLOSED on `false` rather than dropping
+/// the token (which collapsed a book-backed deny to match-none — a fail-OPEN).
+/// The per-token acceptance set (empty / `any` no-op; `any-ipv4`/`any-ipv6`
+/// same-family wildcards; IP/CIDR of the expected family) matches what the Go
+/// side emits after its family split; a wrong-family wildcard or literal is a
+/// wire-contract violation and is rejected.
+fn parse_book_prefix_into(
     prefix: &str,
+    expect_v4: bool,
     out_v4: &mut Vec<PrefixV4>,
     out_v6: &mut Vec<PrefixV6>,
-) {
+) -> bool {
+    // Legit no-op placeholders contribute nothing to either family. The Go side
+    // never emits them into a family array (it emits concrete family-split
+    // CIDRs), but accept them so a degenerate snapshot does not hard-fail on a
+    // semantically empty token.
     if prefix.is_empty() || prefix == "any" {
-        return;
+        return true;
     }
-    // #2008 H11: the Junos family-scoped wildcards expand to the
-    // concrete all-addresses prefix of their family (v4-only / v6-only).
+    // #2008 H11: the Junos family-scoped wildcards expand to the concrete
+    // all-addresses prefix of their family. Only the wildcard MATCHING the
+    // declared array is accepted (family enforcement — M02).
     if prefix == "any-ipv4" {
+        if !expect_v4 {
+            return false;
+        }
         out_v4.push(PrefixV4::from_net(
             ipnet::Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("v4 /0"),
         ));
-        return;
+        return true;
     }
     if prefix == "any-ipv6" {
+        if expect_v4 {
+            return false;
+        }
         out_v6.push(PrefixV6::from_net(
             ipnet::Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("v6 /0"),
         ));
-        return;
+        return true;
     }
     match prefix.parse::<IpNet>() {
-        Ok(IpNet::V4(net)) => out_v4.push(PrefixV4::from_net(net)),
-        Ok(IpNet::V6(net)) => out_v6.push(PrefixV6::from_net(net)),
+        Ok(IpNet::V4(net)) => {
+            if !expect_v4 {
+                return false;
+            }
+            out_v4.push(PrefixV4::from_net(net));
+            true
+        }
+        Ok(IpNet::V6(net)) => {
+            if expect_v4 {
+                return false;
+            }
+            out_v6.push(PrefixV6::from_net(net));
+            true
+        }
         Err(_) => {
             if let Ok(ip) = prefix.parse::<Ipv4Addr>() {
+                if !expect_v4 {
+                    return false;
+                }
                 out_v4.push(PrefixV4::from_net(
                     ipnet::Ipv4Net::new(ip, 32).expect("v4 /32"),
                 ));
+                true
             } else if let Ok(ip) = prefix.parse::<Ipv6Addr>() {
+                if expect_v4 {
+                    return false;
+                }
                 out_v6.push(PrefixV6::from_net(
                     ipnet::Ipv6Net::new(ip, 128).expect("v6 /128"),
                 ));
+                true
+            } else {
+                false
             }
         }
     }
@@ -3266,7 +3431,7 @@ fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<Pref
     if prefix.is_empty() || prefix == "any" {
         return true;
     }
-    // #2008 H11: family-scoped wildcards (see parse_literal_cidr_into).
+    // #2008 H11: family-scoped wildcards (see parse_book_prefix_into).
     if prefix == "any-ipv4" {
         out_v4.push(PrefixV4::from_net(
             ipnet::Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("v4 /0"),
