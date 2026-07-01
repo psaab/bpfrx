@@ -209,6 +209,10 @@ pub(super) fn build_live_forward_request_from_frame(
             FilterLogSource::Output,
             // #2520: AppID via the hot-path app_catalog.lookup.
             resolve_flow_app_id(&forwarding.app_catalog, flow),
+            // #3615: the TX/forward OUTPUT-filter path synthesizes no reject
+            // reply (that silent drop is #3608's deferred domain), so a `then
+            // reject` output term logs the truthful DENY rather than REJECT.
+            false,
             now_ns,
         );
     }

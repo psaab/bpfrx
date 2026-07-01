@@ -36,12 +36,12 @@ use crate::policy::evaluate_policy_result_with_icmp;
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
-use reject_reply::{enqueue_deny_reply, enqueue_filter_reject_reply};
+use reject_reply::{deny_reply_and_emit, enqueue_deny_reply, enqueue_filter_reject_reply};
 
 use filter::{
-    emit_input_filter_log_match, evaluate_dscp_sensitive_input_filter_on_session_hit,
-    evaluate_non_pbr_input_filter, evaluate_non_pbr_input_filter_log_only,
-    host_inbound_gated_lo0_action,
+    emit_input_filter_log_match, emit_pending_filter_log,
+    evaluate_dscp_sensitive_input_filter_on_session_hit, evaluate_non_pbr_input_filter,
+    evaluate_non_pbr_input_filter_log_only, filter_terminal, host_inbound_gated_lo0_action,
 };
 
 /// #3020: extract the ICMP/ICMPv6 `(type, code)` for policy matching. Returns
@@ -93,17 +93,14 @@ fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8,
 /// `None` when no junos-host policy is configured, none matches, or a match
 /// permits (caller continues local delivery).
 #[allow(clippy::too_many_arguments)]
-fn junos_host_policy_deny_action(
+fn junos_host_policy_eval(
     forwarding: &ForwardingState,
-    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     flow: &SessionFlow,
-    meta: UserspaceDpMeta,
     from_zone_id: u16,
     packet_len: u64,
-    now_ns: u64,
     l4_present: bool,
     packet_icmp: Option<(u8, u8)>,
-) -> Option<PolicyAction> {
+) -> Option<(PolicyAction, u32)> {
     let result = crate::policy::evaluate_junos_host_policy_l3_aware(
         &forwarding.policy,
         from_zone_id,
@@ -118,35 +115,51 @@ fn junos_host_policy_deny_action(
     )?;
     match result.action {
         PolicyAction::Permit => None,
-        action @ (PolicyAction::Deny | PolicyAction::Reject) => {
-            emit_policy_deny_event(
-                event_stream,
-                flow,
-                // LocalDelivery applies no NAT — the deny record carries no
-                // nat_* translation (byte-identical to a non-NAT transit deny).
-                &crate::nat::NatDecision::default(),
-                meta,
-                from_zone_id,
-                // The egress "zone" is the firewall host itself. The reserved
-                // JUNOS_HOST_ZONE_ID (u16::MAX-1) does not fit the u8 wire
-                // zone-id slot (#919/#922), so the deny RT_FLOW carries 0
-                // ("unknown / host", the #3110 sentinel) rather than a value
-                // that would truncate into a real zone id on the wire.
-                0,
-                // Host-local sessions are not policy-forwarded; owner_rg_id 0.
-                0,
-                result.policy_id,
-                action,
-                resolve_policy_deny_app_id(
-                    &forwarding.app_catalog,
-                    flow,
-                    flow.forward_key.dst_port,
-                ),
-                now_ns,
-            );
-            Some(action)
-        }
+        action @ (PolicyAction::Deny | PolicyAction::Reject) => Some((action, result.policy_id)),
     }
+}
+
+/// #3019/#3292/#3615: emit the junos-host (`to-zone junos-host`) policy-deny
+/// RT_FLOW. `reject_reply_enqueued` is the ACTUAL outcome of the reject-reply
+/// enqueue — the flowless LocalDelivery arm can synthesize NO reply (a fragment
+/// has no L4 header), so it passes `false` and a `reject` there logs the
+/// truthful DENY; the flow-backed wrapper passes the real
+/// `enqueue_deny_reply` result. Kept emit-only (evaluation is
+/// `junos_host_policy_eval`) so the enqueue can run BEFORE the emit on the
+/// flow-backed path.
+fn emit_junos_host_deny(
+    forwarding: &ForwardingState,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    from_zone_id: u16,
+    policy_id: u32,
+    action: PolicyAction,
+    reject_reply_enqueued: bool,
+    now_ns: u64,
+) {
+    emit_policy_deny_event(
+        event_stream,
+        flow,
+        // LocalDelivery applies no NAT — the deny record carries no nat_*
+        // translation (byte-identical to a non-NAT transit deny).
+        &crate::nat::NatDecision::default(),
+        meta,
+        from_zone_id,
+        // The egress "zone" is the firewall host itself. The reserved
+        // JUNOS_HOST_ZONE_ID (u16::MAX-1) does not fit the u8 wire zone-id slot
+        // (#919/#922), so the deny RT_FLOW carries 0 ("unknown / host", the
+        // #3110 sentinel) rather than a value that would truncate into a real
+        // zone id on the wire.
+        0,
+        // Host-local sessions are not policy-forwarded; owner_rg_id 0.
+        0,
+        policy_id,
+        action,
+        resolve_policy_deny_app_id(&forwarding.app_catalog, flow, flow.forward_key.dst_port),
+        reject_reply_enqueued,
+        now_ns,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,20 +177,20 @@ fn junos_host_policy_drops(
     now_ns: u64,
 ) -> bool {
     let policy_icmp = policy_packet_icmp(packet_frame, meta);
-    match junos_host_policy_deny_action(
+    match junos_host_policy_eval(
         forwarding,
-        event_stream,
         flow,
-        meta,
         from_zone_id,
         packet_len,
-        now_ns,
         // Flow-backed host-bound traffic always carries a real L4 header.
         true,
         policy_icmp,
     ) {
-        Some(action) => {
-            enqueue_deny_reply(
+        Some((action, policy_id)) => {
+            // #3615: enqueue the reject/tcp-rst reply FIRST, then emit the
+            // junos-host deny with the ACTUAL reply outcome so a suppressed
+            // reject logs the truthful DENY.
+            let reject_reply_enqueued = enqueue_deny_reply(
                 tx_pipeline,
                 forwarding,
                 ingress_ifindex,
@@ -187,6 +200,17 @@ fn junos_host_policy_drops(
                 counters,
                 matches!(action, PolicyAction::Reject),
                 from_zone_id,
+            );
+            emit_junos_host_deny(
+                forwarding,
+                event_stream,
+                flow,
+                meta,
+                from_zone_id,
+                policy_id,
+                action,
+                reject_reply_enqueued,
+                now_ns,
             );
             true
         }
@@ -258,32 +282,43 @@ fn flowless_local_delivery_verdict(
         matches!(flow.dst_ip, IpAddr::V6(_)),
         0,
         extra,
-        event_stream,
         flow,
         meta,
         ingress_zone_override,
-        now_ns,
     ) {
         None => return FlowlessLocalVerdict::HostInboundDeny,
-        Some(crate::filter::FilterAction::Accept) => {}
-        Some(_) => return FlowlessLocalVerdict::Filtered,
+        Some((action, lo0_log)) => {
+            // #3615: flowless — no reply can be synthesized (a fragment has no
+            // L4 header to build a RST/ICMP unreachable from), so emit the
+            // matched lo0 filter-log with the truthful DENY
+            // (reject_reply_enqueued = false).
+            if let Some(lo0_log) = lo0_log {
+                emit_pending_filter_log(event_stream, flow, meta, lo0_log, false, now_ns);
+            }
+            if !matches!(action, crate::filter::FilterAction::Accept) {
+                return FlowlessLocalVerdict::Filtered;
+            }
+        }
     }
     // `to-zone junos-host` policy AFTER host-inbound admission (Junos order),
-    // l4_present = false. A matching deny/reject is a SILENT flowless drop (the
-    // deny event is emitted inside the helper for observability / parity).
-    if junos_host_policy_deny_action(
-        forwarding,
-        event_stream,
-        flow,
-        meta,
-        from_zone_id,
-        packet_len,
-        now_ns,
-        false,
-        packet_icmp,
-    )
-    .is_some()
+    // l4_present = false. A matching deny/reject is a SILENT flowless drop — a
+    // fragment has no L4 header to synthesize a RST/ICMP reject from, so #3615
+    // logs the truthful DENY (reject_reply_enqueued = false) for observability.
+    if let Some((action, policy_id)) =
+        junos_host_policy_eval(forwarding, flow, from_zone_id, packet_len, false, packet_icmp)
     {
+        emit_junos_host_deny(
+            forwarding,
+            event_stream,
+            flow,
+            meta,
+            from_zone_id,
+            policy_id,
+            action,
+            // Flowless: no reply is ever synthesized.
+            false,
+            now_ns,
+        );
         return FlowlessLocalVerdict::Filtered;
     }
     FlowlessLocalVerdict::Deliver
@@ -777,6 +812,29 @@ pub(super) fn poll_binding_process_descriptor(
                                 Some(resolved.metadata.ingress_zone),
                             )
                         {
+                            // #2521/#3615: a filter `then reject` synthesizes a
+                            // TCP RST / ICMP unreachable back toward the source
+                            // (same machinery as policy reject); `discard` stays
+                            // a silent drop. Enqueue the reply FIRST so the
+                            // `then log` filter-log below reports the TRUTHFUL
+                            // action — a reject whose reply fail-closes
+                            // (budget/rate/parse/output-filter) logs DENY, not
+                            // REJECT.
+                            let reject_reply_enqueued = if input_filter_eval.action
+                                == crate::filter::FilterAction::Reject
+                            {
+                                enqueue_filter_reject_reply(
+                                    &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
+                                    binding.ifindex,
+                                    packet_frame,
+                                    meta,
+                                    flow,
+                                    telemetry.counters,
+                                )
+                            } else {
+                                false
+                            };
                             if let Some(cached_log) = input_filter_eval.cached_log {
                                 emit_input_filter_log_match(
                                     worker_ctx.forwarding,
@@ -784,29 +842,11 @@ pub(super) fn poll_binding_process_descriptor(
                                     flow,
                                     meta,
                                     cached_log,
+                                    reject_reply_enqueued,
                                     now_ns,
                                 );
                             }
                             if input_filter_eval.action != crate::filter::FilterAction::Accept {
-                                // #2521: a filter `then reject` synthesizes a
-                                // TCP RST / ICMP unreachable back toward the
-                                // source (same machinery as policy reject);
-                                // `discard` stays a silent drop. The reply is
-                                // enqueued before the recycle, while flow /
-                                // packet_frame are in scope.
-                                if input_filter_eval.action
-                                    == crate::filter::FilterAction::Reject
-                                {
-                                    enqueue_filter_reject_reply(
-                                        &mut binding.tx_pipeline,
-                                        worker_ctx.forwarding,
-                                        binding.ifindex,
-                                        packet_frame,
-                                        meta,
-                                        flow,
-                                        telemetry.counters,
-                                    );
-                                }
                                 binding.scratch.scratch_recycle.push(desc.addr);
                                 continue;
                             }
@@ -823,7 +863,7 @@ pub(super) fn poll_binding_process_descriptor(
                         // a denied service still triggered its reject/RST/teardown/
                         // counter/log (codex-review-118 M1). Only an ADMITTED
                         // packet pays the lo0 evaluation.
-                        let lo0_action = if resolved.decision.resolution.disposition
+                        if resolved.decision.resolution.disposition
                             == ForwardingDisposition::LocalDelivery
                         {
                             // #3609: the per-interface host-inbound override is
@@ -855,11 +895,9 @@ pub(super) fn poll_binding_process_descriptor(
                                     packet_frame,
                                     meta,
                                 ),
-                                worker_ctx.event_stream,
                                 flow,
                                 meta,
                                 Some(resolved.metadata.ingress_zone),
-                                now_ns,
                             ) {
                                 None => {
                                     // Host-inbound denied: silent drop, tear down
@@ -891,46 +929,50 @@ pub(super) fn poll_binding_process_descriptor(
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
-                                Some(action) => action,
+                                // #2521/#3615: a lo0 `then reject` synthesizes a
+                                // TCP RST / ICMP unreachable; `filter_terminal`
+                                // enqueues the reply FIRST then emits the lo0
+                                // filter-log with the TRUTHFUL action (a
+                                // suppressed reject logs DENY, not REJECT), and
+                                // returns true iff the packet must be dropped
+                                // (discard/reject). An accepted flow with a lo0
+                                // `then log` term still emits and falls through.
+                                Some((lo0_action, lo0_log)) => {
+                                    if filter_terminal(
+                                        &mut binding.tx_pipeline,
+                                        worker_ctx.forwarding,
+                                        worker_ctx.event_stream,
+                                        binding.ifindex,
+                                        packet_frame,
+                                        meta,
+                                        flow,
+                                        telemetry.counters,
+                                        lo0_action,
+                                        lo0_log,
+                                        now_ns,
+                                    ) {
+                                        delete_terminal_filtered_session(
+                                            sessions,
+                                            binding.bpf_maps.session_map_fd,
+                                            conntrack_v4_fd,
+                                            conntrack_v6_fd,
+                                            worker_ctx.shared_sessions,
+                                            worker_ctx.shared_nat_sessions,
+                                            worker_ctx.shared_forward_wire_sessions,
+                                            &worker_ctx.shared_owner_rg_indexes,
+                                            worker_ctx.peer_worker_commands,
+                                            &resolved.key,
+                                            resolved.decision,
+                                            &resolved.metadata,
+                                            resolved.origin,
+                                        );
+                                        telemetry.dbg.local += 1;
+                                        telemetry.dbg.policy_deny += 1;
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
+                                }
                             }
-                        } else {
-                            crate::filter::FilterAction::Accept
-                        };
-                        if lo0_action != crate::filter::FilterAction::Accept {
-                            // #2521: a lo0 `then reject` synthesizes a TCP RST /
-                            // ICMP unreachable toward the source before the
-                            // host-bound session is torn down; `discard` stays
-                            // a silent drop.
-                            if lo0_action == crate::filter::FilterAction::Reject {
-                                enqueue_filter_reject_reply(
-                                    &mut binding.tx_pipeline,
-                                    worker_ctx.forwarding,
-                                    binding.ifindex,
-                                    packet_frame,
-                                    meta,
-                                    flow,
-                                    telemetry.counters,
-                                );
-                            }
-                            delete_terminal_filtered_session(
-                                sessions,
-                                binding.bpf_maps.session_map_fd,
-                                conntrack_v4_fd,
-                                conntrack_v6_fd,
-                                worker_ctx.shared_sessions,
-                                worker_ctx.shared_nat_sessions,
-                                worker_ctx.shared_forward_wire_sessions,
-                                &worker_ctx.shared_owner_rg_indexes,
-                                worker_ctx.peer_worker_commands,
-                                &resolved.key,
-                                resolved.decision,
-                                &resolved.metadata,
-                                resolved.origin,
-                            );
-                            telemetry.dbg.local += 1;
-                            telemetry.dbg.policy_deny += 1;
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
                         }
                         // #3019: `to-zone junos-host` security policy on the
                         // session-HIT local-delivery path, mirroring the #3070
@@ -1375,20 +1417,13 @@ pub(super) fn poll_binding_process_descriptor(
                         // SUBSEQUENT packets; the miss packet does not take the
                         // cache-hit path, so the same packet is never
                         // double-logged.
-                        if let Some(cached_log) = input_filter_eval.cached_log {
-                            emit_input_filter_log_match(
-                                worker_ctx.forwarding,
-                                worker_ctx.event_stream,
-                                flow,
-                                meta,
-                                cached_log,
-                                now_ns,
-                            );
-                        }
-                        if input_filter_eval.action != crate::filter::FilterAction::Accept {
-                            // #2521: filter `then reject` synthesizes an active
-                            // reply (TCP RST / ICMP unreachable) like policy
-                            // reject; `discard` remains a silent drop.
+                        // #2521/#3615: filter `then reject` synthesizes an active
+                        // reply (TCP RST / ICMP unreachable) like policy reject;
+                        // `discard` remains a silent drop. Enqueue the reply
+                        // FIRST so the `then log` filter-log below reports the
+                        // TRUTHFUL action — a reject whose reply fail-closes logs
+                        // DENY, not REJECT.
+                        let reject_reply_enqueued =
                             if input_filter_eval.action == crate::filter::FilterAction::Reject {
                                 enqueue_filter_reject_reply(
                                     &mut binding.tx_pipeline,
@@ -1398,8 +1433,22 @@ pub(super) fn poll_binding_process_descriptor(
                                     meta,
                                     flow,
                                     telemetry.counters,
-                                );
-                            }
+                                )
+                            } else {
+                                false
+                            };
+                        if let Some(cached_log) = input_filter_eval.cached_log {
+                            emit_input_filter_log_match(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                flow,
+                                meta,
+                                cached_log,
+                                reject_reply_enqueued,
+                                now_ns,
+                            );
+                        }
+                        if input_filter_eval.action != crate::filter::FilterAction::Accept {
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
@@ -1721,9 +1770,7 @@ pub(super) fn poll_binding_process_descriptor(
                         // reject/RST/counter/log (codex-review-118 M1). Only an
                         // ADMITTED packet pays the lo0 evaluation. Gated on
                         // LocalDelivery so transit traffic never pays for it.
-                        let lo0_action = if resolution.disposition
-                            == ForwardingDisposition::LocalDelivery
-                        {
+                        if resolution.disposition == ForwardingDisposition::LocalDelivery {
                             match host_inbound_gated_lo0_action(
                                 worker_ctx.forwarding,
                                 // #3609: the host-inbound override is keyed by
@@ -1746,11 +1793,9 @@ pub(super) fn poll_binding_process_descriptor(
                                     packet_frame,
                                     meta,
                                 ),
-                                worker_ctx.event_stream,
                                 flow,
                                 meta,
                                 ingress_zone_override,
-                                now_ns,
                             ) {
                                 None => {
                                     // Host-inbound denied: silent drop, never
@@ -1766,30 +1811,34 @@ pub(super) fn poll_binding_process_descriptor(
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
-                                Some(action) => action,
+                                // #2521/#3615: `filter_terminal` enqueues the lo0
+                                // reject reply FIRST, then emits the lo0
+                                // filter-log with the TRUTHFUL action (a
+                                // suppressed reject logs DENY, not REJECT), and
+                                // returns true iff the packet must be dropped
+                                // (discard/reject). An accepted lo0 `then log`
+                                // flow still emits and falls through.
+                                Some((lo0_action, lo0_log)) => {
+                                    if filter_terminal(
+                                        &mut binding.tx_pipeline,
+                                        worker_ctx.forwarding,
+                                        worker_ctx.event_stream,
+                                        binding.ifindex,
+                                        packet_frame,
+                                        meta,
+                                        flow,
+                                        telemetry.counters,
+                                        lo0_action,
+                                        lo0_log,
+                                        now_ns,
+                                    ) {
+                                        telemetry.dbg.local += 1;
+                                        telemetry.dbg.policy_deny += 1;
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
+                                }
                             }
-                        } else {
-                            crate::filter::FilterAction::Accept
-                        };
-                        if lo0_action != crate::filter::FilterAction::Accept {
-                            // #2521: lo0 `then reject` synthesizes an active
-                            // reply (TCP RST / ICMP unreachable); `discard`
-                            // stays a silent drop.
-                            if lo0_action == crate::filter::FilterAction::Reject {
-                                enqueue_filter_reject_reply(
-                                    &mut binding.tx_pipeline,
-                                    worker_ctx.forwarding,
-                                    binding.ifindex,
-                                    packet_frame,
-                                    meta,
-                                    flow,
-                                    telemetry.counters,
-                                );
-                            }
-                            telemetry.dbg.local += 1;
-                            telemetry.dbg.policy_deny += 1;
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
                         }
                         // #3019: `to-zone junos-host` security policy on the
                         // session-MISS local-delivery path, AFTER host-inbound
@@ -2812,31 +2861,36 @@ pub(super) fn poll_binding_process_descriptor(
                                     }
                                 }
                             } else {
-                                emit_policy_deny_event(
+                                // #2089/#3071/#3615: enqueue the deny/reject
+                                // reply FIRST, then emit the policy-deny RT_FLOW
+                                // with the TRUTHFUL action. `reject` synthesizes
+                                // a TCP RST / ICMP unreachable back toward the
+                                // source; plain `deny` is a silent drop UNLESS
+                                // the flow is TCP and the ingress (from) zone has
+                                // Junos `tcp-rst`. When a `reject` reply
+                                // fail-closes (budget/rate/parse/output-filter)
+                                // the event is downgraded REJECT→DENY so the log
+                                // never claims an active reject that was not sent
+                                // (#3615). `decision.nat` carries the inbound dst
+                                // translation (#2345/#3058); the AppID is
+                                // resolved from the POST-translation dst port
+                                // (#2520/#3058) so a DNAT'd deny logs the inside
+                                // app, not UNKNOWN(pre-NAT port).
+                                deny_reply_and_emit(
+                                    &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
                                     worker_ctx.event_stream,
-                                    flow,
-                                    // #3058: carry the inbound destination NAT
-                                    // (DNAT / static-DNAT / inbound NPTv6) the
-                                    // policy was evaluated against (#2345) so the
-                                    // deny RT_FLOW record's nat_* fields show the
-                                    // real translated dst, mirroring the permit /
-                                    // session-close record. SNAT is not applied on
-                                    // a denied flow, so `decision.nat` here holds
-                                    // only the dst rewrite (None for a non-NAT
-                                    // deny → byte-identical to the old record).
-                                    &decision.nat,
+                                    binding.ifindex,
+                                    packet_frame,
                                     meta,
+                                    flow,
+                                    telemetry.counters,
+                                    &decision.nat,
                                     from_zone_id,
                                     to_zone_id,
                                     owner_rg_id,
                                     policy_result.policy_id,
                                     policy_result.action,
-                                    // #2520/#3058: resolve the AppID with the same
-                                    // app_catalog.lookup the session-create hot
-                                    // path runs, but from the POST-translation dst
-                                    // port the policy matched (`policy_dst_port`),
-                                    // so a DNAT'd deny logs the inside app (e.g.
-                                    // junos-ssh) instead of UNKNOWN(pre-NAT port).
                                     resolve_policy_deny_app_id(
                                         &worker_ctx.forwarding.app_catalog,
                                         flow,
@@ -2862,28 +2916,10 @@ pub(super) fn poll_binding_process_descriptor(
                                         resolution.egress_ifindex,
                                     );
                                 }
-                                // #2089/#3071: `reject` actively rejects —
-                                // synthesize a TCP RST (TCP) or ICMP
-                                // unreachable (admin-prohibited; other
-                                // protocols) back toward the source. Plain
-                                // `deny` is a silent drop UNLESS the flow is
-                                // TCP and the ingress (from) zone has Junos
-                                // `tcp-rst`, in which case a TCP RST is sent.
-                                // The reply is enqueued here before the
-                                // disposition fall-through, while flow /
-                                // action / from_zone_id / packet_frame are in
-                                // scope.
-                                enqueue_deny_reply(
-                                    &mut binding.tx_pipeline,
-                                    worker_ctx.forwarding,
-                                    binding.ifindex,
-                                    packet_frame,
-                                    meta,
-                                    flow,
-                                    telemetry.counters,
-                                    matches!(policy_result.action, PolicyAction::Reject),
-                                    from_zone_id,
-                                );
+                                // #3615: the deny/reject reply was enqueued by
+                                // `deny_reply_and_emit` above (before the event
+                                // emit) so the RT_FLOW action reflects the actual
+                                // reply outcome.
                                 decision.resolution.disposition =
                                     ForwardingDisposition::PolicyDenied;
                             }
@@ -2955,6 +2991,11 @@ pub(super) fn poll_binding_process_descriptor(
                                 l3_flow,
                                 meta,
                                 cached_log,
+                                // #3615: a flowless (non-first fragment / no-L4)
+                                // deny is ALWAYS a silent drop — no reply can be
+                                // synthesized — so a `then reject` term logs the
+                                // truthful DENY (reject_reply_enqueued = false).
+                                false,
                                 now_ns,
                             );
                         }
@@ -3086,6 +3127,12 @@ pub(super) fn poll_binding_process_descriptor(
                                 policy_result.action,
                                 // No L4 port for a flowless packet → no AppID.
                                 0,
+                                // #3615: a flowless (non-first fragment / no-L4)
+                                // deny is ALWAYS a silent drop — there is no L4
+                                // header to synthesize a RST/ICMP reject from —
+                                // so no reply is ever enqueued and a `reject`
+                                // must log the truthful DENY.
+                                false,
                                 now_ns,
                             );
                             telemetry.dbg.policy_deny += 1;
@@ -3840,25 +3887,29 @@ pub(super) fn poll_binding_process_descriptor(
                                         worker_ctx.forwarding,
                                         decision.resolution,
                                     );
-                                    emit_policy_deny_event(
+                                    // #2089/#3071/#3615: enqueue the deny/reject
+                                    // reply FIRST, then emit the policy-deny
+                                    // RT_FLOW with the TRUTHFUL action (a `reject`
+                                    // whose reply fail-closes is logged as DENY,
+                                    // not REJECT). `decision.nat` carries the
+                                    // inbound dst translation (#2345/#3058); the
+                                    // AppID is resolved from the POST-translation
+                                    // dst port (#2520/#3058).
+                                    deny_reply_and_emit(
+                                        &mut binding.tx_pipeline,
+                                        worker_ctx.forwarding,
                                         worker_ctx.event_stream,
-                                        flow,
-                                        // #3058: same as the ForwardCandidate deny
-                                        // site — `decision.nat` carries the inbound
-                                        // dst translation (DNAT/static-DNAT/NPTv6)
-                                        // the #2345 policy match ran against, so the
-                                        // nat_* fields log the real internal dst.
-                                        // None for a non-NAT deny (byte-identical).
-                                        &decision.nat,
+                                        binding.ifindex,
+                                        packet_frame,
                                         meta,
+                                        flow,
+                                        telemetry.counters,
+                                        &decision.nat,
                                         from_zone_id,
                                         to_zone_id,
                                         owner_rg_id,
                                         policy_result.policy_id,
                                         policy_result.action,
-                                        // #2520/#3058: AppID via the hot-path lookup
-                                        // from the POST-translation dst port the
-                                        // policy matched (`policy_dst_port`).
                                         resolve_policy_deny_app_id(
                                             &worker_ctx.forwarding.app_catalog,
                                             flow,
@@ -3867,24 +3918,6 @@ pub(super) fn poll_binding_process_descriptor(
                                         now_ns,
                                     );
                                     telemetry.dbg.policy_deny += 1;
-                                    // #2089/#3071: `reject` actively rejects
-                                    // (TCP RST / ICMP unreachable); plain
-                                    // `deny` stays a silent drop UNLESS the
-                                    // flow is TCP and the ingress (from) zone
-                                    // has Junos `tcp-rst`, in which case a TCP
-                                    // RST is sent. Enqueue before the
-                                    // disposition record + recycle.
-                                    enqueue_deny_reply(
-                                        &mut binding.tx_pipeline,
-                                        worker_ctx.forwarding,
-                                        binding.ifindex,
-                                        packet_frame,
-                                        meta,
-                                        flow,
-                                        telemetry.counters,
-                                        matches!(policy_result.action, PolicyAction::Reject),
-                                        from_zone_id,
-                                    );
                                     decision.resolution.disposition =
                                         ForwardingDisposition::PolicyDenied;
                                     record_forwarding_disposition(

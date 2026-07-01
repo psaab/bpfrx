@@ -17,8 +17,12 @@
 use super::cookie_reply::syn_cookie_reply_budget_available;
 use super::worker::WorkerTxPipeline;
 use super::*;
+use crate::afxdp::event_emit::emit_policy_deny_event;
 use crate::afxdp::icmp::build_reject_icmp_unreachable;
 use crate::afxdp::icmp_ratelimit::{GeneratedErrorReason, allow_generated_error};
+use crate::event_stream::EventStreamWorkerHandle;
+use crate::nat::NatDecision;
+use crate::policy::PolicyAction;
 
 /// Which `reject` source a synthesized reply is attributed to. Selects the
 /// per-source counters so a policy `then reject` and a firewall-filter `then
@@ -143,6 +147,66 @@ pub(super) fn enqueue_deny_reply(
         );
     }
     false
+}
+
+/// #3615: enqueue the policy deny/reject reply FIRST, THEN emit the policy-deny
+/// RT_FLOW carrying the TRUTHFUL action. `enqueue_deny_reply` returns whether a
+/// TCP RST / ICMP-unreachable was actually enqueued (an explicit `then reject`,
+/// or a plain `deny` in a zone with `tcp-rst`); that outcome is threaded into
+/// `emit_policy_deny_event` so a `reject` whose reply fail-closed
+/// (budget/rate/parse/output-filter) is logged as the truthful DENY rather than
+/// claiming an active reject that never left the box. A plain `deny` always
+/// logs DENY regardless of whether a zone-`tcp-rst` RST rode out.
+///
+/// Both transit deny sites and the junos-host deny route through this single
+/// helper so the poll-loop ordering (enqueue-outcome BEFORE emit) is the SAME
+/// code path a unit test can drive — the poll loop body itself is un-callable.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn deny_reply_and_emit(
+    tx_pipeline: &mut WorkerTxPipeline,
+    forwarding: &ForwardingState,
+    event_stream: Option<&EventStreamWorkerHandle>,
+    ingress_ifindex: i32,
+    packet_frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+    counters: &mut BatchCounters,
+    nat: &NatDecision,
+    from_zone_id: u16,
+    to_zone_id: u16,
+    owner_rg_id: i32,
+    policy_id: u32,
+    action: PolicyAction,
+    app_id: u16,
+    now_ns: u64,
+) {
+    let reject_reply_enqueued = enqueue_deny_reply(
+        tx_pipeline,
+        forwarding,
+        ingress_ifindex,
+        packet_frame,
+        meta,
+        flow,
+        counters,
+        matches!(action, PolicyAction::Reject),
+        from_zone_id,
+    );
+    emit_policy_deny_event(
+        event_stream,
+        flow,
+        nat,
+        meta,
+        from_zone_id,
+        to_zone_id,
+        owner_rg_id,
+        policy_id,
+        action,
+        app_id,
+        reject_reply_enqueued,
+        now_ns,
+    );
 }
 
 #[cold]
@@ -1218,5 +1282,179 @@ mod tests {
         );
         assert_eq!(counters.policy_reject_sent, 1);
         assert!(!pipeline.pending_tx_local.is_empty());
+    }
+
+    // #3615 M10: poll-loop-path ordering coverage for `deny_reply_and_emit` —
+    // the combining helper the transit deny sites + junos-host deny call. RT_FLOW
+    // action bytes mirror event_emit.rs (DENY = 0, REJECT = 2).
+    const RT_FLOW_ACTION_DENY: u8 = 0;
+    const RT_FLOW_ACTION_REJECT: u8 = 2;
+
+    fn unlimited_event_handle() -> (
+        EventStreamWorkerHandle,
+        std::sync::mpsc::Receiver<crate::event_stream::EventFrame>,
+    ) {
+        crate::event_stream::test_worker_handle(
+            8,
+            crate::event_stream::DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        )
+    }
+
+    /// #3615 M10 fail-on-revert: a policy `then reject` whose reply is
+    /// SUPPRESSED by TX-frame budget on the poll path must (a) NOT enqueue a
+    /// reply, (b) bump `policy_reject_reply_budget_drops`, and (c) emit a
+    /// policy-deny event whose action is the TRUTHFUL DENY, not REJECT.
+    /// Reverting `deny_reply_and_emit` to emit BEFORE the enqueue (or hardcode
+    /// `reject_reply_enqueued=true`) flips the wire action back to REJECT — RED
+    /// on the event-action assertion. Asserts action + counter + TX queue
+    /// length together (issue #3615 M10).
+    #[test]
+    fn deny_reply_and_emit_suppressed_reject_logs_deny() {
+        let (frame, meta, flow) = tcp_v4_syn();
+        let (handle, rx) = unlimited_event_handle();
+        let mut pipeline = tx_pipeline(0, 64); // zero budget => reply suppressed
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        deny_reply_and_emit(
+            &mut pipeline,
+            &forwarding,
+            Some(&handle),
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            &NatDecision::default(),
+            7,   // from_zone
+            9,   // to_zone
+            0,   // owner_rg
+            101, // policy_id
+            PolicyAction::Reject,
+            0, // app_id
+            123,
+        );
+        assert!(
+            pipeline.pending_tx_local.is_empty(),
+            "no reply may be enqueued under budget exhaustion"
+        );
+        assert_eq!(counters.policy_reject_reply_budget_drops, 1);
+        assert_eq!(counters.policy_reject_sent, 0);
+        let event = rx
+            .try_recv()
+            .expect("policy-deny event frame")
+            .decode_dataplane_event()
+            .expect("policy-deny payload");
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_DENY,
+            "a suppressed reject on the poll path must log DENY, not REJECT"
+        );
+    }
+
+    /// #3615 M10 (rate-limit suppression variant): once the global `Reject`
+    /// token bucket is empty, `deny_reply_and_emit` enqueues no reply and the
+    /// emitted policy-deny action is the truthful DENY.
+    #[test]
+    fn deny_reply_and_emit_rate_limited_reject_logs_deny() {
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+            reset_bucket_for_test,
+        };
+        let _g = global_bucket_test_lock();
+        let (frame, meta, flow) = tcp_v4_syn();
+        // Pin the refill epoch to the far future then drain, so the call site's
+        // smaller monotonic `now_ns` yields zero refill (mirrors
+        // reject_reply_rate_limited_when_bucket_empty).
+        let far_future = u64::MAX / 2;
+        reset_bucket_for_test(GeneratedErrorReason::Reject, far_future);
+        while allow_generated_error_at(GeneratedErrorReason::Reject, far_future, 1000, 1000) {}
+        let (handle, rx) = unlimited_event_handle();
+        let mut pipeline = tx_pipeline(64, 64); // budget plentiful; rate limits
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        deny_reply_and_emit(
+            &mut pipeline,
+            &forwarding,
+            Some(&handle),
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            &NatDecision::default(),
+            7,
+            9,
+            0,
+            101,
+            PolicyAction::Reject,
+            0,
+            123,
+        );
+        assert!(
+            pipeline.pending_tx_local.is_empty(),
+            "no reply may be enqueued when rate-limited"
+        );
+        assert_eq!(counters.policy_reject_sent, 0);
+        let event = rx
+            .try_recv()
+            .expect("policy-deny event frame")
+            .decode_dataplane_event()
+            .expect("policy-deny payload");
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_DENY,
+            "a rate-limited reject on the poll path must log DENY, not REJECT"
+        );
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+    }
+
+    /// #3615 M10 GREEN companion: a policy `then reject` whose reply IS enqueued
+    /// logs the truthful REJECT and increments `policy_reject_sent`.
+    #[test]
+    fn deny_reply_and_emit_success_logs_reject() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
+        let (frame, meta, flow) = tcp_v4_syn();
+        let (handle, rx) = unlimited_event_handle();
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        deny_reply_and_emit(
+            &mut pipeline,
+            &forwarding,
+            Some(&handle),
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            &NatDecision::default(),
+            7,
+            9,
+            0,
+            101,
+            PolicyAction::Reject,
+            0,
+            123,
+        );
+        assert_eq!(counters.policy_reject_sent, 1, "the RST must be enqueued");
+        assert_eq!(pipeline.pending_tx_local.len(), 1);
+        let event = rx
+            .try_recv()
+            .expect("policy-deny event frame")
+            .decode_dataplane_event()
+            .expect("policy-deny payload");
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_REJECT,
+            "an enqueued reject must log the truthful REJECT"
+        );
     }
 }

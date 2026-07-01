@@ -482,7 +482,26 @@ sync.
   hits emit the same compiled filter/term/action metadata as live paths.
   Terminal output `discard`/`reject` terms are carried in the TX selection
   descriptor and drop before enqueue; filter-log deny records must not
-  describe traffic that still forwards. DSCP-matched input/output filters
+  describe traffic that still forwards.
+  **RT_FLOW reject truthfulness (#3615):** a policy/filter `then reject`
+  synthesizes an active TCP RST / ICMP unreachable, but that reply can
+  fail-close AFTER the action is decided (TX-frame budget, reject token
+  bucket empty, unparseable built frame, or an egress output-filter drop of
+  the reflected reply). The deny/reject reply is therefore enqueued FIRST —
+  `poll_descriptor::reject_reply::deny_reply_and_emit` (policy) and
+  `poll_descriptor::filter::filter_terminal` (input/lo0 filter) — and its
+  ACTUAL outcome is threaded into `emit_policy_deny_event` /
+  `emit_filter_log_event`, which downgrade the RT_FLOW action REJECT→DENY
+  when the reply was suppressed so the forensic log never claims an active
+  reject that was not sent. Reply-free paths (flowless fragments, the
+  PBR/output-filter forward path — #3608's silent-drop domain — and
+  cached-log replay) pass `reject_reply_enqueued = false`. Suppression is
+  also counted per SOURCE: `policy_reject_reply_budget_drops` /
+  `policy_reject_output_filter_drops` (policy) vs
+  `filter_reject_reply_budget_drops` / `filter_reject_output_filter_drops`
+  (filter); the parse-error leg `generated_reply_classify_parse_errors`
+  stays source-neutral (shared by every generated-reply type).
+  DSCP-matched input/output filters
   are intentionally not flow-cached because DSCP is packet metadata, not
   part of the session cache key; session hits re-evaluate DSCP-sensitive
   input filters per packet.

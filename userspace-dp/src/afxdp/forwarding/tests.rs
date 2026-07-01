@@ -2038,6 +2038,9 @@ fn policy_selection_deny_emits_rt_flow_event() {
         42,
         action,
         0,
+        // #3615: action is Deny (asserted above), so reject_reply_enqueued is
+        // ignored — pass false.
+        false,
         123,
     );
 
