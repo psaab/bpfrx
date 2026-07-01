@@ -17,6 +17,13 @@
 //     rejected at commit (config.ValidateEventAttributesMatchStrict); on the
 //     legacy lenient-load path the runtime matcher fails CLOSED (the policy
 //     does not fire) rather than dropping the constraint and over-firing.
+//   - #3751 fail-closed temporal gate: a `within <seconds> { trigger
+//     (on|until) <count>; }` numeric typo is rejected at commit
+//     (config.validateEventOptionsWithinAST); on the legacy lenient-load path
+//     a within clause with no usable positive threshold (a leftover 0 from an
+//     older binary that silently coerced the typo) fails CLOSED in
+//     withinMatches (the policy does not fire) rather than treating the 0 as
+//     an unconditional match and always-firing the remediation.
 //   - #2157 fail-safe queue: actions run on a single serialized worker
 //     goroutine (removing the cross-probe EnterConfigure race) with bounded
 //     backoff retry on a held config lock (configstore.ErrConfigLocked) and
@@ -859,6 +866,22 @@ func (e *Engine) withinMatches(pol *config.EventPolicy, rt *policyRuntime, event
 	timestamps := rt.windows[eventName]
 
 	for _, wc := range pol.WithinClauses {
+		// #3751 defense-in-depth: a within clause with no USABLE positive
+		// threshold (both trigger on/until absent or <= 0) — or a non-positive
+		// window — must fail CLOSED, not always-fire. Commit-time validation
+		// (config.validateEventOptionsWithinAST) rejects such a clause outright,
+		// so this belt only fires on a config that slipped through a TOLERANT
+		// load / peer-sync path (an older binary silently coerced a within/
+		// trigger typo to 0). Falling through to `return true` here would treat
+		// that mis-arrived 0 as an unconditional match — turning a threshold-
+		// gated remediation into an ALWAYS-FIRE one, the original fail-open. A
+		// policy with NO within clauses at all is handled above (return true) —
+		// that legitimately means "no temporal filter"; this guard is only for
+		// a within clause that exists but gates nothing.
+		if wc.Seconds <= 0 || (wc.TriggerOn <= 0 && wc.TriggerUntil <= 0) {
+			return false
+		}
+
 		window := time.Duration(wc.Seconds) * time.Second
 
 		// Count events within the window
