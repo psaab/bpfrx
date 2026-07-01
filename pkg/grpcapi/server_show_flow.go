@@ -65,6 +65,9 @@ func (s *Server) showFlowMonitoringStatistics(buf *strings.Builder) {
 			state = "DOWN"
 		}
 		fmt.Fprintf(buf, "  Collector %s (%s)", h.Address, h.Protocol)
+		if h.SourceAddress != "" {
+			fmt.Fprintf(buf, " source %s", h.SourceAddress)
+		}
 		if h.Instance != "" {
 			fmt.Fprintf(buf, " instance %s", h.Instance)
 		}

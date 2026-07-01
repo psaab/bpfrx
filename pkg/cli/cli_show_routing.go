@@ -1080,6 +1080,10 @@ func (c *CLI) showForwardingOptions() error {
 					if fs.VersionIPFIXTemplate != "" {
 						fmt.Printf("      IPFIX template: %s\n", fs.VersionIPFIXTemplate)
 					}
+					// Per-collector source-address override (#3745).
+					if fs.SourceAddress != "" {
+						fmt.Printf("      Source address: %s\n", fs.SourceAddress)
+					}
 				}
 				if fam.SourceAddress != "" {
 					fmt.Printf("    Source address: %s\n", fam.SourceAddress)
