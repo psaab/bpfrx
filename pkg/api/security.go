@@ -561,13 +561,17 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		writeOK(w, MatchPoliciesResult{Action: res.DisplayAction(), DefaultUsed: res.DefaultUsed})
 		return
 	}
+	matchedID := res.PolicyID
 	writeOK(w, MatchPoliciesResult{
-		Matched:      true,
-		PolicyName:   res.PolicyName,
-		Global:       res.Global,
-		FromZone:     res.FromZone,
-		ToZone:       res.ToZone,
-		PolicyID:     res.PolicyID,
+		Matched:    true,
+		PolicyName: res.PolicyName,
+		Global:     res.Global,
+		FromZone:   res.FromZone,
+		ToZone:     res.ToZone,
+		// #3623: set the pointer only on a match (the two early returns above
+		// leave it nil), so a matched first policy (id 0) is emitted as
+		// "policy_id":0 rather than dropped and mistaken for no match.
+		PolicyID:     &matchedID,
 		Action:       res.DisplayAction(),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,

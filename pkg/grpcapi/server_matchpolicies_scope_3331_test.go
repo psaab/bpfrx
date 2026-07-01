@@ -107,11 +107,15 @@ func TestMatchPoliciesResponseCarriesScopeAndID(t *testing.T) {
 		}
 	}
 	wantID := ids[[2]uint32{uint32(untrustSet), 0}]
-	if resp.PolicyId != wantID {
-		t.Errorf("PolicyId = %d, want %d (untrust->trust runtime ID)", resp.PolicyId, wantID)
+	if resp.GetPolicyId() != wantID {
+		t.Errorf("PolicyId = %d, want %d (untrust->trust runtime ID)", resp.GetPolicyId(), wantID)
 	}
-	if otherID := ids[[2]uint32{uint32(trustSet), 0}]; otherID == resp.PolicyId {
-		t.Errorf("duplicate-name policies share PolicyId %d; cannot disambiguate", resp.PolicyId)
+	// #3623: on a match the id must be PRESENT (pointer non-nil), even at 0.
+	if resp.PolicyId == nil {
+		t.Errorf("PolicyId absent on a matched response; want explicit presence (#3623)")
+	}
+	if otherID := ids[[2]uint32{uint32(trustSet), 0}]; otherID == resp.GetPolicyId() {
+		t.Errorf("duplicate-name policies share PolicyId %d; cannot disambiguate", resp.GetPolicyId())
 	}
 
 	// trust->untrust matches the SCOPED GLOBAL g-allow first? No — the exact
@@ -138,7 +142,7 @@ func TestMatchPoliciesResponseCarriesScopeAndID(t *testing.T) {
 		t.Errorf("global scope from-zone = %q, want trust", respGP.FromZone)
 	}
 	wantGID := ids[[2]uint32{uint32(len(cfg.Security.Policies)), 0}]
-	if respGP.PolicyId != wantGID {
-		t.Errorf("PolicyId = %d, want %d (global set runtime ID)", respGP.PolicyId, wantGID)
+	if respGP.GetPolicyId() != wantGID {
+		t.Errorf("PolicyId = %d, want %d (global set runtime ID)", respGP.GetPolicyId(), wantGID)
 	}
 }

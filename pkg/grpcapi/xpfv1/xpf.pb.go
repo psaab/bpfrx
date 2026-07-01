@@ -2320,8 +2320,17 @@ type PolicyRule struct {
 	// policy ID (matches the ID events expose); rule_id is the stable
 	// "<from>-><to>/<name>" string the snapshot carries. They let automation join
 	// a runtime event (policy_id=N) back to this inventory row.
-	PolicyId      uint32 `protobuf:"varint,17,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
-	RuleId        string `protobuf:"bytes,18,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
+	//
+	// #3623: proto3 EXPLICIT PRESENCE. The first rule of the first zone-pair set
+	// has runtime id 0 (policySetID*MaxRulesPerPolicy + ruleIndex = 0*256 + 0),
+	// and since #3057 the implicit default policy uses a distinct sentinel
+	// (0xFFFFFFFF), so id 0 is UNAMBIGUOUSLY a real policy. A bare proto3 scalar
+	// omits the zero value on the wire, so a generic JSON/proto client could not
+	// distinguish "first policy, id 0" from "field unset" and dropped the join
+	// key for the highest-priority rule. `optional` restores presence: the
+	// inventory always sets policy_id, so it is always present (even at 0).
+	PolicyId      *uint32 `protobuf:"varint,17,opt,name=policy_id,json=policyId,proto3,oneof" json:"policy_id,omitempty"`
+	RuleId        string  `protobuf:"bytes,18,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2469,8 +2478,8 @@ func (x *PolicyRule) GetLogSessionClose() bool {
 }
 
 func (x *PolicyRule) GetPolicyId() uint32 {
-	if x != nil {
-		return x.PolicyId
+	if x != nil && x.PolicyId != nil {
+		return *x.PolicyId
 	}
 	return 0
 }
@@ -6453,7 +6462,13 @@ type MatchPoliciesResponse struct {
 	// matched policy (#3331), so a match-policies answer can be cross-referenced
 	// against the session table and the policy-deny/permit audit log even when
 	// policy names collide across scopes. Set only when matched is true.
-	PolicyId uint32 `protobuf:"varint,11,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	//
+	// #3623: proto3 EXPLICIT PRESENCE. The first zone-pair set's first rule has
+	// runtime id 0, which a bare proto3 scalar omits on the wire — making a
+	// matched-first-policy answer indistinguishable from an unmatched one (both
+	// absent/0). `optional` sets the field only on a match, so its presence means
+	// "matched with this id" (present even at 0) and its absence means "no id".
+	PolicyId *uint32 `protobuf:"varint,11,opt,name=policy_id,json=policyId,proto3,oneof" json:"policy_id,omitempty"`
 	// default_used is true when no policy matched and `action` is the configured
 	// default-policy verdict (#3375), including the no-active-config fail-closed
 	// case (deny). It is the typed form of the " (default)" suffix on `action`,
@@ -6566,8 +6581,8 @@ func (x *MatchPoliciesResponse) GetToZone() string {
 }
 
 func (x *MatchPoliciesResponse) GetPolicyId() uint32 {
-	if x != nil {
-		return x.PolicyId
+	if x != nil && x.PolicyId != nil {
+		return *x.PolicyId
 	}
 	return 0
 }
@@ -7761,7 +7776,7 @@ const file_xpf_proto_rawDesc = "" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12(\n" +
-	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\x80\x05\n" +
+	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\x93\x05\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -7781,9 +7796,11 @@ const file_xpf_proto_rawDesc = "" +
 	"\x17source_address_excluded\x18\r \x01(\bR\x15sourceAddressExcluded\x12@\n" +
 	"\x1cdestination_address_excluded\x18\x0e \x01(\bR\x1adestinationAddressExcluded\x12(\n" +
 	"\x10log_session_init\x18\x0f \x01(\bR\x0elogSessionInit\x12*\n" +
-	"\x11log_session_close\x18\x10 \x01(\bR\x0flogSessionClose\x12\x1b\n" +
-	"\tpolicy_id\x18\x11 \x01(\rR\bpolicyId\x12\x17\n" +
-	"\arule_id\x18\x12 \x01(\tR\x06ruleId\"\x9e\x04\n" +
+	"\x11log_session_close\x18\x10 \x01(\bR\x0flogSessionClose\x12 \n" +
+	"\tpolicy_id\x18\x11 \x01(\rH\x00R\bpolicyId\x88\x01\x01\x12\x17\n" +
+	"\arule_id\x18\x12 \x01(\tR\x06ruleIdB\f\n" +
+	"\n" +
+	"_policy_id\"\x9e\x04\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +
@@ -8103,7 +8120,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\x9c\x03\n" +
+	"_icmp_code\"\xaf\x03\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -8116,9 +8133,11 @@ const file_xpf_proto_rawDesc = "" +
 	"\x06global\x18\b \x01(\bR\x06global\x12\x1b\n" +
 	"\tfrom_zone\x18\t \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\n" +
-	" \x01(\tR\x06toZone\x12\x1b\n" +
-	"\tpolicy_id\x18\v \x01(\rR\bpolicyId\x12!\n" +
-	"\fdefault_used\x18\f \x01(\bR\vdefaultUsed\"N\n" +
+	" \x01(\tR\x06toZone\x12 \n" +
+	"\tpolicy_id\x18\v \x01(\rH\x00R\bpolicyId\x88\x01\x01\x12!\n" +
+	"\fdefault_used\x18\f \x01(\bR\vdefaultUsedB\f\n" +
+	"\n" +
+	"_policy_id\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
 	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +
@@ -8552,7 +8571,9 @@ func file_xpf_proto_init() {
 	if File_xpf_proto != nil {
 		return
 	}
+	file_xpf_proto_msgTypes[42].OneofWrappers = []any{}
 	file_xpf_proto_msgTypes[102].OneofWrappers = []any{}
+	file_xpf_proto_msgTypes[103].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

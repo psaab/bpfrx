@@ -16,6 +16,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // buildInterfacesInput gathers cluster interface data for FormatInterfaces.
@@ -242,12 +243,16 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		}, nil
 	}
 	return &pb.MatchPoliciesResponse{
-		Matched:      true,
-		PolicyName:   res.PolicyName,
-		Global:       res.Global,
-		FromZone:     res.FromZone,
-		ToZone:       res.ToZone,
-		PolicyId:     res.PolicyID,
+		Matched:    true,
+		PolicyName: res.PolicyName,
+		Global:     res.Global,
+		FromZone:   res.FromZone,
+		ToZone:     res.ToZone,
+		// #3623: proto3 explicit presence — set only on a match, so a matched
+		// first policy (runtime id 0) is distinguishable on the wire from an
+		// unmatched response (field absent). The two early returns above leave
+		// PolicyId unset for the unmatched / host-inbound cases.
+		PolicyId:     proto.Uint32(res.PolicyID),
 		Action:       res.DisplayAction(),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,

@@ -177,9 +177,15 @@ type PolicyRule struct {
 	// span-accumulated runtime/RT_FLOW policy ID (the value events expose);
 	// RuleID is the stable "<from>-><to>/<name>" string the snapshot carries.
 	// Together they let automation join a runtime event (policy_id=N) back to
-	// this inventory row. PolicyID is omitted when 0 (the first rule of the
-	// first zone-pair set); RuleID is always populated.
-	PolicyID uint32 `json:"policy_id,omitempty"`
+	// this inventory row. RuleID is always populated.
+	//
+	// #3623: NO omitempty. The first rule of the first zone-pair set has runtime
+	// id 0, and since #3057 the implicit default policy uses a distinct sentinel
+	// (0xFFFFFFFF), so id 0 is UNAMBIGUOUSLY a real policy. With omitempty the
+	// first, highest-priority rule's policy_id was dropped from the JSON, so a
+	// consumer joining an RT_FLOW event (policy_id=0) found no matching row. The
+	// inventory always sets PolicyID, so it is always emitted (including 0).
+	PolicyID uint32 `json:"policy_id"`
 	RuleID   string `json:"rule_id,omitempty"`
 }
 
@@ -435,7 +441,13 @@ type MatchPoliciesResult struct {
 	// matched policy (#3331), so a match-policies answer can be cross-referenced
 	// against the session table and the policy-deny/permit audit log even when
 	// policy names collide across scopes. Present only when matched.
-	PolicyID     uint32   `json:"policy_id,omitempty"`
+	//
+	// #3623: pointer with explicit presence. The first zone-pair set's first
+	// rule has runtime id 0; a plain uint32+omitempty dropped it, making a
+	// matched-first-policy answer look unmatched (both encoded as absent/0). A
+	// *uint32 is set only on a match, so its presence means "matched with this
+	// id" (emitted even at 0) and nil (omitted) means "no matched id".
+	PolicyID     *uint32  `json:"policy_id,omitempty"`
 	Action       string   `json:"action"`
 	SrcAddresses []string `json:"src_addresses,omitempty"`
 	DstAddresses []string `json:"dst_addresses,omitempty"`

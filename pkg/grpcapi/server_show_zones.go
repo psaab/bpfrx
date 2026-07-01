@@ -6,6 +6,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -157,8 +158,11 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				// collapsed `log` bool hides.
 				LogSessionInit:  rule.Log != nil && rule.Log.SessionInit,
 				LogSessionClose: rule.Log != nil && rule.Log.SessionClose,
-				// #3336: runtime identity for event correlation.
-				PolicyId: dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
+				// #3336: runtime identity for event correlation. #3623: proto3
+				// explicit presence — the first zone-pair set's first rule has id
+				// 0, which a bare scalar would omit on the wire; always set it so
+				// the join key survives even at 0.
+				PolicyId: proto.Uint32(dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i))),
 				RuleId:   dpuserspace.StablePolicyRuleID(zpp.FromZone, zpp.ToZone, rule.Name),
 			}
 			if pr.SrcAddresses == nil {
@@ -226,8 +230,9 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				DestinationAddressExcluded: rule.Match.DestinationAddressExcluded,
 				LogSessionInit:             rule.Log != nil && rule.Log.SessionInit,
 				LogSessionClose:            rule.Log != nil && rule.Log.SessionClose,
-				PolicyId:                   dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
-				RuleId:                     dpuserspace.StablePolicyRuleID("junos-global", "junos-global", rule.Name),
+				// #3623: proto3 explicit presence for the runtime id (see above).
+				PolicyId: proto.Uint32(dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i))),
+				RuleId:   dpuserspace.StablePolicyRuleID("junos-global", "junos-global", rule.Name),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}
@@ -268,8 +273,9 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			SrcAddresses: []string{},
 			DstAddresses: []string{},
 			Applications: []string{},
-			PolicyId:     dataplane.DefaultPolicySentinelID,
-			RuleId:       dataplane.DefaultPolicyName,
+			// #3623: presence-wrapped; the default row always carries the sentinel.
+			PolicyId: proto.Uint32(dataplane.DefaultPolicySentinelID),
+			RuleId:   dataplane.DefaultPolicyName,
 		}
 		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
 			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
