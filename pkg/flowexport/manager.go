@@ -205,7 +205,18 @@ func collectInstanceVersionCollectors(inst *config.SamplingInstance, version str
 				// IPv6 flow collectors never dial (#2183).
 				addr = net.JoinHostPort(fs.Address, strconv.Itoa(fs.Port))
 			}
-			srcAddr := fam.SourceAddress
+			// Effective per-collector source-address (#3745): a
+			// flow-server-nested source-address (fs.SourceAddress) is the
+			// per-collector override and wins; else the family output-level
+			// default (fam.SourceAddress); else the inline-jflow default.
+			// Resolving here — instead of applying one family-wide value to
+			// every collector — lets two same-family collectors each bind
+			// their own configured source (the pre-#3745 last-writer-wins
+			// bug bound all collectors to the last nested source).
+			srcAddr := fs.SourceAddress
+			if srcAddr == "" {
+				srcAddr = fam.SourceAddress
+			}
 			if srcAddr == "" {
 				srcAddr = fam.InlineJflowSourceAddress
 			}
