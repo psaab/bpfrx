@@ -131,6 +131,17 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	// automation can join a policy_id back to a rule. The raw ordinal stays the
 	// counter handle below.
 	runtimeIDs := dpuserspace.RuntimePolicyIDs(cfg)
+	// #3624: live per-scheduler active-state, the same view the #3062 text
+	// policy-detail surface uses (cli_show_security.go / server_show_policies_
+	// text.go). haveSched gates the lookup: when the accessor is not wired or
+	// returns ok=false (early boot / NoDataplane) the inventory reports every
+	// rule active (inactive=false), matching the text surface's fail-open
+	// display rather than the fail-closed match-policies simulator (#3414).
+	var schedActive map[string]bool
+	var haveSched bool
+	if s.policySchedActiveFn != nil {
+		schedActive, haveSched = s.policySchedActiveFn()
+	}
 	var policySetID uint32
 	var result []PolicyInfo
 	for _, zpp := range cfg.Security.Policies {
@@ -175,6 +186,10 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				LogSessionClose:            rule.Log != nil && rule.Log.SessionClose,
 				PolicyID:                   dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
 				RuleID:                     dpuserspace.StablePolicyRuleID(zpp.FromZone, zpp.ToZone, rule.Name),
+				// #3624: scheduler binding + runtime scheduler state, mirroring
+				// the #3062 text detail (Scheduler: line + State: inactive).
+				SchedulerName: rule.SchedulerName,
+				Inactive:      haveSched && dpuserspace.PolicyInactive(rule.SchedulerName, schedActive),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}
@@ -259,6 +274,9 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				LogSessionClose:            rule.Log != nil && rule.Log.SessionClose,
 				PolicyID:                   dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
 				RuleID:                     dpuserspace.StablePolicyRuleID("junos-global", "junos-global", rule.Name),
+				// #3624: scheduler binding + runtime scheduler state (see above).
+				SchedulerName: rule.SchedulerName,
+				Inactive:      haveSched && dpuserspace.PolicyInactive(rule.SchedulerName, schedActive),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}

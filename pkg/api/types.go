@@ -187,6 +187,21 @@ type PolicyRule struct {
 	// inventory always sets PolicyID, so it is always emitted (including 0).
 	PolicyID uint32 `json:"policy_id"`
 	RuleID   string `json:"rule_id,omitempty"`
+	// SchedulerName / Inactive expose the policy's scheduler binding and its
+	// runtime scheduler state (#3624), the structured sibling of the #3062
+	// TEXT policy-detail surface (State: inactive + Scheduler: lines).
+	// SchedulerName is the configured `scheduler-name` (empty for an
+	// always-on rule). Inactive is true when the policy is bound to a
+	// scheduler that is currently runtime-inactive — the dataplane is
+	// skipping the rule right now — mirroring the text "State: inactive"
+	// token. Without these an audit reads a time-gated, currently-dormant
+	// permit/deny as an active allow/deny, disagreeing with effective
+	// dataplane behavior. Both omitempty: empty/false for the common
+	// always-on rule, and (like the text surface) Inactive stays false when
+	// live scheduler state cannot be queried, so existing consumers see no
+	// change.
+	SchedulerName string `json:"scheduler_name,omitempty"`
+	Inactive      bool   `json:"inactive,omitempty"`
 }
 
 // SessionEntry holds a single session table entry.
