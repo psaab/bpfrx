@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -283,5 +284,167 @@ func TestPublishRouteOverlaySnapshotWithoutHelper(t *testing.T) {
 	got := m.routeOverlaySnapshot()
 	if len(got) != 1 || got[0].NextHop != "172.16.80.1" {
 		t.Fatalf("overlay not cached: %+v", got)
+	}
+}
+
+// overlayControlServerToggle behaves like overlayControlServer but its
+// apply_snapshot handling can be flipped to fail (OK:false) via the
+// returned setter, so a publish failure can be exercised. All requests
+// are still forwarded on the returned channel.
+func overlayControlServerToggle(t *testing.T, dir string) (string, chan ControlRequest, func(bool)) {
+	t.Helper()
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	reqCh := make(chan ControlRequest, 8)
+	var mu sync.Mutex
+	fail := false
+	setFail := func(f bool) {
+		mu.Lock()
+		fail = f
+		mu.Unlock()
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req ControlRequest
+			if err := json.NewDecoder(conn).Decode(&req); err == nil {
+				reqCh <- req
+				mu.Lock()
+				failNow := fail
+				mu.Unlock()
+				if failNow && req.Type == "apply_snapshot" {
+					_ = json.NewEncoder(conn).Encode(ControlResponse{
+						OK:    false,
+						Error: "simulated apply_snapshot failure",
+					})
+				} else {
+					gen := uint64(0)
+					fib := uint32(0)
+					if req.Snapshot != nil {
+						gen = req.Snapshot.Generation
+						fib = req.Snapshot.FIBGeneration
+					}
+					_ = json.NewEncoder(conn).Encode(ControlResponse{
+						OK: true,
+						Status: &ProcessStatus{
+							Enabled:                true,
+							LastSnapshotGeneration: gen,
+							LastFIBGeneration:      fib,
+						},
+					})
+				}
+			}
+			conn.Close()
+		}
+	}()
+	return controlSock, reqCh, setFail
+}
+
+// TestPublishRouteOverlaySnapshotFailureKeepsBaseline is the #3760
+// regression: a failed apply_snapshot must NOT advance the cached
+// desired overlay. Before the fix, m.routeOverlay was assigned at the
+// top of PublishRouteOverlaySnapshot, so a helper rejection left the
+// cache recording an overlay the dataplane never accepted. A later full
+// apply reads that cache (routeOverlaySnapshot) and rebuilds routes
+// against the never-published overlay — the cache lies about what is
+// live, and the desired-vs-applied observability is defeated.
+//
+// RED-on-revert: reverting the mutate-after-success fix makes the cache
+// advance to the failed overlay B, so assertions (a)/(b) below fail.
+func TestPublishRouteOverlaySnapshotFailureKeepsBaseline(t *testing.T) {
+	dir := t.TempDir()
+	controlSock, reqCh, setFail := overlayControlServerToggle(t, dir)
+
+	cfg := overlayTestConfig()
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+	m.cfg.ControlSocket = controlSock
+	m.generation = 7
+	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
+		m.lastSnapshotHash = h
+	}
+	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
+
+	// Establish a real applied baseline: publish overlay A successfully.
+	overlayA := []config.RouteOverlayEntry{
+		{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
+	}
+	published, err := m.PublishRouteOverlaySnapshot(cfg, overlayA, nil)
+	if err != nil || !published {
+		t.Fatalf("baseline publish: published=%v err=%v", published, err)
+	}
+	<-reqCh // drain the baseline apply_snapshot
+	genAfterBaseline := m.generation
+
+	// The helper now rejects the next apply_snapshot. Publishing overlay B
+	// must fail AND leave the cache at the last-applied baseline A.
+	setFail(true)
+	overlayB := []config.RouteOverlayEntry{
+		{Destination: "0.0.0.0/0", NextHop: "172.16.80.2", Policy: "wan-failover"},
+	}
+	published, err = m.PublishRouteOverlaySnapshot(cfg, overlayB, nil)
+	if err == nil {
+		t.Fatal("expected publish failure, got nil error")
+	}
+	if published {
+		t.Fatal("failed publish reported published=true")
+	}
+	<-reqCh // drain the rejected apply_snapshot attempt
+
+	// (a) The cached desired overlay must still be A: the never-applied B
+	//     must not have advanced the cache (the #3760 divergence).
+	got := m.routeOverlaySnapshot()
+	if len(got) != 1 || got[0].NextHop != "172.16.80.1" {
+		t.Fatalf("cache advanced to the unpublished overlay after a failed publish: %+v (want last-applied A 172.16.80.1)", got)
+	}
+	// The generation must not have advanced on a failed publish.
+	if m.generation != genAfterBaseline {
+		t.Fatalf("generation advanced on a failed publish: %d -> %d", genAfterBaseline, m.generation)
+	}
+
+	// (b) A full apply reads the cached overlay; it must rebuild A's route,
+	//     matching what the dataplane actually has — NOT the failed B.
+	snap, _ := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 9, 0, nil, m.routeOverlaySnapshot(), m.feedSnapshotOverlay())
+	for _, r := range snap.Routes {
+		if r.Table == "inet.0" && r.Destination == "0.0.0.0/0" {
+			if len(r.NextHops) != 1 || r.NextHops[0] != "172.16.80.1" {
+				t.Fatalf("full apply rebuilt routes from the unpublished overlay: %+v (want A 172.16.80.1)", r.NextHops)
+			}
+		}
+	}
+
+	// (c) With the helper healthy again, the next attempt re-publishes the
+	//     change B, because the cache is still at baseline A and the
+	//     content hash differs from the last-published snapshot. If the
+	//     failed publish had advanced the cache, a full-apply diff could
+	//     suppress B as "already published".
+	setFail(false)
+	published, err = m.PublishRouteOverlaySnapshot(cfg, overlayB, nil)
+	if err != nil {
+		t.Fatalf("retry publish after recovery: %v", err)
+	}
+	if !published {
+		t.Fatal("retry after recovery did not re-publish the change")
+	}
+	select {
+	case req := <-reqCh:
+		if req.Type != "apply_snapshot" {
+			t.Fatalf("retry request = %q, want apply_snapshot", req.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry did not publish an apply_snapshot")
+	}
+	// The cache has now advanced exactly once, to B.
+	got = m.routeOverlaySnapshot()
+	if len(got) != 1 || got[0].NextHop != "172.16.80.2" {
+		t.Fatalf("cache did not advance to B after a successful retry: %+v", got)
 	}
 }

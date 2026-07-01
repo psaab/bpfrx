@@ -551,7 +551,15 @@ routing, and only on double fault).
   is autonomous and does not wait for an unrelated commit, lease, or
   probe transition. The dirty bit clears only after a fully consistent
   actuation, and a change that lands mid-actuation is preserved
-  (last-writer-wins).
+  (last-writer-wins). The manager's cached desired overlay
+  (`m.routeOverlay`, read by every full snapshot build) is advanced
+  **only after `apply_snapshot` succeeds** (#3760, mutate-after-success
+  like #3766/#3742): a rejected publish leaves the cache at the
+  last-applied overlay, so the retry above rebuilds the same routes, sees
+  a content-hash mismatch against the still-old published snapshot, and
+  re-publishes — the cache never records an overlay the dataplane never
+  accepted, and a full apply during the dirty window rebuilds routes that
+  match what is actually live rather than the failed target.
 - **Per-cycle transition evaluation (#2527).** An RPM test's pass/fail
   status is a per-test aggregate, evaluated once across the whole probe
   set (`probe-count` probes per cycle), Junos ip-monitoring style. The

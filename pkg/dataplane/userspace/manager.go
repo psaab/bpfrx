@@ -954,7 +954,26 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.routeOverlay = cloneRouteOverlay(overlay)
+	// #3760: do NOT advance the cached desired overlay before the publish
+	// is known not to have failed. buildRouteSnapshots below builds
+	// against this local copy; m.routeOverlay is committed only on a
+	// non-error return (deferred commit). A failed apply_snapshot
+	// therefore leaves m.routeOverlay at the last-applied baseline, so
+	// the next actuator sweep rebuilds the same new routes, sees a hash
+	// mismatch against the still-old lastSnapshotHash, and re-publishes
+	// (#3757 dirty-retry contract). Mirrors the mutate-after-success
+	// pattern (#3766/#3742/#3757): the cache never records an overlay the
+	// dataplane never accepted. The nil-error early returns below
+	// (no published snapshot yet, helper not running) still commit the
+	// overlay so the next full apply carries it; the duplicate-skip
+	// return commits a content-equivalent overlay.
+	desiredOverlay := cloneRouteOverlay(overlay)
+	defer func() {
+		if err == nil {
+			m.routeOverlay = desiredOverlay
+		}
+	}()
+
 	if schedulerState != nil {
 		m.policySchedulerActive = copyPolicySchedulerActiveState(schedulerState)
 	}
@@ -966,8 +985,8 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 		cfg = m.lastSnapshot.Config
 	}
 	if cfg == nil || m.lastSnapshot == nil {
-		// No published snapshot yet: the overlay is cached and the
-		// next full apply will carry it.
+		// No published snapshot yet: the overlay is cached (deferred
+		// commit) and the next full apply will carry it.
 		return false, nil
 	}
 	if m.proc == nil || m.proc.Process == nil {
@@ -988,7 +1007,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	next.FIBGeneration = m.readFIBGeneration()
 	next.GeneratedAt = time.Now().UTC()
 	next.Config = cfg
-	next.Routes = buildRouteSnapshots(cfg, next.Interfaces, m.routeOverlay)
+	next.Routes = buildRouteSnapshots(cfg, next.Interfaces, desiredOverlay)
 
 	// Duplicate-publish skip: identical content (e.g. the actuator ran
 	// twice for the same overlay) does not need a control-socket
@@ -1024,7 +1043,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 		slog.Warn("userspace: failed to sync helper status after route overlay publish", "err", err)
 	}
 	slog.Info("userspace: route overlay snapshot published",
-		"generation", next.Generation, "overlay_routes", len(m.routeOverlay))
+		"generation", next.Generation, "overlay_routes", len(desiredOverlay))
 	return true, nil
 }
 
