@@ -197,12 +197,17 @@ type Daemon struct {
 	// #2461: one exporter per per-flow-server template group, so a
 	// collector receives the template it referenced (was a single exporter
 	// using the first map-iteration template for every collector).
-	flowExporters  []*flowexport.Exporter
-	flowCancel     context.CancelFunc
-	flowWg         sync.WaitGroup
+	flowExporters []*flowexport.Exporter
+	flowCancel    context.CancelFunc
+	// #3742: flowWg/ipfixWg are POINTERS so a build-before-swap reconcile
+	// can start the new generation on a FRESH WaitGroup while the old
+	// generation is waited on separately during teardown. A value field
+	// cannot be handed off (a WaitGroup must not be copied). nil == no
+	// generation running.
+	flowWg         *sync.WaitGroup
 	ipfixExporters []*flowexport.IPFIXExporter
 	ipfixCancel    context.CancelFunc
-	ipfixWg        sync.WaitGroup
+	ipfixWg        *sync.WaitGroup
 	// #2075 flowexport reconcile state. The bundle pointers carry the
 	// live (exporter, resolved-config) pair read lock-free by the
 	// once-registered session-close callbacks; reconcile swaps them
@@ -211,16 +216,22 @@ type Daemon struct {
 	// bools distinguish "never reconciled" from "reconciled to the
 	// nil sentinel". The *ReconMu serialize the reconcile swap against
 	// shutdown's stopFlow/IPFIXExporter (both touch the cancel/wg).
-	flowBundle                atomic.Pointer[exporterBundle]
-	flowHash                  [32]byte
-	flowHashSet               bool
-	flowCBOnce                sync.Once
-	flowReconMu               sync.Mutex
+	flowBundle  atomic.Pointer[exporterBundle]
+	flowHash    [32]byte
+	flowHashSet bool
+	flowCBOnce  sync.Once
+	flowReconMu sync.Mutex
+	// #3742: last NetFlow v9 exporter build error. Set (under flowReconMu)
+	// when a reconcile's NewExporter build failed and the OLD exporters were
+	// kept running so export stayed up; cleared on the next successful
+	// reconcile. Surfaced via FlowExportError().
+	flowExportErr             error
 	ipfixBundlePtr            atomic.Pointer[ipfixBundle]
 	ipfixHash                 [32]byte
 	ipfixHashSet              bool
 	ipfixCBOnce               sync.Once
 	ipfixReconMu              sync.Mutex
+	ipfixExportErr            error
 	dhcpRelay                 *dhcprelay.Manager
 	snmpAgent                 *snmp.Agent
 	lldpMgr                   *lldp.Manager

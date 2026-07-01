@@ -38,6 +38,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/flowexport"
@@ -177,22 +178,16 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 
 	wasRunning := len(d.flowExporters) > 0
 
-	// Stop the old exporters (if any). The session-close callback reads
-	// the bundle lock-free; we publish the new bundle as one atomic
-	// pointer, so a concurrent read sees either the old or new set.
-	if d.flowCancel != nil {
-		d.flowCancel()
-		d.flowWg.Wait()
-		for _, exp := range d.flowExporters {
-			exp.Close()
-		}
-		d.flowExporters = nil
-		d.flowCancel = nil
-	}
-
+	// Removal path: no new exporters to build. Swap the published bundle to
+	// EMPTY first so the session-close callback can no longer queue a record
+	// into an exporter we are about to close, THEN cancel + wait + close the
+	// old set. (#3742: never leave a window where the bundle points at a
+	// stopped exporter.)
 	if len(ecs) == 0 {
 		d.flowBundle.Store(&exporterBundle{})
+		d.teardownV9Locked()
 		d.flowHash, d.flowHashSet = h, true
+		d.flowExportErr = nil
 		if !wasRunning {
 			// Nothing was running and nothing starts: record the hash so
 			// later identical commits gate, but report no change.
@@ -202,55 +197,123 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 		return true
 	}
 
+	// #3742 build-before-swap: construct the FULL replacement set BEFORE
+	// touching the running exporters. NewExporter -> dialCollectors can fail
+	// transiently (a pinned source-address bind before the source interface
+	// is up, transient collector DNS). Building first means such a failure
+	// leaves the OLD exporters running — export stays UP — instead of
+	// tearing the healthy set down and disabling export until the next
+	// commit (the availability half of #3742).
 	flowCtx, cancel := context.WithCancel(d.daemonCtx)
 	groups := make([]v9Group, 0, len(ecs))
 	exps := make([]*flowexport.Exporter, 0, len(ecs))
 	for _, ec := range ecs {
 		exp, err := flowexport.NewExporter(ec)
 		if err != nil {
-			slog.Warn("failed to create flow exporter", "template", ec.TemplateName, "err", err)
-			// Roll back the group exporters started so far and do NOT
-			// record the hash: NewExporter -> dialCollectors can fail
-			// transiently (a pinned source-address bind before the source
-			// interface is up, transient collector DNS). Leaving
-			// flowHashSet false means the NEXT commit (even an identical
+			slog.Warn("failed to create flow exporter; keeping existing exporters running",
+				"template", ec.TemplateName, "err", err)
+			// Roll back ONLY the partially-built NEW set. Do NOT touch the
+			// old exporters or the published bundle (export stays up), and
+			// do NOT record the hash so the NEXT commit (even an identical
 			// one) retries instead of being hash-gated into a permanently-
-			// dead family. NewExporter is cheap, so the retry is safe; the
-			// gate re-arms on the first fully-successful start.
+			// dead family. Surface the error for observability.
 			cancel()
 			for _, e := range exps {
 				e.Close()
 			}
-			d.flowBundle.Store(&exporterBundle{})
+			if !wasRunning {
+				// Nothing was running: publish the well-defined empty
+				// bundle so the callback sees a valid (empty) set rather
+				// than the zero pointer. When old exporters WERE running we
+				// leave the published bundle untouched so export stays up.
+				d.flowBundle.Store(&exporterBundle{})
+			}
 			d.flowHashSet = false
+			d.flowExportErr = err
 			return true
 		}
 		exps = append(exps, exp)
 		groups = append(groups, v9Group{exp: exp, ec: ec})
 	}
 
-	d.flowExporters = exps
-	d.flowCancel = cancel
-	d.flowBundle.Store(&exporterBundle{groups: groups})
-
+	// The new set built cleanly. Register the stable indirection callback
+	// once and start the new Run goroutines on a FRESH WaitGroup (the old
+	// generation is waited on separately during teardown below).
 	d.flowCBOnce.Do(func() {
 		d.eventReader.AddCallback(d.flowExportCallback)
 	})
 
+	newWg := &sync.WaitGroup{}
 	for _, exp := range exps {
-		d.flowWg.Add(1)
+		newWg.Add(1)
 		go func(e *flowexport.Exporter) {
-			defer d.flowWg.Done()
+			defer newWg.Done()
 			e.Run(flowCtx)
 		}(exp)
 	}
 
+	// Capture the old generation, install the new one, and publish the new
+	// bundle BEFORE tearing the old set down. The bundle therefore always
+	// points at a live, flushing exporter — a session-close callback is
+	// never dropped across the swap (#3742): before the swap it drains into
+	// the still-running old exporter (which flushes on cancel below); after
+	// it drains into the new one.
+	oldCancel := d.flowCancel
+	oldWg := d.flowWg
+	oldExps := d.flowExporters
+
+	d.flowExporters = exps
+	d.flowCancel = cancel
+	d.flowWg = newWg
+	d.flowBundle.Store(&exporterBundle{groups: groups})
+
+	if oldCancel != nil {
+		oldCancel()
+		if oldWg != nil {
+			oldWg.Wait()
+		}
+		for _, e := range oldExps {
+			e.Close()
+		}
+	}
+
 	d.flowHash, d.flowHashSet = h, true
+	d.flowExportErr = nil
 	slog.Info("NetFlow v9 exporter reconciled",
 		"template_groups", len(ecs),
 		"sampling_zones", len(ecs[0].SamplingZones),
 		"sampling_rate", ecs[0].SamplingRate)
 	return true
+}
+
+// teardownV9Locked cancels, waits for, and closes the running NetFlow v9
+// exporter generation, clearing the daemon's per-generation handles. The
+// caller MUST hold flowReconMu and MUST unpublish d.flowBundle first (the
+// removal path swaps it to empty) so a session-close callback can no longer
+// queue into an exporter this tears down (#3742). Nil-safe / idempotent.
+func (d *Daemon) teardownV9Locked() {
+	if d.flowCancel != nil {
+		d.flowCancel()
+	}
+	if d.flowWg != nil {
+		d.flowWg.Wait()
+	}
+	for _, exp := range d.flowExporters {
+		exp.Close()
+	}
+	d.flowExporters = nil
+	d.flowCancel = nil
+	d.flowWg = nil
+}
+
+// FlowExportError returns the last NetFlow v9 exporter build error, or nil
+// when the exporters are healthy / not configured (#3742). It is set when a
+// reconcile's NewExporter build failed and the OLD exporters were kept
+// running so export stayed up, and cleared on the next successful reconcile.
+func (d *Daemon) FlowExportError() error {
+	d.flowReconMu.Lock()
+	defer d.flowReconMu.Unlock()
+	return d.flowExportErr
 }
 
 // reconcileIPFIXExporter reconciles the IPFIX template-group exporters.
@@ -266,19 +329,13 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 
 	wasRunning := len(d.ipfixExporters) > 0
 
-	if d.ipfixCancel != nil {
-		d.ipfixCancel()
-		d.ipfixWg.Wait()
-		for _, exp := range d.ipfixExporters {
-			exp.Close()
-		}
-		d.ipfixExporters = nil
-		d.ipfixCancel = nil
-	}
-
+	// Removal path: swap the published bundle to empty first, THEN tear the
+	// old set down (see the v9 path; #3742).
 	if len(ecs) == 0 {
 		d.ipfixBundlePtr.Store(&ipfixBundle{})
+		d.teardownIPFIXLocked()
 		d.ipfixHash, d.ipfixHashSet = h, true
+		d.ipfixExportErr = nil
 		if !wasRunning {
 			return false
 		}
@@ -286,48 +343,100 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 		return true
 	}
 
+	// #3742 build-before-swap: build the full new set first; on failure keep
+	// the OLD exporters running (export stays up) and surface the error.
 	ipfixCtx, cancel := context.WithCancel(d.daemonCtx)
 	groups := make([]ipfixGroup, 0, len(ecs))
 	exps := make([]*flowexport.IPFIXExporter, 0, len(ecs))
 	for _, ec := range ecs {
 		exp, err := flowexport.NewIPFIXExporter(ec)
 		if err != nil {
-			slog.Warn("failed to create IPFIX exporter", "template", ec.TemplateName, "err", err)
-			// Roll back and do NOT record the hash (see the v9 path).
+			slog.Warn("failed to create IPFIX exporter; keeping existing exporters running",
+				"template", ec.TemplateName, "err", err)
+			// Roll back ONLY the new set; leave the old exporters + bundle
+			// untouched and do NOT record the hash (see the v9 path).
 			cancel()
 			for _, e := range exps {
 				e.Close()
 			}
-			d.ipfixBundlePtr.Store(&ipfixBundle{})
+			if !wasRunning {
+				// See the v9 path: publish the empty bundle only when
+				// nothing was running; keep the old bundle otherwise.
+				d.ipfixBundlePtr.Store(&ipfixBundle{})
+			}
 			d.ipfixHashSet = false
+			d.ipfixExportErr = err
 			return true
 		}
 		exps = append(exps, exp)
 		groups = append(groups, ipfixGroup{exp: exp, ec: ec})
 	}
 
-	d.ipfixExporters = exps
-	d.ipfixCancel = cancel
-	d.ipfixBundlePtr.Store(&ipfixBundle{groups: groups})
-
 	d.ipfixCBOnce.Do(func() {
 		d.eventReader.AddCallback(d.ipfixExportCallback)
 	})
 
+	newWg := &sync.WaitGroup{}
 	for _, exp := range exps {
-		d.ipfixWg.Add(1)
+		newWg.Add(1)
 		go func(e *flowexport.IPFIXExporter) {
-			defer d.ipfixWg.Done()
+			defer newWg.Done()
 			e.Run(ipfixCtx)
 		}(exp)
 	}
 
+	// Publish the new bundle BEFORE tearing the old set down (#3742).
+	oldCancel := d.ipfixCancel
+	oldWg := d.ipfixWg
+	oldExps := d.ipfixExporters
+
+	d.ipfixExporters = exps
+	d.ipfixCancel = cancel
+	d.ipfixWg = newWg
+	d.ipfixBundlePtr.Store(&ipfixBundle{groups: groups})
+
+	if oldCancel != nil {
+		oldCancel()
+		if oldWg != nil {
+			oldWg.Wait()
+		}
+		for _, e := range oldExps {
+			e.Close()
+		}
+	}
+
 	d.ipfixHash, d.ipfixHashSet = h, true
+	d.ipfixExportErr = nil
 	slog.Info("IPFIX exporter reconciled",
 		"template_groups", len(ecs),
 		"sampling_zones", len(ecs[0].SamplingZones),
 		"sampling_rate", ecs[0].SamplingRate)
 	return true
+}
+
+// teardownIPFIXLocked is the IPFIX equivalent of teardownV9Locked. The
+// caller MUST hold ipfixReconMu and MUST unpublish d.ipfixBundlePtr first.
+func (d *Daemon) teardownIPFIXLocked() {
+	if d.ipfixCancel != nil {
+		d.ipfixCancel()
+	}
+	if d.ipfixWg != nil {
+		d.ipfixWg.Wait()
+	}
+	for _, exp := range d.ipfixExporters {
+		exp.Close()
+	}
+	d.ipfixExporters = nil
+	d.ipfixCancel = nil
+	d.ipfixWg = nil
+}
+
+// IPFIXExportError returns the last IPFIX exporter build error, or nil when
+// the exporters are healthy / not configured (#3742).
+func (d *Daemon) IPFIXExportError() error {
+	d.ipfixReconMu.Lock()
+	defer d.ipfixReconMu.Unlock()
+	return d.ipfixExportErr
 }
 
 // flowExportCallback is the single, stable NetFlow v9 session-close
