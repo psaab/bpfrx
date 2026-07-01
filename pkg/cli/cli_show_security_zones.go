@@ -8,35 +8,8 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
-
-// policyActionStr renders a config.PolicyAction as its Junos then-token. It
-// mirrors the gRPC/REST policyActionStr (pkg/grpcapi/server_helpers.go,
-// pkg/api/security.go) so the zone-detail global + default-policy tier lines
-// (#3658) agree with every other policy surface. A compiled policy always
-// carries a valid terminal action; "unknown" is the defensive default.
-func policyActionStr(a config.PolicyAction) string {
-	switch a {
-	case config.PolicyPermit:
-		return "permit"
-	case config.PolicyDeny:
-		return "deny"
-	case config.PolicyReject:
-		return "reject"
-	default:
-		return "unknown"
-	}
-}
-
-// globalZoneScopeLabel renders a global policy's optional from/to-zone match
-// scope (#3148) for the zone-detail summary: an empty scope is the "any zone"
-// wildcard and prints as "any".
-func globalZoneScopeLabel(zone string) string {
-	if zone == "" {
-		return "any"
-	}
-	return zone
-}
 
 func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone string) error {
 	// Sort zone names for stable output
@@ -175,62 +148,25 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 				}
 			}
 
-			// Policy detail breakdown. #3658 (M04/M05): the summary now spans
-			// all THREE tiers the runtime evaluates in order — zone-pair, then
+			// Policy detail breakdown. #3658 (M04/M05): the summary spans all
+			// THREE tiers the runtime evaluates in order — zone-pair, then
 			// applicable GLOBAL policies, then the effective default-policy
 			// catch-all — so a zone-centric audit can no longer hide a global
 			// rule that permits/denies the zone's traffic (M04) nor collapse to
 			// a bare "(no policies)" that obscures whether unmatched transit is
-			// denied or permitted (M05). Parity with the REST inventory
-			// (pkg/api/security.go global + synthetic default rows) and gRPC
-			// GetPolicies (#3363).
-			fmt.Println("  Policy summary (evaluation order: zone-pair, global, default-policy):")
-			zonePairPolicies := 0
-			for _, zpp := range cfg.Security.Policies {
-				// #3476: skip a nil zone-pair set (tolerant / HA-sync config
-				// path the runtime walker skips) rather than dereferencing
-				// zpp.FromZone.
-				if zpp == nil {
-					continue
-				}
-				if zpp.FromZone == name || zpp.ToZone == name {
-					for _, pol := range zpp.Policies {
-						// #3476: skip a nil rule rather than dereferencing
-						// pol.Action / pol.Name.
-						if pol == nil {
-							continue
-						}
-						fmt.Printf("    [zone-pair] %s -> %s: %s (%s)\n",
-							zpp.FromZone, zpp.ToZone, pol.Name,
-							policyActionStr(pol.Action))
-						zonePairPolicies++
-					}
-				}
+			// denied or permitted (M05). #3684: it now also threads the per-rule
+			// inventory metadata the name+action summary dropped — runtime
+			// policy id (M11), scheduler binding + runtime-inactive state
+			// (H03/#3624), log/count/address-exclusion modifiers (M12), and the
+			// default-policy log posture + sentinel id (M13). The rendering is
+			// delegated to policymatch.ZoneDetailPolicySummary, the SSOT shared
+			// with the gRPC-text renderer (L10) so the two surfaces cannot
+			// drift. Parity with the REST inventory (pkg/api/security.go) and
+			// gRPC GetPolicies (#3363).
+			schedActive, haveSched := c.policySchedulerActiveState()
+			for _, line := range policymatch.ZoneDetailPolicySummary(cfg, name, schedActive, haveSched) {
+				fmt.Println(line)
 			}
-			globalPolicies := 0
-			for _, gp := range cfg.Security.GlobalPolicies {
-				// #3476-style defensiveness: skip a nil global rule.
-				if gp == nil {
-					continue
-				}
-				if !config.GlobalPolicyAppliesToZone(gp.Match, name) {
-					continue
-				}
-				fmt.Printf("    [global] %s -> %s: %s (%s)\n",
-					globalZoneScopeLabel(gp.Match.FromZone),
-					globalZoneScopeLabel(gp.Match.ToZone),
-					gp.Name, policyActionStr(gp.Action))
-				globalPolicies++
-			}
-			if zonePairPolicies == 0 && globalPolicies == 0 {
-				fmt.Println("    (no zone-pair or global policies affecting this zone)")
-			}
-			// M05: always surface the effective default-policy catch-all — the
-			// tier the runtime falls through to for unmatched transit — instead
-			// of hiding it behind "(no policies)".
-			fmt.Printf("    [default] %s: %s\n",
-				dataplane.DefaultPolicyName,
-				policyActionStr(cfg.Security.DefaultPolicy))
 		}
 
 		fmt.Println()

@@ -67,17 +67,6 @@ func policyActionStr(a config.PolicyAction) string {
 	}
 }
 
-// globalZoneScopeLabel renders a global policy's optional from/to-zone match
-// scope (#3148) for the zone-detail summary (#3658): an empty scope is the
-// "any zone" wildcard and prints as "any". Mirrors the local-CLI peer helper
-// in pkg/cli/cli_show_security_zones.go.
-func globalZoneScopeLabel(zone string) string {
-	if zone == "" {
-		return "any"
-	}
-	return zone
-}
-
 // protoName renders an IP protocol number as its canonical lowercase name,
 // falling back to the numeric form for an unnamed protocol. The named set is
 // owned by appid.ProtocolName (the #2949 SSOT) so gRPC, REST, and the catalog
