@@ -25333,3 +25333,18 @@ top.
 - **Action**: Document the new response fields (M05/M06) and the gRPC-text global
   render (M04) in the API/gRPC references
 - **File(s)**: pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
+
+## 2026-07-01 — #3696 policy-simulator strict selector parser (fail-closed)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Add SSOT strict selector parser policymatch.ParseSelectorArgs +
+  SelectorArgs (+ .Query()); route all four CLI surfaces through it; harden the
+  gRPC ShowText test-policy bridge. A value-taking selector present without a
+  value, an unknown selector token, and an explicit-empty typed value are now
+  HARD ERRORS instead of silently widening the query to the wildcard. Value
+  validation (ParsePort/ParseICMPValue/ValidateProtocol/net.IP) folded into the
+  parser so the redundant per-surface checks are removed. Usage text (#3628
+  SSOT tail) documents the strict failure (M08).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, cmd/cli/show.go, cmd/cli/main.go,
+  pkg/grpcapi/server_show_firewall.go, _Log.md

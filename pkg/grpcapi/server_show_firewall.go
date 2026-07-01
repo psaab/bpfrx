@@ -176,57 +176,89 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var srcPort, dstPort int
 	var icmpType, icmpCode *uint8
-	var srcPortErr, portErr, protoErr, icmpTypeErr, icmpCodeErr error
-	for _, kv := range strings.Split(params, ",") {
-		parts := strings.SplitN(kv, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		switch parts[0] {
-		case "from":
-			fromZone = parts[1]
-		case "to":
-			toZone = parts[1]
-		case "src":
-			srcIP = parts[1]
-		case "dst":
-			dstIP = parts[1]
-		case "srcport":
-			// #3107: a source-port constraint must thread into the shared
-			// matcher's Query.SrcPort term (previously inexpressible from the
-			// CLI `test policy` topic, overmatching source-port-constrained
-			// applications). Validate via the shared helper (#3116) so a
-			// malformed/out-of-range value reports an error instead of
-			// silently coercing to the 0 "any port" wildcard.
-			srcPort, srcPortErr = policymatch.ParsePort(parts[1])
-		case "port":
-			// #3116: a malformed/out-of-range port must NOT silently coerce to
-			// the 0 "any port" wildcard (the shared matcher gates the port term
-			// on dstPort > 0), which would yield a verdict for a packet that
-			// cannot exist. Route through the shared validator and report the
-			// error the way a bad src/dst is reported below.
-			dstPort, portErr = policymatch.ParsePort(parts[1])
-		case "proto":
-			// #3108: a non-empty but unknown/out-of-range protocol token must
-			// NOT silently coerce to the empty "any protocol" wildcard (the
-			// shared matcher's matchApp short-circuits to match-any for an
-			// unresolvable protocol), which would yield a verdict for traffic
-			// that cannot exist. Validate via the shared helper and report the
-			// error the way a bad port/src is reported below.
-			proto = parts[1]
-			protoErr = policymatch.ValidateProtocol(proto)
-		case "ictype":
-			// #3284: ICMP/ICMPv6 type so a type-constrained application term
-			// (junos-ping = type 8) is honored. Empty is unspecified (the term
-			// fails closed); a malformed/out-of-range value errors.
-			icmpType, icmpTypeErr = policymatch.ParseICMPValue(parts[1])
-		case "iccode":
-			icmpCode, icmpCodeErr = policymatch.ParseICMPValue(parts[1])
+	var srcPortErr, portErr, protoErr, icmpTypeErr, icmpCodeErr, parseErr error
+	// #3696: fail CLOSED on malformed selector grammar, the server-boundary
+	// sibling of the strict CLI parser (policymatch.ParseSelectorArgs). The old
+	// `if len(parts) != 2 { continue }` silently DROPPED any comma segment
+	// lacking a `key=value` — `...,port` left dstPort at the 0 wildcard and the
+	// simulator evaluated ALL ports — and the switch had no default arm, so an
+	// unknown key (`prot=tcp`) was ignored, leaving proto empty (any protocol).
+	// An explicit-empty typed value (`port=`) was likewise treated as omitted
+	// because ParsePort("") returns (0, nil), so the handler could not tell
+	// "key absent" (legit wildcard) from "key present, empty value" (malformed).
+	// A malformed segment, an unknown key, or an empty value is now a reported
+	// error, distinguishing key-absent from key-empty (M01). An entirely empty
+	// param string (bare `test-policy:`) still falls through to the
+	// missing-from/to-zone diagnostic below rather than reading as malformed.
+	if params != "" {
+		for _, kv := range strings.Split(params, ",") {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				if parseErr == nil {
+					parseErr = fmt.Errorf("malformed selector segment %q (expected key=value)", kv)
+				}
+				continue
+			}
+			switch parts[0] {
+			case "from":
+				fromZone = parts[1]
+			case "to":
+				toZone = parts[1]
+			case "src":
+				srcIP = parts[1]
+			case "dst":
+				dstIP = parts[1]
+			case "srcport":
+				// #3107: a source-port constraint must thread into the shared
+				// matcher's Query.SrcPort term (previously inexpressible from the
+				// CLI `test policy` topic, overmatching source-port-constrained
+				// applications). Validate via the shared helper (#3116) so a
+				// malformed/out-of-range value reports an error instead of
+				// silently coercing to the 0 "any port" wildcard.
+				srcPort, srcPortErr = policymatch.ParsePort(parts[1])
+			case "port":
+				// #3116: a malformed/out-of-range port must NOT silently coerce to
+				// the 0 "any port" wildcard (the shared matcher gates the port term
+				// on dstPort > 0), which would yield a verdict for a packet that
+				// cannot exist. Route through the shared validator and report the
+				// error the way a bad src/dst is reported below.
+				dstPort, portErr = policymatch.ParsePort(parts[1])
+			case "proto":
+				// #3108: a non-empty but unknown/out-of-range protocol token must
+				// NOT silently coerce to the empty "any protocol" wildcard (the
+				// shared matcher's matchApp short-circuits to match-any for an
+				// unresolvable protocol), which would yield a verdict for traffic
+				// that cannot exist. Validate via the shared helper and report the
+				// error the way a bad port/src is reported below.
+				proto = parts[1]
+				protoErr = policymatch.ValidateProtocol(proto)
+			case "ictype":
+				// #3284: ICMP/ICMPv6 type so a type-constrained application term
+				// (junos-ping = type 8) is honored. Empty is unspecified (the term
+				// fails closed); a malformed/out-of-range value errors.
+				icmpType, icmpTypeErr = policymatch.ParseICMPValue(parts[1])
+			case "iccode":
+				icmpCode, icmpCodeErr = policymatch.ParseICMPValue(parts[1])
+			default:
+				// #3696: an unknown selector key (e.g. `prot=tcp`, a plausible
+				// operator abbreviation of `proto`) must not be silently ignored,
+				// leaving that dimension at the wildcard.
+				if parseErr == nil {
+					parseErr = fmt.Errorf("unknown selector %q", parts[0])
+				}
+			}
 		}
 	}
 	switch {
 	case cfg == nil:
 		buf.WriteString("No active configuration\n")
+	case parseErr != nil:
+		// #3696: report malformed grammar (a segment lacking key=value, an
+		// unknown key, or an explicit-empty typed value) before evaluating, so a
+		// typo cannot silently widen the query. Checked before the from/to-zone
+		// diagnostic so a malformed selector is not masked by a legit-looking
+		// missing-zone message.
+		fmt.Fprintf(buf, "%v\n", parseErr)
 	case fromZone == "" || toZone == "":
 		buf.WriteString("Missing from/to zone parameters\n")
 	case srcPortErr != nil:

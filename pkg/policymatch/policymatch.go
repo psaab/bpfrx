@@ -208,6 +208,8 @@ const matchPoliciesUsageTail = ` from-zone <zone> to-zone <zone>
        [protocol <name|number>]   tcp, udp, icmp, icmp6, gre, esp, ospf, ... or 0-255
        [icmp-type <0-255>] [icmp-code <0-255>]
        from-zone and to-zone are required; an omitted selector matches any.
+       an unknown selector, or a selector given without a value, is an error
+       (the query is not silently widened to match traffic you did not type).
        examples:
          ... protocol tcp destination-port 443
          ... protocol udp source-port 53 destination-port 53
@@ -284,6 +286,189 @@ type Query struct {
 	// closed on a nil state map (#3414), so a scheduled policy is treated as
 	// inactive exactly as the dataplane treats it rather than certified active.
 	PolicyInactiveFn func(schedulerName string) bool
+}
+
+// SelectorArgs is the parsed, VALIDATED result of a policy-simulator selector
+// token vector — the space-separated `from-zone <z> to-zone <z> [source-ip
+// <ip>] [destination-ip <ip>] [source-port <p>] [destination-port <p>]
+// [protocol <name|number>] [icmp-type <n>] [icmp-code <n>]` grammar that all
+// four operator surfaces accept: the local CLI `show security match-policies`
+// and `test policy` (pkg/cli), and the remote CLI equivalents (cmd/cli).
+//
+// A "" SrcIP/DstIP/Protocol or a 0 SrcPort/DstPort means the operator OMITTED
+// that selector, the established wildcard — the corresponding match dimension
+// is unconstrained. A nil ICMPType/ICMPCode is likewise unspecified. These are
+// the ONLY wildcard signals: a selector that is PRESENT always carries a
+// validated value (ParseSelectorArgs rejects a present-but-valueless selector),
+// so a field left at its zero value here unambiguously means "omitted", never
+// "present but silently dropped".
+type SelectorArgs struct {
+	FromZone string
+	ToZone   string
+	SrcIP    string // "" = unspecified; non-empty is a net.ParseIP-validated literal
+	DstIP    string // "" = unspecified; non-empty is a net.ParseIP-validated literal
+	Protocol string // "" = unspecified; non-empty resolves via appid.ProtocolNumber
+	SrcPort  int    // 0 = unspecified
+	DstPort  int    // 0 = unspecified
+	ICMPType *uint8 // nil = unspecified
+	ICMPCode *uint8 // nil = unspecified
+}
+
+// ParseSelectorArgs is the SINGLE strict grammar for the policy-simulator
+// selector token vector (#3696). Before it, each of the four CLI surfaces
+// hand-maintained its own `for i := range args { switch args[i] {...} }` loop,
+// and all four shared the SAME two fail-OPEN defects the session-filter parser
+// hit and #3439 (H5) fixed strictly:
+//
+//   - a value-taking selector present WITHOUT a following value was guarded by
+//     `if i+1 < len(args)` with no else, so a trailing selector left the field
+//     at its zero/empty wildcard — `... destination-port` (no value) evaluated
+//     ALL destination ports and printed a verdict for a port the operator never
+//     typed;
+//   - the switch had no `default:` arm, so an UNKNOWN/misspelled selector token
+//     (and its value) were both silently skipped — `... protcol tcp` dropped
+//     both tokens and yielded an any-protocol verdict.
+//
+// Because the shared matcher treats a zero port / empty protocol / nil
+// icmp-type as "no constraint", either defect silently WIDENED the query: the
+// operator got a permit/deny verdict for a broader set of traffic than they
+// asked about, from a firewall diagnostic whose entire job is to answer
+// precisely which traffic a policy matches.
+//
+// ParseSelectorArgs fails CLOSED, mirroring cmd/cli parseFlowSessionArgs
+// (#3439): a value-taking selector without a value is an error; an empty value
+// (e.g. an explicit `""` token) is an error (a present selector must carry a
+// concrete value — M01); an unknown token is an error; and every value routes
+// through the existing ParsePort / ParseICMPValue / ValidateProtocol / net.IP
+// validators, so a malformed port / icmp / protocol / IP errors instead of
+// degrading to the wildcard. A field left at its zero value in the returned
+// SelectorArgs therefore means the operator OMITTED it (legit wildcard), never
+// "present but dropped". from-zone and to-zone are the only REQUIRED selectors;
+// they may be absent (the caller prints usage), but if present must carry a
+// value like any other selector.
+func ParseSelectorArgs(args []string) (SelectorArgs, error) {
+	var s SelectorArgs
+	// takeValue consumes the token following a value-taking selector, erroring
+	// when it is missing (trailing selector) or empty (present-but-valueless).
+	// Mirrors cmd/cli/show.go parseFlowSessionArgs (#3439 H5).
+	takeValue := func(i *int, kw string) (string, error) {
+		if *i+1 >= len(args) {
+			return "", fmt.Errorf("selector %q requires a value", kw)
+		}
+		*i++
+		v := strings.TrimSpace(args[*i])
+		if v == "" {
+			return "", fmt.Errorf("selector %q requires a value", kw)
+		}
+		return v, nil
+	}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "from-zone":
+			v, err := takeValue(&i, "from-zone")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			s.FromZone = v
+		case "to-zone":
+			v, err := takeValue(&i, "to-zone")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			s.ToZone = v
+		case "source-ip":
+			v, err := takeValue(&i, "source-ip")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			// A non-empty but malformed IP would parse to nil and be treated as
+			// a wildcard by the matcher, yielding a false-positive verdict
+			// (#1711). Reject it here so every surface fails closed identically.
+			if net.ParseIP(v) == nil {
+				return SelectorArgs{}, fmt.Errorf("invalid source-ip %q", v)
+			}
+			s.SrcIP = v
+		case "destination-ip":
+			v, err := takeValue(&i, "destination-ip")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			if net.ParseIP(v) == nil {
+				return SelectorArgs{}, fmt.Errorf("invalid destination-ip %q", v)
+			}
+			s.DstIP = v
+		case "source-port":
+			v, err := takeValue(&i, "source-port")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			p, err := ParsePort(v)
+			if err != nil {
+				return SelectorArgs{}, fmt.Errorf("invalid source-port: %w", err)
+			}
+			s.SrcPort = p
+		case "destination-port":
+			v, err := takeValue(&i, "destination-port")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			p, err := ParsePort(v)
+			if err != nil {
+				return SelectorArgs{}, fmt.Errorf("invalid destination-port: %w", err)
+			}
+			s.DstPort = p
+		case "protocol":
+			v, err := takeValue(&i, "protocol")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			if err := ValidateProtocol(v); err != nil {
+				return SelectorArgs{}, err
+			}
+			s.Protocol = v
+		case "icmp-type":
+			v, err := takeValue(&i, "icmp-type")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			t, err := ParseICMPValue(v)
+			if err != nil {
+				return SelectorArgs{}, fmt.Errorf("invalid icmp-type: %w", err)
+			}
+			s.ICMPType = t
+		case "icmp-code":
+			v, err := takeValue(&i, "icmp-code")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			cc, err := ParseICMPValue(v)
+			if err != nil {
+				return SelectorArgs{}, fmt.Errorf("invalid icmp-code: %w", err)
+			}
+			s.ICMPCode = cc
+		default:
+			return SelectorArgs{}, fmt.Errorf("unknown selector %q", args[i])
+		}
+	}
+	return s, nil
+}
+
+// Query builds a policymatch.Query from parsed selectors. The caller-supplied
+// FeedOverlay and PolicyInactiveFn are left nil for the caller to populate.
+// An empty SrcIP/DstIP maps to a nil net.IP (the match-any wildcard); a
+// non-empty value is already net.ParseIP-validated by ParseSelectorArgs.
+func (s SelectorArgs) Query() Query {
+	return Query{
+		FromZone: s.FromZone,
+		ToZone:   s.ToZone,
+		SrcIP:    net.ParseIP(s.SrcIP),
+		DstIP:    net.ParseIP(s.DstIP),
+		Protocol: s.Protocol,
+		SrcPort:  s.SrcPort,
+		DstPort:  s.DstPort,
+		ICMPType: s.ICMPType,
+		ICMPCode: s.ICMPCode,
+	}
 }
 
 // Result is the simulator verdict.

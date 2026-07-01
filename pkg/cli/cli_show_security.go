@@ -350,78 +350,23 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		return nil
 	}
 
-	// Parse arguments: from-zone <z> to-zone <z> source-ip <ip> destination-ip <ip>
-	//                   destination-port <p> protocol <proto>
-	var fromZone, toZone, srcIP, dstIP, proto string
-	var dstPort, srcPort int
-	var icmpType, icmpCode *uint8
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "from-zone":
-			if i+1 < len(args) {
-				i++
-				fromZone = args[i]
-			}
-		case "to-zone":
-			if i+1 < len(args) {
-				i++
-				toZone = args[i]
-			}
-		case "source-ip":
-			if i+1 < len(args) {
-				i++
-				srcIP = args[i]
-			}
-		case "destination-ip":
-			if i+1 < len(args) {
-				i++
-				dstIP = args[i]
-			}
-		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				p, err := policymatch.ParsePort(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid destination-port: %w", err)
-				}
-				dstPort = p
-			}
-		case "source-port":
-			if i+1 < len(args) {
-				i++
-				p, err := policymatch.ParsePort(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid source-port: %w", err)
-				}
-				srcPort = p
-			}
-		case "protocol":
-			if i+1 < len(args) {
-				i++
-				proto = args[i]
-			}
-		case "icmp-type":
-			if i+1 < len(args) {
-				i++
-				// #3284: honor ICMP/ICMPv6 type-constrained app terms
-				// (junos-ping = type 8).
-				v, err := policymatch.ParseICMPValue(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid icmp-type: %w", err)
-				}
-				icmpType = v
-			}
-		case "icmp-code":
-			if i+1 < len(args) {
-				i++
-				v, err := policymatch.ParseICMPValue(args[i])
-				if err != nil {
-					return fmt.Errorf("invalid icmp-code: %w", err)
-				}
-				icmpCode = v
-			}
-		}
+	// #3696: parse the selector grammar through the single strict SSOT parser
+	// (policymatch.ParseSelectorArgs) shared by all four CLI surfaces + the gRPC
+	// test-policy bridge. A value-taking selector present WITHOUT a value, an
+	// UNKNOWN selector token, an explicit-empty typed value, and a malformed
+	// IP / port / protocol / icmp value are all HARD ERRORS instead of silently
+	// degrading to the wildcard — a firewall policy simulator must answer the
+	// query the operator typed, not a broader one. The per-value validation
+	// (ParsePort / ParseICMPValue / ValidateProtocol / net.ParseIP, #3116 /
+	// #3108 / #3284 / #1711) is folded into the parser, so the redundant
+	// per-surface checks are gone.
+	sel, err := policymatch.ParseSelectorArgs(args)
+	if err != nil {
+		return err
 	}
+	fromZone, toZone, srcIP, dstIP, proto := sel.FromZone, sel.ToZone, sel.SrcIP, sel.DstIP, sel.Protocol
+	srcPort, dstPort := sel.SrcPort, sel.DstPort
+	icmpType, icmpCode := sel.ICMPType, sel.ICMPCode
 
 	if fromZone == "" || toZone == "" {
 		// #3628: the selector list is the shared SSOT in policymatch so all four
@@ -430,26 +375,6 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		// number), not the stale tcp|udp-only subset.
 		fmt.Println(policymatch.MatchPoliciesUsage)
 		return nil
-	}
-
-	// A non-empty but malformed source/destination IP would parse to
-	// nil and be treated as a wildcard by matchPolicyAddr, yielding a
-	// false-positive PERMIT verdict in the simulator (#1711). Reject it
-	// explicitly. An empty value still means "unspecified" (match any).
-	if srcIP != "" && net.ParseIP(srcIP) == nil {
-		return fmt.Errorf("invalid source-ip %q", srcIP)
-	}
-	if dstIP != "" && net.ParseIP(dstIP) == nil {
-		return fmt.Errorf("invalid destination-ip %q", dstIP)
-	}
-
-	// #3108: a non-empty but unknown/out-of-range protocol token ("tcpp",
-	// "999") must not silently become "any protocol" — matchApp short-circuits
-	// to match-any for an unresolvable protocol, yielding a misleading verdict
-	// for a policy using `application any`. An empty value still means
-	// "unspecified" (match any protocol).
-	if err := policymatch.ValidateProtocol(proto); err != nil {
-		return err
 	}
 
 	parsedSrc := net.ParseIP(srcIP)
