@@ -9,9 +9,17 @@ and resolves session display names from the dataplane's assigned `app_id`.
 - `CatalogNames(cfg *config.Config, includeAll bool) ([]string, error)` — `runtime.go`.
   Returns the list of application names the compiler must lower
   into the `app_id` catalog. `includeAll=false` returns only
-  apps referenced by policies; `true` returns every defined app.
-  Returns an error if application-set expansion fails — callers must
-  handle it.
+  apps referenced by a security policy **or** a source/destination-NAT
+  rule's `match application` (#3626 — a NAT term consumes the referenced
+  app's port/proto too, so an app referenced ONLY by a NAT rule must
+  still be catalogued or the dataplane cannot resolve it and session
+  naming for that flow falls back to tuple/numeric); `true` returns every
+  defined app. The NAT walk mirrors the commit-time strict validator
+  (`config.applicationsToValidateStrict`) exactly — Source +
+  Destination.RuleSets, the scalar `rule.Match.Application`, static NAT
+  excluded (it carries no application match) — so the runtime catalog and
+  the strict gate agree on the referenced-app set. Returns an error if
+  application-set expansion fails — callers must handle it.
 - `BuildCatalog(cfg *config.Config) (Catalog, error)` — `catalog.go`.
   Returns the ordered application catalog: `Entries` (each carrying
   `AppID` + `(protocol, dst-port-range, src-port-range)` match rule)
@@ -67,7 +75,14 @@ and resolves session display names from the dataplane's assigned `app_id`.
   commit warning that flags policies relying on AppID matches that the
   runtime won't actually evaluate).
 - `CatalogNames` calls `config.ExpandApplicationSet` internally to
-  flatten `application-set` aliases. Callers don't need to pre-expand.
+  flatten `application-set` aliases (used for both policy and NAT
+  references). Callers don't need to pre-expand.
+- The policy walk and the NAT walk share ONE per-reference resolver
+  (`addAppRef`) inside `CatalogNames`, so the two reference paths cannot
+  diverge (#3626 L04). `TestStrictValidationSetMatchesCatalogNames`
+  pins the user-app subset of `CatalogNames(cfg, false)` to
+  `config.ApplicationsToValidateStrict` — its fixture now carries a
+  NAT-only reference so the parity covers the NAT walk too.
 - `CatalogNames` is nil-tolerant on the policy walk (#3622): a nil
   `*config.ZonePairPolicies` entry or a nil `*config.Policy` entry —
   both admitted by the tolerant-load path (#1960) — is skipped rather

@@ -55,6 +55,29 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 		return sortedNames(names), nil
 	}
 
+	// addAppRef records one `match application` reference (from a security
+	// policy OR a NAT rule) into the catalog. An application-set is expanded to
+	// its members; a bare application name is recorded directly. "" / "any" is
+	// not a reference. This is the single per-reference resolver shared by the
+	// policy and NAT walks so the two paths cannot diverge (#3626 L04).
+	addAppRef := func(appName string) error {
+		if appName == "" || appName == "any" {
+			return nil
+		}
+		if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+			expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
+			if err != nil {
+				return fmt.Errorf("expand application-set %q: %w", appName, err)
+			}
+			for _, expandedName := range expanded {
+				names[expandedName] = struct{}{}
+			}
+			return nil
+		}
+		names[appName] = struct{}{}
+		return nil
+	}
+
 	addPolicyApps := func(policies []*config.Policy) error {
 		for _, pol := range policies {
 			// #3622: a nil policy entry is admitted by the tolerant-load
@@ -64,20 +87,9 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 				continue
 			}
 			for _, appName := range pol.Match.Applications {
-				if appName == "" || appName == "any" {
-					continue
+				if err := addAppRef(appName); err != nil {
+					return err
 				}
-				if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
-					expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
-					if err != nil {
-						return fmt.Errorf("expand application-set %q: %w", appName, err)
-					}
-					for _, expandedName := range expanded {
-						names[expandedName] = struct{}{}
-					}
-					continue
-				}
-				names[appName] = struct{}{}
 			}
 		}
 		return nil
@@ -96,6 +108,45 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 	}
 	if err := addPolicyApps(cfg.Security.GlobalPolicies); err != nil {
 		return nil, err
+	}
+
+	// #3626: a source/destination-NAT rule's `match application <name>` also
+	// consumes the referenced app's port/proto (pkg/dataplane/userspace/nat.go
+	// appPortsFromSpec). An app referenced ONLY by a NAT rule — with no
+	// security policy referencing it — must still land in the compiled catalog,
+	// or the dataplane cannot resolve it and session naming for that flow falls
+	// back to tuple/numeric. Walk NAT rule references exactly as the strict
+	// validator does (compiler_validate_strict.go applicationsToValidateStrict:
+	// Source + Destination.RuleSets, skipping nil rule-sets/rules, the scalar
+	// rule.Match.Application) so the runtime catalog and the commit-time strict
+	// gate agree on the referenced-app set — TestStrictValidationSetMatches-
+	// CatalogNames pins the two walks together. Static NAT carries no
+	// application match, so only source and destination NAT are walked.
+	addNATRuleSet := func(rs *config.NATRuleSet) error {
+		if rs == nil {
+			return nil
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if err := addAppRef(rule.Match.Application); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Source {
+		if err := addNATRuleSet(rs); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Security.NAT.Destination != nil {
+		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+			if err := addNATRuleSet(rs); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return sortedNames(names), nil

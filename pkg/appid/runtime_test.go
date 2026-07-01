@@ -40,6 +40,67 @@ func TestCatalogNamesReferencedOnly(t *testing.T) {
 	}
 }
 
+// TestCatalogNamesIncludesNATOnlyAppRefs is the #3626 RED-on-revert proof.
+// With application-identification DISABLED, an application referenced ONLY by a
+// source- or destination-NAT rule's `match application` — with NO security
+// policy referencing it — must still land in the compiled catalog. Before the
+// fix CatalogNames walked only policies, so these apps were silently dropped
+// and the dataplane could not resolve them. Reverting the NAT walk in
+// CatalogNames turns this test RED (the NAT-only names disappear from the
+// result). It covers a direct source-NAT ref, a direct destination-NAT ref,
+// and a destination-NAT ref via an application-set (member expansion).
+func TestCatalogNamesIncludesNATOnlyAppRefs(t *testing.T) {
+	cfg := &config.Config{
+		Applications: config.ApplicationsConfig{
+			Applications: map[string]*config.Application{
+				"snat-app":   {Name: "snat-app", Protocol: "tcp", DestinationPort: "2222"},
+				"dnat-app":   {Name: "dnat-app", Protocol: "udp", DestinationPort: "3333"},
+				"set-member": {Name: "set-member", Protocol: "tcp", DestinationPort: "4444"},
+				"unused-app": {Name: "unused-app", Protocol: "tcp", DestinationPort: "9999"},
+			},
+			ApplicationSets: map[string]*config.ApplicationSet{
+				"nat-set": {Name: "nat-set", Applications: []string{"set-member"}},
+			},
+		},
+		Security: config.SecurityConfig{
+			NAT: config.NATConfig{
+				Source: []*config.NATRuleSet{
+					{Name: "srs", Rules: []*config.NATRule{
+						{Name: "sr1", Match: config.NATMatch{Application: "snat-app"}},
+						// nil rule must be skipped, not panic.
+						nil,
+					}},
+					// nil rule-set must be skipped, not panic.
+					nil,
+				},
+				Destination: &config.DestinationNATConfig{
+					RuleSets: []*config.NATRuleSet{
+						{Name: "drs", Rules: []*config.NATRule{
+							{Name: "dr1", Match: config.NATMatch{Application: "dnat-app"}},
+							{Name: "dr2", Match: config.NATMatch{Application: "nat-set"}},
+							// "any" / "" are not references.
+							{Name: "dr3", Match: config.NATMatch{Application: "any"}},
+							{Name: "dr4", Match: config.NATMatch{Application: ""}},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	got, err := CatalogNames(cfg, false)
+	if err != nil {
+		t.Fatalf("CatalogNames() error = %v", err)
+	}
+	// snat-app, dnat-app (direct NAT refs) and set-member (via nat-set) must be
+	// present; unused-app (referenced nowhere) and the "any"/"" pseudo-refs must
+	// not appear.
+	want := []string{"dnat-app", "set-member", "snat-app"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CatalogNames() = %v, want %v", got, want)
+	}
+}
+
 // TestStrictValidationSetMatchesCatalogNames is the #2185 drift guard
 // (independent review check #4). The compiler's commit-time strict-validation
 // walk (config.applicationsToValidateStrict, exposed as
@@ -52,11 +113,13 @@ func TestCatalogNamesReferencedOnly(t *testing.T) {
 // compiler copy, this fails — turning a silent commit-gate drift into a test
 // failure. It is a cross-check TEST, not a runtime coupling.
 //
-// Scope note (#2187): the strict walk also collects source/destination-NAT
-// `match application` references, which CatalogNames does not. This fixture
-// carries NO NAT rules, so the two walks still coincide here. Adding a NAT
-// reference to this fixture would (correctly) break the equality — the
-// NAT-reference path is exercised by the compiler-package tests instead.
+// Scope note (#2187 / #3626): the strict walk collects source/destination-NAT
+// `match application` references AND — since #3626 — so does CatalogNames. The
+// fixture now carries a NAT-only user-app reference ("nat-app", referenced by a
+// destination-NAT rule and by NO security policy) so the equality PINS the NAT
+// walk too: before #3626 CatalogNames dropped nat-app and this equality broke;
+// after #3626 both walks include it. The compiler-package tests exercise the
+// commit-gate side of the same NAT reference.
 func TestStrictValidationSetMatchesCatalogNames(t *testing.T) {
 	cfg := &config.Config{
 		Applications: config.ApplicationsConfig{
@@ -65,6 +128,8 @@ func TestStrictValidationSetMatchesCatalogNames(t *testing.T) {
 				"direct-app": {Name: "direct-app", Protocol: "tcp", DestinationPort: "8443"},
 				// referenced only via an application-set
 				"set-app": {Name: "set-app", Protocol: "udp", DestinationPort: "1234"},
+				// referenced ONLY by a destination-NAT rule (#3626)
+				"nat-app": {Name: "nat-app", Protocol: "tcp", DestinationPort: "2222"},
 				// not referenced anywhere — must appear in NEITHER walk
 				"unref-app": {Name: "unref-app", Protocol: "tcp", DestinationPort: "9000"},
 			},
@@ -81,6 +146,15 @@ func TestStrictValidationSetMatchesCatalogNames(t *testing.T) {
 					Policies: []*config.Policy{
 						{Match: config.PolicyMatch{Applications: []string{"direct-app"}}},
 						{Match: config.PolicyMatch{Applications: []string{"web-set"}}},
+					},
+				},
+			},
+			NAT: config.NATConfig{
+				Destination: &config.DestinationNATConfig{
+					RuleSets: []*config.NATRuleSet{
+						{Name: "rs", Rules: []*config.NATRule{
+							{Name: "r1", Match: config.NATMatch{Application: "nat-app"}},
+						}},
 					},
 				},
 			},
@@ -111,8 +185,14 @@ func TestStrictValidationSetMatchesCatalogNames(t *testing.T) {
 	if _, ok := strict["unref-app"]; ok {
 		t.Fatal("unreferenced app must not be in the strict-validation set")
 	}
-	if len(strict) != 2 {
-		t.Fatalf("expected exactly {direct-app, set-app} in strict set, got %v", sortedKeys(strict))
+	// nat-app is referenced ONLY by the destination-NAT rule; both walks must
+	// carry it (#3626). Before the fix CatalogNames omitted it and the
+	// DeepEqual above failed.
+	if _, ok := strict["nat-app"]; !ok {
+		t.Fatal("NAT-only app reference must be in the strict-validation set")
+	}
+	if len(strict) != 3 {
+		t.Fatalf("expected exactly {direct-app, nat-app, set-app} in strict set, got %v", sortedKeys(strict))
 	}
 }
 
