@@ -1,3 +1,34 @@
+## 2026-07-01 — #3760 ip-monitoring: advance the cached desired overlay ONLY after apply_snapshot succeeds (mutate-after-publish)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3760 (MEDIUM, codex-review-160 H6). `PublishRouteOverlaySnapshot`
+    assigned `m.routeOverlay = cloneRouteOverlay(overlay)` at the TOP of the
+    function (manager.go:957), before the `ensureRequiredSnapshotProtocol`
+    /`disarmBeforeUnsupportedPublish`/`apply_snapshot` publish. On any of those
+    failures the function returned an error with `m.routeOverlay` already
+    advanced to the never-published overlay while `m.lastSnapshot`/
+    `m.lastSnapshotHash` stayed at the prior baseline → the cache lied about
+    what is live. A later full apply reads `routeOverlaySnapshot()` and rebuilds
+    routes against the failed overlay, defeating desired-vs-applied
+    observability and risking a real failover route being suppressed as
+    "already published".
+    FIX (mutate-after-success, mirrors #3766/#3742/#3757): build routes against
+    a local `desiredOverlay := cloneRouteOverlay(overlay)` and commit
+    `m.routeOverlay = desiredOverlay` via a deferred hook keyed on the named
+    return `err` — so all nil-error returns (no-published-snapshot cache,
+    helper-not-running cache, duplicate-skip, and successful publish) advance
+    the cache, while the three error returns leave it at the last-applied
+    baseline. On a rejected publish the #3757 dirty-retry re-passes the same
+    overlay, rebuilds identical routes, mismatches the still-old
+    `lastSnapshotHash`, and re-publishes. `policySchedulerActive` mutation left
+    as-is (out of scope for H6).
+    TEST: `TestPublishRouteOverlaySnapshotFailureKeepsBaseline` — toggle-fail
+    control server; after a rejected publish asserts (a) the cache stays at the
+    last-applied overlay A, (b) a full apply rebuilds A's route (not the failed
+    B), (c) the recovered retry re-publishes B and advances the cache once.
+    RED on revert (cache advances to unpublished B). `go test -race` green.
+  - **File(s)**: pkg/dataplane/userspace/manager.go,
+    pkg/dataplane/userspace/route_overlay_test.go, docs/multi-wan.md, _Log.md
 ## 2026-07-01 — #3736 ddns Surface A: run the checkip address observation UNLOCKED + with the reconcile ctx (observation residual of #2778)
 
 - **Timestamp**: 2026-07-01
