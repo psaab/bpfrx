@@ -285,7 +285,7 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			// (local delivery; no transit global/default fallback). Do NOT
 			// report a default-policy verdict here.
 			fmt.Fprintf(buf, "No matching to-zone junos-host policy for %s -> junos-host\n", fromZone)
-			fmt.Fprintf(buf, "  host-inbound: local delivery proceeds (transit global/default-policy NOT applied)\n")
+			fmt.Fprintf(buf, "  %s\n", policymatch.HostInboundShowLine)
 		case res.Matched && res.Global:
 			fmt.Fprintf(buf, "Policy match (global):\n")
 			fmt.Fprintf(buf, "  Policy:    %s\n", res.PolicyName)

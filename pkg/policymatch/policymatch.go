@@ -288,13 +288,17 @@ type Result struct {
 
 	// HostInboundUnmatched is true ONLY for a `to-zone junos-host` query that
 	// matched no host-bound policy (#3285). The dataplane host gate
-	// (evaluate_junos_host_policy) returns None here — there is no implicit
-	// host default-deny and NO transit global/default fallback, so local
-	// delivery proceeds (the management lifeline). Matched is false and
-	// DefaultUsed is false; callers must render this as "host-inbound, not
-	// governed by transit/global/default policy", NOT as the default-policy
-	// verdict. Action is unset (PolicyPermit zero value) and carries no
-	// meaning in this case.
+	// (evaluate_junos_host_policy) returns None here — no security *policy*
+	// governs the flow: there is no implicit host default-deny at the policy
+	// layer and NO transit global/default fallback. Local delivery is instead
+	// gated by host-inbound-traffic service admission, which post-#3405
+	// DEFAULT-DENIES a zone that has no host-inbound-traffic stanza — so
+	// "unmatched" does NOT mean the packet is delivered (#3627). Matched is
+	// false and DefaultUsed is false; callers must render this as "host-inbound,
+	// subject to host-inbound-traffic service admission (no stanza => default
+	// deny), not governed by transit/global/default policy", NOT as the
+	// default-policy verdict. Action is unset (PolicyPermit zero value) and
+	// carries no meaning in this case.
 	HostInboundUnmatched bool
 
 	// FromZone and ToZone identify the SCOPE of the matched policy (#3331), so
@@ -328,14 +332,26 @@ type Result struct {
 }
 
 // HostInboundActionString is the operator-facing verdict rendered for a
-// HostInboundUnmatched result (#3285/#3375). The dataplane host gate returns
-// None for an unmatched `to-zone junos-host` flow — local delivery proceeds,
-// governed by host-inbound-traffic system-services/protocols rather than any
-// transit/global/default security policy. Both the REST and gRPC
-// match-policies surfaces render this exact string (via DisplayAction) so a
-// remote client never sees a blank verdict for the host path and the two
-// transports never diverge.
-const HostInboundActionString = "host-inbound (local delivery; not governed by transit/global/default policy)"
+// HostInboundUnmatched result (#3285/#3375/#3627). The dataplane host gate
+// returns None for an unmatched `to-zone junos-host` flow — no security policy
+// governs it. Local delivery is instead gated by host-inbound-traffic
+// system-services/protocols, which post-#3405 DEFAULT-DENIES a zone with no
+// host-inbound-traffic stanza; the verdict must therefore NOT claim that
+// delivery unconditionally proceeds (the pre-#3627 "local delivery proceeds"
+// wording read as an admit even for a no-stanza default-deny zone). Both the
+// REST and gRPC match-policies surfaces render this exact string (via
+// DisplayAction) so a remote client never sees a blank verdict for the host
+// path and the two transports never diverge.
+const HostInboundActionString = "host-inbound (local delivery subject to host-inbound-traffic service admission — a zone with no host-inbound-traffic stanza denies by default; transit/global/default policy NOT applied)"
+
+// HostInboundShowLine is the human-readable one-line explanation the CLI /
+// `show` / `request` match-policies surfaces print (after a "No matching
+// to-zone junos-host policy ..." header) for a HostInboundUnmatched result.
+// Kept here as the SSOT so the three CLI/gRPC-show call sites cannot drift from
+// each other or from HostInboundActionString (#3627). Like the action string it
+// states that local delivery is gated by host-inbound-traffic admission
+// (default-deny for a no-stanza zone), not that it unconditionally proceeds.
+const HostInboundShowLine = "host-inbound: local delivery subject to host-inbound-traffic service admission (a zone with no host-inbound-traffic stanza denies by default; transit global/default-policy NOT applied)"
 
 // DisplayAction renders the single operator-facing verdict string for a Result,
 // shared by every match-policies surface (#3375) so the REST and gRPC

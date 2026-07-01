@@ -92,9 +92,12 @@ contract.
   surfaces can never diverge. Before #3375 gRPC returned a BLANK `action` for
   two security-sensitive verdicts where REST returned an explicit string: a
   `to-zone junos-host` query that matched no host-bound policy (now
-  `policymatch.HostInboundActionString` — `host-inbound (local delivery; not
-  governed by transit/global/default policy)`, with `host_inbound_unmatched`
-  set), and the no-active-config case (now `deny (default)` instead of an empty
+  `policymatch.HostInboundActionString` — `host-inbound (local delivery subject
+  to host-inbound-traffic service admission — a zone with no
+  host-inbound-traffic stanza denies by default; transit/global/default policy
+  NOT applied)`, with `host_inbound_unmatched` set; the pre-#3627 wording said
+  `local delivery proceeds`, which read as an admit even for a no-stanza
+  default-deny zone, #3405), and the no-active-config case (now `deny (default)` instead of an empty
   response). The response also gained a typed `default_used` bit — the
   machine-readable form of the ` (default)` suffix on `action`, set when no
   policy matched and `action` is the configured default-policy (including the

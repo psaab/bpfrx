@@ -504,7 +504,7 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	if res.HostInboundUnmatched {
 		// #3285: host-bound traffic — no transit global/default fallback.
 		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", fromZone)
-		fmt.Printf("  host-inbound: local delivery proceeds (transit global/default-policy NOT applied)\n")
+		fmt.Printf("  %s\n", policymatch.HostInboundShowLine)
 		return nil
 	}
 	if !res.Matched {

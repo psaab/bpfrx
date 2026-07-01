@@ -6465,13 +6465,18 @@ type MatchPoliciesResponse struct {
 	Matched      bool                   `protobuf:"varint,6,opt,name=matched,proto3" json:"matched,omitempty"`
 	// host_inbound_unmatched is true ONLY for a `to-zone junos-host` query that
 	// matched no host-bound policy (#3285). The dataplane host gate returns None
-	// here — no implicit host default-deny and NO transit global/default
-	// fallback — so local delivery proceeds. When set, `matched` is false and
-	// `default_used` is false (the host path has no default-policy fallback).
+	// here — no security policy governs the flow (no implicit host default-deny
+	// at the policy layer and NO transit global/default fallback). Local delivery
+	// is instead gated by host-inbound-traffic service admission, which post-#3405
+	// DEFAULT-DENIES a zone with no host-inbound-traffic stanza, so "unmatched"
+	// does NOT mean the packet is delivered (#3627). When set, `matched` is false
+	// and `default_used` is false (the host path has no default-policy fallback).
 	// Since #3375 the server populates `action` with the explanatory string
-	// "host-inbound (local delivery; not governed by transit/global/default
-	// policy)" (the SSOT shared with the REST surface), so `action` is NON-empty
-	// and a client may render it directly; it is NOT a default-policy verdict.
+	// "host-inbound (local delivery subject to host-inbound-traffic service
+	// admission — a zone with no host-inbound-traffic stanza denies by default;
+	// transit/global/default policy NOT applied)" (the SSOT shared with the REST
+	// surface), so `action` is NON-empty and a client may render it directly; it
+	// is NOT a default-policy verdict.
 	HostInboundUnmatched bool `protobuf:"varint,7,opt,name=host_inbound_unmatched,json=hostInboundUnmatched,proto3" json:"host_inbound_unmatched,omitempty"`
 	// global is true when the matched policy is a `policy global` rule rather
 	// than a zone-pair rule (#3331); it distinguishes a global-scope verdict from
