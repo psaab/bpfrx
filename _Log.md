@@ -36,6 +36,34 @@
     pkg/grpcapi/server_helpers.go,
     pkg/grpcapi/server_show_zones_metadata_3684_test.go,
     docs/junos-cli-reference.md
+
+## 2026-07-01 — #3674 local `test policy` output at parity with `show security match-policies` (H10 / codex-127 M03)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3674 — the local operational `test policy` simulator
+    (`pkg/cli/cli_request.go` `testPolicy`) printed only the policy name +
+    action (and, for a global match, nothing but name + action with no scope),
+    while `show security match-policies` (`showMatchPolicies`) over the SAME
+    `policymatch.Result` already printed the Policy ID, scope, and description.
+    That made `test policy` the poorest of the four match-policies surfaces — an
+    operator could not correlate a verdict with the RT_FLOW / session-table
+    policy ID or tell whether a global vs zone-pair rule fired. Fix = rendering
+    only (no schema/wire change): added a small `printPolicyMatchIdentity(res)`
+    helper called from BOTH the global and zone-pair branches of `testPolicy`,
+    printing the stable runtime **Policy ID** (#3667 `RuntimePolicyIDs` SSOT),
+    **Rule ID** (#3668 stable inventory join key, when present), **Scope**
+    (`zone-pair`/`global`, reusing the shared `matchScopeZone` helper so an
+    unset global scope reads `any`), and the policy **Description**. All fields
+    come straight off `policymatch.Result`, so the local `test policy` surface
+    is now in lock-step with `showMatchPolicies` with no duplicated matcher
+    logic. The 2-space aligned label style matches the surrounding `test policy`
+    output. Added a RED-on-revert test (`testpolicy_idscope_3674_test.go`)
+    asserting both a zone-pair and a scoped-global match render Policy ID (value
+    checked against the RuntimePolicyIDs SSOT) + Rule ID + Scope + Description;
+    deleting the helper call flips it red. Documented in `pkg/cli/README.md`.
+  - **File(s)**: pkg/cli/cli_request.go, pkg/cli/testpolicy_idscope_3674_test.go
+    (new), pkg/cli/README.md, _Log.md
+
 ## 2026-07-01 — #3683 remote CLI show zones/policies display residuals (M01/M02)
 
 - **Timestamp**: 2026-07-01

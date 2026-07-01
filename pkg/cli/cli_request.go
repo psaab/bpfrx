@@ -324,12 +324,14 @@ func (c *CLI) testPolicy(args []string) error {
 	if res.Global {
 		fmt.Printf("Policy match (global):\n")
 		fmt.Printf("  Policy:    %s\n", res.PolicyName)
+		printPolicyMatchIdentity(res)
 		fmt.Printf("  Action:    %s\n", policymatch.ActionString(res.Action))
 		return nil
 	}
 	fmt.Printf("Policy match:\n")
 	fmt.Printf("  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
 	fmt.Printf("  Policy:    %s\n", res.PolicyName)
+	printPolicyMatchIdentity(res)
 	fmt.Printf("  Action:    %s\n", policymatch.ActionString(res.Action))
 	if srcIP != "" {
 		fmt.Printf("  Source:    %s -> ", srcIP)
@@ -349,6 +351,39 @@ func (c *CLI) testPolicy(args []string) error {
 	}
 	fmt.Println()
 	return nil
+}
+
+// printPolicyMatchIdentity renders the shared PolicyID / RuleID / scope /
+// description block for the local `test policy` simulator (#3674). Before this,
+// the request-path output printed only the policy name + action (and for a
+// global match, nothing but name + action), while `show security match-policies`
+// over the SAME policymatch.Result already printed these identity fields. That
+// made `test policy` the poorest of the match-policies surfaces: an operator
+// could not correlate a verdict with the RT_FLOW / session-table policy ID or
+// tell whether a global vs zone-pair rule fired.
+//
+// All fields come straight off policymatch.Result (populated by the #3667
+// RuntimePolicyIDs SSOT), and the scope line reuses the shared matchScopeZone
+// helper (#3331), so this surface stays in lock-step with showMatchPolicies with
+// no duplicated logic. The 2-space aligned label style matches the surrounding
+// `test policy` output rather than the show path's 4-space sub-indent.
+func printPolicyMatchIdentity(res policymatch.Result) {
+	fmt.Printf("  Policy ID: %d\n", res.PolicyID)
+	// #3668: the stable rule identity joins a hit to the inventory / logs /
+	// tests even after a reorder shifts the numeric Policy ID.
+	if res.RuleID != "" {
+		fmt.Printf("  Rule ID:   %s\n", res.RuleID)
+	}
+	if res.Global {
+		fmt.Printf("  Scope:     global (match from-zone: %s, to-zone: %s)\n",
+			matchScopeZone(res.FromZone), matchScopeZone(res.ToZone))
+	} else {
+		fmt.Printf("  Scope:     zone-pair (from-zone: %s, to-zone: %s)\n",
+			res.FromZone, res.ToZone)
+	}
+	if res.Description != "" {
+		fmt.Printf("  Description: %s\n", res.Description)
+	}
 }
 
 // testRouting looks up a destination in the routing table.
