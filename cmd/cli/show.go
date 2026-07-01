@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/policymatch"
 )
@@ -464,6 +465,30 @@ func (c *ctl) handleShowSecurity(args []string) error {
 	}
 }
 
+// zoneHostInboundView projects a gRPC ZoneInfo onto the shared host-inbound
+// presenter (#3654). The structured response already carries the split
+// system-services / protocols set and the per-interface overrides (#3328), so
+// the remote CLI renders exactly what the local and gRPC-text surfaces do. The
+// wire response cannot distinguish a no-stanza zone from an explicit empty
+// stanza (both are deny-all with empty lists post-#3405), so ZoneConfigured is
+// left false and the posture line reads "(no stanza)".
+func zoneHostInboundView(z *pb.ZoneInfo) config.HostInboundView {
+	v := config.HostInboundView{
+		ZoneSystemServices: z.GetHostInboundSystemServices(),
+		ZoneProtocols:      z.GetHostInboundProtocols(),
+	}
+	for _, ih := range z.GetInterfaceHostInbound() {
+		v.Interfaces = append(v.Interfaces, config.InterfaceHostInboundView{
+			Interface:               ih.GetInterface(),
+			SystemServices:          ih.GetSystemServices(),
+			Protocols:               ih.GetProtocols(),
+			EffectiveSystemServices: config.UnionHostInboundTokens(z.GetHostInboundSystemServices(), ih.GetSystemServices()),
+			EffectiveProtocols:      config.UnionHostInboundTokens(z.GetHostInboundProtocols(), ih.GetProtocols()),
+		})
+	}
+	return v
+}
+
 func (c *ctl) showZones() error {
 	resp, err := c.client.GetZones(c.ctx(), &pb.GetZonesRequest{})
 	if err != nil {
@@ -488,8 +513,19 @@ func (c *ctl) showZones() error {
 		if z.ScreenProfile != "" {
 			fmt.Printf("  Screen: %s\n", z.ScreenProfile)
 		}
-		if len(z.HostInboundServices) > 0 {
-			fmt.Printf("  Host-inbound services: %s\n", strings.Join(z.HostInboundServices, ", "))
+		// #3654 (H09/M03/M06): consume the structured split system-services /
+		// protocols and per-interface overrides from the gRPC response and
+		// render them through the SAME shared presenter the local/gRPC-text
+		// surfaces use, instead of collapsing everything into one legacy
+		// "Host-inbound services" line that dropped the service-vs-protocol
+		// split, the per-interface overrides, and the default-deny posture.
+		for _, line := range zoneHostInboundView(z).Render(config.HostInboundLabels{
+			Indent:         "  ",
+			Sep:            ", ",
+			ServicesLabel:  "Host-inbound system-services",
+			ProtocolsLabel: "Host-inbound protocols",
+		}) {
+			fmt.Println(line)
 		}
 		if z.IngressPackets > 0 || z.EgressPackets > 0 {
 			fmt.Println("  Traffic statistics:")

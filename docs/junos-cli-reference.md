@@ -508,6 +508,23 @@ From zone: guest, To zone: lan
     SSOT as the zone-level stanza (#3200), and management/cluster-control
     lifeline interfaces are excluded from the override exactly as from the
     zone-level deny scoping. (Distinct from #3328, which is the API-display gap.)
+  - **Per-interface host-inbound in the TEXT/CLI views (#3654):** the structured
+    REST/gRPC inventory (#3328) carried the per-interface override rows and the
+    split `system-services` / `protocols` sets, but every text surface used to
+    print ONLY the zone-level set — an interface with a narrower/wider effective
+    admission set than its zone was shown as if it inherited the zone set, and a
+    no-stanza zone printed nothing even though it default-DENIES (#3405). All six
+    surfaces now render the override and posture through one shared presenter
+    (`pkg/config/host_inbound_view.go`): `show security zones`, `show
+    interfaces`, `test security-zone interface`, the gRPC text `show security
+    zones` + interface diagnostic, and the remote `cmd/cli show security zones`.
+    Each shows the effective (zone UNION interface) admitted set, flags an
+    interface-local override, and prints an explicit `Host-inbound: default deny
+    (no stanza | empty stanza | interface override: deny-all)` line when the
+    effective set is empty so "not shown" can never be misread as "not
+    enforced". The remote CLI additionally consumes the split
+    system-services/protocols instead of the legacy flattened
+    "Host-inbound services" line.
   - **Lifeline set derived from cluster config (#3277):** the lifeline
     interfaces excluded from host-inbound deny scoping are no longer a fixed
     fxp0/em0/fab* hardcode. The set is now `fxp0` (always-mgmt) UNION the
@@ -776,6 +793,14 @@ Security zone: junos-host
 - `Interfaces bound: <N>` -- count of bound interfaces.
 - `Interfaces:` header, then each interface indented 4 spaces.
 - Empty `Interfaces:` line with no entries if none bound.
+- **Host-inbound (#3654):** `Allowed host-inbound traffic: <services>` /
+  `Allowed host-inbound protocols: <protocols>` for the zone-level set; a
+  `Host-inbound interface overrides:` block listing each interface's override
+  and its effective (zone UNION interface) admitted set; and a
+  `Host-inbound: default deny (no stanza)` line when the zone admits nothing and
+  declares no override (a no-stanza zone default-DENIES host-bound traffic
+  post-#3405). The gRPC text view labels the zone-level lines
+  `Host-inbound system-services:` / `Host-inbound protocols:`.
 - Blank line between zones.
 
 ---
