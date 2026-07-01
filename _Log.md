@@ -1,3 +1,67 @@
+## 2026-07-01 — #3704 review fold: CLI reloadSyslog zone-map was still positional (4th reverse-map)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Hostile review of PR #3707 found a fourth zone-id reverse-map
+    the #3704 unification missed: `pkg/cli/apply.go reloadSyslog` built the
+    syslog zone-id→name map POSITIONALLY (`znMap[uint16(i+1)] = name` over
+    sorted names). This is a LIVE display path — the daemon builds the embedded
+    CLI with its own shared `EventReader` (daemon_run.go), and `reloadSyslog`
+    runs UNCONDITIONALLY on every local-console commit/rollback (cli_config.go,
+    cli.go rollback) AFTER the daemon reconcile already published the name-hash
+    map via `applySyslogConfig`/`buildZoneIDs`. The positional write CLOBBERED
+    the shared reader with wrong ids, regressing local-TTY-console RT_FLOW
+    syslog zone-name rendering to `zone-N` (gRPC/remote/API commits were
+    correct). FIX: extract `syslogZoneNameMap(cfg)` keyed by
+    `config.StableZoneID(name)` — byte-identical to the daemon's map and
+    order-independent, so a shared reader always agrees (contrast: dropping the
+    write would depend on the daemon reconcile always running first). Removed
+    the now-unused `sort` import. Added RED-on-revert test
+    (`TestSyslogZoneNameMapUsesStableZoneID`): a 3-zone config → the reverse map
+    resolves each zone at its StableZoneID slot (goes RED — empty at the
+    name-hash key, populated at positional 1..N — on revert; verified by
+    temporarily restoring the positional keying).
+  - **File(s)**: pkg/cli/apply.go,
+    pkg/cli/apply_syslog_zonemap_3704_test.go (new), _Log.md
+  - **Validation**: `go test ./pkg/cli/... ./pkg/daemon/...` green;
+    `go build ./pkg/... ./cmd/...` OK; gofmt clean on changed files (the
+    cli.go:503 vet unreachable-code warning is pre-existing, not in this diff).
+
+## 2026-07-01 — #3704 buildZoneSnapshots wire zone id unified onto StableZoneID (completes #3075)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3704 — #3075 moved the compiler/CLI/API/HA-fallback zone-id
+    namespace to the stable name-hash `config.StableZoneID`, but left the LIVE
+    dataplane wire builder `buildZoneSnapshots` (pkg/dataplane/userspace/zones.go)
+    on the legacy sorted-positional `uint16(i + 1)` — a third id call site the
+    #3075 sweep missed. For any >=2-zone config the wire (and thus every
+    session's stored IngressZone/EgressZone, the event-stream delta, and the
+    fabric zone-encoded MAC) diverged from the name-hash namespace everything
+    else uses, causing (a) wrong session zone-name display (positional session
+    id reverse-mapped through the name-hash map -> "zone-N" fallback) and (b)
+    defeated per-RG active/active session-sync ownership
+    (cluster.ShouldSyncZone queried the name-hash zoneRGMap with a positional
+    IngressZone -> always missed -> collapse to the global primary). Fix: assign
+    `config.StableZoneID(name)` in buildZoneSnapshots so the wire id equals
+    CompileResult.ZoneIDs / buildZoneIDs / buildZoneRGMap key by construction —
+    ONE namespace across the compiler, wire/session/HA path, per-RG map, and the
+    display reverse-map. The id is a pure function of the NAME, so a nil zone on
+    one HA peer can no longer shift another zone's id (Codex C131-M01). The Rust
+    side already consumed the wire id name-keyed
+    (zone_name_to_id_from_snapshot / populate_zones), so no dataplane change was
+    needed. Added three RED-on-revert Go tests (wire-id == StableZoneID,
+    session-display reverse-map, per-RG ownership lookup) + a daemon test tying
+    the real buildZoneRGMap + real cluster.ShouldSyncZone to the StableZoneID
+    key space. Validated: go test ./pkg/dataplane/... ./pkg/cluster/...
+    ./pkg/config/... ./pkg/daemon/... green; full `cargo test --release` green
+    (3347 lib + suites, one pre-existing timing-flaky event_stream backlog test
+    passed on rerun); go build ./... clean; RED-on-revert proven by temporarily
+    restoring uint16(i+1) (all three userspace tests failed). HA session-sync
+    change — PARENT must run `make test-failover` before merge.
+  - **File(s)**: pkg/dataplane/userspace/zones.go,
+    pkg/dataplane/userspace/zones_stable_id_3704_test.go (new),
+    pkg/daemon/per_rg_zoneid_3704_test.go (new),
+    userspace-dp/src/test_zone_ids.rs (doc comment),
+    docs/config-schema.md (#3704 note).
 ## 2026-07-01 — #3703 bracket/single-line list collapse on four security surfaces (#2419 class, unfixed leaves)
 
 - **Timestamp**: 2026-07-01

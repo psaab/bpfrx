@@ -7,7 +7,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"sort"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -16,24 +15,34 @@ import (
 	"github.com/psaab/xpf/pkg/logging"
 )
 
+// syslogZoneNameMap builds the zone-id -> name reverse map for structured
+// (RT_FLOW) syslog rendering. The zone-id namespace is the STABLE name-hash
+// config.StableZoneID(name) (#3075) — the SAME namespace the compiler installs
+// into the dataplane and the daemon publishes via applySyslogConfig /
+// buildZoneIDs (daemon_ha_userspace.go). This is load-bearing because the event
+// reader is SHARED with the daemon (daemon_run.go builds the embedded CLI with
+// d.eventReader) and reloadSyslog runs on every LOCAL-CONSOLE commit/rollback
+// AFTER the daemon reconcile already set the name-hash map: the previous
+// sorted-positional (i+1) assignment CLOBBERED the shared map with wrong ids,
+// regressing local-TTY commits to `zone-N` RT_FLOW rendering while
+// gRPC/remote/API commits stayed correct (#3704 follow-up). StableZoneID is a
+// pure function of the name, so this write is byte-identical to the daemon's
+// regardless of reconcile ordering.
+func syslogZoneNameMap(cfg *config.Config) map[uint16]string {
+	znMap := make(map[uint16]string, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		znMap[config.StableZoneID(name)] = name
+	}
+	return znMap
+}
+
 // reloadSyslog rebuilds the syslog client set and zone-name mapping from
 // the supplied config. Safe to call with a nil event reader.
 func (c *CLI) reloadSyslog(cfg *config.Config) {
 	if c.eventReader == nil {
 		return
 	}
-	// Update zone name mapping for structured log format
-	// Uses sorted zone names → sequential IDs (matches compiler order)
-	names := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	znMap := make(map[uint16]string, len(names))
-	for i, name := range names {
-		znMap[uint16(i+1)] = name
-	}
-	c.eventReader.SetZoneNames(znMap)
+	c.eventReader.SetZoneNames(syslogZoneNameMap(cfg))
 
 	var clients []*logging.SyslogClient
 	for name, stream := range cfg.Security.Log.Streams {

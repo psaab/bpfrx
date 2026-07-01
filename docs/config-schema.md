@@ -2111,6 +2111,28 @@ compute identical ids with zero synced/persisted state. The two duplicated
 positional maps (`pkg/dataplane.assignZoneIDs`, `pkg/daemon.buildZoneIDs`) both
 call this SSOT; an HA-symmetry test pins them byte-identical.
 
+**#3704 — live wire builder unified onto the SSOT.** #3075 converted
+`assignZoneIDs` / `buildZoneIDs` (and every CLI/API/HA-fallback consumer) to
+`StableZoneID`, but the LIVE dataplane wire builder
+`buildZoneSnapshots` (`pkg/dataplane/userspace/zones.go`) was a THIRD id call
+site it missed — it kept the legacy sorted-positional `uint16(i+1)`. For any
+`>= 2`-zone config the wire (and thus every session's stored
+`IngressZone`/`EgressZone`, the event-stream delta, and the fabric zone-encoded
+MAC) diverged from the name-hash namespace everything else uses. Two live
+regressions followed: session zone-name **display** reverse-mapped a positional
+session id through the name-hash map and missed (wrong `zone-N` labels), and
+`cluster.ShouldSyncZone(session.IngressZone)` queried the name-hash `zoneRGMap`
+(`pkg/daemon.buildZoneRGMap` key space) with a positional id and always missed —
+**per-RG active/active session-sync ownership collapsed to the global primary**.
+#3704 makes `buildZoneSnapshots` assign `config.StableZoneID(name)` too, so the
+wire id equals `CompileResult.ZoneIDs[name]` / `buildZoneIDs[name]` /
+`buildZoneRGMap` key by construction — one namespace across the compiler, the
+wire/session/HA path, the per-RG map, and the display reverse-map. The Rust side
+already consumed the wire id name-keyed (`zone_name_to_id_from_snapshot`,
+`populate_zones`), so no dataplane change was needed. Because the id is a pure
+function of the NAME, a nil zone entry on one HA peer can no longer shift another
+zone's id (Codex C131-M01).
+
 This replaces the legacy sorted `1..N` positional assignment, whose ids shifted
 whenever an earlier-sorting zone was added/removed and mis-mapped in-flight
 session / HA-delta / status metadata carrying an old numeric id (#3075).

@@ -501,12 +501,36 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 	for name := range cfg.Security.Zones {
 		names = append(names, name)
 	}
+	// Sorted only for a deterministic wire ORDER (stable snapshot/fixture
+	// output). The zone ID is NOT positional — see below.
 	sort.Strings(names)
 	out := make([]ZoneSnapshot, 0, len(names))
-	for i, name := range names {
+	for _, name := range names {
 		zs := ZoneSnapshot{
 			Name: name,
-			ID:   uint16(i + 1),
+			// #3704: the wire zone ID is the STABLE name-hash
+			// config.StableZoneID(name) — the SAME namespace the compiler
+			// (pkg/dataplane.assignZoneIDs -> CompileResult.ZoneIDs), the HA
+			// name fallback (pkg/daemon.buildZoneIDs), the zone→RG map
+			// (buildZoneRGMap key space), and every CLI/API session
+			// zone-name display use. Before #3704 this builder assigned a
+			// SORTED-POSITIONAL uint16(i+1), which #3075 (StableZoneID) left
+			// behind, splitting the live dataplane/session/HA wire ID
+			// namespace from the name-hash namespace everything else moved
+			// to. For any >=2-zone config the two disagreed, so: session
+			// zone-name display reverse-mapped a positional id through the
+			// name-hash map and missed (wrong "zone-N" labels), and
+			// SessionSync.ShouldSyncZone(session.IngressZone) queried the
+			// name-hash zoneRGMap with a positional id and always missed,
+			// collapsing per-RG active/active session-sync ownership to the
+			// global primary. Assigning StableZoneID here makes the wire ID
+			// equal CompileResult.ZoneIDs[name] by construction, so all four
+			// consumers share ONE namespace. The id is a pure function of the
+			// zone NAME (never the zone set, sort order, or a nil sibling), so
+			// a nil zone entry on one HA peer can no longer shift another
+			// zone's id (Codex C131-M01), and both peers plus a cold-booting
+			// node agree with zero synced/persisted state.
+			ID: config.StableZoneID(name),
 		}
 		// #3070: carry the zone's host-inbound-traffic admission set onto the
 		// wire so the dataplane can enforce it for host-bound (local-delivery)
