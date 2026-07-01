@@ -534,6 +534,15 @@ From zone: guest, To zone: lan
     enforced". The remote CLI additionally consumes the split
     system-services/protocols instead of the legacy flattened
     "Host-inbound services" line.
+  - **Zone posture survives a partial interface override (#3671):** the shared
+    zone presenter used to suppress the zone-level `Host-inbound: default deny
+    (...)` line whenever the zone had ANY per-interface override, even though the
+    zone posture still governs every NON-overridden interface. A zone with an
+    empty zone-level set and an override on one interface now renders BOTH the
+    zone default-deny posture line (governing the rest of the zone) AND the
+    override block below it — the override is additional context, never a
+    replacement for the zone posture. Because the fix is in the shared presenter
+    (`HostInboundView.Render`), it propagates to all six #3654 surfaces.
   - **Lifeline set derived from cluster config (#3277):** the lifeline
     interfaces excluded from host-inbound deny scoping are no longer a fixed
     fxp0/em0/fab* hardcode. The set is now `fxp0` (always-mgmt) UNION the

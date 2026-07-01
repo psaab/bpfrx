@@ -193,11 +193,18 @@ type HostInboundLabels struct {
 // Render returns the host-inbound presentation block for a zone (#3654), one
 // line per slice element with NO trailing newline. It emits, in order: the
 // zone-level system-services / protocols lines (when non-empty), an explicit
-// default-deny posture line when the zone admits nothing at the zone level AND
-// has no per-interface override (M03 — so a blank host-inbound section can
-// never be misread as "not enforced"), and one block per per-interface override
-// showing the interface-local tokens plus the effective (zone UNION interface)
-// admitted set (H04/H07/H09).
+// default-deny posture line when the zone admits nothing at the zone level
+// (M03 — so a blank host-inbound section can never be misread as "not
+// enforced"), and one block per per-interface override showing the
+// interface-local tokens plus the effective (zone UNION interface) admitted set
+// (H04/H07/H09).
+//
+// The zone-level default-deny posture line is emitted regardless of whether any
+// per-interface override exists (#3671 / H08): the zone posture still governs
+// every NON-overridden interface in the zone, so a partial interface override
+// must not erase the visible default posture for the rest of the zone. The
+// override blocks are ADDITIONAL context printed below the zone posture, never a
+// replacement for it.
 func (v HostInboundView) Render(l HostInboundLabels) []string {
 	join := func(toks []string) string {
 		if len(toks) == 0 {
@@ -212,7 +219,13 @@ func (v HostInboundView) Render(l HostInboundLabels) []string {
 	if len(v.ZoneProtocols) > 0 {
 		lines = append(lines, l.Indent+l.ProtocolsLabel+": "+strings.Join(v.ZoneProtocols, l.Sep))
 	}
-	if len(v.ZoneSystemServices) == 0 && len(v.ZoneProtocols) == 0 && len(v.Interfaces) == 0 {
+	// The zone-level default-deny posture line is emitted whenever the zone
+	// admits nothing at the zone level, REGARDLESS of whether per-interface
+	// overrides exist (#3671 / H08). The zone posture governs every
+	// non-overridden interface, so a partial interface override must not
+	// suppress the visible zone posture; the override blocks below are
+	// additional context, not a replacement.
+	if len(v.ZoneSystemServices) == 0 && len(v.ZoneProtocols) == 0 {
 		lines = append(lines, l.Indent+"Host-inbound: default deny ("+
 			HostInboundDenyReason(false, v.ZoneConfigured)+")")
 	}
