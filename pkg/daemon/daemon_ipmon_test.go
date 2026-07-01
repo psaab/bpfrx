@@ -1,11 +1,14 @@
 package daemon
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/rpm"
 	"golang.org/x/sync/semaphore"
@@ -326,5 +329,71 @@ func TestActuatorPublishFailureKeepsPendingBump(t *testing.T) {
 	}
 	if !d.pendingFIBBump {
 		t.Fatal("pendingFIBBump lost across a failed publish")
+	}
+}
+
+// hardFailFRRExec makes BOTH the frr-reload.py primary AND the vtysh -f
+// additive fallback fail, so frr.Manager.ApplyFull returns a HARD
+// (non-degraded) error — the manager contract's "nothing converged"
+// case, where the kernel FIB still holds the previous routes.
+type hardFailFRRExec struct{}
+
+func (hardFailFRRExec) Vtysh(string) (string, error) { return "", nil }
+func (hardFailFRRExec) FrrReloadPy(context.Context, string) error {
+	return errors.New("frr-reload.py boom")
+}
+func (hardFailFRRExec) VtyshLoad(context.Context, string) ([]byte, error) {
+	return nil, errors.New("vtysh -f boom")
+}
+
+// TestActuatorAbortsPublishOnHardFRRError is the #3757 H1 regression: a
+// HARD FRR reload failure leaves the kernel FIB on the PREVIOUS routes
+// (frr manager contract: nothing converged). The actuator must NOT
+// publish the userspace snapshot on top — that would split the FIB
+// (kernel on the old route, dataplane on the failover route). It must
+// abort before the dataplane consumer, report failure so the ipmon
+// engine keeps the state dirty and retries, and leave pendingFIBBump
+// untouched. On revert (publish regardless of the FRR outcome) dp.calls
+// contains "publish" and this goes RED.
+func TestActuatorAbortsPublishOnHardFRRError(t *testing.T) {
+	dp := &fakeOverlayDP{}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		frr:      frr.NewForTest(filepath.Join(t.TempDir(), "frr.conf"), hardFailFRRExec{}),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+
+	if ok := d.actuateRouteOverlayLocked(&config.Config{}); ok {
+		t.Fatal("actuator reported success on a hard FRR reload failure")
+	}
+	if len(dp.calls) != 0 {
+		t.Fatalf("calls = %v, want none: a divergent snapshot was published after a hard FRR failure (split FIB)", dp.calls)
+	}
+	if d.pendingFIBBump {
+		t.Fatal("pendingFIBBump set by an aborted actuation")
+	}
+}
+
+// TestActuatorPublishesOnDegradedFRR: a DEGRADED reload (#1880, the
+// additive vtysh -f fallback applied) leaves the new routes LIVE in the
+// kernel FIB, so — unlike a hard error — the actuator SHOULD publish the
+// matching userspace snapshot (both FIBs agree) and report success. This
+// pins the degraded/hard-error distinction so the H1 fix does not
+// over-abort on the deliberate warn-and-continue path.
+func TestActuatorPublishesOnDegradedFRR(t *testing.T) {
+	dp := &fakeOverlayDP{}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		frr:      frr.NewForTest(filepath.Join(t.TempDir(), "frr.conf"), &frr.RecordingExecutor{ReloadErr: errors.New("frr-reload down")}),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+
+	if ok := d.actuateRouteOverlayLocked(&config.Config{}); !ok {
+		t.Fatal("actuator reported failure on a DEGRADED (additive-applied) reload")
+	}
+	if len(dp.calls) != 2 || dp.calls[0] != "publish" || dp.calls[1] != "bump" {
+		t.Fatalf("calls = %v, want [publish bump] on a degraded reload", dp.calls)
 	}
 }

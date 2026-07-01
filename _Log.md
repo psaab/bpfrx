@@ -25788,6 +25788,38 @@ top.
   **File(s)**: test/incus/cluster-setup.sh
 
 - **Timestamp**: 2026-07-01
+  **Action**: #3757 — ip-monitoring route-overlay actuator: fix the split-FIB
+  fail-open (folds M1/H1/H2/H3). ROOT (M1): the ipmon engine cleared its
+  `dirtySince` bit BEFORE calling the actuator, and the actuator returned
+  nothing, so every consumer failure was invisible → no retry. FIX: the
+  actuator (`actuateRouteOverlay`/`actuateRouteOverlayLocked`) now returns a
+  `bool`; the engine `run()` loop clears the dirty bit ONLY after a converged
+  actuation and keeps it dirty (autonomous throttle-paced retry on the next
+  sweep) on any failure. Added a `dirtyGen` counter so a change landing
+  mid-actuation is preserved (last-writer-wins) instead of being cleared. H1
+  (split FIB): `applyFRRConfig` now returns the FRR error, distinguishing a
+  DEGRADED reload (#1880, additive vtysh -f applied — new routes live in the
+  kernel → treated as success, publish proceeds) from a HARD reload error
+  (frr manager contract: nothing converged, kernel still on old routes). On a
+  hard error the actuator ABORTS BEFORE publishing the userspace snapshot, so
+  kernel + dataplane FIB never diverge; it reports failure and stays dirty. H2
+  (publish error) and H3 (unconfirmed FIB bump) likewise report failure → the
+  engine retries autonomously (H3 no longer waits for a future unrelated
+  actuation). The full apply path keeps warn-and-continue on FRR errors
+  (`_ = d.applyFRRConfig(...)`). RED-on-revert PROVEN: neutering the H1 abort
+  makes `TestActuatorAbortsPublishOnHardFRRError` publish a divergent snapshot
+  (fails); reverting the M1 clear-only-on-success makes
+  `TestActuationFailureStaysDirtyUntilConverged` see attempts=1 (no retry,
+  fails). go test ./pkg/ipmon/... ./pkg/daemon/ green (incl. -race);
+  go build ./... green; gofmt + vet clean.
+  **File(s)**: pkg/ipmon/ipmon.go (dirtyGen + run() clear-on-success + actuate
+  func() bool + package doc), pkg/ipmon/ipmon_test.go (2 new self-heal tests +
+  func() bool call sites), pkg/ipmon/nexthop_test.go (func() bool call sites),
+  pkg/ipmon/README.md (consistency + self-heal section), pkg/daemon/daemon_ipmon.go
+  (applyFRRConfig returns error + actuator returns bool + H1 abort + file doc),
+  pkg/daemon/daemon_ipmon_test.go (H1 abort + degraded-publish RED-on-revert
+  tests), pkg/daemon/daemon_apply.go (explicit `_ =` on full-apply FRR error),
+  docs/multi-wan.md (consistency + autonomous self-heal bullet)
   **Action**: #3751 — event-options within/trigger numeric strict-validation
   (fail-open fix). compileEventOptions (compiler_services.go) parsed the
   `within <seconds>` and `trigger (on|until) <count>` numerics with

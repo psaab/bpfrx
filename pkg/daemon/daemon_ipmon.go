@@ -8,6 +8,7 @@
 //     routes-only actuator, so the two paths cannot drift and an
 //     unrelated operator commit can never wipe an active failover
 //     route (AGY r2-2).
+//
 //  2. actuateRouteOverlay — the routes-only actuator: under the SAME
 //     apply semaphore as operator commits it re-renders FRR, publishes
 //     the dataplane snapshot via PublishRouteOverlaySnapshot, and ONLY
@@ -17,6 +18,22 @@
 //     re-invalidate them — traffic would stay pinned to the dead
 //     uplink). It touches NOTHING else: no networkd, no ipsec, no RPM
 //     re-apply, no cluster/heartbeat paths.
+//
+//     Consistency + self-heal (#3757): the actuator returns a bool that
+//     the ipmon engine uses to decide whether to clear its dirty bit. A
+//     HARD FRR reload error means nothing converged (frr manager
+//     contract) — the kernel FIB still holds the previous routes — so
+//     the actuator ABORTS BEFORE publishing the userspace snapshot
+//     (never a split FIB, H1) and returns false. A snapshot-publish
+//     error (H2) or an unconfirmed FIB-generation bump (H3) likewise
+//     returns false. On any false return the engine keeps the state
+//     dirty and retries autonomously on the next throttle-paced sweep
+//     (M1); the dirty bit clears only after a fully consistent
+//     actuation. A DEGRADED FRR reload (#1880, additive vtysh -f
+//     applied) is deliberately treated as success: the new routes ARE
+//     live in the kernel, so publishing the matching snapshot keeps the
+//     two FIBs in agreement while the frr manager's own retry converges
+//     stale-config removal.
 package daemon
 
 import (
@@ -158,27 +175,38 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 // applyFRRConfig applies an assembled FullConfig and handles the
 // shared post-ApplyFull consistent-hash sysctl. Both the full apply
 // path and the actuator go through here.
-func (d *Daemon) applyFRRConfig(fc *frr.FullConfig) {
+//
+// Return contract (#3757): nil on success OR a DEGRADED reload (#1880,
+// additive vtysh -f applied — the new routes ARE live in the kernel
+// FIB and the frr manager's retry loop owns stale-config removal); the
+// underlying error on a HARD reload failure, where the frr manager
+// contract guarantees NOTHING converged and the kernel FIB still holds
+// the previous routes. The full apply path (an operator commit) ignores
+// the result — a transient FRR hiccup must not fail an otherwise-valid
+// commit, and a boot-time re-apply reconverges it — but the route-
+// overlay actuator uses it to avoid publishing a userspace snapshot on
+// top of an un-applied kernel FIB (which would split the FIB).
+func (d *Daemon) applyFRRConfig(fc *frr.FullConfig) error {
 	if d.frr == nil {
-		return
+		return nil
 	}
-	// Warn-and-continue on FRR reload problems: an FRR hiccup must not
-	// fail an otherwise-valid commit. Degraded (#1880) means the config
-	// WAS applied additively and the manager's retry loop owns
-	// convergence of stale-config removal; the gauge
-	// xpf_frr_reload_degraded is 1 until it converges.
+	var hardErr error
 	if err := d.frr.ApplyFull(fc); err != nil {
 		if errors.Is(err, frr.ErrFRRReloadDegraded) {
 			slog.Warn("FRR reload degraded: additive vtysh -f applied; stale-config removal deferred to the in-manager retry", "err", err)
 		} else {
 			slog.Warn("failed to apply FRR config", "err", err)
+			hardErr = err
 		}
 	}
 
-	// Set L4 ECMP hash when consistent-hash is configured.
+	// Set L4 ECMP hash when consistent-hash is configured. Independent of
+	// the reload outcome (an idempotent procfs knob); attempted even on a
+	// degraded/hard-failed reload so it is not stranded.
 	if fc.ConsistentHash {
 		setFibMultipathHashPolicy()
 	}
+	return hardErr
 }
 
 // setFibMultipathHashPolicy enables L4 (5-tuple) ECMP hashing by writing
@@ -204,34 +232,54 @@ func setFibMultipathHashPolicy() {
 // goroutine after debounce + throttle; the engine guarantees at most
 // one invocation in flight. It snapshots the overlay at run time
 // (last-writer-wins under flap storms).
-func (d *Daemon) actuateRouteOverlay() {
+// actuateRouteOverlay returns whether the overlay converged
+// consistently; the ipmon engine keeps the state dirty and retries when
+// it returns false (#3757).
+func (d *Daemon) actuateRouteOverlay() bool {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
 
 	if d.store == nil {
-		return
+		return true // nothing to actuate — converged
 	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
-		return
+		return true
 	}
-	d.actuateRouteOverlayLocked(cfg)
+	return d.actuateRouteOverlayLocked(cfg)
 }
 
 // actuateRouteOverlayLocked is the actuator body; MUST be called with
 // d.applySem held. Split out so the publish-before-bump ordering is
-// directly testable.
-func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) {
+// directly testable. Returns true only when kernel FRR and the
+// userspace snapshot are left in a consistent, converged state; a false
+// return signals the engine to keep the state dirty and retry (#3757).
+func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) bool {
 	overlay := d.ipmonActiveOverlay()
 
-	// 1. Re-render FRR through the shared constructor.
-	d.applyFRRConfig(d.assembleFRRConfig(cfg, overlay))
+	// 1. Re-render FRR through the shared constructor. A HARD FRR reload
+	// error means NOTHING converged (frr manager contract) — the kernel
+	// FIB still holds the previous routes. Publishing the userspace
+	// snapshot now would split the FIB (#3757 H1): kernel on the old
+	// route, dataplane on the new one. Abort WITHOUT publishing and
+	// report failure so the engine keeps the state dirty and retries on
+	// the next sweep; the prior consistent kernel+snapshot state is
+	// preserved. A DEGRADED reload (#1880) returns nil here — the new
+	// routes are live, so the matching snapshot publish keeps the two
+	// FIBs in agreement.
+	if err := d.applyFRRConfig(d.assembleFRRConfig(cfg, overlay)); err != nil {
+		slog.Warn("ip-monitoring: FRR reload failed — NOT publishing the userspace snapshot (would split the FIB); staying dirty for retry",
+			"err", err)
+		return false
+	}
 
 	// 2. Publish the dataplane snapshot (routes-only partial republish,
 	// no Compile, no helper restart).
 	pub, ok := d.dp.(routeOverlayPublisher)
 	if !ok {
-		return
+		// No dataplane publisher (helperless): FRR is the only routing
+		// consumer and it converged — nothing more to do.
+		return true
 	}
 	var schedulerState map[string]bool
 	if d.scheduler != nil {
@@ -239,19 +287,20 @@ func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) {
 	}
 	published, err := pub.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
 	if err != nil {
-		// pendingFIBBump deliberately unchanged: a pending retry from
-		// an earlier bump failure stays pending across a failed
-		// publish.
-		slog.Warn("ip-monitoring: route overlay snapshot publish failed — NOT bumping FIB generation",
+		// #3757 H2: a transient publish failure keeps the state dirty for
+		// an autonomous retry (report failure). pendingFIBBump is
+		// deliberately unchanged: a pending retry from an earlier bump
+		// failure stays pending across a failed publish.
+		slog.Warn("ip-monitoring: route overlay snapshot publish failed — NOT bumping FIB generation; staying dirty for retry",
 			"err", err)
-		return
+		return false
 	}
 	if !published && !d.pendingFIBBump {
 		// Duplicate-skip (content unchanged) or helperless caching:
 		// the dataplane routes did not move and the previous bump was
 		// confirmed, so do not churn established-flow route caches
-		// with a FIB-generation bump (Codex PR #1843 MED).
-		return
+		// with a FIB-generation bump (Codex PR #1843 MED). Converged.
+		return true
 	}
 
 	// 3. Only after a REAL apply_snapshot success (or with an
@@ -261,16 +310,20 @@ func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) {
 	// here, under d.applySem — no extra locking.
 	if _, err := pub.BumpFIBGeneration(); err != nil {
 		d.pendingFIBBump = true
-		slog.Warn("ip-monitoring: FIB generation bump unconfirmed — will retry on next actuation",
+		// #3757 H3: report failure so the engine keeps the state dirty
+		// and the bump retries autonomously on the next throttle-paced
+		// sweep — not only on a future unrelated actuation.
+		slog.Warn("ip-monitoring: FIB generation bump unconfirmed — staying dirty; will retry on next sweep",
 			"err", err)
-		return
+		return false
 	}
 	d.pendingFIBBump = false
 	if !published {
 		slog.Info("ip-monitoring: retried FIB generation bump after earlier failure")
-		return
+		return true
 	}
 	slog.Info("ip-monitoring route overlay actuated", "overlay_routes", len(overlay))
+	return true
 }
 
 // reconcileIPMon applies the committed ip-monitoring policy set to the
