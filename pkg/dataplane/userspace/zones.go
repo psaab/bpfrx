@@ -89,7 +89,10 @@ func hostInboundLifelineInterface(name string, lifelines map[string]bool) bool {
 // live kernel address yet (e.g. a DHCP WAN before its first lease, or a backup
 // node before VIP install): it yields an empty address set, the daemon emits no
 // deny for it, and it self-heals once an address appears because the
-// lease-change / commit paths re-render.
+// lease-change / commit paths re-render. That transient fail-open admit window
+// is surfaced to operators by AddresslessEnforcingZones (#3698) — the daemon
+// logs a state-transition warning and exports xpf_host_inbound_addressless_zones
+// while the window is open, so it is no longer silent.
 func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
@@ -305,6 +308,90 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 			V4Addrs:        g.v4,
 			V6Addrs:        g.v6,
 		})
+	}
+	return out
+}
+
+// AddresslessEnforcingZone names a configured host-inbound-ENFORCING security
+// zone that currently resolves NO firewall-local address across its non-lifeline
+// interfaces (#3698). Such a zone contributes nothing to the kernel-nft
+// host-inbound deny scoping (BuildZoneHostInboundViews yields an empty address
+// set for it, and applyHostInboundFilter emits no deny), so host-bound packets
+// to a freshly-usable address can reach the kernel input path without the zone's
+// intended default-deny — a transient fail-open admit window. The window
+// self-heals once an address is installed (DHCP lease / VRRP VIP / commit
+// re-render), but is otherwise SILENT; this type carries the machine-readable
+// signal the daemon logs and exports so the window is observable.
+type AddresslessEnforcingZone struct {
+	Zone string
+	// Interfaces are the non-lifeline interface refs assigned to the zone
+	// (exactly as authored under `security zones <z> interfaces <ref>`), sorted.
+	// At least one is present — a zone whose only interfaces are management /
+	// cluster-control lifelines (fxp0 / em0 / fab*) is NOT reported, since
+	// lifeline traffic is intentionally never host-inbound-denied.
+	Interfaces []string
+}
+
+// AddresslessEnforcingZones returns, in sorted zone order, the configured
+// host-inbound-enforcing zones currently in the transient fail-open admit window
+// (#3698): a zone that has at least one non-lifeline interface assigned yet
+// resolves NO firewall-local address (no static config address, no live kernel
+// address, no VRRP VIP). The "is this zone scoped by any address" decision is
+// read back from BuildZoneHostInboundViews itself — the exact same builder that
+// drives the nft emission — so this observability signal can never disagree with
+// what applyHostInboundFilter actually enforces (a zone is reported iff the
+// daemon emits no host-inbound deny for it).
+//
+// Excluded (NOT reported), so the signal stays low-noise and precise:
+//   - zones that resolve any address (static / DHCP-learned / VRRP VIP) — scoped;
+//   - zones whose only interfaces are lifelines (fxp0 / em0 / fab*) — lifeline
+//     traffic is never denied, so there is no fail-open to surface;
+//   - zones with no interfaces assigned — nothing to protect.
+func AddresslessEnforcingZones(cfg *config.Config) []AddresslessEnforcingZone {
+	if cfg == nil || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	// A zone is "scoped" iff at least one of its views carries an address — the
+	// same condition applyHostInboundFilter uses (hostInboundHasEnforceableView)
+	// to decide whether it emits a deny. Reusing the builder guarantees the
+	// observability signal matches enforcement exactly.
+	scoped := make(map[string]bool)
+	for _, v := range BuildZoneHostInboundViews(cfg) {
+		if len(v.V4Addrs) > 0 || len(v.V6Addrs) > 0 {
+			scoped[v.Zone] = true
+		}
+	}
+	lifelines := hostInboundLifelineSet(cfg)
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var out []AddresslessEnforcingZone
+	for _, name := range names {
+		if scoped[name] {
+			continue
+		}
+		zone := cfg.Security.Zones[name]
+		if zone == nil {
+			continue
+		}
+		ifaces := make([]string, 0, len(zone.Interfaces))
+		seen := make(map[string]bool, len(zone.Interfaces))
+		for _, ref := range zone.Interfaces {
+			ref = strings.TrimSpace(ref)
+			if ref == "" || seen[ref] || hostInboundLifelineInterface(ref, lifelines) {
+				continue
+			}
+			seen[ref] = true
+			ifaces = append(ifaces, ref)
+		}
+		if len(ifaces) == 0 {
+			// Only lifeline (or no) interfaces — no fail-open window to report.
+			continue
+		}
+		sort.Strings(ifaces)
+		out = append(out, AddresslessEnforcingZone{Zone: name, Interfaces: ifaces})
 	}
 	return out
 }
