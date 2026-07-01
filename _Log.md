@@ -1,3 +1,42 @@
+## 2026-07-01 — #3682 host-inbound lifeline exemption made operator-visible (M08/L05)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3682 — the host-inbound LIFELINE exemption (fxp0 / em0 / fab* /
+    configured chassis-cluster control+fabric interfaces are excluded from a
+    zone's host-inbound deny scoping and always admit host-bound traffic) was an
+    IMPLICIT policy exception with no operator-visible surface, so a zone-assigned
+    lifeline interface silently dropped out of the default-deny. Fix = VISIBILITY
+    only (exemption semantics unchanged): (1) hoisted the lifeline matcher to a
+    shared SSOT `pkg/config/lifeline.go` (`LifelineBaseName`,
+    `HostInboundLifelineSet`, `HostInboundLifelineInterface`) and made the
+    dataplane path (`pkg/dataplane/userspace/zones.go`) delegate to it, so
+    enforcement and display can never drift; (2) added `LifelineInterfaces` to the
+    shared presenter `HostInboundView` + a `HostInboundViewWithLifelines` builder,
+    and a lifeline-exempt render line in `Render` + a lifeline marker in
+    `RenderInterfaceHostInbound` (in place of the misleading default-deny line);
+    (3) routed the surfaces through it — `show security zones` (local CLI +
+    gRPC-text + remote CLI), `show interfaces` (CLI + gRPC), `test security-zone
+    interface` (CLI + gRPC); (4) added `lifeline_interfaces` to the structured
+    `GetZones` proto (regenerated) so the remote CLI + automation see it too.
+    Design follow-up flagged on the issue: em0/fab* is a base-name PREFIX match
+    (a broader `fab-foo` would be exempted; a standalone config naming an
+    interface em0/fabX gets a silent exception) — whether it should be EXACT /
+    role-gated is left as a design question, NOT changed here.
+  - **File(s)**: pkg/config/lifeline.go (new), pkg/config/host_inbound_view.go,
+    pkg/config/host_inbound_view_lifeline_3682_test.go (new),
+    pkg/config/host_inbound_view_3654_test.go,
+    pkg/dataplane/userspace/zones.go, pkg/cli/cli_show_security_zones.go,
+    pkg/cli/cli_show_interfaces.go, pkg/cli/cli_request.go,
+    pkg/grpcapi/server_show_zones_text.go, pkg/grpcapi/server_show_zones.go,
+    pkg/grpcapi/server_show_interfaces.go, cmd/cli/show.go,
+    proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (regenerated),
+    docs/junos-cli-reference.md
+  - **Validation**: `go build ./pkg/... ./cmd/...` clean; `go test
+    ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/... ./pkg/dataplane/...` green;
+    RED-on-revert proven (neutering the two render blocks fails the three #3682
+    tests); gofmt clean; go vet clean on touched packages (the 2 remaining vet
+    diagnostics are pre-existing, in untouched files, documented in the Makefile).
+
 ## 2026-07-01 — #3681 REST /statistics/global host-inbound parity with Prometheus (H04/H05/L03/L07)
 
 - **Timestamp**: 2026-07-01

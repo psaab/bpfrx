@@ -343,6 +343,27 @@ From zone: guest, To zone: lan
     / PMTUD / established-session accepts precede every deny, so the default-deny
     cannot strand management or break HA. (All shipped reference configs already
     declare a `host-inbound-traffic` stanza per zone, so they are unaffected.)
+  - **Lifeline-exemption visibility (#3682):** the lifeline exclusion above is
+    an IMPLICIT policy exception — a zone-assigned interface whose base name is a
+    lifeline (`fxp0` / `em0` / `fab*`, plus a configured chassis-cluster
+    `control-interface` / `fabric-interface` / secondary fabric) is EXCLUDED from
+    that zone's host-inbound deny scoping and always admits host-bound traffic
+    regardless of the zone's admission set. Before #3682 no rendered zone view
+    told the operator this, so such an interface silently dropped out of the
+    default-deny. Every host-inbound surface now surfaces it: `show security
+    zones` (local, gRPC-text, remote CLI) prints a `Host-inbound lifeline-exempt
+    interfaces (management/fabric, bypass host-inbound deny): <ifaces>` line;
+    `show interfaces` and `test security-zone interface` print `Host-inbound:
+    lifeline-exempt (management/fabric, bypasses host-inbound deny)` in place of
+    the (misleading) default-deny line; and the structured `GetZones` gRPC adds a
+    `lifeline_interfaces` field. The matcher SSOT is `config.HostInboundLifeline*`
+    (`pkg/config/lifeline.go`), shared by the dataplane deny-scoping path and the
+    display presenter so enforcement and audit can never drift. This is a
+    VISIBILITY change only — the exemption semantics are unchanged. (Design
+    follow-up: the `em0`/`fab*` match is a base-name PREFIX, so a broader
+    interface literally named `fab-foo`, or a standalone config that merely names
+    an interface `em0`/`fabX` with no configured cluster role, is exempted too;
+    whether this should be an EXACT / role-gated match is tracked on #3682.)
   - **Host-inbound deny accounting (#3326):** a host-bound packet dropped by
     the `host-inbound-traffic` admission gate (a service/protocol not in the
     ingress zone's set) now increments the host-inbound deny counter, surfaced
