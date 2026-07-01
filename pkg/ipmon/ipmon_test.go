@@ -1,6 +1,8 @@
 package ipmon
 
 import (
+	"bytes"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -409,6 +411,160 @@ func TestSuccessfulActuationClearsDirty(t *testing.T) {
 	time.Sleep(200 * time.Millisecond) // ~10 throttle windows
 	if extra := attempts.Load() - first; extra > 0 {
 		t.Fatalf("converged actuation kept retrying: +%d attempts, want 0 (dirty cleared)", extra)
+	}
+}
+
+// TestUnknownStatusNotReportedAsPass is the #3761 H7 regression: a
+// configured policy with no probe result yet is UNKNOWN, not PASS.
+// Reporting PASS tells an operator failover protection is active and
+// healthy when no probe has run. On revert (Known absent / display
+// always PASS) the display carries "Status: PASS" and the UNKNOWN
+// assertion goes RED.
+func TestUnknownStatusNotReportedAsPass(t *testing.T) {
+	e, _ := newTestEngine(nil)
+	e.Apply(testPolicyConfig(), nil) // no probe results seeded yet
+
+	st := e.Status()
+	if len(st) != 1 {
+		t.Fatalf("want 1 policy, got %d", len(st))
+	}
+	if st[0].Known {
+		t.Fatal("policy reported Known before any probe result")
+	}
+	if st[0].Failed {
+		t.Fatal("policy should not be FAILED with no probe results")
+	}
+
+	var buf bytes.Buffer
+	FormatStatus(&buf, st)
+	out := buf.String()
+	if !strings.Contains(out, "Status: UNKNOWN") {
+		t.Fatalf("no-probe-data policy not rendered UNKNOWN:\n%s", out)
+	}
+	if strings.Contains(out, "Status: PASS") {
+		t.Fatalf("unknown-health policy rendered as PASS:\n%s", out)
+	}
+
+	// Once a passing result lands the policy is Known and PASS.
+	e.HandleTransition(transition("WAN", "wan-a", "pass", passResults()))
+	st = e.Status()
+	if !st[0].Known {
+		t.Fatal("policy still Unknown after a probe result")
+	}
+	buf.Reset()
+	FormatStatus(&buf, st)
+	if !strings.Contains(buf.String(), "Status: PASS") {
+		t.Fatalf("known-passing policy not rendered PASS:\n%s", buf.String())
+	}
+}
+
+// TestRoutesAppliedReflectsActuationNotDesired is the #3761 H8
+// regression: xpf_ipmon_routes_applied / RoutesApplied() must reflect
+// what actually converged into the FIBs, not the desired overlay. While
+// the actuator keeps failing, nothing is applied even though the desired
+// overlay is non-empty. On revert (RoutesApplied returns the desired
+// count) the "applied == 0 while failing" assertion goes RED.
+func TestRoutesAppliedReflectsActuationNotDesired(t *testing.T) {
+	var succeed atomic.Bool // false ⇒ actuator fails
+	e := New(func() bool { return succeed.Load() })
+	e.debounce = 5 * time.Millisecond
+	e.throttle = 10 * time.Millisecond
+	e.Apply(testPolicyConfig(), passResults())
+	e.Start()
+	defer e.Stop()
+
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	if len(e.ActiveOverlay()) != 2 {
+		t.Fatalf("desired overlay = %d, want 2", len(e.ActiveOverlay()))
+	}
+
+	// Actuator failing → nothing converged → nothing applied.
+	time.Sleep(80 * time.Millisecond)
+	if got := e.RoutesApplied(); got != 0 {
+		t.Fatalf("RoutesApplied = %d while actuation failing, want 0 (applied != desired)", got)
+	}
+	for _, ps := range e.Status() {
+		if len(ps.AppliedRoutes) != 0 {
+			t.Fatalf("AppliedRoutes = %+v while actuation failing, want none", ps.AppliedRoutes)
+		}
+	}
+
+	// Let it converge; applied catches up to desired.
+	succeed.Store(true)
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for e.RoutesApplied() != 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := e.RoutesApplied(); got != 2 {
+		t.Fatalf("RoutesApplied = %d after convergence, want 2", got)
+	}
+}
+
+// TestUnresolvedAndSuppressedDetail is the #3761 M9+M10 regression:
+// unresolved (no DHCP next-hop) and suppressed (lost winner resolution)
+// candidates are reported distinctly and with detail, not collapsed into
+// a bare "(none applied)". On revert (UnresolvedRoutes []string, no
+// SuppressedRoutes) this fails to compile / the display lacks the
+// distinct rows.
+func TestUnresolvedAndSuppressedDetail(t *testing.T) {
+	cfg := &config.IPMonitoringConfig{Policies: map[string]*config.IPMonitoringPolicy{
+		"a-policy": {
+			Name: "a-policy", MatchRPMProbe: "P1",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "0.0.0.0/0", NextHop: "10.0.0.1", PreferredMetric: 10},
+			},
+		},
+		"b-policy": {
+			Name: "b-policy", MatchRPMProbe: "P1",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "0.0.0.0/0", NextHop: "10.0.0.2", PreferredMetric: 20},
+			},
+		},
+		"c-policy": {
+			Name: "c-policy", MatchRPMProbe: "P1",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "192.0.2.0/24", NextHopInterface: "ge-0-0-3.0", PreferredMetric: 10},
+			},
+		},
+	}}
+	e, _ := newTestEngine(nil)
+	e.SetNextHopResolver(func(string) (string, bool) { return "", false }) // never resolves
+	results := []*rpm.ProbeResult{{ProbeName: "P1", TestName: "t", LastStatus: "fail"}}
+	e.Apply(cfg, results)
+
+	byName := map[string]PolicyStatus{}
+	for _, ps := range e.Status() {
+		byName[ps.Name] = ps
+	}
+
+	// a-policy wins the default route on the lower metric.
+	if len(byName["a-policy"].Routes) != 1 {
+		t.Fatalf("a-policy should win the default route: %+v", byName["a-policy"])
+	}
+	// b-policy is suppressed by a-policy, not applied and not unresolved.
+	b := byName["b-policy"]
+	if len(b.Routes) != 0 {
+		t.Fatalf("b-policy should not win: %+v", b.Routes)
+	}
+	if len(b.SuppressedRoutes) != 1 || b.SuppressedRoutes[0].WinnerPolicy != "a-policy" {
+		t.Fatalf("b-policy suppressed detail wrong: %+v", b.SuppressedRoutes)
+	}
+	// c-policy's interface-typed candidate is unresolved with detail.
+	ur := byName["c-policy"].UnresolvedRoutes
+	if len(ur) != 1 || ur[0].Destination != "192.0.2.0/24" ||
+		ur[0].NextHopInterface != "ge-0-0-3.0" || ur[0].Reason == "" {
+		t.Fatalf("c-policy unresolved detail wrong: %+v", ur)
+	}
+
+	var buf bytes.Buffer
+	FormatStatus(&buf, e.Status())
+	out := buf.String()
+	if !strings.Contains(out, "suppressed by policy a-policy") {
+		t.Fatalf("display missing suppressed detail:\n%s", out)
+	}
+	if !strings.Contains(out, "192.0.2.0/24") || !strings.Contains(out, "unresolved") ||
+		!strings.Contains(out, "ge-0-0-3.0") {
+		t.Fatalf("display missing unresolved detail:\n%s", out)
 	}
 }
 

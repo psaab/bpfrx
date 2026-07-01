@@ -553,8 +553,22 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		ipmonRoutesApplied: prometheus.NewDesc(
 			"xpf_ipmon_routes_applied",
-			"Number of ip-monitoring preferred routes currently applied "+
-				"(after winner resolution, #1827).",
+			"Number of ip-monitoring preferred routes ACTUALLY applied — "+
+				"the size of the last CONVERGED actuation's overlay that is "+
+				"live in both the kernel and userspace FIBs (#1827, #3761). "+
+				"Diverges below xpf_ipmon_routes_desired while an actuation "+
+				"is pending or the FRR/snapshot/FIB actuation keeps failing "+
+				"(#3757): a persistent gap flags a failover that is desired "+
+				"but not converged.",
+			nil, nil,
+		),
+		ipmonRoutesDesired: prometheus.NewDesc(
+			"xpf_ipmon_routes_desired",
+			"Number of ip-monitoring preferred routes the engine WANTS "+
+				"injected right now (winner-resolved overlay across FAILED "+
+				"policies, #3761). Compare with xpf_ipmon_routes_applied: a "+
+				"sustained desired>applied gap means the actuator has not "+
+				"converged the failover routes.",
 			nil, nil,
 		),
 		ipmonUnresolvedNextHops: prometheus.NewDesc(

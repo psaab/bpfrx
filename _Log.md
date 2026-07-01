@@ -1,3 +1,43 @@
+## 2026-07-01 — #3761 ip-monitoring: honest status/metrics (UNKNOWN vs PASS, applied vs desired, suppressed vs unresolved)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3761 (MEDIUM, codex-review-160 H7+H8+M9+M10+L12).
+    Status/metrics reported health/success for non-converged states,
+    hiding the failover-failure modes that need alerts. FIXES:
+    - H7: added `PolicyStatus.Known` (true once ≥1 RPM result for the
+      policy's probe is observed). `FormatStatus` renders `Status:
+      UNKNOWN` before any probe result instead of `PASS`.
+    - H8: engine now tracks `appliedOverlay` — the last CONVERGED
+      actuation's overlay (set in run() only when actuate()==true and no
+      newer change landed). `RoutesApplied()` and
+      `xpf_ipmon_routes_applied` report ACTUALLY-applied; added
+      `xpf_ipmon_routes_desired` for the winner-resolved intent.
+      `PolicyStatus.AppliedRoutes` carries the per-policy applied subset.
+    - M9: `UnresolvedRoutes` is now a typed `[]UnresolvedRoute`
+      (routing-instance, destination, tracked unit, metric, reason).
+    - M10: added `SuppressedRoutes []SuppressedRoute` — resolvable
+      candidates that lost winner resolution, shown as "suppressed by
+      policy <name>", distinct from unresolved. computeOverlayLocked
+      refactored to keep all resolvable candidates per key and attribute
+      losers to the winner after selection.
+    - L12: documented routes_applied/routes_desired/unresolved_next_hops
+      + the UNKNOWN/APPLIED/PENDING/suppressed/unresolved status rows in
+      docs/multi-wan.md and pkg/ipmon/README.md.
+    RED-on-revert tests: TestUnknownStatusNotReportedAsPass (H7),
+    TestRoutesAppliedReflectsActuationNotDesired (H8, -race),
+    TestUnresolvedAndSuppressedDetail (M9+M10). Verified RED on revert
+    (display PASS-not-UNKNOWN, applied==desired-while-failing, missing
+    suppressed/unresolved rows). go test ./pkg/ipmon/... (-race),
+    ./pkg/api/, ./pkg/daemon/ green.
+  - **File(s)**: pkg/ipmon/ipmon.go (types, appliedOverlay,
+    computeOverlayLocked refactor, Status, RoutesApplied, run),
+    pkg/ipmon/display.go (UNKNOWN + applied/pending/suppressed/unresolved
+    rows), pkg/api/metrics_system.go (applied-from-AppliedRoutes +
+    routes_desired), pkg/api/metrics.go + metrics_descriptors.go (new
+    gauge), pkg/ipmon/ipmon_test.go, pkg/ipmon/nexthop_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go, docs/multi-wan.md,
+    pkg/ipmon/README.md
+
 ## 2026-07-01 — #3763 ip-monitoring: recompute pending-recovery deadline when hold-down changes mid-recovery
 
 - **Timestamp**: 2026-07-01

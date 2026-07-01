@@ -93,8 +93,36 @@ this wrong by construction. Resolved entries carry the gateway in
 `RouteOverlayEntry.NextHop` (plus the lease key in
 `NextHopInterface`), so FRR render and the snapshot builder are
 unchanged. Skipped candidates surface as
-`PolicyStatus.UnresolvedRoutes` (shown by `FormatStatus` and exported
-as `xpf_ipmon_unresolved_next_hops`).
+`PolicyStatus.UnresolvedRoutes` (a typed `UnresolvedRoute` with the
+routing-instance, tracked unit, metric, and reason — shown by
+`FormatStatus` and exported as `xpf_ipmon_unresolved_next_hops`).
+
+## Status truth model (#3761)
+
+`Status`/`FormatStatus`/metrics distinguish converged truth from intent:
+
+- **UNKNOWN vs PASS (H7).** `PolicyStatus.Known` is false until the
+  policy's probe has produced at least one result. `FormatStatus`
+  renders `Status: UNKNOWN` in that window — never `PASS`. An operator
+  reading `PASS` would assume failover protection is active when no
+  probe has run.
+- **Applied vs desired (H8).** `PolicyStatus.Routes` is the DESIRED
+  winner-resolved overlay (what the engine wants injected).
+  `PolicyStatus.AppliedRoutes` is the subset of the last CONVERGED
+  actuation's overlay owned by the policy — what is actually live in the
+  kernel + userspace FIBs. The engine records `appliedOverlay` only when
+  the run loop confirms a consistent actuation (`actuate()==true` and no
+  newer change landed), so it holds the last good state across a
+  failing/pending actuation (#3757). `RoutesApplied()` and
+  `xpf_ipmon_routes_applied` report applied; `xpf_ipmon_routes_desired`
+  reports desired. A sustained `desired > applied` gap means the
+  actuator has not converged the failover routes.
+- **Suppressed vs unresolved (M9/M10).** A FAILED policy's resolvable
+  candidate that lost winner resolution to another policy is reported in
+  `PolicyStatus.SuppressedRoutes` (`suppressed by policy <name>`),
+  distinct from an interface-typed candidate skipped for a missing
+  next-hop (`UnresolvedRoutes`). Neither reads as a bare "(none
+  applied)".
 
 `NotifyNextHopChange` is the DHCP gateway-change trigger (wired to
 `dhcp.New`'s `onGatewayChange` hook): it marks the overlay dirty only

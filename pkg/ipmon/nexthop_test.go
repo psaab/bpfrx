@@ -135,7 +135,7 @@ func TestNilResolverSkips(t *testing.T) {
 		t.Fatalf("overlay = %+v with nil resolver, want nil", overlay)
 	}
 	st := e.Status()
-	if len(st) != 1 || len(st[0].UnresolvedRoutes) != 1 || st[0].UnresolvedRoutes[0] != "0.0.0.0/0" {
+	if len(st) != 1 || len(st[0].UnresolvedRoutes) != 1 || st[0].UnresolvedRoutes[0].Destination != "0.0.0.0/0" {
 		t.Fatalf("status = %+v, want one unresolved route", st)
 	}
 }

@@ -185,6 +185,7 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 	// #1827: services ip-monitoring policy state.
 	if c.srv.ipmonStatusFn != nil {
 		routesApplied := 0
+		routesDesired := 0
 		unresolved := 0
 		for _, ps := range c.srv.ipmonStatusFn() {
 			failed := 0.0
@@ -195,7 +196,13 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, failed, ps.Name)
 			ch <- prometheus.MustNewConstMetric(c.ipmonPolicyTransitions,
 				prometheus.CounterValue, float64(ps.Transitions), ps.Name)
-			routesApplied += len(ps.Routes)
+			// #3761 H8: routes_applied must reflect what is ACTUALLY live
+			// in the FIBs (the last converged actuation), not the desired
+			// overlay — a failed FRR/snapshot/FIB actuation must not read
+			// as applied. routes_desired exposes the winner-resolved
+			// intent separately.
+			routesApplied += len(ps.AppliedRoutes)
+			routesDesired += len(ps.Routes)
 			// #1844: Status() recomputes the overlay (including the
 			// resolver skips), so the gauge is current on every scrape
 			// without requiring an actuation.
@@ -203,6 +210,8 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.ipmonRoutesApplied,
 			prometheus.GaugeValue, float64(routesApplied))
+		ch <- prometheus.MustNewConstMetric(c.ipmonRoutesDesired,
+			prometheus.GaugeValue, float64(routesDesired))
 		ch <- prometheus.MustNewConstMetric(c.ipmonUnresolvedNextHops,
 			prometheus.GaugeValue, float64(unresolved))
 	}

@@ -168,6 +168,7 @@ type xpfCollector struct {
 	ipmonPolicyFailed       *prometheus.Desc
 	ipmonPolicyTransitions  *prometheus.Desc
 	ipmonRoutesApplied      *prometheus.Desc
+	ipmonRoutesDesired      *prometheus.Desc
 	ipmonUnresolvedNextHops *prometheus.Desc
 
 	// #1895: count of RPM next-hop probe pins whose kernel fwmark
@@ -588,6 +589,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ipmonPolicyFailed
 	ch <- c.ipmonPolicyTransitions
 	ch <- c.ipmonRoutesApplied
+	ch <- c.ipmonRoutesDesired
 	ch <- c.ipmonUnresolvedNextHops
 	ch <- c.rpmPinInstallFailures
 	ch <- c.eventActionsCommitted
