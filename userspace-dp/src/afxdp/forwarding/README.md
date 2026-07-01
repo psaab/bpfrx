@@ -158,13 +158,28 @@ control plane computes that effective union and carries it on
 `host_inbound_system_services` / `host_inbound_protocols`), populated only for
 an interface that declared an interface-level stanza and is not a
 management/cluster-control lifeline. `forwarding_build::interfaces`
-classifies it into `ForwardingState::ifindex_host_inbound`, keyed by ingress
-ifindex. The local-delivery admit path calls `host_inbound_admits_iface`,
-which prefers the per-INTERFACE set when the ingress ifindex has one and
-otherwise falls back to the zone-keyed `host_inbound_admits` — so a service
-exposed on one interface of a zone is admitted there while the zone-default
-set (possibly empty → fail-closed deny-all) governs the zone's other
-interfaces. A zone enforcing host-inbound ONLY via an interface override is
+classifies it into `ForwardingState::ifindex_host_inbound`, keyed by the
+interface's own **LOGICAL** unit ifindex (`iface.ifindex`). The local-delivery
+admit path calls `host_inbound_admits_iface`, which prefers the per-INTERFACE
+set when the ingress ifindex has one and otherwise falls back to the
+zone-keyed `host_inbound_admits` — so a service exposed on one interface of a
+zone is admitted there while the zone-default set (possibly empty →
+fail-closed deny-all) governs the zone's other interfaces.
+
+**Logical-ifindex keying on the poll path (#3609).** Because the override map
+is keyed by the logical unit ifindex, the local-delivery gate MUST look it up
+with the resolved logical ingress ifindex — NOT the raw physical bind port in
+`meta.ingress_ifindex`. For a frame on a VLAN sub-interface (e.g.
+`reth1.100`), `meta.ingress_ifindex` is the parent port and
+`meta.ingress_vlan_id` selects the unit; the caller resolves `(parent, vlan) →
+logical` once via `resolve_ingress_logical_ifindex` (untagged ports resolve
+physical == logical) and threads it into `host_inbound_gated_lo0_action`, which
+forwards it to `host_inbound_admits_iface`. This mirrors the sibling
+input-filter, zone-pair (#3021), screen (#3022), and CoS (#3026) sites — every
+per-ingress map keyed by the logical unit resolves first. Before #3609 the gate
+passed the raw physical ifindex, so a VLAN sub-interface's override was missed
+and it silently fell back to the zone set (over-/under-permitting the control
+plane). A zone enforcing host-inbound ONLY via an interface override is
 still marked `host_inbound_configured` on its `ZoneSnapshot` (with an empty
 zone-keyed set), so a non-overridden interface in that zone fail-closes —
 matching the kernel-nft primary path, where `BuildZoneHostInboundViews` emits
