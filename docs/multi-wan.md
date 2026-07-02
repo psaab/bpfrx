@@ -285,6 +285,25 @@ Semantics (verified against Junos in the plan's research rounds):
   `routing-instance` target must exist (PR-2 lifted the PR-1b
   rejection of `instance-type forwarding` targets — see the FBF
   section below).
+- **IPv6 link-local preferred-route next-hops (#3759).** A literal IPv6
+  link-local next-hop (`fe80::…`, the common IPv6 WAN gateway form) has
+  no meaning to FRR without an interface scope — FRR rejects a scopeless
+  `ipv6 route ::/0 fe80::1`. The overlay renders through the same
+  `generateStaticRouteInTable` + `IPv6NextHopInterfaces` machinery as
+  configured statics, so a preferred-route link-local next-hop is now
+  fed through `inferIPv6StaticNextHopInterfaces` and gets its interface
+  scope attached exactly like a static route (#2452): resolved to the
+  box's sole IPv6 interface when unambiguous, keyed by the same VRF the
+  render uses (`""` for the master table and `instance-type forwarding`
+  targets, `vrf-<name>` for a virtual-router instance). A global-unicast
+  next-hop resolves by longest-prefix as usual (bare when it matches no
+  connected subnet — FRR accepts a scopeless global next-hop). When the
+  box has multiple IPv6 interfaces the link-local next-hop is ambiguous
+  and stays unresolved — identical to a static route: FRR then rejects
+  it, and the operator must disambiguate. The userspace-snapshot overlay
+  still carries the bare next-hop address (a wire-protocol
+  `addr@iface` convention is a follow-up); the kernel FIB path — where
+  the failover route actually installs — is the one this fix repairs.
 
 ## Per-policy uplink selection — FBF composition (PR-2)
 

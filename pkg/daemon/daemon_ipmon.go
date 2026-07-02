@@ -139,7 +139,7 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 		InterfaceBandwidths:   ifaceBandwidths,
 		InterfacePointToPoint: ifaceP2P,
 		RethMap:               cfg.RethToPhysical(),
-		IPv6NextHopInterfaces: inferIPv6StaticNextHopInterfaces(cfg),
+		IPv6NextHopInterfaces: inferIPv6StaticNextHopInterfaces(cfg, overlay),
 		ClusterMode:           d.cluster != nil,
 		PreferredRoutes:       overlay,
 	}

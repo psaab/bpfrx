@@ -26792,3 +26792,34 @@ top.
     + pkg/ipmon/nexthop_test.go (signature sweep + TestStopAbortsBlockedActuation),
     pkg/daemon/daemon_ipmon_test.go (TestActuateRouteOverlayAbortsOnContextCancel),
     docs/multi-wan.md (non-blocking shutdown bullet)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3759 — ip-monitoring: interface-scoped IPv6 link-local
+    preferred-route next-hop. A literal link-local next-hop
+    (`preferred-route route ::/0 next-hop fe80::1`) committed cleanly but
+    rendered a scopeless `ipv6 route ::/0 fe80::1`, which FRR rejects —
+    the failover route silently failed to install. Root cause: the
+    overlay reuses `generateStaticRouteInTable` + `IPv6NextHopInterfaces`
+    but the overlay's PreferredRoutes were NEVER fed into
+    `inferIPv6StaticNextHopInterfaces`, so the map was always absent for
+    the failover gateway. Fix: pass the overlay to the inference
+    (`inferIPv6StaticNextHopInterfaces(cfg, overlay)` in assembleFRRConfig)
+    and resolve each overlay literal v6 next-hop through the SAME
+    connected-prefix / synthetic-fe80::/64 pipeline as static routes,
+    keyed by the VRF the render uses (`""` for master + forwarding
+    instances, `vrf-<name>` for virtual-router). Matches static-route
+    handling (#2452): resolves on a single IPv6 interface, stays
+    unresolved (FRR-rejected, operator must disambiguate) when ambiguous.
+    Chose the attach-scope option over commit-reject because the routing
+    code (static routes) attaches scope via this exact map and never
+    rejects link-local at commit. RED-on-revert proven: reverting the
+    inference-body overlay loop → direct inference tests RED; reverting
+    the assembleFRRConfig call-site → assemble test RED. go test
+    ./pkg/daemon/ ./pkg/frr/ green.
+  - **File(s)**: pkg/daemon/daemon_run.go (inferIPv6StaticNextHopInterfaces
+    overlay arg + resolution loop), pkg/daemon/daemon_ipmon.go (call site),
+    pkg/daemon/ipv6_static_nexthop_test.go (overlay link-local + forwarding
+    + nil-control tests; static callers → nil), pkg/daemon/daemon_ipmon_test.go
+    (TestAssembleFRRConfigResolvesOverlayLinkLocal),
+    pkg/frr/preferred_routes_test.go (render contract test),
+    docs/multi-wan.md + pkg/frr/README.md (link-local overlay next-hop)

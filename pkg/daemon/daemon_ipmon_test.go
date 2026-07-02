@@ -131,6 +131,35 @@ func TestAssembleFRRConfigCarriesOverlay(t *testing.T) {
 	}
 }
 
+// TestAssembleFRRConfigResolvesOverlayLinkLocal is the #3759 wiring
+// check at the assembler: assembleFRRConfig must feed the overlay it is
+// handed into inferIPv6StaticNextHopInterfaces so a link-local
+// preferred-route next-hop carries an interface scope into the FRR
+// render. On revert (the overlay is not passed to the inference) the
+// map entry is absent and the assertion fails.
+func TestAssembleFRRConfigResolvesOverlayLinkLocal(t *testing.T) {
+	d := &Daemon{}
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"ge-0/0/3": {
+					Units: map[int]*config.InterfaceUnit{
+						50: {Addresses: []string{"2001:559:8585:50::8/64"}},
+					},
+				},
+			},
+		},
+	}
+	overlay := []config.RouteOverlayEntry{
+		{Destination: "::/0", NextHop: "fe80::1", Policy: "wan-failover"},
+	}
+
+	fc := d.assembleFRRConfig(cfg, overlay)
+	if got := fc.IPv6NextHopInterfaces[""]["fe80::1"]; got != "ge-0-0-3.50" {
+		t.Fatalf("IPv6NextHopInterfaces[\"\"][fe80::1] = %q, want ge-0-0-3.50 (overlay not fed into inference, #3759)", got)
+	}
+}
+
 // TestAssembleFRRConfigForwardingInstanceTable (#1827 PR-2): forwarding
 // instances map to InstanceConfig{VRFName: "", TableID: <kernel table>}
 // so FRR renders their statics with `table <id>` instead of polluting
