@@ -2353,6 +2353,81 @@ fn forwarding_resolution_rejects_next_table_loop() {
     );
 }
 
+// #3768 (M5): the v6 next-table recursion must canonicalize the next-table
+// name for the v6 family before looking it up. Here the v6 leak route
+// carries its next-table in the WRONG v4 form ("blue.inet.0") — exactly
+// what the pre-#3768-H6 Go emitter produced. routes_v6 is keyed as
+// "blue.inet6.0", so without canonicalization the recursion into
+// "blue.inet.0" misses -> NoRoute -> the leaked IPv6 route blackholes. With
+// the M5 fix the recursion rewrites "blue.inet.0" -> "blue.inet6.0" and the
+// lookup hits the VRF v6 table. On revert of M5 this asserts RED (NoRoute
+// instead of ForwardCandidate).
+#[test]
+fn forwarding_v6_next_table_canonicalizes_inet_form_on_recursion() {
+    let mut snapshot = forwarding_snapshot_with_next_table(true);
+    // routes[2] is the v6 leak: inet6.0 -> next_table blue.inet6.0. Rewrite
+    // it to the v4-form name a pre-H6 snapshot would carry.
+    assert_eq!(snapshot.routes[2].table, "inet6.0");
+    assert_eq!(snapshot.routes[2].next_table, "blue.inet6.0");
+    snapshot.routes[2].next_table = "blue.inet.0".to_string();
+
+    let state = build_forwarding_state(&snapshot);
+    let resolved = lookup_forwarding_resolution(
+        &state,
+        IpAddr::V6("2606:4700:4700::1111".parse().expect("ipv6")),
+    );
+    assert_eq!(
+        resolved.disposition,
+        ForwardingDisposition::ForwardCandidate,
+        "v6 next-table in .inet.0 form must canonicalize to the v6 VRF table"
+    );
+    assert_eq!(resolved.egress_ifindex, 12);
+    assert_eq!(
+        resolved.next_hop,
+        Some(IpAddr::V6("2001:559:8585:50::1".parse().expect("v6 nh")))
+    );
+}
+
+// #3768 (M6): an A->B->A cross-table next-table cycle is rejected as
+// NextTableUnsupported via the per-resolution visited-table set. The
+// pre-fix guard only caught a direct self-loop (next == current table), so
+// a two-table cycle recursed until MAX_NEXT_TABLE_DEPTH. This asserts the
+// terminal disposition and that resolution terminates (no hang / panic);
+// the visited set makes it terminate at the first revisit rather than
+// burning the full depth budget.
+#[test]
+fn forwarding_resolution_rejects_cross_table_next_table_cycle() {
+    let snapshot = ConfigSnapshot {
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet.0".to_string(),
+                family: "inet".to_string(),
+                destination: "0.0.0.0/0".to_string(),
+                next_hops: vec![],
+                discard: false,
+                next_table: "red.inet.0".to_string(),
+                preference: 0,
+            },
+            crate::RouteSnapshot {
+                table: "red.inet.0".to_string(),
+                family: "inet".to_string(),
+                destination: "0.0.0.0/0".to_string(),
+                next_hops: vec![],
+                discard: false,
+                next_table: "inet.0".to_string(),
+                preference: 0,
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let resolved = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    assert_eq!(
+        resolved.disposition,
+        ForwardingDisposition::NextTableUnsupported
+    );
+}
+
 #[test]
 fn tx_binding_resolution_prefers_bind_ifindex_for_vlan_units() {
     let state = build_forwarding_state(&nat_snapshot());
