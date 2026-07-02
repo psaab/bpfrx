@@ -117,3 +117,33 @@ and resolves session display names from the dataplane's assigned `app_id`.
   a fail-closed result instead of panicking the app-catalog build. This
   matches the strict validation walker (`compiler_validate_strict.go`),
   which already `continue`s on the same nil entries.
+
+## Tolerant-load port parsers must DEGRADE, not MISLABEL (#3725)
+
+Strict commit (`config.validatePortSpec`, canonical unsigned parsing) rejects a
+malformed port spec, but a leniently-loaded / stale-persisted / peer-synced
+`config.Application` (#1960) still flows into both the AppID catalog and the
+display/filter tuple fallback. The port parsers on that path must DEGRADE — drop
+the bad entry — never MISLABEL a session as a wrong-but-plausible application:
+
+- **Tuple fallback (`portInSpec`, `runtime.go`, H02/M05):** parses through
+  `config.ParseCanonicalUint` and range-checks `1..65535` (via `canonicalPort`),
+  exactly like the strict gate. The prior `strconv.Atoi` parse silently narrowed
+  an out-of-range value through the `uint16` cast (`"70000"` → 4464, so a real
+  session to port 4464 was labeled as the malformed app) and accepted a signed
+  spelling (`"+80"` → 80). A malformed spec now never matches.
+- **AppID catalog (`BuildCatalog`, `catalog.go`):** a catalog row is emitted
+  only for an **emittable** application — non-inverted destination range, a
+  source-port that parses, and a non-inverted source range. A bad `source-port`
+  no longer ships an unconstrained `SrcPortLow=0/High=0` row (H03/M06, which
+  would stamp ANY matching dst-port flow), and a reversed range no longer ships
+  inverted bounds (M07). An unemittable app still **consumes** its `app_id` so
+  the id sequence stays in lock-step with `compileApplications` (which bumps the
+  id in those cases); only a dest-port parse error skips the id.
+- **AppNames (`BuildCatalog` and `compileApplications`, M04):** the `app_id →
+  name` mapping is recorded ONLY for an emittable app. Recording it before the
+  port parse left `AppNames` holding a name at an id no `CatalogEntry` can stamp
+  when the malformed app sorted last, so a skewed/stale `app_id` (helper catalog
+  skew) resolved to the malformed name instead of `UNKNOWN`. Both producers are
+  fixed identically; `TestAppCatalogParityOnTolerantLoadPortEdges` pins them
+  byte-identical and dangling-free.
