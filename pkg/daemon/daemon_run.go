@@ -1306,6 +1306,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// #2464: per-collector NetFlow v9 / IPFIX write-health for the
 			// xpf_flow_export_collector_* family + /services/flow-exporters.
 			FlowCollectorHealthFn: d.FlowCollectorHealth,
+			// #3747: per-exporter pending-batch queue depth / high-water /
+			// dropped-at-capacity count for the xpf_flow_export_batch_* family.
+			FlowExportBatchStatsFn: d.FlowExportBatchStats,
 			// #3419 M6: report whether this node is the active cluster member
 			// for RG0 so the REST session view's ha_active field matches the
 			// gRPC contract (server_sessions.go IsLocalPrimary(0)). Standalone

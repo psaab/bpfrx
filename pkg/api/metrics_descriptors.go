@@ -1793,5 +1793,22 @@ func newCollector(srv *Server) *xpfCollector {
 			"Unix timestamp of the last failed write to this flow-export collector (0 if none yet). Labeled by instance and template as well as collector and source (#3741).",
 			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
 		),
+
+		// #3747: per-exporter pending-batch queue observability.
+		flowExportBatchDepth: prometheus.NewDesc(
+			"xpf_flow_export_batch_depth",
+			"Current number of flow records pending in the export batch for this group (both families combined). Normally near 0 — the exporter drains every 100ms; a sustained nonzero value means the drain cannot keep up (stalled export goroutine, slow/unreachable collector, or a SESSION_CLOSE storm) (#3747).",
+			[]string{"protocol", "instance", "template"}, nil,
+		),
+		flowExportBatchMaxDepth: prometheus.NewDesc(
+			"xpf_flow_export_batch_max_depth",
+			"High-water mark of the pending export batch depth for this group since the exporter started. Captures a transient backlog even after a later drain empties the queue (#3747).",
+			[]string{"protocol", "instance", "template"}, nil,
+		),
+		flowExportBatchDroppedTotal: prometheus.NewDesc(
+			"xpf_flow_export_batch_dropped_total",
+			"Total flow records dropped because the pending export batch was at its per-family capacity (#3747). Before #3747 the batch was unbounded and a stalled/overrun drain grew memory without bound; it now drops (drop-newest) and counts. A climbing value means export records are being lost to a drain that cannot keep up.",
+			[]string{"protocol", "instance", "template"}, nil,
+		),
 	}
 }
