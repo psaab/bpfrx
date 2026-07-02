@@ -8,10 +8,59 @@
 
 use super::super::*;
 
+/// #3719 (H03): reject a snapshot in which two DIFFERENT security zones share
+/// the same nonzero, non-reserved numeric zone id, BEFORE `populate_zones`
+/// touches any id-keyed map. Two zone names can fold to the same
+/// `config.StableZoneID`; publishing both would let the later zone silently
+/// overwrite the earlier's `zone_id_to_name` / `zone_host_inbound` /
+/// `zone_tcp_rst` entries below — merging two security zones under one id (a
+/// zone-isolation failure). The Go control plane already QUARANTINES the
+/// later-sorting colliding zone before it reaches the wire
+/// (`config.QuarantinedZoneNames` -> `quarantineCollidingZones`,
+/// pkg/dataplane/userspace/zones.go), so a clean snapshot never trips this; this
+/// is the helper-boundary backstop for a corrupt / hand-built / version-drifted
+/// snapshot, consistent with the #3402 / #3771 fail-closed family. Rejecting the
+/// whole snapshot keeps the previous good forwarding state (a fresh boot keeps
+/// the default-deny), never merging two zones.
+///
+/// The skip set mirrors `populate_zones`: an id of 0, an empty name, or an id in
+/// the reserved range (`>= ZONE_ID_RESERVED_MIN`) is never installed, so it is
+/// not a collision. Duplicate entries with the SAME name are the same zone, not
+/// a collision. The first differing-name duplicate wins the error, naming both.
+pub(super) fn reject_duplicate_zone_ids(
+    snapshot: &ConfigSnapshot,
+) -> Result<(), crate::policy::SnapshotIntegrityError> {
+    let mut owner: std::collections::HashMap<u16, &str> =
+        std::collections::HashMap::with_capacity(snapshot.zones.len());
+    for zone in &snapshot.zones {
+        if zone.id == 0
+            || zone.name.is_empty()
+            || zone.id >= crate::policy::ZONE_ID_RESERVED_MIN
+        {
+            continue;
+        }
+        match owner.get(&zone.id) {
+            Some(&first) if first != zone.name.as_str() => {
+                return Err(crate::policy::SnapshotIntegrityError::DuplicateZoneId {
+                    id: zone.id,
+                    first: first.to_string(),
+                    second: zone.name.clone(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                owner.insert(zone.id, zone.name.as_str());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Populate `state.zone_name_to_id` / `state.zone_id_to_name`.
 /// Must run before any other pass that resolves zone names
 /// (interfaces addresses pass, interfaces egress pass,
-/// `parse_policy_state_with_counters`).
+/// `parse_policy_state_with_counters`). Callers MUST run
+/// `reject_duplicate_zone_ids` first so no two zones share an id.
 pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingState) {
     // #3402: build the name→id map from the shared SSOT so the apply-time
     // integrity preflight (which has no live forwarding state yet) resolves

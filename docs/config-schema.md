@@ -2295,6 +2295,45 @@ id (strict on commit/commit-check; lenient warning on load/peer-sync), using the
 three-view (View 1 pre-expansion union + node0/node1 `${node}` expansion) union
 discipline so the verdict is identical on both cluster nodes.
 
+**#3719 — lenient-path collision QUARANTINE (runtime enforcement of the
+warning).** The strict gate rejects a collision, but the lenient path only
+**warned** while every downstream builder still published BOTH colliding zones
+with the same numeric id. Two `ZoneSnapshot`s sharing an id merge two security
+zones in the dataplane: the Rust id-keyed maps
+(`zone_id_to_name` / `zone_host_inbound` / `zone_tcp_rst`, `populate_zones`) let
+the later zone overwrite the earlier's reverse name, host-inbound admission set,
+and tcp-rst bit, and both zones' interfaces/policies resolve to one id — a
+zone-isolation failure the lenient warning falsely claimed was quarantined.
+`config.QuarantinedZoneNames` (`zoneid.go`) is the SSOT that, for each id claimed
+by more than one name, keeps the **sorted-first** name (the survivor) and
+quarantines the rest. It is a pure function of the name set, so both HA nodes and
+a cold-booting node agree. The userspace builder's `quarantineCollidingZones`
+(`pkg/dataplane/userspace/zones.go`) applies it to the built snapshot BEFORE
+publish: it **drops** the quarantined `ZoneSnapshot`, **unzones** any interface
+bound to it (`Zone=""` → default-deny, fail closed), and **drops** any policy
+whose from/to zone is quarantined (leaving a dangling policy→zone reference would
+trip the Rust `UnresolvableZoneReference` preflight and reject the WHOLE snapshot
+— a brick on a fresh boot). The rest of the config still loads (#1960 no-brick).
+The id→name reverse maps resolve a colliding id to the survivor deterministically
+(`config.StableZoneIDOwner`; `pkg/cli/apply.go:syslogZoneNameMap`,
+`pkg/dataplane/userspace/manager_ha.go:zoneNameByID`) rather than to whichever
+name won a map-iteration race. The quarantine is surfaced to the operator as a
+loud one-shot `slog.Error` naming both zones, on `ProcessStatus.ZoneIDCollisions`
+(`show`), and as the `xpf_userspace_zone_id_collision` 0/1 gauge, so an operator
+is paged until one zone is renamed. Regression coverage:
+`pkg/config/zoneid_test.go` (`TestQuarantinedZoneNamesDropsLaterColliding`,
+`TestStableZoneIDOwnerReturnsSurvivor`,
+`TestZoneIDCollisionLenientWarningStatesQuarantine`),
+`pkg/dataplane/userspace/zones_collision_3719_test.go`
+(`TestBuildSnapshotQuarantinesCollidingZone` — RED-on-revert), and
+`pkg/cli/apply_syslog_zonemap_3704_test.go`
+(`TestSyslogZoneNameMapCollisionResolvesToSurvivor`). A defense-in-depth Rust
+backstop `SnapshotIntegrityError::DuplicateZoneId` (`zones::reject_duplicate_zone_ids`,
+called before `populate_zones` in `build_forwarding_state`) rejects a snapshot
+that STILL carries two different zones under one nonzero non-reserved id — the
+helper-boundary guard for a corrupt / version-drifted snapshot that bypassed the
+Go quarantine (regression `build_forwarding_state_rejects_duplicate_zone_ids`).
+
 **`MaxUsableZoneID`** is now `ZoneIDReservedMin-1` (65533) — the pigeonhole bound
 of the u16 stable-hash space, not the old 255-id u8 wire limit (**#2391
 superseded**). The forwarding builder still rejects any id `>= ZONE_ID_RESERVED_MIN`

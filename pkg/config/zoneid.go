@@ -165,8 +165,87 @@ func validateZoneIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, error
 		if !lenient {
 			return nil, fmt.Errorf("security zones: %s", msg)
 		}
-		warnings = append(warnings, msg+
-			"; the later-sorting zone is NOT installed in the dataplane")
+		// #3719: the lenient path keeps booting but QUARANTINES the
+		// later-sorting zone (QuarantinedZoneNames) so the dataplane never
+		// receives two zones sharing a numeric id. Word the warning so the
+		// operator knows the box is running in a degraded zone-isolation state:
+		// the quarantined zone is dropped from the dataplane, its interfaces are
+		// unzoned, and its traffic is denied until one zone is renamed.
+		warnings = append(warnings, fmt.Sprintf("%s; the later-sorting zone %q is QUARANTINED"+
+			" (dropped from the dataplane, its interfaces unzoned and its traffic denied) —"+
+			" zone isolation is DEGRADED until one zone is renamed", msg, name))
 	}
 	return warnings, nil
+}
+
+// QuarantinedZoneNames returns the set of security-zone names that MUST NOT be
+// installed in the dataplane because their StableZoneID collides with an
+// earlier (alphabetically-sorted) zone's id. For each numeric id claimed by
+// more than one name, the sorted-FIRST name keeps the id and every later name
+// that folds to the same id is quarantined.
+//
+// This is the RUNTIME enforcement of the promise the lenient collision warning
+// (validateZoneIDCollisionAST) already makes — "the later-sorting zone is NOT
+// installed in the dataplane" — so the dataplane never receives two zones that
+// share a numeric id. Publishing both would MERGE two security zones: one
+// zone's interfaces, policies, counters, host-inbound admission set, and
+// tcp-rst bit would stand in for the other (#3719 — the wire builder, the Rust
+// id-keyed maps, and the id→name reverse maps all key on the numeric id). The
+// STRICT commit path REJECTS a collision outright; the LENIENT path (tolerant
+// load / peer-sync / a config a pre-#3075 binary persisted with no collision
+// check) keeps booting but quarantines the colliding zone here, preserving the
+// #1960 no-brick intent — the rest of the config still loads and only the
+// later-sorting colliding zone is dropped.
+//
+// The decision is a pure function of the zone-name SET (StableZoneID is a pure
+// function of the name and the sorted tie-break is deterministic), so both HA
+// nodes and a cold-booting node compute the IDENTICAL quarantine set from the
+// identical config — the same HA-symmetry guarantee StableZoneID itself carries.
+// Returns nil when no id collides (the common case).
+func QuarantinedZoneNames(names []string) map[string]struct{} {
+	if len(names) < 2 {
+		return nil
+	}
+	sorted := make([]string, len(names))
+	copy(sorted, names)
+	sort.Strings(sorted)
+	owner := make(map[uint16]string, len(sorted))
+	var quarantined map[string]struct{}
+	for _, name := range sorted {
+		id := StableZoneID(name)
+		if existing, taken := owner[id]; taken {
+			if existing == name {
+				// Defensive: a duplicated name in the input slice is the same
+				// zone, not a collision (map-keyed callers never hit this).
+				continue
+			}
+			if quarantined == nil {
+				quarantined = make(map[string]struct{})
+			}
+			quarantined[name] = struct{}{}
+			continue
+		}
+		owner[id] = name
+	}
+	return quarantined
+}
+
+// StableZoneIDOwner returns the security-zone name that OWNS a given numeric
+// zone id among names — the sorted-first name that folds to id, i.e. the zone
+// that survives QuarantinedZoneNames. It returns "" when no name in names folds
+// to id. Callers building an id→name reverse map (syslog RT_FLOW rendering, HA
+// session-delta naming) use this so a collision resolves deterministically to
+// the SAME surviving zone the dataplane actually installed, never to a
+// quarantined zone that the wire builder dropped (#3719).
+func StableZoneIDOwner(names []string, id uint16) string {
+	owner := ""
+	for _, name := range names {
+		if StableZoneID(name) != id {
+			continue
+		}
+		if owner == "" || name < owner {
+			owner = name
+		}
+	}
+	return owner
 }

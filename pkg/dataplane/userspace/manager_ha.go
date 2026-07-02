@@ -1158,14 +1158,25 @@ func (m *Manager) zoneNameByID(zoneID uint16) string {
 	if zoneID == 0 {
 		return ""
 	}
-	if cr := m.bpfShim.LastCompileResult(); cr != nil {
-		for name, id := range cr.ZoneIDs {
-			if id == zoneID {
-				return name
-			}
+	cr := m.bpfShim.LastCompileResult()
+	if cr == nil {
+		return ""
+	}
+	// #3719: a StableZoneID collision maps two zone names to the same id in
+	// ZoneIDs. The dataplane installs only the sorted-FIRST name (the survivor
+	// config.QuarantinedZoneNames keeps), so resolve deterministically to that
+	// name instead of returning whichever name a map-iteration coin flip yields
+	// — which could name the QUARANTINED zone that forwards nothing.
+	owner := ""
+	for name, id := range cr.ZoneIDs {
+		if id != zoneID {
+			continue
+		}
+		if owner == "" || name < owner {
+			owner = name
 		}
 	}
-	return ""
+	return owner
 }
 
 func nativeUint32ToIP(v uint32) net.IP {

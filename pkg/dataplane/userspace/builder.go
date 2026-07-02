@@ -75,7 +75,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 	if err != nil {
 		return nil, err
 	}
-	return &ConfigSnapshot{
+	snap := &ConfigSnapshot{
 		Version:         ProtocolVersion,
 		Generation:      generation,
 		FIBGeneration:   fibGeneration,
@@ -134,7 +134,23 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 			SchedulerCount: len(cfg.Schedulers),
 			HAEnabled:      cfg.Chassis.Cluster != nil,
 		},
-	}, nil
+	}
+	// #3719: enforce the StableZoneID zone-isolation invariant BEFORE the
+	// snapshot is published. On the lenient / HA-sync / pre-#3075-persisted
+	// path two zone names can fold to the same numeric id; publishing both
+	// merges two security zones in the dataplane. quarantineCollidingZones
+	// drops the later-sorting colliding zone (and unzones its interfaces / drops
+	// its policies so no dangling reference bricks the helper preflight),
+	// leaving the rest of the config intact (#1960 no-brick). The stashed
+	// collisions ride up to ApplyConfig, which fires the operator alarm and
+	// stamps the status/metric.
+	snap.zoneIDCollisions = quarantineCollidingZones(snap)
+	if len(snap.zoneIDCollisions) > 0 {
+		// Keep the operator-facing counts equal to what is actually published.
+		snap.Summary.ZoneCount = len(snap.Zones)
+		snap.Summary.PolicyCount = len(snap.Policies)
+	}
+	return snap, nil
 }
 
 // snapshotContentHash computes a SHA-256 hash over the stable content of a

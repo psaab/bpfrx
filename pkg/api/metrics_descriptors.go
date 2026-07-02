@@ -506,6 +506,20 @@ func newCollector(srv *Server) *xpfCollector {
 				"re-commit. 0 when the last build was fully representable.",
 			nil, nil,
 		),
+		userspaceZoneIDCollision: prometheus.NewDesc(
+			"xpf_userspace_zone_id_collision",
+			"1 while the most recently built userspace snapshot QUARANTINED "+
+				"one or more security zones because two zone names fold to the "+
+				"same StableZoneID (#3719). The strict commit path rejects a "+
+				"collision; this fires only on the lenient / HA-sync / "+
+				"pre-#3075-persisted path, where the later-sorting zone is "+
+				"dropped from the dataplane (its interfaces unzoned, its "+
+				"traffic denied) so two zones never share an id. The dataplane "+
+				"is fail-closed, but zone isolation is DEGRADED (the "+
+				"quarantined zone forwards nothing) until an operator renames "+
+				"one zone and re-commits. 0 when every zone has a distinct id.",
+			nil, nil,
+		),
 		rpmPinInstallFailures: prometheus.NewDesc(
 			"xpf_rpm_probe_pin_install_failures",
 			"Number of RPM next-hop probe pins whose kernel fwmark rule / "+

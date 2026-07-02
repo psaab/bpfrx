@@ -49,6 +49,7 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitNeighborColdStartCapture(ch, status)
 	c.emitWireguardTelemetry(ch, status)
 	c.emitPolicyContentRejected(ch, status)
+	c.emitZoneIDCollision(ch, status)
 	c.emitRejectObservability(ch, status)
 	c.emitFabricSkipCounters(ch, status)
 }
@@ -120,6 +121,20 @@ func (c *xpfCollector) emitPolicyContentRejected(ch chan<- prometheus.Metric, st
 		v = 1.0
 	}
 	ch <- prometheus.MustNewConstMetric(c.userspacePolicyContentRejected, prometheus.GaugeValue, v)
+}
+
+// emitZoneIDCollision exposes the #3719 0/1 gauge: 1 while the last userspace
+// snapshot build quarantined one or more security zones whose StableZoneID
+// collided (lenient / HA-sync / pre-#3075-persisted path). The dataplane is
+// fail-closed (the later-sorting zone is dropped, never merged), but zone
+// isolation is degraded until one zone is renamed. Emitted unconditionally so 0
+// is a real "all zones distinct" signal, not an absent series.
+func (c *xpfCollector) emitZoneIDCollision(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	v := 0.0
+	if len(status.ZoneIDCollisions) > 0 {
+		v = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(c.userspaceZoneIDCollision, prometheus.GaugeValue, v)
 }
 
 // emitWireguardTelemetry exposes the #1865 per-WG-tunnel telemetry

@@ -45,3 +45,29 @@ func TestSyslogZoneNameMapUsesStableZoneID(t *testing.T) {
 		}
 	}
 }
+
+// TestSyslogZoneNameMapCollisionResolvesToSurvivor (#3719): when two zone names
+// fold to the same StableZoneID the reverse map must resolve the shared id to
+// the SURVIVOR (the sorted-first zone the dataplane installed), never to the
+// QUARANTINED later-sorting zone — otherwise RT_FLOW/syslog would render the
+// survivor's traffic under the wrong (quarantined) zone name. Reverting
+// syslogZoneNameMap to the unconditional overwrite makes the result depend on
+// map-iteration order (nondeterministic; can name z214).
+func TestSyslogZoneNameMapCollisionResolvesToSurvivor(t *testing.T) {
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"z174": {Name: "z174"},
+		"z214": {Name: "z214"},
+	}
+	got := syslogZoneNameMap(cfg)
+	id := config.StableZoneID("z174")
+	if got[id] != "z174" {
+		t.Fatalf("collision id %d resolves to %q, want the survivor z174 (never the quarantined z214)", id, got[id])
+	}
+	if len(got) != 1 {
+		t.Fatalf("map has %d entries for a colliding pair, want 1 (the survivor only): %v", len(got), got)
+	}
+}

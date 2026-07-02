@@ -142,3 +142,77 @@ func TestZoneIDNoFalsePositiveOnOrdinaryZones(t *testing.T) {
 		t.Fatalf("strict commit rejected an ordinary 3-zone config: %v", err)
 	}
 }
+
+// #3719: QuarantinedZoneNames is the runtime SSOT the lenient-path builders use
+// to enforce the collision warning's promise. For a colliding pair it must
+// quarantine the LATER-sorting zone and keep the earlier one (which owns the
+// id), so the dataplane never receives two zones sharing an id. Reverting the
+// quarantine (returning nil / empty) makes this RED.
+func TestQuarantinedZoneNamesDropsLaterColliding(t *testing.T) {
+	if StableZoneID("z174") != StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	q := QuarantinedZoneNames([]string{"z214", "z174"}) // deliberately unsorted input
+	if _, dropped := q["z214"]; !dropped {
+		t.Fatalf("QuarantinedZoneNames did not quarantine the later-sorting colliding zone z214: %v", q)
+	}
+	if _, dropped := q["z174"]; dropped {
+		t.Fatalf("QuarantinedZoneNames wrongly quarantined the earlier-sorting survivor z174: %v", q)
+	}
+	if len(q) != 1 {
+		t.Fatalf("QuarantinedZoneNames returned %d entries, want exactly 1 (only z214): %v", len(q), q)
+	}
+}
+
+// The common case: distinct-folding names yield no quarantine (nil), and a
+// single zone can never collide.
+func TestQuarantinedZoneNamesNoFalsePositive(t *testing.T) {
+	if q := QuarantinedZoneNames([]string{"trust", "untrust", "dmz"}); len(q) != 0 {
+		t.Fatalf("QuarantinedZoneNames quarantined an ordinary distinct-folding set: %v", q)
+	}
+	if q := QuarantinedZoneNames([]string{"trust"}); len(q) != 0 {
+		t.Fatalf("QuarantinedZoneNames quarantined a single zone: %v", q)
+	}
+}
+
+// StableZoneIDOwner resolves a colliding id to the sorted-first (survivor) name
+// — the zone the dataplane actually installed — so id->name reverse maps never
+// name a quarantined zone.
+func TestStableZoneIDOwnerReturnsSurvivor(t *testing.T) {
+	id := StableZoneID("z174")
+	owner := StableZoneIDOwner([]string{"z214", "z174"}, id)
+	if owner != "z174" {
+		t.Fatalf("StableZoneIDOwner(%d) = %q, want the sorted-first survivor z174", id, owner)
+	}
+	if got := StableZoneIDOwner([]string{"z174", "z214"}, 1); got != "" {
+		t.Fatalf("StableZoneIDOwner for an unclaimed id = %q, want empty", got)
+	}
+}
+
+// #3719 (L13): the lenient warning must state that the later-sorting zone is
+// QUARANTINED and that isolation is degraded — the wording must not merely say
+// "not installed" while the runtime published both (the pre-fix contradiction).
+func TestZoneIDCollisionLenientWarningStatesQuarantine(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security zones security-zone z174",
+		"set security zones security-zone z214",
+	})
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient rejected a colliding zone pair: %v", err)
+	}
+	var warn string
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "collision") && strings.Contains(w, "z214") {
+			warn = w
+		}
+	}
+	if warn == "" {
+		t.Fatalf("no zone-id collision warning naming z214: %v", cfg.Warnings)
+	}
+	for _, want := range []string{"QUARANTINED", "z174", "z214", "DEGRADED"} {
+		if !strings.Contains(warn, want) {
+			t.Fatalf("lenient warning %q does not mention %q", warn, want)
+		}
+	}
+}

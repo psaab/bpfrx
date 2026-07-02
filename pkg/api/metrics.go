@@ -164,6 +164,12 @@ type xpfCollector struct {
 	// while the helper rejected the snapshot) so it is observable.
 	userspacePolicyContentRejected *prometheus.Desc
 
+	// #3719: 1 while the most recent userspace snapshot quarantined a security
+	// zone whose StableZoneID collided with another zone's (lenient / HA-sync /
+	// pre-#3075-persisted path). Zone isolation is degraded until one zone is
+	// renamed.
+	userspaceZoneIDCollision *prometheus.Desc
+
 	// #1827: services ip-monitoring observability. #1844 adds the
 	// unresolved interface-typed next-hop gauge (preferred routes of
 	// FAILED policies skipped from the overlay for lack of a
@@ -605,6 +611,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
+	ch <- c.userspaceZoneIDCollision
 	ch <- c.ipmonPolicyFailed
 	ch <- c.ipmonPolicyTransitions
 	ch <- c.ipmonRoutesApplied

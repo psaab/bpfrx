@@ -1,3 +1,78 @@
+## 2026-07-02 — #3719: review MAJOR fix — quarantine scrub must drop scoped-global match-zones
+
+- **Timestamp**: 2026-07-02
+  - **Action**: Hostile review of PR #3837 found a boot-brick defeating the
+    #1960 no-brick intent. `quarantineCollidingZones` dropped policies only by
+    `FromZone`/`ToZone`, but a GLOBAL policy keeps `FromZone/ToZone ==
+    "junos-global"` and carries its concrete match-zone out-of-band in
+    `MatchFromZone`/`MatchToZone` (#3148, policies.go:416-417). A config with a
+    StableZoneID collision AND a scoped global policy `match from-zone <the
+    quarantined zone>` survived the scrub with a dangling match-zone; the Rust
+    `build_global_zone_scope` (policy.rs:1071-1077) resolves every rule's
+    match-zone → `UnresolvableZoneReference` → `?` → WHOLE-snapshot reject →
+    default-deny brick on fresh boot. Fixed: the policy drop loop now also drops
+    a policy when `MatchFromZone` OR `MatchToZone` is quarantined (empty and
+    "junos-global" are never quarantine keys, so inert for zone-pair/unscoped).
+    Added Go regressions `TestQuarantineDropsScopedGlobalPolicyOnQuarantinedZone`
+    + `TestBuildSnapshotDropsDanglingGlobalMatchZone` (both RED-on-revert when
+    the match-zone check is removed) and Rust regressions through
+    `build_forwarding_state`:
+    `build_forwarding_state_global_policy_with_unresolvable_match_zone_bricks`
+    (dangling match-zone → UnresolvableZoneReference = the brick the scrub
+    prevents) + `build_forwarding_state_global_policy_scoped_to_published_zone_builds`
+    (post-scrub shape builds clean). Lifeline caveat (secondary, non-blocking):
+    left the quarantine loser a pure function of the sorted name (HA-symmetric,
+    reused by lifeline-context-free reverse-map callers) — a quarantined mgmt
+    zone does NOT strand management because lifeline interfaces (fxp0/em0/fab*)
+    never reach the AF_XDP local-delivery classifier (#3682) + loud alarm.
+  - **File(s)**: pkg/dataplane/userspace/zones.go,
+    pkg/dataplane/userspace/zones_collision_3719_test.go,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs, _Log.md
+
+## 2026-07-01 — #3719: lenient StableZoneID collision quarantine (zone-isolation fail-closed)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fix the HIGH zone-identity isolation hole (#3719, codex-153
+    H02/M08/L09/L13). #3075/#3704 moved the zone-id namespace to the stable
+    name-hash `config.StableZoneID` and the STRICT commit path rejects a
+    collision, but the LENIENT path (tolerant load / peer-sync / a config a
+    pre-#3075 binary persisted) only WARNED while every downstream builder still
+    published BOTH colliding zones with the same id — merging two security zones
+    in the dataplane (the Rust id-keyed maps let the later zone overwrite the
+    earlier's reverse name / host-inbound set / tcp-rst bit; both zones'
+    interfaces/policies resolved to one id). Added `config.QuarantinedZoneNames`
+    (SSOT: keeps the sorted-first name per id, quarantines the rest) +
+    `config.StableZoneIDOwner`. New `quarantineCollidingZones` pass in
+    `pkg/dataplane/userspace/zones.go` runs in `buildSnapshot` BEFORE publish:
+    drops the later-sorting colliding `ZoneSnapshot`, unzones its interfaces
+    (`Zone=""` → default-deny), and drops its policies (a dangling policy→zone
+    ref would trip the Rust `UnresolvableZoneReference` preflight and brick a
+    fresh boot). Rest of config still loads (#1960 no-brick). Reverse maps
+    (`zoneNameByID`, `syslogZoneNameMap`) resolve a colliding id to the survivor
+    deterministically. Surfaced via loud one-shot `slog.Error`,
+    `ProcessStatus.ZoneIDCollisions`, and the `xpf_userspace_zone_id_collision`
+    0/1 gauge. Refined the lenient warning wording (L13) to state the zone is
+    QUARANTINED and isolation is DEGRADED. Verified colliding pair z174/z214
+    (both fold to 53547). RED-on-revert proven (neutralizing the pass → both
+    zones publish with id 53547). `go test ./pkg/config/... ./pkg/dataplane/...
+    ./pkg/cli/... ./pkg/api/... ./pkg/daemon/...` green; gofmt/vet clean.
+    Rust defense-in-depth `SnapshotIntegrityError::DuplicateZoneId` backstop
+    added (`zones::reject_duplicate_zone_ids` before `populate_zones` in
+    `build_forwarding_state`, + regression
+    `build_forwarding_state_rejects_duplicate_zone_ids`) — NEEDS cargo
+    build/test validation (Rust engineer holds the cargo slot).
+  - **File(s)**: pkg/config/zoneid.go, pkg/config/zoneid_test.go,
+    pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/builder.go,
+    pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_ha.go,
+    pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/zones_collision_3719_test.go, pkg/cli/apply.go,
+    pkg/cli/apply_syslog_zonemap_3704_test.go, pkg/api/metrics.go,
+    pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+    userspace-dp/src/policy.rs,
+    userspace-dp/src/afxdp/forwarding_build/zones.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs, docs/config-schema.md
+
 ## 2026-07-01 — #3710: host-inbound addressless observability per-interface/per-family
 
 - **Timestamp**: 2026-07-01

@@ -205,6 +205,13 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     let mut state = ForwardingState::default();
     let (excluded_local_v4, excluded_local_v6) = nat_translated_local_exclusions(snapshot);
 
+    // #3719 (H03): fail CLOSED if two security zones share a numeric id before
+    // any id-keyed map is populated — populate_zones would otherwise let the
+    // later zone overwrite the earlier's reverse name / host-inbound set /
+    // tcp-rst bit, merging two zones. The Go control plane quarantines a
+    // StableZoneID collision on the lenient path, so a clean snapshot never
+    // trips this; this is the helper-boundary backstop.
+    zones::reject_duplicate_zone_ids(snapshot)?;
     zones::populate_zones(snapshot, &mut state);
     // #2410: fail CLOSED on a tunnel TTL outside 0..=255 instead of
     // narrowing it with an unchecked `as u8` cast that would wrap
