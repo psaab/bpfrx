@@ -1493,6 +1493,7 @@ fn active_flow_debug_test_entry(
             tx_ifindex: 14,
             target_binding_index: None,
             input_filter_log: None,
+            input_filter_counters: crate::filter::CachedFilterCounters::default(),
             tx_selection: CachedTxSelectionDescriptor {
                 queue_id: Some(2),
                 dscp_rewrite: Some(46),

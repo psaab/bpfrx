@@ -1519,6 +1519,7 @@ mod reap_flow_cache_tests {
                 tx_ifindex: 12,
                 target_binding_index: None,
                 input_filter_log: None,
+                input_filter_counters: crate::filter::CachedFilterCounters::default(),
                 tx_selection: CachedTxSelectionDescriptor::default(),
                 nat64: false,
                 nptv6: false,

@@ -510,6 +510,16 @@ sync.
   are intentionally not flow-cached because DSCP is packet metadata, not
   part of the session cache key; session hits re-evaluate DSCP-sensitive
   input filters per packet.
+  **Interface INPUT filter `then count` on cache hits (#3777):** the
+  output/TX `then count` handles have been replayed on every flow-cache hit
+  since #2573 (`tx_selection.filter_counters`); the INPUT side now mirrors
+  that via `RewriteDescriptor::input_filter_counters`, captured once at seed
+  by `evaluate_interface_input_filter_counters_cached` and replayed in
+  `flow_cache_hit.rs`. A matched routing-instance (PBR) term is EXCLUDED at
+  capture (its count is owned by the routing-instance evaluator, #2620), and
+  the captured set is deduped against `tx_selection.filter_counters`
+  (`retain_absent_from`) so a count-plus-forwarding-class input term the cos
+  TX-selection rebuild already folded in is not recorded twice.
   Producers must use the event-stream worker handle so rate limiting,
   queue-budget accounting, replay, and daemon callback ACK behavior stay
   centralized in `event_stream/`.

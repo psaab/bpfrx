@@ -137,6 +137,142 @@ fn evaluate_filter_ref_tx_selection_cached_v6(
     acc
 }
 
+/// #3777: capture the interface INPUT filter `then count` term handles matched
+/// by an established (cacheable) flow's 5-tuple, for replay on every flow-cache
+/// HIT. Output/TX `then count` terms are already replayed on the cached path
+/// (#2573 via [`evaluate_filter_ref_tx_selection_cached`]); INPUT `then count`
+/// terms were not, so an interface input filter with `then count` reported only
+/// the seed (first) packet of an N-packet cacheable flow.
+///
+/// The walk mirrors the `Always`-policy walk of
+/// `evaluate_filter_ref_non_routing_counted` (the non-PBR / session-HIT
+/// per-packet counter): it captures every matched non-routing `then count` term
+/// up to AND INCLUDING the terminal action term, and DEFERS at a matched
+/// routing-instance (PBR) term — returning the counters accumulated before it —
+/// so the PBR term's counter stays owned by the routing-instance evaluator
+/// (which counts it on the session-miss packet). This preserves the #2620
+/// `NonRoutingCountPolicy` count-ownership split on the cached path (a naive
+/// "capture every matched term" walk would double/under-count a filter that
+/// mixes routing-affecting and count terms).
+///
+/// This only COLLECTS `Arc<FilterTermCounter>` handles; it never calls
+/// `record_filter_counter`. The seed packet is counted by the cold path, so the
+/// capture must not re-count. Cache-declined DSCP / per-packet-L4 input filters
+/// never reach a cached flow, so the matched set is stable for the flow's
+/// lifetime and `TermMatchExtra::default()` suffices (matching
+/// `evaluate_filter_ref_tx_selection_cached`).
+pub(crate) fn evaluate_interface_input_filter_counters_cached(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> CachedFilterCounters {
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex).map(Arc::as_ref)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex).map(Arc::as_ref)
+    };
+    let Some(filter) = filter else {
+        return CachedFilterCounters::default();
+    };
+    // Common case: no `then count` term on this input filter — skip the walk.
+    if !filter.has_counter_terms {
+        return CachedFilterCounters::default();
+    }
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            capture_input_filter_counters_v4(filter, src, dst, protocol, src_port, dst_port, dscp)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            capture_input_filter_counters_v6(filter, src, dst, protocol, src_port, dst_port, dscp)
+        }
+        _ => CachedFilterCounters::default(),
+    }
+}
+
+#[inline]
+fn capture_input_filter_counters_v4(
+    filter: &Filter,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> CachedFilterCounters {
+    let mut counters = CachedFilterCounters::default();
+    for term in &filter.terms {
+        if !term_matches_v4(
+            term,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            TermMatchExtra::default(),
+        ) {
+            continue;
+        }
+        // A matched routing-instance (PBR) term defers to the routing-instance
+        // evaluator — mirror evaluate_filter_ref_non_routing_counted's early
+        // return so the PBR term's count is not re-attributed to the cached
+        // input replay (#2620 ownership).
+        if !term.routing_instance.is_empty() {
+            return counters;
+        }
+        if term.has_count {
+            counters.push(term.counter.clone());
+        }
+        if !term.continue_term {
+            return counters;
+        }
+    }
+    counters
+}
+
+#[inline]
+fn capture_input_filter_counters_v6(
+    filter: &Filter,
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> CachedFilterCounters {
+    let mut counters = CachedFilterCounters::default();
+    for term in &filter.terms {
+        if !term_matches_v6(
+            term,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            TermMatchExtra::default(),
+        ) {
+            continue;
+        }
+        if !term.routing_instance.is_empty() {
+            return counters;
+        }
+        if term.has_count {
+            counters.push(term.counter.clone());
+        }
+        if !term.continue_term {
+            return counters;
+        }
+    }
+    counters
+}
+
 fn three_color_policer_semantics_match(
     old: &Option<Arc<ThreeColorPolicerRuntime>>,
     new: &Option<Arc<ThreeColorPolicerRuntime>>,

@@ -11,10 +11,10 @@ mod policer;
 mod tx_selection;
 
 pub(crate) use cache_sensitive::{
-    evaluate_filter_ref_tx_selection_cached, input_dscp_filter_families_changed,
-    input_per_packet_l4_filter_families_changed, interface_input_filter_has_dscp_match,
-    interface_input_filter_has_per_packet_l4_match, interface_output_filter_has_dscp_match,
-    interface_output_filter_has_per_packet_l4_match,
+    evaluate_filter_ref_tx_selection_cached, evaluate_interface_input_filter_counters_cached,
+    input_dscp_filter_families_changed, input_per_packet_l4_filter_families_changed,
+    interface_input_filter_has_dscp_match, interface_input_filter_has_per_packet_l4_match,
+    interface_output_filter_has_dscp_match, interface_output_filter_has_per_packet_l4_match,
 };
 pub(crate) use eval::{
     evaluate_filter, evaluate_filter_counted, evaluate_interface_filter,

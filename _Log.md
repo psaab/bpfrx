@@ -26740,3 +26740,28 @@ top.
     (existing #2866/#3743 pins updated for new signatures),
     pkg/flowexport/routemask_vrf_test.go (new #3744 RED-on-revert pins),
     pkg/flowexport/README.md (#3744 section + file-layout bullet)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3777 — replay interface INPUT filter `then count` on flow-cache
+    hits. Output/TX `then count` handles were replayed on every hit since #2573
+    but the INPUT side captured only a log descriptor, so an input `then count`
+    reported only the seed packet of an N-packet cacheable flow. Added
+    `RewriteDescriptor::input_filter_counters` + a capture walk
+    (`evaluate_interface_input_filter_counters_cached`) that mirrors the
+    `Always`-policy non-routing walk (defers at a routing-instance/PBR term so
+    its count stays owned by the routing evaluator, #2620), captured once at seed
+    and deduped against `tx_selection.filter_counters` (`retain_absent_from`) so a
+    count-plus-forwarding-class input term is not recorded twice. Replayed on the
+    hit path alongside the output counters. RED-on-revert:
+    `txn_flow_cache_hit_replays_input_filter_then_count_3777` (counter reads 1 not
+    2 without the replay). flow_cache/filter/cos tests green.
+  - **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs (capture fn),
+    userspace-dp/src/filter/engine/mod.rs (re-export),
+    userspace-dp/src/filter/mod.rs (CachedFilterCounters::retain_absent_from),
+    userspace-dp/src/afxdp/flow_cache.rs (RewriteDescriptor field + dedup in
+    from_forward_decision), userspace-dp/src/afxdp/poll_descriptor/filter.rs
+    (evaluate_non_pbr_input_filter_counters_cached),
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs (seed capture),
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (replay),
+    userspace-dp/src/afxdp/tests.rs (RED-on-revert), userspace-dp/src/afxdp/README.md,
+    plus RewriteDescriptor test-literal updates across afxdp test modules

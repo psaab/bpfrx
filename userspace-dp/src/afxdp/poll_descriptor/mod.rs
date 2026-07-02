@@ -41,7 +41,8 @@ use reject_reply::{deny_reply_and_emit, enqueue_deny_reply, enqueue_filter_rejec
 use filter::{
     emit_input_filter_log_match, emit_pending_filter_log,
     evaluate_dscp_sensitive_input_filter_on_session_hit, evaluate_non_pbr_input_filter,
-    evaluate_non_pbr_input_filter_log_only, filter_terminal, host_inbound_gated_lo0_action,
+    evaluate_non_pbr_input_filter_counters_cached, evaluate_non_pbr_input_filter_log_only,
+    filter_terminal, host_inbound_gated_lo0_action,
 };
 
 /// #3020: extract the ICMP/ICMPv6 `(type, code)` for policy matching. Returns
@@ -3703,6 +3704,15 @@ pub(super) fn poll_binding_process_descriptor(
                                     Some(flow),
                                     meta,
                                     ingress_zone_override,
+                                ),
+                                // #3777: capture the input `then count` handles
+                                // so cache hits replay them (mirrors the output
+                                // counter replay). The seed packet was counted on
+                                // the cold path above; this only collects handles.
+                                evaluate_non_pbr_input_filter_counters_cached(
+                                    worker_ctx.forwarding,
+                                    Some(flow),
+                                    meta,
                                 ),
                                 worker_ctx.forwarding,
                                 worker_ctx.ha_state,

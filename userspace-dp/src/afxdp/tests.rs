@@ -7617,6 +7617,109 @@ fn txn_admission_refusal_at_cap_drops_and_leaks_nothing() {
     assert_eq!(batch.session_creates, 0);
 }
 
+/// #3777 RED-on-revert: an interface INPUT filter `then count` must count EVERY
+/// packet of a cacheable flow, not just the seed. Packet 1 (SYN) counts on the
+/// cold path and seeds the flow cache; packet 2 (same 5-tuple) hits the flow
+/// cache and MUST replay the input `then count` — mirroring the output-counter
+/// replay (#2573). Reverting the input replay leaves the counter at 1 for a
+/// 2-packet flow (the under-count this fixes).
+#[test]
+fn txn_flow_cache_hit_replays_input_filter_then_count_3777() {
+    use std::sync::atomic::Ordering;
+
+    let mut snapshot = nat_snapshot();
+    // A count-only accept term on the LAN ingress interface (ifindex 24). No
+    // forwarding-class / dscp, so it is NOT tx-selection-affecting and is NOT
+    // folded into tx_selection.filter_counters — exactly the #3777 gap.
+    snapshot.interfaces[0].filter_input_v4 = "count-in".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "count-in".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "count-all".to_string(),
+            action: "accept".to_string(),
+            count: "c-all".to_string(),
+            ..Default::default()
+        }],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let input_counter = forwarding
+        .filter_state
+        .iface_filter_v4_fast
+        .get(&24)
+        .expect("input filter compiled for ifindex 24")
+        .terms
+        .first()
+        .expect("one term")
+        .counter
+        .clone();
+    assert_eq!(input_counter.packets.load(Ordering::Relaxed), 0);
+
+    // Packet 1 (pure ACK = established TCP, so it is flow-cache-eligible per
+    // #2363 — a SYN is not cached): cold path counts the input filter, installs
+    // the session, and seeds the flow cache.
+    let frame1 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta1 = txn_meta_v4(24, 0x10_u8, (frame1.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame1,
+        meta1,
+    );
+    assert_eq!(
+        input_counter.packets.load(Ordering::Relaxed),
+        1,
+        "the seed packet must count on the cold path"
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded SYN must seed the flow cache"
+    );
+
+    // Packet 2 (same 5-tuple, ACK): MUST hit the flow cache and replay the
+    // input count.
+    let frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta2 = txn_meta_v4(24, 0x10_u8, (frame2.len() - 14) as u16);
+    let (_, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    assert!(
+        dbg2.tx >= 1,
+        "packet 2 must be forwarded from the flow-cache fast path"
+    );
+    assert_eq!(
+        input_counter.packets.load(Ordering::Relaxed),
+        2,
+        "the flow-cache hit MUST replay the interface input `then count` (#3777)"
+    );
+}
+
 // I4 boundary: a forward+reverse pair is admitted while 2 slots remain
 // and refused at cap-1 (1 slot remaining). The admitted phase also pins
 // that a passing preflight makes both installs succeed.

@@ -138,6 +138,17 @@ pub(super) fn stage_flow_cache_hit(
             .for_each(|counter| {
                 crate::filter::record_filter_counter(counter, meta.pkt_len as u64);
             });
+        // #3777: replay the interface INPUT filter `then count` handles too.
+        // The output/TX side above replayed on every hit since #2573, but the
+        // input side captured only a log descriptor — so an input `then count`
+        // reported only the seed packet of an N-packet cacheable flow. The
+        // routing-instance (PBR) count is excluded at capture time (owned by the
+        // routing evaluator), so this cannot double-count a mixed filter.
+        cached_descriptor
+            .input_filter_counters
+            .for_each(|counter| {
+                crate::filter::record_filter_counter(counter, meta.pkt_len as u64);
+            });
         // #3073: re-count this cached established-session packet against the
         // admitting policy's hit counter, mirroring the `then count` filter
         // replay above. This is the hot path for long-lived flows (most

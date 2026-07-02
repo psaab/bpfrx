@@ -88,6 +88,12 @@ pub(super) struct RewriteDescriptor {
     #[allow(dead_code)] // populated for future flow-cache fast-path TX
     pub(super) target_binding_index: Option<usize>,
     pub(super) input_filter_log: Option<CachedInputFilterLog>,
+    // #3777: interface INPUT filter `then count` term handles matched by this
+    // flow's 5-tuple, replayed on every cache HIT so an input `then count`
+    // reports the full N-packet load (mirrors `tx_selection.filter_counters`
+    // for the OUTPUT side, #2573). Captured once at seed; the seed packet is
+    // counted by the cold path, so this only carries handles for the hits.
+    pub(super) input_filter_counters: crate::filter::CachedFilterCounters,
     pub(super) tx_selection: CachedTxSelectionDescriptor,
     pub(super) nat64: bool,
     pub(super) nptv6: bool,
@@ -316,6 +322,7 @@ impl FlowCacheEntry {
         ingress_zone: Option<u16>,
         target_binding_index: Option<usize>,
         input_filter_log: Option<CachedInputFilterLog>,
+        input_filter_counters: crate::filter::CachedFilterCounters,
         forwarding: &ForwardingState,
         ha_state: &BTreeMap<i32, HAGroupRuntime>,
         apply_nat_on_fabric: bool,
@@ -427,6 +434,19 @@ impl FlowCacheEntry {
         // the SNAT/DNAT address/port fields; the cache LOOKUP `key` below stays
         // the pre-NAT tuple (matched against the parsed ingress flow).
         let tx_selection_wire_key = forward_wire_key(&flow.forward_key, decision.nat);
+        let tx_selection = resolve_cached_cos_tx_selection(
+            forwarding,
+            decision.resolution.egress_ifindex,
+            meta,
+            Some(&tx_selection_wire_key),
+        );
+        // #3777: the cos TX-selection rebuild folds an interface INPUT filter's
+        // `then count` handles into `tx_selection.filter_counters` when the
+        // egress interface has no output filter. Drop those from the dedicated
+        // input replay set so a count-plus-forwarding-class input term is
+        // recorded once per hit, not twice.
+        let mut input_filter_counters = input_filter_counters;
+        input_filter_counters.retain_absent_from(&tx_selection.filter_counters);
         Some(Self {
             key: flow.forward_key.clone(),
             ingress_ifindex: meta.ingress_ifindex as i32,
@@ -451,12 +471,8 @@ impl FlowCacheEntry {
                 tx_ifindex: decision.resolution.tx_ifindex,
                 target_binding_index,
                 input_filter_log,
-                tx_selection: resolve_cached_cos_tx_selection(
-                    forwarding,
-                    decision.resolution.egress_ifindex,
-                    meta,
-                    Some(&tx_selection_wire_key),
-                ),
+                input_filter_counters,
+                tx_selection,
                 nat64: false,
                 // #2652: carry the NPTv6 flag so the descriptor fast path
                 // routes through the IPv6 arm with a zero L4 csum delta
