@@ -54,6 +54,40 @@
   - **File(s)**: pkg/eventengine/engine.go,
     pkg/eventengine/engine_edge_trigger_3756_test.go,
     pkg/eventengine/README.md
+
+## 2026-07-01 — #3781: ICMP AppID label ignored type/code (false junos-ping)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The AppID LABEL catalog is L3/L4-only — `pkg/appid.CatalogEntry`
+    and `BuildCatalog` never read `app.ICMPType`/`ICMPCode`, so a type-constrained
+    ICMP app (junos-ping = icmp type 8) shipped a protocol-only catalog row that
+    matched EVERY ICMP type. A non-echo ICMP (dest-unreachable/timestamp/ND) that
+    correctly fell to default-deny was logged in RT_FLOW / `show security flow
+    session` with `application=junos-ping` — a false label (MEDIUM log-integrity;
+    the echo-only verdict engine, #3020, was already correct — NOT a match
+    fail-open). Go-only INTERIM per the converged #3781 /research plan (Part 1,
+    no wire change): `icmpTypeConstrained(app)` gates BuildCatalog to DROP the
+    over-matching protocol-only ICMP row for a type/code-constrained app while
+    KEEPING its `AppNames[id]=name` row + CONSUMING the id (AppNames parity with
+    compileApplications preserved — appid_catalog_parity_test.go). The dropped
+    entry means the helper never stamps that id, so such ICMP resolves to an
+    honest UNKNOWN (or junos-icmp-all when referenced) instead of a false label.
+    Same skip in `resolveTupleFallback` (runtime.go) for the AppID-disabled
+    show/session-name path. A protocol-only ICMP app (junos-icmp-all, user app
+    with no type) and non-ICMP apps are unaffected; protocol_wire_v1.json is
+    byte-identical (no field added, one fewer Entries element). The
+    type/code-aware catalog WIRE + Rust classifier (Part 2 tier-1) and the
+    session-close/show HA-sync persistence (tier-2) are DEFERRED per the plan.
+    Updated TestAppCatalogParityOnTolerantLoadPortEdges to allow the deliberate
+    dangling-but-inert AppNames id for type-constrained ICMP apps. RED-on-revert:
+    TestBuildCatalogTypeConstrainedICMPDropsOverMatchingRow,
+    TestBuildCatalogTypeConstrainedICMPHonestUnknown,
+    TestResolveTupleFallbackSkipsTypeConstrainedICMP (all RED with the guards
+    removed — junos-ping ships a row / a non-echo ICMP labels junos-ping).
+  - **File(s)**: pkg/appid/catalog.go, pkg/appid/runtime.go,
+    pkg/appid/catalog_icmp_3781_test.go,
+    pkg/dataplane/appid_catalog_parity_test.go, pkg/appid/README.md
+
 ## 2026-07-01 — #3768: IPv6 ip-rule next-table emitted the v4 table (blackhole)
 
 - **Timestamp**: 2026-07-01

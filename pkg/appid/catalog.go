@@ -151,24 +151,49 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 			// the malformed name instead of UNKNOWN. compileApplications is
 			// fixed the same way to keep the two AppNames maps byte-identical
 			// (appid_catalog_parity_test.go).
+			//
+			// #3781: the id->name row is recorded here EVEN for a
+			// type-constrained ICMP app whose over-matching CatalogEntry is
+			// dropped below, because compileApplications also records that app's
+			// AppNames row (it too is "emittable" — an ICMP app has an empty,
+			// non-inverted port range). Keeping the row in lock-step preserves
+			// the AppNames parity contract; the dropped entry simply means the
+			// helper never stamps that id, so the name is inert (resolves for no
+			// live session) rather than a false label.
 			cat.AppNames[appID] = name
 
-			// Omitted protocol means "any L4"; compileApplications installs
-			// both TCP and UDP entries (ICMP is excluded from that fan-out).
-			protos := []uint8{proto}
-			if proto == 0 && app.Protocol != "icmp" {
-				protos = []uint8{6, 17}
-			}
-			for _, p := range protos {
-				cat.Entries = append(cat.Entries, CatalogEntry{
-					Name:        name,
-					AppID:       appID,
-					Protocol:    p,
-					DstPortLow:  dstLow,
-					DstPortHigh: dstHigh,
-					SrcPortLow:  srcLow,
-					SrcPortHigh: srcHigh,
-				})
+			// #3781 interim (log-integrity): an ICMP/ICMPv6 application that
+			// carries a type/code constraint (e.g. junos-ping = icmp type 8)
+			// cannot express that constraint on the L3/L4-only catalog wire, so a
+			// protocol-only row would match EVERY ICMP message type. A non-echo
+			// ICMP (destination-unreachable, timestamp, ICMPv6 ND) that correctly
+			// falls to default-deny would then be stamped with the ping app label
+			// even though the echo-only verdict engine never matched it. Until the
+			// type/code-aware catalog wire lands (DEFERRED per the #3781 /research
+			// plan), drop the over-matching row: the AppNames id is still recorded
+			// above and consumed below, so such ICMP resolves to an honest UNKNOWN
+			// (or junos-icmp-all, when a protocol-only ICMP app is also referenced)
+			// rather than a false type-constrained label. An ICMP app WITHOUT a
+			// type/code constraint (junos-icmp-all, a user protocol-only ICMP app)
+			// is unaffected and still ships its protocol-only row.
+			if !icmpTypeConstrained(app) {
+				// Omitted protocol means "any L4"; compileApplications installs
+				// both TCP and UDP entries (ICMP is excluded from that fan-out).
+				protos := []uint8{proto}
+				if proto == 0 && app.Protocol != "icmp" {
+					protos = []uint8{6, 17}
+				}
+				for _, p := range protos {
+					cat.Entries = append(cat.Entries, CatalogEntry{
+						Name:        name,
+						AppID:       appID,
+						Protocol:    p,
+						DstPortLow:  dstLow,
+						DstPortHigh: dstHigh,
+						SrcPortLow:  srcLow,
+						SrcPortHigh: srcHigh,
+					})
+				}
 			}
 		}
 		nextID++
@@ -320,6 +345,25 @@ func ProtocolName(p uint8) string {
 	default:
 		return ""
 	}
+}
+
+// icmpTypeConstrained reports whether an application carries an ICMP/ICMPv6
+// type or code constraint (e.g. junos-ping = icmp type 8, predefined.go). Such
+// an app's L3/L4 match rule — the catalog CatalogEntry and the display tuple
+// fallback — is protocol-only (the catalog wire has no icmp type/code fields,
+// #3781), so a protocol-only row / tuple match would over-match EVERY ICMP
+// message type and falsely label a non-echo ICMP (destination-unreachable,
+// timestamp, ICMPv6 ND) that correctly fell to default-deny as the ping app.
+//
+// The strict commit gate (validateApplicationSpecsStrict, #3348) rejects a code
+// without a type and a type on a non-ICMP protocol, so on the strict path a set
+// ICMPCode implies a set ICMPType. This predicate also treats a stray
+// code-only app (admissible on the tolerant-load path) as constrained so no
+// over-broad ICMP label leaks there either. The fully type/code-aware catalog
+// wire + classifier is DEFERRED per the #3781 /research plan; this is the
+// Go-only interim that removes the false label immediately.
+func icmpTypeConstrained(app *config.Application) bool {
+	return app != nil && (app.ICMPType != nil || app.ICMPCode != nil)
 }
 
 // catalogProtocolNumber resolves a protocol to its byte for the app-id catalog,
