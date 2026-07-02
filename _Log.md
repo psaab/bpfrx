@@ -26583,3 +26583,35 @@ top.
     pkg/flowexport/exporter_id_3740_test.go (new RED-on-revert +
     HA-symmetry + degenerate-default tests),
     pkg/flowexport/README.md ("Exporter identity" section + file layout)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3744 — VRF-scope the flowexport route-mask lookup by the
+    flow's ingress ifindex + count unresolved masks. The #2866/#3743
+    NetFlow IE 9/13 (IPv6 29/30) / IPFIX prefix-length route masks were
+    resolved by a VRF/table-blind FIB lookup (main table only) that also
+    discarded the `ok` bit, so a multi-VRF/routing-instance flow's mask
+    resolved in the wrong table and a genuine miss exported as a bogus /0.
+    Option A: MaskResolver gains an `ifindex`; fibMatchMask sets
+    RouteGetOptions.IifIndex (>0) → kernel input-path lookup follows
+    l3mdev enslavement into the flow's VRF table; resolveMasks scopes both
+    halves by the ingress instance (InIf, OutIf fallback, then global
+    table = bit-identical no-op for single-VRF). Async #3743 cache key
+    widened ip16 → (ifindex, ip16) via routeMaskKey so per-VRF masks don't
+    collide (non-blocking-callback/inflight-cap/dedup/size-cap invariants
+    unchanged). Option B: per-exporter routeMaskUnresolved atomic counter +
+    RouteMaskUnresolved() accessor (mirrors EstimatedDurations); the u8
+    wire IE has no sentinel room, so an unresolved half exports 0 but is
+    surfaced out-of-band. Residual documented: pure fwmark/`ip rule` PBR
+    is NOT covered (mark not on the close event); VRF/routing-instance IS.
+    RED-on-revert verified for all three mechanisms (IP-only key,
+    table-blind resolveMasks, dropped miss count → the new pins fail). go
+    test ./pkg/flowexport/... green incl -race; go build ./... green;
+    gofmt + vet clean.
+  - **File(s)**: pkg/flowexport/routemask.go (MaskResolver ifindex,
+    routeMaskKey (ifindex,IP) cache key, resolveMasks ingress scoping +
+    miss count, fibMatchMask IifIndex), pkg/flowexport/netflow.go +
+    pkg/flowexport/ipfix.go (routeMaskUnresolved counter + accessor + call
+    sites pass InIf/OutIf), pkg/flowexport/srcmask_dstmask_test.go
+    (existing #2866/#3743 pins updated for new signatures),
+    pkg/flowexport/routemask_vrf_test.go (new #3744 RED-on-revert pins),
+    pkg/flowexport/README.md (#3744 section + file-layout bullet)
