@@ -49,7 +49,29 @@ const (
 	ipfixPostNapatDestTransportPort    = 228
 	ipfixPostNatSourceIPv6Address      = 281
 	ipfixPostNatDestinationIPv6Address = 282
+	// #3746: RFC 5103 biflow reverse counters. The reverse of an IANA IE is
+	// expressed with the SAME element ID under the reverse Private Enterprise
+	// Number 29305, so reverseOctetDeltaCount reuses IE 1 (octetDeltaCount) and
+	// reversePacketDeltaCount reuses IE 2 (packetDeltaCount). In the Template
+	// Set an enterprise field specifier sets the top (enterprise) bit of the
+	// element ID and appends the 4-byte PEN (RFC 7011 §3.2); the Data Record
+	// value is a plain 8-byte unsigned64. Confirmed against the IANA "IPFIX
+	// Entities" registry and RFC 5103.
+	ipfixReverseOctetDeltaCount  = 1
+	ipfixReversePacketDeltaCount = 2
 )
+
+// ipfixReversePEN is the RFC 5103 reverse Private Enterprise Number. An IPFIX
+// enterprise Information Element carries it in the Template Set field
+// specifier (RFC 7011 §3.2); a collector that does not grok 29305 skips the
+// field using the template-declared length (RFC 7011 §8) — no corruption.
+const ipfixReversePEN uint32 = 29305
+
+// ipfixEnterpriseBit is the top bit of an IPFIX Information Element identifier
+// that marks a field specifier as enterprise-scoped (RFC 7011 §3.2). When set,
+// the field specifier is 8 bytes (2B elementID|bit, 2B length, 4B PEN) instead
+// of the 4-byte IANA form.
+const ipfixEnterpriseBit uint16 = 0x8000
 
 // IPFIX Set IDs (RFC 7011 Section 3.3.2).
 const (
@@ -64,10 +86,16 @@ const (
 	ipfixTemplateIDv6 = 257
 )
 
-// ipfixField defines a template field with IANA element ID and length.
+// ipfixField defines a template field. enterprise is 0 for a standard IANA
+// Information Element (4-byte Template Set field specifier) and the Private
+// Enterprise Number for an RFC 7011 §3.2 enterprise IE (8-byte specifier:
+// elementID|0x8000, length, 4-byte PEN). The Data Record value length is
+// `length` in both cases (#3746 added the first enterprise IEs — the RFC 5103
+// biflow reverse counters under PEN 29305).
 type ipfixField struct {
-	elementID uint16
-	length    uint16
+	elementID  uint16
+	length     uint16
+	enterprise uint32
 }
 
 // #2749: the IPFIX templates advertise ipClassOfService (5), tcpControlBits
@@ -82,26 +110,26 @@ type ipfixField struct {
 
 // ipfixTemplateV4 defines the IPv4 IPFIX base template fields (flow-dir absent).
 var ipfixTemplateV4 = []ipfixField{
-	{ipfixSourceIPv4Address, 4},
-	{ipfixDestinationIPv4Address, 4},
-	{ipfixSourceTransportPort, 2},
-	{ipfixDestinationTransportPort, 2},
-	{ipfixProtocolIdentifier, 1},
-	{ipfixPacketDeltaCount, 8},
-	{ipfixOctetDeltaCount, 8},
-	{ipfixFlowStartMilliseconds, 8},
-	{ipfixFlowEndMilliseconds, 8},
+	{ipfixSourceIPv4Address, 4, 0},
+	{ipfixDestinationIPv4Address, 4, 0},
+	{ipfixSourceTransportPort, 2, 0},
+	{ipfixDestinationTransportPort, 2, 0},
+	{ipfixProtocolIdentifier, 1, 0},
+	{ipfixPacketDeltaCount, 8, 0},
+	{ipfixOctetDeltaCount, 8, 0},
+	{ipfixFlowStartMilliseconds, 8, 0},
+	{ipfixFlowEndMilliseconds, 8, 0},
 	// #2866: src/dst route prefix lengths (IE 9 / IE 13) populated with the
 	// FIB longest-prefix-match mask. Placed in the same slot as the NetFlow
 	// v9 srcMask/dstMask (after FlowEnd, before ingressInterface) so the two
 	// protocols keep a parallel record layout.
-	{ipfixSourceIPv4PrefixLength, 1},
-	{ipfixDestIPv4PrefixLength, 1},
+	{ipfixSourceIPv4PrefixLength, 1, 0},
+	{ipfixDestIPv4PrefixLength, 1, 0},
 	// #2749: ingressInterface (IE 10) re-introduced with a REAL value — the
 	// ingress ifindex on the SESSION_CLOSE frame since #2615. Placed before
 	// the post-NAT tuple so the latter stays the trailing block (#2526
 	// invariant).
-	{ipfixIngressInterface, 4},
+	{ipfixIngressInterface, 4, 0},
 	// #2749: class-of-service + egress interface re-introduced with REAL
 	// values from the extended SESSION_CLOSE frame ([144:152]).
 	// ipClassOfService (IE 5, 1B) = forward DSCP<<2; tcpControlBits (IE 6, 2B,
@@ -110,43 +138,56 @@ var ipfixTemplateV4 = []ipfixField{
 	// tuple so the latter stays the trailing block (#2526). #3270: flowDirection
 	// (IE 61) is spliced in here by ipfixTemplateFieldsV4 when flow-dir is
 	// enabled; it is NOT in this base slice.
-	{ipfixIPClassOfService, 1},
-	{ipfixTCPControlBits, 2},
-	{ipfixEgressInterface, 4},
+	{ipfixIPClassOfService, 1, 0},
+	{ipfixTCPControlBits, 2, 0},
+	{ipfixEgressInterface, 4, 0},
+	// #3746: RFC 5103 biflow reverse counters (enterprise PEN 29305, 8B each).
+	// reversePacketDeltaCount (IE 2) then reverseOctetDeltaCount (IE 1),
+	// mirroring the forward packets-then-bytes layout above. Placed after the
+	// forward CoS/egress block and before the post-NAT trailing block so #2526
+	// keeps the post-NAT tuple last. These are the first enterprise IEs in the
+	// template, so each occupies an 8-byte field specifier in the Template Set.
+	{ipfixReversePacketDeltaCount, 8, ipfixReversePEN},
+	{ipfixReverseOctetDeltaCount, 8, ipfixReversePEN},
 	// #2526: post-NAT (translated) tuple, appended last.
-	{ipfixPostNatSourceIPv4Address, 4},
-	{ipfixPostNatDestinationIPv4Address, 4},
-	{ipfixPostNapatSourceTransportPort, 2},
-	{ipfixPostNapatDestTransportPort, 2},
+	{ipfixPostNatSourceIPv4Address, 4, 0},
+	{ipfixPostNatDestinationIPv4Address, 4, 0},
+	{ipfixPostNapatSourceTransportPort, 2, 0},
+	{ipfixPostNapatDestTransportPort, 2, 0},
 }
 
 // ipfixTemplateV6 defines the IPv6 IPFIX template fields.
 var ipfixTemplateV6 = []ipfixField{
-	{ipfixSourceIPv6Address, 16},
-	{ipfixDestinationIPv6Address, 16},
-	{ipfixSourceTransportPort, 2},
-	{ipfixDestinationTransportPort, 2},
-	{ipfixProtocolIdentifier, 1},
-	{ipfixPacketDeltaCount, 8},
-	{ipfixOctetDeltaCount, 8},
-	{ipfixFlowStartMilliseconds, 8},
-	{ipfixFlowEndMilliseconds, 8},
+	{ipfixSourceIPv6Address, 16, 0},
+	{ipfixDestinationIPv6Address, 16, 0},
+	{ipfixSourceTransportPort, 2, 0},
+	{ipfixDestinationTransportPort, 2, 0},
+	{ipfixProtocolIdentifier, 1, 0},
+	{ipfixPacketDeltaCount, 8, 0},
+	{ipfixOctetDeltaCount, 8, 0},
+	{ipfixFlowStartMilliseconds, 8, 0},
+	{ipfixFlowEndMilliseconds, 8, 0},
 	// #2866: src/dst route prefix lengths (IPv6 variants IE 29 / IE 30).
-	{ipfixSourceIPv6PrefixLength, 1},
-	{ipfixDestIPv6PrefixLength, 1},
+	{ipfixSourceIPv6PrefixLength, 1, 0},
+	{ipfixDestIPv6PrefixLength, 1, 0},
 	// #2749: ingressInterface (IE 10) — see the V4 template note.
-	{ipfixIngressInterface, 4},
+	{ipfixIngressInterface, 4, 0},
 	// #2749: ipClassOfService (IE 5) / tcpControlBits (IE 6) / egressInterface
 	// (IE 14) — see the V4 template note.
-	{ipfixIPClassOfService, 1},
-	{ipfixTCPControlBits, 2},
-	{ipfixEgressInterface, 4},
+	{ipfixIPClassOfService, 1, 0},
+	{ipfixTCPControlBits, 2, 0},
+	{ipfixEgressInterface, 4, 0},
+	// #3746: RFC 5103 biflow reverse counters (PEN 29305, 8B each) — see the
+	// V4 template note. Family-agnostic; the same IEs precede the post-NAT
+	// trailer here.
+	{ipfixReversePacketDeltaCount, 8, ipfixReversePEN},
+	{ipfixReverseOctetDeltaCount, 8, ipfixReversePEN},
 	// #2526: post-NAT (translated) tuple, appended last. v6 addresses use the
 	// 16-byte RFC 8158 elements; ports reuse the family-agnostic 227/228.
-	{ipfixPostNatSourceIPv6Address, 16},
-	{ipfixPostNatDestinationIPv6Address, 16},
-	{ipfixPostNapatSourceTransportPort, 2},
-	{ipfixPostNapatDestTransportPort, 2},
+	{ipfixPostNatSourceIPv6Address, 16, 0},
+	{ipfixPostNatDestinationIPv6Address, 16, 0},
+	{ipfixPostNapatSourceTransportPort, 2, 0},
+	{ipfixPostNapatDestTransportPort, 2, 0},
 }
 
 // ipfixRecordSizeV4 is the byte size of a single IPv4 IPFIX data record.
@@ -155,9 +196,12 @@ var ipfixTemplateV6 = []ipfixField{
 // (4+4+2+2) = 12 → 57. #2749 re-added ingressInterface (IE 10, 4B) with a
 // real value → 61. #2866 added srcMask+dstMask (IE 9/13, 1B each) → 63.
 // #2749 re-added ipClassOfService(1)+tcpControlBits(2)+egressInterface(4) = 7
-// with real values → 70.
-// 4+4+2+2+1+8+8+8+8 + 1+1 + 4 + 1+2+4 + 4+4+2+2 = 70
-const ipfixRecordSizeV4 = 70
+// with real values → 70. #3746 added the RFC 5103 biflow reverse counters
+// (reversePacketDeltaCount + reverseOctetDeltaCount, 8B each) → 86. The
+// enterprise IEs are 8-byte DATA values (only their Template Set field
+// specifiers are wider).
+// 4+4+2+2+1+8+8+8+8 + 1+1 + 4 + 1+2+4 + 8+8 + 4+4+2+2 = 86
+const ipfixRecordSizeV4 = 86
 
 // ipfixRecordSizeV6 is the byte size of a single IPv6 IPFIX data record.
 // #2613 dropped the same 12 unpopulated bytes from the former 117. pre-NAT
@@ -165,9 +209,10 @@ const ipfixRecordSizeV4 = 70
 // ingressInterface (IE 10, 4B) with a real value → 109. #2866 added the IPv6
 // srcMask+dstMask (IE 29/30, 1B each) → 111.
 // #2749 re-added ipClassOfService(1)+tcpControlBits(2)+egressInterface(4) = 7
-// with real values → 118.
-// 16+16+2+2+1+8+8+8+8 + 1+1 + 4 + 1+2+4 + 16+16+2+2 = 118
-const ipfixRecordSizeV6 = 118
+// with real values → 118. #3746 added the RFC 5103 biflow reverse counters
+// (8B each) → 134.
+// 16+16+2+2+1+8+8+8+8 + 1+1 + 4 + 1+2+4 + 8+8 + 16+16+2+2 = 134
+const ipfixRecordSizeV6 = 134
 
 // ipfixRecordSizeV4 / V6 must equal the sum of their (base) template field
 // lengths. A drift between the template (what the collector parses) and the
@@ -203,9 +248,45 @@ func ipfixSpliceFlowDir(base []ipfixField) []ipfixField {
 	}
 	out := make([]ipfixField, 0, len(base)+1)
 	out = append(out, base[:idx]...)
-	out = append(out, ipfixField{ipfixFlowDirection, 1})
+	out = append(out, ipfixField{ipfixFlowDirection, 1, 0})
 	out = append(out, base[idx:]...)
 	return out
+}
+
+// ipfixFieldSpecLen returns the encoded Template Set field-specifier width for
+// f: 8 bytes for an enterprise IE (elementID|0x8000, length, 4-byte PEN;
+// RFC 7011 §3.2), 4 bytes for a standard IANA IE. Note this is the TEMPLATE
+// specifier width, not the DATA record value length (which is f.length in both
+// cases) — #3746.
+func ipfixFieldSpecLen(f ipfixField) int {
+	if f.enterprise != 0 {
+		return 8
+	}
+	return 4
+}
+
+// ipfixFieldSpecsLen sums the Template Set field-specifier widths of fs.
+func ipfixFieldSpecsLen(fs []ipfixField) int {
+	n := 0
+	for _, f := range fs {
+		n += ipfixFieldSpecLen(f)
+	}
+	return n
+}
+
+// encodeIPFIXFieldSpec writes f's Template Set field specifier at b[off:] and
+// returns the next offset. An enterprise IE (RFC 7011 §3.2) sets the top bit of
+// the Information Element identifier and appends the 4-byte PEN (#3746).
+func encodeIPFIXFieldSpec(b []byte, off int, f ipfixField) int {
+	if f.enterprise != 0 {
+		binary.BigEndian.PutUint16(b[off:off+2], f.elementID|ipfixEnterpriseBit)
+		binary.BigEndian.PutUint16(b[off+2:off+4], f.length)
+		binary.BigEndian.PutUint32(b[off+4:off+8], f.enterprise)
+		return off + 8
+	}
+	binary.BigEndian.PutUint16(b[off:off+2], f.elementID)
+	binary.BigEndian.PutUint16(b[off+2:off+4], f.length)
+	return off + 4
 }
 
 // ipfixTemplateFieldsV4 returns the IPv4 IPFIX template fields, splicing in
@@ -276,8 +357,11 @@ func encodeIPFIXTemplateSet() []byte {
 func encodeIPFIXTemplateSetDir(includeDir bool) []byte {
 	v4 := ipfixTemplateFieldsV4(includeDir)
 	v6 := ipfixTemplateFieldsV6(includeDir)
-	// Set header (4 bytes) + 2 template record headers (4 each) + field specifiers (4 each)
-	totalLen := 4 + (4 + len(v4)*4) + (4 + len(v6)*4)
+	// Set header (4 bytes) + 2 template record headers (4 each) + field
+	// specifiers (4 bytes each IANA IE, 8 bytes each enterprise IE — #3746).
+	// The template record header carries the FIELD COUNT (len), which is
+	// unchanged; only the per-specifier byte width differs.
+	totalLen := 4 + (4 + ipfixFieldSpecsLen(v4)) + (4 + ipfixFieldSpecsLen(v6))
 
 	b := make([]byte, totalLen)
 	off := 0
@@ -292,9 +376,7 @@ func encodeIPFIXTemplateSetDir(includeDir bool) []byte {
 	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(len(v4)))
 	off += 4
 	for _, f := range v4 {
-		binary.BigEndian.PutUint16(b[off:off+2], f.elementID) // no enterprise bit
-		binary.BigEndian.PutUint16(b[off+2:off+4], f.length)
-		off += 4
+		off = encodeIPFIXFieldSpec(b, off, f)
 	}
 
 	// IPv6 template record header
@@ -302,9 +384,7 @@ func encodeIPFIXTemplateSetDir(includeDir bool) []byte {
 	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(len(v6)))
 	off += 4
 	for _, f := range v6 {
-		binary.BigEndian.PutUint16(b[off:off+2], f.elementID)
-		binary.BigEndian.PutUint16(b[off+2:off+4], f.length)
-		off += 4
+		off = encodeIPFIXFieldSpec(b, off, f)
 	}
 
 	return b
@@ -408,6 +488,15 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord, includeDir bool) int {
 	off += 2
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
+	// #3746: RFC 5103 biflow reverse counters (PEN 29305) — 8-byte unsigned64
+	// DATA values (the enterprise bit + PEN live only in the Template Set).
+	// reversePacketDeltaCount (IE 2) then reverseOctetDeltaCount (IE 1), matching
+	// the template order. Written before the flow-dir byte so the base and
+	// flow-dir templates both agree with the encoder.
+	binary.BigEndian.PutUint64(b[off:off+8], r.RevPackets)
+	off += 8
+	binary.BigEndian.PutUint64(b[off:off+8], r.RevBytes)
+	off += 8
 	// #3270: flowDirection (IE 61, unsigned8) — 0 ingress / 1 egress, derived
 	// from the per-zone sampling-direction. Written only when the template
 	// advertises it (includeDir), before the post-NAT trailer.
@@ -479,6 +568,12 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord, includeDir bool) int {
 	off += 2
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
+	// #3746: RFC 5103 biflow reverse counters (PEN 29305) — see
+	// encodeIPFIXRecordV4.
+	binary.BigEndian.PutUint64(b[off:off+8], r.RevPackets)
+	off += 8
+	binary.BigEndian.PutUint64(b[off:off+8], r.RevBytes)
+	off += 8
 	// #3270: flowDirection (IE 61, unsigned8) — see encodeIPFIXRecordV4.
 	if includeDir {
 		b[off] = r.Direction
@@ -608,13 +703,20 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		e.routeMaskUnresolved.Add(maskMisses)
 	}
 	fr := FlowRecord{
-		SrcIP:      evt.SrcIP,
-		DstIP:      evt.DstIP,
-		SrcPort:    evt.SrcPort,
-		DstPort:    evt.DstPort,
-		Protocol:   evt.Protocol,
-		Packets:    rec.SessionPkts,
-		Bytes:      rec.SessionBytes,
+		SrcIP:    evt.SrcIP,
+		DstIP:    evt.DstIP,
+		SrcPort:  evt.SrcPort,
+		DstPort:  evt.DstPort,
+		Protocol: evt.Protocol,
+		Packets:  rec.SessionPkts,
+		Bytes:    rec.SessionBytes,
+		// #3746: RFC 5103 biflow reverse (server→client) volume. Since #2501
+		// the SESSION_CLOSE frame carries the reverse counters (decoded to
+		// rec.RevSessionPkts/RevSessionBytes); they are encoded as the reverse
+		// IPFIX IEs (PEN 29305). Already in scope here — no SessionCloseData
+		// plumbing needed.
+		RevPackets: rec.RevSessionPkts,
+		RevBytes:   rec.RevSessionBytes,
 		StartTime:  startTime,
 		EndTime:    rec.Time,
 		IsIPv6:     evt.IsIPv6,

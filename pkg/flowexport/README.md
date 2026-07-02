@@ -32,9 +32,12 @@ it into a `Type:"SESSION_CLOSE"` `EventRecord` via
 HA delta is unchanged and emitted as a 1:1 pair with the type-14 frame —
 the RT_FLOW frame is additive, not a replacement, so HA session sync is
 unaffected. The record carries the real 5-tuple, NAT translated tuple,
-zones, and protocol; the byte/packet volume counters are 0 because the
-AF_XDP forwarding path does not yet maintain per-session accounting — that
-is the follow-up tracked in **#2501**.
+zones, and protocol. Since **#2501** (CLOSED) the AF_XDP forwarding path
+maintains per-session accounting, so the frame carries the real forward AND
+reverse byte/packet volume counters (both were 0 before #2501). The forward
+counts populate the standard IANA `octetDeltaCount`/`packetDeltaCount`; the
+reverse (server→client) counts are exported by IPFIX as the RFC 5103 biflow
+reverse IEs — see "#3746 — biflow reverse volume (IPFIX)" below.
 
 **#2465 — the exported flow StartTime is now the real session-creation
 time, not a packet-count guess.** Before #2465 the NetFlow v9 / IPFIX
@@ -58,8 +61,9 @@ synthesized close from a path that carried no creation instant (the
 explicit clear-session / NAT-remap delete glue and the HA tunnel-remap
 purge, which do not have the originating entry in hand). Each fallback
 bumps a per-exporter `EstimatedDurations()` counter so operators can see
-how often the heuristic is still in play. The byte/packet **volume**
-counters remain 0 pending #2501 — only the timing is now real.
+how often the heuristic is still in play. (Since #2501 the byte/packet
+**volume** counters are real too — the forward direction on the standard
+IANA counters and the reverse direction on the #3746 biflow reverse IEs.)
 
 **#2853 — the flow StartTime keeps MILLISECOND resolution.** #2465's
 `created` field is integer Unix **seconds** (offset 108, u32), so every
@@ -102,17 +106,19 @@ RFC 8158) are appended LAST in every template:
 | postNATDestinationIPv6Address | 282 | ipv6Address | 16 | v6 |
 
 NetFlow v9 reuses the same IANA element type IDs in its template
-FlowSet. With the #2613 drop and the #2749 re-adds of `ingressInterface`
+FlowSet. With the #2613 drop, the #2749 re-adds of `ingressInterface`
 (IE 10, 4B), `ipClassOfService` (IE 5, 1B), `tcpControlBits` (IE 6, 2B) and
-`egressInterface` (IE 14, 4B) the IPv4 IPFIX record is 70 bytes (45 pre-NAT
-body + 2 src/dst mask + 4 ingressInterface + 7 CoS/egress + 12 post-NAT) and
-the IPv6 record is 118 bytes (69 + 2 + 4 + 7 + 36); the NetFlow v9 record
+`egressInterface` (IE 14, 4B), and the #3746 biflow reverse counters
+(2×8B, IPFIX only) the IPv4 IPFIX record is 86 bytes (45 pre-NAT
+body + 2 src/dst mask + 4 ingressInterface + 7 CoS/egress + 16 biflow
+reverse + 12 post-NAT) and the IPv6 record is 134 bytes (69 + 2 + 4 + 7 + 16
++ 36); the NetFlow v9 record
 sizes derive from the template via `recordSize` (4-byte padded, 64 v4 / 112
-v6 — NetFlow `tcpFlags` is 1B not 2B), so they track the template
-automatically. #3270: with `export-extension flow-dir` the templates splice in
-`flowDirection` (IE 61, 1B) before the post-NAT trailer — the IPFIX record
-grows to 71 (v4) / 119 (v6); the v9 record absorbs the byte into its existing
-4-byte padding (`ipfixRecordSize(isV6, includeDir)` /
+v6 — NetFlow `tcpFlags` is 1B not 2B; v9 carries no reverse element), so they
+track the template automatically. #3270: with `export-extension flow-dir` the
+templates splice in `flowDirection` (IE 61, 1B) before the post-NAT trailer —
+the IPFIX record grows to 87 (v4) / 135 (v6); the v9 record absorbs the byte
+into its existing 4-byte padding (`ipfixRecordSize(isV6, includeDir)` /
 `buildTemplateFieldsV4/V6` carry the flag).
 The init-time
 assertion in `ipfix.go` pins the BASE `ipfixRecordSizeV4/V6` to the sum of their
@@ -131,8 +137,7 @@ collector always receives a usable tuple, matching Junos/vSRX (which
 always emits the post-NAT fields). The address and port halves fall back
 independently, so an address-only or port-only translation reports the
 translated half and the pre-NAT other half. A collector distinguishes a
-NAT'd flow from a non-NAT'd flow by post != pre. Volume counters remain 0
-pending #2501.
+NAT'd flow from a non-NAT'd flow by post != pre.
 
 **#2613 — stop advertising fields the close path cannot populate.** The
 templates previously advertised `ipClassOfService`/SrcTos (5),
@@ -339,6 +344,63 @@ by 2 bytes (v4 61→63, v6 109→111). Presence-with-real-value is pinned by
 the encoded record carries the resolved prefix length, not zero — a
 deterministic injected resolver keeps the test free of a kernel-FIB
 dependency).
+
+**#3746 — biflow reverse volume (IPFIX).** Since #2501 the SESSION_CLOSE
+frame carries the reverse (server→client) byte/packet counters — decoded to
+`logging.EventRecord.RevSessionPkts` / `.RevSessionBytes`
+(`pkg/logging/ringbuf.go`) — but the exporters wired only the forward counts
+into the standard `octetDeltaCount` (IE 1) / `packetDeltaCount` (IE 2), so a
+collector systematically under-reported the larger half of an asymmetric flow
+(small request / large download). The IPFIX exporter now also emits the
+reverse direction as the **RFC 5103 biflow reverse Information Elements**:
+`reverseOctetDeltaCount` (IE 1) and `reversePacketDeltaCount` (IE 2), both
+under the reverse **Private Enterprise Number 29305**.
+
+These are the codebase's first **enterprise** IEs. `ipfixField` gained an
+`enterprise uint32` column (0 = IANA, unchanged). In the **Template Set** an
+enterprise field specifier is 8 bytes — the element ID with the top bit
+(`0x8000`) set, the 2-byte length, and the 4-byte PEN (RFC 7011 §3.2) — while
+IANA specifiers stay 4 bytes; the template encoder sizes and writes each
+accordingly (`ipfixFieldSpecsLen` / `encodeIPFIXFieldSpec`). The template
+record's field **count** is unchanged (each enterprise IE is one field). In
+the **Data Record** the reverse counts are plain 8-byte unsigned64 values, so
+the record grows by 16 bytes (v4 70→86, v6 118→134). The two reverse IEs are
+spliced after the forward CoS/egress block and before the post-NAT trailer, so
+the #2526 post-NAT tuple stays last and the #3270 `flowDirection` byte (when
+`export-extension flow-dir` is set) still sits just before the post-NAT block.
+Template IDs stay **256/257** — the content grows once (like #2526/#2749/#2866)
+and a collector re-learns the template on the next refresh; an unknown-PEN
+collector simply skips the 8-byte field via the template-declared length
+(RFC 7011 §8), so the change is backward-safe. The #3740 stable
+SourceID/ODID and the #2609 sequence-across-refresh behaviour are untouched
+(still one record per session).
+
+The counters are **always present** (like the #2526 post-NAT tuple), not
+opt-in: they are core accounting data and skippable by a collector that does
+not implement PEN 29305. Fail-on-revert pins in `ipfix_biflow_test.go`:
+`TestIPFIXTemplateCarriesBiflowReverseIEs` (the two reverse IEs decode from
+the template with the enterprise bit + PEN 29305 + length 8, in both the base
+and flow-dir templates, and the Template Set length matches the bytes walked —
+catching an off-by-one in the 8-byte specifier sizing),
+`TestIPFIXRecordCarriesBiflowReverseCounts` (the encoded record carries the
+reverse packet/byte counts at the reverse IEs' offset),
+`TestIPFIXExportSessionCloseWiresReverseCounts` (the `EventRecord` reverse
+counters reach the `FlowRecord`), and `TestIPFIXBiflowReverseWireLoopback`
+(the IEs + counts survive the real exporter UDP wire path). Removing the
+reverse IEs flips all four RED.
+
+**NetFlow v9 reverse direction — DEFERRED.** NetFlow v9 (RFC 3954) has no
+standard reverse element and no enterprise/PEN namespace, so there is no
+in-record, single-record way to carry the reverse direction. The two
+non-standard alternatives each break a deliberate design choice: a second
+reversed-tuple record contradicts the one-record-per-session / initiator-tuple
+anchor the #3270 flow-dir semantics rely on (and would be low-fidelity — the
+dataplane tracks no reverse-direction post-NAT tuple or ToS), and summing both
+directions into `octetDeltaCount` corrupts that IE's per-direction semantics.
+So **v9 exports the initiator-direction volume only; use IPFIX for
+bidirectional accounting.** `FlowRecord.RevPackets`/`RevBytes` are populated
+for both exporters but consumed only by IPFIX. See the converged research plan
+on #3746.
 
 ## File layout
 

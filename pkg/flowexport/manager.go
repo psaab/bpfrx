@@ -731,11 +731,18 @@ type FlowRecord struct {
 	OutIf     uint32
 	Packets   uint64
 	Bytes     uint64
-	StartTime time.Time
-	EndTime   time.Time
-	SrcMask   uint8
-	DstMask   uint8
-	IsIPv6    bool
+	// #3746: RFC 5103 biflow reverse (server→client) volume. Encoded ONLY by
+	// the IPFIX exporter as the reverse Information Elements
+	// reversePacketDeltaCount / reverseOctetDeltaCount under PEN 29305; NetFlow
+	// v9 has no standard reverse element and leaves these unused (v9 exports the
+	// initiator-direction volume only — see pkg/flowexport/README.md).
+	RevPackets uint64
+	RevBytes   uint64
+	StartTime  time.Time
+	EndTime    time.Time
+	SrcMask    uint8
+	DstMask    uint8
+	IsIPv6     bool
 	// #2526: post-NAT (translated) tuple — RFC 5103 / RFC 8158. These are
 	// ALWAYS populated by ExportSessionClose: when the flow carried no NAT
 	// the converter copies the pre-NAT tuple here (post == pre), matching
