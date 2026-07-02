@@ -1,6 +1,7 @@
 package ipmon
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -183,7 +184,7 @@ func TestStatusUnresolvedRoutes(t *testing.T) {
 // actuates.
 func TestNotifyNextHopChangeGate(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() bool { actuations.Add(1); return true })
+	e := New(func(context.Context) bool { actuations.Add(1); return true })
 	e.debounce = 5 * time.Millisecond
 	e.throttle = 5 * time.Millisecond
 	r := &fakeResolver{}
@@ -221,7 +222,7 @@ func TestNotifyNextHopChangeGate(t *testing.T) {
 
 	// Literal-only FAILED policy: gateway churn must not actuate.
 	e2cnt := atomic.Int32{}
-	e2 := New(func() bool { e2cnt.Add(1); return true })
+	e2 := New(func(context.Context) bool { e2cnt.Add(1); return true })
 	e2.debounce = 5 * time.Millisecond
 	e2.throttle = 5 * time.Millisecond
 	e2.Apply(testPolicyConfig(), passResults())
@@ -288,7 +289,7 @@ func TestFilterOverlayForConfigInterfaceTyped(t *testing.T) {
 // — one actuation path, last-writer-wins.
 func TestGatewayChangeCoalescesWithProbeTransition(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() bool { actuations.Add(1); return true })
+	e := New(func(context.Context) bool { actuations.Add(1); return true })
 	e.debounce = 20 * time.Millisecond
 	e.throttle = 60 * time.Millisecond
 	r := &fakeResolver{}

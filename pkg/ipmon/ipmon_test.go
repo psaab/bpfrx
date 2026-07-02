@@ -2,6 +2,7 @@ package ipmon
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,7 +51,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
-func newTestEngine(actuate func() bool) (*Engine, *fakeClock) {
+func newTestEngine(actuate func(context.Context) bool) (*Engine, *fakeClock) {
 	e := New(actuate)
 	clock := &fakeClock{now: time.Unix(1000000, 0)}
 	e.now = clock.Now
@@ -308,7 +309,7 @@ func TestWinnerResolution(t *testing.T) {
 // per throttle window (§4.3 coalescing).
 func TestDebounceCoalescing(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() bool { actuations.Add(1); return true })
+	e := New(func(context.Context) bool { actuations.Add(1); return true })
 	e.debounce = 20 * time.Millisecond
 	e.throttle = 60 * time.Millisecond
 	e.Apply(testPolicyConfig(), passResults())
@@ -357,7 +358,7 @@ func TestDebounceCoalescing(t *testing.T) {
 func TestActuationFailureStaysDirtyUntilConverged(t *testing.T) {
 	var attempts atomic.Int32
 	var succeed atomic.Bool // false ⇒ actuation fails; flipped to self-heal
-	e := New(func() bool {
+	e := New(func(context.Context) bool {
 		attempts.Add(1)
 		return succeed.Load()
 	})
@@ -395,7 +396,7 @@ func TestActuationFailureStaysDirtyUntilConverged(t *testing.T) {
 // converged actuation and the loop parks) — no retry churn.
 func TestSuccessfulActuationClearsDirty(t *testing.T) {
 	var attempts atomic.Int32
-	e := New(func() bool { attempts.Add(1); return true })
+	e := New(func(context.Context) bool { attempts.Add(1); return true })
 	e.debounce = 5 * time.Millisecond
 	e.throttle = 20 * time.Millisecond
 	e.Apply(testPolicyConfig(), passResults())
@@ -466,7 +467,7 @@ func TestUnknownStatusNotReportedAsPass(t *testing.T) {
 // count) the "applied == 0 while failing" assertion goes RED.
 func TestRoutesAppliedReflectsActuationNotDesired(t *testing.T) {
 	var succeed atomic.Bool // false ⇒ actuator fails
-	e := New(func() bool { return succeed.Load() })
+	e := New(func(context.Context) bool { return succeed.Load() })
 	e.debounce = 5 * time.Millisecond
 	e.throttle = 10 * time.Millisecond
 	e.Apply(testPolicyConfig(), passResults())
@@ -577,7 +578,7 @@ func TestUnresolvedAndSuppressedDetail(t *testing.T) {
 func TestLifecycleIdempotent(t *testing.T) {
 	// H9: double Start does not spawn a second goroutine (no double
 	// close(done) panic), and repeated Stop is safe.
-	e := New(func() bool { return true })
+	e := New(func(context.Context) bool { return true })
 	e.debounce = time.Millisecond
 	e.throttle = time.Millisecond
 	e.Start()
@@ -587,7 +588,7 @@ func TestLifecycleIdempotent(t *testing.T) {
 	e.Stop() // idempotent, no panic
 
 	// H10: Stop before Start must return promptly, not deadlock.
-	e2 := New(func() bool { return true })
+	e2 := New(func(context.Context) bool { return true })
 	stopReturned := make(chan struct{})
 	go func() {
 		e2.Stop()
@@ -608,7 +609,7 @@ func TestLifecycleIdempotent(t *testing.T) {
 // (baseline) and re-enables on takeover.
 func TestPublishGatingBaseline(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() bool { actuations.Add(1); return true })
+	e := New(func(context.Context) bool { actuations.Add(1); return true })
 	e.Apply(testPolicyConfig(), passResults())
 	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
 	if len(e.ActiveOverlay()) == 0 {
@@ -722,7 +723,7 @@ func TestFilterOverlayForConfig(t *testing.T) {
 // actuation (one spurious frr-reload per commit otherwise).
 func TestApplyWithoutOverlayChangeDoesNotActuate(t *testing.T) {
 	var actuations atomic.Int32
-	e := New(func() bool { actuations.Add(1); return true })
+	e := New(func(context.Context) bool { actuations.Add(1); return true })
 	e.debounce = 5 * time.Millisecond
 	e.throttle = 5 * time.Millisecond
 	e.Start()
@@ -765,5 +766,52 @@ func TestApplyWithoutOverlayChangeDoesNotActuate(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if got := actuations.Load(); got == before {
 		t.Fatal("overlay-changing spec edit did not actuate")
+	}
+}
+
+// TestStopAbortsBlockedActuation is the #3758 regression: a shutdown
+// (ipmon.Stop, via the daemon teardown) must abort an in-flight
+// actuation that is blocked on a wait — the apply semaphore held by
+// an unrelated apply, or a wedged FRR reload — instead of wedging the
+// run loop off its stop case forever. The run loop calls the actuator
+// synchronously and can only observe e.stop AFTER the actuator
+// returns, so Stop cancels the actuation context BEFORE waiting on
+// e.done. This test drives one actuation whose actuator blocks until
+// its context is cancelled; Stop must then return promptly. On revert
+// (Stop does not cancel the context, or the actuator ignores it) the
+// actuation never unblocks, run() never returns, and Stop hangs on
+// e.done — the watchdog timeout below fires and the test goes RED.
+func TestStopAbortsBlockedActuation(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	e := New(func(ctx context.Context) bool {
+		once.Do(func() { close(entered) })
+		<-ctx.Done() // block until Stop cancels the actuation context
+		return false // aborted: do not half-actuate
+	})
+	e.debounce = time.Millisecond
+	e.throttle = time.Millisecond
+	e.Apply(testPolicyConfig(), passResults())
+	e.Start()
+
+	// Drive one actuation and wait until the actuator is blocked inside.
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		e.Stop()
+		t.Fatal("actuator was never entered")
+	}
+
+	// Stop must return promptly even though the actuation is blocked.
+	done := make(chan struct{})
+	go func() {
+		e.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ipmon.Stop hung behind a blocked actuation (#3758 shutdown-hang regression)")
 	}
 }

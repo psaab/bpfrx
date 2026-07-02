@@ -139,7 +139,7 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 		InterfaceBandwidths:   ifaceBandwidths,
 		InterfacePointToPoint: ifaceP2P,
 		RethMap:               cfg.RethToPhysical(),
-		IPv6NextHopInterfaces: inferIPv6StaticNextHopInterfaces(cfg),
+		IPv6NextHopInterfaces: inferIPv6StaticNextHopInterfaces(cfg, overlay),
 		ClusterMode:           d.cluster != nil,
 		PreferredRoutes:       overlay,
 	}
@@ -235,8 +235,20 @@ func setFibMultipathHashPolicy() {
 // actuateRouteOverlay returns whether the overlay converged
 // consistently; the ipmon engine keeps the state dirty and retries when
 // it returns false (#3757).
-func (d *Daemon) actuateRouteOverlay() bool {
-	_ = d.applySem.Acquire(context.Background(), 1)
+//
+// ctx is the engine's actuation context (cancelled on ipmon.Stop, i.e.
+// daemon shutdown/reconcile). It is threaded into the apply-semaphore
+// acquire so a shutdown aborts a wait that would otherwise wedge the
+// ipmon run loop — and, through it, shutdown — behind an in-flight
+// apply that never releases the semaphore (#3758). On cancellation the
+// actuator returns false WITHOUT touching FRR or the userspace snapshot
+// (no half-actuation): the engine keeps the state dirty and re-actuates
+// on the next sweep if the daemon is still up, and shutdown proceeds
+// otherwise.
+func (d *Daemon) actuateRouteOverlay(ctx context.Context) bool {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return false
+	}
 	defer d.applySem.Release(1)
 
 	if d.store == nil {

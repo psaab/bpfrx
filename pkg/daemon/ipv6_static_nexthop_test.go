@@ -49,7 +49,7 @@ func TestInferIPv6StaticNextHopInterfaces(t *testing.T) {
 		},
 	}
 
-	got := inferIPv6StaticNextHopInterfaces(cfg)
+	got := inferIPv6StaticNextHopInterfaces(cfg, nil)
 	if got[""]["2001:559:8585:50::1"] != "reth0.50" {
 		t.Fatalf("default route next-hop interface = %q, want reth0.50", got[""]["2001:559:8585:50::1"])
 	}
@@ -100,7 +100,7 @@ func TestInferIPv6StaticNextHopInterfaces_ByVRFAndDeterministicTieBreak(t *testi
 		},
 	}
 
-	got := inferIPv6StaticNextHopInterfaces(cfg)
+	got := inferIPv6StaticNextHopInterfaces(cfg, nil)
 	if got[""]["2001:db8:1::100"] != "reth0.10" {
 		t.Fatalf("global tie-break interface = %q, want reth0.10", got[""]["2001:db8:1::100"])
 	}
@@ -136,7 +136,7 @@ func TestInferIPv6StaticNextHopInterfaces_LinkLocalSingleInterface(t *testing.T)
 		},
 	}
 
-	got := inferIPv6StaticNextHopInterfaces(cfg)
+	got := inferIPv6StaticNextHopInterfaces(cfg, nil)
 	if got[""]["fe80::1"] != "ge-0-0-3.50" {
 		t.Fatalf("link-local next-hop interface = %q, want ge-0-0-3.50", got[""]["fe80::1"])
 	}
@@ -173,7 +173,7 @@ func TestInferIPv6StaticNextHopInterfaces_LinkLocalMultipleAmbiguous(t *testing.
 		},
 	}
 
-	got := inferIPv6StaticNextHopInterfaces(cfg)
+	got := inferIPv6StaticNextHopInterfaces(cfg, nil)
 	if iface := got[""]["fe80::1"]; iface != "" {
 		t.Fatalf("ambiguous link-local next-hop interface = %q, want \"\" (refuse to guess)", iface)
 	}
@@ -211,7 +211,7 @@ func TestInferIPv6StaticNextHopInterfaces_LinkLocalExplicitQualifier(t *testing.
 		},
 	}
 
-	got := inferIPv6StaticNextHopInterfaces(cfg)
+	got := inferIPv6StaticNextHopInterfaces(cfg, nil)
 	if iface, ok := got[""]["fe80::1"]; ok {
 		t.Fatalf("qualified link-local next-hop should not be in inference map, got %q", iface)
 	}
@@ -257,8 +257,82 @@ func TestInferIPv6StaticNextHopInterfaces_VRRPVIPSubnet(t *testing.T) {
 		},
 	}
 
-	got := inferIPv6StaticNextHopInterfaces(cfg)
+	got := inferIPv6StaticNextHopInterfaces(cfg, nil)
 	if got[""]["2001:559:8585:50::254"] != "reth0.50" {
 		t.Fatalf("VIP-subnet next-hop interface = %q, want reth0.50", got[""]["2001:559:8585:50::254"])
+	}
+}
+
+// TestInferIPv6StaticNextHopInterfaces_IPMonOverlayLinkLocal is the
+// #3759 regression: an ip-monitoring preferred-route overlay entry with
+// a literal IPv6 link-local next-hop (fe80::…, the common IPv6 WAN
+// gateway form) must be fed through the SAME inference as configured
+// statics so it renders WITH an interface scope. Before the fix the
+// overlay entries were never passed to inferIPv6StaticNextHopInterfaces,
+// so IPv6NextHopInterfaces[""][fe80::1] was absent and FRR received a
+// scopeless `ipv6 route ::/0 fe80::1` — which it rejects, silently
+// dropping the failover route. On revert (overlay arg dropped / not
+// fed) the link-local lookup below returns "" and the test goes RED.
+// A global-unicast overlay next-hop resolves by longest-prefix as
+// before (proving the normal path still works).
+func TestInferIPv6StaticNextHopInterfaces_IPMonOverlayLinkLocal(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"ge-0/0/3": {
+					Units: map[int]*config.InterfaceUnit{
+						50: {Addresses: []string{"2001:559:8585:50::8/64"}},
+					},
+				},
+			},
+		},
+	}
+	overlay := []config.RouteOverlayEntry{
+		{Destination: "::/0", NextHop: "fe80::1", Policy: "wan-failover"},
+		{Destination: "2001:db8::/48", NextHop: "2001:559:8585:50::1", Policy: "wan-failover"},
+	}
+
+	got := inferIPv6StaticNextHopInterfaces(cfg, overlay)
+	if got[""]["fe80::1"] != "ge-0-0-3.50" {
+		t.Fatalf("overlay link-local next-hop interface = %q, want ge-0-0-3.50 (scopeless → FRR-rejected route, #3759)", got[""]["fe80::1"])
+	}
+	if got[""]["2001:559:8585:50::1"] != "ge-0-0-3.50" {
+		t.Fatalf("overlay global next-hop interface = %q, want ge-0-0-3.50", got[""]["2001:559:8585:50::1"])
+	}
+
+	// Control: a nil overlay leaves the link-local unresolved (the
+	// pre-fix behavior — no configured static names fe80::1).
+	if iface := inferIPv6StaticNextHopInterfaces(cfg, nil)[""]["fe80::1"]; iface != "" {
+		t.Fatalf("nil-overlay link-local = %q, want \"\" (only the overlay names it)", iface)
+	}
+}
+
+// TestInferIPv6StaticNextHopInterfaces_IPMonOverlayForwardingInstance
+// pins the VRF-key contract: an overlay entry targeting an
+// instance-type forwarding routing-instance renders via `table <id>`
+// with vrfName == "" (renderPreferredRoutes), so its next-hop scope
+// must be keyed under "" — NOT "vrf-<name>" — to be found at render.
+func TestInferIPv6StaticNextHopInterfaces_IPMonOverlayForwardingInstance(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"ge-0/0/3": {
+					Units: map[int]*config.InterfaceUnit{
+						50: {Addresses: []string{"2001:559:8585:50::8/64"}},
+					},
+				},
+			},
+		},
+		RoutingInstances: []*config.RoutingInstanceConfig{
+			{Name: "ISP-B", InstanceType: "forwarding", TableID: 100, Interfaces: []string{"ge-0/0/3.50"}},
+		},
+	}
+	overlay := []config.RouteOverlayEntry{
+		{RoutingInstance: "ISP-B", Destination: "::/0", NextHop: "fe80::1", Policy: "fbf"},
+	}
+
+	got := inferIPv6StaticNextHopInterfaces(cfg, overlay)
+	if got[""]["fe80::1"] != "ge-0-0-3.50" {
+		t.Fatalf("forwarding-instance overlay link-local scope = %q under key \"\", want ge-0-0-3.50", got[""]["fe80::1"])
 	}
 }

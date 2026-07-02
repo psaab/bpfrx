@@ -26807,6 +26807,59 @@ top.
     (new RED-on-revert pins), docs/userspace-dnat-plan.md (§13b)
 
 - **Timestamp**: 2026-07-01
+  - **Action**: #3758 — ip-monitoring: non-blocking daemon shutdown.
+    `actuateRouteOverlay` acquired the apply semaphore with
+    `context.Background()`, so an in-flight actuation blocked behind a
+    wedged/held apply could hold the ipmon run loop off its stop case
+    forever — and `ipmon.Stop()` (daemon teardown) hung on `e.done`.
+    Threaded a cancellable actuation context through the engine:
+    `New` creates it, the run loop passes it to `actuate(ctx)`, and
+    `Stop()` cancels it BEFORE waiting on `e.done` so a blocked
+    actuation aborts promptly. `actuateRouteOverlay(ctx)` now uses
+    `applySem.Acquire(ctx, 1)` and, on cancel, returns false WITHOUT
+    touching FRR or the userspace snapshot (no half-actuation). Actuate
+    signature `func() bool` → `func(context.Context) bool` (all engine
+    tests updated). RED-on-revert proven both layers: reverting the
+    daemon Acquire to context.Background() → daemon test hangs 2 s RED;
+    removing the Stop cancel → engine test hangs 2 s RED. go test -race
+    ./pkg/ipmon/... ./pkg/daemon/ green.
+  - **File(s)**: pkg/ipmon/ipmon.go (actuateCtx/actuateCancel fields,
+    New, Stop, run loop, actuate signature), pkg/daemon/daemon_ipmon.go
+    (actuateRouteOverlay ctx param + Acquire(ctx)), pkg/ipmon/ipmon_test.go
+    + pkg/ipmon/nexthop_test.go (signature sweep + TestStopAbortsBlockedActuation),
+    pkg/daemon/daemon_ipmon_test.go (TestActuateRouteOverlayAbortsOnContextCancel),
+    docs/multi-wan.md (non-blocking shutdown bullet)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3759 — ip-monitoring: interface-scoped IPv6 link-local
+    preferred-route next-hop. A literal link-local next-hop
+    (`preferred-route route ::/0 next-hop fe80::1`) committed cleanly but
+    rendered a scopeless `ipv6 route ::/0 fe80::1`, which FRR rejects —
+    the failover route silently failed to install. Root cause: the
+    overlay reuses `generateStaticRouteInTable` + `IPv6NextHopInterfaces`
+    but the overlay's PreferredRoutes were NEVER fed into
+    `inferIPv6StaticNextHopInterfaces`, so the map was always absent for
+    the failover gateway. Fix: pass the overlay to the inference
+    (`inferIPv6StaticNextHopInterfaces(cfg, overlay)` in assembleFRRConfig)
+    and resolve each overlay literal v6 next-hop through the SAME
+    connected-prefix / synthetic-fe80::/64 pipeline as static routes,
+    keyed by the VRF the render uses (`""` for master + forwarding
+    instances, `vrf-<name>` for virtual-router). Matches static-route
+    handling (#2452): resolves on a single IPv6 interface, stays
+    unresolved (FRR-rejected, operator must disambiguate) when ambiguous.
+    Chose the attach-scope option over commit-reject because the routing
+    code (static routes) attaches scope via this exact map and never
+    rejects link-local at commit. RED-on-revert proven: reverting the
+    inference-body overlay loop → direct inference tests RED; reverting
+    the assembleFRRConfig call-site → assemble test RED. go test
+    ./pkg/daemon/ ./pkg/frr/ green.
+  - **File(s)**: pkg/daemon/daemon_run.go (inferIPv6StaticNextHopInterfaces
+    overlay arg + resolution loop), pkg/daemon/daemon_ipmon.go (call site),
+    pkg/daemon/ipv6_static_nexthop_test.go (overlay link-local + forwarding
+    + nil-control tests; static callers → nil), pkg/daemon/daemon_ipmon_test.go
+    (TestAssembleFRRConfigResolvesOverlayLinkLocal),
+    pkg/frr/preferred_routes_test.go (render contract test),
+    docs/multi-wan.md + pkg/frr/README.md (link-local overlay next-hop)
   **Action**: #3747 — bound the flowexport batch queue (`flowBatch`) and
     add drop/depth visibility. The per-family export accumulator
     (`transport.go` `flowBatch.v4/v6`) was UNBOUNDED: `add` appended
