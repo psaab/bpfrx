@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"fmt"
 	"net"
 	"slices"
 	"sort"
@@ -23,7 +24,18 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 	out := make([]RouteSnapshot, 0)
 	seen := make(map[string]struct{})
 	addSnapshot := func(snap RouteSnapshot) {
-		key := snap.Table + "|" + snap.Family + "|" + snap.Destination + "|" + strings.Join(snap.NextHops, ",") + "|" + snap.NextTable
+		// #3770 (H8): the dedupe key MUST include Discard and Preference.
+		// A discard (blackhole) route and a normal route to the same prefix
+		// are DISTINCT forwarding decisions — omitting Discard let one
+		// silently hide the other. Two routes differing only in preference
+		// (e.g. a static next-table route at its configured preference and
+		// the kernel ip-rule mirror at preference 0) collided on the old key
+		// and the second was dropped before the Rust FIB could apply its
+		// preference tie-break (fib.rs sort_routes).
+		key := fmt.Sprintf("%s|%s|%s|%s|%s|%t|%d",
+			snap.Table, snap.Family, snap.Destination,
+			strings.Join(snap.NextHops, ","), snap.NextTable,
+			snap.Discard, snap.Preference)
 		if _, ok := seen[key]; ok {
 			return
 		}
@@ -141,14 +153,39 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 
 	out = applyRouteOverlay(out, overlay)
 
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Table != out[j].Table {
-			return out[i].Table < out[j].Table
+	// #3770 (M10): stable sort with a TOTAL order. The old comparator
+	// keyed only on Table/Family/Destination, so two same-prefix routes
+	// (distinct after the H8 dedupe fix, e.g. a next-table leak and its
+	// ip-rule mirror, or a discard and a connected route) compared equal
+	// and their relative order followed the non-deterministic build input
+	// order (map iteration, kernel ip-rule order) under an UNSTABLE sort —
+	// producing spurious snapshot-to-snapshot diffs and ECMP-member churn
+	// that re-installed the FIB for no config change. Tie-break on
+	// next-hops, next-table, discard, then preference so the wire order is
+	// a deterministic function of content alone.
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Table != b.Table {
+			return a.Table < b.Table
 		}
-		if out[i].Family != out[j].Family {
-			return out[i].Family < out[j].Family
+		if a.Family != b.Family {
+			return a.Family < b.Family
 		}
-		return out[i].Destination < out[j].Destination
+		if a.Destination != b.Destination {
+			return a.Destination < b.Destination
+		}
+		an, bn := strings.Join(a.NextHops, ","), strings.Join(b.NextHops, ",")
+		if an != bn {
+			return an < bn
+		}
+		if a.NextTable != b.NextTable {
+			return a.NextTable < b.NextTable
+		}
+		if a.Discard != b.Discard {
+			// Non-discard (false) sorts before discard (true).
+			return b.Discard
+		}
+		return a.Preference < b.Preference
 	})
 	return out
 }
@@ -175,6 +212,12 @@ func applyRouteOverlay(routes []RouteSnapshot, overlay []config.RouteOverlayEntr
 			Family:      family,
 			Destination: dest,
 			NextHops:    []string{entry.NextHop},
+			// #3770 (M7): the ip-monitoring overlay injects the documented
+			// Static/1 route (route preference 1, PreferredRoute contract in
+			// pkg/config/types_system.go). Leaving it at 0 made the Rust FIB
+			// sort it as MORE preferred than the documented value and diverged
+			// from the FRR managed-section render (distance-1 static).
+			Preference: 1,
 		}
 	}
 	out := make([]RouteSnapshot, 0, len(routes)+len(replaced))
