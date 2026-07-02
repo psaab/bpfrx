@@ -26505,3 +26505,34 @@ top.
     backend_http_test.go (TestDyndns2ServerEndpointParsing), pkg/config/
     compiler_p3_http_providers_test.go (TestP3Dyndns2ServerMalformedWarns
     + TestDDNSDyndns2ServerValidLockstep), pkg/ddns/README.md (#3737 note)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3740 — stable per-group NetFlow v9 SourceID / IPFIX
+    Observation Domain ID. The resolvers start one exporter per
+    (sampling-instance, template) group but every exporter hardcoded
+    SourceID/ODID = 1 and reuses template IDs 256/257, so two groups to
+    one collector present an identical RFC decode key → template
+    redefinitions + interleaved sequence streams (false loss/restart).
+    #3745's per-collector source-address does not fix it by default.
+    Fix (Option A, converged /research plan): new pure helper
+    `stableExporterID(protocol, instance, template)` — FNV-1a 64 over
+    "protocol|instance|template", xor-folded to 32 bits, mapped into
+    [1, 0xFFFFFFFF], mirroring config.StableTunnelEndpointID (#1873).
+    NewExporter stamps it as the v9 SourceID; NewIPFIXExporter as the
+    IPFIX ODID. Template IDs stay 256/257 (a unique ODID restores the
+    RFC scoping key). HA-symmetric: pure function of config-synced
+    fields, nothing node-specific → both cluster nodes compute the same
+    id → failover never presents a new observation domain. Degenerate
+    default (empty instance AND template) keeps id=1 to preserve the
+    pre-#3740 wire + existing unit tests. One-time upgrade churn:
+    named/multi-group deployments see ODID/SourceID 1→hash once (release
+    noted). RED-on-revert verified (constant-1 → distinct-per-group
+    assertions fail; degenerate-default still passes). go test
+    ./pkg/flowexport/... ./pkg/daemon/... green; go build ./... green;
+    gofmt + vet clean.
+  - **File(s)**: pkg/flowexport/exporterid.go (new helper),
+    pkg/flowexport/netflow.go (NewExporter SourceID),
+    pkg/flowexport/ipfix.go (NewIPFIXExporter ODID),
+    pkg/flowexport/exporter_id_3740_test.go (new RED-on-revert +
+    HA-symmetry + degenerate-default tests),
+    pkg/flowexport/README.md ("Exporter identity" section + file layout)
