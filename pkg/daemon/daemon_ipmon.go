@@ -355,12 +355,33 @@ func (d *Daemon) reconcileIPMon(cfg *config.Config) {
 
 // ipmonPublishAllowed implements §4.4 primary-only overlay
 // publication: standalone nodes always publish; cluster nodes publish
-// only while primary for the data RG.
+// while primary for ANY data RG.
+//
+// The gate is IsLocalPrimaryAny() rather than IsLocalPrimary of the
+// lowest data RG (#3764). Probe HA gating is already per-RG
+// (filterRPMForHAGating / rpmProbeGatingRGs) — a gated probe runs only
+// on the node that is primary for its RETH's RG — so a node only ever
+// genuinely FAILs the policies whose RG it owns. Publishing whenever
+// this node is primary for ANY RG is therefore both safe and precise:
+// in a multi-data-RG cluster with split primaryship (RG1 primary on
+// node A, RG2 primary on node B), node B publishes its RG2 overlay and
+// node A publishes its RG1 overlay, while a true standby (primary for
+// nothing) still publishes nothing. Keying on the lowest data RG alone
+// suppressed the ENTIRE overlay on any node that was not primary for
+// that lowest RG — so node B never injected the RG2 failover route it
+// genuinely owns and detects as failed (a functional failover MISS for
+// RG2). With a single data RG (the common case) IsLocalPrimaryAny() is
+// identical to IsLocalPrimary(lowestDataRG), so there is zero regression.
+//
+// This is complete for RETH-bound probes. The residual — an in-scope
+// probe with NO RETH binding, which rpmProbeGatingRGs defaults to the
+// lowest data RG — is deferred (Layer 2: a per-policy publish allow-set,
+// or a commit-check requiring HA-gated probes to bind a RETH).
 func (d *Daemon) ipmonPublishAllowed(cfg *config.Config) bool {
 	if d.cluster == nil || cfg == nil || cfg.Chassis.Cluster == nil {
 		return true
 	}
-	return d.cluster.IsLocalPrimary(lowestDataRG(cfg))
+	return d.cluster.IsLocalPrimaryAny()
 }
 
 // reconcileIPMonGating re-evaluates HA gating after an RG transition:

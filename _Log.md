@@ -27146,3 +27146,35 @@ top.
   dual-stack commit warning), pkg/ddns/backend_dualstack_withdraw_3738_test.go (new),
   pkg/config/compiler_p3_http_providers_test.go (dyndns2 dual-stack warning test),
   pkg/ddns/README.md (per-family-withdraw column + dual-stack sibling-preserve section)
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3764 Layer-1 — gate ip-monitoring overlay publication on
+  IsLocalPrimaryAny() instead of primaryship of the lowest data RG. The publish
+  gate `ipmonPublishAllowed` (pkg/daemon/daemon_ipmon.go) previously returned
+  `d.cluster.IsLocalPrimary(lowestDataRG(cfg))` — a single node-wide boolean
+  keyed to the LOWEST data RG. In a multi-data-RG active/active cluster with
+  split primaryship (RG1 primary on node A, RG2 primary on node B), node B (the
+  owner+forwarder of RG2 traffic) had the WHOLE overlay suppressed because it is
+  not primary for RG1, so the RG2 failover route was never injected on the only
+  node that would use it — a functional failover MISS for RG2. Probe HA gating is
+  already per-RG (filterRPMForHAGating / rpmProbeGatingRGs, daemon_rpm.go), so a
+  node only genuinely FAILs the policies whose RG it owns; publishing whenever
+  primary for ANY RG is therefore both safe and precise (node B publishes its
+  RG2 overlay, node A its RG1 overlay, a true standby publishes nothing). This is
+  COMPLETE for RETH-bound probes. Zero regression for the single-data-RG common
+  case: IsLocalPrimaryAny() is identical to IsLocalPrimary(lowestDataRG) there.
+  Layer-2 (per-policy publish allow-set for UNBOUND in-scope probes, or a
+  commit-check requiring HA-gated probes to bind a RETH) is DEFERRED per the
+  converged /research plan. RED-on-revert: new TestIPMonPublishAllowedAnyPrimary
+  split-primary subtest asserts publish=true on the RG2-primary node; reverting
+  the gate to IsLocalPrimary(lowestDataRG) makes it fire (verified). Single-RG
+  primary/secondary subtests assert the new gate == the old gate (equivalence /
+  no-regression guard); the standby (primary-for-none) subtest stays suppressed.
+  go test ./pkg/daemon/ ./pkg/cluster/... green; go build ./... green; gofmt+vet
+  clean. test-failover note: HA gating change; the single-data-RG loss cluster is
+  unaffected by design (IsLocalPrimaryAny==IsLocalPrimary(theOnlyRG) there), so
+  the split-primary path is unit-covered and a unit test suffices.
+- **File(s)**: pkg/daemon/daemon_ipmon.go (ipmonPublishAllowed gate swap + doc
+  comment), pkg/daemon/daemon_ipmon_test.go (TestIPMonPublishAllowedAnyPrimary +
+  ipmonCluster/ipmonClusterCfg helpers; cluster import), docs/multi-wan.md (HA
+  model publication section — per-any-RG semantics, Layer-2 residual deferred)
