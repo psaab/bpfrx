@@ -298,6 +298,9 @@ The package is split by responsibility (#1988):
   that drives it.
 - `ipfix.go` — IPFIX (v10) template/record encoding and the
   `IPFIXExporter` that drives it.
+- `exporterid.go` — `stableExporterID(protocol, instance, template)`
+  (#3740): the stable, nonzero 32-bit per-group id used as the v9 SourceID
+  / IPFIX Observation Domain ID. See "Exporter identity" below.
 - `routemask.go` — the `MaskResolver` func type and
   `NewRouteMaskResolver` (#2866): a TTL-cached, size-bounded FIB
   longest-prefix-match lookup that resolves a flow's `srcMask`/`dstMask`
@@ -337,6 +340,69 @@ exporters MUST NOT share the same rule:
   the header sequence, which loss/sequence-tracking collectors (pmacct,
   Elastiflow) read as packet loss or an exporter restart. Pinned by
   `TestIPFIXTemplateRefreshPreservesSequenceNumber` (fail-on-revert).
+
+## Exporter identity — SourceID / Observation Domain ID (#3740)
+
+The resolvers start **one exporter per (sampling-instance, template)
+group** (`ResolveV9TemplateGroups` / `ResolveIPFIXTemplateGroups`), but
+every exporter previously hardcoded the NetFlow v9 header **SourceID**
+(RFC 3954 §5.1) and the IPFIX header **Observation Domain ID** (RFC 7011
+§3.1) to `1`, and every group reuses template IDs 256/257. Two groups
+pointed at the SAME collector therefore presented an identical RFC decode
+key — `(exporter source IP, SourceID/ODID, templateID)` — so the collector
+saw template **redefinitions** (256 under one group vs another) and two
+**interleaved sequence streams** under one observation domain, read as
+packet loss or an exporter restart. #3745's per-collector source-address
+does not fix this by default: auto/identical source-address yields the
+same source IP, and SourceID stayed 1 for both.
+
+Each exporter now derives a **stable, nonzero 32-bit id** from its config
+identity via `stableExporterID(protocol, instance, template)`
+(`exporterid.go`): FNV-1a 64 over `"protocol|instance|template"`,
+xor-folded to 32 bits, mapped into `[1, 0xFFFFFFFF]`. It mirrors
+`config.StableTunnelEndpointID` (#1873). `NewExporter` stamps it as the v9
+SourceID; `NewIPFIXExporter` as the IPFIX Observation Domain ID.
+
+- **Template IDs stay 256/257.** A unique ODID/SourceID restores the RFC
+  scoping key, so 256 under ODID-A is a different template from 256 under
+  ODID-B — no per-group template-ID allocator needed.
+- **Per-exporter sequence counters stay** (now correct: each group has its
+  own observation domain, so its own sequence stream).
+- **HA symmetry (load-bearing).** Flow export is NOT gated on RG
+  mastership (`reconcileFlowExporters` has no master/standby guard), so
+  both cluster nodes run exporters from the same synced config. The id is
+  a pure function of config-synced fields (protocol/instance/template) and
+  of NOTHING node-specific, so both nodes compute the IDENTICAL id for a
+  group and a failover never presents the collector a new observation
+  domain — the same argument #1873 relies on.
+- **Protocol tag** (`"netflow9"` vs `"ipfix"`) is folded in so a v9 and an
+  IPFIX group with the same instance/template never share a value
+  (belt-and-braces; a flow-server binds one version per #2136).
+- **Degenerate-default guard.** A hand-built `ExportConfig{}` with no
+  instance AND no template (the singular `Build*` helpers and several unit
+  tests) keeps SourceID/ODID = `1`, preserving the pre-#3740 wire for the
+  unnamed single-default deployment. Real multi-group configs always carry
+  a non-empty `InstanceName` (sampling instances are named), so they
+  always get distinct hashed ids.
+
+**One-time upgrade churn (release note).** For any *named* or *multi-group*
+deployment the SourceID/ODID changes from `1` to the hashed value the
+first time this build runs. This is the intended, collector-visible
+correctness change: a collector sees a **new observation domain** once,
+and any dashboards/filters keyed on `ODID=1` (or `SourceID=1`) must be
+updated to the new per-group id. The truly-degenerate unnamed default
+(empty instance + template) stays at `1`. This is a NetFlow/IPFIX
+**wire-value** change to the external collector only — it is NOT an
+internal Go↔Rust snapshot wire change (no `protocol_wire_v1.json` regen).
+
+Fail-on-revert pins (`exporter_id_3740_test.go`, loopback UDP):
+`TestNetflowV9SourceIDDistinctPerGroup` /
+`TestIPFIXObservationDomainDistinctPerGroup` (two same-collector groups
+differing only in template, and only in instance, emit distinct ids —
+restoring the constant `1` flips them RED),
+`TestStableExporterIDDegenerateDefault` (the all-empty default stays 1),
+and `TestStableExporterIDHASymmetry` (deterministic id + protocol
+disambiguation).
 
 ## Per-collector write-health (#2464)
 

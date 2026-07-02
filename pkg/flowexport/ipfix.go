@@ -538,8 +538,13 @@ type IPFIXExporter struct {
 // would fork the counter, re-seeding the sampling cadence (#2224).
 func NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error) {
 	e := &IPFIXExporter{
-		cfg:          cfg,
-		sourceID:     1,
+		cfg: cfg,
+		// #3740: stable per-group Observation Domain ID (RFC 7011 §3.1)
+		// derived from the config identity so two same-collector groups no
+		// longer collide on ODID=1 (template redefinitions + interleaved
+		// sequence streams). HA-symmetric (pure function of config-synced
+		// fields — both cluster nodes compute the same ODID).
+		sourceID:     stableExporterID("ipfix", cfg.InstanceName, cfg.TemplateName),
 		includeDir:   cfg.IncludeFlowDir,
 		templateSet:  encodeIPFIXTemplateSetDir(cfg.IncludeFlowDir),
 		MaskResolver: NewRouteMaskResolver(0),
