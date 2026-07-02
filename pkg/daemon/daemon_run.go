@@ -964,20 +964,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.reconcileLLDP(cfg)
 	}
 
-	// Start event-options engine if configured.
-	if cfg := d.store.ActiveConfig(); cfg != nil && len(cfg.EventOptions) > 0 {
-		// #846: route through commitAndApply so the engine's commit
-		// serializes with HTTP/gRPC commits under d.applySem.
-		// Event-options changes don't sync to peer (the engine fires
-		// independently on each node based on local RPM events).
-		d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
-			return d.commitAndApply(ctx, comment, false)
-		})
-		d.eventEngine.Apply(cfg.EventOptions)
-		if d.rpm != nil {
-			d.rpm.SetEventCallback(d.eventEngine.HandleEvent)
-		}
-		slog.Info("event-options engine started", "policies", len(cfg.EventOptions))
+	// Start the event-options engine. The engine is constructed
+	// UNCONDITIONALLY at boot (not gated on the boot config already having a
+	// policy), mirroring d.lldpMgr / d.dhcpRelay: the d.eventEngine pointer is
+	// written once here and read-only thereafter (race-free Stats() reads), and
+	// reconcileEventOptions — which runs here and on every day-2 commit
+	// (applyConfigLocked step 17) — makes enabling the FIRST policy on a running
+	// daemon take effect immediately instead of only after a restart (#3752).
+	d.initEventEngine()
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.reconcileEventOptions(cfg)
 	}
 
 	// Start DHCP relay. The Manager is always created (not gated on a

@@ -464,6 +464,16 @@ func (e *Engine) Close() {
 	e.workerWG.Wait()
 }
 
+// PolicyCount returns the number of event-options policies the engine
+// currently has loaded. It is the observable seam for the daemon reconcile
+// tests (#3752): after the first policy is enabled on a running daemon the
+// engine must hold it, so a day-2 enable actually takes effect.
+func (e *Engine) PolicyCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.policies)
+}
+
 // Stats returns a snapshot of the observable counters (#2157), surfaced to
 // pkg/api for the xpf_event_actions_* metric family.
 func (e *Engine) Stats() Stats {

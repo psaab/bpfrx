@@ -1,3 +1,21 @@
+## 2026-07-01 — #3752: event-options engine day-2 first-enable start
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The engine was constructed at boot ONLY when the boot config
+    already had a policy, so enabling the FIRST event-options policy on a
+    running daemon left d.eventEngine nil and the day-2 apply
+    (`if d.eventEngine != nil`) was a silent no-op — inert until restart.
+    Added initEventEngine (construct unconditionally at boot, register RPM
+    callback, write-once pointer, mirrors LLDP/dhcpRelay) + reconcileEventOptions
+    (Apply on boot and every day-2 commit). applyConfigLocked step 17 and the
+    boot block now call these. Engine.PolicyCount accessor for the tests.
+    RED-on-revert: TestInitEventEngineConstructsUnconditionally /
+    TestReconcileEventOptionsDay2Enable.
+  - **File(s)**: pkg/eventengine/engine.go (PolicyCount),
+    pkg/daemon/daemon_apply.go (initEventEngine, reconcileEventOptions, step 17),
+    pkg/daemon/daemon_run.go (boot wiring),
+    pkg/daemon/daemon_eventoptions_reconcile_test.go (new)
+
 ## 2026-07-01 — #3754: event-options remediation commit audit description
 
 - **Timestamp**: 2026-07-01
