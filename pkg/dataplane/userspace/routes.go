@@ -130,10 +130,22 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 	// route leaking (rib-groups, next-table). These rules send traffic
 	// matching a destination prefix to a different routing table.
 	// Without these, the userspace FIB can't cross-reference VRF tables.
-	tableIDToName := make(map[int]string)
+	//
+	// #3768 (H6): key the map on the BARE routing-instance name and derive
+	// the family-specific next-table name (".inet.0" vs ".inet6.0") per
+	// family INSIDE the loop below. The old map baked in "<inst>.inet.0"
+	// unconditionally and the AF_INET6 pass reused it verbatim, so an IPv6
+	// ip-rule leaking e.g. 2001:db8:1::/48 into instance "blue" emitted
+	// RouteSnapshot{Table:"inet6.0", Family:"inet6", NextTable:"blue.inet.0"}.
+	// The Rust FIB keys routes_v6 as canonical_route_table(table, true) =
+	// "blue.inet6.0", so the v6 next-table recursion into "blue.inet.0"
+	// missed -> NoRoute -> leaked IPv6 traffic blackholed. Note that
+	// normalizeRouteSnapshotFamily canonicalizes static-route tables but is
+	// NOT applied to these synthetic ip-rule leak snapshots.
+	tableIDToInst := make(map[int]string)
 	for _, inst := range cfg.RoutingInstances {
 		if inst != nil && inst.TableID > 0 {
-			tableIDToName[inst.TableID] = inst.Name + ".inet.0"
+			tableIDToInst[inst.TableID] = inst.Name
 		}
 	}
 	for _, family := range []int{syscall.AF_INET, syscall.AF_INET6} {
@@ -148,21 +160,23 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 			if rule.Dst == nil || rule.Table <= 0 {
 				continue
 			}
-			tableName, ok := tableIDToName[rule.Table]
+			instName, ok := tableIDToInst[rule.Table]
 			if !ok {
 				continue
 			}
 			familyStr := "inet"
 			mainTable := "inet.0"
+			nextTable := instName + ".inet.0"
 			if family == syscall.AF_INET6 {
 				familyStr = "inet6"
 				mainTable = "inet6.0"
+				nextTable = instName + ".inet6.0"
 			}
 			addSnapshot(RouteSnapshot{
 				Table:       mainTable,
 				Family:      familyStr,
 				Destination: rule.Dst.String(),
-				NextTable:   tableName,
+				NextTable:   nextTable,
 			})
 		}
 	}

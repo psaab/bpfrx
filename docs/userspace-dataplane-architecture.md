@@ -833,6 +833,21 @@ overlay. Four correctness invariants (#3770/#3772):
   the FRR managed-section distance-1 render. An unparseable overlay
   destination is skipped (`canonicalRoutePrefix` returns `""`) rather
   than injected verbatim as a garbage FIB prefix.
+- **ip-rule leak `NextTable` is family-specific (#3768 H6).** Each
+  synthetic ip-rule leak snapshot targets the routing-instance table for
+  the RULE's address family: an IPv4 leak points at `<inst>.inet.0`, an
+  IPv6 leak at `<inst>.inet6.0`. The builder keys the table-id map on the
+  bare instance name and derives the family suffix inside the AF_INET /
+  AF_INET6 loop. The pre-#3768 emitter baked `<inst>.inet.0` once and
+  reused it for the v6 pass, so an IPv6 leak targeted the instance's IPv4
+  table; the Rust FIB keys `routes_v6` by `canonical_route_table(table,
+  true) = "<inst>.inet6.0"`, so the v6 next-table recursion missed and
+  the leaked IPv6 route blackholed. Defense-in-depth: the Rust recursion
+  also `canonical_route_table`s the next-table name for the current
+  family before lookup, and a per-resolution visited-table set rejects an
+  A→B→A cross-table next-table cycle (formerly only a direct self-loop
+  was caught, so a two-table cycle burned to `MAX_NEXT_TABLE_DEPTH`)
+  (#3768 M5+M6, `userspace-dp/src/afxdp/forwarding/mod.rs`).
 
 **Dynamic-address feed overlay (#2049).** The snapshot's address books carry
 the live `security dynamic-address` feed prefixes, not just the static

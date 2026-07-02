@@ -1,3 +1,31 @@
+## 2026-07-01 — #3768: IPv6 ip-rule next-table emitted the v4 table (blackhole)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The userspace-FIB ip-rule route-leak emitter built every
+    next-table name as `<inst>.inet.0` before the AF_INET/AF_INET6 loop and
+    reused it for the IPv6 pass, so an IPv6 leak emitted
+    `NextTable:"blue.inet.0"` instead of `blue.inet6.0`. The Rust FIB keys
+    `routes_v6` by `canonical_route_table(table,true)="blue.inet6.0"`, so the
+    v6 next-table recursion missed → NoRoute → leaked IPv6 inter-VRF traffic
+    blackholed (H6). Fix: key the table-id map on the bare instance name and
+    derive the family suffix inside the loop. Rust half (mutually-masking):
+    M5 canonicalizes the recursive next-table name for the current family
+    before lookup (routes.go H6 + this together restore v6 leaks); M6 adds a
+    per-resolution visited-table set so an A→B→A cross-table next-table cycle
+    is rejected at first revisit instead of burning MAX_NEXT_TABLE_DEPTH. The
+    public `lookup_forwarding_resolution_v4/v6` keep their signatures (many
+    callers incl. tunnel-underlay sub-resolution); recursion moved to a
+    private `_inner` variant carrying the visited set. RED-on-revert:
+    TestIPRuleLeakNextTablePerFamily (Go, v6→blue.inet6.0);
+    forwarding_v6_next_table_canonicalizes_inet_form_on_recursion (Rust,
+    NoRoute on M5 revert) + forwarding_resolution_rejects_cross_table_next_
+    table_cycle (Rust, M6 guard).
+  - **File(s)**: pkg/dataplane/userspace/routes.go,
+    pkg/dataplane/userspace/routes_ipv6_nexttable_3768_test.go,
+    userspace-dp/src/afxdp/forwarding/mod.rs,
+    userspace-dp/src/afxdp/forwarding/tests.rs,
+    docs/userspace-dataplane-architecture.md
+
 ## 2026-07-01 — #3755: RPM first probe cycle event reaches event-options
 
 - **Timestamp**: 2026-07-01
