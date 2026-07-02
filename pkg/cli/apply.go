@@ -29,8 +29,22 @@ import (
 // pure function of the name, so this write is byte-identical to the daemon's
 // regardless of reconcile ordering.
 func syslogZoneNameMap(cfg *config.Config) map[uint16]string {
-	znMap := make(map[uint16]string, len(cfg.Security.Zones))
+	names := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	// #3719: under a StableZoneID collision two zone names fold to the same id,
+	// and the dataplane installs only the sorted-first (the survivor
+	// config.QuarantinedZoneNames keeps). Skip the quarantined zone so the
+	// reverse map names the id after the zone actually installed rather than
+	// whichever name won a map-iteration overwrite race — RT_FLOW/syslog would
+	// otherwise render the wrong zone for the surviving zone's traffic.
+	quarantined := config.QuarantinedZoneNames(names)
+	znMap := make(map[uint16]string, len(names))
+	for _, name := range names {
+		if _, drop := quarantined[name]; drop {
+			continue
+		}
 		znMap[config.StableZoneID(name)] = name
 	}
 	return znMap

@@ -1,3 +1,41 @@
+## 2026-07-01 — #3719: lenient StableZoneID collision quarantine (zone-isolation fail-closed)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fix the HIGH zone-identity isolation hole (#3719, codex-153
+    H02/M08/L09/L13). #3075/#3704 moved the zone-id namespace to the stable
+    name-hash `config.StableZoneID` and the STRICT commit path rejects a
+    collision, but the LENIENT path (tolerant load / peer-sync / a config a
+    pre-#3075 binary persisted) only WARNED while every downstream builder still
+    published BOTH colliding zones with the same id — merging two security zones
+    in the dataplane (the Rust id-keyed maps let the later zone overwrite the
+    earlier's reverse name / host-inbound set / tcp-rst bit; both zones'
+    interfaces/policies resolved to one id). Added `config.QuarantinedZoneNames`
+    (SSOT: keeps the sorted-first name per id, quarantines the rest) +
+    `config.StableZoneIDOwner`. New `quarantineCollidingZones` pass in
+    `pkg/dataplane/userspace/zones.go` runs in `buildSnapshot` BEFORE publish:
+    drops the later-sorting colliding `ZoneSnapshot`, unzones its interfaces
+    (`Zone=""` → default-deny), and drops its policies (a dangling policy→zone
+    ref would trip the Rust `UnresolvableZoneReference` preflight and brick a
+    fresh boot). Rest of config still loads (#1960 no-brick). Reverse maps
+    (`zoneNameByID`, `syslogZoneNameMap`) resolve a colliding id to the survivor
+    deterministically. Surfaced via loud one-shot `slog.Error`,
+    `ProcessStatus.ZoneIDCollisions`, and the `xpf_userspace_zone_id_collision`
+    0/1 gauge. Refined the lenient warning wording (L13) to state the zone is
+    QUARANTINED and isolation is DEGRADED. Verified colliding pair z174/z214
+    (both fold to 53547). RED-on-revert proven (neutralizing the pass → both
+    zones publish with id 53547). `go test ./pkg/config/... ./pkg/dataplane/...
+    ./pkg/cli/... ./pkg/api/... ./pkg/daemon/...` green; gofmt/vet clean.
+    Rust defense-in-depth `SnapshotIntegrityError::DuplicateZoneId` backstop
+    deferred to the helper build (needs cargo).
+  - **File(s)**: pkg/config/zoneid.go, pkg/config/zoneid_test.go,
+    pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/builder.go,
+    pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_ha.go,
+    pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/zones_collision_3719_test.go, pkg/cli/apply.go,
+    pkg/cli/apply_syslog_zonemap_3704_test.go, pkg/api/metrics.go,
+    pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+    docs/config-schema.md
+
 ## 2026-07-01 — #3710: host-inbound addressless observability per-interface/per-family
 
 - **Timestamp**: 2026-07-01

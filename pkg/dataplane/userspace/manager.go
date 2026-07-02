@@ -165,7 +165,14 @@ type Manager struct {
 	// (ForwardingSupported=true while the helper rejected the snapshot) is
 	// observable. nil/empty means the last build was fully representable.
 	lastSnapshotRejectReasons []string
-	policySchedulerActive     map[string]bool
+	// lastZoneIDCollisions holds the #3719 diagnostic: the zones the most
+	// recent snapshot build QUARANTINED because their StableZoneID collided
+	// with an earlier-sorting zone. Set under m.mu at every full snapshot
+	// build, surfaced via ProcessStatus.ZoneIDCollisions and the
+	// xpf_userspace_zone_id_collision gauge. nil/empty means no active
+	// collision.
+	lastZoneIDCollisions  []string
+	policySchedulerActive map[string]bool
 	// routeOverlay is the ip-monitoring effective-route overlay
 	// (#1827 PR-1b). Cached so the FULL apply path
 	// (buildSnapshotWithSchedulerState in ApplyConfig) preserves the
@@ -412,6 +419,35 @@ func (m *Manager) recordPolicyContentRejectionLocked(reasons []string) {
 	}
 }
 
+// recordZoneIDCollisionsLocked stores the #3719 zone-id-collision diagnostic
+// from the last snapshot build and fires a one-shot operator alarm on a
+// transition (per the logging rules — NOT per apply). A collision reaches this
+// only on the LENIENT path (a tolerant load, an HA sync from an un-upgraded
+// peer, or a config a pre-#3075 binary persisted); the strict commit path
+// rejects it. The builder already QUARANTINED the later-sorting colliding zone
+// (dropped from the wire, its interfaces unzoned, its policies removed), so the
+// dataplane is fail-closed and never merges two zones — but zone isolation is
+// DEGRADED (the quarantined zone forwards nothing) until an operator renames
+// one zone, so this is a loud Error naming both zones.
+func (m *Manager) recordZoneIDCollisionsLocked(collisions []ZoneIDCollision) {
+	had := len(m.lastZoneIDCollisions) > 0
+	msgs := make([]string, 0, len(collisions))
+	for _, c := range collisions {
+		msgs = append(msgs, c.String())
+	}
+	now := len(msgs) > 0
+	m.lastZoneIDCollisions = msgs
+	switch {
+	case now && !had:
+		slog.Error(
+			"userspace: security-zone id collision — two zone names fold to the same StableZoneID; the later-sorting zone is QUARANTINED (dropped from the dataplane, its interfaces unzoned and its traffic denied) so two zones never share an id. Zone isolation is DEGRADED until one zone is renamed and the config re-committed.",
+			"collisions", msgs,
+		)
+	case had && !now:
+		slog.Info("userspace: security-zone id collision cleared; all zones install with distinct ids")
+	}
+}
+
 func copyPolicySchedulerActiveState(activeState map[string]bool) map[string]bool {
 	if activeState == nil {
 		return nil
@@ -589,6 +625,10 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// for this class; the reject retains previous-good (or leaves the fresh-boot
 	// default-deny), never fail-open.
 	m.recordPolicyContentRejectionLocked(snap.Capabilities.PolicyContentRejected)
+	// #3719: record + alarm any StableZoneID collision the builder quarantined
+	// (lenient / HA-sync / pre-#3075-persisted path). The colliding zone was
+	// already dropped from snap; this surfaces the degraded-isolation state.
+	m.recordZoneIDCollisionsLocked(snap.zoneIDCollisions)
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
 	m.seedHAGroupInventoryLocked(cfg)
 	prevPlanKey := snapshotBindingPlanKey(m.lastSnapshot)
@@ -1179,6 +1219,10 @@ func (m *Manager) recordHelperStatusLocked(status *ProcessStatus) {
 	// observable in `show`/metrics even though the helper reports the
 	// previous-good capabilities.
 	status.LastSnapshotRejectReasons = append([]string(nil), m.lastSnapshotRejectReasons...)
+	// #3719: stamp the manager-owned zone-id-collision diagnostic (the helper
+	// cannot carry it — the colliding zone was dropped before the wire) so the
+	// degraded zone-isolation state is observable in `show`/metrics.
+	status.ZoneIDCollisions = append([]string(nil), m.lastZoneIDCollisions...)
 	if m.eventStream != nil {
 		es := m.eventStream.Status()
 		status.EventStream = &es

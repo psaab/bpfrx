@@ -132,6 +132,14 @@ type ConfigSnapshot struct {
 	// sampling (256× CPU cost) — operator must pass both
 	// --cold-path-sample-mask 0 and --enable-cold-path-1-in-1-sampling.
 	ColdPathSampleMask *uint64 `json:"cold_path_sample_mask,omitempty"`
+	// zoneIDCollisions is the manager-facing (#3719) record of every security
+	// zone the snapshot builder QUARANTINED because its StableZoneID collided
+	// with an earlier-sorting zone. It is unexported so it never rides the wire
+	// or perturbs the snapshot hash (JSON ignores unexported fields), yet it
+	// carries the diagnostic from the pure builder up to ApplyConfig, which
+	// stamps it onto ProcessStatus.ZoneIDCollisions and fires the one-shot
+	// operator alarm. Empty means no collision (the common case).
+	zoneIDCollisions []ZoneIDCollision
 }
 
 // AddressBookSnapshot is #1606: one row of the deduplicated address-book
@@ -1261,14 +1269,25 @@ type ProcessStatus struct {
 	// as xpf_userspace_policy_content_rejected so the Go/Rust status skew
 	// (ForwardingSupported=true while the helper rejected the snapshot) is
 	// observable.
-	LastSnapshotRejectReasons []string  `json:"last_snapshot_reject_reasons,omitempty"`
-	LastSnapshotGeneration    uint64    `json:"last_snapshot_generation"`
-	LastFIBGeneration         uint32    `json:"last_fib_generation,omitempty"`
-	LastSnapshotAt            time.Time `json:"last_snapshot_at,omitempty"`
-	InterfaceAddresses        int       `json:"interface_addresses,omitempty"`
-	NeighborEntries           int       `json:"neighbor_entries,omitempty"`
-	SessionTableEntries       uint64    `json:"session_table_entries,omitempty"`
-	MaxSessions               uint64    `json:"max_sessions,omitempty"`
+	LastSnapshotRejectReasons []string `json:"last_snapshot_reject_reasons,omitempty"`
+	// ZoneIDCollisions is the manager-owned (#3719) diagnostic listing every
+	// security zone the last snapshot build QUARANTINED because its StableZoneID
+	// collided with an earlier-sorting zone. The strict commit path rejects a
+	// collision, but a lenient/HA-sync/pre-#3075-persisted config keeps booting
+	// with the colliding zone dropped from the dataplane (fail-closed: its
+	// interfaces are unzoned and its traffic denied) so two zones never share a
+	// numeric id. Like LastSnapshotRejectReasons it is stamped by
+	// recordHelperStatusLocked from m.lastZoneIDCollisions (the helper cannot
+	// carry it), surfaced as xpf_userspace_zone_id_collision so an operator is
+	// paged until one zone is renamed. Empty means no active collision.
+	ZoneIDCollisions       []string  `json:"zone_id_collisions,omitempty"`
+	LastSnapshotGeneration uint64    `json:"last_snapshot_generation"`
+	LastFIBGeneration      uint32    `json:"last_fib_generation,omitempty"`
+	LastSnapshotAt         time.Time `json:"last_snapshot_at,omitempty"`
+	InterfaceAddresses     int       `json:"interface_addresses,omitempty"`
+	NeighborEntries        int       `json:"neighbor_entries,omitempty"`
+	SessionTableEntries    uint64    `json:"session_table_entries,omitempty"`
+	MaxSessions            uint64    `json:"max_sessions,omitempty"`
 	// #1760: aggregate NAT reverse-key displacement events summed across
 	// the per-worker session tables -- the latent 1:N collision (#1758)
 	// made observable. Near-precise upper bound on live collisions (counts
