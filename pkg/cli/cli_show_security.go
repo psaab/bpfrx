@@ -405,6 +405,17 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		// simulator falls through to the next active rule / default-policy.
 		PolicyInactiveFn: c.policyInactiveFn(),
 	})
+	if res.ContentRejected {
+		// #3727: the dataplane fails this config closed (unexpandable
+		// application-set) and enforces none of its policies — do NOT print a
+		// fabricated permit/deny/default verdict.
+		fmt.Printf("Policy content rejected for %s -> %s\n", fromZone, toZone)
+		fmt.Printf("  %s\n", policymatch.ContentRejectedShowLine)
+		for _, reason := range res.ContentRejectionReasons {
+			fmt.Printf("    %s\n", reason)
+		}
+		return nil
+	}
 	if res.HostInboundUnmatched {
 		// #3285: host-bound traffic — no transit global/default fallback.
 		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", fromZone)
