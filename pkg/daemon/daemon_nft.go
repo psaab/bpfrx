@@ -251,6 +251,13 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// is otherwise silent. Log only state TRANSITIONS (a zone entering/leaving the
 	// window) so repeated commits / DHCP renewals do not flood.
 	d.logHostInboundAddresslessTransitions(cfg)
+	// #3718 (Option B): a firewall-local address reachable from >1 zone with
+	// DIFFERING host-inbound sets makes the kernel destination-address-only
+	// verdict order-dependent (and can disagree with the ingress-scoped
+	// userspace-dp path). The strict commit gate rejects this, but a tolerant /
+	// peer-synced load can slip one through, and it is NOT self-healing — so log
+	// the state transition and export it as xpf_host_inbound_ambiguous_addresses.
+	d.logHostInboundAmbiguousTransitions(cfg)
 	if !hostInboundHasEnforceableView(views) {
 		// No host-inbound-configured zone with a resolvable address — nothing to
 		// enforce. Remove any stale table. nftDeleteTable is idempotent (an
@@ -301,6 +308,41 @@ func (d *Daemon) logHostInboundAddresslessTransitions(cfg *config.Config) {
 		}
 	}
 	d.hostInboundAddresslessZones = current
+}
+
+// logHostInboundAmbiguousTransitions emits a state-transition log whenever a
+// firewall-local address ENTERS or LEAVES the #3718 ambiguity set — an address
+// host-inbound-reachable from more than one security zone with DIFFERING
+// host-inbound service/protocol sets. The kernel host-inbound chain matches on
+// destination address only (no ingress predicate) over a single global input
+// chain, so such an address's admission verdict is order-dependent (the
+// earlier-sorting zone decides the packet) and can disagree with the
+// ingress-scoped userspace-dp path — a zone-isolation failure. The strict commit
+// gate (config.validateDuplicateHostLocalAddressStrict) rejects this; a tolerant
+// / peer-synced load (#1960) can slip one through, and unlike the addressless
+// window it does NOT self-heal, so the warning stands until the operator fixes
+// the config. It compares against the set observed on the previous apply
+// (d.hostInboundAmbiguousAddrs) so a persisting ambiguity is logged once (on
+// entry), not every apply. Runs under applySem (via applyHostInboundFilter), so
+// the map access needs no extra locking. The current set is also exported as the
+// xpf_host_inbound_ambiguous_addresses gauge (pkg/api), scraped independently.
+func (d *Daemon) logHostInboundAmbiguousTransitions(cfg *config.Config) {
+	current := make(map[string]bool)
+	for _, a := range dpuserspace.AmbiguousHostInboundAddresses(cfg) {
+		key := a.Family + "|" + a.Address
+		current[key] = true
+		if !d.hostInboundAmbiguousAddrs[key] {
+			slog.Warn("host-inbound address is reachable from multiple zones with differing host-inbound sets — the kernel destination-address-only verdict is order-dependent and may disagree with the ingress-scoped userspace path (zone-isolation failure); assign the address to one zone or make the host-inbound sets identical (#3718)",
+				"address", a.Address, "family", a.Family, "zones", strings.Join(a.Zones, ","))
+		}
+	}
+	for key := range d.hostInboundAmbiguousAddrs {
+		if !current[key] {
+			slog.Info("host-inbound address ambiguity resolved — the address no longer has an order-dependent host-inbound verdict",
+				"address", key)
+		}
+	}
+	d.hostInboundAmbiguousAddrs = current
 }
 
 // hostInboundHasEnforceableView reports whether at least one view carries a

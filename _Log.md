@@ -1,3 +1,50 @@
+## 2026-07-01 — #3718 host-inbound: fail-closed duplicate host-local-address gate + runtime reporter/metric (Option B)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3718 (HIGH, codex-review-153 H01/M02/M03/M04/M09). The kernel
+    host-inbound nftables chain matches DESTINATION ADDRESS ONLY (no ingress
+    predicate) over a single global `inet xpf_hostinbound` chain, so two zones
+    resolving the SAME firewall-local address (dup interface addr, dup VRRP VIP,
+    or same addr across routing-instances) emit two daddr-keyed blocks in
+    zone-sort order and the earlier-sorting zone decides the packet — and can
+    disagree with the already-ingress-scoped userspace-dp host_inbound_admits
+    path (split-brain). No duplicate-local-address gate existed. Implemented the
+    converged /research plan's Option B (fail-closed gate + observability);
+    Option A (kernel iifname ingress-scope) and Option C (per-VRF chains) are
+    deferred follow-ons documented on the issue + in
+    docs/host-inbound-service-matrix.md.
+    - COMMIT-TIME: `validateDuplicateHostLocalAddressStrict`
+      (pkg/config/dup_host_local_address.go) hard-rejects a config where the same
+      (family, host address) — interface addr OR VRRP VIP — is
+      host-inbound-reachable from >1 DISTINCT effective host-inbound token set.
+      Keys on differing sets via the shared `CanonicalHostInboundTokenSig`, NOT
+      ">1 zone", so an identical-service dup is allowed (no false positive);
+      lifeline ifaces (fxp0/em0/fab*) excluded. Covers IPv4/IPv6/VRRP/cross-zone
+      M04. Lenient downgrade to cfg.Warnings on the tolerant path
+      (lenientDuplicateHostLocalAddress, #1960). Wired in compiler.go after
+      validateHostInboundTokensStrict.
+    - RUNTIME: `AmbiguousHostInboundAddresses` (pkg/dataplane/userspace/zones.go,
+      mirrors #3698 AddresslessEnforcingZones) reads BuildZoneHostInboundViews;
+      `xpf_host_inbound_ambiguous_addresses{address,family}` gauge (pkg/api,
+      emitted before the dataplane gate); daemon state-transition log
+      `logHostInboundAmbiguousTransitions` (pkg/daemon/daemon_nft.go, WARN on
+      entry / INFO on recovery; ambiguity is NOT self-healing).
+    - TESTS (RED-on-revert proven by neutering each layer): config matrix
+      (v4/v6/VRRP reject + identical-service/same-zone/lifeline/distinct allow +
+      commit-reject/lenient-warn wiring), userspace reporter, api metric
+      (before-gate), daemon log transitions. go test ./pkg/config/...
+      ./pkg/dataplane/... ./pkg/api/... ./pkg/daemon/ green; go build ./...;
+      gofmt+vet clean.
+  - **File(s)**: pkg/config/dup_host_local_address.go (new),
+    pkg/config/dup_host_local_address_3718_test.go (new), pkg/config/compiler.go,
+    pkg/dataplane/userspace/zones.go,
+    pkg/dataplane/userspace/zones_ambiguous_3718_test.go (new),
+    pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+    pkg/api/metrics_counters.go,
+    pkg/api/metrics_host_inbound_ambiguous_3718_test.go (new),
+    pkg/daemon/daemon.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/host_inbound_ambiguous_3718_test.go (new),
+    docs/host-inbound-service-matrix.md, docs/config-schema.md
 ## 2026-07-01 — #3769 fold (review MINOR): empty from-routing-instance NAT external = table-agnostic wildcard
 
 - **Timestamp**: 2026-07-01

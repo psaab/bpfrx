@@ -396,6 +396,101 @@ func AddresslessEnforcingZones(cfg *config.Config) []AddresslessEnforcingZone {
 	return out
 }
 
+// AmbiguousHostInboundAddress names a firewall-local address that is
+// host-inbound-reachable from more than one security zone / effective
+// host-inbound token set with DIFFERING admission (#3718 Option B). The kernel
+// host-inbound nftables chain matches on destination address ONLY (no
+// ingress-interface predicate) over a single global input chain, so such an
+// address's admission verdict is decided order-dependently by whichever zone
+// sorts first — and the kernel path can disagree with the ingress-scoped
+// userspace-dp host_inbound_admits path (split-brain). The commit-time gate
+// (config.validateDuplicateHostLocalAddressStrict) hard-rejects this on the
+// strict path, but a tolerant / peer-synced load (#1960) can slip one through;
+// this type carries the machine-readable runtime signal the daemon logs and the
+// API exports (xpf_host_inbound_ambiguous_addresses) so the ambiguity — which is
+// NOT self-healing — is observable rather than silent.
+type AmbiguousHostInboundAddress struct {
+	// Address is the bare firewall-local host IP (no prefix).
+	Address string
+	// Family is the Junos family name: "inet" (IPv4) or "inet6" (IPv6).
+	Family string
+	// Zones are the distinct security zones that render a host-inbound rule
+	// block for Address, sorted. At least two are present when the ambiguity is
+	// cross-zone; a same-zone-only entry (differing #3362 per-interface
+	// overrides on the same address) carries the single zone.
+	Zones []string
+}
+
+// AmbiguousHostInboundAddresses returns, in sorted (family, address) order, the
+// firewall-local addresses that are host-inbound-reachable from more than one
+// DISTINCT effective host-inbound token set (#3718 Option B). The set of scopes
+// per address is read back from BuildZoneHostInboundViews — the exact same
+// builder that drives the kernel nft emission — so the observability signal can
+// never disagree with what is actually rendered: an address is reported iff the
+// builder produces two rule blocks for it whose EFFECTIVE admission differs
+// (config.CanonicalHostInboundTokenSig, the shared SSOT the commit-time gate
+// also uses).
+//
+// A duplicated address with IDENTICAL host-inbound service sets across its zones
+// is NOT reported — it renders the same accept+drop block twice (order-
+// independent, both paths agree), so it is a deliberate-duplicate false-positive
+// the low-noise contract avoids. Management / cluster-control lifeline
+// interfaces (fxp0 / em0 / fab*) contribute no address (they are excluded from
+// deny scoping), so a shared management address never surfaces here either.
+func AmbiguousHostInboundAddresses(cfg *config.Config) []AmbiguousHostInboundAddress {
+	if cfg == nil || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	type acc struct {
+		sigs  map[string]bool
+		zones map[string]bool
+	}
+	byAddr := make(map[string]*acc)
+	record := func(family, addr, sig, zone string) {
+		key := family + "\x00" + addr
+		a := byAddr[key]
+		if a == nil {
+			a = &acc{sigs: make(map[string]bool), zones: make(map[string]bool)}
+			byAddr[key] = a
+		}
+		a.sigs[sig] = true
+		a.zones[zone] = true
+	}
+	for _, v := range BuildZoneHostInboundViews(cfg) {
+		sig := config.CanonicalHostInboundTokenSig(v.SystemServices, v.Protocols)
+		for _, a := range v.V4Addrs {
+			record("inet", a, sig, v.Zone)
+		}
+		for _, a := range v.V6Addrs {
+			record("inet6", a, sig, v.Zone)
+		}
+	}
+	keys := make([]string, 0, len(byAddr))
+	for k := range byAddr {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []AmbiguousHostInboundAddress
+	for _, k := range keys {
+		a := byAddr[k]
+		if len(a.sigs) < 2 {
+			continue
+		}
+		parts := strings.SplitN(k, "\x00", 2)
+		zones := make([]string, 0, len(a.zones))
+		for z := range a.zones {
+			zones = append(zones, z)
+		}
+		sort.Strings(zones)
+		out = append(out, AmbiguousHostInboundAddress{
+			Address: parts[1],
+			Family:  parts[0],
+			Zones:   zones,
+		})
+	}
+	return out
+}
+
 // unionHostInboundTokens returns the EFFECTIVE host-inbound system-service and
 // protocol token sets for an interface (#3362): the zone-level set UNION the
 // per-interface override, lower-cased, trimmed, and de-duplicated, with

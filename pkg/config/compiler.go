@@ -819,6 +819,23 @@ type compileOpts struct {
 	// zone so it too fails CLOSED), so a leniently-loaded bad config is inert
 	// and consistent. Same doctrine as lenientPolicyZoneRefs.
 	lenientHostInboundTokens bool
+	// lenientDuplicateHostLocalAddress (#3718 Option B) downgrades the
+	// duplicate host-local-address gate (validateDuplicateHostLocalAddressStrict)
+	// from a hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a firewall-local address (interface address
+	// or VRRP VIP) that is host-inbound-reachable from more than one security
+	// zone with DIFFERING host-inbound service/protocol sets — the kernel
+	// host-inbound nftables chain matches destination address only (no ingress
+	// predicate), so the admission verdict for such an address is decided
+	// order-dependently by whichever zone sorts first, and can disagree with the
+	// ingress-scoped userspace-dp path (split-brain). The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick);
+	// on that path the ambiguity is NOT self-healing, so the runtime reporter
+	// (dataplane/userspace.AmbiguousHostInboundAddresses) and the
+	// xpf_host_inbound_ambiguous_addresses metric are the operator's signal. Same
+	// doctrine as lenientZoneInterfaceMembership.
+	lenientDuplicateHostLocalAddress bool
 	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
 	// destination-address gate (validateDestinationNATAddressesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1362,6 +1379,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientAddressBookNames:              true,
 		lenientZoneInterfaceMembership:       true,
 		lenientHostInboundTokens:             true,
+		lenientDuplicateHostLocalAddress:     true,
 		lenientDestNATAddresses:              true,
 		lenientRPMSourceAddress:              true,
 		lenientRPMLinkLocalZone:              true,
@@ -1526,6 +1544,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientAddressBookNames:              true,
 		lenientZoneInterfaceMembership:       true,
 		lenientHostInboundTokens:             true,
+		lenientDuplicateHostLocalAddress:     true,
 		lenientDestNATAddresses:              true,
 		lenientRPMSourceAddress:              true,
 		lenientRPMLinkLocalZone:              true,
@@ -2453,6 +2472,30 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientHostInboundTokens {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("host-inbound-traffic token (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3718 (Option B) duplicate host-local-address gate. Strict on commit /
+	// commit-check (hard-reject a firewall-local interface address or VRRP VIP
+	// that is host-inbound-reachable from more than one security zone with
+	// DIFFERING host-inbound service/protocol sets — the kernel host-inbound
+	// nftables chain matches destination address only over a single global input
+	// chain, so the admission verdict is decided order-dependently by whichever
+	// zone sorts first and can disagree with the ingress-scoped userspace-dp path
+	// (split-brain)); lenient on load / peer-sync (warn so an already-persisted
+	// or peer-synced config still boots — #1960 no-brick; the runtime reporter
+	// AmbiguousHostInboundAddresses + the xpf_host_inbound_ambiguous_addresses
+	// metric surface the ambiguity, which is NOT self-healing on that path). Runs
+	// AFTER the host-inbound token gate so a token typo still wins the
+	// first-error slot. Option A (kernel iifname ingress-scope) and Option C
+	// (per-VRF host-inbound chains) are deferred follow-ons — see
+	// docs/host-inbound-traffic.md.
+	if err := validateDuplicateHostLocalAddressStrict(cfg); err != nil {
+		if opts.lenientDuplicateHostLocalAddress {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("duplicate host-local address (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

@@ -115,6 +115,27 @@ func newCollector(srv *Server) *xpfCollector {
 				"scoping (transient fail-open admit window), labeled by zone.",
 			[]string{"zone"}, nil,
 		),
+		// #3718 (Option B): 1 per firewall-local address that is
+		// host-inbound-reachable from more than one security zone with DIFFERING
+		// host-inbound service/protocol sets. The kernel host-inbound nftables
+		// chain matches on destination address only (no ingress predicate) over a
+		// single global input chain, so such an address's admission verdict is
+		// decided order-dependently by whichever zone sorts first, and can
+		// disagree with the ingress-scoped userspace-dp path (split-brain). The
+		// strict commit gate hard-rejects this; a tolerant / peer-synced load
+		// (#1960) can slip one through, and unlike the addressless window it is
+		// NOT self-healing — so this control-plane signal (config-derived,
+		// emitted BEFORE the dataplane gate) stays 1 until the ambiguity is
+		// resolved. Absent = no ambiguous address.
+		hostInboundAmbiguousAddrs: prometheus.NewDesc(
+			"xpf_host_inbound_ambiguous_addresses",
+			"1 per firewall-local address that is host-inbound-reachable from "+
+				"multiple security zones with differing host-inbound service/"+
+				"protocol sets, making the kernel destination-address-only "+
+				"host-inbound verdict order-dependent (#3718), labeled by "+
+				"address and family.",
+			[]string{"address", "family"}, nil,
+		),
 		tcEgressPacketsTotal: prometheus.NewDesc(
 			"xpf_tc_egress_packets_total",
 			"Total TC egress packets processed.",
