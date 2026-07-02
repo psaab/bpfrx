@@ -182,6 +182,14 @@ func ValidateRingEntries(raw string, _ *Config) error {
 const (
 	maxWireU16 = int64(math.MaxUint16)
 	maxWireU32 = int64(math.MaxUint32)
+	// maxWireI32 is the inclusive ceiling for a typed leaf whose value lands
+	// in a Rust i32 wire field (e.g. RouteSnapshot.preference, #3771). Junos
+	// route preference is a non-negative admin distance whose documented range
+	// runs to 2^32-1, but the snapshot serializes it as i32, so the
+	// wire-representable non-negative ceiling is math.MaxInt32 — a value above
+	// it would overflow the Rust i32 decode (failing the whole snapshot). The
+	// Rust helper backstops the lower bound too (RoutePreferenceOutOfRange).
+	maxWireI32 = int64(math.MaxInt32)
 )
 
 // ValidateIntegerMin returns a closure that accepts any bare integer

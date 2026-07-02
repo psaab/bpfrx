@@ -38,9 +38,33 @@ pub(super) fn populate_routes(
     snapshot: &ConfigSnapshot,
     state: &mut ForwardingState,
     iface_ctx: &IfaceIndex,
-) {
+) -> Result<(), crate::policy::SnapshotIntegrityError> {
+    use crate::policy::SnapshotIntegrityError;
     for route in &snapshot.routes {
+        // #3771 (L1): reject a NEGATIVE route preference. The FIB tie-breaks
+        // same-prefix routes by ascending preference (`sort_routes`); a negative
+        // value (e.g. i32::MIN) would sort ahead of every route and silently
+        // hijack the selection for that prefix. Checked before the family/prefix
+        // parse so it applies to every route shape.
+        if route.preference < 0 {
+            return Err(SnapshotIntegrityError::RoutePreferenceOutOfRange {
+                table: route.table.clone(),
+                destination: route.destination.clone(),
+                preference: route.preference,
+            });
+        }
         if let Ok(prefix) = route.destination.parse::<Ipv4Net>() {
+            // #3771 (M4): the destination parses as IPv4 — a NON-EMPTY declared
+            // family must agree ("inet"), else the route's family metadata
+            // contradicts the FIB it would install into. Fail CLOSED rather than
+            // install into routes_v4 while `family` claims v6.
+            if route_family_mismatch(&route.family, false) {
+                return Err(SnapshotIntegrityError::RouteFamilyMismatch {
+                    table: route.table.clone(),
+                    destination: route.destination.clone(),
+                    family: route.family.clone(),
+                });
+            }
             let next_hops = resolve_route_next_hops_v4(
                 route,
                 &iface_ctx.name_to_ifindex,
@@ -62,6 +86,15 @@ pub(super) fn populate_routes(
             continue;
         }
         if let Ok(prefix) = route.destination.parse::<Ipv6Net>() {
+            // #3771 (M4): the destination parses as IPv6 — a NON-EMPTY declared
+            // family must agree ("inet6").
+            if route_family_mismatch(&route.family, true) {
+                return Err(SnapshotIntegrityError::RouteFamilyMismatch {
+                    table: route.table.clone(),
+                    destination: route.destination.clone(),
+                    family: route.family.clone(),
+                });
+            }
             let next_hops = resolve_route_next_hops_v6(
                 route,
                 &iface_ctx.name_to_ifindex,
@@ -81,6 +114,25 @@ pub(super) fn populate_routes(
                     preference: route.preference,
                 });
         }
+    }
+    Ok(())
+}
+
+/// #3771 (M4): true iff `family` is a NON-EMPTY declared address family that
+/// does not match the actual family (`is_ipv6`). An empty family (older /
+/// omitted producer) is unconstrained — the pre-fix parse-only behaviour — and
+/// is never a mismatch. Any non-empty string other than the matching canonical
+/// token ("inet" for v4, "inet6" for v6) is a mismatch, so a corrupt / unknown
+/// family also fails closed.
+fn route_family_mismatch(family: &str, is_ipv6: bool) -> bool {
+    let fam = family.trim();
+    if fam.is_empty() {
+        return false;
+    }
+    if is_ipv6 {
+        !fam.eq_ignore_ascii_case("inet6")
+    } else {
+        !fam.eq_ignore_ascii_case("inet")
     }
 }
 
@@ -109,20 +161,62 @@ pub(super) fn sort_routes(state: &mut ForwardingState) {
     }
 }
 
-pub(super) fn populate_neighbors(snapshot: &ConfigSnapshot, state: &mut ForwardingState) {
+pub(super) fn populate_neighbors(
+    snapshot: &ConfigSnapshot,
+    state: &mut ForwardingState,
+) -> Result<(), crate::policy::SnapshotIntegrityError> {
     for neigh in &snapshot.neighbors {
-        if neigh.ifindex <= 0 || !neighbor_state_usable(&neigh.state) {
+        if neigh.ifindex <= 0 {
             continue;
         }
         let Ok(ip) = neigh.ip.parse::<IpAddr>() else {
             continue;
         };
+        // #3771 (M11): fail CLOSED on a neighbor whose NON-EMPTY declared family
+        // contradicts its parsed IP, rather than installing it under the wrong
+        // family. Checked before the state / MAC skips so a family-metadata
+        // corruption is surfaced regardless of whether the entry is installable.
+        if neighbor_family_mismatch(&neigh.family, &ip) {
+            return Err(crate::policy::SnapshotIntegrityError::NeighborFamilyMismatch {
+                interface: neigh.interface.clone(),
+                ip: neigh.ip.clone(),
+                family: neigh.family.clone(),
+            });
+        }
+        // #3771 (M12): allowlist neighbor states — skip a known-unusable state
+        // (failed/incomplete) silently and COUNT an unknown/future state
+        // (none/empty/corrupt), instead of the pre-fix denylist that installed
+        // every unrecognized state that happened to carry a parseable IP+MAC.
+        match classify_neighbor_state(&neigh.state) {
+            NeighborStateClass::Usable => {}
+            NeighborStateClass::KnownUnusable => continue,
+            NeighborStateClass::Unknown => {
+                NEIGHBOR_UNKNOWN_STATE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+        }
         let Some(mac) = parse_mac(&neigh.mac) else {
             continue;
         };
         state
             .neighbors
             .insert((neigh.ifindex, ip), NeighborEntry { mac });
+    }
+    Ok(())
+}
+
+/// #3771 (M11): true iff `family` is a NON-EMPTY declared address family that
+/// does not match the actual family of `ip`. An empty family (older / omitted
+/// producer) is unconstrained and never a mismatch; any non-empty non-matching
+/// value (including a corrupt/unknown token) fails closed.
+fn neighbor_family_mismatch(family: &str, ip: &IpAddr) -> bool {
+    let fam = family.trim();
+    if fam.is_empty() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(_) => !fam.eq_ignore_ascii_case("inet"),
+        IpAddr::V6(_) => !fam.eq_ignore_ascii_case("inet6"),
     }
 }
 

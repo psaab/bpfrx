@@ -225,9 +225,16 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     interfaces::populate_egress(snapshot, &mut state, &iface_ctx)?;
 
     fib::sort_connected(&mut state);
-    fib::populate_routes(snapshot, &mut state, &iface_ctx);
+    // #3771: fail the snapshot CLOSED on a route whose `family` contradicts its
+    // destination prefix (M4) or that carries a negative preference (L1) — the
+    // apply preflight then keeps the previous live forwarding state rather than
+    // mis-placing the route in the FIB or letting it hijack the preference
+    // tie-break.
+    fib::populate_routes(snapshot, &mut state, &iface_ctx)?;
     fib::sort_routes(&mut state);
-    fib::populate_neighbors(snapshot, &mut state);
+    // #3771 (M11): fail the snapshot CLOSED on a neighbor whose `family`
+    // contradicts its IP; unknown/failed states are skipped inside.
+    fib::populate_neighbors(snapshot, &mut state)?;
     fib::populate_fabrics(snapshot, &mut state, &iface_ctx);
 
     state.policy = parse_policy_state_with_counters(
