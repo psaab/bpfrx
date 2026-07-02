@@ -2038,6 +2038,18 @@ pub(crate) struct PolicyState {
     both_any_indices: Vec<usize>,
     /// Indices of global rules (from_zone or to_zone = "junos-global").
     global_indices: Vec<usize>,
+    /// #3783: the concrete (interface-assignable) zone-id universe for THIS
+    /// snapshot — every non-zero, non-reserved id in `zone_name_to_id`, sorted
+    /// and deduplicated. A wildcard (`from-zone any` / `to-zone any`) or an
+    /// unscoped `junos-global` policy has no EXACT `(from,to)` pair, so the
+    /// concrete pair a packet actually traverses would have no cold-path
+    /// latency histogram slot; `configured_zone_pairs` materializes those pairs
+    /// from this universe constrained by each wildcard/global scope so the
+    /// #1635 histogram is not dark for the common vSRX catch-all design.
+    /// Config-derived and deterministic, so both HA nodes derive the identical
+    /// slot map from the identical config (the histogram is local per-node
+    /// telemetry — not wire-synced — but its slot layout stays symmetric).
+    concrete_zone_ids: Vec<u16>,
     /// #1606: deduplicated address-book table. Rules reference
     /// books by dense `u32` index (`PolicyRule::source_book_idxs`).
     pub(crate) books: Vec<BookEntry>,
@@ -2096,6 +2108,9 @@ impl Default for PolicyState {
             to_any_index: FxHashMap::default(),
             both_any_indices: Vec::new(),
             global_indices: Vec::new(),
+            // #3783: the Default state carries no zones, so the wildcard/global
+            // histogram-slot expansion has an empty concrete-zone universe.
+            concrete_zone_ids: Vec::new(),
             books: Vec::new(),
             book_id_to_idx: FxHashMap::default(),
             has_junos_host_rules: false,
@@ -2237,23 +2252,121 @@ impl PolicyState {
         }
     }
 
-    /// #1635: the set of concrete `(from_zone_id, to_zone_id)` pairs the
-    /// configured policy distinguishes, used to build the cold-path
-    /// histogram's direct slot map. Returns a deduplicated, sorted Vec
-    /// for deterministic slot assignment. Pairs that reference the
-    /// `junos-global` sentinel zone-id are excluded — global rules don't
-    /// name a concrete zone-pair and would over-broaden the slot map.
+    /// #1635/#3783: the set of concrete `(from_zone_id, to_zone_id)` pairs the
+    /// configured policy can distinguish, used to build the cold-path
+    /// histogram's direct slot map. The recording site
+    /// (`poll_descriptor::lookup_slot`) keys on the CONCRETE ingress/egress
+    /// zone-ids a packet traverses, so every concrete pair a configured policy
+    /// can match MUST appear here or its first-packet latency sample is
+    /// silently dropped on a slot-map miss.
+    ///
+    /// Two tiers, in slot-priority order:
+    ///
+    ///   1. EXACT `zone_pair_index` pairs (the historical set). Emitted FIRST
+    ///      so a mixed config never starves an explicitly-named pair of its
+    ///      slot behind a large wildcard expansion.
+    ///   2. #3783 wildcard/global expansion — the concrete pairs implied by the
+    ///      `from-zone any` / `to-zone any` / `from-zone any to-zone any`
+    ///      tiers (#3090) and by `junos-global` rules (#3148), each constrained
+    ///      by its scope and materialized against `concrete_zone_ids`. Without
+    ///      this a catch-all-only deployment (`from-zone any to-zone <z>` /
+    ///      `security policies global`) produced ZERO exact pairs, so the
+    ///      histogram was dark for exactly the common vSRX catch-all design.
+    ///
+    /// Reserved sentinels (`junos-host` / `junos-global`, id
+    /// `>= ZONE_ID_RESERVED_MIN`) and the id-0 unknown-zone are excluded on both
+    /// tiers — they never form a transit zone-pair the histogram measures. The
+    /// two tiers are each individually sorted and mutually disjoint, so slot
+    /// assignment is deterministic (HA-symmetric — both nodes derive the
+    /// identical slot map from the identical config). If the union exceeds the
+    /// 255-slot capacity the surplus is dropped by `ColdPathSlotMap::build`
+    /// (its `overflow_active` flag surfaces the starvation to operators) —
+    /// exact pairs win because they are assigned first.
     pub(crate) fn configured_zone_pairs(&self) -> Vec<(u16, u16)> {
-        let mut pairs: Vec<(u16, u16)> = self
+        use std::collections::BTreeSet;
+
+        // A concrete, addressable transit zone id: non-zero and outside the
+        // reserved sentinel range.
+        #[inline]
+        fn is_concrete(id: u16) -> bool {
+            id != 0 && id < ZONE_ID_RESERVED_MIN
+        }
+
+        // Tier 1: exact configured pairs (historical behavior).
+        let exact: BTreeSet<(u16, u16)> = self
             .zone_pair_index
             .keys()
             .map(|&key| (((key >> 16) & 0xffff) as u16, (key & 0xffff) as u16))
-            .filter(|&(from, to)| {
-                from < ZONE_ID_RESERVED_MIN && to < ZONE_ID_RESERVED_MIN
-            })
+            .filter(|&(from, to)| is_concrete(from) && is_concrete(to))
             .collect();
-        pairs.sort_unstable();
-        pairs.dedup();
+
+        // The concrete-zone universe a wildcard `any` / unscoped-global side
+        // can resolve to at runtime.
+        let concrete: Vec<u16> = self
+            .concrete_zone_ids
+            .iter()
+            .copied()
+            .filter(|&z| is_concrete(z))
+            .collect();
+
+        // Tier 2: expand the wildcard/global scopes into the concrete pairs
+        // they match. Kept in a separate set so tier-1 retains slot priority.
+        let mut wildcard: BTreeSet<(u16, u16)> = BTreeSet::new();
+
+        // `from-zone any to-zone <Z>`: any concrete ingress zone -> Z.
+        for &to_id in self.from_any_index.keys() {
+            if !is_concrete(to_id) {
+                continue;
+            }
+            for &from in &concrete {
+                wildcard.insert((from, to_id));
+            }
+        }
+        // `to-zone any from-zone <F>`: F -> any concrete egress zone.
+        for &from_id in self.to_any_index.keys() {
+            if !is_concrete(from_id) {
+                continue;
+            }
+            for &to in &concrete {
+                wildcard.insert((from_id, to));
+            }
+        }
+        // `from-zone any to-zone any`: every concrete pair.
+        if !self.both_any_indices.is_empty() {
+            for &from in &concrete {
+                for &to in &concrete {
+                    wildcard.insert((from, to));
+                }
+            }
+        }
+        // `junos-global` rules, each scoped by its optional `match from-zone` /
+        // `match to-zone` context (#3148). `Any` expands to the full concrete
+        // universe; a concrete `Zone(id)` pins that side; a reserved
+        // `Zone(id)` (junos-host) contributes no transit pair.
+        for &idx in &self.global_indices {
+            let rule = &self.rules[idx];
+            let expand_side = |scope: GlobalZoneScope| -> Vec<u16> {
+                match scope {
+                    GlobalZoneScope::Any => concrete.clone(),
+                    GlobalZoneScope::Zone(z) if is_concrete(z) => vec![z],
+                    GlobalZoneScope::Zone(_) => Vec::new(),
+                }
+            };
+            let from_ids = expand_side(rule.global_from_zone);
+            let to_ids = expand_side(rule.global_to_zone);
+            for &from in &from_ids {
+                for &to in &to_ids {
+                    wildcard.insert((from, to));
+                }
+            }
+        }
+
+        // Exact pairs first (slot priority), then the additional wildcard/global
+        // pairs not already covered by an exact pair. Both halves are sorted
+        // (BTreeSet), so the whole assignment is deterministic and HA-symmetric.
+        let mut pairs: Vec<(u16, u16)> = Vec::with_capacity(exact.len() + wildcard.len());
+        pairs.extend(exact.iter().copied());
+        pairs.extend(wildcard.into_iter().filter(|p| !exact.contains(p)));
         pairs
     }
 }
@@ -2299,6 +2412,21 @@ pub(crate) fn parse_policy_state_with_counters(
             action: default_policy.to_string(),
         })?
     };
+    // #3783: capture the concrete (interface-assignable) zone-id universe from
+    // the incoming snapshot's zone table so `configured_zone_pairs` can
+    // materialize the concrete pairs that a wildcard/global-only policy will
+    // actually match — otherwise those pairs get no cold-path histogram slot
+    // and their first-packet latency samples are silently dropped. Reserved
+    // sentinels (junos-host / junos-global, id >= ZONE_ID_RESERVED_MIN) and the
+    // id-0 "unknown zone" are excluded — they never form a transit zone-pair.
+    let mut concrete_zone_ids: Vec<u16> = zone_name_to_id
+        .values()
+        .copied()
+        .filter(|&id| id != 0 && id < ZONE_ID_RESERVED_MIN)
+        .collect();
+    concrete_zone_ids.sort_unstable();
+    concrete_zone_ids.dedup();
+
     let mut state = PolicyState {
         default_action,
         rules: Vec::with_capacity(rules.len()),
@@ -2307,6 +2435,9 @@ pub(crate) fn parse_policy_state_with_counters(
         to_any_index: FxHashMap::default(),
         both_any_indices: Vec::new(),
         global_indices: Vec::new(),
+        // #3783: the concrete-zone universe backing the wildcard/global
+        // histogram-slot expansion (computed above from `zone_name_to_id`).
+        concrete_zone_ids,
         books: Vec::with_capacity(address_books.len()),
         book_id_to_idx: FxHashMap::default(),
         // #3019: armed below if any rule names the `junos-host` self zone.

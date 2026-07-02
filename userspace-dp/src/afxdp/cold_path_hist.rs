@@ -145,6 +145,15 @@ pub(in crate::afxdp) fn zone_pair_packed_key(from_zone_id: u16, to_zone_id: u16)
 /// removed). A miss (pair absent) means no slot assigned (capacity
 /// exhausted); the sample is dropped at the hot path.
 ///
+/// The map is built from `PolicyState::configured_zone_pairs()`, which
+/// (#3783) enumerates not only the EXACT configured zone-pairs but also the
+/// concrete pairs implied by the `from-zone any` / `to-zone any` / both-any
+/// wildcard tiers (#3090) and by `junos-global` rules (#3148). Without that
+/// expansion a wildcard/global-only deployment (the common vSRX catch-all
+/// design) produced no exact pairs, so the concrete `(from, to)` a packet
+/// traverses had no slot and its first-packet latency sample was silently
+/// dropped — the histogram went dark for exactly those configs.
+///
 /// `inverse[slot]` is the reverse map used by the status path to emit
 /// per-zone-pair labels for the sparse wire encoding.
 #[derive(Clone, Debug)]
@@ -1289,6 +1298,126 @@ mod tests {
     fn lookup_slot_returns_none_for_unmapped_pair() {
         let (map, _) = ColdPathSlotMap::build(None, &[(1u16, 2u16)]);
         assert_eq!(lookup_slot(&map, 9, 9), None);
+    }
+
+    // === #3783: wildcard / global-only policy histogram slot coverage ===
+
+    /// A deployment whose ONLY policies are `from-zone any to-zone <z>` and a
+    /// `security policies global` rule produces ZERO exact zone-pair entries.
+    /// The cold-path recorder keys on the CONCRETE ingress/egress zone-ids a
+    /// packet traverses (`poll_descriptor::lookup_slot`), so before #3783 the
+    /// slot map had no slot for `(trust, untrust)` and the first-packet
+    /// latency sample was silently dropped. This drives the real pipeline
+    /// (`parse_policy_state` → `configured_zone_pairs` → `ColdPathSlotMap`) and
+    /// asserts the concrete pairs the wildcard/global tiers match DO resolve a
+    /// slot. RED on revert: the pre-#3783 `configured_zone_pairs` returns the
+    /// empty exact set, so every `lookup_slot` below returns `None`.
+    #[test]
+    fn cold_path_slot_assigned_for_wildcard_and_global_only_policy() {
+        use crate::protocol::PolicyRuleSnapshot;
+        use rustc_hash::FxHashMap;
+
+        const TRUST: u16 = crate::test_zone_ids::TEST_TRUST_ZONE_ID;
+        const UNTRUST: u16 = crate::test_zone_ids::TEST_UNTRUST_ZONE_ID;
+        const DMZ: u16 = crate::test_zone_ids::TEST_DMZ_ZONE_ID;
+
+        let mut zone_name_to_id: FxHashMap<String, u16> = FxHashMap::default();
+        zone_name_to_id.insert("trust".to_string(), TRUST);
+        zone_name_to_id.insert("untrust".to_string(), UNTRUST);
+        zone_name_to_id.insert("dmz".to_string(), DMZ);
+
+        let rules = vec![
+            // from-zone any to-zone untrust — single-wildcard tier, no exact pair.
+            PolicyRuleSnapshot {
+                name: "wild-out".to_string(),
+                from_zone: "any".to_string(),
+                to_zone: "untrust".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                action: "permit".to_string(),
+                ..Default::default()
+            },
+            // Unscoped junos-global permit — matches every concrete pair.
+            PolicyRuleSnapshot {
+                name: "glob".to_string(),
+                from_zone: "junos-global".to_string(),
+                to_zone: "junos-global".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["any".to_string()],
+                applications: vec!["any".to_string()],
+                action: "permit".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let state = crate::policy::parse_policy_state("deny", &rules, &zone_name_to_id);
+        let pairs = state.configured_zone_pairs();
+        let (map, zeroed) = ColdPathSlotMap::build(None, &pairs);
+        assert!(zeroed.is_empty(), "fresh build zeroes nothing");
+
+        // trust->untrust: matched by BOTH the from-any and the global rule.
+        assert!(
+            lookup_slot(&map, TRUST, UNTRUST).is_some(),
+            "trust->untrust (wildcard + global) must have a cold-path slot"
+        );
+        // dmz->trust: matched ONLY by the unscoped global.
+        assert!(
+            lookup_slot(&map, DMZ, TRUST).is_some(),
+            "dmz->trust (global-only) must have a cold-path slot"
+        );
+        // untrust->untrust intrazone: covered by from-any to-zone untrust.
+        assert!(
+            lookup_slot(&map, UNTRUST, UNTRUST).is_some(),
+            "untrust->untrust (from-any to-zone untrust) must have a cold-path slot"
+        );
+    }
+
+    /// A `security policies global match { from-zone trust; to-zone untrust; }`
+    /// rule (#3148 scoped global) must expand to EXACTLY its pinned pair — not
+    /// the full concrete cross-product — so it gets a slot without needlessly
+    /// broadening the slot map. A pair outside the scope stays unmapped.
+    #[test]
+    fn cold_path_slot_scoped_global_pins_single_pair() {
+        use crate::protocol::PolicyRuleSnapshot;
+        use rustc_hash::FxHashMap;
+
+        const TRUST: u16 = crate::test_zone_ids::TEST_TRUST_ZONE_ID;
+        const UNTRUST: u16 = crate::test_zone_ids::TEST_UNTRUST_ZONE_ID;
+        const DMZ: u16 = crate::test_zone_ids::TEST_DMZ_ZONE_ID;
+
+        let mut zone_name_to_id: FxHashMap<String, u16> = FxHashMap::default();
+        zone_name_to_id.insert("trust".to_string(), TRUST);
+        zone_name_to_id.insert("untrust".to_string(), UNTRUST);
+        zone_name_to_id.insert("dmz".to_string(), DMZ);
+
+        let rules = vec![PolicyRuleSnapshot {
+            name: "scoped-glob".to_string(),
+            from_zone: "junos-global".to_string(),
+            to_zone: "junos-global".to_string(),
+            match_from_zone: "trust".to_string(),
+            match_to_zone: "untrust".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            ..Default::default()
+        }];
+
+        let state = crate::policy::parse_policy_state("deny", &rules, &zone_name_to_id);
+        let pairs = state.configured_zone_pairs();
+        let (map, _z) = ColdPathSlotMap::build(None, &pairs);
+
+        assert!(
+            lookup_slot(&map, TRUST, UNTRUST).is_some(),
+            "scoped global's pinned pair must have a slot"
+        );
+        // Not in scope — must stay unmapped (no over-broadening).
+        assert_eq!(
+            lookup_slot(&map, DMZ, TRUST),
+            None,
+            "a pair outside the scoped global's match context must NOT get a slot"
+        );
     }
 
     #[test]
