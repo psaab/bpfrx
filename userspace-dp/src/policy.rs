@@ -1171,6 +1171,13 @@ pub(crate) struct PolicyRuleCounter {
     /// clear appeared to fail or to invent traffic. `reset()` bumps this
     /// generation; each pending batch records the generation it was captured
     /// under and is DISCARDED (not flushed) if the generation has advanced.
+    ///
+    /// #3782: bumping the generation BEFORE zeroing opened the inverse race —
+    /// a POST-clear batch (captured under the new generation, admitted by the
+    /// guard) could be clobbered by a `store(0)` running after the bump. So
+    /// `reset()` no longer stores zero; it `fetch_sub`s the observed pre-clear
+    /// total (see [`PolicyRuleCounter::reset`]), which cannot overwrite a
+    /// concurrent post-clear increment.
     generation: AtomicU64,
 }
 
@@ -1217,13 +1224,57 @@ impl PolicyRuleCounter {
     }
 
     fn reset(&self) {
-        // #3448: bump the clear epoch so any per-worker pending batch still
-        // holding pre-clear counts (recorded under the previous generation)
-        // is discarded at its next flush instead of replaying onto the
-        // freshly-zeroed atomics. The generation only ever increases.
+        // #3448: bump the clear epoch FIRST so any per-worker pending batch
+        // still holding pre-clear counts (recorded under the previous
+        // generation) is discarded at its next flush instead of replaying
+        // onto the counter. The generation only ever increases.
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.packets.store(0, Ordering::Relaxed);
-        self.bytes.store(0, Ordering::Relaxed);
+        // #3782: observe the current (pre-clear) totals, then remove EXACTLY
+        // that amount with an atomic `fetch_sub` rather than `store(0)`.
+        //
+        // A `store(0)` unconditionally overwrites the field, so a legitimate
+        // POST-clear hit recorded by a worker in the tiny window between the
+        // epoch bump above and the zero below (the worker captures the NEW
+        // generation, reaches a flush boundary, and `add_batch`es — the
+        // generation guard correctly admits it) would be clobbered by the
+        // store: the clear silently ate a real post-clear packet. #3448 closed
+        // the inverse race (a pre-clear batch replaying post-clear) but opened
+        // this one, because it bumps the generation before zeroing.
+        //
+        // `fetch_sub(observed)` subtracts only the pre-clear amount we read:
+        // whatever a concurrent worker `fetch_add`s survives, because both are
+        // atomic RMWs on the same location and serialize in the modification
+        // order (no lost update). Every pre-clear direct count is in `observed`
+        // and is removed; any concurrent post-clear increment is preserved. The
+        // only residual is a bounded ns-scale attribution skew for a count that
+        // lands exactly at the clear instant (a legitimately pre/post-ambiguous
+        // packet) — the same eventual-consistency contract the
+        // `PolicyRuleCounter` type doc already accepts, NOT a destructive wipe
+        // of a durably-recorded hit.
+        let observed_packets = self.packets.load(Ordering::Relaxed);
+        let observed_bytes = self.bytes.load(Ordering::Relaxed);
+        self.subtract_observed(observed_packets, observed_bytes);
+    }
+
+    /// #3782: remove exactly `observed_*` from the shared totals with atomic
+    /// `fetch_sub`s (see [`reset`](Self::reset) for why this is not a
+    /// `store(0)`). Split out as the clear's subtraction step so the
+    /// reset/record interleaving can be driven deterministically in tests: the
+    /// invariant is that a concurrent post-clear increment applied between the
+    /// observation in `reset` and this call is preserved, not wiped.
+    ///
+    /// `observed_*` is always `<=` the current total — increments are monotonic
+    /// (`add`/`add_batch` only `fetch_add`) and resets are serialized per
+    /// counter by the `PolicyCounterStore` mutex — so neither `fetch_sub`
+    /// underflows.
+    #[inline]
+    fn subtract_observed(&self, observed_packets: u64, observed_bytes: u64) {
+        if observed_packets != 0 {
+            self.packets.fetch_sub(observed_packets, Ordering::Relaxed);
+        }
+        if observed_bytes != 0 {
+            self.bytes.fetch_sub(observed_bytes, Ordering::Relaxed);
+        }
     }
 
     /// #3448: current clear epoch. Stamped onto a per-worker pending batch

@@ -1,3 +1,29 @@
+## 2026-07-01 — #3782: clear security policies hit-count post-clear race
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fixed the inverse of the #3448 race. `PolicyRuleCounter::reset`
+    bumps the clear epoch (generation) BEFORE zeroing, which let a legitimate
+    POST-clear hit — captured by a worker under the new epoch, admitted by the
+    generation guard, and `add_batch`'d in the window between the bump and the
+    zero — be clobbered by `packets.store(0)`. reset() now observes the
+    pre-clear totals and removes exactly that amount with atomic `fetch_sub`
+    (new `subtract_observed` seam) instead of `store(0)`. Both increment and
+    clear are now RMWs on the same location and serialize in the modification
+    order, so a concurrent post-clear `fetch_add` is preserved (no lost
+    update). The residual is a bounded ns-scale attribution skew for a count
+    landing exactly at the clear instant — the same eventual-consistency
+    contract the PolicyRuleCounter type doc already accepts, not a destructive
+    wipe. Hot path (add/add_batch) UNCHANGED — only the clear path changes.
+    RED-on-revert: clear_preserves_concurrent_post_clear_hit_3782 drives the
+    exact interleaving deterministically through the real flush helper +
+    subtraction seam; restoring store(0) in subtract_observed fails it
+    (post-clear packets 5 -> 0). Full `cargo test --release` green. NAT's
+    analogous NatRuleCounter::reset store(0) is a distinct out-of-scope pattern
+    (per-flow cold-path increment, no coalescer/generation) — flagged as a
+    follow-up.
+  - **File(s)**: userspace-dp/src/policy.rs,
+    userspace-dp/src/policy_tests.rs
+
 ## 2026-07-01 — #3756 H14: attributes-match static per-test string fields
 
 - **Timestamp**: 2026-07-01

@@ -6009,6 +6009,68 @@ fn store_clear_bumps_generation_for_all_counters_3448() {
     );
 }
 
+// #3782: `clear security policies hit-count` must not WIPE a hit recorded
+// AFTER the clear. #3448 fixed the inverse race (a PRE-clear buffered batch
+// replaying onto the freshly-cleared counter) by bumping the clear epoch
+// BEFORE zeroing — but that opened this window: a POST-clear hit captured
+// under the NEW epoch, flushed by a worker between the epoch bump and the
+// zero, was clobbered by `packets.store(0)`. `reset()` now `fetch_sub`s the
+// observed pre-clear total instead of storing zero, so a concurrent post-clear
+// increment survives (both are atomic RMWs that serialize — no lost update).
+//
+// The thread-local coalescer is compiled out under `#[cfg(test)]`, so a live
+// two-thread race would be non-deterministic. This drives the exact
+// interleaving deterministically through the real code paths: the flush helper
+// (`flush_pending_policy_hit_record`, generation-guarded) folds the post-clear
+// batch in, then the clear's subtraction seam (`subtract_observed`) applies.
+// RED-on-revert: restore `packets.store(0)`/`bytes.store(0)` in place of the
+// `fetch_sub`s in `subtract_observed` and the post-clear hit is wiped to zero.
+#[test]
+fn clear_preserves_concurrent_post_clear_hit_3782() {
+    let counter = Arc::new(PolicyRuleCounter::default());
+
+    // Pre-clear traffic already folded into the shared atomics.
+    counter.add_batch(100, 100 * 64);
+    let g0 = counter.generation();
+
+    // === reset() stage 1: bump the clear epoch, then OBSERVE the pre-clear
+    // totals — exactly what reset() does before its subtraction. ===
+    counter.generation.fetch_add(1, Ordering::Relaxed);
+    let observed_packets = counter.packets.load(Ordering::Relaxed);
+    let observed_bytes = counter.bytes.load(Ordering::Relaxed);
+    assert_eq!(observed_packets, 100, "observed pre-clear packet total");
+    assert_eq!(observed_bytes, 100 * 64, "observed pre-clear byte total");
+    assert!(counter.generation() > g0, "clear must advance the epoch");
+
+    // === Concurrent worker: a LEGITIMATE post-clear packet is recorded under
+    // the NEW epoch and reaches its flush boundary in the window before reset
+    // applies its subtraction. It captures the current (bumped) generation, so
+    // the #3448 guard admits it (post-clear, not discarded) and add_batches. ===
+    let mut post_clear = PendingPolicyHitRecord {
+        counter: Some(counter.clone()),
+        generation: counter.generation(),
+        packets: 5,
+        bytes: 5 * 64,
+    };
+    flush_pending_policy_hit_record(&mut post_clear);
+
+    // === reset() stage 2: subtract the observed pre-clear amount. fetch_sub
+    // removes only the pre-clear 100 pkts / 6400 bytes; a store(0) here would
+    // wipe the counter INCLUDING the concurrent post-clear 5 pkts / 320 B. ===
+    counter.subtract_observed(observed_packets, observed_bytes);
+
+    let snap = counter.snapshot("trust->untrust/allow-web");
+    assert_eq!(
+        snap.packets, 5,
+        "post-clear hit wiped by clear — a store(0) clobbered the concurrent \
+         post-clear increment (#3782)"
+    );
+    assert_eq!(
+        snap.bytes, 5 * 64,
+        "post-clear bytes wiped by clear (#3782)"
+    );
+}
+
 // #3451: lock the per-rule counter VALUE contract that the snapshot path
 // exposes to `show security policies hit-count` / REST / Prometheus: `add` and
 // `add_batch` accumulate into the right field, `snapshot` reports packets as
