@@ -50,12 +50,23 @@ type Catalog struct {
 // names come from CatalogNames(cfg, ApplicationIdentification), sorted, with
 // app_id assigned sequentially from 1. The id<->name correspondence is kept
 // byte-identical to pkg/dataplane/compiler.go's AppNames assignment, which is
-// what ResolveSessionName consumes. That compiler records AppNames[appID]=name
-// BEFORE parsing the destination port, then on a bad/unresolvable port simply
-// `continue`s — SKIPPING the loop-tail appID++ — so a malformed application
-// does NOT consume an id slot (the next good application overwrites the same
-// id). This builder mirrors that exactly: record the name, then on a bad port
-// `continue` WITHOUT bumping appID. (Bumping was the #2065-review divergence.)
+// what ResolveSessionName consumes.
+//
+// id-bump rule (unchanged, #2065): the loop-tail appID++ is SKIPPED only when
+// the DESTINATION port fails to parse — compileApplications `continue`s in that
+// case, so a dest-port-malformed application does NOT consume an id slot (the
+// next good application overwrites the same id). Every other application — a
+// reversed range or a bad source-port included — DOES consume its id, matching
+// compileApplications which bumps its id in those cases.
+//
+// AppNames / entry rule (#3725 M04/M07/H03): AppNames[appID]=name and the
+// CatalogEntry rows are recorded ONLY for an EMITTABLE application — one whose
+// destination range is non-inverted, whose source-port parses, and whose source
+// range is non-inverted. Recording the name BEFORE the port parse (the old
+// behavior) left AppNames holding a name at an id no CatalogEntry can stamp when
+// the malformed app sorted last, so a skewed/stale app_id resolved to the
+// malformed name instead of UNKNOWN. compileApplications gates its AppNames the
+// same way, so the two maps stay byte-identical (appid_catalog_parity_test.go).
 func BuildCatalog(cfg *config.Config) (Catalog, error) {
 	cat := Catalog{AppNames: map[uint16]string{}}
 	if cfg == nil {
@@ -89,47 +100,76 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 			continue
 		}
 
-		cat.AppNames[appID] = name
-
 		proto := catalogProtocolNumber(app.Protocol)
 
 		dstLow, dstHigh, derr := parsePortRange(app.DestinationPort)
 		if derr != nil {
 			// Mirror the compiler EXACTLY (pkg/dataplane/compiler.go): on a
 			// bad destination port it slog.Warns and `continue`s, which SKIPS
-			// the loop-tail appID++. The name was already recorded at this id
-			// above, but the id is NOT consumed — the next good application
-			// overwrites this same id. So do NOT bump appID here; emit no
-			// catalog entry for the unparsable port and fall through to the
-			// next name. (Bumping here is the #2065-review bug: it would shift
-			// every subsequent id by one vs CompileResult.AppNames, so the
-			// Rust-stamped app_id would resolve to the wrong name.)
+			// the loop-tail appID++. The id is NOT consumed — the next good
+			// application overwrites this same id. So do NOT bump appID here;
+			// emit no catalog entry (and #3725 M04: no AppNames row) for the
+			// unparsable port and fall through to the next name. (Bumping here
+			// is the #2065-review bug: it would shift every subsequent id by
+			// one vs CompileResult.AppNames, so the Rust-stamped app_id would
+			// resolve to the wrong name.)
 			continue
 		}
 
+		// #3725 H03/M06: a bad source-port must NOT be discarded to zero bounds
+		// (SrcPortLow=0/High=0 = UNCONSTRAINED source), which made a leniently-
+		// loaded "destination-port 80 source-port 70000" stamp ANY TCP/80 flow
+		// as that app (fail-OPEN over-broad labeling). Parse it and, on a parse
+		// error, mark the app unemittable so no over-broad row is shipped.
+		srcOK := true
 		var srcLow, srcHigh uint16
 		if app.SourcePort != "" {
-			// A bad source-port is non-fatal in compileApplications (it warns
-			// and proceeds with zero bounds); do the same.
-			srcLow, srcHigh, _ = parsePortRange(app.SourcePort)
+			var serr error
+			srcLow, srcHigh, serr = parsePortRange(app.SourcePort)
+			if serr != nil {
+				srcOK = false
+			}
 		}
 
-		// Omitted protocol means "any L4"; compileApplications installs both
-		// TCP and UDP entries (ICMP is excluded from that fan-out).
-		protos := []uint8{proto}
-		if proto == 0 && app.Protocol != "icmp" {
-			protos = []uint8{6, 17}
-		}
-		for _, p := range protos {
-			cat.Entries = append(cat.Entries, CatalogEntry{
-				Name:        name,
-				AppID:       appID,
-				Protocol:    p,
-				DstPortLow:  dstLow,
-				DstPortHigh: dstHigh,
-				SrcPortLow:  srcLow,
-				SrcPortHigh: srcHigh,
-			})
+		// #3725 M07: a reversed range (low>high) from the tolerant-load path
+		// must not ship inverted bounds (dst_low=200,dst_high=100). The Rust
+		// matcher tests p>=low && p<=high so it would never stamp anyway, but
+		// shipping garbage bounds diverges from strict commit (validatePortSpec
+		// rejects start>end) and the NAT parser (appPortsFromSpec #3726). Treat
+		// a reversed dst or src range — and a bad source-port — as unemittable:
+		// emit no catalog row (fail CLOSED, no mislabel), but still consume the
+		// id below so the app_id sequence stays in lock-step with
+		// compileApplications (which bumps its id in exactly these cases).
+		emittable := srcOK && dstLow <= dstHigh && srcLow <= srcHigh
+
+		if emittable {
+			// #3725 M04: record the id->name mapping ONLY for an app that emits
+			// at least one catalog entry. Recording it before the port parse
+			// (the old catalog.go / compiler.go:569 behavior) left AppNames
+			// holding a name at an id no CatalogEntry can stamp when the
+			// malformed app sorted last, so a skewed/stale app_id resolved to
+			// the malformed name instead of UNKNOWN. compileApplications is
+			// fixed the same way to keep the two AppNames maps byte-identical
+			// (appid_catalog_parity_test.go).
+			cat.AppNames[appID] = name
+
+			// Omitted protocol means "any L4"; compileApplications installs
+			// both TCP and UDP entries (ICMP is excluded from that fan-out).
+			protos := []uint8{proto}
+			if proto == 0 && app.Protocol != "icmp" {
+				protos = []uint8{6, 17}
+			}
+			for _, p := range protos {
+				cat.Entries = append(cat.Entries, CatalogEntry{
+					Name:        name,
+					AppID:       appID,
+					Protocol:    p,
+					DstPortLow:  dstLow,
+					DstPortHigh: dstHigh,
+					SrcPortLow:  srcLow,
+					SrcPortHigh: srcHigh,
+				})
+			}
 		}
 		nextID++
 	}

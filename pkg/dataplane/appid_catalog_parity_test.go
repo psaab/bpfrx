@@ -138,6 +138,86 @@ func TestAppCatalogIDsMatchOnMalformedDestPort(t *testing.T) {
 	}
 }
 
+// TestAppCatalogParityOnTolerantLoadPortEdges is the #3725 M04/H03/M07 lock-step
+// guard. Malformed applications admitted by the tolerant-load path — a bad
+// source-port ("70000"), a reversed dst range ("300-200"), and a bad dest-port
+// ("nope") that sorts LAST — must keep compileApplications' LIVE result.AppNames
+// (the map the show path resolves a stamped app_id through) byte-identical to
+// appid.BuildCatalog's AppNames, AND neither map may carry a dangling id (a name
+// at an id that stamps no catalog entry). Reverting either fix — restoring the
+// "record AppNames before the port parse" placement in compileApplications, or
+// dropping the emittable gate in BuildCatalog — makes the two maps diverge or
+// re-adds the dangling "zzz-nope" entry, turning this RED.
+func TestAppCatalogParityOnTolerantLoadPortEdges(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Services.ApplicationIdentification = true
+	cfg.Applications.Applications = map[string]*config.Application{
+		"aaa-good":     {Name: "aaa-good", Protocol: "tcp", DestinationPort: "8443"},
+		"bbb-badsrc":   {Name: "bbb-badsrc", Protocol: "tcp", DestinationPort: "80", SourcePort: "70000"},
+		"ccc-revrange": {Name: "ccc-revrange", Protocol: "udp", DestinationPort: "300-200"},
+		// Sorts last: a bad dest-port with no later good app to overwrite the id.
+		"zzz-nope": {Name: "zzz-nope", Protocol: "tcp", DestinationPort: "nope"},
+	}
+
+	result := &CompileResult{AppIDs: make(map[string]uint32)}
+	if err := compileApplications(appCatalogParityDP{}, cfg, result); err != nil {
+		t.Fatalf("compileApplications: %v", err)
+	}
+	cat, err := appid.BuildCatalog(cfg)
+	if err != nil {
+		t.Fatalf("BuildCatalog: %v", err)
+	}
+
+	// Lock-step: the two AppNames maps must be identical.
+	if len(cat.AppNames) != len(result.AppNames) {
+		t.Fatalf("AppNames size mismatch on tolerant-load edges: catalog=%d compiler=%d\n catalog=%v\n compiler=%v",
+			len(cat.AppNames), len(result.AppNames), cat.AppNames, result.AppNames)
+	}
+	for id, name := range result.AppNames {
+		if got := cat.AppNames[id]; got != name {
+			t.Fatalf("app_id %d: compiler=%q catalog=%q (tolerant-load id drift breaks show resolution)", id, name, got)
+		}
+	}
+
+	// M04: no dangling name at an id that stamps no catalog entry, in EITHER
+	// direction. The malformed apps (badsrc/revrange/nope) must not appear.
+	stamped := map[uint16]bool{}
+	for _, e := range cat.Entries {
+		stamped[e.AppID] = true
+	}
+	for id, name := range result.AppNames {
+		if !stamped[id] {
+			t.Fatalf("live AppNames[%d]=%q has no catalog entry to stamp it — a skewed app_id would resolve to it instead of UNKNOWN (M04)", id, name)
+		}
+		if name == "bbb-badsrc" || name == "ccc-revrange" || name == "zzz-nope" {
+			t.Fatalf("malformed app %q must not hold a resolvable app_id (%d)", name, id)
+		}
+	}
+
+	// The one good app resolves; a skewed app_id that no entry stamps resolves
+	// to UNKNOWN, never to a malformed name.
+	goodID, ok := appNameID(result.AppNames, "aaa-good")
+	if !ok {
+		t.Fatal("good app aaa-good missing from live AppNames")
+	}
+	if got := appid.ResolveSessionName(result.AppNames, cfg, 6, 0, 8443, goodID); got != "aaa-good" {
+		t.Fatalf("ResolveSessionName(goodID=%d) = %q, want aaa-good", goodID, got)
+	}
+	// app_id 60000 is not present; with AppID enabled it must be UNKNOWN.
+	if got := appid.ResolveSessionName(result.AppNames, cfg, 6, 0, 80, 60000); got != appid.Unknown {
+		t.Fatalf("skewed app_id resolved to %q, want UNKNOWN (no dangling malformed name) (M04)", got)
+	}
+}
+
+func appNameID(names map[uint16]string, want string) (uint16, bool) {
+	for id, name := range names {
+		if name == want {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
 // TestAppCatalogEntryPortsAndProtos asserts the catalog builder emits the right
 // match shape: a port range stays a range, an omitted protocol fans out to TCP
 // AND UDP under one shared app_id, and a single-port entry is exact.
