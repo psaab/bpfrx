@@ -27979,3 +27979,33 @@ top.
 - **File(s)**: userspace-dp/src/policy.rs (0-exclusion + comments),
   userspace-dp/src/policy_tests.rs (omitempty guard test),
   docs/userspace-dataplane-architecture.md (0-exclusion rationale)
+- **Timestamp**: 2026-07-02
+- **Action**: #3714 — clamp per-application inactivity_timeout to the Go/vSRX
+  86400 s commit bound in the Rust dataplane. Defect: the Rust policy path
+  accepted any u32 `inactivity_timeout` from a snapshot; the sole seconds→ns
+  conversion authority `session::app_inactivity_timeout_ns`
+  (`userspace-dp/src/session/mod.rs`) only saturated at the huge
+  `MAX_SESSION_TIMEOUT_NS` (~292 yr) overflow guard, so a corrupt / mixed-
+  version wire value (e.g. `4294967295`, from `PolicyApplicationSnapshot.
+  inactivity_timeout` OR the HA `SessionSyncRequest.inactivity_timeout`) stamped
+  an effectively never-expiring idle timeout (~136 yr) — diverging session GC
+  from the Go commit-time contract (`appTimeoutMax = 86400`,
+  `pkg/config/compiler_applications.go`, which REJECTS >86400 at commit). Fix:
+  added `APP_INACTIVITY_TIMEOUT_MAX_SECS = 86400` const and clamp the seconds
+  value via `s.min(APP_INACTIVITY_TIMEOUT_MAX_SECS)` before the ns conversion in
+  `app_inactivity_timeout_ns`. Chosen as the single chokepoint because BOTH the
+  local config-snapshot policy match and the HA session-sync receive funnel
+  through it, and the sync-SEND seconds is derived from the stamped ns — so the
+  clamp bounds every value that persists on a session or rides the sync wire.
+  Pure runtime backstop, no wire field changed (no protocol_wire_v1.json regen).
+  RED-on-revert test `app_inactivity_timeout_ns_clamps_to_go_commit_bound_3714`
+  (u32::MAX and 86401 clamp to 86400 s in ns; 86400/30 pass through exactly;
+  0/None → None) — verified RED with the clamp reverted, GREEN with it. Rust-
+  only (no Go change; the Go 86400 gate already exists). Not session-sync-
+  behavior-changing: legit values (≤86400) are unaffected on both send and
+  receive, so no test-failover regression risk (clamp only alters corrupt
+  >86400 wire values, which a well-formed peer never emits).
+- **File(s)**: userspace-dp/src/session/mod.rs (const +
+  app_inactivity_timeout_ns clamp + doc), userspace-dp/src/policy.rs
+  (parse_applications cross-reference comment), userspace-dp/src/session/tests.rs
+  (RED-on-revert unit test), userspace-dp/src/session/README.md (#3714 bound doc)

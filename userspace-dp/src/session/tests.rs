@@ -2406,6 +2406,51 @@ fn from_seconds_saturates_u64_max() {
     assert!(t.tcp_established_ns > DEFAULT_TCP_SESSION_TIMEOUT_NS);
 }
 
+/// #3714: a per-application inactivity timeout must be clamped to the Go
+/// `appTimeoutMax` (86400 s) before the seconds→ns conversion. The Go compiler
+/// rejects `inactivity-timeout > 86400` at commit, so a well-formed snapshot
+/// never carries a larger value; a corrupt / mixed-version wire value (e.g.
+/// `4294967295`) must NOT stamp an effectively never-expiring idle timeout.
+/// Reverting the `s.min(APP_INACTIVITY_TIMEOUT_MAX_SECS)` clamp makes the two
+/// over-bound assertions go RED (they would return the raw seconds in ns).
+#[test]
+fn app_inactivity_timeout_ns_clamps_to_go_commit_bound_3714() {
+    let max_ns = u64::from(APP_INACTIVITY_TIMEOUT_MAX_SECS) * 1_000_000_000;
+
+    // The pin: a corrupt u32::MAX snapshot value must clamp to 86400 s, NOT
+    // stamp ~136 years (4294967295 * 1e9 ns) of retention.
+    assert_eq!(
+        app_inactivity_timeout_ns(Some(u32::MAX)),
+        Some(max_ns),
+        "u32::MAX inactivity_timeout must clamp to the 86400 s commit bound"
+    );
+    // One second over the bound clamps to exactly the bound.
+    assert_eq!(
+        app_inactivity_timeout_ns(Some(APP_INACTIVITY_TIMEOUT_MAX_SECS + 1)),
+        Some(max_ns),
+        "86401 s must clamp to the 86400 s commit bound"
+    );
+
+    // No regression at/under the bound: exact conversion, no clamp artifacts.
+    assert_eq!(
+        app_inactivity_timeout_ns(Some(APP_INACTIVITY_TIMEOUT_MAX_SECS)),
+        Some(max_ns),
+        "the exact 86400 s bound converts exactly (in range)"
+    );
+    assert_eq!(
+        app_inactivity_timeout_ns(Some(30)),
+        Some(30 * 1_000_000_000),
+        "a normal 30 s app timeout converts exactly, unaffected by the clamp"
+    );
+    // 0 / None keep meaning "use the global per-protocol timeout".
+    assert_eq!(
+        app_inactivity_timeout_ns(Some(0)),
+        None,
+        "0 s means use-global (None), not the clamp bound"
+    );
+    assert_eq!(app_inactivity_timeout_ns(None), None, "None stays None");
+}
+
 #[test]
 fn from_seconds_zero_still_defaults_after_saturation() {
     // 0 must remain "use the default", unaffected by the saturation helper.

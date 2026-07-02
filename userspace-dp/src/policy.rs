@@ -4063,6 +4063,12 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications
             // compiled matcher so a session admitted by this term can stamp it.
             // A 0 seconds value collapses to None (use-global) so the override
             // is only set when the operator configured a positive timeout.
+            // #3714: the upper bound (86400 s, mirroring the Go `appTimeoutMax`
+            // commit gate) is enforced at the single seconds→ns conversion
+            // authority `session::app_inactivity_timeout_ns`, which every value
+            // that persists on a session or rides the sync wire funnels through
+            // — so a corrupt/mixed-version `4294967295` here is clamped before
+            // it can stamp a never-expiring idle timeout.
             inactivity_timeout: term.inactivity_timeout.filter(|&t| t > 0),
         });
     }
