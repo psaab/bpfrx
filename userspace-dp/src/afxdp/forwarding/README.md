@@ -428,10 +428,28 @@ stay consistent.
 Host-bound (LocalDelivery) traffic is also subject to the Junos
 `from-zone <z> to-zone junos-host` security policy. Junos order is
 **host-inbound admission FIRST, then security policy** — so the
-`junos_host_policy_drops` gate runs immediately AFTER `host_inbound_admits`
+`junos_host_local_policy` gate runs immediately AFTER `host_inbound_admits`
 at BOTH local-delivery sites in `poll_descriptor` (session miss and session
 hit). A packet host-inbound already rejected never reaches policy, so a
 `to-zone junos-host then permit` cannot re-admit it.
+
+**Permit metadata propagation (#3706).** `junos_host_local_policy` returns a
+`JunosHostLocalPolicy` verdict — `Dropped` (deny/reject), `Permit(result)`, or
+`NoMatch`. On a matching PERMIT the session-MISS install stamps the admitting
+policy's `then log session-init`/`session-close` selection, its `policy_id`, and
+its per-rule hit-counter handle onto the installed host-local session (and the
+published conntrack row) — exactly like a transit permit, so a
+`to-zone junos-host then permit log session-init session-close` session emits the
+RT_FLOW SESSION_CREATE/CLOSE records and is attributable to the admitting policy.
+Before #3706 the gate collapsed to a bare `bool` and discarded the permit result,
+so host-bound permit sessions installed with both log flags off, `policy_id` 0,
+and no counter handle (unlogged + unattributable). The session-HIT path only
+needs the `Dropped` verdict (the session is already installed with the miss-time
+permit metadata); the flowless (`l4_present = false`) arm never installs a
+session, so a flowless permit simply delivers with no metadata to carry.
+`NoMatch` keeps the default no-policy host-local metadata (log off, `policy_id`
+0, no counter) — the historical host-local behavior for a genuinely
+unattributed local session.
 
 `policy::evaluate_junos_host_policy` resolves the reserved `junos-host` zone
 name to `JUNOS_HOST_ZONE_ID` (`u16::MAX-1`, the bottom of the reserved range,
