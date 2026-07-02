@@ -1,3 +1,35 @@
+## 2026-07-01 — #3830: NAT hit-counter clear post-clear increment race
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Follow-up to #3829 (#3782). `NatRuleCounter::reset` (the
+    operator `clear` of per-rule NAT hit counters) zeroed with `store(0)`, the
+    same clobber class #3782 fixed in `PolicyRuleCounter::reset`: a per-flow
+    cold-path `add` (relaxed `fetch_add`) landing in the same instant as a
+    clear was unconditionally overwritten to zero, so the clear silently ate a
+    real post-clear hit. Narrower than #3782 — the NAT counter increments once
+    per-flow on the cold path with NO coalescer and NO generation/epoch guard,
+    so there is no pending-batch replay to fence — but the same store(0)
+    primitive. Fix mirrors #3782: `reset()` observes the pre-clear totals and
+    removes exactly that amount with an atomic `fetch_sub` via a new
+    `subtract_observed` seam instead of `store(0)`. Increment and clear are now
+    both RMWs on the same atomic and serialize in the modification order, so a
+    concurrent post-clear `fetch_add` survives (no lost update). Per-flow
+    increment path (`add`) UNCHANGED — still a cheap relaxed `fetch_add`. No
+    lock/seqcount added (consistent with #3451). `subtract_observed` cannot
+    underflow: increments are monotonic and `reset` is the sole subtractor,
+    called under the `NatCounterStore` registry mutex so clears are serialized.
+    RED-on-revert: nat_counter_clear_preserves_concurrent_post_clear_hit_3830
+    drives the observe -> concurrent-add -> subtract interleaving
+    deterministically through the real subtraction seam; restoring store(0) in
+    subtract_observed fails it (post-clear packets 1 -> 0). A second test
+    (nat_counter_clear_zeroes_when_uncontended_3830) locks the normal
+    `NatCounterStore::clear` -> reset path zeroing both fields exactly. Full
+    `cargo test --release` green (3417 lib + 46 + 8 + 16 + 1, 0 failed).
+    Scope: per-rule NAT hit-counter accuracy (observability), Rust-only, no
+    wire change — NOT enforcement/HA session-sync, so no test-failover impact.
+  - **File(s)**: userspace-dp/src/nat/mod.rs,
+    userspace-dp/src/nat/tests.rs
+
 ## 2026-07-01 — #3782: clear security policies hit-count post-clear race
 
 - **Timestamp**: 2026-07-01
