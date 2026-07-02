@@ -7708,3 +7708,81 @@ fn dnat_destination_port_range_3449() {
         );
     }
 }
+
+// #3830: `clear` of the per-rule NAT hit counters (`NatCounterStore::clear` ->
+// `NatRuleCounter::reset`) must not WIPE a per-flow increment recorded in the
+// same instant as the clear. `reset` observes the pre-clear total, then
+// `fetch_sub`s exactly that amount instead of `store(0)`, so a concurrent
+// post-clear cold-path `add` survives — both are atomic RMWs on the same
+// location and serialize in the modification order (no lost update). Mirrors
+// the #3782 `PolicyRuleCounter` fix; narrower here (per-flow cold-path
+// increment, no coalescer/generation to fence).
+//
+// Drives the reset/increment interleaving deterministically through the real
+// subtraction seam (`subtract_observed`): a live two-thread race would be
+// non-deterministic. RED-on-revert: restoring `packets.store(0)` /
+// `bytes.store(0)` in `subtract_observed` (or collapsing `reset` back to
+// `store(0)`) wipes the concurrent post-clear increment (1 -> 0) and fails
+// the packet/byte assertions.
+#[test]
+fn nat_counter_clear_preserves_concurrent_post_clear_hit_3830() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    let counter = Arc::new(NatRuleCounter::default());
+
+    // Pre-clear traffic already folded into the shared atomics: 100 translated
+    // flows, 64 bytes on each trigger packet (the per-flow semantic).
+    for _ in 0..100 {
+        counter.add(64);
+    }
+
+    // === reset() stage 1: OBSERVE the pre-clear totals — exactly what reset()
+    // reads before its subtraction. ===
+    let observed_packets = counter.packets.load(Ordering::Relaxed);
+    let observed_bytes = counter.bytes.load(Ordering::Relaxed);
+    assert_eq!(observed_packets, 100, "observed pre-clear packet total");
+    assert_eq!(observed_bytes, 100 * 64, "observed pre-clear byte total");
+
+    // === Concurrent cold-path worker: a LEGITIMATE post-clear translated flow
+    // is counted in the window between reset's observation and its
+    // subtraction. ===
+    counter.add(64);
+
+    // === reset() stage 2: subtract the observed pre-clear amount. fetch_sub
+    // removes only the pre-clear 100 pkts / 6400 B; a store(0) here would wipe
+    // the counter INCLUDING the concurrent post-clear 1 pkt / 64 B. ===
+    counter.subtract_observed(observed_packets, observed_bytes);
+
+    let snap = counter.snapshot(7);
+    assert_eq!(
+        snap.packets, 1,
+        "post-clear NAT hit wiped by clear — a store(0) clobbered the \
+         concurrent post-clear increment (#3830)"
+    );
+    assert_eq!(
+        snap.bytes, 64,
+        "post-clear NAT bytes wiped by clear (#3830)"
+    );
+    assert_eq!(snap.counter_id, 7, "snapshot echoes the counter id");
+}
+
+// #3830: with NO concurrent increment, a `clear` still zeroes both fields
+// exactly (the fetch_sub path is not a regression of the normal clear).
+// Exercises the full operator path: `NatCounterStore::clear` -> reset.
+#[test]
+fn nat_counter_clear_zeroes_when_uncontended_3830() {
+    let store = NatCounterStore::default();
+    let counter = store.rule_counter(42).expect("non-zero id yields a counter");
+    counter.add(64);
+    counter.add(1500);
+    let before = counter.snapshot(42);
+    assert_eq!(before.packets, 2, "two flows counted");
+    assert_eq!(before.bytes, 64 + 1500, "byte total accumulated");
+
+    store.clear();
+
+    let after = counter.snapshot(42);
+    assert_eq!(after.packets, 0, "clear zeroes packets when uncontended");
+    assert_eq!(after.bytes, 0, "clear zeroes bytes when uncontended");
+}

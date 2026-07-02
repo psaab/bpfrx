@@ -116,6 +116,23 @@ impl NatDecision {
 /// `PolicyRuleCounter` pattern (policy.rs). `add` is the only mutation on
 /// the increment side: a single `fetch_add(1)` for packets plus a
 /// conditional bytes add, no allocation, no lock.
+///
+/// #3830 — `reset` (operator `clear` of NAT hit counters) removes the
+/// observed pre-clear total with an atomic `fetch_sub` rather than a
+/// `store(0)`. A `store(0)` unconditionally overwrites the field, so a
+/// per-flow `add` (the cold-path relaxed `fetch_add`) landing in the same
+/// instant as a `clear` would be clobbered — the clear silently ate a real
+/// post-clear hit. `fetch_sub(observed)` subtracts only the amount `reset`
+/// read: because both the increment and the subtraction are atomic RMWs on
+/// the same location they serialize in the modification order (no lost
+/// update), so a concurrent post-clear increment survives. This mirrors the
+/// #3782 `PolicyRuleCounter::reset` fix; it is NARROWER here — the NAT
+/// counter increments once per-flow on the cold path with no coalescer and
+/// no generation/epoch guard, so there is no pending-batch replay to fence.
+/// Like the policy counter it keeps the write side off a lock/seqcount
+/// (#3451); the only residual is a bounded ns-scale attribution skew for a
+/// count landing exactly at the clear instant, consistent with the
+/// advisory-telemetry eventual-consistency contract these counters accept.
 #[derive(Debug, Default)]
 pub(crate) struct NatRuleCounter {
     packets: AtomicU64,
@@ -135,8 +152,42 @@ impl NatRuleCounter {
     }
 
     fn reset(&self) {
-        self.packets.store(0, Ordering::Relaxed);
-        self.bytes.store(0, Ordering::Relaxed);
+        // #3830: observe the current (pre-clear) totals, then remove EXACTLY
+        // that amount with an atomic `fetch_sub` rather than `store(0)`.
+        //
+        // A `store(0)` unconditionally overwrites the field, so a legitimate
+        // per-flow hit recorded by a worker on the cold path in the same
+        // instant as this clear (a relaxed `fetch_add` via `add`) would be
+        // clobbered — the clear silently ate a real post-clear packet.
+        // `fetch_sub(observed)` subtracts only the pre-clear amount we read:
+        // whatever a concurrent worker `fetch_add`s survives, because both
+        // are atomic RMWs on the same location and serialize in the
+        // modification order (no lost update). See the type doc and #3782
+        // (`PolicyRuleCounter::reset`, the same clobber class).
+        let observed_packets = self.packets.load(Ordering::Relaxed);
+        let observed_bytes = self.bytes.load(Ordering::Relaxed);
+        self.subtract_observed(observed_packets, observed_bytes);
+    }
+
+    /// #3830: remove exactly `observed_*` from the shared totals with atomic
+    /// `fetch_sub`s rather than a `store(0)` (see [`reset`](Self::reset) for
+    /// why). Split out as the clear's subtraction step so the reset/increment
+    /// interleaving can be driven deterministically in tests: the invariant is
+    /// that a concurrent post-clear `add` applied between the observation in
+    /// `reset` and this call is preserved, not wiped.
+    ///
+    /// `observed_*` is always `<=` the current total — the cold-path increment
+    /// only ever `fetch_add`s (monotonic) and `reset` is the sole subtractor,
+    /// called from `NatCounterStore::clear` under the registry mutex so clears
+    /// are serialized — therefore neither `fetch_sub` can underflow.
+    #[inline]
+    fn subtract_observed(&self, observed_packets: u64, observed_bytes: u64) {
+        if observed_packets != 0 {
+            self.packets.fetch_sub(observed_packets, Ordering::Relaxed);
+        }
+        if observed_bytes != 0 {
+            self.bytes.fetch_sub(observed_bytes, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn snapshot(&self, counter_id: u32) -> NatRuleCounterStatus {
