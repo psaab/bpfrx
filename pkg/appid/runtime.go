@@ -208,6 +208,17 @@ func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Conf
 		best := ""
 		bestPortBased := false
 		for name, app := range cfg.Applications.Applications {
+			// #3781 interim (log-integrity): a type/code-constrained ICMP app
+			// (icmp-type/icmp-code set) match-alls every ICMP type here because
+			// matchTuple is protocol + port only (blind to the ICMP type/code).
+			// Skip it so a non-echo ICMP resolves to an honest UNKNOWN (or a
+			// protocol-only ICMP app when one is referenced) on the AppID-disabled
+			// show/session-name path rather than a false type-constrained label.
+			// The type/code-aware match is DEFERRED with the catalog wire per the
+			// #3781 /research plan. A protocol-only ICMP app is unaffected.
+			if icmpTypeConstrained(app) {
+				continue
+			}
 			if !matchTuple(proto, srcPort, dstPort, app.Protocol, app.SourcePort, app.DestinationPort) {
 				continue
 			}
