@@ -33,6 +33,11 @@ const eventAttributesMatchSep = " matches "
 var EventAttributesKnownFields = map[string]struct{}{
 	"test-owner": {},
 	"test-name":  {},
+	// Static per-test config strings (#3756 H14). Stable identifiers already in
+	// scope at every rpm fireEvent site; no hot-path cost, no new taxonomy.
+	"target":                {},
+	"routing-instance":      {},
+	"destination-interface": {},
 }
 
 // EventAttributesFieldKnown reports whether field is a recognized
@@ -166,7 +171,8 @@ func ValidateEventAttributesMatchStrict(cfg *Config) error {
 			if !EventAttributesFieldKnown(field) {
 				return fmt.Errorf(
 					"event-options policy %q attributes-match %q: unknown field %q "+
-						"(known fields: test-owner, test-name)",
+						"(known fields: test-owner, test-name, target, "+
+						"routing-instance, destination-interface)",
 					pol.Name, attr, field)
 			}
 			if _, err := regexp.Compile(pattern); err != nil {

@@ -1,3 +1,25 @@
+## 2026-07-01 — #3756 H14: attributes-match static per-test string fields
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Widened attributes-match to key on the three STATIC per-test
+    config strings target / routing-instance / destination-interface (already
+    in scope at every rpm fireEvent site). rpm.Event gained Target /
+    RoutingInstance / DestinationInterface; fireEvent now takes *config.RPMTest
+    and populates them (3 call sites + the buffered-events path get them for
+    free). Added the fields to config.EventAttributesKnownFields (SSOT), the
+    strict-commit error message, and the engine attributesMatch switch (drift
+    guard TestEventAttributesKnownFields_MatchesRuntimeSwitch updated in
+    lockstep). #3753 event-name scoping and #2141 fail-closed preserved.
+    Numeric (rtt/jitter/loss) + failure-reason surface DEFERRED (design
+    recorded in feature-gaps M7). RED-on-revert: TestAttributesMatch_
+    {Target,RoutingInstance,DestinationInterface}Field_3756 (fail-closed
+    "unresolvable field" without the switch cases) + the strict-validator loop
+    in TestValidateEventAttributesMatchStrict_Direct.
+  - **File(s)**: pkg/rpm/rpm.go, pkg/rpm/event_buffer_3755_test.go,
+    pkg/config/event_options_match.go, pkg/config/event_options_match_test.go,
+    pkg/eventengine/engine.go, pkg/eventengine/engine_test.go,
+    pkg/eventengine/README.md, docs/feature-gaps.md
+
 ## 2026-07-01 — #3756 M2: `trigger until N` is the inclusive N-th (dead-config fix)
 
 - **Timestamp**: 2026-07-01

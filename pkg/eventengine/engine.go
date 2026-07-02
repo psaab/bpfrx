@@ -990,6 +990,12 @@ func (e *Engine) attributesMatch(pol *config.EventPolicy, ev rpm.Event) bool {
 			value = ev.TestOwner
 		case "test-name":
 			value = ev.TestName
+		case "target":
+			value = ev.Target
+		case "routing-instance":
+			value = ev.RoutingInstance
+		case "destination-interface":
+			value = ev.DestinationInterface
 		default:
 			// Known to config but not yet resolvable on rpm.Event. The SSOT
 			// and this switch are kept identical by a drift-guard test, so

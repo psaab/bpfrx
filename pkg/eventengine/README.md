@@ -151,10 +151,16 @@ triggering on a **regex** match of `<pattern>` against the event attribute
 
 - Unanchored patterns are substring matches (`Com` matches `Comcast`); anchor
   with `^...$` for an exact match.
-- Supported attributes are `test-owner` and `test-name`, defined once in
+- Supported attributes are `test-owner`, `test-name`, and (since #3756 H14) the
+  static per-test config strings `target`, `routing-instance`, and
+  `destination-interface`. They are defined once in
   `config.EventAttributesKnownFields` (the single source of truth consumed by
-  both the commit-time validator and the runtime matcher — a drift-guard test
-  keeps them identical).
+  both the commit-time validator and the runtime matcher — a drift-guard test,
+  `TestEventAttributesKnownFields_MatchesRuntimeSwitch`, keeps them identical)
+  and resolved from the `rpm.Event` populated at every `fireEvent` call site.
+  This lets a policy key on "all probes to target X" or "all probes in
+  routing-instance Y". Numeric attributes (`rtt`, `jitter`, loss threshold) and
+  a `failure-reason` taxonomy remain deferred — see `docs/feature-gaps.md` M7.
 - **Event-name scoping (#3753):** the `<event>.` prefix scopes the constraint
   to a single event of a multi-event policy. The runtime matcher applies a
   constraint ONLY when the current event equals its prefix, so

@@ -1153,10 +1153,23 @@ Tier-2 gaps from the `#2008` parity audit researched in
   (`config.ParseEventAttributesMatch`) is shared between the compiler and the
   engine so they cannot drift. **Behavior-change note:** this is NOT
   behavior-preserving for a stored literal containing regex metacharacters —
-  but regex IS the correct Junos behavior. The supported attribute set stays
-  `test-owner` / `test-name` (the only fields on `rpm.Event`); widening the
-  field surface is deferred until more attributes are exposed. See
-  `pkg/eventengine/README.md`.
+  but regex IS the correct Junos behavior. **#3756 H14 (bounded parity, DONE):**
+  the supported attribute set now also includes the three STATIC per-test config
+  strings `target`, `routing-instance`, and `destination-interface` (they are
+  stable identifiers already in scope at every `rpm.fireEvent` call site, so no
+  hot-path cost and no new taxonomy). This lets a policy match "all probes to
+  target X" or "all probes in routing-instance Y". Added to
+  `config.EventAttributesKnownFields` (SSOT), the `rpm.Event` struct, and the
+  `attributesMatch` runtime switch (kept identical by the drift-guard test).
+  **Also pinned (#3756 M1/M2):** `within { trigger on N }` is EDGE-triggered
+  (fires on the crossing, re-arms below N) and `within { trigger until N }` is
+  the INCLUSIVE N-th (the `until 1` dead-config bug is fixed) — see
+  `pkg/eventengine/README.md`. **Still DEFERRED (design recorded, low demand):**
+  numeric attributes (`rtt` / `jitter` / loss-threshold — regex-over-a-number
+  needs a canonical string FORMAT decision) and a `failure-reason` taxonomy (rpm
+  has no failure classifier today — timeout vs unreachable vs setup-error would
+  need a new reason enum). Neither is a fail-open hole; both are additive parity
+  surface gated on a concrete request. See `pkg/eventengine/README.md`.
 - **H13 Stage 1 `forwarding-options allow-dataplane-sleep`** — DONE
   (schema + field + commit warning). The leaf was previously accepted as a
   no-schema-match fall-through and silently dropped by

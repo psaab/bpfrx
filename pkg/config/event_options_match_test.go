@@ -159,6 +159,22 @@ func TestValidateEventAttributesMatchStrict_Direct(t *testing.T) {
 	if err := ValidateEventAttributesMatchStrict(unknown); err == nil {
 		t.Fatal("strict validator accepted an unknown field")
 	}
+
+	// #3756 H14: the three new static per-test fields are accepted at strict
+	// commit. RED-on-revert: without them in EventAttributesKnownFields the
+	// strict validator rejects a policy keyed on target / routing-instance /
+	// destination-interface as an unknown field.
+	for _, field := range []string{"target", "routing-instance", "destination-interface"} {
+		newField := &Config{EventOptions: []*EventPolicy{
+			{Name: "n", Events: []string{"ev"}, AttributesMatch: []string{`ev.` + field + ` matches ^x$`}},
+		}}
+		if err := ValidateEventAttributesMatchStrict(newField); err != nil {
+			t.Fatalf("strict validator rejected known field %q (#3756 H14): %v", field, err)
+		}
+		if !EventAttributesFieldKnown(field) {
+			t.Errorf("field %q missing from EventAttributesKnownFields SSOT (#3756 H14)", field)
+		}
+	}
 }
 
 // #3753: an attributes-match line scoped to an event the policy does NOT
