@@ -262,6 +262,25 @@ blocks a `commitFn` on `ctx.Done()` and asserts `Close()` aborts it with
 - `xpf_event_attributes_match_invalid_total`
 - `xpf_event_action_queue_depth` (gauge)
 
+## Temporal `within` trigger semantics (#3756)
+
+`within <seconds> { trigger on N }` / `{ trigger until N }` are pinned to the
+Junos reading in `withinMatches` (`engine.go`):
+
+- **`trigger on N` is EDGE-triggered** — the policy fires on the threshold
+  CROSSING (the in-window count first reaching N), NOT on every event while the
+  count stays at or above N. A per-`(policy, event)` latch (`policyRuntime.
+  onLatched`) records that a crossing already fired; it is set in
+  `evaluateEvent` only AFTER the cooldown check passes (a cooldown-suppressed
+  crossing is not consumed) and re-armed (cleared) by `withinMatches` the moment
+  the count drops back below N. Rationale: the 30 s cooldown alone only
+  THROTTLES a sustained failing level — it would re-remediate an unchanged
+  condition every cooldown, which is harmful for a non-idempotent then-batch and
+  spams commit/rollback history. Regression-locked by
+  `TestEdgeTriggerOn_*_3756`. Only a policy carrying a `trigger on` clause
+  latches (`policyHasTriggerOn`); a no-within or `trigger until` policy is
+  unaffected.
+
 ## Gotchas
 
 - 30 s policy cooldown (`policyCooldown`, `engine.go`). The same policy will not

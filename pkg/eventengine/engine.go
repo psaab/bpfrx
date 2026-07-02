@@ -165,10 +165,20 @@ type policyRuntime struct {
 	// means "never triggered". Armed by the worker after a successful commit,
 	// not at evaluate time (#2157 SMR finding 3).
 	lastTrigger time.Time
+	// event name -> edge latch for a `within { trigger on N }` clause
+	// (#3756 M1). Set (true) after the policy fires on a threshold CROSSING;
+	// cleared (re-armed) by withinMatches the moment the in-window count drops
+	// back below N. So a SUSTAINED above-threshold level fires the remediation
+	// ONCE per crossing instead of re-firing every cooldown (Junos `trigger on`
+	// is edge-, not level-triggered).
+	onLatched map[string]bool
 }
 
 func newPolicyRuntime() *policyRuntime {
-	return &policyRuntime{windows: make(map[string][]time.Time)}
+	return &policyRuntime{
+		windows:   make(map[string][]time.Time),
+		onLatched: make(map[string]bool),
+	}
 }
 
 // Engine evaluates event-options policies against RPM events.
@@ -899,6 +909,16 @@ func (e *Engine) evaluateEvent(ev rpm.Event) []triggeredPolicy {
 			continue
 		}
 
+		// #3756 M1: arm the edge latch for this crossing so a sustained
+		// above-threshold level does not re-fire every cooldown. Set only
+		// AFTER the cooldown check passed — a cooldown-suppressed crossing is
+		// NOT treated as already-fired, so the next event past the cooldown
+		// still fires. Cleared by withinMatches when the count drops back
+		// below the trigger-on threshold (re-arm).
+		if policyHasTriggerOn(pol) {
+			rt.onLatched[ev.Name] = true
+		}
+
 		slog.Info("event-options policy triggered",
 			"policy", pol.Name,
 			"event", ev.Name,
@@ -1013,6 +1033,18 @@ func (e *Engine) flagAttributesInvalid(policy, attr, reason string) {
 	}
 }
 
+// policyHasTriggerOn reports whether the policy carries any `within { trigger
+// on N }` clause. Only such a policy participates in the #3756 M1 edge latch;
+// a no-within policy (or a `trigger until` policy) is unaffected.
+func policyHasTriggerOn(pol *config.EventPolicy) bool {
+	for _, wc := range pol.WithinClauses {
+		if wc != nil && wc.TriggerOn > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // withinMatches evaluates temporal trigger clauses against the policy's runtime
 // window.
 // "within N { trigger on M }" — fires when M events happen within N seconds.
@@ -1052,10 +1084,26 @@ func (e *Engine) withinMatches(pol *config.EventPolicy, rt *policyRuntime, event
 		}
 
 		if wc.TriggerOn > 0 {
-			// "trigger on N" — must have at least N events in window
+			// "trigger on N" is EDGE-triggered (#3756 M1): it fires on the
+			// threshold CROSSING, not on every event while the level stays at
+			// or above N. Junos `trigger on` re-arms only after the count drops
+			// back below N; the 30s cooldown alone only THROTTLES a sustained
+			// level (re-remediating it every cooldown), which is harmful for a
+			// non-idempotent then-batch and spams commit/rollback history.
 			if count < wc.TriggerOn {
+				// Dropped below the threshold: re-arm so the next crossing
+				// fires again.
+				rt.onLatched[eventName] = false
 				return false
 			}
+			if rt.onLatched[eventName] {
+				// Level still at/above N and this crossing already fired:
+				// suppress until the count drops below N (re-arm above).
+				return false
+			}
+			// count >= N and not yet latched: this IS the crossing — pass.
+			// evaluateEvent sets the latch only AFTER the cooldown check
+			// passes, so a cooldown-suppressed crossing is not consumed.
 		}
 
 		if wc.TriggerUntil > 0 {

@@ -1,3 +1,20 @@
+## 2026-07-01 — #3756 M1: `trigger on` is edge-triggered (crossing, not level)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: `within { trigger on N }` was LEVEL-triggered — withinMatches
+    returned true for every event with count>=N, so a sustained failing level
+    re-remediated every 30s cooldown. Pinned to the Junos EDGE reading: a
+    per-(policy,event) latch (policyRuntime.onLatched) set after the crossing
+    fires (only AFTER the cooldown check passes, so a suppressed crossing is not
+    consumed) and re-armed by withinMatches when the in-window count drops below
+    N. policyHasTriggerOn gates the latch to trigger-on policies only.
+    RED-on-revert: TestEdgeTriggerOn_SustainedLevelFiresOnce_3756 (level fires 9
+    vs edge 1), _ReArmsAfterDroppingBelow_3756 (5 vs 2),
+    _CooldownDoesNotConsumeCrossing_3756 (guards latch-after-cooldown ordering).
+  - **File(s)**: pkg/eventengine/engine.go,
+    pkg/eventengine/engine_edge_trigger_3756_test.go,
+    pkg/eventengine/README.md
+
 ## 2026-07-01 — #3755: RPM first probe cycle event reaches event-options
 
 - **Timestamp**: 2026-07-01
