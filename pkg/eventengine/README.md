@@ -46,6 +46,17 @@ A `delete` of a missing path is a **tolerated exception** (logged at Debug):
 Junos `change-configuration` semantics, and a missing delete target is not a
 half-applied batch.
 
+**Audit description (#3754):** the remediation commit carries a deterministic
+description — `event-options policy <name>: <event>/<owner>/<test> (<n>
+commands)` — built by `remediationDescription` from the triggering-event
+context captured on the `plannedAction` at evaluate time. It is threaded into
+both the `CommitFn` (daemon `commitAndApply` → `CommitWithDescription`) and the
+standalone `store.CommitWithDescription` branch, so an autonomous config
+mutation lands in commit/rollback history ATTRIBUTED to the policy and event
+that made it — not as an anonymous unattributed commit. Regression-locked by
+`TestRemediation_CommitCarriesAuditDescription` (fail-on-revert: reverting to
+`commitFn(ctx, "")` leaves the comment empty and the test goes RED).
+
 ## Cooldown / window state survives a config reload (#2140)
 
 Per-policy temporal state (sliding `within` windows + last-trigger time) is

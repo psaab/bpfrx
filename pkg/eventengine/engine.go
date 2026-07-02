@@ -136,7 +136,14 @@ type plannedAction struct {
 	// the evaluate that enqueued this action. The worker drops the action if the
 	// live revision no longer matches (policy redefined) or is absent (removed).
 	semRev string
-	ops    []plannedOp
+	// Triggering-event context, captured at evaluate time so the worker can
+	// stamp a deterministic audit description on the remediation commit (#3754).
+	// A security appliance that mutates its own config autonomously must record
+	// in commit/rollback history WHICH policy fired and WHY.
+	event     string
+	testOwner string
+	testName  string
+	ops       []plannedOp
 }
 
 // triggeredPolicy pairs a policy that should fire with the semantic revision its
@@ -424,8 +431,16 @@ func (e *Engine) HandleEvent(ev rpm.Event) {
 		}
 		// Stamp the action with the policy's semantic revision as of this
 		// evaluate (#3750) so the worker can revalidate it against live engine
-		// state before committing.
-		e.enqueue(plannedAction{policyName: tp.pol.Name, semRev: tp.semRev, ops: ops})
+		// state before committing, plus the triggering-event context (#3754)
+		// for the remediation commit's audit description.
+		e.enqueue(plannedAction{
+			policyName: tp.pol.Name,
+			semRev:     tp.semRev,
+			event:      ev.Name,
+			testOwner:  ev.TestOwner,
+			testName:   ev.TestName,
+			ops:        ops,
+		})
 	}
 }
 
@@ -691,21 +706,37 @@ func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
 		return errBatch("commit-check: %v", err)
 	}
 
+	// #3754: stamp a deterministic audit description so the autonomous
+	// remediation lands in commit/rollback history attributed to the policy and
+	// its triggering event, not as an anonymous unattributed commit.
+	desc := remediationDescription(a)
 	if e.commitFn == nil {
-		// Standalone (tests): just commit; no apply.
-		if _, err := e.store.Commit(); err != nil {
+		// Standalone (tests): just commit; no apply. Still record the
+		// description so the journal/history attribution is identical to the
+		// daemon path.
+		if _, err := e.store.CommitWithDescription(desc); err != nil {
 			e.store.ExitConfigure()
 			return errBatch("commit: %v", err)
 		}
 		e.store.ExitConfigure()
 		return nil
 	}
-	if _, err := e.commitFn(ctx, ""); err != nil {
+	if _, err := e.commitFn(ctx, desc); err != nil {
 		e.store.ExitConfigure()
 		return errBatch("commit: %v", err)
 	}
 	e.store.ExitConfigure()
 	return nil
+}
+
+// remediationDescription builds the deterministic audit string stamped on an
+// autonomous event-options remediation commit (#3754). It names the policy,
+// the triggering event/owner/test, and the command-batch size so an operator
+// reading commit/rollback history can tell which policy mutated the config and
+// why.
+func remediationDescription(a plannedAction) string {
+	return fmt.Sprintf("event-options policy %s: %s/%s/%s (%d commands)",
+		a.policyName, a.event, a.testOwner, a.testName, len(a.ops))
 }
 
 // errBatch builds a permanent (non-retryable) batch failure error.

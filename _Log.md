@@ -1,3 +1,16 @@
+## 2026-07-01 — #3754: event-options remediation commit audit description
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Autonomous remediation committed with an empty comment, so the
+    mutation was unattributed in commit/rollback history. plannedAction now
+    carries the triggering event/owner/test (stamped in HandleEvent);
+    applyOnce builds `event-options policy <name>: <event>/<owner>/<test>
+    (<n> commands)` via remediationDescription and threads it into commitFn
+    AND the standalone CommitWithDescription branch. RED-on-revert test:
+    TestRemediation_CommitCarriesAuditDescription.
+  - **File(s)**: pkg/eventengine/engine.go,
+    pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md
+
 ## 2026-07-01 — #3753: event-options attributes-match honors event-name prefix
 
 - **Timestamp**: 2026-07-01
