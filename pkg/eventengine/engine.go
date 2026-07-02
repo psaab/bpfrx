@@ -1107,8 +1107,16 @@ func (e *Engine) withinMatches(pol *config.EventPolicy, rt *policyRuntime, event
 		}
 
 		if wc.TriggerUntil > 0 {
-			// "trigger until N" — stop triggering once N events reached in window
-			if count >= wc.TriggerUntil {
+			// "trigger until N" fires through the INCLUSIVE N-th event, then
+			// stops (#3756 M2). Junos reads it as "trigger UNTIL the event has
+			// been received N times" — the N-th occurrence is the LAST that
+			// fires. The event is appended to the window BEFORE this check
+			// (evaluateEvent), so the N-th matching event already makes
+			// count==N; using `>=` here made count==N return false, so the N-th
+			// never fired and `until 1` (count==1 on the first event) could
+			// NEVER fire at all — a dead-config bug. `>` fires on 1..N and stops
+			// at N+1.
+			if count > wc.TriggerUntil {
 				return false
 			}
 		}

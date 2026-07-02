@@ -280,6 +280,14 @@ Junos reading in `withinMatches` (`engine.go`):
   `TestEdgeTriggerOn_*_3756`. Only a policy carrying a `trigger on` clause
   latches (`policyHasTriggerOn`); a no-within or `trigger until` policy is
   unaffected.
+- **`trigger until N` fires through the INCLUSIVE N-th event**, then stops
+  (Junos "trigger UNTIL the event has been received N times" — the N-th
+  occurrence is the last that fires). The current event is appended to the
+  window BEFORE the check, so the N-th matching event makes `count == N`; the
+  boundary is `count > N` (not `>=`). This fixed a dead-config bug: with `>=`,
+  `until 1` made the first event `count == 1 >= 1` and NEVER fired, and
+  `until N` fired only on events 1..N-1. Regression-locked by
+  `TestInclusiveUntil_*_3756`.
 
 ## Gotchas
 

@@ -1,3 +1,21 @@
+## 2026-07-01 — #3756 M2: `trigger until N` is the inclusive N-th (dead-config fix)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The event is appended to the window BEFORE withinMatches, and
+    the until boundary was `count >= wc.TriggerUntil`, so the N-th matching
+    event (count==N) returned false and never fired — `until 1` could NEVER
+    fire (count==1 on the first event), a dead-config bug; `until N` fired only
+    on events 1..N-1. Changed the boundary to `count > wc.TriggerUntil` so
+    `until N` fires inclusively through the N-th event then stops at N+1
+    (Junos "trigger UNTIL the event has been received N times"). One-char
+    change plus comment. RED-on-revert: TestInclusiveUntil_One_FiresOnce_3756
+    (never fires on >=), _Two_FiresThroughSecond_3756 (1 vs 2);
+    _BelowThresholdKeepsFiring_3756 is the never-reaches-N control (green both
+    ways).
+  - **File(s)**: pkg/eventengine/engine.go,
+    pkg/eventengine/engine_inclusive_until_3756_test.go,
+    pkg/eventengine/README.md
+
 ## 2026-07-01 — #3756 M1: `trigger on` is edge-triggered (crossing, not level)
 
 - **Timestamp**: 2026-07-01
