@@ -5375,6 +5375,90 @@ fn dscp_match_unrepresentable_marker_fails_closed_not_match_all() {
 }
 
 #[test]
+fn dscp_rewrite_out_of_range_fails_closed_not_masked() {
+    // #3715 RED-on-revert (Bug A): a `then dscp` REWRITE wire value outside the
+    // 0..=63 6-bit range must reject the whole snapshot — NOT be masked into a
+    // different valid code point. Pre-fix `parse_term` computed
+    // `snap.dscp_rewrite.map(|v| v & 0x3f)`, so 110 & 0x3f == 46 (EF): a corrupt
+    // byte actively marked traffic with a code point the operator never authored.
+    // Reverting the preflight range check (and restoring the mask) makes this
+    // compile Ok with dscp_rewrite == Some(46).
+    let err = filter_with_marked_term("inet", |t| t.dscp_rewrite = Some(110))
+        .expect_err("an out-of-range dscp rewrite must fail the build closed");
+    match err {
+        SnapshotIntegrityError::FilterDSCPOutOfRange {
+            family,
+            filter,
+            term,
+            dimension,
+            value,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "marked");
+            assert_eq!(dimension, "rewrite");
+            assert_eq!(value, 110, "the error must carry the raw offending byte, not 110 & 0x3f");
+        }
+        other => panic!("expected FilterDSCPOutOfRange, got {other:?}"),
+    }
+    // A rewrite at the top of the valid range (63) still compiles verbatim.
+    let ok = filter_with_marked_term("inet", |t| t.dscp_rewrite = Some(63))
+        .expect("a valid 0..=63 dscp rewrite must compile");
+    assert_eq!(
+        ok.filters
+            .get("inet:f")
+            .expect("filter compiled")
+            .terms
+            .first()
+            .expect("one term")
+            .dscp_rewrite,
+        Some(63),
+        "a valid rewrite must be carried verbatim (no masking)"
+    );
+}
+
+#[test]
+fn dscp_match_out_of_range_fails_closed_not_dropped() {
+    // #3715 RED-on-revert (Bug B): a `from dscp` MATCH wire value >= 64 must reject
+    // the whole snapshot. Pre-fix `build_u6_match_bitmap` silently SKIPPED any value
+    // >= 64 (its `value < 64` guard) while `dscp_match_enabled` stayed true — a term
+    // carrying [46, 64] appeared to match two selectors but silently matched only EF
+    // (fail-WIDE / silently-wrong). Reverting the preflight range check makes this
+    // compile Ok with the 64 dropped from the bitmap. inet6 names the family to
+    // prove it is carried (filter names can be reused across families).
+    let err = filter_with_marked_term("inet6", |t| t.dscp_values = vec![46, 64])
+        .expect_err("an out-of-range dscp match value must fail the build closed");
+    match err {
+        SnapshotIntegrityError::FilterDSCPOutOfRange {
+            family,
+            dimension,
+            value,
+            ..
+        } => {
+            assert_eq!(family, "inet6");
+            assert_eq!(dimension, "match");
+            assert_eq!(value, 64, "the error must carry the first out-of-range value");
+        }
+        other => panic!("expected FilterDSCPOutOfRange, got {other:?}"),
+    }
+    // The boundary value 63 is in range; a fully in-range match set compiles and
+    // keeps the DSCP match enabled.
+    let ok = filter_with_marked_term("inet", |t| t.dscp_values = vec![0, 46, 63])
+        .expect("a fully in-range dscp match set must compile");
+    let term = ok
+        .filters
+        .get("inet:f")
+        .expect("filter compiled")
+        .terms
+        .first()
+        .expect("one term");
+    assert!(
+        term.dscp_match_enabled,
+        "an in-range dscp match set must keep the DSCP match enabled"
+    );
+}
+
+#[test]
 fn flex_match_oversized_width_fails_closed_not_truncated() {
     // #3406 RED-on-revert: a present flex_match whose byte `length` is outside
     // 1..=4 (the value/mask wire fields are u32) must reject the whole snapshot.

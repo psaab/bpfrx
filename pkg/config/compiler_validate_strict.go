@@ -4852,10 +4852,21 @@ func validateFilterRoutingInstanceConflictStrict(cfg *Config) error {
 //
 // The walk is deterministic (filters sorted by name, terms in config order). On
 // the tolerant load / peer-sync path the caller downgrades the returned error to
-// a warning (#1960 no-brick); the snapshot builder drops the bad token
-// independently (a leniently-loaded match widens, a rewrite no-ops) — but the
-// operator never reaches that state through a commit. Mirrors
-// validateFilterMatchValuesStrict.
+// a warning (#1960 no-brick); the snapshot builder then handles the bad token
+// independently, and the two DSCP halves behave DIFFERENTLY there (L10, #3715):
+//
+//   - MATCH: an unresolvable `from dscp` NAME is dropped and the term is marked
+//     dscp_match_unrepresentable, which the Rust filter compiler FAILS CLOSED on
+//     (SnapshotIntegrityError::UnrepresentableFilterDSCP, #3406) — it does NOT
+//     silently widen. A raw numeric value >= 64 is likewise failed closed
+//     (FilterDSCPOutOfRange, #3715) rather than silently dropped from the bitmap.
+//   - REWRITE: an unresolvable `then dscp` NAME warn/no-ops (CoS-only, no match
+//     widening), and a raw numeric value >= 64 is failed closed by the Rust
+//     compiler (FilterDSCPOutOfRange, #3715) rather than masked into a different
+//     valid code point.
+//
+// The operator never reaches any of those states through a commit — this gate is
+// the primary defense. Mirrors validateFilterMatchValuesStrict.
 func validateFilterDSCPStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil

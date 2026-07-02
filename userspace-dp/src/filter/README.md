@@ -586,6 +586,20 @@ match/action widening:
   unresolvable rewrite is CoS-only (no match/action widening), so it is NOT failed
   closed — the Go builder emits NO rewrite and a `slog.Warn` so the lost CoS marking
   is operator-visible (failing forwarding over a cosmetic marking would be worse).
+- **Raw DSCP wire value out of the 6-bit 0..=63 range (#3715):** a `dscp_values`
+  entry >= 64 (match) or a `dscp_rewrite` byte >= 64 (rewrite) can only arrive from
+  a corrupt / hand-built / version-drifted snapshot — the Go commit gate
+  (`validateFilterDSCPStrict`) and the builder both bound DSCP to a code-point name
+  or 0..63. `parse_term` raises `SnapshotIntegrityError::FilterDSCPOutOfRange` for
+  either. Unlike the `dscp_match_unrepresentable` marker above (which fires after the
+  Go builder has already DROPPED an unresolvable NAME), the raw numeric value is
+  directly visible on the wire, so the range check is done in Rust without a Go-side
+  marker. Pre-fix the MATCH value was silently SKIPPED by `build_u6_match_bitmap`
+  (`value < 64` guard) while `dscp_match_enabled` stayed true → a `[46, 64]` term
+  matched only EF (fail-WIDE / silently-wrong); the REWRITE value was MASKED with
+  `& 0x3f`, turning e.g. 110 into 46 (EF) → traffic marked with a code point the
+  operator never authored. BOTH now fail the snapshot closed (the reconcile preflight
+  keeps the previous good filter state), so neither mis-applies.
 - **Mixed positive + `*-port-except` in one direction (104-M05):** the Rust
   compiler already resolves this positive-wins (the except list is dropped — a
   fail-SAFE narrowing, see "Negated port match" below), but the pre-#3406 drop was
@@ -593,7 +607,9 @@ match/action widening:
   address-except warning (#3359), so the dropped except set is operator-visible.
 
 Tests: `icmp_type_unrepresentable_marker_*`, `icmp_code_unrepresentable_marker_*`,
-`dscp_match_unrepresentable_marker_*`, `flex_match_oversized_width_*` (Rust) and
+`dscp_match_unrepresentable_marker_*`, `dscp_match_out_of_range_fails_closed_not_dropped`,
+`dscp_rewrite_out_of_range_fails_closed_not_masked`, `flex_match_oversized_width_*`
+(Rust) and
 `TestFilterSnapshot{ICMP,DSCPMatch,DSCPRewrite,FlexMatchOversizedWidth,MixedPortExcept}*`
 (Go) (fail-on-revert).
 
