@@ -188,17 +188,42 @@ pub(crate) fn secs_to_ns_saturating(secs: u64) -> u64 {
         .min(MAX_SESSION_TIMEOUT_NS)
 }
 
+/// #3714: upper bound (in SECONDS) on a per-application inactivity timeout,
+/// mirroring the Go commit-time gate `appTimeoutMax = 86400`
+/// (`pkg/config/compiler_applications.go`). Go rejects a custom
+/// `set applications application <a> inactivity-timeout <n>` with `n > 86400`
+/// at commit, so a well-formed snapshot never carries a larger value; this
+/// const is the runtime backstop that clamps a corrupt / mixed-version wire
+/// value (config-snapshot `PolicyApplicationSnapshot.inactivity_timeout` OR the
+/// HA `SessionSyncRequest.inactivity_timeout`) so a bogus `4294967295` cannot
+/// stamp an effectively never-expiring idle timeout — diverging session GC from
+/// the commit-time contract. This is the per-application analogue of the
+/// `MAX_SESSION_TIMEOUT_SECS` overflow backstop above: the Go side is the
+/// operator-facing reject, this bound is the dataplane's clamp. Keep the two
+/// values in lockstep with the Go `appTimeoutMax`.
+pub(crate) const APP_INACTIVITY_TIMEOUT_MAX_SECS: u32 = 86400;
+
 /// #3227: convert a matched application's per-application inactivity timeout
 /// (`PolicyEvaluationResult.inactivity_timeout`, in SECONDS) to the nanosecond
 /// session override stamped on `SessionMetadata.inactivity_timeout_ns`. `None`
 /// (or 0 seconds) maps to `None` (use the global per-protocol timeout — the
-/// historical behavior); a positive value saturates at `MAX_SESSION_TIMEOUT_NS`
-/// exactly like a configured global timeout, so a pathological config cannot
-/// wrap into a tiny window.
+/// historical behavior); a positive value is first clamped to
+/// `APP_INACTIVITY_TIMEOUT_MAX_SECS` (#3714 — mirrors the Go 86400 s commit
+/// gate so a corrupt/mixed-version wire value can't produce a never-expiring
+/// session) and then saturates at `MAX_SESSION_TIMEOUT_NS`, so a pathological
+/// config cannot wrap into a tiny window.
+///
+/// This is the single seconds→ns conversion authority for BOTH ingress paths —
+/// the local config-snapshot policy match (`parse_applications` →
+/// `PolicyEvaluationResult`) and the HA session-sync receive
+/// (`SessionSyncRequest.inactivity_timeout`) — so clamping here bounds every
+/// value that persists on a session or rides the sync wire to a peer.
 #[inline]
 pub(crate) fn app_inactivity_timeout_ns(secs: Option<u32>) -> Option<u64> {
     match secs {
-        Some(s) if s > 0 => Some(secs_to_ns_saturating(u64::from(s))),
+        Some(s) if s > 0 => Some(secs_to_ns_saturating(u64::from(
+            s.min(APP_INACTIVITY_TIMEOUT_MAX_SECS),
+        ))),
         _ => None,
     }
 }

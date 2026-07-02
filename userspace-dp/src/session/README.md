@@ -67,7 +67,16 @@ term carries it. It rides the wire on `PolicyApplicationSnapshot.
 inactivity_timeout` (seconds, omitempty — 0/absent = use-global), is
 surfaced by the matcher as `PolicyEvaluationResult.inactivity_timeout`,
 and is stamped at install onto `SessionMetadata.inactivity_timeout_ns`
-(seconds->ns, saturating). `session_timeout_ns` then prefers that override
+(seconds->ns, saturating). **Bound (#3714):** `app_inactivity_timeout_ns`
+first clamps the seconds value to `APP_INACTIVITY_TIMEOUT_MAX_SECS`
+(86400 s) — the runtime backstop mirroring the Go commit gate
+`appTimeoutMax` (`pkg/config/compiler_applications.go`, which rejects
+`inactivity-timeout > 86400` at commit). Because that conversion is the
+single authority both the config-snapshot path and the HA session-sync
+receive funnel through, a corrupt / mixed-version wire value (e.g.
+`4294967295`) is clamped rather than stamping an effectively
+never-expiring idle timeout that would diverge session GC from the
+commit-time contract. `session_timeout_ns` then prefers that override
 for the established TCP / UDP / ICMP idle window on install AND on every
 real-traffic refresh (`lookup.rs` / `update_session`), so the conntrack
 GC ages the flow out on the app's value. It deliberately does NOT extend
