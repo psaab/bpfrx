@@ -3,6 +3,7 @@ package ddns
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -163,7 +164,24 @@ func (b *dyndns2Backend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 // like an upsert, so a provider failure propagates as a non-nil error and the
 // Surface A engine keeps ownership for retry rather than reporting a false
 // withdraw and orphaning the public record.
+//
+// SIBLING-FAMILY GUARD (#3738): offline=YES is HOSTNAME-level — it takes the
+// whole hostname (both the A and the AAAA) offline. A dual-stack same-name
+// dyndns2 scope therefore cannot express a single-family withdraw on the wire:
+// offlining to drop ONE family while its sibling is still live would blackhole
+// the sibling. When the engine flags rec.SiblingFamilyOwned we do the LEAST-
+// DESTRUCTIVE thing — SKIP the offline (a logged no-op) — preserving the live
+// sibling. The withdrawn family's record is left in place (stale) rather than the
+// sibling being taken down; the manager still drops this family's ownership, so a
+// later withdraw of the LAST family (no sibling left → the flag is false) issues
+// offline=YES and takes the whole name down as intended.
 func (b *dyndns2Backend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) error {
+	if rec.SiblingFamilyOwned {
+		slog.Warn("ddns dyndns2: skipping hostname-level offline to preserve the live sibling family "+
+			"(offline=YES takes down BOTH A and AAAA; dyndns2 has no per-family withdraw)",
+			"provider", b.name, "fqdn", rec.FQDN, "withdraw_type", rec.ForwardType)
+		return nil
+	}
 	q := url.Values{}
 	q.Set("hostname", rec.FQDN)
 	// myip is still required by some providers' parsers; send the address being
