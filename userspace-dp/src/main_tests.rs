@@ -1749,8 +1749,17 @@ fn run_control_request(
     response
 }
 
+/// #3789: clearing `defer_workers` on a same-plan apply TRIGGERS the
+/// deferred-binding reconcile (`debug_reconcile_calls` 0 -> 1). When that
+/// reconcile aborts in the pre-teardown preflight — here the test snapshot
+/// carries no map pins, so it stops at `missing_xsk_pin` — the
+/// full-reconcile handler leg now FAILS CLOSED: it reports `ok=false` and
+/// keeps the prior deferred (gen-1) snapshot as the boot baseline. Before
+/// #3789 `afxdp.reconcile` returned `()`, the handler swallowed the abort,
+/// stored the rejected gen-2 (defer_workers=false) snapshot, and acked
+/// ok=true — the M1 class #3766 fixed only for the same-plan *refresh* leg.
 #[test]
-fn apply_snapshot_same_plan_clearing_defer_workers_reconciles_bindings() {
+fn apply_snapshot_same_plan_clearing_defer_workers_reconcile_abort_fails_closed_3789() {
     let state = Arc::new(Mutex::new(ServerState {
         status: ProcessStatus {
             workers: 1,
@@ -1830,19 +1839,36 @@ fn apply_snapshot_same_plan_clearing_defer_workers_reconciles_bindings() {
             ..ControlRequest::default()
         },
     );
-    assert!(response.ok, "unexpected error: {}", response.error);
+    // #3789: the aborted deferred-binding reconcile must fail closed.
+    assert!(
+        !response.ok,
+        "an aborted deferred-binding reconcile must fail closed (#3789), got ok=true"
+    );
+    assert!(
+        response.error.contains("missing_xsk_pin"),
+        "unexpected error: {}",
+        response.error
+    );
     let status = response.status.expect("status response");
+    // The reconcile WAS triggered (the point of clearing defer_workers) and
+    // aborted at the missing mandatory pin.
     assert_eq!(status.debug_reconcile_calls, 1);
     assert_eq!(status.debug_reconcile_stage, "missing_xsk_pin");
-    assert!(
-        !state
-            .lock()
-            .expect("state poisoned")
-            .snapshot
-            .as_ref()
-            .expect("snapshot")
-            .defer_workers
-    );
+    // #3789: the rejected gen-2 snapshot must NOT overwrite the boot
+    // baseline — the prior deferred (gen-1, defer_workers=true) snapshot
+    // stays stored.
+    {
+        let guard = state.lock().expect("state poisoned");
+        let stored = guard.snapshot.as_ref().expect("snapshot");
+        assert_eq!(
+            stored.generation, 1,
+            "a rejected apply must keep the prior snapshot as the boot baseline"
+        );
+        assert!(
+            stored.defer_workers,
+            "a rejected apply must keep the prior deferred snapshot intact"
+        );
+    }
 
     let _ = std::fs::remove_file(&state_file);
 }

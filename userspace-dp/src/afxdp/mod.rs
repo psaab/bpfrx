@@ -435,6 +435,10 @@ mod worker_queue;
 #[path = "worker_runtime.rs"]
 mod worker_runtime;
 pub use self::coordinator::Coordinator;
+// #3789: re-export the full-reconcile abort outcome into afxdp scope so
+// the control-plane server (`server/helpers.rs` + `handlers/snapshot.rs`)
+// can name `afxdp::ReconcileError` on `reconcile_status_bindings`.
+pub(crate) use self::coordinator::ReconcileError;
 // #2962: the lock-free owner-RG export wait handle. The control-socket
 // dispatcher (server/handlers) names this as the return type of
 // kick_owner_rg_export so it can run the blocking ack-wait off the
