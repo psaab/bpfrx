@@ -3,7 +3,9 @@ use super::*;
 use crate::test_zone_ids::*;
 use crate::xsk_ffi::IfInfo;
 use crate::{
-    DestinationNATRuleSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
+    ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
+    CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
+    CoSSchedulerSnapshot, DestinationNATRuleSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
     InterfaceAddressSnapshot, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot,
     SourceNATRuleSnapshot, StaticNATRuleSnapshot, ThreeColorPolicerSnapshot, ZoneSnapshot,
 };
@@ -7615,6 +7617,388 @@ fn txn_admission_refusal_at_cap_drops_and_leaks_nothing() {
         "a refused flow's (rolled-back) NAT decision must never be cached"
     );
     assert_eq!(batch.session_creates, 0);
+}
+
+/// #3777 RED-on-revert: an interface INPUT filter `then count` must count EVERY
+/// packet of a cacheable flow, not just the seed. Packet 1 (SYN) counts on the
+/// cold path and seeds the flow cache; packet 2 (same 5-tuple) hits the flow
+/// cache and MUST replay the input `then count` — mirroring the output-counter
+/// replay (#2573). Reverting the input replay leaves the counter at 1 for a
+/// 2-packet flow (the under-count this fixes).
+#[test]
+fn txn_flow_cache_hit_replays_input_filter_then_count_3777() {
+    use std::sync::atomic::Ordering;
+
+    let mut snapshot = nat_snapshot();
+    // A count-only accept term on the LAN ingress interface (ifindex 24). No
+    // forwarding-class / dscp, so it is NOT tx-selection-affecting and is NOT
+    // folded into tx_selection.filter_counters — exactly the #3777 gap.
+    snapshot.interfaces[0].filter_input_v4 = "count-in".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "count-in".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "count-all".to_string(),
+            action: "accept".to_string(),
+            count: "c-all".to_string(),
+            ..Default::default()
+        }],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let input_counter = forwarding
+        .filter_state
+        .iface_filter_v4_fast
+        .get(&24)
+        .expect("input filter compiled for ifindex 24")
+        .terms
+        .first()
+        .expect("one term")
+        .counter
+        .clone();
+    assert_eq!(input_counter.packets.load(Ordering::Relaxed), 0);
+
+    // Packet 1 (pure ACK = established TCP, so it is flow-cache-eligible per
+    // #2363 — a SYN is not cached): cold path counts the input filter, installs
+    // the session, and seeds the flow cache.
+    let frame1 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta1 = txn_meta_v4(24, 0x10_u8, (frame1.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame1,
+        meta1,
+    );
+    assert_eq!(
+        input_counter.packets.load(Ordering::Relaxed),
+        1,
+        "the seed packet must count on the cold path"
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded SYN must seed the flow cache"
+    );
+
+    // Packet 2 (same 5-tuple, ACK): MUST hit the flow cache and replay the
+    // input count.
+    let frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta2 = txn_meta_v4(24, 0x10_u8, (frame2.len() - 14) as u16);
+    let (_, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    assert!(
+        dbg2.tx >= 1,
+        "packet 2 must be forwarded from the flow-cache fast path"
+    );
+    assert_eq!(
+        input_counter.packets.load(Ordering::Relaxed),
+        2,
+        "the flow-cache hit MUST replay the interface input `then count` (#3777)"
+    );
+}
+
+/// #3778 RED-on-revert: a CoS behavior-aggregate (DSCP) classifier is
+/// per-packet in vSRX, but the cached TX-selection froze the SEED packet's
+/// queue (the flow-cache key excludes DSCP). Packet 1 (DSCP 0) seeds the cache
+/// on the default queue; packet 2 (same 5-tuple, DSCP 46 = EF) hits the flow
+/// cache and MUST re-classify to the EF queue. Reverting the per-packet
+/// re-classify replays the frozen default queue (queue 0), which this asserts
+/// against (expects queue 1).
+#[test]
+fn txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778() {
+    let mut snapshot = nat_snapshot();
+    // CoS on the WAN egress (reth0.80, ifindex 12): a DSCP BA classifier maps
+    // DSCP 46 (EF) -> expedited-forwarding (queue 1); DSCP 0 is unmapped and
+    // falls to the default best-effort queue (0).
+    snapshot.interfaces[1].cos_shaping_rate_bytes_per_sec = 10_000_000;
+    snapshot.interfaces[1].cos_shaping_burst_bytes = 256_000;
+    snapshot.interfaces[1].cos_scheduler_map = "wan-map".to_string();
+    snapshot.interfaces[1].cos_dscp_classifier = "cls".to_string();
+    snapshot.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![
+            CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            },
+            CoSForwardingClassSnapshot {
+                name: "expedited-forwarding".into(),
+                queue: 1,
+            },
+        ],
+        dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+            name: "cls".into(),
+            entries: vec![CoSDSCPClassifierEntrySnapshot {
+                forwarding_class: "expedited-forwarding".into(),
+                loss_priority: "low".into(),
+                dscp_values: vec![46],
+            }],
+        }],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+        schedulers: vec![
+            CoSSchedulerSnapshot {
+                name: "be-sched".into(),
+                transmit_rate_bytes: 4_000_000,
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 128_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+            CoSSchedulerSnapshot {
+                name: "ef-sched".into(),
+                transmit_rate_bytes: 6_000_000,
+                transmit_rate_exact: false,
+                priority: "strict-high".into(),
+                buffer_size_bytes: 64_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+        ],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: "be-sched".into(),
+                },
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "expedited-forwarding".into(),
+                    scheduler: "ef-sched".into(),
+                },
+            ],
+        }],
+    });
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // Packet 1 (pure ACK = established, cache-eligible; DSCP 0): seeds the
+    // cache on the default queue.
+    let frame1 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let mut meta1 = txn_meta_v4(24, 0x10_u8, (frame1.len() - 14) as u16);
+    meta1.dscp = 0;
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame1,
+        meta1,
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded established ACK must seed the flow cache"
+    );
+    let seed_q = binding
+        .scratch
+        .scratch_forwards
+        .last()
+        .and_then(|r| r.cos_queue_id);
+    assert_eq!(
+        seed_q,
+        Some(0),
+        "DSCP-0 seed packet must land on the default (best-effort) queue"
+    );
+
+    // Packet 2 (same 5-tuple, DSCP 46 = EF): flow-cache HIT. The BA classifier
+    // MUST re-classify per packet to the EF queue instead of replaying the
+    // frozen default.
+    let frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let mut meta2 = txn_meta_v4(24, 0x10_u8, (frame2.len() - 14) as u16);
+    meta2.dscp = 46;
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    let hit_q = binding
+        .scratch
+        .scratch_forwards
+        .last()
+        .and_then(|r| r.cos_queue_id);
+    assert_eq!(
+        hit_q,
+        Some(1),
+        "the flow-cache hit MUST re-classify DSCP 46 to the EF queue (#3778), \
+         not replay the seed's frozen default queue"
+    );
+}
+
+/// #3779 RED-on-revert: on the flow-cache hit path the TTL/hop-limit check (and
+/// its ICMP Time Exceeded) MUST run BEFORE the egress side effects (output
+/// `then count` replay, policy hit counter, policers, filter logs, terminal
+/// drop). Packet 1 (TTL 64) seeds the cache and charges the output filter count
+/// once; packet 2 (same 5-tuple, TTL 1) hits the cache and must be handled as a
+/// TTL-exceeded packet — enqueuing ICMP Time Exceeded — WITHOUT charging the
+/// output filter count a second time. Reverting the hoist replays the output
+/// count for the expired packet (it reaches 2) and, on a dropping flow, would
+/// drop it before the TE is built.
+#[test]
+fn txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779() {
+    use std::sync::atomic::Ordering;
+
+    let mut snapshot = nat_snapshot();
+    // Output `then count accept` on the WAN egress (reth0.80, ifindex 12): its
+    // counter is captured into the cached tx_selection and replayed on hits.
+    snapshot.interfaces[1].filter_output_v4 = "count-out".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "count-out".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "count-all".to_string(),
+            action: "accept".to_string(),
+            count: "c-out".to_string(),
+            ..Default::default()
+        }],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let out_counter = forwarding
+        .filter_state
+        .iface_filter_out_v4_fast
+        .get(&12)
+        .expect("output filter compiled for ifindex 12")
+        .terms
+        .first()
+        .expect("one term")
+        .counter
+        .clone();
+
+    // Packet 1 (pure ACK, TTL 64): seeds the cache and charges the output count.
+    let frame1 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta1 = txn_meta_v4(24, 0x10_u8, (frame1.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame1,
+        meta1,
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded established ACK must seed the flow cache"
+    );
+    assert_eq!(
+        out_counter.packets.load(Ordering::Relaxed),
+        1,
+        "the seed packet charges the output `then count` once"
+    );
+    let forwards_after_seed = binding.scratch.scratch_forwards.len();
+
+    // Packet 2 (same 5-tuple, TTL 1): TTL check must precede egress accounting.
+    let mut frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    // IPv4 TTL byte: eth(14) + IP header offset 8 = frame index 22. Rewrite to
+    // 1 and repair the IPv4 header checksum (frame[24..26]).
+    frame2[22] = 1;
+    frame2[24] = 0;
+    frame2[25] = 0;
+    let ip_sum = checksum16(&frame2[14..34]);
+    frame2[24] = (ip_sum >> 8) as u8;
+    frame2[25] = ip_sum as u8;
+    let meta2 = txn_meta_v4(24, 0x10_u8, (frame2.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    assert_eq!(
+        out_counter.packets.load(Ordering::Relaxed),
+        1,
+        "a TTL=1 cache-hit packet MUST NOT charge egress counters — the TTL \
+         check runs before egress accounting (#3779)"
+    );
+    // The expired packet is handled on the TTL path (ICMP Time Exceeded when
+    // the per-reason token bucket admits it, otherwise a silent drop) — in BOTH
+    // cases BEFORE egress accounting, which the count==1 pin above proves. When
+    // a reply IS enqueued it must be a prebuilt Time Exceeded frame, not the
+    // transit packet; the global per-reason rate-limiter bucket is shared across
+    // the test binary, so gate that stronger check on the reply being produced
+    // rather than asserting it unconditionally (which would flake).
+    if binding.scratch.scratch_forwards.len() > forwards_after_seed {
+        let te = binding
+            .scratch
+            .scratch_forwards
+            .last()
+            .expect("a forward request for the TTL=1 packet");
+        assert!(
+            matches!(te.frame, PendingForwardFrame::Prebuilt(_)),
+            "an enqueued forward for a TTL=1 cache-hit packet must be a prebuilt \
+             ICMP Time Exceeded reply, not the transit packet"
+        );
+    }
 }
 
 // I4 boundary: a forward+reverse pair is admitted while 2 slots remain

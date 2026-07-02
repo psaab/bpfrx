@@ -510,6 +510,42 @@ sync.
   are intentionally not flow-cached because DSCP is packet metadata, not
   part of the session cache key; session hits re-evaluate DSCP-sensitive
   input filters per packet.
+  **Interface INPUT filter `then count` on cache hits (#3777):** the
+  output/TX `then count` handles have been replayed on every flow-cache hit
+  since #2573 (`tx_selection.filter_counters`); the INPUT side now mirrors
+  that via `RewriteDescriptor::input_filter_counters`, captured once at seed
+  by `evaluate_interface_input_filter_counters_cached` and replayed in
+  `flow_cache_hit.rs`. A matched routing-instance (PBR) term is EXCLUDED at
+  capture (its count is owned by the routing-instance evaluator, #2620), and
+  the captured set is deduped against `tx_selection.filter_counters`
+  (`retain_absent_from`) so a count-plus-forwarding-class input term the cos
+  TX-selection rebuild already folded in is not recorded twice.
+  **Per-packet CoS BA classifier on cache hits (#3778):** DSCP / IEEE 802.1p
+  behavior-aggregate classifiers pick the egress queue from EACH packet's
+  DSCP / PCP, but the flow-cache key excludes both, so the cached TX-selection
+  froze the SEED packet's queue. `resolve_cached_cos_tx_selection` now sets
+  `CachedTxSelectionDescriptor::ba_reclassify` when the queue was NOT pinned by
+  a (5-tuple-stable) filter forwarding-class AND a BA classifier is configured
+  on the egress interface; `flow_cache_hit.rs` then re-resolves the queue per
+  packet via `reclassify_cached_ba_queue` (one FastMap lookup + two array
+  reads, gated by the flag so filter-FC-pinned / default-queue / no-CoS flows
+  keep the frozen queue for free). A `then forwarding-class` filter term stays
+  cached (its queue is 5-tuple-stable); only the DSCP/PCP-derived queue is
+  per-packet.
+  **TTL/hop-limit precedes egress accounting on cache hits (#3779):** the
+  cache-hit path used to run the output `then count` replay, the policy hit
+  counter, the three-color policers, the filter logs, and the terminal drop
+  BEFORE the TTL/hop-limit check, so a TTL=1 packet on a red-policer or
+  terminal-output-drop cached flow was dropped/charged with NO ICMP Time
+  Exceeded (and every expiring packet charged counters/logs for traffic that
+  never egressed). The check is now hoisted to the TOP of the hit path (for
+  `ForwardCandidate`/`FabricRedirect` dispositions), matching the session-hit /
+  session-miss slow paths: a would-expire packet becomes a Time Exceeded reply,
+  or — when TE is suppressed (ICMP-of-ICMP, rate limited, output-filter drop of
+  the reply) — is dropped, in BOTH cases before any egress counter/policer/log
+  moves. `observed_bytes`/active-epoch stamping in `lookup_counted` still counts
+  the packet as SEEN (deliberate — it is flow-activity telemetry, not
+  forwarded-byte accounting).
   Producers must use the event-stream worker handle so rate limiting,
   queue-budget accounting, replay, and daemon callback ACK behavior stay
   centralized in `event_stream/`.

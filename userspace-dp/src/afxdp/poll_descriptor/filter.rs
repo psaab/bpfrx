@@ -294,6 +294,42 @@ pub(super) fn evaluate_non_pbr_input_filter_log_only(
     })
 }
 
+/// #3777: capture this cacheable flow's interface INPUT filter `then count`
+/// term handles for replay on every flow-cache HIT. Sibling of
+/// `evaluate_non_pbr_input_filter_log_only` (which captures the `then log`
+/// descriptor). Cold-path counting already charged the seed packet; this only
+/// collects the handles the hit path replays. Returns an empty set when there
+/// is no flow, no input filter, or no `then count` term.
+#[cold]
+#[inline(never)]
+pub(super) fn evaluate_non_pbr_input_filter_counters_cached(
+    forwarding: &ForwardingState,
+    flow: Option<&SessionFlow>,
+    meta: UserspaceDpMeta,
+) -> crate::filter::CachedFilterCounters {
+    let Some(flow) = flow else {
+        return crate::filter::CachedFilterCounters::default();
+    };
+    let ingress_ifindex = resolve_ingress_logical_ifindex(
+        forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
+    let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
+    crate::filter::evaluate_interface_input_filter_counters_cached(
+        &forwarding.filter_state,
+        ingress_ifindex,
+        is_v6,
+        flow.src_ip,
+        flow.dst_ip,
+        meta.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        meta.dscp,
+    )
+}
+
 #[inline]
 pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
     forwarding: &ForwardingState,

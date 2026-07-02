@@ -163,6 +163,7 @@ use self::frame::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{
     FABRIC_INGRESS_FLAG, GRE_DECAP_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error,
+    packet_ttl_would_expire,
 };
 use self::icmp_ptb::{
     EgressMtuDecision, build_frag_needed_v4, build_packet_too_big_v6,
@@ -172,7 +173,7 @@ use self::icmp_ratelimit::{GeneratedErrorReason, allow_generated_error};
 #[cfg(test)]
 use self::icmp::{
     build_local_time_exceeded_v4, build_local_time_exceeded_v6, build_reject_icmp_unreachable,
-    can_generate_icmp_error_reply, packet_ttl_would_expire, reject_icmp_reply_suppressed,
+    can_generate_icmp_error_reply, reject_icmp_reply_suppressed,
 };
 #[cfg(test)]
 use self::icmp_embed::{

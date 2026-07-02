@@ -105,6 +105,8 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
             filter_counters: crate::filter::CachedFilterCounters::default(),
             three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
             filter_log: None,
+            // No flow key => default-queue only; nothing to re-classify.
+            ba_reclassify: false,
         };
     };
 
@@ -215,18 +217,34 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         }
     }
 
-    let queue_id = iface.and_then(|iface| {
-        map_cached_forwarding_class_queue(iface, forwarding_class.as_ref())
-            .or_else(|| resolve_cos_dscp_classifier_queue_id(iface, meta.dscp))
-            .or_else(|| {
-                resolve_cos_ieee8021_classifier_queue_id(
-                    iface,
-                    meta.ingress_pcp,
-                    meta.ingress_vlan_present != 0,
-                )
-            })
-            .or(Some(iface.default_queue))
+    // #3778: split the forwarding-class queue (5-tuple-stable) from the BA
+    // classifier queue (per-packet). A filter `then forwarding-class` pins the
+    // queue for the flow's lifetime and stays cached; a DSCP / 802.1p BA
+    // classifier picks the queue from THIS packet's DSCP / PCP and must be
+    // re-resolved on every hit.
+    let fc_queue =
+        iface.and_then(|iface| map_cached_forwarding_class_queue(iface, forwarding_class.as_ref()));
+    let queue_id = fc_queue.or_else(|| {
+        iface.and_then(|iface| {
+            resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                .or_else(|| {
+                    resolve_cos_ieee8021_classifier_queue_id(
+                        iface,
+                        meta.ingress_pcp,
+                        meta.ingress_vlan_present != 0,
+                    )
+                })
+                .or(Some(iface.default_queue))
+        })
     });
+    // Mark for per-packet BA re-classification on the flow-cache hit path only
+    // when the queue is NOT pinned by a filter forwarding-class AND a BA
+    // classifier is configured on the egress interface. A filter-FC-pinned or
+    // plain default-queue interface keeps the frozen queue (correct + free).
+    let ba_reclassify = fc_queue.is_none()
+        && iface.is_some_and(|iface| {
+            !iface.dscp_classifier.is_empty() || !iface.ieee8021_classifier.is_empty()
+        });
 
     CachedTxSelectionDescriptor {
         queue_id,
@@ -235,7 +253,38 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         filter_counters,
         three_color_policers,
         filter_log,
+        ba_reclassify,
     }
+}
+
+/// #3778: re-resolve the per-packet behavior-aggregate (DSCP / IEEE 802.1p PCP)
+/// classifier queue on a flow-cache HIT. The cached TX-selection descriptor
+/// froze the SEED packet's queue, but BA classifiers select the egress queue
+/// from EACH packet's DSCP / PCP (the flow-cache key excludes both), so a
+/// mixed-marking flow would otherwise be pinned to the first packet's queue.
+/// Called on the hit path ONLY when the descriptor set `ba_reclassify` (a BA
+/// classifier is active AND no filter forwarding-class pinned the queue), so
+/// the common no-CoS / filter-FC / default-queue flows never pay for it. One
+/// FastMap lookup + two array reads, allocation-free. Precedence matches the
+/// seed-time resolution: DSCP classifier, then 802.1p, then default queue.
+pub(in crate::afxdp) fn reclassify_cached_ba_queue(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    dscp: u8,
+    ingress_pcp: u8,
+    ingress_vlan_present: bool,
+) -> Option<u8> {
+    forwarding
+        .cos
+        .interfaces
+        .get(&egress_ifindex)
+        .and_then(|iface| {
+            resolve_cos_dscp_classifier_queue_id(iface, dscp)
+                .or_else(|| {
+                    resolve_cos_ieee8021_classifier_queue_id(iface, ingress_pcp, ingress_vlan_present)
+                })
+                .or(Some(iface.default_queue))
+        })
 }
 
 pub(in crate::afxdp) fn resolve_cos_queue_id(

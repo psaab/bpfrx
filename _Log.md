@@ -26844,6 +26844,73 @@ top.
     pkg/flowexport/README.md (#3744 section + file-layout bullet)
 
 - **Timestamp**: 2026-07-01
+  - **Action**: #3777 — replay interface INPUT filter `then count` on flow-cache
+    hits. Output/TX `then count` handles were replayed on every hit since #2573
+    but the INPUT side captured only a log descriptor, so an input `then count`
+    reported only the seed packet of an N-packet cacheable flow. Added
+    `RewriteDescriptor::input_filter_counters` + a capture walk
+    (`evaluate_interface_input_filter_counters_cached`) that mirrors the
+    `Always`-policy non-routing walk (defers at a routing-instance/PBR term so
+    its count stays owned by the routing evaluator, #2620), captured once at seed
+    and deduped against `tx_selection.filter_counters` (`retain_absent_from`) so a
+    count-plus-forwarding-class input term is not recorded twice. Replayed on the
+    hit path alongside the output counters. RED-on-revert:
+    `txn_flow_cache_hit_replays_input_filter_then_count_3777` (counter reads 1 not
+    2 without the replay). flow_cache/filter/cos tests green.
+  - **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs (capture fn),
+    userspace-dp/src/filter/engine/mod.rs (re-export),
+    userspace-dp/src/filter/mod.rs (CachedFilterCounters::retain_absent_from),
+    userspace-dp/src/afxdp/flow_cache.rs (RewriteDescriptor field + dedup in
+    from_forward_decision), userspace-dp/src/afxdp/poll_descriptor/filter.rs
+    (evaluate_non_pbr_input_filter_counters_cached),
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs (seed capture),
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (replay),
+    userspace-dp/src/afxdp/tests.rs (RED-on-revert), userspace-dp/src/afxdp/README.md,
+    plus RewriteDescriptor test-literal updates across afxdp test modules
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3778 — re-run the CoS behavior-aggregate (DSCP / IEEE 802.1p
+    PCP) classifier per packet on the flow-cache hit path. The cached
+    TX-selection resolved the queue from the SEED packet's DSCP/PCP and the
+    flow-cache key excludes both, so a mixed-marking flow was pinned to the first
+    packet's queue. Added `CachedTxSelectionDescriptor::ba_reclassify` (set at
+    seed when the queue is NOT pinned by a filter forwarding-class AND a BA
+    classifier is configured on the egress interface) + `reclassify_cached_ba_queue`;
+    `flow_cache_hit.rs` re-resolves the queue from the current packet's DSCP/PCP
+    when the flag is set, otherwise keeps the frozen queue. RED-on-revert:
+    `txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778` (a DSCP-0 seed then
+    a DSCP-46 EF hit; without the re-classify the hit replays queue 0 not the EF
+    queue 1).
+  - **File(s)**: userspace-dp/src/afxdp/flow_cache.rs (ba_reclassify field),
+    userspace-dp/src/afxdp/tx/cos_classify.rs (split fc/BA queue resolution +
+    ba_reclassify + reclassify_cached_ba_queue),
+    userspace-dp/src/afxdp/tx/mod.rs (re-export),
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (per-packet
+    re-resolve), userspace-dp/src/afxdp/umem/tests.rs (literal),
+    userspace-dp/src/afxdp/tests.rs (RED-on-revert + CoS imports),
+    userspace-dp/src/afxdp/README.md
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3779 — hoist the TTL/hop-limit check ABOVE the egress side
+    effects on the flow-cache hit path. Previously the output `then count`
+    replay, policy hit counter, three-color policers, filter logs, and the
+    terminal drop all ran before the TTL check, so a TTL=1 packet on a
+    red-policer / terminal-output-drop cached flow was dropped/charged with no
+    ICMP Time Exceeded, and every expiring packet charged counters/logs for
+    traffic that never egressed. Moved the `packet_ttl_would_expire` +
+    `build_local_time_exceeded_request` check to the top of the hit path (for
+    ForwardCandidate/FabricRedirect); a would-expire packet becomes a TE reply,
+    or (TE suppressed) is dropped, in both cases before any egress accounting.
+    Removed the now-redundant TTL check from the forward fast path. Made
+    `packet_ttl_would_expire` a non-test import in afxdp/mod.rs. RED-on-revert:
+    `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779` (a TTL=1
+    cache-hit packet on an output-`then count` flow leaves the counter at 1;
+    reverting the hoist charges it to 2). observed_bytes/active-epoch stamping
+    left as SEEN telemetry (deliberate, documented).
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (hoist +
+    remove redundant check), userspace-dp/src/afxdp/mod.rs (packet_ttl_would_expire
+    import), userspace-dp/src/afxdp/tests.rs (RED-on-revert),
+    userspace-dp/src/afxdp/README.md
   - **Action**: #3726 — NAT `appPortsFromSpec` rejects a reversed
     application port range instead of narrowing it to the low port.
     Root cause: `appPortsFromSpec` (pkg/dataplane/userspace/nat.go)
