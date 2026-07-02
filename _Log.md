@@ -1,3 +1,25 @@
+## 2026-07-01 — #3827: type the qualified-next-hop `preference` leaf (Go commit gate)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3771/#3826 follow-up (Low). The route-level `preference` leaf
+    is typed `ValueInteger` + `ValidateInteger(0, maxWireI32)` at the Go commit
+    boundary (#3771), but the `qualified-next-hop <addr> preference <n>` leaf
+    (schema_routing.go) was UNTYPED. The compiler folds a qualified-next-hop
+    preference into the same `route.Preference` i32 wire field
+    (compiler_routing.go), so a negative / i32-overflow preference expressed
+    via the qualified-next-hop syntax bypassed the primary Go gate and was
+    caught only by the Rust `RoutePreferenceOutOfRange` backstop — an opaque
+    snapshot rejection with retained-prior-state instead of a commit error
+    naming the leaf. FIX: mirror the exact route-level typing onto the qnh
+    `preference` leaf (reuse the existing `maxWireI32` const). Go-only, no wire
+    change. RED-on-revert: reverting the typing makes negative / overflow qnh
+    preferences accept again, so the reject assertions fire RED (verified by
+    temporarily reverting: `-1` accepted, tests FAIL). Valid qnh
+    preference/metric/interface still commit. `go test ./pkg/config/...` green,
+    `go build ./...` green, gofmt + vet clean.
+  - **File(s)**: pkg/config/schema_routing.go,
+    pkg/config/schema_route_qnh_preference_3827_test.go, docs/config-schema.md
+
 ## 2026-07-01 — #3756 H14: attributes-match static per-test string fields
 
 - **Timestamp**: 2026-07-01
