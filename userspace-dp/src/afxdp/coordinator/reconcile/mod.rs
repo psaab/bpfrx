@@ -21,6 +21,45 @@ pub(super) mod reset;
 pub(super) mod snapshot;
 pub(super) mod teardown;
 
+/// #3789: the outcome of a full-`reconcile` that aborted in one of the
+/// PRE-TEARDOWN legs (policy preflight, mandatory-map preflight, or the
+/// `build_reconcile_forwarding` integrity build). Before this change
+/// `reconcile` returned `()` and the control-socket `apply_snapshot`
+/// handler could not tell an aborted reconcile from a successful one — so
+/// on the non-same-plan full-apply leg and the same-plan
+/// `needs_reconcile` leg it stored the rejected snapshot as the boot
+/// baseline, set `persist_state`, and acked `ok=true` (the M1 class #3766
+/// fixed for the same-plan *refresh* leg). Returning the failure lets the
+/// handler mirror #3766: report `ok=false`, restore the prior snapshot +
+/// status fields, and NOT persist.
+///
+/// Every variant is raised ONLY by a pre-teardown early return, where
+/// #2440/#2484 keep the prior workers + forwarding + published generation
+/// fully live. The handler restore is therefore a status/bookkeeping
+/// rollback, not a forwarding recovery — the data plane never moved.
+#[derive(Debug)]
+pub(crate) enum ReconcileError {
+    /// A snapshot integrity fault surfaced by the top-of-reconcile policy
+    /// preflight or by the pre-teardown forwarding build
+    /// (`build_reconcile_forwarding`: invalid interface address, CoS
+    /// queue, NAT64 / NPTv6 / filter rule, ...).
+    Integrity(crate::policy::SnapshotIntegrityError),
+    /// A mandatory BPF map pin was missing or its FD failed to open
+    /// (`preflight_map_fds`), or `apply_snapshot` returned `None`
+    /// (defensively unreachable post-#2484). Carries the
+    /// `last_reconcile_stage` descriptor for the control-plane error.
+    MapSetup(String),
+}
+
+impl std::fmt::Display for ReconcileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReconcileError::Integrity(err) => write!(f, "{err}"),
+            ReconcileError::MapSetup(stage) => write!(f, "map setup failed ({stage})"),
+        }
+    }
+}
+
 /// State preserved across `stop_inner(false)` that the later phases
 /// need to consume. `had_live_workers` lives entirely inside
 /// `teardown.rs` (it gates the 500ms mlx5 quiesce sleep alongside the
@@ -96,7 +135,7 @@ impl Coordinator {
         snapshot: Option<&ConfigSnapshot>,
         bindings: &mut [BindingStatus],
         ring_entries: usize,
-    ) {
+    ) -> Result<(), ReconcileError> {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
         // #1606 (AGY r2 finding 4.2): policy-integrity preflight
@@ -129,7 +168,9 @@ impl Coordinator {
                     err
                 );
                 self.last_reconcile_stage = format!("snapshot_integrity_error: {}", err);
-                return;
+                // #3789: surface the reject so the control handler fails
+                // closed instead of persisting the rejected snapshot.
+                return Err(ReconcileError::Integrity(err));
             }
         }
         // #2440 fail-open partial-apply fix: open the mandatory BPF map
@@ -154,7 +195,9 @@ impl Coordinator {
                 None => {
                     // last_reconcile_stage + per-binding last_error set
                     // inside preflight_map_fds. No teardown, no publish.
-                    return;
+                    // #3789: surface the reject (missing / unopenable
+                    // mandatory pin) so the handler fails closed.
+                    return Err(ReconcileError::MapSetup(self.last_reconcile_stage.clone()));
                 }
             };
             // #2484 fail-open partial-apply fix (completes the #2440/#2444
@@ -178,11 +221,14 @@ impl Coordinator {
             // before teardown.
             match snapshot::build_reconcile_forwarding(self, snap) {
                 Ok(forwarding) => fds.forwarding = forwarding,
-                Err(()) => {
+                Err(err) => {
                     // last_reconcile_stage = "snapshot_integrity_error" set
                     // inside build_reconcile_forwarding. No teardown, no
                     // publish: prior generation + workers stay live.
-                    return;
+                    // #3789: surface the integrity error so the control
+                    // handler fails closed on the full-reconcile legs
+                    // instead of persisting the rejected snapshot.
+                    return Err(ReconcileError::Integrity(err));
                 }
             }
             Some(fds)
@@ -219,7 +265,9 @@ impl Coordinator {
             // stage so the operator-visible state is consistent on return.
             self.refresh_bindings(bindings);
             self.last_reconcile_stage = "no_snapshot".to_string();
-            return;
+            // #3789: a config-cleared / shutdown teardown is a successful
+            // reconcile (the caller intentionally passed no snapshot).
+            return Ok(());
         };
         // SAFETY: preflight_fds is Some whenever snapshot is Some (both
         // gated on the same `snapshot` Option above).
@@ -240,7 +288,12 @@ impl Coordinator {
             &mut preserved.synced_sessions,
             fds,
         ) else {
-            return;
+            // #2484: defensively unreachable — the build already succeeded
+            // in the pre-teardown preflight and apply_snapshot reuses it.
+            // #3789: still surface a reject rather than a false ok if it
+            // ever fires (teardown already ran here, so this is a
+            // fail-closed backstop, not a prior-state restore).
+            return Err(ReconcileError::MapSetup(self.last_reconcile_stage.clone()));
         };
         bringup::bring_up_workers(
             self,
@@ -251,5 +304,6 @@ impl Coordinator {
             preserved.synced_sessions,
         );
         self.refresh_bindings(bindings);
+        Ok(())
     }
 }

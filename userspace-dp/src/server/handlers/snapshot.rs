@@ -105,8 +105,33 @@ pub(super) fn apply(
         );
         if needs_reconcile {
             eprintln!("CTRL_REQ: same-plan apply_snapshot reconciling deferred bindings");
-            guard.snapshot = Some(snapshot);
-            reconcile_status_bindings(guard);
+            // #3789: the deferred-binding reconcile runs the FALLIBLE
+            // pre-teardown build (build_reconcile_forwarding). A snapshot
+            // that passed the policy preflight above can still fail a
+            // non-policy integrity check (invalid interface address, CoS
+            // queue, NAT64 / NPTv6 rule, ...) or a mandatory-map open.
+            // Per #2440/#2484 the reconcile aborts BEFORE teardown, so the
+            // prior workers + forwarding + generation stay live. Mirror the
+            // same-plan refresh leg (#3766): install the new snapshot for
+            // the reconcile, but on failure restore the prior snapshot +
+            // status fields, report ok=false, and do NOT persist — a
+            // rejected snapshot must never become the boot baseline nor be
+            // acked ok=true.
+            let prev_snapshot = std::mem::replace(&mut guard.snapshot, Some(snapshot));
+            if let Err(err) = reconcile_status_bindings(guard) {
+                guard.snapshot = prev_snapshot;
+                guard.status.last_snapshot_generation = prev_last_snapshot_generation;
+                guard.status.last_fib_generation = prev_last_fib_generation;
+                guard.status.last_snapshot_at = prev_last_snapshot_at;
+                guard.status.capabilities = prev_capabilities;
+                response.ok = false;
+                response.error = format!("snapshot integrity error: {}", err);
+                eprintln!(
+                    "CTRL_REQ: same-plan apply_snapshot rejected (integrity build): {} — keeping previous state",
+                    err
+                );
+                return;
+            }
         } else {
             // #1866 (PR-review Codex r1 F1 + r2): refresh_runtime_snapshot
             // reconciles WG control threads for the running case
@@ -172,7 +197,7 @@ pub(super) fn apply(
                 .afxdp
                 .prune_local_tunnel_sources_for_snapshot(&snapshot);
         }
-        guard.snapshot = Some(snapshot);
+        let prev_snapshot = std::mem::replace(&mut guard.snapshot, Some(snapshot));
         let replanned = replan_queues(
             guard.snapshot.as_ref(),
             guard.status.workers,
@@ -183,8 +208,29 @@ pub(super) fn apply(
             eprintln!(
                 "CTRL_REQ: apply_snapshot defer_workers=true — skipping worker spawn (RETH MAC pending)"
             );
-        } else {
-            reconcile_status_bindings(guard);
+        } else if let Err(err) = reconcile_status_bindings(guard) {
+            // #3789: full-reconcile leg fail-closed (the #2484 domain, out
+            // of #3766's same-plan-refresh scope). reconcile_status_bindings
+            // ran the fallible pre-teardown build; on a non-policy integrity
+            // failure — or a missing / unopenable mandatory map pin — the
+            // reconcile aborted BEFORE teardown (#2440/#2484), so the prior
+            // workers + forwarding + generation are still live. Restore the
+            // prior snapshot, bindings, and status-reporting fields, report
+            // ok=false, and do NOT persist — the rejected snapshot must not
+            // become the boot baseline nor be acked ok=true.
+            guard.snapshot = prev_snapshot;
+            guard.status.bindings = existing_bindings;
+            guard.status.last_snapshot_generation = prev_last_snapshot_generation;
+            guard.status.last_fib_generation = prev_last_fib_generation;
+            guard.status.last_snapshot_at = prev_last_snapshot_at;
+            guard.status.capabilities = prev_capabilities;
+            response.ok = false;
+            response.error = format!("snapshot integrity error: {}", err);
+            eprintln!(
+                "CTRL_REQ: apply_snapshot rejected (integrity build): {} — keeping previous state",
+                err
+            );
+            return;
         }
         refresh_status(guard);
         *persist_state = true;

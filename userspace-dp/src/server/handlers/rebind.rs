@@ -43,7 +43,11 @@ pub(super) fn handle(guard: &mut ServerState, persist_state: &mut bool) {
         binding.ready = false;
         binding.last_error.clear();
     }
-    reconcile_status_bindings(guard);
+    // #3789: rebind re-creates the AF_XDP sockets for the ALREADY-ACCEPTED
+    // stored snapshot after a link DOWN/UP cycle — it does not introduce a
+    // new config, so a reconcile reject cannot persist a rejected snapshot
+    // here. Discard the outcome explicitly.
+    let _ = reconcile_status_bindings(guard);
     refresh_status(guard);
     *persist_state = true;
     eprintln!(

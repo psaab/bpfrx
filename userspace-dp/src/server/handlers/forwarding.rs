@@ -31,7 +31,12 @@ pub(super) fn set(
     }
     guard.status.forwarding_armed = forwarding_req.armed;
     set_bindings_forwarding_armed(&mut guard.status, forwarding_req.armed);
-    reconcile_status_bindings(guard);
+    // #3789: arming/disarming reconciles the ALREADY-ACCEPTED stored
+    // snapshot (a forwarding-state toggle, not a new config). A build
+    // reject here would surface via the per-binding last_error, and there
+    // is no newly-supplied snapshot to reject — discard the outcome
+    // explicitly.
+    let _ = reconcile_status_bindings(guard);
     if forwarding_req.armed {
         wait_for_binding_settle(guard, Duration::from_secs(2));
     }

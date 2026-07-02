@@ -520,7 +520,9 @@ pub(crate) fn parse_session_sync_mac(value: &str) -> Result<Option<[u8; 6]>, Str
     Ok(Some(out))
 }
 
-pub(crate) fn reconcile_status_bindings(state: &mut ServerState) {
+pub(crate) fn reconcile_status_bindings(
+    state: &mut ServerState,
+) -> Result<(), afxdp::ReconcileError> {
     if !should_run_afxdp(&state.status) {
         state.afxdp.stop();
         // #2794: route the disarmed-forwarding teardown through
@@ -542,15 +544,21 @@ pub(crate) fn reconcile_status_bindings(state: &mut ServerState) {
         let mut bindings = std::mem::take(&mut state.status.bindings);
         state.afxdp.refresh_bindings(&mut bindings);
         state.status.bindings = bindings;
-        return;
+        // A disarmed reconcile is a stop/teardown — always successful.
+        return Ok(());
     }
     let snapshot = state.snapshot.clone();
     let ring_entries = state.status.ring_entries;
     let mut bindings = std::mem::take(&mut state.status.bindings);
-    state
+    // #3789: propagate the reconcile outcome. A pre-teardown abort
+    // (integrity / mandatory-map failure) leaves the prior workers +
+    // forwarding + generation live (#2440/#2484); the caller uses the
+    // Err to fail closed instead of persisting a rejected snapshot.
+    let result = state
         .afxdp
         .reconcile(snapshot.as_ref(), &mut bindings, ring_entries);
     state.status.bindings = bindings;
+    result
 }
 
 pub(crate) fn should_run_afxdp(status: &ProcessStatus) -> bool {
