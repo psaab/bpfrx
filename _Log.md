@@ -26894,3 +26894,41 @@ top.
     (wire FlowExportBatchStatsFn), pkg/api/server.go + metrics.go +
     metrics_descriptors.go + metrics_system.go (xpf_flow_export_batch_* family),
     pkg/flowexport/README.md (Bounded export batch section)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fix #3770 + #3772 in the pkg/dataplane/userspace route-snapshot
+    builder (codex-review-161 H8/M10/M7 + M9/M8), one PR / two commits.
+    #3770: (H8) the dedupe key omitted Discard and Preference, so a discard
+    route and a normal route to the same prefix, or two routes differing only
+    in preference (a static next-table route vs. its preference-0 ip-rule
+    mirror), collided and one was silently dropped before the Rust FIB saw it
+    — added both fields to the key. (M10) the final sort was sort.Slice
+    (unstable) keyed only on Table/Family/Destination, so once same-prefix
+    routes coexist their order tracked non-deterministic build inputs and
+    churned the snapshot — switched to sort.SliceStable with a TOTAL order
+    (next-hops, next-table, discard, preference tie-breakers). (M7) the
+    ip-monitoring overlay route was built with no Preference (default 0),
+    diverging from the documented Static/1 (preference 1) FRR render — now
+    stamps Preference: 1. #3772: (M9) a netlink.RuleList failure was swallowed
+    with `continue`, dropping every route-leak snapshot for that family while
+    the kernel/FRR leak path stayed up — buildRouteSnapshots now returns an
+    error (indirected via a ruleListFn seam) surfaced through builder.go and
+    manager.go so the apply path fails closed and retains prior state (mirrors
+    #3731). (M8) canonicalRoutePrefix returned the raw string on a parse
+    failure despite its "returns empty" doc and the caller's skip guard — now
+    returns "" so a malformed overlay destination is skipped, not injected as
+    a garbage FIB prefix. RED-on-revert tests added for all five: discard +
+    connected survive dedupe; distinct-preference survive dedupe; sort order
+    is identical regardless of input order; overlay carries preference 1;
+    RuleList error is surfaced; canonicalRoutePrefix returns "" and the
+    overlay skips an unparseable destination. go test ./pkg/dataplane/... +
+    ./pkg/routing/... green; go build ./... green; gofmt + vet clean.
+  - **File(s)**: pkg/dataplane/userspace/routes.go (dedupe key, SliceStable
+    total-order sort, overlay Preference:1, ruleListFn seam + surfaced error,
+    canonicalRoutePrefix ""), pkg/dataplane/userspace/builder.go +
+    pkg/dataplane/userspace/manager.go (propagate the route-build error),
+    pkg/dataplane/userspace/routes_dedupe_3770_test.go (new),
+    pkg/dataplane/userspace/routes_rulelist_3772_test.go (new),
+    pkg/dataplane/userspace/{route_overlay,fbf_snapshot,routes_fib_metadata,manager}_test.go
+    (2-value call updates), docs/userspace-dataplane-architecture.md +
+    docs/multi-wan.md (route-snapshot invariants)

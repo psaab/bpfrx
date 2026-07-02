@@ -2539,7 +2539,10 @@ func TestBuildRouteSnapshotsNormalizesFamilyFromDestination(t *testing.T) {
 			},
 		},
 	}
-	routes := buildRouteSnapshots(cfg, nil, nil)
+	routes, err := buildRouteSnapshots(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(routes) != 2 {
 		t.Fatalf("len(routes) = %d, want 2", len(routes))
 	}
@@ -2552,7 +2555,7 @@ func TestBuildRouteSnapshotsNormalizesFamilyFromDestination(t *testing.T) {
 }
 
 func TestBuildRouteSnapshotsIncludesConnectedPrefixes(t *testing.T) {
-	routes := buildRouteSnapshots(&config.Config{}, []InterfaceSnapshot{
+	routes, err := buildRouteSnapshots(&config.Config{}, []InterfaceSnapshot{
 		{
 			Name: "reth1.0",
 			Addresses: []InterfaceAddressSnapshot{
@@ -2562,6 +2565,9 @@ func TestBuildRouteSnapshotsIncludesConnectedPrefixes(t *testing.T) {
 			},
 		},
 	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(routes) != 2 {
 		t.Fatalf("len(routes) = %d, want 2", len(routes))
 	}

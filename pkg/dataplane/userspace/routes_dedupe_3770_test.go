@@ -28,7 +28,10 @@ func TestRouteSnapshotDedupeKeepsDiscardAndConnected(t *testing.T) {
 		},
 	}
 
-	routes := buildRouteSnapshots(cfg, ifaces, nil)
+	routes, err := buildRouteSnapshots(cfg, ifaces, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var haveDiscard, haveConnected bool
 	count := 0
@@ -58,7 +61,10 @@ func TestRouteSnapshotDedupeKeepsDistinctPreference(t *testing.T) {
 		{Destination: "10.5.0.0/16", NextTable: "blue.inet.0", Preference: 5},
 		{Destination: "10.5.0.0/16", NextTable: "blue.inet.0", Preference: 0},
 	}
-	routes := buildRouteSnapshots(cfg, nil, nil)
+	routes, err := buildRouteSnapshots(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	count := 0
 	for _, r := range routes {
 		if r.Table == "inet.0" && r.Destination == "10.5.0.0/16" && r.NextTable == "blue.inet.0" {
@@ -90,8 +96,14 @@ func TestRouteSnapshotSortIsDeterministic(t *testing.T) {
 		{Destination: "10.5.0.0/16", NextTable: "aaa.inet.0"},
 	}
 
-	got1 := buildRouteSnapshots(forward, nil, nil)
-	got2 := buildRouteSnapshots(reverse, nil, nil)
+	got1, err := buildRouteSnapshots(forward, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := buildRouteSnapshots(reverse, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(got1, got2) {
 		t.Fatalf("route order depends on input order (non-deterministic):\n forward=%+v\n reverse=%+v", got1, got2)
 	}
@@ -116,7 +128,10 @@ func TestRouteOverlayCarriesStaticPreference(t *testing.T) {
 	overlay := []config.RouteOverlayEntry{
 		{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
 	}
-	routes := buildRouteSnapshots(cfg, nil, overlay)
+	routes, err := buildRouteSnapshots(cfg, nil, overlay)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	found := false
 	for _, r := range routes {

@@ -264,7 +264,9 @@ Semantics (verified against Junos in the plan's research rounds):
   withdrawn.
 - The injected route has **route preference 1** (`Static/1`) — that is
   what makes it "preferred" over static (AD 5) and DHCP (AD 200)
-  routes.
+  routes. The userspace route snapshot now stamps this preference on the
+  overlay `RouteSnapshot` too (#3770 M7); before, the snapshot route
+  defaulted to preference 0 and diverged from the FRR distance-1 render.
 - `preferred-metric` is the tie-break **among injected routes for the
   same prefix** (two policies in FAIL both injecting 0/0): lowest
   metric wins, then lexicographic policy name. The engine resolves the

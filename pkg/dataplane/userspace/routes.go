@@ -12,14 +12,27 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// ruleListFn is the netlink ip-rule enumerator, indirected so tests can
+// inject a transient failure and assert it is surfaced (#3772 M9).
+var ruleListFn = netlink.RuleList
+
 // buildRouteSnapshots derives the helper FIB from config statics,
 // connected prefixes, and ip-rule leak rules, then applies the
 // ip-monitoring route overlay (#1827 PR-1b): each overlay entry
 // REPLACES the entire (table, family, prefix) entry set — never merges
 // next-hops — so an ECMP half-override is impossible by construction.
-func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, overlay []config.RouteOverlayEntry) []RouteSnapshot {
+//
+// It returns an error when the kernel ip-rule enumeration fails (#3772
+// M9): the synthetic rib-group / next-table leak routes are derived from
+// the live ip-rule table, so a transient RuleList failure must fail the
+// whole snapshot build closed (the apply path then retains the prior
+// dataplane state) rather than silently emitting a PARTIAL snapshot that
+// drops every route-leak route for that family while the kernel/FRR leak
+// path stays up — a divergence with no signal. Mirrors #3731's
+// surface-don't-swallow contract on the RuleAdd (write) side.
+func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, overlay []config.RouteOverlayEntry) ([]RouteSnapshot, error) {
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
 	out := make([]RouteSnapshot, 0)
 	seen := make(map[string]struct{})
@@ -124,9 +137,12 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 		}
 	}
 	for _, family := range []int{syscall.AF_INET, syscall.AF_INET6} {
-		rules, err := netlink.RuleList(family)
+		rules, err := ruleListFn(family)
 		if err != nil {
-			continue
+			// #3772 (M9): do NOT swallow. A partial snapshot missing this
+			// family's route-leak routes would blackhole or policy-bypass
+			// inter-VRF traffic that the kernel/FRR still routes.
+			return nil, fmt.Errorf("route snapshot: list ip-rules for family %d: %w", family, err)
 		}
 		for _, rule := range rules {
 			if rule.Dst == nil || rule.Table <= 0 {
@@ -187,7 +203,7 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 		}
 		return a.Preference < b.Preference
 	})
-	return out
+	return out, nil
 }
 
 // applyRouteOverlay folds the winner-resolved ip-monitoring overlay
@@ -249,12 +265,17 @@ func overlayTableFamily(entry config.RouteOverlayEntry) (string, string) {
 	return table, family
 }
 
-// canonicalRoutePrefix mask-normalizes a CIDR for overlay matching;
-// returns "" for unparseable strings (left untouched).
+// canonicalRoutePrefix mask-normalizes a CIDR for overlay matching and
+// returns "" when the input does not parse as a CIDR (#3772 M8). The
+// caller in applyRouteOverlay treats "" as "skip this entry", so an
+// overlay destination that fails to parse is dropped rather than being
+// injected into the FIB verbatim as a garbage prefix. Previously the
+// function returned the raw string, contradicting this contract and its
+// own doc comment, and let a malformed overlay destination through.
 func canonicalRoutePrefix(s string) string {
 	_, n, err := net.ParseCIDR(s)
 	if err != nil || n == nil {
-		return s
+		return ""
 	}
 	return n.String()
 }

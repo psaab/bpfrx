@@ -801,6 +801,39 @@ ConfigSnapshot {
 }
 ```
 
+**Route-snapshot construction invariants (`buildRouteSnapshots`,
+`pkg/dataplane/userspace/routes.go`).** The builder derives the `routes`
+section from config statics, connected prefixes, and the kernel ip-rule
+mirror (rib-group / next-table leaks), then folds the ip-monitoring
+overlay. Four correctness invariants (#3770/#3772):
+
+- **Dedupe by full identity.** The per-route dedupe key is
+  `Table|Family|Destination|NextHops|NextTable|Discard|Preference`. A
+  discard (blackhole) route and a normal route to the same prefix are
+  DISTINCT decisions, and two routes differing only in preference (a
+  static next-table route vs. its preference-0 ip-rule mirror) must both
+  reach the Rust FIB so `sort_routes` (`fib.rs`) can apply its
+  preference tie-break. Omitting Discard/Preference from the key
+  (pre-#3770) silently dropped one of a colliding pair.
+- **Deterministic emission order.** The final sort is `SliceStable` over
+  a TOTAL order — Table, Family, Destination, then NextHops, NextTable,
+  Discard, Preference. Once same-prefix routes coexist, a partial
+  comparator + unstable sort let their order track non-deterministic
+  build inputs (map iteration, kernel ip-rule order), churning the
+  snapshot hash and re-installing the FIB for an unchanged config.
+- **ip-rule read is fail-closed.** A `netlink.RuleList` failure is
+  SURFACED as a build error (not swallowed), so the apply path retains
+  the prior dataplane state instead of shipping a partial snapshot that
+  drops every route-leak route for that family while the kernel/FRR leak
+  path stays up. This mirrors #3731's surface-don't-swallow contract on
+  the RuleAdd (write) side.
+- **Overlay carries Static/1.** The ip-monitoring overlay route is
+  emitted at route preference 1 (the documented `Static/1`,
+  `PreferredRoute` contract in `pkg/config/types_system.go`), matching
+  the FRR managed-section distance-1 render. An unparseable overlay
+  destination is skipped (`canonicalRoutePrefix` returns `""`) rather
+  than injected verbatim as a garbage FIB prefix.
+
 **Dynamic-address feed overlay (#2049).** The snapshot's address books carry
 the live `security dynamic-address` feed prefixes, not just the static
 `security address-book`. The daemon joins each `address-name ... profile
