@@ -34,10 +34,10 @@ func TestIPFIXTemplateV4_PostNATFields(t *testing.T) {
 	n := len(ipfixTemplateV4)
 	got := ipfixTemplateV4[n-4:]
 	want := []ipfixField{
-		{wantElemPostNatSrcIPv4, 4},
-		{wantElemPostNatDstIPv4, 4},
-		{wantElemPostNapatSrc, 2},
-		{wantElemPostNapatDst, 2},
+		{wantElemPostNatSrcIPv4, 4, 0},
+		{wantElemPostNatDstIPv4, 4, 0},
+		{wantElemPostNapatSrc, 2, 0},
+		{wantElemPostNapatDst, 2, 0},
 	}
 	for i := range want {
 		if got[i] != want[i] {
@@ -52,8 +52,8 @@ func TestIPFIXTemplateV4_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV4 {
 		t.Fatalf("ipfixRecordSizeV4 = %d, want sum(template) = %d", ipfixRecordSizeV4, sum)
 	}
-	if ipfixRecordSizeV4 != 70 {
-		t.Fatalf("ipfixRecordSizeV4 = %d, want 70 (pre-NAT 45 + 2 src/dst mask (#2866) + 4 ingressInterface (#2749) + 7 CoS/egress (#2749: ipClassOfService 1 + tcpControlBits 2 + egressInterface 4) + 12 post-NAT)", ipfixRecordSizeV4)
+	if ipfixRecordSizeV4 != 86 {
+		t.Fatalf("ipfixRecordSizeV4 = %d, want 86 (pre-NAT 45 + 2 src/dst mask (#2866) + 4 ingressInterface (#2749) + 7 CoS/egress (#2749: ipClassOfService 1 + tcpControlBits 2 + egressInterface 4) + 16 biflow reverse (#3746) + 12 post-NAT)", ipfixRecordSizeV4)
 	}
 }
 
@@ -61,10 +61,10 @@ func TestIPFIXTemplateV6_PostNATFields(t *testing.T) {
 	n := len(ipfixTemplateV6)
 	got := ipfixTemplateV6[n-4:]
 	want := []ipfixField{
-		{wantElemPostNatSrcIPv6, 16},
-		{wantElemPostNatDstIPv6, 16},
-		{wantElemPostNapatSrc, 2},
-		{wantElemPostNapatDst, 2},
+		{wantElemPostNatSrcIPv6, 16, 0},
+		{wantElemPostNatDstIPv6, 16, 0},
+		{wantElemPostNapatSrc, 2, 0},
+		{wantElemPostNapatDst, 2, 0},
 	}
 	for i := range want {
 		if got[i] != want[i] {
@@ -78,8 +78,8 @@ func TestIPFIXTemplateV6_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV6 {
 		t.Fatalf("ipfixRecordSizeV6 = %d, want sum(template) = %d", ipfixRecordSizeV6, sum)
 	}
-	if ipfixRecordSizeV6 != 118 {
-		t.Fatalf("ipfixRecordSizeV6 = %d, want 118 (pre-NAT 69 + 2 src/dst mask (#2866) + 4 ingressInterface (#2749) + 7 CoS/egress (#2749) + 36 post-NAT)", ipfixRecordSizeV6)
+	if ipfixRecordSizeV6 != 134 {
+		t.Fatalf("ipfixRecordSizeV6 = %d, want 134 (pre-NAT 69 + 2 src/dst mask (#2866) + 4 ingressInterface (#2749) + 7 CoS/egress (#2749) + 16 biflow reverse (#3746) + 36 post-NAT)", ipfixRecordSizeV6)
 	}
 }
 
