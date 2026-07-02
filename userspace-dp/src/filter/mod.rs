@@ -543,6 +543,22 @@ impl CachedFilterCounters {
             f(counter);
         }
     }
+
+    /// #3777: drop any counter already present in `other` (by `Arc` identity).
+    /// The cos TX-selection rebuild (`resolve_cached_cos_tx_selection`) folds an
+    /// interface INPUT filter's `then count` handles into
+    /// `tx_selection.filter_counters` when the egress interface carries no
+    /// output filter. The dedicated input-filter replay set
+    /// (`RewriteDescriptor::input_filter_counters`) captures the SAME handles, so
+    /// without this dedup a count-plus-forwarding-class input term would be
+    /// recorded TWICE per cache hit. Called once at flow-cache install (seed),
+    /// never on the per-packet hit path. Both sets are `SmallVec`s with inline
+    /// capacity 2, so this is a bounded O(n*m) identity scan off the hot path.
+    #[inline]
+    pub(crate) fn retain_absent_from(&mut self, other: &CachedFilterCounters) {
+        self.counters
+            .retain(|counter| !other.counters.iter().any(|o| Arc::ptr_eq(o, counter)));
+    }
 }
 
 impl ThreeColorPolicerRuntime {

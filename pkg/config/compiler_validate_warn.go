@@ -1630,6 +1630,20 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 		p, ok := catalog[provider]
 		return ok && p != nil && p.Backend == "duckdns"
 	}
+	// #3738: dyndns2 has only a HOSTNAME-level withdraw verb (offline=YES takes
+	// down BOTH the A and the AAAA). Unlike DuckDNS its per-family UPDATE is fine
+	// (myip= sets one family without auto-detecting the other), so the fight is
+	// only on WITHDRAW. Track dyndns2 (provider, FQDN) bindings per family so a
+	// dual-stack same-name dyndns2 scope is flagged too (DuckDNS was already
+	// commit-warned; dyndns2 was not — the codex-157 M06 gap).
+	dyndns2Families := map[duckKey][]string{}
+	isDyndns2 := func(provider string) bool {
+		if provider == "" || catalog == nil {
+			return false
+		}
+		p, ok := catalog[provider]
+		return ok && p != nil && p.Backend == "dyndns2"
+	}
 	if cfg.Interfaces.Interfaces != nil {
 		ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
 		for n := range cfg.Interfaces.Interfaces {
@@ -1674,6 +1688,12 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 						k := duckKey{provider: d.Provider, fqdn: strings.ToLower(strings.TrimSuffix(d.Hostname, "."))}
 						duckFamilies[k] = append(duckFamilies[k], family)
 					}
+					// #3738: record dyndns2 (provider, FQDN) bindings per family so a
+					// dual-stack dyndns2 name (host-level offline withdraw) is flagged.
+					if d.Hostname != "" && isDyndns2(d.Provider) {
+						k := duckKey{provider: d.Provider, fqdn: strings.ToLower(strings.TrimSuffix(d.Hostname, "."))}
+						dyndns2Families[k] = append(dyndns2Families[k], family)
+					}
 				}
 				check("inet", unit.DynamicDNSInet)
 				check("inet6", unit.DynamicDNSInet6)
@@ -1704,6 +1724,37 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 			"inet6: DuckDNS auto-detects and overwrites the family whose address is "+
 			"omitted, so the two scopes clobber each other's A/AAAA on every "+
 			"reconcile. Bind a DuckDNS name to a single family.", k.provider, k.fqdn))
+	}
+
+	// #3738: a single dyndns2 name bound on BOTH inet and inet6 shares one
+	// hostname whose only withdraw verb (offline=YES) is HOST-level — it takes
+	// both families down. A single-family withdraw therefore cannot be expressed
+	// on the wire. The runtime now SUPPRESSES the offline while the sibling family
+	// is still published (pkg/ddns backend_dyndns2 DeleteLease, #3738), so the
+	// live sibling is preserved — but the withdrawn family's record is left stale
+	// until the sibling is also withdrawn. Warn so the operator can prefer
+	// separate hostnames per family for a clean per-family teardown.
+	dyndns2Names := make([]duckKey, 0, len(dyndns2Families))
+	for k, fams := range dyndns2Families {
+		if hasFamily(fams, "inet") && hasFamily(fams, "inet6") {
+			dyndns2Names = append(dyndns2Names, k)
+		}
+	}
+	sort.Slice(dyndns2Names, func(i, j int) bool {
+		if dyndns2Names[i].provider != dyndns2Names[j].provider {
+			return dyndns2Names[i].provider < dyndns2Names[j].provider
+		}
+		return dyndns2Names[i].fqdn < dyndns2Names[j].fqdn
+	})
+	for _, k := range dyndns2Names {
+		warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+			"provider %q (backend dyndns2) hostname %q is bound on BOTH inet and "+
+			"inet6: dyndns2's withdraw verb (offline=YES) is HOSTNAME-level and takes "+
+			"both families down, so a single-family withdraw cannot be expressed on "+
+			"the wire. xpf suppresses the offline while the sibling family is still "+
+			"published (the live sibling is preserved; the withdrawn family's record "+
+			"is left stale). Use separate hostnames per family for a clean per-family "+
+			"teardown.", k.provider, k.fqdn))
 	}
 	return warnings
 }

@@ -26844,6 +26844,73 @@ top.
     pkg/flowexport/README.md (#3744 section + file-layout bullet)
 
 - **Timestamp**: 2026-07-01
+  - **Action**: #3777 — replay interface INPUT filter `then count` on flow-cache
+    hits. Output/TX `then count` handles were replayed on every hit since #2573
+    but the INPUT side captured only a log descriptor, so an input `then count`
+    reported only the seed packet of an N-packet cacheable flow. Added
+    `RewriteDescriptor::input_filter_counters` + a capture walk
+    (`evaluate_interface_input_filter_counters_cached`) that mirrors the
+    `Always`-policy non-routing walk (defers at a routing-instance/PBR term so
+    its count stays owned by the routing evaluator, #2620), captured once at seed
+    and deduped against `tx_selection.filter_counters` (`retain_absent_from`) so a
+    count-plus-forwarding-class input term is not recorded twice. Replayed on the
+    hit path alongside the output counters. RED-on-revert:
+    `txn_flow_cache_hit_replays_input_filter_then_count_3777` (counter reads 1 not
+    2 without the replay). flow_cache/filter/cos tests green.
+  - **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs (capture fn),
+    userspace-dp/src/filter/engine/mod.rs (re-export),
+    userspace-dp/src/filter/mod.rs (CachedFilterCounters::retain_absent_from),
+    userspace-dp/src/afxdp/flow_cache.rs (RewriteDescriptor field + dedup in
+    from_forward_decision), userspace-dp/src/afxdp/poll_descriptor/filter.rs
+    (evaluate_non_pbr_input_filter_counters_cached),
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs (seed capture),
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (replay),
+    userspace-dp/src/afxdp/tests.rs (RED-on-revert), userspace-dp/src/afxdp/README.md,
+    plus RewriteDescriptor test-literal updates across afxdp test modules
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3778 — re-run the CoS behavior-aggregate (DSCP / IEEE 802.1p
+    PCP) classifier per packet on the flow-cache hit path. The cached
+    TX-selection resolved the queue from the SEED packet's DSCP/PCP and the
+    flow-cache key excludes both, so a mixed-marking flow was pinned to the first
+    packet's queue. Added `CachedTxSelectionDescriptor::ba_reclassify` (set at
+    seed when the queue is NOT pinned by a filter forwarding-class AND a BA
+    classifier is configured on the egress interface) + `reclassify_cached_ba_queue`;
+    `flow_cache_hit.rs` re-resolves the queue from the current packet's DSCP/PCP
+    when the flag is set, otherwise keeps the frozen queue. RED-on-revert:
+    `txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778` (a DSCP-0 seed then
+    a DSCP-46 EF hit; without the re-classify the hit replays queue 0 not the EF
+    queue 1).
+  - **File(s)**: userspace-dp/src/afxdp/flow_cache.rs (ba_reclassify field),
+    userspace-dp/src/afxdp/tx/cos_classify.rs (split fc/BA queue resolution +
+    ba_reclassify + reclassify_cached_ba_queue),
+    userspace-dp/src/afxdp/tx/mod.rs (re-export),
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (per-packet
+    re-resolve), userspace-dp/src/afxdp/umem/tests.rs (literal),
+    userspace-dp/src/afxdp/tests.rs (RED-on-revert + CoS imports),
+    userspace-dp/src/afxdp/README.md
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3779 — hoist the TTL/hop-limit check ABOVE the egress side
+    effects on the flow-cache hit path. Previously the output `then count`
+    replay, policy hit counter, three-color policers, filter logs, and the
+    terminal drop all ran before the TTL check, so a TTL=1 packet on a
+    red-policer / terminal-output-drop cached flow was dropped/charged with no
+    ICMP Time Exceeded, and every expiring packet charged counters/logs for
+    traffic that never egressed. Moved the `packet_ttl_would_expire` +
+    `build_local_time_exceeded_request` check to the top of the hit path (for
+    ForwardCandidate/FabricRedirect); a would-expire packet becomes a TE reply,
+    or (TE suppressed) is dropped, in both cases before any egress accounting.
+    Removed the now-redundant TTL check from the forward fast path. Made
+    `packet_ttl_would_expire` a non-test import in afxdp/mod.rs. RED-on-revert:
+    `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779` (a TTL=1
+    cache-hit packet on an output-`then count` flow leaves the counter at 1;
+    reverting the hoist charges it to 2). observed_bytes/active-epoch stamping
+    left as SEEN telemetry (deliberate, documented).
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (hoist +
+    remove redundant check), userspace-dp/src/afxdp/mod.rs (packet_ttl_would_expire
+    import), userspace-dp/src/afxdp/tests.rs (RED-on-revert),
+    userspace-dp/src/afxdp/README.md
   - **Action**: #3726 — NAT `appPortsFromSpec` rejects a reversed
     application port range instead of narrowing it to the low port.
     Root cause: `appPortsFromSpec` (pkg/dataplane/userspace/nat.go)
@@ -27043,3 +27110,39 @@ top.
     (gRPC MatchPolicies + `test policy` branches), pkg/cli/cli_show_security.go +
     pkg/cli/cli_request.go (CLI branches), pkg/policymatch/README.md
     (content-rejected verdict section)
+## 2026-07-01 — #3738 DDNS dual-stack same-name withdraw preserves the sibling family (codex-157 H10/M06)
+
+- **Timestamp**: 2026-07-01
+- **Action**: For a dual-stack Surface A scope (an A and an AAAA published at the
+  SAME name through the SAME provider), withdrawing ONE family took the sibling
+  down. The two host-level-withdraw backends have no per-family verb — DuckDNS
+  `clear=true` (the spec: "ignore all ip's and clear both your records") and
+  dyndns2 `offline=YES` (hostname-level) — so a v6 withdraw cleared/offlined the
+  whole name and blackholed the still-live v4 (H10 DuckDNS; M06 dyndns2). FIX
+  (family-scoped, per-provider): added `LeaseDNSRecord.SiblingFamilyOwned`, set
+  by the engine (`withdrawOwnedLocked` → new `siblingFamilyOwnedLocked`, matching
+  another owned record at the same `{PolicyID, FQDN}` under the opposite family).
+  DuckDNS and dyndns2 `DeleteLease` SKIP their destructive host-wide verb when
+  the flag is set (a logged no-op returning nil) — the LEAST-DESTRUCTIVE action:
+  the live sibling is preserved; the withdrawn family's record is left stale.
+  Per-family backends (rfc2136/cloudflare/route53) ignore the flag and delete the
+  exact RR. The manager still drops the withdrawn family's ownership, so a later
+  withdraw of the LAST family (no sibling → flag false) DOES fire the host-wide
+  verb and cleans both — full teardown converges, single-family withdraw is
+  unchanged, no permanent orphan on teardown. Verified the DuckDNS spec
+  (duckdns.org/spec.jsp): `clear=true` "will ignore all ip's and clear both your
+  records" — it genuinely cannot family-scope a clear, so suppression is the
+  correct preservation strategy. Also added the missing dyndns2 dual-stack commit
+  warning (the codex-157 M06 gap — DuckDNS was already commit-warned via #2960;
+  dyndns2 was not) in `validateSurfaceADDNSWarnings`. RED-on-revert: removing the
+  DuckDNS/dyndns2 guards + the engine flag makes the sibling-preservation tests
+  fire a clear/offline (RED) while the single-family test stays green; removing
+  the dyndns2 warning emission fails the config warning test. go test
+  ./pkg/ddns/... ./pkg/config/... green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/ddns/backend.go (SiblingFamilyOwned field), pkg/ddns/backend_duckdns.go
+  + pkg/ddns/backend_dyndns2.go (DeleteLease sibling guard + log/slog),
+  pkg/ddns/surface_a.go (withdrawOwnedLocked sets the flag; siblingFamilyOwnedLocked
+  + canonicalDDNSName helpers), pkg/config/compiler_validate_warn.go (dyndns2
+  dual-stack commit warning), pkg/ddns/backend_dualstack_withdraw_3738_test.go (new),
+  pkg/config/compiler_p3_http_providers_test.go (dyndns2 dual-stack warning test),
+  pkg/ddns/README.md (per-family-withdraw column + dual-stack sibling-preserve section)
