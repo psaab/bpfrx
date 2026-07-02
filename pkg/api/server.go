@@ -192,6 +192,13 @@ type Config struct {
 	// last-error/last-success state are surfaced here. Optional; if nil (or
 	// it returns nil), the family is omitted.
 	FlowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
+	// FlowExportBatchStatsFn surfaces the per-exporter pending-batch queue
+	// stats (current depth, high-water depth, dropped-at-capacity count) for
+	// the xpf_flow_export_batch_* metric family (#3747). The export batch used
+	// to be unbounded: a stalled/overrun drain grew memory without bound and
+	// with no depth or drop visibility. Optional; if nil (or it returns nil),
+	// the family is omitted.
+	FlowExportBatchStatsFn func() []flowexport.ExporterBatchStats
 	// FeedOverlayFn returns the live dynamic-address feed-prefix overlay
 	// (#2049): an address-name -> union-of-feed-CIDRs map for the active
 	// config, the same view the AF_XDP helper enforces. It is consulted by
@@ -257,6 +264,7 @@ type Server struct {
 	ddnsStatsFn                      func() *dhcpserver.DDNSStats
 	surfaceAStatsFn                  func() *ddns.SurfaceAStats
 	flowCollectorHealthFn            func() []flowexport.ExporterCollectorHealth
+	flowExportBatchStatsFn           func() []flowexport.ExporterBatchStats
 	feedOverlayFn                    func() map[string][]string
 	policySchedActiveFn              func() (map[string]bool, bool)
 	haActiveFn                       func() bool
@@ -293,6 +301,7 @@ func NewServer(cfg Config) *Server {
 		ddnsStatsFn:                      cfg.DDNSStatsFn,
 		surfaceAStatsFn:                  cfg.SurfaceAStatsFn,
 		flowCollectorHealthFn:            cfg.FlowCollectorHealthFn,
+		flowExportBatchStatsFn:           cfg.FlowExportBatchStatsFn,
 		feedOverlayFn:                    cfg.FeedOverlayFn,
 		policySchedActiveFn:              cfg.PolicySchedulerActiveStateFn,
 		haActiveFn:                       cfg.HAActiveFn,

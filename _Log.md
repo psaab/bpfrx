@@ -1,3 +1,40 @@
+## 2026-07-01 — #3739: DDNS Surface A value-specific self-owned publish
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The Surface A self-owned publish path clobbered a
+    co-resident FOREIGN A/AAAA at a shared name. Cloudflare (H11) PATCHed
+    `recs[0]` (an API-ordering artifact) to xpf's address; RFC 2136 (M08)
+    `RemoveRRset`d the WHOLE A/AAAA set before inserting. Both now do a
+    VALUE-SPECIFIC in-place replace that touches ONLY xpf's own value.
+    ENABLER: threaded the previously-published rdata to the backend via a
+    new `LeaseDNSRecord.PrevAddr` field, set in `publishLocked` from the
+    prevAddr it already computed (seeded across restart from the durable
+    store's `AddrText`). Cloudflare `UpsertLease`: list all rows, no-op if a
+    row already carries the new value, else PATCH the row carrying `PrevAddr`
+    in place, else POST a new record (never `recs[0]`). RFC 2136
+    `sendAddSelfOwned`: when `selfOwnedPrevAddr` is valid and differs from
+    the new value, pair an EXACT-RR delete (`Remove`, CLASS=NONE) of xpf's
+    prior rdata with the insert, in ONE atomic UPDATE (no-blackhole
+    preserved); Insert-only on first publish / same-value re-publish. Added
+    helpers `rrAddr` + `prevSelfOwnedRR`. Route 53 (M07) DEFERRED per the
+    converged /research plan — whole-RRSet UPSERT with no per-value op / no
+    CAS would need a new SigV4 ListResourceRecordSets GET + a racy RMW; its
+    DELETE already fails safe. Documented all three in `pkg/ddns/README.md`.
+  - **Files**: `pkg/ddns/backend.go` (PrevAddr field),
+    `pkg/ddns/surface_a.go` (thread PrevAddr into rec),
+    `pkg/ddns/backend_cloudflare.go` (value-specific UpsertLease, dropped
+    findRecord), `pkg/ddns/backend_rfc2136.go` (selfOwnedPrevAddr +
+    value-specific sendAddSelfOwned + helpers),
+    `pkg/ddns/backend_cloudflare_test.go` (ordered fake + 2 RED-on-revert
+    tests + PrevAddr on the renumber case),
+    `pkg/ddns/surface_a_rfc2136_test.go` (co-resident foreign-survives test),
+    `pkg/ddns/README.md`.
+  - **Validation**: `go test -race ./pkg/ddns/...` green; RED-on-revert
+    proven for both providers (revert Cloudflare → recs[0] and RFC 2136 →
+    RemoveRRset each make the new tests fail deterministically);
+    `go build ./...`, `go vet ./pkg/ddns/...`, `gofmt -l` clean;
+    `go test ./pkg/dhcpserver/...` (lease-path consumer) green.
+
 ## 2026-07-01 — #3748 (sub-part b): IPFIX sampler Options Template + record
 
 - **Timestamp**: 2026-07-01
@@ -26823,3 +26860,37 @@ top.
     (TestAssembleFRRConfigResolvesOverlayLinkLocal),
     pkg/frr/preferred_routes_test.go (render contract test),
     docs/multi-wan.md + pkg/frr/README.md (link-local overlay next-hop)
+  **Action**: #3747 — bound the flowexport batch queue (`flowBatch`) and
+    add drop/depth visibility. The per-family export accumulator
+    (`transport.go` `flowBatch.v4/v6`) was UNBOUNDED: `add` appended
+    with no cap and the batch drained ONLY from the exporter `Run`
+    goroutine (100ms ticker). A stopped/stalled drain (reconcile window,
+    slow/blocked collector, SESSION_CLOSE storm) let it grow with the
+    close-event rate → unbounded memory growth (DoS/OOM) with no depth or
+    drop counter. Fix: bound each family at `defaultFlowBatchCap` (65536
+    records); on overflow DROP the incoming record (drop-newest, O(1),
+    never blocks the event-reader flow-close callback) and increment an
+    atomic `dropped` counter; track a `maxDepth` high-water mark. Chose
+    drop-newest over drop-oldest: O(1) with no slice-shift/realloc churn,
+    non-blocking, happy-path append unchanged; forensic value of which
+    end is dropped is symmetric in a near-contemporaneous close storm.
+    Surfaced via `Exporter`/`IPFIXExporter` `BatchDepth/BatchMaxDepth/
+    BatchDropped` accessors → `Daemon.FlowExportBatchStats()` →
+    Prometheus family `xpf_flow_export_batch_{depth,max_depth,
+    dropped_total}` labeled {protocol,instance,template} (mirrors the
+    #2464 CollectorHealth wiring). RED-on-revert: reverting the source
+    (keeping the test) fails to compile — the bounded API (capOverride /
+    Dropped / MaxDepth / depth) does not exist pre-fix; behavioral pins
+    assert drops-above-cap, no-drop-below-cap, per-family independence,
+    high-water survives drain, and a -race concurrent producer/drain
+    accounting invariant (drained+dropped == offered). go test -race
+    ./pkg/flowexport/... + ./pkg/api/... green; ./pkg/daemon/... green;
+    go build ./... green; gofmt + vet clean on touched files.
+  - **File(s)**: pkg/flowexport/transport.go (bounded flowBatch +
+    dropped/maxDepth atomics + depth/Dropped/MaxDepth + ExporterBatchStats),
+    pkg/flowexport/netflow.go + pkg/flowexport/ipfix.go (Batch* accessors),
+    pkg/flowexport/flowbatch_bounded_test.go (new RED-on-revert pins),
+    pkg/daemon/daemon_flowexport.go (FlowExportBatchStats), pkg/daemon/daemon_run.go
+    (wire FlowExportBatchStatsFn), pkg/api/server.go + metrics.go +
+    metrics_descriptors.go + metrics_system.go (xpf_flow_export_batch_* family),
+    pkg/flowexport/README.md (Bounded export batch section)

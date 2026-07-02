@@ -595,3 +595,40 @@ func (d *Daemon) FlowCollectorHealth() []flowexport.ExporterCollectorHealth {
 	}
 	return out
 }
+
+// FlowExportBatchStats returns the pending-batch queue stats (current depth,
+// high-water depth, dropped-at-capacity count) for every running NetFlow v9
+// and IPFIX exporter group (#3747). The slice is empty when no flow export is
+// configured. Safe to call concurrently with reconcile and the export-flush
+// goroutines: it reads the live bundles lock-free and each exporter exposes
+// its batch counters as atomics / a mutex-guarded depth read. Surfaced through
+// the daemon to REST/Prometheus so a stalled or overrun export drain (which
+// used to grow memory without bound and silently) is now observable.
+func (d *Daemon) FlowExportBatchStats() []flowexport.ExporterBatchStats {
+	var out []flowexport.ExporterBatchStats
+	if b := d.flowBundle.Load(); b != nil {
+		for _, g := range b.groups {
+			out = append(out, flowexport.ExporterBatchStats{
+				Protocol: "netflow-v9",
+				Instance: g.ec.InstanceName,
+				Template: g.ec.TemplateName,
+				Depth:    g.exp.BatchDepth(),
+				MaxDepth: g.exp.BatchMaxDepth(),
+				Dropped:  g.exp.BatchDropped(),
+			})
+		}
+	}
+	if b := d.ipfixBundlePtr.Load(); b != nil {
+		for _, g := range b.groups {
+			out = append(out, flowexport.ExporterBatchStats{
+				Protocol: "ipfix",
+				Instance: g.ec.InstanceName,
+				Template: g.ec.TemplateName,
+				Depth:    g.exp.BatchDepth(),
+				MaxDepth: g.exp.BatchMaxDepth(),
+				Dropped:  g.exp.BatchDropped(),
+			})
+		}
+	}
+	return out
+}

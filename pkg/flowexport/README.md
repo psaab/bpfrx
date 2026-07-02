@@ -633,6 +633,42 @@ The snapshot is surfaced through `Exporter.CollectorHealth()` /
   the in-daemon interactive CLI) — the collector line prints
   `... source <src>` for a source-bound collector (#3745).
 
+## Bounded export batch + drop visibility (#3747)
+
+`ExportSessionClose` does not write to the collector inline — it queues the
+`FlowRecord` into the per-family accumulator `flowBatch` (`v4`/`v6`), which the
+exporter `Run` goroutine drains every 100 ms and hands to the send path. Before
+#3747 `flowBatch.add` appended without any bound and the batch was drained
+ONLY from `Run`, so if `Run` was stopped or stalled — the reconcile window
+(the exporter briefly swapped out), a blocked/slow collector write, or a
+`SESSION_CLOSE` storm (scan / failover) outrunning the 100 ms flush — the
+queue grew with the close-event rate: unbounded memory growth (a DoS / OOM
+risk) with no depth or drop visibility to diagnose it.
+
+The batch is now **bounded per family** by `defaultFlowBatchCap` (65 536
+records/family; a test-only `capOverride` makes the drop path reachable). When
+the target family is at capacity `add` **drops the incoming record**
+(drop-newest) and increments an atomic `dropped` counter rather than growing
+the slice. Drop-newest is deliberate: it is O(1) with no slice shift or
+reallocation churn under sustained overflow, it never blocks the caller, and it
+leaves the happy path (below cap) a plain append. Crucially the flow-close
+callback runs on the event-reader path, so `add` MUST NOT block — dropping a
+record is strictly preferable to backpressuring into the session reap/close
+path. Which end is dropped barely matters for forensic value in a close storm
+(all closes are near-contemporaneous); O(1) non-blocking does. A `maxDepth`
+high-water mark records the worst-case backlog so a transient stall is visible
+after a later drain empties the queue.
+
+The counters are surfaced through `Exporter`/`IPFIXExporter`
+`BatchDepth()` / `BatchMaxDepth()` / `BatchDropped()` →
+`Daemon.FlowExportBatchStats()` (annotated with protocol / instance / template
+via `ExporterBatchStats`) as the Prometheus family
+`xpf_flow_export_batch_{depth,max_depth,dropped_total}`, labeled
+`{protocol,instance,template}` (one bounded series per configured flow-server
+group; emitted before the dataplane gate — exporters are control-plane). A
+climbing `dropped_total`, or a sustained nonzero `depth`, is the operator
+signal that the export drain cannot keep up.
+
 ## Entry points
 
 NetFlow v9:
@@ -862,7 +898,9 @@ moment any caller sampled off the copy (#2224).
   configure the collector to handle template re-resolution.
 - Two batches are maintained inside `flowBatch` (`v4` and `v6`, split
   by family, not by zone — `transport.go`). Both flush on a 100 ms
-  ticker or on shutdown.
+  ticker or on shutdown. Each is **bounded** at `defaultFlowBatchCap`
+  records; overflow drops (drop-newest) and increments `dropped` rather
+  than growing without bound (#3747 — see "Bounded export batch" above).
 - `BuildSamplingZones` resolves a zone's interface references
   (`parseIfaceRef`, `manager.go`) into (physical-name, unit) pairs to
   decide which zones have sampling enabled. The unit suffix is parsed

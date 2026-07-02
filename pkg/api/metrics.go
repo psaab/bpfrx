@@ -515,6 +515,15 @@ type xpfCollector struct {
 	flowExportCollectorHealthy            *prometheus.Desc
 	flowExportCollectorLastSuccessSeconds *prometheus.Desc
 	flowExportCollectorLastFailureSeconds *prometheus.Desc
+
+	// #3747: per-exporter pending-batch queue depth / high-water / drop count.
+	// The export batch was unbounded; a stalled or overrun drain grew memory
+	// without bound and silently. These surface the backlog and any bounded
+	// drops. Labels: protocol {netflow-v9,ipfix}, instance, template (bounded
+	// — one series per configured flow-server group).
+	flowExportBatchDepth        *prometheus.Desc
+	flowExportBatchMaxDepth     *prometheus.Desc
+	flowExportBatchDroppedTotal *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -792,6 +801,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.flowExportCollectorHealthy
 	ch <- c.flowExportCollectorLastSuccessSeconds
 	ch <- c.flowExportCollectorLastFailureSeconds
+	ch <- c.flowExportBatchDepth
+	ch <- c.flowExportBatchMaxDepth
+	ch <- c.flowExportBatchDroppedTotal
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

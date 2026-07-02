@@ -235,25 +235,86 @@ func (cc *collectorConns) close() {
 	}
 }
 
+// defaultFlowBatchCap bounds the number of pending flow records held per
+// address family before add() starts dropping (#3747). The batch is drained
+// every 100ms by the exporter Run goroutine, so under normal operation the
+// depth stays well below this; the cap only bites when the drain is STOPPED
+// or STALLED — the reconcile window (Run swapped out), a blocked/slow
+// collector write, or a SESSION_CLOSE storm (scan / failover) outrunning the
+// 100ms flush. Before #3747 add() appended without bound, so a stalled drain
+// let the batch grow with the close-event rate → unbounded memory growth
+// (DoS / OOM) with no depth or drop visibility. At the current FlowRecord
+// size (~a few hundred bytes with its net.IP backing arrays) this cap bounds
+// each family to tens of MB — a bounded, counted drop instead of an OOM.
+const defaultFlowBatchCap = 65536
+
 // flowBatch accumulates flow records pending export, split by address
 // family. The export loop drains it on a periodic ticker (and on
 // shutdown) and hands each non-empty slice to the protocol-specific
 // send path. The split is by family, not by zone.
+//
+// The queue is BOUNDED per family (#3747): add() rejects a record once the
+// target family is at capacity and counts the drop, so a stopped/stalled
+// drain can no longer grow the batch without bound. dropped / maxDepth are
+// atomics so the status/metrics accessors read them without contending on mu.
 type flowBatch struct {
 	mu sync.Mutex
 	v4 []FlowRecord
 	v6 []FlowRecord
+	// capOverride is the per-family record cap; 0 means defaultFlowBatchCap.
+	// Only tests set it (to a small value that makes the drop path reachable).
+	capOverride int
+	// dropped counts records rejected because the target family batch was at
+	// capacity. Monotonic; surfaced through Dropped() for status/CLI/REST and
+	// the xpf_flow_export_batch_dropped_total metric (#3747).
+	dropped atomic.Uint64
+	// maxDepth is the high-water mark of len(v4)+len(v6) observed by add().
+	// It captures the worst-case backlog even after a later drain empties the
+	// queue, so a transient stall is still visible after the fact (#3747).
+	maxDepth atomic.Uint64
 }
 
-// add queues a record into the appropriate per-family batch.
-func (b *flowBatch) add(fr FlowRecord) {
-	b.mu.Lock()
-	if fr.IsIPv6 {
-		b.v6 = append(b.v6, fr)
-	} else {
-		b.v4 = append(b.v4, fr)
+// batchCap returns the effective per-family record cap.
+func (b *flowBatch) batchCap() int {
+	if b.capOverride > 0 {
+		return b.capOverride
 	}
+	return defaultFlowBatchCap
+}
+
+// add queues a record into the appropriate per-family batch. When the target
+// family is already at capacity the record is DROPPED (drop-newest) and the
+// dropped counter is incremented rather than growing the batch without bound
+// (#3747).
+//
+// Drop-newest (reject the incoming record) is chosen over drop-oldest
+// deliberately: it is O(1) with no slice shift or reallocation churn under
+// sustained overflow, it never blocks the caller, and it leaves the happy
+// path (below cap) a plain append — unchanged. The flow-close callback that
+// calls add() runs on the event-reader path, so it MUST NOT block: dropping a
+// record is strictly preferable to backpressuring into the session reap/close
+// path. Which end is dropped barely matters for forensic value in a close
+// storm (all closes are near-contemporaneous); O(1) non-blocking does.
+func (b *flowBatch) add(fr FlowRecord) {
+	capN := b.batchCap()
+	b.mu.Lock()
+	dst := &b.v4
+	if fr.IsIPv6 {
+		dst = &b.v6
+	}
+	if len(*dst) >= capN {
+		b.mu.Unlock()
+		b.dropped.Add(1)
+		return
+	}
+	*dst = append(*dst, fr)
+	depth := uint64(len(b.v4) + len(b.v6))
 	b.mu.Unlock()
+	// maxDepth is written only here; adds are serialized by mu, so the
+	// load-then-store cannot race another writer (readers only Load()).
+	if depth > b.maxDepth.Load() {
+		b.maxDepth.Store(depth)
+	}
 }
 
 // drain atomically removes and returns the accumulated v4 and v6
@@ -266,4 +327,39 @@ func (b *flowBatch) drain() (v4, v6 []FlowRecord) {
 	b.v6 = nil
 	b.mu.Unlock()
 	return v4, v6
+}
+
+// depth returns the current number of records pending across both families.
+func (b *flowBatch) depth() uint64 {
+	b.mu.Lock()
+	d := uint64(len(b.v4) + len(b.v6))
+	b.mu.Unlock()
+	return d
+}
+
+// Dropped returns the cumulative count of records dropped because a family
+// batch was at capacity (#3747).
+func (b *flowBatch) Dropped() uint64 { return b.dropped.Load() }
+
+// MaxDepth returns the high-water mark of the combined pending depth (#3747).
+func (b *flowBatch) MaxDepth() uint64 { return b.maxDepth.Load() }
+
+// ExporterBatchStats is one exporter's pending-batch queue stats (#3747),
+// annotated with the protocol family, sampling instance, and template group
+// it belongs to — the same identity the per-collector health snapshot carries
+// (#2464). It is the cross-package shape surfaced through the daemon to REST
+// status, gRPC show, and the Prometheus collector so an operator can see the
+// export backlog depth and any dropped records. It lives here (not pkg/daemon)
+// so pkg/api and pkg/grpcapi — which must not import pkg/daemon — can name the
+// return type of the injected accessor callback.
+type ExporterBatchStats struct {
+	Protocol string `json:"protocol"`
+	Instance string `json:"instance"`
+	Template string `json:"template"`
+	// Depth is the current combined (v4+v6) pending record count.
+	Depth uint64 `json:"depth"`
+	// MaxDepth is the high-water mark of the combined pending depth.
+	MaxDepth uint64 `json:"max_depth"`
+	// Dropped is the cumulative count of records dropped at capacity.
+	Dropped uint64 `json:"dropped"`
 }
