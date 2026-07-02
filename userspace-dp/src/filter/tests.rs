@@ -7826,3 +7826,98 @@ fn destination_port_except_resolved_name_matches_3205() {
         "port 9999 is NOT excepted, must match the discard term"
     );
 }
+
+// === #3716: a snapshot carrying BOTH a positive and an except port list for
+// one direction resolves POSITIVE-WINS at the Rust boundary ===
+//
+// The Go commit gate `validateFilterPortExceptStrict` (#3297) rejects a term
+// that sets both `destination-port` and `destination-port-except`, so a
+// committed config never reaches the dataplane in this shape. A hand-built /
+// version-drifted / leniently-loaded snapshot still can, and the compiler
+// (filter/compiler.rs) resolves it deterministically as POSITIVE-WINS: the
+// positive list builds the matcher and the except list is IGNORED (the except
+// inversion flag stays false). That is a deliberate NARROWING — the term
+// matches only the positive ports, strictly tighter than the operator-authored
+// except would have been — never a widening, so it is fail-safe at the Rust
+// boundary even without a SnapshotIntegrityError.
+//
+// FAIL-ON-REVERT: change the compiler's selection to except-wins (make the
+// except list win, or set the except flag, when both are present) and the
+// port-9999 assertion below flips from Accept to Discard -> RED.
+#[test]
+fn port_both_positive_and_except_positive_wins_3716() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "discard-both".into(),
+                protocols: vec!["tcp".into()],
+                // Both lists on the same direction (Junos-invalid; the #3297 Go
+                // gate rejects it, so only a drifted snapshot lands here).
+                // Positive wins: matcher = {22}, the except list is IGNORED.
+                destination_ports: vec!["22".into()],
+                destination_ports_except: vec!["443".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    // Port 22 IS in the positive set -> the term matches -> discard.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        22,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "positive-wins: port 22 is in the positive set, must match the discard term"
+    );
+    // Port 9999 is NOT in the positive set {22} -> no match -> implicit accept.
+    // Under except-wins (match every port != 443) this would DISCARD -> RED.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        9999,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "positive-wins: port 9999 is NOT in the positive set {{22}} and the except \
+         list is IGNORED, so the term does NOT match — a revert to except-wins \
+         (match every port except 443) would DISCARD this (#3716)"
+    );
+    // The (ignored) except entry 443 is also not in the positive set {22}, so it
+    // too falls through to implicit accept — confirming the except list is dropped.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "positive-wins: the except entry 443 is IGNORED; 443 is not in the positive \
+         set {{22}} so the term does not match"
+    );
+}
