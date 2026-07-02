@@ -534,6 +534,29 @@ pub(crate) enum SnapshotIntegrityError {
         ip: String,
         family: String,
     },
+    /// #3719 (H03): two DIFFERENT security zones in the same snapshot carried the
+    /// same nonzero, non-reserved numeric zone id. #3075/#3704 made the zone id a
+    /// stable name-hash (`config.StableZoneID`); two zone names can fold to the
+    /// same id, and publishing both would let the later zone silently overwrite
+    /// the earlier's `zone_id_to_name` / `zone_host_inbound` / `zone_tcp_rst`
+    /// entries in `populate_zones` — MERGING two security zones under one id (one
+    /// zone's interfaces / policies / counters / host-inbound set stand in for the
+    /// other, a zone-isolation failure). The Go control plane QUARANTINES the
+    /// later-sorting colliding zone before it reaches the wire
+    /// (`config.QuarantinedZoneNames` -> `quarantineCollidingZones`,
+    /// pkg/dataplane/userspace/zones.go), so a clean snapshot never trips this; it
+    /// is the helper-boundary backstop for a corrupt / hand-built /
+    /// version-drifted snapshot, consistent with the #3402 `UnresolvableZoneReference`
+    /// and #3771 fail-closed family. Rejecting the WHOLE snapshot keeps the
+    /// previous good forwarding state (a fresh boot keeps the default-deny) and
+    /// never merges two zones. Ids of 0, an empty name, or the reserved range are
+    /// skipped by `populate_zones` (never installed) and so are NOT treated as
+    /// collisions.
+    DuplicateZoneId {
+        id: u16,
+        first: String,
+        second: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -770,6 +793,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "neighbor {:?} on interface {:?} declares family {:?} that does not match the address family of its IP — refusing to install it under a contradicting family",
                 ip, interface, family
+            ),
+            Self::DuplicateZoneId { id, first, second } => write!(
+                f,
+                "security zones {:?} and {:?} share numeric zone id {} — publishing both would merge two zones; rename one zone (#3719)",
+                first, second, id
             ),
         }
     }

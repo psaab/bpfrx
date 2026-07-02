@@ -26,7 +26,10 @@
     zones publish with id 53547). `go test ./pkg/config/... ./pkg/dataplane/...
     ./pkg/cli/... ./pkg/api/... ./pkg/daemon/...` green; gofmt/vet clean.
     Rust defense-in-depth `SnapshotIntegrityError::DuplicateZoneId` backstop
-    deferred to the helper build (needs cargo).
+    added (`zones::reject_duplicate_zone_ids` before `populate_zones` in
+    `build_forwarding_state`, + regression
+    `build_forwarding_state_rejects_duplicate_zone_ids`) — NEEDS cargo
+    build/test validation (Rust engineer holds the cargo slot).
   - **File(s)**: pkg/config/zoneid.go, pkg/config/zoneid_test.go,
     pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/builder.go,
     pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_ha.go,
@@ -34,7 +37,10 @@
     pkg/dataplane/userspace/zones_collision_3719_test.go, pkg/cli/apply.go,
     pkg/cli/apply_syslog_zonemap_3704_test.go, pkg/api/metrics.go,
     pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
-    docs/config-schema.md
+    userspace-dp/src/policy.rs,
+    userspace-dp/src/afxdp/forwarding_build/zones.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs, docs/config-schema.md
 
 ## 2026-07-01 — #3710: host-inbound addressless observability per-interface/per-family
 

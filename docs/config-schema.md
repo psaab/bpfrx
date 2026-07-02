@@ -2328,8 +2328,11 @@ is paged until one zone is renamed. Regression coverage:
 (`TestBuildSnapshotQuarantinesCollidingZone` — RED-on-revert), and
 `pkg/cli/apply_syslog_zonemap_3704_test.go`
 (`TestSyslogZoneNameMapCollisionResolvesToSurvivor`). A defense-in-depth Rust
-`SnapshotIntegrityError::DuplicateZoneId` backstop (reject a snapshot that still
-carries duplicate ids before any map population) is tracked for the helper build.
+backstop `SnapshotIntegrityError::DuplicateZoneId` (`zones::reject_duplicate_zone_ids`,
+called before `populate_zones` in `build_forwarding_state`) rejects a snapshot
+that STILL carries two different zones under one nonzero non-reserved id — the
+helper-boundary guard for a corrupt / version-drifted snapshot that bypassed the
+Go quarantine (regression `build_forwarding_state_rejects_duplicate_zone_ids`).
 
 **`MaxUsableZoneID`** is now `ZoneIDReservedMin-1` (65533) — the pigeonhole bound
 of the u16 stable-hash space, not the old 255-id u8 wire limit (**#2391

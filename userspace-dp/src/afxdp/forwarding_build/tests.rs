@@ -1848,6 +1848,82 @@ fn build_forwarding_state_rejects_reserved_zone_ids() {
     );
 }
 
+/// #3719 (H03/L04): two DIFFERENT zones carrying the same nonzero non-reserved
+/// id must fail the snapshot CLOSED before any id-keyed map is populated —
+/// otherwise populate_zones lets the later zone overwrite the earlier's
+/// zone_id_to_name / host-inbound / tcp-rst entries, merging two security zones.
+/// The Go control plane quarantines the collision before the wire; this is the
+/// helper-boundary backstop. Removing reject_duplicate_zone_ids (or its call in
+/// build_forwarding_state) turns this RED — the build succeeds and one id maps
+/// to a single merged zone.
+#[test]
+fn build_forwarding_state_rejects_duplicate_zone_ids() {
+    use crate::ZoneSnapshot;
+    // z174 and z214 both fold to config.StableZoneID 53547 (the verified
+    // collision pair); here we stamp the shared id explicitly.
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            ZoneSnapshot {
+                name: "z174".into(),
+                id: 53547,
+                ..Default::default()
+            },
+            ZoneSnapshot {
+                name: "z214".into(),
+                id: 53547,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("two zones sharing a numeric id must fail closed");
+    match err {
+        crate::policy::SnapshotIntegrityError::DuplicateZoneId { id, first, second } => {
+            assert_eq!(id, 53547);
+            assert_eq!(first, "z174");
+            assert_eq!(second, "z214");
+        }
+        other => panic!("expected DuplicateZoneId, got {other:?}"),
+    }
+}
+
+/// #3719: a zone id repeated only within the RESERVED range (or with id 0) is
+/// skipped by populate_zones and must NOT be treated as a collision — the gate
+/// mirrors populate_zones' skip set, so it must not over-reject.
+#[test]
+fn build_forwarding_state_reserved_duplicate_ids_are_not_collisions() {
+    use crate::ZoneSnapshot;
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            ZoneSnapshot {
+                name: "resv-a".into(),
+                id: crate::policy::ZONE_ID_RESERVED_MIN,
+                ..Default::default()
+            },
+            ZoneSnapshot {
+                name: "resv-b".into(),
+                id: crate::policy::ZONE_ID_RESERVED_MIN,
+                ..Default::default()
+            },
+            ZoneSnapshot {
+                name: "ok".into(),
+                id: 7,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    // Both reserved zones are skipped (never installed); "ok" builds cleanly.
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(state.zone_name_to_id.get("ok").copied(), Some(7));
+    assert!(state.zone_name_to_id.get("resv-a").is_none());
+    assert!(state.zone_name_to_id.get("resv-b").is_none());
+}
+
 /// #921: ifindex_to_zone_id is populated at config build time
 /// from the snapshot's per-interface zone NAME via zone_name_to_id.
 #[test]
