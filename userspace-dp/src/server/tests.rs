@@ -71,6 +71,34 @@ fn run_request(state: Arc<Mutex<ServerState>>, request: ControlRequest) -> Contr
     response
 }
 
+/// Like `run_request` but drives against a caller-supplied `state_file`
+/// and does NOT remove it, so a test can assert what the handler persisted
+/// to disk (used by the #3767 M2 bump-persistence test).
+fn run_request_on_file(
+    state: Arc<Mutex<ServerState>>,
+    request: ControlRequest,
+    state_file: &str,
+) -> ControlResponse {
+    let (mut client, server) =
+        std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let state_file = state_file.to_string();
+        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+    };
+
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    let response: ControlResponse =
+        serde_json::from_reader(std::io::BufReader::new(client)).expect("read response");
+    handle
+        .join()
+        .expect("handler thread")
+        .expect("handler result");
+    response
+}
+
 fn req(request_type: &str) -> ControlRequest {
     ControlRequest {
         request_type: request_type.to_string(),
@@ -572,6 +600,176 @@ fn bump_fib_generation_updates_status_and_stored_snapshot() {
         7,
         "bump must rewrite the stored snapshot's fib_generation"
     );
+}
+
+/// #3767 H4: bump_fib_generation must version-gate exactly like
+/// apply_snapshot. A mixed-version / corrupt client (version != protocol)
+/// must be REJECTED before mutating any validation state — status,
+/// stored snapshot, and worker FIB generation all stay at the prior value.
+#[test]
+fn bump_fib_generation_rejects_wrong_protocol_version() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let state = new_state(ProcessStatus::default());
+    // Seed a stored snapshot at fib_generation 1.
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 1,
+            fib_generation: 1,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request(state.clone(), request).ok);
+    }
+    let worker_fib_before = state.lock().expect("state").afxdp.fib_generation();
+    let mut request = req("bump_fib_generation");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION - 1,
+        fib_generation: 7,
+        generated_at: chrono::Utc::now(),
+        ..ConfigSnapshot::default()
+    });
+    let response = run_request(state.clone(), request);
+    assert!(!response.ok, "wrong-version bump must be rejected");
+    assert!(
+        response
+            .error
+            .contains("unsupported snapshot protocol version"),
+        "unexpected error: {}",
+        response.error
+    );
+    let guard = state.lock().expect("state");
+    assert_eq!(
+        guard.status.last_fib_generation, 1,
+        "rejected bump must not advance last_fib_generation"
+    );
+    assert_eq!(
+        guard.snapshot.as_ref().expect("stored snapshot").fib_generation,
+        1,
+        "rejected bump must not rewrite the stored snapshot"
+    );
+    assert_eq!(
+        guard.afxdp.fib_generation(),
+        worker_fib_before,
+        "rejected bump must not advance the worker FIB generation"
+    );
+}
+
+/// #3767 H5: bump_fib_generation must refuse a generation ROLLBACK. Flow-
+/// cache validation is equality based, so publishing a strictly-lower
+/// fib_generation would revive cache entries a prior bump invalidated
+/// (stale forwarding after a route withdrawal / failover). The rejected
+/// bump must leave status, stored snapshot, and worker FIB generation at
+/// the last accepted value.
+#[test]
+fn bump_fib_generation_rejects_generation_rollback() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let state = new_state(ProcessStatus::default());
+    // Seed a stored snapshot at fib_generation 5.
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 1,
+            fib_generation: 5,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request(state.clone(), request).ok);
+    }
+    // A forward bump to 7 is accepted (monotone).
+    {
+        let mut request = req("bump_fib_generation");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            fib_generation: 7,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request(state.clone(), request).ok);
+    }
+    // A rollback to 3 (< current 7) must be refused.
+    let mut request = req("bump_fib_generation");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        fib_generation: 3,
+        generated_at: chrono::Utc::now(),
+        ..ConfigSnapshot::default()
+    });
+    let response = run_request(state.clone(), request);
+    assert!(!response.ok, "rollback bump must be rejected");
+    assert!(
+        response.error.contains("fib generation rollback rejected"),
+        "unexpected error: {}",
+        response.error
+    );
+    let guard = state.lock().expect("state");
+    assert_eq!(
+        guard.status.last_fib_generation, 7,
+        "rejected rollback must not lower last_fib_generation"
+    );
+    assert_eq!(
+        guard.snapshot.as_ref().expect("stored snapshot").fib_generation,
+        7,
+        "rejected rollback must not rewrite the stored snapshot"
+    );
+    assert_eq!(
+        guard.afxdp.fib_generation(),
+        7,
+        "rejected rollback must not revive an old worker FIB generation"
+    );
+}
+
+/// #3767 M2: an accepted bump_fib_generation must PERSIST the new
+/// generation. Previously the handler mutated status + stored snapshot in
+/// RAM only (no persist_state), so a route-only overlay bump to gen N left
+/// the on-disk state at gen N-1 and a restart booted from a stale FIB
+/// generation the control plane already considered applied.
+#[test]
+fn bump_fib_generation_persists_bumped_generation() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let state = new_state(ProcessStatus::default());
+    let state_file = unique_state_file("bump-persist");
+    // Seed apply persists the state file at fib_generation 1.
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 1,
+            fib_generation: 1,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request_on_file(state.clone(), request, &state_file).ok);
+    }
+    // Route-only bump to 7.
+    {
+        let mut request = req("bump_fib_generation");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            fib_generation: 7,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request_on_file(state.clone(), request, &state_file).ok);
+    }
+    // The on-disk state a restart would boot from must carry gen 7, not the
+    // seed apply's stale gen 1.
+    let bytes = std::fs::read(&state_file).expect("read persisted state file");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse persisted state file");
+    assert_eq!(
+        persisted["snapshot"]["fib_generation"].as_u64(),
+        Some(7),
+        "persisted snapshot must carry the bumped fib_generation"
+    );
+    assert_eq!(
+        persisted["status"]["last_fib_generation"].as_u64(),
+        Some(7),
+        "persisted status must carry the bumped fib_generation"
+    );
+    let _ = std::fs::remove_file(&state_file);
 }
 
 // --- apply_snapshot integrity preflight (#1606 / #1642 class) -----------

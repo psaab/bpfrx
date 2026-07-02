@@ -88,6 +88,45 @@
     pkg/appid/catalog_icmp_3781_test.go,
     pkg/dataplane/appid_catalog_parity_test.go, pkg/appid/README.md
 
+## 2026-07-01 — #3767: bump_fib_generation had no protocol-version / monotonicity / persist guards
+
+- **Timestamp**: 2026-07-01
+  - **Action**: `bump_fib_generation` is a control message that mutates
+    dataplane validation state (status + stored snapshot + worker FIB
+    generation) but, unlike `apply_snapshot`, carried none of apply's guards.
+    Fixed three defects flagged by codex-review-161. **H4 (version gate):**
+    the handler checked only snapshot presence — a mixed-version / corrupt
+    client (version=0) was accepted and mutated validation. Added a
+    `snapshot.version != CONFIG_SNAPSHOT_PROTOCOL_VERSION` reject mirroring
+    `apply`, and stamped `Version: ProtocolVersion` onto the Go bump snapshot
+    (`Manager.BumpFIBGeneration`) so legitimate route-only bumps still pass.
+    **H5 (monotonicity):** `Coordinator::bump_fib_generation` had no
+    monotonicity check, but flow-cache validation is EQUALITY based
+    (`entry.stamp.fib_generation != lookup.fib_generation`), not monotone —
+    so publishing an OLD/reused generation (stale/duplicate/corrupt message,
+    or a reset shim counter) revived cache entries a prior bump invalidated,
+    reusing a forwarding decision after a route withdrawal / failover. The
+    method now refuses a value strictly lower than the current in-memory
+    `validation.fib_generation` (returns bool; handler fails closed on
+    refusal). The full-snapshot transition path (`refresh_runtime_snapshot` /
+    reconcile `apply_snapshot`) assigns validation directly and is NOT gated,
+    so a legitimate config reset still lands. **M2 (persist):** an accepted
+    bump now sets `persist_state` so the on-disk status + snapshot advance
+    with the bump — previously RAM-only, so a bump to gen N left persisted
+    state at gen N-1 and a restart booted from a stale FIB generation.
+    RED-on-revert: bump_fib_generation_rejects_wrong_protocol_version (H4),
+    bump_fib_generation_rejects_generation_rollback (H5),
+    bump_fib_generation_persists_bumped_generation (M2) — all three fail
+    against pre-fix behavior. Full cargo test --release green (3388 lib +
+    46/8/16/1); go test ./pkg/dataplane/userspace green. Not session-sync
+    state (fib-generation is forwarding-state), so no test-failover required.
+  - **File(s)**: userspace-dp/src/server/handlers/snapshot.rs,
+    userspace-dp/src/server/handlers/mod.rs,
+    userspace-dp/src/afxdp/coordinator/mod.rs,
+    userspace-dp/src/server/tests.rs,
+    pkg/dataplane/userspace/manager.go,
+    docs/flow-cache-simplification.md, _Log.md
+
 ## 2026-07-01 — #3768: IPv6 ip-rule next-table emitted the v4 table (blackhole)
 
 - **Timestamp**: 2026-07-01

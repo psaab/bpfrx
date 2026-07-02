@@ -482,6 +482,49 @@ at the live epoch survives a same-MAC refresh and is evicted on a MAC change.
 Neutralizing either `mac_change_epoch.fetch_add` turns the change/eviction
 assertions RED.
 
+## FIB-generation bump gating (#3767)
+
+The `fib_generation` half of the validation stamp is invalidated cheaply by a
+lightweight `bump_fib_generation` control message (the Go
+`Manager.BumpFIBGeneration` route-only overlay path — no full snapshot
+rebuild). Because flow-cache validation is **equality** based
+(`entry.stamp.fib_generation != lookup.fib_generation` in `flow_cache.rs`),
+NOT monotone, the bump verb needs the same guards a full `apply_snapshot`
+carries. Before #3767 it had none — it checked only snapshot presence. Three
+gates were added (handler `server/handlers/snapshot.rs::bump_fib`, coordinator
+`afxdp/coordinator/mod.rs::bump_fib_generation`):
+
+- **Protocol-version gate (H4).** `bump_fib` now rejects
+  `snapshot.version != CONFIG_SNAPSHOT_PROTOCOL_VERSION`, mirroring `apply`.
+  A mixed-version / corrupt client (which serializes `version = 0`) can no
+  longer mutate validation state. The Go `Manager.BumpFIBGeneration` now
+  stamps the bump snapshot with `ProtocolVersion` so a legitimate route-only
+  bump still passes.
+- **Monotonicity gate (H5).** `Coordinator::bump_fib_generation` refuses a
+  value strictly lower than the current in-memory `validation.fib_generation`
+  and returns `false`; the handler then reports `ok = false` and mutates
+  nothing. A route-only overlay bump is monotone by construction on the Go
+  side (the shim counter only increments), so a lower value is a
+  stale/duplicate/corrupt message or a reset shim counter. Reviving it would
+  make cache entries a prior bump already invalidated MATCH validation again,
+  reusing a forwarding decision after a route withdrawal / failover. A full
+  snapshot generation transition assigns `self.validation` directly through
+  `refresh_runtime_snapshot` / reconcile `apply_snapshot` and is intentionally
+  NOT gated here, so a legitimate config-transition reset still lands.
+- **Persist gate (M2).** An accepted bump now sets `persist_state`, so the
+  on-disk `status.last_fib_generation` + `snapshot.fib_generation` advance
+  with the bump. Previously they were mutated in RAM only, so a route-only
+  bump to gen N left the persisted state at gen N-1 and a helper/host restart
+  booted from a stale FIB generation the control plane already considered
+  applied.
+
+Validation (`server/tests.rs`): `bump_fib_generation_rejects_wrong_protocol_version`
+(H4 — fail-on-revert), `bump_fib_generation_rejects_generation_rollback`
+(H5 — fail-on-revert; status / stored snapshot / worker FIB gen all stay at
+the last accepted value), and `bump_fib_generation_persists_bumped_generation`
+(M2 — fail-on-revert; the persisted state a restart boots from carries the
+bumped generation).
+
 ## Recommended Next Step
 
 Implement Phase 1 next:

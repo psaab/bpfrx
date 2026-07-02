@@ -1291,6 +1291,11 @@ func (m *Manager) BumpFIBGeneration() (uint32, error) {
 	if err := m.requestLocked(ControlRequest{
 		Type: "bump_fib_generation",
 		Snapshot: &ConfigSnapshot{
+			// #3767 H4: the helper now version-gates bump_fib_generation
+			// exactly like apply_snapshot. Stamp the protocol version so a
+			// legitimate route-only bump is accepted; an unversioned (0)
+			// message is rejected as a mixed-version / corrupt client.
+			Version:       ProtocolVersion,
 			FIBGeneration: newGen,
 		},
 	}, &status); err != nil {

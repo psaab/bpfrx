@@ -195,6 +195,7 @@ pub(super) fn bump_fib(
     guard: &mut ServerState,
     snapshot: Option<&ConfigSnapshot>,
     response: &mut ControlResponse,
+    persist_state: &mut bool,
 ) {
     // Lightweight FIB generation bump without a full snapshot.
     // Updates the generation counter so workers invalidate stale
@@ -205,10 +206,45 @@ pub(super) fn bump_fib(
         response.error = "missing snapshot".to_string();
         return;
     };
+    // #3767 H4: version gate, mirroring `apply` above. bump_fib mutates
+    // dataplane validation state (status + stored snapshot + worker FIB
+    // generation), so a mixed-version / corrupt client (which serializes
+    // version=0) must be rejected BEFORE any mutation, exactly as a full
+    // apply_snapshot is. The Go `Manager.BumpFIBGeneration` now stamps the
+    // bump snapshot with the protocol version so a legitimate bump passes.
+    if snapshot.version != CONFIG_SNAPSHOT_PROTOCOL_VERSION {
+        response.ok = false;
+        response.error = format!(
+            "unsupported snapshot protocol version {} (want {})",
+            snapshot.version, CONFIG_SNAPSHOT_PROTOCOL_VERSION
+        );
+        return;
+    }
+    // #3767 H5: refuse a generation ROLLBACK. Flow-cache validation is
+    // equality based, so publishing a strictly-lower fib_generation would
+    // revive cache entries a prior bump already invalidated (see
+    // Coordinator::bump_fib_generation). The coordinator owns the
+    // monotonicity invariant and leaves its validation state untouched on
+    // refusal; fail closed here too — do NOT advance the reported status /
+    // stored snapshot and do NOT persist.
+    if !guard.afxdp.bump_fib_generation(snapshot.fib_generation) {
+        response.ok = false;
+        response.error = format!(
+            "fib generation rollback rejected: {} < current {}",
+            snapshot.fib_generation,
+            guard.afxdp.fib_generation()
+        );
+        return;
+    }
     guard.status.last_fib_generation = snapshot.fib_generation;
     if let Some(ref mut snap) = guard.snapshot {
         snap.fib_generation = snapshot.fib_generation;
     }
-    guard.afxdp.bump_fib_generation(snapshot.fib_generation);
     refresh_status(guard);
+    // #3767 M2: persist the accepted bump. Previously bump_fib mutated
+    // guard.status.last_fib_generation and guard.snapshot.fib_generation in
+    // RAM only (no persist_state), so a route-only overlay bump to gen N left
+    // the on-disk state at gen N-1 — a helper/host restart then booted from a
+    // stale FIB generation the control plane already considered applied.
+    *persist_state = true;
 }
