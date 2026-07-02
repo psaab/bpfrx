@@ -147,3 +147,46 @@ the bad entry — never MISLABEL a session as a wrong-but-plausible application:
   skew) resolved to the malformed name instead of `UNKNOWN`. Both producers are
   fixed identically; `TestAppCatalogParityOnTolerantLoadPortEdges` pins them
   byte-identical and dangling-free.
+
+## ICMP type/code labeling (#3781 interim)
+
+The catalog wire (`AppCatalogEntrySnapshot`, `CatalogEntry`) is **L3/L4 only** —
+it has no ICMP type/code fields — so a catalog row for an ICMP application
+matches on protocol alone (a `(0,0)` destination-port pair). Policy MATCHING for
+`junos-ping`/`junos-pingv6` is echo-only (`PolicyApplicationSnapshot.icmp_type`,
+#3020), but the AppID LABEL catalog was not: an ICMP application that carries an
+`icmp-type`/`icmp-code` constraint still shipped a protocol-only row that matched
+**every** ICMP type. A non-echo ICMP (destination-unreachable, timestamp,
+ICMPv6 ND) that correctly fell to default-deny was then LOGGED in RT_FLOW /
+`show security flow session` with `application=junos-ping` — a false label. The
+verdict engine was correct; only the audit label was wrong (log-integrity, not a
+match fail-open).
+
+**Interim (Go-only, no wire change):**
+
+- `icmpTypeConstrained(app)` (`catalog.go`) reports whether an application has an
+  ICMP/ICMPv6 type or code constraint.
+- `BuildCatalog` (`catalog.go`) DROPS the over-matching protocol-only
+  `CatalogEntry` for such an app, but KEEPS its `AppNames[app_id] = name` row and
+  still CONSUMES the id — so the `AppNames` byte-identical parity with
+  `compileApplications` (`appid_catalog_parity_test.go`) is preserved. The
+  dropped entry means the helper never stamps that id, so the name is inert: a
+  non-echo (or echo) ICMP resolves to an honest `UNKNOWN` — or to
+  `junos-icmp-all` when a protocol-only ICMP app is also referenced — instead of
+  a false `junos-ping` label. An ICMP app WITHOUT a type/code constraint
+  (`junos-icmp-all`, a user protocol-only ICMP app) is unaffected.
+- `resolveTupleFallback` (`runtime.go`) skips a type-constrained ICMP app on the
+  AppID-disabled show/session-name path for the same reason (`matchTuple` is
+  protocol+port only, blind to ICMP type/code).
+- The protocol wire (`protocol_wire_v1.json`) is byte-identical: no field was
+  added, one fewer `Entries` element is shipped.
+
+**Deferred follow-up (per the #3781 /research plan):** the fully type/code-aware
+catalog is a two-sided wire change (`icmp_type`/`icmp_code` as `*uint8`
+omitempty on the Go snapshot + `Option<u8>` on the Rust `AppCatalogEntry`, with a
+Go↔Rust decode parity test) plus a type/code-aware `lookup*` in the Rust
+classifier and the deny/create label sites. Tier-2 (session close / `show
+security flow session` re-derivation, which crosses the HA session-sync wire) is
+a separate deliberate change requiring `test-failover`. The interim guarantees
+NO FALSE LABEL (honest `UNKNOWN`), NOT positive echo classification — that
+arrives with the deferred wire work.
