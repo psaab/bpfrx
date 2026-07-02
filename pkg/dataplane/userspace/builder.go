@@ -68,6 +68,13 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 	if err != nil {
 		return nil, err
 	}
+	// #3772 (M9): a kernel ip-rule enumeration failure fails the snapshot
+	// closed so the apply path retains the prior dataplane state rather
+	// than shipping a snapshot missing every route-leak route.
+	routes, err := buildRouteSnapshots(cfg, interfaces, routeOverlay)
+	if err != nil {
+		return nil, err
+	}
 	return &ConfigSnapshot{
 		Version:         ProtocolVersion,
 		Generation:      generation,
@@ -81,7 +88,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		Fabrics:         buildFabricSnapshots(cfg),
 		TunnelEndpoints: buildTunnelEndpointSnapshots(cfg, interfaces),
 		Neighbors:       buildNeighborSnapshots(cfg),
-		Routes:          buildRouteSnapshots(cfg, interfaces, routeOverlay),
+		Routes:          routes,
 		Flow:            buildFlowSnapshot(cfg),
 		DefaultPolicy:   policyActionString(cfg.Security.DefaultPolicy),
 		// #3534: thread the implicit-default-policy RT_FLOW log selection to the

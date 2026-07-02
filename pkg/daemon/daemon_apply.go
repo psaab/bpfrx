@@ -19,6 +19,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/eventengine"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/routing"
@@ -1365,10 +1366,15 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// d.daemonCtx so the TX/RX goroutines outlive this apply call.
 	d.reconcileLLDP(cfg)
 
-	// 17. Update event-options policies (RPM-driven failover)
-	if d.eventEngine != nil {
-		d.eventEngine.Apply(cfg.EventOptions)
-	}
+	// 17. Reconcile event-options policies (RPM-driven failover). Before
+	// #3752 this was a bare `if d.eventEngine != nil { Apply }`, and the
+	// engine was constructed at boot ONLY when the boot config already had
+	// policies — so committing the FIRST event-options policy on a running
+	// daemon (day-2) left d.eventEngine nil and the policy inert until a
+	// restart. The engine is now constructed unconditionally at boot
+	// (daemon_run.go, mirroring LLDP/dhcpRelay); reconcileEventOptions runs
+	// here on every day-2 commit so a first-enable takes effect immediately.
+	d.reconcileEventOptions(cfg)
 
 	// 17b. Reconcile RPM probes (#1827 PR-1a). Config-hash-gated: the
 	// probe set (and the probe next-hop pin rules) is re-applied only
@@ -1618,6 +1624,54 @@ func (d *Daemon) reconcileLLDP(cfg *config.Config) {
 		ctx = context.Background()
 	}
 	d.lldpMgr.Apply(ctx, want)
+}
+
+// initEventEngine constructs the event-options engine and registers the RPM
+// event callback (#3752). Like the LLDP manager and the DHCP relay manager, it
+// is created UNCONDITIONALLY at boot — not gated on the boot config already
+// carrying an event-options policy — so:
+//
+//   - the d.eventEngine pointer is written exactly ONCE at boot and read-only
+//     thereafter, keeping the lock-free reads on the `Stats()` metric/CLI
+//     handler goroutines race-free (the same pointer-race discipline #2372
+//     established for d.lldpMgr); and
+//   - a day-2 commit enabling the FIRST event-options policy takes effect
+//     immediately via reconcileEventOptions, instead of being inert until a
+//     daemon restart (the #3752 defect).
+//
+// The engine routes its remediation commit through d.commitAndApply so it
+// serializes with HTTP/gRPC commits under d.applySem (#846). Event-options
+// changes do not sync to the peer — the engine fires independently on each
+// node from that node's local RPM events. Idempotent: a second call is a no-op.
+func (d *Daemon) initEventEngine() {
+	if d.eventEngine != nil {
+		return
+	}
+	d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
+		return d.commitAndApply(ctx, comment, false)
+	})
+	if d.rpm != nil {
+		d.rpm.SetEventCallback(d.eventEngine.HandleEvent)
+	}
+	slog.Info("event-options engine constructed")
+}
+
+// reconcileEventOptions applies the committed event-options policy set to the
+// engine on every commit (#3752). The engine is constructed once at boot
+// (initEventEngine); this only ever calls Apply, which RECONCILES per-policy
+// runtime state (carrying cooldown/window memory forward for unchanged
+// policies, #2140). It NEVER reassigns the pointer. A nil cfg (or empty policy
+// set) applies zero policies — a no-op that also clears a removed set.
+func (d *Daemon) reconcileEventOptions(cfg *config.Config) {
+	if d.eventEngine == nil {
+		// Defensive: boot wiring constructs the engine before any reconcile.
+		return
+	}
+	var policies []*config.EventPolicy
+	if cfg != nil {
+		policies = cfg.EventOptions
+	}
+	d.eventEngine.Apply(policies)
 }
 
 // lldpConfigEqual reports whether two effective LLDP configs are equivalent for

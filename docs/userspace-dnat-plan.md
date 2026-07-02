@@ -667,6 +667,45 @@ the source-NAT range fields carry; an older Go binary omits it and the newer
 helper falls back to the per-port `destination_port` expansion such a binary
 still emits.
 
+## 13b. Reversed application port range fails closed (#3726)
+
+`appPortsFromSpec` (`pkg/dataplane/userspace/nat.go`) expands an application's
+`source-port` / `destination-port` spec into concrete ports for the NAT match
+terms. For a `lo-hi` range it expanded only when `hi > lo`; for every other case
+it returned `[]int{lo}` — so a REVERSED range (`200-100`, `lo > hi`) silently
+narrowed to an EXACT match on the low port (200) instead of a never-match. The
+`hi == lo` case (e.g. `100-100`) legitimately returns `[lo]`.
+
+- **H04** — a reversed application `destination-port` referenced by a source- or
+  destination-NAT rule translated traffic on port 200 (the low bound), even
+  though the configured range is invalid and can never match a real flow.
+
+Strict commit rejects `lo > hi` (`pkg/config` range validation), so this is the
+#1960 tolerant-load / peer-sync backstop — the same accepted threat model as
+§13 (#3446) and the source-port / ICMP work (#3437 / #3491).
+
+- **Helper fix (`appPortsFromSpec`).** A reversed range (`hi < lo`) returns `nil`
+  (not `[]int{lo}`), so the caller sees "configured but unrepresentable" and
+  fails CLOSED. `hi == lo` keeps its single exact port; valid `lo < hi` ranges
+  expand unchanged.
+
+- **Source-NAT** already failed closed on this signal: `buildSourceNATAppTerms`
+  emits the `natNeverMatchPortRange` sentinel when a non-empty spec coalesces to
+  nothing (the #3429 / #3491 guard), so a reversed range now yields the
+  never-match `{Low:1, High:0}` term instead of an exact-200 match.
+
+- **Destination-NAT** needed a matching guard. The app-term builder stored the
+  coalesced ports but LOST the "a port was configured" signal, so a `nil` port
+  slice fell through to the wildcard match-any-port default (`destination_port
+  == 0`) — a fail-OPEN that widened the rule to every port (the same latent gap
+  hit an all-out-of-range `70000-80000` app spec). The `appTerm` now carries
+  `dstPortConfigured` (true when the application named a non-empty
+  destination-port), and the port-filtering loop treats a configured-but-empty
+  term as `portConfigured` → it emits NO snapshot for that term (the rule
+  installs nothing and does not translate), matching the §13 fail-closed
+  posture. A valid or `hi==lo` app destination-port still publishes its exact
+  DNAT entry.
+
 ## 14. DNAT pool port/address validation (#3450)
 
 A destination-NAT **pool**'s translated `port` and `address` had NO strict

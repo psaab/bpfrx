@@ -579,6 +579,17 @@ func appPortsFromSpec(spec string) []int {
 			}
 			return ports
 		}
+		if hi < lo {
+			// #3726: a REVERSED range ("200-100", lo>hi) is invalid — it can
+			// never match any port. Return nil (not []int{lo}) so the caller
+			// treats it as "configured but unrepresentable" and fails CLOSED
+			// via the never-match sentinel, rather than silently narrowing the
+			// NAT rule to an exact match on the low port. Strict commit already
+			// rejects lo>hi (pkg/config range validation); this hardens the
+			// #1960 tolerant-load / peer-sync backstop. The hi==lo case below
+			// is a legitimate single exact port.
+			return nil
+		}
 		return []int{int(lo)}
 	}
 	p, err := strconv.ParseUint(spec, 10, 16)
@@ -788,6 +799,15 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				srcPorts []NatPortRangeWire
 				icmpType *uint8
 				icmpCode *uint8
+				// dstPortConfigured records that the application specified a
+				// non-empty destination-port spec, even if it coalesced to no
+				// representable port (all out of 1..65535, or a reversed
+				// "200-100" range rejected by appPortsFromSpec, #3726). The
+				// port-filtering loop below reads this so a configured-but-
+				// unrepresentable app destination-port fails CLOSED (never
+				// match) instead of widening to the wildcard match-any-port
+				// term — the DNAT analog of the source-NAT #3429/#3491 guard.
+				dstPortConfigured bool
 			}
 			var appTerms []appTerm
 
@@ -800,11 +820,12 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 					srcPorts = []NatPortRangeWire{natNeverMatchPortRange}
 				}
 				return appTerm{
-					proto:    a.Protocol,
-					ports:    appPortsFromSpec(a.DestinationPort),
-					srcPorts: srcPorts,
-					icmpType: a.ICMPType,
-					icmpCode: a.ICMPCode,
+					proto:             a.Protocol,
+					ports:             appPortsFromSpec(a.DestinationPort),
+					srcPorts:          srcPorts,
+					icmpType:          a.ICMPType,
+					icmpCode:          a.ICMPCode,
+					dstPortConfigured: a.DestinationPort != "",
 				}
 			}
 
@@ -905,7 +926,13 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				portRanges := coalescePortRanges(term.ports)
 				// Did this rule CONFIGURE a destination-port at all? A configured
 				// port that survived to no valid value must not become wildcard.
-				portConfigured := len(term.ports) > 0 ||
+				// #3726: term.dstPortConfigured is true when the application named
+				// a destination-port that coalesced to nothing (all out of
+				// 1..65535, or a reversed "200-100" range now rejected by
+				// appPortsFromSpec). Without this the app term's empty ports
+				// slipped through to the wildcard match-any-port default — a
+				// fail-open that widened the DNAT rule to every port.
+				portConfigured := len(term.ports) > 0 || term.dstPortConfigured ||
 					(explicitFallback && (rule.Match.DestinationPort != 0 || len(rule.Match.InvalidDestinationPorts) > 0))
 				if len(portRanges) == 0 {
 					switch {

@@ -468,6 +468,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.ipmon = ipmon.New(d.actuateRouteOverlay)
 	d.rpm.SetTransitionCallback(d.ipmon.HandleTransition)
 
+	// Construct the event-options engine and register its RPM event callback
+	// HERE — BEFORE the first applyConfig runs reconcileRPM and starts the
+	// probe goroutines (#3755). runProbeLoop runs its FIRST cycle immediately,
+	// so a ping_probe_failed / ping_test_failed / ping_test_completed emitted by
+	// that first cycle would be dropped (fireEvent is a no-op while onEvent is
+	// nil) if the callback were installed later — a boot-time failover edge the
+	// automation exists to handle, lost for long test-interval values. Wiring
+	// the callback before probes start closes that gap; rpm additionally buffers
+	// any event fired before a callback exists and replays it on registration,
+	// as a belt against a future reorder. Idempotent (write-once pointer).
+	d.initEventEngine()
+
 	// Create the DHCP manager eagerly, beside the ipmon engine (#1844
 	// plan §4.3, AGY r2-1/r2-2): d.dhcp is write-once at boot and
 	// read-only thereafter — the engine's run-loop goroutine (via the
@@ -964,20 +976,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.reconcileLLDP(cfg)
 	}
 
-	// Start event-options engine if configured.
-	if cfg := d.store.ActiveConfig(); cfg != nil && len(cfg.EventOptions) > 0 {
-		// #846: route through commitAndApply so the engine's commit
-		// serializes with HTTP/gRPC commits under d.applySem.
-		// Event-options changes don't sync to peer (the engine fires
-		// independently on each node based on local RPM events).
-		d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
-			return d.commitAndApply(ctx, comment, false)
-		})
-		d.eventEngine.Apply(cfg.EventOptions)
-		if d.rpm != nil {
-			d.rpm.SetEventCallback(d.eventEngine.HandleEvent)
-		}
-		slog.Info("event-options engine started", "policies", len(cfg.EventOptions))
+	// Event-options engine safety net. The engine was already constructed and
+	// its RPM callback registered earlier (initEventEngine, before probes
+	// started, #3755), and the boot applyConfig reconciled the policy set via
+	// applyConfigLocked step 17. This mirrors the reconcileRPM/reconcileLLDP
+	// boot safety nets above: it covers the bootstrap-mode path where the boot
+	// applyConfig was suppressed, so a bootstrap-exit still loads any policies.
+	// reconcileEventOptions is idempotent (Apply reconciles state), so a repeat
+	// on the normal path is harmless (#3752).
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.reconcileEventOptions(cfg)
 	}
 
 	// Start DHCP relay. The Manager is always created (not gated on a
@@ -1306,6 +1314,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// #2464: per-collector NetFlow v9 / IPFIX write-health for the
 			// xpf_flow_export_collector_* family + /services/flow-exporters.
 			FlowCollectorHealthFn: d.FlowCollectorHealth,
+			// #3747: per-exporter pending-batch queue depth / high-water /
+			// dropped-at-capacity count for the xpf_flow_export_batch_* family.
+			FlowExportBatchStatsFn: d.FlowExportBatchStats,
 			// #3419 M6: report whether this node is the active cluster member
 			// for RG0 so the REST session view's ha_active field matches the
 			// gRPC contract (server_sessions.go IsLocalPrimary(0)). Standalone
@@ -1927,7 +1938,7 @@ var linkLocalV6Net = func() *net.IPNet {
 	return n
 }()
 
-func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]string {
+func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.RouteOverlayEntry) map[string]map[string]string {
 	type connectedPrefix struct {
 		net       *net.IPNet
 		ifName    string
@@ -2159,6 +2170,42 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 		}
 		addRoutes(vrfName, ri.StaticRoutes)
 		addRoutes(vrfName, ri.Inet6StaticRoutes)
+	}
+
+	// #3759: feed the ip-monitoring effective-route overlay's literal
+	// next-hops through the SAME resolution as configured statics. The
+	// overlay renders via generateStaticRouteInTable with this exact
+	// IPv6NextHopInterfaces map (renderPreferredRoutes), so a link-local
+	// preferred-route next-hop (fe80::…, common for an IPv6 WAN gateway)
+	// needs an interface scope attached here — FRR rejects a scopeless
+	// `ipv6 route ::/0 fe80::1`. Previously the overlay entries were never
+	// fed in, so the map was always absent for the failover gateway and the
+	// route silently failed to install exactly when a link went down. The
+	// per-entry VRF key must match what renderPreferredRoutes passes to
+	// generateStaticRouteInTable: "" for the master table AND for
+	// instance-type forwarding (which renders via `table <id>`, vrfName ==
+	// ""), "vrf-<name>" for a virtual-router instance. A global-unicast
+	// next-hop resolves by longest-prefix as usual (bare if it matches no
+	// connected subnet — FRR accepts a scopeless global next-hop); an
+	// ambiguous or unresolvable link-local stays unresolved, exactly like a
+	// static route (the operator must add a disambiguating interface).
+	for _, entry := range overlay {
+		if entry.NextHop == "" || !strings.Contains(entry.NextHop, ":") {
+			continue
+		}
+		vrfName := ""
+		if entry.RoutingInstance != "" {
+			vrfName = "vrf-" + entry.RoutingInstance
+			for _, ri := range cfg.RoutingInstances {
+				if ri != nil && ri.Name == entry.RoutingInstance {
+					if ri.InstanceType == "forwarding" {
+						vrfName = ""
+					}
+					break
+				}
+			}
+		}
+		setResolved(vrfName, entry.NextHop, resolve(connectedByVRF[vrfName], entry.NextHop))
 	}
 	return resolved
 }

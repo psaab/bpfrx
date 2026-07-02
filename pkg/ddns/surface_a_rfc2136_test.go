@@ -110,6 +110,56 @@ func TestSurfaceARealBackendReplacesOnAddressChange(t *testing.T) {
 	}
 }
 
+// #3739 (M08): a co-resident FOREIGN A at the self-owned name must SURVIVE both
+// the first publish and a later renumber. The old sendAddSelfOwned did a
+// delete-RRset (CLASS=ANY) of the whole A set before inserting, destroying any
+// foreign value; the value-specific replace now removes ONLY xpf's own prior
+// rdata (exact-RR delete) so the foreign record is never collateral. Reverting
+// sendAddSelfOwned to RemoveRRset makes the first zoneHas(foreign) assertion RED
+// (the foreign A is wiped on the first publish).
+func TestSurfaceARealBackendPreservesForeignRecord(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	m := newSurfaceAManagerRealBackend(t, srv)
+	catalog := map[string]*config.DDNSProvider{"corp-2136": {Name: "corp-2136", Backend: "rfc2136"}}
+	sc := realScope("wan.example.net")
+
+	// A human/other appliance already published a FOREIGN A at the shared name.
+	const foreign = "198.51.100.20"
+	srv.seedRR(aRR("wan.example.net", foreign))
+
+	// First publish (no prior xpf value ⇒ Insert-only, additive): xpf's A must
+	// coexist with the foreign one — neither is destroyed.
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, catalog); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	if !srv.zoneHas(aRR("wan.example.net", foreign)) {
+		t.Fatal("M08: a co-resident FOREIGN A must survive xpf's first publish (Insert-only, not delete-RRset)")
+	}
+	if !srv.zoneHas(aRR("wan.example.net", "203.0.113.5")) {
+		t.Fatal("xpf's own A must be published alongside the foreign record")
+	}
+
+	// Renumber xpf's own value: Remove(old-xpf)+Insert(new-xpf) in one atomic
+	// UPDATE. The foreign A survives; the OLD xpf value is gone; the NEW is live.
+	m.now = func() time.Time { return time.Unix(1_700_000_060, 0) }
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.9"), nil, catalog); err != nil {
+		t.Fatalf("renumber: %v", err)
+	}
+	if !srv.zoneHas(aRR("wan.example.net", foreign)) {
+		t.Fatal("M08: the foreign A must survive an xpf renumber (exact-RR delete of only xpf's prior value)")
+	}
+	if !srv.zoneHas(aRR("wan.example.net", "203.0.113.9")) {
+		t.Fatal("renumber must publish the NEW xpf value")
+	}
+	if srv.zoneHas(aRR("wan.example.net", "203.0.113.5")) {
+		t.Fatal("renumber must remove xpf's OWN prior value (203.0.113.5)")
+	}
+	if st := m.Stats(); st.UpsertFail != 0 {
+		t.Fatalf("no publish should have failed; got UpsertFail=%d", st.UpsertFail)
+	}
+}
+
 // MAJOR-1: a same-address forced-refresh of an existing name must succeed.
 func TestSurfaceARealBackendForcedRefreshSucceeds(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)

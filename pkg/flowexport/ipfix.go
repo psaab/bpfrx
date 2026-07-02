@@ -905,6 +905,17 @@ func (e *IPFIXExporter) RouteMaskUnresolved() uint64 {
 	return e.routeMaskUnresolved.Load()
 }
 
+// BatchDepth returns the current number of flow records pending in the export
+// batch (both families combined). See Exporter.BatchDepth (#3747).
+func (e *IPFIXExporter) BatchDepth() uint64 { return e.batch.depth() }
+
+// BatchMaxDepth returns the high-water mark of the pending batch depth (#3747).
+func (e *IPFIXExporter) BatchMaxDepth() uint64 { return e.batch.MaxDepth() }
+
+// BatchDropped returns the cumulative count of flow records dropped because
+// the export batch was at capacity. See Exporter.BatchDropped (#3747).
+func (e *IPFIXExporter) BatchDropped() uint64 { return e.batch.Dropped() }
+
 // CollectorHealth returns a per-collector write-health snapshot (#2464).
 func (e *IPFIXExporter) CollectorHealth() []CollectorHealth {
 	return e.conns.health()

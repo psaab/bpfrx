@@ -142,6 +142,16 @@ type Manager struct {
 	onEvent      EventCallback
 	onTransition TransitionCallback
 
+	// bufferedEvents holds events fired BEFORE an event-options callback was
+	// registered (#3755). The first probe cycle runs immediately when Apply
+	// starts a probe, so a probe-failed/test-failed/test-completed event can be
+	// emitted before SetEventCallback installs onEvent (boot ordering, or any
+	// late registration). Rather than drop that boot-time failover edge, the
+	// events are buffered and REPLAYED to the callback the moment it is
+	// registered. Bounded by maxBufferedEvents so a permanently-absent callback
+	// (event-options never configured) cannot grow it without limit.
+	bufferedEvents []Event
+
 	// rethMap translates Junos RETH names to physical members for
 	// destination-interface resolution (set by the daemon in cluster
 	// mode before Apply).
@@ -194,11 +204,41 @@ type Manager struct {
 	resolveTarget func(ctx context.Context, target string, opts probeSockOpts) (*net.IPAddr, error)
 }
 
-// SetEventCallback registers a callback for RPM events.
+// maxBufferedEvents bounds the pre-registration event buffer (#3755) so a
+// callback that never arrives cannot grow it without limit. The buffer only
+// holds the small burst a first probe cycle can produce before the callback is
+// installed; in the normal daemon boot the callback is registered before any
+// probe starts (initEventEngine precedes reconcileRPM), so it stays empty.
+const maxBufferedEvents = 64
+
+// SetEventCallback registers a callback for RPM events. Any events buffered
+// before a callback existed (a first probe cycle that ran before the
+// event-options callback was wired) are REPLAYED to the new callback in FIFO
+// order, so a boot-time failover edge is not lost (#3755). The replay runs
+// OUTSIDE m.mu because the callback (eventengine.HandleEvent) takes its own
+// locks; holding m.mu across it would invert the lock order.
 func (m *Manager) SetEventCallback(fn EventCallback) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.onEvent = fn
+	var replay []Event
+	if fn != nil && len(m.bufferedEvents) > 0 {
+		replay = m.bufferedEvents
+		m.bufferedEvents = nil
+	}
+	m.mu.Unlock()
+
+	for _, ev := range replay {
+		fn(ev)
+	}
+}
+
+// HasEventCallback reports whether an event-options callback is currently
+// registered. Used by the daemon boot-ordering tests to assert the callback is
+// wired before RPM probes start (#3755).
+func (m *Manager) HasEventCallback() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.onEvent != nil
 }
 
 // SetTransitionCallback registers a callback for per-test pass/fail
@@ -270,12 +310,21 @@ func (m *Manager) PinInstallFailureCount() int {
 }
 
 func (m *Manager) fireEvent(name, owner, testName string) {
-	m.mu.RLock()
+	ev := Event{Name: name, TestOwner: owner, TestName: testName}
+	m.mu.Lock()
 	fn := m.onEvent
-	m.mu.RUnlock()
-	if fn != nil {
-		fn(Event{Name: name, TestOwner: owner, TestName: testName})
+	if fn == nil {
+		// No event-options callback yet: buffer the event so a first-cycle
+		// failover edge is not lost, and replayed when a callback registers
+		// (#3755). Bounded — drop once the cap is reached.
+		if len(m.bufferedEvents) < maxBufferedEvents {
+			m.bufferedEvents = append(m.bufferedEvents, ev)
+		}
+		m.mu.Unlock()
+		return
 	}
+	m.mu.Unlock()
+	fn(ev)
 }
 
 func (m *Manager) fireTransition(owner, testName, status string) {

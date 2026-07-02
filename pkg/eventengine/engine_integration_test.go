@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -313,6 +314,84 @@ func TestRetry_TimerStoppedOnEngineStop(t *testing.T) {
 	if !got {
 		t.Fatal("retry backoff timer was NOT stopped on stopCh — a plain" +
 			" time.After leaks its runtime timer until the backoff elapses (#2890)")
+	}
+}
+
+// #3754: an autonomous remediation commit must carry a deterministic audit
+// description naming the policy and its triggering event, so an operator can
+// tell from commit/rollback history WHICH event policy mutated the config and
+// WHY. Before the fix the engine committed with an empty comment
+// (commitFn(ctx, "")), landing the mutation in history as an ordinary
+// unattributed commit.
+//
+// FAIL-ON-REVERT: this test captures the comment threaded into commitFn and
+// asserts it names the policy, the event, and the command count. Reverting to
+// commitFn(ctx, "") makes the captured comment empty and the test goes RED.
+func TestRemediation_CommitCarriesAuditDescription(t *testing.T) {
+	s := newStore(t)
+	pol := &config.EventPolicy{
+		Name:         "wan-failover",
+		Events:       []string{"ping_test_failed"},
+		ThenCommands: []string{"set system host-name remediated"},
+	}
+
+	var mu sync.Mutex
+	var gotComment string
+	commitFn := func(ctx context.Context, comment string) (*config.Config, error) {
+		mu.Lock()
+		gotComment = comment
+		mu.Unlock()
+		// Promote the candidate so the engine's arm-on-commit path runs like
+		// the real daemon commitAndApply would.
+		return s.Commit()
+	}
+
+	e := New(s, commitFn)
+	defer e.Close()
+	e.Apply([]*config.EventPolicy{pol})
+
+	e.HandleEvent(rpm.Event{Name: "ping_test_failed", TestOwner: "Comcast", TestName: "wan"})
+	waitFor(t, "committed counter", func() bool { return e.Stats().Committed >= 1 })
+
+	mu.Lock()
+	comment := gotComment
+	mu.Unlock()
+
+	if comment == "" {
+		t.Fatal("remediation commit carried an empty comment; the audit " +
+			"description was not threaded (#3754)")
+	}
+	for _, want := range []string{"wan-failover", "ping_test_failed", "Comcast", "wan"} {
+		if !strings.Contains(comment, want) {
+			t.Errorf("audit description %q does not contain %q", comment, want)
+		}
+	}
+}
+
+// #3754: the standalone (no-commitFn) path also records the description in the
+// commit journal — the attribution is identical regardless of whether the
+// daemon commitAndApply hook is wired.
+func TestRemediation_StandaloneCommitDescription(t *testing.T) {
+	s := newStore(t)
+	pol := &config.EventPolicy{
+		Name:         "p",
+		Events:       []string{"ping_test_failed"},
+		ThenCommands: []string{"set system host-name x", "set system domain-name y"},
+	}
+	e := New(s, nil)
+	defer e.Close()
+	e.Apply([]*config.EventPolicy{pol})
+
+	e.HandleEvent(eventFor("ping_test_failed"))
+	waitFor(t, "committed counter", func() bool { return e.Stats().Committed >= 1 })
+
+	got := remediationDescription(plannedAction{
+		policyName: "p", event: "ping_test_failed", testOwner: "owner", testName: "tname",
+		ops: []plannedOp{{}, {}},
+	})
+	want := "event-options policy p: ping_test_failed/owner/tname (2 commands)"
+	if got != want {
+		t.Fatalf("remediationDescription = %q, want %q", got, want)
 	}
 }
 

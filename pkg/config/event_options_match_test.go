@@ -11,24 +11,25 @@ import (
 func TestEventAttributesMatch_ParseLine(t *testing.T) {
 	cases := []struct {
 		in        string
+		wantEvent string
 		wantField string
 		wantPat   string
 		wantOK    bool
 	}{
-		{`ping_test_failed.test-owner matches ^Comcast$`, "test-owner", "^Comcast$", true},
-		{`ping_test_failed.test-name matches .*down`, "test-name", ".*down", true},
+		{`ping_test_failed.test-owner matches ^Comcast$`, "ping_test_failed", "test-owner", "^Comcast$", true},
+		{`ping_test_failed.test-name matches .*down`, "ping_test_failed", "test-name", ".*down", true},
 		// no separator
-		{`ping_test_failed.test-owner Comcast`, "", "", false},
+		{`ping_test_failed.test-owner Comcast`, "", "", "", false},
 		// no dot in field spec
-		{`testowner matches Comcast`, "", "", false},
+		{`testowner matches Comcast`, "", "", "", false},
 		// empty pattern
-		{`ping_test_failed.test-owner matches `, "", "", false},
+		{`ping_test_failed.test-owner matches `, "", "", "", false},
 	}
 	for _, c := range cases {
-		field, pat, ok := ParseEventAttributesMatch(c.in)
-		if ok != c.wantOK || field != c.wantField || pat != c.wantPat {
-			t.Errorf("ParseEventAttributesMatch(%q) = (%q,%q,%v); want (%q,%q,%v)",
-				c.in, field, pat, ok, c.wantField, c.wantPat, c.wantOK)
+		event, field, pat, ok := ParseEventAttributesMatch(c.in)
+		if ok != c.wantOK || event != c.wantEvent || field != c.wantField || pat != c.wantPat {
+			t.Errorf("ParseEventAttributesMatch(%q) = (%q,%q,%q,%v); want (%q,%q,%q,%v)",
+				c.in, event, field, pat, ok, c.wantEvent, c.wantField, c.wantPat, c.wantOK)
 		}
 	}
 }
@@ -139,24 +140,54 @@ func TestEventAttributesMatch_UnknownFieldRejectedAtCommit(t *testing.T) {
 // (unit-level) and accepts a well-formed known-field line.
 func TestValidateEventAttributesMatchStrict_Direct(t *testing.T) {
 	good := &Config{EventOptions: []*EventPolicy{
-		{Name: "ok", AttributesMatch: []string{`ev.test-owner matches ^a+b*$`}},
+		{Name: "ok", Events: []string{"ev"}, AttributesMatch: []string{`ev.test-owner matches ^a+b*$`}},
 	}}
 	if err := ValidateEventAttributesMatchStrict(good); err != nil {
 		t.Fatalf("valid line rejected by strict validator: %v", err)
 	}
 
 	malformed := &Config{EventOptions: []*EventPolicy{
-		{Name: "m", AttributesMatch: []string{`no separator here`}},
+		{Name: "m", Events: []string{"ev"}, AttributesMatch: []string{`no separator here`}},
 	}}
 	if err := ValidateEventAttributesMatchStrict(malformed); err == nil {
 		t.Fatal("strict validator accepted a malformed line")
 	}
 
 	unknown := &Config{EventOptions: []*EventPolicy{
-		{Name: "u", AttributesMatch: []string{`ev.bogus matches ^x$`}},
+		{Name: "u", Events: []string{"ev"}, AttributesMatch: []string{`ev.bogus matches ^x$`}},
 	}}
 	if err := ValidateEventAttributesMatchStrict(unknown); err == nil {
 		t.Fatal("strict validator accepted an unknown field")
+	}
+}
+
+// #3753: an attributes-match line scoped to an event the policy does NOT
+// declare is rejected at strict commit (it can never apply, and the old
+// prefix-dropping parse silently gated the wrong event). RED-on-revert:
+// without the eventNameInPolicy check the out-of-scope constraint is accepted.
+func TestValidateEventAttributesMatchStrict_EventNameScope(t *testing.T) {
+	// event_b IS declared: accepted.
+	inScope := &Config{EventOptions: []*EventPolicy{{
+		Name:            "p",
+		Events:          []string{"ping_test_failed", "ping_test_completed"},
+		AttributesMatch: []string{`ping_test_completed.test-owner matches ^x$`},
+	}}}
+	if err := ValidateEventAttributesMatchStrict(inScope); err != nil {
+		t.Fatalf("in-scope event prefix rejected: %v", err)
+	}
+
+	// ping_probe_failed is NOT one of the policy's events: rejected.
+	outOfScope := &Config{EventOptions: []*EventPolicy{{
+		Name:            "p",
+		Events:          []string{"ping_test_failed", "ping_test_completed"},
+		AttributesMatch: []string{`ping_probe_failed.test-owner matches ^x$`},
+	}}}
+	err := ValidateEventAttributesMatchStrict(outOfScope)
+	if err == nil {
+		t.Fatal("strict validator accepted an attributes-match scoped to an event not in the policy")
+	}
+	if !strings.Contains(err.Error(), "ping_probe_failed") {
+		t.Fatalf("commit error %q does not name the out-of-scope event", err)
 	}
 }
 

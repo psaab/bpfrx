@@ -1119,6 +1119,17 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		}
 	}
 
+	// Thread the previously-published rdata to the backend (#3739) so a
+	// self-owned publish can do a VALUE-SPECIFIC in-place replace — touch only
+	// xpf's own prior value, never a co-resident FOREIGN record at a shared
+	// name. On a first publish (or a lost prior value) PrevAddr stays invalid and
+	// the backend does an additive insert/create instead of clobbering the name.
+	if prevAddr != "" {
+		if pa, perr := netip.ParseAddr(prevAddr); perr == nil {
+			rec.PrevAddr = pa.Unmap()
+		}
+	}
+
 	// Non-secret backend fingerprint for this publish (#3735). Stored on the owned
 	// record so a later provider identity change is detectable, and compared here
 	// against the previous publish's fingerprint to catch an IN-PLACE provider
@@ -1281,6 +1292,13 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 		m.deleteFail++
 		return err
 	}
+	// #3738: flag whether a SIBLING family is still owned at this {provider,
+	// FQDN}. A host-granular-withdraw backend (DuckDNS clear=true, dyndns2
+	// offline=YES — both take the WHOLE hostname down) uses this to SKIP its
+	// destructive verb so it does not blackhole the still-live sibling family;
+	// per-family backends (rfc2136/cloudflare/route53/bind) ignore it. Computed
+	// under the lock from the current ownership store.
+	rec.SiblingFamilyOwned = m.siblingFamilyOwnedLocked(owned)
 	// Perform the wire DeleteLease with m.mu RELEASED (#2778): the 15s-timeout
 	// provider call must not block StatusViews/Stats/other scopes.
 	wireErr := m.providerIO(func() error { return backend.DeleteLease(ctx, rec) })
@@ -1307,6 +1325,42 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 	m.clearOrphan(owned)
 	slog.Info("ddns surface-a: withdrew record", "fqdn", owned.FQDN, "addr", owned.AddrText)
 	return nil
+}
+
+// siblingFamilyOwnedLocked reports whether ANOTHER owned record shares this
+// record's published FQDN and provider under the OPPOSITE address family — the
+// dual-stack same-name topology (#3738). A host-granular-withdraw backend
+// (DuckDNS clear=true / dyndns2 offline=YES, which take the WHOLE hostname down)
+// uses this to SUPPRESS its destructive verb so a single-family withdraw does
+// not blackhole the still-live sibling. The match is on {PolicyID, FQDN,
+// opposite Family}: the collateral-damage condition is precisely a co-located
+// sibling at the SAME provider — a same-name record at a DIFFERENT provider is a
+// different authoritative server the verb cannot touch, so it is not a sibling
+// for this purpose. The record's own entry (same Family) is skipped, so it never
+// self-matches. Caller holds m.mu.
+func (m *SurfaceAManager) siblingFamilyOwnedLocked(owned ownedRecord) bool {
+	osc := owned.scopeOf()
+	fqdn := canonicalDDNSName(owned.FQDN)
+	for _, r := range m.state.all() {
+		if r.Family == owned.Family {
+			continue
+		}
+		if r.scopeOf().PolicyID != osc.PolicyID {
+			continue
+		}
+		if canonicalDDNSName(r.FQDN) == fqdn {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalDDNSName normalizes a published FQDN for equality comparison: trim
+// surrounding whitespace, drop a single trailing dot, and lowercase (DNS names
+// are case-insensitive). Used by the #3738 sibling-family scan so "Home.duckdns.org."
+// and "home.duckdns.org" resolve to the same name.
+func canonicalDDNSName(fqdn string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(fqdn), "."))
 }
 
 // backendFor resolves the live Backend for a scope's provider (resolve-per-

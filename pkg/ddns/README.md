@@ -23,9 +23,9 @@ moved with its assertions intact.
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, the `ForceRefresh()` operator force-now latch (#3276), per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). **Operator-hostname intent (#2779):** the publish path (`surfaceAName` → `sanitizeFQDN`) lower-cases + strips non-LDH characters + drops empty-sanitizing labels. For a *router-owned* Surface A record the hostname is operator intent (the operator types the exact public name), so a name that sanitization would STRUCTURALLY change is now a **commit error** (`config.ValidateDDNSHostname` on the typed `interfaces … dynamic-dns hostname` leaf) instead of a silent rewrite to a different DNS name — e.g. `wan_1.example.net` is rejected at commit rather than published as `wan1.example.net`. Case-folding and a single trailing dot are accepted (benign DNS canonicalizations). Every name that PASSES the commit check is a fixed point of `sanitizeFQDN` (cross-package contract test `surface_a_hostname_2779_test.go`), so the published name equals operator intent. |
 | `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. **Source binding (#2846):** `newHTTPClientBound(bindConfig)` installs the SAME `backend_bind.go` source/interface/VRF `Dialer` (via `Transport.DialContext`) so the HTTP backends + checkip egress from the operator-configured `source-address` / `destination-interface` / `routing-instance` — not the kernel default route. `newHTTPClient()` is the no-bind alias (unbound default, behaviour unchanged). `resolveProviderBindConfig`/`newProviderHTTPClient` adapt a `config.DDNSProvider`'s leaves onto `resolveBindConfig`; a malformed `source-address` is a hard error so the backend constructor degrades to no-op (fail-open, mirrors rfc2136). |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
-| `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that Route 53 / RFC 2136 also enforce. `recs[0]` is an API-ordering artifact, not ownership. |
-| `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). **DuckDNS is NOT here (#2960):** DuckDNS is not dyndns2-protocol-compatible, so it has its own `backend_duckdns.go`; `duckdns` was removed from `dyndns2Endpoints`. **Server validation (#3737):** `resolveDyndns2Endpoint` decides full-URL vs bare-host on the `://` delimiter, parses the URL with `url.Parse`, compares the scheme with `strings.EqualFold` (case-INSENSITIVE per RFC 3986 §3.1, so `HTTPS://host` is accepted — the old case-sensitive `HasPrefix` misclassified it as a bare host and produced a doubly-suffixed malformed URL), and requires a non-empty `Hostname()` in BOTH cases so a hostless value (`http://`, `https:///nic/update`, `:8080`) fails at construction (manager falls back to no-op) instead of only at the first publish. This is the SAME discipline as checkip's `validateCheckIPURL` (#2842) and generic's `validateGenericURLTemplate` (#2841). A malformed `server` is also warned at commit by `config.validateSurfaceADDNSWarnings` (mirror `ddnsDyndns2ServerValid`, RedactURL'd in the message). |
-| `backend_duckdns.go` | DuckDNS backend (#2960): its OWN backend, not a dyndns2 alias. `UpsertLease` issues `GET /update?domains=<label>&token=<tok>&ip=<v4>` (or `&ipv6=<v6>` for AAAA) — the token is a QUERY param (the DuckDNS auth model), not HTTP Basic; the `domains` value is the bare subdomain label (`duckdnsDomain` strips a trailing dot + a `.duckdns.org` suffix). Success is the literal `OK` body (`KO` ⇒ hard auth/config error, `errHTTPAuth`); dyndns2's `good`/`nochg` is NOT a DuckDNS success. **Withdraw (#2960):** `DeleteLease` sends `&clear=true` (the DuckDNS clear verb, not dyndns2's `offline=YES`); DuckDNS clear has no per-family form, so it removes BOTH the A and the AAAA for the domain. The body verdict is parsed like an upsert, so a failed clear keeps ownership for retry. The token comes from the `api-token` leaf (reused from cloudflare). The endpoint defaults to `https://www.duckdns.org/update` and is `server`-overridable for test/mocking. **One family per name (#2960):** the DuckDNS update API has no per-family verb — omitting `ip=`/`ipv6=` makes DuckDNS AUTO-DETECT and SET that family ("If you do not specify the IP address, then it will be detected", duckdns.org/spec.jsp), so a v6-only update overwrites the A. Surface A scopes are per-family with no per-FQDN coalescing, so a dual-stack DuckDNS name has two scopes that clobber each other's A/AAAA on every reconcile. The supported topology is therefore ONE family per DuckDNS name; binding the same DuckDNS name on both `inet` and `inet6` is flagged at commit by `config.validateSurfaceADDNSWarnings`. |
+| `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → list → PATCH/POST/DELETE record. **Upsert is value-specific (#3739 H11):** `UpsertLease` lists EVERY A/AAAA at the name and touches ONLY xpf's own row — a row already carrying the new value is a no-op, else the row carrying xpf's PREVIOUS value (`rec.PrevAddr`) is PATCHed in place, else a new record is POSTed. It NEVER PATCHes `recs[0]` (an API-ordering artifact), so a co-resident FOREIGN A/AAAA a human set on the same name is never rewritten to xpf's address. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that RFC 2136 also enforces (Route 53 replaces the whole RRSet on upsert — see the P2 note). `recs[0]` is an API-ordering artifact, not ownership. |
+| `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). **Dual-stack sibling guard (#3738):** `offline=YES` is HOSTNAME-level (both A and AAAA); when the engine sets `LeaseDNSRecord.SiblingFamilyOwned` (a sibling family is still published at this name/provider) `DeleteLease` SKIPS the offline so the live sibling is preserved (see "Dual-stack same-name withdraw" below). **DuckDNS is NOT here (#2960):** DuckDNS is not dyndns2-protocol-compatible, so it has its own `backend_duckdns.go`; `duckdns` was removed from `dyndns2Endpoints`. **Server validation (#3737):** `resolveDyndns2Endpoint` decides full-URL vs bare-host on the `://` delimiter, parses the URL with `url.Parse`, compares the scheme with `strings.EqualFold` (case-INSENSITIVE per RFC 3986 §3.1, so `HTTPS://host` is accepted — the old case-sensitive `HasPrefix` misclassified it as a bare host and produced a doubly-suffixed malformed URL), and requires a non-empty `Hostname()` in BOTH cases so a hostless value (`http://`, `https:///nic/update`, `:8080`) fails at construction (manager falls back to no-op) instead of only at the first publish. This is the SAME discipline as checkip's `validateCheckIPURL` (#2842) and generic's `validateGenericURLTemplate` (#2841). A malformed `server` is also warned at commit by `config.validateSurfaceADDNSWarnings` (mirror `ddnsDyndns2ServerValid`, RedactURL'd in the message). |
+| `backend_duckdns.go` | DuckDNS backend (#2960): its OWN backend, not a dyndns2 alias. `UpsertLease` issues `GET /update?domains=<label>&token=<tok>&ip=<v4>` (or `&ipv6=<v6>` for AAAA) — the token is a QUERY param (the DuckDNS auth model), not HTTP Basic; the `domains` value is the bare subdomain label (`duckdnsDomain` strips a trailing dot + a `.duckdns.org` suffix). Success is the literal `OK` body (`KO` ⇒ hard auth/config error, `errHTTPAuth`); dyndns2's `good`/`nochg` is NOT a DuckDNS success. **Withdraw (#2960):** `DeleteLease` sends `&clear=true` (the DuckDNS clear verb, not dyndns2's `offline=YES`); DuckDNS clear has no per-family form — the spec says `clear=true` "will ignore all ip's and clear both your records", so it removes BOTH the A and the AAAA for the domain. The body verdict is parsed like an upsert, so a failed clear keeps ownership for retry. **Dual-stack sibling guard (#3738):** when the engine sets `LeaseDNSRecord.SiblingFamilyOwned` (a sibling family is still published at this name/provider) `DeleteLease` SKIPS the clear so the live sibling is preserved (see "Dual-stack same-name withdraw" below). The token comes from the `api-token` leaf (reused from cloudflare). The endpoint defaults to `https://www.duckdns.org/update` and is `server`-overridable for test/mocking. **One family per name (#2960):** the DuckDNS update API has no per-family verb — omitting `ip=`/`ipv6=` makes DuckDNS AUTO-DETECT and SET that family ("If you do not specify the IP address, then it will be detected", duckdns.org/spec.jsp), so a v6-only update overwrites the A. Surface A scopes are per-family with no per-FQDN coalescing, so a dual-stack DuckDNS name has two scopes that clobber each other's A/AAAA on every reconcile. The supported topology is therefore ONE family per DuckDNS name; binding the same DuckDNS name on both `inet` and `inet6` is flagged at commit by `config.validateSurfaceADDNSWarnings`. |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. |
 | `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
 | `sigv4.go` | Minimal self-contained AWS SigV4 signer for Route 53 (no AWS SDK dependency). |
@@ -104,14 +104,43 @@ verb on any cadence is pointless. The terminal mark clears on a successful
 publish or a daemon restart (the runtime cache is rebuilt from the durable
 store), so a later provider change that adds a delete verb is re-probed.
 
-| backend | withdraw mechanism |
-|---|---|
-| `dyndns2` | the same update GET with `offline=YES` (the de-facto dyndns2 withdraw — dyn/no-ip/dns-o-matic take the hostname offline). Body verdict parsed like an upsert; a provider failure → non-nil error → ownership kept for retry. |
-| `duckdns` | the same update GET with `clear=true` (the DuckDNS clear verb, #2960 — NOT dyndns2's `offline=YES`). DuckDNS clear has no per-family form, so it removes BOTH the A and the AAAA for the domain (acceptable: Surface A withdraws only on scope teardown and the firewall is the sole owner of its own `duckdns.org` name). `OK`/`KO` body verdict parsed like an upsert; a failed clear → non-nil error → ownership kept for retry. |
-| `cloudflare` | real DELETE of the record (zone-id resolve → find → DELETE). |
-| `route53` | SigV4 `ChangeResourceRecordSets` DELETE change batch. |
-| `rfc2136` | exact-RR delete (TTL=0 / CLASS=NONE), DHCID-match guarded. |
-| `generic` | **no portable delete verb and no delete template → FAILS** (`errGenericDeleteUnsupported`). Ownership is kept so the abandoned record stays operator-visible; the operator clears it out of band (or uses a backend that supports a withdraw). |
+| backend | withdraw mechanism | per-family withdraw? |
+|---|---|---|
+| `dyndns2` | the same update GET with `offline=YES` (the de-facto dyndns2 withdraw — dyn/no-ip/dns-o-matic take the hostname offline). Body verdict parsed like an upsert; a provider failure → non-nil error → ownership kept for retry. | **No — HOST-level** (offline=YES takes down BOTH A and AAAA). |
+| `duckdns` | the same update GET with `clear=true` (the DuckDNS clear verb, #2960 — NOT dyndns2's `offline=YES`). The DuckDNS spec is explicit that `clear=true` "will ignore all ip's and clear both your records", so it removes BOTH the A and the AAAA for the domain. `OK`/`KO` body verdict parsed like an upsert; a failed clear → non-nil error → ownership kept for retry. | **No — HOST-level** (`clear=true` clears both families). |
+| `cloudflare` | real DELETE of the record (zone-id resolve → find → DELETE). | Yes — the exact A/AAAA RR. |
+| `route53` | SigV4 `ChangeResourceRecordSets` DELETE change batch. | Yes — the exact A/AAAA RR. |
+| `rfc2136` | exact-RR delete (TTL=0 / CLASS=NONE), DHCID-match guarded. | Yes — the exact A/AAAA RR. |
+| `generic` | **no portable delete verb and no delete template → FAILS** (`errGenericDeleteUnsupported`). Ownership is kept so the abandoned record stays operator-visible; the operator clears it out of band (or uses a backend that supports a withdraw). | n/a (no withdraw). |
+
+### Dual-stack same-name withdraw preserves the sibling family (#3738)
+
+For a dual-stack scope — an A and an AAAA published at the SAME name through the
+SAME provider — withdrawing ONE family must NOT take the sibling down. The two
+HOST-level-withdraw backends above (`duckdns` `clear=true`, `dyndns2`
+`offline=YES`) have no wire verb that touches only one family, so firing the verb
+to withdraw the v6 record would blackhole the still-live v4 (or vice-versa) — a
+sibling-family availability bug (codex-157 H10/M06).
+
+The engine closes this with a factual flag on the withdraw record.
+`withdrawOwnedLocked` scans the ownership store (`siblingFamilyOwnedLocked`) for
+another owned record at the SAME `{PolicyID, FQDN}` under the OPPOSITE family and
+sets `LeaseDNSRecord.SiblingFamilyOwned`. A host-level-withdraw backend that sees
+this flag SKIPS its destructive verb (a logged no-op returning nil) — the LEAST-
+DESTRUCTIVE action: the live sibling is preserved; the withdrawn family's record
+is left in place (stale) rather than the sibling being taken down. Per-family
+backends (`rfc2136`/`cloudflare`/`route53`) ignore the flag and delete only the
+exact A/AAAA RR.
+
+Because the manager still drops the withdrawn family's ownership, the flag is
+FALSE on a later withdraw of the LAST family (no sibling remains), so the host-
+wide verb DOES fire then and cleans the whole name — a full teardown converges
+with no permanent orphan, and a single-family scope's withdraw is unchanged. The
+lingering stale record only occurs in the PARTIAL dual-stack case, which is
+already flagged at commit for both backends by
+`config.validateSurfaceADDNSWarnings` (DuckDNS: the #2960 per-family UPDATE
+clobber; dyndns2: the #3738 host-level withdraw). The supported topology is one
+family per name, or a per-family backend for dual-stack same-name.
 
 ## The package boundary (why a `LeaseParser` seam)
 
@@ -403,20 +432,45 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   the SAME `ScopeKey` ownership primitive, the SAME source/VRF binding
   (`backend_bind.go`, via `DHCPDynamicDNSConfig` as the transport carrier), and
   the SAME write-ahead durability discipline.
-- **Self-owned forward ADD = atomic in-place replace** (`rfc2136Updater.selfOwned`
-  → `sendAddSelfOwned`). A router record has NO DHCID (the firewall IS the
-  authoritative owner of its OWN configured FQDN). The lease path's two
-  prerequisites — name-not-in-use (Attempt A) and DHCID-match (Attempt B) — both
-  REFUSE a pre-existing name when there is no DHCID, which would pin a self-record
-  at its first address forever (the #2691 P2 MAJOR-1 bug). So a self-owned
-  forward add is a SINGLE RFC 2136 UPDATE that, in one message, `RemoveRRset`s our
-  forward type at our name (CLASS=ANY, our type only — co-resident records of a
-  DIFFERENT type are never touched) and `Insert`s the new rdata. The server
-  applies both atomically: a same-address forced-refresh deletes-then-re-adds the
-  identical RR (a no-op net change that SUCCEEDS), and an address change replaces
-  the rdata with NO withdraw-then-add blackhole gap. (Third-party case: the
-  firewall owns the name; two firewalls pointed at the same self-record FQDN is an
-  operator misconfig — the per-RG HA gate prevents the in-cluster two-writer case.)
+- **Self-owned forward ADD = atomic VALUE-SPECIFIC in-place replace**
+  (`rfc2136Updater.selfOwned` → `sendAddSelfOwned`). A router record has NO DHCID
+  (the firewall IS the authoritative owner of its OWN configured FQDN). The lease
+  path's two prerequisites — name-not-in-use (Attempt A) and DHCID-match (Attempt
+  B) — both REFUSE a pre-existing name when there is no DHCID, which would pin a
+  self-record at its first address forever (the #2691 P2 MAJOR-1 bug). So a
+  self-owned forward add is a SINGLE RFC 2136 UPDATE that publishes the new rdata
+  and, when the PREVIOUS published value is known (threaded via `LeaseDNSRecord.
+  PrevAddr` from `publishLocked`, seeded across restart from the durable store's
+  `AddrText`), pairs it with an EXACT-RR delete (RFC 2136 §2.5.4, CLASS=NONE) of
+  ONLY xpf's OWN prior value. **#3739 (M08):** this replaced the old
+  `RemoveRRset` (CLASS=ANY delete of the WHOLE A/AAAA set at the name), which
+  destroyed a CO-RESIDENT FOREIGN A/AAAA a human/other appliance had set on the
+  same name. The value-specific replace touches only xpf's own value, so a foreign
+  record now SURVIVES. The server applies delete+insert atomically: a same-address
+  forced-refresh is an idempotent `Insert`-only no-op (nothing to delete); an
+  address change is `Remove(old)`+`Insert(new)` with NO withdraw-then-add
+  blackhole gap; a first publish (or a lost prior value) is `Insert`-only
+  (additive — coexists with any foreign RR rather than clobbering the name). It
+  still never touches a DIFFERENT record TYPE at the name and never issues a
+  delete-RRset/delete-name. (Third-party case: two firewalls pointed at the same
+  self-record FQDN now COEXIST — each manages only its own value — rather than
+  fighting; the per-RG HA gate prevents the in-cluster two-writer case.)
+- **Per-provider co-resident behaviour on publish (#3739).** The value-specific
+  publish above is implemented for the two backends whose protocol supports a
+  single-value operation: **Cloudflare** (per-record-id `PATCH`/`POST`, #3739 H11)
+  and **RFC 2136** (exact-RR delete + insert, #3739 M08). Both touch ONLY xpf's
+  own value, so a co-resident foreign A/AAAA at a shared name survives.
+  **Route 53 is DEFERRED (M07).** `ChangeResourceRecordSets` `UPSERT` replaces the
+  ENTIRE RRSet at name+type — it has no per-value add/remove and no
+  compare-and-swap. Preserving a co-resident foreign value would require a NEW
+  SigV4-signed `ListResourceRecordSets` GET plus a read-modify-write with a
+  genuine race window (no CAS). That is disproportionate risk for the
+  low-reachability shared-name case, and the Route 53 DELETE path already fails
+  SAFE (a delete of a shared RRSet fails `InvalidChangeBatch` "not found" →
+  idempotent no-op, `r53DeleteAlreadyGone`, #2771). So Route 53 still
+  whole-RRSet-replaces on publish; the dedicated-name norm (a single, xpf-owned A)
+  is unaffected. If driven later, the RMW gates behind the same `PrevAddr` and
+  accepts the single-writer race.
 - **Withdraw rebuilds the live backend** (the #2691 P2 MAJOR-2 fix). An
   address-loss withdraw (Pass 1) resolves the backend from the live
   `SurfaceAScope` (`backendFor`); a config-removal withdraw (Pass 2, where the

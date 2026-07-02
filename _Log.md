@@ -1,3 +1,105 @@
+## 2026-07-01 — #3755: RPM first probe cycle event reaches event-options
+
+- **Timestamp**: 2026-07-01
+  - **Action**: RPM probes ran their first cycle immediately, before the
+    event-options callback was registered (SetEventCallback ran later at boot),
+    so the first cycle's events were dropped (fireEvent no-op on nil callback).
+    Fix: moved initEventEngine (which registers the RPM event callback) BEFORE
+    the boot applyConfig/reconcileRPM in daemon_run.go — callback wired before
+    probes start. Belt: rpm.Manager buffers events fired while onEvent==nil
+    (bounded maxBufferedEvents) and replays them FIFO on SetEventCallback;
+    added HasEventCallback accessor. RED-on-revert:
+    TestFireEventBufferedUntilCallbackRegistered (rpm) +
+    TestInitEventEngineRegistersRPMCallbackBeforeProbes (daemon).
+  - **File(s)**: pkg/rpm/rpm.go, pkg/rpm/event_buffer_3755_test.go,
+    pkg/rpm/README.md, pkg/daemon/daemon_run.go,
+    pkg/daemon/daemon_eventoptions_reconcile_test.go,
+    pkg/eventengine/README.md
+
+## 2026-07-01 — #3752: event-options engine day-2 first-enable start
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The engine was constructed at boot ONLY when the boot config
+    already had a policy, so enabling the FIRST event-options policy on a
+    running daemon left d.eventEngine nil and the day-2 apply
+    (`if d.eventEngine != nil`) was a silent no-op — inert until restart.
+    Added initEventEngine (construct unconditionally at boot, register RPM
+    callback, write-once pointer, mirrors LLDP/dhcpRelay) + reconcileEventOptions
+    (Apply on boot and every day-2 commit). applyConfigLocked step 17 and the
+    boot block now call these. Engine.PolicyCount accessor for the tests.
+    RED-on-revert: TestInitEventEngineConstructsUnconditionally /
+    TestReconcileEventOptionsDay2Enable.
+  - **File(s)**: pkg/eventengine/engine.go (PolicyCount),
+    pkg/daemon/daemon_apply.go (initEventEngine, reconcileEventOptions, step 17),
+    pkg/daemon/daemon_run.go (boot wiring),
+    pkg/daemon/daemon_eventoptions_reconcile_test.go (new)
+
+## 2026-07-01 — #3754: event-options remediation commit audit description
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Autonomous remediation committed with an empty comment, so the
+    mutation was unattributed in commit/rollback history. plannedAction now
+    carries the triggering event/owner/test (stamped in HandleEvent);
+    applyOnce builds `event-options policy <name>: <event>/<owner>/<test>
+    (<n> commands)` via remediationDescription and threads it into commitFn
+    AND the standalone CommitWithDescription branch. RED-on-revert test:
+    TestRemediation_CommitCarriesAuditDescription.
+  - **File(s)**: pkg/eventengine/engine.go,
+    pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md
+
+## 2026-07-01 — #3753: event-options attributes-match honors event-name prefix
+
+- **Timestamp**: 2026-07-01
+  - **Action**: attributes-match parsing dropped the `<event>.` prefix, so a
+    constraint written for one event of a multi-event policy gated EVERY event.
+    `ParseEventAttributesMatch` now returns eventName; the runtime matcher
+    (`attributesMatch`) skips a constraint whose event prefix != the current
+    event, and the strict commit validator rejects a prefix not in the
+    policy's events. RED-on-revert tests: eventengine
+    TestAttributesMatch_EventNamePrefixScopesConstraint /
+    _PerEventScopingBothDirections; config
+    TestValidateEventAttributesMatchStrict_EventNameScope.
+  - **File(s)**: pkg/config/event_options_match.go,
+    pkg/config/event_options_match_test.go, pkg/eventengine/engine.go,
+    pkg/eventengine/engine_test.go, pkg/eventengine/README.md
+
+## 2026-07-01 — #3739: DDNS Surface A value-specific self-owned publish
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The Surface A self-owned publish path clobbered a
+    co-resident FOREIGN A/AAAA at a shared name. Cloudflare (H11) PATCHed
+    `recs[0]` (an API-ordering artifact) to xpf's address; RFC 2136 (M08)
+    `RemoveRRset`d the WHOLE A/AAAA set before inserting. Both now do a
+    VALUE-SPECIFIC in-place replace that touches ONLY xpf's own value.
+    ENABLER: threaded the previously-published rdata to the backend via a
+    new `LeaseDNSRecord.PrevAddr` field, set in `publishLocked` from the
+    prevAddr it already computed (seeded across restart from the durable
+    store's `AddrText`). Cloudflare `UpsertLease`: list all rows, no-op if a
+    row already carries the new value, else PATCH the row carrying `PrevAddr`
+    in place, else POST a new record (never `recs[0]`). RFC 2136
+    `sendAddSelfOwned`: when `selfOwnedPrevAddr` is valid and differs from
+    the new value, pair an EXACT-RR delete (`Remove`, CLASS=NONE) of xpf's
+    prior rdata with the insert, in ONE atomic UPDATE (no-blackhole
+    preserved); Insert-only on first publish / same-value re-publish. Added
+    helpers `rrAddr` + `prevSelfOwnedRR`. Route 53 (M07) DEFERRED per the
+    converged /research plan — whole-RRSet UPSERT with no per-value op / no
+    CAS would need a new SigV4 ListResourceRecordSets GET + a racy RMW; its
+    DELETE already fails safe. Documented all three in `pkg/ddns/README.md`.
+  - **Files**: `pkg/ddns/backend.go` (PrevAddr field),
+    `pkg/ddns/surface_a.go` (thread PrevAddr into rec),
+    `pkg/ddns/backend_cloudflare.go` (value-specific UpsertLease, dropped
+    findRecord), `pkg/ddns/backend_rfc2136.go` (selfOwnedPrevAddr +
+    value-specific sendAddSelfOwned + helpers),
+    `pkg/ddns/backend_cloudflare_test.go` (ordered fake + 2 RED-on-revert
+    tests + PrevAddr on the renumber case),
+    `pkg/ddns/surface_a_rfc2136_test.go` (co-resident foreign-survives test),
+    `pkg/ddns/README.md`.
+  - **Validation**: `go test -race ./pkg/ddns/...` green; RED-on-revert
+    proven for both providers (revert Cloudflare → recs[0] and RFC 2136 →
+    RemoveRRset each make the new tests fail deterministically);
+    `go build ./...`, `go vet ./pkg/ddns/...`, `gofmt -l` clean;
+    `go test ./pkg/dhcpserver/...` (lease-path consumer) green.
+
 ## 2026-07-01 — #3748 (sub-part b): IPFIX sampler Options Template + record
 
 - **Timestamp**: 2026-07-01
@@ -26809,3 +26911,193 @@ top.
     remove redundant check), userspace-dp/src/afxdp/mod.rs (packet_ttl_would_expire
     import), userspace-dp/src/afxdp/tests.rs (RED-on-revert),
     userspace-dp/src/afxdp/README.md
+  - **Action**: #3726 — NAT `appPortsFromSpec` rejects a reversed
+    application port range instead of narrowing it to the low port.
+    Root cause: `appPortsFromSpec` (pkg/dataplane/userspace/nat.go)
+    expanded a `lo-hi` range only when `hi > lo`; the else arm returned
+    `[]int{lo}`, so a REVERSED range ("200-100", lo>hi) silently
+    narrowed to an EXACT match on the low port (200) rather than a
+    never-match. Strict commit rejects lo>hi; this is the #1960
+    tolerant-load / peer-sync backstop (same threat model as
+    #3429/#3437/#3446/#3491). Fix part 1: a reversed range (hi<lo)
+    returns nil (hi==lo still returns the single exact port; valid
+    lo<hi still expands). Fix part 2 (DNAT): the app-term builder lost
+    the "port configured" signal, so a nil port slice fell through to
+    the wildcard match-any-port default (destination_port==0) — a
+    fail-OPEN widening (also hit an out-of-range 70000-80000 app spec).
+    Added `dstPortConfigured` to `appTerm` and OR'd it into
+    `portConfigured` so a configured-but-empty app destination-port
+    fails CLOSED (emits no snapshot). SNAT already failed closed via
+    the #3429/#3491 never-match sentinel. RED-on-revert proven per half:
+    reverting appPortsFromSpec → 3 reversed tests RED; reverting the
+    DNAT guard → DNAT reversed test RED with destination_port=0
+    wildcard. go test ./pkg/dataplane/userspace/ + ./pkg/config/... +
+    ./pkg/dataplane/ green; go build ./... green; gofmt + vet clean.
+  - **File(s)**: pkg/dataplane/userspace/nat.go (appPortsFromSpec
+    reversed-range reject; appTerm.dstPortConfigured + portConfigured
+    guard), pkg/dataplane/userspace/nat_reversed_port_range_3726_test.go
+    (new RED-on-revert pins), docs/userspace-dnat-plan.md (§13b)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3758 — ip-monitoring: non-blocking daemon shutdown.
+    `actuateRouteOverlay` acquired the apply semaphore with
+    `context.Background()`, so an in-flight actuation blocked behind a
+    wedged/held apply could hold the ipmon run loop off its stop case
+    forever — and `ipmon.Stop()` (daemon teardown) hung on `e.done`.
+    Threaded a cancellable actuation context through the engine:
+    `New` creates it, the run loop passes it to `actuate(ctx)`, and
+    `Stop()` cancels it BEFORE waiting on `e.done` so a blocked
+    actuation aborts promptly. `actuateRouteOverlay(ctx)` now uses
+    `applySem.Acquire(ctx, 1)` and, on cancel, returns false WITHOUT
+    touching FRR or the userspace snapshot (no half-actuation). Actuate
+    signature `func() bool` → `func(context.Context) bool` (all engine
+    tests updated). RED-on-revert proven both layers: reverting the
+    daemon Acquire to context.Background() → daemon test hangs 2 s RED;
+    removing the Stop cancel → engine test hangs 2 s RED. go test -race
+    ./pkg/ipmon/... ./pkg/daemon/ green.
+  - **File(s)**: pkg/ipmon/ipmon.go (actuateCtx/actuateCancel fields,
+    New, Stop, run loop, actuate signature), pkg/daemon/daemon_ipmon.go
+    (actuateRouteOverlay ctx param + Acquire(ctx)), pkg/ipmon/ipmon_test.go
+    + pkg/ipmon/nexthop_test.go (signature sweep + TestStopAbortsBlockedActuation),
+    pkg/daemon/daemon_ipmon_test.go (TestActuateRouteOverlayAbortsOnContextCancel),
+    docs/multi-wan.md (non-blocking shutdown bullet)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3759 — ip-monitoring: interface-scoped IPv6 link-local
+    preferred-route next-hop. A literal link-local next-hop
+    (`preferred-route route ::/0 next-hop fe80::1`) committed cleanly but
+    rendered a scopeless `ipv6 route ::/0 fe80::1`, which FRR rejects —
+    the failover route silently failed to install. Root cause: the
+    overlay reuses `generateStaticRouteInTable` + `IPv6NextHopInterfaces`
+    but the overlay's PreferredRoutes were NEVER fed into
+    `inferIPv6StaticNextHopInterfaces`, so the map was always absent for
+    the failover gateway. Fix: pass the overlay to the inference
+    (`inferIPv6StaticNextHopInterfaces(cfg, overlay)` in assembleFRRConfig)
+    and resolve each overlay literal v6 next-hop through the SAME
+    connected-prefix / synthetic-fe80::/64 pipeline as static routes,
+    keyed by the VRF the render uses (`""` for master + forwarding
+    instances, `vrf-<name>` for virtual-router). Matches static-route
+    handling (#2452): resolves on a single IPv6 interface, stays
+    unresolved (FRR-rejected, operator must disambiguate) when ambiguous.
+    Chose the attach-scope option over commit-reject because the routing
+    code (static routes) attaches scope via this exact map and never
+    rejects link-local at commit. RED-on-revert proven: reverting the
+    inference-body overlay loop → direct inference tests RED; reverting
+    the assembleFRRConfig call-site → assemble test RED. go test
+    ./pkg/daemon/ ./pkg/frr/ green.
+  - **File(s)**: pkg/daemon/daemon_run.go (inferIPv6StaticNextHopInterfaces
+    overlay arg + resolution loop), pkg/daemon/daemon_ipmon.go (call site),
+    pkg/daemon/ipv6_static_nexthop_test.go (overlay link-local + forwarding
+    + nil-control tests; static callers → nil), pkg/daemon/daemon_ipmon_test.go
+    (TestAssembleFRRConfigResolvesOverlayLinkLocal),
+    pkg/frr/preferred_routes_test.go (render contract test),
+    docs/multi-wan.md + pkg/frr/README.md (link-local overlay next-hop)
+  **Action**: #3747 — bound the flowexport batch queue (`flowBatch`) and
+    add drop/depth visibility. The per-family export accumulator
+    (`transport.go` `flowBatch.v4/v6`) was UNBOUNDED: `add` appended
+    with no cap and the batch drained ONLY from the exporter `Run`
+    goroutine (100ms ticker). A stopped/stalled drain (reconcile window,
+    slow/blocked collector, SESSION_CLOSE storm) let it grow with the
+    close-event rate → unbounded memory growth (DoS/OOM) with no depth or
+    drop counter. Fix: bound each family at `defaultFlowBatchCap` (65536
+    records); on overflow DROP the incoming record (drop-newest, O(1),
+    never blocks the event-reader flow-close callback) and increment an
+    atomic `dropped` counter; track a `maxDepth` high-water mark. Chose
+    drop-newest over drop-oldest: O(1) with no slice-shift/realloc churn,
+    non-blocking, happy-path append unchanged; forensic value of which
+    end is dropped is symmetric in a near-contemporaneous close storm.
+    Surfaced via `Exporter`/`IPFIXExporter` `BatchDepth/BatchMaxDepth/
+    BatchDropped` accessors → `Daemon.FlowExportBatchStats()` →
+    Prometheus family `xpf_flow_export_batch_{depth,max_depth,
+    dropped_total}` labeled {protocol,instance,template} (mirrors the
+    #2464 CollectorHealth wiring). RED-on-revert: reverting the source
+    (keeping the test) fails to compile — the bounded API (capOverride /
+    Dropped / MaxDepth / depth) does not exist pre-fix; behavioral pins
+    assert drops-above-cap, no-drop-below-cap, per-family independence,
+    high-water survives drain, and a -race concurrent producer/drain
+    accounting invariant (drained+dropped == offered). go test -race
+    ./pkg/flowexport/... + ./pkg/api/... green; ./pkg/daemon/... green;
+    go build ./... green; gofmt + vet clean on touched files.
+  - **File(s)**: pkg/flowexport/transport.go (bounded flowBatch +
+    dropped/maxDepth atomics + depth/Dropped/MaxDepth + ExporterBatchStats),
+    pkg/flowexport/netflow.go + pkg/flowexport/ipfix.go (Batch* accessors),
+    pkg/flowexport/flowbatch_bounded_test.go (new RED-on-revert pins),
+    pkg/daemon/daemon_flowexport.go (FlowExportBatchStats), pkg/daemon/daemon_run.go
+    (wire FlowExportBatchStatsFn), pkg/api/server.go + metrics.go +
+    metrics_descriptors.go + metrics_system.go (xpf_flow_export_batch_* family),
+    pkg/flowexport/README.md (Bounded export batch section)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fix #3770 + #3772 in the pkg/dataplane/userspace route-snapshot
+    builder (codex-review-161 H8/M10/M7 + M9/M8), one PR / two commits.
+    #3770: (H8) the dedupe key omitted Discard and Preference, so a discard
+    route and a normal route to the same prefix, or two routes differing only
+    in preference (a static next-table route vs. its preference-0 ip-rule
+    mirror), collided and one was silently dropped before the Rust FIB saw it
+    — added both fields to the key. (M10) the final sort was sort.Slice
+    (unstable) keyed only on Table/Family/Destination, so once same-prefix
+    routes coexist their order tracked non-deterministic build inputs and
+    churned the snapshot — switched to sort.SliceStable with a TOTAL order
+    (next-hops, next-table, discard, preference tie-breakers). (M7) the
+    ip-monitoring overlay route was built with no Preference (default 0),
+    diverging from the documented Static/1 (preference 1) FRR render — now
+    stamps Preference: 1. #3772: (M9) a netlink.RuleList failure was swallowed
+    with `continue`, dropping every route-leak snapshot for that family while
+    the kernel/FRR leak path stayed up — buildRouteSnapshots now returns an
+    error (indirected via a ruleListFn seam) surfaced through builder.go and
+    manager.go so the apply path fails closed and retains prior state (mirrors
+    #3731). (M8) canonicalRoutePrefix returned the raw string on a parse
+    failure despite its "returns empty" doc and the caller's skip guard — now
+    returns "" so a malformed overlay destination is skipped, not injected as
+    a garbage FIB prefix. RED-on-revert tests added for all five: discard +
+    connected survive dedupe; distinct-preference survive dedupe; sort order
+    is identical regardless of input order; overlay carries preference 1;
+    RuleList error is surfaced; canonicalRoutePrefix returns "" and the
+    overlay skips an unparseable destination. go test ./pkg/dataplane/... +
+    ./pkg/routing/... green; go build ./... green; gofmt + vet clean.
+  - **File(s)**: pkg/dataplane/userspace/routes.go (dedupe key, SliceStable
+    total-order sort, overlay Preference:1, ruleListFn seam + surfaced error,
+    canonicalRoutePrefix ""), pkg/dataplane/userspace/builder.go +
+    pkg/dataplane/userspace/manager.go (propagate the route-build error),
+    pkg/dataplane/userspace/routes_dedupe_3770_test.go (new),
+    pkg/dataplane/userspace/routes_rulelist_3772_test.go (new),
+    pkg/dataplane/userspace/{route_overlay,fbf_snapshot,routes_fib_metadata,manager}_test.go
+    (2-value call updates), docs/userspace-dataplane-architecture.md +
+    docs/multi-wan.md (route-snapshot invariants)
+
+## 2026-07-01 — #3738 DDNS dual-stack same-name withdraw preserves the sibling family (codex-157 H10/M06)
+
+- **Timestamp**: 2026-07-01
+- **Action**: For a dual-stack Surface A scope (an A and an AAAA published at the
+  SAME name through the SAME provider), withdrawing ONE family took the sibling
+  down. The two host-level-withdraw backends have no per-family verb — DuckDNS
+  `clear=true` (the spec: "ignore all ip's and clear both your records") and
+  dyndns2 `offline=YES` (hostname-level) — so a v6 withdraw cleared/offlined the
+  whole name and blackholed the still-live v4 (H10 DuckDNS; M06 dyndns2). FIX
+  (family-scoped, per-provider): added `LeaseDNSRecord.SiblingFamilyOwned`, set
+  by the engine (`withdrawOwnedLocked` → new `siblingFamilyOwnedLocked`, matching
+  another owned record at the same `{PolicyID, FQDN}` under the opposite family).
+  DuckDNS and dyndns2 `DeleteLease` SKIP their destructive host-wide verb when
+  the flag is set (a logged no-op returning nil) — the LEAST-DESTRUCTIVE action:
+  the live sibling is preserved; the withdrawn family's record is left stale.
+  Per-family backends (rfc2136/cloudflare/route53) ignore the flag and delete the
+  exact RR. The manager still drops the withdrawn family's ownership, so a later
+  withdraw of the LAST family (no sibling → flag false) DOES fire the host-wide
+  verb and cleans both — full teardown converges, single-family withdraw is
+  unchanged, no permanent orphan on teardown. Verified the DuckDNS spec
+  (duckdns.org/spec.jsp): `clear=true` "will ignore all ip's and clear both your
+  records" — it genuinely cannot family-scope a clear, so suppression is the
+  correct preservation strategy. Also added the missing dyndns2 dual-stack commit
+  warning (the codex-157 M06 gap — DuckDNS was already commit-warned via #2960;
+  dyndns2 was not) in `validateSurfaceADDNSWarnings`. RED-on-revert: removing the
+  DuckDNS/dyndns2 guards + the engine flag makes the sibling-preservation tests
+  fire a clear/offline (RED) while the single-family test stays green; removing
+  the dyndns2 warning emission fails the config warning test. go test
+  ./pkg/ddns/... ./pkg/config/... green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/ddns/backend.go (SiblingFamilyOwned field), pkg/ddns/backend_duckdns.go
+  + pkg/ddns/backend_dyndns2.go (DeleteLease sibling guard + log/slog),
+  pkg/ddns/surface_a.go (withdrawOwnedLocked sets the flag; siblingFamilyOwnedLocked
+  + canonicalDDNSName helpers), pkg/config/compiler_validate_warn.go (dyndns2
+  dual-stack commit warning), pkg/ddns/backend_dualstack_withdraw_3738_test.go (new),
+  pkg/config/compiler_p3_http_providers_test.go (dyndns2 dual-stack warning test),
+  pkg/ddns/README.md (per-family-withdraw column + dual-stack sibling-preserve section)

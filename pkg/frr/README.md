@@ -97,7 +97,12 @@ also carries operator content:
   FRR. The map is built by `inferIPv6StaticNextHopInterfaces`
   (`pkg/daemon/daemon_run.go`); `generateStaticRoute` uses an explicit
   `NextHopEntry.Interface` first and falls back to this map only for an
-  unqualified next-hop.
+  unqualified next-hop. It also resolves the **ip-monitoring overlay's**
+  literal next-hops (`RouteOverlayEntry.NextHop`, passed as the second
+  argument, #3759) so a link-local preferred-route next-hop renders with
+  the same interface scope as a static route — `renderPreferredRoutes`
+  looks the scope up under the same VRF key the render uses (`""` for
+  master + `instance-type forwarding`, `vrf-<name>` otherwise).
 - **Link-local (`fe80::/64`) static next-hops (#2452).** A link-local
   next-hop is interface-scoped and FRR rejects `ipv6 route <dst> fe80::x`
   without a trailing `<iface>`. Link-local addresses are never declared

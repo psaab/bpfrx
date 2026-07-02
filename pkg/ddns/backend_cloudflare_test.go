@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -23,6 +24,11 @@ type cfFakeAPI struct {
 	zoneID   string
 	// records keyed by id.
 	records map[string]cfRecord
+	// order is the record ids in insertion order, so the GET handler returns a
+	// DETERMINISTIC list (real Cloudflare order is arbitrary, but a stable test
+	// order lets a test fix which row is recs[0] — the ordering artifact the
+	// value-specific #3739 fix must NOT rely on).
+	order   []string
 	nextID  int
 	patched int
 	posted  int
@@ -62,7 +68,8 @@ func (f *cfFakeAPI) handler() http.Handler {
 			name := r.URL.Query().Get("name")
 			rtype := r.URL.Query().Get("type")
 			var out []cfRecord
-			for _, rec := range f.records {
+			for _, id := range f.order {
+				rec := f.records[id]
 				if rec.Name == name && rec.Type == rtype {
 					out = append(out, rec)
 				}
@@ -75,6 +82,7 @@ func (f *cfFakeAPI) handler() http.Handler {
 			rec.ID = "rec" + itoa(f.nextID)
 			f.nextID++
 			f.records[rec.ID] = rec
+			f.order = append(f.order, rec.ID)
 			f.ok(w, rec)
 		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/zones/"+f.zoneID+"/dns_records/"):
 			f.patched++
@@ -89,6 +97,12 @@ func (f *cfFakeAPI) handler() http.Handler {
 			f.deleted++
 			id := strings.TrimPrefix(r.URL.Path, "/zones/"+f.zoneID+"/dns_records/")
 			delete(f.records, id)
+			for i, oid := range f.order {
+				if oid == id {
+					f.order = append(f.order[:i], f.order[i+1:]...)
+					break
+				}
+			}
 			f.ok(w, map[string]string{"id": id})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -140,12 +154,17 @@ func TestCloudflareCreateThenUpdate(t *testing.T) {
 	if fake.posted != 1 || fake.patched != 0 {
 		t.Fatalf("unchanged content must not write: posted=%d patched=%d", fake.posted, fake.patched)
 	}
-	// New address → PATCH (update existing).
-	if err := b.UpsertLease(context.Background(), hostRecord(t, "wan.example.net", "203.0.113.9")); err != nil {
+	// New address → PATCH (update existing). Production threads the previous
+	// published value (rec.PrevAddr, #3739) so the renumber patches xpf's OWN
+	// row in place rather than creating a second record. Without PrevAddr the
+	// value-specific path would (correctly) POST a new row and leak the old one.
+	renum := hostRecord(t, "wan.example.net", "203.0.113.9")
+	renum.PrevAddr = netip.MustParseAddr("203.0.113.5")
+	if err := b.UpsertLease(context.Background(), renum); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if fake.patched != 1 {
-		t.Fatalf("address change must patch: patched=%d", fake.patched)
+	if fake.patched != 1 || fake.posted != 1 {
+		t.Fatalf("address change must patch xpf's own row, not create: patched=%d posted=%d", fake.patched, fake.posted)
 	}
 	// Verify the live record content.
 	var live cfRecord
@@ -154,6 +173,81 @@ func TestCloudflareCreateThenUpdate(t *testing.T) {
 	}
 	if live.Content != "203.0.113.9" {
 		t.Fatalf("record content not updated: %q", live.Content)
+	}
+}
+
+// TestCloudflareRenumberPatchesOnlyOwnedRow is the #3739 H11 fail-on-revert for
+// a RENUMBER on a SHARED name: the FQDN carries a FOREIGN A a human set plus
+// xpf's own A. A publish of xpf's NEW address (with PrevAddr = xpf's prior value)
+// must PATCH only xpf's own row and leave the foreign value intact. The fake
+// returns records in insertion order and the foreign row is seeded FIRST, so
+// recs[0] is the FOREIGN row: reverting UpsertLease to the old content-blind
+// "PATCH recs[0]" rewrites the foreign value to xpf's address → this goes RED.
+func TestCloudflareRenumberPatchesOnlyOwnedRow(t *testing.T) {
+	fake := newCFFakeAPI(t)
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	b := newCFTestBackend(t, srv, fake)
+
+	const fqdn = "wan.example.net"
+	// Foreign row FIRST (so it is recs[0]) + xpf's own prior value.
+	foreignA := fake.seedRecord("A", fqdn, "198.51.100.20")
+	ownedA := fake.seedRecord("A", fqdn, "203.0.113.5")
+
+	rec := hostRecord(t, fqdn, "203.0.113.9")
+	rec.PrevAddr = netip.MustParseAddr("203.0.113.5") // xpf's prior value
+	if err := b.UpsertLease(context.Background(), rec); err != nil {
+		t.Fatalf("renumber: %v", err)
+	}
+	// Exactly one PATCH (xpf's own row), no POST.
+	if fake.patched != 1 || fake.posted != 0 {
+		t.Fatalf("renumber must patch xpf's own row only: patched=%d posted=%d", fake.patched, fake.posted)
+	}
+	// xpf's row now carries the new value.
+	if got := fake.records[ownedA].Content; got != "203.0.113.9" {
+		t.Fatalf("xpf row not renumbered: content=%q", got)
+	}
+	// The FOREIGN value must survive untouched (the #3739 clobber).
+	if got := fake.records[foreignA].Content; got != "198.51.100.20" {
+		t.Fatalf("foreign A was clobbered on renumber: content=%q (want 198.51.100.20)", got)
+	}
+}
+
+// TestCloudflareFirstPublishOntoForeignName is the #3739 H11 fail-on-revert for a
+// FIRST publish onto a name that already carries only a FOREIGN A (no xpf row,
+// no PrevAddr). The value-specific upsert must POST a new record and leave the
+// foreign one intact. Reverting to the old "found → PATCH recs[0]" rewrites the
+// sole (foreign) row to xpf's address → this goes RED (foreign clobbered, and a
+// POST that should have happened did not).
+func TestCloudflareFirstPublishOntoForeignName(t *testing.T) {
+	fake := newCFFakeAPI(t)
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	b := newCFTestBackend(t, srv, fake)
+
+	const fqdn = "wan.example.net"
+	foreignA := fake.seedRecord("A", fqdn, "198.51.100.20")
+
+	// No PrevAddr — a genuine first publish onto a name a human already populated.
+	if err := b.UpsertLease(context.Background(), hostRecord(t, fqdn, "203.0.113.9")); err != nil {
+		t.Fatalf("first publish onto foreign name: %v", err)
+	}
+	if fake.posted != 1 || fake.patched != 0 {
+		t.Fatalf("first publish onto a foreign name must POST, not PATCH: posted=%d patched=%d", fake.posted, fake.patched)
+	}
+	// The foreign value must survive.
+	if got := fake.records[foreignA].Content; got != "198.51.100.20" {
+		t.Fatalf("foreign A was clobbered on first publish: content=%q (want 198.51.100.20)", got)
+	}
+	// xpf's new value now coexists.
+	var haveNew bool
+	for _, r := range fake.records {
+		if r.Content == "203.0.113.9" {
+			haveNew = true
+		}
+	}
+	if !haveNew {
+		t.Fatal("xpf's new A was not created alongside the foreign record")
 	}
 }
 
@@ -186,6 +280,7 @@ func (f *cfFakeAPI) seedRecord(rtype, name, content string) string {
 	id := "seed" + itoa(f.nextID)
 	f.nextID++
 	f.records[id] = cfRecord{ID: id, Type: rtype, Name: name, Content: content}
+	f.order = append(f.order, id)
 	return id
 }
 

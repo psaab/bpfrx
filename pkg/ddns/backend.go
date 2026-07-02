@@ -40,6 +40,18 @@ type LeaseDNSRecord struct {
 	// pre-existing third-party RR). NOT part of the published forward/reverse
 	// RR set; carried alongside it only to derive the ownership marker.
 	ClientID string
+	// PrevAddr is the PREVIOUS published rdata for a SELF-OWNED Surface A
+	// record (#3739), threaded from publishLocked (seeded across a restart from
+	// the durable store's AddrText). It lets a self-owned backend do a
+	// VALUE-SPECIFIC in-place replace — touch ONLY xpf's own prior value and add
+	// the new one — instead of clobbering the whole name / RRset, which would
+	// destroy a co-resident FOREIGN A/AAAA at a shared name. Zero (invalid) on a
+	// first publish or when the prior value is genuinely unknown; the backend
+	// then does an ADDITIVE insert/create that coexists with any foreign record
+	// (strictly better than clobbering it). Ignored on the DHCP-lease path (that
+	// path re-derives the exact delete from the owned tuple + DHCID) and by
+	// non-self-owned backends.
+	PrevAddr netip.Addr
 	// KeepForwardDHCID, when true on a DeleteLease, tells the replace-owned
 	// RFC 2136 backend to delete the forward A/AAAA but NOT the shared RFC 4701
 	// DHCID — because ANOTHER owned record still shares this FQDN+ClientID
@@ -54,6 +66,27 @@ type LeaseDNSRecord struct {
 	// non-replace-owned / no-DHCID delete paths. Defaults false (delete the
 	// DHCID with the last record under the name — the pre-#2700 behaviour).
 	KeepForwardDHCID bool
+	// SiblingFamilyOwned, when true on a DeleteLease, tells the backend that
+	// ANOTHER owned record shares this record's FQDN under the OPPOSITE address
+	// family — a dual-stack same-name scope (#3738). It matters ONLY to a backend
+	// whose sole withdraw verb is HOST-GRANULAR: DuckDNS `clear=true` ("if set to
+	// true, the update will ignore all ip's and clear both your records" —
+	// duckdns.org/spec.jsp) and dyndns2 `offline=YES` both take down the WHOLE
+	// hostname (both the A and the AAAA). Firing that verb to withdraw ONE family
+	// while its sibling is still live would blackhole the sibling — the sibling-
+	// family availability bug. When this is set, such a backend does the LEAST-
+	// DESTRUCTIVE thing: it SKIPS the wire delete (a logged no-op returning nil),
+	// preserving the sibling; the withdrawn family's record is left in place
+	// (stale) rather than the live sibling being taken down. The manager still
+	// drops this family's ownership, so a subsequent full teardown (the LAST
+	// family, no sibling left) fires the host-wide verb and cleans both — no
+	// permanent orphan on teardown. Backends with a PER-FAMILY delete (rfc2136 /
+	// cloudflare / route53 / bind) touch only the requested A/AAAA RRset and
+	// IGNORE this flag. Set by withdrawOwnedLocked from a scan of the ownership
+	// store (same {provider, FQDN} under the opposite family). Ignored on
+	// UpsertLease. Defaults false (single-family / full-teardown — the host-wide
+	// verb is correct and issued).
+	SiblingFamilyOwned bool
 }
 
 // DNSUpdater is the pluggable DNS-update backend (plan §4.4). The

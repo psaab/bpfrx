@@ -25,6 +25,24 @@ temporal `within` windows) and triggers commit-and-apply actions.
 
 `pkg/config`, `pkg/configstore`, `pkg/rpm`.
 
+## Daemon lifecycle (#3752 / #3755)
+
+The daemon constructs the engine UNCONDITIONALLY at boot (`initEventEngine`,
+`pkg/daemon`), mirroring the LLDP manager and DHCP relay: the `d.eventEngine`
+pointer is written once and read-only thereafter (race-free `Stats()` reads),
+and `reconcileEventOptions` applies the committed policy set at boot and on
+every day-2 commit. Because the engine always exists, enabling the FIRST
+event-options policy on a running daemon takes effect immediately instead of
+being inert until a restart (#3752 — the old code constructed the engine only
+when the boot config already had a policy).
+
+`initEventEngine` also registers the RPM event callback BEFORE `reconcileRPM`
+starts the probe goroutines. RPM runs each probe's first cycle immediately, so
+a `ping_probe_failed`/`ping_test_failed`/`ping_test_completed` from that first
+cycle would otherwise fire into a nil callback and be lost (#3755); registering
+first closes the gap, and `pkg/rpm` additionally buffers-and-replays any event
+fired before a callback exists as a belt against a future reorder.
+
 ## Transactional batch (#2139)
 
 A `change-configuration` action's `then` commands are applied as an
@@ -45,6 +63,17 @@ all-or-nothing transaction:
 A `delete` of a missing path is a **tolerated exception** (logged at Debug):
 Junos `change-configuration` semantics, and a missing delete target is not a
 half-applied batch.
+
+**Audit description (#3754):** the remediation commit carries a deterministic
+description — `event-options policy <name>: <event>/<owner>/<test> (<n>
+commands)` — built by `remediationDescription` from the triggering-event
+context captured on the `plannedAction` at evaluate time. It is threaded into
+both the `CommitFn` (daemon `commitAndApply` → `CommitWithDescription`) and the
+standalone `store.CommitWithDescription` branch, so an autonomous config
+mutation lands in commit/rollback history ATTRIBUTED to the policy and event
+that made it — not as an anonymous unattributed commit. Regression-locked by
+`TestRemediation_CommitCarriesAuditDescription` (fail-on-revert: reverting to
+`commitFn(ctx, "")` leaves the comment empty and the test goes RED).
 
 ## Cooldown / window state survives a config reload (#2140)
 
@@ -126,6 +155,18 @@ triggering on a **regex** match of `<pattern>` against the event attribute
   `config.EventAttributesKnownFields` (the single source of truth consumed by
   both the commit-time validator and the runtime matcher — a drift-guard test
   keeps them identical).
+- **Event-name scoping (#3753):** the `<event>.` prefix scopes the constraint
+  to a single event of a multi-event policy. The runtime matcher applies a
+  constraint ONLY when the current event equals its prefix, so
+  `attributes-match "event_a.test-owner matches ^X$"` on a policy with
+  `events [ event_a event_b ]` gates event_a alone and leaves event_b
+  unconstrained (and vice-versa). Before this the prefix was dropped and the
+  constraint gated EVERY event. The strict commit validator additionally
+  rejects a prefix that is not one of the policy's declared events (it could
+  never apply). Regression-locked by
+  `TestAttributesMatch_EventNamePrefixScopesConstraint` /
+  `TestAttributesMatch_PerEventScopingBothDirections` (eventengine) and
+  `TestValidateEventAttributesMatchStrict_EventNameScope` (config).
 - **Strict at commit (#2141):** `config.ValidateEventAttributesMatchStrict`
   rejects at commit not only an uncompilable regex (#2008 M7) but also a
   malformed line (no ` matches ` / no `.`) and an unknown `<field>` name. These

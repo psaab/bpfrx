@@ -18,7 +18,14 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
 - `Apply(ctx context.Context, cfg *config.RPMConfig)` — `rpm.go`.
 - `StopAll()` — `rpm.go`.
 - `Results()` — `rpm.go`.
-- `SetEventCallback(fn)` — `rpm.go`.
+- `SetEventCallback(fn)` — `rpm.go`. Registers the event-options callback.
+  Events emitted BEFORE a callback is registered (a first probe cycle that ran
+  before wiring) are buffered and REPLAYED to `fn` on registration, in FIFO
+  order, so a boot-time failover edge is not dropped (#3755). The buffer is
+  bounded (`maxBufferedEvents`) and stays empty on the normal daemon boot
+  because the callback is wired before any probe starts.
+- `HasEventCallback()` — `rpm.go` (#3755). Reports whether an event callback is
+  registered (boot-ordering test seam).
 - `SetTransitionCallback(fn)` — `rpm.go` (#1827).
 - `SetRethMap(map[string]string)` — `rpm.go` (#1827). RETH → physical
   member translation for `destination-interface` resolution.
@@ -46,6 +53,13 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
 
 ## Gotchas
 
+- **The first probe cycle runs immediately** (`runProbeLoop` before the ticker
+  loop), so a `ping_probe_failed` / `ping_test_failed` / `ping_test_completed`
+  can be emitted the instant `Apply` starts a probe. The daemon wires the
+  event-options callback BEFORE `reconcileRPM` starts probes; as a belt,
+  `fireEvent` buffers any event fired while `onEvent` is nil and
+  `SetEventCallback` replays it, so a boot-time failover edge is never dropped
+  (#3755). Regression-locked by `TestFireEventBufferedUntilCallbackRegistered`.
 - **icmp-ping sends a real ICMP echo since #1827** (raw socket, id/seq
   matching, 3 s timeout). The pre-#1827 prober never put a packet on
   the wire (raw-IP dial + UDP connect fallback — a route-existence
