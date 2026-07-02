@@ -1,3 +1,48 @@
+## 2026-07-01 — #3746 flowexport: IPFIX RFC 5103 biflow reverse counters (PEN 29305); NetFlow v9 reverse deferred
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3746 (codex-review-158 H12, converged /research plan Option A).
+    The reverse (server→client) session byte/packet counters have been produced
+    end-to-end since #2501 (decoded to `EventRecord.RevSessionPkts`/
+    `.RevSessionBytes`) and are in scope at IPFIX export time, but the FlowRecord
+    build wired only the FORWARD counts, so collectors under-reported the larger
+    half of asymmetric bi-directional flows. Implemented the IPFIX half: encode
+    the reverse volume as RFC 5103 biflow reverse Information Elements
+    `reverseOctetDeltaCount` (IE 1) + `reversePacketDeltaCount` (IE 2) under the
+    reverse Private Enterprise Number 29305 — the codebase's FIRST enterprise IEs.
+    - `ipfixField` gained an `enterprise uint32` column (0 = IANA). The Template
+      Set encoder now sizes an enterprise field specifier at 8 bytes (elementID
+      with the 0x8000 enterprise bit + a 4-byte PEN) while IANA specs stay 4
+      bytes (`ipfixFieldSpecsLen`/`encodeIPFIXFieldSpec`); the DATA record encodes
+      the reverse counts as plain 8-byte u64. Reverse IEs spliced after the
+      forward CoS/egress block and before the post-NAT trailer (post-NAT stays
+      last per #2526; flowDirection #3270 still just before post-NAT). Template
+      IDs 256/257 reused (content grows once); record sizes v4 70→86, v6 118→134
+      (with flow-dir 87/135).
+    - `FlowRecord` gained `RevPackets`/`RevBytes`; `ExportSessionClose` sets them
+      from `rec.RevSessionPkts`/`.RevSessionBytes` (already in scope — no
+      SessionCloseData plumbing). NetFlow v9 leaves them unused (no standard
+      reverse element).
+    - Tests (`ipfix_biflow_test.go`): full Template Set decode asserting the two
+      reverse IEs carry the enterprise bit + PEN 29305 + length 8 (base AND
+      flow-dir templates) with Template-Set-length integrity (catches an 8-byte
+      specifier off-by-one), a record round-trip of >2^32 reverse sentinels, the
+      ExportSessionClose plumbing pin, and a loopback-UDP real-wire pin.
+      RED-on-revert verified (all four fail with the reverse IEs removed).
+      Updated the enterprise-aware Template-Set walkers in
+      `dropped_fields_test.go` / `flowdir_test.go` and the record-size pins in
+      `postnat_test.go` / `flowdir_test.go`.
+    - Docs: `pkg/flowexport/README.md` drops the stale "#2501 counters are 0"
+      caveats, documents the biflow reverse IEs / enterprise-IE template
+      encoding, and records the NetFlow v9 reverse-direction DEFER (no standard
+      single-record path).
+  - **File(s)**: pkg/flowexport/ipfix.go, pkg/flowexport/manager.go,
+    pkg/flowexport/ipfix_biflow_test.go (new), pkg/flowexport/dropped_fields_test.go,
+    pkg/flowexport/flowdir_test.go, pkg/flowexport/postnat_test.go,
+    pkg/flowexport/README.md, _Log.md
+  - **Validation**: `go test ./pkg/flowexport/...` green; `go build ./...`;
+    gofmt + go vet clean; RED-on-revert confirmed.
+
 ## 2026-07-01 — #3718 host-inbound: fail-closed duplicate host-local-address gate + runtime reporter/metric (Option B)
 
 - **Timestamp**: 2026-07-01
