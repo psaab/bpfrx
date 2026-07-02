@@ -228,6 +228,77 @@ Two observability surfaces consume it:
   visible in a config-only / degraded boot). Alert with e.g.
   `max_over_time(xpf_host_inbound_addressless_zones[1h]) > 0`.
 
+## Duplicate host-local-address ambiguity (#3718, Option B)
+
+The kernel host-inbound chain matches on **destination address only** — every
+rule is `<fam> daddr <zone-addrs> ...` with **no** ingress-interface / VRF / zone
+predicate, over a **single global** `inet xpf_hostinbound` input chain
+(`emitHostInboundZone`, `pkg/daemon/daemon_nft.go`). So when two security zones
+resolve the **same** firewall-local address — a duplicated interface address, a
+duplicated VRRP VIP, or the same address reused across routing-instances (a zone
+is not VRF-scoped in xpf, so overlapping-VRF reuse surfaces as the cross-zone
+case) — they emit two rule blocks keyed on the same `daddr`, in zone-sort order,
+and the **earlier-sorting zone decides the packet** regardless of which zone /
+interface the traffic actually ingresses. A zero-service zone emits only a
+terminal catch-all `drop` for the address, so if it sorts first it drops every
+host-bound service the other zone opened (or the inverse admits what the owning
+zone denied). Worse, the userspace-dp secondary path (`host_inbound_admits`,
+`forwarding/host_inbound.rs`) is **already ingress-zone scoped**, so the kernel
+`daddr` path and the userspace path can render **opposite** verdicts on the same
+packet — a kernel/userspace split-brain.
+
+This is caught fail-closed at commit and surfaced at runtime:
+
+- **Commit-time gate** `config.validateDuplicateHostLocalAddressStrict`
+  (`pkg/config/dup_host_local_address.go`) hard-rejects a config where the same
+  `(family, host address)` — an interface address OR a VRRP VIP — is
+  host-inbound-reachable from **more than one distinct effective host-inbound
+  token set**. It keys on differing token sets, NOT merely ">1 zone", so it does
+  **not** false-positive on a deliberate duplicate: the same address in two zones
+  with **identical** host-inbound service sets renders the same block twice
+  (order-independent, both paths agree) and is allowed; only a differing set (two
+  zones with different `host-inbound-traffic`, or one zone with differing #3362
+  per-interface overrides) is rejected. Covers IPv4 (H01), IPv6 (M02), VRRP VIPs
+  (M03), and the cross-zone subset of same-address-across-routing-instances
+  (M04). Management / cluster-control lifeline interfaces (fxp0 / em0 / fab*) are
+  excluded, mirroring the deny scoping. On the tolerant load / peer-sync path the
+  rejection is downgraded to a `cfg.Warnings` entry (`lenientDuplicateHostLocalAddress`)
+  so an already-persisted or peer-synced config an older binary accepted still
+  boots (#1960 no-brick).
+- **Runtime SSOT** `dpuserspace.AmbiguousHostInboundAddresses`
+  (`pkg/dataplane/userspace/zones.go`) reads the scopes back from
+  `BuildZoneHostInboundViews` (the same builder that drives nft emission), using
+  the shared `config.CanonicalHostInboundTokenSig` so it can never disagree with
+  the commit gate on what counts as a differing set. Unlike the addressless
+  window above, an ambiguity is **NOT self-healing** — it stands until the config
+  is fixed.
+- **State-transition log** (`daemon_nft.go`,
+  `logHostInboundAmbiguousTransitions`): a `WARN` on ENTRY, an `INFO` on RECOVERY,
+  logged once per transition (not every apply).
+- **Prometheus gauge** `xpf_host_inbound_ambiguous_addresses{address,family}`
+  (`pkg/api`), value `1` per ambiguous address, emitted BEFORE the dataplane gate
+  so it stays visible in a config-only / degraded boot. Alert with
+  `max_over_time(xpf_host_inbound_ambiguous_addresses[1h]) > 0`.
+
+### Deferred follow-ons
+
+Option B rejects the ambiguity fail-closed; it does **not** yet make the kernel
+path ingress-scoped. Two follow-ons are tracked on #3718:
+
+- **Option A — kernel `iifname` ingress-scope**: emit host-inbound rules with an
+  `iifname` (ingress netdev / VRF) predicate so the ingress zone disambiguates
+  the `daddr`, matching the Junos model and ending the split-brain with the
+  already-ingress-scoped userspace path. Deferred: `iifname` must enumerate every
+  ingress netdev for a zone (physical, `.0` units, VLAN subinterfaces, VRF
+  members, `lo` for locally-generated traffic, HA/fabric paths) or a legitimate
+  management packet fails closed and locks out the box — it needs the
+  netdev-enumeration audit + loss-cluster lab validation (VLAN units + a VRRP
+  failover).
+- **Option C — per-VRF host-inbound chains**: separate per-routing-instance input
+  chains so the same address can be **intentionally** reused across VRFs with
+  distinct host-inbound policies (which Option B rejects). A larger architectural
+  fork; deferred until there is demand.
+
 ## Adding a new host-inbound service
 
 Adding or changing a token is a coordinated edit across all three surfaces so the
