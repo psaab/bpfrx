@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -186,6 +188,40 @@ type surfaceAState struct {
 	withdrawUnsupported bool
 }
 
+// surfaceAOrphan records a DDNS record this node published at a PREVIOUS provider
+// endpoint that a provider IDENTITY change has left stale and un-withdrawable
+// through the current catalog (#3735). It is the durable-alarm payload behind the
+// operator surfaces (Prometheus gauge + StatusViews row + slog.Warn): what name
+// and address are stale, which provider owned it, and the old vs new endpoint
+// fingerprint. Auto-withdrawal of the record is DEFERRED (the old endpoint's
+// credentials are redacted config.Secret and the endpoint is usually
+// decommissioned), so it is surfaced LOUDLY for MANUAL operator cleanup instead
+// of being silently dropped (H01), overwritten (H02), or deleted at the wrong
+// endpoint (H03).
+type surfaceAOrphan struct {
+	FQDN           string
+	Address        string // the published rdata now stale at the old endpoint
+	Provider       string // the owning PolicyID (provider name) at publish time
+	Interface      string // the owning scope's interface
+	Unit           int    // the owning scope's unit
+	Family         int    // 4/6 — the owning scope's family (deterministic status sort)
+	OldFingerprint string // the endpoint the record was published through
+	NewFingerprint string // the current provider's endpoint ("" = provider gone)
+	Reason         string // human-readable cause (one of orphanReason*)
+	FirstSeen      time.Time
+}
+
+// orphanReason* are the operator-facing explanations attached to a surfaceAOrphan
+// and its StatusViews row (#3735). They all resolve to the same required action:
+// the old record must be cleaned up by hand.
+const (
+	orphanReasonProviderGone = "provider removed from catalog; old record stale at previous endpoint — manual cleanup required"
+
+	orphanReasonEndpointChanged = "provider endpoint changed; old record stale at previous endpoint — manual cleanup required"
+
+	orphanReasonEndpointChangedInPlace = "provider endpoint changed in place; old record stale at previous endpoint — manual cleanup required"
+)
+
 // Surface A scope status states for the operator view (#2843). A configured
 // scope is rendered with exactly one of these so the operator sees every
 // configured scope and its health, not only the successfully-owned ones.
@@ -210,6 +246,14 @@ const (
 	// is NO LONGER configured (the binding was removed); the next reconcile will
 	// withdraw it. Surfaced so a wedged withdraw is visible, not silent.
 	SurfaceAStateWithdrawPending = "withdraw-pending"
+	// SurfaceAStateOrphaned — a record this node published at a PREVIOUS provider
+	// endpoint that a provider identity change (rename to a different endpoint /
+	// in-place server-zone edit / removed binding after an edit) left stale and
+	// un-withdrawable through the current catalog (#3735). Ownership is KEPT and
+	// the record is surfaced LOUDLY (LastError carries the manual-cleanup reason)
+	// because auto-withdrawal is deferred (the old creds are redacted and the old
+	// endpoint is usually gone). The operator must clean the stale record by hand.
+	SurfaceAStateOrphaned = "orphaned"
 )
 
 // SurfaceAStatusView is a read-only projection of one Surface A scope's
@@ -271,6 +315,26 @@ type SurfaceAManager struct {
 	// the durable store (seedFromStore) so a restart does not blast a redundant
 	// update for an unchanged address (inadyn idea #5, plan §5.5).
 	runtime map[string]*surfaceAState
+
+	// orphans tracks records this node published at a PREVIOUS provider endpoint
+	// that a provider identity change (rename to a different endpoint / in-place
+	// server-zone edit / removed binding after an edit) has left stale and
+	// un-withdrawable through the CURRENT catalog (#3735). It is keyed by
+	// orphanKey (the owned record's scope prefix + FQDN + address) so a given
+	// orphaned record contributes exactly one entry. It is the operator-visible
+	// half of the fingerprint alarm: `xpf_ddns_surface_a_orphaned`, a distinct
+	// `SurfaceAStateOrphaned` StatusViews row, and a single loud slog.Warn per
+	// entry (noteOrphan is idempotent by key so it does not re-warn every sweep).
+	//
+	// It is NOT persisted: the H01/H03 orphans are re-derived every reconcile
+	// from the durable owned record + the provider catalog (self-healing across
+	// restart — the alarm re-fires once), while the H02 in-place-mutation orphan
+	// is in-memory-until-restart because the OLD endpoint identity is intentionally
+	// NOT persisted (persisting the old backend's creds to reach it is the
+	// DEFERRED auto-cleanup half, blocked by the #2053 secret contract — see the
+	// README). Auto-withdrawal of the orphaned record is DEFERRED; the alarm tells
+	// the operator to clean it up by hand.
+	orphans map[string]surfaceAOrphan
 
 	// forceRefresh is the operator force-now latch (#3276): when set, the NEXT
 	// reconcile pass treats every configured scope as refresh-due, re-asserting
@@ -341,6 +405,7 @@ func NewSurfaceAManager() *SurfaceAManager {
 		degraded:       degraded,
 		degradedReason: reason,
 		runtime:        map[string]*surfaceAState{},
+		orphans:        map[string]surfaceAOrphan{},
 		httpClients:    newHTTPClientCache(),
 		now:            time.Now,
 	}
@@ -370,6 +435,7 @@ func newSurfaceAManagerForTesting(statePath string, backend DNSUpdater, now func
 		degraded:       degraded,
 		degradedReason: reason,
 		runtime:        map[string]*surfaceAState{},
+		orphans:        map[string]surfaceAOrphan{},
 		backend:        backend,
 		now:            now,
 	}
@@ -691,20 +757,38 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 		noteErr(m.reconcileScopeLocked(ctx, sc, observe, now, force))
 	}
 
-	// liveRR is the set of {FQDN, AddrText} that a STILL-CONFIGURED scope owns
-	// after Pass 1 — the exact name+rdata that is (or will be) live at the
-	// provider. A Pass 2 withdraw issues an EXACT-RR delete (name+type+rdata), so
-	// withdrawing a record whose name+rdata equals a live RR would REMOVE the live
-	// RR. This is the #2903 on-disk MIGRATION case: a pre-#2903 store has the
-	// Surface A record under an FQDN-LESS scope prefix, while the configured scope
-	// now keys under the FQDN-bearing prefix — both carry the SAME name+address.
-	// Pass 1 (re)published under the new prefix; Pass 2 must NOT then exact-RR
-	// delete the same name+address. Skip the wire delete but still drop the stale
-	// old-prefix ownership entry (adopt-in-place — no blackhole, no orphan).
-	liveRR := make(map[string]struct{}, len(desired))
+	// liveByPolicy / liveByFP describe the {FQDN, AddrText} records a STILL-
+	// CONFIGURED scope owns after Pass 1 — the exact name+rdata that is (or will
+	// be) live at the provider — keyed by PROVIDER IDENTITY so the #2903 adoption
+	// guard is provider-AWARE (#3735). A Pass 2 withdraw issues an EXACT-RR delete
+	// (name+type+rdata), so withdrawing a record whose name+rdata equals a live RR
+	// would REMOVE the live RR. The #2903 on-disk MIGRATION case (a pre-#2903 store
+	// keyed under an FQDN-LESS scope prefix; the configured scope now keys under the
+	// FQDN-bearing prefix — SAME provider, name and address) must therefore be
+	// ADOPTED in place, not exact-RR deleted.
+	//
+	// The pre-#3735 guard keyed liveRR only on {FQDN, AddrText}, so it ALSO adopted
+	// a genuine PROVIDER RENAME (prov-A → prov-B, same name+addr) — silently
+	// dropping the old-provider ownership WITHOUT a wire delete and orphaning the
+	// record at provider A (the codex-157 H01 bug). Keying on provider identity
+	// closes that: an old record is adopted only when a still-configured record
+	// with the SAME name+addr shares its PROVIDER NAME (the #2903 same-provider
+	// migration — PolicyID is unchanged and present on both the FQDN-less and the
+	// FQDN-bearing record) OR its non-empty backend FINGERPRINT (a pure rename to
+	// the SAME endpoint — no real orphan exists, so no false alarm). A genuine
+	// rename to a DIFFERENT endpoint matches neither axis, so it is no longer
+	// silently adopted — it becomes a real withdraw candidate that the Pass-2
+	// classifier turns into a KEEP-ownership + loud orphan alarm.
+	liveByPolicy := make(map[string]struct{}, len(desired))
+	liveByFP := make(map[string]struct{}, len(desired))
 	for _, owned := range m.state.all() {
-		if _, stillConfigured := desired[owned.scopeOf().scopePrefix()]; stillConfigured {
-			liveRR[owned.FQDN+"|"+owned.AddrText] = struct{}{}
+		osc := owned.scopeOf()
+		if _, stillConfigured := desired[osc.scopePrefix()]; !stillConfigured {
+			continue
+		}
+		liveByPolicy[osc.PolicyID+"\x00"+owned.FQDN+"\x00"+owned.AddrText] = struct{}{}
+		if owned.BackendFingerprint != "" {
+			liveByFP[owned.BackendFingerprint+"\x00"+owned.FQDN+"\x00"+owned.AddrText] = struct{}{}
 		}
 	}
 
@@ -717,22 +801,29 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 	// SurfaceAScope is gone (#2691 P2 MAJOR-2 fix: a removed-binding withdraw
 	// MUST send a real DNS DELETE, not silently drop ownership and orphan the RR).
 	for _, owned := range m.state.all() {
-		sid := owned.scopeOf().scopePrefix()
+		osc := owned.scopeOf()
+		sid := osc.scopePrefix()
 		if _, stillConfigured := desired[sid]; stillConfigured {
 			continue
 		}
-		if !admit(owned.scopeOf()) {
+		if !admit(osc) {
 			continue
 		}
-		if _, live := liveRR[owned.FQDN+"|"+owned.AddrText]; live {
-			// The exact name+rdata is owned by a still-configured scope (the #2903
-			// on-disk migration from an FQDN-less prefix to an FQDN-bearing one).
-			// An exact-RR delete here would remove the live RR — adopt in place:
-			// drop the stale old-prefix ownership entry, no wire delete.
-			slog.Debug("ddns surface-a: stale-prefix ownership adopted by a configured FQDN scope; dropping without a wire delete",
-				"fqdn", owned.FQDN, "addr", owned.AddrText)
-			m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
-			delete(m.runtime, owned.scopeOf().scopePrefix())
+		// Provider-aware adopt-in-place (#2903 migration / same-endpoint rename,
+		// #3735): the exact name+rdata is still owned by a configured scope with
+		// the SAME provider identity (same PolicyID, or same non-empty endpoint
+		// fingerprint). An exact-RR delete here would remove the just-published
+		// live RR — adopt in place: drop the stale old-prefix ownership entry, no
+		// wire delete, no orphan alarm.
+		liveName := owned.FQDN + "\x00" + owned.AddrText
+		_, adoptByPolicy := liveByPolicy[osc.PolicyID+"\x00"+liveName]
+		_, adoptByFP := liveByFP[owned.BackendFingerprint+"\x00"+liveName]
+		if adoptByPolicy || (owned.BackendFingerprint != "" && adoptByFP) {
+			slog.Debug("ddns surface-a: stale-prefix ownership adopted by a configured same-provider scope; dropping without a wire delete",
+				"fqdn", owned.FQDN, "addr", owned.AddrText, "provider", osc.PolicyID)
+			m.state.delete(osc, owned.Identity, owned.Address)
+			delete(m.runtime, sid)
+			m.clearOrphan(owned)
 			continue
 		}
 		// Per-scope error backoff for the gone-from-config withdraw (#2813): a
@@ -755,17 +846,35 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 			// RR stays operator-visible) and do not re-attempt the wire delete.
 			continue
 		}
+		// #3735: classify whether the record's ORIGINAL endpoint is reachable
+		// through the current catalog BEFORE any backoff/withdraw. A provider that
+		// is gone (H01: renamed to a different endpoint / removed) or whose endpoint
+		// fingerprint no longer matches (H03: in-place server/zone edit) is
+		// un-withdrawable — issuing a delete would either no-op or hit the WRONG
+		// endpoint and false-success-drop ownership. KEEP ownership and raise a loud
+		// operator alarm ONCE (noteOrphan is idempotent), never a wrong-endpoint
+		// delete. Auto-withdrawal of the old record is DEFERRED (the old creds are
+		// redacted config.Secret and the old endpoint is usually gone) — the alarm
+		// tells the operator to clean it up by hand.
+		backend, status, err := m.classifyOwnedBackend(owned, catalog)
+		switch status {
+		case ownedBackendProviderGone:
+			m.noteOrphan(owned, "", orphanReasonProviderGone, now)
+			continue
+		case ownedBackendEndpointChanged:
+			m.noteOrphan(owned, backendFingerprint(catalog[osc.PolicyID]), orphanReasonEndpointChanged, now)
+			continue
+		}
+		if err != nil {
+			m.recordScopeError(rt, owned.FQDN, 0, err, now)
+			noteErr(err)
+			continue
+		}
 		if !rt.nextEligible.IsZero() && now.Before(rt.nextEligible) {
 			// Still inside the error-backoff window — skip the wire delete this pass.
 			m.backedOff++
 			slog.Debug("ddns surface-a: gone-from-config scope in withdraw backoff; skipping this pass",
 				"fqdn", owned.FQDN, "next-eligible", rt.nextEligible)
-			continue
-		}
-		backend, err := m.backendForOwned(owned, catalog)
-		if err != nil {
-			m.recordScopeError(rt, owned.FQDN, 0, err, now)
-			noteErr(err)
 			continue
 		}
 		noteErr(m.withdrawScopeLocked(ctx, owned, backend, rt, owned.FQDN, 0, now))
@@ -1010,17 +1119,36 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		}
 	}
 
+	// Non-secret backend fingerprint for this publish (#3735). Stored on the owned
+	// record so a later provider identity change is detectable, and compared here
+	// against the previous publish's fingerprint to catch an IN-PLACE provider
+	// mutation (H02): the scope key {PolicyID, FQDN} is unchanged (server/zone/
+	// creds are not in the key), so this scope is NEVER a Pass-2 withdraw candidate;
+	// the republish would overwrite the same ownership key with the NEW endpoint and
+	// silently orphan the record at the OLD endpoint. When the stored and current
+	// fingerprints both resolve and differ, the old endpoint's record is stale and
+	// un-withdrawable (the catalog now resolves this provider to the new endpoint),
+	// so raise the SAME loud operator alarm instead of silently overwriting. We
+	// still publish the new record (the operator wants it live at the new endpoint);
+	// auto-withdrawal of the old one is DEFERRED (redacted creds / decommissioned
+	// endpoint) — the alarm tells the operator to clean it up by hand.
+	fp := backendFingerprint(sc.Provider)
+	if hadPrev && prevOwned.BackendFingerprint != "" && fp != "" && prevOwned.BackendFingerprint != fp {
+		m.noteOrphan(prevOwned, fp, orphanReasonEndpointChangedInPlace, now)
+	}
+
 	// Write-ahead the ownership intent BEFORE the wire add (#2662): a crash
 	// after the add finds the record owned and the next reconcile converges it.
 	ow := ownedRecord{
-		Family:      familyInt(addr),
-		Identity:    surfaceAIdentity,
-		Address:     "", // key on scope+FQDN; rdata lives in AddrText below
-		FQDN:        rec.FQDN,
-		ForwardType: rec.ForwardType,
-		PTRName:     "",
-		TTL:         ttl,
-		AddrText:    addr.String(),
+		Family:             familyInt(addr),
+		Identity:           surfaceAIdentity,
+		Address:            "", // key on scope+FQDN; rdata lives in AddrText below
+		FQDN:               rec.FQDN,
+		ForwardType:        rec.ForwardType,
+		PTRName:            "",
+		TTL:                ttl,
+		AddrText:           addr.String(),
+		BackendFingerprint: fp,
 	}.withScope(key)
 	m.state.put(ow)
 	if err := m.state.save(); err != nil {
@@ -1107,7 +1235,7 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 // (binding removed, or address lost) through the GIVEN backend, then drops the
 // ownership entry. Caller holds m.mu and is responsible for resolving the LIVE
 // backend (Pass 1 from the live scope via backendFor, Pass 2 from the provider
-// catalog via backendForOwned) so the delete actually reaches the wire — a nil/
+// catalog via classifyOwnedBackend) so the delete actually reaches the wire — a nil/
 // no-op backend would orphan the RR (#2691 P2 MAJOR-2). A delete is re-derived
 // from the EXACT owned tuple (the sole-delete-authority boundary, shared with
 // the lease path): Surface A never deletes a name it did not record.
@@ -1135,6 +1263,7 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 			"fqdn", owned.FQDN, "addr", owned.AddrText, "err", err)
 		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 		delete(m.runtime, owned.scopeOf().scopePrefix())
+		m.clearOrphan(owned)
 		return nil
 	}
 	if isNopUpdater(backend) {
@@ -1175,6 +1304,7 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 	}
 	m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 	delete(m.runtime, owned.scopeOf().scopePrefix())
+	m.clearOrphan(owned)
 	slog.Info("ddns surface-a: withdrew record", "fqdn", owned.FQDN, "addr", owned.AddrText)
 	return nil
 }
@@ -1191,32 +1321,155 @@ func (m *SurfaceAManager) backendFor(sc SurfaceAScope) (DNSUpdater, error) {
 	return m.newBackend(sc.Provider, sc.FQDN, sc.TTL)
 }
 
-// backendForOwned resolves the live Backend for a WITHDRAW of an owned record
-// whose binding was REMOVED from config, so there is no live SurfaceAScope to
-// read the provider from (#2691 P2 MAJOR-2). It REBUILDS the SAME backend the
-// publish used by looking the owned record's provider (scope.PolicyID) up in the
-// still-committed provider catalog and feeding it through newBackend — so a
+// backendFingerprint returns a STABLE, NON-SECRET fingerprint of a provider's
+// backend ENDPOINT IDENTITY — the backend TYPE plus the server / zone /
+// hosted-zone / region / generic URL template (#3735). It deliberately EXCLUDES
+// every credential (TSIGSecret / Password / APIToken / AWSSecretAccessKey — all
+// config.Secret) and every non-endpoint field, so persisting it on the durable
+// ownedRecord does NOT reopen the #2053 plaintext-secret-on-disk class: no secret
+// is ever hashed in or written out. A change in this fingerprint between the
+// stored ownership and the current provider means the record was published at a
+// DIFFERENT endpoint than the one now configured for the same scope/name — the
+// H01/H02/H03 signal. Returns "" for a nil provider (fingerprint unknown —
+// compared as "cannot determine a mismatch", never a false alarm). The empty
+// backend token normalizes to "rfc2136" to match resolveSurfaceABackend's default
+// so an explicit `backend rfc2136` and the implicit default share a fingerprint.
+func backendFingerprint(p *config.DDNSProvider) string {
+	if p == nil {
+		return ""
+	}
+	backend := p.Backend
+	if backend == "" {
+		backend = "rfc2136" // resolveSurfaceABackend's default
+	}
+	// Length-prefixed, order-fixed, credential-free tuple so no pair of adjacent
+	// fields can alias across the boundary (a value cannot inject the separator).
+	var sb strings.Builder
+	writeField := func(s string) { fmt.Fprintf(&sb, "%d:%s|", len(s), s) }
+	writeField(backend)
+	writeField(p.UpdateServer) // rfc2136 target
+	writeField(p.Server)       // dyndns2 endpoint override
+	writeField(p.Zone)         // cloudflare zone
+	writeField(p.HostedZoneID) // route53 hosted zone
+	writeField(p.AWSRegion)    // route53 region
+	writeField(p.URLTemplate)  // generic endpoint template (%u/%p are placeholders, not live creds)
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(sb.String()))
+	return fmt.Sprintf("fp1-%016x", h.Sum64())
+}
+
+// ownedBackendStatus classifies whether an owned record's ORIGINAL publish
+// endpoint can be rebuilt from the CURRENT provider catalog for a withdraw
+// (#3735). Only ownedBackendOK is safe to issue a wire delete against — the other
+// two mean the old endpoint is unreachable through the current config, so a
+// withdraw would either no-op (provider gone) or, worse, delete at the WRONG
+// endpoint and false-success-drop ownership (endpoint changed).
+type ownedBackendStatus int
+
+const (
+	// ownedBackendOK — the provider is present and its endpoint fingerprint still
+	// matches (or one side is unknown, so no mismatch can be proven): the returned
+	// backend reaches the record's original endpoint. Safe to withdraw.
+	ownedBackendOK ownedBackendStatus = iota
+	// ownedBackendProviderGone — the record's provider (scope.PolicyID) is no
+	// longer in the catalog (H01: renamed/removed): the old endpoint cannot be
+	// rebuilt (no server/creds), so the record is orphaned.
+	ownedBackendProviderGone
+	// ownedBackendEndpointChanged — the provider is present but its endpoint
+	// fingerprint no longer matches the record's stored fingerprint (H03: an
+	// in-place server/zone edit after the binding was removed): rebuilding from the
+	// catalog reaches the NEW endpoint, so a withdraw there would delete at the
+	// wrong place / no-op and false-success-drop ownership. The record is orphaned.
+	ownedBackendEndpointChanged
+)
+
+// classifyOwnedBackend resolves the live backend for a WITHDRAW of an owned
+// record whose binding is gone from config (#2691 P2 MAJOR-2), and classifies
+// whether that backend actually reaches the record's ORIGINAL endpoint (#3735 —
+// the provider-aware successor to the old backendForOwned). It REBUILDS the same
+// backend the publish used by looking the owned record's provider (scope.PolicyID)
+// up in the still-committed catalog and feeding it through newBackend — so a
 // removed-binding withdraw sends a real DNS DELETE instead of orphaning the RR.
-// The static `backend` field (test injection) wins when set; when no factory and
-// no static backend are available the no-op is returned (and withdrawOwnedLocked
-// treats it as a failure that keeps ownership for retry, never a false success).
-func (m *SurfaceAManager) backendForOwned(owned ownedRecord, catalog map[string]*config.DDNSProvider) (DNSUpdater, error) {
+// The static `backend` field (test injection) always wins and is ownedBackendOK
+// (a fixed test backend is the single endpoint). A missing provider is
+// ownedBackendProviderGone; a present-but-fingerprint-mismatched provider is
+// ownedBackendEndpointChanged — both keep ownership + alarm rather than issuing a
+// wrong-endpoint delete / false-success drop.
+func (m *SurfaceAManager) classifyOwnedBackend(owned ownedRecord, catalog map[string]*config.DDNSProvider) (DNSUpdater, ownedBackendStatus, error) {
 	if m.backend != nil {
-		return m.backend, nil
+		return m.backend, ownedBackendOK, nil
 	}
 	if m.newBackend == nil {
-		return nopUpdater{}, nil
+		return nopUpdater{}, ownedBackendProviderGone, nil
 	}
 	policyID := owned.scopeOf().PolicyID
 	prov := catalog[policyID]
 	if prov == nil {
-		// The provider was removed alongside the binding: no credentials/server
-		// to rebuild the backend, so the RR cannot be withdrawn this cycle.
-		slog.Warn("ddns surface-a: owned record's provider is no longer in the catalog; cannot withdraw",
-			"fqdn", owned.FQDN, "provider", policyID)
-		return nopUpdater{}, nil
+		// The provider was removed alongside the binding (or renamed to a new
+		// name): no credentials/server to rebuild the backend, so the RR cannot be
+		// withdrawn — orphaned.
+		return nopUpdater{}, ownedBackendProviderGone, nil
 	}
-	return m.newBackend(prov, owned.FQDN, owned.TTL)
+	// A provider identity change under the SAME name (H03) keeps the PolicyID but
+	// points at a DIFFERENT endpoint. Compare the stored fingerprint with the
+	// current provider's; a proven mismatch means the catalog no longer describes
+	// the endpoint this record lives at, so a withdraw here would hit the wrong
+	// server (or no-op and false-success-drop ownership). Both fingerprints must
+	// be non-empty to prove a mismatch (an unknown/pre-#3735 fingerprint is never
+	// a false alarm).
+	if owned.BackendFingerprint != "" {
+		if cur := backendFingerprint(prov); cur != "" && cur != owned.BackendFingerprint {
+			return nopUpdater{}, ownedBackendEndpointChanged, nil
+		}
+	}
+	b, err := m.newBackend(prov, owned.FQDN, owned.TTL)
+	return b, ownedBackendOK, err
+}
+
+// orphanKey is the stable m.orphans map key for an owned record (#3735): its
+// scope prefix + published name + address. A given orphaned record contributes
+// exactly one entry regardless of how many reconcile passes re-observe it.
+func orphanKey(owned ownedRecord) string {
+	return owned.scopeOf().scopePrefix() + "|" + owned.FQDN + "|" + owned.AddrText
+}
+
+// noteOrphan records (once) that an owned record is stale at a PREVIOUS provider
+// endpoint and cannot be withdrawn automatically (#3735), and emits a single loud
+// operator alarm. It is idempotent by orphanKey so a re-derived orphan (every
+// reconcile re-classifies the still-owned H01/H03 records) does not re-warn each
+// sweep. newFP is the current provider's endpoint fingerprint ("" when the
+// provider is gone from the catalog). Caller holds m.mu.
+func (m *SurfaceAManager) noteOrphan(owned ownedRecord, newFP, reason string, now time.Time) {
+	if m.orphans == nil {
+		m.orphans = map[string]surfaceAOrphan{}
+	}
+	key := orphanKey(owned)
+	if _, ok := m.orphans[key]; ok {
+		return // already alarmed — do not re-warn every sweep
+	}
+	osc := owned.scopeOf()
+	m.orphans[key] = surfaceAOrphan{
+		FQDN:           owned.FQDN,
+		Address:        owned.AddrText,
+		Provider:       osc.PolicyID,
+		Interface:      osc.Interface,
+		Unit:           osc.Unit,
+		Family:         int(osc.Family),
+		OldFingerprint: owned.BackendFingerprint,
+		NewFingerprint: newFP,
+		Reason:         reason,
+		FirstSeen:      now,
+	}
+	slog.Warn("ddns surface-a: provider identity changed; OLD record ORPHANED at the previous endpoint and cannot be withdrawn automatically — MANUAL CLEANUP REQUIRED",
+		"fqdn", owned.FQDN, "addr", owned.AddrText, "provider", owned.scopeOf().PolicyID,
+		"old-endpoint", owned.BackendFingerprint, "new-endpoint", newFP, "reason", reason)
+}
+
+// clearOrphan drops any orphan alarm for an owned record (#3735) — called when
+// the record is cleanly adopted-in-place or withdrawn, so a later genuine
+// re-orphan re-alarms. A delete on an absent key is a no-op.
+func (m *SurfaceAManager) clearOrphan(owned ownedRecord) {
+	delete(m.orphans, orphanKey(owned))
 }
 
 // recordScopeError records a failure on a scope and advances its flat error
@@ -1359,10 +1612,16 @@ func (m *SurfaceAManager) StatusViews(scopes []SurfaceAScope) []SurfaceAStatusVi
 
 	// Orphaned ownership: a record for a scope no longer configured. The next
 	// reconcile (Pass 2) withdraws it; surface it as withdraw-pending so a wedged
-	// teardown is not invisible.
+	// teardown is not invisible. A record the reconciler has flagged as a #3735
+	// provider-change ORPHAN (stale at a previous endpoint, un-withdrawable) is
+	// covered by the dedicated orphan rows below instead — skip it here so it is
+	// not double-listed as merely withdraw-pending.
 	for _, r := range m.state.all() {
 		sc := r.scopeOf()
 		if _, ok := configured[sc.scopePrefix()]; ok {
+			continue
+		}
+		if _, isOrphan := m.orphans[orphanKey(r)]; isOrphan {
 			continue
 		}
 		v := SurfaceAStatusView{
@@ -1380,6 +1639,28 @@ func (m *SurfaceAManager) StatusViews(scopes []SurfaceAScope) []SurfaceAStatusVi
 			v.LastErrorAt = rt.lastErrAt
 		}
 		out = append(out, v)
+	}
+
+	// #3735 orphan alarm rows: a record stale at a PREVIOUS provider endpoint that
+	// a provider identity change (rename to a different endpoint / in-place
+	// server-zone edit / removed binding after an edit) left un-withdrawable
+	// through the current catalog. Ownership is KEPT; the row is the operator-
+	// visible half of the alarm (LastError carries the manual-cleanup reason). It
+	// is emitted for BOTH a gone-from-config record (H01/H03 — skipped above) and a
+	// still-configured scope whose OLD endpoint was orphaned by an in-place mutation
+	// (H02 — the healthy published row for the new endpoint also appears).
+	for _, o := range m.orphans {
+		out = append(out, SurfaceAStatusView{
+			Interface:   o.Interface,
+			Unit:        o.Unit,
+			Family:      o.Family,
+			FQDN:        o.FQDN,
+			Provider:    o.Provider,
+			Published:   o.Address,
+			State:       SurfaceAStateOrphaned,
+			LastError:   o.Reason,
+			LastErrorAt: o.FirstSeen,
+		})
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -1401,6 +1682,15 @@ type SurfaceAStats struct {
 	Skipped          uint64
 	BackedOff        uint64
 	SkippedNoBackend uint64
+	// Orphaned is the count of records this node published at a PREVIOUS provider
+	// endpoint that a provider identity change (rename / in-place mutation /
+	// removed binding after an edit) left stale and un-withdrawable through the
+	// current catalog (#3735). Each is surfaced as a SurfaceAStateOrphaned
+	// StatusViews row and drives the `xpf_ddns_surface_a_orphaned` gauge. A
+	// non-zero value means an old record needs MANUAL operator cleanup
+	// (auto-withdrawal is deferred — the old creds are redacted and the old
+	// endpoint is usually decommissioned).
+	Orphaned int
 	// Degraded is the FAIL-CLOSED alarm (#2971): the ownership state file could
 	// not be loaded (corrupt / unsupported-version / unreadable), so Reconcile
 	// refuses every publish/withdraw until the operator resolves it.
@@ -1436,6 +1726,7 @@ func (m *SurfaceAManager) Stats() SurfaceAStats {
 		Skipped:          m.skipped,
 		BackedOff:        m.backedOff,
 		SkippedNoBackend: m.skippedNoBackend,
+		Orphaned:         len(m.orphans),
 		Degraded:         m.degraded,
 		DegradedReason:   m.degradedReason,
 	}
