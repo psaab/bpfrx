@@ -26844,6 +26844,73 @@ top.
     pkg/flowexport/README.md (#3744 section + file-layout bullet)
 
 - **Timestamp**: 2026-07-01
+  - **Action**: #3777 — replay interface INPUT filter `then count` on flow-cache
+    hits. Output/TX `then count` handles were replayed on every hit since #2573
+    but the INPUT side captured only a log descriptor, so an input `then count`
+    reported only the seed packet of an N-packet cacheable flow. Added
+    `RewriteDescriptor::input_filter_counters` + a capture walk
+    (`evaluate_interface_input_filter_counters_cached`) that mirrors the
+    `Always`-policy non-routing walk (defers at a routing-instance/PBR term so
+    its count stays owned by the routing evaluator, #2620), captured once at seed
+    and deduped against `tx_selection.filter_counters` (`retain_absent_from`) so a
+    count-plus-forwarding-class input term is not recorded twice. Replayed on the
+    hit path alongside the output counters. RED-on-revert:
+    `txn_flow_cache_hit_replays_input_filter_then_count_3777` (counter reads 1 not
+    2 without the replay). flow_cache/filter/cos tests green.
+  - **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs (capture fn),
+    userspace-dp/src/filter/engine/mod.rs (re-export),
+    userspace-dp/src/filter/mod.rs (CachedFilterCounters::retain_absent_from),
+    userspace-dp/src/afxdp/flow_cache.rs (RewriteDescriptor field + dedup in
+    from_forward_decision), userspace-dp/src/afxdp/poll_descriptor/filter.rs
+    (evaluate_non_pbr_input_filter_counters_cached),
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs (seed capture),
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (replay),
+    userspace-dp/src/afxdp/tests.rs (RED-on-revert), userspace-dp/src/afxdp/README.md,
+    plus RewriteDescriptor test-literal updates across afxdp test modules
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3778 — re-run the CoS behavior-aggregate (DSCP / IEEE 802.1p
+    PCP) classifier per packet on the flow-cache hit path. The cached
+    TX-selection resolved the queue from the SEED packet's DSCP/PCP and the
+    flow-cache key excludes both, so a mixed-marking flow was pinned to the first
+    packet's queue. Added `CachedTxSelectionDescriptor::ba_reclassify` (set at
+    seed when the queue is NOT pinned by a filter forwarding-class AND a BA
+    classifier is configured on the egress interface) + `reclassify_cached_ba_queue`;
+    `flow_cache_hit.rs` re-resolves the queue from the current packet's DSCP/PCP
+    when the flag is set, otherwise keeps the frozen queue. RED-on-revert:
+    `txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778` (a DSCP-0 seed then
+    a DSCP-46 EF hit; without the re-classify the hit replays queue 0 not the EF
+    queue 1).
+  - **File(s)**: userspace-dp/src/afxdp/flow_cache.rs (ba_reclassify field),
+    userspace-dp/src/afxdp/tx/cos_classify.rs (split fc/BA queue resolution +
+    ba_reclassify + reclassify_cached_ba_queue),
+    userspace-dp/src/afxdp/tx/mod.rs (re-export),
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (per-packet
+    re-resolve), userspace-dp/src/afxdp/umem/tests.rs (literal),
+    userspace-dp/src/afxdp/tests.rs (RED-on-revert + CoS imports),
+    userspace-dp/src/afxdp/README.md
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3779 — hoist the TTL/hop-limit check ABOVE the egress side
+    effects on the flow-cache hit path. Previously the output `then count`
+    replay, policy hit counter, three-color policers, filter logs, and the
+    terminal drop all ran before the TTL check, so a TTL=1 packet on a
+    red-policer / terminal-output-drop cached flow was dropped/charged with no
+    ICMP Time Exceeded, and every expiring packet charged counters/logs for
+    traffic that never egressed. Moved the `packet_ttl_would_expire` +
+    `build_local_time_exceeded_request` check to the top of the hit path (for
+    ForwardCandidate/FabricRedirect); a would-expire packet becomes a TE reply,
+    or (TE suppressed) is dropped, in both cases before any egress accounting.
+    Removed the now-redundant TTL check from the forward fast path. Made
+    `packet_ttl_would_expire` a non-test import in afxdp/mod.rs. RED-on-revert:
+    `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779` (a TTL=1
+    cache-hit packet on an output-`then count` flow leaves the counter at 1;
+    reverting the hoist charges it to 2). observed_bytes/active-epoch stamping
+    left as SEEN telemetry (deliberate, documented).
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (hoist +
+    remove redundant check), userspace-dp/src/afxdp/mod.rs (packet_ttl_would_expire
+    import), userspace-dp/src/afxdp/tests.rs (RED-on-revert),
+    userspace-dp/src/afxdp/README.md
   - **Action**: #3726 — NAT `appPortsFromSpec` rejects a reversed
     application port range instead of narrowing it to the low port.
     Root cause: `appPortsFromSpec` (pkg/dataplane/userspace/nat.go)
@@ -26998,6 +27065,51 @@ top.
     (2-value call updates), docs/userspace-dataplane-architecture.md +
     docs/multi-wan.md (route-snapshot invariants)
 
+- **Timestamp**: 2026-07-01
+  - **Action**: #3727 — policy simulator (pkg/policymatch) now fail-closes with
+    RUNTIME PARITY on a malformed application-set. matchApp silently SKIPPED a
+    policy application-set whose config.ExpandApplicationSet errored (bare
+    `continue`, policymatch.go H01) and fell through to a later rule / the
+    configured default-policy, so under `default-policy permit-all` the simulator
+    reported PERMIT for a config the dataplane FAIL-CLOSES; `[ bad-set any ]`
+    returned a confident positive match (review M01). The runtime fails the WHOLE
+    snapshot closed on the same set two ways: pkg/appid BuildCatalog errors so
+    buildSnapshot errors and the apply path retains prior state (#3438), and
+    expandUserspacePolicyApplications poisons the rule with the __unsupported__
+    sentinel the helper integrity preflight rejects (#3261). FIX: Match detects
+    the condition up front, config-wide (policyContentRejectionReasons +
+    appSetExpansionRejects), BEFORE any per-tier / host-gate evaluation, and
+    returns a first-class Result.ContentRejected verdict with
+    ContentRejectionReasons naming the offending policy + set; DisplayAction
+    renders the dedicated ContentRejectedActionString (SSOT for REST/gRPC), and
+    the CLI + `test policy` text surfaces print ContentRejectedShowLine + reasons.
+    Detection is ORDER-INSENSITIVE (both `[ bad-set any ]` and `[ any bad-set ]`
+    fail closed, mirroring the order-insensitive BuildCatalog walk) and config-
+    wide (a malformed set anywhere fails EVERY query, mirroring the whole-snapshot
+    rejection). Scope is only the application-SET expansion error; protocol-less
+    apps (#3323), unrepresentable protocol/port (#2124), and undefined bare app
+    names keep their existing term-level behavior. REST MatchPoliciesResult gains
+    content_rejected + content_rejection_reasons JSON fields; the gRPC
+    MatchPolicies RPC renders the SSOT action string (no proto field). RED-on-
+    revert proven: with the Match gate disabled, 5 simulator tests go RED
+    (default-permit fall-through, `[ bad-set any ]` positive match, `[ any
+    bad-set ]` positive match, unrelated-policy whole-config, global policy).
+    Runtime parity anchored in pkg/dataplane/userspace/app_set_reject_3727_test.go
+    (buildSnapshot errors or records PolicyContentRejected for the same input).
+    go test ./pkg/policymatch/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/...
+    ./pkg/dataplane/userspace/... green; go build ./... green; gofmt clean (vet
+    unreachable-code note is pre-existing in cli.go, untouched).
+  - **File(s)**: pkg/policymatch/policymatch.go (Result.ContentRejected +
+    ContentRejectionReasons, ContentRejectedActionString/ShowLine, DisplayAction,
+    Match content-rejection gate, policyContentRejectionReasons +
+    appSetExpansionRejects + globalPolicyRejectionScope, matchApp err-branch
+    comment), pkg/policymatch/app_set_failclosed_3727_test.go (new),
+    pkg/dataplane/userspace/app_set_reject_3727_test.go (new runtime-parity
+    reference), pkg/api/types.go + pkg/api/security.go (REST fields + handler
+    branch), pkg/grpcapi/server_cluster.go + pkg/grpcapi/server_show_firewall.go
+    (gRPC MatchPolicies + `test policy` branches), pkg/cli/cli_show_security.go +
+    pkg/cli/cli_request.go (CLI branches), pkg/policymatch/README.md
+    (content-rejected verdict section)
 ## 2026-07-01 — #3738 DDNS dual-stack same-name withdraw preserves the sibling family (codex-157 H10/M06)
 
 - **Timestamp**: 2026-07-01
@@ -27071,3 +27183,33 @@ top.
   pkg/appid/catalog_tolerant_3725_test.go (new — H03/M07/M04 catalog tests),
   pkg/dataplane/appid_catalog_parity_test.go (tolerant-load parity + M04 test),
   pkg/appid/README.md (tolerant-load DEGRADE-not-MISLABEL section)
+- **Action**: #3764 Layer-1 — gate ip-monitoring overlay publication on
+  IsLocalPrimaryAny() instead of primaryship of the lowest data RG. The publish
+  gate `ipmonPublishAllowed` (pkg/daemon/daemon_ipmon.go) previously returned
+  `d.cluster.IsLocalPrimary(lowestDataRG(cfg))` — a single node-wide boolean
+  keyed to the LOWEST data RG. In a multi-data-RG active/active cluster with
+  split primaryship (RG1 primary on node A, RG2 primary on node B), node B (the
+  owner+forwarder of RG2 traffic) had the WHOLE overlay suppressed because it is
+  not primary for RG1, so the RG2 failover route was never injected on the only
+  node that would use it — a functional failover MISS for RG2. Probe HA gating is
+  already per-RG (filterRPMForHAGating / rpmProbeGatingRGs, daemon_rpm.go), so a
+  node only genuinely FAILs the policies whose RG it owns; publishing whenever
+  primary for ANY RG is therefore both safe and precise (node B publishes its
+  RG2 overlay, node A its RG1 overlay, a true standby publishes nothing). This is
+  COMPLETE for RETH-bound probes. Zero regression for the single-data-RG common
+  case: IsLocalPrimaryAny() is identical to IsLocalPrimary(lowestDataRG) there.
+  Layer-2 (per-policy publish allow-set for UNBOUND in-scope probes, or a
+  commit-check requiring HA-gated probes to bind a RETH) is DEFERRED per the
+  converged /research plan. RED-on-revert: new TestIPMonPublishAllowedAnyPrimary
+  split-primary subtest asserts publish=true on the RG2-primary node; reverting
+  the gate to IsLocalPrimary(lowestDataRG) makes it fire (verified). Single-RG
+  primary/secondary subtests assert the new gate == the old gate (equivalence /
+  no-regression guard); the standby (primary-for-none) subtest stays suppressed.
+  go test ./pkg/daemon/ ./pkg/cluster/... green; go build ./... green; gofmt+vet
+  clean. test-failover note: HA gating change; the single-data-RG loss cluster is
+  unaffected by design (IsLocalPrimaryAny==IsLocalPrimary(theOnlyRG) there), so
+  the split-primary path is unit-covered and a unit test suffices.
+- **File(s)**: pkg/daemon/daemon_ipmon.go (ipmonPublishAllowed gate swap + doc
+  comment), pkg/daemon/daemon_ipmon_test.go (TestIPMonPublishAllowedAnyPrimary +
+  ipmonCluster/ipmonClusterCfg helpers; cluster import), docs/multi-wan.md (HA
+  model publication section — per-any-RG semantics, Layer-2 residual deferred)

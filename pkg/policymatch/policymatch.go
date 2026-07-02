@@ -502,6 +502,33 @@ type Result struct {
 	// default-policy.
 	DefaultUsed bool
 
+	// ContentRejected is true when the simulated config references policy
+	// content the userspace snapshot builder fails the WHOLE snapshot closed on
+	// (#3727) — today, an application-set a policy names that cannot be expanded
+	// (ExpandApplicationSet error, or an application-set that resolves to zero
+	// members). The runtime treats it the way pkg/dataplane/userspace
+	// expandUserspacePolicyApplications -> resolveUserspaceApplicationNames do:
+	// the rule is poisoned with the reserved __unsupported__ sentinel term, the
+	// helper integrity preflight raises SnapshotIntegrityError, and the dataplane
+	// retains its previous-good snapshot (or fresh-boots default-deny) — it
+	// enforces NONE of this config's verdicts. matchApp used to SILENTLY SKIP the
+	// malformed set (its old `continue`) and fall through to a later rule /
+	// default-policy, so the simulator reported a permit/deny/default verdict the
+	// dataplane never certifies; under a default-permit it under-reported a
+	// fail-closed config as PERMIT (the exact operator lie #3727 removes). When
+	// ContentRejected is set the verdict reports that fail-closed retention
+	// instead of a fabricated answer: Matched, DefaultUsed and
+	// HostInboundUnmatched are all false, Action carries no enforced meaning
+	// (set to the conservative PolicyDeny for a raw reader, but DisplayAction
+	// renders the dedicated ContentRejectedActionString), and
+	// ContentRejectionReasons names the offending policy + application-set so the
+	// operator sees WHY. This is a config-level property (the runtime rejects the
+	// ENTIRE snapshot on the first unrepresentable rule), so it is reported for
+	// EVERY query against the config, not only a query that would hit the bad
+	// rule.
+	ContentRejected         bool
+	ContentRejectionReasons []string
+
 	// HostInboundUnmatched is true ONLY for a `to-zone junos-host` query that
 	// matched no host-bound policy (#3285). The dataplane host gate
 	// (evaluate_junos_host_policy) returns None here — no security *policy*
@@ -609,17 +636,38 @@ const HostInboundActionString = "host-inbound (local delivery subject to host-in
 // (default-deny for a no-stanza zone), not that it unconditionally proceeds.
 const HostInboundShowLine = "host-inbound: local delivery subject to host-inbound-traffic service admission (a zone with no host-inbound-traffic stanza denies by default; transit global/default-policy NOT applied)"
 
+// ContentRejectedActionString is the operator-facing verdict rendered for a
+// ContentRejected result (#3727) — the simulated config names application
+// content (an unexpandable application-set) the userspace snapshot builder fails
+// the WHOLE snapshot closed on. The runtime raises SnapshotIntegrityError and
+// retains its previous-good snapshot (or fresh-boots default-deny), so no
+// permit/deny/default verdict this config's policies would produce is actually
+// enforced. The string must report that fail-closed retention rather than a
+// fabricated answer. Rendered by DisplayAction so the REST and gRPC transports
+// (which route the verdict through DisplayAction) cannot diverge or emit a
+// misleading permit/deny for a config the dataplane never applies.
+const ContentRejectedActionString = "policy content rejected by dataplane (fail-closed): the userspace helper cannot represent this config (see reasons), so it retains its previous-good snapshot or fresh-boots default-deny — no simulated permit/deny/default verdict is enforced"
+
+// ContentRejectedShowLine is the human-readable one-line explanation the CLI /
+// `show` / `request` match-policies surfaces print for a ContentRejected result
+// (#3727), kept here as the SSOT so the CLI/gRPC-show call sites cannot drift
+// from each other or from ContentRejectedActionString (mirrors HostInboundShowLine).
+const ContentRejectedShowLine = "policy content rejected: the dataplane fails this config closed (retains previous-good snapshot / fresh-boots default-deny) and enforces none of its policies — the offending application content is listed below"
+
 // DisplayAction renders the single operator-facing verdict string for a Result,
 // shared by every match-policies surface (#3375) so the REST and gRPC
 // transports cannot diverge. Before #3375 gRPC returned a BLANK action for the
 // host-inbound and default-deny verdicts while REST returned explicit strings;
 // routing both surfaces through this method keeps them in lockstep.
 //
+//   - ContentRejected -> ContentRejectedActionString (#3727)
 //   - HostInboundUnmatched -> HostInboundActionString
 //   - no match (default-policy verdict) -> "<action> (default)"
 //   - concrete policy match -> "<action>"
 func (r Result) DisplayAction() string {
 	switch {
+	case r.ContentRejected:
+		return ContentRejectedActionString
 	case r.HostInboundUnmatched:
 		return HostInboundActionString
 	case !r.Matched:
@@ -648,6 +696,25 @@ func (r Result) DisplayAction() string {
 func Match(cfg *config.Config, q Query) Result {
 	if cfg == nil {
 		return Result{DefaultUsed: true, Action: config.PolicyDeny}
+	}
+
+	// #3727: the runtime snapshot builder fails the WHOLE snapshot closed when
+	// any policy references an application-set that cannot be expanded — the
+	// builder (pkg/dataplane/userspace expandUserspacePolicyApplications ->
+	// resolveUserspaceApplicationNames) emits the reserved __unsupported__
+	// sentinel term, which the helper integrity preflight rejects
+	// (SnapshotIntegrityError), so the dataplane retains its previous-good
+	// snapshot or fresh-boots default-deny and enforces none of this config.
+	// matchApp used to SILENTLY SKIP the malformed set (`continue`) and fall
+	// through to a later rule / default-policy, so the simulator reported a
+	// permit/deny/default verdict the dataplane never certifies — under a
+	// default-permit it under-reported a fail-closed config as PERMIT. Detect the
+	// same fail-closed condition up front, config-wide (mirroring the
+	// whole-snapshot rejection), BEFORE any per-tier / host-gate evaluation, so
+	// every query for the config reports the runtime's retention rather than a
+	// fabricated answer.
+	if reasons := policyContentRejectionReasons(cfg); len(reasons) > 0 {
+		return Result{ContentRejected: true, ContentRejectionReasons: reasons, Action: config.PolicyDeny}
 	}
 
 	// #3331: resolve the stable runtime policy-ID namespace once, up front, so a
@@ -1203,6 +1270,111 @@ func expandBookName(cfg *config.Config, overlay map[string][]string, name string
 // protocol IS supplied, matchSingleApp constrains by protocol (and ICMP
 // type/code for a type-constrained term) exactly as before; a non-empty but
 // UNRESOLVABLE protocol fails closed for every protocol-constrained app term.
+// policyContentRejectionReasons detects the config-level condition under which
+// the userspace snapshot builder fails the WHOLE snapshot closed because a
+// policy references an application-SET that cannot be expanded (#3727). Two
+// runtime paths fail closed on the SAME malformed set, so the dataplane never
+// enforces the config:
+//
+//   - the app catalog builder (pkg/appid BuildCatalog, consumed by
+//     buildAppCatalogSnapshot) returns an ExpandApplicationSet error, so
+//     buildSnapshot itself returns an error and the apply path retains the prior
+//     dataplane state (#3438);
+//   - the policy snapshot builder (pkg/dataplane/userspace
+//     expandUserspacePolicyApplications -> resolveUserspaceApplicationNames)
+//     poisons the rule with the reserved __unsupported__ sentinel term, which
+//     the helper integrity preflight rejects (SnapshotIntegrityError), so the
+//     helper keeps its previous-good snapshot or fresh-boots default-deny
+//     (#3261).
+//
+// Either way the config is NEVER enforced, so the simulator must report the
+// fail-closed retention rather than the silent-skip-then-fall-through verdict
+// matchApp's old `continue` fabricated. Every zone-pair and global policy is
+// scanned (regardless of scheduler state — the runtime builds and expands every
+// rule's applications) because the runtime fails the ENTIRE snapshot on the
+// first unrepresentable rule; a single malformed set anywhere makes every
+// verdict for the config fail-closed, not just a query that would hit the bad
+// rule.
+//
+// SCOPE: only the application-SET expansion ERROR — the #3727 gap. A
+// protocol-less member app (#3323), an unrepresentable protocol/port (#2124),
+// or a bare undefined application NAME (a term-level matchSingleApp no-match)
+// still expand a set fine, so they are NOT flagged here and keep their existing
+// simulator behavior; those are separate, already-decided axes.
+func policyContentRejectionReasons(cfg *config.Config) []string {
+	var reasons []string
+	scan := func(scope string, apps []string) {
+		if reason, bad := appSetExpansionRejects(cfg, apps); bad {
+			reasons = append(reasons, fmt.Sprintf(
+				"policy %s names content the userspace matcher cannot represent: %s", scope, reason))
+		}
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol == nil {
+				continue
+			}
+			scan(fmt.Sprintf("%s->%s/%s", zpp.FromZone, zpp.ToZone, pol.Name), pol.Match.Applications)
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol == nil {
+			continue
+		}
+		scan(globalPolicyRejectionScope(pol), pol.Match.Applications)
+	}
+	return reasons
+}
+
+// appSetExpansionRejects reports whether the runtime would fail this policy's
+// application list closed because it names an application-set that
+// ExpandApplicationSet cannot expand (member-not-found, nesting-too-deep, or a
+// missing set) (#3727). The detection is ORDER-INSENSITIVE, mirroring the
+// dominant runtime fail-close: pkg/appid BuildCatalog walks EVERY application
+// token and errors on the first unexpandable set regardless of any `any`/empty
+// token in the list (an `any` token is simply skipped for that reference, it
+// does NOT short-circuit the rule), so buildSnapshot returns an error and the
+// dataplane retains the prior state for BOTH `[ bad-set any ]` (the M01 shape,
+// where the simulator previously returned a confident positive match) AND
+// `[ any bad-set ]`. A token that is not an application-set is left to the
+// unchanged bare-application path (matchSingleApp). A well-formed set that
+// expands cleanly is never flagged.
+func appSetExpansionRejects(cfg *config.Config, apps []string) (string, bool) {
+	for _, a := range apps {
+		if _, isSet := cfg.Applications.ApplicationSets[a]; !isSet {
+			continue
+		}
+		if _, err := config.ExpandApplicationSet(a, &cfg.Applications); err != nil {
+			return fmt.Sprintf("application-set %q cannot be expanded: %v", a, err), true
+		}
+	}
+	return "", false
+}
+
+// globalPolicyRejectionScope renders the scope-qualified identity of a global
+// policy for a #3727 content-rejection reason, mirroring the userspace builder's
+// policyRejectionScope: "global/<name>", or "global(<from>-><to>)/<name>" when
+// the policy carries a `match from-zone`/`match to-zone` scope (empty rendered
+// as "any"). The bare name alone is ambiguous because duplicate policy names
+// across scopes are legal.
+func globalPolicyRejectionScope(pol *config.Policy) string {
+	if pol.Match.FromZone != "" || pol.Match.ToZone != "" {
+		from := pol.Match.FromZone
+		if from == "" {
+			from = "any"
+		}
+		to := pol.Match.ToZone
+		if to == "" {
+			to = "any"
+		}
+		return fmt.Sprintf("global(%s->%s)/%s", from, to, pol.Name)
+	}
+	return fmt.Sprintf("global/%s", pol.Name)
+}
+
 func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
 	if len(apps) == 0 {
 		return true
@@ -1218,6 +1390,14 @@ func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort 
 		if _, isSet := cfg.Applications.ApplicationSets[a]; isSet {
 			members, err := config.ExpandApplicationSet(a, &cfg.Applications)
 			if err != nil {
+				// #3727: an unexpandable application-set is a whole-snapshot
+				// fail-close in the runtime, not a silent skip. Match already
+				// gates on policyContentRejectionReasons BEFORE any rule is
+				// evaluated and returns a ContentRejected verdict, so this branch
+				// is unreachable for a config that entered through Match; keep it
+				// defensive (do not silently fall through to a later app / rule as
+				// the pre-#3727 `continue` did — that fabricated the permit/deny
+				// verdict the dataplane never certifies).
 				continue
 			}
 			for _, m := range members {

@@ -640,6 +640,20 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	// delivery; no global/default fallback). Surface it explicitly so the
 	// caller does not read a misleading default-policy verdict for the host
 	// path.
+	if res.ContentRejected {
+		// #3727: the dataplane fails this config closed (unexpandable
+		// application-set) and enforces none of its policies. Surface the
+		// fail-closed retention + the offending content, NOT a fabricated
+		// permit/deny/default verdict.
+		writeOK(w, MatchPoliciesResult{
+			ContentRejected:         true,
+			ContentRejectionReasons: res.ContentRejectionReasons,
+			Action:                  res.DisplayAction(),
+			QueriedFromZone:         fromZone,
+			QueriedToZone:           toZone,
+		})
+		return
+	}
 	if res.HostInboundUnmatched {
 		writeOK(w, MatchPoliciesResult{
 			HostInboundUnmatched: true,

@@ -562,6 +562,16 @@ type MatchPoliciesResult struct {
 	// delivery; no transit global/default fallback), so Action is not a
 	// default-policy verdict for this case.
 	HostInboundUnmatched bool `json:"host_inbound_unmatched,omitempty"`
+	// ContentRejected is true when the simulated config names application content
+	// the userspace snapshot builder fails the WHOLE snapshot closed on (#3727) —
+	// an application-set that cannot be expanded. The dataplane retains its
+	// previous-good snapshot (or fresh-boots default-deny) and enforces NONE of
+	// this config's policies, so Action is the explanatory
+	// ContentRejectedActionString rather than an enforced permit/deny/default
+	// verdict, Matched/DefaultUsed are false, and ContentRejectionReasons names
+	// the offending policy + application-set so the operator sees WHY.
+	ContentRejected         bool     `json:"content_rejected,omitempty"`
+	ContentRejectionReasons []string `json:"content_rejection_reasons,omitempty"`
 	// DefaultUsed is true when no policy matched and Action is the configured
 	// default-policy verdict (#3375), including the no-active-config fail-closed
 	// case (deny). It is the typed form of the " (default)" suffix on Action, so

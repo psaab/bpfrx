@@ -538,12 +538,32 @@ referenced by an ip-monitoring policy or (b) bound via
 are gated — they run only on the node that is primary for the data RG
 (uplink addresses are VRRP VIPs; a standby probe would fail
 structurally). All other RPM probes keep run-everywhere behavior.
-Overlay publication follows the same gate. Known v1 coarseness: the
-publication gate keys on primaryship of the LOWEST data RG only — in
-a multi-data-RG cluster with split primaryship, per-policy/per-RETH
-publication gating is not yet differentiated (probe gating IS
-per-probe). Overlay publication gating refinement rides the later
-program PRs if a split-RG deployment materializes. The overlay is
+Overlay publication follows primaryship. The publish gate is
+`IsLocalPrimaryAny()` (#3764): a node publishes the overlay while it is
+primary for ANY data RG. Because probe HA gating is already per-RG (a
+gated probe runs only on the node primary for its RETH's RG), a node
+only ever genuinely FAILs the policies whose RG it owns, so
+"publish-if-primary-for-any-RG" is precise: in a multi-data-RG cluster
+with split primaryship (RG1 primary on node A, RG2 primary on node B),
+node B publishes its RG2 failover route (the one it owns and detects as
+failed) and node A publishes its RG1 route; a true standby (primary for
+nothing) publishes nothing. This is COMPLETE for RETH-bound probes.
+
+Pre-#3764 the gate keyed on primaryship of the LOWEST data RG only,
+which suppressed the ENTIRE overlay on any node not primary for that
+lowest RG — node B never injected the RG2 route it owned (a functional
+failover MISS for RG2). With a single data RG (the common case)
+`IsLocalPrimaryAny()` is identical to `IsLocalPrimary(lowestDataRG)`, so
+there is zero regression.
+
+Residual v1 coarseness (Layer 2, DEFERRED): an in-scope probe with NO
+RETH binding falls back to the lowest data RG in `rpmProbeGatingRGs`, so
+per-policy publish attribution is still not differentiated for such
+unbound probes. The tracked refinement is a per-policy publish allow-set
+(daemon resolves each policy → its probe's gating RG → `IsLocalPrimary`)
+or a commit-check requiring HA-gated probes to bind a RETH; it rides a
+later PR only if a split-RG deployment with unbound probes materializes.
+The overlay is
 runtime state and never syncs — on takeover the new primary publishes the
 config baseline, runs a fresh probe cycle, and re-derives the overlay
 from fresh results (at most one fast probe cycle of config-default

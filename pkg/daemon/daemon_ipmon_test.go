@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/frr"
@@ -470,4 +471,117 @@ func TestActuateRouteOverlayAbortsOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("actuateRouteOverlay did not abort on ctx cancel (#3758 shutdown-hang regression)")
 	}
+}
+
+// ipmonCluster builds a single-node (no-peer) cluster.Manager for node 0
+// in cluster mode (ControlInterface set) with the given redundancy
+// groups. Single-node election promotes a Preempt=true RG to PRIMARY and
+// holds a Preempt=false RG at SECONDARY (no peer heartbeat), which lets a
+// test express split primaryship deterministically.
+func ipmonCluster(rgs ...*config.RedundancyGroup) *cluster.Manager {
+	m := cluster.NewManager(0, 1)
+	m.UpdateConfig(&config.ClusterConfig{
+		RethCount:        len(rgs),
+		ControlInterface: "control0",
+		RedundancyGroups: rgs,
+	})
+	return m
+}
+
+// ipmonClusterCfg builds a minimal *config.Config whose chassis cluster
+// declares data RGs with the given IDs — enough for lowestDataRG(cfg)
+// and the ipmonPublishAllowed gate.
+func ipmonClusterCfg(ids ...int) *config.Config {
+	cfg := &config.Config{}
+	rgs := make([]*config.RedundancyGroup, len(ids))
+	for i, id := range ids {
+		rgs[i] = &config.RedundancyGroup{ID: id}
+	}
+	cfg.Chassis.Cluster = &config.ClusterConfig{RedundancyGroups: rgs}
+	return cfg
+}
+
+// TestIPMonPublishAllowedAnyPrimary pins the #3764 fix: overlay
+// publication is gated on IsLocalPrimaryAny(), not primaryship of the
+// lowest data RG. Probe HA gating is already per-RG, so a node only
+// genuinely FAILs the policies whose RG it owns — publishing whenever
+// primary for ANY RG is precise (node B injects its RG2 route) and has
+// zero regression for the single-data-RG common case.
+func TestIPMonPublishAllowedAnyPrimary(t *testing.T) {
+	// Split-primary two-data-RG cluster: node 0 SECONDARY for RG1 (the
+	// lowest data RG) and PRIMARY for RG2. The publish gate must be
+	// ENABLED so node 0 injects the RG2 failover route it genuinely owns
+	// and detects as failed. Pre-#3764 keyed on IsLocalPrimary(lowestRG)
+	// = IsLocalPrimary(1) = false, suppressing the WHOLE overlay here —
+	// this assertion goes RED on revert.
+	t.Run("split-primary publishes for the owned RG", func(t *testing.T) {
+		d := &Daemon{cluster: ipmonCluster(
+			&config.RedundancyGroup{ID: 1, NodePriorities: map[int]int{0: 100}, Preempt: false},
+			&config.RedundancyGroup{ID: 2, NodePriorities: map[int]int{0: 200}, Preempt: true},
+		)}
+		if d.cluster.IsLocalPrimary(1) {
+			t.Fatal("setup: node must be SECONDARY for RG1 (lowest data RG)")
+		}
+		if !d.cluster.IsLocalPrimary(2) {
+			t.Fatal("setup: node must be PRIMARY for RG2")
+		}
+		cfg := ipmonClusterCfg(1, 2)
+		if got := lowestDataRG(cfg); got != 1 {
+			t.Fatalf("setup: lowestDataRG = %d, want 1", got)
+		}
+		if !d.ipmonPublishAllowed(cfg) {
+			t.Fatal("split-primary: publish gate must be ENABLED for the RG2-primary node (RED on revert to the lowest-RG gate)")
+		}
+	})
+
+	// Single-data-RG cluster (the common case): the new gate must be
+	// IDENTICAL to the old IsLocalPrimary(lowestDataRG) gate — asserted as
+	// an explicit equivalence for both primary and secondary, so any
+	// regression that diverges the two surfaces here.
+	t.Run("single-data-RG has zero regression", func(t *testing.T) {
+		cfg := ipmonClusterCfg(1)
+
+		dp := &Daemon{cluster: ipmonCluster(
+			&config.RedundancyGroup{ID: 1, NodePriorities: map[int]int{0: 200}, Preempt: true},
+		)}
+		if got, want := dp.ipmonPublishAllowed(cfg), dp.cluster.IsLocalPrimary(lowestDataRG(cfg)); got != want {
+			t.Fatalf("single-RG primary: publish=%v, IsLocalPrimary(lowest)=%v — must be equivalent", got, want)
+		}
+		if !dp.ipmonPublishAllowed(cfg) {
+			t.Fatal("single-RG primary: publish must be enabled")
+		}
+
+		ds := &Daemon{cluster: ipmonCluster(
+			&config.RedundancyGroup{ID: 1, NodePriorities: map[int]int{0: 100}, Preempt: false},
+		)}
+		if got, want := ds.ipmonPublishAllowed(cfg), ds.cluster.IsLocalPrimary(lowestDataRG(cfg)); got != want {
+			t.Fatalf("single-RG secondary: publish=%v, IsLocalPrimary(lowest)=%v — must be equivalent", got, want)
+		}
+		if ds.ipmonPublishAllowed(cfg) {
+			t.Fatal("single-RG secondary: publish must be suppressed")
+		}
+	})
+
+	// True standby (primary for NO data RG): publication stays suppressed
+	// under both the old and new gate.
+	t.Run("standby primary-for-none stays suppressed", func(t *testing.T) {
+		d := &Daemon{cluster: ipmonCluster(
+			&config.RedundancyGroup{ID: 1, NodePriorities: map[int]int{0: 100}, Preempt: false},
+			&config.RedundancyGroup{ID: 2, NodePriorities: map[int]int{0: 100}, Preempt: false},
+		)}
+		if d.cluster.IsLocalPrimaryAny() {
+			t.Fatal("setup: node must be primary for NO RG")
+		}
+		if d.ipmonPublishAllowed(ipmonClusterCfg(1, 2)) {
+			t.Fatal("standby (primary for no RG): publish must be suppressed")
+		}
+	})
+
+	// Standalone (no cluster manager): always publish.
+	t.Run("standalone always publishes", func(t *testing.T) {
+		d := &Daemon{}
+		if !d.ipmonPublishAllowed(&config.Config{}) {
+			t.Fatal("standalone: publish must always be allowed")
+		}
+	})
 }

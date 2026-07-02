@@ -330,6 +330,16 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			PolicyInactiveFn: s.policyInactiveFn(),
 		})
 		switch {
+		case res.ContentRejected:
+			// #3727: the dataplane fails this config closed (unexpandable
+			// application-set) and enforces none of its policies. Report the
+			// fail-closed retention + the offending content, NOT a fabricated
+			// permit/deny/default verdict.
+			fmt.Fprintf(buf, "Policy content rejected (no verdict enforced for %s -> %s)\n", fromZone, toZone)
+			fmt.Fprintf(buf, "  %s\n", policymatch.ContentRejectedShowLine)
+			for _, reason := range res.ContentRejectionReasons {
+				fmt.Fprintf(buf, "    %s\n", reason)
+			}
 		case res.HostInboundUnmatched:
 			// #3285: host-bound traffic — the dataplane host gate returns None
 			// (local delivery; no transit global/default fallback). Do NOT
