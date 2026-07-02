@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -395,5 +396,49 @@ func TestActuatorPublishesOnDegradedFRR(t *testing.T) {
 	}
 	if len(dp.calls) != 2 || dp.calls[0] != "publish" || dp.calls[1] != "bump" {
 		t.Fatalf("calls = %v, want [publish bump] on a degraded reload", dp.calls)
+	}
+}
+
+// TestActuateRouteOverlayAbortsOnContextCancel is the #3758 regression
+// at the exact bug line: actuateRouteOverlay acquires the apply
+// semaphore with the ENGINE's actuation context (cancelled on ipmon
+// shutdown), not context.Background(). When an unrelated apply holds
+// applySem, the actuator blocks in Acquire — and a shutdown, which
+// cancels that context, must abort the wait promptly rather than hang
+// the ipmon run loop (and, through it, daemon shutdown) behind the
+// wedged apply. This test holds applySem, launches the actuator so it
+// blocks in Acquire, and asserts a context cancel unblocks it with a
+// clean (false, no half-actuation) return. On revert (Acquire uses
+// context.Background()) the cancel has no effect, the goroutine stays
+// blocked, and the watchdog timeout fires — RED.
+func TestActuateRouteOverlayAbortsOnContextCancel(t *testing.T) {
+	d := &Daemon{applySem: semaphore.NewWeighted(1)}
+
+	// An unrelated apply holds the semaphore for the whole test.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatalf("seed Acquire: %v", err)
+	}
+	defer d.applySem.Release(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- d.actuateRouteOverlay(ctx) }()
+
+	// It must be blocked in Acquire (semaphore held) — not returned yet.
+	select {
+	case <-done:
+		t.Fatal("actuateRouteOverlay returned while applySem was held (did not block on Acquire)")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A shutdown cancels the actuation context — Acquire must abort.
+	cancel()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("actuateRouteOverlay returned true after ctx cancel; must abort (false) without actuating")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("actuateRouteOverlay did not abort on ctx cancel (#3758 shutdown-hang regression)")
 	}
 }

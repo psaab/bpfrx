@@ -26768,3 +26768,27 @@ top.
     reversed-range reject; appTerm.dstPortConfigured + portConfigured
     guard), pkg/dataplane/userspace/nat_reversed_port_range_3726_test.go
     (new RED-on-revert pins), docs/userspace-dnat-plan.md (§13b)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3758 — ip-monitoring: non-blocking daemon shutdown.
+    `actuateRouteOverlay` acquired the apply semaphore with
+    `context.Background()`, so an in-flight actuation blocked behind a
+    wedged/held apply could hold the ipmon run loop off its stop case
+    forever — and `ipmon.Stop()` (daemon teardown) hung on `e.done`.
+    Threaded a cancellable actuation context through the engine:
+    `New` creates it, the run loop passes it to `actuate(ctx)`, and
+    `Stop()` cancels it BEFORE waiting on `e.done` so a blocked
+    actuation aborts promptly. `actuateRouteOverlay(ctx)` now uses
+    `applySem.Acquire(ctx, 1)` and, on cancel, returns false WITHOUT
+    touching FRR or the userspace snapshot (no half-actuation). Actuate
+    signature `func() bool` → `func(context.Context) bool` (all engine
+    tests updated). RED-on-revert proven both layers: reverting the
+    daemon Acquire to context.Background() → daemon test hangs 2 s RED;
+    removing the Stop cancel → engine test hangs 2 s RED. go test -race
+    ./pkg/ipmon/... ./pkg/daemon/ green.
+  - **File(s)**: pkg/ipmon/ipmon.go (actuateCtx/actuateCancel fields,
+    New, Stop, run loop, actuate signature), pkg/daemon/daemon_ipmon.go
+    (actuateRouteOverlay ctx param + Acquire(ctx)), pkg/ipmon/ipmon_test.go
+    + pkg/ipmon/nexthop_test.go (signature sweep + TestStopAbortsBlockedActuation),
+    pkg/daemon/daemon_ipmon_test.go (TestActuateRouteOverlayAbortsOnContextCancel),
+    docs/multi-wan.md (non-blocking shutdown bullet)

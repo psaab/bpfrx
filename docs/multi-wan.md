@@ -585,6 +585,19 @@ routing, and only on double fault).
   re-publishes — the cache never records an overlay the dataplane never
   accepted, and a full apply during the dirty window rebuilds routes that
   match what is actually live rather than the failed target.
+- **Non-blocking shutdown (#3758).** The actuator is optional
+  infrastructure and must never wedge daemon shutdown. It runs from the
+  engine's single run-loop goroutine, which can only observe the stop
+  signal *after* the synchronous actuator returns — so a blocked
+  actuation (waiting on the apply semaphore held by an unrelated apply,
+  or on a wedged FRR reload) would otherwise hold shutdown hostage.
+  `ipmon.Stop()` cancels the engine's actuation context **before** it
+  waits for the run loop to exit; the actuator threads that context into
+  `applySem.Acquire`, so a shutdown aborts the wait promptly. A
+  cancelled actuation returns "not converged" **without** touching FRR or
+  the userspace snapshot (no half-actuation): if the daemon is still up
+  the engine keeps the overlay dirty and re-actuates on the next sweep,
+  and if it is shutting down the run loop reaches its stop case at once.
 - **Per-cycle transition evaluation (#2527).** An RPM test's pass/fail
   status is a per-test aggregate, evaluated once across the whole probe
   set (`probe-count` probes per cycle), Junos ip-monitoring style. The
