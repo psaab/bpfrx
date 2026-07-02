@@ -16,7 +16,10 @@ func TestRouteSnapshotCarriesPreference(t *testing.T) {
 		{Destination: "203.0.113.0/24", Preference: 50, NextHops: []config.NextHopEntry{{Address: "172.16.50.1"}}},
 		{Destination: "198.51.100.0/24", Preference: 5, NextHops: []config.NextHopEntry{{Address: "172.16.50.2"}}},
 	}
-	routes := buildRouteSnapshots(cfg, nil, nil)
+	routes, err := buildRouteSnapshots(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	got := map[string]int{}
 	for _, r := range routes {
@@ -43,7 +46,10 @@ func TestRouteSnapshotRetainsAllECMPNextHops(t *testing.T) {
 			{Address: "172.16.50.2", Interface: "ge-0/0/2"},
 		}},
 	}
-	routes := buildRouteSnapshots(cfg, nil, nil)
+	routes, err := buildRouteSnapshots(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var found *RouteSnapshot
 	for i := range routes {

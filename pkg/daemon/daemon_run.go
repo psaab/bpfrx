@@ -1938,7 +1938,7 @@ var linkLocalV6Net = func() *net.IPNet {
 	return n
 }()
 
-func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]string {
+func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.RouteOverlayEntry) map[string]map[string]string {
 	type connectedPrefix struct {
 		net       *net.IPNet
 		ifName    string
@@ -2170,6 +2170,42 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 		}
 		addRoutes(vrfName, ri.StaticRoutes)
 		addRoutes(vrfName, ri.Inet6StaticRoutes)
+	}
+
+	// #3759: feed the ip-monitoring effective-route overlay's literal
+	// next-hops through the SAME resolution as configured statics. The
+	// overlay renders via generateStaticRouteInTable with this exact
+	// IPv6NextHopInterfaces map (renderPreferredRoutes), so a link-local
+	// preferred-route next-hop (fe80::…, common for an IPv6 WAN gateway)
+	// needs an interface scope attached here — FRR rejects a scopeless
+	// `ipv6 route ::/0 fe80::1`. Previously the overlay entries were never
+	// fed in, so the map was always absent for the failover gateway and the
+	// route silently failed to install exactly when a link went down. The
+	// per-entry VRF key must match what renderPreferredRoutes passes to
+	// generateStaticRouteInTable: "" for the master table AND for
+	// instance-type forwarding (which renders via `table <id>`, vrfName ==
+	// ""), "vrf-<name>" for a virtual-router instance. A global-unicast
+	// next-hop resolves by longest-prefix as usual (bare if it matches no
+	// connected subnet — FRR accepts a scopeless global next-hop); an
+	// ambiguous or unresolvable link-local stays unresolved, exactly like a
+	// static route (the operator must add a disambiguating interface).
+	for _, entry := range overlay {
+		if entry.NextHop == "" || !strings.Contains(entry.NextHop, ":") {
+			continue
+		}
+		vrfName := ""
+		if entry.RoutingInstance != "" {
+			vrfName = "vrf-" + entry.RoutingInstance
+			for _, ri := range cfg.RoutingInstances {
+				if ri != nil && ri.Name == entry.RoutingInstance {
+					if ri.InstanceType == "forwarding" {
+						vrfName = ""
+					}
+					break
+				}
+			}
+		}
+		setResolved(vrfName, entry.NextHop, resolve(connectedByVRF[vrfName], entry.NextHop))
 	}
 	return resolved
 }

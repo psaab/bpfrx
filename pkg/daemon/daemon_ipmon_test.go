@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -127,6 +128,35 @@ func TestAssembleFRRConfigCarriesOverlay(t *testing.T) {
 	fc = d.assembleFRRConfig(cfg, d.ipmonActiveOverlay())
 	if len(fc.PreferredRoutes) != 0 {
 		t.Fatalf("PreferredRoutes = %+v on standby, want none", fc.PreferredRoutes)
+	}
+}
+
+// TestAssembleFRRConfigResolvesOverlayLinkLocal is the #3759 wiring
+// check at the assembler: assembleFRRConfig must feed the overlay it is
+// handed into inferIPv6StaticNextHopInterfaces so a link-local
+// preferred-route next-hop carries an interface scope into the FRR
+// render. On revert (the overlay is not passed to the inference) the
+// map entry is absent and the assertion fails.
+func TestAssembleFRRConfigResolvesOverlayLinkLocal(t *testing.T) {
+	d := &Daemon{}
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"ge-0/0/3": {
+					Units: map[int]*config.InterfaceUnit{
+						50: {Addresses: []string{"2001:559:8585:50::8/64"}},
+					},
+				},
+			},
+		},
+	}
+	overlay := []config.RouteOverlayEntry{
+		{Destination: "::/0", NextHop: "fe80::1", Policy: "wan-failover"},
+	}
+
+	fc := d.assembleFRRConfig(cfg, overlay)
+	if got := fc.IPv6NextHopInterfaces[""]["fe80::1"]; got != "ge-0-0-3.50" {
+		t.Fatalf("IPv6NextHopInterfaces[\"\"][fe80::1] = %q, want ge-0-0-3.50 (overlay not fed into inference, #3759)", got)
 	}
 }
 
@@ -395,5 +425,49 @@ func TestActuatorPublishesOnDegradedFRR(t *testing.T) {
 	}
 	if len(dp.calls) != 2 || dp.calls[0] != "publish" || dp.calls[1] != "bump" {
 		t.Fatalf("calls = %v, want [publish bump] on a degraded reload", dp.calls)
+	}
+}
+
+// TestActuateRouteOverlayAbortsOnContextCancel is the #3758 regression
+// at the exact bug line: actuateRouteOverlay acquires the apply
+// semaphore with the ENGINE's actuation context (cancelled on ipmon
+// shutdown), not context.Background(). When an unrelated apply holds
+// applySem, the actuator blocks in Acquire — and a shutdown, which
+// cancels that context, must abort the wait promptly rather than hang
+// the ipmon run loop (and, through it, daemon shutdown) behind the
+// wedged apply. This test holds applySem, launches the actuator so it
+// blocks in Acquire, and asserts a context cancel unblocks it with a
+// clean (false, no half-actuation) return. On revert (Acquire uses
+// context.Background()) the cancel has no effect, the goroutine stays
+// blocked, and the watchdog timeout fires — RED.
+func TestActuateRouteOverlayAbortsOnContextCancel(t *testing.T) {
+	d := &Daemon{applySem: semaphore.NewWeighted(1)}
+
+	// An unrelated apply holds the semaphore for the whole test.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatalf("seed Acquire: %v", err)
+	}
+	defer d.applySem.Release(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- d.actuateRouteOverlay(ctx) }()
+
+	// It must be blocked in Acquire (semaphore held) — not returned yet.
+	select {
+	case <-done:
+		t.Fatal("actuateRouteOverlay returned while applySem was held (did not block on Acquire)")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A shutdown cancels the actuation context — Acquire must abort.
+	cancel()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("actuateRouteOverlay returned true after ctx cancel; must abort (false) without actuating")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("actuateRouteOverlay did not abort on ctx cancel (#3758 shutdown-hang regression)")
 	}
 }

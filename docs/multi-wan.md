@@ -264,7 +264,9 @@ Semantics (verified against Junos in the plan's research rounds):
   withdrawn.
 - The injected route has **route preference 1** (`Static/1`) — that is
   what makes it "preferred" over static (AD 5) and DHCP (AD 200)
-  routes.
+  routes. The userspace route snapshot now stamps this preference on the
+  overlay `RouteSnapshot` too (#3770 M7); before, the snapshot route
+  defaulted to preference 0 and diverged from the FRR distance-1 render.
 - `preferred-metric` is the tie-break **among injected routes for the
   same prefix** (two policies in FAIL both injecting 0/0): lowest
   metric wins, then lexicographic policy name. The engine resolves the
@@ -285,6 +287,25 @@ Semantics (verified against Junos in the plan's research rounds):
   `routing-instance` target must exist (PR-2 lifted the PR-1b
   rejection of `instance-type forwarding` targets — see the FBF
   section below).
+- **IPv6 link-local preferred-route next-hops (#3759).** A literal IPv6
+  link-local next-hop (`fe80::…`, the common IPv6 WAN gateway form) has
+  no meaning to FRR without an interface scope — FRR rejects a scopeless
+  `ipv6 route ::/0 fe80::1`. The overlay renders through the same
+  `generateStaticRouteInTable` + `IPv6NextHopInterfaces` machinery as
+  configured statics, so a preferred-route link-local next-hop is now
+  fed through `inferIPv6StaticNextHopInterfaces` and gets its interface
+  scope attached exactly like a static route (#2452): resolved to the
+  box's sole IPv6 interface when unambiguous, keyed by the same VRF the
+  render uses (`""` for the master table and `instance-type forwarding`
+  targets, `vrf-<name>` for a virtual-router instance). A global-unicast
+  next-hop resolves by longest-prefix as usual (bare when it matches no
+  connected subnet — FRR accepts a scopeless global next-hop). When the
+  box has multiple IPv6 interfaces the link-local next-hop is ambiguous
+  and stays unresolved — identical to a static route: FRR then rejects
+  it, and the operator must disambiguate. The userspace-snapshot overlay
+  still carries the bare next-hop address (a wire-protocol
+  `addr@iface` convention is a follow-up); the kernel FIB path — where
+  the failover route actually installs — is the one this fix repairs.
 
 ## Per-policy uplink selection — FBF composition (PR-2)
 
@@ -585,6 +606,19 @@ routing, and only on double fault).
   re-publishes — the cache never records an overlay the dataplane never
   accepted, and a full apply during the dirty window rebuilds routes that
   match what is actually live rather than the failed target.
+- **Non-blocking shutdown (#3758).** The actuator is optional
+  infrastructure and must never wedge daemon shutdown. It runs from the
+  engine's single run-loop goroutine, which can only observe the stop
+  signal *after* the synchronous actuator returns — so a blocked
+  actuation (waiting on the apply semaphore held by an unrelated apply,
+  or on a wedged FRR reload) would otherwise hold shutdown hostage.
+  `ipmon.Stop()` cancels the engine's actuation context **before** it
+  waits for the run loop to exit; the actuator threads that context into
+  `applySem.Acquire`, so a shutdown aborts the wait promptly. A
+  cancelled actuation returns "not converged" **without** touching FRR or
+  the userspace snapshot (no half-actuation): if the daemon is still up
+  the engine keeps the overlay dirty and re-actuates on the next sweep,
+  and if it is shutting down the run loop reaches its stop case at once.
 - **Per-cycle transition evaluation (#2527).** An RPM test's pass/fail
   status is a per-test aggregate, evaluated once across the whole probe
   set (`probe-count` probes per cycle), Junos ip-monitoring style. The

@@ -26872,6 +26872,59 @@ top.
     (new RED-on-revert pins), docs/userspace-dnat-plan.md (§13b)
 
 - **Timestamp**: 2026-07-01
+  - **Action**: #3758 — ip-monitoring: non-blocking daemon shutdown.
+    `actuateRouteOverlay` acquired the apply semaphore with
+    `context.Background()`, so an in-flight actuation blocked behind a
+    wedged/held apply could hold the ipmon run loop off its stop case
+    forever — and `ipmon.Stop()` (daemon teardown) hung on `e.done`.
+    Threaded a cancellable actuation context through the engine:
+    `New` creates it, the run loop passes it to `actuate(ctx)`, and
+    `Stop()` cancels it BEFORE waiting on `e.done` so a blocked
+    actuation aborts promptly. `actuateRouteOverlay(ctx)` now uses
+    `applySem.Acquire(ctx, 1)` and, on cancel, returns false WITHOUT
+    touching FRR or the userspace snapshot (no half-actuation). Actuate
+    signature `func() bool` → `func(context.Context) bool` (all engine
+    tests updated). RED-on-revert proven both layers: reverting the
+    daemon Acquire to context.Background() → daemon test hangs 2 s RED;
+    removing the Stop cancel → engine test hangs 2 s RED. go test -race
+    ./pkg/ipmon/... ./pkg/daemon/ green.
+  - **File(s)**: pkg/ipmon/ipmon.go (actuateCtx/actuateCancel fields,
+    New, Stop, run loop, actuate signature), pkg/daemon/daemon_ipmon.go
+    (actuateRouteOverlay ctx param + Acquire(ctx)), pkg/ipmon/ipmon_test.go
+    + pkg/ipmon/nexthop_test.go (signature sweep + TestStopAbortsBlockedActuation),
+    pkg/daemon/daemon_ipmon_test.go (TestActuateRouteOverlayAbortsOnContextCancel),
+    docs/multi-wan.md (non-blocking shutdown bullet)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3759 — ip-monitoring: interface-scoped IPv6 link-local
+    preferred-route next-hop. A literal link-local next-hop
+    (`preferred-route route ::/0 next-hop fe80::1`) committed cleanly but
+    rendered a scopeless `ipv6 route ::/0 fe80::1`, which FRR rejects —
+    the failover route silently failed to install. Root cause: the
+    overlay reuses `generateStaticRouteInTable` + `IPv6NextHopInterfaces`
+    but the overlay's PreferredRoutes were NEVER fed into
+    `inferIPv6StaticNextHopInterfaces`, so the map was always absent for
+    the failover gateway. Fix: pass the overlay to the inference
+    (`inferIPv6StaticNextHopInterfaces(cfg, overlay)` in assembleFRRConfig)
+    and resolve each overlay literal v6 next-hop through the SAME
+    connected-prefix / synthetic-fe80::/64 pipeline as static routes,
+    keyed by the VRF the render uses (`""` for master + forwarding
+    instances, `vrf-<name>` for virtual-router). Matches static-route
+    handling (#2452): resolves on a single IPv6 interface, stays
+    unresolved (FRR-rejected, operator must disambiguate) when ambiguous.
+    Chose the attach-scope option over commit-reject because the routing
+    code (static routes) attaches scope via this exact map and never
+    rejects link-local at commit. RED-on-revert proven: reverting the
+    inference-body overlay loop → direct inference tests RED; reverting
+    the assembleFRRConfig call-site → assemble test RED. go test
+    ./pkg/daemon/ ./pkg/frr/ green.
+  - **File(s)**: pkg/daemon/daemon_run.go (inferIPv6StaticNextHopInterfaces
+    overlay arg + resolution loop), pkg/daemon/daemon_ipmon.go (call site),
+    pkg/daemon/ipv6_static_nexthop_test.go (overlay link-local + forwarding
+    + nil-control tests; static callers → nil), pkg/daemon/daemon_ipmon_test.go
+    (TestAssembleFRRConfigResolvesOverlayLinkLocal),
+    pkg/frr/preferred_routes_test.go (render contract test),
+    docs/multi-wan.md + pkg/frr/README.md (link-local overlay next-hop)
   **Action**: #3747 — bound the flowexport batch queue (`flowBatch`) and
     add drop/depth visibility. The per-family export accumulator
     (`transport.go` `flowBatch.v4/v6`) was UNBOUNDED: `add` appended
@@ -26906,3 +26959,41 @@ top.
     (wire FlowExportBatchStatsFn), pkg/api/server.go + metrics.go +
     metrics_descriptors.go + metrics_system.go (xpf_flow_export_batch_* family),
     pkg/flowexport/README.md (Bounded export batch section)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Fix #3770 + #3772 in the pkg/dataplane/userspace route-snapshot
+    builder (codex-review-161 H8/M10/M7 + M9/M8), one PR / two commits.
+    #3770: (H8) the dedupe key omitted Discard and Preference, so a discard
+    route and a normal route to the same prefix, or two routes differing only
+    in preference (a static next-table route vs. its preference-0 ip-rule
+    mirror), collided and one was silently dropped before the Rust FIB saw it
+    — added both fields to the key. (M10) the final sort was sort.Slice
+    (unstable) keyed only on Table/Family/Destination, so once same-prefix
+    routes coexist their order tracked non-deterministic build inputs and
+    churned the snapshot — switched to sort.SliceStable with a TOTAL order
+    (next-hops, next-table, discard, preference tie-breakers). (M7) the
+    ip-monitoring overlay route was built with no Preference (default 0),
+    diverging from the documented Static/1 (preference 1) FRR render — now
+    stamps Preference: 1. #3772: (M9) a netlink.RuleList failure was swallowed
+    with `continue`, dropping every route-leak snapshot for that family while
+    the kernel/FRR leak path stayed up — buildRouteSnapshots now returns an
+    error (indirected via a ruleListFn seam) surfaced through builder.go and
+    manager.go so the apply path fails closed and retains prior state (mirrors
+    #3731). (M8) canonicalRoutePrefix returned the raw string on a parse
+    failure despite its "returns empty" doc and the caller's skip guard — now
+    returns "" so a malformed overlay destination is skipped, not injected as
+    a garbage FIB prefix. RED-on-revert tests added for all five: discard +
+    connected survive dedupe; distinct-preference survive dedupe; sort order
+    is identical regardless of input order; overlay carries preference 1;
+    RuleList error is surfaced; canonicalRoutePrefix returns "" and the
+    overlay skips an unparseable destination. go test ./pkg/dataplane/... +
+    ./pkg/routing/... green; go build ./... green; gofmt + vet clean.
+  - **File(s)**: pkg/dataplane/userspace/routes.go (dedupe key, SliceStable
+    total-order sort, overlay Preference:1, ruleListFn seam + surfaced error,
+    canonicalRoutePrefix ""), pkg/dataplane/userspace/builder.go +
+    pkg/dataplane/userspace/manager.go (propagate the route-build error),
+    pkg/dataplane/userspace/routes_dedupe_3770_test.go (new),
+    pkg/dataplane/userspace/routes_rulelist_3772_test.go (new),
+    pkg/dataplane/userspace/{route_overlay,fbf_snapshot,routes_fib_metadata,manager}_test.go
+    (2-value call updates), docs/userspace-dataplane-architecture.md +
+    docs/multi-wan.md (route-snapshot invariants)
