@@ -84,9 +84,17 @@ func staticRouteNode() *schemaNode {
 					"interface": {desc: "Egress interface for this next-hop", args: 1, placeholder: "<interface-name>", children: nil},
 				}},
 			"qualified-next-hop": {desc: "Qualified next-hop", args: 1, placeholder: "<gateway>", children: map[string]*schemaNode{
-				"interface":  {desc: "Egress interface", args: 1, placeholder: "<interface-name>", children: nil},
-				"preference": {desc: "Preference", args: 1, placeholder: "<value>", children: nil},
-				"metric":     {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
+				"interface": {desc: "Egress interface", args: 1, placeholder: "<interface-name>", children: nil},
+				// #3827 (Low): the qualified-next-hop preference folds into
+				// route.Preference (compiler_routing.go), the same i32 wire field
+				// gated for the route-level `preference` leaf. Mirror that typing
+				// so a negative / i32-overflow value is rejected at commit (naming
+				// the leaf) instead of only tripping the Rust snapshot backstop
+				// (RoutePreferenceOutOfRange) with retained-prior-state.
+				"preference": {desc: "Preference", args: 1, placeholder: "<value>",
+					valueType: ValueInteger, valueDesc: "Route preference / administrative distance (0..2147483647; lower = more preferred, default 5)",
+					valueExamples: []string{"5", "100"}, validator: ValidateInteger(0, maxWireI32), children: nil},
+				"metric": {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
 			}},
 			"discard":    {desc: "Discard (blackhole) route", children: nil},
 			"reject":     {desc: "Reject route (send ICMP unreachable)", children: nil},
