@@ -151,10 +151,16 @@ triggering on a **regex** match of `<pattern>` against the event attribute
 
 - Unanchored patterns are substring matches (`Com` matches `Comcast`); anchor
   with `^...$` for an exact match.
-- Supported attributes are `test-owner` and `test-name`, defined once in
+- Supported attributes are `test-owner`, `test-name`, and (since #3756 H14) the
+  static per-test config strings `target`, `routing-instance`, and
+  `destination-interface`. They are defined once in
   `config.EventAttributesKnownFields` (the single source of truth consumed by
-  both the commit-time validator and the runtime matcher — a drift-guard test
-  keeps them identical).
+  both the commit-time validator and the runtime matcher — a drift-guard test,
+  `TestEventAttributesKnownFields_MatchesRuntimeSwitch`, keeps them identical)
+  and resolved from the `rpm.Event` populated at every `fireEvent` call site.
+  This lets a policy key on "all probes to target X" or "all probes in
+  routing-instance Y". Numeric attributes (`rtt`, `jitter`, loss threshold) and
+  a `failure-reason` taxonomy remain deferred — see `docs/feature-gaps.md` M7.
 - **Event-name scoping (#3753):** the `<event>.` prefix scopes the constraint
   to a single event of a multi-event policy. The runtime matcher applies a
   constraint ONLY when the current event equals its prefix, so
@@ -261,6 +267,33 @@ blocks a `commitFn` on `ctx.Done()` and asserts `Close()` aborts it with
   within-cooldown action, #3750)
 - `xpf_event_attributes_match_invalid_total`
 - `xpf_event_action_queue_depth` (gauge)
+
+## Temporal `within` trigger semantics (#3756)
+
+`within <seconds> { trigger on N }` / `{ trigger until N }` are pinned to the
+Junos reading in `withinMatches` (`engine.go`):
+
+- **`trigger on N` is EDGE-triggered** — the policy fires on the threshold
+  CROSSING (the in-window count first reaching N), NOT on every event while the
+  count stays at or above N. A per-`(policy, event)` latch (`policyRuntime.
+  onLatched`) records that a crossing already fired; it is set in
+  `evaluateEvent` only AFTER the cooldown check passes (a cooldown-suppressed
+  crossing is not consumed) and re-armed (cleared) by `withinMatches` the moment
+  the count drops back below N. Rationale: the 30 s cooldown alone only
+  THROTTLES a sustained failing level — it would re-remediate an unchanged
+  condition every cooldown, which is harmful for a non-idempotent then-batch and
+  spams commit/rollback history. Regression-locked by
+  `TestEdgeTriggerOn_*_3756`. Only a policy carrying a `trigger on` clause
+  latches (`policyHasTriggerOn`); a no-within or `trigger until` policy is
+  unaffected.
+- **`trigger until N` fires through the INCLUSIVE N-th event**, then stops
+  (Junos "trigger UNTIL the event has been received N times" — the N-th
+  occurrence is the last that fires). The current event is appended to the
+  window BEFORE the check, so the N-th matching event makes `count == N`; the
+  boundary is `count > N` (not `>=`). This fixed a dead-config bug: with `>=`,
+  `until 1` made the first event `count == 1 >= 1` and NEVER fired, and
+  `until N` fired only on events 1..N-1. Regression-locked by
+  `TestInclusiveUntil_*_3756`.
 
 ## Gotchas
 

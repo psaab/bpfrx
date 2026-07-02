@@ -116,10 +116,17 @@ func TestAttributesMatch_MalformedLineFailsClosed(t *testing.T) {
 // matcher (i.e. a policy matching ^anything against that field with the right
 // event value must be able to return true), and an unknown field must fail.
 func TestEventAttributesKnownFields_MatchesRuntimeSwitch(t *testing.T) {
-	// The matcher resolves test-owner and test-name; assert exactly those are
-	// the known fields. If a field is added to the SSOT, this test forces the
-	// matcher switch to be updated in lockstep.
-	want := map[string]bool{"test-owner": true, "test-name": true}
+	// The matcher resolves these fields; assert exactly this set is the known
+	// fields. If a field is added to the SSOT, this test forces the matcher
+	// switch to be updated in lockstep (#3756 H14 added the three static
+	// per-test strings target / routing-instance / destination-interface).
+	want := map[string]bool{
+		"test-owner":            true,
+		"test-name":             true,
+		"target":                true,
+		"routing-instance":      true,
+		"destination-interface": true,
+	}
 	if len(config.EventAttributesKnownFields) != len(want) {
 		t.Fatalf("known-field set %v has unexpected size; runtime switch resolves %v",
 			config.EventAttributesKnownFields, want)
@@ -233,6 +240,73 @@ func TestAttributesMatch_PerEventScopingBothDirections(t *testing.T) {
 	}
 	if e.attributesMatch(pol, rpm.Event{Name: "event_b", TestName: "wrong"}) {
 		t.Error("event_b with wrong name must be gated")
+	}
+}
+
+// #3756 H14: the three new static per-test fields (target, routing-instance,
+// destination-interface) resolve against the corresponding rpm.Event field and
+// regex-match like test-owner/test-name.
+//
+// RED-on-revert: before H14 these fields are absent from the SSOT and the
+// matcher switch, so a policy keyed on them fails CLOSED (unknown field →
+// policy never matches) — the match assertions below go RED (attributesMatch
+// returns false for a matching value).
+func TestAttributesMatch_TargetField_3756(t *testing.T) {
+	pol := policyWithMatch("p", "ping_test_failed",
+		"ping_test_failed.target matches ^192\\.0\\.2\\.1$")
+	e := newTestEngine(t, []*config.EventPolicy{pol})
+	if !e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", Target: "192.0.2.1"}) {
+		t.Error("target field should match the event Target")
+	}
+	if e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", Target: "192.0.2.2"}) {
+		t.Error("target field should NOT match a different Target")
+	}
+}
+
+func TestAttributesMatch_RoutingInstanceField_3756(t *testing.T) {
+	pol := policyWithMatch("p", "ping_test_failed",
+		"ping_test_failed.routing-instance matches ^ISP-B$")
+	e := newTestEngine(t, []*config.EventPolicy{pol})
+	if !e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", RoutingInstance: "ISP-B"}) {
+		t.Error("routing-instance field should match the event RoutingInstance")
+	}
+	if e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", RoutingInstance: "ISP-A"}) {
+		t.Error("routing-instance field should NOT match a different RoutingInstance")
+	}
+}
+
+func TestAttributesMatch_DestinationInterfaceField_3756(t *testing.T) {
+	pol := policyWithMatch("p", "ping_test_failed",
+		"ping_test_failed.destination-interface matches ^ge-0/0/1$")
+	e := newTestEngine(t, []*config.EventPolicy{pol})
+	if !e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", DestinationInterface: "ge-0/0/1"}) {
+		t.Error("destination-interface field should match the event DestinationInterface")
+	}
+	if e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", DestinationInterface: "ge-0/0/2"}) {
+		t.Error("destination-interface field should NOT match a different DestinationInterface")
+	}
+}
+
+// The new fields honor the #3753 event-name scoping: a constraint keyed on one
+// event of a multi-event policy must not gate a DIFFERENT event.
+func TestAttributesMatch_NewFieldsEventScoped_3756(t *testing.T) {
+	pol := &config.EventPolicy{
+		Name:            "p",
+		Events:          []string{"ping_test_failed", "ping_test_completed"},
+		AttributesMatch: []string{"ping_test_failed.target matches ^10\\.0\\.0\\.1$"},
+	}
+	e := newTestEngine(t, []*config.EventPolicy{pol})
+
+	// ping_test_failed IS scoped by the target constraint.
+	if !e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", Target: "10.0.0.1"}) {
+		t.Error("scoped event must match its target constraint")
+	}
+	if e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", Target: "10.0.0.2"}) {
+		t.Error("scoped event must be gated by a non-matching target")
+	}
+	// ping_test_completed is NOT scoped by a ping_test_failed constraint.
+	if !e.attributesMatch(pol, rpm.Event{Name: "ping_test_completed", Target: "10.0.0.9"}) {
+		t.Error("a ping_test_failed-scoped target constraint must not gate ping_test_completed (#3753)")
 	}
 }
 

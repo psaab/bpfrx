@@ -1,3 +1,59 @@
+## 2026-07-01 — #3756 H14: attributes-match static per-test string fields
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Widened attributes-match to key on the three STATIC per-test
+    config strings target / routing-instance / destination-interface (already
+    in scope at every rpm fireEvent site). rpm.Event gained Target /
+    RoutingInstance / DestinationInterface; fireEvent now takes *config.RPMTest
+    and populates them (3 call sites + the buffered-events path get them for
+    free). Added the fields to config.EventAttributesKnownFields (SSOT), the
+    strict-commit error message, and the engine attributesMatch switch (drift
+    guard TestEventAttributesKnownFields_MatchesRuntimeSwitch updated in
+    lockstep). #3753 event-name scoping and #2141 fail-closed preserved.
+    Numeric (rtt/jitter/loss) + failure-reason surface DEFERRED (design
+    recorded in feature-gaps M7). RED-on-revert: TestAttributesMatch_
+    {Target,RoutingInstance,DestinationInterface}Field_3756 (fail-closed
+    "unresolvable field" without the switch cases) + the strict-validator loop
+    in TestValidateEventAttributesMatchStrict_Direct.
+  - **File(s)**: pkg/rpm/rpm.go, pkg/rpm/event_buffer_3755_test.go,
+    pkg/config/event_options_match.go, pkg/config/event_options_match_test.go,
+    pkg/eventengine/engine.go, pkg/eventengine/engine_test.go,
+    pkg/eventengine/README.md, docs/feature-gaps.md
+
+## 2026-07-01 — #3756 M2: `trigger until N` is the inclusive N-th (dead-config fix)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The event is appended to the window BEFORE withinMatches, and
+    the until boundary was `count >= wc.TriggerUntil`, so the N-th matching
+    event (count==N) returned false and never fired — `until 1` could NEVER
+    fire (count==1 on the first event), a dead-config bug; `until N` fired only
+    on events 1..N-1. Changed the boundary to `count > wc.TriggerUntil` so
+    `until N` fires inclusively through the N-th event then stops at N+1
+    (Junos "trigger UNTIL the event has been received N times"). One-char
+    change plus comment. RED-on-revert: TestInclusiveUntil_One_FiresOnce_3756
+    (never fires on >=), _Two_FiresThroughSecond_3756 (1 vs 2);
+    _BelowThresholdKeepsFiring_3756 is the never-reaches-N control (green both
+    ways).
+  - **File(s)**: pkg/eventengine/engine.go,
+    pkg/eventengine/engine_inclusive_until_3756_test.go,
+    pkg/eventengine/README.md
+
+## 2026-07-01 — #3756 M1: `trigger on` is edge-triggered (crossing, not level)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: `within { trigger on N }` was LEVEL-triggered — withinMatches
+    returned true for every event with count>=N, so a sustained failing level
+    re-remediated every 30s cooldown. Pinned to the Junos EDGE reading: a
+    per-(policy,event) latch (policyRuntime.onLatched) set after the crossing
+    fires (only AFTER the cooldown check passes, so a suppressed crossing is not
+    consumed) and re-armed by withinMatches when the in-window count drops below
+    N. policyHasTriggerOn gates the latch to trigger-on policies only.
+    RED-on-revert: TestEdgeTriggerOn_SustainedLevelFiresOnce_3756 (level fires 9
+    vs edge 1), _ReArmsAfterDroppingBelow_3756 (5 vs 2),
+    _CooldownDoesNotConsumeCrossing_3756 (guards latch-after-cooldown ordering).
+  - **File(s)**: pkg/eventengine/engine.go,
+    pkg/eventengine/engine_edge_trigger_3756_test.go,
+    pkg/eventengine/README.md
 ## 2026-07-01 — #3768: IPv6 ip-rule next-table emitted the v4 table (blackhole)
 
 - **Timestamp**: 2026-07-01

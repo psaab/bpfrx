@@ -114,6 +114,13 @@ type Event struct {
 	Name      string // "ping_test_failed", "ping_probe_failed", "ping_test_completed"
 	TestOwner string // probe name (matches attributes-match test-owner)
 	TestName  string // test name (matches attributes-match test-name)
+	// Static per-test config strings exposed to attributes-match (#3756 H14).
+	// They are stable identifiers already in scope at every fireEvent call
+	// site, so an operator can key remediation on "all probes to target X" or
+	// "all probes in routing-instance Y" without a new attribute taxonomy.
+	Target               string // test target IP/hostname (attributes-match target)
+	RoutingInstance      string // test routing-instance ("" = master) (routing-instance)
+	DestinationInterface string // egress-interface pin (destination-interface)
 }
 
 // EventCallback is called when RPM probes generate events.
@@ -309,8 +316,19 @@ func (m *Manager) PinInstallFailureCount() int {
 	return len(m.pinFailed)
 }
 
-func (m *Manager) fireEvent(name, owner, testName string) {
-	ev := Event{Name: name, TestOwner: owner, TestName: testName}
+// fireEvent builds an rpm.Event for event-options matching. It takes the whole
+// *config.RPMTest so the static per-test strings (test-name, target,
+// routing-instance, destination-interface) are populated for attributes-match
+// (#3756 H14) at every call site. test is always non-nil from runSingleTest;
+// the nil guard is defensive.
+func (m *Manager) fireEvent(name, owner string, test *config.RPMTest) {
+	ev := Event{Name: name, TestOwner: owner}
+	if test != nil {
+		ev.TestName = test.Name
+		ev.Target = test.Target
+		ev.RoutingInstance = test.RoutingInstance
+		ev.DestinationInterface = test.DestinationInterface
+	}
 	m.mu.Lock()
 	fn := m.onEvent
 	if fn == nil {
@@ -535,7 +553,7 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 			// Probe-level failure event stays per-probe — it is an
 			// eventengine signal and does not drive ip-monitoring
 			// routes (which key off fireTransition only).
-			m.fireEvent("ping_probe_failed", probeName, test.Name)
+			m.fireEvent("ping_probe_failed", probeName, test)
 			if hitLimit {
 				break
 			}
@@ -588,14 +606,14 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 		}
 		m.mu.Unlock()
 		if status == "fail" {
-			m.fireEvent("ping_test_failed", probeName, test.Name)
+			m.fireEvent("ping_test_failed", probeName, test)
 		}
 		m.fireTransition(probeName, test.Name, status)
 	}
 
 	// Fire test completed if all probes passed
 	if failures == 0 && successes > 0 {
-		m.fireEvent("ping_test_completed", probeName, test.Name)
+		m.fireEvent("ping_test_completed", probeName, test)
 	}
 }
 

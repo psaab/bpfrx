@@ -3,6 +3,8 @@ package rpm
 import (
 	"sync"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // TestFireEventBufferedUntilCallbackRegistered is the fail-on-revert pin for
@@ -18,8 +20,8 @@ func TestFireEventBufferedUntilCallbackRegistered(t *testing.T) {
 	m := New()
 
 	// First probe cycle fires before any callback exists.
-	m.fireEvent("ping_probe_failed", "WAN", "t")
-	m.fireEvent("ping_test_failed", "WAN", "t")
+	m.fireEvent("ping_probe_failed", "WAN", &config.RPMTest{Name: "t"})
+	m.fireEvent("ping_test_failed", "WAN", &config.RPMTest{Name: "t"})
 
 	var mu sync.Mutex
 	var got []Event
@@ -56,7 +58,7 @@ func TestFireEventDeliveredLiveAfterRegistration(t *testing.T) {
 		mu.Unlock()
 	})
 
-	m.fireEvent("ping_test_failed", "WAN", "t")
+	m.fireEvent("ping_test_failed", "WAN", &config.RPMTest{Name: "t"})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -73,7 +75,7 @@ func TestFireEventDeliveredLiveAfterRegistration(t *testing.T) {
 func TestFireEventBufferBounded(t *testing.T) {
 	m := New()
 	for i := 0; i < maxBufferedEvents*3; i++ {
-		m.fireEvent("ping_probe_failed", "WAN", "t")
+		m.fireEvent("ping_probe_failed", "WAN", &config.RPMTest{Name: "t"})
 	}
 	m.mu.Lock()
 	n := len(m.bufferedEvents)
