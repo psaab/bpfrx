@@ -27814,3 +27814,42 @@ top.
   `record_policy_hit_counter` gated on non-LocalDelivery), userspace-dp/src/
   afxdp/tests.rs (established-hit exactly-once fail-on-revert test), userspace-dp/
   src/afxdp/forwarding/README.md (#3706 exactly-once hit-counting note)
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3715 — range-check firewall-filter DSCP wire fields to the 6-bit
+  0..=63 range in the userspace-dp filter compiler (fail-closed backstop). The
+  Rust snapshot decode did NOT range-check the two DSCP wire fields against
+  their semantic 0..63 range, inconsistent with the file's own #3406 fail-closed
+  posture. Bug A (rewrite): `parse_term` computed
+  `snap.dscp_rewrite.map(|v| v & 0x3f)` — a corrupt byte like 110 was MASKED to
+  46 (EF), actively marking traffic with a code point the operator never authored
+  (untrusted traffic could land in EF). Bug B (match): `build_u6_match_bitmap`
+  silently SKIPPED any `dscp_values` entry >= 64 while `dscp_match_enabled`
+  stayed true — a `[46, 64]` term appeared to carry two selectors but matched
+  only EF (fail-WIDE / silently-wrong). The Go commit gate
+  (`validateFilterDSCPStrict`, #3309) already bounds both tokens to a code-point
+  name or 0..63 and the Go builder only emits 0..63, so a committed config never
+  produces an out-of-range value — the gap is purely the helper-boundary decode
+  for a corrupt / hand-built / version-drifted / mixed-version snapshot. Fix:
+  added a non-mutating preflight range check in `parse_term` (mirroring the
+  #3406 flex_match length check) that rejects any `dscp_values` entry >= 64
+  (dimension "match") or a `dscp_rewrite` >= 64 (dimension "rewrite") via a new
+  `SnapshotIntegrityError::FilterDSCPOutOfRange { family, filter, term,
+  dimension, value }` variant; removed the `& 0x3f` mask so a valid 0..=63
+  rewrite is carried verbatim. No wire field changed (dscp_values stays Vec<u8>,
+  dscp_rewrite stays Option<u8>) — no protocol_wire_v1.json regen. RED-on-revert
+  tests: `dscp_rewrite_out_of_range_fails_closed_not_masked` (Some(110) rejected,
+  proves NOT masked to 46) and `dscp_match_out_of_range_fails_closed_not_dropped`
+  ([46,64] rejected, in-range set still compiles); both verified RED with the
+  fix reverted (mask restored + preflight removed) and GREEN with it. Also L10:
+  reworded the stale `validateFilterDSCPStrict` doc comment ("a leniently-loaded
+  match widens") to distinguish the match half (fail-closed marker #3406 +
+  numeric range #3715) from the rewrite half (warn/no-op name, fail-closed
+  numeric #3715). Full `cargo test --release` green (3422 lib + integration
+  binaries, 0 failed); `go build ./...`, `go vet ./pkg/config/...`,
+  `go test ./pkg/config/...` green; gofmt clean.
+- **File(s)**: userspace-dp/src/policy.rs (new FilterDSCPOutOfRange variant +
+  Display), userspace-dp/src/filter/compiler.rs (preflight DSCP range check +
+  removed & 0x3f mask), userspace-dp/src/filter/tests.rs (two RED-on-revert
+  tests), userspace-dp/src/filter/README.md (#3715 backstop doc + test list),
+  pkg/config/compiler_validate_strict.go (L10 stale-comment reword)
