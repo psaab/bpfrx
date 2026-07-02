@@ -9561,6 +9561,255 @@ fn poll_descriptor_no_junos_host_policy_local_delivery_unchanged_session_miss() 
     assert!(rx.try_recv().is_err());
 }
 
+/// #3019: gre_to_self_snapshot extended with a `from-zone lan to-zone
+/// junos-host then permit` policy carrying an explicit `then log` selection and
+/// a non-zero admitting `policy_id` — the #3706 fixture. `log_init`/`log_close`
+/// drive the policy's Junos `then log session-init`/`session-close` selection.
+fn junos_host_local_delivery_permit_snapshot(
+    log_init: bool,
+    log_close: bool,
+    policy_id: u32,
+) -> ConfigSnapshot {
+    let mut snapshot = gre_to_self_snapshot();
+    snapshot.policies.push(PolicyRuleSnapshot {
+        name: "host-permit-log".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "junos-host".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        log_session_init: log_init,
+        log_session_close: log_close,
+        policy_id,
+        ..Default::default()
+    });
+    snapshot
+}
+
+/// #3706 helper: run the session-MISS LocalDelivery descriptor for a host-bound
+/// TCP/179 SYN under `snapshot` and return the metadata of the single installed
+/// host-local session (log flags, admitting policy id, hit-counter handle),
+/// asserting exactly one session was cached and it was not policy-denied.
+fn run_junos_host_permit_local_delivery(snapshot: &ConfigSnapshot) -> (bool, bool, u32, u32) {
+    let forwarding = build_forwarding_state(snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+
+    let (tx, rx) = mpsc::sync_channel(8);
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(77, LocalTunnelDelivery { tx, wake });
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+
+    let (_batch, dbg) = txn_run_descriptor_with_deliveries(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+        &local_tunnel_deliveries,
+    );
+    let _ = rx;
+
+    assert_eq!(dbg.local, 1, "packet must take the LocalDelivery arm");
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "a to-zone junos-host permit must NOT policy-deny the host-bound flow"
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "a permitted host-bound flow must cache exactly one host-local session"
+    );
+    let mut seen = None;
+    sessions.iter_with_origin(|_key, _decision, md, _origin| {
+        seen = Some((
+            md.log_session_init,
+            md.log_session_close,
+            md.policy_id,
+            md.policy_counter_idx,
+        ));
+    });
+    seen.expect("a host-local session must be installed for a permitted flow")
+}
+
+/// #3706 LITERAL fail-on-revert (session-MISS): a `from-zone lan to-zone
+/// junos-host then permit log session-init session-close` policy admits a
+/// host-bound flow, and the installed local-delivery session MUST carry BOTH
+/// log flags, the admitting `policy_id`, and a non-zero hit-counter handle.
+/// Before #3706 the junos-host permit gate discarded its
+/// [`PolicyEvaluationResult`], so the session installed with
+/// `log_session_init`/`log_session_close = false`, `policy_id = 0`, and
+/// `policy_counter_idx = 0` — the host-bound management session was unlogged and
+/// unattributable. Revert the `JunosHostLocalPolicy::Permit` stamp (drop the
+/// permit result on the local-delivery path) and this test goes RED, while
+/// `poll_descriptor_junos_host_permit_no_log_local_delivery_no_overlog` stays
+/// GREEN (a bare permit must not over-log).
+#[test]
+fn poll_descriptor_junos_host_permit_log_stamps_local_delivery_session_miss() {
+    let snapshot = junos_host_local_delivery_permit_snapshot(true, true, 4242);
+    let (log_init, log_close, policy_id, counter_idx) =
+        run_junos_host_permit_local_delivery(&snapshot);
+
+    assert!(
+        log_init,
+        "#3706: to-zone junos-host `then permit log session-init` must stamp \
+         log_session_init on the installed host-local session (was false)"
+    );
+    assert!(
+        log_close,
+        "#3706: `then permit log session-close` must stamp log_session_close \
+         on the installed host-local session (was false)"
+    );
+    assert_eq!(
+        policy_id, 4242,
+        "#3706: the admitting junos-host policy id must be stamped so the \
+         SESSION_CREATE/CLOSE RT_FLOW record attributes the flow (was the 0 \
+         sentinel)"
+    );
+    assert_ne!(
+        counter_idx, 0,
+        "#3706: the admitting junos-host rule's 1-based hit-counter handle must \
+         be stamped (was the 0 no-counter sentinel)"
+    );
+}
+
+/// #3706 GREEN pair (session-MISS): a `to-zone junos-host then permit` policy
+/// with NO `then log` clause installs the host-local session but MUST NOT set
+/// either log flag — proving the #3706 stamp propagates the policy's ACTUAL log
+/// selection and does not blanket-log every permitted host-bound flow. The
+/// admitting policy id is still stamped for attribution parity with transit.
+#[test]
+fn poll_descriptor_junos_host_permit_no_log_local_delivery_no_overlog() {
+    let snapshot = junos_host_local_delivery_permit_snapshot(false, false, 77);
+    let (log_init, log_close, policy_id, _counter_idx) =
+        run_junos_host_permit_local_delivery(&snapshot);
+
+    assert!(
+        !log_init,
+        "a permit WITHOUT `then log` must not set log_session_init (no over-log)"
+    );
+    assert!(
+        !log_close,
+        "a permit WITHOUT `then log` must not set log_session_close (no over-log)"
+    );
+    assert_eq!(
+        policy_id, 77,
+        "the admitting junos-host policy id is stamped even without `then log`"
+    );
+}
+
+/// #3706 fail-on-revert (established session-HIT double-count): a
+/// `to-zone junos-host then permit` host-local session must count each packet
+/// against the admitting rule's hit counter EXACTLY ONCE — parity with transit.
+/// The #3706 MISS-install stamps a bound `policy_counter`, and the LocalDelivery
+/// session-HIT path ALSO re-evaluates the junos-host policy on every hit (the
+/// mandatory teardown re-check), whose `try_match_rule` counts the packet.
+/// Counting at the generic session-hit `record_policy_hit_counter` site TOO
+/// would double-count every established host-local permit packet (2N for N
+/// hits). This drives 1 SYN (miss) + 3 established ACKs (hits) and asserts the
+/// rule's packet counter == 4. Remove the `!= LocalDelivery` guard on the
+/// session-hit counter and this goes RED (reads 7).
+#[test]
+fn poll_descriptor_junos_host_permit_established_hit_counts_once() {
+    // No `then log`; policy id 55. Counting is orthogonal to the log flags.
+    let snapshot = junos_host_local_delivery_permit_snapshot(false, false, 55);
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // `stable_policy_rule_id` for a rule with no explicit rule_id is
+    // "<from>-><to>/<name>". The fixture rule is lan -> junos-host / host-permit-log.
+    let rule_id = "lan->junos-host/host-permit-log";
+    let hit_packets = |f: &ForwardingState| -> u64 {
+        f.policy
+            .counter_snapshots()
+            .into_iter()
+            .find(|c| c.rule_id == rule_id)
+            .map(|c| c.packets)
+            .unwrap_or_else(|| panic!("missing policy counter for {rule_id}"))
+    };
+
+    // Packet 1: SYN => session MISS => install. The miss-site junos-host
+    // re-eval counts this first packet once (cold path).
+    let syn = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let syn_meta = txn_meta_v4(24, TCP_FLAG_SYN, (syn.len() - 14) as u16);
+    let (_b, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &syn,
+        syn_meta,
+    );
+    assert_eq!(dbg.local, 1, "SYN must take the LocalDelivery arm");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the permitted SYN must install one host-local session"
+    );
+    assert_eq!(
+        hit_packets(&forwarding),
+        1,
+        "the miss SYN counts once against the admitting rule (cold path)"
+    );
+
+    // Packets 2..=4: pure ACKs (0x10) on the SAME 5-tuple => session HIT. Each
+    // must count exactly once (via the mandatory junos-host teardown re-eval).
+    let ack = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        0x10_u8,
+    );
+    let ack_meta = txn_meta_v4(24, 0x10_u8, (ack.len() - 14) as u16);
+    for i in 0..3 {
+        let (_b, dbg) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &ack,
+            ack_meta,
+        );
+        assert_eq!(
+            dbg.session_hit, 1,
+            "established ACK #{i} must hit the installed host-local session"
+        );
+    }
+
+    assert_eq!(
+        hit_packets(&forwarding),
+        4,
+        "#3706: 1 miss + 3 established hits must count EXACTLY 4 packets against \
+         the admitting junos-host rule; double-counting the session-hit path \
+         reads 7 (the pre-fix regression)"
+    );
+}
+
 /// #3326 LITERAL fail-on-revert (session-MISS): a host-bound packet denied by
 /// the zone host-inbound admission gate must increment the
 /// `host_inbound_denied_packets` batch counter (which `syncBPFCountersLocked`

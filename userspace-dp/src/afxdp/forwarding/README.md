@@ -428,10 +428,43 @@ stay consistent.
 Host-bound (LocalDelivery) traffic is also subject to the Junos
 `from-zone <z> to-zone junos-host` security policy. Junos order is
 **host-inbound admission FIRST, then security policy** — so the
-`junos_host_policy_drops` gate runs immediately AFTER `host_inbound_admits`
+`junos_host_local_policy` gate runs immediately AFTER `host_inbound_admits`
 at BOTH local-delivery sites in `poll_descriptor` (session miss and session
 hit). A packet host-inbound already rejected never reaches policy, so a
 `to-zone junos-host then permit` cannot re-admit it.
+
+**Permit metadata propagation (#3706).** `junos_host_local_policy` returns a
+`JunosHostLocalPolicy` verdict — `Dropped` (deny/reject), `Permit(result)`, or
+`NoMatch`. On a matching PERMIT the session-MISS install stamps the admitting
+policy's `then log session-init`/`session-close` selection, its `policy_id`, and
+its per-rule hit-counter handle onto the installed host-local session (and the
+published conntrack row) — exactly like a transit permit, so a
+`to-zone junos-host then permit log session-init session-close` session emits the
+RT_FLOW SESSION_CREATE/CLOSE records and is attributable to the admitting policy.
+Before #3706 the gate collapsed to a bare `bool` and discarded the permit result,
+so host-bound permit sessions installed with both log flags off, `policy_id` 0,
+and no counter handle (unlogged + unattributable). The session-HIT path only
+needs the `Dropped` verdict (the session is already installed with the miss-time
+permit metadata); the flowless (`l4_present = false`) arm never installs a
+session, so a flowless permit simply delivers with no metadata to carry.
+`NoMatch` keeps the default no-policy host-local metadata (log off, `policy_id`
+0, no counter) — the historical host-local behavior for a genuinely
+unattributed local session.
+
+**Exactly-once hit counting (#3706).** The LocalDelivery session-HIT path
+re-evaluates the junos-host policy on every packet (the mandatory teardown
+re-check), and that re-eval's `try_match_rule` counts the packet against the
+admitting rule's hit counter — as it did pre-#3706, when a host-local session
+carried no bound counter and the generic session-hit
+`record_policy_hit_counter` was a no-op (`resolve_session_hit_counter(None, 0)`
+→ `None`). Because #3706 now stamps a bound counter onto a junos-host permit
+session, the generic session-hit counter site would count a SECOND time, so
+`poll_descriptor` skips it for `LocalDelivery` (the `!= LocalDelivery` guard) and
+lets the per-hit junos-host re-eval be the single counter. Transit has no per-hit
+re-eval and counts solely at the generic site, so both paths count exactly once
+(the bound counter is still stamped for close-time `policy_id` re-resolution and
+HA sync). The first (miss) packet counts once via the session-MISS junos-host
+gate's `try_match_rule`.
 
 `policy::evaluate_junos_host_policy` resolves the reserved `junos-host` zone
 name to `JUNOS_HOST_ZONE_ID` (`u16::MAX-1`, the bottom of the reserved range,

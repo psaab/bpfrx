@@ -72,27 +72,31 @@ fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8,
 /// host-bound (LocalDelivery) path. MUST be called AFTER `host_inbound_admits`
 /// (Junos order: host-inbound-traffic admission first, then security policy),
 /// so a `then permit` can never re-admit what host-inbound already rejected.
+/// The gate itself is [`junos_host_local_policy`], which returns a
+/// [`JunosHostLocalPolicy`] verdict (drop / permit-with-metadata / no-match);
+/// [`junos_host_policy_eval`] is the reply-FREE evaluation core it and the
+/// flowless arm share.
 ///
-/// Returns `true` iff the packet must be DROPPED — a `to-zone junos-host` rule
-/// MATCHED with `deny`/`reject`. On a deny/reject it emits the policy-deny
-/// RT_FLOW (mirroring the transit deny path) and synthesizes a `reject` / zone
-/// `tcp-rst` reply. Returns `false` (continue local delivery) when no
-/// junos-host policy is configured, none matches, or a matching rule permits —
-/// preserving pre-#3019 host-bound behavior so management traffic is never
-/// newly denied (the lifeline guarantee). Cold path only (LocalDelivery).
 /// #3019/#3292: evaluate the configured `to-zone junos-host` security policy for
 /// a host-bound (LocalDelivery) packet and, on a matching deny/reject, emit the
 /// policy-deny RT_FLOW. This is the reply-FREE core shared by both the
-/// flow-backed [`junos_host_policy_drops`] (which adds the synthesized
-/// reject/tcp-rst reply) and the flowless LocalDelivery arm (#3292, which can
-/// emit no reply — a fragment has no L4 header to build a RST from).
+/// flow-backed [`junos_host_local_policy`] gate (which adds the synthesized
+/// reject/tcp-rst reply on a deny/reject and surfaces a permit's metadata) and
+/// the flowless LocalDelivery arm (#3292, which can emit no reply — a fragment
+/// has no L4 header to build a RST from).
 ///
 /// `l4_present = false` routes through the l3-aware junos-host evaluation so a
 /// port-bearing application term fails closed for a flowless packet; the
-/// flow-backed wrapper passes `true` (byte-identical to pre-#3292). Returns
-/// `Some(action)` when a junos-host rule matched deny/reject (caller drops);
-/// `None` when no junos-host policy is configured, none matches, or a match
-/// permits (caller continues local delivery).
+/// flow-backed wrapper passes `true` (byte-identical to pre-#3292).
+///
+/// #3706: returns the FULL [`PolicyEvaluationResult`] of a matching junos-host
+/// rule — permit as well as deny/reject — so the local-delivery session-install
+/// path can stamp a matching PERMIT's `then log` selection, admitting
+/// `policy_id`, and hit-counter handle onto the installed host-bound session
+/// (parity with the transit permit path). `None` means no junos-host policy is
+/// configured or none matched; the caller then keeps the default no-policy
+/// local-session metadata. Callers that only gate (drop on deny/reject) inspect
+/// `result.action` themselves.
 #[allow(clippy::too_many_arguments)]
 fn junos_host_policy_eval(
     forwarding: &ForwardingState,
@@ -101,8 +105,8 @@ fn junos_host_policy_eval(
     packet_len: u64,
     l4_present: bool,
     packet_icmp: Option<(u8, u8)>,
-) -> Option<(PolicyAction, u32)> {
-    let result = crate::policy::evaluate_junos_host_policy_l3_aware(
+) -> Option<crate::policy::PolicyEvaluationResult> {
+    crate::policy::evaluate_junos_host_policy_l3_aware(
         &forwarding.policy,
         from_zone_id,
         flow.src_ip,
@@ -113,11 +117,30 @@ fn junos_host_policy_eval(
         packet_icmp,
         packet_len,
         l4_present,
-    )?;
-    match result.action {
-        PolicyAction::Permit => None,
-        action @ (PolicyAction::Deny | PolicyAction::Reject) => Some((action, result.policy_id)),
-    }
+    )
+}
+
+/// #3706: verdict of the flow-backed `to-zone junos-host` security-policy gate
+/// on the local-delivery (host-inbound) path, returned by
+/// [`junos_host_local_policy`]. The pre-#3706 gate collapsed to a bare `bool`
+/// (dropped?) and discarded a matching permit's metadata, so a
+/// `to-zone junos-host then permit log` session installed with no log flags and
+/// `policy_id` 0 — unlogged and unattributable.
+enum JunosHostLocalPolicy {
+    /// A matching junos-host `deny`/`reject` dropped the host-bound packet (the
+    /// reject/tcp-rst reply was enqueued and the policy-deny RT_FLOW emitted).
+    /// The caller recycles the frame and skips session install.
+    Dropped,
+    /// A matching junos-host policy PERMITTED the host-bound flow. Carries the
+    /// full evaluation result so the session-install path stamps the policy's
+    /// `then log session-init/session-close` selection, admitting `policy_id`,
+    /// and per-rule hit-counter handle onto the installed local session +
+    /// published conntrack row (#3706), matching the transit permit path.
+    Permit(crate::policy::PolicyEvaluationResult),
+    /// No junos-host policy matched (none configured, or none matched). The
+    /// caller continues local delivery with the default no-policy metadata
+    /// (byte-identical to pre-#3706 host-local behavior).
+    NoMatch,
 }
 
 /// #3019/#3292/#3615: emit the junos-host (`to-zone junos-host`) policy-deny
@@ -191,7 +214,7 @@ fn emit_host_inbound_deny(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn junos_host_policy_drops(
+fn junos_host_local_policy(
     forwarding: &ForwardingState,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     tx_pipeline: &mut crate::afxdp::worker::WorkerTxPipeline,
@@ -203,7 +226,7 @@ fn junos_host_policy_drops(
     from_zone_id: u16,
     packet_len: u64,
     now_ns: u64,
-) -> bool {
+) -> JunosHostLocalPolicy {
     let policy_icmp = policy_packet_icmp(packet_frame, meta);
     match junos_host_policy_eval(
         forwarding,
@@ -214,7 +237,14 @@ fn junos_host_policy_drops(
         true,
         policy_icmp,
     ) {
-        Some((action, policy_id)) => {
+        // #3706: a matching PERMIT carries its `then log` selection, admitting
+        // policy_id, and hit-counter handle back to the caller so the installed
+        // host-bound session is logged + attributed like a transit permit.
+        Some(result) if matches!(result.action, PolicyAction::Permit) => {
+            JunosHostLocalPolicy::Permit(result)
+        }
+        Some(result) => {
+            let action = result.action;
             // #3615: enqueue the reject/tcp-rst reply FIRST, then emit the
             // junos-host deny with the ACTUAL reply outcome so a suppressed
             // reject logs the truthful DENY.
@@ -235,14 +265,14 @@ fn junos_host_policy_drops(
                 flow,
                 meta,
                 from_zone_id,
-                policy_id,
+                result.policy_id,
                 action,
                 reject_reply_enqueued,
                 now_ns,
             );
-            true
+            JunosHostLocalPolicy::Dropped
         }
-        None => false,
+        None => JunosHostLocalPolicy::NoMatch,
     }
 }
 
@@ -340,22 +370,28 @@ fn flowless_local_delivery_verdict(
     // l4_present = false. A matching deny/reject is a SILENT flowless drop — a
     // fragment has no L4 header to synthesize a RST/ICMP reject from, so #3615
     // logs the truthful DENY (reject_reply_enqueued = false) for observability.
-    if let Some((action, policy_id)) =
+    // #3706: the eval now returns a matching PERMIT too; a flowless fragment is
+    // NEVER installed as a session (this synthetic L3 tuple is evaluation- and
+    // logging-only), so a permit simply falls through to Deliver with no
+    // metadata to carry — only a deny/reject drives the flowless filter drop.
+    if let Some(result) =
         junos_host_policy_eval(forwarding, flow, from_zone_id, packet_len, false, packet_icmp)
     {
-        emit_junos_host_deny(
-            forwarding,
-            event_stream,
-            flow,
-            meta,
-            from_zone_id,
-            policy_id,
-            action,
-            // Flowless: no reply is ever synthesized.
-            false,
-            now_ns,
-        );
-        return FlowlessLocalVerdict::Filtered;
+        if !matches!(result.action, PolicyAction::Permit) {
+            emit_junos_host_deny(
+                forwarding,
+                event_stream,
+                flow,
+                meta,
+                from_zone_id,
+                result.policy_id,
+                result.action,
+                // Flowless: no reply is ever synthesized.
+                false,
+                now_ns,
+            );
+            return FlowlessLocalVerdict::Filtered;
+        }
     }
     FlowlessLocalVerdict::Deliver
 }
@@ -765,11 +801,35 @@ pub(super) fn poll_binding_process_descriptor(
                         // handle over the positional idx so a live policy
                         // reorder cannot re-attribute this established flow's
                         // packets to a different rule.
-                        if let Some(counter) = worker_ctx.forwarding.policy.resolve_session_hit_counter(
-                            resolved.metadata.policy_counter.as_ref(),
-                            resolved.metadata.policy_counter_idx,
-                        ) {
-                            crate::policy::record_policy_hit_counter(counter, desc.len as u64);
+                        //
+                        // #3706: EXCEPT on the LocalDelivery (host-bound) path.
+                        // A host-local session re-evaluates the `to-zone
+                        // junos-host` policy on EVERY hit (the mandatory teardown
+                        // re-check below), and that re-eval's `try_match_rule`
+                        // already counts this packet against the admitting rule's
+                        // hit counter — exactly as it did pre-#3706, when a
+                        // host-local session carried no bound counter and this
+                        // line was a no-op (`resolve_session_hit_counter(None, 0)`
+                        // -> None). Now that a junos-host permit stamps a bound
+                        // counter (#3706), counting HERE too would double-count
+                        // every established host-local permit packet. Transit has
+                        // no per-hit policy re-eval, so it counts solely here.
+                        // Gate on disposition so the count fires exactly once on
+                        // both paths (parity with transit) while the #3706 permit
+                        // attribution — policy_id / log flags / the bound counter
+                        // handle used for close-time re-resolution + HA sync —
+                        // stays stamped on the session.
+                        if resolved.decision.resolution.disposition
+                            != ForwardingDisposition::LocalDelivery
+                        {
+                            if let Some(counter) =
+                                worker_ctx.forwarding.policy.resolve_session_hit_counter(
+                                    resolved.metadata.policy_counter.as_ref(),
+                                    resolved.metadata.policy_counter_idx,
+                                )
+                            {
+                                crate::policy::record_policy_hit_counter(counter, desc.len as u64);
+                            }
                         }
                         flow_cache_install_failed = resolved.install_failed;
                         if resolved.created {
@@ -1037,21 +1097,27 @@ pub(super) fn poll_binding_process_descriptor(
                         // purge. Runs AFTER host-inbound admission (Junos order).
                         // A matching deny/reject drops + emits the policy-deny
                         // RT_FLOW; permit / no-match continue. No-op unless a
-                        // junos-host policy is configured.
+                        // junos-host policy is configured. #3706: the session is
+                        // already installed (with the miss-time permit metadata),
+                        // so only the DROP verdict matters here — a permit /
+                        // no-match leaves the established session untouched.
                         if resolved.decision.resolution.disposition
                             == ForwardingDisposition::LocalDelivery
-                            && junos_host_policy_drops(
-                                worker_ctx.forwarding,
-                                worker_ctx.event_stream,
-                                &mut binding.tx_pipeline,
-                                binding.ifindex,
-                                packet_frame,
-                                telemetry.counters,
-                                flow,
-                                meta,
-                                resolved.metadata.ingress_zone,
-                                desc.len as u64,
-                                now_ns,
+                            && matches!(
+                                junos_host_local_policy(
+                                    worker_ctx.forwarding,
+                                    worker_ctx.event_stream,
+                                    &mut binding.tx_pipeline,
+                                    binding.ifindex,
+                                    packet_frame,
+                                    telemetry.counters,
+                                    flow,
+                                    meta,
+                                    resolved.metadata.ingress_zone,
+                                    desc.len as u64,
+                                    now_ns,
+                                ),
+                                JunosHostLocalPolicy::Dropped
                             )
                         {
                             delete_terminal_filtered_session(
@@ -1914,15 +1980,21 @@ pub(super) fn poll_binding_process_descriptor(
                                 }
                             }
                         }
-                        // #3019: `to-zone junos-host` security policy on the
-                        // session-MISS local-delivery path, AFTER host-inbound
-                        // admission (Junos order). A matching junos-host deny/
-                        // reject drops the host-bound packet (and emits the
-                        // policy-deny RT_FLOW + reject/tcp-rst reply); a permit
-                        // or no-match continues to local delivery unchanged.
-                        // No-op unless a junos-host policy is configured.
-                        if resolution.disposition == ForwardingDisposition::LocalDelivery
-                            && junos_host_policy_drops(
+                        // #3019/#3706: `to-zone junos-host` security policy on
+                        // the session-MISS local-delivery path, AFTER
+                        // host-inbound admission (Junos order). A matching
+                        // junos-host deny/reject drops the host-bound packet
+                        // (and emits the policy-deny RT_FLOW + reject/tcp-rst
+                        // reply); a matching PERMIT is carried forward so its
+                        // `then log` selection + admitting policy id + counter
+                        // handle can be stamped onto the installed session
+                        // (#3706); a no-match continues to local delivery with
+                        // the default no-policy metadata. No-op unless a
+                        // junos-host policy is configured.
+                        let junos_host_outcome = if resolution.disposition
+                            == ForwardingDisposition::LocalDelivery
+                        {
+                            junos_host_local_policy(
                                 worker_ctx.forwarding,
                                 worker_ctx.event_stream,
                                 &mut binding.tx_pipeline,
@@ -1935,7 +2007,10 @@ pub(super) fn poll_binding_process_descriptor(
                                 desc.len as u64,
                                 now_ns,
                             )
-                        {
+                        } else {
+                            JunosHostLocalPolicy::NoMatch
+                        };
+                        if matches!(junos_host_outcome, JunosHostLocalPolicy::Dropped) {
                             telemetry.dbg.local += 1;
                             telemetry.dbg.policy_deny += 1;
                             telemetry.counters.touched = true;
@@ -1952,6 +2027,44 @@ pub(super) fn poll_binding_process_descriptor(
                                 meta.tcp_flags,
                             )
                         {
+                            // #3706: a matching `to-zone junos-host then permit
+                            // [log ...]` policy admitted this host-bound flow, so
+                            // stamp its log selection, admitting policy id, and
+                            // per-rule hit-counter handle onto the installed
+                            // session — parity with the transit permit path. The
+                            // #2508/#3056/#3073 comments below ("host-local
+                            // sessions are not policy-forwarded, so they carry no
+                            // log / policy id / counter") predate junos-host
+                            // permit-policy matching and are true ONLY for a
+                            // no-match host-local session; an explicit permit DOES
+                            // have an admitting policy + logging selection.
+                            let (
+                                host_log_session_init,
+                                host_log_session_close,
+                                host_policy_id,
+                                host_policy_counter_idx,
+                            ) = match &junos_host_outcome {
+                                JunosHostLocalPolicy::Permit(result) => (
+                                    result.log_session_init,
+                                    result.log_session_close,
+                                    result.policy_id,
+                                    result.policy_counter_idx,
+                                ),
+                                // No junos-host policy matched: default no-policy
+                                // host-local metadata (byte-identical to
+                                // pre-#3706). Dropped never reaches here.
+                                _ => (false, false, 0, 0),
+                            };
+                            // #3706/#3322: bind the admitting rule's shared hit
+                            // counter here, where `host_policy_counter_idx` still
+                            // indexes the rule that admitted this flow, so a later
+                            // live policy reorder cannot re-point the count.
+                            // `hit_counter_by_idx(0)` is None (the no-match case).
+                            let host_policy_counter = worker_ctx
+                                .forwarding
+                                .policy
+                                .hit_counter_by_idx(host_policy_counter_idx)
+                                .cloned();
                             let local_metadata = SessionMetadata {
                                 ingress_zone: from_zone_id,
                                 egress_zone: to_zone_id,
@@ -1963,20 +2076,25 @@ pub(super) fn poll_binding_process_descriptor(
                                 // BPF session map so subsequent established packets bypass
                                 // userspace and return directly to the kernel.
                                 nat64_reverse: None,
-                                // #2508: firewall-local (host-destined) sessions are
-                                // not policy-forwarded, so they carry no per-policy
-                                // `then log` selection.
-                                log_session_init: false,
-                                log_session_close: false,
-                                // #3056: host-local sessions are not policy-forwarded,
-                                // so they carry no admitting policy ID.
-                                policy_id: 0,
+                                // #2508/#3706: a matching `to-zone junos-host then
+                                // permit log` policy's per-policy RT_FLOW SYSLOG
+                                // selection (a no-match host-local session carries
+                                // none, so both stay false).
+                                log_session_init: host_log_session_init,
+                                log_session_close: host_log_session_close,
+                                // #3056/#3706: the admitting junos-host policy's ID
+                                // so the live-session BPF-compat publish and the
+                                // SESSION_CREATE/CLOSE RT_FLOW records reference the
+                                // policy that admitted the host-bound flow (0 only
+                                // for a no-match host-local session).
+                                policy_id: host_policy_id,
                                 // #3227: host-local sessions are not policy-app-matched.
                                 inactivity_timeout_ns: None,
-                                // #3073: host-local sessions are not policy-forwarded,
-                                // so they carry no per-rule hit counter.
-                                policy_counter_idx: 0,
-                                policy_counter: None,
+                                // #3073/#3706: the admitting junos-host rule's
+                                // hit-counter handle (0 / None for a no-match
+                                // host-local session).
+                                policy_counter_idx: host_policy_counter_idx,
+                                policy_counter: host_policy_counter,
                             };
                             if install_helper_local_session_on_miss(
                                 sessions,

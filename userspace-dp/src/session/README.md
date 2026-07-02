@@ -611,8 +611,13 @@ The ID is consumed at three surfaces:
    rather than misparsing.
 
 `0` stays the legitimate value for a session with no admitting policy
-(host-local, neighbor-seed, fabric-return, tunnel sync-import, flow-cache
-replay seed).
+(neighbor-seed, fabric-return, tunnel sync-import, flow-cache replay seed, and a
+host-local session that matched NO `to-zone junos-host` policy). #3706 narrowed
+the host-local case: a host-bound session admitted by an explicit
+`to-zone junos-host then permit` policy now stamps that policy's real `policy_id`
+(and its `then log` selection + hit-counter handle) at the session-MISS
+local-delivery install, exactly like a transit permit — so only a genuinely
+unattributed host-local session still carries `0`.
 
 #### Re-resolution at the local publish surfaces (#3395)
 

@@ -27734,3 +27734,83 @@ top.
   userspace-dp/src/main_tests.rs (renamed + retargeted defer-clear test),
   docs/userspace-dataplane-architecture.md + userspace-dp/src/server/
   README.md (#3789 handler-observes-outcome doc)
+
+## 2026-07-01 — #3706 to-zone junos-host `then permit log` now stamps the local-delivery session (codex-163)
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3706 — a `from-zone <z> to-zone junos-host then permit log
+  session-init session-close` policy admitted host-bound traffic but its
+  logging + policy attribution were DISCARDED on the local-delivery
+  (host-inbound / junos-host) forwarding path. Root cause: the flow-backed
+  junos-host gate wrapper (`junos_host_policy_eval` in
+  `poll_descriptor/mod.rs`) returned `None` on `PolicyAction::Permit`, so the
+  caller treated a matched permit identically to "no host policy" and the
+  session-MISS local-delivery install hardcoded `log_session_init: false`,
+  `log_session_close: false`, `policy_id: 0`, `policy_counter_idx: 0`,
+  `policy_counter: None`. Host-bound management permit sessions were therefore
+  unlogged (no RT_FLOW SESSION_CREATE/CLOSE) and unattributable (policy id 0),
+  a vSRX session-to-policy parity gap. Distinct from #3611 (junos-host
+  enforcement / global context) and #3639 (to-zone junos-host GLOBAL matching)
+  — those are about MATCHING; this is about propagating the PERMIT result
+  metadata into the installed local session. Fix: `junos_host_policy_eval` now
+  returns the FULL `PolicyEvaluationResult` (permit as well as deny/reject);
+  the flow-backed gate `junos_host_policy_drops` was renamed
+  `junos_host_local_policy` and now returns a `JunosHostLocalPolicy` verdict
+  (`Dropped` / `Permit(result)` / `NoMatch`). On a matching PERMIT the
+  session-MISS install stamps the admitting policy's `then log` selection,
+  `policy_id`, and per-rule hit-counter handle (bound once via
+  `hit_counter_by_idx`, #3322-stable) onto the local session + published
+  conntrack row — parity with the transit permit path. The session-HIT path
+  keeps only the `Dropped` check (the session is already installed with the
+  miss-time permit metadata); the flowless (`l4_present = false`) arm never
+  installs a session, so a flowless permit delivers with no metadata to carry
+  (only deny/reject drives the flowless filter drop). `NoMatch` keeps the
+  default no-policy host-local metadata (byte-identical to pre-#3706). Added
+  two fail-on-revert AF_XDP session-MISS tests: a `then permit log
+  session-init session-close` session installs with both log flags + a
+  non-zero admitting `policy_id` (4242) + a non-zero counter handle (goes RED
+  on revert), and a permit WITHOUT `then log` installs with both log flags
+  OFF (no over-log) while still carrying the admitting policy id. Full
+  `cargo test --release` green.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs
+  (`junos_host_policy_eval` returns full result; new `JunosHostLocalPolicy`
+  enum; `junos_host_policy_drops` -> `junos_host_local_policy`; flowless arm
+  permit handling; session-MISS install stamps permit metadata; session-HIT
+  `Dropped` match; doc comments), userspace-dp/src/afxdp/tests.rs (two #3706
+  fail-on-revert tests + `junos_host_local_delivery_permit_snapshot` /
+  `run_junos_host_permit_local_delivery` helpers),
+  userspace-dp/src/afxdp/forwarding/README.md (#3706 permit-metadata
+  propagation section), userspace-dp/src/session/README.md (#3706 host-local
+  policy-id exception)
+
+## 2026-07-02 — #3706 review fold: no double-count on the established host-local hit path
+
+- **Timestamp**: 2026-07-02
+- **Action**: #3706 hostile-review fold (one blocking MINOR, observability-only,
+  PR-introduced). The MISS-install stamp of a bound `policy_counter` onto a
+  junos-host permit host-local session made the generic session-HIT counter
+  (`poll_descriptor/mod.rs` ~:808, `resolve_session_hit_counter` ->
+  `record_policy_hit_counter`) count each established host-local permit packet,
+  while the mandatory `to-zone junos-host` session-HIT teardown re-eval
+  (`junos_host_local_policy` -> `junos_host_policy_eval` ->
+  `evaluate_junos_host_policy_l3_aware` -> `try_match_rule`, policy.rs:3736
+  `rule.hit_counter.add`) ALSO counted the same packet — DOUBLE-counting every
+  established host-local permit packet (2N for N hits). LocalDelivery sessions
+  are not flow-cached, so the flow-cache replay path never deduped it. Pre-#3706
+  the generic site was a no-op for host-local (`resolve_session_hit_counter(None,
+  0)` -> None), so the established count came solely from the re-eval (once).
+  Transit counts once (no per-hit re-eval). Fix: gate the generic session-HIT
+  `record_policy_hit_counter` on `resolved.decision.resolution.disposition !=
+  ForwardingDisposition::LocalDelivery` — the LocalDelivery path already counts
+  exactly once via its mandatory junos-host re-eval, byte-identical to pre-#3706
+  host-local counting; transit is untouched. The #3706 permit attribution
+  (policy_id / log flags / the bound counter handle for close-time
+  re-resolution + HA sync) stays stamped. Added a fail-on-revert test
+  (`poll_descriptor_junos_host_permit_established_hit_counts_once`): drive 1 SYN
+  miss + 3 established ACK hits, assert the admitting rule's packet counter == 4
+  (removing the `!= LocalDelivery` guard reads 7 -> RED, verified). Full
+  `cargo test --release` green.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs (session-HIT
+  `record_policy_hit_counter` gated on non-LocalDelivery), userspace-dp/src/
+  afxdp/tests.rs (established-hit exactly-once fail-on-revert test), userspace-dp/
+  src/afxdp/forwarding/README.md (#3706 exactly-once hit-counting note)
