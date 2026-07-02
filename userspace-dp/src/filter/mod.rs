@@ -161,10 +161,21 @@ pub(crate) struct FilterTerm {
     // matches every port NOT in the source/dest port set:
     // `(port ∈ ranges) XOR except`. The except port list builds the SAME
     // PortMatcher and sets `*_port_constrained`; only the inversion differs.
-    // When the except list is non-empty but ALL entries fail to parse
-    // (PortMatcher::Any while constrained), the term means "match all ports
-    // except {}" = match ALL — handled in port_match. Only meaningful when the
-    // direction is `*_port_constrained`.
+    // #3205 FAIL-CLOSED: when the except list is non-empty but ALL entries fail
+    // to parse (`PortMatcher::Any` while constrained), the term matches NOTHING
+    // — NOT "match all ports except {}" = match ALL. `port_match`
+    // (engine/matching.rs) returns false for `constrained && PortMatcher::Any`
+    // in BOTH the positive and the except direction, so an unresolved
+    // `destination-port-except <name>` can never invert an empty set into
+    // match-ALL (that was the pre-#3205 fail-OPEN hole that accepted the very
+    // port it was meant to exclude). This intentionally DIFFERS from the ADDRESS
+    // empty-except path (`nets_match_v4`/`nets_match_v6`, which returns `except`
+    // → match-ALL): a port scope has no prefix-list indirection, so
+    // `constrained && Any` can ONLY mean every token was unparseable — never a
+    // legitimately empty scope — whereas an empty address prefix-list scope IS
+    // reachable and legitimate and keeps the Junos "match all except {}" =
+    // match-ALL semantic. Only meaningful when the direction is
+    // `*_port_constrained`.
     pub(crate) source_port_except: bool,
     pub(crate) dest_port_except: bool,
     pub(crate) dscp_bitmap: u64,
