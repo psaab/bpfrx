@@ -1,3 +1,39 @@
+## 2026-07-01 — #3748 (sub-part b): IPFIX sampler Options Template + record
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The IPFIX exporter never advertised its 1-in-N sampling
+    rate: `ipfixSetIDOptionsTemplate` (Set ID 3) was a bare constant and
+    `sendTemplates` emitted DATA templates (256/257) only, so a collector
+    could not learn N to scale the sampled record count. Added a sampler
+    Options Template (Set ID 3, template ID 258) + Options Data Record (Set
+    ID 258) advertising PSAMP systematic count-based sampling
+    (`selectorAlgorithm`=1 IE 304, `samplingPacketInterval`=1 IE 305,
+    `samplingPacketSpace`=N-1 IE 306), scoped by `observationDomainId` (IE
+    149) = the group's #3740 stable ODID. `sendTemplates` now emits the
+    options message on the SAME refresh cadence for sampled groups
+    (`SamplingRate > 1`, matching the `ShouldExport` gate); unsampled /
+    export-all groups (rate 0/1) advertise nothing (collector assumes
+    1-in-1), keeping the #2609 refresh sequence bit-identical there. The
+    Options Data Record rides a Set ID ≥ 256 so it advances the header
+    Sequence Number by one (RFC 7011 §3.1), consistent with `sendRecords`
+    and the #2609 convention. Documented the semantic nuance: xpf samples
+    1-in-N at SESSION-RECORD granularity (per SESSION_CLOSE), NOT 1-in-N
+    packets like Junos jflow — a collector scales the record COUNT by N but
+    must NOT multiply per-record `octetDeltaCount` (which is already the full
+    per-session volume). Sub-part (a) active-timeout interim records is
+    DEFERRED per the converged /research plan (multi-surface Rust+Go+wire+HA,
+    test-failover-gated).
+  - **File(s)**: pkg/flowexport/ipfix.go (new IE/set constants, options
+    template + data encoders, `ipfixOptionsSamplerRecordSize` build-time pin,
+    exporter `emitSampler`/`optionsTemplateSet`/`optionsDataSet`,
+    `sendSamplerOptions`), pkg/flowexport/ipfix_sampler_test.go (new: decode +
+    wire-loopback + degenerate-rate + RED-on-revert), pkg/flowexport/README.md,
+    docs/feature-coverage.md, _Log.md.
+  - **Validation**: `go test ./pkg/flowexport/...` green (existing + 4 new
+    tests); `go build ./...`, `gofmt -l`, `go vet ./pkg/flowexport/` clean.
+    RED-on-revert proven: disabling the `sendSamplerOptions` call times out
+    the wire-loopback message-2 read.
+
 ## 2026-07-01 — #3776: flow-cache invalidation on session reap (incomplete #2220 closure)
 
 - **Timestamp**: 2026-07-01
