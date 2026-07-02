@@ -530,6 +530,10 @@ type IPFIXExporter struct {
 	// #2465: see Exporter.estimatedDurations — count of close flows whose
 	// StartTime fell back to the packet-count heuristic (no real creation ts).
 	estimatedDurations atomic.Uint64
+	// #3744: see Exporter.routeMaskUnresolved — count of route-mask halves
+	// exported as an unresolved 0 (no FIB route / cold cache) rather than a
+	// real matched-route prefix length.
+	routeMaskUnresolved atomic.Uint64
 }
 
 // NewIPFIXExporter creates a new IPFIX exporter. cfg is held by pointer
@@ -597,8 +601,12 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		evt.SrcIP, evt.DstIP, evt.SrcPort, evt.DstPort,
 		evt.NATSrcIP, evt.NATDstIP, evt.NATSrcPort, evt.NATDstPort)
 	// #2866: resolve src/dst route prefix lengths from the FIB (0/0 with no
-	// resolver wired).
-	srcMask, dstMask := resolveMasks(e.MaskResolver, evt.SrcIP, evt.DstIP)
+	// resolver wired). #3744: scope to the flow's ingress VRF table (evt.InIf,
+	// evt.OutIf fallback) and count any unresolved half.
+	srcMask, dstMask, maskMisses := resolveMasks(e.MaskResolver, evt.SrcIP, evt.DstIP, evt.InIf, evt.OutIf)
+	if maskMisses > 0 {
+		e.routeMaskUnresolved.Add(maskMisses)
+	}
 	fr := FlowRecord{
 		SrcIP:      evt.SrcIP,
 		DstIP:      evt.DstIP,
@@ -641,6 +649,13 @@ func (e *IPFIXExporter) Stats() (flows, packets uint64) {
 // real session-creation timestamp.
 func (e *IPFIXExporter) EstimatedDurations() uint64 {
 	return e.estimatedDurations.Load()
+}
+
+// RouteMaskUnresolved returns the count of exported route-mask halves (#3744)
+// exported as an unresolved 0 rather than a real matched-route prefix length.
+// See Exporter.RouteMaskUnresolved.
+func (e *IPFIXExporter) RouteMaskUnresolved() uint64 {
+	return e.routeMaskUnresolved.Load()
 }
 
 // CollectorHealth returns a per-collector write-health snapshot (#2464).

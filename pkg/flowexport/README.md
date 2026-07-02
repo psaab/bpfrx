@@ -268,8 +268,63 @@ lookup does not stall `ExportSessionClose`) and
 `TestRouteMaskCacheAsyncPopulateAndHit` (miss → default → background
 populate → warm hit). Reverting to the synchronous lookup-in-`resolve`
 flips these RED (the first two by blocking / returning the wrong value).
-Note #3744 (route-mask being VRF/table/source-blind) is a separate design
-item and out of scope here.
+
+**#3744 — the route-mask lookup is scoped to the flow's VRF table and an
+unresolved lookup is counted.** Before #3744 the FIB lookup was
+VRF/table-blind: `fibMatchMask` issued `RouteGetWithOptions(ip,
+{FIBMatch:true})` with no interface, so it always resolved against the
+**main** table, and `resolveMasks` discarded the `ok` bit. In a multi-VRF
+/ routing-instance deployment every flow's mask was therefore looked up in
+the wrong table (a leaked or per-instance prefix resolved to the wrong
+length, often `/0`), and a genuine miss was exported as a bogus `/0`
+indistinguishable from a real default-route match.
+
+*Scoping (Option A).* The SESSION_CLOSE event already carries the
+ingress/egress ifindex (#2615/#2749 → `SessionCloseData.InIf`/`OutIf`),
+and xpf enslaves interfaces to real l3mdev VRF master devices
+(`pkg/routing/vrf.go`), so each interface's ifindex selects a distinct
+kernel table. `MaskResolver` now takes an `ifindex`; `fibMatchMask` sets
+`RouteGetOptions.IifIndex` when it is >0, which makes the kernel perform
+an *input-path* route lookup that follows l3mdev enslavement into the
+interface's VRF table. `resolveMasks(r, srcIP, dstIP, inIf, outIf)` scopes
+**both** the source and destination half by the **ingress** instance
+(`inIf`): Junos attributes the session to the ingress routing-instance and
+next-table / rib-group leaked routes to the destination appear in that
+ingress table. When the dataplane reported no ingress attribution
+(`inIf==0`) it falls back to `outIf`, then to the global table
+(`inIf==outIf==0`) — bit-identical to the pre-#3744 main-table lookup, so
+single-VRF / default deployments are a no-op. The async #3743 cache key
+widens from the 16-byte IP to `(ifindex, IP)` (`routeMaskKey`) so per-VRF
+masks for the same host address do not collide; the non-blocking-callback,
+bounded-inflight, dedup and size-cap invariants are unchanged.
+
+*Unresolved bit (Option B).* The wire field is a `u8` prefix length
+(0..128) with no room for an "unresolved" sentinel a collector would
+understand, so an unresolved lookup is surfaced **out-of-band**:
+`resolveMasks` returns the number of halves that did not resolve, and each
+exporter accumulates them into a `routeMaskUnresolved atomic.Uint64`
+(`RouteMaskUnresolved()` accessor, mirroring `EstimatedDurations`). Since
+#3797 the first flow to any cold `(ifindex, prefix)` key resolves `0`
+while the background lookup warms, so a nonzero counter is expected in
+steady state; a value climbing in lockstep with exported flows is the only
+operator-visible signal that an exported mask-`0` is *unresolved* versus a
+real default-route `/0`.
+
+*Documented residual.* Pure fwmark / `ip rule` PBR (`pkg/routing/rules.go`)
+selects a table by mark or source address, and the mark is **not** carried
+on the SESSION_CLOSE event, so an ifindex-scoped lookup cannot reproduce a
+mark-only PBR decision. The dominant multi-table case — VRF /
+routing-instance — IS covered; carrying the fwmark is a separate future
+item if demand appears.
+
+Pinned by `TestRouteMaskLookupScopedByIfindex` (same dst IP → different
+mask per ingress ifindex, `(ifindex,IP)` key does not collide across
+VRFs), `TestResolveMasksScopesByIngressInstance` (both halves scope by
+`inIf`, fall back to `outIf`, then to the global table),
+`TestResolveMasksMissCount` and `TestExporterRouteMaskUnresolvedCounter`
+(an unresolved half increments the counter and still exports `0`, no
+sentinel). Reverting the `(ifindex,IP)` key, the ingress scoping, or the
+miss count flips one of these RED.
 
 `Exporter` / `IPFIXExporter` carry a `MaskResolver` func (defaulted by
 `NewExporter`/`NewIPFIXExporter` to `NewRouteMaskResolver`; nil on a
@@ -308,7 +363,10 @@ The package is split by responsibility (#1988):
   exporters call. The netlink `RTM_GETROUTE` runs on a bounded background
   goroutine, never on the EventReader callback that calls `resolve()`
   (#3743): a cache miss returns the default and warms the cache for the next
-  flow.
+  flow. The lookup is scoped to the flow's VRF table by the ingress ifindex
+  and the cache is keyed by `(ifindex, IP)` (#3744); an unresolved lookup is
+  counted into each exporter's `routeMaskUnresolved`
+  (`RouteMaskUnresolved()`).
 - `transport.go` — shared collector connection management
   (`collectorConns`: dial / fan-out write / close) and the per-family
   batch accumulator (`flowBatch`) used by both exporters. `dialCollectors`

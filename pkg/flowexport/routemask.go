@@ -9,7 +9,13 @@ import (
 )
 
 // MaskResolver returns the prefix length (subnet mask, in bits) of the FIB
-// longest-prefix-match route for an IP, plus whether a mask was resolved.
+// longest-prefix-match route for an IP, plus whether a mask was resolved. The
+// lookup is scoped to the flow's routing table by ifindex (#3744): the ingress
+// interface selects the l3mdev VRF table the flow was actually forwarded in, so
+// a multi-VRF/routing-instance flow's mask is resolved in ITS table, not the
+// global one. ifindex==0 (no attribution) falls back to the global/main table,
+// the pre-#3744 behaviour and a bit-identical no-op for single-VRF/default
+// deployments where the main table IS the flow's table.
 //
 // #2866: NetFlow v9 srcMask (IE 9) / dstMask (IE 13) and the IPv6 variants
 // (IE 29 / IE 30) are the prefix lengths of the routing-table entries that
@@ -21,16 +27,18 @@ import (
 //
 // The bool return lets a caller distinguish "resolved to /0 (default route)"
 // from "no route / resolver unavailable"; the exporters write the resolved
-// length on either true OR a 0 from a successful default-route match, and
-// leave the field at 0 only when no resolver is wired (zero-value exporter).
-type MaskResolver func(ip net.IP) (mask uint8, ok bool)
+// length on either true OR a 0 from a successful default-route match, and count
+// an unresolved (!ok) lookup so an operator can see how often an exported mask
+// is an unresolved-0 (route absent / cold cache) versus a real default-route /0.
+type MaskResolver func(ip net.IP, ifindex int) (mask uint8, ok bool)
 
-// routeMaskCacheMax bounds the number of distinct IPs the cache retains. The
-// TTL bounds the syscall RATE; this bounds the FOOTPRINT. On an internet-facing
-// firewall the destination-IP cardinality is effectively unbounded, so without
-// a size cap the map would grow for the daemon's lifetime (~50-70 B/entry) — a
-// slow leak. 8192 entries (~0.5 MB worst case) is far above the working set of
-// distinct src/dst prefixes for any realistic flow mix yet a hard ceiling.
+// routeMaskCacheMax bounds the number of distinct (ifindex,IP) keys the cache
+// retains. The TTL bounds the syscall RATE; this bounds the FOOTPRINT. On an
+// internet-facing firewall the destination-IP cardinality is effectively
+// unbounded, so without a size cap the map would grow for the daemon's lifetime
+// (~50-70 B/entry) — a slow leak. 8192 entries (~0.5 MB worst case) is far above
+// the working set of distinct src/dst prefixes for any realistic flow mix yet a
+// hard ceiling.
 const routeMaskCacheMax = 8192
 
 // defaultRouteMaskInflight bounds the number of concurrent BACKGROUND FIB
@@ -45,28 +53,41 @@ const routeMaskCacheMax = 8192
 // further misses just return the default and are retried on a later flow.
 const defaultRouteMaskInflight = 32
 
+// routeMaskKey is the cache key: the flow's routing table (selected by the
+// ingress ifindex, #3744) plus the 16-byte IP being resolved. Keying on
+// ifindex as well as IP is what keeps a VRF-A result from being served to a
+// VRF-B flow to the same destination — the same host address can have a
+// different matching-route prefix length in each VRF's table. ifindex 0 (no
+// attribution → global table) is its own key, so single-VRF/default flows share
+// one keyspace exactly as before #3744.
+type routeMaskKey struct {
+	ifindex uint32
+	ip      string // 16-byte string form of the IP (net.IP.To16())
+}
+
 // routeMaskCache caches FIB-match results for a short TTL so the per-flow
 // session-close export path does not issue an RTM_GETROUTE netlink syscall for
 // every record. Flows to the same destination/source prefix are common
 // (per-host or per-subnet aggregates), so a small TTL cache collapses the
 // syscall rate dramatically while keeping the mask fresh across routing
-// changes. The cache is keyed by the 16-byte IP representation and bounded at
+// changes. The cache is keyed by (ifindex, 16-byte IP) and bounded at
 // routeMaskCacheMax entries.
 type routeMaskCache struct {
 	ttl     time.Duration
 	maxSize int
 	// lookup is the FIB query; a package var/field so tests can inject a
-	// deterministic resolver without touching the kernel routing table.
-	lookup func(ip net.IP) (uint8, bool)
+	// deterministic resolver without touching the kernel routing table. The
+	// ifindex scopes the lookup to that interface's VRF table (#3744).
+	lookup func(ip net.IP, ifindex int) (uint8, bool)
 
 	// maxInflight bounds concurrent background FIB lookups (#3743). 0 selects
 	// defaultRouteMaskInflight. See scheduleLookupLocked.
 	maxInflight int
 
 	mu       sync.Mutex
-	entries  map[string]routeMaskEntry
-	pending  map[string]struct{} // keys with a background lookup in flight (dedup)
-	inflight int                 // count of background lookups currently running
+	entries  map[routeMaskKey]routeMaskEntry
+	pending  map[routeMaskKey]struct{} // keys with a background lookup in flight (dedup)
+	inflight int                       // count of background lookups currently running
 
 	// afterPopulate, when non-nil, is invoked after each background lookup has
 	// stored its result. Test-only seam for deterministic assertions; nil in
@@ -93,8 +114,8 @@ func NewRouteMaskResolver(ttl time.Duration) MaskResolver {
 		maxSize:     routeMaskCacheMax,
 		maxInflight: defaultRouteMaskInflight,
 		lookup:      fibMatchMask,
-		entries:     make(map[string]routeMaskEntry),
-		pending:     make(map[string]struct{}),
+		entries:     make(map[routeMaskKey]routeMaskEntry),
+		pending:     make(map[routeMaskKey]struct{}),
 	}
 	return c.resolve
 }
@@ -105,10 +126,13 @@ func NewRouteMaskResolver(ttl time.Duration) MaskResolver {
 // would serialize the event reader (and every callback behind it) behind
 // netlink latency. On a fresh cache hit it returns the cached prefix length; on
 // a miss it schedules a bounded, deduplicated background lookup that warms the
-// cache for the NEXT flow to this prefix and returns the safe default (0,
-// false) now. An approximate mask on the first flow to a new prefix is the
-// accepted trade-off for never blocking the shared event-reader path.
-func (c *routeMaskCache) resolve(ip net.IP) (uint8, bool) {
+// cache for the NEXT flow to this (ifindex, prefix) key and returns the safe
+// default (0, false) now. An approximate mask on the first flow to a new prefix
+// is the accepted trade-off for never blocking the shared event-reader path.
+//
+// ifindex scopes the lookup to the flow's l3mdev VRF table (#3744); it is part
+// of the cache key so per-VRF masks do not collide.
+func (c *routeMaskCache) resolve(ip net.IP, ifindex int) (uint8, bool) {
 	if ip == nil {
 		return 0, false
 	}
@@ -116,7 +140,7 @@ func (c *routeMaskCache) resolve(ip net.IP) (uint8, bool) {
 	if ip16 == nil {
 		return 0, false
 	}
-	key := string(ip16)
+	key := routeMaskKey{ifindex: uint32(ifindex), ip: string(ip16)}
 	now := time.Now()
 
 	c.mu.Lock()
@@ -127,23 +151,23 @@ func (c *routeMaskCache) resolve(ip net.IP) (uint8, bool) {
 	}
 	// Cache miss (or expired): schedule the FIB lookup off this goroutine and
 	// return the default now — do NOT block the callback on netlink.
-	c.scheduleLookupLocked(key, ip16)
+	c.scheduleLookupLocked(key, ip16, ifindex)
 	c.mu.Unlock()
 	return 0, false
 }
 
-// scheduleLookupLocked starts a background FIB lookup for key (the 16-byte
-// string form of an IP) unless one is already in flight for it (dedup) or the
-// concurrent-lookup cap is reached (backpressure — the miss is retried on a
-// later flow rather than piling up goroutines behind a slow netlink socket).
-// ip16 is copied because the caller's slice may be reused after resolve()
-// returns. The caller holds c.mu. #3743.
-func (c *routeMaskCache) scheduleLookupLocked(key string, ip16 net.IP) {
+// scheduleLookupLocked starts a background FIB lookup for key unless one is
+// already in flight for it (dedup) or the concurrent-lookup cap is reached
+// (backpressure — the miss is retried on a later flow rather than piling up
+// goroutines behind a slow netlink socket). ip16 is copied because the caller's
+// slice may be reused after resolve() returns. ifindex scopes the FIB lookup to
+// the flow's VRF table (#3744). The caller holds c.mu. #3743.
+func (c *routeMaskCache) scheduleLookupLocked(key routeMaskKey, ip16 net.IP, ifindex int) {
 	if c.lookup == nil {
 		return
 	}
 	if c.pending == nil {
-		c.pending = make(map[string]struct{})
+		c.pending = make(map[routeMaskKey]struct{})
 	}
 	if _, inFlight := c.pending[key]; inFlight {
 		return
@@ -158,15 +182,15 @@ func (c *routeMaskCache) scheduleLookupLocked(key string, ip16 net.IP) {
 	c.pending[key] = struct{}{}
 	c.inflight++
 	ipCopy := append(net.IP(nil), ip16...)
-	go c.populate(key, ipCopy)
+	go c.populate(key, ipCopy, ifindex)
 }
 
 // populate runs a single background FIB lookup and stores the result so the
-// next flow to this prefix resolves from the warm cache. It is the goroutine
-// body scheduled by scheduleLookupLocked; the netlink round-trip happens here,
-// entirely off the EventReader callback path. #3743.
-func (c *routeMaskCache) populate(key string, ip net.IP) {
-	mask, ok := c.lookup(ip)
+// next flow to this (ifindex, prefix) key resolves from the warm cache. It is
+// the goroutine body scheduled by scheduleLookupLocked; the netlink round-trip
+// happens here, entirely off the EventReader callback path. #3743.
+func (c *routeMaskCache) populate(key routeMaskKey, ip net.IP, ifindex int) {
+	mask, ok := c.lookup(ip, ifindex)
 	now := time.Now()
 	c.mu.Lock()
 	c.storeLocked(key, mask, ok, now)
@@ -183,7 +207,7 @@ func (c *routeMaskCache) populate(key string, ip net.IP) {
 
 // storeLocked bounds the cache then inserts a resolved entry. The caller holds
 // c.mu.
-func (c *routeMaskCache) storeLocked(key string, mask uint8, ok bool, now time.Time) {
+func (c *routeMaskCache) storeLocked(key routeMaskKey, mask uint8, ok bool, now time.Time) {
 	c.evictLocked(key, now)
 	c.entries[key] = routeMaskEntry{mask: mask, ok: ok, expires: now.Add(c.ttl)}
 }
@@ -191,12 +215,12 @@ func (c *routeMaskCache) storeLocked(key string, mask uint8, ok bool, now time.T
 // evictLocked bounds the cache before an insert. It is a no-op until the map is
 // at the size cap; at the cap it first drops every expired entry (cheap, and it
 // usually recovers headroom on a busy cache because TTLs are short), and if the
-// map is STILL at the cap (a burst of distinct live IPs) it clears the whole
+// map is STILL at the cap (a burst of distinct live keys) it clears the whole
 // map. Clearing is the simplest hard bound — it sacrifices the warm set for one
 // cold round of syscalls rather than tracking per-entry LRU, which is not worth
 // the bookkeeping for a syscall-amortization cache. maxSize<=0 disables the
 // bound (used only by tests). The caller holds c.mu.
-func (c *routeMaskCache) evictLocked(key string, now time.Time) {
+func (c *routeMaskCache) evictLocked(key routeMaskKey, now time.Time) {
 	if c.maxSize <= 0 || len(c.entries) < c.maxSize {
 		return
 	}
@@ -215,18 +239,44 @@ func (c *routeMaskCache) evictLocked(key string, now time.Time) {
 	}
 }
 
-// resolveMasks returns the src/dst route prefix lengths for a flow using r.
-// A nil resolver (zero-value exporter) yields 0/0 — the pre-#2866 behaviour.
-// A resolver miss (no matching route) also yields 0 for that half. A
-// successful match to a default route legitimately yields 0; that is the real
-// matched-route prefix length, not "unpopulated".
-func resolveMasks(r MaskResolver, srcIP, dstIP net.IP) (srcMask, dstMask uint8) {
+// resolveMasks returns the src/dst route prefix lengths for a flow using r,
+// plus the count of halves that did NOT resolve (0, 1, or 2). Both halves are
+// scoped to the flow's INGRESS routing instance (#3744): the session belongs to
+// the ingress routing-instance and next-table / rib-group leaked routes to the
+// destination appear in that ingress table, so the ingress ifindex (inIf)
+// selects the table for BOTH the source and destination lookup. When the
+// dataplane could not attribute an ingress interface (inIf==0) the egress
+// interface (outIf) is used as a best-effort scope before falling back to the
+// global table.
+//
+// A nil resolver (zero-value exporter) yields 0/0 with 0 misses — the pre-#2866
+// behaviour, where the feature is simply off (not an "unresolved" condition).
+// A resolver miss (no matching route / cold cache) yields 0 for that half AND
+// increments the returned miss count: the u8 wire field (0..128) has no room for
+// an "unresolved" sentinel a collector would understand, so the miss is surfaced
+// out-of-band via a counter (#3744) rather than silently exported as a bogus /0.
+// A successful match to a default route legitimately yields 0 with no miss; that
+// is the real matched-route prefix length, not "unpopulated".
+func resolveMasks(r MaskResolver, srcIP, dstIP net.IP, inIf, outIf uint32) (srcMask, dstMask uint8, misses uint64) {
 	if r == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	srcMask, _ = r(srcIP)
-	dstMask, _ = r(dstIP)
-	return srcMask, dstMask
+	scope := int(inIf)
+	if scope == 0 {
+		// No ingress attribution: fall back to the egress interface's table
+		// rather than the global table (still better VRF locality than table 0).
+		scope = int(outIf)
+	}
+	var srcOK, dstOK bool
+	srcMask, srcOK = r(srcIP, scope)
+	dstMask, dstOK = r(dstIP, scope)
+	if !srcOK {
+		misses++
+	}
+	if !dstOK {
+		misses++
+	}
+	return srcMask, dstMask, misses
 }
 
 // fibMatchMask queries the kernel FIB for the longest-prefix-match route to ip
@@ -234,8 +284,19 @@ func resolveMasks(r MaskResolver, srcIP, dstIP net.IP) (srcMask, dstMask uint8) 
 // kernel report the actual matching FIB entry (with its Dst prefix) rather than
 // echoing the queried host as a /32 or /128, so a default-route match returns
 // the real /0.
-func fibMatchMask(ip net.IP) (uint8, bool) {
-	routes, err := netlink.RouteGetWithOptions(ip, &netlink.RouteGetOptions{FIBMatch: true})
+//
+// ifindex>0 sets RTA_IIF, which makes the kernel perform an INPUT route lookup
+// as if the packet arrived on that interface — that follows l3mdev enslavement
+// into the interface's VRF table (#3744), so the mask is resolved in the flow's
+// own routing instance rather than the main table. ifindex==0 omits RTA_IIF and
+// keeps the pre-#3744 main-table output-route lookup, bit-identical for
+// single-VRF/default deployments.
+func fibMatchMask(ip net.IP, ifindex int) (uint8, bool) {
+	opts := &netlink.RouteGetOptions{FIBMatch: true}
+	if ifindex > 0 {
+		opts.IifIndex = ifindex
+	}
+	routes, err := netlink.RouteGetWithOptions(ip, opts)
 	if err != nil || len(routes) == 0 {
 		return 0, false
 	}
