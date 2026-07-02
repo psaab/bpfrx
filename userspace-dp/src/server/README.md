@@ -162,9 +162,18 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
 ## Gotchas
 
 - `reconcile_status_bindings` has two arms. When `should_run_afxdp`
-  holds it runs `Coordinator::reconcile` then surfaces the result. When
-  it does NOT (forwarding disarmed / unsupported) it `stop()`s every
-  worker and then routes the per-binding status through
+  holds it runs `Coordinator::reconcile` and returns its
+  `Result<(), afxdp::ReconcileError>` (#3789): a pre-teardown abort
+  (integrity build fault or a missing / unopenable mandatory pin) surfaces
+  as `Err`, and the `apply_snapshot` handler's full-apply /
+  same-plan-`needs_reconcile` legs fail closed on it — restoring the prior
+  snapshot + status fields and reporting `ok=false` instead of persisting
+  the rejected snapshot (see `docs/userspace-dataplane-architecture.md`,
+  "Control-plane handler observes the reconcile outcome"). The
+  already-accepted-snapshot callers (`set_queue_state`, `set_binding_state`,
+  `rebind`, `set_forwarding_state`) discard the outcome. When
+  `should_run_afxdp` does NOT hold (forwarding disarmed / unsupported) it
+  `stop()`s every worker and then routes the per-binding status through
   `refresh_bindings` — which sends each now-workerless slot through
   `zero_unbound_slot`, clearing the FULL survivor set
   (`socket_ifindex`/`socket_queue_id`/`socket_bind_flags`,

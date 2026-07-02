@@ -279,6 +279,59 @@ fail) using the `bpf_map::pin` sentinel-path test seam
 (`TEST_MAP_PIN_OK` / `TEST_MAP_PIN_FAIL`) so the ordering is exercised
 without real bpffs pins.
 
+##### Control-plane handler observes the reconcile outcome (#3789)
+
+The invariants above keep the *data plane* fail-closed: on a pre-teardown
+abort the prior workers + forwarding + published generation stay live. But
+`Coordinator::reconcile` returned `()`, so the control-socket
+`apply_snapshot` handler could not tell an aborted reconcile from a
+successful one. On the two legs that drive the FULL reconcile —
+
+- the **non-same-plan full-apply** branch
+  (`server/handlers/snapshot.rs`), and
+- the **same-plan `needs_reconcile`** branch (deferred-binding
+  reconcile after a `defer_workers` clear) —
+
+the handler stored the incoming snapshot as the boot baseline, set
+`persist_state`, and acked `ok=true` regardless of whether the reconcile
+actually applied it. A snapshot that passed the policy preflight but
+aborted the reconcile (a non-policy integrity build fault, or a missing /
+unopenable mandatory pin) was therefore **persisted as a rejected boot
+baseline and acked positive** — the M1 class #3766 fixed only for the
+same-plan *refresh* leg (`refresh_runtime_snapshot`).
+
+#3789 closes this: `reconcile` (and the `reconcile_status_bindings`
+helper) now return `Result<(), ReconcileError>`
+(`coordinator/reconcile/mod.rs`), where `ReconcileError::Integrity`
+carries the `SnapshotIntegrityError` from the policy preflight or
+`build_reconcile_forwarding`, and `ReconcileError::MapSetup` carries the
+`last_reconcile_stage` descriptor for a mandatory-pin abort. Both
+handler legs now mirror #3766's pattern: install the new snapshot for the
+reconcile, and on `Err` **restore** the prior snapshot (+ the full-apply
+leg also restores `status.bindings`) and the bumped status-reporting
+fields (`last_snapshot_generation` / `last_fib_generation` /
+`last_snapshot_at` / `capabilities`), report `ok=false`, and do NOT set
+`persist_state`. Because the reconcile aborts *before* teardown, the
+restore is a status/bookkeeping rollback — the data plane never moved. The
+sibling control-socket handlers that reconcile the ALREADY-accepted stored
+snapshot (`set_queue_state`, `set_binding_state`, `rebind`,
+`set_forwarding_state`) explicitly discard the outcome: they introduce no
+new snapshot to reject.
+
+Regression coverage: `coordinator/tests.rs`
+(`reconcile_build_failure_returns_integrity_err_and_keeps_prior_generation_3789`,
+`reconcile_missing_pin_returns_map_setup_err_3789` — the reconcile now
+returns the typed error) and `server/tests.rs`
+(`apply_snapshot_full_reconcile_build_failure_rejects_and_keeps_prior_3789`,
+`apply_snapshot_same_plan_needs_reconcile_build_failure_rejects_and_keeps_prior_3789`
+— fail-on-revert: reverting the handler to ignore the reconcile result
+makes `ok=false` / prior-snapshot-kept assertions flip). The
+`main_tests.rs`
+`apply_snapshot_same_plan_clearing_defer_workers_reconcile_abort_fails_closed_3789`
+test (renamed from `…_reconciles_bindings`, which previously codified the
+swallow) now asserts the deferred-binding reconcile is triggered but the
+missing-pin abort fails closed.
+
 #### Per-Packet Processing Pipeline
 
 ```
