@@ -34,6 +34,7 @@ type xpfCollector struct {
 	hostInboundDeny             *prometheus.Desc
 	hostInboundKernelDenies     *prometheus.Desc
 	hostInboundAddresslessZones *prometheus.Desc
+	hostInboundAmbiguousAddrs   *prometheus.Desc
 	tcEgressPacketsTotal        *prometheus.Desc
 	syncookieTotal              *prometheus.Desc
 	flowCacheTotal              *prometheus.Desc
@@ -528,6 +529,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hostInboundDeny
 	ch <- c.hostInboundKernelDenies
 	ch <- c.hostInboundAddresslessZones
+	ch <- c.hostInboundAmbiguousAddrs
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
@@ -891,6 +893,13 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// window can be open in a config-only / degraded boot too, and that is exactly
 	// when it must stay visible.
 	c.collectHostInboundAddresslessZones(ch)
+
+	// #3718 (Option B): firewall-local addresses reachable from multiple zones
+	// with differing host-inbound service sets (order-dependent kernel verdict).
+	// Config-derived and independent of dataplane load — and, unlike the
+	// addressless window, NOT self-healing — so emit it BEFORE the dataplane gate
+	// so it stays visible in a config-only / degraded boot too.
+	c.collectHostInboundAmbiguousAddresses(ch)
 
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {
