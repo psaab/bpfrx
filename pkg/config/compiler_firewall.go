@@ -307,8 +307,15 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 			// #2622 negated port match: match all destination ports EXCEPT
 			// these. Multi-value/bracket-list, same accumulation as the
 			// positive destination-port case. #3205: resolve named ports and
-			// record unresolved tokens — an unresolved except port that slips
-			// through fails OPEN (matches all ports) in the dataplane.
+			// record unresolved tokens. An unresolved except port is
+			// hard-rejected at commit by validateFilterMatchValuesStrict, so an
+			// operator never reaches the dataplane with one. If a leniently
+			// loaded / peer-synced snapshot still carries an unresolved token,
+			// the Rust dataplane now fails CLOSED: port_match returns false for
+			// a constrained term with an empty PortMatcher::Any in BOTH
+			// directions, so the except term matches NOTHING (not all ports).
+			// Pre-#3205 this except case failed OPEN — an unresolved except port
+			// matched every port, including the one it was meant to exclude.
 			term.DestPortsExcept = append(term.DestPortsExcept, resolveFilterPortTokens(firewallMatchValues(child), term)...)
 		case "source-port-except":
 			term.SourcePortsExcept = append(term.SourcePortsExcept, resolveFilterPortTokens(firewallMatchValues(child), term)...)

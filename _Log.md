@@ -28009,3 +28009,30 @@ top.
   app_inactivity_timeout_ns clamp + doc), userspace-dp/src/policy.rs
   (parse_applications cross-reference comment), userspace-dp/src/session/tests.rs
   (RED-on-revert unit test), userspace-dp/src/session/README.md (#3714 bound doc)
+
+- **Timestamp**: 2026-07-02
+- **Action**: #3716 doc-accuracy — reword stale port-except fail-OPEN comments
+  to match the #3205 fail-CLOSED matcher; add a positive-wins boundary pin test.
+  ROOT: two invariant comments (Rust `filter/mod.rs`, Go `compiler_firewall.go`)
+  and one design doc (`docs/config-schema.md`) still described the pre-#3205
+  port-except fail-OPEN behavior ("an except term whose port list ALL fails to
+  parse means match all ports except {} = match ALL"). The code has fail-CLOSED
+  since #3205: `port_match` (userspace-dp/src/filter/engine/matching.rs:310-316)
+  returns `false` for `constrained && PortMatcher::Any` in BOTH the positive AND
+  the except direction — the term matches NOTHING, never all-ports. VERIFIED the
+  code is fail-closed before touching anything; this is COMMENT-vs-code drift, no
+  behavior change. Reworded `mod.rs` struct invariant (164-176) and the Go
+  `destination-port-except` case comment to state fail-CLOSED + contrast the
+  ADDRESS empty-except path (which legitimately keeps match-ALL). Fixed the
+  mirrored stale claim in `docs/config-schema.md`. Bug C (H06, positive+except
+  snapshot): made the `filter/compiler.rs` positive-wins selection contract
+  explicit (references the #3297 Go strict gate `validateFilterPortExceptStrict`
+  that rejects both-present at commit; positive-wins is a deliberate narrowing,
+  never a widening, so fail-safe without a SnapshotIntegrityError) and added a
+  RED-on-revert pin test `port_both_positive_and_except_positive_wins_3716`
+  (port 9999 → Accept under positive-wins, would DISCARD under except-wins).
+- **File(s)**: userspace-dp/src/filter/mod.rs (struct invariant reword),
+  pkg/config/compiler_firewall.go (destination-port-except comment reword),
+  docs/config-schema.md (mirrored stale claim + test list),
+  userspace-dp/src/filter/compiler.rs (positive-wins contract comment),
+  userspace-dp/src/filter/tests.rs (#3716 positive-wins pin test)

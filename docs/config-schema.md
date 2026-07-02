@@ -2632,20 +2632,33 @@ positive port slices, both AST shapes).
 (`filter/compiler.rs`) selects ONE port spec list per direction — the
 positive list if it carries real entries, otherwise the `-except` list — and
 sets a per-direction `source_port_except` / `dest_port_except` inversion flag
-on `FilterTerm` (positive wins if both are somehow present). The matcher
-`port_match` (`filter/engine/matching.rs`) now evaluates
-`matcher.matches(port) XOR except`, mirroring the address `nets_match_v4` /
-`nets_match_v6` `except` semantics: an except term whose port list ALL
-fails to parse means "match all ports except {}" = match ALL (vs the
-positive all-malformed fail-closed = match NOTHING). The wire specimen
-`userspace-dp/tests/fixtures/protocol_wire_v1.json` was regenerated for the
-two new fields. Regression coverage:
+on `FilterTerm`. A positive port match and its `*-port-except` counterpart are
+mutually exclusive in the same direction; the Go commit gate
+`validateFilterPortExceptStrict` (#3297) rejects a term carrying both, and the
+Rust compiler resolves a drifted/leniently-loaded snapshot that has both as
+positive-wins (the except list is ignored — a deliberate narrowing, never a
+widening). The matcher `port_match` (`filter/engine/matching.rs`) evaluates
+`matcher.matches(port) XOR except` for a RESOLVED port set, mirroring the
+address `nets_match_v4` / `nets_match_v6` `except` inversion. #3205 hardened
+the all-malformed case: an except term whose port list ALL fails to parse
+(constrained + empty `PortMatcher::Any`) FAILS CLOSED = match NOTHING in BOTH
+directions — NOT "match all ports except {}" = match ALL. A port scope has no
+prefix-list indirection, so `constrained + Any` can only mean every token was
+unparseable; `validateFilterMatchValuesStrict` rejects such a term at commit,
+making the fail-closed matcher defense-in-depth on the tolerant load / peer-
+sync path. (The empty-except = match-ALL semantic still applies to the ADDRESS
+path, where an empty prefix-list scope is reachable and legitimate.) The wire
+specimen `userspace-dp/tests/fixtures/protocol_wire_v1.json` was regenerated
+for the two new fields. Regression coverage:
 `pkg/config/firewall_port_except_2622_test.go` (hierarchical + flat-set
 bracket list + inet6, fail-on-revert) and the Rust matcher
 `destination_port_except_negation` / `source_port_except_negation`
 (a port IN the except list does NOT match; a port NOT in it DOES —
-fail-on-revert). Scope: ports only; `packet-length` from the same
-review-039 finding is NOT implemented here.
+fail-on-revert), plus `destination_port_except_unresolved_fails_closed_3205` /
+`destination_port_except_resolved_name_matches_3205` (#3205 fail-closed) and
+`port_both_positive_and_except_positive_wins_3716` (#3716 positive-wins
+boundary pin). Scope: ports only; `packet-length` from the same review-039
+finding is NOT implemented here.
 
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 

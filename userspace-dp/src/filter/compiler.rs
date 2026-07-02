@@ -650,12 +650,22 @@ fn parse_term(
     }
     // #2622: a direction's port scope is either the positive `source-port` /
     // `destination-port` list OR the negated `source-port-except` /
-    // `destination-port-except` list (Junos treats them as mutually exclusive).
-    // Build ONE PortMatcher per direction from whichever list carries entries,
-    // and set `*_port_except` when the except list is the source. If both are
-    // somehow present, the positive list builds the matcher and the except list
-    // is ignored (positive wins) — the except flag stays false so the positive
-    // set is honored verbatim.
+    // `destination-port-except` list (Junos treats them as mutually exclusive,
+    // and the Go commit gate `validateFilterPortExceptStrict` — #3297 — rejects
+    // a term that carries both). Build ONE PortMatcher per direction from
+    // whichever list carries entries, and set `*_port_except` when the except
+    // list is the source.
+    //
+    // #3716 positive-wins boundary contract: because #3297 rejects both-present
+    // at commit, this only fires for a hand-built / version-drifted / leniently
+    // loaded snapshot. When it does, the positive list builds the matcher and
+    // the except list is IGNORED (positive wins) — the except flag stays false
+    // so the positive set is honored verbatim. That is a deliberate NARROWING
+    // (the term matches only the positive ports, strictly tighter than the
+    // operator-authored except would have been), never a widening, so it is
+    // fail-safe at the Rust boundary even without a SnapshotIntegrityError. The
+    // status is pinned by `port_both_positive_and_except_positive_wins_3716` in
+    // tests.rs so a future change to this selection is caught.
     let source_port_except = snap.source_ports.iter().all(|p| !port_is_real(p))
         && snap.source_ports_except.iter().any(|p| port_is_real(p));
     let dest_port_except = snap.destination_ports.iter().all(|p| !port_is_real(p))
