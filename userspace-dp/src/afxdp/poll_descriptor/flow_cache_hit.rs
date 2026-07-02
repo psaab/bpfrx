@@ -130,6 +130,49 @@ pub(super) fn stage_flow_cache_hit(
         let cached_decision = cached.decision;
         let cached_descriptor = &cached.descriptor;
         let cached_metadata = &cached.metadata;
+        // #3779: TTL/hop-limit check BEFORE any egress side effect. The slow
+        // paths (session-hit `poll_descriptor/mod.rs`, session-miss) test TTL
+        // before egress accounting, but the cache-hit path used to run the
+        // output `then count` replay, the policy hit counter, the three-color
+        // policers, the filter logs, AND the terminal drop FIRST — so a TTL=1
+        // packet on a red-policer or terminal-output-drop cached flow was
+        // dropped/charged without ever emitting ICMP Time Exceeded, and every
+        // would-expire packet charged counters/logs/telemetry for traffic that
+        // never egressed. Hoist it: for a forward disposition a would-expire
+        // packet becomes a Time Exceeded reply, or — when TE is suppressed
+        // (ICMP-of-ICMP, rate limited, or an output-filter drop of the reply) —
+        // is dropped, in BOTH cases before any egress counter/policer/log moves.
+        // Non-expiring packets fall straight through (Some(false)) with no
+        // behavior change.
+        if matches!(
+            cached_decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
+        ) && matches!(packet_ttl_would_expire(raw_frame, meta), Some(true))
+        {
+            // #1145: reuse the line-50 raw_frame bind instead of re-slicing.
+            if let Some(request) = build_local_time_exceeded_request(
+                raw_frame,
+                desc,
+                meta,
+                &worker_ctx.ident,
+                flow,
+                worker_ctx.forwarding,
+                worker_ctx.dynamic_neighbors,
+                worker_ctx.ha_state,
+                now_secs,
+                telemetry.counters,
+            ) {
+                scratch.scratch_forwards.push(request);
+                // Don't recycle — enqueue_pending_forwards returns the frame via
+                // pending_fill_frames when processing the prebuilt TE response.
+                return FlowCacheOutcome::Consumed;
+            }
+            // TTL expired but Time Exceeded suppressed: the packet cannot be
+            // forwarded (the rewrite path rejects TTL<=1) and must NOT charge
+            // egress counters/policers/logs — drop it here.
+            scratch.scratch_recycle.push(desc.addr);
+            return FlowCacheOutcome::Consumed;
+        }
         // #2573: replay ALL matched `then count` term counters, not just the
         // last. A #2544 fall-through flow can match multiple count terms.
         cached_descriptor
@@ -243,30 +286,10 @@ pub(super) fn stage_flow_cache_hit(
             cached_decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
         ) {
-            // TTL/hop-limit check on flow cache hit path:
-            // generate ICMP Time Exceeded for packets that
-            // would expire after decrement.
-            // #1145: reuse the line-50 raw_frame bind
-            // instead of re-slicing for the same packet.
-            let local_icmp_te = build_local_time_exceeded_request(
-                raw_frame,
-                desc,
-                meta,
-                &worker_ctx.ident,
-                flow,
-                worker_ctx.forwarding,
-                worker_ctx.dynamic_neighbors,
-                worker_ctx.ha_state,
-                now_secs,
-                telemetry.counters,
-            );
-            if let Some(request) = local_icmp_te {
-                scratch.scratch_forwards.push(request);
-                // Don't recycle here — enqueue_pending_forwards
-                // returns the frame via pending_fill_frames
-                // when processing the prebuilt TE response.
-                return FlowCacheOutcome::Consumed;
-            }
+            // #3779: the TTL/hop-limit check (and any ICMP Time Exceeded) was
+            // hoisted ABOVE the egress side effects earlier in this function, so
+            // a packet reaching here has a live TTL. No TTL test remains on the
+            // forward fast path.
             telemetry.counters.forward_candidate_packets += 1;
             if cached_decision.nat.rewrite_src.is_some() {
                 telemetry.counters.snat_packets += 1;

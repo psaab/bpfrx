@@ -532,6 +532,20 @@ sync.
   keep the frozen queue for free). A `then forwarding-class` filter term stays
   cached (its queue is 5-tuple-stable); only the DSCP/PCP-derived queue is
   per-packet.
+  **TTL/hop-limit precedes egress accounting on cache hits (#3779):** the
+  cache-hit path used to run the output `then count` replay, the policy hit
+  counter, the three-color policers, the filter logs, and the terminal drop
+  BEFORE the TTL/hop-limit check, so a TTL=1 packet on a red-policer or
+  terminal-output-drop cached flow was dropped/charged with NO ICMP Time
+  Exceeded (and every expiring packet charged counters/logs for traffic that
+  never egressed). The check is now hoisted to the TOP of the hit path (for
+  `ForwardCandidate`/`FabricRedirect` dispositions), matching the session-hit /
+  session-miss slow paths: a would-expire packet becomes a Time Exceeded reply,
+  or — when TE is suppressed (ICMP-of-ICMP, rate limited, output-filter drop of
+  the reply) — is dropped, in BOTH cases before any egress counter/policer/log
+  moves. `observed_bytes`/active-epoch stamping in `lookup_counted` still counts
+  the packet as SEEN (deliberate — it is flow-activity telemetry, not
+  forwarded-byte accounting).
   Producers must use the event-stream worker handle so rate limiting,
   queue-budget accounting, replay, and daemon callback ACK behavior stay
   centralized in `event_stream/`.

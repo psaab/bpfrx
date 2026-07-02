@@ -26787,3 +26787,25 @@ top.
     re-resolve), userspace-dp/src/afxdp/umem/tests.rs (literal),
     userspace-dp/src/afxdp/tests.rs (RED-on-revert + CoS imports),
     userspace-dp/src/afxdp/README.md
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3779 — hoist the TTL/hop-limit check ABOVE the egress side
+    effects on the flow-cache hit path. Previously the output `then count`
+    replay, policy hit counter, three-color policers, filter logs, and the
+    terminal drop all ran before the TTL check, so a TTL=1 packet on a
+    red-policer / terminal-output-drop cached flow was dropped/charged with no
+    ICMP Time Exceeded, and every expiring packet charged counters/logs for
+    traffic that never egressed. Moved the `packet_ttl_would_expire` +
+    `build_local_time_exceeded_request` check to the top of the hit path (for
+    ForwardCandidate/FabricRedirect); a would-expire packet becomes a TE reply,
+    or (TE suppressed) is dropped, in both cases before any egress accounting.
+    Removed the now-redundant TTL check from the forward fast path. Made
+    `packet_ttl_would_expire` a non-test import in afxdp/mod.rs. RED-on-revert:
+    `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779` (a TTL=1
+    cache-hit packet on an output-`then count` flow leaves the counter at 1;
+    reverting the hoist charges it to 2). observed_bytes/active-epoch stamping
+    left as SEEN telemetry (deliberate, documented).
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (hoist +
+    remove redundant check), userspace-dp/src/afxdp/mod.rs (packet_ttl_would_expire
+    import), userspace-dp/src/afxdp/tests.rs (RED-on-revert),
+    userspace-dp/src/afxdp/README.md
