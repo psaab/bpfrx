@@ -73,6 +73,31 @@ const ipfixReversePEN uint32 = 29305
 // of the 4-byte IANA form.
 const ipfixEnterpriseBit uint16 = 0x8000
 
+// #3748: PSAMP sampling Information Elements (RFC 5477 / the IANA "IPFIX
+// Entities" registry) carried by the Options Data Record that advertises the
+// group's 1-in-N sampling configuration to a collector.
+const (
+	// observationDomainId (IE 149, unsigned32) — the SCOPE field of the
+	// sampler Options Template. Its value is the group's stable Observation
+	// Domain ID (#3740), which also stamps the message header, so the record
+	// scopes the sampling config to this observation domain.
+	ipfixObservationDomainID = 149
+	// selectorAlgorithm (IE 304, unsigned16) — the PSAMP selection method.
+	ipfixSelectorAlgorithm = 304
+	// samplingPacketInterval (IE 305, unsigned32) — number of consecutive
+	// units selected (1 for 1-in-N systematic count-based sampling).
+	ipfixSamplingPacketInterval = 305
+	// samplingPacketSpace (IE 306, unsigned32) — number of units skipped
+	// between selections (N-1 for 1-in-N).
+	ipfixSamplingPacketSpace = 306
+)
+
+// ipfixSelectorAlgorithmSystematicCount is the IANA "PSAMP Selection Method"
+// registry value for Systematic count-based Sampling (RFC 5476): select
+// samplingPacketInterval units, then skip samplingPacketSpace units. xpf's
+// 1-in-N is expressed as interval=1, space=N-1 (#3748).
+const ipfixSelectorAlgorithmSystematicCount uint16 = 1
+
 // IPFIX Set IDs (RFC 7011 Section 3.3.2).
 const (
 	ipfixSetIDTemplate        = 2
@@ -84,6 +109,10 @@ const (
 const (
 	ipfixTemplateIDv4 = 256
 	ipfixTemplateIDv6 = 257
+	// #3748: the sampler Options Template ID. Distinct from the 256/257 data
+	// template IDs so a collector never confuses the options record with a
+	// flow record.
+	ipfixOptionsTemplateIDSampler = 258
 )
 
 // ipfixField defines a template field. enterprise is 0 for a standard IANA
@@ -390,6 +419,101 @@ func encodeIPFIXTemplateSetDir(includeDir bool) []byte {
 	return b
 }
 
+// #3748: the sampler Options Template scope + option fields (RFC 7011 §4 /
+// RFC 5477). The single scope field (observationDomainId, IE 149) binds the
+// record to an Observation Domain; the option fields carry the sampling
+// configuration. All are standard IANA IEs (4-byte Template Set specifiers).
+var (
+	ipfixOptionsSamplerScope = []ipfixField{
+		{ipfixObservationDomainID, 4, 0},
+	}
+	ipfixOptionsSamplerFields = []ipfixField{
+		{ipfixSelectorAlgorithm, 2, 0},
+		{ipfixSamplingPacketInterval, 4, 0},
+		{ipfixSamplingPacketSpace, 4, 0},
+	}
+)
+
+// ipfixOptionsSamplerRecordSize is the byte size of the sampler Options Data
+// Record: observationDomainId(4) + selectorAlgorithm(2) + samplingPacketInterval(4)
+// + samplingPacketSpace(4) = 14. Pinned against the field slices at build time so
+// a template/encoder drift panics at init (#3748), mirroring the #2526 data-record
+// pins.
+const ipfixOptionsSamplerRecordSize = 14
+
+var _ = func() struct{} {
+	if ipfixSumLen(ipfixOptionsSamplerScope)+ipfixSumLen(ipfixOptionsSamplerFields) != ipfixOptionsSamplerRecordSize {
+		panic("ipfixOptionsSamplerRecordSize != sum(scope+option fields)")
+	}
+	return struct{}{}
+}()
+
+// encodeIPFIXOptionsTemplateSet builds the sampler Options Template Set (Set ID
+// 3, RFC 7011 §3.4.2.2). The Options Template Record header is 6 bytes —
+// Template ID, Field Count, Scope Field Count — unlike the 4-byte Data Template
+// Record header. Field Count is scope + option fields; Scope Field Count is the
+// number of leading scope fields (#3748).
+func encodeIPFIXOptionsTemplateSet() []byte {
+	scope := ipfixOptionsSamplerScope
+	opts := ipfixOptionsSamplerFields
+	// Set header (4) + Options Template Record header (6) + field specifiers.
+	totalLen := 4 + 6 + ipfixFieldSpecsLen(scope) + ipfixFieldSpecsLen(opts)
+
+	b := make([]byte, totalLen)
+	off := 0
+
+	// Set header: Set ID = 3 (Options Template Set), Length.
+	binary.BigEndian.PutUint16(b[off:off+2], ipfixSetIDOptionsTemplate)
+	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(totalLen))
+	off += 4
+
+	// Options Template Record header: Template ID, Field Count, Scope Field Count.
+	binary.BigEndian.PutUint16(b[off:off+2], ipfixOptionsTemplateIDSampler)
+	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(len(scope)+len(opts)))
+	binary.BigEndian.PutUint16(b[off+4:off+6], uint16(len(scope)))
+	off += 6
+
+	for _, f := range scope {
+		off = encodeIPFIXFieldSpec(b, off, f)
+	}
+	for _, f := range opts {
+		off = encodeIPFIXFieldSpec(b, off, f)
+	}
+	return b
+}
+
+// encodeIPFIXOptionsSamplerDataSet builds the sampler Options Data Set (a Data
+// Set whose Set ID equals the Options Template ID, 258). It carries one record
+// scoped to odid, advertising 1-in-N systematic count-based sampling as
+// interval=1 / space=samplingRate-1. samplingRate <= 1 (unsampled) yields
+// space=0 (1-in-1), but callers only emit this set when sampling is active (see
+// IPFIXExporter.emitSampler) (#3748).
+func encodeIPFIXOptionsSamplerDataSet(odid uint32, samplingRate int) []byte {
+	var space uint32
+	if samplingRate > 1 {
+		space = uint32(samplingRate - 1)
+	}
+	totalLen := 4 + ipfixOptionsSamplerRecordSize
+	b := make([]byte, totalLen)
+	off := 0
+
+	// Set header: Set ID = Options Template ID (>= 256, so this is a Data Set).
+	binary.BigEndian.PutUint16(b[off:off+2], ipfixOptionsTemplateIDSampler)
+	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(totalLen))
+	off += 4
+
+	// Record: observationDomainId (scope), then the option fields.
+	binary.BigEndian.PutUint32(b[off:off+4], odid)
+	off += 4
+	binary.BigEndian.PutUint16(b[off:off+2], ipfixSelectorAlgorithmSystematicCount)
+	off += 2
+	binary.BigEndian.PutUint32(b[off:off+4], 1) // samplingPacketInterval = 1
+	off += 4
+	binary.BigEndian.PutUint32(b[off:off+4], space) // samplingPacketSpace = N-1
+	off += 4
+	return b
+}
+
 // encodeIPFIXDataSet builds an IPFIX data set from a batch of records with the
 // base (flow-dir absent) layout. Retained for callers/tests.
 func encodeIPFIXDataSet(records []FlowRecord) []byte {
@@ -609,6 +733,16 @@ type IPFIXExporter struct {
 	// (IE 61) is present (#3270).
 	includeDir bool
 
+	// #3748: sampler Options Template (Set ID 3) + Options Data Record (Set ID
+	// 258) advertising the group's 1-in-N sampling rate. Precomputed at
+	// construction (rate is fixed per group) and re-sent on the template-refresh
+	// cadence. emitSampler gates emission on SamplingRate > 1 — an unsampled
+	// group (rate 0/1, export-all) advertises nothing (a collector then assumes
+	// 1-in-1, which is correct), matching the ShouldExport sampling gate.
+	emitSampler        bool
+	optionsTemplateSet []byte
+	optionsDataSet     []byte
+
 	mu    sync.Mutex
 	seq   uint32 // cumulative data record count
 	conns *collectorConns
@@ -636,17 +770,28 @@ type IPFIXExporter struct {
 // embeds the live 1-in-N sampleCounter (atomic.Uint64) and copying it
 // would fork the counter, re-seeding the sampling cadence (#2224).
 func NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error) {
+	// #3740: stable per-group Observation Domain ID (RFC 7011 §3.1) derived
+	// from the config identity so two same-collector groups no longer collide
+	// on ODID=1 (template redefinitions + interleaved sequence streams).
+	// HA-symmetric (pure function of config-synced fields — both cluster nodes
+	// compute the same ODID). Also the scope value of the #3748 sampler record.
+	sourceID := stableExporterID("ipfix", cfg.InstanceName, cfg.TemplateName)
 	e := &IPFIXExporter{
-		cfg: cfg,
-		// #3740: stable per-group Observation Domain ID (RFC 7011 §3.1)
-		// derived from the config identity so two same-collector groups no
-		// longer collide on ODID=1 (template redefinitions + interleaved
-		// sequence streams). HA-symmetric (pure function of config-synced
-		// fields — both cluster nodes compute the same ODID).
-		sourceID:     stableExporterID("ipfix", cfg.InstanceName, cfg.TemplateName),
+		cfg:          cfg,
+		sourceID:     sourceID,
 		includeDir:   cfg.IncludeFlowDir,
 		templateSet:  encodeIPFIXTemplateSetDir(cfg.IncludeFlowDir),
 		MaskResolver: NewRouteMaskResolver(0),
+	}
+
+	// #3748: advertise the 1-in-N sampling rate via an Options Template +
+	// Options Data Record only when the group is actually sampled (rate > 1),
+	// matching the ShouldExport gate. Precompute both (the rate and ODID are
+	// fixed per group) so the refresh path just re-sends the bytes.
+	if cfg.SamplingRate > 1 {
+		e.emitSampler = true
+		e.optionsTemplateSet = encodeIPFIXOptionsTemplateSet()
+		e.optionsDataSet = encodeIPFIXOptionsSamplerDataSet(sourceID, cfg.SamplingRate)
 	}
 
 	conns, err := dialCollectors(cfg.Collectors)
@@ -797,6 +942,55 @@ func (e *IPFIXExporter) sendTemplates() {
 	encodeIPFIXHeaderInto(pkt[:16], hdr)
 	copy(pkt[16:], e.templateSet)
 	e.conns.writeAll(pkt, "ipfix template send failed")
+
+	// #3748: on the same refresh cadence, advertise the 1-in-N sampling
+	// configuration (Options Template + Options Data Record) for sampled groups.
+	if e.emitSampler {
+		e.sendSamplerOptions()
+	}
+}
+
+// sendSamplerOptions emits the sampler Options Template Set (Set ID 3, template
+// ID 258) followed by its Options Data Record (Set ID 258) in one IPFIX Message,
+// advertising the group's 1-in-N sampling rate as PSAMP systematic count-based
+// sampling (#3748). Called on the template-refresh cadence for sampled groups.
+//
+// SEMANTIC NUANCE (documented in README): xpf samples 1-in-N at SESSION-RECORD
+// granularity — ShouldExport applies the modulo per SESSION_CLOSE event, not
+// 1-in-N packets in the datapath as Junos jflow does. Advertising interval=1 /
+// space=N-1 lets a collector scale the sampled RECORD COUNT by N (correct), but
+// each exported record already carries the full per-session octet/packet volume,
+// so a collector must NOT additionally multiply octetDeltaCount by N.
+//
+// The Options Data Record is a Data Record (it rides a Set with ID >= 256), so
+// it advances the header Sequence Number by one, consistent with the #2609
+// convention in sendRecords: capture the current cumulative count for THIS
+// message's header, then increment for the record it carries. A collector that
+// tracks sequence numbers counts this record too, so skipping the increment
+// would look like the loss #2609 fixed.
+func (e *IPFIXExporter) sendSamplerOptions() {
+	body := make([]byte, 0, len(e.optionsTemplateSet)+len(e.optionsDataSet))
+	body = append(body, e.optionsTemplateSet...)
+	body = append(body, e.optionsDataSet...)
+
+	e.mu.Lock()
+	seq := e.seq
+	e.seq++ // the Options Data Record counts toward the sequence (RFC 7011 §3.1)
+	e.mu.Unlock()
+
+	now := time.Now()
+	hdr := ipfixHeader{
+		Version:        10,
+		Length:         uint16(16 + len(body)),
+		ExportTime:     uint32(now.Unix()),
+		SequenceNumber: seq,
+		ObservationID:  e.sourceID,
+	}
+
+	pkt := make([]byte, 16+len(body))
+	encodeIPFIXHeaderInto(pkt[:16], hdr)
+	copy(pkt[16:], body)
+	e.conns.writeAll(pkt, "ipfix options template send failed")
 }
 
 func (e *IPFIXExporter) flushBatches() {
