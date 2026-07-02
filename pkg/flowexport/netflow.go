@@ -506,6 +506,16 @@ type Exporter struct {
 	// operator-visible signal that the dataplane is not stamping creation
 	// times (e.g. all closes arriving via the explicit-delete / HA-purge path).
 	estimatedDurations atomic.Uint64
+	// #3744: count of route-mask HALVES (src and/or dst) that did not resolve
+	// to a FIB route at export time — the mask was exported as an unresolved 0
+	// rather than a real matched-route prefix length. Since #3743 the FIRST
+	// flow to any cold (ifindex,prefix) key resolves 0 while the background
+	// lookup warms, so a nonzero value is expected in steady state; a value
+	// climbing in lockstep with exportedFlows means masks are chronically
+	// unresolved (no route / churn faster than the TTL / wrong VRF scope) —
+	// the only operator-visible signal that an exported mask-0 is unresolved
+	// versus a real default-route /0.
+	routeMaskUnresolved atomic.Uint64
 }
 
 // NewExporter creates a new NetFlow v9 exporter. cfg is held by pointer
@@ -581,7 +591,13 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 		evt.NATSrcIP, evt.NATDstIP, evt.NATSrcPort, evt.NATDstPort)
 	// #2866: resolve src/dst route prefix lengths (NetFlow IE 9/13, IPv6 IE
 	// 29/30) from the FIB. Masks default to 0 when no resolver is wired.
-	srcMask, dstMask := resolveMasks(e.MaskResolver, evt.SrcIP, evt.DstIP)
+	// #3744: scope the lookup to the flow's ingress VRF table (evt.InIf, with
+	// evt.OutIf as a fallback) and count any unresolved half so an exported
+	// mask-0 can be told apart from a real default-route /0.
+	srcMask, dstMask, maskMisses := resolveMasks(e.MaskResolver, evt.SrcIP, evt.DstIP, evt.InIf, evt.OutIf)
+	if maskMisses > 0 {
+		e.routeMaskUnresolved.Add(maskMisses)
+	}
 	fr := FlowRecord{
 		SrcIP:     evt.SrcIP,
 		DstIP:     evt.DstIP,
@@ -618,6 +634,13 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 // real session-creation timestamp.
 func (e *Exporter) EstimatedDurations() uint64 {
 	return e.estimatedDurations.Load()
+}
+
+// RouteMaskUnresolved returns the count of exported route-mask halves (#3744)
+// that did not resolve to a FIB route and were exported as an unresolved 0
+// rather than a real matched-route prefix length. See routeMaskUnresolved.
+func (e *Exporter) RouteMaskUnresolved() uint64 {
+	return e.routeMaskUnresolved.Load()
 }
 
 // Stats returns export statistics.
