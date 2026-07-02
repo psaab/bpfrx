@@ -27782,3 +27782,35 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md (#3706 permit-metadata
   propagation section), userspace-dp/src/session/README.md (#3706 host-local
   policy-id exception)
+
+## 2026-07-02 — #3706 review fold: no double-count on the established host-local hit path
+
+- **Timestamp**: 2026-07-02
+- **Action**: #3706 hostile-review fold (one blocking MINOR, observability-only,
+  PR-introduced). The MISS-install stamp of a bound `policy_counter` onto a
+  junos-host permit host-local session made the generic session-HIT counter
+  (`poll_descriptor/mod.rs` ~:808, `resolve_session_hit_counter` ->
+  `record_policy_hit_counter`) count each established host-local permit packet,
+  while the mandatory `to-zone junos-host` session-HIT teardown re-eval
+  (`junos_host_local_policy` -> `junos_host_policy_eval` ->
+  `evaluate_junos_host_policy_l3_aware` -> `try_match_rule`, policy.rs:3736
+  `rule.hit_counter.add`) ALSO counted the same packet — DOUBLE-counting every
+  established host-local permit packet (2N for N hits). LocalDelivery sessions
+  are not flow-cached, so the flow-cache replay path never deduped it. Pre-#3706
+  the generic site was a no-op for host-local (`resolve_session_hit_counter(None,
+  0)` -> None), so the established count came solely from the re-eval (once).
+  Transit counts once (no per-hit re-eval). Fix: gate the generic session-HIT
+  `record_policy_hit_counter` on `resolved.decision.resolution.disposition !=
+  ForwardingDisposition::LocalDelivery` — the LocalDelivery path already counts
+  exactly once via its mandatory junos-host re-eval, byte-identical to pre-#3706
+  host-local counting; transit is untouched. The #3706 permit attribution
+  (policy_id / log flags / the bound counter handle for close-time
+  re-resolution + HA sync) stays stamped. Added a fail-on-revert test
+  (`poll_descriptor_junos_host_permit_established_hit_counts_once`): drive 1 SYN
+  miss + 3 established ACK hits, assert the admitting rule's packet counter == 4
+  (removing the `!= LocalDelivery` guard reads 7 -> RED, verified). Full
+  `cargo test --release` green.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs (session-HIT
+  `record_policy_hit_counter` gated on non-LocalDelivery), userspace-dp/src/
+  afxdp/tests.rs (established-hit exactly-once fail-on-revert test), userspace-dp/
+  src/afxdp/forwarding/README.md (#3706 exactly-once hit-counting note)

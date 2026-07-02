@@ -9713,6 +9713,103 @@ fn poll_descriptor_junos_host_permit_no_log_local_delivery_no_overlog() {
     );
 }
 
+/// #3706 fail-on-revert (established session-HIT double-count): a
+/// `to-zone junos-host then permit` host-local session must count each packet
+/// against the admitting rule's hit counter EXACTLY ONCE — parity with transit.
+/// The #3706 MISS-install stamps a bound `policy_counter`, and the LocalDelivery
+/// session-HIT path ALSO re-evaluates the junos-host policy on every hit (the
+/// mandatory teardown re-check), whose `try_match_rule` counts the packet.
+/// Counting at the generic session-hit `record_policy_hit_counter` site TOO
+/// would double-count every established host-local permit packet (2N for N
+/// hits). This drives 1 SYN (miss) + 3 established ACKs (hits) and asserts the
+/// rule's packet counter == 4. Remove the `!= LocalDelivery` guard on the
+/// session-hit counter and this goes RED (reads 7).
+#[test]
+fn poll_descriptor_junos_host_permit_established_hit_counts_once() {
+    // No `then log`; policy id 55. Counting is orthogonal to the log flags.
+    let snapshot = junos_host_local_delivery_permit_snapshot(false, false, 55);
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // `stable_policy_rule_id` for a rule with no explicit rule_id is
+    // "<from>-><to>/<name>". The fixture rule is lan -> junos-host / host-permit-log.
+    let rule_id = "lan->junos-host/host-permit-log";
+    let hit_packets = |f: &ForwardingState| -> u64 {
+        f.policy
+            .counter_snapshots()
+            .into_iter()
+            .find(|c| c.rule_id == rule_id)
+            .map(|c| c.packets)
+            .unwrap_or_else(|| panic!("missing policy counter for {rule_id}"))
+    };
+
+    // Packet 1: SYN => session MISS => install. The miss-site junos-host
+    // re-eval counts this first packet once (cold path).
+    let syn = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let syn_meta = txn_meta_v4(24, TCP_FLAG_SYN, (syn.len() - 14) as u16);
+    let (_b, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &syn,
+        syn_meta,
+    );
+    assert_eq!(dbg.local, 1, "SYN must take the LocalDelivery arm");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the permitted SYN must install one host-local session"
+    );
+    assert_eq!(
+        hit_packets(&forwarding),
+        1,
+        "the miss SYN counts once against the admitting rule (cold path)"
+    );
+
+    // Packets 2..=4: pure ACKs (0x10) on the SAME 5-tuple => session HIT. Each
+    // must count exactly once (via the mandatory junos-host teardown re-eval).
+    let ack = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        0x10_u8,
+    );
+    let ack_meta = txn_meta_v4(24, 0x10_u8, (ack.len() - 14) as u16);
+    for i in 0..3 {
+        let (_b, dbg) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &ack,
+            ack_meta,
+        );
+        assert_eq!(
+            dbg.session_hit, 1,
+            "established ACK #{i} must hit the installed host-local session"
+        );
+    }
+
+    assert_eq!(
+        hit_packets(&forwarding),
+        4,
+        "#3706: 1 miss + 3 established hits must count EXACTLY 4 packets against \
+         the admitting junos-host rule; double-counting the session-hit path \
+         reads 7 (the pre-fix regression)"
+    );
+}
+
 /// #3326 LITERAL fail-on-revert (session-MISS): a host-bound packet denied by
 /// the zone host-inbound admission gate must increment the
 /// `host_inbound_denied_packets` batch counter (which `syncBPFCountersLocked`

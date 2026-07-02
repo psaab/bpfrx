@@ -801,11 +801,35 @@ pub(super) fn poll_binding_process_descriptor(
                         // handle over the positional idx so a live policy
                         // reorder cannot re-attribute this established flow's
                         // packets to a different rule.
-                        if let Some(counter) = worker_ctx.forwarding.policy.resolve_session_hit_counter(
-                            resolved.metadata.policy_counter.as_ref(),
-                            resolved.metadata.policy_counter_idx,
-                        ) {
-                            crate::policy::record_policy_hit_counter(counter, desc.len as u64);
+                        //
+                        // #3706: EXCEPT on the LocalDelivery (host-bound) path.
+                        // A host-local session re-evaluates the `to-zone
+                        // junos-host` policy on EVERY hit (the mandatory teardown
+                        // re-check below), and that re-eval's `try_match_rule`
+                        // already counts this packet against the admitting rule's
+                        // hit counter — exactly as it did pre-#3706, when a
+                        // host-local session carried no bound counter and this
+                        // line was a no-op (`resolve_session_hit_counter(None, 0)`
+                        // -> None). Now that a junos-host permit stamps a bound
+                        // counter (#3706), counting HERE too would double-count
+                        // every established host-local permit packet. Transit has
+                        // no per-hit policy re-eval, so it counts solely here.
+                        // Gate on disposition so the count fires exactly once on
+                        // both paths (parity with transit) while the #3706 permit
+                        // attribution — policy_id / log flags / the bound counter
+                        // handle used for close-time re-resolution + HA sync —
+                        // stays stamped on the session.
+                        if resolved.decision.resolution.disposition
+                            != ForwardingDisposition::LocalDelivery
+                        {
+                            if let Some(counter) =
+                                worker_ctx.forwarding.policy.resolve_session_hit_counter(
+                                    resolved.metadata.policy_counter.as_ref(),
+                                    resolved.metadata.policy_counter_idx,
+                                )
+                            {
+                                crate::policy::record_policy_hit_counter(counter, desc.len as u64);
+                            }
                         }
                         flow_cache_install_failed = resolved.install_failed;
                         if resolved.created {
