@@ -27297,3 +27297,32 @@ top.
   comment), pkg/daemon/daemon_ipmon_test.go (TestIPMonPublishAllowedAnyPrimary +
   ipmonCluster/ipmonClusterCfg helpers; cluster import), docs/multi-wan.md (HA
   model publication section — per-any-RG semantics, Layer-2 residual deferred)
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3720 — fix host-inbound physical-vs-unit override precedence.
+  buildInterfaceHostInboundMap (pkg/dataplane/userspace/zones.go) was
+  first-writer-wins over sorted refs, so a bare physical ref (a prefix of, and
+  sorting before, its units) filled out["ifN.M"] and the later exact unit
+  override was SKIPPED — the less-specific physical ref silently shadowed the
+  more-specific unit (H04, fail-open/fail-closed). Fix: new
+  mergeHostInboundTraffic UNIONs physical ∪ unit (Junos additive); a unit ref
+  now merges onto the physical-inherited entry instead of being dropped. Added
+  the #3720 M01 cross-zone quarantine — a physical override is not expanded onto
+  a unit resolved to a different zone (lenient multi-owner leak). Mirrored the
+  same additive+quarantine resolution in the config-side clone
+  buildHostInboundOverrideMapLocal and removed the now-redundant leak-prone
+  bare-physical fallback in validateDuplicateHostLocalAddressStrict
+  (pkg/config/dup_host_local_address.go), so the commit gate's
+  CanonicalHostInboundTokenSig equals the runtime effective set. Fixed the H05
+  presentation drift: InterfaceHostInboundEffective + hostInboundViewBase
+  (pkg/config/host_inbound_view.go) now fold a physical-parent override into a
+  unit ref's effective set, so `show interfaces <unit>` / `show security zones`
+  agree with enforcement. RED-on-revert verified for all 6 new tests (physical
+  ∪ unit union, view scoping, M01 quarantine, presentation parity). Single-level
+  (physical-only / unit-only) resolution bit-identical. go test
+  ./pkg/config/... ./pkg/dataplane/... green.
+- **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/config/dup_host_local_address.go, pkg/config/host_inbound_view.go,
+  pkg/dataplane/userspace/host_inbound_phys_unit_3720_test.go (new),
+  pkg/config/host_inbound_effective_3720_test.go (new),
+  docs/host-inbound-service-matrix.md

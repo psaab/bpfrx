@@ -74,15 +74,34 @@ func (z *ZoneConfig) InterfaceHostInboundEffective(ref string) (svc, proto []str
 		zoneSvc = z.HostInboundTraffic.SystemServices
 		zoneProto = z.HostInboundTraffic.Protocols
 	}
-	var ov *HostInboundTraffic
-	if z != nil {
-		ov = z.InterfaceHostInbound[ref]
-	}
-	if ov == nil {
+	if z == nil {
 		return UnionHostInboundTokens(zoneSvc, nil), UnionHostInboundTokens(zoneProto, nil), false
 	}
-	return UnionHostInboundTokens(zoneSvc, ov.SystemServices),
-		UnionHostInboundTokens(zoneProto, ov.Protocols), true
+	// #3720 (H05): the per-interface override is ADDITIVE across the physical and
+	// the unit level, exactly as the dataplane resolves it in
+	// buildInterfaceHostInboundMap. For a logical-unit ref (contains "."), a
+	// physical-interface-level override on its parent IN THIS ZONE also applies,
+	// so the diagnostic must UNION it. Before #3720 this read only the exact ref,
+	// so `show interfaces <unit>` reported "no override / default-deny" while the
+	// dataplane admitted the inherited physical override — the diagnostic gave the
+	// OPPOSITE answer to enforcement.
+	var ovSvc, ovProto []string
+	if base, unit, ok := strings.Cut(ref, "."); ok && unit != "" && base != "" {
+		if phys := z.InterfaceHostInbound[base]; phys != nil {
+			ovSvc = UnionHostInboundTokens(ovSvc, phys.SystemServices)
+			ovProto = UnionHostInboundTokens(ovProto, phys.Protocols)
+			overridden = true
+		}
+	}
+	if exact := z.InterfaceHostInbound[ref]; exact != nil {
+		ovSvc = UnionHostInboundTokens(ovSvc, exact.SystemServices)
+		ovProto = UnionHostInboundTokens(ovProto, exact.Protocols)
+		overridden = true
+	}
+	if !overridden {
+		return UnionHostInboundTokens(zoneSvc, nil), UnionHostInboundTokens(zoneProto, nil), false
+	}
+	return UnionHostInboundTokens(zoneSvc, ovSvc), UnionHostInboundTokens(zoneProto, ovProto), true
 }
 
 // InterfaceHostInboundView is a single per-interface host-inbound override
@@ -170,12 +189,17 @@ func (z *ZoneConfig) hostInboundViewBase() HostInboundView {
 		if ov == nil {
 			continue
 		}
+		// SystemServices/Protocols show the tokens authored on THIS ref; the
+		// effective set is resolved through InterfaceHostInboundEffective so a
+		// unit ref also folds in a physical-parent override (#3720 H05) — the
+		// same additive resolution the dataplane enforces.
+		effSvc, effProto, _ := z.InterfaceHostInboundEffective(ref)
 		v.Interfaces = append(v.Interfaces, InterfaceHostInboundView{
 			Interface:               ref,
 			SystemServices:          append([]string(nil), ov.SystemServices...),
 			Protocols:               append([]string(nil), ov.Protocols...),
-			EffectiveSystemServices: UnionHostInboundTokens(v.ZoneSystemServices, ov.SystemServices),
-			EffectiveProtocols:      UnionHostInboundTokens(v.ZoneProtocols, ov.Protocols),
+			EffectiveSystemServices: effSvc,
+			EffectiveProtocols:      effProto,
 		})
 	}
 	return v

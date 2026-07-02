@@ -152,15 +152,57 @@ func buildZoneInterfaceMapLocal(cfg *Config) map[string]string {
 	return out
 }
 
+// mergeHostInboundOverrideLocal mirrors
+// pkg/dataplane/userspace.mergeHostInboundTraffic: it returns a NEW
+// *HostInboundTraffic whose token lists are the order-preserving UNION of a and
+// b (a first, then b's not-already-present tokens). It backs the #3720 additive
+// physical→unit override resolution so the commit-time gate classifies the same
+// effective set the runtime does. Returns nil only when both inputs are nil.
+func mergeHostInboundOverrideLocal(a, b *HostInboundTraffic) *HostInboundTraffic {
+	if a == nil && b == nil {
+		return nil
+	}
+	appendUnique := func(dst *[]string, src []string) {
+		for _, t := range src {
+			dup := false
+			for _, e := range *dst {
+				if e == t {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				*dst = append(*dst, t)
+			}
+		}
+	}
+	out := &HostInboundTraffic{}
+	if a != nil {
+		appendUnique(&out.SystemServices, a.SystemServices)
+		appendUnique(&out.Protocols, a.Protocols)
+	}
+	if b != nil {
+		appendUnique(&out.SystemServices, b.SystemServices)
+		appendUnique(&out.Protocols, b.Protocols)
+	}
+	return out
+}
+
 // buildHostInboundOverrideMapLocal mirrors
 // pkg/dataplane/userspace.buildInterfaceHostInboundMap: per-interface
-// host-inbound overrides (#3362) keyed by the interface ref, with a bare
-// physical ref expanded to each of its configured units. Rebuilt locally
-// because pkg/config cannot import pkg/dataplane.
+// host-inbound overrides (#3362) keyed by the interface ref. A physical
+// override is expanded onto each of its configured units (skipping a unit owned
+// by a DIFFERENT zone — #3720 M01) and MERGED (unioned) with any unit-level
+// override rather than the sorted-first physical ref shadowing the unit (the
+// #3720 first-writer-wins bug). Rebuilt locally because pkg/config cannot import
+// pkg/dataplane; the effective set it produces per unit therefore matches the
+// runtime builder exactly, so the commit gate and the runtime reporter classify
+// the same unit identically.
 func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffic {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
 	}
+	zoneByIface := buildZoneInterfaceMapLocal(cfg)
 	out := make(map[string]*HostInboundTraffic)
 	zoneNames := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
@@ -182,18 +224,22 @@ func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffi
 			if ref == "" || hib == nil {
 				continue
 			}
+			if strings.Contains(ref, ".") {
+				// Logical unit ref: most specific — merge onto any physical-
+				// inherited set (Junos additive), exact match only.
+				out[ref] = mergeHostInboundOverrideLocal(out[ref], hib)
+				continue
+			}
 			if _, ok := out[ref]; !ok {
 				out[ref] = hib
-			}
-			if strings.Contains(ref, ".") {
-				continue // logical unit ref: exact match only
 			}
 			if ifCfg := cfg.Interfaces.Interfaces[ref]; ifCfg != nil {
 				for unitNum := range ifCfg.Units {
 					un := fmt.Sprintf("%s.%d", ref, unitNum)
-					if _, ok := out[un]; !ok {
-						out[un] = hib
+					if z := zoneByIface[un]; z != "" && z != zn {
+						continue // #3720 M01: do not leak cross-zone
 					}
+					out[un] = mergeHostInboundOverrideLocal(out[un], hib)
 				}
 			}
 		}
@@ -287,10 +333,13 @@ func validateDuplicateHostLocalAddressStrict(cfg *Config) error {
 			if zone == nil {
 				continue
 			}
+			// #3720: overrideByIface already expands a physical override onto its
+			// same-zone units and MERGES a unit-level override on top, so the
+			// per-unit entry IS the authoritative effective override. No bare-
+			// physical fallback: a nil entry means the physical override was
+			// quarantined as cross-zone (M01), and pulling overrideByIface[ifName]
+			// here would reintroduce that cross-zone leak.
 			override := overrideByIface[unitName]
-			if override == nil {
-				override = overrideByIface[ifName]
-			}
 			sig := effectiveHostInboundSigLocal(zone, override)
 
 			for _, a := range unit.Addresses {

@@ -228,6 +228,52 @@ Two observability surfaces consume it:
   visible in a config-only / degraded boot). Alert with e.g.
   `max_over_time(xpf_host_inbound_addressless_zones[1h]) > 0`.
 
+## Per-interface override precedence (#3362, #3720)
+
+Host-inbound-traffic can be authored at three granularities, and the EFFECTIVE
+admission set for a logical unit is the **UNION** of all three (Junos
+host-inbound is additive — an interface admits a service listed at ANY level):
+
+1. **zone-level** — `security zones <z> host-inbound-traffic { ... }`, applies to
+   every interface in the zone;
+2. **physical-interface-level** — `security zones <z> interfaces <ifN>
+   host-inbound-traffic { ... }` (a bare interface ref), applies to every
+   configured unit of that physical interface;
+3. **unit-level** — `security zones <z> interfaces <ifN.M>
+   host-inbound-traffic { ... }`, applies only to that logical unit.
+
+So for unit `ifN.M`: `effective = zone ∪ physical(ifN) ∪ unit(ifN.M)`. A
+more-specific unit override never *replaces* a physical override — they are
+merged. Before #3720 the resolver
+(`buildInterfaceHostInboundMap`, `pkg/dataplane/userspace/zones.go`) walked refs
+in sorted order and wrote each key first-writer-wins; a bare physical ref sorts
+before (is a prefix of) its units, so it filled `out["ifN.M"]` first and the
+later exact unit override was **dropped** — the less-specific physical ref
+silently shadowed the more-specific unit ref (fail-open, admitting a service the
+unit did not open, or fail-closed, denying one it did). The fix MERGES (unions)
+the two levels instead.
+
+**Cross-zone quarantine (#3720 M01).** The physical→unit expansion does NOT
+apply a physical override to a unit that resolves to a **different** zone. On the
+lenient / peer-synced load path an ownership conflict is downgraded to a warning
+(`compiler_validate_strict.go`), so a physical `ifN` override owned by zone
+trust could otherwise leak its tokens onto `ifN.M` owned by zone guest. The
+expansion skips any unit whose resolved zone differs from the override's zone.
+
+**Presentation parity (#3720 H05).** `ZoneConfig.InterfaceHostInboundEffective`
+(`pkg/config/host_inbound_view.go`) — used by `show interfaces <unit>`, `show
+security zones`, and the gRPC interface diagnostic — folds the physical-parent
+override into a unit ref's effective set with the same additive rule, so the
+operator diagnostic agrees with what the dataplane admits. Before #3720 it read
+only the exact ref and reported "no override / default-deny" for a unit that in
+fact inherited a physical override.
+
+**Gate alignment.** The commit-time duplicate-address gate
+(`buildHostInboundOverrideMapLocal` +
+`validateDuplicateHostLocalAddressStrict`, `pkg/config/dup_host_local_address.go`)
+mirrors the same additive resolution and quarantine, so the
+`CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
+
 ## Duplicate host-local-address ambiguity (#3718, Option B)
 
 The kernel host-inbound chain matches on **destination address only** — every

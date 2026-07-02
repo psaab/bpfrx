@@ -520,18 +520,78 @@ func unionHostInboundTokens(zoneHI, ifaceHI *config.HostInboundTraffic) (svc, pr
 	return svc, proto
 }
 
+// mergeHostInboundTraffic returns a NEW *config.HostInboundTraffic whose token
+// lists are the order-preserving UNION of a and b (a's tokens first, then any of
+// b's not already present, exact-string dedup). It underpins the #3720 additive
+// physical→unit override resolution: a physical-interface override and a
+// more-specific unit-level override on the same unit are UNIONed (Junos
+// host-inbound is additive across levels) rather than the sorted-first physical
+// ref silently shadowing the unit ref (the #3720 first-writer-wins bug). Returns
+// nil only when BOTH inputs are nil; a fresh struct is always allocated so the
+// shared config-owned override objects are never mutated in place.
+func mergeHostInboundTraffic(a, b *config.HostInboundTraffic) *config.HostInboundTraffic {
+	if a == nil && b == nil {
+		return nil
+	}
+	appendUnique := func(dst *[]string, src []string) {
+		for _, t := range src {
+			dup := false
+			for _, e := range *dst {
+				if e == t {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				*dst = append(*dst, t)
+			}
+		}
+	}
+	out := &config.HostInboundTraffic{}
+	if a != nil {
+		appendUnique(&out.SystemServices, a.SystemServices)
+		appendUnique(&out.Protocols, a.Protocols)
+	}
+	if b != nil {
+		appendUnique(&out.SystemServices, b.SystemServices)
+		appendUnique(&out.Protocols, b.Protocols)
+	}
+	return out
+}
+
 // buildInterfaceHostInboundMap resolves per-interface host-inbound overrides
 // (#3362) keyed by the interface ref as it appears on a resolved interface
-// snapshot (InterfaceSnapshot.Name). A ref naming a logical unit (contains
-// ".") maps ONLY itself — never a sibling unit. A ref naming a physical
-// interface (no unit suffix) expands to each of its configured units, mirroring
-// the physical→unit expansion in buildInterfaceZoneMap, so an override authored
-// on the physical applies to every unit's snapshot. Zones and refs are walked
-// in sorted order; the first writer of a given key wins (deterministic).
+// snapshot (InterfaceSnapshot.Name).
+//
+// Precedence / merge rule (#3720). Junos host-inbound is ADDITIVE across the
+// override levels, so the EFFECTIVE override for a unit is the UNION of any
+// physical-interface-level override that applies to it and its own unit-level
+// override — never the less-specific physical ref shadowing the more-specific
+// unit ref:
+//   - A ref naming a logical unit (contains ".") is the MOST specific override.
+//     It maps ONLY itself — never a sibling unit — and is MERGED (unioned) onto
+//     whatever physical-inherited set already sits on that unit key.
+//   - A ref naming a physical interface (no unit suffix) expands to each of its
+//     configured units (mirroring buildInterfaceZoneMap), but NOT onto a unit
+//     resolved to a DIFFERENT zone (#3720 M01 quarantine — a physical override
+//     must not leak its tokens cross-zone on the lenient multi-owner warn path).
+//     The expansion MERGES so a same-zone unit override unions rather than being
+//     dropped.
+//
+// Before #3720 the loop wrote every key first-writer-wins in sorted ref order:
+// a bare physical ref (a prefix of, and therefore sorting before, its units)
+// filled out["ifN.M"] first, so the later exact unit override was skipped and
+// the less-specific physical ref silently decided the unit (fail-open or
+// fail-closed). Zones are still walked in sorted order and the bare physical key
+// itself stays first-writer-wins across zones (deterministic), so single-level
+// (physical-only or unit-only) configs are bit-identical to before.
 func buildInterfaceHostInboundMap(cfg *config.Config) map[string]*config.HostInboundTraffic {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
 	}
+	// Resolved logical-interface → zone lookup so the physical→unit expansion can
+	// skip a unit owned by a different zone (#3720 M01).
+	zoneByIface := buildInterfaceZoneMap(cfg)
 	out := make(map[string]*config.HostInboundTraffic)
 	zoneNames := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
@@ -553,18 +613,29 @@ func buildInterfaceHostInboundMap(cfg *config.Config) map[string]*config.HostInb
 			if ref == "" || hib == nil {
 				continue
 			}
+			if strings.Contains(ref, ".") {
+				// Logical unit ref: the most specific override. Merge (union) it
+				// onto any physical-inherited set already on this unit key. Because
+				// refs are walked sorted and a bare physical ref sorts before its
+				// units, a same-zone physical expansion below has already run, so
+				// this yields physical ∪ unit.
+				out[ref] = mergeHostInboundTraffic(out[ref], hib)
+				continue
+			}
+			// Bare physical ref: first-writer-wins across zones for the bare key
+			// itself (preserves the lenient cross-zone quarantine).
 			if _, ok := out[ref]; !ok {
 				out[ref] = hib
-			}
-			if strings.Contains(ref, ".") {
-				continue // logical unit ref: exact match only, never a sibling
 			}
 			if ifCfg := cfg.Interfaces.Interfaces[ref]; ifCfg != nil {
 				for unitNum := range ifCfg.Units {
 					un := fmt.Sprintf("%s.%d", ref, unitNum)
-					if _, ok := out[un]; !ok {
-						out[un] = hib
+					// #3720 M01: do not leak a physical override onto a unit that
+					// resolves to a different zone.
+					if z := zoneByIface[un]; z != "" && z != zn {
+						continue
 					}
+					out[un] = mergeHostInboundTraffic(out[un], hib)
 				}
 			}
 		}
