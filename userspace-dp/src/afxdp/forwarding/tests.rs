@@ -4015,3 +4015,132 @@ fn select_route_next_hop_consistent_under_liveness_flip_between_passes() {
         "selected next-hop must be a real candidate from the snapshot",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3773 (M13): fabric-link skip classification. Before #3773 populate_fabrics
+// dropped a fabric link with a malformed peer/local MAC or peer address on a
+// bare `continue` — no counter, log, or status — so an HA cross-chassis fabric
+// link that silently failed to install (and therefore silently did not
+// forward) was invisible to the operator. These tests assert the deterministic
+// per-build `fabric_skips` record (race-free) plus the cumulative diagnostic
+// atomic (`> before`, safe for a monotonic counter under parallel tests).
+// fail-on-revert: reinstating the bare `continue` leaves `fabric_skips` empty
+// and bumps no counter → RED.
+// ---------------------------------------------------------------------------
+
+fn fabric_snapshot_template() -> FabricSnapshot {
+    FabricSnapshot {
+        name: "fab0".into(),
+        parent_interface: "ge-0/0/0".into(),
+        parent_linux_name: "ge-0-0-0".into(),
+        parent_ifindex: 21,
+        overlay_linux_name: "fab0".into(),
+        overlay_ifindex: 101,
+        rx_queues: 2,
+        peer_address: "10.99.13.2".into(),
+        local_mac: "02:bf:72:ff:00:01".into(),
+        peer_mac: "00:aa:bb:cc:dd:ee".into(),
+    }
+}
+
+#[test]
+fn fabric_link_well_formed_installs_with_no_skip() {
+    let mut snapshot = nat_snapshot();
+    snapshot.fabrics = vec![fabric_snapshot_template()];
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(state.fabrics.len(), 1, "a well-formed fabric must install");
+    assert!(
+        state.fabric_skips.is_empty(),
+        "a well-formed fabric must not be recorded as skipped: {:?}",
+        state.fabric_skips
+    );
+}
+
+#[test]
+fn fabric_link_malformed_peer_mac_is_skipped_and_counted() {
+    let before = crate::afxdp::forwarding::FABRIC_LINK_SKIPPED_MALFORMED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut snapshot = nat_snapshot();
+    let mut fab = fabric_snapshot_template();
+    fab.peer_mac = "not-a-mac".into(); // NON-EMPTY but unparseable
+    snapshot.fabrics = vec![fab];
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.fabrics.is_empty(),
+        "a fabric with a malformed peer MAC must not install"
+    );
+    assert_eq!(state.fabric_skips.len(), 1, "the skip must be recorded");
+    assert_eq!(state.fabric_skips[0].name, "fab0");
+    assert_eq!(
+        state.fabric_skips[0].reason,
+        FabricSkipReason::MalformedPeerMac
+    );
+    assert!(state.fabric_skips[0].reason.is_malformed());
+    let after = crate::afxdp::forwarding::FABRIC_LINK_SKIPPED_MALFORMED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after > before,
+        "a malformed fabric must bump FABRIC_LINK_SKIPPED_MALFORMED"
+    );
+}
+
+#[test]
+fn fabric_link_invalid_parent_ifindex_is_skipped_malformed() {
+    let mut snapshot = nat_snapshot();
+    let mut fab = fabric_snapshot_template();
+    fab.parent_ifindex = 0; // unusable parent netdev index
+    snapshot.fabrics = vec![fab];
+    let state = build_forwarding_state(&snapshot);
+    assert!(state.fabrics.is_empty());
+    assert_eq!(state.fabric_skips.len(), 1);
+    assert_eq!(
+        state.fabric_skips[0].reason,
+        FabricSkipReason::InvalidParentIfindex
+    );
+    assert!(state.fabric_skips[0].reason.is_malformed());
+}
+
+#[test]
+fn fabric_link_unparseable_peer_address_is_skipped_malformed() {
+    let mut snapshot = nat_snapshot();
+    let mut fab = fabric_snapshot_template();
+    fab.peer_address = "not-an-ip".into();
+    snapshot.fabrics = vec![fab];
+    let state = build_forwarding_state(&snapshot);
+    assert!(state.fabrics.is_empty());
+    assert_eq!(state.fabric_skips.len(), 1);
+    assert_eq!(
+        state.fabric_skips[0].reason,
+        FabricSkipReason::UnparseablePeerAddress
+    );
+}
+
+#[test]
+fn fabric_link_empty_peer_mac_is_skipped_as_unresolved_peer() {
+    let before = crate::afxdp::forwarding::FABRIC_LINK_UNRESOLVED_PEER
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut snapshot = nat_snapshot();
+    let mut fab = fabric_snapshot_template();
+    // EMPTY peer MAC + a peer address with no matching neighbor entry: the
+    // expected late-resolution transient (awaiting ARP/NDP), classified
+    // UNRESOLVED rather than malformed.
+    fab.peer_mac = String::new();
+    snapshot.fabrics = vec![fab];
+    let state = build_forwarding_state(&snapshot);
+    assert!(state.fabrics.is_empty());
+    assert_eq!(state.fabric_skips.len(), 1);
+    assert_eq!(
+        state.fabric_skips[0].reason,
+        FabricSkipReason::UnresolvedPeerMac
+    );
+    assert!(
+        !state.fabric_skips[0].reason.is_malformed(),
+        "an empty (unresolved) peer MAC is a distinct non-malformed state"
+    );
+    let after = crate::afxdp::forwarding::FABRIC_LINK_UNRESOLVED_PEER
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after > before,
+        "an unresolved fabric peer must bump FABRIC_LINK_UNRESOLVED_PEER"
+    );
+}

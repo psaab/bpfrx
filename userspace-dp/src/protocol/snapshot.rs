@@ -418,7 +418,7 @@ pub(crate) struct ZoneSnapshot {
     pub tcp_rst: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub(crate) struct FabricSnapshot {
     pub name: String,
     #[serde(rename = "parent_interface", default)]

@@ -169,3 +169,32 @@ func TestEmitNeighborPhase3CountersAndGauges(t *testing.T) {
 	assertGaugeClose(t, got, c.neighborPendingKeys, nil, 3)
 	assertGaugeClose(t, got, c.negNeighKeys, nil, 1)
 }
+
+// #3773 (M13): value + type pin for the fabric-link skip counters emitted by
+// emitFabricSkipCounters. Both are CounterValue; a mixup or a dropped emit
+// fails this test. fail-on-revert: removing the emit leaves `got` without the
+// series and assertCounterClose fails.
+func TestEmitFabricSkipCounters(t *testing.T) {
+	newDesc := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name, nil, nil)
+	}
+	c := &xpfCollector{
+		fabricLinkSkippedMalformedTotal: newDesc(
+			"xpf_userspace_fabric_link_skipped_malformed_total"),
+		fabricLinkUnresolvedPeerTotal: newDesc(
+			"xpf_userspace_fabric_link_unresolved_peer_total"),
+	}
+	status := dpuserspace.ProcessStatus{
+		FabricLinkSkippedMalformedTotal: 6,
+		FabricLinkUnresolvedPeerTotal:   2,
+	}
+	ch := make(chan prometheus.Metric, 8)
+	c.emitFabricSkipCounters(ch, status)
+	close(ch)
+	var got []prometheus.Metric
+	for m := range ch {
+		got = append(got, m)
+	}
+	assertCounterClose(t, got, c.fabricLinkSkippedMalformedTotal, nil, 6)
+	assertCounterClose(t, got, c.fabricLinkUnresolvedPeerTotal, nil, 2)
+}

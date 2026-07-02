@@ -315,6 +315,14 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
             es_stats.dataplane_events.session_create.dropped;
     }
     state.status.last_cache_flush_at = state.afxdp.last_cache_flush_at();
+    // #3773 (M13): surface the cumulative fabric-skip diagnostic atomics so an
+    // operator (and Prometheus) sees a silently-unresolved HA cross-chassis
+    // fabric link. Malformed = a config/environment fault; unresolved-peer =
+    // the expected late-resolution transient (distinct counter).
+    state.status.fabric_link_skipped_malformed_total =
+        state.afxdp.fabric_link_skipped_malformed_total();
+    state.status.fabric_link_unresolved_peer_total =
+        state.afxdp.fabric_link_unresolved_peer_total();
 }
 
 pub(crate) fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {

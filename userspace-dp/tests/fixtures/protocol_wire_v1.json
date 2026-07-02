@@ -816,6 +816,8 @@
     "event_stream_session_create_dropped": 0,
     "event_stream_session_create_sent": 0,
     "event_stream_write_stalls": 0,
+    "fabric_link_skipped_malformed_total": 0,
+    "fabric_link_unresolved_peer_total": 0,
     "fabrics": [],
     "filter_term_counters": [],
     "flow_cache_capacity": 0,

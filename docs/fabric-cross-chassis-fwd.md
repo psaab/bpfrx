@@ -242,3 +242,80 @@ wheel's job, not the sweep's (see `pkg/cluster/README.md` and
 `userspace-dp/src/session/README.md` "Standby retention"). This keeps
 #270's empty-sweep back-off and avoids the >1/s control-socket contention
 CLAUDE.md warns against.
+
+## Fabric-link build/refresh observability + persistence (#3773)
+
+A fabric redirect can only fire if a `FabricLink` was actually built for
+the parent interface. Two resolution passes build them:
+
+- **snapshot build** — `populate_fabrics`
+  (`userspace-dp/src/afxdp/forwarding_build/fib.rs`), run for every
+  `build_forwarding_state` (config apply + route-churn `bump_fib`).
+- **runtime refresh** — `resolve_fabric_links_from_snapshots`
+  (`userspace-dp/src/afxdp/forwarding/mod.rs`), driven by the Go daemon's
+  `SyncFabricState`/`refreshFabricFwd` (`update_fabrics` control verb) once
+  ARP/NDP resolves the peer MAC that was unresolved at initial build.
+
+### M13 — skipped fabric links are counted + named (was a silent `continue`)
+
+Before #3773 each pass dropped a fabric link on a bare `continue` when
+`parent_ifindex <= 0`, the `peer_address` was unparseable, the `local_mac`
+was unresolvable, or the `peer_mac` was unresolvable — **no counter, log,
+or status**. An HA cross-chassis fabric link that silently failed to
+install (and therefore silently did not forward) was invisible; the
+operator had no way to see an unresolved fabric.
+
+Both passes now route the skip-vs-install decision through the shared
+`build_fabric_link_or_skip` classifier, which partitions skips into two
+cumulative diagnostic atomics (`forwarding/mod.rs`):
+
+- **`FABRIC_LINK_SKIPPED_MALFORMED`** — an invalid parent ifindex, an
+  unparseable peer address, or a **non-empty** local/peer MAC string that
+  failed to parse. A config/environment fault that will not self-heal.
+  Surfaced as `xpf_userspace_fabric_link_skipped_malformed_total`.
+- **`FABRIC_LINK_UNRESOLVED_PEER`** — an **empty** peer/local MAC field
+  still awaiting neighbor/interface resolution: the expected transient of
+  the late-resolution `SyncFabricState` path (peer MAC empty until ARP/NDP
+  resolves). Briefly non-zero at startup is normal; a persistently
+  climbing value means a fabric peer is not resolving. Surfaced as
+  `xpf_userspace_fabric_link_unresolved_peer_total`.
+
+Fabric is an HA *optimization*, not enforcement, so a malformed link is
+**skipped-with-visibility, not fail-closed-whole-snapshot** — the rest of
+the forwarding state still applies (a single bad fabric stanza must not
+blackhole the whole dataplane). This mirrors the #3771 M12
+`NEIGHBOR_UNKNOWN_STATE_SKIPPED` diagnostic-atomic pattern.
+
+The counters quantify; a named journal line qualifies. Each build/refresh
+records its skips (by fabric name + reason) in
+`ForwardingState.fabric_skips`, and `log_fabric_skip_transition`
+(`coordinator/mod.rs`, mirroring `log_wg_endpoint_set_transition`) emits
+`fabric skip set changed (<path>): [...] => [...]` **only when the set
+changes** — so a persistently unresolved/malformed fabric logs ONCE when
+it first appears (or changes reason), not on every 30s `SyncFabricState`
+tick or route-churn `bump_fib`. The `snapshot-refresh` path prunes a skip
+whose parent was re-added by the preserved-fabric merge (a link kept from
+the prior resolved set is not reported as skipped).
+
+### L4 — the `update_fabrics` refresh is now persisted
+
+`update_fabrics` (`server/handlers/mod.rs`) was the only mutating control
+verb that neither updated the stored snapshot nor set `persist_state`, so
+a late-resolved peer/local MAC lived **only** in the coordinator's
+in-memory forwarding state. The published state file (read by the Go
+control plane's `show` surface, and the last record a consumer sees) kept
+the stale apply-time (unresolved) fabric MACs.
+
+The handler now folds the freshly-resolved `FabricSnapshot`s into the
+stored snapshot and flags a write **only when the set actually changed**
+— so the 30s periodic refresh does not rewrite the state file on every
+unchanged tick.
+
+**Restart continuity is explicit and is provided by the Go control plane,
+not this file.** The helper starts with `snapshot: None`
+(`server/lifecycle.rs`) and never self-restores from the state file; on
+restart the daemon re-applies the full snapshot and re-runs
+`populateFabricFwd` (500 ms fast retries → 30 s periodic), which
+re-resolves and re-syncs the fabric MACs within seconds. The persisted
+fabric set is therefore the **observability snapshot** (so `show` reflects
+the resolved truth), not the restore source.

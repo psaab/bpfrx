@@ -1681,6 +1681,17 @@ func newCollector(srv *Server) *xpfCollector {
 			"Keys currently held in the per-binding negative neighbor caches, summed across bindings (gauge; lazy-TTL upper bound — an expired entry stays counted until its next access) (#1771 §2.6).",
 			nil, nil,
 		),
+		// #3773 (M13): fabric-link skip diagnostics.
+		fabricLinkSkippedMalformedTotal: prometheus.NewDesc(
+			"xpf_userspace_fabric_link_skipped_malformed_total",
+			"HA cross-chassis fabric links skipped during a forwarding build/refresh because a value was MALFORMED: an invalid parent ifindex, an unparseable peer address, or a non-empty local/peer MAC string that failed to parse. Non-zero (especially climbing) is a fabric config/environment fault an operator must fix; the helper journal names which fabric and why. Before #3773 these were silent (no counter, log, or status) (#3773 M13).",
+			nil, nil,
+		),
+		fabricLinkUnresolvedPeerTotal: prometheus.NewDesc(
+			"xpf_userspace_fabric_link_unresolved_peer_total",
+			"HA cross-chassis fabric links skipped during a forwarding build/refresh because a peer or local MAC was UNRESOLVED: an EMPTY MAC field still awaiting neighbor/interface resolution (the expected late-resolution SyncFabricState transient). Briefly non-zero at startup is normal; a persistently climbing value means a fabric peer is not resolving. A distinct, non-malformed state vs xpf_userspace_fabric_link_skipped_malformed_total (#3773 M13).",
+			nil, nil,
+		),
 		// #1865: per-tunnel WireGuard telemetry. The tunnel label is
 		// the tunnel interface NAME (stable across commits — #1873
 		// positional ids renumber and are never a label). Counters

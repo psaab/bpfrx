@@ -226,34 +226,31 @@ pub(super) fn populate_fabrics(
     iface_ctx: &IfaceIndex,
 ) {
     for fabric in &snapshot.fabrics {
-        if fabric.parent_ifindex <= 0 {
-            continue;
-        }
-        let Ok(peer_addr) = fabric.peer_address.parse::<IpAddr>() else {
-            continue;
-        };
+        // #3773 (M13): resolve the peer address + local/peer MAC through the
+        // build-time iface/neighbor context, then classify the skip-vs-install
+        // decision through the SHARED helper so this snapshot-build path and
+        // the runtime-refresh path (`resolve_fabric_links_from_snapshots`)
+        // stay in lockstep. A skipped link is COUNTED (malformed vs
+        // unresolved-peer) and RECORDED by name in `state.fabric_skips` — no
+        // more silent `continue`.
+        let peer_addr = fabric.peer_address.parse::<IpAddr>().ok();
         let local_mac = parse_mac(&fabric.local_mac)
             .or_else(|| iface_ctx.mac_by_ifindex.get(&fabric.parent_ifindex).copied());
-        let Some(local_mac) = local_mac else {
-            continue;
-        };
-        let peer_mac = parse_mac(&fabric.peer_mac).or_else(|| {
-            state
-                .neighbors
-                .get(&(fabric.overlay_ifindex, peer_addr))
-                .or_else(|| state.neighbors.get(&(fabric.parent_ifindex, peer_addr)))
-                .map(|entry| entry.mac)
+        let peer_mac = peer_addr.and_then(|addr| {
+            parse_mac(&fabric.peer_mac).or_else(|| {
+                state
+                    .neighbors
+                    .get(&(fabric.overlay_ifindex, addr))
+                    .or_else(|| state.neighbors.get(&(fabric.parent_ifindex, addr)))
+                    .map(|entry| entry.mac)
+            })
         });
-        let Some(peer_mac) = peer_mac else {
-            continue;
-        };
-        state.fabrics.push(FabricLink {
-            parent_ifindex: fabric.parent_ifindex,
-            overlay_ifindex: fabric.overlay_ifindex,
-            peer_addr,
-            peer_mac,
-            local_mac,
-        });
+        match crate::afxdp::forwarding::build_fabric_link_or_skip(
+            fabric, peer_addr, local_mac, peer_mac,
+        ) {
+            Ok(link) => state.fabrics.push(link),
+            Err(skip) => state.fabric_skips.push(skip),
+        }
     }
 }
 

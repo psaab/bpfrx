@@ -50,6 +50,27 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitWireguardTelemetry(ch, status)
 	c.emitPolicyContentRejected(ch, status)
 	c.emitRejectObservability(ch, status)
+	c.emitFabricSkipCounters(ch, status)
+}
+
+// emitFabricSkipCounters exposes the #3773 (M13) fabric-link skip
+// diagnostics: a fabric link dropped during a forwarding build/refresh for a
+// MALFORMED value (invalid parent ifindex / unparseable peer address /
+// non-empty unparseable local|peer MAC) vs an UNRESOLVED peer/local MAC (empty
+// MAC awaiting neighbor/interface resolution — the expected SyncFabricState
+// transient). Both emitted unconditionally so a 0 is a real "no fabric
+// skipped" signal rather than an absent series.
+func (c *xpfCollector) emitFabricSkipCounters(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	ch <- prometheus.MustNewConstMetric(
+		c.fabricLinkSkippedMalformedTotal,
+		prometheus.CounterValue,
+		float64(status.FabricLinkSkippedMalformedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.fabricLinkUnresolvedPeerTotal,
+		prometheus.CounterValue,
+		float64(status.FabricLinkUnresolvedPeerTotal),
+	)
 }
 
 // emitRejectObservability exposes the #3657 source-split reject reply

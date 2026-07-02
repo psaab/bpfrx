@@ -20,18 +20,49 @@ impl super::Coordinator {
     /// shared Arc-backed state used by workers, so refreshed fabric links
     /// become visible to workers as soon as the new values are published.
     pub fn refresh_fabric_links(&mut self, snapshots: &[crate::FabricSnapshot]) {
-        let new_fabrics = resolve_fabric_links_from_snapshots(
+        let (new_fabrics, new_skips) = resolve_fabric_links_from_snapshots(
             snapshots,
             &self.forwarding.egress,
             &self.neighbors.dynamic,
         );
-        if !new_fabrics.is_empty() {
+        // Mirror the pre-#3773 gate: only REPLACE the fabric set when at least
+        // one link resolved this pass, so an all-unresolved refresh keeps the
+        // working set (from a prior SyncFabricState) instead of wiping it.
+        let replace = !new_fabrics.is_empty();
+        // #3773 (M13): the skip list is pruned against whichever fabric set is
+        // FINAL — a link kept from the prior resolved set is not reported as
+        // "skipped" for the operator even if THIS pass could not re-resolve it
+        // (its counter already bumped inside the resolver; the pruning only
+        // governs the named status/log surface, not the cumulative atomics).
+        let final_parents: Vec<i32> = if replace {
+            new_fabrics.iter().map(|f| f.parent_ifindex).collect()
+        } else {
+            self.forwarding
+                .fabrics
+                .iter()
+                .map(|f| f.parent_ifindex)
+                .collect()
+        };
+        let pruned: Vec<FabricLinkSkip> = new_skips
+            .into_iter()
+            .filter(|s| !final_parents.contains(&s.parent_ifindex))
+            .collect();
+        log_fabric_skip_transition("fabric-refresh", &self.forwarding.fabric_skips, &pruned);
+        let skips_changed = self.forwarding.fabric_skips != pruned;
+        if replace {
             self.forwarding.fabrics = new_fabrics.clone();
+            self.forwarding.fabric_skips = pruned;
             self.ha.fabrics.store(Arc::new(new_fabrics));
             // Also update shared_forwarding so workers see the new fabric
             // links for fabric redirect resolution. Without this, workers
             // use the snapshot's forwarding state which may have empty fabrics
             // if the peer MAC wasn't resolved at snapshot time.
+            self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+        } else if skips_changed {
+            // Nothing resolved this pass, but the skip diagnostics changed —
+            // publish the updated (named) skip set without disturbing the
+            // preserved working fabric links.
+            self.forwarding.fabric_skips = pruned;
             self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         }
     }
@@ -122,6 +153,9 @@ impl super::Coordinator {
         // may not include them if the peer MAC wasn't resolved at
         // snapshot build time. Always keep the better-resolved set.
         let preserved_fabrics = self.forwarding.fabrics.clone();
+        // #3773 (M13): capture the prior fabric-skip set so the post-merge
+        // transition log fires only when the named skip set actually changes.
+        let old_fabric_skips = self.forwarding.fabric_skips.clone();
         // #3766: build the new forwarding state FIRST, before ANY
         // self-mutation. The policy preflight above only validates
         // POLICY state; a non-policy integrity fault surfaces only here.
@@ -246,6 +280,26 @@ impl super::Coordinator {
                 }
             }
         }
+        // #3773 (M13): the new build's `populate_fabrics` recorded its skips in
+        // `self.forwarding.fabric_skips`. After the preserved-fabric merge
+        // above, prune any skip whose parent is now present in the final
+        // fabric set (a link kept from the prior resolved set is not reported
+        // as skipped), then log the transition against the prior skip set —
+        // once per change, not per route-churn `bump_fib`.
+        let final_parents: Vec<i32> = self
+            .forwarding
+            .fabrics
+            .iter()
+            .map(|f| f.parent_ifindex)
+            .collect();
+        self.forwarding
+            .fabric_skips
+            .retain(|s| !final_parents.contains(&s.parent_ifindex));
+        log_fabric_skip_transition(
+            "snapshot-refresh",
+            &old_fabric_skips,
+            &self.forwarding.fabric_skips,
+        );
         self.shared_validation.store(Arc::new(self.validation));
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         // #1432 S2a (Copilot C1): reconcile WG control threads on every

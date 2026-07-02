@@ -299,6 +299,8 @@ pub(crate) fn run() -> Result<(), String> {
             event_stream_session_create_sent: 0,
             event_stream_session_create_dropped: 0,
             last_cache_flush_at: 0,
+            fabric_link_skipped_malformed_total: 0,
+            fabric_link_unresolved_peer_total: 0,
         },
         snapshot: None,
         afxdp: {

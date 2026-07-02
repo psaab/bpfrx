@@ -167,6 +167,21 @@ next-hops, preference 0). The wire specimen lives in
       snapshot-refresh manager-key set, the `update_neighbors` handler,
       and `parse_neighbor_entries` share the same gate so an installed
       neighbor is never pruned as a stale key.
+    - **Fabric-link skips (#3773 M13).** `build_fabric_link_or_skip` is the
+      SHARED classifier for both fabric-resolution passes
+      (`populate_fabrics` snapshot build, `resolve_fabric_links_from_snapshots`
+      runtime refresh). A skipped fabric link is no longer a silent
+      `continue`: it is counted by the `FABRIC_LINK_SKIPPED_MALFORMED`
+      (invalid parent ifindex / unparseable peer address / non-empty
+      unparseable local|peer MAC) or `FABRIC_LINK_UNRESOLVED_PEER` (empty MAC
+      awaiting neighbor/interface resolution — the expected `SyncFabricState`
+      transient) diagnostic atomic, recorded by name in
+      `ForwardingState.fabric_skips`, and named once-per-change in the journal
+      by `log_fabric_skip_transition`. Both atomics surface in status/Prometheus
+      (`xpf_userspace_fabric_link_{skipped_malformed,unresolved_peer}_total`).
+      Fabric is an HA optimization, so a malformed link is
+      skipped-with-visibility, NOT fail-closed-whole-snapshot. See
+      `docs/fabric-cross-chassis-fwd.md`.
 
 ## Where it sits
 

@@ -1562,6 +1562,52 @@ func TestProcessStatusNeighborPhase3CountersRoundTrip(t *testing.T) {
 	}
 }
 
+// #3773 (M13): wire pin for the fabric-link skip diagnostic counters. The Rust
+// helper serializes these via serde renames in
+// userspace-dp/src/protocol/control.rs; a key rename on either side silently
+// decodes as zero, so pin both tags here and verify the pre-#3773 (keys
+// absent) payload defaults to zero.
+func TestProcessStatusFabricSkipCountersRoundTrip(t *testing.T) {
+	in := ProcessStatus{
+		FabricLinkSkippedMalformedTotal: 4,
+		FabricLinkUnresolvedPeerTotal:   9,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"fabric_link_skipped_malformed_total",
+		"fabric_link_unresolved_peer_total",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from ProcessStatus JSON: %s", key, string(raw))
+		}
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if back.FabricLinkSkippedMalformedTotal != in.FabricLinkSkippedMalformedTotal ||
+		back.FabricLinkUnresolvedPeerTotal != in.FabricLinkUnresolvedPeerTotal {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", back, in)
+	}
+
+	// Pre-#3773 helper payload (keys absent) must decode to zero.
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus: %v", err)
+	}
+	if legacy.FabricLinkSkippedMalformedTotal != 0 || legacy.FabricLinkUnresolvedPeerTotal != 0 {
+		t.Fatalf("legacy decode must zero-default fabric-skip fields: %+v", legacy)
+	}
+}
+
 // #2375: wire pin for the pending_neigh distinct-hop capacity-drop
 // counter. Mirrors the Rust
 // process_status_pending_neigh_capacity_drops_roundtrip test — a rename
