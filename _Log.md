@@ -26740,3 +26740,31 @@ top.
     (existing #2866/#3743 pins updated for new signatures),
     pkg/flowexport/routemask_vrf_test.go (new #3744 RED-on-revert pins),
     pkg/flowexport/README.md (#3744 section + file-layout bullet)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3726 — NAT `appPortsFromSpec` rejects a reversed
+    application port range instead of narrowing it to the low port.
+    Root cause: `appPortsFromSpec` (pkg/dataplane/userspace/nat.go)
+    expanded a `lo-hi` range only when `hi > lo`; the else arm returned
+    `[]int{lo}`, so a REVERSED range ("200-100", lo>hi) silently
+    narrowed to an EXACT match on the low port (200) rather than a
+    never-match. Strict commit rejects lo>hi; this is the #1960
+    tolerant-load / peer-sync backstop (same threat model as
+    #3429/#3437/#3446/#3491). Fix part 1: a reversed range (hi<lo)
+    returns nil (hi==lo still returns the single exact port; valid
+    lo<hi still expands). Fix part 2 (DNAT): the app-term builder lost
+    the "port configured" signal, so a nil port slice fell through to
+    the wildcard match-any-port default (destination_port==0) — a
+    fail-OPEN widening (also hit an out-of-range 70000-80000 app spec).
+    Added `dstPortConfigured` to `appTerm` and OR'd it into
+    `portConfigured` so a configured-but-empty app destination-port
+    fails CLOSED (emits no snapshot). SNAT already failed closed via
+    the #3429/#3491 never-match sentinel. RED-on-revert proven per half:
+    reverting appPortsFromSpec → 3 reversed tests RED; reverting the
+    DNAT guard → DNAT reversed test RED with destination_port=0
+    wildcard. go test ./pkg/dataplane/userspace/ + ./pkg/config/... +
+    ./pkg/dataplane/ green; go build ./... green; gofmt + vet clean.
+  - **File(s)**: pkg/dataplane/userspace/nat.go (appPortsFromSpec
+    reversed-range reject; appTerm.dstPortConfigured + portConfigured
+    guard), pkg/dataplane/userspace/nat_reversed_port_range_3726_test.go
+    (new RED-on-revert pins), docs/userspace-dnat-plan.md (§13b)
