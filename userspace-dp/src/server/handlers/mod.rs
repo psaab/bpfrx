@@ -142,9 +142,12 @@ pub(crate) fn handle_stream(
             "update_neighbors" => {
                 neighbors::update(&mut guard, request.neighbors.as_ref(), neighbor_replace)
             }
-            "bump_fib_generation" => {
-                snapshot::bump_fib(&mut guard, request.snapshot.as_ref(), &mut response)
-            }
+            "bump_fib_generation" => snapshot::bump_fib(
+                &mut guard,
+                request.snapshot.as_ref(),
+                &mut response,
+                &mut persist_state,
+            ),
             "clear_policy_counters" => {
                 guard.afxdp.clear_policy_counters();
                 refresh_status(&mut guard);

@@ -800,11 +800,43 @@ impl Coordinator {
         self.nat_counters.clear();
     }
 
+    /// Current in-memory FIB generation (the value flow-cache lookups
+    /// validate against). Read by the `bump_fib_generation` control handler
+    /// to build a rollback-rejection error and by tests.
+    pub fn fib_generation(&self) -> u32 {
+        self.validation.fib_generation
+    }
+
     /// Bump just the FIB generation counter without a full snapshot rebuild.
     /// Workers will invalidate flow cache entries with stale FIB generations.
-    pub fn bump_fib_generation(&mut self, fib_generation: u32) {
+    ///
+    /// #3767 (H5): flow-cache validation is EQUALITY based, not monotone —
+    /// `flow_cache.rs` treats an entry as stale only when
+    /// `entry.stamp.fib_generation != lookup.fib_generation`. So publishing an
+    /// OLD or reused generation (a stale/duplicate/corrupt control message, or
+    /// a shim counter that was reset to a lower value) would make cache
+    /// entries that a prior bump already invalidated MATCH validation again,
+    /// reviving a forwarding decision after a route withdrawal / failover.
+    ///
+    /// A lightweight route-only overlay bump is monotone by construction on
+    /// the Go side (`Manager.BumpFIBGeneration` increments the shim counter),
+    /// so a value strictly lower than the current in-memory generation is
+    /// never legitimate here — reject it and leave `self.validation` and the
+    /// shared validation Arc untouched. A full-snapshot generation transition
+    /// runs through `refresh_runtime_snapshot`, which assigns `self.validation`
+    /// directly and is intentionally NOT gated by this monotonicity check, so
+    /// a legitimate config-transition reset still lands.
+    ///
+    /// Returns `true` when the bump was applied, `false` when it was refused
+    /// as a rollback.
+    #[must_use]
+    pub fn bump_fib_generation(&mut self, fib_generation: u32) -> bool {
+        if fib_generation < self.validation.fib_generation {
+            return false;
+        }
         self.validation.fib_generation = fib_generation;
         self.shared_validation.store(Arc::new(self.validation));
+        true
     }
 }
 
