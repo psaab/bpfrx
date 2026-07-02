@@ -1,3 +1,68 @@
+## 2026-07-01 — #3755: RPM first probe cycle event reaches event-options
+
+- **Timestamp**: 2026-07-01
+  - **Action**: RPM probes ran their first cycle immediately, before the
+    event-options callback was registered (SetEventCallback ran later at boot),
+    so the first cycle's events were dropped (fireEvent no-op on nil callback).
+    Fix: moved initEventEngine (which registers the RPM event callback) BEFORE
+    the boot applyConfig/reconcileRPM in daemon_run.go — callback wired before
+    probes start. Belt: rpm.Manager buffers events fired while onEvent==nil
+    (bounded maxBufferedEvents) and replays them FIFO on SetEventCallback;
+    added HasEventCallback accessor. RED-on-revert:
+    TestFireEventBufferedUntilCallbackRegistered (rpm) +
+    TestInitEventEngineRegistersRPMCallbackBeforeProbes (daemon).
+  - **File(s)**: pkg/rpm/rpm.go, pkg/rpm/event_buffer_3755_test.go,
+    pkg/rpm/README.md, pkg/daemon/daemon_run.go,
+    pkg/daemon/daemon_eventoptions_reconcile_test.go,
+    pkg/eventengine/README.md
+
+## 2026-07-01 — #3752: event-options engine day-2 first-enable start
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The engine was constructed at boot ONLY when the boot config
+    already had a policy, so enabling the FIRST event-options policy on a
+    running daemon left d.eventEngine nil and the day-2 apply
+    (`if d.eventEngine != nil`) was a silent no-op — inert until restart.
+    Added initEventEngine (construct unconditionally at boot, register RPM
+    callback, write-once pointer, mirrors LLDP/dhcpRelay) + reconcileEventOptions
+    (Apply on boot and every day-2 commit). applyConfigLocked step 17 and the
+    boot block now call these. Engine.PolicyCount accessor for the tests.
+    RED-on-revert: TestInitEventEngineConstructsUnconditionally /
+    TestReconcileEventOptionsDay2Enable.
+  - **File(s)**: pkg/eventengine/engine.go (PolicyCount),
+    pkg/daemon/daemon_apply.go (initEventEngine, reconcileEventOptions, step 17),
+    pkg/daemon/daemon_run.go (boot wiring),
+    pkg/daemon/daemon_eventoptions_reconcile_test.go (new)
+
+## 2026-07-01 — #3754: event-options remediation commit audit description
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Autonomous remediation committed with an empty comment, so the
+    mutation was unattributed in commit/rollback history. plannedAction now
+    carries the triggering event/owner/test (stamped in HandleEvent);
+    applyOnce builds `event-options policy <name>: <event>/<owner>/<test>
+    (<n> commands)` via remediationDescription and threads it into commitFn
+    AND the standalone CommitWithDescription branch. RED-on-revert test:
+    TestRemediation_CommitCarriesAuditDescription.
+  - **File(s)**: pkg/eventengine/engine.go,
+    pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md
+
+## 2026-07-01 — #3753: event-options attributes-match honors event-name prefix
+
+- **Timestamp**: 2026-07-01
+  - **Action**: attributes-match parsing dropped the `<event>.` prefix, so a
+    constraint written for one event of a multi-event policy gated EVERY event.
+    `ParseEventAttributesMatch` now returns eventName; the runtime matcher
+    (`attributesMatch`) skips a constraint whose event prefix != the current
+    event, and the strict commit validator rejects a prefix not in the
+    policy's events. RED-on-revert tests: eventengine
+    TestAttributesMatch_EventNamePrefixScopesConstraint /
+    _PerEventScopingBothDirections; config
+    TestValidateEventAttributesMatchStrict_EventNameScope.
+  - **File(s)**: pkg/config/event_options_match.go,
+    pkg/config/event_options_match_test.go, pkg/eventengine/engine.go,
+    pkg/eventengine/engine_test.go, pkg/eventengine/README.md
+
 ## 2026-07-01 — #3739: DDNS Surface A value-specific self-owned publish
 
 - **Timestamp**: 2026-07-01

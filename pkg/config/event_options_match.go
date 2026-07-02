@@ -43,28 +43,35 @@ func EventAttributesFieldKnown(field string) bool {
 }
 
 // ParseEventAttributesMatch splits a raw attributes-match line of the form
-// "<event>.<field> matches <pattern>" into its field name and regex pattern.
-// It returns ok=false when the line is not a well-formed match expression
-// (no " matches " separator, or no "." in the field spec). The returned
-// field is the last dot-separated component of the left-hand side (the
-// attribute name), mirroring the event_name.attribute Junos spelling.
-func ParseEventAttributesMatch(attr string) (field, pattern string, ok bool) {
+// "<event>.<field> matches <pattern>" into its event name, field name, and
+// regex pattern. It returns ok=false when the line is not a well-formed match
+// expression (no " matches " separator, or no "." in the field spec). The
+// returned field is the LAST dot-separated component of the left-hand side
+// (the attribute name); eventName is everything BEFORE it — the event this
+// constraint is scoped to, per the Junos event_name.attribute spelling.
+//
+// #3753: the event-name prefix was previously discarded, so a constraint
+// written for one event of a multi-event policy incorrectly gated EVERY event
+// in the policy. Callers that scope by event (the runtime matcher, the strict
+// commit validator) now honor eventName.
+func ParseEventAttributesMatch(attr string) (eventName, field, pattern string, ok bool) {
 	parts := strings.SplitN(attr, eventAttributesMatchSep, 2)
 	if len(parts) != 2 {
-		return "", "", false
+		return "", "", "", false
 	}
 	fieldSpec := strings.TrimSpace(parts[0])
 	pattern = strings.TrimSpace(parts[1])
 
 	dotIdx := strings.LastIndex(fieldSpec, ".")
 	if dotIdx < 0 {
-		return "", "", false
+		return "", "", "", false
 	}
+	eventName = strings.TrimSpace(fieldSpec[:dotIdx])
 	field = fieldSpec[dotIdx+1:]
-	if field == "" || pattern == "" {
-		return "", "", false
+	if eventName == "" || field == "" || pattern == "" {
+		return "", "", "", false
 	}
-	return field, pattern, true
+	return eventName, field, pattern, true
 }
 
 // EventAttributesMatchPattern returns the regex pattern of a well-formed
@@ -72,8 +79,20 @@ func ParseEventAttributesMatch(attr string) (field, pattern string, ok bool) {
 // ParseEventAttributesMatch for callers that only need the pattern (e.g.
 // building the engine's compiled-regex cache).
 func EventAttributesMatchPattern(attr string) (pattern string, ok bool) {
-	_, pattern, ok = ParseEventAttributesMatch(attr)
+	_, _, pattern, ok = ParseEventAttributesMatch(attr)
 	return pattern, ok
+}
+
+// eventNameInPolicy reports whether eventName is one of the policy's declared
+// events (#3753). An attributes-match line scoped to an event the policy does
+// not list can never apply, so the strict commit validator rejects it.
+func eventNameInPolicy(eventName string, events []string) bool {
+	for _, e := range events {
+		if e == eventName {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateEventAttributesMatch checks that every event-options policy
@@ -110,6 +129,10 @@ func ValidateEventAttributesMatch(cfg *Config) error {
 //     <pattern>" (no " matches " separator, or no "." in the left-hand
 //     field spec). The lenient/runtime code previously skipped such a line,
 //     silently DROPPING the constraint and broadening the policy.
+//   - an <event> prefix that is not one of the policy's declared events
+//     (#3753). A constraint scoped to an event the policy never lists can
+//     never apply; left unchecked (and combined with the old prefix-dropping
+//     parse) it silently gated the wrong event.
 //   - a <field> name not in EventAttributesKnownFields (a typo such as
 //     "test-ower"). An unknown field can never be satisfied against an
 //     rpm.Event, so the matcher dropped it and broadened the policy.
@@ -127,12 +150,18 @@ func ValidateEventAttributesMatchStrict(cfg *Config) error {
 			continue
 		}
 		for _, attr := range pol.AttributesMatch {
-			field, pattern, ok := ParseEventAttributesMatch(attr)
+			eventName, field, pattern, ok := ParseEventAttributesMatch(attr)
 			if !ok {
 				return fmt.Errorf(
 					"event-options policy %q attributes-match %q: malformed match "+
 						"expression (expected \"<event>.<field> matches <pattern>\")",
 					pol.Name, attr)
+			}
+			if !eventNameInPolicy(eventName, pol.Events) {
+				return fmt.Errorf(
+					"event-options policy %q attributes-match %q: event %q is not one "+
+						"of the policy's events %v (the constraint would never apply)",
+					pol.Name, attr, eventName, pol.Events)
 			}
 			if !EventAttributesFieldKnown(field) {
 				return fmt.Errorf(

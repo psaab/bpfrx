@@ -136,7 +136,14 @@ type plannedAction struct {
 	// the evaluate that enqueued this action. The worker drops the action if the
 	// live revision no longer matches (policy redefined) or is absent (removed).
 	semRev string
-	ops    []plannedOp
+	// Triggering-event context, captured at evaluate time so the worker can
+	// stamp a deterministic audit description on the remediation commit (#3754).
+	// A security appliance that mutates its own config autonomously must record
+	// in commit/rollback history WHICH policy fired and WHY.
+	event     string
+	testOwner string
+	testName  string
+	ops       []plannedOp
 }
 
 // triggeredPolicy pairs a policy that should fire with the semantic revision its
@@ -424,8 +431,16 @@ func (e *Engine) HandleEvent(ev rpm.Event) {
 		}
 		// Stamp the action with the policy's semantic revision as of this
 		// evaluate (#3750) so the worker can revalidate it against live engine
-		// state before committing.
-		e.enqueue(plannedAction{policyName: tp.pol.Name, semRev: tp.semRev, ops: ops})
+		// state before committing, plus the triggering-event context (#3754)
+		// for the remediation commit's audit description.
+		e.enqueue(plannedAction{
+			policyName: tp.pol.Name,
+			semRev:     tp.semRev,
+			event:      ev.Name,
+			testOwner:  ev.TestOwner,
+			testName:   ev.TestName,
+			ops:        ops,
+		})
 	}
 }
 
@@ -447,6 +462,16 @@ func (e *Engine) Close() {
 		}
 	})
 	e.workerWG.Wait()
+}
+
+// PolicyCount returns the number of event-options policies the engine
+// currently has loaded. It is the observable seam for the daemon reconcile
+// tests (#3752): after the first policy is enabled on a running daemon the
+// engine must hold it, so a day-2 enable actually takes effect.
+func (e *Engine) PolicyCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.policies)
 }
 
 // Stats returns a snapshot of the observable counters (#2157), surfaced to
@@ -691,21 +716,37 @@ func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
 		return errBatch("commit-check: %v", err)
 	}
 
+	// #3754: stamp a deterministic audit description so the autonomous
+	// remediation lands in commit/rollback history attributed to the policy and
+	// its triggering event, not as an anonymous unattributed commit.
+	desc := remediationDescription(a)
 	if e.commitFn == nil {
-		// Standalone (tests): just commit; no apply.
-		if _, err := e.store.Commit(); err != nil {
+		// Standalone (tests): just commit; no apply. Still record the
+		// description so the journal/history attribution is identical to the
+		// daemon path.
+		if _, err := e.store.CommitWithDescription(desc); err != nil {
 			e.store.ExitConfigure()
 			return errBatch("commit: %v", err)
 		}
 		e.store.ExitConfigure()
 		return nil
 	}
-	if _, err := e.commitFn(ctx, ""); err != nil {
+	if _, err := e.commitFn(ctx, desc); err != nil {
 		e.store.ExitConfigure()
 		return errBatch("commit: %v", err)
 	}
 	e.store.ExitConfigure()
 	return nil
+}
+
+// remediationDescription builds the deterministic audit string stamped on an
+// autonomous event-options remediation commit (#3754). It names the policy,
+// the triggering event/owner/test, and the command-batch size so an operator
+// reading commit/rollback history can tell which policy mutated the config and
+// why.
+func remediationDescription(a plannedAction) string {
+	return fmt.Sprintf("event-options policy %s: %s/%s/%s (%d commands)",
+		a.policyName, a.event, a.testOwner, a.testName, len(a.ops))
 }
 
 // errBatch builds a permanent (non-retryable) batch failure error.
@@ -899,11 +940,22 @@ func (e *Engine) eventMatches(pol *config.EventPolicy, ev rpm.Event) bool {
 // by the boot-time lenient-compile warning plus the AttributesInvalid counter.
 func (e *Engine) attributesMatch(pol *config.EventPolicy, ev rpm.Event) bool {
 	for _, attr := range pol.AttributesMatch {
-		field, pattern, ok := config.ParseEventAttributesMatch(attr)
+		eventName, field, pattern, ok := config.ParseEventAttributesMatch(attr)
 		if !ok {
 			// Malformed line that slipped through a lenient load: fail closed.
 			e.flagAttributesInvalid(pol.Name, attr, "malformed match expression")
 			return false
+		}
+
+		// #3753: the constraint is scoped to a specific event name. Only apply
+		// it when the CURRENT event IS that event; a constraint written for a
+		// DIFFERENT event of a multi-event policy must NOT gate this event
+		// (before this the prefix was dropped, so `event_a.test-owner ...`
+		// incorrectly gated event_b too — and vice-versa). Commit-time
+		// validation guarantees eventName is one of the policy's events, so an
+		// out-of-scope prefix here can only be a legacy lenient-load config.
+		if eventName != ev.Name {
+			continue
 		}
 
 		if !config.EventAttributesFieldKnown(field) {
