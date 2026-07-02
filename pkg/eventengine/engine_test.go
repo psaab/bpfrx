@@ -170,6 +170,72 @@ func TestAttributesMatch_RegexCachedAtApply(t *testing.T) {
 	}
 }
 
+// #3753: an attributes-match constraint carries an event-name prefix that
+// SCOPES it to a single event of a multi-event policy. The constraint must
+// apply ONLY when the current event is that event; a constraint written for
+// event_a must NOT gate event_b (and vice-versa).
+//
+// RED-on-revert: before the fix the parser dropped the "event_a." prefix, so
+// attributesMatch applied the test-owner=^owner$ constraint to EVERY event.
+// event_b arriving with test-owner="other" would then be rejected (the
+// event_a-scoped constraint wrongly gated it) — this test's event_b/other
+// assertion goes RED.
+func TestAttributesMatch_EventNamePrefixScopesConstraint(t *testing.T) {
+	pol := &config.EventPolicy{
+		Name:            "p",
+		Events:          []string{"event_a", "event_b"},
+		AttributesMatch: []string{"event_a.test-owner matches ^owner$"},
+	}
+	e := newTestEngine(t, []*config.EventPolicy{pol})
+
+	// event_a IS scoped by the constraint.
+	if !e.attributesMatch(pol, rpm.Event{Name: "event_a", TestOwner: "owner"}) {
+		t.Error("event_a with matching owner must match (constraint applies to event_a)")
+	}
+	if e.attributesMatch(pol, rpm.Event{Name: "event_a", TestOwner: "other"}) {
+		t.Error("event_a with non-matching owner must NOT match (constraint gates event_a)")
+	}
+
+	// event_b is NOT scoped by an event_a constraint: it must pass regardless
+	// of the test-owner value. This is the discriminating assertion.
+	if !e.attributesMatch(pol, rpm.Event{Name: "event_b", TestOwner: "other"}) {
+		t.Error("event_b must NOT be gated by an event_a-scoped constraint (#3753)")
+	}
+	if !e.attributesMatch(pol, rpm.Event{Name: "event_b", TestOwner: "owner"}) {
+		t.Error("event_b must match irrespective of an event_a-scoped constraint (#3753)")
+	}
+}
+
+// #3753 vice-versa: with a constraint scoped to each of two events, each
+// constraint gates ONLY its own event.
+func TestAttributesMatch_PerEventScopingBothDirections(t *testing.T) {
+	pol := &config.EventPolicy{
+		Name:   "p",
+		Events: []string{"event_a", "event_b"},
+		AttributesMatch: []string{
+			"event_a.test-owner matches ^a-owner$",
+			"event_b.test-name matches ^b-name$",
+		},
+	}
+	e := newTestEngine(t, []*config.EventPolicy{pol})
+
+	// event_a is gated by the a-owner constraint only; the b-name constraint
+	// (scoped to event_b) must be skipped for event_a.
+	if !e.attributesMatch(pol, rpm.Event{Name: "event_a", TestOwner: "a-owner", TestName: "irrelevant"}) {
+		t.Error("event_a must match on the a-owner constraint alone; the event_b constraint must not apply")
+	}
+	if e.attributesMatch(pol, rpm.Event{Name: "event_a", TestOwner: "wrong"}) {
+		t.Error("event_a with wrong owner must be gated")
+	}
+	// event_b is gated by the b-name constraint only.
+	if !e.attributesMatch(pol, rpm.Event{Name: "event_b", TestOwner: "irrelevant", TestName: "b-name"}) {
+		t.Error("event_b must match on the b-name constraint alone; the event_a constraint must not apply")
+	}
+	if e.attributesMatch(pol, rpm.Event{Name: "event_b", TestName: "wrong"}) {
+		t.Error("event_b with wrong name must be gated")
+	}
+}
+
 // Multiple attributes-match lines must ALL match (AND semantics) — one
 // failing constraint blocks the policy.
 func TestAttributesMatch_AllMustMatch(t *testing.T) {

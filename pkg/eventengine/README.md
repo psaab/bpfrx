@@ -126,6 +126,18 @@ triggering on a **regex** match of `<pattern>` against the event attribute
   `config.EventAttributesKnownFields` (the single source of truth consumed by
   both the commit-time validator and the runtime matcher — a drift-guard test
   keeps them identical).
+- **Event-name scoping (#3753):** the `<event>.` prefix scopes the constraint
+  to a single event of a multi-event policy. The runtime matcher applies a
+  constraint ONLY when the current event equals its prefix, so
+  `attributes-match "event_a.test-owner matches ^X$"` on a policy with
+  `events [ event_a event_b ]` gates event_a alone and leaves event_b
+  unconstrained (and vice-versa). Before this the prefix was dropped and the
+  constraint gated EVERY event. The strict commit validator additionally
+  rejects a prefix that is not one of the policy's declared events (it could
+  never apply). Regression-locked by
+  `TestAttributesMatch_EventNamePrefixScopesConstraint` /
+  `TestAttributesMatch_PerEventScopingBothDirections` (eventengine) and
+  `TestValidateEventAttributesMatchStrict_EventNameScope` (config).
 - **Strict at commit (#2141):** `config.ValidateEventAttributesMatchStrict`
   rejects at commit not only an uncompilable regex (#2008 M7) but also a
   malformed line (no ` matches ` / no `.`) and an unknown `<field>` name. These

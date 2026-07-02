@@ -1,3 +1,19 @@
+## 2026-07-01 — #3753: event-options attributes-match honors event-name prefix
+
+- **Timestamp**: 2026-07-01
+  - **Action**: attributes-match parsing dropped the `<event>.` prefix, so a
+    constraint written for one event of a multi-event policy gated EVERY event.
+    `ParseEventAttributesMatch` now returns eventName; the runtime matcher
+    (`attributesMatch`) skips a constraint whose event prefix != the current
+    event, and the strict commit validator rejects a prefix not in the
+    policy's events. RED-on-revert tests: eventengine
+    TestAttributesMatch_EventNamePrefixScopesConstraint /
+    _PerEventScopingBothDirections; config
+    TestValidateEventAttributesMatchStrict_EventNameScope.
+  - **File(s)**: pkg/config/event_options_match.go,
+    pkg/config/event_options_match_test.go, pkg/eventengine/engine.go,
+    pkg/eventengine/engine_test.go, pkg/eventengine/README.md
+
 ## 2026-07-01 — #3739: DDNS Surface A value-specific self-owned publish
 
 - **Timestamp**: 2026-07-01

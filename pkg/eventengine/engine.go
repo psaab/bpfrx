@@ -899,11 +899,22 @@ func (e *Engine) eventMatches(pol *config.EventPolicy, ev rpm.Event) bool {
 // by the boot-time lenient-compile warning plus the AttributesInvalid counter.
 func (e *Engine) attributesMatch(pol *config.EventPolicy, ev rpm.Event) bool {
 	for _, attr := range pol.AttributesMatch {
-		field, pattern, ok := config.ParseEventAttributesMatch(attr)
+		eventName, field, pattern, ok := config.ParseEventAttributesMatch(attr)
 		if !ok {
 			// Malformed line that slipped through a lenient load: fail closed.
 			e.flagAttributesInvalid(pol.Name, attr, "malformed match expression")
 			return false
+		}
+
+		// #3753: the constraint is scoped to a specific event name. Only apply
+		// it when the CURRENT event IS that event; a constraint written for a
+		// DIFFERENT event of a multi-event policy must NOT gate this event
+		// (before this the prefix was dropped, so `event_a.test-owner ...`
+		// incorrectly gated event_b too — and vice-versa). Commit-time
+		// validation guarantees eventName is one of the policy's events, so an
+		// out-of-scope prefix here can only be a legacy lenient-load config.
+		if eventName != ev.Name {
+			continue
 		}
 
 		if !config.EventAttributesFieldKnown(field) {
