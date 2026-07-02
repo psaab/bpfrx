@@ -1,3 +1,34 @@
+## 2026-07-02 — #3719: review MAJOR fix — quarantine scrub must drop scoped-global match-zones
+
+- **Timestamp**: 2026-07-02
+  - **Action**: Hostile review of PR #3837 found a boot-brick defeating the
+    #1960 no-brick intent. `quarantineCollidingZones` dropped policies only by
+    `FromZone`/`ToZone`, but a GLOBAL policy keeps `FromZone/ToZone ==
+    "junos-global"` and carries its concrete match-zone out-of-band in
+    `MatchFromZone`/`MatchToZone` (#3148, policies.go:416-417). A config with a
+    StableZoneID collision AND a scoped global policy `match from-zone <the
+    quarantined zone>` survived the scrub with a dangling match-zone; the Rust
+    `build_global_zone_scope` (policy.rs:1071-1077) resolves every rule's
+    match-zone → `UnresolvableZoneReference` → `?` → WHOLE-snapshot reject →
+    default-deny brick on fresh boot. Fixed: the policy drop loop now also drops
+    a policy when `MatchFromZone` OR `MatchToZone` is quarantined (empty and
+    "junos-global" are never quarantine keys, so inert for zone-pair/unscoped).
+    Added Go regressions `TestQuarantineDropsScopedGlobalPolicyOnQuarantinedZone`
+    + `TestBuildSnapshotDropsDanglingGlobalMatchZone` (both RED-on-revert when
+    the match-zone check is removed) and Rust regressions through
+    `build_forwarding_state`:
+    `build_forwarding_state_global_policy_with_unresolvable_match_zone_bricks`
+    (dangling match-zone → UnresolvableZoneReference = the brick the scrub
+    prevents) + `build_forwarding_state_global_policy_scoped_to_published_zone_builds`
+    (post-scrub shape builds clean). Lifeline caveat (secondary, non-blocking):
+    left the quarantine loser a pure function of the sorted name (HA-symmetric,
+    reused by lifeline-context-free reverse-map callers) — a quarantined mgmt
+    zone does NOT strand management because lifeline interfaces (fxp0/em0/fab*)
+    never reach the AF_XDP local-delivery classifier (#3682) + loud alarm.
+  - **File(s)**: pkg/dataplane/userspace/zones.go,
+    pkg/dataplane/userspace/zones_collision_3719_test.go,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs, _Log.md
+
 ## 2026-07-01 — #3719: lenient StableZoneID collision quarantine (zone-isolation fail-closed)
 
 - **Timestamp**: 2026-07-01

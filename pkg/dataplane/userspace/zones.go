@@ -1017,6 +1017,16 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	// Unzone interfaces bound to a quarantined zone. An unzoned interface
 	// matches no zone policy -> default-deny (fail closed), and it removes the
 	// dangling interface->zone reference from the snapshot.
+	//
+	// Lifeline note (#3719 review, secondary): if the operator's management zone
+	// happens to be the later-sorting collider it is quarantined and its
+	// interfaces are unzoned. This does NOT strand management, because lifeline
+	// interfaces (fxp0/em0/fab*) never reach the AF_XDP local-delivery
+	// classifier (#3682) — their host-bound traffic is served by the kernel
+	// path regardless of zone — and the loud operator alarm names both zones. We
+	// deliberately keep the quarantine loser purely a function of the sorted
+	// name (HA-symmetric, and reused by the reverse-map callers that have no
+	// lifeline context) rather than making it lifeline-aware.
 	for i := range snap.Interfaces {
 		if _, drop := quarantined[snap.Interfaces[i].Zone]; drop {
 			snap.Interfaces[i].Zone = ""
@@ -1024,15 +1034,28 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	}
 	// Drop policies whose from/to zone is quarantined so the snapshot carries no
 	// dangling policy->zone reference (which the Rust UnresolvableZoneReference
-	// preflight would reject wholesale). A global rule keeps FromZone/ToZone ==
-	// "junos-global" and is never quarantined.
+	// preflight would reject wholesale — a whole-snapshot brick on a fresh boot,
+	// the exact failure this quarantine exists to prevent). This MUST include a
+	// scoped GLOBAL policy's out-of-band match-zone: a global rule keeps
+	// FromZone/ToZone == "junos-global" (never quarantined) but carries its
+	// concrete `match from-zone`/`to-zone` in MatchFromZone/MatchToZone (#3148,
+	// policies.go). The Rust build_global_zone_scope resolves those against the
+	// published zone table for EVERY rule, so a global policy scoped to a
+	// quarantined zone would leave a dangling match-zone and brick the snapshot
+	// (#3719 review). Empty ("" — the zone-pair case) and "junos-global" are
+	// never keys in the quarantine set, so they never match here.
 	if len(snap.Policies) > 0 {
+		refsQuarantinedZone := func(p PolicyRuleSnapshot) bool {
+			for _, z := range [...]string{p.FromZone, p.ToZone, p.MatchFromZone, p.MatchToZone} {
+				if _, drop := quarantined[z]; drop {
+					return true
+				}
+			}
+			return false
+		}
 		keptPol := snap.Policies[:0]
 		for _, p := range snap.Policies {
-			if _, drop := quarantined[p.FromZone]; drop {
-				continue
-			}
-			if _, drop := quarantined[p.ToZone]; drop {
+			if refsQuarantinedZone(p) {
 				continue
 			}
 			keptPol = append(keptPol, p)

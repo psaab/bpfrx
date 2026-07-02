@@ -1924,6 +1924,84 @@ fn build_forwarding_state_reserved_duplicate_ids_are_not_collisions() {
     assert!(state.zone_name_to_id.get("resv-b").is_none());
 }
 
+/// #3719 review MAJOR: a scoped `junos-global` policy carries its concrete
+/// match-zone out-of-band in `match_from_zone`/`match_to_zone`. If the Go
+/// quarantine's match-zone scrub were reverted, a global policy referencing the
+/// QUARANTINED (dropped) zone would reach the helper with a dangling match-zone;
+/// `build_global_zone_scope` resolves it against the published zone table, misses,
+/// and returns `UnresolvableZoneReference` (#3402), which propagates via `?` and
+/// rejects the WHOLE snapshot — a fresh-boot brick, the exact failure the
+/// quarantine exists to prevent. This pins that boundary behavior: the Go scrub
+/// MUST drop such a policy so this dangling reference never reaches the wire.
+#[test]
+fn build_forwarding_state_global_policy_with_unresolvable_match_zone_bricks() {
+    let snapshot = ConfigSnapshot {
+        // z214 was quarantined/dropped; only the survivor z174 is published.
+        zones: vec![crate::ZoneSnapshot {
+            name: "z174".into(),
+            id: 53547,
+            ..Default::default()
+        }],
+        policies: vec![crate::PolicyRuleSnapshot {
+            name: "g-scoped-quarantined".into(),
+            from_zone: "junos-global".into(),
+            to_zone: "junos-global".into(),
+            match_from_zone: "z214".into(), // dangling — not in the zone table
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            action: "permit".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("a dangling global match-zone must fail the snapshot closed");
+    match err {
+        crate::policy::SnapshotIntegrityError::UnresolvableZoneReference { zone, .. } => {
+            assert_eq!(zone, "z214");
+        }
+        other => panic!("expected UnresolvableZoneReference, got {other:?}"),
+    }
+}
+
+/// The clean post-quarantine shape: the z214-scoped global policy was dropped by
+/// the Go quarantine, leaving only a global policy scoped to the SURVIVING zone
+/// z174. `build_forwarding_state` resolves it and builds with no
+/// `SnapshotIntegrityError` — no brick. Together with the test above this is the
+/// end-to-end guard: the scrubbed snapshot builds; the un-scrubbed one rejects.
+#[test]
+fn build_forwarding_state_global_policy_scoped_to_published_zone_builds() {
+    let snapshot = ConfigSnapshot {
+        zones: vec![crate::ZoneSnapshot {
+            name: "z174".into(),
+            id: 53547,
+            ..Default::default()
+        }],
+        policies: vec![crate::PolicyRuleSnapshot {
+            name: "g-scoped-survivor".into(),
+            from_zone: "junos-global".into(),
+            to_zone: "junos-global".into(),
+            match_from_zone: "z174".into(),
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            action: "permit".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect("a global policy scoped to a published zone must build without a brick");
+    assert_eq!(state.zone_name_to_id.get("z174").copied(), Some(53547));
+}
+
 /// #921: ifindex_to_zone_id is populated at config build time
 /// from the snapshot's per-interface zone NAME via zone_name_to_id.
 #[test]

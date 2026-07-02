@@ -151,6 +151,99 @@ func TestBuildSnapshotQuarantinesCollidingZone(t *testing.T) {
 	}
 }
 
+// TestQuarantineDropsScopedGlobalPolicyOnQuarantinedZone (review MAJOR): a
+// GLOBAL policy keeps FromZone/ToZone == "junos-global" but carries its concrete
+// `match from-zone`/`to-zone` out-of-band in MatchFromZone/MatchToZone (#3148).
+// If the match-zone is the quarantined zone, the scrub MUST drop the policy too
+// — otherwise a dangling match-zone reaches the Rust build_global_zone_scope,
+// which returns UnresolvableZoneReference and rejects the WHOLE snapshot (a
+// fresh-boot brick, the exact failure the quarantine prevents). RED-on-revert:
+// without the MatchFromZone/MatchToZone check the two global rules survive.
+func TestQuarantineDropsScopedGlobalPolicyOnQuarantinedZone(t *testing.T) {
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	snap := &ConfigSnapshot{
+		Zones: []ZoneSnapshot{
+			{Name: "z174", ID: config.StableZoneID("z174")},
+			{Name: "z214", ID: config.StableZoneID("z214")},
+		},
+		Policies: []PolicyRuleSnapshot{
+			{Name: "g-scoped-from-quarantined", FromZone: "junos-global", ToZone: "junos-global", MatchFromZone: "z214"},
+			{Name: "g-scoped-to-quarantined", FromZone: "junos-global", ToZone: "junos-global", MatchToZone: "z214"},
+			{Name: "g-scoped-survivor", FromZone: "junos-global", ToZone: "junos-global", MatchFromZone: "z174"},
+			{Name: "g-unscoped", FromZone: "junos-global", ToZone: "junos-global"},
+		},
+	}
+	quarantineCollidingZones(snap)
+
+	// No published policy may reference the quarantined zone in ANY zone slot —
+	// including the out-of-band global match-zone.
+	published := map[string]uint16{}
+	for _, z := range snap.Zones {
+		published[z.Name] = z.ID
+	}
+	for _, p := range snap.Policies {
+		for _, z := range []string{p.MatchFromZone, p.MatchToZone} {
+			if z == "" {
+				continue
+			}
+			if _, ok := published[z]; !ok {
+				t.Fatalf("policy %q keeps a dangling match-zone %q absent from published zones — Rust build_global_zone_scope would brick the snapshot", p.Name, z)
+			}
+		}
+	}
+	kept := map[string]bool{}
+	for _, p := range snap.Policies {
+		kept[p.Name] = true
+	}
+	if kept["g-scoped-from-quarantined"] || kept["g-scoped-to-quarantined"] {
+		t.Fatalf("a global policy scoped to the quarantined zone survived: %v", kept)
+	}
+	if !kept["g-scoped-survivor"] || !kept["g-unscoped"] {
+		t.Fatalf("a non-colliding global policy was wrongly dropped: %v", kept)
+	}
+}
+
+// TestBuildSnapshotDropsDanglingGlobalMatchZone drives the REAL publish path: a
+// config with a StableZoneID collision AND a scoped global policy whose
+// `match from-zone` is the quarantined zone must yield a snapshot with NO policy
+// referencing an unpublished zone (so feeding it to the Rust preflight cannot
+// brick). RED-on-revert: without the match-zone scrub the built snapshot carries
+// a global rule whose MatchFromZone == "z214" (dropped from Zones).
+func TestBuildSnapshotDropsDanglingGlobalMatchZone(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"z174": {Name: "z174"},
+		"z214": {Name: "z214"},
+	}
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		{
+			Name:   "g-scoped-quarantined",
+			Match:  config.PolicyMatch{FromZone: "z214", Applications: []string{"any"}},
+			Action: config.PolicyPermit,
+		},
+	}
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 0, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	published := map[string]bool{}
+	for _, z := range snap.Zones {
+		published[z.Name] = true
+	}
+	for _, p := range snap.Policies {
+		for _, z := range []string{p.FromZone, p.ToZone, p.MatchFromZone, p.MatchToZone} {
+			if z == "" || z == "junos-global" {
+				continue
+			}
+			if !published[z] {
+				t.Fatalf("published policy %q references unpublished zone %q — the Rust preflight would reject the whole snapshot (brick)", p.Name, z)
+			}
+		}
+	}
+}
+
 // TestBuildSnapshotNoCollisionPublishesAll: the common case is untouched — an
 // ordinary distinct-folding zone set publishes every zone and records no
 // collision (no false positive).
