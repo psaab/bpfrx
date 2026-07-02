@@ -207,6 +207,31 @@ type ownedRecord struct {
 	// from the JSON when false; an absent value (older stores, fully-published
 	// records) degrades to "settled", the safe default.
 	PTRPending bool `json:"ptr_pending,omitempty"`
+	// BackendFingerprint is a STABLE, NON-SECRET fingerprint of the provider
+	// backend ENDPOINT this record was published through (#3735): a hash of the
+	// backend TYPE + server/host + zone + hosted-zone + region + generic URL
+	// template, computed by backendFingerprint (surface_a.go). It carries NO
+	// credentials (TSIGSecret / Password / APIToken / AWSSecretAccessKey are all
+	// config.Secret and are deliberately excluded), so persisting it does NOT
+	// reopen the #2053 plaintext-secret-on-disk disclosure class — nothing
+	// sensitive is ever hashed in or written out.
+	//
+	// Its sole purpose is to make a provider IDENTITY change DETECTABLE so the
+	// old record is not silently mishandled: a provider RENAME to a different
+	// endpoint (H01), an in-place server/zone edit under the same provider name
+	// (H02), or a removed-binding withdraw after a provider edit (H03). When the
+	// stored fingerprint no longer matches the current provider's, the record was
+	// published at a DIFFERENT endpoint than the one now configured for the same
+	// scope/name — so it cannot be adopted-in-place, overwritten, or withdrawn
+	// through the current catalog without either losing cleanup authority or
+	// deleting at the WRONG endpoint. The reconciler then KEEPS ownership and
+	// raises a loud operator alarm (auto-withdrawal of the old endpoint is
+	// DEFERRED — the old creds are redacted config.Secret and the old endpoint is
+	// usually decommissioned; see the pkg/ddns README + #3735). Omitted from the
+	// JSON when empty; an absent value (a pre-#3735 store, or a nil-provider test)
+	// degrades to "unknown" and is compared as "cannot determine a mismatch" —
+	// never a false alarm.
+	BackendFingerprint string `json:"backend_fingerprint,omitempty"`
 	// Scope is the ScopeKey this record belongs to (#2691 P1b, plan §5.4). It
 	// is the per-family / per-interface / per-RG / per-routing-instance scope
 	// the record was published under, so two scopes for the same name+address

@@ -196,9 +196,15 @@ func TestSurfaceARealBackendWithdrawOnConfigRemoval(t *testing.T) {
 	}
 }
 
-// MINOR M1: if the provider was removed from the catalog too, withdraw cannot
-// reach the wire — it must NOT claim success (no DeleteOK), must NOT drop
-// ownership (keep the RR cleanable), and must surface an error.
+// MINOR M1 + #3735: if the provider was removed from the catalog too
+// (rename/removal), the withdraw cannot reach the old endpoint. It must still NOT
+// claim success (no DeleteOK) and NOT drop ownership (keep the RR cleanable), but
+// pre-#3735 it churned a recurring reconcile error every sweep. #3735 recognizes
+// this as a TERMINAL orphan: a single loud operator alarm fires (Stats.Orphaned +
+// a SurfaceAStateOrphaned status row) and the wire delete is not re-attempted —
+// the record stays owned and operator-visible for MANUAL cleanup (auto-withdrawal
+// is deferred: the old creds are redacted config.Secret and the old endpoint is
+// usually decommissioned).
 func TestSurfaceARealBackendWithdrawNoProviderKeepsOwnership(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	srv.setStateful(true)
@@ -209,11 +215,19 @@ func TestSurfaceARealBackendWithdrawNoProviderKeepsOwnership(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 	// Binding AND provider both gone: empty scopes + empty catalog.
-	if err := m.Reconcile(context.Background(), nil, fixedObserver("203.0.113.5"), nil, map[string]*config.DDNSProvider{}); err == nil {
-		t.Fatal("withdraw with no resolvable provider must surface an error, not silently succeed")
+	if err := m.Reconcile(context.Background(), nil, fixedObserver("203.0.113.5"), nil, map[string]*config.DDNSProvider{}); err != nil {
+		t.Fatalf("provider-gone withdraw must not churn a reconcile error (terminal orphan alarm): %v", err)
 	}
-	if st := m.Stats(); st.DeleteOK != 0 || st.Scopes != 1 {
+	st := m.Stats()
+	if st.DeleteOK != 0 || st.Scopes != 1 {
 		t.Fatalf("an unresolvable withdraw must not claim success nor drop ownership; stats=%+v", st)
+	}
+	if st.Orphaned != 1 {
+		t.Fatalf("#3735: a provider-gone withdraw must raise exactly one orphan alarm; stats=%+v", st)
+	}
+	views := m.StatusViews(nil)
+	if len(views) != 1 || views[0].State != SurfaceAStateOrphaned || views[0].FQDN != "wan.example.net" {
+		t.Fatalf("#3735: a provider-gone orphan must surface a SurfaceAStateOrphaned status row; got %+v", views)
 	}
 }
 

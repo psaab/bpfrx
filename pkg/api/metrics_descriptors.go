@@ -375,6 +375,16 @@ func newCollector(srv *Server) *xpfCollector {
 			"Current number of Surface A DDNS records this node owns in DNS.",
 			nil, nil,
 		),
+		surfaceADDNSOrphaned: prometheus.NewDesc(
+			"xpf_ddns_surface_a_orphaned",
+			"Current number of Surface A DDNS records stale at a PREVIOUS provider "+
+				"endpoint that a provider identity change (rename to a different "+
+				"endpoint / in-place server-zone edit / removed binding after an edit) "+
+				"left un-withdrawable through the current catalog (#3735). Non-zero "+
+				"means an old record needs MANUAL operator cleanup — auto-withdrawal is "+
+				"deferred (old creds are redacted and the old endpoint is usually gone).",
+			nil, nil,
+		),
 		surfaceADDNSDegraded: prometheus.NewDesc(
 			"xpf_ddns_surface_a_degraded",
 			"1 when the Surface A DDNS ownership state is unloadable and the "+

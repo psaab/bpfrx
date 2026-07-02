@@ -112,6 +112,8 @@ func (c *xpfCollector) collectSurfaceADDNSMetrics(ch chan<- prometheus.Metric) {
 		float64(st.SkippedNoBackend), "no-backend")
 	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSScopes, prometheus.GaugeValue,
 		float64(st.Scopes))
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSOrphaned, prometheus.GaugeValue,
+		float64(st.Orphaned))
 	var degraded float64
 	if st.Degraded {
 		degraded = 1
