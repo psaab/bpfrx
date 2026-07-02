@@ -34,6 +34,7 @@ type xpfCollector struct {
 	hostInboundDeny             *prometheus.Desc
 	hostInboundKernelDenies     *prometheus.Desc
 	hostInboundAddresslessZones *prometheus.Desc
+	hostInboundAddresslessIface *prometheus.Desc
 	hostInboundAmbiguousAddrs   *prometheus.Desc
 	tcEgressPacketsTotal        *prometheus.Desc
 	syncookieTotal              *prometheus.Desc
@@ -543,6 +544,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hostInboundDeny
 	ch <- c.hostInboundKernelDenies
 	ch <- c.hostInboundAddresslessZones
+	ch <- c.hostInboundAddresslessIface
 	ch <- c.hostInboundAmbiguousAddrs
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
@@ -913,6 +915,14 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// window can be open in a config-only / degraded boot too, and that is exactly
 	// when it must stay visible.
 	c.collectHostInboundAddresslessZones(ch)
+
+	// #3710: the per-interface/per-family refinement of the addressless-zone
+	// signal above. A MIXED zone collapses to "scoped" at zone granularity the
+	// moment ANY interface resolves ANY address, hiding a DHCP-pending unit beside
+	// an addressed sibling, or the v6 side of a dual-stack edge whose v6 lease
+	// lands after v4. Config-derived and independent of dataplane load, so emit it
+	// BEFORE the dataplane gate like the zone-level signal.
+	c.collectHostInboundAddresslessInterfaces(ch)
 
 	// #3718 (Option B): firewall-local addresses reachable from multiple zones
 	// with differing host-inbound service sets (order-dependent kernel verdict).

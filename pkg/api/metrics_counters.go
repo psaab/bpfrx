@@ -73,6 +73,32 @@ func (c *xpfCollector) collectHostInboundAddresslessZones(ch chan<- prometheus.M
 	}
 }
 
+// collectHostInboundAddresslessInterfaces emits
+// xpf_host_inbound_addressless_interfaces (#3710): a 1 per {zone, interface-unit,
+// family} in the transient host-inbound fail-open admit window at
+// per-interface/per-family granularity — a non-lifeline unit with a DHCP/DHCPv6
+// client configured for the family but no resolved address in it yet. This is the
+// refinement of collectHostInboundAddresslessZones above: the zone-level series
+// goes silent for a MIXED zone the moment any interface resolves any address,
+// hiding a DHCP-pending unit beside an addressed sibling (or the v6 side of a
+// dual-stack edge whose v6 lease lands after v4). Config-derived (no dataplane
+// dependency), so Collect calls this BEFORE the dataplane gate. The SSOT is
+// dpuserspace.AddresslessEnforcingInterfaces, the same builder the daemon logs
+// from, so the metric and the log agree.
+func (c *xpfCollector) collectHostInboundAddresslessInterfaces(ch chan<- prometheus.Metric) {
+	if c.srv == nil || c.srv.store == nil {
+		return
+	}
+	cfg := c.srv.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	for _, i := range dpuserspace.AddresslessEnforcingInterfaces(cfg) {
+		ch <- prometheus.MustNewConstMetric(c.hostInboundAddresslessIface,
+			prometheus.GaugeValue, 1, i.Zone, i.Interface, i.Family, i.Reason)
+	}
+}
+
 // collectHostInboundAmbiguousAddresses emits xpf_host_inbound_ambiguous_addresses
 // (#3718 Option B): a 1 per firewall-local address that is
 // host-inbound-reachable from more than one security zone with DIFFERING

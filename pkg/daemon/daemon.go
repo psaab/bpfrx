@@ -326,6 +326,17 @@ type Daemon struct {
 	// Written and read only under applySem in applyHostInboundFilter.
 	hostInboundAddresslessZones map[string]bool
 
+	// hostInboundAddresslessIfaces is the set of {zone, interface-unit, family}
+	// host-inbound fail-open windows observed on the PREVIOUS apply (#3710), keyed
+	// as "<zone>|<iface>|<family>". This is the per-interface/per-family refinement
+	// of hostInboundAddresslessZones: a DHCP/DHCPv6 client on a non-lifeline unit
+	// with no resolved address in that family yet, which the zone-level signal
+	// hides in a MIXED zone (a DHCP-pending unit beside a statically-addressed
+	// sibling, or the v6 side of a dual-stack edge whose v6 lease lands after v4).
+	// applyHostInboundFilter diffs the current set against this to emit
+	// state-transition logs only. Written and read only under applySem.
+	hostInboundAddresslessIfaces map[string]bool
+
 	// hostInboundAmbiguousAddrs is the set of firewall-local addresses observed
 	// on the PREVIOUS apply that are host-inbound-reachable from more than one
 	// security zone with DIFFERING host-inbound service/protocol sets (#3718

@@ -115,6 +115,24 @@ func newCollector(srv *Server) *xpfCollector {
 				"scoping (transient fail-open admit window), labeled by zone.",
 			[]string{"zone"}, nil,
 		),
+		// #3710: the per-interface/per-family refinement of the addressless-zone
+		// signal above. 1 while a non-lifeline logical unit in a configured
+		// host-inbound-enforcing zone has a DHCP/DHCPv6 client configured for a
+		// family but has not yet resolved an address in that family — a transient
+		// fail-open window that the zone-level series hides whenever an addressed
+		// sibling interface (or the other family) already scopes the zone.
+		// Config-derived, independent of dataplane load, emitted BEFORE the
+		// dataplane gate. Present only while the window is open (absent =
+		// enforced), labeled by zone, interface (logical unit), family and reason.
+		hostInboundAddresslessIface: prometheus.NewDesc(
+			"xpf_host_inbound_addressless_interfaces",
+			"1 while a non-lifeline interface unit in a configured host-inbound-"+
+				"enforcing zone has a DHCP/DHCPv6 client for a family but no "+
+				"resolved address in that family yet (per-interface/per-family "+
+				"transient fail-open admit window, #3710), labeled by zone, "+
+				"interface, family and reason.",
+			[]string{"zone", "interface", "family", "reason"}, nil,
+		),
 		// #3718 (Option B): 1 per firewall-local address that is
 		// host-inbound-reachable from more than one security zone with DIFFERING
 		// host-inbound service/protocol sets. The kernel host-inbound nftables

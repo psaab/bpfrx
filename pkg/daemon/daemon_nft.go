@@ -251,6 +251,13 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// is otherwise silent. Log only state TRANSITIONS (a zone entering/leaving the
 	// window) so repeated commits / DHCP renewals do not flood.
 	d.logHostInboundAddresslessTransitions(cfg)
+	// #3710: the zone-level signal above collapses a MIXED zone (some interfaces
+	// addressed, some not; or one family up before the other) to "scoped" the
+	// moment ANY interface resolves ANY address, hiding the per-interface /
+	// per-family fail-open windows that enforcement (per-daddr, per-family) can
+	// still leave open. Log those at unit+family granularity so the operator sees
+	// WHICH interface/family is in the window, not just that a whole zone is.
+	d.logHostInboundAddresslessIfaceTransitions(cfg)
 	// #3718 (Option B): a firewall-local address reachable from >1 zone with
 	// DIFFERING host-inbound sets makes the kernel destination-address-only
 	// verdict order-dependent (and can disagree with the ingress-scoped
@@ -308,6 +315,41 @@ func (d *Daemon) logHostInboundAddresslessTransitions(cfg *config.Config) {
 		}
 	}
 	d.hostInboundAddresslessZones = current
+}
+
+// logHostInboundAddresslessIfaceTransitions emits a state-transition log whenever
+// a {zone, interface-unit, family} ENTERS or LEAVES the transient host-inbound
+// fail-open admit window at per-interface/per-family granularity (#3710). The
+// zone-level logHostInboundAddresslessTransitions above marks a zone scoped (and
+// stays silent) as soon as ANY of its interfaces resolves ANY address in EITHER
+// family, so a MIXED zone hides the gap: a DHCP-pending interface beside a
+// statically-addressed sibling, or the IPv6 side of a dual-stack edge whose v6
+// lease lands after its v4. Enforcement is per-destination-address and per-family
+// (the kernel chain emits `<fam> daddr <set> ... drop` separately for inet and
+// inet6), so those finer gaps are real fail-open windows the zone-level collapse
+// cannot express. It compares the current per-interface set against the set
+// observed on the previous apply (d.hostInboundAddresslessIfaces) so a unit that
+// stays DHCP-pending across repeated commits / renewals is logged once (on
+// entry), not every apply. Runs under applySem (via applyHostInboundFilter), so
+// the map access needs no extra locking. The current set is also exported as the
+// xpf_host_inbound_addressless_interfaces gauge (pkg/api), scraped independently.
+func (d *Daemon) logHostInboundAddresslessIfaceTransitions(cfg *config.Config) {
+	current := make(map[string]bool)
+	for _, i := range dpuserspace.AddresslessEnforcingInterfaces(cfg) {
+		key := i.Zone + "|" + i.Interface + "|" + i.Family
+		current[key] = true
+		if !d.hostInboundAddresslessIfaces[key] {
+			slog.Warn("host-inbound interface has no address in this family yet — host-inbound default-deny NOT enforced for it until a lease arrives (transient fail-open admit window); the zone-level signal is hidden by an addressed sibling / family",
+				"zone", i.Zone, "interface", i.Interface, "family", i.Family, "reason", i.Reason)
+		}
+	}
+	for key := range d.hostInboundAddresslessIfaces {
+		if !current[key] {
+			slog.Info("host-inbound interface now has an address in this family — host-inbound default-deny enforced (fail-open admit window closed)",
+				"key", key)
+		}
+	}
+	d.hostInboundAddresslessIfaces = current
 }
 
 // logHostInboundAmbiguousTransitions emits a state-transition log whenever a
