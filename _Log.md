@@ -1,3 +1,40 @@
+## 2026-07-01 — #3739: DDNS Surface A value-specific self-owned publish
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The Surface A self-owned publish path clobbered a
+    co-resident FOREIGN A/AAAA at a shared name. Cloudflare (H11) PATCHed
+    `recs[0]` (an API-ordering artifact) to xpf's address; RFC 2136 (M08)
+    `RemoveRRset`d the WHOLE A/AAAA set before inserting. Both now do a
+    VALUE-SPECIFIC in-place replace that touches ONLY xpf's own value.
+    ENABLER: threaded the previously-published rdata to the backend via a
+    new `LeaseDNSRecord.PrevAddr` field, set in `publishLocked` from the
+    prevAddr it already computed (seeded across restart from the durable
+    store's `AddrText`). Cloudflare `UpsertLease`: list all rows, no-op if a
+    row already carries the new value, else PATCH the row carrying `PrevAddr`
+    in place, else POST a new record (never `recs[0]`). RFC 2136
+    `sendAddSelfOwned`: when `selfOwnedPrevAddr` is valid and differs from
+    the new value, pair an EXACT-RR delete (`Remove`, CLASS=NONE) of xpf's
+    prior rdata with the insert, in ONE atomic UPDATE (no-blackhole
+    preserved); Insert-only on first publish / same-value re-publish. Added
+    helpers `rrAddr` + `prevSelfOwnedRR`. Route 53 (M07) DEFERRED per the
+    converged /research plan — whole-RRSet UPSERT with no per-value op / no
+    CAS would need a new SigV4 ListResourceRecordSets GET + a racy RMW; its
+    DELETE already fails safe. Documented all three in `pkg/ddns/README.md`.
+  - **Files**: `pkg/ddns/backend.go` (PrevAddr field),
+    `pkg/ddns/surface_a.go` (thread PrevAddr into rec),
+    `pkg/ddns/backend_cloudflare.go` (value-specific UpsertLease, dropped
+    findRecord), `pkg/ddns/backend_rfc2136.go` (selfOwnedPrevAddr +
+    value-specific sendAddSelfOwned + helpers),
+    `pkg/ddns/backend_cloudflare_test.go` (ordered fake + 2 RED-on-revert
+    tests + PrevAddr on the renumber case),
+    `pkg/ddns/surface_a_rfc2136_test.go` (co-resident foreign-survives test),
+    `pkg/ddns/README.md`.
+  - **Validation**: `go test -race ./pkg/ddns/...` green; RED-on-revert
+    proven for both providers (revert Cloudflare → recs[0] and RFC 2136 →
+    RemoveRRset each make the new tests fail deterministically);
+    `go build ./...`, `go vet ./pkg/ddns/...`, `gofmt -l` clean;
+    `go test ./pkg/dhcpserver/...` (lease-path consumer) green.
+
 ## 2026-07-01 — #3748 (sub-part b): IPFIX sampler Options Template + record
 
 - **Timestamp**: 2026-07-01

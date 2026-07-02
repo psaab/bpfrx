@@ -194,30 +194,26 @@ func (b *cloudflareBackend) listRecords(ctx context.Context, zoneID, rtype, fqdn
 	return recs, nil
 }
 
-// findRecord returns ONE existing A/AAAA record for the FQDN+type to update, or
-// (zero, false) when none exists. It prefers the row whose content already
-// equals wantContent (so a re-publish is a no-op) and otherwise returns the
-// first record (the row to PATCH to the new content). Used only by the upsert
-// path — the delete path re-derives ownership from content and must NOT
-// collapse to a single record.
-func (b *cloudflareBackend) findRecord(ctx context.Context, zoneID, rtype, fqdn, wantContent string) (cfRecord, bool, error) {
-	recs, err := b.listRecords(ctx, zoneID, rtype, fqdn)
-	if err != nil {
-		return cfRecord{}, false, err
-	}
-	if len(recs) == 0 {
-		return cfRecord{}, false, nil
-	}
-	for _, rec := range recs {
-		if rec.Content == wantContent {
-			return rec, true, nil
-		}
-	}
-	return recs[0], true, nil
-}
-
-// UpsertLease publishes the A/AAAA: resolve zone id, find the record, PATCH its
-// content if present else POST a new one.
+// UpsertLease publishes the A/AAAA with a VALUE-SPECIFIC in-place replace
+// (#3739): resolve zone id, list every A/AAAA at the name, and touch ONLY the
+// row xpf owns — never a co-resident FOREIGN value at a shared name. recs[0] is
+// an API-ordering artifact, not a statement of ownership (mirrors the
+// content-scoped DELETE, #2770). The precedence is:
+//
+//  1. A row already carrying the NEW content → no write (idempotent re-publish;
+//     extra ban-avoidance on top of the engine's change-detection).
+//  2. Else a row carrying xpf's PREVIOUS published value (rec.PrevAddr) → PATCH
+//     that row in place. This is the renumber of xpf's OWN record; the foreign
+//     row (if any) is left untouched.
+//  3. Else no xpf-owned row exists at this name → POST a NEW record. Any foreign
+//     record at the name survives (never PATCH recs[0], which would rewrite a
+//     foreign value to xpf's address — the #3739 H11 bug).
+//
+// Degenerate cases stay correct: a first publish (no prev, empty name) POSTs;
+// a first publish onto a name that already carries only a foreign record also
+// POSTs (coexist, do not clobber). If xpf's prior value is genuinely unknown
+// (PrevAddr lost) on a renumber, a new row is POSTed and the old xpf row leaks —
+// acceptable, and strictly better than clobbering a foreign record.
 func (b *cloudflareBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) error {
 	zoneID, err := b.resolveZoneID(ctx)
 	if err != nil {
@@ -229,9 +225,23 @@ func (b *cloudflareBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord)
 	if ttl <= 0 {
 		ttl = 1 // Cloudflare TTL=1 means "automatic".
 	}
-	existing, found, err := b.findRecord(ctx, zoneID, rec.ForwardType, name, content)
+	recs, err := b.listRecords(ctx, zoneID, rec.ForwardType, name)
 	if err != nil {
 		return err
+	}
+	var prevContent string
+	if rec.PrevAddr.IsValid() {
+		prevContent = rec.PrevAddr.Unmap().String()
+	}
+	prevID := ""
+	for _, r := range recs {
+		if r.Content == content {
+			// Already correct — no write.
+			return nil
+		}
+		if prevContent != "" && r.Content == prevContent {
+			prevID = r.ID
+		}
 	}
 	payload := map[string]any{
 		"type":    rec.ForwardType,
@@ -239,15 +249,12 @@ func (b *cloudflareBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord)
 		"content": content,
 		"ttl":     ttl,
 	}
-	if found {
-		if existing.Content == content {
-			// Already correct — no write (extra ban-avoidance on top of the
-			// engine's change-detection).
-			return nil
-		}
-		_, err = b.do(ctx, http.MethodPatch, "/zones/"+zoneID+"/dns_records/"+existing.ID, payload)
+	if prevID != "" {
+		// Renumber xpf's OWN row in place — never a foreign row.
+		_, err = b.do(ctx, http.MethodPatch, "/zones/"+zoneID+"/dns_records/"+prevID, payload)
 		return err
 	}
+	// No xpf-owned row to update — create a new one alongside any foreign record.
 	_, err = b.do(ctx, http.MethodPost, "/zones/"+zoneID+"/dns_records", payload)
 	return err
 }

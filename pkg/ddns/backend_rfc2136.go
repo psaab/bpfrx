@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -126,6 +127,18 @@ type rfc2136Updater struct {
 	// work under its mutex, so per-call mutation of this stateless-config
 	// backend is safe). Empty ⇒ no DHCID (name-not-in-use guard only).
 	dhcidClientID string
+
+	// selfOwnedPrevAddr is the PREVIOUS published rdata for the self-owned
+	// forward record currently being upserted (#3739), carried alongside the
+	// record like dhcidClientID. sendAddSelfOwned uses it to do a VALUE-SPECIFIC
+	// replace — an exact-RR delete of xpf's OWN prior value paired with the
+	// insert of the new one, in ONE atomic UPDATE — so a co-resident FOREIGN
+	// A/AAAA at a shared name survives (instead of the old delete-RRset that
+	// destroyed every same-type record at the name). Invalid ⇒ first publish or
+	// unknown prior value ⇒ Insert-only (additive, coexists with any foreign RR).
+	// Set at the top of UpsertLease and only consulted on the self-owned A/AAAA
+	// path; ignored by the DHCP-lease path (selfOwned=false) and by PTR adds.
+	selfOwnedPrevAddr netip.Addr
 
 	// selfOwned marks a backend that publishes the FIREWALL'S OWN records
 	// (Surface A router/interface-address publish, #2691 P2), as opposed to a
@@ -354,6 +367,7 @@ func canonicalReverseZone(ptrName string) string {
 // lease's reconcile result; a PTR NOTAUTH/REFUSED is a counted skip.
 func (u *rfc2136Updater) UpsertLease(ctx context.Context, rec LeaseDNSRecord) error {
 	u.dhcidClientID = rec.ClientID
+	u.selfOwnedPrevAddr = rec.PrevAddr // #3739: value-specific self-owned replace
 	forwardRR, err := u.forwardRR(rec)
 	if err != nil {
 		return err
@@ -785,22 +799,33 @@ func (u *rfc2136Updater) sendAddOwned(ctx context.Context, zone string, rr dns.R
 // (forced-refresh) deletes-then-re-adds the identical RR (a no-op net change
 // that SUCCEEDS), and an address change replaces the rdata atomically.
 //
-// Exact-RR / co-resident safety: the delete is scoped to OUR forward type (A
-// for a v4 record, AAAA for a v6 record) at OUR exact name only — it never
-// touches a different RR type at the name (e.g. a co-resident MX/TXT) and never
-// issues a delete-name. The third-party case: if an operator points two
-// firewalls' Surface-A FQDNs at the SAME name they will fight (each replaces the
-// other's A) — that is an operator misconfiguration (the per-RG HA gate already
-// prevents the in-cluster two-writer case), and is strictly the documented
-// "self-owned name" contract; this backend never adopts or deletes a DIFFERENT
-// record TYPE, so a co-resident non-A/AAAA record at the name is never harmed.
+// Exact-RR / co-resident safety (#3739): the replace is now VALUE-SPECIFIC. When
+// the previous published value is known (u.selfOwnedPrevAddr, threaded from the
+// manager) and differs from the new one, the message pairs an EXACT-RR delete of
+// xpf's OWN prior rdata (RFC 2136 §2.5.4, CLASS=NONE) with the insert of the new
+// rdata — so a CO-RESIDENT FOREIGN A/AAAA at a shared name SURVIVES (the old
+// whole-RRset delete destroyed every same-type record at the name). Both ops are
+// in the SAME UPDATE, so the replace stays atomic and no-blackhole. When the
+// prior value is unknown (first publish) or equal to the new one, the message is
+// Insert-only — additive, coexisting with any foreign RR (a same-value re-publish
+// is an idempotent no-op). It never touches a different RR type at the name and
+// never issues a delete-name/delete-RRset. The third-party case: if an operator
+// points two firewalls' Surface-A FQDNs at the SAME name their records now
+// COEXIST (each only manages its own value) rather than fighting — non-destructive
+// by design; the per-RG HA gate still prevents the in-cluster two-writer case.
 func (u *rfc2136Updater) sendAddSelfOwned(ctx context.Context, zone string, rr dns.RR) error {
 	m := new(dns.Msg)
 	m.SetUpdate(dns.Fqdn(zone))
-	// RemoveRRset deletes the entire RRset of rr's type at rr's name (CLASS=ANY,
-	// TTL=0, empty rdata) — our prior A/AAAA value(s), if any. Applied in the
-	// SAME message as the Insert below, so the replace is atomic.
-	m.RemoveRRset([]dns.RR{rr})
+	// Value-specific replace: remove ONLY xpf's own prior rdata (exact-RR delete)
+	// when it is known and differs from the new value. Skipped on a first publish
+	// (invalid prev) or a same-value re-publish (Insert is idempotent).
+	if prev := u.selfOwnedPrevAddr.Unmap(); prev.IsValid() {
+		if cur, ok := rrAddr(rr); !ok || cur != prev {
+			if prevRR, ok := prevSelfOwnedRR(prev, rr); ok {
+				m.Remove([]dns.RR{prevRR})
+			}
+		}
+	}
 	m.Insert([]dns.RR{rr})
 	resp, err := u.exchange(ctx, m)
 	if err != nil {
@@ -812,6 +837,58 @@ func (u *rfc2136Updater) sendAddSelfOwned(ctx context.Context, zone string, rr d
 	default:
 		return rcodeError(resp.Rcode)
 	}
+}
+
+// rrAddr extracts the netip.Addr rdata from an A/AAAA RR (ok=false for any other
+// type or an unparseable address). Used by the self-owned value-specific replace
+// to compare xpf's previous value against the new one.
+func rrAddr(rr dns.RR) (netip.Addr, bool) {
+	switch v := rr.(type) {
+	case *dns.A:
+		if a, ok := netip.AddrFromSlice(v.A.To4()); ok {
+			return a.Unmap(), true
+		}
+	case *dns.AAAA:
+		if a, ok := netip.AddrFromSlice(v.AAAA.To16()); ok {
+			return a.Unmap(), true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+// prevSelfOwnedRR builds the exact-RR-delete RR for xpf's PREVIOUS self-owned
+// value (#3739), matching the name/TTL and the forward TYPE of the record being
+// published. ok=false when prev's family does not match cur's type — a
+// cross-family delete is never emitted (a Surface A scope is family-fixed, so
+// this is belt-and-suspenders, never a normal case).
+func prevSelfOwnedRR(prev netip.Addr, cur dns.RR) (dns.RR, bool) {
+	prev = prev.Unmap()
+	if !prev.IsValid() {
+		return nil, false
+	}
+	name := cur.Header().Name
+	ttl := cur.Header().Ttl
+	switch cur.(type) {
+	case *dns.A:
+		if !prev.Is4() {
+			return nil, false
+		}
+		a4 := prev.As4()
+		return &dns.A{
+			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+			A:   net.IP(a4[:]),
+		}, true
+	case *dns.AAAA:
+		if !prev.Is6() {
+			return nil, false
+		}
+		a16 := prev.As16()
+		return &dns.AAAA{
+			Hdr:  dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
+			AAAA: net.IP(a16[:]),
+		}, true
+	}
+	return nil, false
 }
 
 // sendRemove issues an exact-RR delete (RFC 2136 §2.5.4 via miekg Remove,
