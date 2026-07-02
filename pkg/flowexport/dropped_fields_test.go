@@ -58,7 +58,9 @@ func TestIPFIXTemplateDroppedFieldsAbsent(t *testing.T) {
 		}
 	}
 
-	// Also walk the encoded bytes (the wire the collector parses).
+	// Also walk the encoded bytes (the wire the collector parses). #3746: field
+	// specifiers are 4 bytes (IANA) or 8 bytes (enterprise: element-ID top bit
+	// set + a 4-byte PEN), so mask the enterprise bit and advance by width.
 	ts := encodeIPFIXTemplateSet()
 	off := 4 // skip set header
 	for off+4 <= len(ts) {
@@ -66,11 +68,16 @@ func TestIPFIXTemplateDroppedFieldsAbsent(t *testing.T) {
 		count := int(binary.BigEndian.Uint16(ts[off : off+2]))
 		off += 2
 		for i := 0; i < count && off+4 <= len(ts); i++ {
-			eid := binary.BigEndian.Uint16(ts[off : off+2])
+			raw := binary.BigEndian.Uint16(ts[off : off+2])
+			eid := raw & 0x7fff
 			if name, bad := dropped[eid]; bad {
 				t.Errorf("dropped IPFIX IE %s (%d) found in encoded template set", name, eid)
 			}
-			off += 4
+			if raw&0x8000 != 0 {
+				off += 8
+			} else {
+				off += 4
+			}
 		}
 	}
 }

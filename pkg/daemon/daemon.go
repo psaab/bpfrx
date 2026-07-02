@@ -326,6 +326,19 @@ type Daemon struct {
 	// Written and read only under applySem in applyHostInboundFilter.
 	hostInboundAddresslessZones map[string]bool
 
+	// hostInboundAmbiguousAddrs is the set of firewall-local addresses observed
+	// on the PREVIOUS apply that are host-inbound-reachable from more than one
+	// security zone with DIFFERING host-inbound service/protocol sets (#3718
+	// Option B), keyed as "<family>|<addr>". The kernel host-inbound chain
+	// matches destination address only, so such an address's admission verdict
+	// is decided order-dependently by whichever zone sorts first (and can
+	// disagree with the ingress-scoped userspace-dp path). The strict commit gate
+	// rejects this; a tolerant / peer-synced load (#1960) can slip one through,
+	// and unlike the addressless window it is NOT self-healing.
+	// applyHostInboundFilter diffs the current set against this to emit
+	// state-transition logs only. Written and read only under applySem.
+	hostInboundAmbiguousAddrs map[string]bool
+
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
 	mgmtVRFInterfaces map[string]bool

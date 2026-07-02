@@ -42,6 +42,98 @@
     userspace-dp/src/session/README.md ("Flow-cache invalidation on reap
     (#3776)" section)
 
+## 2026-07-01 — #3746 flowexport: IPFIX RFC 5103 biflow reverse counters (PEN 29305); NetFlow v9 reverse deferred
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3746 (codex-review-158 H12, converged /research plan Option A).
+    The reverse (server→client) session byte/packet counters have been produced
+    end-to-end since #2501 (decoded to `EventRecord.RevSessionPkts`/
+    `.RevSessionBytes`) and are in scope at IPFIX export time, but the FlowRecord
+    build wired only the FORWARD counts, so collectors under-reported the larger
+    half of asymmetric bi-directional flows. Implemented the IPFIX half: encode
+    the reverse volume as RFC 5103 biflow reverse Information Elements
+    `reverseOctetDeltaCount` (IE 1) + `reversePacketDeltaCount` (IE 2) under the
+    reverse Private Enterprise Number 29305 — the codebase's FIRST enterprise IEs.
+    - `ipfixField` gained an `enterprise uint32` column (0 = IANA). The Template
+      Set encoder now sizes an enterprise field specifier at 8 bytes (elementID
+      with the 0x8000 enterprise bit + a 4-byte PEN) while IANA specs stay 4
+      bytes (`ipfixFieldSpecsLen`/`encodeIPFIXFieldSpec`); the DATA record encodes
+      the reverse counts as plain 8-byte u64. Reverse IEs spliced after the
+      forward CoS/egress block and before the post-NAT trailer (post-NAT stays
+      last per #2526; flowDirection #3270 still just before post-NAT). Template
+      IDs 256/257 reused (content grows once); record sizes v4 70→86, v6 118→134
+      (with flow-dir 87/135).
+    - `FlowRecord` gained `RevPackets`/`RevBytes`; `ExportSessionClose` sets them
+      from `rec.RevSessionPkts`/`.RevSessionBytes` (already in scope — no
+      SessionCloseData plumbing). NetFlow v9 leaves them unused (no standard
+      reverse element).
+    - Tests (`ipfix_biflow_test.go`): full Template Set decode asserting the two
+      reverse IEs carry the enterprise bit + PEN 29305 + length 8 (base AND
+      flow-dir templates) with Template-Set-length integrity (catches an 8-byte
+      specifier off-by-one), a record round-trip of >2^32 reverse sentinels, the
+      ExportSessionClose plumbing pin, and a loopback-UDP real-wire pin.
+      RED-on-revert verified (all four fail with the reverse IEs removed).
+      Updated the enterprise-aware Template-Set walkers in
+      `dropped_fields_test.go` / `flowdir_test.go` and the record-size pins in
+      `postnat_test.go` / `flowdir_test.go`.
+    - Docs: `pkg/flowexport/README.md` drops the stale "#2501 counters are 0"
+      caveats, documents the biflow reverse IEs / enterprise-IE template
+      encoding, and records the NetFlow v9 reverse-direction DEFER (no standard
+      single-record path).
+  - **File(s)**: pkg/flowexport/ipfix.go, pkg/flowexport/manager.go,
+    pkg/flowexport/ipfix_biflow_test.go (new), pkg/flowexport/dropped_fields_test.go,
+    pkg/flowexport/flowdir_test.go, pkg/flowexport/postnat_test.go,
+    pkg/flowexport/README.md, _Log.md
+  - **Validation**: `go test ./pkg/flowexport/...` green; `go build ./...`;
+    gofmt + go vet clean; RED-on-revert confirmed.
+
+## 2026-07-01 — #3718 host-inbound: fail-closed duplicate host-local-address gate + runtime reporter/metric (Option B)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3718 (HIGH, codex-review-153 H01/M02/M03/M04/M09). The kernel
+    host-inbound nftables chain matches DESTINATION ADDRESS ONLY (no ingress
+    predicate) over a single global `inet xpf_hostinbound` chain, so two zones
+    resolving the SAME firewall-local address (dup interface addr, dup VRRP VIP,
+    or same addr across routing-instances) emit two daddr-keyed blocks in
+    zone-sort order and the earlier-sorting zone decides the packet — and can
+    disagree with the already-ingress-scoped userspace-dp host_inbound_admits
+    path (split-brain). No duplicate-local-address gate existed. Implemented the
+    converged /research plan's Option B (fail-closed gate + observability);
+    Option A (kernel iifname ingress-scope) and Option C (per-VRF chains) are
+    deferred follow-ons documented on the issue + in
+    docs/host-inbound-service-matrix.md.
+    - COMMIT-TIME: `validateDuplicateHostLocalAddressStrict`
+      (pkg/config/dup_host_local_address.go) hard-rejects a config where the same
+      (family, host address) — interface addr OR VRRP VIP — is
+      host-inbound-reachable from >1 DISTINCT effective host-inbound token set.
+      Keys on differing sets via the shared `CanonicalHostInboundTokenSig`, NOT
+      ">1 zone", so an identical-service dup is allowed (no false positive);
+      lifeline ifaces (fxp0/em0/fab*) excluded. Covers IPv4/IPv6/VRRP/cross-zone
+      M04. Lenient downgrade to cfg.Warnings on the tolerant path
+      (lenientDuplicateHostLocalAddress, #1960). Wired in compiler.go after
+      validateHostInboundTokensStrict.
+    - RUNTIME: `AmbiguousHostInboundAddresses` (pkg/dataplane/userspace/zones.go,
+      mirrors #3698 AddresslessEnforcingZones) reads BuildZoneHostInboundViews;
+      `xpf_host_inbound_ambiguous_addresses{address,family}` gauge (pkg/api,
+      emitted before the dataplane gate); daemon state-transition log
+      `logHostInboundAmbiguousTransitions` (pkg/daemon/daemon_nft.go, WARN on
+      entry / INFO on recovery; ambiguity is NOT self-healing).
+    - TESTS (RED-on-revert proven by neutering each layer): config matrix
+      (v4/v6/VRRP reject + identical-service/same-zone/lifeline/distinct allow +
+      commit-reject/lenient-warn wiring), userspace reporter, api metric
+      (before-gate), daemon log transitions. go test ./pkg/config/...
+      ./pkg/dataplane/... ./pkg/api/... ./pkg/daemon/ green; go build ./...;
+      gofmt+vet clean.
+  - **File(s)**: pkg/config/dup_host_local_address.go (new),
+    pkg/config/dup_host_local_address_3718_test.go (new), pkg/config/compiler.go,
+    pkg/dataplane/userspace/zones.go,
+    pkg/dataplane/userspace/zones_ambiguous_3718_test.go (new),
+    pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+    pkg/api/metrics_counters.go,
+    pkg/api/metrics_host_inbound_ambiguous_3718_test.go (new),
+    pkg/daemon/daemon.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/host_inbound_ambiguous_3718_test.go (new),
+    docs/host-inbound-service-matrix.md, docs/config-schema.md
 ## 2026-07-01 — #3769 fold (review MINOR): empty from-routing-instance NAT external = table-agnostic wildcard
 
 - **Timestamp**: 2026-07-01
@@ -26580,3 +26672,35 @@ top.
     pkg/flowexport/exporter_id_3740_test.go (new RED-on-revert +
     HA-symmetry + degenerate-default tests),
     pkg/flowexport/README.md ("Exporter identity" section + file layout)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3744 — VRF-scope the flowexport route-mask lookup by the
+    flow's ingress ifindex + count unresolved masks. The #2866/#3743
+    NetFlow IE 9/13 (IPv6 29/30) / IPFIX prefix-length route masks were
+    resolved by a VRF/table-blind FIB lookup (main table only) that also
+    discarded the `ok` bit, so a multi-VRF/routing-instance flow's mask
+    resolved in the wrong table and a genuine miss exported as a bogus /0.
+    Option A: MaskResolver gains an `ifindex`; fibMatchMask sets
+    RouteGetOptions.IifIndex (>0) → kernel input-path lookup follows
+    l3mdev enslavement into the flow's VRF table; resolveMasks scopes both
+    halves by the ingress instance (InIf, OutIf fallback, then global
+    table = bit-identical no-op for single-VRF). Async #3743 cache key
+    widened ip16 → (ifindex, ip16) via routeMaskKey so per-VRF masks don't
+    collide (non-blocking-callback/inflight-cap/dedup/size-cap invariants
+    unchanged). Option B: per-exporter routeMaskUnresolved atomic counter +
+    RouteMaskUnresolved() accessor (mirrors EstimatedDurations); the u8
+    wire IE has no sentinel room, so an unresolved half exports 0 but is
+    surfaced out-of-band. Residual documented: pure fwmark/`ip rule` PBR
+    is NOT covered (mark not on the close event); VRF/routing-instance IS.
+    RED-on-revert verified for all three mechanisms (IP-only key,
+    table-blind resolveMasks, dropped miss count → the new pins fail). go
+    test ./pkg/flowexport/... green incl -race; go build ./... green;
+    gofmt + vet clean.
+  - **File(s)**: pkg/flowexport/routemask.go (MaskResolver ifindex,
+    routeMaskKey (ifindex,IP) cache key, resolveMasks ingress scoping +
+    miss count, fibMatchMask IifIndex), pkg/flowexport/netflow.go +
+    pkg/flowexport/ipfix.go (routeMaskUnresolved counter + accessor + call
+    sites pass InIf/OutIf), pkg/flowexport/srcmask_dstmask_test.go
+    (existing #2866/#3743 pins updated for new signatures),
+    pkg/flowexport/routemask_vrf_test.go (new #3744 RED-on-revert pins),
+    pkg/flowexport/README.md (#3744 section + file-layout bullet)

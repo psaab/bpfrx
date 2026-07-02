@@ -32,9 +32,12 @@ it into a `Type:"SESSION_CLOSE"` `EventRecord` via
 HA delta is unchanged and emitted as a 1:1 pair with the type-14 frame —
 the RT_FLOW frame is additive, not a replacement, so HA session sync is
 unaffected. The record carries the real 5-tuple, NAT translated tuple,
-zones, and protocol; the byte/packet volume counters are 0 because the
-AF_XDP forwarding path does not yet maintain per-session accounting — that
-is the follow-up tracked in **#2501**.
+zones, and protocol. Since **#2501** (CLOSED) the AF_XDP forwarding path
+maintains per-session accounting, so the frame carries the real forward AND
+reverse byte/packet volume counters (both were 0 before #2501). The forward
+counts populate the standard IANA `octetDeltaCount`/`packetDeltaCount`; the
+reverse (server→client) counts are exported by IPFIX as the RFC 5103 biflow
+reverse IEs — see "#3746 — biflow reverse volume (IPFIX)" below.
 
 **#2465 — the exported flow StartTime is now the real session-creation
 time, not a packet-count guess.** Before #2465 the NetFlow v9 / IPFIX
@@ -58,8 +61,9 @@ synthesized close from a path that carried no creation instant (the
 explicit clear-session / NAT-remap delete glue and the HA tunnel-remap
 purge, which do not have the originating entry in hand). Each fallback
 bumps a per-exporter `EstimatedDurations()` counter so operators can see
-how often the heuristic is still in play. The byte/packet **volume**
-counters remain 0 pending #2501 — only the timing is now real.
+how often the heuristic is still in play. (Since #2501 the byte/packet
+**volume** counters are real too — the forward direction on the standard
+IANA counters and the reverse direction on the #3746 biflow reverse IEs.)
 
 **#2853 — the flow StartTime keeps MILLISECOND resolution.** #2465's
 `created` field is integer Unix **seconds** (offset 108, u32), so every
@@ -102,17 +106,19 @@ RFC 8158) are appended LAST in every template:
 | postNATDestinationIPv6Address | 282 | ipv6Address | 16 | v6 |
 
 NetFlow v9 reuses the same IANA element type IDs in its template
-FlowSet. With the #2613 drop and the #2749 re-adds of `ingressInterface`
+FlowSet. With the #2613 drop, the #2749 re-adds of `ingressInterface`
 (IE 10, 4B), `ipClassOfService` (IE 5, 1B), `tcpControlBits` (IE 6, 2B) and
-`egressInterface` (IE 14, 4B) the IPv4 IPFIX record is 70 bytes (45 pre-NAT
-body + 2 src/dst mask + 4 ingressInterface + 7 CoS/egress + 12 post-NAT) and
-the IPv6 record is 118 bytes (69 + 2 + 4 + 7 + 36); the NetFlow v9 record
+`egressInterface` (IE 14, 4B), and the #3746 biflow reverse counters
+(2×8B, IPFIX only) the IPv4 IPFIX record is 86 bytes (45 pre-NAT
+body + 2 src/dst mask + 4 ingressInterface + 7 CoS/egress + 16 biflow
+reverse + 12 post-NAT) and the IPv6 record is 134 bytes (69 + 2 + 4 + 7 + 16
++ 36); the NetFlow v9 record
 sizes derive from the template via `recordSize` (4-byte padded, 64 v4 / 112
-v6 — NetFlow `tcpFlags` is 1B not 2B), so they track the template
-automatically. #3270: with `export-extension flow-dir` the templates splice in
-`flowDirection` (IE 61, 1B) before the post-NAT trailer — the IPFIX record
-grows to 71 (v4) / 119 (v6); the v9 record absorbs the byte into its existing
-4-byte padding (`ipfixRecordSize(isV6, includeDir)` /
+v6 — NetFlow `tcpFlags` is 1B not 2B; v9 carries no reverse element), so they
+track the template automatically. #3270: with `export-extension flow-dir` the
+templates splice in `flowDirection` (IE 61, 1B) before the post-NAT trailer —
+the IPFIX record grows to 87 (v4) / 135 (v6); the v9 record absorbs the byte
+into its existing 4-byte padding (`ipfixRecordSize(isV6, includeDir)` /
 `buildTemplateFieldsV4/V6` carry the flag).
 The init-time
 assertion in `ipfix.go` pins the BASE `ipfixRecordSizeV4/V6` to the sum of their
@@ -131,8 +137,7 @@ collector always receives a usable tuple, matching Junos/vSRX (which
 always emits the post-NAT fields). The address and port halves fall back
 independently, so an address-only or port-only translation reports the
 translated half and the pre-NAT other half. A collector distinguishes a
-NAT'd flow from a non-NAT'd flow by post != pre. Volume counters remain 0
-pending #2501.
+NAT'd flow from a non-NAT'd flow by post != pre.
 
 **#2613 — stop advertising fields the close path cannot populate.** The
 templates previously advertised `ipClassOfService`/SrcTos (5),
@@ -268,8 +273,63 @@ lookup does not stall `ExportSessionClose`) and
 `TestRouteMaskCacheAsyncPopulateAndHit` (miss → default → background
 populate → warm hit). Reverting to the synchronous lookup-in-`resolve`
 flips these RED (the first two by blocking / returning the wrong value).
-Note #3744 (route-mask being VRF/table/source-blind) is a separate design
-item and out of scope here.
+
+**#3744 — the route-mask lookup is scoped to the flow's VRF table and an
+unresolved lookup is counted.** Before #3744 the FIB lookup was
+VRF/table-blind: `fibMatchMask` issued `RouteGetWithOptions(ip,
+{FIBMatch:true})` with no interface, so it always resolved against the
+**main** table, and `resolveMasks` discarded the `ok` bit. In a multi-VRF
+/ routing-instance deployment every flow's mask was therefore looked up in
+the wrong table (a leaked or per-instance prefix resolved to the wrong
+length, often `/0`), and a genuine miss was exported as a bogus `/0`
+indistinguishable from a real default-route match.
+
+*Scoping (Option A).* The SESSION_CLOSE event already carries the
+ingress/egress ifindex (#2615/#2749 → `SessionCloseData.InIf`/`OutIf`),
+and xpf enslaves interfaces to real l3mdev VRF master devices
+(`pkg/routing/vrf.go`), so each interface's ifindex selects a distinct
+kernel table. `MaskResolver` now takes an `ifindex`; `fibMatchMask` sets
+`RouteGetOptions.IifIndex` when it is >0, which makes the kernel perform
+an *input-path* route lookup that follows l3mdev enslavement into the
+interface's VRF table. `resolveMasks(r, srcIP, dstIP, inIf, outIf)` scopes
+**both** the source and destination half by the **ingress** instance
+(`inIf`): Junos attributes the session to the ingress routing-instance and
+next-table / rib-group leaked routes to the destination appear in that
+ingress table. When the dataplane reported no ingress attribution
+(`inIf==0`) it falls back to `outIf`, then to the global table
+(`inIf==outIf==0`) — bit-identical to the pre-#3744 main-table lookup, so
+single-VRF / default deployments are a no-op. The async #3743 cache key
+widens from the 16-byte IP to `(ifindex, IP)` (`routeMaskKey`) so per-VRF
+masks for the same host address do not collide; the non-blocking-callback,
+bounded-inflight, dedup and size-cap invariants are unchanged.
+
+*Unresolved bit (Option B).* The wire field is a `u8` prefix length
+(0..128) with no room for an "unresolved" sentinel a collector would
+understand, so an unresolved lookup is surfaced **out-of-band**:
+`resolveMasks` returns the number of halves that did not resolve, and each
+exporter accumulates them into a `routeMaskUnresolved atomic.Uint64`
+(`RouteMaskUnresolved()` accessor, mirroring `EstimatedDurations`). Since
+#3797 the first flow to any cold `(ifindex, prefix)` key resolves `0`
+while the background lookup warms, so a nonzero counter is expected in
+steady state; a value climbing in lockstep with exported flows is the only
+operator-visible signal that an exported mask-`0` is *unresolved* versus a
+real default-route `/0`.
+
+*Documented residual.* Pure fwmark / `ip rule` PBR (`pkg/routing/rules.go`)
+selects a table by mark or source address, and the mark is **not** carried
+on the SESSION_CLOSE event, so an ifindex-scoped lookup cannot reproduce a
+mark-only PBR decision. The dominant multi-table case — VRF /
+routing-instance — IS covered; carrying the fwmark is a separate future
+item if demand appears.
+
+Pinned by `TestRouteMaskLookupScopedByIfindex` (same dst IP → different
+mask per ingress ifindex, `(ifindex,IP)` key does not collide across
+VRFs), `TestResolveMasksScopesByIngressInstance` (both halves scope by
+`inIf`, fall back to `outIf`, then to the global table),
+`TestResolveMasksMissCount` and `TestExporterRouteMaskUnresolvedCounter`
+(an unresolved half increments the counter and still exports `0`, no
+sentinel). Reverting the `(ifindex,IP)` key, the ingress scoping, or the
+miss count flips one of these RED.
 
 `Exporter` / `IPFIXExporter` carry a `MaskResolver` func (defaulted by
 `NewExporter`/`NewIPFIXExporter` to `NewRouteMaskResolver`; nil on a
@@ -284,6 +344,63 @@ by 2 bytes (v4 61→63, v6 109→111). Presence-with-real-value is pinned by
 the encoded record carries the resolved prefix length, not zero — a
 deterministic injected resolver keeps the test free of a kernel-FIB
 dependency).
+
+**#3746 — biflow reverse volume (IPFIX).** Since #2501 the SESSION_CLOSE
+frame carries the reverse (server→client) byte/packet counters — decoded to
+`logging.EventRecord.RevSessionPkts` / `.RevSessionBytes`
+(`pkg/logging/ringbuf.go`) — but the exporters wired only the forward counts
+into the standard `octetDeltaCount` (IE 1) / `packetDeltaCount` (IE 2), so a
+collector systematically under-reported the larger half of an asymmetric flow
+(small request / large download). The IPFIX exporter now also emits the
+reverse direction as the **RFC 5103 biflow reverse Information Elements**:
+`reverseOctetDeltaCount` (IE 1) and `reversePacketDeltaCount` (IE 2), both
+under the reverse **Private Enterprise Number 29305**.
+
+These are the codebase's first **enterprise** IEs. `ipfixField` gained an
+`enterprise uint32` column (0 = IANA, unchanged). In the **Template Set** an
+enterprise field specifier is 8 bytes — the element ID with the top bit
+(`0x8000`) set, the 2-byte length, and the 4-byte PEN (RFC 7011 §3.2) — while
+IANA specifiers stay 4 bytes; the template encoder sizes and writes each
+accordingly (`ipfixFieldSpecsLen` / `encodeIPFIXFieldSpec`). The template
+record's field **count** is unchanged (each enterprise IE is one field). In
+the **Data Record** the reverse counts are plain 8-byte unsigned64 values, so
+the record grows by 16 bytes (v4 70→86, v6 118→134). The two reverse IEs are
+spliced after the forward CoS/egress block and before the post-NAT trailer, so
+the #2526 post-NAT tuple stays last and the #3270 `flowDirection` byte (when
+`export-extension flow-dir` is set) still sits just before the post-NAT block.
+Template IDs stay **256/257** — the content grows once (like #2526/#2749/#2866)
+and a collector re-learns the template on the next refresh; an unknown-PEN
+collector simply skips the 8-byte field via the template-declared length
+(RFC 7011 §8), so the change is backward-safe. The #3740 stable
+SourceID/ODID and the #2609 sequence-across-refresh behaviour are untouched
+(still one record per session).
+
+The counters are **always present** (like the #2526 post-NAT tuple), not
+opt-in: they are core accounting data and skippable by a collector that does
+not implement PEN 29305. Fail-on-revert pins in `ipfix_biflow_test.go`:
+`TestIPFIXTemplateCarriesBiflowReverseIEs` (the two reverse IEs decode from
+the template with the enterprise bit + PEN 29305 + length 8, in both the base
+and flow-dir templates, and the Template Set length matches the bytes walked —
+catching an off-by-one in the 8-byte specifier sizing),
+`TestIPFIXRecordCarriesBiflowReverseCounts` (the encoded record carries the
+reverse packet/byte counts at the reverse IEs' offset),
+`TestIPFIXExportSessionCloseWiresReverseCounts` (the `EventRecord` reverse
+counters reach the `FlowRecord`), and `TestIPFIXBiflowReverseWireLoopback`
+(the IEs + counts survive the real exporter UDP wire path). Removing the
+reverse IEs flips all four RED.
+
+**NetFlow v9 reverse direction — DEFERRED.** NetFlow v9 (RFC 3954) has no
+standard reverse element and no enterprise/PEN namespace, so there is no
+in-record, single-record way to carry the reverse direction. The two
+non-standard alternatives each break a deliberate design choice: a second
+reversed-tuple record contradicts the one-record-per-session / initiator-tuple
+anchor the #3270 flow-dir semantics rely on (and would be low-fidelity — the
+dataplane tracks no reverse-direction post-NAT tuple or ToS), and summing both
+directions into `octetDeltaCount` corrupts that IE's per-direction semantics.
+So **v9 exports the initiator-direction volume only; use IPFIX for
+bidirectional accounting.** `FlowRecord.RevPackets`/`RevBytes` are populated
+for both exporters but consumed only by IPFIX. See the converged research plan
+on #3746.
 
 ## File layout
 
@@ -308,7 +425,10 @@ The package is split by responsibility (#1988):
   exporters call. The netlink `RTM_GETROUTE` runs on a bounded background
   goroutine, never on the EventReader callback that calls `resolve()`
   (#3743): a cache miss returns the default and warms the cache for the next
-  flow.
+  flow. The lookup is scoped to the flow's VRF table by the ingress ifindex
+  and the cache is keyed by `(ifindex, IP)` (#3744); an unresolved lookup is
+  counted into each exporter's `routeMaskUnresolved`
+  (`RouteMaskUnresolved()`).
 - `transport.go` — shared collector connection management
   (`collectorConns`: dial / fan-out write / close) and the per-family
   batch accumulator (`flowBatch`) used by both exporters. `dialCollectors`

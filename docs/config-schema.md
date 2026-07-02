@@ -171,6 +171,35 @@ validation:
   directions — tail-drop and typo-bypass — across bracket / repeated-line /
   hierarchical shapes, plus the value-slot completion pin).
 
+## Duplicate host-local-address fail-closed gate (#3718, Option B)
+
+Beyond the per-leaf token allowlist above, host-inbound admission has a
+**cross-field** commit-time gate. The kernel host-inbound nftables chain matches
+on **destination address only** (no ingress-interface / VRF predicate) over a
+single global input chain, so two security zones that resolve the SAME
+firewall-local address (a duplicated interface address, a duplicated VRRP VIP, or
+the same address reused across routing-instances) emit two rule blocks keyed on
+the same `daddr` in zone-sort order — the earlier-sorting zone decides the packet
+regardless of ingress, and can even disagree with the ingress-scoped userspace-dp
+path (split-brain). `validateDuplicateHostLocalAddressStrict`
+(`compiler_validate` group, `dup_host_local_address.go`) **rejects at commit /
+commit-check** a config where the same `(family, host address)` — interface
+address OR VRRP VIP — is host-inbound-reachable from more than one **distinct
+effective host-inbound token set**. It keys on *differing* sets (via the shared
+`config.CanonicalHostInboundTokenSig`), NOT merely ">1 zone", so a deliberate
+duplicate with **identical** service sets across its zones is allowed (no false
+positive), and management/cluster-control lifeline interfaces (fxp0 / em0 / fab*)
+are excluded. Lenient downgrade to a `cfg.Warnings` entry on the tolerant load /
+peer-sync path (`lenientDuplicateHostLocalAddress`, #1960 no-brick); the runtime
+`dpuserspace.AmbiguousHostInboundAddresses` reporter + the
+`xpf_host_inbound_ambiguous_addresses` gauge surface any tolerantly-loaded
+ambiguity (it is NOT self-healing). The kernel `iifname` ingress-scope fix
+(Option A) and per-VRF host-inbound chains (Option C) are deferred follow-ons —
+see `docs/host-inbound-service-matrix.md`. Coverage:
+`dup_host_local_address_3718_test.go` (config), `zones_ambiguous_3718_test.go`
+(reporter), `metrics_host_inbound_ambiguous_3718_test.go` (metric),
+`host_inbound_ambiguous_3718_test.go` (daemon log transitions).
+
 ## Trailing-token arity on scalar value leaves (#3332)
 
 The mirror image of the multi-value contract is the **scalar** value leaf: a

@@ -73,6 +73,35 @@ func (c *xpfCollector) collectHostInboundAddresslessZones(ch chan<- prometheus.M
 	}
 }
 
+// collectHostInboundAmbiguousAddresses emits xpf_host_inbound_ambiguous_addresses
+// (#3718 Option B): a 1 per firewall-local address that is
+// host-inbound-reachable from more than one security zone with DIFFERING
+// host-inbound service/protocol sets. The kernel host-inbound chain matches
+// destination address only (no ingress predicate) over a single global input
+// chain, so the admission verdict for such an address is order-dependent (the
+// earlier-sorting zone wins) and can disagree with the ingress-scoped
+// userspace-dp path. The strict commit gate
+// (config.validateDuplicateHostLocalAddressStrict) rejects this; a tolerant /
+// peer-synced load (#1960) can slip one through, and unlike the addressless
+// window it is NOT self-healing — so this series stays present until the config
+// is fixed. Config-derived (no dataplane dependency), so Collect calls this
+// BEFORE the dataplane gate, matching the addressless-zone signal above. The
+// SSOT is dpuserspace.AmbiguousHostInboundAddresses, the same builder the daemon
+// logs from, so the metric and the log agree.
+func (c *xpfCollector) collectHostInboundAmbiguousAddresses(ch chan<- prometheus.Metric) {
+	if c.srv == nil || c.srv.store == nil {
+		return
+	}
+	cfg := c.srv.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	for _, a := range dpuserspace.AmbiguousHostInboundAddresses(cfg) {
+		ch <- prometheus.MustNewConstMetric(c.hostInboundAmbiguousAddrs,
+			prometheus.GaugeValue, 1, a.Address, a.Family)
+	}
+}
+
 func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	// #3345: on a counter-read failure, SKIP emitting the sample instead of
 	// reporting a misleading 0, and bump xpf_counter_read_errors_total. A

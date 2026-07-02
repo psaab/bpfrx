@@ -182,21 +182,22 @@ func TestIPFIXTemplateFlowDirConditional(t *testing.T) {
 	}
 }
 
-// TestIPFIXRecordSizeWithDir pins the concrete with-dir record sizes the issue
-// specifies: IPFIX V4 71 / V6 119.
+// TestIPFIXRecordSizeWithDir pins the concrete with-dir record sizes: base
+// (#3746 added the 16-byte biflow reverse counters) + 1 flow-dir byte —
+// IPFIX V4 87 / V6 135.
 func TestIPFIXRecordSizeWithDir(t *testing.T) {
-	if got := ipfixRecordSize(false, true); got != 71 {
-		t.Errorf("ipfixRecordSize(v4, dir) = %d, want 71", got)
+	if got := ipfixRecordSize(false, true); got != 87 {
+		t.Errorf("ipfixRecordSize(v4, dir) = %d, want 87", got)
 	}
-	if got := ipfixRecordSize(true, true); got != 119 {
-		t.Errorf("ipfixRecordSize(v6, dir) = %d, want 119", got)
+	if got := ipfixRecordSize(true, true); got != 135 {
+		t.Errorf("ipfixRecordSize(v6, dir) = %d, want 135", got)
 	}
 	// Build-time invariant: with-dir template field-length sum equals size.
-	if sum := ipfixSumLen(ipfixTemplateFieldsV4(true)); sum != 71 {
-		t.Errorf("sum(ipfixTemplateFieldsV4(dir)) = %d, want 71", sum)
+	if sum := ipfixSumLen(ipfixTemplateFieldsV4(true)); sum != 87 {
+		t.Errorf("sum(ipfixTemplateFieldsV4(dir)) = %d, want 87", sum)
 	}
-	if sum := ipfixSumLen(ipfixTemplateFieldsV6(true)); sum != 119 {
-		t.Errorf("sum(ipfixTemplateFieldsV6(dir)) = %d, want 119", sum)
+	if sum := ipfixSumLen(ipfixTemplateFieldsV6(true)); sum != 135 {
+		t.Errorf("sum(ipfixTemplateFieldsV6(dir)) = %d, want 135", sum)
 	}
 	// Encoded template byte-walk: IE 61 advertised with includeDir.
 	ts := encodeIPFIXTemplateSetDir(true)
@@ -209,7 +210,10 @@ func TestIPFIXRecordSizeWithDir(t *testing.T) {
 }
 
 // templateSetHasIE walks an encoded IPFIX template set and reports whether the
-// given element ID is advertised in any template record.
+// given element ID is advertised in any template record. #3746: field
+// specifiers are 4 bytes for an IANA IE and 8 bytes for an enterprise IE
+// (top bit of the element ID set + a 4-byte PEN), so the walk masks the
+// enterprise bit for the comparison and advances by the specifier width.
 func templateSetHasIE(ts []byte, ie uint16) bool {
 	off := 4 // skip set header
 	for off+4 <= len(ts) {
@@ -217,10 +221,16 @@ func templateSetHasIE(ts []byte, ie uint16) bool {
 		count := int(binary.BigEndian.Uint16(ts[off : off+2]))
 		off += 2
 		for i := 0; i < count && off+4 <= len(ts); i++ {
-			if binary.BigEndian.Uint16(ts[off:off+2]) == ie {
+			raw := binary.BigEndian.Uint16(ts[off : off+2])
+			enterprise := raw&0x8000 != 0
+			if raw&0x7fff == ie {
 				return true
 			}
-			off += 4
+			if enterprise {
+				off += 8
+			} else {
+				off += 4
+			}
 		}
 	}
 	return false
