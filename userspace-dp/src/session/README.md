@@ -250,6 +250,44 @@ ever being touched, then be reaped while still forwarding (an HA Close
 delta to the peer + BPF redirect-key deletion + a stale flow-cache
 descriptor out-living its session). UDP (60 s) was the most exposed.
 
+## Flow-cache invalidation on reap (#3776)
+
+The #2220 keepalive only protects an ACTIVELY-forwarding flow — the cache
+hit is what refreshes the session. It does nothing for a flow that idles
+PAST its timeout: the GC wheel reaps the session and
+`release_source_nat_allocation` returns its SNAT port to the pool, but
+the flow-cache slot survives (config/fib generation, RG epoch, and RG
+lease are all unchanged, and the slot is not LRU-evicted). If traffic
+later resumes on the same 5-tuple it HITS the surviving
+`RewriteDescriptor` and is forwarded WITHOUT a live session — a
+stateful-firewall bypass (no policy re-evaluation, no session install, no
+`show security flow session` row, not HA-synced) — and via a SNAT port
+that may already have been re-handed to a different flow (NAT-port reuse /
+reverse-path collision). This was the half of #2220 that was never
+shipped.
+
+`reap_expired_sessions` (`afxdp/worker/loop_body/mod.rs`) now closes it:
+for every entry the GC sweep reaps it calls
+`flow_cache.invalidate_slot(&key, binding.ifindex)` on every binding of
+the owning worker, mirroring the RST-teardown eviction in
+`afxdp/worker/lifecycle.rs`. The next packet on that tuple then MISSES the
+cache and re-runs full session lookup/creation + policy (fail-closed: no
+forwarding without a live session, no stale-SNAT reuse). Because the flow
+cache is per-binding and worker-owned and the sweep runs on the owning
+worker, this is a same-thread mutation — no cross-thread flush. Invalidating
+on every binding is safe and precise: the session table is keyed by the
+5-tuple ALONE, so at most one live session (hence at most one valid
+descriptor) exists per key, and `invalidate_slot` drops only a slot whose
+key AND ingress_ifindex both match — on a non-owning binding it either
+no-ops or evicts a stale prior-flow slot with the same tuple, never
+another live flow's entry. Forward and reverse are each their own
+`ExpiredSession` with their own key, so both directions are covered. The
+work is bounded by the ~1/s GC sweep, so it adds no per-packet cost and
+does not regress the keepalive fast path. Config/RG-lifecycle removals
+already invalidate via the generation/epoch stamp checks
+(`flow_cache.rs` lookup); the reap path is the gap those checks do not
+cover because a plain idle-timeout reap bumps neither.
+
 ## Per-session byte/packet accounting (#2501)
 
 Each `SessionEntry` carries a `SessionCounters` (`fwd_packets`, `fwd_bytes`,

@@ -724,24 +724,15 @@ pub(crate) fn worker_loop(
         // SAME node and the standby gauge stays 0.
         let local_expired =
             count_local_session_expiries(expired_entries.iter().map(|e| e.origin));
-        for expired_entry in expired_entries {
-            release_source_nat_allocation(
-                &forwarding.source_nat_rules,
-                &expired_entry.key,
-                expired_entry.decision.nat,
-                expired_entry.metadata.is_reverse,
-                loop_now_ns,
-            );
-            delete_session_map_entry_for_removed_session_with_origin(
-                session_map_fd,
-                &expired_entry.key,
-                expired_entry.decision,
-                &expired_entry.metadata,
-                expired_entry.origin,
-                conntrack_v4_fd,
-                conntrack_v6_fd,
-            );
-        }
+        reap_expired_sessions(
+            &mut bindings,
+            &expired_entries,
+            forwarding.as_ref(),
+            session_map_fd,
+            conntrack_v4_fd,
+            conntrack_v6_fd,
+            loop_now_ns,
+        );
         if local_expired > 0 {
             if let Some(binding) = bindings.first() {
                 binding
@@ -1308,6 +1299,77 @@ pub(crate) fn worker_loop(
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
 }
 
+/// #3776: apply the per-worker teardown side effects for every session the GC
+/// wheel reaped this sweep — release its SNAT allocation, delete its BPF
+/// redirect/conntrack entries, AND invalidate the per-worker flow-cache slot(s)
+/// that back it.
+///
+/// The flow-cache invalidation is the half of #2220 that was never shipped.
+/// #2220 (PR #2233) added only the keepalive: on a cache HIT the hot path
+/// touches the backing session so an ACTIVELY-forwarding flow's session cannot
+/// be reaped out from under a live cache entry. It does not cover a flow that
+/// idles PAST its timeout — the GC reaps the session and releases its SNAT
+/// port, but the flow-cache slot survives (config/fib generation, RG epoch, and
+/// RG lease are all unchanged, and the slot is not LRU-evicted). If traffic
+/// later resumes on the same 5-tuple it HITS the surviving `RewriteDescriptor`
+/// and is forwarded WITHOUT a live session — a stateful-firewall bypass (no
+/// policy re-evaluation, no session install, no `show security flow session`
+/// row, not HA-synced) — and via a SNAT port that `release_source_nat_allocation`
+/// may already have handed to a different flow (NAT-port reuse / reverse-path
+/// collision). Evicting the slot here forces the next packet to MISS the cache
+/// and re-run full session lookup/creation + policy (fail-closed: no forwarding
+/// without a live session, no stale-SNAT reuse via a surviving descriptor).
+/// Mirrors the RST-teardown eviction in `worker/lifecycle.rs`.
+///
+/// Cache ownership: the flow cache is per-binding and worker-owned, and this
+/// runs on the owning worker's GC sweep, so the eviction is a same-thread
+/// mutation — no cross-thread flush is needed. We invalidate on EVERY binding of
+/// this worker because a reaped session does not carry the ingress ifindex the
+/// cache is keyed on. That is both safe and precise: the session table is keyed
+/// by the 5-tuple ALONE, so at most one live session — hence at most one VALID
+/// descriptor — can exist for a given key, and `invalidate_slot` only drops a
+/// slot whose key AND ingress_ifindex both match. On a non-owning binding the
+/// call therefore either no-ops or drops a STALE prior-flow slot with the same
+/// tuple (which should go anyway); it can never drop another live flow's entry.
+/// Forward and reverse directions are each their own `ExpiredSession` with their
+/// own key, so both directions' slots are covered. This is the reap path
+/// (bounded by the ~1/s GC sweep), so it adds no per-packet cost and does not
+/// regress the #2220 keepalive fast path.
+fn reap_expired_sessions(
+    bindings: &mut [BindingWorker],
+    expired_entries: &[crate::session::ExpiredSession],
+    forwarding: &ForwardingState,
+    session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    now_ns: u64,
+) {
+    for expired_entry in expired_entries {
+        release_source_nat_allocation(
+            &forwarding.source_nat_rules,
+            &expired_entry.key,
+            expired_entry.decision.nat,
+            expired_entry.metadata.is_reverse,
+            now_ns,
+        );
+        delete_session_map_entry_for_removed_session_with_origin(
+            session_map_fd,
+            &expired_entry.key,
+            expired_entry.decision,
+            &expired_entry.metadata,
+            expired_entry.origin,
+            conntrack_v4_fd,
+            conntrack_v6_fd,
+        );
+        for binding in bindings.iter_mut() {
+            binding
+                .flow
+                .flow_cache
+                .invalidate_slot(&expired_entry.key, binding.ifindex);
+        }
+    }
+}
+
 /// #2428: count only the create-counted LOCAL-origin expired sessions for
 /// the `session_expires` counter (which the Go control plane reads as
 /// `GlobalCtrSessionsClosed`).
@@ -1355,6 +1417,261 @@ fn count_local_session_expiries(
             | SessionOrigin::WorkerLocalImport => false,
         })
         .count() as u64
+}
+
+#[cfg(test)]
+mod reap_flow_cache_tests {
+    //! #3776: the GC reap path must invalidate the per-worker flow-cache
+    //! slot(s) backing every session it reaps, so a packet that resumes on the
+    //! same 5-tuple after the idle timeout MISSES the cache and re-runs full
+    //! session lookup/creation + policy — instead of being forwarded via a
+    //! stale `RewriteDescriptor` with no live session (stateful-firewall
+    //! bypass) and a SNAT port that may now belong to a different flow
+    //! (NAT-port reuse). These tests drive the production `reap_expired_sessions`
+    //! helper the expiry loop calls; deleting its `invalidate_slot` loop turns
+    //! `reaped_session_flow_cache_slot_is_invalidated` and
+    //! `reaped_snat_descriptor_is_not_reused` RED.
+    use super::*;
+    use crate::nat::NatDecision;
+    use crate::session::{
+        ExpiredSession, SessionDecision, SessionKey, SessionMetadata, SessionOrigin,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const REAP_INGRESS_IF: i32 = 24;
+
+    fn reap_rg_epochs() -> [AtomicU32; MAX_RG_EPOCHS] {
+        std::array::from_fn(|_| AtomicU32::new(0))
+    }
+
+    fn reap_key(src_port: u16) -> SessionKey {
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            src_port,
+            dst_port: 443,
+        }
+    }
+
+    fn reap_metadata() -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        }
+    }
+
+    fn reap_resolution() -> ForwardingResolution {
+        ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: Some([6, 7, 8, 9, 10, 11]),
+            tx_vlan_id: 0,
+        }
+    }
+
+    fn reap_decision(snat_port: Option<u16>) -> SessionDecision {
+        SessionDecision {
+            resolution: reap_resolution(),
+            nat: NatDecision {
+                rewrite_src: snat_port.map(|_| IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: snat_port,
+                ..NatDecision::default()
+            },
+        }
+    }
+
+    fn insert_cache_entry(binding: &mut BindingWorker, key: &SessionKey, snat_port: Option<u16>) {
+        let decision = reap_decision(snat_port);
+        binding.flow.flow_cache.insert(FlowCacheEntry {
+            key: key.clone(),
+            ingress_ifindex: REAP_INGRESS_IF,
+            descriptor: RewriteDescriptor {
+                dst_mac: [0; 6],
+                src_mac: [0; 6],
+                fabric_redirect: false,
+                tx_vlan_id: 0,
+                ether_type: 0x0800,
+                rewrite_src_ip: decision.nat.rewrite_src,
+                rewrite_dst_ip: None,
+                rewrite_src_port: decision.nat.rewrite_src_port,
+                rewrite_dst_port: None,
+                ip_csum_delta: 0,
+                l4_csum_delta: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                target_binding_index: None,
+                input_filter_log: None,
+                tx_selection: CachedTxSelectionDescriptor::default(),
+                nat64: false,
+                nptv6: false,
+                apply_nat_on_fabric: false,
+            },
+            decision,
+            metadata: reap_metadata(),
+            stamp: FlowCacheStamp {
+                config_generation: 1,
+                fib_generation: 1,
+                owner_rg_id: 1,
+                owner_rg_epoch: 0,
+                owner_rg_lease_until: 0,
+            },
+            observed_bytes: 0,
+            last_used_epoch: 0,
+            neighbor_mac_epoch: 0,
+        });
+    }
+
+    fn cache_hits(
+        binding: &mut BindingWorker,
+        key: &SessionKey,
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    ) -> bool {
+        binding
+            .flow
+            .flow_cache
+            .lookup(
+                key,
+                FlowCacheLookup {
+                    ingress_ifindex: REAP_INGRESS_IF,
+                    config_generation: 1,
+                    fib_generation: 1,
+                },
+                0,
+                rg_epochs,
+            )
+            .is_some()
+    }
+
+    fn expired(key: SessionKey, snat_port: Option<u16>) -> ExpiredSession {
+        ExpiredSession {
+            key,
+            decision: reap_decision(snat_port),
+            metadata: reap_metadata(),
+            origin: SessionOrigin::ForwardFlow,
+        }
+    }
+
+    // #3776 H1: a packet that resumes on a reaped flow's 5-tuple must MISS the
+    // cache. Without the GC-path `invalidate_slot` the descriptor survives the
+    // reap and the resumed packet is forwarded with no live session — the
+    // stateful-firewall bypass. RED on revert (the entry survives, `cache_hits`
+    // stays true after the reap).
+    #[test]
+    fn reaped_session_flow_cache_slot_is_invalidated() {
+        let rg_epochs = reap_rg_epochs();
+        let forwarding = ForwardingState::default();
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, REAP_INGRESS_IF, 0);
+        let key = reap_key(12345);
+        insert_cache_entry(&mut binding, &key, None);
+        assert!(
+            cache_hits(&mut binding, &key, &rg_epochs),
+            "precondition: an active flow's descriptor is cached and hits"
+        );
+
+        reap_expired_sessions(
+            std::slice::from_mut(&mut binding),
+            &[expired(key.clone(), None)],
+            &forwarding,
+            -1,
+            -1,
+            -1,
+            1_000_000_000,
+        );
+
+        assert!(
+            !cache_hits(&mut binding, &key, &rg_epochs),
+            "#3776: a packet on a reaped flow's tuple must MISS the cache so it \
+             re-runs full session lookup + policy (no sessionless forward)"
+        );
+        assert_eq!(
+            binding.flow.flow_cache.entries.iter().flatten().count(),
+            0,
+            "#3776: the reaped flow's cache slot must be evicted"
+        );
+    }
+
+    // #3776 H2: the SNAT-bearing descriptor of a reaped flow must not survive to
+    // re-drive a translation whose port `release_source_nat_allocation` just
+    // returned to the pool. RED on revert (the SNAT descriptor keeps hitting).
+    #[test]
+    fn reaped_snat_descriptor_is_not_reused() {
+        let rg_epochs = reap_rg_epochs();
+        let forwarding = ForwardingState::default();
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, REAP_INGRESS_IF, 0);
+        let key = reap_key(23456);
+        insert_cache_entry(&mut binding, &key, Some(20001));
+        assert!(cache_hits(&mut binding, &key, &rg_epochs));
+
+        reap_expired_sessions(
+            std::slice::from_mut(&mut binding),
+            &[expired(key.clone(), Some(20001))],
+            &forwarding,
+            -1,
+            -1,
+            -1,
+            1_000_000_000,
+        );
+
+        assert!(
+            !cache_hits(&mut binding, &key, &rg_epochs),
+            "#3776: a released-SNAT descriptor must not survive the reap and \
+             re-SNAT to a port now owned by a different flow"
+        );
+    }
+
+    // A flow that is NOT reaped this sweep must keep hitting the cache — the
+    // #2220 keepalive fast path is preserved, the reap targets only the reaped
+    // key, and there is no collateral invalidation.
+    #[test]
+    fn live_flow_survives_reap_of_a_different_flow() {
+        let rg_epochs = reap_rg_epochs();
+        let forwarding = ForwardingState::default();
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, REAP_INGRESS_IF, 0);
+        let reaped = reap_key(30001);
+        let live = reap_key(30002);
+        insert_cache_entry(&mut binding, &reaped, None);
+        insert_cache_entry(&mut binding, &live, None);
+        assert!(cache_hits(&mut binding, &reaped, &rg_epochs));
+        assert!(cache_hits(&mut binding, &live, &rg_epochs));
+
+        reap_expired_sessions(
+            std::slice::from_mut(&mut binding),
+            &[expired(reaped.clone(), None)],
+            &forwarding,
+            -1,
+            -1,
+            -1,
+            1_000_000_000,
+        );
+
+        assert!(
+            !cache_hits(&mut binding, &reaped, &rg_epochs),
+            "the reaped flow's slot is evicted"
+        );
+        assert!(
+            cache_hits(&mut binding, &live, &rg_epochs),
+            "a still-live flow's slot must survive the reap of a different flow \
+             (no keepalive/hot-path regression, no collateral invalidation)"
+        );
+    }
 }
 
 #[cfg(test)]
