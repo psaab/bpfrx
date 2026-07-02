@@ -699,11 +699,17 @@ builder (`walkPolicyRuleSlots`) assigns each policy a distinct positional
 `policy_id` (`policy_set_id * MAX_RULES_PER_POLICY + rule_index`) and a distinct
 stable `rule_id` by construction, so a clean commit never trips these; they are
 the helper-boundary backstop for a corrupt / hand-built / mixed-version HA
-peer-sync snapshot. The reserved implicit-default sentinel
-(`DEFAULT_POLICY_SENTINEL_ID`, `u32::MAX`) is never carried by a configured rule
-and is excluded from the `policy_id` check (M01); `policy_id` 0 is the valid
-first-policy id and is checked normally. Rejecting the whole snapshot mirrors
-`DuplicateAddressBookId` and keeps the previous good forwarding state.
+peer-sync snapshot. The `policy_id` check (M01) excludes two values: the
+reserved implicit-default sentinel (`DEFAULT_POLICY_SENTINEL_ID`, `u32::MAX`),
+never carried by a configured rule; and `0`, the `omitempty` wire zero-value
+that is simultaneously the valid FIRST-policy id AND the "unspecified" value a
+pre-`policy_id` (pre-#3056/#3057) producer or an older HA peer leaves on EVERY
+rule — rejecting a duplicate `0` would fail-close a legitimate older-peer /
+hand-built (all-zero) snapshot, an availability regression during a rolling
+upgrade rather than the aliasing corruption this guards. A genuine collision of
+two distinct rules on a real assigned (non-zero) positional `policy_id` is still
+caught. Rejecting the whole snapshot mirrors `DuplicateAddressBookId` and keeps
+the previous good forwarding state.
 
 **Wildcard zone tiers (#3090).** A policy whose `from-zone` or `to-zone` is the
 Junos wildcard `any` is indexed into one of three dedicated lists alongside the

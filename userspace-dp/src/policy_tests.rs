@@ -6428,3 +6428,33 @@ fn distinct_rules_get_distinct_hit_counters() {
     assert!(ids.contains(&"lan->wan/p1".to_string()));
     assert!(ids.contains(&"lan->wan/p2".to_string()));
 }
+
+#[test]
+fn omitempty_zero_policy_ids_still_parse() {
+    // #3713 (M01) availability guard: `policy_id` is an `omitempty` wire u32, so
+    // a pre-policy_id (pre-#3056/#3057) producer or an older HA peer leaves it
+    // at 0 on EVERY rule. Two DISTINCT rules (distinct stable rule_ids) that
+    // both carry policy_id 0 must still parse — rejecting duplicate-0 would
+    // fail-close a legitimate older-peer / hand-built snapshot during a rolling
+    // upgrade. The DuplicatePolicyId check applies only to real assigned
+    // (non-zero, non-sentinel) positional ids. If the `!= 0` exclusion is
+    // removed this test goes RED (Err(DuplicatePolicyId { policy_id: 0 })).
+    let store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("a", 0), permit_snapshot("b", 0)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("all-zero omitempty policy_ids on distinct rules must still parse");
+    assert_eq!(state.rules.len(), 2);
+    assert_ne!(
+        state.rules[0].rule_id, state.rules[1].rule_id,
+        "distinct rule_ids keep distinct counters even at policy_id 0"
+    );
+    assert!(
+        !Arc::ptr_eq(&state.rules[0].hit_counter, &state.rules[1].hit_counter),
+        "distinct-rule_id rules never share a counter"
+    );
+}

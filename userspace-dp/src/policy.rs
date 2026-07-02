@@ -39,9 +39,13 @@ pub(crate) enum SnapshotIntegrityError {
     /// RT_FLOW / `SESSION_CLOSE` / display join key AND the value stored in
     /// `rule_id_to_policy_id` (last-writer-wins), so a duplicate lets an existing
     /// session re-resolve (#3395 live-row refresh) to the WRONG policy — wrong
-    /// attribution during incident response. The reserved implicit-default
-    /// sentinel (`DEFAULT_POLICY_SENTINEL_ID`, `u32::MAX`) is never carried by a
-    /// configured rule and is excluded from the check (M01).
+    /// attribution during incident response. Two values are excluded from the
+    /// check (M01): the reserved implicit-default sentinel
+    /// (`DEFAULT_POLICY_SENTINEL_ID`, `u32::MAX`), never carried by a configured
+    /// rule; and `0`, the `omitempty` wire zero-value that is both the valid
+    /// FIRST-policy id AND the "unspecified" value a pre-policy_id producer or
+    /// older HA peer leaves on every rule — rejecting duplicate-0 would
+    /// fail-close a legitimate older-peer / hand-built (all-zero) snapshot.
     DuplicatePolicyId { policy_id: u32 },
     UnknownAddressBookId { rule_id: String, book_id: u32 },
     /// #2124: a policy rule has at least one `application_terms` entry that
@@ -2507,9 +2511,11 @@ pub(crate) fn parse_policy_state_with_counters(
     // good state; a fresh boot keeps the default-deny PolicyState) mirrors
     // `DuplicateAddressBookId` and the #2124/#3261/#3367/#3711 fail-closed
     // family. Run FIRST so no transient counter is observed for a snapshot that
-    // is then rejected (L14). The reserved implicit-default sentinel
-    // (`DEFAULT_POLICY_SENTINEL_ID`) is never carried by a configured rule and
-    // is excluded from the policy_id check (M01).
+    // is then rejected (L14). The policy_id check (M01) excludes the reserved
+    // implicit-default sentinel (`DEFAULT_POLICY_SENTINEL_ID`) and the
+    // `omitempty` zero-value 0 (both the valid first-policy id AND the
+    // "unspecified" value an older/pre-policy_id producer leaves on every rule);
+    // see the per-value rationale at the check below.
     {
         let mut seen_rule_ids: FxHashSet<String> = FxHashSet::default();
         seen_rule_ids.reserve(rules.len());
@@ -2520,7 +2526,22 @@ pub(crate) fn parse_policy_state_with_counters(
             if !seen_rule_ids.insert(rule_id.clone()) {
                 return Err(SnapshotIntegrityError::DuplicateRuleId { rule_id });
             }
-            if snap.policy_id != DEFAULT_POLICY_SENTINEL_ID
+            // M01: only a real, ASSIGNED positional policy_id is checked for
+            // uniqueness. Two values are excluded:
+            //   - DEFAULT_POLICY_SENTINEL_ID (u32::MAX): the implicit default,
+            //     never carried by a configured rule.
+            //   - 0: the `omitempty` wire zero-value. It is simultaneously the
+            //     valid FIRST-policy id AND the "unspecified" value a
+            //     pre-policy_id (pre-#3056/#3057) producer or an older HA peer
+            //     leaves on EVERY rule. Rejecting a duplicate 0 would fail-close
+            //     a legitimate older-peer / hand-built snapshot that simply
+            //     omits policy_id (all-zero) — an availability regression during
+            //     a rolling upgrade, not the aliasing corruption this guards.
+            // A genuine collision of two DISTINCT rules on a real assigned
+            // (non-zero) positional policy_id is still caught: that is the
+            // RT_FLOW / SESSION_CLOSE / display join-key aliasing M01 targets.
+            if snap.policy_id != 0
+                && snap.policy_id != DEFAULT_POLICY_SENTINEL_ID
                 && !seen_policy_ids.insert(snap.policy_id)
             {
                 return Err(SnapshotIntegrityError::DuplicatePolicyId {

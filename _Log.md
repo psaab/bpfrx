@@ -27887,3 +27887,20 @@ top.
   userspace-dp/src/policy_tests.rs (4 tests),
   docs/userspace-dataplane-architecture.md (duplicate rule-identity fail-closed
   paragraph)
+
+- **Timestamp**: 2026-07-02 (refinement)
+- **Action**: #3713 — the full cargo test surfaced 23 pre-existing fixtures that
+  build multiple rules all leaving policy_id at its omitempty zero-value (0);
+  they tripped DuplicatePolicyId{0}. policy_id is `omitempty` on the wire, so 0
+  is BOTH the valid first-policy id AND the "unspecified" value a
+  pre-#3056/#3057 producer or an older HA peer leaves on every rule. Rejecting
+  duplicate-0 would fail-close a legitimate older-peer / hand-built (all-zero)
+  snapshot — an availability regression during a rolling upgrade, not the
+  aliasing corruption M01 targets. Fix: exclude 0 from the policy_id duplicate
+  check (alongside the u32::MAX sentinel); a genuine collision of two distinct
+  rules on a real assigned NON-ZERO positional policy_id is still caught. Added
+  omitempty_zero_policy_ids_still_parse (RED if the `!= 0` exclusion is removed).
+  The DuplicateRuleId check (primary H06 fix) was clean — zero rule_id failures.
+- **File(s)**: userspace-dp/src/policy.rs (0-exclusion + comments),
+  userspace-dp/src/policy_tests.rs (omitempty guard test),
+  docs/userspace-dataplane-architecture.md (0-exclusion rationale)
