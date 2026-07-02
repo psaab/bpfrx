@@ -1638,7 +1638,7 @@ fn reconcile_with_none_snapshot_reaches_no_snapshot_early_exit() {
         rx_packets: 42,
         ..BindingStatus::default()
     }];
-    coordinator.reconcile(None, &mut bindings, 64);
+    let _ = coordinator.reconcile(None, &mut bindings, 64);
     assert_eq!(coordinator.last_reconcile_stage, "no_snapshot");
     assert_eq!(coordinator.reconcile_calls, 1);
     assert!(
@@ -1704,7 +1704,7 @@ fn reconcile_none_snapshot_refreshes_bindings_clearing_reset_survivor_fields() {
         ..BindingStatus::default()
     }];
 
-    coordinator.reconcile(None, &mut bindings, 64);
+    let _ = coordinator.reconcile(None, &mut bindings, 64);
 
     assert_eq!(coordinator.last_reconcile_stage, "no_snapshot");
     // The reset-survivor fields must now be cleared by the teardown
@@ -1768,7 +1768,7 @@ fn reconcile_none_snapshot_refreshes_bindings_clearing_reset_survivor_fields() {
 fn teardown_quiesce_skipped_when_no_live_workers() {
     let mut coordinator = Coordinator::new();
     let mut bindings: Vec<BindingStatus> = Vec::new();
-    coordinator.reconcile(None, &mut bindings, 64);
+    let _ = coordinator.reconcile(None, &mut bindings, 64);
     assert_eq!(
         coordinator.last_quiesce_ms, 0,
         "no live workers => no mlx5 quiesce"
@@ -1795,7 +1795,7 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
         "precondition: a live worker handle is seeded (had_live_workers == true)"
     );
     let mut bindings: Vec<BindingStatus> = Vec::new();
-    coordinator.reconcile(None, &mut bindings, 64);
+    let _ = coordinator.reconcile(None, &mut bindings, 64);
     assert_eq!(
         coordinator.last_reconcile_stage, "no_snapshot",
         "None snapshot reaches the no_snapshot early-exit"
@@ -1839,7 +1839,7 @@ fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
     let mut snap = fail_open_snapshot(1);
     snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
     let mut bindings: Vec<BindingStatus> = Vec::new();
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
     assert_eq!(
         coordinator.last_quiesce_ms, 500,
         "#2522: live workers + a rebinding snapshot MUST still pay the mlx5 EBUSY quiesce"
@@ -3193,7 +3193,7 @@ fn reconcile_mandatory_map_open_failure_keeps_prior_generation_published() {
     // fds) and `sessions` to fail its open, so the failure is isolated
     // to the third mandatory open. The optional maps (conntrack/dnat)
     // are empty so they are never opened.
-    coordinator.reconcile(Some(&fail_open_snapshot(8)), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&fail_open_snapshot(8)), &mut bindings, 64);
 
     // The reconcile aborted at the session-map open.
     assert!(
@@ -3265,7 +3265,7 @@ fn reconcile_missing_session_pin_keeps_prior_generation_published() {
     let mut snap = fail_open_snapshot(12);
     snap.map_pins.sessions = String::new();
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert_eq!(
         coordinator.last_reconcile_stage, "missing_session_pin",
@@ -3301,13 +3301,97 @@ fn reconcile_all_mandatory_maps_open_advances_published_generation() {
     // the preflight passes and the reconcile proceeds to publish.
     let mut snap = fail_open_snapshot(2);
     snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert_eq!(
         coordinator.validation.config_generation, 2,
         "a fully-openable snapshot must advance the published generation"
     );
     assert_eq!((**coordinator.shared_validation.load()).config_generation, 2);
+}
+
+/// #3789: a snapshot that PASSES the policy preflight and opens every
+/// mandatory map, but FAILS the pre-teardown forwarding build (here an
+/// unparseable interface address), must return
+/// `Err(ReconcileError::Integrity(_))` — NOT the old `()` that silently
+/// swallowed the reject — while leaving the prior published generation
+/// intact (build fails BEFORE teardown, #2484). This is the coordinator-
+/// level half of the fix: the control-plane handler relies on this Err to
+/// fail closed on the full-apply / same-plan-needs-reconcile legs.
+///
+/// Fail-on-revert: before #3789 `reconcile` returned `()` and
+/// `build_reconcile_forwarding` discarded the error to `()`; the
+/// `matches!(..., Err(ReconcileError::Integrity(_)))` assertion cannot be
+/// expressed against a `()` return, so reverting the signature re-breaks
+/// the handler's ability to observe the reject.
+#[test]
+fn reconcile_build_failure_returns_integrity_err_and_keeps_prior_generation_3789() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 7,
+        fib_generation: 3,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+
+    // All three mandatory pins open (sentinel-OK) so the preflight passes
+    // and control reaches the fallible `build_reconcile_forwarding`.
+    let mut snap = fail_open_snapshot(8);
+    snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
+    // An unparseable interface address (/33 is invalid for IPv4) makes the
+    // forwarding build fail with a non-policy integrity error.
+    snap.interfaces = vec![crate::protocol::snapshot::InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        ifindex: 10,
+        addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.0.0.0/33".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        matches!(result, Err(ReconcileError::Integrity(_))),
+        "a non-policy forwarding-build failure must surface as Err(Integrity), got {result:?}"
+    );
+    assert_eq!(
+        coordinator.validation.config_generation, 7,
+        "the rejected build must not advance the published generation"
+    );
+    assert_eq!(
+        (**coordinator.shared_validation.load()).config_generation,
+        7,
+        "the rejected build must not advance the worker-visible generation"
+    );
+}
+
+/// #3789: the mandatory-map preflight failure surfaces as
+/// `Err(ReconcileError::MapSetup(..))` (not `()`), carrying the
+/// `last_reconcile_stage` descriptor, so the handler can fail closed on
+/// an unopenable-pin reject too (the #2440 sibling of the build reject).
+#[test]
+fn reconcile_missing_pin_returns_map_setup_err_3789() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    let mut snap = fail_open_snapshot(3);
+    // Sessions pin empty -> preflight_map_fds aborts at missing_session_pin.
+    snap.map_pins.sessions = String::new();
+
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    match result {
+        Err(ReconcileError::MapSetup(stage)) => {
+            assert_eq!(stage, "missing_session_pin", "unexpected stage: {stage}");
+        }
+        other => panic!("expected Err(MapSetup(missing_session_pin)), got {other:?}"),
+    }
 }
 
 /// #3402: a FRESH-BOOT snapshot ships its zones AND a concrete-zone policy in
@@ -3373,7 +3457,7 @@ fn reconcile_fresh_boot_concrete_zone_policy_passes_preflight_3402() {
         ..Default::default()
     }];
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
         !coordinator
@@ -3428,7 +3512,7 @@ fn reconcile_policy_references_undefined_zone_still_fails_closed_3402() {
         ..Default::default()
     }];
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
         coordinator
@@ -3506,7 +3590,7 @@ fn reconcile_snapshot_integrity_error_preserves_prior_generation_and_state() {
         ..Default::default()
     }];
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert_eq!(
         coordinator.last_reconcile_stage, "snapshot_integrity_error",
@@ -3611,7 +3695,7 @@ fn reconcile_present_conntrack_pin_open_failure_keeps_prior_generation() {
     let mut snap = mandatory_ok_snapshot(31);
     snap.map_pins.conntrack_v4 = format!("{TEST_MAP_PIN_FAIL}conntrack_v4");
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
         coordinator
@@ -3671,7 +3755,7 @@ fn reconcile_present_dnat_pin_open_failure_keeps_prior_generation() {
     let mut snap = mandatory_ok_snapshot(41);
     snap.map_pins.dnat_table = format!("{TEST_MAP_PIN_FAIL}dnat_table");
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
         coordinator
@@ -3721,7 +3805,7 @@ fn reconcile_empty_optional_pins_advance_published_generation() {
     assert!(snap.map_pins.dnat_table.is_empty());
     assert!(snap.map_pins.dnat_table_v6.is_empty());
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert_eq!(
         coordinator.validation.config_generation, 51,
@@ -3756,7 +3840,7 @@ fn reconcile_present_optional_pins_open_ok_advance_generation() {
     snap.map_pins.dnat_table = format!("{TEST_MAP_PIN_OK}dnat_table");
     snap.map_pins.dnat_table_v6 = format!("{TEST_MAP_PIN_OK}dnat_table_v6");
 
-    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert_eq!(
         coordinator.validation.config_generation, 61,

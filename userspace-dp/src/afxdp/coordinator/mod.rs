@@ -15,6 +15,10 @@ mod tunnel_supervision;
 mod wg_control;
 mod worker_manager;
 pub(crate) use bpf_maps::BpfMaps;
+// #3789: the full-`reconcile` abort outcome, so `server/helpers.rs`
+// (`reconcile_status_bindings`) and the control-socket handler can name
+// the fallible return type.
+pub(crate) use reconcile::ReconcileError;
 // #1890: re-import the split-out CoS builders at coordinator scope so
 // pre-split references keep resolving unchanged — `status.rs` and
 // `tests.rs` reach them through `use super::*`, and

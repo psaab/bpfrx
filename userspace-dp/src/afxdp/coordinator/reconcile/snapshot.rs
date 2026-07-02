@@ -199,8 +199,10 @@ pub(super) fn preflight_map_fds(
 /// stash on `ReconcileSnapshotFds::forwarding` (build-once, reused by
 /// `apply_snapshot`). On an integrity error sets
 /// `coord.last_reconcile_stage = "snapshot_integrity_error"` (matching the
-/// descriptive-stage pattern) and returns `Err(())`; the orchestrator
-/// aborts WITHOUT teardown or publish.
+/// descriptive-stage pattern) and returns `Err(SnapshotIntegrityError)`
+/// (#3789: was `Err(())`); the orchestrator aborts WITHOUT teardown or
+/// publish and wraps the error in `ReconcileError::Integrity` for the
+/// control-plane handler.
 ///
 /// MUST run before `tear_down`: it reads `Some(&coord.forwarding)` as the
 /// build's "previous" arg (WG engine reuse, NAT counter carry-over, cold-
@@ -208,7 +210,7 @@ pub(super) fn preflight_map_fds(
 pub(super) fn build_reconcile_forwarding(
     coord: &mut Coordinator,
     snapshot: &ConfigSnapshot,
-) -> Result<ForwardingState, ()> {
+) -> Result<ForwardingState, crate::policy::SnapshotIntegrityError> {
     match build_forwarding_state_with_policy_counters_and_previous(
         snapshot,
         &coord.policy_counters,
@@ -222,7 +224,11 @@ pub(super) fn build_reconcile_forwarding(
                 "xpf-userspace-dp: snapshot integrity error during reconcile preflight: {} — keeping previous forwarding state + workers",
                 err
             );
-            Err(())
+            // #3789: return the concrete integrity error (was `()`) so the
+            // orchestrator can surface it to the control-plane handler,
+            // which fails closed instead of persisting the rejected
+            // snapshot.
+            Err(err)
         }
     }
 }

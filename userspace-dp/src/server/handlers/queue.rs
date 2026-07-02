@@ -36,7 +36,11 @@ pub(super) fn set(
     }
     if found {
         if registration_changed {
-            reconcile_status_bindings(guard);
+            // #3789: this reconcile re-binds the ALREADY-ACCEPTED stored
+            // snapshot (a queue registration toggle, not a new config), so
+            // a build reject cannot introduce a rejected snapshot here —
+            // discard the outcome explicitly.
+            let _ = reconcile_status_bindings(guard);
             wait_for_binding_settle(guard, Duration::from_secs(2));
         }
         refresh_status(guard);

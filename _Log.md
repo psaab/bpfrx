@@ -27617,3 +27617,47 @@ top.
   pkg/api/metrics.go + metrics_descriptors.go + metrics_userspace.go
   (2 Prometheus counters), docs/fabric-cross-chassis-fwd.md,
   userspace-dp/src/afxdp/forwarding/README.md
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3789 — full-reconcile + same-plan-needs-reconcile legs now
+  fail closed on a swallowed non-policy build failure (M1 sibling of
+  #3766/#2484). Before this change `Coordinator::reconcile` returned `()`,
+  so the control-socket `apply_snapshot` handler could not distinguish an
+  aborted reconcile from a successful one. On the non-same-plan full-apply
+  leg and the same-plan `needs_reconcile` (deferred-binding) leg the
+  handler stored the incoming snapshot as the boot baseline, set
+  `persist_state`, and acked `ok=true` even when the reconcile aborted in
+  the pre-teardown preflight (a non-policy integrity build fault, or a
+  missing / unopenable mandatory pin). Prior forwarding stayed correct
+  (#2440/#2484 keep it live), but a REJECTED snapshot was persisted +
+  acked positive. Fix: `reconcile` (and `reconcile_status_bindings`) now
+  return `Result<(), ReconcileError>` (`Integrity(SnapshotIntegrityError)`
+  from the policy preflight / `build_reconcile_forwarding`, or
+  `MapSetup(stage)` for a mandatory-pin abort). Both handler legs mirror
+  #3766: on `Err`, restore the prior snapshot (+ `status.bindings` on the
+  full-apply leg) and the bumped status fields (last_snapshot_generation /
+  last_fib_generation / last_snapshot_at / capabilities), report
+  `ok=false`, and do NOT persist. The already-accepted-snapshot callers
+  (set_queue_state / set_binding_state / rebind / set_forwarding_state)
+  explicitly discard the outcome (no new snapshot to reject).
+  `build_reconcile_forwarding` now returns the concrete
+  `SnapshotIntegrityError` (was `Err(())`). Added 4 tests (2 coordinator:
+  typed Integrity / MapSetup Err + prior-generation preserved; 2 handler:
+  full-apply + same-plan-needs-reconcile fail-closed, RED-on-revert
+  proven) and retargeted the pre-existing main_tests defer-clear test
+  (which previously codified the swallow) to assert the fail-closed abort.
+  Full `cargo test --release` green (3408 lib pass / 2 pre-existing ignored
+  / 0 failed, plus 46+8+16+1 in the other targets).
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/mod.rs
+  (ReconcileError enum + Display, reconcile -> Result, early-return
+  mapping), userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs
+  (build_reconcile_forwarding -> Result<_, SnapshotIntegrityError>),
+  userspace-dp/src/afxdp/coordinator/mod.rs + userspace-dp/src/afxdp/mod.rs
+  (ReconcileError re-exports), userspace-dp/src/server/helpers.rs
+  (reconcile_status_bindings -> Result), userspace-dp/src/server/handlers/
+  {snapshot,queue,binding,rebind,forwarding}.rs (observe / discard result),
+  userspace-dp/src/afxdp/coordinator/tests.rs + userspace-dp/src/server/
+  tests.rs (new tests; let _ on existing reconcile calls),
+  userspace-dp/src/main_tests.rs (renamed + retargeted defer-clear test),
+  docs/userspace-dataplane-architecture.md + userspace-dp/src/server/
+  README.md (#3789 handler-observes-outcome doc)

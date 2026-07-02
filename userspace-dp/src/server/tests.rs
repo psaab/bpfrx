@@ -909,6 +909,210 @@ fn apply_snapshot_same_plan_build_failure_rejects_and_keeps_prior_3766() {
     );
 }
 
+/// Sentinel-OK map pins for the ARMED reconcile legs. The literal mirrors
+/// `afxdp::TEST_MAP_PIN_OK` (pub(in crate::afxdp), not reachable here); the
+/// `#[cfg(test)]` seam in `OwnedFd::open_bpf_map` short-circuits these to a
+/// dummy fd so the reconcile passes `preflight_map_fds` and reaches the
+/// fallible forwarding build without a real bpffs.
+fn ok_map_pins() -> crate::protocol::snapshot::MapPins {
+    crate::protocol::snapshot::MapPins {
+        xsk: "test-map-pin-ok://xsk".to_string(),
+        heartbeat: "test-map-pin-ok://heartbeat".to_string(),
+        sessions: "test-map-pin-ok://sessions".to_string(),
+        ..Default::default()
+    }
+}
+
+fn forwarding_caps() -> UserspaceCapabilities {
+    UserspaceCapabilities {
+        forwarding_supported: true,
+        ..Default::default()
+    }
+}
+
+/// A tunnel interface is excluded from the binding plan, so applies that
+/// differ only in this interface's ADDRESS share a plan key. `address`
+/// controls whether the forwarding build succeeds ("10.0.0.1/24") or fails
+/// ("10.0.0.0/33", unparseable — a NON-policy integrity fault).
+fn tunnel_iface_3789(address: &str) -> crate::protocol::snapshot::InterfaceSnapshot {
+    crate::protocol::snapshot::InterfaceSnapshot {
+        name: "gr-0/0/0".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 4300,
+        tunnel: true,
+        hardware_addr: "02:00:00:00:43:00".to_string(),
+        addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: address.to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// #3789 fail-closed FULL-APPLY leg (the non-same-plan branch, the #2484
+/// domain out of #3766's same-plan-refresh scope): an ARMED
+/// forwarding-supported helper's first apply takes the else full-apply
+/// leg -> reconcile_status_bindings -> the fallible afxdp.reconcile. A
+/// snapshot that passes the policy preflight but whose forwarding build
+/// FAILS (unparseable interface address) must report ok=false, NOT store
+/// the rejected snapshot as the boot baseline, and NOT advance the
+/// reported generation.
+///
+/// Fail-on-revert: before #3789 `afxdp.reconcile` returned () and the
+/// handler unconditionally stored the snapshot, refreshed status, and set
+/// persist_state=true -> response.ok stayed true (M1), the rejected
+/// snapshot became guard.snapshot, and last_snapshot_generation advanced.
+/// Every assertion below flips.
+#[test]
+fn apply_snapshot_full_reconcile_build_failure_rejects_and_keeps_prior_3789() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    // Armed so the reconcile takes the real afxdp.reconcile path (not the
+    // disarmed stop arm). forwarding_supported comes from the snapshot.
+    let state = new_state(ProcessStatus {
+        forwarding_armed: true,
+        ..ProcessStatus::default()
+    });
+
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 5,
+        fib_generation: 5,
+        generated_at: chrono::Utc::now(),
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![tunnel_iface_3789("10.0.0.0/33")],
+        ..ConfigSnapshot::default()
+    });
+
+    let response = run_request(state.clone(), request);
+    assert!(
+        !response.ok,
+        "a full-apply reconcile whose forwarding build fails must report ok=false"
+    );
+    assert!(
+        response.error.contains("snapshot integrity error"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    let guard = state.lock().expect("state");
+    assert!(
+        guard.snapshot.is_none(),
+        "rejected snapshot must not be stored as the boot baseline"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 0,
+        "rejected full-apply must not bump last_snapshot_generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 0,
+        "rejected full-apply must not bump last_fib_generation"
+    );
+}
+
+/// #3789 fail-closed SAME-PLAN NEEDS-RECONCILE leg: when the prior apply
+/// deferred workers, the next same-plan apply reconciles the deferred
+/// bindings via afxdp.reconcile (NOT the same-plan refresh leg #3766
+/// fixed). A build failure on that reconcile must restore the prior
+/// (deferred) snapshot, report ok=false, and NOT advance the generation.
+///
+/// Fail-on-revert: pre-#3789 this leg stored the snapshot then called
+/// reconcile_status_bindings (returning ()) and fell through to
+/// refresh_status + persist_state=true with ok=true — so the rejected
+/// gen-2 snapshot overwrote the gen-1 baseline and last_snapshot_generation
+/// advanced to 2. The generation/defer_workers assertions flip.
+#[test]
+fn apply_snapshot_same_plan_needs_reconcile_build_failure_rejects_and_keeps_prior_3789() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    // Prior snapshot deferred workers -> previous_defer_workers=true makes
+    // same_plan_apply_needs_binding_reconcile return true on the next
+    // (non-defer) same-plan apply. Tunnel-only interface set -> the plan
+    // key is address-independent, so gen-1 and gen-2 are same-plan.
+    let prior = ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: chrono::Utc::now(),
+        defer_workers: true,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![tunnel_iface_3789("10.0.0.1/24")],
+        ..ConfigSnapshot::default()
+    };
+
+    // Armed + supported + one runnable binding (registered, ifindex>0) so
+    // the needs-reconcile runnable_bindings>0 gate holds.
+    let status = ProcessStatus {
+        forwarding_armed: true,
+        capabilities: forwarding_caps(),
+        last_snapshot_generation: 1,
+        last_fib_generation: 1,
+        bindings: vec![BindingStatus {
+            slot: 0,
+            registered: true,
+            ifindex: 10,
+            ..BindingStatus::default()
+        }],
+        ..ProcessStatus::default()
+    };
+
+    let state = Arc::new(Mutex::new(ServerState {
+        status,
+        snapshot: Some(prior),
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+
+    // New same-plan apply: defer_workers=false, unparseable address -> the
+    // deferred-binding reconcile's forwarding build fails.
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 2,
+        fib_generation: 2,
+        generated_at: chrono::Utc::now(),
+        defer_workers: false,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![tunnel_iface_3789("10.0.0.0/33")],
+        ..ConfigSnapshot::default()
+    });
+
+    let response = run_request(state.clone(), request);
+    assert!(
+        !response.ok,
+        "a same-plan needs-reconcile apply whose build fails must report ok=false"
+    );
+    assert!(
+        response.error.contains("snapshot integrity error"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    let guard = state.lock().expect("state");
+    assert_eq!(
+        guard.snapshot.as_ref().map(|s| s.generation),
+        Some(1),
+        "the rejected snapshot must not overwrite the persisted baseline"
+    );
+    assert!(
+        guard.snapshot.as_ref().is_some_and(|s| s.defer_workers),
+        "the prior (deferred) snapshot must be restored intact"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 1,
+        "rejected same-plan needs-reconcile must not bump last_snapshot_generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 1,
+        "rejected same-plan needs-reconcile must not bump last_fib_generation"
+    );
+}
+
 // --- set_binding_state / set_queue_state error arms ---------------------
 
 #[test]
@@ -1192,7 +1396,8 @@ fn reconcile_disarmed_clears_full_stale_binding_survivors() {
 
     {
         let mut guard = state.lock().expect("state");
-        reconcile_status_bindings(&mut guard);
+        // #3789: disarmed reconcile is a teardown — always Ok.
+        reconcile_status_bindings(&mut guard).expect("disarmed reconcile is infallible");
     }
 
     let guard = state.lock().expect("state");
