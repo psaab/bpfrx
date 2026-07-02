@@ -40,6 +40,18 @@ type LeaseDNSRecord struct {
 	// pre-existing third-party RR). NOT part of the published forward/reverse
 	// RR set; carried alongside it only to derive the ownership marker.
 	ClientID string
+	// PrevAddr is the PREVIOUS published rdata for a SELF-OWNED Surface A
+	// record (#3739), threaded from publishLocked (seeded across a restart from
+	// the durable store's AddrText). It lets a self-owned backend do a
+	// VALUE-SPECIFIC in-place replace — touch ONLY xpf's own prior value and add
+	// the new one — instead of clobbering the whole name / RRset, which would
+	// destroy a co-resident FOREIGN A/AAAA at a shared name. Zero (invalid) on a
+	// first publish or when the prior value is genuinely unknown; the backend
+	// then does an ADDITIVE insert/create that coexists with any foreign record
+	// (strictly better than clobbering it). Ignored on the DHCP-lease path (that
+	// path re-derives the exact delete from the owned tuple + DHCID) and by
+	// non-self-owned backends.
+	PrevAddr netip.Addr
 	// KeepForwardDHCID, when true on a DeleteLease, tells the replace-owned
 	// RFC 2136 backend to delete the forward A/AAAA but NOT the shared RFC 4701
 	// DHCID — because ANOTHER owned record still shares this FQDN+ClientID

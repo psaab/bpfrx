@@ -1119,6 +1119,17 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		}
 	}
 
+	// Thread the previously-published rdata to the backend (#3739) so a
+	// self-owned publish can do a VALUE-SPECIFIC in-place replace — touch only
+	// xpf's own prior value, never a co-resident FOREIGN record at a shared
+	// name. On a first publish (or a lost prior value) PrevAddr stays invalid and
+	// the backend does an additive insert/create instead of clobbering the name.
+	if prevAddr != "" {
+		if pa, perr := netip.ParseAddr(prevAddr); perr == nil {
+			rec.PrevAddr = pa.Unmap()
+		}
+	}
+
 	// Non-secret backend fingerprint for this publish (#3735). Stored on the owned
 	// record so a later provider identity change is detectable, and compared here
 	// against the previous publish's fingerprint to catch an IN-PLACE provider
