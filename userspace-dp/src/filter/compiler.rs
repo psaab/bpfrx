@@ -464,6 +464,38 @@ fn parse_term(
             term: snap.name.clone(),
         });
     }
+    // #3715: DSCP is a 6-bit field (0..=63). A raw wire value >= 64 can only
+    // arrive from a corrupt / hand-built / version-drifted snapshot — the Go
+    // commit gate (validateFilterDSCPStrict) and the snapshot builder both bound
+    // DSCP to a code-point name or 0..63. A `dscp_values` entry >= 64 is silently
+    // SKIPPED by build_u6_match_bitmap (its `value < 64` guard) while
+    // dscp_match_enabled stays true — the term then matches only the in-range
+    // subset (fail-WIDE / silently-wrong); a `dscp_rewrite` >= 64 was MASKED with
+    // & 0x3f below, turning e.g. 110 into 46 (EF) and marking traffic with a code
+    // point the operator never authored. Range-check both here, in the
+    // non-mutating preflight, and fail the snapshot closed (the reconcile preflight
+    // keeps the previous good filter state), mirroring the #3406 flex_match length
+    // check above.
+    if let Some(&value) = snap.dscp_values.iter().find(|&&v| v > 63) {
+        return Err(SnapshotIntegrityError::FilterDSCPOutOfRange {
+            family: filter_family.to_string(),
+            filter: filter_name.to_string(),
+            term: snap.name.clone(),
+            dimension: "match",
+            value,
+        });
+    }
+    if let Some(value) = snap.dscp_rewrite {
+        if value > 63 {
+            return Err(SnapshotIntegrityError::FilterDSCPOutOfRange {
+                family: filter_family.to_string(),
+                filter: filter_name.to_string(),
+                term: snap.name.clone(),
+                dimension: "rewrite",
+                value,
+            });
+        }
+    }
     // #3406: a present flex_match whose byte length is outside 1..=4 is
     // unrepresentable (the value/mask wire fields are u32). The pre-fix Go builder
     // capped an oversized width to 4 and still emitted the term, so only the
@@ -685,7 +717,11 @@ fn parse_term(
             FilterAction::Discard
         }
     };
-    let dscp_rewrite = snap.dscp_rewrite.map(|value| value & 0x3f);
+    // #3715: no `& 0x3f` mask — the preflight above already rejected any
+    // dscp_rewrite >= 64, so the value is a valid 0..=63 code point verbatim.
+    // Masking would silently turn a corrupt byte (e.g. 110) into a DIFFERENT
+    // valid code point (46 = EF).
+    let dscp_rewrite = snap.dscp_rewrite;
 
     Ok(FilterTerm {
         id,

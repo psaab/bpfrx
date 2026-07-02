@@ -278,6 +278,36 @@ pub(crate) enum SnapshotIntegrityError {
         term: String,
         length: u8,
     },
+    /// #3715: a firewall-filter term carried a raw DSCP wire value outside the
+    /// semantic 0..=63 range (DSCP is a 6-bit field). `dimension` is "match" for a
+    /// `snap.dscp_values` entry >= 64 and "rewrite" for a `snap.dscp_rewrite` byte
+    /// >= 64; `value` is the offending byte. Unlike the `dscp_match_unrepresentable`
+    /// marker (#3406) — which the Go control plane sets after it has already dropped
+    /// an unresolvable code-point NAME — a raw numeric value >= 64 is directly
+    /// visible on the wire (`dscp_values` is Vec<u8>, `dscp_rewrite` is Option<u8>),
+    /// so the range check happens HERE without a Go-side marker. The Go commit gate
+    /// (`validateFilterDSCPStrict`, #3309) bounds both tokens to a code-point name or
+    /// 0..63 and the Go builder (`filters.go`) only ever emits 0..63, so a committed
+    /// config never produces an out-of-range value; this is the helper-boundary
+    /// backstop for a corrupt / hand-built / version-drifted / mixed-version
+    /// snapshot, consistent with the #2505/#3367/#3406 fail-closed family.
+    ///
+    /// Pre-fix the MATCH value was silently dropped by `build_u6_match_bitmap` (its
+    /// `value < 64` guard skipped it) while `dscp_match_enabled` stayed true — a term
+    /// that appears to carry two selectors then matched only the in-range subset
+    /// (fail-WIDE / silently-wrong). The REWRITE value was MASKED with `& 0x3f`,
+    /// turning e.g. 110 into 46 (EF) — actively marking traffic with a code point the
+    /// operator never authored (untrusted traffic could land in EF). Rejecting the
+    /// whole snapshot (the reconcile preflight keeps the previous good filter state)
+    /// never mis-applies. `family` (inet / inet6) is carried because filter names can
+    /// be reused across families.
+    FilterDSCPOutOfRange {
+        family: String,
+        filter: String,
+        term: String,
+        dimension: &'static str,
+        value: u8,
+    },
     /// #3723: a firewall-filter term combined a resolved `protocol` (or the inet6
     /// `next-header`) with an L4 predicate the matcher can NEVER satisfy for that
     /// protocol — a source/destination-port with a non-port-bearing protocol
@@ -653,6 +683,17 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "firewall family {:?} filter {:?} term {:?} has a flexible-match-range byte length {} outside the representable 1..=4 range — refusing to truncate it to a 4-byte window (which would broaden the match)",
                 family, filter, term, length
+            ),
+            Self::FilterDSCPOutOfRange {
+                family,
+                filter,
+                term,
+                dimension,
+                value,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} has a {} dscp/traffic-class value {} outside the 0..=63 6-bit range — refusing to mask it into a different valid code point (rewrite) or silently drop it from the match bitmap (match)",
+                family, filter, term, dimension, value
             ),
             Self::UnsatisfiableFilterCrossField {
                 family,
