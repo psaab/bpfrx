@@ -1,3 +1,47 @@
+## 2026-07-01 — #3776: flow-cache invalidation on session reap (incomplete #2220 closure)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: The per-worker flow-cache keepalive shipped for #2220 (PR
+    #2233, `touch_if_stale` on cache hit) only protects ACTIVELY-forwarding
+    flows. #2220's OWN suggested GC-path `invalidate_slot` was never
+    implemented, so the worker expiry loop
+    (`afxdp/worker/loop_body/mod.rs`) reaped sessions and released their
+    SNAT allocation WITHOUT touching the flow cache. An idle-then-resume
+    flow whose session was GC'd left a surviving `RewriteDescriptor` that
+    kept forwarding on the same 5-tuple — a stateful-firewall bypass (no
+    policy re-eval, no session install, no `show security flow session`
+    row, not HA-synced) — via a SNAT port that
+    `release_source_nat_allocation` may already have re-handed to another
+    flow (NAT-port reuse). Verified: expiry loop had no `invalidate_slot`
+    (only RST teardown `worker/lifecycle.rs:231-235` + neighbor fall-through
+    `flow_cache_hit.rs:125` did); cache `lookup_counted` checks only
+    key+config/fib-gen+RG-epoch+lease, never session liveness
+    (`flow_cache.rs:820-857`).
+    FIX: extracted the reap side-effects into `reap_expired_sessions`
+    (SNAT release + BPF map/conntrack delete + flow-cache invalidate) and
+    call it from the expiry loop. For every reaped entry it now calls
+    `flow_cache.invalidate_slot(&key, binding.ifindex)` on EVERY binding of
+    the owning worker (same-thread; cache is per-binding worker-owned).
+    Safe/precise because the session table is keyed by 5-tuple ALONE (≤1
+    live session per key) and `invalidate_slot` matches key AND ingress —
+    on a non-owning binding it no-ops or drops a stale same-tuple slot,
+    never a live entry. Forward + reverse each reap as their own
+    `ExpiredSession` → both directions covered. Reap path only (~1/s GC) →
+    no per-packet cost, keepalive fast path unchanged. FIN-closed sessions
+    flow through the same wheel (short closing timeout) → covered;
+    config/RG-lifecycle removals already invalidate via generation/epoch
+    stamp checks.
+    Tests (RED-on-revert verified — deleting the invalidate loop fails all
+    3): `reaped_session_flow_cache_slot_is_invalidated` (H1 bypass),
+    `reaped_snat_descriptor_is_not_reused` (H2 SNAT reuse),
+    `live_flow_survives_reap_of_a_different_flow` (no collateral
+    invalidation / keepalive-path preserved). Full `cargo test --release`
+    green.
+  - **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs
+    (reap_expired_sessions helper + call site + reap_flow_cache_tests),
+    userspace-dp/src/session/README.md ("Flow-cache invalidation on reap
+    (#3776)" section)
+
 ## 2026-07-01 — #3769 fold (review MINOR): empty from-routing-instance NAT external = table-agnostic wildcard
 
 - **Timestamp**: 2026-07-01
