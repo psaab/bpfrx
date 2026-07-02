@@ -229,6 +229,21 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 	// NOT a transit default — the dataplane host gate returns None (local
 	// delivery; no global/default fallback). Signal it explicitly so the client
 	// does not render a misleading default-policy verdict for the host path.
+	if res.ContentRejected {
+		// #3727: the dataplane fails this config closed (unexpandable
+		// application-set) and enforces none of its policies. Render the SSOT
+		// fail-closed action string (self-describing) so a gRPC client does not
+		// read a fabricated permit/deny/default verdict. Matched/DefaultUsed stay
+		// false; the structured response has no dedicated content-rejected field,
+		// so the explanatory Action string carries the posture (the reasons are
+		// surfaced in full on the REST and `test policy` text surfaces).
+		return &pb.MatchPoliciesResponse{
+			Matched:         false,
+			Action:          res.DisplayAction(),
+			QueriedFromZone: req.FromZone,
+			QueriedToZone:   req.ToZone,
+		}, nil
+	}
 	if res.HostInboundUnmatched {
 		// #3375: render the same explanatory action string REST returns instead
 		// of leaving it blank, so a gRPC client showing `action` directly gets a

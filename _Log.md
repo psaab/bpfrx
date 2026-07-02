@@ -26997,3 +26997,49 @@ top.
     pkg/dataplane/userspace/{route_overlay,fbf_snapshot,routes_fib_metadata,manager}_test.go
     (2-value call updates), docs/userspace-dataplane-architecture.md +
     docs/multi-wan.md (route-snapshot invariants)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3727 — policy simulator (pkg/policymatch) now fail-closes with
+    RUNTIME PARITY on a malformed application-set. matchApp silently SKIPPED a
+    policy application-set whose config.ExpandApplicationSet errored (bare
+    `continue`, policymatch.go H01) and fell through to a later rule / the
+    configured default-policy, so under `default-policy permit-all` the simulator
+    reported PERMIT for a config the dataplane FAIL-CLOSES; `[ bad-set any ]`
+    returned a confident positive match (review M01). The runtime fails the WHOLE
+    snapshot closed on the same set two ways: pkg/appid BuildCatalog errors so
+    buildSnapshot errors and the apply path retains prior state (#3438), and
+    expandUserspacePolicyApplications poisons the rule with the __unsupported__
+    sentinel the helper integrity preflight rejects (#3261). FIX: Match detects
+    the condition up front, config-wide (policyContentRejectionReasons +
+    appSetExpansionRejects), BEFORE any per-tier / host-gate evaluation, and
+    returns a first-class Result.ContentRejected verdict with
+    ContentRejectionReasons naming the offending policy + set; DisplayAction
+    renders the dedicated ContentRejectedActionString (SSOT for REST/gRPC), and
+    the CLI + `test policy` text surfaces print ContentRejectedShowLine + reasons.
+    Detection is ORDER-INSENSITIVE (both `[ bad-set any ]` and `[ any bad-set ]`
+    fail closed, mirroring the order-insensitive BuildCatalog walk) and config-
+    wide (a malformed set anywhere fails EVERY query, mirroring the whole-snapshot
+    rejection). Scope is only the application-SET expansion error; protocol-less
+    apps (#3323), unrepresentable protocol/port (#2124), and undefined bare app
+    names keep their existing term-level behavior. REST MatchPoliciesResult gains
+    content_rejected + content_rejection_reasons JSON fields; the gRPC
+    MatchPolicies RPC renders the SSOT action string (no proto field). RED-on-
+    revert proven: with the Match gate disabled, 5 simulator tests go RED
+    (default-permit fall-through, `[ bad-set any ]` positive match, `[ any
+    bad-set ]` positive match, unrelated-policy whole-config, global policy).
+    Runtime parity anchored in pkg/dataplane/userspace/app_set_reject_3727_test.go
+    (buildSnapshot errors or records PolicyContentRejected for the same input).
+    go test ./pkg/policymatch/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/...
+    ./pkg/dataplane/userspace/... green; go build ./... green; gofmt clean (vet
+    unreachable-code note is pre-existing in cli.go, untouched).
+  - **File(s)**: pkg/policymatch/policymatch.go (Result.ContentRejected +
+    ContentRejectionReasons, ContentRejectedActionString/ShowLine, DisplayAction,
+    Match content-rejection gate, policyContentRejectionReasons +
+    appSetExpansionRejects + globalPolicyRejectionScope, matchApp err-branch
+    comment), pkg/policymatch/app_set_failclosed_3727_test.go (new),
+    pkg/dataplane/userspace/app_set_reject_3727_test.go (new runtime-parity
+    reference), pkg/api/types.go + pkg/api/security.go (REST fields + handler
+    branch), pkg/grpcapi/server_cluster.go + pkg/grpcapi/server_show_firewall.go
+    (gRPC MatchPolicies + `test policy` branches), pkg/cli/cli_show_security.go +
+    pkg/cli/cli_request.go (CLI branches), pkg/policymatch/README.md
+    (content-rejected verdict section)
