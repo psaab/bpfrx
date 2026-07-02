@@ -520,6 +520,18 @@ sync.
   the captured set is deduped against `tx_selection.filter_counters`
   (`retain_absent_from`) so a count-plus-forwarding-class input term the cos
   TX-selection rebuild already folded in is not recorded twice.
+  **Per-packet CoS BA classifier on cache hits (#3778):** DSCP / IEEE 802.1p
+  behavior-aggregate classifiers pick the egress queue from EACH packet's
+  DSCP / PCP, but the flow-cache key excludes both, so the cached TX-selection
+  froze the SEED packet's queue. `resolve_cached_cos_tx_selection` now sets
+  `CachedTxSelectionDescriptor::ba_reclassify` when the queue was NOT pinned by
+  a (5-tuple-stable) filter forwarding-class AND a BA classifier is configured
+  on the egress interface; `flow_cache_hit.rs` then re-resolves the queue per
+  packet via `reclassify_cached_ba_queue` (one FastMap lookup + two array
+  reads, gated by the flag so filter-FC-pinned / default-queue / no-CoS flows
+  keep the frozen queue for free). A `then forwarding-class` filter term stays
+  cached (its queue is 5-tuple-stable); only the DSCP/PCP-derived queue is
+  per-packet.
   Producers must use the event-stream worker handle so rate limiting,
   queue-budget accounting, replay, and daemon callback ACK behavior stay
   centralized in `event_stream/`.

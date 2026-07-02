@@ -3,7 +3,9 @@ use super::*;
 use crate::test_zone_ids::*;
 use crate::xsk_ffi::IfInfo;
 use crate::{
-    DestinationNATRuleSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
+    ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
+    CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
+    CoSSchedulerSnapshot, DestinationNATRuleSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
     InterfaceAddressSnapshot, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot,
     SourceNATRuleSnapshot, StaticNATRuleSnapshot, ThreeColorPolicerSnapshot, ZoneSnapshot,
 };
@@ -7717,6 +7719,159 @@ fn txn_flow_cache_hit_replays_input_filter_then_count_3777() {
         input_counter.packets.load(Ordering::Relaxed),
         2,
         "the flow-cache hit MUST replay the interface input `then count` (#3777)"
+    );
+}
+
+/// #3778 RED-on-revert: a CoS behavior-aggregate (DSCP) classifier is
+/// per-packet in vSRX, but the cached TX-selection froze the SEED packet's
+/// queue (the flow-cache key excludes DSCP). Packet 1 (DSCP 0) seeds the cache
+/// on the default queue; packet 2 (same 5-tuple, DSCP 46 = EF) hits the flow
+/// cache and MUST re-classify to the EF queue. Reverting the per-packet
+/// re-classify replays the frozen default queue (queue 0), which this asserts
+/// against (expects queue 1).
+#[test]
+fn txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778() {
+    let mut snapshot = nat_snapshot();
+    // CoS on the WAN egress (reth0.80, ifindex 12): a DSCP BA classifier maps
+    // DSCP 46 (EF) -> expedited-forwarding (queue 1); DSCP 0 is unmapped and
+    // falls to the default best-effort queue (0).
+    snapshot.interfaces[1].cos_shaping_rate_bytes_per_sec = 10_000_000;
+    snapshot.interfaces[1].cos_shaping_burst_bytes = 256_000;
+    snapshot.interfaces[1].cos_scheduler_map = "wan-map".to_string();
+    snapshot.interfaces[1].cos_dscp_classifier = "cls".to_string();
+    snapshot.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![
+            CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            },
+            CoSForwardingClassSnapshot {
+                name: "expedited-forwarding".into(),
+                queue: 1,
+            },
+        ],
+        dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+            name: "cls".into(),
+            entries: vec![CoSDSCPClassifierEntrySnapshot {
+                forwarding_class: "expedited-forwarding".into(),
+                loss_priority: "low".into(),
+                dscp_values: vec![46],
+            }],
+        }],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+        schedulers: vec![
+            CoSSchedulerSnapshot {
+                name: "be-sched".into(),
+                transmit_rate_bytes: 4_000_000,
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 128_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+            CoSSchedulerSnapshot {
+                name: "ef-sched".into(),
+                transmit_rate_bytes: 6_000_000,
+                transmit_rate_exact: false,
+                priority: "strict-high".into(),
+                buffer_size_bytes: 64_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+        ],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: "be-sched".into(),
+                },
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "expedited-forwarding".into(),
+                    scheduler: "ef-sched".into(),
+                },
+            ],
+        }],
+    });
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // Packet 1 (pure ACK = established, cache-eligible; DSCP 0): seeds the
+    // cache on the default queue.
+    let frame1 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let mut meta1 = txn_meta_v4(24, 0x10_u8, (frame1.len() - 14) as u16);
+    meta1.dscp = 0;
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame1,
+        meta1,
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded established ACK must seed the flow cache"
+    );
+    let seed_q = binding
+        .scratch
+        .scratch_forwards
+        .last()
+        .and_then(|r| r.cos_queue_id);
+    assert_eq!(
+        seed_q,
+        Some(0),
+        "DSCP-0 seed packet must land on the default (best-effort) queue"
+    );
+
+    // Packet 2 (same 5-tuple, DSCP 46 = EF): flow-cache HIT. The BA classifier
+    // MUST re-classify per packet to the EF queue instead of replaying the
+    // frozen default.
+    let frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let mut meta2 = txn_meta_v4(24, 0x10_u8, (frame2.len() - 14) as u16);
+    meta2.dscp = 46;
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    let hit_q = binding
+        .scratch
+        .scratch_forwards
+        .last()
+        .and_then(|r| r.cos_queue_id);
+    assert_eq!(
+        hit_q,
+        Some(1),
+        "the flow-cache hit MUST re-classify DSCP 46 to the EF queue (#3778), \
+         not replay the seed's frozen default queue"
     );
 }
 

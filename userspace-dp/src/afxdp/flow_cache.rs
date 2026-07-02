@@ -57,6 +57,16 @@ pub(super) struct CachedTxSelectionDescriptor {
     pub(super) filter_counters: crate::filter::CachedFilterCounters,
     pub(super) three_color_policers: crate::filter::CachedThreeColorPolicers,
     pub(super) filter_log: Option<crate::filter::FilterLogMatch>,
+    // #3778: the cached `queue_id` is resolved from the SEED packet's DSCP /
+    // 802.1p PCP. Behavior-aggregate (BA) classifiers are per-packet in vSRX
+    // and the flow-cache key excludes DSCP/PCP, so when the queue was chosen by
+    // a BA classifier (NOT a 5-tuple-stable filter forwarding-class) it must be
+    // re-resolved per packet on the hit path. True iff a BA classifier is
+    // configured on the egress interface AND no filter forwarding-class pinned
+    // the queue; false keeps the frozen `queue_id` (default-queue / filter-FC /
+    // no-CoS flows), so the per-packet re-classify cost is paid only when it can
+    // change the queue.
+    pub(super) ba_reclassify: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -193,7 +193,25 @@ pub(super) fn stage_flow_cache_hit(
             scratch.scratch_recycle.push(desc.addr);
             return FlowCacheOutcome::Consumed;
         }
-        let cached_queue_id = cached_descriptor.tx_selection.queue_id;
+        // #3778: behavior-aggregate (DSCP / 802.1p PCP) classifiers are
+        // per-packet in vSRX, but the cached queue was frozen from the SEED
+        // packet's DSCP/PCP (the flow-cache key excludes both). When the seed
+        // marked this descriptor `ba_reclassify` (a BA classifier is active and
+        // no filter forwarding-class pinned the queue), re-resolve THIS packet's
+        // queue from its own DSCP/PCP so a mixed-marking flow is not pinned to
+        // the first packet's queue. Otherwise the frozen queue is correct.
+        let cached_queue_id = if cached_descriptor.tx_selection.ba_reclassify {
+            reclassify_cached_ba_queue(
+                worker_ctx.forwarding,
+                cached_decision.resolution.egress_ifindex,
+                meta.dscp,
+                meta.ingress_pcp,
+                meta.ingress_vlan_present != 0,
+            )
+            .or(cached_descriptor.tx_selection.queue_id)
+        } else {
+            cached_descriptor.tx_selection.queue_id
+        };
         let cached_dscp_rewrite = policer_action
             .dscp_rewrite
             .or(cached_descriptor.tx_selection.dscp_rewrite);

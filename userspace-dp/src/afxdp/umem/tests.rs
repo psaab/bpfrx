@@ -1501,6 +1501,7 @@ fn active_flow_debug_test_entry(
                 filter_counters: crate::filter::CachedFilterCounters::default(),
                 three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
                 filter_log: None,
+                ba_reclassify: false,
             },
             nat64: false,
             nptv6: false,
