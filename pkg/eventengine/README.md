@@ -25,6 +25,24 @@ temporal `within` windows) and triggers commit-and-apply actions.
 
 `pkg/config`, `pkg/configstore`, `pkg/rpm`.
 
+## Daemon lifecycle (#3752 / #3755)
+
+The daemon constructs the engine UNCONDITIONALLY at boot (`initEventEngine`,
+`pkg/daemon`), mirroring the LLDP manager and DHCP relay: the `d.eventEngine`
+pointer is written once and read-only thereafter (race-free `Stats()` reads),
+and `reconcileEventOptions` applies the committed policy set at boot and on
+every day-2 commit. Because the engine always exists, enabling the FIRST
+event-options policy on a running daemon takes effect immediately instead of
+being inert until a restart (#3752 — the old code constructed the engine only
+when the boot config already had a policy).
+
+`initEventEngine` also registers the RPM event callback BEFORE `reconcileRPM`
+starts the probe goroutines. RPM runs each probe's first cycle immediately, so
+a `ping_probe_failed`/`ping_test_failed`/`ping_test_completed` from that first
+cycle would otherwise fire into a nil callback and be lost (#3755); registering
+first closes the gap, and `pkg/rpm` additionally buffers-and-replays any event
+fired before a callback exists as a belt against a future reorder.
+
 ## Transactional batch (#2139)
 
 A `change-configuration` action's `then` commands are applied as an

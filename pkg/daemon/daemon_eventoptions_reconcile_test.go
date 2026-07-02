@@ -95,6 +95,29 @@ func TestReconcileEventOptionsDay2Enable(t *testing.T) {
 	d.eventEngine.Close()
 }
 
+// TestInitEventEngineRegistersRPMCallbackBeforeProbes pins the #3755 ordering
+// guarantee at the boot-wiring level: initEventEngine (called before
+// reconcileRPM starts probes) registers the RPM event callback, so the first
+// probe cycle's events reach the event engine instead of firing into a nil
+// callback. If the callback registration is dropped from initEventEngine, or
+// initEventEngine is not run before probes start, HasEventCallback stays false.
+func TestInitEventEngineRegistersRPMCallbackBeforeProbes(t *testing.T) {
+	d := &Daemon{
+		daemonCtx: context.Background(),
+		rpm:       rpm.New(),
+		store:     newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf")),
+	}
+	if d.rpm.HasEventCallback() {
+		t.Fatal("RPM event callback set before initEventEngine")
+	}
+	d.initEventEngine()
+	if !d.rpm.HasEventCallback() {
+		t.Fatal("initEventEngine did not register the RPM event callback " +
+			"(the first probe cycle's events would be dropped, #3755)")
+	}
+	d.eventEngine.Close()
+}
+
 // reconcileEventOptions must tolerate a nil config (bootstrap / no-active-
 // config paths call it as a safety net).
 func TestReconcileEventOptionsNilConfig(t *testing.T) {

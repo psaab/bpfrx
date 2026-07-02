@@ -1,3 +1,21 @@
+## 2026-07-01 — #3755: RPM first probe cycle event reaches event-options
+
+- **Timestamp**: 2026-07-01
+  - **Action**: RPM probes ran their first cycle immediately, before the
+    event-options callback was registered (SetEventCallback ran later at boot),
+    so the first cycle's events were dropped (fireEvent no-op on nil callback).
+    Fix: moved initEventEngine (which registers the RPM event callback) BEFORE
+    the boot applyConfig/reconcileRPM in daemon_run.go — callback wired before
+    probes start. Belt: rpm.Manager buffers events fired while onEvent==nil
+    (bounded maxBufferedEvents) and replays them FIFO on SetEventCallback;
+    added HasEventCallback accessor. RED-on-revert:
+    TestFireEventBufferedUntilCallbackRegistered (rpm) +
+    TestInitEventEngineRegistersRPMCallbackBeforeProbes (daemon).
+  - **File(s)**: pkg/rpm/rpm.go, pkg/rpm/event_buffer_3755_test.go,
+    pkg/rpm/README.md, pkg/daemon/daemon_run.go,
+    pkg/daemon/daemon_eventoptions_reconcile_test.go,
+    pkg/eventengine/README.md
+
 ## 2026-07-01 — #3752: event-options engine day-2 first-enable start
 
 - **Timestamp**: 2026-07-01
