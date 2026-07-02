@@ -169,6 +169,59 @@ func TestDuckDNSDualStackNameWarns(t *testing.T) {
 	}
 }
 
+// TestDyndns2DualStackNameWarns is the #3738 fail-on-revert gate for the dyndns2
+// host-level withdraw: a single dyndns2 name bound on BOTH inet and inet6 must
+// warn at commit, because dyndns2's only withdraw verb (offline=YES) is
+// HOSTNAME-level — it takes both families down, so a single-family withdraw
+// cannot be expressed on the wire (the runtime now suppresses the offline while
+// the sibling is live, preserving it). RED without the dyndns2 cross-family
+// detection in validateSurfaceADDNSWarnings. A single-family dyndns2 name, and a
+// dual-stack name on a per-family backend (cloudflare), must NOT warn.
+func TestDyndns2DualStackNameWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider dd2 backend dyndns2",
+		"set system services dynamic-dns provider dd2 server https://dyn.example.net/nic/update",
+		"set system services dynamic-dns provider dd2 username u",
+		"set system services dynamic-dns provider dd2 password p",
+		// DUAL-STACK on the SAME dyndns2 name → must warn (host-level offline).
+		"set interfaces ge-0-0-2 unit 0 family inet dynamic-dns provider dd2",
+		"set interfaces ge-0-0-2 unit 0 family inet dynamic-dns hostname wan.example.net",
+		"set interfaces ge-0-0-2 unit 0 family inet6 dynamic-dns provider dd2",
+		"set interfaces ge-0-0-2 unit 0 family inet6 dynamic-dns hostname wan.example.net",
+		// SINGLE-FAMILY dyndns2 name → must NOT warn.
+		"set interfaces ge-0-0-2 unit 1 family inet dynamic-dns provider dd2",
+		"set interfaces ge-0-0-2 unit 1 family inet dynamic-dns hostname v4only.example.net",
+		// A dual-stack name on a per-family backend → must NOT warn (cloudflare).
+		"set system services dynamic-dns provider cf backend cloudflare",
+		"set system services dynamic-dns provider cf api-token cf-secret",
+		"set system services dynamic-dns provider cf zone example.net",
+		"set interfaces ge-0-0-2 unit 2 family inet dynamic-dns provider cf",
+		"set interfaces ge-0-0-2 unit 2 family inet dynamic-dns hostname dual.example.net",
+		"set interfaces ge-0-0-2 unit 2 family inet6 dynamic-dns provider cf",
+		"set interfaces ge-0-0-2 unit 2 family inet6 dynamic-dns hostname dual.example.net",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warns := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warns, "\n")
+
+	if !strings.Contains(joined, `provider "dd2" (backend dyndns2) hostname "wan.example.net" is bound on BOTH inet and inet6`) {
+		t.Fatalf("expected a dyndns2 dual-stack withdraw warning for wan.example.net; got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "offline=YES") {
+		t.Fatalf("dyndns2 dual-stack warning should name the offline=YES host-level verb; got:\n%s", joined)
+	}
+	// No false positives.
+	if strings.Contains(joined, "v4only.example.net") {
+		t.Fatalf("single-family dyndns2 name must NOT warn; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "dual.example.net") {
+		t.Fatalf("dual-stack name on a per-family (cloudflare) backend must NOT warn; got:\n%s", joined)
+	}
+}
+
 // TestP3CheckIPURLMalformedWarns is the #2773 fail-on-revert gate: a malformed
 // checkip-url must be flagged at commit (was dead code — validateCheckIPURL had
 // no callers, so a typo committed silently and then masqueraded forever as a
