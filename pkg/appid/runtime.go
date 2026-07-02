@@ -3,7 +3,6 @@ package appid
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -263,18 +262,56 @@ func matchTuple(proto uint8, srcPort, dstPort uint16, appProto, appSrcPort, appD
 // portInSpec reports whether port satisfies an application port spec. An empty
 // spec means "no constraint" and always matches. A "lo-hi" spec is an inclusive
 // range; a bare value is an exact match. A malformed spec never matches.
+//
+// #3725 (H02/M05): the tuple fallback MUST parse a port token the same way the
+// strict commit gate does (config.validatePortSpec via config.ParseCanonicalUint)
+// and reject anything the strict path rejects, rather than mislabeling a real
+// session as a malformed app. The old strconv.Atoi parse had two mislabel bugs
+// on the tolerant-load / stale-persisted / peer-sync path (strict commit rejects
+// these specs, but a leniently-loaded typed config still flows into this
+// fallback):
+//   - uint16 narrowing: strconv.Atoi("70000")==70000 and uint16(70000)==4464, so
+//     portInSpec(4464,"70000") was true — a real session to port 4464 got labeled
+//     as the malformed "70000" app.
+//   - signed acceptance: strconv.Atoi("+80")==80, so a "+80" spec matched port 80
+//     even though the canonical config parser rejects the signed spelling.
+//
+// canonicalPort (below) parses bare unsigned digits only and range-checks
+// 1..65535, so a malformed spec is DROPPED (never matches / never mislabels)
+// consistent with the strict path, the catalog parser, and the NAT parser.
 func portInSpec(port uint16, spec string) bool {
 	if spec == "" {
 		return true
 	}
 	if strings.Contains(spec, "-") {
 		parts := strings.SplitN(spec, "-", 2)
-		lo, err1 := strconv.Atoi(parts[0])
-		hi, err2 := strconv.Atoi(parts[1])
-		return err1 == nil && err2 == nil && int(port) >= lo && int(port) <= hi
+		lo, ok1 := canonicalPort(parts[0])
+		hi, ok2 := canonicalPort(parts[1])
+		// A reversed range (lo>hi) can never match any port; reject it here so
+		// the fallback fails CLOSED rather than treating garbage bounds as a
+		// live constraint (mirrors validatePortSpec's start>end rejection).
+		if !ok1 || !ok2 || lo > hi {
+			return false
+		}
+		return port >= lo && port <= hi
 	}
-	v, err := strconv.Atoi(spec)
-	return err == nil && uint16(v) == port
+	v, ok := canonicalPort(spec)
+	return ok && v == port
+}
+
+// canonicalPort parses one canonical port token — a bare run of unsigned decimal
+// digits, no sign and no surrounding whitespace — and requires it in the valid
+// 1..65535 range. It returns ok=false for a signed ("+80"), non-numeric, or
+// out-of-range ("70000") token so a malformed spec is dropped rather than
+// sign-stripped or uint16-narrowed into a wrong-but-plausible port. This mirrors
+// the strict commit gate config.validatePortSpec, which parses through
+// config.ParseCanonicalUint and range-checks 1..65535.
+func canonicalPort(s string) (uint16, bool) {
+	n, err := config.ParseCanonicalUint(s)
+	if err != nil || n < 1 || n > 65535 {
+		return 0, false
+	}
+	return uint16(n), true
 }
 
 // protocolNumber resolves a protocol token for app-id runtime tuple matching.

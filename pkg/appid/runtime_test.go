@@ -343,6 +343,87 @@ func TestResolveTupleFallbackPrefersPortOverProtocol(t *testing.T) {
 	}
 }
 
+// TestPortInSpecCanonicalRejectsMalformed is the #3725 H02/M05 fail-on-revert
+// guard for the tuple-fallback port parser. The old strconv.Atoi parse
+// MISLABELED sessions on the tolerant-load path:
+//   - H02 (uint16 narrowing): strconv.Atoi("70000")==70000, uint16(70000)==4464,
+//     so portInSpec(4464,"70000") was TRUE — a real session to port 4464 matched
+//     a spec that strict commit rejects.
+//   - M05 (signed acceptance): strconv.Atoi("+80")==80, so "+80" matched port 80.
+//
+// Reverting portInSpec to strconv.Atoi turns the "must NOT match" assertions RED.
+func TestPortInSpecCanonicalRejectsMalformed(t *testing.T) {
+	// H02: an out-of-range single port must never match the uint16-narrowed
+	// value (4464), and must not match its own numeric value either.
+	if portInSpec(4464, "70000") {
+		t.Error("portInSpec(4464, \"70000\") = true; out-of-range spec must not uint16-narrow and match port 4464 (H02)")
+	}
+	if portInSpec(70000&0xFFFF, "70000") {
+		t.Error("portInSpec of the narrowed value must be false — a malformed spec must be dropped, not narrowed (H02)")
+	}
+	// M05: a signed spelling the strict gate rejects must not match here.
+	if portInSpec(80, "+80") {
+		t.Error("portInSpec(80, \"+80\") = true; the signed spelling must be rejected like strict commit (M05)")
+	}
+	if portInSpec(0, "+0") {
+		t.Error("portInSpec(0, \"+0\") = true; signed / zero spec must not match (M05)")
+	}
+	// An out-of-range endpoint inside a range must not narrow either.
+	if portInSpec(4464, "70000-70001") {
+		t.Error("portInSpec(4464, \"70000-70001\") = true; range endpoints must not uint16-narrow (H02)")
+	}
+	// A reversed range never matches any port (fail closed).
+	if portInSpec(150, "200-100") {
+		t.Error("portInSpec(150, \"200-100\") = true; a reversed range must never match")
+	}
+	// Port 0 is out of the valid 1..65535 range and must never match.
+	if portInSpec(0, "0") {
+		t.Error("portInSpec(0, \"0\") = true; port 0 is invalid and must be dropped")
+	}
+
+	// Well-formed specs still parse correctly (no over-rejection / no brick).
+	if !portInSpec(80, "80") {
+		t.Error("portInSpec(80, \"80\") = false; a well-formed exact port must still match")
+	}
+	if !portInSpec(8444, "8443-8445") {
+		t.Error("portInSpec(8444, \"8443-8445\") = false; a well-formed range must still match")
+	}
+	if portInSpec(9000, "8443-8445") {
+		t.Error("portInSpec(9000, \"8443-8445\") = true; port outside a well-formed range must not match")
+	}
+	if !portInSpec(65535, "65535") {
+		t.Error("portInSpec(65535, \"65535\") = false; the max valid port must match")
+	}
+	if !portInSpec(1234, "") {
+		t.Error("portInSpec(1234, \"\") = false; an empty (unconstrained) spec must always match")
+	}
+}
+
+// TestResolveTupleFallbackNoMislabelOnMalformedPort proves the H02/M05 fix flows
+// through the whole tuple fallback: a custom app carrying an out-of-range or
+// signed port spec (admitted by the tolerant-load path, rejected by strict
+// commit) must NOT be attributed to a real session whose port equals the
+// uint16-narrowed or sign-stripped value. Reverting portInSpec to strconv.Atoi
+// makes the session resolve to the malformed app name and fails this test.
+func TestResolveTupleFallbackNoMislabelOnMalformedPort(t *testing.T) {
+	cfg := &config.Config{
+		Applications: config.ApplicationsConfig{
+			Applications: map[string]*config.Application{
+				// 70000 & 0xFFFF == 4464
+				"bad-narrow": {Name: "bad-narrow", Protocol: "tcp", DestinationPort: "70000"},
+				"bad-signed": {Name: "bad-signed", Protocol: "udp", DestinationPort: "+80"},
+			},
+		},
+	}
+	// AppID disabled → tuple fallback is the active path.
+	if got := ResolveSessionName(nil, cfg, 6, 40000, 4464, 0); got == "bad-narrow" {
+		t.Fatalf("TCP/4464 = %q, must not be mislabeled as the out-of-range \"70000\" app (H02)", got)
+	}
+	if got := ResolveSessionName(nil, cfg, 17, 40000, 80, 0); got == "bad-signed" {
+		t.Fatalf("UDP/80 = %q, must not be mislabeled as the signed \"+80\" app (M05)", got)
+	}
+}
+
 func TestSessionMatchesUnknown(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.ApplicationIdentification = true
