@@ -6162,3 +6162,137 @@ fn parse_port_spec_rejects_signed_3606() {
         }])
     );
 }
+
+// === #3783: configured_zone_pairs wildcard/global histogram-slot expansion ===
+
+/// A `from-zone any to-zone untrust` wildcard has no exact zone-pair entry, so
+/// the cold-path histogram would have no slot for the concrete pair a packet
+/// traverses. `configured_zone_pairs` (the slot-map input) must materialize
+/// EVERY concrete `from -> untrust` pair, and nothing with another to-zone
+/// (the wildcard is to-zone-pinned).
+#[test]
+fn configured_zone_pairs_expands_from_any_wildcard() {
+    let zmap = test_zone_name_to_id();
+    let rule = PolicyRuleSnapshot {
+        name: "wild".to_string(),
+        from_zone: "any".to_string(),
+        to_zone: "untrust".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let state = parse_policy_state("deny", &[rule], &zmap);
+    let pairs = state.configured_zone_pairs();
+    for &from in &[
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+        TEST_SFMIX_ZONE_ID,
+    ] {
+        assert!(
+            pairs.contains(&(from, TEST_UNTRUST_ZONE_ID)),
+            "missing {from}->untrust in {pairs:?}"
+        );
+    }
+    assert!(
+        pairs.iter().all(|&(_, to)| to == TEST_UNTRUST_ZONE_ID),
+        "from-any is to-zone-pinned; unexpected to-zone in {pairs:?}"
+    );
+}
+
+/// `from-zone any to-zone any` must expand to the full concrete cross-product
+/// so every zone-pair a packet can traverse gets a histogram slot.
+#[test]
+fn configured_zone_pairs_expands_both_any() {
+    let zmap = test_zone_name_to_id();
+    let rule = PolicyRuleSnapshot {
+        name: "catch-all".to_string(),
+        from_zone: "any".to_string(),
+        to_zone: "any".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let state = parse_policy_state("deny", &[rule], &zmap);
+    let pairs = state.configured_zone_pairs();
+    // 5 concrete zones ⇒ 25 pairs.
+    assert_eq!(
+        pairs.len(),
+        25,
+        "both-any ⇒ full 5x5 cross-product: {pairs:?}"
+    );
+    assert!(pairs.contains(&(TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID)));
+    assert!(pairs.contains(&(TEST_SFMIX_ZONE_ID, TEST_LAN_ZONE_ID)));
+}
+
+/// A scoped `junos-global` policy (`match from-zone trust; to-zone untrust;`)
+/// expands to EXACTLY its pinned pair — not the full cross-product — while an
+/// unscoped global expands to every concrete pair.
+#[test]
+fn configured_zone_pairs_global_scope_semantics() {
+    let zmap = test_zone_name_to_id();
+
+    let scoped = PolicyRuleSnapshot {
+        name: "scoped".to_string(),
+        from_zone: "junos-global".to_string(),
+        to_zone: "junos-global".to_string(),
+        match_from_zone: "trust".to_string(),
+        match_to_zone: "untrust".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let state = parse_policy_state("deny", &[scoped], &zmap);
+    assert_eq!(
+        state.configured_zone_pairs(),
+        vec![(TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID)],
+        "scoped global expands to exactly its pinned pair"
+    );
+
+    let unscoped = PolicyRuleSnapshot {
+        name: "unscoped".to_string(),
+        from_zone: "junos-global".to_string(),
+        to_zone: "junos-global".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let state = parse_policy_state("deny", &[unscoped], &zmap);
+    assert_eq!(
+        state.configured_zone_pairs().len(),
+        25,
+        "unscoped global ⇒ full 5x5 cross-product"
+    );
+}
+
+/// No regression for the pure exact-pair case: an exact zone-pair policy still
+/// yields exactly its one pair, with no wildcard-style broadening.
+#[test]
+fn configured_zone_pairs_exact_only_not_overbroadened() {
+    let zmap = test_zone_name_to_id();
+    let rule = PolicyRuleSnapshot {
+        name: "exact".to_string(),
+        from_zone: "trust".to_string(),
+        to_zone: "untrust".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let state = parse_policy_state("deny", &[rule], &zmap);
+    assert_eq!(
+        state.configured_zone_pairs(),
+        vec![(TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID)],
+        "exact-only config yields exactly its one pair"
+    );
+}

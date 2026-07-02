@@ -27526,3 +27526,36 @@ top.
   pkg/config/schema_validators.go (maxWireI32),
   pkg/config/schema_route_preference_3771_test.go (commit-gate tests),
   userspace-dp/src/afxdp/forwarding/README.md, userspace-dp/src/FEATURES.md
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3783 — cold-path latency histogram slot coverage for
+  wildcard/global-only policies. `PolicyState::configured_zone_pairs()`
+  (the input to `ColdPathSlotMap`) enumerated ONLY the exact
+  `zone_pair_index` keys, so a catch-all deployment (`from-zone any
+  to-zone <z>` / `to-zone any` / `from-zone any to-zone any` /
+  `security policies global`) produced zero exact pairs — the concrete
+  `(from,to)` a packet traverses had no slot and the #1635 first-packet
+  latency sample was silently dropped on the `lookup_slot` miss (dark
+  telemetry for the common vSRX design). Fix: added
+  `PolicyState.concrete_zone_ids` (the non-zero/non-reserved zone-id
+  universe from `zone_name_to_id`, captured at parse time) and reworked
+  `configured_zone_pairs()` to emit two tiers — exact pairs FIRST (slot
+  priority), then the concrete pairs each wildcard/global scope can match
+  (from-any → every `(f,Z)`; to-any → every `(F,t)`; both-any →
+  cross-product; `junos-global` → cross-product narrowed by its
+  `GlobalZoneScope`). Config-derived + deterministic → HA-symmetric slot
+  layout (histogram counts are per-node local telemetry, not wire-synced;
+  no session-sync/wire change → no test-failover needed). Surplus past 255
+  slots still handled by `ColdPathSlotMap::build`'s `overflow_active`;
+  exact pairs win because assigned first. Added 6 tests (2 end-to-end
+  through `parse_policy_state → configured_zone_pairs → ColdPathSlotMap →
+  lookup_slot` in cold_path_hist.rs, 4 semantics in policy_tests.rs);
+  verified RED-on-revert (5 fail on the old exact-only body, exact-only
+  no-regression test stays green). Full `cargo test --release` green
+  (3404 lib + aux binaries, 0 failed).
+- **File(s)**: userspace-dp/src/policy.rs (concrete_zone_ids field +
+  Default + parse populate + configured_zone_pairs two-tier rewrite),
+  userspace-dp/src/afxdp/cold_path_hist.rs (ColdPathSlotMap doc + 2
+  end-to-end tests), userspace-dp/src/policy_tests.rs (4 semantics tests),
+  docs/userspace-dataplane-architecture.md (#3783 histogram-slot-coverage
+  paragraph)

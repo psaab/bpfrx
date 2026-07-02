@@ -645,6 +645,32 @@ probes per cold-path evaluation — no N×N materialization of concrete pairs. A
 deliberately not applied to host-bound traffic to preserve the management
 lifeline guarantee. This lifted the #3018 interim commit reject.
 
+**Cold-path histogram slot coverage for wildcard/global policies (#3783).**
+The first-packet latency histogram (#1635, sparse slot map since #3075) is
+keyed at record time on the CONCRETE `(from_zone_id, to_zone_id)` a packet
+traverses (`poll_descriptor::lookup_slot`), and its slot set comes from
+`PolicyState::configured_zone_pairs()`. That function originally enumerated
+ONLY the exact `zone_pair_index` keys, so a deployment whose only rules are
+`from-zone any to-zone <z>` / `to-zone any` / `from-zone any to-zone any` or
+`security policies global` produced ZERO exact pairs — the concrete pair a
+packet actually took had no slot and the latency sample was silently dropped,
+dark-ing the instrument for exactly the catch-all designs operators commonly
+deploy. `configured_zone_pairs()` now emits two tiers: (1) the exact pairs
+FIRST (they keep slot priority so a mixed config never starves a named pair),
+then (2) the concrete pairs the wildcard/global scopes can match, materialized
+from the snapshot's concrete-zone universe (`PolicyState::concrete_zone_ids`,
+every non-zero non-reserved id in `zone_name_to_id`) constrained by each scope —
+`from-zone any to-zone Z` → every `(f, Z)`; `to-zone any from-zone F` →
+every `(F, t)`; both-any → the full cross-product; a `junos-global` rule → the
+cross-product narrowed by its `match from-zone`/`to-zone` `GlobalZoneScope`
+(#3148). The expansion is config-derived and deterministic, so both HA nodes
+build the identical slot map from the identical config (the histogram counts
+are per-node local telemetry scraped via status/Prometheus — not wire-synced —
+but the slot LAYOUT stays symmetric). If the union exceeds the 255-slot
+capacity the surplus is dropped by `ColdPathSlotMap::build` and surfaced via its
+`overflow_active` flag; exact pairs are assigned first, so they win under
+pressure.
+
 **Global policy zone context (#3148).** A Junos global policy may carry optional
 `match { from-zone <z>; to-zone <z>; }` to scope it to one zone pair (or one
 wildcard side) instead of every zone pair. Such a rule keeps the
