@@ -143,7 +143,11 @@ pub(super) fn stage_flow_cache_hit(
         // (ICMP-of-ICMP, rate limited, or an output-filter drop of the reply) —
         // is dropped, in BOTH cases before any egress counter/policer/log moves.
         // Non-expiring packets fall straight through (Some(false)) with no
-        // behavior change.
+        // behavior change. A TTL-expired hit returns Consumed here BEFORE the
+        // session accounting further down (sessions.account_packet /
+        // touch_if_stale): an expired packet is never egressed, so it must not
+        // charge session byte/packet counters or refresh the idle timer —
+        // matching the slow path, which also drops before accounting.
         if matches!(
             cached_decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
