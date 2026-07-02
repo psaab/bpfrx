@@ -1,3 +1,44 @@
+## 2026-07-01 — #3710: host-inbound addressless observability per-interface/per-family
+
+- **Timestamp**: 2026-07-01
+  - **Action**: Refine the #3698 addressless host-inbound fail-open reporter.
+    `AddresslessEnforcingZones` collapses to ZONE granularity — a zone is
+    marked "scoped" (and stays silent) the moment ANY interface resolves an
+    address in EITHER family. But enforcement is per-destination-address and
+    per-family (the kernel chain emits `<fam> daddr <set> ... drop` separately
+    for inet and inet6), so a MIXED zone still carries real fail-open windows
+    the zone-level view cannot express: (1) a DHCP-pending interface beside a
+    statically-addressed sibling; (2) the IPv6 side of a dual-stack edge whose
+    v6 lease lands after its v4. Added `AddresslessEnforcingInterfaces` (SSOT
+    in `pkg/dataplane/userspace/zones.go`) reporting `{zone, interface-unit,
+    family, reason}` at unit+family granularity. It reports a non-lifeline unit
+    in a configured enforcing zone when a family has a DHCP/DHCPv6 client
+    configured but resolves NO address in that family, using the SAME static /
+    live-kernel + configured-VRRP-VIP resolution `BuildZoneHostInboundViews`
+    scopes the deny with. Only `dhcp-pending` is reported — static addrs and
+    VIPs are config-injected regardless of link/lease state, so they never open
+    a per-interface window; gating on a configured DHCP client (not "any family
+    with no address") keeps it low-noise (an IPv4-only interface is NOT flagged
+    addressless in inet6). Wired a daemon state-transition logger
+    (`logHostInboundAddresslessIfaceTransitions`, WARN on entry / INFO on
+    recovery, transitions only, new `hostInboundAddresslessIfaces` diff field)
+    and a Prometheus gauge
+    `xpf_host_inbound_addressless_interfaces{zone,interface,family,reason}`
+    emitted BEFORE the dataplane gate. The zone-level
+    `xpf_host_inbound_addressless_zones` is unchanged (coarser compatibility
+    aggregate). Observability-only, no enforcement change. Go-only (no
+    Rust/cargo). RED-on-revert: `TestAddresslessEnforcingInterfaces` — a mixed
+    zone surfaces `trust/ge-0-0-1.0/inet` + `dual/ge-0-0-2.0/inet6`; collapsing
+    the reporter to zone-granularity (skip a unit whose zone resolves any addr)
+    yields empty and fails the test. Low-noise + self-heal + IPv4-only-no-v6 +
+    empty-config cases also pinned. `go test ./pkg/dataplane/... ./pkg/api/...
+    ./pkg/daemon/` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/dataplane/userspace/zones.go,
+    pkg/dataplane/userspace/zones_addressless_iface_3710_test.go,
+    pkg/daemon/daemon.go, pkg/daemon/daemon_nft.go, pkg/api/metrics.go,
+    pkg/api/metrics_descriptors.go, pkg/api/metrics_counters.go,
+    docs/host-inbound-service-matrix.md, _Log.md
+
 ## 2026-07-01 — #3830: NAT hit-counter clear post-clear increment race
 
 - **Timestamp**: 2026-07-01

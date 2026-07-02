@@ -228,6 +228,52 @@ Two observability surfaces consume it:
   visible in a config-only / degraded boot). Alert with e.g.
   `max_over_time(xpf_host_inbound_addressless_zones[1h]) > 0`.
 
+### Per-interface / per-family refinement (#3710)
+
+The zone-level signal above **collapses**: `AddresslessEnforcingZones` marks a
+zone "scoped" (and stays silent) the moment ANY of its interfaces resolves an
+address in EITHER family. But host-inbound ENFORCEMENT is per-destination-address
+and per-family — the kernel chain emits `<fam> daddr <set> ... drop` separately
+for `inet` and `inet6` — so a **MIXED** zone can still carry a real fail-open
+window the zone-level view cannot express:
+
+- **Mixed-interface zone**: `trust` has `ge-0-0-0.0` (static `192.0.2.1`) and
+  `ge-0-0-1.0` (DHCP WAN, lease pending). The addressed sibling makes the zone
+  scoped, so #3698 never surfaces `ge-0-0-1.0`'s window.
+- **Mixed-family interface**: `ge-0-0-2.0` has a static/DHCP v4 address but its v6
+  lease (DHCPv6) has not landed. `len(v.V4Addrs) > 0` marks the zone scoped, so
+  the IPv6 side entering the same window is invisible — dual-stack edges commonly
+  bring the two families up at different times.
+
+`dpuserspace.AddresslessEnforcingInterfaces` (`pkg/dataplane/userspace/zones.go`)
+surfaces the window at `{zone, interface-unit, family}` granularity. It reports a
+non-lifeline logical unit assigned to a configured enforcing zone when, for a
+family, the unit has a **DHCP / DHCPv6 client** configured (`family inet { dhcp; }`
+/ `family inet6 { dhcpv6; }` / `dhcpv6-client`) but currently resolves **no
+address** in that family — using the same static / live-kernel address resolution
+plus configured VRRP VIPs that `BuildZoneHostInboundViews` scopes the deny with.
+
+Only the `dhcp-pending` reason is reported: a static address or a VRRP VIP is
+injected into the enforced deny from config regardless of link/lease state, so it
+never opens a per-interface window. Gating on a configured DHCP client (rather
+than "any family with no address") keeps the signal low-noise — an IPv4-only
+interface is **not** flagged as addressless in `inet6`, because it never intends
+to acquire a v6 address. The window self-heals the instant the lease lands, like
+the zone-level signal.
+
+Two observability surfaces consume it (mirroring #3698):
+
+- **State-transition log** (`daemon_nft.go`,
+  `logHostInboundAddresslessIfaceTransitions`). A `WARN` on ENTRY, an `INFO` on
+  RECOVERY, transitions only.
+- **Prometheus gauge**
+  `xpf_host_inbound_addressless_interfaces{zone,interface,family,reason}`
+  (`pkg/api`). Value `1` per open window; absent when the family is enforced.
+  Emitted BEFORE the dataplane gate. The zone-level
+  `xpf_host_inbound_addressless_zones` remains as a coarser compatibility
+  aggregate — this per-interface series is strictly more sensitive and is exported
+  alongside it, not in place of it.
+
 ## Per-interface override precedence (#3362, #3720)
 
 Host-inbound-traffic can be authored at three granularities, and the EFFECTIVE
