@@ -1592,6 +1592,33 @@ pub(super) fn lookup_forwarding_resolution_v4(
     allow_tunnels: bool,
     ecmp_flow_hash: Option<u64>,
 ) -> ForwardingResolution {
+    // #3768 (M6): each top-level resolution starts a fresh visited-table
+    // chain for A->B->A next-table cycle detection. The tunnel-underlay
+    // sub-resolution (resolve_tunnel_outer) also enters through this public
+    // wrapper, so it correctly starts its own independent chain.
+    let mut visited: Vec<String> = Vec::new();
+    lookup_forwarding_resolution_v4_inner(
+        state,
+        dynamic_neighbors,
+        ip,
+        table,
+        depth,
+        allow_tunnels,
+        ecmp_flow_hash,
+        &mut visited,
+    )
+}
+
+fn lookup_forwarding_resolution_v4_inner(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
+    ip: Ipv4Addr,
+    table: &str,
+    depth: usize,
+    allow_tunnels: bool,
+    ecmp_flow_hash: Option<u64>,
+    visited: &mut Vec<String>,
+) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
             disposition: ForwardingDisposition::NextTableUnsupported,
@@ -1669,8 +1696,21 @@ pub(super) fn lookup_forwarding_resolution_v4(
                 };
             }
             if !route.next_table.is_empty() {
-                let next_table_name = route.next_table.as_str();
-                if next_table_name == table {
+                // #3768 (M5): canonicalize the recursive next-table name for
+                // THIS address family before loop detection and recursion.
+                // routes_v4 is keyed by canonical_route_table(table, false),
+                // so a v4 next-table string is already canonical here; the
+                // canonicalization is defense-in-depth (a stale/mis-derived
+                // "<inst>.inet6.0" on the v4 side would otherwise miss). The
+                // symmetric v6 site is where this actually rewrites (see the
+                // Go #3768 H6 fix + the v6 lookup below).
+                let next_table_name = canonical_route_table(&route.next_table, false);
+                // #3768 (M6): reject a next-table that revisits the current
+                // table (direct self-loop) OR any table already on this
+                // resolution's chain (A->B->A cross-table cycle). Without the
+                // visited set an A->B->A cycle burned to MAX_NEXT_TABLE_DEPTH
+                // on every packet and masked the config defect.
+                if next_table_name == table || visited.iter().any(|t| t == &next_table_name) {
                     return ForwardingResolution {
                         disposition: ForwardingDisposition::NextTableUnsupported,
                         local_ifindex: 0,
@@ -1683,9 +1723,8 @@ pub(super) fn lookup_forwarding_resolution_v4(
                         tx_vlan_id: 0,
                     };
                 }
-                // Clone needed: the recursive call borrows `state` again.
-                let next_table_name = route.next_table.clone();
-                return lookup_forwarding_resolution_v4(
+                visited.push(table.to_string());
+                return lookup_forwarding_resolution_v4_inner(
                     state,
                     dynamic_neighbors,
                     ip,
@@ -1693,6 +1732,7 @@ pub(super) fn lookup_forwarding_resolution_v4(
                     depth + 1,
                     allow_tunnels,
                     ecmp_flow_hash,
+                    visited,
                 );
             }
             // #2389/#2734: select one equal-cost next-hop, skipping a dead
@@ -1770,6 +1810,31 @@ pub(super) fn lookup_forwarding_resolution_v6(
     allow_tunnels: bool,
     ecmp_flow_hash: Option<u64>,
 ) -> ForwardingResolution {
+    // #3768 (M6): fresh visited-table chain per top-level resolution (see
+    // the v4 wrapper).
+    let mut visited: Vec<String> = Vec::new();
+    lookup_forwarding_resolution_v6_inner(
+        state,
+        dynamic_neighbors,
+        ip,
+        table,
+        depth,
+        allow_tunnels,
+        ecmp_flow_hash,
+        &mut visited,
+    )
+}
+
+fn lookup_forwarding_resolution_v6_inner(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
+    ip: Ipv6Addr,
+    table: &str,
+    depth: usize,
+    allow_tunnels: bool,
+    ecmp_flow_hash: Option<u64>,
+    visited: &mut Vec<String>,
+) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
             disposition: ForwardingDisposition::NextTableUnsupported,
@@ -1843,8 +1908,17 @@ pub(super) fn lookup_forwarding_resolution_v6(
                 };
             }
             if !route.next_table.is_empty() {
-                let next_table_name = route.next_table.as_str();
-                if next_table_name == table {
+                // #3768 (M5): canonicalize the recursive next-table name for
+                // the v6 family before loop detection + recursion. routes_v6
+                // is keyed by canonical_route_table(table, true) =
+                // "<inst>.inet6.0"; canonicalizing here rewrites a
+                // "<inst>.inet.0" next-table string (e.g. a pre-#3768-H6 Go
+                // snapshot, or a next_table authored in v4 form) onto the v6
+                // table so the lookup hits instead of blackholing.
+                let next_table_name = canonical_route_table(&route.next_table, true);
+                // #3768 (M6): self-loop + A->B->A cross-table cycle guard
+                // (see the v4 site).
+                if next_table_name == table || visited.iter().any(|t| t == &next_table_name) {
                     return ForwardingResolution {
                         disposition: ForwardingDisposition::NextTableUnsupported,
                         local_ifindex: 0,
@@ -1857,8 +1931,8 @@ pub(super) fn lookup_forwarding_resolution_v6(
                         tx_vlan_id: 0,
                     };
                 }
-                let next_table_name = route.next_table.clone();
-                return lookup_forwarding_resolution_v6(
+                visited.push(table.to_string());
+                return lookup_forwarding_resolution_v6_inner(
                     state,
                     dynamic_neighbors,
                     ip,
@@ -1866,6 +1940,7 @@ pub(super) fn lookup_forwarding_resolution_v6(
                     depth + 1,
                     allow_tunnels,
                     ecmp_flow_hash,
+                    visited,
                 );
             }
             // #2389/#2734: select one equal-cost next-hop, skipping a dead
