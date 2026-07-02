@@ -643,6 +643,21 @@ func (e *Exporter) RouteMaskUnresolved() uint64 {
 	return e.routeMaskUnresolved.Load()
 }
 
+// BatchDepth returns the current number of flow records pending in the export
+// batch (both families combined). Normally near 0 — the Run goroutine drains
+// every 100ms; a sustained nonzero value means the drain cannot keep up
+// (stalled Run / slow collector / close storm) (#3747).
+func (e *Exporter) BatchDepth() uint64 { return e.batch.depth() }
+
+// BatchMaxDepth returns the high-water mark of the pending batch depth (#3747).
+func (e *Exporter) BatchMaxDepth() uint64 { return e.batch.MaxDepth() }
+
+// BatchDropped returns the cumulative count of flow records dropped because
+// the export batch was at capacity (#3747). A climbing value means records
+// are being lost to a stalled/overrun drain rather than growing memory
+// without bound.
+func (e *Exporter) BatchDropped() uint64 { return e.batch.Dropped() }
+
 // Stats returns export statistics.
 func (e *Exporter) Stats() (flows, packets uint64) {
 	return e.exportedFlows.Load(), e.exportedPkts.Load()

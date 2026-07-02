@@ -166,6 +166,29 @@ func (c *xpfCollector) collectFlowExportMetrics(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorLastFailureSeconds,
 			prometheus.GaugeValue, lastFailure, h.Protocol, h.Instance, h.Template, h.Address, h.SourceAddress)
 	}
+	c.collectFlowExportBatchMetrics(ch)
+}
+
+// collectFlowExportBatchMetrics emits the xpf_flow_export_batch_* family from
+// the per-exporter pending-batch queue stats (#3747). The family is omitted
+// entirely when no FlowExportBatchStatsFn is wired or when no flow export is
+// configured (empty slice). Labels: protocol {netflow-v9,ipfix}, instance,
+// template — one series per configured flow-server group (bounded). The
+// export batch used to be unbounded: a stalled/overrun drain grew memory
+// without bound and silently. depth / max_depth expose the backlog and
+// dropped_total exposes the bounded drops that now replace that growth.
+func (c *xpfCollector) collectFlowExportBatchMetrics(ch chan<- prometheus.Metric) {
+	if c.srv.flowExportBatchStatsFn == nil {
+		return
+	}
+	for _, s := range c.srv.flowExportBatchStatsFn() {
+		ch <- prometheus.MustNewConstMetric(c.flowExportBatchDepth,
+			prometheus.GaugeValue, float64(s.Depth), s.Protocol, s.Instance, s.Template)
+		ch <- prometheus.MustNewConstMetric(c.flowExportBatchMaxDepth,
+			prometheus.GaugeValue, float64(s.MaxDepth), s.Protocol, s.Instance, s.Template)
+		ch <- prometheus.MustNewConstMetric(c.flowExportBatchDroppedTotal,
+			prometheus.CounterValue, float64(s.Dropped), s.Protocol, s.Instance, s.Template)
+	}
 }
 
 func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
