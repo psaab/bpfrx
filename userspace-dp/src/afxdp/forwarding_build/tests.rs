@@ -1989,6 +1989,306 @@ fn interface_with_empty_zone_builds_with_zone_zero() {
 }
 
 // ---------------------------------------------------------------------
+// #3771: route / neighbor wire-struct integrity guards. A route whose
+// `family` contradicts its destination prefix (M4), a route with a
+// negative preference (L1), and a neighbor whose `family` contradicts its
+// IP (M11) all fail the snapshot CLOSED; a neighbor with an unknown state
+// (M12) is skipped + counted rather than installed.
+// ---------------------------------------------------------------------
+
+/// #3771 (M4): a route declaring family="inet6" with an IPv4 destination fails
+/// the snapshot CLOSED via `RouteFamilyMismatch`. fail-on-revert: restoring the
+/// parse-only `populate_routes` installs it into routes_v4 (ignoring `family`)
+/// and the build succeeds, making this `expect_err` red.
+#[test]
+fn route_family_contradicts_destination_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        routes: vec![crate::RouteSnapshot {
+            table: "inet6.0".into(),
+            family: "inet6".into(),           // claims IPv6
+            destination: "10.0.0.0/8".into(), // ...but is IPv4
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("route family/destination mismatch must fail closed");
+    match err {
+        crate::policy::SnapshotIntegrityError::RouteFamilyMismatch {
+            table,
+            destination,
+            family,
+        } => {
+            assert_eq!(table, "inet6.0");
+            assert_eq!(destination, "10.0.0.0/8");
+            assert_eq!(family, "inet6");
+        }
+        other => panic!("expected RouteFamilyMismatch, got {other:?}"),
+    }
+
+    // The symmetric case: family="inet" with an IPv6 destination.
+    let snapshot_v6 = ConfigSnapshot {
+        routes: vec![crate::RouteSnapshot {
+            table: "inet.0".into(),
+            family: "inet".into(),               // claims IPv4
+            destination: "2001:db8::/32".into(), // ...but is IPv6
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(matches!(
+        try_build_forwarding_state_with_policy_counters(
+            &snapshot_v6,
+            &crate::policy::PolicyCounterStore::default(),
+        ),
+        Err(crate::policy::SnapshotIntegrityError::RouteFamilyMismatch { .. })
+    ));
+}
+
+/// #3771 (M4) anti-over-reject: a route whose `family` AGREES with its
+/// destination builds, and an EMPTY `family` (older / omitted producer) is
+/// unconstrained and also builds (parse-only, the pre-fix behaviour).
+#[test]
+fn route_family_matching_or_empty_builds() {
+    let snapshot = ConfigSnapshot {
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.0.0.0/8".into(),
+                next_hops: vec!["192.0.2.1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8::/32".into(),
+                next_hops: vec!["2001:db8::1".into()],
+                ..Default::default()
+            },
+            // Empty family — unconstrained, must not be rejected.
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: String::new(),
+                destination: "172.16.0.0/12".into(),
+                next_hops: vec!["192.0.2.2".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect("matching / empty family routes must build");
+    let v4 = state.routes_v4.get("inet.0").expect("v4 table");
+    assert_eq!(v4.len(), 2, "both v4 routes install");
+    let v6 = state.routes_v6.get("inet6.0").expect("v6 table");
+    assert_eq!(v6.len(), 1, "the v6 route installs");
+}
+
+/// #3771 (L1): a route with a NEGATIVE preference fails the snapshot CLOSED via
+/// `RoutePreferenceOutOfRange`. fail-on-revert: removing the preference guard
+/// installs the route with i32::MIN preference (sorting ahead of every route)
+/// and the build succeeds, making this `expect_err` red.
+#[test]
+fn route_negative_preference_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        routes: vec![crate::RouteSnapshot {
+            table: "inet.0".into(),
+            family: "inet".into(),
+            destination: "0.0.0.0/0".into(),
+            next_hops: vec!["192.0.2.1".into()],
+            preference: i32::MIN,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("a negative route preference must fail closed");
+    match err {
+        crate::policy::SnapshotIntegrityError::RoutePreferenceOutOfRange {
+            destination,
+            preference,
+            ..
+        } => {
+            assert_eq!(destination, "0.0.0.0/0");
+            assert_eq!(preference, i32::MIN);
+        }
+        other => panic!("expected RoutePreferenceOutOfRange, got {other:?}"),
+    }
+}
+
+/// #3771 (L1) anti-over-reject: preference 0 (the most-preferred value) and a
+/// normal positive preference both build.
+#[test]
+fn route_nonnegative_preference_builds() {
+    let snapshot = ConfigSnapshot {
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.0.0.0/8".into(),
+                next_hops: vec!["192.0.2.1".into()],
+                preference: 0,
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "172.16.0.0/12".into(),
+                next_hops: vec!["192.0.2.2".into()],
+                preference: 100,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect("non-negative preferences must build");
+}
+
+/// #3771 (M11): a neighbor declaring family="inet" with an IPv6 IP fails the
+/// snapshot CLOSED via `NeighborFamilyMismatch`. fail-on-revert: restoring the
+/// family-ignoring `populate_neighbors` installs the neighbor and the build
+/// succeeds, making this `expect_err` red.
+#[test]
+fn neighbor_family_contradicts_ip_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        neighbors: vec![crate::NeighborSnapshot {
+            interface: "ge-0/0/0".into(),
+            ifindex: 10,
+            family: "inet".into(),           // claims IPv4
+            ip: "2001:db8::1".into(),        // ...but is IPv6
+            mac: "aa:bb:cc:dd:ee:01".into(),
+            state: "reachable".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("neighbor family/IP mismatch must fail closed");
+    match err {
+        crate::policy::SnapshotIntegrityError::NeighborFamilyMismatch {
+            interface,
+            ip,
+            family,
+        } => {
+            assert_eq!(interface, "ge-0/0/0");
+            assert_eq!(ip, "2001:db8::1");
+            assert_eq!(family, "inet");
+        }
+        other => panic!("expected NeighborFamilyMismatch, got {other:?}"),
+    }
+}
+
+/// #3771 (M11) anti-over-reject: a neighbor whose `family` matches its IP, and a
+/// neighbor with an EMPTY `family` (older producer), both build and install.
+#[test]
+fn neighbor_family_matching_or_empty_installs() {
+    let snapshot = ConfigSnapshot {
+        neighbors: vec![
+            crate::NeighborSnapshot {
+                interface: "ge-0/0/0".into(),
+                ifindex: 10,
+                family: "inet".into(),
+                ip: "10.0.0.1".into(),
+                mac: "aa:bb:cc:dd:ee:01".into(),
+                state: "reachable".into(),
+                ..Default::default()
+            },
+            crate::NeighborSnapshot {
+                interface: "ge-0/0/0".into(),
+                ifindex: 10,
+                family: String::new(), // unconstrained
+                ip: "2001:db8::2".into(),
+                mac: "aa:bb:cc:dd:ee:02".into(),
+                state: "stale".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect("matching / empty family neighbors must build");
+    assert_eq!(state.neighbors.len(), 2, "both neighbors install");
+}
+
+/// #3771 (M12): a neighbor with an UNKNOWN state (`none`) is NOT installed and
+/// the diagnostic counter bumps. fail-on-revert: the denylist treats `none` as
+/// usable and installs it, so the `is_empty` assertion (race-free) goes red.
+#[test]
+fn neighbor_unknown_state_is_skipped_and_counted() {
+    let before = crate::afxdp::forwarding::NEIGHBOR_UNKNOWN_STATE_SKIPPED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let snapshot = ConfigSnapshot {
+        neighbors: vec![crate::NeighborSnapshot {
+            interface: "ge-0/0/0".into(),
+            ifindex: 10,
+            family: "inet".into(),
+            ip: "10.0.0.9".into(),
+            mac: "aa:bb:cc:dd:ee:09".into(),
+            state: "none".into(), // pre-fix denylist treated this as usable
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.neighbors.is_empty(),
+        "an unknown-state neighbor must not be installed into the FIB"
+    );
+    let after = crate::afxdp::forwarding::NEIGHBOR_UNKNOWN_STATE_SKIPPED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after > before,
+        "an unknown-state neighbor must bump NEIGHBOR_UNKNOWN_STATE_SKIPPED"
+    );
+}
+
+/// #3771 (M12): a `failed` neighbor is still skipped under the new allowlist
+/// (regression against the pre-fix denylist). The "failed does not bump the
+/// unknown-state counter" property is proven deterministically by
+/// `classify_neighbor_state_is_an_allowlist` (KnownUnusable) — asserting on the
+/// process-global counter here would be flaky under parallel test execution.
+#[test]
+fn neighbor_failed_state_is_not_installed() {
+    let snapshot = ConfigSnapshot {
+        neighbors: vec![crate::NeighborSnapshot {
+            interface: "ge-0/0/0".into(),
+            ifindex: 10,
+            family: "inet".into(),
+            ip: "10.0.0.4".into(),
+            mac: String::new(),
+            state: "failed".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.neighbors.is_empty(),
+        "a failed neighbor is not installed"
+    );
+}
+
+// ---------------------------------------------------------------------
 // #2410: validated narrowing newtypes — out-of-range VLAN / TTL / queue
 // fail the snapshot CLOSED instead of wrapping (VLAN/TTL) or silently
 // dropping (queue). #2409: malformed interface address fails closed.

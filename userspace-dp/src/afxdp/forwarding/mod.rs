@@ -64,9 +64,71 @@ pub(super) fn canonical_route_table(table: &str, is_ipv6: bool) -> String {
     table.to_string()
 }
 
+/// #3771 (M12): count of neighbors skipped because their kernel state string
+/// classified as UNKNOWN (empty / `none` / a future or corrupt token) rather
+/// than a recognized usable state (`reachable`/`stale`/`delay`/`probe`/
+/// `permanent`/`noarp`) or a known-unusable state (`failed`/`incomplete`). The
+/// pre-#3771 denylist (`!(contains("failed") || contains("incomplete"))`)
+/// treated EVERY unrecognized state as usable, so a `none` / empty / future
+/// state with a parseable IP+MAC was installed into the FIB. This diagnostic
+/// counter bumps once per skipped unknown-state neighbor per snapshot build; a
+/// steadily climbing value signals a version-drifted or corrupt control-plane
+/// producer.
+pub(in crate::afxdp) static NEIGHBOR_UNKNOWN_STATE_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #3771 (M12): three-way classification of a kernel neighbor state string for
+/// FIB installation.
+///
+/// - `Usable` — a recognized forwarding-usable NUD state; install the entry.
+/// - `KnownUnusable` — `failed` / `incomplete`; an EXPECTED transient/failed
+///   state, skipped silently (the pre-fix denylist already rejected these).
+/// - `Unknown` — empty / `none` / a future or corrupt token; skipped AND
+///   counted (`NEIGHBOR_UNKNOWN_STATE_SKIPPED`).
+///
+/// The Go producer (`neighborStateString`, pkg/dataplane/userspace/neighbors.go)
+/// joins multiple NUD bits with `|`, so a pipe-joined state is `Usable` only
+/// when EVERY token is in the allowlist; any unrecognized token makes the whole
+/// state `Unknown`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::afxdp) enum NeighborStateClass {
+    Usable,
+    KnownUnusable,
+    Unknown,
+}
+
+pub(in crate::afxdp) fn classify_neighbor_state(state: &str) -> NeighborStateClass {
+    let trimmed = state.trim();
+    if trimmed.is_empty() {
+        return NeighborStateClass::Unknown;
+    }
+    let mut saw_known_unusable = false;
+    for token in trimmed.split('|') {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "reachable" | "stale" | "delay" | "probe" | "permanent" | "noarp" => {}
+            "failed" | "incomplete" => saw_known_unusable = true,
+            // #3771 (M12): an empty / `none` / future / corrupt token is NOT in
+            // the allowlist — reject the whole state as Unknown (was silently
+            // treated as usable by the pre-fix denylist).
+            _ => return NeighborStateClass::Unknown,
+        }
+    }
+    if saw_known_unusable {
+        NeighborStateClass::KnownUnusable
+    } else {
+        NeighborStateClass::Usable
+    }
+}
+
+/// #3771 (M12): allowlist gate over [`classify_neighbor_state`] — true iff the
+/// state is a recognized usable NUD state. Shared by the FIB build
+/// (`populate_neighbors`), the runtime snapshot-refresh manager-key computation
+/// (`snapshot_refresh.rs`), the `update_neighbors` control handler
+/// (`server/handlers/neighbors.rs`), and `parse_neighbor_entries` — all of which
+/// must agree on which neighbors are installable so a neighbor the FIB installs
+/// is never pruned as a stale manager key (and vice versa).
 pub(super) fn neighbor_state_usable(state: &str) -> bool {
-    let normalized = state.to_ascii_lowercase();
-    !(normalized.contains("failed") || normalized.contains("incomplete"))
+    matches!(classify_neighbor_state(state), NeighborStateClass::Usable)
 }
 
 pub(super) fn parse_packet_destination(
@@ -2165,8 +2227,15 @@ pub(super) fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry
         if fields.is_empty() {
             continue;
         }
-        if fields.iter().any(|field| !neighbor_state_usable(field)) {
-            continue;
+        // #3771 (M12): the NUD state is the FINAL token of an `ip neigh` row
+        // (REACHABLE / STALE / FAILED / ...). Classify ONLY that token with the
+        // allowlist. The pre-#3771 denylist was applied to EVERY field, which
+        // only worked because an IP / MAC / `lladdr` never contained the
+        // "failed" / "incomplete" substrings; the allowlist would reject those
+        // non-state fields and drop every row, so we must scope it to the state.
+        match fields.last() {
+            Some(state) if neighbor_state_usable(state) => {}
+            _ => continue,
         }
         let Ok(ip) = fields[0].parse::<IpAddr>() else {
             continue;

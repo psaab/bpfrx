@@ -132,6 +132,42 @@ old Go binary omits them (serde defaults: default instance, empty
 next-hops, preference 0). The wire specimen lives in
 `tests/fixtures/protocol_wire_v1.json`.
 
+- **Route / neighbor wire-struct integrity (#3771).** `populate_routes`
+  and `populate_neighbors` are fallible and fail the snapshot CLOSED —
+  the apply preflight then keeps the previous live forwarding state —
+  on a wire-struct whose metadata contradicts itself, consistent with
+  the #2410/#2409 fail-closed family:
+    - **Route family/destination (M4).** A `RouteSnapshot` whose
+      NON-EMPTY `family` does not match the address family its
+      `destination` prefix parses as is rejected
+      (`SnapshotIntegrityError::RouteFamilyMismatch`) instead of being
+      installed into the prefix-parsed FIB while the metadata claims the
+      other family. This is NOT the #2448 malformed-destination case
+      (the prefix is a valid CIDR). An EMPTY `family` is unconstrained
+      (parse-only, the pre-fix behavior) and never a mismatch.
+    - **Route preference range (L1).** A NEGATIVE `preference` is
+      rejected (`RoutePreferenceOutOfRange`): the `sort_routes`
+      tie-break is ascending preference, so a negative value would sort
+      ahead of every route and hijack selection for the prefix. The Go
+      commit boundary (`schema_routing.go`, `ValidateInteger(0, i32max)`
+      on the route `preference` leaf) is the primary gate; this is the
+      helper-boundary backstop.
+    - **Neighbor family/IP (M11).** A `NeighborSnapshot` whose NON-EMPTY
+      `family` contradicts its parsed `ip` is rejected
+      (`NeighborFamilyMismatch`) instead of being installed under a
+      contradicting family.
+    - **Neighbor state allowlist (M12).** `neighbor_state_usable` /
+      `classify_neighbor_state` are an ALLOWLIST
+      (`reachable`/`stale`/`delay`/`probe`/`permanent`/`noarp`), NOT the
+      pre-fix denylist. `failed`/`incomplete` are known-unusable (skipped
+      silently); an empty / `none` / future / corrupt state is UNKNOWN —
+      skipped AND counted by the `NEIGHBOR_UNKNOWN_STATE_SKIPPED`
+      diagnostic atomic (the pre-fix denylist installed every
+      unrecognized state that carried a parseable IP+MAC). The
+      snapshot-refresh manager-key set, the `update_neighbors` handler,
+      and `parse_neighbor_entries` share the same gate so an installed
+      neighbor is never pruned as a stale key.
+
 ## Where it sits
 
 - Reads the live snapshot Arcs (FIB, NAT, neighbor table) supplied

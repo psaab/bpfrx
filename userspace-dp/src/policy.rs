@@ -483,6 +483,57 @@ pub(crate) enum SnapshotIntegrityError {
     /// `resolve_policy_zone_id` / `build_global_zone_scope`) and so never trip
     /// this.
     UnresolvableZoneReference { rule_id: String, zone: String },
+    /// #3771 (M4): a `RouteSnapshot` carried a NON-EMPTY `family` that does not
+    /// match the address family of its `destination` prefix (e.g. family="inet6"
+    /// with an IPv4 destination). The pre-fix `populate_routes` chose the FIB
+    /// (`routes_v4` vs `routes_v6`) SOLELY by parsing `destination` as
+    /// `Ipv4Net` / `Ipv6Net` and never consulted `family`, so an inconsistent
+    /// snapshot installed the route into the family the PREFIX parses as while the
+    /// `family` metadata claimed the other — a silent divergence between the
+    /// control plane's model and the installed FIB. The Go producer derives
+    /// `family` from the same prefix (`normalizeRouteSnapshotFamily`,
+    /// pkg/dataplane/userspace/routes.go), so a clean snapshot never trips this;
+    /// it is the helper-boundary backstop for a corrupt / hand-built /
+    /// version-drifted snapshot, consistent with the #2410/#2409 fail-closed
+    /// family. This is NOT the #2448 malformed-destination case — the prefix is a
+    /// valid CIDR; only the `family` metadata is inconsistent. An EMPTY `family`
+    /// is unconstrained (parse-only, the pre-fix behaviour) and is NOT an error.
+    RouteFamilyMismatch {
+        table: String,
+        destination: String,
+        family: String,
+    },
+    /// #3771 (L1): a `RouteSnapshot` carried a NEGATIVE `preference`. Junos route
+    /// preference is a non-negative administrative distance (default 5; lower =
+    /// more preferred); the FIB tie-breaks same-prefix routes by ASCENDING
+    /// preference (fib.rs `sort_routes`, #2390), so a negative preference (e.g.
+    /// `i32::MIN`) would sort AHEAD of every legitimate route and silently hijack
+    /// the selection for that prefix. The Go boundary (`schema_routing.go`
+    /// `ValidateInteger(0, ...)` on the route `preference` leaf) rejects it at
+    /// commit; this is the helper-boundary backstop for a corrupt /
+    /// version-drifted snapshot, consistent with the #2410 out-of-range
+    /// fail-closed family. A preference of 0 is the legitimate most-preferred
+    /// value and is NOT an error.
+    RoutePreferenceOutOfRange {
+        table: String,
+        destination: String,
+        preference: i32,
+    },
+    /// #3771 (M11): a `NeighborSnapshot` carried a NON-EMPTY `family` that does
+    /// not match the address family of its parsed `ip` (e.g. family="inet" with
+    /// an IPv6 address). The pre-fix `populate_neighbors` installed the neighbor
+    /// keyed on the parsed IP and never consulted `family`, so an inconsistent
+    /// snapshot installed a neighbor under a family that contradicts its own
+    /// metadata. The Go producer derives `family` from the netlink family
+    /// enumeration (`buildNeighborSnapshots`, pkg/dataplane/userspace/neighbors.go),
+    /// so a clean snapshot never trips this; it is the helper-boundary backstop
+    /// for a corrupt / hand-built / version-drifted snapshot. An EMPTY `family`
+    /// is unconstrained (parse-only) and is NOT an error.
+    NeighborFamilyMismatch {
+        interface: String,
+        ip: String,
+        family: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -692,6 +743,33 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "rule {:?} references undefined zone {:?} — refusing to fail open by dropping the unindexed rule (it would fall through to default-policy: a stale deny becomes an allow under permit-all, a stale permit blackholes under deny-all)",
                 rule_id, zone
+            ),
+            Self::RouteFamilyMismatch {
+                table,
+                destination,
+                family,
+            } => write!(
+                f,
+                "route {:?} in table {:?} declares family {:?} that does not match the address family of its destination prefix — refusing to install it into the prefix-parsed FIB while the family metadata claims the other",
+                destination, table, family
+            ),
+            Self::RoutePreferenceOutOfRange {
+                table,
+                destination,
+                preference,
+            } => write!(
+                f,
+                "route {:?} in table {:?} has negative preference {} — Junos preference is a non-negative admin distance; a negative value would sort ahead of every route in the FIB tie-break",
+                destination, table, preference
+            ),
+            Self::NeighborFamilyMismatch {
+                interface,
+                ip,
+                family,
+            } => write!(
+                f,
+                "neighbor {:?} on interface {:?} declares family {:?} that does not match the address family of its IP — refusing to install it under a contradicting family",
+                ip, interface, family
             ),
         }
     }

@@ -91,7 +91,13 @@ func staticRouteNode() *schemaNode {
 			"discard":    {desc: "Discard (blackhole) route", children: nil},
 			"reject":     {desc: "Reject route (send ICMP unreachable)", children: nil},
 			"next-table": {desc: "Resolve in another routing table", args: 1, placeholder: "<table>", children: nil},
-			"preference": {desc: "Route preference (administrative distance)", args: 1, placeholder: "<value>", children: nil},
+			// #3771 (L1): validate the route preference at the Go commit boundary
+			// — a non-negative admin distance representable on the i32 wire. This
+			// is the primary gate; the Rust helper backstops it
+			// (RoutePreferenceOutOfRange) for a corrupt / version-drifted snapshot.
+			"preference": {desc: "Route preference (administrative distance)", args: 1, placeholder: "<value>",
+				valueType: ValueInteger, valueDesc: "Route preference / administrative distance (0..2147483647; lower = more preferred, default 5)",
+				valueExamples: []string{"5", "100"}, validator: ValidateInteger(0, maxWireI32), children: nil},
 		},
 	}
 }
