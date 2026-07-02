@@ -26997,3 +26997,40 @@ top.
     pkg/dataplane/userspace/{route_overlay,fbf_snapshot,routes_fib_metadata,manager}_test.go
     (2-value call updates), docs/userspace-dataplane-architecture.md +
     docs/multi-wan.md (route-snapshot invariants)
+
+## 2026-07-01 — #3738 DDNS dual-stack same-name withdraw preserves the sibling family (codex-157 H10/M06)
+
+- **Timestamp**: 2026-07-01
+- **Action**: For a dual-stack Surface A scope (an A and an AAAA published at the
+  SAME name through the SAME provider), withdrawing ONE family took the sibling
+  down. The two host-level-withdraw backends have no per-family verb — DuckDNS
+  `clear=true` (the spec: "ignore all ip's and clear both your records") and
+  dyndns2 `offline=YES` (hostname-level) — so a v6 withdraw cleared/offlined the
+  whole name and blackholed the still-live v4 (H10 DuckDNS; M06 dyndns2). FIX
+  (family-scoped, per-provider): added `LeaseDNSRecord.SiblingFamilyOwned`, set
+  by the engine (`withdrawOwnedLocked` → new `siblingFamilyOwnedLocked`, matching
+  another owned record at the same `{PolicyID, FQDN}` under the opposite family).
+  DuckDNS and dyndns2 `DeleteLease` SKIP their destructive host-wide verb when
+  the flag is set (a logged no-op returning nil) — the LEAST-DESTRUCTIVE action:
+  the live sibling is preserved; the withdrawn family's record is left stale.
+  Per-family backends (rfc2136/cloudflare/route53) ignore the flag and delete the
+  exact RR. The manager still drops the withdrawn family's ownership, so a later
+  withdraw of the LAST family (no sibling → flag false) DOES fire the host-wide
+  verb and cleans both — full teardown converges, single-family withdraw is
+  unchanged, no permanent orphan on teardown. Verified the DuckDNS spec
+  (duckdns.org/spec.jsp): `clear=true` "will ignore all ip's and clear both your
+  records" — it genuinely cannot family-scope a clear, so suppression is the
+  correct preservation strategy. Also added the missing dyndns2 dual-stack commit
+  warning (the codex-157 M06 gap — DuckDNS was already commit-warned via #2960;
+  dyndns2 was not) in `validateSurfaceADDNSWarnings`. RED-on-revert: removing the
+  DuckDNS/dyndns2 guards + the engine flag makes the sibling-preservation tests
+  fire a clear/offline (RED) while the single-family test stays green; removing
+  the dyndns2 warning emission fails the config warning test. go test
+  ./pkg/ddns/... ./pkg/config/... green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/ddns/backend.go (SiblingFamilyOwned field), pkg/ddns/backend_duckdns.go
+  + pkg/ddns/backend_dyndns2.go (DeleteLease sibling guard + log/slog),
+  pkg/ddns/surface_a.go (withdrawOwnedLocked sets the flag; siblingFamilyOwnedLocked
+  + canonicalDDNSName helpers), pkg/config/compiler_validate_warn.go (dyndns2
+  dual-stack commit warning), pkg/ddns/backend_dualstack_withdraw_3738_test.go (new),
+  pkg/config/compiler_p3_http_providers_test.go (dyndns2 dual-stack warning test),
+  pkg/ddns/README.md (per-family-withdraw column + dual-stack sibling-preserve section)

@@ -3,6 +3,7 @@ package ddns
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -140,15 +141,31 @@ func (b *duckdnsBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 }
 
 // DeleteLease withdraws the firewall's own record via the DuckDNS clear verb
-// (&clear=true). DuckDNS has no per-family clear: clear=true removes BOTH the A
-// and the AAAA for the domain. This is the only portable DuckDNS withdraw, so a
-// dual-stack scope's two records collapse onto one clear — acceptable because the
-// Surface A engine only withdraws on scope teardown (the firewall is the sole
-// owner of its own duckdns.org name; there is no third-party RR to preserve). The
-// body verdict (OK/KO) is parsed exactly like an upsert, so a failed clear
-// returns a non-nil error and the engine keeps ownership for retry instead of
-// orphaning the public record.
+// (&clear=true). DuckDNS has no per-family clear: the spec is explicit that
+// clear=true "will ignore all ip's and clear both your records"
+// (duckdns.org/spec.jsp), so it removes BOTH the A and the AAAA for the domain.
+// This is the only portable DuckDNS withdraw. The body verdict (OK/KO) is parsed
+// exactly like an upsert, so a failed clear returns a non-nil error and the
+// engine keeps ownership for retry instead of orphaning the public record.
+//
+// SIBLING-FAMILY GUARD (#3738): a dual-stack same-name DuckDNS scope has an A and
+// an AAAA under one name. Because clear=true is HOST-WIDE, firing it to withdraw
+// ONE family while the sibling is still live would blackhole the sibling. DuckDNS
+// cannot express a single-family clear, so when the engine flags
+// rec.SiblingFamilyOwned we do the LEAST-DESTRUCTIVE thing — SKIP the clear (a
+// logged no-op) — preserving the live sibling. The withdrawn family's record is
+// left in place (stale) rather than the sibling being taken down; the manager
+// still drops this family's ownership, so a later withdraw of the LAST family
+// (no sibling left → the flag is false) issues clear=true and cleans both. This
+// path is only reachable for the dual-stack DuckDNS topology, which is already
+// flagged at commit (config.validateSurfaceADDNSWarnings, #2960).
 func (b *duckdnsBackend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) error {
+	if rec.SiblingFamilyOwned {
+		slog.Warn("ddns duckdns: skipping host-wide clear to preserve the live sibling family "+
+			"(DuckDNS clear=true clears BOTH A and AAAA; dual-stack same name has no per-family clear)",
+			"provider", b.name, "fqdn", rec.FQDN, "withdraw_type", rec.ForwardType)
+		return nil
+	}
 	q := url.Values{}
 	q.Set("clear", "true")
 	return b.update(ctx, rec.FQDN, q)
