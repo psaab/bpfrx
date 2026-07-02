@@ -402,6 +402,74 @@ bidirectional accounting.** `FlowRecord.RevPackets`/`RevBytes` are populated
 for both exporters but consumed only by IPFIX. See the converged research plan
 on #3746.
 
+**#3748 (sub-part b) — IPFIX sampler Options Template + record.** Before
+#3748 `ipfixSetIDOptionsTemplate` (Set ID 3) was a bare constant: the IPFIX
+exporter emitted DATA templates (256/257) only and never advertised the
+sampling rate, so a collector receiving 1-in-N-sampled records could not
+learn N and could not scale the sampled record count. The exporter now emits,
+on the SAME template-refresh cadence, an **Options Template** (Set ID 3,
+template ID **258** — distinct from the 256/257 data IDs) and an **Options
+Data Record** (Set ID 258) carrying the sampling configuration as PSAMP
+systematic count-based sampling (RFC 5477 / IANA "IPFIX Entities"):
+
+| Field | IE | Len | Role | Value |
+|-------|----|----|------|-------|
+| `observationDomainId` | 149 | 4 | **scope** | the group's stable ODID (#3740) |
+| `selectorAlgorithm` | 304 | 2 | option | `1` (systematic count-based) |
+| `samplingPacketInterval` | 305 | 4 | option | `1` |
+| `samplingPacketSpace` | 306 | 4 | option | `N-1` |
+
+The record is scoped by `observationDomainId` (IE 149) — the group's #3740
+ODID, which also stamps the message header — so the sampling config binds to
+this observation domain. `encodeIPFIXOptionsTemplateSet` /
+`encodeIPFIXOptionsSamplerDataSet` build the two sets; `sendSamplerOptions`
+packages them into one IPFIX Message (template first, then its data record).
+The `ipfixOptionsSamplerRecordSize` (14) is pinned against the field slices at
+build time (same discipline as the #2526 data-record pins), so a
+template/encoder drift panics at init.
+
+**Emitted only for sampled groups (`SamplingRate > 1`).** This matches the
+`ShouldExport` gate exactly. An unsampled / export-all group (rate 0 or 1)
+advertises **nothing** — a collector then correctly assumes 1-in-1 — which
+also keeps the #2609 template-refresh sequence behaviour bit-identical for the
+common unsampled case. The Options Template and record are precomputed once at
+construction (`emitSampler` / `optionsTemplateSet` / `optionsDataSet`) since
+the rate and ODID are fixed per group.
+
+**Sequence-number accounting.** The Options Data Record rides a Set with ID
+≥ 256, so it is a **Data Record** and advances the header Sequence Number by
+one (RFC 7011 §3.1) — a sequence-tracking collector counts it, so skipping the
+increment would look like the loss #2609 fixed. `sendSamplerOptions` captures
+the current cumulative count for the message header, then increments, exactly
+as `sendRecords` does. The template-only data-template refresh still carries
+the cumulative count without advancing it (#2609 unchanged).
+
+**SEMANTIC NUANCE — record-granularity sampling, not packet sampling.** xpf
+samples **1-in-N at SESSION-RECORD granularity**: `ShouldExport` applies the
+modulo per SESSION_CLOSE event, NOT 1-in-N packets in the datapath the way
+Junos jflow does. Advertising interval=1 / space=N-1 lets a collector scale
+the sampled **record COUNT** by N (correct), but each exported record already
+carries the **full per-session** `octetDeltaCount` / `packetDeltaCount`, so a
+collector must **NOT** additionally multiply the per-record volume by N —
+doing so double-counts. This is documented on `sendSamplerOptions` too.
+
+Fail-on-revert pins in `ipfix_sampler_test.go`:
+`TestIPFIXOptionsTemplateSetDecode` (Set ID 3, template 258, one scope field =
+IE 149, option IEs 304/305/306 with correct lengths + set-length integrity),
+`TestIPFIXOptionsSamplerDataSetDecode` (interval=1 / space=N-1 across sampled
+and degenerate rates), `TestIPFIXSamplerOptionsWireLoopback` (the real
+exporter UDP path emits the options message after the data template, scope ==
+header ODID, rate = N-1, and the record advances the sequence by one), and
+`TestIPFIXSamplerOptionsAbsentWhenUnsampled` (rate 0/1 emit no options
+message). Removing the sampler emission flips these RED.
+
+**Sub-part (a) — active-timeout interim records — DEFERRED.** The related gap
+that a configured `flow-active-timeout` emits no interim records (long-lived
+flows under-report in-progress volume) is a separate, multi-surface
+Rust + Go + wire + HA change with a delta-accounting invariant and must be its
+own `make test-failover`-gated PR. It is NOT implemented here; the converged
+design is recorded on #3748.
+
 ## File layout
 
 The package is split by responsibility (#1988):

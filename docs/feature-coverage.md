@@ -137,7 +137,14 @@ the userspace dataplane admission boundary is in
 
 - **Syslog**: facility/severity/category filtering, structured RT_FLOW
   format, TCP/TLS transport, event mode local file.
-- **NetFlow v9 / IPFIX**: 1-in-N sampling, per-collector write-health
+- **NetFlow v9 / IPFIX**: 1-in-N sampling (IPFIX advertises the rate to
+  collectors via a sampler Options Template — Set ID 3, template 258,
+  `selectorAlgorithm`/`samplingPacketInterval`/`samplingPacketSpace`, scoped by
+  the group's Observation Domain ID; #3748. Note: xpf samples 1-in-N at
+  session-record granularity, so a collector scales the record COUNT by N but
+  must not multiply per-record volume — each record carries the full
+  per-session byte/packet counts. Active-timeout interim records are deferred,
+  #3748 sub-part a), per-collector write-health
   (`show flow-monitoring statistics`, REST `/api/v1/services/flow-exporters`,
   `xpf_flow_export_collector_*` Prometheus metrics — a collector going
   unreachable surfaces write_failures + a state-change warn, #2464).
