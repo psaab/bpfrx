@@ -1007,7 +1007,14 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	next.FIBGeneration = m.readFIBGeneration()
 	next.GeneratedAt = time.Now().UTC()
 	next.Config = cfg
-	next.Routes = buildRouteSnapshots(cfg, next.Interfaces, desiredOverlay)
+	// #3772 (M9): a transient ip-rule enumeration failure aborts the
+	// overlay publish (fail-closed). The deferred commit above leaves
+	// m.routeOverlay at the last-applied baseline on a non-nil err, so the
+	// next actuator sweep rebuilds and re-publishes (#3757 dirty-retry).
+	next.Routes, err = buildRouteSnapshots(cfg, next.Interfaces, desiredOverlay)
+	if err != nil {
+		return false, fmt.Errorf("build route overlay snapshot: %w", err)
+	}
 
 	// Duplicate-publish skip: identical content (e.g. the actuator ran
 	// twice for the same overlay) does not need a control-socket

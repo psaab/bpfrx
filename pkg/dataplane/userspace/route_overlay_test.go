@@ -38,7 +38,10 @@ func TestRouteOverlayWholeEntryReplacement(t *testing.T) {
 	overlay := []config.RouteOverlayEntry{
 		{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
 	}
-	routes := buildRouteSnapshots(cfg, nil, overlay)
+	routes, err := buildRouteSnapshots(cfg, nil, overlay)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var defaults []RouteSnapshot
 	for _, r := range routes {
@@ -73,7 +76,10 @@ func TestRouteOverlayWholeEntryReplacement(t *testing.T) {
 	riOverlay := []config.RouteOverlayEntry{
 		{RoutingInstance: "ISP-B", Destination: "0.0.0.0/0", NextHop: "10.9.99.1", Policy: "p"},
 	}
-	routes = buildRouteSnapshots(cfg, nil, riOverlay)
+	routes, err = buildRouteSnapshots(cfg, nil, riOverlay)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range routes {
 		if r.Table == "ISP-B.inet.0" && r.Destination == "0.0.0.0/0" {
 			if len(r.NextHops) != 1 || r.NextHops[0] != "10.9.99.1" {
@@ -86,7 +92,10 @@ func TestRouteOverlayWholeEntryReplacement(t *testing.T) {
 	}
 
 	// Withdrawal (nil overlay) restores the config routes.
-	routes = buildRouteSnapshots(cfg, nil, nil)
+	routes, err = buildRouteSnapshots(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range routes {
 		if r.Table == "inet.0" && r.Destination == "0.0.0.0/0" && len(r.NextHops) != 2 {
 			t.Fatalf("withdrawn overlay left residue: %+v", r)
