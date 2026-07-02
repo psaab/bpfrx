@@ -2117,8 +2117,13 @@ fn forwarding_resolution_supports_next_table_recursion() {
 #[test]
 fn forwarding_state_normalizes_ipv6_routes_emitted_in_inet_table() {
     let mut snapshot = forwarding_snapshot(true);
+    // Override ONLY the table name (inet.0) for a v6-destination route to
+    // exercise `canonical_route_table` (inet.0 -> inet6.0 when the destination
+    // parses as v6). #3771 (M4): the `family` must stay consistent with the
+    // destination ("inet6") — a family="inet" here now fails the snapshot
+    // CLOSED (RouteFamilyMismatch) rather than being silently ignored, so the
+    // fixture keeps its correct v6 family.
     snapshot.routes[1].table = "inet.0".to_string();
-    snapshot.routes[1].family = "inet".to_string();
     let state = build_forwarding_state(&snapshot);
     let resolved = lookup_forwarding_resolution(
         &state,
@@ -2173,6 +2178,50 @@ fn parse_neighbor_entries_accepts_stale_ipv4_and_ipv6_rows() {
     );
     assert_eq!(parsed[0].1.mac, [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
     assert_eq!(parsed[1].1.mac, [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+}
+
+/// #3771 (M12): neighbor-state classification is an ALLOWLIST, not the pre-fix
+/// denylist. A recognized usable state installs; failed/incomplete are known-
+/// unusable; an empty / `none` / future / corrupt token is UNKNOWN (skipped +
+/// counted). Fail-on-revert: the denylist
+/// (`!(contains("failed") || contains("incomplete"))`) classifies `none` /
+/// `bogus` as usable, flipping the `Unknown` assertions and
+/// `!neighbor_state_usable("none")` red.
+#[test]
+fn classify_neighbor_state_is_an_allowlist() {
+    for s in [
+        "reachable",
+        "stale",
+        "delay",
+        "probe",
+        "permanent",
+        "noarp",
+        "REACHABLE",
+        "Stale",
+    ] {
+        assert_eq!(
+            classify_neighbor_state(s),
+            NeighborStateClass::Usable,
+            "{s} must be usable"
+        );
+        assert!(neighbor_state_usable(s), "{s} must be usable");
+    }
+    for s in ["failed", "incomplete", "FAILED", "reachable|failed"] {
+        assert_eq!(
+            classify_neighbor_state(s),
+            NeighborStateClass::KnownUnusable,
+            "{s} must be known-unusable"
+        );
+        assert!(!neighbor_state_usable(s), "{s} must not be usable");
+    }
+    for s in ["", "none", "bogus", "future-state", "stale|bogus"] {
+        assert_eq!(
+            classify_neighbor_state(s),
+            NeighborStateClass::Unknown,
+            "{s} must be unknown"
+        );
+        assert!(!neighbor_state_usable(s), "{s} must not be usable");
+    }
 }
 
 #[test]

@@ -23,6 +23,27 @@
     follow-up.
   - **File(s)**: userspace-dp/src/policy.rs,
     userspace-dp/src/policy_tests.rs
+## 2026-07-01 — #3827: type the qualified-next-hop `preference` leaf (Go commit gate)
+
+- **Timestamp**: 2026-07-01
+  - **Action**: #3771/#3826 follow-up (Low). The route-level `preference` leaf
+    is typed `ValueInteger` + `ValidateInteger(0, maxWireI32)` at the Go commit
+    boundary (#3771), but the `qualified-next-hop <addr> preference <n>` leaf
+    (schema_routing.go) was UNTYPED. The compiler folds a qualified-next-hop
+    preference into the same `route.Preference` i32 wire field
+    (compiler_routing.go), so a negative / i32-overflow preference expressed
+    via the qualified-next-hop syntax bypassed the primary Go gate and was
+    caught only by the Rust `RoutePreferenceOutOfRange` backstop — an opaque
+    snapshot rejection with retained-prior-state instead of a commit error
+    naming the leaf. FIX: mirror the exact route-level typing onto the qnh
+    `preference` leaf (reuse the existing `maxWireI32` const). Go-only, no wire
+    change. RED-on-revert: reverting the typing makes negative / overflow qnh
+    preferences accept again, so the reject assertions fire RED (verified by
+    temporarily reverting: `-1` accepted, tests FAIL). Valid qnh
+    preference/metric/interface still commit. `go test ./pkg/config/...` green,
+    `go build ./...` green, gofmt + vet clean.
+  - **File(s)**: pkg/config/schema_routing.go,
+    pkg/config/schema_route_qnh_preference_3827_test.go, docs/config-schema.md
 
 ## 2026-07-01 — #3756 H14: attributes-match static per-test string fields
 
@@ -27447,3 +27468,61 @@ top.
   ./pkg/api/... ./pkg/grpcapi/... green; go build ./...; gofmt + vet clean.
 - **File(s)**: pkg/dataplane/userspace/zones.go,
   pkg/dataplane/userspace/host_inbound_view_grouping_3721_test.go (new)
+
+## 2026-07-01 — #3771 route/neighbor wire-struct integrity guard (codex-161)
+
+- **Timestamp**: 2026-07-01
+- **Action**: Fail-close the route/neighbor snapshot decode at the Rust
+  helper boundary on self-contradicting wire-struct metadata (M4/M11/M12/L1),
+  extending the #3367/#3406/#3712-3716/#3719 snapshot-integrity family to the
+  ROUTE and NEIGHBOR structs.
+    - M4 (`RouteFamilyMismatch`): `populate_routes` now rejects a route whose
+      non-empty `family` disagrees with the address family its `destination`
+      parses as (was: FIB chosen by the prefix parse only, `family` ignored).
+    - L1 (`RoutePreferenceOutOfRange`): reject a NEGATIVE route preference —
+      it would sort ahead of every route in the `sort_routes` ascending-
+      preference tie-break. Go primary gate added at the commit boundary
+      (`schema_routing.go`: typed `preference` leaf, `ValidateInteger(0,
+      maxWireI32)` where maxWireI32 = the i32 wire ceiling, new const in
+      schema_validators.go mirroring maxWireU16/maxWireU32).
+    - M11 (`NeighborFamilyMismatch`): `populate_neighbors` rejects a neighbor
+      whose non-empty `family` disagrees with its parsed `ip`.
+    - M12 (allowlist + counter): `neighbor_state_usable`/new
+      `classify_neighbor_state` became an ALLOWLIST (reachable/stale/delay/
+      probe/permanent/noarp). failed/incomplete are known-unusable (skipped
+      silently); an empty/`none`/future/corrupt state is Unknown — skipped AND
+      counted by the new `NEIGHBOR_UNKNOWN_STATE_SKIPPED` diagnostic atomic
+      (was: denylist installed every unrecognized state carrying a parseable
+      IP+MAC). `parse_neighbor_entries` re-scoped to classify only the state
+      (last) `ip neigh` field — the pre-fix all-fields denylist scan cannot use
+      an allowlist.
+    - `populate_routes`/`populate_neighbors` are now fallible;
+      `build_forwarding_state_with_policy_counters_and_previous` propagates the
+      Err via `?` so the reconcile/refresh preflight keeps the previous live
+      forwarding state. EMPTY `family` stays unconstrained (parse-only, pre-fix
+      behavior). NO wire field changed → no protocol_wire_v1.json regen.
+    - RED-on-revert verified: reverting all four guards flips
+      route_family_contradicts_destination_fails_closed,
+      route_negative_preference_fails_closed,
+      neighbor_family_contradicts_ip_fails_closed,
+      neighbor_unknown_state_is_skipped_and_counted, and
+      classify_neighbor_state_is_an_allowlist RED while the anti-over-reject
+      tests stay green. Full `cargo test --release` green (3394 lib + aux
+      binaries, 0 failed); `go test ./pkg/config ./pkg/dataplane/userspace`
+      green. Updated the forwarding/README.md + FEATURES.md policy.rs row.
+      Fixed the pre-existing
+      `forwarding_state_normalizes_ipv6_routes_emitted_in_inet_table` test (it
+      artificially set family="inet" on a v6 route — now keeps the correct v6
+      family while still exercising table normalization).
+- **File(s)**: userspace-dp/src/policy.rs (3 SnapshotIntegrityError variants +
+  Display arms), userspace-dp/src/afxdp/forwarding_build/fib.rs
+  (populate_routes/populate_neighbors fallible + family/preference guards +
+  helpers), userspace-dp/src/afxdp/forwarding/mod.rs (classify_neighbor_state +
+  NeighborStateClass + NEIGHBOR_UNKNOWN_STATE_SKIPPED + parse_neighbor_entries),
+  userspace-dp/src/afxdp/forwarding_build/mod.rs (`?` propagation),
+  userspace-dp/src/afxdp/forwarding/tests.rs (classifier unit test + fixture
+  fix), userspace-dp/src/afxdp/forwarding_build/tests.rs (M4/M11/M12/L1 tests),
+  pkg/config/schema_routing.go (typed preference leaf),
+  pkg/config/schema_validators.go (maxWireI32),
+  pkg/config/schema_route_preference_3771_test.go (commit-gate tests),
+  userspace-dp/src/afxdp/forwarding/README.md, userspace-dp/src/FEATURES.md

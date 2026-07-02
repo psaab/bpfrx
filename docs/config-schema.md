@@ -3540,7 +3540,23 @@ of installing silently and then vanishing from the dataplane.
   link-local form above, both shapes); `discard` / `reject` / `next-table` /
   `qualified-next-hop ... interface ...` are declared children of the `route`
   node, so a no-next-hop blackhole/leak route and the link-local-IPv6
-  qualified-next-hop form still commit. `preference` is likewise declared.
+  qualified-next-hop form still commit.
+- **preference (#3771, #3827)** — BOTH the route-level `preference` leaf
+  (#3771) AND the `qualified-next-hop <addr> preference <n>` leaf (#3827) are
+  typed `ValueInteger` + `ValidateInteger(0, maxWireI32)`: a non-negative
+  administrative distance representable on the i32 wire field the compiler
+  folds every preference into (`route.Preference`, compiler_routing.go). A
+  negative (would sort ahead of every route in the Rust FIB tie-break),
+  non-numeric, or i32-overflowing preference is a commit error naming the
+  leaf. This is the primary gate; the Rust helper backstops the wire bound
+  (`RoutePreferenceOutOfRange`) with a fail-closed snapshot rejection for a
+  corrupt / version-drifted snapshot. Typing the qualified-next-hop leaf
+  (#3827) closed the completeness gap where a bad preference expressed via the
+  qualified-next-hop syntax skipped the Go gate and reached only the opaque
+  Rust backstop (retained-prior-state instead of a commit diagnostic).
+  Fail-on-revert tests: `pkg/config/schema_route_preference_3771_test.go`
+  (route-level) and `pkg/config/schema_route_qnh_preference_3827_test.go`
+  (qualified-next-hop).
 
 Before #2448 both leaves were accepted untyped: the Rust FIB builder
 (`userspace-dp forwarding_build/fib.rs populate_routes`) soft-skips a
