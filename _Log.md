@@ -27326,3 +27326,25 @@ top.
   pkg/dataplane/userspace/host_inbound_phys_unit_3720_test.go (new),
   pkg/config/host_inbound_effective_3720_test.go (new),
   docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3721 — behavior-preserving perf fix for host-inbound view
+  grouping. BuildZoneHostInboundViews (pkg/dataplane/userspace/zones.go)
+  keyed each group on an ORDER-SENSITIVE strings.Join of the effective
+  token slices, so two interfaces with semantically identical but
+  differently-ordered sets ([ssh ping] vs [ping ssh]) fell into separate
+  groups and emitted duplicate nft rule blocks + deny counters — payload
+  / `nft -f` bloat on large trunks. Fix: key getGroup on the CANONICAL
+  (sorted/deduped) signature via config.CanonicalHostInboundTokenSig (the
+  same SSOT the commit gate + ambiguity reporter use), keeping the
+  first-seen authored svc/proto order on the emitted view for display
+  fidelity. Behavior-preserving: admission per address is unchanged (all
+  accepts + one deny, order-independent); only duplicate blocks collapse.
+  Tests: reordered-identical sets merge to ONE address-bearing view
+  (RED-on-revert), distinct sets stay separate (over-merge guard),
+  per-address effective set unchanged (enforcement-preserving), plus a
+  modest BenchmarkBuildZoneHostInboundViews on a varying-order trunk.
+  go test ./pkg/config/... ./pkg/dataplane/... ./pkg/daemon/... ./pkg/cli/...
+  ./pkg/api/... ./pkg/grpcapi/... green; go build ./...; gofmt + vet clean.
+- **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/host_inbound_view_grouping_3721_test.go (new)

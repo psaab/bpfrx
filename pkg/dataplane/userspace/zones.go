@@ -125,7 +125,19 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	}
 	groups := make(map[string]*group)
 	getGroup := func(zone string, svc, proto []string, iface string) *group {
-		sig := zone + "\x00" + strings.Join(svc, ",") + "\x00" + strings.Join(proto, ",")
+		// #3721: group by a CANONICAL (sorted, deduped) token signature so two
+		// interfaces whose EFFECTIVE admission sets are semantically identical but
+		// authored in a different order ([ssh ping] vs [ping ssh]) fall into ONE
+		// group — one nft rule block + one deny counter — instead of the
+		// order-sensitive strings.Join keying two groups that inflate the nft
+		// payload / `nft -f` replace time on a large trunk. The group keeps the
+		// FIRST-seen authored svc/proto order for display fidelity; enforcement
+		// keys on the address set plus the accept-token set, both
+		// order-independent, so this is behavior-preserving (identical admission,
+		// fewer duplicate blocks). Shares config.CanonicalHostInboundTokenSig with
+		// the commit gate and the ambiguity reporter so all three agree on what
+		// counts as "the same set".
+		sig := zone + "\x00" + config.CanonicalHostInboundTokenSig(svc, proto)
 		g := groups[sig]
 		if g == nil {
 			g = &group{
