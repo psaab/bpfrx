@@ -26805,3 +26805,39 @@ top.
     reversed-range reject; appTerm.dstPortConfigured + portConfigured
     guard), pkg/dataplane/userspace/nat_reversed_port_range_3726_test.go
     (new RED-on-revert pins), docs/userspace-dnat-plan.md (§13b)
+
+- **Timestamp**: 2026-07-01
+  **Action**: #3747 — bound the flowexport batch queue (`flowBatch`) and
+    add drop/depth visibility. The per-family export accumulator
+    (`transport.go` `flowBatch.v4/v6`) was UNBOUNDED: `add` appended
+    with no cap and the batch drained ONLY from the exporter `Run`
+    goroutine (100ms ticker). A stopped/stalled drain (reconcile window,
+    slow/blocked collector, SESSION_CLOSE storm) let it grow with the
+    close-event rate → unbounded memory growth (DoS/OOM) with no depth or
+    drop counter. Fix: bound each family at `defaultFlowBatchCap` (65536
+    records); on overflow DROP the incoming record (drop-newest, O(1),
+    never blocks the event-reader flow-close callback) and increment an
+    atomic `dropped` counter; track a `maxDepth` high-water mark. Chose
+    drop-newest over drop-oldest: O(1) with no slice-shift/realloc churn,
+    non-blocking, happy-path append unchanged; forensic value of which
+    end is dropped is symmetric in a near-contemporaneous close storm.
+    Surfaced via `Exporter`/`IPFIXExporter` `BatchDepth/BatchMaxDepth/
+    BatchDropped` accessors → `Daemon.FlowExportBatchStats()` →
+    Prometheus family `xpf_flow_export_batch_{depth,max_depth,
+    dropped_total}` labeled {protocol,instance,template} (mirrors the
+    #2464 CollectorHealth wiring). RED-on-revert: reverting the source
+    (keeping the test) fails to compile — the bounded API (capOverride /
+    Dropped / MaxDepth / depth) does not exist pre-fix; behavioral pins
+    assert drops-above-cap, no-drop-below-cap, per-family independence,
+    high-water survives drain, and a -race concurrent producer/drain
+    accounting invariant (drained+dropped == offered). go test -race
+    ./pkg/flowexport/... + ./pkg/api/... green; ./pkg/daemon/... green;
+    go build ./... green; gofmt + vet clean on touched files.
+  - **File(s)**: pkg/flowexport/transport.go (bounded flowBatch +
+    dropped/maxDepth atomics + depth/Dropped/MaxDepth + ExporterBatchStats),
+    pkg/flowexport/netflow.go + pkg/flowexport/ipfix.go (Batch* accessors),
+    pkg/flowexport/flowbatch_bounded_test.go (new RED-on-revert pins),
+    pkg/daemon/daemon_flowexport.go (FlowExportBatchStats), pkg/daemon/daemon_run.go
+    (wire FlowExportBatchStatsFn), pkg/api/server.go + metrics.go +
+    metrics_descriptors.go + metrics_system.go (xpf_flow_export_batch_* family),
+    pkg/flowexport/README.md (Bounded export batch section)
