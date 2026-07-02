@@ -27853,3 +27853,37 @@ top.
   removed & 0x3f mask), userspace-dp/src/filter/tests.rs (two RED-on-revert
   tests), userspace-dp/src/filter/README.md (#3715 backstop doc + test list),
   pkg/config/compiler_validate_strict.go (L10 stale-comment reword)
+
+## 2026-07-02
+
+- **Timestamp**: 2026-07-02
+- **Action**: #3713 — reject duplicate policy rule_id / policy_id at snapshot
+  parse (fail closed). The Rust policy snapshot parser had NO uniqueness guard
+  for rule_id or policy_id (it already hard-fails duplicate address-book ids).
+  Two rules with the same stable rule_id (an identical explicit wire rule_id, or
+  an identical synthesized `from->to/name` key from a duplicate policy name in a
+  zone pair) SHARE one Arc<PolicyRuleCounter> (rule_hit_counter is get-or-insert
+  keyed by rule_id) so counter_snapshots() collapses two rows onto one total
+  (hit-count mis-attribution); a duplicate policy_id overwrites the
+  last-writer-wins rule_id_to_policy_id map so an existing session re-resolves
+  (#3395 live-row refresh / RT_FLOW SESSION_CLOSE) to the WRONG policy. Fix: a
+  non-mutating preflight in parse_policy_state_with_counters (FIRST validation,
+  before the book loop / rule loop) rejects a duplicate resolved rule_id
+  (DuplicateRuleId) and a duplicate non-sentinel policy_id (DuplicatePolicyId,
+  M01) BEFORE any per-rule counter is allocated (L14 — no transient counter for a
+  rejected snapshot). Mirrors DuplicateAddressBookId + the #2124/#3261/#3367/#3711
+  fail-closed family; keeps the previous good forwarding state. The reserved
+  implicit-default sentinel (DEFAULT_POLICY_SENTINEL_ID, u32::MAX) is excluded
+  from the policy_id check; policy_id 0 (the valid first-policy id) is checked
+  normally. Rust-only — the Go builder (walkPolicyRuleSlots) already assigns
+  unique positional ids by construction, and the Rust parser is the only
+  enforcement plane in the retired-eBPF world for a corrupt / hand-built /
+  mixed-version HA peer-sync snapshot. RED-on-revert tests:
+  duplicate_synthesized_rule_id_fails_closed, duplicate_explicit_wire_rule_id_
+  fails_closed, duplicate_policy_id_fails_closed (all Err on fix, Ok on revert)
+  + distinct_rules_get_distinct_hit_counters (distinct Arcs, no shared counter).
+- **File(s)**: userspace-dp/src/policy.rs (two new SnapshotIntegrityError
+  variants + Display arms + preflight in parse_policy_state_with_counters),
+  userspace-dp/src/policy_tests.rs (4 tests),
+  docs/userspace-dataplane-architecture.md (duplicate rule-identity fail-closed
+  paragraph)

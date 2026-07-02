@@ -6296,3 +6296,135 @@ fn configured_zone_pairs_exact_only_not_overbroadened() {
         "exact-only config yields exactly its one pair"
     );
 }
+
+#[test]
+fn duplicate_synthesized_rule_id_fails_closed() {
+    // #3713: two rules with the SAME (from,to,name) synthesize the identical
+    // stable rule_id (`lan->wan/dup`) even though they carry DISTINCT positional
+    // policy_ids. Without the preflight both rules would get-or-insert the SAME
+    // Arc<PolicyRuleCounter> keyed by that rule_id, so counter_snapshots() would
+    // emit two rows with one collapsed total (hit-count mis-attribution).
+    // Reverting the fix returns Ok(state) with two rules sharing a counter, so
+    // this Err assertion is non-tautological (RED on revert).
+    let store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("dup", 0), permit_snapshot("dup", 1)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::DuplicateRuleId { rule_id }) => {
+            assert_eq!(rule_id, "lan->wan/dup");
+        }
+        other => panic!("expected DuplicateRuleId, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_explicit_wire_rule_id_fails_closed() {
+    // #3713: two rules with DISTINCT names/zone-pairs but the SAME explicit wire
+    // rule_id (a corrupt / mixed-version producer). stable_policy_rule_id returns
+    // the explicit rule_id verbatim, so both resolve to "wire-dup" and would
+    // share one hit counter and alias the RT_FLOW/session join key. Distinct
+    // policy_ids ensure the rule_id check (not the policy_id check) fires.
+    let store = PolicyCounterStore::default();
+    let a = PolicyRuleSnapshot {
+        rule_id: "wire-dup".to_string(),
+        name: "alpha".to_string(),
+        policy_id: 10,
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let b = PolicyRuleSnapshot {
+        rule_id: "wire-dup".to_string(),
+        name: "bravo".to_string(),
+        policy_id: 11,
+        from_zone: "trust".to_string(),
+        to_zone: "untrust".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[a, b], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::DuplicateRuleId { rule_id }) => {
+            assert_eq!(rule_id, "wire-dup");
+        }
+        other => panic!("expected DuplicateRuleId, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_policy_id_fails_closed() {
+    // #3713 (M01): two rules with DISTINCT stable rule_ids (`lan->wan/p1`,
+    // `lan->wan/p2`) but the SAME positional policy_id (7). The Go builder
+    // assigns a unique policy_id per rule by construction; a duplicate is a
+    // corrupt / mixed-version snapshot. Without the reject, the last-writer-wins
+    // rule_id_to_policy_id map would let an existing session re-resolve to the
+    // wrong policy (#3395 live-row refresh). Reverting the fix returns Ok(state),
+    // so this Err assertion is non-tautological (RED on revert).
+    let store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("p1", 7), permit_snapshot("p2", 7)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::DuplicatePolicyId { policy_id }) => {
+            assert_eq!(policy_id, 7);
+        }
+        other => panic!("expected DuplicatePolicyId, got {other:?}"),
+    }
+}
+
+#[test]
+fn distinct_rules_get_distinct_hit_counters() {
+    // #3713 positive control: two genuinely distinct rules (distinct stable
+    // rule_id AND distinct policy_id, including the valid first-policy id 0 which
+    // is NOT the u32::MAX sentinel) still parse cleanly and each gets its OWN
+    // hit-counter Arc — no shared/mis-attributed counting. This guards the
+    // preflight against over-rejecting a legitimate multi-rule snapshot.
+    let store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &[permit_snapshot("p1", 0), permit_snapshot("p2", 1)],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    )
+    .expect("two distinct rules must parse cleanly");
+    assert_eq!(state.rules.len(), 2, "both distinct rules retained");
+    assert_ne!(
+        state.rules[0].rule_id, state.rules[1].rule_id,
+        "distinct rule_ids"
+    );
+    assert_ne!(
+        state.rules[0].policy_id, state.rules[1].policy_id,
+        "distinct policy_ids"
+    );
+    assert!(
+        !Arc::ptr_eq(&state.rules[0].hit_counter, &state.rules[1].hit_counter),
+        "distinct rules must NOT share one Arc<PolicyRuleCounter>"
+    );
+    // counter_snapshots() emits one row per distinct rule id (plus the reserved
+    // default-policy row), never two rows collapsed onto one shared total.
+    let ids: Vec<String> = state
+        .counter_snapshots()
+        .into_iter()
+        .map(|c| c.rule_id)
+        .collect();
+    assert!(ids.contains(&"lan->wan/p1".to_string()));
+    assert!(ids.contains(&"lan->wan/p2".to_string()));
+}

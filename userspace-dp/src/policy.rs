@@ -16,6 +16,33 @@ use std::sync::{Arc, Mutex};
 pub(crate) enum SnapshotIntegrityError {
     AddressBookIdZero,
     DuplicateAddressBookId(u32),
+    /// #3713: two policy rules resolved to the SAME stable rule identity
+    /// (`stable_policy_rule_id`) — either an identical explicit wire `rule_id`
+    /// (corrupt / mixed-version producer) or an identical synthesized
+    /// `from->to/name` key (a duplicate policy name in one zone pair). The
+    /// rule_id is the get-or-insert key for `PolicyCounterStore::rule_hit_counter`,
+    /// so two rules with the same id SHARE one `Arc<PolicyRuleCounter>`:
+    /// `counter_snapshots()` then emits two rows with the same id and the same
+    /// collapsed totals (hit-count mis-attribution), and it is also the RT_FLOW /
+    /// session / display join key, so an incident-response surface joins the
+    /// wrong rule. Rejecting the WHOLE snapshot (the preflight keeps the previous
+    /// good state; a fresh boot keeps the default-deny `PolicyState`) mirrors
+    /// `DuplicateAddressBookId` and the #2124/#3261/#3367/#3711 fail-closed
+    /// family. A normal Go snapshot assigns each policy a distinct positional
+    /// identity, so this guards a corrupt / hand-built / mixed-version HA
+    /// peer-sync snapshot.
+    DuplicateRuleId { rule_id: String },
+    /// #3713: two policy rules carry the SAME positional `policy_id`. The Go
+    /// builder assigns `policy_set_id * MAX_RULES_PER_POLICY + rule_index`
+    /// (`walkPolicyRuleSlots`), which is unique per rule by construction, so a
+    /// duplicate is a corrupt / mixed-version snapshot. `policy_id` is the
+    /// RT_FLOW / `SESSION_CLOSE` / display join key AND the value stored in
+    /// `rule_id_to_policy_id` (last-writer-wins), so a duplicate lets an existing
+    /// session re-resolve (#3395 live-row refresh) to the WRONG policy — wrong
+    /// attribution during incident response. The reserved implicit-default
+    /// sentinel (`DEFAULT_POLICY_SENTINEL_ID`, `u32::MAX`) is never carried by a
+    /// configured rule and is excluded from the check (M01).
+    DuplicatePolicyId { policy_id: u32 },
     UnknownAddressBookId { rule_id: String, book_id: u32 },
     /// #2124: a policy rule has at least one `application_terms` entry that
     /// failed to parse (unrepresentable protocol or malformed port). Dropping a
@@ -573,6 +600,16 @@ impl std::fmt::Display for SnapshotIntegrityError {
             Self::DuplicateAddressBookId(id) => {
                 write!(f, "duplicate address_books.id={}", id)
             }
+            Self::DuplicateRuleId { rule_id } => write!(
+                f,
+                "duplicate policy rule_id {:?} — two rules resolve to the same stable identity (identical explicit rule_id or duplicate policy name in a zone pair); refusing to fail open by sharing one hit counter and aliasing the RT_FLOW/session/display join key",
+                rule_id
+            ),
+            Self::DuplicatePolicyId { policy_id } => write!(
+                f,
+                "duplicate policy_id {} — two rules carry the same positional policy id (corrupt/mixed-version snapshot); refusing to fail open by letting a session re-resolve to the wrong policy",
+                policy_id
+            ),
             Self::UnknownAddressBookId { rule_id, book_id } => write!(
                 f,
                 "rule {:?} references unknown address book id={}",
@@ -2453,6 +2490,45 @@ pub(crate) fn parse_policy_state_with_counters(
             action: default_policy.to_string(),
         })?
     };
+    // #3713: preflight rule-identity uniqueness BEFORE allocating any per-rule
+    // hit counter (`counter_store.rule_hit_counter`) or building a PolicyRule
+    // entry. The Rust parser is the ONLY enforcement plane in the retired-eBPF
+    // world; a corrupt / hand-built / mixed-version-HA-peer snapshot can carry
+    // two rules that resolve to an identical stable `rule_id` (an identical
+    // explicit wire rule_id, or an identical synthesized `from->to/name` key
+    // from a duplicate policy name in a zone pair) or an identical positional
+    // `policy_id`. Both alias the runtime identity: the rule_id is the
+    // get-or-insert key for `rule_hit_counter` (two rules would SHARE one
+    // `Arc<PolicyRuleCounter>` and collapse their totals onto one row), and the
+    // policy_id is the RT_FLOW / SESSION_CLOSE / display join key AND the
+    // last-writer-wins value in `rule_id_to_policy_id` (a duplicate lets an
+    // existing session re-resolve to the WRONG policy). Rejecting the WHOLE
+    // snapshot (this preflight is non-mutating, so the store keeps the previous
+    // good state; a fresh boot keeps the default-deny PolicyState) mirrors
+    // `DuplicateAddressBookId` and the #2124/#3261/#3367/#3711 fail-closed
+    // family. Run FIRST so no transient counter is observed for a snapshot that
+    // is then rejected (L14). The reserved implicit-default sentinel
+    // (`DEFAULT_POLICY_SENTINEL_ID`) is never carried by a configured rule and
+    // is excluded from the policy_id check (M01).
+    {
+        let mut seen_rule_ids: FxHashSet<String> = FxHashSet::default();
+        seen_rule_ids.reserve(rules.len());
+        let mut seen_policy_ids: FxHashSet<u32> = FxHashSet::default();
+        seen_policy_ids.reserve(rules.len());
+        for snap in rules {
+            let rule_id = stable_policy_rule_id(snap);
+            if !seen_rule_ids.insert(rule_id.clone()) {
+                return Err(SnapshotIntegrityError::DuplicateRuleId { rule_id });
+            }
+            if snap.policy_id != DEFAULT_POLICY_SENTINEL_ID
+                && !seen_policy_ids.insert(snap.policy_id)
+            {
+                return Err(SnapshotIntegrityError::DuplicatePolicyId {
+                    policy_id: snap.policy_id,
+                });
+            }
+        }
+    }
     // #3783: capture the concrete (interface-assignable) zone-id universe from
     // the incoming snapshot's zone table so `configured_zone_pairs` can
     // materialize the concrete pairs that a wildcard/global-only policy will

@@ -678,6 +678,33 @@ snapshot only ever emits parseable, family-separated literals / `any` / family
 wildcards, so these rejects guard against a corrupt / hand-built / mixed-version
 HA peer-sync snapshot; the preflight keeps the previous good forwarding state.
 
+**Duplicate rule-identity fail-closed (#3713).** `parse_policy_state_with_counters`
+preflights rule-identity uniqueness BEFORE it allocates any per-rule hit counter
+or builds a `PolicyRule` entry — the FIRST validation in the function, so no
+transient counter is get-or-inserted into the shared `PolicyCounterStore` for a
+snapshot that is then rejected. Two failure modes are rejected:
+`SnapshotIntegrityError::DuplicateRuleId` when two rules resolve to the same
+stable `rule_id` (`stable_policy_rule_id` returns an explicit wire `rule_id`
+verbatim, else the synthesized `from->to/name` key — an identical explicit id or
+a duplicate policy name in one zone pair collides), and
+`SnapshotIntegrityError::DuplicatePolicyId` when two rules carry the same
+positional `policy_id`. Both alias the runtime identity: `rule_id` is the
+get-or-insert key for `PolicyCounterStore::rule_hit_counter`, so a duplicate
+would make two rules SHARE one `Arc<PolicyRuleCounter>` and `counter_snapshots()`
+would emit two rows with the same id and the same collapsed totals (hit-count
+mis-attribution); `policy_id` is the RT_FLOW / `SESSION_CLOSE` / display join key
+AND the last-writer-wins value in `rule_id_to_policy_id`, so a duplicate lets an
+existing session re-resolve (#3395 live-row refresh) to the WRONG policy. The Go
+builder (`walkPolicyRuleSlots`) assigns each policy a distinct positional
+`policy_id` (`policy_set_id * MAX_RULES_PER_POLICY + rule_index`) and a distinct
+stable `rule_id` by construction, so a clean commit never trips these; they are
+the helper-boundary backstop for a corrupt / hand-built / mixed-version HA
+peer-sync snapshot. The reserved implicit-default sentinel
+(`DEFAULT_POLICY_SENTINEL_ID`, `u32::MAX`) is never carried by a configured rule
+and is excluded from the `policy_id` check (M01); `policy_id` 0 is the valid
+first-policy id and is checked normally. Rejecting the whole snapshot mirrors
+`DuplicateAddressBookId` and keeps the previous good forwarding state.
+
 **Wildcard zone tiers (#3090).** A policy whose `from-zone` or `to-zone` is the
 Junos wildcard `any` is indexed into one of three dedicated lists alongside the
 exact `zone_pair_index`: **from-any** (key = concrete to-zone id), **to-any**
