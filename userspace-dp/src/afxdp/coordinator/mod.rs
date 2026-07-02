@@ -167,6 +167,42 @@ pub(in crate::afxdp) fn log_wg_endpoint_set_transition(
     }
 }
 
+/// #3773 (M13): stable, order-independent summary of a fabric-skip set for
+/// transition logging (`name:reason`, sorted). Empty when no fabric link was
+/// skipped — the common healthy case.
+fn fabric_skip_set_summary(skips: &[FabricLinkSkip]) -> String {
+    let mut items: Vec<String> = skips
+        .iter()
+        .map(|s| format!("{}:{}", s.name, s.reason.as_str()))
+        .collect();
+    items.sort();
+    items.join(", ")
+}
+
+/// #3773 (M13): log a fabric-skip-set transition between two forwarding
+/// states, mirroring `log_wg_endpoint_set_transition`. Silent when the skip set
+/// is unchanged (the common case, including the healthy empty=>empty), so a
+/// PERSISTENTLY malformed/unresolved fabric logs ONCE when it first appears (or
+/// changes reason) rather than on every 30s `SyncFabricState` refresh / route
+/// churn `bump_fib` — state-transition cadence per the logging rules. Names
+/// each skipped fabric and why, so an operator triaging a dead HA
+/// cross-chassis path has a journal line instead of a silent skip. The
+/// cumulative `FABRIC_LINK_SKIPPED_MALFORMED` / `FABRIC_LINK_UNRESOLVED_PEER`
+/// atomics (status/Prometheus) quantify it in parallel.
+pub(in crate::afxdp) fn log_fabric_skip_transition(
+    path: &str,
+    old: &[FabricLinkSkip],
+    new: &[FabricLinkSkip],
+) {
+    let old_set = fabric_skip_set_summary(old);
+    let new_set = fabric_skip_set_summary(new);
+    if old_set != new_set {
+        eprintln!(
+            "xpf-userspace-dp: fabric skip set changed ({path}): [{old_set}] => [{new_set}]"
+        );
+    }
+}
+
 pub struct Coordinator {
     pub(crate) bpf_maps: BpfMaps,
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,

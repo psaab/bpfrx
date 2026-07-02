@@ -483,6 +483,10 @@ type xpfCollector struct {
 	neighborNetlinkRedumpUpsertsTotal       *prometheus.Desc
 	neighborPendingKeys                     *prometheus.Desc
 	negNeighKeys                            *prometheus.Desc
+	// #3773 (M13): fabric-link skip diagnostics — malformed value vs
+	// unresolved (empty) peer/local MAC.
+	fabricLinkSkippedMalformedTotal *prometheus.Desc
+	fabricLinkUnresolvedPeerTotal   *prometheus.Desc
 	// #1865: operator-visible WireGuard telemetry — per-tunnel
 	// handshake/encap/decap counters + drop reasons from the helper's
 	// wg_tunnels status rows. Label sets: {tunnel} (+ role / direction
@@ -780,6 +784,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborNetlinkRedumpUpsertsTotal
 	ch <- c.neighborPendingKeys
 	ch <- c.negNeighKeys
+	ch <- c.fabricLinkSkippedMalformedTotal
+	ch <- c.fabricLinkUnresolvedPeerTotal
 	ch <- c.wgHandshakesCompletedTotal
 	ch <- c.wgHandshakeInitiationsCreatedTotal
 	ch <- c.wgHandshakeInitiationBuildFailuresTotal

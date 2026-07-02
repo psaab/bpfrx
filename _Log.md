@@ -27559,3 +27559,61 @@ top.
   end-to-end tests), userspace-dp/src/policy_tests.rs (4 semantics tests),
   docs/userspace-dataplane-architecture.md (#3783 histogram-slot-coverage
   paragraph)
+
+- **Timestamp**: 2026-07-01
+- **Action**: #3773 (codex-161 M13+L4) — fabric-link build/refresh
+  observability + persistence. M13: `populate_fabrics`
+  (afxdp/forwarding_build/fib.rs) and `resolve_fabric_links_from_snapshots`
+  (afxdp/forwarding/mod.rs) silently `continue`'d over a fabric link with a
+  malformed peer/local MAC or peer address — no counter, log, or status, so
+  an HA cross-chassis fabric link that silently failed to install was
+  invisible. Introduced a SHARED `build_fabric_link_or_skip` classifier used
+  by both passes; a skip is now COUNTED into two cumulative diagnostic
+  atomics — `FABRIC_LINK_SKIPPED_MALFORMED` (invalid parent ifindex /
+  unparseable peer address / non-empty unparseable local|peer MAC) vs
+  `FABRIC_LINK_UNRESOLVED_PEER` (empty MAC awaiting neighbor/interface
+  resolution — the expected late-resolution `SyncFabricState` transient) —
+  RECORDED by name in `ForwardingState.fabric_skips`, and named once-per-
+  change in the journal by `log_fabric_skip_transition`
+  (coordinator/mod.rs, mirrors log_wg_endpoint_set_transition; wired into
+  snapshot_refresh + reconcile + refresh_fabric_links; snapshot_refresh
+  prunes a skip whose parent was re-added by the preserved-fabric merge).
+  Both atomics surface in status (ProcessStatus + refresh_status via new
+  Coordinator accessors) and Prometheus
+  (`xpf_userspace_fabric_link_{skipped_malformed,unresolved_peer}_total`).
+  Fabric is an HA optimization → skipped-with-visibility, NOT
+  fail-closed-whole-snapshot. L4: the `update_fabrics` handler
+  (server/handlers/mod.rs) was the only mutating verb that neither updated
+  the stored snapshot nor set persist_state, so late-resolved MACs lived
+  only in RAM and the published state file (Go `show` surface) kept stale
+  apply-time MACs; it now folds the resolved FabricSnapshots into the stored
+  snapshot + persists ONLY when the set changed (no 30s churn). Restart
+  continuity documented: the helper starts snapshot:None and never
+  self-restores — the Go daemon re-applies + re-runs populateFabricFwd
+  within seconds; the persisted set is the observability snapshot, not the
+  restore source. Added 5 Rust M13 tests (forwarding/tests.rs) + 2 L4
+  handler tests (server/tests.rs) + 1 Go wire round-trip test
+  (protocol_test.go); all RED-on-revert. Regenerated protocol_wire_v1.json
+  (2 new ProcessStatus keys). FULL `cargo test --release` green.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs (FabricSkipReason
+  + FabricLinkSkip + ForwardingState.fabric_skips),
+  userspace-dp/src/afxdp/forwarding/mod.rs (2 atomics + record_fabric_skip +
+  build_fabric_link_or_skip + resolve_fabric_links_from_snapshots return
+  skips), userspace-dp/src/afxdp/forwarding_build/fib.rs (populate_fabrics),
+  userspace-dp/src/afxdp/coordinator/mod.rs (log_fabric_skip_transition),
+  userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs (refresh_fabric_links
+  + main-path prune/log), userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs (2 accessors),
+  userspace-dp/src/protocol/control.rs (2 status fields),
+  userspace-dp/src/protocol/snapshot.rs (FabricSnapshot PartialEq),
+  userspace-dp/src/server/handlers/mod.rs (L4 persist),
+  userspace-dp/src/server/helpers.rs (refresh_status),
+  userspace-dp/src/server/lifecycle.rs (ProcessStatus init),
+  userspace-dp/src/afxdp/forwarding/tests.rs (5 tests),
+  userspace-dp/src/server/tests.rs (2 tests),
+  userspace-dp/tests/fixtures/protocol_wire_v1.json (regen),
+  pkg/dataplane/userspace/protocol.go (2 mirror fields),
+  pkg/dataplane/userspace/protocol_test.go (wire round-trip test),
+  pkg/api/metrics.go + metrics_descriptors.go + metrics_userspace.go
+  (2 Prometheus counters), docs/fabric-cross-chassis-fwd.md,
+  userspace-dp/src/afxdp/forwarding/README.md

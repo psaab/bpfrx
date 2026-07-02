@@ -141,6 +141,23 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) egress: FastMap<i32, EgressInterface>,
     pub(in crate::afxdp) ingress_logical_ifindex: FastMap<(i32, u16), i32>,
     pub(in crate::afxdp) fabrics: Vec<FabricLink>,
+    /// #3773 (M13): fabric links this build/refresh pass SKIPPED because a
+    /// value was malformed (`parent_ifindex <= 0`, an unparseable
+    /// `peer_address`, or a NON-EMPTY unparseable local/peer MAC) or because
+    /// the peer/local MAC could not be resolved yet (an EMPTY MAC field
+    /// awaiting neighbor/interface resolution — the expected transient of the
+    /// late-resolution `SyncFabricState` path). Before #3773 each skip was a
+    /// bare `continue` with no counter, log, or status, so an HA cross-chassis
+    /// fabric link that silently failed to install was invisible to the
+    /// operator. Populated by `populate_fabrics` (snapshot build) and
+    /// `resolve_fabric_links_from_snapshots` (runtime refresh); each push also
+    /// bumps the cumulative `FABRIC_LINK_SKIPPED_MALFORMED` /
+    /// `FABRIC_LINK_UNRESOLVED_PEER` diagnostic atomics surfaced in
+    /// status/Prometheus, and a transition (`log_fabric_skip_transition`)
+    /// names the link in the journal. This list is the most-recent
+    /// resolution pass's skips — the coordinator prunes an entry whose
+    /// parent is re-added by the preserved-fabric merge (snapshot_refresh).
+    pub(in crate::afxdp) fabric_skips: Vec<FabricLinkSkip>,
     pub(in crate::afxdp) allow_dns_reply: bool,
     pub(in crate::afxdp) allow_embedded_icmp: bool,
     /// `security alg <proto> disable` bitfield (#2008 H3/H4): bit 0 DNS,
@@ -702,6 +719,73 @@ pub(in crate::afxdp) struct FabricLink {
     pub(in crate::afxdp) peer_addr: IpAddr,
     pub(in crate::afxdp) peer_mac: [u8; 6],
     pub(in crate::afxdp) local_mac: [u8; 6],
+}
+
+/// #3773 (M13): why a configured fabric link was skipped during a forwarding
+/// build/refresh pass. `is_malformed()` partitions the reasons into the two
+/// cumulative counters: a MALFORMED value (an unusable parent ifindex, an
+/// unparseable peer address, or a NON-EMPTY MAC string that fails to parse) vs
+/// an UNRESOLVED peer/local MAC (an EMPTY MAC field still awaiting neighbor /
+/// interface resolution — the expected transient the late-resolution
+/// `SyncFabricState` path fills in). A persistently non-zero UNRESOLVED count
+/// is a distinct, benign-until-persistent state; a non-zero MALFORMED count is
+/// a config/environment fault an operator must fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum FabricSkipReason {
+    /// `parent_ifindex <= 0` — the fabric parent netdev index is unusable.
+    InvalidParentIfindex,
+    /// `peer_address` does not parse as an IP address.
+    UnparseablePeerAddress,
+    /// A NON-EMPTY `local_mac` string failed to parse (and no parent-ifindex
+    /// MAC fallback was available).
+    MalformedLocalMac,
+    /// An EMPTY `local_mac` with no resolvable parent-ifindex MAC — awaiting
+    /// interface MAC resolution.
+    UnresolvedLocalMac,
+    /// A NON-EMPTY `peer_mac` string failed to parse (and no neighbor entry
+    /// resolved it).
+    MalformedPeerMac,
+    /// An EMPTY `peer_mac` with no resolved neighbor — awaiting ARP/NDP
+    /// resolution (the common startup transient).
+    UnresolvedPeerMac,
+}
+
+impl FabricSkipReason {
+    /// True for a malformed value (a config/environment fault that will not
+    /// self-heal), false for an unresolved-but-well-formed peer/local MAC (the
+    /// expected late-resolution transient).
+    pub(in crate::afxdp) fn is_malformed(self) -> bool {
+        matches!(
+            self,
+            FabricSkipReason::InvalidParentIfindex
+                | FabricSkipReason::UnparseablePeerAddress
+                | FabricSkipReason::MalformedLocalMac
+                | FabricSkipReason::MalformedPeerMac
+        )
+    }
+
+    pub(in crate::afxdp) fn as_str(self) -> &'static str {
+        match self {
+            FabricSkipReason::InvalidParentIfindex => "invalid-parent-ifindex",
+            FabricSkipReason::UnparseablePeerAddress => "unparseable-peer-address",
+            FabricSkipReason::MalformedLocalMac => "malformed-local-mac",
+            FabricSkipReason::UnresolvedLocalMac => "unresolved-local-mac",
+            FabricSkipReason::MalformedPeerMac => "malformed-peer-mac",
+            FabricSkipReason::UnresolvedPeerMac => "unresolved-peer-mac",
+        }
+    }
+}
+
+/// #3773 (M13): a skipped fabric link, named for operator diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) struct FabricLinkSkip {
+    /// The configured fabric name (`FabricSnapshot.name`, e.g. `fab0`).
+    pub(in crate::afxdp) name: String,
+    /// The parent netdev ifindex the skip pertained to (`<= 0` for an
+    /// `InvalidParentIfindex` skip). Used by the preserved-fabric merge to
+    /// prune a skip whose parent was re-added from the prior resolved set.
+    pub(in crate::afxdp) parent_ifindex: i32,
+    pub(in crate::afxdp) reason: FabricSkipReason,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

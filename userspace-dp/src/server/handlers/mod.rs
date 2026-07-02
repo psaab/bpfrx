@@ -136,6 +136,33 @@ pub(crate) fn handle_stream(
             "update_fabrics" => {
                 if let Some(fabrics) = request.fabrics.as_ref() {
                     guard.afxdp.refresh_fabric_links(fabrics);
+                    // #3773 (L4): PERSIST the resolved fabric set. Before #3773
+                    // this arm was the ONLY mutating handler that neither
+                    // updated the persisted snapshot nor set `persist_state`, so
+                    // the late-resolved peer/local MACs from the SyncFabricState
+                    // path lived only in the coordinator's in-memory forwarding
+                    // state — the published state file (read by the Go control
+                    // plane's `show` surface) kept the stale apply-time fabric
+                    // MACs, and any consumer of the last-written state saw them
+                    // too. Fold the freshly-resolved FabricSnapshots into the
+                    // stored snapshot (the persisted SSOT) so `show` reflects the
+                    // truth, and flag a write ONLY when the set actually changed
+                    // — the 30s periodic SyncFabricState refresh must not rewrite
+                    // the state file on every unchanged tick.
+                    //
+                    // Restart continuity is provided by the Go control plane, not
+                    // this file: the helper starts with `snapshot: None`
+                    // (lifecycle.rs) and never self-restores; on restart the
+                    // daemon re-applies the full snapshot and re-runs
+                    // populateFabricFwd (500ms fast retries → 30s periodic), which
+                    // re-resolves and re-syncs the fabric MACs. The persisted set
+                    // is the observability snapshot, not the restore source.
+                    if let Some(snapshot) = guard.snapshot.as_mut() {
+                        if snapshot.fabrics != *fabrics {
+                            snapshot.fabrics = fabrics.clone();
+                            persist_state = true;
+                        }
+                    }
                     refresh_status(&mut guard);
                 }
             }

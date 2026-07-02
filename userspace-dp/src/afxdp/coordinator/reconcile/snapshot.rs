@@ -301,6 +301,15 @@ pub(super) fn apply_snapshot(
     // #1866 D3: WG endpoint-set transition log at the reconcile apply
     // boundary (mirrors refresh_runtime_snapshot).
     super::super::log_wg_endpoint_set_transition("reconcile", &coord.forwarding, &new_forwarding);
+    // #3773 (M13): fabric-skip transition log at the reconcile apply boundary
+    // (mirrors the WG log). `coord.forwarding` was defaulted by
+    // `stop_inner(false)`, so this names the reconcile build's skipped fabric
+    // links; the cumulative malformed/unresolved atomics quantify them.
+    super::super::log_fabric_skip_transition(
+        "reconcile",
+        &coord.forwarding.fabric_skips,
+        &new_forwarding.fabric_skips,
+    );
     // #1873 R-D: the purge diff runs against the tunnel-owner map
     // captured BEFORE teardown (AGY code r3) — stop_inner(false) has
     // already defaulted coord.forwarding, so diffing the live state

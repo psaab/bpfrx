@@ -1437,3 +1437,131 @@ fn export_owner_rg_does_not_hold_state_lock_during_ack_wait() {
     assert!(export_resp.ok, "export failed: {}", export_resp.error);
     ack_thread.join().expect("ack thread");
 }
+
+/// #3773 (L4): an `update_fabrics` that CHANGES the fabric set must fold the
+/// freshly-resolved FabricSnapshots into the STORED snapshot AND persist. The
+/// helper starts with `snapshot: None` and never self-restores, so the
+/// published state file (read by the Go control plane's `show` surface, and
+/// the last-written record a consumer sees) is the observability SSOT. Before
+/// #3773 the `update_fabrics` arm neither updated the stored snapshot nor set
+/// `persist_state`, so a late-resolved peer/local MAC from the SyncFabricState
+/// path lived only in the coordinator's in-memory forwarding state — the
+/// persisted fabrics kept the stale apply-time (unresolved) values.
+/// fail-on-revert: dropping the snapshot fold + `persist_state` leaves the
+/// persisted `snapshot.fabrics` at the empty apply-time set (RED).
+#[test]
+fn update_fabrics_persists_resolved_fabric_set() {
+    use crate::{ConfigSnapshot, FabricSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let state = new_state(ProcessStatus::default());
+    let state_file = unique_state_file("fabric-persist");
+    // Seed an apply_snapshot with NO fabrics (initial build before the peer
+    // MAC resolved). This persists the state file with an empty fabric set.
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 1,
+            fib_generation: 1,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request_on_file(state.clone(), request, &state_file).ok);
+    }
+    // SyncFabricState resolves a peer MAC and pushes it via update_fabrics.
+    let resolved = FabricSnapshot {
+        name: "fab0".into(),
+        parent_interface: "ge-0/0/0".into(),
+        parent_linux_name: "ge-0-0-0".into(),
+        parent_ifindex: 21,
+        overlay_linux_name: "fab0".into(),
+        overlay_ifindex: 101,
+        rx_queues: 2,
+        peer_address: "10.99.13.2".into(),
+        local_mac: "02:bf:72:ff:00:01".into(),
+        peer_mac: "00:aa:bb:cc:dd:ee".into(),
+    };
+    {
+        let mut request = req("update_fabrics");
+        request.fabrics = Some(vec![resolved.clone()]);
+        assert!(run_request_on_file(state.clone(), request, &state_file).ok);
+    }
+    // The stored (in-RAM) snapshot must now carry the resolved fabric.
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .snapshot
+            .as_ref()
+            .expect("stored snapshot")
+            .fabrics,
+        vec![resolved.clone()],
+        "update_fabrics must fold the resolved fabric into the stored snapshot"
+    );
+    // The on-disk state a `show` reads (and the last record a restart-time
+    // consumer sees) must carry the resolved peer MAC, not the empty
+    // apply-time set.
+    let bytes = std::fs::read(&state_file).expect("read persisted state file");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse persisted state file");
+    assert_eq!(
+        persisted["snapshot"]["fabrics"][0]["peer_mac"].as_str(),
+        Some("00:aa:bb:cc:dd:ee"),
+        "persisted snapshot must carry the resolved fabric peer MAC (#3773 L4)"
+    );
+    let _ = std::fs::remove_file(&state_file);
+}
+
+/// #3773 (L4): an `update_fabrics` whose fabric set is UNCHANGED from the
+/// stored snapshot must NOT rewrite the state file — the 30s periodic
+/// SyncFabricState refresh must not churn the disk on every unchanged tick.
+#[test]
+fn update_fabrics_unchanged_set_does_not_rewrite_state_file() {
+    use crate::{ConfigSnapshot, FabricSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let resolved = FabricSnapshot {
+        name: "fab0".into(),
+        parent_interface: "ge-0/0/0".into(),
+        parent_linux_name: "ge-0-0-0".into(),
+        parent_ifindex: 21,
+        overlay_linux_name: "fab0".into(),
+        overlay_ifindex: 101,
+        rx_queues: 2,
+        peer_address: "10.99.13.2".into(),
+        local_mac: "02:bf:72:ff:00:01".into(),
+        peer_mac: "00:aa:bb:cc:dd:ee".into(),
+    };
+    let state = new_state(ProcessStatus::default());
+    let state_file = unique_state_file("fabric-nochurn");
+    // Seed a snapshot that ALREADY carries the resolved fabric.
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 1,
+            fib_generation: 1,
+            generated_at: chrono::Utc::now(),
+            fabrics: vec![resolved.clone()],
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request_on_file(state.clone(), request, &state_file).ok);
+    }
+    let before = std::fs::metadata(&state_file)
+        .expect("state file exists after seed apply")
+        .modified()
+        .expect("mtime");
+    // A same-set update_fabrics: nothing changed, so no rewrite.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    {
+        let mut request = req("update_fabrics");
+        request.fabrics = Some(vec![resolved.clone()]);
+        assert!(run_request_on_file(state.clone(), request, &state_file).ok);
+    }
+    let after = std::fs::metadata(&state_file)
+        .expect("state file still exists")
+        .modified()
+        .expect("mtime");
+    assert_eq!(
+        before, after,
+        "an unchanged update_fabrics must not rewrite the state file"
+    );
+    let _ = std::fs::remove_file(&state_file);
+}

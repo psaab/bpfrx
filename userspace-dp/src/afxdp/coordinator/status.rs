@@ -15,6 +15,22 @@ impl super::Coordinator {
         (entries, generation)
     }
 
+    /// #3773 (M13): cumulative count of fabric links skipped for a MALFORMED
+    /// value (invalid parent ifindex / unparseable peer address / a NON-EMPTY
+    /// unparseable local|peer MAC). Surfaced as
+    /// `xpf_userspace_fabric_link_skipped_malformed_total`.
+    pub fn fabric_link_skipped_malformed_total(&self) -> u64 {
+        crate::afxdp::forwarding::FABRIC_LINK_SKIPPED_MALFORMED.load(Ordering::Relaxed)
+    }
+
+    /// #3773 (M13): cumulative count of fabric links skipped for an UNRESOLVED
+    /// peer/local MAC (an EMPTY MAC field awaiting neighbor/interface
+    /// resolution — the expected late-resolution transient). Surfaced as
+    /// `xpf_userspace_fabric_link_unresolved_peer_total`.
+    pub fn fabric_link_unresolved_peer_total(&self) -> u64 {
+        crate::afxdp::forwarding::FABRIC_LINK_UNRESOLVED_PEER.load(Ordering::Relaxed)
+    }
+
     /// #710: sum of `no_owner_binding_drops` across every binding's
     /// `BindingLiveState`. The per-binding increment site lives in
     /// `apply_worker_shaped_tx_requests` and mechanically lands on

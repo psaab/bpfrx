@@ -77,6 +77,105 @@ pub(super) fn canonical_route_table(table: &str, is_ipv6: bool) -> String {
 pub(in crate::afxdp) static NEIGHBOR_UNKNOWN_STATE_SKIPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// #3773 (M13): count of fabric links skipped during a forwarding
+/// build/refresh because a value was MALFORMED — `parent_ifindex <= 0`, an
+/// unparseable `peer_address`, or a NON-EMPTY local/peer MAC string that failed
+/// to parse. Before #3773 each was a bare `continue` with no signal, so an HA
+/// cross-chassis fabric link that silently failed to install (and therefore
+/// silently did not forward) was invisible. A non-zero — especially a steadily
+/// climbing — value is a config/environment fault the operator must fix; the
+/// paired `log_fabric_skip_transition` journal line names which fabric and why.
+/// Bumps once per malformed fabric per build/refresh pass, in both
+/// `populate_fabrics` (snapshot build) and `resolve_fabric_links_from_snapshots`
+/// (runtime refresh). Surfaced in status/Prometheus
+/// (`xpf_userspace_fabric_link_skipped_malformed_total`).
+pub(in crate::afxdp) static FABRIC_LINK_SKIPPED_MALFORMED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #3773 (M13): count of fabric links skipped during a forwarding
+/// build/refresh because the peer or local MAC could not be resolved YET — an
+/// EMPTY MAC field with no neighbor (peer) or interface (local) MAC available.
+/// This is the EXPECTED transient of the late-resolution `SyncFabricState` path
+/// (`FabricSnapshot.peer_mac` is empty until ARP/NDP resolves the peer). A
+/// briefly non-zero value at startup is normal; a PERSISTENTLY non-zero value
+/// means a fabric peer is not resolving (peer down, wrong sync IP, L2 broken) —
+/// a distinct, non-malformed state per the issue's intent (an unresolved-peer
+/// state is fine; a SILENT skip is not). Surfaced in status/Prometheus
+/// (`xpf_userspace_fabric_link_unresolved_peer_total`).
+pub(in crate::afxdp) static FABRIC_LINK_UNRESOLVED_PEER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #3773 (M13): bump the appropriate cumulative counter for a skipped fabric
+/// link and return the named `FabricLinkSkip` record (for the ForwardingState
+/// skip list + the transition log). Malformed reasons bump
+/// `FABRIC_LINK_SKIPPED_MALFORMED`; unresolved-MAC reasons bump
+/// `FABRIC_LINK_UNRESOLVED_PEER`.
+fn record_fabric_skip(fabric: &crate::FabricSnapshot, reason: FabricSkipReason) -> FabricLinkSkip {
+    if reason.is_malformed() {
+        FABRIC_LINK_SKIPPED_MALFORMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        FABRIC_LINK_UNRESOLVED_PEER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    FabricLinkSkip {
+        name: fabric.name.clone(),
+        parent_ifindex: fabric.parent_ifindex,
+        reason,
+    }
+}
+
+/// #3773 (M13): SHARED fabric-link classifier for both build paths
+/// (`populate_fabrics` and `resolve_fabric_links_from_snapshots`). Each caller
+/// resolves the peer address + local/peer MACs through its own iface/neighbor
+/// context, then hands the resolved `Option`s here; this centralizes the
+/// skip-vs-install decision AND the counter/record so the two paths cannot
+/// drift. Returns the installable `FabricLink` or a counted `FabricLinkSkip`.
+/// Checks proceed in the pre-#3773 order (parent → peer address → local MAC →
+/// peer MAC) so the FIRST failing reason is reported. An EMPTY MAC field is an
+/// UNRESOLVED skip (transient); a NON-EMPTY MAC field that still resolved to
+/// `None` is a MALFORMED skip (the string failed to parse).
+pub(in crate::afxdp) fn build_fabric_link_or_skip(
+    fabric: &crate::FabricSnapshot,
+    peer_addr: Option<std::net::IpAddr>,
+    local_mac: Option<[u8; 6]>,
+    peer_mac: Option<[u8; 6]>,
+) -> Result<FabricLink, FabricLinkSkip> {
+    if fabric.parent_ifindex <= 0 {
+        return Err(record_fabric_skip(
+            fabric,
+            FabricSkipReason::InvalidParentIfindex,
+        ));
+    }
+    let Some(peer_addr) = peer_addr else {
+        return Err(record_fabric_skip(
+            fabric,
+            FabricSkipReason::UnparseablePeerAddress,
+        ));
+    };
+    let Some(local_mac) = local_mac else {
+        let reason = if fabric.local_mac.trim().is_empty() {
+            FabricSkipReason::UnresolvedLocalMac
+        } else {
+            FabricSkipReason::MalformedLocalMac
+        };
+        return Err(record_fabric_skip(fabric, reason));
+    };
+    let Some(peer_mac) = peer_mac else {
+        let reason = if fabric.peer_mac.trim().is_empty() {
+            FabricSkipReason::UnresolvedPeerMac
+        } else {
+            FabricSkipReason::MalformedPeerMac
+        };
+        return Err(record_fabric_skip(fabric, reason));
+    };
+    Ok(FabricLink {
+        parent_ifindex: fabric.parent_ifindex,
+        overlay_ifindex: fabric.overlay_ifindex,
+        peer_addr,
+        peer_mac,
+        local_mac,
+    })
+}
+
 /// #3771 (M12): three-way classification of a kernel neighbor state string for
 /// FIB installation.
 ///
@@ -441,34 +540,33 @@ pub(super) fn resolve_fabric_links_from_snapshots(
     snapshots: &[crate::FabricSnapshot],
     egress: &FastMap<i32, EgressInterface>,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
-) -> Vec<FabricLink> {
+) -> (Vec<FabricLink>, Vec<FabricLinkSkip>) {
     let mut out = Vec::with_capacity(snapshots.len());
+    let mut skips = Vec::new();
     for fabric in snapshots {
-        if fabric.parent_ifindex <= 0 {
-            continue;
-        }
-        let Ok(peer_addr) = fabric.peer_address.parse::<IpAddr>() else {
-            continue;
-        };
+        // Resolve the same inputs the pre-#3773 code did, then classify /
+        // count the skip-vs-install decision through the shared helper so this
+        // runtime-refresh path and `populate_fabrics` cannot diverge (#3773
+        // M13). The peer-MAC neighbor lookup keys on the parsed peer address,
+        // so it is gated on a successful parse; an unparseable address is
+        // reported as `UnparseablePeerAddress` regardless of the MAC fields.
+        let peer_addr = fabric.peer_address.parse::<IpAddr>().ok();
         let local_mac = parse_mac(&fabric.local_mac)
             .or_else(|| egress.get(&fabric.parent_ifindex).map(|e| e.src_mac));
-        let Some(local_mac) = local_mac else { continue };
-        let peer_mac = parse_mac(&fabric.peer_mac).or_else(|| {
-            dynamic_neighbors
-                .get(&(fabric.overlay_ifindex, peer_addr))
-                .or_else(|| dynamic_neighbors.get(&(fabric.parent_ifindex, peer_addr)))
-                .map(|e| e.mac)
+        let peer_mac = peer_addr.and_then(|addr| {
+            parse_mac(&fabric.peer_mac).or_else(|| {
+                dynamic_neighbors
+                    .get(&(fabric.overlay_ifindex, addr))
+                    .or_else(|| dynamic_neighbors.get(&(fabric.parent_ifindex, addr)))
+                    .map(|e| e.mac)
+            })
         });
-        let Some(peer_mac) = peer_mac else { continue };
-        out.push(FabricLink {
-            parent_ifindex: fabric.parent_ifindex,
-            overlay_ifindex: fabric.overlay_ifindex,
-            peer_addr,
-            peer_mac,
-            local_mac,
-        });
+        match build_fabric_link_or_skip(fabric, peer_addr, local_mac, peer_mac) {
+            Ok(link) => out.push(link),
+            Err(skip) => skips.push(skip),
+        }
     }
-    out
+    (out, skips)
 }
 
 pub(super) fn resolve_fabric_redirect(

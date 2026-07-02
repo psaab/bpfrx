@@ -1564,6 +1564,20 @@ type ProcessStatus struct {
 	// non-WG deployments and for older helpers (key omitted on the
 	// Rust side when no tunnel is configured).
 	WgTunnels []WgTunnelStatus `json:"wg_tunnels,omitempty"`
+	// #3773 (M13): fabric-link skip diagnostics. FabricLinkSkippedMalformed
+	// counts fabric links dropped during a forwarding build/refresh for a
+	// MALFORMED value (invalid parent ifindex, unparseable peer address, or a
+	// non-empty local/peer MAC that failed to parse) — a config/environment
+	// fault the operator must fix. FabricLinkUnresolvedPeer counts links
+	// dropped because a peer/local MAC was UNRESOLVED (an empty MAC field
+	// awaiting neighbor/interface resolution — the expected late-resolution
+	// SyncFabricState transient). Distinct counters so a benign unresolved
+	// peer is not conflated with a genuine misconfiguration. Both surfaced as
+	// xpf_userspace_fabric_link_skipped_malformed_total and
+	// xpf_userspace_fabric_link_unresolved_peer_total. Omitempty for wire
+	// compat with older helpers (default 0).
+	FabricLinkSkippedMalformedTotal uint64 `json:"fabric_link_skipped_malformed_total,omitempty"`
+	FabricLinkUnresolvedPeerTotal   uint64 `json:"fabric_link_unresolved_peer_total,omitempty"`
 }
 
 // WgPeerStatus mirrors the Rust WgPeerStatus in

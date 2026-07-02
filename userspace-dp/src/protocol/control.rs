@@ -569,6 +569,23 @@ pub(crate) struct ProcessStatus {
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     #[serde(rename = "last_cache_flush_at", default)]
     pub last_cache_flush_at: u64,
+    /// #3773 (M13): cumulative count of fabric links skipped during a
+    /// forwarding build/refresh because a value was MALFORMED — an invalid
+    /// parent ifindex, an unparseable peer address, or a NON-EMPTY local/peer
+    /// MAC string that failed to parse. A non-zero (especially climbing) value
+    /// is a fabric config/environment fault an operator must fix; the helper
+    /// journal names which fabric and why. Additive / defaulted for
+    /// mixed-version compat.
+    #[serde(rename = "fabric_link_skipped_malformed_total", default)]
+    pub fabric_link_skipped_malformed_total: u64,
+    /// #3773 (M13): cumulative count of fabric links skipped because the peer
+    /// or local MAC was UNRESOLVED — an EMPTY MAC field still awaiting
+    /// neighbor/interface resolution (the expected late-resolution
+    /// `SyncFabricState` transient). Briefly non-zero at startup is normal; a
+    /// PERSISTENTLY climbing value means a fabric peer is not resolving. A
+    /// distinct, non-malformed state per #3773.
+    #[serde(rename = "fabric_link_unresolved_peer_total", default)]
+    pub fabric_link_unresolved_peer_total: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

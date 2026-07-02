@@ -356,6 +356,18 @@ func (c *xpfCollector) emitNeighborWarmCounters(ch chan<- prometheus.Metric, sta
 		prometheus.GaugeValue,
 		float64(status.NegNeighKeys),
 	)
+	// #3773 (M13): fabric-link skip diagnostics. Emitted unconditionally so a
+	// 0 is a real "no fabric skipped" signal rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.fabricLinkSkippedMalformedTotal,
+		prometheus.CounterValue,
+		float64(status.FabricLinkSkippedMalformedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.fabricLinkUnresolvedPeerTotal,
+		prometheus.CounterValue,
+		float64(status.FabricLinkUnresolvedPeerTotal),
+	)
 	// #1772: neighbor/ARP resolution LATENCY telemetry.
 	c.emitNeighborLatencyHistograms(ch, status)
 }
