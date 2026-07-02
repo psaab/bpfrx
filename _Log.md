@@ -27148,6 +27148,41 @@ top.
   pkg/ddns/README.md (per-family-withdraw column + dual-stack sibling-preserve section)
 
 - **Timestamp**: 2026-07-01
+- **Action**: #3725 — pkg/appid tolerant-load port parsers DEGRADE instead of
+  MISLABEL. Four codex-155 sub-findings, all genuine residuals against current
+  origin/master (the merged #3446/#3450/#3491/#3726 reversed-range work fixed
+  the NAT/strict-commit parsers, never the appid catalog/runtime parsers):
+  H02/M05 — `portInSpec` (runtime.go) parsed with `strconv.Atoi`, silently
+  narrowing an out-of-range value through the uint16 cast (`"70000"` → 4464, so
+  a real session to port 4464 got labeled as the malformed app) and accepting a
+  signed spelling (`"+80"` → 80). Now parses through `config.ParseCanonicalUint`
+  + range-checks 1..65535 (new `canonicalPort` helper) exactly like the strict
+  gate; a reversed range never matches. H03/M06 — `BuildCatalog` discarded a
+  bad source-port parse error to zero bounds (`SrcPortLow=0/High=0` =
+  UNCONSTRAINED), so a leniently-loaded `destination-port 80 source-port 70000`
+  stamped ANY TCP/80 flow as that app; now a catalog row is emitted only for an
+  EMITTABLE app (parseable, non-inverted src). M07 — `parsePortRange` had no
+  low<=high check, so a reversed range shipped inverted bounds; now dropped at
+  the emission site (fail closed, no garbage bounds). M04 — `AppNames[appID]`
+  was recorded BEFORE the port parse, leaving a dangling name at an id no entry
+  can stamp when the malformed app sorted last (skewed app_id → malformed name
+  instead of UNKNOWN); now recorded only for emittable apps in BOTH
+  `BuildCatalog` and the LIVE `compileApplications` (the map ResolveSessionName
+  actually consumes), kept byte-identical. id-bump sequence is UNCHANGED (bump
+  unless dest-port parse errors) so no lock-step drift — an unemittable app
+  still consumes its id. RED-on-revert verified per sub-finding (Atoi revert →
+  H02/M05 mislabel RED; catalog revert → over-broad SrcPortLow:0 + inverted
+  200/100 + dangling zzz-bad RED; compiler revert → AppNames 92 vs 89 size
+  mismatch + dangling names RED). go test ./pkg/appid ./pkg/dataplane
+  ./pkg/grpcapi ./pkg/api ./pkg/cli ./pkg/config green; go build ./... green;
+  gofmt + vet clean.
+- **File(s)**: pkg/appid/runtime.go (portInSpec canonical parse + canonicalPort),
+  pkg/appid/catalog.go (emittable gate: H03/M06/M07/M04 + doc comment),
+  pkg/dataplane/compiler.go (compileApplications AppNames emittable gate, M04
+  live path), pkg/appid/runtime_test.go (H02/M05 tests),
+  pkg/appid/catalog_tolerant_3725_test.go (new — H03/M07/M04 catalog tests),
+  pkg/dataplane/appid_catalog_parity_test.go (tolerant-load parity + M04 test),
+  pkg/appid/README.md (tolerant-load DEGRADE-not-MISLABEL section)
 - **Action**: #3764 Layer-1 — gate ip-monitoring overlay publication on
   IsLocalPrimaryAny() instead of primaryship of the lowest data RG. The publish
   gate `ipmonPublishAllowed` (pkg/daemon/daemon_ipmon.go) previously returned

@@ -566,7 +566,6 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		proto := protocolNumber(app.Protocol)
 
 		result.AppIDs[appName] = appID
-		result.AppNames[uint16(appID)] = appName
 
 		// Parse destination port range boundaries.
 		dstLow, dstHigh, err := parsePortRange(app.DestinationPort)
@@ -577,13 +576,32 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		}
 
 		// Parse source port range (stored in BPF app_value, not expanded)
+		srcOK := true
 		var srcLow, srcHigh uint16
 		if app.SourcePort != "" {
-			srcLow, srcHigh, err = parsePortRange(app.SourcePort)
-			if err != nil {
+			var srcErr error
+			srcLow, srcHigh, srcErr = parsePortRange(app.SourcePort)
+			if srcErr != nil {
 				slog.Warn("bad source-port for application",
-					"name", appName, "port", app.SourcePort, "err", err)
+					"name", appName, "port", app.SourcePort, "err", srcErr)
+				srcOK = false
 			}
+		}
+
+		// #3725 M04: record the app_id -> name mapping — the LIVE map the show
+		// path (appid.ResolveSessionName) resolves a stamped app_id through —
+		// ONLY for an EMITTABLE application. Recording it BEFORE the port parse
+		// (the old placement) left AppNames holding a name at an id no session
+		// can legitimately carry when the malformed app sorted last (no later
+		// good app overwrote the id), so a skewed/stale app_id from a helper
+		// catalog skew resolved to the malformed name instead of UNKNOWN.
+		// "Emittable" mirrors appid.BuildCatalog exactly (non-inverted dst
+		// range, parseable source-port, non-inverted src range) so the two
+		// AppNames maps stay byte-identical (appid_catalog_parity_test.go). The
+		// id is still consumed (loop-tail appID++) because BuildCatalog also
+		// consumes it here; only the dest-port `continue` above skips the id.
+		if srcOK && dstLow <= dstHigh && srcLow <= srcHigh {
+			result.AppNames[uint16(appID)] = appName
 		}
 
 		var appTimeout uint32
