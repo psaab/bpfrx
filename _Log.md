@@ -29069,3 +29069,39 @@ top.
   ValidateEnum in ike.policy + ike.gateway + ipsec.gateway),
   pkg/config/schema_ike_enum_3896_test.go (new, RED-on-revert gate),
   docs/config-schema.md (#3896 enum-typing section)
+
+## 2026-07-03 — #3900 annotation comment-delimiter injection
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix config annotation `*/`/`/*` comment-delimiter injection
+  (fable-review-161 F-035, MEDIUM config-integrity/injection). Node
+  annotations are emitted VERBATIM between `/* */` by ast_format.go, so an
+  annotation containing `*/` closes the comment early and the trailing
+  text is re-lexed as configuration on the next Format→Parse round-trip
+  (HA config sync — the primary formats, the secondary re-parses — and
+  rollback/archive reload). Empirically reproduced: annotation `note */
+  set system host-name pwned; /* end` on a leaf produced an injected
+  `set system host-name pwned` node in the reparsed tree. Annotations
+  enter the tree ONLY via `Store.Annotate` (the lexer discards comments
+  on parse), so allowing the primary to commit a malicious annotation is
+  the root. Fix mirrors the #1798 two-layer free-text defense: (1)
+  `Store.Annotate` rejects a delimiter up front via new public
+  `config.ValidateAnnotationText` (immediate operator feedback); (2) the
+  strict commit path `validateNodesControlChars` rejects it as a
+  backstop; (3) the lenient load/peer-sync path
+  `sanitizeNodesControlChars`/`SanitizeTreeControlChars` scrubs an
+  already-persisted delimiter in place (single-pass `sanitizeCommentDelim`
+  inserts a space between the two chars — also splits chained `*/*`,
+  `/*/`, `/**/`). Values are immune (emitted quoted; the lexer never
+  starts a comment inside a quoted string), so the guard is
+  annotation-only. RED-on-revert proven: reverting the strict-reject +
+  lenient-sanitize wiring makes the strict-reject test fail and the
+  Format→Parse round-trip re-inject. go test ./pkg/config/...
+  ./pkg/configstore/... green; go build ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/config/freetext.go (hasCommentDelim,
+  sanitizeCommentDelim, ValidateAnnotationText; wired into
+  validateNodesControlChars + sanitizeNodesControlChars; package doc),
+  pkg/configstore/store_command.go (Store.Annotate early reject),
+  pkg/config/freetext_test.go (RED-on-revert injection + reject +
+  helper tests), pkg/configstore/store_test.go
+  (TestAnnotateRejectsCommentDelimiter), docs/phases.md (#3900 note)
