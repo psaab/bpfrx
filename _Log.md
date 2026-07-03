@@ -28442,6 +28442,34 @@ top.
   pkg/scheduler/scheduler_test.go + pkg/daemon/policy_scheduler_apply_test.go
   (updated for fail-closed semantics), pkg/scheduler/README.md +
   docs/config-schema.md (docs)
+- **Timestamp**: 2026-07-03
+- **Action**: Fix #3868 (fable-161 F-150) — HA config divergence on a
+  commit-confirmed TIMEOUT. The standby receives the unconfirmed config (C2)
+  via config-sync `SyncApply` (arms NO confirm timer → permanent active), but
+  `executeConfirmedRollback` reverted only the LOCAL node to the prior confirmed
+  config (C1) and never pushed the rollback to the peer → nodes diverged
+  (primary=C1, standby=C2); a failover served the abandoned C2. FIX: the
+  confirm-timeout rollback path (daemon_apply.go, non-nil `prevCfg` branch, after
+  `PromoteRollback` + apply) now calls `d.resyncRolledBackConfigToPeer()` which
+  runs the same `d.syncConfigToPeer()` push a normal commit uses — reading the
+  now-promoted active (C1) via `ShowActive` and queuing it to the peer. Peer-
+  absent is self-guarded (nil cluster/sessionSync, not RG0 primary, config-sync
+  disabled, or no active TCP conn all no-op); reverse-sync-on-reconnect retries.
+  The nil-`prevCfg` (first-commit → bootstrap) branch deliberately does NOT
+  re-sync (reverted empty tree carries no config-sync stanza; a bootstrap node
+  is not the RG0 authority). Split into `resyncRolledBackConfigToPeer` +
+  `resyncPeerForTest` seam (the real push needs a live TCP transport) so the
+  rollback is unit-testable. RED-on-revert PROVEN: removing the resync call
+  makes TestExecuteConfirmedRollbackResyncsPeer fail "got 0 calls". Sibling of
+  #3865/#3861 (store-side timer clear) — this is the daemon-HA half.
+  go test ./pkg/daemon/... ./pkg/cluster/... green; go build ./... green;
+  gofmt + vet clean. test-failover WARRANTED (HA config convergence) — flagged
+  for batch validation.
+- **File(s)**: pkg/daemon/daemon_apply.go (executeConfirmedRollback resync +
+  resyncRolledBackConfigToPeer helper + nil-branch note), pkg/daemon/daemon.go
+  (resyncPeerForTest seam field), pkg/daemon/rollback_resync_test.go (new
+  RED-on-revert + peer-absent tests), docs/ha-cluster-test-plan.md (TC-5b
+  commit-confirmed timeout convergence scenario)
 
 ## 2026-07-03
 
