@@ -179,6 +179,15 @@ func (s *Store) Annotate(path []string, comment string) error {
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
+	// #3900: reject a comment delimiter (or control character) in the
+	// annotation up front. An annotation is emitted verbatim into a
+	// `/* */` comment, so a `*/` would close the comment early and let the
+	// trailing text be re-parsed as configuration on the next Format→Parse
+	// (HA config sync, rollback/archive reload). The strict commit path
+	// enforces the same rule; this is the immediate-feedback layer.
+	if err := config.ValidateAnnotationText(comment); err != nil {
+		return err
+	}
 
 	children := s.candidate.Children
 	var target *config.Node

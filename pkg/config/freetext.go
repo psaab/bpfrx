@@ -35,6 +35,21 @@ import (
 // The render-side belt (sanitizers in pkg/networkd, pkg/frr, pkg/ipsec
 // at each free-text file interpolation) is the third, independent
 // layer.
+//
+// #3900: a second, annotation-only injection class rides the same two
+// layers. Node annotations (the `annotate` command) are emitted VERBATIM
+// into `/* ... */` block comments by ast_format.go. An annotation
+// containing the sequence `*/` closes the comment early, so every token
+// after it is re-lexed as real configuration on the next Format→Parse
+// round-trip — HA config sync (the primary formats, the secondary
+// re-parses) and rollback/archive reload. `/*` is neutralized on the
+// same footing (a stray open would swallow following statements as an
+// unterminated comment). The strict commit path REJECTS a comment
+// delimiter in an annotation; the lenient load/peer-sync path scrubs it
+// in place (breaking the pair with a space). Config VALUES are immune —
+// they are emitted quoted (quoteKey), and the lexer never starts a
+// comment inside a quoted string — so the comment-delimiter guard is
+// applied to annotations only.
 
 // hasControlChars reports whether s contains any ASCII control
 // character: the full C0 set (0x00–0x1F, which includes \n, \r and \t)
@@ -66,6 +81,65 @@ func sanitizeControlChars(s string) string {
 	return string(b)
 }
 
+// ValidateAnnotationText returns a non-nil error if the annotation text
+// contains an ASCII control character or a `*/`/`/*` block-comment
+// delimiter (#3900). It is the single validation entry point for the
+// `annotate` command path (configstore.Store.Annotate), giving the
+// operator immediate feedback instead of deferring the rejection to
+// commit. The strict commit path (validateNodesControlChars) applies the
+// same rule as a backstop for annotations introduced by any other route.
+func ValidateAnnotationText(annotation string) error {
+	if hasControlChars(annotation) {
+		return fmt.Errorf("annotation %q contains control characters (newlines and other control characters are not allowed in annotations)", annotation)
+	}
+	if hasCommentDelim(annotation) {
+		return fmt.Errorf("annotation %q contains a comment delimiter (the sequences '*/' and '/*' are not allowed in annotations — they would close the comment and inject the remaining text as configuration on reload)", annotation)
+	}
+	return nil
+}
+
+// hasCommentDelim reports whether s contains a block-comment delimiter
+// (`*/` or `/*`). Annotations are emitted verbatim between `/* */`, so
+// either sequence lets annotation text escape the comment on the next
+// Format→Parse round-trip (#3900). Values never need this check — they
+// are emitted quoted and the lexer does not start comments inside a
+// quoted string — so the guard is used on annotations only.
+func hasCommentDelim(s string) bool {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] == '*' && s[i+1] == '/' {
+			return true
+		}
+		if s[i] == '/' && s[i+1] == '*' {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeCommentDelim breaks every block-comment delimiter (`*/`, `/*`)
+// in s by inserting a single space between the two characters, so the
+// text can no longer close or open a `/* */` comment. The single
+// left-to-right pass also splits chained delimiters such as `*/*` and
+// `/*/` (a delimiter created by a preceding split is re-examined on the
+// next byte), so the result is guaranteed free of both sequences.
+// Replacing rather than deleting keeps the annotation readable.
+func sanitizeCommentDelim(s string) string {
+	if !hasCommentDelim(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for i := 0; i < len(s); i++ {
+		b.WriteByte(s[i])
+		if i+1 < len(s) {
+			if (s[i] == '*' && s[i+1] == '/') || (s[i] == '/' && s[i+1] == '*') {
+				b.WriteByte(' ')
+			}
+		}
+	}
+	return b.String()
+}
+
 // joinNodePath builds a human-readable config path for error/warning
 // messages. Key values are sanitized for display so a path containing
 // the offending newline does not itself produce a multi-line message.
@@ -83,7 +157,9 @@ func joinNodePath(prefix string, keys []string) string {
 
 // validateNodesControlChars walks the (group-expanded) AST and returns
 // an error for the first value or annotation containing a control
-// character. Strict commit-path only — see the package comment above.
+// character, or the first annotation containing a `*/`/`/*` comment
+// delimiter (#3900). Strict commit-path only — see the package comment
+// above.
 func validateNodesControlChars(nodes []*Node, prefix string) error {
 	for _, n := range nodes {
 		nodePath := joinNodePath(prefix, n.Keys)
@@ -95,6 +171,9 @@ func validateNodesControlChars(nodes []*Node, prefix string) error {
 		if hasControlChars(n.Annotation) {
 			return fmt.Errorf("%s: annotation %q contains control characters (newlines and other control characters are not allowed in annotations)", nodePath, n.Annotation)
 		}
+		if hasCommentDelim(n.Annotation) {
+			return fmt.Errorf("%s: annotation %q contains a comment delimiter (the sequences '*/' and '/*' are not allowed in annotations — they would close the comment and inject the remaining text as configuration on reload)", nodePath, n.Annotation)
+		}
 		if err := validateNodesControlChars(n.Children, nodePath); err != nil {
 			return err
 		}
@@ -103,9 +182,10 @@ func validateNodesControlChars(nodes []*Node, prefix string) error {
 }
 
 // sanitizeNodesControlChars walks the AST replacing control characters
-// in values and annotations in place, returning one human-readable
-// config path per modified node. Lenient-path counterpart of
-// validateNodesControlChars.
+// in values and annotations in place — and breaking any `*/`/`/*`
+// comment delimiter in an annotation (#3900) — returning one
+// human-readable config path per modified node. Lenient-path
+// counterpart of validateNodesControlChars.
 func sanitizeNodesControlChars(nodes []*Node, prefix string) []string {
 	var warnings []string
 	for _, n := range nodes {
@@ -118,6 +198,10 @@ func sanitizeNodesControlChars(nodes []*Node, prefix string) []string {
 		}
 		if hasControlChars(n.Annotation) {
 			n.Annotation = sanitizeControlChars(n.Annotation)
+			changed = true
+		}
+		if hasCommentDelim(n.Annotation) {
+			n.Annotation = sanitizeCommentDelim(n.Annotation)
 			changed = true
 		}
 		nodePath := joinNodePath(prefix, n.Keys)

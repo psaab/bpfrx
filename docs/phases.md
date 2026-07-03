@@ -670,7 +670,7 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 ## Sprint 21 (`72e1020`)
 - **show security policies detail:** Expanded Junos-style policy view with resolved address book entries, application details, log flags, per-rule BPF hit counters; zone-pair filtering; global policies; gRPC policies-detail topic
 - **show firewall filter `<name>`:** Per-filter drill-down showing terms with match conditions (dscp, protocol, ports, tcp-flags, fragment), actions (accept/discard/reject/log/forwarding-class), BPF hit counts; DynamicFn completion for filter names
-- **Config annotate:** `annotate <path> "comment"` in configure mode; Annotation field on AST Node; /* comment */ output in FormatText(); Annotate() method in configstore; parser tests
+- **Config annotate:** `annotate <path> "comment"` in configure mode; Annotation field on AST Node; /* comment */ output in FormatText(); Annotate() method in configstore; parser tests. **#3900 injection hardening:** the annotation is emitted verbatim between `/* */`, so a `*/` (or `/*`) in the text would close the comment early and let the trailing text be re-lexed as configuration on the next Format→Parse round-trip (HA config sync, rollback/archive reload). `Store.Annotate` now rejects a comment delimiter up front (`config.ValidateAnnotationText`), the strict commit path (`validateNodesControlChars`) rejects it as a backstop, and the lenient load/peer-sync path (`sanitizeNodesControlChars`/`SanitizeTreeControlChars`) scrubs an already-persisted delimiter in place — mirroring the #1798 control-character two-layer defense (`pkg/config/freetext.go`).
 - Files: 8 files, 789 insertions — pkg/{cli,cmdtree,config,configstore,grpcapi}/, cmd/cli/
 
 ## Sprint 22 (`26cf1ad`)

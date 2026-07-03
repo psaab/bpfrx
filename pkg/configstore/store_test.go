@@ -1359,6 +1359,42 @@ func TestAnnotate(t *testing.T) {
 	}
 }
 
+// TestAnnotateRejectsCommentDelimiter is the #3900 guard: an annotation
+// containing a `*/` (or `/*`) block-comment delimiter must be rejected up
+// front, because it would close the `/* */` comment early and inject the
+// trailing text as configuration on the next Format→Parse round-trip
+// (HA config sync, rollback/archive reload).
+func TestAnnotateRejectsCommentDelimiter(t *testing.T) {
+	s := newTestStore(t)
+	s.EnterConfigure()
+	if err := s.Set([]string{"system", "host-name", "fw1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The exact injection payload from the issue.
+	err := s.Annotate([]string{"system"}, "note */ set system host-name pwned; /* end")
+	if err == nil {
+		t.Fatal("Annotate must reject an annotation containing a '*/' comment delimiter")
+	}
+	if !strings.Contains(err.Error(), "comment delimiter") {
+		t.Errorf("error should mention comment delimiter: %v", err)
+	}
+	// The bare `/*` open half must be rejected too.
+	if err := s.Annotate([]string{"system"}, "danger /* swallow"); err == nil {
+		t.Fatal("Annotate must reject an annotation containing a '/*' comment delimiter")
+	}
+	// The rejected annotation must NOT have been applied, so the candidate
+	// stays injection-free through a format round-trip.
+	text := s.ShowCandidate()
+	if strings.Contains(text, "pwned") || strings.Contains(text, "set system host-name") {
+		t.Errorf("rejected annotation leaked into candidate:\n%s", text)
+	}
+	// A benign annotation still works.
+	if err := s.Annotate([]string{"system"}, "primary firewall"); err != nil {
+		t.Errorf("benign annotation must be accepted: %v", err)
+	}
+}
+
 func TestLoadSet(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.EnterConfigure(); err != nil {
