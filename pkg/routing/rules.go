@@ -29,10 +29,38 @@ type ruleOps interface {
 // Lower values = higher priority. We use 100-199 range for next-table rules.
 const nextTableRulePriority = 100
 
-// ribGroupRulePriority is the base priority for rib-group ip rules.
-// Must be AFTER the main table (32766) so VRF routes supplement rather
-// than override main table routing. We use 33000-33099 range.
+// ribGroupRulePriority is the LEGACY base priority for the pre-#3876
+// rib-group `from all lookup <sourceTable>` blanket rules. It sat AFTER the
+// main table (32766), so any main-table default route was matched first and
+// the rule was never consulted — the rib-group import leak was a silent
+// no-op in every deployment carrying a default route (#3876). It is retained
+// ONLY so clear() removes any stale rule an in-place upgrade left behind; no
+// new rule is programmed in this window.
 const ribGroupRulePriority = 33000
+
+// ribGroupLeakRulePriority is the base priority for the #3876 rib-group
+// per-prefix import leak rules: `ip rule to <connected-prefix> lookup
+// <sourceTable>`. It sits BEFORE the main table (32766) and before PBR
+// (31000-31999) so a specific imported connected prefix wins over a
+// main-table default route — the fix for the #3876 shadow-by-default no-op.
+// We use the 30000-30999 range (maxRibGroupLeakRules priorities).
+const ribGroupLeakRulePriority = 30000
+
+// maxRibGroupLeakRules bounds the number of per-prefix rib-group leak ip
+// rules the applier installs, matching the ribGroupLeakRulePriority window
+// clear() scans ([ribGroupLeakRulePriority, ribGroupLeakRulePriority+1000)).
+// A larger connected-prefix set is truncated and reported as a degraded
+// apply (mirroring maxPBRRules) rather than programming a rule the clear()
+// pass could not later remove. ValidateConfig emits a commit-time warning
+// before this cap is reached.
+const maxRibGroupLeakRules = 1000
+
+// mainTableID is the Linux main routing table (RT_TABLE_MAIN). The #3876
+// Phase-1 leak targets ONLY main: an interface-routes rib-group whose
+// import-rib list resolves to this table has its source instance's
+// connected prefixes leaked into main. Non-main (VRF→VRF) import targets are
+// deferred to Phase 2 and warned at commit.
+const mainTableID = 254
 
 // pbrRulePriority is the base priority for policy-based routing ip rules.
 // BEFORE the main table (32766) so the kernel also honors PBR for XDP_PASS'd
@@ -179,19 +207,36 @@ type ribGroupManager struct {
 
 // Apply creates Linux policy routing rules (ip rule) for rib-group route
 // leaking. When a routing instance has interface-routes with a rib-group
-// reference, the instance's routes are leaked to other tables listed in
-// the rib-group's import-rib list.
+// that imports the main table, the instance's CONNECTED (interface) routes
+// are leaked into main so main-table lookups reach them.
+//
+// #3876: this is done PER CONNECTED PREFIX with a rule that sits BEFORE the
+// main table (priority < 32766), so a specific imported prefix wins over a
+// main-table default route:
+//
+//	ip rule to <connected-prefix> lookup <sourceTable> pref 30000
+//
+// This replaces the pre-#3876 `from all lookup <sourceTable> pref 33000`
+// blanket rule, which (a) sat AFTER main so any default route shadowed it —
+// making the leak a silent no-op — and (b) leaked the WHOLE source table as
+// a catch-all fall-through rather than just the interface routes Junos
+// leaks. The per-prefix rules also carry a Dst, so the userspace FIB
+// snapshot builder auto-captures them as NextTable leaks into main (see
+// pkg/dataplane/userspace/routes.go) — the pre-#3876 Dst-less rule was
+// skipped there too, so the leak was absent from BOTH FIBs.
+//
+// connectedPrefixes is keyed by routing-instance name and holds that
+// instance's connected network prefixes (v4 and v6 mixed), derived from the
+// config addresses on its member interface units via
+// config.ConnectedNetworkPrefix — the SAME derivation the userspace FIB uses
+// for connected routes, so the leaked prefix set matches the connected
+// routes in the source table.
 //
 // Both IPv4 (InterfaceRoutesRibGroup) and IPv6 (InterfaceRoutesRibGroupV6)
-// rib-groups are handled. For each source table that needs leaking, both
-// IPv4 and IPv6 ip rules are created.
-//
-// For example, if dmz-vr (table 101) has interface-routes rib-group "dmz-leak",
-// and dmz-leak has import-rib [ dmz-vr.inet.0 inet.0 ], then an ip rule is
-// created to make table 101 visible to main table lookups:
-//
-//	ip rule add from all lookup 101 pref 33000
-func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instances []*config.RoutingInstanceConfig) error {
+// rib-groups are handled. Non-main (VRF→VRF) import targets are deferred to
+// Phase 2 and warned at commit (pkg/config); this applier installs nothing
+// for them.
+func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instances []*config.RoutingInstanceConfig, connectedPrefixes map[string][]string) error {
 	// Clean up old rib-group rules. As with next-table, a failed per-family
 	// list does not abort the apply; the clear error is captured and
 	// returned at the end (or at the early-return below) so the caller can
@@ -224,107 +269,96 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 		tableIDs[inst.Name] = inst.TableID
 	}
 
-	// Track which source tables we've already added rules for
-	// (avoid duplicate rules if multiple rib-groups reference the same table)
+	// Track which source tables we've already added rules for (avoid
+	// duplicate rules if two instances share a table ID).
 	leakedTables := make(map[int]bool)
 
-	prio := ribGroupRulePriority
+	prio := ribGroupLeakRulePriority
+	capped := false
 	for _, inst := range instances {
-		// Collect all rib-group names referenced by this instance (inet + inet6)
-		rgNames := []string{inst.InterfaceRoutesRibGroup, inst.InterfaceRoutesRibGroupV6}
-
-		sourceTable := inst.TableID
-		needsLeak := false
-		for _, rgName := range rgNames {
-			if rgName == "" {
-				continue
-			}
-			rgDef, ok := ribGroups[rgName]
-			if !ok {
-				slog.Warn("interface-routes references unknown rib-group",
-					"instance", inst.Name, "rib-group", rgName)
-				continue
-			}
-			for _, ribName := range rgDef.ImportRibs {
-				targetTable, ok := resolveRibTable(ribName, tableIDs)
-				if !ok {
-					// Unknown / undefined rib name: do NOT treat it as
-					// a (non-source) target table — that would set
-					// needsLeak and install an `ip rule from all lookup
-					// <sourceTable>` for a rib that does not exist,
-					// silently leaking the source table into the main
-					// lookup (#2226). Skip it; warn for visibility. The
-					// strict commit-time gate normally rejects this
-					// before apply, but a tolerantly-loaded / peer-synced
-					// config can still reach here.
-					slog.Warn("rib-group import-rib references unknown rib; skipping (not leaking)",
-						"instance", inst.Name, "rib-group", rgName, "import-rib", ribName)
-					continue
-				}
-				if targetTable != sourceTable {
-					needsLeak = true
-					break
-				}
-			}
-			if needsLeak {
-				break
-			}
+		if capped {
+			break
 		}
-		if !needsLeak {
+		sourceTable := inst.TableID
+
+		// Phase 1 leaks ONLY into main. A rib-group whose import-ribs resolve
+		// only to non-main tables (VRF→VRF) installs nothing here and is
+		// warned at commit (Phase 2 deferral). Family gating: the v4
+		// rib-group leaks v4 connected prefixes, the v6 rib-group leaks v6.
+		leakV4 := ribGroupLeaksIntoMain(inst.InterfaceRoutesRibGroup, ribGroups, tableIDs, inst.Name)
+		leakV6 := ribGroupLeaksIntoMain(inst.InterfaceRoutesRibGroupV6, ribGroups, tableIDs, inst.Name)
+		if !leakV4 && !leakV6 {
 			continue
 		}
-
 		if leakedTables[sourceTable] {
 			continue
 		}
-
-		// Each leaked table consumes TWO priorities (IPv4 then IPv6).
-		// clear() only scans [ribGroupRulePriority, ribGroupRulePriority+100),
-		// so a pair that would place the IPv6 rule (prio+1) at or beyond the
-		// upper bound must be rejected as a unit — otherwise it leaks
-		// permanently across applies. Stop before marking the table leaked
-		// so a capped table is not recorded as done. ValidateConfig emits a
-		// commit-time warning before this point is ever reached.
-		if prio+1 >= ribGroupRulePriority+100 {
-			slog.Warn("rib-group rule limit reached; ignoring further leaking tables",
-				"limit", 100, "instance", inst.Name, "table", sourceTable)
-			break
-		}
 		leakedTables[sourceTable] = true
 
-		// Add IPv4 rule
-		rule := netlink.NewRule()
-		rule.Table = sourceTable
-		rule.Priority = prio
-		rule.Family = unix.AF_INET
-
-		if err := rg.ops.RuleAdd(rule); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"add rib-group IPv4 rule instance %s table %d: %w",
-				inst.Name, sourceTable, err))
-		} else {
-			slog.Info("rib-group rule added",
-				"instance", inst.Name, "table", sourceTable,
-				"family", "inet", "pref", prio)
+		v4, v6 := splitConnectedPrefixesByFamily(connectedPrefixes[inst.Name])
+		var toInstall []struct {
+			prefix string
+			family int
 		}
-		prio++
-
-		// Add IPv6 rule
-		rule6 := netlink.NewRule()
-		rule6.Table = sourceTable
-		rule6.Priority = prio
-		rule6.Family = unix.AF_INET6
-
-		if err := rg.ops.RuleAdd(rule6); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"add rib-group IPv6 rule instance %s table %d: %w",
-				inst.Name, sourceTable, err))
-		} else {
-			slog.Info("rib-group rule added",
-				"instance", inst.Name, "table", sourceTable,
-				"family", "inet6", "pref", prio)
+		if leakV4 {
+			for _, p := range v4 {
+				toInstall = append(toInstall, struct {
+					prefix string
+					family int
+				}{p, unix.AF_INET})
+			}
 		}
-		prio++
+		if leakV6 {
+			for _, p := range v6 {
+				toInstall = append(toInstall, struct {
+					prefix string
+					family int
+				}{p, unix.AF_INET6})
+			}
+		}
+
+		for _, lr := range toInstall {
+			// Hard-cap at the priority window clear() scans. A rule at or
+			// beyond the upper bound would never be removed on a later apply
+			// and would leak permanently. ValidateConfig warns before this
+			// point is reached; mirror the maxPBRRules/next-table caps.
+			if prio >= ribGroupLeakRulePriority+maxRibGroupLeakRules {
+				errs = append(errs, fmt.Errorf(
+					"rib-group leak rule limit (%d) reached; connected prefixes beyond "+
+						"the limit are not leaked — reduce the number of interface-routes "+
+						"rib-group prefixes", maxRibGroupLeakRules))
+				capped = true
+				break
+			}
+			_, dst, err := net.ParseCIDR(lr.prefix)
+			if err != nil || dst == nil {
+				errs = append(errs, fmt.Errorf(
+					"rib-group leak: parse connected prefix %q instance %s: %w",
+					lr.prefix, inst.Name, err))
+				continue
+			}
+			rule := netlink.NewRule()
+			rule.Dst = dst
+			rule.Table = sourceTable
+			rule.Priority = prio
+			rule.Family = lr.family
+
+			familyStr := "inet"
+			if lr.family == unix.AF_INET6 {
+				familyStr = "inet6"
+			}
+			if err := rg.ops.RuleAdd(rule); err != nil {
+				errs = append(errs, fmt.Errorf(
+					"add rib-group leak rule prefix %s instance %s table %d family %s: %w",
+					lr.prefix, inst.Name, sourceTable, familyStr, err))
+				prio++
+				continue
+			}
+			slog.Info("rib-group leak rule added",
+				"instance", inst.Name, "prefix", lr.prefix,
+				"table", sourceTable, "family", familyStr, "pref", prio)
+			prio++
+		}
 	}
 	// Desired rules are re-added; surface any clear/add failure so a dropped
 	// leak rule (or the orphaned-rule window) is observable rather than
@@ -332,8 +366,61 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 	return errors.Join(errs...)
 }
 
-// clear removes all ip rules in the rib-group priority range. Also
-// cleans up legacy rules from the old 200-299 range.
+// ribGroupLeaksIntoMain reports whether the named interface-routes rib-group
+// imports the main table — the #3876 Phase-1 target for per-prefix connected-
+// route leaking. It returns false for an empty name, an undefined group, or a
+// group whose import-ribs resolve only to non-main tables (a VRF→VRF import,
+// deferred to Phase 2 and warned at commit). Unresolvable import-ribs are
+// skipped (never treated as a main-table hit) — the #2226 fail-closed guard.
+func ribGroupLeaksIntoMain(rgName string, ribGroups map[string]*config.RibGroup, tableIDs map[string]int, instName string) bool {
+	if rgName == "" {
+		return false
+	}
+	rgDef, ok := ribGroups[rgName]
+	if !ok {
+		slog.Warn("interface-routes references unknown rib-group",
+			"instance", instName, "rib-group", rgName)
+		return false
+	}
+	for _, ribName := range rgDef.ImportRibs {
+		targetTable, ok := resolveRibTable(ribName, tableIDs)
+		if !ok {
+			slog.Warn("rib-group import-rib references unknown rib; skipping (not leaking)",
+				"instance", instName, "rib-group", rgName, "import-rib", ribName)
+			continue
+		}
+		if targetTable == mainTableID {
+			return true
+		}
+	}
+	return false
+}
+
+// splitConnectedPrefixesByFamily partitions a mixed connected-prefix list
+// (as carried in ApplyRibGroupRules' connectedPrefixes map) into v4 and v6
+// by literal ':' presence — the same family test the userspace route
+// snapshot uses.
+func splitConnectedPrefixesByFamily(prefixes []string) (v4, v6 []string) {
+	for _, p := range prefixes {
+		if strings.Contains(p, ":") {
+			v6 = append(v6, p)
+		} else {
+			v4 = append(v4, p)
+		}
+	}
+	return v4, v6
+}
+
+// clear removes all ip rules in the rib-group priority ranges. It scans
+// THREE windows so an in-place binary upgrade removes stale rules from every
+// generation of this reconciler:
+//   - [ribGroupLeakRulePriority, +maxRibGroupLeakRules): the current #3876
+//     per-prefix leak window (30000-30999).
+//   - [ribGroupRulePriority, +100): the pre-#3876 `from all lookup <table>`
+//     blanket window (33000-33099). Removing these on reconcile is what
+//     prevents an upgrade from leaving a shadowed-by-default blanket rule
+//     behind alongside the new per-prefix rules.
+//   - [200, 300): the original legacy window.
 //
 // Per-family RuleList dump failures are aggregated and returned rather
 // than swallowed; see the rationale on nextTableManager.clear (#2273).
@@ -346,9 +433,10 @@ func (rg *ribGroupManager) clear() error {
 			continue
 		}
 		for _, r := range rules {
-			inCurrent := r.Priority >= ribGroupRulePriority && r.Priority < ribGroupRulePriority+100
+			inCurrent := r.Priority >= ribGroupLeakRulePriority && r.Priority < ribGroupLeakRulePriority+maxRibGroupLeakRules
+			inOldBlanket := r.Priority >= ribGroupRulePriority && r.Priority < ribGroupRulePriority+100
 			inLegacy := r.Priority >= 200 && r.Priority < 300
-			if inCurrent || inLegacy {
+			if inCurrent || inOldBlanket || inLegacy {
 				if err := rg.ops.RuleDel(&r); err != nil {
 					slog.Debug("failed to delete stale rib-group rule",
 						"priority", r.Priority, "err", err)
@@ -1124,7 +1212,7 @@ func dscpToTOS(dscp string) uint8 {
 // that reaches apply via the tolerant load / peer-sync path.
 func resolveRibTable(ribName string, tableIDs map[string]int) (int, bool) {
 	if ribName == "inet.0" || ribName == "inet6.0" {
-		return 254, true // main table
+		return mainTableID, true // main table
 	}
 	// Parse "<instance>.inet.0" or "<instance>.inet6.0" with an EXACT family
 	// suffix — a loose ".inet" substring match would accept malformed names
