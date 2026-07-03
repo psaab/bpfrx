@@ -6,6 +6,28 @@ import (
 	"time"
 )
 
+// ensureWritableLocked returns ErrClusterReadOnly when the store is in
+// cluster read-only mode (a non-RG0-primary / secondary node; config
+// authority is the primary). Callers MUST hold s.mu.
+//
+// #3893: the read-only flag was previously checked ONLY at the
+// EnterConfigure* gate. Once a config session was already open (entered
+// before the node became secondary, or via a path that did not re-check),
+// Set/Delete/Commit/Load/Rollback only verified candidate!=nil — so an open
+// session could Set+Commit on the read-only secondary and diverge its active
+// config from the primary (the local edit is one the primary never sees and
+// the next config-sync overwrites, causing churn). Every user-session
+// mutating op now calls this helper so the mutation is rejected regardless of
+// when the session was opened. The internal HA-sync ingress (SyncApply) and
+// the commit-confirmed timeout revert (PromoteRollback) do NOT go through the
+// gated methods, so they correctly bypass this gate.
+func (s *Store) ensureWritableLocked() error {
+	if s.clusterReadOnly {
+		return ErrClusterReadOnly
+	}
+	return nil
+}
+
 // EnterConfigure enters configuration mode by cloning the active config.
 // Returns an error if another session is already in config mode.
 func (s *Store) EnterConfigure() error {
@@ -17,8 +39,8 @@ func (s *Store) EnterConfigure() error {
 func (s *Store) EnterConfigureSession(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.clusterReadOnly {
-		return fmt.Errorf("configuration database is not writable (secondary node)")
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
 	}
 	if s.configDir {
 		// Allow re-entry by same session.
@@ -42,8 +64,8 @@ func (s *Store) EnterConfigureSession(sessionID string) error {
 func (s *Store) EnterConfigureExclusive(holder string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.clusterReadOnly {
-		return fmt.Errorf("configuration database is not writable (secondary node)")
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
 	}
 	if s.configDir {
 		return fmt.Errorf("%w", ErrConfigLocked)

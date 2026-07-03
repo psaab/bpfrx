@@ -730,7 +730,16 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueExamples: []string{"3600", "28800"}, validator: ValidateIntegerMin(1), children: nil},
 		}},
 		"policy": {desc: "IKE policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
-			"mode":           {desc: "IKE phase 1 mode (main|aggressive)", args: 1, placeholder: "<mode>", children: nil},
+			// #3896: type mode/version/nat-traversal so a typo fails closed at
+			// commit instead of silently downgrading. The accepted sets mirror
+			// exactly what the strongSwan generator (pkg/ipsec) recognizes:
+			// mode "aggressive" → aggressive=yes else main (ike.go
+			// resolveIKESettings); any unrecognized spelling silently fell back
+			// to main-mode before this gate.
+			"mode": {desc: "IKE phase 1 mode (main|aggressive)", args: 1, placeholder: "<mode>",
+				valueType: ValueEnumOf, valueDesc: "IKE phase 1 negotiation mode",
+				valueExamples: []string{"main", "aggressive"},
+				validator:     ValidateEnum([]string{"main", "aggressive"}), children: nil},
 			"proposals":      {desc: "IKE proposal reference", args: 1, placeholder: "<proposal-name>", children: nil},
 			"pre-shared-key": {desc: "Pre-shared key (ascii-text <key>)", children: nil},
 		}},
@@ -740,9 +749,15 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"ike-policy":         {desc: "IKE policy reference", args: 1, placeholder: "<policy-name>", children: nil},
 			"external-interface": {desc: "External interface for IKE (derives local address)", args: 1, placeholder: "<interface-name>", children: nil},
 			"local-certificate":  {desc: "Local certificate for IKE authentication", args: 1, placeholder: "<certificate-name>", children: nil},
-			"version":            {desc: "IKE version (v1-only|v2-only)", args: 1, placeholder: "<version>", children: nil},
-			"no-nat-traversal":   {desc: "Disable NAT traversal (UDP encapsulation)", children: nil},
-			"nat-traversal":      {desc: "NAT traversal (enable|disable|force)", args: 1, placeholder: "<mode>", children: nil},
+			"version": {desc: "IKE version (v1-only|v2-only)", args: 1, placeholder: "<version>",
+				valueType: ValueEnumOf, valueDesc: "IKE protocol version pin",
+				valueExamples: []string{"v1-only", "v2-only"},
+				validator:     ValidateEnum([]string{"v1-only", "v2-only"}), children: nil},
+			"no-nat-traversal": {desc: "Disable NAT traversal (UDP encapsulation)", children: nil},
+			"nat-traversal": {desc: "NAT traversal (enable|disable|force)", args: 1, placeholder: "<mode>",
+				valueType: ValueEnumOf, valueDesc: "NAT traversal (UDP encapsulation) mode",
+				valueExamples: []string{"enable", "disable", "force"},
+				validator:     ValidateEnum([]string{"enable", "disable", "force"}), children: nil},
 			"dead-peer-detection": {desc: "Dead peer detection", children: map[string]*schemaNode{
 				"always-send":       {desc: "Send DPD probes regardless of traffic", children: nil},
 				"optimized":         {desc: "Optimized DPD probing", children: nil},
@@ -796,9 +811,15 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"ike-policy":         {desc: "IKE policy reference", args: 1, placeholder: "<policy-name>", children: nil},
 			"external-interface": {desc: "External interface for IKE (derives local address)", args: 1, placeholder: "<interface-name>", children: nil},
 			"local-certificate":  {desc: "Local certificate for IKE authentication", args: 1, placeholder: "<certificate-name>", children: nil},
-			"version":            {desc: "IKE version (v1-only|v2-only)", args: 1, placeholder: "<version>", children: nil},
-			"no-nat-traversal":   {desc: "Disable NAT traversal (UDP encapsulation)", children: nil},
-			"nat-traversal":      {desc: "NAT traversal (enable|disable|force)", args: 1, placeholder: "<mode>", children: nil},
+			"version": {desc: "IKE version (v1-only|v2-only)", args: 1, placeholder: "<version>",
+				valueType: ValueEnumOf, valueDesc: "IKE protocol version pin",
+				valueExamples: []string{"v1-only", "v2-only"},
+				validator:     ValidateEnum([]string{"v1-only", "v2-only"}), children: nil},
+			"no-nat-traversal": {desc: "Disable NAT traversal (UDP encapsulation)", children: nil},
+			"nat-traversal": {desc: "NAT traversal (enable|disable|force)", args: 1, placeholder: "<mode>",
+				valueType: ValueEnumOf, valueDesc: "NAT traversal (UDP encapsulation) mode",
+				valueExamples: []string{"enable", "disable", "force"},
+				validator:     ValidateEnum([]string{"enable", "disable", "force"}), children: nil},
 			"dead-peer-detection": {desc: "Dead peer detection", children: map[string]*schemaNode{
 				"always-send":       {desc: "Send DPD probes regardless of traffic", children: nil},
 				"optimized":         {desc: "Optimized DPD probing", children: nil},

@@ -161,6 +161,46 @@ config to the dataplane. A subsequent restart therefore re-classifies into
 bootstrap (the marker disambiguates never-committed from
 operator-committed-empty).
 
+### Cluster read-only gate (#3893)
+
+On an HA chassis cluster the RG0 primary is the sole config authority;
+the secondary is read-only and receives config only via `SyncApply`
+(peer sync from the primary). The daemon toggles the store's read-only
+mode on the RG0 primary↔secondary transition:
+`SetClusterReadOnly(true)` when this node becomes secondary,
+`SetClusterReadOnly(false)` when it is promoted to primary
+(`pkg/daemon/daemon_ha.go`).
+
+`clusterReadOnly` was originally checked ONLY at the `EnterConfigure*`
+gate. That left two holes: a config session **opened before** the node
+became secondary, and any mutating path that did not re-enter
+`EnterConfigure`. Once a session was open, `Set`/`Delete`/`Commit`/
+`Load*`/`Rollback` only verified `candidate != nil` — so an open session
+could `Set` + `Commit` on the read-only secondary and **diverge** its
+active config from the primary (a local edit the primary never sees,
+which the next config-sync overwrites — churn/divergence).
+
+The gate is now enforced on **every user-session mutating op** through
+`ensureWritableLocked()` (called under `s.mu`): `Set`, `Delete`,
+`DeactivateFromInput`/`ActivateFromInput`, `Copy`, `Rename`, `Insert`,
+`Annotate`, `LoadOverride`/`LoadMerge`/`LoadSet`, `CommitWithDescription`
+(and thus `Commit`), `CommitConfirmed`, and `Rollback`, in addition to
+the retained `EnterConfigure*` gate. A rejected op returns the
+`ErrClusterReadOnly` sentinel ("configuration is read-only on the
+cluster secondary"), which `errors.Is` distinguishes from the transient
+`ErrConfigLocked`.
+
+**Internal-sync bypass (load-bearing):** the secondary must still APPLY
+config authored by the primary. `SyncApply` (HA peer-sync ingress) and
+`PromoteRollback` (commit-confirmed timeout revert) promote the
+`active`/`compiled` state **directly** and never route through the gated
+`Set`/`Commit`/`Load`/`Rollback` methods, so they are unaffected by this
+gate — exactly the distinction between a user-driven mutation (blocked
+on a secondary) and an internal convergence apply (must proceed).
+Boot-time `bootstrapFromFile` enters config mode first, so it too is
+governed by the same gate (a no-op there because `clusterReadOnly` is
+`false` at boot, before any RG0 transition).
+
 ### Step-0 committed marker (#1922 Item 2)
 
 The config-DB compatibility envelope (#1917) carries a `committed=` header
