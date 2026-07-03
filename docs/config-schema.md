@@ -108,6 +108,33 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**Firewall-filter `source/destination-prefix-list` refs are dual-AST too
+(#3843).** These `from` leaves are NOT `multi: true` value-tails — each
+reference carries an optional trailing `except` modifier, so they compile
+through a dedicated helper `firewallPrefixListRefs` (`compiler_firewall.go`)
+rather than `firewallMatchValues`. The helper reads BOTH shapes and groups each
+`<name> [except]` pair:
+
+- **hierarchical single-name leaf** `source-prefix-list plX;` /
+  `source-prefix-list plX except;` — the name(s) ride on `child.Keys[1:]` with
+  ZERO children (the `load merge` / config-file shape).
+- **hierarchical block** `source-prefix-list { pl1; pl2 except; }` and
+  **flat-set** `set ... source-prefix-list plX except` — one child node per
+  referenced list (`child.Children`).
+
+Before #3843 the `source/destination-prefix-list` case iterated only
+`child.Children`, so the single-name leaf shape had its scope SILENTLY DROPPED:
+the term compiled with NO prefix-list refs (implicit match-all) yet passed
+strict commit cleanly — a HIGH fail-open (the #2419 dual-AST class on the
+prefix-list-ref leaf, distinct from the #2506 dataplane-snapshot resolver).
+Because the dropped ref never reached `term.SourcePrefixLists`, the
+`validateFirewallPrefixListReferencesStrict` gate (#2506) had nothing to check
+and an undefined name also slipped through. Reading `child.Keys[1:]` guarantees
+the scope survives; an unresolvable name is then hard-rejected at commit, so a
+dropped scope is impossible. Coverage:
+`compiler_prefix_list_hier_leaf_3843_test.go` (single-name source/dest/except +
+undefined-reject fail-on-revert, plus block / flat-set regression guards).
+
 **NAT `match` axes are multi-value (#3431).** The source/destination NAT rule
 `match` leaves `application`, `protocol` (DNAT), `source-address-name`, and
 `destination-address-name` are all `multi: true` (alongside the already-plural
