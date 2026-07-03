@@ -408,6 +408,21 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 		s.candidate = s.active.Clone()
 	}
 
+	// #3861: an authoritative config synced from the cluster primary
+	// supersedes any commit-confirmed window still pending on THIS node
+	// (e.g. a node that armed `commit confirmed`, failed over to standby,
+	// then received a sync from the new primary). The pending timer's
+	// rollback target is the local pre-confirm tree — now stale; letting
+	// it fire would silently revert this node to a pre-sync config and
+	// diverge it from the cluster. Treat the sync as the confirmation:
+	// cancel the timer and bump confirmGen so an already-fired-but-blocked
+	// callback no-ops in PromoteRollback. This runs with the in-memory
+	// promotion (Option B: the apply stands even if the disk write below
+	// fails), matching SyncApply's degrade-not-fail contract.
+	if s.clearPendingConfirmLocked() {
+		slog.Info("HA config-sync apply confirmed a pending commit-confirmed window")
+	}
+
 	// #1799 Option B (degrade-not-fail): the in-memory apply above
 	// MUST stand even if the disk write fails — failing the
 	// secondary's apply on local disk trouble would silently diverge
