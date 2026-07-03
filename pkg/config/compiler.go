@@ -2072,6 +2072,12 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3870: resolve the BGP local-AS from `routing-options
+	// autonomous-system` when `protocols bgp local-as` was omitted. Runs
+	// after the child loop so both routing-options and protocols/
+	// routing-instances are populated regardless of their order under root.
+	resolveBGPAutonomousSystem(cfg)
+
 	// Extract lo0 filter input from parsed interfaces into SystemConfig.
 	if lo0 := cfg.Interfaces.Interfaces["lo0"]; lo0 != nil {
 		if u0 := lo0.Units[0]; u0 != nil {

@@ -32,17 +32,27 @@ package config
 // schemaNode defines a container keyword in the Junos config hierarchy.
 // It tells SetPath how to group flat path tokens into the correct tree structure.
 type schemaNode struct {
-	args         int                    // extra tokens consumed as part of this node's key
-	children     map[string]*schemaNode // known container children
-	wildcard     *schemaNode            // matches any keyword not in children (for dynamic names)
-	multi        bool                   // true = multiple leaf values allowed (e.g. source-address); false = replace on set
-	scalar       bool                   // true = fixed-arity scalar value leaf (keyword + exactly `args` value tokens, NO body); rejects trailing tokens at commit (#3332). Opt-in; see isScalarValueLeaf.
-	valueHint    ValueHint              // hint for dynamic value completion (when args > 0)
-	desc         string                 // description shown in completion help
-	placeholder  string                 // Junos-style placeholder (e.g., "<interface-name>")
-	midKeyword   string                 // fixed keyword in the middle of args (e.g., "to-zone")
-	midKeywordAt int                    // 1-based arg position where midKeyword appears (e.g., 2 for "from-zone X to-zone Y")
-	compoundKey  bool                   // children form compound key (e.g., "family inet6" → Keys=["family","inet6"])
+	args     int                    // extra tokens consumed as part of this node's key
+	children map[string]*schemaNode // known container children
+	wildcard *schemaNode            // matches any keyword not in children (for dynamic names)
+	multi    bool                   // true = multiple leaf values allowed (e.g. source-address); false = replace on set
+	// valueList opts a multi leaf that ALSO declares modifier children into
+	// bracket-list value absorption (#3872 static `next-hop [ a b ]`). By
+	// default the SetPath absorber only collapses a trailing value list onto a
+	// multi leaf when children == nil (ast_edit.go); a multi leaf WITH children
+	// (e.g. the CoS named containers) stays a container. valueList lets such a
+	// node absorb trailing tokens that are neither a sibling NOR a known child
+	// (the bracket list) while STILL descending into the container when the
+	// next token names a known child (the `interface` modifier). Only next-hop
+	// sets it; every other multi+children node is unchanged.
+	valueList    bool
+	scalar       bool      // true = fixed-arity scalar value leaf (keyword + exactly `args` value tokens, NO body); rejects trailing tokens at commit (#3332). Opt-in; see isScalarValueLeaf.
+	valueHint    ValueHint // hint for dynamic value completion (when args > 0)
+	desc         string    // description shown in completion help
+	placeholder  string    // Junos-style placeholder (e.g., "<interface-name>")
+	midKeyword   string    // fixed keyword in the middle of args (e.g., "to-zone")
+	midKeywordAt int       // 1-based arg position where midKeyword appears (e.g., 2 for "from-zone X to-zone Y")
+	compoundKey  bool      // children form compound key (e.g., "family inet6" → Keys=["family","inet6"])
 
 	// Typed-leaf metadata (#1319). The zero value (valueType==ValueAny,
 	// validator==nil) is the legacy behaviour: any string accepted, no

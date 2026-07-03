@@ -138,6 +138,18 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	return nil
 }
 
+// isRouteInlineKeyword reports whether tok is a static-route clause keyword in
+// the fully-inline route-keys form (`route <dst> next-hop a b qualified-next-hop
+// ...`). Used to bound a multi-value next-hop gateway run (#3872) so it stops
+// at the next clause instead of swallowing a following keyword as a gateway.
+func isRouteInlineKeyword(tok string) bool {
+	switch tok {
+	case "next-hop", "qualified-next-hop", "next-table", "discard", "reject", "preference", "metric", "interface":
+		return true
+	}
+	return false
+}
+
 // compileStaticRoutes parses static route entries from a "static" node,
 // appending to and returning the updated slice.
 func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRoute {
@@ -158,7 +170,11 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 			for i := 2; i < len(routeInst.node.Keys); i++ {
 				switch routeInst.node.Keys[i] {
 				case "next-hop":
-					if i+1 < len(routeInst.node.Keys) {
+					// Absorb a collapsed bracket list `next-hop [ a b ]` in the
+					// fully-inline form: consume consecutive gateway tokens
+					// until the next route keyword, installing each as an
+					// equal-cost next-hop (#3872).
+					for i+1 < len(routeInst.node.Keys) && !isRouteInlineKeyword(routeInst.node.Keys[i+1]) {
 						i++
 						route.NextHops = append(route.NextHops, NextHopEntry{Address: routeInst.node.Keys[i]})
 					}
@@ -171,10 +187,35 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					if i+1 < len(routeInst.node.Keys) {
 						i++
 						nh := NextHopEntry{Address: routeInst.node.Keys[i]}
-						// Check for "interface <name>" following the address
-						if i+2 < len(routeInst.node.Keys) && routeInst.node.Keys[i+1] == "interface" {
+						// Consume trailing modifiers in the fully-inline form:
+						// "qualified-next-hop <gw> interface <if> preference <n>
+						// metric <m>" (#3871). Each modifier carries its own
+						// per-next-hop preference/metric — the floating backup's
+						// admin distance — never folded into the route level.
+						for i+2 < len(routeInst.node.Keys) {
+							kw := routeInst.node.Keys[i+1]
+							val := routeInst.node.Keys[i+2]
+							consumed := true
+							switch kw {
+							case "interface":
+								nh.Interface = val
+							case "preference":
+								if n, err := strconv.Atoi(val); err == nil {
+									nh.Preference = n
+									nh.HasPreference = true
+								}
+							case "metric":
+								if n, err := strconv.Atoi(val); err == nil {
+									nh.Metric = n
+									nh.HasMetric = true
+								}
+							default:
+								consumed = false
+							}
+							if !consumed {
+								break
+							}
 							i += 2
-							nh.Interface = routeInst.node.Keys[i]
 						}
 						route.NextHops = append(route.NextHops, nh)
 					}
@@ -195,22 +236,39 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 		for _, prop := range routeInst.node.Children {
 			switch prop.Name() {
 			case "next-hop":
-				nh := NextHopEntry{}
-				nh.Address = nodeVal(prop)
-				// Check children for interface (needed for IPv6 link-local next-hops)
+				// #3872: `next-hop [ gw1 gw2 ]` is canonical Junos ECMP — the
+				// bracket list collapses onto Keys=["next-hop", gw1, gw2, ...]
+				// in both AST shapes (multi leaf). Read EVERY gateway and
+				// install each as an equal-cost next-hop; reading only Keys[1]
+				// silently dropped all but the first. A single-gateway form may
+				// carry an `interface <if>` modifier (IPv6 link-local), inline
+				// on the keys (`next-hop fe80::1 interface reth0.50`) or as a
+				// child node — that egress interface applies to the gateway(s).
+				var addrs []string
+				iface := ""
+				for j := 1; j < len(prop.Keys); j++ {
+					if prop.Keys[j] == "interface" {
+						if j+1 < len(prop.Keys) {
+							iface = prop.Keys[j+1]
+							j++
+						}
+						continue
+					}
+					addrs = append(addrs, prop.Keys[j])
+				}
+				// Child interface (hierarchical + flat-set container shapes).
 				for _, child := range prop.Children {
 					if child.Name() == "interface" {
-						nh.Interface = nodeVal(child)
+						iface = nodeVal(child)
 					}
 				}
-				// Also check inline keys: "next-hop fe80::50 interface reth0.50"
-				// has all in Keys rather than Children.
-				for j := 2; j < len(prop.Keys)-1; j++ {
-					if prop.Keys[j] == "interface" {
-						nh.Interface = prop.Keys[j+1]
-					}
+				if len(addrs) == 0 && iface != "" {
+					// interface-only next-hop (unnumbered) — keep one entry.
+					route.NextHops = append(route.NextHops, NextHopEntry{Interface: iface})
 				}
-				route.NextHops = append(route.NextHops, nh)
+				for _, a := range addrs {
+					route.NextHops = append(route.NextHops, NextHopEntry{Address: a, Interface: iface})
+				}
 			case "discard":
 				route.Discard = true
 			case "preference":
@@ -220,17 +278,47 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					}
 				}
 			case "qualified-next-hop":
+				// A qualified-next-hop is a FLOATING backup: it carries its own
+				// preference (admin distance) and optional metric, kept
+				// PER-next-hop rather than folded into the route-level
+				// Preference (#3871). preference/metric/interface arrive as
+				// nested children (canonical separate `set` lines and the
+				// hierarchical brace form) or as inline keys (single-line block
+				// parse), so read both shapes.
 				nh := NextHopEntry{}
 				nh.Address = nodeVal(prop)
-				// Check for "interface <name>" among remaining keys
-				for j := 2; j < len(prop.Keys)-1; j++ {
-					if prop.Keys[j] == "interface" {
+				// Inline keys: "qualified-next-hop <gw> interface <if> preference <n> metric <m>".
+				for j := 2; j+1 < len(prop.Keys); j++ {
+					switch prop.Keys[j] {
+					case "interface":
 						nh.Interface = prop.Keys[j+1]
+					case "preference":
+						if n, err := strconv.Atoi(prop.Keys[j+1]); err == nil {
+							nh.Preference = n
+							nh.HasPreference = true
+						}
+					case "metric":
+						if n, err := strconv.Atoi(prop.Keys[j+1]); err == nil {
+							nh.Metric = n
+							nh.HasMetric = true
+						}
 					}
 				}
-				// Also check children for flat set syntax
+				// Child nodes (flat-set separate lines + hierarchical brace form).
 				if ifNode := prop.FindChild("interface"); ifNode != nil {
 					nh.Interface = nodeVal(ifNode)
+				}
+				if pNode := prop.FindChild("preference"); pNode != nil {
+					if n, err := strconv.Atoi(nodeVal(pNode)); err == nil {
+						nh.Preference = n
+						nh.HasPreference = true
+					}
+				}
+				if mNode := prop.FindChild("metric"); mNode != nil {
+					if n, err := strconv.Atoi(nodeVal(mNode)); err == nil {
+						nh.Metric = n
+						nh.HasMetric = true
+					}
 				}
 				route.NextHops = append(route.NextHops, nh)
 			case "next-table":
@@ -306,6 +394,10 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 				}
 				ri.StaticRoutes = ro.StaticRoutes
 				ri.Inet6StaticRoutes = ro.Inet6StaticRoutes
+				// #3870: capture the instance-level autonomous-system so a
+				// per-instance BGP that omits local-as can inherit it (falling
+				// back to the global routing-options AS in resolveBGPAutonomousSystem).
+				ri.AutonomousSystem = ro.AutonomousSystem
 				// Parse interface-routes rib-group
 				if irNode := prop.FindChild("interface-routes"); irNode != nil {
 					if rgNode := irNode.FindChild("rib-group"); rgNode != nil {
@@ -376,6 +468,40 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// resolveBGPAutonomousSystem fills a BGP local-AS from `routing-options
+// autonomous-system` when `protocols bgp local-as` was not set (#3870).
+//
+// Junos accepts the BGP AS at TWO hierarchy points: the global
+// `routing-options autonomous-system <N>` (the canonical vSRX placement) and
+// the more specific `protocols bgp local-as <N>` override. The FRR renderer
+// gates `router bgp` on BGPConfig.LocalAS > 0 (policy_render.go), and only
+// `local-as` populated LocalAS — so a config that set the AS only at
+// routing-options rendered NO `router bgp` block at all, silently. This
+// resolves the Junos precedence into LocalAS after the whole tree is compiled
+// (routing-options and protocols may appear in either order under the root):
+// local-as wins if present, else the global autonomous-system. Per-instance
+// BGP inherits the instance's own routing-options autonomous-system if set,
+// else the global one. Must run AFTER both compileRoutingOptions and
+// compileProtocols/compileRoutingInstances have populated cfg.
+func resolveBGPAutonomousSystem(cfg *Config) {
+	globalAS := cfg.RoutingOptions.AutonomousSystem
+	if bgp := cfg.Protocols.BGP; bgp != nil && bgp.LocalAS == 0 && globalAS > 0 {
+		bgp.LocalAS = globalAS
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri.BGP == nil || ri.BGP.LocalAS != 0 {
+			continue
+		}
+		as := ri.AutonomousSystem // instance-level override
+		if as == 0 {
+			as = globalAS // inherit the global autonomous-system
+		}
+		if as > 0 {
+			ri.BGP.LocalAS = as
+		}
+	}
 }
 
 func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {

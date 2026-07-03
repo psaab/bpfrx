@@ -113,13 +113,22 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 		vrfPart = fmt.Sprintf(" table %d", tableID)
 	}
 
-	// Discard or no next-hops: single Null0 line.
-	if sr.Discard || len(sr.NextHops) == 0 {
+	// Explicit discard (blackhole) route: single Null0 line.
+	if sr.Discard {
 		nexthop := "Null0"
 		if sr.Preference > 0 {
 			return fmt.Sprintf("%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
 		}
 		return fmt.Sprintf("%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
+	}
+
+	// A non-discard route with NO next-hops is incomplete — e.g. every gateway
+	// of an ECMP `next-hop [ a b ]` list was deleted (#3872 delete-side). Render
+	// NOTHING rather than a Null0 blackhole: silently blackholing traffic that
+	// would otherwise fall through to a default / more-specific route is a
+	// fail-wide. (An explicit `discard` above still renders Null0.)
+	if len(sr.NextHops) == 0 {
+		return ""
 	}
 
 	// One line per next-hop → FRR creates ECMP.
@@ -160,8 +169,20 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 		default:
 			continue
 		}
-		if sr.Preference > 0 {
-			fmt.Fprintf(&b, "%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
+		// Per-next-hop admin distance (#3871): a qualified-next-hop carries
+		// its own preference (HasPreference) and renders as a FLOATING backup
+		// at that distance; a plain next-hop uses the route-level distance so
+		// a `next-hop [ a b ]` list stays equal-cost ECMP. FRR installs the
+		// lowest-distance reachable next-hop and fails over to the higher-
+		// distance one only when the primary is down. FRR's static-route CLI
+		// has no metric field, so nh.Metric is not emitted — the floating
+		// behavior comes entirely from the distance.
+		dist := sr.Preference
+		if nh.HasPreference {
+			dist = nh.Preference
+		}
+		if dist > 0 {
+			fmt.Fprintf(&b, "%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, dist, vrfPart)
 		} else {
 			fmt.Fprintf(&b, "%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
 		}

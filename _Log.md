@@ -28581,6 +28581,76 @@ top.
   docs/deterministic-nat-cgnat.md (/22→/25 fix + hier example + grouping +
   impl map), docs/config-schema.md (port now modeled note)
 
+## 2026-07-03 — routing: BGP AS fallback + floating qualified-next-hop + next-hop ECMP list (#3870/#3871/#3872)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3870 (F-009) — BGP `router bgp` gated on `BGPConfig.LocalAS > 0`
+  (policy_render.go) which only `protocols bgp local-as` set, so the canonical
+  vSRX placement `routing-options autonomous-system <N>` + `protocols bgp`
+  rendered NO BGP at all, silently. FIX: `resolveBGPAutonomousSystem(cfg)` in
+  compiler_routing.go, called post-child-loop in compiler.go (order-independent),
+  fills LocalAS from the global autonomous-system when local-as is omitted;
+  local-as still wins; per-instance BGP inherits the instance's own
+  routing-options AS if set else the global one (new
+  RoutingInstanceConfig.AutonomousSystem field). RED-on-revert PROVEN: without
+  the resolver LocalAS=0 (no `router bgp`); local-as-override + no-AS cases stay
+  GREEN (pre-existing behavior).
+- **File(s)**: pkg/config/compiler.go (post-loop resolver call),
+  pkg/config/compiler_routing.go (resolveBGPAutonomousSystem + capture instance
+  AS), pkg/config/types_routing.go (RoutingInstanceConfig.AutonomousSystem),
+  pkg/config/compiler_bgp_as_3870_test.go (new, 4 tests), pkg/frr/README.md
+
+## 2026-07-03 — #3871 (F-008): floating qualified-next-hop per-NH preference/metric
+
+- **Timestamp**: 2026-07-03
+- **Action**: A static `qualified-next-hop <gw> { preference N; metric M; }`
+  (Junos floating static) had its per-NH preference/metric dropped (folded to a
+  single route-level Preference), so config_render rendered all next-hops at
+  equal cost → floating static became equal-cost ECMP over the backup. FIX:
+  carry Preference/HasPreference/Metric/HasMetric PER-NextHopEntry
+  (types_routing.go); compiler reads qualified-next-hop preference/metric from
+  children + inline keys (compiler_routing.go, both the hierarchical-children
+  handler and the fully-inline route-keys branch); renderer emits each next-hop
+  at its own admin distance (config_render.go — primary at route-level 5,
+  qualified at 250). FRR installs the lower-distance primary and floats the
+  backup in only when the primary is down. Metric carried but NOT rendered (FRR
+  static CLI has no metric field). Plain next-hop list stays equal-cost ECMP
+  (no per-NH preference) — distinct from the floating backup. RED-on-revert
+  PROVEN: renderer revert → both at distance 5; compiler revert → qualified
+  HasPreference/HasMetric false.
+- **File(s)**: pkg/config/types_routing.go (NextHopEntry per-NH pref/metric),
+  pkg/config/compiler_routing.go (qualified-next-hop parse, 2 shapes),
+  pkg/frr/config_render.go (per-NH distance),
+  pkg/config/compiler_qualified_nexthop_3871_test.go (new, 2 tests),
+  pkg/frr/static_floating_3871_test.go (new, 2 tests), pkg/frr/README.md
+
+## 2026-07-03 — #3872 (F-010): static next-hop bracket list = ECMP multipath
+
+- **Timestamp**: 2026-07-03
+- **Action**: A static route `next-hop [ gw1 gw2 ]` (canonical Junos ECMP)
+  collapsed to a single next-hop — the schema leaf was not multi and the
+  compiler read one address — so multipath was silently lost. FIX: make the
+  next-hop leaf `multi: true, valueList: true` (schema_routing.go) so the
+  bracket list collapses onto one leaf (Keys=[next-hop gw1 gw2]) in both AST
+  shapes; the compiler reads Keys[1:] and installs every gateway equal-cost
+  (compiler_routing.go, children handler + inline branch + isRouteInlineKeyword
+  helper). NEW schemaNode.valueList flag + ast_edit.go absorber change: a multi
+  leaf WITH modifier children absorbs a value list ONLY when it opts in
+  (valueList) — so the many CoS multi+children named containers are UNCHANGED
+  (a broad absorber change first broke TestValidateCoSOversubscription*; the
+  surgical flag fixed it). The `interface` modifier child still walks for the
+  IPv6 link-local single-gateway form. Composes with #3871: plain list =
+  equal-cost (no per-NH preference), qualified-next-hop = floating backup.
+  RED-on-revert PROVEN: reverting the multi/valueList schema collapses the
+  bracket list to only the first gateway; single next-hop + interface-modifier
+  + block-parse forms stay GREEN. Full `go test ./...` green.
+- **File(s)**: pkg/config/schema.go (valueList field),
+  pkg/config/ast_edit.go (valueList-gated child-aware absorber),
+  pkg/config/schema_routing.go (next-hop multi+valueList),
+  pkg/config/compiler_routing.go (multi-address read + isRouteInlineKeyword),
+  pkg/config/compiler_static_nexthop_list_3872_test.go (new, 5 tests),
+  pkg/frr/static_ecmp_list_3872_test.go (new), docs/config-schema.md,
+  pkg/frr/README.md
 ## 2026-07-03
 
 - **Timestamp**: 2026-07-03 14:35
@@ -28620,3 +28690,35 @@ top.
   + partialFrameConn/recordingBufConn/closeCountingTimeoutConn mocks +
   parseOctetFrame collector parser), pkg/logging/README.md (partial-frame
   teardown #3874 bullet)
+
+## 2026-07-03 — PR #3879 hostile-review folds: #3872 delete-side + 2 MINORs
+
+- **Timestamp**: 2026-07-03
+- **Action**: MAJOR (delete-side fail-wide, the #3846 class the PR cites). The
+  read/render side of #3872 next-hop ECMP was fixed but the DELETE side was
+  not: the removeMultiLeafMembers gate was `multi && children == nil && args
+  == 1`, and next-hop has an `interface` child so it was EXCLUDED → fell
+  through to removeMatchingNode (prefix match) → `delete ... next-hop <gw>` on
+  a `[ a b ]` list deleted the WHOLE leaf → route left with 0 next-hops → FRR
+  rendered Null0 (blackholed the healthy path); a non-first member was
+  undeletable. FIX: (1) gate flip `multi && (children == nil || valueList) &&
+  args == 1` mirroring the read side; (2) removeMultiLeafMembers gains a
+  modifierChildren param — for a valueList node the children are MODIFIERS of
+  the gateway (not droppable members), and dropping the last gateway removes
+  the WHOLE entry (gateway + interface) rather than a gateway-less container;
+  (3) renderer emits Null0 ONLY for an explicit `discard` — a non-discard
+  0-next-hop route renders NOTHING (not a Null0 blackhole). MINOR 1: doc that a
+  metric-only qualified-next-hop (no preference) does NOT float (FRR statics
+  have no metric field). MINOR 2: fixed the stale schema comment that said the
+  qualified preference "folds into route.Preference" (#3871 removed that fold).
+  RED-on-revert PROVEN: reverting the gate → whole leaf deleted (0 next-hops) +
+  non-first undeletable; reverting the renderer → 0-next-hop route renders
+  Null0. Full go test ./pkg/config/... ./pkg/frr/... green. NOTE: pre-existing
+  master canary failure TestNoDirectOsWriteFile (daemon_flow.go archiveConfig,
+  from master #9d14a1720) is unrelated to this PR.
+- **File(s)**: pkg/config/ast_edit.go (delete gate flip + removeMultiLeafMembers
+  modifierChildren), pkg/frr/config_render.go (Null0 only for discard),
+  pkg/config/schema_routing.go (MINOR 2 stale comment + metric note),
+  pkg/frr/README.md (MINOR 1 metric-only-doesn't-float),
+  pkg/config/delete_static_nexthop_3872_test.go (new, 5 tests),
+  pkg/frr/static_empty_route_3872_test.go (new, 2 tests)

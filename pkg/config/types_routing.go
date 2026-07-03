@@ -199,6 +199,26 @@ func ConnectedNetworkPrefix(cidr string) (prefix, family string, ok bool) {
 type NextHopEntry struct {
 	Address   string // IP address (e.g. "10.0.1.1" or "fe80::1")
 	Interface string // outgoing interface (for IPv6 link-local)
+	// Preference is this next-hop's own administrative distance, carried from
+	// a `qualified-next-hop <gw> { preference N; }` (#3871 — the Junos
+	// FLOATING-static idiom: a primary next-hop plus a less-preferred backup).
+	// Valid only when HasPreference. A plain `next-hop` leaves HasPreference
+	// false and renders at the ROUTE-level distance (StaticRoute.Preference),
+	// so plain `next-hop [ a b ]` stays equal-cost ECMP while a qualified
+	// backup renders at its own higher distance and installs only when the
+	// primary next-hop is down. Folding the qualified preference into the
+	// single route-level Preference (the pre-#3871 behavior) rendered every
+	// next-hop at equal cost, so the floating static load-balanced over the
+	// backup instead of preferring the primary.
+	Preference    int
+	HasPreference bool
+	// Metric is this next-hop's `qualified-next-hop <gw> { metric M; }` value
+	// (#3871). Carried in the typed config for parity/display; FRR's static
+	// route CLI (`ip route NET GW [DISTANCE]`) has no per-route metric field,
+	// so the floating behavior is expressed entirely through the per-next-hop
+	// admin distance (Preference), not Metric. Valid only when HasMetric.
+	Metric    int
+	HasMetric bool
 }
 
 // StaticRoute defines a single static route.
@@ -540,18 +560,23 @@ func (tc *TunnelConfig) WgHasEndpoint() bool {
 
 // RoutingInstanceConfig represents a VRF-based routing instance.
 type RoutingInstanceConfig struct {
-	Name                      string
-	Description               string
-	InstanceType              string         // "virtual-router" or "vrf"
-	Interfaces                []string       // interfaces belonging to this instance
-	StaticRoutes              []*StaticRoute // per-instance static routes
-	Inet6StaticRoutes         []*StaticRoute // per-instance rib inet6.0 static routes
-	OSPF                      *OSPFConfig    // per-instance OSPF (optional)
-	OSPFv3                    *OSPFv3Config  // per-instance OSPFv3 (optional)
-	BGP                       *BGPConfig     // per-instance BGP (optional)
-	RIP                       *RIPConfig     // per-instance RIP (optional)
-	ISIS                      *ISISConfig    // per-instance IS-IS (optional)
-	TableID                   int            // Linux kernel routing table number (auto-assigned)
-	InterfaceRoutesRibGroup   string         // interface-routes { rib-group inet <name>; }
-	InterfaceRoutesRibGroupV6 string         // interface-routes { rib-group inet6 <name>; }
+	Name              string
+	Description       string
+	InstanceType      string         // "virtual-router" or "vrf"
+	Interfaces        []string       // interfaces belonging to this instance
+	StaticRoutes      []*StaticRoute // per-instance static routes
+	Inet6StaticRoutes []*StaticRoute // per-instance rib inet6.0 static routes
+	OSPF              *OSPFConfig    // per-instance OSPF (optional)
+	OSPFv3            *OSPFv3Config  // per-instance OSPFv3 (optional)
+	BGP               *BGPConfig     // per-instance BGP (optional)
+	RIP               *RIPConfig     // per-instance RIP (optional)
+	ISIS              *ISISConfig    // per-instance IS-IS (optional)
+	// AutonomousSystem is this instance's `routing-options autonomous-system`
+	// (#3870). When the instance's BGP omits `local-as`, the BGP AS is
+	// resolved from this instance-level AS if set, else the GLOBAL
+	// routing-options autonomous-system (Junos inheritance). 0 = unset.
+	AutonomousSystem          uint32
+	TableID                   int    // Linux kernel routing table number (auto-assigned)
+	InterfaceRoutesRibGroup   string // interface-routes { rib-group inet <name>; }
+	InterfaceRoutesRibGroupV6 string // interface-routes { rib-group inet6 <name>; }
 }
