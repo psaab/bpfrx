@@ -161,6 +161,20 @@ also carries operator content:
   the FRR-invalid `redistribute direct`, failing the reload) — matching the
   policy-term `FromProtocols` normalization and keeping the commit gate's
   acceptance of `direct` honest.
+- **BGP local-AS resolves from `routing-options autonomous-system` (#3870).**
+  `generateProtocols` gates the `router bgp <N>` block on `BGPConfig.LocalAS
+  > 0`, and ONLY `protocols bgp local-as` populated `LocalAS`. A canonical
+  vSRX config that declares the AS at the global `routing-options
+  autonomous-system <N>` (the standard Junos placement) — with `protocols
+  bgp` but no `local-as` — therefore rendered NO `router bgp` block at all,
+  silently, and BGP never came up. `resolveBGPAutonomousSystem`
+  (`compiler_routing.go`), run once after the whole tree compiles (so
+  `routing-options` and `protocols` may appear in either order), fills
+  `LocalAS` from the global `autonomous-system` when `local-as` was omitted;
+  `local-as` still WINS when present (Junos precedence). A per-routing-instance
+  BGP without `local-as` inherits the instance's own `routing-options
+  autonomous-system` if set, else the global one. No AS anywhere leaves
+  `LocalAS == 0` and renders no `router bgp`, unchanged.
 - **A BGP neighbor's peer-as (remote-as) is validated at commit (#2963).**
   `peer-as` is optional in the parser/compiler, so a neighbor authored
   without one (and without an inherited group `peer-as`) keeps a zero

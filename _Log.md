@@ -28475,3 +28475,22 @@ top.
   pkg/config/deterministic_nat_flatset_3864_test.go (new, 7 tests),
   docs/deterministic-nat-cgnat.md (/22→/25 fix + hier example + grouping +
   impl map), docs/config-schema.md (port now modeled note)
+
+## 2026-07-03 — routing: BGP AS fallback + floating qualified-next-hop + next-hop ECMP list (#3870/#3871/#3872)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3870 (F-009) — BGP `router bgp` gated on `BGPConfig.LocalAS > 0`
+  (policy_render.go) which only `protocols bgp local-as` set, so the canonical
+  vSRX placement `routing-options autonomous-system <N>` + `protocols bgp`
+  rendered NO BGP at all, silently. FIX: `resolveBGPAutonomousSystem(cfg)` in
+  compiler_routing.go, called post-child-loop in compiler.go (order-independent),
+  fills LocalAS from the global autonomous-system when local-as is omitted;
+  local-as still wins; per-instance BGP inherits the instance's own
+  routing-options AS if set else the global one (new
+  RoutingInstanceConfig.AutonomousSystem field). RED-on-revert PROVEN: without
+  the resolver LocalAS=0 (no `router bgp`); local-as-override + no-AS cases stay
+  GREEN (pre-existing behavior).
+- **File(s)**: pkg/config/compiler.go (post-loop resolver call),
+  pkg/config/compiler_routing.go (resolveBGPAutonomousSystem + capture instance
+  AS), pkg/config/types_routing.go (RoutingInstanceConfig.AutonomousSystem),
+  pkg/config/compiler_bgp_as_3870_test.go (new, 4 tests), pkg/frr/README.md

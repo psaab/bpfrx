@@ -306,6 +306,10 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 				}
 				ri.StaticRoutes = ro.StaticRoutes
 				ri.Inet6StaticRoutes = ro.Inet6StaticRoutes
+				// #3870: capture the instance-level autonomous-system so a
+				// per-instance BGP that omits local-as can inherit it (falling
+				// back to the global routing-options AS in resolveBGPAutonomousSystem).
+				ri.AutonomousSystem = ro.AutonomousSystem
 				// Parse interface-routes rib-group
 				if irNode := prop.FindChild("interface-routes"); irNode != nil {
 					if rgNode := irNode.FindChild("rib-group"); rgNode != nil {
@@ -376,6 +380,40 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// resolveBGPAutonomousSystem fills a BGP local-AS from `routing-options
+// autonomous-system` when `protocols bgp local-as` was not set (#3870).
+//
+// Junos accepts the BGP AS at TWO hierarchy points: the global
+// `routing-options autonomous-system <N>` (the canonical vSRX placement) and
+// the more specific `protocols bgp local-as <N>` override. The FRR renderer
+// gates `router bgp` on BGPConfig.LocalAS > 0 (policy_render.go), and only
+// `local-as` populated LocalAS — so a config that set the AS only at
+// routing-options rendered NO `router bgp` block at all, silently. This
+// resolves the Junos precedence into LocalAS after the whole tree is compiled
+// (routing-options and protocols may appear in either order under the root):
+// local-as wins if present, else the global autonomous-system. Per-instance
+// BGP inherits the instance's own routing-options autonomous-system if set,
+// else the global one. Must run AFTER both compileRoutingOptions and
+// compileProtocols/compileRoutingInstances have populated cfg.
+func resolveBGPAutonomousSystem(cfg *Config) {
+	globalAS := cfg.RoutingOptions.AutonomousSystem
+	if bgp := cfg.Protocols.BGP; bgp != nil && bgp.LocalAS == 0 && globalAS > 0 {
+		bgp.LocalAS = globalAS
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri.BGP == nil || ri.BGP.LocalAS != 0 {
+			continue
+		}
+		as := ri.AutonomousSystem // instance-level override
+		if as == 0 {
+			as = globalAS // inherit the global autonomous-system
+		}
+		if as > 0 {
+			ri.BGP.LocalAS = as
+		}
+	}
 }
 
 func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {

@@ -505,18 +505,23 @@ func (tc *TunnelConfig) WgHasEndpoint() bool {
 
 // RoutingInstanceConfig represents a VRF-based routing instance.
 type RoutingInstanceConfig struct {
-	Name                      string
-	Description               string
-	InstanceType              string         // "virtual-router" or "vrf"
-	Interfaces                []string       // interfaces belonging to this instance
-	StaticRoutes              []*StaticRoute // per-instance static routes
-	Inet6StaticRoutes         []*StaticRoute // per-instance rib inet6.0 static routes
-	OSPF                      *OSPFConfig    // per-instance OSPF (optional)
-	OSPFv3                    *OSPFv3Config  // per-instance OSPFv3 (optional)
-	BGP                       *BGPConfig     // per-instance BGP (optional)
-	RIP                       *RIPConfig     // per-instance RIP (optional)
-	ISIS                      *ISISConfig    // per-instance IS-IS (optional)
-	TableID                   int            // Linux kernel routing table number (auto-assigned)
-	InterfaceRoutesRibGroup   string         // interface-routes { rib-group inet <name>; }
-	InterfaceRoutesRibGroupV6 string         // interface-routes { rib-group inet6 <name>; }
+	Name              string
+	Description       string
+	InstanceType      string         // "virtual-router" or "vrf"
+	Interfaces        []string       // interfaces belonging to this instance
+	StaticRoutes      []*StaticRoute // per-instance static routes
+	Inet6StaticRoutes []*StaticRoute // per-instance rib inet6.0 static routes
+	OSPF              *OSPFConfig    // per-instance OSPF (optional)
+	OSPFv3            *OSPFv3Config  // per-instance OSPFv3 (optional)
+	BGP               *BGPConfig     // per-instance BGP (optional)
+	RIP               *RIPConfig     // per-instance RIP (optional)
+	ISIS              *ISISConfig    // per-instance IS-IS (optional)
+	// AutonomousSystem is this instance's `routing-options autonomous-system`
+	// (#3870). When the instance's BGP omits `local-as`, the BGP AS is
+	// resolved from this instance-level AS if set, else the GLOBAL
+	// routing-options autonomous-system (Junos inheritance). 0 = unset.
+	AutonomousSystem          uint32
+	TableID                   int    // Linux kernel routing table number (auto-assigned)
+	InterfaceRoutesRibGroup   string // interface-routes { rib-group inet <name>; }
+	InterfaceRoutesRibGroupV6 string // interface-routes { rib-group inet6 <name>; }
 }
