@@ -706,6 +706,57 @@ Strict commit rejects `lo > hi` (`pkg/config` range validation), so this is the
   posture. A valid or `hi==lo` app destination-port still publishes its exact
   DNAT entry.
 
+## 13c. Rule `match destination-port` + `match application` (#3857)
+
+A DNAT rule that configured BOTH `match application` AND a rule-level `match
+destination-port` mishandled the port on the lenient / HA peer-sync decode path
+(`buildDestinationNATSnapshotsWithFeeds`, `nat.go`). Before #3857 the rule-level
+`match destination-port` was consulted ONLY on the no-application explicit-match
+path; when an application was ALSO present the builder read the application's own
+destination-port for the term and reached the rule-level port through a stray
+switch case that read only the SINGULAR first port. Three fail modes resulted
+(fable-161 F-018, the source-NAT builder handled all three correctly):
+
+- **F-018a (fail-open)** — a port-less application (`protocol tcp`, no
+  destination-port) combined with an INVALID / unrepresentable rule
+  destination-port (a non-numeric token on `InvalidDestinationPorts`, or an
+  out-of-range numeric) fell through to the wildcard match-any-port default
+  (`destination_port == 0`), WIDENING the rule to every port — the exact
+  fail-open the #3446 guard (§13) closes, re-opened on the mixed-version /
+  corrupt-snapshot path.
+- **F-018b** — a VALID rule destination-port was DROPPED when an application was
+  present (the application's own port, or a wildcard, won), so the operator's
+  explicit `match destination-port` had no effect.
+- **F-018c** — a MULTI-value rule destination-port list collapsed to the
+  singular first port (the switch case read `rule.Match.DestinationPort`, not the
+  full `DestinationPorts` list).
+
+Strict commit rejects an out-of-range / non-numeric rule `match
+destination-port` (`validateNATMatchDestinationPortStrict`), so this is the
+#1960 tolerant-load / peer-sync backstop — the same accepted threat model as §13
+/ §13a / §13b.
+
+**Builder fix.** The explicit rule-level `match destination-port` is now
+authoritative for the destination-port axis and applies to EVERY resolved
+application term. The builder resolves the rule's port list once
+(`ruleDstPorts`, the plural `DestinationPorts`, falling back to the scalar
+`DestinationPort` a mixed-version peer may carry alone; `ruleDstPortConfigured`
+also trips on a non-empty `InvalidDestinationPorts`) and, when configured, uses
+it in place of the application's own destination-port on each term. The
+application still constrains protocol / source-port / ICMP type-code (the #3437
+axes) — only the destination-port is taken from the explicit rule match. The
+full multi-value list is preserved (each port coalesces to its own compact wire
+range), and a configured-but-unrepresentable value trips the same
+`portConfigured` → emit-no-snapshot fail-closed branch used by §13 / §13b, so
+the rule matches NOTHING instead of widening to `[0,0]`. The stray singular-port
+switch case is removed; a port-less application with no rule destination-port
+still emits the genuine wildcard entry, unchanged.
+
+**Wire.** No new wire field and no Rust change — the Rust `l4_extra_matches`
+(`nat/destination.rs`) already AND-checks `match_destination_ports` and the
+exact `destination_port`, preserving the `low > high` never-match sentinel. The
+builder simply emits correct port ranges (or omits the rule).
+
 ## 14. DNAT pool port/address validation (#3450)
 
 A destination-NAT **pool**'s translated `port` and `address` had NO strict

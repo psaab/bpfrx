@@ -896,11 +896,13 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			//   - No application configured: use the explicit match grammar
 			//     (protocol + destination-port). DNAT `match` grammar has no
 			//     source-port or ICMP type/code, so those axes stay unconstrained
-			//     on the explicit-match fallback term. #3446: this fallback sets
-			//     explicitFallback so the port-filtering loop below can tell a
+			//     on the explicit-match fallback term. The term carries the
+			//     rule's destination-port list directly; #3857 additionally
+			//     resolves the rule-level destination-port below (ruleDstPorts /
+			//     ruleDstPortConfigured) so the port-filtering loop can tell a
 			//     configured-but-unresolved destination-port from a genuine
-			//     wildcard and fail closed.
-			explicitFallback := false
+			//     wildcard and fail closed — for BOTH this path and the
+			//     application-present path.
 			if len(appTerms) == 0 {
 				if appConfigured {
 					appTerms = []appTerm{{srcPorts: []NatPortRangeWire{natNeverMatchPortRange}}}
@@ -917,9 +919,33 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 					for _, proto := range protos {
 						appTerms = append(appTerms, appTerm{proto: proto, ports: rule.Match.DestinationPorts})
 					}
-					explicitFallback = true
 				}
 			}
+
+			// #3857: an explicit rule-level `match destination-port` is
+			// authoritative for the DNAT destination-port axis and applies to
+			// EVERY resolved application term. Before #3857 the rule-level port
+			// was consulted ONLY on the no-application explicit-match path
+			// (explicitFallback); with an application ALSO present the builder
+			// (a) dropped a VALID rule destination-port (the application's own
+			// port, or a match-any wildcard, won), (b) collapsed a multi-value
+			// list to the singular first port, and (c) — for a port-less
+			// application — WIDENED an invalid/unrepresentable token to the
+			// wildcard [0,0] port, a fail-open that bypassed the #3446 dport
+			// guard on the lenient / HA peer-sync decode path. Resolve the
+			// rule's port list once here (the plural, falling back to the scalar
+			// a mixed-version peer may carry alone) and, when configured, use it
+			// in place of the application's own destination-port on every term.
+			// The application still constrains protocol / source-port / ICMP
+			// type-code; only the destination-port axis is taken from the
+			// explicit rule match. A configured-but-unrepresentable value fails
+			// CLOSED below (the rule is omitted), exactly like the no-application
+			// path and the source-NAT builder — it never widens to [0,0].
+			ruleDstPorts := rule.Match.DestinationPorts
+			if len(ruleDstPorts) == 0 && rule.Match.DestinationPort != 0 {
+				ruleDstPorts = []int{rule.Match.DestinationPort}
+			}
+			ruleDstPortConfigured := len(ruleDstPorts) > 0 || len(rule.Match.InvalidDestinationPorts) > 0
 
 			for _, term := range appTerms {
 				// #3446: a `match destination-port` that was configured but
@@ -943,25 +969,40 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				// #3437 MatchSourcePorts handling). coalescePortRanges drops
 				// out-of-range values; an all-invalid configured port therefore
 				// coalesces to nothing and is failed CLOSED below.
-				portRanges := coalescePortRanges(term.ports)
-				// Did this rule CONFIGURE a destination-port at all? A configured
+				// #3857: the explicit rule-level `match destination-port`
+				// overrides the application's own destination-port on this term.
+				// term.ports (the application's destination-port) is used only
+				// when the rule did NOT configure `match destination-port`. On
+				// the no-application explicit-match path term.ports already IS
+				// rule.Match.DestinationPorts, so the override is a no-op there.
+				termPorts := term.ports
+				termDstPortConfigured := term.dstPortConfigured
+				if ruleDstPortConfigured {
+					termPorts = ruleDstPorts
+					termDstPortConfigured = true
+				}
+				portRanges := coalescePortRanges(termPorts)
+				// Did this term CONFIGURE a destination-port at all? A configured
 				// port that survived to no valid value must not become wildcard.
 				// #3726: term.dstPortConfigured is true when the application named
 				// a destination-port that coalesced to nothing (all out of
-				// 1..65535, or a reversed "200-100" range now rejected by
-				// appPortsFromSpec). Without this the app term's empty ports
-				// slipped through to the wildcard match-any-port default — a
-				// fail-open that widened the DNAT rule to every port.
-				portConfigured := len(term.ports) > 0 || term.dstPortConfigured ||
-					(explicitFallback && (rule.Match.DestinationPort != 0 || len(rule.Match.InvalidDestinationPorts) > 0))
+				// 1..65535, or a reversed "200-100" range rejected by
+				// appPortsFromSpec). #3857: termDstPortConfigured is also true
+				// when the rule pinned an explicit `match destination-port` (a
+				// numeric out-of-range, or non-numeric token on
+				// InvalidDestinationPorts). Without this the empty ports slip
+				// through to the wildcard match-any-port default — a fail-open
+				// that widens the DNAT rule to every port.
+				portConfigured := len(termPorts) > 0 || termDstPortConfigured
 				if len(portRanges) == 0 {
 					switch {
-					case rule.Match.DestinationPort >= 1 && rule.Match.DestinationPort <= 65535:
-						p := uint16(rule.Match.DestinationPort)
-						portRanges = []NatPortRangeWire{{Low: p, High: p}}
 					case portConfigured:
 						// Configured but no valid port → fail closed: emit no
 						// snapshot for this term so the rule matches nothing.
+						// #3857: this now also catches an invalid/unrepresentable
+						// rule-level `match destination-port` present ALONGSIDE an
+						// application, which previously widened to the [0,0]
+						// wildcard via the removed singular-port switch case.
 						continue
 					default:
 						// Genuine wildcard (no port match): a [0,0] range maps to
