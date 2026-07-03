@@ -28234,3 +28234,39 @@ top.
   pkg/config/quotekey_roundtrip_3854_test.go (new),
   docs/config-schema.md (Quoted-value escape round-trip contract subsection),
   _Log.md
+
+## 2026-07-03 — #3857 DNAT `match application` + `match destination-port` fail-open
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix HIGH fail-open (fable-161 F-018): a DNAT rule with BOTH
+  `match application` AND `match destination-port` mishandled the rule-level
+  destination-port on the lenient / HA peer-sync decode path — (a) an
+  invalid/unrepresentable rule dest-port present alongside an application
+  WIDENED to the wildcard `[0,0]` port (bypassing the #3446 dport guard), (b) a
+  valid rule dest-port was DROPPED (the application's own port / a wildcard
+  won), (c) a multi-value rule dest-port list collapsed to the singular first
+  port. The source-NAT builder handled all three correctly.
+- **Fix**: `buildDestinationNATSnapshotsWithFeeds` now treats the explicit
+  rule-level `match destination-port` as authoritative for the destination-port
+  axis on EVERY resolved application term. Resolve the rule port list once
+  (`ruleDstPorts` = plural `DestinationPorts`, fallback to scalar
+  `DestinationPort` for a mixed-version peer; `ruleDstPortConfigured` also trips
+  on non-empty `InvalidDestinationPorts`) and, when configured, use it in place
+  of the application's own destination-port on each term. Application still
+  constrains protocol / source-port / ICMP type-code (#3437). Full multi-value
+  list preserved; a configured-but-unrepresentable value fails CLOSED via the
+  existing `portConfigured` → emit-no-snapshot branch (never `[0,0]`). Removed
+  the stray singular-port switch case and the now-dead `explicitFallback` flag.
+  Go-only — no Rust change (Rust `l4_extra_matches` already AND-checks the port
+  ranges + exact port and preserves the `low > high` never-match sentinel).
+- **Tests (RED-on-revert)**: `nat_dnat_app_dport_3857_test.go` — 6 defect
+  tests (invalid/out-of-range dport + app → 0 snapshots; valid dport overrides
+  app port; scalar-only peer-sync dport honored; multi-port kept with/without
+  app port) + 1 regression guard (app-only path unchanged). Crafted-NATMatch
+  lenient/peer-sync path. Verified 6/6 RED on a temporary `git show
+  origin/master` revert of nat.go, GREEN with the fix.
+- **Validation**: go test ./pkg/dataplane/... green; go build ./... green;
+  gofmt + go vet clean.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_dnat_app_dport_3857_test.go (new),
+  docs/userspace-dnat-plan.md (§13c), _Log.md
