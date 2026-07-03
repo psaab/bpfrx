@@ -703,10 +703,18 @@ impl DnatTable {
         // interface/RI scope, source-port, or ICMP type/code does not match the
         // packet is skipped (no fail-open).
         //
-        // #3844: the first matching entry (zone-specific, then zone-wildcard)
-        // determines the outcome via `to_outcome` — a `then destination-nat
-        // off` entry yields `Exempt` (no translation, short-circuit later
-        // tiers); any other entry yields `Translate`.
+        // #3844: WITHIN a tier the first matching entry (zone-specific, then
+        // zone-wildcard) determines the outcome via `to_outcome` — a `then
+        // destination-nat off` entry yields `Exempt` (no translation), any
+        // other entry yields `Translate`. An `Exempt` (a `Some(..)`) halts the
+        // cross-tier `.or_else` chain, so it short-circuits the LOWER tiers.
+        // NOTE ON PRECEDENCE: across tiers this is MOST-SPECIFIC-WINS (exact
+        // (proto,dst,port) > wildcard-port > proto-any > prefix-LPM), NOT strict
+        // Junos config order. A more-specific *later* translate rule beats a
+        // broader *earlier* off rule (same tier-precedence the DnatTable applies
+        // to translate-vs-translate, #3164). To exempt traffic that a translate
+        // rule would otherwise catch, the `off` rule must be at least as
+        // specific as that translate rule (typically the same match tier).
         entries
             .iter()
             .find(|entry| {
