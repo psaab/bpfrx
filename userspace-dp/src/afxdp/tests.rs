@@ -1481,6 +1481,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
         match_destination_ports: vec![],
         match_icmp_type: None,
         match_icmp_code: None,
+        off: false,
     }];
     snapshot.policies.push(PolicyRuleSnapshot {
         name: "allow-inbound".to_string(),
@@ -11531,6 +11532,7 @@ fn inbound_dnat_snapshot(policy: PolicyRuleSnapshot) -> ConfigSnapshot {
         match_destination_ports: vec![],
         match_icmp_type: None,
         match_icmp_code: None,
+        off: false,
     }];
     snapshot.neighbors.push(NeighborSnapshot {
         interface: "reth1.0".to_string(),
