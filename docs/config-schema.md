@@ -633,6 +633,57 @@ and break the symmetry in the other direction. Pinned by
 `pkg/config/quotekey_roundtrip_3854_test.go` (`TestQuoteKeyLexerSymmetry3854`,
 `TestFormatParseRoundTrip3854`, `TestFormatParseIdempotent3854`).
 
+## Firewall-filter cross-family name collision fail-closed gate (#3884)
+
+Junos namespaces firewall filters **per family**, so `family inet filter blockX`
+and `family mpls filter blockX` are two distinct filters. xpf cannot: `compileFirewall`
+(`compiler_firewall.go`) selects the destination map with `dest := fw.FiltersInet`
+and only switches to `fw.FiltersInet6` when the family is literally `inet6`, so
+EVERY other family (`inet`, `any`, `mpls`, `ccc`, `vpls`, `bridge`, and any
+not-yet-modelled token — `SchemaValidate` does not reject an unknown family
+keyword) folds into the single `fw.FiltersInet` pool, then writes
+`dest[filter.Name] = filter` **unconditionally**. Two same-name filters authored
+under two different non-inet6 families therefore silently collapse — the later
+definition last-write-wins over the earlier with no commit error. If the `family
+inet` filter was a `discard`/deny and the colliding-family filter is accept-all,
+the effective IPv4 filter becomes accept-all: a deny silently downgraded to an
+accept (a security **fail-open**).
+
+Downstream consumers reference filters by **name** within the inet (V4) / inet6
+(V6) buckets only — an interface unit's `FilterInputV4` resolves against
+`fw.FiltersInet`, `FilterInputV6` against `fw.FiltersInet6`
+(`compiler_validate_warn.go`, `routing/rules.go`, `dataplane/userspace/filters.go`).
+There is no family dimension in the reference, so once two non-inet6 families
+share a name the map cannot disambiguate them and the reuse is genuinely
+ambiguous. `validateFirewallFilterFamilyCollisionsAST` (`compiler_firewall.go`)
+**rejects at commit / commit-check** a filter name defined under more than one
+distinct non-inet6 family, naming the filter and the colliding families. It is an
+AST pre-walk (mirroring `validateApplicationNameCollisionsAST`, #3339) because the
+colliding definitions are merged away by last-write-wins by the time
+`fw.FiltersInet` exists — only the raw AST still carries every family's
+definition — and it aggregates across every top-level `firewall {}` block
+(compileFirewall folds each into the same map, so a split-block collision is just
+as real).
+
+`inet6` has its own dest map (`fw.FiltersInet6`) and is the ONLY family that folds
+there, so a name shared between `family inet` and `family inet6` lands in two
+different maps and does **not** collide — the legitimate dual-stack case (one
+filter name for the V4 and V6 path) is preserved. Only a name under ≥ 2 distinct
+non-inet6 families is flagged. Because the schema-driven flat `set` grammar only
+structures `family inet` / `family inet6`, an unknown family (`any`, `mpls`, …)
+reaches a structured `filter` subtree — and thus the fold-overwrite — only via a
+hierarchical config-file parse or a directly-constructed / peer-synced AST; that
+is exactly the reachable path the gate closes.
+
+On the tolerant load / peer-sync path the error downgrades to a `cfg.Warnings`
+entry (`lenientFirewallFilterFamilyCollisions`, #1960 / #3261 no-brick), keeping
+the arbitrary-but-stable last-write-wins map so an already-persisted or
+peer-synced config an older binary silently accepted still BOOTS. Fail-on-revert:
+`pkg/config/compiler_firewall_family_collision_3884_test.go` (strict reject on
+`CompileConfig`, warn-not-brick on `CompileConfigLenient` with the surviving
+accept asserted, plus the inet/inet6 dual-stack and single-family no-false-reject
+cases).
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list
