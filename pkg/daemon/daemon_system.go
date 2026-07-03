@@ -774,21 +774,11 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 		// the exact xpf-provisioned account (UID-keyed marker).
 		d.reconcileUserPassword(user)
 
-		// Grant sudo for super-user class
-		if user.Class == "super-user" {
-			sudoFile := fmt.Sprintf("/etc/sudoers.d/xpf-%s", user.Name)
-			sudoLine := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", user.Name)
-			current, _ := os.ReadFile(sudoFile)
-			if string(current) != sudoLine {
-				// DurableState: a torn or lost sudoers file is a
-				// management-access (sudo) hazard, so it must survive a
-				// power cut.
-				if err := fsatomic.WriteFileDurable(sudoFile, []byte(sudoLine), 0440); err != nil {
-					slog.Warn("failed to write sudoers file",
-						"user", user.Name, "err", err)
-				}
-			}
-		}
+		// Super-user sudo grants are reconciled separately by
+		// reconcileSudoers so that a class DOWNGRADE or full user removal
+		// REVOKES the stale NOPASSWD grant. reconcileSudoers must run even
+		// when this per-user loop is skipped (Login nil / no users), which
+		// is exactly the "user removed from config" case (#3889).
 
 		// Set SSH authorized keys
 		if len(user.SSHKeys) > 0 {
@@ -848,6 +838,119 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			}
 		}
 	}
+}
+
+// sudoersDir is the directory that holds xpf-managed NOPASSWD sudo grants
+// for super-user login accounts. Overridable in tests so the reconcile can
+// run against a throwaway directory instead of the real /etc/sudoers.d.
+var sudoersDir = "/etc/sudoers.d"
+
+// sudoersPrefix namespaces every xpf-managed sudoers drop-in. Only files
+// with this prefix are ever written, kept, or removed by reconcileSudoers —
+// operator-authored files in the same directory are left untouched.
+const sudoersPrefix = "xpf-"
+
+// validateSudoersFile checks a generated sudoers drop-in with `visudo -cf`
+// so a malformed grant can never lock out sudo (a single broken drop-in
+// makes sudo refuse to run at all). It is a package var so tests can stub
+// it. The default is best-effort: it only validates when the process is
+// root (the daemon is; unit tests are not) and when visudo is installed —
+// otherwise it returns nil and the atomic durable write is relied on as
+// the write safety (the file content is a fixed, config-validated template).
+var validateSudoersFile = defaultValidateSudoersFile
+
+func defaultValidateSudoersFile(path string) error {
+	// visudo enforces root-ownership + 0440 on drop-ins, so the check is
+	// only meaningful when we actually run as root. Skip otherwise to keep
+	// non-root unit tests deterministic and hermetic.
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	if _, err := exec.LookPath("visudo"); err != nil {
+		return nil // best-effort: visudo not present
+	}
+	if out, err := runCommandTimeout("visudo", "-cf", path); err != nil {
+		return fmt.Errorf("visudo -cf %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// reconcileSudoers makes /etc/sudoers.d match the CURRENT config's
+// super-user set on every apply. It (a) writes a NOPASSWD grant
+// xpf-<user> for each current super-user login account and (b) REVOKES
+// any xpf-<user> drop-in whose user is no longer a super-user (class
+// DOWNGRADE) or no longer present in the config (user REMOVAL). Without
+// this sweep a demoted or deleted admin kept passwordless root sudo
+// forever (#3889) — the original write-only path had no revocation branch.
+//
+// It mirrors the networkd/rsyslog stale-file reconcilers: build the desired
+// set, sweep the managed namespace, remove what is not desired. Only
+// sudoersPrefix files are touched. It MUST be called on every apply,
+// independent of applySystemLogin's early return, so the "all users
+// removed" case still revokes stale grants.
+func (d *Daemon) reconcileSudoers(cfg *config.Config) {
+	// Desired: an xpf-<user> drop-in for each current super-user account.
+	desired := make(map[string]struct{})
+	if cfg.System.Login != nil {
+		for _, user := range cfg.System.Login.Users {
+			if user.Name == "" || user.Name == "root" {
+				continue // never grant/modify root via config
+			}
+			if user.Class != "super-user" {
+				continue
+			}
+			desired[sudoersPrefix+user.Name] = struct{}{}
+			if err := writeSudoersGrant(user.Name); err != nil {
+				slog.Warn("failed to write sudoers file",
+					"user", user.Name, "err", err)
+			}
+		}
+	}
+
+	// Revoke: remove any xpf-managed drop-in that is no longer desired.
+	entries, _ := os.ReadDir(sudoersDir)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, sudoersPrefix) {
+			continue // leave non-xpf sudoers.d files (and subdirs) alone
+		}
+		if _, keep := desired[name]; keep {
+			continue
+		}
+		path := filepath.Join(sudoersDir, name)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to revoke stale sudoers grant",
+				"file", name, "err", err)
+		} else if err == nil {
+			slog.Info("revoked stale super-user sudo grant", "file", name)
+		}
+	}
+}
+
+// writeSudoersGrant writes (idempotently) the NOPASSWD grant for one
+// super-user. The write is durable because a torn or lost sudoers file is
+// a management-access (sudo) hazard that must survive a power cut. The
+// generated file is validated with visudo; if validation fails the file is
+// removed rather than left as a lockout landmine (a broken drop-in breaks
+// ALL sudo invocations).
+func writeSudoersGrant(user string) error {
+	path := filepath.Join(sudoersDir, sudoersPrefix+user)
+	line := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", user)
+	if current, _ := os.ReadFile(path); string(current) == line {
+		return nil // idempotent: already correct
+	}
+	// DurableState: a torn or lost sudoers file is a management-access
+	// (sudo) hazard, so it must survive a power cut.
+	if err := fsatomic.WriteFileDurable(path, []byte(line), 0440); err != nil {
+		return err
+	}
+	if err := validateSudoersFile(path); err != nil {
+		// Fail closed toward availability of sudo itself: never leave an
+		// invalid drop-in that would break every sudo invocation.
+		os.Remove(path)
+		return fmt.Errorf("generated sudoers grant rejected: %w", err)
+	}
+	return nil
 }
 
 // reconcileUserPassword applies, leaves, or locks a login user's OS
