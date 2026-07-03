@@ -104,10 +104,16 @@ pub(crate) struct WgCounters {
     /// `EncapError::NoSession` from the no-current-session arm ONLY.
     pub(crate) encap_drops_no_session: AtomicU64,
     /// `EncapError::NoSession` from the `is_confirmed()` gate arm —
-    /// the responder key-confirmation window. Distinguishable so an
-    /// operator does not tcpdump a transient rekey blip (#1736 AGY
-    /// r2). Counter-only split: the returned error stays `NoSession`
-    /// and every caller contract is untouched.
+    /// egress was asked to encrypt on an UNCONFIRMED `current` session.
+    /// Distinguishable so an operator does not tcpdump a transient rekey
+    /// blip (#1736 AGY r2). Counter-only split: the returned error stays
+    /// `NoSession` and every caller contract is untouched. After the
+    /// #3882 3-slot keypair fix an unconfirmed responder keypair lives
+    /// in `next`, never `current`, so the natural responder-rekey path
+    /// no longer reaches this gate (it reports `encap_drops_no_session`
+    /// while the confirmed `current` keeps serving egress); the gate
+    /// remains as a defense-in-depth invariant that egress never uses an
+    /// unconfirmed session.
     pub(crate) encap_drops_unconfirmed: AtomicU64,
     pub(crate) encap_drops_rekey_required: AtomicU64,
     /// UnknownPeer | CryptoFailed | BufferTooSmall — all
@@ -134,7 +140,7 @@ pub(crate) struct WgCounters {
     /// (drop-only; never arms the rekey edge — Codex r1 M4).
     pub(crate) decap_drops_expired: AtomicU64,
     /// Sessions torn down by the control thread's `expire_sessions`
-    /// pass (current + previous slots).
+    /// pass (current + previous + next slots, #3882).
     pub(crate) sessions_expired: AtomicU64,
     /// Timer-driven handshake initiations by reason: `age` = the rekey
     /// edge (T1 send-age / T2 receive-horizon / send-side T3),
