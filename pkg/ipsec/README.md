@@ -299,6 +299,27 @@ all files stay in `package ipsec`, so the public API is unchanged.
   ESP render was valid — the canonicalization just makes the ICV
   explicit in the generated config. Already-suffixed forms (e.g.
   `aes256gcm128`) pass through unchanged.
+- **ESP/IKE integrity-token mapping (#3851).** `normalizeAuthAlg`
+  (`ike.go`) maps a Junos `authentication-algorithm` name to the
+  strongSwan integrity keyword charon actually accepts. Junos names an
+  ESP integrity algorithm with an explicit HMAC truncation length
+  (`hmac-sha-256-128`, `hmac-sha1-96`, `hmac-md5-96`,
+  `hmac-sha-384-192`, `hmac-sha-512-256`), but strongSwan's proposal
+  keyword table names the BASE algorithm only (`sha256`, `sha1`, `md5`,
+  `sha384`, `sha512`) and derives the RFC-mandated truncation
+  internally. The truncation suffix must be MAPPED away, not
+  dash-stripped: the old normalizer did `ReplaceAll(name, "-", "")`, so
+  `hmac-sha-256-128` rendered as `sha256128` and `hmac-sha1-96` as
+  `sha196` — neither is a token in
+  `proposal_keywords_static.txt`, so charon rejected the ENTIRE ESP
+  proposal and the tunnel silently never loaded. The current mapping
+  collapses the name (drop `hmac-`, drop dashes) then matches the base
+  SHA/MD5 family, so every Junos spelling — the ESP truncated forms, the
+  IKE short forms (`sha-256`, `sha1`, `md5`), and already-normalized
+  swanctl tokens (idempotent) — yields a valid keyword. AEAD (GCM)
+  proposals never reach this function: the builders take the `gcmPRF`
+  branch for AEAD ciphers (GCM carries its own ICV, no separate
+  integrity algorithm), so this fix does not touch the GCM path.
 - **swanctl double-quote / backslash escaping (#2126).** Free-text
   values interpolated inside a swanctl double-quoted string — the PSK
   `secret = "..."` and the `id = "..."` / `certs = "..."` lines — are

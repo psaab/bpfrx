@@ -41,7 +41,7 @@ func TestPhase2DHGroupParseRenderRoundTrip(t *testing.T) {
 		t.Fatalf("parsed DHGroup = %d, want 14 (group14 must not be dropped)", prop.DHGroup)
 	}
 	got := buildESPProposal(prop, 0)
-	const want = "aes256-sha256128-modp2048"
+	const want = "aes256-sha256-modp2048"
 	if got != want {
 		t.Errorf("rendered ESP proposal = %q, want %q", got, want)
 	}

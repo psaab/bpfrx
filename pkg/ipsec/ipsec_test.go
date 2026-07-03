@@ -70,7 +70,7 @@ func TestGenerateConfig_WithProposal(t *testing.T) {
 		},
 	}
 	got := m.generateConfig(cfg)
-	if !strings.Contains(got, "esp_proposals = aes256-sha256128-modp2048") {
+	if !strings.Contains(got, "esp_proposals = aes256-sha256-modp2048") {
 		t.Errorf("unexpected esp_proposals in: %s", got)
 	}
 }
@@ -94,8 +94,10 @@ func TestGenerateConfig_GCMNoAuth(t *testing.T) {
 		},
 	}
 	got := m.generateConfig(cfg)
-	// GCM mode should skip auth algorithm
-	if strings.Contains(got, "sha256128-modp2048") {
+	// GCM mode should skip auth algorithm — no integrity token is emitted
+	// for an AEAD cipher (the caller takes the gcmPRF branch, not
+	// normalizeAuthAlg), so the strongSwan integrity keyword must be absent.
+	if strings.Contains(got, "sha256-modp2048") {
 		t.Errorf("GCM should not include auth alg: %s", got)
 	}
 	if !strings.Contains(got, "esp_proposals = aes256gcm128-modp2048") {
@@ -155,7 +157,7 @@ func TestBuildESPProposal(t *testing.T) {
 		{
 			"aes-sha256-dh14",
 			&config.IPsecProposal{EncryptionAlg: "aes256-cbc", AuthAlg: "hmac-sha256-128", DHGroup: 14},
-			"aes256-sha256128-modp2048",
+			"aes256-sha256-modp2048",
 		},
 		{
 			"defaults",
@@ -187,8 +189,8 @@ func TestBuildESPProposal_PFSOverride(t *testing.T) {
 		DHGroup:       2,
 	}
 	got := buildESPProposal(prop, 14)
-	if got != "aes256-sha256128-modp2048" {
-		t.Fatalf("buildESPProposal() with PFS override = %q, want aes256-sha256128-modp2048", got)
+	if got != "aes256-sha256-modp2048" {
+		t.Fatalf("buildESPProposal() with PFS override = %q, want aes256-sha256-modp2048", got)
 	}
 }
 
@@ -378,11 +380,11 @@ func TestGenerateConfig_GatewayReference(t *testing.T) {
 		t.Errorf("gateway local address not resolved: %s", got)
 	}
 	// Should have IKE proposals from gateway's ike-policy
-	if !strings.Contains(got, "proposals = aes256-sha256128-modp2048") {
+	if !strings.Contains(got, "proposals = aes256-sha256-modp2048") {
 		t.Errorf("IKE proposals not generated: %s", got)
 	}
 	// Should have ESP proposals from VPN's ipsec-policy
-	if !strings.Contains(got, "esp_proposals = aes256-sha256128-modp2048") {
+	if !strings.Contains(got, "esp_proposals = aes256-sha256-modp2048") {
 		t.Errorf("ESP proposals not generated: %s", got)
 	}
 }
@@ -419,7 +421,7 @@ func TestBuildIKEProposal(t *testing.T) {
 		{
 			"aes-sha256-dh14",
 			&config.IPsecProposal{EncryptionAlg: "aes256-cbc", AuthAlg: "hmac-sha256-128", DHGroup: 14},
-			"aes256-sha256128-modp2048",
+			"aes256-sha256-modp2048",
 		},
 		{
 			"defaults",
@@ -539,7 +541,7 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 		{"local identity", `id = "@vpn.example.com"`},
 		{"remote identity", `id = "203.0.113.1"`},
 		{"IKE proposal", "proposals = aes256-sha256-modp2048"},
-		{"ESP proposal", "esp_proposals = aes256-sha256128-modp2048"},
+		{"ESP proposal", "esp_proposals = aes256-sha256-modp2048"},
 		{"copy DF", "copy_df = yes"},
 		{"start action", "start_action = start"},
 		{"DPD action", "dpd_action = restart"},

@@ -28132,3 +28132,40 @@ top.
   removeMultiLeafMembers helper), pkg/config/delete_multi_leaf_member_3846_test.go
   (new RED-on-revert tests), docs/config-schema.md (delete-side member-delete
   contract note)
+
+## 2026-07-03 — #3851 ipsec normalizeAuthAlg strongSwan integrity-token mapping
+- **Timestamp**: 2026-07-03
+- **Action**: Fix `normalizeAuthAlg` (pkg/ipsec/ike.go) so a canonical Junos
+  ESP auth-algorithm name maps to a strongSwan-VALID integrity keyword instead
+  of a dash-stripped token charon rejects. The old body did
+  `ReplaceAll(name,"hmac-","")` + `ReplaceAll(name,"-","")`, so
+  `hmac-sha-256-128` -> `sha256128` and `hmac-sha1-96` -> `sha196`; neither is
+  in strongSwan's proposal_keywords_static.txt, so charon rejected the whole
+  ESP proposal and the tunnel silently never loaded (HIGH, fable-161 F-017).
+  New impl collapses the name (drop hmac-, drop dashes, lowercase) then matches
+  the base SHA/MD5 family (sha512/sha384/sha256/sha224/sha1/md5), covering the
+  Junos truncation-length suffixes (-128/-192/-256/-96), the IKE short forms
+  (sha-256/sha1/md5), and already-normalized swanctl tokens (idempotent).
+  Unknown names fall through to the collapsed token (historical behaviour).
+  AES-GCM path unaffected (callers take the gcmPRF branch for AEAD).
+- **Tests corrected (they PINNED the broken form)**: the assertion strings
+  `aes256-sha256128-modp2048` -> `aes256-sha256-modp2048` in ipsec_test.go
+  (TestGenerateConfig_WithProposal, TestBuildESPProposal, _PFSOverride,
+  TestGenerateConfig_GatewayReference, TestBuildIKEProposal,
+  TestGenerateConfig_IKEChain), dhgroup_roundtrip_test.go
+  (TestPhase2DHGroupParseRenderRoundTrip), swanctl_render_test.go
+  (TestBuildESPProposal_JunosGCMSuffix / _JunosGCMSuffixAndPRF non-gcm cases);
+  the GCM negative assertion in TestGenerateConfig_GCMNoAuth updated
+  `sha256128-modp2048` -> `sha256-modp2048`. Added
+  TestNormalizeAuthAlg_JunosToStrongSwan (full Junos->keyword table + asserts
+  each output is in the strongSwan integrity keyword set) and
+  TestBuildProposals_IntegTokenStrongSwanValid (assembled ESP/IKE proposal
+  string carries a strongSwan-valid integrity token).
+- **RED-on-revert proven**: reverting normalizeAuthAlg to the naive
+  dash-strip fails TestNormalizeAuthAlg_JunosToStrongSwan (returns "sha256128")
+  plus the 8 corrected pin tests. go test -count=1 ./pkg/ipsec/... green;
+  go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/ipsec/ike.go (normalizeAuthAlg rewrite + resolveESPSettings
+  comment), pkg/ipsec/ipsec_test.go, pkg/ipsec/dhgroup_roundtrip_test.go,
+  pkg/ipsec/swanctl_render_test.go (corrected pins + new tests),
+  pkg/ipsec/README.md (#3851 integrity-token mapping bullet)
