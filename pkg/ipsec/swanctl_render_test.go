@@ -58,10 +58,12 @@ func TestBuildESPProposal_JunosGCMSuffix(t *testing.T) {
 			"aes256gcm128-modp2048",
 		},
 		{
-			// Non-GCM CBC path stays byte-identical to the old behavior.
-			"non-gcm cbc unchanged",
+			// Non-GCM CBC path: the Junos truncation suffix (-128) maps to
+			// the strongSwan base integrity keyword sha256, NOT the invalid
+			// dash-stripped "sha256128" (#3851).
+			"non-gcm cbc integ",
 			&config.IPsecProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "hmac-sha256-128", DHGroup: 14},
-			"aes256-sha256128-modp2048",
+			"aes256-sha256-modp2048",
 		},
 	}
 	for _, tt := range tests {
@@ -101,7 +103,7 @@ func TestBuildIKEProposal_JunosGCMSuffixAndPRF(t *testing.T) {
 		{
 			"non-gcm cbc unchanged",
 			&config.IPsecProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "hmac-sha256-128", DHGroup: 14},
-			"aes256-sha256128-modp2048",
+			"aes256-sha256-modp2048",
 		},
 	}
 	for _, tt := range tests {
@@ -481,5 +483,107 @@ func assertBalancedSecretQuotes(t *testing.T, cfg string) {
 		case term != len(val)-1:
 			t.Errorf("secret value terminates before end of line (unescaped interior quote): %q", val)
 		}
+	}
+}
+
+// strongSwanIntegKeywords is the set of integrity-algorithm proposal
+// keywords that strongSwan/charon actually accepts (the short spellings
+// from src/libstrongswan/crypto/proposal/proposal_keywords_static.txt).
+// A token outside this set makes charon reject the WHOLE proposal, so the
+// tunnel silently never loads — the #3851 failure mode.
+var strongSwanIntegKeywords = map[string]bool{
+	"md5":    true,
+	"sha1":   true,
+	"sha224": true,
+	"sha256": true,
+	"sha384": true,
+	"sha512": true,
+}
+
+// TestNormalizeAuthAlg_JunosToStrongSwan is the #3851 regression: every
+// canonical Junos authentication-algorithm spelling — including the
+// explicit HMAC truncation-length suffix Junos uses for ESP
+// (hmac-sha-256-128, hmac-sha1-96, ...) — must map to a strongSwan-VALID
+// base integrity keyword. The pre-fix normalizer dash-stripped the name
+// and produced "sha256128"/"sha196"/"md596", which are NOT strongSwan
+// keywords, so charon rejected the ESP proposal and the tunnel never
+// loaded. This table pins the VALID output; it goes RED on revert (the
+// old code returns the invalid dash-stripped token, which is not in
+// strongSwanIntegKeywords).
+func TestNormalizeAuthAlg_JunosToStrongSwan(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		// Junos ESP spellings with explicit truncation length.
+		{"hmac-sha-256-128", "sha256"},
+		{"hmac-sha256-128", "sha256"},
+		{"hmac-sha-384-192", "sha384"},
+		{"hmac-sha-512-256", "sha512"},
+		{"hmac-sha1-96", "sha1"},
+		{"hmac-sha-1-96", "sha1"},
+		{"hmac-md5-96", "md5"},
+		// Junos ESP spellings without a truncation suffix.
+		{"hmac-sha-256", "sha256"},
+		{"hmac-sha-384", "sha384"},
+		{"hmac-sha-512", "sha512"},
+		{"hmac-sha1", "sha1"},
+		{"hmac-md5", "md5"},
+		// Junos IKE (Phase 1) short spellings.
+		{"sha-256", "sha256"},
+		{"sha-384", "sha384"},
+		{"sha-512", "sha512"},
+		{"sha1", "sha1"},
+		{"sha-1", "sha1"},
+		{"md5", "md5"},
+		// Already-normalized swanctl tokens are idempotent.
+		{"sha256", "sha256"},
+		{"sha384", "sha384"},
+		{"sha512", "sha512"},
+		// Case-insensitive.
+		{"HMAC-SHA-256-128", "sha256"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got := normalizeAuthAlg(tt.in)
+			if got != tt.want {
+				t.Fatalf("normalizeAuthAlg(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if !strongSwanIntegKeywords[got] {
+				t.Fatalf("normalizeAuthAlg(%q) = %q, which is NOT a strongSwan integrity keyword (charon would reject the whole proposal)", tt.in, got)
+			}
+		})
+	}
+}
+
+// TestBuildProposals_IntegTokenStrongSwanValid asserts that the assembled
+// ESP and IKE proposal STRINGS carry a strongSwan-valid integrity token
+// for the canonical Junos ESP auth-algorithm name that shipped broken.
+// The whole proposal string must parse: aes256-sha256-modp2048, not
+// aes256-sha256128-modp2048 (which charon rejects wholesale).
+func TestBuildProposals_IntegTokenStrongSwanValid(t *testing.T) {
+	espProp := &config.IPsecProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "hmac-sha-256-128", DHGroup: 14}
+	if got, want := buildESPProposal(espProp, 0), "aes256-sha256-modp2048"; got != want {
+		t.Fatalf("buildESPProposal() = %q, want %q", got, want)
+	}
+	assertProposalIntegValid(t, buildESPProposal(espProp, 0))
+
+	ikeProp := &config.IKEProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: 14}
+	if got, want := buildIKEProposalFromIKE(ikeProp), "aes256-sha256-modp2048"; got != want {
+		t.Fatalf("buildIKEProposalFromIKE() = %q, want %q", got, want)
+	}
+	assertProposalIntegValid(t, buildIKEProposalFromIKE(ikeProp))
+}
+
+// assertProposalIntegValid checks that a rendered non-AEAD proposal of the
+// form <enc>-<integ>-<dh> carries an integrity token strongSwan accepts.
+func assertProposalIntegValid(t *testing.T, proposal string) {
+	t.Helper()
+	parts := strings.Split(proposal, "-")
+	if len(parts) != 3 {
+		t.Fatalf("proposal %q not in <enc>-<integ>-<dh> form", proposal)
+	}
+	if integ := parts[1]; !strongSwanIntegKeywords[integ] {
+		t.Fatalf("proposal %q carries integrity token %q that strongSwan does not accept — charon would reject the whole proposal", proposal, integ)
 	}
 }
