@@ -955,6 +955,19 @@ reserved for whole-dataplane selection where a rewrite shim
   listen port; the pubkey is the instance identity (modeled on
   `vrrp-group <id>`, dual-AST via `namedInstances`). A commit-time gate
   (`validateWireguardPeersStrict`, `compiler_validate_wireguard.go`)
+  hard-rejects a WG tunnel with a missing/invalid LOCAL identity (#3863)
+  — a `listen-port` not in `[1,65535]` (the Rust `hydrate_wg_identity`
+  drops a row whose `wg_listen_port` is 0, and `parseTunnelWireguard`
+  collapses a missing/0/out-of-range listen-port to 0), or a
+  `private-key` that is not exactly 64 hex chars / 32-byte X25519 (the
+  Rust `decode_wg_key_hex` drops a row whose private key does not
+  decode). Without this gate a bad local identity COMMITTED CLEAN and the
+  dataplane then silently dropped the WHOLE tunnel row — a permanent VPN
+  outage with no diagnostic. The listen-port VALUE bound is also enforced
+  at the schema layer (`ValidateInteger(1,65535)`), but that runs only on
+  the author path and cannot see a MISSING leaf; the private-key has NO
+  schema value validator, so the compiler gate is the universal chokepoint
+  every compile/load/HA-sync path funnels through. The gate also
   hard-rejects a WG tunnel with zero peers, a duplicate or malformed
   (non-64-hex) peer pubkey, a malformed preshared-key,
   endpoint-bearing peers that disagree on outer transport family (one
