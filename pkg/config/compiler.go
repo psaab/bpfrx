@@ -3733,10 +3733,12 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, nptv6Warnings...)
 
-	// #1434 multi-peer WireGuard: per-peer commit gate. Strict (commit /
-	// commit-check): hard-reject a WG tunnel with zero peers, a duplicate
-	// or malformed (non-64-hex) peer pubkey, a malformed PSK, or
-	// endpoint-bearing peers that disagree on outer transport family.
+	// #1434 multi-peer WireGuard: per-tunnel commit gate. Strict (commit /
+	// commit-check): hard-reject a WG tunnel with a missing/invalid
+	// local identity (listen-port not in [1,65535] or a private-key that
+	// is not 64 hex chars, #3863), zero peers, a duplicate or malformed
+	// (non-64-hex) peer pubkey, a malformed PSK, or endpoint-bearing
+	// peers that disagree on outer transport family.
 	// Lenient (load / peer-sync): warn so an already-persisted or
 	// peer-synced config still boots — the Rust hydrate path drops a row
 	// with a malformed key independently and the engine reconcile is

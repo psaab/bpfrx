@@ -117,10 +117,14 @@ func TestTunnelEndpointIDNoFalsePositiveOnNonEmittedWGUnit(t *testing.T) {
 	}
 	tree := buildTree(t, []string{
 		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set interfaces wg0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg0 unit 0 family inet address 10.70.0.1/30",
 		"set interfaces wg0 unit 1 family inet address 10.70.0.5/30",
 		"set interfaces wg341 tunnel mode wireguard",
+		"set interfaces wg341 tunnel wireguard listen-port 51820",
+		"set interfaces wg341 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set interfaces wg341 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	cfg, err := CompileConfig(tree)
@@ -221,6 +225,8 @@ func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
 		"set interfaces wg1408 unit 00 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg1408 unit 0 family inet address 10.70.3.1/30",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard listen-port 51820",
+		"set interfaces wg78 unit 0 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfig(tree); err != nil {
@@ -261,6 +267,8 @@ func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
 func TestTunnelEndpointIDNoFalsePositive(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set interfaces wg0 unit 0 tunnel mode wireguard",
+		"set interfaces wg0 unit 0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 unit 0 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set interfaces wg0 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set groups node0 interfaces gr-0/0/0 unit 0 tunnel mode gre",
 		"set groups node0 interfaces gr-0/0/0 unit 0 tunnel source 10.0.0.1",
@@ -411,6 +419,8 @@ func TestTunnelEndpointIDDefectBIncompleteGREStillRejects(t *testing.T) {
 func TestTunnelEndpointIDWildcardApplyGroupsSingleInterfaceClean(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set groups wgtun interfaces <*> unit 0 tunnel wireguard listen-port 51820",
+		"set groups wgtun interfaces <*> unit 0 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set groups wgtun interfaces <*> unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 apply-groups wgtun",
 	})
@@ -434,6 +444,8 @@ func TestTunnelEndpointIDWildcardApplyGroupsSingleInterfaceClean(t *testing.T) {
 func TestTunnelEndpointIDNonFatalUndefinedPeerGroup(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups node0 interfaces wg0 unit 0 tunnel mode wireguard",
+		"set groups node0 interfaces wg0 unit 0 tunnel wireguard listen-port 51820",
+		"set groups node0 interfaces wg0 unit 0 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set groups node0 interfaces wg0 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		`set apply-groups "${node}"`,
 	})

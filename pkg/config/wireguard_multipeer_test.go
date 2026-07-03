@@ -36,6 +36,7 @@ func compileSet(t *testing.T, cmds []string) (*Config, error) {
 func TestWireguardAllowedIPsBracketListFlatSet(t *testing.T) {
 	cfg, err := compileSet(t, []string{
 		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
 		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
 		"set interfaces wg0 tunnel wireguard peer " + wgKeyB +
 			" allowed-ips [ 10.1.0.0/16 10.2.0.0/16 ]",
@@ -61,6 +62,7 @@ func TestWireguardAllowedIPsBracketListHierarchical(t *testing.T) {
         tunnel {
             mode wireguard;
             wireguard {
+                listen-port 51820;
                 private-key ` + wgKeyA + `;
                 peer ` + wgKeyB + ` {
                     allowed-ips [ 10.1.0.0/16 10.2.0.0/16 ];
@@ -336,6 +338,119 @@ func TestWireguardZeroPeerRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no peer") {
 		t.Errorf("error = %q, want no-peer message", err)
+	}
+}
+
+// #3863 local-identity commit gate. A WireGuard tunnel whose LOCAL
+// identity (listen-port / private-key) does not parse is dropped WHOLE
+// by the Rust hydrate_wg_identity
+// (userspace-dp/src/afxdp/forwarding_build/tunnels.rs) — a silent,
+// permanent VPN outage with no diagnostic. The tests below are
+// fail-on-revert guards: each invalid config commits CLEAN via
+// CompileConfig before the compiler_validate_wireguard.go local-identity
+// gate (the schema listen-port value-bound is author-path-only and never
+// runs here; private-key has NO schema value validator at all), then the
+// dataplane silently drops the row. The gate must REJECT them at commit
+// so the commit-accept set never exceeds the runtime-hydrate set.
+
+// Positive control: a valid local identity + one peer compiles. Proves
+// the gate does not over-reject a well-formed tunnel.
+func TestWireguardValidLocalIdentityCompiles(t *testing.T) {
+	cfg, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.0.0.0/24",
+	})
+	if err != nil {
+		t.Fatalf("valid WG local identity must compile: %v", err)
+	}
+	if tc := wgTunnel(t, cfg, "wg0"); tc.WgListenPort != 51820 {
+		t.Errorf("WgListenPort = %d, want 51820", tc.WgListenPort)
+	}
+}
+
+// listen-port 0 reaches the compiler as WgListenPort==0. The Rust hydrate
+// drops a row whose wg_listen_port is 0, so the compiler must reject it.
+func TestWireguardListenPortZeroRejected(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 0",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.0.0.0/24",
+	})
+	if err == nil {
+		t.Fatal("listen-port 0 must be a commit error (dataplane drops a port-0 WG row)")
+	}
+	if !strings.Contains(err.Error(), "listen-port") {
+		t.Errorf("error = %q, want listen-port message", err)
+	}
+}
+
+// listen-port out of [1,65535] is silently collapsed to WgListenPort==0
+// by parseTunnelWireguard, so the compiler must reject it rather than
+// commit a dead tunnel.
+func TestWireguardListenPortOutOfRangeRejected(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 99999",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.0.0.0/24",
+	})
+	if err == nil {
+		t.Fatal("listen-port 99999 must be a commit error (out of [1,65535])")
+	}
+	if !strings.Contains(err.Error(), "listen-port") {
+		t.Errorf("error = %q, want listen-port message", err)
+	}
+}
+
+// A WG tunnel with NO listen-port has WgListenPort==0 and is dropped at
+// runtime — the compiler must reject the missing leaf (fail-closed).
+func TestWireguardMissingListenPortRejected(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.0.0.0/24",
+	})
+	if err == nil {
+		t.Fatal("missing listen-port must be a commit error")
+	}
+	if !strings.Contains(err.Error(), "listen-port") {
+		t.Errorf("error = %q, want listen-port message", err)
+	}
+}
+
+// A malformed / short private-key does not decode to 32 bytes; the Rust
+// decode_wg_key_hex rejects it and drops the row. The private-key has NO
+// schema value validator, so the compiler is the ONLY gate.
+func TestWireguardMalformedPrivateKeyRejected(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key deadbeef",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.0.0.0/24",
+	})
+	if err == nil {
+		t.Fatal("malformed private-key must be a commit error")
+	}
+	if !strings.Contains(err.Error(), "private-key") {
+		t.Errorf("error = %q, want private-key message", err)
+	}
+}
+
+// A WG tunnel with NO private-key cannot do crypto; hydrate drops it.
+func TestWireguardMissingPrivateKeyRejected(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.0.0.0/24",
+	})
+	if err == nil {
+		t.Fatal("missing private-key must be a commit error")
+	}
+	if !strings.Contains(err.Error(), "private-key") {
+		t.Errorf("error = %q, want private-key message", err)
 	}
 }
 
