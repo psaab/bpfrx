@@ -925,6 +925,31 @@ so an already-persisted or older-peer-synced config still boots (#1960 no-brick
 doctrine). Distinct from #3339 (implicit-set vs explicit-set collision / duplicate
 term NAMES), #3352 (unknown leaves inside a term), and #3320 (malformed timeout).
 
+**Unknown application-set member keyword rejected (#3890 — fable-review-161
+F-160):** an `applications application-set <name>` member is `application
+<name>`, `application-set <name>` (nested), or `description <text>` (metadata).
+The schema declares `application-set` as an opaque `args:1` leaf (`children:
+nil`), so the `SchemaValidate` walk never reaches its members. Before this fix
+`compileApplications`' member switch had NO default arm, so a TYPO'd member
+keyword (e.g. `applicaton foo` for `application foo`, or a mistyped
+`application-set`) was SILENTLY DROPPED — the set was under-populated with no
+commit error. If that set was referenced by a DENY policy the deny then matched
+FEWER applications than the operator intended, permitting traffic meant to be
+blocked (a fail-OPEN under-match; for a permit policy it is the fail-closed
+inverse). `compileApplications` now records the offending keyword on
+`ApplicationSet.UnknownMembers` (a `description` is accepted-and-ignored, the
+documented way to author an otherwise-empty set), and
+`validateApplicationSyntaxStrict` (`compiler_validate_strict.go`) hard-rejects
+the first one at commit — the same all-user-sets, referenced-or-not scope and
+strict-reject / lenient-warn discipline as the #3352 opaque-`term` unknown-leaf
+gate it mirrors. The tolerant load/peer-sync path downgrades the reject to a
+warning (`lenientApplicationSpecs`) so an already-persisted or older-peer-synced
+config still boots (#1960 no-brick doctrine). Implicit application-sets
+synthesized for term-bearing applications never carry `UnknownMembers`, so they
+are unaffected. Distinct from #2068 (a dropped NESTED-set member — a valid
+keyword the old switch already handled) and the #3144/#3146/#3434 empty-set gate
+(a set that resolves by name but expands to zero members).
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

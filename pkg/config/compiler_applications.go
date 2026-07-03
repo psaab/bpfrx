@@ -186,6 +186,28 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				if v != "" {
 					as.Applications = append(as.Applications, v)
 				}
+			case "description":
+				// Junos allows a `description` statement on an application-set
+				// (metadata, not a member reference). Accept it without adding a
+				// member and without flagging it below — a `description` is the
+				// documented way to author an otherwise-empty set (the #3144/#3434
+				// empty-set gate then rejects it only when it is REFERENCED).
+			default:
+				// #3890: an unrecognized member statement inside the opaque
+				// application-set body. The schema declares `application-set` as
+				// an args:1 leaf (children:nil), so the SchemaValidate walk never
+				// reaches its members; without this default arm a typo'd member
+				// keyword (e.g. `applicaton foo` for `application foo`, or a
+				// mistyped `application-set`) was SILENTLY DROPPED — the set was
+				// under-populated, and if it was referenced by a DENY policy the
+				// deny matched FEWER applications than intended (a fail-open
+				// under-match). Mirroring UnknownTermLeaves (#3352), record the
+				// offending keyword so validateApplicationSyntaxStrict rejects the
+				// first one at commit (lenient-warn on the tolerant load / peer-sync
+				// path) instead of compiling an under-populated set.
+				if kw := member.Name(); kw != "" {
+					as.UnknownMembers = append(as.UnknownMembers, kw)
+				}
 			}
 		}
 

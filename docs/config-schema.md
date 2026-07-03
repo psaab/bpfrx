@@ -3272,7 +3272,16 @@ strict-vs-lenient gates:
   multi-term user applications are skipped (their members are
   compiler-synthesized, not operator references). Pre-fix a policy matching the
   set silently failed to match the intended traffic (the unresolved member never
-  matches — an effective no-op term).
+  matches — an effective no-op term). **Sibling gate (#3890, fable-review-161
+  F-160):** Finding B checks a member's NAME resolves; a mistyped member KEYWORD
+  (`applicaton foo` instead of `application foo`, or a bad `application-set`) is a
+  distinct failure — the token never becomes a reference at all, it is silently
+  dropped and the set is UNDER-POPULATED (a fail-open under-match for a deny
+  policy referencing it). `compileApplications` records the bad keyword on
+  `ApplicationSet.UnknownMembers` and `validateApplicationSyntaxStrict` rejects it
+  (a `description` is accepted as metadata); it runs EARLIER than Finding B, so a
+  typo'd keyword is reported as "unknown member statement" rather than a dangling
+  reference. Same strict-reject / lenient-warn discipline (`lenientApplicationSpecs`).
 - **Finding C — `then routing-instance <name>` (FBF) →
   `validateFirewallRoutingInstanceReferencesStrict`.** A firewall-filter term
   whose filter-based-forwarding steer names a routing-instance not defined under
