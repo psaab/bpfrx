@@ -1,3 +1,55 @@
+## 2026-07-03 — #3876: rib-group interface-route import was a no-op (shadowed by default route) — per-prefix leak before main
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-016 (HIGH, advertised feature no-op). The
+    rib-group `interface-routes` import installed `ip rule from all lookup
+    <sourceTable> pref 33000`, which sat AFTER main (32766) so any main-table
+    default route shadowed it (silent no-op in every real deployment) AND leaked
+    the WHOLE source table (over-broad vs Junos, which leaks only connected
+    routes). The Dst-less rule was also skipped by the userspace snapshot builder
+    → leak absent from BOTH FIBs. Implemented CONVERGED PLAN Option 2 (per-prefix
+    dst-rules), Phase 1 (import into main).
+  - **Fix**: Replaced the blanket rule with one `ip rule to <connected-prefix>
+    lookup <sourceTable> pref 30000` per connected prefix of the source
+    instance (band 30000-30999, BEFORE main + PBR). Specific imported prefixes
+    now win over the default route. The per-prefix rules carry a Dst, so the
+    existing userspace snapshot loop (routes.go, rule.Dst != nil → table→instance
+    NextTable) auto-captures them into inet.0 — the leak is now in both FIBs; the
+    Dst==nil skip is unchanged (a from-all rule can't be a per-prefix leak).
+    clear() now scans the new 30000-30999 window PLUS the legacy 33000-33099
+    blanket + 200-299 windows so an in-place upgrade removes the stale broken
+    blanket rule. Connected prefixes derived via new SSOT
+    `config.RibGroupConnectedPrefixes` / `config.ConnectedNetworkPrefix` (shared
+    with the userspace FIB connected-route builder), plumbed through
+    `ApplyRibGroupRules` from daemon_apply.go step 3c. Cap
+    `maxRibGroupLeakRules = 1000` with degraded-Apply error. Commit-time WARNs
+    (validateRibGroupLeakWarnings) fail-loud on the un-leakable residuals:
+    DHCP-only / unaddressed source (no enumerable static prefix) and VRF→VRF
+    import targets (Phase 2 deferral). Window warn updated to the per-prefix
+    budget. Route-copy (Option 1) + VRF→VRF install deferred (warned).
+  - **File(s)**: `pkg/routing/rules.go` (per-prefix Apply + ribGroupLeaksIntoMain
+    + splitConnectedPrefixesByFamily + clear() 3-window + constants),
+    `pkg/routing/routing.go` (ApplyRibGroupRules signature),
+    `pkg/config/types_routing.go` (ConnectedNetworkPrefix),
+    `pkg/config/compiler_routing.go` (RibGroupConnectedPrefixes + ribTargetKind),
+    `pkg/config/compiler_validate_warn.go` (validateRibGroupLeakWarnings +
+    per-prefix window warn), `pkg/dataplane/userspace/routes.go` (shared helper
+    + Dst==nil comment), `pkg/daemon/daemon_apply.go` (plumb prefixes),
+    `pkg/routing/rules_test.go`, `pkg/config/compiler_routing_rules_test.go`,
+    `pkg/config/ribgroup_leak_warn_3876_test.go`,
+    `pkg/dataplane/userspace/routes_ribgroup_leak_3876_test.go` (tests),
+    `docs/rib-group-route-leaking.md`, `docs/feature-coverage.md` (docs).
+  - **Validation**: `go build ./...`; `go test ./pkg/routing/... ./pkg/config/...
+    ./pkg/dataplane/... ./pkg/daemon/...` green; gofmt + vet clean. RED-on-revert
+    verified for all four legs: (a) moving the band to 33000 (after main) fails
+    the pref<32766 assertion; (b) Dst-bearing capture + Dst-less skip pinned in
+    userspace snapshot tests; (c) dropping the 33000 window from clear() leaves
+    the stale blanket rule; (d) neutering the warn drops the VRF→VRF /
+    no-enumerable-prefix diagnostics. Cluster forwarding smoke (iperf through a
+    leaked path with a default route present) NOT run — flagged for operator
+    validation; test-failover not required (routing/forwarding only, no
+    session-sync/VRRP path).
+
 ## 2026-07-03 — #3863: WireGuard tunnel local identity never validated at commit (HIGH silent VPN outage)
 
 - **Timestamp**: 2026-07-03

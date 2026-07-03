@@ -968,3 +968,92 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 		}
 	}
 }
+
+// mainRIBTableID is the Linux main routing table (RT_TABLE_MAIN). It mirrors
+// pkg/routing.mainTableID; the two MUST agree on which import-rib targets are
+// "main" so the commit-time warn and the runtime applier classify a rib-group
+// import the same way (#3876).
+const mainRIBTableID = 254
+
+// ribTargetKind classifies a rib-group import-rib name against a source
+// instance for the #3876 per-prefix leak. It mirrors pkg/routing.resolveRibTable
+// (via ribInstanceFromName, the shared exact-suffix matcher) and returns:
+//   - "main": the main table (inet.0 / inet6.0) — the Phase-1 leak target.
+//   - "self": the source instance's own rib (no leak needed).
+//   - "vrf":  another DEFINED instance's rib — a VRF→VRF import, deferred to
+//     Phase 2 (warned, not installed).
+//   - "unknown": an unresolvable name (the strict gate rejects it at commit;
+//     the applier skips it — #2226).
+func ribTargetKind(ribName, selfInstance string, definedInstances map[string]bool) string {
+	if ribName == "inet.0" || ribName == "inet6.0" {
+		return "main"
+	}
+	if instance, ok := ribInstanceFromName(ribName); ok {
+		if instance == selfInstance {
+			return "self"
+		}
+		if definedInstances[instance] {
+			return "vrf"
+		}
+	}
+	return "unknown"
+}
+
+// RibGroupConnectedPrefixes derives, per source routing instance carrying an
+// interface-routes rib-group, the connected network prefixes eligible for the
+// #3876 per-prefix leak. For each instance member interface (e.g.
+// "ge-0/0/1.0") it resolves the physical interface + unit and collects the
+// masked network prefix of every static address on that unit via
+// ConnectedNetworkPrefix — the SAME derivation the userspace FIB uses for
+// connected routes, so the leaked ip-rule set matches the connected routes in
+// the source table.
+//
+// DHCP-only units carry no static Addresses (the lease is learned at runtime)
+// and contribute no enumerable prefix; the commit-time warn
+// (validateRibGroupLeakWarnings) surfaces that so the leak is fail-loud rather
+// than a silent no-op. The map is keyed by routing-instance name with v4 and
+// v6 prefixes mixed (the applier splits by family). Shared by the daemon
+// applier input and the config warn path so the two never drift.
+func RibGroupConnectedPrefixes(cfg *Config) map[string][]string {
+	out := make(map[string][]string)
+	if cfg == nil {
+		return out
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.Name == "" {
+			continue
+		}
+		if ri.InterfaceRoutesRibGroup == "" && ri.InterfaceRoutesRibGroupV6 == "" {
+			continue
+		}
+		var prefixes []string
+		for _, member := range ri.Interfaces {
+			base, unitTok, hasUnit := strings.Cut(member, ".")
+			unitNum := 0
+			if hasUnit {
+				n, err := strconv.Atoi(unitTok)
+				if err != nil {
+					continue
+				}
+				unitNum = n
+			}
+			ifc := cfg.Interfaces.Interfaces[base]
+			if ifc == nil {
+				continue
+			}
+			unit := ifc.Units[unitNum]
+			if unit == nil {
+				continue
+			}
+			for _, addr := range unit.Addresses {
+				if prefix, _, ok := ConnectedNetworkPrefix(addr); ok {
+					prefixes = append(prefixes, prefix)
+				}
+			}
+		}
+		if len(prefixes) > 0 {
+			out[ri.Name] = prefixes
+		}
+	}
+	return out
+}

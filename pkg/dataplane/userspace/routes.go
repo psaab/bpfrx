@@ -157,6 +157,13 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 			return nil, fmt.Errorf("route snapshot: list ip-rules for family %d: %w", family, err)
 		}
 		for _, rule := range rules {
+			// A Dst-less rule (`from all lookup <table>`) cannot be
+			// represented as a per-prefix NextTable leak (it would mean
+			// "leak the whole table"), so it is skipped here. The rib-group
+			// import leak installs per-prefix `to <prefix> lookup
+			// <sourceTable>` rules (pkg/routing, #3876) that DO carry a Dst,
+			// so they are auto-captured by this loop as NextTable leaks into
+			// main — no change to this skip is needed for the fix.
 			if rule.Dst == nil || rule.Table <= 0 {
 				continue
 			}
@@ -349,23 +356,19 @@ func connectedPrefixesForInterface(iface InterfaceSnapshot) ([]string, []string)
 		if addr.Scope != 0 && addr.Scope != int(netlink.SCOPE_UNIVERSE) {
 			continue
 		}
-		ip, network, err := net.ParseCIDR(addr.Address)
-		if err != nil || network == nil {
+		// Mask-to-network + skip-host + skip-link-local is factored into
+		// config.ConnectedNetworkPrefix so the rib-group per-prefix leak
+		// (pkg/routing, #3876) derives the identical connected-prefix set
+		// from the config addresses and the ip rules it installs match the
+		// connected routes this FIB carries in the source table.
+		prefix, family, ok := config.ConnectedNetworkPrefix(addr.Address)
+		if !ok {
 			continue
 		}
-		ones, bits := network.Mask.Size()
-		if ones <= 0 || ones == bits {
-			continue
-		}
-		network.IP = ip.Mask(network.Mask)
-		prefix := network.String()
-		switch addr.Family {
+		switch family {
 		case "inet":
 			v4 = append(v4, prefix)
 		case "inet6":
-			if ip.IsLinkLocalUnicast() {
-				continue
-			}
 			v6 = append(v6, prefix)
 		}
 	}

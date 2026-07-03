@@ -86,7 +86,11 @@ the userspace dataplane admission boundary is in
 
 - **FRR integration**: static, OSPF, BGP, IS-IS, RIP, ECMP multipath,
   export/redistribute.
-- **VRFs** with inter-VRF route leaking (next-table + rib-group).
+- **VRFs** with inter-VRF route leaking (next-table + rib-group). The
+  `interface-routes rib-group` import into the main table leaks each source
+  instance's connected (interface) routes per-prefix so a specific imported
+  prefix wins over a main-table default route — see
+  `docs/rib-group-route-leaking.md` (#3876).
 - **GRE tunnels**, XFRM interfaces, PBR (policy-based routing).
 - **Probe-driven WAN failover** (`services ip-monitoring` preferred-route
   injection, #1827).

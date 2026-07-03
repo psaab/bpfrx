@@ -1131,9 +1131,15 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		}
 	}
 
-	// 3c. Apply rib-group route leaking rules (ip rule)
+	// 3c. Apply rib-group route leaking rules (ip rule). #3876: the leak is
+	// now per connected prefix (`ip rule to <prefix> lookup <sourceTable>`
+	// BEFORE main) so an imported interface route wins over a main-table
+	// default route. The connected prefixes are derived from the config
+	// addresses on each source instance's member interface units, using the
+	// same derivation the userspace FIB uses for connected routes.
 	if d.routing != nil && len(cfg.RoutingOptions.RibGroups) > 0 {
-		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances); err != nil {
+		connectedPrefixes := config.RibGroupConnectedPrefixes(cfg)
+		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances, connectedPrefixes); err != nil {
 			slog.Warn("failed to apply rib-group rules", "err", err)
 		}
 	}
