@@ -73,16 +73,28 @@ func (n *Node) QuotedKeyPath() string {
 	return strings.Join(parts, " ")
 }
 
+// keyEscaper escapes exactly the characters that the lexer's readString
+// (pkg/config/lexer.go) un-escapes on parse: backslash, double-quote, and
+// newline. The mapping is symmetric — the set of sequences emitted here is
+// identical to the set the lexer decodes — so Format(Parse(x)) == x and
+// Parse(Format(x)) == x for every value, including IKE pre-shared keys and
+// other string leaves that contain a backslash (the #3854 corruption). It is
+// a single-pass Replacer, so backslash is escaped before (never after) the
+// quote it may precede: `\"` never double-processes into `\\"`. Do not add
+// escapes for characters the lexer does not interpret (e.g. `\t`), or the
+// round-trip would over-escape and diverge.
+var keyEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+
 // quoteKey wraps a key in double quotes if it contains characters that
-// are not valid in bare Junos identifiers.
+// are not valid in bare Junos identifiers, escaping backslash, quote, and
+// newline so the quoted form round-trips symmetrically through the lexer.
 func quoteKey(s string) string {
 	if s == "" {
 		return `""`
 	}
 	for i := 0; i < len(s); i++ {
 		if !isIdentChar(s[i]) {
-			// Escape any internal quotes.
-			return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+			return `"` + keyEscaper.Replace(s) + `"`
 		}
 	}
 	return s

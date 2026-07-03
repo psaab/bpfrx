@@ -585,6 +585,31 @@ is exactly the repetition). The ordered list lands in `PolicyTerm.ASPathPrepend
 `TestGeneratePolicyOptions_ASPathPrepend` in
 `pkg/frr/policy_as_path_prepend_2892_test.go` (render).
 
+### Quoted-value escape round-trip contract (#3854)
+
+When a key or value contains a character that is not a bare Junos identifier
+byte (`isIdentChar` in `lexer.go` — anything outside letters/digits/`-_./:*+%=,<>`),
+`Format`/`FormatSet` wrap it in double quotes via `quoteKey` (`ast.go`). The set
+of characters `quoteKey` escapes MUST exactly match the set the lexer's
+`readString` un-escapes on parse, or the config does not round-trip. The lexer
+decodes exactly three sequences — `\"` → `"`, `\\` → `\`, and `\n` → newline —
+and preserves any other `\X` verbatim. `quoteKey` therefore escapes exactly
+those three characters (backslash, double-quote, newline) via the single-pass
+`keyEscaper` (`strings.NewReplacer(`\`→`\\`, `"`→`\"`, "\n"→`\n`)). Backslash is
+escaped first (in the same pass) so `\"` cannot double-process into `\\"`.
+
+This symmetry guarantees `Format(Parse(x)) == x` and `Parse(Format(x)) == x` for
+every value — critically an IKE pre-shared-key `ascii-text` (or any string leaf)
+containing a backslash. Before #3854 `quoteKey` escaped only `"`, so a value like
+`P@ss\next` (backslash before `n`) was corrupted on every `Format→Parse` cycle:
+HA config sync (which is `Format→wire→Parse`) silently diverged the standby's PSK
+so IPsec failed to re-establish on failover, and rollback slots serialized via
+`Format` round-tripped to a different, possibly invalid config. Do NOT add escapes
+for characters the lexer does not interpret (e.g. `\t`) — that would over-escape
+and break the symmetry in the other direction. Pinned by
+`pkg/config/quotekey_roundtrip_3854_test.go` (`TestQuoteKeyLexerSymmetry3854`,
+`TestFormatParseRoundTrip3854`, `TestFormatParseIdempotent3854`).
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list
