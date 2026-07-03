@@ -570,6 +570,14 @@ type Daemon struct {
 	// applySem) both run the reconcile.
 	proxyARPEnabledMu sync.Mutex
 	proxyARPEnabled   map[string]map[int]struct{}
+
+	// archiveTransfer performs the transfer-on-commit upload of one
+	// serialized active-config file to an archive site. nil ⇒ the default
+	// scp transport (scpArchiveTransfer). Overridable so tests can capture
+	// the uploaded file's bytes and assert archiveConfig serializes the
+	// CURRENT active config (Store.ShowActive), not the stale boot file
+	// d.opts.ConfigFile (#3867).
+	archiveTransfer func(ctx context.Context, srcPath, dest string) error
 }
 
 func (d *Daemon) applyResult() *dataplane.ApplyResult {

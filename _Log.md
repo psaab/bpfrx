@@ -28470,3 +28470,61 @@ top.
   (resyncPeerForTest seam field), pkg/daemon/rollback_resync_test.go (new
   RED-on-revert + peer-absent tests), docs/ha-cluster-test-plan.md (TC-5b
   commit-confirmed timeout convergence scenario)
+
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix #3867 — config archive transfer-on-commit uploaded the
+  boot-time /etc/xpf/xpf.conf (never rewritten since the configstore became
+  DB-canonical), so every `system archival configuration transfer-on-commit`
+  scp'd the DAY-0 config instead of the just-committed one — a silently-wrong
+  DR/compliance archive while scp logged success. `archiveConfig`
+  (pkg/daemon/daemon_flow.go) now serializes the CURRENT active config via
+  `Store.ShowActive()` (= `s.active.Format()`, the same text
+  `show configuration` renders and the local auto-archive `writeArchive`
+  uses), writes it to a 0600 temp file keeping the boot-file basename
+  (preserves the historical remote filename for directory-destination sites),
+  scp's THAT, and removes the temp file after every upload completes. The scp
+  step is split into `scpArchiveTransfer` behind the new injectable
+  `Daemon.archiveTransfer` seam so tests capture the uploaded bytes.
+  RED-on-revert PROVEN: reverting the source back to `d.opts.ConfigFile`
+  makes `TestArchiveConfigUploadsActiveNotBootFile` capture the day-0 boot
+  file ("day0-boot") instead of the committed active config ("committed-c1")
+  — both the exact-equality assertion and the boot-file guard trip. go test
+  ./pkg/daemon/... green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/daemon/daemon_flow.go (archiveConfig rewrite +
+  scpArchiveTransfer), pkg/daemon/daemon.go (archiveTransfer field),
+  pkg/daemon/archive_config_3867_test.go (new RED-on-revert + temp-cleanup
+  tests), pkg/configstore/README.md (remote transfer-on-commit source note)
+- **Timestamp**: 2026-07-03
+- **Action**: #3864 — deterministic (CGNAT) source NAT was un-configurable via
+  flat-set. The documented CGNAT quick-start (`set ... port deterministic
+  block-size N` + `... host address X` on SEPARATE `set` lines) was spuriously
+  rejected "deterministic block-size must be > 0" / "host address required":
+  the sibling `port deterministic ...` leaves overwrote each other last-wins in
+  `compiler_nat.go` and the host address was never read off Keys (`port`
+  unmodeled in `schema_security.go`). FIX: (1) model `port deterministic {
+  block-size; host address }` + `port range` as a container sub-stanza in
+  setSchema so the flat-set tokens GROUP onto ONE `port` node (and tab-complete
+  + typed block-size validation); (2) rewrite the compiler `port` case to read
+  block-size/host/range from BOTH the flat-set (Keys) AND hierarchical
+  (children) shapes and ACCUMULATE into a single DeterministicNATConfig instead
+  of resetting per sibling (the #2419 dual-AST-shape class) — new helpers
+  applyDeterministicKeys/applyDeterministicChildren/applyDeterministicHost only
+  write present fields. The genuine capacity/missing-field validation is
+  UNCHANGED (a real missing block-size / host / over-subscribed pool is still
+  rejected). RED-on-revert PROVEN: reverting the two source files (tests kept)
+  makes the flat-set doc config + reversed-order + range + IPv6 tests go RED
+  with the spurious "block-size must be > 0" / "host address required", while
+  the hierarchical-preserved and the two genuine-incomplete guards stay GREEN
+  (pre-existing-correct). DOC FIX: the doc's own IPv4 example was arithmetically
+  over-subscribed (/22 = 1024 hosts > 128 blocks → genuine capacity reject in
+  BOTH forms); corrected to /25 (128 hosts fit the 128 blocks) so the quick-
+  start actually commits clean, added the hierarchical equivalent + the
+  grouping note. go test ./pkg/config/... + ./pkg/dataplane/... green; go build
+  ./... green; gofmt + vet clean.
+- **File(s)**: pkg/config/schema_security.go (model `port` container),
+  pkg/config/compiler_nat.go (dual-shape accumulate + 3 helpers),
+  pkg/config/deterministic_nat_flatset_3864_test.go (new, 7 tests),
+  docs/deterministic-nat-cgnat.md (/22→/25 fix + hier example + grouping +
+  impl map), docs/config-schema.md (port now modeled note)
