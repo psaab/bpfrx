@@ -112,12 +112,79 @@ func TestExecuteConfirmedRollbackSerializesWithCommit(t *testing.T) {
 	if got := atomic.LoadInt32(&maxSeen); got != 1 {
 		t.Fatalf("rollback and commit must serialize via applySem; saw %d concurrent body invocations", got)
 	}
-	// Both the rollback and the commit must have actually run their apply
-	// body — serialization must be achieved by BLOCKING on applySem, not by
-	// one of them being skipped (Codex r1: a TryAcquire-skip refactor would
-	// satisfy maxSeen==1 while silently dropping a rollback).
-	if got := atomic.LoadInt32(&total); got != 2 {
-		t.Fatalf("both rollback and commit apply bodies must run (blocking, not skipping); saw total=%d, want 2", got)
+	// #3861: a plain commit during a pending commit-confirmed window now
+	// CONFIRMS it (Junos: any subsequent explicit commit confirms a pending
+	// `commit confirmed`). The two operations still fully serialize on
+	// applySem, but whether the rollback body runs depends on who wins the
+	// semaphore:
+	//   - commit-first: Commit() confirms the window (cancels the timer and
+	//     bumps confirmGen); the later executeConfirmedRollback(gen) sees a
+	//     stale generation and no-ops. The committed config is NOT silently
+	//     reverted — the #3861 fix — so only the commit body runs (total==1).
+	//   - rollback-first: PromoteRollback reverts to A and re-seeds the
+	//     candidate from A, then the commit re-commits A (total==2).
+	// Either way the body count is bounded by [1,2]: fully serialized, never
+	// overlapping, never a spurious third apply. The deterministic
+	// anti-TryAcquire-skip guarantee (a rollback must BLOCK on a contended
+	// applySem, never be silently dropped) is covered by
+	// TestExecuteConfirmedRollbackBlocksOnApplySem below; store/dataplane
+	// atomicity by TestExecuteConfirmedRollbackStoreApplyConsistency.
+	if got := atomic.LoadInt32(&total); got < 1 || got > 2 {
+		t.Fatalf("apply body ran %d times, want 1 (commit-first confirms per #3861) or 2 (rollback-first)", got)
+	}
+}
+
+// #1922 Item 1a anti-skip guarantee, revalidated under #3861: the rollback
+// executor must BLOCK on d.applySem when it is contended, never skip the
+// rollback (a TryAcquire refactor would satisfy the no-overlap check by
+// silently dropping the rollback body). The concurrent-race sibling above can
+// no longer assert this via total==2 because a commit that wins the race now
+// legitimately confirms the window and supersedes the rollback (#3861), so
+// prove the blocking behavior DETERMINISTICALLY: hold applySem, fire the
+// executor, and confirm it waits (store still B, body not run) then completes
+// once the semaphore is released (store reverts to A, body ran exactly once).
+// A TryAcquire-skip refactor would return immediately without ever rolling
+// back, leaving the store on B — which the post-release assertions catch.
+func TestExecuteConfirmedRollbackBlocksOnApplySem(t *testing.T) {
+	s, gen := newRollbackTestStore(t) // active=B pending, rollback target=A
+	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s}
+
+	var bodyRan int32
+	d.applyBodyForTest = func(_ *config.Config) { atomic.AddInt32(&bodyRan, 1) }
+
+	// Hold the apply semaphore so the executor must wait for it.
+	if err := d.applySem.Acquire(t.Context(), 1); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		d.executeConfirmedRollback(gen)
+		close(done)
+	}()
+
+	// While the semaphore is held the executor must be blocked: no rollback.
+	time.Sleep(30 * time.Millisecond)
+	if got := atomic.LoadInt32(&bodyRan); got != 0 {
+		t.Fatalf("rollback body ran (%d) while applySem was held — executor did not block on the semaphore", got)
+	}
+	if got := s.ActiveConfig().System.HostName; got != "B" {
+		t.Fatalf("store promoted while applySem held: host-name = %q, want B", got)
+	}
+
+	// Release the semaphore: a BLOCKING executor now proceeds. A TryAcquire-
+	// skip refactor would already have returned without rolling back.
+	d.applySem.Release(1)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executor did not complete after applySem release (did it block forever?)")
+	}
+	if got := atomic.LoadInt32(&bodyRan); got != 1 {
+		t.Fatalf("rollback body ran %d times after release, want 1 (blocked-then-ran, not skipped)", got)
+	}
+	if got := s.ActiveConfig().System.HostName; got != "A" {
+		t.Fatalf("after rollback active host-name = %q, want A", got)
 	}
 }
 
