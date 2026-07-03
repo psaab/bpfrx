@@ -160,6 +160,41 @@ type RibGroup struct {
 	ImportRibs []string // import-rib [ rib1 rib2 ... ]
 }
 
+// ConnectedNetworkPrefix converts an interface address in CIDR form
+// (e.g. "10.0.1.1/24" or "2001:db8::1/64") to its masked network prefix
+// ("10.0.1.0/24"), applying the connected-route skip rules shared by the
+// userspace FIB connected-route builder (pkg/dataplane/userspace,
+// connectedPrefixesForInterface) and the rib-group per-prefix leak
+// (pkg/routing, #3876). Both callers derive the SAME prefix set from an
+// address so the ip rules the leak installs match the connected routes the
+// FIB actually carries in the source table.
+//
+// A host address (/32 IPv4, /128 IPv6), a default route (/0), and an IPv6
+// link-local address carry no leakable connected network and return
+// ok=false. family is "inet" or "inet6". Unparseable input returns ok=false.
+func ConnectedNetworkPrefix(cidr string) (prefix, family string, ok bool) {
+	ip, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil || network == nil {
+		return "", "", false
+	}
+	ones, bits := network.Mask.Size()
+	if ones <= 0 || ones == bits {
+		// Default route (/0) or a host route (/32, /128) — no connected
+		// network prefix to leak.
+		return "", "", false
+	}
+	if ip.To4() == nil {
+		family = "inet6"
+		if ip.IsLinkLocalUnicast() {
+			return "", "inet6", false
+		}
+	} else {
+		family = "inet"
+	}
+	network.IP = ip.Mask(network.Mask)
+	return network.String(), family, true
+}
+
 // NextHopEntry defines a single next-hop for a static route.
 type NextHopEntry struct {
 	Address   string // IP address (e.g. "10.0.1.1" or "fe80::1")
