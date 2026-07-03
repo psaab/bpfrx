@@ -1,3 +1,48 @@
+## 2026-07-03 — #3855: routing-instance kernel TableIDs are positional → sibling delete/reorder renumbers survivors → vrf.go recreates untouched VRFs (HIGH HA/routing outage)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-007. `compileRoutingInstances`
+    (compiler_routing.go) assigned each routing-instance a kernel routing
+    TableID POSITIONALLY (100, 101, 102… by config order). Deleting or
+    reordering ONE instance renumbered every survivor after it; `reconcileVRFs`
+    (pkg/routing/vrf.go) then saw the survivor's live `vrf-<name>` device carry a
+    now-stale table id and DELETED+recreated it (link down/up + route reprogram)
+    — a forwarding OUTAGE on an unrelated VRF, on both HA nodes. Same
+    positional-identity class as #3075 (StableZoneID) / #3395 (stable policy_id).
+  - **Fix**: New `pkg/config/routinginstanceid.go` mirroring zoneid.go:
+    `StableRoutingInstanceTableID(name)` folds FNV-1a/64 of the instance NAME
+    into a reserved band `[100000, 999999]` (`RoutingInstanceTableIDBase` +
+    `RoutingInstanceTableIDSpan`) — a pure function of the name, invariant under
+    add/remove/reorder of siblings, HA-symmetric, above every other reserved
+    kernel-table constant (mgmt 999, RPM probe 7000-7049, kernel 253/254/255)
+    and >= 100 by construction. `compileRoutingInstances` now assigns the stable
+    id (was `tableID := 100; …; tableID++`) and, after building the slice,
+    resolves collisions via `QuarantinedRoutingInstanceNames`: the sorted-first
+    name keeps the table, later colliders are DROPPED (never two VRFs on one
+    table = cross-VRF leak) with a loud warning. Strict commit gate
+    `validateRoutingInstanceTableIDCollisionAST` (union-of-groups + node0/node1
+    views, mirrors the zone/tunnel gates) hard-REJECTS a colliding pair; lenient
+    load/peer-sync warns + quarantines (#1960 no-brick). Wired into both
+    compiler.go call sites next to the zone gate; new
+    `lenientRoutingInstanceTableIDCollision` opt.
+  - **File(s)**: pkg/config/routinginstanceid.go (new),
+    pkg/config/compiler_routing.go, pkg/config/compiler.go,
+    pkg/config/routinginstanceid_test.go (new),
+    pkg/config/parser_ast_test.go, pkg/config/parser_routing_test.go,
+    pkg/routing/vrf_stable_tableid_test.go (new),
+    pkg/routing/README.md, docs/test_env.md,
+    pkg/grpcapi/testdata/server_show_golden.json (vr1 table 100→627081).
+  - **Validation**: RED-on-revert proven — temporarily reverting the assignment
+    to positional made TestRoutingInstanceTableIDStableUnderSiblingChurn go RED
+    (C renumbered 102→101 on sibling delete; reorder swapped A/C). Restored →
+    green. `TestReconcileVRFsStableTableIDNoRecreateOnSiblingDelete` proves
+    reconcileVRFs does adds=0/dels=1 (only the removed VRF) when a sibling is
+    deleted; `TestReconcileVRFsRecreatesOnRealTableChange` proves the
+    recreate-on-mismatch path still fires for a genuine table change. Collision
+    strict-reject + lenient-quarantine covered. `go test ./...` = 53 ok / 0 fail;
+    go build ./...; gofmt+vet clean. FLAG: test-failover WARRANTED (HA VRF
+    forwarding stability) — parent will batch-validate.
+
 ## 2026-07-03 — #3842: policy dup inner match/then blocks silently dropped (HIGH fail-open)
 
 - **Timestamp**: 2026-07-03
