@@ -165,6 +165,12 @@ when `routing_table != 0`. PBR from firewall filters takes priority over VRF rou
 ### Current test config
 `dmz-vr` routing instance: ge-0-0-2 in VRF, rib-group route leaking to main table.
 
+> NOTE (#3855): routing-instance kernel table ids are now a **stable
+> name-hash** in `[100000, 999999]` (`config.StableRoutingInstanceTableID`),
+> not the positional `100, 101…` shown in the legacy commands below. The
+> `table 100` examples are illustrative — read the instance's real table
+> from `show routing-instances` / `ip vrf show` and substitute it.
+
 ### Infrastructure verification (DONE)
 ```bash
 # 1. VRF device exists

@@ -161,6 +161,43 @@ delegate to the owning domain. Exported types:
   (lower priority value = higher priority). PBR sits before main as
   well; rib-group sits after.
 
+### Routing-instance kernel table IDs (#3855)
+
+A routing-instance's kernel routing table id (`VRFSpec.TableID`, what
+`reconcileVRFs` binds a `vrf-<name>` device to) is a **stable
+name-hash**, not a positional counter. `config.StableRoutingInstanceTableID`
+(FNV-1a/64 of the instance NAME, folded into the reserved band
+`[RoutingInstanceTableIDBase, RoutingInstanceTableIDBase+RoutingInstanceTableIDSpan-1]`
+= `[100000, 999999]`) computes it. This mirrors the #3075 `StableZoneID`
+and #1873 `StableTunnelEndpointID` stable-identity pattern.
+
+**Why:** the pre-#3855 compiler assigned `100, 101, 102…` by config
+order, so deleting or reordering ONE routing-instance **renumbered every
+survivor after it**. `reconcileVRFs` then saw an untouched survivor's
+kernel VRF carry a now-stale table id, **deleted and recreated** the live
+device (link down/up + route reprogram) — a forwarding outage on a VRF
+the operator never touched, on **both HA nodes**. A name-derived id is
+invariant under add/remove/reorder of siblings, so `reconcileVRFs` only
+recreates on a *genuine* table change (a rename → new name → new id), not
+on spurious positional churn.
+
+The band sits above every other reserved kernel-table constant (the
+kernel-reserved 253/254/255, the mgmt VRF table `999`, the RPM probe band
+`ProbeTableBase` 7000-7049) so a stable routing-instance table can never
+collide with any of them, and it stays `>= 100` by construction. The id
+is a pure function of the NAME — both HA nodes and a cold-booting node
+compute identical ids from identical config with zero synced state.
+
+**Collision handling (#3719 pattern):** two names folding to the same
+kernel table would MERGE two VRFs onto one table (a cross-VRF route
+leak), so it is never allowed. The strict commit path
+(`config.validateRoutingInstanceTableIDCollisionAST`) hard-**rejects** a
+colliding pair; the lenient load / peer-sync path warns and
+`compileRoutingInstances` **quarantines** the later-sorting instance
+(`config.QuarantinedRoutingInstanceNames`) — its VRF is not created and
+its routes/leaks are not programmed — preserving the #1960 no-brick
+intent while guaranteeing no two VRFs ever share a table.
+
 ### clear()/Apply error contract (#2273, #3430, #3731)
 
 Each reconciler's `Apply` is clear-then-re-add: `clear()` removes every

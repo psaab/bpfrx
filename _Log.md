@@ -44,6 +44,50 @@
     pkg/configstore/commit_confirmed_3861_test.go (new),
     pkg/daemon/rollback_serialize_test.go (serialize-test semantics + new
     blocking test), pkg/configstore/README.md (persistence-contract doc)
+## 2026-07-03 — #3855: routing-instance kernel TableIDs are positional → sibling delete/reorder renumbers survivors → vrf.go recreates untouched VRFs (HIGH HA/routing outage)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-007. `compileRoutingInstances`
+    (compiler_routing.go) assigned each routing-instance a kernel routing
+    TableID POSITIONALLY (100, 101, 102… by config order). Deleting or
+    reordering ONE instance renumbered every survivor after it; `reconcileVRFs`
+    (pkg/routing/vrf.go) then saw the survivor's live `vrf-<name>` device carry a
+    now-stale table id and DELETED+recreated it (link down/up + route reprogram)
+    — a forwarding OUTAGE on an unrelated VRF, on both HA nodes. Same
+    positional-identity class as #3075 (StableZoneID) / #3395 (stable policy_id).
+  - **Fix**: New `pkg/config/routinginstanceid.go` mirroring zoneid.go:
+    `StableRoutingInstanceTableID(name)` folds FNV-1a/64 of the instance NAME
+    into a reserved band `[100000, 999999]` (`RoutingInstanceTableIDBase` +
+    `RoutingInstanceTableIDSpan`) — a pure function of the name, invariant under
+    add/remove/reorder of siblings, HA-symmetric, above every other reserved
+    kernel-table constant (mgmt 999, RPM probe 7000-7049, kernel 253/254/255)
+    and >= 100 by construction. `compileRoutingInstances` now assigns the stable
+    id (was `tableID := 100; …; tableID++`) and, after building the slice,
+    resolves collisions via `QuarantinedRoutingInstanceNames`: the sorted-first
+    name keeps the table, later colliders are DROPPED (never two VRFs on one
+    table = cross-VRF leak) with a loud warning. Strict commit gate
+    `validateRoutingInstanceTableIDCollisionAST` (union-of-groups + node0/node1
+    views, mirrors the zone/tunnel gates) hard-REJECTS a colliding pair; lenient
+    load/peer-sync warns + quarantines (#1960 no-brick). Wired into both
+    compiler.go call sites next to the zone gate; new
+    `lenientRoutingInstanceTableIDCollision` opt.
+  - **File(s)**: pkg/config/routinginstanceid.go (new),
+    pkg/config/compiler_routing.go, pkg/config/compiler.go,
+    pkg/config/routinginstanceid_test.go (new),
+    pkg/config/parser_ast_test.go, pkg/config/parser_routing_test.go,
+    pkg/routing/vrf_stable_tableid_test.go (new),
+    pkg/routing/README.md, docs/test_env.md,
+    pkg/grpcapi/testdata/server_show_golden.json (vr1 table 100→627081).
+  - **Validation**: RED-on-revert proven — temporarily reverting the assignment
+    to positional made TestRoutingInstanceTableIDStableUnderSiblingChurn go RED
+    (C renumbered 102→101 on sibling delete; reorder swapped A/C). Restored →
+    green. `TestReconcileVRFsStableTableIDNoRecreateOnSiblingDelete` proves
+    reconcileVRFs does adds=0/dels=1 (only the removed VRF) when a sibling is
+    deleted; `TestReconcileVRFsRecreatesOnRealTableChange` proves the
+    recreate-on-mismatch path still fires for a genuine table change. Collision
+    strict-reject + lenient-quarantine covered. `go test ./...` = 53 ok / 0 fail;
+    go build ./...; gofmt+vet clean. FLAG: test-failover WARRANTED (HA VRF
+    forwarding stability) — parent will batch-validate.
 
 ## 2026-07-03 — #3842: policy dup inner match/then blocks silently dropped (HIGH fail-open)
 
@@ -28282,6 +28326,41 @@ top.
   docs/config-schema.md (Quoted-value escape round-trip contract subsection),
   _Log.md
 
+## 2026-07-03 — #3857 DNAT `match application` + `match destination-port` fail-open
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix HIGH fail-open (fable-161 F-018): a DNAT rule with BOTH
+  `match application` AND `match destination-port` mishandled the rule-level
+  destination-port on the lenient / HA peer-sync decode path — (a) an
+  invalid/unrepresentable rule dest-port present alongside an application
+  WIDENED to the wildcard `[0,0]` port (bypassing the #3446 dport guard), (b) a
+  valid rule dest-port was DROPPED (the application's own port / a wildcard
+  won), (c) a multi-value rule dest-port list collapsed to the singular first
+  port. The source-NAT builder handled all three correctly.
+- **Fix**: `buildDestinationNATSnapshotsWithFeeds` now treats the explicit
+  rule-level `match destination-port` as authoritative for the destination-port
+  axis on EVERY resolved application term. Resolve the rule port list once
+  (`ruleDstPorts` = plural `DestinationPorts`, fallback to scalar
+  `DestinationPort` for a mixed-version peer; `ruleDstPortConfigured` also trips
+  on non-empty `InvalidDestinationPorts`) and, when configured, use it in place
+  of the application's own destination-port on each term. Application still
+  constrains protocol / source-port / ICMP type-code (#3437). Full multi-value
+  list preserved; a configured-but-unrepresentable value fails CLOSED via the
+  existing `portConfigured` → emit-no-snapshot branch (never `[0,0]`). Removed
+  the stray singular-port switch case and the now-dead `explicitFallback` flag.
+  Go-only — no Rust change (Rust `l4_extra_matches` already AND-checks the port
+  ranges + exact port and preserves the `low > high` never-match sentinel).
+- **Tests (RED-on-revert)**: `nat_dnat_app_dport_3857_test.go` — 6 defect
+  tests (invalid/out-of-range dport + app → 0 snapshots; valid dport overrides
+  app port; scalar-only peer-sync dport honored; multi-port kept with/without
+  app port) + 1 regression guard (app-only path unchanged). Crafted-NATMatch
+  lenient/peer-sync path. Verified 6/6 RED on a temporary `git show
+  origin/master` revert of nat.go, GREEN with the fix.
+- **Validation**: go test ./pkg/dataplane/... green; go build ./... green;
+  gofmt + go vet clean.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_dnat_app_dport_3857_test.go (new),
+  docs/userspace-dnat-plan.md (§13c), _Log.md
 ## 2026-07-03 — #3849 policy time-range scheduler daily/per-day descend + fail-closed
 - **Timestamp**: 2026-07-03
 - **Action**: #3849 (fable-review-161 F-014) — policy time-range scheduler
