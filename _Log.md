@@ -1,3 +1,45 @@
+## 2026-07-03 — #3863: WireGuard tunnel local identity never validated at commit (HIGH silent VPN outage)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-011. A WireGuard tunnel's LOCAL
+    identity — `listen-port` and `private-key` — was never validated at commit.
+    `validateOneWireguardTunnel` (compiler_validate_wireguard.go) validated the
+    PEERS (zero-peer, pubkey, PSK, endpoint family, dup allowed-ips) but not the
+    local identity. So a missing/`0`/out-of-range `listen-port` (which
+    `parseTunnelWireguard` silently collapses to `WgListenPort == 0`) or a
+    missing/malformed `private-key` (stored verbatim) COMMITTED CLEAN. At runtime
+    the Rust `hydrate_wg_identity`
+    (userspace-dp/src/afxdp/forwarding_build/tunnels.rs) drops the WHOLE tunnel
+    row when `wg_listen_port == 0` or the private key fails `decode_wg_key_hex`
+    (not exactly 64 hex chars → 32 bytes) → the tunnel is permanently dead with
+    no diagnostic. Empirically confirmed via CompileConfig: all of
+    listen-port 0/99999/missing + malformed/missing private-key committed clean
+    on origin/master. (The schema layer already bounds the listen-port VALUE via
+    `ValidateInteger(1,65535)`, but that is author-path-only and cannot see a
+    MISSING leaf; private-key has NO schema validator. The compiler gate is the
+    universal chokepoint every compile/load/HA-sync path funnels through.)
+  - **Fix**: Extended `validateOneWireguardTunnel` to reject
+    `WgListenPort == 0` and a `private-key` that fails `isWireguardKeyHex`
+    (64 hex / 32-byte X25519, mirroring the peer-pubkey and Rust
+    `decode_wg_key_hex` rules), checked BEFORE the peer gates to mirror the Rust
+    order (listen_port → privkey → peers). Validates the real Secret value via
+    `.Reveal()` (#2053) and does NOT echo the private key in the error (secret
+    hygiene). Fail-closed on strict (commit/commit-check); the `lenientWireguardPeers`
+    load/peer-sync path downgrades to a warning so an already-persisted config
+    still boots (runtime hydrate drops the bad row independently).
+  - **File(s)**: `pkg/config/compiler_validate_wireguard.go` (gate + doc),
+    `pkg/config/compiler.go` (call-site comment),
+    `pkg/config/wireguard_multipeer_test.go` (6 new #3863 tests + listen-port on
+    2 bracket tests), `pkg/config/tunnelid_test.go` (5 success-expecting WG stubs
+    given a valid local identity), `pkg/config/parser_routing_test.go`
+    (TestTunnelNameMapWireguardInterfaceLevel private-key), `docs/config-schema.md`,
+    `docs/wireguard-interop.md`.
+  - **Validation**: 6 new tests (positive control + listen-port 0/99999/missing
+    + malformed/missing private-key). RED-on-revert proven: neutering both gate
+    checks FAILS the 5 reject tests, positive control stays green. `go test
+    ./pkg/config/...` green; `go build ./...`; gofmt + vet clean;
+    configstore/api/dataplane-userspace tests green.
+
 ## 2026-07-03 — #3842: policy dup inner match/then blocks silently dropped (HIGH fail-open)
 
 - **Timestamp**: 2026-07-03

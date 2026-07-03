@@ -3307,6 +3307,7 @@ func TestTunnelNameMapWireguardInterfaceLevel(t *testing.T) {
 	cmds := []string{
 		"set interfaces wg0 tunnel mode wireguard",
 		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set interfaces wg0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg0 unit 0 family inet address 10.66.0.1/24",
 		"set interfaces wg0 unit 1 family inet address 10.66.1.1/24",
