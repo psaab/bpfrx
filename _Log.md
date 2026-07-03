@@ -28856,3 +28856,32 @@ top.
   pkg/config/compiler.go (lenientNAT64Prefix option + wiring + 2 lenient
   blocks), pkg/config/compiler_nat64_prefix_test.go (new, 11 tests),
   docs/config-schema.md (#3886 subsection)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3889 — reconcile + REVOKE super-user sudoers grants. The
+  daemon wrote a NOPASSWD `/etc/sudoers.d/xpf-<user>` for each super-user
+  login account but had NO removal branch, so a class DOWNGRADE
+  (super-user → operator/read-only) or a full user REMOVAL from config
+  left the passwordless-root grant dangling forever (fable-161 F-055,
+  MEDIUM security / stale privilege). Fix: moved the write out of the
+  per-user `applySystemLogin` loop into a new `reconcileSudoers(cfg)`
+  (`pkg/daemon/daemon_system.go`) called unconditionally from the apply
+  pipeline (`daemon_apply.go` step 11b) — it MUST run even when
+  `applySystemLogin` early-returns on no users (the "all users removed"
+  case). It mirrors the networkd/rsyslog stale-file reconcilers: build the
+  desired super-user set, WRITE `xpf-<user>` for each current super-user
+  (durable `fsatomic.WriteFileDurable` 0440, existing #1916 safety),
+  SWEEP `/etc/sudoers.d/xpf-*` and REMOVE any drop-in not in the desired
+  set. Only `xpf-` prefixed files are ever touched (operator-authored
+  files left alone); root is never granted. Added a `visudo -cf`
+  validation seam (`validateSudoersFile`, best-effort: root-only +
+  visudo-present) — a rejected drop-in is removed rather than left as a
+  lockout landmine (one malformed file breaks ALL sudo). RED-on-revert:
+  disabling the sweep made the downgrade/removal/all-removed assertions
+  FAIL (stale grant persists). go test ./pkg/daemon/ green; go build
+  ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/daemon/daemon_system.go (reconcileSudoers +
+  writeSudoersGrant + sudoersDir/sudoersPrefix/validateSudoersFile;
+  removed inline write from applySystemLogin), pkg/daemon/daemon_apply.go
+  (step 11b reconcileSudoers call), pkg/daemon/daemon_sudoers_reconcile_3889_test.go
+  (new, 4 tests), docs/system-login.md (#3889 revocation section)
