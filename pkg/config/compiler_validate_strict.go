@@ -3727,8 +3727,9 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 
 // validateApplicationSyntaxStrict hard-rejects SYNTACTIC errors in a
 // user-defined application definition that the typed-schema walk cannot reach:
-// an unrecognized leaf inside an opaque inline `term { ... }` (#3352) and an
-// `alg` name xpf does not support (#3353).
+// an unrecognized leaf inside an opaque inline `term { ... }` (#3352), an
+// `alg` name xpf does not support (#3353), and an unrecognized member statement
+// inside an opaque `application-set { ... }` body (#3890).
 //
 // Unlike validateApplicationSpecsStrict — whose port / protocol / icmp / timeout
 // checks are SEMANTIC and deliberately scoped to REFERENCED applications (an
@@ -3753,7 +3754,7 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 // tolerant load / peer-sync path so an already-persisted or older-peer-synced
 // config still BOOTS (#1960 no-brick).
 func validateApplicationSyntaxStrict(cfg *Config) error {
-	if cfg == nil || len(cfg.Applications.Applications) == 0 {
+	if cfg == nil {
 		return nil
 	}
 	names := make([]string, 0, len(cfg.Applications.Applications))
@@ -3805,6 +3806,39 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 					"deferred to the per-application ALG slice of #2008",
 				name, app.ALG)
 		}
+	}
+	// #3890: an unrecognized member statement inside an opaque application-set
+	// body. The schema declares `application-set` as an args:1 leaf
+	// (children:nil), so the SchemaValidate walk never reaches its members and a
+	// typo'd member keyword (e.g. `applicaton foo` for `application foo`, or a
+	// mistyped `application-set`) was silently dropped by compileApplications —
+	// the set was under-populated, and if referenced by a DENY policy the deny
+	// matched FEWER applications than intended (a fail-open under-match; traffic
+	// the operator meant to block is permitted). compileApplications records the
+	// offending keyword on ApplicationSet.UnknownMembers (mirroring
+	// UnknownTermLeaves); reject the first one so the silent under-population
+	// becomes an operator-visible commit error. Implicit application-sets
+	// synthesized for term-bearing applications never carry UnknownMembers, so
+	// they are unaffected. Iteration is sorted so the first-reported error is
+	// deterministic.
+	setNames := make([]string, 0, len(cfg.Applications.ApplicationSets))
+	for name := range cfg.Applications.ApplicationSets {
+		setNames = append(setNames, name)
+	}
+	sort.Strings(setNames)
+	for _, name := range setNames {
+		set := cfg.Applications.ApplicationSets[name]
+		if set == nil || len(set.UnknownMembers) == 0 {
+			continue
+		}
+		return fmt.Errorf(
+			"application-set %q: unknown member statement %q; an application-set "+
+				"member is `application <name>`, `application-set <name>`, or "+
+				"`description <text>` (an unrecognized keyword is silently dropped, "+
+				"leaving the set under-populated — a deny policy referencing it then "+
+				"matches fewer applications than intended, permitting traffic meant "+
+				"to be blocked)",
+			name, set.UnknownMembers[0])
 	}
 	return nil
 }

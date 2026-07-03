@@ -1,3 +1,48 @@
+## 2026-07-03 — #3890: typo'd application-set member keyword silently dropped (deny under-populated, fail-open)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-160 (MEDIUM, security fail-open). The
+    application-set member compiler (`compiler_applications.go`) switch over
+    member keywords had NO default arm, so a TYPO'd member keyword (e.g.
+    `applicaton foo` for `application foo`, or a mistyped `application-set`) was
+    SILENTLY DROPPED — it never reached strict validation, committed clean, and
+    the application-set was UNDER-POPULATED. If that set was used in a DENY
+    policy the deny matched FEWER applications than intended → traffic the
+    operator meant to block was permitted (fail-open under-match).
+  - **Fix**: Added a `default:` arm to the member switch that records the
+    offending keyword on the new `ApplicationSet.UnknownMembers` field (mirroring
+    the #3352 `UnknownTermLeaves` opaque-`term` pattern), plus an explicit
+    `case "description":` accept-and-ignore arm (Junos allows `description` on an
+    application-set — the documented way to author an otherwise-empty set; the
+    existing #3144/#3434 empty-set tests depend on it). Extended
+    `validateApplicationSyntaxStrict` (`compiler_validate_strict.go`) — the same
+    all-user-sets, referenced-or-not gate that already rejects an unknown leaf
+    inside an opaque `term` — to hard-reject the first application-set carrying an
+    UnknownMembers entry, naming the set + the bad keyword. Runs at commit /
+    commit-check; the tolerant load / peer-sync path downgrades to a
+    `cfg.Warnings` entry via the existing `lenientApplicationSpecs` flag (#1960
+    no-brick). Implicit application-sets synthesized for term-bearing applications
+    never carry UnknownMembers, so they are unaffected. Distinct from #2068 (a
+    dropped valid NESTED-set member) and #2217 Finding B
+    `validateApplicationSetMembersStrict` (a dangling member NAME; #3890 is a
+    typo'd member KEYWORD that never becomes a reference, and the syntax gate runs
+    earlier so it reports "unknown member statement" rather than a dangling ref).
+  - **Validation**: New `compiler_application_set_member_3890_test.go` (8 tests):
+    typo'd `application`/`application-set` keyword rejected (flat + hierarchical),
+    unreferenced set rejected, deny-policy end-to-end rejected, lenient warns,
+    valid `application`+nested-`application-set` set commits fully-populated +
+    expands, `description`-only set commits (not flagged). RED-on-revert proven —
+    removing the default arm makes the 6 reject/lenient tests FAIL while the
+    valid-members and description guards stay green. `go test ./pkg/config/...`
+    green; `go test ./pkg/appid/... ./pkg/policymatch/... ./pkg/dataplane/userspace/...`
+    green; `go build ./...` clean; gofmt + vet clean.
+  - **File(s)**: pkg/config/compiler_applications.go (default + description arms),
+    pkg/config/types_security.go (ApplicationSet.UnknownMembers field),
+    pkg/config/compiler_validate_strict.go (validateApplicationSyntaxStrict set
+    loop + doc), pkg/config/compiler_application_set_member_3890_test.go (new),
+    pkg/config/README.md (#3890 subsection), docs/config-schema.md (Finding B
+    sibling-gate note)
+
 ## 2026-07-03 — #3884: firewall-filter cross-family name collision folds into FiltersInet (discard→accept-all fail-open)
 
 - **Timestamp**: 2026-07-03

@@ -860,6 +860,20 @@ type ApplicationsConfig struct {
 type ApplicationSet struct {
 	Name         string
 	Applications []string // references to Application or ApplicationSet names
+	// UnknownMembers records the raw member keywords inside an application-set
+	// body that are NOT a recognized member statement (`application` or
+	// `application-set`). The schema declares `application-set` as an opaque
+	// args:1 leaf (children:nil), so the SchemaValidate walk never reaches its
+	// members; before #3890 compileApplications had no default arm on the
+	// member switch, so a typo'd member keyword (e.g. `applicaton foo` for
+	// `application foo`, or a mistyped `application-set`) was SILENTLY DROPPED —
+	// the set was under-populated, and if it was referenced by a DENY policy the
+	// deny matched FEWER applications than the operator intended (a fail-open
+	// under-match; traffic meant to be blocked is permitted). Mirroring
+	// UnknownTermLeaves, the offending keyword is recorded here and the deferred
+	// gate (validateApplicationSyntaxStrict) hard-rejects the first one on the
+	// strict commit path / warns on the tolerant load / peer-sync path (#3890).
+	UnknownMembers []string
 }
 
 // Application defines a network application by protocol and port.
