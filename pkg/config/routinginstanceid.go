@@ -1,0 +1,231 @@
+package config
+
+import (
+	"fmt"
+	"hash/fnv"
+	"sort"
+)
+
+// RoutingInstanceTableIDBase and RoutingInstanceTableIDSpan define the reserved
+// kernel routing-table band for STABLE, name-hashed routing-instance table IDs
+// (#3855). Every configured routing-instance's kernel table lands in
+// [RoutingInstanceTableIDBase, RoutingInstanceTableIDBase+RoutingInstanceTableIDSpan-1]
+// = [100000, 999999].
+//
+// The band sits ABOVE every other reserved kernel-table constant this project
+// uses — the kernel-reserved local/main/default tables (253/254/255), the mgmt
+// VRF table (999, pkg/daemon), and the RPM probe-pin band (ProbeTableBase
+// 7000..7049) — so a stable routing-instance table can never collide with any
+// of them. It also stays >= 100 (the historical routing-instance table floor
+// several callers and tests still assume) by construction.
+const (
+	RoutingInstanceTableIDBase = 100000
+	RoutingInstanceTableIDSpan = 900000 // [100000, 999999]
+)
+
+// StableRoutingInstanceTableID maps a routing-instance name to a STABLE kernel
+// routing table id: FNV-1a/64 xor-folded and mapped into the reserved band
+// [RoutingInstanceTableIDBase, RoutingInstanceTableIDBase+RoutingInstanceTableIDSpan-1].
+//
+// The id is a pure function of the instance NAME alone — never of the rest of
+// the routing-instance set, the compile order, or allocation history. This is
+// the #3075 StableZoneID / #1873 StableTunnelEndpointID pattern applied to
+// routing-instance kernel tables:
+//
+//	Positional assignment (the pre-#3855 defect) gave instances 100, 101, 102…
+//	by config order, so DELETING or REORDERING one instance RENUMBERED every
+//	survivor that followed it. pkg/routing/vrf.go then saw the survivor's kernel
+//	VRF device carry a now-stale table id, DELETED it and recreated it with the
+//	new number — a link down/up + route reprogram, i.e. a forwarding OUTAGE on a
+//	VRF the operator never touched, on BOTH HA nodes.
+//
+// Deriving the table id from the NAME makes it invariant under add/remove/
+// reorder of siblings: an untouched instance keeps its table id, so vrf.go's
+// recreate-on-table-mismatch never fires spuriously. A genuine reconfig (rename
+// → different name → different id) still recreates correctly. Both HA nodes and
+// a cold-booting node compute identical ids from identical config with zero
+// synced/persisted state.
+func StableRoutingInstanceTableID(name string) int {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	s := h.Sum64()
+	// xor-fold the high half down so the modulo samples the whole hash, then
+	// map into the reserved band. Pure function of the name.
+	folded := s ^ (s >> 32)
+	return RoutingInstanceTableIDBase + int(folded%uint64(RoutingInstanceTableIDSpan))
+}
+
+// collectRoutingInstanceNamesAST appends the routing-instance names declared
+// under a "routing-instances" node into out. Mirrors compileRoutingInstances
+// (compiler_routing.go): each non-leaf child's Keys[0] is the instance name in
+// both the hierarchical and flat-set AST shapes.
+func collectRoutingInstanceNamesAST(riNode *Node, out map[string]struct{}) {
+	if riNode == nil {
+		return
+	}
+	for _, child := range riNode.Children {
+		if child.IsLeaf || len(child.Keys) == 0 {
+			continue
+		}
+		if name := child.Keys[0]; name != "" {
+			out[name] = struct{}{}
+		}
+	}
+}
+
+// emitNodeExpandedRoutingInstanceNames returns the routing-instance names that
+// survive expanding the candidate tree for chassis-cluster node nodeID (View 2
+// for node0, View 3 for node1), used by validateRoutingInstanceTableIDCollisionAST.
+// It is the post-`${node}`/apply-groups view: a `${node}`-interpolated or
+// wildcard apply-group instance name is only concrete after expansion.
+//
+// It mirrors emitNodeExpandedZoneNames (zoneid.go): RECURSION-FREE by
+// construction (clone + expand + read the names straight off the AST, never
+// calling CompileConfig*), and per-node expansion errors are NON-FATAL (the
+// view contributes the EMPTY set), so a config that defines only `groups node0`
+// and references `${node}` does not turn a legitimate node1-expansion miss into
+// a spurious commit failure. View 1's pre-expansion union still covers any
+// collision inside the un-expandable group.
+func emitNodeExpandedRoutingInstanceNames(tree *ConfigTree, nodeID int, out map[string]struct{}) {
+	clone := tree.Clone()
+	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
+	if err := clone.ExpandGroupsWithVars(vars); err != nil {
+		return
+	}
+	collectRoutingInstanceNamesAST(clone.FindChild("routing-instances"), out)
+}
+
+// validateRoutingInstanceTableIDCollisionAST checks the UNION of routing-instance
+// names across three views of the candidate config for StableRoutingInstanceTableID
+// collisions (#3855), mirroring validateZoneIDCollisionAST (#3075) and
+// validateTunnelEndpointIDCollisionAST (#1873):
+//
+//	View 1 — the PRE-expansion presence union across the main "routing-instances"
+//	  hierarchy AND every "groups" block. It runs on the pre-expansion tree so
+//	  the check covers the union of instance names across all groups, keeping the
+//	  accept/reject decision identical on both chassis-cluster nodes.
+//	View 2 — the instance names that survive expanding the candidate for node0.
+//	View 3 — the same for node1.
+//
+// All three views are pure functions of the SAME candidate config, so the union
+// stays a pure function of config (HA symmetry preserved) and is monotone over
+// View 1 (Views 2/3 only ADD rejects).
+//
+// Strict (commit / commit-check) returns an error so an operator can never
+// commit a config whose two routing-instance names fold to the same kernel
+// table — two VRFs sharing a table would MERGE their routes (a cross-VRF leak).
+// Lenient (load / peer-sync of an already-active config) returns a warning so an
+// upgraded node still boots (#1960 no-brick); compileRoutingInstances then
+// QUARANTINES the later-sorting colliding instance (see QuarantinedRoutingInstanceNames)
+// so the two never actually share a kernel table.
+func validateRoutingInstanceTableIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, error) {
+	names := make(map[string]struct{})
+	// View 1 — pre-expansion presence union (main + every groups block).
+	collectRoutingInstanceNamesAST(tree.FindChild("routing-instances"), names)
+	for _, child := range tree.Children {
+		if child.Name() != "groups" {
+			continue
+		}
+		for _, group := range child.Children {
+			// Node{Keys:["groups","node0"]} merges the group name into
+			// Keys[1]; the children are then the group body. The other shape
+			// nests the group name as a child node.
+			if len(child.Keys) >= 2 {
+				collectRoutingInstanceNamesAST(child.FindChild("routing-instances"), names)
+				break
+			}
+			collectRoutingInstanceNamesAST(group.FindChild("routing-instances"), names)
+		}
+	}
+	// Views 2/3 — post-expansion instance names for node0 and node1. Both
+	// computed on both nodes from the shared candidate, so the union stays
+	// HA-symmetric; per-node expansion errors contribute the empty set.
+	emitNodeExpandedRoutingInstanceNames(tree, 0, names)
+	emitNodeExpandedRoutingInstanceNames(tree, 1, names)
+	if len(names) < 2 {
+		return nil, nil
+	}
+	sorted := make([]string, 0, len(names))
+	for name := range names {
+		sorted = append(sorted, name)
+	}
+	sort.Strings(sorted)
+	byID := make(map[int]string, len(sorted))
+	var warnings []string
+	for _, name := range sorted {
+		id := StableRoutingInstanceTableID(name)
+		owner, taken := byID[id]
+		if !taken {
+			byID[id] = name
+			continue
+		}
+		msg := fmt.Sprintf(
+			"routing-instance table-id collision between %q and %q (both fold to kernel table %d) — rename one instance (#3855)",
+			owner, name, id)
+		if !lenient {
+			return nil, fmt.Errorf("routing-instances: %s", msg)
+		}
+		// Lenient: keep booting but QUARANTINE the later-sorting instance
+		// (QuarantinedRoutingInstanceNames) so two routing-instances never
+		// share a kernel table. Word the warning so the operator knows the box
+		// is running degraded: the quarantined instance is dropped, its VRF is
+		// not created and its routes/PBR/next-table leaks are not programmed
+		// until one instance is renamed.
+		warnings = append(warnings, fmt.Sprintf("%s; the later-sorting instance %q is QUARANTINED"+
+			" (no VRF created, its routes and inter-VRF leaks not programmed) —"+
+			" its forwarding is DISABLED until one instance is renamed", msg, name))
+	}
+	return warnings, nil
+}
+
+// QuarantinedRoutingInstanceNames returns the set of routing-instance names that
+// MUST NOT be programmed into the kernel/dataplane because their
+// StableRoutingInstanceTableID collides with an earlier (alphabetically-sorted)
+// instance's table id. For each kernel table claimed by more than one name, the
+// sorted-FIRST name keeps the table and every later name that folds to the same
+// table is quarantined.
+//
+// This is the RUNTIME enforcement of the promise the lenient collision warning
+// (validateRoutingInstanceTableIDCollisionAST) makes — the later-sorting
+// instance is dropped — so two routing-instances never share a kernel table.
+// Programming both would MERGE two VRFs: one instance's routes, next-table
+// leaks and PBR would stand in for the other (pkg/routing/vrf.go binds a
+// vrf-<name> device to the kernel table by number; two devices on one table is
+// a cross-VRF route leak). The STRICT commit path REJECTS a collision outright;
+// the LENIENT path (tolerant load / peer-sync / a config a pre-#3855 binary
+// persisted with positional ids and no stable-hash collision check) keeps
+// booting but quarantines the colliding instance here, preserving the #1960
+// no-brick intent.
+//
+// The decision is a pure function of the instance-name SET
+// (StableRoutingInstanceTableID is a pure function of the name and the sorted
+// tie-break is deterministic), so both HA nodes and a cold-booting node compute
+// the IDENTICAL quarantine set from the identical config. Returns nil when no
+// table collides (the common case).
+func QuarantinedRoutingInstanceNames(names []string) map[string]struct{} {
+	if len(names) < 2 {
+		return nil
+	}
+	sorted := make([]string, len(names))
+	copy(sorted, names)
+	sort.Strings(sorted)
+	owner := make(map[int]string, len(sorted))
+	var quarantined map[string]struct{}
+	for _, name := range sorted {
+		id := StableRoutingInstanceTableID(name)
+		if existing, taken := owner[id]; taken {
+			if existing == name {
+				// Defensive: a duplicated name in the input slice is the same
+				// instance, not a collision.
+				continue
+			}
+			if quarantined == nil {
+				quarantined = make(map[string]struct{})
+			}
+			quarantined[name] = struct{}{}
+			continue
+		}
+		owner[id] = name
+	}
+	return quarantined
+}
