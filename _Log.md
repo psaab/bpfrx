@@ -82,6 +82,46 @@
     pkg/config/README.md (#3890 subsection), docs/config-schema.md (Finding B
     sibling-gate note)
 
+## 2026-07-03 — #3893: clusterReadOnly enforced only at EnterConfigure* — an open session could Set/Commit on the HA secondary (config divergence)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-048 (MEDIUM, HA config integrity).
+    The `clusterReadOnly` guard (secondary nodes reject config mutations; the
+    RG0 primary is the sole config authority) was checked ONLY at
+    `EnterConfigure*` (`store_lock.go`). Once a config session was already open
+    (entered before the node became secondary, or via a path that did not
+    re-check), `Set`/`Delete`/`Commit`/`Load*`/`Rollback` only verified
+    `candidate != nil` — ZERO `clusterReadOnly` refs on the mutating path. So an
+    open session could `Set` + `Commit` on the read-only secondary and diverge
+    its active config from the primary (a local edit the primary never sees,
+    overwritten by the next config-sync → churn/divergence).
+  - **Fix**: Added `ErrClusterReadOnly` sentinel (`envelope.go`, "configuration
+    is read-only on the cluster secondary") and an `ensureWritableLocked()`
+    helper (`store_lock.go`, called under `s.mu`). Every user-session mutating
+    op now calls it: `Set`, `Delete`, `DeactivateFromInput`/`ActivateFromInput`,
+    `Copy`, `Rename`, `Insert`, `Annotate`, `LoadOverride`/`LoadMerge`/`LoadSet`
+    (`store_command.go`), `CommitWithDescription` (⇒ `Commit`), `CommitConfirmed`,
+    `Rollback` (`store_commit.go`) — plus the retained `EnterConfigure*` gate,
+    now routed through the same helper/sentinel. Distinguished the user path from
+    the internal-sync path: `SyncApply` (HA peer-sync ingress) and
+    `PromoteRollback` (commit-confirmed timeout revert) promote `active`/`compiled`
+    DIRECTLY and never route through the gated methods, so they are unaffected —
+    the secondary still APPLIES primary-authored config. Boot `bootstrapFromFile`
+    enters config mode first (governed by the same gate; no-op at boot when
+    `clusterReadOnly=false`, before any RG0 transition).
+  - **RED-on-revert**: neutering `ensureWritableLocked()` to `return nil` made
+    the open-session `Set`/`Commit` (and EnterConfigure) rejection assertions
+    FAIL — the edit commits and diverges the secondary. Restored → green.
+    New tests also assert the RG0 primary can `Set`+`Commit`, `SyncApply` applies
+    on a read-only secondary (internal bypass), and a promoted node can commit.
+  - **Validation**: go test ./pkg/configstore/... ./pkg/cluster/... green;
+    go build ./... clean; gofmt + go vet clean.
+  - **File(s)**: pkg/configstore/envelope.go (ErrClusterReadOnly),
+    pkg/configstore/store_lock.go (ensureWritableLocked + EnterConfigure* gates),
+    pkg/configstore/store_command.go + store_commit.go (mutating-op gates),
+    pkg/configstore/cluster_readonly_3893_test.go (new, 5 tests),
+    pkg/configstore/README.md (Cluster read-only gate #3893 section)
+
 ## 2026-07-03 — #3884: firewall-filter cross-family name collision folds into FiltersInet (discard→accept-all fail-open)
 
 - **Timestamp**: 2026-07-03
