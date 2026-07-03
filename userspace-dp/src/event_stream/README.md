@@ -242,14 +242,36 @@ cluster-scoped.
   (see `protocol.rs`). Use `push_delta_lossless()` only when
   correctness requires every frame and the producer can tolerate
   back-pressure.
+- **Seq allocation is atomic with the channel enqueue (#3878).** Every
+  producer path (`push_delta`, `push_delta_lossless`, and the RT_FLOW
+  `try_emit_dataplane_*` telemetry path) allocates its `next_seq` value and
+  calls `tx.try_send` while holding `EventStreamShared.producer_seq_lock`, so
+  the seq embedded in a frame is monotonic in wire (channel-FIFO) order. Before
+  #3878 the seq was allocated in `encode_delta_frame` and enqueued in a
+  separate step, so two workers could allocate N and N+1 but enqueue them
+  inverted — the Go reader (zero reorder tolerance) treats a seq inversion as a
+  session-sync gap and forces a spurious full owner-RG resync + disconnect,
+  which is self-amplifying during recovery (F-152). On a **full-channel drop**
+  the allocated seq is **rolled back** (a compare-exchange on `next_seq`, safe
+  under the lock) rather than burned, so a saturation drop never leaves a hole
+  that trips the reader's gap check on the NEXT frame (F-153). The lock covers
+  only the atomic allocate + non-blocking `try_send`; the lossless retry loop
+  drops it before every sleep so a backpressured export never stalls the other
+  producers, and re-allocates (rolling back the failed attempt) on each retry so
+  the eventual wire seq matches the successful enqueue position. The I/O
+  thread's own FullResync/resync allocations do NOT take this lock: they precede
+  a reader reset, so their seq holes are benign, and the rollback CAS tolerates
+  the rare interleave with them.
 - **HA session open/close deltas are correctness-critical and use the
   LOSSLESS path (#2874).** `flush_session_deltas` (`afxdp/session_delta.rs`)
   routes the type-2 session-sync open/close delta through
-  `push_delta_lossless`, NOT `push_delta`. The lossy `push_delta` burns a
-  sequence number in `encode_delta_frame` and then drops the frame on a full
-  channel, leaving a hole the Go consumer cumulatively ACKs past — which
-  trims the helper replay window over the missing open/close, so the standby
-  permanently misses a session until an unrelated full-sync runs. When the
+  `push_delta_lossless`, NOT `push_delta`. The lossy `push_delta` DROPS the
+  frame on a full channel (since #3878 it rolls the seq back rather than burning
+  it, so the drop no longer leaves a seq hole — but the delta CONTENT is still
+  lost), so the standby permanently misses that session open/close until an
+  unrelated full-sync runs. The lossless path instead waits briefly for
+  capacity and surfaces a give-up as an `Err`, which the worker turns into a
+  resync (below) rather than a silent miss. When the
   lossless push cannot enqueue (peer disconnected / queue timeout — a
   genuinely wedged consumer), `flush_session_deltas` returns `true` and the
   worker loop latches loss-of-sync via `SessionTable::set_delta_loss`, which

@@ -559,6 +559,15 @@ backlog (`write_buf`) and writes non-blocking; on `WouldBlock` it keeps the
 remainder for the next cycle. Daemon detects gaps via sequence numbers and can
 request a full reconciliation.
 
+**Seq/enqueue atomicity (#3878)**: because the daemon detects gaps via sequence
+numbers and has zero reorder tolerance, the seq allocation and the channel
+enqueue happen together under `producer_seq_lock` — the seq embedded in a frame
+is monotonic in wire (channel-FIFO) order across all producer threads. A
+full-channel drop rolls the allocated seq back rather than burning it, so a
+saturation drop does not open a hole that the reader would mistake for a lost
+session mutation and answer with a spurious full owner-RG resync (self-
+amplifying during recovery). See `event_stream/README.md` for the mechanism.
+
 The idle **keepalive** also rides the canonical write path (#2883): the
 connected loop enqueues the keepalive frame into `write_buf` rather than calling
 `write_all` directly. Before #2883 the keepalive used `write_all` on the
