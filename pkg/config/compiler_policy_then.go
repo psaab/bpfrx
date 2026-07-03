@@ -98,23 +98,21 @@ func validatePolicyThenPermitStrict(nodes []*Node, lenient bool) ([]string, erro
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
-		thenNode := polNode.FindChild("then")
-		if thenNode == nil {
-			return nil
-		}
 		// A bare `then permit` (a `permit` node with no modifier tokens) is
 		// fully supported. Only `then permit <modifier>` carries an
-		// unsupported modifier. ALL `then permit` nodes are inspected
-		// (FindChildren, not FindChild): a flat-set `set ... then permit`
-		// followed by `set ... then permit application-services X` produces
-		// TWO separate `permit` nodes, and a FindChild-first gate would see
-		// only the (valid) bare node first and miss the unsupported modifier
-		// on the second. collapsedThenActionTokens flattens each node's
-		// modifier tokens across all three parser groupings (flat-onto-permit,
-		// collapsed-child, nested). The supported permit-modifier set is empty
-		// (supportedPolicyThenPermitChildren), so any token is unsupported;
-		// report the first per offending node.
-		for _, permitNode := range thenNode.FindChildren("permit") {
+		// unsupported modifier. ALL `then permit` nodes across ALL `then {}`
+		// blocks are inspected (policyThenActionNodes): a flat-set
+		// `set ... then permit` followed by `set ... then permit
+		// application-services X` produces TWO separate `permit` nodes (the
+		// #3377 two-node split), and #3842 adds the DUPLICATE inner `then {}`
+		// block case (load merge/override appends a second `then` child) — a
+		// FindChild-first gate saw only the first then block / bare node and
+		// missed the unsupported modifier on the second. collapsedThenAction-
+		// Tokens flattens each node's modifier tokens across all three parser
+		// groupings (flat-onto-permit, collapsed-child, nested). The supported
+		// permit-modifier set is empty (supportedPolicyThenPermitChildren), so
+		// any token is unsupported; report the first per offending node.
+		for _, permitNode := range policyThenActionNodes(polNode, "permit") {
 			for _, tok := range collapsedThenActionTokens(permitNode) {
 				if supportedPolicyThenPermitChildren[tok] {
 					continue
@@ -253,22 +251,19 @@ func validatePolicyThenRejectStrict(nodes []*Node, lenient bool) ([]string, erro
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
-		thenNode := polNode.FindChild("then")
-		if thenNode == nil {
-			return nil
-		}
 		// A bare `then reject` (a `reject` node with no modifier tokens) is
 		// fully supported. Only `then reject <modifier>` (a reject profile or
 		// a packet-type reject like tcp-reset) carries an unsupported
-		// modifier. ALL `then reject` nodes are inspected (FindChildren, not
-		// FindChild) for the same two-node split reason as the permit gate:
-		// `set ... then reject` then `set ... then reject profile X` produces
-		// TWO separate `reject` nodes. collapsedThenActionTokens flattens each
-		// node's modifier tokens across all three parser groupings. The
-		// supported reject-modifier set is empty
+		// modifier. ALL `then reject` nodes across ALL `then {}` blocks are
+		// inspected (policyThenActionNodes) for the same two-node split reason
+		// as the permit gate — `set ... then reject` then `set ... then reject
+		// profile X` produces TWO separate `reject` nodes — plus the #3842
+		// duplicate inner `then {}` block case. collapsedThenActionTokens
+		// flattens each node's modifier tokens across all three parser
+		// groupings. The supported reject-modifier set is empty
 		// (supportedPolicyThenRejectChildren), so any token is unsupported;
 		// report the first per offending node.
-		for _, rejectNode := range thenNode.FindChildren("reject") {
+		for _, rejectNode := range policyThenActionNodes(polNode, "reject") {
 			for _, tok := range collapsedThenActionTokens(rejectNode) {
 				if supportedPolicyThenRejectChildren[tok] {
 					continue
@@ -455,11 +450,12 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
-		thenNode := polNode.FindChild("then")
-		if thenNode == nil {
-			return nil
-		}
-		denyNodes := thenNode.FindChildren("deny")
+		// #3842: union `then deny` nodes across ALL `then {}` blocks
+		// (policyThenActionNodes), not just the first via FindChild — a
+		// duplicate inner then block (load merge/override) carries deny
+		// modifiers the compiler applies but a FindChild-first gate never
+		// validated.
+		denyNodes := policyThenActionNodes(polNode, "deny")
 		if len(denyNodes) == 0 {
 			return nil
 		}
