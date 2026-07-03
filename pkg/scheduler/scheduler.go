@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -266,49 +267,122 @@ func copyActiveState(in map[string]bool) map[string]bool {
 }
 
 // isWithinWindow determines whether now falls within the time window defined
-// by sched. It returns true (active) if no times are configured.
+// by sched.
+//
+// Fail-closed (#3849): an ABSENT window is INACTIVE, never always-on. A
+// scheduler that resolves to no window at all — no daily window, no per-day
+// window for today, and no date-only range — returns false. This is the
+// security half of the fix: a policy `scheduler-name` bound to a window that
+// failed to compile (or was left empty) must DENY, not permit 24/7. The old
+// "no times configured => active" shortcut was the fail-open bug.
 func isWithinWindow(now time.Time, sched *config.SchedulerConfig) bool {
-	if sched.StartTime == "" && sched.StopTime == "" {
-		return true
+	// Date-range gate (outer). A configured calendar range that now falls
+	// outside of closes the scheduler regardless of any time-of-day window.
+	inRange, ok := withinDateRange(now, sched)
+	if !ok {
+		return false // unparseable date -> fail closed
+	}
+	if !inRange {
+		return false
 	}
 
-	// Check date range if configured.
+	// Resolve the window that applies to today (a per-day override wins over
+	// the daily window).
+	win, have := effectiveDayWindow(sched, now.Weekday())
+	if !have {
+		// No time-of-day window applies today. A scheduler scoped ONLY by a
+		// date range (no daily/per-day time restriction) is active for the
+		// entire range; anything else has no window and fails CLOSED.
+		if schedulerHasDateRange(sched) && !schedulerHasTimeWindow(sched) {
+			return true
+		}
+		return false
+	}
+
+	if win.Exclude {
+		return false
+	}
+	if win.AllDay {
+		return true
+	}
+	// A half-specified window (only one of start/stop) is unparseable ->
+	// fail closed.
+	if win.StartTime == "" || win.StopTime == "" {
+		slog.Warn("scheduler: incomplete time window, failing closed",
+			"name", sched.Name, "start", win.StartTime, "stop", win.StopTime)
+		return false
+	}
+	return withinTimeOfDay(now, sched.Name, win.StartTime, win.StopTime)
+}
+
+// withinDateRange reports whether now is inside sched's calendar range.
+// ok is false when a configured date fails to parse (caller fails closed).
+func withinDateRange(now time.Time, sched *config.SchedulerConfig) (inRange, ok bool) {
 	if sched.StartDate != "" {
 		startDate, err := time.Parse("2006-01-02", sched.StartDate)
 		if err != nil {
 			slog.Warn("scheduler: invalid start date", "name", sched.Name, "date", sched.StartDate, "err", err)
-			return false
+			return false, false
 		}
 		if now.Before(startDate) {
-			return false
+			return false, true
 		}
 	}
 	if sched.StopDate != "" {
 		stopDate, err := time.Parse("2006-01-02", sched.StopDate)
 		if err != nil {
 			slog.Warn("scheduler: invalid stop date", "name", sched.Name, "date", sched.StopDate, "err", err)
-			return false
+			return false, false
 		}
-		// StopDate is inclusive: the scheduler is active through the entire stop date.
+		// StopDate is inclusive: active through the entire stop date.
 		if now.After(stopDate.AddDate(0, 0, 1)) {
-			return false
+			return false, true
 		}
 	}
+	return true, true
+}
 
-	// If only date range is set (no times), active for the entire date range.
-	if sched.StartTime == "" && sched.StopTime == "" {
-		return true
+// effectiveDayWindow resolves the window applying to weekday wd: a per-day
+// override if one exists, otherwise the scheduler's daily window. have is
+// false when neither is configured.
+func effectiveDayWindow(sched *config.SchedulerConfig, wd time.Weekday) (config.SchedulerDayWindow, bool) {
+	if len(sched.Days) > 0 {
+		if win := sched.Days[strings.ToLower(wd.String())]; win != nil {
+			return *win, true
+		}
 	}
+	if sched.AllDay || sched.StartTime != "" || sched.StopTime != "" {
+		return config.SchedulerDayWindow{
+			StartTime: sched.StartTime,
+			StopTime:  sched.StopTime,
+			AllDay:    sched.AllDay,
+		}, true
+	}
+	return config.SchedulerDayWindow{}, false
+}
 
-	// Parse start and stop times of day.
-	startTOD, err := parseTimeOfDay(sched.StartTime)
+// schedulerHasTimeWindow reports whether the scheduler carries any
+// time-of-day restriction (daily window or per-day arms).
+func schedulerHasTimeWindow(sched *config.SchedulerConfig) bool {
+	return sched.AllDay || sched.StartTime != "" || sched.StopTime != "" || len(sched.Days) > 0
+}
+
+func schedulerHasDateRange(sched *config.SchedulerConfig) bool {
+	return sched.StartDate != "" || sched.StopDate != ""
+}
+
+// withinTimeOfDay reports whether now's clock time falls within
+// [start, stop), handling overnight (wraparound) windows. An unparseable
+// bound fails closed.
+func withinTimeOfDay(now time.Time, name, start, stop string) bool {
+	startTOD, err := parseTimeOfDay(start)
 	if err != nil {
-		slog.Warn("scheduler: invalid start time", "name", sched.Name, "time", sched.StartTime, "err", err)
+		slog.Warn("scheduler: invalid start time", "name", name, "time", start, "err", err)
 		return false
 	}
-	stopTOD, err := parseTimeOfDay(sched.StopTime)
+	stopTOD, err := parseTimeOfDay(stop)
 	if err != nil {
-		slog.Warn("scheduler: invalid stop time", "name", sched.Name, "time", sched.StopTime, "err", err)
+		slog.Warn("scheduler: invalid stop time", "name", name, "time", stop, "err", err)
 		return false
 	}
 
