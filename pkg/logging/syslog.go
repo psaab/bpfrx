@@ -528,6 +528,32 @@ func (s *SyslogClient) writeMsg(line string) error {
 // A deadline expiry surfaces as a timeout error (os.ErrDeadlineExceeded);
 // callers treat it as a write failure and drop the message. Called with mu
 // held; conn is non-nil.
+//
+// Partial-frame teardown (#3874). A stream write can return 0 < n < len(b) —
+// some but not all of the framed record reached the wire — when the deadline
+// expires (or the peer resets) mid-write. Both stream framings are corrupted
+// by a truncated write: the RFC 6587 octet-count prefix ("<len> <msg>") and
+// the self-framing binary record (length at offset [3:5]) both tell the
+// collector to expect `len` bytes, so a truncated frame leaves the collector's
+// length parser mid-record. If the connection stayed up, the NEXT frame's
+// bytes would concatenate onto the truncated one and the parser would
+// mis-frame every subsequent message — a permanent desync of the
+// audit/forensics channel, exactly under incident load (slow writes). A
+// half-written octet-counted frame is unrecoverable in-stream; the only
+// correct recovery is close+reconnect so the next frame starts a fresh,
+// correctly-counted stream. So on a partial write we tear the conn down here
+// (conn=nil); the next Send sees conn==nil, treats it as a non-timeout write
+// failure, and the existing cooldown-gated reconnect path dials a fresh
+// stream. A clean 0-byte timeout (n==0) wrote nothing, cannot desync the
+// collector, and stays drop-without-close per #2287.
+//
+// Closing the raw conn here does NOT reintroduce the #2285 re-entrant
+// deadlock: net.Conn.Close() (and *tls.Conn.Close) is a pure syscall that
+// never routes back through slog/SyslogSlogHandler.Handle/SyslogClient.Send,
+// so it cannot re-lock s.mu on this goroutine. It is also NOT the #2287 stall
+// hazard: we only close (cheap) — we do NOT dial or re-arm a second
+// writeTimeout in this branch; the reconnect happens on the next Send via the
+// conn==nil path, so the worst-case in-Send stall stays one writeTimeout.
 func (s *SyslogClient) streamWrite(b []byte) error {
 	if s.writeTimeout > 0 {
 		// Best-effort: if SetWriteDeadline is unsupported by the conn it
@@ -535,7 +561,15 @@ func (s *SyslogClient) streamWrite(b []byte) error {
 		// without the bound). Real TCP/TLS conns always support it.
 		_ = s.conn.SetWriteDeadline(s.now().Add(s.writeTimeout))
 	}
-	_, err := s.conn.Write(b)
+	n, err := s.conn.Write(b)
+	if n > 0 && n < len(b) {
+		// A truncated frame is on the wire and the stream is now unrecoverable
+		// (see the doc comment). Discard the corrupt conn so the next Send
+		// reconnects and resyncs; leaving it up would concatenate the next
+		// frame onto the truncated one and permanently desync the collector.
+		s.conn.Close()
+		s.conn = nil
+	}
 	return err
 }
 

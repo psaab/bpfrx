@@ -86,6 +86,32 @@ connectionless and exempt:
   event reader (~2× plus a dial). Only a *genuine connection error*
   (broken pipe / ECONNRESET, non-timeout) triggers the reconnect+retry
   path below.
+- **Partial-frame teardown (#3874).** A stream `conn.Write` can return
+  `0 < n < len(b)` — some but not all of the framed record reached the
+  wire — when the deadline expires (or the peer resets) mid-write. Both
+  stream framings are corrupted by a truncated write: the RFC 6587
+  octet-count prefix (`<len> <msg>`) and the self-framing binary record
+  (length at offset `[3:5]`) both tell the collector to expect `len`
+  bytes, so a truncated frame leaves the collector's length parser
+  mid-record. If the connection stayed up, the NEXT frame's bytes would
+  concatenate onto the truncated one and the parser would mis-frame every
+  subsequent message — a **permanent desync of the audit/forensics
+  channel**, exactly under incident load (slow writes / a backpressured
+  collector, when the logs matter most). A half-written octet-counted
+  frame is unrecoverable in-stream, so `streamWrite` tears the connection
+  down (`conn=nil`) whenever `0 < n < len(b)`; the next `Send` sees
+  `conn==nil`, treats it as a non-timeout write failure, and the
+  cooldown-gated reconnect path dials a fresh, correctly-counted stream
+  (the resync). A **clean 0-byte timeout** (`n==0`) wrote nothing, cannot
+  desync the collector, and stays drop-without-close per #2287 — only a
+  partial write closes. Closing the raw conn here does NOT reintroduce
+  the #2285 re-entrant deadlock: `net.Conn.Close` (and `*tls.Conn.Close`)
+  is a pure syscall that never routes back through the
+  slog→`SyslogSlogHandler.Handle`→`SyslogClient.Send` path, so it cannot
+  re-lock `s.mu` on the sending goroutine. It is also NOT the #2287 stall
+  hazard: the close is cheap (no dial, no second `writeTimeout`) — the
+  reconnect happens on the next `Send` via the `conn==nil` path, so the
+  worst-case in-`Send` stall stays one `writeTimeout`.
 - **Reconnect cooldown.** A non-timeout write failure on a stream
   transport attempts one reconnect, gated by `reconnectCooldown`
   (default `defaultReconnectCooldown`, 1s). If the previous reconnect
