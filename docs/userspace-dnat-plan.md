@@ -762,3 +762,57 @@ emits the genuine preserve-destination-port entry, unchanged.
 the builder uses the existing `pool_address` / `pool_port` slots and simply
 drops a rule that would have translated wrongly, so `protocol_wire_v1.json` is
 unchanged.
+
+## 15. `then destination-nat off` exemption (#3844)
+
+Junos supports a DNAT **no-translate exemption**: a rule whose action is `then
+destination-nat off` matches the traffic but applies NO translation, and because
+DNAT rules are ORDERED, a matched `off` rule STOPS evaluation so a later rule
+cannot re-translate the flow. SNAT already handled `source-nat off` (via
+`NATThen.Off`); the DNAT path did not.
+
+**The fail-open (fable-161 F-003).** The token was accepted at commit, but the
+DNAT then-parser (`compileNATDestination`, `compiler_nat.go`) recognized ONLY
+`pool`, so an `off` rule compiled to an EMPTY `Then` (`Type == 0`, `Off ==
+false`, `PoolName == ""`). The snapshot builder
+(`buildDestinationNATSnapshotsWithFeeds`) then skipped it (`rule.Then.PoolName ==
+""` → `continue`). The "exempted" traffic was therefore NOT exempted — it fell
+through and was DNAT'd by a later matching rule, reaching a destination the
+operator explicitly exempted (fail-open).
+
+**Parser.** The DNAT then-parser now recognizes `off` in both AST shapes
+(flat-set leaf and hierarchical child), mirroring the SNAT `off` handling — it
+sets `Then.Type = NATDestination`, `Then.Off = true`. The `set` schema
+(`schema_security.go`) declares `off` under `then destination-nat` so CLI
+completion / `?` help advertise it.
+
+**Snapshot builder.** An `off` rule (`Then.Type == NATDestination && Then.Off`)
+is no longer skipped for having no pool. It runs the SAME destination / source /
+protocol / port match expansion as a translate rule (so the exemption is scoped
+identically) but emits an entry with an empty `pool_address` and the additive,
+skew-safe `off` wire field set. The pool lookup, pool-address/port validation,
+and pool-port override are all skipped for an `off` rule (there is no pool).
+
+**Dataplane (`nat/destination.rs`).** `DnatEntry` carries `off`.
+`from_snapshots` skips the `pool_address` parse for an `off` entry (it has none)
+and stores a placeholder value that is never read. The lookup helpers
+(`match_entries`, `match_prefix_slots`) now return a `DnatOutcome` enum
+(`Translate | Exempt`) instead of the raw pool value; a matched `off` entry
+yields `Exempt`. Because `Exempt` is a non-`None` `.or_else` result, an
+exemption at a more-specific proto/port/prefix tier HALTS the tier chain and is
+never overridden by a broader translate tier — the Junos "matched rule wins,
+stop" semantic. `lookup_with_counter_scoped` maps `Exempt` (and no-match) to no
+DNAT decision. `off` is added to the `insert_entry` / `insert_prefix_slot` dedup
+identity, so an exemption and a translate rule that share an otherwise-identical
+match stay DISTINCT and the earlier-inserted (config-order-first) entry wins the
+`.find()` (deduping them would drop the exemption — the fail-open again). An
+`off` entry is excluded from `destination_ips_scoped`, so the exempted
+destination is NOT registered as a firewall-local address (no proxy-ARP/ND for a
+real routed host, only for a translated VIP).
+
+**Wire.** One additive, skew-safe field: `DestinationNATRuleSnapshot.off`
+(`json:"off,omitempty"` / `#[serde(default)]`). An older helper that ignores it
+drops the pool-less `off` entry (reverting to the pre-#3844 fail-open, never a
+crash); a newer helper honoring an older control plane that omits the field
+defaults it `false` (a normal translate entry). `protocol_wire_v1.json`
+regenerated (one `"off": false` line on the DNAT specimen).
