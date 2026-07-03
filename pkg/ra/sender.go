@@ -786,7 +786,48 @@ func (s *sender) buildRA() *ndp.RouterAdvertisement {
 		ra.Options = append(ra.Options, ndp.NewMTU(uint32(s.cfg.LinkMTU)))
 	}
 
+	// #3895 defense-in-depth: drop any option that fails to marshal so one bad
+	// option degrades to "missing that option" instead of aborting the whole
+	// RA. The commit-time schema bounds (pkg/config router-advertisement
+	// lifetimes) are the primary guard; this backstops any un-bounded field
+	// that could still overflow its on-wire encoding at send time.
+	ra.Options = pruneUnmarshalableOptions(s.cfg.Interface, ra.Options)
+
 	return ra
+}
+
+// pruneUnmarshalableOptions returns the subset of opts that marshal
+// successfully, logging and dropping any option whose ndp encoding fails.
+//
+// This is defense-in-depth for the RA send path (#3895). The whole Router
+// Advertisement is built and sent in a single WriteTo, which internally
+// marshals every option; a single option that fails to marshal — e.g. an
+// ndp.PREF64 whose scaled lifetime overflows the RFC 8781 13-bit field, or any
+// future option with an out-of-range field — would return an error from that
+// one WriteTo and abort the ENTIRE advertisement. The segment then silently
+// stops receiving RAs and hosts lose their default route / SLAAC config when
+// the current advertisements expire (an IPv6 blackhole). Skipping the bad
+// option keeps the rest of the RA on the wire.
+//
+// NDP options are independent on the wire — marshalOptions simply concatenates
+// each option's bytes with no cross-option state — so probing each option in
+// isolation is faithful to how the combined RA marshals. The probe reuses
+// ndp.MarshalMessage (the same encoder the real conn.WriteTo uses) on a
+// throwaway RA holding just that one option.
+func pruneUnmarshalableOptions(iface string, opts []ndp.Option) []ndp.Option {
+	kept := opts[:0] // filter in place; buildRA hands us a fresh slice
+	for _, opt := range opts {
+		probe := &ndp.RouterAdvertisement{Options: []ndp.Option{opt}}
+		if _, err := ndp.MarshalMessage(probe); err != nil {
+			slog.Warn("ra: dropping un-marshalable option from RA (rest of RA still sent)",
+				"interface", iface,
+				"option", fmt.Sprintf("%T", opt),
+				"err", err)
+			continue
+		}
+		kept = append(kept, opt)
+	}
+	return kept
 }
 
 // randomAdvInterval returns a random duration between MinRtrAdvInterval and
