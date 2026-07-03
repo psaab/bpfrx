@@ -1344,6 +1344,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// 11. Apply system login users (create OS accounts, SSH keys)
 	d.applySystemLogin(cfg)
 
+	// 11b. Reconcile super-user sudo grants against the CURRENT config so a
+	// class downgrade or user removal REVOKES the stale NOPASSWD grant
+	// (#3889). Runs unconditionally — applySystemLogin returns early when
+	// there are no users, which is exactly the "all users removed" case
+	// that must still sweep stale grants.
+	d.reconcileSudoers(cfg)
+
 	// 12. Apply SSH service configuration (root-login)
 	d.applySSHConfig(cfg)
 
