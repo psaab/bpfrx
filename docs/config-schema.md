@@ -314,8 +314,9 @@ degrades to a no-op rather than a surprise rejection. It exempts:
 - **`args == 0`** — a childless, untyped, zero-arg node is AMBIGUOUS between
   a presence-only flag (`dhcp`) and a deliberately-OPAQUE leaf whose subtree
   the compiler reads despite no schema children (`tcp-mss <mode> <value>`,
-  #1979; the unmodeled NAT pool `address`/`port`/`host` leaves). The screen
-  flag subset (`tcp land`, …) is handled by #3411 instead.
+  #1979; the unmodeled NAT pool `address`/`host` leaves — `port` is now a
+  modeled container for its `deterministic`/`range` sub-stanzas, #3864). The
+  screen flag subset (`tcp land`, …) is handled by #3411 instead.
 
 A quoted multi-word value (`description "trust zone"`) arrives as ONE token,
 so it is unaffected — only an UNQUOTED trailing token (`description trust

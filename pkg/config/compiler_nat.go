@@ -1014,6 +1014,79 @@ func expandAddressRange(low, high string) ([]string, error) {
 	return result, nil
 }
 
+// applyDeterministicKeys reads deterministic CGNAT sub-tokens from a flat-set
+// key slice that begins immediately AFTER the "deterministic" keyword, e.g.
+// ["block-size","2016"] or ["host","address","100.64.0.0/22"] or ["host","X"].
+// Only fields that are present are written, so the caller can invoke it
+// repeatedly across sibling `port deterministic ...` leaves and the values
+// ACCUMULATE rather than overwrite last-wins (#3864; #2419 dual-AST-shape).
+func applyDeterministicKeys(det *DeterministicNATConfig, keys []string) {
+	for i := 0; i < len(keys); i++ {
+		switch keys[i] {
+		case "block-size":
+			if i+1 < len(keys) {
+				if n, err := strconv.Atoi(keys[i+1]); err == nil {
+					det.BlockSize = n
+				}
+			}
+		case "host":
+			// "host address X" (canonical) or the tolerant "host X".
+			if i+1 < len(keys) && keys[i+1] == "address" {
+				if i+2 < len(keys) {
+					det.HostAddress = keys[i+2]
+				}
+			} else if i+1 < len(keys) {
+				det.HostAddress = keys[i+1]
+			}
+		}
+	}
+}
+
+// applyDeterministicChildren reads deterministic CGNAT sub-fields from the
+// CHILDREN of a `deterministic` container node (the hierarchical /
+// schema-grouped shape, `deterministic { block-size N; host address X }`).
+// Like applyDeterministicKeys it only writes present fields so mixed/repeated
+// shapes accumulate into a single config (#3864).
+func applyDeterministicChildren(det *DeterministicNATConfig, detNode *Node) {
+	// The deterministic node may itself carry trailing flat-set tokens
+	// (e.g. Keys=["deterministic","block-size","2016"]).
+	if len(detNode.Keys) > 1 {
+		applyDeterministicKeys(det, detNode.Keys[1:])
+	}
+	for _, c := range detNode.Children {
+		switch c.Name() {
+		case "block-size":
+			if v := nodeVal(c); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					det.BlockSize = n
+				}
+			}
+		case "host":
+			applyDeterministicHost(det, c)
+		}
+	}
+}
+
+// applyDeterministicHost reads the subscriber CIDR from a `host` node in any
+// of its shapes: the flat leaf Keys=["host","address","X"], the hierarchical
+// `host { address X }`, or the tolerant bare `host X`. It never records the
+// literal keyword "address" as the value (#3864).
+func applyDeterministicHost(det *DeterministicNATConfig, hostNode *Node) {
+	if len(hostNode.Keys) >= 3 && hostNode.Keys[1] == "address" {
+		det.HostAddress = hostNode.Keys[2]
+		return
+	}
+	if addr := hostNode.FindChild("address"); addr != nil {
+		if v := nodeVal(addr); v != "" {
+			det.HostAddress = v
+			return
+		}
+	}
+	if len(hostNode.Keys) == 2 {
+		det.HostAddress = hostNode.Keys[1]
+	}
+}
+
 func compileNATSource(node *Node, sec *SecurityConfig) error {
 	// Global flags
 	if node.FindChild("address-persistent") != nil {
@@ -1054,7 +1127,37 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					}
 				}
 			case "port":
-				// "port range low N high M" or "port N"
+				// Port block configuration for a source pool. Supported
+				// AST shapes (#3864, #2419 dual-AST-shape):
+				//
+				//   flat leaf  : Keys=["port","range","low",N,"high",M]
+				//                Keys=["port",N]
+				//                Keys=["port","deterministic","block-size",N]
+				//                Keys=["port","deterministic","host","address",X]
+				//   hierarchical / schema-grouped: one `port` container
+				//                (schema_security.go groups the flat-set
+				//                tokens) with `range`/`deterministic`
+				//                children — `port { range low N high M;
+				//                deterministic { block-size N; host address
+				//                X } }`.
+				//
+				// Deterministic block-size and host address arrive on
+				// SEPARATE flat-set `set` lines; before #3864 each sibling
+				// `port deterministic ...` leaf reset pool.Deterministic to
+				// a fresh struct (last-wins) and the host address was never
+				// read off Keys, so the documented CGNAT quick-start was
+				// spuriously rejected ("block-size must be > 0" / "host
+				// address required"). Deterministic fields are now
+				// ACCUMULATED into a single config across every shape and
+				// sibling, writing only fields that are present.
+				ensureDet := func() *DeterministicNATConfig {
+					if pool.Deterministic == nil {
+						pool.Deterministic = &DeterministicNATConfig{}
+					}
+					return pool.Deterministic
+				}
+
+				// Port range / single value — flat leaf shapes.
 				if len(prop.Keys) >= 6 && prop.Keys[1] == "range" &&
 					prop.Keys[2] == "low" && prop.Keys[4] == "high" {
 					if v, err := strconv.Atoi(prop.Keys[3]); err == nil {
@@ -1063,69 +1166,46 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					if v, err := strconv.Atoi(prop.Keys[5]); err == nil {
 						pool.PortHigh = v
 					}
-				} else if v := nodeVal(prop); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
+				} else if len(prop.Keys) == 2 && prop.Keys[1] != "range" &&
+					prop.Keys[1] != "deterministic" {
+					// "port N" single value.
+					if n, err := strconv.Atoi(prop.Keys[1]); err == nil {
 						pool.PortLow = n
 						pool.PortHigh = n
 					}
 				}
-				// Check for deterministic port config (hierarchical)
-				for _, portChild := range prop.Children {
-					if portChild.Name() == "deterministic" {
-						detCfg := &DeterministicNATConfig{}
-						for _, detProp := range portChild.Children {
-							switch detProp.Name() {
-							case "block-size":
-								if v := nodeVal(detProp); v != "" {
-									if n, err := strconv.Atoi(v); err == nil {
-										detCfg.BlockSize = n
-									}
-								}
-							case "host":
-								// "host address 100.64.0.0/22"
-								if len(detProp.Keys) >= 3 && detProp.Keys[1] == "address" {
-									detCfg.HostAddress = detProp.Keys[2]
-								} else if v := nodeVal(detProp); v != "" {
-									detCfg.HostAddress = v
-								}
-								for _, hc := range detProp.Children {
-									if hc.Name() == "address" {
-										if v := nodeVal(hc); v != "" {
-											detCfg.HostAddress = v
-										}
-									}
-								}
-							}
-						}
-						pool.Deterministic = detCfg
-					}
-				}
-				// Flat set: "port deterministic block-size 2016"
+
+				// Deterministic — flat leaf: Keys=["port","deterministic",...].
 				if len(prop.Keys) >= 2 && prop.Keys[1] == "deterministic" {
-					detCfg := &DeterministicNATConfig{}
-					for i := 2; i < len(prop.Keys); i++ {
-						if prop.Keys[i] == "block-size" && i+1 < len(prop.Keys) {
-							if n, err := strconv.Atoi(prop.Keys[i+1]); err == nil {
-								detCfg.BlockSize = n
+					applyDeterministicKeys(ensureDet(), prop.Keys[2:])
+				}
+
+				// Children — hierarchical / schema-grouped `port { ... }`.
+				for _, pc := range prop.Children {
+					switch pc.Name() {
+					case "range":
+						// range low N high M
+						if len(pc.Keys) >= 5 && pc.Keys[1] == "low" &&
+							pc.Keys[3] == "high" {
+							if v, err := strconv.Atoi(pc.Keys[2]); err == nil {
+								pool.PortLow = v
+							}
+							if v, err := strconv.Atoi(pc.Keys[4]); err == nil {
+								pool.PortHigh = v
+							}
+						}
+					case "deterministic":
+						applyDeterministicChildren(ensureDet(), pc)
+					default:
+						// Bare numeric child: `port N` grouped under a
+						// modeled container becomes port { N }.
+						if pc.IsLeaf && len(pc.Keys) == 1 {
+							if n, err := strconv.Atoi(pc.Keys[0]); err == nil {
+								pool.PortLow = n
+								pool.PortHigh = n
 							}
 						}
 					}
-					// host address from children
-					for _, portChild := range prop.Children {
-						if portChild.Name() == "host" {
-							if len(portChild.Keys) >= 3 && portChild.Keys[1] == "address" {
-								detCfg.HostAddress = portChild.Keys[2]
-							}
-							for _, hc := range portChild.Children {
-								if hc.Name() == "address" {
-									if v := nodeVal(hc); v != "" {
-										detCfg.HostAddress = v
-									}
-								}
-							}
-						}
-					}
-					pool.Deterministic = detCfg
 				}
 			case "persistent-nat":
 				// #2823: default is target-host-port (the pre-#2823
