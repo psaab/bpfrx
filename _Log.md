@@ -28759,3 +28759,30 @@ top.
   pkg/frr/README.md (MINOR 1 metric-only-doesn't-float),
   pkg/config/delete_static_nexthop_3872_test.go (new, 5 tests),
   pkg/frr/static_empty_route_3872_test.go (new, 2 tests)
+
+## 2026-07-03 — #3886 NAT64 rule-set `prefix` /96 commit gate
+- **Timestamp**: 2026-07-03
+- **Action**: Add commit-time strict/lenient validator for a NAT64 rule-set
+  `prefix`. A non-/96 or malformed prefix committed GREEN then made the Rust
+  `Nat64State::try_from_snapshots` /96-integrity check
+  (`userspace-dp/src/nat64.rs`) abort the ENTIRE `build_reconcile_forwarding`
+  without publishing → dataplane frozen at the last-good snapshot → every later
+  commit silently stopped reaching the dataplane. New `validateNAT64PrefixStrict`
+  (`compiler_nat.go`, wired after `validateNPTv6Strict` in `compileExpanded`)
+  mirrors the Rust check EXACTLY: split on `/`, the mask token must parse as
+  decimal `96` (only /96 supported), the address token must be IPv6 via the
+  textual `natAddrFamily` (colon == v6, matching Rust `Ipv6Addr::from_str` incl.
+  the `::ffff:x` mapped form). Strict (commit/commit-check): hard-reject.
+  Lenient (`CompileConfigLenient`/`CompileConfigForNodeLenient`, new
+  `lenientNAT64Prefix` flag): warn so an already-persisted / peer-synced bad
+  prefix still BOOTS (#1960 no-brick) — the helper's own try_from_snapshots
+  backstop keeps the previous live state. Empty/absent prefix is out of scope
+  (buildNAT64Snapshots skips it, never reaches the Rust check). RED-on-revert
+  proven (forcing lenient=true made all reject tests FAIL). go test
+  ./pkg/config/... green; go build ./... clean; gofmt + vet clean. Flagged the
+  Rust abort-whole-rebuild-vs-skip-bad-rule as a separate defense-in-depth
+  follow-up (larger userspace-dp change), not fixed here.
+- **File(s)**: pkg/config/compiler_nat.go (validateNAT64PrefixStrict),
+  pkg/config/compiler.go (lenientNAT64Prefix option + wiring + 2 lenient
+  blocks), pkg/config/compiler_nat64_prefix_test.go (new, 11 tests),
+  docs/config-schema.md (#3886 subsection)

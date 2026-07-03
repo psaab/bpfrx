@@ -3188,6 +3188,63 @@ match/prefix reject + parseable host/​block still-compile + lenient-warn). Lik
 `pool-utilization-alarm`, this is compiler-side only — not yet a typed
 `setSchema` leaf.
 
+### #3886 — NAT64 rule-set `prefix` /96 commit gate
+
+A NAT64 rule-set `prefix` (`security nat nat64 rule-set <r> prefix <p>`) is read
+verbatim into the wire snapshot (`compileNAT64` in `compiler_nat.go` →
+`NAT64RuleSnapshot.Prefix` via `buildNAT64Snapshots`) and parsed at dataplane
+apply by `Nat64State::try_from_snapshots` (`userspace-dp/src/nat64.rs`). That
+**/96-integrity check** requires an IPv6 `<address>/96`: it splits the string on
+`/`, the token after the first `/` MUST parse as a decimal `96` (only `/96` is
+supported by the translator), and the address token before the `/` MUST parse as
+an `Ipv6Addr`. Anything else — a non-`/96` length, a missing/garbage mask, or a
+non-IPv6 / malformed address — makes `try_from_snapshots` return a
+`SnapshotIntegrityError`, which propagates via `?` out of
+`build_reconcile_forwarding` and **aborts the ENTIRE forwarding rebuild WITHOUT
+publishing**. The dataplane is then frozen at the last-good snapshot: every later
+commit (new sessions, policy, NAT) silently stops reaching the dataplane. The
+`prefix` `setSchema` leaf (`schema_security.go`) carries no `keyValidator`
+(unlike the RA `nat-prefix`/`nat64prefix` leaves, whose `ValidatePREF64CIDR`
+accepts the broader RFC 8781 `{32,40,48,56,64,96}` set — WRONG for a NAT64
+translator that supports `/96` only), so before this gate a bad prefix committed
+GREEN and wedged the whole control→dataplane pipeline.
+
+`validateNAT64PrefixStrict` (`pkg/config/compiler_nat.go`, invoked from the
+typed-config phase of `compileExpanded` in `compiler.go`, right after
+`validateNPTv6Strict`) closes that gap and mirrors the Rust check EXACTLY (split
+on `/`, mask token must be `96`, address token must be IPv6 via the textual
+`natAddrFamily` — a colon means IPv6, matching Rust `Ipv6Addr::from_str` for the
+IPv4-mapped `::ffff:x` form), so anything that would abort the rebuild at runtime
+is rejected at commit — no commit-accept → runtime-abort gap.
+
+- **Scope / out-of-scope:** only a NON-EMPTY prefix is validated. An empty/absent
+  prefix is deliberately exempt — `buildNAT64Snapshots` skips an empty-prefix
+  rule, so it is never emitted on the wire and never reaches the Rust check, so
+  it cannot freeze the rebuild.
+- **Strict (`commit` / `commit check`):** a non-`/96` or malformed prefix is a
+  HARD commit error naming the rule-set and offending prefix.
+- **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
+  `CompileConfigForNodeLenient`, flag `lenientNAT64Prefix`):** the violation
+  downgrades to a `cfg.Warnings` entry so a node that committed a bad NAT64
+  prefix BEFORE this gate existed (or a peer-synced config) still BOOTS after
+  upgrade instead of failing closed (#1960 fail-closed-on-compile-failure). The
+  Rust helper's own `try_from_snapshots` backstop keeps the previous live
+  forwarding state, so a leniently-loaded bad prefix is inert — and the
+  operator's next strict commit rejects it loudly.
+
+> Defense-in-depth follow-up (not fixed here): even with the commit gate, a bad
+> NAT64 prefix arriving via HA peer-sync/lenient still makes the Rust
+> `try_from_snapshots` reject the WHOLE forwarding snapshot rather than skipping
+> just the bad NAT64 rule and publishing the rest. Scoping the Rust rejection to
+> the offending rule is a larger `userspace-dp` change tracked separately.
+
+Regression coverage: `pkg/config/compiler_nat64_prefix_test.go` (well-known
+`64:ff9b::/96` + `/96` NSP accept; non-`/96` lengths, missing mask, garbage
+mask, malformed IPv6 address, and IPv4 prefix reject with asserted message;
+lenient strict-reject → warn + valid-no-warning). Compiler-side only — not a
+typed `setSchema` leaf (a schema `keyValidator` has no lenient mode and would
+hard-reject on the load path too, re-introducing the #1960 boot-brick).
+
 ### #2217 — firewall / application undefined-reference validation
 
 Three firewall/application cross-references compiled cleanly with no operator
