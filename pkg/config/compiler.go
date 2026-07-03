@@ -407,6 +407,24 @@ type compileOpts struct {
 	// last-write-wins maps it always produced are unchanged on that path. Same
 	// doctrine as lenientApplicationSpecs / lenientApplicationSetMembers.
 	lenientApplicationNameCollisions bool
+
+	// lenientFirewallFilterFamilyCollisions (#3884, fable-review-161 F-030)
+	// downgrades the firewall-filter cross-family name-collision gate
+	// (validateFirewallFilterFamilyCollisionsAST) from a hard compile error to a
+	// cfg.Warnings entry. compileFirewall folds every filter family except inet6
+	// (inet, any, mpls, ccc, vpls, bridge, ...) into ONE name-keyed map
+	// (fw.FiltersInet) with an unconditional `dest[name] = filter` write, so a
+	// same-name filter authored under a second such family silently OVERWRITES
+	// the first — a `discard` filter can be replaced by a same-name accept-all
+	// (fail-open). Downstream consumers key filters by name within the inet (V4) /
+	// inet6 (V6) buckets only, with no family dimension to disambiguate, so the
+	// reuse is genuinely ambiguous. The strict commit / commit-check path hard-
+	// rejects it; the tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config an older binary silently
+	// accepted still BOOTS (#1960 no-brick), keeping the arbitrary-but-stable
+	// last-write-wins map compileFirewall always produced. Same doctrine as
+	// lenientApplicationNameCollisions.
+	lenientFirewallFilterFamilyCollisions bool
 	// lenientFilterProtocols (#2175 review) downgrades the firewall-filter
 	// `from protocol <token>` gate (validateFilterProtocolsStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1362,6 +1380,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRouteFilterMatchTypes:           true,
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
+		lenientFirewallFilterFamilyCollisions:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1540,6 +1559,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRouteFilterMatchTypes:           true,
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
+		lenientFirewallFilterFamilyCollisions:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1802,6 +1822,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3884 (fable-review-161 F-030) firewall-filter cross-family name-collision
+	// gate. compileFirewall folds every filter family except inet6 into ONE
+	// name-keyed map (fw.FiltersInet) with an unconditional overwrite, so a
+	// same-name filter under a second non-inet6 family silently replaces the
+	// first — a discard filter can become a same-name accept-all (fail-open).
+	// Strict (commit / commit-check): the collision hard-rejects. Lenient (load /
+	// peer-sync): warn so an already-persisted or peer-synced config an older
+	// binary silently accepted still BOOTS (#1960 / #3261). Runs on the group-
+	// expanded, inactive-pruned AST because the colliding definitions are merged
+	// away by last-write-wins by the time fw.FiltersInet exists — only the raw
+	// AST still carries every family's definition.
+	fwFilterFamilyWarnings, err := validateFirewallFilterFamilyCollisionsAST(
+		tree.Children, opts.lenientFirewallFilterFamilyCollisions)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3096: the #3079 interim NAT rule-set scope reject is LIFTED. A
 	// `security nat {source|destination|static}` rule-set whose `from`/`to`
 	// clause scopes traffic by `interface` or `routing-instance` is now
@@ -1990,6 +2027,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, flowTraceSizeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
+	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
