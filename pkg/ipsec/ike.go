@@ -104,14 +104,16 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 			// requires an integrity algorithm, so the fallback includes
 			// both a cipher and integrity in addition to the modp term. The
 			// string is built directly with swanctl's canonical keyword
-			// spellings (aes256 / sha256 / modp<bits>) rather than via
-			// buildESPProposal: buildESPProposal's hmac-sha-256-128
-			// normalization emits the non-canonical "sha256128" token,
-			// which strongSwan's proposal parser does not recognize (its
+			// spellings (aes256 / sha256 / modp<bits>). This is now the
+			// same integrity keyword buildESPProposal produces —
+			// normalizeAuthAlg maps hmac-sha-256-128 to the strongSwan base
+			// keyword "sha256" (#3851), not the invalid dash-stripped
+			// "sha256128" that strongSwan's proposal parser rejects (its
 			// keyword table has only "sha256"/"sha2_256" for
-			// AUTH_HMAC_SHA2_256_128) and would reject the whole proposal.
-			// (The normal-path "sha256128" spelling is a separate
-			// pre-existing concern tracked outside #2073.)
+			// AUTH_HMAC_SHA2_256_128). This fallback keeps the direct
+			// spelling because the proposal reference dangles (there is no
+			// proposal object to hand to buildESPProposal), not because the
+			// builder is unsafe.
 			//
 			// formatDHGroup renders the PFS group with its canonical
 			// swanctl keyword: modp<bits> for the MODP groups
@@ -251,12 +253,60 @@ func gcmPRF(authAlg string) string {
 	}
 }
 
-// normalizeAuthAlg maps a Junos authentication-algorithm name to its
-// swanctl integrity token (hmac-sha-256 -> sha256).
+// normalizeAuthAlg maps a Junos authentication-algorithm name to the
+// swanctl/charon integrity token that strongSwan actually accepts.
+//
+// Junos names an ESP integrity algorithm with an explicit HMAC
+// truncation length: hmac-sha-256-128, hmac-sha1-96, hmac-md5-96,
+// hmac-sha-384-192, hmac-sha-512-256. strongSwan's proposal keyword
+// table names the BASE algorithm only (sha256, sha1, md5, sha384,
+// sha512) and derives the RFC-mandated truncation internally. The Junos
+// truncation suffix must therefore be mapped away, NOT dash-stripped: a
+// naive strings.ReplaceAll(authAlg, "-", "") on hmac-sha-256-128 yields
+// "sha256128", which is not a token in strongSwan's
+// proposal_keywords_static.txt, so charon rejects the ENTIRE ESP/IKE
+// proposal and the tunnel silently never loads (#3851).
+//
+// The IKE (Phase 1) config layer feeds the shorter Junos spellings
+// (sha-256, sha1, md5) with no truncation suffix, and swanctl tokens
+// (sha256) can also arrive already normalized; all collapse to the same
+// canonical token here, so the function is idempotent.
+//
+// AEAD (GCM) proposals never reach this function — the callers take the
+// gcmPRF() branch for AEAD ciphers, which carry their own ICV and no
+// separate integrity algorithm.
 func normalizeAuthAlg(authAlg string) string {
-	a := strings.ReplaceAll(authAlg, "hmac-", "")
+	// Collapse every Junos/swanctl spelling to one comparable token:
+	// drop the hmac- prefix and all dashes. hmac-sha-256-128 ->
+	// "sha256128", sha-256 -> "sha256", sha256 -> "sha256".
+	a := strings.ToLower(authAlg)
+	a = strings.ReplaceAll(a, "hmac-", "")
 	a = strings.ReplaceAll(a, "-", "")
-	return a
+
+	// Map the collapsed token (with any truncation-length suffix) to the
+	// strongSwan base-algorithm keyword. Longer SHA-2 digests are matched
+	// before sha1 so no truncation suffix can be misread.
+	switch {
+	case a == "":
+		return ""
+	case strings.HasPrefix(a, "sha512"):
+		return "sha512"
+	case strings.HasPrefix(a, "sha384"):
+		return "sha384"
+	case strings.HasPrefix(a, "sha256"):
+		return "sha256"
+	case strings.HasPrefix(a, "sha224"):
+		return "sha224"
+	case strings.HasPrefix(a, "sha1"):
+		return "sha1"
+	case strings.HasPrefix(a, "md5"):
+		return "md5"
+	default:
+		// Unknown algorithm: return the collapsed token unchanged rather
+		// than inventing a spelling. This preserves the historical
+		// behaviour for any name outside the known SHA/MD5 family.
+		return a
+	}
 }
 
 // buildIKEProposalFromIKE builds a swanctl IKE proposal string from an IKE proposal.
