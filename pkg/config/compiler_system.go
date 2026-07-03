@@ -1068,6 +1068,11 @@ func parseSNMPv3UserKeys(keys []string, user *SNMPv3User) {
 	}
 }
 
+var schedulerWeekdays = map[string]struct{}{
+	"monday": {}, "tuesday": {}, "wednesday": {}, "thursday": {},
+	"friday": {}, "saturday": {}, "sunday": {},
+}
+
 func compileSchedulers(node *Node, cfg *Config) error {
 	if cfg.Schedulers == nil {
 		cfg.Schedulers = make(map[string]*SchedulerConfig)
@@ -1077,23 +1082,92 @@ func compileSchedulers(node *Node, cfg *Config) error {
 		sched := &SchedulerConfig{Name: inst.name}
 
 		for _, prop := range inst.node.Children {
-			switch prop.Name() {
-			case "start-time":
+			name := prop.Name()
+			switch {
+			case name == "start-time":
+				// Legacy simplified shape: start-time/stop-time as direct
+				// children of the scheduler (the daily window).
 				sched.StartTime = nodeVal(prop)
-			case "stop-time":
+			case name == "stop-time":
 				sched.StopTime = nodeVal(prop)
-			case "start-date":
+			case name == "start-date":
 				sched.StartDate = nodeVal(prop)
-			case "stop-date":
+			case name == "stop-date":
 				sched.StopDate = nodeVal(prop)
-			case "daily":
+			case name == "daily":
 				sched.Daily = true
+				// Junos hierarchical shape:
+				//   daily { start-time X; stop-time Y; }
+				//   daily all-day;  /  daily { exclude; }
+				// A bare `daily;` leaf carries no window and only flips the
+				// recurrence flag. Descend to read the daily window (#3849 —
+				// previously this branch ignored the block, leaving the
+				// window empty so isWithinWindow fell open to always-active).
+				if win, ok := schedulerWindowFromNode(prop); ok {
+					if win.StartTime != "" {
+						sched.StartTime = win.StartTime
+					}
+					if win.StopTime != "" {
+						sched.StopTime = win.StopTime
+					}
+					sched.AllDay = win.AllDay
+				}
+			default:
+				if _, ok := schedulerWeekdays[name]; ok {
+					if win, ok := schedulerWindowFromNode(prop); ok {
+						if sched.Days == nil {
+							sched.Days = make(map[string]*SchedulerDayWindow)
+						}
+						w := win
+						sched.Days[name] = &w
+					}
+				}
 			}
 		}
 
 		cfg.Schedulers[inst.name] = sched
 	}
 	return nil
+}
+
+// schedulerWindowFromNode extracts a time window from a `daily` or weekday
+// container node inside a scheduler. It handles both AST shapes and returns
+// ok=false when the node is a bare flag with no recognized window statement
+// (e.g. a plain `daily;`), so the caller can leave the window unset.
+func schedulerWindowFromNode(n *Node) (SchedulerDayWindow, bool) {
+	var win SchedulerDayWindow
+	found := false
+
+	// Flat leaf shape where the keyword rides on the node's own Keys, e.g.
+	// hierarchical `daily all-day;` parses to Keys=["daily","all-day"].
+	if len(n.Keys) >= 2 {
+		switch n.Keys[1] {
+		case "all-day":
+			win.AllDay = true
+			found = true
+		case "exclude":
+			win.Exclude = true
+			found = true
+		}
+	}
+
+	for _, c := range n.Children {
+		switch c.Name() {
+		case "start-time":
+			win.StartTime = nodeVal(c)
+			found = true
+		case "stop-time":
+			win.StopTime = nodeVal(c)
+			found = true
+		case "all-day":
+			win.AllDay = true
+			found = true
+		case "exclude":
+			win.Exclude = true
+			found = true
+		}
+	}
+	return win, found
 }
 
 func compileChassis(node *Node, ch *ChassisConfig) error {

@@ -154,6 +154,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	"groups":             {desc: "Configuration groups", wildcard: &schemaNode{desc: "Group name", placeholder: "<group-name>"}}, // wildcard children set in init()
 	"apply-groups":       {desc: "Groups from which to inherit configuration data", args: 1, multi: true, placeholder: "<group-name>", children: nil},
 	"security":           schemaSecurity,
+	"schedulers":         schemaSchedulers,
 	"interfaces":         schemaInterfaces,
 	"applications":       schemaApplications,
 	"routing-options":    schemaRoutingOptions,
