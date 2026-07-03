@@ -28969,3 +28969,30 @@ top.
   removed inline write from applySystemLogin), pkg/daemon/daemon_apply.go
   (step 11b reconcileSudoers call), pkg/daemon/daemon_sudoers_reconcile_3889_test.go
   (new, 4 tests), docs/system-login.md (#3889 revocation section)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3896 — type IKE gateway `version`, IKE policy `mode`, and
+  gateway `nat-traversal` setSchema leaves with `ValidateEnum` so a typo
+  fails closed at commit instead of silently weakening negotiation
+  downstream. These three leaves were untyped free-form (`args:1`, no
+  validator) in BOTH the `ike` and `ipsec` stanza copies of the gateway
+  schema (fable-review-161 F-039). A typo committed CLEAN and was then
+  mis-mapped by the swanctl generator: `version v2-onyl` dropped the
+  v2-only pin (gateway silently accepts legacy IKEv1 — a downgrade);
+  `mode agressive` fell back to main mode; a typo'd `nat-traversal` value
+  silently took the auto-detect default. The accepted enum sets mirror
+  EXACTLY the generator-recognized values (verified against
+  `pkg/ipsec/policy.go` version/encap switch + `pkg/ipsec/ike.go`
+  aggressive check — a value the generator handles but the enum omitted
+  would be a false-reject regression): version ∈ {v1-only, v2-only},
+  mode ∈ {main, aggressive}, nat-traversal ∈ {enable, disable, force}.
+  ValidateEnum names the offending value in the reject error. RED-on-
+  revert proven: reverting the three leaves to untyped makes every typo
+  case return nil and go RED. go test ./pkg/config/ ./pkg/ipsec/ green
+  (existing ipsec render tests — version=2, aggressive=yes — unchanged,
+  proving valid values still render identically); go build ./... clean;
+  gofmt + vet clean.
+- **File(s)**: pkg/config/schema_security.go (mode/version/nat-traversal
+  ValidateEnum in ike.policy + ike.gateway + ipsec.gateway),
+  pkg/config/schema_ike_enum_3896_test.go (new, RED-on-revert gate),
+  docs/config-schema.md (#3896 enum-typing section)

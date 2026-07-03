@@ -1192,6 +1192,27 @@ reserved for whole-dataplane selection where a rewrite shim
     UNTYPED: the swanctl renderer normalizes arbitrary algorithm spellings
     by string substitution, so an enum there would false-reject valid
     configs.
+  - **#3896 (IKE negotiation-mode / version / NAT-T enums):** the IKE
+    gateway `version`, IKE policy `mode`, and gateway `nat-traversal` leaves
+    were untyped free-form (`args:1`, no validator) in BOTH the `ike` and
+    `ipsec` stanza copies of the gateway schema, so a typo committed clean and
+    was then silently mis-mapped by the swanctl generator — a MEDIUM security
+    footgun (silent negotiation weakening):
+    - `version` — `ValidateEnum([v1-only, v2-only])`. `pkg/ipsec/policy.go`
+      emits `version = 2` for `v2-only` and `version = 1` for `v1-only`; any
+      OTHER spelling emits no `version` line, so a `v2-onyl` typo dropped the
+      v2-only pin and the gateway silently accepted legacy IKEv1 (a downgrade).
+    - `mode` — `ValidateEnum([main, aggressive])`. `pkg/ipsec/ike.go`
+      `resolveIKESettings` sets `aggressive = (Mode == "aggressive")`; every
+      other spelling (including a `agressive` typo) fell back to main mode.
+    - `nat-traversal` — `ValidateEnum([enable, disable, force])`. The
+      `pkg/ipsec/policy.go` switch maps `disable`→`encap = no`,
+      `force`→`forceencaps = yes`, and default (`enable`/empty)→auto-detect;
+      an unrecognized value silently took the auto-detect default.
+
+    The accepted sets are EXACTLY the generator-recognized values (a value the
+    generator handles but the enum omitted would be a false-reject regression).
+    A typo is now rejected at commit with an error naming the bad value.
   - **#2404 (responder-only / dynamic-IP peer):** the `security ike gateway
     <g> dynamic` node now declares a `hostname <fqdn>` child (it was a
     `children: nil` leaf in both the `ike` and `ipsec` stanza copies of the
