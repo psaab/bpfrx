@@ -108,6 +108,28 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**`valueList` — a bracketed value list on a multi leaf that ALSO has a
+modifier child (#3872).** The bracket-absorption above fires only for a
+`multi: true` leaf with `children: nil`. The static-route `next-hop` leaf is
+the exception: it is `multi: true` (so `next-hop [ gw1 gw2 ]` — canonical Junos
+ECMP — collapses onto ONE leaf `Keys=[next-hop gw1 gw2]` and the compiler
+installs every gateway as an equal-cost next-hop) BUT it also declares an
+`interface` modifier child for the IPv6 link-local form
+(`next-hop fe80::1 interface reth0.50`). A plain `multi` leaf with children
+would stay a container and never absorb the list; a plain-container leaf would
+mis-nest the second gateway as an orphan child. `next-hop` therefore sets
+`valueList: true`, which tells `SetPath` (`ast_edit.go`) to absorb a trailing
+value list (tokens that are neither a sibling nor a known child) onto the leaf
+while STILL descending into the container when the next token names the
+`interface` child. Only `next-hop` sets it; every other `multi`+children node
+(the CoS named containers) is unchanged — the guard `children == nil ||
+valueList` keeps them on the container path. The compiler reads every gateway
+from `Keys[1:]` (skipping an inline `interface <if>` pair) plus the `interface`
+child. This is DISTINCT from a `qualified-next-hop`, which is a separate
+floating-backup leaf carrying its own per-next-hop preference (#3871): a plain
+`next-hop` list is equal-cost ECMP, a `qualified-next-hop` is a distance-N
+backup.
+
 **Delete-side contract: `delete` a member, not the whole list (#3846).**
 The read-side accumulate rule above has a mirror on the edit side. A
 `delete ... from protocol tcp` on a bracket-list leaf must remove ONLY the

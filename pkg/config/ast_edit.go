@@ -257,46 +257,67 @@ func (t *ConfigTree) SetPath(path []string) error {
 		//     `destination-port 20000 to 20003` is handled the same way:
 		//     none of "20000", "to", "20003" are siblings, so all land on
 		//     the one leaf.
-		if childSchema.children == nil && childSchema.multi && i < len(path) {
+		// A multi leaf collapses a trailing value list onto ONE node. This
+		// runs for a plain multi leaf (children == nil, the #2419 case) and,
+		// via the valueList opt-in, for a multi leaf that ALSO declares
+		// modifier children (the #3872 static `next-hop [ a b ]`, whose only
+		// child is the `interface` modifier). A multi leaf WITH children that
+		// does NOT opt in (every CoS named container) is untouched — the guard
+		// keeps it on the container path below, exactly as before.
+		if childSchema.multi && (childSchema.children == nil || childSchema.valueList) && i < len(path) {
 			nextToken := path[i]
 			_, nextIsSibling := schema.children[nextToken]
 			if !nextIsSibling && schema.wildcard != nil {
 				nextIsSibling = true
 			}
-			if !nextIsSibling {
-				// Trailing values for this leaf: absorb every following
-				// token that is not a sibling keyword so the flat-set list
-				// collapses onto one node, matching the hierarchical AST.
-				// (case (b) only runs when schema.wildcard == nil — the
-				// wildcard check above forces nextIsSibling=true otherwise.)
-				nodeKeys = append([]string(nil), nodeKeys...)
-				for i < len(path) {
-					if _, sib := schema.children[path[i]]; sib {
+			// When the next token names a known child of THIS node (only
+			// possible for a valueList node — plain multi leaves have no
+			// children, so indexing a nil map yields ok == false), the
+			// occurrence is a CONTAINER: fall through to the container path so
+			// the modifier attaches as a child rather than being absorbed as a
+			// bogus extra value.
+			if _, nextIsChild := childSchema.children[nextToken]; !nextIsChild {
+				if !nextIsSibling {
+					// Trailing values for this leaf: absorb every following
+					// token that is neither a sibling keyword nor a known
+					// child so the flat-set list collapses onto one node,
+					// matching the hierarchical AST. (case (b) only runs when
+					// schema.wildcard == nil — the wildcard check above forces
+					// nextIsSibling=true otherwise.)
+					nodeKeys = append([]string(nil), nodeKeys...)
+					for i < len(path) {
+						if _, sib := schema.children[path[i]]; sib {
+							break
+						}
+						if _, ch := childSchema.children[path[i]]; ch {
+							break
+						}
+						nodeKeys = append(nodeKeys, path[i])
+						i++
+					}
+				}
+				// Dedup: skip if exact leaf already exists.
+				dup := false
+				for _, n := range *current {
+					if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+						dup = true
 						break
 					}
-					nodeKeys = append(nodeKeys, path[i])
-					i++
 				}
-			}
-			// Dedup: skip if exact leaf already exists.
-			dup := false
-			for _, n := range *current {
-				if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
-					dup = true
-					break
+				if !dup {
+					*current = append(*current, &Node{
+						Keys:   append([]string(nil), nodeKeys...),
+						IsLeaf: true,
+					})
 				}
+				if i >= len(path) {
+					return nil
+				}
+				// Don't descend — continue at same level for next sibling.
+				continue
 			}
-			if !dup {
-				*current = append(*current, &Node{
-					Keys:   append([]string(nil), nodeKeys...),
-					IsLeaf: true,
-				})
-			}
-			if i >= len(path) {
-				return nil
-			}
-			// Don't descend — continue at same level for next sibling.
-			continue
+			// nextIsChild: fall through to the container path so the modifier
+			// child (e.g. `interface`) attaches under this node.
 		}
 
 		// This is a container (or a leaf with trailing value tokens).

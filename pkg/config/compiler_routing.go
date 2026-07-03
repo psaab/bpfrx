@@ -138,6 +138,18 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	return nil
 }
 
+// isRouteInlineKeyword reports whether tok is a static-route clause keyword in
+// the fully-inline route-keys form (`route <dst> next-hop a b qualified-next-hop
+// ...`). Used to bound a multi-value next-hop gateway run (#3872) so it stops
+// at the next clause instead of swallowing a following keyword as a gateway.
+func isRouteInlineKeyword(tok string) bool {
+	switch tok {
+	case "next-hop", "qualified-next-hop", "next-table", "discard", "reject", "preference", "metric", "interface":
+		return true
+	}
+	return false
+}
+
 // compileStaticRoutes parses static route entries from a "static" node,
 // appending to and returning the updated slice.
 func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRoute {
@@ -158,7 +170,11 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 			for i := 2; i < len(routeInst.node.Keys); i++ {
 				switch routeInst.node.Keys[i] {
 				case "next-hop":
-					if i+1 < len(routeInst.node.Keys) {
+					// Absorb a collapsed bracket list `next-hop [ a b ]` in the
+					// fully-inline form: consume consecutive gateway tokens
+					// until the next route keyword, installing each as an
+					// equal-cost next-hop (#3872).
+					for i+1 < len(routeInst.node.Keys) && !isRouteInlineKeyword(routeInst.node.Keys[i+1]) {
 						i++
 						route.NextHops = append(route.NextHops, NextHopEntry{Address: routeInst.node.Keys[i]})
 					}
@@ -220,22 +236,39 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 		for _, prop := range routeInst.node.Children {
 			switch prop.Name() {
 			case "next-hop":
-				nh := NextHopEntry{}
-				nh.Address = nodeVal(prop)
-				// Check children for interface (needed for IPv6 link-local next-hops)
+				// #3872: `next-hop [ gw1 gw2 ]` is canonical Junos ECMP — the
+				// bracket list collapses onto Keys=["next-hop", gw1, gw2, ...]
+				// in both AST shapes (multi leaf). Read EVERY gateway and
+				// install each as an equal-cost next-hop; reading only Keys[1]
+				// silently dropped all but the first. A single-gateway form may
+				// carry an `interface <if>` modifier (IPv6 link-local), inline
+				// on the keys (`next-hop fe80::1 interface reth0.50`) or as a
+				// child node — that egress interface applies to the gateway(s).
+				var addrs []string
+				iface := ""
+				for j := 1; j < len(prop.Keys); j++ {
+					if prop.Keys[j] == "interface" {
+						if j+1 < len(prop.Keys) {
+							iface = prop.Keys[j+1]
+							j++
+						}
+						continue
+					}
+					addrs = append(addrs, prop.Keys[j])
+				}
+				// Child interface (hierarchical + flat-set container shapes).
 				for _, child := range prop.Children {
 					if child.Name() == "interface" {
-						nh.Interface = nodeVal(child)
+						iface = nodeVal(child)
 					}
 				}
-				// Also check inline keys: "next-hop fe80::50 interface reth0.50"
-				// has all in Keys rather than Children.
-				for j := 2; j < len(prop.Keys)-1; j++ {
-					if prop.Keys[j] == "interface" {
-						nh.Interface = prop.Keys[j+1]
-					}
+				if len(addrs) == 0 && iface != "" {
+					// interface-only next-hop (unnumbered) — keep one entry.
+					route.NextHops = append(route.NextHops, NextHopEntry{Interface: iface})
 				}
-				route.NextHops = append(route.NextHops, nh)
+				for _, a := range addrs {
+					route.NextHops = append(route.NextHops, NextHopEntry{Address: a, Interface: iface})
+				}
 			case "discard":
 				route.Discard = true
 			case "preference":

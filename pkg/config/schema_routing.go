@@ -77,7 +77,19 @@ func staticRouteNode() *schemaNode {
 			// through the presence-only modifier path, so the value token
 			// after `interface` was rejected as `unknown modifier` (#2448
 			// over-rejection regression).
-			"next-hop": {desc: "Next-hop gateway (IP, ip@interface, or interface name)", args: 1, placeholder: "<gateway>",
+			// #3872: next-hop is a multi + valueList leaf so a canonical Junos
+			// ECMP list `next-hop [ gw1 gw2 ]` collapses onto ONE leaf
+			// (Keys=["next-hop", gw1, gw2]) in BOTH the block-parse and
+			// flat-set SetPath shapes, matching the #2419 multi-value pattern;
+			// the compiler reads Keys[1:] and installs every gateway as an
+			// equal-cost next-hop. valueList lets this multi leaf keep its
+			// `interface` MODIFIER child: SetPath descends into the container
+			// for the single-gateway IPv6 link-local form
+			// (`next-hop fe80::1 interface reth0.50`) and absorbs the value
+			// list otherwise (ast_edit.go). A qualified-next-hop backup is a
+			// SEPARATE leaf (floating, per-NH preference, #3871), kept distinct
+			// from this equal-cost list.
+			"next-hop": {desc: "Next-hop gateway (IP, ip@interface, or interface name)", args: 1, multi: true, valueList: true, placeholder: "<gateway>",
 				keyValueType: ValueIPAddress, keyValueDesc: "next-hop IP address, ip@interface, or interface name",
 				keyValueExamples: []string{"192.168.1.1", "2001:db8::1"}, keyValidator: ValidateStaticNextHop,
 				children: map[string]*schemaNode{

@@ -28518,3 +28518,31 @@ top.
   pkg/frr/config_render.go (per-NH distance),
   pkg/config/compiler_qualified_nexthop_3871_test.go (new, 2 tests),
   pkg/frr/static_floating_3871_test.go (new, 2 tests), pkg/frr/README.md
+
+## 2026-07-03 — #3872 (F-010): static next-hop bracket list = ECMP multipath
+
+- **Timestamp**: 2026-07-03
+- **Action**: A static route `next-hop [ gw1 gw2 ]` (canonical Junos ECMP)
+  collapsed to a single next-hop — the schema leaf was not multi and the
+  compiler read one address — so multipath was silently lost. FIX: make the
+  next-hop leaf `multi: true, valueList: true` (schema_routing.go) so the
+  bracket list collapses onto one leaf (Keys=[next-hop gw1 gw2]) in both AST
+  shapes; the compiler reads Keys[1:] and installs every gateway equal-cost
+  (compiler_routing.go, children handler + inline branch + isRouteInlineKeyword
+  helper). NEW schemaNode.valueList flag + ast_edit.go absorber change: a multi
+  leaf WITH modifier children absorbs a value list ONLY when it opts in
+  (valueList) — so the many CoS multi+children named containers are UNCHANGED
+  (a broad absorber change first broke TestValidateCoSOversubscription*; the
+  surgical flag fixed it). The `interface` modifier child still walks for the
+  IPv6 link-local single-gateway form. Composes with #3871: plain list =
+  equal-cost (no per-NH preference), qualified-next-hop = floating backup.
+  RED-on-revert PROVEN: reverting the multi/valueList schema collapses the
+  bracket list to only the first gateway; single next-hop + interface-modifier
+  + block-parse forms stay GREEN. Full `go test ./...` green.
+- **File(s)**: pkg/config/schema.go (valueList field),
+  pkg/config/ast_edit.go (valueList-gated child-aware absorber),
+  pkg/config/schema_routing.go (next-hop multi+valueList),
+  pkg/config/compiler_routing.go (multi-address read + isRouteInlineKeyword),
+  pkg/config/compiler_static_nexthop_list_3872_test.go (new, 5 tests),
+  pkg/frr/static_ecmp_list_3872_test.go (new), docs/config-schema.md,
+  pkg/frr/README.md

@@ -117,6 +117,19 @@ also carries operator content:
   interfaces and no qualifier the next-hop is genuinely ambiguous — the
   inference refuses to guess (leaves it unresolved) rather than route to the
   wrong link, and the operator must add an interface qualifier.
+- **Static `next-hop [ a b ]` ECMP list (#3872).** A static route's
+  `next-hop [ gw1 gw2 ]` is the canonical Junos ECMP spelling — multiple
+  next-hops = equal-cost multipath. The schema `next-hop` leaf is `multi:
+  true, valueList: true` (`schema_routing.go`) so the bracket list collapses
+  onto one leaf in both AST shapes, and the compiler
+  (`compileStaticRoutes`) reads EVERY gateway from `Keys[1:]` (plus separate
+  `next-hop` statements). Each gateway becomes a `NextHopEntry`, and
+  `generateStaticRouteInTable` emits one `ip route` line per next-hop → FRR
+  installs equal-cost multipath. Before #3872 the leaf was a plain container
+  and the compiler read a single address, so `next-hop [ a b ]` silently
+  installed only the first gateway. A plain list carries NO per-next-hop
+  preference (all equal-cost) — kept distinct from the floating
+  `qualified-next-hop` backup below.
 - **Floating static via `qualified-next-hop` (#3871).** A static route's
   `qualified-next-hop <gw> { preference N; metric M; }` is the Junos floating-
   static idiom — a primary next-hop plus a LESS-preferred backup that installs
