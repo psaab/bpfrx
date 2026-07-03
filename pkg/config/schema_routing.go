@@ -225,6 +225,30 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 	}},
 }}
 
+// Router-advertisement lifetime upper bounds (#3895). The RA sender
+// (pkg/ra/sender.go buildRA) builds and sends the whole Router Advertisement
+// in a single WriteTo, so an option whose lifetime overflows its on-wire field
+// makes the ndp marshal fail and aborts the ENTIRE RA — the segment then
+// silently stops receiving RAs and hosts lose their default route / SLAAC when
+// the current advertisements expire. #2497 typed these lifetimes as integers
+// but left them UNBOUNDED (ValidateIntegerMin(0)); bound them at commit so an
+// over-large value is rejected loudly instead of blackholing IPv6 at runtime.
+const (
+	// RFC 8781 §4: the PREF64 lifetime is a 13-bit value scaled by 8 seconds
+	// on the wire, so the maximum representable lifetime is 8191*8 = 65528s.
+	// A larger value makes ndp.PREF64.marshal return "scaled lifetime is too
+	// large" and aborts the whole RA (the #3895 blackhole).
+	raPREF64MaxLifetimeSeconds = 65528
+	// RFC 4861 §4.2: the RA header Router Lifetime is a 16-bit seconds field.
+	// A larger value silently wraps in ndp's uint16(lifetime) (65536 -> 0 =
+	// "not a default router"), so hosts drop their default route.
+	raRouterMaxLifetimeSeconds = 65535
+	// RFC 4861 §4.6.2: the Prefix Information valid/preferred lifetimes are
+	// 32-bit seconds fields (0xffffffff = infinity). A larger value silently
+	// truncates in ndp's uint32(lifetime); bound at the 32-bit maximum.
+	raPrefixMaxLifetimeSeconds = 4294967295
+)
+
 var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map[string]*schemaNode{
 	"ospf": {desc: "OSPF configuration", children: map[string]*schemaNode{
 		"router-id":           {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
@@ -405,9 +429,13 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			"min-advertisement-interval": {desc: "Minimum time between unsolicited RAs (seconds)", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "min RA interval in seconds",
 				valueExamples: []string{"200", "600"}, validator: ValidateIntegerMin(1), children: nil},
+			// #3895: bound the router lifetime at the RFC 4861 §4.2 16-bit
+			// field maximum. A larger value silently wraps in the RA sender's
+			// ndp uint16(lifetime) (65536 -> 0 = "not a default router"), so
+			// hosts drop their default route.
 			"default-lifetime": {desc: "Router lifetime advertised to hosts (seconds)", args: 1, placeholder: "<seconds>",
-				valueType: ValueInteger, valueDesc: "router lifetime in seconds",
-				valueExamples: []string{"1800", "9000"}, validator: ValidateIntegerMin(1), children: nil},
+				valueType: ValueInteger, valueDesc: "router lifetime in seconds (RFC 4861 §4.2 16-bit)",
+				valueExamples: []string{"1800", "9000"}, validator: ValidateInteger(1, raRouterMaxLifetimeSeconds), children: nil},
 			// #2497: link-mtu is advertised verbatim via ndp.NewMTU. RFC 8200
 			// §5 sets the IPv6 minimum link MTU at 1280 bytes; a smaller value
 			// (1-1279) committed today reaches the wire and blackholes hosts
@@ -450,12 +478,15 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 					// `valid-lifetime abc`, which previously stayed at 0 and
 					// silently fell back to the default) while still accepting
 					// an explicit 0.
+					// #3895: bound at the RFC 4861 §4.6.2 32-bit PIO lifetime
+					// field maximum (0xffffffff = infinity). A larger value
+					// silently truncates in the RA sender's ndp uint32(lifetime).
 					"valid-lifetime": {desc: "Prefix valid lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
-						valueType: ValueInteger, valueDesc: "prefix valid lifetime in seconds",
-						valueExamples: []string{"0", "86400", "2592000"}, validator: ValidateIntegerMin(0), children: nil},
+						valueType: ValueInteger, valueDesc: "prefix valid lifetime in seconds (RFC 4861 §4.6.2 32-bit)",
+						valueExamples: []string{"0", "86400", "2592000"}, validator: ValidateInteger(0, raPrefixMaxLifetimeSeconds), children: nil},
 					"preferred-lifetime": {desc: "Prefix preferred lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
-						valueType: ValueInteger, valueDesc: "prefix preferred lifetime in seconds",
-						valueExamples: []string{"0", "604800", "86400"}, validator: ValidateIntegerMin(0), children: nil},
+						valueType: ValueInteger, valueDesc: "prefix preferred lifetime in seconds (RFC 4861 §4.6.2 32-bit)",
+						valueExamples: []string{"0", "604800", "86400"}, validator: ValidateInteger(0, raPrefixMaxLifetimeSeconds), children: nil},
 				}},
 			// #2497: nat-prefix/nat64prefix feed an ndp.PREF64 option whose
 			// 3-bit PLC wire field can only encode the RFC 8781 §4 length set
@@ -469,17 +500,23 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 				keyValueType: ValueCIDR, keyValueDesc: "NAT64 prefix (RFC 8781 length /32 /40 /48 /56 /64 /96)",
 				keyValueExamples: []string{"64:ff9b::/96"}, keyValidator: ValidatePREF64CIDR,
 				children: map[string]*schemaNode{
+					// #3895: bound at the RFC 8781 §4 13-bit scaled-by-8 field
+					// maximum (8191*8 = 65528s). A larger value makes
+					// ndp.PREF64.marshal fail, aborting the entire RA.
 					"lifetime": {desc: "Lifetime", args: 1, placeholder: "<seconds>",
-						valueType: ValueInteger, valueDesc: "PREF64 lifetime in seconds (0 = router lifetime)",
-						valueExamples: []string{"0", "1800"}, validator: ValidateIntegerMin(0), children: nil},
+						valueType: ValueInteger, valueDesc: "PREF64 lifetime in seconds (0 = router lifetime; RFC 8781 max 65528)",
+						valueExamples: []string{"0", "1800"}, validator: ValidateInteger(0, raPREF64MaxLifetimeSeconds), children: nil},
 				}},
 			"nat64prefix": {desc: "NAT64 prefix", args: 1, placeholder: "<prefix>",
 				keyValueType: ValueCIDR, keyValueDesc: "NAT64 prefix (RFC 8781 length /32 /40 /48 /56 /64 /96)",
 				keyValueExamples: []string{"64:ff9b::/96"}, keyValidator: ValidatePREF64CIDR,
 				children: map[string]*schemaNode{
+					// #3895: bound at the RFC 8781 §4 13-bit scaled-by-8 field
+					// maximum (8191*8 = 65528s). A larger value makes
+					// ndp.PREF64.marshal fail, aborting the entire RA.
 					"lifetime": {desc: "Lifetime", args: 1, placeholder: "<seconds>",
-						valueType: ValueInteger, valueDesc: "PREF64 lifetime in seconds (0 = router lifetime)",
-						valueExamples: []string{"0", "1800"}, validator: ValidateIntegerMin(0), children: nil},
+						valueType: ValueInteger, valueDesc: "PREF64 lifetime in seconds (0 = router lifetime; RFC 8781 max 65528)",
+						valueExamples: []string{"0", "1800"}, validator: ValidateInteger(0, raPREF64MaxLifetimeSeconds), children: nil},
 				}},
 		}},
 	}},

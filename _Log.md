@@ -29033,3 +29033,62 @@ top.
   vet clean.
 - **File(s)**: pkg/config/types_routing.go (cloneForUnit method),
   pkg/config/compiler_interfaces.go (call site), pkg/config/tunnel_perunit_deepcopy_test.go (new, 4 tests)
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3895 — bound the router-advertisement lifetimes at commit and
+  make the RA sender robust to an un-marshalable option, so an over-large
+  PREF64/router/prefix lifetime can no longer blackhole IPv6 on a segment.
+  Defect: the whole RA is built and sent in a single `conn.WriteTo`, which
+  marshals every option; a PREF64 scaled-lifetime > 8191 (RFC 8781 §4 13-bit
+  scaled-by-8, `8191*8 = 65528s`) makes `ndp.PREF64.marshal` FAIL and aborts
+  the ENTIRE advertisement — the segment silently stops receiving RAs and
+  hosts lose their default route / SLAAC when the current RAs expire. #2497
+  typed these lifetime leaves but left them UNBOUNDED (ValidateIntegerMin(0)).
+  Fix (a) commit gate (`pkg/config/schema_routing.go`): bound
+  `nat-prefix`/`nat64prefix lifetime` to [0, 65528] (RFC 8781), `default-lifetime`
+  to [1, 65535] (RFC 4861 §4.2 16-bit; a larger value silently wraps in
+  `uint16(lifetime)` — 65536 → 0 = "not a default router"), and prefix
+  `valid-/preferred-lifetime` to [0, 4294967295] (RFC 4861 §4.6.2 32-bit).
+  Fix (b) sender robustness (`pkg/ra/sender.go`): `buildRA` now calls
+  `pruneUnmarshalableOptions`, which probes each option through
+  `ndp.MarshalMessage` (the same encoder `conn.WriteTo` uses) and LOGS+DROPS
+  any that fail so the rest of the RA still goes out — defense-in-depth for a
+  config that predates the bound (loaded `active.json`). RED-on-revert:
+  reverting the PREF64 validator to min-only made
+  `TestSchema3895_PREF64Lifetime_RejectsOverlarge` FAIL (no commit error);
+  reverting the `buildRA` prune call made `TestBuildRA_3895_PruneOverlargePREF64`
+  FAIL with `ndp: pref64 scaled lifetime is too large` (RA marshal aborts).
+  Validation: `go test ./pkg/ra/... ./pkg/config/...` green; `go build ./...`
+  clean; gofmt + vet clean.
+- **File(s)**: pkg/config/schema_routing.go (raPREF64/Router/Prefix
+  MaxLifetimeSeconds consts + 5 leaf validators), pkg/ra/sender.go
+  (pruneUnmarshalableOptions + buildRA call), pkg/config/schema_validate_3895_test.go
+  (new, 6 tests), pkg/ra/sender_marshal_3895_test.go (new, 4 tests),
+  pkg/ra/README.md (#3895 gotcha)
+- **Timestamp**: 2026-07-03
+- **Action**: #3896 — type IKE gateway `version`, IKE policy `mode`, and
+  gateway `nat-traversal` setSchema leaves with `ValidateEnum` so a typo
+  fails closed at commit instead of silently weakening negotiation
+  downstream. These three leaves were untyped free-form (`args:1`, no
+  validator) in BOTH the `ike` and `ipsec` stanza copies of the gateway
+  schema (fable-review-161 F-039). A typo committed CLEAN and was then
+  mis-mapped by the swanctl generator: `version v2-onyl` dropped the
+  v2-only pin (gateway silently accepts legacy IKEv1 — a downgrade);
+  `mode agressive` fell back to main mode; a typo'd `nat-traversal` value
+  silently took the auto-detect default. The accepted enum sets mirror
+  EXACTLY the generator-recognized values (verified against
+  `pkg/ipsec/policy.go` version/encap switch + `pkg/ipsec/ike.go`
+  aggressive check — a value the generator handles but the enum omitted
+  would be a false-reject regression): version ∈ {v1-only, v2-only},
+  mode ∈ {main, aggressive}, nat-traversal ∈ {enable, disable, force}.
+  ValidateEnum names the offending value in the reject error. RED-on-
+  revert proven: reverting the three leaves to untyped makes every typo
+  case return nil and go RED. go test ./pkg/config/ ./pkg/ipsec/ green
+  (existing ipsec render tests — version=2, aggressive=yes — unchanged,
+  proving valid values still render identically); go build ./... clean;
+  gofmt + vet clean.
+- **File(s)**: pkg/config/schema_security.go (mode/version/nat-traversal
+  ValidateEnum in ike.policy + ike.gateway + ipsec.gateway),
+  pkg/config/schema_ike_enum_3896_test.go (new, RED-on-revert gate),
+  docs/config-schema.md (#3896 enum-typing section)
