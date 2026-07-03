@@ -1,3 +1,44 @@
+## 2026-07-03 — #3863: WireGuard tunnel local identity never validated at commit (HIGH silent VPN outage)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-011. A WireGuard tunnel's LOCAL
+    identity — `listen-port` and `private-key` — was never validated at commit.
+    `validateOneWireguardTunnel` (compiler_validate_wireguard.go) validated the
+    PEERS (zero-peer, pubkey, PSK, endpoint family, dup allowed-ips) but not the
+    local identity. So a missing/`0`/out-of-range `listen-port` (which
+    `parseTunnelWireguard` silently collapses to `WgListenPort == 0`) or a
+    missing/malformed `private-key` (stored verbatim) COMMITTED CLEAN. At runtime
+    the Rust `hydrate_wg_identity`
+    (userspace-dp/src/afxdp/forwarding_build/tunnels.rs) drops the WHOLE tunnel
+    row when `wg_listen_port == 0` or the private key fails `decode_wg_key_hex`
+    (not exactly 64 hex chars → 32 bytes) → the tunnel is permanently dead with
+    no diagnostic. Empirically confirmed via CompileConfig: all of
+    listen-port 0/99999/missing + malformed/missing private-key committed clean
+    on origin/master. (The schema layer already bounds the listen-port VALUE via
+    `ValidateInteger(1,65535)`, but that is author-path-only and cannot see a
+    MISSING leaf; private-key has NO schema validator. The compiler gate is the
+    universal chokepoint every compile/load/HA-sync path funnels through.)
+  - **Fix**: Extended `validateOneWireguardTunnel` to reject
+    `WgListenPort == 0` and a `private-key` that fails `isWireguardKeyHex`
+    (64 hex / 32-byte X25519, mirroring the peer-pubkey and Rust
+    `decode_wg_key_hex` rules), checked BEFORE the peer gates to mirror the Rust
+    order (listen_port → privkey → peers). Validates the real Secret value via
+    `.Reveal()` (#2053) and does NOT echo the private key in the error (secret
+    hygiene). Fail-closed on strict (commit/commit-check); the `lenientWireguardPeers`
+    load/peer-sync path downgrades to a warning so an already-persisted config
+    still boots (runtime hydrate drops the bad row independently).
+  - **File(s)**: `pkg/config/compiler_validate_wireguard.go` (gate + doc),
+    `pkg/config/compiler.go` (call-site comment),
+    `pkg/config/wireguard_multipeer_test.go` (6 new #3863 tests + listen-port on
+    2 bracket tests), `pkg/config/tunnelid_test.go` (5 success-expecting WG stubs
+    given a valid local identity), `pkg/config/parser_routing_test.go`
+    (TestTunnelNameMapWireguardInterfaceLevel private-key), `docs/config-schema.md`,
+    `docs/wireguard-interop.md`.
+  - **Validation**: 6 new tests (positive control + listen-port 0/99999/missing
+    + malformed/missing private-key). RED-on-revert proven: neutering both gate
+    checks FAILS the 5 reject tests, positive control stays green. `go test
+    ./pkg/config/...` green; `go build ./...`; gofmt + vet clean;
+    configstore/api/dataplane-userspace tests green.
 ## 2026-07-03 — #3861: plain commit / SyncApply during a commit-confirmed window silently reverted (HIGH config loss)
 
 - **Timestamp**: 2026-07-03
@@ -28427,3 +28468,35 @@ top.
   scpArchiveTransfer), pkg/daemon/daemon.go (archiveTransfer field),
   pkg/daemon/archive_config_3867_test.go (new RED-on-revert + temp-cleanup
   tests), pkg/configstore/README.md (remote transfer-on-commit source note)
+- **Timestamp**: 2026-07-03
+- **Action**: #3864 — deterministic (CGNAT) source NAT was un-configurable via
+  flat-set. The documented CGNAT quick-start (`set ... port deterministic
+  block-size N` + `... host address X` on SEPARATE `set` lines) was spuriously
+  rejected "deterministic block-size must be > 0" / "host address required":
+  the sibling `port deterministic ...` leaves overwrote each other last-wins in
+  `compiler_nat.go` and the host address was never read off Keys (`port`
+  unmodeled in `schema_security.go`). FIX: (1) model `port deterministic {
+  block-size; host address }` + `port range` as a container sub-stanza in
+  setSchema so the flat-set tokens GROUP onto ONE `port` node (and tab-complete
+  + typed block-size validation); (2) rewrite the compiler `port` case to read
+  block-size/host/range from BOTH the flat-set (Keys) AND hierarchical
+  (children) shapes and ACCUMULATE into a single DeterministicNATConfig instead
+  of resetting per sibling (the #2419 dual-AST-shape class) — new helpers
+  applyDeterministicKeys/applyDeterministicChildren/applyDeterministicHost only
+  write present fields. The genuine capacity/missing-field validation is
+  UNCHANGED (a real missing block-size / host / over-subscribed pool is still
+  rejected). RED-on-revert PROVEN: reverting the two source files (tests kept)
+  makes the flat-set doc config + reversed-order + range + IPv6 tests go RED
+  with the spurious "block-size must be > 0" / "host address required", while
+  the hierarchical-preserved and the two genuine-incomplete guards stay GREEN
+  (pre-existing-correct). DOC FIX: the doc's own IPv4 example was arithmetically
+  over-subscribed (/22 = 1024 hosts > 128 blocks → genuine capacity reject in
+  BOTH forms); corrected to /25 (128 hosts fit the 128 blocks) so the quick-
+  start actually commits clean, added the hierarchical equivalent + the
+  grouping note. go test ./pkg/config/... + ./pkg/dataplane/... green; go build
+  ./... green; gofmt + vet clean.
+- **File(s)**: pkg/config/schema_security.go (model `port` container),
+  pkg/config/compiler_nat.go (dual-shape accumulate + 3 helpers),
+  pkg/config/deterministic_nat_flatset_3864_test.go (new, 7 tests),
+  docs/deterministic-nat-cgnat.md (/22→/25 fix + hier example + grouping +
+  impl map), docs/config-schema.md (port now modeled note)

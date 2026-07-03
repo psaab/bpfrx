@@ -12,8 +12,15 @@ import (
 // path and a hard error on the strict path.
 //
 // The gates (all LOCKED by the plan review rounds,
-// docs/research/1434-multitunnel-wg/plan.md §5.5/§5.6):
+// docs/research/1434-multitunnel-wg/plan.md §5.5/§5.6, plus the #3863
+// local-identity gate):
 //
+//   - Missing/invalid listen-port = REJECT. A WG tunnel needs a
+//     listen-port in [1,65535] to bind its UDP socket; the Rust
+//     hydrate drops a row whose wg_listen_port is 0 (#3863).
+//   - Missing/malformed private-key = REJECT. The local static key is
+//     exactly 64 hex chars (32-byte X25519); hydrate drops a row whose
+//     private key does not decode (#3863).
 //   - Zero-peer = REJECT. A WG tunnel with no peer can never handshake;
 //     xpf has no dynamic peer learning (peers are config-static).
 //   - Duplicate peer pubkey = REJECT. The Rust engine reconcile only
@@ -107,9 +114,39 @@ func tunnelLabel(ifName string, unit int, tc *TunnelConfig) string {
 	return ifName
 }
 
-// validateOneWireguardTunnel applies the per-tunnel WG peer gates to a
-// single tunnel's WgPeers slice.
+// validateOneWireguardTunnel applies the per-tunnel WG gates to a single
+// tunnel: first the LOCAL identity (listen-port + private-key), then the
+// per-peer gates over WgPeers.
+//
+// Local identity (#3863). The Rust hydrate_wg_identity
+// (userspace-dp/src/afxdp/forwarding_build/tunnels.rs) drops the WHOLE
+// tunnel row — a silent, permanent, no-signal VPN outage — when the local
+// identity does not parse: `wg_listen_port == 0` (a WG tunnel with no
+// listen port cannot bind its UDP socket, and the shim steering gate
+// reads port 0 as "no WG") or the local private key fails
+// decode_wg_key_hex (not exactly 64 hex chars decoding to 32 bytes).
+// parseTunnelWireguard silently collapses a missing/0/out-of-range
+// listen-port to WgListenPort == 0 and stores private-key verbatim, so a
+// bad or absent local identity would otherwise COMMIT CLEAN and then
+// produce a dead tunnel with no diagnostic. Reject it at commit
+// (fail-closed) so the commit-accept set never exceeds the
+// runtime-hydrate set. The listen-port VALUE bound is also enforced at
+// the schema layer (schema_interfaces.go ValidateInteger(1,65535)), but
+// that runs only on the author path and cannot see a MISSING leaf; this
+// compiler gate is the universal chokepoint every compile/load/HA-sync
+// path funnels through. Checked before the peer gates to mirror the Rust
+// order (listen_port -> local privkey -> peers).
 func validateOneWireguardTunnel(tc *TunnelConfig) error {
+	if tc.WgListenPort == 0 {
+		return fmt.Errorf("listen-port is missing or out of range (a WireGuard tunnel requires a listen-port of 1-65535 to bind its UDP socket; the dataplane drops a tunnel whose listen-port is 0 or unparseable)")
+	}
+	// Validate the REAL key material, not the redacted Secret form
+	// (#2053) — a redacted "<redacted>" string would never be 64 hex and
+	// would false-reject. The error deliberately does NOT echo the key
+	// (unlike the peer PUBLIC key below): the private key is secret.
+	if !isWireguardKeyHex(tc.WgLocalPrivkeyHex.Reveal()) {
+		return fmt.Errorf("private-key is invalid or missing (expected 64 hex chars / 32-byte X25519 private key; the dataplane drops a tunnel whose private-key does not decode)")
+	}
 	if len(tc.WgPeers) == 0 {
 		return fmt.Errorf("tunnel has no peer (a peerless WireGuard tunnel can never handshake; configure at least one `peer <public-key>`)")
 	}

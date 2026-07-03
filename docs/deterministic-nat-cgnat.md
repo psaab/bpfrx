@@ -17,7 +17,7 @@ overhead.
 ```
 set security nat source pool CGNAT-POOL address 203.0.113.1/32 to 203.0.113.4/32
 set security nat source pool CGNAT-POOL port deterministic block-size 2016
-set security nat source pool CGNAT-POOL port deterministic host address 100.64.0.0/22
+set security nat source pool CGNAT-POOL port deterministic host address 100.64.0.0/25
 set security nat source pool CGNAT-POOL port range low 1024 high 65535
 ```
 
@@ -26,7 +26,35 @@ This allocates:
 - Port range 1024-65535 = 64512 ports per IP
 - Block size 2016 = 32 blocks per IP
 - 4 IPs x 32 blocks = 128 subscriber slots
-- 100.64.0.0/22 = 1024 hosts (must fit within 128 blocks -- validated at compile)
+- 100.64.0.0/25 = 128 hosts (must fit within the 128 blocks -- validated at
+  compile: `totalBlocks >= subscriberCount`). A larger prefix such as
+  `/22` (1024 hosts) is rejected `insufficient capacity (128 blocks) for
+  1024 subscribers` -- widen the pool (more public IPs) or shrink the
+  block-size to add blocks.
+
+The four `set` lines above are entered in flat-set order; `block-size` and
+`host address` are SEPARATE `set` lines under the same `port deterministic`
+sub-stanza and GROUP onto one pool (#3864). The equivalent hierarchical
+block form also compiles:
+
+```
+security {
+    nat {
+        source {
+            pool CGNAT-POOL {
+                address 203.0.113.1/32 to 203.0.113.4/32;
+                port {
+                    range low 1024 high 65535;
+                    deterministic {
+                        block-size 2016;
+                        host address 100.64.0.0/25;
+                    }
+                }
+            }
+        }
+    }
+}
+```
 
 ### IPv6 Subscribers / NAPT64 (Deterministic Mode 2)
 
@@ -166,7 +194,8 @@ public IPs). `MAX_NAT_POOL_IPS` correspondingly increased to 8192.
 | Component | Change |
 |-----------|--------|
 | `pkg/config/types.go` | `DeterministicNATConfig` struct, `PoolUtilizationAlarmConfig` |
-| `pkg/config/compiler.go` | Parse deterministic port config (hierarchical + flat set), address ranges (`addr1/32 to addr2/32`), validation |
+| `pkg/config/compiler_nat.go` | Parse deterministic port config (hierarchical + flat set, accumulated across both AST shapes, #3864), address ranges (`addr1/32 to addr2/32`), capacity validation |
+| `pkg/config/schema_security.go` | Models `port deterministic { block-size; host address }` so the flat-set sub-stanza GROUPS + tab-completes (#3864) |
 | `pkg/dataplane/compiler.go` | Compile deterministic fields to `NATPoolConfig`, mode 1 vs mode 2 dispatch |
 | `pkg/dataplane/types.go` | `NATPoolConfig` extended with deterministic fields |
 | `pkg/api/metrics.go` | `xpf_nat_pool_deterministic_info` Prometheus gauge |
