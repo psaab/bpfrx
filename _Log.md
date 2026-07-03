@@ -28036,3 +28036,27 @@ top.
   docs/config-schema.md (mirrored stale claim + test list),
   userspace-dp/src/filter/compiler.rs (positive-wins contract comment),
   userspace-dp/src/filter/tests.rs (#3716 positive-wins pin test)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3843 — fix HIGH fail-open: a firewall-filter term with a
+  HIERARCHICAL single-name `source/destination-prefix-list <name>;` leaf (the
+  `load merge`/config-file shape, where the name rides on `child.Keys[1]` with
+  ZERO children) had its scoping constraint SILENTLY DROPPED —
+  `compileFilterFrom` iterated only `child.Children` and never read
+  `child.Keys[1]`, so the term compiled UNSCOPED (implicit match-all) yet passed
+  strict commit cleanly. Same for `destination-prefix-list`. This is the #2419
+  dual-AST-shape class on the prefix-list-ref leaf (distinct from the #2506
+  dataplane-snapshot resolver). FIX: new helper `firewallPrefixListRefs` reads
+  BOTH `child.Keys[1:]` (single-name / flat leaf, grouping each `<name>
+  [except]` pair) AND `child.Children` (block / flat-set), so the scope survives
+  every shape; an unresolvable name is then hard-rejected by
+  `validateFirewallPrefixListReferencesStrict` (#2506), making a dropped scope
+  impossible (fail-closed). RED-on-revert test proven: reverting the
+  `child.Keys[1:]` read makes all four single-name assertions go RED (scope →
+  nil refs; undefined `source-prefix-list ghost;` silently accepted). Flat-set +
+  block-form shapes still scope correctly. go test ./pkg/config/... green; go
+  build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/config/compiler_firewall.go (firewallPrefixListRefs helper +
+  rewired source/destination-prefix-list cases),
+  pkg/config/compiler_prefix_list_hier_leaf_3843_test.go (new RED-on-revert
+  tests), docs/config-schema.md (dual-AST prefix-list-ref note)
