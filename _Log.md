@@ -28234,3 +28234,44 @@ top.
   pkg/config/quotekey_roundtrip_3854_test.go (new),
   docs/config-schema.md (Quoted-value escape round-trip contract subsection),
   _Log.md
+
+## 2026-07-03 — #3849 policy time-range scheduler daily/per-day descend + fail-closed
+- **Timestamp**: 2026-07-03
+- **Action**: #3849 (fable-review-161 F-014) — policy time-range scheduler
+  `daily { start-time/stop-time }` descend + fail-closed empty window. HIGH
+  fail-open: `compileSchedulers` (compiler_system.go) only read
+  `start-time`/`stop-time` as DIRECT children of `scheduler <name>`, never
+  descending into the Junos `daily {}` container (nor the `monday`..`sunday`
+  arms), so `StartTime`/`StopTime` were left EMPTY and the runtime evaluator
+  `isWithinWindow` (pkg/scheduler) returned always-true for an empty window —
+  a policy `scheduler-name <s>` scoped to business hours permitted traffic
+  24/7. The stanza was also absent from `setSchema` (F-013), so flat-set
+  scheduler config packed onto one leaf and was dropped. FIX: (1)
+  `compileSchedulers` descends into `daily {}` + per-day containers via
+  `schedulerWindowFromNode` for both AST shapes, reading start-time/stop-time/
+  all-day/exclude; `SchedulerConfig` gains `AllDay` + `Days` (per-weekday
+  overrides). (2) new top-level `schemaSchedulers` (schema_schedulers.go,
+  registered in schema.go) groups flat-set into the nested AST; time/date
+  slots typed (ValueTimeOfDay/ValueDate + ValidateTimeOfDay/ValidateDate) so a
+  malformed window is rejected at commit. (3) `isWithinWindow` rewritten
+  fail-closed: an absent window (no daily, no applicable per-day, no date-only
+  range) is INACTIVE, never always-on; per-day overrides win over daily;
+  half-specified windows fail closed. (4) config hash (daemon_scheduler.go)
+  hashes AllDay + Days so per-day edits re-evaluate. RED-on-revert PROVEN for
+  both cores: reverting the daily descend blanks StartTime/StopTime
+  (TestCompileSchedulerDailyBlockHierarchical/FlatSet RED); reverting the
+  empty-window guard makes the empty scheduler always-active
+  (TestIsWithinWindow_NoWindowFailsClosed RED). go test ./... green; go build
+  ./... green; gofmt + vet clean.
+- **File(s)**: pkg/config/compiler_system.go (compileSchedulers descend +
+  schedulerWindowFromNode), pkg/config/types_security.go (AllDay + Days +
+  SchedulerDayWindow), pkg/config/schema_schedulers.go (new top-level schema),
+  pkg/config/schema.go (register schedulers), pkg/config/value_type.go
+  (ValueTimeOfDay/ValueDate), pkg/config/schema_validators.go
+  (ValidateTimeOfDay/ValidateDate), pkg/scheduler/scheduler.go (fail-closed
+  isWithinWindow + per-day), pkg/daemon/daemon_scheduler.go (hash new fields),
+  pkg/config/compiler_schedulers_3849_test.go (new),
+  pkg/scheduler/scheduler_3849_test.go (new),
+  pkg/scheduler/scheduler_test.go + pkg/daemon/policy_scheduler_apply_test.go
+  (updated for fail-closed semantics), pkg/scheduler/README.md +
+  docs/config-schema.md (docs)

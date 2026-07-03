@@ -3805,3 +3805,48 @@ whole pool stanza (address, port, persistent-nat) was unmodeled, so
   `pool_snat_persistent_any_remote_host_reuses_everywhere`,
   `pool_snat_persistent_permit_empty_string_falls_back_to_legacy_bool`
   (`userspace-dp/src/nat/tests.rs`).
+
+### #3849 — Policy time-range `schedulers` daily/per-day window descend + fail-closed
+
+The top-level `[edit schedulers]` policy time-range stanza compiled
+`start-time`/`stop-time` only as DIRECT children of `scheduler <name>`, so
+the actual Junos shape — `daily { start-time X; stop-time Y; }` (and the
+`monday`..`sunday` day arms) — left `StartTime`/`StopTime` EMPTY. The
+runtime evaluator (`pkg/scheduler.isWithinWindow`) then treated an empty
+window as always-active, so a policy `scheduler-name <s>` scoped to
+business hours actually permitted traffic 24/7 (HIGH, fail-open;
+fable-review-161 F-014). The stanza was also ABSENT from `setSchema`
+(F-013), so flat-set `set schedulers scheduler X daily start-time ...`
+packed the whole line onto one leaf node and the compiler dropped it.
+
+- **compiler** — `compileSchedulers` (`compiler_system.go`) descends into
+  the `daily {}` container AND each `monday`..`sunday` container via
+  `schedulerWindowFromNode`, reading `start-time`/`stop-time`/`all-day`/
+  `exclude` for BOTH the hierarchical and flat-set AST shapes. The legacy
+  direct-child `start-time`/`stop-time` shape still compiles unchanged.
+- **typed model** — `SchedulerConfig` gains `AllDay bool` (`daily
+  all-day`) and `Days map[string]*SchedulerDayWindow` (per-weekday
+  overrides keyed by lowercase weekday name); a weekday override wins over
+  the daily window, `Exclude` forces a day closed (`types_security.go`).
+- **schema** — a new top-level `schedulers` entry
+  (`schema_schedulers.go`, registered in `schema.go`) makes SetPath group
+  flat-set scheduler config into the nested AST the hierarchical parser
+  produces. The `start-time`/`stop-time` slots are `ValueTimeOfDay` +
+  `ValidateTimeOfDay`, and `start-date`/`stop-date` are `ValueDate` +
+  `ValidateDate`, so a malformed window is rejected at commit (the
+  fail-closed-at-commit half). Unknown keywords stay lenient
+  (`schema_walk.go`), so no valid scheduler config is newly rejected.
+- **fail-closed runtime** — `isWithinWindow` no longer returns
+  always-true on an empty window. A scheduler that resolves to NO window
+  for a given instant (no daily window, no applicable per-day override,
+  no date-only range) returns `false`. A policy bound to a window that
+  failed to compile now DENIES, matching the firewall's fail-closed
+  posture. "Always active" is expressed by omitting `scheduler-name` or
+  using `daily all-day`. The existing
+  `validatePolicySchedulerReferencesStrict` commit check (an undefined
+  `scheduler-name` is already rejected) is complementary and unchanged.
+- **tests** — compile descend (both shapes) + commit rejection:
+  `pkg/config/compiler_schedulers_3849_test.go`; runtime fail-closed +
+  per-day evaluation: `pkg/scheduler/scheduler_3849_test.go` and the
+  updated `pkg/scheduler/scheduler_test.go`
+  (`TestIsWithinWindow_NoWindowFailsClosed`).
