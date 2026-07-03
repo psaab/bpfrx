@@ -28528,3 +28528,43 @@ top.
   pkg/config/deterministic_nat_flatset_3864_test.go (new, 7 tests),
   docs/deterministic-nat-cgnat.md (/22→/25 fix + hier example + grouping +
   impl map), docs/config-schema.md (port now modeled note)
+
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03 14:35
+- **Action**: #3874 — syslog stream (TCP/TLS) partial-frame teardown to
+  resync the collector's RFC 6587 octet-count parser. A `conn.Write` on a
+  stream transport can return `0 < n < len(b)` (a truncated frame on the
+  wire) when the write deadline expires or the peer resets mid-frame. The
+  timeout branch at syslog.go returned WITHOUT closing (deliberate per
+  #2287, which avoided a re-entrant close deadlock), so the NEXT frame's
+  bytes concatenated onto the truncated one → the collector's octet-count
+  length parser desynced permanently — audit/forensics channel corruption
+  exactly under incident load. FIX: `streamWrite` now reads the byte count
+  and, on a PARTIAL write (`0 < n < len(b)`), tears the conn down
+  (`conn.Close()`; `conn=nil`). The next `Send` sees `conn==nil`, treats
+  it as a non-timeout write failure, and the existing cooldown-gated
+  reconnect path dials a fresh, correctly-counted stream (the resync). A
+  clean 0-byte timeout (`n==0`) wrote nothing and stays drop-without-close
+  per #2287 — only a partial write closes. The fix lives in `streamWrite`
+  so it covers BOTH `Send` (octet-counted) and `SendBinary` (self-framing
+  length at `[3:5]`), both of which desync on truncation. WHY it does NOT
+  reintroduce the #2285 re-entrant deadlock: `net.Conn.Close`/`*tls.Conn.Close`
+  is a pure syscall that never routes back through
+  slog→SyslogSlogHandler.Handle→SyslogClient.Send, so it cannot re-lock
+  `s.mu` on the sending goroutine; and it is not the #2287 stall hazard
+  (close is cheap — no dial, no second writeTimeout; the reconnect is
+  deferred to the next Send via the conn==nil path). RED-on-revert PROVEN:
+  reverting `streamWrite` to `_, err := conn.Write(b); return err` makes
+  TestPartialWriteTearsDownStreamToResync fail (`closes=0, want 1`) — the
+  corrupt conn stays up and frame 2 concatenates onto the truncated frame
+  1. TestCleanTimeoutDoesNotCloseConn (0-byte timeout does not close/dial),
+  TestPartialWriteConnErrorTearsDown (non-timeout reset mid-frame), and
+  TestPartialWriteNoReentrantDeadlock (slog-default-wired client, 3s guard)
+  all green. `go test ./pkg/logging/... -race` green; `go build ./...`
+  green; gofmt + vet clean.
+- **File(s)**: pkg/logging/syslog.go (streamWrite partial-write teardown +
+  doc comment), pkg/logging/syslog_partial_frame_3874_test.go (new, 4 tests
+  + partialFrameConn/recordingBufConn/closeCountingTimeoutConn mocks +
+  parseOctetFrame collector parser), pkg/logging/README.md (partial-frame
+  teardown #3874 bullet)
