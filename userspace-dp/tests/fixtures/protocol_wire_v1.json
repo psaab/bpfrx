@@ -464,6 +464,7 @@
     "match_icmp_type": null,
     "match_source_ports": [],
     "name": "",
+    "off": false,
     "pool_address": "",
     "pool_port": 0,
     "protocol": "",

@@ -251,6 +251,22 @@ pub(crate) struct DestinationNATRuleSnapshot {
     pub match_icmp_type: Option<u8>,
     #[serde(rename = "match_icmp_code", default)]
     pub match_icmp_code: Option<u8>,
+    /// #3844: a `then destination-nat off` no-translate EXEMPTION. Junos DNAT
+    /// rules are ordered; a rule whose action is `off` matches the traffic but
+    /// applies NO translation and STOPS evaluation, so a later DNAT rule cannot
+    /// re-translate it. When true the DNAT table installs the entry with its
+    /// full match (destination/source/protocol/port) but NO pool translation:
+    /// on a match the lookup returns no DNAT decision AND short-circuits the
+    /// remaining proto/port/prefix tiers for that flow, and the off
+    /// destination is NOT registered as a firewall-local address (it is a real
+    /// routed host, not a VIP). Before #3844 the Go builder dropped the
+    /// pool-less off rule, so the "exempted" traffic fell through and was
+    /// DNAT'd by a later rule (fail-open). Additive wire field (#1961): an
+    /// older control plane omits it and this helper defaults it false (a normal
+    /// translate entry); a pool-less non-off entry still fails its `pool_address`
+    /// parse and is dropped as before.
+    #[serde(default)]
+    pub off: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

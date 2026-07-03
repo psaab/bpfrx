@@ -1685,6 +1685,213 @@ fn dnat_basic_lookup_tcp() {
     );
 }
 
+// #3844: `then destination-nat off` is a no-translate EXEMPTION. An off entry
+// that matches must return NO DNAT decision AND short-circuit later DNAT rules
+// for the same destination — a translate rule keyed identically must NOT
+// re-translate the exempted flow. Before #3844 the off rule compiled to an
+// empty Then and was dropped, so the "exempted" traffic fell through and was
+// DNAT'd by the later rule (fail-open).
+#[test]
+fn dnat_off_exemption_short_circuits_identical_translate_rule() {
+    let table = DnatTable::from_snapshots(
+        &[
+            // The off (exemption) rule is configured FIRST — like the Junos
+            // rule order that makes it win. It carries the same destination /
+            // protocol / port as the translate rule and NO pool address.
+            DestinationNATRuleSnapshot {
+                name: "exempt".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // A later translate rule that, without the exemption, WOULD DNAT
+            // the same traffic. It must not fire for the exempted flow.
+            DestinationNATRuleSnapshot {
+                name: "web".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // The exemption wins: no DNAT (RED before #3844 — the off rule was dropped
+    // as pool-less and only the translate rule survived, returning a rewrite).
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "matched `then destination-nat off` must yield no DNAT"
+    );
+}
+
+// #3844: an off-only destination must NOT be registered as a firewall-local
+// address — it is a real routed host, not a VIP the firewall should proxy-ARP/ND
+// for. (A translate rule for the same destination WOULD register it; here the
+// only rule is the exemption.)
+#[test]
+fn dnat_off_exemption_not_local_address() {
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                name: "exempt".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // A translate rule for a DIFFERENT destination — it must still be a
+            // local address, proving the exclusion is off-specific.
+            DestinationNATRuleSnapshot {
+                name: "web".to_string(),
+                destination_address: "203.0.113.20".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                pool_address: "192.168.1.20".to_string(),
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let locals: Vec<IpAddr> = table.destination_ips().collect();
+    assert!(
+        !locals.contains(&"203.0.113.10".parse::<IpAddr>().unwrap()),
+        "an off-exempted destination must not be a local address; locals={locals:?}"
+    );
+    assert!(
+        locals.contains(&"203.0.113.20".parse::<IpAddr>().unwrap()),
+        "a translate destination must still be a local address; locals={locals:?}"
+    );
+}
+
+// #3844: a source-scoped exemption — exempt one source subnet from DNAT while
+// every other source is still translated by a later (unconstrained) rule. This
+// exercises both outcomes and the tier short-circuit across the source axis.
+#[test]
+fn dnat_off_exemption_source_scoped() {
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                name: "exempt-internal".to_string(),
+                source_addresses: vec!["198.51.100.0/24".to_string()],
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "web".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // A source in the exempted subnet is NOT translated.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.5".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "exempted source subnet must not be DNAT'd"
+    );
+    // A source outside the exempted subnet still gets the translate rule.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "203.0.113.99".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        }),
+        "non-exempted source must still be DNAT'd by the later rule"
+    );
+}
+
+// #3844: an off exemption at the MORE-SPECIFIC (exact-port) tier short-circuits
+// a broader wildcard-port translate entry — the tier `.or_else` chain must stop
+// at Exempt and never probe the wildcard tier.
+#[test]
+fn dnat_off_exemption_short_circuits_broader_tier() {
+    let table = DnatTable::from_snapshots(
+        &[
+            // Exact-port off exemption for port 80.
+            DestinationNATRuleSnapshot {
+                name: "exempt-80".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // Wildcard-port translate for the same destination (any tcp port).
+            DestinationNATRuleSnapshot {
+                name: "any-port".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 0,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // Port 80 hits the exact-port off entry first → exempt, no fall-through to
+    // the wildcard translate.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "exact-port exemption must short-circuit the wildcard-port translate"
+    );
+    // A different port (443) misses the exact-port off entry and is translated
+    // by the wildcard-port rule.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            443,
+            "",
+        ),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "a non-exempted port must still hit the wildcard-port translate"
+    );
+}
+
 #[test]
 fn dnat_wildcard_port_fallback() {
     // port=0 entry matches any destination port
@@ -5989,6 +6196,7 @@ fn parsed_nat_rules_share_store_counters() {
             match_destination_ports: vec![],
             match_icmp_type: None,
             match_icmp_code: None,
+            off: false,
         }],
         &store,
     );

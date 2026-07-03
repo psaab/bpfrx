@@ -41,6 +41,41 @@
     pkg/config/compiler_policy_dup_block_3842_test.go, docs/config-schema.md,
     _Log.md
 
+## 2026-07-03 — #3844: DNAT `then destination-nat off` no-translate exemption (fable-161 F-003)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed a HIGH fail-open — `then destination-nat off` (Junos DNAT
+    exemption) was accepted at commit but the then-parser recognized only
+    `pool`, so it compiled to an empty Then (Type=0, Off=false, Pool="") and was
+    skipped at the snapshot builder (PoolName==""). The "exempted" traffic fell
+    through and was DNAT'd by a later rule. Full fix (Go + Rust), mirroring the
+    SNAT `off` handling. Go: `compiler_nat.go` parser sets
+    Then.Type=NATDestination + Then.Off=true (both AST shapes);
+    `schema_security.go` declares `off` under `then destination-nat`; `nat.go`
+    builder emits a pool-less Off entry with the full match expansion;
+    `protocol.go` adds the additive `off` wire field. Rust: `protocol/nat.rs`
+    adds serde-default `off`; `nat/destination.rs` DnatEntry.off, from_snapshots
+    (placeholder value, no pool parse for off), a new DnatOutcome enum
+    (Translate|Exempt) so a matched off short-circuits later proto/port/prefix
+    tiers (Junos ordered-rule semantic), `off` added to the insert dedup identity
+    (exemption vs translate stay distinct, config-order-first wins), and off
+    entries excluded from destination_ips (no proxy-ARP for a routed host).
+  - **File(s)**: pkg/config/compiler_nat.go, pkg/config/types_security.go,
+    pkg/config/schema_security.go, pkg/dataplane/userspace/nat.go,
+    pkg/dataplane/userspace/protocol.go, userspace-dp/src/protocol/nat.rs,
+    userspace-dp/src/nat/destination.rs, userspace-dp/src/nat/tests.rs,
+    userspace-dp/src/afxdp/tests.rs,
+    userspace-dp/tests/fixtures/protocol_wire_v1.json,
+    pkg/config/compiler_nat_dnat_off_3844_test.go,
+    pkg/dataplane/userspace/nat_dnat_off_3844_test.go,
+    docs/userspace-dnat-plan.md (§15), docs/feature-gaps.md
+  - **Validation**: go test ./pkg/config/... ./pkg/dataplane/... green;
+    go build ./...; gofmt+vet clean; full cargo test --release green
+    (3437 passed) after regenerating protocol_wire_v1.json. RED-on-revert
+    proven: 3 of the 4 Rust exemption tests fail when the off handling is
+    reverted (off entry dropped as pool-less → translate fires); the two Go
+    tests fail on a parser/builder revert.
+
 ## 2026-07-02 — #3719: review MAJOR fix — quarantine scrub must drop scoped-global match-zones
 
 - **Timestamp**: 2026-07-02

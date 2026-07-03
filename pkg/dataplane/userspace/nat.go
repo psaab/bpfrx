@@ -689,31 +689,51 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			continue
 		}
 		for _, rule := range rs.Rules {
-			if rule == nil || rule.Then.PoolName == "" {
+			if rule == nil {
+				continue
+			}
+			// #3844: `then destination-nat off` is a no-translate EXEMPTION.
+			// It carries no pool, but the rule MUST still install a snapshot
+			// entry so the Rust DnatTable can recognize the matched traffic as
+			// exempt and SHORT-CIRCUIT later DNAT rules (the Junos "matched
+			// rule wins, stop" semantic). Before #3844 the off rule compiled to
+			// an empty Then, was skipped here (PoolName == ""), and the
+			// "exempted" traffic fell through to be DNAT'd by a later rule
+			// (fail-open). An off entry runs the SAME match expansion below
+			// (destination/source addresses, protocol, ports) but with an empty
+			// pool and Off=true; the pool lookup/validation is skipped.
+			isOff := rule.Then.Type == config.NATDestination && rule.Then.Off
+			if !isOff && rule.Then.PoolName == "" {
 				continue
 			}
 			ruleCounterID := natCounterID(natCounterIDs, dataplane.NATCounterTypeDest, rs.Name, rule.Name)
-			pool, ok := cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]
-			if !ok || pool == nil || pool.Address == "" {
-				continue
-			}
-			// #3450 fail-closed (lenient / peer-sync backstop; the commit gate
-			// validateDNATPoolStrict rejects these). A pool with a
-			// configured-but-invalid port (0/out-of-range/non-numeric — PortRaw
-			// set but Port not in 1..65535) or a non-host pool address must
-			// publish NO entry, so the rule matches NOTHING rather than wrapping
-			// the port on a uint16 cast, collapsing to preserve-destination-port,
-			// or coercing a non-host CIDR to its network base.
-			poolAddr, poolAddrOK := dnatPoolHostIP(pool.Address)
-			if !poolAddrOK {
-				slog.Warn("userspace snapshot: skipping DNAT rule with non-host pool address (fail-closed, #3450)",
-					"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "address", pool.Address)
-				continue
-			}
-			if pool.PortRaw != "" && (pool.Port < 1 || pool.Port > 65535) {
-				slog.Warn("userspace snapshot: skipping DNAT rule with out-of-range pool port (fail-closed, #3450)",
-					"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "port_raw", pool.PortRaw, "port", pool.Port)
-				continue
+			var pool *config.NATPool
+			var poolAddr string
+			if !isOff {
+				var ok bool
+				pool, ok = cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]
+				if !ok || pool == nil || pool.Address == "" {
+					continue
+				}
+				// #3450 fail-closed (lenient / peer-sync backstop; the commit gate
+				// validateDNATPoolStrict rejects these). A pool with a
+				// configured-but-invalid port (0/out-of-range/non-numeric — PortRaw
+				// set but Port not in 1..65535) or a non-host pool address must
+				// publish NO entry, so the rule matches NOTHING rather than wrapping
+				// the port on a uint16 cast, collapsing to preserve-destination-port,
+				// or coercing a non-host CIDR to its network base.
+				var poolAddrOK bool
+				poolAddr, poolAddrOK = dnatPoolHostIP(pool.Address)
+				if !poolAddrOK {
+					slog.Warn("userspace snapshot: skipping DNAT rule with non-host pool address (fail-closed, #3450)",
+						"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "address", pool.Address)
+					continue
+				}
+				if pool.PortRaw != "" && (pool.Port < 1 || pool.Port > 65535) {
+					slog.Warn("userspace snapshot: skipping DNAT rule with out-of-range pool port (fail-closed, #3450)",
+						"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "port_raw", pool.PortRaw, "port", pool.Port)
+					continue
+				}
 			}
 			// #2395: a DNAT rule may publish multiple destination addresses
 			// (`match destination-address [ A B C ]`). The DNAT table is keyed
@@ -965,7 +985,11 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 						matchDstPorts = []NatPortRangeWire{pr}
 					}
 					poolPort := dstPort
-					if pool.Port != 0 {
+					// #3844: an off (exemption) rule has no pool — `pool` is
+					// nil, so the pool-port override is skipped. The Rust side
+					// short-circuits on the Off flag before reading any pool
+					// value, so poolPort/poolAddr are unused for off entries.
+					if !isOff && pool.Port != 0 {
 						// #3450: pool.Port is gated to 1..65535 above (an
 						// invalid configured port skips the whole rule), so this
 						// uint16 cast can no longer wrap. Port == 0 (no `port`
@@ -1028,7 +1052,13 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 							MatchSourcePorts: term.srcPorts,
 							MatchICMPType:    term.icmpType,
 							MatchICMPCode:    term.icmpCode,
-							CounterID:        ruleCounterID,
+							// #3844: a `then destination-nat off` exemption. When
+							// set, the Rust DnatTable treats a match as
+							// no-translate and short-circuits later DNAT rules;
+							// the pool fields are unused. PoolAddress is empty
+							// for an off entry.
+							Off:       isOff,
+							CounterID: ruleCounterID,
 						})
 					}
 				}

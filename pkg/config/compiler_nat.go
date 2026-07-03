@@ -1585,12 +1585,28 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 			if thenNode != nil {
 				for _, t := range thenNode.Children {
 					if t.Name() == "destination-nat" {
-						if len(t.Keys) >= 3 && t.Keys[1] == "pool" {
+						// #3844: `then destination-nat off` is a no-translate
+						// EXEMPTION — traffic matching this rule must NOT be
+						// DNAT'd. Mirror the source-nat `off` handling above so
+						// the exemption carries Then.Type=NATDestination +
+						// Then.Off=true instead of compiling to an empty Then
+						// that the snapshot builder skips (the #3844 fail-open,
+						// where the "exempted" traffic fell through to a later
+						// DNAT rule). Both AST shapes are handled: the flat-set
+						// leaf (Keys=["destination-nat","off"]) and the
+						// hierarchical child (`destination-nat { off; }`).
+						if len(t.Keys) >= 2 && t.Keys[1] == "off" {
+							rule.Then.Type = NATDestination
+							rule.Then.Off = true
+						} else if len(t.Keys) >= 3 && t.Keys[1] == "pool" {
 							rule.Then.Type = NATDestination
 							rule.Then.PoolName = t.Keys[2]
 						} else if poolNode := t.FindChild("pool"); poolNode != nil {
 							rule.Then.Type = NATDestination
 							rule.Then.PoolName = nodeVal(poolNode)
+						} else if t.FindChild("off") != nil {
+							rule.Then.Type = NATDestination
+							rule.Then.Off = true
 						}
 					}
 				}

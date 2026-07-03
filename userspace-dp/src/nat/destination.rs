@@ -43,6 +43,24 @@ pub(crate) struct DnatValue {
     pub new_dst_port: u16,
 }
 
+/// #3844: outcome of matching a DNAT entry within one proto/port tier.
+///
+/// The lookup probes tiers with `.or_else` (exact `(proto, dst, port)` →
+/// wildcard port → `PROTO_ANY` → prefix LPM). A `None` from a tier means "no
+/// rule matched" and `.or_else` continues to the next tier. `Some(Exempt)` and
+/// `Some(Translate)` are BOTH matches, so either one halts the `.or_else`
+/// chain — this is what gives a matched `then destination-nat off` rule the
+/// Junos "stop evaluation" semantic: it short-circuits the broader tiers and
+/// the caller then maps `Exempt` to no-DNAT.
+enum DnatOutcome {
+    /// A translate rule matched — apply the pool translation (and its counter).
+    Translate(DnatValue, Option<Arc<NatRuleCounter>>),
+    /// A `then destination-nat off` exemption matched — no translation, and the
+    /// remaining tiers are short-circuited (they are never probed because this
+    /// is a non-`None` `.or_else` result).
+    Exempt,
+}
+
 #[derive(Clone, Debug)]
 struct DnatEntry {
     from_zone: Box<str>,
@@ -92,6 +110,16 @@ struct DnatEntry {
     /// ICMP-type-constrained entry (fail closed).
     match_icmp_type: Option<u8>,
     match_icmp_code: Option<u8>,
+    /// #3844: a `then destination-nat off` no-translate EXEMPTION. When true a
+    /// match on this entry means "do NOT translate" — the lookup returns no
+    /// DNAT decision AND short-circuits the remaining proto/port/prefix tiers
+    /// (the Junos ordered "matched rule wins, stop" semantic), so a later DNAT
+    /// rule cannot re-translate the exempted flow. `value` is a placeholder for
+    /// an off entry (never read; the exemption returns before any translation).
+    /// An off entry is also excluded from `destination_ips` local-address
+    /// registration — the exempted destination is a real routed host, not a
+    /// VIP the firewall should proxy-ARP/ND for.
+    off: bool,
     value: DnatValue,
     /// #2218: per-rule translation hit counter (None for counter_id 0).
     hit_counter: Option<Arc<NatRuleCounter>>,
@@ -167,6 +195,16 @@ impl DnatEntry {
             }
         }
         true
+    }
+
+    /// #3844: map a matched entry to its lookup outcome. An `off` entry is a
+    /// no-translate exemption; any other entry translates to its pool value.
+    fn to_outcome(&self) -> DnatOutcome {
+        if self.off {
+            DnatOutcome::Exempt
+        } else {
+            DnatOutcome::Translate(self.value, self.hit_counter.clone())
+        }
     }
 }
 
@@ -292,9 +330,18 @@ impl DnatTable {
                     Err(_) => continue,
                 }
             };
-            let pool_ip: IpAddr = match snap.pool_address.parse() {
-                Ok(ip) => ip,
-                Err(_) => continue,
+            // #3844: an off (exemption) entry carries no pool. Parse the pool
+            // address only for a translate entry; for an off entry the value is
+            // a placeholder that is never read (the exemption short-circuits
+            // before any translation), so a missing/empty pool_address must NOT
+            // drop the entry the way it does for a translate rule.
+            let pool_ip: IpAddr = if snap.off {
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            } else {
+                match snap.pool_address.parse() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                }
             };
             // Determine the protocol key to insert this entry under.
             //
@@ -408,6 +455,7 @@ impl DnatTable {
                 match_dst_ports,
                 match_icmp_type: snap.match_icmp_type,
                 match_icmp_code: snap.match_icmp_code,
+                off: snap.off,
                 value: DnatValue {
                     new_dst_ip: pool_ip,
                     new_dst_port: if snap.pool_port != 0 {
@@ -532,7 +580,7 @@ impl DnatTable {
         // — can never alias the wildcard entry on the exact/port-wildcard
         // probes; the wildcard is only reached via the explicit final fallback.
         let protocol = u16::from(protocol);
-        let (value, hit_counter) = self
+        let outcome = self
             .match_entries(
                 self.entries.get(&DnatKey {
                     protocol,
@@ -604,7 +652,18 @@ impl DnatTable {
                     ingress_routing_instance,
                     packet_icmp,
                 )
-            })?;
+            });
+        // #3844: map the winning tier's outcome to a decision. A `then
+        // destination-nat off` exemption (Exempt) — or no matching rule (None)
+        // — produces NO DNAT decision. The `.or_else` chain already
+        // short-circuited at the tier where an Exempt matched (Exempt is a
+        // non-None value, so a broader tier was never probed), giving the Junos
+        // "matched rule wins, stop evaluation" semantic: a later/broader DNAT
+        // rule cannot re-translate the exempted flow.
+        let (value, hit_counter) = match outcome {
+            Some(DnatOutcome::Translate(v, c)) => (v, c),
+            Some(DnatOutcome::Exempt) | None => return None,
+        };
         let rewrite_dst_port = if value.new_dst_port != 0 && value.new_dst_port != dst_port {
             Some(value.new_dst_port)
         } else {
@@ -634,7 +693,7 @@ impl DnatTable {
         ingress_ifname: &str,
         ingress_routing_instance: &str,
         packet_icmp: Option<(u8, u8)>,
-    ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
+    ) -> Option<DnatOutcome> {
         let entries = entries?;
         // #2394: an entry only fires when its zone, source-address, AND #3096
         // interface/routing-instance scope all match. #3437: the application's
@@ -643,6 +702,19 @@ impl DnatTable {
         // within each tier every constraint must hold — an entry whose source,
         // interface/RI scope, source-port, or ICMP type/code does not match the
         // packet is skipped (no fail-open).
+        //
+        // #3844: WITHIN a tier the first matching entry (zone-specific, then
+        // zone-wildcard) determines the outcome via `to_outcome` — a `then
+        // destination-nat off` entry yields `Exempt` (no translation), any
+        // other entry yields `Translate`. An `Exempt` (a `Some(..)`) halts the
+        // cross-tier `.or_else` chain, so it short-circuits the LOWER tiers.
+        // NOTE ON PRECEDENCE: across tiers this is MOST-SPECIFIC-WINS (exact
+        // (proto,dst,port) > wildcard-port > proto-any > prefix-LPM), NOT strict
+        // Junos config order. A more-specific *later* translate rule beats a
+        // broader *earlier* off rule (same tier-precedence the DnatTable applies
+        // to translate-vs-translate, #3164). To exempt traffic that a translate
+        // rule would otherwise catch, the `off` rule must be at least as
+        // specific as that translate rule (typically the same match tier).
         entries
             .iter()
             .find(|entry| {
@@ -652,18 +724,15 @@ impl DnatTable {
                     && entry.source_matches(src_ip)
                     && entry.l4_extra_matches(src_port, dst_port, packet_icmp)
             })
-            .map(|entry| (entry.value, entry.hit_counter.clone()))
             .or_else(|| {
-                entries
-                    .iter()
-                    .find(|entry| {
-                        entry.from_zone.is_empty()
-                            && entry.scope_ok(ingress_ifname, ingress_routing_instance)
-                            && entry.source_matches(src_ip)
-                            && entry.l4_extra_matches(src_port, dst_port, packet_icmp)
-                    })
-                    .map(|entry| (entry.value, entry.hit_counter.clone()))
+                entries.iter().find(|entry| {
+                    entry.from_zone.is_empty()
+                        && entry.scope_ok(ingress_ifname, ingress_routing_instance)
+                        && entry.source_matches(src_ip)
+                        && entry.l4_extra_matches(src_port, dst_port, packet_icmp)
+                })
             })
+            .map(|entry| entry.to_outcome())
     }
 
     /// #3164: longest-prefix-match over the non-host prefix table. Mirrors the
@@ -683,7 +752,7 @@ impl DnatTable {
         ingress_ifname: &str,
         ingress_routing_instance: &str,
         packet_icmp: Option<(u8, u8)>,
-    ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
+    ) -> Option<DnatOutcome> {
         self.match_prefix_slots(
             self.prefix_entries.get(&DnatProtoPortKey {
                 protocol,
@@ -749,7 +818,7 @@ impl DnatTable {
         ingress_ifname: &str,
         ingress_routing_instance: &str,
         packet_icmp: Option<(u8, u8)>,
-    ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
+    ) -> Option<DnatOutcome> {
         let slots = slots?;
         let best_in_tier = |zone_specific: bool| -> Option<&DnatPrefixSlot> {
             let mut best: Option<&DnatPrefixSlot> = None;
@@ -778,7 +847,7 @@ impl DnatTable {
         };
         best_in_tier(true)
             .or_else(|| best_in_tier(false))
-            .map(|slot| (slot.entry.value, slot.entry.hit_counter.clone()))
+            .map(|slot| slot.entry.to_outcome())
     }
 
     /// #3164: dedup-insert a prefix slot. Like `insert_entry`, two slots with the
@@ -811,6 +880,12 @@ impl DnatTable {
                 && existing.entry.match_dst_ports == new_slot.entry.match_dst_ports
                 && existing.entry.match_icmp_type == new_slot.entry.match_icmp_type
                 && existing.entry.match_icmp_code == new_slot.entry.match_icmp_code
+                // #3844: an off (exemption) rule and a translate rule that share
+                // an otherwise-identical match are DISTINCT — both must be
+                // retained so the exemption can win by insertion (config) order.
+                // Deduping them would collapse one onto the other and either
+                // drop the exemption (fail-open) or drop the translation.
+                && existing.entry.off == new_slot.entry.off
         }) {
             *existing = new_slot;
             return;
@@ -849,6 +924,11 @@ impl DnatTable {
                 && existing.match_dst_ports == entry.match_dst_ports
                 && existing.match_icmp_type == entry.match_icmp_type
                 && existing.match_icmp_code == entry.match_icmp_code
+                // #3844: an off (exemption) rule and a translate rule sharing an
+                // otherwise-identical match are DISTINCT entries — see
+                // insert_prefix_slot. Both are retained; the earlier-inserted
+                // (config-order-first) entry wins in match_entries' `.find()`.
+                && existing.off == entry.off
         }) {
             *existing = entry;
             return;
@@ -910,11 +990,22 @@ impl DnatTable {
         let mut out: Vec<(IpAddr, &str)> = Vec::new();
         for (key, entries) in &self.entries {
             for entry in entries {
+                // #3844: a `then destination-nat off` exemption must NOT
+                // register its destination as a firewall-local address — the
+                // exempted destination is a real host reachable via routing,
+                // not a VIP the firewall owns, so proxy-ARP/ND for it would
+                // hijack that host's traffic on a directly-connected segment.
+                if entry.off {
+                    continue;
+                }
                 out.push((key.dst_ip, entry.from_routing_instance.as_ref()));
             }
         }
         for slots in self.prefix_entries.values() {
             for slot in slots {
+                if slot.entry.off {
+                    continue;
+                }
                 let instance = slot.entry.from_routing_instance.as_ref();
                 if let Some(net) = slot.network() {
                     out.push((net, instance));

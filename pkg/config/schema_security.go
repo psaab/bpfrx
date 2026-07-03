@@ -395,6 +395,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					}},
 					"then": {desc: "Destination NAT action", children: map[string]*schemaNode{
 						"destination-nat": {desc: "Destination NAT translation", children: map[string]*schemaNode{
+							"off":  {desc: "Disable destination NAT for matching traffic (no-translate exemption)", children: nil},
 							"pool": {desc: "Translate using a destination NAT pool", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: nil},
 						}},
 					}},
