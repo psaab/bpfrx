@@ -686,6 +686,99 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 	return warnings, nil
 }
 
+// validateNAT64PrefixStrict is the #3886 strict-vs-lenient gate for a NAT64
+// rule-set's `prefix` (`security nat nat64 rule-set <r> prefix <p>`).
+//
+// The prefix is read verbatim into NAT64RuleSnapshot.Prefix
+// (compiler_nat.go:compileNAT64 -> buildNAT64Snapshots) and parsed at
+// dataplane apply by Nat64State::try_from_snapshots (userspace-dp/src/nat64.rs).
+// That /96-integrity check REQUIRES the prefix to be `<ipv6-address>/96`: it
+// splits on '/', the token after the first '/' MUST parse as a decimal /96
+// (only /96 is supported by the translator), and the address token before the
+// '/' MUST parse as an IPv6 address. Anything else (a non-/96 length, a missing
+// or garbage mask, a non-IPv6 / malformed address) makes try_from_snapshots
+// return a SnapshotIntegrityError, which propagates via `?` out of
+// build_reconcile_forwarding and ABORTS the whole forwarding rebuild WITHOUT
+// publishing a snapshot. The dataplane is then frozen at the last-good state:
+// every later commit (new sessions, policy, NAT) silently stops reaching the
+// dataplane with no operator feedback. Without this gate a single bad NAT64
+// prefix COMMITS GREEN and wedges the entire control->dataplane pipeline.
+//
+// This mirrors the Rust /96-integrity check EXACTLY so anything that would
+// abort the rebuild at runtime is rejected at commit — no commit-accept ->
+// runtime-abort gap. An empty/absent prefix is deliberately OUT OF SCOPE: the
+// Go builder (buildNAT64Snapshots) skips an empty-prefix rule, so it is never
+// emitted on the wire and never reaches the Rust check, so it cannot freeze the
+// rebuild.
+//
+// Strict (commit / commit-check): hard-reject a non-/96 or malformed prefix.
+// Lenient (load / peer-sync, #1960 / #1979 doctrine): return the message as a
+// warning so a config committed before this gate existed (or peer-synced) still
+// BOOTS — fail-closed-on-compile-failure would otherwise brick the daemon on
+// restart. The Rust helper's own try_from_snapshots backstop keeps the previous
+// live forwarding state on the leniently-loaded config, so the bad rule never
+// installs. Same doctrine as validateNPTv6Strict.
+func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	var warnings []string
+	emit := func(msg string) error {
+		if lenient {
+			warnings = append(warnings,
+				msg+" (this NAT64 rule is invalid; on a userspace-dataplane apply/preflight"+
+					" the helper's Nat64State::try_from_snapshots rejects the whole forwarding"+
+					" snapshot and the previous live state is kept, so this rule — and every"+
+					" later config change — will not reach the dataplane until it is corrected)")
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	for _, rs := range cfg.Security.NAT.NAT64 {
+		if rs == nil || rs.Prefix == "" {
+			continue
+		}
+		// Mirror Nat64State::try_from_snapshots (userspace-dp/src/nat64.rs)
+		// EXACTLY. Split on '/' (Rust `split('/')`); a trailing junk field
+		// after the mask is ignored by both sides, so we index [0] and [1] and
+		// disregard the rest rather than SplitN'ing the mask.
+		parts := strings.Split(rs.Prefix, "/")
+		// The token after the first '/' must parse as a decimal /96. A missing
+		// mask (no '/'), an empty mask, a non-numeric mask, or any length other
+		// than 96 is rejected — only /96 is supported by the translator.
+		mask96 := false
+		if len(parts) >= 2 {
+			if m, err := strconv.ParseUint(parts[1], 10, 8); err == nil && m == 96 {
+				mask96 = true
+			}
+		}
+		if !mask96 {
+			if err := emit(fmt.Sprintf(
+				"security nat nat64 rule-set %q prefix %q must be an IPv6 prefix of length /96 (RFC 6052: the well-known 64:ff9b::/96 or a /96 network-specific prefix); any other length or a missing/garbage mask is rejected by the dataplane, which aborts the entire forwarding rebuild",
+				rs.Name, rs.Prefix)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		// The address token before the first '/' must parse as an IPv6 address.
+		// natAddrFamily keys the family on the un-parsed text (colon == v6) so
+		// an IPv4-mapped literal (::ffff:1.2.3.4) is classified V6, matching
+		// Rust's Ipv6Addr::from_str exactly (a dotted-quad or a non-IP token is
+		// NOT V6 and is rejected).
+		if natAddrFamily(parts[0]) != "v6" {
+			if err := emit(fmt.Sprintf(
+				"security nat nat64 rule-set %q prefix %q has an address part %q that is not a valid IPv6 address; the dataplane rejects it and aborts the entire forwarding rebuild",
+				rs.Name, rs.Prefix, parts[0])); err != nil {
+				return nil, err
+			}
+			continue
+		}
+	}
+
+	return warnings, nil
+}
+
 func compileNAT(node *Node, sec *SecurityConfig) error {
 	// Initialize SourcePools map
 	if sec.NAT.SourcePools == nil {

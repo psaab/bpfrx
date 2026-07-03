@@ -242,6 +242,52 @@ fn dataplane_event_queue_full_counts_per_kind_drop() {
     assert_eq!(stats.filter_log.dropped, 1);
 }
 
+// #3878 F-153: a telemetry frame that clears the rate limiter AND the queue
+// budget but then hits a FULL shared channel must NOT burn a sequence number.
+// The seq is allocated atomically with the enqueue and rolled back on the
+// `Full` `try_send`, so a saturation drop never leaves a reader-visible gap.
+//
+// RED-on-revert: without the rollback, `next_seq` advances to 1 on the dropped
+// emit, and the next real frame lands on seq 2 with a hole at seq 1.
+#[test]
+fn dataplane_event_channel_full_does_not_burn_seq_3878() {
+    // capacity 2 -> telemetry budget ceil(2/2) = 1, so the budget alone admits
+    // one frame; pre-fill the shared channel with non-telemetry control frames
+    // (fixed seqs, `next_seq` untouched) so the budget still has room but the
+    // channel is full, forcing the `try_send` Full path.
+    let (handle, _rx, shared) = test_handle(
+        2,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    assert!(handle.try_send(crate::event_stream::EventFrame::encode_drain_complete(100)));
+    assert!(handle.try_send(crate::event_stream::EventFrame::encode_drain_complete(101)));
+    assert_eq!(
+        shared.next_seq.load(Ordering::Relaxed),
+        0,
+        "control frames must not allocate sequence numbers"
+    );
+
+    let outcome =
+        handle.try_emit_dataplane_event_at(test_event(DataplaneEventKind::PolicyDeny, 7), 0);
+    assert_eq!(
+        outcome,
+        DataplaneEventEmitOutcome::Dropped {
+            reason: DataplaneEventDropReason::QueueFull
+        }
+    );
+    assert_eq!(
+        shared.next_seq.load(Ordering::Relaxed),
+        0,
+        "#3878 F-153: a full-channel telemetry drop must not burn a sequence number"
+    );
+
+    let stats = handle.dataplane_event_stats();
+    assert_eq!(stats.policy_deny.queue_full, 1);
+}
+
 #[test]
 fn dataplane_event_disconnected_counts_per_kind_drop() {
     let (handle, rx, shared) = test_handle(

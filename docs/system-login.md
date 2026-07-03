@@ -110,11 +110,39 @@ provisioned, on the next commit xpf **locks** that account's password
 rather than orphaning a live credential. Re-adding the directive
 restores the password.
 
-This password reconciliation is **declarative**; SSH keys
-(`authorized_keys`) and sudo (`/etc/sudoers.d/xpf-<name>`) remain
-additive and are independent of the password — a live password is a
-higher-severity orphan than a stale key, so the two are treated
-asymmetrically by design.
+This password reconciliation is **declarative**. SSH keys
+(`authorized_keys`) remain additive and independent of the password — a
+live password is a higher-severity orphan than a stale key. The
+super-user sudo grant (`/etc/sudoers.d/xpf-<name>`) is **also
+declarative** and reconciled on every apply (see below): a class
+downgrade or user removal revokes it (#3889).
+
+## Super-user sudo grants are reconciled and revoked (#3889)
+
+A login user with `class super-user` is granted passwordless root via a
+NOPASSWD drop-in `/etc/sudoers.d/xpf-<name>`. That grant is reconciled
+against the **current** config on every commit by `reconcileSudoers`
+(`pkg/daemon/daemon_system.go`), mirroring the networkd/rsyslog
+stale-file reconcilers:
+
+1. Write `xpf-<name>` for each user that is a super-user **now**.
+2. Sweep `/etc/sudoers.d/xpf-*` and **REMOVE** any drop-in whose user is
+   no longer a super-user. This covers both a **class downgrade**
+   (`super-user` → `operator`/`read-only`) and a **user removal** from
+   the config — in either case the passwordless-root grant is revoked on
+   the next apply. Before #3889 the write had no removal branch, so a
+   demoted or deleted admin kept passwordless root forever.
+
+Only files with the `xpf-` prefix are written, kept, or removed; any
+operator-authored file in `/etc/sudoers.d` is left untouched. The
+reconcile runs **unconditionally** — even when `system login` has no
+users (the "all users removed" case), so stale grants are still swept.
+Writes are **DurableState** (`fsatomic.WriteFileDurable`, `0440`) and
+the generated file is validated with `visudo -cf` (best-effort, root
+only) before being trusted; a rejected drop-in is removed rather than
+left as a lockout landmine, because a single malformed file in
+`/etc/sudoers.d` breaks **all** sudo invocations. `root` is never
+granted an xpf-managed drop-in.
 
 ### Scope — only xpf-managed accounts
 
@@ -153,10 +181,11 @@ The password path is a `chpasswd` **process** invocation (which performs
 its own `lckpwdf`-protected shadow update), not a direct file write, so
 the #1916 fsatomic file-write wrapper does not apply to it.
 
-The sudoers drop-in and `authorized_keys` writes in the same apply
-function ARE direct file writes and were migrated to **DurableState** in
-#1916 (`fsatomic.WriteFileDurable`): a torn sudoers file is a
-management-access hazard, and SSH keys must survive a power cut. The
+The sudoers drop-in (now written by `reconcileSudoers`, #3889) and the
+`authorized_keys` write in `applySystemLogin` ARE direct file writes and
+were migrated to **DurableState** in #1916
+(`fsatomic.WriteFileDurable`): a torn sudoers file is a management-access
+hazard, and SSH keys must survive a power cut. The
 `authorized_keys` writes additionally use `fsatomic.WithOwner(uid, gid)`
 (owner resolved cgo-free via `lookupUIDGID`) so the file is installed
 already-correctly-owned — a plain durable write would replace the inode

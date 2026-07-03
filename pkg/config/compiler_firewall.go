@@ -227,6 +227,126 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 	return nil
 }
 
+// validateFirewallFilterFamilyCollisionsAST walks every top-level `firewall`
+// node and rejects a firewall-filter NAME reused across two DIFFERENT non-inet6
+// families (#3884, fable-review-161 F-030).
+//
+// compileFirewall selects the destination map with `dest := fw.FiltersInet`
+// (compiler_firewall.go) and only switches to fw.FiltersInet6 when the family
+// is literally "inet6" — so EVERY other family (inet, any, mpls, ccc, vpls,
+// bridge, and any not-yet-modelled token, since SchemaValidate does not reject
+// an unknown family keyword) folds into the single fw.FiltersInet pool, then
+// writes `dest[filter.Name] = filter` unconditionally. A same-name filter
+// authored under a second such family therefore silently OVERWRITES the first
+// (last-write-wins). If `family inet filter blockX { ... then discard; }` is
+// followed by `family any filter blockX { ... then accept; }`, the effective
+// IPv4 filter becomes accept-all — a deny silently downgraded to an accept
+// (a security fail-open).
+//
+// Downstream consumers reference filters by NAME within the inet (V4) / inet6
+// (V6) buckets only — an interface unit's FilterInputV4 resolves against
+// fw.FiltersInet, FilterInputV6 against fw.FiltersInet6 (compiler_validate_warn.go,
+// routing/rules.go, dataplane/userspace/filters.go). There is no family
+// dimension in the reference, so once two non-inet6 families share a name the
+// map cannot disambiguate them — the reuse is genuinely ambiguous. Junos
+// namespaces firewall filters per family; xpf folds them, so it rejects the
+// reuse fail-closed instead of resolving it by arbitrary map-write order.
+//
+// inet6 has its own destination map (fw.FiltersInet6) and is the ONLY family
+// that folds there, so a name shared between family inet and family inet6 lands
+// in two DIFFERENT maps and does NOT collide — that legitimate dual-stack case
+// (the same filter name for the V4 and V6 path) is preserved. Only a name that
+// appears under >= 2 distinct non-inet6 families is flagged.
+//
+// Strict path (commit / commit-check, lenient=false): the first collision is a
+// hard compile error naming the offending filter and its families. Lenient path
+// (load / peer-sync, lenient=true): every collision is returned as a warning and
+// compilation continues with the existing last-write-wins behavior, so an
+// already-persisted or peer-synced config that an older binary silently accepted
+// still BOOTS (#1960 / #3261 fail-closed-on-load doctrine).
+//
+// The traversal mirrors compileFirewall's family/filter walk exactly (BOTH AST
+// shapes: hierarchical `family inet { filter ... }` and the set-command
+// `family { inet { filter ... } }`), and aggregates across every top-level
+// `firewall {}` block because compileFirewall compiles each into the same
+// fw.FiltersInet map — a collision split across two blocks is just as real.
+func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]string, error) {
+	// filterFamilies[name] = the ordered set of DISTINCT non-inet6 families that
+	// define a filter of this name (all folding into the shared FiltersInet pool).
+	filterFamilies := map[string][]string{}
+	// order preserves first-seen filter-name order for a deterministic error.
+	order := []string{}
+
+	record := func(name, fam string) {
+		for _, f := range filterFamilies[name] {
+			if f == fam {
+				return // same family already recorded — not a cross-family reuse
+			}
+		}
+		if len(filterFamilies[name]) == 0 {
+			order = append(order, name)
+		}
+		filterFamilies[name] = append(filterFamilies[name], fam)
+	}
+
+	for _, fwNode := range nodes {
+		if fwNode.Name() != "firewall" {
+			continue
+		}
+		for _, familyNode := range fwNode.FindChildren("family") {
+			var afNodes []*Node
+			var afName string
+			if len(familyNode.Keys) >= 2 {
+				// Hierarchical: family inet { ... }
+				afName = familyNode.Keys[1]
+				afNodes = []*Node{familyNode}
+			} else {
+				// Set-command shape: family { inet { ... } inet6 { ... } }
+				afNodes = append(afNodes, familyNode.Children...)
+			}
+			for _, afNode := range afNodes {
+				af := afName
+				if af == "" {
+					af = afNode.Keys[0]
+					if len(afNode.Keys) >= 2 {
+						af = afNode.Keys[1]
+					}
+				}
+				if af == "inet6" {
+					// Its own dest map (FiltersInet6) — cannot collide with the pool.
+					continue
+				}
+				for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
+					if filterInst.name == "" {
+						continue
+					}
+					record(filterInst.name, af)
+				}
+			}
+		}
+	}
+
+	var warnings []string
+	for _, name := range order {
+		fams := filterFamilies[name]
+		if len(fams) < 2 {
+			continue
+		}
+		msg := fmt.Sprintf(
+			"firewall filter %q is defined under multiple non-inet6 families "+
+				"(%s) — xpf folds every family except inet6 into one name-keyed "+
+				"filter map, so the later definition silently overwrites the "+
+				"earlier (a discard filter can become accept-all — fail-open); "+
+				"Junos namespaces filters per family, so rename one of them (#3884)",
+			name, strings.Join(fams, ", "))
+		if !lenient {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+	}
+	return warnings, nil
+}
+
 // firewallMatchValues extracts every value carried by a `from` match-criterion
 // node, across BOTH parser AST shapes (#2545):
 //

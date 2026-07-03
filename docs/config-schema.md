@@ -633,6 +633,57 @@ and break the symmetry in the other direction. Pinned by
 `pkg/config/quotekey_roundtrip_3854_test.go` (`TestQuoteKeyLexerSymmetry3854`,
 `TestFormatParseRoundTrip3854`, `TestFormatParseIdempotent3854`).
 
+## Firewall-filter cross-family name collision fail-closed gate (#3884)
+
+Junos namespaces firewall filters **per family**, so `family inet filter blockX`
+and `family mpls filter blockX` are two distinct filters. xpf cannot: `compileFirewall`
+(`compiler_firewall.go`) selects the destination map with `dest := fw.FiltersInet`
+and only switches to `fw.FiltersInet6` when the family is literally `inet6`, so
+EVERY other family (`inet`, `any`, `mpls`, `ccc`, `vpls`, `bridge`, and any
+not-yet-modelled token — `SchemaValidate` does not reject an unknown family
+keyword) folds into the single `fw.FiltersInet` pool, then writes
+`dest[filter.Name] = filter` **unconditionally**. Two same-name filters authored
+under two different non-inet6 families therefore silently collapse — the later
+definition last-write-wins over the earlier with no commit error. If the `family
+inet` filter was a `discard`/deny and the colliding-family filter is accept-all,
+the effective IPv4 filter becomes accept-all: a deny silently downgraded to an
+accept (a security **fail-open**).
+
+Downstream consumers reference filters by **name** within the inet (V4) / inet6
+(V6) buckets only — an interface unit's `FilterInputV4` resolves against
+`fw.FiltersInet`, `FilterInputV6` against `fw.FiltersInet6`
+(`compiler_validate_warn.go`, `routing/rules.go`, `dataplane/userspace/filters.go`).
+There is no family dimension in the reference, so once two non-inet6 families
+share a name the map cannot disambiguate them and the reuse is genuinely
+ambiguous. `validateFirewallFilterFamilyCollisionsAST` (`compiler_firewall.go`)
+**rejects at commit / commit-check** a filter name defined under more than one
+distinct non-inet6 family, naming the filter and the colliding families. It is an
+AST pre-walk (mirroring `validateApplicationNameCollisionsAST`, #3339) because the
+colliding definitions are merged away by last-write-wins by the time
+`fw.FiltersInet` exists — only the raw AST still carries every family's
+definition — and it aggregates across every top-level `firewall {}` block
+(compileFirewall folds each into the same map, so a split-block collision is just
+as real).
+
+`inet6` has its own dest map (`fw.FiltersInet6`) and is the ONLY family that folds
+there, so a name shared between `family inet` and `family inet6` lands in two
+different maps and does **not** collide — the legitimate dual-stack case (one
+filter name for the V4 and V6 path) is preserved. Only a name under ≥ 2 distinct
+non-inet6 families is flagged. Because the schema-driven flat `set` grammar only
+structures `family inet` / `family inet6`, an unknown family (`any`, `mpls`, …)
+reaches a structured `filter` subtree — and thus the fold-overwrite — only via a
+hierarchical config-file parse or a directly-constructed / peer-synced AST; that
+is exactly the reachable path the gate closes.
+
+On the tolerant load / peer-sync path the error downgrades to a `cfg.Warnings`
+entry (`lenientFirewallFilterFamilyCollisions`, #1960 / #3261 no-brick), keeping
+the arbitrary-but-stable last-write-wins map so an already-persisted or
+peer-synced config an older binary silently accepted still BOOTS. Fail-on-revert:
+`pkg/config/compiler_firewall_family_collision_3884_test.go` (strict reject on
+`CompileConfig`, warn-not-brick on `CompileConfigLenient` with the surviving
+accept asserted, plus the inet/inet6 dual-stack and single-family no-false-reject
+cases).
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list
@@ -3137,6 +3188,63 @@ match/prefix reject + parseable host/​block still-compile + lenient-warn). Lik
 `pool-utilization-alarm`, this is compiler-side only — not yet a typed
 `setSchema` leaf.
 
+### #3886 — NAT64 rule-set `prefix` /96 commit gate
+
+A NAT64 rule-set `prefix` (`security nat nat64 rule-set <r> prefix <p>`) is read
+verbatim into the wire snapshot (`compileNAT64` in `compiler_nat.go` →
+`NAT64RuleSnapshot.Prefix` via `buildNAT64Snapshots`) and parsed at dataplane
+apply by `Nat64State::try_from_snapshots` (`userspace-dp/src/nat64.rs`). That
+**/96-integrity check** requires an IPv6 `<address>/96`: it splits the string on
+`/`, the token after the first `/` MUST parse as a decimal `96` (only `/96` is
+supported by the translator), and the address token before the `/` MUST parse as
+an `Ipv6Addr`. Anything else — a non-`/96` length, a missing/garbage mask, or a
+non-IPv6 / malformed address — makes `try_from_snapshots` return a
+`SnapshotIntegrityError`, which propagates via `?` out of
+`build_reconcile_forwarding` and **aborts the ENTIRE forwarding rebuild WITHOUT
+publishing**. The dataplane is then frozen at the last-good snapshot: every later
+commit (new sessions, policy, NAT) silently stops reaching the dataplane. The
+`prefix` `setSchema` leaf (`schema_security.go`) carries no `keyValidator`
+(unlike the RA `nat-prefix`/`nat64prefix` leaves, whose `ValidatePREF64CIDR`
+accepts the broader RFC 8781 `{32,40,48,56,64,96}` set — WRONG for a NAT64
+translator that supports `/96` only), so before this gate a bad prefix committed
+GREEN and wedged the whole control→dataplane pipeline.
+
+`validateNAT64PrefixStrict` (`pkg/config/compiler_nat.go`, invoked from the
+typed-config phase of `compileExpanded` in `compiler.go`, right after
+`validateNPTv6Strict`) closes that gap and mirrors the Rust check EXACTLY (split
+on `/`, mask token must be `96`, address token must be IPv6 via the textual
+`natAddrFamily` — a colon means IPv6, matching Rust `Ipv6Addr::from_str` for the
+IPv4-mapped `::ffff:x` form), so anything that would abort the rebuild at runtime
+is rejected at commit — no commit-accept → runtime-abort gap.
+
+- **Scope / out-of-scope:** only a NON-EMPTY prefix is validated. An empty/absent
+  prefix is deliberately exempt — `buildNAT64Snapshots` skips an empty-prefix
+  rule, so it is never emitted on the wire and never reaches the Rust check, so
+  it cannot freeze the rebuild.
+- **Strict (`commit` / `commit check`):** a non-`/96` or malformed prefix is a
+  HARD commit error naming the rule-set and offending prefix.
+- **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
+  `CompileConfigForNodeLenient`, flag `lenientNAT64Prefix`):** the violation
+  downgrades to a `cfg.Warnings` entry so a node that committed a bad NAT64
+  prefix BEFORE this gate existed (or a peer-synced config) still BOOTS after
+  upgrade instead of failing closed (#1960 fail-closed-on-compile-failure). The
+  Rust helper's own `try_from_snapshots` backstop keeps the previous live
+  forwarding state, so a leniently-loaded bad prefix is inert — and the
+  operator's next strict commit rejects it loudly.
+
+> Defense-in-depth follow-up (not fixed here): even with the commit gate, a bad
+> NAT64 prefix arriving via HA peer-sync/lenient still makes the Rust
+> `try_from_snapshots` reject the WHOLE forwarding snapshot rather than skipping
+> just the bad NAT64 rule and publishing the rest. Scoping the Rust rejection to
+> the offending rule is a larger `userspace-dp` change tracked separately.
+
+Regression coverage: `pkg/config/compiler_nat64_prefix_test.go` (well-known
+`64:ff9b::/96` + `/96` NSP accept; non-`/96` lengths, missing mask, garbage
+mask, malformed IPv6 address, and IPv4 prefix reject with asserted message;
+lenient strict-reject → warn + valid-no-warning). Compiler-side only — not a
+typed `setSchema` leaf (a schema `keyValidator` has no lenient mode and would
+hard-reject on the load path too, re-introducing the #1960 boot-brick).
+
 ### #2217 — firewall / application undefined-reference validation
 
 Three firewall/application cross-references compiled cleanly with no operator
@@ -3164,7 +3272,16 @@ strict-vs-lenient gates:
   multi-term user applications are skipped (their members are
   compiler-synthesized, not operator references). Pre-fix a policy matching the
   set silently failed to match the intended traffic (the unresolved member never
-  matches — an effective no-op term).
+  matches — an effective no-op term). **Sibling gate (#3890, fable-review-161
+  F-160):** Finding B checks a member's NAME resolves; a mistyped member KEYWORD
+  (`applicaton foo` instead of `application foo`, or a bad `application-set`) is a
+  distinct failure — the token never becomes a reference at all, it is silently
+  dropped and the set is UNDER-POPULATED (a fail-open under-match for a deny
+  policy referencing it). `compileApplications` records the bad keyword on
+  `ApplicationSet.UnknownMembers` and `validateApplicationSyntaxStrict` rejects it
+  (a `description` is accepted as metadata); it runs EARLIER than Finding B, so a
+  typo'd keyword is reported as "unknown member statement" rather than a dangling
+  reference. Same strict-reject / lenient-warn discipline (`lenientApplicationSpecs`).
 - **Finding C — `then routing-instance <name>` (FBF) →
   `validateFirewallRoutingInstanceReferencesStrict`.** A firewall-filter term
   whose filter-based-forwarding steer names a routing-instance not defined under

@@ -37,6 +37,87 @@
     userspace-dp/src/afxdp/wg/counters.rs (doc), userspace-dp/src/afxdp/wg/tests.rs
     (established_pair promote + 2 new tests + rewrites),
     docs/pr/wireguard-clean/plan.md (3-slot lifecycle bullet)
+## 2026-07-03 — #3890: typo'd application-set member keyword silently dropped (deny under-populated, fail-open)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-160 (MEDIUM, security fail-open). The
+    application-set member compiler (`compiler_applications.go`) switch over
+    member keywords had NO default arm, so a TYPO'd member keyword (e.g.
+    `applicaton foo` for `application foo`, or a mistyped `application-set`) was
+    SILENTLY DROPPED — it never reached strict validation, committed clean, and
+    the application-set was UNDER-POPULATED. If that set was used in a DENY
+    policy the deny matched FEWER applications than intended → traffic the
+    operator meant to block was permitted (fail-open under-match).
+  - **Fix**: Added a `default:` arm to the member switch that records the
+    offending keyword on the new `ApplicationSet.UnknownMembers` field (mirroring
+    the #3352 `UnknownTermLeaves` opaque-`term` pattern), plus an explicit
+    `case "description":` accept-and-ignore arm (Junos allows `description` on an
+    application-set — the documented way to author an otherwise-empty set; the
+    existing #3144/#3434 empty-set tests depend on it). Extended
+    `validateApplicationSyntaxStrict` (`compiler_validate_strict.go`) — the same
+    all-user-sets, referenced-or-not gate that already rejects an unknown leaf
+    inside an opaque `term` — to hard-reject the first application-set carrying an
+    UnknownMembers entry, naming the set + the bad keyword. Runs at commit /
+    commit-check; the tolerant load / peer-sync path downgrades to a
+    `cfg.Warnings` entry via the existing `lenientApplicationSpecs` flag (#1960
+    no-brick). Implicit application-sets synthesized for term-bearing applications
+    never carry UnknownMembers, so they are unaffected. Distinct from #2068 (a
+    dropped valid NESTED-set member) and #2217 Finding B
+    `validateApplicationSetMembersStrict` (a dangling member NAME; #3890 is a
+    typo'd member KEYWORD that never becomes a reference, and the syntax gate runs
+    earlier so it reports "unknown member statement" rather than a dangling ref).
+  - **Validation**: New `compiler_application_set_member_3890_test.go` (8 tests):
+    typo'd `application`/`application-set` keyword rejected (flat + hierarchical),
+    unreferenced set rejected, deny-policy end-to-end rejected, lenient warns,
+    valid `application`+nested-`application-set` set commits fully-populated +
+    expands, `description`-only set commits (not flagged). RED-on-revert proven —
+    removing the default arm makes the 6 reject/lenient tests FAIL while the
+    valid-members and description guards stay green. `go test ./pkg/config/...`
+    green; `go test ./pkg/appid/... ./pkg/policymatch/... ./pkg/dataplane/userspace/...`
+    green; `go build ./...` clean; gofmt + vet clean.
+  - **File(s)**: pkg/config/compiler_applications.go (default + description arms),
+    pkg/config/types_security.go (ApplicationSet.UnknownMembers field),
+    pkg/config/compiler_validate_strict.go (validateApplicationSyntaxStrict set
+    loop + doc), pkg/config/compiler_application_set_member_3890_test.go (new),
+    pkg/config/README.md (#3890 subsection), docs/config-schema.md (Finding B
+    sibling-gate note)
+
+## 2026-07-03 — #3884: firewall-filter cross-family name collision folds into FiltersInet (discard→accept-all fail-open)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-030 (MEDIUM, security fail-open).
+    `compileFirewall` (`compiler_firewall.go`) selects `dest := fw.FiltersInet`
+    for EVERY family except `inet6` (inet, any, mpls, ccc, vpls, bridge, ...) and
+    writes `dest[name] = filter` unconditionally, so two same-name filters under
+    two different non-inet6 families silently collapse (last-write-wins) with no
+    commit error. A `family inet filter blockX { then discard }` replaced by a
+    same-name `family any filter blockX { then accept }` becomes accept-all on the
+    IPv4 path — a deny silently downgraded to an accept.
+  - **Fix**: Added `validateFirewallFilterFamilyCollisionsAST` (new AST pre-walk
+    in `compiler_firewall.go`, mirroring the #3339 application-collision gate)
+    that rejects at commit / commit-check a filter name defined under ≥ 2 distinct
+    non-inet6 families (naming the filter + families), and downgrades to a
+    `cfg.Warnings` entry on the tolerant load / peer-sync path
+    (`lenientFirewallFilterFamilyCollisions`, #1960 / #3261 no-brick). Chose
+    fail-closed REJECT over per-(family,name) namespacing because downstream
+    consumers reference filters by NAME within the inet (V4) / inet6 (V6) buckets
+    only — no family dimension exists to disambiguate, so the reuse is genuinely
+    ambiguous. inet6 has its own dest map (`FiltersInet6`) so the legitimate
+    inet/inet6 dual-stack same-name case is preserved (distinct maps, no collision).
+    Wired the gate into `compileConfig` (invoke after `validateApplicationNameCollisionsAST`;
+    warnings accumulated alongside `appCollisionWarnings`) with the new
+    `lenientFirewallFilterFamilyCollisions` opt set in both lenient constructors.
+  - **File(s)**: `pkg/config/compiler_firewall.go` (validator),
+    `pkg/config/compiler.go` (opt + invocation + warning accumulation),
+    `pkg/config/compiler_firewall_family_collision_3884_test.go` (new tests),
+    `docs/config-schema.md` (new gate section).
+  - **Validation**: `go test ./pkg/config/...` green; `go build ./...` clean;
+    gofmt + `go vet ./pkg/config/...` clean. RED-on-revert proven — neutralizing
+    the gate (forcing lenient) makes the strict Rejected tests fail (CompileConfig
+    returns nil, discard silently overwritten by accept). Reachable only via a
+    hierarchical config-file parse / peer-synced AST (the flat `set` grammar only
+    structures `family inet|inet6`), so tests use `parseHier` + a directly-built
+    AST — the actual reachable path.
 
 ## 2026-07-03 — #3876: rib-group interface-route import was a no-op (shadowed by default route) — per-prefix leak before main
 
@@ -28731,6 +28812,49 @@ top.
   parseOctetFrame collector parser), pkg/logging/README.md (partial-frame
   teardown #3874 bullet)
 
+## 2026-07-03 — #3878 event-stream seq allocate/enqueue atomicity (F-152 + F-153)
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fixed the cross-worker event-stream sequence allocate/enqueue
+  race (F-152) and the try_send-Full seq burn (F-153). Seq allocation and the
+  channel `try_send` now happen together under a new
+  `EventStreamShared.producer_seq_lock`, so the seq embedded in each frame is
+  monotonic in wire (channel-FIFO) order across all producer threads —
+  eliminating the out-of-order frame that the Go reader (zero reorder
+  tolerance, `pkg/dataplane/userspace/eventstream.go`) mistook for a
+  session-sync gap and answered with a spurious full owner-RG resync +
+  disconnect (self-amplifying during recovery). On a full-channel drop the
+  allocated seq is rolled back via a compare-exchange on `next_seq` (safe under
+  the lock; CAS tolerates the rare I/O-thread FullResync interleave) instead of
+  being burned, so a saturation drop no longer opens a reader-visible hole that
+  trips the NEXT frame's gap check (F-153). Approach = Option 1 (producer-lock
+  atomicity) from the issue; NO wire-format change (the seq field/offset are
+  unchanged, only its allocation timing). Reader (Go) UNCHANGED — Option 3
+  (reader reorder-window) was deliberately skipped because it would mask future
+  producer regressions. The lossless retry path drops the lock before every
+  sleep (no producer stall under backpressure) and re-allocates + rolls back on
+  each Full so the eventual wire seq matches the successful enqueue position.
+  `send_frame_lossless`/`push_delta_lossless` now share one
+  `send_lossless_encoded` retry core; `encode_delta_frame` takes the seq as a
+  parameter instead of allocating it internally.
+- **RED-on-revert**: neutralizing the rollback CAS + the producer lock makes
+  all three new tests fail — `push_delta_full_channel_drop_does_not_burn_seq_3878`
+  and `dataplane_event_channel_full_does_not_burn_seq_3878` (F-153, deterministic:
+  next_seq burns) and `concurrent_push_delta_preserves_monotonic_wire_order_3878`
+  (F-152 stress: "wire seq went backwards: 184 after 192"). All green with the
+  fix. NOTE: did NOT run crate-wide `cargo fmt` — origin/master is not clean
+  under this env's rustfmt (1367 diff lines on pristine master), so fmt would
+  sweep 200+ unrelated files; edits were hand-formatted to match surrounding
+  style. FULL `cargo test --release` green; `go build ./...` + `go test
+  ./pkg/dataplane/... ./pkg/cluster/...` green (no Go change).
+- **File(s)**: userspace-dp/src/event_stream/mod.rs (producer_seq_lock field +
+  init, rollback_seq, send_sequenced, send_lossless_encoded, send_frame_lossless
+  wrapper, encode_delta_frame seq-param, push_delta/push_delta_lossless rewire),
+  userspace-dp/src/event_stream/producer.rs (try_emit_dataplane_frame routes
+  through send_sequenced), userspace-dp/src/event_stream/tests.rs (2 new tests),
+  userspace-dp/src/event_stream/producer_tests.rs (1 new test),
+  userspace-dp/src/event_stream/README.md (#3878 seq-atomicity gotcha + #2874
+  bullet update), docs/session-sync-design.md (seq/enqueue atomicity note)
 ## 2026-07-03 — PR #3879 hostile-review folds: #3872 delete-side + 2 MINORs
 
 - **Timestamp**: 2026-07-03
@@ -28762,3 +28886,86 @@ top.
   pkg/frr/README.md (MINOR 1 metric-only-doesn't-float),
   pkg/config/delete_static_nexthop_3872_test.go (new, 5 tests),
   pkg/frr/static_empty_route_3872_test.go (new, 2 tests)
+
+## 2026-07-03 — #3878 fold: roll back the lossless-path seq UNDER the lock
+
+- **Timestamp**: 2026-07-03
+- **Action**: Hostile review of PR #3883 found a residual of the exact F-153
+  bug in the LOSSLESS path. `send_lossless_encoded` released the producer lock
+  at the end of its guard block and rolled the seq back in the OUTER match arms
+  — after the lock was dropped. Two concurrent lossless flushers on a Full
+  channel could then interleave: A alloc 6 / B alloc 7 / A rollback(6) CAS
+  expects-6-sees-7 FAILS / B rollback(7) CAS succeeds → next_seq left at 6 with
+  seq 6 STRANDED = a wire hole → spurious full owner-RG resync (the exact
+  symptom this PR targets). Reachable because flush_session_deltas →
+  push_delta_lossless runs per-worker (up to 6 concurrent on the mlx5 VF).
+  Fix: compute the try_send outcome AND perform the rollback INSIDE the guard
+  block (mirror send_sequenced), so allocations+rollbacks are strictly LIFO and
+  rollback_seq's CAS always targets the top of the stack; the lock is still
+  dropped before thread::sleep (no producer stall). Restores rollback_seq's
+  documented "called ONLY while producer_seq_lock is held" contract for both
+  callers.
+- **Test**: added `concurrent_lossless_full_drops_do_not_strand_seq_3878` — 4
+  threads call push_delta_lossless on a saturated (Full) channel, then give up;
+  asserts next_seq returns to the base (no stranded hole). RED on the pre-fold
+  code (non-LIFO rollback strands seqs, next_seq drifts above base), green with
+  the fix. The prior concurrent test used lossy push_delta on a never-Full
+  channel; the two single-threaded F-153 tests can't strand — none exercised
+  concurrent-lossless-on-Full.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs (send_lossless_encoded
+  rollback-under-lock), userspace-dp/src/event_stream/tests.rs (new test)
+## 2026-07-03 — #3886 NAT64 rule-set `prefix` /96 commit gate
+- **Timestamp**: 2026-07-03
+- **Action**: Add commit-time strict/lenient validator for a NAT64 rule-set
+  `prefix`. A non-/96 or malformed prefix committed GREEN then made the Rust
+  `Nat64State::try_from_snapshots` /96-integrity check
+  (`userspace-dp/src/nat64.rs`) abort the ENTIRE `build_reconcile_forwarding`
+  without publishing → dataplane frozen at the last-good snapshot → every later
+  commit silently stopped reaching the dataplane. New `validateNAT64PrefixStrict`
+  (`compiler_nat.go`, wired after `validateNPTv6Strict` in `compileExpanded`)
+  mirrors the Rust check EXACTLY: split on `/`, the mask token must parse as
+  decimal `96` (only /96 supported), the address token must be IPv6 via the
+  textual `natAddrFamily` (colon == v6, matching Rust `Ipv6Addr::from_str` incl.
+  the `::ffff:x` mapped form). Strict (commit/commit-check): hard-reject.
+  Lenient (`CompileConfigLenient`/`CompileConfigForNodeLenient`, new
+  `lenientNAT64Prefix` flag): warn so an already-persisted / peer-synced bad
+  prefix still BOOTS (#1960 no-brick) — the helper's own try_from_snapshots
+  backstop keeps the previous live state. Empty/absent prefix is out of scope
+  (buildNAT64Snapshots skips it, never reaches the Rust check). RED-on-revert
+  proven (forcing lenient=true made all reject tests FAIL). go test
+  ./pkg/config/... green; go build ./... clean; gofmt + vet clean. Flagged the
+  Rust abort-whole-rebuild-vs-skip-bad-rule as a separate defense-in-depth
+  follow-up (larger userspace-dp change), not fixed here.
+- **File(s)**: pkg/config/compiler_nat.go (validateNAT64PrefixStrict),
+  pkg/config/compiler.go (lenientNAT64Prefix option + wiring + 2 lenient
+  blocks), pkg/config/compiler_nat64_prefix_test.go (new, 11 tests),
+  docs/config-schema.md (#3886 subsection)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3889 — reconcile + REVOKE super-user sudoers grants. The
+  daemon wrote a NOPASSWD `/etc/sudoers.d/xpf-<user>` for each super-user
+  login account but had NO removal branch, so a class DOWNGRADE
+  (super-user → operator/read-only) or a full user REMOVAL from config
+  left the passwordless-root grant dangling forever (fable-161 F-055,
+  MEDIUM security / stale privilege). Fix: moved the write out of the
+  per-user `applySystemLogin` loop into a new `reconcileSudoers(cfg)`
+  (`pkg/daemon/daemon_system.go`) called unconditionally from the apply
+  pipeline (`daemon_apply.go` step 11b) — it MUST run even when
+  `applySystemLogin` early-returns on no users (the "all users removed"
+  case). It mirrors the networkd/rsyslog stale-file reconcilers: build the
+  desired super-user set, WRITE `xpf-<user>` for each current super-user
+  (durable `fsatomic.WriteFileDurable` 0440, existing #1916 safety),
+  SWEEP `/etc/sudoers.d/xpf-*` and REMOVE any drop-in not in the desired
+  set. Only `xpf-` prefixed files are ever touched (operator-authored
+  files left alone); root is never granted. Added a `visudo -cf`
+  validation seam (`validateSudoersFile`, best-effort: root-only +
+  visudo-present) — a rejected drop-in is removed rather than left as a
+  lockout landmine (one malformed file breaks ALL sudo). RED-on-revert:
+  disabling the sweep made the downgrade/removal/all-removed assertions
+  FAIL (stale grant persists). go test ./pkg/daemon/ green; go build
+  ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/daemon/daemon_system.go (reconcileSudoers +
+  writeSudoersGrant + sudoersDir/sudoersPrefix/validateSudoersFile;
+  removed inline write from applySystemLogin), pkg/daemon/daemon_apply.go
+  (step 11b reconcileSudoers call), pkg/daemon/daemon_sudoers_reconcile_3889_test.go
+  (new, 4 tests), docs/system-login.md (#3889 revocation section)
