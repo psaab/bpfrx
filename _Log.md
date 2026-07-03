@@ -28401,3 +28401,36 @@ top.
   pkg/scheduler/scheduler_test.go + pkg/daemon/policy_scheduler_apply_test.go
   (updated for fail-closed semantics), pkg/scheduler/README.md +
   docs/config-schema.md (docs)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3864 — deterministic (CGNAT) source NAT was un-configurable via
+  flat-set. The documented CGNAT quick-start (`set ... port deterministic
+  block-size N` + `... host address X` on SEPARATE `set` lines) was spuriously
+  rejected "deterministic block-size must be > 0" / "host address required":
+  the sibling `port deterministic ...` leaves overwrote each other last-wins in
+  `compiler_nat.go` and the host address was never read off Keys (`port`
+  unmodeled in `schema_security.go`). FIX: (1) model `port deterministic {
+  block-size; host address }` + `port range` as a container sub-stanza in
+  setSchema so the flat-set tokens GROUP onto ONE `port` node (and tab-complete
+  + typed block-size validation); (2) rewrite the compiler `port` case to read
+  block-size/host/range from BOTH the flat-set (Keys) AND hierarchical
+  (children) shapes and ACCUMULATE into a single DeterministicNATConfig instead
+  of resetting per sibling (the #2419 dual-AST-shape class) — new helpers
+  applyDeterministicKeys/applyDeterministicChildren/applyDeterministicHost only
+  write present fields. The genuine capacity/missing-field validation is
+  UNCHANGED (a real missing block-size / host / over-subscribed pool is still
+  rejected). RED-on-revert PROVEN: reverting the two source files (tests kept)
+  makes the flat-set doc config + reversed-order + range + IPv6 tests go RED
+  with the spurious "block-size must be > 0" / "host address required", while
+  the hierarchical-preserved and the two genuine-incomplete guards stay GREEN
+  (pre-existing-correct). DOC FIX: the doc's own IPv4 example was arithmetically
+  over-subscribed (/22 = 1024 hosts > 128 blocks → genuine capacity reject in
+  BOTH forms); corrected to /25 (128 hosts fit the 128 blocks) so the quick-
+  start actually commits clean, added the hierarchical equivalent + the
+  grouping note. go test ./pkg/config/... + ./pkg/dataplane/... green; go build
+  ./... green; gofmt + vet clean.
+- **File(s)**: pkg/config/schema_security.go (model `port` container),
+  pkg/config/compiler_nat.go (dual-shape accumulate + 3 helpers),
+  pkg/config/deterministic_nat_flatset_3864_test.go (new, 7 tests),
+  docs/deterministic-nat-cgnat.md (/22→/25 fix + hier example + grouping +
+  impl map), docs/config-schema.md (port now modeled note)
