@@ -333,30 +333,27 @@ impl EventStreamWorkerHandle {
             };
         }
 
-        let seq = self.next_seq();
-        let frame = encode(seq);
-        match self.try_send_frame(frame) {
-            Ok(()) => {
+        // #3878: allocate the seq and enqueue the frame atomically under the
+        // producer lock so wire order == seq order across producers (F-152),
+        // and roll the seq back on a full-channel drop so a saturation drop
+        // never burns a seq into a reader-visible gap (F-153). The rate-limit
+        // and queue-budget gates above stay lock-free and still refuse before
+        // any seq is allocated.
+        match self.send_sequenced(encode) {
+            Ok(seq) => {
                 self.shared.dataplane_event_counters.record_sent(kind);
                 DataplaneEventEmitOutcome::Queued { seq }
             }
-            Err(EventStreamSendError::Full) => {
+            Err(err) => {
                 self.shared.dataplane_event_queue.release(kind);
+                let reason = match err {
+                    EventStreamSendError::Full => DataplaneEventDropReason::QueueFull,
+                    EventStreamSendError::Disconnected => DataplaneEventDropReason::Disconnected,
+                };
                 self.shared
                     .dataplane_event_counters
-                    .record_drop(kind, DataplaneEventDropReason::QueueFull);
-                DataplaneEventEmitOutcome::Dropped {
-                    reason: DataplaneEventDropReason::QueueFull,
-                }
-            }
-            Err(EventStreamSendError::Disconnected) => {
-                self.shared.dataplane_event_queue.release(kind);
-                self.shared
-                    .dataplane_event_counters
-                    .record_drop(kind, DataplaneEventDropReason::Disconnected);
-                DataplaneEventEmitOutcome::Dropped {
-                    reason: DataplaneEventDropReason::Disconnected,
-                }
+                    .record_drop(kind, reason);
+                DataplaneEventEmitOutcome::Dropped { reason }
             }
         }
     }

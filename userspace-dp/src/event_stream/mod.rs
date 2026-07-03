@@ -27,9 +27,9 @@ use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -246,6 +246,17 @@ pub(crate) struct EventStreamStats {
 struct EventStreamShared {
     /// Workers fetch_add to get globally monotonic sequence numbers.
     next_seq: AtomicU64,
+    /// Serializes seq allocation with channel enqueue across all producer
+    /// threads (#3878). Held ONLY around `next_seq` allocation + the single
+    /// `tx.try_send`, so the wire (channel-FIFO) order equals seq order and two
+    /// workers cannot allocate N and N+1 but enqueue them inverted (F-152). The
+    /// critical section is non-blocking (an atomic + a byte-copy encode + a
+    /// non-blocking `try_send`); the lossless retry path releases it before any
+    /// sleep so a backpressured export never stalls the other producers. The
+    /// I/O thread's own FullResync/resync allocations do NOT take this lock —
+    /// they precede a reader reset, so their seq holes are benign; the rollback
+    /// CAS below guards the rare interleave with them.
+    producer_seq_lock: Mutex<()>,
     /// Updated by I/O thread from Ack frames.
     acked_seq: AtomicU64,
     /// Set by Pause, cleared by Resume.
@@ -324,6 +335,7 @@ impl EventStreamShared {
     ) -> Self {
         Self {
             next_seq: AtomicU64::new(0),
+            producer_seq_lock: Mutex::new(()),
             acked_seq: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             session_evicted_while_paused: AtomicBool::new(false),
@@ -513,49 +525,146 @@ impl EventStreamWorkerHandle {
         }
     }
 
-    fn send_frame_lossless(&self, mut frame: EventFrame) -> Result<(), String> {
+    /// Roll back a sequence number allocated by `next_seq()` when the frame it
+    /// was allocated for could NOT be committed to the channel (#3878 F-153).
+    ///
+    /// Called ONLY while `producer_seq_lock` is held, so no other producer
+    /// thread can have allocated after us — `seq` is the highest
+    /// producer-allocated value and rolling it back frees it for the next
+    /// enqueue, keeping the wire seq contiguous. The compare-exchange guards
+    /// the rare race with the I/O thread's own FullResync allocation
+    /// (`replay_buffered` / drain-poison, which do not take this lock): if it
+    /// bumped `next_seq` past `seq`, the CAS fails and we leave the counter
+    /// alone — that seq is burned, but a FullResync is already in flight so the
+    /// reader resets and the hole is moot. The CAS can never create a duplicate
+    /// wire seq.
+    fn rollback_seq(&self, seq: u64) {
+        let _ = self.shared.next_seq.compare_exchange(
+            seq,
+            seq - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Allocate the next wire sequence number and enqueue `encode(seq)` to the
+    /// shared channel ATOMICALLY under `producer_seq_lock`, so seq order ==
+    /// channel (wire) order across every producer thread (#3878 F-152). On a
+    /// `Full` drop the seq is rolled back so a saturation drop never burns a
+    /// sequence number and trips the reader's gap check (#3878 F-153). A
+    /// `Disconnected` drop leaves the counter advanced: the stream tears down
+    /// and the reader reconnects from `lastRecvSeq = 0`, so the burn is benign
+    /// and rolling it back would only risk racing a fresh reconnect.
+    fn send_sequenced<F>(&self, encode: F) -> Result<u64, EventStreamSendError>
+    where
+        F: FnOnce(u64) -> EventFrame,
+    {
+        let _guard = self
+            .shared
+            .producer_seq_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seq = self.next_seq();
+        let frame = encode(seq);
+        match self.try_send_frame(frame) {
+            Ok(()) => Ok(seq),
+            Err(EventStreamSendError::Full) => {
+                self.rollback_seq(seq);
+                Err(EventStreamSendError::Full)
+            }
+            Err(EventStreamSendError::Disconnected) => Err(EventStreamSendError::Disconnected),
+        }
+    }
+
+    /// Lossless retry core shared by `send_frame_lossless` (pre-built control
+    /// frames) and `push_delta_lossless` (session deltas). On EACH attempt the
+    /// `encode` closure runs and the frame is enqueued while
+    /// `producer_seq_lock` is held, so a delta's seq is allocated in the same
+    /// critical section as its enqueue (#3878) even across the retry loop and
+    /// concurrent lossy producers. The lock is dropped before any sleep so a
+    /// backpressured lossless export never stalls the other producers.
+    ///
+    /// `encode` returns `(frame, rollback_seq)`; `rollback_seq` is `Some(seq)`
+    /// for frames whose seq came from `next_seq()` (roll it back on a drop,
+    /// #3878 F-153) and `None` for control frames that carry a fixed, non-
+    /// allocated seq (e.g. `DrainComplete`).
+    fn send_lossless_encoded<F>(&self, mut encode: F) -> Result<(), String>
+    where
+        F: FnMut() -> (EventFrame, Option<u64>),
+    {
         if !self.shared.connected.load(Ordering::Acquire) {
             return Err("event stream not connected".to_string());
         }
         let deadline = Instant::now() + LOSSLESS_QUEUE_TIMEOUT;
         loop {
-            match self.tx.try_send(frame) {
+            // Raw `tx.try_send` (NOT `try_send_frame`): a `Full` here is a
+            // RETRY, not a drop, so it must not bump `frames_dropped` — the
+            // lossless caller decides whether an eventual give-up counts as a
+            // loss (#2880). Allocation and enqueue happen together under the
+            // producer lock so a delta's re-allocated seq matches its enqueue
+            // order (#3878).
+            let (result, rollback_seq, reported_seq) = {
+                let _guard = self
+                    .shared
+                    .producer_seq_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (frame, rollback_seq) = encode();
+                let reported_seq = frame.seq;
+                (self.tx.try_send(frame), rollback_seq, reported_seq)
+            };
+            match result {
                 Ok(()) => {
                     self.shared.frames_sent.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
-                Err(mpsc::TrySendError::Full(returned)) => {
-                    frame = returned;
+                Err(mpsc::TrySendError::Full(_)) => {
+                    // Roll back the seq allocated for THIS attempt (#3878): the
+                    // next attempt re-allocates so the eventual wire seq matches
+                    // the successful enqueue position, and a give-up leaves no
+                    // burned seq. Control frames carry a fixed seq (None).
+                    if let Some(seq) = rollback_seq {
+                        self.rollback_seq(seq);
+                    }
                     if !self.shared.connected.load(Ordering::Acquire) {
                         return Err(format!(
-                            "event stream disconnected while queuing seq {}",
-                            frame.seq
+                            "event stream disconnected while queuing seq {reported_seq}"
                         ));
                     }
                     if Instant::now() >= deadline {
                         return Err(format!(
-                            "timed out queuing event stream frame seq {}",
-                            frame.seq
+                            "timed out queuing event stream frame seq {reported_seq}"
                         ));
                     }
                     thread::sleep(LOSSLESS_QUEUE_RETRY_DELAY);
                 }
-                Err(mpsc::TrySendError::Disconnected(returned)) => {
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if let Some(seq) = rollback_seq {
+                        self.rollback_seq(seq);
+                    }
                     return Err(format!(
-                        "event stream channel disconnected while queuing seq {}",
-                        returned.seq
+                        "event stream channel disconnected while queuing seq {reported_seq}"
                     ));
                 }
             }
         }
     }
 
+    /// Lossless send of a caller-encoded frame that carries its own seq (a
+    /// control frame such as `DrainComplete`). Retries on a full channel until
+    /// capacity frees, the deadline expires, or the peer disconnects. Test-only
+    /// after #3878 rerouted `push_delta_lossless` through the seq-allocating
+    /// `send_lossless_encoded` closure.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn send_frame_lossless(&self, frame: EventFrame) -> Result<(), String> {
+        self.send_lossless_encoded(move || (frame.clone(), None))
+    }
+
     fn encode_delta_frame(
-        &self,
+        seq: u64,
         delta: &SessionDelta,
         zone_name_to_id: &FxHashMap<String, u16>,
     ) -> EventFrame {
-        let seq = self.next_seq();
         match delta.kind {
             SessionDeltaKind::Open => EventFrame::encode_session_open(
                 seq,
@@ -576,25 +685,35 @@ impl EventStreamWorkerHandle {
         }
     }
 
-    /// Encode and send a session delta as an event frame.
+    /// Encode and send a session delta as an event frame. The seq is allocated
+    /// atomically with the channel enqueue (#3878) so a concurrent producer
+    /// cannot invert wire order, and a full-channel drop rolls the seq back
+    /// rather than burning it into a reader-visible gap.
     pub(crate) fn push_delta(
         &self,
         delta: &SessionDelta,
         zone_name_to_id: &FxHashMap<String, u16>,
     ) {
-        let frame = self.encode_delta_frame(delta, zone_name_to_id);
-        self.try_send(frame);
+        let _ = self.send_sequenced(|seq| Self::encode_delta_frame(seq, delta, zone_name_to_id));
     }
 
     /// Lossless variant used for explicit bootstrap/replay exports. This path
-    /// may wait briefly for queue capacity, but it never silently drops.
+    /// may wait briefly for queue capacity, but it never silently drops. The
+    /// seq is (re)allocated under the producer lock on each retry (#3878), so
+    /// the delta's wire seq matches its enqueue order even under backpressure
+    /// and concurrent lossy producers.
     pub(crate) fn push_delta_lossless(
         &self,
         delta: &SessionDelta,
         zone_name_to_id: &FxHashMap<String, u16>,
     ) -> Result<(), String> {
-        let frame = self.encode_delta_frame(delta, zone_name_to_id);
-        self.send_frame_lossless(frame)
+        self.send_lossless_encoded(|| {
+            let seq = self.next_seq();
+            (
+                Self::encode_delta_frame(seq, delta, zone_name_to_id),
+                Some(seq),
+            )
+        })
     }
 
     /// #2460: emit a SESSION_CLOSE RT_FLOW frame (type 14) for a Close delta

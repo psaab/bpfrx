@@ -1303,6 +1303,116 @@ fn test_lossless_send_fails_when_not_connected() {
     assert!(err.contains("not connected"));
 }
 
+// #3878 F-153: a full-channel drop of a lossy session delta must NOT burn a
+// sequence number. The producer allocates the seq atomically with the enqueue
+// and, on a `Full` `try_send`, rolls the seq back — so the next successfully
+// sent frame stays contiguous and the Go reader never sees a spurious gap that
+// would force a full owner-RG resync.
+//
+// RED-on-revert: without the rollback, the dropped frame's seq is burned;
+// `next_seq` advances to 2 after the drop and the next frame lands on seq 3,
+// leaving a hole at seq 2.
+#[test]
+fn push_delta_full_channel_drop_does_not_burn_seq_3878() {
+    let (tx, rx) = mpsc::sync_channel::<EventFrame>(1);
+    let shared = Arc::new(EventStreamShared::new());
+    let handle = EventStreamWorkerHandle {
+        tx,
+        shared: shared.clone(),
+    };
+    let zone_map = FxHashMap::default();
+    let delta = test_close_delta(crate::session::SessionDeltaKind::Open);
+
+    // Frame 1 fills the capacity-1 channel (seq 1).
+    handle.push_delta(&delta, &zone_map);
+    assert_eq!(shared.next_seq.load(Ordering::Relaxed), 1);
+
+    // Frame 2: the channel is full -> `try_send` returns Full. The seq must be
+    // rolled back, not burned.
+    handle.push_delta(&delta, &zone_map);
+    assert_eq!(
+        shared.next_seq.load(Ordering::Relaxed),
+        1,
+        "#3878 F-153: a full-channel drop must not burn a sequence number",
+    );
+
+    // Drain frame 1, then send frame 2 for real: it must be seq 2 (contiguous
+    // with seq 1), never seq 3 (a reader-visible gap -> spurious resync).
+    let f1 = rx.try_recv().expect("frame 1 queued");
+    assert_eq!(f1.seq, 1);
+    handle.push_delta(&delta, &zone_map);
+    let f2 = rx.try_recv().expect("frame 2 queued");
+    assert_eq!(
+        f2.seq, 2,
+        "seq after a full-channel drop must stay contiguous (no gap)"
+    );
+    assert!(rx.try_recv().is_err(), "no extra frame should be queued");
+}
+
+// #3878 F-152: seq allocation and channel enqueue are atomic under the producer
+// lock, so the seq embedded in each frame is strictly monotonic in wire
+// (channel-FIFO) order even when many workers push concurrently. Without the
+// lock two workers can allocate N and N+1 but enqueue them inverted, so a lower
+// seq lands after a higher one and the Go reader treats the inversion as a
+// session-sync gap -> spurious full owner-RG resync + disconnect.
+//
+// RED-on-revert: this is a concurrency stress test. With the non-atomic
+// allocate-then-enqueue restored, the wide window between `next_seq()` and
+// `try_send` (a full session-open encode) lets two of the eight workers invert
+// within the ~8000 frames, and the monotonicity assertion fails.
+#[test]
+fn concurrent_push_delta_preserves_monotonic_wire_order_3878() {
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 1000;
+    let total = (THREADS * PER_THREAD) as usize;
+
+    // Channel sized to hold every frame: the I/O thread is not draining in this
+    // unit test, so a smaller channel would exercise drops, not ordering.
+    let (tx, rx) = mpsc::sync_channel::<EventFrame>(total);
+    let shared = Arc::new(EventStreamShared::new());
+    let handle = EventStreamWorkerHandle { tx, shared };
+
+    let mut joins = Vec::new();
+    for _ in 0..THREADS {
+        let worker = handle.clone();
+        joins.push(std::thread::spawn(move || {
+            let zone_map = FxHashMap::default();
+            let delta = test_close_delta(crate::session::SessionDeltaKind::Open);
+            for _ in 0..PER_THREAD {
+                worker.push_delta(&delta, &zone_map);
+            }
+        }));
+    }
+    for join in joins {
+        join.join().expect("worker thread");
+    }
+
+    // Drain the channel in FIFO (wire) order; the embedded seqs must be strictly
+    // increasing and form a contiguous 1..=total run (no inversions, no burns).
+    let mut prev = 0u64;
+    let mut count = 0u64;
+    while let Ok(frame) = rx.try_recv() {
+        assert!(
+            frame.seq > prev,
+            "wire seq went backwards: {} after {} (non-atomic allocate+enqueue reordered a frame)",
+            frame.seq,
+            prev,
+        );
+        prev = frame.seq;
+        count += 1;
+    }
+    assert_eq!(
+        count,
+        THREADS * PER_THREAD,
+        "every delta must reach the channel"
+    );
+    assert_eq!(
+        prev,
+        THREADS * PER_THREAD,
+        "seqs must be a contiguous 1..=N run with no gaps or burns",
+    );
+}
+
 #[test]
 fn test_partial_read_accumulation() {
     // Simulate a partial Unix stream read: first 8 bytes, then the
