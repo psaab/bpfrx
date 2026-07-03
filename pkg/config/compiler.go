@@ -599,6 +599,21 @@ type compileOpts struct {
 	// is inert. Commit stays strict so the operator's next edit fails loudly.
 	// Same doctrine as lenientNATHostMask.
 	lenientNPTv6 bool
+	// lenientNAT64Prefix (#3886) downgrades the NAT64 `prefix` /96 commit gate
+	// (validateNAT64PrefixStrict) from a hard compile error to a cfg.Warnings
+	// entry. The strict commit / commit-check path hard-rejects a NAT64
+	// rule-set prefix that is not an IPv6 `<address>/96` (a non-/96 length, a
+	// missing/garbage mask, or a non-IPv6 address). Before this gate such a
+	// prefix committed green, then the Rust Nat64State::try_from_snapshots
+	// /96-integrity check aborted the WHOLE forwarding rebuild without
+	// publishing — freezing the dataplane at the last-good snapshot so every
+	// later commit silently stopped taking effect. The tolerant load / peer-sync
+	// paths downgrade to a warning so an already-persisted or peer-synced config
+	// carrying a bad NAT64 prefix still BOOTS (#1960 no-brick) — the helper's own
+	// try_from_snapshots backstop keeps the previous live state, so a
+	// leniently-loaded bad prefix is inert. Commit stays strict so the operator's
+	// next edit fails loudly. Same doctrine as lenientNPTv6.
+	lenientNAT64Prefix bool
 	// lenientFirewallRefs (#2217) downgrades the firewall-filter term
 	// cross-reference gates — `then policer <name>` (Finding A,
 	// validateFirewallPolicerReferencesStrict) and `then routing-instance
@@ -1393,6 +1408,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterRoutingInstanceConflict:   true,
 		lenientFilterDSCP:                      true,
 		lenientNPTv6:                           true,
+		lenientNAT64Prefix:                     true,
 		lenientFirewallRefs:                    true,
 		lenientFlowServerTemplateRef:           true,
 		lenientSamplingInstanceConflicts:       true,
@@ -1572,6 +1588,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterRoutingInstanceConflict:   true,
 		lenientFilterDSCP:                      true,
 		lenientNPTv6:                           true,
+		lenientNAT64Prefix:                     true,
 		lenientFirewallRefs:                    true,
 		lenientFlowServerTemplateRef:           true,
 		lenientSamplingInstanceConflicts:       true,
@@ -3776,6 +3793,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, nptv6Warnings...)
+
+	// #3886: NAT64 prefix commit gate. A NAT64 rule-set `prefix` is read
+	// verbatim into the wire snapshot and parsed at dataplane apply by the Rust
+	// Nat64State::try_from_snapshots /96-integrity check. A non-/96 or malformed
+	// prefix committed green then makes that check ABORT the entire forwarding
+	// rebuild without publishing — freezing the dataplane at the last-good
+	// snapshot so every later commit silently stops reaching it. Strict (commit
+	// / commit-check): hard-reject anything that is not `<ipv6-address>/96`,
+	// matching the Rust check exactly so there is no commit-accept ->
+	// runtime-abort gap. Lenient (load / peer-sync): warn so a config committed
+	// before this gate existed still boots; the Rust helper independently keeps
+	// the previous live state, so the bad rule is inert.
+	nat64PrefixWarnings, err := validateNAT64PrefixStrict(cfg, opts.lenientNAT64Prefix)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, nat64PrefixWarnings...)
 
 	// #1434 multi-peer WireGuard: per-tunnel commit gate. Strict (commit /
 	// commit-check): hard-reject a WG tunnel with a missing/invalid
