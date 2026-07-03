@@ -28204,3 +28204,33 @@ top.
   comment), pkg/ipsec/ipsec_test.go, pkg/ipsec/dhgroup_roundtrip_test.go,
   pkg/ipsec/swanctl_render_test.go (corrected pins + new tests),
   pkg/ipsec/README.md (#3851 integrity-token mapping bullet)
+
+## 2026-07-03 — #3854 quoteKey symmetric backslash/newline escape (fable-161 F-005)
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix `quoteKey` Format→Parse round-trip corruption. The lexer's
+  `readString` un-escapes exactly `\"`→`"`, `\\`→`\`, `\n`→newline, but
+  `quoteKey` escaped only `"` — so any value with a backslash before `n`/`"`/`\`
+  (e.g. an IKE PSK `ascii-text`) corrupted on every Format→Parse cycle, silently
+  diverging the HA standby's config (config sync = Format→wire→Parse) and
+  corrupting rollback slots serialized via Format.
+- **Fix**: replaced the quote-only `strings.ReplaceAll` with a package-level
+  single-pass `keyEscaper = strings.NewReplacer(`\`→`\\`, `"`→`\"`, "\n"→`\n`)`
+  whose emitted escape set is EXACTLY the lexer's decode set. Single pass ⇒
+  backslash escaped before the quote it may precede (no `\"`→`\\"` double-process);
+  no over-escape of bytes the lexer passes through verbatim (e.g. `\t`).
+- **Tests (RED-on-revert)**: added `quotekey_roundtrip_3854_test.go` —
+  `TestQuoteKeyLexerSymmetry3854` (unit: quoteKey→lexer symmetric per value),
+  `TestFormatParseRoundTrip3854` (integration over the real Format→Parse path,
+  incl. an IKE-PSK-like `secret\with\backslashes` + backslash-before-n/quote +
+  double-backslash + newline + kitchen-sink), `TestFormatParseIdempotent3854`.
+  Verified RED on a temporary revert to the quote-only escape (Format→Parse
+  corrupted `pass\node`→`pass<newline>ode`, double-backslash lost a `\`,
+  backslash-quote truncated), GREEN with the fix.
+- **Validation**: go test ./pkg/config/... green; consumer pkgs
+  ./pkg/configstore/... + ./pkg/cluster/... green; go build ./... green;
+  gofmt + vet clean.
+- **File(s)**: pkg/config/ast.go (keyEscaper + quoteKey),
+  pkg/config/quotekey_roundtrip_3854_test.go (new),
+  docs/config-schema.md (Quoted-value escape round-trip contract subsection),
+  _Log.md
