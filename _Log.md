@@ -28494,3 +28494,27 @@ top.
   pkg/config/compiler_routing.go (resolveBGPAutonomousSystem + capture instance
   AS), pkg/config/types_routing.go (RoutingInstanceConfig.AutonomousSystem),
   pkg/config/compiler_bgp_as_3870_test.go (new, 4 tests), pkg/frr/README.md
+
+## 2026-07-03 — #3871 (F-008): floating qualified-next-hop per-NH preference/metric
+
+- **Timestamp**: 2026-07-03
+- **Action**: A static `qualified-next-hop <gw> { preference N; metric M; }`
+  (Junos floating static) had its per-NH preference/metric dropped (folded to a
+  single route-level Preference), so config_render rendered all next-hops at
+  equal cost → floating static became equal-cost ECMP over the backup. FIX:
+  carry Preference/HasPreference/Metric/HasMetric PER-NextHopEntry
+  (types_routing.go); compiler reads qualified-next-hop preference/metric from
+  children + inline keys (compiler_routing.go, both the hierarchical-children
+  handler and the fully-inline route-keys branch); renderer emits each next-hop
+  at its own admin distance (config_render.go — primary at route-level 5,
+  qualified at 250). FRR installs the lower-distance primary and floats the
+  backup in only when the primary is down. Metric carried but NOT rendered (FRR
+  static CLI has no metric field). Plain next-hop list stays equal-cost ECMP
+  (no per-NH preference) — distinct from the floating backup. RED-on-revert
+  PROVEN: renderer revert → both at distance 5; compiler revert → qualified
+  HasPreference/HasMetric false.
+- **File(s)**: pkg/config/types_routing.go (NextHopEntry per-NH pref/metric),
+  pkg/config/compiler_routing.go (qualified-next-hop parse, 2 shapes),
+  pkg/frr/config_render.go (per-NH distance),
+  pkg/config/compiler_qualified_nexthop_3871_test.go (new, 2 tests),
+  pkg/frr/static_floating_3871_test.go (new, 2 tests), pkg/frr/README.md

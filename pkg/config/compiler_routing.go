@@ -171,10 +171,35 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					if i+1 < len(routeInst.node.Keys) {
 						i++
 						nh := NextHopEntry{Address: routeInst.node.Keys[i]}
-						// Check for "interface <name>" following the address
-						if i+2 < len(routeInst.node.Keys) && routeInst.node.Keys[i+1] == "interface" {
+						// Consume trailing modifiers in the fully-inline form:
+						// "qualified-next-hop <gw> interface <if> preference <n>
+						// metric <m>" (#3871). Each modifier carries its own
+						// per-next-hop preference/metric — the floating backup's
+						// admin distance — never folded into the route level.
+						for i+2 < len(routeInst.node.Keys) {
+							kw := routeInst.node.Keys[i+1]
+							val := routeInst.node.Keys[i+2]
+							consumed := true
+							switch kw {
+							case "interface":
+								nh.Interface = val
+							case "preference":
+								if n, err := strconv.Atoi(val); err == nil {
+									nh.Preference = n
+									nh.HasPreference = true
+								}
+							case "metric":
+								if n, err := strconv.Atoi(val); err == nil {
+									nh.Metric = n
+									nh.HasMetric = true
+								}
+							default:
+								consumed = false
+							}
+							if !consumed {
+								break
+							}
 							i += 2
-							nh.Interface = routeInst.node.Keys[i]
 						}
 						route.NextHops = append(route.NextHops, nh)
 					}
@@ -220,17 +245,47 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					}
 				}
 			case "qualified-next-hop":
+				// A qualified-next-hop is a FLOATING backup: it carries its own
+				// preference (admin distance) and optional metric, kept
+				// PER-next-hop rather than folded into the route-level
+				// Preference (#3871). preference/metric/interface arrive as
+				// nested children (canonical separate `set` lines and the
+				// hierarchical brace form) or as inline keys (single-line block
+				// parse), so read both shapes.
 				nh := NextHopEntry{}
 				nh.Address = nodeVal(prop)
-				// Check for "interface <name>" among remaining keys
-				for j := 2; j < len(prop.Keys)-1; j++ {
-					if prop.Keys[j] == "interface" {
+				// Inline keys: "qualified-next-hop <gw> interface <if> preference <n> metric <m>".
+				for j := 2; j+1 < len(prop.Keys); j++ {
+					switch prop.Keys[j] {
+					case "interface":
 						nh.Interface = prop.Keys[j+1]
+					case "preference":
+						if n, err := strconv.Atoi(prop.Keys[j+1]); err == nil {
+							nh.Preference = n
+							nh.HasPreference = true
+						}
+					case "metric":
+						if n, err := strconv.Atoi(prop.Keys[j+1]); err == nil {
+							nh.Metric = n
+							nh.HasMetric = true
+						}
 					}
 				}
-				// Also check children for flat set syntax
+				// Child nodes (flat-set separate lines + hierarchical brace form).
 				if ifNode := prop.FindChild("interface"); ifNode != nil {
 					nh.Interface = nodeVal(ifNode)
+				}
+				if pNode := prop.FindChild("preference"); pNode != nil {
+					if n, err := strconv.Atoi(nodeVal(pNode)); err == nil {
+						nh.Preference = n
+						nh.HasPreference = true
+					}
+				}
+				if mNode := prop.FindChild("metric"); mNode != nil {
+					if n, err := strconv.Atoi(nodeVal(mNode)); err == nil {
+						nh.Metric = n
+						nh.HasMetric = true
+					}
 				}
 				route.NextHops = append(route.NextHops, nh)
 			case "next-table":

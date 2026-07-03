@@ -117,6 +117,25 @@ also carries operator content:
   interfaces and no qualifier the next-hop is genuinely ambiguous — the
   inference refuses to guess (leaves it unresolved) rather than route to the
   wrong link, and the operator must add an interface qualifier.
+- **Floating static via `qualified-next-hop` (#3871).** A static route's
+  `qualified-next-hop <gw> { preference N; metric M; }` is the Junos floating-
+  static idiom — a primary next-hop plus a LESS-preferred backup that installs
+  only when the primary is down. `generateStaticRouteInTable` renders each
+  next-hop with its OWN admin distance: a next-hop carrying a per-next-hop
+  preference (`NextHopEntry.HasPreference`, set by the compiler from the
+  qualified-next-hop's `preference` child/inline key) uses that distance; a
+  plain next-hop uses the route-level `StaticRoute.Preference` (default 5). So
+  `next-hop 10.0.0.1` + `qualified-next-hop 10.0.0.2 preference 250` emits
+  `ip route <dst> 10.0.0.1 5` and `ip route <dst> 10.0.0.2 250` — FRR installs
+  the distance-5 primary and floats the distance-250 backup in only when the
+  primary's next-hop is unresolvable. Before #3871 the qualified preference was
+  folded into a single route-level `Preference`, so every next-hop rendered at
+  equal cost and the floating static became equal-cost ECMP that load-balanced
+  over the backup. A plain `next-hop [ a b ]` bracket LIST is equal-cost ECMP
+  (#3872) — kept distinct: no per-next-hop preference. FRR's static-route CLI
+  has no metric field, so `NextHopEntry.Metric` is carried in the typed config
+  (parity/display) but not emitted — the floating behavior is entirely the
+  per-next-hop distance.
 - **VRRP-VIP-only subnets (#2452 secondary).** A bondless-RETH member that
   carries only a VRRP virtual address (no matching `unit.Addresses` entry)
   also contributes its VIP subnet as a connected prefix, so a static

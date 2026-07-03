@@ -164,6 +164,26 @@ type RibGroup struct {
 type NextHopEntry struct {
 	Address   string // IP address (e.g. "10.0.1.1" or "fe80::1")
 	Interface string // outgoing interface (for IPv6 link-local)
+	// Preference is this next-hop's own administrative distance, carried from
+	// a `qualified-next-hop <gw> { preference N; }` (#3871 — the Junos
+	// FLOATING-static idiom: a primary next-hop plus a less-preferred backup).
+	// Valid only when HasPreference. A plain `next-hop` leaves HasPreference
+	// false and renders at the ROUTE-level distance (StaticRoute.Preference),
+	// so plain `next-hop [ a b ]` stays equal-cost ECMP while a qualified
+	// backup renders at its own higher distance and installs only when the
+	// primary next-hop is down. Folding the qualified preference into the
+	// single route-level Preference (the pre-#3871 behavior) rendered every
+	// next-hop at equal cost, so the floating static load-balanced over the
+	// backup instead of preferring the primary.
+	Preference    int
+	HasPreference bool
+	// Metric is this next-hop's `qualified-next-hop <gw> { metric M; }` value
+	// (#3871). Carried in the typed config for parity/display; FRR's static
+	// route CLI (`ip route NET GW [DISTANCE]`) has no per-route metric field,
+	// so the floating behavior is expressed entirely through the per-next-hop
+	// admin distance (Preference), not Metric. Valid only when HasMetric.
+	Metric    int
+	HasMetric bool
 }
 
 // StaticRoute defines a single static route.

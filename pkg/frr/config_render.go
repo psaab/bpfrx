@@ -160,8 +160,20 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 		default:
 			continue
 		}
-		if sr.Preference > 0 {
-			fmt.Fprintf(&b, "%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
+		// Per-next-hop admin distance (#3871): a qualified-next-hop carries
+		// its own preference (HasPreference) and renders as a FLOATING backup
+		// at that distance; a plain next-hop uses the route-level distance so
+		// a `next-hop [ a b ]` list stays equal-cost ECMP. FRR installs the
+		// lowest-distance reachable next-hop and fails over to the higher-
+		// distance one only when the primary is down. FRR's static-route CLI
+		// has no metric field, so nh.Metric is not emitted — the floating
+		// behavior comes entirely from the distance.
+		dist := sr.Preference
+		if nh.HasPreference {
+			dist = nh.Preference
+		}
+		if dist > 0 {
+			fmt.Fprintf(&b, "%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, dist, vrfPart)
 		} else {
 			fmt.Fprintf(&b, "%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
 		}
