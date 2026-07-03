@@ -96,6 +96,23 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	s.compiled = compiled
 	s.dirty = false
 
+	// #3861: a PLAIN commit during a pending commit-confirmed window is
+	// the confirmation (Junos semantics: any subsequent explicit commit
+	// confirms a pending `commit confirmed`). The frontend `commit` path
+	// intercepts a pending confirm and calls ConfirmCommit before it ever
+	// reaches here, but NON-frontend callers (the eventengine remediation
+	// commit, cli/gRPC/REST commit handlers) reach CommitWithDescription
+	// directly. Without clearing the armed timer, its rollback target (the
+	// pre-confirm T0 tree) stays live and reverts THIS just-promoted
+	// config when it fires — silently discarding the background commit.
+	// clearPendingConfirmLocked cancels the timer AND bumps confirmGen so a
+	// callback that already fired and is blocked on s.mu no-ops instead of
+	// reverting. Runs only AFTER the persist+promote succeeded, so a failed
+	// commit leaves the pending confirm fully intact.
+	if s.clearPendingConfirmLocked() {
+		slog.Info("plain commit confirmed a pending commit-confirmed window")
+	}
+
 	// Log to journal with description
 	s.journalLog(&JournalEntry{
 		Action:     "commit",
@@ -243,20 +260,45 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	return compiled, nil
 }
 
-// ConfirmCommit cancels the auto-rollback timer, confirming the config.
-func (s *Store) ConfirmCommit() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+// clearPendingConfirmLocked cancels an armed commit-confirmed rollback
+// timer and discards its rollback target, treating whatever the caller is
+// about to promote (a plain commit, an HA config-sync apply, or the
+// operator's explicit confirmation) as the CONFIRMATION of the pending
+// confirmed commit. This is Junos semantics: any subsequent explicit
+// `commit` confirms a pending `commit confirmed`. It is a no-op when no
+// timer is armed and returns true only when a pending timer was cleared.
+// Must be called under s.mu.
+//
+// The confirmGen bump is load-bearing (#1817): time.Timer.Stop() cannot
+// un-fire a callback that has already started and is blocked on s.mu.
+// Bumping the generation makes that already-fired-but-blocked callback a
+// no-op in PromoteRollback (gen mismatch), so it cannot revert the newer
+// config the caller just promoted.
+//
+// A nested `commit confirmed` (CommitConfirmed while one is pending) does
+// NOT go through here — it re-arms its own timer and PRESERVES the
+// original rollback target — so this only fires on a PLAIN commit / sync /
+// explicit confirm, never on a confirmed→confirmed re-arm.
+func (s *Store) clearPendingConfirmLocked() bool {
 	if s.confirmTimer == nil {
-		return fmt.Errorf("no pending confirmed commit")
+		return false
 	}
-
 	s.confirmTimer.Stop()
 	s.confirmGen++ // invalidate a callback that already fired and is blocked on s.mu
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
 	s.confirmPrevCfg = nil
+	return true
+}
+
+// ConfirmCommit cancels the auto-rollback timer, confirming the config.
+func (s *Store) ConfirmCommit() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.clearPendingConfirmLocked() {
+		return fmt.Errorf("no pending confirmed commit")
+	}
 
 	slog.Info("commit confirmed")
 	return nil

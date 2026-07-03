@@ -1,3 +1,49 @@
+## 2026-07-03 — #3861: plain commit / SyncApply during a commit-confirmed window silently reverted (HIGH config loss)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-012. While a `commit confirmed`
+    window was pending (rollback timer armed), a PLAIN `Store.Commit` /
+    `CommitWithDescription` — the eventengine autonomous-remediation path, and
+    the cli/gRPC/REST daemon commit handlers, all of which bypass the frontend
+    confirm-dance — did NOT stop the pending timer nor bump the generation. The
+    new config was promoted, but when the timer fired it reverted store+disk to
+    the pre-confirm T0 tree, silently discarding the newer commit (operator sees
+    C2 committed, then it vanishes). Same silent-revert for `SyncApply` (HA
+    config-sync apply on a node that armed a confirm then received an
+    authoritative primary config).
+  - **Fix**: Junos semantics — any subsequent explicit commit CONFIRMS a
+    pending `commit confirmed`. Added shared helper
+    `clearPendingConfirmLocked()` (store_commit.go): cancels the armed timer,
+    bumps `confirmGen` (so an already-fired-but-blocked callback no-ops in
+    PromoteRollback), clears `confirmTimer`/`confirmPrevTree`/`confirmPrevCfg`.
+    Refactored `ConfirmCommit` onto it. `CommitWithDescription` calls it AFTER
+    the persist+promote succeeds (store_commit.go:112 — a failed commit leaves
+    the pending confirm intact). `SyncApply` calls it with the in-memory
+    promotion (store.go:422 — degrade-not-fail). The nested confirmed→confirmed
+    RE-ARM is untouched (it goes through `CommitConfirmed`, which re-arms and
+    preserves the original rollback target) — only a PLAIN commit / sync
+    confirms.
+  - **Validation**: New commit_confirmed_3861_test.go — RED-on-revert proven by
+    temporarily neutering the two clear calls: plain-commit and SyncApply tests
+    reverted to "Base" (discarding "Remediated"/"Synced") while the nested-rearm
+    and ConfirmCommit guardrails stayed green. With the fix all four pass.
+    go test ./pkg/configstore/... ./pkg/eventengine/... ./pkg/daemon/...
+    ./pkg/cli/... ./pkg/grpcapi/... ./pkg/api/... green; go build ./... green;
+    gofmt + vet clean.
+  - **Daemon test update**: TestExecuteConfirmedRollbackSerializesWithCommit
+    (#1922 Item 1a) asserted total==2 (both rollback+commit bodies always run),
+    which encoded the pre-#3861 behavior where a commit that won the applySem
+    race did NOT confirm the pending window and the rollback then reverted it.
+    Under #3861 a commit-first race legitimately confirms (total==1); relaxed to
+    [1,2] and added TestExecuteConfirmedRollbackBlocksOnApplySem to preserve the
+    Codex-r1 anti-TryAcquire-skip intent deterministically (executor must BLOCK
+    on a held applySem, not skip).
+  - **File(s)**: pkg/configstore/store_commit.go (clearPendingConfirmLocked +
+    ConfirmCommit refactor + CommitWithDescription clear),
+    pkg/configstore/store.go (SyncApply clear),
+    pkg/configstore/commit_confirmed_3861_test.go (new),
+    pkg/daemon/rollback_serialize_test.go (serialize-test semantics + new
+    blocking test), pkg/configstore/README.md (persistence-contract doc)
 ## 2026-07-03 — #3855: routing-instance kernel TableIDs are positional → sibling delete/reorder renumbers survivors → vrf.go recreates untouched VRFs (HIGH HA/routing outage)
 
 - **Timestamp**: 2026-07-03
