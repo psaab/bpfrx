@@ -272,9 +272,13 @@ func parseNextTableInstance(table string) string {
 }
 
 func compileRoutingInstances(node *Node, cfg *Config) error {
-	// Auto-assign VRF table IDs starting from 100
-	tableID := 100
-
+	// Assign each routing-instance a STABLE kernel routing table id derived from
+	// its NAME (#3855), never a positional counter. Positional assignment
+	// (100, 101, … by config order) renumbered every survivor after a deleted
+	// or reordered instance, so pkg/routing/vrf.go saw a stale table id on an
+	// UNTOUCHED VRF and deleted+recreated its live device — a forwarding outage
+	// on an unrelated VRF, on both HA nodes. A name-hashed id is invariant under
+	// add/remove/reorder of siblings. See StableRoutingInstanceTableID.
 	for _, child := range node.Children {
 		if child.IsLeaf || len(child.Keys) == 0 {
 			continue
@@ -282,9 +286,8 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 		instanceName := child.Keys[0]
 		ri := &RoutingInstanceConfig{
 			Name:    instanceName,
-			TableID: tableID,
+			TableID: StableRoutingInstanceTableID(instanceName),
 		}
-		tableID++
 
 		for _, prop := range child.Children {
 			switch prop.Name() {
@@ -339,6 +342,38 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 		}
 
 		cfg.RoutingInstances = append(cfg.RoutingInstances, ri)
+	}
+
+	// #3855: enforce the never-share-a-table invariant. StableRoutingInstanceTableID
+	// folds into a 900k-slot reserved band so a collision is astronomically
+	// rare, and the strict commit gate (validateRoutingInstanceTableIDCollisionAST)
+	// rejects one outright — but if we are reached on a lenient path (tolerant
+	// load / peer-sync / a config a pre-#3855 binary persisted) with two names
+	// folding to the same kernel table, DROP the later-sorting instance rather
+	// than let two vrf-<name> devices bind the same table (a cross-VRF route
+	// leak). This is the runtime half of #3719's zone quarantine, ported to
+	// routing-instance tables; the decision matches QuarantinedRoutingInstanceNames
+	// exactly so both HA nodes drop the identical instance.
+	if len(cfg.RoutingInstances) > 1 {
+		names := make([]string, 0, len(cfg.RoutingInstances))
+		for _, ri := range cfg.RoutingInstances {
+			names = append(names, ri.Name)
+		}
+		if quarantined := QuarantinedRoutingInstanceNames(names); len(quarantined) > 0 {
+			kept := cfg.RoutingInstances[:0]
+			for _, ri := range cfg.RoutingInstances {
+				if _, drop := quarantined[ri.Name]; drop {
+					cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+						"routing-instance %q QUARANTINED: its stable table id %d collides with"+
+							" another instance's — no VRF created, its routes and inter-VRF"+
+							" leaks are not programmed until one instance is renamed (#3855)",
+						ri.Name, ri.TableID))
+					continue
+				}
+				kept = append(kept, ri)
+			}
+			cfg.RoutingInstances = kept
+		}
 	}
 	return nil
 }

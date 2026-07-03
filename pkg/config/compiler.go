@@ -777,6 +777,17 @@ type compileOpts struct {
 	// doctrine as lenientZoneCount; mirrors the #1873 tunnel-id gate's
 	// strict/lenient split.
 	lenientZoneIDCollision bool
+	// lenientRoutingInstanceTableIDCollision (#3855) downgrades the stable
+	// routing-instance table-id collision gate
+	// (validateRoutingInstanceTableIDCollisionAST) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// config whose two routing-instance names fold to the same kernel table (two
+	// VRFs on one table = a cross-VRF route leak). The tolerant load / peer-sync
+	// paths downgrade to a warning so an already-persisted or peer-synced config
+	// still BOOTS (#1960 no-brick); compileRoutingInstances then QUARANTINES the
+	// later-sorting instance so the two never actually share a table. Same
+	// doctrine as lenientZoneIDCollision; mirrors the #3075 / #1873 id gates.
+	lenientRoutingInstanceTableIDCollision bool
 	// lenientAddressBookNames (#3061) downgrades the address-book / zone name
 	// `/`-character gate (validateAddressBookEntryNamesStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -1326,88 +1337,89 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // #1830 (e) — the dataplane no longer caps equal-flow at 32 workers.)
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
-		sanitizeFreeTextControlChars:         true,
-		lenientVRRPTrackDuplicates:           true,
-		lenientDeviceMap:                     true,
-		lenientPolicyMatchAddress:            true,
-		lenientTCPMSSRange:                   true,
-		lenientLogStreamPort:                 true,
-		lenientLogTLSProfile:                 true,
-		lenientFlowTraceFile:                 true,
-		lenientFlowTraceFilter:               true,
-		lenientFlowTraceSizeFiles:            true,
-		lenientLogEventModeFormat:            true,
-		lenientEventAttributesMatch:          true,
-		lenientIPsecPolicyProposalRef:        true,
-		lenientIPsecGatewayRefs:              true,
-		lenientIKEPolicyChainRef:             true,
-		lenientLogProfileStreamRef:           true,
-		lenientDynamicAddressFeedRef:         true,
-		lenientNATPoolAlarmThreshold:         true,
-		lenientNATHostMask:                   true,
-		lenientUnsupportedInterfaceStanzas:   true,
-		lenientRoutingExportRef:              true,
-		lenientFRRAuthValues:                 true,
-		lenientRouteFilterMatchTypes:         true,
-		lenientApplicationSpecs:              true,
-		lenientApplicationNameCollisions:     true,
-		lenientFilterProtocols:               true,
-		lenientFilterCrossField:              true,
-		lenientFilterActions:                 true,
-		lenientFilterMatchValues:             true,
-		lenientFlexMatch:                     true,
-		lenientFilterPortExcept:              true,
-		lenientFilterAddressExcept:           true,
-		lenientFilterFromMatch:               true,
-		lenientFilterAddressLiterals:         true,
-		lenientFilterRoutingInstanceConflict: true,
-		lenientFilterDSCP:                    true,
-		lenientNPTv6:                         true,
-		lenientFirewallRefs:                  true,
-		lenientFlowServerTemplateRef:         true,
-		lenientSamplingInstanceConflicts:     true,
-		lenientApplicationSetMembers:         true,
-		lenientPolicyMatchApplications:       true,
-		lenientNATMatchApplications:          true,
-		lenientPolicyMatchAddressSetMembers:  true,
-		lenientRibGroupRefs:                  true,
-		lenientDHCPStaticBindings:            true,
-		lenientWireguardPeers:                true,
-		lenientPolicyZoneRefs:                true,
-		lenientZoneCount:                     true,
-		lenientZoneIDCollision:               true,
-		lenientAddressBookNames:              true,
-		lenientZoneInterfaceMembership:       true,
-		lenientHostInboundTokens:             true,
-		lenientDuplicateHostLocalAddress:     true,
-		lenientDestNATAddresses:              true,
-		lenientRPMSourceAddress:              true,
-		lenientRPMLinkLocalZone:              true,
-		lenientRPMHTTPGetScheme:              true,
-		lenientRPMRoutingInstance:            true,
-		lenientBGPNeighborPeerAS:             true,
-		lenientRouterID:                      true,
-		lenientSNMPTrapGroup:                 true,
-		lenientPolicyTerminalAction:          true,
-		lenientPolicyLogAction:               true,
-		lenientDuplicatePolicyNames:          true,
-		lenientScreenProfileRefs:             true,
-		lenientScreenNumeric:                 true,
-		lenientScreenUnknown:                 true,
-		lenientTrailingTokens:                true,
-		lenientFlowAging:                     true,
-		lenientReservedZoneNames:             true,
-		lenientBackupRouterDst:               true,
-		lenientSecureTunnelBindIface:         true,
-		lenientPolicyMatchLeaves:             true,
-		lenientPolicyThenPermit:              true,
-		lenientPolicyThenReject:              true,
-		lenientPolicyThenDeny:                true,
-		lenientPolicyMissingMatch:            true,
-		lenientPolicyCommunityRef:            true,
-		lenientVRRPVirtualAddress:            true,
-		lenientDNATToScope:                   true,
-		lenientEventWithinTrigger:            true,
+		sanitizeFreeTextControlChars:           true,
+		lenientVRRPTrackDuplicates:             true,
+		lenientDeviceMap:                       true,
+		lenientPolicyMatchAddress:              true,
+		lenientTCPMSSRange:                     true,
+		lenientLogStreamPort:                   true,
+		lenientLogTLSProfile:                   true,
+		lenientFlowTraceFile:                   true,
+		lenientFlowTraceFilter:                 true,
+		lenientFlowTraceSizeFiles:              true,
+		lenientLogEventModeFormat:              true,
+		lenientEventAttributesMatch:            true,
+		lenientIPsecPolicyProposalRef:          true,
+		lenientIPsecGatewayRefs:                true,
+		lenientIKEPolicyChainRef:               true,
+		lenientLogProfileStreamRef:             true,
+		lenientDynamicAddressFeedRef:           true,
+		lenientNATPoolAlarmThreshold:           true,
+		lenientNATHostMask:                     true,
+		lenientUnsupportedInterfaceStanzas:     true,
+		lenientRoutingExportRef:                true,
+		lenientFRRAuthValues:                   true,
+		lenientRouteFilterMatchTypes:           true,
+		lenientApplicationSpecs:                true,
+		lenientApplicationNameCollisions:       true,
+		lenientFilterProtocols:                 true,
+		lenientFilterCrossField:                true,
+		lenientFilterActions:                   true,
+		lenientFilterMatchValues:               true,
+		lenientFlexMatch:                       true,
+		lenientFilterPortExcept:                true,
+		lenientFilterAddressExcept:             true,
+		lenientFilterFromMatch:                 true,
+		lenientFilterAddressLiterals:           true,
+		lenientFilterRoutingInstanceConflict:   true,
+		lenientFilterDSCP:                      true,
+		lenientNPTv6:                           true,
+		lenientFirewallRefs:                    true,
+		lenientFlowServerTemplateRef:           true,
+		lenientSamplingInstanceConflicts:       true,
+		lenientApplicationSetMembers:           true,
+		lenientPolicyMatchApplications:         true,
+		lenientNATMatchApplications:            true,
+		lenientPolicyMatchAddressSetMembers:    true,
+		lenientRibGroupRefs:                    true,
+		lenientDHCPStaticBindings:              true,
+		lenientWireguardPeers:                  true,
+		lenientPolicyZoneRefs:                  true,
+		lenientZoneCount:                       true,
+		lenientZoneIDCollision:                 true,
+		lenientRoutingInstanceTableIDCollision: true,
+		lenientAddressBookNames:                true,
+		lenientZoneInterfaceMembership:         true,
+		lenientHostInboundTokens:               true,
+		lenientDuplicateHostLocalAddress:       true,
+		lenientDestNATAddresses:                true,
+		lenientRPMSourceAddress:                true,
+		lenientRPMLinkLocalZone:                true,
+		lenientRPMHTTPGetScheme:                true,
+		lenientRPMRoutingInstance:              true,
+		lenientBGPNeighborPeerAS:               true,
+		lenientRouterID:                        true,
+		lenientSNMPTrapGroup:                   true,
+		lenientPolicyTerminalAction:            true,
+		lenientPolicyLogAction:                 true,
+		lenientDuplicatePolicyNames:            true,
+		lenientScreenProfileRefs:               true,
+		lenientScreenNumeric:                   true,
+		lenientScreenUnknown:                   true,
+		lenientTrailingTokens:                  true,
+		lenientFlowAging:                       true,
+		lenientReservedZoneNames:               true,
+		lenientBackupRouterDst:                 true,
+		lenientSecureTunnelBindIface:           true,
+		lenientPolicyMatchLeaves:               true,
+		lenientPolicyThenPermit:                true,
+		lenientPolicyThenReject:                true,
+		lenientPolicyThenDeny:                  true,
+		lenientPolicyMissingMatch:              true,
+		lenientPolicyCommunityRef:              true,
+		lenientVRRPVirtualAddress:              true,
+		lenientDNATToScope:                     true,
+		lenientEventWithinTrigger:              true,
 	})
 }
 
@@ -1446,6 +1458,17 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, zoneIDErr
 	}
 
+	// #3855: stable routing-instance table-id collision gate. Like the zone gate
+	// above it runs on the PRE-expansion tree and unions instance names across
+	// all groups so both cluster nodes accept/reject identically. Strict
+	// hard-rejects a colliding pair (two VRFs must never share a kernel table);
+	// lenient warns and compileRoutingInstances quarantines the later instance.
+	riTableIDWarnings, riTableIDErr := validateRoutingInstanceTableIDCollisionAST(
+		tree, opts.lenientRoutingInstanceTableIDCollision)
+	if riTableIDErr != nil {
+		return nil, riTableIDErr
+	}
+
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -1470,6 +1493,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	}
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	return cfg, nil
 }
 
@@ -1491,88 +1515,89 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
-		sanitizeFreeTextControlChars:         true,
-		lenientVRRPTrackDuplicates:           true,
-		lenientDeviceMap:                     true,
-		lenientPolicyMatchAddress:            true,
-		lenientTCPMSSRange:                   true,
-		lenientLogStreamPort:                 true,
-		lenientLogTLSProfile:                 true,
-		lenientFlowTraceFile:                 true,
-		lenientFlowTraceFilter:               true,
-		lenientFlowTraceSizeFiles:            true,
-		lenientLogEventModeFormat:            true,
-		lenientEventAttributesMatch:          true,
-		lenientIPsecPolicyProposalRef:        true,
-		lenientIPsecGatewayRefs:              true,
-		lenientIKEPolicyChainRef:             true,
-		lenientLogProfileStreamRef:           true,
-		lenientDynamicAddressFeedRef:         true,
-		lenientNATPoolAlarmThreshold:         true,
-		lenientNATHostMask:                   true,
-		lenientUnsupportedInterfaceStanzas:   true,
-		lenientRoutingExportRef:              true,
-		lenientFRRAuthValues:                 true,
-		lenientRouteFilterMatchTypes:         true,
-		lenientApplicationSpecs:              true,
-		lenientApplicationNameCollisions:     true,
-		lenientFilterProtocols:               true,
-		lenientFilterCrossField:              true,
-		lenientFilterActions:                 true,
-		lenientFilterMatchValues:             true,
-		lenientFlexMatch:                     true,
-		lenientFilterPortExcept:              true,
-		lenientFilterAddressExcept:           true,
-		lenientFilterFromMatch:               true,
-		lenientFilterAddressLiterals:         true,
-		lenientFilterRoutingInstanceConflict: true,
-		lenientFilterDSCP:                    true,
-		lenientNPTv6:                         true,
-		lenientFirewallRefs:                  true,
-		lenientFlowServerTemplateRef:         true,
-		lenientSamplingInstanceConflicts:     true,
-		lenientApplicationSetMembers:         true,
-		lenientPolicyMatchApplications:       true,
-		lenientNATMatchApplications:          true,
-		lenientPolicyMatchAddressSetMembers:  true,
-		lenientRibGroupRefs:                  true,
-		lenientDHCPStaticBindings:            true,
-		lenientWireguardPeers:                true,
-		lenientPolicyZoneRefs:                true,
-		lenientZoneCount:                     true,
-		lenientZoneIDCollision:               true,
-		lenientAddressBookNames:              true,
-		lenientZoneInterfaceMembership:       true,
-		lenientHostInboundTokens:             true,
-		lenientDuplicateHostLocalAddress:     true,
-		lenientDestNATAddresses:              true,
-		lenientRPMSourceAddress:              true,
-		lenientRPMLinkLocalZone:              true,
-		lenientRPMHTTPGetScheme:              true,
-		lenientRPMRoutingInstance:            true,
-		lenientBGPNeighborPeerAS:             true,
-		lenientRouterID:                      true,
-		lenientSNMPTrapGroup:                 true,
-		lenientPolicyTerminalAction:          true,
-		lenientPolicyLogAction:               true,
-		lenientDuplicatePolicyNames:          true,
-		lenientScreenProfileRefs:             true,
-		lenientScreenNumeric:                 true,
-		lenientScreenUnknown:                 true,
-		lenientTrailingTokens:                true,
-		lenientFlowAging:                     true,
-		lenientReservedZoneNames:             true,
-		lenientBackupRouterDst:               true,
-		lenientSecureTunnelBindIface:         true,
-		lenientPolicyMatchLeaves:             true,
-		lenientPolicyThenPermit:              true,
-		lenientPolicyThenReject:              true,
-		lenientPolicyThenDeny:                true,
-		lenientPolicyMissingMatch:            true,
-		lenientPolicyCommunityRef:            true,
-		lenientVRRPVirtualAddress:            true,
-		lenientDNATToScope:                   true,
-		lenientEventWithinTrigger:            true,
+		sanitizeFreeTextControlChars:           true,
+		lenientVRRPTrackDuplicates:             true,
+		lenientDeviceMap:                       true,
+		lenientPolicyMatchAddress:              true,
+		lenientTCPMSSRange:                     true,
+		lenientLogStreamPort:                   true,
+		lenientLogTLSProfile:                   true,
+		lenientFlowTraceFile:                   true,
+		lenientFlowTraceFilter:                 true,
+		lenientFlowTraceSizeFiles:              true,
+		lenientLogEventModeFormat:              true,
+		lenientEventAttributesMatch:            true,
+		lenientIPsecPolicyProposalRef:          true,
+		lenientIPsecGatewayRefs:                true,
+		lenientIKEPolicyChainRef:               true,
+		lenientLogProfileStreamRef:             true,
+		lenientDynamicAddressFeedRef:           true,
+		lenientNATPoolAlarmThreshold:           true,
+		lenientNATHostMask:                     true,
+		lenientUnsupportedInterfaceStanzas:     true,
+		lenientRoutingExportRef:                true,
+		lenientFRRAuthValues:                   true,
+		lenientRouteFilterMatchTypes:           true,
+		lenientApplicationSpecs:                true,
+		lenientApplicationNameCollisions:       true,
+		lenientFilterProtocols:                 true,
+		lenientFilterCrossField:                true,
+		lenientFilterActions:                   true,
+		lenientFilterMatchValues:               true,
+		lenientFlexMatch:                       true,
+		lenientFilterPortExcept:                true,
+		lenientFilterAddressExcept:             true,
+		lenientFilterFromMatch:                 true,
+		lenientFilterAddressLiterals:           true,
+		lenientFilterRoutingInstanceConflict:   true,
+		lenientFilterDSCP:                      true,
+		lenientNPTv6:                           true,
+		lenientFirewallRefs:                    true,
+		lenientFlowServerTemplateRef:           true,
+		lenientSamplingInstanceConflicts:       true,
+		lenientApplicationSetMembers:           true,
+		lenientPolicyMatchApplications:         true,
+		lenientNATMatchApplications:            true,
+		lenientPolicyMatchAddressSetMembers:    true,
+		lenientRibGroupRefs:                    true,
+		lenientDHCPStaticBindings:              true,
+		lenientWireguardPeers:                  true,
+		lenientPolicyZoneRefs:                  true,
+		lenientZoneCount:                       true,
+		lenientZoneIDCollision:                 true,
+		lenientRoutingInstanceTableIDCollision: true,
+		lenientAddressBookNames:                true,
+		lenientZoneInterfaceMembership:         true,
+		lenientHostInboundTokens:               true,
+		lenientDuplicateHostLocalAddress:       true,
+		lenientDestNATAddresses:                true,
+		lenientRPMSourceAddress:                true,
+		lenientRPMLinkLocalZone:                true,
+		lenientRPMHTTPGetScheme:                true,
+		lenientRPMRoutingInstance:              true,
+		lenientBGPNeighborPeerAS:               true,
+		lenientRouterID:                        true,
+		lenientSNMPTrapGroup:                   true,
+		lenientPolicyTerminalAction:            true,
+		lenientPolicyLogAction:                 true,
+		lenientDuplicatePolicyNames:            true,
+		lenientScreenProfileRefs:               true,
+		lenientScreenNumeric:                   true,
+		lenientScreenUnknown:                   true,
+		lenientTrailingTokens:                  true,
+		lenientFlowAging:                       true,
+		lenientReservedZoneNames:               true,
+		lenientBackupRouterDst:                 true,
+		lenientSecureTunnelBindIface:           true,
+		lenientPolicyMatchLeaves:               true,
+		lenientPolicyThenPermit:                true,
+		lenientPolicyThenReject:                true,
+		lenientPolicyThenDeny:                  true,
+		lenientPolicyMissingMatch:              true,
+		lenientPolicyCommunityRef:              true,
+		lenientVRRPVirtualAddress:              true,
+		lenientDNATToScope:                     true,
+		lenientEventWithinTrigger:              true,
 	})
 }
 
@@ -1603,6 +1628,15 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, zoneIDErr
 	}
 
+	// #3855: stable routing-instance table-id collision gate — see
+	// compileConfigWithOpts. Pre-expansion union across all groups so the
+	// verdict is identical on both cluster nodes; read-only, safe on the copy.
+	riTableIDWarnings, riTableIDErr := validateRoutingInstanceTableIDCollisionAST(
+		tree, opts.lenientRoutingInstanceTableIDCollision)
+	if riTableIDErr != nil {
+		return nil, riTableIDErr
+	}
+
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)
@@ -1614,6 +1648,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	}
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	return cfg, nil
 }
 

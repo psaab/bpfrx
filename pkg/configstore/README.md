@@ -82,9 +82,36 @@ per-path:
   one is pending) PRESERVE `confirmPrevTree` — the rollback target
   stays the last truly CONFIRMED config, not the unconfirmed
   commit-1 tree.
+- **A plain commit CONFIRMS a pending `commit confirmed` (#3861).**
+  Junos semantics: any subsequent explicit `commit` confirms a pending
+  `commit confirmed`. The frontend `commit` path intercepts a pending
+  confirm (`IsConfirmPending`) and calls `ConfirmCommit` before it ever
+  reaches the store commit — the interactive cli/gRPC/REST handlers all
+  do this dance at their own layer. The NON-frontend committer that
+  bypasses it is the eventengine autonomous-remediation commit, which
+  reaches `Commit`/`CommitWithDescription` directly during a pending
+  window (any future direct-store caller is covered too — the fix is
+  defense-in-depth at the store layer, not a per-caller patch). Those
+  paths now call `clearPendingConfirmLocked` AFTER the
+  persist+promote succeeds: it cancels the armed rollback timer and
+  bumps `confirmGen` so the just-promoted config becomes the confirmed
+  config. Without it the pending timer's stale rollback target (the
+  pre-confirm T0 tree) fired and SILENTLY reverted the background
+  commit, discarding it (the eventengine sequence: operator `commit
+  confirmed 5`; remediation `Store.Commit` at T+2; T+5 timeout reverts
+  to T0, losing the remediation). This does NOT touch the nested
+  confirmed→confirmed re-arm (that goes through `CommitConfirmed`, which
+  re-arms and preserves the target) — only a PLAIN commit confirms.
 - **`SyncApply` (HA config-sync receive) — Option B,
   degrade-not-fail.** The in-memory apply always proceeds (failing it
   would silently diverge the cluster; sync is one-way fire-and-forget).
+  An authoritative config synced from the cluster primary also CONFIRMS
+  any commit-confirmed window still pending on this node (#3861): a node
+  that armed `commit confirmed`, failed over to standby, then received a
+  primary sync must not later revert the synced config to its stale
+  local pre-confirm tree. `SyncApply` calls `clearPendingConfirmLocked`
+  with the in-memory promotion (the timer cancel stands even if the disk
+  write below fails, matching the degrade-not-fail contract).
   A persist failure sets the store's degraded flag — surfaced by
   `ConfigPersistDegraded()` as `/health` 503 and the
   `xpf_daemon_config_persist_degraded` Prometheus gauge — writes a

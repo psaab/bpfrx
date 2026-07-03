@@ -692,8 +692,9 @@ security {
 	if len(ri.Interfaces) != 1 || ri.Interfaces[0] != "enp7s0" {
 		t.Errorf("instance interfaces: got %v, want [enp7s0]", ri.Interfaces)
 	}
-	if ri.TableID != 100 {
-		t.Errorf("table ID: got %d, want 100", ri.TableID)
+	// #3855: table id is the stable name-hash, not positional 100.
+	if want := StableRoutingInstanceTableID(ri.Name); ri.TableID != want {
+		t.Errorf("table ID: got %d, want stable %d", ri.TableID, want)
 	}
 	if len(ri.StaticRoutes) != 1 {
 		t.Fatalf("expected 1 static route, got %d", len(ri.StaticRoutes))
