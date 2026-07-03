@@ -86,10 +86,13 @@ per-path:
   Junos semantics: any subsequent explicit `commit` confirms a pending
   `commit confirmed`. The frontend `commit` path intercepts a pending
   confirm (`IsConfirmPending`) and calls `ConfirmCommit` before it ever
-  reaches the store commit, but NON-frontend committers — the
-  eventengine autonomous-remediation commit, and the cli/gRPC/REST
-  daemon commit handlers — reach `Commit`/`CommitWithDescription`
-  directly. Those paths now call `clearPendingConfirmLocked` AFTER the
+  reaches the store commit — the interactive cli/gRPC/REST handlers all
+  do this dance at their own layer. The NON-frontend committer that
+  bypasses it is the eventengine autonomous-remediation commit, which
+  reaches `Commit`/`CommitWithDescription` directly during a pending
+  window (any future direct-store caller is covered too — the fix is
+  defense-in-depth at the store layer, not a per-caller patch). Those
+  paths now call `clearPendingConfirmLocked` AFTER the
   persist+promote succeeds: it cancels the armed rollback timer and
   bumps `confirmGen` so the just-promoted config becomes the confirmed
   config. Without it the pending timer's stale rollback target (the
