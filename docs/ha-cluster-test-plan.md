@@ -542,6 +542,46 @@ printf 'show configuration security policies from-zone lan to-zone wan | display
 - Policy `test-sync` appears on fw1 within seconds
 - fw1 shows config as read-only (secondary cannot modify)
 
+### TC-5b: Commit-Confirmed Timeout Converges Both Nodes (#3868)
+
+**Objective:** Verify that when a `commit confirmed` is left to TIME OUT, BOTH
+nodes revert to the prior confirmed config — the standby must not be stranded on
+the abandoned unconfirmed config.
+
+Background: config sync is unidirectional (primary → secondary) and the standby
+applies a synced config via `SyncApply`, which arms **no** confirm timer — it
+holds the pushed config as its permanent active. So an unconfirmed `commit
+confirmed` on the primary is replicated to the standby immediately. On the
+confirm-timeout the primary's `executeConfirmedRollback` reverts its own store
+(`PromoteRollback`) AND now re-syncs the rolled-back config to the peer
+(`syncConfigToPeer`), so the standby converges too. Without the re-sync the
+nodes diverge (primary=C1, standby=C2) and a failover would serve the abandoned
+C2. The re-sync self-guards peer-absent (nil cluster/sessionSync, not RG0
+primary, config-sync disabled, or no active TCP conn all no-op); the existing
+reverse-sync-on-reconnect retries when the peer returns.
+
+```bash
+# 1. On fw0 (primary), commit-confirmed a distinctive change WITHOUT confirming:
+printf 'configure\nset security policies from-zone lan to-zone wan policy test-confirm match source-address any destination-address any application any then permit\ncommit confirmed 1\nexit\nexit\n' | incus exec xpf-fw0 -- cli
+
+# 2. Immediately verify the UNCONFIRMED policy replicated to fw1:
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec xpf-fw1 -- cli   # test-confirm present
+
+# 3. Do NOT confirm. Wait for the 1-minute timeout to fire on fw0.
+sleep 75
+
+# 4. Verify BOTH nodes reverted (test-confirm GONE on fw0 AND fw1):
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec xpf-fw0 -- cli
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec xpf-fw1 -- cli
+```
+
+**Pass criteria:**
+- After step 2, `test-confirm` is present on BOTH fw0 and fw1.
+- After the timeout (step 4), `test-confirm` is absent on BOTH fw0 and fw1 — the
+  standby converged to the rolled-back config, no divergence.
+- A subsequent failover serves the rolled-back (confirmed) config, not the
+  abandoned one.
+
 ### TC-6: Session Synchronization
 
 **Objective:** Verify active sessions are synced to secondary for hitless failover.
