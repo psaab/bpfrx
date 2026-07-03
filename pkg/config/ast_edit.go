@@ -393,9 +393,15 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 	//
 	// Gate on args == 1 so keyed multi entries (address <name> <prefix>,
 	// args == 2; named containers with children such as `interfaces <name>`)
-	// keep whole-node delete semantics.
-	if childSchema.multi && childSchema.children == nil && childSchema.args == 1 {
-		return removeMultiLeafMembers(current, keyword, path[i+1:])
+	// keep whole-node delete semantics. The valueList opt-in (#3872 static
+	// `next-hop`) extends member-delete to a multi leaf that ALSO carries
+	// modifier children (its `interface`), mirroring the read/render-side gate
+	// flip: without this, `delete ... next-hop <gw>` prefix-matched and deleted
+	// the WHOLE next-hop leaf, so deleting one gateway of a `[ a b ]` ECMP list
+	// silently blackholed the healthy other path (Null0), and a non-first
+	// member was undeletable — the exact #3846 delete-side fail-wide.
+	if childSchema.multi && (childSchema.children == nil || childSchema.valueList) && childSchema.args == 1 {
+		return removeMultiLeafMembers(current, keyword, path[i+1:], childSchema.valueList)
 	}
 
 	// Consume keyword + extra args as this node's keys.
@@ -542,22 +548,31 @@ func removeMatchingNode(nodes *[]*Node, targetKeys []string) error {
 }
 
 // removeMultiLeafMembers implements member-specific deletion for a value-list
-// multi-leaf (a `multi: true` leaf with no children and a single value slot —
-// e.g. `from protocol [ tcp udp icmp ]`). keyword is the leaf's first key
-// ("protocol"); members are the trailing tokens naming individual values to
-// drop.
+// multi-leaf. keyword is the leaf's first key ("protocol", "next-hop"); members
+// are the trailing tokens naming individual values to drop.
 //
 //   - members empty  → delete the whole leaf (mirrors removeMatchingNode's
 //     prefix match), so `delete ... from protocol` still clears the list.
 //   - members named  → drop ONLY those values from every node whose first key
 //     is keyword, reading BOTH the flat Keys[1:] shape (bracket list / flat
-//     set) AND the child-node shape (hierarchical block) — the #2419 dual AST
-//     shape. A node left with no values is removed entirely.
+//     set) AND, for a plain value-list leaf, the child-node shape (hierarchical
+//     block) — the #2419 dual AST shape. A node left with no values is removed
+//     entirely.
+//
+// modifierChildren distinguishes the two node classes:
+//   - false — a plain value-list leaf (children == nil, e.g. `from protocol
+//     [ tcp udp icmp ]`): child nodes ARE list members and are droppable.
+//   - true  — a valueList leaf that ALSO declares MODIFIER children (#3872
+//     static `next-hop <gw> { interface <if> }`): the children are modifiers
+//     OF the value, never members, so they are never matched against the drop
+//     set. When every value on Keys[1:] is dropped, the WHOLE entry — the
+//     gateway AND its interface modifier — is removed, rather than left as a
+//     gateway-less next-hop container that would render Null0/blackhole.
 //
 // Returns an error when no named member was found anywhere (mirroring
 // removeMatchingNode's not-found contract), so deleting a member that is not
 // present is reported rather than silently succeeding.
-func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string) error {
+func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string, modifierChildren bool) error {
 	if len(members) == 0 {
 		return removeMatchingNode(nodes, []string{keyword})
 	}
@@ -580,6 +595,18 @@ func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string) er
 				continue
 			}
 			newKeys = append(newKeys, v)
+		}
+		if modifierChildren {
+			// valueList node: children are MODIFIERS of the value, not members.
+			// Drop the whole entry (gateway + interface modifier) once every
+			// gateway on Keys[1:] is gone — a next-hop with no gateway is
+			// meaningless and would render Null0.
+			if len(newKeys) == 1 {
+				continue
+			}
+			n.Keys = newKeys
+			out = append(out, n)
+			continue
 		}
 		// Block shape: one child node per member.
 		newChildren := n.Children[:0]

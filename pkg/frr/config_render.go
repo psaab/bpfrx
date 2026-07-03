@@ -113,13 +113,22 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 		vrfPart = fmt.Sprintf(" table %d", tableID)
 	}
 
-	// Discard or no next-hops: single Null0 line.
-	if sr.Discard || len(sr.NextHops) == 0 {
+	// Explicit discard (blackhole) route: single Null0 line.
+	if sr.Discard {
 		nexthop := "Null0"
 		if sr.Preference > 0 {
 			return fmt.Sprintf("%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
 		}
 		return fmt.Sprintf("%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
+	}
+
+	// A non-discard route with NO next-hops is incomplete — e.g. every gateway
+	// of an ECMP `next-hop [ a b ]` list was deleted (#3872 delete-side). Render
+	// NOTHING rather than a Null0 blackhole: silently blackholing traffic that
+	// would otherwise fall through to a default / more-specific route is a
+	// fail-wide. (An explicit `discard` above still renders Null0.)
+	if len(sr.NextHops) == 0 {
+		return ""
 	}
 
 	// One line per next-hop → FRR creates ECMP.

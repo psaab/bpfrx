@@ -97,15 +97,23 @@ func staticRouteNode() *schemaNode {
 				}},
 			"qualified-next-hop": {desc: "Qualified next-hop", args: 1, placeholder: "<gateway>", children: map[string]*schemaNode{
 				"interface": {desc: "Egress interface", args: 1, placeholder: "<interface-name>", children: nil},
-				// #3827 (Low): the qualified-next-hop preference folds into
-				// route.Preference (compiler_routing.go), the same i32 wire field
-				// gated for the route-level `preference` leaf. Mirror that typing
-				// so a negative / i32-overflow value is rejected at commit (naming
-				// the leaf) instead of only tripping the Rust snapshot backstop
+				// The qualified-next-hop preference is carried PER next-hop
+				// (NextHopEntry.Preference, #3871) so the qualified gateway
+				// renders as a FLOATING backup at its own admin distance — it is
+				// NO LONGER folded into the single route-level preference (that
+				// fold was the #3871 bug: it made every next-hop equal-cost).
+				// The typing is still the same i32 wire field gated for the
+				// route-level `preference` leaf (#3827): a negative / i32-
+				// overflow value is rejected at commit (naming the leaf) instead
+				// of only tripping the Rust snapshot backstop
 				// (RoutePreferenceOutOfRange) with retained-prior-state.
 				"preference": {desc: "Preference", args: 1, placeholder: "<value>",
 					valueType: ValueInteger, valueDesc: "Route preference / administrative distance (0..2147483647; lower = more preferred, default 5)",
 					valueExamples: []string{"5", "100"}, validator: ValidateInteger(0, maxWireI32), children: nil},
+				// metric is carried per next-hop (NextHopEntry.Metric, #3871) but
+				// NOT rendered — FRR's static-route CLI has no metric field, so a
+				// metric-only qualified-next-hop (no preference) does NOT float;
+				// preference is what creates the floating backup.
 				"metric": {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
 			}},
 			"discard":    {desc: "Discard (blackhole) route", children: nil},

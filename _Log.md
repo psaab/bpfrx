@@ -28638,3 +28638,35 @@ top.
   + partialFrameConn/recordingBufConn/closeCountingTimeoutConn mocks +
   parseOctetFrame collector parser), pkg/logging/README.md (partial-frame
   teardown #3874 bullet)
+
+## 2026-07-03 — PR #3879 hostile-review folds: #3872 delete-side + 2 MINORs
+
+- **Timestamp**: 2026-07-03
+- **Action**: MAJOR (delete-side fail-wide, the #3846 class the PR cites). The
+  read/render side of #3872 next-hop ECMP was fixed but the DELETE side was
+  not: the removeMultiLeafMembers gate was `multi && children == nil && args
+  == 1`, and next-hop has an `interface` child so it was EXCLUDED → fell
+  through to removeMatchingNode (prefix match) → `delete ... next-hop <gw>` on
+  a `[ a b ]` list deleted the WHOLE leaf → route left with 0 next-hops → FRR
+  rendered Null0 (blackholed the healthy path); a non-first member was
+  undeletable. FIX: (1) gate flip `multi && (children == nil || valueList) &&
+  args == 1` mirroring the read side; (2) removeMultiLeafMembers gains a
+  modifierChildren param — for a valueList node the children are MODIFIERS of
+  the gateway (not droppable members), and dropping the last gateway removes
+  the WHOLE entry (gateway + interface) rather than a gateway-less container;
+  (3) renderer emits Null0 ONLY for an explicit `discard` — a non-discard
+  0-next-hop route renders NOTHING (not a Null0 blackhole). MINOR 1: doc that a
+  metric-only qualified-next-hop (no preference) does NOT float (FRR statics
+  have no metric field). MINOR 2: fixed the stale schema comment that said the
+  qualified preference "folds into route.Preference" (#3871 removed that fold).
+  RED-on-revert PROVEN: reverting the gate → whole leaf deleted (0 next-hops) +
+  non-first undeletable; reverting the renderer → 0-next-hop route renders
+  Null0. Full go test ./pkg/config/... ./pkg/frr/... green. NOTE: pre-existing
+  master canary failure TestNoDirectOsWriteFile (daemon_flow.go archiveConfig,
+  from master #9d14a1720) is unrelated to this PR.
+- **File(s)**: pkg/config/ast_edit.go (delete gate flip + removeMultiLeafMembers
+  modifierChildren), pkg/frr/config_render.go (Null0 only for discard),
+  pkg/config/schema_routing.go (MINOR 2 stale comment + metric note),
+  pkg/frr/README.md (MINOR 1 metric-only-doesn't-float),
+  pkg/config/delete_static_nexthop_3872_test.go (new, 5 tests),
+  pkg/frr/static_empty_route_3872_test.go (new, 2 tests)

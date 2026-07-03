@@ -148,7 +148,10 @@ also carries operator content:
   (#3872) — kept distinct: no per-next-hop preference. FRR's static-route CLI
   has no metric field, so `NextHopEntry.Metric` is carried in the typed config
   (parity/display) but not emitted — the floating behavior is entirely the
-  per-next-hop distance.
+  per-next-hop distance. A metric-ONLY `qualified-next-hop <gw> { metric M; }`
+  (no `preference`) therefore does NOT float: with `HasPreference == false` it
+  renders at the route-level distance, equal-cost with the primary — a
+  `preference` is REQUIRED to make a qualified-next-hop a floating backup.
 - **VRRP-VIP-only subnets (#2452 secondary).** A bondless-RETH member that
   carries only a VRRP virtual address (no matching `unit.Addresses` entry)
   also contributes its VIP subnet as a connected prefix, so a static
