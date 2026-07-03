@@ -253,6 +253,55 @@ func firewallMatchValues(child *Node) []string {
 	return vals
 }
 
+// firewallPrefixListRefs extracts every prefix-list reference carried by a
+// firewall-filter `from source-prefix-list` / `destination-prefix-list` match
+// node, across BOTH parser AST shapes (#3843 — the prefix-list-ref instance of
+// the #2419 dual-shape class):
+//
+//   - hierarchical single-name leaf  `source-prefix-list plX;`
+//     → Keys=["source-prefix-list","plX"], no children
+//     hierarchical single-name+except `source-prefix-list plX except;`
+//     → Keys=["source-prefix-list","plX","except"], no children
+//   - hierarchical block             `source-prefix-list { pl1; pl2 except; }`
+//     → one child node per name (child.Keys=["pl1"] / ["pl2","except"])
+//   - flat set command               `set ... source-prefix-list plX except`
+//     → one child node (child.Keys=["plX"] / ["plX","except"])
+//
+// The single-name leaf shape was SILENTLY DROPPED before #3843: the caller only
+// iterated child.Children and never read child.Keys[1], so a `load merge`/config-
+// file term compiled with NO prefix-list scope (implicit match-all) yet passed
+// strict commit cleanly — a fail-open. Reading BOTH child.Keys[1:] AND
+// child.Children guarantees the scope survives every shape; an unresolvable name
+// is still hard-rejected by validateFirewallPrefixListReferencesStrict, so a
+// dropped scope is impossible (fail-closed).
+func firewallPrefixListRefs(child *Node) []PrefixListRef {
+	var refs []PrefixListRef
+	// A token slice is a sequence of `<name> [except]` groups: an `except`
+	// modifier attaches to the prefix-list name immediately preceding it.
+	appendTokens := func(tokens []string) {
+		for i := 0; i < len(tokens); {
+			name := tokens[i]
+			i++
+			if name == "" {
+				continue
+			}
+			ref := PrefixListRef{Name: name}
+			if i < len(tokens) && tokens[i] == "except" {
+				ref.Except = true
+				i++
+			}
+			refs = append(refs, ref)
+		}
+	}
+	// Single-name / flat leaf shape: the name(s) ride on this node's own Keys.
+	appendTokens(child.Keys[1:])
+	// Block / flat-set shape: one child node per referenced prefix-list.
+	for _, plNode := range child.Children {
+		appendTokens(plNode.Keys)
+	}
+	return refs
+}
+
 // compileFilterFrom compiles a firewall-filter term's `from` match block. The
 // family ("inet" / "inet6") selects the ICMPv4 vs ICMPv6 icmp-type name table
 // when resolving symbolic icmp-type values (#3205).
@@ -285,22 +334,14 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 			// unresolved token for the strict commit gate (fail closed).
 			term.DestinationPorts = append(term.DestinationPorts, resolveFilterPortTokens(firewallMatchValues(child), term)...)
 		case "source-prefix-list":
-			// Block form: source-prefix-list { mgmt-hosts except; }
-			for _, plNode := range child.Children {
-				ref := PrefixListRef{Name: plNode.Keys[0]}
-				if len(plNode.Keys) >= 2 && plNode.Keys[1] == "except" {
-					ref.Except = true
-				}
-				term.SourcePrefixLists = append(term.SourcePrefixLists, ref)
-			}
+			// #3843: read BOTH the single-name leaf shape
+			// (`source-prefix-list plX;` → child.Keys[1:]) AND the block /
+			// flat-set shape (`source-prefix-list { plX except; }` /
+			// `set ... source-prefix-list plX` → child.Children). Iterating
+			// only child.Children silently dropped the leaf-shape scope.
+			term.SourcePrefixLists = append(term.SourcePrefixLists, firewallPrefixListRefs(child)...)
 		case "destination-prefix-list":
-			for _, plNode := range child.Children {
-				ref := PrefixListRef{Name: plNode.Keys[0]}
-				if len(plNode.Keys) >= 2 && plNode.Keys[1] == "except" {
-					ref.Except = true
-				}
-				term.DestPrefixLists = append(term.DestPrefixLists, ref)
-			}
+			term.DestPrefixLists = append(term.DestPrefixLists, firewallPrefixListRefs(child)...)
 		case "source-port":
 			term.SourcePorts = append(term.SourcePorts, resolveFilterPortTokens(firewallMatchValues(child), term)...)
 		case "destination-port-except":
