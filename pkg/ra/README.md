@@ -231,6 +231,27 @@ best-effort).
   valid life paired with a large explicit preferred life) would otherwise
   silently lose SLAAC on every host. The clamp is never the reverse —
   extending validity would advertise a longer-lived prefix than configured.
+- **RA lifetimes are bounded so one bad option cannot blackhole the whole
+  segment (#3895).** The entire RA is built and sent in ONE `conn.WriteTo`,
+  which internally marshals every option, so a single option whose lifetime
+  overflows its on-wire field aborts the ENTIRE advertisement — the segment
+  then silently stops receiving RAs and hosts lose their default route / SLAAC
+  when the current RAs expire. Two guards, in depth:
+  - **Primary (commit-time gate, `pkg/config` `schema_routing.go`):** the
+    router-advertisement lifetime leaves are bounded to their wire fields —
+    `default-lifetime` ≤ 65535 (RFC 4861 §4.2 16-bit), `prefix
+    valid-/preferred-lifetime` ≤ 4294967295 (RFC 4861 §4.6.2 32-bit), and
+    `nat-prefix`/`nat64prefix lifetime` ≤ 65528 (RFC 8781 §4 13-bit
+    scaled-by-8, `8191*8`). An over-large value is rejected loudly at commit
+    (#2497 typed these leaves but left them unbounded).
+  - **Defense-in-depth (send-time, `buildRA` → `pruneUnmarshalableOptions`,
+    `sender.go`):** each option is probed through `ndp.MarshalMessage` (the
+    same encoder `conn.WriteTo` uses); any option that fails to marshal is
+    logged and DROPPED so the rest of the RA still goes out. This backstops a
+    config that predates the commit-time bound (e.g. a loaded `active.json`) —
+    a bad option degrades to "missing that one option" instead of a total RA
+    blackout. NDP options are independent on the wire, so per-option probing is
+    faithful to how the combined RA marshals.
 - IPv6 NODAD is set on the per-instance NDP socket so it doesn't fight
   the kernel's own duplicate-address detection on the link-local
   address.
