@@ -45,6 +45,20 @@ var ErrConfigCompile = errors.New("config DB present but does not compile")
 // preserved for operators that grep logs; only the error VALUE is new.
 var ErrConfigLocked = errors.New("configuration is locked by another user")
 
+// ErrClusterReadOnly tags a rejected config mutation on a cluster node that
+// is NOT the RG0 primary (a read-only secondary; config authority is the
+// primary). It is returned both at the EnterConfigure* gate AND on every
+// user-session mutating op (Set/Delete/Commit/Load/Rollback and the
+// interactive structural edits), so a config session that was opened BEFORE
+// the node became secondary — or reached via a path that did not re-check —
+// cannot Set+Commit and diverge the secondary's active config from the
+// primary (#3893). It is a PERMANENT condition (unlike the transient
+// ErrConfigLocked): the node stays read-only until it is promoted to RG0
+// primary. The internal HA-sync ingress (Store.SyncApply) and the
+// commit-confirmed timeout revert (Store.PromoteRollback) do NOT route
+// through the gated methods, so they deliberately bypass this gate.
+var ErrClusterReadOnly = errors.New("configuration is read-only on the cluster secondary")
+
 // Config-DB compatibility envelope (#1917 increment B, plan §6.4 / D1).
 //
 // The envelope is EMBEDDED in active.json as a single magic header LINE

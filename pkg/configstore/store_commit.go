@@ -64,6 +64,13 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// #3893: reject a user-session commit on a read-only secondary. The
+	// internal HA-sync ingress (SyncApply) and the commit-confirmed timeout
+	// revert (PromoteRollback) promote the active config directly and never
+	// reach here, so they are unaffected by this gate.
+	if err := s.ensureWritableLocked(); err != nil {
+		return nil, err
+	}
 	if s.candidate == nil {
 		return nil, fmt.Errorf("not in configuration mode")
 	}
@@ -189,6 +196,11 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// #3893: reject a user-session commit-confirmed on a read-only secondary
+	// (same gate as CommitWithDescription).
+	if err := s.ensureWritableLocked(); err != nil {
+		return nil, err
+	}
 	if s.candidate == nil {
 		return nil, fmt.Errorf("not in configuration mode")
 	}
@@ -455,6 +467,13 @@ func (s *Store) Rollback(n int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// #3893: `rollback N` mutates the candidate; reject it on a read-only
+	// secondary. This is the user-session verb, distinct from the internal
+	// commit-confirmed timeout revert PromoteRollback (which promotes the
+	// active config directly and is intentionally NOT gated).
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
