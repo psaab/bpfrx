@@ -642,6 +642,59 @@ func normalizePolicyAddrTokens(toks []string) []string {
 	return out
 }
 
+// policyMatchChildren returns the children of EVERY `match {}` block under a
+// security-policy term, flattened in declaration order. #3842: a policy
+// loaded via `load merge` / `load override` (or a hierarchical config that
+// authors two blocks) carries DUPLICATE inner `match {}` blocks as SEPARATE
+// children — parseStatements APPENDS a repeated block, it does not merge it
+// (parser.go) — and Junos merges duplicate match blocks. Reading only the
+// first via FindChild("match") silently DROPS the second block's constraints,
+// WIDENING the policy with a clean commit (a security fail-open) AND hiding
+// the second block from the strict match gates. The compiler (compilePolicy)
+// and the strict match gates (validatePolicyMatchLeavesStrict #3113/#3142/
+// #3673, validatePolicyRequiredMatchStrict #3044) all accumulate over this
+// helper so every match block is both enforced and validated. #3562/#3377
+// closed the top-level duplicate-`security`/`policies` and duplicate-action-
+// node cases; this closes the duplicate inner match/then blocks under one
+// term.
+func policyMatchChildren(polNode *Node) []*Node {
+	var out []*Node
+	for _, mn := range polNode.FindChildren("match") {
+		out = append(out, mn.Children...)
+	}
+	return out
+}
+
+// policyThenChildren is the `then {}` sibling of policyMatchChildren (#3842):
+// the children of EVERY `then {}` block under a policy term, flattened in
+// order. compilePolicy accumulates the terminal action / log / count over all
+// then blocks, so a second `then { reject; }` after a first `then { permit; }`
+// contributes a SECOND terminal action that the #3043 conflicting-terminal-
+// action gate rejects at commit (the fail-closed floor) instead of being
+// silently dropped into a fail-open permit.
+func policyThenChildren(polNode *Node) []*Node {
+	var out []*Node
+	for _, tn := range polNode.FindChildren("then") {
+		out = append(out, tn.Children...)
+	}
+	return out
+}
+
+// policyThenActionNodes returns every `then` action node named `action`
+// (permit / deny / reject) across ALL `then {}` blocks under a policy term.
+// The then-action reject gates (validatePolicyThenPermitStrict #3114,
+// validatePolicyThenRejectStrict #3115, validatePolicyThenDenyStrict #3141)
+// use it so a modifier carried by a DUPLICATE `then {}` block is inspected,
+// not only the first block's action nodes (#3842). It composes with the
+// existing per-then-block FindChildren(action) two-node handling (#3377).
+func policyThenActionNodes(polNode *Node, action string) []*Node {
+	var out []*Node
+	for _, tn := range polNode.FindChildren("then") {
+		out = append(out, tn.FindChildren(action)...)
+	}
+	return out
+}
+
 // compilePolicy extracts a Policy from a named policy instance.
 func compilePolicy(polInst struct {
 	name string
@@ -649,9 +702,12 @@ func compilePolicy(polInst struct {
 }) *Policy {
 	pol := &Policy{Name: polInst.name}
 
-	matchNode := polInst.node.FindChild("match")
-	if matchNode != nil {
-		for _, m := range matchNode.Children {
+	// #3842: accumulate across ALL `match {}` blocks (policyMatchChildren) —
+	// a duplicate inner match block must contribute its constraints, never be
+	// silently dropped by a FindChild-first read (a fail-open widening).
+	matchChildren := policyMatchChildren(polInst.node)
+	if len(matchChildren) > 0 {
+		for _, m := range matchChildren {
 			switch m.Name() {
 			case "source-address":
 				if len(m.Keys) >= 2 {
@@ -703,9 +759,14 @@ func compilePolicy(polInst struct {
 		}
 	}
 
-	thenNode := polInst.node.FindChild("then")
-	if thenNode != nil {
-		for _, t := range thenNode.Children {
+	// #3842: accumulate across ALL `then {}` blocks (policyThenChildren) so a
+	// duplicate inner then block's terminal action / log / count is enforced.
+	// Two terminal actions from two then blocks feed pol.terminalActions and
+	// are rejected by the #3043 conflicting-terminal-action gate at commit
+	// (fail-closed) rather than the second being silently dropped (fail-open).
+	thenChildren := policyThenChildren(polInst.node)
+	if len(thenChildren) > 0 {
+		for _, t := range thenChildren {
 			switch t.Name() {
 			case "permit":
 				pol.Action = PolicyPermit

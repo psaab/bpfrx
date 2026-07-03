@@ -1407,6 +1407,40 @@ reserved for whole-dataplane selection where a rewrite shim
   `pkg/config/compiler_dup_flow_subblock_3566_test.go` (per-validator
   RED-on-revert subtests duplicating each descended level — `flow`,
   `traceoptions`, `file`, `log` — built with `NewParser`).
+- **#3842 (the innermost sibling of #3562/#3566 — duplicate `match {}`/`then {}`
+  blocks UNDER ONE policy term):** #3562/#3566 fixed the duplicate-block bypass
+  at the `security`/`policies`/`flow` container levels, but the per-policy check
+  itself still read only the FIRST inner `match {}` / `then {}` block via
+  `polNode.FindChild("match")` / `FindChild("then")` — both in the COMPILER
+  (`compilePolicy`, `compiler_security.go`) and in the six strict policy gates.
+  A policy term with a DUPLICATE inner `match {}` or `then {}` block — the shape
+  `LoadMerge`/`LoadOverride` yields, since `parseStatements` appends a repeated
+  block at EVERY level (it cannot be produced by flat-set `SetPath`, which
+  merges the block) — had the SECOND block silently DROPPED: an L7 `application`
+  constraint, an address constraint, or a `then reject`/`deny` in the duplicate
+  block was discarded, WIDENING the policy with a clean commit (a HIGH security
+  fail-open), and the gates never validated it either. The fix ACCUMULATES over
+  all blocks via three shared helpers in `compiler_security.go` —
+  `policyMatchChildren` (children of every `match {}`), `policyThenChildren`
+  (children of every `then {}`), and `policyThenActionNodes(pol, action)` (every
+  permit/deny/reject node across every `then {}`, composing with the #3377
+  per-then-block two-node handling). The compiler and all six gates
+  (`validatePolicyMatchLeavesStrict` #3113, `validatePolicyRequiredMatchStrict`
+  #3044, `validatePolicyThenPermitStrict` #3114, `validatePolicyThenRejectStrict`
+  #3115, `validatePolicyThenDenyStrict` #3141) now read through these helpers, so
+  every block is enforced AND validated — Junos merge semantics. Two blocks with
+  CONFLICTING terminal actions (`then { permit }` + `then { reject }`) surface as
+  two `pol.terminalActions` and are rejected by the #3043 conflicting-terminal-
+  action gate at commit (the fail-closed floor) rather than the second being
+  dropped into a fail-open permit. RULE OF THUMB (restated for the leaf level):
+  the per-instance body of a strict walk must also union same-named repeated
+  BLOCKS (`match`/`then`) — a `FindChild`-first read of an inner block is the
+  same bypass one level deeper. Regression coverage:
+  `pkg/config/compiler_policy_dup_block_3842_test.go` (compiler accumulate,
+  conflicting-then-block reject, second-block unsupported-leaf #3113 and
+  unsupported-modifier #3114 rejection incl. the lenient-warn surface, split
+  required dimensions merged, single-block regression guard — built with
+  `NewParser` for the `LoadOverride` shape).
 - **#3473 (duplicate security-policy names — strict commit gate):**
   `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
   hard-rejects two security policies that share a name within the same

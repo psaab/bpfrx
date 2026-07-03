@@ -106,11 +106,17 @@ func validatePolicyRequiredMatchStrict(nodes []*Node, lenient bool) ([]string, e
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
+		// #3842: union the dimensions across EVERY `match {}` block
+		// (policyMatchChildren), not just the first via FindChild. Junos merges
+		// duplicate match blocks, so a policy whose required dimensions are
+		// split across two blocks (e.g. source/destination-address in one,
+		// application in a load-merged second) is complete once merged — a
+		// FindChild-first read saw only the first block and would either
+		// spuriously reject a complete policy or, symmetrically, let a widened
+		// one through depending on which block came first.
 		present := map[string]bool{}
-		if matchNode := polNode.FindChild("match"); matchNode != nil {
-			for _, m := range matchNode.Children {
-				present[m.Name()] = true
-			}
+		for _, m := range policyMatchChildren(polNode) {
+			present[m.Name()] = true
 		}
 		var missing []string
 		for _, req := range requiredPolicyMatchLeaves {

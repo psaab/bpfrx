@@ -207,11 +207,13 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node, isGlobal bool) error {
-		matchNode := polNode.FindChild("match")
-		if matchNode == nil {
-			return nil
-		}
-		for _, m := range matchNode.Children {
+		// #3842: inspect EVERY `match {}` block (policyMatchChildren), not just
+		// the first via FindChild. A duplicate inner match block (load merge/
+		// override appends a second `match` child) is compiled by compilePolicy
+		// and can carry an unsupported leaf; a FindChild-first walk here never
+		// validated it, so the second block's leaf was silently dropped and the
+		// policy widened with a clean commit.
+		for _, m := range policyMatchChildren(polNode) {
 			leaf := m.Name()
 			// #3148: from-zone/to-zone are supported match context for a
 			// global policy only; under a zone-pair policy they fall through

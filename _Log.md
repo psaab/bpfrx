@@ -1,3 +1,46 @@
+## 2026-07-03 — #3842: policy dup inner match/then blocks silently dropped (HIGH fail-open)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-006. A security policy term with
+    DUPLICATE inner `match {}` or `then {}` blocks — the shape `load
+    merge`/`load override` yields (parseStatements appends a repeated block at
+    every level; flat-set SetPath merges so cannot produce it) — had the SECOND
+    block silently dropped. `compilePolicy` (compiler_security.go) read only the
+    first block via `FindChild("match")`/`FindChild("then")`, and the six strict
+    policy gates used the same first-block read, so an L7 application/address
+    constraint or a `then reject`/`deny` in the duplicate block was discarded and
+    the policy WIDENED with a clean commit (a HIGH security fail-open), with the
+    gates never validating the second block either. #3562/#3377 fixed top-level
+    duplicate `security`/`policies` blocks and duplicate action NODES within one
+    then block, but not duplicate inner match/then BLOCKS under one term.
+  - **Fix**: Added three shared accumulate helpers in `compiler_security.go` —
+    `policyMatchChildren` (children of every `match {}`), `policyThenChildren`
+    (children of every `then {}`), `policyThenActionNodes(pol, action)` (every
+    permit/deny/reject node across every `then {}`, composing with the #3377
+    per-then-block two-node handling). Routed the compiler (`compilePolicy`) and
+    all six gates through them: `validatePolicyMatchLeavesStrict` (#3113),
+    `validatePolicyRequiredMatchStrict` (#3044), `validatePolicyThenPermitStrict`
+    (#3114), `validatePolicyThenRejectStrict` (#3115),
+    `validatePolicyThenDenyStrict` (#3141). Junos merge semantics: every block is
+    enforced AND validated. Two blocks with conflicting terminal actions
+    (`then { permit }` + `then { reject }`) now feed two `pol.terminalActions`
+    and are rejected by the #3043 conflicting-terminal-action gate at commit (the
+    fail-closed floor) instead of the second being dropped into a fail-open
+    permit.
+  - **Validation**: New `compiler_policy_dup_block_3842_test.go` — six tests
+    (compiler accumulate, conflicting-then-block reject, second-block
+    unsupported-leaf #3113 + lenient-warn, second-block unsupported-modifier
+    #3114, split required dimensions merged, single-block regression guard).
+    Proved RED-on-revert by reverting the helpers to first-block-only: all five
+    assertive tests go RED, the single-block guard stays green. `go test
+    ./pkg/config/...` green, `go build ./...` clean, gofmt + vet clean.
+  - **File(s)**: pkg/config/compiler_security.go,
+    pkg/config/compiler_policy_match.go,
+    pkg/config/compiler_policy_missing_match.go,
+    pkg/config/compiler_policy_then.go,
+    pkg/config/compiler_policy_dup_block_3842_test.go, docs/config-schema.md,
+    _Log.md
+
 ## 2026-07-02 — #3719: review MAJOR fix — quarantine scrub must drop scoped-global match-zones
 
 - **Timestamp**: 2026-07-02
