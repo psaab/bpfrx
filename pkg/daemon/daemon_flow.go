@@ -3,9 +3,14 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -225,6 +230,18 @@ func parseProtocol(proto string) uint8 {
 
 // archiveConfig transfers the active config to remote archive sites
 // when system { archival { configuration { transfer-on-commit; } } } is set.
+//
+// #3867: the uploaded bytes are the CURRENT ACTIVE configuration serialized
+// from the configstore — the same hierarchical text `show configuration`
+// renders via Store.ShowActive() and the same source the local auto-archive
+// (writeArchive) uses — NOT d.opts.ConfigFile. The boot file
+// /etc/xpf/xpf.conf is written once at install and is never rewritten after
+// the configstore became DB-canonical, so scp'ing it uploaded the day-0
+// config on every commit: the DR/compliance archive silently diverged from
+// the running config from the first commit onward while scp still logged
+// success. We serialize the just-committed active config to a temp file and
+// scp THAT, preserving the historical remote filename (the boot-file
+// basename) and the scp transport.
 func (d *Daemon) archiveConfig(cfg *config.Config) {
 	if cfg.System.Archival == nil || !cfg.System.Archival.TransferOnCommit {
 		return
@@ -232,26 +249,88 @@ func (d *Daemon) archiveConfig(cfg *config.Config) {
 	if len(cfg.System.Archival.ArchiveSites) == 0 {
 		return
 	}
+	if d.store == nil {
+		slog.Warn("config archival skipped: no configuration store")
+		return
+	}
 
-	configFile := d.opts.ConfigFile
+	// Serialize the CURRENT active config (the just-committed tree) — the
+	// same hierarchical text `show configuration` renders. This is the
+	// config the operator expects the DR/compliance archive to reflect, not
+	// the stale install-time boot file.
+	active := d.store.ShowActive()
+	if active == "" {
+		slog.Warn("config archival skipped: active configuration is empty")
+		return
+	}
+
+	// Write to a temp file whose basename matches the historical remote name
+	// (the boot-file basename, default xpf.conf) so an archive-site directory
+	// destination keeps the same archived filename as before this fix.
+	base := filepath.Base(d.opts.ConfigFile)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		base = "xpf.conf"
+	}
+	tmpDir, err := os.MkdirTemp("", "xpf-archive-")
+	if err != nil {
+		slog.Warn("config archival failed: create temp dir", "err", err)
+		return
+	}
+	srcPath := filepath.Join(tmpDir, base)
+	// 0600 — the active config may contain encrypted secrets; keep the
+	// transient copy owner-only (MkdirTemp already made the dir 0700).
+	if err := os.WriteFile(srcPath, []byte(active), 0600); err != nil {
+		slog.Warn("config archival failed: write temp config", "err", err)
+		os.RemoveAll(tmpDir)
+		return
+	}
+
+	transfer := d.archiveTransfer
+	if transfer == nil {
+		transfer = scpArchiveTransfer
+	}
+
+	var wg sync.WaitGroup
 	for _, site := range cfg.System.Archival.ArchiveSites {
+		wg.Add(1)
 		go func(dest string) {
+			defer wg.Done()
 			slog.Info("archiving config", "destination", dest)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			out, err := exec.CommandContext(ctx, "scp",
-				"-o", "StrictHostKeyChecking=no",
-				"-o", "BatchMode=yes",
-				configFile, dest,
-			).CombinedOutput()
-			if err != nil {
-				slog.Warn("config archival failed",
-					"destination", dest, "err", err, "output", string(out))
+			if err := transfer(ctx, srcPath, dest); err != nil {
+				slog.Warn("config archival failed", "destination", dest, "err", err)
 			} else {
 				slog.Info("config archived successfully", "destination", dest)
 			}
 		}(site)
 	}
+
+	// Remove the temp file only after every upload finishes reading it.
+	go func() {
+		wg.Wait()
+		os.RemoveAll(tmpDir)
+	}()
+}
+
+// scpArchiveTransfer is the default transfer-on-commit transport: scp the
+// serialized active-config file to one archive site. It is split out of
+// archiveConfig behind the Daemon.archiveTransfer seam so tests can inject a
+// capturing transfer and assert archiveConfig serializes the CURRENT active
+// config rather than the stale boot file (#3867).
+func scpArchiveTransfer(ctx context.Context, srcPath, dest string) error {
+	out, err := exec.CommandContext(ctx, "scp",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "BatchMode=yes",
+		srcPath, dest,
+	).CombinedOutput()
+	if err != nil {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			return fmt.Errorf("%w: %s", err, trimmed)
+		}
+		return err
+	}
+	return nil
 }
 
 // applyFlowTrace sets up the initial flow trace writer from config.

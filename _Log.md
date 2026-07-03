@@ -28443,6 +28443,31 @@ top.
   (updated for fail-closed semantics), pkg/scheduler/README.md +
   docs/config-schema.md (docs)
 
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix #3867 — config archive transfer-on-commit uploaded the
+  boot-time /etc/xpf/xpf.conf (never rewritten since the configstore became
+  DB-canonical), so every `system archival configuration transfer-on-commit`
+  scp'd the DAY-0 config instead of the just-committed one — a silently-wrong
+  DR/compliance archive while scp logged success. `archiveConfig`
+  (pkg/daemon/daemon_flow.go) now serializes the CURRENT active config via
+  `Store.ShowActive()` (= `s.active.Format()`, the same text
+  `show configuration` renders and the local auto-archive `writeArchive`
+  uses), writes it to a 0600 temp file keeping the boot-file basename
+  (preserves the historical remote filename for directory-destination sites),
+  scp's THAT, and removes the temp file after every upload completes. The scp
+  step is split into `scpArchiveTransfer` behind the new injectable
+  `Daemon.archiveTransfer` seam so tests capture the uploaded bytes.
+  RED-on-revert PROVEN: reverting the source back to `d.opts.ConfigFile`
+  makes `TestArchiveConfigUploadsActiveNotBootFile` capture the day-0 boot
+  file ("day0-boot") instead of the committed active config ("committed-c1")
+  — both the exact-equality assertion and the boot-file guard trip. go test
+  ./pkg/daemon/... green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/daemon/daemon_flow.go (archiveConfig rewrite +
+  scpArchiveTransfer), pkg/daemon/daemon.go (archiveTransfer field),
+  pkg/daemon/archive_config_3867_test.go (new RED-on-revert + temp-cleanup
+  tests), pkg/configstore/README.md (remote transfer-on-commit source note)
 - **Timestamp**: 2026-07-03
 - **Action**: #3864 — deterministic (CGNAT) source NAT was un-configurable via
   flat-set. The documented CGNAT quick-start (`set ... port deterministic
