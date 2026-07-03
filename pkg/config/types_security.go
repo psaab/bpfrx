@@ -578,7 +578,7 @@ type NATThen struct {
 	Type      NATType
 	Interface bool   // source-nat interface mode
 	PoolName  string // pool reference
-	Off       bool   // source-nat off (no-NAT exemption)
+	Off       bool   // source-nat / destination-nat off (no-NAT exemption, #3844)
 }
 
 // NATType is the type of NAT.

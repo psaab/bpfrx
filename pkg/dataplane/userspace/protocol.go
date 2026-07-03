@@ -733,6 +733,24 @@ type DestinationNATRuleSnapshot struct {
 	// MatchSourcePorts.
 	MatchICMPType *uint8 `json:"match_icmp_type,omitempty"`
 	MatchICMPCode *uint8 `json:"match_icmp_code,omitempty"`
+	// Off carries a `then destination-nat off` no-translate EXEMPTION (#3844).
+	// Junos DNAT rules are ordered; a rule whose action is `off` matches the
+	// traffic but applies NO translation and STOPS evaluation, so a later DNAT
+	// rule cannot re-translate it. Before #3844 the off rule compiled to an
+	// empty Then and was dropped at this snapshot boundary — the "exempted"
+	// traffic fell through and was DNAT'd by a later matching rule (a fail-open
+	// security defect). An off entry carries its full destination/source/
+	// protocol/port MATCH (so the exemption is scoped exactly like a translate
+	// rule would be) but an empty PoolAddress; the Rust DnatTable recognizes
+	// the Off flag, returns NO translation, and short-circuits the remaining
+	// proto/port/prefix tiers for that flow. An off destination is NOT
+	// registered as a firewall-local address (no proxy-ARP/ND) — it is a real
+	// host reachable via routing, not a VIP the firewall owns. Additive wire
+	// field (#1961 skew-safe): an older helper without it ignores the field
+	// and (because an off entry carries no pool address) drops the entry as a
+	// pool-less DNAT rule — reverting to the pre-#3844 fail-open, never a
+	// crash; the commit-side compiles it identically on both binaries.
+	Off bool `json:"off,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). All expanded
 	// (protocol, port) tuples of the same DNAT rule share one counter ID so
