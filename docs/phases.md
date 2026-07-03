@@ -1000,7 +1000,8 @@ Configuration synchronization between chassis cluster nodes. Primary node pushes
 - **`clusterReadOnly bool`** field on `Store` struct
 - **`SetClusterReadOnly(ro bool)`** — toggles mode (called by daemon on cluster state change)
 - **`ClusterReadOnly() bool`** — getter for read-only state
-- **`EnterConfigureSession()`** / **`EnterConfigureExclusive()`** — both return `"configuration database is not writable (secondary node)"` when read-only
+- **`EnterConfigureSession()`** / **`EnterConfigureExclusive()`** — reject with the `ErrClusterReadOnly` sentinel (`"configuration is read-only on the cluster secondary"`, `errors.Is`-comparable) when read-only
+- **Every user-session mutating op enforces read-only too (#3893)** — `Set`/`Delete`/`Deactivate`/`Activate`/`Copy`/`Rename`/`Insert`/`Annotate`/`Load*`/`Commit`/`CommitConfirmed`/`Rollback` route through `ensureWritableLocked()` and return `ErrClusterReadOnly` on a secondary, so a session opened before the node went secondary can no longer Set+Commit and diverge the standby. The internal convergence paths (`SyncApply`, `PromoteRollback`) promote `active`/`compiled` directly and are deliberately **not** gated.
 - **`SyncApply(content string, chassisPreserve func(*ConfigTree)) (*Config, error)`** — bypasses read-only checks for applying config received from primary
   - Parses config text, calls optional `chassisPreserve` callback to patch tree before compilation
   - Pushes current active to history, promotes new tree, persists to DB
