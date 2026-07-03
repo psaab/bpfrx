@@ -28969,3 +28969,37 @@ top.
   removed inline write from applySystemLogin), pkg/daemon/daemon_apply.go
   (step 11b reconcileSudoers call), pkg/daemon/daemon_sudoers_reconcile_3889_test.go
   (new, 4 tests), docs/system-login.md (#3889 revocation section)
+
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3895 — bound the router-advertisement lifetimes at commit and
+  make the RA sender robust to an un-marshalable option, so an over-large
+  PREF64/router/prefix lifetime can no longer blackhole IPv6 on a segment.
+  Defect: the whole RA is built and sent in a single `conn.WriteTo`, which
+  marshals every option; a PREF64 scaled-lifetime > 8191 (RFC 8781 §4 13-bit
+  scaled-by-8, `8191*8 = 65528s`) makes `ndp.PREF64.marshal` FAIL and aborts
+  the ENTIRE advertisement — the segment silently stops receiving RAs and
+  hosts lose their default route / SLAAC when the current RAs expire. #2497
+  typed these lifetime leaves but left them UNBOUNDED (ValidateIntegerMin(0)).
+  Fix (a) commit gate (`pkg/config/schema_routing.go`): bound
+  `nat-prefix`/`nat64prefix lifetime` to [0, 65528] (RFC 8781), `default-lifetime`
+  to [1, 65535] (RFC 4861 §4.2 16-bit; a larger value silently wraps in
+  `uint16(lifetime)` — 65536 → 0 = "not a default router"), and prefix
+  `valid-/preferred-lifetime` to [0, 4294967295] (RFC 4861 §4.6.2 32-bit).
+  Fix (b) sender robustness (`pkg/ra/sender.go`): `buildRA` now calls
+  `pruneUnmarshalableOptions`, which probes each option through
+  `ndp.MarshalMessage` (the same encoder `conn.WriteTo` uses) and LOGS+DROPS
+  any that fail so the rest of the RA still goes out — defense-in-depth for a
+  config that predates the bound (loaded `active.json`). RED-on-revert:
+  reverting the PREF64 validator to min-only made
+  `TestSchema3895_PREF64Lifetime_RejectsOverlarge` FAIL (no commit error);
+  reverting the `buildRA` prune call made `TestBuildRA_3895_PruneOverlargePREF64`
+  FAIL with `ndp: pref64 scaled lifetime is too large` (RA marshal aborts).
+  Validation: `go test ./pkg/ra/... ./pkg/config/...` green; `go build ./...`
+  clean; gofmt + vet clean.
+- **File(s)**: pkg/config/schema_routing.go (raPREF64/Router/Prefix
+  MaxLifetimeSeconds consts + 5 leaf validators), pkg/ra/sender.go
+  (pruneUnmarshalableOptions + buildRA call), pkg/config/schema_validate_3895_test.go
+  (new, 6 tests), pkg/ra/sender_marshal_3895_test.go (new, 4 tests),
+  pkg/ra/README.md (#3895 gotcha)
