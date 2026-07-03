@@ -786,6 +786,12 @@ func ValidateConfig(cfg *Config) []string {
 	// commit time so the operator sees it before applying.
 	warnings = append(warnings, validateRoutingRuleWindowWarnings(cfg)...)
 
+	// #3876: warn when an interface-routes rib-group import cannot be fully
+	// realized by the Phase-1 per-prefix leak (no enumerable static connected
+	// prefix, or a VRF→VRF import target that Phase 1 does not install) so the
+	// operator sees a fail-loud diagnostic rather than a silent no-op.
+	warnings = append(warnings, validateRibGroupLeakWarnings(cfg)...)
+
 	// #1387: DHCP dynamic-DNS live-backend validation. Increment 2 wired the
 	// live RFC 2136 backend, so the increment-1 "no records are published"
 	// deferred-backend warning is retired. The warnings here flag a config
@@ -1805,28 +1811,110 @@ func validateRoutingRuleWindowWarnings(cfg *Config) []string {
 			nextTableRoutes, nextTableWindow))
 	}
 
-	// rib-group: the applier walks routing-instances and programs two ip
-	// rules (v4+v6) per source table that references an interface-routes
-	// rib-group. Window of 100 priorities fits 50 such tables.
-	const ribGroupTableLimit = 50
-	ribGroupInstances := 0
-	for _, inst := range cfg.RoutingInstances {
-		if inst == nil {
-			continue
-		}
-		if inst.InterfaceRoutesRibGroup != "" || inst.InterfaceRoutesRibGroupV6 != "" {
-			ribGroupInstances++
-		}
+	// rib-group (#3876): the applier now programs one ip rule PER CONNECTED
+	// PREFIX of each source instance whose interface-routes rib-group imports
+	// the main table, into a fixed window of maxRibGroupLeakRules (1000)
+	// priorities that clear() scans. Count the connected prefixes the applier
+	// would leak and warn if they exceed the window (an over-count against
+	// pkg/routing.maxRibGroupLeakRules — kept in lockstep here).
+	const ribGroupLeakLimit = 1000
+	leakPrefixes := 0
+	for _, prefixes := range RibGroupConnectedPrefixes(cfg) {
+		leakPrefixes += len(prefixes)
 	}
-	if ribGroupInstances > ribGroupTableLimit {
+	if leakPrefixes > ribGroupLeakLimit {
 		warnings = append(warnings, fmt.Sprintf(
-			"routing-options: %d routing-instances reference an interface-routes "+
-				"rib-group, but only %d leaking tables can be programmed as ip rules "+
-				"(two priorities each); instances beyond the limit will be ignored at "+
-				"apply time. Reduce the number of rib-group-leaking instances.",
-			ribGroupInstances, ribGroupTableLimit))
+			"routing-options: interface-routes rib-group would leak %d connected "+
+				"prefixes as ip rules, but only %d can be programmed; prefixes beyond "+
+				"the limit will be ignored at apply time. Reduce the number of "+
+				"rib-group-leaked interface prefixes.",
+			leakPrefixes, ribGroupLeakLimit))
 	}
 
+	return warnings
+}
+
+// validateRibGroupLeakWarnings emits commit-time warnings for
+// interface-routes rib-group imports the #3876 Phase-1 per-prefix leak
+// cannot fully realize, so the operator sees a fail-loud diagnostic instead
+// of a silent no-op:
+//
+//   - A source instance whose rib-group imports the main table but has NO
+//     enumerable static connected prefix (DHCP-only / unaddressed member
+//     interfaces): the leak installs no ip rule because there is no static
+//     prefix to enumerate at commit. (Runtime route-copy for dynamically
+//     learned addresses is the deferred Phase-2 mechanism.)
+//   - A rib-group importing a NON-MAIN (VRF→VRF) rib: Phase 1 leaks only into
+//     the main table; a VRF→VRF import target is not yet installed (Phase 2).
+//
+// The strict import-rib reference gate
+// (validateRibGroupImportRibReferencesStrict) is unchanged; these are
+// additional non-fatal WARN diagnostics.
+func validateRibGroupLeakWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	ribGroups := cfg.RoutingOptions.RibGroups
+	if len(ribGroups) == 0 {
+		return nil
+	}
+	definedInstances := make(map[string]bool, len(cfg.RoutingInstances))
+	for _, ri := range cfg.RoutingInstances {
+		if ri != nil && ri.Name != "" {
+			definedInstances[ri.Name] = true
+		}
+	}
+	connected := RibGroupConnectedPrefixes(cfg)
+
+	var warnings []string
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.Name == "" {
+			continue
+		}
+		// Classify the union of this instance's v4 + v6 rib-group imports.
+		importsMain := false
+		var vrfTargets []string
+		seenVRF := make(map[string]bool)
+		for _, rgName := range []string{ri.InterfaceRoutesRibGroup, ri.InterfaceRoutesRibGroupV6} {
+			if rgName == "" {
+				continue
+			}
+			rgDef, ok := ribGroups[rgName]
+			if !ok {
+				continue // unknown group — the reference gate/warn covers it
+			}
+			for _, ribName := range rgDef.ImportRibs {
+				switch ribTargetKind(ribName, ri.Name, definedInstances) {
+				case "main":
+					importsMain = true
+				case "vrf":
+					if !seenVRF[ribName] {
+						seenVRF[ribName] = true
+						vrfTargets = append(vrfTargets, ribName)
+					}
+				}
+			}
+		}
+
+		if importsMain && len(connected[ri.Name]) == 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"routing-instance %q: interface-routes rib-group imports the main "+
+					"table but the instance has no enumerable static connected prefix "+
+					"(DHCP-only or unaddressed member interfaces); no leak ip rule is "+
+					"installed. Configure a static interface address to leak, or note "+
+					"that dynamically learned addresses are not leaked (Phase 2).",
+				ri.Name))
+		}
+		if len(vrfTargets) > 0 {
+			sort.Strings(vrfTargets)
+			warnings = append(warnings, fmt.Sprintf(
+				"routing-instance %q: interface-routes rib-group imports non-main "+
+					"rib(s) [%s] (VRF→VRF import); this is not yet installed and takes "+
+					"no effect — only imports into the main table (inet.0/inet6.0) leak "+
+					"interface routes today (Phase 2 deferral).",
+				ri.Name, strings.Join(vrfTargets, ", ")))
+		}
+	}
 	return warnings
 }
 

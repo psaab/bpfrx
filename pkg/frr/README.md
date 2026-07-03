@@ -117,6 +117,41 @@ also carries operator content:
   interfaces and no qualifier the next-hop is genuinely ambiguous — the
   inference refuses to guess (leaves it unresolved) rather than route to the
   wrong link, and the operator must add an interface qualifier.
+- **Static `next-hop [ a b ]` ECMP list (#3872).** A static route's
+  `next-hop [ gw1 gw2 ]` is the canonical Junos ECMP spelling — multiple
+  next-hops = equal-cost multipath. The schema `next-hop` leaf is `multi:
+  true, valueList: true` (`schema_routing.go`) so the bracket list collapses
+  onto one leaf in both AST shapes, and the compiler
+  (`compileStaticRoutes`) reads EVERY gateway from `Keys[1:]` (plus separate
+  `next-hop` statements). Each gateway becomes a `NextHopEntry`, and
+  `generateStaticRouteInTable` emits one `ip route` line per next-hop → FRR
+  installs equal-cost multipath. Before #3872 the leaf was a plain container
+  and the compiler read a single address, so `next-hop [ a b ]` silently
+  installed only the first gateway. A plain list carries NO per-next-hop
+  preference (all equal-cost) — kept distinct from the floating
+  `qualified-next-hop` backup below.
+- **Floating static via `qualified-next-hop` (#3871).** A static route's
+  `qualified-next-hop <gw> { preference N; metric M; }` is the Junos floating-
+  static idiom — a primary next-hop plus a LESS-preferred backup that installs
+  only when the primary is down. `generateStaticRouteInTable` renders each
+  next-hop with its OWN admin distance: a next-hop carrying a per-next-hop
+  preference (`NextHopEntry.HasPreference`, set by the compiler from the
+  qualified-next-hop's `preference` child/inline key) uses that distance; a
+  plain next-hop uses the route-level `StaticRoute.Preference` (default 5). So
+  `next-hop 10.0.0.1` + `qualified-next-hop 10.0.0.2 preference 250` emits
+  `ip route <dst> 10.0.0.1 5` and `ip route <dst> 10.0.0.2 250` — FRR installs
+  the distance-5 primary and floats the distance-250 backup in only when the
+  primary's next-hop is unresolvable. Before #3871 the qualified preference was
+  folded into a single route-level `Preference`, so every next-hop rendered at
+  equal cost and the floating static became equal-cost ECMP that load-balanced
+  over the backup. A plain `next-hop [ a b ]` bracket LIST is equal-cost ECMP
+  (#3872) — kept distinct: no per-next-hop preference. FRR's static-route CLI
+  has no metric field, so `NextHopEntry.Metric` is carried in the typed config
+  (parity/display) but not emitted — the floating behavior is entirely the
+  per-next-hop distance. A metric-ONLY `qualified-next-hop <gw> { metric M; }`
+  (no `preference`) therefore does NOT float: with `HasPreference == false` it
+  renders at the route-level distance, equal-cost with the primary — a
+  `preference` is REQUIRED to make a qualified-next-hop a floating backup.
 - **VRRP-VIP-only subnets (#2452 secondary).** A bondless-RETH member that
   carries only a VRRP virtual address (no matching `unit.Addresses` entry)
   also contributes its VIP subnet as a connected prefix, so a static
@@ -161,6 +196,20 @@ also carries operator content:
   the FRR-invalid `redistribute direct`, failing the reload) — matching the
   policy-term `FromProtocols` normalization and keeping the commit gate's
   acceptance of `direct` honest.
+- **BGP local-AS resolves from `routing-options autonomous-system` (#3870).**
+  `generateProtocols` gates the `router bgp <N>` block on `BGPConfig.LocalAS
+  > 0`, and ONLY `protocols bgp local-as` populated `LocalAS`. A canonical
+  vSRX config that declares the AS at the global `routing-options
+  autonomous-system <N>` (the standard Junos placement) — with `protocols
+  bgp` but no `local-as` — therefore rendered NO `router bgp` block at all,
+  silently, and BGP never came up. `resolveBGPAutonomousSystem`
+  (`compiler_routing.go`), run once after the whole tree compiles (so
+  `routing-options` and `protocols` may appear in either order), fills
+  `LocalAS` from the global `autonomous-system` when `local-as` was omitted;
+  `local-as` still WINS when present (Junos precedence). A per-routing-instance
+  BGP without `local-as` inherits the instance's own `routing-options
+  autonomous-system` if set, else the global one. No AS anywhere leaves
+  `LocalAS == 0` and renders no `router bgp`, unchanged.
 - **A BGP neighbor's peer-as (remote-as) is validated at commit (#2963).**
   `peer-as` is optional in the parser/compiler, so a neighbor authored
   without one (and without an inherited group `peer-as`) keeps a zero

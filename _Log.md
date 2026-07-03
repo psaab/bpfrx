@@ -1,3 +1,55 @@
+## 2026-07-03 — #3876: rib-group interface-route import was a no-op (shadowed by default route) — per-prefix leak before main
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-016 (HIGH, advertised feature no-op). The
+    rib-group `interface-routes` import installed `ip rule from all lookup
+    <sourceTable> pref 33000`, which sat AFTER main (32766) so any main-table
+    default route shadowed it (silent no-op in every real deployment) AND leaked
+    the WHOLE source table (over-broad vs Junos, which leaks only connected
+    routes). The Dst-less rule was also skipped by the userspace snapshot builder
+    → leak absent from BOTH FIBs. Implemented CONVERGED PLAN Option 2 (per-prefix
+    dst-rules), Phase 1 (import into main).
+  - **Fix**: Replaced the blanket rule with one `ip rule to <connected-prefix>
+    lookup <sourceTable> pref 30000` per connected prefix of the source
+    instance (band 30000-30999, BEFORE main + PBR). Specific imported prefixes
+    now win over the default route. The per-prefix rules carry a Dst, so the
+    existing userspace snapshot loop (routes.go, rule.Dst != nil → table→instance
+    NextTable) auto-captures them into inet.0 — the leak is now in both FIBs; the
+    Dst==nil skip is unchanged (a from-all rule can't be a per-prefix leak).
+    clear() now scans the new 30000-30999 window PLUS the legacy 33000-33099
+    blanket + 200-299 windows so an in-place upgrade removes the stale broken
+    blanket rule. Connected prefixes derived via new SSOT
+    `config.RibGroupConnectedPrefixes` / `config.ConnectedNetworkPrefix` (shared
+    with the userspace FIB connected-route builder), plumbed through
+    `ApplyRibGroupRules` from daemon_apply.go step 3c. Cap
+    `maxRibGroupLeakRules = 1000` with degraded-Apply error. Commit-time WARNs
+    (validateRibGroupLeakWarnings) fail-loud on the un-leakable residuals:
+    DHCP-only / unaddressed source (no enumerable static prefix) and VRF→VRF
+    import targets (Phase 2 deferral). Window warn updated to the per-prefix
+    budget. Route-copy (Option 1) + VRF→VRF install deferred (warned).
+  - **File(s)**: `pkg/routing/rules.go` (per-prefix Apply + ribGroupLeaksIntoMain
+    + splitConnectedPrefixesByFamily + clear() 3-window + constants),
+    `pkg/routing/routing.go` (ApplyRibGroupRules signature),
+    `pkg/config/types_routing.go` (ConnectedNetworkPrefix),
+    `pkg/config/compiler_routing.go` (RibGroupConnectedPrefixes + ribTargetKind),
+    `pkg/config/compiler_validate_warn.go` (validateRibGroupLeakWarnings +
+    per-prefix window warn), `pkg/dataplane/userspace/routes.go` (shared helper
+    + Dst==nil comment), `pkg/daemon/daemon_apply.go` (plumb prefixes),
+    `pkg/routing/rules_test.go`, `pkg/config/compiler_routing_rules_test.go`,
+    `pkg/config/ribgroup_leak_warn_3876_test.go`,
+    `pkg/dataplane/userspace/routes_ribgroup_leak_3876_test.go` (tests),
+    `docs/rib-group-route-leaking.md`, `docs/feature-coverage.md` (docs).
+  - **Validation**: `go build ./...`; `go test ./pkg/routing/... ./pkg/config/...
+    ./pkg/dataplane/... ./pkg/daemon/...` green; gofmt + vet clean. RED-on-revert
+    verified for all four legs: (a) moving the band to 33000 (after main) fails
+    the pref<32766 assertion; (b) Dst-bearing capture + Dst-less skip pinned in
+    userspace snapshot tests; (c) dropping the 33000 window from clear() leaves
+    the stale blanket rule; (d) neutering the warn drops the VRF→VRF /
+    no-enumerable-prefix diagnostics. Cluster forwarding smoke (iperf through a
+    leaked path with a default route present) NOT run — flagged for operator
+    validation; test-failover not required (routing/forwarding only, no
+    session-sync/VRRP path).
+
 ## 2026-07-03 — #3863: WireGuard tunnel local identity never validated at commit (HIGH silent VPN outage)
 
 - **Timestamp**: 2026-07-03
@@ -28529,6 +28581,76 @@ top.
   docs/deterministic-nat-cgnat.md (/22→/25 fix + hier example + grouping +
   impl map), docs/config-schema.md (port now modeled note)
 
+## 2026-07-03 — routing: BGP AS fallback + floating qualified-next-hop + next-hop ECMP list (#3870/#3871/#3872)
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3870 (F-009) — BGP `router bgp` gated on `BGPConfig.LocalAS > 0`
+  (policy_render.go) which only `protocols bgp local-as` set, so the canonical
+  vSRX placement `routing-options autonomous-system <N>` + `protocols bgp`
+  rendered NO BGP at all, silently. FIX: `resolveBGPAutonomousSystem(cfg)` in
+  compiler_routing.go, called post-child-loop in compiler.go (order-independent),
+  fills LocalAS from the global autonomous-system when local-as is omitted;
+  local-as still wins; per-instance BGP inherits the instance's own
+  routing-options AS if set else the global one (new
+  RoutingInstanceConfig.AutonomousSystem field). RED-on-revert PROVEN: without
+  the resolver LocalAS=0 (no `router bgp`); local-as-override + no-AS cases stay
+  GREEN (pre-existing behavior).
+- **File(s)**: pkg/config/compiler.go (post-loop resolver call),
+  pkg/config/compiler_routing.go (resolveBGPAutonomousSystem + capture instance
+  AS), pkg/config/types_routing.go (RoutingInstanceConfig.AutonomousSystem),
+  pkg/config/compiler_bgp_as_3870_test.go (new, 4 tests), pkg/frr/README.md
+
+## 2026-07-03 — #3871 (F-008): floating qualified-next-hop per-NH preference/metric
+
+- **Timestamp**: 2026-07-03
+- **Action**: A static `qualified-next-hop <gw> { preference N; metric M; }`
+  (Junos floating static) had its per-NH preference/metric dropped (folded to a
+  single route-level Preference), so config_render rendered all next-hops at
+  equal cost → floating static became equal-cost ECMP over the backup. FIX:
+  carry Preference/HasPreference/Metric/HasMetric PER-NextHopEntry
+  (types_routing.go); compiler reads qualified-next-hop preference/metric from
+  children + inline keys (compiler_routing.go, both the hierarchical-children
+  handler and the fully-inline route-keys branch); renderer emits each next-hop
+  at its own admin distance (config_render.go — primary at route-level 5,
+  qualified at 250). FRR installs the lower-distance primary and floats the
+  backup in only when the primary is down. Metric carried but NOT rendered (FRR
+  static CLI has no metric field). Plain next-hop list stays equal-cost ECMP
+  (no per-NH preference) — distinct from the floating backup. RED-on-revert
+  PROVEN: renderer revert → both at distance 5; compiler revert → qualified
+  HasPreference/HasMetric false.
+- **File(s)**: pkg/config/types_routing.go (NextHopEntry per-NH pref/metric),
+  pkg/config/compiler_routing.go (qualified-next-hop parse, 2 shapes),
+  pkg/frr/config_render.go (per-NH distance),
+  pkg/config/compiler_qualified_nexthop_3871_test.go (new, 2 tests),
+  pkg/frr/static_floating_3871_test.go (new, 2 tests), pkg/frr/README.md
+
+## 2026-07-03 — #3872 (F-010): static next-hop bracket list = ECMP multipath
+
+- **Timestamp**: 2026-07-03
+- **Action**: A static route `next-hop [ gw1 gw2 ]` (canonical Junos ECMP)
+  collapsed to a single next-hop — the schema leaf was not multi and the
+  compiler read one address — so multipath was silently lost. FIX: make the
+  next-hop leaf `multi: true, valueList: true` (schema_routing.go) so the
+  bracket list collapses onto one leaf (Keys=[next-hop gw1 gw2]) in both AST
+  shapes; the compiler reads Keys[1:] and installs every gateway equal-cost
+  (compiler_routing.go, children handler + inline branch + isRouteInlineKeyword
+  helper). NEW schemaNode.valueList flag + ast_edit.go absorber change: a multi
+  leaf WITH modifier children absorbs a value list ONLY when it opts in
+  (valueList) — so the many CoS multi+children named containers are UNCHANGED
+  (a broad absorber change first broke TestValidateCoSOversubscription*; the
+  surgical flag fixed it). The `interface` modifier child still walks for the
+  IPv6 link-local single-gateway form. Composes with #3871: plain list =
+  equal-cost (no per-NH preference), qualified-next-hop = floating backup.
+  RED-on-revert PROVEN: reverting the multi/valueList schema collapses the
+  bracket list to only the first gateway; single next-hop + interface-modifier
+  + block-parse forms stay GREEN. Full `go test ./...` green.
+- **File(s)**: pkg/config/schema.go (valueList field),
+  pkg/config/ast_edit.go (valueList-gated child-aware absorber),
+  pkg/config/schema_routing.go (next-hop multi+valueList),
+  pkg/config/compiler_routing.go (multi-address read + isRouteInlineKeyword),
+  pkg/config/compiler_static_nexthop_list_3872_test.go (new, 5 tests),
+  pkg/frr/static_ecmp_list_3872_test.go (new), docs/config-schema.md,
+  pkg/frr/README.md
 ## 2026-07-03
 
 - **Timestamp**: 2026-07-03 14:35
@@ -28612,3 +28734,34 @@ top.
   userspace-dp/src/event_stream/producer_tests.rs (1 new test),
   userspace-dp/src/event_stream/README.md (#3878 seq-atomicity gotcha + #2874
   bullet update), docs/session-sync-design.md (seq/enqueue atomicity note)
+## 2026-07-03 — PR #3879 hostile-review folds: #3872 delete-side + 2 MINORs
+
+- **Timestamp**: 2026-07-03
+- **Action**: MAJOR (delete-side fail-wide, the #3846 class the PR cites). The
+  read/render side of #3872 next-hop ECMP was fixed but the DELETE side was
+  not: the removeMultiLeafMembers gate was `multi && children == nil && args
+  == 1`, and next-hop has an `interface` child so it was EXCLUDED → fell
+  through to removeMatchingNode (prefix match) → `delete ... next-hop <gw>` on
+  a `[ a b ]` list deleted the WHOLE leaf → route left with 0 next-hops → FRR
+  rendered Null0 (blackholed the healthy path); a non-first member was
+  undeletable. FIX: (1) gate flip `multi && (children == nil || valueList) &&
+  args == 1` mirroring the read side; (2) removeMultiLeafMembers gains a
+  modifierChildren param — for a valueList node the children are MODIFIERS of
+  the gateway (not droppable members), and dropping the last gateway removes
+  the WHOLE entry (gateway + interface) rather than a gateway-less container;
+  (3) renderer emits Null0 ONLY for an explicit `discard` — a non-discard
+  0-next-hop route renders NOTHING (not a Null0 blackhole). MINOR 1: doc that a
+  metric-only qualified-next-hop (no preference) does NOT float (FRR statics
+  have no metric field). MINOR 2: fixed the stale schema comment that said the
+  qualified preference "folds into route.Preference" (#3871 removed that fold).
+  RED-on-revert PROVEN: reverting the gate → whole leaf deleted (0 next-hops) +
+  non-first undeletable; reverting the renderer → 0-next-hop route renders
+  Null0. Full go test ./pkg/config/... ./pkg/frr/... green. NOTE: pre-existing
+  master canary failure TestNoDirectOsWriteFile (daemon_flow.go archiveConfig,
+  from master #9d14a1720) is unrelated to this PR.
+- **File(s)**: pkg/config/ast_edit.go (delete gate flip + removeMultiLeafMembers
+  modifierChildren), pkg/frr/config_render.go (Null0 only for discard),
+  pkg/config/schema_routing.go (MINOR 2 stale comment + metric note),
+  pkg/frr/README.md (MINOR 1 metric-only-doesn't-float),
+  pkg/config/delete_static_nexthop_3872_test.go (new, 5 tests),
+  pkg/frr/static_empty_route_3872_test.go (new, 2 tests)

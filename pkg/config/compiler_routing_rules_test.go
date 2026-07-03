@@ -1,15 +1,53 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
 
-// TestValidateRoutingRuleWindowWarnings covers the #1706 commit-time
-// warnings that pair with the applier's fixed next-table / rib-group
-// ip-rule priority windows. The warning fires only when the config
-// exceeds the window the applier can program; at or below the limit it
-// stays silent.
+// mkLeakingInstance builds a config with ONE routing-instance that imports
+// the main table via an interface-routes rib-group and carries n static
+// connected prefixes on its member interface unit. family selects v4 ("inet")
+// or v6 ("inet6") addresses (and the corresponding rib-group field), so the
+// #3876 per-prefix window warn can be exercised on either family.
+func mkLeakingInstance(n int, family string) *Config {
+	cfg := &Config{}
+	addrs := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		if family == "inet6" {
+			addrs = append(addrs, fmt.Sprintf("2001:db8:%x::1/64", i))
+		} else {
+			addrs = append(addrs, fmt.Sprintf("10.%d.%d.1/24", i/256, i%256))
+		}
+	}
+	cfg.Interfaces.Interfaces = map[string]*InterfaceConfig{
+		"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*InterfaceUnit{
+			0: {Number: 0, Addresses: addrs},
+		}},
+	}
+	cfg.RoutingOptions.RibGroups = map[string]*RibGroup{
+		"leak": {Name: "leak", ImportRibs: []string{"inet.0", "inet6.0"}},
+	}
+	ri := &RoutingInstanceConfig{
+		Name:       "dmz-vr",
+		TableID:    101,
+		Interfaces: []string{"ge-0/0/1.0"},
+	}
+	if family == "inet6" {
+		ri.InterfaceRoutesRibGroupV6 = "leak"
+	} else {
+		ri.InterfaceRoutesRibGroup = "leak"
+	}
+	cfg.RoutingInstances = []*RoutingInstanceConfig{ri}
+	return cfg
+}
+
+// TestValidateRoutingRuleWindowWarnings covers the commit-time warnings that
+// pair with the applier's fixed next-table / rib-group ip-rule priority
+// windows. The warning fires only when the config exceeds the window the
+// applier can program; at or below the limit it stays silent. The rib-group
+// window is now PER CONNECTED PREFIX (#3876, 1000-rule window).
 func TestValidateRoutingRuleWindowWarnings(t *testing.T) {
 	mkNextTableRoutes := func(n int) []*StaticRoute {
 		routes := make([]*StaticRoute, n)
@@ -17,13 +55,6 @@ func TestValidateRoutingRuleWindowWarnings(t *testing.T) {
 			routes[i] = &StaticRoute{Destination: "10.0.0.0/8", NextTable: "vr"}
 		}
 		return routes
-	}
-	mkRibGroupInstances := func(n int) []*RoutingInstanceConfig {
-		insts := make([]*RoutingInstanceConfig, n)
-		for i := range insts {
-			insts[i] = &RoutingInstanceConfig{InterfaceRoutesRibGroup: "leak"}
-		}
-		return insts
 	}
 
 	t.Run("next-table at limit is silent", func(t *testing.T) {
@@ -50,30 +81,29 @@ func TestValidateRoutingRuleWindowWarnings(t *testing.T) {
 	})
 
 	t.Run("rib-group at limit is silent", func(t *testing.T) {
-		cfg := &Config{RoutingInstances: mkRibGroupInstances(50)}
+		cfg := mkLeakingInstance(1000, "inet")
 		got := validateRoutingRuleWindowWarnings(cfg)
 		if len(got) != 0 {
-			t.Fatalf("expected no warning at 50 rib-group instances, got %v", got)
+			t.Fatalf("expected no warning at 1000 leaked prefixes, got %v", got)
 		}
 	})
 
 	t.Run("rib-group over limit warns", func(t *testing.T) {
-		cfg := &Config{RoutingInstances: mkRibGroupInstances(51)}
+		cfg := mkLeakingInstance(1001, "inet")
 		got := validateRoutingRuleWindowWarnings(cfg)
 		if len(got) != 1 || !strings.Contains(got[0], "rib-group") {
 			t.Fatalf("expected a rib-group over-limit warning, got %v", got)
 		}
-		if !strings.Contains(got[0], "51") {
-			t.Errorf("warning should report the count 51, got %q", got[0])
+		if !strings.Contains(got[0], "1001") {
+			t.Errorf("warning should report the prefix count 1001, got %q", got[0])
 		}
 	})
 
 	t.Run("instances with no rib-group reference are not counted", func(t *testing.T) {
-		insts := make([]*RoutingInstanceConfig, 60)
-		for i := range insts {
-			insts[i] = &RoutingInstanceConfig{} // no rib-group reference
-		}
-		cfg := &Config{RoutingInstances: insts}
+		// An addressed instance with NO rib-group reference contributes no
+		// leaked prefixes and must not warn.
+		cfg := mkLeakingInstance(1001, "inet")
+		cfg.RoutingInstances[0].InterfaceRoutesRibGroup = ""
 		got := validateRoutingRuleWindowWarnings(cfg)
 		if len(got) != 0 {
 			t.Fatalf("instances without a rib-group reference must not warn, got %v", got)
@@ -81,11 +111,7 @@ func TestValidateRoutingRuleWindowWarnings(t *testing.T) {
 	})
 
 	t.Run("v6-only rib-group reference is counted", func(t *testing.T) {
-		insts := make([]*RoutingInstanceConfig, 51)
-		for i := range insts {
-			insts[i] = &RoutingInstanceConfig{InterfaceRoutesRibGroupV6: "leak6"}
-		}
-		cfg := &Config{RoutingInstances: insts}
+		cfg := mkLeakingInstance(1001, "inet6")
 		got := validateRoutingRuleWindowWarnings(cfg)
 		if len(got) != 1 || !strings.Contains(got[0], "rib-group") {
 			t.Fatalf("expected a rib-group over-limit warning for v6-only refs, got %v", got)
@@ -99,14 +125,10 @@ func TestValidateRoutingRuleWindowWarnings(t *testing.T) {
 // ValidateConfig were dropped, the operator would lose the warning even
 // though the helper-level tests above still pass.
 func TestValidateConfigSurfacesRoutingRuleWindowWarnings(t *testing.T) {
-	cfg := &Config{}
+	cfg := mkLeakingInstance(1001, "inet")
 	for i := 0; i < 101; i++ {
 		cfg.RoutingOptions.StaticRoutes = append(cfg.RoutingOptions.StaticRoutes,
 			&StaticRoute{Destination: "10.0.0.0/8", NextTable: "vr"})
-	}
-	for i := 0; i < 51; i++ {
-		cfg.RoutingInstances = append(cfg.RoutingInstances,
-			&RoutingInstanceConfig{InterfaceRoutesRibGroup: "leak"})
 	}
 
 	warnings := ValidateConfig(cfg)

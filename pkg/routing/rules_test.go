@@ -129,11 +129,26 @@ func (f *fakeRuleOps) hasTable(family, table int) bool {
 	return false
 }
 
+// findDstRule returns the first rule in the family whose table and masked
+// destination prefix match — the #3876 per-prefix leak rule shape.
+func (f *fakeRuleOps) findDstRule(family, table int, dst string) (netlink.Rule, bool) {
+	for _, r := range f.rules[family] {
+		if r.Table == table && r.Dst != nil && r.Dst.String() == dst {
+			return r, true
+		}
+	}
+	return netlink.Rule{}, false
+}
+
 // TestRibGroupRulesApply_Fake exercises ribGroupManager over a fake
-// ruleOps, asserting the leak rules are programmed for the source table
-// — the exact ip-rule-creation path the old test suite could not reach
-// without netlink. Constructs the domain manager directly, NOT the whole
-// routing.Manager.
+// ruleOps, asserting the #3876 PER-PREFIX leak rules are programmed for the
+// source table. Each rule must carry a Dst (the connected prefix) and sit at
+// a priority BEFORE the main table (< 32766) so a specific imported prefix
+// wins over a main-table default route.
+//
+// RED-on-revert: reverting to the pre-#3876 `from all lookup <sourceTable>
+// pref 33000` blanket rule makes this fail — the rule carries no Dst
+// (findDstRule misses) and sits at 33000 > 32766 (shadowed by default).
 func TestRibGroupRulesApply_Fake(t *testing.T) {
 	ops := newFakeRuleOps()
 	rg := &ribGroupManager{ops: ops}
@@ -150,20 +165,40 @@ func TestRibGroupRulesApply_Fake(t *testing.T) {
 	}
 	instances := []*config.RoutingInstanceConfig{
 		{Name: "tunnel-vr", TableID: 100, InterfaceRoutesRibGroup: "self-only"},
-		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "dmz-leak"},
+		{Name: "dmz-vr", TableID: 101,
+			InterfaceRoutesRibGroup:   "dmz-leak",
+			InterfaceRoutesRibGroupV6: "dmz-leak"},
+	}
+	connected := map[string][]string{
+		"dmz-vr": {"10.0.30.0/24", "2001:db8:30::/64"},
+		// tunnel-vr present but must not leak (self-only imports no main rib).
+		"tunnel-vr": {"10.0.99.0/24"},
 	}
 
-	if err := rg.Apply(ribGroups, instances); err != nil {
+	if err := rg.Apply(ribGroups, instances, connected); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	// dmz-vr (table 101) leaks → one IPv4 + one IPv6 rule for table 101.
-	if !ops.hasTable(unix.AF_INET, 101) {
-		t.Errorf("expected IPv4 leak rule for table 101, rules=%v", ops.rules[unix.AF_INET])
+	// dmz-vr (table 101) leaks its connected prefixes into main → one
+	// per-prefix rule per family, each with a Dst, each BEFORE main.
+	v4, ok := ops.findDstRule(unix.AF_INET, 101, "10.0.30.0/24")
+	if !ok {
+		t.Fatalf("expected IPv4 per-prefix leak rule to 10.0.30.0/24 table 101, rules=%v", ops.rules[unix.AF_INET])
 	}
-	if !ops.hasTable(unix.AF_INET6, 101) {
-		t.Errorf("expected IPv6 leak rule for table 101, rules=%v", ops.rules[unix.AF_INET6])
+	if v4.Priority >= 32766 {
+		t.Errorf("IPv4 leak rule pref %d must be BEFORE main (32766) so it wins over a default route (#3876)", v4.Priority)
 	}
+	if v4.Priority < ribGroupLeakRulePriority || v4.Priority >= ribGroupLeakRulePriority+maxRibGroupLeakRules {
+		t.Errorf("IPv4 leak rule pref %d outside the #3876 window [%d,%d)", v4.Priority, ribGroupLeakRulePriority, ribGroupLeakRulePriority+maxRibGroupLeakRules)
+	}
+	v6, ok := ops.findDstRule(unix.AF_INET6, 101, "2001:db8:30::/64")
+	if !ok {
+		t.Fatalf("expected IPv6 per-prefix leak rule to 2001:db8:30::/64 table 101, rules=%v", ops.rules[unix.AF_INET6])
+	}
+	if v6.Priority >= 32766 {
+		t.Errorf("IPv6 leak rule pref %d must be BEFORE main (32766)", v6.Priority)
+	}
+
 	// tunnel-vr (self-only) must NOT produce a leak rule for table 100.
 	if ops.hasTable(unix.AF_INET, 100) {
 		t.Errorf("self-only should not leak table 100, rules=%v", ops.rules[unix.AF_INET])
@@ -175,7 +210,7 @@ func TestRibGroupRulesApply_Fake(t *testing.T) {
 	// Re-applying must clear the prior rules first (clear-then-add), so
 	// the rule count stays stable rather than doubling.
 	prevAdds := ops.adds
-	if err := rg.Apply(ribGroups, instances); err != nil {
+	if err := rg.Apply(ribGroups, instances, connected); err != nil {
 		t.Fatalf("Apply (second): %v", err)
 	}
 	if got := ops.count(unix.AF_INET); got != 1 {
@@ -186,6 +221,49 @@ func TestRibGroupRulesApply_Fake(t *testing.T) {
 	}
 	if ops.adds <= prevAdds {
 		t.Error("expected re-apply to re-add rules")
+	}
+}
+
+// TestRibGroupUpgradeCleanupRemovesLegacyBlanket is the #3876 upgrade-cleanup
+// guard. A pre-#3876 binary left an `ip rule from all lookup <sourceTable>
+// pref 33000` blanket rule in the kernel. On the first apply after upgrade,
+// clear() MUST remove that stale rule (its window is scanned) so the box is
+// not left with the broken blanket rule alongside the new per-prefix rules.
+//
+// RED-on-revert: dropping the [33000,33100) (old-blanket) window from clear()
+// leaves the seeded rule behind.
+func TestRibGroupUpgradeCleanupRemovesLegacyBlanket(t *testing.T) {
+	ops := newFakeRuleOps()
+	// Seed a stale pre-#3876 blanket rule (from all lookup 101 pref 33000).
+	seedRule(ops, unix.AF_INET, ribGroupRulePriority, 101)
+	seedRule(ops, unix.AF_INET6, ribGroupRulePriority, 101)
+	// And an even older legacy-window rule (pref 200).
+	seedRule(ops, unix.AF_INET, 200, 101)
+
+	rg := &ribGroupManager{ops: ops}
+	ribGroups := map[string]*config.RibGroup{
+		"dmz-leak": {Name: "dmz-leak", ImportRibs: []string{"inet.0"}},
+	}
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "dmz-leak"},
+	}
+	connected := map[string][]string{"dmz-vr": {"10.0.30.0/24"}}
+
+	if err := rg.Apply(ribGroups, instances, connected); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// The stale pref-33000 blanket rules and the pref-200 legacy rule must be gone.
+	if hasPriority(ops, unix.AF_INET, ribGroupRulePriority) || hasPriority(ops, unix.AF_INET6, ribGroupRulePriority) {
+		t.Errorf("upgrade cleanup must remove the stale pref-%d blanket rules, rules v4=%v v6=%v",
+			ribGroupRulePriority, ops.rules[unix.AF_INET], ops.rules[unix.AF_INET6])
+	}
+	if hasPriority(ops, unix.AF_INET, 200) {
+		t.Errorf("upgrade cleanup must remove the legacy pref-200 rule, rules=%v", ops.rules[unix.AF_INET])
+	}
+	// The new per-prefix rule must be installed in the #3876 window.
+	if _, ok := ops.findDstRule(unix.AF_INET, 101, "10.0.30.0/24"); !ok {
+		t.Errorf("expected the new per-prefix leak rule after upgrade, rules=%v", ops.rules[unix.AF_INET])
 	}
 }
 
@@ -216,8 +294,11 @@ func TestRibGroupRulesApply_UnknownRibNoLeak(t *testing.T) {
 	instances := []*config.RoutingInstanceConfig{
 		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "typo-leak"},
 	}
+	// Even WITH connected prefixes available, an all-unknown rib-group must
+	// leak nothing (it imports no main rib → leakV4/leakV6 stay false).
+	connected := map[string][]string{"dmz-vr": {"10.0.30.0/24", "2001:db8:30::/64"}}
 
-	if err := rg.Apply(ribGroups, instances); err != nil {
+	if err := rg.Apply(ribGroups, instances, connected); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -257,16 +338,24 @@ func TestRibGroupRulesApply_DefinedRibStillLeaks(t *testing.T) {
 	}
 	instances := []*config.RoutingInstanceConfig{
 		{Name: "tunnel-vr", TableID: 100},
-		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "dmz-leak"},
+		{Name: "dmz-vr", TableID: 101,
+			InterfaceRoutesRibGroup:   "dmz-leak",
+			InterfaceRoutesRibGroupV6: "dmz-leak"},
+	}
+	connected := map[string][]string{
+		"dmz-vr": {"10.0.30.0/24", "2001:db8:30::/64"},
 	}
 
-	if err := rg.Apply(ribGroups, instances); err != nil {
+	if err := rg.Apply(ribGroups, instances, connected); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if !ops.hasTable(unix.AF_INET, 101) {
+	// The rib-group imports main (inet.0), so the per-prefix leak fires even
+	// though it ALSO names a VRF→VRF target (tunnel-vr.inet.0) that Phase 1
+	// does not install.
+	if _, ok := ops.findDstRule(unix.AF_INET, 101, "10.0.30.0/24"); !ok {
 		t.Errorf("defined import-rib must still leak table 101 (IPv4), rules=%v", ops.rules[unix.AF_INET])
 	}
-	if !ops.hasTable(unix.AF_INET6, 101) {
+	if _, ok := ops.findDstRule(unix.AF_INET6, 101, "2001:db8:30::/64"); !ok {
 		t.Errorf("defined import-rib must still leak table 101 (IPv6), rules=%v", ops.rules[unix.AF_INET6])
 	}
 }
@@ -283,17 +372,23 @@ func TestRibGroupRulesApply_DefinedRibStillLeaks(t *testing.T) {
 // makes every subtest go RED (Apply returns nil).
 func TestRibGroupApplyAggregatesAddErrors(t *testing.T) {
 	ribGroups := map[string]*config.RibGroup{
-		"dmz-leak": {Name: "dmz-leak", ImportRibs: []string{"inet.0"}}, // main 254 != source
+		"dmz-leak": {Name: "dmz-leak", ImportRibs: []string{"inet.0"}}, // imports main
 	}
 	instances := []*config.RoutingInstanceConfig{
-		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "dmz-leak"},
+		{Name: "dmz-vr", TableID: 101,
+			InterfaceRoutesRibGroup:   "dmz-leak",
+			InterfaceRoutesRibGroupV6: "dmz-leak"},
+	}
+	// One v4 + one v6 connected prefix → one v4 leak rule + one v6 leak rule.
+	connected := map[string][]string{
+		"dmz-vr": {"10.0.30.0/24", "2001:db8:30::/64"},
 	}
 
 	t.Run("v4-only", func(t *testing.T) {
 		ops := newFakeRuleOps()
 		ops.failAdd(unix.AF_INET, errors.New("netlink EPERM on v4"))
 		rg := &ribGroupManager{ops: ops}
-		if err := rg.Apply(ribGroups, instances); err == nil {
+		if err := rg.Apply(ribGroups, instances, connected); err == nil {
 			t.Fatal("Apply must return non-nil when the v4 leak rule fails (#3731)")
 		}
 		if ops.hasTable(unix.AF_INET, 101) {
@@ -308,7 +403,7 @@ func TestRibGroupApplyAggregatesAddErrors(t *testing.T) {
 		ops := newFakeRuleOps()
 		ops.failAdd(unix.AF_INET6, errors.New("netlink EPERM on v6"))
 		rg := &ribGroupManager{ops: ops}
-		if err := rg.Apply(ribGroups, instances); err == nil {
+		if err := rg.Apply(ribGroups, instances, connected); err == nil {
 			t.Fatal("Apply must return non-nil when the v6 leak rule fails (#3731)")
 		}
 		if !ops.hasTable(unix.AF_INET, 101) {
@@ -323,7 +418,7 @@ func TestRibGroupApplyAggregatesAddErrors(t *testing.T) {
 		ops := newFakeRuleOps()
 		ops.addErr = errors.New("netlink ENOBUFS")
 		rg := &ribGroupManager{ops: ops}
-		if err := rg.Apply(ribGroups, instances); err == nil {
+		if err := rg.Apply(ribGroups, instances, connected); err == nil {
 			t.Fatal("Apply must return non-nil when both leak rules fail (#3731)")
 		}
 		if ops.count(unix.AF_INET) != 0 || ops.count(unix.AF_INET6) != 0 {
@@ -503,79 +598,65 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 	})
 }
 
-// TestRibGroupRulesPriorityCap exercises the #1706 hard cap for rib-group
-// rules. Each leaking table consumes TWO priorities (v4+v6), so the
-// window of 100 priorities fits 50 tables. The 50th table must program at
-// slots 33098/33099 (the last in-range pair); the 51st must be rejected.
+// TestRibGroupRulesPriorityCap exercises the #3876 hard cap for the
+// per-prefix rib-group leak. One rule is programmed per connected prefix, and
+// the total is bounded by maxRibGroupLeakRules; prefixes beyond the window
+// must be dropped (with a degraded Apply error) and every programmed rule
+// must stay inside the window clear() scans so nothing leaks across applies.
 func TestRibGroupRulesPriorityCap(t *testing.T) {
-	mkConfig := func(n int) (map[string]*config.RibGroup, []*config.RoutingInstanceConfig) {
-		ribGroups := map[string]*config.RibGroup{}
-		instances := make([]*config.RoutingInstanceConfig, n)
-		for i := 0; i < n; i++ {
-			rgName := fmt.Sprintf("leak-%d", i)
-			// Import a different table than the source so needsLeak is true.
-			ribGroups[rgName] = &config.RibGroup{
-				Name:       rgName,
-				ImportRibs: []string{"inet.0"}, // main table 254 != source
-			}
-			instances[i] = &config.RoutingInstanceConfig{
-				Name:                    fmt.Sprintf("vr-%d", i),
-				TableID:                 1000 + i, // distinct source tables
-				InterfaceRoutesRibGroup: rgName,
-			}
+	// One instance leaking into main, with n distinct v4 connected prefixes.
+	mkConfig := func(n int) (map[string]*config.RibGroup, []*config.RoutingInstanceConfig, map[string][]string) {
+		ribGroups := map[string]*config.RibGroup{
+			"leak": {Name: "leak", ImportRibs: []string{"inet.0"}},
 		}
-		return ribGroups, instances
+		instances := []*config.RoutingInstanceConfig{
+			{Name: "leak-vr", TableID: 1000, InterfaceRoutesRibGroup: "leak"},
+		}
+		prefixes := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			prefixes = append(prefixes, fmt.Sprintf("10.%d.%d.0/24", i/256, i%256))
+		}
+		return ribGroups, instances, map[string][]string{"leak-vr": prefixes}
 	}
 
 	t.Run("at-limit", func(t *testing.T) {
 		ops := newFakeRuleOps()
 		rg := &ribGroupManager{ops: ops}
-		ribGroups, instances := mkConfig(50)
-		if err := rg.Apply(ribGroups, instances); err != nil {
+		ribGroups, instances, connected := mkConfig(maxRibGroupLeakRules)
+		if err := rg.Apply(ribGroups, instances, connected); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
-		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
-		if total != 100 {
-			t.Fatalf("expected 50 tables * 2 = 100 rules at the limit, got %d", total)
+		if got := ops.count(unix.AF_INET); got != maxRibGroupLeakRules {
+			t.Fatalf("expected exactly %d rules at the limit, got %d", maxRibGroupLeakRules, got)
 		}
-		assertAllRulesInRange(t, ops, ribGroupRulePriority, ribGroupRulePriority+100)
-		// The 50th (last admitted) table must occupy the final in-range
-		// pair: IPv4 at 33098, IPv6 at 33099.
-		if !hasPriority(ops, unix.AF_INET, ribGroupRulePriority+98) {
-			t.Errorf("expected IPv4 rule at the last in-range slot %d", ribGroupRulePriority+98)
-		}
-		if !hasPriority(ops, unix.AF_INET6, ribGroupRulePriority+99) {
-			t.Errorf("expected IPv6 rule at the last in-range slot %d", ribGroupRulePriority+99)
-		}
+		assertAllRulesInRange(t, ops, ribGroupLeakRulePriority, ribGroupLeakRulePriority+maxRibGroupLeakRules)
 	})
 
 	t.Run("over-limit", func(t *testing.T) {
 		ops := newFakeRuleOps()
 		rg := &ribGroupManager{ops: ops}
-		ribGroups, instances := mkConfig(60)
-		if err := rg.Apply(ribGroups, instances); err != nil {
-			t.Fatalf("Apply: %v", err)
+		ribGroups, instances, connected := mkConfig(maxRibGroupLeakRules + 25)
+		// Over-limit must surface a degraded Apply error (not swallowed).
+		if err := rg.Apply(ribGroups, instances, connected); err == nil {
+			t.Fatal("over-limit Apply must return a degraded error naming the cap")
 		}
-		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
-		if total != 100 {
-			t.Fatalf("expected cap to hold at 100 rules (50 tables), got %d", total)
+		if got := ops.count(unix.AF_INET); got != maxRibGroupLeakRules {
+			t.Fatalf("expected cap to hold at %d rules, got %d", maxRibGroupLeakRules, got)
 		}
-		assertAllRulesInRange(t, ops, ribGroupRulePriority, ribGroupRulePriority+100)
-		// The 51st table (would-be slots 33100/33101) must be absent.
-		if hasPriority(ops, unix.AF_INET, ribGroupRulePriority+100) ||
-			hasPriority(ops, unix.AF_INET6, ribGroupRulePriority+101) {
-			t.Errorf("51st table leaked beyond the cleared window (slot %d/%d present)",
-				ribGroupRulePriority+100, ribGroupRulePriority+101)
+		assertAllRulesInRange(t, ops, ribGroupLeakRulePriority, ribGroupLeakRulePriority+maxRibGroupLeakRules)
+		// The rule beyond the window (pref ribGroupLeakRulePriority+1000) must be absent.
+		if hasPriority(ops, unix.AF_INET, ribGroupLeakRulePriority+maxRibGroupLeakRules) {
+			t.Errorf("a rule leaked beyond the cleared window (slot %d present)",
+				ribGroupLeakRulePriority+maxRibGroupLeakRules)
 		}
 
 		// Re-apply must not leak: all programmed rules are inside the
-		// cleared window.
-		if err := rg.Apply(ribGroups, instances); err != nil {
-			t.Fatalf("Apply (second): %v", err)
+		// cleared window, so the count stays capped.
+		if err := rg.Apply(ribGroups, instances, connected); err == nil {
+			t.Fatal("re-apply over-limit must still surface the degraded error")
 		}
-		total = ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
-		if total != 100 {
-			t.Fatalf("re-apply leaked rib-group rules: expected 100, got %d", total)
+		if got := ops.count(unix.AF_INET); got != maxRibGroupLeakRules {
+			t.Fatalf("re-apply leaked rib-group rules: expected %d, got %d", maxRibGroupLeakRules, got)
 		}
 	})
 }
@@ -780,7 +861,7 @@ func TestRulesClearListErrorSurfaced(t *testing.T) {
 			run: func(ops *fakeRuleOps) error {
 				rg := &ribGroupManager{ops: ops}
 				// Empty rib-groups → early return after clear; no re-adds.
-				return rg.Apply(nil, nil)
+				return rg.Apply(nil, nil, nil)
 			},
 		},
 		{

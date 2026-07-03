@@ -173,8 +173,12 @@ func (m *Manager) ApplyNextTableRules(routes []*config.StaticRoute, instances []
 }
 
 // ApplyRibGroupRules creates ip rules implementing rib-group route leaking.
-func (m *Manager) ApplyRibGroupRules(ribGroups map[string]*config.RibGroup, instances []*config.RoutingInstanceConfig) error {
-	return m.ribGroup.Apply(ribGroups, instances)
+// connectedPrefixes is keyed by routing-instance name and holds each source
+// instance's connected network prefixes (v4+v6 mixed); the per-prefix leak
+// rules (#3876) are installed for the prefixes of instances whose
+// interface-routes rib-group imports the main table.
+func (m *Manager) ApplyRibGroupRules(ribGroups map[string]*config.RibGroup, instances []*config.RoutingInstanceConfig, connectedPrefixes map[string][]string) error {
+	return m.ribGroup.Apply(ribGroups, instances, connectedPrefixes)
 }
 
 // ApplyPBRRules creates ip rules implementing policy-based routing.

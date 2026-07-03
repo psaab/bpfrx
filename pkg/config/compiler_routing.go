@@ -138,6 +138,18 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	return nil
 }
 
+// isRouteInlineKeyword reports whether tok is a static-route clause keyword in
+// the fully-inline route-keys form (`route <dst> next-hop a b qualified-next-hop
+// ...`). Used to bound a multi-value next-hop gateway run (#3872) so it stops
+// at the next clause instead of swallowing a following keyword as a gateway.
+func isRouteInlineKeyword(tok string) bool {
+	switch tok {
+	case "next-hop", "qualified-next-hop", "next-table", "discard", "reject", "preference", "metric", "interface":
+		return true
+	}
+	return false
+}
+
 // compileStaticRoutes parses static route entries from a "static" node,
 // appending to and returning the updated slice.
 func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRoute {
@@ -158,7 +170,11 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 			for i := 2; i < len(routeInst.node.Keys); i++ {
 				switch routeInst.node.Keys[i] {
 				case "next-hop":
-					if i+1 < len(routeInst.node.Keys) {
+					// Absorb a collapsed bracket list `next-hop [ a b ]` in the
+					// fully-inline form: consume consecutive gateway tokens
+					// until the next route keyword, installing each as an
+					// equal-cost next-hop (#3872).
+					for i+1 < len(routeInst.node.Keys) && !isRouteInlineKeyword(routeInst.node.Keys[i+1]) {
 						i++
 						route.NextHops = append(route.NextHops, NextHopEntry{Address: routeInst.node.Keys[i]})
 					}
@@ -171,10 +187,35 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					if i+1 < len(routeInst.node.Keys) {
 						i++
 						nh := NextHopEntry{Address: routeInst.node.Keys[i]}
-						// Check for "interface <name>" following the address
-						if i+2 < len(routeInst.node.Keys) && routeInst.node.Keys[i+1] == "interface" {
+						// Consume trailing modifiers in the fully-inline form:
+						// "qualified-next-hop <gw> interface <if> preference <n>
+						// metric <m>" (#3871). Each modifier carries its own
+						// per-next-hop preference/metric — the floating backup's
+						// admin distance — never folded into the route level.
+						for i+2 < len(routeInst.node.Keys) {
+							kw := routeInst.node.Keys[i+1]
+							val := routeInst.node.Keys[i+2]
+							consumed := true
+							switch kw {
+							case "interface":
+								nh.Interface = val
+							case "preference":
+								if n, err := strconv.Atoi(val); err == nil {
+									nh.Preference = n
+									nh.HasPreference = true
+								}
+							case "metric":
+								if n, err := strconv.Atoi(val); err == nil {
+									nh.Metric = n
+									nh.HasMetric = true
+								}
+							default:
+								consumed = false
+							}
+							if !consumed {
+								break
+							}
 							i += 2
-							nh.Interface = routeInst.node.Keys[i]
 						}
 						route.NextHops = append(route.NextHops, nh)
 					}
@@ -195,22 +236,39 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 		for _, prop := range routeInst.node.Children {
 			switch prop.Name() {
 			case "next-hop":
-				nh := NextHopEntry{}
-				nh.Address = nodeVal(prop)
-				// Check children for interface (needed for IPv6 link-local next-hops)
+				// #3872: `next-hop [ gw1 gw2 ]` is canonical Junos ECMP — the
+				// bracket list collapses onto Keys=["next-hop", gw1, gw2, ...]
+				// in both AST shapes (multi leaf). Read EVERY gateway and
+				// install each as an equal-cost next-hop; reading only Keys[1]
+				// silently dropped all but the first. A single-gateway form may
+				// carry an `interface <if>` modifier (IPv6 link-local), inline
+				// on the keys (`next-hop fe80::1 interface reth0.50`) or as a
+				// child node — that egress interface applies to the gateway(s).
+				var addrs []string
+				iface := ""
+				for j := 1; j < len(prop.Keys); j++ {
+					if prop.Keys[j] == "interface" {
+						if j+1 < len(prop.Keys) {
+							iface = prop.Keys[j+1]
+							j++
+						}
+						continue
+					}
+					addrs = append(addrs, prop.Keys[j])
+				}
+				// Child interface (hierarchical + flat-set container shapes).
 				for _, child := range prop.Children {
 					if child.Name() == "interface" {
-						nh.Interface = nodeVal(child)
+						iface = nodeVal(child)
 					}
 				}
-				// Also check inline keys: "next-hop fe80::50 interface reth0.50"
-				// has all in Keys rather than Children.
-				for j := 2; j < len(prop.Keys)-1; j++ {
-					if prop.Keys[j] == "interface" {
-						nh.Interface = prop.Keys[j+1]
-					}
+				if len(addrs) == 0 && iface != "" {
+					// interface-only next-hop (unnumbered) — keep one entry.
+					route.NextHops = append(route.NextHops, NextHopEntry{Interface: iface})
 				}
-				route.NextHops = append(route.NextHops, nh)
+				for _, a := range addrs {
+					route.NextHops = append(route.NextHops, NextHopEntry{Address: a, Interface: iface})
+				}
 			case "discard":
 				route.Discard = true
 			case "preference":
@@ -220,17 +278,47 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					}
 				}
 			case "qualified-next-hop":
+				// A qualified-next-hop is a FLOATING backup: it carries its own
+				// preference (admin distance) and optional metric, kept
+				// PER-next-hop rather than folded into the route-level
+				// Preference (#3871). preference/metric/interface arrive as
+				// nested children (canonical separate `set` lines and the
+				// hierarchical brace form) or as inline keys (single-line block
+				// parse), so read both shapes.
 				nh := NextHopEntry{}
 				nh.Address = nodeVal(prop)
-				// Check for "interface <name>" among remaining keys
-				for j := 2; j < len(prop.Keys)-1; j++ {
-					if prop.Keys[j] == "interface" {
+				// Inline keys: "qualified-next-hop <gw> interface <if> preference <n> metric <m>".
+				for j := 2; j+1 < len(prop.Keys); j++ {
+					switch prop.Keys[j] {
+					case "interface":
 						nh.Interface = prop.Keys[j+1]
+					case "preference":
+						if n, err := strconv.Atoi(prop.Keys[j+1]); err == nil {
+							nh.Preference = n
+							nh.HasPreference = true
+						}
+					case "metric":
+						if n, err := strconv.Atoi(prop.Keys[j+1]); err == nil {
+							nh.Metric = n
+							nh.HasMetric = true
+						}
 					}
 				}
-				// Also check children for flat set syntax
+				// Child nodes (flat-set separate lines + hierarchical brace form).
 				if ifNode := prop.FindChild("interface"); ifNode != nil {
 					nh.Interface = nodeVal(ifNode)
+				}
+				if pNode := prop.FindChild("preference"); pNode != nil {
+					if n, err := strconv.Atoi(nodeVal(pNode)); err == nil {
+						nh.Preference = n
+						nh.HasPreference = true
+					}
+				}
+				if mNode := prop.FindChild("metric"); mNode != nil {
+					if n, err := strconv.Atoi(nodeVal(mNode)); err == nil {
+						nh.Metric = n
+						nh.HasMetric = true
+					}
 				}
 				route.NextHops = append(route.NextHops, nh)
 			case "next-table":
@@ -306,6 +394,10 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 				}
 				ri.StaticRoutes = ro.StaticRoutes
 				ri.Inet6StaticRoutes = ro.Inet6StaticRoutes
+				// #3870: capture the instance-level autonomous-system so a
+				// per-instance BGP that omits local-as can inherit it (falling
+				// back to the global routing-options AS in resolveBGPAutonomousSystem).
+				ri.AutonomousSystem = ro.AutonomousSystem
 				// Parse interface-routes rib-group
 				if irNode := prop.FindChild("interface-routes"); irNode != nil {
 					if rgNode := irNode.FindChild("rib-group"); rgNode != nil {
@@ -376,6 +468,40 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// resolveBGPAutonomousSystem fills a BGP local-AS from `routing-options
+// autonomous-system` when `protocols bgp local-as` was not set (#3870).
+//
+// Junos accepts the BGP AS at TWO hierarchy points: the global
+// `routing-options autonomous-system <N>` (the canonical vSRX placement) and
+// the more specific `protocols bgp local-as <N>` override. The FRR renderer
+// gates `router bgp` on BGPConfig.LocalAS > 0 (policy_render.go), and only
+// `local-as` populated LocalAS — so a config that set the AS only at
+// routing-options rendered NO `router bgp` block at all, silently. This
+// resolves the Junos precedence into LocalAS after the whole tree is compiled
+// (routing-options and protocols may appear in either order under the root):
+// local-as wins if present, else the global autonomous-system. Per-instance
+// BGP inherits the instance's own routing-options autonomous-system if set,
+// else the global one. Must run AFTER both compileRoutingOptions and
+// compileProtocols/compileRoutingInstances have populated cfg.
+func resolveBGPAutonomousSystem(cfg *Config) {
+	globalAS := cfg.RoutingOptions.AutonomousSystem
+	if bgp := cfg.Protocols.BGP; bgp != nil && bgp.LocalAS == 0 && globalAS > 0 {
+		bgp.LocalAS = globalAS
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri.BGP == nil || ri.BGP.LocalAS != 0 {
+			continue
+		}
+		as := ri.AutonomousSystem // instance-level override
+		if as == 0 {
+			as = globalAS // inherit the global autonomous-system
+		}
+		if as > 0 {
+			ri.BGP.LocalAS = as
+		}
+	}
 }
 
 func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
@@ -967,4 +1093,93 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 			term.Action = "reject"
 		}
 	}
+}
+
+// mainRIBTableID is the Linux main routing table (RT_TABLE_MAIN). It mirrors
+// pkg/routing.mainTableID; the two MUST agree on which import-rib targets are
+// "main" so the commit-time warn and the runtime applier classify a rib-group
+// import the same way (#3876).
+const mainRIBTableID = 254
+
+// ribTargetKind classifies a rib-group import-rib name against a source
+// instance for the #3876 per-prefix leak. It mirrors pkg/routing.resolveRibTable
+// (via ribInstanceFromName, the shared exact-suffix matcher) and returns:
+//   - "main": the main table (inet.0 / inet6.0) — the Phase-1 leak target.
+//   - "self": the source instance's own rib (no leak needed).
+//   - "vrf":  another DEFINED instance's rib — a VRF→VRF import, deferred to
+//     Phase 2 (warned, not installed).
+//   - "unknown": an unresolvable name (the strict gate rejects it at commit;
+//     the applier skips it — #2226).
+func ribTargetKind(ribName, selfInstance string, definedInstances map[string]bool) string {
+	if ribName == "inet.0" || ribName == "inet6.0" {
+		return "main"
+	}
+	if instance, ok := ribInstanceFromName(ribName); ok {
+		if instance == selfInstance {
+			return "self"
+		}
+		if definedInstances[instance] {
+			return "vrf"
+		}
+	}
+	return "unknown"
+}
+
+// RibGroupConnectedPrefixes derives, per source routing instance carrying an
+// interface-routes rib-group, the connected network prefixes eligible for the
+// #3876 per-prefix leak. For each instance member interface (e.g.
+// "ge-0/0/1.0") it resolves the physical interface + unit and collects the
+// masked network prefix of every static address on that unit via
+// ConnectedNetworkPrefix — the SAME derivation the userspace FIB uses for
+// connected routes, so the leaked ip-rule set matches the connected routes in
+// the source table.
+//
+// DHCP-only units carry no static Addresses (the lease is learned at runtime)
+// and contribute no enumerable prefix; the commit-time warn
+// (validateRibGroupLeakWarnings) surfaces that so the leak is fail-loud rather
+// than a silent no-op. The map is keyed by routing-instance name with v4 and
+// v6 prefixes mixed (the applier splits by family). Shared by the daemon
+// applier input and the config warn path so the two never drift.
+func RibGroupConnectedPrefixes(cfg *Config) map[string][]string {
+	out := make(map[string][]string)
+	if cfg == nil {
+		return out
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.Name == "" {
+			continue
+		}
+		if ri.InterfaceRoutesRibGroup == "" && ri.InterfaceRoutesRibGroupV6 == "" {
+			continue
+		}
+		var prefixes []string
+		for _, member := range ri.Interfaces {
+			base, unitTok, hasUnit := strings.Cut(member, ".")
+			unitNum := 0
+			if hasUnit {
+				n, err := strconv.Atoi(unitTok)
+				if err != nil {
+					continue
+				}
+				unitNum = n
+			}
+			ifc := cfg.Interfaces.Interfaces[base]
+			if ifc == nil {
+				continue
+			}
+			unit := ifc.Units[unitNum]
+			if unit == nil {
+				continue
+			}
+			for _, addr := range unit.Addresses {
+				if prefix, _, ok := ConnectedNetworkPrefix(addr); ok {
+					prefixes = append(prefixes, prefix)
+				}
+			}
+		}
+		if len(prefixes) > 0 {
+			out[ri.Name] = prefixes
+		}
+	}
+	return out
 }
