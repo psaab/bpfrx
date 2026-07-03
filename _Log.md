@@ -28442,7 +28442,60 @@ top.
   pkg/scheduler/scheduler_test.go + pkg/daemon/policy_scheduler_apply_test.go
   (updated for fail-closed semantics), pkg/scheduler/README.md +
   docs/config-schema.md (docs)
+- **Timestamp**: 2026-07-03
+- **Action**: Fix #3868 (fable-161 F-150) — HA config divergence on a
+  commit-confirmed TIMEOUT. The standby receives the unconfirmed config (C2)
+  via config-sync `SyncApply` (arms NO confirm timer → permanent active), but
+  `executeConfirmedRollback` reverted only the LOCAL node to the prior confirmed
+  config (C1) and never pushed the rollback to the peer → nodes diverged
+  (primary=C1, standby=C2); a failover served the abandoned C2. FIX: the
+  confirm-timeout rollback path (daemon_apply.go, non-nil `prevCfg` branch, after
+  `PromoteRollback` + apply) now calls `d.resyncRolledBackConfigToPeer()` which
+  runs the same `d.syncConfigToPeer()` push a normal commit uses — reading the
+  now-promoted active (C1) via `ShowActive` and queuing it to the peer. Peer-
+  absent is self-guarded (nil cluster/sessionSync, not RG0 primary, config-sync
+  disabled, or no active TCP conn all no-op); reverse-sync-on-reconnect retries.
+  The nil-`prevCfg` (first-commit → bootstrap) branch deliberately does NOT
+  re-sync (reverted empty tree carries no config-sync stanza; a bootstrap node
+  is not the RG0 authority). Split into `resyncRolledBackConfigToPeer` +
+  `resyncPeerForTest` seam (the real push needs a live TCP transport) so the
+  rollback is unit-testable. RED-on-revert PROVEN: removing the resync call
+  makes TestExecuteConfirmedRollbackResyncsPeer fail "got 0 calls". Sibling of
+  #3865/#3861 (store-side timer clear) — this is the daemon-HA half.
+  go test ./pkg/daemon/... ./pkg/cluster/... green; go build ./... green;
+  gofmt + vet clean. test-failover WARRANTED (HA config convergence) — flagged
+  for batch validation.
+- **File(s)**: pkg/daemon/daemon_apply.go (executeConfirmedRollback resync +
+  resyncRolledBackConfigToPeer helper + nil-branch note), pkg/daemon/daemon.go
+  (resyncPeerForTest seam field), pkg/daemon/rollback_resync_test.go (new
+  RED-on-revert + peer-absent tests), docs/ha-cluster-test-plan.md (TC-5b
+  commit-confirmed timeout convergence scenario)
 
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix #3867 — config archive transfer-on-commit uploaded the
+  boot-time /etc/xpf/xpf.conf (never rewritten since the configstore became
+  DB-canonical), so every `system archival configuration transfer-on-commit`
+  scp'd the DAY-0 config instead of the just-committed one — a silently-wrong
+  DR/compliance archive while scp logged success. `archiveConfig`
+  (pkg/daemon/daemon_flow.go) now serializes the CURRENT active config via
+  `Store.ShowActive()` (= `s.active.Format()`, the same text
+  `show configuration` renders and the local auto-archive `writeArchive`
+  uses), writes it to a 0600 temp file keeping the boot-file basename
+  (preserves the historical remote filename for directory-destination sites),
+  scp's THAT, and removes the temp file after every upload completes. The scp
+  step is split into `scpArchiveTransfer` behind the new injectable
+  `Daemon.archiveTransfer` seam so tests capture the uploaded bytes.
+  RED-on-revert PROVEN: reverting the source back to `d.opts.ConfigFile`
+  makes `TestArchiveConfigUploadsActiveNotBootFile` capture the day-0 boot
+  file ("day0-boot") instead of the committed active config ("committed-c1")
+  — both the exact-equality assertion and the boot-file guard trip. go test
+  ./pkg/daemon/... green; go build ./... green; gofmt + vet clean.
+- **File(s)**: pkg/daemon/daemon_flow.go (archiveConfig rewrite +
+  scpArchiveTransfer), pkg/daemon/daemon.go (archiveTransfer field),
+  pkg/daemon/archive_config_3867_test.go (new RED-on-revert + temp-cleanup
+  tests), pkg/configstore/README.md (remote transfer-on-commit source note)
 - **Timestamp**: 2026-07-03
 - **Action**: #3864 — deterministic (CGNAT) source NAT was un-configurable via
   flat-set. The documented CGNAT quick-start (`set ... port deterministic
@@ -28546,3 +28599,42 @@ top.
   pkg/config/compiler_static_nexthop_list_3872_test.go (new, 5 tests),
   pkg/frr/static_ecmp_list_3872_test.go (new), docs/config-schema.md,
   pkg/frr/README.md
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03 14:35
+- **Action**: #3874 — syslog stream (TCP/TLS) partial-frame teardown to
+  resync the collector's RFC 6587 octet-count parser. A `conn.Write` on a
+  stream transport can return `0 < n < len(b)` (a truncated frame on the
+  wire) when the write deadline expires or the peer resets mid-frame. The
+  timeout branch at syslog.go returned WITHOUT closing (deliberate per
+  #2287, which avoided a re-entrant close deadlock), so the NEXT frame's
+  bytes concatenated onto the truncated one → the collector's octet-count
+  length parser desynced permanently — audit/forensics channel corruption
+  exactly under incident load. FIX: `streamWrite` now reads the byte count
+  and, on a PARTIAL write (`0 < n < len(b)`), tears the conn down
+  (`conn.Close()`; `conn=nil`). The next `Send` sees `conn==nil`, treats
+  it as a non-timeout write failure, and the existing cooldown-gated
+  reconnect path dials a fresh, correctly-counted stream (the resync). A
+  clean 0-byte timeout (`n==0`) wrote nothing and stays drop-without-close
+  per #2287 — only a partial write closes. The fix lives in `streamWrite`
+  so it covers BOTH `Send` (octet-counted) and `SendBinary` (self-framing
+  length at `[3:5]`), both of which desync on truncation. WHY it does NOT
+  reintroduce the #2285 re-entrant deadlock: `net.Conn.Close`/`*tls.Conn.Close`
+  is a pure syscall that never routes back through
+  slog→SyslogSlogHandler.Handle→SyslogClient.Send, so it cannot re-lock
+  `s.mu` on the sending goroutine; and it is not the #2287 stall hazard
+  (close is cheap — no dial, no second writeTimeout; the reconnect is
+  deferred to the next Send via the conn==nil path). RED-on-revert PROVEN:
+  reverting `streamWrite` to `_, err := conn.Write(b); return err` makes
+  TestPartialWriteTearsDownStreamToResync fail (`closes=0, want 1`) — the
+  corrupt conn stays up and frame 2 concatenates onto the truncated frame
+  1. TestCleanTimeoutDoesNotCloseConn (0-byte timeout does not close/dial),
+  TestPartialWriteConnErrorTearsDown (non-timeout reset mid-frame), and
+  TestPartialWriteNoReentrantDeadlock (slog-default-wired client, 3s guard)
+  all green. `go test ./pkg/logging/... -race` green; `go build ./...`
+  green; gofmt + vet clean.
+- **File(s)**: pkg/logging/syslog.go (streamWrite partial-write teardown +
+  doc comment), pkg/logging/syslog_partial_frame_3874_test.go (new, 4 tests
+  + partialFrameConn/recordingBufConn/closeCountingTimeoutConn mocks +
+  parseOctetFrame collector parser), pkg/logging/README.md (partial-frame
+  teardown #3874 bullet)

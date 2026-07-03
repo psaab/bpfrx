@@ -307,6 +307,22 @@ owned by the `journal/` subpackage.
   route through package-var seams (`rbWriteFileDurable`,
   `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the
   durability call and inject failures (#1916 pattern).
+- Remote transfer-on-commit source (#3867): the daemon's
+  `archiveConfig` (`system archival configuration transfer-on-commit`,
+  `pkg/daemon/daemon_flow.go`) serializes the CURRENT active config via
+  `Store.ShowActive()` — the SAME `s.active.Format()` text this local
+  auto-archive and `show configuration` render — writes it to a temp
+  file, and scp's THAT to each archive site. It no longer scp's the
+  boot file `d.opts.ConfigFile` (`/etc/xpf/xpf.conf`): that file is
+  written once at install and is never rewritten now the store is
+  DB-canonical, so uploading it archived the day-0 config on every
+  commit (a silently-wrong DR/compliance archive while scp logged
+  success). The temp file keeps the boot-file basename so a
+  directory-destination site retains the historical remote filename,
+  and is removed after every upload completes. The transfer step is
+  injectable behind `Daemon.archiveTransfer` (default
+  `scpArchiveTransfer`) so tests can capture the uploaded bytes and
+  assert the archive-source selection.
 - `master.key` is written durably BEFORE any tree encrypted with it
   (the key persist runs inside writeTree's encrypt step) — a lost key
   meant a permanently undecryptable active config.
