@@ -93,15 +93,39 @@ func policySchedulerConfigHash(cfg *config.Config) ([32]byte, bool) {
 		writePolicySchedulerHashString(h, sched.StopTime)
 		writePolicySchedulerHashString(h, sched.StartDate)
 		writePolicySchedulerHashString(h, sched.StopDate)
-		if sched.Daily {
-			_, _ = h.Write([]byte{1})
-		} else {
-			_, _ = h.Write([]byte{0})
+		writePolicySchedulerHashBool(h, sched.Daily)
+		writePolicySchedulerHashBool(h, sched.AllDay)
+		// Per-day windows, hashed in a stable weekday order so a change to
+		// any per-day arm forces a scheduler re-evaluation.
+		dayNames := make([]string, 0, len(sched.Days))
+		for day := range sched.Days {
+			dayNames = append(dayNames, day)
+		}
+		sort.Strings(dayNames)
+		for _, day := range dayNames {
+			writePolicySchedulerHashString(h, day)
+			win := sched.Days[day]
+			if win == nil {
+				writePolicySchedulerHashString(h, "<nil>")
+				continue
+			}
+			writePolicySchedulerHashString(h, win.StartTime)
+			writePolicySchedulerHashString(h, win.StopTime)
+			writePolicySchedulerHashBool(h, win.AllDay)
+			writePolicySchedulerHashBool(h, win.Exclude)
 		}
 	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out, true
+}
+
+func writePolicySchedulerHashBool(h interface{ Write([]byte) (int, error) }, b bool) {
+	if b {
+		_, _ = h.Write([]byte{1})
+	} else {
+		_, _ = h.Write([]byte{0})
+	}
 }
 
 func writePolicySchedulerHashString(h interface{ Write([]byte) (int, error) }, s string) {

@@ -77,6 +77,14 @@ const (
 	// ValidateDDNSHostname — a name the publish path would silently
 	// rewrite is rejected at commit.
 	ValueHostname
+	// ValueTimeOfDay is a Junos scheduler time-of-day in HH:MM:SS 24-hour
+	// form (e.g. 09:00:00). Validated by ValidateTimeOfDay so an
+	// unparseable start-time/stop-time is rejected at commit instead of
+	// silently zeroing the scheduler window (#3849 fail-closed).
+	ValueTimeOfDay
+	// ValueDate is a Junos scheduler calendar date in YYYY-MM-DD form
+	// (e.g. 2026-03-01). Validated by ValidateDate.
+	ValueDate
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -113,6 +121,10 @@ func (v ValueType) Placeholder() string {
 		return "<dh-group>"
 	case ValueHostname:
 		return "<fqdn>"
+	case ValueTimeOfDay:
+		return "<HH:MM:SS>"
+	case ValueDate:
+		return "<YYYY-MM-DD>"
 	}
 	return ""
 }

@@ -7,11 +7,26 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-func TestIsWithinWindow_NoTimes(t *testing.T) {
-	sched := &config.SchedulerConfig{Name: "always"}
+// TestIsWithinWindow_NoWindowFailsClosed pins the #3849 fail-open fix: a
+// scheduler with NO window at all (no daily time, no per-day arm, no date
+// range) must be INACTIVE, not always-on. Reverting isWithinWindow to the old
+// "no times configured => active" shortcut goes RED here.
+func TestIsWithinWindow_NoWindowFailsClosed(t *testing.T) {
 	now := time.Date(2026, 2, 12, 14, 30, 0, 0, time.UTC)
-	if !isWithinWindow(now, sched) {
-		t.Error("no times configured should always be active")
+	if isWithinWindow(now, &config.SchedulerConfig{Name: "empty"}) {
+		t.Error("empty scheduler (no window) must fail closed (inactive), not run 24/7")
+	}
+	// A bare `daily;` recurrence flag with no time window is still no window.
+	if isWithinWindow(now, &config.SchedulerConfig{Name: "bare-daily", Daily: true}) {
+		t.Error("bare daily flag with no window must fail closed (inactive)")
+	}
+}
+
+// TestIsWithinWindow_AllDay pins `daily all-day` = always active.
+func TestIsWithinWindow_AllDay(t *testing.T) {
+	now := time.Date(2026, 2, 12, 3, 0, 0, 0, time.UTC)
+	if !isWithinWindow(now, &config.SchedulerConfig{Name: "all", AllDay: true}) {
+		t.Error("daily all-day should be active at any time")
 	}
 }
 
@@ -159,7 +174,7 @@ func TestScheduler_InitialState(t *testing.T) {
 	var state map[string]bool
 
 	schedCfg := map[string]*config.SchedulerConfig{
-		"always-on": {Name: "always-on"}, // no times = always active
+		"always-on": {Name: "always-on", AllDay: true}, // all-day = always active
 	}
 
 	s := New(schedCfg, func(activeState map[string]bool) error {
@@ -182,7 +197,7 @@ func TestScheduler_InitialState(t *testing.T) {
 func TestScheduler_NewPrimedDoesNotNotifyInitialState(t *testing.T) {
 	var called bool
 	schedCfg := map[string]*config.SchedulerConfig{
-		"always-on": {Name: "always-on"},
+		"always-on": {Name: "always-on", AllDay: true},
 	}
 
 	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) error {
@@ -305,7 +320,7 @@ func TestScheduler_MonotonicAdvanceDoesNotFailClosed(t *testing.T) {
 
 func TestScheduler_ActiveState(t *testing.T) {
 	schedCfg := map[string]*config.SchedulerConfig{
-		"always-on": {Name: "always-on"},
+		"always-on": {Name: "always-on", AllDay: true},
 	}
 	s := New(schedCfg, func(activeState map[string]bool) error { return nil })
 
@@ -324,7 +339,7 @@ func TestScheduler_ActiveState(t *testing.T) {
 func TestScheduler_Update(t *testing.T) {
 	var lastState map[string]bool
 	schedCfg := map[string]*config.SchedulerConfig{
-		"always-on": {Name: "always-on"},
+		"always-on": {Name: "always-on", AllDay: true},
 	}
 	s := New(schedCfg, func(activeState map[string]bool) error {
 		lastState = activeState
@@ -333,7 +348,7 @@ func TestScheduler_Update(t *testing.T) {
 
 	// Update with new schedulers (removes always-on, adds another)
 	s.Update(map[string]*config.SchedulerConfig{
-		"new-sched": {Name: "new-sched"},
+		"new-sched": {Name: "new-sched", AllDay: true},
 	})
 
 	if !lastState["new-sched"] {
