@@ -2346,8 +2346,9 @@ routing-options {
 		t.Fatalf("RoutingInstances = %d, want 2", len(cfg.RoutingInstances))
 	}
 	for _, ri := range cfg.RoutingInstances {
-		if ri.TableID != 100 && ri.TableID != 101 {
-			t.Errorf("instance %s: TableID = %d, want 100 or 101", ri.Name, ri.TableID)
+		// #3855: table ids are now the stable name-hash, not positional 100/101.
+		if want := StableRoutingInstanceTableID(ri.Name); ri.TableID != want {
+			t.Errorf("instance %s: TableID = %d, want stable %d", ri.Name, ri.TableID, want)
 		}
 	}
 	var dmzVR *RoutingInstanceConfig
