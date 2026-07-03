@@ -26,6 +26,41 @@ during specific windows.
   failures uint64, since time.Time)` — `scheduler.go`. Expose the #3780
   self-heal state for tests and metrics.
 
+## Time-window model (#3849)
+
+A `config.SchedulerConfig` resolves to at most one window per instant:
+
+- **Daily window** — `StartTime`/`StopTime` (the body of a Junos
+  `daily { start-time X; stop-time Y; }` block, or the legacy simplified
+  shape where `start-time`/`stop-time` are direct children of the
+  scheduler). `AllDay` marks the daily window active for the whole day
+  (`daily all-day`).
+- **Per-day overrides** — `Days["monday".."sunday"]`. A weekday present in
+  `Days` overrides the daily window for that weekday; its `Exclude` flag
+  forces the day inactive, `AllDay` forces it active. Days without an
+  override fall back to the daily window.
+- **Date range** — `StartDate`/`StopDate` gate the whole scheduler to a
+  calendar range (inclusive of the stop date). A scheduler with only a
+  date range (no time-of-day window) is active for the entire range.
+
+`compileSchedulers` (`pkg/config/compiler_system.go`) reads all of these
+for both the hierarchical and flat-set AST shapes; the flat-set grammar is
+grouped by the `schedulers` entry in `setSchema`
+(`pkg/config/schema_schedulers.go`), and the `start-time`/`stop-time` /
+`start-date`/`stop-date` value slots are typed so a malformed window is
+rejected at commit (`ValidateTimeOfDay` / `ValidateDate`).
+
+**Fail-closed invariant (#3849 — security).** `isWithinWindow` treats an
+ABSENT window as **inactive**, never always-on. A scheduler that resolves
+to no window for a given instant — no daily window, no applicable per-day
+override, and no date-only range — returns `false`. Before #3849 the
+`daily {}` block was never descended (so `StartTime`/`StopTime` stayed
+empty) and an empty window returned `true`, so a policy `scheduler-name`
+scoped to business hours actually permitted traffic 24/7 (fail-open). A
+window that fails to compile now DENIES, matching the firewall's
+fail-closed posture. To express "always active", omit `scheduler-name`
+from the policy or use `daily all-day`.
+
 ## Republish self-heal (#3780)
 
 `updateFn` returns an `error`. A window transition republishes

@@ -354,7 +354,11 @@ func TestPolicySchedulerInitialPublishSkipsUserspaceLegacyMapUpdate(t *testing.T
 func testPolicySchedulerApplyConfig() *config.Config {
 	return &config.Config{
 		Schedulers: map[string]*config.SchedulerConfig{
-			"workhours": {Name: "workhours"},
+			// AllDay = always active (`daily all-day`). Post-#3849 an empty
+			// scheduler fails CLOSED, so this test — which asserts the seeded
+			// active state reaches compile as active=true — pins an
+			// explicitly always-on window.
+			"workhours": {Name: "workhours", AllDay: true},
 		},
 		Security: config.SecurityConfig{
 			Policies: []*config.ZonePairPolicies{{
