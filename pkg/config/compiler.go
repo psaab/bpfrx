@@ -407,6 +407,24 @@ type compileOpts struct {
 	// last-write-wins maps it always produced are unchanged on that path. Same
 	// doctrine as lenientApplicationSpecs / lenientApplicationSetMembers.
 	lenientApplicationNameCollisions bool
+
+	// lenientFirewallFilterFamilyCollisions (#3884, fable-review-161 F-030)
+	// downgrades the firewall-filter cross-family name-collision gate
+	// (validateFirewallFilterFamilyCollisionsAST) from a hard compile error to a
+	// cfg.Warnings entry. compileFirewall folds every filter family except inet6
+	// (inet, any, mpls, ccc, vpls, bridge, ...) into ONE name-keyed map
+	// (fw.FiltersInet) with an unconditional `dest[name] = filter` write, so a
+	// same-name filter authored under a second such family silently OVERWRITES
+	// the first — a `discard` filter can be replaced by a same-name accept-all
+	// (fail-open). Downstream consumers key filters by name within the inet (V4) /
+	// inet6 (V6) buckets only, with no family dimension to disambiguate, so the
+	// reuse is genuinely ambiguous. The strict commit / commit-check path hard-
+	// rejects it; the tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config an older binary silently
+	// accepted still BOOTS (#1960 no-brick), keeping the arbitrary-but-stable
+	// last-write-wins map compileFirewall always produced. Same doctrine as
+	// lenientApplicationNameCollisions.
+	lenientFirewallFilterFamilyCollisions bool
 	// lenientFilterProtocols (#2175 review) downgrades the firewall-filter
 	// `from protocol <token>` gate (validateFilterProtocolsStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -581,6 +599,21 @@ type compileOpts struct {
 	// is inert. Commit stays strict so the operator's next edit fails loudly.
 	// Same doctrine as lenientNATHostMask.
 	lenientNPTv6 bool
+	// lenientNAT64Prefix (#3886) downgrades the NAT64 `prefix` /96 commit gate
+	// (validateNAT64PrefixStrict) from a hard compile error to a cfg.Warnings
+	// entry. The strict commit / commit-check path hard-rejects a NAT64
+	// rule-set prefix that is not an IPv6 `<address>/96` (a non-/96 length, a
+	// missing/garbage mask, or a non-IPv6 address). Before this gate such a
+	// prefix committed green, then the Rust Nat64State::try_from_snapshots
+	// /96-integrity check aborted the WHOLE forwarding rebuild without
+	// publishing — freezing the dataplane at the last-good snapshot so every
+	// later commit silently stopped taking effect. The tolerant load / peer-sync
+	// paths downgrade to a warning so an already-persisted or peer-synced config
+	// carrying a bad NAT64 prefix still BOOTS (#1960 no-brick) — the helper's own
+	// try_from_snapshots backstop keeps the previous live state, so a
+	// leniently-loaded bad prefix is inert. Commit stays strict so the operator's
+	// next edit fails loudly. Same doctrine as lenientNPTv6.
+	lenientNAT64Prefix bool
 	// lenientFirewallRefs (#2217) downgrades the firewall-filter term
 	// cross-reference gates — `then policer <name>` (Finding A,
 	// validateFirewallPolicerReferencesStrict) and `then routing-instance
@@ -1362,6 +1395,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRouteFilterMatchTypes:           true,
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
+		lenientFirewallFilterFamilyCollisions:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1374,6 +1408,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterRoutingInstanceConflict:   true,
 		lenientFilterDSCP:                      true,
 		lenientNPTv6:                           true,
+		lenientNAT64Prefix:                     true,
 		lenientFirewallRefs:                    true,
 		lenientFlowServerTemplateRef:           true,
 		lenientSamplingInstanceConflicts:       true,
@@ -1540,6 +1575,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRouteFilterMatchTypes:           true,
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
+		lenientFirewallFilterFamilyCollisions:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1552,6 +1588,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterRoutingInstanceConflict:   true,
 		lenientFilterDSCP:                      true,
 		lenientNPTv6:                           true,
+		lenientNAT64Prefix:                     true,
 		lenientFirewallRefs:                    true,
 		lenientFlowServerTemplateRef:           true,
 		lenientSamplingInstanceConflicts:       true,
@@ -1802,6 +1839,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3884 (fable-review-161 F-030) firewall-filter cross-family name-collision
+	// gate. compileFirewall folds every filter family except inet6 into ONE
+	// name-keyed map (fw.FiltersInet) with an unconditional overwrite, so a
+	// same-name filter under a second non-inet6 family silently replaces the
+	// first — a discard filter can become a same-name accept-all (fail-open).
+	// Strict (commit / commit-check): the collision hard-rejects. Lenient (load /
+	// peer-sync): warn so an already-persisted or peer-synced config an older
+	// binary silently accepted still BOOTS (#1960 / #3261). Runs on the group-
+	// expanded, inactive-pruned AST because the colliding definitions are merged
+	// away by last-write-wins by the time fw.FiltersInet exists — only the raw
+	// AST still carries every family's definition.
+	fwFilterFamilyWarnings, err := validateFirewallFilterFamilyCollisionsAST(
+		tree.Children, opts.lenientFirewallFilterFamilyCollisions)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3096: the #3079 interim NAT rule-set scope reject is LIFTED. A
 	// `security nat {source|destination|static}` rule-set whose `from`/`to`
 	// clause scopes traffic by `interface` or `routing-instance` is now
@@ -1990,6 +2044,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, flowTraceSizeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
+	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
@@ -3738,6 +3793,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, nptv6Warnings...)
+
+	// #3886: NAT64 prefix commit gate. A NAT64 rule-set `prefix` is read
+	// verbatim into the wire snapshot and parsed at dataplane apply by the Rust
+	// Nat64State::try_from_snapshots /96-integrity check. A non-/96 or malformed
+	// prefix committed green then makes that check ABORT the entire forwarding
+	// rebuild without publishing — freezing the dataplane at the last-good
+	// snapshot so every later commit silently stops reaching it. Strict (commit
+	// / commit-check): hard-reject anything that is not `<ipv6-address>/96`,
+	// matching the Rust check exactly so there is no commit-accept ->
+	// runtime-abort gap. Lenient (load / peer-sync): warn so a config committed
+	// before this gate existed still boots; the Rust helper independently keeps
+	// the previous live state, so the bad rule is inert.
+	nat64PrefixWarnings, err := validateNAT64PrefixStrict(cfg, opts.lenientNAT64Prefix)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, nat64PrefixWarnings...)
 
 	// #1434 multi-peer WireGuard: per-tunnel commit gate. Strict (commit /
 	// commit-check): hard-reject a WG tunnel with a missing/invalid

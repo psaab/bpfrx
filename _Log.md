@@ -1,3 +1,40 @@
+## 2026-07-03 — #3884: firewall-filter cross-family name collision folds into FiltersInet (discard→accept-all fail-open)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-review-161 F-030 (MEDIUM, security fail-open).
+    `compileFirewall` (`compiler_firewall.go`) selects `dest := fw.FiltersInet`
+    for EVERY family except `inet6` (inet, any, mpls, ccc, vpls, bridge, ...) and
+    writes `dest[name] = filter` unconditionally, so two same-name filters under
+    two different non-inet6 families silently collapse (last-write-wins) with no
+    commit error. A `family inet filter blockX { then discard }` replaced by a
+    same-name `family any filter blockX { then accept }` becomes accept-all on the
+    IPv4 path — a deny silently downgraded to an accept.
+  - **Fix**: Added `validateFirewallFilterFamilyCollisionsAST` (new AST pre-walk
+    in `compiler_firewall.go`, mirroring the #3339 application-collision gate)
+    that rejects at commit / commit-check a filter name defined under ≥ 2 distinct
+    non-inet6 families (naming the filter + families), and downgrades to a
+    `cfg.Warnings` entry on the tolerant load / peer-sync path
+    (`lenientFirewallFilterFamilyCollisions`, #1960 / #3261 no-brick). Chose
+    fail-closed REJECT over per-(family,name) namespacing because downstream
+    consumers reference filters by NAME within the inet (V4) / inet6 (V6) buckets
+    only — no family dimension exists to disambiguate, so the reuse is genuinely
+    ambiguous. inet6 has its own dest map (`FiltersInet6`) so the legitimate
+    inet/inet6 dual-stack same-name case is preserved (distinct maps, no collision).
+    Wired the gate into `compileConfig` (invoke after `validateApplicationNameCollisionsAST`;
+    warnings accumulated alongside `appCollisionWarnings`) with the new
+    `lenientFirewallFilterFamilyCollisions` opt set in both lenient constructors.
+  - **File(s)**: `pkg/config/compiler_firewall.go` (validator),
+    `pkg/config/compiler.go` (opt + invocation + warning accumulation),
+    `pkg/config/compiler_firewall_family_collision_3884_test.go` (new tests),
+    `docs/config-schema.md` (new gate section).
+  - **Validation**: `go test ./pkg/config/...` green; `go build ./...` clean;
+    gofmt + `go vet ./pkg/config/...` clean. RED-on-revert proven — neutralizing
+    the gate (forcing lenient) makes the strict Rejected tests fail (CompileConfig
+    returns nil, discard silently overwritten by accept). Reachable only via a
+    hierarchical config-file parse / peer-synced AST (the flat `set` grammar only
+    structures `family inet|inet6`), so tests use `parseHier` + a directly-built
+    AST — the actual reachable path.
+
 ## 2026-07-03 — #3876: rib-group interface-route import was a no-op (shadowed by default route) — per-prefix leak before main
 
 - **Timestamp**: 2026-07-03
@@ -28793,3 +28830,29 @@ top.
   concurrent-lossless-on-Full.
 - **File(s)**: userspace-dp/src/event_stream/mod.rs (send_lossless_encoded
   rollback-under-lock), userspace-dp/src/event_stream/tests.rs (new test)
+## 2026-07-03 — #3886 NAT64 rule-set `prefix` /96 commit gate
+- **Timestamp**: 2026-07-03
+- **Action**: Add commit-time strict/lenient validator for a NAT64 rule-set
+  `prefix`. A non-/96 or malformed prefix committed GREEN then made the Rust
+  `Nat64State::try_from_snapshots` /96-integrity check
+  (`userspace-dp/src/nat64.rs`) abort the ENTIRE `build_reconcile_forwarding`
+  without publishing → dataplane frozen at the last-good snapshot → every later
+  commit silently stopped reaching the dataplane. New `validateNAT64PrefixStrict`
+  (`compiler_nat.go`, wired after `validateNPTv6Strict` in `compileExpanded`)
+  mirrors the Rust check EXACTLY: split on `/`, the mask token must parse as
+  decimal `96` (only /96 supported), the address token must be IPv6 via the
+  textual `natAddrFamily` (colon == v6, matching Rust `Ipv6Addr::from_str` incl.
+  the `::ffff:x` mapped form). Strict (commit/commit-check): hard-reject.
+  Lenient (`CompileConfigLenient`/`CompileConfigForNodeLenient`, new
+  `lenientNAT64Prefix` flag): warn so an already-persisted / peer-synced bad
+  prefix still BOOTS (#1960 no-brick) — the helper's own try_from_snapshots
+  backstop keeps the previous live state. Empty/absent prefix is out of scope
+  (buildNAT64Snapshots skips it, never reaches the Rust check). RED-on-revert
+  proven (forcing lenient=true made all reject tests FAIL). go test
+  ./pkg/config/... green; go build ./... clean; gofmt + vet clean. Flagged the
+  Rust abort-whole-rebuild-vs-skip-bad-rule as a separate defense-in-depth
+  follow-up (larger userspace-dp change), not fixed here.
+- **File(s)**: pkg/config/compiler_nat.go (validateNAT64PrefixStrict),
+  pkg/config/compiler.go (lenientNAT64Prefix option + wiring + 2 lenient
+  blocks), pkg/config/compiler_nat64_prefix_test.go (new, 11 tests),
+  docs/config-schema.md (#3886 subsection)
