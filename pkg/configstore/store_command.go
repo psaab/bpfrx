@@ -12,6 +12,9 @@ func (s *Store) Set(path []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -37,6 +40,9 @@ func (s *Store) Delete(path []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -71,6 +77,9 @@ func (s *Store) DeleteFromInput(input string) error {
 func (s *Store) DeactivateFromInput(input string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -88,6 +97,9 @@ func (s *Store) DeactivateFromInput(input string) error {
 func (s *Store) ActivateFromInput(input string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -102,6 +114,9 @@ func (s *Store) ActivateFromInput(input string) error {
 func (s *Store) Copy(srcPath, dstPath []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -116,6 +131,9 @@ func (s *Store) Copy(srcPath, dstPath []string) error {
 func (s *Store) Rename(srcPath, dstPath []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -131,6 +149,9 @@ func (s *Store) Rename(srcPath, dstPath []string) error {
 func (s *Store) Insert(elementPath, refPath []string, before bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -152,6 +173,9 @@ func (s *Store) Annotate(path []string, comment string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -189,6 +213,9 @@ func (s *Store) LoadOverride(content string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -210,6 +237,9 @@ func (s *Store) LoadMerge(content string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
@@ -344,6 +374,9 @@ func applyEditLine(tree *config.ConfigTree, line string) error {
 func (s *Store) LoadSet(content string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureWritableLocked(); err != nil {
+		return 0, err
+	}
 	if s.candidate == nil {
 		return 0, fmt.Errorf("not in configuration mode")
 	}
