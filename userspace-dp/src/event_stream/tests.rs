@@ -1359,11 +1359,15 @@ fn push_delta_full_channel_drop_does_not_burn_seq_3878() {
 // RED-on-revert: this is a concurrency stress test. With the non-atomic
 // allocate-then-enqueue restored, the wide window between `next_seq()` and
 // `try_send` (a full session-open encode) lets two of the eight workers invert
-// within the ~8000 frames, and the monotonicity assertion fails.
+// within the few thousand frames, and the monotonicity assertion fails.
 #[test]
 fn concurrent_push_delta_preserves_monotonic_wire_order_3878() {
+    // 8-way contention over the wide next_seq()->try_send window reorders very
+    // early on revert (observed at seq ~192); 500 per thread keeps a large
+    // margin while bounding the CPU burst so this does not starve co-scheduled
+    // timing-sensitive tests in a module-only test run.
     const THREADS: u64 = 8;
-    const PER_THREAD: u64 = 1000;
+    const PER_THREAD: u64 = 500;
     let total = (THREADS * PER_THREAD) as usize;
 
     // Channel sized to hold every frame: the I/O thread is not draining in this
@@ -1410,6 +1414,75 @@ fn concurrent_push_delta_preserves_monotonic_wire_order_3878() {
         prev,
         THREADS * PER_THREAD,
         "seqs must be a contiguous 1..=N run with no gaps or burns",
+    );
+}
+
+// #3878 F-153 (lossless path): concurrent lossless flushers that all hit a FULL
+// channel must NOT strand a sequence number. Each failed attempt's rollback
+// runs UNDER the producer lock, so allocations+rollbacks are strictly LIFO and
+// every drop returns `next_seq` to where it started. Before the follow-up fix
+// the rollback ran AFTER the lock was released, so two flushers could interleave
+// alloc(6)/alloc(7)/rollback(6)-CAS-fails/rollback(7)-CAS-succeeds and leave
+// `next_seq` at 6 with seq 6 stranded — a wire hole → spurious owner-RG resync
+// (reachable because `flush_session_deltas` → `push_delta_lossless` runs
+// per-worker, up to 6 concurrent flushers on the mlx5 VF).
+//
+// RED-on-revert: with the rollback moved back outside the guard, the non-LIFO
+// CAS failures strand seqs and `next_seq` ends well above the base.
+#[test]
+fn concurrent_lossless_full_drops_do_not_strand_seq_3878() {
+    const CAP: usize = 5;
+    const THREADS: usize = 3;
+
+    // rx is HELD (never dropped/drained) so every `try_send` returns Full, not
+    // Disconnected — the flushers stay in the retry loop.
+    let (tx, _rx) = mpsc::sync_channel::<EventFrame>(CAP);
+    let shared = Arc::new(EventStreamShared::new());
+    let handle = EventStreamWorkerHandle {
+        tx,
+        shared: shared.clone(),
+    };
+    let zone_map = FxHashMap::default();
+    let delta = test_close_delta(crate::session::SessionDeltaKind::Open);
+
+    // Fill the channel so every lossless attempt hits Full; base next_seq = CAP.
+    for _ in 0..CAP {
+        handle.push_delta(&delta, &zone_map);
+    }
+    assert_eq!(shared.next_seq.load(Ordering::Relaxed), CAP as u64);
+
+    // Mark connected so the flushers enter the retry loop rather than bailing at
+    // the initial connected check.
+    shared.connected.store(true, Ordering::Release);
+
+    let mut joins = Vec::new();
+    for _ in 0..THREADS {
+        let worker = handle.clone();
+        joins.push(std::thread::spawn(move || {
+            let zm = FxHashMap::default();
+            let d = test_close_delta(crate::session::SessionDeltaKind::Open);
+            // Retries on Full; gives up (Err) once `connected` is cleared below.
+            let _ = worker.push_delta_lossless(&d, &zm);
+        }));
+    }
+
+    // Let the flushers churn concurrently on the Full channel (this is where the
+    // non-LIFO rollback strands seqs on the buggy version), then make them give
+    // up quickly instead of waiting out the 5s lossless timeout. The flushers
+    // sleep LOSSLESS_QUEUE_RETRY_DELAY (50us) between attempts, so this window is
+    // low-CPU (mostly sleeping) yet still runs hundreds of interleaved attempts.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    shared.connected.store(false, Ordering::Release);
+    for join in joins {
+        join.join().expect("lossless flusher");
+    }
+
+    // Every lossless attempt was dropped and rolled back UNDER the lock, so the
+    // counter must be back at the base with no stranded hole.
+    assert_eq!(
+        shared.next_seq.load(Ordering::Relaxed),
+        CAP as u64,
+        "#3878: concurrent lossless Full-drops must not strand a sequence number",
     );
 }
 

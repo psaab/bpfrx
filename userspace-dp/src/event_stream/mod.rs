@@ -600,10 +600,17 @@ impl EventStreamWorkerHandle {
             // Raw `tx.try_send` (NOT `try_send_frame`): a `Full` here is a
             // RETRY, not a drop, so it must not bump `frames_dropped` — the
             // lossless caller decides whether an eventual give-up counts as a
-            // loss (#2880). Allocation and enqueue happen together under the
-            // producer lock so a delta's re-allocated seq matches its enqueue
-            // order (#3878).
-            let (result, rollback_seq, reported_seq) = {
+            // loss (#2880). Allocation, enqueue, AND the rollback-on-drop all
+            // happen together under the producer lock (#3878): the rollback
+            // MUST stay inside the guard so allocations+rollbacks are strictly
+            // LIFO and `rollback_seq`'s CAS always targets the top of the
+            // stack. Rolling back after the lock is released lets two
+            // concurrent flushers interleave alloc(N)/alloc(N+1)/rollback(N)-
+            // fails/rollback(N+1)-succeeds and STRAND seq N — the exact F-153
+            // hole this fix targets (flush_session_deltas runs push_delta_
+            // lossless per-worker, so >=2 concurrent flushers on a Full channel
+            // is the normal recovery-churn regime).
+            let outcome = {
                 let _guard = self
                     .shared
                     .producer_seq_lock
@@ -611,21 +618,32 @@ impl EventStreamWorkerHandle {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let (frame, rollback_seq) = encode();
                 let reported_seq = frame.seq;
-                (self.tx.try_send(frame), rollback_seq, reported_seq)
+                match self.tx.try_send(frame) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // The next attempt re-allocates, so this attempt's seq
+                        // must be freed for the next successful enqueue (and a
+                        // give-up must leave no burned seq). Control frames
+                        // carry a fixed seq (None).
+                        if let Some(seq) = rollback_seq {
+                            self.rollback_seq(seq);
+                        }
+                        Err((EventStreamSendError::Full, reported_seq))
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        if let Some(seq) = rollback_seq {
+                            self.rollback_seq(seq);
+                        }
+                        Err((EventStreamSendError::Disconnected, reported_seq))
+                    }
+                }
             };
-            match result {
+            match outcome {
                 Ok(()) => {
                     self.shared.frames_sent.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
-                Err(mpsc::TrySendError::Full(_)) => {
-                    // Roll back the seq allocated for THIS attempt (#3878): the
-                    // next attempt re-allocates so the eventual wire seq matches
-                    // the successful enqueue position, and a give-up leaves no
-                    // burned seq. Control frames carry a fixed seq (None).
-                    if let Some(seq) = rollback_seq {
-                        self.rollback_seq(seq);
-                    }
+                Err((EventStreamSendError::Full, reported_seq)) => {
                     if !self.shared.connected.load(Ordering::Acquire) {
                         return Err(format!(
                             "event stream disconnected while queuing seq {reported_seq}"
@@ -638,10 +656,7 @@ impl EventStreamWorkerHandle {
                     }
                     thread::sleep(LOSSLESS_QUEUE_RETRY_DELAY);
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    if let Some(seq) = rollback_seq {
-                        self.rollback_seq(seq);
-                    }
+                Err((EventStreamSendError::Disconnected, reported_seq)) => {
                     return Err(format!(
                         "event stream channel disconnected while queuing seq {reported_seq}"
                     ));

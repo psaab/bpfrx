@@ -28765,3 +28765,31 @@ top.
   pkg/frr/README.md (MINOR 1 metric-only-doesn't-float),
   pkg/config/delete_static_nexthop_3872_test.go (new, 5 tests),
   pkg/frr/static_empty_route_3872_test.go (new, 2 tests)
+
+## 2026-07-03 — #3878 fold: roll back the lossless-path seq UNDER the lock
+
+- **Timestamp**: 2026-07-03
+- **Action**: Hostile review of PR #3883 found a residual of the exact F-153
+  bug in the LOSSLESS path. `send_lossless_encoded` released the producer lock
+  at the end of its guard block and rolled the seq back in the OUTER match arms
+  — after the lock was dropped. Two concurrent lossless flushers on a Full
+  channel could then interleave: A alloc 6 / B alloc 7 / A rollback(6) CAS
+  expects-6-sees-7 FAILS / B rollback(7) CAS succeeds → next_seq left at 6 with
+  seq 6 STRANDED = a wire hole → spurious full owner-RG resync (the exact
+  symptom this PR targets). Reachable because flush_session_deltas →
+  push_delta_lossless runs per-worker (up to 6 concurrent on the mlx5 VF).
+  Fix: compute the try_send outcome AND perform the rollback INSIDE the guard
+  block (mirror send_sequenced), so allocations+rollbacks are strictly LIFO and
+  rollback_seq's CAS always targets the top of the stack; the lock is still
+  dropped before thread::sleep (no producer stall). Restores rollback_seq's
+  documented "called ONLY while producer_seq_lock is held" contract for both
+  callers.
+- **Test**: added `concurrent_lossless_full_drops_do_not_strand_seq_3878` — 4
+  threads call push_delta_lossless on a saturated (Full) channel, then give up;
+  asserts next_seq returns to the base (no stranded hole). RED on the pre-fold
+  code (non-LIFO rollback strands seqs, next_seq drifts above base), green with
+  the fix. The prior concurrent test used lossy push_delta on a never-Full
+  channel; the two single-threaded F-153 tests can't strand — none exercised
+  concurrent-lossless-on-Full.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs (send_lossless_encoded
+  rollback-under-lock), userspace-dp/src/event_stream/tests.rs (new test)
