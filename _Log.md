@@ -29010,6 +29010,29 @@ top.
   (step 11b reconcileSudoers call), pkg/daemon/daemon_sudoers_reconcile_3889_test.go
   (new, 4 tests), docs/system-login.md (#3889 revocation section)
 
+- **Timestamp**: 2026-07-03
+- **Action**: #3898 — deep-copy per-unit tunnel inheritance. The per-unit
+  tunnel inherit at compiler_interfaces.go did `*tc = *ifc.Tunnel`, a
+  SHALLOW struct copy that duplicated only the slice HEADERS (ptr+len+cap)
+  of the interface-level tunnel's reference fields. Sibling units then
+  aliased the same backing array; when each unit appended its own
+  address/peer into the shared spare capacity, the second-processed unit
+  overwrote the first's slot — unit A silently carried unit B's IP
+  (duplicate IP on two tunnel netdevs) or WgPeers. Fix: added
+  `TunnelConfig.cloneForUnit(linuxName)` which returns a deep copy —
+  independent backing arrays for Addresses, WgPeers, and each peer's
+  nested AllowedIPs (full audit of TunnelConfig reference-typed fields;
+  all other fields are value types). Call site now uses cloneForUnit
+  instead of the shallow copy. RED-on-revert: reverting the call-site line
+  to the shallow copy makes TestPerUnitTunnelAddressesIndependent and
+  TestPerUnitTunnelWgPeersIndependent FAIL (unit 1 carries unit 2's
+  address/peer + shared backing array). No docs change: per-unit tunnel
+  inheritance semantics are not a separately documented contract — this is
+  an internal correctness fix that makes each unit correctly own its own
+  config. go test ./pkg/config/... green; go build ./... clean; gofmt +
+  vet clean.
+- **File(s)**: pkg/config/types_routing.go (cloneForUnit method),
+  pkg/config/compiler_interfaces.go (call site), pkg/config/tunnel_perunit_deepcopy_test.go (new, 4 tests)
 ## 2026-07-03
 
 - **Timestamp**: 2026-07-03

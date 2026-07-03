@@ -513,6 +513,39 @@ func (tc *TunnelConfig) String() string {
 		tc.WgListenPort, priv, strings.Join(peers, " "))
 }
 
+// cloneForUnit returns a deep copy of tc for a per-unit tunnel netdev,
+// with Name overridden to linuxName. Every reference-typed field is
+// given an INDEPENDENT backing array so a per-unit override on one unit
+// (e.g. appending its own Addresses or WgPeers) never mutates a slice
+// that a sibling unit inherited from the same interface-level tunnel
+// (#3898). A plain `*tc = *ifc.Tunnel` struct copy only copies the
+// slice headers (ptr+len+cap), so siblings would alias the parent's
+// backing array and cross-contaminate each other's IPs / peers.
+//
+// Deep-copied fields (audit of TunnelConfig for reference types):
+//   - Addresses      []string
+//   - WgPeers         []WgPeerConfig, and each peer's nested AllowedIPs []string
+//
+// All other fields are value types (strings, ints, uint32, uint16,
+// bool, Secret which is a string alias) and are safe to copy by value.
+func (tc *TunnelConfig) cloneForUnit(linuxName string) *TunnelConfig {
+	cp := *tc
+	cp.Name = linuxName
+	if tc.Addresses != nil {
+		cp.Addresses = append([]string(nil), tc.Addresses...)
+	}
+	if tc.WgPeers != nil {
+		cp.WgPeers = make([]WgPeerConfig, len(tc.WgPeers))
+		for i, p := range tc.WgPeers {
+			cp.WgPeers[i] = p
+			if p.AllowedIPs != nil {
+				cp.WgPeers[i].AllowedIPs = append([]string(nil), p.AllowedIPs...)
+			}
+		}
+	}
+	return &cp
+}
+
 // WgOuterFamilyV6 reports whether the tunnel's outer transport family is
 // IPv6 (#1434). A WG interface binds ONE kernel UDP socket, so it has a
 // single outer family. The family is derived from the peer(s) that
