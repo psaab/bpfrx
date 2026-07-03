@@ -355,6 +355,13 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 		slog.Warn("commit confirmed (first commit) timed out; rolling back to BOOTSTRAP mode " +
 			"(removing interface/FRR/dataplane takeover, keeping the management lifeline)")
 		d.enterBootstrapMode()
+		// #3868: no peer re-sync here. This branch reverts a FIRST commit on a
+		// fresh store to the empty tree + bootstrap mode; the reverted active
+		// carries no chassis-cluster/config-sync stanza, so syncConfigToPeer ->
+		// pushConfigToPeer would no-op anyway (and a bootstrap node is not the
+		// RG0 config authority). The divergence #3868 fixes is the NON-nil
+		// rollback target below, where the standby holds a real abandoned
+		// config (C2) as permanent active.
 		return
 	}
 	// #1956 V-3/OQ-15.2: the non-nil rollback target is applied
@@ -372,7 +379,36 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	if err := d.applyConfigLocked(context.Background(), prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
 	}
+	// #3868: RE-SYNC the rolled-back config (C1) to the cluster peer. The
+	// standby already received the unconfirmed config (C2) via config-sync
+	// SyncApply, which arms NO confirm timer, so it holds C2 as its PERMANENT
+	// active. PromoteRollback above reverted only THIS node's store to C1;
+	// without this push the nodes DIVERGE (primary=C1, standby=C2) and a
+	// failover would serve the abandoned C2. syncConfigToPeer reads the
+	// now-promoted active (C1) via ShowActive and queues it, exactly like a
+	// normal commit's sync. It self-guards the peer-absent/disconnected case
+	// (nil cluster/sessionSync, not RG0 primary, config-sync disabled, or no
+	// active TCP conn all no-op); the existing reverse-sync-on-reconnect
+	// retries when the peer comes back. Runs under d.applySem (held above),
+	// after PromoteRollback, so the pushed text is always the rollback target.
+	d.resyncRolledBackConfigToPeer()
 	slog.Warn("commit confirmed timed out, configuration rolled back")
+}
+
+// resyncRolledBackConfigToPeer pushes the just-promoted rollback-target config
+// to the cluster peer after a commit-confirmed timeout (#3868). Split out so
+// the confirm-timeout rollback path is unit-testable without a live cluster
+// transport: rollback_resync_test.go injects d.resyncPeerForTest to observe the
+// call; production leaves it nil and the real syncConfigToPeer runs. MUST be
+// called with d.applySem held and AFTER PromoteRollback so d.store.ShowActive()
+// (read inside syncConfigToPeer -> pushConfigToPeer) reflects the rolled-back
+// config, not the abandoned unconfirmed one.
+func (d *Daemon) resyncRolledBackConfigToPeer() {
+	if d.resyncPeerForTest != nil {
+		d.resyncPeerForTest()
+		return
+	}
+	d.syncConfigToPeer()
 }
 
 // applyConfigLocked runs the actual reconcile pipeline. MUST be

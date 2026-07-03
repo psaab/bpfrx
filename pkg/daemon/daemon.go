@@ -316,6 +316,16 @@ type Daemon struct {
 	// / commitAndApply paths without standing up the full dataplane.
 	applyBodyForTest func(*config.Config)
 
+	// resyncPeerForTest, when non-nil, replaces the real
+	// d.syncConfigToPeer() call the commit-confirmed timeout rollback
+	// makes to converge the standby onto the rolled-back config (#3868).
+	// Test-only seam: the production peer re-sync path (syncConfigToPeer
+	// -> pushConfigToPeer -> SessionSync.QueueConfig) needs a live TCP
+	// transport, so rollback_resync_test.go injects this to observe that
+	// executeConfirmedRollback re-syncs the C1 rollback target after
+	// PromoteRollback.
+	resyncPeerForTest func()
+
 	// hostInboundAddresslessZones is the set of configured host-inbound-
 	// enforcing zones observed in the transient fail-open admit window on the
 	// PREVIOUS apply (#3698): a zone with a non-lifeline interface but no
