@@ -622,7 +622,7 @@ impl WgEngine {
     ///   1. Build a fresh `PeerTable` off-line (no readers see partial
     ///      state).
     ///   2. Identify peers present in the old table but absent in the
-    ///      new one. Drain their `(current, previous)` session
+    ///      new one. Drain their `(current, previous, next)` session
     ///      `local_index` entries from `sessions_by_local_index`
     ///      before publishing the new table — otherwise an inbound
     ///      packet targeting a removed peer's session would decrypt
@@ -707,6 +707,11 @@ impl WgEngine {
             }
             if let Some(prev) = peer.previous.read().unwrap().as_ref() {
                 dropped_indices.push(prev.local_index);
+            }
+            // #3882: the pending `next` (unconfirmed responder) keypair
+            // is also demux-registered; drain it too or its entry leaks.
+            if let Some(next) = peer.next.read().unwrap().as_ref() {
+                dropped_indices.push(next.local_index);
             }
         }
         if !dropped_indices.is_empty() {
@@ -794,6 +799,36 @@ impl WgEngine {
             peer_index_by_pubkey: old.peer_index_by_pubkey.clone(),
             allowed_ips: old.allowed_ips.clone(),
         }));
+    }
+
+    /// Test-only: promote a peer's pending `next` keypair to `current`
+    /// exactly as the first authenticated inbound data record would
+    /// (drives `maybe_promote_next` → `promote_next` + demux cleanup),
+    /// WITHOUT running a real decap (no counter / tx / replay side
+    /// effects). Lets fixtures model a fully-established tunnel where the
+    /// responder session has been confirmed AND promoted. No-op if the
+    /// peer's `next` no longer holds `session` (#3882).
+    #[cfg(test)]
+    pub(crate) fn promote_next_for_test(&self, pubkey: &[u8; 32], session: &Arc<WgSession>) {
+        if let Some(peer) = self.peer_arc(pubkey) {
+            self.maybe_promote_next(&peer, session);
+        }
+    }
+
+    /// Test-only: force a session directly into a peer's `current` slot
+    /// (and register it for demux), bypassing the role-based install
+    /// routing. Used to exercise the egress `is_confirmed()`
+    /// defense-in-depth gate, which the #3882 3-slot model makes the
+    /// natural responder path no longer reach (an unconfirmed responder
+    /// keypair now parks in `next`, never `current`).
+    #[cfg(test)]
+    pub(crate) fn force_current_for_test(&self, pubkey: &[u8; 32], session: Arc<WgSession>) {
+        let peer = self.peer_arc(pubkey).expect("peer exists");
+        self.sessions_by_local_index
+            .write()
+            .unwrap()
+            .insert(session.local_index, session.clone());
+        *peer.current.write().unwrap() = Some(session);
     }
 
     /// Long-lived session/timer state for a peer (NOT its config).
@@ -884,22 +919,22 @@ impl WgEngine {
         // this trivially in expectation; a collision means the
         // caller must regenerate and retry).
         //
-        // After the demux insert, rotate_session() returns whichever
-        // session falls off the (current, previous) pair. That
-        // dropped session MUST then be removed from the demux map,
-        // and because the new session's local_index is now unique by
-        // construction, the remove cannot accidentally evict the
-        // entry we just inserted. The single-locked-region pattern
-        // keeps the (demux, current, previous) triple visible
-        // together to any subsequent decap.
+        // After the demux insert, install_new_session() routes the new
+        // session into `current` (initiator) or `next` (responder) per
+        // the 3-slot lifecycle and returns whichever session(s) fall out
+        // of the slots. Those evicted sessions MUST then be removed from
+        // the demux map, and because the new session's local_index is
+        // now unique by construction, the removes cannot accidentally
+        // evict the entry we just inserted. The single-locked-region
+        // pattern keeps the (demux, current, previous, next) tuple
+        // visible together to any subsequent decap.
         let new_local_index = session.local_index;
         let mut by_index = self.sessions_by_local_index.write().unwrap();
         if by_index.contains_key(&new_local_index) {
             return Err(InstallSessionError::LocalIndexCollision);
         }
         by_index.insert(new_local_index, session.clone());
-        let dropped_previous = peer.rotate_session(session);
-        if let Some(old) = dropped_previous {
+        for old in peer.install_new_session(session) {
             // `old.local_index != new_local_index` is guaranteed by
             // the uniqueness check above; the explicit assert keeps
             // the invariant visible if a future change ever relaxes
@@ -908,6 +943,37 @@ impl WgEngine {
             by_index.remove(&old.local_index);
         }
         Ok(())
+    }
+
+    /// #3882: promote a peer's pending `next` keypair to `current` when
+    /// the just-authenticated inbound `session` IS that pending keypair
+    /// (WG confirm-on-first-inbound-data). Called from `try_decap` after
+    /// a successful AEAD authenticate.
+    ///
+    /// Fast path: a cheap `next` RwLock read; if the record was on the
+    /// peer's `current`/`previous` (steady state) or the peer has no
+    /// pending `next`, return immediately with no `reconcile_lock`.
+    /// Slow path (once per responder rekey): take `reconcile_lock` to
+    /// serialize with install/reconcile/expiry, re-check `next` identity,
+    /// slide next→current (old current→previous), and drop the evicted
+    /// previous keypair from the demux map.
+    fn maybe_promote_next(&self, peer: &Peer, session: &Arc<WgSession>) {
+        // Pre-check WITHOUT the reconcile lock — the double-checked
+        // locking pattern (kernel `wg_noise_received_with_keypair`).
+        {
+            let next = peer.next.read().unwrap();
+            match next.as_ref() {
+                Some(n) if Arc::ptr_eq(n, session) => {}
+                _ => return,
+            }
+        }
+        let _guard = self.reconcile_lock.lock().unwrap();
+        if let Some(dropped_previous) = peer.promote_next(session) {
+            self.sessions_by_local_index
+                .write()
+                .unwrap()
+                .remove(&dropped_previous.local_index);
+        }
     }
 
     /// Hot-path encap.
@@ -1193,6 +1259,19 @@ impl WgEngine {
         // confirmation — the authentication is what the WG spec
         // ties confirmation to, not downstream policy gates.
         session.mark_confirmed();
+        // #3882 WG 3-slot keypair lifecycle: an authenticated inbound
+        // record on a peer's pending `next` (unconfirmed responder)
+        // keypair CONFIRMS it — promote next→current (old current→
+        // previous) so egress switches to the freshly-confirmed keypair.
+        // Done here (before the replay/LPM gates, same rationale as
+        // mark_confirmed) off ONE peer snapshot reused by the timer
+        // block below. The common steady-state record (on `current` or
+        // `previous`) returns from the fast pre-check with only a cheap
+        // RwLock read — no reconcile lock.
+        let peer = self.peer_arc(&session.peer_pubkey);
+        if let Some(peer) = peer.as_ref() {
+            self.maybe_promote_next(peer, &session);
+        }
         // Check the replay window AFTER successful decrypt — per
         // RFC 6479 / the WG paper, we mustn't update the window
         // for packets that fail authentication, or an attacker
@@ -1228,7 +1307,7 @@ impl WgEngine {
         // (arms T6) vs authenticated-recv (clears T7 only — a received
         // keepalive must not arm T6, no keepalive ping-pong).
         {
-            if let Some(peer) = self.peer_arc(&session.peer_pubkey) {
+            if let Some(peer) = peer.as_ref() {
                 if n == 0 {
                     peer.note_authenticated_recv(now_ns);
                 } else {

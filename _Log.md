@@ -1,3 +1,42 @@
+## 2026-07-03 — #3882: WireGuard responder rekey promoted an UNCONFIRMED session straight to `current` (no `next` slot) — 3-slot keypair lifecycle fix
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-019 (HIGH security, replayable egress DoS).
+    The userspace WG used a 2-slot keypair model (current/previous). When xpf
+    was the RESPONDER to a (re)key, `install_session` rotated the UNCONFIRMED
+    new session straight into `current`, demoting the confirmed keypair to
+    `previous`. Egress (`try_encap`) reads `current` only → NoSession → every
+    PEER-INITIATED rekey blackholed xpf→peer egress until the peer sent data
+    (replayable → persistent egress DoS).
+  - **Fix**: Added a third `next` keypair slot mirroring kernel WireGuard's
+    current/previous/next lifecycle. `Peer::install_new_session` (peer.rs) now
+    routes by role: Initiator → `current` (confirmed by the handshake response,
+    old current→previous, stale `next` evicted); Responder → `next`
+    (unconfirmed; `current`/`previous` untouched so egress never blackholes).
+    `try_decap` → `WgEngine::maybe_promote_next` (engine.rs) promotes
+    next→current (old current→previous) on the FIRST authenticated inbound data
+    record on the `next` keypair (WG confirm-on-first-inbound-data), via a
+    double-checked lock (cheap `next` read pre-check; `reconcile_lock` only on
+    the actual promotion). `Peer::promote_next` does the slot slide. `next` is
+    demux-registered, drained on peer-removal (`reconcile_peers`) and torn down
+    at REJECT_AFTER_TIME (`expire_sessions`). The initiator lifecycle and the
+    egress `is_confirmed()` defense-in-depth gate are unchanged; no wire change.
+  - **Validation**: FULL `cargo test --release` green
+    (CARGO_TARGET_DIR=/dev/shm/cargo-3882). RED-on-revert proven: reverting the
+    responder→`next` routing to the 2-slot rotate makes
+    `peer_initiated_rekey_does_not_blackhole_egress` panic on the egress
+    `.expect`. New tests: peer-initiated-rekey no-blackhole + promote +
+    previous-keypair grace; initiator-rekey immediate switch; rewrote
+    `encap_no_session_vs_unconfirmed_split` for the 3-slot reality (unconfirmed
+    keypair in `next` ⇒ no_session, gate kept as defense-in-depth). FLAG:
+    test-failover / WG-rekey-soak WARRANTED (batch-validate).
+  - **File(s)**: userspace-dp/src/afxdp/wg/peer.rs (next slot + install_new_session
+    + promote_next), userspace-dp/src/afxdp/wg/engine.rs (install_session_locked
+    role routing, maybe_promote_next, reconcile next-drain, test helpers),
+    userspace-dp/src/afxdp/wg/timers.rs (expire next slot),
+    userspace-dp/src/afxdp/wg/counters.rs (doc), userspace-dp/src/afxdp/wg/tests.rs
+    (established_pair promote + 2 new tests + rewrites),
+    docs/pr/wireguard-clean/plan.md (3-slot lifecycle bullet)
 ## 2026-07-03 — #3890: typo'd application-set member keyword silently dropped (deny under-populated, fail-open)
 
 - **Timestamp**: 2026-07-03

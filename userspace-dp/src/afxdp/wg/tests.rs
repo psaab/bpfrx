@@ -129,8 +129,17 @@ fn established_pair(
         .install_session(&resp_pub, init_session)
         .unwrap();
     resp_engine
-        .install_session(&init_pub, resp_session)
+        .install_session(&init_pub, resp_session.clone())
         .unwrap();
+    // #3882 3-slot lifecycle: a responder-role install parks the session
+    // in `next`, NOT `current`. Model a fully-established (bidirectional)
+    // tunnel by promoting it — the equivalent of the initiator's first
+    // inbound data record confirming the keypair — so responder-side
+    // encap works for the bulk of the round-trip tests. (The
+    // confirm-on-first-inbound-data path itself is exercised by
+    // `responder_session_blocks_encap_until_initiator_data_authenticated`
+    // and the peer-initiated-rekey tests, which do NOT use this helper.)
+    resp_engine.promote_next_for_test(&init_pub, &resp_session);
 
     (init_engine, resp_engine, init_pub, resp_pub)
 }
@@ -1753,6 +1762,184 @@ mod framed_handshake {
         assert_ne!(init_idx, resp_idx);
     }
 
+    /// #3882 RED-on-revert: a PEER-INITIATED rekey (xpf is the RESPONDER)
+    /// must NOT blackhole the xpf→peer egress direction. Under the 3-slot
+    /// keypair model the unconfirmed new responder keypair parks in
+    /// `next`; egress keeps using the confirmed `current` until the
+    /// peer's first inbound data record on the new keypair promotes it.
+    ///
+    /// On revert (responder keypair rotated straight into `current`, the
+    /// pre-#3882 2-slot behavior) the marked egress `try_encap` returns
+    /// `NoSession` and the `.expect(...)` below panics — the persistent,
+    /// replayable egress DoS the F-019 defect described.
+    #[test]
+    fn peer_initiated_rekey_does_not_blackhole_egress() {
+        let (xpf, peer, xpf_pub, peer_pub) = engine_pair();
+
+        // --- Phase 1: initial handshake, xpf as INITIATOR → a confirmed
+        //     `current` on xpf; xpf→peer egress works. ---
+        let mut m1 = [0u8; WG_MSG_INIT_LEN];
+        xpf.create_initiation(&peer_pub, &mut m1).unwrap();
+        let mut m2 = [0u8; WG_MSG_RESPONSE_LEN];
+        peer.consume_initiation_create_response(&m1, &mut m2)
+            .unwrap();
+        xpf.consume_response(&m2).unwrap();
+        let initial_current = xpf
+            .current_session_local_index(&peer_pub)
+            .expect("xpf holds a confirmed current after the initial handshake");
+
+        let inner = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut wire = [0u8; 2048];
+        let mut plain = [0u8; 2048];
+        // Baseline egress + delivery (peer confirms/promotes its own
+        // responder keypair on this first inbound record).
+        let e0 = xpf
+            .try_encap(&peer_pub, &inner, &mut wire)
+            .expect("baseline xpf→peer egress works");
+        peer.try_decap(&wire[..e0.len], &mut plain).unwrap();
+
+        // --- Phase 2: PEER-INITIATED rekey — peer is initiator, xpf is
+        //     responder; xpf builds a NEW (unconfirmed) responder keypair. ---
+        let mut rk1 = [0u8; WG_MSG_INIT_LEN];
+        peer.create_initiation(&xpf_pub, &mut rk1).unwrap();
+        let mut rk2 = [0u8; WG_MSG_RESPONSE_LEN];
+        xpf.consume_initiation_create_response(&rk1, &mut rk2)
+            .unwrap();
+
+        // RED-on-revert (the F-019 defect): xpf→peer egress must STILL
+        // work right after the peer-initiated rekey — it uses the
+        // confirmed `current`, NOT the unconfirmed new keypair. On revert
+        // (responder keypair rotated into `current`) this returns
+        // NoSession → the `.expect` panics → the persistent egress DoS.
+        // During the window the peer's `current` is also still the old
+        // keypair, so the record round-trips. Capture a peer→xpf record
+        // on the OLD keypair here too, to prove the previous-keypair
+        // decrypt grace after promotion below.
+        let e1 = xpf
+            .try_encap(&peer_pub, &inner, &mut wire)
+            .expect("peer-initiated rekey must NOT blackhole xpf→peer egress");
+        peer.try_decap(&wire[..e1.len], &mut plain)
+            .expect("peer decrypts on the still-current phase-1 keypair");
+
+        // The fix's mechanism: the unconfirmed rekey keypair parked in
+        // `next`; `current` was UNCHANGED (still the confirmed phase-1
+        // keypair) which is why the egress above did not blackhole.
+        {
+            let xp = xpf.peer_arc(&peer_pub).unwrap();
+            assert!(
+                xp.next.read().unwrap().is_some(),
+                "the unconfirmed responder rekey keypair must park in `next`"
+            );
+            assert_eq!(
+                xp.current.read().unwrap().as_ref().map(|s| s.local_index),
+                Some(initial_current),
+                "current must stay the confirmed phase-1 keypair — egress must not switch \
+                 to the unconfirmed one"
+            );
+        }
+        let mut wire_old = [0u8; 2048];
+        let e_old = peer
+            .try_encap(&xpf_pub, &inner, &mut wire_old)
+            .expect("peer egress on its (still current) old keypair");
+        let e_old_len = e_old.len;
+
+        // --- Phase 3: peer completes its side and sends the first data
+        //     record on the NEW keypair → xpf promotes next→current. ---
+        peer.consume_response(&rk2).unwrap();
+        let e_new = peer.try_encap(&xpf_pub, &inner, &mut wire).unwrap();
+        xpf.try_decap(&wire[..e_new.len], &mut plain)
+            .expect("xpf decrypts the first inbound data on the new keypair");
+
+        let promoted_current = xpf.current_session_local_index(&peer_pub).unwrap();
+        assert_ne!(
+            promoted_current, initial_current,
+            "first inbound data on `next` must promote it to `current`"
+        );
+        {
+            let xp = xpf.peer_arc(&peer_pub).unwrap();
+            assert!(
+                xp.next.read().unwrap().is_none(),
+                "`next` drained after promotion"
+            );
+            assert_eq!(
+                xp.previous.read().unwrap().as_ref().map(|s| s.local_index),
+                Some(initial_current),
+                "old current demoted to previous (in-flight reverse-traffic grace)"
+            );
+        }
+
+        // Previous-keypair grace: the peer→xpf record captured on the OLD
+        // keypair during the window still decrypts now that that keypair
+        // sits in `previous`.
+        xpf.try_decap(&wire_old[..e_old_len], &mut plain)
+            .expect("previous keypair must still decrypt in-flight reverse traffic");
+
+        // Egress still works, now on the promoted keypair.
+        let e2 = xpf
+            .try_encap(&peer_pub, &inner, &mut wire)
+            .expect("egress works on the promoted keypair");
+        peer.try_decap(&wire[..e2.len], &mut plain).unwrap();
+    }
+
+    /// #3882 guard: an xpf-INITIATED rekey is confirmed by the peer's
+    /// response, so its keypair goes straight to `current` (old
+    /// current→previous) and egress switches immediately — the initiator
+    /// lifecycle is UNCHANGED by the 3-slot responder fix, and `next`
+    /// stays empty.
+    #[test]
+    fn initiator_rekey_switches_current_immediately() {
+        let (xpf, peer, _xpf_pub, peer_pub) = engine_pair();
+
+        let mut m1 = [0u8; WG_MSG_INIT_LEN];
+        xpf.create_initiation(&peer_pub, &mut m1).unwrap();
+        let mut m2 = [0u8; WG_MSG_RESPONSE_LEN];
+        peer.consume_initiation_create_response(&m1, &mut m2)
+            .unwrap();
+        xpf.consume_response(&m2).unwrap();
+        let first = xpf.current_session_local_index(&peer_pub).unwrap();
+
+        // xpf initiates a REKEY. The peer builds a fresh responder
+        // keypair + msg2; xpf.consume_response installs the new INITIATOR
+        // keypair straight into `current`.
+        let mut rm1 = [0u8; WG_MSG_INIT_LEN];
+        xpf.create_initiation(&peer_pub, &mut rm1).unwrap();
+        let mut rm2 = [0u8; WG_MSG_RESPONSE_LEN];
+        peer.consume_initiation_create_response(&rm1, &mut rm2)
+            .unwrap();
+        xpf.consume_response(&rm2).unwrap();
+
+        let second = xpf.current_session_local_index(&peer_pub).unwrap();
+        assert_ne!(
+            second, first,
+            "initiator rekey switches `current` immediately"
+        );
+        {
+            let xp = xpf.peer_arc(&peer_pub).unwrap();
+            assert!(
+                xp.next.read().unwrap().is_none(),
+                "an initiator install must not populate `next`"
+            );
+            assert_eq!(
+                xp.previous.read().unwrap().as_ref().map(|s| s.local_index),
+                Some(first),
+                "old current demoted to previous"
+            );
+            assert!(
+                xp.current.read().unwrap().as_ref().unwrap().is_confirmed(),
+                "the initiator keypair is confirmed at install"
+            );
+        }
+        // Egress works immediately on the new keypair (no
+        // wait-for-inbound as the responder path requires).
+        let inner = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut wire = [0u8; 2048];
+        let mut plain = [0u8; 2048];
+        let e = xpf
+            .try_encap(&peer_pub, &inner, &mut wire)
+            .expect("egress on the rekeyed initiator keypair");
+        peer.try_decap(&wire[..e.len], &mut plain).unwrap();
+    }
+
     /// msg1's mac1 keys on the RESPONDER's pubkey; a responder configured
     /// with a different identity rejects it with Mac1Mismatch.
     #[test]
@@ -2651,14 +2838,19 @@ mod telemetry_counters {
         let _ = enc;
     }
 
-    /// The unconfirmed-vs-no-session split (AGY r2 #1736): the
-    /// responder key-confirmation gate bumps `encap_drops_unconfirmed`
-    /// (NOT no_session) while still returning `NoSession`; an engine
-    /// with a peer but no session at all bumps `encap_drops_no_session`.
+    /// The unconfirmed-vs-no-session split (AGY r2 #1736) under the
+    /// #3882 3-slot keypair model. A fresh responder handshake parks the
+    /// UNCONFIRMED keypair in `next`, leaving `current` empty, so egress
+    /// reports NO-SESSION (the confirmed `current` — here absent — is
+    /// what egress uses; the unconfirmed keypair never enters `current`).
+    /// The `is_confirmed()` gate survives as a defense-in-depth
+    /// invariant, verified here by forcing an unconfirmed session into
+    /// `current`. An engine with a peer but no session at all bumps
+    /// `encap_drops_no_session`.
     #[test]
     fn encap_no_session_vs_unconfirmed_split() {
-        // Unconfirmed: drive the framed handshake so the responder
-        // holds a real (unconfirmed) session, then encap from it.
+        // Drive the framed handshake so the responder holds a real
+        // (unconfirmed) session — which the 3-slot model parks in `next`.
         let (init, resp, init_pub, resp_pub) = framed_engine_pair();
         let mut msg1 = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
         init.create_initiation(&resp_pub, &mut msg1).unwrap();
@@ -2667,14 +2859,51 @@ mod telemetry_counters {
             .unwrap();
         let inner = ipv4_packet(Ipv4Addr::new(10, 2, 2, 1), Ipv4Addr::new(10, 2, 2, 2));
         let mut wire = [0u8; 2048];
+        // Egress with the keypair in `next` and `current` empty → the
+        // no-session arm (NOT the unconfirmed gate): the 3-slot fix keeps
+        // egress off the unconfirmed keypair without blackholing a
+        // confirmed one.
         let err = resp.try_encap(&init_pub, &inner, &mut wire).unwrap_err();
         assert_eq!(err, EncapError::NoSession, "wire error contract unchanged");
         let rc = resp.counters();
-        assert_eq!(rc.encap_drops_unconfirmed.load(Ordering::Relaxed), 1);
         assert_eq!(
             rc.encap_drops_no_session.load(Ordering::Relaxed),
+            1,
+            "3-slot model: the unconfirmed responder keypair sits in `next`, current is empty"
+        );
+        assert_eq!(
+            rc.encap_drops_unconfirmed.load(Ordering::Relaxed),
             0,
-            "the unconfirmed gate must NOT masquerade as no-session"
+            "an unconfirmed keypair in `next` must not reach the current-session confirmed gate"
+        );
+
+        // Defense-in-depth: the egress `is_confirmed()` gate still
+        // refuses if an UNCONFIRMED session ever occupies `current`.
+        // Force the unconfirmed responder session from `next` into
+        // `current` and confirm the gate — not the no-session arm —
+        // fires.
+        let unconfirmed = resp
+            .peer_arc(&init_pub)
+            .unwrap()
+            .next
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(!unconfirmed.is_confirmed());
+        resp.force_current_for_test(&init_pub, unconfirmed);
+        let err_gate = resp.try_encap(&init_pub, &inner, &mut wire).unwrap_err();
+        assert_eq!(err_gate, EncapError::NoSession, "wire error contract unchanged");
+        assert_eq!(
+            rc.encap_drops_unconfirmed.load(Ordering::Relaxed),
+            1,
+            "an unconfirmed session in `current` must bump the unconfirmed gate"
+        );
+        assert_eq!(
+            rc.encap_drops_no_session.load(Ordering::Relaxed),
+            1,
+            "the unconfirmed gate must NOT masquerade as no-session (no new no_session drop)"
         );
 
         // No session at all: fresh engine, configured peer, no handshake.
@@ -3347,8 +3576,17 @@ mod s5_timer_tests {
             assert_eq!(s.created_ns, 7_000 * SEC);
         }
         {
-            let cur = resp_peer.current.read().unwrap();
-            let s = cur.as_ref().unwrap();
+            // #3882: a fresh responder-role session parks in `next`
+            // (unconfirmed), NOT `current` — egress must not use it
+            // until the initiator's first inbound data record confirms
+            // and promotes it. `current` stays empty on this initial
+            // handshake (no prior confirmed keypair to keep serving).
+            assert!(
+                resp_peer.current.read().unwrap().is_none(),
+                "responder must not promote an unconfirmed keypair into current"
+            );
+            let next = resp_peer.next.read().unwrap();
+            let s = next.as_ref().unwrap();
             assert_eq!(s.role, SessionRole::Responder);
             assert_eq!(s.created_ns, 8_000 * SEC);
         }

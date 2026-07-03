@@ -168,7 +168,8 @@ message and at most one output message. Nothing to "drain".
   lives in a single `ArcSwap<PeerTable>` (`engine.rs:262`) so the
   hot path observes the three sub-fields as one atomic snapshot
   (`peer_arc` does an `ArcSwap::load` only — no lock). Per-peer
-  session state (`peer.current` / `peer.previous`) is
+  session state (`peer.current` / `peer.previous` / `peer.next`, the
+  3-slot keypair lifecycle — see below) is
   `RwLock<Option<Arc<WgSession>>>` and ingress demux
   (`sessions_by_local_index`) is `RwLock<FxHashMap<u32, Arc<WgSession>>>`,
   so encap takes one `RwLock::read` on `peer.current`
@@ -179,7 +180,27 @@ message and at most one output message. Nothing to "drain".
   earlier draft of this bullet claimed "never under a lock on the
   hot path"; that overstated the invariant — the lock-free property
   applies to the peer-table snapshot via `ArcSwap`, not to the
-  per-session current/previous slots or the inbound demux map.
+  per-session current/previous/next slots or the inbound demux map.
+- 3-slot keypair lifecycle (#3882, mirrors kernel WireGuard
+  `current`/`previous`/`next`): `peer.current` is the CONFIRMED
+  keypair egress encrypts with; `peer.previous` retains the prior
+  current so in-flight reverse traffic decrypts across a rotation;
+  `peer.next` holds a responder-role keypair that has NOT yet been
+  confirmed. When xpf is the RESPONDER to a (re)key,
+  `Peer::install_new_session` parks the new session in `next`, NOT
+  `current` — egress keeps using the confirmed `current`, so a
+  peer-initiated rekey never blackholes xpf→peer egress. The first
+  authenticated inbound data record on the `next` keypair
+  (`WgEngine::maybe_promote_next` in `try_decap`, double-checked
+  locking under `reconcile_lock`) promotes next→current (old
+  current→previous). Initiator-role installs (the handshake response
+  already confirmed them) go straight into `current` as before. All
+  three slots are demux-registered, drained on peer-removal
+  (`reconcile_peers`), and torn down at REJECT_AFTER_TIME
+  (`expire_sessions`). Before #3882 the 2-slot model rotated the
+  unconfirmed responder keypair straight into `current`, so every
+  peer-initiated rekey blackholed egress until the peer sent data — a
+  replayable egress DoS (fable-161 F-019).
 - Replay windows are per-session, tracked by a `ReplayState`
   (single counter + 64-bit sliding bitmap, RFC 6479) guarded by a
   `std::sync::Mutex` on the session. Encap is lock-free on the

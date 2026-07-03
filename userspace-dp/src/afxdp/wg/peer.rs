@@ -3,8 +3,10 @@
 //! A peer holds:
 //!   - Its static public key (the identity used by the engine table).
 //!   - Optionally an endpoint (UDP `IP:port`) for outbound handshake.
-//!   - Active and previous transport sessions (current + prior, to
-//!     allow in-flight rekey handover).
+//!   - The 3-slot keypair lifecycle (#3882): `current` (confirmed,
+//!     egress), `previous` (prior current, in-flight rekey handover),
+//!     and `next` (unconfirmed responder keypair awaiting the peer's
+//!     first inbound data record). See the `Peer` struct doc.
 //!
 //! Reconciliation: the engine rebuilds the peer set from the config
 //! snapshot whenever a new snapshot lands. Existing peer state is
@@ -12,7 +14,7 @@
 //! AllowedIPs trie is rebuilt fresh because its index space is
 //! tied to the snapshot.
 
-use super::session::WgSession;
+use super::session::{SessionRole, WgSession};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -92,10 +94,34 @@ impl std::fmt::Debug for PeerConfig {
 
 /// A peer's long-lived, config-independent state: its identity, its
 /// transport sessions, and its timer bookkeeping. Reused across config
-/// commits (same pubkey → same `Arc<Peer>`) so the (current, previous)
-/// session pair and timer pacing survive a commit. The operator-facing
-/// config tuple lives in the per-snapshot `PeerConfig` (#2836), NOT
-/// here, so config changes are observed atomically with the table swap.
+/// commits (same pubkey → same `Arc<Peer>`) so the
+/// (current, previous, next) keypair slots and timer pacing survive a
+/// commit. The operator-facing config tuple lives in the per-snapshot
+/// `PeerConfig` (#2836), NOT here, so config changes are observed
+/// atomically with the table swap.
+///
+/// ## 3-slot keypair lifecycle (#3882)
+///
+/// The three session slots mirror the kernel WireGuard
+/// current/previous/next keypair model (`drivers/net/wireguard/noise.c`,
+/// `add_new_keypair` / `wg_noise_received_with_keypair`):
+///
+///   - **current** — the CONFIRMED keypair egress encrypts with. Only
+///     ever set to a confirmed session: an initiator-role session (the
+///     handshake response confirmed it) or a `next` session promoted
+///     after its first authenticated inbound data record.
+///   - **previous** — the prior current, retained across a rotation so
+///     in-flight reverse traffic on the old keypair still decrypts.
+///   - **next** — a responder-role keypair that has NOT yet been
+///     confirmed. When xpf is the RESPONDER to a (re)key, the new
+///     session lands here, NOT in `current`; egress keeps using the
+///     confirmed `current` until the initiator proves it completed the
+///     handshake by sending the first inbound data record on the new
+///     keypair, at which point `promote_next` slides next→current
+///     (old current→previous). Before #3882 the unconfirmed responder
+///     session was rotated straight into `current`, so every
+///     peer-initiated rekey blackholed xpf→peer egress until the peer
+///     sent data (a replayable egress DoS — the F-019 defect).
 pub(crate) struct Peer {
     pub(crate) pubkey: [u8; 32],
     /// #1888 S5 activity stamps + armed timers, all CLOCK_MONOTONIC ns
@@ -138,6 +164,14 @@ pub(crate) struct Peer {
     /// in-flight ciphertexts decrypt successfully. Same lock
     /// discipline as `current`.
     pub(crate) previous: RwLock<Option<Arc<WgSession>>>,
+    /// The pending (unconfirmed) responder keypair (#3882). Populated
+    /// when xpf responds to a peer-initiated (re)key; egress NEVER
+    /// reads this slot. Promoted to `current` by `promote_next` on the
+    /// first authenticated inbound data record. Same lock discipline as
+    /// `current`. Its session is registered in the engine demux map so
+    /// that first inbound record can be decrypted and trigger the
+    /// promotion.
+    pub(crate) next: RwLock<Option<Arc<WgSession>>>,
 }
 
 impl std::fmt::Debug for Peer {
@@ -148,6 +182,7 @@ impl std::fmt::Debug for Peer {
             .field("pubkey", &self.pubkey)
             .field("current", &self.current)
             .field("previous", &self.previous)
+            .field("next", &self.next)
             .finish()
     }
 }
@@ -163,6 +198,7 @@ impl Peer {
             t8_last_attempt_ns: AtomicU64::new(0),
             current: RwLock::new(None),
             previous: RwLock::new(None),
+            next: RwLock::new(None),
         }
     }
 
@@ -213,14 +249,68 @@ impl Peer {
         );
     }
 
-    /// Replace `current` with `new`, moving the old current to
-    /// `previous`. Called from the slow-path handshake-complete code.
-    pub(crate) fn rotate_session(&self, new: Arc<WgSession>) -> Option<Arc<WgSession>> {
-        let old_current = {
-            let mut cur = self.current.write().unwrap();
-            cur.replace(new)
+    /// Install a freshly-completed transport session per the WG 3-slot
+    /// keypair lifecycle (#3882, mirrors kernel `add_new_keypair`).
+    /// Returns every session EVICTED from a slot so the caller can drop
+    /// its demux entry.
+    ///
+    ///   - **Initiator role** — the handshake response already confirmed
+    ///     this keypair, so it becomes `current` immediately: demote the
+    ///     old current to `previous`, discard any pending (unconfirmed)
+    ///     `next` (superseded by this confirmed keypair), and evict the
+    ///     old previous.
+    ///   - **Responder role** — the keypair is UNCONFIRMED (the initiator
+    ///     has not proven it completed the handshake), so it is parked in
+    ///     `next`; `current` keeps serving egress. Any stale pending
+    ///     `next` is replaced (and evicted). `current`/`previous` are
+    ///     left untouched so a peer-initiated rekey never blackholes the
+    ///     xpf→peer direction.
+    ///
+    /// Each slot lock is taken and released independently (never nested),
+    /// matching the rest of the module's discipline; the caller holds the
+    /// engine `reconcile_lock` so no concurrent installer/promoter/expiry
+    /// can interleave.
+    pub(crate) fn install_new_session(&self, new: Arc<WgSession>) -> Vec<Arc<WgSession>> {
+        let mut evicted: Vec<Arc<WgSession>> = Vec::new();
+        if matches!(new.role, SessionRole::Initiator) {
+            // A pending unconfirmed responder keypair is superseded by
+            // this confirmed initiator keypair — drop it.
+            if let Some(old_next) = self.next.write().unwrap().take() {
+                evicted.push(old_next);
+            }
+            let old_current = self.current.write().unwrap().replace(new);
+            if let Some(old_prev) =
+                std::mem::replace(&mut *self.previous.write().unwrap(), old_current)
+            {
+                evicted.push(old_prev);
+            }
+        } else {
+            // Responder: unconfirmed. Park in `next`; egress keeps using
+            // the confirmed `current` until the first inbound data record
+            // promotes it.
+            if let Some(old_next) = self.next.write().unwrap().replace(new) {
+                evicted.push(old_next);
+            }
+        }
+        evicted
+    }
+
+    /// Promote the pending `next` keypair to `current` (moving the old
+    /// current to `previous`) IFF `next` is still `expected` (#3882 WG
+    /// confirm-on-first-inbound-data). Returns the session evicted from
+    /// `previous` (to drop from the demux map), or `None` if `next` no
+    /// longer holds `expected` (a concurrent install/promote raced, or
+    /// it was already promoted). Caller holds `reconcile_lock`.
+    pub(crate) fn promote_next(&self, expected: &Arc<WgSession>) -> Option<Arc<WgSession>> {
+        let promoted = {
+            let mut next = self.next.write().unwrap();
+            match next.as_ref() {
+                Some(n) if Arc::ptr_eq(n, expected) => {}
+                _ => return None,
+            }
+            next.take().expect("next is Some (matched above)")
         };
-        let mut prev = self.previous.write().unwrap();
-        std::mem::replace(&mut *prev, old_current)
+        let old_current = self.current.write().unwrap().replace(promoted);
+        std::mem::replace(&mut *self.previous.write().unwrap(), old_current)
     }
 }

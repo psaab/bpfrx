@@ -191,20 +191,23 @@ impl WgEngine {
         }
     }
 
-    /// Tear down current/previous sessions older than
+    /// Tear down current/previous/next sessions older than
     /// REJECT_AFTER_TIME. Holds `reconcile_lock` (serialized with
-    /// install/reconcile — a concurrent `consume_response` cannot
-    /// interleave) and removes the demux entries exactly like the
-    /// reconcile peer-removal drain, so no demux entry can orphan.
-    /// Returns the number of sessions dropped; each bumps
-    /// `sessions_expired`.
+    /// install/reconcile/promote — a concurrent `consume_response` or
+    /// `maybe_promote_next` cannot interleave) and removes the demux
+    /// entries exactly like the reconcile peer-removal drain, so no
+    /// demux entry can orphan. The `next` slot is included so an
+    /// unconfirmed responder keypair the peer never confirms (never
+    /// sends data on) is also torn down at REJECT_AFTER_TIME instead of
+    /// pinning a demux entry (#3882). Returns the number of sessions
+    /// dropped; each bumps `sessions_expired`.
     pub(crate) fn expire_sessions(&self, now_ns: u64) -> usize {
         let _guard = self.reconcile_lock.lock().unwrap();
         let table = self.load_table();
         let mut dropped_indices: Vec<u32> = Vec::new();
         for entry in table.peers.iter() {
             let peer = &entry.peer;
-            for slot in [&peer.current, &peer.previous] {
+            for slot in [&peer.current, &peer.previous, &peer.next] {
                 let mut guard = slot.write().unwrap();
                 if let Some(session) = guard.as_ref() {
                     if now_ns.saturating_sub(session.created_ns) >= REJECT_AFTER_TIME_NS {
