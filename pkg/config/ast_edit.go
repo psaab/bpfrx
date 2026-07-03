@@ -356,6 +356,27 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 		return removeMatchingNode(current, leafKeys)
 	}
 
+	// Value-list multi-leaf (a `multi: true` leaf with a single value slot and
+	// no children): the bracket-list class fixed on the read side in #2419 —
+	// `from protocol [ tcp udp icmp ]`, policy match
+	// source-/destination-address/application, host-inbound-traffic
+	// system-services/protocols, apply-groups, domain-search, and friends. The
+	// leaf carries its members on Keys[1:] AND/OR one child node per member
+	// (the dual AST shape). A `delete ... protocol tcp` names a MEMBER of the
+	// list, not the whole node — remove ONLY that member and keep the rest,
+	// mirroring firewallMatchValues on the read side. A bare `delete ...
+	// protocol` (no trailing member) still clears the whole leaf. Without this
+	// branch removeMatchingNode prefix-matches the leaf by its first key and
+	// deletes the ENTIRE list (a config-integrity fail-wide, #3846), and a
+	// non-first member is undeletable.
+	//
+	// Gate on args == 1 so keyed multi entries (address <name> <prefix>,
+	// args == 2; named containers with children such as `interfaces <name>`)
+	// keep whole-node delete semantics.
+	if childSchema.multi && childSchema.children == nil && childSchema.args == 1 {
+		return removeMultiLeafMembers(current, keyword, path[i+1:])
+	}
+
 	// Consume keyword + extra args as this node's keys.
 	nodeKeyCount := 1 + childSchema.args
 	if i+nodeKeyCount > len(path) {
@@ -497,6 +518,71 @@ func removeMatchingNode(nodes *[]*Node, targetKeys []string) error {
 		}
 	}
 	return fmt.Errorf("path not found: no node matching %q", strings.Join(targetKeys, " "))
+}
+
+// removeMultiLeafMembers implements member-specific deletion for a value-list
+// multi-leaf (a `multi: true` leaf with no children and a single value slot —
+// e.g. `from protocol [ tcp udp icmp ]`). keyword is the leaf's first key
+// ("protocol"); members are the trailing tokens naming individual values to
+// drop.
+//
+//   - members empty  → delete the whole leaf (mirrors removeMatchingNode's
+//     prefix match), so `delete ... from protocol` still clears the list.
+//   - members named  → drop ONLY those values from every node whose first key
+//     is keyword, reading BOTH the flat Keys[1:] shape (bracket list / flat
+//     set) AND the child-node shape (hierarchical block) — the #2419 dual AST
+//     shape. A node left with no values is removed entirely.
+//
+// Returns an error when no named member was found anywhere (mirroring
+// removeMatchingNode's not-found contract), so deleting a member that is not
+// present is reported rather than silently succeeding.
+func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string) error {
+	if len(members) == 0 {
+		return removeMatchingNode(nodes, []string{keyword})
+	}
+	drop := make(map[string]bool, len(members))
+	for _, m := range members {
+		drop[m] = true
+	}
+	removedAny := false
+	out := (*nodes)[:0]
+	for _, n := range *nodes {
+		if len(n.Keys) == 0 || n.Keys[0] != keyword {
+			out = append(out, n)
+			continue
+		}
+		// Flat / bracket shape: members ride on Keys[1:].
+		newKeys := append([]string(nil), n.Keys[:1]...)
+		for _, v := range n.Keys[1:] {
+			if drop[v] {
+				removedAny = true
+				continue
+			}
+			newKeys = append(newKeys, v)
+		}
+		// Block shape: one child node per member.
+		newChildren := n.Children[:0]
+		for _, c := range n.Children {
+			if len(c.Keys) >= 1 && drop[c.Keys[0]] {
+				removedAny = true
+				continue
+			}
+			newChildren = append(newChildren, c)
+		}
+		// Leaf/container emptied of all members: drop it entirely.
+		if len(newKeys) == 1 && len(newChildren) == 0 {
+			continue
+		}
+		n.Keys = newKeys
+		n.Children = newChildren
+		out = append(out, n)
+	}
+	*nodes = out
+	if !removedAny {
+		return fmt.Errorf("path not found: no member %q of %q",
+			strings.Join(members, " "), keyword)
+	}
+	return nil
 }
 
 // keysMatch returns true if nodeKeys starts with all elements of targetKeys.

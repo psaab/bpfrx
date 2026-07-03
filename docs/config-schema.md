@@ -108,6 +108,37 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**Delete-side contract: `delete` a member, not the whole list (#3846).**
+The read-side accumulate rule above has a mirror on the edit side. A
+`delete ... from protocol tcp` on a bracket-list leaf must remove ONLY the
+named member (`tcp`), leaving `[ udp icmp ]` intact — NOT prefix-match the
+leaf by its first key and drop the whole list. Before #3846 `deletePath`
+(`ast_edit.go`) fell straight into `removeMatchingNode`/`keysMatch`, whose
+prefix match deleted the entire node on `delete ... protocol tcp` (udp +
+icmp silently gone) and left a NON-FIRST member undeletable
+(`delete ... protocol udp` matched nothing and errored) — a
+config-integrity fail-wide and potential fail-open (a removed match
+constraint widens the term). `deletePath` now intercepts value-list
+multi-leaves (`multi: true`, `children: nil`, `args == 1`) and routes them
+to `removeMultiLeafMembers`, which:
+
+- with trailing member token(s), drops ONLY those members — reading BOTH
+  the flat `Keys[1:]` shape and the child-node shape, exactly mirroring
+  `firewallMatchValues` on the read side — and removes the leaf entirely
+  only once it is emptied of all members;
+- with NO trailing member (`delete ... from protocol`), still clears the
+  whole leaf (via `removeMatchingNode`);
+- reports a member that is not present as not-found, matching
+  `removeMatchingNode`'s contract.
+
+The `args == 1` gate keeps keyed multi entries on whole-node delete
+semantics: `address <name> <prefix>` (`args: 2`) and named containers with
+children such as `interfaces <name>` are untouched, so `delete ... address
+a1` still removes that whole entry, not just its name token. Covered by
+`pkg/config/delete_multi_leaf_member_3846_test.go` (firewall `from
+protocol`, host-inbound-traffic `system-services`, policy match
+`source-address`, and the keyed-entry `address` non-regression).
+
 **Firewall-filter `source/destination-prefix-list` refs are dual-AST too
 (#3843).** These `from` leaves are NOT `multi: true` value-tails — each
 reference carries an optional trailing `except` modifier, so they compile

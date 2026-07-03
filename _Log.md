@@ -28060,3 +28060,32 @@ top.
   rewired source/destination-prefix-list cases),
   pkg/config/compiler_prefix_list_hier_leaf_3843_test.go (new RED-on-revert
   tests), docs/config-schema.md (dual-AST prefix-list-ref note)
+
+- **Timestamp**: 2026-07-03
+- **Action**: Fix #3846 — `delete ... <multi-leaf> <member>` deleted the WHOLE
+  bracket-list, not just the member (config-integrity fail-wide). On a
+  `multi: true` value-list leaf holding a bracket list (`from protocol
+  [ tcp udp icmp ]`, policy match source-/destination-address/application,
+  host-inbound-traffic system-services/protocols), `delete ... from protocol
+  tcp` prefix-matched the leaf by its first key in `removeMatchingNode`/
+  `keysMatch` and dropped the ENTIRE list; a NON-FIRST member
+  (`delete ... protocol udp`) matched nothing and was undeletable. This is the
+  delete-side counterpart of the #2419 multi-value-leaf read class. FIX:
+  `deletePath` now intercepts value-list multi-leaves (`multi: true`,
+  `children: nil`, `args == 1`) and routes them to new helper
+  `removeMultiLeafMembers`, which drops ONLY the named member(s) — reading BOTH
+  the flat `Keys[1:]` shape and the child-node shape, mirroring
+  `firewallMatchValues` on the read side — removes the leaf only once emptied,
+  and still clears the whole leaf on a bare `delete ... from protocol` (no
+  member). The `args == 1` gate keeps keyed multi entries (`address <name>
+  <prefix>`, args 2; named containers `interfaces <name>`) on whole-node delete
+  semantics. RED-on-revert proven: disabling the intercept empties the whole
+  list on the first member delete, errors on a non-first member, and takes
+  sibling members with the host-inbound-services / policy-match member deletes.
+  go test ./pkg/config/... green; go build ./... green; gofmt + vet clean (the
+  two gofmt-flagged files login_password_test.go / static_nat_zone_test.go are
+  pre-existing, not touched here).
+- **File(s)**: pkg/config/ast_edit.go (deletePath intercept +
+  removeMultiLeafMembers helper), pkg/config/delete_multi_leaf_member_3846_test.go
+  (new RED-on-revert tests), docs/config-schema.md (delete-side member-delete
+  contract note)
