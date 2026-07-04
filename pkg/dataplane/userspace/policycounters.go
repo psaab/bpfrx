@@ -7,7 +7,26 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// Test-only observability hooks. Both are nil in production, so the only
+// runtime cost is a nil check on the 1/15s counter-read path.
+//
+//   - policyRuleCounterIndexBuildObserver fires each time the ruleID->counter
+//     index is built. A bulk ReadAllPolicyCounters builds it EXACTLY ONCE
+//     (O(P+C)); a test asserts the read did not regress to the per-policy
+//     rebuild the pre-#3965 ReadPolicyCounters loop performed (O(P*(P+C))).
+//   - policyCounterResolveObserver fires AFTER ReadAllPolicyCounters releases
+//     the snapshot lock, during the lock-free resolution phase. A test uses it
+//     to assert the policy mutex is not held across the whole read
+//     (snapshot-and-release), so a concurrent commit/apply is not starved.
+var (
+	policyRuleCounterIndexBuildObserver func()
+	policyCounterResolveObserver        func()
+)
+
 func buildPolicyRuleCounterIndex(status *ProcessStatus) map[string]PolicyRuleCounterStatus {
+	if policyRuleCounterIndexBuildObserver != nil {
+		policyRuleCounterIndexBuildObserver()
+	}
 	index := make(map[string]PolicyRuleCounterStatus)
 	if status == nil {
 		return index
@@ -142,6 +161,135 @@ func (m *Manager) ReadPolicyCounters(policyID uint32) (dataplane.CounterValue, e
 	total.Packets += counter.Packets
 	total.Bytes += counter.Bytes
 	return total, nil
+}
+
+// ErrPolicyCounterUnpublished is returned by the reader NewPolicyCounterReader
+// builds for a policy whose per-rule counter the helper has not published. It
+// mirrors the error the per-policy ReadPolicyCounters returned in userspace mode
+// for the same case (the retired bpfShim map-not-found error surfaced when the
+// helper counter was absent), so callers keep their existing degraded-read
+// handling (Prometheus skip-and-bump, REST HTTP 500).
+var ErrPolicyCounterUnpublished = errors.New("policy counter not published")
+
+// ReadAllPolicyCounters returns every published per-policy counter keyed by the
+// numeric policy-counter handle the read callers compute
+// (policySetID*MaxRulesPerPolicy + sliceIndex, plus DefaultPolicySentinelID for
+// the implicit default policy). It is the O(P+C), snapshot-and-release bulk read
+// that replaces looping the per-policy ReadPolicyCounters on the observability
+// paths (#3965).
+//
+// The pre-#3965 pattern — a Prometheus scrape (every ~15s) calling
+// ReadPolicyCounters once per policy — was O(P*(P+C)) AND held the policy mutex
+// m.mu for the ENTIRE read: each call rebuilt the whole ruleID->counter index
+// (O(C)) and rescanned the config (O(P)) under the lock, so a firewall with many
+// policies periodically starved commit/apply and session classification for the
+// duration of the scrape. This method instead:
+//
+//   - takes m.mu only briefly to COPY the helper-published counter slice
+//     (and, if the caller passes a nil config, the last snapshot config), then
+//     releases it before doing any resolution/formatting;
+//   - builds the ruleID->counter index EXACTLY ONCE (O(C));
+//   - walks the config ONCE (O(P)), resolving each policy's handle -> ruleID ->
+//     counter.
+//
+// The caller SHOULD pass the same config it walks for labels (the active
+// config), so the returned handles line up with the caller's computed handles.
+// A nil config falls back to the last published snapshot config.
+//
+// The retired-eBPF bpfShim policy_counters array is intentionally NOT consulted:
+// it is never incremented in userspace mode (the only runtime forwarding path),
+// so it contributes zero. The single-policy ReadPolicyCounters retains the
+// bpfShim add solely for legacy API parity.
+func (m *Manager) ReadAllPolicyCounters(cfg *config.Config) (map[uint32]dataplane.CounterValue, error) {
+	m.mu.Lock()
+	if cfg == nil && m.lastSnapshot != nil {
+		cfg = m.lastSnapshot.Config
+	}
+	counters := append([]PolicyRuleCounterStatus(nil), m.lastStatus.PolicyRuleCounters...)
+	m.mu.Unlock()
+
+	if policyCounterResolveObserver != nil {
+		policyCounterResolveObserver()
+	}
+
+	result := make(map[uint32]dataplane.CounterValue)
+	if cfg == nil {
+		return result, nil
+	}
+	index := buildPolicyRuleCounterIndex(&ProcessStatus{PolicyRuleCounters: counters})
+
+	put := func(policyID uint32, ruleID string) {
+		if c, ok := index[ruleID]; ok {
+			result[policyID] = dataplane.CounterValue{Packets: c.Packets, Bytes: c.Bytes}
+		}
+	}
+
+	var policySetID uint32
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			// A nil zone-pair slot still consumes a policy-set ID, matching
+			// policyRuleIDForCounter and every counter caller.
+			policySetID++
+			continue
+		}
+		for i, rule := range zpp.Policies {
+			if rule == nil {
+				continue
+			}
+			put(policySetID*dataplane.MaxRulesPerPolicy+uint32(i),
+				stablePolicyRuleID(zpp.FromZone, zpp.ToZone, rule.Name))
+		}
+		policySetID++
+	}
+	for i, rule := range cfg.Security.GlobalPolicies {
+		if rule == nil {
+			continue
+		}
+		put(policySetID*dataplane.MaxRulesPerPolicy+uint32(i),
+			stablePolicyRuleID("junos-global", "junos-global", rule.Name))
+	}
+	// #3363: the implicit default-policy hit counter is published under the
+	// stable rule id dataplane.DefaultPolicyName and read via the reserved
+	// sentinel handle.
+	put(dataplane.DefaultPolicySentinelID, dataplane.DefaultPolicyName)
+
+	return result, nil
+}
+
+// NewPolicyCounterReader returns a per-policy counter reader that the
+// observability surfaces (Prometheus collector, REST inventory) use in place of
+// looping ReadPolicyCounters. When dp provides the bulk ReadAllPolicyCounters
+// snapshot (the userspace Manager), the whole policy set is read O(P+C) with a
+// single brief lock: the reader closes over the snapshot map and does O(1)
+// lookups, returning ErrPolicyCounterUnpublished for a policy the helper has not
+// published (the same skip/error signal the per-policy read produced). Otherwise
+// (the retired eBPF Manager, test fakes) it returns fallback unchanged — the
+// per-policy read path, bit-for-bit as before.
+//
+// cfg should be the config the caller walks for labels/handles so the snapshot's
+// handles line up. dp is taken as any so callers can pass their narrow runtime
+// interface without a shared type.
+func NewPolicyCounterReader(dp any, cfg *config.Config, fallback func(uint32) (dataplane.CounterValue, error)) func(uint32) (dataplane.CounterValue, error) {
+	provider, ok := dp.(interface {
+		ReadAllPolicyCounters(*config.Config) (map[uint32]dataplane.CounterValue, error)
+	})
+	if !ok {
+		return fallback
+	}
+	bulk, err := provider.ReadAllPolicyCounters(cfg)
+	if err != nil {
+		// Surface the read failure through the same per-policy error channel so
+		// callers keep their existing degraded-read handling.
+		return func(uint32) (dataplane.CounterValue, error) {
+			return dataplane.CounterValue{}, err
+		}
+	}
+	return func(policyID uint32) (dataplane.CounterValue, error) {
+		if v, ok := bulk[policyID]; ok {
+			return v, nil
+		}
+		return dataplane.CounterValue{}, ErrPolicyCounterUnpublished
+	}
 }
 
 func (m *Manager) ClearPolicyCounters() error {
