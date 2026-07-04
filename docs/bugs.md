@@ -1034,6 +1034,11 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Root cause:** Same as #135 — tcpdump attached to IPVLAN overlay instead of physical parent
 - **Fix:** Resolve fabric overlay name to physical parent before starting packet capture
 
+### monitor traffic matching truncates multi-token pcap filter to first token (FIXED #4005)
+- **Symptom:** `monitor traffic interface ge-0-0-0 matching "tcp port 80"` captures on just `tcp` — the `port 80` narrowing is silently dropped, so the operator's diagnostic capture shows far more traffic than requested. Any multi-token BPF filter (`host 10.0.0.1 and port 443`, `udp and not port 53`) is reduced to its first whitespace token.
+- **Root cause:** The operational CLI tokenizes the command line with `strings.Fields` (`cli_dispatch.go`), which splits on whitespace and does NOT honor shell quoting. A quoted filter `"tcp port 80"` therefore reaches `handleMonitorTraffic` as three separate tokens `"tcp`, `port`, `80"`. The old `case "matching"` read only `args[i+1]` (the first token, `"tcp`, with a literal quote) and the remaining tokens fell through the switch and were discarded.
+- **Fix:** `parseMonitorTrafficArgs` (`pkg/cli/cli_request.go`) makes the `matching` clause greedy — it consumes every following token up to the next recognized option keyword (`interface`/`count`, none of which are pcap primitives), joins them into one filter expression, and strips a single balanced layer of surrounding quotes via `stripSurroundingQuotes`. `buildMonitorTrafficArgv` passes the full filter to tcpdump as trailing argv tokens, exactly as libpcap consumes a filter. A `count` following the filter is no longer swallowed. Regression guard: `pkg/cli/monitor_traffic_filter_4005_test.go`.
+
 ### try_fabric_redirect missing inc_iface_tx — TX counters undercount (FIXED #137, `6fd6124`)
 - **Symptom:** Fabric TX traffic not counted in `show interfaces statistics` or `monitor interface`. Packets forwarded via `try_fabric_redirect()` in xdp_zone.c bypass TX counter instrumentation
 - **Root cause:** `try_fabric_redirect()` calls `bpf_redirect_map` but never calls `inc_iface_tx(meta, fabric_ifindex)` before returning

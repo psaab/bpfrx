@@ -35,6 +35,34 @@
     `gofmt` clean.
   - **File(s)**: pkg/appid/catalog.go, pkg/dataplane/compiler.go,
     pkg/appid/catalog_proto0_4008_test.go, pkg/appid/README.md, _Log.md
+## 2026-07-03 — #4005: `monitor traffic matching "<filter>"` truncated the pcap filter to the first token
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-022 (MEDIUM, CLI — wrong packet capture
+    filter). `monitor traffic interface <if> matching "tcp port 80"` captured
+    on just `tcp`, silently dropping `port 80` — any multi-token BPF filter
+    (`host 10.0.0.1 and port 443`, `udp and not port 53`) was reduced to its
+    first whitespace token, so the operator's diagnostic capture showed far
+    more traffic than requested. Root cause: the operational CLI tokenizes the
+    command line with `strings.Fields` (cli_dispatch.go), which splits on
+    whitespace and does NOT honor shell quoting, so a quoted filter reaches
+    `handleMonitorTraffic` as separate tokens (`"tcp`, `port`, `80"`). The old
+    `case "matching"` read only `args[i+1]` (the first token, with a literal
+    quote) and let the rest fall through the switch and be discarded.
+  - **Fix**: extracted `parseMonitorTrafficArgs` — the `matching` clause is now
+    greedy: it consumes every following token up to the next recognized option
+    keyword (`interface`/`count`, none of which are pcap primitives), joins
+    them into one filter expression, and strips a single balanced layer of
+    surrounding quotes via `stripSurroundingQuotes`. `buildMonitorTrafficArgv`
+    passes the full filter to tcpdump as trailing argv tokens exactly as
+    libpcap consumes a filter. A `count` following the filter is no longer
+    swallowed; a single-token filter (`icmp`) and and/or/not operators are
+    preserved verbatim.
+  - **File(s)**: pkg/cli/cli_request.go, docs/bugs.md,
+    pkg/cli/monitor_traffic_filter_4005_test.go (RED-on-revert: reverting the
+    parse to the first-token read drops `port 80` — filter=`"tcp` — and the
+    argv places only `"tcp` after the interface flags). go test ./pkg/cli/...
+    green; go build ./... green; gofmt clean.
 
 ## 2026-07-03 — #4000: bare `commit` during a pending confirm window silently dropped newly-staged edits
 
@@ -30885,3 +30913,27 @@ top.
     pkg/config/parser_security_test.go, pkg/ipsec/ike.go, pkg/ipsec/ipsec_test.go,
     pkg/cli/cli_show_security_ipsec.go, pkg/grpcapi/server_show_security_text.go,
     pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4006 — `make test` now runs BOTH the Go suite AND the Rust
+    userspace-dp cargo suite. Before this change `test` ran only `go vet` +
+    `go test ./...`, so a regression in the Rust AF_XDP dataplane — the ONLY
+    runtime forwarding path after the #1373/#1476 eBPF retirement — passed
+    `make test` green (a false all-clear for the most critical code). Split the
+    old `test` recipe into `test-go` (unchanged: `go vet ./pkg/flowexport/...`
+    then `go test ./...`) and a new `test-rust`
+    (`cargo test --manifest-path userspace-dp/Cargo.toml --release --bins
+    --tests -- --test-threads=1`), and made `test: test-go test-rust`. Each leg
+    is a plain prerequisite recipe, so a non-zero exit from either aborts the
+    target — a Rust test failure now fails `make test` (verified: a throwaway
+    Makefile with the same prerequisite shape and a `false` in test-rust exited
+    non-zero and never ran the trailing line; RED-on-revert semantics hold).
+    userspace-dp is a binary-only crate (no [lib]), so `--bins` reaches its
+    unit tests and `--tests` adds integration tests; benches are excluded
+    (criterion `harness = false` rejects libtest's `--test-threads`, and they
+    are perf gates run via `cargo bench`). `--test-threads=1` dodges the
+    intermittent `__skb_wait_for_more_packets` socket-test hang. `go build
+    ./...` unaffected (green). Docs updated: README build section, CLAUDE.md
+    Quick Start, docs/testing.md, docs/testing-procedures.md.
+  - **File(s)**: Makefile, README.md, CLAUDE.md, docs/testing.md,
+    docs/testing-procedures.md, _Log.md
