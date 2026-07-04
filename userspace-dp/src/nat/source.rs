@@ -248,6 +248,13 @@ pub(crate) struct SourceNatRule {
     pub(crate) off: bool,
     pub(crate) pool_name: String,
     pub(crate) pool_mode: bool,
+    /// #3906: `port no-translation` — translate the source ADDRESS but PRESERVE
+    /// the original source port. When true a pool-mode rule takes the
+    /// address-only path (pick a pool address, leave `rewrite_src_port` unset so
+    /// the packet keeps its L4 source port); no pool port is allocated and
+    /// `pool_allocator.port_low/high` are irrelevant. Default false = the
+    /// pre-#3906 PAT behaviour (allocate a port from the pool range).
+    pub(crate) no_translation: bool,
     pub(crate) pool_failure: Option<SourceNatFailureReason>,
     pub(crate) address_persistent: bool,
     pub(crate) persistent_nat: bool,
@@ -510,6 +517,8 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             off: snap.off,
             pool_name: snap.pool_name.clone(),
             pool_mode: !snap.pool_name.is_empty() || !snap.pool_addresses.is_empty(),
+            // #3906: `port no-translation` preserves the source port.
+            no_translation: snap.pool_no_translation,
             address_persistent: snap.address_persistent,
             persistent_nat: snap.persistent_nat,
             // #2823: prefer the enum string; fall back to the legacy bool.
@@ -641,6 +650,7 @@ fn source_nat_runtime_compatible(new_rule: &SourceNatRule, old_rule: &SourceNatR
     new_rule.name == old_rule.name
         && new_rule.pool_name == old_rule.pool_name
         && new_rule.pool_mode == old_rule.pool_mode
+        && new_rule.no_translation == old_rule.no_translation
         && new_rule.pool_failure == old_rule.pool_failure
         && new_rule.address_persistent == old_rule.address_persistent
         && new_rule.persistent_nat == old_rule.persistent_nat
@@ -869,9 +879,18 @@ pub(crate) fn match_source_nat_result_for_tuple(
         // port it returns can never be written to a frame.
         let port_less = protocol != 0 && !crate::ip_proto::has_l4_ports(protocol);
         let tuple_unknown = protocol == 0;
+        // #3906: `port no-translation` translates the ADDRESS only and PRESERVES
+        // the original source port. It takes the same address-only path as a
+        // port-less protocol — pick a pool address, leave `rewrite_src_port`
+        // unset so the packet rewriter keeps the packet's own source port
+        // (checksum.rs `rewrite_src_port.unwrap_or(key.src_port)`). No pool port
+        // is allocated. The chosen address is cached per-flow (flow_cache), so
+        // the round-robin selection is stable for the flow's lifetime, exactly
+        // like the port-less path.
+        let address_only = port_less || tuple_unknown || rule.no_translation;
         match src_ip {
             IpAddr::V4(_) if !rule.pool_addresses_v4.is_empty() => {
-                if port_less || tuple_unknown {
+                if address_only {
                     let addr_idx = rule.pool_allocator.address_index(
                         src_ip,
                         0,
@@ -881,7 +900,8 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     let pool_addr = rule.pool_addresses_v4[addr_idx];
                     // Port-less: IP-only translation. Tuple-unknown: a
                     // round-robin port (legacy, never frame-written).
-                    let port = if tuple_unknown {
+                    // no-translation: preserve the source port (None). #3906.
+                    let port = if tuple_unknown && !rule.no_translation {
                         match rule.pool_allocator.try_next_port(addr_idx) {
                             Ok(port) => Some(port),
                             Err(reason) => {
@@ -928,7 +948,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
             }
             IpAddr::V6(_) if !rule.pool_addresses_v6.is_empty() => {
                 let v6_offset = rule.pool_addresses_v4.len();
-                if port_less || tuple_unknown {
+                if address_only {
                     let addr_idx = rule.pool_allocator.address_index(
                         src_ip,
                         v6_offset,
@@ -937,7 +957,8 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     );
                     let v6_idx = addr_idx - v6_offset;
                     let pool_addr = rule.pool_addresses_v6[v6_idx];
-                    let port = if tuple_unknown {
+                    // no-translation: preserve the source port (None). #3906.
+                    let port = if tuple_unknown && !rule.no_translation {
                         match rule.pool_allocator.try_next_port(addr_idx) {
                             Ok(port) => Some(port),
                             Err(reason) => {

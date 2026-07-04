@@ -79,6 +79,14 @@ pub(crate) struct SourceNATRuleSnapshot {
     pub port_low: u16,
     #[serde(rename = "port_high", default)]
     pub port_high: u16,
+    /// #3906: `port no-translation` — translate the source ADDRESS but PRESERVE
+    /// the original source port (Junos 1:1 source-port behaviour). When true the
+    /// match path takes the address-only branch and leaves `rewrite_src_port`
+    /// unset, so the packet keeps its L4 source port and `port_low`/`port_high`
+    /// are ignored. Additive wire field (#1961): an older control plane omits it
+    /// and this helper defaults it to false (the pre-#3906 PAT behaviour).
+    #[serde(rename = "pool_no_translation", default)]
+    pub pool_no_translation: bool,
     #[serde(rename = "address_persistent", default)]
     pub address_persistent: bool,
     #[serde(rename = "persistent_nat", default)]

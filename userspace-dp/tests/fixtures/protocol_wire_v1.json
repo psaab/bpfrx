@@ -1106,6 +1106,7 @@
     "persistent_nat_permit_any_remote_host": false,
     "pool_addresses": [],
     "pool_name": "",
+    "pool_no_translation": false,
     "pool_unusable": false,
     "pool_unusable_reason": "",
     "port_high": 0,

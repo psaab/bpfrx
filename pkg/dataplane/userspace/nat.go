@@ -171,6 +171,7 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			}
 			var poolAddresses []string
 			var portLow, portHigh uint16
+			var poolNoTranslation bool
 			var persistentNAT bool
 			var persistentNATPermitAnyRemoteHost bool
 			var persistentNATPermit string
@@ -195,6 +196,11 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 						poolUnusable = true
 						poolUnusableReason = "empty_pool"
 					}
+					// #3906: `port no-translation` preserves the source port.
+					// The dataplane takes the address-only path and ignores the
+					// port range in this mode, so a defaulted/valid range is
+					// fine even when no-translation is set.
+					poolNoTranslation = pool.PortNoTranslation
 					var valid bool
 					portLow, portHigh, valid = sourceNATPoolPortRange(pool)
 					if !valid {
@@ -252,6 +258,7 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 				PoolAddresses:                    poolAddresses,
 				PortLow:                          portLow,
 				PortHigh:                         portHigh,
+				PoolNoTranslation:                poolNoTranslation,
 				AddressPersistent:                cfg.Security.NAT.AddressPersistent,
 				PersistentNAT:                    persistentNAT,
 				PersistentNATPermitAnyRemoteHost: persistentNATPermitAnyRemoteHost,
