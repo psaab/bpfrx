@@ -1,3 +1,34 @@
+## 2026-07-04 — #3881: hierarchical inline-keys static route drops `interface` modifier
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the defect at HEAD (9cd280f1e). The
+    hierarchical INLINE-keys route form (`route 2001:db8::/32 next-hop fe80::1
+    interface reth0.50;` on one line, no braces) collapses the whole route onto
+    ONE leaf node `Keys=[route <dst> next-hop fe80::1 interface reth0.50]` with
+    NO children → `compileStaticRoutes` takes the inline-keys switch. The
+    `next-hop` case absorbed the gateway run (stopping at the `interface` route
+    keyword via `isRouteInlineKeyword`) but had NO logic to consume the trailing
+    `interface <if>` modifier → the egress interface was silently DROPPED. A
+    scratch repro compiled `nexthops=[{Address:fe80::1 Interface:""}]`. For an
+    IPv6 link-local next-hop the egress interface is REQUIRED (unresolvable
+    without it). FIX (`pkg/config/compiler_routing.go`): the inline-keys
+    `next-hop` case now collects the gateways into a slice, then consumes a
+    trailing `interface <if>` and applies it to the gateway(s), mirroring the
+    working child/brace form. Both the inline-keys case and the child/brace
+    read now treat `interface` as the modifier keyword ONLY after ≥1 gateway is
+    parsed (Copilot defect 2, negligible edge), so a next-hop value literally
+    named `interface` as the FIRST token stays a gateway value.
+  - **File(s)**: pkg/config/compiler_routing.go,
+    pkg/config/compiler_static_route_inline_iface_3881_test.go,
+    docs/config-schema.md, _Log.md
+  - **Validation**: 5 new tests (inline-keys / brace / flat-set interface
+    modifier + inline ECMP + literal-`interface`-first-value). RED-on-revert
+    proven: reverting the two edits fails `TestStaticRouteInlineKeysInterface
+    Modifier_3881` (Interface="") and `TestStaticRouteNextHopLiteralInterface
+    FirstValue_3881` (0 next-hops); brace + flat-set stay green.
+    `go test ./pkg/config/...` green, `go build ./...` clean, gofmt + go vet
+    clean.
+
 ## 2026-07-04 — #4120: drop leftover test-env `is_trust_flow` debug-log bypass (fable-163 F27)
 
 - **Timestamp**: 2026-07-04

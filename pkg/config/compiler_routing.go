@@ -174,9 +174,28 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					// fully-inline form: consume consecutive gateway tokens
 					// until the next route keyword, installing each as an
 					// equal-cost next-hop (#3872).
+					var addrs []string
 					for i+1 < len(routeInst.node.Keys) && !isRouteInlineKeyword(routeInst.node.Keys[i+1]) {
 						i++
-						route.NextHops = append(route.NextHops, NextHopEntry{Address: routeInst.node.Keys[i]})
+						addrs = append(addrs, routeInst.node.Keys[i])
+					}
+					// A single-gateway next-hop may carry a trailing `interface
+					// <if>` egress modifier (#3881). In the fully-inline route-keys
+					// form (`route <dst> next-hop fe80::1 interface reth0.50` — no
+					// braces) `interface` is a route keyword, so the gateway run
+					// above stops before it; without this the modifier is dropped.
+					// For an IPv6 link-local next-hop the egress interface is
+					// REQUIRED (a link-local gateway is unresolvable without it).
+					// Consume the modifier ONLY after ≥1 gateway is parsed, so a
+					// bare-first `interface` token stays a gateway value, not the
+					// modifier.
+					iface := ""
+					if len(addrs) > 0 && i+2 < len(routeInst.node.Keys) && routeInst.node.Keys[i+1] == "interface" {
+						iface = routeInst.node.Keys[i+2]
+						i += 2
+					}
+					for _, a := range addrs {
+						route.NextHops = append(route.NextHops, NextHopEntry{Address: a, Interface: iface})
 					}
 				case "next-table":
 					if i+1 < len(routeInst.node.Keys) {
@@ -247,7 +266,11 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 				var addrs []string
 				iface := ""
 				for j := 1; j < len(prop.Keys); j++ {
-					if prop.Keys[j] == "interface" {
+					// Treat `interface` as the egress modifier only after ≥1
+					// gateway has been parsed (#3881). A next-hop value literally
+					// named "interface" as the FIRST token is a gateway, not the
+					// modifier keyword.
+					if prop.Keys[j] == "interface" && len(addrs) > 0 {
 						if j+1 < len(prop.Keys) {
 							iface = prop.Keys[j+1]
 							j++
