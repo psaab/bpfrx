@@ -382,10 +382,16 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		}},
 	}},
 	"rip": {desc: "RIP configuration", children: map[string]*schemaNode{
-		"group":               {desc: "Group", args: 1, placeholder: "<group-name>", children: nil},
-		"neighbor":            {desc: "Neighbor", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
-		"passive-interface":   {desc: "Passive interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
-		"redistribute":        {desc: "Redistribute", args: 1, placeholder: "<protocol>", children: nil},
+		"group":             {desc: "Group", args: 1, placeholder: "<group-name>", children: nil},
+		"neighbor":          {desc: "Neighbor", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+		"passive-interface": {desc: "Passive interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+		// multi (#3904): `redistribute [ static direct ]` lists several
+		// protocols; without multi the flat-set path stranded the tail as a
+		// child node and the scalar reader dropped all but the first. (RIP
+		// group `export [ a b ]` is handled on the compiler read side —
+		// `group` keeps children:nil, which stays permissive for every group
+		// sub-leaf, and the bracket already collapses onto the export leaf.)
+		"redistribute":        {desc: "Redistribute", args: 1, multi: true, placeholder: "<protocol>", children: nil},
 		"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
 		"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
 	}},

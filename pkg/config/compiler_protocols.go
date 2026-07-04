@@ -583,9 +583,12 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							proto.RIP.Interfaces = append(proto.RIP.Interfaces, gc.Keys[1])
 						}
 					case "export":
-						if len(gc.Keys) >= 2 {
-							proto.RIP.Redistribute = append(proto.RIP.Redistribute, gc.Keys[1])
-						}
+						// multi-value leaf (#3904): `group G export [ a b ]`
+						// collapses every policy onto the leaf's Keys; read ALL
+						// via firewallMatchValues. Reading only Keys[1] dropped
+						// every export policy past the first (the RIP arm of the
+						// #2419 bracket-list-truncation class).
+						proto.RIP.Redistribute = append(proto.RIP.Redistribute, firewallMatchValues(gc)...)
 					}
 				}
 			case "neighbor":
@@ -597,9 +600,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					proto.RIP.Passive = append(proto.RIP.Passive, child.Keys[1])
 				}
 			case "redistribute":
-				if len(child.Keys) >= 2 {
-					proto.RIP.Redistribute = append(proto.RIP.Redistribute, child.Keys[1])
-				}
+				// multi-value leaf (#3904): `redistribute [ static direct ]`
+				// spreads across Keys[1:] + child nodes; accumulate every value
+				// via firewallMatchValues rather than only Keys[1].
+				proto.RIP.Redistribute = append(proto.RIP.Redistribute, firewallMatchValues(child)...)
 			case "authentication-key":
 				if v := nodeVal(child); v != "" {
 					proto.RIP.AuthKey = Secret(v)

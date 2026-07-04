@@ -1,3 +1,25 @@
+## 2026-07-03 — #3904 (F-162): RIP `group export` / `redistribute [ a b ]` bracket-list truncated to the first — multi-value fix
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-162 (routing), the RIP arm of the #3904
+    bundle. `protocols rip group G export [ pol-a pol-b ]` and top-level
+    `protocols rip redistribute [ static direct ]` each kept only the first
+    value — dropped export policies / redistributed protocols.
+  - **Fix**: Both compiler readers (`compiler_protocols.go` RIP block)
+    accumulate every value into `RIPConfig.Redistribute` via
+    `firewallMatchValues` instead of `gc.Keys[1]` / `child.Keys[1]`. The
+    declared top-level `redistribute` leaf is now `multi: true`
+    (`schema_routing.go`); the RIP `group` node stays `children: nil`
+    (permissive for every group sub-leaf; the `export` bracket already
+    collapses onto the export leaf's Keys, so only the compiler read needed
+    fixing). The FRR renderer (`generateProtocols`) already loops
+    `rip.Redistribute` (one `redistribute <proto>` per entry), so no render
+    change was needed. RED-on-revert proven: reverting to the Keys[1] read
+    yields `[pol-a static]` (drops pol-b + direct). SchemaValidate accepts the
+    bracket configs. go test ./pkg/config/... ./pkg/frr/... green.
+  - **File(s)**: pkg/config/compiler_protocols.go, pkg/config/schema_routing.go,
+    pkg/config/multivalue_rip_3904_test.go (new), docs/config-schema.md
+
 ## 2026-07-03 — #3904 (F-040/F-161): IKE/IPsec policy `proposals [ p1 p2 ]` bracket-list truncated to the first proposal — multi-value fix
 
 - **Timestamp**: 2026-07-03

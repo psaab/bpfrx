@@ -271,6 +271,18 @@ kept a scalar reader that dropped everything past the first bracketed value:
   establish). Coverage: `multivalue_proposals_3904_test.go` in `pkg/config`
   (compile) and `pkg/ipsec` (end-to-end render).
 
+- **RIP `group … export` and top-level `redistribute`**
+  (`compiler_protocols.go`) — both accumulate every value into
+  `RIPConfig.Redistribute` via `firewallMatchValues` (the FRR renderer
+  `generateProtocols` already loops the slice, one `redistribute <proto>` per
+  entry). The declared top-level `redistribute` leaf is now `multi: true`
+  (`schema_routing.go`); the RIP `group` node keeps `children: nil` (permissive
+  for every group sub-leaf such as `metric-out`), and the `export` bracket
+  already collapses onto the export leaf's Keys, so the fix there is the
+  compiler read alone. Before #3904 `export [ a b ]` / `redistribute [ static
+  direct ]` kept only the first — dropped redistributions. Coverage:
+  `multivalue_rip_3904_test.go`.
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a
