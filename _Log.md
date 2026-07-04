@@ -259,6 +259,30 @@
   - **File(s)**: pkg/routing/routes.go, pkg/routing/routeformat.go,
     pkg/grpcapi/server_routing.go, pkg/routing/routes_multipath_test.go,
     pkg/routing/README.md, _Log.md
+## 2026-07-03 — #3947: legacy address parser drops a bare `any` mixed with literals → deny narrows (fail-open)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-084 (MEDIUM, security fail-open on the
+    drift / hand-built-snapshot / mixed-version-decode legacy path). The
+    legacy address parser `parse_legacy_address_set` handled a bare `any`
+    token with a no-op match arm (`"any" | "" => {}`), leaning on the legacy
+    empty→`MatchAny` convention — which only yields match-all when the list
+    is otherwise empty. A list MIXING `any` with a literal (e.g.
+    `[ any 10.0.0.0/8 ]`) therefore DROPPED the `any` and NARROWED the match
+    set to just the literal. For a DENY term that narrowing is a fail-OPEN: a
+    deny meant to match every source matched only the listed literal, so
+    other sources fell through to a later permit / default-permit. Fix mirrors
+    `parse_v3_literal_set` EXACTLY: a bare `any` now sets BOTH per-family
+    match-all flags (`any_v4 = true; any_v6 = true`), so an `any` anywhere in
+    the list is match-all for both families regardless of accompanying
+    literals or family-scoped wildcards. The empty (`""`) token is split into
+    its own no-op arm (distinct from `any`), preserving the legacy
+    empty→`MatchAny` convention for an otherwise-empty list while a mixed
+    `[ "" 10.0.0.0/8 ]` keeps the literal scoping.
+  - **File(s)**: userspace-dp/src/policy.rs (arm + fn doc comment),
+    userspace-dp/src/policy_tests.rs (4 RED-on-revert unit tests),
+    docs/userspace-dataplane-architecture.md (#3947 paragraph), _Log.md.
+
 ## 2026-07-03 — #3941: deleting an IPsec VPN never terminates its live SAs (--load-all only unloads config)
 
 - **Timestamp**: 2026-07-03

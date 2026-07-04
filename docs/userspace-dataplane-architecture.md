@@ -678,6 +678,22 @@ snapshot only ever emits parseable, family-separated literals / `any` / family
 wildcards, so these rejects guard against a corrupt / hand-built / mixed-version
 HA peer-sync snapshot; the preflight keeps the previous good forwarding state.
 
+**Legacy `any` mixed with literals stays match-all (#3947).** `parse_legacy_address_set`
+now treats a bare `any` token exactly like `parse_v3_literal_set` — it sets
+BOTH per-family match-all flags (`any_v4`/`any_v6` → `MatchAny`), regardless of
+any literals or family-scoped wildcards present in the same list. The pre-fix
+no-op arm (`"any" | "" => {}`) leaned on the legacy empty→`MatchAny` convention,
+which only yields match-all when the list is otherwise EMPTY; a list MIXING
+`any` with a literal (`[ any 10.0.0.0/8 ]`) DROPPED the `any` and NARROWED the
+match set to just the literal. For a DENY term that narrowing is a fail-OPEN: a
+deny meant to match every source (`any`) matched only the listed literal, so
+traffic from other sources fell through to a later permit / default-permit. The
+empty (`""`) token remains a no-op — distinct from `any` — so an otherwise-empty
+list still collapses to `MatchAny` via `from_prefixes`, but a mixed
+`[ "" 10.0.0.0/8 ]` keeps the literal scoping. This only bites the drift /
+hand-built / mixed-version-decode legacy path; a normal Go v3 snapshot never
+uses the legacy field.
+
 **Duplicate rule-identity fail-closed (#3713).** `parse_policy_state_with_counters`
 preflights rule-identity uniqueness BEFORE it allocates any per-rule hit counter
 or builds a `PolicyRule` entry — the FIRST validation in the function, so no

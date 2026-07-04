@@ -3045,7 +3045,16 @@ pub(crate) fn parse_policy_state_with_counters(
 /// family is explicitly excluded), NOT MatchAny. Only when NO
 /// family-scoped wildcard appears does the legacy "empty = MatchAny"
 /// convention apply (via `from_prefixes`), preserving back-compat for
-/// the unconstrained / `any` / all-malformed cases.
+/// the unconstrained / all-malformed cases.
+///
+/// #3947: a bare `any` token now sets BOTH per-family any-flags
+/// (mirroring `parse_v3_literal_set`) instead of being a no-op that
+/// relied on the empty→MatchAny convention. The old no-op arm only
+/// yielded MatchAny when the list was otherwise empty; a list mixing
+/// `any` with a literal (`[ any 10.0.0.0/8 ]`) dropped the `any` and
+/// NARROWED to the literal — a fail-OPEN for a deny term. An `any`
+/// anywhere in the list is match-all for both families regardless of
+/// any accompanying literals or family-scoped wildcards.
 ///
 /// #3367: the returned `Option<String>` carries the FIRST token that was
 /// non-empty, non-`any`, non-family-wildcard, and unparseable as an IP/CIDR.
@@ -3060,10 +3069,26 @@ fn parse_legacy_address_set(addresses: &[String]) -> (PrefixSetV4, PrefixSetV6, 
     let mut malformed: Option<String> = None;
     for tok in addresses {
         match tok.as_str() {
-            // Bare `any` is the unconstrained both-families wildcard;
-            // it leaves no per-family scoping and falls through to the
-            // legacy empty→MatchAny convention below for both families.
-            "any" | "" => {}
+            // #3947: a bare `any` is the both-families match-all wildcard.
+            // Mirror `parse_v3_literal_set` EXACTLY — set BOTH per-family
+            // any-flags. The pre-fix no-op arm leaned on the legacy
+            // empty→MatchAny convention below, which only holds when the list
+            // is otherwise EMPTY: a list MIXING `any` with a literal (e.g.
+            // `[ any 10.0.0.0/8 ]`) then DROPPED the `any` and NARROWED the
+            // match to just the literal — a fail-OPEN for a deny term (the
+            // deny that should match every source matched only the listed
+            // one). Setting the flags here keeps the set match-all regardless
+            // of any accompanying literals.
+            "any" => {
+                any_v4 = true;
+                any_v6 = true;
+            }
+            // The empty token contributes nothing to either family; it stays a
+            // no-op (matches `parse_v3_literal_set`). It is NOT `any`: an
+            // otherwise-empty list still collapses to MatchAny via the legacy
+            // `from_prefixes` convention below, but a mixed `[ "" 10.0.0.0/8 ]`
+            // keeps the literal scoping rather than widening to match-all.
+            "" => {}
             "any-ipv4" => any_v4 = true,
             "any-ipv6" => any_v6 = true,
             s => {
