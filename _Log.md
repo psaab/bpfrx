@@ -32611,3 +32611,32 @@ top.
     vet, gofmt clean.
   - **File(s)**: pkg/grpcapi/server.go,
     pkg/grpcapi/server_fabric_allowlist_4122_test.go, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4118 — honor RFC 3442 classless static routes (DHCPv4
+    option 121 / legacy 249) in the DHCP client. Verified at HEAD:
+    `leaseFromACKv4` extracted only `ack.Router()` (option 3); grep of
+    pkg/dhcp for 121/249/classless returned nothing. The insomniacslk/dhcp
+    library exposes a `ClasslessStaticRoute()` accessor (option 121) but no
+    legacy-249 helper. Fix: parse option 121 (accessor) with a raw
+    `GenericOptionCode(249)` + `Routes.FromBytes` fallback (identical RFC
+    3442 encoding) in new `classlessStaticRoutes` helper; store on new
+    `Lease.ClasslessRoutes []LeaseRoute`. RFC 3442 precedence enforced —
+    when option 121/249 present the option-3 Router is IGNORED; the
+    0.0.0.0/0 entry supplies `lease.Gateway`, more-specific routes go on
+    ClasslessRoutes. Programmed via the same paths as the default route:
+    `collectDHCPRoutes` emits a `frr.DHCPRoute{Destination}` per classless
+    route (DHCPRoute grew a `Destination` field, "" = default), 
+    `renderDHCPDefaults` writes `ip route <dest> <gw> [<iface>] 200` with
+    static-default suppression scoped to ONLY the default route, and
+    `applyMgmtVRFRoutes` installs them into mgmt VRF table 999 via netlink.
+    `leaseContentChanged` diffs ClasslessRoutes so they withdraw/re-install
+    with the lease. RED-on-revert: reverting the parse to option-3-only
+    fails TestLeaseFromACKv4ClasslessRoutesSupersedeOption3 /
+    ClasslessOnlySpecificNoDefault / LegacyOption249 (gateway falls back to
+    the option-3 gw 198.51.100.99, ClasslessRoutes empty). go test -count=1
+    ./pkg/dhcp/... ./pkg/frr/... green; go build ./..., vet, gofmt clean.
+  - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/commit.go,
+    pkg/dhcp/classless_routes_test.go, pkg/frr/manager.go,
+    pkg/frr/config_render.go, pkg/frr/frr_test.go,
+    pkg/daemon/daemon_flow.go, pkg/dhcp/README.md, _Log.md

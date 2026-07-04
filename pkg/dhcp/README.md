@@ -164,6 +164,27 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   address reconciliation on DHCP-marked interfaces.
 - DHCP-learned default routes go into FRR with admin distance 200 — lower
   priority than static routes, so a configured static default wins.
+- **RFC 3442 classless static routes (option 121 / legacy 249, #4118).**
+  `leaseFromACKv4` parses option 121 (the standard `ClasslessStaticRoute`
+  accessor) and falls back to the legacy Microsoft option 249 (raw
+  `GenericOptionCode(249)` decoded with the identical
+  `{mask-length, significant-prefix-octets, gateway}` encoding). Per RFC
+  3442 **precedence, option 121/249 SUPERSEDES option 3**: when it is
+  present the client MUST ignore the option-3 Router default entirely.
+  The `0.0.0.0/0` entry (if any) in the option supplies `lease.Gateway`
+  (so every existing gateway consumer — FRR default route, neighbor
+  resolution, ip-monitoring next-hop — is unchanged); every more-specific
+  route lands on `lease.ClasslessRoutes`. When option 121/249 is absent
+  the client falls back to option 3 exactly as before. The classless
+  routes are programmed through the same paths as the default route:
+  `collectDHCPRoutes` emits one `frr.DHCPRoute` per route (with a
+  non-empty `Destination`), `renderDHCPDefaults` writes
+  `ip route <dest> <gw> [<iface>] 200` — and the static-default
+  suppression applies ONLY to the default route, never to the
+  more-specific classless routes — and `applyMgmtVRFRoutes` installs them
+  into the management VRF table (999) via netlink. `leaseContentChanged`
+  diffs `ClasslessRoutes`, so the routes are withdrawn/re-installed in
+  lock-step with the lease on renew/expiry, like the default route.
 - **Lease records are NOT expired by the wall clock.** During a
   *timeout-driven* failed re-acquisition (T2 rebind timed out, fresh
   DORA in progress) the lease record and the kernel address

@@ -232,11 +232,16 @@ type InstanceConfig struct {
 	Inet6StaticRoutes []*config.StaticRoute
 }
 
-// DHCPRoute represents a default route learned via DHCP.
+// DHCPRoute represents a route learned via DHCP. An empty Destination
+// means the default route (0.0.0.0/0 or ::/0) — the option-3 gateway or
+// the option-121 0.0.0.0/0 entry. A non-empty Destination (e.g.
+// "10.0.0.0/8") is an RFC 3442 classless static route from option 121 /
+// legacy option 249.
 type DHCPRoute struct {
-	Gateway   string // "10.0.2.1" or "fe80::1"
-	Interface string // needed for IPv6 link-local gateways
-	IsIPv6    bool
+	Destination string // "" = default route; else a classless-route prefix
+	Gateway     string // "10.0.2.1" or "fe80::1"
+	Interface   string // needed for IPv6 link-local gateways
+	IsIPv6      bool
 }
 
 // FullConfig holds the complete routing config for a single FRR apply.
