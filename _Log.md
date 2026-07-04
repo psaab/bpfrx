@@ -1,3 +1,35 @@
+## 2026-07-03 — #4031: monitorFabricState exits + leaks sibling netlink socket on ENOBUFS (fable-161 F-167)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed `monitorFabricState` (the fabric link/neighbor netlink
+    monitor, #124) permanently exiting when either its `LinkSubscribe` or
+    `NeighSubscribe` update channel closed (`!ok`) on a recoverable ENOBUFS
+    receive-buffer overflow, AND leaking the SIBLING subscription's netlink
+    socket (the `!ok` return never closed the other `done` channel, so its
+    done-watcher never ran `s.Close()`). Fabric up/down + peer-neighbor changes
+    then went unobserved → HA mis-behavior (stale fabric-up blackhole / missed
+    fabric-down failover) plus an accumulating fd leak.
+  - **Fix**: mirrored the #3950 `monitorLinkState` resilient-resubscribe
+    pattern. `monitorFabricState` now delegates one subscription lifetime to
+    `runFabricStateSubscription`, which `defer`-closes BOTH `done` channels on
+    every path (no sibling leak), returns `true` on a recoverable channel close
+    or subscribe failure (caller backs off `fabricStateResubBackoffDefault` = 2s,
+    then resubscribes) and `false` only on context cancellation. Each fresh
+    subscription calls `triggerFabricRefresh` once both sockets are live to
+    re-sync fabric forwarding and catch up on transitions missed during the
+    overflow. Added `fabricLinkSubscribe` / `fabricNeighSubscribe` /
+    `fabricStateResubBackoff` seams on `Daemon`.
+  - **Tests**: `daemon_fabric_monitor_4031_test.go` — inject a channel close on
+    the link OR neighbor subscription; assert resubscribe (>=2 subscriptions),
+    sibling socket released (its `done` closed — no leak), refreshes keep firing,
+    and clean context-cancel exit. RED-on-revert verified (buggy single-function
+    version: `linkSubCalls=1`/`neighSubCalls=1`, no resubscribe → both resubscribe
+    tests FAIL; context-cancel still passes). `go test ./pkg/daemon/ -race` green.
+  - **File(s)**: `pkg/daemon/daemon_ha_fabric.go`, `pkg/daemon/daemon.go`,
+    `pkg/daemon/daemon_fabric_monitor_4031_test.go`, `docs/bugs.md`,
+    `docs/fabric-cross-chassis-fwd.md`
+  - **Follow-up**: test-failover WARRANTED (HA fabric) — batch-validated.
+
 ## 2026-07-03 — #4028: full-resync RG enumeration hardcoded 0..15 → RG >= 16 never resynced (fable-161 F-166)
 
 - **Timestamp**: 2026-07-03
