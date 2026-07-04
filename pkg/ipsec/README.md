@@ -140,15 +140,34 @@ all files stay in `package ipsec`, so the public API is unchanged.
   carries no required modp term), so PFS was silently disabled. On the
   tolerant load / peer-sync paths the commit check is downgraded to a
   warning (an already-persisted or peer-synced config still boots), and
-  `resolveESPSettings` has a render-side safety net: when the policy
-  resolves with a PFS group but the proposal ref dangles, it carries the
-  configured PFS group on a conservative valid fallback proposal
-  (`aes256-sha256-modp<bits>`, built with swanctl's canonical keyword
-  spellings) instead of falling through to `default`,
-  and logs a warning. Note: strongSwan ≥ 6.0.2 changed its `default` ESP
-  set to make PFS *optional* rather than absent, so the silent weakening is
-  a downgrade-to-negotiable-PFS there rather than no-PFS — the fix is the
-  same.
+  `resolveESPSettings` has a render-side safety net that emits a
+  conservative **fixed** ESP suite instead of falling through to
+  `default`, and logs a warning. Note: strongSwan ≥ 6.0.2 changed its
+  `default` ESP set to make PFS *optional* rather than absent, so the
+  silent weakening is a downgrade-to-negotiable-PFS there rather than
+  no-PFS — the fix is the same.
+  - **Absent vs dangling (#4117).** The safety net distinguishes two
+    cases. A VPN that names **no** `ipsec-policy` at all
+    (`vpn.IPsecPolicy == ""`) legitimately gets `esp_proposals = default`
+    — the operator made no crypto choice, so strongSwan's built-in suite
+    is their explicit choice. This is the ONLY path that emits `default`.
+    A **named-but-unresolved (dangling)** reference — the policy is
+    undefined, or the policy resolves but its proposal ref dangles — never
+    falls through to `default`. It renders a conservative fixed suite:
+    `aes256-sha256-modp<bits>` when a PFS group is configured (the #2073
+    case), or `aes256-sha256` (no modp term) when no PFS is configured.
+    Before #4117 the no-PFS dangling case still fell through to `default`,
+    silently substituting the operator's whole cipher/integrity choice
+    with strongSwan's built-in suite (the reasoning was "no PFS = nothing
+    to preserve", which overlooked that the cipher/integrity intent is
+    also lost). #4117 chose the conservative **fixed suite** over the
+    IKE-style whole-VPN **skip** (#2270) for parity with the #2073 PFS
+    case, which already emits the fallback rather than skipping: skipping
+    only the no-PFS case would drop a no-PFS tunnel entirely while an
+    otherwise-identical with-PFS tunnel keeps a working fallback — a
+    surprising availability asymmetry driven solely by whether PFS
+    happened to be configured. IKE (Phase 1) fails closed by skipping
+    instead because it has no equivalent strong fixed suite to offer.
 - **DH-group keyword rendering (#2392).** Every IKE/ESP proposal builder
   (`buildIKEProposalFromIKE`, `buildIKEProposal`, `buildESPProposal`, and
   the #2073 PFS fallback above) renders the Diffie-Hellman group suffix
