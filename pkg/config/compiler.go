@@ -264,6 +264,24 @@ type compileOpts struct {
 	// lenientIPsecPolicyProposalRef.
 	lenientIKEPolicyChainRef bool
 
+	// lenientIPsecTrafficSelectors (#4098) downgrades the IPsec
+	// `traffic-selector local-ip / remote-ip` value gate
+	// (validateIPsecTrafficSelectorsStrict) from a hard compile error to a
+	// cfg.Warnings entry on the tolerant load / peer-sync paths. A selector
+	// value containing a control character (a newline in particular) or
+	// whitespace, or one that is not a CIDR prefix / host address / IP range,
+	// would otherwise inject an arbitrary `key = value` line — e.g.
+	// `updown = <script>`, executed by the root charon daemon, or an
+	// `esp_proposals` override — into the rendered swanctl.conf children
+	// block (the swanctl-injection class already closed for the connection
+	// name / IKE identity / cert / PSK, #1798/#2126). Commit / commit-check
+	// stay strict so a new operator edit is rejected; an already-persisted or
+	// peer-synced config carrying such a value must still BOOT (warn) per the
+	// #1960 fail-closed-on-load doctrine — the render path now strips control
+	// chars (sanitizeSwanctlValue in pkg/ipsec/policy.go) so the malformed
+	// line stays inert. Same doctrine as lenientIKEPolicyChainRef.
+	lenientIPsecTrafficSelectors bool
+
 	// lenientLogProfileStreamRef (#2008 H7) downgrades the
 	// `security log profile <name> stream-name <stream>` cross-reference
 	// from a hard error to a warning on the tolerant load / peer-sync
@@ -1385,6 +1403,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecPolicyProposalRef:          true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
+		lenientIPsecTrafficSelectors:           true,
 		lenientLogProfileStreamRef:             true,
 		lenientDynamicAddressFeedRef:           true,
 		lenientNATPoolAlarmThreshold:           true,
@@ -1565,6 +1584,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecPolicyProposalRef:          true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
+		lenientIPsecTrafficSelectors:           true,
 		lenientLogProfileStreamRef:             true,
 		lenientDynamicAddressFeedRef:           true,
 		lenientNATPoolAlarmThreshold:           true,
@@ -1903,6 +1923,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #4098 IPsec traffic-selector injection gate. `security ipsec vpn
+	// <name> traffic-selector <ts> local-ip / remote-ip` are free-form 1-arg
+	// strings the IPsec renderer interpolates into the swanctl.conf
+	// children{} block as `local_ts = <value>` / `remote_ts = <value>`.
+	// Unlike the sibling child SA name they were emitted raw, so a value
+	// carrying a materialized `\n` (lexer.go) injected an arbitrary
+	// `key = value` line — `updown = <script>` runs as ROOT under charon, or
+	// an `esp_proposals` override silently rewrites the crypto posture — into
+	// the generated config. Runs on the group-expanded, inactive-pruned tree
+	// so an apply-groups-inherited selector is covered and an inactive VPN is
+	// ignored; it inspects EVERY value token (both parser shapes + a
+	// bracketed list, #2419) so a malicious token the typed compiler's
+	// nodeVal would drop is still caught. Strict (commit / commit-check):
+	// hard-reject naming the VPN, selector, leaf, and reason. Lenient (load /
+	// peer-sync): warn so an already-persisted or peer-synced config still
+	// boots (#1960) — the render belt (sanitizeSwanctlValue) keeps the value
+	// inert. Mirrors validateSecureTunnelBindInterfaceAST.
+	ipsecTSWarnings, err := validateIPsecTrafficSelectorsStrict(
+		tree.Children, opts.lenientIPsecTrafficSelectors)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3113 security-policy unsupported-match-leaf gate. A policy whose
 	// `match` clause carries a leaf the compiler does not enforce (e.g.
 	// `dynamic-application`, `url-category`, `source-identity`) committed
@@ -2058,6 +2101,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
+	cfg.Warnings = append(cfg.Warnings, ipsecTSWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenRejectWarnings...)
