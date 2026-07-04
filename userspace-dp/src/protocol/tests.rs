@@ -1401,7 +1401,14 @@ fn syn_cookie_master_key_is_skipped_in_state_snapshot() {
     // Control-socket delivery (apply_snapshot) still populates the key via the
     // `default` path, so a valid key is present after a restart re-push — SYN
     // cookie source validation keeps working.
-    let with_key = r#"{"syn_cookie_master_key":"00112233445566778899aabbccddeeff"}"#;
+    let with_key = r#"{
+        "version": 3,
+        "generation": 1,
+        "generated_at": "2024-01-01T00:00:00Z",
+        "summary": {"host_name":"h","dataplane_type":"userspace","interface_count":0,
+                    "zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "syn_cookie_master_key": "00112233445566778899aabbccddeeff"
+    }"#;
     let parsed: ConfigSnapshot = serde_json::from_str(with_key).expect("decode snapshot with key");
     assert_eq!(
         parsed.syn_cookie_master_key, "00112233445566778899aabbccddeeff",
