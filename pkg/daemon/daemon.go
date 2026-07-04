@@ -352,15 +352,24 @@ type Daemon struct {
 	// / commitAndApply paths without standing up the full dataplane.
 	applyBodyForTest func(*config.Config)
 
-	// resyncPeerForTest, when non-nil, replaces the real
-	// d.syncConfigToPeer() call the commit-confirmed timeout rollback
-	// makes to converge the standby onto the rolled-back config (#3868).
-	// Test-only seam: the production peer re-sync path (syncConfigToPeer
-	// -> pushConfigToPeer -> SessionSync.QueueConfig) needs a live TCP
-	// transport, so rollback_resync_test.go injects this to observe that
-	// executeConfirmedRollback re-syncs the C1 rollback target after
-	// PromoteRollback.
-	resyncPeerForTest func()
+	// applyErrForTest is the error the applyBodyForTest seam returns from
+	// applyConfigLocked (default nil = success). Test-only: lets a test drive
+	// commitAndApply / commitConfirmedAndApply through the real apply→sync
+	// error-classification (#4034) with an injected FATAL protocol-gate error,
+	// a non-fatal best-effort subsystem error, or a context abort, without
+	// standing up the full dataplane. Only consulted when applyBodyForTest is
+	// set, so a test that does not touch it is byte-identical to before.
+	applyErrForTest error
+
+	// syncPeerForTest, when non-nil, replaces the real d.syncConfigToPeer()
+	// push to the cluster peer on BOTH the commit-apply path (commitAndApply /
+	// commitConfirmedAndApply via applyAndSyncCommitted, #4034) AND the
+	// commit-confirmed timeout rollback re-sync (resyncRolledBackConfigToPeer,
+	// #3868). Test-only seam: the production push (syncConfigToPeer ->
+	// pushConfigToPeer -> SessionSync.QueueConfig) needs a live TCP transport,
+	// so tests inject this to observe that the committed/rolled-back config is
+	// pushed (and what text it would carry via d.store.ShowActive()).
+	syncPeerForTest func()
 
 	// hostInboundAddresslessZones is the set of configured host-inbound-
 	// enforcing zones observed in the transient fail-open admit window on the
