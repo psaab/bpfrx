@@ -108,6 +108,41 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
+leaves (#3984).** The `#2419` discussion above is about ONE statement with a
+bracket list. The SAME `multi: true` marker fixes a second, distinct shape:
+a keyed-list leaf that the operator writes as SEPARATE `set` statements, one
+value per line, which the compiler reads back as DISTINCT siblings via
+`FindChildren`:
+
+```
+set system ntp server 1.1.1.1
+set system ntp server 2.2.2.2
+set system ntp server 3.3.3.3
+```
+
+Each statement consumes exactly `1 + args` tokens with NO trailing token, so
+`SetPath` reaches its terminal-leaf branch (`i >= len(path)`). For a leaf
+declared `args > 0, children: nil` WITHOUT `multi`, that branch takes the
+**single-value REPLACE** path (correct for a scalar such as `host-name`): the
+SECOND `set` replaces the first, and the config silently collapses to the
+LAST value on any flat-set / `load set` / `| display set` round-trip. A leaf
+whose compiler reads MULTIPLE siblings (accumulating into a slice) is NOT a
+scalar — it must be `multi: true` so the terminal branch instead DEDUPs and
+APPENDS, keeping each occurrence a distinct sibling. The leaves in this class
+are `system ntp server`, `system archival configuration archive-sites`,
+`system services web-management api-auth api-key`, and `security flow
+traceoptions flag` (joining the already-`multi` `name-server` /
+`domain-search`). The compiler stays `FindChildren`-based and unchanged — the
+bug was purely the SetPath collapse. `archive-sites` also carries an optional
+trailing `password <s>` modifier, which lands on `Keys[2:]` of the collapsed
+leaf and is read there (`compiler_system.go`). Pinned by
+`pkg/config/set_repeated_leaf_3984_test.go` (RED on revert of the markers).
+This is the SET-side sibling of the display-side #3980 (`navigatePath` renders
+all N siblings) and the delete/deactivate-side #3846/#3975 (member-wise edit,
+which these leaves now inherit for free because `delete`/`deactivate` route a
+`multi: true, children: nil, args == 1` leaf through the member matcher).
+
 **`valueList` — a bracketed value list on a multi leaf that ALSO has a
 modifier child (#3872).** The bracket-absorption above fires only for a
 `multi: true` leaf with `children: nil`. The static-route `next-hop` leaf is
@@ -253,6 +288,28 @@ the scope survives; an unresolvable name is then hard-rejected at commit, so a
 dropped scope is impossible. Coverage:
 `compiler_prefix_list_hier_leaf_3843_test.go` (single-name source/dest/except +
 undefined-reject fail-on-revert, plus block / flat-set regression guards).
+
+**The prefix-list DEFINITION body is dual-AST too (#3996).** Distinct from the
+`from source/destination-prefix-list` *reference* above, this is the
+`policy-options prefix-list NAME { <p1>; <p2>; ... }` *definition*. Its schema
+leaf (`schemaPolicyOptions`, `schema_routing.go`) is `args: 1` (the name) with
+`children: nil`, so every prefix under the name lands as a CHILD of the named
+node. Two child shapes occur: one child per prefix (a `set ... prefix-list NAME
+<p>` per line, or a brace block with one `<p>;` per line — each child holds a
+single prefix in `Keys[0]`), OR the bracketed-list form `set ... prefix-list
+NAME [ p1 p2 p3 ]`, where the lexer strips `[`/`]` and packs EVERY prefix onto a
+SINGLE child node's `Keys`. `compilePolicyOptions` (`compiler_routing.go`) reads
+the FULL `Keys` slice of each child — note it reads from `Keys[0]`, NOT
+`Keys[1:]`, because a prefix-list entry carries no field-name prefix (the child's
+keys ARE the prefix values), so `firewallMatchValues` (which skips `Keys[0]`) is
+the WRONG helper here. Before #3996 the loop read only `entry.Keys[0]`, so a
+bracketed list kept just the FIRST prefix and silently dropped the rest → an
+under-populated prefix-list (a route-filter, firewall filter, or dynamic address
+group matched a partial prefix set with no commit error). The separate-command
+and single-prefix shapes were unaffected (each child had exactly one key).
+Coverage: `compiler_prefix_list_bracket_3996_test.go` (bracketed all-three +
+display-set round-trip fail-on-revert, plus separate-command / single-prefix
+regression guards); the multi-block MERGE case is `compiler_prefix_list_merge_2641_test.go`.
 
 **NAT `match` axes are multi-value (#3431).** The source/destination NAT rule
 `match` leaves `application`, `protocol` (DNAT), `source-address-name`, and

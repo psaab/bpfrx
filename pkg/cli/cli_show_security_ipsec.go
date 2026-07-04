@@ -243,8 +243,12 @@ func (c *CLI) showIKE(args []string) error {
 			ver = "v1+v2"
 		}
 		fmt.Printf("  IKE version:        %s\n", ver)
-		if gw.DeadPeerDetect != "" {
-			fmt.Printf("  DPD:                %s\n", gw.DeadPeerDetect)
+		if gw.DPDEnable || gw.DeadPeerDetect != "" {
+			mode := gw.DeadPeerDetect
+			if mode == "" {
+				mode = "enabled"
+			}
+			fmt.Printf("  DPD:                %s\n", mode)
 			if gw.DPDInterval > 0 {
 				fmt.Printf("  DPD interval:       %ds\n", gw.DPDInterval)
 			}

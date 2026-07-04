@@ -30,6 +30,37 @@
   - **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
     docs/wireguard-interop.md, userspace-dp/src/afxdp/frame/README.md,
     _Log.md
+## 2026-07-03 — #3996: policy-options prefix-list bracketed-list definition collapsed to first prefix
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-042 (MEDIUM, config-parity). A
+    `policy-options prefix-list NAME` definition written as a bracketed
+    list — `set policy-options prefix-list NAME [ p1 p2 p3 ]` — compiled to
+    only its FIRST prefix. The lexer strips `[`/`]` and packs every prefix
+    onto a SINGLE child node's `Keys` (the #2419/#3842 dual-AST class), but
+    `compilePolicyOptions` (`pkg/config/compiler_routing.go`) read only
+    `entry.Keys[0]` for each child, so the bracketed list dropped all but the
+    first prefix → an under-populated prefix-list (a route-filter, firewall
+    filter, or dynamic address group matched a partial prefix set with no
+    commit error). The separate-command form (`set ... prefix-list NAME <p>`
+    per line), the brace-block form, and the multi-block merge (#2641) were
+    already correct — each produced one child per prefix — which is why the
+    defect hid.
+  - **Fix**: read the FULL `Keys` slice of every child (`for _, p := range
+    entry.Keys`), not just `Keys[0]`. Read from index 0 (NOT `Keys[1:]`)
+    because a prefix-list entry carries no field-name prefix — the child's
+    keys ARE the prefix values — so `firewallMatchValues` (which skips
+    `Keys[0]`) is the wrong helper here. Single-key children (the existing
+    shapes) are unaffected. Validation: new
+    `compiler_prefix_list_bracket_3996_test.go` — bracketed all-three +
+    display-set round-trip (both RED on revert to the `Keys[0]`-only read),
+    plus separate-command / single-prefix regression guards.
+    `go test ./pkg/config/...` green; `go build ./...`, gofmt, vet clean.
+    Doc: docs/config-schema.md new "prefix-list DEFINITION body is dual-AST
+    too (#3996)" note.
+  - **File(s)**: pkg/config/compiler_routing.go,
+    pkg/config/compiler_prefix_list_bracket_3996_test.go,
+    docs/config-schema.md, _Log.md
 
 ## 2026-07-03 — #3988: scheduler start/stop date parsed as UTC instead of system local time
 
@@ -102,6 +133,62 @@
   - **File(s)**: `pkg/cli/monitor_interface.go`,
     `pkg/cli/monitor_interface_stdin_3985_test.go`,
     `docs/monitor-interface-research.md`, `_Log.md`.
+
+## 2026-07-03 — #3984: repeated keyed-list leaves (`ntp server`, `archive-sites`, `api-key`, traceoptions `flag`) collapsed to the LAST on flat-set/load-set replay
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-041 (MEDIUM, config data loss — SET side of
+    the repeated-keyed-list class). The leaves `system ntp server <ip>`,
+    `system archival configuration archive-sites <url>`, `system services
+    web-management api-auth api-key <key>` and `security flow traceoptions
+    flag <flag>` were declared in `setSchema` as `{args: 1, children: nil}`
+    WITHOUT `multi: true`. Each is a REPEATED single-value statement whose
+    compiler reads EVERY sibling via `FindChildren` (`compiler_system.go`
+    NTP/archive-sites/api-key, `compiler_security.go` traceoptions flag),
+    accumulating into a slice. But `SetPath`'s terminal-leaf branch
+    (`pkg/config/ast_edit.go`, the `i >= len(path)` case) took the
+    single-value-REPLACE path for an `args > 0, !multi, children == nil` leaf,
+    so a SECOND `set ... server 2.2.2.2` REPLACED the first. A flat-set /
+    `load set` / `| display set` round-trip of a multi-value config therefore
+    DROPPED all but the LAST value silently. The compiler was already
+    multi-value (FindChildren) — the config was internally multi but the SET
+    path collapsed it.
+    FIX (schema markers only): added `multi: true` to the four leaves
+    (`schema_system.go` server:100, archive-sites:78, api-key:348;
+    `schema_security.go` flag:693). With `multi: true` the terminal-leaf
+    branch DEDUPs and APPENDs instead of replacing, so each `set` keeps a
+    distinct sibling; the compiler read is unchanged (still FindChildren).
+    Mechanism note: this is the SEPARATE-STATEMENTS use of `multi` (distinct
+    siblings), not the #2419 bracket-collapse — each `set` consumes exactly
+    `1+args` tokens with no trailing token, so the collapse branch (which
+    needs trailing tokens) never runs. `archive-sites`'s optional trailing
+    `password <s>` rides on `Keys[2:]` of the leaf and the compiler already
+    reads it there; the existing `flat_set_password` test stays green because
+    a passworded site is a distinct leaf either way. Delete/deactivate of
+    these leaves now inherit member-wise editing for free (the multi-leaf
+    branch in deletePath/setInactiveAtPath, #3846/#3975).
+    AUDIT (step 3): swept every raw (non-`namedInstances`) `FindChildren` read
+    against its schema decl. Only four leaves were in the collapse class
+    (children:nil, !multi, compiler accumulates siblings): the four fixed.
+    NOT bugs — `key-exchange`/`as-path`/`vlan-id-list`/`code-points` already
+    `multi`; ddns `server` read singly via a props map; `priority-cost` /
+    `track-priority-cost` are scalars validated in a loop (track-interface
+    capped at 1/vrrp-group); CoS rewrite `code-point` returns the first value
+    only; policy-`then` actions are one-per-then. Keyed CONTAINERS (`route`,
+    `security-zone`, `policy`, ...) have schema children so SetPath treats
+    them as containers → distinct siblings, never collapsed.
+    RED-on-revert: `pkg/config/set_repeated_leaf_3984_test.go` — 3× NTP
+    server, 3× archive-sites (one passworded), 2× api-key, 2× trace flag via
+    ParseSetCommand + SetPath assert all siblings survive + compiler reads
+    all; a display-set round-trip (FormatSet → re-apply) reproduces all 3 NTP
+    servers; single-server anti-over-broadening guard. Reverting the four
+    markers fails exactly the 5 collapse cases while the single-value guard
+    stays green. `go test ./pkg/config/... ./pkg/cli/...` green; `go build
+    ./...`, gofmt, vet clean. Docs: `docs/config-schema.md` new subsection
+    "`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
+    leaves (#3984)".
+  - **File(s)**: pkg/config/schema_system.go, pkg/config/schema_security.go,
+    pkg/config/set_repeated_leaf_3984_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-07-03 — #3982: config-mode `rename` of a non-first same-keyword sibling failed (matched only the first sibling)
 
@@ -30668,3 +30755,27 @@ top.
   - **File(s)**: pkg/configstore/store_lock.go,
     pkg/configstore/store_lock_3979_test.go, pkg/configstore/README.md,
     cmd/cli/shared.go, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3994 — IKE dead-peer-detection bare / interval-only /
+    threshold-only forms now enable DPD. The compiler overloaded the
+    `DeadPeerDetect` mode string as the enable flag, so a bare
+    `dead-peer-detection;` produced an empty mode read as DISABLED downstream
+    (no `dpd_delay`), and an interval-only / threshold-only stanza let
+    `nodeVal()` capture the sub-field token ("interval"/"threshold") as a bogus
+    mode. Added `IPsecGateway.DPDEnable` as the single enable source of truth;
+    rewrote `parseDeadPeerDetectionNode` to set it for every form and to scan
+    both node Keys and children for mode/interval/threshold; gated `deriveDPD`
+    on `DPDEnable` (mode-string fallback kept) and gave the bare/default form a
+    concrete `dpd_action` (restart/clear, Junos-optimized default) instead of
+    leaning on strongSwan's implicit default; updated both `show security`
+    DPD-display sites to gate on `DPDEnable`. Tests: config-layer form matrix
+    (`TestIKEDeadPeerDetectionForms`) + end-to-end swanctl render
+    (`TestGenerateConfig_DPDBareAndTuningForms`, RED-on-revert: bare form loses
+    `dpd_delay = 10s` when the fix is reverted — proven). go build ./..., gofmt,
+    vet clean; pkg/config + pkg/ipsec + pkg/cli + pkg/grpcapi suites green.
+    Docs: pkg/ipsec/README.md DPD bullet rewritten.
+  - **File(s)**: pkg/config/types_security.go, pkg/config/compiler_ipsec.go,
+    pkg/config/parser_security_test.go, pkg/ipsec/ike.go, pkg/ipsec/ipsec_test.go,
+    pkg/cli/cli_show_security_ipsec.go, pkg/grpcapi/server_show_security_text.go,
+    pkg/ipsec/README.md, _Log.md

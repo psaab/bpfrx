@@ -531,9 +531,22 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 			pl = &PrefixList{Name: inst.name}
 			po.PrefixLists[inst.name] = pl
 		}
+		// Read EVERY prefix entry. A prefix-list body may carry its prefixes as
+		// distinct sibling children (one `set ... prefix-list NAME <p>` per line,
+		// or a brace block with one `<p>;` per line — each child then holds a
+		// single prefix in Keys[0]) OR, via the bracketed-list form
+		// `set ... prefix-list NAME [ p1 p2 p3 ]`, collapsed onto a SINGLE child
+		// node's Keys (the lexer strips `[`/`]` and packs every token onto one
+		// leaf — the #2419/#3842 dual-shape class). Read the FULL Keys slice of
+		// each child, not just Keys[0]; the prior `entry.Keys[0]`-only read kept
+		// just the FIRST prefix of a bracketed list and silently dropped the
+		// rest → an under-populated prefix-list (route-filter / firewall-filter /
+		// dynamic address group matched a partial prefix set) (#3996).
 		for _, entry := range inst.node.Children {
-			if len(entry.Keys) > 0 {
-				pl.Prefixes = append(pl.Prefixes, entry.Keys[0])
+			for _, p := range entry.Keys {
+				if p != "" {
+					pl.Prefixes = append(pl.Prefixes, p)
+				}
 			}
 		}
 	}

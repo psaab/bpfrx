@@ -171,8 +171,16 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 }
 
 // deriveDPD computes the dead-peer-detection settings for a connection.
+//
+// DPD is enabled whenever the gateway carries a `dead-peer-detection` stanza
+// (gw.DPDEnable), regardless of whether an explicit mode keyword was given. A
+// bare `dead-peer-detection;` therefore yields a DPD-enabled connection with
+// the strongSwan defaults (10s delay, restart/clear action) — before #3994 the
+// enable check was gw.DeadPeerDetect != "", so the bare form was silently
+// treated as disabled. gw.DeadPeerDetect != "" is still honoured as a fallback
+// so a hand-built gateway that sets only the mode still enables DPD.
 func deriveDPD(gw *config.IPsecGateway, vpn *config.IPsecVPN) dpdSettings {
-	if gw == nil || gw.DeadPeerDetect == "" {
+	if gw == nil || (!gw.DPDEnable && gw.DeadPeerDetect == "") {
 		return dpdSettings{}
 	}
 
@@ -202,8 +210,17 @@ func deriveDPD(gw *config.IPsecGateway, vpn *config.IPsecVPN) dpdSettings {
 			action = "trap"
 		}
 	default:
+		// No explicit mode keyword (bare `dead-peer-detection;`). Junos
+		// treats a bare stanza as its default DPD behaviour, which matches
+		// the "optimized" mode: restart an always-on tunnel, otherwise clear
+		// the dead SA so it re-establishes on the next packet. Emitting a
+		// concrete action here means the bare form gets a sensible
+		// dpd_action instead of relying on strongSwan's implicit default
+		// (#3994).
 		if vpn != nil && vpn.EstablishTunnels == "immediately" {
 			action = "restart"
+		} else {
+			action = "clear"
 		}
 	}
 

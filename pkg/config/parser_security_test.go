@@ -1973,6 +1973,101 @@ func TestIKEGatewayLocalCertificateAndTrafficSelectorSetSyntax(t *testing.T) {
 	}
 }
 
+// TestIKEDeadPeerDetectionForms exercises every DPD stanza shape through the
+// flat-set compile path (#3994). The bare statement must ENABLE DPD (not be
+// read as disabled), and the interval-only / threshold-only forms must enable
+// DPD + capture the tuning value WITHOUT leaving the mode string holding the
+// bogus sub-field token ("interval"/"threshold").
+func TestIKEDeadPeerDetectionForms(t *testing.T) {
+	compile := func(t *testing.T, cmds []string) *IPsecGateway {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, cmd := range cmds {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%v): %v", path, err)
+			}
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		return cfg.Security.IPsec.Gateways["g"]
+	}
+
+	cases := []struct {
+		name          string
+		cmds          []string
+		wantEnable    bool
+		wantMode      string
+		wantInterval  int
+		wantThreshold int
+	}{
+		{
+			name:       "bare enables DPD with defaults",
+			cmds:       []string{`set security ike gateway g dead-peer-detection`},
+			wantEnable: true,
+			wantMode:   "",
+		},
+		{
+			name:         "interval-only enables + tunes, no bogus mode",
+			cmds:         []string{`set security ike gateway g dead-peer-detection interval 10`},
+			wantEnable:   true,
+			wantMode:     "",
+			wantInterval: 10,
+		},
+		{
+			name:          "threshold-only enables + tunes, no bogus mode",
+			cmds:          []string{`set security ike gateway g dead-peer-detection threshold 3`},
+			wantEnable:    true,
+			wantMode:      "",
+			wantThreshold: 3,
+		},
+		{
+			name:       "always-send mode",
+			cmds:       []string{`set security ike gateway g dead-peer-detection always-send`},
+			wantEnable: true,
+			wantMode:   "always-send",
+		},
+		{
+			name:         "optimized mode with tuning",
+			cmds:         []string{`set security ike gateway g dead-peer-detection optimized`, `set security ike gateway g dead-peer-detection interval 15`, `set security ike gateway g dead-peer-detection threshold 4`},
+			wantEnable:   true,
+			wantMode:     "optimized",
+			wantInterval: 15, wantThreshold: 4,
+		},
+		{
+			name:       "no DPD stanza leaves DPD off",
+			cmds:       []string{`set security ike gateway g address 1.2.3.4`},
+			wantEnable: false,
+			wantMode:   "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := compile(t, tc.cmds)
+			if gw == nil {
+				t.Fatal("missing gateway g")
+			}
+			if gw.DPDEnable != tc.wantEnable {
+				t.Errorf("DPDEnable = %v, want %v", gw.DPDEnable, tc.wantEnable)
+			}
+			if gw.DeadPeerDetect != tc.wantMode {
+				t.Errorf("DeadPeerDetect = %q, want %q", gw.DeadPeerDetect, tc.wantMode)
+			}
+			if gw.DPDInterval != tc.wantInterval {
+				t.Errorf("DPDInterval = %d, want %d", gw.DPDInterval, tc.wantInterval)
+			}
+			if gw.DPDThreshold != tc.wantThreshold {
+				t.Errorf("DPDThreshold = %d, want %d", gw.DPDThreshold, tc.wantThreshold)
+			}
+		})
+	}
+}
+
 func TestIKEAdvancedSetSyntax(t *testing.T) {
 	setCommands := []string{`set security ike proposal ike-p1 authentication-method pre-shared-keys`, `set security ike proposal ike-p1 dh-group group14`, `set security ike proposal ike-p1 encryption-algorithm aes-256-cbc`, `set security ike policy pol1 mode main`, `set security ike policy pol1 proposals ike-p1`, `set security ike policy pol1 pre-shared-key ascii-text mysecret`, `set security ike gateway gw1 ike-policy pol1`, `set security ike gateway gw1 address 10.0.0.1`, `set security ike gateway gw1 version v2-only`, `set security ike gateway gw1 no-nat-traversal`, `set security ike gateway gw1 dead-peer-detection always-send`, `set security ike gateway gw1 local-identity hostname vpn.test.com`, `set security ike gateway gw1 remote-identity inet 10.0.0.1`, `set security ipsec proposal esp-p2 protocol esp`, `set security ipsec proposal esp-p2 encryption-algorithm aes-256-cbc`, `set security ipsec proposal esp-p2 authentication-algorithm hmac-sha-256-128`, `set security ipsec policy ipsec-pol perfect-forward-secrecy keys group5`, `set security ipsec policy ipsec-pol proposals esp-p2`, `set security ipsec vpn tun1 bind-interface st0.0`, `set security ipsec vpn tun1 df-bit copy`, `set security ipsec vpn tun1 establish-tunnels immediately`, `set security ipsec vpn tun1 ike gateway gw1`, `set security ipsec vpn tun1 ike ipsec-policy ipsec-pol`}
 	tree := &ConfigTree{}
