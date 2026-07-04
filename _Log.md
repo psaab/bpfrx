@@ -50,6 +50,48 @@
   - **Validation flag**: test-failover WARRANTED (HA config convergence) —
     parent batch-validates on the loss userspace cluster with the
     force-node0-primary gate.
+## 2026-07-03 — #3929: session-count stats (SessionCount + xpf_sessions_active/established) permanently 0 on the userspace dataplane
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-051 (MEDIUM, observability). `SessionCount`
+    (gRPC `GetStatus`, REST `/status`) and the Prometheus
+    `xpf_sessions_active`/`xpf_sessions_established` gauges were sourced from
+    `gc.Stats().TotalEntries`/`EstablishedSessions`. On the userspace dataplane
+    (the only live forwarding path since #1476) the BPF GC sweep is skipped
+    (#333), so `gc.Stats()` session counts are permanently 0 — active-session
+    metrics/dashboards/alerts read a constant 0 regardless of real load, and a
+    session-leak/exhaustion condition is invisible. Fix: re-source all three
+    outputs from the LIVE dataplane session table (the same mirrored conntrack
+    maps `show security flow session` reads). `collectSessionGauges`
+    (`pkg/api/metrics_sessions.go`) now derives `active` (forward entries,
+    `IsReverse==0`) and `established` (forward entries with
+    `State==SessStateEstablished`) inside the SAME `IterateSessions`/
+    `IterateSessionsV6` scan that already backs the type breakdown — one scan,
+    no new periodic scan (the #333 GC-skip optimization stands), and all session
+    gauges share the one fail-loud `xpf_sessions_breakdown_scrape_ok` gate
+    (#2469 extended to active/established). `GetStatus`
+    (`pkg/grpcapi/server_show_status.go`) and `/status`
+    (`pkg/api/health.go`) read `dp.SessionCount()` (forward-only live total)
+    guarded by `dp != nil && IsLoaded()`. `SessionCount()` added to the
+    `apiRuntimeDataPlane` interface (pkg/api) and its daemon mirror
+    `apiDataPlane` (`pkg/daemon/runtime_probes.go`). The Rust mirror writes
+    `state=ESTABLISHED` for all live rows (`publish_conntrack.rs`), so on a real
+    node established≈active today; the Go derivation is correct and general and
+    was unit-tested with a mock snapshot carrying a DISTINCT established subset.
+    RED-on-revert (verified by temporarily reverting each site): Prometheus
+    snapshot with 4 forward (3 established, +1 reverse ignored) → active=4,
+    established=3, ipv4=3/ipv6=1/snat=1/dnat=1 (revert → 0/0); REST `/status`
+    `session_count`=4 (revert → 0); gRPC `GetStatus` SessionCount=7 for
+    v4=5+v6=2 (revert → 0). `go test ./pkg/api/... ./pkg/grpcapi/...
+    ./pkg/conntrack/... ./pkg/dataplane/... ./pkg/daemon/...` green;
+    `go build ./...`, gofmt, vet clean. Cluster smoke (metric non-zero under
+    iperf) WARRANTED but not required for merge — pure read-path stats change,
+    no forwarding/HA/session-sync code touched.
+  - **File(s)**: pkg/api/metrics_sessions.go, pkg/api/api.go, pkg/api/health.go,
+    pkg/grpcapi/server_show_status.go, pkg/daemon/runtime_probes.go,
+    pkg/api/README.md, pkg/api/metrics_sessions_userspace_3929_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go,
+    pkg/grpcapi/server_show_status_3929_test.go
 
 ## 2026-07-03 — #3918: flow-cache neighbor_mac_epoch stamped AFTER neighbor resolve → resolve→stamp TOCTOU re-opens the #3048 stale-MAC blackhole on VRRP gateway failover
 
@@ -29611,3 +29653,38 @@ top.
     force-node0-primary gate.
   - **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
     docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3932 — flow-traceoptions leaked one EventReader callback per
+    commit. `updateFlowTrace`/`applyFlowTrace` (pkg/daemon/daemon_flow.go)
+    closed the old `TraceWriter` but still called
+    `EventReader.AddCallback(tw.HandleEvent)` every commit touching
+    `security flow traceoptions`, without removing the previous callback. After
+    N such commits the reader held N registered trace callbacks: each event was
+    dispatched to all N, and the stale (already-closed) writers still ran
+    `HandleEvent` and bumped `DroppedWrites` — an unbounded per-event cost plus
+    a leaked-writer drop storm on a long-lived daemon. Fix (issue option b, the
+    #2075/#3742 flowexport pattern): register a SINGLE stable indirection
+    callback `Daemon.flowTraceCallback` exactly once (guarded by `traceCBOnce`)
+    that reads the live writer lock-free from a new
+    `atomic.Pointer[logging.TraceWriter]` (`traceWriterPtr`, replacing the plain
+    `traceWriter` field); each reconcile only SWAPS the underlying writer and
+    closes the one it replaced (`reconcileFlowTrace`), guarded by `traceReconMu`
+    so exactly one writer is closed per swap while the event-path callback stays
+    lock-free. Disabling traceoptions swaps in nil (callback stays, no-op); a
+    NewTraceWriter build failure keeps the current writer running rather than
+    dropping tracing. Added exported test hook
+    `logging.SetTraceLogDirForTest` (trace.go) so the cross-package daemon test
+    can drive `NewTraceWriter` against a temp dir. RED-on-revert unit test
+    `TestFlowTraceSingleCallbackAcrossReconciles`: after 3 reconciles the reader
+    has exactly 1 callback (RED=2/3 on revert) + 1 live writer, the 2 superseded
+    writers are closed and receive ZERO dispatched events (their `DroppedWrites`
+    do not move — RED bumps them on revert), a single SESSION_CLOSE writes
+    exactly one trace line, and disabling clears the writer while the single
+    callback remains. Verified RED by simulating the per-commit AddCallback
+    (callbacks=2, want 1). `go test -race ./pkg/daemon/... ./pkg/logging/...`
+    green, `go build ./...`, gofmt, vet clean. Doc: pkg/logging/README.md
+    flow-trace single-callback bullet.
+  - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_flow.go,
+    pkg/daemon/daemon_flowtrace_3932_test.go, pkg/logging/trace.go,
+    pkg/logging/README.md, _Log.md

@@ -80,9 +80,14 @@ func (s *Server) statusHandler(w http.ResponseWriter, _ *http.Request) {
 	if cfg := s.store.ActiveConfig(); cfg != nil {
 		resp.ZoneCount = len(cfg.Security.Zones)
 	}
-	if s.gc != nil {
-		stats := s.gc.Stats()
-		resp.SessionCount = stats.TotalEntries
+	// #3929: report the live session count from the dataplane session table,
+	// NOT the BPF GC sweep stats. On the userspace dataplane (the only live
+	// forwarding path) the BPF GC sweep is skipped (#333), so
+	// gc.Stats().TotalEntries is permanently 0 — this reported 0 sessions on
+	// every real deployment.
+	if s.dp != nil && s.dp.IsLoaded() {
+		v4, v6 := s.dp.SessionCount()
+		resp.SessionCount = v4 + v6
 	}
 	writeOK(w, resp)
 }
