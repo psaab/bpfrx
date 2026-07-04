@@ -1,3 +1,37 @@
+## 2026-07-03 — #4041: the debug-log direct-TX diagnostic double-recycled a UMEM frame offset on a tuple-mismatch → the offset aliased an in-flight TX frame (on-wire corruption / double-free, debug-log build)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-079 (MEDIUM, Rust dataplane, debug-log build).
+    On the cross-binding direct-TX path in `enqueue_pending_forwards`
+    (`userspace-dp/src/afxdp/tx/dispatch/mod.rs`), the `debug-log`-gated
+    tuple-mismatch diagnostic (`if cfg!(feature = "debug-log")`) pushed the
+    built frame's `tx_offset` back onto `free_tx_frames` AND set
+    `build_failed = true`. The shared `if build_failed` handler immediately
+    below then pushed the SAME `tx_offset` a second time. The offset landed on
+    the free-list twice → it was popped for two later TX descriptors that
+    aliased one in-flight UMEM frame → on-wire corruption / double-free. Only
+    the direct-TX path was affected: the three sibling debug-log mismatch sites
+    (segmentation + the two Vec-copy fallbacks) operate on owned `Vec` frames,
+    not free-list offsets, and forward-anyway without recycling.
+  - **Fix**: removed the recycle push from the diagnostic branch. The mismatch
+    is still recorded via `record_exception`, and `build_failed = true` routes
+    the drop through the SINGLE `if build_failed` recycle — the offset returns
+    to `free_tx_frames` exactly once. A correct builder can never trip the
+    mismatch (`enforce_expected_ports` makes built ports == expected), so the
+    RED-on-revert test reaches the branch via a new `#[cfg(test)]`
+    `FORCE_TUPLE_MISMATCH` hook (mirrors the #2208 `FORCE_OVERSIZED` pattern,
+    routed through a `direct_tx_tuple_mismatch_reason` wrapper that DCEs out of
+    release). Test `direct_tx_tuple_mismatch_recycles_frame_exactly_once`
+    asserts no duplicate offset on the free-list (both builds) and, under
+    `--features debug-log`, pool-conservation + a recorded mismatch exception.
+  - **Validation**: RED-on-revert proven — reinstating the duplicate push fails
+    the test with `tx_offset 0 recycled 2 times` (run with
+    `--features debug-log`). FULL `cargo test --release` green; the new test
+    green under `--features debug-log`; `go build ./...` green. rustfmt touched
+    only the added lines (pre-existing repo quirks left alone).
+  - **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+    userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+    userspace-dp/src/afxdp/tx/README.md, _Log.md
 ## 2026-07-03 — #4044: the LLDP received-neighbor table was unbounded → an LLDP frame flood (many spoofed chassis/port ids) grew it without limit → OOM (L2 DoS)
 
 - **Timestamp**: 2026-07-03

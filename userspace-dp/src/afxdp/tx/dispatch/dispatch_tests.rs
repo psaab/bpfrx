@@ -707,6 +707,9 @@ impl Drop for ForceFaultGuard {
     fn drop(&mut self) {
         super::cos::FORCE_ENQUEUE_ERR.with(|c| c.set(false));
         super::FORCE_OVERSIZED.with(|c| c.set(false));
+        // #4041: reset the direct-TX tuple-mismatch injection so a panicking
+        // assertion cannot leak it into the next test on the same thread.
+        super::FORCE_TUPLE_MISMATCH.with(|c| c.set(false));
     }
 }
 
@@ -1473,4 +1476,143 @@ fn shared_exact_policy_handles_unknown_queue() {
         !request_runs_under_shared_exact_policy(&cos_fast_interfaces, 999, Some(5)),
         "an unknown egress_ifindex must not be reported as shared_exact policy"
     );
+}
+
+// #4041: the direct-TX diagnostic tuple-mismatch branch (debug-log build) must
+// recycle the frame's `tx_offset` onto `free_tx_frames` EXACTLY once. Before
+// the fix the mismatch branch pushed the offset AND the shared `if build_failed`
+// handler pushed it again — the same UMEM offset landed on the free-list twice,
+// so it was handed out for two later TX descriptors that then aliased one
+// in-flight frame (on-wire corruption / double-free on the debug-log build).
+//
+// A correct builder never trips the mismatch (`enforce_expected_ports` makes the
+// built L4 ports equal the expected tuple), so the branch is reached via the
+// `#[cfg(test)] FORCE_TUPLE_MISMATCH` hook. The branch itself only exists under
+// the `debug-log` feature (`if cfg!(feature = "debug-log")`), so the
+// single-recycle assertions are gated on that feature; the non-debug-log build
+// exercises the normal direct-TX forward (offset consumed by the TX pipeline).
+//
+// RED-on-revert (run with `--features debug-log`): reinstating the duplicate
+// `push_front` makes the popped offset appear twice in `free_tx_frames` and the
+// pool length grow by one — both assertions below fail.
+#[test]
+fn direct_tx_tuple_mismatch_recycles_frame_exactly_once() {
+    let _guard = ForceFaultGuard;
+    // Two bindings on SEPARATE UMEMs so `can_rewrite_in_place` is false and
+    // dispatch takes the cross-binding direct-TX path. Unlike the cp2 harness
+    // the egress pool is left populated so a direct-TX frame is available.
+    let mut bindings = vec![
+        BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+        BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+    ];
+    let original_frame = build_ipv4_test_packet(0);
+    unsafe {
+        bindings[0]
+            .umem
+            .area()
+            .slice_mut_unchecked(0, original_frame.len())
+    }
+    .expect("ingress frame")
+    .copy_from_slice(&original_frame);
+
+    let egress_free_before = bindings[1].tx_pipeline.free_tx_frames.len();
+    let front_offset = *bindings[1]
+        .tx_pipeline
+        .free_tx_frames
+        .front()
+        .expect("egress pool populated");
+
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mirror_targets = MirrorTargetMap::default();
+    let mut pending = vec![test_live_forward_request_for_frame(
+        original_frame.len(),
+        test_forwarding_decision_to_bound_ifindex(22),
+    )];
+    let mut post_recycles = Vec::new();
+    let ingress_ident = bindings[0].identity();
+    let ingress_live = &*bindings[0].live as *const BindingLiveState;
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
+        Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+    let mut dbg = DebugPollCounters::default();
+
+    // Force the direct-TX tuple-mismatch diagnostic branch to fire.
+    super::FORCE_TUPLE_MISMATCH.with(|c| c.set(true));
+
+    let (left, rest) = bindings.split_at_mut(0);
+    let (ingress, right) = rest.split_first_mut().expect("ingress binding");
+    enqueue_pending_forwards(
+        left,
+        0,
+        ingress,
+        right,
+        &lookup,
+        &mirror_targets,
+        &mut pending,
+        &mut post_recycles,
+        1,
+        &forwarding,
+        &ingress_ident,
+        unsafe { &*ingress_live },
+        None,
+        &local_tunnel_deliveries,
+        &recent_exceptions,
+        &mut dbg,
+        &mut BatchCounters::default(),
+        0,
+        &worker_commands_by_id,
+    );
+
+    let free = &bindings[1].tx_pipeline.free_tx_frames;
+    // Regardless of build: the popped offset must never appear twice on the
+    // free-list — a duplicate is the aliasing bug.
+    let dup = free.iter().filter(|&&o| o == front_offset).count();
+    assert!(
+        dup <= 1,
+        "#4041: tx_offset {front_offset} recycled {dup} times — a duplicate \
+         free-list entry aliases an in-flight TX frame"
+    );
+
+    if cfg!(feature = "debug-log") {
+        // The mismatch fired: the frame was dropped and its offset returned to
+        // the pool exactly once, so the pool length is unchanged.
+        assert_eq!(
+            free.len(),
+            egress_free_before,
+            "#4041: a mismatch drop must recycle the offset exactly once \
+             (pool conserved); a second push grows the pool by one"
+        );
+        assert_eq!(
+            dup, 1,
+            "the recycled offset must be present exactly once after a mismatch drop"
+        );
+        let reasons: Vec<String> = recent_exceptions
+            .lock()
+            .expect("exceptions")
+            .iter()
+            .map(|e| e.reason.clone())
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("forward_tuple_mismatch")),
+            "the mismatch must still be recorded for operators: {reasons:?}"
+        );
+        assert_eq!(
+            dbg.enqueue_ok, 0,
+            "a dropped mismatch frame is not a successful TX"
+        );
+    } else {
+        // Without the debug-log feature the mismatch branch is compiled out; the
+        // direct-TX forward succeeds and the offset is consumed by the TX
+        // pipeline (one fewer free frame), never duplicated.
+        assert_eq!(
+            free.len(),
+            egress_free_before - 1,
+            "the direct-TX forward consumes exactly one free frame"
+        );
+        assert_eq!(dbg.enqueue_ok, 1, "the direct-TX forward is enqueued");
+    }
 }

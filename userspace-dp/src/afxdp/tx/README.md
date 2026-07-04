@@ -48,6 +48,15 @@ writer to synchronize against.
   `tx_shared_recycle_unknown_slot_drops` on the worker status surface with
   bounded one-line logging per drain; never push a foreign offset into an
   arbitrary binding's fill ring.
+- The cross-binding direct-TX build's `debug-log` tuple-mismatch diagnostic
+  (`dispatch/mod.rs`) drops the built frame by setting `build_failed`; the
+  frame's `tx_offset` is recycled to `free_tx_frames` through the SINGLE
+  `if build_failed` handler. The diagnostic branch records the mismatch
+  exception but must NOT push the offset itself. Recycling the same offset in
+  both the diagnostic branch and the `build_failed` handler double-frees it —
+  the offset is then handed out for two later TX descriptors that alias one
+  in-flight frame (on-wire corruption / double-free on the debug-log build).
+  Regression: `direct_tx_tuple_mismatch_recycles_frame_exactly_once` (#4041).
 - `Ordering::Relaxed` is intentional and correct given the
   single-writer invariant. Don't promote without proving a second
   writer exists.
