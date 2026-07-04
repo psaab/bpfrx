@@ -65,6 +65,38 @@
     `TestSleepCtx*` (RED-on-revert: retry loop honours ctx cancel instead of
     spinning the full 60s budget). Full `pkg/cluster` + `pkg/daemon` suites
     green with `-race`. test-failover WARRANTED (HA heartbeat) — batch-validate.
+## 2026-07-03 — #4036: control-socket fixed 3s deadline false-times-out a large (up to 64MB) apply_snapshot (fable-161 F-182)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the userspace-dp control-socket round-trip
+    (`requestDetailedLocked`) using a FIXED 3s read/write deadline for EVERY
+    request type. An `apply_snapshot` can be up to `MaxControlRequestBytes`
+    (64 MiB, #2744) of feed-backed address-book CIDR text; the Rust helper
+    receives+decodes+APPLIES the whole body (LPM tables, binding plan, AF_XDP
+    reconcile) before replying, which can exceed 3s → Go's `Decode` timed out
+    and reported the apply FAILED while the helper had actually applied it and
+    the dataplane was forwarding live with the new config (spurious commit
+    failure / needless rollback / false HA dp-failure).
+  - **Fix**: new pure helper `controlRoundtripDeadline(bodyLen)` sizes the
+    deadline to the serialized request length — historical 3s base for any
+    sub-1-MiB request (status poll and small forwarding/HA/session requests
+    unchanged, poll stays responsive per #182), +1s per mebibyte, capped at
+    120s. 64 MiB → 3s+64s = 67s. Computed from the same `len(body)` the #2744
+    pre-flight already serializes (no extra marshal). The dedicated
+    session-sync socket keeps the flat 3s (small per-session installs; bulk
+    export/drain run over the main socket and get the scaled deadline).
+  - **Tests**: `control_socket_deadline_4036_test.go` — pins the sizing math
+    (small=base, per-MiB scaling, 120s cap, monotone); a fail-on-revert
+    round-trip where a mock helper drains a >=3 MiB apply_snapshot then sleeps
+    3.5s (> old 3s, < scaled 6s) before replying OK; and a hung-helper case
+    that still times out at the base deadline. RED-on-revert verified: with the
+    deadline reverted to a fixed 3s the large-apply test FAILS at 3.01s
+    ("i/o timeout") while the math + hung tests stay green.
+  - **File(s)**: `pkg/dataplane/userspace/process.go`,
+    `pkg/dataplane/userspace/control_socket_deadline_4036_test.go`,
+    `docs/userspace-dataplane-architecture.md`
+  - **Follow-up**: no HA state/session-sync code touched (deadline sizing only)
+    — test-failover not warranted.
 
 ## 2026-07-03 — #4031: monitorFabricState exits + leaks sibling netlink socket on ENOBUFS (fable-161 F-167)
 

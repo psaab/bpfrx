@@ -1297,6 +1297,42 @@ identical**; the relationship is pinned by
 `legitimate_feed_above_old_16mib_cap_is_now_accepted` /
 `request_above_new_cap_is_still_rejected` fail-on-revert tests (Rust).
 
+### Control-socket round-trip deadline (#4036)
+
+The Go sender (`requestDetailedLocked`, `pkg/dataplane/userspace/process.go`)
+sets a single read/write deadline on the control connection covering the
+whole round-trip: write the request body, then block on the helper's JSON
+response. The helper reads the whole body, decodes it, **applies** it, and
+only then writes the response, so the deadline must cover the helper's apply
+time — not just the socket transfer.
+
+The deadline is **sized to the serialized request length** rather than fixed.
+A fixed 3s was correct for the small frequent requests but too short for a
+large `apply_snapshot`: at the 64 MiB ceiling the helper must decode ~1.4M
+feed-backed address-book CIDRs, build the address-book LPM tables, plan
+bindings, and reconcile AF_XDP before replying, which can exceed 3s. Under
+the fixed deadline Go's `Decode` timed out and reported the apply **FAILED**
+while the helper had actually applied the snapshot and the dataplane was
+forwarding live with the new config — a spurious commit failure that could
+trigger a needless rollback/retry or a false HA dp-failure.
+
+`controlRoundtripDeadline(bodyLen)` computes the deadline: it keeps the
+historical **3s base** for any sub-1-MiB request (so the 1/s status poll and
+the small forwarding/HA/session requests are byte-for-byte unchanged and the
+poll stays responsive per the #182 contention discipline) and adds **1s per
+mebibyte** on top, capped at **120s**. At the 64 MiB request ceiling this is
+`3s + 64s = 67s`, comfortably under the cap — generous enough for a legitimate
+feed-heavy apply while still bounding a genuinely-hung helper (the caller holds
+`m.mu` across the round-trip, so an unbounded wait would freeze status polls
+and session installs). The length is the same `len(body)` the #2744 pre-flight
+already serializes, so no extra marshal. The dedicated session-sync socket
+(`requestSessionSync`) keeps the flat 3s: it carries only small per-session
+installs; the bulk session export/drain paths run over this main control
+socket and so already get the scaled deadline. Sizing math and a fail-on-revert
+round-trip (a slow-but-successful large apply that trips a fixed 3s but not the
+scaled deadline; a hung helper that still times out) are pinned by
+`control_socket_deadline_4036_test.go`.
+
 ## Limitations and Mixed Boundaries
 
 This section is a high-level architecture note. The authoritative current gate
