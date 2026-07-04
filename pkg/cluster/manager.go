@@ -149,6 +149,15 @@ type Manager struct {
 	hbSender   *heartbeatSender
 	hbReceiver *heartbeatReceiver
 
+	// hbStartMu serializes StartHeartbeat's stop-previous + socket-create +
+	// install sequence so two concurrent StartHeartbeat calls (e.g. a
+	// comms-restart bind-retry goroutine racing RestartHeartbeat) cannot
+	// interleave and leave two live heartbeat goroutine sets running. It is a
+	// separate lock from m.mu because StartHeartbeat calls StopHeartbeat
+	// (which acquires m.mu and joins goroutines that also take m.mu). See
+	// StartHeartbeat (#4033).
+	hbStartMu sync.Mutex
+
 	// Heartbeat config.
 	controlInterface string
 	hbInterval       time.Duration
