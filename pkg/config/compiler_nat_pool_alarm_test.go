@@ -38,6 +38,66 @@ func TestPoolUtilizationAlarmRejectsBareStanza(t *testing.T) {
 	}
 }
 
+// #4077: a raise-only alarm (no clear-threshold) is legal in Junos. It must
+// COMMIT, with clear-threshold defaulted to a hysteresis margin below raise so
+// the runtime monitor (which treats clear<=0 as disabled) actually arms it.
+// Goes RED on revert (validation rejects raise=90/clear=0).
+func TestPoolUtilizationAlarmRaiseOnlyDefaultsClear(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security nat source pool-utilization-alarm raise-threshold 90",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("raise-only alarm must compile, got: %v", err)
+	}
+	a := cfg.Security.NAT.PoolUtilizationAlarm
+	if a == nil {
+		t.Fatal("alarm not stored")
+	}
+	if a.RaiseThreshold != 90 {
+		t.Fatalf("raise-threshold not stored: %+v", a)
+	}
+	// raise 90 - hysteresis 10 = 80; must be a valid clear (0 < clear < raise)
+	// so the runtime monitor enables the alarm.
+	if a.ClearThreshold != 80 {
+		t.Fatalf("clear-threshold should default to 80 (raise-10), got %d", a.ClearThreshold)
+	}
+	if !(a.ClearThreshold > 0 && a.ClearThreshold < a.RaiseThreshold) {
+		t.Fatalf("defaulted clear must satisfy 0 < clear < raise, got clear=%d raise=%d", a.ClearThreshold, a.RaiseThreshold)
+	}
+}
+
+// A low raise-threshold floors the defaulted clear at 1 (never below 1) and
+// keeps it strictly below raise.
+func TestPoolUtilizationAlarmRaiseOnlyLowRaiseFloorsClear(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security nat source pool-utilization-alarm raise-threshold 5",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("raise-only alarm (low raise) must compile, got: %v", err)
+	}
+	a := cfg.Security.NAT.PoolUtilizationAlarm
+	if a == nil || a.RaiseThreshold != 5 {
+		t.Fatalf("alarm not stored correctly: %+v", a)
+	}
+	if a.ClearThreshold != 1 {
+		t.Fatalf("clear-threshold should floor at 1 for raise=5, got %d", a.ClearThreshold)
+	}
+}
+
+// An EXPLICIT clear-threshold is preserved and still validated: a raise-only
+// default must NOT paper over an explicitly invalid clear (regression guard for
+// the #4077 default so it does not weaken the #2079 gate).
+func TestPoolUtilizationAlarmExplicitClearStillValidated(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security nat source pool-utilization-alarm raise-threshold 90 clear-threshold 0",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("explicit clear-threshold 0 must still be rejected")
+	}
+}
+
 func TestPoolUtilizationAlarmRejectsInverted(t *testing.T) {
 	// clear >= raise is invalid (hysteresis meaningless).
 	tree := buildTree(t, []string{
