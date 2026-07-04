@@ -196,6 +196,37 @@ display-set round-trip, policy match `source-address`, block-shape
 `system-services` member toggle, single-value-leaf and keyed-entry
 non-regression).
 
+**Rename-side contract: resolve the SPECIFIC named sibling by full identity
+(#3982).** `rename <old> to <new>` (`RenamePath`, `ast_edit.go`) is the same
+read-all-siblings class as the delete/deactivate fixes above, but on a
+named-entity axis: with several same-keyword siblings (`policy A/B/C`,
+`term X/Y/Z`) the operator must be able to rename the 2nd+ occurrence. The
+pre-#3982 implementation resolved the source through `removeNode`, whose
+per-level loop broke on the FIRST child whose FIRST key matched
+(`matchNodeKeys > 0` returns `1` for a keyword-only match). So `rename policy B
+to B2` with siblings `[A B C]` matched `policy A`, descended into it looking for
+`B`, and failed `source not found` (for other shapes it could rename the wrong,
+first node). The operator's only recourse was delete + re-add, losing ordering
+and sub-config. `RenamePath` now:
+
+- resolves the source through `findNodeWithParent`, which prefers the LONGEST
+  key match (`consumed > bestConsumed`) and so selects the specific `policy B`
+  by its full identity, not the first `policy` keyword;
+- renames IN PLACE when the destination parent is the source parent (the common
+  case — only the name changes), preserving sibling order and the node's
+  children/sub-config; a cross-parent rename detaches the node and appends it
+  under the new parent (via `childrenAtPath`), also keeping its subtree;
+- rejects a rename whose new identity collides with an existing sibling under
+  the destination parent (`rename policy B to C` when `C` exists), so a rename
+  never silently creates a duplicate named entity.
+
+The now-dead `removeNode` helper (first-keyword-match, order-destroying
+append-on-reinsert) was removed. Covered by `TestRenameNonFirstSibling` in
+`pkg/config/parser_ast_test.go` (non-first `B->B2` renames exactly B with
+`[A B C]` order preserved and `then permit` sub-config intact, first-sibling
+`A->A2` still works, colliding `B->C` rejected with the tree unchanged, and a
+post-rename `CompileConfig` seeing `[A B2 C]`).
+
 **Firewall-filter `source/destination-prefix-list` refs are dual-AST too
 (#3843).** These `from` leaves are NOT `multi: true` value-tails — each
 reference carries an optional trailing `except` modifier, so they compile
