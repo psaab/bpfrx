@@ -1,6 +1,8 @@
 package userspace
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -4317,6 +4319,86 @@ func TestBuildScreenSnapshotsMatchesZoneToProfile(t *testing.T) {
 	}
 	if snaps[0].ICMPFloodThreshold != 50 {
 		t.Fatalf("ICMPFloodThreshold = %d, want 50", snaps[0].ICMPFloodThreshold)
+	}
+}
+
+// #3962: buildScreenSnapshots must serialize the per-zone screen profiles in a
+// deterministic (sorted-by-zone-name) order. Before the fix it ranged the
+// cfg.Security.Zones map directly, so the wire byte order varied build-to-build
+// even for an UNCHANGED config. That shifted the snapshotContentHash every
+// build, defeated the reconcile dedup, and re-applied the whole screen config
+// on every reconcile. Building the snapshot many times from the same config
+// must yield byte-identical (and equal-hash) Screens output. Goes RED on
+// revert because map iteration order randomizes per run.
+func TestBuildScreenSnapshotsDeterministicOrder(t *testing.T) {
+	cfg := &config.Config{}
+	// Many zones, each enabling a screen check, so map-order randomization is
+	// overwhelmingly likely to reorder the output across N builds pre-fix.
+	cfg.Security.Zones = map[string]*config.ZoneConfig{}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{}
+	zoneNames := []string{"trust", "untrust", "dmz", "wan", "lan", "guest", "mgmt", "iot", "voice", "video"}
+	for i, zn := range zoneNames {
+		profile := "prof-" + zn
+		cfg.Security.Zones[zn] = &config.ZoneConfig{Name: zn, ScreenProfile: profile}
+		cfg.Security.Screen[profile] = &config.ScreenProfile{
+			Name: profile,
+			TCP:  config.TCPScreen{Land: true, SynFin: i%2 == 0},
+			ICMP: config.ICMPScreen{FloodThreshold: i + 1},
+		}
+	}
+
+	first := buildScreenSnapshots(cfg)
+	if len(first) != len(zoneNames) {
+		t.Fatalf("len(first) = %d, want %d", len(first), len(zoneNames))
+	}
+	// Pin the deterministic contract: output is sorted ascending by zone name.
+	for i := 1; i < len(first); i++ {
+		if first[i-1].Zone >= first[i].Zone {
+			t.Fatalf("snapshots not sorted by zone: %q before %q", first[i-1].Zone, first[i].Zone)
+		}
+	}
+
+	firstJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+	}
+	firstHash := sha256.Sum256(firstJSON)
+
+	const iterations = 64
+	for n := 0; n < iterations; n++ {
+		got := buildScreenSnapshots(cfg)
+		gotJSON, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal iteration %d: %v", n, err)
+		}
+		if !bytes.Equal(firstJSON, gotJSON) {
+			t.Fatalf("iteration %d: screen snapshot bytes differ (nondeterministic order)\nfirst: %s\ngot:   %s",
+				n, firstJSON, gotJSON)
+		}
+		if sha256.Sum256(gotJSON) != firstHash {
+			t.Fatalf("iteration %d: content hash differs from first build", n)
+		}
+	}
+
+	// The missing-profile-refs sibling feeds ConfigSnapshot.ScreenMissingProfiles
+	// and so also feeds the content hash — it must be deterministic too. Point a
+	// few zones at undefined profiles.
+	for _, zn := range []string{"trust", "wan", "iot"} {
+		cfg.Security.Zones[zn].ScreenProfile = "does-not-exist-" + zn
+	}
+	firstMissing, err := json.Marshal(buildScreenMissingProfileRefs(cfg))
+	if err != nil {
+		t.Fatalf("marshal first missing: %v", err)
+	}
+	for n := 0; n < iterations; n++ {
+		gotMissing, err := json.Marshal(buildScreenMissingProfileRefs(cfg))
+		if err != nil {
+			t.Fatalf("marshal missing iteration %d: %v", n, err)
+		}
+		if !bytes.Equal(firstMissing, gotMissing) {
+			t.Fatalf("iteration %d: missing-profile-refs bytes differ (nondeterministic order)\nfirst: %s\ngot:   %s",
+				n, firstMissing, gotMissing)
+		}
 	}
 }
 

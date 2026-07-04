@@ -961,6 +961,24 @@ overlay. Four correctness invariants (#3770/#3772):
   was caught, so a two-table cycle burned to `MAX_NEXT_TABLE_DEPTH`)
   (#3768 M5+M6, `userspace-dp/src/afxdp/forwarding/mod.rs`).
 
+**Deterministic emission applies to EVERY map-backed snapshot builder, not
+just routes (#3962).** Any builder that ranges a Go `map` and appends the
+result into a `ConfigSnapshot` slice must iterate the map in a stable order,
+because that slice is serialized into the JSON that `snapshotContentHash`
+(`builder.go`) hashes for the duplicate-publish dedup. Go map iteration order
+is randomized per run, so ranging `cfg.Security.Zones` (a
+`map[string]*ZoneConfig`) directly produces a different wire byte order every
+build for an UNCHANGED config — the hash differs, the reconcile never skips,
+and the dataplane re-applies the config on every reconcile (needless
+control-socket + dataplane work; a screen re-apply can also re-arm SYN-cookie
+state). `buildScreenSnapshots` and its sibling `buildScreenMissingProfileRefs`
+(`screens.go`, feeding `Screens` / `ScreenMissingProfiles`) now collect the
+zone names, `sort.Strings` them, and range in sorted order — matching the
+long-standing pattern in `buildZoneSnapshots` (`zones.go`) and
+`buildSYNCookieMasterKey`. The syn-cookie master-key hash and all
+zone-host-inbound builders already sorted; the NAT / tunnel / neighbor
+builders range config SLICES (already ordered), so they were never affected.
+
 **Dynamic-address feed overlay (#2049).** The snapshot's address books carry
 the live `security dynamic-address` feed prefixes, not just the static
 `security address-book`. The daemon joins each `address-name ... profile

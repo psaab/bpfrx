@@ -13,7 +13,22 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 		return nil
 	}
 	var out []ScreenProfileSnapshot
-	for _, zone := range cfg.Security.Zones {
+	// Iterate zones in a deterministic (sorted-by-name) order. Ranging the
+	// cfg.Security.Zones map directly yields nondeterministic iteration order,
+	// which shifts the serialized snapshot's byte order build-to-build even
+	// for an UNCHANGED config. That defeats the snapshotContentHash dedup
+	// (builder.go) — the hash differs every build, the reconcile never skips,
+	// and the dataplane re-applies the whole screen config on every reconcile
+	// (needless control-socket + dataplane work, can re-arm SYN-cookie state).
+	// Sorting by zone name (the wire key, == the map key) makes the wire bytes
+	// stable so the content hash matches and the reconcile skips (#3962).
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, name := range zoneNames {
+		zone := cfg.Security.Zones[name]
 		if zone == nil || zone.ScreenProfile == "" {
 			continue
 		}
@@ -104,7 +119,17 @@ func buildScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef
 		return nil
 	}
 	var out []ScreenMissingProfileRef
-	for _, zone := range cfg.Security.Zones {
+	// Same determinism requirement as buildScreenSnapshots (#3962): this slice
+	// is carried in ConfigSnapshot.ScreenMissingProfiles and so feeds the
+	// snapshotContentHash dedup. Ranging the zones map directly would shift the
+	// wire byte order build-to-build. Sort by zone name for a stable order.
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, name := range zoneNames {
+		zone := cfg.Security.Zones[name]
 		if zone == nil || zone.ScreenProfile == "" {
 			// No screen configured for this zone — legit Pass, not a
 			// missing reference.
