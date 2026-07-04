@@ -518,6 +518,13 @@ func (c SNMPCommunity) MarshalYAML() (any, error) {
 type SNMPTrapGroup struct {
 	Name    string
 	Targets []string // IP addresses
+	// Version selects the SNMP protocol version used to emit this group's
+	// traps: "v1" emits an SNMPv1 Trap-PDU, "v2" an SNMPv2c trap (the
+	// default), and "all" emits both a v1 and a v2c trap. An empty string
+	// (unspecified) defaults to v2c. The schema enum is v1|v2|all (Junos
+	// semantics); the emitter honors it in pkg/snmp/traps.go so a
+	// `version v1` group is not silently sent as v2c (#3948).
+	Version string
 }
 
 // SNMPv3User defines an SNMPv3 USM user with authentication and privacy.
