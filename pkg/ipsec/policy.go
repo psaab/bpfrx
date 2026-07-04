@@ -184,9 +184,22 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 				fmt.Fprintf(&b, "        rekey_time = %ds\n", espLifetime)
 				b.WriteString("        rand_time = 0s\n")
 			}
-			if vpn.DFBit == "copy" {
+			// Junos df-bit → strongSwan copy_df (outer/ESP-header DF handling).
+			// strongSwan copy_df has two states: yes (default) copies the inner
+			// DF bit to the outer header; no forces the outer DF bit to 0
+			// (XFRM_STATE_NOPMTUDISC), which allows the encapsulated packet to be
+			// fragmented. There is no "force outer DF=1" — copy_df=yes is the
+			// closest DF-preserving / PMTUD-enabling behavior.
+			//   copy  → copy_df = yes   (outer DF = inner DF)
+			//   set   → copy_df = yes   (preserve DF / keep PMTUD; can't force 1)
+			//   clear → copy_df = no    (outer DF = 0, allow fragmentation)
+			// #4015: previously "set" emitted copy_df=no (which CLEARS DF) and
+			// "clear" fell through to the default copy_df=yes, i.e. set/clear were
+			// inverted — a "df-bit clear" blackholed oversized packets via PMTUD.
+			switch vpn.DFBit {
+			case "copy", "set":
 				fmt.Fprintf(&b, "        copy_df = yes\n")
-			} else if vpn.DFBit == "set" {
+			case "clear":
 				fmt.Fprintf(&b, "        copy_df = no\n")
 			}
 			if vpn.EstablishTunnels == "immediately" {

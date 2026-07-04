@@ -890,9 +890,13 @@ func TestGenerateConfig_DFBit(t *testing.T) {
 		want    string
 		notWant string
 	}{
+		// #4015: df-bit set/clear were inverted. strongSwan copy_df=no CLEARS
+		// the outer DF bit, so it must map to Junos "clear" (allow
+		// fragmentation), NOT "set". "set" (and "copy") preserve/copy the DF
+		// bit via copy_df=yes (strongSwan cannot force DF=1).
 		{"copy", "copy", "copy_df = yes", "copy_df = no"},
-		{"set", "set", "copy_df = no", "copy_df = yes"},
-		{"clear", "clear", "", "copy_df"},
+		{"set", "set", "copy_df = yes", "copy_df = no"},
+		{"clear", "clear", "copy_df = no", "copy_df = yes"},
 		{"empty", "", "", "copy_df"},
 	}
 	for _, tt := range tests {

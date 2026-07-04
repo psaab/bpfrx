@@ -849,7 +849,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 		"vpn": {desc: "IPsec VPN tunnel name", args: 1, placeholder: "<vpn-name>", children: map[string]*schemaNode{
 			"bind-interface":    {desc: "XFRM tunnel interface to bind", args: 1, placeholder: "<interface-name>", children: nil},
-			"df-bit":            {desc: "Outer-header DF bit handling (copy|set)", args: 1, placeholder: "<mode>", children: nil},
+			"df-bit":            {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>", children: nil},
 			"establish-tunnels": {desc: "Tunnel establishment (immediately = initiate at commit)", args: 1, placeholder: "<mode>", children: nil},
 			"local-identity":    {desc: "Local identity (default local traffic selector)", args: 1, placeholder: "<identity>", children: nil},
 			"remote-identity":   {desc: "Remote identity (default remote traffic selector)", args: 1, placeholder: "<identity>", children: nil},
