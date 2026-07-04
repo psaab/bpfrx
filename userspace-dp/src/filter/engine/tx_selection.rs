@@ -48,7 +48,7 @@ pub(crate) fn evaluate_filter_ref_tx_selection_counted<'a>(
 /// #4085: TX-selection walk that extracts forwarding-class / dscp-rewrite /
 /// three-color-policer modifiers but does NOT record `then count` term
 /// counters. Used for the INGRESS input filter's tx-selection leg
-/// ([`resolve_cos_tx_selection_internal`]) — that filter's `then count`
+/// (`resolve_cos_tx_selection_internal`) — that filter's `then count`
 /// counters are already recorded once by the input-filter ACTION evaluation
 /// (`evaluate_non_pbr_input_filter`, `poll_descriptor`), so a second increment
 /// here double-counted every packet of a non-cacheable flow (and the seed
