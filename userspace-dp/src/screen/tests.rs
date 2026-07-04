@@ -1891,6 +1891,147 @@ fn udp_flood_triggers() {
     );
 }
 
+/// #4112 F18: Junos measures ICMP flood PER DESTINATION IP, not per zone.
+/// Traffic to two distinct destinations, each AT the per-destination threshold,
+/// counts INDEPENDENTLY and is NOT summed into one zone counter. RED on revert
+/// (single per-zone aggregate at `threshold`): the two destinations sum, so the
+/// 4th packet overall crosses the zone counter and is false-dropped even though
+/// no single destination is flooded.
+#[test]
+fn icmp_flood_per_destination_counts_independently() {
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = 3;
+    let mut state = make_state("trust", profile);
+    let dst_a = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let dst_b = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    // 3 to A and 3 to B: each destination is AT its per-destination cap (3), so
+    // none trip. The reverted single zone counter (threshold 3) would drop from
+    // the 4th packet on.
+    for _ in 0..3 {
+        assert_eq!(
+            state.check_packet("trust", &icmp_pkt(src, dst_a, 84), 100),
+            ScreenVerdict::Pass,
+            "destination A within its own per-destination cap"
+        );
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            state.check_packet("trust", &icmp_pkt(src, dst_b, 84), 100),
+            ScreenVerdict::Pass,
+            "destination B counts independently of A (not summed)"
+        );
+    }
+    // A single-destination flood is STILL capped: the 4th packet to A trips the
+    // per-destination cap.
+    assert_eq!(
+        state.check_packet("trust", &icmp_pkt(src, dst_a, 84), 100),
+        ScreenVerdict::Drop("icmp-flood"),
+        "a single flooded destination is still capped per-destination"
+    );
+}
+
+/// #4112 F18: Junos measures UDP flood PER DESTINATION IP AND PORT. Two flows to
+/// the SAME destination IP but DIFFERENT destination ports count independently.
+/// RED on revert (single per-zone aggregate): the two ports sum and are
+/// false-dropped.
+#[test]
+fn udp_flood_per_destination_port_counts_independently() {
+    let mut profile = ScreenProfile::default();
+    profile.udp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let to_port = |port: u16| {
+        let mut p = udp_pkt(src, dst);
+        p.dst_port = port;
+        p
+    };
+    // 2 to (dst, 80) and 2 to (dst, 443): each destination-port is AT its cap.
+    for _ in 0..2 {
+        assert_eq!(
+            state.check_packet("trust", &to_port(80), 100),
+            ScreenVerdict::Pass
+        );
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            state.check_packet("trust", &to_port(443), 100),
+            ScreenVerdict::Pass,
+            "a different destination port counts independently (not summed)"
+        );
+    }
+    // Same (dst, port) flood is STILL capped: the 3rd packet to (dst, 80) trips.
+    assert_eq!(
+        state.check_packet("trust", &to_port(80), 100),
+        ScreenVerdict::Drop("udp-flood"),
+        "a single flooded destination-port is still capped"
+    );
+}
+
+/// #4112 F18: the per-zone aggregate is retained as a coarse SECONDARY
+/// zone-saturation ceiling ABOVE the per-destination cap. A flood spread thin
+/// across many destinations (each under the per-destination cap) is still
+/// bounded zone-wide at `SECONDARY_FLOOD_CEILING_MULT × threshold` — an operator
+/// relying on the zone-wide cap still gets it. With threshold 2 and the 8×
+/// multiplier the ceiling is 16, so the 17th distinct-destination packet trips.
+#[test]
+fn icmp_flood_secondary_zone_ceiling_still_fires() {
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    // 16 distinct destinations, one packet each — every per-destination cap is
+    // far below threshold, but the zone aggregate climbs to the 8×2 = 16 ceiling.
+    for i in 0..16u8 {
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i + 1));
+        assert_eq!(
+            state.check_packet("trust", &icmp_pkt(src, dst, 84), 100),
+            ScreenVerdict::Pass,
+            "under the zone-saturation ceiling"
+        );
+    }
+    // 17th distinct destination: still under its own per-destination cap, but the
+    // zone aggregate (17) crosses the 16 ceiling → secondary drop.
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 200));
+    assert_eq!(
+        state.check_packet("trust", &icmp_pkt(src, dst, 84), 100),
+        ScreenVerdict::Drop("icmp-flood"),
+        "zone-wide saturation ceiling fires above the per-destination cap"
+    );
+}
+
+/// #4112 F18: the per-destination cap also runs on the FLOWLESS path (non-first
+/// fragment / non-query ICMP), so a fragment-based flood cannot evade it. Two
+/// distinct destinations count independently there too.
+#[test]
+fn icmp_flood_flowless_per_destination_independent() {
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst_a = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let dst_b = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    for _ in 0..2 {
+        assert_eq!(
+            state.check_flowless_screens("trust", &flowless_icmp_pkt(src, dst_a), true, 100),
+            ScreenVerdict::Pass
+        );
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            state.check_flowless_screens("trust", &flowless_icmp_pkt(src, dst_b), true, 100),
+            ScreenVerdict::Pass,
+            "flowless per-destination independence"
+        );
+    }
+    assert_eq!(
+        state.check_flowless_screens("trust", &flowless_icmp_pkt(src, dst_a), true, 100),
+        ScreenVerdict::Drop("icmp-flood"),
+        "flowless single-destination flood still capped"
+    );
+}
+
 // ================================================================
 // Rate limiting: SYN flood
 // ================================================================
@@ -2179,6 +2320,58 @@ fn syn_flood_dest_runs_when_cookie_active() {
         state.check_packet_with_zone_id("trust", 3, &pkt, 100),
         ScreenVerdict::Drop("syn-flood"),
         "per-dest must still enforce while the zone is cookie-active"
+    );
+    assert_eq!(state.syn_flood_dst_drops(), 1);
+}
+
+/// #4112 F19: the per-DESTINATION SYN cap is evaluated BEFORE the aggregate
+/// over-attack early-return, so a per-destination-over-threshold backend is
+/// HARD-DROPPED even while the zone aggregate is over attack-threshold and
+/// minting SYN cookies. A LOW `syn_flood_threshold` makes over_attack fire, and
+/// the per-dest cap is also low, so the same SYN trips BOTH. On revert (per-dst
+/// checked only AFTER the `if over_attack` return) the 3rd SYN is a
+/// SynCookieChallenge, not a Drop, and `syn_flood_dst_drops` stays 0 — the
+/// destination-threshold that exists to shield a single victim is defeated in
+/// exactly the high-load regime it is configured for.
+#[test]
+fn syn_flood_dest_hard_drops_over_attack_with_cookie() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 2; // LOW aggregate → over_attack fires fast
+    profile.syn_cookie = true;
+    profile.syn_flood_dst_threshold = 2; // per-dest also low
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    let victim = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9));
+    // SYNs 1,2 to the victim: aggregate 1,2 (not over 2) AND per-dest 1,2 (not
+    // over 2) → Pass. These also feed both counters.
+    for i in 0..2u8 {
+        let pkt = tcp_pkt(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, i + 1)),
+            victim,
+            1234,
+            80,
+            TCP_SYN,
+        );
+        assert_eq!(
+            state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+            ScreenVerdict::Pass
+        );
+    }
+    // SYN 3: aggregate 3 > 2 → over_attack (WOULD mint a cookie), AND per-dest
+    // 3 > 2. The per-destination cap is evaluated first and HARD-DROPS. On revert
+    // this is a SynCookieChallenge (the flooded victim admits cookie-completing
+    // clients) — the F19 bug.
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 50)),
+        victim,
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+        ScreenVerdict::Drop("syn-flood"),
+        "per-dst must hard-drop before the aggregate mints a cookie"
     );
     assert_eq!(state.syn_flood_dst_drops(), 1);
 }
