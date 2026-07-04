@@ -32817,3 +32817,26 @@ top.
     pkg/config/compiler_protocols.go, pkg/config/schema_validate_4119_test.go,
     pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/sender_marshal_4119_test.go,
     pkg/cli/cli_show_routing.go, docs/embedded-radvd.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4111 — mask the SNMP community name in the two operational
+    status commands (`show system services`, `show snmp`) for non-super-user
+    login classes. Follow-up to #4099/#4106 (config-render secret redaction):
+    the #4106 hostile review found these two STATUS commands format the typed
+    active config directly (`cfg.System.SNMP.Communities`), bypassing the
+    `RedactedClone` path #4106 wired into the config-render surfaces, so the
+    SNMP community credential printed cleartext to view-only classes
+    (read-only / config-viewer / operator — all PermView `show`). Fix reuses
+    the existing `CLI.showConfigRedacted()` predicate (redact for any class
+    without PermAll; cleartext for super-user + unset/legacy class): for a
+    redacting class the community NAME is masked to `config.SecretDataPlaceholder`
+    (`##SECRET-DATA##`) while the authorization MODE (read-only/read-write)
+    stays visible. Only the secret community name is masked. RED-on-revert
+    PROVEN both ways: reverting either mask makes the read-only/config-viewer/
+    operator/unauthorized subtests fail (cleartext CLI-LEAK-SNMP-COMMUNITY
+    reappears, placeholder missing); super-user still sees cleartext.
+    go test ./pkg/cli/... green; go build ./..., gofmt clean (vet warning at
+    cli.go:503 is pre-existing, untouched).
+  - **File(s)**: pkg/cli/cli_show_system.go, pkg/cli/cli_show_services.go,
+    pkg/cli/cli_show_snmp_community_redaction_4111_test.go,
+    docs/system-login.md, _Log.md
