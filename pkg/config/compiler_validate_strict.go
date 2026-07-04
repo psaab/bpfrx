@@ -210,22 +210,33 @@ func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
 		if pol == nil {
 			continue
 		}
-		propRef := pol.Proposals
-		explicitRef := propRef != ""
+		// #3904: `proposals` is a list. Mirror resolveESPSettings, which
+		// renders every RESOLVABLE reference — so the chain resolves if ANY
+		// listed proposal is defined; only an all-dangling (or empty) list
+		// drops the connection to the strongSwan default.
+		explicitRef := len(pol.Proposals) > 0
+		propRefs := pol.Proposals
 		if !explicitRef {
 			// Mirror resolveESPSettings' policy-name fallback: a policy
 			// with no `proposals` leaf resolves against a proposal named
 			// after the policy itself.
-			propRef = pol.Name
+			propRefs = []string{pol.Name}
 		}
-		if _, ok := proposals[propRef]; ok {
+		resolved := false
+		for _, ref := range propRefs {
+			if _, ok := proposals[ref]; ok {
+				resolved = true
+				break
+			}
+		}
+		if resolved {
 			continue
 		}
 		if explicitRef {
-			return fmt.Errorf("ipsec policy %q references undefined ipsec proposal %q "+
+			return fmt.Errorf("ipsec policy %q references undefined ipsec proposal(s) %q "+
 				"(the configured proposal set, including any perfect-forward-secrecy "+
 				"group, would be silently dropped to the strongSwan default)",
-				pol.Name, propRef)
+				pol.Name, strings.Join(propRefs, ", "))
 		}
 		// No explicit `proposals` leaf was given, so do not blame a
 		// phantom proposal named after the policy — describe the actual
@@ -303,8 +314,13 @@ func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
 	// name).
 	chainResolves := func(ikePolicyName string) bool {
 		if pol, ok := ikePolicies[ikePolicyName]; ok && pol != nil {
-			if _, ok := ikeProposals[pol.Proposals]; ok {
-				return true
+			// #3904: `proposals` is a list; the chain resolves if ANY listed
+			// ike-proposal is defined (resolveIKESettings renders the
+			// resolvable subset).
+			for _, ref := range pol.Proposals {
+				if _, ok := ikeProposals[ref]; ok {
+					return true
+				}
 			}
 		}
 		// Legacy fallback: a gateway's ike-policy value naming an IPsec
@@ -357,12 +373,11 @@ func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
 				gw.Name, vpnName, gw.IKEPolicy)
 		}
 		pol := ikePolicies[gw.IKEPolicy]
-		if pol.Proposals == "" {
-			// The ike-policy exists but has no `proposals` leaf at all, so
-			// pol.Proposals is the empty string. Reporting an "undefined
-			// ike-proposal \"\"" misleads the operator into hunting for a
-			// proposal named "" — say plainly that the policy is missing its
-			// proposals configuration.
+		if len(pol.Proposals) == 0 {
+			// The ike-policy exists but has no `proposals` leaf at all.
+			// Reporting an "undefined ike-proposal \"\"" misleads the operator
+			// into hunting for a proposal named "" — say plainly that the
+			// policy is missing its proposals configuration.
 			return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
 				"has no proposals configured; phase-1 would silently negotiate "+
 				"with the strongSwan default proposal set instead of the "+
@@ -370,10 +385,10 @@ func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
 				gw.IKEPolicy, gw.Name, vpnName)
 		}
 		return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
-			"references undefined ike-proposal %q; phase-1 would silently "+
+			"references undefined ike-proposal(s) %q; phase-1 would silently "+
 			"negotiate with the strongSwan default proposal set instead of "+
 			"the configured crypto",
-			gw.IKEPolicy, gw.Name, vpnName, pol.Proposals)
+			gw.IKEPolicy, gw.Name, vpnName, strings.Join(pol.Proposals, ", "))
 	}
 	return nil
 }

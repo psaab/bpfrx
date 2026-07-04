@@ -940,7 +940,7 @@ func (s *Server) showIKE(cfg *config.Config, buf *strings.Builder) {
 				fmt.Fprintf(buf, "  IKE policy:         %s\n", gw.IKEPolicy)
 				if pol, ok := cfg.Security.IPsec.IKEPolicies[gw.IKEPolicy]; ok {
 					fmt.Fprintf(buf, "    Mode:     %s\n", pol.Mode)
-					fmt.Fprintf(buf, "    Proposal: %s\n", pol.Proposals)
+					fmt.Fprintf(buf, "    Proposal: %s\n", strings.Join(pol.Proposals, ", "))
 				}
 			}
 			ver := gw.Version

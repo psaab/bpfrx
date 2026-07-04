@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 func (c *CLI) showIPsec(args []string) error {
@@ -217,7 +218,7 @@ func (c *CLI) showIKE(args []string) error {
 			fmt.Printf("  IKE policy:         %s\n", gw.IKEPolicy)
 			if pol, ok := cfg.Security.IPsec.IKEPolicies[gw.IKEPolicy]; ok {
 				fmt.Printf("    Mode:     %s\n", pol.Mode)
-				fmt.Printf("    Proposal: %s\n", pol.Proposals)
+				fmt.Printf("    Proposal: %s\n", strings.Join(pol.Proposals, ", "))
 			}
 		}
 		ver := gw.Version

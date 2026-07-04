@@ -1,3 +1,36 @@
+## 2026-07-03 — #3904 (F-040/F-161): IKE/IPsec policy `proposals [ p1 p2 ]` bracket-list truncated to the first proposal — multi-value fix
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-040/F-161 (crypto-negotiation narrowing), the
+    IKE/IPsec-proposals arm of the #3904 bundle (same #2419/#3872
+    bracket-list-truncation class). An `ike policy … proposals [ p1 p2 ]` /
+    `ipsec policy … proposals [ e1 e2 ]` list silently offered ONLY the first
+    proposal — a peer requiring the second could not establish.
+  - **Fix**: Made both `proposals` schema leaves `args: 1, multi: true`
+    (`schema_security.go`); widened `IKEPolicy.Proposals` and
+    `IPsecPolicyDef.Proposals` from scalar `string` to `[]string`
+    (`types_security.go`); compiler readers now accumulate EVERY reference via
+    `firewallMatchValues` (`compiler_ipsec.go`). The strongSwan generator
+    (`pkg/ipsec/ike.go` `resolveIKESettings`/`resolveESPSettings`/`hasIKEChain`)
+    renders every resolvable proposal comma-joined into the swanctl `proposals =`
+    / `esp_proposals =` line; strict validators
+    (`compiler_validate_strict.go`) resolve the chain if ANY listed proposal is
+    defined (mirroring the renderer's resolvable-subset behaviour). Display sites
+    (`pkg/cli`, `pkg/grpcapi`) and the `PrepareConfig` deep-copy (`pkg/ipsec/
+    policy.go`, slice clone) updated. RED-on-revert proven: simulating the old
+    Keys[1]/first-only read makes both the compile and end-to-end render tests
+    fail. go build ./... clean; go test ./pkg/config/... ./pkg/ipsec/... green.
+  - **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+    pkg/config/compiler_ipsec.go, pkg/config/compiler_validate_strict.go,
+    pkg/ipsec/ike.go, pkg/ipsec/policy.go, pkg/cli/cli_show_security_ipsec.go,
+    pkg/grpcapi/server_show_security_text.go,
+    pkg/config/multivalue_proposals_3904_test.go (new),
+    pkg/ipsec/multivalue_proposals_3904_test.go (new),
+    pkg/config/parser_security_test.go, pkg/config/ike_policy_chain_ref_test.go,
+    pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
+    pkg/ipsec/ike_chain_failclosed_test.go, pkg/ipsec/swanctl_render_test.go,
+    docs/config-schema.md
+
 ## 2026-07-03 — #3882: WireGuard responder rekey promoted an UNCONFIRMED session straight to `current` (no `next` slot) — 3-slot keypair lifecycle fix
 
 - **Timestamp**: 2026-07-03

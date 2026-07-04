@@ -54,12 +54,30 @@ func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authM
 
 	if ikePol, ok := cfg.IKEPolicies[gw.IKEPolicy]; ok {
 		aggressive = ikePol.Mode == "aggressive"
-		if ikeProp, ok := cfg.IKEProposals[ikePol.Proposals]; ok {
-			authMethod, err = authMethodToSwan(ikeProp.AuthMethod)
+		// #3904: an ike-policy may list several proposals
+		// (`proposals [ p1 p2 ]`); offer EVERY resolvable one in the swanctl
+		// `proposals =` line (comma-joined) rather than only the first. The
+		// auth method and lifetime are taken from the first resolvable
+		// proposal — strongSwan carries a single auth method per connection,
+		// and a policy's proposals share it in practice.
+		var parts []string
+		var first *config.IKEProposal
+		for _, ref := range ikePol.Proposals {
+			ikeProp, ok := cfg.IKEProposals[ref]
+			if !ok {
+				continue
+			}
+			if first == nil {
+				first = ikeProp
+			}
+			parts = append(parts, buildIKEProposalFromIKE(ikeProp))
+		}
+		if first != nil {
+			authMethod, err = authMethodToSwan(first.AuthMethod)
 			if err != nil {
 				return "", "", 0, false, err
 			}
-			return authMethod, buildIKEProposalFromIKE(ikeProp), ikeProp.LifetimeSeconds, aggressive, nil
+			return authMethod, strings.Join(parts, ","), first.LifetimeSeconds, aggressive, nil
 		}
 	}
 
@@ -83,12 +101,29 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 	if vpn.IPsecPolicy != "" {
 		if ipsecPol, ok := cfg.Policies[vpn.IPsecPolicy]; ok {
 			pfsGroup = ipsecPol.PFSGroup
-			propRef := ipsecPol.Proposals
-			if propRef == "" {
-				propRef = vpn.IPsecPolicy
+			// #3904: an ipsec policy may list several ESP proposals
+			// (`proposals [ p1 p2 ]`); render EVERY resolvable one into the
+			// swanctl `esp_proposals =` line (comma-joined). A policy with no
+			// explicit `proposals` leaf resolves against a proposal named
+			// after the policy itself (the historical fallback).
+			propRefs := ipsecPol.Proposals
+			if len(propRefs) == 0 {
+				propRefs = []string{vpn.IPsecPolicy}
 			}
-			if prop, ok := cfg.Proposals[propRef]; ok {
-				return buildESPProposal(prop, pfsGroup), prop.LifetimeSeconds
+			var parts []string
+			var first *config.IPsecProposal
+			for _, ref := range propRefs {
+				prop, ok := cfg.Proposals[ref]
+				if !ok {
+					continue
+				}
+				if first == nil {
+					first = prop
+				}
+				parts = append(parts, buildESPProposal(prop, pfsGroup))
+			}
+			if first != nil {
+				return strings.Join(parts, ","), first.LifetimeSeconds
 			}
 			// #2073: the IPsec policy resolves but its proposal reference
 			// does not. The commit-time strict validator
@@ -123,9 +158,9 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 			// so the #2392 ECP fix applies here too — group 19/20 no longer
 			// emits the strongSwan-invalid modp256/modp384 token.
 			if pfsGroup > 0 {
-				slog.Warn("ipsec policy references undefined proposal; "+
+				slog.Warn("ipsec policy references undefined proposal(s); "+
 					"preserving configured PFS group on fallback proposal",
-					"policy", vpn.IPsecPolicy, "proposal", propRef,
+					"policy", vpn.IPsecPolicy, "proposals", strings.Join(propRefs, ","),
 					"pfs_group", pfsGroup)
 				return fmt.Sprintf("aes256-sha256-%s", formatDHGroup(pfsGroup)), 0
 			}
@@ -192,8 +227,16 @@ func hasIKEChain(cfg *config.IPsecConfig, ikePolicyName string) bool {
 	if cfg.IKEProposals == nil {
 		return false
 	}
-	_, ok = cfg.IKEProposals[pol.Proposals]
-	return ok
+	// #3904: the chain resolves if ANY listed ike-proposal is defined —
+	// resolveIKESettings renders the resolvable subset, so a partially
+	// dangling list is still a real (non-empty) proposal, not a fall-through
+	// to strongSwan's default set.
+	for _, ref := range pol.Proposals {
+		if _, ok := cfg.IKEProposals[ref]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeEncAlg maps a Junos encryption-algorithm name to its swanctl

@@ -479,6 +479,11 @@ func PrepareConfig(cfg *config.Config) *config.IPsecConfig {
 	}
 	for name, pol := range src.IKEPolicies {
 		cp := *pol
+		// #3904: Proposals is a slice; clone it so a runtime mutation of the
+		// returned deep copy never aliases the active config tree.
+		if pol.Proposals != nil {
+			cp.Proposals = append([]string(nil), pol.Proposals...)
+		}
 		out.IKEPolicies[name] = &cp
 	}
 	for name, gw := range src.Gateways {
@@ -495,6 +500,10 @@ func PrepareConfig(cfg *config.Config) *config.IPsecConfig {
 	}
 	for name, pol := range src.Policies {
 		cp := *pol
+		// #3904: clone the Proposals slice (see IKEPolicies above).
+		if pol.Proposals != nil {
+			cp.Proposals = append([]string(nil), pol.Proposals...)
+		}
 		out.Policies[name] = &cp
 	}
 	for name, vpn := range src.VPNs {

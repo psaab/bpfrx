@@ -50,7 +50,7 @@ func TestResolveIKESettings_DanglingPolicyFailsClosed(t *testing.T) {
 func TestResolveIKESettings_DanglingProposalFailsClosed(t *testing.T) {
 	cfg := &config.IPsecConfig{
 		IKEPolicies: map[string]*config.IKEPolicy{
-			"ike-pol": {Name: "ike-pol", Proposals: "no-such-proposal"},
+			"ike-pol": {Name: "ike-pol", Proposals: []string{"no-such-proposal"}},
 		},
 	}
 	gw := &config.IPsecGateway{Name: "gw1", Address: "192.0.2.1", IKEPolicy: "ike-pol"}
@@ -64,7 +64,7 @@ func TestResolveIKESettings_DanglingProposalFailsClosed(t *testing.T) {
 func TestResolveIKESettings_ResolvableChain(t *testing.T) {
 	cfg := &config.IPsecConfig{
 		IKEPolicies: map[string]*config.IKEPolicy{
-			"ike-pol": {Name: "ike-pol", Proposals: "ike-prop"},
+			"ike-pol": {Name: "ike-pol", Proposals: []string{"ike-prop"}},
 		},
 		IKEProposals: map[string]*config.IKEProposal{
 			"ike-prop": {
@@ -97,7 +97,7 @@ func TestResolveIKESettings_ResolvableChain(t *testing.T) {
 func TestRenderConfig_BrokenChainSkipsVPN_HealthyTunnelSurvives(t *testing.T) {
 	cfg := &config.IPsecConfig{
 		IKEPolicies: map[string]*config.IKEPolicy{
-			"good-pol": {Name: "good-pol", Proposals: "good-prop", PSK: "secret-good"},
+			"good-pol": {Name: "good-pol", Proposals: []string{"good-prop"}, PSK: "secret-good"},
 		},
 		IKEProposals: map[string]*config.IKEProposal{
 			"good-prop": {

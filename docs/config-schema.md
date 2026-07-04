@@ -251,6 +251,26 @@ validation:
   directions — tail-drop and typo-bypass — across bracket / repeated-line /
   hierarchical shapes, plus the value-slot completion pin).
 
+**IKE / IPsec `proposals`, RIP `export`/`redistribute`, and routing-instance
+`interface` are multi-value (#3904).** Four more sibling leaves of the #2419 /
+#3872 bracket-list-truncation class that the earlier sweeps never reached; each
+kept a scalar reader that dropped everything past the first bracketed value:
+
+- **security `ike policy … proposals` and `ipsec policy … proposals`**
+  (`schema_security.go`) — now `args: 1, multi: true, children: nil`. The typed
+  config fields `IKEPolicy.Proposals` and `IPsecPolicyDef.Proposals` widened from
+  a scalar `string` to `[]string`, and the compiler readers (`compiler_ipsec.go`)
+  accumulate EVERY reference via `firewallMatchValues`. The strongSwan generator
+  (`pkg/ipsec` `resolveIKESettings` / `resolveESPSettings`) renders every
+  resolvable proposal into the swanctl `proposals =` / `esp_proposals =` line,
+  comma-joined; the strict validators (`validateIKEPolicyChainReferencesStrict`,
+  `validateIPsecPolicyProposalReferencesStrict`) resolve the chain if ANY listed
+  proposal is defined (mirroring the renderer, which offers the resolvable
+  subset). Before #3904 `proposals [ p1 p2 ]` offered ONLY `p1` — a silent
+  crypto-negotiation narrowing (a peer requiring the second proposal could not
+  establish). Coverage: `multivalue_proposals_3904_test.go` in `pkg/config`
+  (compile) and `pkg/ipsec` (end-to-end render).
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a
