@@ -613,11 +613,18 @@ the NAT module applies it:
   #4074). This lets many internal hosts pinging one target with the same id
   share a single pool address without colliding on the reverse tuple
   `(pool_addr, id)`; the reverse companion session and the reply un-NAT are
-  keyed on the translated id. A non-identifier ICMP control/error message
-  parses flowless (`src_port == 0`) and, like a genuinely port-less protocol
-  (GRE/ESP/AH/OSPF), takes the address-only path — its L4 bytes are never
-  rewritten. `port no-translation` preserves the id just as it preserves a
-  TCP/UDP source port. By default, pool address
+  keyed on the translated id. Whether a tuple is an ICMP query is decided by an
+  authoritative "identifier present" signal threaded from the frame parser
+  (`match_source_nat_result_for_tuple`'s `icmp_identifier_present` arg), NOT by
+  `src_port != 0` — a SessionFlow is only built for an ICMP protocol when the
+  parser matched an identifier-bearing query type, so an ICMP Query Identifier
+  of **0** (a valid on-wire value, 0..=65535) is translated like any other id
+  rather than misread as flowless (#4088; the earlier `src_port != 0` gate left
+  id==0 colliding on `(pool_addr, 0)`). A non-identifier ICMP control/error
+  message parses flowless (no SessionFlow, `icmp_identifier_present` false) and,
+  like a genuinely port-less protocol (GRE/ESP/AH/OSPF), takes the address-only
+  path — its L4 bytes are never rewritten. `port no-translation` preserves the
+  id just as it preserves a TCP/UDP source port. By default, pool address
   selection is round-robin within the packet address family. With global source
   NAT `address-persistent`, the userspace dataplane hashes a domain-tag seed,
   address family, and canonical source IP bytes with a seeded non-cryptographic

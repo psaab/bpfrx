@@ -1,3 +1,40 @@
+## 2026-07-04 — #4088: pool SNAT — id==0 ICMP echo is a valid keyable query
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (b9c2ee46c). Confirmed the #4086
+    residual: `nat/source.rs` computed `icmp_query = matches!(protocol,
+    PROTO_ICMP | PROTO_ICMPV6) && src_port != 0`, so an ICMP echo whose
+    Query Identifier is 0 (a valid on-wire value, 0..=65535) flattened to
+    the same `src_port == 0` sentinel a non-query ICMP uses, took the
+    address-only path, and two id==0 flows behind one pool address collided
+    on the reverse tuple `(pool_addr, 0)` — the #4074 bug, residual for
+    id==0. Root insight: the frame parser only builds a `SessionFlow` for an
+    ICMP protocol when `parse_flow_ports` matched an identifier-bearing
+    query type (`icmp_identifier_bearing`), so at the real call site a
+    SessionFlow existing for ICMP ⟺ it IS a query (id may be 0). FIX:
+    threaded an authoritative `icmp_identifier_present: bool` into
+    `match_source_nat_result_for_tuple` (last positional bool before
+    `matched_counter`) and changed the gate to `matches!(protocol, ICMP |
+    ICMPV6) && icmp_identifier_present` (dropping the `src_port != 0`
+    heuristic). The flow caller (`forwarding/mod.rs`
+    `match_source_nat_for_flow_result_at`) passes
+    `matches!(flow.forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6)`; the
+    address-only wrapper (`match_source_nat_result`, `protocol == 0`) and the
+    status.rs test helper pass `false`. The reverse arms
+    (`session/key.rs`) already key on `nat.rewrite_src_port`, so id==0
+    recovers once the forward allocates. Frame rewriter
+    (`apply_nat_icmp_identifier_rewrite`) re-gates on the real ICMP type byte
+    (defense in depth). Updated all 23 `match_source_nat_result_for_tuple`
+    call sites (2 ICMP-query → true, the rest → false).
+  - **File(s)**: userspace-dp/src/nat/source.rs,
+    userspace-dp/src/afxdp/forwarding/mod.rs,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    userspace-dp/src/nat/tests.rs (new
+    `pool_snat_translates_icmp_query_id_zero_distinct_per_host` RED-on-revert
+    + updated call sites/comments),
+    userspace-dp/src/session/tests.rs (new
+    `icmp_query_id_zero_translation_demuxes_reverse_wire_key`),
+    docs/userspace-dataplane-architecture.md.
 ## 2026-07-04 — #4076: bump linkGen on anchor transient-lookup + device-vanished recreate
 
 - **Timestamp**: 2026-07-04

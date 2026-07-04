@@ -398,6 +398,16 @@ pub(super) fn match_source_nat_for_flow_result_at(
         egress.primary_v6,
         now_ns,
         non_first_fragment,
+        // #4088 (RFC 5508 §3.1): a `SessionFlow` is only built for an
+        // ICMP/ICMPv6 protocol when the frame parser matched an
+        // identifier-bearing query type (`icmp_identifier_bearing`), so its
+        // `src_port` holds a real Query Identifier — even when that id is 0.
+        // Signal that authoritatively so pool SNAT translates the id instead
+        // of dropping an id==0 query onto the address-only path.
+        matches!(
+            flow.forward_key.protocol,
+            crate::ip_proto::PROTO_ICMP | crate::ip_proto::PROTO_ICMPV6
+        ),
         matched_counter,
     )
 }

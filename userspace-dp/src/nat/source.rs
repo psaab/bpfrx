@@ -771,6 +771,9 @@ pub(crate) fn match_source_nat_result(
         egress_v6,
         0,
         false,
+        // #4088: the address-only wrapper never carries an ICMP query id
+        // (`protocol == 0`), so there is no identifier to preserve.
+        false,
         &mut counter,
     )
 }
@@ -800,6 +803,19 @@ pub(crate) fn match_source_nat_result_for_tuple(
     // a non-first fragment has no L4 ports. Interface-mode (address-only)
     // and `off`/static rules are unaffected.
     non_first_fragment: bool,
+    // #4088 (RFC 5508 §3.1): for an ICMP/ICMPv6 tuple this is the
+    // authoritative "the tuple carries a real ICMP Query Identifier" signal,
+    // replacing the old `src_port != 0` heuristic. The frame parser
+    // (`parse_flow_ports`) only lifts an identifier into `src_port` for an
+    // identifier-bearing query type, and a `SessionFlow` is only built for an
+    // ICMP protocol when that gate matched — so the flow caller passes
+    // `matches!(protocol, PROTO_ICMP | PROTO_ICMPV6)`. An ICMP Query
+    // Identifier of 0 is a valid on-wire value (0..=65535); keying the query
+    // gate on `src_port != 0` misclassified an id==0 query as flowless and
+    // took the address-only path, colliding two id==0 flows behind one pool
+    // address on the reverse tuple (pool_addr, 0). The synthetic /
+    // address-only (`protocol == 0`) callers pass `false`.
+    icmp_identifier_present: bool,
     matched_counter: &mut Option<Arc<NatRuleCounter>>,
 ) -> SourceNatLookup {
     let flow = SourceNatFlowKey {
@@ -886,12 +902,17 @@ pub(crate) fn match_source_nat_result_for_tuple(
         // hosts pinging the same target with the same id, both hidden behind
         // one pool address, collide on the reverse tuple (pool_addr, id) and
         // their replies are mis-associated. A non-identifier ICMP control/error
-        // message parses flowless (`src_port == 0`) and keeps the address-only
-        // path — there is no id to translate. `no_translation` (port
-        // no-translation) still preserves the id via the `address_only` gate
-        // below. The translated id comes from the same pool port/id space as
-        // the TCP/UDP PAT allocation (`allocate_translation`).
-        let icmp_query = matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) && src_port != 0;
+        // message parses flowless (no `SessionFlow`, `icmp_identifier_present`
+        // false) and keeps the address-only path — there is no id to translate.
+        // `no_translation` (port no-translation) still preserves the id via the
+        // `address_only` gate below. The translated id comes from the same pool
+        // port/id space as the TCP/UDP PAT allocation (`allocate_translation`).
+        //
+        // #4088 (RFC 5508 §3.1): classify by the identifier-present signal, NOT
+        // by `src_port != 0`. A valid ICMP echo whose Query Identifier is 0
+        // must be treated as a real, keyable query (allocate + rewrite +
+        // reverse-recover its id like any other), not misread as flowless.
+        let icmp_query = matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) && icmp_identifier_present;
         let port_less = protocol != 0 && !crate::ip_proto::has_l4_ports(protocol) && !icmp_query;
         let tuple_unknown = protocol == 0;
         // #3906: `port no-translation` translates the ADDRESS only and PRESERVES
