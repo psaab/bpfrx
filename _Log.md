@@ -32819,6 +32819,48 @@ top.
     pkg/cli/cli_show_routing.go, docs/embedded-radvd.md, _Log.md
 
 - **Timestamp**: 2026-07-04
+  - **Action**: #4113 (fable-163 F7+F13) XDP shim degraded-path counter
+    hardening. F13: `USERSPACE_FALLBACK_STATS` was a shared `Array<u64>`
+    incremented with a non-atomic load/add/store RMW; native XDP runs one
+    program instance per RX queue on distinct CPUs concurrently, so two CPUs
+    bumping the same reason in one window lose an increment (the retained
+    shim regressed from the #45 per-CPU-counter lineage). Fix: make it a
+    `PerCpuArray<u64>` so each increment is CPU-local + correct. Read side
+    now sums across CPUs: Go `readDegradedPathStatsLocked`
+    (`statsMap.Lookup(i, &perCPU []uint64)` + sum), the decouple-test helper
+    `userspaceXDPDegradedPathStat`, and the debug-log-gated helper reader
+    `read_degraded_path_stats` (per-CPU sized buffer via
+    `libbpf_num_possible_cpus()` — a single-u64 buffer would be overrun by
+    the kernel's per-cpu lookup write). Canary allowlist updated
+    `ebpf.Array`→`ebpf.PerCPUArray`. F7: `record_trace` force-inserted the
+    `userspace_trace` BPF map (bpf_ktime_get_ns + avalanche key +
+    bpf_map_update_elem) for the EARLY_FILTER / BINDING_MISSING stages even
+    with tracing OFF — attacker-influenceable per-packet map-update on the
+    native-XDP ingress core (reachable via multicast/broadcast dst
+    `should_fallback_early`, or a transient config-reload unbind). Fix: gate
+    the insert on `USERSPACE_CTRL_FLAG_TRACE` unconditionally (removed the
+    `forced` bypass); degraded-path visibility for those stages is preserved
+    by the per-CPU counter, which the call sites bump independently via
+    `incr_fallback_stat`. VALIDATION: `make generate` regen of the shim .o
+    PASSED the kernel verifier gate (toolchain nightly-2026-05-23,
+    bpf-linker 0.10.2, kernel 7.0.13); committed the regenerated
+    `userspace_xdp_bpfel.o`. FULL `cargo test --release` userspace-dp 3578
+    passed / 0 failed; `go build ./...`, `go vet`, canary + degraded-path
+    Go tests green. RED-on-revert PROVEN: the baseline single-value
+    `Lookup` against the PerCPUArray .o fails `per-cpu value requires a
+    slice or a pointer to slice` (read-side sum is load-bearing);
+    `TestUserspaceXDPDegradedCtrlDisabledDropsTransit` passes on-branch,
+    exercising the per-CPU counter read. (Pre-existing on this sandbox
+    kernel 7.0.13, identical on origin/master baseline:
+    BindingNotReady/NDP decouple subtests — unrelated to this change.)
+  - **File(s)**: userspace-xdp/src/lib.rs,
+    userspace-dp/src/afxdp/bpf_map/pin.rs,
+    pkg/dataplane/userspace/maps_sync.go,
+    pkg/dataplane/retirement_boundary_canary_test.go,
+    pkg/dataplane/userspace/xdp_shim_decouple_test.go,
+    pkg/dataplane/userspace_xdp_bpfel.o,
+    docs/afxdp-packet-processing.md,
+    docs/userspace-dataplane-architecture.md, _Log.md
   - **Action**: #4111 — mask the SNMP community name in the two operational
     status commands (`show system services`, `show snmp`) for non-super-user
     login classes. Follow-up to #4099/#4106 (config-render secret redaction):
@@ -32840,3 +32882,38 @@ top.
   - **File(s)**: pkg/cli/cli_show_system.go, pkg/cli/cli_show_services.go,
     pkg/cli/cli_show_snmp_community_redaction_4111_test.go,
     docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4113 follow-up — fix an UPGRADE BOOT-BRICK the F13 map-type
+    change introduced (Copilot MAJOR on PR #4136). userspace_fallback_stats
+    is a COLLECTION-PINNED shim map (userspacePinnedShimMaps ->
+    ms.Pinning=PinByName, pinned at ebpf.NewCollectionWithOptions,
+    loader_userspace_shim.go). Its pin persists on bpffs across a daemon
+    restart, so on an in-place upgrade the new daemon's PerCpuArray spec hits
+    the OLD daemon's stale Array pin -> PinByName compatibility check returns
+    ErrMapIncompatible -> the WHOLE shim collection load aborts ->
+    boot-brick (#1917/#1960 class). cleanupUserspaceShimLegacyOnlyMapPins only
+    removes xdp_progs/tc_progs/policer_states; the shared-map refuse-reset
+    path (loadOrCreatePinnedShimMapWith) does not cover this collection pin.
+    VERIFY: reproduced the brick under root — NewMapWithOptions(PerCpuArray,
+    PinByName) against a pre-pinned Array returns ErrMapIncompatible.
+    FIX (option a, targeted): reconcileDisposableCollectionPin() runs BEFORE
+    the collection load and drops ONLY this disposable counter pin when its
+    on-disk shape no longer matches the spec (disposablePinShapeMatches
+    compares type/key/value/entries). Safe because the counter resets on every
+    reload; DATA maps (sessions/conntrack/dnat) keep their #2360 refuse-reset.
+    A missing or already-migrated pin is left untouched so counters survive an
+    ordinary restart. Also folded Copilot comment-2: pin.rs
+    read_degraded_path_stats now iterates DEGRADED_PATH_REASON_NAMES.len()
+    instead of a hardcoded 0..16. VALIDATION: root-gated E2E
+    TestReconcileDisposableCollectionPinMigratesArrayToPerCPUArray asserts the
+    brick (ErrMapIncompatible), the reconcile reset, the successful
+    PerCpuArray recreate, and idempotency on a compatible pin (RED-on-revert:
+    reverting the reconcile leaves the stale pin -> load bricks). Pure unit
+    TestDisposablePinShapeMatches covers the decision. FULL cargo test
+    --release 3578 passed / 0 failed; go build ./..., go vet, full
+    pkg/dataplane tree green; gofmt/rustfmt clean. No shim source change this
+    round (no make generate; the .o is unchanged).
+  - **File(s)**: pkg/dataplane/loader_userspace_shim.go,
+    pkg/dataplane/userspace_shim_loader_test.go,
+    userspace-dp/src/afxdp/bpf_map/pin.rs, docs/in-place-upgrade.md, _Log.md

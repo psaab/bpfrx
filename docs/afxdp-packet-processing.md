@@ -244,7 +244,23 @@ The remaining work is now cleaner:
 retained-shim degraded actions. Go exposes them in status JSON as
 `degraded_path_counters`. The pinned BPF map remains
 `userspace_fallback_stats` as an internal mixed-version compatibility
-exception.
+exception. The map is a **per-CPU** `u64` array (`#4113`): native XDP runs
+one program instance per RX queue on distinct CPUs concurrently, and
+`incr_fallback_stat` does a non-atomic load/add/store; a shared array would
+lose increments when two CPUs bump the same reason in the same window. Per-CPU
+storage makes each increment CPU-local; the Go and helper readers
+(`readDegradedPathStatsLocked`, `read_degraded_path_stats`) sum across CPUs.
+
+**Trace map insert is trace-flag gated (`#4113`)**: `record_trace` writes the
+`userspace_trace` BPF map (a `bpf_ktime_get_ns` read plus an avalanche key
+compute plus a `bpf_map_update_elem`) **only** when the control flag
+`USERSPACE_CTRL_FLAG_TRACE` is set. Earlier code force-inserted for the
+`EARLY_FILTER` / `BINDING_MISSING` stages even with tracing disabled, which was
+reachable by unauthenticated traffic aimed at well-known multicast/broadcast
+groups (`should_fallback_early`) or during a transient config-reload unbind —
+an attacker-influenceable per-packet map-update on the native-XDP ingress core.
+Visibility for those stages is preserved by the per-CPU degraded-path counter,
+which the call sites bump independently of the trace insert.
 
 **Binding debug state**: Each `BindingWorker` tracks live ring state
 (`debug_pending_fill_frames`, `debug_free_tx_frames`,
