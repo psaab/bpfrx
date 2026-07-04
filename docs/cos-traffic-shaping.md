@@ -797,6 +797,31 @@ set class-of-service interfaces ge-0-0-1 unit 0 shaping-rate burst-size 125m
 set class-of-service interfaces ge-0-0-1 unit 0 scheduler-map my-map
 ```
 
+### Interface-level bindings (all units) (#4021)
+
+A `scheduler-map`, `shaping-rate` (with `burst-size`), `classifiers`, or
+`rewrite-rules` may be bound at the **physical interface level** — directly
+under `class-of-service interfaces geX` with **no `unit`** — as a common
+short form for a single-unit port:
+
+```
+set class-of-service interfaces ge-0-0-1 scheduler-map my-map
+set class-of-service interfaces ge-0-0-1 shaping-rate 10g
+```
+
+Junos precedence: an interface-level binding applies to **every configured
+logical unit** on the interface, and a **unit-level binding overrides it per
+knob**. The compiler folds the interface-level binding into each of the
+interface's logical units after the interface stanza is known
+(`applyCoSInterfaceLevelBindings` in `pkg/config/compiler.go`), so the
+dataplane snapshot and `show class-of-service interface` — which iterate the
+per-unit bindings — apply it without any interface-level awareness of their
+own. Mixing forms is honored: a `unit N` that sets its own `scheduler-map`
+keeps that map while still inheriting the interface-level `shaping-rate`.
+Before #4021 an interface-level binding compiled and committed cleanly but
+was silently dropped (only `unit N` children were read), so the shaping /
+classification / marking never applied.
+
 Scheduler `buffer-size` may be configured as an explicit byte size
 (`4m`, `256k`, `1g`) or as a Junos percent value (`10%`). Percent values
 are carried over the userspace protocol as `buffer_size_percent`, not as
