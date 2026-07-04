@@ -76,6 +76,34 @@ window that fails to compile now DENIES, matching the firewall's
 fail-closed posture. To express "always active", omit `scheduler-name`
 from the policy or use `daily all-day`.
 
+**No-window commit warning (#3860).** The fail-closed flip (#3849/#3858)
+is safe but silent: a *degenerate* scheduler that defines no window at all
+— an empty `scheduler x {}`, or a bare `daily;` with no start/stop time,
+no `all-day`, no per-day arm, and no start/stop date — now resolves to
+INACTIVE where the old always-on bug forwarded 24/7. An operator migrating
+a config that leaned on that bug would lose enforcement with no signal.
+`ValidateConfig` (`pkg/config/compiler_validate_warn.go`,
+`schedulerHasEffectiveWindow`) therefore emits a commit-time WARNING naming
+each such scheduler: *"scheduler X defines no time window; policies bound
+to it will be INACTIVE (use `daily all-day` for always-on)."* A scheduler
+carrying any window — a daily/weekday time-of-day arm, `all-day`, or a
+start/stop calendar range — does NOT warn. The predicate mirrors the
+runtime `schedulerHasTimeWindow || schedulerHasDateRange` split, so the
+warning fires exactly when `isWithinWindow` would fail closed for every
+instant. It is a warning, not a hard reject, because a degenerate scheduler
+is legal Junos and an upgrade must not refuse an existing candidate.
+
+**Overnight windows with per-day overrides.** An overnight window
+(e.g. `22:00:00`-`06:00:00`) wraps past midnight, but `effectiveDayWindow`
+resolves the applicable window by the *current* weekday. The post-midnight
+tail (00:00-06:00 the next calendar day) is therefore evaluated against
+that next day's window — a per-day override on the next day (or its absence)
+governs the tail, not the prior day's overnight window. This matches (and
+does not regress) the single-daily behavior: a uniform `daily 22:00-06:00`
+carries across every night because every day resolves to the same window.
+Mixing an overnight daily window with divergent per-day arms is the case to
+reason about carefully.
+
 ## Republish self-heal (#3780)
 
 `updateFn` returns an `error`. A window transition republishes
