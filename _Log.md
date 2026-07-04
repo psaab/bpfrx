@@ -1,3 +1,39 @@
+## 2026-07-03 — #3985: `monitor interface` leaked a stdin-reader goroutine that stole the next command's keystroke
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-021 (MEDIUM, CLI UX). Both
+    `monitorInterfaceSingle` and `monitorInterfaceTraffic`
+    (`pkg/cli/monitor_interface.go`) spawned a goroutine that looped on a
+    blocking `os.Stdin.Read` to detect the quit key. `setRawMode` used
+    `VMIN=1`/`VTIME=0`, so the read blocked indefinitely. When the monitor
+    returned on `q`/ESC/Ctrl-C the goroutine was left parked mid-read; the
+    operator's NEXT command's first keystroke went to the dead monitor's
+    reader instead of the CLI prompt, and each `monitor interface`
+    invocation leaked another reader competing for stdin.
+  - **Fix**: switched `setRawMode` to `VMIN=0`/`VTIME=1` (poll-with-timeout:
+    Read returns immediately with data, else `(0, nil)` after ~100ms).
+    Extracted the reader loop into a testable `keyReader(r, keyCh, done)`
+    that re-checks `done` between polls (`continue` on `n==0`) and discards a
+    byte read after `done` is closed rather than forwarding it. Added
+    `startKeyReader(r) -> (keyCh, stop)`; `stop` closes `done` and
+    `wg.Wait()`s the goroutine (idempotent via `sync.Once`). Both monitors
+    now `defer stop()`, ordered (LIFO) to stop the reader BEFORE the terminal
+    is restored — so once the command returns no goroutine is competing for
+    stdin.
+  - **Test**: `pkg/cli/monitor_interface_stdin_3985_test.go` — a `fakeTTY`
+    poll reader drives `keyReader`/`startKeyReader`. Asserts keys forward
+    while running, the goroutine stays alive across idle polls and returns
+    promptly once `done` closes, a post-`done` key is not forwarded, and
+    `stop()` blocks until the goroutine drains (and is idempotent).
+    RED-on-revert verified: reverting `keyReader` to the pre-fix body fails
+    both `TestKeyReaderLifecycle` ("returned while running") and
+    `TestKeyReaderDiscardsKeyAfterDone` ("key forwarded after done closed").
+    `go test ./pkg/cli/ -race` green; `go build ./...`, gofmt clean (vet
+    unchanged — pre-existing `cli.go:503` unreachable-code note only).
+  - **File(s)**: `pkg/cli/monitor_interface.go`,
+    `pkg/cli/monitor_interface_stdin_3985_test.go`,
+    `docs/monitor-interface-research.md`, `_Log.md`.
+
 ## 2026-07-03 — #3982: config-mode `rename` of a non-first same-keyword sibling failed (matched only the first sibling)
 
 - **Timestamp**: 2026-07-03

@@ -97,6 +97,22 @@ Interface='i'  Switch to specific interface (prompts)
 - "Current delta" = change since last refresh
 - Delay: cur/avg/max processing delay
 
+### Terminal Input Handling (implementation)
+Both `monitor interface <name>` and `monitor interface traffic` put stdin in
+raw mode (`setRawMode`) and run a background goroutine (`keyReader`, launched
+via `startKeyReader`) that reads single bytes and forwards them to the render
+loop so keys like `q`/`f`/`n` take effect immediately.
+
+The raw terminal is configured `VMIN=0`/`VTIME=1` (poll-with-timeout): a read
+returns immediately when a key is available and otherwise returns `(0, nil)`
+after ~100ms. This lets `keyReader` observe its `done` channel between reads
+and return. On exit the monitor's deferred stop function closes `done` and
+**waits for the goroutine to return before restoring the terminal**, so no
+reader is left parked in `os.Stdin.Read` after the monitor exits. Using
+`VMIN=1`/`VTIME=0` (blocking read) instead would leave the goroutine parked
+forever, and it would steal the first keystroke of the operator's next command
+(#3985).
+
 ## 2. `monitor interface traffic` — All-Interfaces Summary
 
 ```
