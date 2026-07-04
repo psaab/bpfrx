@@ -24,6 +24,21 @@ func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRo
 
 	resp := &pb.GetRoutesResponse{}
 	for _, e := range entries {
+		// ECMP route: emit one RouteInfo per equal-cost next-hop so the
+		// structured view lists all of them (same idiom as the REST
+		// static-route handler), instead of a single bare next-hop.
+		if len(e.NextHops) > 0 {
+			for _, nh := range e.NextHops {
+				resp.Routes = append(resp.Routes, &pb.RouteInfo{
+					Destination: e.Destination,
+					NextHop:     nh.Gateway,
+					Interface:   nh.Interface,
+					Preference:  int32(e.Preference),
+					Protocol:    e.Protocol,
+				})
+			}
+			continue
+		}
 		resp.Routes = append(resp.Routes, &pb.RouteInfo{
 			Destination: e.Destination,
 			NextHop:     e.NextHop,
