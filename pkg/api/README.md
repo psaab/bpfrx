@@ -53,6 +53,19 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     validation is unambiguous on the canonical metrics surface. Each rule
     also carries the runtime `policy_id` (the RT_FLOW/session-table join
     key, #3336). #3623: `policy_id` is emitted ALWAYS (no `omitempty`).
+    #3965: both this endpoint and the `xpf_policy_hits_total` collector read
+    the WHOLE policy set from ONE dataplane snapshot rather than calling
+    `ReadPolicyCounters` once per policy. The per-policy read rebuilt the
+    ruleID->counter index and rescanned the config UNDER the dataplane's
+    policy mutex on every call, so a scrape of P policies was `O(P*(P+C))`
+    with the mutex held the entire time — periodically stalling the scrape
+    AND starving commit/apply and session classification on a firewall with
+    many policies. `dpuserspace.NewPolicyCounterReader` now builds the index
+    ONCE (`O(P+C)`) from a snapshot taken under a single brief lock (the
+    userspace `Manager.ReadAllPolicyCounters`), then resolves outside the
+    lock; a dataplane without the bulk snapshot (test fakes / retired eBPF)
+    transparently falls back to the per-policy read, and the skip-and-bump
+    (#3345/#3408) / HTTP-500 degraded-read contracts are unchanged.
     The first rule of the first zone-pair set legitimately has runtime id
     0 (`policySetID*MaxRulesPerPolicy + ruleIndex = 0`), and since #3057
     the implicit default policy uses a distinct sentinel (`0xFFFFFFFF`),

@@ -151,6 +151,15 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	// #3408: surface a per-policy counter read failure as HTTP 500 after
 	// building, rather than reporting clean-zero hit counts.
 	var readErr error
+	// #3965: read the policy set from ONE snapshot (O(P+C), one brief dataplane
+	// lock) instead of a per-policy ReadPolicyCounters loop that held the policy
+	// mutex across an O(P*(P+C)) walk. Built only when the dataplane is loaded so
+	// no snapshot is taken on a config-only boot; falls back to the per-policy
+	// read for dataplanes without the bulk snapshot (test fakes / retired eBPF).
+	var readPolicy func(uint32) (dataplane.CounterValue, error)
+	if s.dp != nil && s.dp.IsLoaded() {
+		readPolicy = dpuserspace.NewPolicyCounterReader(s.dp, cfg, s.dp.ReadPolicyCounters)
+	}
 	// #3336: span-accumulated runtime/RT_FLOW policy IDs keyed
 	// [policySetID, sliceIndex] — the identity the event path logs, so
 	// automation can join a policy_id back to a rule. The raw ordinal stays the
@@ -226,7 +235,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				pr.Applications = []string{}
 			}
 
-			if (statsEnabled || rule.Count) && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || rule.Count) && readPolicy != nil {
 				// #3474: the counter read handle MUST use the RAW slice index i,
 				// not len(pi.Rules) (the compacted, nil-skipped count). The
 				// resolver (policyRuleIDForCounter) and every other caller —
@@ -239,7 +248,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				// SSOT. (Nil rules are not reachable via any production config
 				// path today; this is defensive SSOT-alignment, like #3476/#3494.)
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
+				if ctrs, err := readPolicy(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
 				} else if readErr == nil {
@@ -313,9 +322,9 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				pr.Applications = []string{}
 			}
 
-			if (statsEnabled || rule.Count) && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || rule.Count) && readPolicy != nil {
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
+				if ctrs, err := readPolicy(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
 				} else if readErr == nil {
