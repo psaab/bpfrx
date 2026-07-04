@@ -1430,6 +1430,54 @@ fn forward_ack_without_reverse_synack_stays_opening_v6() {
     forward_ack_without_reverse_synack_stays_opening(tcp_key_v6());
 }
 
+/// #4109 FAIL-ON-REVERT (Copilot fold): the promotion gate requires a GENUINE
+/// reverse SYN-ACK (`is_syn_ack`), not merely any ACK-bearing reverse segment.
+/// A bare reverse ACK (ACK set, SYN clear) during OPENING cannot occur in a
+/// legitimate 3-way handshake — the server's only pre-established reverse
+/// segment is the SYN-ACK — but a server-spoofing attacker could inject one; it
+/// must NOT promote a half-open session to ESTABLISHED. Loosening the gate back
+/// to `has_ack` makes both `established` asserts RED. A subsequent genuine
+/// reverse SYN-ACK still promotes (control).
+fn reverse_bare_ack_does_not_promote_opening(forward: SessionKey) {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_SYN);
+    // A bare reverse ACK (ACK-only, no SYN) — not a handshake SYN-ACK.
+    assert!(table.lookup(&reverse, now + 1_000_000, TCP_ACK).is_some());
+    assert!(
+        !table.entry_by_key(&reverse).expect("rev entry").established,
+        "a bare reverse ACK (no SYN) must NOT promote the reverse companion (#4109)"
+    );
+    assert!(
+        !table.entry_by_key(&forward).expect("fwd entry").established,
+        "a bare reverse ACK must NOT promote the forward companion either (#4109)"
+    );
+    // Control: a genuine reverse SYN-ACK DOES promote both halves.
+    assert!(
+        table
+            .lookup(&reverse, now + 2_000_000, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+    assert!(
+        table.entry_by_key(&reverse).expect("rev").established,
+        "a genuine reverse SYN-ACK promotes the reverse companion"
+    );
+    assert!(
+        table.entry_by_key(&forward).expect("fwd").established,
+        "a genuine reverse SYN-ACK promotes the forward companion"
+    );
+}
+
+#[test]
+fn reverse_bare_ack_does_not_promote_opening_v4() {
+    reverse_bare_ack_does_not_promote_opening(key_v4());
+}
+
+#[test]
+fn reverse_bare_ack_does_not_promote_opening_v6() {
+    reverse_bare_ack_does_not_promote_opening(tcp_key_v6());
+}
+
 /// #4109 F17 FAIL-ON-REVERT (correctness/DoS): a unidirectional RST seen on ONE
 /// half of a flow must reap BOTH the forward entry and its reverse companion at
 /// the short 2s RST window. Before #4109 only the matched half moved to the 2s
@@ -2988,9 +3036,12 @@ fn reference_update_session(
     // plain `=`, the in-place-vs-reference parity sweep would stay blind to the
     // #3489 bug (both sides would agree on the wrong non-sticky behavior).
     entry.closing |= matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-    // #3152: mirror update_session — promote OPENING -> ESTABLISHED on the
-    // first ACK-bearing segment, then select the timeout consulting the state.
-    entry.established |= matches!(protocol, PROTO_TCP) && has_ack(tcp_flags);
+    // #3152/#4109: mirror update_session — promote OPENING -> ESTABLISHED only
+    // on a genuine reverse SYN-ACK (is_syn_ack + is_reverse), then select the
+    // timeout consulting the state. Keeping this in lock-step with the
+    // production gate keeps the in-place-vs-reference parity sweep honest.
+    entry.established |=
+        matches!(protocol, PROTO_TCP) && is_syn_ack(tcp_flags) && metadata.is_reverse;
     entry.expires_after_ns = if entry.closing {
         if entry.reset {
             TCP_RST_TIMEOUT_NS

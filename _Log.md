@@ -32581,6 +32581,34 @@ top.
   - **File(s)**: userspace-dp/src/session/lookup.rs,
     userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
     userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4109 Copilot fold (PR #4128) — tighten the F16 promotion gate
+    from `has_ack` to `is_syn_ack`. Copilot flagged that the gate
+    `is_tcp && has_ack && is_reverse` promotes on ANY ack-bearing reverse
+    segment, not specifically a SYN-ACK, leaving a residual: a server-spoofed
+    bare reverse ACK (ACK set, SYN clear) during OPENING could still promote —
+    much harder to exploit than the original client-side F16 (needs a packet on
+    the REVERSE tuple, i.e. spoofing the server) but not matching the stated
+    "reverse SYN-ACK" intent. VERIFIED all three safety conditions before
+    tightening: (a) xpf is inline + control segments bypass the flow cache
+    (flow_cache `packet_eligible` = pure-ACK/UDP only), so a normal handshake's
+    SYN-ACK always reaches the slow-path promotion site; (b) mid-stream pickups
+    are seeded ESTABLISHED at install (install.rs `!is_initial_syn`), never
+    OPENING, so unaffected; (c) in a legit 3-way handshake (and simultaneous
+    open) the server's only pre-established reverse segment IS the SYN-ACK — a
+    bare reverse ACK during OPENING is not a legit promotion trigger. Changed
+    both gates (lookup.rs `promote_from_reverse`, mod.rs `update_session`) and
+    the in-place-vs-reference parity mirror (tests.rs) to `is_syn_ack`; removed
+    the now-unused `has_ack` import. Added RED-on-revert test
+    `reverse_bare_ack_does_not_promote_opening` (v4+v6): a bare reverse ACK does
+    NOT promote either half, a genuine reverse SYN-ACK does (control). Updated
+    README to say "genuine reverse SYN-ACK (is_syn_ack, not has_ack)" + document
+    the closed residual. All existing #4109 tests stay green (they promote via
+    SYN|ACK). FULL cargo test --release (single-threaded) green; go build green.
+  - **File(s)**: userspace-dp/src/session/lookup.rs,
+    userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+    userspace-dp/src/session/README.md, _Log.md
   - **Action**: #4122 — fail-closed fabric gRPC allowlist interceptor. The
     cluster fabric listener (`RunFabricListener`, `pkg/grpcapi/server.go`)
     registered the identical full 48-RPC `BpfrxService` as the loopback

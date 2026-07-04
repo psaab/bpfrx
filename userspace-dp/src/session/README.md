@@ -105,17 +105,23 @@ bare SYN (SYN set, ACK clear) starts in the OPENING (half-open) state
 `SessionTimeouts.tcp_opening_ns` window (20 s, the Junos
 `tcp-initial-timeout` default) instead of the full 300 s established
 timeout. It is promoted to ESTABLISHED — and the established / per-app
-idle window then applies — only on evidence of a real reverse SYN-ACK
-(**#4109**, tightened from "any ACK-bearing segment"): the server's reply
-is an ACK-bearing segment on the REVERSE half of the flow, so ONLY an ACK
-on the reverse companion (`metadata.is_reverse`) promotes, and it promotes
-BOTH the reverse entry and its forward companion (see the companion
-propagation below). A client-only forward ACK never promotes a half-open
-session — before #4109 it did, so a bare SYN followed by a bare ACK pinned
-a 300 s established entry with no peer ever replying, a 2-packet bypass of
-the #3152 half-open reap (a real vSRX with the syn-check default does not
-mark a session ESTABLISHED on a client ACK that precedes the server's
-SYN-ACK). The promotion is sticky (a later segment never demotes an
+idle window then applies — only on a genuine reverse SYN-ACK
+(**#4109**, tightened from "any ACK-bearing segment"): the server's
+handshake response is a SYN-ACK on the REVERSE half of the flow, so ONLY a
+SYN-ACK (`is_syn_ack`, not merely `has_ack`) on the reverse companion
+(`metadata.is_reverse`) promotes, and it promotes BOTH the reverse entry
+and its forward companion (see the companion propagation below). A
+client-only forward ACK never promotes a half-open session — before #4109
+any ACK did, so a bare SYN followed by a bare ACK pinned a 300 s
+established entry with no peer ever replying, a 2-packet bypass of the
+#3152 half-open reap (a real vSRX with the syn-check default does not mark
+a session ESTABLISHED on a client ACK that precedes the server's SYN-ACK).
+Requiring the SYN bit (not just `has_ack` on the reverse tuple) also closes
+the residual where a server-spoofed bare reverse ACK could promote — in a
+legitimate 3-way handshake (and simultaneous open) the server's only
+pre-established reverse segment IS the SYN-ACK, and xpf is inline so it
+always observes it (control segments bypass the flow cache and reach this
+slow-path promotion site). The promotion is sticky (a later segment never demotes an
 established session back to OPENING) and is applied on all three
 timeout-selection sites (`install` / `upsert_synced`, `lookup`,
 `update_session`). The state is initialised

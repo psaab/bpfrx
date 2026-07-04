@@ -121,18 +121,24 @@ impl SessionTable {
                 // the entry back to the 30s graceful-FIN close window.
                 entry.reset |= has_rst(tcp_flags);
             }
-            // #3152/#4109: promote OPENING -> ESTABLISHED only on real handshake
-            // evidence. Forward and reverse are two independent entries; the
-            // server's SYN-ACK is an ACK-bearing segment on the REVERSE half, so
-            // ONLY an ACK on the reverse entry (`is_reverse`) promotes — and it
-            // promotes both this reverse entry and its forward companion (after
-            // the borrow ends, below). A client-only forward ACK never promotes
-            // a half-open session: before #4109 it did, so a bare SYN + a bare
-            // ACK pinned a 300s established entry with no peer replying, turning
-            // the #3152 half-open reap into a 2-packet bypass. Sticky — an
+            // #3152/#4109: promote OPENING -> ESTABLISHED only on a genuine
+            // reverse SYN-ACK. Forward and reverse are two independent entries;
+            // the server's handshake response is a SYN-ACK on the REVERSE half,
+            // so ONLY a SYN-ACK (`is_syn_ack`, not merely any ACK) on the reverse
+            // entry (`is_reverse`) promotes — and it promotes both this reverse
+            // entry and its forward companion (after the borrow ends, below). A
+            // client-only forward ACK never promotes a half-open session: before
+            // #4109 any ACK did, so a bare SYN + a bare ACK pinned a 300s
+            // established entry with no peer replying, turning the #3152 half-open
+            // reap into a 2-packet bypass. Requiring the SYN bit too (not just
+            // has_ack on the reverse tuple) closes the residual where a
+            // server-spoofed bare reverse ACK could still promote — a legit
+            // 3-way handshake's only pre-established reverse segment IS the
+            // SYN-ACK, and xpf is inline so it always sees it (control segments
+            // bypass the flow cache and reach this slow-path site). Sticky — an
             // already-established entry (e.g. a mid-stream pickup seeded
             // ESTABLISHED at install) is never demoted.
-            let promote_from_reverse = is_tcp && has_ack(tcp_flags) && entry.metadata.is_reverse;
+            let promote_from_reverse = is_tcp && is_syn_ack(tcp_flags) && entry.metadata.is_reverse;
             if promote_from_reverse {
                 entry.established = true;
             }

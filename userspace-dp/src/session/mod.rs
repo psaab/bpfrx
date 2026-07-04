@@ -286,7 +286,7 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 // so the conntrack submodules (install, lookup, expire) keep referencing
 // TCP_FIN/TCP_RST via `super::*`. The session-closing test is the shared
 // `is_closing` predicate.
-use crate::tcp_flags::{TCP_FIN, TCP_RST, has_ack, has_rst, is_closing, is_initial_syn};
+use crate::tcp_flags::{TCP_FIN, TCP_RST, has_rst, is_closing, is_initial_syn, is_syn_ack};
 
 #[allow(unused_macros)]
 macro_rules! debug_log {
@@ -1182,22 +1182,23 @@ impl SessionTable {
             // established window. A plain assignment here let that happen,
             // leaving a FIN'd session lingering 10× too long (#3489).
             record.entry.closing |= matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
-            // #3152/#4109: promote OPENING -> ESTABLISHED only on real
-            // handshake evidence (sticky, mirrors lookup.rs). Only an
-            // ACK-bearing segment on the REVERSE half (the server's SYN-ACK)
-            // promotes; a client-only forward ACK never does. Before #4109 any
-            // ACK promoted here, so a bare SYN + bare ACK could pin a 300s
-            // established entry with no peer ever replying, bypassing the #3152
-            // half-open reap. `metadata` was just assigned onto the record
-            // above, so `metadata.is_reverse` is this entry's direction. Set
-            // BEFORE the timeout selection so an established refresh uses the
-            // established window. (This path's live reach is the one-shot
-            // HA promote of a peer-synced session, which is imported ESTABLISHED
-            // already — see `upsert_synced_with_origin` — so the gate is a
-            // no-op there and only defends a hypothetical OPENING promote; the
-            // cross-companion propagation lives on the read path in lookup.rs.)
+            // #3152/#4109: promote OPENING -> ESTABLISHED only on a genuine
+            // reverse SYN-ACK (sticky, mirrors lookup.rs). Only a SYN-ACK
+            // (`is_syn_ack`, not merely any ACK) on the REVERSE half (the
+            // server's handshake response) promotes; a client-only forward ACK
+            // never does. Before #4109 any ACK promoted here, so a bare SYN +
+            // bare ACK could pin a 300s established entry with no peer ever
+            // replying, bypassing the #3152 half-open reap. `metadata` was just
+            // assigned onto the record above, so `metadata.is_reverse` is this
+            // entry's direction. Set BEFORE the timeout selection so an
+            // established refresh uses the established window. (This path's live
+            // reach is the one-shot HA promote of a peer-synced session, which is
+            // imported ESTABLISHED already — see `upsert_synced_with_origin` — so
+            // the gate is a no-op there and only defends a hypothetical OPENING
+            // promote; the cross-companion propagation lives on the read path in
+            // lookup.rs.)
             record.entry.established |=
-                matches!(protocol, PROTO_TCP) && has_ack(tcp_flags) && metadata.is_reverse;
+                matches!(protocol, PROTO_TCP) && is_syn_ack(tcp_flags) && metadata.is_reverse;
             record.entry.expires_after_ns = if record.entry.closing {
                 if record.entry.reset {
                     TCP_RST_TIMEOUT_NS
