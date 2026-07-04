@@ -606,6 +606,49 @@ printf 'show configuration security policies from-zone lan to-zone wan | display
 - A subsequent failover serves the rolled-back (confirmed) config, not the
   abandoned one.
 
+### TC-5c: Non-Fatal Apply Error Still Syncs Config to the Standby (#4034)
+
+**Objective:** Verify that a commit which succeeds locally but whose apply hits a
+NON-FATAL best-effort subsystem error still propagates the committed config to
+the standby — the nodes must not diverge.
+
+Background: on the RG0 primary a commit promotes+persists the compiled config,
+runs the ordered subsystem reconcile (`applyConfigLocked`), then pushes the
+config to the standby (`syncConfigToPeer`). `applyConfigLocked`'s tail joins the
+best-effort subsystem failures (networkd file write, Kea restart, host-inbound /
+lo0 nft apply) and returns them so the operator sees a fail-closed commit — but
+the config is still committed + active and the dataplane is armed. Before #4034
+that non-fatal error short-circuited `commitAndApply` BEFORE the peer push, so
+the standby never received the config and the nodes diverged; a failover then
+served stale config. The fix routes both `commitAndApply` and
+`commitConfirmedAndApply` through `applyAndSyncCommitted`, which pushes on every
+non-fatal apply outcome and suppresses the push ONLY for the two classes that
+must not propagate: a required-protocol-gate error (`compileErrorMustAbortApply`
+→ dataplane DISARMED, so pushing a disarm-config to the standby is strictly
+worse) and a daemon-stop context abort (#2926 boundary — next boot + reverse
+sync converge the peer).
+
+This is hard to induce deterministically on the live cluster (it needs a
+subsystem write to fail mid-commit). The behavior is pinned by the
+`pkg/daemon` unit tests (`configsync_tail_error_test.go`): a non-fatal tail
+error STILL calls the peer sync exactly once, a clean commit syncs once, and a
+fatal / context-abort error skips the sync. On the cluster, a commit whose
+journal shows a `WARN`-level networkd/Kea/nft apply failure must still be
+reflected on the standby:
+
+```bash
+# After any commit that logs a best-effort subsystem WARN on fw0, confirm the
+# committed config is present on fw1 (the standby):
+printf 'show configuration | display set\nexit\n' | incus exec xpf-fw1 -- cli
+```
+
+**Pass criteria:**
+- A commit that logs a non-fatal subsystem apply WARN on the primary is still
+  present on the standby (no divergence).
+- Unit tests in `pkg/daemon/configsync_tail_error_test.go` pass, including
+  RED-on-revert (the non-fatal case drops to zero peer pushes if the fix is
+  reverted).
+
 ### TC-6: Session Synchronization
 
 **Objective:** Verify active sessions are synced to secondary for hitless failover.
