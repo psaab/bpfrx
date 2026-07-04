@@ -32052,3 +32052,37 @@ top.
     FULL `cargo test --release`, `go build ./...`, rustfmt.
   - **File(s)**: userspace-dp/src/session/key.rs,
     userspace-dp/src/session/tests.rs, _Log.md
+  - **Action**: #4085 — firewall-filter `then count` double-count fix (Rust
+    dataplane). VERIFIED against origin/master: an interface INPUT filter term
+    with BOTH `then count` and a tx-selection modifier (`then forwarding-class`
+    / `then dscp`) OR a three-color policer was counted TWICE per packet. The
+    input-filter ACTION evaluation (`evaluate_non_pbr_input_filter` ->
+    `evaluate_interface_filter_non_routing_counted`) records the count once —
+    the one legitimate count. But when the egress interface has no output
+    filter and the input filter affects tx-selection / has a policer, the CoS
+    classifier (`afxdp/tx/cos_classify.rs` `resolve_cos_tx_selection[_at]`)
+    RE-WALKS the same ingress filter (to recover the fc queue / dscp-rewrite
+    and to meter the ingress policer) using the *counted* eval variant, reading
+    the SAME `term.counter` Arc a second time. Cacheable flows double-counted
+    the seed packet (+1/flow); non-cacheable (DSCP-sensitive / NAT64 / NPTv6)
+    double-counted EVERY packet. Fix: added counter-suppressed eval variants
+    `evaluate_filter_ref_tx_selection_{,runtime_}uncounted` (thread a
+    `count_terms: bool`; when false, skip `record_filter_counter` but KEEP the
+    policer meter + fc/dscp/log accumulation), and switched the INGRESS
+    tx-selection leg (cos_classify.rs) to them. The OUTPUT-filter leg KEEPS
+    counting (an output filter is action-evaluated nowhere else). Cache-hit
+    exactly-once is preserved unchanged: the cached path already captures the
+    ingress count via the non-counting `evaluate_filter_ref_tx_selection_cached`
+    into `tx_selection.filter_counters`, deduped against `input_filter_counters`
+    (#3777, flow_cache.rs `retain_absent_from`), replayed once per hit. So miss
+    (action-eval) + hits (cached replay) = exactly one per packet.
+    RED-on-revert (6 tests fail on revert, the plain-count no-regression guard
+    stays green): miss v4/v6, None-now_ns branch, count+policer (also asserts
+    the policer STILL meters -> drop), non-cacheable 3-packet, and cache-hit
+    seed+2hits=3. FULL cargo test --release green; go build ./... green.
+    Docs: userspace-dp/src/filter/README.md.
+  - **File(s)**: userspace-dp/src/filter/engine/tx_selection.rs,
+    userspace-dp/src/filter/engine/mod.rs,
+    userspace-dp/src/afxdp/tx/cos_classify.rs,
+    userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+    userspace-dp/src/filter/README.md, _Log.md

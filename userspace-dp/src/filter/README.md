@@ -221,6 +221,28 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   exits. (The earlier coarse fix gated the precheck solely on
   `affects_route_lookup`; that under-counted to zero on the discard/reject
   and session-hit exits, where the routing evaluator is never the counter.)
+
+  **The CoS TX-selection INGRESS leg is counter-suppressed (#4085).** An
+  interface INPUT filter is action-evaluated for its `then count` exactly
+  once (the #2620 precheck above / the DSCP-sensitive session-hit re-eval).
+  But when the resolved egress interface has NO output filter and the input
+  filter `affects_tx_selection` (a `then forwarding-class` / `then dscp`
+  term) OR carries a three-color policer, the CoS classifier
+  (`afxdp/tx/cos_classify.rs` `resolve_cos_tx_selection[_at]`) RE-WALKS the
+  same ingress filter to recover the forwarding-class queue / dscp-rewrite
+  and to METER the ingress three-color policer. That re-walk reads the SAME
+  `term.counter` Arc, so counting it there double-counts every packet of a
+  non-cacheable flow (DSCP-sensitive / NAT64 / NPTv6) and the seed packet of
+  a cacheable one. The ingress leg therefore uses the counter-suppressed
+  eval variant (`evaluate_filter_ref_tx_selection_{,runtime_}uncounted`,
+  `count_terms == false`): fc/dscp/log accumulate and the policer STILL
+  meters, but `record_filter_counter` is NOT called. The OUTPUT-filter leg
+  KEEPS counting: an output filter is action-evaluated nowhere else, so its
+  single `then count` belongs to the TX-selection walk. On the flow-cache
+  HIT path the ingress count is replayed exactly once from the cached
+  `tx_selection.filter_counters` (deduped against the dedicated
+  `input_filter_counters` set at seed, #3777), so miss (action-eval) + hits
+  (cached replay) still total exactly one per packet.
 - `policer.rs` — token-bucket implementation plus the #1375 RFC
   2697/2698 three-color meter core. Token math is integer-only:
   the legacy token bucket keeps its bits/sec constructor contract, and
