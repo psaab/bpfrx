@@ -193,13 +193,25 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 						Name: termInst.name,
 					}
 
-					fromNode := termInst.node.FindChild("from")
-					if fromNode != nil {
+					// #3850: apply EVERY `from {}` block, not just the first via
+					// FindChild — a duplicate block (a `load merge`/`load
+					// override` that splits its conditions, or a hierarchical
+					// config authored twice) must AND-combine every condition,
+					// never be dropped (a fail-open widening of the term match).
+					// compileFilterFrom accumulates into term. Flat-set is
+					// unaffected: SetPath merges duplicate containers into one
+					// node (ast_edit.go), so this only changes the hierarchical
+					// (parser / load merge) shape.
+					for _, fromNode := range termInst.node.FindChildren("from") {
 						compileFilterFrom(fromNode, term, af)
 					}
 
-					thenNode := termInst.node.FindChild("then")
-					if thenNode != nil {
+					// #3850: apply EVERY `then {}` block. compileFilterThen
+					// accumulates modifiers (count/log/forwarding-class/...); a
+					// terminal action (accept/discard/reject) resolves last-wins
+					// across blocks (Junos merges duplicate stanzas), so the
+					// second block's action is applied, never silently dropped.
+					for _, thenNode := range termInst.node.FindChildren("then") {
 						compileFilterThen(thenNode, term)
 					}
 

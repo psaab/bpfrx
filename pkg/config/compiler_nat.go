@@ -1599,8 +1599,14 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &NATRule{Name: ruleInst.name}
 
-			matchNode := ruleInst.node.FindChild("match")
-			if matchNode != nil {
+			// #3850: iterate EVERY `match {}` block, not just the first — a
+			// duplicate block (a `load merge`/`load override` that splits its
+			// conditions, or a hierarchical config authored twice) must
+			// AND-combine every condition, never be dropped by a FindChild-first
+			// read (a fail-open widening of the NAT match). Flat-set is
+			// unaffected: SetPath merges duplicate containers into one node
+			// (ast_edit.go), so this only changes the hierarchical/parser shape.
+			for _, matchNode := range ruleInst.node.FindChildren("match") {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "source-address":
@@ -1675,8 +1681,11 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			thenNode := ruleInst.node.FindChild("then")
-			if thenNode != nil {
+			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
+			// rule carries a single translation action, so a duplicate then
+			// block resolves last-wins (Junos merges duplicate stanzas) — the
+			// second block's action is applied, never silently dropped.
+			for _, thenNode := range ruleInst.node.FindChildren("then") {
 				for _, t := range thenNode.Children {
 					if t.Name() == "source-nat" {
 						if len(t.Keys) >= 2 {
@@ -1815,8 +1824,14 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &NATRule{Name: ruleInst.name}
 
-			matchNode := ruleInst.node.FindChild("match")
-			if matchNode != nil {
+			// #3850: iterate EVERY `match {}` block, not just the first — a
+			// duplicate block (a `load merge`/`load override` that splits its
+			// conditions, or a hierarchical config authored twice) must
+			// AND-combine every condition, never be dropped by a FindChild-first
+			// read (a fail-open widening of the NAT match). Flat-set is
+			// unaffected: SetPath merges duplicate containers into one node
+			// (ast_edit.go), so this only changes the hierarchical/parser shape.
+			for _, matchNode := range ruleInst.node.FindChildren("match") {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
@@ -1884,8 +1899,11 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			thenNode := ruleInst.node.FindChild("then")
-			if thenNode != nil {
+			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
+			// rule carries a single translation action, so a duplicate then
+			// block resolves last-wins (Junos merges duplicate stanzas) — the
+			// second block's action is applied, never silently dropped.
+			for _, thenNode := range ruleInst.node.FindChildren("then") {
 				for _, t := range thenNode.Children {
 					if t.Name() == "destination-nat" {
 						// #3844: `then destination-nat off` is a no-translate
@@ -2093,8 +2111,14 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &StaticNATRule{Name: ruleInst.name}
 
-			matchNode := ruleInst.node.FindChild("match")
-			if matchNode != nil {
+			// #3850: iterate EVERY `match {}` block, not just the first — a
+			// duplicate block (a `load merge`/`load override` that splits its
+			// conditions, or a hierarchical config authored twice) must
+			// AND-combine every condition, never be dropped by a FindChild-first
+			// read (a fail-open widening of the NAT match). Flat-set is
+			// unaffected: SetPath merges duplicate containers into one node
+			// (ast_edit.go), so this only changes the hierarchical/parser shape.
+			for _, matchNode := range ruleInst.node.FindChildren("match") {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
@@ -2130,8 +2154,11 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			thenNode := ruleInst.node.FindChild("then")
-			if thenNode != nil {
+			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
+			// rule carries a single translation action, so a duplicate then
+			// block resolves last-wins (Junos merges duplicate stanzas) — the
+			// second block's action is applied, never silently dropped.
+			for _, thenNode := range ruleInst.node.FindChildren("then") {
 				for _, t := range thenNode.Children {
 					if t.Name() == "static-nat" {
 						if len(t.Keys) >= 3 && t.Keys[1] == "nptv6-prefix" {

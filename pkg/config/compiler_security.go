@@ -217,7 +217,10 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 			}
 		case "pre-id-default-policy":
 			sec.PreIDDefaultPolicy = &PreIDDefaultPolicy{}
-			if thenNode := child.FindChild("then"); thenNode != nil {
+			// #3850: read EVERY `then {}` block, not just the first via
+			// FindChild — a duplicate then block (load merge/override) would
+			// otherwise have its session-log modes silently dropped.
+			for _, thenNode := range child.FindChildren("then") {
 				// #3703: multi-value session-log list leaf. Read every mode via
 				// the firewallMatchValues SSOT (Keys[1:] AND/OR one-per-child)
 				// across EVERY `log` leaf so a bracket `then log [ session-init
