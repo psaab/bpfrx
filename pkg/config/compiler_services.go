@@ -1297,21 +1297,54 @@ func compilePortMirroring(node *Node, fo *ForwardingOptionsConfig) error {
 		Instances: make(map[string]*PortMirrorInstance),
 	}
 
+	// #3972: an invalid port-mirroring entry is a HARD commit reject naming
+	// the offending instance, NOT a green commit that later fail-closes the
+	// WHOLE mirror table with only a warn in the snapshot builder. This
+	// realizes the #1376 design ("Duplicate ingress ifindex config must be
+	// rejected at commit time", docs/pr/1373-retire-ebpf-dataplane/
+	// plan-1376-port-mirroring.md) which the original implementation deferred
+	// to buildMirrorConfigSnapshots — where one bad entry dropped every valid
+	// mirror session silently. Reject up front so an operator with 3 good
+	// sessions + 1 typo'd 4th sees the specific error and fixes it instead of
+	// losing all mirroring.
+	//
+	// The mirror table contract is one output per ingress interface, so an
+	// ingress source may be used only ONCE across all instances. Ingress
+	// names are normalized with LinuxIfName so the vSRX ("ge-0/0/0.0") and
+	// Linux ("ge-0-0-0.0") spellings of one interface are recognized as the
+	// same source (matching the snapshot builder's ifindex dedup).
+	ingressOwner := make(map[string]string)
+
 	for _, inst := range namedInstances(node.FindChildren("instance")) {
 		mi := &PortMirrorInstance{Name: inst.name}
 
 		if inputNode := inst.node.FindChild("input"); inputNode != nil {
 			if rateNode := inputNode.FindChild("rate"); rateNode != nil {
 				if v := nodeVal(rateNode); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						mi.InputRate = n
+					n, err := strconv.Atoi(v)
+					if err != nil {
+						return fmt.Errorf("port-mirroring instance %q: invalid input rate %q: must be a non-negative integer (0 mirrors every packet)", inst.name, v)
 					}
+					if n < 0 {
+						// uint32(InputRate) in the snapshot builder would wrap a
+						// negative rate into a huge 1-in-N sampling divisor.
+						return fmt.Errorf("port-mirroring instance %q: input rate must not be negative, got %d", inst.name, n)
+					}
+					mi.InputRate = n
 				}
 			}
 			if ingressNode := inputNode.FindChild("ingress"); ingressNode != nil {
 				for _, child := range ingressNode.Children {
 					if child.Name() == "interface" {
 						if v := nodeVal(child); v != "" {
+							key := LinuxIfName(v)
+							if owner, dup := ingressOwner[key]; dup {
+								if owner == inst.name {
+									return fmt.Errorf("port-mirroring instance %q: duplicate ingress interface %q", inst.name, v)
+								}
+								return fmt.Errorf("port-mirroring: ingress interface %q is mirrored by both instance %q and %q (one output per ingress interface)", v, owner, inst.name)
+							}
+							ingressOwner[key] = inst.name
 							mi.Input = append(mi.Input, v)
 						}
 					}
