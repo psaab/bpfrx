@@ -910,8 +910,16 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 						// (hierarchical `targets { a; b; }`) and/or packed in
 						// the leaf Keys (flat-set / bracketed list).
 						tg.Targets = append(tg.Targets, firewallMatchValues(prop)...)
-					case "version", "categories":
-						// Accepted trap-group leaves (schema-declared). Not
+					case "version":
+						// #3948: carry the trap-group SNMP version to the
+						// emitter. Schema enum is v1|v2|all; an empty value
+						// (unspecified) defaults to v2c in pkg/snmp/traps.go.
+						// Without this the version was parsed but dropped, so a
+						// `version v1` group silently emitted v2c traps that a
+						// v1-only receiver drops.
+						tg.Version = nodeVal(prop)
+					case "categories":
+						// Accepted trap-group leaf (schema-declared). Not
 						// consumed by the link-trap runtime today; recognized
 						// here so a valid key does not trip the unknown-key
 						// rejection below.

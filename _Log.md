@@ -1,3 +1,29 @@
+## 2026-07-03 — #3948: SNMP trap-group `version` had no typed field → a `version v1` group emitted v2c traps
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-069 (MEDIUM, observability/interop). An SNMP
+    trap-group's `version` (schema enum v1|v2|all) was parsed only to satisfy
+    the unknown-key rejection (#2990) but had NO typed field, so it was dropped
+    and the emitter always built an SNMPv2c trap. A trap-group configured
+    `version v1` therefore emitted v2c traps that a v1-only receiver drops —
+    the operator's traps silently never arrive. Added `Version` to
+    `config.SNMPTrapGroup`, populated it in the compiler
+    (`tg.Version = nodeVal(prop)`), and threaded it to the emitter.
+    `sendLinkTraps` now builds the trap PER GROUP via `buildLinkTrapsForVersion`
+    (community stays global): `v1` -> new `buildLinkTrapV1` (SNMPv1 Trap-PDU,
+    RFC 1157: message version 0, PDU tag 0xa4, enterprise=snmpTraps
+    1.3.6.1.6.3.1.1.5, agent-addr 0.0.0.0, generic-trap 2/3, specific-trap 0,
+    time-stamp, ifIndex/ifDescr/ifOperStatus varbinds — per RFC 2576 §3.1),
+    `v2`/unspecified -> existing v2c `buildLinkTrap` (unchanged default), `all`
+    -> BOTH. RED-on-revert proven both sides: dropping the compiler line leaves
+    Version empty (TestSNMPTrapGroup_VersionCarried RED); building v2c
+    regardless makes TestSendLinkTraps_VersionV1_EmitsV1 receive version=1/
+    tag=0xa7 and TestSendLinkTraps_VersionAll_EmitsBoth get only 1 packet.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_system.go,
+    pkg/snmp/traps.go, pkg/snmp/traps_version_3948_test.go,
+    pkg/config/compiler_snmp_trapgroup_2990_test.go, pkg/snmp/README.md,
+    _Log.md
+
 ## 2026-07-03 — #3941: deleting an IPsec VPN never terminates its live SAs (--load-all only unloads config)
 
 - **Timestamp**: 2026-07-03

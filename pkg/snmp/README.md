@@ -253,6 +253,19 @@ authorization surface: every request is dropped because no community matches.
   community saw flaky traps and a less-privileged community could leak
   through the wrong credential boundary. Trap groups are likewise iterated
   in sorted order so dispatch and log output are reproducible.
+- **Trap-group `version` selects the emitted PDU shape (#3948).** Each trap
+  group carries a `version` (`v1` | `v2` | `all`, schema enum in
+  `pkg/config/schema_system.go`) compiled onto `config.SNMPTrapGroup.Version`.
+  `sendLinkTraps` builds the trap **per group** and honors it via
+  `buildLinkTrapsForVersion`: `v1` emits an SNMPv1 Trap-PDU
+  (`buildLinkTrapV1` — message version field 0, PDU tag 0xa4, the trap type
+  carried in the enterprise/generic-trap/specific-trap/time-stamp fields per
+  RFC 1157, with ifIndex/ifDescr/ifOperStatus varbinds; enterprise =
+  `snmpTraps` 1.3.6.1.6.3.1.1.5 and agent-addr 0.0.0.0 per the RFC 2576 §3.1
+  SNMPv2→SNMPv1 mapping), `v2` (or an unspecified/empty version — the default)
+  emits the SNMPv2c trap (`buildLinkTrap`, version 1, PDU tag 0xa7), and `all`
+  emits BOTH. Before #3948 the version was parsed but had no typed field, so a
+  `version v1` group silently emitted v2c traps that a v1-only receiver drops.
 - Don't add a third BER library to this package. The hand-coded encoder
   is intentional; keeping the surface small avoids bringing in an SNMP
   framework with its own poll loop and threading model.
