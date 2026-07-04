@@ -1,3 +1,25 @@
+## 2026-07-04 — #4120: drop leftover test-env `is_trust_flow` debug-log bypass (fable-163 F27)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the defect at HEAD (caabd4bc9):
+    `poll_descriptor/mod.rs` bound `let is_trust_flow = meta.ingress_ifindex
+    == 5 || from_zone == "lan" || 10.x-src` and OR'd it past the numeric
+    `dbg.*` caps at the session-miss (`dbg.session_miss <= 10`) and policy-deny
+    (`dbg.policy_deny <= 3`) `debug-log` cold-path lines. On any real 10.x LAN
+    the whole trusted side bypassed the cap → log flood (the CLAUDE.md Logging
+    Rules hazard). FIX: dropped `is_trust_flow` entirely; the numeric caps now
+    govern uniformly. Extracted the two throttle decisions into pure predicates
+    `session_miss_debug_log_allowed` / `policy_deny_debug_log_allowed` (named
+    caps `SESSION_MISS_DEBUG_LOG_CAP=10` / `POLICY_DENY_DEBUG_LOG_CAP=3`) that
+    take ONLY the interval counter — topology can no longer be an input by
+    construction. Added `debug_log_throttle_tests` pinning the cap boundaries
+    and the topology-free contract (RED-on-revert: re-adding the bypass would
+    have to OR past a predicate whose signature has no ifindex/zone/ip slot).
+    No markdown doc references `is_trust_flow`; rationale lives in the inline
+    doc comments. rustfmt applied to my lines only (avoided whole-crate drift);
+    `cargo check --release --all-targets` clean (no unused-symbol warnings).
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs, _Log.md
+
 ## 2026-07-04 — #4121: compilePolicy match reads share the firewallMatchValues SSOT (fable-163 F28)
 
 - **Timestamp**: 2026-07-04
