@@ -214,7 +214,9 @@ authorization surface: every request is dropped because no community matches.
 - `Start(ctx context.Context) error` — `agent.go`. Blocks until ctx cancelled.
 - `Stop()` — `agent.go`.
 - `SetIfDataFn(fn)` — `agent.go`. Caller-supplied accessor for live
-  interface data.
+  interface data. The daemon wires `buildSNMPIfData`, which does a full
+  netlink `LinkList` (RTM_GETLINK dump) per call — so the request path must
+  invoke it at most once per PDU (see the per-PDU snapshot gotcha below).
 - `NotifyLinkUp` / `NotifyLinkDown` — `traps.go`.
 
 ## Callers
@@ -252,6 +254,24 @@ authorization surface: every request is dropped because no community matches.
   varbind fits. This prevents emitting an oversized UDP datagram that the peer
   or the network would fragment or drop. See `effectiveMaxSize` / `trimToFit`
   in `agent.go`.
+- **The interface table is snapshotted ONCE per PDU (#4013).** `SetIfDataFn`
+  (the daemon's `buildSNMPIfData`) performs a full netlink `LinkList`
+  (RTM_GETLINK dump) on every call, so a request handler must NOT read it
+  per-varbind. Each request builds one lazy `ifSnapshot` (`newIfSnapshot`) and
+  threads it through `getOIDValueSnap` / `findNextOIDSnap` /
+  `getIfTableValue` / `getIfXTableValue`, so a GETBULK/GETNEXT walk over N
+  interfaces performs at most ONE dump for the whole PDU instead of two per
+  returned varbind. Before this the ifTable GETBULK walk issued 2× a full
+  RTM_GETLINK dump per varbind — an O(N)/O(N²) netlink storm that floods the
+  kernel and contends with the interface reconcile and VRRP; an aggressive
+  poller could amplify a single GETBULK into a netlink DoS. The snapshot is
+  lazy: a PDU that never touches the ifTable/ifXTable (e.g. a system-group GET
+  of `sysUpTime`) triggers no dump at all. The public one-shot forms
+  (`getOIDValue` / `findNextOID`) build a fresh single-use snapshot and are for
+  single-object callers/tests only — multi-varbind handlers use the `*Snap`
+  forms with one shared snapshot. `ifSnapshot` is not safe for concurrent use;
+  each request builds its own. Fail-on-revert guard:
+  `TestV2cGetBulk_SingleLinkListPerPDU`.
 - **Trap delivery is asynchronous and bounded (#2991).** Link-state traps
   are emitted from the daemon's netlink link-monitor goroutine.
   `sendLinkTraps` builds the packet on the caller's goroutine (cheap) and
