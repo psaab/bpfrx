@@ -785,46 +785,75 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 		sec.NAT.SourcePools = make(map[string]*NATPool)
 	}
 
-	srcNode := node.FindChild("source")
-	if srcNode != nil {
+	// #3915: iterate EVERY source/destination/static/nat64/natv6v4/proxy-arp
+	// sub-block under this nat{} node, not just the FIRST. The Junos parser
+	// APPENDS a repeated hierarchical block as a sibling (parseStatements,
+	// parser.go) instead of merging it, so `load override`/`load merge` can
+	// produce a second `source {}` (or destination/static/nat64/proxy-arp)
+	// block carrying additional rule-sets. The prior FindChild-first read
+	// compiled only the first block and SILENTLY DROPPED the second block's
+	// rule-sets -> the SNAT/DNAT/static rule-set vanished and traffic that
+	// should have been translated egressed untranslated (a NAT bypass /
+	// connectivity break). Each sub-block compiler APPENDS its rule-sets
+	// (sec.NAT.Source / Destination.RuleSets / Static / NAT64 / ProxyARP) and
+	// map-assigns its pools, so invoking it once per duplicate block MERGES the
+	// blocks exactly as Junos merges duplicate hierarchical stanzas. With a
+	// single block the callback fires exactly once, bit-identical to the prior
+	// FindChild read. Mirrors the #3842 policy dup-block accumulate fix and the
+	// #3444/#3562 forEachChild dup-block-bypass class.
+	if err := forEachChild(node.Children, "source", func(srcNode *Node) error {
 		if err := compileNATSource(srcNode, sec); err != nil {
 			return fmt.Errorf("source: %w", err)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	dstNode := node.FindChild("destination")
-	if dstNode != nil {
+	if err := forEachChild(node.Children, "destination", func(dstNode *Node) error {
 		if err := compileNATDestination(dstNode, sec); err != nil {
 			return fmt.Errorf("destination: %w", err)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	staticNode := node.FindChild("static")
-	if staticNode != nil {
+	if err := forEachChild(node.Children, "static", func(staticNode *Node) error {
 		if err := compileNATStatic(staticNode, sec); err != nil {
 			return fmt.Errorf("static: %w", err)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	nat64Node := node.FindChild("nat64")
-	if nat64Node != nil {
+	if err := forEachChild(node.Children, "nat64", func(nat64Node *Node) error {
 		if err := compileNAT64(nat64Node, sec); err != nil {
 			return fmt.Errorf("nat64: %w", err)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	// natv6v4 { no-v6-frag-header; }
-	v6v4Node := node.FindChild("natv6v4")
-	if v6v4Node != nil {
-		sec.NAT.NATv6v4 = &NATv6v4Config{}
+	// natv6v4 { no-v6-frag-header; } — accumulate across duplicate blocks:
+	// initialize the struct once and OR the flag so a second natv6v4 block
+	// cannot silently reset an already-observed no-v6-frag-header.
+	if err := forEachChild(node.Children, "natv6v4", func(v6v4Node *Node) error {
+		if sec.NAT.NATv6v4 == nil {
+			sec.NAT.NATv6v4 = &NATv6v4Config{}
+		}
 		if v6v4Node.FindChild("no-v6-frag-header") != nil {
 			sec.NAT.NATv6v4.NoV6FragHeader = true
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// proxy-arp { interface <name> { address <addr>; } }
-	proxyNode := node.FindChild("proxy-arp")
-	if proxyNode != nil {
+	if err := forEachChild(node.Children, "proxy-arp", func(proxyNode *Node) error {
 		for _, inst := range namedInstances(proxyNode.FindChildren("interface")) {
 			entry := &ProxyARPEntry{Interface: inst.name}
 			for _, prop := range inst.node.Children {
@@ -867,6 +896,9 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 			}
 			sec.NAT.ProxyARP = append(sec.NAT.ProxyARP, entry)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	return nil
