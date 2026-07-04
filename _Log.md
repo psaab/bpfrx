@@ -1,3 +1,33 @@
+## 2026-07-04 — #4121: compilePolicy match reads share the firewallMatchValues SSOT (fable-163 F28)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST on the claimed #2419 fail-open. Built a scratch
+    matrix (flat bracket / flat repeated / flat bracket+single / hier bracket /
+    hier block / hier repeated) and compiled each — the CURRENT either/or read
+    (`compiler_security.go` compilePolicy, `if len(m.Keys) >= 2 { Keys[1:] }
+    else { Children }`) read ALL values in EVERY realistic shape. The bracketed
+    `[ a b c ]` collapses onto `Keys` and the Keys[1:] arm reads it in full — the
+    issue's premise (drops all-but-first) is REFUTED. The ONLY shape where
+    either/or diverges from `firewallMatchValues` (read-both) is a node carrying
+    members in BOTH slots (`source-address a1 { a2; }`), which no canonical Junos
+    / display-set round-trip emits. VERDICT: already-reads-both-equivalent
+    (cosmetic divergence), NOT a genuine fail-open. Did the trivial SSOT
+    consolidation the issue requests: routed the three policy-match `multi`
+    arms (source-address / destination-address / application) through
+    `firewallMatchValues` — the SAME reader the strict gates use, and the same
+    pattern the `then log` / `default-policy-log` arms in this file already use
+    — so compiler + gates share ONE reader (future dual-AST drift = shared-test
+    failure). Address arms keep the `normalizePolicyAddrTokens` any-ipv4/6
+    normalization. RED-on-revert proven: reverting to either/or turns the
+    both-slots subtest RED (src=[a1], a2 dropped) while all four realistic
+    shapes stay GREEN. Part B (2357-line file-split + trafficSelectorValues
+    fold) DEFERRED (low-value/high-churn) — issue kept open via Refs.
+  - **File(s)**: pkg/config/compiler_security.go,
+    pkg/config/compiler_policy_match_ssot_4121_test.go (new),
+    docs/config-schema.md
+  - **Validation**: `go test ./pkg/config/...` green; `go build ./...` OK;
+    gofmt + go vet clean.
+
 ## 2026-07-04 — #4116: VRRP address owner (priority 255) always preempts (fable-163 F22)
 
 - **Timestamp**: 2026-07-04
