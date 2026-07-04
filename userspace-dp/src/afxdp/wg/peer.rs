@@ -15,9 +15,10 @@
 //! tied to the snapshot.
 
 use super::session::{SessionRole, WgSession};
+use super::tai64n::TAI64N_LEN;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Immutable per-snapshot peer config tuple (#2836).
 ///
@@ -172,6 +173,24 @@ pub(crate) struct Peer {
     /// that first inbound record can be decrypted and trigger the
     /// promotion.
     pub(crate) next: RwLock<Option<Arc<WgSession>>>,
+    /// #4092 responder handshake anti-replay: the greatest TAI64N
+    /// timestamp this peer has presented in an accepted type-1
+    /// initiation. A received initiation whose recovered TAI64N is
+    /// `<=` this value is a replay (or a reorder) and MUST be rejected
+    /// — the WireGuard handshake anti-replay rule (whitepaper §5.1;
+    /// kernel `wg_noise_handshake_consume_initiation`'s
+    /// `memcmp(timestamp, last_timestamp) > 0` gate; wireguard-go's
+    /// `t.After(handshake.lastTimestamp)`). TAI64N is big-endian, so a
+    /// lexicographic `[u8; 12]` comparison equals the numeric one.
+    /// Initialised to all-zeros ("no initiation accepted"); a valid
+    /// TAI64N always carries the `2^62` epoch base, so the first real
+    /// initiation is strictly greater. Slow control-thread path only
+    /// (never per-packet), so a `Mutex` is fine. Peer-resident, so it
+    /// survives config commits (same pubkey → same `Arc<Peer>`); an
+    /// engine rebuild on a crypto-identity change resets it — the
+    /// WG-spec-permitted bounded reset (see `tai64n.rs` cross-restart
+    /// note).
+    pub(crate) greatest_tai64n: Mutex<[u8; TAI64N_LEN]>,
 }
 
 impl std::fmt::Debug for Peer {
@@ -199,6 +218,28 @@ impl Peer {
             current: RwLock::new(None),
             previous: RwLock::new(None),
             next: RwLock::new(None),
+            greatest_tai64n: Mutex::new([0u8; TAI64N_LEN]),
+        }
+    }
+
+    /// #4092 responder handshake anti-replay check-and-update. Given the
+    /// TAI64N recovered from a received type-1 initiation, accept it iff
+    /// it is STRICTLY greater than the greatest already accepted from
+    /// this peer, advancing the high-water on accept. Returns `true` =
+    /// fresh (accept the initiation), `false` = replay/reorder (drop it).
+    ///
+    /// The check and the update are done under one lock so two concurrent
+    /// initiations from the same peer cannot both pass with the same (or
+    /// a stale) timestamp. Big-endian TAI64N ⇒ `[u8; 12]` lexicographic
+    /// order equals numeric order.
+    #[inline]
+    pub(crate) fn check_and_update_tai64n(&self, ts: &[u8; TAI64N_LEN]) -> bool {
+        let mut hw = self.greatest_tai64n.lock().unwrap();
+        if *ts > *hw {
+            *hw = *ts;
+            true
+        } else {
+            false
         }
     }
 

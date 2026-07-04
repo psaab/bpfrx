@@ -1975,6 +1975,9 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         hs_rx_drops_unknown_peer: 8,
         hs_rx_drops_stale_response: 9,
         hs_rx_drops_index_exhausted: 10,
+        // #4092 handshake anti-replay rejects (off-ladder value; every
+        // field must be nonzero for the wire-invariant populated pin).
+        hs_rx_drops_replayed_init: 45,
         hs_rx_cookie_unsupported: 11,
         rx_unknown_type: 12,
         hs_send_errors: 13,

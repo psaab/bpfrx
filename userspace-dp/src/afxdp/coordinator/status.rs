@@ -906,6 +906,7 @@ impl super::Coordinator {
                 hs_rx_drops_unknown_peer: c.hs_rx_drops_unknown_peer.load(Ordering::Relaxed),
                 hs_rx_drops_stale_response: c.hs_rx_drops_stale_response.load(Ordering::Relaxed),
                 hs_rx_drops_index_exhausted: c.hs_rx_drops_index_exhausted.load(Ordering::Relaxed),
+                hs_rx_drops_replayed_init: c.hs_rx_drops_replayed_init.load(Ordering::Relaxed),
                 hs_rx_cookie_unsupported: c.hs_rx_cookie_unsupported.load(Ordering::Relaxed),
                 rx_unknown_type: c.rx_unknown_type.load(Ordering::Relaxed),
                 hs_send_errors: c.hs_send_errors.load(Ordering::Relaxed),

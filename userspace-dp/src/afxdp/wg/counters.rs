@@ -25,11 +25,12 @@
 //! sites stay one-liners and a future error-variant addition fails
 //! compilation here rather than silently going uncounted.
 //!
-//! Reserved reason names with NO increment site today (do not invent
-//! counters for them): TAI64N-replay rejects and under-load rate-limit
-//! rejects — S1 explicitly defers per-peer TAI64N anti-replay and
-//! cookie/MAC2 (S7) to responder hardening (handshake_session.rs,
-//! "does not yet enforce per-peer TAI64N anti-replay").
+//! Per-peer TAI64N anti-replay rejects ARE counted now
+//! (`hs_rx_drops_replayed_init`, #4092 — the responder rejects an
+//! initiation whose TAI64N is `<=` the greatest already accepted from
+//! that peer). Still reserved with NO increment site today (do not
+//! invent counters for them): under-load rate-limit rejects and
+//! cookie/MAC2 (S7), deferred to the remaining responder hardening.
 
 use super::engine::{DecapError, EncapError};
 use super::handshake::FramingError;
@@ -60,6 +61,12 @@ pub(crate) struct WgCounters {
     pub(crate) hs_rx_drops_unknown_peer: AtomicU64,
     pub(crate) hs_rx_drops_stale_response: AtomicU64,
     pub(crate) hs_rx_drops_index_exhausted: AtomicU64,
+    /// #4092 responder handshake anti-replay rejects: a type-1
+    /// initiation whose recovered TAI64N was `<=` the greatest already
+    /// accepted from that peer (a replay or a reorder). Distinct from
+    /// the transport-record `decap_drops_replay` window; this is the
+    /// HANDSHAKE anti-replay gate.
+    pub(crate) hs_rx_drops_replayed_init: AtomicU64,
     /// Type-3 (cookie) datagrams — S7 placeholder, dropped today.
     pub(crate) hs_rx_cookie_unsupported: AtomicU64,
     /// Type byte ∉ {1,2,3,4}. Zero-length UDP datagrams never reach
@@ -234,6 +241,7 @@ impl WgCounters {
                 &self.hs_rx_drops_stale_response
             }
             HandshakeError::IndexExhausted => &self.hs_rx_drops_index_exhausted,
+            HandshakeError::ReplayedInitiation => &self.hs_rx_drops_replayed_init,
         };
         Self::bump(c);
         e

@@ -733,6 +733,11 @@ pub(crate) struct WgTunnelStatus {
     pub hs_rx_drops_stale_response: u64,
     #[serde(rename = "hs_rx_drops_index_exhausted", default)]
     pub hs_rx_drops_index_exhausted: u64,
+    /// #4092 responder handshake anti-replay rejects (TAI64N `<=`
+    /// greatest accepted from the peer). Distinct from the transport
+    /// `decap_drops_replay` counter.
+    #[serde(rename = "hs_rx_drops_replayed_init", default)]
+    pub hs_rx_drops_replayed_init: u64,
     #[serde(rename = "hs_rx_cookie_unsupported", default)]
     pub hs_rx_cookie_unsupported: u64,
     #[serde(rename = "rx_unknown_type", default)]
