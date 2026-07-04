@@ -1,3 +1,35 @@
+## 2026-07-03 — #3939: NetFlow v9 / IPFIX protocolIdentifier was 0 for GRE/ESP/AH (parsed protocol NAME, not rec.ProtocolNum) → exported flows misattributed
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-058 (MEDIUM, observability/correctness). The
+    NetFlow v9 / IPFIX exporters set `FlowRecord.Protocol` from
+    `SessionCloseData.Protocol`, which the daemon callbacks filled via
+    `parseProtocol(rec.Protocol)` — a NAME→number table covering only
+    TCP/UDP/ICMP/ICMPv6. GRE (47), ESP (50), AH (51) and every other protocol
+    fell through to 0, so a collector saw those flows as protocol 0 (HOPOPT)
+    and could not distinguish an ESP tunnel from a GRE flow.
+  - **Fix**: source the exported `protocolIdentifier` (IE 4) directly from
+    `EventRecord.ProtocolNum` (the raw numeric IP protocol, 0-255, the
+    dataplane stamps and `pkg/logging/ringbuf.go` decodes verbatim) in BOTH
+    `ExportSessionClose` builders (netflow.go, ipfix.go). Also set
+    `SessionCloseData.Protocol = rec.ProtocolNum` in both daemon callbacks and
+    removed the now-unused `parseProtocol` — this eliminates the lossy value at
+    the root and additionally corrects the non-TCP `flowStartTime` duration
+    heuristic. The rendered protocol NAME (`EventRecord.Protocol`) stays a
+    display-only string for `show` output; only the exported numeric field
+    changed.
+  - **RED-on-revert**: `pkg/flowexport/protocol_num_test.go` encodes GRE/ESP/AH
+    + TCP/UDP/ICMP for both v9 and IPFIX (v4 + v6) and asserts the encoded
+    protocolIdentifier byte equals the numeric protocol; the SessionCloseData
+    carries the pre-fix lossy 0 so reverting the exporter to `evt.Protocol`
+    makes every case encode 0 → RED (verified by temporarily reverting both
+    exporters: v4/ICMP FlowRecord.Protocol=0 want 1). `go test -count=1
+    ./pkg/flowexport/...` green, daemon flowexport tests green, `go build
+    ./...`, gofmt, vet clean. Doc: pkg/flowexport/README.md (#3939 subsection).
+  - **File(s)**: pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go,
+    pkg/daemon/daemon_flowexport.go, pkg/daemon/daemon_flow.go,
+    pkg/flowexport/protocol_num_test.go, pkg/flowexport/README.md, _Log.md
+
 ## 2026-07-03 — #3934: dynamic address-feed fetch had no body-size / entry cap → remote OOM DoS (plaintext-http MITM can amplify)
 
 - **Timestamp**: 2026-07-03
