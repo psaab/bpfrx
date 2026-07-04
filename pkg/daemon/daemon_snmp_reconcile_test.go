@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -124,5 +127,199 @@ func TestApplyConfigLockedReconcilesSNMPBeforeDataplaneAbort(t *testing.T) {
 			"abort: a committed read-write -> read-only downgrade is still " +
 			"serving the stale read-write gate because applyConfigLocked " +
 			"aborted early before reaching the SNMP reconcile")
+	}
+}
+
+// snmpServeRecorder is a snmpServe seam that counts how many times the SNMP
+// UDP listener was (re)started and blocks until its context is cancelled,
+// mirroring the real agent.Start blocking contract so teardownSNMP's wg.Wait
+// joins cleanly. A listener "bounce" (stop+restart) increments the count; an
+// idempotent reconcile must not.
+type snmpServeRecorder struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *snmpServeRecorder) serve(ctx context.Context, _ *snmp.Agent) {
+	r.mu.Lock()
+	r.calls++
+	r.mu.Unlock()
+	<-ctx.Done()
+}
+
+func (r *snmpServeRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// newSNMPReconcileDaemon builds a daemon wired to drive the REAL
+// applyConfigLocked -> reconcileSNMP lifecycle path (#3967) without binding
+// UDP/161 or touching real netlink: the listener runs on the injected serve
+// seam, the link-state monitor on hermetic subscribe/list seams, and the
+// SNMPv3 engineBoots file on a temp path. snmpBootReady=true simulates the
+// post-boot state in which day-2 commits own the SNMP lifecycle.
+func newSNMPReconcileDaemon(t *testing.T, serve func(context.Context, *snmp.Agent)) *Daemon {
+	t.Helper()
+	installFakeNetworkctl(t)
+	d := &Daemon{
+		applySem:      semaphore.NewWeighted(1),
+		dp:            &runtimeOnlyApplyTestDP{},
+		vrrpMgr:       vrrp.NewManager(),
+		store:         newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		opts:          Options{NoDataplane: true},
+		daemonCtx:     context.Background(),
+		snmpBootReady: true,
+		snmpServe:     serve,
+		snmpBootsPath: filepath.Join(t.TempDir(), "engineboots"),
+		// Keep the link-state monitor hermetic: return an established
+		// subscription that streams nothing and exits on ctx cancel, and an
+		// empty link list for the boot seed.
+		linkStateSubscribe: func(_ chan<- netlink.LinkUpdate, done <-chan struct{}, _ func(error)) error {
+			go func() { <-done }()
+			return nil
+		},
+		linkStateList: func() ([]netlink.Link, error) { return nil, nil },
+	}
+	t.Cleanup(d.teardownSNMP)
+	return d
+}
+
+// snmpEnabledConfig is a minimal SNMP-enabled config (one read-only community).
+func snmpEnabledConfig() *config.Config {
+	return &config.Config{
+		System: config.SystemConfig{
+			SNMP: &config.SNMPConfig{
+				Communities: map[string]*config.SNMPCommunity{
+					"public": {Name: "public", Authorization: "read-only"},
+				},
+			},
+		},
+	}
+}
+
+// snmpEnabledWithTrapConfig adds a trap group to snmpEnabledConfig so a day-2
+// commit that introduces trap targets must bring up the link-state monitor.
+func snmpEnabledWithTrapConfig() *config.Config {
+	return &config.Config{
+		System: config.SystemConfig{
+			SNMP: &config.SNMPConfig{
+				Communities: map[string]*config.SNMPCommunity{
+					"public": {Name: "public", Authorization: "read-only"},
+				},
+				TrapGroups: map[string]*config.SNMPTrapGroup{
+					"managers": {Name: "managers", Targets: []string{"192.0.2.1"}, Version: "v2"},
+				},
+			},
+		},
+	}
+}
+
+// TestApplyConfigLockedStartsSNMPWhenEnabledDay2 is the #3967 RED-on-revert
+// test for the primary defect: enabling SNMP on a running daemon must start the
+// agent listener via the apply path, not sit inert until a restart. It drives
+// the REAL applyConfigLocked so it fails if reconcileSNMP's start wiring is
+// removed from the apply body.
+//
+// Mutation check: delete the d.reconcileSNMP(cfg) call from applyConfigLocked
+// (or revert its start branch) and this test fails — d.snmpAgent stays nil and
+// the listener never starts after a day-2 enable.
+func TestApplyConfigLockedStartsSNMPWhenEnabledDay2(t *testing.T) {
+	rec := &snmpServeRecorder{}
+	d := newSNMPReconcileDaemon(t, rec.serve)
+
+	if d.snmpAgent != nil {
+		t.Fatal("precondition: no SNMP agent should be running before the enable commit")
+	}
+
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(enable): %v", err)
+	}
+
+	if d.snmpAgent == nil {
+		t.Fatal("day-2 SNMP enable was NOT reconciled into the running subsystem: " +
+			"the agent is still nil after the commit (inert until restart)")
+	}
+	if !waitUntil(t, time.Second, func() bool { return rec.count() == 1 }) {
+		t.Fatalf("SNMP listener did not start on a day-2 enable: serve invocations = %d, want 1", rec.count())
+	}
+}
+
+// TestApplyConfigLockedStopsSNMPWhenDisabledDay2 proves the enable->disable
+// half: a commit that removes SNMP stops the running listener rather than
+// leaving it bound until a restart.
+func TestApplyConfigLockedStopsSNMPWhenDisabledDay2(t *testing.T) {
+	rec := &snmpServeRecorder{}
+	d := newSNMPReconcileDaemon(t, rec.serve)
+
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(enable): %v", err)
+	}
+	if d.snmpAgent == nil {
+		t.Fatal("precondition: agent should be running after the enable commit")
+	}
+
+	if err := d.applyConfigLocked(context.Background(), snmpDowngradeDisabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(disable): %v", err)
+	}
+	if d.snmpAgent != nil {
+		t.Fatal("day-2 SNMP disable was NOT reconciled: the agent is still running after the commit")
+	}
+}
+
+// snmpDowngradeDisabledConfig is an SNMP-absent config (the disable target).
+func snmpDowngradeDisabledConfig() *config.Config { return &config.Config{} }
+
+// TestReconcileSNMPUnchangedIsNoOp proves idempotence: re-committing an
+// identical SNMP stanza must NOT bounce the UDP listener — the serve seam is
+// invoked exactly once across two identical enable commits and the agent
+// pointer is preserved.
+func TestReconcileSNMPUnchangedIsNoOp(t *testing.T) {
+	rec := &snmpServeRecorder{}
+	d := newSNMPReconcileDaemon(t, rec.serve)
+
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(enable #1): %v", err)
+	}
+	if !waitUntil(t, time.Second, func() bool { return rec.count() == 1 }) {
+		t.Fatalf("listener not started on first enable: serve = %d", rec.count())
+	}
+	first := d.snmpAgent
+
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(enable #2, unchanged): %v", err)
+	}
+	if got := rec.count(); got != 1 {
+		t.Fatalf("unchanged SNMP commit bounced the listener: serve invocations = %d, want 1", got)
+	}
+	if d.snmpAgent != first {
+		t.Fatal("unchanged SNMP commit replaced the running agent (listener bounce)")
+	}
+}
+
+// TestReconcileSNMPStartsMonitorOnTrapGroupAddedDay2 proves the trap-group half
+// of the defect: an agent already running WITHOUT trap groups must bring up the
+// link-state trap monitor when a commit adds a trap group — without bouncing
+// the UDP listener.
+func TestReconcileSNMPStartsMonitorOnTrapGroupAddedDay2(t *testing.T) {
+	rec := &snmpServeRecorder{}
+	d := newSNMPReconcileDaemon(t, rec.serve)
+
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(enable, no trap groups): %v", err)
+	}
+	if d.snmpMonitorRunning {
+		t.Fatal("precondition: link-state monitor should not run without trap groups")
+	}
+
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledWithTrapConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(add trap group): %v", err)
+	}
+	if !d.snmpMonitorRunning {
+		t.Fatal("adding a trap group day-2 did NOT start the SNMP link-state monitor " +
+			"(link traps would never flow to the new target until a restart)")
+	}
+	if got := rec.count(); got != 1 {
+		t.Fatalf("adding a trap group bounced the UDP listener: serve invocations = %d, want 1", got)
 	}
 }
