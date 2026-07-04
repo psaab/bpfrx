@@ -1,3 +1,42 @@
+## 2026-07-03 — #3920: RETH member left DOWN after rename — renameRethMember downs the member for the rename but never brings it UP, and programRethMAC early-returns (no UP) on MAC-match → RG demote/blackhole
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-057 (MEDIUM, HA — data-link-down
+    blackhole). `renameRethMember` (`pkg/daemon/daemon_reth.go`) brings a
+    RETH member DOWN to rename it (kernel requires the link be down to
+    rename) but never brought it back UP. It relied on the caller's next
+    step, `programRethMAC` (`daemon_apply.go:936`), for the UP — but
+    `programRethMAC` early-returns with no UP when the virtual MAC already
+    matches. That MAC-match no-op is the *common* path here:
+    `renameRethMember` finds the interface by matching that same virtual
+    MAC, so on a just-renamed member the MAC always already matches and
+    `programRethMAC` always no-ops → the member is left administratively
+    DOWN → interface track detects link-down → redundancy group demotes →
+    blackhole. Secondary facet: even the MAC-change fast path in
+    `programRethMAC` sets the MAC while the link is still DOWN (from the
+    rename), which succeeds without a cycle and returns without an UP.
+  - **Fix (option a)**: the function that downs the link owns bringing it
+    back up. `renameRethMember` now brings the member UP after a successful
+    rename (and best-effort UP on a failed rename, since it had already
+    downed the link). No flap: whenever a rename happens the MAC already
+    matches so `programRethMAC` no-ops, leaving the rename's UP as the final
+    state; even if `programRethMAC` did cycle, the member still ends UP.
+    Both functions now route netlink through a small `rethLinkOps` seam
+    (`rethLinkOpsFn`) so the admin link state is unit-testable without a
+    real netlink socket.
+  - **Test**: `pkg/daemon/daemon_reth_rename_up_test.go` —
+    `TestRenameRethMemberBringsLinkUpWhenMACMatches` (RED-on-revert:
+    removing the post-rename UP leaves the member DOWN → fails with the
+    blackhole message), `TestRenameRethMemberUpOnFailedRename`,
+    `TestProgramRethMACCyclePathEndsUp` (MAC-changing cycle still ends UP),
+    `TestProgramRethMACLiveChangeNoCycle`. RED-on-revert proven; all pass;
+    `go test ./pkg/daemon/` green; `go build ./...`, `go vet`, gofmt clean.
+    test-failover WARRANTED (HA RETH member link → RG demote) — batch with
+    the other HA-Medium fixes under the force-node0-primary gate.
+  - **File(s)**: `pkg/daemon/daemon_reth.go`,
+    `pkg/daemon/daemon_reth_rename_up_test.go`, `docs/reth-mac.md`,
+    `_Log.md`.
+
 ## 2026-07-03 — #3912: cluster-sync bulk-ack TOCTOU — pendingBulkAckEpoch stored AFTER BulkEnd write → early ack latches a phantom pending epoch that blocks manual failover
 
 - **Timestamp**: 2026-07-03
