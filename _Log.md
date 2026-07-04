@@ -29235,3 +29235,15 @@ top.
   leaf, no schema change needed).
 - **File(s)**: pkg/config/compiler_routing.go,
   pkg/config/compiler_routing_instance_interface_3904_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3915 (F-158) — compileNAT accumulates ALL duplicate NAT
+  sub-blocks. Each source/destination/static/nat64/natv6v4/proxy-arp block
+  under a `nat {}` node was read FindChild-first, so a `load override`/`merge`
+  second block (e.g. a 2nd `source {}` with extra rule-sets) was SILENTLY
+  DROPPED -> SNAT/DNAT vanished, traffic egressed untranslated. Converted all
+  six sub-block reads to iterate via forEachChild; sub-block compilers already
+  append rule-sets + map-assign pools, so per-block invocation merges (Junos
+  semantics), single-block bit-identical. natv6v4 inits struct once + ORs flag.
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_nat_dup_subblock_3915_test.go, docs/config-schema.md
