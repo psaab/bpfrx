@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -311,39 +312,88 @@ var fabricAllowedStreamMethods = map[string]bool{
 	pb.BpfrxService_MonitorInterface_FullMethodName: true,
 }
 
-// isFabricSafeSystemAction reports whether a SystemAction request carries one of
-// the two cross-node cluster-failover actions the peer legitimately proxies over
-// the fabric (proxyPeerSystemAction call sites in server_diag.go):
+// parseProxiedFailoverAction is the single source of truth for what a
+// well-formed, peer-proxied cross-node cluster-failover SystemAction looks like.
+// It parses the two — and only two — request-action forms that a node
+// legitimately proxies to its peer over the fabric (the proxyPeerSystemAction
+// call sites in server_diag.go):
 //
-//	"cluster-failover-data:node<N>"        — request chassis cluster failover ... node <N>
-//	"cluster-failover:<rgID>:node<N>"      — request chassis cluster failover redundancy-group <rg> node <N>
+//	"cluster-failover-data:node<N>"    -> (rgID=-1, nodeID=N, ok)  [all data RGs]
+//	"cluster-failover:<rgID>:node<N>"  -> (rgID, nodeID=N, ok)
+//
+// It returns ok=false — fail-closed — for any other action, a missing/empty
+// node target, a non-numeric rgID or nodeID, a trailing garbage suffix
+// (e.g. "cluster-failover:1:node1:node2"), or a nodeID outside the supported
+// cluster range (IsSupportedClusterNodeID == 0/1). The parse mirrors the
+// handler's own strconv.Atoi + IsSupportedClusterNodeID validation
+// (server_diag.go) so the fabric interceptor gate and the handler agree on
+// which failover actions are valid.
+//
+// Why the range check matters on the interceptor: the handler proxy-dials the
+// peer whenever targetNode != local BEFORE rejecting an out-of-range/garbage
+// node as forwarded-not-local / InvalidArgument. A loose HasPrefix/Contains
+// gate would let a malformed action (e.g. "cluster-failover:1:node99") reach
+// that outbound-dial path, letting an unauthenticated fabric client drive
+// avoidable proxy dials + connection churn. Strict parsing here denies the
+// malformed action at the interceptor (PermissionDenied) so it never reaches
+// the handler.
+func parseProxiedFailoverAction(action string) (rgID, nodeID int, ok bool) {
+	const dataPrefix = "cluster-failover-data:node"
+	if strings.HasPrefix(action, dataPrefix) {
+		n, err := strconv.Atoi(strings.TrimPrefix(action, dataPrefix))
+		if err != nil || !cluster.IsSupportedClusterNodeID(n) {
+			return 0, 0, false
+		}
+		return -1, n, true
+	}
+	const rgPrefix = "cluster-failover:"
+	if strings.HasPrefix(action, rgPrefix) {
+		rest := strings.TrimPrefix(action, rgPrefix)
+		idx := strings.Index(rest, ":node")
+		if idx < 0 {
+			// No node target: this is the local-only failover form, never
+			// proxied over the fabric.
+			return 0, 0, false
+		}
+		rg, err := strconv.Atoi(rest[:idx])
+		if err != nil {
+			return 0, 0, false
+		}
+		n, err := strconv.Atoi(rest[idx+len(":node"):])
+		if err != nil || !cluster.IsSupportedClusterNodeID(n) {
+			return 0, 0, false
+		}
+		return rg, n, true
+	}
+	return 0, 0, false
+}
+
+// isFabricSafeSystemAction reports whether a SystemAction request carries a
+// well-formed cross-node cluster-failover action the peer legitimately proxies
+// over the fabric — delegating the strict parse to parseProxiedFailoverAction.
 //
 // These re-balance redundancy-group ownership — an operation squarely within the
 // fabric peer's trust boundary (coordinating RG ownership is the fabric's job).
-// Every other action — zeroize, reboot, halt, power-off, and the local-only
-// clear-* / cluster-failover-reset verbs — returns false and is denied on the
-// fabric listener. Node-local execution via the trusted loopback listener is
-// unaffected: an operator SSHed into the target node still runs any action.
+// Every other action — zeroize, reboot, halt, power-off, the local-only
+// clear-* / cluster-failover-reset verbs, and any malformed failover suffix —
+// is denied on the fabric listener. Node-local execution via the trusted
+// loopback listener is unaffected: an operator SSHed into the target node still
+// runs any action.
 //
 // This is the nested-action choice over a blanket SystemAction exclusion:
 // excluding SystemAction entirely would make a cross-node `request chassis
 // cluster failover ... node <peer>` return PermissionDenied when the initiating
 // node proxies it, regressing a shipped HA operator workflow. Allowing ONLY the
-// two failover forms preserves that flow while keeping node-lifecycle actions
-// (zeroize/reboot/...) off the unauthenticated fabric surface.
+// two well-formed failover forms preserves that flow while keeping
+// node-lifecycle actions (zeroize/reboot/...) off the unauthenticated fabric
+// surface.
 func isFabricSafeSystemAction(req interface{}) bool {
 	sa, ok := req.(*pb.SystemActionRequest)
 	if !ok {
 		return false
 	}
-	action := sa.GetAction()
-	if strings.HasPrefix(action, "cluster-failover-data:node") {
-		return true
-	}
-	if strings.HasPrefix(action, "cluster-failover:") && strings.Contains(action, ":node") {
-		return true
-	}
-	return false
+	_, _, ok = parseProxiedFailoverAction(sa.GetAction())
+	return ok
 }
 
 // fabricAllowlistUnaryInterceptor fail-closes unary RPCs on the cluster fabric

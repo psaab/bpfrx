@@ -97,6 +97,19 @@ func TestFabricAllowlistUnary_SystemActionNestedGate(t *testing.T) {
 		"clear-config-lock",
 		"cluster-failover-reset:1", // local-only, never proxied
 		"cluster-failover:1",       // no node suffix -> local-only, never proxied
+		// Malformed / out-of-range failover suffixes must be denied AT THE
+		// INTERCEPTOR so they never reach the handler's outbound proxy-dial
+		// path (an unauth fabric client could otherwise drive avoidable proxy
+		// dials / connection churn to arbitrary node IDs). RED-on-revert: the
+		// loose HasPrefix/Contains gate admitted all of these.
+		"cluster-failover:1:node99",      // node out of supported range (0/1)
+		"cluster-failover-data:node99",   // node out of supported range
+		"cluster-failover:garbage:node1", // non-numeric rgID
+		"cluster-failover:1:nodeX",       // non-numeric node
+		"cluster-failover-data:nodeX",    // non-numeric node
+		"cluster-failover:1:node1:node2", // trailing garbage suffix
+		"cluster-failover:1:node",        // empty node
+		"cluster-failover-data:node",     // empty node
 	}
 	for _, action := range deniedActions {
 		probe := &unaryCallProbe{}
@@ -137,6 +150,49 @@ func TestFabricAllowlistUnary_SystemActionNestedGate(t *testing.T) {
 	}
 	if probe.called {
 		t.Error("SystemAction with wrong req type: handler was invoked")
+	}
+}
+
+// TestParseProxiedFailoverAction pins the SSOT parse the fabric interceptor
+// shares with the handler: only well-formed cross-node failover forms (valid
+// numeric rgID + in-range node) parse ok; every malformed / out-of-range /
+// non-failover action is fail-closed (ok=false).
+func TestParseProxiedFailoverAction(t *testing.T) {
+	type want struct {
+		rgID, nodeID int
+		ok           bool
+	}
+	cases := map[string]want{
+		// Well-formed.
+		"cluster-failover-data:node0": {-1, 0, true},
+		"cluster-failover-data:node1": {-1, 1, true},
+		"cluster-failover:1:node0":    {1, 0, true},
+		"cluster-failover:2:node1":    {2, 1, true},
+		"cluster-failover:0:node1":    {0, 1, true},
+		// Malformed / out-of-range / non-failover -> fail-closed.
+		"cluster-failover-data:node99":   {0, 0, false},
+		"cluster-failover-data:nodeX":    {0, 0, false},
+		"cluster-failover-data:node":     {0, 0, false},
+		"cluster-failover:1:node99":      {0, 0, false},
+		"cluster-failover:garbage:node1": {0, 0, false},
+		"cluster-failover:1:nodeX":       {0, 0, false},
+		"cluster-failover:1:node1:node2": {0, 0, false},
+		"cluster-failover:1:node":        {0, 0, false},
+		"cluster-failover:1":             {0, 0, false}, // no node -> local-only
+		"cluster-failover-reset:1":       {0, 0, false},
+		"zeroize":                        {0, 0, false},
+		"reboot":                         {0, 0, false},
+		"":                               {0, 0, false},
+	}
+	for action, w := range cases {
+		rg, node, ok := parseProxiedFailoverAction(action)
+		if ok != w.ok {
+			t.Errorf("parseProxiedFailoverAction(%q): ok = %v, want %v", action, ok, w.ok)
+			continue
+		}
+		if ok && (rg != w.rgID || node != w.nodeID) {
+			t.Errorf("parseProxiedFailoverAction(%q): (rg=%d node=%d), want (rg=%d node=%d)", action, rg, node, w.rgID, w.nodeID)
+		}
 	}
 }
 
