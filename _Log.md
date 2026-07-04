@@ -1,3 +1,41 @@
+## 2026-07-03 — #3962: buildScreenSnapshots ranged the zones map in nondeterministic order → wire byte order varied per build → snapshotContentHash dedup missed → dataplane re-applied the screen config on every reconcile
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-074 (MEDIUM, perf/churn). Both
+    `buildScreenSnapshots` and its sibling `buildScreenMissingProfileRefs`
+    (`pkg/dataplane/userspace/screens.go`) ranged the
+    `cfg.Security.Zones` map (`map[string]*ZoneConfig`) directly and
+    appended each row to a slice. Go map iteration order is randomized per
+    run, so the serialized `Screens` / `ScreenMissingProfiles` byte order
+    varied build-to-build even for an UNCHANGED config. That shifted
+    `snapshotContentHash` (`builder.go`) every build, the reconcile's
+    duplicate-publish dedup never matched, and the dataplane re-applied the
+    whole screen config on every reconcile (needless control-socket +
+    dataplane work; a screen re-apply can re-arm SYN-cookie state).
+  - **Fix**: both builders now collect the zone names, `sort.Strings` them,
+    and range in sorted-by-name order (the wire key == the map key) so the
+    serialized bytes are stable and the content hash matches → the reconcile
+    skips an unchanged screen snapshot. Matches the long-standing sorted
+    pattern in `buildZoneSnapshots` / `buildSYNCookieMasterKey`.
+  - **Audit**: swept the sibling snapshot builders. `buildZoneSnapshots`
+    and every zone-host-inbound builder (`zones.go`) already sort;
+    `buildSYNCookieMasterKey` sorts its hash input; the NAT / static-NAT /
+    NAT64 / tunnel / neighbor builders range config SLICES (already
+    ordered). The two screen builders were the only map-range-into-wire
+    nondeterminism feeding the content hash.
+  - **Test**: `TestBuildScreenSnapshotsDeterministicOrder`
+    (`manager_test.go`) builds a 10-zone config 64× and asserts the
+    marshaled `Screens` bytes + sha256 are identical every build (and the
+    output is sorted ascending), plus the same 64× byte-stability assertion
+    on `buildScreenMissingProfileRefs`. RED-on-revert verified: restoring
+    the bare `range cfg.Security.Zones` fails the test
+    (`snapshots not sorted by zone: "voice" before "video"`).
+  - **Validation**: `go test ./pkg/dataplane/...` green; `go build ./...`
+    green; `gofmt -l` clean; `go vet ./pkg/dataplane/userspace/` clean.
+  - **File(s)**: `pkg/dataplane/userspace/screens.go`,
+    `pkg/dataplane/userspace/manager_test.go`,
+    `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
 ## 2026-07-03 — #3958: ValidateConfig warn pass emitted false "not in address-book" warnings for literal / any-ipv4 / any-ipv6 / dynamic-address-feed policy references → alarm fatigue
 
 - **Timestamp**: 2026-07-03
