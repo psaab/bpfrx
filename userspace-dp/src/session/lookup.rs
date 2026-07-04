@@ -14,6 +14,26 @@
 
 use super::*;
 
+/// #4109: the TCP close / handshake-promotion state a `lookup_with_origin`
+/// mutation must mirror onto the matched entry's forward↔reverse companion.
+/// Captured inside the `&mut self.entries` borrow (which pins the matched
+/// entry) and applied via `propagate_tcp_state_to_companion` after that borrow
+/// ends, since touching the companion needs a fresh `&mut self` probe.
+struct TcpStatePropagation {
+    /// The matched entry's own NAT decision — feeds `reverse_session_key` to
+    /// recover the companion's key from the matched canonical key.
+    nat: NatDecision,
+    /// A FIN/RST advanced the matched entry into the close window (F17): stamp
+    /// the same close/reset onto the companion and pull it onto the short
+    /// window so both halves reap together.
+    close: bool,
+    /// The close carried RST (short 2s window), not a graceful FIN.
+    reset: bool,
+    /// A reverse SYN-ACK promoted the matched (reverse) entry (F16): promote the
+    /// forward companion too, so ESTABLISHED requires real handshake evidence.
+    established: bool,
+}
+
 impl SessionTable {
     pub fn lookup(
         &mut self,
@@ -57,7 +77,7 @@ impl SessionTable {
         // touch self.wheel via push_to_wheel. Without this scoping
         // the &mut record would conflict with the second &mut self
         // via self.wheel.
-        let (result, actual_key) = {
+        let (result, actual_key, propagate) = {
             let record = self.entries.get_mut(handle as usize)?;
             // #964 Step 1: path-specific validation defends against
             // a stale secondary index pointing at a slab slot that
@@ -75,8 +95,10 @@ impl SessionTable {
                     return None;
                 }
             }
+            let is_tcp = matches!(key.protocol, PROTO_TCP);
             let entry = &mut record.entry;
-            if matches!(key.protocol, PROTO_TCP) && is_closing(tcp_flags) {
+            let do_close = is_tcp && is_closing(tcp_flags);
+            if do_close {
                 if !entry.closing {
                     debug_log!(
                         "SESS_CLOSING: {} proto=TCP {}:{} -> {}:{} rev={} tcp_flags=0x{:02x}",
@@ -99,18 +121,23 @@ impl SessionTable {
                 // the entry back to the 30s graceful-FIN close window.
                 entry.reset |= has_rst(tcp_flags);
             }
-            // #3152: promote OPENING -> ESTABLISHED on the first ACK-bearing
-            // segment after the opening SYN. The reverse SYN-ACK and the
-            // forward handshake-completing ACK both carry ACK, so a completed
-            // three-way handshake promotes the session to the established idle
-            // window; a bare SYN that never gets a reply never produces such a
-            // segment and reaps at the short `tcp_opening_ns`. Sticky — once
-            // established a later segment never demotes back to OPENING.
-            if matches!(key.protocol, PROTO_TCP) && has_ack(tcp_flags) {
+            // #3152/#4109: promote OPENING -> ESTABLISHED only on real handshake
+            // evidence. Forward and reverse are two independent entries; the
+            // server's SYN-ACK is an ACK-bearing segment on the REVERSE half, so
+            // ONLY an ACK on the reverse entry (`is_reverse`) promotes — and it
+            // promotes both this reverse entry and its forward companion (after
+            // the borrow ends, below). A client-only forward ACK never promotes
+            // a half-open session: before #4109 it did, so a bare SYN + a bare
+            // ACK pinned a 300s established entry with no peer replying, turning
+            // the #3152 half-open reap into a 2-packet bypass. Sticky — an
+            // already-established entry (e.g. a mid-stream pickup seeded
+            // ESTABLISHED at install) is never demoted.
+            let promote_from_reverse = is_tcp && has_ack(tcp_flags) && entry.metadata.is_reverse;
+            if promote_from_reverse {
                 entry.established = true;
             }
             entry.last_seen_ns = now_ns;
-            entry.expires_after_ns = if matches!(key.protocol, PROTO_TCP) && entry.closing {
+            entry.expires_after_ns = if is_tcp && entry.closing {
                 if entry.reset {
                     TCP_RST_TIMEOUT_NS
                 } else {
@@ -132,6 +159,12 @@ impl SessionTable {
                     opening_override_ns,
                 )
             };
+            let propagate = TcpStatePropagation {
+                nat: entry.decision.nat,
+                close: do_close,
+                reset: is_tcp && has_rst(tcp_flags),
+                established: promote_from_reverse,
+            };
             (
                 (
                     SessionLookup {
@@ -141,8 +174,25 @@ impl SessionTable {
                     entry.origin,
                 ),
                 record.key.clone(),
+                propagate,
             )
         }; // <-- &mut self.entries borrow ends here
+        // #4109: mirror the close (F17) / handshake promotion (F16) onto the
+        // forward↔reverse companion now that the matched entry's &mut borrow has
+        // ended (touching the companion needs a fresh &mut self probe). Resolved
+        // from the matched CANONICAL key (`actual_key`, not the alias lookup
+        // `key`) + its own nat, exactly as `account_packet` hops reverse→forward.
+        // Skipped entirely when there is nothing to propagate.
+        if propagate.close || propagate.established {
+            self.propagate_tcp_state_to_companion(
+                &actual_key,
+                propagate.nat,
+                now_ns,
+                propagate.close,
+                propagate.reset,
+                propagate.established,
+            );
+        }
         // Push the canonical key (NOT the alias lookup `key`) into
         // the wheel. push_to_wheel re-reads the record to compute
         // the throttled target_tick — that matches the model in the

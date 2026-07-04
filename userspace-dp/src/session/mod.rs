@@ -982,6 +982,73 @@ impl SessionTable {
         }
     }
 
+    /// #4109: mirror a TCP close (F17) or handshake promotion (F16) onto the
+    /// matched entry's forward↔reverse companion so both halves of a flow stay
+    /// in sync. Forward and reverse are two independent `SessionEntry`s in this
+    /// same worker-owned table; the read path only ever mutates the ONE entry a
+    /// packet's wire tuple resolves, so without this a unidirectional FIN/RST
+    /// leaves the other half pinned on the full established idle window (F17),
+    /// and a bare-SYN half-open flow could be pushed to ESTABLISHED by a
+    /// client-only ACK with no server reply (F16).
+    ///
+    /// The companion key is recovered exactly as `account_packet` hops
+    /// reverse→forward: `reverse_session_key` on the matched entry's OWN
+    /// canonical key + its own `nat` yields the other half's key (the transform
+    /// is its own inverse given the reversed decision, so it works from either
+    /// direction). `matched_key` MUST be the entry's canonical `record.key`, not
+    /// an alias/translated lookup key.
+    ///
+    /// A missing companion (e.g. a `FabricRedirect` flow with no local reverse
+    /// entry, or a half already independently reaped) is a no-op — the same
+    /// fail-open posture as `account_packet`'s reverse hop.
+    pub(in crate::session) fn propagate_tcp_state_to_companion(
+        &mut self,
+        matched_key: &SessionKey,
+        matched_nat: NatDecision,
+        now_ns: u64,
+        close: bool,
+        reset: bool,
+        established: bool,
+    ) {
+        let companion_key = reverse_session_key(matched_key, matched_nat);
+        let mut shortened = false;
+        if let Some(entry) = self.entry_by_key_mut(&companion_key) {
+            if established {
+                // F16: a real reverse SYN-ACK promoted the matched (reverse)
+                // half — promote the forward companion too. Sticky and flag-only:
+                // the companion's own next segment (the handshake-completing
+                // forward ACK) re-stamps the established idle window via
+                // `session_timeout_ns(established=true)`. We deliberately do NOT
+                // extend its expiry here so a handshake the client never
+                // completes still reaps on the short opening window.
+                entry.established = true;
+            }
+            if close {
+                // F17: a FIN/RST on one half kills the whole flow. Stamp the
+                // same close/reset state on the companion and pull it onto the
+                // short close window (#3046 2s RST / #3489 30s FIN) so the dead
+                // half reaps with its sibling instead of lingering the full 300s
+                // established window. `reset` is sticky exactly like the matched
+                // entry (a graceful FIN cannot clear an already-observed RST).
+                entry.closing = true;
+                entry.reset |= reset;
+                entry.last_seen_ns = now_ns;
+                entry.expires_after_ns = if entry.reset {
+                    TCP_RST_TIMEOUT_NS
+                } else {
+                    TCP_CLOSING_TIMEOUT_NS
+                };
+                shortened = true;
+            }
+        }
+        if shortened {
+            // The companion's expiry just shortened; re-bucket it in the timer
+            // wheel so the GC checks it at the new (short) close tick rather than
+            // the old established-window tick it was scheduled at.
+            self.push_to_wheel(&companion_key, now_ns);
+        }
+    }
+
     /// #2501: read the four per-direction traffic counters for the session
     /// keyed by `key`, or `None` if no live entry exists. Cold path
     /// (BPF-conntrack-map refresh on the ~1s GC cadence); a single lookup +
@@ -1115,14 +1182,22 @@ impl SessionTable {
             // established window. A plain assignment here let that happen,
             // leaving a FIN'd session lingering 10× too long (#3489).
             record.entry.closing |= matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
-            // #3152: promote OPENING -> ESTABLISHED on the first ACK-bearing
-            // segment after the opening SYN (sticky, mirrors lookup.rs). The
-            // SYN-ACK on the reverse half and the completing ACK on the
-            // forward half both carry ACK; a bare SYN that never gets a reply
-            // never reaches here with an ACK and stays OPENING. Set BEFORE the
-            // timeout selection so an established refresh uses the established
-            // window.
-            record.entry.established |= matches!(protocol, PROTO_TCP) && has_ack(tcp_flags);
+            // #3152/#4109: promote OPENING -> ESTABLISHED only on real
+            // handshake evidence (sticky, mirrors lookup.rs). Only an
+            // ACK-bearing segment on the REVERSE half (the server's SYN-ACK)
+            // promotes; a client-only forward ACK never does. Before #4109 any
+            // ACK promoted here, so a bare SYN + bare ACK could pin a 300s
+            // established entry with no peer ever replying, bypassing the #3152
+            // half-open reap. `metadata` was just assigned onto the record
+            // above, so `metadata.is_reverse` is this entry's direction. Set
+            // BEFORE the timeout selection so an established refresh uses the
+            // established window. (This path's live reach is the one-shot
+            // HA promote of a peer-synced session, which is imported ESTABLISHED
+            // already — see `upsert_synced_with_origin` — so the gate is a
+            // no-op there and only defends a hypothetical OPENING promote; the
+            // cross-companion propagation lives on the read path in lookup.rs.)
+            record.entry.established |=
+                matches!(protocol, PROTO_TCP) && has_ack(tcp_flags) && metadata.is_reverse;
             record.entry.expires_after_ns = if record.entry.closing {
                 if record.entry.reset {
                     TCP_RST_TIMEOUT_NS

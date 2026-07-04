@@ -32378,3 +32378,39 @@ top.
     pkg/config/compiler_ipsec_trafficselector.go, pkg/config/compiler.go,
     pkg/ipsec/trafficselector_render_4098_test.go,
     pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4109 (F16+F17+F15) — TCP state-machine hardening in the
+    userspace-dp conntrack. VERIFY-FIRST confirmed both findings at
+    origin/master. F16 (security/DoS): `lookup.rs` promoted OPENING→ESTABLISHED
+    on ANY ACK-bearing segment (`has_ack`, a pure bit test), so a bare SYN
+    followed by a bare forward ACK — with NO reverse SYN-ACK — pinned a 300 s
+    established entry with no peer replying, a 2-packet bypass of the #3152
+    half-open reap (a real vSRX syn-check does not establish on a client ACK
+    preceding the server SYN-ACK). FIX: promote ONLY on an ACK on the REVERSE
+    companion (`metadata.is_reverse`) — the server's SYN-ACK — and promote BOTH
+    halves; a client-only forward ACK never promotes. F17 (correctness/DoS): a
+    unidirectional FIN/RST advanced only the entry it hit into the short close
+    window; the sibling companion (a separate `SessionEntry`) kept the 300 s
+    established timeout, so #3046's 2 s reset-reap was ~50% effective. FIX: new
+    `SessionTable::propagate_tcp_state_to_companion` (recovers the companion via
+    `reverse_session_key(matched.key, matched.nat)`, exactly as `account_packet`
+    hops reverse→forward) stamps `closing`/`reset` onto the companion, pulls it
+    onto the 2 s RST / 30 s FIN window, and re-buckets it in the timer wheel so
+    both halves reap together. Gated behind close-or-reverse-promote (a plain
+    data-ACK pays no extra probe); missing companion (FabricRedirect / already
+    reaped) is a no-op. `update_session` (HA-promote mirror) gets the F16
+    `is_reverse` gate only (synced sessions import ESTABLISHED, so it's a no-op
+    there; cross-companion close on a cluster rides the peer's Close-delta).
+    install.rs seed unchanged (bare-SYN → OPENING). F15: added RED-on-revert
+    tests (v4+v6): forward-ACK-without-SYN-ACK stays OPENING + reaps both at 20 s;
+    unidirectional RST reaps both companions at 2 s; unidirectional FIN reaps
+    both at 30 s; negative controls (normal SYN→SYN-ACK→ACK promotes; established
+    flow's forward ACK unaffected). Rewrote the existing single-key
+    `tcp_handshake_promotes_opening_to_established` onto the two-entry model. FULL
+    cargo test --release (single-threaded) green; go build ./... green.
+    FLAG: companion propagation touches the HA-synced session path (a synced
+    session's local companion) → test-failover recommended before merge.
+  - **File(s)**: userspace-dp/src/session/lookup.rs,
+    userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+    userspace-dp/src/session/README.md, _Log.md
