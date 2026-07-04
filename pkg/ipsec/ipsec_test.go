@@ -1015,6 +1015,85 @@ func TestGenerateConfig_DPDModes(t *testing.T) {
 	}
 }
 
+// TestGenerateConfig_DPDBareAndTuningForms compiles a full tunnel from flat-set
+// commands and renders the swanctl config, asserting the DPD stanza forms flow
+// end-to-end (#3994). It builds the config through the real compile path (no
+// hand-set DeadPeerDetect/DPDEnable), so it goes RED on revert of the parse +
+// deriveDPD fix: a bare `dead-peer-detection` would compile to a disabled DPD
+// and the rendered config would lack dpd_delay.
+func TestGenerateConfig_DPDBareAndTuningForms(t *testing.T) {
+	compileFromSet := func(t *testing.T, cmds []string) *config.IPsecConfig {
+		t.Helper()
+		tree := &config.ConfigTree{}
+		for _, cmd := range cmds {
+			path, err := config.ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%v): %v", path, err)
+			}
+		}
+		cfg, err := config.CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		return &cfg.Security.IPsec
+	}
+
+	base := []string{
+		`set security ike proposal ike-p1 authentication-method pre-shared-keys`,
+		`set security ike proposal ike-p1 dh-group group14`,
+		`set security ike proposal ike-p1 encryption-algorithm aes-256-cbc`,
+		`set security ike policy pol1 mode main`,
+		`set security ike policy pol1 proposals ike-p1`,
+		`set security ike policy pol1 pre-shared-key ascii-text mysecret`,
+		`set security ike gateway gw1 ike-policy pol1`,
+		`set security ike gateway gw1 address 203.0.113.1`,
+		`set security ipsec proposal esp-p2 protocol esp`,
+		`set security ipsec proposal esp-p2 encryption-algorithm aes-256-cbc`,
+		`set security ipsec proposal esp-p2 authentication-algorithm hmac-sha-256-128`,
+		`set security ipsec policy ipsec-pol proposals esp-p2`,
+		`set security ipsec vpn tun1 bind-interface st0.0`,
+		`set security ipsec vpn tun1 ike gateway gw1`,
+		`set security ipsec vpn tun1 ike ipsec-policy ipsec-pol`,
+	}
+	with := func(extra ...string) []string {
+		return append(append([]string{}, base...), extra...)
+	}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+
+	t.Run("bare enables DPD with defaults", func(t *testing.T) {
+		out := m.generateConfig(compileFromSet(t, with(`set security ike gateway gw1 dead-peer-detection`)))
+		for _, want := range []string{"dpd_delay = 10s", "dpd_timeout = 50s", "dpd_action = clear"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("bare dead-peer-detection did not enable DPD (missing %q):\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("interval-only tunes delay", func(t *testing.T) {
+		out := m.generateConfig(compileFromSet(t, with(`set security ike gateway gw1 dead-peer-detection interval 20`)))
+		if !strings.Contains(out, "dpd_delay = 20s") {
+			t.Fatalf("interval-only DPD: want dpd_delay = 20s:\n%s", out)
+		}
+	})
+
+	t.Run("always-send maps to restart", func(t *testing.T) {
+		out := m.generateConfig(compileFromSet(t, with(`set security ike gateway gw1 dead-peer-detection always-send`)))
+		if !strings.Contains(out, "dpd_action = restart") {
+			t.Fatalf("always-send DPD: want dpd_action = restart:\n%s", out)
+		}
+	})
+
+	t.Run("no DPD stanza emits no dpd", func(t *testing.T) {
+		out := m.generateConfig(compileFromSet(t, base))
+		if strings.Contains(out, "dpd_delay") {
+			t.Fatalf("no DPD stanza should not emit dpd_delay:\n%s", out)
+		}
+	})
+}
+
 func TestGenerateConfig_JunosObfuscatedPSK(t *testing.T) {
 	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{

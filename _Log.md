@@ -30691,3 +30691,27 @@ top.
   - **File(s)**: pkg/configstore/store_lock.go,
     pkg/configstore/store_lock_3979_test.go, pkg/configstore/README.md,
     cmd/cli/shared.go, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3994 — IKE dead-peer-detection bare / interval-only /
+    threshold-only forms now enable DPD. The compiler overloaded the
+    `DeadPeerDetect` mode string as the enable flag, so a bare
+    `dead-peer-detection;` produced an empty mode read as DISABLED downstream
+    (no `dpd_delay`), and an interval-only / threshold-only stanza let
+    `nodeVal()` capture the sub-field token ("interval"/"threshold") as a bogus
+    mode. Added `IPsecGateway.DPDEnable` as the single enable source of truth;
+    rewrote `parseDeadPeerDetectionNode` to set it for every form and to scan
+    both node Keys and children for mode/interval/threshold; gated `deriveDPD`
+    on `DPDEnable` (mode-string fallback kept) and gave the bare/default form a
+    concrete `dpd_action` (restart/clear, Junos-optimized default) instead of
+    leaning on strongSwan's implicit default; updated both `show security`
+    DPD-display sites to gate on `DPDEnable`. Tests: config-layer form matrix
+    (`TestIKEDeadPeerDetectionForms`) + end-to-end swanctl render
+    (`TestGenerateConfig_DPDBareAndTuningForms`, RED-on-revert: bare form loses
+    `dpd_delay = 10s` when the fix is reverted — proven). go build ./..., gofmt,
+    vet clean; pkg/config + pkg/ipsec + pkg/cli + pkg/grpcapi suites green.
+    Docs: pkg/ipsec/README.md DPD bullet rewritten.
+  - **File(s)**: pkg/config/types_security.go, pkg/config/compiler_ipsec.go,
+    pkg/config/parser_security_test.go, pkg/ipsec/ike.go, pkg/ipsec/ipsec_test.go,
+    pkg/cli/cli_show_security_ipsec.go, pkg/grpcapi/server_show_security_text.go,
+    pkg/ipsec/README.md, _Log.md
