@@ -29442,3 +29442,37 @@ top.
     pkg/daemon/direct_garp_probe_target_test.go, pkg/vrrp/instance.go,
     pkg/vrrp/instance_garp_probe_target_test.go, pkg/vrrp/README.md,
     pkg/daemon/README.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3926 — flush the session-delete journal while CONNECTED. A
+    session DELETE generated while the sync link is UP but `sendCh` is full
+    (backpressure) is journaled by `QueueDeleteV4`/`V6`, but the journal was
+    flushed ONLY on a full disconnect/reconnect (`handleNewConnection` →
+    `flushDeleteJournal`). The periodic sweep replayed INSTALLS but never the
+    journaled deletes, so a delete journaled while the link stayed up was never
+    delivered until an unrelated disconnect — the standby retained the dead
+    session and made a wrong forwarding decision on failover. Fix (chose the
+    sweep-replay option, mirroring the existing install-replay — it reuses the
+    tested #2121 `flushDeleteJournal`/`rejournalTail` requeue path with no
+    hot-path mutex, no O(N^2) take-all churn, and bounded ≤1s convergence since
+    delete backpressure sets `syncBackfillNeeded` which holds the sweep at the
+    1s active cadence): `syncSweep` now calls `flushDeleteJournal` every tick
+    while connected, before the `s.sessions == nil` early-return (the flush is
+    independent of the kernel session iteration). `flushDeleteJournal` is a
+    no-op on an empty journal, re-sends each entry at most once (take-all under
+    the journal lock, `DeletesSent` counted on success), preserves the encoded
+    #2170/#2221 delete generation (no re-stamp — a stale journaled delete that
+    replays after a same-key replacement was re-synced is still refused by the
+    peer's delete guard), and re-journals any un-sent tail if `sendCh` is still
+    full (retried next tick). RED-on-revert unit test
+    `TestDeleteJournalConnectedFlushViaSweep`: connected + full `sendCh` →
+    delete journaled with a fresh gen > install gen, `DeletesSent==0`; drain
+    `sendCh` WITHOUT a disconnect; `syncSweep()` flushes the delete (journal
+    empty, `DeletesSent==1`, wire gen preserved); a second sweep does not
+    double-send. Verified RED on a reverted flush line (delete stuck in journal,
+    1 remain). `go test ./pkg/cluster/...` green, `-race` on the journal tests
+    green, `go build ./...`, gofmt, vet clean. test-failover WARRANTED (HA
+    session-sync convergence) — batch with the other HA-Medium fixes under the
+    force-node0-primary gate.
+  - **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
+    docs/session-sync-architecture.md, _Log.md
