@@ -1990,46 +1990,72 @@ func validateApplicationSetMembersStrict(cfg *Config) error {
 // are an address-book construct (expanded to /32s under the book) and
 // are referenced from a policy only by book NAME, so no range form
 // reaches this token list.
+// policyMatchNamedAddressRefs collects every NAME that is a valid non-literal
+// policy source/destination-address reference: an address-book entry (an
+// Address or an AddressSet, global or already folded from a zone-local book)
+// and a dynamic-address feed binding name. It is the single source of truth for
+// the named-reference set that both the strict commit gate
+// (validatePolicyMatchAddressesStrict, #2008/#3294) and the non-fatal warn pass
+// (compiler_validate_warn.go, #3958) consult, so the two cannot drift and emit
+// a spurious "not in address-book" warning for a form the strict path accepts.
+//
+// The dynamic-address feed binding NAME is included because the userspace
+// dataplane resolves it as a DIRECT policy address token via the feed overlay
+// (#2049/#3294) and enforces the live feed prefixes. Scope note: this set is
+// for the DIRECT policy reference only — policyMatchAddressBookResolves (#3149)
+// stays feed-UNaware so a feed member nested in an address-set still poisons its
+// set at strict (the anti-Option-C guardrail; feed-in-set enforcement rides the
+// dataplane set-row merge, not a strict-accept here).
+func policyMatchNamedAddressRefs(cfg *Config) map[string]bool {
+	names := make(map[string]bool)
+	if cfg == nil {
+		return names
+	}
+	if ab := cfg.Security.AddressBook; ab != nil {
+		for name := range ab.Addresses {
+			names[name] = true
+		}
+		for name := range ab.AddressSets {
+			names[name] = true
+		}
+	}
+	for name := range cfg.Security.DynamicAddress.AddressBindings {
+		names[name] = true
+	}
+	return names
+}
+
+// policyMatchAddressTokenRecognized reports whether tok is a syntactically
+// recognized policy source/destination-address reference of ANY form: the
+// reserved wildcards (`any` / `any-ipv4` / `any-ipv6` / the empty token), a
+// literal CIDR or bare IP, or a name in `named` (an address-book entry or a
+// dynamic-address feed binding — see policyMatchNamedAddressRefs). It is the
+// exact acceptance predicate validatePolicyMatchAddressesStrict (#2008/#3294)
+// uses, factored out so the warn pass agrees with strict (#3958). It reports
+// only that the token is a well-formed reference form, NOT that a named
+// address-set's members fully resolve — that deeper check is #3149's domain
+// (validatePolicyMatchAddressSetMembersStrict).
+func policyMatchAddressTokenRecognized(tok string, named map[string]bool) bool {
+	switch tok {
+	case "", "any", "any-ipv4", "any-ipv6":
+		return true
+	}
+	if named[tok] {
+		return true
+	}
+	if _, _, err := net.ParseCIDR(tok); err == nil {
+		return true
+	}
+	return net.ParseIP(tok) != nil
+}
+
 func validatePolicyMatchAddressesStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
-	// Collect valid address-book names (Addresses + AddressSets).
-	bookNames := make(map[string]bool)
-	if ab := cfg.Security.AddressBook; ab != nil {
-		for name := range ab.Addresses {
-			bookNames[name] = true
-		}
-		for name := range ab.AddressSets {
-			bookNames[name] = true
-		}
-	}
-	// #3294: a dynamic-address feed binding NAME is a valid DIRECT policy
-	// address token — the userspace dataplane resolves it via the feed overlay
-	// (#2049) and enforces the live feed prefixes. Recognize it here so a direct
-	// feed reference COMMITS instead of being rejected as an undefined token
-	// (the documented #2049 feed-in-policy feature was un-committable under
-	// strict). Deliberately scoped to THIS top-level gate only:
-	// policyMatchAddressBookResolves (#3149) must stay feed-UNaware so a feed
-	// member nested in an address-set still poisons its set at strict — feeding
-	// it through the shared recursive resolver would strict-accept feed-in-set
-	// (the anti-Option-C guardrail; feed-in-set enforcement on the lenient path
-	// is handled by the dataplane set-row merge, not by strict-accepting it).
-	for name := range cfg.Security.DynamicAddress.AddressBindings {
-		bookNames[name] = true
-	}
+	bookNames := policyMatchNamedAddressRefs(cfg)
 	validToken := func(tok string) bool {
-		switch tok {
-		case "", "any", "any-ipv4", "any-ipv6":
-			return true
-		}
-		if bookNames[tok] {
-			return true
-		}
-		if _, _, err := net.ParseCIDR(tok); err == nil {
-			return true
-		}
-		return net.ParseIP(tok) != nil
+		return policyMatchAddressTokenRecognized(tok, bookNames)
 	}
 	check := func(scope string, pol *Policy) error {
 		if pol == nil {

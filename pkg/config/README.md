@@ -257,6 +257,31 @@ such a policy, so a leniently-loaded bad config is no worse off, now flagged. Th
 lenient path and for unreferenced sets (which never reach the runtime gate, so
 they stay warn-only). Same fail-closed-on-load doctrine as #3144/#3146.
 
+**Warn pass must agree with strict on the valid address-reference forms
+(#3958):** the non-fatal `ValidateConfig` warn pass
+(`compiler_validate_warn.go`) emits a `policy … source/destination-address …
+not in address-book` advisory for a policy address token it does not recognize.
+It previously excluded only the bare `any` keyword and address-book entry names,
+so it drew a FALSE warning for every OTHER valid reference form on a perfectly
+good policy: a literal IPv4/IPv6 address or CIDR (`10.0.0.0/8`, `2001:db8::/32`
+— including the `0.0.0.0/0` / `::/0` that `compilePolicy` normalizes `any-ipv4` /
+`any-ipv6` to), the `any-ipv4` / `any-ipv6` wildcards, and a dynamic-address
+FEED binding name (a direct #2049/#3294 reference). Spurious warnings on normal
+commits train operators to ignore validation output (alarm fatigue), burying a
+REAL undefined-reference warning. The strict commit gate
+`validatePolicyMatchAddressesStrict` (#2008/#3294) already accepts exactly these
+forms; the warn pass had drifted. The acceptance logic is now a single source of
+truth — `policyMatchNamedAddressRefs` (address-book entries + feed bindings) and
+`policyMatchAddressTokenRecognized` (the `any`/literal/named predicate) in
+`compiler_validate_strict.go` — that BOTH the strict gate and the warn pass call,
+so they cannot diverge again. The warn pass now warns only for a token that is
+NONE of {`any`/`any-ipv4`/`any-ipv6`, literal CIDR/IP, feed binding, address-book
+entry} — a genuinely undefined reference, which still warns (and is hard-rejected
+by #2008 on the strict commit path). The address-set MEMBER validation keeps its
+own address-book-only set: a feed binding nested in an address-set stays
+deliberately NOT strict-accepted (#3294 anti-Option-C), so it is not added to the
+member-check set.
+
 **Zone-local address books (#3061):** Junos supports both the global
 `security address-book global { ... }` and a per-zone book attached inline
 under `security zones security-zone <z> address-book { address ...;

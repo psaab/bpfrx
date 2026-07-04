@@ -84,7 +84,10 @@ func ValidateConfig(cfg *Config) []string {
 		zones[name] = true
 	}
 
-	// Collect valid address-book entries
+	// Collect valid address-book entries (Addresses + AddressSets). Used by the
+	// address-set member validation below, which deliberately does NOT accept a
+	// dynamic-address feed binding as a set member (feed-in-set is enforced on
+	// the dataplane set-row merge, not strict-accepted — #3294).
 	addrs := make(map[string]bool)
 	if ab := cfg.Security.AddressBook; ab != nil {
 		for name := range ab.Addresses {
@@ -94,6 +97,20 @@ func ValidateConfig(cfg *Config) []string {
 			addrs[name] = true
 		}
 	}
+
+	// #3958: a policy source/destination-address reference is valid in several
+	// forms that are NOT plain address-book names — the `any`/`any-ipv4`/
+	// `any-ipv6` wildcards, a literal IPv4/IPv6 address or CIDR, and a
+	// dynamic-address feed binding name. The previous warn check only excluded
+	// `any` and address-book entries, so it emitted a false "not in
+	// address-book" warning for every literal / any-ipv4 / any-ipv6 / feed
+	// reference in a perfectly valid policy — alarm fatigue that trains
+	// operators to ignore validation warnings. Mirror the strict gate
+	// (validatePolicyMatchAddressesStrict, #2008/#3294) EXACTLY via the shared
+	// policyMatchAddressTokenRecognized predicate so the warn pass and the
+	// strict path cannot diverge; only a token recognized by NONE of the valid
+	// forms — a genuinely undefined reference — still warns.
+	policyAddrRefs := policyMatchNamedAddressRefs(cfg)
 
 	// Validate application port specs and protocols
 	for name, app := range cfg.Applications.Applications {
@@ -149,13 +166,13 @@ func ValidateConfig(cfg *Config) []string {
 				continue
 			}
 			for _, addr := range p.Match.SourceAddresses {
-				if addr != "any" && !addrs[addr] {
+				if !policyMatchAddressTokenRecognized(addr, policyAddrRefs) {
 					warnings = append(warnings, fmt.Sprintf(
 						"policy %q: source-address %q not in address-book", p.Name, addr))
 				}
 			}
 			for _, addr := range p.Match.DestinationAddresses {
-				if addr != "any" && !addrs[addr] {
+				if !policyMatchAddressTokenRecognized(addr, policyAddrRefs) {
 					warnings = append(warnings, fmt.Sprintf(
 						"policy %q: destination-address %q not in address-book", p.Name, addr))
 				}

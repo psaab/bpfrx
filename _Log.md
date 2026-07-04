@@ -1,3 +1,37 @@
+## 2026-07-03 — #3958: ValidateConfig warn pass emitted false "not in address-book" warnings for literal / any-ipv4 / any-ipv6 / dynamic-address-feed policy references → alarm fatigue
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-045 (MEDIUM, UX/alarm-fatigue). The
+    non-fatal `ValidateConfig` warn pass (`compiler_validate_warn.go`)
+    checked a policy source/destination-address token against only the
+    address-book entry set plus the bare `any` keyword, so it emitted a
+    spurious `policy … not in address-book` warning for every OTHER valid
+    reference form on a perfectly good policy: a literal IPv4/IPv6 address
+    or CIDR (incl. the `0.0.0.0/0` / `::/0` that `compilePolicy` normalizes
+    `any-ipv4` / `any-ipv6` to), the `any-ipv4` / `any-ipv6` wildcards, and
+    a dynamic-address FEED binding name. Spurious warnings on normal commits
+    train operators to ignore validation output, burying a REAL undefined
+    reference.
+  - **Fix**: extracted the strict gate's acceptance logic
+    (`validatePolicyMatchAddressesStrict`, #2008/#3294) into two shared
+    helpers in `compiler_validate_strict.go` —
+    `policyMatchNamedAddressRefs` (address-book entries + feed bindings) and
+    `policyMatchAddressTokenRecognized` (the any/literal/named predicate) —
+    and had BOTH the strict gate and the warn pass call them, so they cannot
+    diverge again. The warn pass now warns only for a token that is NONE of
+    {any/any-ipv4/any-ipv6, literal CIDR/IP, feed binding, address-book
+    entry}. The address-set MEMBER validation keeps its own
+    address-book-only set (feed-in-set stays not strict-accepted, #3294).
+  - **File(s)**: `pkg/config/compiler_validate_warn.go`,
+    `pkg/config/compiler_validate_strict.go`,
+    `pkg/config/compiler_addrbook_warn_3958_test.go` (new),
+    `pkg/config/README.md`, `_Log.md`
+  - **Validation**: new `TestValidateWarnAddressRefFormsNoFalsePositive`
+    (RED-on-revert: reverting the predicate re-emits false warnings for the
+    literal / any-ipv4 / any-ipv6 / feed forms) +
+    `TestValidateWarnAddressRefUndefinedStillWarns` (a genuinely undefined
+    token still warns). `go test ./pkg/config/...` green; `go build ./...`,
+    gofmt, and `go vet ./pkg/config/` clean.
 ## 2026-07-03 — #3956: DHCPv4 client kept a revoked address until T2 — a RENEWING DHCPNAK was treated like a renew timeout
 
 - **Timestamp**: 2026-07-03
