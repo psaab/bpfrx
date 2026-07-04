@@ -34,6 +34,62 @@
     `pkg/cli/monitor_interface_stdin_3985_test.go`,
     `docs/monitor-interface-research.md`, `_Log.md`.
 
+## 2026-07-03 — #3984: repeated keyed-list leaves (`ntp server`, `archive-sites`, `api-key`, traceoptions `flag`) collapsed to the LAST on flat-set/load-set replay
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-041 (MEDIUM, config data loss — SET side of
+    the repeated-keyed-list class). The leaves `system ntp server <ip>`,
+    `system archival configuration archive-sites <url>`, `system services
+    web-management api-auth api-key <key>` and `security flow traceoptions
+    flag <flag>` were declared in `setSchema` as `{args: 1, children: nil}`
+    WITHOUT `multi: true`. Each is a REPEATED single-value statement whose
+    compiler reads EVERY sibling via `FindChildren` (`compiler_system.go`
+    NTP/archive-sites/api-key, `compiler_security.go` traceoptions flag),
+    accumulating into a slice. But `SetPath`'s terminal-leaf branch
+    (`pkg/config/ast_edit.go`, the `i >= len(path)` case) took the
+    single-value-REPLACE path for an `args > 0, !multi, children == nil` leaf,
+    so a SECOND `set ... server 2.2.2.2` REPLACED the first. A flat-set /
+    `load set` / `| display set` round-trip of a multi-value config therefore
+    DROPPED all but the LAST value silently. The compiler was already
+    multi-value (FindChildren) — the config was internally multi but the SET
+    path collapsed it.
+    FIX (schema markers only): added `multi: true` to the four leaves
+    (`schema_system.go` server:100, archive-sites:78, api-key:348;
+    `schema_security.go` flag:693). With `multi: true` the terminal-leaf
+    branch DEDUPs and APPENDs instead of replacing, so each `set` keeps a
+    distinct sibling; the compiler read is unchanged (still FindChildren).
+    Mechanism note: this is the SEPARATE-STATEMENTS use of `multi` (distinct
+    siblings), not the #2419 bracket-collapse — each `set` consumes exactly
+    `1+args` tokens with no trailing token, so the collapse branch (which
+    needs trailing tokens) never runs. `archive-sites`'s optional trailing
+    `password <s>` rides on `Keys[2:]` of the leaf and the compiler already
+    reads it there; the existing `flat_set_password` test stays green because
+    a passworded site is a distinct leaf either way. Delete/deactivate of
+    these leaves now inherit member-wise editing for free (the multi-leaf
+    branch in deletePath/setInactiveAtPath, #3846/#3975).
+    AUDIT (step 3): swept every raw (non-`namedInstances`) `FindChildren` read
+    against its schema decl. Only four leaves were in the collapse class
+    (children:nil, !multi, compiler accumulates siblings): the four fixed.
+    NOT bugs — `key-exchange`/`as-path`/`vlan-id-list`/`code-points` already
+    `multi`; ddns `server` read singly via a props map; `priority-cost` /
+    `track-priority-cost` are scalars validated in a loop (track-interface
+    capped at 1/vrrp-group); CoS rewrite `code-point` returns the first value
+    only; policy-`then` actions are one-per-then. Keyed CONTAINERS (`route`,
+    `security-zone`, `policy`, ...) have schema children so SetPath treats
+    them as containers → distinct siblings, never collapsed.
+    RED-on-revert: `pkg/config/set_repeated_leaf_3984_test.go` — 3× NTP
+    server, 3× archive-sites (one passworded), 2× api-key, 2× trace flag via
+    ParseSetCommand + SetPath assert all siblings survive + compiler reads
+    all; a display-set round-trip (FormatSet → re-apply) reproduces all 3 NTP
+    servers; single-server anti-over-broadening guard. Reverting the four
+    markers fails exactly the 5 collapse cases while the single-value guard
+    stays green. `go test ./pkg/config/... ./pkg/cli/...` green; `go build
+    ./...`, gofmt, vet clean. Docs: `docs/config-schema.md` new subsection
+    "`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
+    leaves (#3984)".
+  - **File(s)**: pkg/config/schema_system.go, pkg/config/schema_security.go,
+    pkg/config/set_repeated_leaf_3984_test.go, docs/config-schema.md, _Log.md
+
 ## 2026-07-03 — #3982: config-mode `rename` of a non-first same-keyword sibling failed (matched only the first sibling)
 
 - **Timestamp**: 2026-07-03
