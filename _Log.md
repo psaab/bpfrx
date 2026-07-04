@@ -31729,3 +31729,30 @@ top.
     pkg/configstore/store_persist.go,
     pkg/configstore/file_perms_4056_test.go,
     pkg/configstore/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4061 VRRP RFC 5798 §6.1/§6.4.2 — a BACKUP now adopts the
+    MASTER's advertised interval (Master_Adver_Interval) when computing
+    Master_Down_Interval, instead of its own configured AdvertiseInterval.
+    `VRRPPacket.MaxAdvertInt` was parsed (packet.go) but never consumed:
+    `masterDownInterval()` used `vi.advertInterval()` (local cfg), so a
+    master/backup interval mismatch (a rolling `reth-advertise-interval`
+    change or a misconfig) timed the master out on the wrong cadence — a
+    shorter local interval failed over prematurely (flapping), a longer one
+    detected master-down too late (traffic loss). Fix: new sticky field
+    `masterAdverInterval` set in `recordMasterAdvert` from the received
+    advert's Max Adver Int (centiseconds on the wire → ×10 ms Duration,
+    zero-field guarded); `masterDownInterval()` and the #2082/#2850
+    staleness-horizon replicas (`shouldPreemptObservedMaster`,
+    `preemptingLiveLowerMaster`) now use the learned interval via a shared
+    `effectiveAdvertInterval` helper, falling back to the local interval
+    before any advert is heard. Skew_Time still uses the local priority
+    (§6.1). Matching-interval case (RETH 30 ms both sides) is bit-identical
+    → ~60 ms failover preserved. RED-on-revert: reverting
+    `masterDownInterval` to the local-only computation makes
+    `TestMasterAdverInterval_LearnedFromAdvert` fail (108 ms from local
+    30 ms vs 3.609 s from the master's advertised 1000 ms). Validated:
+    `go test -race ./pkg/vrrp/`, `go build ./...`, gofmt + vet clean.
+    test-failover WARRANTED (VRRP failover timing) — batch-validate.
+  - **File(s)**: pkg/vrrp/instance.go,
+    pkg/vrrp/instance_master_interval_test.go, pkg/vrrp/README.md, _Log.md
