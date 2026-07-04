@@ -1684,8 +1684,17 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
 			// rule carries a single translation action, so a duplicate then
 			// block resolves last-wins (Junos merges duplicate stanzas) — the
-			// second block's action is applied, never silently dropped.
+			// second block's action is applied, never silently dropped. RESET
+			// the translation spec at the top of each block so only the LAST
+			// block's fields survive: a source-nat then-block is a COMPLETE,
+			// mutually-exclusive spec (interface | pool | off), so without the
+			// reset a first `interface` block would leave Interface=true stale
+			// under a second `pool` block (both fields set → the dataplane's
+			// field precedence, not true last-wins). NATThen carries only these
+			// translation-mode fields, so a whole-struct reset is safe (#3850
+			// review).
 			for _, thenNode := range ruleInst.node.FindChildren("then") {
+				rule.Then = NATThen{}
 				for _, t := range thenNode.Children {
 					if t.Name() == "source-nat" {
 						if len(t.Keys) >= 2 {
@@ -1902,8 +1911,14 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
 			// rule carries a single translation action, so a duplicate then
 			// block resolves last-wins (Junos merges duplicate stanzas) — the
-			// second block's action is applied, never silently dropped.
+			// second block's action is applied, never silently dropped. RESET
+			// the translation spec at the top of each block (see the source-NAT
+			// note) so a second `pool` block cannot inherit a first `off`
+			// block's stale field; a destination-nat then-block is a complete
+			// mutually-exclusive spec (pool | off) and NATThen carries only
+			// translation-mode fields (#3850 review).
 			for _, thenNode := range ruleInst.node.FindChildren("then") {
+				rule.Then = NATThen{}
 				for _, t := range thenNode.Children {
 					if t.Name() == "destination-nat" {
 						// #3844: `then destination-nat off` is a no-translate
@@ -2157,8 +2172,19 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
 			// rule carries a single translation action, so a duplicate then
 			// block resolves last-wins (Junos merges duplicate stanzas) — the
-			// second block's action is applied, never silently dropped.
+			// second block's action is applied, never silently dropped. RESET
+			// the static-nat target fields at the top of each block so only the
+			// LAST block's spec survives (no stale prefix/nptv6/mapped-port from
+			// an earlier block). The reset covers ONLY the then-set fields
+			// (Then/IsNPTv6/MappedPort) — the match fields (Match/SourceAddress
+			// (es)/MatchDestinationPort) are set by the match loop above and MUST
+			// persist. A single static-nat then-block is a complete spec, so
+			// `prefix X mapped-port P` within one block stays coupled: the reset
+			// runs BETWEEN blocks, then the whole block is read (#3850 review).
 			for _, thenNode := range ruleInst.node.FindChildren("then") {
+				rule.Then = ""
+				rule.IsNPTv6 = false
+				rule.MappedPort = 0
 				for _, t := range thenNode.Children {
 					if t.Name() == "static-nat" {
 						if len(t.Keys) >= 3 && t.Keys[1] == "nptv6-prefix" {

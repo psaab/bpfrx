@@ -128,6 +128,53 @@ security {
 	}
 }
 
+// TestNATSourceDupThenTypeSwitchResetsStaleField_3850 proves the per-block
+// reset (#3850 review fold): a source NAT rule whose first `then` block sets
+// `source-nat interface` and whose second sets `source-nat pool poolB` compiles
+// to a POOL-ONLY spec (PoolName=poolB, Interface=false) — true last-wins across
+// a translation-TYPE switch. Reverting the `rule.Then = NATThen{}` per-block
+// reset leaves the first block's Interface=true set ALONGSIDE PoolName=poolB
+// (both fields set, so the dataplane's field precedence decides, not true
+// last-wins), so this goes RED.
+func TestNATSourceDupThenTypeSwitchResetsStaleField_3850(t *testing.T) {
+	cfgText := `
+security {
+    nat {
+        source {
+            rule-set RS1 {
+                from zone trust;
+                to zone untrust;
+                rule R1 {
+                    match {
+                        source-address 10.0.0.0/24;
+                    }
+                    then {
+                        source-nat interface;
+                    }
+                    then {
+                        source-nat pool poolB;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	nat := natNodeFromText(t, cfgText)
+	sec := &SecurityConfig{}
+	if err := compileNAT(nat, sec); err != nil {
+		t.Fatalf("compileNAT: %v", err)
+	}
+	r := sec.NAT.Source[0].Rules[0]
+	if r.Then.PoolName != "poolB" {
+		t.Fatalf("second then block pool not applied: PoolName=%q, want poolB", r.Then.PoolName)
+	}
+	if r.Then.Interface {
+		t.Fatalf("STALE Interface=true from the first then block survived the translation-" +
+			"type switch (per-block reset missing); want Interface=false (true last-wins)")
+	}
+}
+
 // --- NAT DESTINATION -------------------------------------------------------
 
 // TestNATDestinationDupMatchBlocksMerge_3850: two `match {}` blocks under a
