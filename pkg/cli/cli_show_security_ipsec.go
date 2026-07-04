@@ -47,6 +47,23 @@ func (c *CLI) showIPsec(args []string) error {
 					outBytes = "0"
 				}
 				fmt.Printf("  Bytes transferred In/Out: %s/%s\n", inBytes, outBytes)
+				if sa.InPackets != "" || sa.OutPackets != "" {
+					inPkts := sa.InPackets
+					if inPkts == "" {
+						inPkts = "0"
+					}
+					outPkts := sa.OutPackets
+					if outPkts == "" {
+						outPkts = "0"
+					}
+					fmt.Printf("  Packets In/Out: %s/%s\n", inPkts, outPkts)
+				}
+				if sa.SPIIn != "" || sa.SPIOut != "" {
+					fmt.Printf("  SPI In/Out: %s/%s\n", sa.SPIIn, sa.SPIOut)
+				}
+				if sa.Rekey != "" {
+					fmt.Printf("  Lifetime: %s\n", sa.Rekey)
+				}
 			}
 			fmt.Println()
 		}

@@ -29,9 +29,11 @@ all files stay in `package ipsec`, so the public API is unchanged.
   shell-out helper (`runSwanctl`, `swanctlTimeout`).
 - `ike.go` — IKE/ESP settings resolution + proposal builders
   (`resolveIKESettings`/`resolveESPSettings`/`deriveDPD`/`buildESPProposal`/
-  `dhGroupBits`) and the SA-status query + `swanctl --list-sas` SPI
-  parsing (`SAStatus`/`GetSAStatus`/`parseSAOutput`/`TerminateAllSAs`/
-  `InitiateConnection`/`ActiveConnectionNames`).
+  `dhGroupBits`) and the SA-status query + `swanctl --list-sas` output
+  parsing (`SAStatus`/`GetSAStatus`/`parseSAOutput` + the line helpers
+  `parseIKEHeader`/`parseChildHeader`/`parseEndpointHost`/`parseTrafficLine`,
+  `TerminateAllSAs`/`InitiateConnection`/`ActiveConnectionNames`). The parser
+  is pinned to captured golden fixtures in `testdata/swanctl_list_sas_*.txt`.
 - `crypto.go` — **isolated** Junos `$9$` pre-shared-key decryption
   (`normalizePSK`/`decodeJunosSecret`/`junosGap`/`junosGapDecode` and the
   `$9$` alphabet tables). Kept in its own file so the decryption surface
@@ -57,6 +59,22 @@ all files stay in `package ipsec`, so the public API is unchanged.
 
 ## Gotchas
 
+- **SA-status parsing must match the real `swanctl --list-sas` layout
+  (#3937).** `GetSAStatus` shells out to `swanctl --list-sas` and feeds the
+  stdout to `parseSAOutput`. The real strongSwan output is
+  `name: #<id>, <STATE>, IKEv<n>, <spi>_i* <spi>_r`, then indented
+  `local/remote '<id>' @ <host>[<port>]` endpoints, a crypto proposal line,
+  an `established/rekeying` timing line, then the child SA header
+  `name: #<id>, reqid <n>, <STATE>, <MODE>, ESP:<proposal>` with indented
+  `in/out <spi>, <bytes> bytes, <packets> packets` counters and bare-CIDR
+  `local/remote` traffic selectors. The `@` distinguishes an IKE endpoint
+  line from a child traffic-selector line. The parser previously assumed an
+  `ipsec statusall`-style layout (`local: A === B`, `local_ts = C`,
+  `bytes_in=N`) that swanctl **never emits**, so every SA field but the
+  name/state came back blank and `show security ipsec sa` was permanently
+  empty even with active tunnels. Golden fixtures captured from real output
+  live in `testdata/swanctl_list_sas_*.txt`; edit the parser only alongside a
+  fixture so it can't silently drift from reality again.
 - IKE version negotiation supports v1-only, v2-only, or dual (default).
   Aggressive mode is opt-in.
 - NAT traversal modes: `disable`, `force`, `enable` (auto-detect).

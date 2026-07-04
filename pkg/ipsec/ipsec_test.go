@@ -1,6 +1,8 @@
 package ipsec
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -291,37 +293,94 @@ func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
 	}
 }
 
+// readSAFixture loads a captured `swanctl --list-sas` golden fixture. The
+// fixtures pin parseSAOutput to the format the installed strongSwan actually
+// emits (the parser previously assumed an "ipsec statusall"-style layout that
+// swanctl never produces, #3937).
+func readSAFixture(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return string(b)
+}
+
 func TestParseSAOutput(t *testing.T) {
-	output := `site-a: #1, ESTABLISHED
-  local: 10.0.1.1 === 10.0.2.1
-  site-a: #1, reqid 1, INSTALLED
-    local_ts = 10.0.1.0/24
-    remote_ts = 10.0.2.0/24
-`
-	sas := parseSAOutput(output)
+	sas := parseSAOutput(readSAFixture(t, "swanctl_list_sas_single.txt"))
 	if len(sas) != 1 {
-		t.Fatalf("expected 1 SA, got %d", len(sas))
+		t.Fatalf("expected 1 SA, got %d: %+v", len(sas), sas)
 	}
-	if sas[0].Name != "site-a" {
-		t.Errorf("name = %q, want %q", sas[0].Name, "site-a")
+	sa := sas[0]
+	// RED-on-revert: the pre-#3937 parser left every field but name/state
+	// blank against real swanctl output. Each assertion below fails (empty)
+	// if the parser regresses to the assumed "statusall" layout.
+	checks := []struct {
+		name, got, want string
+	}{
+		{"Name", sa.Name, "site-a"},
+		{"ConnectionName", sa.ConnectionName, "site-a"},
+		{"State", sa.State, "INSTALLED"},
+		{"LocalAddr", sa.LocalAddr, "10.0.1.1"},
+		{"RemoteAddr", sa.RemoteAddr, "10.0.2.1"},
+		{"LocalTS", sa.LocalTS, "10.0.1.0/24"},
+		{"RemoteTS", sa.RemoteTS, "10.0.2.0/24"},
+		{"InBytes", sa.InBytes, "1420"},
+		{"OutBytes", sa.OutBytes, "1638"},
+		{"InPackets", sa.InPackets, "12"},
+		{"OutPackets", sa.OutPackets, "14"},
+		{"SPIIn", sa.SPIIn, "c1234567"},
+		{"SPIOut", sa.SPIOut, "c7654321"},
 	}
-	if sas[0].LocalAddr != "10.0.1.1" {
-		t.Errorf("local addr = %q, want %q", sas[0].LocalAddr, "10.0.1.1")
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
+		}
 	}
-	if sas[0].RemoteAddr != "10.0.2.1" {
-		t.Errorf("remote addr = %q, want %q", sas[0].RemoteAddr, "10.0.2.1")
+	if !strings.Contains(sa.Rekey, "rekeying in 3358s") {
+		t.Errorf("Rekey = %q, want it to carry the child timing line", sa.Rekey)
+	}
+}
+
+func TestParseSAOutput_TwoTunnels(t *testing.T) {
+	sas := parseSAOutput(readSAFixture(t, "swanctl_list_sas_two.txt"))
+	if len(sas) != 2 {
+		t.Fatalf("expected 2 SAs, got %d: %+v", len(sas), sas)
+	}
+	if sas[0].Name != "site-a" || sas[0].RemoteAddr != "10.0.2.1" || sas[0].InBytes != "1420" {
+		t.Errorf("unexpected first tunnel: %+v", sas[0])
+	}
+	// IPv6 endpoint: the "[port]" suffix must be stripped without eating the
+	// v6 host colons.
+	if sas[1].Name != "site-b" || sas[1].ConnectionName != "site-b" {
+		t.Errorf("unexpected second tunnel name: %+v", sas[1])
+	}
+	if sas[1].LocalAddr != "2001:db8:1::1" || sas[1].RemoteAddr != "2001:db8:2::1" {
+		t.Errorf("v6 endpoint parse wrong: local=%q remote=%q", sas[1].LocalAddr, sas[1].RemoteAddr)
+	}
+	if sas[1].LocalTS != "2001:db8:1::/64" || sas[1].RemoteTS != "2001:db8:2::/64" {
+		t.Errorf("v6 traffic selectors wrong: local=%q remote=%q", sas[1].LocalTS, sas[1].RemoteTS)
+	}
+	if sas[1].InBytes != "204800" || sas[1].OutBytes != "198400" {
+		t.Errorf("v6 byte counters wrong: in=%q out=%q", sas[1].InBytes, sas[1].OutBytes)
 	}
 }
 
 func TestParseSAOutput_MultiChild(t *testing.T) {
-	output := `site-a: #1, ESTABLISHED
-  local: 10.0.1.1 === 10.0.2.1
-  site-a-ts1: #1, reqid 1, INSTALLED
-    local_ts = 10.0.1.0/24
-    remote_ts = 10.0.2.0/24
-  site-a-ts2: #2, reqid 2, INSTALLED
-    local_ts = 10.0.3.0/24
-    remote_ts = 10.0.4.0/24
+	output := `site-a: #1, ESTABLISHED, IKEv2, 8f7c1c8e3a2b1234_i* 4d3c2b1a09876543_r
+  local  '10.0.1.1' @ 10.0.1.1[500]
+  remote '10.0.2.1' @ 10.0.2.1[500]
+  established 42s ago, rekeying in 13342s
+  site-a-ts1: #1, reqid 1, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128
+    in  aaaa1111,  100 bytes,    1 packets
+    out bbbb2222,  200 bytes,    2 packets
+    local  10.0.1.0/24
+    remote 10.0.2.0/24
+  site-a-ts2: #2, reqid 2, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128
+    in  cccc3333,  300 bytes,    3 packets
+    out dddd4444,  400 bytes,    4 packets
+    local  10.0.3.0/24
+    remote 10.0.4.0/24
 `
 	sas := parseSAOutput(output)
 	if len(sas) != 2 {
@@ -330,8 +389,38 @@ func TestParseSAOutput_MultiChild(t *testing.T) {
 	if sas[0].Name != "site-a-ts1" || sas[0].ConnectionName != "site-a" {
 		t.Fatalf("unexpected first child: %+v", sas[0])
 	}
+	if sas[0].LocalTS != "10.0.1.0/24" || sas[0].InBytes != "100" {
+		t.Errorf("first child fields wrong: %+v", sas[0])
+	}
+	// Both children inherit the parent IKE SA endpoints (swanctl prints them
+	// once, on the IKE header block).
+	if sas[0].RemoteAddr != "10.0.2.1" || sas[1].RemoteAddr != "10.0.2.1" {
+		t.Errorf("children did not inherit endpoint: %+v / %+v", sas[0], sas[1])
+	}
 	if sas[1].Name != "site-a-ts2" || sas[1].ConnectionName != "site-a" {
 		t.Fatalf("unexpected second child: %+v", sas[1])
+	}
+	if sas[1].LocalTS != "10.0.3.0/24" || sas[1].OutBytes != "400" {
+		t.Errorf("second child fields wrong: %+v", sas[1])
+	}
+}
+
+func TestParseSAOutput_ConnectingNoChild(t *testing.T) {
+	// An IKE SA still negotiating (no child SA yet) is reported by its IKE
+	// name/state so the operator can see the tunnel is coming up.
+	output := `site-c: #3, CONNECTING, IKEv2
+  local  '10.0.1.1' @ 10.0.1.1[500]
+  remote '10.0.9.1' @ 10.0.9.1[500]
+`
+	sas := parseSAOutput(output)
+	if len(sas) != 1 {
+		t.Fatalf("expected 1 SA, got %d: %+v", len(sas), sas)
+	}
+	if sas[0].Name != "site-c" || sas[0].State != "CONNECTING" {
+		t.Errorf("unexpected connecting SA: %+v", sas[0])
+	}
+	if sas[0].RemoteAddr != "10.0.9.1" {
+		t.Errorf("connecting endpoint not parsed: %+v", sas[0])
 	}
 }
 
@@ -446,17 +535,28 @@ func TestParseSAOutput_Empty(t *testing.T) {
 }
 
 func TestParseSAOutput_Multiple(t *testing.T) {
-	output := `site-a: #1, ESTABLISHED
-  local: 10.0.1.1 === 10.0.2.1
-site-b: #2, CONNECTING
-  local: 10.0.1.1 === 10.0.3.1
+	// One established tunnel with a child SA plus one still-connecting IKE SA
+	// with no child, in real swanctl layout. The established tunnel is
+	// reported by its child SA (INSTALLED), the connecting one by its IKE SA.
+	output := `site-a: #1, ESTABLISHED, IKEv2, 8f7c1c8e3a2b1234_i* 4d3c2b1a09876543_r
+  local  '10.0.1.1' @ 10.0.1.1[500]
+  remote '10.0.2.1' @ 10.0.2.1[500]
+  established 42s ago, rekeying in 13342s
+  site-a: #1, reqid 1, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128
+    in  c1234567,  1420 bytes,    12 packets,     2s ago
+    out c7654321,  1638 bytes,    14 packets,     2s ago
+    local  10.0.1.0/24
+    remote 10.0.2.0/24
+site-b: #2, CONNECTING, IKEv2
+  local  '10.0.1.1' @ 10.0.1.1[500]
+  remote '10.0.3.1' @ 10.0.3.1[500]
 `
 	sas := parseSAOutput(output)
 	if len(sas) != 2 {
-		t.Fatalf("expected 2 SAs, got %d", len(sas))
+		t.Fatalf("expected 2 SAs, got %d: %+v", len(sas), sas)
 	}
-	if sas[0].Name != "site-a" {
-		t.Errorf("sa[0] name = %q", sas[0].Name)
+	if sas[0].Name != "site-a" || sas[0].State != "INSTALLED" {
+		t.Errorf("sa[0] = %+v", sas[0])
 	}
 	if sas[1].Name != "site-b" {
 		t.Errorf("sa[1] name = %q", sas[1].Name)
