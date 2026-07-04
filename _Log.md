@@ -1,3 +1,40 @@
+## 2026-07-03 — #4017: image bake signed the appliance manifest BEFORE the validation gate → a FAILED/invalid image got a minisign signature and was publishable (false trust)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-092 (MEDIUM, build/supply-chain). In
+    `scripts/image/bake.py` the minisign SIGN step ran at export time,
+    BEFORE the in-guest verify-dataplane validation gate. A validation
+    failure aborted via `die()` (exit non-zero) but the signed
+    `xpf-<ver>.SHA256SUMS.minisig` already existed in the output dir. A
+    signature is a TRUST artifact — downstream publish
+    (`scripts/dist/publish.py`) and operators read a signed image as a
+    validated one (the #1864 secure-boot chain assumes signed ⇒ validated)
+    — so a signed-but-invalid image was publishable: false trust, worse
+    than no signature.
+  - **Fix**: reordered so VALIDATE runs strictly before SIGN. The checksum
+    manifest (SHA256SUMS) and the `.manifest` traceability record are still
+    written at export (they are not trust artifacts; publish refuses
+    unsigned trees anyway), but the `.minisig` signature is produced ONLY
+    after the validation gate returns success. Extracted three module-level
+    helpers — `validation_gate_step()`, `sign_manifest_step()`, and
+    `finalize_artifacts(validate_step, sign_step)` which enforces the
+    validate-then-sign ordering. On a gate failure `validation_gate_step`
+    calls `die()` (SystemExit, non-zero) inside `finalize_artifacts` BEFORE
+    `sign_step` is reached, so no `.minisig` is ever written for a failed
+    bake. `--skip-validate` still downgrades the gate to a loud
+    "not publishable" warning.
+  - **Test**: `scripts/image/test_bake_sign_ordering.py` (unittest, run as
+    `python3 scripts/image/test_bake_sign_ordering.py`). Drives
+    `finalize_artifacts` with injected steps: a failing validate
+    (exception AND `die()`-style SystemExit) asserts sign never runs, exits
+    non-zero, and leaves NO `.minisig` on disk; a passing validate asserts
+    sign runs after. RED-on-revert proven: swapping the two lines in
+    `finalize_artifacts` (sign before validate) fails 5 of 6 tests.
+    `python3 -m py_compile scripts/image/bake.py` clean; `go build ./...`
+    unaffected (green — Python-only change).
+  - **File(s)**: scripts/image/bake.py,
+    scripts/image/test_bake_sign_ordering.py, docs/install-images.md,
+    _Log.md
 ## 2026-07-03 — #4011: tx/kick latency cross-thread skew tests were load-sensitive timing flakes (fable-161 F-091 residual)
 
 - **Timestamp**: 2026-07-03

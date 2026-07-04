@@ -19,7 +19,9 @@ cannot move the verifier floor (#1930), networkd, init_on_alloc=0,
 `apt-get install ./xpf.deb` which stages the binaries + creates the
 /usr/local/sbin symlinks + enables the units via its postinst)
 -> virt-sysprep seal -> virt-sparsify+compress export -> checksums +
-manifest -> in-guest verify-dataplane validation gate (validate.py).
+manifest -> in-guest verify-dataplane validation gate (validate.py) ->
+minisign the manifest ONLY after the gate passes (#4017: a signature is a
+trust artifact, so a failed bake must never leave a signed image).
 
 Requirements: make/go/cargo, libguestfs-tools, qemu-utils, curl; incus for
 the validation gate. /dev/kvm makes libguestfs fast.
@@ -440,6 +442,76 @@ def virt_customize(work_qcow, xpf_deb):
     run(argv)
 
 
+def validation_gate_step(skip_validate, qcow_out, meta_out):
+    """Run the in-guest verify-dataplane validation gate (validate.py).
+
+    Aborts the bake (via die(), exit non-zero) if the gate FAILS, so a
+    validation failure stops BEFORE signing (#4017). --skip-validate
+    downgrades to a loud warning and skips the gate — the resulting
+    artifacts are marked non-publishable.
+    """
+    if skip_validate:
+        print("WARNING: --skip-validate — artifacts have NOT passed the in-guest "
+              "verify-dataplane gate; do not publish them.", file=sys.stderr)
+        return
+    info("running validation gate (factory boot + in-guest verify-dataplane + "
+         "valid/invalid day-0 drives)...")
+    if subprocess.run([sys.executable, os.path.join(HERE, "validate.py"),
+                       "--qcow2", qcow_out, "--metadata", meta_out,
+                       "all"]).returncode != 0:
+        die("validation gate FAILED — artifacts are NOT publishable")
+
+
+def sign_manifest_step(out_dir, sums, ver):
+    """Sign the checksum manifest with minisign (#1924 §5.1).
+
+    #4017: the signature is a TRUST artifact — downstream publish and
+    operators read a signed image as a validated one — so this step is
+    ordered strictly AFTER the validation gate (see finalize_artifacts). A
+    bake that fails validation never reaches this step, so no
+    signed-but-invalid image can exist. Fail-OPEN at bake (a dev bake
+    without a key still produces artifacts); fail-CLOSED at publish
+    (scripts/dist/publish.py refuses unsigned artifacts). XPF_SIGN_SECKEY
+    is a PATH to the secret key; the bytes never enter this process. The
+    pinned public key is copied into dist/ so the published tree is
+    self-describing (its trust root remains the in-repo checked-in copy,
+    not this convenience copy).
+    """
+    seckey = os.environ.get("XPF_SIGN_SECKEY")
+    if not seckey:
+        print("WARNING: XPF_SIGN_SECKEY unset — manifest NOT signed. This "
+              "dev artifact is NOT publishable; `make dist-publish` will "
+              "refuse it. Set XPF_SIGN_SECKEY=<path-to-minisign-seckey> to "
+              "sign (#1924).", file=sys.stderr)
+        return
+    try:
+        sign.require_minisign()
+        sig = sign.sign_manifest(sums, seckey,
+                                 comment=f"xpf image {ver} sha256sums")
+        info(f"signed manifest: {os.path.basename(sig)}")
+        pub_src = sign.DEFAULT_IMAGE_PUBKEY
+        if os.path.isfile(pub_src):
+            shutil.copyfile(pub_src, os.path.join(out_dir, "xpf-image.pub"))
+    except sign.SignError as e:
+        die(f"image signing FAILED: {e}")
+
+
+def finalize_artifacts(*, validate_step, sign_step):
+    """#4017 ordering invariant: VALIDATE strictly before SIGN.
+
+    Runs the validation gate first; the manifest signature (a TRUST
+    artifact — downstream publish/operators read a signed image as a good
+    one, per the #1864 secure-boot chain) is produced ONLY after the gate
+    returns success. If validate_step aborts — die()/SystemExit or any
+    exception — sign_step is never reached, so a bake that fails validation
+    leaves NO signed artifact behind. Extracted as a standalone,
+    dependency-free function so the ordering is unit-testable with injected
+    steps (scripts/image/test_bake_sign_ordering.py).
+    """
+    validate_step()
+    sign_step()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -570,30 +642,11 @@ def main():
         info("checksums:")
         print(open(sums).read(), end="")
 
-        # Sign the manifest with minisign (#1924 §5.1). Fail-OPEN at bake
-        # (a dev bake without a key still produces artifacts), fail-CLOSED
-        # at publish (scripts/dist/publish.py refuses unsigned artifacts).
-        # XPF_SIGN_SECKEY is a PATH to the secret key; the bytes never enter
-        # this process. The pinned public key is copied into dist/ so the
-        # published tree is self-describing (its trust root remains the
-        # in-repo checked-in copy, not this convenience copy).
-        seckey = os.environ.get("XPF_SIGN_SECKEY")
-        if seckey:
-            try:
-                sign.require_minisign()
-                sig = sign.sign_manifest(sums, seckey,
-                                         comment=f"xpf image {ver} sha256sums")
-                info(f"signed manifest: {os.path.basename(sig)}")
-                pub_src = sign.DEFAULT_IMAGE_PUBKEY
-                if os.path.isfile(pub_src):
-                    shutil.copyfile(pub_src, os.path.join(a.out, "xpf-image.pub"))
-            except sign.SignError as e:
-                die(f"image signing FAILED: {e}")
-        else:
-            print("WARNING: XPF_SIGN_SECKEY unset — manifest NOT signed. This "
-                  "dev artifact is NOT publishable; `make dist-publish` will "
-                  "refuse it. Set XPF_SIGN_SECKEY=<path-to-minisign-seckey> to "
-                  "sign (#1924).", file=sys.stderr)
+        # NOTE(#4017): the manifest is SIGNED below, AFTER the validation
+        # gate — not here. The checksum manifest itself is not a trust
+        # artifact (publish refuses unsigned trees), but the .minisig
+        # signature is, so it must never exist for an image that failed the
+        # gate. See finalize_artifacts() at the end of the pipeline.
 
         try:
             commit = out_text(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
@@ -634,16 +687,18 @@ def main():
                     + proto_lines)
         info(f"manifest: {manifest}")
 
-        # 7. validation gate
-        if a.skip_validate:
-            print("WARNING: --skip-validate — artifacts have NOT passed the in-guest "
-                  "verify-dataplane gate; do not publish them.", file=sys.stderr)
-        else:
-            info("running validation gate (factory boot + in-guest verify-dataplane + "
-                 "valid/invalid day-0 drives)...")
-            if subprocess.run([sys.executable, os.path.join(HERE, "validate.py"),
-                               "--qcow2", qcow_out, "--metadata", meta_out, "all"]).returncode != 0:
-                die(f"validation gate FAILED — artifacts in {a.out} are NOT publishable")
+        # 7. validation gate, THEN sign (#4017). The manifest signature is a
+        # TRUST artifact — downstream publish (scripts/dist/publish.py) and
+        # operators read a signed image as a validated one (#1864 secure-boot
+        # chain), so it must never exist for an image that failed the gate.
+        # finalize_artifacts enforces validate-before-sign: the gate runs
+        # first and signing happens ONLY on success. A gate failure aborts
+        # (die(), exit non-zero) BEFORE any .minisig is written.
+        finalize_artifacts(
+            validate_step=lambda: validation_gate_step(
+                a.skip_validate, qcow_out, meta_out),
+            sign_step=lambda: sign_manifest_step(a.out, sums, ver),
+        )
 
         info(f"bake complete: {qcow_out}")
         info("deploy quickstarts: docs/install-images.md")
