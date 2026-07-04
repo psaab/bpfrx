@@ -1,3 +1,41 @@
+## 2026-07-03 — #4013: SNMP ifTable GETBULK/GETNEXT read the interface list (a full netlink LinkList) TWICE per returned varbind → O(N)/O(N²) RTM_GETLINK storm per SNMP walk
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-180 (MEDIUM, perf/DoS). The SNMP
+    ifTable/ifXTable request path read interface data through `getIfData()`,
+    whose daemon-wired callback (`buildSNMPIfData`) performs a full netlink
+    `LinkList` (RTM_GETLINK dump) on EVERY call. `handleGetBulk` /
+    `handleGetNext` (and their SNMPv3 twins in `v3.go`) called `getIfData`
+    twice per returned varbind — once in `findNextOID` for the next-OID
+    lookup, once in `getOIDValue` -> `getIfTableValue`/`getIfXTableValue` for
+    the row. A GETBULK walk over N interfaces returns O(N) varbinds, so a
+    single walk drove 2× a full kernel interface dump per varbind: an
+    O(N)/O(N²) RTM_GETLINK storm that floods the kernel netlink path, slows
+    SNMP responses, and contends with the interface reconcile and VRRP. An
+    aggressive/malicious poller could amplify a single GETBULK into a netlink
+    DoS.
+  - **Fix**: introduced a lazy per-PDU interface snapshot (`ifSnapshot` /
+    `newIfSnapshot`). Each handler builds one snapshot at the start of the PDU
+    and threads it through the walk via `getOIDValueSnap` / `findNextOIDSnap`;
+    `getIfTableValue`/`getIfXTableValue` became pure lookups over the snapshot
+    slice. The first ifTable/ifXTable/ifNumber access triggers exactly one
+    LinkList; later varbinds read the cached slice. A GETBULK/GETNEXT walk over
+    N interfaces now does 1 dump per PDU instead of 2N. The snapshot is lazy so
+    a system-group-only PDU (e.g. `sysUpTime` poll) triggers no dump — no
+    regression for system-OID monitoring. Public one-shot `getOIDValue` /
+    `findNextOID` retained (fresh single-use snapshot) for single-object
+    callers/tests.
+  - **File(s)**: `pkg/snmp/agent.go`, `pkg/snmp/v3.go`,
+    `pkg/snmp/getbulk_size_test.go`, `pkg/snmp/README.md`.
+  - **Validation**: `go test ./pkg/snmp/...` green. New fail-on-revert guards
+    `TestV2cGetBulk_SingleLinkListPerPDU` /
+    `TestV2cGetNext_SingleLinkListPerPDU` count `ifDataFn` (the LinkList seam)
+    invocations per PDU and assert exactly 1; reverting to per-varbind reads
+    drives the count to 2× the varbinds (200 for a 100-rep GETBULK over 20
+    ifaces, 6 for a 3-OID GETNEXT) — both RED — while asserting the served
+    ifTable values stay correct. `go build ./...` + `go vet ./pkg/snmp/...`
+    clean.
+
 ## 2026-07-03 — #4009: cluster-deploy secondary-node detection grep never matched → deploy restarted the PRIMARY first ~50% of the time (spurious mid-deploy failover)
 
 - **Timestamp**: 2026-07-03
