@@ -1,3 +1,32 @@
+## 2026-07-04 — #4069: RG-activation reverse-prewarm used O(N·M) Vec::contains dedup on the failover critical path → slow prewarm on a busy cluster
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed fable-161 F-192 (MEDIUM, HA failover perf).
+    `prewarm_reverse_synced_sessions_for_owner_rgs`
+    (`userspace-dp/src/afxdp/shared_ops.rs`) runs on RG activation — the
+    failover critical path (~60ms/~130ms budget). It unions the forward
+    owner-RG session keys (M) with the narrower reverse-prewarm keys (N).
+    The dedup was `candidate_keys.contains(&key)` inside a per-reverse-key
+    loop — a linear scan of the growing forward Vec per key, i.e. O(N·M).
+    On a busy cluster (thousands of synced sessions) this quadratic scan
+    measurably slowed how quickly a newly-primary node fully forwarded.
+    Fix: extract `merge_owner_rg_candidate_keys(forward, reverse)`, which
+    seeds a `FastSet<SessionKey>` (FxHashSet) from the forward keys once
+    (O(M)) and probes each reverse key in O(1) → O(N+M). Result set AND its
+    order are identical to the old dedup (forward keys first, then
+    not-yet-seen reverse keys in first-seen order; `insert` returning true
+    is exactly `!contains`, and it also folds within-`reverse` duplicates).
+    RED-on-revert: `merge_owner_rg_candidate_keys_scales_linearly_not_
+    quadratically` merges N=M=200k distinct keys under a 5s budget (fix
+    ~ms; a Vec::contains revert is ~4e10 comparisons → tens of seconds to
+    minutes → RED). `merge_owner_rg_candidate_keys_preserves_order_and_
+    dedups` pins the order/dedup contract. Validation: FULL `cargo test
+    --release` green; `go build ./...` green; rustfmt clean. test-failover
+    WARRANTED (RG-activation/failover path) — batch-validate.
+  - **File(s)**: userspace-dp/src/afxdp/shared_ops.rs,
+    userspace-dp/src/afxdp/ha_tests.rs,
+    userspace-dp/src/afxdp/README.md, _Log.md
+
 ## 2026-07-04 — #4067: read-only / config-viewer login class could run `monitor traffic` (root tcpdump packet capture) → unprivileged capture / privilege gap
 
 - **Timestamp**: 2026-07-04
