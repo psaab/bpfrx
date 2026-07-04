@@ -67,6 +67,45 @@ microsecond time-window value. Feeding 5000 here would be read as a count and
 clamped to the dataplane cap (1023, `maxScanSweepThreshold`) — effectively never
 firing.
 
+### ICMP / UDP flood are measured PER DESTINATION (#4112)
+
+Junos `icmp flood threshold N` caps the ICMP rate to a single DESTINATION IP, and
+`udp flood threshold N` caps the UDP rate to a destination IP AND port; traffic to
+different destinations counts INDEPENDENTLY. Before #4112 the Rust engine keyed
+the ICMP/UDP flood counters by ZONE NAME only (`icmp_counters` / `udp_counters`,
+`screen/mod.rs`), a per-zone AGGREGATE. That both false-dropped legitimate traffic
+(two high-volume services in one zone — a DNS resolver + VoIP — SUM into one
+counter and cross the threshold though no single destination is flooded) and let
+an attacker spread a modest flood across many destinations while no single victim
+was rate-limited as the operator expected.
+
+#4112 gives ICMP/UDP flood the same per-destination substrate the SYN-flood path
+grew in #3315 — the no-eviction count-min `SynRateSketch` (`syn_rate.rs`), reused
+via `SynRateSketch::increment` (ICMP, keyed on `dst_ip`) and `increment_ip_port`
+(UDP, keyed on `dst_ip` + `dst_port`):
+
+- **PRIMARY per-destination cap** — the configured `threshold` is enforced per
+  destination (ICMP) / per destination IP+port (UDP). A single flooded
+  destination is still capped; distinct destinations no longer sum. The sketch is
+  allocated per zone that configures the threshold (`icmp_dst_sketch` /
+  `udp_dst_sketch`, `ROWS*DST_COLS*16 = 64 KiB` each, mirroring the #3315 per-dest
+  sizing) and freed when the threshold is removed.
+- **SECONDARY per-zone ceiling** — the existing `icmp_counters` / `udp_counters`
+  aggregate is retained as a coarse zone-saturation backstop at
+  `SECONDARY_FLOOD_CEILING_MULT × threshold` (currently 8×). It counts only
+  per-destination-ADMITTED packets (the per-destination check short-circuits
+  first), so it bounds the admitted zone-wide rate and still caps a flood spread
+  thin across many under-threshold destinations — an operator relying on the
+  zone-wide cap still gets it. There is no separate Junos knob for this ceiling,
+  so it is derived from the single configured per-destination threshold.
+
+Both the flow-present (`check_packet_with_zone_id`) and the flowless
+(`check_flowless_screens`, non-first fragment / non-query ICMP) paths share the
+`icmp_flood_drop` / `udp_flood_drop` helpers so a fragment-based flood cannot
+evade the per-destination cap. A flowless non-first fragment carries no L4 port,
+so the UDP cap degrades to per-destination-IP there (the best available for a
+fragment).
+
 ### SYN-flood sub-thresholds: source / destination / alarm / timeout (#3315)
 
 The Go compiler parses the full Junos `tcp syn-flood` shape (alarm/attack/
@@ -116,10 +155,20 @@ screen runtime:
 Enforcement order (`screen/mod.rs`, inside the initial-SYN gate, after the
 validated-cookie bypass): (1) the aggregate `attack-threshold` (+
 `alarm-threshold`) ALWAYS counts via a single `RateCounter::increment_and_classify`
-so its cookie-activation side-effect can never be skipped — `attack` keeps the
-existing cookie-mint / Drop behaviour; (2) per-destination cap; (3) per-source
-cap (gated). The aggregate is authoritative — a per-IP cap only ADDS drops for
-IPs under the aggregate radar. A per-IP trip hard-drops with the existing
+so its cookie-activation side-effect can never be skipped — it does NOT return
+here; (2) the per-destination cap is evaluated BEFORE the aggregate over-attack
+verdict (#4112 F19), so a per-destination trip HARD-DROPS the flooded victim even
+while the zone is over `attack-threshold` and minting cookies for validated
+clients; (3) the aggregate over-attack verdict then mints the SYN-cookie
+challenge (or Drops when cookies are disabled) for the case where the per-dest
+cap did not trip — `attack` keeps its existing cookie-mint / Drop behaviour;
+(4) per-source cap (gated, skipped while cookie-active). Before #4112 the
+per-destination sketch sat AFTER the over-attack early-return, so a real-client
+flood that pushed the zone over `attack-threshold` took the cookie-mint branch on
+every SYN and the per-destination sketch was NEVER reached — the
+`destination-threshold` that exists to shield a single victim even from validated
+clients was defeated in exactly the high-load regime it is configured for (a
+code-vs-comment contradiction). A per-IP trip hard-drops with the existing
 `syn-flood` reason id (no Go gRPC/CLI change); per-source vs per-destination is
 distinguished by separate per-worker counters.
 
