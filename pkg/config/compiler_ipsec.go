@@ -194,13 +194,54 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// parseDeadPeerDetectionNode compiles a `dead-peer-detection` stanza on an IKE
+// gateway. The presence of the stanza — in ANY form — enables DPD (#3994):
+//
+//   - bare `dead-peer-detection;`            → enable with Junos defaults
+//   - `dead-peer-detection interval <n>;`    → enable + tune the probe interval
+//   - `dead-peer-detection threshold <n>;`   → enable + tune the retry count
+//   - `dead-peer-detection always-send;`     → enable + explicit mode
+//     (also optimized / probe-idle-tunnel)
+//
+// Enablement is tracked on gw.DPDEnable, independent of the mode. The previous
+// implementation overloaded the DeadPeerDetect mode string as the enable flag,
+// which mishandled two forms: the bare statement produced an empty mode and was
+// read as DISABLED downstream, and an interval-only / threshold-only stanza let
+// nodeVal() pick up the sub-field name ("interval"/"threshold") as a bogus mode
+// (DPD enabled but with a mode that mapped to no dpd_action). Both forms now
+// enable DPD with the mode left empty (Junos default behaviour), and only a
+// real mode keyword sets DeadPeerDetect.
+//
+// Tokens may ride on the node's own Keys (compact-hierarchical
+// `dead-peer-detection always-send` / `dead-peer-detection interval 10`) or on
+// child nodes (flat-set and block forms), so both are scanned.
 func parseDeadPeerDetectionNode(node *Node, gw *IPsecGateway) {
 	if gw == nil || node == nil {
 		return
 	}
 
-	if v := nodeVal(node); v != "" {
-		gw.DeadPeerDetect = v
+	gw.DPDEnable = true
+
+	keys := node.Keys
+	for i := 1; i < len(keys); i++ {
+		switch keys[i] {
+		case "always-send", "optimized", "probe-idle-tunnel":
+			gw.DeadPeerDetect = keys[i]
+		case "interval":
+			if i+1 < len(keys) {
+				if n, err := strconv.Atoi(keys[i+1]); err == nil {
+					gw.DPDInterval = n
+				}
+				i++
+			}
+		case "threshold":
+			if i+1 < len(keys) {
+				if n, err := strconv.Atoi(keys[i+1]); err == nil {
+					gw.DPDThreshold = n
+				}
+				i++
+			}
+		}
 	}
 
 	for _, c := range node.Children {
@@ -216,10 +257,6 @@ func parseDeadPeerDetectionNode(node *Node, gw *IPsecGateway) {
 				gw.DPDThreshold = n
 			}
 		}
-	}
-
-	if gw.DeadPeerDetect == "" && (len(node.Children) > 0 || len(node.Keys) > 1) {
-		gw.DeadPeerDetect = "always-send"
 	}
 }
 
