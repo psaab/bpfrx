@@ -161,6 +161,41 @@ a1` still removes that whole entry, not just its name token. Covered by
 protocol`, host-inbound-traffic `system-services`, policy match
 `source-address`, and the keyed-entry `address` non-regression).
 
+**Deactivate-side contract: toggle the whole bracket leaf, round-trippably
+(#3975).** `deactivate` / `activate` (`setInactiveAtPath`, `ast_edit.go`)
+needed the SAME multi-leaf interception the delete side got in #3846. The
+`Inactive` marker is a NODE-level flag and a bracket list collapses onto ONE
+node's `Keys[1:]`, so a bracket-list leaf can only be toggled whole — but the
+pre-#3975 schema-driven traversal ate the first member as an extra key
+(`nodeKeyCount == 2`) and then treated the remaining members as container
+tokens, so `deactivate ... from protocol tcp udp icmp` ERRORED with
+`container "protocol tcp" does not exist`. That is exactly the line
+`show | display set` emits for an inactive bracket leaf (`ast_format.go`
+expands `deactivate <path> tcp udp icmp`), so an inactive bracket leaf did NOT
+round-trip: replaying its display-set errored and the leaf reloaded ACTIVE — a
+silent loss of the operator's deactivate intent, the deactivate-side
+counterpart of the #3846 fail. `setInactiveAtPath` now intercepts value-list
+multi-leaves (`multi: true`, `children == nil` or `valueList`, `args == 1`) and
+routes them to `markMultiLeafMembersInactive`, which:
+
+- with no trailing member (`deactivate ... from protocol`), toggles the whole
+  leaf (via `markMatchingNodeInactive`);
+- with trailing member token(s), toggles the WHOLE node when any named member
+  rides on `Keys[1:]` (the flat/bracket shape — a bracket list is one statement
+  and cannot be half-deactivated), and for a plain value-list leaf ALSO toggles
+  any named child node (the hierarchical block shape, e.g.
+  `system-services { ssh; https; }`);
+- reports a member that is not present anywhere as not-found, matching
+  `removeMultiLeafMembers`'s contract.
+
+The `args == 1` gate keeps keyed multi entries (`address <name> <prefix>`,
+`args: 2`) on whole-node toggle semantics, exactly like the delete side.
+Covered by `pkg/config/deactivate_multi_leaf_3975_test.go` (firewall `from
+protocol` whole-list / no-member / member / absent-member / activate-reverse /
+display-set round-trip, policy match `source-address`, block-shape
+`system-services` member toggle, single-value-leaf and keyed-entry
+non-regression).
+
 **Firewall-filter `source/destination-prefix-list` refs are dual-AST too
 (#3843).** These `from` leaves are NOT `multi: true` value-tails — each
 reference carries an optional trailing `except` modifier, so they compile
@@ -3857,7 +3892,11 @@ replay paths (`LoadSet`, `LoadMerge`, and the hierarchical
 `ConfigTree.DeactivatePath` / `ActivatePath` (`ast_edit.go`). So display-set
 output round-trips: an inactive node reloads inactive rather than being
 skipped (and silently reactivated) or parsed as a junk path beginning
-"deactivate".
+"deactivate". A bracket-list (`multi: true`) leaf round-trips too: its
+display-set `deactivate` line carries the fully-expanded member list
+(`deactivate ... from protocol tcp udp icmp`), and `setInactiveAtPath` routes
+that shape through the multi-leaf branch (#3975, see "Deactivate-side contract"
+above) instead of erroring on the trailing members.
 
 **Interactive `activate` / `deactivate` config-mode verbs (#2051).** The two
 verbs are first-class config-mode edits on all four surfaces. The store
