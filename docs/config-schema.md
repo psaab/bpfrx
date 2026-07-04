@@ -251,6 +251,52 @@ validation:
   directions — tail-drop and typo-bypass — across bracket / repeated-line /
   hierarchical shapes, plus the value-slot completion pin).
 
+**IKE/IPsec proposals, RIP export/redistribute, and routing-instance interface
+are multi-value (#3904).** Four more leaves of the #2419/#3431/#3703
+bracket-list-truncation class (fable-161 F-040/F-161/F-162/F-163), all fixed by
+routing the compiler read through `firewallMatchValues` (Keys[1:] + child nodes,
+both AST shapes):
+
+- **IKE/IPsec policy `proposals`** (`schema_security.go`) — both leaves are now
+  `args: 1, multi: true`. `IKEPolicy.Proposals` and `IPsecPolicyDef.Proposals`
+  changed from a scalar `string` to `[]string`, and `compileIKE` /`compileIPsec`
+  (`compiler_ipsec.go`) accumulate EVERY reference. The strongSwan generator
+  (`pkg/ipsec/ike.go` `resolveIKESettings` / `resolveESPSettings`) builds each
+  resolvable proposal and comma-joins them into the swanctl `proposals =` /
+  `esp_proposals =` list (strongSwan negotiates the first mutually acceptable
+  one); the auth method + lifetime come from the first resolvable proposal, and
+  the policy-level PFS group applies to every ESP proposal. Before #3904 the
+  scalar kept only the FIRST reference, so `proposals [ p1 p2 ]` silently offered
+  only `p1` — crypto negotiation NARROWED and a peer requiring `p2` could not
+  establish. The strict commit validators (`compiler_validate_strict.go`) now
+  require EVERY reference in the list to resolve (a dangling trailing reference
+  is a typo the commit-check rejects, mirroring the NAT H05 gate). Coverage:
+  `compiler_ipsec_proposals_multivalue_3904_test.go` (both AST shapes + dangling-
+  second rejection) and `pkg/ipsec/ike_proposals_multivalue_3904_test.go` (both
+  proposals comma-joined into the rendered swanctl config, PFS applied to all).
+- **RIP `redistribute` / group `export` / `neighbor` / `passive-interface`**
+  (`schema_routing.go` — the declared top-level leaves are now `multi: true`; the
+  `group` block stays an opaque `children: nil` container, so its `export` /
+  `neighbor` bracket list already collapses onto Keys[1:]). The RIP block in
+  `compileProtocols` (`compiler_protocols.go`) reads every value via
+  `firewallMatchValues` into the already-plural `RIPConfig.Redistribute` /
+  `Interfaces` / `Passive` slices. Before #3904 each read only `child.Keys[1]`, so
+  `redistribute [ static connected ]` or `export [ pa pb ]` kept ONE entry — a
+  RIP node silently advertised / redistributed less than configured. The existing
+  RIP export strict validator (`compiler_validate_strict.go`) already walks the
+  full slice, so a dangling non-first export name is rejected at commit. Coverage:
+  `compiler_rip_multivalue_3904_test.go` (both AST shapes).
+- **routing-instance `interface`** (`compiler_routing.go`) — the
+  `interface [ i1 i2 ]` list is compiled through `firewallMatchValues` into the
+  already-plural `RoutingInstanceConfig.Interfaces`. `interface` is an OPAQUE
+  implicit leaf under the `routing-instances` wildcard (not a declared schema
+  child — like `instance-type`), so the flat-set bracket already collapses onto
+  Keys[1:] and no schema change is required. Before #3904 the read was
+  `nodeVal(prop)` (Keys[1] only), so `interface [ ge-0/0/1 ge-0/0/2 ]` bound only
+  the first port to the VRF and the rest stayed in the DEFAULT table — a VRF
+  isolation break. Coverage: `compiler_routing_instance_interface_3904_test.go`
+  (both AST shapes + single-value back-compat).
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a

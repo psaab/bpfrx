@@ -123,7 +123,7 @@ func TestIKEPolicyResolvableChainAccepted(t *testing.T) {
 		t.Fatalf("CompileConfig rejected a fully resolvable IKE chain: %v", err)
 	}
 	pol := cfg.Security.IPsec.IKEPolicies["ike-pol"]
-	if pol == nil || pol.Proposals != "ike-aes256" {
+	if pol == nil || len(pol.Proposals) != 1 || pol.Proposals[0] != "ike-aes256" {
 		t.Fatalf("ike-policy ike-pol not compiled with proposals=ike-aes256: %+v", pol)
 	}
 	if _, ok := cfg.Security.IPsec.IKEProposals["ike-aes256"]; !ok {

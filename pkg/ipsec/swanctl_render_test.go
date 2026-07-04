@@ -277,7 +277,7 @@ func TestProposalBuilders_ECPGroupAcrossAllSites(t *testing.T) {
 		// carries the configured PFS group onto a conservative proposal.
 		cfg := &config.IPsecConfig{
 			Policies: map[string]*config.IPsecPolicyDef{
-				"pol1": {Name: "pol1", PFSGroup: gc.group, Proposals: "missing-prop"},
+				"pol1": {Name: "pol1", PFSGroup: gc.group, Proposals: []string{"missing-prop"}},
 			},
 		}
 		vpn := &config.IPsecVPN{IPsecPolicy: "pol1"}

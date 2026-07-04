@@ -207,7 +207,7 @@ func TestResolveESPSettings_DanglingProposalPreservesPFS(t *testing.T) {
 			"ipsec-pol": {
 				Name:      "ipsec-pol",
 				PFSGroup:  14,
-				Proposals: "does-not-exist",
+				Proposals: []string{"does-not-exist"},
 			},
 		},
 		// Proposals deliberately omits "does-not-exist" — dangling ref.
@@ -241,7 +241,7 @@ func TestResolveESPSettings_DanglingProposalNoPFSStaysDefault(t *testing.T) {
 			"ipsec-pol": {
 				Name:      "ipsec-pol",
 				PFSGroup:  0,
-				Proposals: "does-not-exist",
+				Proposals: []string{"does-not-exist"},
 			},
 		},
 	}
@@ -279,7 +279,7 @@ func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
 			},
 		},
 		Policies: map[string]*config.IPsecPolicyDef{
-			"ipsec-pol": {Name: "ipsec-pol", PFSGroup: 14, Proposals: "does-not-exist"},
+			"ipsec-pol": {Name: "ipsec-pol", PFSGroup: 14, Proposals: []string{"does-not-exist"}},
 		},
 	}
 	got := m.generateConfig(cfg)
@@ -481,7 +481,7 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 			"ike-pol": {
 				Name:      "ike-pol",
 				Mode:      "main",
-				Proposals: "ike-p1",
+				Proposals: []string{"ike-p1"},
 				PSK:       "secret123",
 			},
 		},
@@ -512,7 +512,7 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 			"ipsec-pol": {
 				Name:      "ipsec-pol",
 				PFSGroup:  14,
-				Proposals: "esp-p2",
+				Proposals: []string{"esp-p2"},
 			},
 		},
 		VPNs: map[string]*config.IPsecVPN{
@@ -561,7 +561,7 @@ func TestGenerateConfig_DynamicHostname(t *testing.T) {
 		// The ike-policy -> ike-proposal chain must resolve, else
 		// renderConfig fail-closed-skips the VPN (#2270).
 		IKEPolicies: map[string]*config.IKEPolicy{
-			"pol1": {Name: "pol1", Proposals: "ike-p1"},
+			"pol1": {Name: "pol1", Proposals: []string{"ike-p1"}},
 		},
 		IKEProposals: map[string]*config.IKEProposal{
 			"ike-p1": {Name: "ike-p1", AuthMethod: "pre-shared-keys", EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: 14},
@@ -717,7 +717,7 @@ func TestGenerateConfig_AggressiveMode(t *testing.T) {
 			"aggr-pol": {
 				Name:      "aggr-pol",
 				Mode:      "aggressive",
-				Proposals: "ike-p1",
+				Proposals: []string{"ike-p1"},
 				PSK:       "secret",
 			},
 		},
@@ -755,7 +755,7 @@ func TestGenerateConfig_AggressiveMode_NotSet(t *testing.T) {
 			"main-pol": {
 				Name:      "main-pol",
 				Mode:      "main",
-				Proposals: "ike-p1",
+				Proposals: []string{"ike-p1"},
 				PSK:       "secret",
 			},
 		},
@@ -849,7 +849,7 @@ func TestGenerateConfig_IKELifetime(t *testing.T) {
 			},
 		},
 		IKEPolicies: map[string]*config.IKEPolicy{
-			"pol1": {Name: "pol1", Proposals: "ike-p1", PSK: "secret"},
+			"pol1": {Name: "pol1", Proposals: []string{"ike-p1"}, PSK: "secret"},
 		},
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {Name: "gw", Address: "203.0.113.1", IKEPolicy: "pol1"},
@@ -879,7 +879,7 @@ func TestGenerateConfig_ESPLifetime(t *testing.T) {
 			},
 		},
 		Policies: map[string]*config.IPsecPolicyDef{
-			"ipsec-pol": {Name: "ipsec-pol", Proposals: "esp-p2"},
+			"ipsec-pol": {Name: "ipsec-pol", Proposals: []string{"esp-p2"}},
 		},
 		VPNs: map[string]*config.IPsecVPN{
 			"tun": {Gateway: "203.0.113.1", IPsecPolicy: "ipsec-pol"},
@@ -944,7 +944,7 @@ func TestGenerateConfig_PubkeyAuth(t *testing.T) {
 			},
 		},
 		IKEPolicies: map[string]*config.IKEPolicy{
-			"pol1": {Name: "pol1", Proposals: "ike-p1"},
+			"pol1": {Name: "pol1", Proposals: []string{"ike-p1"}},
 		},
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {
