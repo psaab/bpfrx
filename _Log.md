@@ -1,3 +1,44 @@
+## 2026-07-03 — #4024: a flowless (session-less) MissingNeighbor transit packet was FIB-reinjected past the zone security policy → deny-all fail-open for flowless fragments
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-259 (MEDIUM, security fail-open). In
+    `userspace-dp` the flowless (non-first fragment / no-L4) transit path
+    enforced the zone security policy only for the `ForwardCandidate`
+    disposition (#3291), deferring `MissingNeighbor` to "its own cold-path
+    arm". That arm's #1913 policy gate is `if let Some(flow)`, which is
+    never true for a flowless packet (`flow == None`), so a flowless
+    fragment whose next-hop neighbor was unresolved fell through — no
+    policy check — to the `pending_neigh` buffer + the trailing #1913
+    slow-path reinject. Under a `deny-all` zone pair the kernel FIB then
+    forwarded the transit: a zone-policy bypass for flowless fragments (and
+    the pre-session missing-neighbor window). The route resolves (egress /
+    to-zone are known), so the policy IS evaluable; MissingNeighbor
+    (unresolved next-hop MAC) is orthogonal to permit/deny and must not be
+    a policy escape hatch.
+  - **Fix**: added an `else` (flow == None) branch to the `MissingNeighbor`
+    match arm that rebuilds the L3 tuple
+    (`frame::l3_session_flow_from_meta`) and runs the SAME
+    `evaluate_policy_result_l3_aware(.., l4_present = false)` gate the
+    flow-backed arm (#1913) and the flowless ForwardCandidate arm (#3291)
+    use — BEFORE the neg-cache probe / #1769 resolver enqueue / kernel
+    ARP-NDP probe / pending_neigh buffer / reinject. A deny emits the
+    PolicyDeny event (silent drop — a fragment has no L4 header to reject),
+    converts the disposition to `PolicyDenied` (so the #1913 reinject
+    chokepoint drops it fail-closed), and recycles the frame. A permit
+    keeps `MissingNeighbor` and takes the normal buffer-and-retry forward
+    path — no over-gating of legitimate flowless forwarding. Fail-closed:
+    an underivable L3 tuple leaves the arm on the same reinject path (only
+    reached for a permit / non-derivable case).
+  - **Tests**: `flowless_non_first_fragment_missing_neighbor_dropped_by_deny_all_4024`
+    (deny-all + flowless MissingNeighbor → policy_deny == 1, pending_neigh
+    empty; RED on revert: policy_deny == 0, buffered) and
+    `flowless_non_first_fragment_missing_neighbor_permitted_forwards_4024`
+    (an `application any` permit → not denied, still buffered for retry —
+    no over-gating). Both drive a real non-first fragment through
+    `poll_binding_process_descriptor` via `txn_run_descriptor`.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/README.md,
+    _Log.md
 ## 2026-07-03 — #4027: `interfaces interface-range` created a phantom admin-down interface and dropped member config (fable-161 F-029)
 
 - **Timestamp**: 2026-07-03
