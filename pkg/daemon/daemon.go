@@ -639,6 +639,22 @@ type Daemon struct {
 	// linkStateResubBackoff is the delay between a subscription close and the
 	// resubscribe attempt. Zero ⇒ linkStateResubBackoffDefault (#3950).
 	linkStateResubBackoff time.Duration
+
+	// --- fabric-state monitor seams (#4031) ---
+	// fabricLinkSubscribe starts the netlink link-update subscription for the
+	// fabric-state monitor (monitorFabricState). It MUST stream updates to ch
+	// and close ch when the subscription ends (a receive error — including a
+	// recoverable ENOBUFS receive-buffer overflow — or done being closed). nil
+	// ⇒ the real netlink subscription (defaultFabricLinkSubscribe). Overridable
+	// so tests can drive the resilient resubscribe loop with an injected close.
+	fabricLinkSubscribe func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error
+	// fabricNeighSubscribe starts the netlink neighbor-update subscription for
+	// the fabric-state monitor. Same close/leak contract as fabricLinkSubscribe.
+	// nil ⇒ netlink.NeighSubscribe (defaultFabricNeighSubscribe) (#4031).
+	fabricNeighSubscribe func(ch chan<- netlink.NeighUpdate, done <-chan struct{}) error
+	// fabricStateResubBackoff is the delay between a fabric subscription close
+	// and the resubscribe attempt. Zero ⇒ fabricStateResubBackoffDefault (#4031).
+	fabricStateResubBackoff time.Duration
 }
 
 func (d *Daemon) applyResult() *dataplane.ApplyResult {
