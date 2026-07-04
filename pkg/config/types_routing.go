@@ -314,19 +314,27 @@ type ISISInterface struct {
 
 // RAInterfaceConfig configures Router Advertisement on an interface.
 type RAInterfaceConfig struct {
-	Interface       string
-	ManagedConfig   bool   // managed-configuration (M flag)
-	OtherStateful   bool   // other-stateful-configuration (O flag)
-	Preference      string // "high", "medium", "low" (default: medium)
-	DefaultLifetime int    // seconds, 0 = default (1800)
-	MaxAdvInterval  int    // seconds, 0 = default (600)
-	MinAdvInterval  int    // seconds, 0 = default (200)
-	Prefixes        []*RAPrefix
-	DNSServers      []string // recursive DNS server addresses
-	NAT64Prefix     string   // PREF64 prefix (e.g. "64:ff9b::/96")
-	NAT64PrefixLife int      // PREF64 lifetime in seconds (0 = default)
-	LinkMTU         int      // advertised link MTU, 0 = omit
-	SourceLinkLocal string   // explicit link-local to use as RA source (overrides auto-selected)
+	Interface     string
+	ManagedConfig bool   // managed-configuration (M flag)
+	OtherStateful bool   // other-stateful-configuration (O flag)
+	Preference    string // "high", "medium", "low" (default: medium)
+	// DefaultLifetime is the RA header Router Lifetime in seconds (RFC 4861
+	// §4.2). It is meaningful ONLY when DefaultLifetimeSet is true; an
+	// EXPLICIT 0 means "not a default router" (RFC 4861 §6.2.1) and MUST be
+	// preserved through to the wire. When DefaultLifetimeSet is false the
+	// field is unset and readers default it to defaultRouterLifetime (1800).
+	// Do NOT treat 0 as "unset" — that conflation (#4119) made an explicit
+	// 0 indistinguishable from absent and coerced it back to 1800.
+	DefaultLifetime    int
+	DefaultLifetimeSet bool // true when default-lifetime was explicitly configured
+	MaxAdvInterval     int  // seconds, 0 = default (600)
+	MinAdvInterval     int  // seconds, 0 = default (200)
+	Prefixes           []*RAPrefix
+	DNSServers         []string // recursive DNS server addresses
+	NAT64Prefix        string   // PREF64 prefix (e.g. "64:ff9b::/96")
+	NAT64PrefixLife    int      // PREF64 lifetime in seconds (0 = default)
+	LinkMTU            int      // advertised link MTU, 0 = omit
+	SourceLinkLocal    string   // explicit link-local to use as RA source (overrides auto-selected)
 }
 
 // RAPrefix defines a prefix advertised via RA.

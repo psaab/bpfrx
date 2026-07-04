@@ -32640,3 +32640,30 @@ top.
     pkg/dhcp/classless_routes_test.go, pkg/frr/manager.go,
     pkg/frr/config_render.go, pkg/frr/frr_test.go,
     pkg/daemon/daemon_flow.go, pkg/dhcp/README.md, _Log.md
+- **Timestamp**: 2026-07-04
+  - **Action**: #4119 — allow `router-advertisement default-lifetime 0`
+    (RFC 4861 §6.2.1 "not a default router"). Verified at HEAD: schema
+    `ValidateInteger(1, 65535)` rejected 0 at commit; `types_routing.go`
+    `DefaultLifetime int` doc said "0 = default (1800)"; and buildRA /
+    Status / CLI show all coerced `lifetime <= 0` back to 1800 — so an
+    explicit 0 could never reach the wire and xpf always hijacked host
+    default-router selection on multi-router LANs. Fix: lower the schema
+    floor to `ValidateInteger(0, 65535)` (upper 16-bit #3895 bound kept);
+    add `RAInterfaceConfig.DefaultLifetimeSet` to separate an explicit
+    value (incl. 0) from an unset leaf; the compiler sets it only when
+    default-lifetime is configured; buildRA / Status / CLI show default to
+    1800 ONLY when the flag is false; configEqual compares the flag so an
+    unset→"0" edit restarts the sender. Dependent options (RDNSS, PREF64),
+    whose lifetime defaults to the router lifetime, use a separate
+    optLifetime that never drops below 1800 — a 0 Router Lifetime withdraws
+    only default-router duty, not the DNS server / NAT64 prefix; Prefix
+    Information options carry their own 30d/7d lifetimes so on-link SLAAC is
+    unaffected. RED-on-revert PROVEN: reverting the schema floor fails
+    TestSchema4119_DefaultLifetime_Accepts0; reverting the buildRA coercion
+    fails TestBuildRA_4119_ExplicitZero + _PrefixAndPref64StillAdvertised
+    (RouterLifetime springs back to 1800). go test ./pkg/config/...
+    ./pkg/ra/... ./pkg/cli/... green; go build ./..., vet, gofmt clean.
+  - **File(s)**: pkg/config/types_routing.go, pkg/config/schema_routing.go,
+    pkg/config/compiler_protocols.go, pkg/config/schema_validate_4119_test.go,
+    pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/sender_marshal_4119_test.go,
+    pkg/cli/cli_show_routing.go, docs/embedded-radvd.md, _Log.md
