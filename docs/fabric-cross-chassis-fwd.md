@@ -69,6 +69,21 @@ re-syncs the fabric state, rather than dying permanently, and it closes BOTH
 netlink sockets on every path so neither fd leaks (#4031). It exits only on
 context cancellation.
 
+**Per-fabric refresh channels (dual-fabric, #4038):** in a redundant
+`fabric-link` + `fabric-link-1` cluster the fab0 loop (`populateFabricFwd`)
+and the fab1 loop (`populateFabricFwd1`) each own a refresh channel
+(`fabricRefreshCh` / `fabricRefreshCh1`). `monitorFabricState` does not tag
+events per fabric, so `triggerFabricRefresh()` signals BOTH channels (non-
+blocking, capacity 1) and every configured fabric re-resolves on any event —
+matching the synchronous `RefreshFabricFwd()`, which already refreshes both
+entries. A single shared channel was wrong: a Go send is received by exactly
+one waiting goroutine, so one trigger woke only fab0 OR fab1 (whichever won
+the receive) and the other fabric's link/neighbor event was dropped until its
+30s safety-net tick — degrading the second fabric's sub-second convergence.
+A single-fabric cluster leaves `fabricRefreshCh1` nil; the non-blocking send
+falls through its `default` arm, so `triggerFabricRefresh()` is a no-op for
+the absent fabric.
+
 ### Fix 2: VRRP Coordinated Preemption (Defense-in-depth)
 
 **Concept:** All VRRP instances preempt simultaneously when `ReleaseSyncHold()`
