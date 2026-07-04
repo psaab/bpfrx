@@ -3291,8 +3291,12 @@ pub(super) fn poll_binding_process_descriptor(
                     // (3) Zone security policy — only for TRANSIT
                     //     (ForwardCandidate). Local delivery (host-inbound) is
                     //     #3292; NoRoute drops anyway; MissingNeighbor keeps its
-                    //     own cold-path arm; FabricRedirect is HA peer-owned and
-                    //     enforced on the peer. A non-Permit verdict is a SILENT
+                    //     own cold-path arm, which now enforces this SAME zone
+                    //     policy on its flowless (flow == None) branch (#4024 —
+                    //     before which a flowless MissingNeighbor fragment was
+                    //     FIB-reinjected past a deny-all); FabricRedirect is HA
+                    //     peer-owned and enforced on the peer. A non-Permit
+                    //     verdict is a SILENT
                     //     drop (no L4 header to reject), with a PolicyDeny event
                     //     for observability — same record the flow-backed deny
                     //     emits, with ports = 0.
@@ -4171,13 +4175,115 @@ pub(super) fn poll_binding_process_descriptor(
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
+                            } else {
+                                // #4024: a FLOWLESS packet (non-first fragment /
+                                // no-L4) that resolves to MissingNeighbor still
+                                // carries FULL L3 identity — src/dst/protocol/
+                                // ingress+egress zones — so it MUST pass the zone
+                                // security policy BEFORE any neighbor-resolution
+                                // side-effect (neg-cache probe, #1769 resolver
+                                // enqueue, kernel ARP/NDP probe, pending_neigh
+                                // buffer) OR the trailing slow-path reinject.
+                                //
+                                // Before #4024 the flowless case fell through
+                                // here to the reinject path (documented as
+                                // "preserving the pre-#1913 behavior — a flowless
+                                // MissingNeighbor packet was always slow-path-
+                                // eligible"). That FAILED OPEN: under a `deny-all`
+                                // zone pair, a flowless fragment whose next-hop
+                                // neighbor was unresolved was FIB-reinjected and
+                                // the kernel forwarded it — a zone-policy bypass.
+                                // #3291 enforces zone policy on the flowless
+                                // ForwardCandidate arm but deferred MissingNeighbor
+                                // to "its own cold-path arm" (this one), whose
+                                // #1913 gate is `if let Some(flow)` and so never
+                                // fired for a flowless (flow == None) packet.
+                                //
+                                // `l3_session_flow_from_meta` rebuilds the L3
+                                // tuple the shim stamped even for a fragment; the
+                                // synthetic flow is evaluated with ports = 0 /
+                                // l4_present = false, so port-bearing application
+                                // terms fail closed while address/protocol/`any`
+                                // still match — parity with the #3291 flowless
+                                // ForwardCandidate gate and the #1913 flow-backed
+                                // gate above, with no over-gating of a permitted
+                                // flowless flow. `from_zone_id`/`to_zone_id` were
+                                // resolved at the top of this arm (MissingNeighbor
+                                // has a valid egress_ifindex). A deny is a SILENT
+                                // drop — a fragment has no L4 header to synthesize
+                                // a reject from — with a PolicyDeny event for
+                                // observability, then PolicyDenied so the trailing
+                                // #1913 reinject chokepoint drops it fail-closed.
+                                if let Some(l3_flow) =
+                                    crate::afxdp::frame::l3_session_flow_from_meta(meta)
+                                {
+                                    let policy_icmp = policy_packet_icmp(packet_frame, meta);
+                                    let policy_result =
+                                        crate::policy::evaluate_policy_result_l3_aware(
+                                            &worker_ctx.forwarding.policy,
+                                            from_zone_id,
+                                            to_zone_id,
+                                            l3_flow.src_ip,
+                                            l3_flow.dst_ip,
+                                            meta.protocol,
+                                            0,
+                                            0,
+                                            policy_icmp,
+                                            desc.len as u64,
+                                            // L4 header ABSENT — port-bearing app
+                                            // terms fail closed.
+                                            false,
+                                        );
+                                    if !matches!(policy_result.action, PolicyAction::Permit) {
+                                        let owner_rg_id = owner_rg_for_resolution(
+                                            worker_ctx.forwarding,
+                                            decision.resolution,
+                                        );
+                                        emit_policy_deny_event(
+                                            worker_ctx.event_stream,
+                                            &l3_flow,
+                                            &decision.nat,
+                                            meta,
+                                            from_zone_id,
+                                            to_zone_id,
+                                            owner_rg_id,
+                                            policy_result.policy_id,
+                                            policy_result.action,
+                                            // No L4 port for a flowless packet →
+                                            // no AppID.
+                                            0,
+                                            // #3615: a flowless deny is ALWAYS a
+                                            // silent drop — no reply can be
+                                            // synthesized — so a `reject` term
+                                            // logs the truthful DENY.
+                                            false,
+                                            now_ns,
+                                        );
+                                        telemetry.dbg.policy_deny += 1;
+                                        decision.resolution.disposition =
+                                            ForwardingDisposition::PolicyDenied;
+                                        record_forwarding_disposition(
+                                            &worker_ctx.ident,
+                                            DispositionCounters::Hot(telemetry.counters),
+                                            decision.resolution,
+                                            desc.len as u32,
+                                            Some(meta),
+                                            debug.as_ref(),
+                                            worker_ctx.recent_exceptions,
+                                            worker_ctx.last_resolution,
+                                            worker_ctx.forwarding,
+                                        );
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
+                                }
+                                // Flowless permit (or no derivable L3 tuple):
+                                // fall through to the negative-cache / probe /
+                                // reinject path. A permitted flowless fragment is
+                                // legitimately forwarded once the neighbor
+                                // resolves — `MissingNeighbor` stays slow-path-
+                                // eligible for it.
                             }
-                            // No flow tuple (e.g. non-first fragment) skips
-                            // the early policy gate and falls through to the
-                            // negative-cache / probe / reinject path,
-                            // preserving the pre-#1913 behavior —
-                            // `MissingNeighbor` for a flowless packet was
-                            // always slow-path-eligible.
                             // #1651 B3: dead-host fast-fail gate. Runs at
                             // the very top of the MissingNeighbor arm,
                             // BEFORE the kernel probe, session seed, and

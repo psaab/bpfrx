@@ -30,6 +30,84 @@
     `docs/fabric-cross-chassis-fwd.md`
   - **Follow-up**: test-failover WARRANTED (HA fabric) — batch-validated.
 
+## 2026-07-03 — #4024: a flowless (session-less) MissingNeighbor transit packet was FIB-reinjected past the zone security policy → deny-all fail-open for flowless fragments
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-259 (MEDIUM, security fail-open). In
+    `userspace-dp` the flowless (non-first fragment / no-L4) transit path
+    enforced the zone security policy only for the `ForwardCandidate`
+    disposition (#3291), deferring `MissingNeighbor` to "its own cold-path
+    arm". That arm's #1913 policy gate is `if let Some(flow)`, which is
+    never true for a flowless packet (`flow == None`), so a flowless
+    fragment whose next-hop neighbor was unresolved fell through — no
+    policy check — to the `pending_neigh` buffer + the trailing #1913
+    slow-path reinject. Under a `deny-all` zone pair the kernel FIB then
+    forwarded the transit: a zone-policy bypass for flowless fragments (and
+    the pre-session missing-neighbor window). The route resolves (egress /
+    to-zone are known), so the policy IS evaluable; MissingNeighbor
+    (unresolved next-hop MAC) is orthogonal to permit/deny and must not be
+    a policy escape hatch.
+  - **Fix**: added an `else` (flow == None) branch to the `MissingNeighbor`
+    match arm that rebuilds the L3 tuple
+    (`frame::l3_session_flow_from_meta`) and runs the SAME
+    `evaluate_policy_result_l3_aware(.., l4_present = false)` gate the
+    flow-backed arm (#1913) and the flowless ForwardCandidate arm (#3291)
+    use — BEFORE the neg-cache probe / #1769 resolver enqueue / kernel
+    ARP-NDP probe / pending_neigh buffer / reinject. A deny emits the
+    PolicyDeny event (silent drop — a fragment has no L4 header to reject),
+    converts the disposition to `PolicyDenied` (so the #1913 reinject
+    chokepoint drops it fail-closed), and recycles the frame. A permit
+    keeps `MissingNeighbor` and takes the normal buffer-and-retry forward
+    path — no over-gating of legitimate flowless forwarding. Fail-closed:
+    an underivable L3 tuple leaves the arm on the same reinject path (only
+    reached for a permit / non-derivable case).
+  - **Tests**: `flowless_non_first_fragment_missing_neighbor_dropped_by_deny_all_4024`
+    (deny-all + flowless MissingNeighbor → policy_deny == 1, pending_neigh
+    empty; RED on revert: policy_deny == 0, buffered) and
+    `flowless_non_first_fragment_missing_neighbor_permitted_forwards_4024`
+    (an `application any` permit → not denied, still buffered for retry —
+    no over-gating). Both drive a real non-first fragment through
+    `poll_binding_process_descriptor` via `txn_run_descriptor`.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/README.md,
+    _Log.md
+## 2026-07-03 — #4027: `interfaces interface-range` created a phantom admin-down interface and dropped member config (fable-161 F-029)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the compiler mishandling `interfaces interface-range
+    <name> { member <if>; <shared cfg> }`. Verified first with a scratch
+    repro (ParseSetCommand + tree.SetPath): the generic `interfaces` wildcard
+    treated `interface-range` as an interface NAME, so the compiler minted a
+    PHANTOM `InterfaceConfig` keyed `interface-range` (matching no kernel NIC,
+    later reconciled admin-down) while the shared config (mtu, unit/family
+    addresses) AND the member interfaces themselves were silently dropped — a
+    genuine config-parity defect (interface-range was entirely unimplemented,
+    only referenced in a Junos help-text doc).
+  - **Fix**: added `expandInterfaceRanges` (`compiler_interface_range.go`), an
+    AST pre-pass called in `compileExpanded` BEFORE section compilation and the
+    H9/H10 unsupported-stanza gate. It rewrites every interface-range stanza
+    into its member interfaces: the range's shared statements are flattened to
+    `set`-command suffixes and replayed through `ConfigTree.SetPath` under each
+    member's name (schema-driven re-nesting, so compileInterfaces reads them
+    identically to a normal per-interface config), merged with the member's own
+    config re-applied LAST so member-local knobs win on a scalar conflict while
+    additive statements (addresses) accumulate. `member-range <a> to <b>`
+    expands over the trailing decimal (prefix-shared, capped). Handles both the
+    flat-set (range name in each leaf's Keys[0]) and hierarchical (range name in
+    the node's Keys[1]) AST shapes, mutates the group-expanded/inactive-pruned
+    clone in place, and is a strict no-op when no interface-range is present.
+    No networkd change needed — the phantom never reaches the reconcile because
+    it never enters the compiled `cfg.Interfaces`.
+  - **File(s)**: pkg/config/compiler_interface_range.go,
+    pkg/config/compiler.go,
+    pkg/config/compiler_interface_range_4027_test.go,
+    docs/config-schema.md
+  - **Validation**: new config tests (member expansion + NO phantom; shared
+    unit/family deep-apply; member override precedence + address accumulation;
+    hierarchical shape; member-range; multiple flat-set ranges; no-stanza
+    no-op) — all RED on revert of the expansion pass except the no-op test.
+    `go test ./pkg/config/... ./pkg/networkd/...` green, `go build ./...`,
+    gofmt, vet clean.
 ## 2026-07-03 — #4028: full-resync RG enumeration hardcoded 0..15 → RG >= 16 never resynced (fable-161 F-166)
 
 - **Timestamp**: 2026-07-03
