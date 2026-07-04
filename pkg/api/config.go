@@ -118,7 +118,12 @@ func (s *Server) configActivateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
-	if s.store.IsConfirmPending() {
+	// Bare commit during a pending commit-confirmed window (#4000). Confirm
+	// the pending config only when the candidate is UNCHANGED; new staged
+	// edits fall through to the normal commit below, where commitFn applies
+	// them AND clears the timer (#3861), so they are committed rather than
+	// silently dropped.
+	if s.store.IsConfirmPending() && !s.store.IsDirty() {
 		if err := s.store.ConfirmCommit(); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

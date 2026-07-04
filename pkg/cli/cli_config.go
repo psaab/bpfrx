@@ -231,8 +231,16 @@ func (c *CLI) handleCommit(args []string) error {
 		return nil
 	}
 
-	// Bare commit: if a confirmed commit is pending, confirm it
-	if c.store.IsConfirmPending() {
+	// Bare commit during a pending commit-confirmed window (#4000). Junos
+	// semantics: a `commit` here confirms the pending config AND commits any
+	// new candidate edits. If the candidate is UNCHANGED since the pending
+	// commit, this is a pure confirmation — cancel the rollback timer, no new
+	// commit (avoids a spurious history/rollback entry). If the operator
+	// staged NEW edits after `commit confirmed`, fall through to the normal
+	// commit below: CommitWithDescription (#3861) applies the new candidate
+	// AND clears the confirm timer, so the edits are committed rather than
+	// silently dropped (the pre-#4000 intercept confirmed-and-discarded).
+	if c.store.IsConfirmPending() && !c.store.IsDirty() {
 		if err := c.store.ConfirmCommit(); err != nil {
 			return fmt.Errorf("confirm commit: %w", err)
 		}
