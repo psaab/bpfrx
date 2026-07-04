@@ -27,11 +27,28 @@ func (t *ConfigTree) CopyPath(src, dst []string) error {
 }
 
 // RenamePath moves a subtree from src to dst path.
+//
+// The source node is resolved by its FULL identity (the named key, e.g.
+// `policy <name>` / `term <name>`) via findNodeWithParent, which prefers the
+// longest key match over the first keyword match. This is what lets a
+// NON-FIRST same-keyword sibling be renamed: the earlier removeNode-based
+// implementation broke on the first child whose FIRST key matched, so
+// `rename policy B to B2` with siblings [A B C] resolved `policy A`, descended
+// into it, and failed "source not found" (the #3982 read-all-siblings defect,
+// the config-edit sibling of #3842/#2419/#3975/#3980).
+//
+// A rename that only changes the name (the common case: destination parent ==
+// source parent) is performed IN PLACE so sibling order is preserved. A rename
+// that moves the node under a different parent removes it from the source and
+// appends it to the destination. Either way the renamed node keeps its
+// children / sub-config. A rename whose new identity collides with an existing
+// sibling under the destination parent is rejected rather than creating a
+// duplicate.
 func (t *ConfigTree) RenamePath(src, dst []string) error {
 	if len(src) == 0 || len(dst) == 0 {
 		return fmt.Errorf("empty path")
 	}
-	srcNode, err := t.removeNode(src)
+	srcNode, srcParent, err := t.findNodeWithParent(src)
 	if err != nil {
 		return fmt.Errorf("source not found: %s", strings.Join(src, " "))
 	}
@@ -39,9 +56,62 @@ func (t *ConfigTree) RenamePath(src, dst []string) error {
 	if len(dst) < nk {
 		return fmt.Errorf("destination path too short")
 	}
-	srcNode.Keys = append([]string(nil), dst[len(dst)-nk:]...)
+	newKeys := append([]string(nil), dst[len(dst)-nk:]...)
 	dstParentPath := dst[:len(dst)-nk]
-	return t.insertNode(dstParentPath, srcNode)
+	dstParent, err := t.childrenAtPath(dstParentPath)
+	if err != nil {
+		return fmt.Errorf("destination parent not found: %s", strings.Join(dstParentPath, " "))
+	}
+	// Collision guard: reject a rename whose new identity duplicates an
+	// existing sibling under the destination parent (excluding the node being
+	// renamed, so renaming to the same name is a no-op rather than an error).
+	for _, n := range *dstParent {
+		if n != srcNode && keysEqual(n.Keys, newKeys) {
+			return fmt.Errorf("rename target already exists: %s", strings.Join(dst, " "))
+		}
+	}
+	if dstParent == srcParent {
+		// Same parent: rename in place, preserving sibling order and children.
+		srcNode.Keys = newKeys
+		return nil
+	}
+	// Different parent: detach from the source parent and append to the
+	// destination parent, keeping the node's children/sub-config.
+	for i, n := range *srcParent {
+		if n == srcNode {
+			*srcParent = append((*srcParent)[:i], (*srcParent)[i+1:]...)
+			break
+		}
+	}
+	srcNode.Keys = newKeys
+	*dstParent = append(*dstParent, srcNode)
+	return nil
+}
+
+// childrenAtPath navigates to the node identified by path and returns a pointer
+// to its children slice. An empty path returns the tree root's children. Like
+// findNodeWithParent it prefers the longest key match at each level so a
+// same-keyword sibling in the path is resolved by full identity.
+func (t *ConfigTree) childrenAtPath(path []string) (*[]*Node, error) {
+	children := &t.Children
+	pos := 0
+	for pos < len(path) {
+		var bestChild *Node
+		bestConsumed := 0
+		for _, child := range *children {
+			consumed := matchNodeKeys(child, path, pos)
+			if consumed > bestConsumed {
+				bestChild = child
+				bestConsumed = consumed
+			}
+		}
+		if bestChild == nil {
+			return nil, fmt.Errorf("path element %q not found", path[pos])
+		}
+		children = &bestChild.Children
+		pos += bestConsumed
+	}
+	return children, nil
 }
 
 // InsertBefore moves an existing element before another element in the same

@@ -1,3 +1,35 @@
+## 2026-07-03 — #3982: config-mode `rename` of a non-first same-keyword sibling failed (matched only the first sibling)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-036 (MEDIUM, config-mode edit parity).
+    `RenamePath` (`pkg/config/ast_edit.go`) — the `rename <old> to <new>`
+    config-mode verb — resolved the source through `removeNode`
+    (`pkg/config/ast.go`), whose per-level loop broke on the FIRST child
+    whose FIRST key matched (`matchNodeKeys > 0` returns `1` for a
+    keyword-only match). With several same-keyword siblings (`policy A/B/C`,
+    `term X/Y/Z`) renaming a NON-FIRST one — `rename policy B to B2` with
+    `[A B C]` — matched `policy A`, descended into it for `B`, and failed
+    `source not found` (other shapes could rename the wrong first node). The
+    operator could not rename the 2nd+ occurrence; the only recourse was
+    delete + re-add, losing ordering and sub-config. This is the config-edit
+    sibling of the #3842 / #2419 / #3975 / #3980 read-all-siblings class.
+  - **Fix**: rewrote `RenamePath` to resolve the source through
+    `findNodeWithParent` (prefers the LONGEST key match, so it selects
+    `policy B` by full identity, not the first `policy` keyword). A rename
+    that only changes the name (destination parent == source parent) is done
+    IN PLACE, preserving sibling order and the node's children/sub-config; a
+    cross-parent rename detaches and re-appends via a new `childrenAtPath`
+    helper, keeping the subtree. Added a collision guard: a rename whose new
+    identity duplicates an existing sibling under the destination parent
+    (`rename policy B to C` when `C` exists) is rejected rather than creating
+    a duplicate. Removed the now-dead first-keyword-match `removeNode` helper.
+  - **File(s)**: `pkg/config/ast_edit.go` (RenamePath rewrite + childrenAtPath),
+    `pkg/config/ast.go` (removeNode deleted), `pkg/config/parser_ast_test.go`
+    (TestRenameNonFirstSibling — RED on revert), `docs/config-schema.md`
+    (rename-side contract section).
+  - **Validation**: `TestRenameNonFirstSibling` RED on revert (`source not
+    found: ... policy B`), GREEN with the fix; `go test ./pkg/config/...`,
+    `go build ./...`, `gofmt`, `go vet ./pkg/config/` all clean.
 ## 2026-07-03 — #3980: path-scoped `show configuration <path>` / `| display set` showed only the FIRST sibling at a repeated-keyword level (navigatePath terminal single-key match was FindChild-first)
 
 - **Timestamp**: 2026-07-03

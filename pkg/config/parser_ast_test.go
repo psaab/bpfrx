@@ -685,6 +685,167 @@ func TestInsertBeforeAfter(t *testing.T) {
 	}
 }
 
+// TestRenameNonFirstSibling covers #3982: `rename <old> to <new>` must resolve
+// the target by full identity and rename the SPECIFIC same-keyword sibling,
+// including a NON-FIRST one. Before the fix RenamePath removed the target via
+// removeNode, which broke on the first child whose FIRST key matched, so
+// renaming the 2nd of several `policy <name>` errored "source not found" (or,
+// under other shapes, renamed the wrong/first node). This test goes RED on
+// revert.
+func TestRenameNonFirstSibling(t *testing.T) {
+	build := func() *ConfigTree {
+		tree := &ConfigTree{}
+		cmds := []string{
+			"set security zones security-zone trust",
+			"set security zones security-zone untrust",
+		}
+		for _, name := range []string{"A", "B", "C"} {
+			p := "set security policies from-zone trust to-zone untrust policy " + name
+			cmds = append(cmds,
+				p+" match source-address any",
+				p+" match destination-address any",
+				p+" match application any",
+				p+" then permit",
+			)
+		}
+		for _, cmd := range cmds {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath: %v", err)
+			}
+		}
+		return tree
+	}
+	base := []string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy"}
+	path := func(name string) []string {
+		return append(append([]string{}, base...), name)
+	}
+	// policyNode returns the policy node with the given name, or nil.
+	policyNode := func(tree *ConfigTree, name string) *Node {
+		for _, c := range tree.Children {
+			if len(c.Keys) == 0 || c.Keys[0] != "security" {
+				continue
+			}
+			for _, c2 := range c.Children {
+				if len(c2.Keys) == 0 || c2.Keys[0] != "policies" {
+					continue
+				}
+				for _, c3 := range c2.Children {
+					if len(c3.Keys) >= 4 && c3.Keys[1] == "trust" && c3.Keys[3] == "untrust" {
+						for _, p := range c3.Children {
+							if len(p.Keys) >= 2 && p.Keys[0] == "policy" && p.Keys[1] == name {
+								return p
+							}
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+	order := func(tree *ConfigTree) []string {
+		var names []string
+		for _, c := range tree.Children {
+			if len(c.Keys) == 0 || c.Keys[0] != "security" {
+				continue
+			}
+			for _, c2 := range c.Children {
+				if len(c2.Keys) == 0 || c2.Keys[0] != "policies" {
+					continue
+				}
+				for _, c3 := range c2.Children {
+					if len(c3.Keys) >= 4 && c3.Keys[1] == "trust" && c3.Keys[3] == "untrust" {
+						for _, p := range c3.Children {
+							if len(p.Keys) >= 2 && p.Keys[0] == "policy" {
+								names = append(names, p.Keys[1])
+							}
+						}
+					}
+				}
+			}
+		}
+		return names
+	}
+
+	// (1) Rename the NON-FIRST sibling B -> B2. A + C untouched, order preserved.
+	tree := build()
+	if err := tree.RenamePath(path("B"), path("B2")); err != nil {
+		t.Fatalf("RenamePath(B->B2): %v", err)
+	}
+	if got := order(tree); len(got) != 3 || got[0] != "A" || got[1] != "B2" || got[2] != "C" {
+		t.Fatalf("after rename B->B2: expected [A B2 C], got %v", got)
+	}
+	if policyNode(tree, "B") != nil {
+		t.Errorf("old name B should be gone after rename")
+	}
+	// Renamed node keeps its sub-config (the `then permit` child).
+	b2 := policyNode(tree, "B2")
+	if b2 == nil {
+		t.Fatalf("renamed policy B2 not found")
+	}
+	foundPermit := false
+	for _, ch := range b2.Children {
+		if len(ch.Keys) >= 1 && ch.Keys[0] == "then" {
+			for _, gc := range ch.Children {
+				if len(gc.Keys) >= 1 && gc.Keys[0] == "permit" {
+					foundPermit = true
+				}
+			}
+		}
+	}
+	if !foundPermit {
+		t.Errorf("renamed policy B2 lost its `then permit` sub-config: %+v", b2.Children)
+	}
+
+	// (2) Renaming the FIRST sibling still works.
+	tree = build()
+	if err := tree.RenamePath(path("A"), path("A2")); err != nil {
+		t.Fatalf("RenamePath(A->A2): %v", err)
+	}
+	if got := order(tree); len(got) != 3 || got[0] != "A2" || got[1] != "B" || got[2] != "C" {
+		t.Fatalf("after rename A->A2: expected [A2 B C], got %v", got)
+	}
+
+	// (3) Rename to a COLLIDING existing sibling name is rejected, tree unchanged.
+	tree = build()
+	if err := tree.RenamePath(path("B"), path("C")); err == nil {
+		t.Fatalf("RenamePath(B->C) should be rejected (C already exists)")
+	}
+	if got := order(tree); len(got) != 3 || got[0] != "A" || got[1] != "B" || got[2] != "C" {
+		t.Fatalf("after rejected rename: expected [A B C] unchanged, got %v", got)
+	}
+
+	// (4) Renamed config still compiles and the zone pair sees the new name.
+	tree = build()
+	if err := tree.RenamePath(path("B"), path("B2")); err != nil {
+		t.Fatalf("RenamePath(B->B2): %v", err)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig after rename: %v", err)
+	}
+	var zp *ZonePairPolicies
+	for _, p := range cfg.Security.Policies {
+		if p.FromZone == "trust" && p.ToZone == "untrust" {
+			zp = p
+			break
+		}
+	}
+	if zp == nil {
+		t.Fatal("zone pair trust->untrust not found after rename")
+	}
+	if len(zp.Policies) != 3 || zp.Policies[0].Name != "A" || zp.Policies[1].Name != "B2" || zp.Policies[2].Name != "C" {
+		var names []string
+		for _, p := range zp.Policies {
+			names = append(names, p.Name)
+		}
+		t.Errorf("compiled policy names after rename: expected [A B2 C], got %v", names)
+	}
+}
+
 func TestInsertFirewallFilterTerms(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{"set firewall family inet filter my-filter term allow-ssh from protocol tcp", "set firewall family inet filter my-filter term allow-ssh from destination-port 22", "set firewall family inet filter my-filter term allow-ssh then accept", "set firewall family inet filter my-filter term allow-http from protocol tcp", "set firewall family inet filter my-filter term allow-http from destination-port 80", "set firewall family inet filter my-filter term allow-http then accept", "set firewall family inet filter my-filter term deny-all then discard"}
