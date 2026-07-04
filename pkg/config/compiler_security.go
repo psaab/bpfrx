@@ -710,21 +710,22 @@ func compilePolicy(polInst struct {
 		for _, m := range matchChildren {
 			switch m.Name() {
 			case "source-address":
-				if len(m.Keys) >= 2 {
-					pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, normalizePolicyAddrTokens(m.Keys[1:])...)
-				} else {
-					for _, c := range m.Children {
-						pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, normalizePolicyAddrToken(c.Name()))
-					}
-				}
+				// #4121: read BOTH Keys[1:] AND Children via the
+				// firewallMatchValues SSOT — the SAME reader the strict match
+				// gates (validatePolicyMatchLeavesStrict) use — so the compiler
+				// and gates can never diverge on a dual-AST shape (the #2419
+				// bracketed-list class). The prior either/or read
+				// (`if len(Keys)>=2 { Keys[1:] } else { Children }`) was correct
+				// for every shape the parser actually produces (bracket/inline →
+				// Keys, block → Children, repeated → sibling nodes, all mutually
+				// exclusive), but a `source-address a1 { a2; }` node carrying
+				// members in BOTH slots dropped the child members. Reading both
+				// removes that divergence and shares one reader with the gates.
+				pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, normalizePolicyAddrTokens(firewallMatchValues(m))...)
 			case "destination-address":
-				if len(m.Keys) >= 2 {
-					pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, normalizePolicyAddrTokens(m.Keys[1:])...)
-				} else {
-					for _, c := range m.Children {
-						pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, normalizePolicyAddrToken(c.Name()))
-					}
-				}
+				// #4121: read BOTH slots via the firewallMatchValues SSOT (see
+				// the source-address arm).
+				pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, normalizePolicyAddrTokens(firewallMatchValues(m))...)
 			case "source-address-excluded":
 				pol.Match.SourceAddressExcluded = true
 			case "destination-address-excluded":
@@ -748,13 +749,9 @@ func compilePolicy(polInst struct {
 					pol.Match.ToZone = m.Children[0].Name()
 				}
 			case "application":
-				if len(m.Keys) >= 2 {
-					pol.Match.Applications = append(pol.Match.Applications, m.Keys[1:]...)
-				} else {
-					for _, c := range m.Children {
-						pol.Match.Applications = append(pol.Match.Applications, c.Name())
-					}
-				}
+				// #4121: read BOTH slots via the firewallMatchValues SSOT (see
+				// the source-address arm).
+				pol.Match.Applications = append(pol.Match.Applications, firewallMatchValues(m)...)
 			}
 		}
 	}

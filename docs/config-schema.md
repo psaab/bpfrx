@@ -439,6 +439,31 @@ both AST shapes):
   isolation break. Coverage: `compiler_routing_instance_interface_3904_test.go`
   (both AST shapes + single-value back-compat).
 
+**Policy match source-/destination-address/application share the reader
+(#4121, divergence-elimination, NOT a fail-open).** `compilePolicy`
+(`compiler_security.go`) previously read the three `multi: true` policy-match
+value leaves with a per-arm either/or (`if len(m.Keys) >= 2 { Keys[1:] } else {
+Children }`) while the strict match gates read them via `firewallMatchValues`
+(Keys[1:] AND Children). VERIFY-FIRST established the either/or was NOT lossy for
+any shape the parser actually emits: a bracket / inline list collapses onto
+`Keys` (read by the Keys[1:] arm), a hierarchical block `source-address { a; b; }`
+yields `Keys=["source-address"]` + child nodes (read by the Children arm), and
+repeated statements yield sibling leaves (each read on its own pass) — the three
+shapes are mutually exclusive, so either/or picked the correct slot every time
+and the #2419 bracketed-list class was already read in full. The ONE shape where
+either/or diverged from read-both — a node carrying members in BOTH slots
+(`source-address a1 { a2; }`, not emitted by any canonical Junos or display-set
+round-trip) — dropped the child members. The three arms now route through
+`firewallMatchValues` (address arms keep the `any-ipv4`/`any-ipv6` →
+`0.0.0.0/0`/`::/0` normalization via `normalizePolicyAddrTokens`) so the compiler
+and the strict gates share ONE match-value reader: a future dual-AST divergence
+becomes a shared-test change rather than a silent drift. Coverage:
+`compiler_policy_match_ssot_4121_test.go` (flat/hier bracket, flat/hier repeated,
+hier block all read every value; the both-slots node is the fail-on-revert case).
+The optional `compiler_security.go` file-split (2357 lines) and folding
+`trafficSelectorValues` (`compiler_ipsec_trafficselector.go`) onto the shared
+reader are deferred (issue #4121 part B, low-value/high-churn).
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a

@@ -1,3 +1,33 @@
+## 2026-07-04 — #4121: compilePolicy match reads share the firewallMatchValues SSOT (fable-163 F28)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST on the claimed #2419 fail-open. Built a scratch
+    matrix (flat bracket / flat repeated / flat bracket+single / hier bracket /
+    hier block / hier repeated) and compiled each — the CURRENT either/or read
+    (`compiler_security.go` compilePolicy, `if len(m.Keys) >= 2 { Keys[1:] }
+    else { Children }`) read ALL values in EVERY realistic shape. The bracketed
+    `[ a b c ]` collapses onto `Keys` and the Keys[1:] arm reads it in full — the
+    issue's premise (drops all-but-first) is REFUTED. The ONLY shape where
+    either/or diverges from `firewallMatchValues` (read-both) is a node carrying
+    members in BOTH slots (`source-address a1 { a2; }`), which no canonical Junos
+    / display-set round-trip emits. VERDICT: already-reads-both-equivalent
+    (cosmetic divergence), NOT a genuine fail-open. Did the trivial SSOT
+    consolidation the issue requests: routed the three policy-match `multi`
+    arms (source-address / destination-address / application) through
+    `firewallMatchValues` — the SAME reader the strict gates use, and the same
+    pattern the `then log` / `default-policy-log` arms in this file already use
+    — so compiler + gates share ONE reader (future dual-AST drift = shared-test
+    failure). Address arms keep the `normalizePolicyAddrTokens` any-ipv4/6
+    normalization. RED-on-revert proven: reverting to either/or turns the
+    both-slots subtest RED (src=[a1], a2 dropped) while all four realistic
+    shapes stay GREEN. Part B (2357-line file-split + trafficSelectorValues
+    fold) DEFERRED (low-value/high-churn) — issue kept open via Refs.
+  - **File(s)**: pkg/config/compiler_security.go,
+    pkg/config/compiler_policy_match_ssot_4121_test.go (new),
+    docs/config-schema.md
+  - **Validation**: `go test ./pkg/config/...` green; `go build ./...` OK;
+    gofmt + go vet clean.
+
 ## 2026-07-04 — #4116: VRRP address owner (priority 255) always preempts (fable-163 F22)
 
 - **Timestamp**: 2026-07-04
@@ -32547,6 +32577,68 @@ top.
     pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
 
 - **Timestamp**: 2026-07-04
+  - **Action**: #4109 (F16+F17+F15) — TCP state-machine hardening in the
+    userspace-dp conntrack. VERIFY-FIRST confirmed both findings at
+    origin/master. F16 (security/DoS): `lookup.rs` promoted OPENING→ESTABLISHED
+    on ANY ACK-bearing segment (`has_ack`, a pure bit test), so a bare SYN
+    followed by a bare forward ACK — with NO reverse SYN-ACK — pinned a 300 s
+    established entry with no peer replying, a 2-packet bypass of the #3152
+    half-open reap (a real vSRX syn-check does not establish on a client ACK
+    preceding the server SYN-ACK). FIX: promote ONLY on an ACK on the REVERSE
+    companion (`metadata.is_reverse`) — the server's SYN-ACK — and promote BOTH
+    halves; a client-only forward ACK never promotes. F17 (correctness/DoS): a
+    unidirectional FIN/RST advanced only the entry it hit into the short close
+    window; the sibling companion (a separate `SessionEntry`) kept the 300 s
+    established timeout, so #3046's 2 s reset-reap was ~50% effective. FIX: new
+    `SessionTable::propagate_tcp_state_to_companion` (recovers the companion via
+    `reverse_session_key(matched.key, matched.nat)`, exactly as `account_packet`
+    hops reverse→forward) stamps `closing`/`reset` onto the companion, pulls it
+    onto the 2 s RST / 30 s FIN window, and re-buckets it in the timer wheel so
+    both halves reap together. Gated behind close-or-reverse-promote (a plain
+    data-ACK pays no extra probe); missing companion (FabricRedirect / already
+    reaped) is a no-op. `update_session` (HA-promote mirror) gets the F16
+    `is_reverse` gate only (synced sessions import ESTABLISHED, so it's a no-op
+    there; cross-companion close on a cluster rides the peer's Close-delta).
+    install.rs seed unchanged (bare-SYN → OPENING). F15: added RED-on-revert
+    tests (v4+v6): forward-ACK-without-SYN-ACK stays OPENING + reaps both at 20 s;
+    unidirectional RST reaps both companions at 2 s; unidirectional FIN reaps
+    both at 30 s; negative controls (normal SYN→SYN-ACK→ACK promotes; established
+    flow's forward ACK unaffected). Rewrote the existing single-key
+    `tcp_handshake_promotes_opening_to_established` onto the two-entry model. FULL
+    cargo test --release (single-threaded) green; go build ./... green.
+    FLAG: companion propagation touches the HA-synced session path (a synced
+    session's local companion) → test-failover recommended before merge.
+  - **File(s)**: userspace-dp/src/session/lookup.rs,
+    userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+    userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4109 Copilot fold (PR #4128) — tighten the F16 promotion gate
+    from `has_ack` to `is_syn_ack`. Copilot flagged that the gate
+    `is_tcp && has_ack && is_reverse` promotes on ANY ack-bearing reverse
+    segment, not specifically a SYN-ACK, leaving a residual: a server-spoofed
+    bare reverse ACK (ACK set, SYN clear) during OPENING could still promote —
+    much harder to exploit than the original client-side F16 (needs a packet on
+    the REVERSE tuple, i.e. spoofing the server) but not matching the stated
+    "reverse SYN-ACK" intent. VERIFIED all three safety conditions before
+    tightening: (a) xpf is inline + control segments bypass the flow cache
+    (flow_cache `packet_eligible` = pure-ACK/UDP only), so a normal handshake's
+    SYN-ACK always reaches the slow-path promotion site; (b) mid-stream pickups
+    are seeded ESTABLISHED at install (install.rs `!is_initial_syn`), never
+    OPENING, so unaffected; (c) in a legit 3-way handshake (and simultaneous
+    open) the server's only pre-established reverse segment IS the SYN-ACK — a
+    bare reverse ACK during OPENING is not a legit promotion trigger. Changed
+    both gates (lookup.rs `promote_from_reverse`, mod.rs `update_session`) and
+    the in-place-vs-reference parity mirror (tests.rs) to `is_syn_ack`; removed
+    the now-unused `has_ack` import. Added RED-on-revert test
+    `reverse_bare_ack_does_not_promote_opening` (v4+v6): a bare reverse ACK does
+    NOT promote either half, a genuine reverse SYN-ACK does (control). Updated
+    README to say "genuine reverse SYN-ACK (is_syn_ack, not has_ack)" + document
+    the closed residual. All existing #4109 tests stay green (they promote via
+    SYN|ACK). FULL cargo test --release (single-threaded) green; go build green.
+  - **File(s)**: userspace-dp/src/session/lookup.rs,
+    userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+    userspace-dp/src/session/README.md, _Log.md
   - **Action**: #4122 — fail-closed fabric gRPC allowlist interceptor. The
     cluster fabric listener (`RunFabricListener`, `pkg/grpcapi/server.go`)
     registered the identical full 48-RPC `BpfrxService` as the loopback
@@ -32649,3 +32741,57 @@ top.
   **File(s)**: userspace-dp/src/screen/mod.rs,
     userspace-dp/src/screen/syn_rate.rs, userspace-dp/src/screen/tests.rs,
     docs/syn-cookie-flood-protection.md, _Log.md
+  - **Action**: #4118 — honor RFC 3442 classless static routes (DHCPv4
+    option 121 / legacy 249) in the DHCP client. Verified at HEAD:
+    `leaseFromACKv4` extracted only `ack.Router()` (option 3); grep of
+    pkg/dhcp for 121/249/classless returned nothing. The insomniacslk/dhcp
+    library exposes a `ClasslessStaticRoute()` accessor (option 121) but no
+    legacy-249 helper. Fix: parse option 121 (accessor) with a raw
+    `GenericOptionCode(249)` + `Routes.FromBytes` fallback (identical RFC
+    3442 encoding) in new `classlessStaticRoutes` helper; store on new
+    `Lease.ClasslessRoutes []LeaseRoute`. RFC 3442 precedence enforced —
+    when option 121/249 present the option-3 Router is IGNORED; the
+    0.0.0.0/0 entry supplies `lease.Gateway`, more-specific routes go on
+    ClasslessRoutes. Programmed via the same paths as the default route:
+    `collectDHCPRoutes` emits a `frr.DHCPRoute{Destination}` per classless
+    route (DHCPRoute grew a `Destination` field, "" = default), 
+    `renderDHCPDefaults` writes `ip route <dest> <gw> [<iface>] 200` with
+    static-default suppression scoped to ONLY the default route, and
+    `applyMgmtVRFRoutes` installs them into mgmt VRF table 999 via netlink.
+    `leaseContentChanged` diffs ClasslessRoutes so they withdraw/re-install
+    with the lease. RED-on-revert: reverting the parse to option-3-only
+    fails TestLeaseFromACKv4ClasslessRoutesSupersedeOption3 /
+    ClasslessOnlySpecificNoDefault / LegacyOption249 (gateway falls back to
+    the option-3 gw 198.51.100.99, ClasslessRoutes empty). go test -count=1
+    ./pkg/dhcp/... ./pkg/frr/... green; go build ./..., vet, gofmt clean.
+  - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/commit.go,
+    pkg/dhcp/classless_routes_test.go, pkg/frr/manager.go,
+    pkg/frr/config_render.go, pkg/frr/frr_test.go,
+    pkg/daemon/daemon_flow.go, pkg/dhcp/README.md, _Log.md
+- **Timestamp**: 2026-07-04
+  - **Action**: #4119 — allow `router-advertisement default-lifetime 0`
+    (RFC 4861 §6.2.1 "not a default router"). Verified at HEAD: schema
+    `ValidateInteger(1, 65535)` rejected 0 at commit; `types_routing.go`
+    `DefaultLifetime int` doc said "0 = default (1800)"; and buildRA /
+    Status / CLI show all coerced `lifetime <= 0` back to 1800 — so an
+    explicit 0 could never reach the wire and xpf always hijacked host
+    default-router selection on multi-router LANs. Fix: lower the schema
+    floor to `ValidateInteger(0, 65535)` (upper 16-bit #3895 bound kept);
+    add `RAInterfaceConfig.DefaultLifetimeSet` to separate an explicit
+    value (incl. 0) from an unset leaf; the compiler sets it only when
+    default-lifetime is configured; buildRA / Status / CLI show default to
+    1800 ONLY when the flag is false; configEqual compares the flag so an
+    unset→"0" edit restarts the sender. Dependent options (RDNSS, PREF64),
+    whose lifetime defaults to the router lifetime, use a separate
+    optLifetime that never drops below 1800 — a 0 Router Lifetime withdraws
+    only default-router duty, not the DNS server / NAT64 prefix; Prefix
+    Information options carry their own 30d/7d lifetimes so on-link SLAAC is
+    unaffected. RED-on-revert PROVEN: reverting the schema floor fails
+    TestSchema4119_DefaultLifetime_Accepts0; reverting the buildRA coercion
+    fails TestBuildRA_4119_ExplicitZero + _PrefixAndPref64StillAdvertised
+    (RouterLifetime springs back to 1800). go test ./pkg/config/...
+    ./pkg/ra/... ./pkg/cli/... green; go build ./..., vet, gofmt clean.
+  - **File(s)**: pkg/config/types_routing.go, pkg/config/schema_routing.go,
+    pkg/config/compiler_protocols.go, pkg/config/schema_validate_4119_test.go,
+    pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/sender_marshal_4119_test.go,
+    pkg/cli/cli_show_routing.go, docs/embedded-radvd.md, _Log.md

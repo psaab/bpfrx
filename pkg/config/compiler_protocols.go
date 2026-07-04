@@ -715,7 +715,13 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 			case "default-lifetime":
 				if v := nodeVal(prop); v != "" {
 					if n, err := strconv.Atoi(v); err == nil {
+						// #4119: record that default-lifetime was set
+						// explicitly so the sender preserves an explicit 0
+						// (RFC 4861 §6.2.1 "not a default router") instead of
+						// re-defaulting it to 1800. An absent leaf leaves
+						// DefaultLifetimeSet false → 1800 default.
 						ra.DefaultLifetime = n
+						ra.DefaultLifetimeSet = true
 					}
 				}
 			case "max-advertisement-interval":

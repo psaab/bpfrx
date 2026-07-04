@@ -105,14 +105,26 @@ bare SYN (SYN set, ACK clear) starts in the OPENING (half-open) state
 `SessionTimeouts.tcp_opening_ns` window (20 s, the Junos
 `tcp-initial-timeout` default) instead of the full 300 s established
 timeout. It is promoted to ESTABLISHED — and the established / per-app
-idle window then applies — on the first ACK-bearing segment after the
-opening SYN: the reverse SYN-ACK and the forward handshake-completing ACK
-both carry the ACK bit, so a completed three-way handshake promotes the
-session while a bare SYN that never gets a reply never produces such a
-segment and reaps at the short window. The promotion is sticky (a later
-segment never demotes an established session back to OPENING) and is
-applied on all three timeout-selection sites (`install` /
-`upsert_synced`, `lookup`, `update_session`). The state is initialised
+idle window then applies — only on a genuine reverse SYN-ACK
+(**#4109**, tightened from "any ACK-bearing segment"): the server's
+handshake response is a SYN-ACK on the REVERSE half of the flow, so ONLY a
+SYN-ACK (`is_syn_ack`, not merely `has_ack`) on the reverse companion
+(`metadata.is_reverse`) promotes, and it promotes BOTH the reverse entry
+and its forward companion (see the companion propagation below). A
+client-only forward ACK never promotes a half-open session — before #4109
+any ACK did, so a bare SYN followed by a bare ACK pinned a 300 s
+established entry with no peer ever replying, a 2-packet bypass of the
+#3152 half-open reap (a real vSRX with the syn-check default does not mark
+a session ESTABLISHED on a client ACK that precedes the server's SYN-ACK).
+Requiring the SYN bit (not just `has_ack` on the reverse tuple) also closes
+the residual where a server-spoofed bare reverse ACK could promote — in a
+legitimate 3-way handshake (and simultaneous open) the server's only
+pre-established reverse segment IS the SYN-ACK, and xpf is inline so it
+always observes it (control segments bypass the flow cache and reach this
+slow-path promotion site). The promotion is sticky (a later segment never demotes an
+established session back to OPENING) and is applied on all three
+timeout-selection sites (`install` / `upsert_synced`, `lookup`,
+`update_session`). The state is initialised
 ESTABLISHED for every non-TCP session and for any TCP session whose
 creating packet is NOT a bare SYN (a mid-stream pickup such as a SYN-ACK
 or data segment), so those paths are byte-identical to pre-#3152.
@@ -209,6 +221,44 @@ close is an *idle* timeout — `expire.rs` reaps only after
 `now - last_seen_ns > expires_after_ns`, and `last_seen_ns` is re-stamped
 on every refresh — so a genuinely active half-closed flow keeps advancing
 `last_seen_ns` and is never reaped early by the short window.)
+
+**Forward↔reverse companion propagation (#4109).** A flow is TWO
+independent `SessionEntry`s in the worker-owned table — the canonical
+forward entry (`is_reverse == false`) and its reverse companion
+(`is_reverse == true`, keyed on `reverse_session_key(forward.key, nat)` and
+installed alongside the forward entry by `poll_descriptor`). The read path
+resolves and mutates only the ONE entry a packet's wire tuple hits, so
+per-direction TCP state had to be mirrored explicitly onto the sibling.
+`SessionTable::propagate_tcp_state_to_companion` (called from `lookup.rs`
+after the matched entry's borrow ends) recovers the companion key exactly
+as `account_packet` hops reverse→forward — `reverse_session_key` on the
+matched entry's OWN canonical key + nat, which is its own inverse — and
+carries two things across:
+
+- **Close (F17):** a FIN/RST advances only the entry it lands on into the
+  short close window; the other half kept the 300 s established timeout, so
+  a unidirectional RST left the dead flow's forward half lingering up to
+  300 s (the #3046 2 s reset-reap was ~50 % effective under a reset
+  workload; symmetric for a one-sided FIN vs #3489's 30 s). The companion
+  now inherits `closing` (and `reset` if RST, sticky) and is pulled onto
+  the same short window (2 s RST / 30 s FIN) and re-bucketed in the wheel,
+  so both halves reap together — matching vSRX, where a RST invalidates the
+  WHOLE session.
+- **Promote (F16):** when a reverse SYN-ACK promotes the reverse companion,
+  the forward companion is promoted too (flag only — its own
+  handshake-completing forward ACK re-stamps the established idle window;
+  we deliberately do not extend its expiry, so a handshake the client never
+  completes still reaps on the opening window).
+
+A missing companion (a `FabricRedirect` flow with no local reverse entry,
+or a half already independently reaped) is a no-op — the same fail-open
+posture as `account_packet`'s reverse hop. The propagation is gated behind
+"a close or a reverse-promote happened", so a plain data-ACK refresh pays
+no extra probe. On the HA-promote path (`update_session`), only the F16
+`is_reverse` promotion gate is mirrored (a peer-synced session is imported
+ESTABLISHED already, so the gate is a no-op there); cross-companion close
+on a cluster is carried by the peer's Close-delta session-sync rather than
+re-derived locally.
 
 **Seconds→nanoseconds bound (#2441).** Configured TCP/UDP/ICMP timeouts
 arrive in the snapshot as `u64` seconds and are converted in

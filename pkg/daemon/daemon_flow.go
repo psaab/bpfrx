@@ -30,18 +30,28 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 	}
 	var routes []frr.DHCPRoute
 	for _, lease := range d.dhcp.Leases() {
-		if !lease.Gateway.IsValid() {
-			continue
-		}
 		if d.mgmtVRFInterfaces[lease.Interface] {
 			continue
 		}
-		dr := frr.DHCPRoute{
-			Gateway:   lease.Gateway.String(),
-			Interface: lease.Interface,
-			IsIPv6:    lease.Family == dhcp.AFInet6,
+		isIPv6 := lease.Family == dhcp.AFInet6
+		// Default route (option-3 gateway, or option-121 0.0.0.0/0 entry).
+		if lease.Gateway.IsValid() {
+			routes = append(routes, frr.DHCPRoute{
+				Gateway:   lease.Gateway.String(),
+				Interface: lease.Interface,
+				IsIPv6:    isIPv6,
+			})
 		}
-		routes = append(routes, dr)
+		// RFC 3442 classless static routes (option 121 / legacy 249). A
+		// lease may carry these with or without a default gateway.
+		for _, cr := range lease.ClasslessRoutes {
+			routes = append(routes, frr.DHCPRoute{
+				Destination: cr.Destination.String(),
+				Gateway:     cr.Gateway.String(),
+				Interface:   lease.Interface,
+				IsIPv6:      isIPv6,
+			})
+		}
 	}
 	return routes
 }
@@ -62,7 +72,13 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 	defer nlh.Close()
 
 	for _, lease := range d.dhcp.Leases() {
-		if !lease.Gateway.IsValid() || !d.mgmtVRFInterfaces[lease.Interface] {
+		if !d.mgmtVRFInterfaces[lease.Interface] {
+			continue
+		}
+		// A lease may carry a default gateway (option 3 or the option-121
+		// 0.0.0.0/0 entry) and/or RFC 3442 classless static routes (option
+		// 121 / legacy 249). Program each into the management VRF table.
+		if !lease.Gateway.IsValid() && len(lease.ClasslessRoutes) == 0 {
 			continue
 		}
 		link, err := nlh.LinkByName(lease.Interface)
@@ -71,25 +87,52 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 				"interface", lease.Interface, "err", err)
 			continue
 		}
-		var dst *net.IPNet
-		if lease.Family == dhcp.AFInet6 {
-			dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
-		} else {
-			dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+		linkIndex := link.Attrs().Index
+
+		if lease.Gateway.IsValid() {
+			var dst *net.IPNet
+			if lease.Family == dhcp.AFInet6 {
+				dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+			} else {
+				dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+			}
+			gwSlice := lease.Gateway.AsSlice()
+			route := &netlink.Route{
+				LinkIndex: linkIndex,
+				Dst:       dst,
+				Gw:        net.IP(gwSlice),
+				Table:     mgmtTableID,
+			}
+			if err := nlh.RouteReplace(route); err != nil {
+				slog.Warn("mgmt VRF route: failed to add default route",
+					"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtTableID, "err", err)
+			} else {
+				slog.Info("mgmt VRF default route installed",
+					"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtTableID)
+			}
 		}
-		gwSlice := lease.Gateway.AsSlice()
-		route := &netlink.Route{
-			LinkIndex: link.Attrs().Index,
-			Dst:       dst,
-			Gw:        net.IP(gwSlice),
-			Table:     mgmtTableID,
-		}
-		if err := nlh.RouteReplace(route); err != nil {
-			slog.Warn("mgmt VRF route: failed to add default route",
-				"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtTableID, "err", err)
-		} else {
-			slog.Info("mgmt VRF default route installed",
-				"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtTableID)
+
+		// RFC 3442 classless static routes.
+		for _, cr := range lease.ClasslessRoutes {
+			dst := &net.IPNet{
+				IP:   net.IP(cr.Destination.Addr().AsSlice()),
+				Mask: net.CIDRMask(cr.Destination.Bits(), cr.Destination.Addr().BitLen()),
+			}
+			route := &netlink.Route{
+				LinkIndex: linkIndex,
+				Dst:       dst,
+				Gw:        net.IP(cr.Gateway.AsSlice()),
+				Table:     mgmtTableID,
+			}
+			if err := nlh.RouteReplace(route); err != nil {
+				slog.Warn("mgmt VRF route: failed to add classless route",
+					"interface", lease.Interface, "dst", cr.Destination, "gw", cr.Gateway,
+					"table", mgmtTableID, "err", err)
+			} else {
+				slog.Info("mgmt VRF classless route installed",
+					"interface", lease.Interface, "dst", cr.Destination, "gw", cr.Gateway,
+					"table", mgmtTableID)
+			}
 		}
 	}
 }

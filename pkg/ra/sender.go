@@ -668,9 +668,31 @@ func (s *sender) sendGoodbyeRA() bool {
 
 // buildRA constructs a Router Advertisement from the config.
 func (s *sender) buildRA() *ndp.RouterAdvertisement {
-	lifetime := s.cfg.DefaultLifetime
-	if lifetime <= 0 {
-		lifetime = defaultRouterLifetime
+	// #4119: an EXPLICIT default-lifetime (DefaultLifetimeSet) is honored
+	// verbatim, including 0 — RFC 4861 §6.2.1 Router Lifetime 0 means "this
+	// router is NOT a default router" (hosts drop it from their default-router
+	// list but may still use the prefixes/PREF64 it advertises). Only an UNSET
+	// default-lifetime falls back to defaultRouterLifetime (1800). The old
+	// `if lifetime <= 0` coercion made an explicit 0 indistinguishable from
+	// unset and forced it to 1800, so xpf could never advertise "not a default
+	// router" and hijacked host default-route selection on multi-router LANs.
+	lifetime := defaultRouterLifetime
+	if s.cfg.DefaultLifetimeSet {
+		lifetime = s.cfg.DefaultLifetime
+	}
+
+	// Dependent options (RDNSS, PREF64) that inherit a lifetime default MUST
+	// NOT collapse to 0 just because the ROUTER lifetime is an explicit 0:
+	// their independent lifetimes govern whether hosts keep using the DNS
+	// server / NAT64 prefix, and the whole point of Router Lifetime 0 is to
+	// keep advertising those while declining default-router duty. Fall back to
+	// the standard 1800s default for a dependent option whenever the resolved
+	// router lifetime is not positive (identical to the pre-#4119 value, which
+	// was always >= 1800). The Prefix Information options are unaffected — they
+	// carry their own valid/preferred lifetimes (30d/7d) already.
+	optLifetime := lifetime
+	if optLifetime <= 0 {
+		optLifetime = defaultRouterLifetime
 	}
 
 	ra := &ndp.RouterAdvertisement{
@@ -757,7 +779,7 @@ func (s *sender) buildRA() *ndp.RouterAdvertisement {
 		}
 		if len(servers) > 0 {
 			ra.Options = append(ra.Options, &ndp.RecursiveDNSServer{
-				Lifetime: time.Duration(lifetime) * time.Second,
+				Lifetime: time.Duration(optLifetime) * time.Second,
 				Servers:  servers,
 			})
 		}
@@ -769,7 +791,7 @@ func (s *sender) buildRA() *ndp.RouterAdvertisement {
 		if err == nil {
 			pref64Life := s.cfg.NAT64PrefixLife
 			if pref64Life <= 0 {
-				pref64Life = lifetime
+				pref64Life = optLifetime
 			}
 			ra.Options = append(ra.Options, &ndp.PREF64{
 				Lifetime: time.Duration(pref64Life) * time.Second,

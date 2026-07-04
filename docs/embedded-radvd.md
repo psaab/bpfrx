@@ -32,7 +32,8 @@ type RAInterfaceConfig struct {
     ManagedConfig      bool        // M flag
     OtherStateful      bool        // O flag
     Preference         string      // "high", "medium", "low"
-    DefaultLifetime    int         // seconds (0 = default 1800)
+    DefaultLifetime    int         // RA Router Lifetime, seconds; meaningful only when DefaultLifetimeSet
+    DefaultLifetimeSet bool        // true when default-lifetime was explicitly configured (#4119)
     MaxAdvInterval     int         // seconds (0 = default 600)
     MinAdvInterval     int         // seconds (0 = default 200)
     Prefixes           []*RAPrefix
@@ -268,7 +269,7 @@ Map `RAInterfaceConfig` fields directly to `ndp.RouterAdvertisement`:
 | `ManagedConfig` | `ManagedConfiguration` |
 | `OtherStateful` | `OtherConfiguration` |
 | `Preference` | `RouterSelectionPreference` (map "high"→`ndp.High`, "low"→`ndp.Low`, default→`ndp.Medium`) |
-| `DefaultLifetime` | `RouterLifetime` (time.Duration) |
+| `DefaultLifetime` | `RouterLifetime` (time.Duration) — see the lifetime note below |
 | `Prefixes[].Prefix` | Option: `ndp.PrefixInformation{Prefix, PrefixLength}` |
 | `Prefixes[].OnLink` | `PrefixInformation.OnLink` |
 | `Prefixes[].Autonomous` | `PrefixInformation.AutonomousAddressConfiguration` |
@@ -280,6 +281,31 @@ Map `RAInterfaceConfig` fields directly to `ndp.RouterAdvertisement`:
 | (interface MAC) | Option: `ndp.LinkLayerAddress{Direction: ndp.Source, Addr: mac}` |
 
 Additionally, `CurrentHopLimit` should default to 64 (standard for Linux).
+
+**Router Lifetime and `default-lifetime 0` (#4119).** `RouterLifetime` comes
+from `DefaultLifetime`, but only when `DefaultLifetimeSet` is true. RFC 4861
+§6.2.1 defines a Router Lifetime of 0 as "this router is NOT a default router":
+a host removes it from its default-router list yet may still use the prefixes /
+PREF64 it advertises. An operator therefore needs to advertise prefixes / NAT64
+while declining default-router duty on a multi-router LAN. To support that:
+
+- The schema floor is 0 (`ValidateInteger(0, 65535)`), so `set protocols
+  router-advertisement interface <if> default-lifetime 0` commits.
+- The compiler sets `DefaultLifetimeSet=true` for any explicit value; an
+  absent leaf leaves it false.
+- `buildRA` marshals `RouterLifetime = DefaultLifetime` when the flag is set
+  (an explicit 0 stays 0) and defaults to 1800s only when it is unset. The old
+  `if lifetime <= 0 { lifetime = 1800 }` coercion conflated an explicit 0 with
+  "unset" and could never emit Router Lifetime 0.
+- The Prefix Information options carry their own valid / preferred lifetimes
+  (30d / 7d), so on-link prefixes and SLAAC keep working with a Router Lifetime
+  of 0. The RDNSS and PREF64 options — whose lifetimes DEFAULT to the router
+  lifetime — fall back to 1800s (never 0) when the router lifetime is an
+  explicit 0, so a 0 Router Lifetime withdraws only default-router duty, not the
+  DNS server or NAT64 prefix.
+- `configEqual` compares `DefaultLifetimeSet` so an unset → `default-lifetime 0`
+  edit (both have `DefaultLifetime == 0` but a different wire value) restarts
+  the sender.
 
 ### 3.6 Goodbye RA (Withdraw)
 

@@ -57,14 +57,16 @@ func renewalTimers(leaseTime time.Duration) (t1, t2Remaining time.Duration) {
 }
 
 // leaseContentChanged reports whether two leases differ in any field a
-// downstream consumer reads (address, gateway, DNS — what reconcileDNS,
-// FRR route generation, and the compiled config consume). Obtained and
-// LeaseTime are excluded: they change on every successful renewal and
-// feed only the run loop's own T1/T2 timers, never compiled state.
+// downstream consumer reads (address, gateway, DNS, and the RFC 3442
+// classless static routes — what reconcileDNS, FRR route generation, and
+// the compiled config consume). Obtained and LeaseTime are excluded: they
+// change on every successful renewal and feed only the run loop's own
+// T1/T2 timers, never compiled state.
 func leaseContentChanged(prev, next *Lease) bool {
 	return prev.Address != next.Address ||
 		prev.Gateway != next.Gateway ||
-		!slices.Equal(prev.DNS, next.DNS)
+		!slices.Equal(prev.DNS, next.DNS) ||
+		!slices.Equal(prev.ClasslessRoutes, next.ClasslessRoutes)
 }
 
 // delegatedPrefixesChanged reports whether the delegated-prefix set
