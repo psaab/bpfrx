@@ -205,23 +205,34 @@ sync.
   (`meta.ingress_vlan_present != 0`), not `vlan_id > 0` — 802.1p
   priority-tagged frames carry a real 802.1Q tag with VID 0, so a
   VID-based test would mis-read the IP header at offset 14 (#2145).
-  - **#3064 — L3 fragment screens on the flowless path:**
-    `stage_screen_check` now resolves the ingress zone BEFORE branching on
-    `flow`, and on the flowless branch (`flow == None`) it runs ONLY the
-    L3-header fragment screens — ping-of-death, teardrop, icmp-fragment
-    (`ScreenState::check_fragment_screens_l3`) — against the zone profile.
-    A non-first IP fragment is deliberately flowless (`#2344`:
-    `parse_session_flow_from_bytes` returns `None` so the fragment payload
-    is never parsed as L4 ports); before #3064 it short-circuited to `Pass`,
-    leaving those per-fragment screens DEAD in the live pipeline so hostile
-    Teardrop / Ping-of-Death contributions transited unscreened. The
-    flowless branch extracts a header-only `ScreenPacketInfo` straight from
-    the IP header with a PLACEHOLDER L4 tuple (it never reads ports or does
-    a session lookup), so the #2344 flowless fast path is NOT reintroduced.
-    Flow/session-dependent screens (land, TCP-flag, icmp/udp/syn-flood
-    counters, scan/sweep, SYN-cookie) stay gated on the flow-present path
-    and are unchanged. A truncated/unparseable header fails CLOSED (drop),
-    matching the flow path (`#2146`).
+  - **#3064 + #3902 — source-independent screens on the flowless path:**
+    `stage_screen_check` resolves the ingress zone BEFORE branching on
+    `flow`, and on the flowless branch (`flow == None`) it runs the
+    SOURCE-INDEPENDENT screens via `ScreenState::check_flowless_screens`
+    against the zone profile: LAND anti-spoof, the three L3-header fragment
+    screens (ping-of-death, teardrop, icmp-fragment), ip-source-route, and
+    the per-zone ICMP/UDP flood counters. A non-first IP fragment (`#2344`)
+    and a non-query ICMP/ICMPv6 control message (`#3290`) are deliberately
+    flowless (`parse_session_flow_from_bytes` returns `None` so the payload
+    is never parsed as an L4 tuple). #3064 first restored the three fragment
+    screens here (before it, the flowless branch short-circuited to `Pass`,
+    leaving them DEAD so hostile Teardrop / Ping-of-Death contributions
+    transited unscreened). #3902 closes the remaining gap: the flowless
+    branch ran ONLY those three fragment screens, so LAND / ip-source-route /
+    ICMP flood / UDP flood — which need NO transport flow — were BYPASSED on
+    the flowless path (screen fail-open). The branch now derives the REAL L3
+    source/destination addresses from the IP header (`flowless_l3_addrs`) so
+    LAND (`src_ip == dst_ip`) evaluates correctly instead of on the pre-#3902
+    unspecified placeholder (which would have looked like `src == dst` on
+    every flowless packet); if the frame is too short to hold the addresses,
+    LAND is skipped (`addrs_known == false`) rather than false-dropped. The
+    branch still never reads L4 ports or does a session lookup, so the #2344
+    flowless fast path is NOT reintroduced. Flow/session-dependent screens
+    (TCP-flag bits, the SYN-flood per-source/per-destination sketches,
+    scan/sweep, SYN-cookie) require a flow / real TCP header and stay gated
+    on the flow-present `check_packet_with_zone_id` path — unchanged, with no
+    screen double-run on the flow path. A truncated/unparseable header fails
+    CLOSED (drop), matching the flow path (`#2146`).
   - **#3291 — zone policy / input filter / PBR on the flowless TRANSIT
     arm:** #3064 restored only the *screen* engine on the flowless path;
     zone security policy, the interface input filter, and firewall-filter

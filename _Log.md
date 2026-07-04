@@ -1,3 +1,40 @@
+## 2026-07-03 — #3902: flowless screen path bypassed the source-independent screens (LAND, ip-source-route, ICMP/UDP flood) — fail-open on non-query ICMP + non-first fragments
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-085 (MEDIUM, screen/IDS fail-open). In
+    `stage_screen_check` the flowless branch (`flow == None` — a non-first IP
+    fragment #2344 or a non-query ICMP/ICMPv6 control message #3290) ran ONLY
+    the three L3 fragment screens restored by #3064 (ping-of-death, teardrop,
+    icmp-fragment). It did NOT run the SOURCE-INDEPENDENT screens — LAND
+    anti-spoof, ip-source-route, and the per-zone ICMP/UDP flood counters —
+    which need no transport flow. A crafted non-query ICMP or non-first
+    fragment therefore BYPASSED those screens (screen fail-open).
+  - **Fix**: Replaced `ScreenState::check_fragment_screens_l3` (&self, 3
+    fragment screens) with `ScreenState::check_flowless_screens` (&mut self)
+    that also runs LAND, ip-source-route, ICMP flood, and UDP flood, in the
+    same relative drop precedence as `check_packet_with_zone_id` (LAND →
+    ping-of-death → teardrop → icmp-fragment → source-route → icmp-flood →
+    udp-flood). Flow/session-dependent screens (TCP-flag, SYN-flood
+    per-source/dest sketches, scan/sweep, SYN-cookie) stay on the flow-present
+    path — no double-run on the flow path, flow path untouched. LAND compares
+    `src_ip == dst_ip`, so `poll_stages.rs` now derives the REAL L3 addresses
+    from the IP header (`flowless_l3_addrs`) instead of the pre-#3902
+    unspecified placeholder (which would have made every flowless packet look
+    like `src == dst`); when the frame is too short to hold them, LAND is
+    skipped (`addrs_known == false`) rather than false-dropped. No L4 port
+    read / session lookup is added, so the #2344 flowless fast path is NOT
+    reintroduced.
+  - **Validation**: 8 new `check_flowless_screens` unit tests (LAND on
+    flowless ICMP + non-first fragment, addrs-unknown skip, source-route,
+    ICMP flood, UDP flood, teardrop regression guard, clean-pass). RED-on-
+    revert proven: neutering the source-independent checks to the pre-#3902
+    behavior fails the 6 source-independent drop tests while the fragment +
+    clean tests stay green. FULL `cargo test --release` green; `go build
+    ./...` green.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/screen/tests.rs,
+    userspace-dp/src/afxdp/README.md
+
 ## 2026-07-03 — #3882: WireGuard responder rekey promoted an UNCONFIRMED session straight to `current` (no `next` slot) — 3-slot keypair lifecycle fix
 
 - **Timestamp**: 2026-07-03
