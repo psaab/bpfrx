@@ -1625,6 +1625,36 @@ reserved for whole-dataplane selection where a rewrite shim
   no-op knob, not a false dataplane/identity promise — and its real
   implementation is split to /research. Regression coverage:
   `pkg/config/compiler_interfaces_unsupported_test.go`.
+- **#4027 (interface-range expansion):** `interfaces interface-range
+  <name> { member <if>; [member-range <a> to <b>;] <shared cfg> }` is a
+  Junos construct that applies a shared configuration block to a SET of
+  member interfaces. Before the fix xpf had no handling: the generic
+  `interfaces` wildcard treated `interface-range` itself as an interface
+  NAME, so the compiler minted a PHANTOM `InterfaceConfig` keyed
+  `interface-range` (matching no kernel NIC, later reconciled admin-down)
+  and both the shared config and the member interfaces were silently
+  dropped. `expandInterfaceRanges` (`compiler_interface_range.go`) now
+  rewrites every interface-range stanza into its member interfaces as an
+  AST pre-pass in `compileExpanded`, BEFORE section compilation and the
+  H9/H10 gate above (so both see the real members, never the phantom).
+  Each member gets the range's shared statements — flattened to
+  `set`-command suffixes and replayed through `ConfigTree.SetPath`, so
+  they re-nest with the exact schema-driven shape a normal per-interface
+  config would have — merged with the member's own per-interface config:
+  the member's own statements are re-applied LAST so they WIN on a scalar
+  conflict (e.g. a member-local `mtu` overrides the range `mtu`) while
+  additive statements (addresses) accumulate. `member-range <a> to <b>`
+  expands over the trailing decimal (endpoints must share a prefix; capped
+  at `interfaceRangeMaxMembers` to bound a typo). The pass handles BOTH AST
+  shapes (flat-set replay packs the range name into each leaf's `Keys[0]`;
+  the hierarchical parser packs it into the `interface-range` node's
+  `Keys[1]`) and is a strict no-op — the tree is left byte-identical —
+  when no interface-range stanza is present. This is a compile-time AST
+  rewrite, not a `setSchema` change: adding schema children for `member` /
+  `member-range` would alter the flat-set grouping the expansion depends
+  on, so the construct stays out of the grammar SSOT and is normalized
+  before any typed-leaf walk. Regression coverage:
+  `pkg/config/compiler_interface_range_4027_test.go`.
 - **#3444 (destination-NAT rule-set `to` scope reject):** a Junos
   destination-NAT rule-set has only a `from` clause (zone | interface |
   routing-instance) — DNAT translates the destination on inbound, so there
