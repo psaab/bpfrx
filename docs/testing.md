@@ -130,7 +130,9 @@ make generate && make build
 # Primary userspace dataplane helper
 make build-userspace-dp
 
-# Run unit tests (266 tests across 12 packages)
+# Run unit tests — Go suite AND Rust userspace-dp cargo suite (#4006).
+# A Rust dataplane regression fails `make test`. `make test-go` /
+# `make test-rust` run one leg; the Rust leg needs cargo (~minutes).
 make test
 
 # Deploy to Incus VM

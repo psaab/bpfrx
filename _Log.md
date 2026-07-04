@@ -30847,3 +30847,27 @@ top.
     pkg/config/parser_security_test.go, pkg/ipsec/ike.go, pkg/ipsec/ipsec_test.go,
     pkg/cli/cli_show_security_ipsec.go, pkg/grpcapi/server_show_security_text.go,
     pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4006 — `make test` now runs BOTH the Go suite AND the Rust
+    userspace-dp cargo suite. Before this change `test` ran only `go vet` +
+    `go test ./...`, so a regression in the Rust AF_XDP dataplane — the ONLY
+    runtime forwarding path after the #1373/#1476 eBPF retirement — passed
+    `make test` green (a false all-clear for the most critical code). Split the
+    old `test` recipe into `test-go` (unchanged: `go vet ./pkg/flowexport/...`
+    then `go test ./...`) and a new `test-rust`
+    (`cargo test --manifest-path userspace-dp/Cargo.toml --release --bins
+    --tests -- --test-threads=1`), and made `test: test-go test-rust`. Each leg
+    is a plain prerequisite recipe, so a non-zero exit from either aborts the
+    target — a Rust test failure now fails `make test` (verified: a throwaway
+    Makefile with the same prerequisite shape and a `false` in test-rust exited
+    non-zero and never ran the trailing line; RED-on-revert semantics hold).
+    userspace-dp is a binary-only crate (no [lib]), so `--bins` reaches its
+    unit tests and `--tests` adds integration tests; benches are excluded
+    (criterion `harness = false` rejects libtest's `--test-threads`, and they
+    are perf gates run via `cargo bench`). `--test-threads=1` dodges the
+    intermittent `__skb_wait_for_more_packets` socket-test hang. `go build
+    ./...` unaffected (green). Docs updated: README build section, CLAUDE.md
+    Quick Start, docs/testing.md, docs/testing-procedures.md.
+  - **File(s)**: Makefile, README.md, CLAUDE.md, docs/testing.md,
+    docs/testing-procedures.md, _Log.md

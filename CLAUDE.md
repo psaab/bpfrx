@@ -60,7 +60,10 @@ make build           # Build xpfd daemon (uses the git-tracked shim .o — does
                      # NOT require make generate)
 make build-ctl       # Build remote CLI client
 make build-userspace-dp # Build the primary Rust AF_XDP dataplane helper
-make test            # Run Go tests
+make test            # Run BOTH the Go suite AND the Rust userspace-dp
+                     # cargo suite (#4006) — a Rust dataplane regression
+                     # fails `make test`. `make test-go` / `make test-rust`
+                     # run one leg. The Rust leg needs cargo (~minutes).
 ```
 
 ## Test Environment (Incus VM)

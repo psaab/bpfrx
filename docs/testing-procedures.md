@@ -4,7 +4,9 @@
 
 | Test | Command | Duration | When to Run |
 |------|---------|----------|-------------|
-| Unit tests | `make test` | ~30s | Every code change |
+| Unit tests (Go + Rust) | `make test` | ~minutes | Every code change |
+| Go unit tests only | `make test-go` | ~30s | Go-only change |
+| Rust dataplane tests only | `make test-rust` | ~minutes | userspace-dp change |
 | Connectivity | `make test-connectivity` | ~60s | After deploy |
 | Failover | `make test-failover` | ~120s | Cluster/VRRP/session sync changes |
 | Hard crash | `make test-ha-crash` | ~120s | Cluster state machine changes |
@@ -15,7 +17,15 @@
 
 ### 1. Unit Tests (`make test`)
 
-Run 880+ Go tests across 30 packages. Covers:
+`make test` runs BOTH suites (#4006): the Go suite (`make test-go`) and
+the Rust userspace-dp cargo suite (`make test-rust`). A failure in either
+fails `make test`. Before #4006 this target ran only the Go suite, so a
+Rust dataplane regression — a forwarding / CoS / NAT / session break in
+the ONLY runtime forwarding path (#1373/#1476) — passed `make test`
+green. The Go leg is ~30s; the Rust leg compiles + runs a few thousand
+tests in `--release` and takes a few minutes.
+
+**Go suite** (`make test-go`) — 880+ tests across 30 packages. Covers:
 - Config parser (hierarchical + flat set syntax)
 - Config compiler (Junos AST -> typed structs)
 - Cluster election logic (dual-active, preempt, non-preempt)
@@ -23,6 +33,14 @@ Run 880+ Go tests across 30 packages. Covers:
 - Session sync protocol
 - Address book compilation
 - NAT rule compilation
+
+**Rust suite** (`make test-rust`) — `cargo test --release --bins --tests`
+for `userspace-dp` (a binary-only crate, so `--bins` reaches the bin's
+unit tests and `--tests` adds any integration tests), run with
+`--test-threads=1` to avoid the intermittent `__skb_wait_for_more_packets`
+socket-test hang. This is the primary correctness gate for packet
+forwarding, CoS shaping, NAT, and session handling. Benches are excluded
+(perf gates run via `cargo bench`).
 
 **Must pass before any commit.**
 
