@@ -40,7 +40,7 @@ func TestExecuteConfirmedRollbackResyncsPeer(t *testing.T) {
 	// through the injected seam. Read ShowActive() at call time — this is
 	// exactly the text pushConfigToPeer would queue, so it proves the re-sync
 	// carries the rolled-back config (C1 = host-name A), not the abandoned one.
-	d.resyncPeerForTest = func() {
+	d.syncPeerForTest = func() {
 		calls++
 		syncedConfig = d.store.ShowActive()
 	}
@@ -76,7 +76,7 @@ func TestExecuteConfirmedRollbackResyncsPeer(t *testing.T) {
 // The existing reverse-sync-on-reconnect converges the peer when it returns.
 func TestExecuteConfirmedRollbackResyncPeerAbsent(t *testing.T) {
 	s, gen := newRollbackTestStore(t) // active=B pending, rollback target=A
-	// No cluster, no sessionSync, no resyncPeerForTest seam: exercises the real
+	// No cluster, no sessionSync, no syncPeerForTest seam: exercises the real
 	// syncConfigToPeer nil-guard.
 	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s}
 	d.applyBodyForTest = func(_ *config.Config) {}

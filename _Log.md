@@ -1,3 +1,38 @@
+## 2026-07-03 — #4034: a non-fatal error in the tail of the config apply path skipped syncConfigToPeer → the standby never got the committed config (HA divergence)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-169 (MEDIUM, HA config divergence). On the
+    RG0 primary, `commitAndApply` / `commitConfirmedAndApply` promote+persist
+    the compiled config, run `applyConfigLocked`, then push it to the standby
+    via `syncConfigToPeer`. The push sat AFTER an unconditional
+    `if applyErr != nil { return nil, err }`, so ANY apply error short-circuited
+    before the sync. `applyConfigLocked`'s tail deliberately JOINs the
+    best-effort subsystem failures (networkd write #2987, Kea restart
+    #1778/#1835, host-inbound #3333 / lo0 #3392 nft) and returns them for a
+    fail-closed commit — but the config is still committed + active and the
+    dataplane armed. Those NON-FATAL errors made the primary skip the peer sync,
+    so the standby stayed on the OLD config and the nodes DIVERGED; a failover
+    then served stale config. The sync was skipped precisely when the local
+    apply had a recoverable hiccup.
+  - **Fix**: routed both commit paths through a shared `applyAndSyncCommitted`
+    helper that classifies the apply error before deciding whether to push.
+    `applyErrSkipsPeerSync` suppresses the sync ONLY for (a) a
+    required-protocol-gate error (`compileErrorMustAbortApply` → dataplane
+    DISARMED; pushing a disarm-config to the standby is strictly worse) and (b)
+    a context cancel/deadline (#2926 daemon-stop boundary abort — next boot +
+    reverse-sync converge). Every other (non-fatal, best-effort) error now still
+    syncs and returns the committed config alongside the error. The #3868
+    rollback re-sync and the commit-apply sync now share one
+    `pushCommittedConfigToPeer` indirection (seam renamed `resyncPeerForTest` →
+    `syncPeerForTest`; new `applyErrForTest` seam injects the apply outcome).
+  - **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon.go,
+    pkg/daemon/rollback_resync_test.go,
+    pkg/daemon/configsync_tail_error_test.go (new, RED-on-revert),
+    docs/ha-cluster-test-plan.md (TC-5c).
+  - **Validation**: `go build ./...`, `go vet`, gofmt clean;
+    `go test -race ./pkg/daemon/ ./pkg/cluster/` green; RED-on-revert proven
+    (non-fatal tests drop to 0 peer pushes when the fix is reverted).
+    test-failover WARRANTED (HA config-sync) — batch-validated.
 ## 2026-07-03 — #4033: heartbeat goroutine leak + double-fire on comms restart (fable-161 F-168)
 
 - **Timestamp**: 2026-07-03

@@ -208,13 +208,81 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 	if err != nil {
 		return nil, err
 	}
-	if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
-		return nil, err
+	return d.applyAndSyncCommitted(compiled, syncPeer)
+}
+
+// applyAndSyncCommitted runs the reconcile pipeline for a config the store has
+// ALREADY promoted+persisted (committed + active), then pushes it to the
+// cluster peer unless the apply failed in a way that must not propagate.
+// Shared by commitAndApply and commitConfirmedAndApply. Caller holds d.applySem.
+//
+// #4034: the peer config-sync used to sit AFTER an unconditional
+// `if applyErr != nil { return nil, err }`, so ANY applyConfigLocked error —
+// including the NON-FATAL best-effort tail errors it joins (networkd write /
+// Kea restart / host-inbound + lo0 nft, daemon_apply.go tail) — skipped the
+// sync. But those errors leave the config committed + active AND the dataplane
+// armed and forwarding; the standby then never received the new config and the
+// nodes DIVERGED, so a failover served stale config. The sync was skipped
+// precisely when the local apply had a recoverable hiccup — the worst time to
+// skip it.
+//
+// applyErrSkipsPeerSync distinguishes the two error classes that MUST still
+// suppress the sync (a disarmed dataplane, or a daemon-stop context abort)
+// from a non-fatal subsystem error that must NOT. On a non-fatal error the
+// committed config is returned alongside the error so the operator sees the
+// failure while the standby still converges.
+func (d *Daemon) applyAndSyncCommitted(compiled *config.Config, syncPeer bool) (*config.Config, error) {
+	applyErr := d.applyConfigLocked(d.applyCancelCtx(), compiled)
+	if applyErrSkipsPeerSync(applyErr) {
+		// Fatal (required-protocol-gate: dataplane disarmed / fail-closed) or a
+		// daemon-stop context abort (#2926 boundary): report failure and do NOT
+		// push. Pushing a disarm-config to the standby is strictly worse, and a
+		// shutdown-aborted apply reconverges on next boot + reverse-sync.
+		return nil, applyErr
 	}
+	// Committed + active locally with the dataplane armed. A non-fatal
+	// best-effort subsystem error must NOT skip the peer sync (#4034): the
+	// standby has to receive the committed config or the nodes diverge.
 	if syncPeer {
-		d.syncConfigToPeer()
+		d.pushCommittedConfigToPeer()
 	}
-	return compiled, nil
+	return compiled, applyErr
+}
+
+// applyErrSkipsPeerSync reports whether an applyConfigLocked error means the
+// just-committed config must NOT be pushed to the cluster peer (#4034). Two
+// classes skip the sync; every OTHER (non-fatal, best-effort subsystem) error
+// still syncs because the config is committed + active and the dataplane armed:
+//
+//   - A required-protocol-gate error (compileErrorMustAbortApply): the
+//     dataplane is DISARMED (fail-closed, #2138). The commit is reported failed;
+//     pushing a config that would disarm the standby's dataplane too is strictly
+//     worse than letting the operator fix it and re-commit.
+//   - A context cancellation/deadline (#2926 boundary abort): the apply was
+//     aborted mid-pipeline by a daemon stop. The local node is tearing down;
+//     the next boot re-applies in full and the reverse-sync-on-reconnect
+//     converges the peer, so a push racing the transport teardown is avoided.
+func applyErrSkipsPeerSync(err error) bool {
+	if err == nil {
+		return false
+	}
+	if compileErrorMustAbortApply(err) {
+		return true
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// pushCommittedConfigToPeer pushes the current active config to the cluster
+// peer, honoring the syncPeerForTest seam. Shared by the commit-apply path
+// (applyAndSyncCommitted, #4034) and the commit-confirmed rollback re-sync
+// (resyncRolledBackConfigToPeer, #3868) so both route through one observable
+// point. Caller holds d.applySem and has already promoted the active config.
+func (d *Daemon) pushCommittedConfigToPeer() {
+	if d.syncPeerForTest != nil {
+		d.syncPeerForTest()
+		return
+	}
+	d.syncConfigToPeer()
 }
 
 // syncAndApply is the cluster-sync-recv analogue of commitAndApply.
@@ -305,13 +373,7 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 	if err != nil {
 		return nil, err
 	}
-	if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
-		return nil, err
-	}
-	if syncPeer {
-		d.syncConfigToPeer()
-	}
-	return compiled, nil
+	return d.applyAndSyncCommitted(compiled, syncPeer)
 }
 
 // executeConfirmedRollback is the daemon-owned commit-confirmed timeout
@@ -396,19 +458,16 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 }
 
 // resyncRolledBackConfigToPeer pushes the just-promoted rollback-target config
-// to the cluster peer after a commit-confirmed timeout (#3868). Split out so
-// the confirm-timeout rollback path is unit-testable without a live cluster
-// transport: rollback_resync_test.go injects d.resyncPeerForTest to observe the
-// call; production leaves it nil and the real syncConfigToPeer runs. MUST be
-// called with d.applySem held and AFTER PromoteRollback so d.store.ShowActive()
-// (read inside syncConfigToPeer -> pushConfigToPeer) reflects the rolled-back
-// config, not the abandoned unconfirmed one.
+// to the cluster peer after a commit-confirmed timeout (#3868). Delegates to
+// pushCommittedConfigToPeer so the confirm-timeout rollback path is unit-testable
+// without a live cluster transport: rollback_resync_test.go injects
+// d.syncPeerForTest to observe the call; production leaves it nil and the real
+// syncConfigToPeer runs. MUST be called with d.applySem held and AFTER
+// PromoteRollback so d.store.ShowActive() (read inside syncConfigToPeer ->
+// pushConfigToPeer) reflects the rolled-back config, not the abandoned
+// unconfirmed one.
 func (d *Daemon) resyncRolledBackConfigToPeer() {
-	if d.resyncPeerForTest != nil {
-		d.resyncPeerForTest()
-		return
-	}
-	d.syncConfigToPeer()
+	d.pushCommittedConfigToPeer()
 }
 
 // applyConfigLocked runs the actual reconcile pipeline. MUST be
@@ -428,7 +487,7 @@ func (d *Daemon) resyncRolledBackConfigToPeer() {
 func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) error {
 	if d.applyBodyForTest != nil {
 		d.applyBodyForTest(cfg)
-		return nil
+		return d.applyErrForTest
 	}
 
 	// Defensive nil guard (AGY r2 Low): no production caller passes a nil
