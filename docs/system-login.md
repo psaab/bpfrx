@@ -144,6 +144,23 @@ defense-in-depth should a lower class ever gain config-view access. The raw
 redacted before display and fails **closed** — a parse error returns an error
 rather than the cleartext bytes.
 
+**SNMP community masking in status commands (#4111).** The #4099 redaction
+above covers the config-render surfaces (they route through the `RedactedClone`
+renderers). Two **operational status** commands, however, format the typed
+active config directly and so bypassed that path: `show system services`
+(`showSystemServices`, `pkg/cli/cli_show_system.go`) printed `Community: <name>
+(<auth>)`, and `show snmp` (`showSNMP`, `pkg/cli/cli_show_services.go`) printed
+`  <name>: <auth>`. Both are PermView `show` commands reachable by
+`read-only` / `config-viewer` / `operator`, so the SNMP community string — a
+read/write credential — leaked in cleartext to view-only classes. They now
+reuse the same `CLI.showConfigRedacted()` predicate: for any class without
+`PermAll` the community **name** is masked to `##SECRET-DATA##` while the
+authorization **mode** (`read-only` / `read-write`) stays visible; `super-user`
+and the unset/legacy class still read the cleartext name (parity with the #4099
+config-render decision above). The TSIG key already showed `(secret redacted)`
+and SNMPv3 renders auth/priv protocol names only, so the community name was the
+last cleartext SNMP secret on these two surfaces.
+
 ### Generating a hash
 
 ```
