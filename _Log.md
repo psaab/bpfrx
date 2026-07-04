@@ -1,3 +1,36 @@
+## 2026-07-03 — #3992: WG wg_encap_frame resolved the outer underlay route TWICE per packet
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-088 (MEDIUM, Rust dataplane perf).
+    `wg_encap_frame` (`userspace-dp/src/afxdp/frame/wg.rs`) resolved the
+    OUTER (underlay) route for the encapped WG/UDP datagram TWICE per
+    packet: once via `outer_physical_egress_mtu` for the #2680 MTU guard,
+    then AGAIN via a second `outer_physical_egress_ifindex` call at the
+    #2701 outer-source-write site. Both calls used the identical
+    `peer_endpoint.ip()` + `endpoint.transport_table`, so the two FIB LPMs
+    always returned the same physical egress ifindex — the second lookup was
+    pure redundant per-packet work on the encrypt hot path (FIB LPM +
+    neighbor resolve is non-trivial at line rate over a tunnel). FIX:
+    resolve `outer_physical_egress_ifindex` ONCE near the top of
+    `wg_encap_frame`, cache the ifindex + the `state.egress` row in locals,
+    derive the guard MTU by inlining `outer_physical_egress_mtu`'s body
+    against the shared row (byte-identical guard MTU for that ifindex), and
+    reuse the same `egress` row for the outer IPv4/IPv6 source primary.
+    `outer_physical_egress_mtu` remains the SSOT for the SEPARATE PTB path
+    (`wg_endpoint_physical_outer_mtu`, TX dispatcher) — untouched. The
+    emitted outer header is byte-identical (the dedup does not change WHICH
+    route is chosen). RED-on-revert: new `#[cfg(test)]`
+    `OUTER_ROUTE_RESOLVE_COUNT` seam bumped on each entry to
+    `outer_physical_egress_ifindex`; `wg_encap_frame_resolves_outer_route_once_v4`
+    resets it, builds one frame off the established-session #2701 fixture,
+    and asserts exactly 1 resolution (2 → red on revert) plus outer-header
+    byte-identity (dst/src MAC, ethertype, outer src=172.16.80.8, outer
+    dst=203.0.113.7, UDP dst port=51820). Zero production cost — the counter
+    and its increment are `#[cfg(test)]` only.
+  - **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+    docs/wireguard-interop.md, userspace-dp/src/afxdp/frame/README.md,
+    _Log.md
+
 ## 2026-07-03 — #3988: scheduler start/stop date parsed as UTC instead of system local time
 
 - **Timestamp**: 2026-07-03

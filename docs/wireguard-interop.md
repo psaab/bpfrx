@@ -299,6 +299,25 @@ source primary. So the outer UDP is always sourced from the physical WAN
 primary, not the tunnel-logical address. Same conservative fallback: an
 unresolvable outer falls back to `egress_ifindex` (no worse than pre-#2701).
 
+**#3992 (single outer-route resolution per packet).** #2680 and #2701 shared
+one CONCEPT — the physical underlay egress via the route to the selected peer
+endpoint — but `wg_encap_frame` computed it TWICE per packet: once via
+`outer_physical_egress_mtu` for the MTU guard, then again via a second
+`outer_physical_egress_ifindex` call at the outer-source-write site. Both used
+the same `peer_endpoint.ip()` and the same `endpoint.transport_table`, so the
+two FIB LPMs always returned the identical ifindex — the second was pure
+redundant per-packet work on the encrypt hot path (FIB LPM cost is non-trivial
+at line rate over a tunnel). `wg_encap_frame` now resolves
+`outer_physical_egress_ifindex` ONCE, caches the ifindex + the `state.egress`
+row, and reuses both for the MTU guard (inlining `outer_physical_egress_mtu`'s
+body against the shared row — byte-identical guard MTU) AND the outer-source
+lookup. The emitted outer header is byte-identical (the dedup does not change
+WHICH route is chosen); `outer_physical_egress_mtu` remains the SSOT for the
+PTB path (`wg_endpoint_physical_outer_mtu`), which is a separate call site.
+RED-on-revert: `wg_encap_frame_resolves_outer_route_once_v4` counts entries to
+`outer_physical_egress_ifindex` per encap (test-only `OUTER_ROUTE_RESOLVE_COUNT`
+seam) and asserts exactly 1 (2 before the fix) plus outer-header byte-identity.
+
 **#2703 (outer TTL default).** A tunnel TTL of `0` is the "use the default
 64" sentinel in the Go config (`schema_interfaces.go`, `types_routing.go`),
 and the netlink GRE path applies it (`pkg/routing/tunnel.go: if ttl == 0 {
