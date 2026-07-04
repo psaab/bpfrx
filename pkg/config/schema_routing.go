@@ -439,9 +439,15 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			// field maximum. A larger value silently wraps in the RA sender's
 			// ndp uint16(lifetime) (65536 -> 0 = "not a default router"), so
 			// hosts drop their default route.
-			"default-lifetime": {desc: "Router lifetime advertised to hosts (seconds)", args: 1, placeholder: "<seconds>",
-				valueType: ValueInteger, valueDesc: "router lifetime in seconds (RFC 4861 §4.2 16-bit)",
-				valueExamples: []string{"1800", "9000"}, validator: ValidateInteger(1, raRouterMaxLifetimeSeconds), children: nil},
+			// #4119: the floor is 0, not 1, because RFC 4861 §6.2.1 defines
+			// Router Lifetime 0 as "this router is NOT a default router" — a
+			// valid, deliberate advertisement (advertise prefixes/PREF64 but do
+			// not enter host default-router lists). The compiler records an
+			// explicit 0 via DefaultLifetimeSet so the sender does not coerce
+			// it back to 1800.
+			"default-lifetime": {desc: "Router lifetime advertised to hosts (seconds; 0 = not a default router)", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "router lifetime in seconds (RFC 4861 §4.2 16-bit; 0 = not a default router)",
+				valueExamples: []string{"0", "1800", "9000"}, validator: ValidateInteger(0, raRouterMaxLifetimeSeconds), children: nil},
 			// #2497: link-mtu is advertised verbatim via ndp.NewMTU. RFC 8200
 			// §5 sets the IPv6 minimum link MTU at 1280 bytes; a smaller value
 			// (1-1279) committed today reaches the wire and blackholes hosts

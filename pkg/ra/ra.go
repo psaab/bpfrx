@@ -739,10 +739,18 @@ func (m *Manager) Status() []SenderInfo {
 
 	var result []SenderInfo
 	for _, s := range m.senders {
+		// #4119: report the effective Router Lifetime. An explicit 0
+		// (DefaultLifetimeSet, "not a default router") is reported as 0, not
+		// coerced to 1800; only an unset default-lifetime shows the 1800
+		// default.
+		lifetime := defaultRouterLifetime
+		if s.cfg.DefaultLifetimeSet {
+			lifetime = s.cfg.DefaultLifetime
+		}
 		info := SenderInfo{
 			Interface:   s.cfg.Interface,
 			SrcAddr:     s.getSrcAddr().String(),
-			Lifetime:    s.cfg.DefaultLifetime,
+			Lifetime:    lifetime,
 			MaxInterval: s.cfg.MaxAdvInterval,
 			MinInterval: s.cfg.MinAdvInterval,
 			LinkMTU:     s.cfg.LinkMTU,
@@ -751,9 +759,6 @@ func (m *Manager) Status() []SenderInfo {
 			Preference:  s.cfg.Preference,
 			NAT64Prefix: s.cfg.NAT64Prefix,
 			State:       "active",
-		}
-		if info.Lifetime <= 0 {
-			info.Lifetime = defaultRouterLifetime
 		}
 		if info.MaxInterval <= 0 {
 			info.MaxInterval = defaultMaxAdvInterval
@@ -795,6 +800,11 @@ func configEqual(a, b *config.RAInterfaceConfig) bool {
 		a.OtherStateful != b.OtherStateful ||
 		a.Preference != b.Preference ||
 		a.DefaultLifetime != b.DefaultLifetime ||
+		// #4119: unset (→1800) and explicit-0 both have DefaultLifetime==0 but
+		// marshal a DIFFERENT Router Lifetime, so the set-flag is part of the
+		// identity — otherwise an unset→"default-lifetime 0" edit would not
+		// restart the sender and the wire would keep advertising 1800.
+		a.DefaultLifetimeSet != b.DefaultLifetimeSet ||
 		a.MaxAdvInterval != b.MaxAdvInterval ||
 		a.MinAdvInterval != b.MinAdvInterval ||
 		a.LinkMTU != b.LinkMTU ||
