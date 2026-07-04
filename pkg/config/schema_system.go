@@ -68,7 +68,14 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	"archival": {desc: "Configuration archival", children: map[string]*schemaNode{
 		"configuration": {desc: "Configuration archival", children: map[string]*schemaNode{
 			"transfer-on-commit": {desc: "Transfer on commit", children: nil},
-			"archive-sites":      {desc: "Archive site URL", args: 1, placeholder: "<url>", children: nil},
+			// #3984: a repeated keyed-list leaf — an operator writes one
+			// `set ... archive-sites <url>` per site and the compiler reads
+			// every sibling via FindChildren (compiler_system.go). Without
+			// `multi: true` SetPath's single-value-REPLACE branch dropped all
+			// but the LAST site on a flat-set / load-set / display-set
+			// round-trip. A trailing `password <s>` modifier rides on the
+			// leaf's Keys[2:], which the compiler already reads.
+			"archive-sites": {desc: "Archive site URL", args: 1, multi: true, placeholder: "<url>", children: nil},
 		}},
 	}},
 	"master-password": {desc: "Master password", children: map[string]*schemaNode{
@@ -84,7 +91,13 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		"no-ipv6-reject-zero-hop-limit": {desc: "Do not reject IPv6 packets with zero hop limit", children: nil},
 	}},
 	"ntp": {desc: "NTP configuration", children: map[string]*schemaNode{
-		"server": {desc: "NTP server", args: 1, placeholder: "<address>", children: nil},
+		// #3984: a repeated keyed-list leaf — one `set system ntp server
+		// <ip>` per server, and the compiler reads every sibling via
+		// FindChildren("server") (compiler_system.go). Without `multi: true`
+		// SetPath's single-value-REPLACE branch collapsed a multi-server
+		// config to the LAST server on a flat-set / load-set / display-set
+		// round-trip.
+		"server": {desc: "NTP server", args: 1, multi: true, placeholder: "<address>", children: nil},
 		"threshold": {desc: "Threshold", args: 1, placeholder: "<seconds>", children: map[string]*schemaNode{
 			"action": {desc: "Action on threshold", args: 1, placeholder: "<action>", children: nil},
 		}},
@@ -327,7 +340,12 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 				"user": {desc: "User name", wildcard: &schemaNode{desc: "Basic-auth user name for the REST API", placeholder: "<username>", children: map[string]*schemaNode{
 					"password": {desc: "Password", args: 1, placeholder: "<password>", children: nil},
 				}}},
-				"api-key": {desc: "API key", args: 1, placeholder: "<key>", children: nil},
+				// #3984: repeated keyed-list leaf — the compiler accumulates
+				// every `api-key` sibling into APIAuth.APIKeys via
+				// FindChildren (compiler_system.go). `multi: true` keeps each
+				// `set ... api-key <key>` a distinct sibling instead of
+				// replacing the previous one.
+				"api-key": {desc: "API key", args: 1, multi: true, placeholder: "<key>", children: nil},
 			}},
 		}},
 		"dns": {desc: "DNS service", children: nil},

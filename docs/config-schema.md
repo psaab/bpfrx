@@ -108,6 +108,41 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
+leaves (#3984).** The `#2419` discussion above is about ONE statement with a
+bracket list. The SAME `multi: true` marker fixes a second, distinct shape:
+a keyed-list leaf that the operator writes as SEPARATE `set` statements, one
+value per line, which the compiler reads back as DISTINCT siblings via
+`FindChildren`:
+
+```
+set system ntp server 1.1.1.1
+set system ntp server 2.2.2.2
+set system ntp server 3.3.3.3
+```
+
+Each statement consumes exactly `1 + args` tokens with NO trailing token, so
+`SetPath` reaches its terminal-leaf branch (`i >= len(path)`). For a leaf
+declared `args > 0, children: nil` WITHOUT `multi`, that branch takes the
+**single-value REPLACE** path (correct for a scalar such as `host-name`): the
+SECOND `set` replaces the first, and the config silently collapses to the
+LAST value on any flat-set / `load set` / `| display set` round-trip. A leaf
+whose compiler reads MULTIPLE siblings (accumulating into a slice) is NOT a
+scalar — it must be `multi: true` so the terminal branch instead DEDUPs and
+APPENDS, keeping each occurrence a distinct sibling. The leaves in this class
+are `system ntp server`, `system archival configuration archive-sites`,
+`system services web-management api-auth api-key`, and `security flow
+traceoptions flag` (joining the already-`multi` `name-server` /
+`domain-search`). The compiler stays `FindChildren`-based and unchanged — the
+bug was purely the SetPath collapse. `archive-sites` also carries an optional
+trailing `password <s>` modifier, which lands on `Keys[2:]` of the collapsed
+leaf and is read there (`compiler_system.go`). Pinned by
+`pkg/config/set_repeated_leaf_3984_test.go` (RED on revert of the markers).
+This is the SET-side sibling of the display-side #3980 (`navigatePath` renders
+all N siblings) and the delete/deactivate-side #3846/#3975 (member-wise edit,
+which these leaves now inherit for free because `delete`/`deactivate` route a
+`multi: true, children: nil, args == 1` leaf through the member matcher).
+
 **`valueList` — a bracketed value list on a multi leaf that ALSO has a
 modifier child (#3872).** The bracket-absorption above fires only for a
 `multi: true` leaf with `children: nil`. The static-route `next-hop` leaf is

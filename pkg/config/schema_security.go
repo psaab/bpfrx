@@ -685,7 +685,12 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		"power-mode-disable":           {desc: "Disable power mode", children: nil},
 		"traceoptions": {desc: "Flow trace debugging options", children: map[string]*schemaNode{
 			"file": {desc: "Trace file name (with size/files options)", args: 1, placeholder: "<filename>", children: nil},
-			"flag": {desc: "Trace flag (e.g. basic-datapath, session)", args: 1, placeholder: "<flag>", children: nil},
+			// #3984: repeated keyed-list leaf — the compiler accumulates
+			// every traceoptions `flag` sibling into Traceoptions.Flags via
+			// FindChildren (compiler_security.go). `multi: true` keeps each
+			// `set ... flag <flag>` a distinct sibling instead of replacing
+			// the previous one.
+			"flag": {desc: "Trace flag (e.g. basic-datapath, session)", args: 1, multi: true, placeholder: "<flag>", children: nil},
 			"packet-filter": {desc: "Trace packet filter name", args: 1, placeholder: "<filter-name>", children: map[string]*schemaNode{
 				"source-prefix":      {desc: "Source prefix to trace", args: 1, placeholder: "<prefix>", children: nil},
 				"destination-prefix": {desc: "Destination prefix to trace", args: 1, placeholder: "<prefix>", children: nil},
