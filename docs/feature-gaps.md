@@ -814,7 +814,12 @@ evidence, not as active eBPF source-removal blockers.
   DOWN/UP *outside* a config commit (HA RETH member flap, `programRethMAC` link
   cycle) re-defaults the per-interface `proxy_arp`/`proxy_ndp` sysctl; the ticker
   re-asserts the desired state within ~30s so the interface self-heals without an
-  operator re-commit.
+  operator re-commit. Each tick runs the reconcile under the apply semaphore
+  (`d.applySem`, the same lock the commit/config-apply path holds across
+  `store.Commit` + `applyConfigLocked`), so a re-assert can never interleave with
+  a commit that *removes* a responder and re-install the removed responder from a
+  stale pre-commit config snapshot -- it always reconciles the post-commit
+  `ActiveConfig` (#4001).
 - Breadth tradeoff (IPv4): with the default `medium_id=0`, `proxy_arp=1` makes the
   kernel answer ARP on that interface for ANY target routed out a different
   interface -- broader than Junos `proxy-arp`, which proxies only the listed

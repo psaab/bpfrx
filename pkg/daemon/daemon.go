@@ -601,9 +601,11 @@ type Daemon struct {
 	// net.ipv6.conf.<if>.proxy_ndp on any (interface, family) that dropped out
 	// — a day-2 commit removing proxy-arp must drive the leaked sysctl back to
 	// 0 (the dataplane reconcile is stateless across commits, so the daemon
-	// owns this teardown state). Guarded by proxyARPEnabledMu because the apply
-	// path (under applySem) and the always-on re-assert loop (NOT under
-	// applySem) both run the reconcile.
+	// owns this teardown state). Guarded by proxyARPEnabledMu; both callers of
+	// the reconcile run under applySem — the apply path directly, and the
+	// always-on re-assert loop via reassertProxyARPOnce (#4001) — so a re-assert
+	// can never interleave with a commit reconcile and re-add a removed
+	// responder from a stale config snapshot.
 	proxyARPEnabledMu sync.Mutex
 	proxyARPEnabled   map[string]map[int]struct{}
 
