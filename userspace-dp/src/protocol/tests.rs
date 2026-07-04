@@ -1372,6 +1372,43 @@ fn config_snapshot_decodes_without_app_catalog() {
         "snapshot without app_catalog must decode to an empty catalog (HA/upgrade compat)");
 }
 
+// #3909 (MEDIUM, secret exposure): the SYN-cookie master key is the secret
+// that makes XDP-generated SYN-ACK cookies unforgeable. It must be
+// `skip_serializing`, exactly like the WireGuard private key / PSK, so it never
+// lands in `state.json` (written world-readable 0644 by write_state). A local
+// unprivileged reader of that file could otherwise forge valid SYN cookies and
+// defeat SYN-flood source validation.
+//
+// FAIL-ON-REVERT: remove `skip_serializing` from
+// ConfigSnapshot::syn_cookie_master_key and this test goes RED — the field name
+// and the key bytes reappear in the serialized world-readable snapshot.
+#[test]
+fn syn_cookie_master_key_is_skipped_in_state_snapshot() {
+    let snap = ConfigSnapshot {
+        syn_cookie_master_key: "0badc0ffee0badc0ffee0badc0ffee42".into(),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&snap).expect("serialize snapshot");
+    assert!(
+        !json.contains("syn_cookie_master_key"),
+        "syn_cookie_master_key field must be skip_serializing, got: {json}"
+    );
+    assert!(
+        !json.contains("0badc0ffee"),
+        "syn_cookie_master_key value must not appear in the world-readable snapshot"
+    );
+
+    // Control-socket delivery (apply_snapshot) still populates the key via the
+    // `default` path, so a valid key is present after a restart re-push — SYN
+    // cookie source validation keeps working.
+    let with_key = r#"{"syn_cookie_master_key":"00112233445566778899aabbccddeeff"}"#;
+    let parsed: ConfigSnapshot = serde_json::from_str(with_key).expect("decode snapshot with key");
+    assert_eq!(
+        parsed.syn_cookie_master_key, "00112233445566778899aabbccddeeff",
+        "control-plane delivery must still populate the key on deserialize"
+    );
+}
+
 // #2214 (HIGH, #1961-class): a NAT64 rule with no resolvable source pool makes
 // the Go builder emit `pool_addresses:null` (nil slice, no `,omitempty`). Plain
 // `#[serde(default)]` only fills an ABSENT key; an explicit null is still handed
