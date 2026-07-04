@@ -375,3 +375,22 @@ all files stay in `package ipsec`, so the public API is unchanged.
   `sanitizeSwanctlValue` control-char belt (sanitize first, then
   escape). Identity values are now always emitted quoted so a DN with
   spaces/commas parses as a single value.
+- **PSK secret `id` selectors (#3952).** Each `secrets { ike-<conn> {
+  secret = ... } }` PSK block now emits `id-<n>` selector(s) scoping the
+  secret to its peer (`pskIDSelectors` in `policy.go`). A PSK secret with
+  NO id matches ANY peer, so with two or more PSK VPNs strongSwan could
+  bind the wrong secret to a peer and IKE authentication would fail (or a
+  peer could authenticate against another VPN's PSK). The selector is the
+  remote peer's IKE identity — the configured `remote-id` when set,
+  otherwise the concrete remote gateway address (strongSwan uses the peer
+  IP as its default identity when no id is negotiated), and this is the
+  discriminator between two PSK VPNs to different peers. A configured
+  `local-id` rides along as a harmless extra owner (two VPNs on the same
+  firewall usually share the local id, so it never disambiguates on its
+  own, but it can never cause a wrong-peer match either). A dynamic
+  responder-only peer (`remote_addrs = %any`) with no `remote-id` has
+  nothing to scope by, so it emits no id — never a literal `id = "%any"`
+  (which would defeat the scoping and match all peers) — preserving the
+  legacy any-peer behavior for that one tunnel. A cert/EAP VPN has no PSK,
+  so it emits no secret block and is unaffected. The selector values reuse
+  the `sanitizeSwanctlValue`/`escapeSwanctlQuoted` quoting (#1798/#2126).

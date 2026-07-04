@@ -216,13 +216,16 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 			continue
 		}
 		vpn := ipsecCfg.VPNs[name]
+		// Resolve the remote endpoint + gateway once: it feeds both the
+		// IKE-policy-chain PSK lookup and the id selectors below. This VPN
+		// was not skipped, so resolveRemoteAddr returned ok=true and a
+		// usable remoteAddr ("", a concrete address, or "%any").
+		remoteAddr, _, gw, _ := resolveRemoteAddr(ipsecCfg, vpn)
 		secret := vpn.PSK.Reveal()
 		// Resolve PSK from IKE policy chain: VPN -> gateway -> IKE policy -> PSK
-		if secret == "" {
-			if gw, ok := ipsecCfg.Gateways[vpn.Gateway]; ok {
-				if ikePol, ok := ipsecCfg.IKEPolicies[gw.IKEPolicy]; ok {
-					secret = ikePol.PSK.Reveal()
-				}
+		if secret == "" && gw != nil {
+			if ikePol, ok := ipsecCfg.IKEPolicies[gw.IKEPolicy]; ok {
+				secret = ikePol.PSK.Reveal()
 			}
 		}
 		if secret != "" {
@@ -236,6 +239,16 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 			// double-quote or backslash render as a balanced, swanctl-
 			// parseable quoted string instead of corrupting the block.
 			fmt.Fprintf(&b, "    secret = \"%s\"\n", escapeSwanctlQuoted(sanitizeSwanctlValue(decoded)))
+			// Scope this PSK to its peer with id selectors (#3952). A PSK
+			// secret with NO id matches ANY peer, so with two or more PSK
+			// VPNs strongSwan can bind the wrong secret to a peer and IKE
+			// authentication fails. Each id-<n> narrows the secret to a
+			// peer whose IKE identity matches — the configured remote-id,
+			// else the remote gateway address (plus the local-id when set).
+			for i, sel := range pskIDSelectors(remoteAddr, gw) {
+				fmt.Fprintf(&b, "    id-%d = \"%s\"\n", i+1,
+					escapeSwanctlQuoted(sanitizeSwanctlValue(sel)))
+			}
 			fmt.Fprintf(&b, "  }\n")
 		}
 	}
@@ -426,6 +439,53 @@ func sanitizeChildName(name string) string {
 		return "traffic-selector"
 	}
 	return out
+}
+
+// pskIDSelectors returns the ordered list of swanctl secret `id-<n>`
+// selector values that scope a PSK to its peer (#3952). A PSK secret with
+// no id matches ANY peer, so with two or more PSK VPNs strongSwan may bind
+// the wrong secret to a peer and IKE authentication fails. Each returned
+// value is an IKE identity strongSwan matches against the peer of the
+// exchange (the peer's identity must match at least one selector):
+//
+//   - the remote peer identity: the configured remote-id when set,
+//     otherwise the concrete remote gateway address (strongSwan uses the
+//     peer IP as its default identity when no id is negotiated). This is
+//     the discriminator between two PSK VPNs to different peers;
+//   - the local identity, added only when a local-id is explicitly
+//     configured, so the secret is also selected when strongSwan looks it
+//     up by our own identity (a harmless extra owner — two VPNs on the
+//     same firewall typically share the local id, so it never disambiguates
+//     on its own, but it can never cause a wrong-peer match either).
+//
+// A dynamic responder-only peer (remote_addrs = %any) with no configured
+// remote-id yields no address selector — %any is not a usable identity —
+// so the list carries only whatever identities ARE known (the local-id, if
+// any). When the list is empty the caller emits no id, preserving the
+// legacy any-peer behavior for a config that offers nothing to scope by.
+func pskIDSelectors(remoteAddr string, gw *config.IPsecGateway) []string {
+	var ids []string
+	seen := make(map[string]bool)
+	add := func(v string) {
+		if v == "" || v == "%any" || seen[v] {
+			return
+		}
+		seen[v] = true
+		ids = append(ids, v)
+	}
+	// Remote peer identity — the discriminator. Prefer the explicit
+	// remote-id (the identity the peer presents / we expect), else the
+	// concrete remote gateway address.
+	if gw != nil && gw.RemoteIDValue != "" {
+		add(formatIdentity(gw.RemoteIDType, gw.RemoteIDValue))
+	} else {
+		add(remoteAddr)
+	}
+	// Local identity, when explicitly configured.
+	if gw != nil && gw.LocalIDValue != "" {
+		add(formatIdentity(gw.LocalIDType, gw.LocalIDValue))
+	}
+	return ids
 }
 
 // formatIdentity formats an IKE identity for strongSwan.
