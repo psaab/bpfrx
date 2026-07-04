@@ -333,49 +333,89 @@ func scpArchiveTransfer(ctx context.Context, srcPath, dest string) error {
 	return nil
 }
 
-// applyFlowTrace sets up the initial flow trace writer from config.
-func (d *Daemon) applyFlowTrace(cfg *config.Config, er *logging.EventReader) {
-	if cfg.Security.Flow.Traceoptions == nil || cfg.Security.Flow.Traceoptions.File == "" {
+// flowTraceCallback is the single, stable flow-traceoptions handler
+// registered on the EventReader exactly ONCE (traceCBOnce). It reads the live
+// TraceWriter lock-free from the atomic pointer, so a config commit can swap
+// the writer — or clear it to nil on disable — without ever registering a
+// second callback. This is the #3932 fix: the previous applyFlowTrace /
+// updateFlowTrace called er.AddCallback on every commit touching traceoptions,
+// so a long-lived daemon leaked one callback (and one TraceWriter) per commit,
+// and every event was then dispatched to all N — a growing per-event cost plus
+// a stale-writer drop storm. A nil pointer (traceoptions disabled) makes this a
+// no-op.
+func (d *Daemon) flowTraceCallback(rec logging.EventRecord, raw []byte) {
+	tw := d.traceWriterPtr.Load()
+	if tw == nil {
 		return
 	}
-
-	tw, err := logging.NewTraceWriter(cfg.Security.Flow.Traceoptions)
-	if err != nil {
-		slog.Warn("failed to create trace writer", "err", err)
-		return
-	}
-	d.traceWriter = tw
-	er.AddCallback(tw.HandleEvent)
-	slog.Info("flow traceoptions enabled",
-		"file", cfg.Security.Flow.Traceoptions.File,
-		"filters", len(cfg.Security.Flow.Traceoptions.PacketFilters))
+	tw.HandleEvent(rec, raw)
 }
 
-// updateFlowTrace updates the trace writer when config changes.
+// applyFlowTrace sets up the initial flow trace writer from config at boot.
+func (d *Daemon) applyFlowTrace(cfg *config.Config, er *logging.EventReader) {
+	d.reconcileFlowTrace(cfg, er)
+}
+
+// updateFlowTrace reconciles the trace writer when config changes.
 func (d *Daemon) updateFlowTrace(cfg *config.Config) {
-	if d.traceWriter != nil {
-		d.traceWriter.Close()
-		d.traceWriter = nil
-	}
+	d.reconcileFlowTrace(cfg, d.eventReader)
+}
 
-	if d.eventReader == nil {
+// reconcileFlowTrace installs the flow trace writer described by cfg as the
+// SINGLE live writer. The stable indirection callback (flowTraceCallback) is
+// registered on er exactly once — the first time a writer is installed — and
+// every later call only SWAPS the underlying writer, closing the one it
+// replaced. So N commits touching traceoptions leave exactly one registered
+// callback and one live TraceWriter (#3932). Closing the old writer on swap
+// releases its file handle so it can no longer rotate the trace file (no
+// double-rotation, no drop storm from a stale closed writer). Disabling
+// traceoptions clears the writer to nil; the stable callback stays but becomes
+// a no-op. er may be nil (no event reader yet) — then this is a no-op.
+func (d *Daemon) reconcileFlowTrace(cfg *config.Config, er *logging.EventReader) {
+	if er == nil {
 		return
 	}
 
-	if cfg.Security.Flow.Traceoptions == nil || cfg.Security.Flow.Traceoptions.File == "" {
-		return
+	to := cfg.Security.Flow.Traceoptions
+	enabled := to != nil && to.File != ""
+
+	var tw *logging.TraceWriter
+	if enabled {
+		w, err := logging.NewTraceWriter(to)
+		if err != nil {
+			// Keep the current writer running rather than dropping tracing on a
+			// bad reconcile (mirrors the flowexport #3742 keep-old-on-build-
+			// failure posture). Nothing is swapped, so no callback/writer leak.
+			slog.Warn("failed to create trace writer", "err", err)
+			return
+		}
+		tw = w
+		// Register the single stable callback exactly once, the first time a
+		// writer exists. A boot with traceoptions disabled registers nothing;
+		// the first enable arms it.
+		d.traceCBOnce.Do(func() {
+			er.AddCallback(d.flowTraceCallback)
+		})
 	}
 
-	tw, err := logging.NewTraceWriter(cfg.Security.Flow.Traceoptions)
-	if err != nil {
-		slog.Warn("failed to create trace writer", "err", err)
-		return
+	// Swap the live writer (possibly nil) and close the one it replaced. The
+	// callback reads the pointer lock-free; traceReconMu only serializes
+	// concurrent reconciles so exactly one writer is closed per swap.
+	d.traceReconMu.Lock()
+	old := d.traceWriterPtr.Swap(tw)
+	if old != nil {
+		old.Close()
 	}
-	d.traceWriter = tw
-	d.eventReader.AddCallback(tw.HandleEvent)
-	slog.Info("flow traceoptions updated",
-		"file", cfg.Security.Flow.Traceoptions.File,
-		"filters", len(cfg.Security.Flow.Traceoptions.PacketFilters))
+	d.traceReconMu.Unlock()
+
+	switch {
+	case enabled:
+		slog.Info("flow traceoptions active",
+			"file", to.File,
+			"filters", len(to.PacketFilters))
+	case old != nil:
+		slog.Info("flow traceoptions disabled")
+	}
 }
 
 // monitorLinkState subscribes to netlink link updates and sends SNMP traps
