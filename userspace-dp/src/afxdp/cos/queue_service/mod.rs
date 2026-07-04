@@ -1623,6 +1623,28 @@ fn build_cos_batch_from_queue(
     secondary_budget: u64,
     phase: CoSServicePhase,
 ) -> Option<CoSBatch> {
+    // #3968: clear the pop-snapshot stack at batch start — the
+    // non-exact analog of the clear `drain_exact_local_items_to_scratch_flow_fair`
+    // / `drain_exact_prepared_items_to_scratch_flow_fair` already do
+    // (queue_service/drain.rs). A fully-committed non-exact batch
+    // leaves ALL of its snapshots on the stack:
+    // `restore_cos_local_items_inner` pops one only per RETRIED item,
+    // so a whole-batch commit consumes none. `drain_shaped_tx` builds
+    // one batch per call and the outer TX loop calls it repeatedly, so
+    // a saturated promoted non-exact queue with more than
+    // `TX_BATCH_SIZE` resident items is drained across consecutive
+    // `build_cos_batch_from_queue` calls with NO intervening
+    // `cos_queue_push_back` (the only other clear site). Without this,
+    // the next build pushes on top of the prior batch's stale
+    // snapshots, growing the stack past its documented `TX_BATCH_SIZE`
+    // bound (hot-path realloc / stale re-read; the per-pop
+    // `debug_assert` in `cos_queue_pop_known_bucket_inner` trips in dev
+    // builds). Cleared unconditionally at entry: any snapshots resident
+    // here belong to an already-submitted batch and are stale — the
+    // submit (and its synchronous rollback) completed before this call.
+    if let Some(ff) = queue.flow_fair_state.as_mut() {
+        ff.pop_snapshot_stack.clear();
+    }
     let head = cos_queue_front(queue)?;
     match head {
         CoSPendingTxItem::Local(_) => {

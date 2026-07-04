@@ -3507,3 +3507,135 @@ fn sojourn_zero_stamp_items_record_nothing_end_to_end() {
         "enqueue_ns == 0 must be treated as no-data, never a sample",
     );
 }
+
+/// #3968: the NON-exact flow-fair service path
+/// (`build_cos_batch_from_queue`) must clear the pop-snapshot stack
+/// at batch start — the analog of the clear the exact drain path
+/// (`drain_exact_*_flow_fair`) already performs (drain.rs).
+///
+/// A fully-committed non-exact batch leaves ALL of its snapshots on
+/// the stack: `restore_cos_local_items_inner` only pops a snapshot
+/// per RETRIED item, so a batch the TX ring accepted whole consumes
+/// none. `drain_shaped_tx` builds one batch per call and the outer
+/// TX loop calls it repeatedly, so a saturated promoted non-exact
+/// queue with more than `TX_BATCH_SIZE` resident items is drained
+/// across consecutive `build_cos_batch_from_queue` calls with NO
+/// intervening `push_back` (the only other clear site). Without the
+/// batch-start clear the second build pushes on top of the first
+/// batch's stale snapshots, growing the stack past its documented
+/// `TX_BATCH_SIZE` bound — a hot-path realloc / stale re-read (and
+/// the per-pop `debug_assert` in `cos_queue_pop_known_bucket_inner`
+/// trips in dev builds).
+///
+/// RED-on-revert: without the clear, the second batch's stack holds
+/// `TX_BATCH_SIZE + 64` snapshots (release) or the per-pop
+/// `debug_assert` panics (dev). A single build is unaffected.
+#[test]
+fn build_cos_batch_clears_pop_snapshot_stack_across_batches() {
+    let mut root = test_cos_runtime_with_queues(
+        25_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "best-effort".into(),
+            priority: 5,
+            transmit_rate_bytes: 1_000_000_000 / 8,
+            guarantee_enabled: true,
+            // NON-exact: exercises the build_cos_batch_from_queue
+            // service path (the exact path drains via
+            // drain_exact_*_flow_fair, which already clears).
+            exact: false,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: 8 * 1024 * 1024,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    enable_test_flow_fair(queue);
+
+    let pre_cap = test_flow_fair_state(queue).pop_snapshot_stack.capacity();
+    assert_eq!(
+        pre_cap, TX_BATCH_SIZE,
+        "stack must be preallocated to TX_BATCH_SIZE",
+    );
+
+    // Saturate: TX_BATCH_SIZE + 64 items across two flows so the
+    // MQFQ min-finish scan does real selection and the first build
+    // pops a full TX_BATCH_SIZE batch with 64 items left resident.
+    let total = TX_BATCH_SIZE + 64;
+    for i in 0..total {
+        let src_port = if i % 2 == 0 { 9001u16 } else { 9002u16 };
+        cos_queue_push_back(queue, test_flow_cos_item(src_port, 100));
+    }
+
+    // Batch 1: build_cos_batch_from_queue pops TX_BATCH_SIZE items,
+    // pushing one rollback snapshot per pop. Budgets = u64::MAX so
+    // nothing caps the batch below the frame-count bound.
+    let batch1 = build_cos_batch_from_queue(
+        &mut root.queues[0],
+        0,
+        u64::MAX,
+        u64::MAX,
+        CoSServicePhase::Guarantee,
+    )
+    .expect("first batch built");
+    let batch1_len = match &batch1 {
+        CoSBatch::Local { items, .. } => items.len(),
+        CoSBatch::Prepared { items, .. } => items.len(),
+    };
+    assert_eq!(
+        batch1_len, TX_BATCH_SIZE,
+        "first batch fills a full TX_BATCH_SIZE batch",
+    );
+    assert_eq!(
+        test_flow_fair_state(&root.queues[0])
+            .pop_snapshot_stack
+            .len(),
+        TX_BATCH_SIZE,
+        "one snapshot per popped item",
+    );
+
+    // Full commit: the TX ring accepted every item, so nothing is
+    // push_fronted back and no snapshot is consumed. Drop the batch
+    // WITHOUT a push_back (which would clear the stack) — mirrors
+    // the drain_shaped_tx full-commit hot path exactly.
+    drop(batch1);
+
+    // Batch 2: drain the remaining 64 items with NO intervening
+    // push_back. With the batch-start clear the stack holds ONLY the
+    // second batch's own snapshots.
+    let batch2 = build_cos_batch_from_queue(
+        &mut root.queues[0],
+        0,
+        u64::MAX,
+        u64::MAX,
+        CoSServicePhase::Guarantee,
+    )
+    .expect("second batch built");
+    let batch2_len = match &batch2 {
+        CoSBatch::Local { items, .. } => items.len(),
+        CoSBatch::Prepared { items, .. } => items.len(),
+    };
+    assert_eq!(
+        batch2_len, 64,
+        "second batch drains the remaining resident items",
+    );
+    assert_eq!(
+        test_flow_fair_state(&root.queues[0])
+            .pop_snapshot_stack
+            .len(),
+        batch2_len,
+        "#3968: the second batch's stack holds ONLY its own \
+         snapshots — no stale first-batch residue",
+    );
+    assert_eq!(
+        test_flow_fair_state(&root.queues[0])
+            .pop_snapshot_stack
+            .capacity(),
+        pre_cap,
+        "#3968: stack must not realloc past TX_BATCH_SIZE",
+    );
+}
