@@ -869,6 +869,167 @@ func TestApplyRSSIndirectionOne_QueueCountOne_NoOp(t *testing.T) {
 	}
 }
 
+// ─── #3954: hash-key line must not be misparsed as a table row ───────
+//
+// Real mlx5 `ethtool -x` output ends with an "RSS hash key:" section whose
+// bytes are printed colon-separated hex ("09:5c:8e:..."). When the first
+// key byte is a decimal-looking hex value (both nibbles 0-9: 0x00-0x09,
+// 0x10-0x19, ..., 0x90-0x99 — 100 of 256 values, ~39% of random keys) the
+// "09" prefix parses as a valid decimal via strconv.Atoi, so the idempotence
+// probe used to misread the key line as an indirection-table row whose
+// remaining hex bytes then failed to parse → a false "current != desired"
+// verdict → a spurious `ethtool -X` rewrite mid-traffic.
+//
+// These fixtures are captured-shape mlx5 output (128-entry table, 40-byte
+// Toeplitz key) with a first key byte of 0x09 to pin the fix.
+
+// capturedConstrainedTableDecimalKey: a live-shape `ethtool -x` dump whose
+// indirection table only uses queues 0..3 (the layout mlx5 writes for
+// weight vector [1 1 1 1 0 0]) AND whose RSS hash key begins with a
+// decimal-looking byte (09). indirectionTableMatches([1,1,1,1,0,0]) must
+// return true on this — i.e. the desired config is already applied.
+const capturedConstrainedTableDecimalKey = `RX flow hash indirection table for ge-0-0-2 with 6 RX ring(s):
+    0:      0     1     2     3     0     1     2     3
+    8:      0     1     2     3     0     1     2     3
+   16:      0     1     2     3     0     1     2     3
+   24:      0     1     2     3     0     1     2     3
+   32:      0     1     2     3     0     1     2     3
+   40:      0     1     2     3     0     1     2     3
+   48:      0     1     2     3     0     1     2     3
+   56:      0     1     2     3     0     1     2     3
+   64:      0     1     2     3     0     1     2     3
+   72:      0     1     2     3     0     1     2     3
+   80:      0     1     2     3     0     1     2     3
+   88:      0     1     2     3     0     1     2     3
+   96:      0     1     2     3     0     1     2     3
+  104:      0     1     2     3     0     1     2     3
+  112:      0     1     2     3     0     1     2     3
+  120:      0     1     2     3     0     1     2     3
+RSS hash key:
+09:5c:8e:3a:7f:c1:d2:0b:44:91:6a:2e:88:fd:03:57:be:19:e4:7c:35:a0:6d:f2:48:9b:11:cc:82:5f:30:a7:6e:d9:04:53:bf:1a:e5:7d
+RSS hash function:
+    toeplitz: on
+    xor: off
+    crc32: off
+`
+
+// capturedDefaultTableDecimalKey: a live-shape `ethtool -x` dump whose
+// indirection table is the kernel round-robin default across all 6 queues
+// (entry[i] == i mod 6) AND whose RSS hash key begins with a decimal-looking
+// byte (09). indirectionTableIsDefault(_, 6) must return true on this.
+const capturedDefaultTableDecimalKey = `RX flow hash indirection table for ge-0-0-2 with 6 RX ring(s):
+    0:      0     1     2     3     4     5     0     1
+    8:      2     3     4     5     0     1     2     3
+   16:      4     5     0     1     2     3     4     5
+   24:      0     1     2     3     4     5     0     1
+RSS hash key:
+09:5c:8e:3a:7f:c1:d2:0b:44:91:6a:2e:88:fd:03:57:be:19:e4:7c:35:a0:6d:f2:48:9b:11:cc:82:5f:30:a7:6e:d9:04:53:bf:1a:e5:7d
+RSS hash function:
+    toeplitz: on
+    xor: off
+    crc32: off
+`
+
+// #3954 test 1 (RED on revert): the desired constrained layout is already
+// live and the RSS key's first byte is decimal-looking (09). The probe must
+// report "already applied" — the key line must not be misread as a table
+// row. On revert the misparse makes indirectionTableMatches return false.
+func TestIndirectionTableMatches_DecimalFirstKeyByte_StillMatches(t *testing.T) {
+	if !indirectionTableMatches([]byte(capturedConstrainedTableDecimalKey), []int{1, 1, 1, 1, 0, 0}) {
+		t.Fatal("constrained table with a decimal-looking RSS key byte must still match desired [1 1 1 1 0 0] " +
+			"(#3954: the RSS hash key line must not be parsed as a table row)")
+	}
+}
+
+// #3954 test 2: the round-robin default layout with a decimal-looking RSS
+// key byte must still parse as default. On revert the key line "09:5c:..."
+// is misread as row 9 whose entry "5c:8e:..." fails to parse → false.
+func TestIndirectionTableIsDefault_DecimalFirstKeyByte_StillDefault(t *testing.T) {
+	if !indirectionTableIsDefault([]byte(capturedDefaultTableDecimalKey), 6) {
+		t.Fatal("round-robin default table with a decimal-looking RSS key byte must still parse as default " +
+			"(#3954)")
+	}
+}
+
+// #3954 test 3 (RED on revert, end-to-end): drive the full
+// applyRSSIndirectionOne probe path with the golden fixture that already
+// matches the desired weight vector. The probe must SKIP the rewrite — the
+// only ethtool call is the `-x` probe, no `-X weight`. On revert the
+// hash-key misparse forces a spurious `ethtool -X` weight rewrite (2 calls).
+func TestApplyRSSIndirectionOne_MatchingTableDecimalKey_SkipsWrite(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"ge-0-0-2": mlx5Driver},
+		queues:   map[string]int{"ge-0-0-2": 6},
+		ethtoolX: map[string][]byte{"ge-0-0-2": []byte(capturedConstrainedTableDecimalKey)},
+	}
+	// workers=4, queues=6 → desired weights [1 1 1 1 0 0], already live.
+	applyRSSIndirectionOne("ge-0-0-2", 4, f)
+
+	if len(f.calls) != 1 {
+		t.Fatalf("want exactly 1 ethtool call (probe only), got %d: %v (#3954: spurious -X rewrite)",
+			len(f.calls), f.calls)
+	}
+	if f.calls[0][0] != "-x" {
+		t.Fatalf("the single call must be the -x probe, got %v", f.calls[0])
+	}
+	for _, c := range f.calls {
+		if c[0] == "-X" {
+			t.Fatalf("already-correct RSS config must not trigger `ethtool -X`, got %v", c)
+		}
+	}
+}
+
+// #3954 test 4: the negative path still fires. When the live table is the
+// full round-robin default (queues 0..5) but only 4 workers are desired, the
+// config genuinely differs → exactly one `ethtool -X weight` rewrite. Pins
+// that the section-bounded parser did not over-suppress writes.
+func TestApplyRSSIndirectionOne_DifferingTableDecimalKey_WritesOnce(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"ge-0-0-2": mlx5Driver},
+		queues:   map[string]int{"ge-0-0-2": 6},
+		ethtoolX: map[string][]byte{"ge-0-0-2": []byte(capturedDefaultTableDecimalKey)},
+	}
+	applyRSSIndirectionOne("ge-0-0-2", 4, f)
+
+	writes := 0
+	for _, c := range f.calls {
+		if len(c) >= 3 && c[0] == "-X" && c[2] == "weight" {
+			writes++
+			want := []string{"-X", "ge-0-0-2", "weight", "1", "1", "1", "1", "0", "0"}
+			if !reflect.DeepEqual(c, want) {
+				t.Fatalf("weight argv mismatch: want %v, got %v", want, c)
+			}
+		}
+	}
+	if writes != 1 {
+		t.Fatalf("genuinely-different config must issue exactly one -X weight, got %d: %v",
+			writes, f.calls)
+	}
+}
+
+// #3954 test 5 (unit, parser): the shared parser stops at the RSS hash key
+// section so the decimal-first-byte key line contributes no rows, and the
+// preceding table rows all parse. Guards the section bound directly.
+func TestParseIndirectionTable_StopsAtHashKey(t *testing.T) {
+	rows, ok := parseIndirectionTable([]byte(capturedConstrainedTableDecimalKey))
+	if !ok {
+		t.Fatal("parse must succeed (all in-section tokens are integers)")
+	}
+	if len(rows) != 16 {
+		t.Fatalf("want 16 indirection rows (key/function sections excluded), got %d", len(rows))
+	}
+	for _, row := range rows {
+		if len(row.entries) != 8 {
+			t.Fatalf("row %d: want 8 entries, got %d", row.idx, len(row.entries))
+		}
+		for _, q := range row.entries {
+			if q < 0 || q > 3 {
+				t.Fatalf("row %d: constrained table must only use queues 0..3, saw %d", row.idx, q)
+			}
+		}
+	}
+}
+
 // Sanity: the production isExecNotFound detects the stable sentinel that
 // `exec.Command("missing").CombinedOutput()` wraps, without substring
 // matching (Go MEDIUM #1).
