@@ -644,15 +644,42 @@ fn tx_latency_hist_cross_thread_snapshot_skew_within_bound() {
     // — not raw `fetch_add` — so the pin exercises the actual
     // shipped fold, not a synthetic one.
     //
-    // Skew bound (plan §3.6 R2 / §6.1):
+    // Deterministic bound (#4011): the old bound was
     //   K_skew = ceil(λ_obs × W_read_max) + 2
-    //   λ_obs = count_final / elapsed_wall_ns
-    //         (measured AFTER stopping the writer, per Codex §7)
-    //   W_read_max = max snapshot read window observed
-    //   +2 margin is TSO / ARM re-order allowance, independent of λ
+    // where λ_obs = count_final / elapsed_wall_ns (the AVERAGE
+    // production rate over the whole run) and W_read_max = the
+    // MAXIMUM snapshot read window observed. Multiplying an average
+    // rate by a maximum window under-estimates the emission during
+    // any single window whose INSTANTANEOUS writer rate ran above
+    // the average — ordinary under a loaded box / scheduler jitter
+    // — so a legitimately-bounded skew could exceed the modelled
+    // K_skew and trip the pin (the load-sensitive flake that made
+    // `make test` itself flaky once #4006 wired the Rust suite in).
     //
-    // Pin assertion: max observed |sum − count| across all
-    // reader snapshots ≤ K_skew.
+    // Fix: MEASURE per-window emission directly instead of
+    // modelling it from a global average. The writer increments the
+    // histogram bucket BEFORE `count` (stats.rs
+    // record_tx_completions_with_stamp: bucket fetch_add, then
+    // count fetch_add) and the reader reads the histogram BEFORE
+    // `count` (snapshot.rs: snapshot_hist, then count load); both
+    // counters are monotonic. The reader brackets each snapshot
+    // with a raw `count` load before and after, so
+    //   window_delta = count_after − count_before
+    // is exactly how many completions the writer published during
+    // that snapshot's whole read window — the only records that can
+    // make `sum(hist)` and `count` disagree for THIS sample. With a
+    // single sequential writer under TSO at most one record is
+    // "hist done, count pending" at any instant, giving the proven
+    //   |sum − count| ≤ window_delta + 1.
+    //
+    // Pin assertion (per sample): |sum(hist) − count| ≤
+    // window_delta + K_MARGIN, K_MARGIN = 2. This holds under ANY
+    // load — window_delta scales with whatever the writer actually
+    // did during a preempted read — yet still catches the real
+    // defect the pin guards: a torn/dropped accounting bug that
+    // loses a bucket or count increment drives |sum − count| toward
+    // count_final (millions), unbounded relative to the handful of
+    // records in any single window_delta.
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
@@ -716,7 +743,7 @@ fn tx_latency_hist_cross_thread_snapshot_skew_within_bound() {
     #[derive(Clone, Copy)]
     struct Sample {
         skew: i64,
-        w_read_ns: u64,
+        window_delta: u64,
     }
     let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::with_capacity(5_000)));
     let reader_live = Arc::clone(&live);
@@ -736,83 +763,99 @@ fn tx_latency_hist_cross_thread_snapshot_skew_within_bound() {
         // reader keeps snapshotting until the main thread signals
         // `stop`, so the observed race window is time-bounded,
         // not iteration-count-bounded.
+        //
+        // Bracket each snapshot with a raw `count` load before and
+        // after (#4011). `count` is monotonic, so
+        // `count_after − count_before` is exactly how many
+        // completions the writer published during this snapshot's
+        // read window — the per-sample bound denominator, measured
+        // rather than modelled from a global average rate.
         let mut local = Vec::with_capacity(16_384);
         while !reader_stop.load(Ordering::Relaxed) {
-            let pre = Instant::now();
+            let count_before = reader_live
+                .owner_profile_owner
+                .tx_submit_latency_count
+                .load(Ordering::Relaxed);
             let snap = reader_live.snapshot();
-            let w_read_ns = pre.elapsed().as_nanos() as u64;
+            let count_after = reader_live
+                .owner_profile_owner
+                .tx_submit_latency_count
+                .load(Ordering::Relaxed);
             let count = snap.tx_submit_latency_count as i64;
             let sum_buckets: i64 = snap.tx_submit_latency_hist.iter().copied().sum::<u64>() as i64;
             let skew = (sum_buckets - count).abs();
-            local.push(Sample { skew, w_read_ns });
+            let window_delta = count_after.saturating_sub(count_before);
+            local.push(Sample { skew, window_delta });
         }
         *reader_samples.lock().unwrap() = local;
     });
 
     // Let the writer+reader run for a bounded wall window, then
     // shut the writer down and join both threads.
-    let wall_start = Instant::now();
     std::thread::sleep(Duration::from_millis(200));
     stop.store(true, Ordering::Relaxed);
     writer_handle.join().expect("writer thread joins cleanly");
     reader_handle.join().expect("reader thread joins cleanly");
-    let elapsed_ns = wall_start.elapsed().as_nanos() as u64;
 
-    // Post-hoc: compute λ_obs from final count / elapsed_wall
-    // (plan §6.1 / Codex §7 — NOT from per-snapshot count).
-    let final_snap = live.snapshot();
-    let count_final = final_snap.tx_submit_latency_count;
+    let count_final = live.snapshot().tx_submit_latency_count;
     assert!(
         count_final > 0,
         "writer thread produced no completions — harness broken",
     );
-    let lambda_obs_per_ns = count_final as f64 / elapsed_ns.max(1) as f64;
 
     let gathered = samples.lock().unwrap().clone();
     assert!(
         !gathered.is_empty(),
         "reader thread produced no snapshots — harness broken",
     );
+
+    // Per-sample deterministic bound (#4011): for every snapshot
+    //   |sum(hist) − count| ≤ window_delta + K_MARGIN.
+    // K_MARGIN = 2 = the proven +1 in-flight boundary (one record
+    // "hist done, count pending" under TSO's single sequential
+    // writer) plus one unit of weak-memory reorder slack. `excess`
+    // = skew − window_delta is how far a sample exceeds the ideal
+    // `skew ≤ window_delta`; the worst `excess` across all samples
+    // must stay within K_MARGIN, independent of scheduler load.
+    const K_MARGIN: i64 = 2;
     let mut max_skew = 0i64;
-    let mut max_w_read_ns = 0u64;
+    let mut max_window_delta = 0u64;
+    let mut max_excess = i64::MIN;
+    let mut worst = Sample {
+        skew: 0,
+        window_delta: 0,
+    };
     for s in &gathered {
+        let excess = s.skew - s.window_delta as i64;
+        if excess > max_excess {
+            max_excess = excess;
+            worst = *s;
+        }
         if s.skew > max_skew {
             max_skew = s.skew;
         }
-        if s.w_read_ns > max_w_read_ns {
-            max_w_read_ns = s.w_read_ns;
+        if s.window_delta > max_window_delta {
+            max_window_delta = s.window_delta;
         }
     }
-    // K_skew bound using the MAX observed read window and the
-    // steady-state λ_obs. +2 is the derivation-independent
-    // margin (plan §3.6 R2).
-    //
-    // Derivation (identical to #812 §3.6 R2): during one reader
-    // window of duration W_read_ns, the writer emits at most
-    // ceil(λ_obs × W_read_ns) records. The +2 absorbs two sources
-    // of off-by-one: (1) a record in flight at window start that
-    // had already incremented `count` but not yet the histogram
-    // (or vice-versa), and (2) the analogous boundary at window
-    // end. #812 empirically demonstrated this bound is tight for
-    // the tx-completion path; `record_kick_latency` has the same
-    // single-writer / Relaxed-ordering / count-then-bucket shape
-    // (see `record_kick_latency` at tx.rs), so the derivation
-    // carries over unchanged. Tightening the bound below +2
-    // would risk flakes on schedulers with more jitter.
-    let k_skew = (lambda_obs_per_ns * max_w_read_ns as f64).ceil() as i64 + 2;
     assert!(
-        max_skew <= k_skew,
-        "cross-thread skew {max_skew} exceeds bound K_skew = {k_skew} \
-         (lambda_obs_per_ns={lambda_obs_per_ns:.6}, \
-         max_w_read_ns={max_w_read_ns}, count_final={count_final}, \
-         samples={})",
+        max_excess <= K_MARGIN,
+        "cross-thread skew exceeds per-window bound: worst sample \
+         skew={} window_delta={} excess={} (> K_MARGIN={}); \
+         max_skew={max_skew} max_window_delta={max_window_delta} \
+         count_final={count_final} samples={}",
+        worst.skew,
+        worst.window_delta,
+        max_excess,
+        K_MARGIN,
         gathered.len(),
     );
     eprintln!(
         "tx_latency_hist_cross_thread_snapshot_skew_within_bound: \
-         max_skew={max_skew} k_skew={k_skew} \
-         lambda_obs_per_ns={lambda_obs_per_ns:.6} \
-         max_w_read_ns={max_w_read_ns} count_final={count_final}",
+         max_excess={max_excess} K_MARGIN={K_MARGIN} \
+         max_skew={max_skew} max_window_delta={max_window_delta} \
+         count_final={count_final} samples={}",
+        gathered.len(),
     );
 }
 
@@ -1132,10 +1175,23 @@ fn tx_kick_latency_cross_thread_snapshot_skew_within_bound() {
     // Spawn a writer thread that calls `record_kick_latency` in
     // a tight loop; spawn a reader thread that calls
     // `BindingLiveState::snapshot()` in a tight loop. Assert
-    // the bounded-skew invariant `|sum(hist) - count| ≤ K_skew`
-    // holds for every reader sample.
+    // the bounded-skew invariant `|sum(hist) - count| ≤
+    // window_delta + K_MARGIN` holds for every reader sample.
     //
-    // K_skew = ceil(λ_obs × W_read_max) + 2 (plan §4 / #812 §3.6 R2).
+    // Deterministic bound (#4011): identical rationale to the
+    // tx-submit sibling `tx_latency_hist_cross_thread_snapshot_
+    // skew_within_bound`. `record_kick_latency` has the same
+    // single-writer / Relaxed / bucket-then-count shape
+    // (stats.rs: tx_kick_latency_hist fetch_add, then
+    // tx_kick_latency_count fetch_add), so the old
+    // ceil(λ_obs × W_read_max) model was the same load-sensitive
+    // flake (average rate × max window under-estimates a single
+    // window whose instantaneous rate spiked). We replace it with
+    // the per-sample directly-measured `window_delta = count_after
+    // − count_before` bound: |sum(hist) − count| ≤ window_delta +
+    // K_MARGIN, K_MARGIN = 2. Load-independent, and a dropped
+    // bucket/count increment still drives skew toward count_final
+    // (unbounded relative to any window_delta) → loud failure.
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
@@ -1170,7 +1226,7 @@ fn tx_kick_latency_cross_thread_snapshot_skew_within_bound() {
     #[derive(Clone, Copy)]
     struct Sample {
         skew: i64,
-        w_read_ns: u64,
+        window_delta: u64,
     }
     let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::with_capacity(5_000)));
     let reader_live = Arc::clone(&live);
@@ -1182,72 +1238,91 @@ fn tx_kick_latency_cross_thread_snapshot_skew_within_bound() {
         while !reader_warm_rd.load(Ordering::Acquire) && Instant::now() < wait_deadline {
             std::thread::yield_now();
         }
+        // Bracket each snapshot with a raw `count` load before and
+        // after (#4011): window_delta = count_after − count_before
+        // is the writer's actual publication count during this
+        // snapshot's read window (measured, not modelled).
         let mut local = Vec::with_capacity(16_384);
         while !reader_stop.load(Ordering::Relaxed) {
-            let pre = Instant::now();
+            let count_before = reader_live
+                .owner_profile_owner
+                .tx_kick_latency_count
+                .load(Ordering::Relaxed);
             let snap = reader_live.snapshot();
-            let w_read_ns = pre.elapsed().as_nanos() as u64;
+            let count_after = reader_live
+                .owner_profile_owner
+                .tx_kick_latency_count
+                .load(Ordering::Relaxed);
             let count = snap.tx_kick_latency_count as i64;
             let sum_buckets: i64 = snap.tx_kick_latency_hist.iter().copied().sum::<u64>() as i64;
             let skew = (sum_buckets - count).abs();
-            local.push(Sample { skew, w_read_ns });
+            let window_delta = count_after.saturating_sub(count_before);
+            local.push(Sample { skew, window_delta });
         }
         *reader_samples.lock().unwrap() = local;
     });
 
-    let wall_start = Instant::now();
     std::thread::sleep(Duration::from_millis(200));
     stop.store(true, Ordering::Relaxed);
     writer_handle.join().expect("writer thread joins cleanly");
     reader_handle.join().expect("reader thread joins cleanly");
-    let elapsed_ns = wall_start.elapsed().as_nanos() as u64;
 
-    let final_snap = live.snapshot();
-    let count_final = final_snap.tx_kick_latency_count;
+    let count_final = live.snapshot().tx_kick_latency_count;
     assert!(
         count_final > 0,
         "writer thread produced no samples — harness broken",
     );
-    let lambda_obs_per_ns = count_final as f64 / elapsed_ns.max(1) as f64;
 
     let gathered = samples.lock().unwrap().clone();
     assert!(
         !gathered.is_empty(),
         "reader thread produced no snapshots — harness broken",
     );
+
+    // Per-sample deterministic bound (#4011): |sum(hist) − count|
+    // ≤ window_delta + K_MARGIN for every snapshot. K_MARGIN = 2 =
+    // the proven +1 in-flight boundary (one record "hist done,
+    // count pending" under TSO's single sequential writer) plus one
+    // unit of weak-memory reorder slack. Load-independent.
+    const K_MARGIN: i64 = 2;
     let mut max_skew = 0i64;
-    let mut max_w_read_ns = 0u64;
+    let mut max_window_delta = 0u64;
+    let mut max_excess = i64::MIN;
+    let mut worst = Sample {
+        skew: 0,
+        window_delta: 0,
+    };
     for s in &gathered {
+        let excess = s.skew - s.window_delta as i64;
+        if excess > max_excess {
+            max_excess = excess;
+            worst = *s;
+        }
         if s.skew > max_skew {
             max_skew = s.skew;
         }
-        if s.w_read_ns > max_w_read_ns {
-            max_w_read_ns = s.w_read_ns;
+        if s.window_delta > max_window_delta {
+            max_window_delta = s.window_delta;
         }
     }
-    // #825 vs #812 margin note. The #812 cross-thread harness
-    // uses margin +2 because its writer path (stamp + reap
-    // fold) is ~50× slower per call than a bare
-    // `record_kick_latency` here (3 × fetch_add). That means
-    // within a single long reader window, instantaneous writer
-    // rate can spike above the global λ_obs. We therefore use
-    // margin factor 2× on the λ×W_read term plus +4 fixed —
-    // still O(λ × W) dominated and still a tight bound, just
-    // sized to the faster writer path.
-    let k_skew = (lambda_obs_per_ns * max_w_read_ns as f64 * 2.0).ceil() as i64 + 4;
     assert!(
-        max_skew <= k_skew,
-        "cross-thread skew {max_skew} exceeds bound K_skew = {k_skew} \
-         (lambda_obs_per_ns={lambda_obs_per_ns:.6}, \
-         max_w_read_ns={max_w_read_ns}, count_final={count_final}, \
-         samples={})",
+        max_excess <= K_MARGIN,
+        "cross-thread skew exceeds per-window bound: worst sample \
+         skew={} window_delta={} excess={} (> K_MARGIN={}); \
+         max_skew={max_skew} max_window_delta={max_window_delta} \
+         count_final={count_final} samples={}",
+        worst.skew,
+        worst.window_delta,
+        max_excess,
+        K_MARGIN,
         gathered.len(),
     );
     eprintln!(
         "tx_kick_latency_cross_thread_snapshot_skew_within_bound: \
-         max_skew={max_skew} k_skew={k_skew} \
-         lambda_obs_per_ns={lambda_obs_per_ns:.6} \
-         max_w_read_ns={max_w_read_ns} count_final={count_final}",
+         max_excess={max_excess} K_MARGIN={K_MARGIN} \
+         max_skew={max_skew} max_window_delta={max_window_delta} \
+         count_final={count_final} samples={}",
+        gathered.len(),
     );
 }
 
