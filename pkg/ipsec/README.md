@@ -13,8 +13,11 @@ the apply path pays no fsync (the file is regenerated on every apply).
 - `Manager` — `manager.go`.
 - `New()` — `manager.go`. Default swanctl conf dir
   `/etc/swanctl/conf.d`.
-- `Apply(ipsecCfg *config.IPsecConfig) error` — `manager.go`. Generate config and reload strongSwan.
-- `Clear() error` — `manager.go`.
+- `Apply(ipsecCfg *config.IPsecConfig) error` — `manager.go`. Generate
+  config and reload strongSwan, then terminate the live SAs of any
+  connection deleted since the last Apply (#3941).
+- `Clear() error` — `manager.go`. Remove the xpf snippet, reload, and
+  terminate every previously-applied connection's live SAs (#3941).
 - `SAStatus`, `TerminateAllSAs`, `InitiateConnection`, `GetSAStatus`,
   `ActiveConnectionNames` — `ike.go`.
 - `PrepareConfig(cfg *config.Config) *config.IPsecConfig` — `policy.go`.
@@ -25,8 +28,10 @@ The package is split by responsibility (one responsibility per module);
 all files stay in `package ipsec`, so the public API is unchanged.
 
 - `manager.go` — transactional SA-config reconciler: `Manager`
-  lifecycle (`New`/`Apply`/`Clear`/`reload`) and the `swanctl`
-  shell-out helper (`runSwanctl`, `swanctlTimeout`).
+  lifecycle (`New`/`Apply`/`Clear`/`reload`), the removed-connection
+  diff + live-SA teardown (`swapConnNames`/`terminateRemovedConns`,
+  #3941), and the `swanctl` shell-out helper (`runSwanctl`, the `sc`
+  seam, `swanctlTimeout`).
 - `ike.go` — IKE/ESP settings resolution + proposal builders
   (`resolveIKESettings`/`resolveESPSettings`/`deriveDPD`/`buildESPProposal`/
   `dhGroupBits`) and the SA-status query + `swanctl --list-sas` output
@@ -59,6 +64,25 @@ all files stay in `package ipsec`, so the public API is unchanged.
 
 ## Gotchas
 
+- **Deleting a VPN must TERMINATE its live SAs, not just unload the
+  config (#3941).** `swanctl --load-all` UNLOADS a removed connection's
+  config but leaves its already-established IKE/child SAs installed — the
+  deleted tunnel keeps forwarding until rekey/lifetime expiry (a security
+  gap: a VPN removed for a compromised peer / decommissioned site stays
+  up). `Apply` therefore remembers the previous applied connection-name
+  set (`prevConnNames`, sanitized VPN map keys) and on each apply diffs it
+  against the new set (`swapConnNames`). For every connection that
+  disappeared, `terminateRemovedConns` reloads first (so the removed conn
+  is unloaded and cannot re-initiate), then queries live SAs and issues
+  `swanctl --terminate --ike <conn>` only for a removed conn that actually
+  has a live SA — so deleting a VPN that was never up is a clean no-op. If
+  the live-SA query fails, it falls back to an unconditional (idempotent)
+  terminate. The diff keys off the VPN NAME, not renderability, so a VPN
+  that merely became unrenderable (a broken gateway reference) is not
+  treated as deleted and keeps its SAs. Modified/added connections are
+  untouched — only removals are torn down. All swanctl shell-outs route
+  through the `sc` seam so the diff→terminate path is unit-tested against
+  a recording double (`delete_terminate_3941_test.go`).
 - **SA-status parsing must match the real `swanctl --list-sas` layout
   (#3937).** `GetSAStatus` shells out to `swanctl --list-sas` and feeds the
   stdout to `parseSAOutput`. The real strongSwan output is

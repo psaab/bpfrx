@@ -33,6 +33,65 @@
   - **File(s)**: pkg/routing/routes.go, pkg/routing/routeformat.go,
     pkg/grpcapi/server_routing.go, pkg/routing/routes_multipath_test.go,
     pkg/routing/README.md, _Log.md
+## 2026-07-03 — #3941: deleting an IPsec VPN never terminates its live SAs (--load-all only unloads config)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-175 (MEDIUM, security/correctness).
+    Deleting an IPsec VPN and committing applied the new config via
+    `swanctl --load-all`, which UNLOADS the removed connection's config but
+    does NOT terminate its already-established IKE/child SAs — so the deleted
+    tunnel stayed UP and forwarding until rekey/lifetime expiry. `Manager`
+    now remembers the previous applied connection-name set (`prevConnNames`,
+    sanitized VPN map keys) and on every `Apply`/`Clear` diffs it against the
+    new set (`swapConnNames`). For each connection that disappeared,
+    `terminateRemovedConns` reloads first (unloads the removed conn so it
+    can't re-initiate), queries live SAs (`liveConnNames` via the `sc` seam),
+    and issues `swanctl --terminate --ike <conn>` only for a removed conn
+    that actually has a live SA (deleting a never-up VPN is a clean no-op).
+    A failed live-SA query falls back to an unconditional idempotent
+    terminate. The diff keys off the VPN NAME (not renderability) so a VPN
+    that merely became unrenderable keeps its SAs; modified/added conns are
+    untouched. Ordering (reload-then-terminate) prevents a straggler SA from
+    being re-initiated from a still-loaded config mid-teardown. Added the
+    `sc` exec seam (Manager `swanctl` field + accessor) so all swanctl
+    shell-outs are mockable.
+  - **File(s)**: pkg/ipsec/manager.go, pkg/ipsec/delete_terminate_3941_test.go,
+    pkg/ipsec/README.md, _Log.md
+  - **Validation**: `go test ./pkg/ipsec/...` green (5 new tests: delete-with-
+    active-SA terminates; delete-last-VPN/Clear path terminates; delete-with-
+    no-SA is a no-op; add/modify never terminate nor probe SAs; list-SAs error
+    falls back to unconditional terminate). RED-on-revert verified: neutering
+    the `terminateRemovedConns` call fails all three terminate assertions.
+    `go build ./...` + `go vet ./pkg/ipsec/... ./pkg/daemon/...` clean.
+
+## 2026-07-03 — #3942: GetBGPSummary scrapes text → phantom trailer peers + never sets PfxRcd
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-064 (MEDIUM, observability). `GetBGPSummary`
+    (`pkg/frr/status_parse.go`) scraped the `show bgp summary` TEXT table with a
+    `strings.Fields` field-count heuristic. Two defects: (a) the footer line
+    `Total number of neighbors N` has exactly 5 fields, passing the
+    `len(fields) < 5` guard, so it became a PHANTOM peer (`Neighbor="Total"`,
+    `AS="of"`); (b) the FRR text table overloads ONE `State/PfxRcd` column — for
+    an Established peer that column is the prefix count, not a state word — so
+    the scraper stored the pfxRcd digit in `State` and never populated `PfxRcd`.
+    Every real peer showed 0 prefixes and a bogus extra peer appeared in
+    `show bgp summary` (+ the gRPC/REST BGP status). Switched `GetBGPSummary` to
+    `show bgp summary json` and added `parseBGPSummaryJSON` (mirrors the existing
+    `parseRouteJSON` JSON-vtysh pattern): decodes FRR's per-AFI/SAFI peer map
+    (`ipv4Unicast`/`ipv6Unicast`/…), reads the real `state`, `pfxRcd`,
+    `remoteAs`, `msgRcvd`/`msgSent`, `peerUptime` fields — no column overload, no
+    footer to misparse. Added an `AddressFamily` field to `BGPPeerSummary` so a
+    neighbor active in multiple families produces one disambiguated (labelled +
+    sorted) row per family. Non-JSON / peerless / empty output → no peers, no
+    error (valid observability state). CLI / REST / gRPC `show bgp summary`
+    renderers now surface `AF` + `PfxRcd` columns. Added golden fixtures + a
+    RED-on-revert test (text + JSON responses both injected: NEW code parses
+    JSON → 2 peers, PfxRcd 3/1; reverted text scraper → 3 peers incl. phantom
+    `Total`, empty PfxRcd, State="3"/"1" — proven RED). Updated `pkg/frr/README.md`.
+  - **File(s)**: pkg/frr/status_parse.go, pkg/frr/bgp_summary_3942_test.go,
+    pkg/cli/cli_show_routing.go, pkg/api/routing.go,
+    pkg/grpcapi/server_routing.go, pkg/frr/README.md, _Log.md
 
 ## 2026-07-03 — #3939: NetFlow v9 / IPFIX protocolIdentifier was 0 for GRE/ESP/AH (parsed protocol NAME, not rec.ProtocolNum) → exported flows misattributed
 

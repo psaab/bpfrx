@@ -353,11 +353,11 @@ func (c *CLI) showBGP(args []string) error {
 			fmt.Println("No BGP peers")
 			return nil
 		}
-		fmt.Printf("  %-20s %-8s %-10s %-10s %-12s %s\n",
-			"Neighbor", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State")
+		fmt.Printf("  %-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
+			"Neighbor", "AF", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State", "PfxRcd")
 		for _, p := range peers {
-			fmt.Printf("  %-20s %-8s %-10s %-10s %-12s %s\n",
-				p.Neighbor, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State)
+			fmt.Printf("  %-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
+				p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)
 		}
 		return nil
 

@@ -173,9 +173,11 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
+		fmt.Fprintf(&b, "%-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
+			"Neighbor", "AF", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State", "PfxRcd")
 		for _, p := range peers {
-			fmt.Fprintf(&b, "%-20s %-8s %-10s %-10s %-12s %s\n",
-				p.Neighbor, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State)
+			fmt.Fprintf(&b, "%-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
+				p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)
 		}
 	}
 	return &pb.GetBGPStatusResponse{Output: b.String()}, nil
