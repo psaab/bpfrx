@@ -2441,6 +2441,114 @@ func TestPortMirroringSetSyntaxMultiInput(t *testing.T) {
 	}
 }
 
+// compilePortMirroringSet is a flat-set helper: it runs each `set` command
+// through ParseSetCommand + tree.SetPath (NEVER NewParser — the parser merges
+// newline-separated set lines into one node) then compiles the tree.
+func compilePortMirroringSet(t *testing.T, cmds ...string) (*Config, error) {
+	t.Helper()
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	return CompileConfig(tree)
+}
+
+// #3972: an invalid port-mirroring entry (negative rate, duplicate ingress
+// source) must be a HARD commit reject naming the bad entry — NOT a green
+// commit that later fail-closes the WHOLE mirror table with only a warn in the
+// snapshot builder. RED-on-revert: pre-#3972 the compiler silently accepted a
+// negative rate (InputRate=-5) and a cross-instance duplicate ingress, the
+// commit went green, and buildMirrorConfigSnapshots then dropped every valid
+// mirror session. These tests go RED against that behavior.
+func TestPortMirroringRejectsNegativeRateFlatSet(t *testing.T) {
+	// 3 valid instances + 1 with a negative rate.
+	cfg, err := compilePortMirroringSet(t,
+		"set forwarding-options port-mirroring instance span1 input rate 10",
+		"set forwarding-options port-mirroring instance span1 input ingress interface ge-0/0/0.0",
+		"set forwarding-options port-mirroring instance span1 output interface mon0",
+		"set forwarding-options port-mirroring instance span2 input rate 20",
+		"set forwarding-options port-mirroring instance span2 input ingress interface ge-0/0/1.0",
+		"set forwarding-options port-mirroring instance span2 output interface mon0",
+		"set forwarding-options port-mirroring instance span3 input ingress interface ge-0/0/2.0",
+		"set forwarding-options port-mirroring instance span3 output interface mon0",
+		"set forwarding-options port-mirroring instance bad input rate -5",
+		"set forwarding-options port-mirroring instance bad input ingress interface ge-0/0/3.0",
+		"set forwarding-options port-mirroring instance bad output interface mon0",
+	)
+	if err == nil {
+		t.Fatalf("CompileConfig succeeded, want reject for negative rate; PortMirroring=%+v", cfg.ForwardingOptions.PortMirroring)
+	}
+	if !strings.Contains(err.Error(), `instance "bad"`) || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("error = %v, want a specific negative-rate reject naming instance \"bad\"", err)
+	}
+}
+
+func TestPortMirroringRejectsNonNumericRateFlatSet(t *testing.T) {
+	_, err := compilePortMirroringSet(t,
+		"set forwarding-options port-mirroring instance span1 input rate notanumber",
+		"set forwarding-options port-mirroring instance span1 input ingress interface ge-0/0/0.0",
+		"set forwarding-options port-mirroring instance span1 output interface mon0",
+	)
+	if err == nil || !strings.Contains(err.Error(), `instance "span1"`) || !strings.Contains(err.Error(), "invalid input rate") {
+		t.Fatalf("error = %v, want invalid-input-rate reject naming instance \"span1\"", err)
+	}
+}
+
+// A duplicate ingress source across two instances is rejected — the mirror
+// table contract is one output per ingress interface. Names are normalized so
+// the vSRX ("ge-0/0/0.0") and Linux ("ge-0-0-0.0") spellings collide.
+func TestPortMirroringRejectsDuplicateIngressFlatSet(t *testing.T) {
+	_, err := compilePortMirroringSet(t,
+		"set forwarding-options port-mirroring instance span1 input ingress interface ge-0/0/0.0",
+		"set forwarding-options port-mirroring instance span1 output interface mon0",
+		"set forwarding-options port-mirroring instance span2 input ingress interface ge-0-0-0.0",
+		"set forwarding-options port-mirroring instance span2 output interface mon1",
+	)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded, want reject for duplicate ingress interface across instances")
+	}
+	if !strings.Contains(err.Error(), `"span1"`) || !strings.Contains(err.Error(), `"span2"`) {
+		t.Fatalf("error = %v, want a duplicate-ingress reject naming both instances", err)
+	}
+}
+
+// An all-valid config compiles every instance. rate 0 (mirror every packet) is
+// valid per the #1376 design, so it is NOT rejected.
+func TestPortMirroringAllValidFlatSetCompilesAllEntries(t *testing.T) {
+	cfg, err := compilePortMirroringSet(t,
+		"set forwarding-options port-mirroring instance span1 input rate 10",
+		"set forwarding-options port-mirroring instance span1 input ingress interface ge-0/0/0.0",
+		"set forwarding-options port-mirroring instance span1 output interface mon0",
+		"set forwarding-options port-mirroring instance span2 input rate 20",
+		"set forwarding-options port-mirroring instance span2 input ingress interface ge-0/0/1.0",
+		"set forwarding-options port-mirroring instance span2 output interface mon0",
+		"set forwarding-options port-mirroring instance span3 input rate 0",
+		"set forwarding-options port-mirroring instance span3 input ingress interface ge-0/0/2.0",
+		"set forwarding-options port-mirroring instance span3 output interface mon1",
+	)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	pm := cfg.ForwardingOptions.PortMirroring
+	if pm == nil || len(pm.Instances) != 3 {
+		t.Fatalf("PortMirroring = %+v, want 3 instances", pm)
+	}
+	if got := pm.Instances["span3"].InputRate; got != 0 {
+		t.Fatalf("span3 InputRate = %d, want 0 (mirror all)", got)
+	}
+	for _, name := range []string{"span1", "span2", "span3"} {
+		if pm.Instances[name] == nil {
+			t.Fatalf("instance %q missing after compile", name)
+		}
+	}
+}
+
 func TestPortMirroringHierarchicalSimple(t *testing.T) {
 	input := `forwarding-options {
     port-mirroring {

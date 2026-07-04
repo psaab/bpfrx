@@ -18,6 +18,40 @@ Add `MirrorConfig { output_ifindex, rate }` to the userspace snapshot and Rust
 state. Preserve the current eBPF data model: one mirror entry per ingress
 ifindex. Duplicate ingress ifindex config must be rejected at commit time.
 
+### Commit-Time Validation (#3972)
+
+The commit-time reject the design above called for was originally missing:
+`config.compilePortMirroring` accepted any input and the duplicate-ingress /
+negative-rate checks lived only in the snapshot builder
+(`buildMirrorConfigSnapshots`), where a single bad entry made
+`buildMirrorConfigSnapshotsFailClosed` drop the **entire** mirror table with
+only a `slog.Warn`. An operator with three valid mirror sessions plus one
+typo'd fourth (duplicate ingress or negative rate) lost **all** mirroring
+silently.
+
+`config.compilePortMirroring` now hard-rejects at commit, naming the offending
+instance:
+
+- **Duplicate ingress source** — the same interface used as an ingress source
+  by more than one instance (or twice in one instance). The mirror table
+  contract is one output per ingress interface. Ingress names are normalized
+  with `LinuxIfName`, so the vSRX (`ge-0/0/0.0`) and Linux (`ge-0-0-0.0`)
+  spellings of one interface collide.
+- **Negative input rate** — a negative rate would wrap in
+  `uint32(InputRate)`.
+- **Non-numeric input rate** — previously swallowed silently (`strconv.Atoi`
+  error ignored), which turned a typo'd `rate` into rate 0 = mirror every
+  packet. Now a specific reject.
+
+`rate 0` remains valid (mirror every packet, per the sampling model below), so
+only negative / non-numeric rates are rejected.
+
+The snapshot builder (`buildMirrorConfigSnapshots`) is now **scope-drop**
+defense-in-depth: if an invalid entry ever reaches it (e.g. a stale on-disk
+config written by an older build), it skips only the offending entry with a
+specific warning and still publishes the valid mirror sessions — it no longer
+fail-closes the whole table.
+
 Mirroring runs after ingress policy/forwarding decision while the original
 packet bytes are still available. A matched mirror allocates a clone frame,
 copies the full L2 frame with no truncation, and queues it to the configured
@@ -119,8 +153,10 @@ survival under mirror pressure.
 - Go/Rust: status/counter wire round-trips include
   `mirrored_packets`, `mirrored_bytes`, `mirror_drops_no_frame`,
   `mirror_drops_no_binding`, and `mirror_drops_queue_full`.
-- Go: commit validation rejects duplicate ingress mirror entries and logs/skips
-  nonexistent output ifindex consistently with current compiler behavior.
+- Go: commit validation (`config.compilePortMirroring`, #3972) hard-rejects
+  duplicate ingress mirror entries, negative rates, and non-numeric rates,
+  naming the offending instance; the snapshot builder scope-drops (rather than
+  whole-table fail-closes) and logs/skips a nonexistent output ifindex.
 - Go: `deriveUserspaceCapabilities()` admits port-mirroring configs now that
   snapshot/runtime support is wired, without emitting the stale unsupported
   reason.

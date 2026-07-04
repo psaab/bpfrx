@@ -30349,3 +30349,43 @@ top.
     pkg/dhcprelay/README.md #3960 giaddr-re-resolution bullet.
   - **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
     pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3972 — port-mirroring invalid-entry fail mode. VERIFY FIRST
+    refuted the issue's stated fail-mode: the "warn + drop whole table" lived in
+    `pkg/dataplane/userspace/mirrors.go` `buildMirrorConfigSnapshotsFailClosed`
+    (the LIVE userspace snapshot path — `pkg/dataplane/compiler.go` port-mirror
+    compile is retired eBPF), NOT the Go compiler, and the Go compiler
+    (`compilePortMirroring`) did NO validation at all (silently accepted a
+    negative rate and a duplicate ingress). The #1376 plan
+    (docs/pr/1373-retire-ebpf-dataplane/plan-1376-port-mirroring.md line 19)
+    intended the reject at COMMIT TIME; the implementation deferred it to the
+    snapshot builder, where one bad entry (duplicate ingress ifindex or negative
+    rate) returned an error that `buildMirrorConfigSnapshotsFailClosed` turned
+    into a whole-table drop with only a `slog.Warn` — 3 valid mirror sessions +
+    1 typo → all 4 lost silently. FIX = HARD-REJECT at commit (the issue's
+    preferred mode, matching the project's strict-commit-reject posture):
+    `config.compilePortMirroring` now returns a specific error naming the
+    offending instance on a duplicate ingress source (normalized via
+    `LinuxIfName` so vSRX/Linux spellings collide — one output per ingress
+    interface), a negative input rate, or a non-numeric rate (previously
+    swallowed → silently became rate 0 = mirror-all). `rate 0` stays valid
+    (mirror every packet, per the #1376 sampling model), so only negative /
+    non-numeric are rejected. Defense-in-depth: `buildMirrorConfigSnapshots`
+    converted from whole-table-fail-closed to SCOPE-DROP (skip only the bad
+    entry + specific warn, keep the valid sessions) and its `FailClosed` wrapper
+    removed (builder.go calls it directly). RED-on-revert (proven by restoring
+    origin/master source via `git show` in the worktree): the 3 new pkg/config
+    reject tests (`TestPortMirroringRejectsNegativeRateFlatSet`,
+    `...RejectsNonNumericRateFlatSet`, `...RejectsDuplicateIngressFlatSet`, all
+    ParseSetCommand+SetPath per CLAUDE.md) FAIL against the old compiler
+    (CompileConfig went green). All-valid config compiles all 3 instances
+    (`...AllValidFlatSetCompilesAllEntries`). Updated userspace tests to assert
+    scope-drop (`...ScopeDropsDuplicateIngressIfindex`,
+    `...ScopeDropsNegativeInputRate`). `go test ./pkg/config/...` +
+    `./pkg/dataplane/...` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/config/compiler_services.go,
+    pkg/config/parser_routing_test.go,
+    pkg/dataplane/userspace/mirrors.go, pkg/dataplane/userspace/builder.go,
+    pkg/dataplane/userspace/manager_test.go,
+    docs/pr/1373-retire-ebpf-dataplane/plan-1376-port-mirroring.md, _Log.md
