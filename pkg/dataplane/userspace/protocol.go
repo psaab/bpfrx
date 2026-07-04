@@ -526,21 +526,30 @@ type SourceNATRuleSnapshot struct {
 	// widening); an old Go binary omits them (omitempty). The Rust match path
 	// AND-s every non-empty scope: a rule fires only when the flow's
 	// ingress/egress interface and routing instance match every set field.
-	FromInterface                    string   `json:"from_interface,omitempty"`
-	ToInterface                      string   `json:"to_interface,omitempty"`
-	FromRoutingInstance              string   `json:"from_routing_instance,omitempty"`
-	ToRoutingInstance                string   `json:"to_routing_instance,omitempty"`
-	SourceAddresses                  []string `json:"source_addresses,omitempty"`
-	DestinationAddresses             []string `json:"destination_addresses,omitempty"`
-	InterfaceMode                    bool     `json:"interface_mode,omitempty"`
-	Off                              bool     `json:"off,omitempty"`
-	PoolName                         string   `json:"pool_name,omitempty"`
-	PoolAddresses                    []string `json:"pool_addresses,omitempty"`
-	PortLow                          uint16   `json:"port_low,omitempty"`
-	PortHigh                         uint16   `json:"port_high,omitempty"`
-	AddressPersistent                bool     `json:"address_persistent,omitempty"`
-	PersistentNAT                    bool     `json:"persistent_nat,omitempty"`
-	PersistentNATPermitAnyRemoteHost bool     `json:"persistent_nat_permit_any_remote_host,omitempty"`
+	FromInterface        string   `json:"from_interface,omitempty"`
+	ToInterface          string   `json:"to_interface,omitempty"`
+	FromRoutingInstance  string   `json:"from_routing_instance,omitempty"`
+	ToRoutingInstance    string   `json:"to_routing_instance,omitempty"`
+	SourceAddresses      []string `json:"source_addresses,omitempty"`
+	DestinationAddresses []string `json:"destination_addresses,omitempty"`
+	InterfaceMode        bool     `json:"interface_mode,omitempty"`
+	Off                  bool     `json:"off,omitempty"`
+	PoolName             string   `json:"pool_name,omitempty"`
+	PoolAddresses        []string `json:"pool_addresses,omitempty"`
+	PortLow              uint16   `json:"port_low,omitempty"`
+	PortHigh             uint16   `json:"port_high,omitempty"`
+	// PoolNoTranslation carries the source-pool `port no-translation` modifier
+	// (#3906). When true the dataplane translates the source address but
+	// PRESERVES the original source port (Junos 1:1 source-port behaviour): it
+	// takes the address-only path and leaves rewrite_src_port unset, so the
+	// packet keeps its L4 source port and PortLow/PortHigh are ignored. Before
+	// #3906 the token was silently dropped and the pool PAT-translated the port
+	// anyway. Additive wire field (#1961): an old helper without it
+	// PAT-translates the port (pre-#3906 behaviour); an old Go binary omits it.
+	PoolNoTranslation                bool `json:"pool_no_translation,omitempty"`
+	AddressPersistent                bool `json:"address_persistent,omitempty"`
+	PersistentNAT                    bool `json:"persistent_nat,omitempty"`
+	PersistentNATPermitAnyRemoteHost bool `json:"persistent_nat_permit_any_remote_host,omitempty"`
 	// PersistentNATPermit carries the full three-way Junos
 	// `persistent-nat permit` enum (#2823): "any-remote-host",
 	// "target-host", or "target-host-port". Empty => the helper falls back

@@ -3328,6 +3328,69 @@ fn pool_snat_portless_protocols_translate_ip_only_no_port() {
     }
 }
 
+// #3906 FAIL-ON-REVERT: pool-mode source-NAT with `port no-translation` must
+// translate the source ADDRESS but PRESERVE the original source port — for a
+// port-carrying protocol (TCP/UDP) it takes the address-only path (pick a pool
+// address, leave `rewrite_src_port` unset so the packet rewriter keeps the
+// packet's own source port) and consumes NO pool port. Before #3906 the
+// `no-translation` token was dropped and the pool PAT-translated the port,
+// returning `rewrite_src_port: Some(_)`.
+//
+// Reverting the source.rs `address_only` inclusion of `rule.no_translation`
+// makes the TCP flow fall through to `allocate_translation`, so
+// `rewrite_src_port` becomes `Some(_)` and a pool port is consumed — turning
+// both the None assertion and the used_ports==0 assertion RED.
+#[test]
+fn pool_snat_no_translation_preserves_source_port() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-notrans".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        pool_no_translation: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let mut counter = None;
+    let d = expect_snat_decision(match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.1.100".parse().expect("src"),
+        "8.8.8.8".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        443,
+        None,
+        None,
+        0,
+        false,
+        &mut counter,
+    ));
+    assert_eq!(
+        d.rewrite_src,
+        Some("203.0.113.1".parse().unwrap()),
+        "no-translation must still translate the source ADDRESS to the pool address",
+    );
+    assert_eq!(
+        d.rewrite_src_port, None,
+        "no-translation must PRESERVE the source port (leave rewrite_src_port unset) \
+         — Some(_) here is the pre-#3906 PAT-anyway bug",
+    );
+    assert_eq!(d.rewrite_dst, None);
+    assert_eq!(d.rewrite_dst_port, None);
+    // No pool port may be consumed when the source port is preserved.
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(
+        status[0].used_ports, 0,
+        "no-translation must NOT allocate a pool port (source port preserved)",
+    );
+}
+
 #[test]
 fn pool_snat_multiple_addresses_round_robin() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {

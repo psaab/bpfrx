@@ -5911,6 +5911,72 @@ func validateDNATPoolStrict(cfg *Config) error {
 	return nil
 }
 
+// validateSourceNATPoolStrict (#3906) hard-rejects a source-NAT pool whose
+// `port range <low> to <high>` the dataplane cannot honor as configured:
+//
+//   - a REVERSED range (low > high) — the Rust allocator marks the pool
+//     unusable (SourceNatFailureReason::InvalidPortRange) and drops the rule at
+//     runtime, so the config commits green then silently stops translating; and
+//   - an OUT-OF-RANGE endpoint (low < 1 or high > 65535) — a port cannot live
+//     outside 1..65535, and the u16 wire slot would wrap it.
+//
+// Before #3906 the pool `port range <low> to <high>` was parsed with the wrong
+// keyword shape and silently ignored (the pool defaulted to 1024-65535 PAT), so
+// an operator narrowing the pool to a specific range got the full default range
+// and a reversed range was never caught. Only an EXPLICITLY configured range is
+// validated: a pool with no `port` leaf keeps PortLow==0/PortHigh==0 (defaulted
+// to 1024/65535 downstream) and is left untouched. A `port no-translation` pool
+// preserves the source port and ignores the range entirely, so its (defaulted)
+// range is not an error.
+//
+// Strict on commit / commit-check (hard-reject so the bad value is operator-
+// visible); the compiler downgrades this to a warning on the tolerant load /
+// peer-sync path (#1960 no-brick) — the snapshot builder independently fails
+// CLOSED (sourceNATPoolPortRange returns !valid, marking the pool unusable), so
+// a leniently-loaded bad range installs nothing rather than translating wrongly.
+// Pools are walked in sorted name order for a deterministic first-reported
+// offender.
+func validateSourceNATPoolStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	pools := cfg.Security.NAT.SourcePools
+	names := make([]string, 0, len(pools))
+	for name := range pools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		pool := pools[name]
+		if pool == nil {
+			continue
+		}
+		// Only validate an EXPLICITLY configured range. No `port` leaf leaves
+		// PortLow/PortHigh at 0 (defaulted to 1024/65535 downstream) — the
+		// legitimate default-PAT mode, untouched.
+		low := pool.PortLow
+		high := pool.PortHigh
+		if low == 0 && high == 0 {
+			continue
+		}
+		if low < 1 || low > 65535 || high < 1 || high > 65535 {
+			return fmt.Errorf(
+				"source-nat pool %q: port range %d to %d is out of range (1-65535); "+
+					"the rule would commit but the dataplane marks the pool unusable and "+
+					"drops the rule at runtime, silently stopping translation",
+				name, low, high)
+		}
+		if low > high {
+			return fmt.Errorf(
+				"source-nat pool %q: port range low %d is greater than high %d "+
+					"(reversed); the rule would commit but the dataplane marks the pool "+
+					"unusable and drops the rule at runtime, silently stopping translation",
+				name, low, high)
+		}
+	}
+	return nil
+}
+
 // validateRouteFilterMatchTypesStrict gates the two route-filter match-types
 // that the FRR prefix-list backend cannot render losslessly (#2525):
 //

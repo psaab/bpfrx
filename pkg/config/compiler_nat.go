@@ -1107,6 +1107,52 @@ func expandAddressRange(low, high string) ([]string, error) {
 	return result, nil
 }
 
+// parseSourcePoolPortRange interprets the tokens that follow a source-pool
+// `port range` keyword into an inclusive [low, high] range (#3906). It accepts
+// two shapes so both the Junos wire grammar and the legacy explicit-keyword
+// grammar compile:
+//
+//   - Junos: `<low> to <high>` (e.g. Keys after "range" = ["5000","to","6000"])
+//     and a bare `<low>` (single port, low == high).
+//   - Legacy: `low <lo> high <hi>` (Keys after "range" = ["low","5000","high",
+//     "6000"]) — the shape the pre-#3906 compiler required. Before #3906 only
+//     this shape was accepted, so the Junos `port range <low> to <high>` was
+//     silently dropped and the pool defaulted to 1024-65535 PAT.
+//
+// A reversed (low > high) or out-of-range value parses successfully here (it is
+// carried into PortLow/PortHigh); the strict commit gate
+// (validateSourceNATPoolStrict) hard-rejects it so the operator sees the error
+// rather than the rule dropping at runtime. ok is false only when no numeric low
+// could be read (garbage tokens), leaving PortLow/PortHigh at their default.
+func parseSourcePoolPortRange(toks []string) (low, high int, ok bool) {
+	// Legacy explicit-keyword shape: low <lo> high <hi>.
+	if len(toks) >= 4 && toks[0] == "low" && toks[2] == "high" {
+		lo, err1 := strconv.Atoi(toks[1])
+		hi, err2 := strconv.Atoi(toks[3])
+		if err1 != nil || err2 != nil {
+			return 0, 0, false
+		}
+		return lo, hi, true
+	}
+	// Junos shape: <low> [to <high>].
+	if len(toks) == 0 {
+		return 0, 0, false
+	}
+	lo, err := strconv.Atoi(toks[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	hi := lo
+	if len(toks) >= 3 && toks[1] == "to" {
+		v, err2 := strconv.Atoi(toks[2])
+		if err2 != nil {
+			return 0, 0, false
+		}
+		hi = v
+	}
+	return lo, hi, true
+}
+
 // applyDeterministicKeys reads deterministic CGNAT sub-tokens from a flat-set
 // key slice that begins immediately AFTER the "deterministic" keyword, e.g.
 // ["block-size","2016"] or ["host","address","100.64.0.0/22"] or ["host","X"].
@@ -1250,21 +1296,30 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					return pool.Deterministic
 				}
 
-				// Port range / single value — flat leaf shapes.
-				if len(prop.Keys) >= 6 && prop.Keys[1] == "range" &&
-					prop.Keys[2] == "low" && prop.Keys[4] == "high" {
-					if v, err := strconv.Atoi(prop.Keys[3]); err == nil {
-						pool.PortLow = v
-					}
-					if v, err := strconv.Atoi(prop.Keys[5]); err == nil {
-						pool.PortHigh = v
+				// Port range / single value — flat leaf shapes
+				// (Keys=["port","range",...]/["port",N]/["port",
+				// "no-translation"]). #3906: `range` accepts both the Junos
+				// wire shape `<low> to <high>` and the legacy `low <lo> high
+				// <hi>` shape; `no-translation` preserves the source port.
+				if len(prop.Keys) >= 3 && prop.Keys[1] == "range" {
+					if lo, hi, ok := parseSourcePoolPortRange(prop.Keys[2:]); ok {
+						pool.PortLow = lo
+						pool.PortHigh = hi
 					}
 				} else if len(prop.Keys) == 2 && prop.Keys[1] != "range" &&
-					prop.Keys[1] != "deterministic" {
+					prop.Keys[1] != "deterministic" &&
+					prop.Keys[1] != "no-translation" {
 					// "port N" single value.
 					if n, err := strconv.Atoi(prop.Keys[1]); err == nil {
 						pool.PortLow = n
 						pool.PortHigh = n
+					}
+				}
+				// no-translation may ride along on the flat-leaf keys
+				// (Keys=["port","no-translation"]).
+				for _, k := range prop.Keys[1:] {
+					if k == "no-translation" {
+						pool.PortNoTranslation = true
 					}
 				}
 
@@ -1277,16 +1332,15 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				for _, pc := range prop.Children {
 					switch pc.Name() {
 					case "range":
-						// range low N high M
-						if len(pc.Keys) >= 5 && pc.Keys[1] == "low" &&
-							pc.Keys[3] == "high" {
-							if v, err := strconv.Atoi(pc.Keys[2]); err == nil {
-								pool.PortLow = v
-							}
-							if v, err := strconv.Atoi(pc.Keys[4]); err == nil {
-								pool.PortHigh = v
-							}
+						// range <low> to <high> | range low <lo> high <hi>
+						// (#3906). pc.Keys[1:] is the token slice after the
+						// `range` keyword.
+						if lo, hi, ok := parseSourcePoolPortRange(pc.Keys[1:]); ok {
+							pool.PortLow = lo
+							pool.PortHigh = hi
 						}
+					case "no-translation":
+						pool.PortNoTranslation = true
 					case "deterministic":
 						applyDeterministicChildren(ensureDet(), pc)
 					default:

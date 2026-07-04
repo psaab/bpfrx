@@ -321,10 +321,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// both shapes, so an old on-disk config keeps compiling.
 			"pool": {desc: "Source NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: map[string]*schemaNode{
 				"port": {desc: "Source pool port block configuration", children: map[string]*schemaNode{
-					// `range low <lo> high <hi>` — the low/high tokens
-					// collapse onto this one multi leaf (Keys=["range",
-					// "low",lo,"high",hi]); the compiler reads them off Keys.
-					"range": {desc: "Explicit source port range for the pool", multi: true, children: nil},
+					// #3906: `range <low> to <high>` (Junos) and the legacy
+					// `range low <lo> high <hi>` both collapse onto this multi
+					// leaf; the compiler parses both via parseSourcePoolPortRange.
+					"range": {desc: "Explicit source port range for the pool (<low> to <high>)", multi: true, children: nil},
+					// #3906: preserve the original source port (1:1) — the
+					// pool translates the address only. Value-less leaf.
+					"no-translation": {desc: "Preserve the source port (translate the address only)", children: nil},
 					"deterministic": {desc: "Deterministic (CGNAT) port block allocation", children: map[string]*schemaNode{
 						"block-size": {
 							desc:          "Ports allocated per subscriber block",
