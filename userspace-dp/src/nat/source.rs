@@ -21,6 +21,7 @@ use super::allocator::{
 };
 use super::{NatCounterStore, NatDecision, NatRuleCounter, NatScopeCtx};
 use crate::SourceNATRuleSnapshot;
+use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
 use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rustc_hash::FxHashMap;
@@ -877,7 +878,21 @@ pub(crate) fn match_source_nat_result_for_tuple(
         // via `try_next_port` with no flow-keyed mapping — because the
         // packet rewriters gate every L4 write on `has_l4_ports`, so the
         // port it returns can never be written to a frame.
-        let port_less = protocol != 0 && !crate::ip_proto::has_l4_ports(protocol);
+        // #4074 (RFC 5508 §3.1 "ICMP Query Mappings"): an ICMP/ICMPv6 echo or
+        // query message carries a 16-bit Query Identifier that the flow parser
+        // (`parse_flow_ports`) lifts into `src_port` (with `dst_port == 0`).
+        // That identifier is the ICMP demux key — exactly the role a TCP/UDP
+        // port plays — so pool-mode SNAT must translate it, or two internal
+        // hosts pinging the same target with the same id, both hidden behind
+        // one pool address, collide on the reverse tuple (pool_addr, id) and
+        // their replies are mis-associated. A non-identifier ICMP control/error
+        // message parses flowless (`src_port == 0`) and keeps the address-only
+        // path — there is no id to translate. `no_translation` (port
+        // no-translation) still preserves the id via the `address_only` gate
+        // below. The translated id comes from the same pool port/id space as
+        // the TCP/UDP PAT allocation (`allocate_translation`).
+        let icmp_query = matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) && src_port != 0;
+        let port_less = protocol != 0 && !crate::ip_proto::has_l4_ports(protocol) && !icmp_query;
         let tuple_unknown = protocol == 0;
         // #3906: `port no-translation` translates the ADDRESS only and PRESERVES
         // the original source port. It takes the same address-only path as a

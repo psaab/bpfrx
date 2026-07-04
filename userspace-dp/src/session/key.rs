@@ -27,7 +27,15 @@ pub(crate) fn reply_matches_forward_session(
 
 pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        (forward_key.src_port, forward_key.dst_port)
+        // #4074: the ICMP Query Identifier lives in `src_port` (`dst_port` is
+        // always 0) and is a single symmetric field carried at the same offset
+        // in both directions. Pool SNAT translates it (RFC 5508 §3.1), so the
+        // forward wire key carries the translated id when the decision set one;
+        // absent a translation this is `forward_key.src_port` — unchanged.
+        (
+            nat.rewrite_src_port.unwrap_or(forward_key.src_port),
+            forward_key.dst_port,
+        )
     } else {
         (
             nat.rewrite_src_port.unwrap_or(forward_key.src_port),
@@ -64,7 +72,9 @@ pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
 
 pub(crate) fn translated_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        (key.src_port, key.dst_port)
+        // #4074: translate the ICMP Query Identifier (in `src_port`) like a
+        // port; `dst_port` stays 0. No translation => `key.src_port` unchanged.
+        (nat.rewrite_src_port.unwrap_or(key.src_port), key.dst_port)
     } else {
         (
             nat.rewrite_src_port.unwrap_or(key.src_port),
@@ -83,7 +93,16 @@ pub(crate) fn translated_session_key(key: &SessionKey, nat: NatDecision) -> Sess
 
 pub(super) fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        (forward_key.src_port, forward_key.dst_port)
+        // #4074: the reply carries the SAME (translated) ICMP identifier at the
+        // same offset, which the parser lifts into the reply's `src_port`. So
+        // the reverse wire key's `src_port` is the translated id (not swapped
+        // with `dst_port` the way a TCP/UDP port pair is), and `dst_port` stays
+        // 0. This is what makes two hosts sharing a pool address + original id
+        // demux — their translated ids differ, so their reverse keys differ.
+        (
+            nat.rewrite_src_port.unwrap_or(forward_key.src_port),
+            forward_key.dst_port,
+        )
     } else {
         (
             nat.rewrite_dst_port.unwrap_or(forward_key.dst_port),
@@ -153,7 +172,11 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
 
 pub(crate) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        (key.src_port, key.dst_port)
+        // #4074: the reverse (reply) companion is keyed on the translated ICMP
+        // identifier so the reply demuxes to the right forward flow. Symmetric
+        // field: `src_port` = translated id, `dst_port` = 0 (see
+        // `reverse_wire_key`). No translation => `key.src_port` unchanged.
+        (nat.rewrite_src_port.unwrap_or(key.src_port), key.dst_port)
     } else {
         (
             nat.rewrite_dst_port.unwrap_or(key.dst_port),
