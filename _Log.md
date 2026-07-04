@@ -30426,3 +30426,37 @@ top.
     pkg/dataplane/userspace/mirrors.go, pkg/dataplane/userspace/builder.go,
     pkg/dataplane/userspace/manager_test.go,
     docs/pr/1373-retire-ebpf-dataplane/plan-1376-port-mirroring.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3979 — `configure exclusive` lock never released on session
+    exit → permanent config lockout. VERIFY FIRST confirmed the defect (also
+    already flagged in `cmd/cli/shared.go` #1563 comment): `EnterConfigureExclusive`
+    records the holder in `exclusiveHolder` and leaves `configHolder` empty, but
+    `ExitConfigureSession`'s release guard compared only `configHolder`. So an
+    exclusive holder's own exit saw `configHolder("") != sessionID` and returned
+    false WITHOUT clearing anything → the exclusive lock persisted with no live
+    holder → every subsequent `configure` / `configure exclusive` /
+    `configure private` rejected until daemon restart. The disconnect
+    auto-release (`configLockInterceptor`, pkg/grpcapi/server.go) routes through
+    `ExitConfigureSession`, so it silently failed too — a single operator running
+    `configure exclusive` then disconnecting bricked all future config edits.
+    FIX (pkg/configstore/store_lock.go): added `effectiveHolderLocked()`
+    (exclusiveHolder if set, else configHolder); `ExitConfigureSession` now
+    compares the session against the effective holder, releasing whichever lock
+    THIS session actually holds. Matching the effective holder ALSO restores the
+    stale-holder reclaim on disconnect (the interceptor path). `ConfigHolder()`
+    now reports the effective holder so `clear system config-lock` / diag
+    attributes an exclusive lock to its real holder instead of an empty string.
+    Live-holder-blocks-others preserved (`EnterConfigure*` still rejects with
+    ErrConfigLocked while configDir set; a non-holder exit can't steal the lock);
+    shared/private release unchanged. RED-on-revert (proven by restoring the old
+    `configHolder` guard): TestExclusiveLockReleasedOnSessionExit,
+    TestExclusiveLockReacquireCycle, TestLiveExclusiveHolderBlocksOthers all FAIL
+    on the old guard while TestSharedLockUnaffected stays GREEN (shared mode was
+    never broken). `go test ./pkg/cli/... ./pkg/configstore/...` green;
+    `go build ./...`, gofmt, vet clean. Docs: pkg/configstore/README.md new
+    "Config lock: shared/private vs. exclusive holders (#3979)" section; updated
+    the now-outdated cmd/cli/shared.go #1563 comment.
+  - **File(s)**: pkg/configstore/store_lock.go,
+    pkg/configstore/store_lock_3979_test.go, pkg/configstore/README.md,
+    cmd/cli/shared.go, _Log.md

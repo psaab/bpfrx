@@ -78,15 +78,40 @@ func (s *Store) EnterConfigureExclusive(holder string) error {
 	return nil
 }
 
+// effectiveHolderLocked returns the session ID that currently holds the config
+// lock, regardless of mode. Exclusive mode records the holder in
+// exclusiveHolder; shared/private mode records it in configHolder. Callers MUST
+// hold s.mu. Returns "" when no session identifier was supplied at acquire time
+// (the internal EnterConfigure()/daemon path) or when unlocked.
+func (s *Store) effectiveHolderLocked() string {
+	if s.exclusiveHolder != "" {
+		return s.exclusiveHolder
+	}
+	return s.configHolder
+}
+
 // ExitConfigureSession exits configuration mode only if the given session holds
 // the lock. Returns true if the lock was released.
+//
+// #3979: the release guard must match against whichever holder field the
+// acquiring mode actually set. EnterConfigureExclusive records the holder in
+// exclusiveHolder and leaves configHolder empty; the previous guard compared
+// only configHolder, so an exclusive holder could NEVER release its own lock —
+// the guard saw configHolder("") != sessionID and bailed out early. The lock
+// then persisted with no live holder (the disconnect auto-release in
+// configLockInterceptor routes through here too, so it silently failed), and
+// every subsequent configure/configure exclusive/configure private was
+// rejected until daemon restart — a single operator using `configure exclusive`
+// then disconnecting bricked all future config edits. Comparing against the
+// effective holder releases whichever lock THIS session holds and restores the
+// stale-holder reclaim on disconnect.
 func (s *Store) ExitConfigureSession(sessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.configDir {
 		return false
 	}
-	if sessionID != "" && s.configHolder != sessionID {
+	if sessionID != "" && s.effectiveHolderLocked() != sessionID {
 		return false
 	}
 	s.candidate = nil
@@ -117,11 +142,14 @@ func (s *Store) ForceExitConfigure() {
 }
 
 // ConfigHolder returns the session ID of the current config lock holder
-// and whether the lock is held.
+// and whether the lock is held. #3979: report the effective holder so an
+// exclusive lock (tracked in exclusiveHolder, with configHolder empty) is
+// attributed to its real holder in `clear system config-lock` / diagnostic
+// output instead of an empty string.
 func (s *Store) ConfigHolder() (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.configHolder, s.configDir
+	return s.effectiveHolderLocked(), s.configDir
 }
 
 // IsExclusiveLocked returns true if exclusive mode is active.
