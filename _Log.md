@@ -1,3 +1,47 @@
+## 2026-07-03 — #4009: cluster-deploy secondary-node detection grep never matched → deploy restarted the PRIMARY first ~50% of the time (spurious mid-deploy failover)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-093 (MEDIUM, test-infra). A rolling
+    `cluster-setup.sh deploy all` must restart the SECONDARY node first so the
+    primary keeps forwarding. `deploy_rolling` (the default raw-push fast path,
+    driven by `make cluster-deploy`) detected the secondary with an inline
+    `grep "secondary:node0"` against `show chassis cluster status`. That output
+    (FormatStatus, `pkg/cluster/status.go`) renders space-separated, lowercase
+    per-node rows (`node0  200  primary` / `node1  100  secondary`) with no
+    `secondary:node0` token anywhere, so the grep NEVER matched. Detection
+    always fell through to the fixed default `secondary=1, primary=0`, so
+    whenever node0 was the RG0 SECONDARY the deploy restarted node1 (the
+    PRIMARY) first → a spurious mid-deploy failover that churned cluster state
+    and left downstream smoke (`apply-cos-config.sh`, `test-failover`) starting
+    from an unexpected primary ~50% of the time — the root cause of the
+    force-node0-primary workaround in the HA batch-tf scripts. (The sibling
+    `deploy_rolling_deb` had a separate, working `show chassis cluster
+    information` / `Local state:` grep; the two detections had diverged.)
+  - **Fix**: extracted ONE tested SSOT parser `deploy_rolling_secondary_node`
+    into `test/incus/deploy-lib.sh` — reads `show chassis cluster status` on
+    stdin, scopes to the `Redundancy group: 0` header, and echoes 0 when
+    node0's RG0 Status is `secondary`/`secondary-hold` (upgrade node0 first)
+    else 1; defaults to 1 (node0-primary steady state) on empty/unparseable
+    input. `rolling_detect_secondary` in `cluster-setup.sh` wires it to node0
+    live. BOTH `deploy_rolling` and `deploy_rolling_deb` now use it. Added a
+    belt-and-braces `reassert_primary_node0` (RG ids via `deploy_rolling_rg_ids`)
+    that resets manual failover + forces node0 primary for every RG after a
+    rolling deploy, so smoke always starts from the documented node0-primary
+    state regardless of preempt config — best-effort, non-fatal. The #1875
+    lock + sha-verify/verify-dataplane gate are untouched.
+  - **Validation**: 7 new offline captured-output tests in
+    `deploy-lib-selftest.sh` (`make test-deploy-lib`, 19/19 pass) covering
+    node0-primary→1, node0-secondary→0, active-active RG0-scoping→0,
+    secondary-hold→0, peer-down→1, empty→1, and rg-id extraction. RED-on-revert
+    demonstrated: the retired `grep "secondary:node0"` returns 1 (node1-first)
+    on the node0-secondary sample → would restart the primary first. shellcheck
+    clean (warning+) on all three scripts; `go build ./...` green; existing
+    `cluster_status_parse_test.py` still passes. No live cluster run (shared
+    loss cluster — validated by reasoning + captured-output tests only).
+  - **File(s)**: `test/incus/deploy-lib.sh`,
+    `test/incus/cluster-setup.sh`, `test/incus/deploy-lib-selftest.sh`,
+    `docs/ha-cluster-test-plan.md`, `_Log.md`
+
 ## 2026-07-03 — #4005: `monitor traffic matching "<filter>"` truncated the pcap filter to the first token
 
 - **Timestamp**: 2026-07-03
