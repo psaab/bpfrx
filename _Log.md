@@ -30,6 +30,46 @@
   - **Validation**: `TestRenameNonFirstSibling` RED on revert (`source not
     found: ... policy B`), GREEN with the fix; `go test ./pkg/config/...`,
     `go build ./...`, `gofmt`, `go vet ./pkg/config/` all clean.
+## 2026-07-03 — #3980: path-scoped `show configuration <path>` / `| display set` showed only the FIRST sibling at a repeated-keyword level (navigatePath terminal single-key match was FindChild-first)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-037 (MEDIUM, config-display fidelity).
+    `navigatePath` (`pkg/config/ast.go`), the node selector behind every
+    path-scoped `FormatPath*` renderer (`show configuration <path>`,
+    `| display set`, JSON, XML, inheritance), resolved a path ending on a
+    bare keyword by returning `[]*Node{n}` — the FIRST matching sibling
+    only. A hierarchy level may hold multiple DISTINCT statements with the
+    same leading keyword (several `system ntp server <addr>`, many
+    `routing-options static route <dest>`, repeated `archive-sites`), so
+    `show configuration system ntp server` and its `| display set` showed
+    only the first entry, hiding the rest; a scoped `display set` backup
+    taken that way silently dropped the hidden statements on restore. The
+    full-tree `Format`/`FormatSet` (no path) already walked each sibling and
+    were unaffected — this was the path-scoped selector only.
+  - **Fix**: at the terminal path element, gather EVERY sibling whose first
+    key equals the keyword (FindChildren-not-FindChild), the display-side
+    sibling of the #3377 all-nodes walk / #3842 / #2419 read-all-siblings
+    class. Naming a specific keyed value (`... server 2.2.2.2`) still routes
+    through the keyword+value multi-key branch to that one entry.
+  - **Test**: `pkg/config/show_config_repeated_keyword_3980_test.go` —
+    path-scoped ntp-server render (hierarchical + display set), path-scoped
+    static-route render, static-route `display set` round-trip (render →
+    ParseSetCommand re-apply → all routes reproduced), full-tree control,
+    single-statement no-regression. RED-on-revert verified: reverting
+    `ast.go` renders only the first sibling and the render/round-trip
+    assertions fail; control + no-regression stay green. Full
+    `go test ./pkg/config/...` green; `go build ./...`, gofmt, vet clean.
+  - **Note**: a separate, orthogonal construction defect still collapses the
+    keyed-list LEAVES `system ntp server` / `archive-sites` on flat-set
+    replay — non-`multi` `args:1` schema entries hit `SetPath`'s
+    single-value-replace branch and keep only the LAST, though the compiler
+    reads all via `FindChildren`. That is a schema/SetPath fix (mark
+    keyed-list + read `firewallMatchValues`), not a renderer change; tracked
+    separately. The round-trip test uses static routes (a keyed container
+    that round-trips cleanly) to isolate the display-side fix.
+  - **File(s)**: `pkg/config/ast.go`,
+    `pkg/config/show_config_repeated_keyword_3980_test.go`,
+    `pkg/config/README.md`, `_Log.md`.
 
 ## 2026-07-03 — #3975: `deactivate`/`activate` on a bracketed multi-value leaf errored + broke round-trip (setInactiveAtPath lacked the #2419 multi-value handling deletePath got in #3846)
 
