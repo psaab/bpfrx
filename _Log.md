@@ -1,3 +1,34 @@
+## 2026-07-04 — #4101: DHCPv4 client rejects a degenerate subnet mask (fable-163 F6)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST then fix the MEDIUM security/untrusted-input
+    defect. Confirmed at HEAD (`origin/master` ee8de92ef): `leaseFromACKv4`
+    (`pkg/dhcp/dhcp.go`) guarded only `mask == nil` (fallback `/24`) and
+    then took `ones, _ := net.IPMask(mask).Size()`. For a zero mask
+    (`0.0.0.0`) `Size()` returns `ones=0, bits=32`; for a non-contiguous
+    mask (`255.255.0.255`) it returns `(0,0)` — either way
+    `netip.PrefixFrom(addr, 0)` yields `YourIP/0`, which the apply path
+    (`applyAddress` `AddrReplace`) installs as an on-link `0.0.0.0/0`
+    connected route, blackholing/hijacking ALL IPv4 forwarding. A single
+    crafted ACK from a rogue/broken server triggers it, no operator action.
+  - **Fix**: after `.Size()` (now `ones, bits`), reject when
+    `bits != 32 || ones == 0` with an error (no lease). The error
+    propagates through `v4Exchange` → `runDHCPv4`, which retries a fresh
+    DISCOVER on acquire (no `YourIP/0` ever committed) or falls through to
+    T2/expiry keeping the current valid lease on renew/rebind — the safest
+    behavior (refuse the ACK, never default a degenerate mask to `/24`
+    which would mask the attack). A *missing* option 1 still falls back to
+    `/24`; only a present-but-degenerate mask is refused. `/31` and `/32`
+    (point-to-point / host leases) are accepted (floor: reject only
+    `ones==0` + non-contiguous).
+  - **File(s)**: `pkg/dhcp/dhcp.go` (guard), `pkg/dhcp/renew_test.go`
+    (table test `TestLeaseFromACKv4RejectsDegenerateMask` + `mustV4ACK`
+    helper), `pkg/dhcp/README.md` (Gotchas bullet).
+  - **Validation**: RED-on-revert proven — with the guard removed both
+    `0.0.0.0` and `255.255.0.255` parse to `192.0.2.50/0`; the /24, /32,
+    /31 and absent-mask cases pass either way. `go test ./pkg/dhcp/...`
+    green, `go build ./...`, `gofmt`, `go vet` clean.
+
 ## 2026-07-04 — #4097: FRR community-list member / as-path regex render-side sanitize belt (fable-163 F2)
 
 - **Timestamp**: 2026-07-04
