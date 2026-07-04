@@ -268,10 +268,28 @@ way the kernel conntrack path exports incremental session creation.
 ### Delete Journal
 
 Delete messages are queued immediately from conntrack GC callbacks. If the peer
-is disconnected, deletes are journaled in a bounded ring.
+is disconnected — **or the peer is connected but `sendCh` is momentarily full
+(backpressure)** — the delete is journaled in a bounded ring by
+`QueueDeleteV4`/`V6` instead of being sent inline.
 
-The journal is replayed when the next first-post-disconnect connection comes up,
-before `OnPeerConnected` and before the fresh bulk starts.
+The journal is replayed on two triggers:
+
+1. **Reconnect flush** — the next first-post-disconnect connection comes up,
+   before `OnPeerConnected` and before the fresh bulk starts
+   (`handleNewConnection` → `flushDeleteJournal`).
+2. **Connected sweep flush (#3926)** — the periodic sweep (`syncSweep`) calls
+   `flushDeleteJournal` on every tick while connected, mirroring the
+   install-replay it already performs. This converges a delete that was
+   journaled during a connected-but-backpressured moment **without requiring a
+   disconnect**. Before #3926 the journal was flushed only on trigger (1), so a
+   delete journaled while the link stayed up was never delivered until an
+   unrelated disconnect — the standby kept the dead session and made the wrong
+   forwarding decision on failover. The delete backpressure sets
+   `syncBackfillNeeded`, which holds the sweep at the 1s active cadence, so
+   convergence is bounded by one active sweep interval. The re-sent delete
+   carries the same encoded #2170/#2221 generation drawn when it was first
+   journaled, so a stale journaled delete that replays after a same-key
+   replacement was re-synced is still refused by the peer's delete guard.
 
 Replay goes through the ordered send channel (`queueMessage`), so a delete that
 is delivered stays ordered behind any session frames already queued in `sendCh`

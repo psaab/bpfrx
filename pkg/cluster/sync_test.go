@@ -2368,6 +2368,102 @@ func TestDeleteJournalReconnectConvergence(t *testing.T) {
 	}
 }
 
+func TestDeleteJournalConnectedFlushViaSweep(t *testing.T) {
+	// #3926: a delete generated while CONNECTED but with a FULL sendCh is
+	// journaled by QueueDeleteV4 (connected backpressure). Before the fix the
+	// journal was flushed ONLY on a full disconnect/reconnect, so a
+	// journaled-while-connected delete never reached the standby until an
+	// unrelated disconnect — the standby kept the dead session (wrong forwarding
+	// on failover). The periodic sweep must flush the journal while connected so
+	// the standby converges to the primary's DELETED set without a disconnect.
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.stats.Connected.Store(true)
+
+	key := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+
+	// Install once so the matching delete draws a real (non-zero,
+	// strictly-greater) generation (#2170/#2221). Drain the install frame.
+	ss.QueueSessionV4(key, dataplane.SessionValue{State: 1})
+	ss.genSentMu.Lock()
+	installGen := ss.genSentV4[key]
+	ss.genSentMu.Unlock()
+	if installGen == 0 {
+		t.Fatal("expected a non-zero install generation to be stamped")
+	}
+	select {
+	case <-ss.sendCh: // drain the install frame
+	default:
+		t.Fatal("expected the install frame on sendCh")
+	}
+
+	// Fill sendCh to capacity so the delete cannot be sent inline and is
+	// journaled (connected-but-backpressured).
+	for len(ss.sendCh) < cap(ss.sendCh) {
+		ss.sendCh <- []byte{0}
+	}
+	ss.QueueDeleteV4(key)
+
+	// The delete must be journaled (not sent) and carry a fresh gen > installGen.
+	ss.deleteJournalMu.Lock()
+	if len(ss.deleteJournal) != 1 {
+		ss.deleteJournalMu.Unlock()
+		t.Fatalf("expected 1 journaled delete, got %d", len(ss.deleteJournal))
+	}
+	wantGen := binary.LittleEndian.Uint64(ss.deleteJournal[0][syncHeaderSize+16 : syncHeaderSize+24])
+	ss.deleteJournalMu.Unlock()
+	if wantGen == 0 || wantGen <= installGen {
+		t.Fatalf("delete gen %d must be non-zero and strictly greater than install gen %d", wantGen, installGen)
+	}
+	if got := ss.stats.DeletesSent.Load(); got != 0 {
+		t.Fatalf("delete should be journaled, not sent, while sendCh is full; DeletesSent=%d", got)
+	}
+
+	// Drain sendCh entirely (capacity returns) WITHOUT a disconnect.
+	for len(ss.sendCh) > 0 {
+		<-ss.sendCh
+	}
+
+	// A connected sweep tick must flush the journaled delete (the #3926 fix). On
+	// revert, syncSweep never touches the delete journal → this assertion goes
+	// RED (the delete is stuck in the journal until a disconnect).
+	ss.syncSweep()
+
+	ss.deleteJournalMu.Lock()
+	remaining := len(ss.deleteJournal)
+	ss.deleteJournalMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("journaled delete not flushed by connected sweep, %d remain (bug #3926)", remaining)
+	}
+	if got := ss.stats.DeletesSent.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 delete flushed, DeletesSent=%d", got)
+	}
+
+	// The flushed message must be the delete carrying the exact same generation
+	// (encoded gen preserved across the connected flush — no re-stamp).
+	select {
+	case msg := <-ss.sendCh:
+		if msg[4] != syncMsgDeleteV4 {
+			t.Fatalf("flushed message type = %d, want delete %d", msg[4], syncMsgDeleteV4)
+		}
+		gotGen := binary.LittleEndian.Uint64(msg[syncHeaderSize+16 : syncHeaderSize+24])
+		if gotGen != wantGen {
+			t.Fatalf("flushed delete gen = %d, want %d (gen must be preserved)", gotGen, wantGen)
+		}
+	default:
+		t.Fatal("expected the flushed delete on sendCh")
+	}
+
+	// No double-send: a second connected sweep must not re-emit the delete.
+	ss.syncSweep()
+	if got := ss.stats.DeletesSent.Load(); got != 1 {
+		t.Fatalf("delete double-sent by second sweep, DeletesSent=%d", got)
+	}
+	if len(ss.sendCh) != 0 {
+		t.Fatalf("second sweep re-queued a delete; sendCh len=%d", len(ss.sendCh))
+	}
+}
+
 func TestSessionQueueDoesNotJournal(t *testing.T) {
 	// Session updates (not deletes) should NOT be journaled — they get replayed by sweep.
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
