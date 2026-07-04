@@ -427,19 +427,18 @@ pub(super) fn stage_screen_check(
     } else {
         14
     };
-    // #3064: a non-first IP fragment has no transport flow —
-    // `parse_session_flow_from_bytes` returns `None` for it (#2344, so the
-    // fragment payload is never parsed as L4 ports). Such a fragment used to
-    // return `Pass` here, which made the PER-FRAGMENT L3-header screens
-    // (ping-of-death, teardrop, icmp-fragment) DEAD in the live pipeline —
-    // hostile Teardrop / Ping-of-Death fragment contributions transited
-    // unscreened. Run ONLY the L3-header fragment screens on the flowless
-    // path: extract a header-only `ScreenPacketInfo` straight from the IP
-    // header (placeholder L4 tuple — we never parse the fragment payload, so
-    // the #2344 flowless fast path is NOT reintroduced) and evaluate the
-    // three L3 fragment screens. Flow/session-dependent screens (land,
-    // TCP-flag, flood counters, scan/sweep, SYN-cookie) stay on the
-    // flow-present path below.
+    // #3064 + #3902: a non-first IP fragment (or a non-query ICMP/ICMPv6
+    // control message) has no transport flow — `parse_session_flow_from_bytes`
+    // returns `None` for it (#2344, so the payload is never parsed as L4
+    // ports). Such a packet used to `Pass` here, which made the per-fragment
+    // L3-header screens (ping-of-death, teardrop, icmp-fragment) DEAD (#3064)
+    // AND — until #3902 — bypassed the SOURCE-INDEPENDENT screens (LAND,
+    // ip-source-route, ICMP/UDP flood) that need no flow. The flowless branch
+    // below now runs ALL of those (see the detailed #3902 note in the branch).
+    // Only the genuinely FLOW/session-dependent screens (TCP-flag, SYN-flood
+    // sketches, scan/sweep, SYN-cookie) stay on the flow-present path below —
+    // they require a real TCP header / per-flow tuple. The #2344 flowless fast
+    // path is NOT reintroduced (no L4 parse / session lookup happens here).
     let Some(flow) = flow else {
         // #3902: the flowless path (a non-first IP fragment or a non-query
         // ICMP/ICMPv6 control message) must still run the SOURCE-INDEPENDENT
