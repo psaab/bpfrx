@@ -2224,6 +2224,94 @@ fn icmp_port_handling_unchanged_with_dnat_ports() {
     ));
 }
 
+// #4074 FAIL-ON-REVERT (RFC 5508 §3.1): with pool SNAT translating the ICMP
+// Query Identifier, two internal hosts pinging the SAME target with the SAME
+// original id, both hidden behind ONE pool address, must produce DISTINCT
+// reverse wire keys — otherwise the return replies collide on
+// `(pool_addr, id)` and are mis-associated.
+//
+// The forward SNAT decision carries the translated id in `rewrite_src_port`.
+// `reverse_wire_key` must fold it into the reverse key's `src_port` (the ICMP
+// identifier is symmetric — the reply carries the same translated id at the
+// same offset). Reverting the key.rs ICMP arm (ignore `rewrite_src_port`, keep
+// the original id) collapses both reverse keys to `{T, P, 0x1234, 0}`, turning
+// the `assert_ne!` RED.
+#[test]
+fn icmp_query_id_translation_demuxes_reverse_wire_key() {
+    let target = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+    let pool = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+    let query_id = 0x1234u16;
+
+    let mk_forward = |host: Ipv4Addr| SessionKey {
+        addr_family: 2,
+        protocol: PROTO_ICMP,
+        src_ip: IpAddr::V4(host),
+        dst_ip: target,
+        src_port: query_id,
+        dst_port: 0,
+    };
+    // Distinct translated ids allocated by pool SNAT for the two hosts.
+    let mk_nat = |translated_id: u16| NatDecision {
+        rewrite_src: Some(pool),
+        rewrite_src_port: Some(translated_id),
+        ..NatDecision::default()
+    };
+
+    let fwd_a = mk_forward(Ipv4Addr::new(10, 0, 0, 1));
+    let fwd_b = mk_forward(Ipv4Addr::new(10, 0, 0, 2));
+    let nat_a = mk_nat(40001);
+    let nat_b = mk_nat(40002);
+
+    // The reverse (reply) wire keys carry the translated id in src_port, so
+    // they differ — the replies demux back to the right host.
+    let rev_a = reverse_wire_key(&fwd_a, nat_a);
+    let rev_b = reverse_wire_key(&fwd_b, nat_b);
+    assert_eq!(rev_a.src_ip, target, "reply source is the pinged target");
+    assert_eq!(rev_a.dst_ip, pool, "reply destination is the pool address");
+    assert_eq!(
+        rev_a.src_port, 40001,
+        "reverse key carries the translated id"
+    );
+    assert_eq!(rev_a.dst_port, 0, "ICMP dst_port stays 0");
+    assert_ne!(
+        rev_a, rev_b,
+        "distinct translated ids MUST give distinct reverse keys (no collision)",
+    );
+
+    // The reply that carries host A's translated id (40001) matches forward A
+    // but NOT forward B (whose reverse key expects 40002).
+    let reply_a = SessionKey {
+        addr_family: 2,
+        protocol: PROTO_ICMP,
+        src_ip: target,
+        dst_ip: pool,
+        src_port: 40001,
+        dst_port: 0,
+    };
+    assert!(reply_matches_forward_session(&fwd_a, nat_a, &reply_a));
+    assert!(!reply_matches_forward_session(&fwd_b, nat_b, &reply_a));
+
+    // The reverse companion session key is keyed on the translated id too, so
+    // both hosts' companions have distinct primary keys.
+    assert_ne!(
+        reverse_session_key(&fwd_a, nat_a),
+        reverse_session_key(&fwd_b, nat_b),
+        "reverse companion keys must differ per translated id",
+    );
+
+    // Sanity: with NO translated id (rewrite_src_port None), ICMP keeps the
+    // original id — the pre-#4074 behavior, and the collision case.
+    let no_id_nat = NatDecision {
+        rewrite_src: Some(pool),
+        ..NatDecision::default()
+    };
+    assert_eq!(
+        reverse_wire_key(&fwd_a, no_id_nat),
+        reverse_wire_key(&fwd_b, no_id_nat),
+        "without id translation the two reverse keys collide (documents the gap)",
+    );
+}
+
 #[test]
 fn find_forward_nat_match_with_dnat_port_rewrite() {
     let mut table = SessionTable::new();
@@ -5514,6 +5602,101 @@ fn account_packet_miss_is_noop() {
     // create state.
     table.account_packet(&key_v4(), 9999, 0, 0);
     assert!(table.session_counters(&key_v4()).is_none());
+}
+
+// #4074 FAIL-ON-REVERT: for a TRANSLATED pool-SNAT ICMP flow, a reverse (reply)
+// packet's volume must fold onto the canonical FORWARD entry's `rev` counter —
+// exactly like TCP/UDP — so the forward-only conntrack mirror / SESSION_CLOSE
+// harvest sees the reply-direction bytes. `account_packet` does this by calling
+// `reverse_session_key(reverse_entry_key, reverse_decision)` to recover the
+// forward entry's key. Because SNAT translated the ICMP id X->Y, the reverse
+// entry is keyed on Y; `NatDecision::reverse` stored the ORIGINAL id X in
+// `rewrite_dst_port`. So `reverse_session_key` MUST read `rewrite_dst_port` to
+// recover X and hit the forward entry {..,X,..}.
+//
+// Reverting the `reverse_session_key` ICMP arm to read only `rewrite_src_port`
+// yields Y (not X) -> the forward entry is MISSED -> `account_packet` falls back
+// to the reverse entry, so the FORWARD entry's `rev_*` stays 0 and the reply
+// volume is lost by the forward-only harvest. This asserts the forward entry's
+// `rev_*` is bumped, going RED on revert. Covers v4 + v6.
+#[test]
+fn account_packet_reverse_folds_onto_forward_translated_icmp() {
+    for v6 in [false, true] {
+        let mut table = SessionTable::new();
+        let now = 1_000_000_000u64;
+        let (proto, af, host, target, pool): (u8, u8, IpAddr, IpAddr, IpAddr) = if v6 {
+            (
+                PROTO_ICMPV6,
+                10,
+                IpAddr::V6("2001:db8::1".parse().unwrap()),
+                IpAddr::V6("2606:4700:4700::1111".parse().unwrap()),
+                IpAddr::V6("2001:db8:cafe::8".parse().unwrap()),
+            )
+        } else {
+            (
+                PROTO_ICMP,
+                2,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            )
+        };
+        let orig_id: u16 = 0x1234; // X (original identifier)
+        let translated_id: u16 = 40001; // Y (pool-allocated identifier)
+
+        // Forward ICMP entry {host, target, X, 0}, pool-SNAT'd to {pool, .., Y}.
+        let fwd = SessionKey {
+            addr_family: af,
+            protocol: proto,
+            src_ip: host,
+            dst_ip: target,
+            src_port: orig_id,
+            dst_port: 0,
+        };
+        let fwd_nat = NatDecision {
+            rewrite_src: Some(pool),
+            rewrite_src_port: Some(translated_id),
+            ..NatDecision::default()
+        };
+        let fwd_decision = SessionDecision {
+            resolution: resolution(),
+            nat: fwd_nat,
+        };
+        // Reverse companion, keyed on the translated id (the reply carries Y).
+        let rev = reverse_session_key(&fwd, fwd_nat);
+        assert_eq!(rev.src_port, translated_id, "v6={v6}: companion keyed on Y");
+        // The reverse entry's decision is the inverted forward decision — this
+        // is exactly what build_reverse_session_from_forward_match installs.
+        let rev_nat = fwd_nat.reverse(host, target, orig_id, 0);
+        let rev_decision = SessionDecision {
+            resolution: resolution(),
+            nat: rev_nat,
+        };
+
+        assert!(table.install_with_protocol(fwd.clone(), fwd_decision, metadata(), now, proto, 0));
+        assert!(table.install_with_protocol(
+            rev.clone(),
+            rev_decision,
+            metadata_reverse(),
+            now,
+            proto,
+            0,
+        ));
+
+        // A reverse (reply) packet keyed by the reverse-entry tuple.
+        table.account_packet(&rev, 100, 0, 0);
+
+        let c = table.session_counters(&fwd).expect("forward entry exists");
+        assert_eq!(
+            c.rev_packets, 1,
+            "v6={v6}: reverse ICMP volume must fold onto the FORWARD entry",
+        );
+        assert_eq!(
+            c.rev_bytes, 100,
+            "v6={v6}: reverse bytes on the forward entry"
+        );
+        assert_eq!(c.fwd_packets, 0, "v6={v6}: no forward packet was accounted");
+    }
 }
 
 #[test]

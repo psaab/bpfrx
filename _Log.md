@@ -31952,6 +31952,106 @@ top.
     pkg/config/compiler_nat_pool_alarm_test.go,
     docs/deterministic-nat-cgnat.md, docs/config-schema.md, _Log.md
 - **Timestamp**: 2026-07-04
+  - **Action**: #4074 (RFC 5508 §3.1 "ICMP Query Mappings") — pool-mode source
+    NAT now translates the ICMP/ICMPv6 Query Identifier. The flow parser lifts
+    an echo/query Identifier into the tuple `src_port` (dst_port 0), so it is
+    the ICMP demux key exactly like a TCP/UDP port. Before this, pool SNAT took
+    the port-less address-only path for ICMP (`rewrite_src_port` unset), so two
+    internal hosts pinging the same target with the same id, both hidden behind
+    one pool address, collided on the reverse tuple `(pool_addr, id)` → replies
+    mis-associated. Fix, three coordinated parts: (1) nat/source.rs — an
+    identifier-bearing ICMP flow (`src_port != 0`) now takes the PAT
+    `allocate_translation` path, drawing a unique translated id from the pool
+    id space (mirrors the TCP/UDP port allocation; `no_translation` and
+    flowless/non-identifier ICMP stay address-only). (2) session/key.rs — the
+    ICMP arm of forward_wire_key / reverse_wire_key / translated_session_key /
+    reverse_session_key folds the translated id into `src_port` (symmetric
+    field, dst_port stays 0), so the reverse index + companion session demux on
+    the translated id. No-op when `rewrite_src_port` is None (interface-mode,
+    static, DNAT, no-NAT unchanged). (3) afxdp/frame/mod.rs —
+    `apply_nat_icmp_identifier_rewrite` rewrites the Identifier at l4+4 and
+    repairs the ICMP checksum incrementally, both directions (forward
+    orig→translated via `rewrite_src_port`, reverse translated→orig via the
+    `rewrite_dst_port` produced by `NatDecision::reverse`); gated on an
+    identifier-bearing ICMP type so error/control messages are untouched; the
+    ICMPv6 pseudo-header address delta is already folded by the IP-rewrite
+    section, ICMPv4 has no pseudo-header. ICMP is never flow-cached, so the
+    TCP/UDP descriptor fast path is unaffected. RED-on-revert: distinct
+    translated ids per host + distinct reverse keys (nat + session tests);
+    on-wire identifier + checksum forward/reverse (frame v4 + v6 tests).
+    Validated: FULL `cargo test --release`, `go build ./...`, rustfmt.
+  - **File(s)**: userspace-dp/src/nat/source.rs,
+    userspace-dp/src/nat/tests.rs, userspace-dp/src/session/key.rs,
+    userspace-dp/src/session/tests.rs, userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    docs/userspace-dataplane-architecture.md, _Log.md
+- **Timestamp**: 2026-07-04
+  - **Action**: #4074 review fold (PR #4086, MERGE-NEEDS-MINOR) — fix a
+    reachable DNAT regression introduced by the ICMP query-id rewriter. The new
+    `apply_nat_icmp_identifier_rewrite` fires on `rewrite_src_port.or(rewrite_
+    dst_port)`. A forward DNAT to a POOLED PORT that is UNSCOPED by protocol/
+    destination-port (`validateDNATPoolStrict` does NOT require a
+    `match destination-port`, unlike static NAT) produces, for an ICMP echo, a
+    NatDecision `{rewrite_dst_port=Some(pool_port)}` → the `.or()` fired the
+    identifier rewrite for the DNAT case too → ICMP ping through that rule got
+    its Query Identifier corrupted to the pool port (pre-PR it was address-
+    only). Fix in the DECISION layer, NOT the frame fn (the LEGITIMATE reverse
+    pool-SNAT reply is also ICMP-with-rewrite_dst_port, from
+    `NatDecision::reverse`, and MUST still fire): gate `rewrite_dst_port` on
+    `has_l4_ports(protocol)` in the DNAT lookup
+    (`DnatTable::lookup_with_counter_scoped`, destination.rs — capture the
+    predicate before `protocol` is widened to the u16 key space). A port-less
+    protocol (ICMP/ICMPv6/GRE) now keeps `rewrite_dst_port = None` (address-only
+    DNAT). Static NAT needs no gate — it is ICMP-safe by construction (the build
+    maps `match_destination_port == 0` to `(None, None)`, so a port-mapped entry
+    is always keyed `(ip, Some(nonzero))` which dst_port-0 ICMP can never match,
+    and the whole-address `(ip, None)` bucket only holds `mapped_port = None`);
+    documented at the static DNAT decision site. NAT64 already sets
+    `rewrite_dst_port: None`. RED-on-revert: `dnat_pooled_port_does_not_
+    translate_icmp_identifier` (decision-layer: ICMP DNAT → rewrite_dst_port
+    None, TCP control still Some(8080)) +
+    `rewrite_forwarded_frame_in_place_dnat_preserves_icmpv4_identifier` (wire-
+    level: identifier preserved, checksum valid). Existing pool-SNAT id tests +
+    the reverse pool-SNAT reply still pass. Validated: FULL `cargo test
+    --release`, `go build ./...`, rustfmt.
+  - **File(s)**: userspace-dp/src/nat/destination.rs,
+    userspace-dp/src/nat/static_nat.rs, userspace-dp/src/nat/tests.rs,
+    userspace-dp/src/afxdp/frame/tests.rs, _Log.md
+- **Timestamp**: 2026-07-04
+  - **Action**: #4074 Copilot fold (PR #4086) — fix a PR-introduced ICMP
+    reply-accounting regression (Finding 1). `account_packet` (session/mod.rs)
+    folds a REVERSE ICMP packet's volume onto the canonical FORWARD entry by
+    calling `reverse_session_key(reverse_entry_key, reverse_decision)` to
+    recover the forward key. Pool-SNAT translated the ICMP id X->Y, so the
+    reverse entry is keyed on Y and `NatDecision::reverse` stored the ORIGINAL
+    id X in `rewrite_dst_port`. The PR's `reverse_session_key` ICMP arm read
+    only `rewrite_src_port` (None on the reverse decision) -> yielded Y ->
+    MISSED the forward entry {..,X,..} -> the reply volume was mis-accounted
+    onto the reverse entry, so the forward-only conntrack mirror / SESSION_CLOSE
+    / NetFlow / IPFIX under-counted reply-direction volume for translated ICMP.
+    Fix: the ICMP arm now reads `rewrite_src_port.or(rewrite_dst_port)` — the id
+    is a symmetric field and at most one of the two is set (SNAT sets only
+    src_port forward; its `.reverse()` sets only dst_port; ICMP DNAT is gated to
+    no L4 port), so `.or()` recovers Y forward->reverse and X reverse->forward.
+    Forward->reverse callers (session_delta/ha/bpf_map/publish_conntrack/
+    session_glue/coordinator/types) are UNCHANGED (rewrite_dst_port is None
+    there). `reverse_wire_key` (the demux, forward->reverse only) is correct and
+    untouched. RED-on-revert: account_packet_reverse_folds_onto_forward_
+    translated_icmp (v4 + v6) — a reverse ICMP packet bumps the FORWARD entry's
+    rev_* (reverting the arm to src_port-only misses the forward entry -> RED).
+    Finding 2 (id==0 edge): the `icmp_query = ... && src_port != 0` gate
+    misclassifies an identifier-bearing ICMP query with id==0 as flowless (both
+    Some((0,0)) and None flatten to src_port 0), so an id==0 echo is not
+    translated and two id==0 flows collide on (pool_addr, 0). REPORTED for a
+    follow-up rather than folded: the clean signal (parse_flow_ports Some vs
+    None) would thread a new bool through SessionFlow (83 construction literals,
+    a hot per-packet struct) or `match_source_nat_result_for_tuple` (28 call
+    sites) — a moderate-to-large refactor for a rare edge (standard ping uses a
+    nonzero PID as the id; id==0 is uncommon on-wire) that is strictly better
+    than pre-PR either way (pre-PR ALL ids collided; now only id==0). Validated:
+    FULL `cargo test --release`, `go build ./...`, rustfmt.
+  - **File(s)**: userspace-dp/src/session/key.rs,
+    userspace-dp/src/session/tests.rs, _Log.md
   - **Action**: #4085 — firewall-filter `then count` double-count fix (Rust
     dataplane). VERIFIED against origin/master: an interface INPUT filter term
     with BOTH `then count` and a tx-selection modifier (`then forwarding-class`

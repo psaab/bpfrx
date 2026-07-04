@@ -554,6 +554,15 @@ impl StaticNatTable {
         if let Some(entry) = pick_scoped(self.dnat.get(&(dst_ip, Some(dst_port))), &zone_ok)
             .or_else(|| pick_scoped(self.dnat.get(&(dst_ip, None)), &zone_ok))
         {
+            // #4074: this cannot attach a spurious L4 port to an ICMP flow (the
+            // regression the DNAT-pool path had). A port-mapped entry always
+            // carries `mapped_port = Some(_)` together with `match_dst_port =
+            // Some(nonzero)` (the build maps `match_destination_port == 0` to
+            // `(None, None)`), so it is keyed under `(ip, Some(nonzero))` and an
+            // ICMP packet (dst_port 0) can never match it; the whole-address
+            // `(ip, None)` bucket only ever holds `mapped_port = None`. So
+            // `rewrite_dst_port` is structurally `None` for ICMP here — no
+            // protocol gate needed.
             return Some((
                 NatDecision {
                     rewrite_src: None,

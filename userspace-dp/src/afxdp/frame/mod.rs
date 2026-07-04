@@ -95,6 +95,9 @@ pub(in crate::afxdp) use tcp::{
     frame_has_tcp_rst,
 };
 pub(super) use tcp::{extract_tcp_flags_and_window, extract_tcp_window, tcp_flags_str};
+// #4074: the ICMP identifier-bearing query-type gate, reused by the NAT
+// identifier rewriter (`apply_nat_icmp_identifier_rewrite`).
+use inspect::icmp_identifier_bearing;
 // #1352: clamp_tcp_mss_frame is now imported directly by the per-family
 // helpers in frame/build/{ipv4,ipv6}.rs.
 
@@ -862,6 +865,9 @@ pub(super) fn apply_nat_ipv4(
     // #1852: skip on a non-first fragment — the port bytes are payload.
     if !non_first_fragment {
         apply_nat_port_rewrite(packet, ihl, protocol, ChecksumFamily::V4, nat)?;
+        // #4074: translate the ICMP Query Identifier (RFC 5508 §3.1). No-op
+        // for TCP/UDP and for any ICMP decision without a translated id.
+        apply_nat_icmp_identifier_rewrite(packet, ihl, protocol, ChecksumFamily::V4, nat)?;
     }
 
     Some(())
@@ -987,6 +993,10 @@ pub(super) fn apply_nat_ipv6(
     // #1852: skip on a non-first fragment — the port bytes are payload.
     if !non_first_fragment {
         apply_nat_port_rewrite(packet, rel_l4, protocol, ChecksumFamily::V6, nat)?;
+        // #4074: translate the ICMPv6 Query Identifier (RFC 5508 §3.1). The
+        // pseudo-header address delta is already folded above; this adds only
+        // the identifier delta.
+        apply_nat_icmp_identifier_rewrite(packet, rel_l4, protocol, ChecksumFamily::V6, nat)?;
     }
 
     Some(())
@@ -1066,6 +1076,80 @@ pub(in crate::afxdp::frame) fn apply_nat_port_rewrite(
         }
     }
 
+    Some(())
+}
+
+/// #4074 (RFC 5508 §3.1 "ICMP Query Mappings"): rewrite the ICMP / ICMPv6
+/// Query Identifier and repair the ICMP checksum incrementally.
+///
+/// The identifier is a single 16-bit field at `l4_offset + 4` — the same
+/// offset in BOTH families and BOTH directions (`type[0] code[1]
+/// checksum[2..4] identifier[4..6] sequence[6..8]`) — and it is the ICMP
+/// demux key that pool-mode SNAT translates so two internal hosts pinging the
+/// same target with the same id, both hidden behind one pool address, do not
+/// collide on the reverse tuple `(pool_addr, id)`. Because the field is
+/// symmetric, the forward NAT decision carries the translated id in
+/// `rewrite_src_port` while the reverse (reply) decision — produced by
+/// `NatDecision::reverse` — carries the ORIGINAL id in `rewrite_dst_port`. At
+/// most one of the two is set for an ICMP flow, so the new identifier is
+/// `rewrite_src_port.or(rewrite_dst_port)`.
+///
+/// Gated on the ICMP type being an identifier-bearing query (echo / timestamp
+/// / information for ICMPv4, echo for ICMPv6): an error or control message's
+/// `l4+4` bytes are a gateway address / next-hop MTU / pointer / reserved
+/// field, NOT an identifier, and must never be touched — the same query-type
+/// gate `parse_flow_ports` applies when it lifts the id into the session tuple.
+///
+/// For ICMPv6 the pseudo-header address change is already folded into the
+/// checksum by the caller's IP-rewrite section (`adjust_l4_checksum_ipv6_*`,
+/// which handles `PROTO_ICMPV6`); here only the identifier delta is applied.
+/// ICMPv4 has no pseudo-header, so the SNAT address change never affects the
+/// ICMPv4 checksum and only the identifier delta matters.
+// #[inline(always)]: `family` and the protocol match are constants at both
+// call sites, so the whole body folds out of the TCP/UDP NAT path.
+#[inline(always)]
+pub(in crate::afxdp::frame) fn apply_nat_icmp_identifier_rewrite(
+    packet: &mut [u8],
+    l4_offset: usize,
+    protocol: u8,
+    family: ChecksumFamily,
+    nat: NatDecision,
+) -> Option<()> {
+    if !matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return Some(());
+    }
+    let Some(new_ident) = nat.rewrite_src_port.or(nat.rewrite_dst_port) else {
+        return Some(());
+    };
+    // Need type[0], checksum[2..4], and identifier[4..6].
+    if packet.len() < l4_offset + 6 {
+        return Some(());
+    }
+    // The l4+4 bytes are an identifier ONLY for query types (echo / timestamp /
+    // information). Anything else keeps its bytes untouched (fail closed).
+    if !icmp_identifier_bearing(protocol, packet[l4_offset]) {
+        return Some(());
+    }
+    let old_ident = u16::from_be_bytes([packet[l4_offset + 4], packet[l4_offset + 5]]);
+    if old_ident == new_ident {
+        return Some(());
+    }
+    packet
+        .get_mut(l4_offset + 4..l4_offset + 6)?
+        .copy_from_slice(&new_ident.to_be_bytes());
+    // ICMP checksum field is at l4+2 in both families.
+    let csum_off = l4_offset + 2;
+    let current = u16::from_be_bytes([*packet.get(csum_off)?, *packet.get(csum_off + 1)?]);
+    let mut updated = checksum16_adjust(current, &[old_ident], &[new_ident]);
+    // ICMPv6 forbids a transmitted 0x0000 checksum (RFC 8200 §8.1); a v4 ICMP
+    // 0x0000 is a legal checksum value. `adjust_zero_checksum_illegal` is the
+    // shared SSOT for this rule (ICMPv6 canonicalizes, ICMPv4 does not).
+    if adjust_zero_checksum_illegal(protocol, family) && updated == 0 {
+        updated = 0xffff;
+    }
+    packet
+        .get_mut(csum_off..csum_off + 2)?
+        .copy_from_slice(&updated.to_be_bytes());
     Some(())
 }
 

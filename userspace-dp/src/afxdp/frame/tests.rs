@@ -1932,6 +1932,357 @@ fn rewrite_forwarded_frame_in_place_keeps_icmpv6_echo_identifier_and_sequence() 
     assert!(icmpv6_checksum_ok(packet));
 }
 
+fn build_icmp_frame_v4(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8, icmp_type: u8, id: u16) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, ttl, PROTO_ICMP, 0x00, 0x00,
+    ]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    let ip_csum = checksum16(&frame[14..34]);
+    frame[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+    let icmp_start = frame.len();
+    frame.extend_from_slice(&[
+        icmp_type,
+        0,
+        0x00,
+        0x00,
+        (id >> 8) as u8,
+        id as u8,
+        0x00,
+        0x01,
+    ]);
+    let icmp_csum = checksum16(&frame[icmp_start..]);
+    frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+    frame
+}
+
+fn build_icmpv6_echo_frame(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    hop: u8,
+    icmp_type: u8,
+    id: u16,
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x08, PROTO_ICMPV6, hop]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&[
+        icmp_type,
+        0,
+        0x00,
+        0x00,
+        (id >> 8) as u8,
+        id as u8,
+        0x00,
+        0x01,
+    ]);
+    let sum = checksum16_ipv6(src, dst, PROTO_ICMPV6, &frame[54..]);
+    frame[56] = (sum >> 8) as u8;
+    frame[57] = sum as u8;
+    frame
+}
+
+fn icmp_test_decision(nat: NatDecision) -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat,
+    }
+}
+
+// #4074 FAIL-ON-REVERT (RFC 5508 §3.1): pool SNAT translates the ICMP Query
+// Identifier on the wire and repairs the ICMP checksum — forward (orig ->
+// translated) on egress and reverse (translated -> orig) on the reply.
+// Reverting `apply_nat_icmp_identifier_rewrite` leaves the identifier AND the
+// checksum untouched, turning the translated-id and checksum assertions RED.
+#[test]
+fn rewrite_forwarded_frame_in_place_translates_icmpv4_echo_identifier() {
+    let host = Ipv4Addr::new(10, 0, 1, 100);
+    let target = Ipv4Addr::new(8, 8, 8, 8);
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let orig_id: u16 = 0x1234;
+    let translated_id: u16 = 40001;
+    // `flow_src_port` carries the packet's on-wire ICMP identifier (the parser
+    // fills it); `restore_l4_tuple_from_meta` uses it, so it must match the
+    // frame — orig id on the request, translated id on the reply.
+    let meta_for = |flow_src_port: u16| UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        flow_src_port,
+        ..UserspaceDpMeta::default()
+    };
+    let meta = meta_for(orig_id);
+
+    // Forward: host -> target, echo request. SNAT src to pool + translate id.
+    let frame = build_icmp_frame_v4(host, target, 64, 8, orig_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let fwd_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(pool)),
+        rewrite_src_port: Some(translated_id),
+        ..NatDecision::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(fwd_nat),
+        false,
+        None,
+    )
+    .expect("fwd rewrite");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("fwd out");
+    // eth 14 + ip 20 => icmp at 34; type@34, identifier@38..40.
+    assert_eq!(out[34], 8, "still an echo request");
+    assert_eq!(&out[26..30], &pool.octets(), "src translated to pool");
+    assert_eq!(
+        u16::from_be_bytes([out[38], out[39]]),
+        translated_id,
+        "identifier translated on the wire",
+    );
+    assert_eq!(
+        checksum16(&out[34..]),
+        0,
+        "ICMPv4 checksum valid after id rewrite",
+    );
+
+    // Reverse: reply target -> pool carries the translated id; un-NAT restores
+    // the original id and dst. Use the real NatDecision::reverse inversion.
+    let reply = build_icmp_frame_v4(target, pool, 64, 0, translated_id);
+    let mut rarea = MmapArea::new(4096).expect("mmap");
+    rarea
+        .slice_mut(0, reply.len())
+        .unwrap()
+        .copy_from_slice(&reply);
+    let rev_nat = fwd_nat.reverse(IpAddr::V4(host), IpAddr::V4(target), orig_id, 0);
+    let rres = rewrite_forwarded_frame_in_place(
+        &rarea,
+        XdpDesc {
+            addr: 0,
+            len: reply.len() as u32,
+            options: 0,
+        },
+        meta_for(translated_id),
+        &icmp_test_decision(rev_nat),
+        false,
+        None,
+    )
+    .expect("rev rewrite");
+    let rout = rarea
+        .slice(rres.offset as usize, rres.len as usize)
+        .expect("rev out");
+    assert_eq!(rout[34], 0, "still an echo reply");
+    assert_eq!(&rout[30..34], &host.octets(), "dst un-NAT'd to the host");
+    assert_eq!(
+        u16::from_be_bytes([rout[38], rout[39]]),
+        orig_id,
+        "identifier restored to the original on the reply",
+    );
+    assert_eq!(
+        checksum16(&rout[34..]),
+        0,
+        "ICMPv4 checksum valid after reverse id rewrite",
+    );
+}
+
+#[test]
+fn rewrite_forwarded_frame_in_place_translates_icmpv6_echo_identifier() {
+    let host = "2001:559:8585:ef00::100".parse::<Ipv6Addr>().unwrap();
+    let target = "2001:4860:4860::8888".parse::<Ipv6Addr>().unwrap();
+    let pool = "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap();
+    let orig_id: u16 = 0x3e0f;
+    let translated_id: u16 = 40002;
+    // `flow_src_port` mirrors the packet's on-wire ICMPv6 identifier so
+    // `restore_l4_tuple_from_meta` is a no-op and MY incremental checksum
+    // adjustment (not a full recompute) is what the test validates.
+    let meta_for = |flow_src_port: u16| UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        flow_src_port,
+        ..UserspaceDpMeta::default()
+    };
+    let meta = meta_for(orig_id);
+
+    // Forward: host -> target, echo request (128). SNAT src + translate id.
+    let frame = build_icmpv6_echo_frame(host, target, 64, 128, orig_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let fwd_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V6(pool)),
+        rewrite_src_port: Some(translated_id),
+        ..NatDecision::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(fwd_nat),
+        false,
+        None,
+    )
+    .expect("fwd v6 rewrite");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("fwd v6 out");
+    // eth 14 + ipv6 40 => icmp at 54; type@54, identifier@58..60.
+    assert_eq!(out[54], 128, "still an echo request");
+    assert_eq!(&out[22..38], &pool.octets(), "src translated to pool");
+    assert_eq!(
+        u16::from_be_bytes([out[58], out[59]]),
+        translated_id,
+        "identifier translated on the wire",
+    );
+    assert!(
+        icmpv6_checksum_ok(&out[14..]),
+        "ICMPv6 checksum valid after id rewrite",
+    );
+
+    // Reverse: reply target -> pool with the translated id; un-NAT restores it.
+    let reply = build_icmpv6_echo_frame(target, pool, 64, 129, translated_id);
+    let mut rarea = MmapArea::new(4096).expect("mmap");
+    rarea
+        .slice_mut(0, reply.len())
+        .unwrap()
+        .copy_from_slice(&reply);
+    let rev_nat = fwd_nat.reverse(IpAddr::V6(host), IpAddr::V6(target), orig_id, 0);
+    let rres = rewrite_forwarded_frame_in_place(
+        &rarea,
+        XdpDesc {
+            addr: 0,
+            len: reply.len() as u32,
+            options: 0,
+        },
+        meta_for(translated_id),
+        &icmp_test_decision(rev_nat),
+        false,
+        None,
+    )
+    .expect("rev v6 rewrite");
+    let rout = rarea
+        .slice(rres.offset as usize, rres.len as usize)
+        .expect("rev v6 out");
+    assert_eq!(rout[54], 129, "still an echo reply");
+    assert_eq!(&rout[38..54], &host.octets(), "dst un-NAT'd to the host");
+    assert_eq!(
+        u16::from_be_bytes([rout[58], rout[59]]),
+        orig_id,
+        "identifier restored to the original on the reply",
+    );
+    assert!(
+        icmpv6_checksum_ok(&rout[14..]),
+        "ICMPv6 checksum valid after reverse id rewrite",
+    );
+}
+
+// #4074: end-to-end — a DNAT'd ICMP echo (address-only, `rewrite_dst` set,
+// `rewrite_dst_port` None, which is what the gated DNAT lookup now produces for
+// a port-less protocol) must PRESERVE the ICMP Query Identifier and leave the
+// checksum valid. This is the wire-level counterpart to the decision-layer test
+// `dnat_pooled_port_does_not_translate_icmp_identifier`: the gate keeps
+// `rewrite_dst_port` None, so `apply_nat_icmp_identifier_rewrite` no-ops here.
+#[test]
+fn rewrite_forwarded_frame_in_place_dnat_preserves_icmpv4_identifier() {
+    let client = Ipv4Addr::new(198, 51, 100, 1);
+    let public = Ipv4Addr::new(203, 0, 113, 10);
+    let internal = Ipv4Addr::new(10, 0, 0, 5);
+    let orig_id: u16 = 0x1234;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        flow_src_port: orig_id,
+        ..UserspaceDpMeta::default()
+    };
+    let frame = build_icmp_frame_v4(client, public, 64, 8, orig_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    // Address-only DNAT decision (the gated lookup's output for ICMP).
+    let dnat = NatDecision {
+        rewrite_dst: Some(IpAddr::V4(internal)),
+        rewrite_dst_port: None,
+        ..NatDecision::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(dnat),
+        false,
+        None,
+    )
+    .expect("dnat rewrite");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("dnat out");
+    assert_eq!(&out[30..34], &internal.octets(), "dst translated by DNAT");
+    assert_eq!(
+        u16::from_be_bytes([out[38], out[39]]),
+        orig_id,
+        "ICMP identifier PRESERVED through address-only DNAT",
+    );
+    assert_eq!(
+        checksum16(&out[34..]),
+        0,
+        "ICMPv4 checksum valid (identifier untouched)",
+    );
+}
+
 fn tcp_ports_ipv6(packet: &[u8]) -> (u16, u16) {
     (
         u16::from_be_bytes([packet[40], packet[41]]),

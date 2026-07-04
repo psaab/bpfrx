@@ -574,6 +574,17 @@ impl DnatTable {
         ingress_routing_instance: &str,
         packet_icmp: Option<(u8, u8)>,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
+        // #4074: whether the inbound protocol carries a rewritable 16-bit L4
+        // port (TCP/UDP). A port-less protocol (ICMP/ICMPv6/GRE/...) has no L4
+        // port, so a DNAT rule must NEVER attach a translated destination port
+        // to it — captured here before `protocol` is widened to the u16 key
+        // space below. Without this, an UNSCOPED pool DNAT rule (no `match
+        // destination-port`) whose pool carries a `port` would set
+        // `rewrite_dst_port = Some(pool_port)` for an ICMP echo, and the SNAT
+        // ICMP-identifier rewriter (`apply_nat_icmp_identifier_rewrite`) would
+        // then corrupt the ICMP Query Identifier to the pool port. ICMP DNAT
+        // must stay address-only (the pre-#4074 behaviour).
+        let protocol_has_l4_ports = crate::ip_proto::has_l4_ports(protocol);
         // The inbound packet protocol is a real IANA byte; widen it to the
         // u16 key space. The wildcard sentinel (PROTO_ANY = 256) is OUTSIDE
         // this range, so a real packet — even one carrying protocol 0 (HOPOPT)
@@ -664,11 +675,18 @@ impl DnatTable {
             Some(DnatOutcome::Translate(v, c)) => (v, c),
             Some(DnatOutcome::Exempt) | None => return None,
         };
-        let rewrite_dst_port = if value.new_dst_port != 0 && value.new_dst_port != dst_port {
-            Some(value.new_dst_port)
-        } else {
-            None
-        };
+        // #4074: gate the destination-port translation on the protocol actually
+        // carrying an L4 port. A port-less protocol (ICMP/ICMPv6/GRE/...) keeps
+        // `rewrite_dst_port = None` — address-only DNAT — so a pooled-port DNAT
+        // rule can never smuggle a spurious L4 port onto an ICMP flow (which
+        // would otherwise drive the ICMP-identifier rewriter to corrupt the
+        // Query Identifier).
+        let rewrite_dst_port =
+            if protocol_has_l4_ports && value.new_dst_port != 0 && value.new_dst_port != dst_port {
+                Some(value.new_dst_port)
+            } else {
+                None
+            };
         Some((
             NatDecision {
                 rewrite_src: None,

@@ -1685,6 +1685,71 @@ fn dnat_basic_lookup_tcp() {
     );
 }
 
+// #4074 FAIL-ON-REVERT: an UNSCOPED pool DNAT rule (no `match destination-port`)
+// whose pool carries a `port` must NOT attach that port to a port-less ICMP
+// flow. `validateDNATPoolStrict` does not require a destination-port, so such a
+// rule commits; the snapshot builder emits protocol="" (ANY) + destination_port
+// 0 (wildcard) + pool_port=8080, and the ICMP DNAT lookup runs with dst_port 0.
+// Pre-gate, `rewrite_dst_port` became `Some(8080)` and the SNAT ICMP-identifier
+// rewriter (`apply_nat_icmp_identifier_rewrite`) then corrupted the ICMP Query
+// Identifier to 8080, breaking ping through the DNAT rule. The `has_l4_ports`
+// gate keeps ICMP DNAT address-only (pre-#4074 behaviour).
+//
+// Reverting the gate in destination.rs makes `rewrite_dst_port` `Some(8080)` for
+// the ICMP lookup, turning the `None` assertion RED. The TCP control (which DOES
+// carry an L4 port) still receives the port translation.
+#[test]
+fn dnat_pooled_port_does_not_translate_icmp_identifier() {
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 0,     // unscoped by destination-port
+            protocol: String::new(), // any protocol (matches ICMP)
+            pool_address: "10.0.0.5".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // ICMP echo (dst_port 0): the destination address is translated, but the
+    // pool port must NOT be attached — ICMP has no L4 port.
+    let icmp = table.lookup(
+        PROTO_ICMP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        0,
+        "",
+    );
+    assert_eq!(
+        icmp,
+        Some(NatDecision {
+            rewrite_dst: Some("10.0.0.5".parse().unwrap()),
+            rewrite_dst_port: None,
+            ..NatDecision::default()
+        }),
+        "ICMP DNAT must be address-only — no pooled L4 port on a port-less flow",
+    );
+    // TCP control: a port-carrying protocol still gets the pool port.
+    let tcp = table.lookup(
+        PROTO_TCP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        80,
+        "",
+    );
+    assert_eq!(
+        tcp,
+        Some(NatDecision {
+            rewrite_dst: Some("10.0.0.5".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        }),
+        "TCP DNAT still translates the destination port",
+    );
+}
+
 // #3844: `then destination-nat off` is a no-translate EXEMPTION. An off entry
 // that matches must return NO DNAT decision AND short-circuit later DNAT rules
 // for the same destination — a translate rule keyed identically must NOT
@@ -3326,6 +3391,167 @@ fn pool_snat_portless_protocols_translate_ip_only_no_port() {
             "proto {proto}: no pool port may be allocated for a port-less protocol",
         );
     }
+}
+
+// #4074 FAIL-ON-REVERT (RFC 5508 §3.1): pool-mode source-NAT applied to an
+// ICMP echo/query flow must translate the ICMP Query Identifier — the flow
+// parser lifts that id into `src_port` (with `dst_port == 0`), and it is the
+// ICMP demux key exactly like a TCP/UDP port. Two internal hosts pinging the
+// same target with the SAME id, both hidden behind ONE pool address, must get
+// DISTINCT translated ids so their return replies demux (the reverse tuple
+// `(pool_addr, id)` no longer collides).
+//
+// Reverting the source.rs `icmp_query` gate makes ICMP fall through to the
+// port-less address-only path (`rewrite_src_port: None`), so BOTH decisions
+// carry the untranslated id, the two `is_some()`/distinctness assertions go
+// RED, and (in production) the reverse keys collide.
+#[test]
+fn pool_snat_translates_icmp_query_id_distinct_per_host() {
+    for proto in [PROTO_ICMP, PROTO_ICMPV6] {
+        let (src_a, src_b, dst): (IpAddr, IpAddr, IpAddr) = if proto == PROTO_ICMP {
+            (
+                "10.0.1.100".parse().unwrap(),
+                "10.0.1.101".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+            )
+        } else {
+            (
+                "2001:db8::100".parse().unwrap(),
+                "2001:db8::101".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+            )
+        };
+        let pool_addr = if proto == PROTO_ICMP {
+            "203.0.113.1/32".to_string()
+        } else {
+            "2001:db8:cafe::1/128".to_string()
+        };
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-snat".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec![if proto == PROTO_ICMP {
+                "0.0.0.0/0".to_string()
+            } else {
+                "::/0".to_string()
+            }],
+            pool_name: "my-pool".to_string(),
+            pool_addresses: vec![pool_addr],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        // Both hosts use the SAME ICMP query-id 0x1234 to the SAME target.
+        let query_id = 0x1234u16;
+        let mut counter = None;
+        let da = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src_a,
+            dst,
+            proto,
+            query_id,
+            0,
+            None,
+            None,
+            0,
+            false,
+            &mut counter,
+        ));
+        let db = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src_b,
+            dst,
+            proto,
+            query_id,
+            0,
+            None,
+            None,
+            0,
+            false,
+            &mut counter,
+        ));
+        // Both hosts land on the single pool address (overload) ...
+        let expected_pool: IpAddr = if proto == PROTO_ICMP {
+            "203.0.113.1".parse().unwrap()
+        } else {
+            "2001:db8:cafe::1".parse().unwrap()
+        };
+        assert_eq!(da.rewrite_src, Some(expected_pool), "proto {proto}");
+        assert_eq!(db.rewrite_src, Some(expected_pool), "proto {proto}");
+        // ... and each MUST get a translated query-id from the pool id space.
+        let id_a = da
+            .rewrite_src_port
+            .unwrap_or_else(|| panic!("proto {proto}: host A must get a translated ICMP id"));
+        let id_b = db
+            .rewrite_src_port
+            .unwrap_or_else(|| panic!("proto {proto}: host B must get a translated ICMP id"));
+        assert!(id_a >= 1024, "proto {proto}: id {id_a} out of pool range");
+        assert!(id_b >= 1024, "proto {proto}: id {id_b} out of pool range");
+        // The demux invariant: same pool address + same original id => the
+        // translated ids MUST differ (RFC 5508 §3.1 uniqueness).
+        assert_ne!(
+            id_a, id_b,
+            "proto {proto}: two hosts sharing a pool address + query-id must get DISTINCT translated ids",
+        );
+        assert_eq!(da.rewrite_dst, None, "proto {proto}");
+        assert_eq!(da.rewrite_dst_port, None, "proto {proto}");
+
+        // Two pool ids consumed, one per flow.
+        let status = source_nat_pool_statuses(&rules);
+        assert_eq!(
+            status[0].used_ports, 2,
+            "proto {proto}: one pool id per ICMP query flow",
+        );
+    }
+}
+
+// #4074: a NON-identifier ICMP message (an error / control type, or any flow
+// the parser could not lift an id from — `src_port == 0`) keeps the
+// address-only path: the source IP is translated but NO id is allocated. This
+// pins that the `icmp_query` gate is `src_port != 0`, not "all ICMP".
+#[test]
+fn pool_snat_icmp_without_query_id_is_address_only() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let mut counter = None;
+    let d = expect_snat_decision(match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        PROTO_ICMP,
+        0, // flowless / non-identifier ICMP
+        0,
+        None,
+        None,
+        0,
+        false,
+        &mut counter,
+    ));
+    assert_eq!(d.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(
+        d.rewrite_src_port, None,
+        "a flowless / non-identifier ICMP must NOT allocate a pool id",
+    );
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].used_ports, 0, "no pool id for a flowless ICMP");
 }
 
 // #3906 FAIL-ON-REVERT: pool-mode source-NAT with `port no-translation` must
