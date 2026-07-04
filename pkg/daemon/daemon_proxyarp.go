@@ -193,6 +193,10 @@ func diffProxyResponders(prev, cur map[string]map[int]struct{}) map[string]map[i
 // SNMP-gated, so this is a dedicated, unconditionally-started loop. The
 // reconcile is a no-op when no proxy-arp entries are configured, so the loop is
 // cheap on configs that do not use proxy-arp.
+//
+// Each tick runs the reconcile under d.applySem (see reassertProxyARPOnce) so a
+// re-assert can never interleave with a concurrent commit/config reconcile
+// (#4001).
 func (d *Daemon) proxyARPReassertLoop(ctx context.Context) {
 	t := time.NewTicker(proxyARPReassertInterval)
 	defer t.Stop()
@@ -201,9 +205,41 @@ func (d *Daemon) proxyARPReassertLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				proxyARPReconcileFn(d, cfg)
-			}
+			d.reassertProxyARPOnce(ctx)
 		}
+	}
+}
+
+// reassertProxyARPOnce runs one proxy-ARP reconcile under the apply semaphore.
+//
+// #4001: the earlier version read d.store.ActiveConfig() and ran the reconcile
+// WITHOUT holding d.applySem — the same semaphore the commit/config-apply path
+// holds across store.Commit + applyConfigLocked (which calls reconcileProxyARP).
+// That let a tick interleave with a commit that REMOVES a proxy-arp responder:
+// the loop could capture the pre-commit ActiveConfig (still listing the removed
+// responder) and, after the commit's reconcile had already torn the responder
+// down, re-install it from that stale snapshot — the diff then remembered it as
+// enabled, so the firewall kept proxying ARP for a removed/moved VIP until the
+// next commit (an HA blackhole / mis-steer when the VIP had moved to the peer).
+//
+// Acquiring applySem before reading ActiveConfig closes the window two ways: the
+// tick blocks behind any in-flight commit, and the config it reconciles is
+// always the post-commit ActiveConfig, so it can never re-add a just-removed
+// responder. The reconcile is netlink + procfs only (no helper control socket)
+// and runs on a 30s cadence, so holding applySem for it does not starve the
+// commit path.
+//
+// Lock order matches the commit path: applySem is acquired FIRST, then
+// reconcileProxyARP takes proxyARPEnabledMu internally (applySem ->
+// proxyARPEnabledMu). reconcileProxyARP never re-acquires applySem, so there is
+// no self-deadlock. On shutdown the loop ctx is cancelled and Acquire returns an
+// error, so a blocked tick unwinds promptly without reconciling.
+func (d *Daemon) reassertProxyARPOnce(ctx context.Context) {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return // ctx cancelled (daemon shutdown) — do not reconcile.
+	}
+	defer d.applySem.Release(1)
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		proxyARPReconcileFn(d, cfg)
 	}
 }

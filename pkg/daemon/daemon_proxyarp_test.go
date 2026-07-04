@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -366,7 +367,7 @@ func TestProxyARPReassertLoop_DrivesReconcile(t *testing.T) {
 		proxyARPReassertInterval = prevIvl
 	})
 
-	d := &Daemon{store: s}
+	d := &Daemon{store: s, applySem: semaphore.NewWeighted(1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { d.proxyARPReassertLoop(ctx); close(done) }()
@@ -401,7 +402,7 @@ func TestProxyARPReassertLoop_StopsOnContextCancel(t *testing.T) {
 	proxyARPReassertInterval = time.Hour // never ticks during the test
 	t.Cleanup(func() { proxyARPReassertInterval = prevIvl })
 
-	d := &Daemon{store: s}
+	d := &Daemon{store: s, applySem: semaphore.NewWeighted(1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { d.proxyARPReassertLoop(ctx); close(done) }()
@@ -410,5 +411,152 @@ func TestProxyARPReassertLoop_StopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("loop did not exit on context cancel")
+	}
+}
+
+// TestReassertProxyARPOnce_HoldsApplySem is the #4001 fail-on-revert guard: the
+// periodic re-assert MUST run its reconcile under d.applySem — the same
+// semaphore the commit/config-apply path holds across store.Commit +
+// applyConfigLocked (reconcileProxyARP). Without it, a tick can interleave with
+// a commit that removes a proxy-arp responder and re-install the removed
+// responder from a stale pre-commit config snapshot (an HA blackhole for a
+// moved VIP).
+//
+// The test substitutes the reconcile fn with a probe that, from inside the
+// reconcile, tries a NON-BLOCKING acquire of the capacity-1 applySem. On the
+// fixed code the re-assert already holds applySem, so TryAcquire FAILS
+// (ranWithoutLock stays 0). Revert reassertProxyARPOnce to the old
+// read-ActiveConfig-then-reconcile-without-the-lock form and TryAcquire
+// succeeds → ranWithoutLock flips to 1 and this test goes RED.
+func TestReassertProxyARPOnce_HoldsApplySem(t *testing.T) {
+	dir := t.TempDir()
+	s, err := configstore.New(filepath.Join(dir, "xpf.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadSet(
+		"set security nat proxy-arp interface ge-0/0/1 address 10.0.2.50/32\n",
+	); err != nil {
+		t.Fatalf("LoadSet: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	var ranWithoutLock int64
+	var called int64
+	prevFn := proxyARPReconcileFn
+	proxyARPReconcileFn = func(dd *Daemon, _ *config.Config) {
+		atomic.AddInt64(&called, 1)
+		// The re-assert must hold applySem while reconciling. A successful
+		// non-blocking acquire proves it does NOT — the #4001 race is open.
+		if dd.applySem.TryAcquire(1) {
+			dd.applySem.Release(1)
+			atomic.StoreInt64(&ranWithoutLock, 1)
+		}
+	}
+	t.Cleanup(func() { proxyARPReconcileFn = prevFn })
+
+	d := &Daemon{store: s, applySem: semaphore.NewWeighted(1)}
+	d.reassertProxyARPOnce(context.Background())
+
+	if atomic.LoadInt64(&called) != 1 {
+		t.Fatalf("reconcile fn called %d times, want 1", atomic.LoadInt64(&called))
+	}
+	if atomic.LoadInt64(&ranWithoutLock) != 0 {
+		t.Fatal("re-assert ran the proxy-ARP reconcile WITHOUT holding applySem (#4001): " +
+			"a concurrent commit removing a responder could be undone by the re-assert")
+	}
+}
+
+// TestReassertProxyARPOnce_SerializesWithCommit is the #4001 semantic
+// fail-on-revert guard: a re-assert that fires while a commit holds applySem
+// must BLOCK until the commit releases it, and must then reconcile the
+// POST-commit ActiveConfig — never a stale pre-commit snapshot that still lists
+// a just-removed responder.
+//
+// The test holds applySem (standing in for an in-flight commit), promotes a
+// config with proxy-arp REMOVED into the store, launches reassertProxyARPOnce
+// (which must block), asserts the reconcile has not run, then releases the
+// semaphore and asserts the reconcile ran against the removed-responder config.
+// On revert (no Acquire in the re-assert) the reconcile runs immediately and can
+// observe the config while the commit is mid-flight — this test's blocked-until-
+// release assertion goes RED.
+func TestReassertProxyARPOnce_SerializesWithCommit(t *testing.T) {
+	dir := t.TempDir()
+	s, err := configstore.New(filepath.Join(dir, "xpf.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Commit 1: proxy-arp configured (responder present).
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadSet(
+		"set security nat proxy-arp interface ge-0/0/1 address 10.0.2.50/32\n",
+	); err != nil {
+		t.Fatalf("LoadSet: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	var sawEntries int64 // set to 1 if the reconcile ever saw a proxy-arp entry
+	var called int64
+	reconciled := make(chan struct{}, 1)
+	prevFn := proxyARPReconcileFn
+	proxyARPReconcileFn = func(_ *Daemon, cfg *config.Config) {
+		if cfg != nil && len(cfg.Security.NAT.ProxyARP) > 0 {
+			atomic.StoreInt64(&sawEntries, 1)
+		}
+		atomic.AddInt64(&called, 1)
+		reconciled <- struct{}{}
+	}
+	t.Cleanup(func() { proxyARPReconcileFn = prevFn })
+
+	d := &Daemon{store: s, applySem: semaphore.NewWeighted(1)}
+
+	// Simulate an in-flight commit: hold applySem, then promote a config with
+	// proxy-arp REMOVED so ActiveConfig() no longer lists the responder.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	// Still in configure mode after commit 1; remove proxy-arp and re-commit.
+	if err := s.Delete([]string{"security", "nat", "proxy-arp"}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("Commit 2: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() { d.reassertProxyARPOnce(context.Background()); close(done) }()
+
+	// The re-assert must be blocked on applySem — the reconcile has not run.
+	select {
+	case <-reconciled:
+		d.applySem.Release(1)
+		t.Fatal("re-assert reconciled while the commit held applySem (#4001 race open)")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Release the "commit" lock; the re-assert now proceeds against the
+	// POST-commit ActiveConfig (proxy-arp removed).
+	d.applySem.Release(1)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-assert did not run after applySem was released")
+	}
+
+	if atomic.LoadInt64(&called) != 1 {
+		t.Fatalf("reconcile fn called %d times, want 1", atomic.LoadInt64(&called))
+	}
+	if atomic.LoadInt64(&sawEntries) != 0 {
+		t.Fatal("re-assert reconciled a config that still listed the removed proxy-arp " +
+			"responder — it read a stale pre-commit snapshot (#4001)")
 	}
 }
