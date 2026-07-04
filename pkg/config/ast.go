@@ -216,10 +216,29 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 		found := false
 		for _, n := range current {
 			if len(n.Keys) > 0 && n.Keys[0] == keyword {
-				i++
-				if i >= len(path) {
-					return []*Node{n}
+				if i+1 >= len(path) {
+					// Terminal path element on a bare keyword: return
+					// EVERY sibling sharing this leading keyword (#3980),
+					// not just the first. A hierarchy level may hold
+					// multiple DISTINCT statements with the same leading
+					// keyword — e.g. `ntp server 1.1.1.1` /
+					// `ntp server 2.2.2.2`, several `from-zone` policy
+					// contexts, repeated `archive-sites`. Returning only
+					// the first hid the rest from a path-scoped
+					// `show configuration <path>` and, worse, from its
+					// `| display set`, so a scoped display-set backup
+					// silently dropped the hidden statements on restore.
+					// FindChildren-not-FindChild, the display-side sibling
+					// of the #3842 / #2419 read-all-siblings class.
+					var all []*Node
+					for _, sib := range current {
+						if len(sib.Keys) > 0 && sib.Keys[0] == keyword {
+							all = append(all, sib)
+						}
+					}
+					return all
 				}
+				i++
 				current = n.Children
 				found = true
 				break
