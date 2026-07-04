@@ -100,8 +100,15 @@ type SyncStats struct {
 	BulkSyncs         atomic.Uint64
 	ConfigsSent       atomic.Uint64
 	ConfigsReceived   atomic.Uint64
-	IPsecSASent       atomic.Uint64
-	IPsecSAReceived   atomic.Uint64
+	// ConfigsStaleIgnored counts config-sync messages dropped by the #3931
+	// config-generation ordering guard: an incoming config whose monotonic
+	// generation was NOT strictly newer than the last-applied one (an
+	// out-of-order / reordered older config). A nonzero value means the
+	// guard prevented a rapid-commit reorder (C1 applied after C2) from
+	// leaving the standby on the older config.
+	ConfigsStaleIgnored atomic.Uint64
+	IPsecSASent         atomic.Uint64
+	IPsecSAReceived     atomic.Uint64
 	// #2239 HA DHCP-server lease sync counters. Sent/Received count
 	// full-set lease push MESSAGES (one per family per push); Seeded counts
 	// leases written into a freshly-started Kea on takeover; errors fold
@@ -154,6 +161,7 @@ type SyncStatsSnapshot struct {
 	BulkSyncs            uint64
 	ConfigsSent          uint64
 	ConfigsReceived      uint64
+	ConfigsStaleIgnored  uint64
 	IPsecSASent          uint64
 	IPsecSAReceived      uint64
 	DHCPLeasesSent       uint64
@@ -348,6 +356,36 @@ type SessionSync struct {
 	recvGenMu  sync.Mutex
 	recvGenV4  map[dataplane.SessionKey]uint64
 	recvGenV6  map[dataplane.SessionKeyV6]uint64
+
+	// #3931 config-sync ordering guard.
+	//
+	// Sender side: configGenCounter is a process-wide strictly-monotonic
+	// config generation, seeded at construction from CLOCK_MONOTONIC nanos
+	// (the same cross-boot reasoning as the session genCounter above). Every
+	// QueueConfig draws configGenCounter.Add(1) and STAMPS it on the wire
+	// (encodeConfigPayload), so a rapid commit pair carries strictly
+	// increasing generations.
+	//
+	// Receiver side: the config-sync handler no longer spawns a racing
+	// goroutine per message (the pre-#3931 `go OnConfigReceived` hazard). It
+	// enqueues (gen, text) onto configApplyCh, and a single ordered consumer
+	// (configApplyLoop) drains it in receive order, applying a config only
+	// when its generation is strictly newer than lastAppliedConfigGen
+	// (admitConfigGen). An out-of-order older config is dropped with an alarm
+	// (ConfigsStaleIgnored). lastAppliedConfigGen is reset to 0 on a peer
+	// bulk re-prime (resetRecvGen) so a rebooted primary — whose monotonic
+	// counter restarts lower — is accepted instead of refused as stale (the
+	// #2198 F2 inverse-of-stale-RETAIN reasoning, applied to config).
+	configGenCounter     atomic.Uint64
+	lastAppliedConfigGen atomic.Uint64
+	configApplyCh        chan configApplyItem
+}
+
+// configApplyItem is one config-sync payload queued for ordered apply by the
+// single-consumer configApplyLoop (#3931).
+type configApplyItem struct {
+	gen  uint64
+	text string
 }
 type failoverAck struct {
 	status uint8
@@ -504,6 +542,16 @@ func (s *SessionSync) initGenState() {
 	s.genSentV6 = make(map[dataplane.SessionKeyV6]uint64)
 	s.recvGenV4 = make(map[dataplane.SessionKey]uint64)
 	s.recvGenV6 = make(map[dataplane.SessionKeyV6]uint64)
+	// #3931: seed the config generation from the same monotonic base so the
+	// sender's config-gen never regresses below a value the peer may hold
+	// across this node's restarts within a boot, and create the ordered
+	// config-apply queue drained by configApplyLoop. Buffered generously —
+	// commits are seconds apart and apply is sub-second, so the queue never
+	// fills in practice; overflow drops with an alarm and re-converges on the
+	// next commit/reconnect re-push (see the syncMsgConfig handler).
+	s.configGenCounter.Store(seed)
+	s.lastAppliedConfigGen.Store(0)
+	s.configApplyCh = make(chan configApplyItem, 64)
 }
 
 // NewDualSessionSync creates a session sync manager with dual-fabric transport.
@@ -592,7 +640,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.

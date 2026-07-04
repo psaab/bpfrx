@@ -41,7 +41,7 @@ All multi-byte integers in the wire format are **little-endian**, matching the n
 | 5    | BulkStart        | Primary→Secondary | 0                   | Marks start of bulk transfer |
 | 6    | BulkEnd          | Primary→Secondary | 0                   | Marks end of bulk transfer |
 | 7    | Heartbeat        | Bidirectional     | 0                   | Keepalive (sent on 30s idle) |
-| 8    | Config           | Primary→Secondary | Variable (UTF-8)    | Full config text |
+| 8    | Config           | Primary→Secondary | Variable (UTF-8) + 16B gen framing | Full config text + monotonic config generation (#3931) |
 | 9    | IPsecSA          | Primary→Secondary | Variable (UTF-8)    | Newline-separated connection names |
 
 ## Session V4 Payload Layout (120 bytes)
@@ -300,7 +300,56 @@ V6}` (drives the real sender enqueue + receiver apply in wire order),
 
 ## Config Payload (Variable)
 
-Raw UTF-8 text of the full Junos-format configuration. Sent as-is after `commitConfig()` on the primary. The secondary's `OnConfigReceived` callback invokes `load override` + commit to apply it.
+UTF-8 text of the full Junos-format configuration followed by a trailing
+16-byte generation framing (#3931):
+
+```
+[config text bytes ...][configGenMagic (8 bytes)][gen (uint64 LE, 8 bytes)]
+```
+
+`configGenMagic` = `00 ff 78 70 66 43 47 00` (`\x00\xffxpfCG\x00`), chosen from
+non-printable bytes so it cannot collide with real Junos config text. The
+sender (`QueueConfig`) stamps a strictly-monotonic `gen` drawn from a
+process-wide counter seeded from `CLOCK_MONOTONIC` nanos (same cross-boot
+reasoning as the session install `genCounter`).
+
+**Ordering guard (#3931).** Config sync historically applied via a racing
+`go OnConfigReceived` goroutine per message with no sequence number, so a rapid
+commit pair (C1 then C2) could apply out of order and leave the standby on the
+older C1 with no alarm. The receiver now:
+
+1. Decodes `(configText, gen)` with `decodeConfigPayload`. A payload without the
+   trailing magic is a **legacy sender's** raw config text and decodes with
+   `gen=0` (applied unconditionally — the pre-#3931 behavior).
+2. Enqueues `{gen, configText}` onto a bounded, single-consumer ordered apply
+   queue (`configApplyLoop`) — the `receiveLoop` is single-threaded per
+   connection, so this preserves receive order. The non-blocking enqueue never
+   stalls session sync / heartbeats behind a slow config apply.
+3. Applies a config only when `admitConfigGen` accepts its generation
+   (strictly newer than the last-applied high-water mark, or `gen=0`). An
+   out-of-order older config is **dropped with an alarm** and counted in
+   `ConfigsStaleIgnored`. The standby therefore always converges to the newest
+   config the primary sent.
+
+The last-applied high-water mark is reset to 0 on a peer bulk re-prime
+(`resetRecvGen`, fired on `BulkStart`) so a **rebooted primary** — whose
+monotonic counter restarts lower — is accepted instead of refused as stale
+(the #2198 F2 inverse-of-stale-RETAIN reasoning applied to config). The next
+config after a reconnect is always the peer's *current* config
+(`pushConfigToPeer` sends `ShowActive`), so the newest content still wins.
+
+**Wire compatibility.** #3931 deliberately does NOT bump
+`SessionSyncWireVersion`: the framing is additive and self-detecting via the
+magic, and that gate governs whether SESSIONS sync at all across a mixed-base
+pair — bumping it would break session sync for the whole mixed-version ISSU
+window (the #2239 lesson). The one asymmetric direction is a NEW sender's
+framed payload reaching a LEGACY receiver in the brief ISSU window: the old
+node treats the 16 trailing bytes as config text, its Junos parser rejects it,
+and the config-sync apply fails — the old node retains its current config
+(fail-safe, no crash, no divergence worse than today).
+
+The secondary's `OnConfigReceived` callback invokes `load override` + commit to
+apply the accepted config.
 
 ## IPsec SA Payload (Variable)
 
@@ -409,7 +458,7 @@ This is **additive** to the periodic sweep — it provides sub-millisecond sync 
 | DeleteV4/V6 | Lookup → delete reverse → delete dnat_table (SNAT) → delete forward |
 | BulkStart/End | Log markers; BulkEnd triggers `OnBulkSyncReceived` (releases VRRP sync hold) |
 | Heartbeat | No-op (resets read deadline) |
-| Config | `OnConfigReceived` callback (runs in goroutine) |
+| Config | Decode `(text, gen)` → enqueue on the single-consumer ordered apply queue (`configApplyLoop`); `admitConfigGen` drops out-of-order older gens, then `OnConfigReceived` applies (#3931) |
 | IPsecSA | Store names, call `OnIPsecSAReceived` |
 
 ### Session Reconstruction on Receiver
@@ -463,6 +512,7 @@ All counters are `atomic.Uint64` / `atomic.Bool`, lock-free:
 | DeletesReceived | Delete messages received |
 | BulkSyncs | Completed bulk sync operations |
 | ConfigsSent/Received | Config sync messages |
+| ConfigsStaleIgnored | Config messages dropped by the #3931 ordering guard (incoming generation not strictly newer than last-applied) |
 | IPsecSASent/Received | IPsec SA list messages |
 | Errors | Send failures, channel overflows, bad magic |
 | Connected | Peer TCP connection active |

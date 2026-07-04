@@ -328,6 +328,9 @@ func (m *Manager) FormatInformation() string {
 		}
 		fmt.Fprintf(&b, "  Configs sent:     %d\n", syncStats.ConfigsSent)
 		fmt.Fprintf(&b, "  Configs received: %d\n", syncStats.ConfigsReceived)
+		if syncStats.ConfigsStaleIgnored > 0 {
+			fmt.Fprintf(&b, "  Configs stale-dropped: %d\n", syncStats.ConfigsStaleIgnored)
+		}
 	} else {
 		fmt.Fprintln(&b, "  Not configured")
 	}
