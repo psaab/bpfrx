@@ -99,6 +99,46 @@ All heartbeat/sync liveness timestamps were also moved off wall-clock
 so NTP steps / VM pause-resume can no longer fire false peer-loss
 (#1792).
 
+### Addendum (#4033, 2026-07): heartbeat goroutine-leak / double-fire on comms restart
+
+Two coupled defects survived along the comms-restart path (transport
+config change → `stopClusterComms` → `startClusterComms`, and the
+`RestartHeartbeat` VRF-rebind path):
+
+1. **`StartHeartbeat` overwrote a running heartbeat without stopping it.**
+   It reassigned `m.hbSender` / `m.hbReceiver` and started fresh
+   goroutines while any previous sender+receiver were still running —
+   their `stopCh` was never closed, so they leaked and kept sending. A
+   second `StartHeartbeat` (a comms restart, or the daemon bind-retry
+   goroutine racing `RestartHeartbeat`) doubled the on-wire heartbeat
+   rate and leaked one goroutine set per restart. `StartHeartbeat` is now
+   **idempotent**: it tears down any running heartbeat (`StopHeartbeat` —
+   cancel + join) *before* installing the new pair, serialized by a
+   dedicated `hbStartMu` so two concurrent starts cannot interleave and
+   both install. Exactly one heartbeat goroutine set exists at a time.
+   `heartbeatSender.stop()` now also closes its send socket (previously
+   only the receiver closed its conn — the sender FD leaked on every
+   stop/restart).
+
+2. **The daemon bind-retry loop ignored the comms context.** The
+   `startClusterComms` heartbeat goroutine looped `for i:=0;i<30` with a
+   plain `time.Sleep(2s)` — it never observed `commsCtx`. On a comms
+   restart the old retry goroutine survived `stopClusterComms` (up to
+   30×2s = 60s), and could call `StartHeartbeat` *after* teardown,
+   installing a heartbeat into a dead comms lifecycle and racing the
+   replacement goroutine. The loop is now `startHeartbeatWithRetry(ctx,
+   …)`: every iteration checks `ctx.Err()` and every retry sleep uses
+   `sleepCtx(ctx, …)`, so a cancelled comms context makes the goroutine
+   exit promptly. Combined with (1)'s stop-previous, a comms restart
+   leaves exactly one retry goroutine and one heartbeat.
+
+RED-on-revert coverage: `TestStartHeartbeatStopsPreviousHeartbeat`
+(cluster — N sequential `StartHeartbeat` calls leave only the last pair
+running; all earlier pairs are stopped) and
+`TestStartHeartbeatWithRetryExitsMidRetryOnCancel` /
+`…ExitsBeforeStartOnCancel` (daemon — the retry loop exits on ctx
+cancel instead of spinning the full 60s budget).
+
 ---
 
 ## Bug 2: XSK Rebind EBUSY After RETH MAC Programming — FIXED

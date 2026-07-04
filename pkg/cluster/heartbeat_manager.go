@@ -15,7 +15,26 @@ import (
 // localAddr is the local control link IP, peerAddr is the peer control link IP.
 // vrfDevice is optional — if non-empty, sockets bind to that VRF device so
 // packets route through the correct table.
+//
+// StartHeartbeat is idempotent: a heartbeat that is already running is torn
+// down (cancel + join) BEFORE the new sender/receiver are installed, so
+// exactly one heartbeat goroutine set exists at a time. Without this a second
+// StartHeartbeat (e.g. a comms restart, or the daemon's bind-retry goroutine
+// racing RestartHeartbeat) would overwrite m.hbSender/m.hbReceiver and leak
+// the previous goroutines — their stopCh is never closed, so N restarts leak
+// N heartbeat goroutines and duplicate the on-wire heartbeat rate (#4033).
 func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
+	// Serialize the whole stop-previous + create + install sequence so
+	// concurrent callers cannot interleave and both install a heartbeat.
+	// hbStartMu is distinct from m.mu: StopHeartbeat below takes m.mu and
+	// joins goroutines that also take m.mu.
+	m.hbStartMu.Lock()
+	defer m.hbStartMu.Unlock()
+
+	// Stop any heartbeat that is already running before installing a new one.
+	// Safe to call unconditionally — it is a no-op when nothing is running.
+	m.StopHeartbeat()
+
 	m.mu.Lock()
 	interval := m.hbInterval
 	threshold := m.hbThreshold
@@ -90,6 +109,15 @@ func vrfListenConfig(vrfDevice string) net.ListenConfig {
 			return err
 		},
 	}
+}
+
+// HeartbeatRunning reports whether a heartbeat sender or receiver is currently
+// installed. Used by status reporting and to assert the idempotent
+// start/stop discipline (#4033).
+func (m *Manager) HeartbeatRunning() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hbSender != nil || m.hbReceiver != nil
 }
 
 // StopHeartbeat halts heartbeat sender and receiver goroutines.
