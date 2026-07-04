@@ -113,7 +113,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		ThreeColorPolicers:    buildThreeColorPolicerSnapshots(cfg),
 		ClassOfService:        buildClassOfServiceSnapshot(cfg),
 		FlowExport:            buildFlowExportSnapshot(cfg),
-		MirrorConfigs:         buildMirrorConfigSnapshotsFailClosed(cfg, interfaces),
+		MirrorConfigs:         buildMirrorConfigSnapshots(cfg, interfaces),
 		AddressBooks:          addressBooks,
 		AppCatalog:            appCatalog,
 		Config:                cfg,

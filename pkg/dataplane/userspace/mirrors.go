@@ -1,28 +1,29 @@
 package userspace
 
 import (
-	"fmt"
 	"log/slog"
 	"sort"
 
 	"github.com/psaab/xpf/pkg/config"
 )
 
-func buildMirrorConfigSnapshotsFailClosed(cfg *config.Config, interfaces []InterfaceSnapshot) []MirrorConfigSnapshot {
-	mirrors, err := buildMirrorConfigSnapshots(cfg, interfaces)
-	if err != nil {
-		// The mirror table contract is one output per ingress ifindex. Keep
-		// snapshot publication fail-closed by omitting an ambiguous mirror table
-		// if this helper is called on an invalid config.
-		slog.Warn("userspace snapshot: invalid port-mirroring config skipped", "err", err)
-		return nil
-	}
-	return mirrors
-}
-
-func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) ([]MirrorConfigSnapshot, error) {
+// buildMirrorConfigSnapshots resolves forwarding-options port-mirroring into
+// the per-ingress mirror table. The table contract is one output per ingress
+// ifindex, so a duplicate ingress ifindex (the same physical interface used as
+// an ingress source by more than one instance) or a negative sampling rate is
+// a SCOPE-DROP: the offending entry is skipped with a specific warning and the
+// remaining valid entries are still published (#3972). One typo must never
+// silently disable ALL mirroring.
+//
+// config.compilePortMirroring already HARD-REJECTS these cases at commit time,
+// so this scope-drop is defense-in-depth for a config that reaches the
+// snapshot builder without passing the commit gate (e.g. a stale on-disk
+// config written by an older build). It replaces the pre-#3972
+// whole-table-fail-closed-on-warn behavior that dropped every valid mirror
+// session on a single bad entry.
+func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []MirrorConfigSnapshot {
 	if cfg == nil || cfg.ForwardingOptions.PortMirroring == nil || len(cfg.ForwardingOptions.PortMirroring.Instances) == 0 {
-		return nil, nil
+		return nil
 	}
 	ifindexByName := make(map[string]int, len(interfaces))
 	for _, iface := range interfaces {
@@ -51,6 +52,13 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 			slog.Warn("port-mirroring instance has no output interface", "name", name)
 			continue
 		}
+		if inst.InputRate < 0 {
+			// A negative rate would wrap in uint32(inst.InputRate) below. Drop
+			// only this instance; the commit gate rejects it up front.
+			slog.Warn("port-mirroring: skipping instance with negative input rate",
+				"name", name, "rate", inst.InputRate)
+			continue
+		}
 		outputIfindex := ifindexByName[inst.Output]
 		if outputIfindex <= 0 {
 			outputIfindex = ifindexByName[config.LinuxIfName(inst.Output)]
@@ -72,10 +80,11 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 				continue
 			}
 			if previous, ok := seenIngress[ingressIfindex]; ok {
-				return nil, fmt.Errorf("duplicate port-mirroring ingress ifindex %d in instances %q and %q", ingressIfindex, previous, name)
-			}
-			if inst.InputRate < 0 {
-				return nil, fmt.Errorf("port-mirroring instance %q has negative input rate %d", name, inst.InputRate)
+				// One output per ingress ifindex: the first instance (sorted
+				// by name) owns it. Skip the conflicting entry, keep the rest.
+				slog.Warn("port-mirroring: skipping duplicate ingress interface (one output per ingress interface)",
+					"name", name, "interface", input, "ifindex", ingressIfindex, "owner", previous)
+				continue
 			}
 			seenIngress[ingressIfindex] = name
 			out = append(out, MirrorConfigSnapshot{
@@ -85,5 +94,5 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 			})
 		}
 	}
-	return out, nil
+	return out
 }
