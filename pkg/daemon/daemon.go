@@ -588,6 +588,29 @@ type Daemon struct {
 	// CURRENT active config (Store.ShowActive), not the stale boot file
 	// d.opts.ConfigFile (#3867).
 	archiveTransfer func(ctx context.Context, srcPath, dest string) error
+
+	// --- SNMP link-state monitor seams (#3950) ---
+	// linkStateSubscribe starts a netlink link-update subscription for the
+	// SNMP link-state monitor. It MUST stream updates to ch and close ch when
+	// the subscription ends (a receive error — including a recoverable
+	// ENOBUFS receive-buffer overflow — or done being closed), invoking onErr
+	// with the terminating receive error first (mirroring the
+	// netlink.LinkSubscribeOptions.ErrorCallback contract). nil ⇒ the real
+	// netlink subscription (defaultLinkStateSubscribe). Overridable so tests
+	// can drive the resilient resubscribe/re-sync loop with an injected
+	// ENOBUFS (#3950).
+	linkStateSubscribe func(ch chan<- netlink.LinkUpdate, done <-chan struct{}, onErr func(error)) error
+	// linkStateList enumerates current links for the boot seed and the
+	// post-ENOBUFS catch-up re-sync. nil ⇒ netlink.LinkList (#3950).
+	linkStateList func() ([]netlink.Link, error)
+	// linkStateEmit is invoked for every observed up/down transition (from a
+	// streamed event OR a post-resubscribe catch-up re-sync). nil ⇒ an SNMP
+	// linkUp/linkDown trap via d.snmpAgent. Overridable so tests can capture
+	// transitions without wiring an SNMP agent (#3950).
+	linkStateEmit func(index int, name string, up bool)
+	// linkStateResubBackoff is the delay between a subscription close and the
+	// resubscribe attempt. Zero ⇒ linkStateResubBackoffDefault (#3950).
+	linkStateResubBackoff time.Duration
 }
 
 func (d *Daemon) applyResult() *dataplane.ApplyResult {
