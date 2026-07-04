@@ -111,7 +111,9 @@ pub(in crate::afxdp) fn read_degraded_path_stats() -> Option<Vec<(String, u64)>>
     }
     let ncpus = ncpus as usize;
     let mut result = Vec::new();
-    for idx in 0u32..16 {
+    // Iterate the authoritative reason list rather than a hardcoded 16 so the
+    // scan cannot drift if a degraded-path reason is added or removed.
+    for idx in 0u32..DEGRADED_PATH_REASON_NAMES.len() as u32 {
         let mut values = vec![0u64; ncpus];
         let rc = unsafe {
             libbpf_sys::bpf_map_lookup_elem(

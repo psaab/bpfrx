@@ -32882,3 +32882,38 @@ top.
   - **File(s)**: pkg/cli/cli_show_system.go, pkg/cli/cli_show_services.go,
     pkg/cli/cli_show_snmp_community_redaction_4111_test.go,
     docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4113 follow-up — fix an UPGRADE BOOT-BRICK the F13 map-type
+    change introduced (Copilot MAJOR on PR #4136). userspace_fallback_stats
+    is a COLLECTION-PINNED shim map (userspacePinnedShimMaps ->
+    ms.Pinning=PinByName, pinned at ebpf.NewCollectionWithOptions,
+    loader_userspace_shim.go). Its pin persists on bpffs across a daemon
+    restart, so on an in-place upgrade the new daemon's PerCpuArray spec hits
+    the OLD daemon's stale Array pin -> PinByName compatibility check returns
+    ErrMapIncompatible -> the WHOLE shim collection load aborts ->
+    boot-brick (#1917/#1960 class). cleanupUserspaceShimLegacyOnlyMapPins only
+    removes xdp_progs/tc_progs/policer_states; the shared-map refuse-reset
+    path (loadOrCreatePinnedShimMapWith) does not cover this collection pin.
+    VERIFY: reproduced the brick under root — NewMapWithOptions(PerCpuArray,
+    PinByName) against a pre-pinned Array returns ErrMapIncompatible.
+    FIX (option a, targeted): reconcileDisposableCollectionPin() runs BEFORE
+    the collection load and drops ONLY this disposable counter pin when its
+    on-disk shape no longer matches the spec (disposablePinShapeMatches
+    compares type/key/value/entries). Safe because the counter resets on every
+    reload; DATA maps (sessions/conntrack/dnat) keep their #2360 refuse-reset.
+    A missing or already-migrated pin is left untouched so counters survive an
+    ordinary restart. Also folded Copilot comment-2: pin.rs
+    read_degraded_path_stats now iterates DEGRADED_PATH_REASON_NAMES.len()
+    instead of a hardcoded 0..16. VALIDATION: root-gated E2E
+    TestReconcileDisposableCollectionPinMigratesArrayToPerCPUArray asserts the
+    brick (ErrMapIncompatible), the reconcile reset, the successful
+    PerCpuArray recreate, and idempotency on a compatible pin (RED-on-revert:
+    reverting the reconcile leaves the stale pin -> load bricks). Pure unit
+    TestDisposablePinShapeMatches covers the decision. FULL cargo test
+    --release 3578 passed / 0 failed; go build ./..., go vet, full
+    pkg/dataplane tree green; gofmt/rustfmt clean. No shim source change this
+    round (no make generate; the .o is unchanged).
+  - **File(s)**: pkg/dataplane/loader_userspace_shim.go,
+    pkg/dataplane/userspace_shim_loader_test.go,
+    userspace-dp/src/afxdp/bpf_map/pin.rs, docs/in-place-upgrade.md, _Log.md

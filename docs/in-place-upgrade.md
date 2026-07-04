@@ -557,6 +557,35 @@ non-rolling release (image-replace both nodes). A pre-emptive guard would
 require the staged binary to report its protocol version to the driver
 before the first cut (future work).
 
+## Pinned BPF-map type/shape migration (shim collection pins)
+
+The retained AF_XDP shim pins several maps under `/sys/fs/bpf/xpf` via the
+collection load (`PinByName`, `loader_userspace_shim.go`). These pins live on
+bpffs and PERSIST across a daemon restart, so on an in-place upgrade the new
+daemon inherits the OLD daemon's pins. cilium/ebpf's `PinByName` load runs a
+compatibility check against each existing pin; if the new spec's type or shape
+differs, it returns `ErrMapIncompatible` and the WHOLE shim collection load
+aborts — a boot-brick on upgrade (#1917/#1960 class).
+
+Two disciplines apply, split by whether the map holds recoverable state:
+
+- **DATA maps** (sessions, conntrack, dnat) go through
+  `loadOrCreatePinnedShimMapWith`, which deliberately **REFUSES** to reset an
+  incompatible pin (#2360). A silent reset would drop live sessions, so an
+  incompatible DATA-map pin is a loud failure requiring operator action
+  (image-replace, not rolling).
+- **DISPOSABLE maps** — degraded-path counters (`userspace_fallback_stats` /
+  `degraded_path_counters`) that reset to zero on every reload — are reconciled
+  by `reconcileDisposableCollectionPin` BEFORE the collection load: a stale
+  pin whose shape no longer matches (e.g. #4113 changed this map from `Array`
+  to `PerCpuArray`) is dropped so the load recreates it fresh. Losing the old
+  counts on the one-time migration is acceptable; a missing or already-migrated
+  pin is left untouched, so counters survive an ordinary restart.
+
+When bumping a shim map's type/size, decide which bucket the map is in. A DATA
+map bump is a non-rolling release; a disposable-counter bump is handled by the
+reconcile above (extend it only for maps whose loss is truly safe).
+
 ## Honest limits
 
 - **No true zero-gap standalone restart.** The helper is an `exec.Command`
