@@ -1,3 +1,32 @@
+## 2026-07-04 — #3860: warn at commit when a scheduler defines no window
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (113a1a0aa). Confirmed a degenerate
+    scheduler with no effective window (empty `scheduler x {}` or a bare
+    `daily;` — no start/stop time, no `all-day`, no per-day arm, no
+    start/stop date) compiles (`compileSchedulers`,
+    `pkg/config/compiler_system.go:1084`) to a `SchedulerConfig` with every
+    window field zero and NO commit warning. Post-#3849/#3858 the runtime
+    (`pkg/scheduler.isWithinWindow:278`) fail-closes such a scheduler to
+    INACTIVE (the security half of #3849; helpers `schedulerHasTimeWindow`
+    / `schedulerHasDateRange`). Only half-windows and unparseable
+    times/dates log today — the fully-degenerate always-on→INACTIVE flip
+    was silent. FIX: added a commit-time WARNING in `ValidateConfig`
+    (`pkg/config/compiler_validate_warn.go`) that iterates schedulers by
+    sorted name and, when `schedulerHasEffectiveWindow` is false, appends
+    `scheduler "X" defines no time window; policies bound to it will be
+    INACTIVE (use `+"`daily all-day`"+` for always-on)`. Warning, not
+    hard-reject (#1960-safe: degenerate scheduler is legal Junos; an
+    upgrade must not refuse an existing candidate). A scheduler with any
+    daily/weekday arm, `all-day`, or start/stop date does NOT warn.
+  - **File(s)**: pkg/config/compiler_validate_warn.go,
+    pkg/config/compiler_validate_scheduler_no_window_3860_test.go,
+    pkg/scheduler/README.md, _Log.md
+  - **Validation**: RED-on-revert proven (neutralizing the warn loop makes
+    the 3 no-window cases fire zero warnings → FAIL; has-window cases stay
+    green). `go test ./pkg/config/...` green, `go build ./...` clean,
+    gofmt clean, `go vet ./pkg/config/` clean.
+
 ## 2026-07-04 — #3881: hierarchical inline-keys static route drops `interface` modifier
 
 - **Timestamp**: 2026-07-04
