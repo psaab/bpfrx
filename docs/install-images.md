@@ -112,10 +112,8 @@ Pipeline (offline — the image is never booted to provision it):
 5. `virt-sysprep` seal: machine-id, ssh host keys, logs, tmp files,
    bash history, package caches, random seed; `/etc/xpf` factory-empty.
 6. Export compressed qcow2 + incus metadata tarball + the per-version
-   `xpf-<ver>.SHA256SUMS` manifest, minisign-signed to
-   `xpf-<ver>.SHA256SUMS.minisig` when `XPF_SIGN_SECKEY` (a path) is set
-   (#1924). An unsigned dev bake warns "not publishable"; `make dist-publish`
-   refuses it.
+   `xpf-<ver>.SHA256SUMS` checksum manifest. The manifest is NOT signed
+   yet — signing is deferred to AFTER the validation gate (step 8, #4017).
 7. **Validation gate** (default on): the image is imported into local
    incus and the FULL first-boot matrix runs — factory boot (fxp0
    DHCP, sshd posture via `sshd -T`, -generic kernel flavor + full
@@ -125,6 +123,15 @@ Pipeline (offline — the image is never booted to provision it):
    verifier-failing shim (#1864/#1869 discipline). Use
    `--skip-validate` only for iteration; such artifacts are not
    publishable.
+8. **Sign — ONLY after validation passes (#4017):** the SHA256SUMS
+   manifest is minisign-signed to `xpf-<ver>.SHA256SUMS.minisig` when
+   `XPF_SIGN_SECKEY` (a path) is set (#1924). A signature is a TRUST
+   artifact — downstream publish (`scripts/dist/publish.py`) and
+   operators read a signed image as a validated one (#1864 secure-boot
+   chain) — so signing runs strictly AFTER the gate. A bake that FAILS
+   validation exits non-zero at step 7 and leaves NO `.minisig` behind:
+   there is never a signed-but-invalid image. An unsigned dev bake warns
+   "not publishable"; `make dist-publish` refuses it.
 
 Each bake also writes `dist/xpf-<ver>.manifest` recording the exact
 inputs (base image URL + release + verified SHA256, git commit, bake
