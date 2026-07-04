@@ -1,3 +1,52 @@
+## 2026-07-03 — #3968: non-exact CoS shaper path (`build_cos_batch_from_queue`) never cleared `pop_snapshot_stack` across batches → committed-batch snapshots accumulated on the hot path → unbounded scratch growth (realloc / stale re-read past the TX_BATCH_SIZE bound)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-078 (MEDIUM, Rust dataplane —
+    reused-scratch-not-cleared). The MQFQ pop
+    (`cos_queue_pop_known_bucket_inner`) pushes a rollback snapshot onto
+    the per-queue `FlowFairState::pop_snapshot_stack` (bounded to
+    `TX_BATCH_SIZE`). A partial-commit `cos_queue_push_front` pops one per
+    RETRIED item, but a whole-batch commit consumes none —
+    `restore_cos_local_items_inner` push_fronts only retried items — so a
+    fully-committed batch leaves ALL its snapshots resident. The EXACT
+    drains (`drain_exact_{local,prepared}_items_to_scratch_flow_fair`,
+    `queue_service/drain.rs:162,461`) clear the stack at batch start; the
+    NON-exact `build_cos_batch_from_queue` (`queue_service/mod.rs`) did
+    NOT. `drain_shaped_tx` builds one non-exact batch per call and the
+    outer TX loop calls it repeatedly, so a saturated promoted non-exact
+    flow-fair queue with more than `TX_BATCH_SIZE` resident items is
+    drained across consecutive builds with NO intervening
+    `cos_queue_push_back` (the only other clear site). Each build then
+    pushed on top of the prior batch's stale snapshots, growing the stack
+    past its documented bound (hot-path realloc / stale re-read; the
+    per-pop `debug_assert` trips in dev builds).
+  - **Fix**: `build_cos_batch_from_queue` now clears
+    `pop_snapshot_stack` unconditionally at entry (guarded by
+    `flow_fair_state.as_mut()`), mirroring the exact drains. Safe because
+    the previous batch's submit and its synchronous rollback complete
+    before the next build, so no live snapshot is dropped.
+  - **Audit**: swept sibling reused scratch in the same hot path. The
+    only reused scratch Vec on the `build_cos_batch_from_queue` path is
+    `pop_snapshot_stack`; the submit sidecars (`sidecar`, `enq_sidecar`)
+    are fresh stack arrays, and `scratch_{local,prepared}_tx` /
+    `shared_recycles` are caller-owned and cleared by their callers. No
+    other missing-clear found.
+  - **Test**: added
+    `build_cos_batch_clears_pop_snapshot_stack_across_batches`
+    (`queue_service/tests.rs`) — two sequential builds on a saturated
+    promoted non-exact flow-fair queue (full commit, no push_back
+    between); asserts the second batch's stack holds ONLY its own 64
+    snapshots (len == batch2, capacity == TX_BATCH_SIZE, no realloc).
+    RED-on-revert: without the clear the second stack held 128 (64 stale
+    + 64 new) in release; the per-pop `debug_assert` panics in dev.
+  - **Validation**: FULL `cargo test --release --test-threads=1` green
+    (main bin 3461 passed / 0 failed / 2 ignored; all integration suites
+    green). `go build ./...` clean. rustfmt touched only the added lines
+    (no blanket-format; pre-existing master drift left untouched).
+  - **File(s)**: `userspace-dp/src/afxdp/cos/queue_service/mod.rs`,
+    `userspace-dp/src/afxdp/cos/queue_service/tests.rs`,
+    `userspace-dp/src/afxdp/cos/README.md`, `_Log.md`
+
 ## 2026-07-03 — #3962: buildScreenSnapshots ranged the zones map in nondeterministic order → wire byte order varied per build → snapshotContentHash dedup missed → dataplane re-applied the screen config on every reconcile
 
 - **Timestamp**: 2026-07-03

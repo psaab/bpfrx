@@ -144,6 +144,19 @@ mod.rs for further file-level breakdown.
   runnable now or a parked queue's wake tick is due. Not-yet-due
   parked queues skip timer-wheel advance and shared-root lease top-up
   because no queue can service on that drain call.
+- **Pop-snapshot stack is cleared at batch start on BOTH drain paths
+  (#785 exact, #3968 non-exact).** Each MQFQ pop pushes a rollback
+  snapshot onto the per-queue `FlowFairState::pop_snapshot_stack`
+  (bounded to `TX_BATCH_SIZE`); a partial-commit `cos_queue_push_front`
+  pops one per RETRIED item, but a whole-batch commit consumes none and
+  leaves the batch's snapshots resident. `cos_queue_push_back` clears
+  them on the next enqueue, but a saturated queue is drained across
+  consecutive batches with no intervening enqueue. So every batch build
+  clears the stack at entry: the exact drains
+  (`drain_exact_{local,prepared}_items_to_scratch_flow_fair`) and the
+  non-exact `build_cos_batch_from_queue`. Any snapshots resident at
+  build entry belong to an already-submitted batch and are stale — the
+  submit and its synchronous rollback completed before the next build.
 - Scheduler-map queues without a positive explicit scheduler
   `transmit-rate` are residual-only under a shaped root. They keep an
   effective rate for burst sizing and surplus weight, but
