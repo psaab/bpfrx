@@ -1,3 +1,32 @@
+## 2026-07-03 — #4005: `monitor traffic matching "<filter>"` truncated the pcap filter to the first token
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-022 (MEDIUM, CLI — wrong packet capture
+    filter). `monitor traffic interface <if> matching "tcp port 80"` captured
+    on just `tcp`, silently dropping `port 80` — any multi-token BPF filter
+    (`host 10.0.0.1 and port 443`, `udp and not port 53`) was reduced to its
+    first whitespace token, so the operator's diagnostic capture showed far
+    more traffic than requested. Root cause: the operational CLI tokenizes the
+    command line with `strings.Fields` (cli_dispatch.go), which splits on
+    whitespace and does NOT honor shell quoting, so a quoted filter reaches
+    `handleMonitorTraffic` as separate tokens (`"tcp`, `port`, `80"`). The old
+    `case "matching"` read only `args[i+1]` (the first token, with a literal
+    quote) and let the rest fall through the switch and be discarded.
+  - **Fix**: extracted `parseMonitorTrafficArgs` — the `matching` clause is now
+    greedy: it consumes every following token up to the next recognized option
+    keyword (`interface`/`count`, none of which are pcap primitives), joins
+    them into one filter expression, and strips a single balanced layer of
+    surrounding quotes via `stripSurroundingQuotes`. `buildMonitorTrafficArgv`
+    passes the full filter to tcpdump as trailing argv tokens exactly as
+    libpcap consumes a filter. A `count` following the filter is no longer
+    swallowed; a single-token filter (`icmp`) and and/or/not operators are
+    preserved verbatim.
+  - **File(s)**: pkg/cli/cli_request.go, docs/bugs.md,
+    pkg/cli/monitor_traffic_filter_4005_test.go (RED-on-revert: reverting the
+    parse to the first-token read drops `port 80` — filter=`"tcp` — and the
+    argv places only `"tcp` after the interface flags). go test ./pkg/cli/...
+    green; go build ./... green; gofmt clean.
+
 ## 2026-07-03 — #4000: bare `commit` during a pending confirm window silently dropped newly-staged edits
 
 - **Timestamp**: 2026-07-03
