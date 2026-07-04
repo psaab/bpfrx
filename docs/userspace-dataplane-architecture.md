@@ -231,9 +231,10 @@ mandatory BPF map FDs**:
 - The **full forwarding-state build** runs in the same preflight, also
   **before** `tear_down` (#2484). The top-of-reconcile policy preflight
   only parses the policy/address-book state, so snapshot INTEGRITY faults
-  reachable only inside the full build — `Nat64UnparseableRule`, NPTv6 /
-  static-NAT integrity faults from
-  `build_forwarding_state_with_policy_counters_and_previous` — used to
+  reachable only inside the full build — `Nptv6UnparseableRule`, NPTv6
+  overlap / unresolvable-zone integrity faults from
+  `build_forwarding_state_with_policy_counters_and_previous` (NAT64 is
+  fail-scoped per #3888 and no longer aborts) — used to
   surface *inside* `apply_snapshot`, after teardown had already stopped the
   workers and reset `coord.validation` / `shared_validation`. They are now
   detected by `snapshot::build_reconcile_forwarding` in the preflight: on

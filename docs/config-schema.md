@@ -3622,16 +3622,21 @@ match/prefix reject + parseable host/​block still-compile + lenient-warn). Lik
 A NAT64 rule-set `prefix` (`security nat nat64 rule-set <r> prefix <p>`) is read
 verbatim into the wire snapshot (`compileNAT64` in `compiler_nat.go` →
 `NAT64RuleSnapshot.Prefix` via `buildNAT64Snapshots`) and parsed at dataplane
-apply by `Nat64State::try_from_snapshots` (`userspace-dp/src/nat64.rs`). That
+apply by `Nat64State::from_snapshots` (`userspace-dp/src/nat64.rs`). That
 **/96-integrity check** requires an IPv6 `<address>/96`: it splits the string on
 `/`, the token after the first `/` MUST parse as a decimal `96` (only `/96` is
 supported by the translator), and the address token before the `/` MUST parse as
 an `Ipv6Addr`. Anything else — a non-`/96` length, a missing/garbage mask, or a
-non-IPv6 / malformed address — makes `try_from_snapshots` return a
-`SnapshotIntegrityError`, which propagates via `?` out of
-`build_reconcile_forwarding` and **aborts the ENTIRE forwarding rebuild WITHOUT
-publishing**. The dataplane is then frozen at the last-good snapshot: every later
-commit (new sessions, policy, NAT) silently stops reaching the dataplane. The
+non-IPv6 / malformed address — makes `from_snapshots` SKIP the offending NAT64
+rule (logging a loud one-line warning) and publish the rest (#3888, fail-scoped).
+**Pre-#3888** the fallible `try_from_snapshots` instead returned a
+`SnapshotIntegrityError` that propagated via `?` out of
+`build_reconcile_forwarding` and **aborted the ENTIRE forwarding rebuild WITHOUT
+publishing** — the dataplane was then frozen at the last-good snapshot and every
+later commit (new sessions, policy, NAT) silently stopped reaching the dataplane.
+#3888 scopes that runtime blast radius to the one bad NAT64 rule; the commit gate
+below remains the primary defense so a bad prefix is rejected before it is ever
+emitted. The
 `prefix` `setSchema` leaf (`schema_security.go`) carries no `keyValidator`
 (unlike the RA `nat-prefix`/`nat64prefix` leaves, whose `ValidatePREF64CIDR`
 accepts the broader RFC 8781 `{32,40,48,56,64,96}` set — WRONG for a NAT64
@@ -3657,15 +3662,17 @@ is rejected at commit — no commit-accept → runtime-abort gap.
   downgrades to a `cfg.Warnings` entry so a node that committed a bad NAT64
   prefix BEFORE this gate existed (or a peer-synced config) still BOOTS after
   upgrade instead of failing closed (#1960 fail-closed-on-compile-failure). The
-  Rust helper's own `try_from_snapshots` backstop keeps the previous live
-  forwarding state, so a leniently-loaded bad prefix is inert — and the
-  operator's next strict commit rejects it loudly.
+  Rust helper's own `from_snapshots` backstop (#3888) SKIPS the bad NAT64 rule
+  and publishes the rest, so a leniently-loaded bad prefix degrades NAT64 only
+  (not the whole dataplane) — and the operator's next strict commit rejects it
+  loudly.
 
-> Defense-in-depth follow-up (not fixed here): even with the commit gate, a bad
-> NAT64 prefix arriving via HA peer-sync/lenient still makes the Rust
-> `try_from_snapshots` reject the WHOLE forwarding snapshot rather than skipping
-> just the bad NAT64 rule and publishing the rest. Scoping the Rust rejection to
-> the offending rule is a larger `userspace-dp` change tracked separately.
+> Defense-in-depth follow-up (DONE in #3888): a bad NAT64 prefix arriving via HA
+> peer-sync/lenient — a path the commit gate does not cover — now makes the Rust
+> `from_snapshots` SKIP just the offending NAT64 rule and publish the rest,
+> rather than aborting the WHOLE forwarding rebuild. NPTv6 intentionally stays
+> abort-all (its #2241 overlap rejection is order-dependent, so a blind per-rule
+> skip would be ambiguous) — a flagged follow-up, out of #3888 scope.
 
 Regression coverage: `pkg/config/compiler_nat64_prefix_test.go` (well-known
 `64:ff9b::/96` + `/96` NSP accept; non-`/96` lengths, missing mask, garbage

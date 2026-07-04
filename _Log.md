@@ -33222,3 +33222,42 @@ top.
     pkg/config/compiler_security_log.go,
     pkg/config/compiler_security_flow.go,
     pkg/config/compiler_security_alg.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3888 — NAT64 `from_snapshots` fail-SCOPED (skip-and-continue)
+    instead of aborting the whole forwarding rebuild. Defense-in-depth Rust half
+    of #3886. `Nat64State::try_from_snapshots` was fallible (`-> Result`) and its
+    4 `return Err(Nat64UnparseableRule)` sites (empty prefix / non-`/96` / bad
+    prefix addr / bad pool entry) propagated via `?` out of
+    `build_reconcile_forwarding` (forwarding_build/mod.rs), aborting the ENTIRE
+    forwarding snapshot — so ONE malformed NAT64 rule from a mixed-version HA
+    peer-sync or a lenient/corrupt snapshot (paths the Go #3886 commit gate does
+    not cover) froze the whole control→dataplane pipeline (every later commit
+    stopped reaching the dataplane). FIX: renamed to infallible
+    `Nat64State::from_snapshots(-> Self)` mirroring the sibling
+    `DnatTable::from_snapshots` skip-and-continue posture (#1960 lenient-load
+    doctrine); each of the 4 sites now `eprintln!("xpf nat64: skipping malformed
+    rule ...")` + skips the WHOLE rule (labeled `continue 'rules` for the bad
+    pool entry so the pool is dropped all-or-nothing, NOT narrowed — preserves
+    #2212 anti-silent-narrowing intent) and publishes the remaining NAT64 rules
+    plus every other rule type. Dropped the `?` at the call site. Removed the
+    now-dead `SnapshotIntegrityError::Nat64UnparseableRule` variant + its Display
+    arm (its "refusing to fail open by dropping the rule" text was contradicted
+    by the new behavior) and the redundant `#[cfg(test)]` `from_snapshots`
+    wrapper. NPTv6 stays fail-CLOSED (abort-all) — its #2241 overlap rejection is
+    order-dependent so a blind per-rule skip is ambiguous (flagged follow-up, out
+    of scope). Re-pointed the #2484 coordinator pre-teardown-preflight regression
+    test (`reconcile_snapshot_integrity_error_preserves_prior_generation_and_state`)
+    from a bad NAT64 empty-prefix seam to a bad NPTv6 internal-prefix seam (NAT64
+    no longer produces an integrity Err). Flipped the 5 nat64_tests.rs
+    `expect_err` tests to assert the skip (rule absent, 0 prefixes) and added
+    `nat64_mixed_good_bad_good_publishes_good_rules` as the RED-on-revert guard
+    ([good,bad,good] publishes 2, bad skipped). Docs: nat64.rs module +
+    fn docs, src/FEATURES.md, docs/config-schema.md (#3886 section — follow-up
+    now DONE), docs/userspace-dataplane-architecture.md.
+  - **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/policy.rs,
+    userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+    userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+    userspace-dp/src/afxdp/coordinator/tests.rs, userspace-dp/src/FEATURES.md,
+    docs/config-schema.md, docs/userspace-dataplane-architecture.md, _Log.md
