@@ -354,6 +354,19 @@ owned by the `journal/` subpackage.
   commit and leaked config content (incl. secrets) into a 0644 file.
   Full trees live in the rollback files (above), which remain the
   canonical config history.
+- **`system_action` entries (#4108 F8)** — `Store.LogSystemAction(verb)`
+  appends a `{action: "system_action", detail: <verb>}` record for the
+  destructive maintenance verbs `reboot`/`halt`/`power-off`/`zeroize`
+  (written by `grpcapi.Server.SystemAction` BEFORE the action runs). The
+  append is fsynced, so the record is durable on disk before the box goes
+  down or the config is wiped — the `slog.Warn` line only reaches
+  journald, which does not survive a `zeroize`. The journal file itself
+  survives a `zeroize`: `.config.journal` neither ends in `.conf` nor
+  starts with `rollback`, so it is not in the wipe's removal set.
+  `system_action` is deliberately EXCLUDED from `ListCommitHistory`
+  (`show system commit` shows config commits only). The local gRPC
+  transport is unauthenticated, so no operator identity is attributed —
+  action + timestamp is the best-effort record.
 - **`config_hash`** — sha256 hex of the post-action active tree's
   `Format()` text, the same text `saveRollbackFiles` writes: while a
   slot is retained, `sha256sum <config>.N` correlates the rollback

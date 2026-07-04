@@ -524,6 +524,32 @@ func (s *Store) ListCommitHistory(limit int) ([]*JournalEntry, error) {
 	return commits, nil
 }
 
+// LogSystemAction appends a `system_action` audit entry (action name +
+// timestamp) to the commit journal and fsyncs it (#4108 F8). It is the
+// tamper-evident record for the destructive maintenance verbs — reboot,
+// halt, power-off, zeroize — which otherwise leave NO durable trail: the
+// slog.Warn line goes to journald, which does not survive a zeroize, so
+// post-incident attribution had nothing to read.
+//
+// The caller MUST invoke this BEFORE running the action, because the append
+// is synchronous and fsynced (journal.Log), so the record is durable on disk
+// before the box goes down or the config is wiped. The journal file itself
+// (`.config.journal`) also survives a zeroize: it neither ends in `.conf` nor
+// starts with `rollback`, so it is not in the zeroize removal set — belt and
+// braces on top of the pre-execution fsync.
+//
+// Journaling must never block a confirmed power/wipe action, so an append
+// failure is warned (journalLog), not returned. Detail carries the action
+// name; the local gRPC transport is unauthenticated (127.0.0.1, trusted) so
+// no operator identity is available to attribute — action + timestamp is the
+// best-effort record.
+func (s *Store) LogSystemAction(action string) {
+	s.journalLog(&JournalEntry{
+		Action: "system_action",
+		Detail: action,
+	})
+}
+
 // CommitDiffSummary returns a human-readable summary of changes between
 // the active and candidate configs. Must be called while in config mode.
 func (s *Store) CommitDiffSummary() string {
