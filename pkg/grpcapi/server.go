@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
@@ -252,8 +255,17 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 		return
 	}
 
+	// #4122: the fabric listener is the ONLY network-exposed gRPC surface
+	// (the loopback Run() listener binds 127.0.0.1). Fail-close it to the
+	// exact set of read/monitor RPCs the peer actually proxies over the
+	// fabric; the allowlist interceptors run BEFORE the handler so
+	// destructive RPCs (Commit/Delete/Rollback, SystemAction{zeroize,
+	// reboot,halt,power-off}) are rejected with PermissionDenied and never
+	// reach a handler. The loopback listener is left UNCHANGED (127.0.0.1 is
+	// the trusted local surface, full service).
 	srv := grpc.NewServer(
-		grpc.UnaryInterceptor(s.configLockInterceptor),
+		grpc.ChainUnaryInterceptor(s.fabricAllowlistUnaryInterceptor, s.configLockInterceptor),
+		grpc.ChainStreamInterceptor(s.fabricAllowlistStreamInterceptor),
 	)
 	pb.RegisterBpfrxServiceServer(srv, s)
 
@@ -266,6 +278,100 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 
 	<-ctx.Done()
 	srv.GracefulStop()
+}
+
+// fabricAllowedUnaryMethods is the fail-closed allowlist (#4122) of unary RPCs
+// the cluster fabric listener serves. Every entry is a method the local node
+// actually proxies to its peer over the fabric link — see the
+// dialPeer()->NewBpfrxServiceClient call sites in server_show_forwarding.go
+// (ShowText), server_sessions.go (GetSessions, GetSessionSummary,
+// GetZonePairSummary, ClearSessions), and server_diag.go dialPeer() itself
+// (GetStatus health probe). Any unary method NOT in this set is rejected with
+// PermissionDenied — so Commit, Delete, Rollback, and the whole config-mode
+// surface are unreachable on the network-exposed fabric IP.
+//
+// SystemAction is deliberately absent: it multiplexes fabric-safe cross-node
+// cluster-failover with destructive node actions (zeroize/reboot/halt/
+// power-off) under ONE gRPC method, so a method-name allowlist that included it
+// would still expose zeroize. It is gated separately, by request-action, in
+// isFabricSafeSystemAction.
+var fabricAllowedUnaryMethods = map[string]bool{
+	pb.BpfrxService_GetStatus_FullMethodName:          true,
+	pb.BpfrxService_GetSessions_FullMethodName:        true,
+	pb.BpfrxService_GetSessionSummary_FullMethodName:  true,
+	pb.BpfrxService_GetZonePairSummary_FullMethodName: true,
+	pb.BpfrxService_ShowText_FullMethodName:           true,
+	pb.BpfrxService_ClearSessions_FullMethodName:      true,
+}
+
+// fabricAllowedStreamMethods is the fail-closed allowlist (#4122) of streaming
+// RPCs the fabric listener serves. Only MonitorInterface is proxied
+// (proxyMonitorInterface in server_diag.go).
+var fabricAllowedStreamMethods = map[string]bool{
+	pb.BpfrxService_MonitorInterface_FullMethodName: true,
+}
+
+// isFabricSafeSystemAction reports whether a SystemAction request carries one of
+// the two cross-node cluster-failover actions the peer legitimately proxies over
+// the fabric (proxyPeerSystemAction call sites in server_diag.go):
+//
+//	"cluster-failover-data:node<N>"        — request chassis cluster failover ... node <N>
+//	"cluster-failover:<rgID>:node<N>"      — request chassis cluster failover redundancy-group <rg> node <N>
+//
+// These re-balance redundancy-group ownership — an operation squarely within the
+// fabric peer's trust boundary (coordinating RG ownership is the fabric's job).
+// Every other action — zeroize, reboot, halt, power-off, and the local-only
+// clear-* / cluster-failover-reset verbs — returns false and is denied on the
+// fabric listener. Node-local execution via the trusted loopback listener is
+// unaffected: an operator SSHed into the target node still runs any action.
+//
+// This is the nested-action choice over a blanket SystemAction exclusion:
+// excluding SystemAction entirely would make a cross-node `request chassis
+// cluster failover ... node <peer>` return PermissionDenied when the initiating
+// node proxies it, regressing a shipped HA operator workflow. Allowing ONLY the
+// two failover forms preserves that flow while keeping node-lifecycle actions
+// (zeroize/reboot/...) off the unauthenticated fabric surface.
+func isFabricSafeSystemAction(req interface{}) bool {
+	sa, ok := req.(*pb.SystemActionRequest)
+	if !ok {
+		return false
+	}
+	action := sa.GetAction()
+	if strings.HasPrefix(action, "cluster-failover-data:node") {
+		return true
+	}
+	if strings.HasPrefix(action, "cluster-failover:") && strings.Contains(action, ":node") {
+		return true
+	}
+	return false
+}
+
+// fabricAllowlistUnaryInterceptor fail-closes unary RPCs on the cluster fabric
+// listener (#4122): only the peer-proxied read/monitor RPCs
+// (fabricAllowedUnaryMethods) plus the two cross-node cluster-failover
+// SystemAction forms (isFabricSafeSystemAction) are served; every other method
+// is rejected with PermissionDenied before the handler runs. The loopback
+// listener does NOT install this interceptor and keeps the full service.
+func (s *Server) fabricAllowlistUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	if fabricAllowedUnaryMethods[info.FullMethod] {
+		return handler(ctx, req)
+	}
+	if info.FullMethod == pb.BpfrxService_SystemAction_FullMethodName && isFabricSafeSystemAction(req) {
+		return handler(ctx, req)
+	}
+	slog.Warn("fabric gRPC listener denied non-allowlisted method", "method", info.FullMethod)
+	return nil, status.Errorf(codes.PermissionDenied, "method %s is not permitted on the cluster fabric listener", info.FullMethod)
+}
+
+// fabricAllowlistStreamInterceptor fail-closes streaming RPCs on the fabric
+// listener (#4122): only MonitorInterface (fabricAllowedStreamMethods) is
+// served; every other stream is rejected with PermissionDenied.
+func (s *Server) fabricAllowlistStreamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	if fabricAllowedStreamMethods[info.FullMethod] {
+		return handler(srv, ss)
+	}
+	slog.Warn("fabric gRPC listener denied non-allowlisted stream method", "method", info.FullMethod)
+	return status.Errorf(codes.PermissionDenied, "stream method %s is not permitted on the cluster fabric listener", info.FullMethod)
 }
 
 // configLockInterceptor auto-releases stale config locks when a gRPC client
