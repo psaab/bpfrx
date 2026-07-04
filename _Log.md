@@ -33,6 +33,100 @@
     "NOT bounded by a total-entry cap" note).
   - **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_sizecap_3934_test.go,
     pkg/feeds/README.md, _Log.md
+## 2026-07-03 — #3931: cluster config-sync applied via unordered goroutines with no sequence number → a rapid commit pair could leave the standby on the OLDER config (no alarm)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-156 (MEDIUM, HA config divergence). Config
+    sync applied the received config via a racing `go OnConfigReceived(...)`
+    goroutine per message (`sync_conn.go`, `syncMsgConfig` handler) with NO
+    sequence number / generation on the config-sync wire. A rapid commit pair
+    (C1 then C2) spawned two goroutines that could race: if the C1-apply ran
+    after the C2-apply, the standby ended on the OLDER C1 while the primary was
+    on C2 → the nodes DIVERGED with no alarm; on failover the standby served
+    the stale C1. Unlike the session-install path (#2170 gen-guard), config
+    sync had no ordering guard.
+  - **Fix**: (1) Wire — the config-sync payload now carries a monotonic config
+    generation as a trailing 16-byte framing
+    `[config text][configGenMagic (8)][gen u64 LE (8)]` (`encodeConfigPayload`/
+    `decodeConfigPayload`, `sync_protocol.go`). The magic (`\x00\xffxpfCG\x00`)
+    is non-printable so it cannot collide with Junos config text; a payload
+    without it is a legacy sender's raw text and decodes with gen=0 (applied
+    unconditionally). The sender (`QueueConfig`) stamps a strictly-monotonic
+    gen from `configGenCounter` (seeded from CLOCK_MONOTONIC nanos, same
+    cross-boot reasoning as the session `genCounter`). (2) Ordering + serialize
+    — the handler no longer spawns a racing goroutine; it enqueues
+    `{gen, text}` onto a bounded single-consumer queue (`configApplyCh`) drained
+    by `configApplyLoop` (started in `Start`). The receiveLoop is
+    single-threaded per connection, so this preserves receive order; the
+    non-blocking enqueue never stalls session sync / heartbeats behind a slow
+    apply. `admitConfigGen` applies a config only if its gen is strictly newer
+    than `lastAppliedConfigGen` (or gen=0 legacy); an out-of-order older config
+    is dropped with an alarm and counted in `ConfigsStaleIgnored`. The standby
+    always converges to the newest config. `resetRecvGen` (BulkStart) also
+    zeroes `lastAppliedConfigGen` so a rebooted primary's lower-seeded counter
+    is accepted, not refused as stale (#2198 F2 reasoning applied to config).
+    Deliberately NO `SessionSyncWireVersion` bump — the framing is additive and
+    self-detecting (the #2239 lesson); the only degraded direction is a new
+    sender → legacy receiver in the brief ISSU window, which fails SAFE (old
+    node's parser rejects the framing bytes → keeps its current config).
+  - **Test**: `pkg/cluster/sync_config_gen_test.go` — wire round-trip +
+    legacy/short/empty decode, `admitConfigGen` monotonic + legacy-unconditional
+    + reset, and the end-to-end RED-on-revert
+    `TestConfigSyncOrderedApplyDropsReorderedOlder` (delivers C2 then C1 →
+    standby ends on C2, drops stale C1, `ConfigsStaleIgnored=1`). RED-on-revert
+    VERIFIED: neutralizing `admitConfigGen` to always-accept makes the standby
+    end on the older C1 (`applied=[C2 C1]`) → test fails. `go test -race
+    ./pkg/cluster/...` and `go test ./pkg/daemon/...` green; `go build ./...`,
+    `go vet ./pkg/cluster/...`, gofmt clean.
+  - **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/sync_conn.go`,
+    `pkg/cluster/sync_protocol.go`, `pkg/cluster/status.go`,
+    `pkg/cluster/sync_config_gen_test.go`, `docs/sync-protocol.md`,
+    `docs/feature-coverage.md`, `_Log.md`
+  - **Validation flag**: test-failover WARRANTED (HA config convergence) —
+    parent batch-validates on the loss userspace cluster with the
+    force-node0-primary gate.
+## 2026-07-03 — #3929: session-count stats (SessionCount + xpf_sessions_active/established) permanently 0 on the userspace dataplane
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-051 (MEDIUM, observability). `SessionCount`
+    (gRPC `GetStatus`, REST `/status`) and the Prometheus
+    `xpf_sessions_active`/`xpf_sessions_established` gauges were sourced from
+    `gc.Stats().TotalEntries`/`EstablishedSessions`. On the userspace dataplane
+    (the only live forwarding path since #1476) the BPF GC sweep is skipped
+    (#333), so `gc.Stats()` session counts are permanently 0 — active-session
+    metrics/dashboards/alerts read a constant 0 regardless of real load, and a
+    session-leak/exhaustion condition is invisible. Fix: re-source all three
+    outputs from the LIVE dataplane session table (the same mirrored conntrack
+    maps `show security flow session` reads). `collectSessionGauges`
+    (`pkg/api/metrics_sessions.go`) now derives `active` (forward entries,
+    `IsReverse==0`) and `established` (forward entries with
+    `State==SessStateEstablished`) inside the SAME `IterateSessions`/
+    `IterateSessionsV6` scan that already backs the type breakdown — one scan,
+    no new periodic scan (the #333 GC-skip optimization stands), and all session
+    gauges share the one fail-loud `xpf_sessions_breakdown_scrape_ok` gate
+    (#2469 extended to active/established). `GetStatus`
+    (`pkg/grpcapi/server_show_status.go`) and `/status`
+    (`pkg/api/health.go`) read `dp.SessionCount()` (forward-only live total)
+    guarded by `dp != nil && IsLoaded()`. `SessionCount()` added to the
+    `apiRuntimeDataPlane` interface (pkg/api) and its daemon mirror
+    `apiDataPlane` (`pkg/daemon/runtime_probes.go`). The Rust mirror writes
+    `state=ESTABLISHED` for all live rows (`publish_conntrack.rs`), so on a real
+    node established≈active today; the Go derivation is correct and general and
+    was unit-tested with a mock snapshot carrying a DISTINCT established subset.
+    RED-on-revert (verified by temporarily reverting each site): Prometheus
+    snapshot with 4 forward (3 established, +1 reverse ignored) → active=4,
+    established=3, ipv4=3/ipv6=1/snat=1/dnat=1 (revert → 0/0); REST `/status`
+    `session_count`=4 (revert → 0); gRPC `GetStatus` SessionCount=7 for
+    v4=5+v6=2 (revert → 0). `go test ./pkg/api/... ./pkg/grpcapi/...
+    ./pkg/conntrack/... ./pkg/dataplane/... ./pkg/daemon/...` green;
+    `go build ./...`, gofmt, vet clean. Cluster smoke (metric non-zero under
+    iperf) WARRANTED but not required for merge — pure read-path stats change,
+    no forwarding/HA/session-sync code touched.
+  - **File(s)**: pkg/api/metrics_sessions.go, pkg/api/api.go, pkg/api/health.go,
+    pkg/grpcapi/server_show_status.go, pkg/daemon/runtime_probes.go,
+    pkg/api/README.md, pkg/api/metrics_sessions_userspace_3929_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go,
+    pkg/grpcapi/server_show_status_3929_test.go
 
 ## 2026-07-03 — #3918: flow-cache neighbor_mac_epoch stamped AFTER neighbor resolve → resolve→stamp TOCTOU re-opens the #3048 stale-MAC blackhole on VRRP gateway failover
 
