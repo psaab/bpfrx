@@ -50,6 +50,21 @@ grouped by the `schedulers` entry in `setSchema`
 `start-date`/`stop-date` value slots are typed so a malformed window is
 rejected at commit (`ValidateTimeOfDay` / `ValidateDate`).
 
+**Time zone — system local (#3988).** Scheduler dates and times are Junos
+local wall-clock. `withinDateRange` parses `StartDate`/`StopDate` with
+`time.ParseInLocation("2006-01-02", …, now.Location())`, so the calendar
+boundary lands on **local midnight**; every production caller supplies `now`
+from `time.Now()` or the evaluation ticker, both of which carry `time.Local`.
+Parsing the date with `time.Parse` (its UTC default) put the boundary on UTC
+midnight and shifted the whole range by the local UTC offset — a
+`start-date 2026-07-01` range under UTC-7 went active at 17:00 local on
+2026-06-30, ~7 h early. The daily `start-time`/`stop-time` window is already
+local-safe and unchanged: it never forms an instant, comparing only wall-clock
+H/M/S components (`parseTimeOfDay` vs `timeOfDay`, both in `now`'s zone). A
+UTC-offset-0 host is unaffected (local == UTC). Deriving the zone from `now`
+rather than reading `time.Local` directly keeps the boundary consistent with
+the same clock the window is compared against and needs no global test seam.
+
 **Fail-closed invariant (#3849 — security).** `isWithinWindow` treats an
 ABSENT window as **inactive**, never always-on. A scheduler that resolves
 to no window for a given instant — no daily window, no applicable per-day

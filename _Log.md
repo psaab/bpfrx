@@ -1,3 +1,39 @@
+## 2026-07-03 — #3988: scheduler start/stop date parsed as UTC instead of system local time
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-052 (MEDIUM, config correctness).
+    `withinDateRange` (`pkg/scheduler/scheduler.go`) parsed a scheduler's
+    `start-date`/`stop-date` with `time.Parse("2006-01-02", …)`, whose
+    default zone is UTC. The parsed midnight instant was then compared
+    against `now` (`time.Now()` / the evaluation ticker, both `time.Local`),
+    so the calendar boundary sat on UTC midnight instead of local midnight
+    and the whole range shifted by the local UTC offset. Under UTC-7 a
+    `start-date 2026-07-01` range went active at 17:00 local on 2026-06-30
+    (~7 h early) and a `stop-date` closed the window ~7 h early on the stop
+    date — a time-based firewall policy (maintenance-window allow,
+    business-hours block) engaged at the wrong wall-clock, off by the offset.
+  - **Fix**: parse both dates with
+    `time.ParseInLocation("2006-01-02", …, now.Location())` so the boundary
+    lands on LOCAL midnight. Deriving the zone from `now` (rather than
+    reading `time.Local` directly) makes the boundary consistent with the
+    same clock the window is compared against, needs no global test seam,
+    and leaves a UTC-offset-0 host bit-identical (local == UTC). Audited the
+    daily `start-time`/`stop-time` path: already zone-safe — it forms no
+    instant, comparing only wall-clock H/M/S components (`parseTimeOfDay` vs
+    `timeOfDay`, both in `now`'s zone) — so only the date-range parse needed
+    the change.
+  - **Test**: `pkg/scheduler/scheduler_localtz_3988_test.go`. Builds `now`
+    in a fixed UTC-7 zone; `TestWithinDateRange_StartDateIsLocalMidnight`
+    and `TestWithinDateRange_StopDateInclusiveLocal` assert the local-midnight
+    boundary and go RED on revert (fire/close ~7 h early);
+    `TestWithinDateRange_UTCOffsetZeroUnchanged` (offset-0 unchanged) and
+    `TestWithinDateRange_DailyWindowZoneSafe` (daily window local before &
+    after) stay green on revert. Deterministic — the zone is injected via
+    `now.Location()`, not the host TZ.
+  - **File(s)**: `pkg/scheduler/scheduler.go`,
+    `pkg/scheduler/scheduler_localtz_3988_test.go`,
+    `pkg/scheduler/README.md`, `_Log.md`.
+
 ## 2026-07-03 — #3985: `monitor interface` leaked a stdin-reader goroutine that stole the next command's keystroke
 
 - **Timestamp**: 2026-07-03

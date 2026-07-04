@@ -317,9 +317,22 @@ func isWithinWindow(now time.Time, sched *config.SchedulerConfig) bool {
 
 // withinDateRange reports whether now is inside sched's calendar range.
 // ok is false when a configured date fails to parse (caller fails closed).
+//
+// #3988: the calendar boundary is interpreted in the SYSTEM LOCAL time zone,
+// matching the Junos convention that a scheduler start-date/stop-date is a
+// local wall-clock date. The date is parsed in now.Location() rather than with
+// time.Parse (which defaults to UTC): every production caller supplies now from
+// time.Now() or the evaluation ticker, both of which carry time.Local, so the
+// date boundary lands on LOCAL midnight. Parsing as UTC shifted the boundary by
+// the local UTC offset (e.g. a start-date 2026-07-01 range under UTC-7 went
+// active at 17:00 local on 2026-06-30 — 7h early). Deriving the zone from now
+// keeps the boundary consistent with the same clock the window is compared
+// against, needs no global seam, and leaves a UTC-offset-0 host unchanged
+// (local == UTC).
 func withinDateRange(now time.Time, sched *config.SchedulerConfig) (inRange, ok bool) {
+	loc := now.Location()
 	if sched.StartDate != "" {
-		startDate, err := time.Parse("2006-01-02", sched.StartDate)
+		startDate, err := time.ParseInLocation("2006-01-02", sched.StartDate, loc)
 		if err != nil {
 			slog.Warn("scheduler: invalid start date", "name", sched.Name, "date", sched.StartDate, "err", err)
 			return false, false
@@ -329,7 +342,7 @@ func withinDateRange(now time.Time, sched *config.SchedulerConfig) (inRange, ok 
 		}
 	}
 	if sched.StopDate != "" {
-		stopDate, err := time.Parse("2006-01-02", sched.StopDate)
+		stopDate, err := time.ParseInLocation("2006-01-02", sched.StopDate, loc)
 		if err != nil {
 			slog.Warn("scheduler: invalid stop date", "name", sched.Name, "date", sched.StopDate, "err", err)
 			return false, false
@@ -421,6 +434,15 @@ func parseTimeOfDay(s string) (tod, error) {
 	return tod{h: t.Hour(), m: t.Minute(), s: t.Second()}, nil
 }
 
+// timeOfDay extracts t's wall-clock hour/minute/second in t's own location.
+//
+// #3988 audit: the daily start-time/stop-time window is zone-safe as-is. Both
+// sides of the comparison use wall-clock components — parseTimeOfDay reads the
+// H/M/S of the configured "HH:MM:SS", and timeOfDay reads now's LOCAL H/M/S
+// (now carries time.Local in every production caller). No instant is formed, so
+// the configured 09:00:00 is compared against 09:00:00 local regardless of the
+// UTC offset. Only the calendar date-range parse (withinDateRange) formed a
+// UTC instant and had to move to now.Location().
 func timeOfDay(t time.Time) tod {
 	return tod{h: t.Hour(), m: t.Minute(), s: t.Second()}
 }
