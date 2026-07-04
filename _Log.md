@@ -1,3 +1,48 @@
+## 2026-07-03 — #3917: HA peer-fence iterated the STARTUP config snapshot → day-2 redundancy-groups never fenced → split-brain dual-active
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-165 (MEDIUM, HA — split-brain dual-active).
+    In `pkg/daemon/daemon_ha_sync.go`, `startClusterComms` wired
+    `d.sessionSync.OnFenceReceived` as a closure over the `cfg` snapshot it
+    captured at startup. On a peer fence the callback iterated
+    `cfg.Chassis.Cluster.RedundancyGroups` from that snapshot. `startClusterComms`
+    is only restarted on a **transport-field** change (`clusterTransportKey`
+    — control/fabric interfaces + peer addresses), so a redundancy-group added
+    by a day-2 commit is absent from the snapshot. Such a day-2 RG was therefore
+    NEVER fenced on a peer fence → it stayed active on this node while the peer
+    also became active for it → split-brain dual-active (the exact failure the
+    fence exists to prevent).
+  - **Fix**: Extracted the fence handler into `d.fenceAllRedundancyGroups(ctx)`
+    plus a shared live-config reader `d.currentRedundancyGroups()` that reads
+    `d.store.ActiveConfig()` (the CURRENT compiled config, RLock-guarded) —
+    mirroring how `pushConfigToPeer` and other HA reconcilers read live config.
+    Every RG in the current config, including day-2 additions, is now fenced.
+    Nil-safe: `d.dp == nil` (config-only mode) skips deactivation with the same
+    diagnostic; `d.store == nil` / no-cluster config returns an empty slice.
+  - **Audit / second stale-snapshot fix**: the per-RG watchdog-heartbeat
+    goroutine in the same function iterated the same startup `cc.RedundancyGroups`
+    every 500ms → a day-2 RG got no watchdog write → its watchdog stayed stale →
+    the dataplane refused to forward for it. Fixed to re-read
+    `d.currentRedundancyGroups()` each tick and gated on `d.dp != nil` alone
+    (dropped the startup RG-count precondition so a cluster that boots with zero
+    RGs still picks up its first day-2 RG). Transport/feature-flag fields
+    (heartbeat/sync/fabric endpoints, IPsecSASync, DHCPLeaseSync) legitimately
+    rely on the #87 transport-restart and are out of the RG-membership class.
+  - **Test**: `pkg/daemon/daemon_ha_fence_3917_test.go` —
+    `TestFenceAllRedundancyGroups_ReadsCurrentConfig` commits a day-2 RG2 after
+    building the startup config and asserts the fence deactivates {0,1,2} (RED
+    on revert: a simulated stale snapshot fences only {0,1});
+    `_StartupRGsFenced` (base case preserved), `_ConfigOnlyModeSafe`
+    (`d.dp == nil` no panic), `_NoClusterSafe` (nil store + non-cluster config),
+    and `TestCurrentRedundancyGroups` (2 → 3 after day-2 commit). RED-on-revert
+    verified by injecting a snapshot-truncation bug: day-2 test failed with
+    `fenced RGs = [0 1], want [0 1 2]`.
+  - **File(s)**: pkg/daemon/daemon_ha_sync.go,
+    pkg/daemon/daemon_ha_fence_3917_test.go, docs/ha-failover-status.md, _Log.md
+  - **Validation**: `go test ./pkg/daemon/... ./pkg/cluster/...` green;
+    `go build ./...`; gofmt clean; `go vet ./pkg/daemon/...` clean.
+    test-failover WARRANTED (HA fence/split-brain) — batched with the other
+    HA-Medium fixes under the force-node0-primary gate.
 ## 2026-07-03 — #3920: RETH member left DOWN after rename — renameRethMember downs the member for the rename but never brings it UP, and programRethMAC early-returns (no UP) on MAC-match → RG demote/blackhole
 
 - **Timestamp**: 2026-07-03

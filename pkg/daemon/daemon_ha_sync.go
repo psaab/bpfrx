@@ -408,7 +408,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// Start BPF watchdog heartbeat: write monotonic timestamp to ha_watchdog
 	// map every 500ms for each configured RG. If the daemon is SIGKILL'd,
 	// the timestamp goes stale and BPF stops forwarding within 2s.
-	if d.dp != nil && len(cc.RedundancyGroups) > 0 {
+	//
+	// #3917: gate on d.dp only (not the startup RG count) and re-read the
+	// CURRENT redundancy-group set each tick. Comms are only restarted on a
+	// transport-field change, so binding cc.RedundancyGroups here would
+	// starve a day-2 RG (added by a later commit) of watchdog heartbeats ->
+	// its watchdog goes stale -> the dataplane stops forwarding for it.
+	// This mirrors the live-config read the fence path now uses.
+	if d.dp != nil {
 		go func() {
 			ticker := time.NewTicker(500 * time.Millisecond)
 			defer ticker.Stop()
@@ -417,10 +424,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				case <-commsCtx.Done():
 					return
 				case <-ticker.C:
+					rgs := d.currentRedundancyGroups()
+					if len(rgs) == 0 {
+						continue
+					}
 					var ts unix.Timespec
 					_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 					now := uint64(ts.Sec)
-					for _, rg := range cc.RedundancyGroups {
+					for _, rg := range rgs {
 						if err := d.dp.HA().SetHAWatchdog(commsCtx, rg.ID, now); err != nil {
 							slog.Warn("ha watchdog write failed", "rg", rg.ID, "err", err)
 						}
@@ -702,32 +713,17 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.cluster.SetPeerFenceFunc(d.sessionSync.SendFence)
 			d.sessionSync.OnFenceReceived = func() {
 				slog.Warn("cluster: fence received from peer")
-				// Guard d.dp: the daemon can run in config-only mode
-				// (d.dp == nil) when the runtime dataplane factory rejects
-				// the configured backend — for example, a stale
-				// "system dataplane-type dpdk" config triggers
-				// dataplane.ErrDPDKBackendRetired and daemon_run.go falls
-				// back to nil dp. Without this guard a peer fence would
-				// panic on a nil pointer dereference. The same applies to
-				// any future Start() failure that leaves d.dp == nil.
-				if d.dp == nil {
-					slog.Warn("cluster: fence received but dataplane is nil; skipping RG deactivation",
-						"mode", "config-only",
-						"action", "skip_rg_deactivation",
-						"remediation", "set system dataplane-type userspace and restart xpfd",
-					)
-					return
-				}
-				if cfg.Chassis.Cluster != nil {
-					slog.Warn("cluster: fence: disabling all RGs",
-						"rg_count", len(cfg.Chassis.Cluster.RedundancyGroups))
-					for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-						if err := d.dp.HA().SetRGActive(commsCtx, rg.ID, false); err != nil {
-							slog.Warn("cluster: fence: failed to disable rg_active",
-								"rg", rg.ID, "err", err)
-						}
-					}
-				}
+				// #3917: fence the CURRENT redundancy-group set, not the
+				// `cfg` snapshot captured in this closure at
+				// startClusterComms time. Comms are only restarted on a
+				// transport-field change (clusterTransportKey), so a
+				// redundancy-group added by a day-2 commit is absent from
+				// the startup snapshot. Fencing off the snapshot would
+				// leave that RG active on this node while the peer also
+				// becomes active for it -> split-brain dual-active. The
+				// dp==nil (config-only) and nil-cluster guards live in
+				// fenceAllRedundancyGroups.
+				d.fenceAllRedundancyGroups(commsCtx)
 			}
 
 			d.sessionSync.SetVRFDevice(vrfDevice)
@@ -840,6 +836,59 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Monitor fabric link/neighbor state via netlink (#124).
 			go d.monitorFabricState(commsCtx)
 		}()
+	}
+}
+
+// currentRedundancyGroups returns the redundancy-groups from the CURRENT
+// active configuration (d.store.ActiveConfig()) rather than a snapshot
+// captured earlier. #3917: long-lived HA goroutines wired in
+// startClusterComms (peer-fence handling, watchdog heartbeat) must read
+// live config at every event/tick. startClusterComms is only restarted on a
+// transport-field change (clusterTransportKey), so a redundancy-group added
+// by a day-2 commit never reaches a closure that captured the startup `cfg`.
+// Returns nil when there is no store, no compiled config, or the config is
+// not in cluster mode — every caller must tolerate an empty slice.
+func (d *Daemon) currentRedundancyGroups() []*config.RedundancyGroup {
+	if d.store == nil {
+		return nil
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return nil
+	}
+	return cfg.Chassis.Cluster.RedundancyGroups
+}
+
+// fenceAllRedundancyGroups disables rg_active for every redundancy-group in
+// the CURRENT active config. It is the peer-fence handler: when a fence
+// message arrives the local node must relinquish ALL redundancy-groups so
+// the peer can own them without a dual-active split-brain. #3917: reading
+// the live config here (via currentRedundancyGroups) ensures day-2 RGs are
+// fenced too. Safe when the dataplane is nil (config-only mode) or the
+// config has no cluster/RGs.
+func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
+	// Guard d.dp: the daemon can run in config-only mode (d.dp == nil)
+	// when the runtime dataplane factory rejects the configured backend —
+	// for example, a stale "system dataplane-type dpdk" config triggers
+	// dataplane.ErrDPDKBackendRetired and daemon_run.go falls back to nil
+	// dp. Without this guard a peer fence would panic on a nil pointer
+	// dereference. The same applies to any future Start() failure that
+	// leaves d.dp == nil.
+	if d.dp == nil {
+		slog.Warn("cluster: fence received but dataplane is nil; skipping RG deactivation",
+			"mode", "config-only",
+			"action", "skip_rg_deactivation",
+			"remediation", "set system dataplane-type userspace and restart xpfd",
+		)
+		return
+	}
+	rgs := d.currentRedundancyGroups()
+	slog.Warn("cluster: fence: disabling all RGs", "rg_count", len(rgs))
+	for _, rg := range rgs {
+		if err := d.dp.HA().SetRGActive(ctx, rg.ID, false); err != nil {
+			slog.Warn("cluster: fence: failed to disable rg_active",
+				"rg", rg.ID, "err", err)
+		}
 	}
 }
 
