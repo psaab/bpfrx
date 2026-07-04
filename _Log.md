@@ -1,3 +1,34 @@
+## 2026-07-03 — #4049: LLDP resolved its socket with the Junos slash name (ge-0/0/0) instead of the kernel dash name (ge-0-0-0) → net.InterfaceByName failed → LLDP never started on any renamed data port
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-068 (MEDIUM, LLDP broken on renamed
+    interfaces). `Manager.Apply` (`pkg/lldp/lldp.go`) opened its AF_PACKET
+    socket via `net.InterfaceByName(lldpIf.Name)`, where `lldpIf.Name` is the
+    Junos display name copied verbatim from the `protocols lldp interface
+    <name>` stanza (compiler `pkg/config/compiler_protocols.go` ->
+    `effectiveLLDPConfig` `pkg/daemon/daemon_apply.go`, both verbatim). xpfd
+    renames the kernel device to dash form (`ge-0-0-0`) via its `.link` files,
+    so a kernel ifname never contains a slash — `net.InterfaceByName("ge-0/0/0")`
+    always failed with "no such network interface", the socket was never
+    opened, and LLDP silently did not run on exactly the renamed ge-*/reth*
+    ports an operator configures it on. Only a (rare) non-renamed name would
+    have worked.
+  - **Fix**: resolve the kernel name with the existing
+    `config.LinuxIfName` helper (slash->dash) before the lookup. `LinuxIfName`
+    is a no-op on a name already in kernel form, so a non-renamed interface is
+    unaffected. The lookup is taken through a new `interfaceByNameFn` seam
+    (mirrors the existing `newIfSessionFn` seam) so the resolution is
+    unit-testable without a host device. `pkg/config` carries no dependency on
+    `pkg/lldp` (`go list -deps ./pkg/config` shows no `pkg/lldp`), so importing
+    config into lldp introduces no cycle.
+  - **Validation**: RED-on-revert proven — reverting the `LinuxIfName`
+    conversion (keeping the seam) fails `TestApplyResolvesKernelIfName` with
+    `lookup[0] = "ge-0/0/0", want kernel name "ge-0-0-0"`; a kernel-form name
+    (`em0`) passes through unchanged. `go test ./pkg/lldp/...` green; `go build
+    ./...` green; `gofmt`/`go vet` clean.
+  - **File(s)**: pkg/lldp/lldp.go, pkg/lldp/socket_test.go,
+    pkg/lldp/README.md, _Log.md
+
 ## 2026-07-03 — #4041: the debug-log direct-TX diagnostic double-recycled a UMEM frame offset on a tuple-mismatch → the offset aliased an in-flight TX frame (on-wire corruption / double-free, debug-log build)
 
 - **Timestamp**: 2026-07-03

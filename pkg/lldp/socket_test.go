@@ -581,3 +581,69 @@ func TestRxLoopSkipsSelfTransmittedFrames(t *testing.T) {
 		t.Fatal("rxLoop did not exit after ctx cancellation")
 	}
 }
+
+// TestApplyResolvesKernelIfName is the regression test for #4049: the LLDP
+// manager must hand the LINUX KERNEL device name (dash form, ge-0-0-0) to the
+// interface lookup, not the JUNOS display name copied verbatim from the
+// `protocols lldp interface <name>` config stanza (slash form, ge-0/0/0). xpfd
+// renames the kernel device to dash form via its .link files; a slash never
+// appears in a kernel ifname, so passing ge-0/0/0 to net.InterfaceByName fails
+// and LLDP silently never opens a socket on the renamed data port.
+//
+// It stubs the interfaceByNameFn seam to capture the name actually passed to
+// the lookup, and stubs newIfSessionFn to a no-op error so no real socket or
+// goroutine is created. Against the pre-fix code (net.InterfaceByName(lldpIf
+// .Name) with no LinuxIfName conversion) the captured name is "ge-0/0/0" and
+// the slash-form assertion fails.
+func TestApplyResolvesKernelIfName(t *testing.T) {
+	var gotNames []string
+	prevLookup := interfaceByNameFn
+	interfaceByNameFn = func(name string) (*net.Interface, error) {
+		gotNames = append(gotNames, name)
+		// Return a valid-looking interface so Apply proceeds to newIfSessionFn.
+		return &net.Interface{
+			Index:        1,
+			Name:         name,
+			HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+		}, nil
+	}
+	prevSess := newIfSessionFn
+	// Fail session setup deliberately: this test only asserts the name handed
+	// to the lookup, so it must not spawn TX/RX goroutines or open sockets.
+	newIfSessionFn = func(iface *net.Interface) (*ifSession, error) {
+		return nil, errStubNoSocket
+	}
+	t.Cleanup(func() {
+		interfaceByNameFn = prevLookup
+		newIfSessionFn = prevSess
+	})
+
+	m := New()
+	cfg := &LLDPConfig{
+		Interfaces: []LLDPInterface{
+			{Name: "ge-0/0/0"}, // Junos slash name -> kernel ge-0-0-0
+			{Name: "em0"},      // already kernel-form -> unchanged
+		},
+		Interval: 30,
+	}
+	m.Apply(context.Background(), cfg)
+	t.Cleanup(m.Stop)
+
+	want := []string{"ge-0-0-0", "em0"}
+	if len(gotNames) != len(want) {
+		t.Fatalf("interfaceByNameFn called with %v, want %v", gotNames, want)
+	}
+	for i, w := range want {
+		if gotNames[i] != w {
+			t.Errorf("lookup[%d] = %q, want kernel name %q "+
+				"(config name must be slash->dash converted before the lookup)",
+				i, gotNames[i], w)
+		}
+	}
+}
+
+var errStubNoSocket = errStub("stub: no socket")
+
+type errStub string
+
+func (e errStub) Error() string { return string(e) }

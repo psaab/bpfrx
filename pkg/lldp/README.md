@@ -29,7 +29,9 @@ frame flood cannot exhaust memory (#4044).
 
 ## Dependencies
 
-Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
+Standard library + `golang.org/x/sys/unix`, plus `pkg/linuxsock` (raw-socket
+open) and `pkg/config` (the `LinuxIfName` slash->dash helper, see the
+interface-name gotcha below).
 
 ## Socket lifecycle (#2035)
 
@@ -114,6 +116,18 @@ Two properties keep this safe (#2372 review findings 3 + 6):
 - Uses AF_PACKET raw sockets — the daemon needs `CAP_NET_RAW`. Without
   it, session setup fails at `Apply()` time, the interface is skipped,
   and the neighbor table stays empty for it.
+- **Config names are Junos display names; the socket needs the kernel
+  name (#4049).** The `protocols lldp interface <name>` stanza carries a
+  Junos name (`ge-0/0/0`, `reth0.50`), but xpfd renames the kernel device
+  to dash form (`ge-0-0-0`) via its `.link` files. `Apply()` runs each
+  config name through `config.LinuxIfName` (slash->dash) before
+  `net.InterfaceByName` — a kernel ifname never contains a slash, so
+  passing the raw Junos name failed the lookup and LLDP silently never
+  opened a socket on the renamed data ports. `LinuxIfName` is a no-op on a
+  name already in kernel form, so a non-renamed interface is unaffected.
+  The lookup goes through the `interfaceByNameFn` seam so the resolution
+  is unit-tested (`TestApplyResolvesKernelIfName`, `socket_test.go`)
+  without a host device present.
 - TTL countdown is per-neighbor; expired entries auto-purge from the
   `Neighbors()` snapshot.
 - The neighbor map is RWMutex-guarded. `Neighbors()` returns a copy, not
