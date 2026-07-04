@@ -43,6 +43,17 @@ type Lease struct {
 	LeaseTime time.Duration
 	Obtained  time.Time
 
+	// ClasslessRoutes holds the RFC 3442 classless static routes learned
+	// from DHCPv4 option 121 (or the legacy Microsoft option 249) in the
+	// ACK. Per RFC 3442, when the server sends option 121 the client MUST
+	// ignore the option-3 Router default: the 0.0.0.0/0 entry (if any) in
+	// this set populates Gateway instead, and every more-specific route is
+	// held here so it is programmed alongside the lease and withdrawn on
+	// lease change/expiry, exactly like the default route. Nil for DHCPv6
+	// or when the server sends no option 121/249. IPv4 only — RFC 3442 is
+	// a DHCPv4 option.
+	ClasslessRoutes []LeaseRoute
+
 	// serverID is the DHCPv4 server-identifier (option 54) from the ACK
 	// that granted this lease. It is the unicast destination for the
 	// RFC 2131 §4.3.6 RENEWING DHCPREQUEST at T1. Unexported: internal
@@ -54,6 +65,15 @@ type Lease struct {
 	// that granted this lease, echoed in the RFC 8415 §18.2.4 RENEW so
 	// the original server matches the binding. Unexported (#2994).
 	v6ServerDUID dhcpv6.DUID
+}
+
+// LeaseRoute is one RFC 3442 classless static route (destination prefix
+// plus gateway) learned from DHCPv4 option 121 / legacy option 249. It is
+// comparable (netip.Prefix and netip.Addr are comparable), so a slice of
+// LeaseRoute is diffable with slices.Equal for leaseContentChanged.
+type LeaseRoute struct {
+	Destination netip.Prefix
+	Gateway     netip.Addr
 }
 
 // dhcpExchangeMode selects which RFC exchange a renewal cycle step runs.
@@ -962,11 +982,28 @@ func leaseFromACKv4(ifaceName string, ack *dhcpv4.DHCPv4) (*Lease, error) {
 		}
 	}
 
-	// Gateway
-	routers := ack.Router()
-	if len(routers) > 0 {
-		if gw, ok := netip.AddrFromSlice(routers[0].To4()); ok {
-			lease.Gateway = gw
+	// RFC 3442 classless static routes (option 121, or the legacy
+	// Microsoft option 249). When either is present it SUPERSEDES the
+	// option-3 Router option: RFC 3442 requires the client to ignore
+	// option 3 entirely and install the option-121 routes instead. The
+	// 0.0.0.0/0 entry (if any) is the option-121 way to express the
+	// default gateway and populates lease.Gateway (so every existing
+	// gateway consumer — FRR default route, neighbor resolution,
+	// ip-monitoring next-hop — keeps working); more-specific routes are
+	// held on the lease and programmed/withdrawn alongside it. Only when
+	// option 121/249 is absent do we fall back to option 3.
+	if classless, defGW, present := classlessStaticRoutes(ack); present {
+		lease.ClasslessRoutes = classless
+		if defGW.IsValid() {
+			lease.Gateway = defGW
+		}
+	} else {
+		// Gateway (option 3) — honored only when option 121/249 is absent.
+		routers := ack.Router()
+		if len(routers) > 0 {
+			if gw, ok := netip.AddrFromSlice(routers[0].To4()); ok {
+				lease.Gateway = gw
+			}
 		}
 	}
 
@@ -983,6 +1020,67 @@ func leaseFromACKv4(ifaceName string, ack *dhcpv4.DHCPv4) (*Lease, error) {
 	lease.LeaseTime = lt
 
 	return lease, nil
+}
+
+// classlessStaticRoutes parses RFC 3442 classless static routes from a
+// DHCPv4 ACK. It prefers option 121 (the standard code) and falls back to
+// the legacy Microsoft option 249 — both share the identical
+// {mask-length, significant-prefix-octets, gateway} wire encoding, so the
+// same dhcpv4.Routes decoder handles either.
+//
+// It returns the non-default routes separately from the default-route
+// gateway (the 0.0.0.0/0 entry, if the server included one). present is
+// true whenever either option was found — per RFC 3442 the caller MUST
+// then IGNORE the option-3 Router option, even if the option carried no
+// 0.0.0.0/0 entry (in which case defaultGW is the zero Addr and no default
+// route is installed — the server's explicit choice). A malformed entry
+// (bad mask, short buffer) is skipped rather than failing the whole lease.
+func classlessStaticRoutes(ack *dhcpv4.DHCPv4) (routes []LeaseRoute, defaultGW netip.Addr, present bool) {
+	libRoutes := ack.ClasslessStaticRoute() // option 121
+	if len(libRoutes) == 0 {
+		// Legacy option 249 (Microsoft), identical RFC 3442 encoding.
+		if raw := ack.Options.Get(dhcpv4.GenericOptionCode(249)); len(raw) > 0 {
+			var r dhcpv4.Routes
+			if err := r.FromBytes(raw); err == nil {
+				libRoutes = r
+			}
+		}
+	}
+	if len(libRoutes) == 0 {
+		return nil, netip.Addr{}, false
+	}
+	present = true
+	for _, lr := range libRoutes {
+		if lr == nil || lr.Dest == nil {
+			continue
+		}
+		ones, bits := lr.Dest.Mask.Size()
+		if bits != 32 {
+			continue // not an IPv4 mask; RFC 3442 is IPv4-only
+		}
+		gw, ok := netip.AddrFromSlice(lr.Router.To4())
+		if !ok {
+			continue
+		}
+		dst, ok := netip.AddrFromSlice(lr.Dest.IP.To4())
+		if !ok {
+			continue
+		}
+		if ones == 0 {
+			// Default-route entry — supplies lease.Gateway (RFC 3442's way
+			// to express the default gateway). First one wins, matching the
+			// single-gateway model of the option-3 path (routers[0]).
+			if !defaultGW.IsValid() {
+				defaultGW = gw
+			}
+			continue
+		}
+		routes = append(routes, LeaseRoute{
+			Destination: netip.PrefixFrom(dst, ones).Masked(),
+			Gateway:     gw,
+		})
+	}
+	return routes, defaultGW, present
 }
 
 // runDHCPv6 runs the DHCPv6 solicit/request cycle with retries and

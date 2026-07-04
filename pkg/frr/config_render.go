@@ -207,13 +207,17 @@ func renderGenerateRoutes(b *strings.Builder, fc *FullConfig) {
 	b.WriteString("!\n")
 }
 
-// renderDHCPDefaults emits DHCP-learned default routes at admin distance 200.
-// Suppressed when an explicit static default route exists for the same
+// renderDHCPDefaults emits DHCP-learned routes at admin distance 200: the
+// default route (option-3 gateway or the option-121 0.0.0.0/0 entry) plus
+// any RFC 3442 classless static routes (option 121 / legacy 249), each
+// carried on its DHCPRoute with a non-empty Destination. The default route
+// is suppressed when an explicit static default route exists for the same
 // address family so the management interface's DHCP gateway doesn't compete
-// with configured routes. Both families bind the route to the originating
-// interface when the lease records one (dr.Interface != ""), so that in
-// multi-WAN / shared-gateway-IP deployments the kernel can pick the correct
-// egress instead of leaving an ambiguous gateway-only default.
+// with configured routes; classless static routes are more-specific and are
+// never suppressed by a static default. Both families bind the route to the
+// originating interface when the lease records one (dr.Interface != ""), so
+// that in multi-WAN / shared-gateway-IP deployments the kernel can pick the
+// correct egress instead of leaving an ambiguous gateway-only default.
 func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 	if len(fc.DHCPRoutes) == 0 {
 		return
@@ -234,23 +238,38 @@ func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 	}
 	wrote := false
 	for _, dr := range fc.DHCPRoutes {
-		if dr.IsIPv6 && hasV6Default {
-			continue
-		}
-		if !dr.IsIPv6 && hasV4Default {
-			continue
+		// Destination: empty means the default route; a non-empty value is
+		// an RFC 3442 classless static route (option 121 / legacy 249).
+		dest := dr.Destination
+		isDefault := dest == "" || dest == "0.0.0.0/0" || dest == "::/0"
+		if isDefault {
+			// A configured static default of the same family suppresses the
+			// DHCP-learned default (a static default wins). This suppression
+			// applies ONLY to the default route — classless static routes are
+			// more-specific and must not be dropped by a static default.
+			if dr.IsIPv6 {
+				dest = "::/0"
+				if hasV6Default {
+					continue
+				}
+			} else {
+				dest = "0.0.0.0/0"
+				if hasV4Default {
+					continue
+				}
+			}
 		}
 		if dr.IsIPv6 {
 			if dr.Interface != "" {
-				fmt.Fprintf(b, "ipv6 route ::/0 %s %s 200\n", dr.Gateway, dr.Interface)
+				fmt.Fprintf(b, "ipv6 route %s %s %s 200\n", dest, dr.Gateway, dr.Interface)
 			} else {
-				fmt.Fprintf(b, "ipv6 route ::/0 %s 200\n", dr.Gateway)
+				fmt.Fprintf(b, "ipv6 route %s %s 200\n", dest, dr.Gateway)
 			}
 		} else {
 			if dr.Interface != "" {
-				fmt.Fprintf(b, "ip route 0.0.0.0/0 %s %s 200\n", dr.Gateway, dr.Interface)
+				fmt.Fprintf(b, "ip route %s %s %s 200\n", dest, dr.Gateway, dr.Interface)
 			} else {
-				fmt.Fprintf(b, "ip route 0.0.0.0/0 %s 200\n", dr.Gateway)
+				fmt.Fprintf(b, "ip route %s %s 200\n", dest, dr.Gateway)
 			}
 		}
 		wrote = true
