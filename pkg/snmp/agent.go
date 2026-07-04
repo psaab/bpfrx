@@ -400,11 +400,53 @@ func (a *Agent) SetIfDataFn(fn func() []IfData) {
 }
 
 // getIfData returns sorted interface data from the callback, or nil.
+//
+// The callback (buildSNMPIfData in the daemon) performs a full netlink
+// LinkList (RTM_GETLINK dump) on every invocation, so getIfData is EXPENSIVE.
+// A request handler must not call it per-varbind: it snapshots ONCE per PDU via
+// ifSnapshot and threads the result through the walk (#4013).
 func (a *Agent) getIfData() []IfData {
 	if a.ifDataFn == nil {
 		return nil
 	}
 	return a.ifDataFn()
+}
+
+// ifSnapshot memoizes a single interface-table read for the lifetime of ONE
+// PDU. getOIDValue / findNextOID / getIfTableValue / getIfXTableValue read the
+// interface list through it, so a GETBULK or GETNEXT walk over N interfaces
+// performs at most one netlink LinkList per PDU instead of the pre-#4013 two
+// dumps per returned varbind — an O(N)/O(N²) RTM_GETLINK storm that floods the
+// kernel netlink path and contends with the interface reconcile and VRRP on a
+// box with many interfaces. This mirrors the >1/s control-socket snapshot
+// discipline in CLAUDE.md, applied to netlink.
+//
+// The snapshot is LAZY: a PDU that never touches the ifTable/ifXTable (e.g. a
+// system-group GET of sysUpTime, the common monitoring poll) triggers no
+// LinkList at all, so the fix adds no netlink cost to those requests. It is not
+// safe for concurrent use — each request builds its own via newIfSnapshot.
+type ifSnapshot struct {
+	a      *Agent
+	loaded bool
+	data   []IfData
+}
+
+// newIfSnapshot returns a fresh per-PDU interface-data snapshot bound to the
+// agent. Call once at the start of handling a request and thread the result
+// through getOIDValueSnap / findNextOIDSnap for the whole PDU.
+func (a *Agent) newIfSnapshot() *ifSnapshot {
+	return &ifSnapshot{a: a}
+}
+
+// get returns the interface table for this PDU, invoking the agent's ifDataFn
+// (one netlink LinkList) on the first call and returning the cached slice on
+// every subsequent call within the same PDU.
+func (s *ifSnapshot) get() []IfData {
+	if !s.loaded {
+		s.data = s.a.getIfData()
+		s.loaded = true
+	}
+	return s.data
 }
 
 // Start begins listening for SNMP requests on UDP port 161.
@@ -617,9 +659,12 @@ func (a *Agent) handleGet(community []byte, pduBody []byte) []byte {
 		return nil
 	}
 
+	// One interface snapshot for the whole PDU (#4013): the ifTable read
+	// happens at most once regardless of how many OIDs the GET requests.
+	snap := a.newIfSnapshot()
 	var varbinds []varbind
 	for _, oid := range oids {
-		val, valTag := a.getOIDValue(oid)
+		val, valTag := a.getOIDValueSnap(oid, snap)
 		if val == nil {
 			// For v2c GET, return noSuchObject exception.
 			varbinds = append(varbinds, varbind{oid: oid, tag: tagNoSuchInstance, value: nil})
@@ -639,14 +684,16 @@ func (a *Agent) handleGetNext(community []byte, pduBody []byte) []byte {
 		return nil
 	}
 
+	// One interface snapshot for the whole PDU (#4013).
+	snap := a.newIfSnapshot()
 	var varbinds []varbind
 	for _, oid := range oids {
-		nextOID := a.findNextOID(oid)
+		nextOID := a.findNextOIDSnap(oid, snap)
 		if nextOID == nil {
 			// End of MIB view.
 			varbinds = append(varbinds, varbind{oid: oid, tag: tagEndOfMibView, value: nil})
 		} else {
-			val, valTag := a.getOIDValue(nextOID)
+			val, valTag := a.getOIDValueSnap(nextOID, snap)
 			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
 		}
 	}
@@ -672,15 +719,20 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 		maxRepetitions = 100 // safety cap
 	}
 
+	// One interface snapshot for the whole PDU (#4013): a GETBULK walk over N
+	// interfaces returns O(N) varbinds; without this the pre-#4013 code did two
+	// netlink LinkList dumps (findNextOID + getOIDValue) per varbind — an
+	// O(N)/O(N²) RTM_GETLINK storm. The snapshot bounds it to one dump per PDU.
+	snap := a.newIfSnapshot()
 	var varbinds []varbind
 
 	// Process non-repeaters (like GETNEXT for first N OIDs).
 	for i := 0; i < nonRepeaters && i < len(oids); i++ {
-		nextOID := a.findNextOID(oids[i])
+		nextOID := a.findNextOIDSnap(oids[i], snap)
 		if nextOID == nil {
 			varbinds = append(varbinds, varbind{oid: oids[i], tag: tagEndOfMibView, value: nil})
 		} else {
-			val, valTag := a.getOIDValue(nextOID)
+			val, valTag := a.getOIDValueSnap(nextOID, snap)
 			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
 		}
 	}
@@ -689,12 +741,12 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 	for i := nonRepeaters; i < len(oids); i++ {
 		currentOID := oids[i]
 		for j := 0; j < maxRepetitions; j++ {
-			nextOID := a.findNextOID(currentOID)
+			nextOID := a.findNextOIDSnap(currentOID, snap)
 			if nextOID == nil {
 				varbinds = append(varbinds, varbind{oid: currentOID, tag: tagEndOfMibView, value: nil})
 				break
 			}
-			val, valTag := a.getOIDValue(nextOID)
+			val, valTag := a.getOIDValueSnap(nextOID, snap)
 			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
 			currentOID = nextOID
 		}
@@ -731,8 +783,19 @@ func (a *Agent) isValidCommunity(community string) bool {
 	return a.getCommunity(community) != nil
 }
 
-// getOIDValue returns the encoded value and BER tag for a given OID.
+// getOIDValue returns the encoded value and BER tag for a given OID. It is the
+// one-shot convenience form: it builds a fresh per-call interface snapshot.
+// Request handlers that walk multiple OIDs in one PDU MUST use getOIDValueSnap
+// with a single shared snapshot instead, so the ifTable read happens once per
+// PDU (#4013).
 func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
+	return a.getOIDValueSnap(oid, a.newIfSnapshot())
+}
+
+// getOIDValueSnap is getOIDValue served from a caller-provided per-PDU
+// interface snapshot. All ifTable/ifXTable/ifNumber reads go through snap so a
+// multi-varbind walk triggers at most one netlink LinkList.
+func (a *Agent) getOIDValueSnap(oid []int, snap *ifSnapshot) ([]byte, byte) {
 	cfg := a.snapshotCfg()
 	// System MIB group
 	if oidEqual(oid, oidSysDescr) {
@@ -774,7 +837,7 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 
 	// interfaces.ifNumber
 	if oidEqual(oid, oidIfNumber) {
-		ifaces := a.getIfData()
+		ifaces := snap.get()
 		return berEncodeIntegerValue(len(ifaces)), tagInteger
 	}
 
@@ -782,22 +845,23 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 	if len(oid) == len(oidIfTablePrefix)+2 && oidHasPrefix(oid, oidIfTablePrefix) {
 		col := oid[len(oidIfTablePrefix)]
 		ifIdx := oid[len(oidIfTablePrefix)+1]
-		return a.getIfTableValue(col, ifIdx)
+		return getIfTableValue(col, ifIdx, snap.get())
 	}
 
 	// ifXTable: 1.3.6.1.2.1.31.1.1.1.<col>.<ifIndex>
 	if len(oid) == len(oidIfXTablePrefix)+2 && oidHasPrefix(oid, oidIfXTablePrefix) {
 		col := oid[len(oidIfXTablePrefix)]
 		ifIdx := oid[len(oidIfXTablePrefix)+1]
-		return a.getIfXTableValue(col, ifIdx)
+		return getIfXTableValue(col, ifIdx, snap.get())
 	}
 
 	return nil, 0
 }
 
-// getIfTableValue returns the value for a specific ifTable column and ifIndex.
-func (a *Agent) getIfTableValue(col, ifIdx int) ([]byte, byte) {
-	ifaces := a.getIfData()
+// getIfTableValue returns the value for a specific ifTable column and ifIndex,
+// served from the caller's per-PDU interface snapshot (#4013) rather than a
+// fresh netlink dump.
+func getIfTableValue(col, ifIdx int, ifaces []IfData) ([]byte, byte) {
 	var iface *IfData
 	for i := range ifaces {
 		if ifaces[i].IfIndex == ifIdx {
@@ -832,9 +896,10 @@ func (a *Agent) getIfTableValue(col, ifIdx int) ([]byte, byte) {
 	return nil, 0
 }
 
-// getIfXTableValue returns the value for a specific ifXTable column and ifIndex.
-func (a *Agent) getIfXTableValue(col, ifIdx int) ([]byte, byte) {
-	ifaces := a.getIfData()
+// getIfXTableValue returns the value for a specific ifXTable column and
+// ifIndex, served from the caller's per-PDU interface snapshot (#4013) rather
+// than a fresh netlink dump.
+func getIfXTableValue(col, ifIdx int, ifaces []IfData) ([]byte, byte) {
 	var iface *IfData
 	for i := range ifaces {
 		if ifaces[i].IfIndex == ifIdx {
@@ -877,8 +942,18 @@ func (a *Agent) getIfXTableValue(col, ifIdx int) ([]byte, byte) {
 	return nil, 0
 }
 
-// findNextOID returns the next OID in the tree after the given OID, or nil.
+// findNextOID returns the next OID in the tree after the given OID, or nil. It
+// is the one-shot convenience form: it builds a fresh per-call interface
+// snapshot. Request handlers that walk in one PDU MUST use findNextOIDSnap with
+// a single shared snapshot instead (#4013).
 func (a *Agent) findNextOID(oid []int) []int {
+	return a.findNextOIDSnap(oid, a.newIfSnapshot())
+}
+
+// findNextOIDSnap is findNextOID served from a caller-provided per-PDU
+// interface snapshot, so a GETNEXT/GETBULK walk reads the interface list once
+// per PDU rather than once per next-OID lookup.
+func (a *Agent) findNextOIDSnap(oid []int, snap *ifSnapshot) []int {
 	// Check static OIDs first.
 	for _, candidate := range staticOIDs {
 		if oidCompare(candidate, oid) > 0 {
@@ -887,7 +962,7 @@ func (a *Agent) findNextOID(oid []int) []int {
 	}
 
 	// Walk ifTable OIDs: 1.3.6.1.2.1.2.2.1.<col>.<ifIndex>
-	ifaces := a.getIfData()
+	ifaces := snap.get()
 	if len(ifaces) == 0 {
 		return nil
 	}

@@ -349,7 +349,125 @@ test_verify_running_stale_binary_hardfails() {
 	rm -f "$lb"; teardown_fake_vm
 }
 
+# ── Rolling-deploy node ordering (#4009) ─────────────────────────────
+# Captured `cli -c "show chassis cluster status"` samples (FormatStatus,
+# pkg/cluster/status.go). deploy_rolling_secondary_node must echo the RG0
+# SECONDARY node index (upgrade it FIRST). RED-on-revert: the retired
+# inline `grep "secondary:node0"` never matched these space-separated,
+# lowercase rows, so a node0-secondary cluster wrongly resolved to
+# node1-first — restarting the PRIMARY first → a spurious mid-deploy failover.
+
+STATUS_NODE0_PRIMARY="Monitor Failure codes:
+    CS  Cold Sync monitoring        FL  Fabric Connection monitoring
+
+Cluster ID: 1
+Node name: node0
+
+Node    Priority  Status         Preempt  Manual   Monitor-failures
+
+Redundancy group: 0 , Failover count: 0
+node0   200       primary        no       no       None
+  Takeover ready: yes
+  Transfer ready: yes
+node1   100       secondary      no       no       None
+"
+
+STATUS_NODE0_SECONDARY="Redundancy group: 0 , Failover count: 1
+node0   100       secondary      no       no       None
+node1   200       primary        no       no       None
+"
+
+# Active-active: node0 is SECONDARY for RG0 but PRIMARY for RG1. The decision
+# must be scoped to RG0 (the mastership that steers the WAN path) → node0 first.
+STATUS_MULTI_RG_NODE0_SEC_RG0="Redundancy group: 0 , Failover count: 1
+node0   200       secondary      no       no       None
+node1   100       primary        no       no       None
+
+Redundancy group: 1 , Failover count: 2
+node0   200       primary        no       no       None
+node1   100       secondary      no       no       None
+"
+
+STATUS_SECONDARY_HOLD="Redundancy group: 0 , Failover count: 0
+node0   100       secondary-hold no       no       None
+node1   200       primary        no       no       None
+"
+
+STATUS_PEER_DOWN="Redundancy group: 0 , Failover count: 0
+node0   200       primary        no       no       None
+"
+
+test_rolling_secondary_node0_primary() {
+	local got; got=$(printf '%s' "$STATUS_NODE0_PRIMARY" | deploy_rolling_secondary_node)
+	if [[ "$got" == 1 ]]; then
+		ok "rolling: node0 primary -> upgrade node1 (secondary) first"
+	else
+		bad "rolling: node0 primary -> expected 1, got '$got'"
+	fi
+}
+
+test_rolling_secondary_node0_secondary() {
+	local got; got=$(printf '%s' "$STATUS_NODE0_SECONDARY" | deploy_rolling_secondary_node)
+	if [[ "$got" == 0 ]]; then
+		ok "rolling: node0 secondary -> upgrade node0 first (no spurious failover)"
+	else
+		bad "rolling: node0 secondary -> expected 0, got '$got' (retired secondary:node0 grep gives 1 -> restarts PRIMARY first)"
+	fi
+}
+
+test_rolling_secondary_multi_rg_scoped_to_rg0() {
+	local got; got=$(printf '%s' "$STATUS_MULTI_RG_NODE0_SEC_RG0" | deploy_rolling_secondary_node)
+	if [[ "$got" == 0 ]]; then
+		ok "rolling: multi-RG decision scoped to RG0 (node0 secondary in RG0)"
+	else
+		bad "rolling: multi-RG -> expected 0 (RG0), got '$got'"
+	fi
+}
+
+test_rolling_secondary_hold_counts_as_secondary() {
+	local got; got=$(printf '%s' "$STATUS_SECONDARY_HOLD" | deploy_rolling_secondary_node)
+	if [[ "$got" == 0 ]]; then
+		ok "rolling: node0 secondary-hold -> upgrade node0 first"
+	else
+		bad "rolling: secondary-hold -> expected 0, got '$got'"
+	fi
+}
+
+test_rolling_secondary_peer_down_defaults() {
+	local got; got=$(printf '%s' "$STATUS_PEER_DOWN" | deploy_rolling_secondary_node)
+	if [[ "$got" == 1 ]]; then
+		ok "rolling: node0 primary (peer down) -> default node1 first"
+	else
+		bad "rolling: peer-down -> expected 1, got '$got'"
+	fi
+}
+
+test_rolling_secondary_empty_defaults() {
+	local got; got=$(printf '' | deploy_rolling_secondary_node)
+	if [[ "$got" == 1 ]]; then
+		ok "rolling: empty/unparseable status -> default node1 first"
+	else
+		bad "rolling: empty -> expected 1, got '$got'"
+	fi
+}
+
+test_rolling_rg_ids() {
+	local got; got=$(printf '%s' "$STATUS_MULTI_RG_NODE0_SEC_RG0" | deploy_rolling_rg_ids | tr '\n' ' ')
+	if [[ "$got" == "0 1 " ]]; then
+		ok "rolling: rg-id extraction lists '0 1' for the post-deploy reassert"
+	else
+		bad "rolling: rg-ids -> expected '0 1 ', got '$got'"
+	fi
+}
+
 # ── Run ───────────────────────────────────────────────────────────────
+test_rolling_secondary_node0_primary
+test_rolling_secondary_node0_secondary
+test_rolling_secondary_multi_rg_scoped_to_rg0
+test_rolling_secondary_hold_counts_as_secondary
+test_rolling_secondary_peer_down_defaults
+test_rolling_secondary_empty_defaults
+test_rolling_rg_ids
 test_verify_pushed_sha_match
 test_verify_pushed_sha_mismatch_hardfails
 test_verify_pushed_sha_absent_hardfails

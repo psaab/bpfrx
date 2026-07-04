@@ -38,6 +38,125 @@
     `cargo test --release --test-threads=1` green. `go build ./...` green.
   - **File(s)**: userspace-dp/src/afxdp/umem/tests.rs, _Log.md
 
+## 2026-07-03 — #4013: SNMP ifTable GETBULK/GETNEXT read the interface list (a full netlink LinkList) TWICE per returned varbind → O(N)/O(N²) RTM_GETLINK storm per SNMP walk
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-180 (MEDIUM, perf/DoS). The SNMP
+    ifTable/ifXTable request path read interface data through `getIfData()`,
+    whose daemon-wired callback (`buildSNMPIfData`) performs a full netlink
+    `LinkList` (RTM_GETLINK dump) on EVERY call. `handleGetBulk` /
+    `handleGetNext` (and their SNMPv3 twins in `v3.go`) called `getIfData`
+    twice per returned varbind — once in `findNextOID` for the next-OID
+    lookup, once in `getOIDValue` -> `getIfTableValue`/`getIfXTableValue` for
+    the row. A GETBULK walk over N interfaces returns O(N) varbinds, so a
+    single walk drove 2× a full kernel interface dump per varbind: an
+    O(N)/O(N²) RTM_GETLINK storm that floods the kernel netlink path, slows
+    SNMP responses, and contends with the interface reconcile and VRRP. An
+    aggressive/malicious poller could amplify a single GETBULK into a netlink
+    DoS.
+  - **Fix**: introduced a lazy per-PDU interface snapshot (`ifSnapshot` /
+    `newIfSnapshot`). Each handler builds one snapshot at the start of the PDU
+    and threads it through the walk via `getOIDValueSnap` / `findNextOIDSnap`;
+    `getIfTableValue`/`getIfXTableValue` became pure lookups over the snapshot
+    slice. The first ifTable/ifXTable/ifNumber access triggers exactly one
+    LinkList; later varbinds read the cached slice. A GETBULK/GETNEXT walk over
+    N interfaces now does 1 dump per PDU instead of 2N. The snapshot is lazy so
+    a system-group-only PDU (e.g. `sysUpTime` poll) triggers no dump — no
+    regression for system-OID monitoring. Public one-shot `getOIDValue` /
+    `findNextOID` retained (fresh single-use snapshot) for single-object
+    callers/tests.
+  - **File(s)**: `pkg/snmp/agent.go`, `pkg/snmp/v3.go`,
+    `pkg/snmp/getbulk_size_test.go`, `pkg/snmp/README.md`.
+  - **Validation**: `go test ./pkg/snmp/...` green. New fail-on-revert guards
+    `TestV2cGetBulk_SingleLinkListPerPDU` /
+    `TestV2cGetNext_SingleLinkListPerPDU` count `ifDataFn` (the LinkList seam)
+    invocations per PDU and assert exactly 1; reverting to per-varbind reads
+    drives the count to 2× the varbinds (200 for a 100-rep GETBULK over 20
+    ifaces, 6 for a 3-OID GETNEXT) — both RED — while asserting the served
+    ifTable values stay correct. `go build ./...` + `go vet ./pkg/snmp/...`
+    clean.
+
+## 2026-07-03 — #4009: cluster-deploy secondary-node detection grep never matched → deploy restarted the PRIMARY first ~50% of the time (spurious mid-deploy failover)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-093 (MEDIUM, test-infra). A rolling
+    `cluster-setup.sh deploy all` must restart the SECONDARY node first so the
+    primary keeps forwarding. `deploy_rolling` (the default raw-push fast path,
+    driven by `make cluster-deploy`) detected the secondary with an inline
+    `grep "secondary:node0"` against `show chassis cluster status`. That output
+    (FormatStatus, `pkg/cluster/status.go`) renders space-separated, lowercase
+    per-node rows (`node0  200  primary` / `node1  100  secondary`) with no
+    `secondary:node0` token anywhere, so the grep NEVER matched. Detection
+    always fell through to the fixed default `secondary=1, primary=0`, so
+    whenever node0 was the RG0 SECONDARY the deploy restarted node1 (the
+    PRIMARY) first → a spurious mid-deploy failover that churned cluster state
+    and left downstream smoke (`apply-cos-config.sh`, `test-failover`) starting
+    from an unexpected primary ~50% of the time — the root cause of the
+    force-node0-primary workaround in the HA batch-tf scripts. (The sibling
+    `deploy_rolling_deb` had a separate, working `show chassis cluster
+    information` / `Local state:` grep; the two detections had diverged.)
+  - **Fix**: extracted ONE tested SSOT parser `deploy_rolling_secondary_node`
+    into `test/incus/deploy-lib.sh` — reads `show chassis cluster status` on
+    stdin, scopes to the `Redundancy group: 0` header, and echoes 0 when
+    node0's RG0 Status is `secondary`/`secondary-hold` (upgrade node0 first)
+    else 1; defaults to 1 (node0-primary steady state) on empty/unparseable
+    input. `rolling_detect_secondary` in `cluster-setup.sh` wires it to node0
+    live. BOTH `deploy_rolling` and `deploy_rolling_deb` now use it. Added a
+    belt-and-braces `reassert_primary_node0` (RG ids via `deploy_rolling_rg_ids`)
+    that resets manual failover + forces node0 primary for every RG after a
+    rolling deploy, so smoke always starts from the documented node0-primary
+    state regardless of preempt config — best-effort, non-fatal. The #1875
+    lock + sha-verify/verify-dataplane gate are untouched.
+  - **Validation**: 7 new offline captured-output tests in
+    `deploy-lib-selftest.sh` (`make test-deploy-lib`, 19/19 pass) covering
+    node0-primary→1, node0-secondary→0, active-active RG0-scoping→0,
+    secondary-hold→0, peer-down→1, empty→1, and rg-id extraction. RED-on-revert
+    demonstrated: the retired `grep "secondary:node0"` returns 1 (node1-first)
+    on the node0-secondary sample → would restart the primary first. shellcheck
+    clean (warning+) on all three scripts; `go build ./...` green; existing
+    `cluster_status_parse_test.py` still passes. No live cluster run (shared
+    loss cluster — validated by reasoning + captured-output tests only).
+  - **File(s)**: `test/incus/deploy-lib.sh`,
+    `test/incus/cluster-setup.sh`, `test/incus/deploy-lib-selftest.sh`,
+    `docs/ha-cluster-test-plan.md`, `_Log.md`
+
+## 2026-07-03 — #4008: explicit `protocol 0` in an application fanned out to TCP+UDP (over-broad app match)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-164 (MEDIUM, appid — over-broad protocol
+    match). The app-identification catalog builder keyed its "any L4" TCP+UDP
+    fan-out on the RESOLVED protocol number being 0 (`proto == 0`), which
+    conflated three distinct cases that all resolve to 0: an OMITTED protocol
+    (the intended fan-out), an EXPLICIT `protocol 0` (IANA HOPOPT, which
+    `appid.ProtocolNumber("0")` resolves to `(0, true)` — a specific protocol,
+    NOT a wildcard), and an unrepresentable token on the tolerant-load path
+    (`ok == false`). So a single-protocol `protocol 0` application compiled to
+    BOTH a TCP (6) and a UDP (17) catalog entry, and a policy referencing that
+    app over-matched — a TCP-only intent also matched the UDP flow on the same
+    port (over-permit / over-broad classification). Verified genuine and Go-
+    scoped (the fan-out is in the Go compile, NOT the Rust dataplane match):
+    scratch catalog build showed `protocol 0` → `[6 17]` (bug), `protocol tcp`
+    → `[6]` (correct), omitted → `[6 17]` (deliberate default).
+  - **Fix**: key the fan-out on the protocol being ABSENT
+    (`strings.TrimSpace(app.Protocol) == ""`) instead of the resolved number
+    being 0. Only an omitted spec fans out to TCP+UDP; every explicit protocol
+    (including `protocol 0`) stays a single entry. The redundant
+    `app.Protocol != "icmp"` guard is subsumed — a non-empty protocol never
+    fans out. Applied to `pkg/appid/catalog.go` (the LIVE catalog shipped to
+    the userspace-dp helper via `pkg/dataplane/userspace/flow.go` →
+    `AppCatalogEntrySnapshot`) and mirrored in `pkg/dataplane/compiler.go`
+    (retired-eBPF; its `SetApplication`/`SetAppRange` writes are no-ops, but
+    keeping the fan-out identical preserves the documented parity invariant).
+    The omitted-protocol default (`any-l4` fan-out, `TestAppCatalogEntryPorts
+    AndProtos`) is unchanged.
+  - **Validation**: added `pkg/appid/catalog_proto0_4008_test.go` — RED-on-
+    revert on both `TestCatalogExplicitProtocol0DoesNotFanOut` and the full
+    config-parse `TestCatalogProtocol0FromParsedConfig` (revert → `protocol 0`
+    → `[6 17]`, both FAIL; fix → `[0]`, PASS). `go test ./pkg/appid/...
+    ./pkg/config/... ./pkg/dataplane/` green; `go build ./...`, `go vet`,
+    `gofmt` clean.
+  - **File(s)**: pkg/appid/catalog.go, pkg/dataplane/compiler.go,
+    pkg/appid/catalog_proto0_4008_test.go, pkg/appid/README.md, _Log.md
 ## 2026-07-03 — #4005: `monitor traffic matching "<filter>"` truncated the pcap filter to the first token
 
 - **Timestamp**: 2026-07-03

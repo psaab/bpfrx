@@ -612,9 +612,17 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		algType := algTypeFromString(app.ALG)
 
 		// When no protocol is specified, install entries for both TCP and UDP
-		// (matching Junos behavior where omitted protocol means any L4).
+		// (matching Junos behavior where omitted protocol means any L4). An
+		// EXPLICIT protocol — including `protocol 0` (HOPOPT) — matches that
+		// single protocol only. #4008: keying the fan-out on the resolved number
+		// being 0 conflated an explicit `protocol 0` (and an unrepresentable
+		// token) with the omitted case, fanning a single-protocol app out to
+		// TCP+UDP → over-broad match. Key on the protocol being ABSENT instead.
+		// This mirrors appid.BuildCatalog (the LIVE catalog shipped to the
+		// helper); the SetApplication / SetAppRange writes below are the retired
+		// eBPF path (#1476), so this parity keeps the documented invariant true.
 		protos := []uint8{proto}
-		if proto == 0 && app.Protocol != "icmp" {
+		if strings.TrimSpace(app.Protocol) == "" {
 			protos = []uint8{6, 17} // TCP + UDP
 		}
 

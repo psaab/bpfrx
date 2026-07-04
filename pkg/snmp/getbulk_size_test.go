@@ -415,6 +415,125 @@ func TestV2cGetBulk_NothingFitsReturnsTooBig(t *testing.T) {
 	}
 }
 
+// buildV2cGetNextRequest constructs an SNMP v2c GETNEXT request for a list of
+// start OIDs.
+func buildV2cGetNextRequest(community string, requestID int, oids [][]int) []byte {
+	var vbList []byte
+	for _, oid := range oids {
+		oidBytes := berEncodeTLV(tagObjectIdentifier, berEncodeOID(oid))
+		valBytes := berEncodeTLV(tagNull, nil)
+		vbList = append(vbList, berEncodeTLV(tagSequence, append(oidBytes, valBytes...))...)
+	}
+	vbListEnc := berEncodeTLV(tagSequence, vbList)
+
+	pduBody := berEncodeIntegerTLV(requestID)
+	pduBody = append(pduBody, berEncodeIntegerTLV(0)...) // error-status
+	pduBody = append(pduBody, berEncodeIntegerTLV(0)...) // error-index
+	pduBody = append(pduBody, vbListEnc...)
+	pdu := berEncodeTLV(pduGetNextRequest, pduBody)
+
+	msg := berEncodeIntegerTLV(snmpVersion2c)
+	msg = append(msg, berEncodeTLV(tagOctetString, []byte(community))...)
+	msg = append(msg, pdu...)
+	return berEncodeTLV(tagSequence, msg)
+}
+
+// TestV2cGetBulk_SingleLinkListPerPDU is the #4013 RED-on-revert guard: a
+// GETBULK walk over N interfaces must read the interface table (the expensive
+// netlink LinkList in the production ifDataFn) AT MOST ONCE for the whole PDU,
+// not once per findNextOID + once per getOIDValue (two dumps per returned
+// varbind). We count ifDataFn invocations through the same SetIfDataFn seam the
+// daemon wires netlink.LinkList onto.
+//
+// fail-on-revert: restore the per-varbind a.getIfData() calls (drop the
+// per-PDU ifSnapshot) and this walk drives the counter to 2×(#varbinds) — many
+// dozens of dumps — so the `!= 1` assertion fires RED.
+func TestV2cGetBulk_SingleLinkListPerPDU(t *testing.T) {
+	const nIfaces = 20
+
+	a := NewAgent(&config.SNMPConfig{
+		Communities: map[string]*config.SNMPCommunity{
+			"public": {Name: "public", Authorization: "read-only"},
+		},
+	})
+
+	var linkListCalls int
+	ifaces := manyIfData(nIfaces)
+	a.SetIfDataFn(func() []IfData {
+		linkListCalls++
+		return ifaces
+	})
+
+	// Walk the whole ifTable/ifXTable space in one PDU: start at the ifTable
+	// prefix and ask for many repetitions so the walk returns a large number of
+	// varbinds (each of which, pre-#4013, cost two LinkList dumps).
+	req := buildV2cGetBulkRequest("public", 1, 0, 100, [][]int{oidIfTablePrefix})
+	resp := a.handlePacket(req)
+	if resp == nil {
+		t.Fatal("nil response")
+	}
+
+	if linkListCalls != 1 {
+		t.Fatalf("GETBULK over %d interfaces triggered %d LinkList dumps; want exactly 1 per PDU "+
+			"(the per-PDU snapshot is bypassed — O(N)/O(N²) RTM_GETLINK storm)", nIfaces, linkListCalls)
+	}
+
+	// The response must still carry correct, non-empty ifTable data served from
+	// the snapshot — the fix must not blank the table.
+	errStatus, oids := v2cResponseVarbinds(t, resp)
+	if errStatus != errNoError {
+		t.Fatalf("error-status = %d, want noError", errStatus)
+	}
+	if len(oids) == 0 {
+		t.Fatal("snapshot-served GETBULK returned no varbinds")
+	}
+	// First returned varbind is ifIndex column 1 for the first interface; its
+	// value must equal that interface's IfIndex (proves values come through).
+	firstIfIndexOID := append(append([]int{}, oidIfTablePrefix...), 1, 1)
+	if !oidEqual(oids[0], firstIfIndexOID) {
+		t.Fatalf("first walked OID = %v, want ifTable ifIndex.1 %v", oids[0], firstIfIndexOID)
+	}
+	val, tag := getIfTableValue(1, 1, ifaces)
+	if tag != tagInteger {
+		t.Fatalf("ifIndex.1 tag = %d, want INTEGER", tag)
+	}
+	if decoded, _, _ := berDecodeInteger(berEncodeTLV(tagInteger, val)); decoded != 1 {
+		t.Fatalf("ifIndex.1 value = %d, want 1", decoded)
+	}
+}
+
+// TestV2cGetNext_SingleLinkListPerPDU asserts the same one-dump-per-PDU bound
+// for a GETNEXT that requests several ifTable OIDs at once: the shared snapshot
+// means the whole PDU reads the interface table once, not once per varbind.
+func TestV2cGetNext_SingleLinkListPerPDU(t *testing.T) {
+	a := NewAgent(&config.SNMPConfig{
+		Communities: map[string]*config.SNMPCommunity{
+			"public": {Name: "public", Authorization: "read-only"},
+		},
+	})
+
+	var linkListCalls int
+	ifaces := manyIfData(8)
+	a.SetIfDataFn(func() []IfData {
+		linkListCalls++
+		return ifaces
+	})
+
+	// GETNEXT with three ifTable start OIDs in one PDU. Each varbind does a
+	// findNextOID + getOIDValue; pre-#4013 that is 6 dumps, post-#4013 it is 1.
+	c1 := append(append([]int{}, oidIfTablePrefix...), 1, 1)
+	c2 := append(append([]int{}, oidIfTablePrefix...), 1, 2)
+	c3 := append(append([]int{}, oidIfTablePrefix...), 1, 3)
+	req := buildV2cGetNextRequest("public", 5, [][]int{c1, c2, c3})
+	resp := a.handlePacket(req)
+	if resp == nil {
+		t.Fatal("nil response")
+	}
+	if linkListCalls != 1 {
+		t.Fatalf("GETNEXT of 3 ifTable OIDs triggered %d LinkList dumps; want exactly 1 per PDU", linkListCalls)
+	}
+}
+
 // TestEffectiveMaxSize pins the min/floor derivation directly.
 func TestEffectiveMaxSize(t *testing.T) {
 	cases := []struct {

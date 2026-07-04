@@ -347,6 +347,12 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 	var respVarbinds []varbind
 	var requestID int
 
+	// One interface snapshot for the whole PDU (#4013): the GET/GETNEXT/GETBULK
+	// cases below walk the ifTable/ifXTable through findNextOIDSnap /
+	// getOIDValueSnap so the netlink LinkList happens at most once per request
+	// instead of twice per returned varbind.
+	snap := a.newIfSnapshot()
+
 	switch pduTag {
 	case pduGetRequest:
 		var oids [][]int
@@ -359,7 +365,7 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagNoSuchInstance})
 				continue
 			}
-			val, valTag := a.getOIDValue(oid)
+			val, valTag := a.getOIDValueSnap(oid, snap)
 			if val == nil {
 				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagNoSuchInstance})
 			} else {
@@ -378,11 +384,11 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagEndOfMibView})
 				continue
 			}
-			nextOID := a.findNextOID(oid)
+			nextOID := a.findNextOIDSnap(oid, snap)
 			if nextOID == nil {
 				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagEndOfMibView})
 			} else {
-				val, valTag := a.getOIDValue(nextOID)
+				val, valTag := a.getOIDValueSnap(nextOID, snap)
 				respVarbinds = append(respVarbinds, varbind{oid: nextOID, tag: valTag, value: val})
 			}
 		}
@@ -413,23 +419,23 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 			break
 		}
 		for i := 0; i < nonRepeaters && i < len(oids); i++ {
-			nextOID := a.findNextOID(oids[i])
+			nextOID := a.findNextOIDSnap(oids[i], snap)
 			if nextOID == nil {
 				respVarbinds = append(respVarbinds, varbind{oid: oids[i], tag: tagEndOfMibView})
 			} else {
-				val, valTag := a.getOIDValue(nextOID)
+				val, valTag := a.getOIDValueSnap(nextOID, snap)
 				respVarbinds = append(respVarbinds, varbind{oid: nextOID, tag: valTag, value: val})
 			}
 		}
 		for i := nonRepeaters; i < len(oids); i++ {
 			currentOID := oids[i]
 			for j := 0; j < maxRepetitions; j++ {
-				nextOID := a.findNextOID(currentOID)
+				nextOID := a.findNextOIDSnap(currentOID, snap)
 				if nextOID == nil {
 					respVarbinds = append(respVarbinds, varbind{oid: currentOID, tag: tagEndOfMibView})
 					break
 				}
-				val, valTag := a.getOIDValue(nextOID)
+				val, valTag := a.getOIDValueSnap(nextOID, snap)
 				respVarbinds = append(respVarbinds, varbind{oid: nextOID, tag: valTag, value: val})
 				currentOID = nextOID
 			}
