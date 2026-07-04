@@ -223,11 +223,14 @@ func (c *ctl) dispatchOperational(line string) error {
 		// interceptor — it only fires while an RPC is in flight, never
 		// on connection close. Issuing EnterConfigure here and exiting
 		// would leak the daemon-side config lock until daemon restart.
-		// Exclusive locks are especially bad: EnterConfigureExclusive
-		// sets `exclusiveHolder`, but ExitConfigureSession only
-		// releases when the session matches `configHolder`, so even
-		// an explicit teardown call wouldn't recover them.
-		// See #1563.
+		// Exclusive locks were historically worse: EnterConfigureExclusive
+		// records the holder in `exclusiveHolder`, but ExitConfigureSession
+		// used to release only when the session matched `configHolder`, so
+		// even an explicit teardown could not recover them. #3979 fixed the
+		// release path to match the effective holder; this -c leak is
+		// unaffected by that fix because it stems from the interceptor never
+		// firing on an idle connection close, not the holder mismatch.
+		// See #1563, #3979.
 		if c.rl == nil {
 			return fmt.Errorf(
 				"configuration mode requires an interactive terminal " +
