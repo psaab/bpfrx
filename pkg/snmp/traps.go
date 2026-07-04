@@ -14,10 +14,33 @@ import (
 // SNMPv2-Trap PDU type (context-specific, constructed, tag 7).
 const pduSNMPv2Trap = 0xa7
 
+// SNMPv1 Trap-PDU type (context-specific, constructed, tag 4). RFC 1157.
+const pduSNMPv1Trap = 0xa4
+
+// snmpVersion1 is the message version field value for SNMPv1 (0). The v2c
+// message version (1) is snmpVersion2c in agent.go.
+const snmpVersion1 = 0
+
+// tagIPAddress is the ASN.1 application tag (class application, primitive,
+// number 0) for IpAddress / NetworkAddress — the agent-addr field of an
+// SNMPv1 Trap-PDU.
+const tagIPAddress = 0x40
+
+// SNMPv1 generic-trap values (RFC 1157). specific-trap is 0 for these.
+const (
+	genericTrapLinkDown = 2
+	genericTrapLinkUp   = 3
+)
+
 // Standard trap OIDs.
 var (
 	// snmpTrapOID.0: 1.3.6.1.6.3.1.1.4.1.0
 	oidSnmpTrapOID = []int{1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0}
+
+	// snmpTraps node: 1.3.6.1.6.3.1.1.5 — the enterprise field of an SNMPv1
+	// Trap-PDU carrying a standard generic trap, per RFC 2576 §3.1
+	// (SNMPv2->SNMPv1 notification mapping).
+	oidSnmpTraps = []int{1, 3, 6, 1, 6, 3, 1, 1, 5}
 
 	// linkDown: 1.3.6.1.6.3.1.1.5.3
 	oidLinkDown = []int{1, 3, 6, 1, 6, 3, 1, 1, 5, 3}
@@ -100,6 +123,89 @@ func (a *Agent) buildLinkTrap(community string, linkUp bool, ifindex int, ifname
 	return berEncodeTLV(tagSequence, msgBody)
 }
 
+// buildLinkTrapV1 builds an SNMPv1 Trap-PDU (RFC 1157) for a link up/down
+// event, for a trap group configured `version v1` (#3948). A v1-only receiver
+// drops the SNMPv2c trap buildLinkTrap emits, so a v1 group must send the
+// distinct v1 PDU shape: the trap type is carried in the generic-trap /
+// specific-trap / time-stamp fields (not as sysUpTime.0 + snmpTrapOID.0
+// varbinds), and the message version field is 0. The enterprise is the
+// snmpTraps node and agent-addr is 0.0.0.0, per the RFC 2576 §3.1
+// SNMPv2->SNMPv1 mapping for a standard generic trap.
+func (a *Agent) buildLinkTrapV1(community string, linkUp bool, ifindex int, ifname string) []byte {
+	// sysUpTime in hundredths of a second.
+	uptime := int(time.Since(a.startTime).Milliseconds() / 10)
+
+	genericTrap := genericTrapLinkDown
+	operStatus := 2 // down
+	if linkUp {
+		genericTrap = genericTrapLinkUp
+		operStatus = 1 // up
+	}
+
+	// Varbinds: ifIndex, ifDescr, ifOperStatus. sysUpTime.0 and snmpTrapOID.0
+	// are NOT repeated as varbinds in v1 — they map to the time-stamp field
+	// and the generic-trap/enterprise fields respectively.
+	ifIndexOID := append(append([]int{}, oidIfIndex...), ifindex)
+	vb1OID := berEncodeTLV(tagObjectIdentifier, berEncodeOID(ifIndexOID))
+	vb1Val := berEncodeIntegerTLV(ifindex)
+	vb1 := berEncodeTLV(tagSequence, append(vb1OID, vb1Val...))
+
+	ifDescrOID := append(append([]int{}, oidIfDescr...), ifindex)
+	vb2OID := berEncodeTLV(tagObjectIdentifier, berEncodeOID(ifDescrOID))
+	vb2Val := berEncodeTLV(tagOctetString, []byte(ifname))
+	vb2 := berEncodeTLV(tagSequence, append(vb2OID, vb2Val...))
+
+	ifOperOID := append(append([]int{}, oidIfOperStatus...), ifindex)
+	vb3OID := berEncodeTLV(tagObjectIdentifier, berEncodeOID(ifOperOID))
+	vb3Val := berEncodeIntegerTLV(operStatus)
+	vb3 := berEncodeTLV(tagSequence, append(vb3OID, vb3Val...))
+
+	var vbList []byte
+	vbList = append(vbList, vb1...)
+	vbList = append(vbList, vb2...)
+	vbList = append(vbList, vb3...)
+	vbListEncoded := berEncodeTLV(tagSequence, vbList)
+
+	// Trap-PDU body: enterprise, agent-addr, generic-trap, specific-trap,
+	// time-stamp, variable-bindings.
+	var pduBody []byte
+	pduBody = append(pduBody, berEncodeTLV(tagObjectIdentifier, berEncodeOID(oidSnmpTraps))...)
+	pduBody = append(pduBody, berEncodeTLV(tagIPAddress, []byte{0, 0, 0, 0})...)
+	pduBody = append(pduBody, berEncodeIntegerTLV(genericTrap)...)
+	pduBody = append(pduBody, berEncodeIntegerTLV(0)...) // specific-trap
+	pduBody = append(pduBody, berEncodeTLV(tagTimeTicks, berEncodeTimeTicks(uptime))...)
+	pduBody = append(pduBody, vbListEncoded...)
+
+	pduEncoded := berEncodeTLV(pduSNMPv1Trap, pduBody)
+
+	// Message: version(v1=0), community, PDU.
+	msgBody := berEncodeIntegerTLV(snmpVersion1)
+	msgBody = append(msgBody, berEncodeTLV(tagOctetString, []byte(community))...)
+	msgBody = append(msgBody, pduEncoded...)
+
+	return berEncodeTLV(tagSequence, msgBody)
+}
+
+// buildLinkTrapsForVersion returns the pre-built trap packet(s) a trap group
+// with the given configured version emits for a link event (#3948). Junos
+// trap-group version semantics: "v1" emits an SNMPv1 Trap-PDU, "v2" (or an
+// empty/unspecified value — the default) emits an SNMPv2c trap, and "all"
+// emits BOTH. Any unrecognized value defaults to v2c (the pre-#3948 behavior)
+// rather than dropping the notification.
+func (a *Agent) buildLinkTrapsForVersion(community, version string, linkUp bool, ifindex int, ifname string) [][]byte {
+	switch version {
+	case "v1":
+		return [][]byte{a.buildLinkTrapV1(community, linkUp, ifindex, ifname)}
+	case "all":
+		return [][]byte{
+			a.buildLinkTrapV1(community, linkUp, ifindex, ifname),
+			a.buildLinkTrap(community, linkUp, ifindex, ifname),
+		}
+	default: // "v2", "" (unspecified), or anything else -> v2c
+		return [][]byte{a.buildLinkTrap(community, linkUp, ifindex, ifname)}
+	}
+}
+
 // trapSender delivers a single pre-built trap to a target. It is a package
 // var (not a direct call) so tests can inject a deliberately slow/blocking
 // sender to prove the link-monitor caller does not block on trap delivery
@@ -150,27 +256,31 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 
 	community := selectTrapCommunity(cfg)
 
-	pkt := a.buildLinkTrap(community, linkUp, ifindex, ifname)
-
 	direction := "down"
 	if linkUp {
 		direction = "up"
 	}
 
-	// Enqueue one job per target. The blocking dial/write happens on the
-	// trap worker so a dead or slow target never stalls the link monitor
-	// (#2991). Iterate trap groups in deterministic (sorted) order so log
-	// output and dispatch ordering are stable across runs.
+	// Enqueue one job per target. The trap PDU is built per group because the
+	// SNMP version is a per-trap-group setting (#3948): a `version v1` group
+	// gets an SNMPv1 Trap-PDU, `v2`/unspecified a v2c trap, and `all` both.
+	// The blocking dial/write happens on the trap worker so a dead or slow
+	// target never stalls the link monitor (#2991). Iterate trap groups in
+	// deterministic (sorted) order so log output and dispatch ordering are
+	// stable across runs.
 	for _, tg := range sortedTrapGroups(cfg) {
+		pkts := a.buildLinkTrapsForVersion(community, tg.Version, linkUp, ifindex, ifname)
 		for _, target := range tg.Targets {
-			a.enqueueTrap(trapJob{
-				target:  target,
-				pkt:     pkt,
-				group:   tg.Name,
-				event:   "link" + direction,
-				iface:   ifname,
-				ifindex: ifindex,
-			})
+			for _, pkt := range pkts {
+				a.enqueueTrap(trapJob{
+					target:  target,
+					pkt:     pkt,
+					group:   tg.Name,
+					event:   "link" + direction,
+					iface:   ifname,
+					ifindex: ifindex,
+				})
+			}
 		}
 	}
 }

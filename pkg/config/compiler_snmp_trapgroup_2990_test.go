@@ -134,6 +134,60 @@ func TestSNMPTrapGroup_ValidAccepted(t *testing.T) {
 	}
 }
 
+// TestSNMPTrapGroup_VersionCarried is the config->struct half of the #3948
+// fix: a trap-group `version` (v1|v2|all) must land on SNMPTrapGroup.Version so
+// the emitter can honor it. Before the fix the compiler recognized `version`
+// only to avoid the unknown-key rejection but dropped its value, so every group
+// emitted v2c. Reverting the `tg.Version = nodeVal(prop)` line leaves Version
+// empty here and fails these assertions.
+func TestSNMPTrapGroup_VersionCarried(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want string
+	}{
+		{"v1", "set snmp trap-group g1 version v1", "v1"},
+		{"v2", "set snmp trap-group g1 version v2", "v2"},
+		{"all", "set snmp trap-group g1 version all", "all"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := compileSNMPLines(t, []string{
+				"set snmp trap-group g1 targets 10.0.0.10",
+				tc.line,
+			})
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			tg := cfg.System.SNMP.TrapGroups["g1"]
+			if tg == nil {
+				t.Fatal("trap-group 'g1' missing from compiled config")
+			}
+			if tg.Version != tc.want {
+				t.Fatalf("Version = %q, want %q", tg.Version, tc.want)
+			}
+		})
+	}
+}
+
+// TestSNMPTrapGroup_VersionUnspecifiedEmpty confirms an unspecified version
+// stays empty in the typed config; the emitter defaults that to v2c (#3948).
+func TestSNMPTrapGroup_VersionUnspecifiedEmpty(t *testing.T) {
+	cfg, err := compileSNMPLines(t, []string{
+		"set snmp trap-group g1 targets 10.0.0.10",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	tg := cfg.System.SNMP.TrapGroups["g1"]
+	if tg == nil {
+		t.Fatal("trap-group 'g1' missing from compiled config")
+	}
+	if tg.Version != "" {
+		t.Fatalf("Version = %q, want empty (unspecified)", tg.Version)
+	}
+}
+
 // TestSNMPTrapGroup_BracketedTargets confirms a bracketed/flat-set list of
 // targets accumulates (the multi-value leaf contract, docs/config-schema.md).
 func TestSNMPTrapGroup_BracketedTargets(t *testing.T) {
