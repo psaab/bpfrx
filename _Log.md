@@ -1,3 +1,40 @@
+## 2026-07-04 — #4076: bump linkGen on anchor transient-lookup + device-vanished recreate
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (f1c54a5a4). Confirmed the #4075
+    follow-up gap in `applyAnchorLocked` (`pkg/routing/tunnel.go`): its
+    up-front `willRecreate` switch (`tunnel.go:515`) has only
+    `lookupErr == nil` and `isLinkNotFound` cases — NO `default: return`
+    (unlike the legacy `applyKernelTunnelLocked`, `tunnel.go:777`, which
+    aborts a transient non-not-found lookup error). So a TRANSIENT
+    (non-not-found) `LinkByName` error leaves `willRecreate=false` (no
+    up-front `stopKeepaliveLocked`/`bumpLinkGenLocked`), yet if the device
+    had simultaneously VANISHED the fall-through `LinkAdd` SUCCEEDS
+    (`created=true`, `tunnel.go:570`) against a genuinely NEW device with
+    a STALE `linkGen`. A stale keepalive runner still holding the previous
+    generation would then pass the lock-free gen guard
+    (`keepaliveTick`, `tunnel.go:1601`) and `LinkSet*` the fresh device in
+    the µs window before `startKeepalive` drains it. FIX: added a
+    `if created && !willRecreate { t.bumpLinkGenLocked(tc.Name) }` block
+    after the `LinkAdd`/`link==nil` reconcile (`tunnel.go` ~:584) — every
+    genuinely new device gets a fresh generation. Guarded on
+    `!willRecreate` so the classified-recreate path (already bumped +
+    drained up-front) is not double-bumped, and gated on `created` so a
+    plain reuse/adopt reconcile never needlessly bumps (no per-apply
+    re-resolve of a stable keepalive). Chose the issue's preferred
+    non-aborting one-line hardening over mirroring the legacy
+    `default: return`. TESTS:
+    `TestAnchorKeepaliveTransientLookupVanishedBumpsGen`
+    (byNameHardErr + addExisting=false → LinkAdd created → gen MUST bump;
+    RED on revert: 0->0) +
+    `TestAnchorKeepaliveReuseDoesNotBumpGen` (repeated reuse applies →
+    gen unchanged, no needless re-resolve). RED-on-revert verified. Full
+    `go test ./pkg/routing/...` green; `go build ./...`, `go vet`, gofmt
+    clean. Updated `pkg/routing/README.md` Recreate-safety bullet.
+  - **File(s)**: pkg/routing/tunnel.go,
+    pkg/routing/tunnel_anchor_keepalive_test.go, pkg/routing/README.md,
+    _Log.md
+
 ## 2026-07-04 — #3860: warn at commit when a scheduler defines no window
 
 - **Timestamp**: 2026-07-04

@@ -581,6 +581,24 @@ func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool
 			slog.Info("tunnel anchor created", "name", tc.Name, "mode", "tun")
 		}
 	}
+	// #4076: a genuine (re)create ALWAYS gets a fresh generation. The
+	// up-front willRecreate block bumps for the CLASSIFIED recreate
+	// (reusable-mismatch / not-found). But a TRANSIENT (non-not-found)
+	// lookup error masks the recreate there — willRecreate stays false
+	// because the switch has no `default` (unlike the legacy branch's
+	// `default: return`) — while the device had actually VANISHED, so the
+	// LinkAdd above SUCCEEDED and `created` is now true against a NEW
+	// device. Bump the generation here so a keepalive runner still holding
+	// the previous generation drops its netlink op (the lock-free gen
+	// guard in keepaliveTick) before it can LinkSet* the fresh device in
+	// the µs window before startKeepalive drains it. Guarded on
+	// !willRecreate so the classified-recreate path (already bumped
+	// up-front) is not double-bumped, and gated on `created` so a plain
+	// reuse/adopt reconcile never needlessly bumps (no per-apply
+	// re-resolve of a stable keepalive). fable-161 F-063 follow-up.
+	if created && !willRecreate {
+		t.bumpLinkGenLocked(tc.Name)
+	}
 	if !created {
 		t.reconcileAnchorMTULocked(tc, link, adopting)
 	}

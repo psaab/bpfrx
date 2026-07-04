@@ -259,3 +259,92 @@ func TestAnchorKeepaliveTransientLookupKeepsRunner(t *testing.T) {
 		t.Fatalf("transient lookup error must NOT bump the generation: %d -> %d", startGen, gen.Load())
 	}
 }
+
+// --- #4076: a TRANSIENT (non-not-found) lookup error whose device has
+// SIMULTANEOUSLY VANISHED — so LinkAdd SUCCEEDS (created=true) — is a
+// genuine (re)create. The up-front willRecreate classification cannot see
+// the vanish THROUGH the transient error (the anchor switch has no
+// `default: return`, unlike the legacy branch), so willRecreate stays
+// false and the up-front bump is skipped. The created=true bump MUST then
+// advance the generation so a stale keepalive runner still holding the
+// previous generation drops any in-flight LinkSet* against the fresh
+// device (the lock-free gen guard in keepaliveTick). RED-on-revert:
+// dropping the created=true bump leaves the generation unbumped here. ---
+func TestAnchorKeepaliveTransientLookupVanishedBumpsGen(t *testing.T) {
+	ops := newFakeLinkOps()
+	// Transient (non-not-found) lookup error → willRecreate stays false.
+	ops.byNameHardErr["gr-0-0-0"] = errors.New("transient netlink transport error")
+	// Device vanished: addExisting stays false → LinkAdd SUCCEEDS → created=true.
+	tm, _ := newReconcileManager(ops)
+	// Alive prober + 60s interval so the runner startKeepalive spawns does
+	// no real I/O and never ticks during the test.
+	tm.prober = &fakeProber{results: []probeOutcome{{result: ProbeAlive, kind: UnsupportedNone}}}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.ensureReconcileStateLocked()
+
+	// Seed a STALE runner holding the PREVIOUS generation (pre-closed done
+	// so any drain is instant). This is the runner the bump must invalidate.
+	gen := tm.linkGenForLocked("gr-0-0-0")
+	startGen := gen.Load()
+	state := &KeepaliveState{
+		Up: true, RemoteAddr: "203.0.113.1", SourceAddr: "198.51.100.1",
+		Interval: 60, MaxRetries: 3,
+	}
+	seededDone := make(chan struct{})
+	close(seededDone)
+	tm.keepalives["gr-0-0-0"] = &keepaliveRunner{
+		cancel: func() {}, state: state, done: seededDone,
+		remote: "203.0.113.1", source: "198.51.100.1", interval: 60, maxRetries: 3,
+		linkGen: gen, startGen: startGen,
+	}
+
+	tm.applyAnchorLocked(anchorKATC("gr-0-0-0", 60, 3), false)
+
+	// The device genuinely vanished + was recreated (LinkAdd succeeded) →
+	// the generation MUST have advanced so the stale runner's gen guard
+	// drops any in-flight LinkSet* against the new device.
+	if gen.Load() <= startGen {
+		t.Fatalf("transient-lookup + device-vanished (LinkAdd created) must BUMP the generation: %d -> %d", startGen, gen.Load())
+	}
+
+	// Drain the fresh runner startKeepalive spawned (restartKA fired on created).
+	tm.stopKeepaliveLocked("gr-0-0-0")
+}
+
+// --- #4076 (companion, no-needless-re-resolve): a REUSED (matching)
+// anchor TUN across repeated applies must NOT bump the generation. The
+// created=true bump fires only on a genuine (re)create, never on a plain
+// reconcile, so a stable keepalive is never forced to re-resolve its
+// anchor each commit. ---
+func TestAnchorKeepaliveReuseDoesNotBumpGen(t *testing.T) {
+	ops := newFakeLinkOps()
+	seedAnchor(ops, "gr-0-0-0", 10, 1500) // reusable TUN → reuse-in-place (no recreate)
+	tm, _ := newReconcileManager(ops)
+	tm.prober = &fakeProber{results: []probeOutcome{{result: ProbeAlive, kind: UnsupportedNone}}}
+
+	tc := anchorKATC("gr-0-0-0", 60, 3)
+	if err := tm.Apply([]*config.TunnelConfig{tc}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	tm.mu.Lock()
+	gen := tm.linkGenForLocked("gr-0-0-0")
+	afterFirst := gen.Load()
+	tm.mu.Unlock()
+
+	// Repeated identical applies (steady state, device reused each time)
+	// must leave the generation untouched — no needless re-resolve.
+	for i := 0; i < 3; i++ {
+		if err := tm.Apply([]*config.TunnelConfig{tc}); err != nil {
+			t.Fatalf("Apply %d: %v", i+2, err)
+		}
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if got := gen.Load(); got != afterFirst {
+		t.Fatalf("steady-state reuse must NOT bump the generation: %d -> %d", afterFirst, got)
+	}
+	tm.stopKeepaliveLocked("gr-0-0-0")
+}
