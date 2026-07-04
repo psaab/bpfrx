@@ -828,6 +828,13 @@ func (c *CLI) handleShowSystem(args []string) error {
 		return nil
 
 	case "rollback":
+		// Secret redaction (#4099): rollback slots render a historical config
+		// AST that carries the same cleartext secret leaves as `show
+		// configuration`. Route a VIEW-only login class through the #4051
+		// *Redacted store methods so `show system rollback N [| display set]`
+		// cannot harvest IKE PSKs / SNMP communities / auth-keys; super-user
+		// (and the no-RBAC empty class) still sees cleartext.
+		redact := c.showConfigRedacted()
 		if len(args) >= 2 {
 			// "show system rollback compare N" — diff rollback N against active
 			if args[1] == "compare" {
@@ -838,7 +845,12 @@ func (c *CLI) handleShowSystem(args []string) error {
 				if err != nil || n < 1 {
 					return fmt.Errorf("usage: show system rollback compare <N>")
 				}
-				diff, err := c.store.ShowCompareRollback(n)
+				var diff string
+				if redact {
+					diff, err = c.store.ShowCompareRollbackRedacted(n)
+				} else {
+					diff, err = c.store.ShowCompareRollback(n)
+				}
 				if err != nil {
 					return err
 				}
@@ -857,13 +869,23 @@ func (c *CLI) handleShowSystem(args []string) error {
 			}
 			rest := strings.Join(args[2:], " ")
 			if strings.Contains(rest, "| display set") {
-				content, err := c.store.ShowRollbackSet(n)
+				var content string
+				if redact {
+					content, err = c.store.ShowRollbackSetRedacted(n)
+				} else {
+					content, err = c.store.ShowRollbackSet(n)
+				}
 				if err != nil {
 					return err
 				}
 				fmt.Print(content)
 			} else if strings.Contains(rest, "compare") {
-				diff, err := c.store.ShowCompareRollback(n)
+				var diff string
+				if redact {
+					diff, err = c.store.ShowCompareRollbackRedacted(n)
+				} else {
+					diff, err = c.store.ShowCompareRollback(n)
+				}
 				if err != nil {
 					return err
 				}
@@ -873,7 +895,12 @@ func (c *CLI) handleShowSystem(args []string) error {
 					fmt.Print(diff)
 				}
 			} else {
-				content, err := c.store.ShowRollback(n)
+				var content string
+				if redact {
+					content, err = c.store.ShowRollbackRedacted(n)
+				} else {
+					content, err = c.store.ShowRollback(n)
+				}
 				if err != nil {
 					return err
 				}
@@ -962,7 +989,9 @@ func (c *CLI) handleShowSystem(args []string) error {
 		if cfg == nil {
 			return fmt.Errorf("no active configuration")
 		}
-		fmt.Print(c.store.ShowActivePath([]string{"system", "login"}))
+		// #4099: system login carries encrypted-password hashes — mask them
+		// for a VIEW-only login class via the #4051 redacted renderer.
+		fmt.Print(c.showActiveConfigPath([]string{"system", "login"}))
 		return nil
 
 	case "internet-options":
@@ -970,7 +999,7 @@ func (c *CLI) handleShowSystem(args []string) error {
 		if cfg == nil {
 			return fmt.Errorf("no active configuration")
 		}
-		fmt.Print(c.store.ShowActivePath([]string{"system", "internet-options"}))
+		fmt.Print(c.showActiveConfigPath([]string{"system", "internet-options"}))
 		return nil
 
 	case "root-authentication":
@@ -978,12 +1007,23 @@ func (c *CLI) handleShowSystem(args []string) error {
 		if cfg == nil {
 			return fmt.Errorf("no active configuration")
 		}
-		fmt.Print(c.store.ShowActivePath([]string{"system", "root-authentication"}))
+		// #4099: root-authentication is the encrypted root password — mask it
+		// for a VIEW-only login class.
+		fmt.Print(c.showActiveConfigPath([]string{"system", "root-authentication"}))
 		return nil
 
 	case "configuration":
 		if len(args) >= 2 && args[1] == "rescue" {
-			content, err := c.store.LoadRescueConfig()
+			// #4099: rescue.conf is the full active config TEXT with cleartext
+			// secret leaves (#4056). Mask them for a VIEW-only login class via
+			// the reparse+RedactedClone path (fail-closed on parse error).
+			var content string
+			var err error
+			if c.showConfigRedacted() {
+				content, err = c.store.LoadRescueConfigRedacted()
+			} else {
+				content, err = c.store.LoadRescueConfig()
+			}
 			if err != nil {
 				return err
 			}

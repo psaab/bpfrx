@@ -344,6 +344,16 @@ func (c *CLI) handleConfigShow(args []string) error {
 	// Check for pipe commands
 	line := strings.Join(args, " ")
 
+	// Secret redaction (#4099): route the config-mode config display through
+	// the #4051 *Redacted store methods for a login class that
+	// showConfigRedacted() flags. Config mode requires PermConfig (super-user
+	// today), so this is defense-in-depth — cleartext for the current
+	// reachable class, and automatically masked should a non-super-user ever
+	// gain config-view access. The redacted candidate variants take the path
+	// directly (nil/empty == whole tree) and mirror the cleartext siblings'
+	// nil-source defaults.
+	redact := c.showConfigRedacted()
+
 	if strings.Contains(line, "| compare") {
 		// Check for "| compare rollback N"
 		if idx := strings.Index(line, "| compare rollback"); idx >= 0 {
@@ -352,18 +362,27 @@ func (c *CLI) handleConfigShow(args []string) error {
 			if err != nil || n < 1 {
 				return fmt.Errorf("usage: show | compare rollback <N>")
 			}
-			diff, err := c.store.ShowCompareRollback(n)
+			var diff string
+			if redact {
+				diff, err = c.store.ShowCompareRollbackRedacted(n)
+			} else {
+				diff, err = c.store.ShowCompareRollback(n)
+			}
 			if err != nil {
 				return err
 			}
 			fmt.Print(diff)
 			return nil
 		}
-		fmt.Print(c.store.ShowCompare())
+		if redact {
+			fmt.Print(c.store.ShowCompareRedacted())
+		} else {
+			fmt.Print(c.store.ShowCompare())
+		}
 		return nil
 	}
 
-	// Build path from editPath + args before the pipe (used by all display formats).
+	// Build path from editPath + args before the pipe (used by all formats).
 	var displayPath []string
 	{
 		editPath := c.store.GetEditPath()
@@ -376,64 +395,47 @@ func (c *CLI) handleConfigShow(args []string) error {
 		}
 	}
 
-	if strings.Contains(line, "| display json") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathJSON(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateJSON())
+	var output string
+	switch {
+	case strings.Contains(line, "| display json"):
+		switch {
+		case redact:
+			output = c.store.ShowCandidateJSONRedacted(displayPath)
+		case len(displayPath) > 0:
+			output = c.store.ShowCandidatePathJSON(displayPath)
+		default:
+			output = c.store.ShowCandidateJSON()
 		}
-		return nil
-	}
-
-	if strings.Contains(line, "| display set") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathSet(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateSet())
+	case strings.Contains(line, "| display set"):
+		switch {
+		case redact:
+			output = c.store.ShowCandidateSetRedacted(displayPath)
+		case len(displayPath) > 0:
+			output = c.store.ShowCandidatePathSet(displayPath)
+		default:
+			output = c.store.ShowCandidateSet()
 		}
-		return nil
-	}
-
-	if strings.Contains(line, "| display xml") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathXML(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateXML())
+	case strings.Contains(line, "| display xml"):
+		switch {
+		case redact:
+			output = c.store.ShowCandidateXMLRedacted(displayPath)
+		case len(displayPath) > 0:
+			output = c.store.ShowCandidatePathXML(displayPath)
+		default:
+			output = c.store.ShowCandidateXML()
 		}
-		return nil
-	}
-
-	if strings.Contains(line, "| display inheritance") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathInheritance(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateInheritance())
+	case strings.Contains(line, "| display inheritance"):
+		switch {
+		case redact:
+			output = c.store.ShowCandidateInheritanceRedacted(displayPath)
+		case len(displayPath) > 0:
+			output = c.store.ShowCandidatePathInheritance(displayPath)
+		default:
+			output = c.store.ShowCandidateInheritance()
 		}
-		return nil
-	}
-
-	// Unknown pipe command
-	if idx := strings.Index(line, "| "); idx >= 0 {
+	case strings.Index(line, "| ") >= 0:
+		// Unknown pipe command
+		idx := strings.Index(line, "| ")
 		pipeParts := strings.Fields(strings.TrimSpace(line[idx+2:]))
 		if len(pipeParts) >= 2 && pipeParts[0] == "display" {
 			fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
@@ -441,25 +443,21 @@ func (c *CLI) handleConfigShow(args []string) error {
 			fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
 		}
 		return nil
-	}
-
-	// Show scoped to path (editPath + args)
-	fullPath := append([]string{}, c.store.GetEditPath()...)
-	for _, a := range args {
-		if a == "|" {
-			break
+	default:
+		// Show scoped to path (editPath + args), or the whole candidate.
+		switch {
+		case redact:
+			output = c.store.ShowCandidateRedacted(displayPath)
+		case len(displayPath) > 0:
+			output = c.store.ShowCandidatePath(displayPath)
+		default:
+			output = c.store.ShowCandidate()
 		}
-		fullPath = append(fullPath, a)
 	}
-	if len(fullPath) > 0 {
-		output := c.store.ShowCandidatePath(fullPath)
-		if output == "" {
-			fmt.Printf("configuration path not found: %s\n", strings.Join(fullPath, " "))
-		} else {
-			fmt.Print(output)
-		}
+	if len(displayPath) > 0 && output == "" {
+		fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
 	} else {
-		fmt.Print(c.store.ShowCandidate())
+		fmt.Print(output)
 	}
 	return nil
 }

@@ -42,6 +42,65 @@
     ./pkg/config/... ./pkg/appid/... ./pkg/policymatch/...
     ./pkg/dataplane/userspace/...` green; `go build ./...` + `go vet` clean.
 
+## 2026-07-04 — #4099: on-box CLI `show configuration` secret redaction by login class
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed fable-163 F3 (HIGH security, secret disclosure to a
+    VIEW-only login class). VERIFY-FIRST: the on-box interactive CLI
+    config-render show paths called the NON-redacted `Show*` store
+    methods, so a `read-only` / `config-viewer` / `operator` (all
+    PermView) login could `show configuration` and harvest cleartext IKE
+    PSKs, SNMP communities, BGP auth-keys, WireGuard private keys and the
+    encrypted root password — the CLI residual of #4051/F-020, which had
+    wired only the REST + gRPC ShowConfig paths through the `*Redacted`
+    `RedactedClone` renderers. DECISION: redact for every login class
+    EXCEPT `super-user` (and the unset/no-RBAC class = privileged); this
+    closes the reported VIEW-only leak while preserving the deliberate
+    #4057 super-user/root cleartext allowance (root has direct DB
+    filesystem access). Unknown class fails closed. Matches Junos (never
+    cleartext in show config) and the always-redacted REST/gRPC path.
+    FIX: new predicate `CLI.showConfigRedacted()` + helper
+    `showActiveConfigPath()` (`pkg/cli/permissions.go`) route
+    `cli_show.go` (case "configuration", all formats + path variants),
+    `cli_show_system.go` (`show system rollback [N|compare]`, `show
+    system login`/`internet-options`/`root-authentication`, `show system
+    configuration rescue`), and `cli_config.go handleConfigShow`
+    (config-mode candidate show / `| compare [rollback N]`,
+    defense-in-depth under PermConfig) through the existing `*Redacted`
+    store methods. Added `Store.LoadRescueConfigRedacted()`
+    (`pkg/configstore/store_persist.go`) — reparse + `RedactedClone` +
+    re-render, fail-closed on parse error — for the raw `rescue.conf`
+    text (#4056). RED-on-revert unit test proven (forcing `redact=false`
+    re-leaks every sentinel + drops the placeholder).
+  - **File(s)**: pkg/cli/permissions.go, pkg/cli/cli_show.go,
+    pkg/cli/cli_show_system.go, pkg/cli/cli_config.go,
+    pkg/configstore/store_persist.go,
+    pkg/cli/cli_show_config_redaction_4099_test.go,
+    docs/system-login.md, docs/junos-config-display-reference.md
+
+- **Timestamp**: 2026-07-04 (follow-up)
+  - **Action**: #4099 Copilot follow-up (fold-before-merge, no merge).
+    `LoadRescueConfigRedacted` returned `fmt.Errorf("...: %v",
+    perrs[0])` on a malformed rescue.conf. `config.ParseError.Error()`
+    (parser.go:12) renders `line %d, column %d: %s` where `.Message` is
+    populated from the tampered file content (verified: the lexer emits
+    `unexpected character: %c` carrying the offending byte; the parser's
+    only `%s`-on-full-Token error sites never receive an identifier in
+    the hierarchical path, so a FULL token value does not leak, but the
+    raw parser detail + offending character DO). Forwarding that to the
+    VIEW-only CLI caller defeats the fail-closed "never leak" contract.
+    FIX: return a GENERIC, position-only error — "rescue configuration
+    is malformed and cannot be safely displayed (parse failed at line N,
+    column M)" — using only `perrs[0].Line`/`.Column` (ints, cannot hold
+    a token), never the ParseError, its `.Message`, or `.Error()`. Added
+    a store-level RED-on-revert test
+    (`rescue_redaction_leak_4099_test.go`): a tampered rescue.conf whose
+    parse fails on `@` inside a secret-looking token → the returned
+    error must not contain the raw parser detail, the offending-char
+    message, or the secret token body. Confirmed RED on revert (old `%v
+    perrs[0]` re-forwards `unexpected character: @`).
+  - **File(s)**: pkg/configstore/store_persist.go,
+    pkg/configstore/rescue_redaction_leak_4099_test.go
 ## 2026-07-04 — #4101: DHCPv4 client rejects a degenerate subnet mask (fable-163 F6)
 
 - **Timestamp**: 2026-07-04

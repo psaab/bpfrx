@@ -432,3 +432,40 @@ func (s *Store) LoadRescueConfig() (string, error) {
 	}
 	return string(data), nil
 }
+
+// LoadRescueConfigRedacted returns the rescue configuration text with secret
+// leaves masked by config.SecretDataPlaceholder, for the on-box CLI display
+// path (#4099). rescue.conf is the full active config TEXT with cleartext
+// secret leaves (#4056), so `show system configuration rescue` — a PermView
+// command — would otherwise leak IKE PSKs, SNMP communities and auth-keys to a
+// read-only / config-viewer login class exactly as the raw-AST `show
+// configuration` renderers did before they were routed through the #4051
+// RedactedClone path. This reparses the saved text into an AST, redacts a
+// clone, and re-renders it as hierarchical text. It fails CLOSED: an empty
+// file returns "" (no rescue config), and a parse failure returns an error
+// rather than falling back to the cleartext bytes, so a malformed rescue file
+// can never leak a secret.
+//
+// The parse-failure error is deliberately GENERIC: config.ParseError.Error()
+// embeds ParseError.Message, which the lexer/parser can populate with the
+// OFFENDING TOKEN VALUE (e.g. an unterminated `pre-shared-key "SECRET…`). If
+// that token were echoed back to the VIEW-only CLI caller it would defeat the
+// whole "never leak a secret" guarantee, so the returned error carries only
+// the position (Line/Column are ints and cannot hold a token) — never the
+// ParseError itself, its .Message, or any token text (#4099 Copilot follow-up).
+func (s *Store) LoadRescueConfigRedacted() (string, error) {
+	text, err := s.LoadRescueConfig()
+	if err != nil {
+		return "", err
+	}
+	if text == "" {
+		return "", nil
+	}
+	tree, perrs := config.NewParser(text).Parse()
+	if len(perrs) > 0 {
+		return "", fmt.Errorf("rescue configuration is malformed and cannot be "+
+			"safely displayed (parse failed at line %d, column %d)",
+			perrs[0].Line, perrs[0].Column)
+	}
+	return tree.RedactedClone().Format(), nil
+}
