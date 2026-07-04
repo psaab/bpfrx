@@ -480,8 +480,17 @@ fn resolve_cos_tx_selection_internal(
     if let Some(ingress_filter) = ingress_filter.filter(|filter| {
         (!has_output_filter && filter.affects_tx_selection) || filter.has_three_color_policer_terms
     }) {
+        // #4085: the INGRESS input filter's `then count` terms are already
+        // recorded exactly once by the input-filter ACTION evaluation
+        // (`evaluate_non_pbr_input_filter` on the session-miss / DSCP-sensitive
+        // session-hit path) and, for a cacheable flow, replayed on hits from the
+        // cached filter_counter set. This tx-selection re-walk exists ONLY to
+        // extract forwarding-class / dscp-rewrite for queue selection and to
+        // METER the ingress three-color policer, so it MUST NOT re-record the
+        // count — use the counter-suppressed variant (the policer meter still
+        // runs via the threaded now_ns).
         let ingress_result = if let Some(now_ns) = now_ns {
-            crate::filter::evaluate_filter_ref_tx_selection_runtime_counted(
+            crate::filter::evaluate_filter_ref_tx_selection_runtime_uncounted(
                 ingress_filter,
                 flow_key.src_ip,
                 flow_key.dst_ip,
@@ -494,7 +503,7 @@ fn resolve_cos_tx_selection_internal(
                 now_ns,
             )
         } else {
-            crate::filter::evaluate_filter_ref_tx_selection_counted(
+            crate::filter::evaluate_filter_ref_tx_selection_uncounted(
                 ingress_filter,
                 flow_key.src_ip,
                 flow_key.dst_ip,

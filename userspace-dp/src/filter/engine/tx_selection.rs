@@ -41,6 +41,43 @@ pub(crate) fn evaluate_filter_ref_tx_selection_counted<'a>(
         extra,
         packet_bytes,
         None,
+        true,
+    )
+}
+
+/// #4085: TX-selection walk that extracts forwarding-class / dscp-rewrite /
+/// three-color-policer modifiers but does NOT record `then count` term
+/// counters. Used for the INGRESS input filter's tx-selection leg
+/// ([`resolve_cos_tx_selection_internal`]) — that filter's `then count`
+/// counters are already recorded once by the input-filter ACTION evaluation
+/// (`evaluate_non_pbr_input_filter`, `poll_descriptor`), so a second increment
+/// here double-counted every packet of a non-cacheable flow (and the seed
+/// packet of a cacheable one). The three-color policer METER still runs (it is
+/// metered nowhere else); only the counter increment is suppressed.
+#[inline]
+pub(crate) fn evaluate_filter_ref_tx_selection_uncounted<'a>(
+    filter: &'a Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra<'_>,
+    packet_bytes: u64,
+) -> TxSelectionFilterResult<'a> {
+    evaluate_filter_ref_tx_selection_runtime(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        extra,
+        packet_bytes,
+        None,
+        false,
     )
 }
 
@@ -67,10 +104,44 @@ pub(crate) fn evaluate_filter_ref_tx_selection_runtime_counted<'a>(
         extra,
         packet_bytes,
         Some(now_ns),
+        true,
+    )
+}
+
+/// #4085: three-color-policer-metered but counter-suppressed sibling of
+/// [`evaluate_filter_ref_tx_selection_runtime_counted`]. See
+/// [`evaluate_filter_ref_tx_selection_uncounted`] for why the ingress leg must
+/// not re-record `then count` — this variant threads `now_ns` so the ingress
+/// three-color policer still meters, while suppressing the double count.
+pub(crate) fn evaluate_filter_ref_tx_selection_runtime_uncounted<'a>(
+    filter: &'a Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra<'_>,
+    packet_bytes: u64,
+    now_ns: u64,
+) -> TxSelectionFilterResult<'a> {
+    evaluate_filter_ref_tx_selection_runtime(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        extra,
+        packet_bytes,
+        Some(now_ns),
+        false,
     )
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_filter_ref_tx_selection_runtime<'a>(
     filter: &'a Filter,
     src_ip: IpAddr,
@@ -82,6 +153,11 @@ fn evaluate_filter_ref_tx_selection_runtime<'a>(
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     now_ns: Option<u64>,
+    // #4085: when false, matched `then count` terms are NOT recorded (the
+    // policer meter + fc/dscp/log modifiers still apply). The ingress
+    // tx-selection leg passes false — the input-filter action-eval owns that
+    // count.
+    count_terms: bool,
 ) -> TxSelectionFilterResult<'a> {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_tx_selection_counted_v4(
@@ -95,6 +171,7 @@ fn evaluate_filter_ref_tx_selection_runtime<'a>(
             extra,
             packet_bytes,
             now_ns,
+            count_terms,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_tx_selection_counted_v6(
             filter,
@@ -107,12 +184,14 @@ fn evaluate_filter_ref_tx_selection_runtime<'a>(
             extra,
             packet_bytes,
             now_ns,
+            count_terms,
         ),
         _ => TxSelectionFilterResult::default(),
     }
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
     filter: &'a Filter,
     src_ip: Ipv4Addr,
@@ -124,6 +203,7 @@ fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     now_ns: Option<u64>,
+    count_terms: bool,
 ) -> TxSelectionFilterResult<'a> {
     // #2544: accumulate modifiers across fall-through terms (forwarding-class,
     // dscp-rewrite, policer metering + drop, log). A matched fall-through term
@@ -137,7 +217,9 @@ fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
         ) {
             continue;
         }
-        if term.has_count {
+        // #4085: skip the counter on the ingress tx-selection leg (count_terms
+        // == false) — the input-filter action-eval already recorded it once.
+        if count_terms && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         merge_matched_tx_modifiers(&mut acc, filter, term, now_ns, packet_bytes);
@@ -180,6 +262,7 @@ fn merge_matched_tx_modifiers<'a>(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
     filter: &'a Filter,
     src_ip: Ipv6Addr,
@@ -191,6 +274,7 @@ fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     now_ns: Option<u64>,
+    count_terms: bool,
 ) -> TxSelectionFilterResult<'a> {
     // #2544: see evaluate_filter_ref_tx_selection_counted_v4.
     let mut acc = TxSelectionFilterResult::default();
@@ -200,7 +284,9 @@ fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
         ) {
             continue;
         }
-        if term.has_count {
+        // #4085: skip the counter on the ingress tx-selection leg (count_terms
+        // == false) — the input-filter action-eval already recorded it once.
+        if count_terms && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         merge_matched_tx_modifiers(&mut acc, filter, term, now_ns, packet_bytes);
