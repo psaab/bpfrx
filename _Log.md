@@ -31610,3 +31610,33 @@ top.
   - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_fabric.go,
     pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_fabric_test.go,
     docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4056 — configstore secret-bearing files 0644→0600
+    (world-readable secrets at rest). VERIFY-FIRST confirmed the rollback
+    text slots (`<config>.N`), config archives (`config-*.conf`),
+    `rescue.conf`, AND the active/candidate/rollback JSON DB were all
+    written mode 0644 (world-readable). The text copies come from
+    `config.Format()`, which never redacts/encrypts, so they ALWAYS carry
+    cleartext IKE PSK / auth keys / SNMP community; the JSON DB is
+    AES-GCM-encrypted only when `system master-password` is set, cleartext
+    otherwise. Either way 0644 exposed secrets to any local user and
+    defeated master-password encryption. Fix: mode 0600 on
+    `db.go writeTreeMarked`, `store_commit.go saveRollbackFiles` (durable
+    slot 1 + atomic slots 2..N), `store_persist.go writeArchive` and
+    `SaveRescueConfig`; `.configdb` dir 0700 (mkdir + idempotent Chmod for
+    upgrades) and archive dir 0700. `master.key` was already 0600. The v2
+    audit journal stays 0644 (metadata-only, no secrets, #1896). fsatomic
+    enforces the mode on the temp fd before rename, so an existing 0644
+    file is re-created 0600 on the next commit; daemon owns the files so
+    read-back is unaffected. Shipped perms only; the encryption-in-rollback
+    design (encrypt/redact secrets in the persisted TEXT copies when
+    master-password is set, with decrypt-on-restore) is deferred to an
+    issue comment. RED-on-revert: `file_perms_4056_test.go` asserts each
+    file 0600 + dirs 0700 + read-back + cleartext secret present; reverting
+    to 0644/0755 fails all four. Validated: `go test ./pkg/configstore/...`,
+    `go build ./...`, gofmt + vet clean.
+  - **File(s)**: pkg/configstore/db.go, pkg/configstore/store_commit.go,
+    pkg/configstore/store_persist.go,
+    pkg/configstore/file_perms_4056_test.go,
+    pkg/configstore/README.md, _Log.md
