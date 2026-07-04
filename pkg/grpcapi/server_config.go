@@ -184,8 +184,12 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 }
 
 func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
-	// If a confirmed commit is pending, confirm it
-	if s.store.IsConfirmPending() {
+	// Bare commit during a pending commit-confirmed window (#4000). Confirm
+	// the pending config only when the candidate is UNCHANGED; new staged
+	// edits fall through to the normal commit below, where the daemon commitFn
+	// (CommitWithDescription, #3861) applies them AND clears the timer, so the
+	// edits are committed rather than silently dropped.
+	if s.store.IsConfirmPending() && !s.store.IsDirty() {
 		if err := s.store.ConfirmCommit(); err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}

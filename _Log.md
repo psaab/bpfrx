@@ -1,3 +1,36 @@
+## 2026-07-03 — #4000: bare `commit` during a pending confirm window silently dropped newly-staged edits
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-047 (MEDIUM, config-session correctness).
+    While a `commit confirmed <N>` rollback window was PENDING, a bare
+    `commit` with NEW candidate edits staged after the confirmed commit
+    confirmed the pending config (cleared the timer, #3861) but did NOT
+    apply the new edits — it returned success, silently dropping them.
+    Root cause: all three frontends (cli `handleCommit`, gRPC `Commit`,
+    REST `configCommitHandler`) intercepted ANY pending confirm and called
+    `store.ConfirmCommit()`, which only cancels the rollback timer and never
+    promotes the candidate. Junos semantics: a `commit` during the window
+    confirms the pending config AND commits any new edits.
+  - **Fix**: guard the confirm-only intercept with `&& !store.IsDirty()`.
+    An UNCHANGED candidate still confirms-only (no spurious history/rollback
+    entry — the pre-#4000 behavior). A DIRTY candidate falls through to the
+    normal commit path, where `CommitWithDescription` applies the new
+    candidate AND clears the confirm timer via the #3861
+    `clearPendingConfirmLocked` — so the edits are committed, the window is
+    confirmed, and the arm-time rollback timer fire is a no-op (confirmGen
+    bumped). Composes with #3861 without regressing its timer-clear. On the
+    daemon path the fall-through routes through `commitAndApply` (applySem +
+    dataplane re-apply), so the new config reaches the dataplane.
+  - **File(s)**: pkg/cli/cli_config.go, pkg/grpcapi/server_config.go,
+    pkg/api/config.go, pkg/configstore/README.md,
+    pkg/cli/cli_commit_confirm_pending_4000_test.go (RED-on-revert:
+    guard removed → staged host-name dropped, active stays at the confirmed
+    value while `commit` returns success),
+    pkg/configstore/commit_confirm_pending_edit_4000_test.go (store contract:
+    ConfirmCommit never promotes a dirty candidate; a plain Commit applies +
+    confirms). go test ./pkg/configstore/... ./pkg/cli/... ./pkg/grpcapi/...
+    ./pkg/api/... green; go build ./... green; gofmt clean.
+
 ## 2026-07-03 — #4001: proxyARPReassertLoop re-installs responders without the apply semaphore
 
 - **Timestamp**: 2026-07-03

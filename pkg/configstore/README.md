@@ -102,6 +102,19 @@ per-path:
   to T0, losing the remediation). This does NOT touch the nested
   confirmed→confirmed re-arm (that goes through `CommitConfirmed`, which
   re-arms and preserves the target) — only a PLAIN commit confirms.
+- **A bare `commit` during the window also commits any NEW candidate edits
+  (#4000).** The frontend intercept confirms-only (`ConfirmCommit`, timer
+  cancel with no promotion) ONLY when the candidate is UNCHANGED
+  (`!IsDirty()`). If the operator staged edits after `commit confirmed`, the
+  intercept falls through to the normal commit, so `CommitWithDescription`
+  applies the new candidate AND clears the timer (via the #3861
+  `clearPendingConfirmLocked`). Junos semantics: a `commit` during a confirm
+  window confirms the pending config AND commits new edits — they must not be
+  silently dropped. The pre-#4000 intercept confirmed-and-discarded (the new
+  edits were lost while `commit` returned success). `ConfirmCommit` itself
+  never promotes the candidate, so routing a dirty candidate through it is the
+  silent-loss bug; the `!IsDirty()` guard is the fix at all three frontends
+  (cli/gRPC/REST).
 - **`SyncApply` (HA config-sync receive) — Option B,
   degrade-not-fail.** The in-memory apply always proceeds (failing it
   would silently diverge the cluster; sync is one-way fire-and-forget).
