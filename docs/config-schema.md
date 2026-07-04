@@ -3150,9 +3150,10 @@ redaction is done with targeted marshallers — `SNMPCommunity.MarshalJSON`
 redacts the `Name` field, and `SNMPConfig.MarshalJSON` renders the
 `Communities` map as a sorted slice so the secret never leaks as a JSON
 object key. Text `show snmp` / `show configuration` print the map key, not
-the marshalled struct, and are deliberately OUT OF SCOPE (operators read
-their own secrets — Junos parity; `show configuration` redaction is a
-separate concern).
+the marshalled struct, so the #2053 marshaller does not cover them — the
+raw-AST render path is closed separately in **#4051 below** for the remote
+surfaces (REST + gRPC), while the on-box CLI stays cleartext (operators read
+their own secrets — Junos parity).
 
 **Borderline fields left as plain string** (rulings): `MasterPassword`
 (commit-encryption PRF selector, not a user secret), `ArchiveSitesWithPassword`
@@ -3166,6 +3167,60 @@ every reader). Do NOT feed `Reveal()` output into a log line. Regression
 coverage: `pkg/config/secret_test.go` (marshal/unmarshal/slice/map/SNMP) and
 `pkg/api/config_secret_redaction_test.go` (the live `GET /api/v1/config`
 leak net + in-memory-cleartext-preserved render guard).
+
+### #4051 — Raw-AST secret redaction on the config display endpoints
+
+#2053 closed the leak on the TYPED compiled-config marshal (`GET
+/api/v1/config`) but NOT on the raw-AST render surface. The
+`*ConfigTree` serializers in `ast_format.go` (`Format` / `FormatSet` /
+`FormatJSON` / `FormatXML` / `FormatInheritance` / `FormatCompare`) print
+leaf key tokens VERBATIM, so the endpoints that render the AST returned the
+same secrets in CLEARTEXT: the REST config **show / export / search /
+rollback** handlers (`pkg/api/config.go`) and the gRPC **ShowConfig /
+ShowCompare / ShowRollback** RPCs (`pkg/grpcapi/server_config.go`). Combined
+with a non-loopback REST bind an attacker could read every PSK / auth-key /
+SNMP community. Junos redacts secrets in `show configuration`
+(`SECRET-DATA`); xpf's raw-AST paths did not (fable-161 F-020).
+
+The fix is a DISPLAY-only AST transform. **`ConfigTree.RedactedClone()`**
+(`pkg/config/ast_redact.go`) returns a deep clone with every secret leaf
+value masked by **`config.SecretDataPlaceholder`** (`##SECRET-DATA##`, the
+Junos `SECRET-DATA` idiom — deliberately distinct from the typed-struct
+`<redacted>` sentinel so the two surfaces stay independently greppable). It
+walks the tree on the FLATTENED key path so a secret is matched identically
+in both AST shapes (hierarchical parse vs a flat-set collapsed leaf,
+CLAUDE.md dual-shape rule). The masked render is byte-identical to the
+cleartext render except at the secret tokens and stays structurally valid
+(the placeholder is quoted where needed).
+
+**Secret-leaf set = #2053's `config.Secret` field set** resolved to AST
+keyword signatures (verified against the compiler's `Secret(...)` sites):
+distinctive keywords `pre-shared-key` (keeps the `ascii-text`/`hexadecimal`
+qualifier), `authentication-key`, `authentication-password`,
+`privacy-password`, `encrypted-password`, `simple-password`, `api-key`,
+`tsig-secret`, `api-token`, `aws-secret-key`, `private-key`,
+`preshared-key`; and three GENERIC keywords disambiguated by required
+ancestor context so a non-secret look-alike is never masked — `key` only
+under `authentication md5 <id>` (OSPF hello key, not a GRE tunnel `key` or a
+chassis device-map identity `key`), `password` only under `api-auth` /
+`dynamic-dns` (not a future non-secret `password`), and `community` only
+directly under `snmp` (the v1/v2c community IS the secret — masked as a
+container-identity token — not a `policy-options community` routing object).
+
+**Redaction is applied at the REST + gRPC boundary only.** The cleartext
+`Store.Show*` methods remain the SSOT for **HA config sync**
+(`daemon_ha_sync.go` → the peer must receive real secrets), the
+**DR/compliance archive** (`daemon_flow.go`), on-disk **persistence +
+rollback** (`configstore`), and the **on-box CLI** (operator reads own
+secrets). The display endpoints call new redacted siblings
+(`ShowActive*Redacted` / `ShowCandidate*Redacted` / `ShowRollback*Redacted`
+/ `ShowCompare*Redacted` in `store_format.go`) that render a `RedactedClone`
+of the source tree. The remote `cli` binary is covered transitively (it goes
+through gRPC ShowConfig). Regression coverage: `pkg/config/ast_redact_test.go`
+(mask-every-format + no-source-mutation + no-over-masking + qualifier-kept),
+`pkg/api/config_raw_ast_redaction_test.go` (REST show/export/search),
+`pkg/grpcapi/server_config_redaction_test.go` (gRPC ShowConfig incl.
+path-scoped).
 
 ### #1979 — flow / flow-export NUM_WIDTH commit-time validation (Layer B)
 
