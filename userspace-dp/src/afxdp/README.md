@@ -265,9 +265,23 @@ sync.
     route lookup against the override table when a PBR term matched;
     (3) zone policy via `evaluate_policy_result_l3_aware(.., l4_present =
     false)` — gated to `ForwardCandidate` (transit) so host-inbound
-    (#3292) / NoRoute / MissingNeighbor / fabric arms are untouched. A
-    non-Permit verdict is a SILENT drop (a fragment has no L4 header to
-    synthesize a TCP RST / reject from) plus a `PolicyDeny` event. The
+    (#3292) / NoRoute / fabric arms are untouched. The `MissingNeighbor`
+    flowless case is enforced separately (#4024): #3291 deferred it to
+    "its own cold-path arm", but that arm's #1913 policy gate is
+    `if let Some(flow)` and so never fired for a flowless (flow == None)
+    packet — a flowless fragment whose next-hop neighbor was unresolved
+    was FIB-reinjected and the kernel forwarded it, so a `deny-all` zone
+    pair FAILED OPEN for it. The `MissingNeighbor` arm now has an `else`
+    (flow == None) branch that rebuilds the L3 tuple
+    (`frame::l3_session_flow_from_meta`) and runs the SAME
+    `evaluate_policy_result_l3_aware(.., l4_present = false)` gate BEFORE
+    the neg-cache probe / `#1769` resolver enqueue / kernel ARP-NDP probe
+    / `pending_neigh` buffer / trailing reinject — a deny converts the
+    disposition to `PolicyDenied` so the #1913 reinject chokepoint drops
+    it fail-closed; a permit stays `MissingNeighbor` and takes the normal
+    buffer-and-retry forward path. A non-Permit verdict is a SILENT drop
+    (a fragment has no L4 header to synthesize a TCP RST / reject from)
+    plus a `PolicyDeny` event. The
     `l4_present = false` flag makes PORT-BEARING application/filter terms
     fail closed (a flowless packet's port 0 can never confirm an
     `application junos-http` or a `destination-port 80` term), while

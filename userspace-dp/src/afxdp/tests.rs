@@ -12802,6 +12802,114 @@ fn flowless_non_first_fragment_steered_by_pbr_routing_instance_3291() {
     );
 }
 
+// ---- #4024: flowless / non-first-fragment MISSING-NEIGHBOR ENFORCEMENT ----
+//
+// #3291 enforced zone policy on the flowless ForwardCandidate arm but deferred
+// MissingNeighbor to "its own cold-path arm" — whose #1913 policy gate is
+// `if let Some(flow)` and so never fired for a flowless (flow == None) packet.
+// So a flowless fragment whose next-hop neighbor was unresolved fell through to
+// the FIB reinject, and a `deny-all` zone pair FAILED OPEN for it (kernel
+// forwarded the transit). #4024 adds the flowless (flow == None) policy gate to
+// the MissingNeighbor arm. Reverting the gate flips the deny case from a
+// policy-deny drop back to a buffered-and-reinjected forward, turning the
+// asserts RED.
+
+#[test]
+fn flowless_non_first_fragment_missing_neighbor_dropped_by_deny_all_4024() {
+    // lan->wan is default-deny (policy_deny_snapshot only permits dmz->wan).
+    // With NO neighbor for 172.16.80.200 the connected WAN route resolves but
+    // ARP is unresolved -> MissingNeighbor. A flowless (non-first fragment) that
+    // hits that cold path MUST be DROPPED by zone policy, not FIB-reinjected.
+    // RED-on-revert: the flowless MissingNeighbor arm used to skip the policy
+    // gate (dbg.policy_deny == 0) and buffer the frame for retry
+    // (pending_neigh not empty) while the trailing chokepoint reinjected it.
+    let mut snapshot = policy_deny_snapshot();
+    // Empty neighbors => the WAN connected route resolves egress but no MAC =>
+    // MissingNeighbor (the cold path under test), not ForwardCandidate.
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+    let frame = frag_v4_transit_frame();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        frag_v4_transit_meta(),
+    );
+
+    assert_eq!(
+        dbg.missing_neigh, 1,
+        "#4024: no neighbor for the connected WAN dst must resolve MissingNeighbor \
+         (the flowless cold path under test)"
+    );
+    assert_eq!(
+        dbg.policy_deny, 1,
+        "#4024: a deny-all zone pair must DROP a flowless MissingNeighbor fragment \
+         via the policy gate (RED on revert: 0 — flowless skipped the gate)"
+    );
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "#4024: a denied flowless MissingNeighbor fragment must NOT be buffered \
+         for neighbor retry (RED on revert: buffered before the reinject leak)"
+    );
+}
+
+#[test]
+fn flowless_non_first_fragment_missing_neighbor_permitted_forwards_4024() {
+    // An `application any` permit for lan->wan must NOT deny a flowless
+    // MissingNeighbor fragment — the gate must not over-block legitimate
+    // flowless forwarding. The permitted fragment stays on the cold path
+    // (buffered for in-place retry once the neighbor resolves).
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.policies = vec![PolicyRuleSnapshot {
+        name: "permit-lan-wan".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    }];
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+    let frame = frag_v4_transit_frame();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        frag_v4_transit_meta(),
+    );
+
+    assert_eq!(
+        dbg.missing_neigh, 1,
+        "#4024: the permitted fragment still resolves MissingNeighbor"
+    );
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "#4024: an `application any` permit must not deny the flowless fragment"
+    );
+    assert!(
+        !binding.pending_neigh.is_empty(),
+        "#4024: a PERMITTED flowless MissingNeighbor fragment must still take the \
+         forward/retry path (buffered for neighbor resolution) — no over-gating"
+    );
+}
+
 // ---- #2364: seeded fabric queue hash ------------------------------------
 
 /// Build N attacker-constructible flowless v4 metas differing only in the
