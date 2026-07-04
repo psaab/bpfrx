@@ -31678,3 +31678,41 @@ top.
     pkg/configstore/store_persist.go,
     pkg/configstore/file_perms_4056_test.go,
     pkg/configstore/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4060 — reject the `##SECRET-DATA##` redaction placeholder on
+    commit-ingest (symmetric guard for the #4051 raw-AST secret redaction).
+    RedactedClone masks every secret leaf with `config.SecretDataPlaceholder`
+    ("##SECRET-DATA##") for the REST config show/export + gRPC ShowConfig
+    display surfaces. Those renders are display-only and NOT restorable, but
+    had NO commit-ingest guard — unlike the typed-struct sentinel
+    "<redacted>" which `Secret.UnmarshalJSON` refuses via
+    errRedactedSecretIngest. Re-applying a redacted export (a load/commit of
+    the exported text) would silently commit "##SECRET-DATA##" as the LITERAL
+    secret for every secret leaf → IKE PSK / key / community becomes a nonsense
+    string → IPsec/auth breaks. Fix: new `errRedactionPlaceholderIngest` +
+    `checkRedactionPlaceholder` in `pkg/config/ast_redact.go`, walking the tree
+    with the SAME secret-leaf set (`secretIndices`) RedactedClone uses to
+    PRODUCE the placeholder — exact scope symmetry, so a non-secret leaf that
+    happens to carry the literal string is not rejected. Hooked into the single
+    commit-ingest schema gate `SchemaValidateWithDefinitions`
+    (`pkg/config/schema_walk.go`): STRICT on the operator commit / commit-check
+    path (fails the commit), downgraded to a WARNING on the tolerant
+    Load/SyncApply path (compileTreeLenient) — the same #1319 strict/lenient
+    doctrine. RED-on-revert: removing the schema_walk hook makes
+    TestRedactionPlaceholderIngestRejected FAIL (opaque secret leaves like IKE
+    PSK / community / api-key have no typed-leaf validator, so they would
+    silently commit; only encrypted-password is coincidentally caught by its
+    hash validator, with a different error). Tests: pkg/config
+    ast_redact_test.go (full-set + per-leaf reject, normal-secret passes,
+    non-secret-scope), pkg/configstore redaction_placeholder_4060_test.go
+    (CommitCheck+Commit reject, CheckText reject, real secret commits, Load
+    warn-boots then strict CommitCheck rejects). Doc:
+    docs/junos-config-display-reference.md §7.1 — REST export is secret-redacted,
+    not a restorable backup; use the DR archive / `request system configuration
+    rescue save`. Validated: go test ./pkg/config/... ./pkg/configstore/...,
+    go build ./..., gofmt + vet clean.
+  - **File(s)**: pkg/config/ast_redact.go, pkg/config/schema_walk.go,
+    pkg/config/ast_redact_test.go,
+    pkg/configstore/redaction_placeholder_4060_test.go,
+    docs/junos-config-display-reference.md, _Log.md
