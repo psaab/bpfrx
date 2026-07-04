@@ -1,0 +1,11 @@
+site-a: #1, ESTABLISHED, IKEv2, 8f7c1c8e3a2b1234_i* 4d3c2b1a09876543_r
+  local  '10.0.1.1' @ 10.0.1.1[500]
+  remote '10.0.2.1' @ 10.0.2.1[500]
+  AES_CBC-256/HMAC_SHA2_256_128/PRF_HMAC_SHA2_256/MODP_2048
+  established 42s ago, rekeying in 13342s
+  site-a: #1, reqid 1, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128
+    installed 42s ago, rekeying in 3358s, expires in 3918s
+    in  c1234567,  1420 bytes,    12 packets,     2s ago
+    out c7654321,  1638 bytes,    14 packets,     2s ago
+    local  10.0.1.0/24
+    remote 10.0.2.0/24

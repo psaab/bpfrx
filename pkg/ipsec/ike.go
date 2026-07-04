@@ -530,7 +530,11 @@ func formatDHGroup(group int) string {
 	}
 }
 
-// SAStatus represents an IPsec Security Association.
+// SAStatus represents an IPsec Security Association as reported by
+// `swanctl --list-sas`. For a connection with an established CHILD SA the
+// Name is the child SA name and the endpoint/traffic-selector/counter fields
+// are populated from the child; for an IKE SA with no child yet (e.g.
+// CONNECTING) the Name is the IKE SA name and only the endpoint fields carry.
 type SAStatus struct {
 	Name           string
 	ConnectionName string
@@ -541,6 +545,13 @@ type SAStatus struct {
 	RemoteTS       string
 	InBytes        string
 	OutBytes       string
+	InPackets      string
+	OutPackets     string
+	SPIIn          string
+	SPIOut         string
+	// Rekey is the raw child (or IKE) SA timing line, e.g.
+	// "installed 42s ago, rekeying in 3358s, expires in 3918s".
+	Rekey string
 }
 
 // TerminateAllSAs terminates all active IKE SAs via swanctl.
@@ -614,34 +625,62 @@ func (m *Manager) GetSAStatus() ([]SAStatus, error) {
 	return parseSAOutput(stdout.String()), nil
 }
 
+// parseSAOutput parses the human-readable output of `swanctl --list-sas`
+// (the command GetSAStatus invokes). The real strongSwan layout is, for each
+// tunnel:
+//
+//	site-a: #1, ESTABLISHED, IKEv2, 8f7c..._i* 4d3c..._r
+//	  local  '10.0.1.1' @ 10.0.1.1[500]
+//	  remote '10.0.2.1' @ 10.0.2.1[500]
+//	  AES_CBC-256/HMAC_SHA2_256_128/PRF_HMAC_SHA2_256/MODP_2048
+//	  established 42s ago, rekeying in 13342s
+//	  site-a: #1, reqid 1, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128
+//	    installed 42s ago, rekeying in 3358s, expires in 3918s
+//	    in  c1234567,  1420 bytes,    12 packets,     2s ago
+//	    out c7654321,  1638 bytes,    14 packets,     2s ago
+//	    local  10.0.1.0/24
+//	    remote 10.0.2.0/24
+//
+// The IKE SA header has no leading whitespace; endpoints appear as
+// "local/remote 'id' @ host[port]" (the "@" distinguishes an endpoint from a
+// child traffic-selector line, which is a bare CIDR); the CHILD SA header is
+// indented and carries ", reqid <n>,"; per-direction counters are the
+// "in/out <spi>, <bytes> bytes, <packets> packets" lines. An earlier version
+// of this parser assumed an "ipsec statusall"-style layout (local: A === B /
+// local_ts = C / bytes_in=N) that swanctl never emits, so every SA field but
+// the name/state came back blank (#3937).
 func parseSAOutput(output string) []SAStatus {
 	var sas []SAStatus
 	var currentConn *SAStatus
 	var currentChild *SAStatus
 	connHasChild := false
 
+	flushChild := func() {
+		if currentChild != nil {
+			sas = append(sas, *currentChild)
+			currentChild = nil
+		}
+	}
+	flushConn := func() {
+		flushChild()
+		if currentConn != nil && !connHasChild {
+			sas = append(sas, *currentConn)
+		}
+		currentConn = nil
+	}
+
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
 
-		// Connection name line (no leading whitespace = new SA)
-		if len(line) > 0 && line[0] != ' ' && strings.Contains(line, ":") {
-			if currentChild != nil {
-				sas = append(sas, *currentChild)
-				currentChild = nil
-			}
-			if currentConn != nil && !connHasChild {
-				sas = append(sas, *currentConn)
-			}
-			name := strings.TrimSuffix(strings.Fields(trimmed)[0], ":")
-			currentConn = &SAStatus{Name: name, ConnectionName: name}
+		// IKE SA header: no leading whitespace, "name: #<id>, <STATE>, IKEv<n>".
+		if line[0] != ' ' && line[0] != '\t' && strings.Contains(trimmed, ": #") &&
+			!strings.Contains(trimmed, ", reqid ") {
+			flushConn()
+			currentConn = parseIKEHeader(trimmed)
 			connHasChild = false
-			// Extract state from the connection name line (e.g. "site-a: #1, ESTABLISHED")
-			for _, word := range []string{"ESTABLISHED", "CONNECTING", "INSTALLED", "REKEYING"} {
-				if strings.Contains(trimmed, word) {
-					currentConn.State = word
-					break
-				}
-			}
 			continue
 		}
 
@@ -649,24 +688,11 @@ func parseSAOutput(output string) []SAStatus {
 			continue
 		}
 
-		if strings.Contains(trimmed, ", reqid ") && strings.Contains(trimmed, ":") {
-			if currentChild != nil {
-				sas = append(sas, *currentChild)
-			}
-			childName := strings.TrimSuffix(strings.Fields(trimmed)[0], ":")
-			currentChild = &SAStatus{
-				Name:           childName,
-				ConnectionName: currentConn.Name,
-				LocalAddr:      currentConn.LocalAddr,
-				RemoteAddr:     currentConn.RemoteAddr,
-			}
+		// Child SA header: indented "name: #<id>, reqid <n>, <STATE>, ...".
+		if strings.Contains(trimmed, ": #") && strings.Contains(trimmed, ", reqid ") {
+			flushChild()
+			currentChild = parseChildHeader(trimmed, currentConn)
 			connHasChild = true
-			for _, word := range []string{"ESTABLISHED", "CONNECTING", "INSTALLED", "REKEYING"} {
-				if strings.Contains(trimmed, word) {
-					currentChild.State = word
-					break
-				}
-			}
 			continue
 		}
 
@@ -675,56 +701,114 @@ func parseSAOutput(output string) []SAStatus {
 			target = currentChild
 		}
 
-		if strings.Contains(trimmed, "local") && strings.Contains(trimmed, "===") {
-			parts := strings.Split(trimmed, "===")
-			if len(parts) >= 2 {
-				currentConn.LocalAddr = strings.TrimSpace(strings.TrimPrefix(parts[0], "local:"))
-				currentConn.RemoteAddr = strings.TrimSpace(parts[1])
+		switch {
+		// IKE endpoint lines carry "@ host[port]"; child traffic-selector
+		// lines ("local  10.0.1.0/24") are bare CIDRs with no "@".
+		case strings.HasPrefix(trimmed, "local ") && strings.Contains(trimmed, "@"):
+			if h := parseEndpointHost(trimmed); h != "" {
+				currentConn.LocalAddr = h
 				if currentChild != nil {
-					currentChild.LocalAddr = currentConn.LocalAddr
-					currentChild.RemoteAddr = currentConn.RemoteAddr
+					currentChild.LocalAddr = h
 				}
 			}
-		}
-
-		if strings.Contains(trimmed, "ESTABLISHED") || strings.Contains(trimmed, "CONNECTING") {
-			for _, word := range []string{"ESTABLISHED", "CONNECTING", "INSTALLED", "REKEYING"} {
-				if strings.Contains(trimmed, word) {
-					target.State = word
-					break
+		case strings.HasPrefix(trimmed, "remote ") && strings.Contains(trimmed, "@"):
+			if h := parseEndpointHost(trimmed); h != "" {
+				currentConn.RemoteAddr = h
+				if currentChild != nil {
+					currentChild.RemoteAddr = h
 				}
 			}
-		}
-
-		if strings.Contains(trimmed, "local_ts") {
-			if idx := strings.Index(trimmed, "="); idx >= 0 {
-				target.LocalTS = strings.TrimSpace(trimmed[idx+1:])
-			}
-		}
-		if strings.Contains(trimmed, "remote_ts") {
-			if idx := strings.Index(trimmed, "="); idx >= 0 {
-				target.RemoteTS = strings.TrimSpace(trimmed[idx+1:])
-			}
-		}
-		if strings.HasPrefix(trimmed, "bytes_in") || strings.Contains(trimmed, " bytes_in") {
-			for _, field := range strings.Fields(trimmed) {
-				if strings.HasPrefix(field, "bytes_in=") {
-					target.InBytes = strings.TrimPrefix(field, "bytes_in=")
-					target.InBytes = strings.TrimRight(target.InBytes, ",")
-				}
-				if strings.HasPrefix(field, "bytes_out=") {
-					target.OutBytes = strings.TrimPrefix(field, "bytes_out=")
-					target.OutBytes = strings.TrimRight(target.OutBytes, ",")
-				}
-			}
+		case strings.HasPrefix(trimmed, "local ") && currentChild != nil:
+			currentChild.LocalTS = strings.TrimSpace(strings.TrimPrefix(trimmed, "local"))
+		case strings.HasPrefix(trimmed, "remote ") && currentChild != nil:
+			currentChild.RemoteTS = strings.TrimSpace(strings.TrimPrefix(trimmed, "remote"))
+		case strings.HasPrefix(trimmed, "in "):
+			spi, b, p := parseTrafficLine(trimmed)
+			target.SPIIn, target.InBytes, target.InPackets = spi, b, p
+		case strings.HasPrefix(trimmed, "out "):
+			spi, b, p := parseTrafficLine(trimmed)
+			target.SPIOut, target.OutBytes, target.OutPackets = spi, b, p
+		case strings.Contains(trimmed, "rekeying in ") || strings.Contains(trimmed, "expires in "):
+			target.Rekey = trimmed
 		}
 	}
 
-	if currentChild != nil {
-		sas = append(sas, *currentChild)
-	} else if currentConn != nil && !connHasChild {
-		sas = append(sas, *currentConn)
-	}
-
+	flushConn()
 	return sas
+}
+
+// parseIKEHeader parses an IKE SA header line, e.g.
+// "site-a: #1, ESTABLISHED, IKEv2, 8f7c..._i* 4d3c..._r". State is the
+// comma-field immediately after "name: #<id>".
+func parseIKEHeader(line string) *SAStatus {
+	sa := &SAStatus{}
+	if colon := strings.Index(line, ":"); colon >= 0 {
+		sa.Name = strings.TrimSpace(line[:colon])
+	}
+	sa.ConnectionName = sa.Name
+	if parts := strings.Split(line, ","); len(parts) >= 2 {
+		sa.State = strings.TrimSpace(parts[1])
+	}
+	return sa
+}
+
+// parseChildHeader parses a child SA header line, e.g.
+// "site-a: #1, reqid 1, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128".
+// State is the comma-field after the "reqid <n>" field. Endpoints are
+// inherited from the parent IKE SA (swanctl prints them only once, on the IKE
+// header block).
+func parseChildHeader(line string, conn *SAStatus) *SAStatus {
+	sa := &SAStatus{
+		ConnectionName: conn.Name,
+		LocalAddr:      conn.LocalAddr,
+		RemoteAddr:     conn.RemoteAddr,
+	}
+	if colon := strings.Index(line, ":"); colon >= 0 {
+		sa.Name = strings.TrimSpace(line[:colon])
+	}
+	parts := strings.Split(line, ",")
+	for i, p := range parts {
+		if strings.Contains(p, "reqid ") && i+1 < len(parts) {
+			sa.State = strings.TrimSpace(parts[i+1])
+			break
+		}
+	}
+	return sa
+}
+
+// parseEndpointHost extracts the host from an IKE endpoint line, e.g.
+// "local  '10.0.1.1' @ 10.0.1.1[500]" -> "10.0.1.1". The "[port]" suffix and
+// any trailing "[virtual-ip]" tokens are stripped; IPv6 hosts are preserved
+// because only the "[port]" bracket is removed.
+func parseEndpointHost(line string) string {
+	at := strings.Index(line, "@")
+	if at < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(line[at+1:])
+	if sp := strings.IndexAny(rest, " \t"); sp >= 0 {
+		rest = rest[:sp]
+	}
+	if b := strings.IndexByte(rest, '['); b >= 0 {
+		rest = rest[:b]
+	}
+	return rest
+}
+
+// parseTrafficLine extracts the SPI, byte count and packet count from a child
+// SA counter line, e.g. "in  c1234567,  1420 bytes,    12 packets,     2s ago".
+func parseTrafficLine(line string) (spi, bytesCount, packets string) {
+	fields := strings.Fields(line)
+	if len(fields) >= 2 {
+		spi = strings.TrimRight(fields[1], ",")
+	}
+	for i, f := range fields {
+		switch {
+		case strings.HasPrefix(f, "bytes") && i > 0:
+			bytesCount = strings.TrimRight(fields[i-1], ",")
+		case strings.HasPrefix(f, "packets") && i > 0:
+			packets = strings.TrimRight(fields[i-1], ",")
+		}
+	}
+	return
 }
