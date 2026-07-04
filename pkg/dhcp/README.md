@@ -178,3 +178,16 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   route through a path that fires `onGatewayChange` (`finishClient` and
   `abandonLeaseAfterNAK` both do), so the ip-monitoring overlay
   withdraws its resolved next-hop in lock-step with the address.
+- **Degenerate subnet mask is refused (#4101, untrusted input).**
+  `leaseFromACKv4` validates option 1 after `net.IPMask.Size()`: a zero
+  mask (`0.0.0.0` → `Size()` returns `ones=0`) or a non-contiguous mask
+  (`255.255.0.255` → `(0,0)`) is rejected with an error instead of
+  producing a `YourIP/0` lease. Without the guard the kernel would install
+  an on-link `0.0.0.0/0` connected route on the DHCP interface and
+  blackhole/hijack all IPv4 forwarding — a rogue or broken server could
+  force this with a single crafted ACK. The rejection propagates through
+  `v4Exchange` → `runDHCPv4`, which retries a fresh DISCOVER on acquire (no
+  address ever installed) or falls through to T2/expiry keeping the current
+  valid lease on renew/rebind. A missing option 1 still falls back to `/24`;
+  only a *present-but-degenerate* mask is refused. Valid prefixes including
+  `/31` and `/32` (point-to-point / host leases) are accepted.

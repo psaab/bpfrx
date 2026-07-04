@@ -57,6 +57,70 @@
     perrs[0]` re-forwards `unexpected character: @`).
   - **File(s)**: pkg/configstore/store_persist.go,
     pkg/configstore/rescue_redaction_leak_4099_test.go
+## 2026-07-04 — #4101: DHCPv4 client rejects a degenerate subnet mask (fable-163 F6)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST then fix the MEDIUM security/untrusted-input
+    defect. Confirmed at HEAD (`origin/master` ee8de92ef): `leaseFromACKv4`
+    (`pkg/dhcp/dhcp.go`) guarded only `mask == nil` (fallback `/24`) and
+    then took `ones, _ := net.IPMask(mask).Size()`. For a zero mask
+    (`0.0.0.0`) `Size()` returns `ones=0, bits=32`; for a non-contiguous
+    mask (`255.255.0.255`) it returns `(0,0)` — either way
+    `netip.PrefixFrom(addr, 0)` yields `YourIP/0`, which the apply path
+    (`applyAddress` `AddrReplace`) installs as an on-link `0.0.0.0/0`
+    connected route, blackholing/hijacking ALL IPv4 forwarding. A single
+    crafted ACK from a rogue/broken server triggers it, no operator action.
+  - **Fix**: after `.Size()` (now `ones, bits`), reject when
+    `bits != 32 || ones == 0` with an error (no lease). The error
+    propagates through `v4Exchange` → `runDHCPv4`, which retries a fresh
+    DISCOVER on acquire (no `YourIP/0` ever committed) or falls through to
+    T2/expiry keeping the current valid lease on renew/rebind — the safest
+    behavior (refuse the ACK, never default a degenerate mask to `/24`
+    which would mask the attack). A *missing* option 1 still falls back to
+    `/24`; only a present-but-degenerate mask is refused. `/31` and `/32`
+    (point-to-point / host leases) are accepted (floor: reject only
+    `ones==0` + non-contiguous).
+  - **File(s)**: `pkg/dhcp/dhcp.go` (guard), `pkg/dhcp/renew_test.go`
+    (table test `TestLeaseFromACKv4RejectsDegenerateMask` + `mustV4ACK`
+    helper), `pkg/dhcp/README.md` (Gotchas bullet).
+  - **Validation**: RED-on-revert proven — with the guard removed both
+    `0.0.0.0` and `255.255.0.255` parse to `192.0.2.50/0`; the /24, /32,
+    /31 and absent-mask cases pass either way. `go test ./pkg/dhcp/...`
+    green, `go build ./...`, `gofmt`, `go vet` clean.
+
+## 2026-07-04 — #4097: FRR community-list member / as-path regex render-side sanitize belt (fable-163 F2)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST on the reported HIGH frr.conf config-injection.
+    Confirmed the two render sites DO emit verbatim: `policy_render.go`
+    `bgp community-list %s %s permit %s` (member) and `bgp as-path
+    access-list %s permit %s` (`ap.Regex`), while every auth/description
+    field routes through `sanitizeFRRValue`. BUT the newline-injection
+    vector is ALREADY closed at HEAD by the pre-existing #1798/#3900
+    AST-level control-char defense in `pkg/config/freetext.go`, which
+    runs at the top of `compileExpanded` for EVERY compile and covers
+    community members + as-path regexes because they are ordinary AST
+    node values: strict commit hard-rejects any control char
+    (`validateNodesControlChars`), lenient load/HA-sync/rollback scrubs
+    it in place (`sanitizeNodesControlChars`). Proven by probe: with a
+    would-be new gate removed, strict `CompileConfig` still rejects the
+    `\n` as-path/community value; lenient load scrubs it to a
+    newline-free regex. So the injection is NOT exploitable — the issue's
+    "bypasses ALL sanitization" premise misses the AST layers.
+  - **Decision**: The genuine gap is layer-3 of the documented #1798
+    three-layer model — the render-side belt these two sites lacked while
+    every other frr.conf free-text field has it. Shipped ONLY the render
+    belt (route `member` + `ap.Regex` through `sanitizeFRRValue`; a space
+    stays legit because FRR reads both as a rest-of-line token). Did NOT
+    add the commit-time strict gate the issue asked for — it is fully
+    redundant with `validateNodesControlChars` (fires first) and would be
+    dead code. F20 (Junos→FRR as-path regex syntax translation) is
+    non-trivial (different regex semantics) — left for a separate issue.
+  - **File(s)**: `pkg/frr/policy_render.go` (2 render sites +
+    `sanitizeFRRValue` doc), `pkg/frr/policy_injection_4097_test.go`
+    (render RED-on-revert), `pkg/config/compiler_frr_policy_inject_4097_test.go`
+    (guards #1798 coverage of the two fields end-to-end),
+    `pkg/frr/README.md` (security section bullet).
 
 ## 2026-07-04 — #4092: WireGuard responder handshake TAI64N anti-replay — enforce the per-peer greatest-timestamp gate
 
@@ -32194,3 +32258,35 @@ top.
     userspace-dp/src/afxdp/tx/cos_classify.rs,
     userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
     userspace-dp/src/filter/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4098 — IPsec traffic-selector local_ts/remote_ts swanctl
+    injection (config-injection → root RCE via `updown`). VERIFY-FIRST at HEAD
+    confirmed policy.go rendered child.LocalTS/RemoteTS with a bare `%s`
+    (unlike the sibling child.Name, which uses `sanitizeSwanctlValue`), sourced
+    from `traffic-selector local-ip/remote-ip` (+ `local-identity`/
+    `remote-identity` fallback) via `effectiveTrafficSelectors`. lexer.go
+    materializes `\n` in a quoted value. FINDING: the general free-text
+    control-char gate (`validateNodesControlChars`, freetext.go) ALREADY
+    rejects an embedded newline in ANY value at strict commit and sanitizes it
+    on the lenient path — so the pure-newline RCE-via-commit was not reachable
+    at HEAD; the issue's "NO commit validation" premise held only for
+    `compiler_validate*strict*.go`, missing the freetext gate. Still fixed the
+    two genuine residual gaps: (a) render-side belt — run local_ts/remote_ts
+    through `sanitizeSwanctlValue` (parity with child.Name), the defense for
+    any path that reaches render with an unsanitized typed config (direct
+    IPsecConfig construction / peer-sync); (b) new AST commit gate
+    `validateIPsecTrafficSelectorsStrict` — rejects a local-ip/remote-ip value
+    carrying a control char OR whitespace, or that is not a CIDR/host/range
+    (whitespace + shape are what the general gate misses). Strict on commit,
+    lenient-downgraded (warn) on load/sync per #1960; walks every value token
+    (both parser shapes + bracketed list #2419). RED-on-revert verified for
+    BOTH: reverting the render belt fails the direct-construction render test
+    (injected `updown =` line reaches the children block); neutralizing the
+    validator fails the whitespace + non-CIDR strict tests. go test
+    ./pkg/ipsec/... ./pkg/config/... green; go build ./... , go vet, gofmt
+    clean.
+  - **File(s)**: pkg/ipsec/policy.go,
+    pkg/config/compiler_ipsec_trafficselector.go, pkg/config/compiler.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
