@@ -29128,3 +29128,23 @@ top.
   pkg/config/freetext_test.go (RED-on-revert injection + reject +
   helper tests), pkg/configstore/store_test.go
   (TestAnnotateRejectsCommentDelimiter), docs/phases.md (#3900 note)
+
+## 2026-07-03 — #3904 multi-value bracket-list truncation bundle (F-040/F-161/F-162/F-163)
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-040/F-161 — IKE/IPsec `proposals [ p1 p2 ]` no longer truncates
+  to the first reference. Schema leaves marked `multi: true`; `IKEPolicy.Proposals`
+  and `IPsecPolicyDef.Proposals` widened `string` → `[]string`; compiler reads all
+  via `firewallMatchValues`; strongSwan generator emits every resolvable proposal
+  comma-joined; strict validators require every reference to resolve; show/CLI
+  join the list.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_ipsec.go, pkg/config/compiler_validate_strict.go,
+  pkg/ipsec/ike.go, pkg/cli/cli_show_security_ipsec.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/config/compiler_ipsec_proposals_multivalue_3904_test.go,
+  pkg/ipsec/ike_proposals_multivalue_3904_test.go,
+  pkg/config/parser_security_test.go, pkg/config/ike_policy_chain_ref_test.go,
+  pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/ipsec/swanctl_render_test.go, pkg/ipsec/ike_chain_failclosed_test.go,
+  docs/config-schema.md

@@ -251,6 +251,30 @@ validation:
   directions — tail-drop and typo-bypass — across bracket / repeated-line /
   hierarchical shapes, plus the value-slot completion pin).
 
+**IKE/IPsec proposals, RIP export/redistribute, and routing-instance interface
+are multi-value (#3904).** Four more leaves of the #2419/#3431/#3703
+bracket-list-truncation class (fable-161 F-040/F-161/F-162/F-163), all fixed by
+routing the compiler read through `firewallMatchValues` (Keys[1:] + child nodes,
+both AST shapes):
+
+- **IKE/IPsec policy `proposals`** (`schema_security.go`) — both leaves are now
+  `args: 1, multi: true`. `IKEPolicy.Proposals` and `IPsecPolicyDef.Proposals`
+  changed from a scalar `string` to `[]string`, and `compileIKE` /`compileIPsec`
+  (`compiler_ipsec.go`) accumulate EVERY reference. The strongSwan generator
+  (`pkg/ipsec/ike.go` `resolveIKESettings` / `resolveESPSettings`) builds each
+  resolvable proposal and comma-joins them into the swanctl `proposals =` /
+  `esp_proposals =` list (strongSwan negotiates the first mutually acceptable
+  one); the auth method + lifetime come from the first resolvable proposal, and
+  the policy-level PFS group applies to every ESP proposal. Before #3904 the
+  scalar kept only the FIRST reference, so `proposals [ p1 p2 ]` silently offered
+  only `p1` — crypto negotiation NARROWED and a peer requiring `p2` could not
+  establish. The strict commit validators (`compiler_validate_strict.go`) now
+  require EVERY reference in the list to resolve (a dangling trailing reference
+  is a typo the commit-check rejects, mirroring the NAT H05 gate). Coverage:
+  `compiler_ipsec_proposals_multivalue_3904_test.go` (both AST shapes + dangling-
+  second rejection) and `pkg/ipsec/ike_proposals_multivalue_3904_test.go` (both
+  proposals comma-joined into the rendered swanctl config, PFS applied to all).
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a
