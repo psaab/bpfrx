@@ -60,6 +60,9 @@ type apiDataPlane interface {
 	IterateSessionsV6(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
 	GetSessionV4(dataplane.SessionKey) (dataplane.SessionValue, error)
 	GetSessionV6(dataplane.SessionKeyV6) (dataplane.SessionValueV6, error)
+	// SessionCount feeds the REST /status SessionCount from the live session
+	// table (#3929); mirrors the pkg/api apiRuntimeDataPlane addition.
+	SessionCount() (v4, v6 int)
 	ClearAllSessions() (int, int, error)
 
 	ReadGlobalCounter(uint32) (uint64, error)

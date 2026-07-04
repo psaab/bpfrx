@@ -24,6 +24,11 @@ type apiRuntimeDataPlane interface {
 	// direction's volume.
 	GetSessionV4(dataplane.SessionKey) (dataplane.SessionValue, error)
 	GetSessionV6(dataplane.SessionKeyV6) (dataplane.SessionValueV6, error)
+	// SessionCount returns the live forward-only session count (v4, v6) read
+	// from the dataplane session table — the same source `show security flow
+	// session` uses. The /status handler reports it as SessionCount (#3929):
+	// GC sweep stats are permanently 0 on the userspace dataplane (#333).
+	SessionCount() (v4, v6 int)
 	ClearAllSessions() (int, int, error)
 
 	ReadGlobalCounter(uint32) (uint64, error)

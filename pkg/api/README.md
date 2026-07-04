@@ -251,13 +251,28 @@ under the daemon's errgroup. Nothing else imports this package.
   on that error instead of an HTTP 200 with a partial/zero body. The
   Prometheus session-breakdown collector emits
   `xpf_sessions_breakdown_scrape_ok` (1 = full scan, 0 = truncated) and
-  OMITS the `xpf_sessions_{ipv4,ipv6,snat,dnat}` gauges when the scan
-  failed, so an alert fires rather than a graph silently dropping to
-  zero. The gRPC `GetSessions` (legacy + cursor) and `GetSessionSummary`
-  return `codes.Internal` on the same error. The contract is pinned by
-  `sessions_iterator_error_test.go` in this package and in `pkg/grpcapi`
-  / `pkg/cli` (CLI top-talkers fails the command; NAT summaries print a
-  stderr warning).
+  OMITS the `xpf_sessions_{active,established,ipv4,ipv6,snat,dnat}` gauges
+  when the scan failed, so an alert fires rather than a graph silently
+  dropping to zero. The gRPC `GetSessions` (legacy + cursor) and
+  `GetSessionSummary` return `codes.Internal` on the same error. The
+  contract is pinned by `sessions_iterator_error_test.go` in this package
+  and in `pkg/grpcapi` / `pkg/cli` (CLI top-talkers fails the command; NAT
+  summaries print a stderr warning).
+- Session-count metrics come from the LIVE dataplane session table, not
+  the BPF GC sweep stats (#3929). `collectSessionGauges`
+  (`metrics_sessions.go`) derives `xpf_sessions_active` (forward entries)
+  and `xpf_sessions_established` (forward entries in the ESTABLISHED
+  state) from the SAME `IterateSessions`/`IterateSessionsV6` scan that
+  backs the type breakdown, so all session gauges share one scan (no new
+  periodic scan; the #333 GC-skip optimization stands) and one
+  fail-loud `scrape_ok` gate. The REST `/status` and gRPC `GetStatus`
+  `SessionCount` read `dp.SessionCount()` (forward-only live total).
+  Before #3929 all three read `gc.Stats().TotalEntries` /
+  `EstablishedSessions`, which are permanently 0 on the userspace
+  dataplane (the only live forwarding path) because the BPF GC sweep is
+  skipped (#333) — so active-session metrics/dashboards read a constant 0
+  regardless of real load. `xpf_gc_sweep_duration_seconds` still reflects
+  the (skipped, 0) BPF sweep and is orthogonal.
 - Dataplane counter read failures get a uniform observability-integrity
   treatment (#3345 global; #3408 per-zone / per-policy / screen-flood /
   filter): a failed counter read is no longer swallowed to `0`, because a

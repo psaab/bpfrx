@@ -25,9 +25,15 @@ func (s *Server) GetStatus(_ context.Context, _ *pb.GetStatusRequest) (*pb.GetSt
 	if cfg := s.store.ActiveConfig(); cfg != nil {
 		resp.ZoneCount = int32(len(cfg.Security.Zones))
 	}
-	if s.gc != nil {
-		stats := s.gc.Stats()
-		resp.SessionCount = int32(stats.TotalEntries)
+	// #3929: read the live session count from the dataplane session table (the
+	// same source `show security flow session` uses), NOT the BPF GC sweep
+	// stats. On the userspace dataplane (the only live forwarding path) the BPF
+	// GC sweep is skipped (#333), so gc.Stats().TotalEntries is permanently 0 —
+	// this reported 0 sessions on every real deployment. SessionCount counts
+	// forward entries only, so it is the live session total.
+	if s.dp != nil && s.dp.IsLoaded() {
+		v4, v6 := s.dp.SessionCount()
+		resp.SessionCount = int32(v4 + v6)
 	}
 	if s.cluster != nil {
 		rg0 := s.cluster.GroupState(0)
