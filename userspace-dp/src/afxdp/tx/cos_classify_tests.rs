@@ -3377,3 +3377,537 @@ fn pbr_recovers_classify_modifiers_on_cached_tx_selection() {
         "#2621: cached dscp rewrite must survive the PBR term"
     );
 }
+
+// ============================================================================
+// #4085: an interface INPUT filter term carrying BOTH `then count` and a
+// tx-selection modifier (`then forwarding-class` / `then dscp`) OR a three-color
+// policer must be counted EXACTLY ONCE per packet.
+//
+// The `then count` hit-counter is owned by the input-filter ACTION evaluation
+// (`evaluate_non_pbr_input_filter` -> `evaluate_interface_filter_non_routing_counted`,
+// on the session-miss / DSCP-sensitive session-hit path). The CoS TX-selection
+// re-walk (`resolve_cos_tx_selection[_at]`) re-reads the SAME `term.counter` Arc
+// only to extract forwarding-class / dscp-rewrite for queue selection and to
+// METER the ingress three-color policer. Before the fix that re-walk used the
+// *counted* eval variant, so it recorded the count a SECOND time — doubling the
+// hit counter on every packet of a non-cacheable flow (DSCP-sensitive / NAT64 /
+// NPTv6) and on the seed packet of a cacheable flow.
+//
+// The fix makes the ingress TX-selection leg counter-suppressed
+// (`evaluate_filter_ref_tx_selection_{,runtime_}uncounted`); the OUTPUT leg
+// stays counted (an output filter is action-evaluated nowhere else), the policer
+// still meters, and the cache-hit replay (deduped `filter_counters` +
+// `input_filter_counters`) still records exactly once per hit.
+//
+// Each test replays the session-miss two-leg sequence (action-eval count, then
+// TX-selection walk) and asserts the term counter lands on 1, not 2 — RED (2) on
+// revert.
+// ============================================================================
+
+fn count_fc_two_class_service() -> ClassOfServiceSnapshot {
+    ClassOfServiceSnapshot {
+        forwarding_classes: vec![
+            CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            },
+            CoSForwardingClassSnapshot {
+                name: "expedited-forwarding".into(),
+                queue: 1,
+            },
+        ],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+        schedulers: vec![
+            CoSSchedulerSnapshot {
+                name: "be-sched".into(),
+                transmit_rate_bytes: 4_000_000,
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 128_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+            CoSSchedulerSnapshot {
+                name: "ef-sched".into(),
+                transmit_rate_bytes: 6_000_000,
+                transmit_rate_exact: false,
+                priority: "strict-high".into(),
+                buffer_size_bytes: 64_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+        ],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: "be-sched".into(),
+                },
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "expedited-forwarding".into(),
+                    scheduler: "ef-sched".into(),
+                },
+            ],
+        }],
+    }
+}
+
+/// Ingress reth1.0 (ifindex 101, parent 5) carries an input filter with a single
+/// `accept; count; forwarding-class expedited-forwarding;` term; egress reth0.0
+/// (ifindex 202) is a CoS interface with NO output filter — so the CoS
+/// TX-selection re-walks the ingress input filter for its forwarding-class.
+fn input_count_fc_snapshot(is_v6: bool) -> ConfigSnapshot {
+    let family = if is_v6 { "inet6" } else { "inet" };
+    let mut ingress = InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 101,
+        parent_ifindex: 5,
+        vlan_id: 0,
+        hardware_addr: "02:bf:72:00:61:01".into(),
+        ..Default::default()
+    };
+    if is_v6 {
+        ingress.filter_input_v6 = "in-count-fc".into();
+    } else {
+        ingress.filter_input_v4 = "in-count-fc".into();
+    }
+    ConfigSnapshot {
+        interfaces: vec![
+            ingress,
+            InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        filters: vec![FirewallFilterSnapshot {
+            name: "in-count-fc".into(),
+            family: family.into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "voice".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "accept".into(),
+                count: "lan-hits".into(),
+                forwarding_class: "expedited-forwarding".into(),
+                ..Default::default()
+            }],
+        }],
+        class_of_service: Some(count_fc_two_class_service()),
+        ..Default::default()
+    }
+}
+
+/// Ingress input filter term with `then count` AND a three-color policer (tiny
+/// committed burst -> RED drop) but NO forwarding-class. The `has_three_color_
+/// policer_terms` gate (not `affects_tx_selection`) drives the TX-selection
+/// re-walk here; the policer must still METER (drop) while the count is
+/// suppressed.
+fn input_count_policer_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "reth1.0".into(),
+                ifindex: 101,
+                parent_ifindex: 5,
+                vlan_id: 0,
+                hardware_addr: "02:bf:72:00:61:01".into(),
+                filter_input_v4: "in-count-pol".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        filters: vec![FirewallFilterSnapshot {
+            name: "in-count-pol".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "metered".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "accept".into(),
+                count: "lan-hits".into(),
+                policer: "trickle".into(),
+                ..Default::default()
+            }],
+        }],
+        three_color_policers: vec![ThreeColorPolicerSnapshot {
+            name: "trickle".into(),
+            mode: "single-rate".into(),
+            color_blind: true,
+            committed_rate_bytes_per_sec: 1,
+            committed_burst_bytes: 1,
+            peak_or_excess_rate_bytes_per_sec: 0,
+            peak_or_excess_burst_bytes: 1,
+            then_action: "discard".into(),
+        }],
+        class_of_service: Some(count_fc_two_class_service()),
+        ..Default::default()
+    }
+}
+
+/// A plain `accept; count;` input filter with NO tx-selection modifier and NO
+/// policer: the CoS TX-selection ingress branch never fires for it, so the
+/// counter must be untouched by the re-walk (a no-regression guard, GREEN both
+/// before and after the fix).
+fn input_count_only_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "reth1.0".into(),
+                ifindex: 101,
+                parent_ifindex: 5,
+                vlan_id: 0,
+                hardware_addr: "02:bf:72:00:61:01".into(),
+                filter_input_v4: "in-count-only".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        filters: vec![FirewallFilterSnapshot {
+            name: "in-count-only".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "count".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "accept".into(),
+                count: "lan-hits".into(),
+                ..Default::default()
+            }],
+        }],
+        class_of_service: Some(count_fc_two_class_service()),
+        ..Default::default()
+    }
+}
+
+fn count4085_v4_key() -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 443,
+    }
+}
+
+fn count4085_v6_key() -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x61, 0, 0, 0, 100)),
+        dst_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 200)),
+        src_port: 12345,
+        dst_port: 443,
+    }
+}
+
+fn count4085_meta(is_v6: bool) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        ingress_ifindex: 5,
+        ingress_vlan_id: 0,
+        addr_family: if is_v6 {
+            libc::AF_INET6 as u8
+        } else {
+            libc::AF_INET as u8
+        },
+        protocol: PROTO_TCP,
+        dscp: 0,
+        pkt_len: 1500,
+        ..Default::default()
+    }
+}
+
+/// Read the `Arc<FilterTermCounter>` for the sole `then count` term of the
+/// ingress input filter attached at `ifindex`.
+fn ingress_count_term_counter(
+    forwarding: &ForwardingState,
+    ifindex: i32,
+    is_v6: bool,
+) -> Arc<crate::filter::FilterTermCounter> {
+    let filters = if is_v6 {
+        &forwarding.filter_state.iface_filter_v6_fast
+    } else {
+        &forwarding.filter_state.iface_filter_v4_fast
+    };
+    filters
+        .get(&ifindex)
+        .expect("ingress input filter present")
+        .terms
+        .iter()
+        .find(|term| term.has_count)
+        .expect("input filter carries a `then count` term")
+        .counter
+        .clone()
+}
+
+/// Leg 1 of the session-miss path: the input-filter ACTION evaluation records
+/// the `then count` hit-counter exactly once (the ONE legitimate count).
+fn count4085_action_eval(forwarding: &ForwardingState, is_v6: bool, key: &SessionKey, pkt_len: u64) {
+    crate::filter::evaluate_interface_filter_non_routing_counted(
+        &forwarding.filter_state,
+        101,
+        is_v6,
+        key.src_ip,
+        key.dst_ip,
+        key.protocol,
+        key.src_port,
+        key.dst_port,
+        0,
+        TermMatchExtra::default(),
+        pkt_len,
+        crate::filter::NonRoutingCountPolicy::Always,
+    );
+}
+
+fn count4085_counts_once_per_miss(is_v6: bool) {
+    let forwarding = build_forwarding_state(&input_count_fc_snapshot(is_v6));
+    let counter = ingress_count_term_counter(&forwarding, 101, is_v6);
+    let key = if is_v6 {
+        count4085_v6_key()
+    } else {
+        count4085_v4_key()
+    };
+    let meta = count4085_meta(is_v6);
+
+    // Leg 1: action-eval counts once. Assert it landed on the RIGHT counter so a
+    // wrong-ifindex zero here can't let a pre-fix leg-2 double masquerade as 1.
+    count4085_action_eval(&forwarding, is_v6, &key, meta.pkt_len as u64);
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "input-filter action-eval records the `then count` exactly once"
+    );
+
+    // Leg 2 (runtime, now_ns present): the CoS TX-selection walk recovers the
+    // forwarding-class queue but MUST NOT re-record the count.
+    let sel = resolve_cos_tx_selection_at(
+        &forwarding,
+        202,
+        meta,
+        Some(&key),
+        TermMatchExtra::default(),
+        1_000_000_000,
+    );
+    assert_eq!(
+        sel.queue_id,
+        Some(1),
+        "forwarding-class -> EF queue must still be selected"
+    );
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "#4085: the TX-selection ingress leg must NOT re-record the input-filter \
+         count (RED == 2 on revert)"
+    );
+}
+
+#[test]
+fn input_filter_count_plus_fc_counts_once_per_miss_v4() {
+    count4085_counts_once_per_miss(false);
+}
+
+#[test]
+fn input_filter_count_plus_fc_counts_once_per_miss_v6() {
+    count4085_counts_once_per_miss(true);
+}
+
+#[test]
+fn input_filter_count_plus_fc_counts_once_none_now_ns_branch_v4() {
+    // Exercise the `now_ns == None` entry point (`resolve_cos_tx_selection` ->
+    // `evaluate_filter_ref_tx_selection_uncounted`), the sibling of the runtime
+    // branch above.
+    let forwarding = build_forwarding_state(&input_count_fc_snapshot(false));
+    let counter = ingress_count_term_counter(&forwarding, 101, false);
+    let key = count4085_v4_key();
+    let meta = count4085_meta(false);
+
+    count4085_action_eval(&forwarding, false, &key, meta.pkt_len as u64);
+    assert_eq!(counter.packets.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    let sel = resolve_cos_tx_selection(&forwarding, 202, meta, Some(&key), TermMatchExtra::default());
+    assert_eq!(sel.queue_id, Some(1));
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "#4085: the None-now_ns TX-selection ingress leg must NOT re-count \
+         (RED == 2 on revert)"
+    );
+}
+
+#[test]
+fn input_filter_count_plus_policer_counts_once_and_still_meters_v4() {
+    // The `has_three_color_policer_terms` gate drives the re-walk. The count must
+    // be suppressed BUT the policer must still meter (RED -> drop) — the policer
+    // is metered nowhere else.
+    let forwarding = build_forwarding_state(&input_count_policer_snapshot());
+    let counter = ingress_count_term_counter(&forwarding, 101, false);
+    let key = count4085_v4_key();
+    let meta = count4085_meta(false);
+
+    count4085_action_eval(&forwarding, false, &key, meta.pkt_len as u64);
+    assert_eq!(counter.packets.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    let sel = resolve_cos_tx_selection_at(
+        &forwarding,
+        202,
+        meta,
+        Some(&key),
+        TermMatchExtra::default(),
+        1_000_000_000,
+    );
+    assert!(
+        sel.drop,
+        "#4085: the ingress three-color policer must still meter (RED -> drop) \
+         even though the count is suppressed"
+    );
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "#4085: count+policer input term must count once, not twice \
+         (RED == 2 on revert)"
+    );
+}
+
+#[test]
+fn plain_count_only_input_filter_unchanged_v4() {
+    // No fc / dscp / policer -> the TX-selection ingress branch never fires, so
+    // the re-walk leaves the counter untouched (no-regression guard).
+    let forwarding = build_forwarding_state(&input_count_only_snapshot());
+    let counter = ingress_count_term_counter(&forwarding, 101, false);
+    let key = count4085_v4_key();
+    let meta = count4085_meta(false);
+
+    count4085_action_eval(&forwarding, false, &key, meta.pkt_len as u64);
+    let _ = resolve_cos_tx_selection_at(
+        &forwarding,
+        202,
+        meta,
+        Some(&key),
+        TermMatchExtra::default(),
+        1_000_000_000,
+    );
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a plain count-only input filter is counted once and untouched by \
+         TX-selection"
+    );
+}
+
+#[test]
+fn non_cacheable_flow_counts_once_per_packet_v4() {
+    // A non-cacheable (DSCP-sensitive / NAT64 / NPTv6) flow takes the session-miss
+    // path on EVERY packet, so the double-count is per-packet, not per-flow.
+    // Replay the two-leg miss sequence 3x and require exactly 3 counts (RED == 6
+    // on revert).
+    let forwarding = build_forwarding_state(&input_count_fc_snapshot(false));
+    let counter = ingress_count_term_counter(&forwarding, 101, false);
+    let key = count4085_v4_key();
+    let meta = count4085_meta(false);
+
+    for _ in 0..3 {
+        count4085_action_eval(&forwarding, false, &key, meta.pkt_len as u64);
+        let _ = resolve_cos_tx_selection_at(
+            &forwarding,
+            202,
+            meta,
+            Some(&key),
+            TermMatchExtra::default(),
+            1_000_000_000,
+        );
+    }
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "#4085: a non-cacheable flow counts once per packet (RED == 6 on revert)"
+    );
+}
+
+#[test]
+fn cache_hit_replays_input_count_exactly_once_v4() {
+    // End-to-end exactly-once across a cacheable flow: the seed (miss) packet is
+    // counted by the action-eval (leg 1) with the TX-selection re-walk suppressed
+    // (leg 2), and each subsequent flow-cache HIT replays the deduped cached
+    // counter sets exactly once. seed(1) + 2 hits(1 each) == 3.
+    let forwarding = build_forwarding_state(&input_count_fc_snapshot(false));
+    let counter = ingress_count_term_counter(&forwarding, 101, false);
+    let key = count4085_v4_key();
+    let meta = count4085_meta(false);
+
+    // --- seed / miss packet.
+    count4085_action_eval(&forwarding, false, &key, meta.pkt_len as u64);
+    let _ = resolve_cos_tx_selection_at(
+        &forwarding,
+        202,
+        meta,
+        Some(&key),
+        TermMatchExtra::default(),
+        1_000_000_000,
+    );
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "seed packet counts once"
+    );
+
+    // --- build the cached counter sets exactly as flow-cache install does: the
+    // cos rebuild folds the input filter's count into `tx_selection.filter_counters`
+    // (no output filter present) and the dedicated input replay set is deduped
+    // against it (`retain_absent_from`) so the count lives in exactly ONE set.
+    let tx = resolve_cached_cos_tx_selection(&forwarding, 202, meta, Some(&key));
+    let mut input_counters = crate::filter::evaluate_interface_input_filter_counters_cached(
+        &forwarding.filter_state,
+        101,
+        false,
+        key.src_ip,
+        key.dst_ip,
+        key.protocol,
+        key.src_port,
+        key.dst_port,
+        meta.dscp,
+    );
+    input_counters.retain_absent_from(&tx.filter_counters);
+
+    // --- two flow-cache HITs: replay both sets once per hit (flow_cache_hit.rs).
+    for _ in 0..2 {
+        tx.filter_counters
+            .for_each(|c| crate::filter::record_filter_counter(c, meta.pkt_len as u64));
+        input_counters.for_each(|c| crate::filter::record_filter_counter(c, meta.pkt_len as u64));
+    }
+    assert_eq!(
+        counter.packets.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "#4085: seed (1) + 2 cache hits (1 each) == 3 — hits must count once, \
+         not zero or two"
+    );
+}
