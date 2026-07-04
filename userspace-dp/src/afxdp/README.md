@@ -658,6 +658,23 @@ status reads in `state_writer.rs` / `slowpath.rs` keep
 `.lock().map(..).unwrap_or_default()` deliberately (a momentary
 default-mode status read is harmless and not on the session path).
 
+## RG-activation prewarm dedup is O(N+M) (#4069)
+
+`prewarm_reverse_synced_sessions_for_owner_rgs` runs on RG activation —
+i.e. on the failover critical path (~60ms/~130ms budget). It unions the
+forward owner-RG session keys (M) with the narrower reverse-prewarm keys
+(N) before restoring forward entries and synthesizing reverse companions.
+That union is deduplicated by `merge_owner_rg_candidate_keys`, which seeds
+a `FastSet<SessionKey>` from the forward keys once (O(M)) and then probes
+each reverse key in O(1) — O(N+M) total. The prior inline dedup used
+`candidate_keys.contains(&key)`, a linear scan of the growing forward Vec
+once per reverse key (O(N·M)); on a busy cluster with thousands of synced
+sessions that quadratic scan measurably slowed how quickly a newly-primary
+node fully forwarded. The result set and its order are identical to the old
+dedup — forward keys first, then not-yet-seen reverse keys in first-seen
+order — only the membership data structure changed. `ha_tests.rs` pins the
+order/dedup contract and a large-N (N=M=200k) linear-time guard.
+
 ## Hot-path constants
 
 - `RX_BATCH_SIZE = 64`

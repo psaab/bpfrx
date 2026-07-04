@@ -578,6 +578,68 @@ fn prewarm_recovers_from_poisoned_shared_session_mutex() {
     );
 }
 
+// --- #4069 RG-activation prewarm dedup is O(N+M), not O(N·M) --------------
+
+#[test]
+fn merge_owner_rg_candidate_keys_preserves_order_and_dedups() {
+    // The merge must be a stable, deduplicated union: forward keys in their
+    // original order, then each reverse key not already present in first-seen
+    // order, with duplicates (cross-list AND repeated within reverse) removed.
+    // This is the exact semantic contract the O(N+M) hash-set rewrite must
+    // preserve versus the former O(N·M) `Vec::contains` dedup.
+    let key = |port: u16| SessionKey {
+        src_port: port,
+        ..test_key()
+    };
+    let forward = vec![key(1), key(2), key(3)];
+    // reverse: key(2) is already in forward (drop), key(10)/key(11) are new,
+    // the second key(10) is a within-reverse duplicate (drop).
+    let reverse = vec![key(2), key(10), key(11), key(10)];
+
+    let merged = merge_owner_rg_candidate_keys(forward, reverse);
+
+    assert_eq!(
+        merged,
+        vec![key(1), key(2), key(3), key(10), key(11)],
+        "merge must keep forward order then append new reverse keys, deduped"
+    );
+}
+
+#[test]
+fn merge_owner_rg_candidate_keys_scales_linearly_not_quadratically() {
+    // RED-on-revert: the former O(N·M) `Vec::contains` dedup re-scanned the
+    // growing forward Vec once per reverse key. At N = M = 200_000 that is on
+    // the order of 4e10 SessionKey comparisons — tens of seconds to minutes.
+    // The O(N+M) hash-set merge completes in well under a second, so this
+    // generous 5s budget passes on the fix and blows out (RED) on a quadratic
+    // regression. Every key is distinct, so nothing is deduped and the merge
+    // performs the full N+M of work (worst case for the old linear scan too,
+    // which never finds a match and walks the entire forward Vec each time).
+    const N: u32 = 200_000;
+    let distinct_key = |i: u32| SessionKey {
+        // 10.x.x.x — encode i into the low 24 bits so every key is unique.
+        src_ip: IpAddr::V4(Ipv4Addr::from(0x0a00_0000 | (i & 0x00ff_ffff))),
+        ..test_key()
+    };
+    let forward: Vec<SessionKey> = (0..N).map(distinct_key).collect();
+    let reverse: Vec<SessionKey> = (N..2 * N).map(distinct_key).collect();
+
+    let start = std::time::Instant::now();
+    let merged = merge_owner_rg_candidate_keys(forward, reverse);
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        merged.len() as u32,
+        2 * N,
+        "all keys are distinct — the union must contain every one"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "O(N+M) prewarm merge took {elapsed:?} for N=M={N}; a quadratic \
+         Vec::contains regression (O(N·M)) would blow this 5s budget"
+    );
+}
+
 // --- #2170 install-generation guard (helper-side belt-and-suspenders) -----
 
 fn synced_entry_with_generation(generation: u64) -> SyncedSessionEntry {

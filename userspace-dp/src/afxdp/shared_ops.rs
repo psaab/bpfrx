@@ -215,6 +215,37 @@ pub(super) fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionE
     replica
 }
 
+/// Union the forward owner-RG session keys with the narrower
+/// reverse-prewarm keys, deduplicated, preserving order: every `forward`
+/// key first (in its original order), then each `reverse` key not already
+/// present, in first-seen order.
+///
+/// #4069: membership is tested against a hash set built once (O(M)), so the
+/// merge is O(N+M) — N reverse keys, M forward keys. The prior inline
+/// `forward.contains(&key)` re-scanned the growing forward Vec once per
+/// reverse key, i.e. O(N·M). This merge runs on the RG-activation prewarm,
+/// which is on the failover critical path (~60ms/~130ms budget); on a busy
+/// cluster with thousands of synced sessions the quadratic scan measurably
+/// slowed how quickly a newly-primary node fully forwarded. The result set
+/// (and its order) is identical to the old dedup — only the membership data
+/// structure changed.
+pub(super) fn merge_owner_rg_candidate_keys(
+    mut forward: Vec<SessionKey>,
+    reverse: Vec<SessionKey>,
+) -> Vec<SessionKey> {
+    // Seed the membership set with the forward keys (O(M)), then probe each
+    // reverse key in O(1). `insert` returns true only for a not-yet-seen
+    // key, which is exactly the old `!forward.contains(&key)` predicate and
+    // also folds out duplicates within `reverse` itself.
+    let mut seen: FastSet<SessionKey> = forward.iter().cloned().collect();
+    for key in reverse {
+        if seen.insert(key.clone()) {
+            forward.push(key);
+        }
+    }
+    forward
+}
+
 /// Pre-warm reverse companions in shared session maps at RG activation.
 ///
 /// With deterministic reverse companions (#310), the Go sync path already
@@ -248,21 +279,21 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     }
     let publish_session_map = session_map_fd >= 0;
     let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-    let mut candidate_keys = owner_rg_session_keys_serialized(
-        shared_sessions,
-        &shared_owner_rg_indexes.sessions,
-        owner_rgs,
+    // #4069: dedup the forward and reverse-prewarm key sets in O(N+M) via a
+    // hash set (see merge_owner_rg_candidate_keys) instead of the former
+    // O(N·M) `Vec::contains` scan on this failover-critical prewarm path.
+    let candidate_keys = merge_owner_rg_candidate_keys(
+        owner_rg_session_keys_serialized(
+            shared_sessions,
+            &shared_owner_rg_indexes.sessions,
+            owner_rgs,
+        ),
+        owner_rg_session_keys_serialized(
+            shared_sessions,
+            &shared_owner_rg_indexes.reverse_prewarm_sessions,
+            owner_rgs,
+        ),
     );
-    let reverse_candidate_keys = owner_rg_session_keys_serialized(
-        shared_sessions,
-        &shared_owner_rg_indexes.reverse_prewarm_sessions,
-        owner_rgs,
-    );
-    for key in reverse_candidate_keys {
-        if !candidate_keys.contains(&key) {
-            candidate_keys.push(key);
-        }
-    }
     // #2402: acquire the shared-session guard with poison RECOVERY. The
     // prior `.lock().map(..).unwrap_or_default()` swallowed a poisoned
     // lock into EMPTY (forward_entries, reverse_entries) — so if a worker
