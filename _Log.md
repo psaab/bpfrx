@@ -1,3 +1,37 @@
+## 2026-07-03 — #3937: parseSAOutput parses a swanctl format swanctl never emits → all IPsec SA status blank
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-067 (MEDIUM, observability). `GetSAStatus`
+    shells out to `swanctl --list-sas` and feeds stdout to `parseSAOutput`,
+    but the parser assumed an `ipsec statusall`-style layout (`local: A === B`,
+    `local_ts = C`, `bytes_in=N`) that swanctl NEVER emits. Against the real
+    `swanctl --list-sas` output the name and state parsed, but the endpoints,
+    traffic selectors, byte counters — every troubleshooting field — came back
+    blank, so `show security ipsec sa[/detail/statistics]`, `show security ike
+    sa`, and the gRPC/REST IPsec SA views were permanently empty even with
+    active tunnels. Rewrote `parseSAOutput` (`pkg/ipsec/ike.go`) to parse the
+    ACTUAL layout: IKE header `name: #<id>, <STATE>, IKEv<n>, <spi>_i* <spi>_r`;
+    indented `local/remote '<id>' @ <host>[<port>]` endpoints (the `@`
+    distinguishes an endpoint from a bare-CIDR child traffic-selector line);
+    child header `name: #<id>, reqid <n>, <STATE>, <MODE>, ESP:<proposal>`;
+    `in/out <spi>, <bytes> bytes, <packets> packets` counters. Kept the
+    already-invoked `swanctl --list-sas` command (did NOT switch to `--raw`) —
+    the minimal robust fix is to parse the human format the daemon already
+    runs, pinned to reality by a golden fixture. Added helper functions
+    `parseIKEHeader`/`parseChildHeader`/`parseEndpointHost`/`parseTrafficLine`.
+    Extended `SAStatus` with `InPackets`/`OutPackets`/`SPIIn`/`SPIOut`/`Rekey`
+    and surfaced them in `show security ipsec sa detail`
+    (`pkg/cli/cli_show_security_ipsec.go`). Added golden fixtures captured from
+    real strongSwan output (`pkg/ipsec/testdata/swanctl_list_sas_single.txt`,
+    `swanctl_list_sas_two.txt` — the latter IPv6, to pin the `[port]`-strip
+    that must not eat v6 host colons) and rewrote the drifted synthetic tests
+    to pin against them. RED-on-revert proven: the old parser leaves
+    LocalAddr/RemoteAddr/TS/bytes/packets/SPI all blank against the fixtures.
+  - **File(s)**: `pkg/ipsec/ike.go`, `pkg/ipsec/ipsec_test.go`,
+    `pkg/ipsec/testdata/swanctl_list_sas_single.txt`,
+    `pkg/ipsec/testdata/swanctl_list_sas_two.txt`,
+    `pkg/cli/cli_show_security_ipsec.go`, `pkg/ipsec/README.md`
+
 ## 2026-07-03 — #3929: session-count stats (SessionCount + xpf_sessions_active/established) permanently 0 on the userspace dataplane
 
 - **Timestamp**: 2026-07-03
