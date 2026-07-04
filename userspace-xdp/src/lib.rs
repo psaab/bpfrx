@@ -5,7 +5,7 @@ use aya_ebpf::{
     bindings::{BPF_F_NO_PREALLOC, xdp_action, xdp_md},
     helpers::r#gen::{bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_xdp_adjust_meta},
     macros::{map, xdp},
-    maps::{Array, CpuMap, HashMap, XskMap},
+    maps::{Array, CpuMap, HashMap, PerCpuArray, XskMap},
     programs::XdpContext,
 };
 use core::mem;
@@ -374,9 +374,19 @@ const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
 
 // Pinned-map compatibility exception: Go still reads this map name during
 // mixed-version upgrades, but status/docs expose it as degraded_path_counters.
+//
+// #4113 (F13): PerCpuArray, NOT a shared Array. Native XDP runs one program
+// instance per RX queue on distinct CPUs concurrently (loss cluster VFs = 6
+// RX queues -> 6 CPUs). `incr_fallback_stat` does a non-atomic load/add/store
+// RMW; on a shared Array two CPUs taking the same fallback branch in the same
+// window both read v, compute v+1, store v+1 -> one increment LOST. A per-CPU
+// array makes each increment CPU-local, so the non-atomic RMW is correct
+// (matching the #45 per-CPU-counter lineage the retired eBPF pipeline used).
+// The Go/helper readers SUM across CPUs (readDegradedPathStatsLocked,
+// read_degraded_path_stats).
 #[map(name = "userspace_fallback_stats")]
-static USERSPACE_FALLBACK_STATS: Array<u64> =
-    Array::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
+static USERSPACE_FALLBACK_STATS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
 
 #[map(name = "userspace_trace")]
 static USERSPACE_TRACE: HashMap<u32, UserspaceTraceValue> = HashMap::with_max_entries(1024, 0);
@@ -1081,11 +1091,17 @@ fn record_trace(
     reason: u32,
     parsed: &ParsedPacket,
 ) {
-    let forced = matches!(
-        stage,
-        USERSPACE_TRACE_STAGE_BINDING_MISSING | USERSPACE_TRACE_STAGE_EARLY_FILTER
-    );
-    if !forced && (ctrl_flags & USERSPACE_CTRL_FLAG_TRACE) == 0 {
+    // #4113 (F7): gate the BPF map insert on the TRACE flag UNCONDITIONALLY.
+    // The previous `forced` bypass ran a per-packet bpf_ktime_get_ns + avalanche
+    // key compute + bpf_map_update_elem (per-bucket lock) for the EARLY_FILTER /
+    // BINDING_MISSING stages even when tracing was OFF. That was reachable by
+    // unauthenticated traffic aimed at well-known multicast/broadcast groups
+    // (should_fallback_early) or during a transient config-reload unbind
+    // (BINDING_MISSING) -> attacker-influenceable native-XDP hot-path
+    // amplification. Degraded-path visibility for those stages is preserved by
+    // the (F13 per-CPU) USERSPACE_FALLBACK_STATS counter, which the call sites
+    // bump via incr_fallback_stat independently of this trace insert.
+    if (ctrl_flags & USERSPACE_CTRL_FLAG_TRACE) == 0 {
         return;
     }
     if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
