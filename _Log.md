@@ -24,6 +24,44 @@
   - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/swanctl_render_test.go,
     pkg/ipsec/README.md, _Log.md
 
+## 2026-07-03 — #3950: monitorLinkState exited permanently on netlink ENOBUFS → SNMP link traps went dark for the daemon's lifetime
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-171 (MEDIUM, robustness). `monitorLinkState`
+    (`pkg/daemon/daemon_flow.go`) subscribed to netlink link updates via
+    `netlink.LinkSubscribe` and returned when the update channel closed (`!ok`).
+    The vishvananda/netlink subscribe goroutine closes that channel on ANY
+    receive error, including a recoverable `ENOBUFS` (socket-rcvbuf overflow
+    under a burst of link events — the socket stays usable, some multicast
+    notifications were dropped). A single transient ENOBUFS therefore exited the
+    monitor goroutine forever, so no interface up/down was detected again — the
+    SNMP linkUp/linkDown trap path (and the broader link-event-driven class:
+    RETH member link-down tracking, DHCP-on-link-up) went dark.
+  - **Fix**: mirrored the neighbor listener's resilient resubscribe pattern.
+    `monitorLinkState` now loops over `runLinkStateSubscription`, which owns ONE
+    subscription and returns `true` on a recoverable channel close (back off
+    `linkStateResubBackoffDefault` = 2s, then resubscribe) and `false` only on
+    context cancellation (clean exit). Because ENOBUFS means notifications were
+    DROPPED, each fresh subscription runs `resyncLinkState` (full `LinkList`)
+    right after it goes live and emits catch-up traps for any transition missed
+    during the overflow; `prevOper` persists across resubscribes so the catch-up
+    dedups against last-known state. Added three test seams on `Daemon`
+    (`linkStateSubscribe` with an onErr callback, `linkStateList`,
+    `linkStateEmit`) plus `linkStateResubBackoff`; production defaults are
+    `defaultLinkStateSubscribe` (wires the netlink ErrorCallback that logs the
+    ENOBUFS) / `netlink.LinkList` / SNMP trap.
+  - **File(s)**: `pkg/daemon/daemon_flow.go` (rewrote `monitorLinkState`; added
+    `runLinkStateSubscription`, `resyncLinkState`, `applyLinkState`,
+    `emitLinkStateTrap`, `defaultLinkStateSubscribe`, `linkStateResubBackoffDefault`),
+    `pkg/daemon/daemon.go` (four seam fields), `docs/bugs.md`.
+  - **Test(s)**: `pkg/daemon/daemon_linkstate_monitor_3950_test.go` — ENOBUFS
+    resubscribe + catch-up re-sync + continue (RED on revert: exits after 1
+    subscription, no emits), context-cancel clean exit, normal-event happy path
+    (boot seed of an already-up interface does NOT emit). `go test ./pkg/daemon/
+    -race` green; `go build ./...`, gofmt, vet clean.
+  - **Validation**: proved RED-on-revert by flipping the recoverable-close
+    branch from `return true` to `return false` — `TestMonitorLinkStateResubscribesOnENOBUFS`
+    then fails (1 subscription, empty emits). Restored → all green.
 ## 2026-07-03 — #3948: SNMP trap-group `version` had no typed field → a `version v1` group emitted v2c traps
 
 - **Timestamp**: 2026-07-03
