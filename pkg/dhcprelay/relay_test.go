@@ -1555,6 +1555,196 @@ func TestRunRelay_DegradedBaseline_AdoptsFirstRealIfindex(t *testing.T) {
 	}
 }
 
+// --- #3960 primary-IPv4 (giaddr) re-resolution ---
+
+// giaddrResolver returns an ifaceResolver backed by an atomic address (so a test
+// can readdress the interface mid-flight) plus an atomic error toggle (so a test
+// can simulate the interface losing its address). It also counts calls. The
+// stored value is always a net.IP, so atomic.Value's same-type rule holds.
+func giaddrResolver(initial net.IP) (ifaceResolver, *atomic.Value, *atomic.Bool, *atomic.Int64) {
+	addr := &atomic.Value{}
+	addr.Store(initial)
+	failing := &atomic.Bool{}
+	calls := &atomic.Int64{}
+	r := func(ifaceName string) (net.IP, error) {
+		calls.Add(1)
+		if failing.Load() {
+			return nil, errors.New("no IPv4 address")
+		}
+		return addr.Load().(net.IP), nil
+	}
+	return r, addr, failing, calls
+}
+
+// serverConnBinds returns, in factory-call order, the bind IPs of the server
+// conns (the non-wildcard binds; the client listener binds 0.0.0.0).
+func serverConnBinds(calls []factoryCall) []net.IP {
+	var out []net.IP
+	for _, c := range calls {
+		if !c.bindAddr.IP.Equal(net.IPv4zero) {
+			out = append(out, c.bindAddr.IP)
+		}
+	}
+	return out
+}
+
+// TestRunRelay_AddressReaddr_RebindsGiaddr proves the #3960 fix: when the relay
+// interface's PRIMARY IPv4 changes under a STABLE ifindex (DHCP renew to a new
+// IP, static readdress, HA VIP move on the same netdev), the relay tears down
+// the session and rebuilds — re-resolving the giaddr so the server conn rebinds
+// to the NEW giaddr:67. Asserted via the factory: gen-1 opens 2 conns bound to
+// the old giaddr; after readdress the supervisor rebuilds, opening 2 more with
+// the server conn bound to the NEW giaddr.
+//
+// FAIL-ON-REVERT: revert the #3960 re-resolution and the watcher never detects
+// the address change → no rebuild → stuck at 2 factory calls → waitCalls times
+// out → RED. The server stays bound to the old (now-invalid) giaddr:67 and every
+// reply is blackholed.
+func TestRunRelay_AddressReaddr_RebindsGiaddr(t *testing.T) {
+	factory, getCalls := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	resolve, addr, _, _ := giaddrResolver(net.IPv4(10, 0, 0, 254))
+	m.resolveGIAddr = resolve
+	m.ifindexCheck = 5 * time.Millisecond // reuse the watcher cadence
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	calls := waitCalls(t, getCalls, 2, 2*time.Second) // gen-1 client + server
+
+	if binds := serverConnBinds(calls); len(binds) != 1 ||
+		!binds[0].Equal(net.IPv4(10, 0, 0, 254)) {
+		t.Fatalf("gen-1 server conn binds = %v, want [10.0.0.254]", binds)
+	}
+
+	// Interface readdressed under the SAME ifindex.
+	addr.Store(net.IPv4(10, 0, 0, 99))
+
+	// The readdr watcher must cancel the session and the supervisor rebuild,
+	// producing 2 more factory calls (gen-2 client + server).
+	calls = waitCalls(t, getCalls, 4, 2*time.Second)
+
+	binds := serverConnBinds(calls)
+	if len(binds) < 2 {
+		t.Fatalf("expected >=2 server conns (original + rebind), got %d: %v", len(binds), binds)
+	}
+	if last := binds[len(binds)-1]; !last.Equal(net.IPv4(10, 0, 0, 99)) {
+		t.Errorf("rebound server conn bound %v, want the NEW giaddr 10.0.0.99 "+
+			"(server replies to giaddr:67 blackhole on the old address, #3960)", last)
+	}
+}
+
+// TestRunRelay_AddressReaddr_StampsNewGiaddr proves the request-side of the
+// #3960 fix end to end: after a same-ifindex readdress the NEXT relayed request
+// carries the NEW giaddr (not the stale one the server would reply to and
+// blackhole). The gen-2 client conn is seeded with a DHCPREQUEST; the rebuilt
+// session relays it stamped with the new address.
+func TestRunRelay_AddressReaddr_StampsNewGiaddr(t *testing.T) {
+	client1 := newFakeConn()
+	server1 := newFakeConn()
+	client2 := newFakeConn()
+	client2.pending = [][]byte{makeRequest(t)}
+	server2 := newFakeConn()
+	factory, getCalls := recordingFactory(client1, server1, client2, server2)
+	m := testManager(factory)
+	defer m.Stop()
+
+	resolve, addr, _, _ := giaddrResolver(net.IPv4(10, 0, 0, 254))
+	m.resolveGIAddr = resolve
+	m.ifindexCheck = 5 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second) // gen-1 client + server
+
+	// Readdress -> rebuild -> gen-2 relays the seeded request.
+	addr.Store(net.IPv4(10, 0, 0, 99))
+	waitCalls(t, getCalls, 4, 2*time.Second) // gen-2 client + server
+
+	deadline := time.Now().Add(2 * time.Second)
+	for server2.writeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server2.writeCount() == 0 {
+		t.Fatal("gen-2 session did not relay the request after readdress")
+	}
+	relayed, err := dhcpv4.FromBytes(server2.firstWrite(t))
+	if err != nil {
+		t.Fatalf("relayed datagram does not parse: %v", err)
+	}
+	if !relayed.GatewayIPAddr.Equal(net.IPv4(10, 0, 0, 99)) {
+		t.Errorf("relayed giaddr = %v, want the NEW 10.0.0.99 "+
+			"(stale giaddr -> server reply blackholed, #3960)", relayed.GatewayIPAddr)
+	}
+}
+
+// TestRunRelay_AddressStable_NoRebind proves idempotency: with the primary IPv4
+// never changing, the watcher re-resolves the giaddr repeatedly but never
+// restarts the session. The factory is called exactly twice for the lifetime.
+func TestRunRelay_AddressStable_NoRebind(t *testing.T) {
+	factory, getCalls := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	resolve, _, _, calls := giaddrResolver(net.IPv4(10, 0, 0, 254))
+	m.resolveGIAddr = resolve
+	m.ifindexCheck = 2 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	// Let the watcher tick many times against a stable address.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) && calls.Load() < 10 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if calls.Load() < 5 {
+		t.Fatalf("giaddr watcher did not run enough to be meaningful (%d resolves)", calls.Load())
+	}
+	if got := len(getCalls()); got != 2 {
+		t.Errorf("stable address must NOT rebind: got %d factory calls, want 2", got)
+	}
+}
+
+// TestRunRelay_AddressResolveFailure_KeepsListener proves the tolerant-resolve
+// invariant for #3960: a momentarily unaddressed interface (resolver errors "no
+// IPv4 address") must NOT tear down a working session (no rebuild, no socket
+// close) and must NOT stamp a bogus giaddr — the session keeps its
+// last-known-good giaddr until a real new address appears.
+func TestRunRelay_AddressResolveFailure_KeepsListener(t *testing.T) {
+	client := newFakeConn()
+	server := newFakeConn()
+	factory, getCalls := recordingFactory(client, server)
+	m := testManager(factory)
+	defer m.Stop()
+
+	resolve, _, failing, calls := giaddrResolver(net.IPv4(10, 0, 0, 254))
+	m.resolveGIAddr = resolve
+	m.ifindexCheck = 2 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	// The interface loses its address on every subsequent re-resolve.
+	failing.Store(true)
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	base := calls.Load()
+	for time.Now().Before(deadline) && calls.Load() < base+10 {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	if got := len(getCalls()); got != 2 {
+		t.Errorf("giaddr resolve failure must NOT rebind: got %d factory calls, want 2", got)
+	}
+	if client.isClosed() || server.isClosed() {
+		t.Error("giaddr resolve failure must NOT tear down the working listener")
+	}
+}
+
 // makeRequest builds a DHCPREQUEST client packet for the master-gate tests.
 func makeRequest(t *testing.T) []byte {
 	t.Helper()
