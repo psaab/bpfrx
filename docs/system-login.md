@@ -90,6 +90,13 @@ subcommand with the same prefix matcher the dispatcher uses, so an abbreviated
 fully-spelled form and cannot bypass the gate. `super-user` reaches these verbs
 through `PermAll`, so `PermMaint` need not appear in its permission list.
 
+**Audit trail (#4108 F8).** When one of these destructive verbs runs, the gRPC
+`SystemAction` handler writes a fsynced `system_action` entry (verb + timestamp)
+to the configstore audit journal (`.config.journal`) **before** executing, so a
+durable, attributable record survives even a `zeroize` (the `journald` line does
+not). See the configstore README "Audit journal" section for the record format
+and zeroize-survival details.
+
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`
 spawns a **root `tcpdump` live packet capture** on a data interface, so it

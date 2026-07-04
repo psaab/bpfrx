@@ -19,6 +19,30 @@
   - **File(s)**: pkg/config/types_system.go, pkg/cli/permissions.go,
     pkg/cli/permissions_maintenance_4108_test.go, docs/system-login.md, _Log.md
 
+- **Timestamp**: 2026-07-04
+  - **Action**: F8 (LOW, audit/observability). VERIFY-FIRST confirmed the
+    gap: `grpcapi/server_diag.go` SystemAction only `slog.Warn`'d the
+    destructive verbs — no journal call — so a `zeroize` (wipes config) or
+    reboot left NO tamper-resistant audit record (the journald line does not
+    survive a zeroize). Fix: new public `Store.LogSystemAction(action)`
+    (`pkg/configstore/store_commit.go`) appends a fsynced `system_action`
+    journal entry (reuses `journalLog`); the SystemAction handler calls
+    `s.logSystemAction(<verb>)` BEFORE executing reboot/halt/power-off/
+    zeroize (`pkg/grpcapi/server_diag.go`), so the fsynced record is durable
+    before the box goes down / config is wiped. The journal file
+    `.config.journal` also survives zeroize (not in the .conf/rollback
+    removal set). Extracted the destructive execution behind package seams
+    (`schedulePowerAction`/`performZeroizeWipe`) so a unit test can drive the
+    full SystemAction dispatch without rebooting or wiping /etc/xpf.
+    `system_action` is excluded from `ListCommitHistory` (show system commit
+    = config commits only). RED-on-revert proven (no-op'ing LogSystemAction
+    → both configstore + grpcapi tests fail: no journal entry).
+  - **File(s)**: pkg/configstore/store_commit.go,
+    pkg/configstore/journal/journal.go, pkg/grpcapi/server_diag.go,
+    pkg/configstore/system_action_journal_4108_test.go,
+    pkg/grpcapi/system_action_journal_4108_test.go,
+    pkg/configstore/README.md, docs/system-login.md, _Log.md
+
 ## 2026-07-04 — #4099: on-box CLI `show configuration` secret redaction by login class
 
 - **Timestamp**: 2026-07-04

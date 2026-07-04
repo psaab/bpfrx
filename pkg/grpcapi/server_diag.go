@@ -714,57 +714,88 @@ func (s *Server) proxyPeerSystemAction(ctx context.Context, req *pb.SystemAction
 	return pb.NewBpfrxServiceClient(conn).SystemAction(peerCtx, req)
 }
 
+// logSystemAction records a destructive maintenance action to the configstore
+// audit journal BEFORE it executes (#4108 F8). The store append is synchronous
+// and fsynced, so an attributable record is durable on disk even when the
+// action wipes the config (zeroize) or takes the box down (reboot/halt/
+// power-off) — the slog.Warn line only reaches journald, which does not
+// survive a zeroize. Best-effort: a journal write failure never blocks a
+// confirmed power/wipe action (the store layer warns rather than failing).
+func (s *Server) logSystemAction(action string) {
+	if s.store == nil {
+		return
+	}
+	s.store.LogSystemAction(action)
+}
+
+// schedulePowerAction runs `systemctl <arg>` after a 1s grace so the RPC
+// response reaches the client first. It is a package var so a test can drive
+// the reboot/halt/power-off SystemAction verbs (to assert the #4108 F8 journal
+// wiring) WITHOUT actually taking the host down.
+var schedulePowerAction = func(systemctlArg string) {
+	go func() {
+		time.Sleep(1 * time.Second)
+		// context.Background(): a confirmed power action must not be
+		// cancelled by client disconnect. Errors ignored as before.
+		runTimeout(context.Background(), "systemctl", systemctlArg)
+	}()
+}
+
+// performZeroizeWipe erases the on-disk config, BPF pins, and managed networkd
+// files (factory reset). It is a package var so a test can drive the `zeroize`
+// SystemAction verb (to assert the #4108 F8 journal wiring) WITHOUT wiping a
+// real /etc/xpf on the developer/appliance box.
+var performZeroizeWipe = func() {
+	// Remove configs
+	configDir := "/etc/xpf"
+	files, _ := os.ReadDir(configDir)
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".conf") || strings.HasPrefix(f.Name(), "rollback") {
+			os.Remove(configDir + "/" + f.Name())
+		}
+	}
+	// Remove BPF pins
+	os.RemoveAll("/sys/fs/bpf/xpf")
+	// Remove managed networkd files
+	ndFiles, _ := os.ReadDir("/etc/systemd/network")
+	for _, f := range ndFiles {
+		if strings.HasPrefix(f.Name(), "10-xpf-") {
+			os.Remove("/etc/systemd/network/" + f.Name())
+		}
+	}
+}
+
 func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {
 	switch req.Action {
 	case "reboot":
 		slog.Warn("system reboot requested via gRPC")
-		go func() {
-			time.Sleep(1 * time.Second)
-			// context.Background(): a confirmed power action must not be
-			// cancelled by client disconnect. Errors ignored as before.
-			runTimeout(context.Background(), "systemctl", "reboot")
-		}()
+		// Journal BEFORE the box goes down: the fsynced record survives the
+		// reboot even though the slog.Warn journald line may not (#4108 F8).
+		s.logSystemAction("reboot")
+		schedulePowerAction("reboot")
 		return &pb.SystemActionResponse{Message: "System going down for reboot NOW!"}, nil
 
 	case "halt":
 		slog.Warn("system halt requested via gRPC")
-		go func() {
-			time.Sleep(1 * time.Second)
-			// context.Background(): a confirmed power action must not be
-			// cancelled by client disconnect. Errors ignored as before.
-			runTimeout(context.Background(), "systemctl", "halt")
-		}()
+		s.logSystemAction("halt")
+		schedulePowerAction("halt")
 		return &pb.SystemActionResponse{Message: "System halting NOW!"}, nil
 
 	case "power-off":
 		slog.Warn("system power-off requested via gRPC")
-		go func() {
-			time.Sleep(1 * time.Second)
-			// context.Background(): a confirmed power action must not be
-			// cancelled by client disconnect. Errors ignored as before.
-			runTimeout(context.Background(), "systemctl", "poweroff")
-		}()
+		s.logSystemAction("power-off")
+		schedulePowerAction("poweroff")
 		return &pb.SystemActionResponse{Message: "System powering off NOW!"}, nil
 
 	case "zeroize":
 		slog.Warn("system zeroize requested via gRPC")
-		// Remove configs
-		configDir := "/etc/xpf"
-		files, _ := os.ReadDir(configDir)
-		for _, f := range files {
-			if strings.HasSuffix(f.Name(), ".conf") || strings.HasPrefix(f.Name(), "rollback") {
-				os.Remove(configDir + "/" + f.Name())
-			}
-		}
-		// Remove BPF pins
-		os.RemoveAll("/sys/fs/bpf/xpf")
-		// Remove managed networkd files
-		ndFiles, _ := os.ReadDir("/etc/systemd/network")
-		for _, f := range ndFiles {
-			if strings.HasPrefix(f.Name(), "10-xpf-") {
-				os.Remove("/etc/systemd/network/" + f.Name())
-			}
-		}
+		// Journal BEFORE the wipe: the fsynced record is durable on disk
+		// before any config file is removed, so a factory reset still leaves
+		// an attributable audit trail (#4108 F8). The journal file itself
+		// (.config.journal) is not in the removal set below (it neither ends
+		// in .conf nor starts with rollback), so the record also survives.
+		s.logSystemAction("zeroize")
+		performZeroizeWipe()
 		return &pb.SystemActionResponse{Message: "System zeroized. Configuration erased. Reboot to complete factory reset."}, nil
 
 	case "clear-config-lock":

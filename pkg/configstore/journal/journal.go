@@ -46,7 +46,8 @@ type Entry struct {
 	Schema    int       `json:"v,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 	// Action: "commit", "commit_confirmed", "auto_rollback",
-	// "config_sync", "persist_error", "persist_recovered".
+	// "config_sync", "persist_error", "persist_recovered",
+	// "system_action" (destructive maintenance verb, #4108 F8).
 	Action string `json:"action"`
 	// Detail is the human-readable description (commit comment or
 	// error text).
