@@ -30037,3 +30037,39 @@ top.
   - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_flow.go,
     pkg/daemon/daemon_flowtrace_3932_test.go, pkg/logging/trace.go,
     pkg/logging/README.md, _Log.md
+- **Timestamp**: 2026-07-03
+  - **Action**: #3960 — DHCP relay `giaddr` not re-resolved on a same-ifindex
+    interface address change → relayed reply path silently breaks. The relay
+    (`pkg/dhcprelay`) resolved `giaddr` (its own interface IPv4, the source the
+    upstream server unicasts `OFFER`/`ACK` back to at `giaddr:67`) ONCE at
+    session start in `runRelaySession`, then consumed it in three places: the
+    server conn's `giaddr:67` bind, the per-packet `GatewayIPAddr` stamp, and
+    the raw-L2 reply source IP. A same-ifindex readdress (DHCP lease renew to a
+    new IP, static readdress, HA VIP move on the same netdev) left all three
+    STALE — the server replied to the old address AND the server conn stayed
+    bound to the old `giaddr:67`, so replies were blackholed and relayed clients
+    stopped getting leases. The #2347 ifindex-drift watcher only rebuilt on an
+    ifindex change, never on an address change. Fix: fold primary-IPv4
+    re-resolution into that same periodic watcher — on each tick it now
+    re-resolves `m.resolveGIAddr(ifaceName)` and compares against the session's
+    bound `giaddr`; a real, differing address records a new `sessionReaddr`
+    outcome and cancels the session context (reusing the #1915 close-on-cancel +
+    WaitGroup teardown). `runRelay` rebuilds immediately, which re-resolves the
+    `giaddr`, rebinds the server conn to the new `giaddr:67`, and makes the new
+    main loop stamp the current address — fixing all three consumers atomically
+    (a bare per-relay re-stamp would be WORSE: the server would reply to the new
+    `giaddr:67` with nothing bound there until the rebuild). Tolerant like the
+    ifindex probe: a momentarily unaddressed interface (resolve failure) keeps
+    the last-known-good `giaddr` and never tears down or stamps a bogus giaddr;
+    idempotent (unchanged address => no rebuild). RED-on-revert tests
+    (`relay_test.go`): `TestRunRelay_AddressReaddr_RebindsGiaddr` (readdress →
+    gen-2 server conn rebinds to the NEW giaddr; revert → no rebuild → 2 factory
+    calls → RED), `TestRunRelay_AddressReaddr_StampsNewGiaddr` (seeded gen-2
+    request carries the new giaddr end to end), plus negative controls
+    `TestRunRelay_AddressStable_NoRebind` and
+    `TestRunRelay_AddressResolveFailure_KeepsListener`. Confirmed RED by
+    neutering the readdr rebuild (both positive tests failed). `go test -race
+    ./pkg/dhcprelay/` green, `go build ./...`, gofmt, vet clean. Doc:
+    pkg/dhcprelay/README.md #3960 giaddr-re-resolution bullet.
+  - **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+    pkg/dhcprelay/README.md, _Log.md
