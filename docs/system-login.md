@@ -41,11 +41,17 @@ classes are:
 
 | Class | Permissions |
 |---|---|
-| `super-user` | everything |
-| `operator` | view, clear, control (request/test) |
+| `super-user` | everything (incl. destructive maintenance) |
+| `operator` | view, clear, control (request/test) — **not** maintenance |
 | `read-only` | view only |
 | `config-viewer` | view only (can display config; cannot enter `configure` to modify) |
 | `unauthorized` | nothing |
+
+`super-user` is the only class that holds the destructive **maintenance**
+permission (`PermMaint`), which it reaches through `PermAll`. `operator` has
+`control` (so it can run benign `request`/`test` commands) but **not**
+maintenance, mirroring Junos where the predefined `operator` class lacks the
+`maintenance` permission and therefore cannot reboot or zeroize the box (#4108).
 
 RBAC is enforced at runtime by `checkPermission` (`pkg/cli/permissions.go`),
 invoked by the dispatch layer before each top-level command. The accepted
@@ -64,8 +70,32 @@ Gating is on the resolved **top-level** command word:
 | `show`, `ping`, `traceroute`, `monitor` | view |
 | `clear` | clear |
 | `request`, `test` | control |
+| `request system {reboot,halt,power-off,zeroize}`, `request chassis cluster failover` | **maintenance** (super-user only) |
 | `configure` | config |
 | anything else | super-user (all) |
+
+**Privileged-subcommand exception — destructive maintenance (#4108 F21).**
+Most `request` verbs are `control`-level, but the four `request system` verbs
+that take the box down or wipe it — `reboot`, `halt`, `power-off`, `zeroize` —
+and `request chassis cluster failover` are gated at the super-user-only
+**maintenance** (`PermMaint`) level. On Junos the predefined `operator` class
+has no `maintenance` permission and so cannot reboot/zeroize; xpf matches that:
+`operator` (which holds `control`) is **denied** these verbs, while its benign
+`request` commands (`request security …`, `request system software`,
+`request system dynamic-dns`, rescue-config save, etc.) stay `control` and
+remain available. The exception lives in `requiredPermission` →
+`requestSubcommandIsMaintenance` (`pkg/cli/permissions.go`) and resolves the
+subcommand with the same prefix matcher the dispatcher uses, so an abbreviated
+`request system zero` or `request sys reboot` is gated identically to the
+fully-spelled form and cannot bypass the gate. `super-user` reaches these verbs
+through `PermAll`, so `PermMaint` need not appear in its permission list.
+
+**Audit trail (#4108 F8).** When one of these destructive verbs runs, the gRPC
+`SystemAction` handler writes a fsynced `system_action` entry (verb + timestamp)
+to the configstore audit journal (`.config.journal`) **before** executing, so a
+durable, attributable record survives even a `zeroize` (the `journald` line does
+not). See the configstore README "Audit journal" section for the record format
+and zeroize-survival details.
 
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`
@@ -81,6 +111,38 @@ plain read-only. The exception lives in `requiredPermission`
 matcher the dispatcher uses, so an abbreviated `monitor tr` is gated
 identically to the fully-spelled form and cannot bypass the gate. Other
 `monitor` subcommands and read-only `show` commands are unaffected.
+
+**Secret redaction in `show configuration` (#4099).** The on-box interactive
+CLI config-render show paths — `show configuration` (hierarchical / `| display
+set` / `| display json` / `| display xml` / `| display inheritance`, including
+path-scoped subtrees), `show system rollback <N> [| display set | compare]`,
+`show system login` / `internet-options` / `root-authentication`, `show system
+configuration rescue`, and the config-mode `show` / `show | compare` — mask
+secret leaves (IKE pre-shared-keys, SNMP communities, BGP/OSPF
+authentication-keys, WireGuard private keys, encrypted passwords, DDNS
+tokens/keys) with `##SECRET-DATA##` for **every login class except
+`super-user`**. This mirrors Junos (which never renders a cleartext secret in
+`show configuration` for any class) and the always-redacted REST/gRPC
+`ShowConfig` path (#4051): a VIEW-only `read-only`, `config-viewer`, or
+`operator` login can no longer harvest cleartext firewall secrets through the
+console. The redaction predicate is `CLI.showConfigRedacted()`
+(`pkg/cli/permissions.go`): it routes rendering through the `*Redacted`
+configstore methods (the same `RedactedClone` renderers REST/gRPC use) for any
+class **without** `PermAll`.
+
+`super-user` still reads cleartext — it is the console root that already has
+direct config-DB filesystem access, so masking it would only obstruct the
+operator copying a secret while providing no protection (the deliberate #4057
+allowance). An **unset/empty** class (no `system login` configured — the legacy
+no-RBAC allow-everything mode) is likewise treated as privileged and reads
+cleartext, so a deployment with no login classes is bit-identical to before the
+change. An **unknown** class fails **closed** (redacted). Config mode requires
+`PermConfig` (super-user only today), so the config-mode candidate show paths
+render cleartext in practice; they are wired through the same gate as
+defense-in-depth should a lower class ever gain config-view access. The raw
+`rescue.conf` text (a full cleartext-secret config dump, #4056) is reparsed +
+redacted before display and fails **closed** — a parse error returns an error
+rather than the cleartext bytes.
 
 ### Generating a hash
 

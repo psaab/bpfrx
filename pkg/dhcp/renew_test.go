@@ -437,3 +437,100 @@ func TestRunDHCPv4RebindingNAKRestartsDiscover(t *testing.T) {
 		t.Errorf("lease after REBINDING NAK = %v, want nil (deconfigured)", got)
 	}
 }
+
+// mustV4ACK builds a minimal DHCPv4 ACK carrying yourIP and, when non-nil,
+// the given subnet mask (option 1). A nil mask omits the option so the
+// leaseFromACKv4 fallback path is exercised.
+func mustV4ACK(t *testing.T, yourIP net.IP, mask net.IPMask) *dhcpv4.DHCPv4 {
+	t.Helper()
+	mods := []dhcpv4.Modifier{
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeAck),
+		dhcpv4.WithYourIP(yourIP),
+	}
+	if mask != nil {
+		mods = append(mods, dhcpv4.WithNetmask(mask))
+	}
+	ack, err := dhcpv4.New(mods...)
+	if err != nil {
+		t.Fatalf("build DHCPv4 ACK: %v", err)
+	}
+	return ack
+}
+
+// TestLeaseFromACKv4RejectsDegenerateMask locks in the #4101 fix: a rogue or
+// broken server that ACKs with a zero (0.0.0.0 → /0) or non-contiguous subnet
+// mask must NOT yield a YourIP/0 lease — the kernel would install an on-link
+// 0.0.0.0/0 connected route and blackhole all IPv4 forwarding. leaseFromACKv4
+// must reject such an ACK (error, no lease). RED-on-revert: without the guard,
+// the zero/non-contiguous cases parse to a valid Lease at 192.0.2.50/0.
+func TestLeaseFromACKv4RejectsDegenerateMask(t *testing.T) {
+	yourIP := net.ParseIP("192.0.2.50")
+
+	tests := []struct {
+		name     string
+		mask     net.IPMask
+		wantErr  bool
+		wantOnes int // expected prefix bits when accepted
+	}{
+		{
+			name:    "zero mask 0.0.0.0 (/0) rejected",
+			mask:    net.IPMask{0, 0, 0, 0},
+			wantErr: true,
+		},
+		{
+			name:    "non-contiguous mask 255.255.0.255 rejected",
+			mask:    net.IPMask{255, 255, 0, 255},
+			wantErr: true,
+		},
+		{
+			name:     "normal /24 accepted",
+			mask:     net.IPMask{255, 255, 255, 0},
+			wantErr:  false,
+			wantOnes: 24,
+		},
+		{
+			name:     "host /32 accepted",
+			mask:     net.IPMask{255, 255, 255, 255},
+			wantErr:  false,
+			wantOnes: 32,
+		},
+		{
+			name:     "point-to-point /31 accepted",
+			mask:     net.IPMask{255, 255, 255, 254},
+			wantErr:  false,
+			wantOnes: 31,
+		},
+		{
+			name:     "absent mask falls back to /24",
+			mask:     nil,
+			wantErr:  false,
+			wantOnes: 24,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ack := mustV4ACK(t, yourIP, tc.mask)
+			lease, err := leaseFromACKv4("wan0", ack)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("leaseFromACKv4 accepted degenerate mask; got lease %v, want error (no YourIP/0)",
+						lease.Address)
+				}
+				if lease != nil {
+					t.Errorf("lease returned alongside error = %v, want nil", lease.Address)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("leaseFromACKv4 rejected a valid mask: %v", err)
+			}
+			if got := lease.Address.Bits(); got != tc.wantOnes {
+				t.Errorf("lease prefix = /%d, want /%d", got, tc.wantOnes)
+			}
+			if lease.Address.Bits() == 0 {
+				t.Errorf("lease installed YourIP/0 (%v) — would blackhole IPv4", lease.Address)
+			}
+		})
+	}
+}

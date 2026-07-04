@@ -410,3 +410,28 @@ all files stay in `package ipsec`, so the public API is unchanged.
   legacy any-peer behavior for that one tunnel. A cert/EAP VPN has no PSK,
   so it emits no secret block and is unaffected. The selector values reuse
   the `sanitizeSwanctlValue`/`escapeSwanctlQuoted` quoting (#1798/#2126).
+- **Traffic-selector `local_ts`/`remote_ts` sanitize + commit gate
+  (#4098).** The child SA `local_ts = <value>` / `remote_ts = <value>`
+  lines (from `security ipsec vpn <name> traffic-selector <ts>
+  local-ip/remote-ip`, or the `local-identity`/`remote-identity`
+  fallback) are now run through `sanitizeSwanctlValue` at render, parity
+  with the sibling child SA name. Before #4098 they were interpolated
+  raw: the Junos lexer materializes a `\n` escape inside a quoted value,
+  so a selector such as `local-ip "10.0.0.0/24\n        updown =
+  /tmp/x.sh"` injected a real newline plus an arbitrary `key = value`
+  line into the `children {}` block — and charon runs as **root**, so an
+  injected `updown = <script>` is a config-injection → root RCE (an
+  injected `esp_proposals`/`mode`/`mark_*` silently rewrites the crypto
+  posture). Two layers close it: the render belt above keeps any value
+  that reaches the renderer inert, and a commit-time gate
+  (`validateIPsecTrafficSelectorsStrict`, `pkg/config/compiler_ipsec_trafficselector.go`)
+  rejects a `local-ip`/`remote-ip` value that carries a control
+  character or whitespace, or that is not a CIDR prefix / host address /
+  IP range. The gate is strict on operator commit / commit-check and
+  lenient-downgraded (warn) on load / peer-sync per #1960, mirroring the
+  `sanitizeSwanctlValue` render belt on the other swanctl-injection
+  surfaces (#1798/#2126). Note: the general free-text control-char gate
+  (`validateNodesControlChars`, `pkg/config/freetext.go`) already
+  rejected an embedded newline in ANY value at commit — the #4098 gate
+  adds the traffic-selector-specific shape check (malformed / mis-scoped
+  selector) and the render-side belt.

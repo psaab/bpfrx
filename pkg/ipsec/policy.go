@@ -173,11 +173,22 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 		fmt.Fprintf(&b, "    children {\n")
 		for _, child := range effectiveTrafficSelectors(name, vpn) {
 			fmt.Fprintf(&b, "      %s {\n", sanitizeSwanctlValue(child.Name))
+			// local_ts / remote_ts carry the traffic-selector prefixes
+			// (`traffic-selector local-ip/remote-ip`, or the
+			// local-identity/remote-identity fallback). Run them through
+			// sanitizeSwanctlValue for parity with child.Name above: an
+			// embedded control character — a newline in particular — would
+			// otherwise inject an arbitrary `key = value` line (e.g.
+			// `updown = /tmp/x.sh`, executed by charon as ROOT) or an extra
+			// swanctl section into the children{} block. The commit-time
+			// gate (validateIPsecTrafficSelectorsStrict, #4098) rejects such
+			// a value; this render-side belt keeps an already-persisted /
+			// peer-synced value inert on the lenient load path (#1798/#4098).
 			if child.LocalTS != "" {
-				fmt.Fprintf(&b, "        local_ts = %s\n", child.LocalTS)
+				fmt.Fprintf(&b, "        local_ts = %s\n", sanitizeSwanctlValue(child.LocalTS))
 			}
 			if child.RemoteTS != "" {
-				fmt.Fprintf(&b, "        remote_ts = %s\n", child.RemoteTS)
+				fmt.Fprintf(&b, "        remote_ts = %s\n", sanitizeSwanctlValue(child.RemoteTS))
 			}
 			fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
 			if espLifetime > 0 {

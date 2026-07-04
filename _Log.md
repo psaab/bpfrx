@@ -62,6 +62,183 @@
     userspace-dp/src/afxdp/forwarding_build/wg.rs,
     userspace-dp/src/afxdp/forwarding_build/tests.rs,
     userspace-dp/src/afxdp/wg/tests.rs, docs/wireguard-interop.md, _Log.md
+## 2026-07-04 — #4108: RBAC maintenance gate + system_action audit journal (fable-163 F21+F8)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: F21 (MEDIUM, RBAC/vsrx-parity). VERIFY-FIRST confirmed the
+    bug: `operator` holds `PermControl` and `requiredPermission` mapped ALL
+    of `request`/`test` → `PermControl`, so `operator` passed the gate for
+    the destructive `request system {reboot,halt,power-off,zeroize}` and
+    `request chassis cluster failover` — verbs the predefined Junos
+    `operator` class LACKS (`maintenance`). Fix: added a super-user-only
+    `PermMaint` bit (`pkg/config/types_system.go`); super-user reaches it via
+    `PermAll` so no non-super class holds it. New `requiredPermission` branch
+    → `requestSubcommandIsMaintenance` returns `PermMaint` for the four
+    destructive `request system` verbs + `request chassis cluster failover`,
+    resolving the subcommand with the SAME prefix matcher the dispatcher uses
+    (abbrev `request system zero` / `request sys reboot` cannot bypass). Kept
+    benign `request` verbs at `PermControl` so `operator` retains them.
+    RED-on-revert proven (operator allowed all four + cluster failover +
+    abbreviations when the branch is neutralized).
+  - **File(s)**: pkg/config/types_system.go, pkg/cli/permissions.go,
+    pkg/cli/permissions_maintenance_4108_test.go, docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: F8 (LOW, audit/observability). VERIFY-FIRST confirmed the
+    gap: `grpcapi/server_diag.go` SystemAction only `slog.Warn`'d the
+    destructive verbs — no journal call — so a `zeroize` (wipes config) or
+    reboot left NO tamper-resistant audit record (the journald line does not
+    survive a zeroize). Fix: new public `Store.LogSystemAction(action)`
+    (`pkg/configstore/store_commit.go`) appends a fsynced `system_action`
+    journal entry (reuses `journalLog`); the SystemAction handler calls
+    `s.logSystemAction(<verb>)` BEFORE executing reboot/halt/power-off/
+    zeroize (`pkg/grpcapi/server_diag.go`), so the fsynced record is durable
+    before the box goes down / config is wiped. The journal file
+    `.config.journal` also survives zeroize (not in the .conf/rollback
+    removal set). Extracted the destructive execution behind package seams
+    (`schedulePowerAction`/`performZeroizeWipe`) so a unit test can drive the
+    full SystemAction dispatch without rebooting or wiping /etc/xpf.
+    `system_action` is excluded from `ListCommitHistory` (show system commit
+    = config commits only). RED-on-revert proven (no-op'ing LogSystemAction
+    → both configstore + grpcapi tests fail: no journal entry).
+  - **File(s)**: pkg/configstore/store_commit.go,
+    pkg/configstore/journal/journal.go, pkg/grpcapi/server_diag.go,
+    pkg/configstore/system_action_journal_4108_test.go,
+    pkg/grpcapi/system_action_journal_4108_test.go,
+    pkg/configstore/README.md, docs/system-login.md, _Log.md
+## 2026-07-04 — #4102: predefined Junos application-SET table (fable-163 F14)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST then fix the MEDIUM vsrx-parity defect.
+    Confirmed at HEAD (`origin/master` e82b7d49c): `pkg/config/predefined.go`
+    shipped 89 individual predefined apps but NO predefined application-SET
+    table — the RPC bundles existed only as protocol-split members
+    (`junos-ms-rpc-tcp/-udp`, `junos-sun-rpc-tcp/-udp`), while
+    `junos-ms-rpc` / `junos-sun-rpc` / `junos-cifs` / `junos-routing-inbound`
+    were nowhere. `ResolveApplicationSet` consulted ONLY user-defined sets
+    (contrast `ResolveApplication`, which checks the predefined table). So a
+    stock vSRX policy `match application junos-ms-rpc` hard-failed at commit
+    (`validatePolicyMatchApplicationsStrict` → `appRefError`) and, on the
+    tolerant/HA-sync path, at runtime (`resolveUserspaceApplicationNames` →
+    `__unsupported__` → Rust `SnapshotIntegrityError`). Fail-closed but a
+    canonical vSRX config could not commit.
+  - **Fix**: added a `PredefinedApplicationSets` table seeded with the four
+    standard Junos bundles (members verified against a real `show
+    configuration groups junos-defaults` SRX dump), and routed both
+    `ResolveApplicationSet` and the `ExpandApplicationSet` member walk through
+    a new `lookupApplicationSet` helper that falls back to the predefined
+    table AFTER user-defined sets (user-then-predefined order, mirroring
+    `ResolveApplication`). `memberIsNestedSet` preserves the pre-#4102 member
+    classification (user-set → application → error) and only recurses a
+    predefined set when the member is not an application — zero regression for
+    existing configs. Both the commit gate and the runtime resolver route
+    through those two functions, so one table fixes every surface (commit,
+    runtime, NAT match, appid). Members:
+    `junos-ms-rpc`={ms-rpc-tcp,ms-rpc-udp}, `junos-sun-rpc`={sun-rpc-tcp,
+    sun-rpc-udp}, `junos-cifs`={netbios-session,smb-session},
+    `junos-routing-inbound`={bgp,rip,ldp-tcp,ldp-udp}. All members already in
+    the predefined app table — no member-app added, no partial-set gap.
+  - **File(s)**: `pkg/config/predefined.go`,
+    `pkg/config/predefined_app_sets_4102_test.go` (new),
+    `docs/config-schema.md`, `_Log.md`.
+  - **Validation**: `predefined_app_sets_4102_test.go` proves each set
+    resolves + expands to its canonical members (RED on revert:
+    `ResolveApplicationSet` miss / `ExpandApplicationSet` not-found /
+    `CompileConfig` appRefError when the table is emptied — verified), a
+    user-defined set still resolves and shadows a same-named bundle, and an
+    unknown set still hard-fails (no false-accept). `go test
+    ./pkg/config/... ./pkg/appid/... ./pkg/policymatch/...
+    ./pkg/dataplane/userspace/...` green; `go build ./...` + `go vet` clean.
+
+## 2026-07-04 — #4099: on-box CLI `show configuration` secret redaction by login class
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed fable-163 F3 (HIGH security, secret disclosure to a
+    VIEW-only login class). VERIFY-FIRST: the on-box interactive CLI
+    config-render show paths called the NON-redacted `Show*` store
+    methods, so a `read-only` / `config-viewer` / `operator` (all
+    PermView) login could `show configuration` and harvest cleartext IKE
+    PSKs, SNMP communities, BGP auth-keys, WireGuard private keys and the
+    encrypted root password — the CLI residual of #4051/F-020, which had
+    wired only the REST + gRPC ShowConfig paths through the `*Redacted`
+    `RedactedClone` renderers. DECISION: redact for every login class
+    EXCEPT `super-user` (and the unset/no-RBAC class = privileged); this
+    closes the reported VIEW-only leak while preserving the deliberate
+    #4057 super-user/root cleartext allowance (root has direct DB
+    filesystem access). Unknown class fails closed. Matches Junos (never
+    cleartext in show config) and the always-redacted REST/gRPC path.
+    FIX: new predicate `CLI.showConfigRedacted()` + helper
+    `showActiveConfigPath()` (`pkg/cli/permissions.go`) route
+    `cli_show.go` (case "configuration", all formats + path variants),
+    `cli_show_system.go` (`show system rollback [N|compare]`, `show
+    system login`/`internet-options`/`root-authentication`, `show system
+    configuration rescue`), and `cli_config.go handleConfigShow`
+    (config-mode candidate show / `| compare [rollback N]`,
+    defense-in-depth under PermConfig) through the existing `*Redacted`
+    store methods. Added `Store.LoadRescueConfigRedacted()`
+    (`pkg/configstore/store_persist.go`) — reparse + `RedactedClone` +
+    re-render, fail-closed on parse error — for the raw `rescue.conf`
+    text (#4056). RED-on-revert unit test proven (forcing `redact=false`
+    re-leaks every sentinel + drops the placeholder).
+  - **File(s)**: pkg/cli/permissions.go, pkg/cli/cli_show.go,
+    pkg/cli/cli_show_system.go, pkg/cli/cli_config.go,
+    pkg/configstore/store_persist.go,
+    pkg/cli/cli_show_config_redaction_4099_test.go,
+    docs/system-login.md, docs/junos-config-display-reference.md
+
+- **Timestamp**: 2026-07-04 (follow-up)
+  - **Action**: #4099 Copilot follow-up (fold-before-merge, no merge).
+    `LoadRescueConfigRedacted` returned `fmt.Errorf("...: %v",
+    perrs[0])` on a malformed rescue.conf. `config.ParseError.Error()`
+    (parser.go:12) renders `line %d, column %d: %s` where `.Message` is
+    populated from the tampered file content (verified: the lexer emits
+    `unexpected character: %c` carrying the offending byte; the parser's
+    only `%s`-on-full-Token error sites never receive an identifier in
+    the hierarchical path, so a FULL token value does not leak, but the
+    raw parser detail + offending character DO). Forwarding that to the
+    VIEW-only CLI caller defeats the fail-closed "never leak" contract.
+    FIX: return a GENERIC, position-only error — "rescue configuration
+    is malformed and cannot be safely displayed (parse failed at line N,
+    column M)" — using only `perrs[0].Line`/`.Column` (ints, cannot hold
+    a token), never the ParseError, its `.Message`, or `.Error()`. Added
+    a store-level RED-on-revert test
+    (`rescue_redaction_leak_4099_test.go`): a tampered rescue.conf whose
+    parse fails on `@` inside a secret-looking token → the returned
+    error must not contain the raw parser detail, the offending-char
+    message, or the secret token body. Confirmed RED on revert (old `%v
+    perrs[0]` re-forwards `unexpected character: @`).
+  - **File(s)**: pkg/configstore/store_persist.go,
+    pkg/configstore/rescue_redaction_leak_4099_test.go
+## 2026-07-04 — #4101: DHCPv4 client rejects a degenerate subnet mask (fable-163 F6)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST then fix the MEDIUM security/untrusted-input
+    defect. Confirmed at HEAD (`origin/master` ee8de92ef): `leaseFromACKv4`
+    (`pkg/dhcp/dhcp.go`) guarded only `mask == nil` (fallback `/24`) and
+    then took `ones, _ := net.IPMask(mask).Size()`. For a zero mask
+    (`0.0.0.0`) `Size()` returns `ones=0, bits=32`; for a non-contiguous
+    mask (`255.255.0.255`) it returns `(0,0)` — either way
+    `netip.PrefixFrom(addr, 0)` yields `YourIP/0`, which the apply path
+    (`applyAddress` `AddrReplace`) installs as an on-link `0.0.0.0/0`
+    connected route, blackholing/hijacking ALL IPv4 forwarding. A single
+    crafted ACK from a rogue/broken server triggers it, no operator action.
+  - **Fix**: after `.Size()` (now `ones, bits`), reject when
+    `bits != 32 || ones == 0` with an error (no lease). The error
+    propagates through `v4Exchange` → `runDHCPv4`, which retries a fresh
+    DISCOVER on acquire (no `YourIP/0` ever committed) or falls through to
+    T2/expiry keeping the current valid lease on renew/rebind — the safest
+    behavior (refuse the ACK, never default a degenerate mask to `/24`
+    which would mask the attack). A *missing* option 1 still falls back to
+    `/24`; only a present-but-degenerate mask is refused. `/31` and `/32`
+    (point-to-point / host leases) are accepted (floor: reject only
+    `ones==0` + non-contiguous).
+  - **File(s)**: `pkg/dhcp/dhcp.go` (guard), `pkg/dhcp/renew_test.go`
+    (table test `TestLeaseFromACKv4RejectsDegenerateMask` + `mustV4ACK`
+    helper), `pkg/dhcp/README.md` (Gotchas bullet).
+  - **Validation**: RED-on-revert proven — with the guard removed both
+    `0.0.0.0` and `255.255.0.255` parse to `192.0.2.50/0`; the /24, /32,
+    /31 and absent-mask cases pass either way. `go test ./pkg/dhcp/...`
+    green, `go build ./...`, `gofmt`, `go vet` clean.
 
 ## 2026-07-04 — #4097: FRR community-list member / as-path regex render-side sanitize belt (fable-163 F2)
 
@@ -32233,3 +32410,35 @@ top.
     userspace-dp/src/afxdp/tx/cos_classify.rs,
     userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
     userspace-dp/src/filter/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4098 — IPsec traffic-selector local_ts/remote_ts swanctl
+    injection (config-injection → root RCE via `updown`). VERIFY-FIRST at HEAD
+    confirmed policy.go rendered child.LocalTS/RemoteTS with a bare `%s`
+    (unlike the sibling child.Name, which uses `sanitizeSwanctlValue`), sourced
+    from `traffic-selector local-ip/remote-ip` (+ `local-identity`/
+    `remote-identity` fallback) via `effectiveTrafficSelectors`. lexer.go
+    materializes `\n` in a quoted value. FINDING: the general free-text
+    control-char gate (`validateNodesControlChars`, freetext.go) ALREADY
+    rejects an embedded newline in ANY value at strict commit and sanitizes it
+    on the lenient path — so the pure-newline RCE-via-commit was not reachable
+    at HEAD; the issue's "NO commit validation" premise held only for
+    `compiler_validate*strict*.go`, missing the freetext gate. Still fixed the
+    two genuine residual gaps: (a) render-side belt — run local_ts/remote_ts
+    through `sanitizeSwanctlValue` (parity with child.Name), the defense for
+    any path that reaches render with an unsanitized typed config (direct
+    IPsecConfig construction / peer-sync); (b) new AST commit gate
+    `validateIPsecTrafficSelectorsStrict` — rejects a local-ip/remote-ip value
+    carrying a control char OR whitespace, or that is not a CIDR/host/range
+    (whitespace + shape are what the general gate misses). Strict on commit,
+    lenient-downgraded (warn) on load/sync per #1960; walks every value token
+    (both parser shapes + bracketed list #2419). RED-on-revert verified for
+    BOTH: reverting the render belt fails the direct-construction render test
+    (injected `updown =` line reaches the children block); neutralizing the
+    validator fails the whitespace + non-CIDR strict tests. go test
+    ./pkg/ipsec/... ./pkg/config/... green; go build ./... , go vet, gofmt
+    clean.
+  - **File(s)**: pkg/ipsec/policy.go,
+    pkg/config/compiler_ipsec_trafficselector.go, pkg/config/compiler.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
