@@ -146,6 +146,45 @@ var PredefinedApplications = map[string]*Application{
 	"junos-udp-any": {Name: "junos-udp-any", Protocol: "udp"},
 }
 
+// PredefinedApplicationSets contains the built-in Junos application-SET bundles
+// (the `junos-defaults` application-sets shipped on an SRX/vSRX). A canonical
+// vSRX policy references these by name — e.g.
+// `set security policies ... match application junos-ms-rpc` — so without this
+// table a migrated config hard-fails: the commit gate
+// (validatePolicyMatchApplicationsStrict) rejects the token and the runtime
+// resolver (resolveUserspaceApplicationNames) returns __unsupported__, because
+// ResolveApplicationSet used to consult ONLY user-defined sets (#4102).
+//
+// Members are verified against a real `show configuration groups
+// junos-defaults` dump (SRX 15.1X49). Every member resolves through the
+// PredefinedApplications table above, so each set expands to >= 1 member and
+// clears the empty-set fail-open gate (#3146). ResolveApplicationSet and
+// ExpandApplicationSet fall back to this table AFTER user-defined sets, so an
+// operator can still shadow or extend a bundle name (user-then-predefined
+// precedence, mirroring ResolveApplication).
+var PredefinedApplicationSets = map[string]*ApplicationSet{
+	// Microsoft RPC endpoint mapper (TCP + UDP 135).
+	"junos-ms-rpc": {
+		Name:         "junos-ms-rpc",
+		Applications: []string{"junos-ms-rpc-tcp", "junos-ms-rpc-udp"},
+	},
+	// ONC / Sun RPC portmapper (TCP + UDP 111).
+	"junos-sun-rpc": {
+		Name:         "junos-sun-rpc",
+		Applications: []string{"junos-sun-rpc-tcp", "junos-sun-rpc-udp"},
+	},
+	// CIFS / Windows file sharing over NetBIOS session (139) + SMB (445).
+	"junos-cifs": {
+		Name:         "junos-cifs",
+		Applications: []string{"junos-netbios-session", "junos-smb-session"},
+	},
+	// Inbound routing protocols: BGP (179/tcp), RIP (520/udp), LDP (646/tcp+udp).
+	"junos-routing-inbound": {
+		Name:         "junos-routing-inbound",
+		Applications: []string{"junos-bgp", "junos-rip", "junos-ldp-tcp", "junos-ldp-udp"},
+	},
+}
+
 // ResolveApplication looks up an application by name, checking user-defined
 // applications first, then predefined.
 func ResolveApplication(name string, userApps map[string]*Application) (*Application, bool) {
@@ -160,12 +199,26 @@ func ResolveApplication(name string, userApps map[string]*Application) (*Applica
 	return nil, false
 }
 
-// ResolveApplicationSet looks up an application-set by name.
+// ResolveApplicationSet looks up an application-set by name, checking
+// user-defined sets first, then the built-in PredefinedApplicationSets table
+// (#4102). Mirrors ResolveApplication's user-then-predefined precedence so the
+// commit gate and the runtime resolver both recognize the standard Junos
+// bundles (junos-ms-rpc, junos-sun-rpc, junos-cifs, junos-routing-inbound).
 func ResolveApplicationSet(name string, appSets map[string]*ApplicationSet) (*ApplicationSet, bool) {
+	return lookupApplicationSet(name, appSets)
+}
+
+// lookupApplicationSet returns the application-set definition for name,
+// checking user-defined sets first (so an operator can shadow or extend a
+// predefined bundle name) then the built-in predefined Junos set table.
+func lookupApplicationSet(name string, appSets map[string]*ApplicationSet) (*ApplicationSet, bool) {
 	if appSets != nil {
 		if as, ok := appSets[name]; ok {
 			return as, true
 		}
+	}
+	if as, ok := PredefinedApplicationSets[name]; ok {
+		return as, true
 	}
 	return nil, false
 }
@@ -181,7 +234,7 @@ func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, e
 		return nil, fmt.Errorf("application-set nesting too deep (max 3): %s", name)
 	}
 
-	as, ok := apps.ApplicationSets[name]
+	as, ok := lookupApplicationSet(name, apps.ApplicationSets)
 	if !ok {
 		return nil, fmt.Errorf("application-set %q not found", name)
 	}
@@ -190,8 +243,11 @@ func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, e
 	seen := make(map[string]bool)
 
 	for _, memberName := range as.Applications {
-		// Check if it's another application-set (recurse)
-		if _, isSet := apps.ApplicationSets[memberName]; isSet {
+		// Check if it's another application-set (recurse). A member may name a
+		// user-defined OR a predefined set (#4102); memberIsNestedSet preserves
+		// the historical classification (user-set → application → error) and
+		// only recurses a predefined set when the member is not an application.
+		if memberIsNestedSet(memberName, apps) {
 			expanded, err := expandAppSet(memberName, apps, depth+1)
 			if err != nil {
 				return nil, err
@@ -216,6 +272,26 @@ func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, e
 	}
 
 	return result, nil
+}
+
+// memberIsNestedSet reports whether an application-set member should be expanded
+// as a nested set rather than resolved as a leaf application. A user-defined set
+// always wins first (an operator may shadow a predefined bundle name); a
+// predefined set is consulted only when the member does not resolve as an
+// application, so a user application that shadows a predefined-set name keeps
+// application semantics — preserving the pre-#4102 member classification for
+// every existing config while enabling nested references to predefined bundles.
+func memberIsNestedSet(memberName string, apps *ApplicationsConfig) bool {
+	if apps.ApplicationSets != nil {
+		if _, ok := apps.ApplicationSets[memberName]; ok {
+			return true
+		}
+	}
+	if _, isApp := ResolveApplication(memberName, apps.Applications); isApp {
+		return false
+	}
+	_, isPredefSet := PredefinedApplicationSets[memberName]
+	return isPredefSet
 }
 
 // ExpandAddressSet recursively expands an address-set to individual

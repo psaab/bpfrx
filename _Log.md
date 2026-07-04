@@ -42,6 +42,49 @@
     pkg/configstore/system_action_journal_4108_test.go,
     pkg/grpcapi/system_action_journal_4108_test.go,
     pkg/configstore/README.md, docs/system-login.md, _Log.md
+## 2026-07-04 — #4102: predefined Junos application-SET table (fable-163 F14)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST then fix the MEDIUM vsrx-parity defect.
+    Confirmed at HEAD (`origin/master` e82b7d49c): `pkg/config/predefined.go`
+    shipped 89 individual predefined apps but NO predefined application-SET
+    table — the RPC bundles existed only as protocol-split members
+    (`junos-ms-rpc-tcp/-udp`, `junos-sun-rpc-tcp/-udp`), while
+    `junos-ms-rpc` / `junos-sun-rpc` / `junos-cifs` / `junos-routing-inbound`
+    were nowhere. `ResolveApplicationSet` consulted ONLY user-defined sets
+    (contrast `ResolveApplication`, which checks the predefined table). So a
+    stock vSRX policy `match application junos-ms-rpc` hard-failed at commit
+    (`validatePolicyMatchApplicationsStrict` → `appRefError`) and, on the
+    tolerant/HA-sync path, at runtime (`resolveUserspaceApplicationNames` →
+    `__unsupported__` → Rust `SnapshotIntegrityError`). Fail-closed but a
+    canonical vSRX config could not commit.
+  - **Fix**: added a `PredefinedApplicationSets` table seeded with the four
+    standard Junos bundles (members verified against a real `show
+    configuration groups junos-defaults` SRX dump), and routed both
+    `ResolveApplicationSet` and the `ExpandApplicationSet` member walk through
+    a new `lookupApplicationSet` helper that falls back to the predefined
+    table AFTER user-defined sets (user-then-predefined order, mirroring
+    `ResolveApplication`). `memberIsNestedSet` preserves the pre-#4102 member
+    classification (user-set → application → error) and only recurses a
+    predefined set when the member is not an application — zero regression for
+    existing configs. Both the commit gate and the runtime resolver route
+    through those two functions, so one table fixes every surface (commit,
+    runtime, NAT match, appid). Members:
+    `junos-ms-rpc`={ms-rpc-tcp,ms-rpc-udp}, `junos-sun-rpc`={sun-rpc-tcp,
+    sun-rpc-udp}, `junos-cifs`={netbios-session,smb-session},
+    `junos-routing-inbound`={bgp,rip,ldp-tcp,ldp-udp}. All members already in
+    the predefined app table — no member-app added, no partial-set gap.
+  - **File(s)**: `pkg/config/predefined.go`,
+    `pkg/config/predefined_app_sets_4102_test.go` (new),
+    `docs/config-schema.md`, `_Log.md`.
+  - **Validation**: `predefined_app_sets_4102_test.go` proves each set
+    resolves + expands to its canonical members (RED on revert:
+    `ResolveApplicationSet` miss / `ExpandApplicationSet` not-found /
+    `CompileConfig` appRefError when the table is emptied — verified), a
+    user-defined set still resolves and shadows a same-named bundle, and an
+    unknown set still hard-fails (no false-accept). `go test
+    ./pkg/config/... ./pkg/appid/... ./pkg/policymatch/...
+    ./pkg/dataplane/userspace/...` green; `go build ./...` + `go vet` clean.
 
 ## 2026-07-04 — #4099: on-box CLI `show configuration` secret redaction by login class
 
