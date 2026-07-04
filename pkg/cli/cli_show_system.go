@@ -287,8 +287,19 @@ func (c *CLI) showSystemServices() error {
 		if cfg.System.SNMP.Location != "" {
 			fmt.Printf("    Location:     %s\n", cfg.System.SNMP.Location)
 		}
+		// #4111: the SNMP community name is a secret (it is the read/write
+		// credential). Mask it for any non-super-user login class, mirroring
+		// the #4099/#4106 config-render redaction decision (showConfigRedacted).
+		// The authorization mode (read-only/read-write) stays visible; only the
+		// secret community string is masked. Super-user / unset class reads
+		// cleartext (console operator parity with #4057/#4106).
+		redactCommunity := c.showConfigRedacted()
 		for name, comm := range cfg.System.SNMP.Communities {
-			fmt.Printf("    Community:    %s (%s)\n", name, comm.Authorization)
+			shown := name
+			if redactCommunity {
+				shown = config.SecretDataPlaceholder
+			}
+			fmt.Printf("    Community:    %s (%s)\n", shown, comm.Authorization)
 		}
 	}
 
