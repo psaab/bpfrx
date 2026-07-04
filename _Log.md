@@ -46,6 +46,137 @@
   - **File(s)**: `userspace-dp/src/afxdp/cos/queue_service/mod.rs`,
     `userspace-dp/src/afxdp/cos/queue_service/tests.rs`,
     `userspace-dp/src/afxdp/cos/README.md`, `_Log.md`
+## 2026-07-03 — #3970: fwdstatus Sampler issued its OWN redundant 1 Hz control-socket status poll on top of the primary status poll → 2/s on the shared control socket, starving session installs during bulk sync
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-070 (MEDIUM, control-socket contention).
+    The forwarding-status CPU `Sampler` (`pkg/fwdstatus/sampler.go`) ran a
+    1 Hz timer goroutine and on every tick called `us.Status()` on the
+    dataplane accessor, which bottoms out in
+    `userspace.Manager.Status()` → `requestLocked({Type:"status"})` — a
+    control-socket round-trip. The userspace manager ALSO runs its own
+    primary 1 Hz status poll (`statusLoop`, `process.go`) that issues the
+    same `status` request and caches the result in `m.lastStatus`. Net =
+    two independent 1 Hz status requests (2/s) on the socket shared by
+    session installs, HA sync, and snapshot sync — violating the CLAUDE.md
+    ">1/s starves session installs during bulk sync" budget.
+  - **Fix**: added `Manager.CachedStatus() (ProcessStatus, bool)` that
+    returns the last-captured `m.lastStatus` under lock WITHOUT a
+    control-socket request (ok=false when nothing captured yet). Threaded
+    it through `LegacyDataPlaneAdapter.CachedStatus()` and the daemon
+    accessor (`forwardingStatusDaemonUserspaceDataPlane.CachedStatus()` +
+    `userspaceCachedStatusProbe`). The Sampler now type-asserts to
+    `CachedStatus()` and consumes the cache the primary poll already
+    fetched — it adds zero control-socket traffic. On a cache miss the
+    worker counters hold at their previous values, matching the old
+    Status()-error path (series monotonicity preserved). `Build()`
+    (on-demand `show chassis forwarding`) still calls `Status()` — a rare
+    CLI diagnostic, not a periodic poller, so not a rate violation.
+  - **Test**: `TestSamplerConsumesCachedStatusNoControlSocketPoll` +
+    `TestSamplerCacheMissHoldsCountersNoPoll` — a counting accessor mocks
+    both `Status()` (control socket) and `CachedStatus()` (cache) over N
+    sampler ticks and asserts `statusCalls==0`, `cachedCalls==N`, and the
+    worker counters are still populated from the cache. RED-on-revert
+    verified: reverting the Sampler to call `Status()` fails with "5
+    Status() control-socket request(s); want 0". `go test ./pkg/fwdstatus
+    ./pkg/daemon ./pkg/grpcapi ./pkg/cli ./pkg/dataplane/userspace` green,
+    `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/fwdstatus/sampler.go, pkg/fwdstatus/sampler_test.go,
+    pkg/fwdstatus/README.md, pkg/dataplane/userspace/manager.go,
+    pkg/dataplane/userspace/legacy_dataplane.go,
+    pkg/daemon/daemon_forwarding_status.go, _Log.md
+
+## 2026-07-03 — #3965: ReadPolicyCounters was O(P·(P+C)) under the policy mutex → every Prometheus scrape stalled + starved commit/apply at scale
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-073 (MEDIUM, perf/scalability). The
+    Prometheus `xpf_policy_hits_total` collector
+    (`pkg/api/metrics_counters.go collectPolicyCounters`) and the REST
+    `GET /api/v1/security/policies` inventory
+    (`pkg/api/security.go policiesHandler`) read per-policy hit counters by
+    looping the single-policy `dp.ReadPolicyCounters(policyID)`. Each call
+    rebuilt the whole ruleID->counter index (O(C)) and rescanned the config
+    (O(P)) UNDER the userspace dataplane's policy mutex `m.mu`, so a scrape
+    of P policies was O(P·(P+C)) with `m.mu` held the entire time. On a
+    firewall with hundreds–thousands of policies every scrape (~15s) stalled
+    for seconds AND starved every other `m.mu` user — commit/apply and
+    session classification — for the duration.
+  - **Fix**: new `Manager.ReadAllPolicyCounters(cfg)`
+    (`pkg/dataplane/userspace/policycounters.go`) snapshots the
+    helper-published counter slice under ONE brief lock, releases it, then
+    builds the ruleID->counter index ONCE and walks the config ONCE outside
+    the lock — O(P+C), lock held only for the copy. New
+    `dpuserspace.NewPolicyCounterReader(dp, cfg, fallback)` wraps that bulk
+    snapshot behind a per-policy reader closure: when the dataplane provides
+    the bulk snapshot (the real userspace Manager) it does O(1) map lookups;
+    otherwise (test fakes / retired eBPF) it returns the per-policy
+    `fallback` unchanged. The two `pkg/api` callers now build one reader per
+    read and look each policy up through it. The retired bpfShim
+    policy_counters array is not consulted (never incremented in userspace
+    mode). Counter values, the skip-and-bump (#3345/#3408) contract, and the
+    REST HTTP-500 degraded-read contract are all preserved.
+  - **Tests**: `pkg/dataplane/userspace/policycounters_bulk_test.go` —
+    (1) correctness: the bulk read matches the single ReadPolicyCounters for
+    zone-pair, global, and default-sentinel handles, and an unpublished
+    policy is absent (same skip/error signal); (2) O(P+C) RED-on-revert:
+    1024 policies build the index EXACTLY ONCE (the per-policy read builds it
+    1024×); (3) snapshot-and-release RED-on-revert: the policy mutex is free
+    during resolution (a resolve-phase observer's `TryLock` succeeds).
+    Verified RED-on-revert: the naive "hold-lock + rebuild-per-policy" form
+    fails tests (2) and (3). `go test ./pkg/dataplane/userspace/ ./pkg/api/`
+    green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/dataplane/userspace/policycounters.go,
+    pkg/dataplane/userspace/policycounters_bulk_test.go,
+    pkg/api/metrics_counters.go, pkg/api/security.go, pkg/api/README.md,
+    _Log.md
+  - **Scope note**: the gRPC text (`show security policies hit-count`) and
+    interactive CLI surfaces share the same per-policy loop but are
+    operator-triggered (not the recurring 15s scrape). They keep the
+    per-policy read; `NewPolicyCounterReader` makes their later adoption a
+    one-line change if desired.
+## 2026-07-03 — #3967: SNMP agent / trap-groups were start-once-at-boot → a day-2 commit that enabled SNMP, added a community/trap target, or disabled SNMP sat inert until a daemon restart
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-059 (MEDIUM, config-lifecycle). The SNMP
+    agent listener + link-state trap monitor were created ONCE at daemon
+    boot (`daemon_run.go` boot block). `applyConfigLocked` only did an
+    in-place `UpdateConfig` on an ALREADY-running agent (#2008), so
+    enabling SNMP on a running firewall (agent was nil) never started the
+    listener, disabling it never stopped it, and adding the FIRST trap
+    group never started the link-state monitor — the change sat in the
+    config, inert until a restart (a silent config-doesn't-take-effect +
+    monitoring-gap surprise).
+  - **Fix**: new `reconcileSNMP` (`pkg/daemon/daemon_snmp_reconcile.go`),
+    called from `applyConfigLocked` in place of the bare `UpdateConfig`
+    guard, reconciles the whole subsystem on every commit: disabled→enabled
+    starts the listener (+ monitor if trap groups), enabled→disabled stops
+    it, enabled→enabled swaps community/authorization/v3/trap-target state
+    in place (no listener bounce), and a newly-added trap group starts the
+    monitor without a restart. Idempotent: an unchanged SNMP stanza is a
+    no-op gated on `snmpConfigHash` (FNV over the raw secret-bearing
+    fields). The boot block now calls the shared `startSNMPLocked` + sets
+    `snmpBootReady` (the gate that keeps the boot apply and boot block from
+    double-starting); a shared `snmpEnabled` predicate makes boot and day-2
+    agree. Agent + monitor bind to a `d.daemonCtx`-derived lifetime context;
+    `teardownSNMP` stops them at shutdown. Concurrency: `teardownSNMPLocked`
+    cancels + joins the goroutines before nilling `d.snmpAgent`, so the
+    monitor's `emitLinkStateTrap` reads never race the clear (verified with
+    `-race`).
+  - **File(s)**: `pkg/daemon/daemon_snmp_reconcile.go` (new),
+    `pkg/daemon/daemon.go` (reconcile state fields + serve/boots seams),
+    `pkg/daemon/daemon_apply.go` (reconcileSNMP wiring),
+    `pkg/daemon/daemon_run.go` (boot block → startSNMPLocked +
+    snmpBootReady; shutdown teardownSNMP; drop now-unused imports),
+    `pkg/daemon/daemon_snmp_reconcile_test.go` (RED-on-revert lifecycle
+    tests), `pkg/snmp/README.md` (reconcile section).
+  - **Validation**: RED-on-revert confirmed (reverting the apply wiring to
+    the pre-fix `if d.snmpAgent != nil { UpdateConfig }` fails all three
+    lifecycle tests — enable, disable, trap-group-add). `go test
+    ./pkg/snmp/ ./pkg/daemon/` green; `-race` on the daemon SNMP/linkstate
+    paths clean; `go build ./...`, `gofmt`, `go vet` clean. (Pre-existing
+    unrelated `-race` flake in `pkg/snmp/traps_async_2991_test.go` —
+    `trapSender` package-var reassignment races `trapWorker`; untouched
+    by this change.)
 
 ## 2026-07-03 — #3962: buildScreenSnapshots ranged the zones map in nondeterministic order → wire byte order varied per build → snapshotContentHash dedup missed → dataplane re-applied the screen config on every reconcile
 

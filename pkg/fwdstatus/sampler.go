@@ -27,10 +27,10 @@ const (
 // cpuSample is one tick of the cumulative-counter ring.  All
 // counters are monotonic nanoseconds.
 type cpuSample struct {
-	wall            time.Time
-	daemonCPUNs     uint64 // /proc/self/stat utime+stime, converted to ns
-	workerThreadNs  uint64 // Σ WorkerRuntimeStatus.thread_cpu_ns across workers
-	workerWallNs    uint64 // Σ WorkerRuntimeStatus.wall_ns across workers
+	wall           time.Time
+	daemonCPUNs    uint64 // /proc/self/stat utime+stime, converted to ns
+	workerThreadNs uint64 // Σ WorkerRuntimeStatus.thread_cpu_ns across workers
+	workerWallNs   uint64 // Σ WorkerRuntimeStatus.wall_ns across workers
 }
 
 // Sampler maintains a ring of cumulative CPU counters.  One
@@ -97,12 +97,23 @@ func (s *Sampler) sample(now time.Time) {
 	daemonNs := ticksToNanos(selfStat.UtimeTicks + selfStat.StimeTicks)
 
 	// Worker counters — userspace-dp only.
+	//
+	// #3970: consume the CACHED ProcessStatus that the manager's
+	// primary 1 Hz status poll (statusLoop) already fetched, rather
+	// than issuing our own Status() control-socket request. Two
+	// independent 1 Hz "status" requests doubled the shared
+	// control-socket rate and starved session installs during bulk
+	// sync (CLAUDE.md "Control socket contention"). CachedStatus()
+	// MUST NOT touch the control socket; on a miss (helper not yet
+	// polled) the worker counters hold at their previous values,
+	// preserving series monotonicity exactly as the old Status()
+	// error path did.
 	workerThread, workerWall := s.lastWorkerThread, s.lastWorkerWall
 	if s.dp != nil {
 		if us, ok := s.dp.(interface {
-			Status() (userspace.ProcessStatus, error)
+			CachedStatus() (userspace.ProcessStatus, bool)
 		}); ok {
-			if st, err := us.Status(); err == nil {
+			if st, ok := us.CachedStatus(); ok {
 				var tc, w uint64
 				for _, wr := range st.WorkerRuntime {
 					tc += wr.ThreadCPUNS
@@ -164,13 +175,16 @@ func (s *Sampler) Snapshot() SamplerSnapshot {
 // wall ≤ newest.wall − W.
 //
 // Daemon %: (Δdaemon_cpu_ns / Δwall_ns) × 100 — per-core percent;
-//          can exceed 100% on multi-core.
+//
+//	can exceed 100% on multi-core.
+//
 // Worker %: (Δworker_thread_cpu_ns / Δworker_wall_ns) × 100 —
-//          per-worker-average OS thread CPU via CLOCK_THREAD_CPUTIME_ID,
-//          summed across workers.  Busy-poll mode shows ~100% regardless
-//          of traffic (known false-positive); eBPF path has no workers
-//          so Δworker_wall_ns stays 0 and the window flags as invalid.
-//          See #883 / #884 for why we don't use active_ns here.
+//
+//	per-worker-average OS thread CPU via CLOCK_THREAD_CPUTIME_ID,
+//	summed across workers.  Busy-poll mode shows ~100% regardless
+//	of traffic (known false-positive); eBPF path has no workers
+//	so Δworker_wall_ns stays 0 and the window flags as invalid.
+//	See #883 / #884 for why we don't use active_ns here.
 func computeCPUWindows(snap SamplerSnapshot) (
 	daemonPct, workerPct [numCPUWindows]float64,
 	daemonValid, workerValid [numCPUWindows]bool,

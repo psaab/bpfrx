@@ -17,8 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vishvananda/netlink"
-
 	"github.com/psaab/xpf/pkg/api"
 	"github.com/psaab/xpf/pkg/cli"
 	"github.com/psaab/xpf/pkg/cluster"
@@ -42,7 +40,6 @@ import (
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
-	"github.com/psaab/xpf/pkg/snmp"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -1014,84 +1011,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	// Start SNMP agent if configured (unless system processes snmp disable).
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.SNMP != nil && (len(cfg.System.SNMP.Communities) > 0 || len(cfg.System.SNMP.V3Users) > 0) && !isProcessDisabled(cfg, "snmpd") {
-		d.snmpAgent = snmp.NewAgent(cfg.System.SNMP)
-		d.snmpAgent.SetIfDataFn(func() []snmp.IfData {
-			links, err := netlink.LinkList()
-			if err != nil {
-				return nil
-			}
-			var result []snmp.IfData
-			for _, link := range links {
-				attrs := link.Attrs()
-				if attrs.Name == "lo" {
-					continue
-				}
-				ifType := 6 // ethernetCsmacd
-				switch link.Type() {
-				case "vrf":
-					ifType = 53 // propVirtual
-				case "gre", "ip6tnl", "xfrm":
-					ifType = 131 // tunnel
-				case "veth":
-					ifType = 53
-				}
-				admin := 2 // down
-				if attrs.Flags&net.FlagUp != 0 {
-					admin = 1
-				}
-				oper := 2 // down
-				if attrs.OperState == netlink.OperUp || attrs.OperState == netlink.OperUnknown {
-					oper = 1
-				}
-				speed := uint32(0)
-				if attrs.TxQLen > 0 {
-					speed = 1000000000 // default 1Gbps
-				}
-				var stats *netlink.LinkStatistics
-				if attrs.Statistics != nil {
-					stats = attrs.Statistics
-				}
-				entry := snmp.IfData{
-					IfIndex:     attrs.Index,
-					IfDescr:     attrs.Name,
-					IfType:      ifType,
-					IfMtu:       attrs.MTU,
-					IfSpeed:     speed,
-					AdminStatus: admin,
-					OperStatus:  oper,
-					IfName:      attrs.Name,
-					IfHighSpeed: speed / 1_000_000, // bps -> Mbps
-				}
-				if stats != nil {
-					entry.InOctets = uint32(stats.RxBytes)
-					entry.OutOctets = uint32(stats.TxBytes)
-					entry.HCInOctets = stats.RxBytes
-					entry.HCInUcastPkts = stats.RxPackets
-					entry.HCOutOctets = stats.TxBytes
-					entry.HCOutUcastPkts = stats.TxPackets
-					entry.InMulticastPkts = uint32(stats.Multicast)
-				}
-				result = append(result, entry)
-			}
-			return result
-		})
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			d.snmpAgent.Start(ctx)
-		}()
-
-		// Start link state monitor for SNMP traps.
-		if len(cfg.System.SNMP.TrapGroups) > 0 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				d.monitorLinkState(ctx)
-			}()
-		}
+	// Start the SNMP agent if configured (#3967). This is the FIRST start; it
+	// runs regardless of config-only / bootstrap mode (unlike the boot
+	// applyConfig, which is gated on !NoDataplane and suppressed in bootstrap)
+	// so the agent serves even in degraded modes, matching pre-#3967 behavior.
+	// The agent + link-state monitor are bound to a lifetime context derived
+	// from d.daemonCtx (via startSNMPLocked) and torn down explicitly at
+	// shutdown (teardownSNMP), NOT on this run WaitGroup. Setting snmpBootReady
+	// hands day-2 lifecycle changes over to reconcileSNMP (applyConfigLocked):
+	// an earlier boot apply left the start gated on snmpBootReady==false so the
+	// boot apply and this block never double-start.
+	d.snmpReconMu.Lock()
+	if cfg := d.store.ActiveConfig(); snmpEnabled(cfg) {
+		d.startSNMPLocked(cfg)
+		d.snmpHash, d.snmpHashSet = snmpConfigHash(cfg), true
 	}
+	d.snmpBootReady = true
+	d.snmpReconMu.Unlock()
 
 	// Start periodic neighbor resolution to keep ARP entries warm for
 	// known forwarding targets (DNAT pools, gateways, address-book hosts).
@@ -1690,6 +1626,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Cancel context to stop background goroutines, then wait for them.
 	stop()
 	wg.Wait()
+
+	// Stop the SNMP agent + link-state trap monitor (#3967). Their goroutines
+	// bind to d.daemonCtx (never cancelled in production) rather than the run
+	// WaitGroup, so wg.Wait above does not cover them — teardownSNMP cancels
+	// the agent's lifetime context, joins the goroutines, and releases UDP/161.
+	d.teardownSNMP()
 
 	// Clean up flow exporters.
 	d.stopFlowExporter()

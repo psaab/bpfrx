@@ -265,6 +265,17 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 	// unaffected.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
 
+	// #3965: read the whole policy set from ONE snapshot instead of calling
+	// ReadPolicyCounters once per policy. The per-policy read rebuilt the
+	// ruleID->counter index and rescanned the config under the dataplane's
+	// policy mutex on EVERY call, so a scrape of P policies was O(P*(P+C)) with
+	// the mutex held the entire time — starving commit/apply. NewPolicyCounter
+	// Reader builds the index once (O(P+C), one brief lock) when the dataplane
+	// provides the bulk snapshot, and falls back to the per-policy read
+	// otherwise. A policy the helper has not published yields an error, so the
+	// skip-and-bump contract (#3345/#3408) below is unchanged.
+	readPolicy := dpuserspace.NewPolicyCounterReader(dp, cfg, dp.ReadPolicyCounters)
+
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
 		// #3476: the compile path normalizes nil entries out, but the
@@ -285,7 +296,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 				continue
 			}
 			policyID := policyCounterID(policySetID, i)
-			ctrs, err := dp.ReadPolicyCounters(policyID)
+			ctrs, err := readPolicy(policyID)
 			if err != nil {
 				c.counterReadErrors.Add(1)
 				continue
@@ -304,7 +315,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 			continue
 		}
 		policyID := policyCounterID(policySetID, i)
-		ctrs, err := dp.ReadPolicyCounters(policyID)
+		ctrs, err := readPolicy(policyID)
 		if err != nil {
 			c.counterReadErrors.Add(1)
 			continue
@@ -335,7 +346,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 	// that was previously uncounted. Gated on policy-stats like the per-rule
 	// metrics above so all surfaces agree.
 	if statsEnabled {
-		if ctrs, err := dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err != nil {
+		if ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID); err != nil {
 			c.counterReadErrors.Add(1)
 		} else {
 			ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
