@@ -33186,3 +33186,39 @@ top.
     origin/master (was 14 behind); only `_Log.md` conflicted, resolved by
     union (kept both blocks). No production code change this round.
   - **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
+
+## 2026-07-04 — #4121 part B: split compiler_security.go into focused modules
+
+- **Timestamp**: 2026-07-04
+  - **Action**: PURE CODE MOTION (part B; the compilePolicy match-value SSOT
+    consolidation, part A, shipped in #4133). The 2357-line grab-bag
+    `pkg/config/compiler_security.go` mixed zones / policies / screen /
+    address-book / log / flow / ALG compilation plus ~15 commit-time
+    validators. Split it into eight focused per-concern files, all in
+    package config, function bodies byte-identical to origin/master (no
+    logic / behavior change). One commit per extracted module (bisectable,
+    each builds): compiler_security_zones.go (parseHostInboundNode,
+    compileZones), compiler_security_policy.go (compilePolicies +
+    compilePolicy + the #3842 duplicate-block helpers + #3141 collapsed-deny
+    wiring), compiler_security_screen.go (screen threshold consts + advisory
+    validators + compileScreen), compiler_security_addressbook.go (zone-local
+    #3061 helpers + display helpers + compileAddressBook / mergeAddressNode),
+    compiler_security_log.go (compileLog + #3349/#3350 gates),
+    compiler_security_flow.go (compileFlow + #3420/#3422/#3424 traceoptions
+    gates + #1979/#2486 tcp-mss gates), compiler_security_alg.go (compileALG).
+    Base compiler_security.go now holds only the compileSecurity dispatcher.
+    Per-file import blocks are the exact union of std imports each cluster
+    uses. VERIFICATION: a slicing/reconstruction check proved every one of
+    the 45 declarations appears verbatim in exactly one file and the
+    declaration stream reconstructed from the eight files equals the original
+    byte-for-byte. gofmt -l clean (only 2 pre-existing dirty test files),
+    go vet ./pkg/config/, go build ./..., go test ./pkg/config/... all green.
+    Updated docs/config-schema.md (the "file-split deferred" note → done).
+  - **File(s)**: pkg/config/compiler_security.go,
+    pkg/config/compiler_security_zones.go,
+    pkg/config/compiler_security_policy.go,
+    pkg/config/compiler_security_screen.go,
+    pkg/config/compiler_security_addressbook.go,
+    pkg/config/compiler_security_log.go,
+    pkg/config/compiler_security_flow.go,
+    pkg/config/compiler_security_alg.go, docs/config-schema.md, _Log.md

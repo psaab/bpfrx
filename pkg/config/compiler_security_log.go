@@ -1,0 +1,268 @@
+package config
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func compileLog(node *Node, sec *SecurityConfig) error {
+	if sec.Log.Streams == nil {
+		sec.Log.Streams = make(map[string]*SyslogStream)
+	}
+
+	// Top-level log settings
+	if modeNode := node.FindChild("mode"); modeNode != nil {
+		sec.Log.Mode = nodeVal(modeNode)
+	}
+	if fmtNode := node.FindChild("format"); fmtNode != nil {
+		sec.Log.Format = nodeVal(fmtNode)
+	}
+	if srcNode := node.FindChild("source-interface"); srcNode != nil {
+		sec.Log.SourceInterface = nodeVal(srcNode)
+	}
+	if node.FindChild("report") != nil {
+		sec.Log.Report = true
+	}
+
+	for _, inst := range namedInstances(node.FindChildren("stream")) {
+		stream := &SyslogStream{
+			Name: inst.name,
+			Port: 514, // default
+		}
+		for _, prop := range inst.node.Children {
+			switch prop.Name() {
+			case "host":
+				// Flat: host 192.168.99.3;
+				if v := nodeVal(prop); v != "" {
+					stream.Host = v
+				}
+				// Nested: host { 192.168.99.3; port 9006; }
+				for _, hc := range prop.Children {
+					switch hc.Name() {
+					case "port":
+						if v := nodeVal(hc); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								stream.Port = n
+							}
+						}
+					default:
+						// IP address as a bare child node
+						if stream.Host == "" && len(hc.Keys) >= 1 {
+							stream.Host = hc.Keys[0]
+						}
+					}
+				}
+			case "port":
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						stream.Port = n
+					}
+				}
+			case "severity":
+				stream.Severity = nodeVal(prop)
+			case "facility":
+				stream.Facility = nodeVal(prop)
+			case "format":
+				stream.Format = nodeVal(prop)
+			case "category":
+				stream.Category = nodeVal(prop)
+			case "source-address":
+				stream.SourceAddress = nodeVal(prop)
+			case "transport":
+				for _, tc := range prop.Children {
+					switch tc.Name() {
+					case "protocol":
+						stream.Transport.Protocol = nodeVal(tc)
+					case "tls-profile":
+						stream.Transport.TLSProfile = nodeVal(tc)
+					}
+				}
+			}
+		}
+		if stream.Host != "" {
+			sec.Log.Streams[stream.Name] = stream
+		}
+	}
+
+	// H7 (#2008): `security log profile <name>` log-routing objects. Each
+	// names a target stream (`stream-name`), may be marked the default
+	// (`default-profile`), and may carry per-category field config. Reads
+	// via namedInstances + nodeVal so both hierarchical and flat-set AST
+	// shapes work (same as the stream loop). The stream-name cross-
+	// reference is enforced after full compile in
+	// validateLogProfileStreamReferencesStrict — schema_walk per-leaf
+	// validators cannot see sibling stream nodes. `category` is accepted
+	// for parse/validation parity; per-category field-extra-name selection
+	// is not yet used to alter the emitted structured data (out of scope).
+	for _, inst := range namedInstances(node.FindChildren("profile")) {
+		p := &LogProfile{Name: inst.name}
+		for _, prop := range inst.node.Children {
+			switch prop.Name() {
+			case "stream-name":
+				p.StreamName = nodeVal(prop)
+			case "default-profile":
+				p.DefaultProfile = true
+			case "category":
+				// Accepted for parity; field-extra-name emission is out of
+				// scope for this increment (xpf already emits per-stream
+				// structured data).
+			}
+		}
+		if sec.Log.Profiles == nil {
+			sec.Log.Profiles = make(map[string]*LogProfile)
+		}
+		sec.Log.Profiles[p.Name] = p
+	}
+	return nil
+}
+
+// validateSecurityLogStreamPortsAST is the #3349 commit-time range gate for
+// `security log stream <s> port <p>` and the nested `host { port <p>; }`
+// spelling. The syslog port value lives in TWO AST locations — a direct
+// `port` child of the stream and a `port` child of a nested `host` block
+// (compileLog reads both) — a dual value-location the declarative
+// SchemaValidate walker cannot express, the same rationale as tcp-mss
+// (validateTCPMSSRanges). compileLog ignores a non-numeric or out-of-range
+// port (strconv.Atoi error path) and silently keeps the default 514, so a typo
+// such as `port 6514x` commits and quietly logs audit to the wrong port. This
+// pass reads the raw tokens before that swallowing and range-checks them.
+//
+// It mirrors compileLog's traversal exactly (FindChild("log") +
+// namedInstances(stream) + per-child switch on host/port) so it validates
+// precisely the tokens the compiler consumes. Runs on the group-expanded tree
+// so apply-groups-inherited ports are covered.
+//
+// Strict path (commit / commit-check, lenient=false): a non-numeric or
+// out-of-range port is a hard compile error. Lenient path (load / peer-sync,
+// lenient=true): downgraded to a warning so an already-persisted or
+// peer-synced config that an older binary accepted (and that the compiler
+// still maps to 514) still boots (#1960 / #3261 fail-closed-on-load class).
+func validateSecurityLogStreamPortsAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	check := func(path, raw string) error {
+		if raw == "" {
+			// No value token: the compiler keeps the default 514. The
+			// missing-value case is the schema walker's concern, not this
+			// range gate.
+			return nil
+		}
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= 65535 {
+			return nil
+		}
+		msg := fmt.Sprintf("%s: invalid syslog port %q (expected an integer in "+
+			"[1..65535]; an invalid value silently keeps the default 514)", path, raw)
+		if lenient {
+			warnings = append(warnings, msg)
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	for _, n := range nodes {
+		if n.Name() != "security" {
+			continue
+		}
+		secPath := joinNodePath(prefix, n.Keys)
+		for _, logNode := range n.FindChildren("log") {
+			logPath := joinNodePath(secPath, []string{"log"})
+			for _, inst := range namedInstances(logNode.FindChildren("stream")) {
+				streamPath := joinNodePath(logPath, []string{"stream", inst.name})
+				for _, prop := range inst.node.Children {
+					switch prop.Name() {
+					case "port":
+						if err := check(joinNodePath(streamPath, []string{"port"}), nodeVal(prop)); err != nil {
+							return warnings, err
+						}
+					case "host":
+						for _, hc := range prop.Children {
+							if hc.Name() == "port" {
+								if err := check(joinNodePath(streamPath, []string{"host", "port"}), nodeVal(hc)); err != nil {
+									return warnings, err
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return warnings, nil
+}
+
+// validateSecurityLogStreamTLSProfileAST is the #3350 commit-time gate for
+// `security log stream <s> transport tls-profile <name>`. The token is parsed
+// (schema_security.go), validated for syntax, and stored on
+// stream.Transport.TLSProfile (compileLog) — but it is NEVER resolved into a
+// *tls.Config at runtime: daemon_system.go applyLogStreams always passes a nil
+// *tls.Config to logging.NewSyslogClientTransport, so the TLS dialer falls back
+// to the system CA roots (pkg/logging/syslog.go dialTLS). There is also no
+// `tls-profile` DEFINITION stanza anywhere in the config (no local-certificate /
+// trusted-ca / SNI source for syslog — only IPsec/IKE define certs), so the
+// named profile has nothing to resolve to. An operator who configures
+// `tls-profile` believes mutual TLS / a pinned CA is in force when it is not —
+// a secure-syslog posture silently downgraded to system roots (a fail-open).
+//
+// Because the profile can never be honored, this gate REJECTS any
+// `transport tls-profile` at commit rather than letting it silently no-op.
+// `transport protocol tls` ON ITS OWN is left intact: a TLS stream that trusts
+// the system CA roots is a legitimate, fully-honored configuration — only the
+// named-but-unapplied profile is rejected.
+//
+// It descends compileLog's traversal (log + namedInstances(stream) + the
+// `transport` child loop) with forEachChild at EVERY container level so it
+// gates the token wherever it lives, including a duplicate security/log
+// sub-block (#3566, the sub-level sibling of the #3562 duplicate-top-level
+// class). Runs on the group-expanded tree so an apply-groups-inherited
+// tls-profile is covered.
+//
+// Strict path (commit / commit-check, lenient=false): a present tls-profile is
+// a hard compile error. Lenient path (load / peer-sync, lenient=true):
+// downgraded to a warning so an already-persisted or peer-synced config that an
+// older binary accepted (and that silently used system roots) still boots
+// (#1960 / #3261 fail-closed-on-load class). The runtime behavior is unchanged
+// by the lenient downgrade — the profile was never applied either way — so a
+// leniently-loaded value is inert, now flagged.
+func validateSecurityLogStreamTLSProfileAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	// Descend security > log with forEachChild at EVERY level (and
+	// namedInstances over every `stream`) so a tls-profile carried by a stream
+	// in a duplicate security/log sub-block is still rejected (#3566); the inner
+	// transport / tls-profile checks are unchanged.
+	walkErr := forEachChild(nodes, "security", func(n *Node) error {
+		secPath := joinNodePath(prefix, n.Keys)
+		return forEachChild(n.Children, "log", func(logNode *Node) error {
+			logPath := joinNodePath(secPath, []string{"log"})
+			for _, inst := range namedInstances(logNode.FindChildren("stream")) {
+				streamPath := joinNodePath(logPath, []string{"stream", inst.name})
+				for _, prop := range inst.node.Children {
+					if prop.Name() != "transport" {
+						continue
+					}
+					for _, tc := range prop.Children {
+						if tc.Name() != "tls-profile" {
+							continue
+						}
+						profile := nodeVal(tc)
+						path := joinNodePath(streamPath, []string{"transport", "tls-profile"})
+						msg := fmt.Sprintf("%s: tls-profile %q is not applied at runtime — "+
+							"xpf has no TLS profile definition (certificate / trusted-ca / "+
+							"SNI) to resolve it to, so the TLS syslog stream silently falls "+
+							"back to the system CA roots instead of the named profile. Remove "+
+							"the tls-profile (a `transport protocol tls` stream that trusts the "+
+							"system CA roots is honored) until profile resolution is implemented",
+							path, profile)
+						if lenient {
+							warnings = append(warnings, msg)
+							continue
+						}
+						return fmt.Errorf("%s", msg)
+					}
+				}
+			}
+			return nil
+		})
+	})
+	if walkErr != nil {
+		return warnings, walkErr
+	}
+	return warnings, nil
+}
