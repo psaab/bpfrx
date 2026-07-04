@@ -30,11 +30,22 @@ import (
 // sanitizeFRRValue strips ASCII control characters — the C0 set
 // (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
 // space — from a free-text config value (description, auth key,
-// password) before it is interpolated into a generated frr.conf line.
-// Render-side belt for #1798: a BGP neighbor description or auth key
-// containing an embedded newline must not be able to inject extra
-// frr.conf commands even if the commit-time validation layer were
-// bypassed.
+// password, BGP community member, AS-path regex) before it is
+// interpolated into a generated frr.conf line. Render-side belt for
+// #1798 / #4097: a BGP neighbor description, auth key, community-list
+// member, or as-path-access-list regex containing an embedded newline
+// must not be able to inject extra frr.conf commands even if the
+// commit-time validation layer were bypassed (a leniently-loaded /
+// peer-synced / rolled-back stored value re-parses through the same
+// lexer, which materializes a `\n` escape into a real newline byte).
+// Collapsing the newline to a space keeps the whole value on the single
+// rendered line, so no injected `router bgp` / `neighbor` command
+// reaches the managed section. A single SPACE (0x20) is preserved: an
+// FRR `bgp as-path access-list ... permit LINE` and an expanded
+// `bgp community-list expanded ... permit LINE` take the regex as a
+// rest-of-line token, so a space inside the regex is legitimate (unlike
+// a whitespace-split auth secret, which frrTokenUnsafeIndex also rejects
+// at commit).
 func sanitizeFRRValue(s string) string {
 	clean := true
 	for i := 0; i < len(s); i++ {
@@ -1306,7 +1317,14 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 			}
 		}
 		for _, member := range cd.Members {
-			fmt.Fprintf(&b, "bgp community-list %s %s permit %s\n", listKind, name, member)
+			// #4097: sanitize the member so an embedded newline (from a
+			// leniently-loaded / peer-synced / rolled-back stored value)
+			// cannot inject an extra frr.conf line — parity with the auth
+			// / description fields. The listKind decision above reads the
+			// RAW members (a `\n` is not a regex metacharacter, so it does
+			// not by itself flip standard→expanded; the exploit's `^`/`$`
+			// do). The strict #1798 commit control-char gate rejects it outright.
+			fmt.Fprintf(&b, "bgp community-list %s %s permit %s\n", listKind, name, sanitizeFRRValue(member))
 		}
 	}
 	if len(po.Communities) > 0 {
@@ -1322,7 +1340,13 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 		sort.Strings(aspNames)
 		for _, name := range aspNames {
 			ap := po.ASPaths[name]
-			fmt.Fprintf(&b, "bgp as-path access-list %s permit %s\n", name, ap.Regex)
+			// #4097: sanitize the regex so an embedded newline cannot
+			// inject an extra frr.conf line — parity with the auth /
+			// description fields. FRR takes the regex as a rest-of-line
+			// token, so a legitimate space (multi-AS path) survives; only
+			// control chars (incl. the newline injection vector) collapse
+			// to a space. The strict #1798 commit control-char gate rejects it.
+			fmt.Fprintf(&b, "bgp as-path access-list %s permit %s\n", name, sanitizeFRRValue(ap.Regex))
 		}
 		b.WriteString("!\n")
 	}

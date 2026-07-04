@@ -339,6 +339,30 @@ also carries operator content:
   is NOT covered by this gate** (it is cosmetic, not a security secret, and
   historically multi-word); it remains control-char-sanitized only — a
   follow-up if FRR's `description` token ever needs the same treatment.
+- **Community members and as-path regexes get the render-side sanitize belt
+  (#4097).** `generatePolicyOptions` renders a `policy-options community
+  <name> members <value>` member as `bgp community-list <kind> <name> permit
+  <value>` and a `policy-options as-path <name> <regex>` as `bgp as-path
+  access-list <name> permit <regex>`. Both were the last free-text frr.conf
+  interpolations still emitting the value with a bare `%s`; they now pass
+  through `sanitizeFRRValue` for parity with the auth/description fields —
+  the third of the documented #1798 defense layers ("the render-side belt …
+  at each free-text file interpolation"). The **newline-injection vector
+  itself is already closed by the first two #1798 layers**, which cover these
+  two values because they are ordinary AST node values: the strict commit path
+  hard-rejects any control character (`validateNodesControlChars`,
+  `pkg/config/freetext.go`) and the lenient load / HA-sync / rollback path
+  scrubs it in place (`sanitizeNodesControlChars`) — so a `\n` the lexer
+  materializes from a quoted escape never reaches the renderer on any current
+  path (guarded by `pkg/config` `TestFRRPolicyValueControlCharsBlocked_4097`).
+  The render belt is defense-in-depth for any future path that hands the
+  renderer a typed value the AST walk never saw. Unlike an auth secret a
+  **space is legitimate** here — FRR takes the community/as-path value as a
+  rest-of-line token — so `sanitizeFRRValue` (which strips only the C0/DEL set
+  and leaves `0x20`) is the right tool, and no whitespace-rejecting commit gate
+  is added. (NOTE: a Junos→FRR as-path regex *syntax* translation is still
+  absent — Junos regex operates on whole AS-number terms, FRR uses POSIX ERE
+  over the space-separated AS string — tracked separately, not part of #4097.)
 - **Group address-family flags are gated by neighbor address version
   (#2454).** When `compiler_protocols.go` copies a BGP group's `family inet`
   / `family inet6` flags down to each neighbor, it parses the neighbor's
