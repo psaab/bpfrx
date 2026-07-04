@@ -440,13 +440,17 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		return nil
 	}
 
-	// Reconcile the SNMP agent's live authorization/identity config FIRST
-	// (#2008 H17, Codex r2). The agent is created once at startup
-	// (daemon_run.go) and keeps serving on UDP/161; without this step a
-	// commit that flips a community read-write -> read-only, deletes a
-	// community, or changes the v3 user set would not reach the running agent
-	// until a daemon restart, leaving the SET access-control gate reading
-	// stale authorization.
+	// Reconcile the whole SNMP subsystem FIRST (#2008 H17, Codex r2; extended
+	// to full lifecycle reconcile in #3967). reconcileSNMP matches the running
+	// agent + trap-group monitor to the committed config on EVERY commit:
+	//   - enable a previously-disabled agent (start the UDP/161 listener),
+	//   - disable a running agent (stop the listener),
+	//   - swap community authorization / v3 users / trap targets in place on a
+	//     still-enabled agent (no listener bounce),
+	//   - and start the link-state trap monitor when trap groups appear.
+	// Before #3967 only the in-place authorization swap existed and only when
+	// SNMP was already enabled at boot — enabling SNMP or adding a trap target
+	// day-2 sat inert in the config until a daemon restart.
 	//
 	// This MUST run before any reconcile step that can abort applyConfigLocked
 	// early — specifically the dataplane apply below, which returns early on a
@@ -460,15 +464,12 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// is unconditionally before every early-return path in the body (the only
 	// aborting one is the dataplane apply at compileErrorMustAbortApply).
 	//
-	// The swap is in-place (UpdateConfig holds the agent's cfgMu) so the UDP
-	// listener and in-flight polls are not interrupted, and it is idempotent —
-	// an atomic pointer/table swap, safe to call once per apply. Guarded on a
-	// non-nil agent: if SNMP was not enabled at startup there is no running
-	// listener to reconcile (enabling SNMP for the first time still requires a
-	// restart, matching the other start-once subsystems).
-	if d.snmpAgent != nil {
-		d.snmpAgent.UpdateConfig(cfg.System.SNMP)
-	}
+	// reconcileSNMP is idempotent: an unchanged SNMP stanza is a no-op (no
+	// listener bounce). The in-place swap holds the agent's cfgMu so the UDP
+	// listener and in-flight polls are not interrupted. During the boot apply
+	// it no-ops the start (snmpBootReady is still false) so the boot block
+	// owns the first start, which honors config-only / bootstrap suppression.
+	d.reconcileSNMP(cfg)
 
 	// #1922 Item 2 bootstrap exit: the FIRST apply of a non-empty config
 	// (an interface-claiming confirmed commit, or a cluster SyncApply from

@@ -225,15 +225,41 @@ type Daemon struct {
 	// when a reconcile's NewExporter build failed and the OLD exporters were
 	// kept running so export stayed up; cleared on the next successful
 	// reconcile. Surfaced via FlowExportError().
-	flowExportErr             error
-	ipfixBundlePtr            atomic.Pointer[ipfixBundle]
-	ipfixHash                 [32]byte
-	ipfixHashSet              bool
-	ipfixCBOnce               sync.Once
-	ipfixReconMu              sync.Mutex
-	ipfixExportErr            error
-	dhcpRelay                 *dhcprelay.Manager
-	snmpAgent                 *snmp.Agent
+	flowExportErr  error
+	ipfixBundlePtr atomic.Pointer[ipfixBundle]
+	ipfixHash      [32]byte
+	ipfixHashSet   bool
+	ipfixCBOnce    sync.Once
+	ipfixReconMu   sync.Mutex
+	ipfixExportErr error
+	dhcpRelay      *dhcprelay.Manager
+	snmpAgent      *snmp.Agent
+
+	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
+	// The SNMP agent is a start-once-at-boot subsystem: the boot block in
+	// daemon_run.go performs the first start (respecting config-only /
+	// bootstrap modes), and every later commit reconciles through
+	// reconcileSNMP (called from applyConfigLocked). snmpReconMu serializes
+	// the reconcile against itself; the agent's own cfgMu still guards the
+	// live authorization/community swap done by UpdateConfig.
+	snmpReconMu        sync.Mutex
+	snmpCtx            context.Context    // lifetime context for the agent + monitor goroutines
+	snmpCancel         context.CancelFunc // cancels snmpCtx (day-2 disable / shutdown)
+	snmpWg             *sync.WaitGroup    // joins the listener + link-state monitor goroutines
+	snmpHash           uint64             // FxHash-free FNV of the live SNMP stanza (idempotence gate)
+	snmpHashSet        bool               // true once snmpHash reflects a running agent
+	snmpMonitorRunning bool               // true while the link-state trap monitor goroutine is live
+	snmpBootReady      bool               // set true after the boot block; gates the reconcile START path
+	// snmpServe runs the agent's UDP/161 listener for the lifetime of ctx.
+	// nil ⇒ agent.Start (binds UDP/161, needs CAP_NET_BIND_SERVICE). The
+	// reconcile unit test injects a seam so it can drive enable/disable
+	// without binding a privileged socket (#3967).
+	snmpServe func(ctx context.Context, agent *snmp.Agent)
+	// snmpBootsPath overrides the SNMPv3 engineBoots persistence path passed
+	// to snmp.NewAgentWithBootsPath. Empty ⇒ the package default. Tests inject
+	// a temp path so a reconcile-triggered start does not touch /var/lib/xpf
+	// (#3967).
+	snmpBootsPath             string
 	lldpMgr                   *lldp.Manager
 	lldpApplied               *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
 	lldpApplyInit             bool             // true once reconcileLLDP has run at least once
