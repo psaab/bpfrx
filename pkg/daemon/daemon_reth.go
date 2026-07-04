@@ -136,11 +136,46 @@ func pciAddrToEnp(pciAddr string) string {
 	return fmt.Sprintf("enp%ds%d", bus, slot)
 }
 
+// rethLinkOps groups the netlink primitives that renameRethMember and
+// programRethMAC use. It exists as a seam so tests can inject a fake and
+// assert the RETH member's final admin link state (#3920). The zero value is
+// unusable; use rethLinkOpsFn, which is wired to the real netlink calls.
+type rethLinkOps struct {
+	interfaces      func() ([]net.Interface, error)
+	byName          func(string) (netlink.Link, error)
+	byIndex         func(int) (netlink.Link, error)
+	setDown         func(netlink.Link) error
+	setUp           func(netlink.Link) error
+	setName         func(netlink.Link, string) error
+	setHardwareAddr func(netlink.Link, net.HardwareAddr) error
+}
+
+// rethLinkOpsFn is the live wiring; tests save/restore and override it.
+var rethLinkOpsFn = rethLinkOps{
+	interfaces:      net.Interfaces,
+	byName:          netlink.LinkByName,
+	byIndex:         netlink.LinkByIndex,
+	setDown:         netlink.LinkSetDown,
+	setUp:           netlink.LinkSetUp,
+	setName:         netlink.LinkSetName,
+	setHardwareAddr: netlink.LinkSetHardwareAddr,
+}
+
 // renameRethMember finds an interface by its RETH virtual MAC and renames it
 // to the expected config name. Returns the old kernel name if renamed, or "".
-// The interface must be DOWN for the rename to succeed.
+//
+// The interface must be DOWN for the rename to succeed, so renameRethMember
+// brings it down for the rename and then back UP — the function that downs a
+// link owns bringing it back up. It does NOT rely on the caller's subsequent
+// programRethMAC for the UP: programRethMAC early-returns (no UP) when the
+// virtual MAC already matches, and that is exactly the case here — the
+// interface was found by matching that same virtual MAC, so programRethMAC
+// always no-ops on the just-renamed member. Without this UP the RETH data link
+// would be left administratively DOWN → the interface track detects link-down
+// → the redundancy group demotes → traffic blackhole (#3920).
 func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
-	ifaces, err := net.Interfaces()
+	ops := rethLinkOpsFn
+	ifaces, err := ops.interfaces()
 	if err != nil {
 		return ""
 	}
@@ -148,16 +183,27 @@ func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
 		if !bytes.Equal(iface.HardwareAddr, expectedMAC) || iface.Name == targetName {
 			continue
 		}
-		link, err := netlink.LinkByIndex(iface.Index)
+		link, err := ops.byIndex(iface.Index)
 		if err != nil {
 			return ""
 		}
 		// Ensure interface is DOWN for rename.
-		netlink.LinkSetDown(link)
-		if err := netlink.LinkSetName(link, targetName); err != nil {
+		ops.setDown(link)
+		if err := ops.setName(link, targetName); err != nil {
 			slog.Warn("failed to rename RETH member",
 				"from", iface.Name, "to", targetName, "err", err)
+			// We downed the link above; a failed rename must not strand
+			// the member DOWN. Best-effort restore admin UP.
+			ops.setUp(link)
 			return ""
+		}
+		// Bring the member back UP after the rename. renameRethMember downed
+		// it, so renameRethMember owns the UP — do not depend on
+		// programRethMAC, which no-ops (no UP) when the MAC already matches
+		// (#3920).
+		if err := ops.setUp(link); err != nil {
+			slog.Warn("failed to bring RETH member up after rename",
+				"iface", targetName, "err", err)
 		}
 		return iface.Name
 	}
@@ -168,7 +214,8 @@ func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
 // Skips if the interface already has the correct MAC.
 // The interface must be brought DOWN to change its MAC, then back UP.
 func programRethMAC(ifName string, mac net.HardwareAddr) (linkCycled bool, err error) {
-	link, err := netlink.LinkByName(ifName)
+	ops := rethLinkOpsFn
+	link, err := ops.byName(ifName)
 	if err != nil {
 		return false, fmt.Errorf("interface %s: %w", ifName, err)
 	}
@@ -181,21 +228,21 @@ func programRethMAC(ifName string, mac net.HardwareAddr) (linkCycled bool, err e
 	// mlx5 zero-copy AF_XDP sockets break on link cycle — the driver
 	// doesn't reinitialize XSK WQEs after link UP. If the driver
 	// supports IFF_LIVE_ADDR_CHANGE, this succeeds without any cycle.
-	if err := netlink.LinkSetHardwareAddr(link, mac); err == nil {
+	if err := ops.setHardwareAddr(link, mac); err == nil {
 		slog.Info("RETH MAC set without link cycle", "iface", ifName)
 		return false, nil
 	}
 	// Fallback: bring link down, set MAC, bring back up.
 	slog.Info("RETH MAC requires link cycle (driver does not support live change)",
 		"iface", ifName)
-	if err := netlink.LinkSetDown(link); err != nil {
+	if err := ops.setDown(link); err != nil {
 		return false, fmt.Errorf("link down %s: %w", ifName, err)
 	}
-	if err := netlink.LinkSetHardwareAddr(link, mac); err != nil {
-		netlink.LinkSetUp(link) // best-effort restore
+	if err := ops.setHardwareAddr(link, mac); err != nil {
+		ops.setUp(link) // best-effort restore
 		return false, fmt.Errorf("set mac %s: %w", ifName, err)
 	}
-	if err := netlink.LinkSetUp(link); err != nil {
+	if err := ops.setUp(link); err != nil {
 		return true, fmt.Errorf("link up %s: %w", ifName, err)
 	}
 	return true, nil
