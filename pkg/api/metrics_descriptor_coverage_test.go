@@ -56,6 +56,20 @@ type descriptorCoverageDP struct {
 
 func (d *descriptorCoverageDP) IsLoaded() bool { return true }
 
+// #3929: collectSessionGauges now derives xpf_sessions_active/established/
+// breakdown from the session table iteration, omitting them on iterator error
+// (the #2469 fail-loud contract). dataplane.New() answers IterateSessions with
+// a map-missing error, which would drop the session-gauge family out of
+// coverage — override both iterators to succeed (enumerate nothing) so the
+// xpf_sessions_active sentinel stays exercised.
+func (d *descriptorCoverageDP) IterateSessions(func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return nil
+}
+
+func (d *descriptorCoverageDP) IterateSessionsV6(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return nil
+}
+
 func (d *descriptorCoverageDP) Status() (dpuserspace.ProcessStatus, error) {
 	return d.status, nil
 }

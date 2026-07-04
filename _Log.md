@@ -1,3 +1,46 @@
+## 2026-07-03 — #3929: session-count stats (SessionCount + xpf_sessions_active/established) permanently 0 on the userspace dataplane
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-051 (MEDIUM, observability). `SessionCount`
+    (gRPC `GetStatus`, REST `/status`) and the Prometheus
+    `xpf_sessions_active`/`xpf_sessions_established` gauges were sourced from
+    `gc.Stats().TotalEntries`/`EstablishedSessions`. On the userspace dataplane
+    (the only live forwarding path since #1476) the BPF GC sweep is skipped
+    (#333), so `gc.Stats()` session counts are permanently 0 — active-session
+    metrics/dashboards/alerts read a constant 0 regardless of real load, and a
+    session-leak/exhaustion condition is invisible. Fix: re-source all three
+    outputs from the LIVE dataplane session table (the same mirrored conntrack
+    maps `show security flow session` reads). `collectSessionGauges`
+    (`pkg/api/metrics_sessions.go`) now derives `active` (forward entries,
+    `IsReverse==0`) and `established` (forward entries with
+    `State==SessStateEstablished`) inside the SAME `IterateSessions`/
+    `IterateSessionsV6` scan that already backs the type breakdown — one scan,
+    no new periodic scan (the #333 GC-skip optimization stands), and all session
+    gauges share the one fail-loud `xpf_sessions_breakdown_scrape_ok` gate
+    (#2469 extended to active/established). `GetStatus`
+    (`pkg/grpcapi/server_show_status.go`) and `/status`
+    (`pkg/api/health.go`) read `dp.SessionCount()` (forward-only live total)
+    guarded by `dp != nil && IsLoaded()`. `SessionCount()` added to the
+    `apiRuntimeDataPlane` interface (pkg/api) and its daemon mirror
+    `apiDataPlane` (`pkg/daemon/runtime_probes.go`). The Rust mirror writes
+    `state=ESTABLISHED` for all live rows (`publish_conntrack.rs`), so on a real
+    node established≈active today; the Go derivation is correct and general and
+    was unit-tested with a mock snapshot carrying a DISTINCT established subset.
+    RED-on-revert (verified by temporarily reverting each site): Prometheus
+    snapshot with 4 forward (3 established, +1 reverse ignored) → active=4,
+    established=3, ipv4=3/ipv6=1/snat=1/dnat=1 (revert → 0/0); REST `/status`
+    `session_count`=4 (revert → 0); gRPC `GetStatus` SessionCount=7 for
+    v4=5+v6=2 (revert → 0). `go test ./pkg/api/... ./pkg/grpcapi/...
+    ./pkg/conntrack/... ./pkg/dataplane/... ./pkg/daemon/...` green;
+    `go build ./...`, gofmt, vet clean. Cluster smoke (metric non-zero under
+    iperf) WARRANTED but not required for merge — pure read-path stats change,
+    no forwarding/HA/session-sync code touched.
+  - **File(s)**: pkg/api/metrics_sessions.go, pkg/api/api.go, pkg/api/health.go,
+    pkg/grpcapi/server_show_status.go, pkg/daemon/runtime_probes.go,
+    pkg/api/README.md, pkg/api/metrics_sessions_userspace_3929_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go,
+    pkg/grpcapi/server_show_status_3929_test.go
+
 ## 2026-07-03 — #3924: userspace local-address sync pruned VRRP VIP keys on a transient netlink AddrList failure → VIP/SSH/BGP/IKE blackhole
 
 - **Timestamp**: 2026-07-03
