@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -47,6 +48,32 @@ const (
 type Manager struct {
 	configDir  string
 	configPath string
+
+	// mu guards prevConnNames across concurrent Apply callers (the ordered
+	// commit path and the DHCP-rebind re-render both call Apply).
+	mu sync.Mutex
+	// prevConnNames is the set of swanctl connection names (sanitized VPN
+	// names) written by the most recent Apply. Diffing it against the new
+	// config's connection set yields the connections an operator DELETED, so
+	// their live SAs can be torn down (#3941). nil until the first Apply.
+	prevConnNames map[string]bool
+
+	// swanctl is the exec seam for shelling out to swanctl. Nil in
+	// production and directly-constructed test Managers; sc() falls back to
+	// the package-level runSwanctl. Tests that must observe/intercept the
+	// swanctl invocations (e.g. the removed-connection terminate in #3941)
+	// set this to a recording double.
+	swanctl func(args ...string) ([]byte, error)
+}
+
+// sc returns the swanctl exec function, defaulting to the package-level
+// runSwanctl when the seam is unset. This keeps a zero-value / directly
+// constructed Manager working while letting tests inject a double.
+func (m *Manager) sc(args ...string) ([]byte, error) {
+	if m.swanctl != nil {
+		return m.swanctl(args...)
+	}
+	return runSwanctl(args...)
 }
 
 // New creates a new IPsec manager.
@@ -67,11 +94,45 @@ func NewWithConfigDir(dir string) *Manager {
 }
 
 // Apply generates swanctl config and reloads strongSwan.
+//
+// swanctl --load-all only UNLOADS the config of a connection the operator
+// deleted; it does NOT terminate that connection's already-established
+// IKE/child SAs, so a removed VPN keeps forwarding until rekey/lifetime
+// expiry (#3941). Apply therefore diffs the previous applied connection set
+// against the new one and, after the reload has unloaded the removed
+// connections, actively terminates their live SAs (terminateRemovedConns).
 func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
+	newNames := vpnConnNameSet(ipsecCfg)
+	removed := m.swapConnNames(newNames)
+
+	var applyErr error
 	if ipsecCfg == nil || len(ipsecCfg.VPNs) == 0 {
-		return m.Clear()
+		applyErr = m.clearConfig()
+	} else {
+		applyErr = m.applyConfig(ipsecCfg)
 	}
 
+	// Terminate the live SAs of deleted connections AFTER the reload has
+	// unloaded their config, so a straggler SA cannot be re-initiated from a
+	// still-loaded connection while we tear it down. Terminate is idempotent:
+	// a removed VPN with no active SA is a clean no-op (no --terminate is
+	// issued because it never shows up in --list-sas).
+	m.terminateRemovedConns(removed)
+
+	return applyErr
+}
+
+// Clear removes the xpf config and reloads strongSwan, terminating the live
+// SAs of every previously-applied connection.
+func (m *Manager) Clear() error {
+	removed := m.swapConnNames(nil)
+	err := m.clearConfig()
+	m.terminateRemovedConns(removed)
+	return err
+}
+
+// applyConfig renders + atomically writes the swanctl snippet and reloads.
+func (m *Manager) applyConfig(ipsecCfg *config.IPsecConfig) error {
 	cfg, err := m.renderConfig(ipsecCfg)
 	if err != nil {
 		return err
@@ -98,8 +159,8 @@ func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 	return nil
 }
 
-// Clear removes the xpf config and reloads strongSwan.
-func (m *Manager) Clear() error {
+// clearConfig removes the xpf snippet and reloads strongSwan.
+func (m *Manager) clearConfig() error {
 	if err := os.Remove(m.configPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove config: %w", err)
 	}
@@ -108,10 +169,114 @@ func (m *Manager) Clear() error {
 }
 
 func (m *Manager) reload() error {
-	output, err := runSwanctl("--load-all")
+	output, err := m.sc("--load-all")
 	if err != nil {
 		return fmt.Errorf("swanctl --load-all: %w: %s", err, string(output))
 	}
 	slog.Info("swanctl config reloaded")
 	return nil
+}
+
+// vpnConnNameSet returns the set of swanctl connection names (sanitized VPN
+// names, matching what renderConfig writes and what swanctl reports in
+// --list-sas) for every VPN in ipsecCfg. A nil config / empty VPN map yields
+// an empty set.
+func vpnConnNameSet(ipsecCfg *config.IPsecConfig) map[string]bool {
+	if ipsecCfg == nil || len(ipsecCfg.VPNs) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(ipsecCfg.VPNs))
+	for name := range ipsecCfg.VPNs {
+		names[sanitizeSwanctlValue(name)] = true
+	}
+	return names
+}
+
+// swapConnNames records newNames as the current applied connection set and
+// returns the connections that were present before but are gone now — the
+// ones an operator DELETED. The diff keys off the VPN name (map key), not
+// renderability, so a VPN that merely became unrenderable (a broken gateway
+// reference) is NOT treated as removed and keeps its SAs.
+func (m *Manager) swapConnNames(newNames map[string]bool) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var removed []string
+	for name := range m.prevConnNames {
+		if !newNames[name] {
+			removed = append(removed, name)
+		}
+	}
+	m.prevConnNames = newNames
+	return removed
+}
+
+// terminateRemovedConns tears down the live IKE/child SAs of the deleted
+// connections. It queries live SAs and only terminates a removed connection
+// that actually has an SA, so a deletion of a VPN that was never up issues no
+// swanctl call. A terminate failure is logged but never fails the apply — the
+// config reload already unloaded the connection, and the SA may simply have
+// been down already (#3941).
+func (m *Manager) terminateRemovedConns(removed []string) {
+	if len(removed) == 0 {
+		return
+	}
+
+	removedSet := make(map[string]bool, len(removed))
+	for _, name := range removed {
+		removedSet[name] = true
+	}
+
+	live, err := m.liveConnNames()
+	if err != nil {
+		// Could not enumerate live SAs (charon down / vici error). Fall back
+		// to an unconditional, idempotent terminate of each removed name so a
+		// straggler SA is not left forwarding; swanctl no-ops when nothing
+		// matches.
+		slog.Warn("could not list SAs before terminating removed IPsec "+
+			"connections; terminating unconditionally", "err", err)
+		for _, name := range removed {
+			m.terminateIKE(name)
+		}
+		return
+	}
+
+	for name := range live {
+		if removedSet[name] {
+			m.terminateIKE(name)
+		}
+	}
+}
+
+// terminateIKE issues `swanctl --terminate --ike <name>` for a single
+// connection, logging (but not propagating) any error.
+func (m *Manager) terminateIKE(name string) {
+	if out, err := m.sc("--terminate", "--ike", name); err != nil {
+		slog.Warn("swanctl terminate for deleted IPsec VPN failed "+
+			"(SA may already be down)", "ike", name, "err", err,
+			"output", string(out))
+		return
+	}
+	slog.Info("terminated live SAs for deleted IPsec VPN", "ike", name)
+}
+
+// liveConnNames returns the set of connection (IKE SA) names strongSwan
+// currently reports via --list-sas. It routes through the swanctl exec seam
+// (unlike GetSAStatus, which uses stdout only); parseSAOutput ignores any
+// unrecognized stderr lines CombinedOutput may fold in.
+func (m *Manager) liveConnNames() (map[string]bool, error) {
+	out, err := m.sc("--list-sas")
+	if err != nil {
+		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, string(out))
+	}
+	names := make(map[string]bool)
+	for _, sa := range parseSAOutput(string(out)) {
+		conn := sa.ConnectionName
+		if conn == "" {
+			conn = sa.Name
+		}
+		if conn != "" {
+			names[conn] = true
+		}
+	}
+	return names, nil
 }
