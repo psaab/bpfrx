@@ -813,9 +813,17 @@ func (m *Manager) readDegradedPathStatsLocked() map[string]uint64 {
 	}
 	result := make(map[string]uint64)
 	for i := uint32(0); i < uint32(len(degradedPathReasonNames)); i++ {
-		var val uint64
-		if err := statsMap.Lookup(i, &val); err != nil {
+		// #4113 (F13): userspace_fallback_stats is a PER-CPU array. A per-CPU
+		// map lookup returns one value per possible CPU, which we sum to get
+		// the cumulative count for this reason. Reading into a single uint64
+		// would fail (per-CPU maps require a slice destination).
+		var perCPU []uint64
+		if err := statsMap.Lookup(i, &perCPU); err != nil {
 			continue
+		}
+		var val uint64
+		for _, v := range perCPU {
+			val += v
 		}
 		if val == 0 {
 			continue

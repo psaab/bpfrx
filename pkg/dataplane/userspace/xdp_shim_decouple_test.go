@@ -454,9 +454,16 @@ func userspaceXDPDegradedPathStat(t *testing.T, coll *ebpf.Collection, name stri
 		t.Fatal("userspace_fallback_stats compatibility map not loaded")
 	}
 	idx := degradedPathReasonIndex(t, name)
-	var got uint64
-	if err := stats.Lookup(idx, &got); err != nil {
+	// #4113 (F13): userspace_fallback_stats is a PER-CPU array; a per-CPU
+	// lookup returns one value per possible CPU. Sum across CPUs to get the
+	// cumulative count for this reason.
+	var perCPU []uint64
+	if err := stats.Lookup(idx, &perCPU); err != nil {
 		t.Fatalf("lookup userspace_fallback_stats compatibility map[%d] (%s): %v", idx, name, err)
+	}
+	var got uint64
+	for _, v := range perCPU {
+		got += v
 	}
 	return got
 }

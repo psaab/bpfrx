@@ -105,10 +105,11 @@ var userspaceShimAllowedMapTypes = map[string]ebpf.MapType{
 	"dnat_table":    ebpf.Hash,
 	"dnat_table_v6": ebpf.Hash, // #2406 SNAT66-return reverse-NAT steering
 
-	"userspace_bindings":         ebpf.Array,
-	"userspace_cpumap":           ebpf.CPUMap,
-	"userspace_ctrl":             ebpf.Array,
-	"userspace_fallback_stats":   ebpf.Array,
+	"userspace_bindings":       ebpf.Array,
+	"userspace_cpumap":         ebpf.CPUMap,
+	"userspace_ctrl":           ebpf.Array,
+	"userspace_fallback_stats": ebpf.PerCPUArray, // #4113 (F13): per-CPU, lost-update-free
+
 	"userspace_heartbeat":        ebpf.Array,
 	"userspace_ingress_ifaces":   ebpf.Hash,
 	"userspace_interface_nat_v4": ebpf.Hash,
