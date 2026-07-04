@@ -36,6 +36,28 @@
     pkg/configstore/store_format.go, pkg/api/config.go,
     pkg/api/config_raw_ast_redaction_test.go, pkg/grpcapi/server_config.go,
     pkg/grpcapi/server_config_redaction_test.go, docs/config-schema.md, _Log.md
+## 2026-07-03 — #4052: test-failover.sh preflight session-count check was a single immediate assert with no settle-wait → false FAIL on a healthy cluster (racy 8-stream handshake window)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the fable-161 batch-tf false-alarm. The Phase-1
+    preflight in `test/incus/test-failover.sh` asserted
+    `fw0_sessions >= MIN_SESSIONS(4)` the instant after starting
+    `iperf3 -P8`, before the 8 TCP 3-way handshakes complete, so it
+    could observe 0-3 Valid sessions and FALSE-FAIL a healthy cluster
+    (a settled cluster shows ~25 Valid sessions at 23.4 Gbps / 0 retr).
+    Replaced the single immediate assert with a poll-with-timeout loop
+    (20 iterations × 0.5s = 10s max) that re-queries
+    `show security flow session destination-prefix <target> |
+    grep -c "Session State: Valid"` each pass and breaks as soon as the
+    count reaches MIN_SESSIONS; it only fails if the streams genuinely
+    never establish within the timeout (a real establishment failure).
+    MIN_SESSIONS stays 4; pass/fail reporting and the fw0/target vars
+    are preserved; the other failover assertions already have their own
+    waits and are untouched. Used `for _ in` to avoid an SC2034.
+  - **File(s)**: test/incus/test-failover.sh
+  - **Validation**: `shellcheck -S warning` clean (only the pre-existing
+    SC2034 at line 338, unrelated); `go build ./...` green. No live
+    cluster run — this is a script-timing fix.
 
 ## 2026-07-03 — #4049: LLDP resolved its socket with the Junos slash name (ge-0/0/0) instead of the kernel dash name (ge-0-0-0) → net.InterfaceByName failed → LLDP never started on any renamed data port
 
@@ -31626,3 +31648,33 @@ top.
   - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_fabric.go,
     pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_fabric_test.go,
     docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4056 — configstore secret-bearing files 0644→0600
+    (world-readable secrets at rest). VERIFY-FIRST confirmed the rollback
+    text slots (`<config>.N`), config archives (`config-*.conf`),
+    `rescue.conf`, AND the active/candidate/rollback JSON DB were all
+    written mode 0644 (world-readable). The text copies come from
+    `config.Format()`, which never redacts/encrypts, so they ALWAYS carry
+    cleartext IKE PSK / auth keys / SNMP community; the JSON DB is
+    AES-GCM-encrypted only when `system master-password` is set, cleartext
+    otherwise. Either way 0644 exposed secrets to any local user and
+    defeated master-password encryption. Fix: mode 0600 on
+    `db.go writeTreeMarked`, `store_commit.go saveRollbackFiles` (durable
+    slot 1 + atomic slots 2..N), `store_persist.go writeArchive` and
+    `SaveRescueConfig`; `.configdb` dir 0700 (mkdir + idempotent Chmod for
+    upgrades) and archive dir 0700. `master.key` was already 0600. The v2
+    audit journal stays 0644 (metadata-only, no secrets, #1896). fsatomic
+    enforces the mode on the temp fd before rename, so an existing 0644
+    file is re-created 0600 on the next commit; daemon owns the files so
+    read-back is unaffected. Shipped perms only; the encryption-in-rollback
+    design (encrypt/redact secrets in the persisted TEXT copies when
+    master-password is set, with decrypt-on-restore) is deferred to an
+    issue comment. RED-on-revert: `file_perms_4056_test.go` asserts each
+    file 0600 + dirs 0700 + read-back + cleartext secret present; reverting
+    to 0644/0755 fails all four. Validated: `go test ./pkg/configstore/...`,
+    `go build ./...`, gofmt + vet clean.
+  - **File(s)**: pkg/configstore/db.go, pkg/configstore/store_commit.go,
+    pkg/configstore/store_persist.go,
+    pkg/configstore/file_perms_4056_test.go,
+    pkg/configstore/README.md, _Log.md
