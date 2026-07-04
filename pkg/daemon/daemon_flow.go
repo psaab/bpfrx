@@ -235,6 +235,22 @@ func (d *Daemon) archiveConfig(cfg *config.Config) {
 	if len(cfg.System.Archival.ArchiveSites) == 0 {
 		return
 	}
+	d.archiveToSites(cfg.System.Archival.ArchiveSites)
+}
+
+// archiveToSites serializes the CURRENT active configuration (Store.ShowActive
+// — the same hierarchical text `show configuration` renders) to a transient
+// 0600 temp file and uploads it to every archive site via the archiveTransfer
+// seam (default scpArchiveTransfer). It is the shared archive-to-site path used
+// by BOTH transfer-on-commit (archiveConfig, invoked on each commit apply) and
+// the periodic transfer-interval timer (runArchiveTimer, #4078) — the periodic
+// path reuses this exact transport rather than reimplementing it. The uploaded
+// remote filename preserves the historical basename (the boot-file basename,
+// default xpf.conf).
+func (d *Daemon) archiveToSites(sites []string) {
+	if len(sites) == 0 {
+		return
+	}
 	if d.store == nil {
 		slog.Warn("config archival skipped: no configuration store")
 		return
@@ -277,7 +293,7 @@ func (d *Daemon) archiveConfig(cfg *config.Config) {
 	}
 
 	var wg sync.WaitGroup
-	for _, site := range cfg.System.Archival.ArchiveSites {
+	for _, site := range sites {
 		wg.Add(1)
 		go func(dest string) {
 			defer wg.Done()
