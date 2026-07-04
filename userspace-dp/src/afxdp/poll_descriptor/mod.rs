@@ -19,7 +19,7 @@ mod cookie_reply;
 mod filter;
 mod flow_cache_hit;
 mod nat_exception;
-mod reject_reply;
+pub(in crate::afxdp) mod reject_reply;
 mod rx_telemetry;
 
 use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
@@ -1302,6 +1302,13 @@ pub(super) fn poll_binding_process_descriptor(
                                 worker_ctx.event_stream,
                                 None,
                                 None,
+                                // #3608: output-filter `then reject` on the
+                                // fabric-return forward emits the active reply
+                                // rather than silently dropping.
+                                Some(ForwardRejectReply {
+                                    tx_pipeline: &mut binding.tx_pipeline,
+                                    counters: telemetry.counters,
+                                }),
                             ) {
                                 request.frame = owned_packet_frame
                                     .take()
@@ -3780,6 +3787,13 @@ pub(super) fn poll_binding_process_descriptor(
                         worker_ctx.event_stream,
                         None,
                         None,
+                        // #3608: give the transit forward path the ingress TX
+                        // pipeline so an output-filter `then reject` emits the
+                        // active reply instead of a silent drop.
+                        Some(ForwardRejectReply {
+                            tx_pipeline: &mut binding.tx_pipeline,
+                            counters: telemetry.counters,
+                        }),
                     ) {
                         // #2362: capture the per-packet L4 match inputs from the
                         // frame BEFORE `owned_packet_frame.take()` below moves the

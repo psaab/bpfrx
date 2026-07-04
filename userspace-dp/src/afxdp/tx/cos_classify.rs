@@ -11,6 +11,14 @@ pub(in crate::afxdp) struct CoSTxSelection {
     pub(in crate::afxdp) queue_id: Option<u8>,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
     pub(in crate::afxdp) drop: bool,
+    // #3608: `drop` folds every non-`Accept` output-filter action plus any
+    // three-color-policer drop into one bit. `reject` isolates the subset that
+    // was an explicit output-filter `then reject` (`FilterAction::Reject`), so
+    // the TX/CoS consumer can synthesize the active reject reply (TCP RST /
+    // ICMP admin-prohibited) instead of the silent drop a `then discard` or a
+    // red policer produces. `reject` is only ever true when `drop` is true; a
+    // policer drop or a `then discard` keeps `reject == false`.
+    pub(in crate::afxdp) reject: bool,
     pub(in crate::afxdp) filter_log: Option<crate::filter::FilterLogMatch>,
 }
 
@@ -102,6 +110,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
             queue_id: iface.map(|iface| iface.default_queue),
             dscp_rewrite: None,
             drop: false,
+            reject: false,
             filter_counters: crate::filter::CachedFilterCounters::default(),
             three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
             filter_log: None,
@@ -250,6 +259,12 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         queue_id,
         dscp_rewrite: effective_dscp_rewrite,
         drop: output_result.action != crate::filter::FilterAction::Accept,
+        // #3608: the cached-descriptor `drop` above is the OUTPUT filter's
+        // terminal action only (the three-color policer runs separately at
+        // replay via `apply_cached_three_color_policers`), so a `drop == true`
+        // here is exactly `then discard` or `then reject`. Carry the reject
+        // subset so the flow-cache-hit consumer can send an active reply.
+        reject: output_result.action == crate::filter::FilterAction::Reject,
         filter_counters,
         three_color_policers,
         filter_log,
@@ -364,6 +379,7 @@ fn resolve_cos_tx_selection_internal(
             queue_id: iface.map(|iface| iface.default_queue),
             dscp_rewrite: None,
             drop: false,
+            reject: false,
             filter_log: None,
         };
     };
@@ -386,6 +402,7 @@ fn resolve_cos_tx_selection_internal(
             queue_id: None,
             dscp_rewrite: None,
             drop: false,
+            reject: false,
             filter_log: None,
         };
     }
@@ -475,6 +492,12 @@ fn resolve_cos_tx_selection_internal(
     let mut effective_dscp_rewrite = output_result.dscp_rewrite;
     let mut drop =
         output_result.policer_drop || output_result.action != crate::filter::FilterAction::Accept;
+    // #3608: isolate the `then reject` subset of the collapsed `drop` bit so the
+    // TX/CoS consumer can synthesize an active reject reply. Only the OUTPUT
+    // filter's terminal action produces a reject; a three-color-policer drop
+    // (`policer_drop`, above or the ingress meter below) is always a silent
+    // discard.
+    let reject = output_result.action == crate::filter::FilterAction::Reject;
     let mut ingress_forwarding_class = None;
     let filter_log = output_result.log_match;
     if let Some(ingress_filter) = ingress_filter.filter(|filter| {
@@ -526,6 +549,7 @@ fn resolve_cos_tx_selection_internal(
             queue_id: None,
             dscp_rewrite: effective_dscp_rewrite,
             drop,
+            reject,
             filter_log,
         };
     };
@@ -535,6 +559,7 @@ fn resolve_cos_tx_selection_internal(
                 queue_id: Some(*queue_id),
                 dscp_rewrite: effective_dscp_rewrite,
                 drop,
+                reject,
                 filter_log,
             };
         }
@@ -545,6 +570,7 @@ fn resolve_cos_tx_selection_internal(
                 queue_id: Some(*queue_id),
                 dscp_rewrite: effective_dscp_rewrite,
                 drop,
+                reject,
                 filter_log,
             };
         }
@@ -554,6 +580,7 @@ fn resolve_cos_tx_selection_internal(
             queue_id: Some(queue_id),
             dscp_rewrite: effective_dscp_rewrite,
             drop,
+            reject,
             filter_log,
         };
     }
@@ -566,6 +593,7 @@ fn resolve_cos_tx_selection_internal(
             queue_id: Some(queue_id),
             dscp_rewrite: effective_dscp_rewrite,
             drop,
+            reject,
             filter_log,
         };
     }
@@ -573,6 +601,7 @@ fn resolve_cos_tx_selection_internal(
         queue_id: Some(iface.default_queue),
         dscp_rewrite: effective_dscp_rewrite,
         drop,
+        reject,
         filter_log,
     }
 }

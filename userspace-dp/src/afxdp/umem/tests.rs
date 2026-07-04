@@ -1573,6 +1573,7 @@ fn active_flow_debug_test_entry(
                 queue_id: Some(2),
                 dscp_rewrite: Some(46),
                 drop: false,
+                reject: false,
                 filter_counters: crate::filter::CachedFilterCounters::default(),
                 three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
                 filter_log: None,

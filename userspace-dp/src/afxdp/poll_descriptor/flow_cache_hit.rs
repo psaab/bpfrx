@@ -226,6 +226,26 @@ pub(super) fn stage_flow_cache_hit(
             cached_descriptor,
             now_ns,
         );
+        // #3608: an output firewall-filter `then reject` cached on this flow now
+        // emits the same active reply (TCP RST / ICMP admin-prohibited) the
+        // input/lo0 path already produces (#2521) rather than the historical
+        // silent drop. Only the `then reject` subset synthesizes; `then discard`
+        // and a red three-color policer stay silent. Enqueue the reply FIRST so
+        // the cached output filter-log below reports the TRUTHFUL action (#3615)
+        // — a reject whose reply fail-closes logs DENY, not REJECT.
+        let output_reject_reply_enqueued = if cached_descriptor.tx_selection.reject {
+            super::reject_reply::enqueue_filter_reject_reply(
+                tx_pipeline,
+                worker_ctx.forwarding,
+                worker_ctx.ident.ifindex,
+                packet_frame,
+                meta,
+                flow,
+                telemetry.counters,
+            )
+        } else {
+            false
+        };
         emit_cached_output_filter_log(
             worker_ctx.forwarding,
             worker_ctx.event_stream,
@@ -234,6 +254,7 @@ pub(super) fn stage_flow_cache_hit(
             cached_decision,
             cached_descriptor,
             cached_metadata,
+            output_reject_reply_enqueued,
             now_ns,
         );
         if cached_descriptor.tx_selection.drop || policer_action.drop {
@@ -474,6 +495,11 @@ pub(super) fn stage_flow_cache_hit(
                         target_binding_index: target_bi,
                     }),
                     Some(&cached_precomputed_tx_selection),
+                    // #3608: no reject reply here — this fallback runs only for a
+                    // NON-dropped cached flow (the `then reject`/`then discard`
+                    // drop already returned above at the cached-drop check), so
+                    // the precomputed selection is never a reject.
+                    None,
                 ) {
                     request.frame = owned_packet_frame
                         .take()

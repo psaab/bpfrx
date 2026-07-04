@@ -796,6 +796,24 @@ paths. `apply_lo0_filter_action` returns the matched `FilterAction`
 (not a bare drop `bool`) so the caller can tell `Reject` from
 `Discard`.
 
+The OUTPUT-firewall-filter (interface `filter output`) `then reject` on
+the transit forward / TX/CoS path is wired the same way (#3608). The
+TX/CoS classifier (`resolve_cos_tx_selection*` / `resolve_cached_cos_tx_selection`)
+collapses every non-`Accept` terminal action plus any three-color-policer
+drop into a single `drop` bit, so it now also carries a `reject` bit
+(`CoSTxSelection.reject` / `CachedTxSelectionDescriptor.reject`) that
+isolates exactly the `then reject` subset (`FilterAction::Reject`) — a
+`then discard` or a red policer keeps `reject == false`. The transit
+forward-request builder (`build_live_forward_request_from_frame`) and the
+flow-cache-hit fast path (`poll_descriptor/flow_cache_hit.rs`) consume
+that bit: on a reject drop they call `enqueue_filter_reject_reply` (the
+same shared synthesis) BEFORE returning `None` / recycling, reflecting the
+ORIGINAL inbound frame back toward the source via the ingress interface.
+The output filter-log is emitted AFTER the enqueue with the truthful
+outcome, so a reject whose reply fail-closes logs DENY, not REJECT
+(#3615). The builder gets the ingress TX pipeline + counters via the
+`ForwardRejectReply` context passed by its poll-loop callers.
+
 Zone-level Junos `tcp-rst` (#3071) reuses the same `enqueue_policy_reject_reply`
 machinery through the unified `enqueue_deny_reply` decision helper. Both
 policy-deny call sites in `poll_descriptor/mod.rs` now call
@@ -821,8 +839,11 @@ packet when synthesis returns `false`). The RT_FLOW filter-log action
 maps `Reject → reject` (matching policy reject and Junos), `Discard →
 deny`.
 
-**Scope:** output-firewall-filter `then reject` realized on the
-TX/CoS path (`tx/cos_classify.rs`) still collapses `Reject` to a
-silent drop. That site lacks the descriptor/packet context the
-reflected-reply synthesis needs, so wiring it would be a divergent
-path — tracked as a follow-up, not part of #2521.
+**Scope (resolved #3608):** output-firewall-filter `then reject` on the
+TX/CoS path is now an active reject too — see the OUTPUT-filter paragraph
+above. The remaining collapse-to-drop site is the deferred-CoS dispatch
+path (`tx/dispatch/mod.rs`, `resolve_pending_forward_cos_tx_selection`),
+which is unreachable in production today (every `PendingForwardRequest` is
+built with `cos_tx_selection_resolved: true`, so the deferred re-resolve
+never runs); the `reject` bit is available there for a future wiring if a
+deferred-CoS request path is ever introduced.

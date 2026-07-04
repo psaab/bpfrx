@@ -440,6 +440,10 @@ pub(super) fn emit_cached_output_filter_log(
     cached_decision: SessionDecision,
     cached_descriptor: &RewriteDescriptor,
     cached_metadata: &SessionMetadata,
+    // #3608: whether the cached `then reject` reply actually went out; threaded
+    // into the RT_FLOW action so a reject that fail-closed logs the truthful DENY
+    // (#3615). `false` for a `then accept`/`then discard`/policer log.
+    reject_reply_enqueued: bool,
     now_ns: u64,
 ) {
     let Some(log_match) = cached_descriptor.tx_selection.filter_log else {
@@ -453,6 +457,7 @@ pub(super) fn emit_cached_output_filter_log(
         cached_decision,
         cached_metadata,
         log_match,
+        reject_reply_enqueued,
         now_ns,
     );
 }
@@ -468,6 +473,7 @@ fn emit_cached_output_filter_log_tail(
     cached_decision: SessionDecision,
     cached_metadata: &SessionMetadata,
     log_match: crate::filter::FilterLogMatch,
+    reject_reply_enqueued: bool,
     now_ns: u64,
 ) {
     emit_filter_log_event(
@@ -482,11 +488,11 @@ fn emit_cached_output_filter_log_tail(
         FilterLogSource::CachedOutput,
         // #2520: AppID via the hot-path app_catalog.lookup.
         resolve_flow_app_id(&forwarding.app_catalog, flow),
-        // #3615: the TX/forward output-filter path does NOT synthesize a reject
-        // reply (that is #3608's silent-drop domain, deferred). No reply is
-        // enqueued here, so a `then reject` output-filter drop logs the truthful
-        // DENY rather than claiming an active reject was sent.
-        false,
+        // #3608/#3615: the cached output-filter `then reject` now DOES synthesize
+        // the active reply on the flow-cache-hit path. `reject_reply_enqueued`
+        // reports whether it actually went out, so a reject that fail-closed logs
+        // the truthful DENY rather than claiming an active reject was sent.
+        reject_reply_enqueued,
         now_ns,
     );
 }
