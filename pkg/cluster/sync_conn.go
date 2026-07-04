@@ -685,6 +685,25 @@ func (s *SessionSync) syncSweep() int {
 	if !s.stats.Connected.Load() {
 		return 0
 	}
+	// #3926: converge journaled deletes while CONNECTED. A delete generated
+	// during a connected-but-backpressured moment (sendCh full) is journaled by
+	// QueueDeleteV4/V6 but was previously flushed ONLY on a full
+	// disconnect/reconnect (handleNewConnection) — the install-replay below
+	// never carried it, so a journaled-while-connected delete never reached the
+	// standby until an unrelated disconnect, leaving the standby with a dead
+	// session (wrong forwarding on failover). Mirror the install-replay here:
+	// flush the delete journal every sweep tick while connected so the standby
+	// converges to the primary's DELETED set without requiring a disconnect.
+	// flushDeleteJournal is a no-op when the journal is empty, re-sends each
+	// entry at most once (take-all under the journal lock, DeletesSent counted
+	// on success), preserves the encoded #2170/#2221 delete generation, and
+	// re-journals any un-sent tail if sendCh is still full (retried next tick,
+	// #2121). The delete backpressure that journaled the entry set
+	// syncBackfillNeeded, which holds the sweep at the 1s active cadence, so
+	// convergence is bounded by one active sweep interval. This flush is
+	// independent of the kernel session iteration below and runs even when
+	// s.sessions is nil.
+	s.flushDeleteJournal()
 	if s.sessions == nil {
 		return 0
 	}

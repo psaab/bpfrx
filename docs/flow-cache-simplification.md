@@ -445,15 +445,34 @@ neighbor write paths are covered:
   sighting and same-MAC re-learn add a single Relaxed read per key and no
   bump, matching the per-key semantics.
 
-`FlowCacheEntry` carries a `neighbor_mac_epoch` stamped at insert
-(`poll_descriptor/mod.rs`, the single insert site, reading the live
-`dynamic_neighbors.mac_change_epoch()`). The worker fast path
+`FlowCacheEntry` carries a `neighbor_mac_epoch`. The worker fast path
 (`poll_descriptor/flow_cache_hit.rs`) re-reads the epoch on every hit; a
 mismatch (`FlowCacheEntry::neighbor_mac_epoch_stale`) evicts the slot and
 falls through to the slow path, which re-resolves the current MAC. This is
 the same lazy epoch-compare pattern as `rg_epochs` — chosen over an explicit
 cross-worker `FlushFlowCaches` so invalidation is lock-free and self-healing
 on the next packet.
+
+**Read-before-resolve (#3918).** The stamped epoch is SNAPSHOTTED BEFORE the
+next-hop MAC is resolved, not re-read at insert time. `poll_descriptor/mod.rs`
+captures `dynamic_neighbors.mac_change_epoch()` into
+`neighbor_mac_epoch_at_resolve` at the top of per-descriptor processing —
+before `resolve_flow_session_decision` / the session-miss
+`finalize_new_flow_ha_resolution` consult the neighbor table — and threads
+that value into `FlowCacheEntry::from_forward_decision` (a `neighbor_mac_epoch`
+value parameter; the constructor has no `dynamic_neighbors` handle, so it
+cannot re-read the live epoch). Re-reading the epoch AT insert time (after the
+resolve) was a TOCTOU that re-opened the #3048 blackhole: a VRRP gateway
+failover landing between the resolve (which read the OLD MAC) and the stamp
+would capture the NEW epoch onto the cached OLD `dst_mac` — a fresh-looking
+stale entry that survives every hit until it ages out. Reading first
+guarantees the stamped epoch is `<=` the epoch observed at resolve time, so
+the MAC-change bump makes the entry stale on its next hit and it re-resolves
+to the new MAC. A Relaxed load suffices: the snapshot and the stamp run on the
+one worker thread (program order sequences the snapshot before the resolve),
+and the neighbor shard `Mutex` — not this counter — synchronizes the MAC
+bytes; the epoch is a monotonic invalidation signal needing only eventual
+cross-thread visibility. Mirrors the #2170/#3912 record-before-use discipline.
 
 **Scope / tradeoff (documented per #3048):** the flow cache is keyed by the
 flow 5-tuple, not by next-hop, so next-hop-scoped invalidation is not
@@ -480,7 +499,15 @@ re-learn no-bump, change bumps — fail-on-revert for `learn_pair_if_changed`
 (flow_cache_tests.rs) is the end-to-end fail-on-revert: a descriptor stamped
 at the live epoch survives a same-MAC refresh and is evicted on a MAC change.
 Neutralizing either `mac_change_epoch.fetch_add` turns the change/eviction
-assertions RED.
+assertions RED. `flow_cache_stamps_pre_resolve_epoch_survives_interleaved_
+gateway_failover` (flow_cache_tests.rs) is the #3918 read-before-resolve
+fail-on-revert: it snapshots the epoch, interleaves a gateway-MAC failover
+(bumping the live epoch), stamps a real `from_forward_decision` entry with the
+PRE-resolve snapshot, and asserts the entry is stale on its next hit — and
+that a POST-resolve read (the pre-#3918 bug) would look fresh (the blackhole).
+Reverting the fix so the constructor ignores the caller's pre-resolve epoch
+turns it RED. `flow_cache_normal_resolve_caches_and_serves_neighbor_mac` is
+the companion no-interleave case: a normal resolve must not spuriously evict.
 
 ## FIB-generation bump gating (#3767)
 

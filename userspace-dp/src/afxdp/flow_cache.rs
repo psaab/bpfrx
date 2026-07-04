@@ -337,6 +337,15 @@ impl FlowCacheEntry {
         ha_state: &BTreeMap<i32, HAGroupRuntime>,
         apply_nat_on_fabric: bool,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+        // #3918: the caller's PRE-RESOLVE snapshot of
+        // `ShardedNeighborMap::mac_change_epoch()` — read BEFORE the neighbor
+        // MAC backing `decision.resolution` was resolved. Passed as a value so
+        // this constructor cannot re-read the live epoch (it has no
+        // `dynamic_neighbors` handle): the only source is the caller's
+        // pre-resolve capture. Stamping this instead of a post-resolve read
+        // closes the resolve→stamp TOCTOU that re-opened the #3048 stale-MAC
+        // blackhole on a VRRP gateway MAC failover.
+        neighbor_mac_epoch: u32,
     ) -> Option<Self> {
         if !Self::should_cache(meta, decision) {
             return None;
@@ -528,12 +537,17 @@ impl FlowCacheEntry {
             // #1219: 0 = "never touched"; first lookup hit will stamp
             // it with the current epoch.
             last_used_epoch: 0,
-            // #3048: the neighbor-MAC-change epoch is captured by the
-            // caller at insert time (it owns the `dynamic_neighbors`
-            // handle), immediately before `FlowCache::insert`. Seeded to 0
-            // here; the live value is read from
-            // `ShardedNeighborMap::mac_change_epoch()` at the insert site.
-            neighbor_mac_epoch: 0,
+            // #3048/#3918: the neighbor-MAC-change epoch is captured by the
+            // caller BEFORE it resolves the neighbor MAC for `decision`
+            // (the caller owns the `dynamic_neighbors` handle) and passed in
+            // as `neighbor_mac_epoch`. Reading it pre-resolve — instead of
+            // re-reading `mac_change_epoch()` after the resolve at stamp time
+            // — closes the resolve→stamp TOCTOU: a MAC change landing between
+            // the resolve and here advances the live epoch past this stamped
+            // (older) value, so the entry is treated stale on its next
+            // fast-path hit (`neighbor_mac_epoch_stale`) and re-resolved to
+            // the current MAC instead of blackholing on the pre-failover MAC.
+            neighbor_mac_epoch,
         })
     }
 }

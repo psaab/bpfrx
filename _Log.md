@@ -41,6 +41,51 @@
     pkg/api/metrics_descriptor_coverage_test.go,
     pkg/grpcapi/server_show_status_3929_test.go
 
+## 2026-07-03 — #3918: flow-cache neighbor_mac_epoch stamped AFTER neighbor resolve → resolve→stamp TOCTOU re-opens the #3048 stale-MAC blackhole on VRRP gateway failover
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-089 (MEDIUM, HA — stale-MAC blackhole on
+    failover). `poll_descriptor/mod.rs` stamped the flow-cache entry's
+    `neighbor_mac_epoch` by reading the LIVE
+    `dynamic_neighbors.mac_change_epoch()` at insert time — AFTER the neighbor
+    MAC backing the decision was resolved. A VRRP gateway failover (a kernel
+    ARP/NDP update replacing the gateway MAC) landing between the resolve
+    (which read the OLD MAC) and the stamp captured the NEW epoch onto the
+    cached OLD `dst_mac`: the entry's epoch then EQUALS the live epoch, so
+    `neighbor_mac_epoch_stale` returns false and the stale MAC is served on
+    every fast-path hit → blackhole until the entry ages out (re-opening the
+    #3048 class the epoch mechanism was added to prevent).
+  - **Fix**: Read-before-resolve. Capture the epoch into
+    `neighbor_mac_epoch_at_resolve` at the top of per-descriptor processing
+    (before `resolve_flow_session_decision` / session-miss
+    `finalize_new_flow_ha_resolution` consult the neighbor table) and thread it
+    into `FlowCacheEntry::from_forward_decision` as a `neighbor_mac_epoch`
+    VALUE parameter. The constructor has no `dynamic_neighbors` handle, so it
+    structurally cannot re-read the live epoch — the only source is the
+    caller's pre-resolve snapshot. The separate post-construction stamp is
+    removed. A subsequent MAC-change bump now makes the stamped (older) epoch
+    != current on the next hit → evict + re-resolve to the new MAC. Relaxed
+    load suffices (snapshot + stamp on one worker thread, program-ordered
+    before the resolve; the neighbor shard Mutex synchronizes the MAC bytes;
+    the epoch is a monotonic invalidation signal). Mirrors #2170/#3912
+    record-before-use.
+  - **Test**: `flow_cache_stamps_pre_resolve_epoch_survives_interleaved_gateway_failover`
+    (flow_cache_tests.rs) models the interleaved failover with real primitives
+    (ShardedNeighborMap genuine `mac_change_epoch` bump + real
+    `from_forward_decision` + `neighbor_mac_epoch_stale`): stamps a pre-resolve
+    snapshot, asserts the entry is stale after failover, and asserts a
+    POST-resolve read looks fresh (the blackhole). RED-on-revert VERIFIED:
+    reverting the constructor to ignore the pre-resolve param fails the
+    blackhole assertion. `flow_cache_normal_resolve_caches_and_serves_neighbor_mac`
+    is the no-interleave companion (no spurious eviction). FULL
+    `cargo test --release` green (3456 lib + 71 others, 0 failed).
+    `go build ./...` green.
+  - **File(s)**: `userspace-dp/src/afxdp/flow_cache.rs`,
+    `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+    `userspace-dp/src/afxdp/flow_cache_tests.rs`,
+    `docs/flow-cache-simplification.md`, `_Log.md`
+  - **Validation flag**: test-failover WARRANTED (HA VRRP gateway failover →
+    stale-MAC scenario) — parent batch-validates on the loss userspace cluster.
 ## 2026-07-03 — #3924: userspace local-address sync pruned VRRP VIP keys on a transient netlink AddrList failure → VIP/SSH/BGP/IKE blackhole
 
 - **Timestamp**: 2026-07-03
@@ -29522,3 +29567,72 @@ top.
     pkg/daemon/direct_garp_probe_target_test.go, pkg/vrrp/instance.go,
     pkg/vrrp/instance_garp_probe_target_test.go, pkg/vrrp/README.md,
     pkg/daemon/README.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3926 — flush the session-delete journal while CONNECTED. A
+    session DELETE generated while the sync link is UP but `sendCh` is full
+    (backpressure) is journaled by `QueueDeleteV4`/`V6`, but the journal was
+    flushed ONLY on a full disconnect/reconnect (`handleNewConnection` →
+    `flushDeleteJournal`). The periodic sweep replayed INSTALLS but never the
+    journaled deletes, so a delete journaled while the link stayed up was never
+    delivered until an unrelated disconnect — the standby retained the dead
+    session and made a wrong forwarding decision on failover. Fix (chose the
+    sweep-replay option, mirroring the existing install-replay — it reuses the
+    tested #2121 `flushDeleteJournal`/`rejournalTail` requeue path with no
+    hot-path mutex, no O(N^2) take-all churn, and bounded ≤1s convergence since
+    delete backpressure sets `syncBackfillNeeded` which holds the sweep at the
+    1s active cadence): `syncSweep` now calls `flushDeleteJournal` every tick
+    while connected, before the `s.sessions == nil` early-return (the flush is
+    independent of the kernel session iteration). `flushDeleteJournal` is a
+    no-op on an empty journal, re-sends each entry at most once (take-all under
+    the journal lock, `DeletesSent` counted on success), preserves the encoded
+    #2170/#2221 delete generation (no re-stamp — a stale journaled delete that
+    replays after a same-key replacement was re-synced is still refused by the
+    peer's delete guard), and re-journals any un-sent tail if `sendCh` is still
+    full (retried next tick). RED-on-revert unit test
+    `TestDeleteJournalConnectedFlushViaSweep`: connected + full `sendCh` →
+    delete journaled with a fresh gen > install gen, `DeletesSent==0`; drain
+    `sendCh` WITHOUT a disconnect; `syncSweep()` flushes the delete (journal
+    empty, `DeletesSent==1`, wire gen preserved); a second sweep does not
+    double-send. Verified RED on a reverted flush line (delete stuck in journal,
+    1 remain). `go test ./pkg/cluster/...` green, `-race` on the journal tests
+    green, `go build ./...`, gofmt, vet clean. test-failover WARRANTED (HA
+    session-sync convergence) — batch with the other HA-Medium fixes under the
+    force-node0-primary gate.
+  - **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
+    docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3932 — flow-traceoptions leaked one EventReader callback per
+    commit. `updateFlowTrace`/`applyFlowTrace` (pkg/daemon/daemon_flow.go)
+    closed the old `TraceWriter` but still called
+    `EventReader.AddCallback(tw.HandleEvent)` every commit touching
+    `security flow traceoptions`, without removing the previous callback. After
+    N such commits the reader held N registered trace callbacks: each event was
+    dispatched to all N, and the stale (already-closed) writers still ran
+    `HandleEvent` and bumped `DroppedWrites` — an unbounded per-event cost plus
+    a leaked-writer drop storm on a long-lived daemon. Fix (issue option b, the
+    #2075/#3742 flowexport pattern): register a SINGLE stable indirection
+    callback `Daemon.flowTraceCallback` exactly once (guarded by `traceCBOnce`)
+    that reads the live writer lock-free from a new
+    `atomic.Pointer[logging.TraceWriter]` (`traceWriterPtr`, replacing the plain
+    `traceWriter` field); each reconcile only SWAPS the underlying writer and
+    closes the one it replaced (`reconcileFlowTrace`), guarded by `traceReconMu`
+    so exactly one writer is closed per swap while the event-path callback stays
+    lock-free. Disabling traceoptions swaps in nil (callback stays, no-op); a
+    NewTraceWriter build failure keeps the current writer running rather than
+    dropping tracing. Added exported test hook
+    `logging.SetTraceLogDirForTest` (trace.go) so the cross-package daemon test
+    can drive `NewTraceWriter` against a temp dir. RED-on-revert unit test
+    `TestFlowTraceSingleCallbackAcrossReconciles`: after 3 reconciles the reader
+    has exactly 1 callback (RED=2/3 on revert) + 1 live writer, the 2 superseded
+    writers are closed and receive ZERO dispatched events (their `DroppedWrites`
+    do not move — RED bumps them on revert), a single SESSION_CLOSE writes
+    exactly one trace line, and disabling clears the writer while the single
+    callback remains. Verified RED by simulating the per-commit AddCallback
+    (callbacks=2, want 1). `go test -race ./pkg/daemon/... ./pkg/logging/...`
+    green, `go build ./...`, gofmt, vet clean. Doc: pkg/logging/README.md
+    flow-trace single-callback bullet.
+  - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_flow.go,
+    pkg/daemon/daemon_flowtrace_3932_test.go, pkg/logging/trace.go,
+    pkg/logging/README.md, _Log.md

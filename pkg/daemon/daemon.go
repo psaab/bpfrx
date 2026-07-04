@@ -288,15 +288,25 @@ type Daemon struct {
 	syncReadyTimer              *time.Timer
 	syncReadyTimeout            time.Duration
 	slogHandler                 *logging.SyslogSlogHandler
-	traceWriter                 *logging.TraceWriter
-	eventBuf                    *logging.EventBuffer
-	eventReader                 *logging.EventReader
-	eventEngine                 *eventengine.Engine
-	aggregator                  *logging.SessionAggregator
-	aggCancel                   context.CancelFunc
-	vrrpMgr                     *vrrp.Manager
-	gc                          *conntrack.GC
-	startTime                   time.Time // daemon start time; used to suppress stale config sync
+	// #3932: the flow-traceoptions writer is published through an atomic
+	// pointer read lock-free by a SINGLE stable EventReader callback that
+	// traceCBOnce registers exactly once. Each commit that changes
+	// traceoptions SWAPS the underlying writer (closing the old one) instead
+	// of registering a new callback, so a long-lived daemon that re-commits
+	// traceoptions repeatedly leaves exactly one callback and one live
+	// TraceWriter regardless of commit count. traceReconMu serializes the
+	// build+swap on the commit path; the callback reads the pointer lock-free.
+	traceWriterPtr atomic.Pointer[logging.TraceWriter]
+	traceCBOnce    sync.Once
+	traceReconMu   sync.Mutex
+	eventBuf       *logging.EventBuffer
+	eventReader    *logging.EventReader
+	eventEngine    *eventengine.Engine
+	aggregator     *logging.SessionAggregator
+	aggCancel      context.CancelFunc
+	vrrpMgr        *vrrp.Manager
+	gc             *conntrack.GC
+	startTime      time.Time // daemon start time; used to suppress stale config sync
 
 	// #846: applySem (capacity 1) serializes applyConfig + the
 	// commit→apply pair across all entry points (HTTP/gRPC commits,
