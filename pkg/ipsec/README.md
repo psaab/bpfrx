@@ -106,9 +106,25 @@ all files stay in `package ipsec`, so the public API is unchanged.
 - Traffic selectors are auto-derived from the policy source / destination
   prefixes when not given explicitly. Mixing explicit and derived
   selectors is supported but the explicit set wins.
-- DPD (dead-peer detection) profiles auto-generate from IKE/ESP
-  lifetimes. Operators can override with explicit `dead-peer-detection
-  delay/timeout`.
+- **DPD (dead-peer detection).** A `dead-peer-detection` stanza on an IKE
+  gateway is compiled by `parseDeadPeerDetectionNode` (`pkg/config`
+  `compiler_ipsec.go`) into `gw.DPDEnable` + mode/interval/threshold, and
+  rendered by `deriveDPD` (`pkg/ipsec/ike.go`) into swanctl `dpd_delay`,
+  `dpd_timeout`, and `dpd_action`. Every Junos form enables DPD (#3994):
+  - a bare `dead-peer-detection;` enables DPD with defaults — 10s delay,
+    threshold 5 (→ `dpd_timeout = delay × threshold`), and `dpd_action`
+    from the default/optimized mapping (`restart` for a
+    `establish-tunnels immediately` tunnel, else `clear`);
+  - `interval <n>` tunes `dpd_delay`; `threshold <n>` tunes the retry
+    count feeding `dpd_timeout`;
+  - the mode keyword maps to `dpd_action`: `always-send` → `restart`,
+    `optimized` → `clear`/`restart`, `probe-idle-tunnel` → `trap`/`restart`.
+
+  `DPDEnable` is the single source of truth for "is DPD on"; the mode
+  string only carries the explicit keyword. Before #3994 the enable check
+  was `DeadPeerDetect != ""`, so a bare statement was read as DISABLED and
+  an interval-only / threshold-only stanza captured the sub-field name as a
+  bogus mode.
 - XFRM interface ID is derived from the bind-interface name via
   `xfrmiIfID()`. The same name → same numeric ID across reboots — don't
   rename a bind interface without expecting a reset of the SAs that ride

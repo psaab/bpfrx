@@ -1024,13 +1024,19 @@ type IPsecGateway struct {
 	Version          string // "v1-only", "v2-only" (empty = both)
 	NoNATTraversal   bool   // disable NAT-T (legacy, use NATTraversal)
 	NATTraversal     string // "enable" (default), "disable", "force"
-	DeadPeerDetect   string // "always-send", "optimized", "probe-idle"
-	DPDInterval      int    // seconds
-	DPDThreshold     int    // retry count before peer is considered dead
-	LocalIDType      string // "hostname", "inet", "fqdn"
-	LocalIDValue     string // identity value
-	RemoteIDType     string // "hostname", "inet", "fqdn"
-	RemoteIDValue    string // identity value
+	// DPDEnable records that a `dead-peer-detection` stanza is present, so a
+	// bare `dead-peer-detection;` (Junos: enable DPD with defaults) or an
+	// interval-only / threshold-only form enables DPD even though no explicit
+	// mode keyword was given. It is the single source of truth for "is DPD
+	// on"; DeadPeerDetect only carries the explicit mode keyword (#3994).
+	DPDEnable      bool
+	DeadPeerDetect string // explicit mode: "always-send", "optimized", "probe-idle-tunnel" (empty = Junos default / bare stanza)
+	DPDInterval    int    // seconds
+	DPDThreshold   int    // retry count before peer is considered dead
+	LocalIDType    string // "hostname", "inet", "fqdn"
+	LocalIDValue   string // identity value
+	RemoteIDType   string // "hostname", "inet", "fqdn"
+	RemoteIDValue  string // identity value
 	// DynamicHostnameExtras holds tokens that rode past the FQDN on a
 	// compact-hierarchical `dynamic hostname <fqdn> <extra>` line (#3332).
 	// The flat-set form lands `hostname <fqdn>` as a scalar child the generic

@@ -948,8 +948,12 @@ func (s *Server) showIKE(cfg *config.Config, buf *strings.Builder) {
 				ver = "v1+v2"
 			}
 			fmt.Fprintf(buf, "  IKE version:        %s\n", ver)
-			if gw.DeadPeerDetect != "" {
-				fmt.Fprintf(buf, "  DPD:                %s\n", gw.DeadPeerDetect)
+			if gw.DPDEnable || gw.DeadPeerDetect != "" {
+				mode := gw.DeadPeerDetect
+				if mode == "" {
+					mode = "enabled"
+				}
+				fmt.Fprintf(buf, "  DPD:                %s\n", mode)
 				if gw.DPDInterval > 0 {
 					fmt.Fprintf(buf, "  DPD interval:       %ds\n", gw.DPDInterval)
 				}
