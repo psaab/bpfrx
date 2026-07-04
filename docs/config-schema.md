@@ -283,6 +283,17 @@ kept a scalar reader that dropped everything past the first bracketed value:
   direct ]` kept only the first — dropped redistributions. Coverage:
   `multivalue_rip_3904_test.go`.
 
+- **routing-instance `interface`** (`compiler_routing.go`
+  `compileRoutingInstances`) — reads every port into
+  `RoutingInstanceConfig.Interfaces` via `firewallMatchValues` instead of
+  `nodeVal(prop)`. No schema or type change: `interface` is an IMPLICIT leaf
+  under the `routing-instances` wildcard (deliberately not declared — see the
+  `schemaRoutingInstances` header comment), and the bracket already collapses
+  onto its Keys; `Interfaces` was already `[]string`. Before #3904 `interface
+  [ ge-0/0/1 ge-0/0/2 ]` kept only the first port — the rest stayed in the
+  DEFAULT table (a VRF isolation break). Coverage:
+  `multivalue_routing_instance_3904_test.go`.
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a

@@ -1,3 +1,22 @@
+## 2026-07-03 — #3904 (F-163): routing-instance `interface [ i1 i2 ]` kept only the first port (VRF isolation break) — multi-value fix
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-163 (VRF isolation break), the
+    routing-instance-interface arm of the #3904 bundle. `routing-instances VR
+    interface [ ge-0/0/1 ge-0/0/2 ]` placed ONLY ge-0/0/1 in the VRF; the
+    remaining ports stayed in the default table — an isolation break.
+  - **Fix**: The `interface` reader in `compileRoutingInstances`
+    (`compiler_routing.go`) accumulates every value via `firewallMatchValues`
+    instead of `nodeVal(prop)` (Keys[1]). No schema or type change was needed:
+    `interface` is an IMPLICIT leaf under the routing-instances wildcard (the
+    bracket already collapses onto its Keys) and `Interfaces` was already a
+    `[]string`. RED-on-revert proven: reverting to nodeVal yields
+    `[ge-0/0/1]`. SchemaValidate accepts the bracket config; the repeated-line
+    form still accumulates every port. go test ./pkg/config/... green.
+  - **File(s)**: pkg/config/compiler_routing.go,
+    pkg/config/multivalue_routing_instance_3904_test.go (new),
+    docs/config-schema.md
+
 ## 2026-07-03 — #3904 (F-162): RIP `group export` / `redistribute [ a b ]` bracket-list truncated to the first — multi-value fix
 
 - **Timestamp**: 2026-07-03

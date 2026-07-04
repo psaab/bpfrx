@@ -384,9 +384,14 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 			case "instance-type":
 				ri.InstanceType = nodeVal(prop)
 			case "interface":
-				if v := nodeVal(prop); v != "" {
-					ri.Interfaces = append(ri.Interfaces, v)
-				}
+				// multi-value leaf (#3904): `interface [ ge-0/0/1 ge-0/0/2 ]`
+				// collapses every port onto the leaf's Keys (and/or child
+				// nodes). Read EVERY value via the firewallMatchValues SSOT —
+				// the pre-#3904 nodeVal(prop) read only Keys[1], stranding the
+				// remaining ports OUTSIDE the routing-instance (in the default
+				// table): a VRF isolation break (the routing arm of the #2419
+				// bracket-list-truncation class).
+				ri.Interfaces = append(ri.Interfaces, firewallMatchValues(prop)...)
 			case "routing-options":
 				var ro RoutingOptionsConfig
 				if err := compileRoutingOptions(prop, &ro); err != nil {
