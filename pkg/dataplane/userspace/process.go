@@ -212,6 +212,53 @@ func findBinary(explicit string) (string, error) {
 // silent control-socket rejection after a successful commit.
 const MaxControlRequestBytes = 64 * 1024 * 1024
 
+const (
+	// controlBaseDeadline is the round-trip read/write deadline for a SMALL
+	// control-socket request (the 1/s status poll, forwarding arm/disarm,
+	// HA-state push, per-session install, ...). It is preserved unchanged at
+	// the historical 3s so the frequent status poll stays responsive per the
+	// #182 control-socket-contention discipline: a sub-1-MiB request gets
+	// exactly this deadline, no more.
+	controlBaseDeadline = 3 * time.Second
+	// controlDeadlinePerMiB is the additional round-trip budget granted per
+	// mebibyte of serialized request body. A large apply_snapshot — up to
+	// MaxControlRequestBytes (64 MiB, #2744) of feed-backed address-book CIDR
+	// text — needs the helper to receive, JSON-decode, and APPLY the whole
+	// body (building the address-book LPM tables, planning bindings,
+	// reconciling AF_XDP) and then write its response inside the deadline.
+	// A fixed 3s falsely timed a large apply out (#4036): Go reported the
+	// apply FAILED while the Rust helper had actually applied the snapshot and
+	// the dataplane was forwarding live with the new config — a spurious
+	// commit failure / needless rollback / false HA dp-failure.
+	controlDeadlinePerMiB = 1 * time.Second
+	// controlMaxDeadline caps the scaled deadline so a genuinely-hung helper
+	// still eventually times out rather than blocking the caller (which holds
+	// m.mu across the round-trip) forever. At the 64 MiB request ceiling the
+	// scaled deadline is base + 64s = 67s, comfortably under this cap.
+	controlMaxDeadline = 120 * time.Second
+)
+
+// controlRoundtripDeadline sizes the control-socket read/write deadline to the
+// serialized request length so a large apply_snapshot is not falsely timed out
+// (#4036). It is a pure function of the body length: a sub-1-MiB request keeps
+// the base deadline (small requests unchanged — the status poll stays
+// responsive), and each additional mebibyte adds controlDeadlinePerMiB up to
+// controlMaxDeadline. The deadline is generous enough for a legitimate 64 MiB
+// feed-heavy apply while still bounding a hung helper.
+func controlRoundtripDeadline(bodyLen int) time.Duration {
+	if bodyLen < 0 {
+		bodyLen = 0
+	}
+	// floor(bodyLen / 1 MiB): 0 for any request under 1 MiB, so small
+	// requests keep exactly controlBaseDeadline.
+	mib := bodyLen >> 20
+	d := controlBaseDeadline + time.Duration(mib)*controlDeadlinePerMiB
+	if d > controlMaxDeadline {
+		d = controlMaxDeadline
+	}
+	return d
+}
+
 func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, error) {
 	if m.cfg.ControlSocket == "" {
 		return ControlResponse{}, errors.New("userspace dataplane control socket not configured")
@@ -240,7 +287,15 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 		return ControlResponse{}, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	// Size the round-trip deadline to the request body (#4036). A fixed 3s was
+	// too short for a large apply_snapshot (up to MaxControlRequestBytes / 64
+	// MiB of feed-backed address-book CIDRs): the helper receives+decodes+
+	// applies the whole body before replying, which can exceed 3s, so Go timed
+	// out and reported the apply FAILED while the dataplane had applied it live.
+	// controlRoundtripDeadline keeps the 3s base for small requests (status
+	// poll stays responsive) and scales up for a large apply, capped so a hung
+	// helper still times out.
+	_ = conn.SetDeadline(time.Now().Add(controlRoundtripDeadline(len(body))))
 	// Reuse the pre-flight-serialized body; the Rust receiver frames on a
 	// single trailing newline (json.Encoder appends one).
 	if _, err := conn.Write(append(body, '\n')); err != nil {

@@ -1,10 +1,16 @@
 package lldp
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
+	"log/slog"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode"
 )
 
 func TestEncodeTLV(t *testing.T) {
@@ -304,6 +310,125 @@ func TestParseTLVs_ValidShutdownTTL(t *testing.T) {
 	}
 }
 
+// TestSanitizeTLVString unit-tests the LLDP-receive control-char sanitizer
+// (#4043): every C0/C1/DEL control character is replaced by a space, a normal
+// ASCII or multi-byte UTF-8 string is returned unchanged, and no control byte
+// survives. LLDP TLV strings are untrusted L2 input; leaving ESC/CR/LF raw
+// would let a crafted neighbor inject ANSI sequences into an operator's
+// terminal or forge/split a syslog line.
+func TestSanitizeTLVString(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain ascii unchanged", "switch-core-1", "switch-core-1"},
+		{"utf8 preserved", "café-λ-世界", "café-λ-世界"},
+		{"ansi escape stripped", "\x1b[31mred", " [31mred"},
+		{"crlf log injection", "a\r\nDROP", "a  DROP"},
+		{"nul and c0", "x\x00y\x07z", "x y z"},
+		{"del stripped", "a\x7fb", "a b"},
+		{"c1 stripped", "aC", "a C"},
+		{"trailing newline", "port0\n", "port0 "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeTLVString(tc.in)
+			if got != tc.want {
+				t.Errorf("sanitizeTLVString(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if i := strings.IndexFunc(got, unicode.IsControl); i >= 0 {
+				t.Errorf("sanitizeTLVString(%q) retained a control char at byte %d: %q", tc.in, i, got)
+			}
+		})
+	}
+}
+
+// TestParseTLVs_SanitizesControlChars asserts the end-to-end store boundary:
+// a received LLDP frame whose free-text TLVs (system-name, system-desc,
+// port-desc, port-id, non-MAC chassis-id) carry ESC + CRLF + C0/DEL control
+// characters is parsed into a neighbor whose stored strings are control-char
+// free, so neither expiryLoop's log line nor the `show lldp neighbors` table
+// can be poisoned by a hostile neighbor (#4043). Readable payload survives.
+func TestParseTLVs_SanitizesControlChars(t *testing.T) {
+	sysName := "\x1b[31mroot\r\nfake-log-line"
+	sysDesc := "desc\x1b]0;title\x07"
+	portDesc := "port\x00\x0bdesc"
+	portID := "eth\x1b[2J0\n"
+	// Non-MAC chassis-id subtype (7 = locally assigned) carrying a CRLF.
+	chassisRaw := append([]byte{7}, []byte("host\r\nA")...)
+
+	data := concat(
+		rawTLV(tlvChassisID, chassisRaw),
+		mustEncodeTLV(tlvPortID, encodePortID(portID)),
+		mustEncodeTLV(tlvTTL, encodeTTL(120)),
+		mustEncodeTLV(tlvSystemName, []byte(sysName)),
+		mustEncodeTLV(tlvSystemDesc, []byte(sysDesc)),
+		mustEncodeTLV(tlvPortDesc, []byte(portDesc)),
+		mustEncodeTLV(tlvEnd, nil),
+	)
+
+	n := ParseTLVs(data)
+	if n == nil {
+		t.Fatal("ParseTLVs returned nil for a valid (if hostile) frame")
+	}
+
+	for name, got := range map[string]string{
+		"SystemName": n.SystemName,
+		"SystemDesc": n.SystemDesc,
+		"PortDesc":   n.PortDesc,
+		"PortID":     n.PortID,
+		"ChassisID":  n.ChassisID,
+	} {
+		if i := strings.IndexFunc(got, unicode.IsControl); i >= 0 {
+			t.Errorf("%s retained a control char at byte %d: %q", name, i, got)
+		}
+	}
+
+	// The printable payload survives (control chars become spaces, not drops).
+	if !strings.Contains(n.SystemName, "root") || !strings.Contains(n.SystemName, "fake-log-line") {
+		t.Errorf("SystemName lost readable text: %q", n.SystemName)
+	}
+	if strings.ContainsAny(n.PortID, "\x1b\n") {
+		t.Errorf("PortID still carries ESC/LF: %q", n.PortID)
+	}
+	if !strings.HasPrefix(n.ChassisID, "host") {
+		t.Errorf("ChassisID lost readable text: %q", n.ChassisID)
+	}
+}
+
+// TestParseTLVs_CleanStringsUnchanged is the negative control for #4043: a
+// frame whose TLV strings contain no control characters is stored verbatim, so
+// the sanitizer never mangles a normal neighbor name.
+func TestParseTLVs_CleanStringsUnchanged(t *testing.T) {
+	mac := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
+	data := concat(
+		mustEncodeTLV(tlvChassisID, encodeChassisID(mac)),
+		mustEncodeTLV(tlvPortID, encodePortID("ge-0/0/1")),
+		mustEncodeTLV(tlvTTL, encodeTTL(120)),
+		mustEncodeTLV(tlvSystemName, []byte("switch-core-1")),
+		mustEncodeTLV(tlvSystemDesc, []byte("Juniper EX4300")),
+		mustEncodeTLV(tlvPortDesc, []byte("uplink to spine")),
+		mustEncodeTLV(tlvEnd, nil),
+	)
+	n := ParseTLVs(data)
+	if n == nil {
+		t.Fatal("ParseTLVs returned nil for a valid clean frame")
+	}
+	if n.PortID != "ge-0/0/1" {
+		t.Errorf("PortID: got %q, want %q", n.PortID, "ge-0/0/1")
+	}
+	if n.SystemName != "switch-core-1" {
+		t.Errorf("SystemName: got %q, want %q", n.SystemName, "switch-core-1")
+	}
+	if n.SystemDesc != "Juniper EX4300" {
+		t.Errorf("SystemDesc: got %q, want %q", n.SystemDesc, "Juniper EX4300")
+	}
+	if n.PortDesc != "uplink to spine" {
+		t.Errorf("PortDesc: got %q, want %q", n.PortDesc, "uplink to spine")
+	}
+}
+
 func concat(parts ...[]byte) []byte {
 	var out []byte
 	for _, p := range parts {
@@ -424,4 +549,146 @@ func TestStopIdempotent(t *testing.T) {
 	m := New()
 	m.Stop() // should not panic
 	m.Stop() // double stop should be fine
+}
+
+// mkNeighbor builds a Neighbor for the cap tests.
+func mkNeighbor(iface, chassis, port string) *Neighbor {
+	return &Neighbor{
+		ChassisID: chassis,
+		PortID:    port,
+		TTL:       120,
+		Interface: iface,
+		LastSeen:  time.Now(),
+		ExpiresAt: time.Now().Add(120 * time.Second),
+	}
+}
+
+func neighborKey(iface, chassis, port string) string {
+	return fmt.Sprintf("%s/%s/%s", iface, chassis, port)
+}
+
+// TestLearnNeighborCapPerInterface is the fail-on-revert unit test for the
+// #4044 neighbor-table cap. It asserts:
+//   - exactly maxNeighborsPerInterface distinct neighbors are admitted on one
+//     interface;
+//   - a genuinely NEW neighbor past the cap is DROPPED (returns false) and does
+//     not grow the table (so a flood of distinct spoofed ids cannot OOM the
+//     daemon);
+//   - a refresh of an already-known key still succeeds at the cap and updates in
+//     place without growing the table (an established neighbor's periodic
+//     re-advertisement is never dropped);
+//   - the cap is PER INTERFACE — a second interface has its own budget.
+//
+// On revert (learnNeighbor storing unconditionally) the over-cap add grows the
+// table to cap+1, so the bounded-length assertions fail.
+func TestLearnNeighborCapPerInterface(t *testing.T) {
+	m := New()
+
+	// Fill eth0 exactly to the cap. Every add is a distinct new key.
+	for i := 0; i < maxNeighborsPerInterface; i++ {
+		chassis := fmt.Sprintf("02:00:00:00:00:%02x", i)
+		if !m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
+			t.Fatalf("add %d within cap should be admitted", i)
+		}
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
+		t.Fatalf("after filling to cap: got %d neighbors, want %d", got, maxNeighborsPerInterface)
+	}
+
+	// One more DISTINCT neighbor on eth0 must be dropped, not stored.
+	overChassis := "02:00:00:00:ff:ff"
+	if m.learnNeighbor(neighborKey("eth0", overChassis, "p"), mkNeighbor("eth0", overChassis, "p")) {
+		t.Fatal("a new neighbor past the per-interface cap must be dropped (returned true)")
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
+		t.Fatalf("table grew past the cap: got %d, want %d", got, maxNeighborsPerInterface)
+	}
+
+	// A refresh of an EXISTING key must still be accepted at the cap and update
+	// in place (no growth). Bump the TTL so we can confirm the update landed.
+	refreshChassis := "02:00:00:00:00:00"
+	refreshed := mkNeighbor("eth0", refreshChassis, "p")
+	refreshed.TTL = 999
+	if !m.learnNeighbor(neighborKey("eth0", refreshChassis, "p"), refreshed) {
+		t.Fatal("a refresh of an existing neighbor must be accepted even at the cap")
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
+		t.Fatalf("refresh must not grow the table: got %d, want %d", got, maxNeighborsPerInterface)
+	}
+	m.mu.RLock()
+	gotTTL := m.neighbors[neighborKey("eth0", refreshChassis, "p")].TTL
+	m.mu.RUnlock()
+	if gotTTL != 999 {
+		t.Fatalf("refresh did not update in place: TTL got %d, want 999", gotTTL)
+	}
+
+	// The cap is per interface: a neighbor on eth1 has its own budget.
+	if !m.learnNeighbor(neighborKey("eth1", "02:00:00:00:01:00", "p"), mkNeighbor("eth1", "02:00:00:00:01:00", "p")) {
+		t.Fatal("a neighbor on a different interface must be admitted (cap is per-interface)")
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface+1 {
+		t.Fatalf("per-interface cap should allow eth1 entry: got %d, want %d", got, maxNeighborsPerInterface+1)
+	}
+}
+
+// captureHandler is a slog.Handler that records emitted records for assertions.
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.records = append(h.records, r.Clone())
+	h.mu.Unlock()
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestLearnNeighborCapWarnsRateLimited asserts the cap fires a warn when a new
+// neighbor is dropped, and that the warn is rate-limited to once per interval
+// per interface so an ongoing flood cannot flood the log too (#4044).
+func TestLearnNeighborCapWarnsRateLimited(t *testing.T) {
+	h := &captureHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	m := New()
+	// Fill to the cap (no drops, no warns yet).
+	for i := 0; i < maxNeighborsPerInterface; i++ {
+		chassis := fmt.Sprintf("02:00:00:00:00:%02x", i)
+		m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p"))
+	}
+	// Now drop 10 distinct new neighbors past the cap.
+	for i := 0; i < 10; i++ {
+		chassis := fmt.Sprintf("02:00:00:00:aa:%02x", i)
+		if m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
+			t.Fatalf("over-cap add %d should have been dropped", i)
+		}
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	warns := 0
+	var lastIface string
+	for _, r := range h.records {
+		if r.Level == slog.LevelWarn && strings.Contains(r.Message, "neighbor table full") {
+			warns++
+			r.Attrs(func(a slog.Attr) bool {
+				if a.Key == "interface" {
+					lastIface = a.Value.String()
+				}
+				return true
+			})
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("expected exactly 1 rate-limited cap warn for 10 drops, got %d", warns)
+	}
+	if lastIface != "eth0" {
+		t.Fatalf("cap warn carried interface %q, want eth0", lastIface)
+	}
 }

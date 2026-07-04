@@ -440,7 +440,8 @@ type Daemon struct {
 	fabricPeerIP1    net.IP        // secondary fabric peer IP
 	fabricPopulated  bool          // true after first successful fab0 write
 	fabric1Populated bool          // true after first successful fab1 write
-	fabricRefreshCh  chan struct{} // triggers immediate fabric_fwd refresh
+	fabricRefreshCh  chan struct{} // wakes the fab0 populateFabricFwd loop
+	fabricRefreshCh1 chan struct{} // wakes the fab1 populateFabricFwd1 loop (#4038)
 	lastFabricProbe  time.Time     // rate-limit active fab0 neighbor probes
 	lastFabricProbe1 time.Time     // rate-limit active fab1 neighbor probes
 	lastFabricLog0   time.Time     // rate-limit fab0 refresh failure logs

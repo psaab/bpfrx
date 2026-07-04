@@ -375,6 +375,80 @@ func TestRxLoopBackoffInterruptedByCancel(t *testing.T) {
 	}
 }
 
+// TestRxLoopBoundsNeighborTableUnderFlood is the end-to-end fail-on-revert
+// regression test for the #4044 unbounded-neighbor-table DoS. It drives the
+// real receive path (rxLoop) through the recvFn seam with a flood of
+// maxNeighborsPerInterface+50 LLDP frames, each carrying a DISTINCT chassis id
+// (distinct source MAC) so every frame is a genuinely new neighbor. The
+// per-interface cap must bound the table at exactly maxNeighborsPerInterface no
+// matter how many distinct-id frames arrive.
+//
+// Non-tautological / fail-on-revert: with the cap removed (rxLoop storing every
+// learned neighbor unconditionally, the pre-#4044 behavior) all flood frames
+// are stored and the table grows to flood == cap+50, so the bounded assertion
+// fails. The flood advertises a large TTL, so expiryLoop cannot mask the growth.
+func TestRxLoopBoundsNeighborTableUnderFlood(t *testing.T) {
+	const flood = maxNeighborsPerInterface + 50
+
+	frames := make([][]byte, flood)
+	for i := range frames {
+		// Distinct source MAC per frame => distinct chassis id => distinct key.
+		mac := net.HardwareAddr{0x02, 0x00, 0x00, byte(i >> 16), byte(i >> 8), byte(i)}
+		f, err := BuildFrame(mac, "flood0", 3600, "attacker", "")
+		if err != nil {
+			t.Fatalf("BuildFrame %d: %v", i, err)
+		}
+		frames[i] = f
+	}
+
+	var idx int32
+	allDelivered := make(chan struct{})
+	var once sync.Once
+	gate := make(chan struct{})
+	sess := &ifSession{
+		iface: &net.Interface{Name: "flood0", Index: 1},
+		recvFn: func(buf []byte) (int, int, error) {
+			i := int(atomic.AddInt32(&idx, 1)) - 1
+			if i < flood {
+				return copy(buf, frames[i]), unix.PACKET_HOST, nil
+			}
+			// recv is re-entered only after the previous frame is fully
+			// processed, so by this call all `flood` frames are learned.
+			once.Do(func() { close(allDelivered) })
+			<-gate
+			return 0, 0, unix.EBADF
+		},
+	}
+
+	m := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		m.rxLoop(ctx, sess)
+		close(loopDone)
+	}()
+
+	select {
+	case <-allDelivered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rxLoop did not consume all flood frames within 5s")
+	}
+
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
+		t.Fatalf("neighbor table not bounded under flood: got %d neighbors, want cap %d "+
+			"(revert removes the cap and the table grows to %d)",
+			got, maxNeighborsPerInterface, flood)
+	}
+
+	cancel()
+	close(gate)
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rxLoop did not exit after ctx cancellation")
+	}
+}
+
 // TestApplySkipsInterfaceOnSocketError verifies that a session construction
 // failure (e.g. CAP_NET_RAW missing) is surfaced at Apply time by skipping the
 // interface, and that Stop() afterwards is still a clean no-op.

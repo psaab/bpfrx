@@ -2,7 +2,8 @@
 
 IEEE 802.1AB Link Layer Discovery Protocol. Sends periodic LLDP frames
 out unmanaged interfaces, receives neighbor announcements, and ages
-entries by TTL.
+entries by TTL. The received-neighbor table is bounded per interface so a
+frame flood cannot exhaust memory (#4044).
 
 ## Entry points
 
@@ -125,3 +126,41 @@ Two properties keep this safe (#2372 review findings 3 + 6):
   rejected rather than cached under an empty `ifname//` key with TTL 0
   (#2551). A valid 2-byte TTL of 0 is a legitimate shutdown advert and is
   still accepted (the gate is "the TLV parsed", not "TTL != 0").
+- **Bounded neighbor table (#4044):** LLDP is unauthenticated L2 — any
+  station on the segment can flood frames carrying arbitrary (spoofed)
+  chassis-id / port-id pairs, one distinct neighbor entry per distinct
+  pair, and a switching loop can multiply frames. Left unbounded the
+  table grew until the daemon was OOM-killed (an L2-local DoS);
+  `expiryLoop` reaps only *expired* entries every 10s, so a flood faster
+  than the reap interval — or advertising a large TTL — grew the table
+  without bound between reaps. The receive path routes every learned
+  neighbor through `learnNeighbor` (`lldp.go`), which caps the table at
+  `maxNeighborsPerInterface` (64) **per local interface**: a refresh of an
+  already-known `ifname/chassis/port` key always updates in place (never
+  grows the map, so an established neighbor's re-advertisements are never
+  dropped), but a genuinely new neighbor past the cap is **dropped** with a
+  warn rate-limited to once per 60s per interface (so the flood floods
+  neither the table nor the log). A real switch port sees one, maybe a
+  handful, of neighbors, so 64 is far above any legitimate topology; the
+  effective global bound is the cap times the operator-configured
+  LLDP-enabled interface count, so no separate global cap is needed.
+  `expiryLoop` still reaps aged-out entries, so once a transient flood
+  stops the table shrinks back below the cap and new legitimate neighbors
+  are admitted again. Because the table is bounded at the cap per
+  interface, the per-interface count on the new-neighbor path iterates a
+  small, bounded set. The warn dampener is reset alongside the neighbor
+  table in `Stop()`, so a fresh `Apply` generation warns again.
+- **Control-char sanitization on receive (#4043):** LLDP is an
+  unauthenticated L2 protocol — any device on the segment can craft a frame
+  whose free-text TLVs carry ANSI escape sequences, CR/LF, or other control
+  characters. `ParseTLVs` runs every operator-visible received string
+  (system-name, system-description, port-description, port-id, and the
+  non-MAC chassis-id) through `sanitizeTLVString` at the store boundary
+  before it lands in the neighbor table, so both the expiry log line and the
+  `show lldp neighbors` table read already-clean strings. Each Unicode
+  control rune (C0 `0x00-0x1F` including ESC/CR/LF, DEL `0x7F`, and C1
+  `0x80-0x9F`) is replaced by a space; a legitimate multi-byte UTF-8 name is
+  preserved unchanged (`strings.Map` is rune-aware). This is the
+  LLDP-receive counterpart of the #1798/#3900 free-text sanitizer and
+  neutralizes terminal-escape spoofing (`show lldp neighbors`) and syslog
+  log-injection (a forged/split log line) from a hostile neighbor.

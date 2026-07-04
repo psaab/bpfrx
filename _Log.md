@@ -32,6 +32,66 @@
   - **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
     userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
     userspace-dp/src/afxdp/tx/README.md, _Log.md
+## 2026-07-03 — #4044: the LLDP received-neighbor table was unbounded → an LLDP frame flood (many spoofed chassis/port ids) grew it without limit → OOM (L2 DoS)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-177 (MEDIUM, DoS — unbounded LLDP neighbor
+    table). LLDP is an unauthenticated L2 protocol; any device on the segment
+    can send frames carrying arbitrary (spoofed) chassis-id / port-id pairs,
+    one distinct neighbor entry per distinct pair. `rxLoop` stored every
+    learned frame unconditionally (`m.neighbors[key] = neighbor`), so a flood
+    of distinct-id frames grew the map without bound until the daemon was
+    OOM-killed. `expiryLoop` reaps only *expired* entries every 10s, so a flood
+    faster than the reap interval — or advertising a large TTL — grew the table
+    unbounded between reaps.
+  - **Fix**: bounded the table per local interface. The receive path now routes
+    every learned neighbor through `learnNeighbor`, which caps at
+    `maxNeighborsPerInterface` (64) per interface: a refresh of an already-known
+    `ifname/chassis/port` key updates in place (never grows the map, so an
+    established neighbor's re-advertisements are never dropped), and a genuinely
+    new neighbor past the cap is DROPPED with a warn rate-limited to once per
+    60s per interface (so the flood floods neither the table nor the log). The
+    effective global bound is the cap times the operator-configured
+    LLDP-enabled interface count, so no separate global cap is needed.
+    `expiryLoop` still reaps aged-out entries, so once a transient flood stops
+    the table shrinks back below the cap. The warn dampener is reset alongside
+    the neighbor table in `Stop()`.
+  - **File(s)**: pkg/lldp/lldp.go, pkg/lldp/lldp_test.go,
+    pkg/lldp/socket_test.go, pkg/lldp/README.md
+  - **Validation**: `go test -race ./pkg/lldp/...` green; new
+    `TestLearnNeighborCapPerInterface` (cap/refresh/per-interface budget, RED on
+    revert), `TestLearnNeighborCapWarnsRateLimited` (exactly one warn for 10
+    drops), and `TestRxLoopBoundsNeighborTableUnderFlood` (real receive path,
+    cap+50 distinct-id frames bounded at the cap — grows to 114 on revert). All
+    three verified RED with the cap disabled. `go build ./...`, `gofmt`,
+    `go vet` clean.
+
+## 2026-07-03 — #4043: received LLDP TLV strings logged/displayed without control-char sanitization → ANSI-escape / CRLF log-injection from a crafted L2 frame
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-178 (MEDIUM, security — log/terminal
+    injection via LLDP). LLDP is an unauthenticated L2 protocol; any device on
+    the segment can send a frame whose free-text TLVs (system-name,
+    system-description, port-description, port-id, non-MAC chassis-id) carry
+    ANSI escape sequences, CR/LF, or other control characters. `ParseTLVs`
+    stored those strings verbatim in the neighbor table, so `expiryLoop`'s log
+    line and the `show lldp neighbors` table (both grpcapi and CLI) emitted the
+    raw bytes — cursor/screen ANSI spoofing on an operator terminal and
+    forged/split syslog lines (log injection).
+  - **Fix**: added `sanitizeTLVString` (rune-aware `strings.Map` +
+    `unicode.IsControl`, replacing every C0/C1/DEL control rune with a space,
+    preserving legitimate multi-byte UTF-8) and applied it at the parse/store
+    boundary in `ParseTLVs` for all five wire-sourced operator-visible fields.
+    Sanitizing at store means the neighbor table holds clean strings, so the
+    log AND both show paths read already-sanitized values from one chokepoint.
+    This is the LLDP-receive counterpart of the #1798/#3900 free-text
+    control-char sanitizer.
+  - **File(s)**: pkg/lldp/lldp.go, pkg/lldp/lldp_test.go, pkg/lldp/README.md
+  - **Validation**: `go test ./pkg/lldp/...` green; new `TestSanitizeTLVString`
+    (table-driven helper unit test) + `TestParseTLVs_SanitizesControlChars`
+    (end-to-end store boundary, RED-on-revert across all five fields) +
+    `TestParseTLVs_CleanStringsUnchanged` (negative control — a clean name is
+    stored verbatim). `go build ./...`, `gofmt`, `go vet` clean.
 
 ## 2026-07-03 — #4034: a non-fatal error in the tail of the config apply path skipped syncConfigToPeer → the standby never got the committed config (HA divergence)
 
@@ -100,6 +160,38 @@
     `TestSleepCtx*` (RED-on-revert: retry loop honours ctx cancel instead of
     spinning the full 60s budget). Full `pkg/cluster` + `pkg/daemon` suites
     green with `-race`. test-failover WARRANTED (HA heartbeat) — batch-validate.
+## 2026-07-03 — #4036: control-socket fixed 3s deadline false-times-out a large (up to 64MB) apply_snapshot (fable-161 F-182)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the userspace-dp control-socket round-trip
+    (`requestDetailedLocked`) using a FIXED 3s read/write deadline for EVERY
+    request type. An `apply_snapshot` can be up to `MaxControlRequestBytes`
+    (64 MiB, #2744) of feed-backed address-book CIDR text; the Rust helper
+    receives+decodes+APPLIES the whole body (LPM tables, binding plan, AF_XDP
+    reconcile) before replying, which can exceed 3s → Go's `Decode` timed out
+    and reported the apply FAILED while the helper had actually applied it and
+    the dataplane was forwarding live with the new config (spurious commit
+    failure / needless rollback / false HA dp-failure).
+  - **Fix**: new pure helper `controlRoundtripDeadline(bodyLen)` sizes the
+    deadline to the serialized request length — historical 3s base for any
+    sub-1-MiB request (status poll and small forwarding/HA/session requests
+    unchanged, poll stays responsive per #182), +1s per mebibyte, capped at
+    120s. 64 MiB → 3s+64s = 67s. Computed from the same `len(body)` the #2744
+    pre-flight already serializes (no extra marshal). The dedicated
+    session-sync socket keeps the flat 3s (small per-session installs; bulk
+    export/drain run over the main socket and get the scaled deadline).
+  - **Tests**: `control_socket_deadline_4036_test.go` — pins the sizing math
+    (small=base, per-MiB scaling, 120s cap, monotone); a fail-on-revert
+    round-trip where a mock helper drains a >=3 MiB apply_snapshot then sleeps
+    3.5s (> old 3s, < scaled 6s) before replying OK; and a hung-helper case
+    that still times out at the base deadline. RED-on-revert verified: with the
+    deadline reverted to a fixed 3s the large-apply test FAILS at 3.01s
+    ("i/o timeout") while the math + hung tests stay green.
+  - **File(s)**: `pkg/dataplane/userspace/process.go`,
+    `pkg/dataplane/userspace/control_socket_deadline_4036_test.go`,
+    `docs/userspace-dataplane-architecture.md`
+  - **Follow-up**: no HA state/session-sync code touched (deadline sizing only)
+    — test-failover not warranted.
 
 ## 2026-07-03 — #4031: monitorFabricState exits + leaks sibling netlink socket on ENOBUFS (fable-161 F-167)
 
@@ -31440,3 +31532,27 @@ top.
     test/incus/test-active-active.sh, test/incus/test-restart-connectivity.sh,
     test/incus/test-private-rg.sh, Makefile, docs/engineering-style.md,
     CLAUDE.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4038 — dual-fabric refresh: give fab1 its own refresh
+    channel. Dual-fabric (fabric-link + fabric-link-1) IS supported
+    (`populateFabricFwd1` launched from `startClusterComms` when
+    `cc.Fabric1Interface`/`Fabric1PeerAddress` are set). The fab0 loop
+    (`populateFabricFwd`) and fab1 loop (`populateFabricFwd1`) both
+    selected on ONE shared `fabricRefreshCh` (cap 1). `monitorFabricState`
+    does not tag events per fabric, so `triggerFabricRefresh()`'s single
+    non-blocking send was received by exactly ONE waiting goroutine —
+    fab0 OR fab1, whichever won the race — and the other fabric's
+    link/neighbor event was dropped until its 30s safety-net tick,
+    degrading the second fabric's sub-second convergence. Fix: add
+    `fabricRefreshCh1`; fab1 reads it; `triggerFabricRefresh()` signals
+    BOTH channels (non-blocking; a nil fab1 channel in single-fabric mode
+    falls through `default`). Mirrors the synchronous `RefreshFabricFwd()`,
+    which already refreshes both entries. RED-on-revert: dropping the fab1
+    send makes `TestTriggerFabricRefreshWakesBothFabrics` fail on the fab1
+    assertion. Validated: gofmt/vet clean, `go build ./...`, and
+    `go test -race ./pkg/daemon/... ./pkg/cluster/...` all green.
+    test-failover WARRANTED (HA fabric) — batch-validate.
+  - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_fabric.go,
+    pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_fabric_test.go,
+    docs/fabric-cross-chassis-fwd.md, _Log.md

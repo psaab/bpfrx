@@ -783,8 +783,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				go d.runDHCPLeaseSyncLoop(commsCtx)
 			}
 
-			// Initialize fabric refresh channel for event-driven updates (#124).
+			// Initialize per-fabric refresh channels for event-driven
+			// updates (#124). Each fabric owns its own channel so a
+			// single netlink-triggered refresh wakes both the fab0 and
+			// fab1 loops rather than only whichever won a shared-channel
+			// receive (#4038).
 			d.fabricRefreshCh = make(chan struct{}, 1)
+			d.fabricRefreshCh1 = make(chan struct{}, 1)
 
 			// Populate fabric_fwd BPF map for cross-chassis redirect,
 			// then periodically refresh to correct neighbor drift.
