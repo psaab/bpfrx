@@ -35,6 +35,45 @@
   - **File(s)**: scripts/image/bake.py,
     scripts/image/test_bake_sign_ordering.py, docs/install-images.md,
     _Log.md
+## 2026-07-03 — #4011: tx/kick latency cross-thread skew tests were load-sensitive timing flakes (fable-161 F-091 residual)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Made `tx_latency_hist_cross_thread_snapshot_skew_within_bound`
+    and its sibling `tx_kick_latency_cross_thread_snapshot_skew_within_bound`
+    deterministic (Option 2). Surfaced by #4006 wiring the Rust suite into
+    `make test`: the old bound `K_skew = ceil(λ_obs × W_read_max) + 2` (and the
+    kick variant `×2 + 4`) coupled the AVERAGE writer rate (count_final /
+    elapsed_wall) with the MAXIMUM reader snapshot window. When a single
+    snapshot window's INSTANTANEOUS writer rate ran above the run-average
+    (routine under scheduler jitter on a loaded box — 4 qemu VMs + agy), the
+    true, legitimately-bounded skew could exceed the modelled K_skew → the pin
+    tripped (3463 passed / 1 failed under load; 3/3 in isolation), making
+    `make test` itself flaky.
+  - **Fix**: replaced the wall-clock λ×W model with a per-sample,
+    directly-MEASURED bound. The writer increments the histogram bucket before
+    `count` (stats.rs record_tx_completions_with_stamp / record_kick_latency)
+    and the reader reads the histogram before `count` (snapshot.rs); both
+    counters are monotonic. The reader now brackets each `snapshot()` with a raw
+    `count` load before and after, so `window_delta = count_after −
+    count_before` is exactly how many records the writer published during THAT
+    snapshot's read window — the only records that can make `sum(hist)` and
+    `count` disagree for that sample. Assert per sample `|sum − count| ≤
+    window_delta + K_MARGIN`, K_MARGIN = 2 (the proven +1 in-flight boundary
+    under TSO's single sequential writer plus one unit of weak-memory reorder
+    slack). Load-independent: window_delta self-scales with whatever the writer
+    did during a preempted read. Still catches the real defect — a
+    dropped/torn bucket or count increment drives skew toward count_final
+    (millions), unbounded relative to any single window_delta → loud failure.
+    Removed the `Instant::now()`/`elapsed()`/λ_obs/max_w_read machinery
+    (the warmup-wait `Instant`/`Duration` stay). Live-source runtime-contract
+    comments in profile.rs/stats.rs (`|sum − count| ≤ K_skew`) unchanged — the
+    data-structure contract is unchanged; only the test methodology changed.
+  - **Validation**: both tests green in isolation (max_excess=1 vs K_MARGIN=2
+    with max_window_delta=1110 observed on a heavily-preempted reader window —
+    the old model would have blown that window). Under-load loop 30/30 green
+    while the box was contended by a parallel `cargo build` + `yes`. FULL
+    `cargo test --release --test-threads=1` green. `go build ./...` green.
+  - **File(s)**: userspace-dp/src/afxdp/umem/tests.rs, _Log.md
 
 ## 2026-07-03 — #4013: SNMP ifTable GETBULK/GETNEXT read the interface list (a full netlink LinkList) TWICE per returned varbind → O(N)/O(N²) RTM_GETLINK storm per SNMP walk
 
@@ -31057,3 +31096,28 @@ top.
     Quick Start, docs/testing.md, docs/testing-procedures.md.
   - **File(s)**: Makefile, README.md, CLAUDE.md, docs/testing.md,
     docs/testing-procedures.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fix inverted IPsec `df-bit set`/`df-bit clear` action (#4015).
+    Traced the whole path — config parse → compile (`compiler_ipsec.go`
+    stores `DFBit` verbatim) → strongSwan config generation
+    (`pkg/ipsec/policy.go`). The df-bit action is applied entirely in Go via
+    strongSwan `copy_df`; NO Rust dataplane involvement (the only Rust DF
+    logic is NAT64, unrelated). strongSwan `copy_df`: `yes` (default) copies
+    the inner DF to the outer header (= Junos `copy`); `no` forces the outer
+    DF to 0 (= Junos `clear`, allow fragmentation). The old mapping emitted
+    `copy_df = no` for `set` (which CLEARS DF) and let `clear` fall through
+    to the default `copy_df = yes` (which COPIES/preserves DF) — set and
+    clear were inverted. Impact: `df-bit clear` (intended to allow
+    fragmentation into a tunnel) instead preserved/set DF → PMTUD blackhole
+    for oversized packets. Fix: single-point switch — `copy`/`set` →
+    `copy_df = yes` (strongSwan cannot force DF=1; copy_df=yes is the
+    DF-preserving/PMTUD behavior), `clear` → `copy_df = no`. Updated the
+    existing `TestGenerateConfig_DFBit` to encode the correct mapping
+    (RED-on-revert: `set`/`clear` subtests fail on the old branch) and added
+    `TestIPsecDFBitSetSyntaxCompile` (ParseSetCommand + tree.SetPath compile
+    leg). Schema desc `(copy|set)` → `(copy|set|clear)`; docs/phases.md
+    df-bit entry expanded to all three modes.
+  - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/ipsec_test.go,
+    pkg/config/parser_security_test.go, pkg/config/schema_security.go,
+    docs/phases.md, _Log.md

@@ -834,7 +834,7 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 - **DataPlane interface update:** `SetApplication()` signature extended with `srcPortLow, srcPortHigh uint16`; eBPF + DPDK parity
 
 ### IPsec Enhancements
-- **df-bit copy:** `set security ipsec vpn X df-bit copy` → strongSwan `copy_df=yes` / `fragmentation=yes`
+- **df-bit (copy|set|clear):** `set security ipsec vpn X df-bit <mode>` → strongSwan `copy_df`. `copy` and `set` → `copy_df=yes` (outer DF copied from / preserved with inner; strongSwan cannot force outer DF=1, so `set` keeps PMTUD rather than clearing DF). `clear` → `copy_df=no` (outer DF forced to 0 — allow fragmentation of oversized packets into the tunnel). #4015 fixed a set/clear inversion where `set` emitted `copy_df=no` (clearing DF) and `clear` fell through to the default (`copy_df=yes`).
 - **establish-tunnels immediately:** Auto-establish at boot → strongSwan `auto=start` (vs `auto=route`)
 - **IKE gateway dynamic hostname:** DNS hostname for peer → strongSwan `right=hostname`
 - **IKE gateway local-address:** Explicit local address → strongSwan `left=X.X.X.X`
