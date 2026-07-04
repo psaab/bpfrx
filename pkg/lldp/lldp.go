@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/linuxsock"
 	"golang.org/x/sys/unix"
 )
@@ -129,6 +130,11 @@ type ifSession struct {
 	// it nil.
 	recvFn func(buf []byte) (int, int, error)
 }
+
+// interfaceByNameFn is the interface-resolution seam. Tests override it to
+// assert Apply resolves the kernel (dash-form) device name before the lookup,
+// and to avoid depending on a host device being present.
+var interfaceByNameFn = net.InterfaceByName
 
 // newIfSessionFn is the construction seam for ifSession. Tests override it to
 // inject a socketpair(2)-backed session so the Stop-unblocks-recv contract can
@@ -255,9 +261,17 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 		if lldpIf.Disable {
 			continue
 		}
-		iface, err := net.InterfaceByName(lldpIf.Name)
+		// Config interfaces carry Junos display names (ge-0/0/0, reth0.50);
+		// xpfd renames the kernel device to dash form (ge-0-0-0) via .link
+		// files, so net.InterfaceByName must be handed the kernel name — a
+		// slash never appears in a kernel ifname and the lookup would fail,
+		// silently skipping LLDP on exactly the renamed data ports. LinuxIfName
+		// is a no-op on a name that is already kernel-form (no slash).
+		kernelName := config.LinuxIfName(lldpIf.Name)
+		iface, err := interfaceByNameFn(kernelName)
 		if err != nil {
-			slog.Warn("LLDP: interface not found", "interface", lldpIf.Name, "err", err)
+			slog.Warn("LLDP: interface not found", "interface", lldpIf.Name,
+				"kernel", kernelName, "err", err)
 			continue
 		}
 
