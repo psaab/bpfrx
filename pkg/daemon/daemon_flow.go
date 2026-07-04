@@ -214,20 +214,6 @@ func parseSrcPort(addr string) uint16 {
 	return 0
 }
 
-func parseProtocol(proto string) uint8 {
-	switch proto {
-	case "TCP":
-		return 6
-	case "UDP":
-		return 17
-	case "ICMP":
-		return 1
-	case "ICMPv6":
-		return 58
-	}
-	return 0
-}
-
 // archiveConfig transfers the active config to remote archive sites
 // when system { archival { configuration { transfer-on-commit; } } } is set.
 //

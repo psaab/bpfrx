@@ -848,11 +848,17 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		e.routeMaskUnresolved.Add(maskMisses)
 	}
 	fr := FlowRecord{
-		SrcIP:    evt.SrcIP,
-		DstIP:    evt.DstIP,
-		SrcPort:  evt.SrcPort,
-		DstPort:  evt.DstPort,
-		Protocol: evt.Protocol,
+		SrcIP:   evt.SrcIP,
+		DstIP:   evt.DstIP,
+		SrcPort: evt.SrcPort,
+		DstPort: evt.DstPort,
+		// #3939: source protocolIdentifier (IE 4) from the record's raw numeric
+		// IP protocol (rec.ProtocolNum, 0-255) — NOT a protocol-NAME re-lookup.
+		// The daemon callback derived evt.Protocol via a name table that only
+		// covered TCP/UDP/ICMP/ICMPv6, so GRE (47), ESP (50), AH (51) and every
+		// other protocol exported as 0 and were misattributed at the collector.
+		// rec.ProtocolNum is the authoritative number the dataplane stamped.
+		Protocol: rec.ProtocolNum,
 		Packets:  rec.SessionPkts,
 		Bytes:    rec.SessionBytes,
 		// #3746: RFC 5103 biflow reverse (server→client) volume. Since #2501

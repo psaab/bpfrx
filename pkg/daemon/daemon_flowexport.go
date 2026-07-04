@@ -467,9 +467,15 @@ func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 		return
 	}
 	sd := flowexport.SessionCloseData{
-		SrcPort:  parseSrcPort(rec.SrcAddr),
-		DstPort:  parseSrcPort(rec.DstAddr),
-		Protocol: parseProtocol(rec.Protocol),
+		SrcPort: parseSrcPort(rec.SrcAddr),
+		DstPort: parseSrcPort(rec.DstAddr),
+		// #3939: carry the record's raw numeric IP protocol (rec.ProtocolNum,
+		// 0-255) verbatim. The prior parseProtocol(rec.Protocol) name lookup
+		// only covered TCP/UDP/ICMP/ICMPv6, so GRE/ESP/AH and every other
+		// protocol collapsed to 0. The exporter sources protocolIdentifier from
+		// rec.ProtocolNum directly; keeping sd.Protocol consistent here also
+		// fixes the flowStartTime duration heuristic for non-TCP protocols.
+		Protocol: rec.ProtocolNum,
 		// #2749: ingress ifindex (SNMP ifIndex) for the NetFlow v9
 		// ingressInterface field; carried on the close frame since #2615.
 		InIf: rec.IngressIfindex,
@@ -521,9 +527,12 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 		return
 	}
 	sd := flowexport.SessionCloseData{
-		SrcPort:  parseSrcPort(rec.SrcAddr),
-		DstPort:  parseSrcPort(rec.DstAddr),
-		Protocol: parseProtocol(rec.Protocol),
+		SrcPort: parseSrcPort(rec.SrcAddr),
+		DstPort: parseSrcPort(rec.DstAddr),
+		// #3939: carry the record's raw numeric IP protocol (rec.ProtocolNum,
+		// 0-255) verbatim — see the NetFlow callback above. parseProtocol's
+		// name table dropped GRE/ESP/AH (and all non-TCP/UDP/ICMP) to 0.
+		Protocol: rec.ProtocolNum,
 		// #2749: ingress ifindex (SNMP ifIndex) for the IPFIX
 		// ingressInterface field; carried on the close frame since #2615.
 		InIf: rec.IngressIfindex,

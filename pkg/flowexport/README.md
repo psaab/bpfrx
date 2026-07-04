@@ -186,6 +186,28 @@ ingress pins in `ingress_interface_test.go`; the Rust side pins the stamping
 (`test_encode_session_close_rt_flow_v4_wire_layout`); the Go decode round-trip
 is pinned by `TestDecodeRawEventCloseCarriesCosBlock`.
 
+**#3939 — `protocolIdentifier` (IE 4) sourced from the record's numeric
+protocol, not a name re-lookup.** The exporters previously set
+`FlowRecord.Protocol` from `SessionCloseData.Protocol`, which the daemon
+callbacks filled via `parseProtocol(rec.Protocol)` — a NAME→number table that
+covered only `TCP`/`UDP`/`ICMP`/`ICMPv6`. Every other protocol (GRE 47, ESP 50,
+AH 51, and any numeric-only protocol) fell through to `0`, so a collector saw
+those tunnel/other flows all reported as protocol 0 (HOPOPT) and could not tell
+an ESP tunnel from a GRE flow — tunnel-traffic capacity/security analytics were
+wrong. The fix sources the exported `protocolIdentifier` directly from
+`EventRecord.ProtocolNum` — the raw numeric IP protocol (0-255) the dataplane
+stamps on the close frame and `pkg/logging/ringbuf.go` decodes verbatim — in
+both `ExportSessionClose` builders. The daemon callbacks now also set
+`SessionCloseData.Protocol = rec.ProtocolNum` (removing the lossy
+`parseProtocol`), which additionally corrects the non-TCP `flowStartTime`
+duration heuristic. The rendered protocol NAME (`EventRecord.Protocol`) stays a
+display-only string for `show` output; only the exported numeric field changed.
+Fail-on-revert is pinned by `protocol_num_test.go`
+(`TestNetflowProtocolIdentifierFromProtocolNum` /
+`TestIPFIXProtocolIdentifierFromProtocolNum`), which encode GRE/ESP/AH +
+TCP/UDP/ICMP and assert the wire byte equals the numeric protocol; reverting to
+the name lookup makes every case encode 0.
+
 **#3270 — `flowDirection` (IE 61) populated from the per-zone
 sampling-direction, opt-in.** flowDirection is exported again, but only when a
 template configures `export-extension flow-dir`, and the value is a REAL signal
