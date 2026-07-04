@@ -2,6 +2,7 @@ package dhcp
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -278,5 +279,161 @@ func TestRunDHCPv6RenewUsesRenewNotSolicit(t *testing.T) {
 	}
 	if got := m.LeaseFor("wan0", AFInet6); got == nil || got.Address != leaseA.Address {
 		t.Errorf("lease after renew = %v, want preserved %s", got, leaseA.Address)
+	}
+}
+
+// TestRunDHCPv4RenewingNAKRestartsDiscover pins RFC 2131 §4.4.5 (#3956): a
+// DHCPNAK received in the RENEWING state must abandon the address and
+// return to INIT (fresh DISCOVER) IMMEDIATELY — it must NOT fall through
+// to the T2 REBINDING attempt. Reverting the fix (treating a NAK like a
+// renew timeout) turns this RED: the third exchange would be a REBIND and
+// the revoked lease would still be recorded.
+func TestRunDHCPv4RenewingNAKRestartsDiscover(t *testing.T) {
+	leaseA := &Lease{
+		Interface: "wan0",
+		Family:    AFInet,
+		Address:   netip.MustParsePrefix("192.0.2.50/24"),
+		Gateway:   netip.MustParseAddr("192.0.2.1"),
+		serverID:  netip.MustParseAddr("192.0.2.1"),
+		LeaseTime: 100 * time.Second,
+	}
+
+	var modes []dhcpExchangeMode
+	var leaseAtRestart *Lease
+	gwHooks := 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	m := &Manager{
+		leases:          map[clientKey]*Lease{},
+		delegatedPDs:    map[string][]DelegatedPrefix{},
+		v4opts:          map[string]*DHCPv4Options{"wan0": {}},
+		afterForTest:    immediateAfter,
+		onGatewayChange: func() { gwHooks++ },
+	}
+	m.doV4ExchangeForTest = func(_ context.Context, _ string, mode dhcpExchangeMode, _ *Lease) (*Lease, error) {
+		modes = append(modes, mode)
+		switch len(modes) {
+		case 1: // initial acquire
+			return leaseA, nil
+		case 2: // T1 renew — server NAKs (lease revoked)
+			return nil, fmt.Errorf("DHCPv4 renew: %w", errDHCPNAK)
+		default: // must be a fresh DISCOVER, not a REBIND
+			leaseAtRestart = m.LeaseFor("wan0", AFInet)
+			cancel()
+			return nil, context.Canceled
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { m.runDHCPv4(ctx, "wan0"); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runDHCPv4 did not terminate")
+	}
+
+	want := []dhcpExchangeMode{exchangeAcquire, exchangeRenew, exchangeAcquire}
+	if len(modes) != len(want) {
+		t.Fatalf("got %d exchanges, want %d: %v", len(modes), len(want), modes)
+	}
+	for i, w := range want {
+		if modes[i] != w {
+			t.Errorf("exchange %d = %s, want %s", i, modes[i], w)
+		}
+	}
+	// The anti-regression: the exchange AFTER the RENEWING NAK is a fresh
+	// DISCOVER (INIT restart), NOT a REBIND (waiting for T2).
+	if modes[2] != exchangeAcquire {
+		t.Fatalf("post-NAK exchange = %s, want acquire (NAK must not wait for T2)", modes[2])
+	}
+	// The revoked lease must be gone by the time the client re-DISCOVERs.
+	if leaseAtRestart != nil {
+		t.Errorf("lease still recorded after RENEWING NAK = %v, want removed", leaseAtRestart)
+	}
+	if got := m.LeaseFor("wan0", AFInet); got != nil {
+		t.Errorf("lease after RENEWING NAK = %v, want nil (deconfigured)", got)
+	}
+	// Deconfigure must fire the gateway-change hook so the ip-monitoring
+	// overlay withdraws the resolved next-hop (once for the initial commit,
+	// once for the abandon).
+	if gwHooks < 2 {
+		t.Errorf("onGatewayChange fired %d times, want >=2 (commit + abandon)", gwHooks)
+	}
+}
+
+// TestRunDHCPv4RebindingNAKRestartsDiscover pins the REBINDING half of
+// RFC 2131 §4.4.5 (#3956): a renew TIMEOUT at T1 still falls through to
+// the T2 REBINDING attempt, but a DHCPNAK there abandons the address and
+// restarts DISCOVER from INIT. Reverting the fix keeps the revoked lease
+// recorded across the re-acquire.
+func TestRunDHCPv4RebindingNAKRestartsDiscover(t *testing.T) {
+	leaseA := &Lease{
+		Interface: "wan0",
+		Family:    AFInet,
+		Address:   netip.MustParsePrefix("192.0.2.50/24"),
+		Gateway:   netip.MustParseAddr("192.0.2.1"),
+		serverID:  netip.MustParseAddr("192.0.2.1"),
+		LeaseTime: 100 * time.Second,
+	}
+
+	var modes []dhcpExchangeMode
+	var leaseAtRestart *Lease
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	m := &Manager{
+		leases:       map[clientKey]*Lease{},
+		delegatedPDs: map[string][]DelegatedPrefix{},
+		v4opts:       map[string]*DHCPv4Options{"wan0": {}},
+		afterForTest: immediateAfter,
+	}
+	m.doV4ExchangeForTest = func(_ context.Context, _ string, mode dhcpExchangeMode, _ *Lease) (*Lease, error) {
+		modes = append(modes, mode)
+		switch len(modes) {
+		case 1: // initial acquire
+			return leaseA, nil
+		case 2: // T1 renew — genuine TIMEOUT, must fall through to T2
+			return nil, context.DeadlineExceeded
+		case 3: // T2 rebind — server NAKs (lease revoked)
+			return nil, fmt.Errorf("DHCPv4 rebind: %w", errDHCPNAK)
+		default: // must be a fresh DISCOVER
+			leaseAtRestart = m.LeaseFor("wan0", AFInet)
+			cancel()
+			return nil, context.Canceled
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { m.runDHCPv4(ctx, "wan0"); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runDHCPv4 did not terminate")
+	}
+
+	want := []dhcpExchangeMode{exchangeAcquire, exchangeRenew, exchangeRebind, exchangeAcquire}
+	if len(modes) != len(want) {
+		t.Fatalf("got %d exchanges, want %d: %v", len(modes), len(want), modes)
+	}
+	for i, w := range want {
+		if modes[i] != w {
+			t.Errorf("exchange %d = %s, want %s", i, modes[i], w)
+		}
+	}
+	// A timeout at T1 still reaches REBIND (unchanged from prior behavior).
+	if modes[2] != exchangeRebind {
+		t.Fatalf("post-T1-timeout exchange = %s, want rebind", modes[2])
+	}
+	// The REBINDING NAK abandons the lease before the re-DISCOVER.
+	if leaseAtRestart != nil {
+		t.Errorf("lease still recorded after REBINDING NAK = %v, want removed", leaseAtRestart)
+	}
+	if got := m.LeaseFor("wan0", AFInet); got != nil {
+		t.Errorf("lease after REBINDING NAK = %v, want nil (deconfigured)", got)
 	}
 }

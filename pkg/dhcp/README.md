@@ -102,13 +102,21 @@ the debounced `onAddressChange` callback when content changed.
   `Lease.v6ServerDUID` fields so a later RENEW can target the original
   server. DHCPv6 stateless mode has no binding, so every refresh stays
   an Information-Request regardless of mode.
-- **Only renewal failure re-acquires**: a NAK/timeout at T1 falls
-  through to the T2 rebind; a second failure (or a failure to apply
-  the renewed address) falls back to full re-acquisition — RFC 2131
-  §4.4.5 / RFC 8415 §18.2.4-5 behavior. A transient renew failure
-  retains the old lease and address until then (`docs/dns-ownership.md`).
-  Any malformed/unmatched renew is therefore fail-safe: it degrades to
-  the previous full-acquisition path, never to a worse state.
+- **Timeout falls through, NAK abandons (#3956)**: a renew *timeout*
+  (no reply) at T1 falls through to the T2 rebind; a second timeout (or
+  a failure to apply the renewed address) falls back to full
+  re-acquisition, retaining the old lease and address until then
+  (`docs/dns-ownership.md`). A DHCPNAK is different — it is an explicit
+  lease REVOCATION (the server reassigned the address or the client
+  changed subnets). Per RFC 2131 §4.4.5 a NAK in the RENEWING *or*
+  REBINDING state deconfigures the interface immediately
+  (`abandonLeaseAfterNAK`: remove the kernel address, drop the lease
+  record, fire `onGatewayChange`) and returns to INIT — a fresh DISCOVER
+  with no prior lease — rather than keeping the revoked address until
+  T2. `doDHCPv4` wraps the sentinel `errDHCPNAK` on a NAK reply so the
+  run loop distinguishes the two via `errors.Is`. A malformed/unmatched
+  timeout renew is therefore still fail-safe (degrades to the previous
+  full-acquisition path), and an explicit revocation is honored at once.
 - **Address moves are re-acquisition-equivalent**: if a renewal returns
   a different address, the old one is removed and the new one applied
   via the same netlink mechanisms the fresh-acquisition path uses.
@@ -156,13 +164,17 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   address reconciliation on DHCP-marked interfaces.
 - DHCP-learned default routes go into FRR with admin distance 200 — lower
   priority than static routes, so a configured static default wins.
-- **Lease records are NOT expired by the clock.** During a failed
-  re-acquisition (T2 rebind failed, fresh DORA in progress) the lease
-  record and the kernel address intentionally persist until replaced
-  — consumers (FRR DHCP routes, ip-monitoring resolved next-hops)
-  keep the last-known gateway. This deliberately diverges from RFC
-  2131 §4.4.5 (an expired lease should stop being used). **Coupling
-  rule (#1844):** if expiry is ever implemented, the lease-record
-  removal MUST route through a path that fires `onGatewayChange`
-  (`finishClient` already does), so the ip-monitoring overlay
+- **Lease records are NOT expired by the wall clock.** During a
+  *timeout-driven* failed re-acquisition (T2 rebind timed out, fresh
+  DORA in progress) the lease record and the kernel address
+  intentionally persist until replaced — consumers (FRR DHCP routes,
+  ip-monitoring resolved next-hops) keep the last-known gateway. This
+  deliberately diverges from RFC 2131 §4.4.5 for the *timeout* case (an
+  expired lease should stop being used). An explicit **DHCPNAK is
+  honored** (#3956): it deconfigures immediately via
+  `abandonLeaseAfterNAK` — see "Timeout falls through, NAK abandons"
+  above. **Coupling rule (#1844):** any lease-record removal (the NAK
+  path and, if clock expiry is ever implemented, that path too) MUST
+  route through a path that fires `onGatewayChange` (`finishClient` and
+  `abandonLeaseAfterNAK` both do), so the ip-monitoring overlay
   withdraws its resolved next-hop in lock-step with the address.
