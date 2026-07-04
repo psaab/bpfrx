@@ -27,8 +27,11 @@ type VRRPPacket struct {
 
 // Marshal serializes a VRRPv3 advertisement packet.
 // For IPv4, addresses are 4 bytes each; for IPv6, 16 bytes each.
-// Checksum is computed over the VRRP data only (IPv4) or with
-// a pseudo-header (IPv6).
+// Per RFC 5798 §5.2.8 the checksum is computed over an upper-layer
+// pseudo-header (source, destination, protocol 112, VRRP length) plus
+// the VRRP message for BOTH families. This is a change from VRRPv2,
+// which for IPv4 checksummed the VRRP message only (no pseudo-header).
+// Both srcIP and dstIP are therefore required for IPv4 as well as IPv6.
 func (p *VRRPPacket) Marshal(isIPv6 bool, srcIP, dstIP net.IP) ([]byte, error) {
 	addrSize := 4
 	if isIPv6 {
@@ -71,12 +74,20 @@ func (p *VRRPPacket) Marshal(isIPv6 bool, srcIP, dstIP net.IP) ([]byte, error) {
 		off += addrSize
 	}
 
-	// Compute checksum
+	// Compute checksum over the RFC 5798 §5.2.8 pseudo-header + VRRP message.
 	if isIPv6 {
-		csum := vrrpIPv6Checksum(srcIP.To16(), dstIP.To16(), buf)
+		src16, dst16 := srcIP.To16(), dstIP.To16()
+		if src16 == nil || dst16 == nil {
+			return nil, fmt.Errorf("IPv6 src/dst required for checksum")
+		}
+		csum := vrrpIPv6Checksum(src16, dst16, buf)
 		binary.BigEndian.PutUint16(buf[6:8], csum)
 	} else {
-		csum := onesComplementChecksum(buf)
+		src4, dst4 := srcIP.To4(), dstIP.To4()
+		if src4 == nil || dst4 == nil {
+			return nil, fmt.Errorf("IPv4 src/dst required for checksum")
+		}
+		csum := vrrpIPv4Checksum(src4, dst4, buf)
 		binary.BigEndian.PutUint16(buf[6:8], csum)
 	}
 
@@ -131,7 +142,33 @@ func ParseVRRPPacket(data []byte, isIPv6 bool, srcIP, dstIP net.IP) (*VRRPPacket
 			return nil, fmt.Errorf("IPv6 checksum mismatch: got 0x%04x, want 0x%04x", saved, expected)
 		}
 	} else {
-		if onesComplementChecksum(data[:expectedLen]) != 0 {
+		// RFC 5798 §5.2.8 checksums IPv4 adverts over a pseudo-header +
+		// the VRRP message (a change from VRRPv2, which had no
+		// pseudo-header). Accept the conformant pseudo-header checksum
+		// OR the legacy no-pseudo-header checksum: this lets a new node
+		// interoperate with a conformant vSRX/Cisco/keepalived-v3 peer
+		// AND with an old xpf node during a rolling upgrade. Emit only
+		// the conformant form (Marshal). The legacy accept is a
+		// migration aid that can be tightened to pseudo-header-only in a
+		// future release once all peers are upgraded.
+		saved := binary.BigEndian.Uint16(data[6:8])
+
+		// Legacy check needs the stored checksum field in place: over the
+		// VRRP message only, a correct checksum makes the sum fold to 0.
+		legacyOK := onesComplementChecksum(data[:expectedLen]) == 0
+
+		// Pseudo-header check: zero the field, recompute over the
+		// pseudo-header + message, compare against the stored value.
+		data[6] = 0
+		data[7] = 0
+		pseudoOK := false
+		if src4, dst4 := srcIP.To4(), dstIP.To4(); src4 != nil && dst4 != nil {
+			pseudoOK = vrrpIPv4Checksum(src4, dst4, data[:expectedLen]) == saved
+		}
+		data[6] = byte(saved >> 8)
+		data[7] = byte(saved)
+
+		if !pseudoOK && !legacyOK {
 			return nil, fmt.Errorf("IPv4 checksum verification failed")
 		}
 	}
@@ -156,7 +193,9 @@ func ParseVRRPPacket(data []byte, isIPv6 bool, srcIP, dstIP net.IP) (*VRRPPacket
 }
 
 // onesComplementChecksum computes the ones-complement checksum over data.
-// Used for IPv4 VRRP (checksum over VRRP data only, no pseudo-header).
+// Used to verify the legacy (VRRPv2-style, no pseudo-header) IPv4 checksum
+// during a rolling-upgrade migration window — the conformant path uses
+// vrrpIPv4Checksum.
 func onesComplementChecksum(data []byte) uint16 {
 	var sum uint32
 	for i := 0; i < len(data)-1; i += 2 {
@@ -165,6 +204,39 @@ func onesComplementChecksum(data []byte) uint16 {
 	if len(data)%2 != 0 {
 		sum += uint32(data[len(data)-1]) << 8
 	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
+// vrrpIPv4Checksum computes the VRRPv3 checksum for IPv4 with the RFC 5798
+// §5.2.8 pseudo-header. VRRPv3 (unlike VRRPv2) covers a pseudo-header of the
+// upper-layer source (4B) and destination (4B) addresses, a zero byte, the
+// protocol number (112), and the 2-byte VRRP message length, followed by the
+// VRRP message itself. src and dst must be 4-byte IPv4 slices.
+func vrrpIPv4Checksum(src, dst net.IP, payload []byte) uint16 {
+	var sum uint32
+
+	// Pseudo-header: source address (4 bytes)
+	sum += uint32(src[0])<<8 | uint32(src[1])
+	sum += uint32(src[2])<<8 | uint32(src[3])
+	// Pseudo-header: destination address (4 bytes)
+	sum += uint32(dst[0])<<8 | uint32(dst[1])
+	sum += uint32(dst[2])<<8 | uint32(dst[3])
+	// Pseudo-header: zero byte (high) + protocol 112 (low) = one 16-bit word.
+	sum += vrrpProto
+	// Pseudo-header: VRRP message length (2 bytes)
+	sum += uint32(len(payload))
+
+	// Payload (the VRRP message)
+	for i := 0; i < len(payload)-1; i += 2 {
+		sum += uint32(payload[i])<<8 | uint32(payload[i+1])
+	}
+	if len(payload)%2 != 0 {
+		sum += uint32(payload[len(payload)-1]) << 8
+	}
+
 	for sum > 0xffff {
 		sum = (sum >> 16) + (sum & 0xffff)
 	}
