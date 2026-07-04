@@ -172,3 +172,52 @@ deploy_verify_running_xpfd() {
 	fi
 	info "Verified running xpfd on $rinst matches the pushed build ($local_sum, ExecStart=$exec_path)."
 }
+
+# ── Rolling-deploy node ordering (#4009) ─────────────────────────────
+# A rolling cluster deploy must restart the SECONDARY node first (traffic
+# stays on the primary), then the primary. Getting the order wrong restarts
+# the primary while the standby is not yet upgraded/ready → a spurious
+# mid-deploy failover that masks real failover behavior in downstream smoke.
+#
+# These parsers are PURE (stdin → stdout, no incus, no info/warn/die) so the
+# selftest can exercise them offline against captured `show chassis cluster
+# status` samples.
+
+# deploy_rolling_secondary_node reads `cli -c "show chassis cluster status"`
+# output (run on node0) on stdin and echoes the node index (0 or 1) to upgrade
+# FIRST — the RG0 SECONDARY. node0's own RG0 row reports node0's role directly:
+#
+#   Redundancy group: 0 , Failover count: 0
+#   node0   200       primary        no       no       None
+#   node1   100       secondary      no       no       None
+#
+# If node0's RG0 Status is "secondary" (or "secondary-hold"), node0 is the
+# secondary and is upgraded first → echo 0. Otherwise node1 is the secondary
+# → echo 1. Defaults to 1 (node0 primary / node1 secondary — the documented
+# steady state) when RG0's node0 row is absent or unparseable.
+#
+# #4009: the legacy inline grep pattern "secondary:node0" never matched this
+# space-separated, lowercase status output, so detection ALWAYS fell through to
+# the default (node1 first). Whenever node0 was actually the RG0 secondary, the
+# deploy then restarted node1 (the PRIMARY) first → a spurious mid-deploy
+# failover. The RG number is read from the "Redundancy group: N" header so the
+# decision is scoped to RG0 even in active-active (multi-RG) layouts.
+deploy_rolling_secondary_node() {
+	awk '
+		/^Redundancy group:[[:space:]]/ { rg = $3; next }
+		(rg == "0") && ($1 == "node0") {
+			st = tolower($3)
+			if (st ~ /^secondary/) { print 0 } else { print 1 }
+			found = 1
+			exit
+		}
+		END { if (found != 1) print 1 }
+	'
+}
+
+# deploy_rolling_rg_ids reads `show chassis cluster status` on stdin and echoes
+# the redundancy-group ids present (one per line, ascending, deduplicated).
+# Used by the post-deploy node0-primary reassert to iterate every RG.
+deploy_rolling_rg_ids() {
+	awk '/^Redundancy group:[[:space:]]/ { print $3 }' | sort -n -u
+}
