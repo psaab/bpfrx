@@ -479,9 +479,18 @@ and the strict gates share ONE match-value reader: a future dual-AST divergence
 becomes a shared-test change rather than a silent drift. Coverage:
 `compiler_policy_match_ssot_4121_test.go` (flat/hier bracket, flat/hier repeated,
 hier block all read every value; the both-slots node is the fail-on-revert case).
-The optional `compiler_security.go` file-split (2357 lines) and folding
-`trafficSelectorValues` (`compiler_ipsec_trafficselector.go`) onto the shared
-reader are deferred (issue #4121 part B, low-value/high-churn).
+The `compiler_security.go` file-split (issue #4121 part B) is done: the former
+2357-line grab-bag is split into focused per-concern modules, all in package
+config, as PURE CODE MOTION (function bodies byte-identical, no behavior
+change) — `compiler_security.go` now holds only the `compileSecurity`
+dispatcher, with `compiler_security_zones.go` (zone compilation),
+`compiler_security_policy.go` (policy compilation + the shared-reader arms
+above), `compiler_security_screen.go` (screen/IDS), `compiler_security_addressbook.go`
+(global + zone-local address books), `compiler_security_log.go` (security log),
+`compiler_security_flow.go` (flow + tcp-mss + traceoptions gates), and
+`compiler_security_alg.go` (ALG). Folding `trafficSelectorValues`
+(`compiler_ipsec_trafficselector.go`) onto the shared reader remains deferred
+(the #4104 DRY note, low-value/high-churn).
 
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
