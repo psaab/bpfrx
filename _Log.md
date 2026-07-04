@@ -35,6 +35,34 @@
     no-op) — all RED on revert of the expansion pass except the no-op test.
     `go test ./pkg/config/... ./pkg/networkd/...` green, `go build ./...`,
     gofmt, vet clean.
+## 2026-07-03 — #4028: full-resync RG enumeration hardcoded 0..15 → RG >= 16 never resynced (fable-161 F-166)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed `handleEventStreamFullResync` enumerating owned
+    redundancy-groups with a hardcoded `for rgID := 0; rgID < 16` loop, which
+    silently skipped any configured RG with id >= 16. On a FullResync (a #2874
+    sequence gap / #2442 delta-ring overflow), that RG's owned sessions were
+    never re-exported to the standby → dropped on a failover of RG >= 16.
+    Verified genuine first: the `<group-id>` config slot has no validator and
+    is parsed via an unbounded `strconv.Atoi` (`compiler_system.go`), so RG
+    ids > 15 are configurable (Junos allows high RG ids).
+  - **Fix**: extracted `primaryOwnerRGIDs(cfg)`
+    (`pkg/daemon/daemon_ha_userspace.go`) — it walks
+    `cfg.Chassis.Cluster.RedundancyGroups` (the same live active config
+    `buildZoneIDs` reads, already in hand in the caller) and keeps every id the
+    node `IsLocalPrimary` for, skipping nil RG entries (#3494). This mirrors the
+    live-config enumeration the watchdog/fence paths use (`currentRedundancyGroups`,
+    #3917). `handleEventStreamFullResync` now calls it instead of the 0..15 loop.
+  - **File(s)**: `pkg/daemon/daemon_ha_userspace.go`,
+    `pkg/daemon/userspace_sync_test.go`, `docs/session-sync-architecture.md`,
+    `_Log.md`
+  - **Validation**: new `TestPrimaryOwnerRGIDsIncludesHighID` (RED-on-revert:
+    reverting the helper body to 0..15 yields `[0 1]`, dropping RG 20 → FAIL)
+    + `TestPrimaryOwnerRGIDsFollowsConfigAndOwnership` (config/ownership filter,
+    nil-RG skip, nil-cluster/nil-config → nil). `go test ./pkg/cluster/...
+    ./pkg/daemon/...` green, `-race` on the resync/enum tests green,
+    `go build ./...` + gofmt + vet clean. HA session-sync change — test-failover
+    warranted (batch-validated).
 
 ## 2026-07-03 — #4021: interface-level class-of-service binding was silently dropped (fable-161 F-028)
 

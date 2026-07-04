@@ -658,12 +658,7 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 	if cfg == nil {
 		return false
 	}
-	var rgIDs []int
-	for rgID := 0; rgID < 16; rgID++ {
-		if d.cluster.IsLocalPrimary(rgID) {
-			rgIDs = append(rgIDs, rgID)
-		}
-	}
+	rgIDs := d.primaryOwnerRGIDs(cfg)
 	if len(rgIDs) == 0 {
 		return false
 	}
@@ -864,6 +859,33 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 		}
 	}
 	return total, nil
+}
+
+// primaryOwnerRGIDs returns the redundancy-group IDs in cfg for which this node
+// is the local primary. It enumerates the ACTUAL configured redundancy groups
+// (from cfg, the same active config the zone IDs are built from) rather than a
+// hardcoded 0..15 range. Junos redundancy-group ids are not bounded to 15 (the
+// `<group-id>` config slot has no validator and is parsed via an unbounded
+// strconv.Atoi), so a hardcoded 0..15 loop silently skipped any RG with id >=
+// 16 — its owned sessions were never re-exported on a full resync, so the
+// standby never received them and they were dropped on failover of that RG
+// (#4028). Reading the configured RG set closes that hole for every id.
+// Returns nil when there is no cluster manager or the config has no cluster/RGs;
+// every caller must tolerate an empty slice. Nil RG entries (#3494) are skipped.
+func (d *Daemon) primaryOwnerRGIDs(cfg *config.Config) []int {
+	if d.cluster == nil || cfg == nil || cfg.Chassis.Cluster == nil {
+		return nil
+	}
+	var rgIDs []int
+	for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+		if rg == nil {
+			continue
+		}
+		if d.cluster.IsLocalPrimary(rg.ID) {
+			rgIDs = append(rgIDs, rg.ID)
+		}
+	}
+	return rgIDs
 }
 
 func (d *Daemon) exportUserspaceOwnerRGSessionsWithConfig(
