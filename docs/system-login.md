@@ -55,6 +55,33 @@ runtime RBAC table can never drift apart: adding a class in one place
 without the other is impossible. An empty/unset class keeps the legacy
 allow-everything behavior (no class configured = no RBAC restriction).
 
+### Command-to-permission mapping
+
+Gating is on the resolved **top-level** command word:
+
+| Command | Required permission |
+|---|---|
+| `show`, `ping`, `traceroute`, `monitor` | view |
+| `clear` | clear |
+| `request`, `test` | control |
+| `configure` | config |
+| anything else | super-user (all) |
+
+**Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
+every command is gated on the top-level word alone, but `monitor traffic`
+spawns a **root `tcpdump` live packet capture** on a data interface, so it
+is gated at the **control** level (the same bucket as the `request` /
+shell-out family) instead of the plain `view` level the rest of `monitor`
+(interface stats, security-flow trace) uses. A `read-only` / `config-viewer`
+class — intended only to VIEW config and status — is therefore **denied**
+`monitor traffic`; `operator` and `super-user` are allowed. This mirrors
+Junos, which gates `monitor traffic` behind the maintenance permission, not
+plain read-only. The exception lives in `requiredPermission`
+(`pkg/cli/permissions.go`) and resolves the subcommand with the same prefix
+matcher the dispatcher uses, so an abbreviated `monitor tr` is gated
+identically to the fully-spelled form and cannot bypass the gate. Other
+`monitor` subcommands and read-only `show` commands are unaffected.
+
 ### Generating a hash
 
 ```
