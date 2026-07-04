@@ -82,6 +82,36 @@ fn copy_frame_is_oversized(cp_len: usize) -> bool {
     cp_len > tx_frame_capacity()
 }
 
+// #4041: test-only fault injection for the direct-TX tuple-mismatch
+// diagnostic. The mismatch is a builder-bug paranoia check that a CORRECT
+// builder can never trip — `enforce_expected_ports()` in
+// `build_forwarded_frame_into_from_frame` makes the built L4 ports equal the
+// expected tuple, so `forward_tuple_mismatch_reason` always returns `None`
+// on a real frame. To exercise the single-recycle invariant on the diagnostic
+// branch (where the frame's `tx_offset` must be returned to `free_tx_frames`
+// EXACTLY once), this thread-local forces the branch. Like `FORCE_OVERSIZED`
+// above it is `#[cfg(test)]` only and DCEs out of release builds.
+#[cfg(test)]
+thread_local! {
+    static FORCE_TUPLE_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// #4041: wrapper around `forward_tuple_mismatch_reason` that lets the dispatch
+// tests force the direct-TX mismatch branch. The hot path is a single tail call
+// (the `#[cfg(test)]` block DCEs out), so release builds keep the bare check.
+#[inline(always)]
+fn direct_tx_tuple_mismatch_reason(
+    source_ports: Option<(u16, u16)>,
+    expected_ports: Option<(u16, u16)>,
+    built_ports: Option<(u16, u16)>,
+) -> Option<String> {
+    #[cfg(test)]
+    if FORCE_TUPLE_MISMATCH.with(|c| c.get()) {
+        return Some("forward_tuple_mismatch:forced-test".to_string());
+    }
+    forward_tuple_mismatch_reason(source_ports, expected_ports, built_ports)
+}
+
 #[inline]
 fn recycle_ingress_frame(ingress_binding: &mut BindingWorker, source_offset: u64, now_ns: u64) {
     ingress_binding
@@ -890,15 +920,23 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         request.meta.protocol,
                                     )
                                 });
-                                if let Some(reason) = forward_tuple_mismatch_reason(
+                                if let Some(reason) = direct_tx_tuple_mismatch_reason(
                                     live_frame_ports_from_meta_bytes(source_frame, request.meta),
                                     expected_ports,
                                     built_ports,
                                 ) {
-                                    target_binding
-                                        .tx_pipeline
-                                        .free_tx_frames
-                                        .push_front(tx_offset);
+                                    // #4041: DO NOT recycle `tx_offset` here.
+                                    // Setting `build_failed` routes this frame
+                                    // through the single `if build_failed`
+                                    // recycle below, which pushes the offset
+                                    // back onto `free_tx_frames` exactly once.
+                                    // Pushing it in this diagnostic branch too
+                                    // double-recycled the offset — it would be
+                                    // handed out twice on a later TX and alias
+                                    // an in-flight frame (on-wire corruption /
+                                    // double-free on the debug-log build). The
+                                    // `record_exception` below still surfaces
+                                    // the mismatch to operators.
                                     record_exception(
                                         recent_exceptions,
                                         ingress_ident,
