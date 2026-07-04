@@ -1,3 +1,28 @@
+## 2026-07-04 — #4100: VRRPv3 IPv4 advert checksum RFC 5798 §5.2.8 pseudo-header (fable-163 F10)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: MEDIUM, vsrx-interop/HA. VERIFY-FIRST confirmed the bug at
+    HEAD: `pkg/vrrp/packet.go` marshalled+verified the IPv4 VRRPv3 checksum
+    over the VRRP message only (`onesComplementChecksum`, no pseudo-header),
+    while the IPv6 leg (`vrrpIPv6Checksum`) prepends the RFC-5798 pseudo-header
+    — `Marshal(false, srcIP, dstIP)` discarded the addresses on IPv4. A
+    conformant vSRX/Cisco/keepalived-v3 peer verifies IPv4 with the
+    pseudo-header → mutual advert rejection → dual-master split-brain on the
+    IPv4 VIP (latent in a pure-xpf cluster; surfaces on interop). Fix: added
+    `vrrpIPv4Checksum(src4, dst4, buf)` (pseudo-header = src 4B + dst 4B + zero
+    + protocol 112 + VRRP length 2B) mirroring the IPv6 helper; Marshal now
+    emits it (and requires src/dst on IPv4, like IPv6). Parse does
+    ROLLING-UPGRADE dual-accept: try the conformant pseudo-header checksum
+    first, fall back to the legacy no-pseudo-header checksum, so a new node
+    interoperates with BOTH a conformant peer and an old xpf node during an
+    upgrade; a corrupt checksum still fails both. Documented as a migration
+    aid (can tighten to pseudo-header-only later). RED-on-revert proven for
+    all three halves (parse pseudo-add / marshal pseudo-add / legacy
+    fallback). `go test -race ./pkg/vrrp/` green, `go build ./...` clean,
+    gofmt+vet clean.
+  - **File(s)**: pkg/vrrp/packet.go, pkg/vrrp/packet_checksum_test.go,
+    docs/vrrp-afpacket-receiver.md, _Log.md
+
 ## 2026-07-04 — #4108: RBAC maintenance gate + system_action audit journal (fable-163 F21+F8)
 
 - **Timestamp**: 2026-07-04
