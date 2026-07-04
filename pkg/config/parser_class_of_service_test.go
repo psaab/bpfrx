@@ -1606,3 +1606,139 @@ func TestCompileClassOfServiceAcceptsBoundaryCodePoints(t *testing.T) {
 		t.Fatalf("expected wan-pcp code-point 7, got %#v", pcp)
 	}
 }
+
+// buildCoSTree4021 applies flat-set lines via ParseSetCommand + SetPath (the
+// only correct way to test set syntax; NewParser merges newline-separated set
+// lines into one node).
+func buildCoSTree4021(t *testing.T, lines []string) *ConfigTree {
+	t.Helper()
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	return tree
+}
+
+// #4021: an interface-level CoS binding (`class-of-service interfaces geX
+// scheduler-map M` with no `unit`) must produce a LIVE per-unit binding. On
+// revert (compiler reads only per-unit `unit` children) cos.Interfaces[geX]
+// is nil and this test goes RED.
+func TestCompileClassOfServiceInterfaceLevelBinding4021(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service schedulers be-sched transmit-rate 5g",
+		"set class-of-service scheduler-maps edge-map forwarding-class best-effort scheduler be-sched",
+		"set class-of-service classifiers dscp wan-classifier forwarding-class best-effort loss-priority low code-points be",
+		"set class-of-service rewrite-rules dscp wan-rewrite forwarding-class best-effort loss-priority low code-point ef",
+		// Physical interface carries logical units 0 and 80.
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/2 unit 80 vlan-id 80",
+		// Interface-level (no unit) CoS binding.
+		"set class-of-service interfaces ge-0/0/2 scheduler-map edge-map",
+		"set class-of-service interfaces ge-0/0/2 shaping-rate 9g",
+		"set class-of-service interfaces ge-0/0/2 classifiers dscp wan-classifier",
+		"set class-of-service interfaces ge-0/0/2 rewrite-rules dscp wan-rewrite",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	if serr := SchemaValidate(tree, cfg); serr != nil {
+		t.Fatalf("SchemaValidate error: %v", serr)
+	}
+	ci := cfg.ClassOfService.Interfaces["ge-0/0/2"]
+	if ci == nil {
+		t.Fatal("interface-level CoS binding DROPPED: cos.Interfaces[ge-0/0/2] == nil")
+	}
+	if ci.Level == nil || ci.Level.SchedulerMap != "edge-map" {
+		t.Fatalf("expected Level.SchedulerMap=edge-map, got %#v", ci.Level)
+	}
+	// Interface-level applies to EVERY configured logical unit (0 and 80).
+	for _, unitNum := range []int{0, 80} {
+		u := ci.Units[unitNum]
+		if u == nil {
+			t.Fatalf("unit %d: interface-level binding did not fold in", unitNum)
+		}
+		if u.SchedulerMap != "edge-map" {
+			t.Fatalf("unit %d scheduler-map = %q, want edge-map", unitNum, u.SchedulerMap)
+		}
+		if u.ShapingRateBytes != parseBandwidthLimit("9g") {
+			t.Fatalf("unit %d shaping-rate = %d, want %d", unitNum, u.ShapingRateBytes, parseBandwidthLimit("9g"))
+		}
+		if u.DSCPClassifier != "wan-classifier" {
+			t.Fatalf("unit %d dscp classifier = %q, want wan-classifier", unitNum, u.DSCPClassifier)
+		}
+		if u.DSCPRewriteRule != "wan-rewrite" {
+			t.Fatalf("unit %d dscp rewrite = %q, want wan-rewrite", unitNum, u.DSCPRewriteRule)
+		}
+	}
+}
+
+// #4021: a unit-level binding overrides the interface-level one PER KNOB,
+// while knobs the unit does not set still inherit the interface-level value.
+func TestCompileClassOfServiceUnitOverridesInterfaceLevel4021(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service schedulers be-sched transmit-rate 5g",
+		"set class-of-service scheduler-maps edge-map forwarding-class best-effort scheduler be-sched",
+		"set class-of-service scheduler-maps unit-map forwarding-class best-effort scheduler be-sched",
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.1/24",
+		// Interface-level defaults.
+		"set class-of-service interfaces ge-0/0/2 scheduler-map edge-map",
+		"set class-of-service interfaces ge-0/0/2 shaping-rate 9g",
+		// Unit-level overrides scheduler-map only; shaping-rate inherits.
+		"set class-of-service interfaces ge-0/0/2 unit 0 scheduler-map unit-map",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	u := cfg.ClassOfService.Interfaces["ge-0/0/2"].Units[0]
+	if u == nil {
+		t.Fatal("expected ge-0/0/2 unit 0")
+	}
+	if u.SchedulerMap != "unit-map" {
+		t.Fatalf("unit-level override lost: scheduler-map = %q, want unit-map", u.SchedulerMap)
+	}
+	if u.ShapingRateBytes != parseBandwidthLimit("9g") {
+		t.Fatalf("interface-level shaping-rate not inherited: got %d, want %d", u.ShapingRateBytes, parseBandwidthLimit("9g"))
+	}
+}
+
+// #4021: the per-unit-only form is unchanged by the fix — no interface-level
+// Level, binding lands on the named unit only.
+func TestCompileClassOfServicePerUnitStillWorks4021(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service schedulers be-sched transmit-rate 5g",
+		"set class-of-service scheduler-maps edge-map forwarding-class best-effort scheduler be-sched",
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.1/24",
+		"set class-of-service interfaces ge-0/0/2 unit 0 scheduler-map edge-map",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	ci := cfg.ClassOfService.Interfaces["ge-0/0/2"]
+	if ci == nil {
+		t.Fatal("expected ge-0/0/2 CoS")
+	}
+	if ci.Level != nil {
+		t.Fatalf("per-unit-only config must not synthesize an interface-level binding, got %#v", ci.Level)
+	}
+	if ci.Units[0] == nil || ci.Units[0].SchedulerMap != "edge-map" {
+		t.Fatalf("per-unit scheduler-map = %#v, want edge-map", ci.Units[0])
+	}
+}

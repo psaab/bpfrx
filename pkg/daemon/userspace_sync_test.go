@@ -882,6 +882,91 @@ func TestHandleEventStreamFullResyncRequiresHAReady(t *testing.T) {
 	}
 }
 
+// clusterManagerPrimaryForRGs builds a standalone cluster.Manager (no control
+// interface) that elects the local node primary for every listed RG id. With no
+// control interface, electSingleNode() promotes every weight>0 RG immediately,
+// so IsLocalPrimary(id) is true for each configured id.
+func clusterManagerPrimaryForRGs(ids ...int) *cluster.Manager {
+	m := cluster.NewManager(0, 1)
+	rgs := make([]*config.RedundancyGroup, 0, len(ids))
+	for _, id := range ids {
+		rgs = append(rgs, &config.RedundancyGroup{
+			ID:             id,
+			NodePriorities: map[int]int{0: 200},
+			Preempt:        true,
+		})
+	}
+	m.UpdateConfig(&config.ClusterConfig{RethCount: 1, RedundancyGroups: rgs})
+	return m
+}
+
+// TestPrimaryOwnerRGIDsIncludesHighID is the #4028 RED-on-revert guard: the
+// full-resync RG enumeration must follow the configured redundancy-group set,
+// not a hardcoded 0..15 range. A cluster with an RG id >= 16 must have that RG
+// enumerated so its sessions are re-exported to the standby on a full resync.
+// Reverting primaryOwnerRGIDs to the old `for rgID := 0; rgID < 16` loop drops
+// RG 20 here and turns this test RED.
+func TestPrimaryOwnerRGIDsIncludesHighID(t *testing.T) {
+	d := &Daemon{cluster: clusterManagerPrimaryForRGs(0, 1, 20)}
+	// Sanity: the manager must actually consider the node primary for RG 20.
+	if !d.cluster.IsLocalPrimary(20) {
+		t.Fatal("test setup: node should be primary for RG 20")
+	}
+
+	cfg := &config.Config{}
+	cfg.Chassis.Cluster = &config.ClusterConfig{
+		RethCount: 1,
+		RedundancyGroups: []*config.RedundancyGroup{
+			{ID: 0}, {ID: 1}, {ID: 20},
+		},
+	}
+
+	got := d.primaryOwnerRGIDs(cfg)
+	want := map[int]bool{0: true, 1: true, 20: true}
+	if len(got) != len(want) {
+		t.Fatalf("primaryOwnerRGIDs() = %v, want ids %v", got, want)
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Fatalf("primaryOwnerRGIDs() returned unexpected RG %d (got %v)", id, got)
+		}
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Fatalf("primaryOwnerRGIDs() missing RGs %v (got %v) — RG >= 16 skipped?", want, got)
+	}
+}
+
+// TestPrimaryOwnerRGIDsFollowsConfigAndOwnership verifies the enumeration only
+// returns configured RGs the node owns, skips nil entries (#3494), and returns
+// nil when there is no cluster or no cluster config.
+func TestPrimaryOwnerRGIDsFollowsConfigAndOwnership(t *testing.T) {
+	// Node owns RG 0 and 20, but the config only lists 0 and 5. RG 5 is not
+	// owned, RG 20 is owned but not configured — neither should appear.
+	d := &Daemon{cluster: clusterManagerPrimaryForRGs(0, 20)}
+	cfg := &config.Config{}
+	cfg.Chassis.Cluster = &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{
+			{ID: 0},
+			nil, // #3494: nil RG entry must not panic and must be skipped
+			{ID: 5},
+		},
+	}
+	got := d.primaryOwnerRGIDs(cfg)
+	if len(got) != 1 || got[0] != 0 {
+		t.Fatalf("primaryOwnerRGIDs() = %v, want [0]", got)
+	}
+
+	// No cluster manager → nil.
+	if ids := (&Daemon{}).primaryOwnerRGIDs(cfg); ids != nil {
+		t.Fatalf("primaryOwnerRGIDs() with nil cluster = %v, want nil", ids)
+	}
+	// No cluster config → nil.
+	if ids := d.primaryOwnerRGIDs(&config.Config{}); ids != nil {
+		t.Fatalf("primaryOwnerRGIDs() with no cluster config = %v, want nil", ids)
+	}
+}
+
 func TestWireUserspaceEventStreamCallbacksStandaloneWiresSessionAndFullResync(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "events.sock")
 	es := dpuserspace.NewEventStream(socketPath)

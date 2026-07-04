@@ -39,6 +39,68 @@
   - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
     userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/README.md,
     _Log.md
+## 2026-07-03 — #4028: full-resync RG enumeration hardcoded 0..15 → RG >= 16 never resynced (fable-161 F-166)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed `handleEventStreamFullResync` enumerating owned
+    redundancy-groups with a hardcoded `for rgID := 0; rgID < 16` loop, which
+    silently skipped any configured RG with id >= 16. On a FullResync (a #2874
+    sequence gap / #2442 delta-ring overflow), that RG's owned sessions were
+    never re-exported to the standby → dropped on a failover of RG >= 16.
+    Verified genuine first: the `<group-id>` config slot has no validator and
+    is parsed via an unbounded `strconv.Atoi` (`compiler_system.go`), so RG
+    ids > 15 are configurable (Junos allows high RG ids).
+  - **Fix**: extracted `primaryOwnerRGIDs(cfg)`
+    (`pkg/daemon/daemon_ha_userspace.go`) — it walks
+    `cfg.Chassis.Cluster.RedundancyGroups` (the same live active config
+    `buildZoneIDs` reads, already in hand in the caller) and keeps every id the
+    node `IsLocalPrimary` for, skipping nil RG entries (#3494). This mirrors the
+    live-config enumeration the watchdog/fence paths use (`currentRedundancyGroups`,
+    #3917). `handleEventStreamFullResync` now calls it instead of the 0..15 loop.
+  - **File(s)**: `pkg/daemon/daemon_ha_userspace.go`,
+    `pkg/daemon/userspace_sync_test.go`, `docs/session-sync-architecture.md`,
+    `_Log.md`
+  - **Validation**: new `TestPrimaryOwnerRGIDsIncludesHighID` (RED-on-revert:
+    reverting the helper body to 0..15 yields `[0 1]`, dropping RG 20 → FAIL)
+    + `TestPrimaryOwnerRGIDsFollowsConfigAndOwnership` (config/ownership filter,
+    nil-RG skip, nil-cluster/nil-config → nil). `go test ./pkg/cluster/...
+    ./pkg/daemon/...` green, `-race` on the resync/enum tests green,
+    `go build ./...` + gofmt + vet clean. HA session-sync change — test-failover
+    warranted (batch-validated).
+
+## 2026-07-03 — #4021: interface-level class-of-service binding was silently dropped (fable-161 F-028)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the CoS interface-binding compiler dropping a binding
+    applied at the physical interface level (`class-of-service interfaces geX
+    { scheduler-map M; ... }` with no `unit`). Verified first with a scratch
+    repro: the interface-level form compiled AND passed SchemaValidate cleanly
+    but `cos.Interfaces[geX]` came back nil (only `unit N` children were read),
+    so the shaping/classification/marking never applied — a genuine
+    config-parity defect, unlike F-027.
+  - **Fix**: added `CoSInterface.Level` (`types_cos.go`); extracted the
+    per-unit knob reader into `parseCoSInterfaceUnitBody` and reused it to read
+    the interface node's direct knobs into `Level`
+    (`compiler_class_of_service.go`); a post-compile pass
+    `applyCoSInterfaceLevelBindings` (`compiler.go`, after both the interface
+    stanza and CoS are compiled) folds `Level` into each configured logical
+    unit with unit-level-overrides-interface-level precedence per knob. Added
+    the interface-level knobs (scheduler-map, shaping-rate+burst-size,
+    classifiers, rewrite-rules) as schema children of `interfaces geX` so
+    flat-set grouping nests them like the unit form and tab-completion offers
+    them (`schema_cos.go`). Dataplane snapshot + `show class-of-service`
+    consumers iterate `Units` and are UNCHANGED.
+  - **File(s)**: pkg/config/types_cos.go,
+    pkg/config/compiler_class_of_service.go, pkg/config/compiler.go,
+    pkg/config/schema_cos.go, pkg/config/parser_class_of_service_test.go,
+    pkg/dataplane/userspace/cos_iface_level_4021_test.go,
+    docs/cos-traffic-shaping.md
+  - **Validation**: new config tests (interface-level folds into all units;
+    unit overrides per knob while inheriting the rest; per-unit-only unchanged)
+    + a dataplane snapshot test proving the binding reaches the per-unit
+    InterfaceSnapshot the Rust dataplane consumes; all RED on revert of the
+    fold pass. `go test ./pkg/config/... ./pkg/dataplane/...` green, `go build
+    ./...`, gofmt, vet clean.
 
 ## 2026-07-03 — #4017: image bake signed the appliance manifest BEFORE the validation gate → a FAILED/invalid image got a minisign signature and was publishable (false trust)
 
@@ -31163,3 +31225,46 @@ top.
   - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/ipsec_test.go,
     pkg/config/parser_security_test.go, pkg/config/schema_security.go,
     docs/phases.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4020 — route the destructive HA smoke targets through
+    the #1875 shared-cluster lock. The reboot / force-stop / failover
+    smoke scripts (`test-failover`, `test-ha-crash`,
+    `test-double-failover`, `test-stress-failover`, `test-chained-crash`,
+    `test-active-active`, `test-restart-connectivity`, `test-private-rg`)
+    historically took NO cluster lock — a `test-failover` that reboots
+    fw0 mid-iperf on the SHARED loss cluster could collide with a
+    concurrent agent's deploy/smoke (half-deployed node; garbage loss
+    numbers). Deploys (`cluster-setup.sh` mutating verbs) and
+    `apply-cos-config.sh` already self-lock; the destructive smoke did
+    not. New `test/incus/cluster-cell.sh` preamble exports
+    `xpf_enter_destructive_cluster_cell`, which (1) re-execs under the
+    incus-admin group forwarding BPFRX_*/XPF_* so the
+    `XPF_CLUSTER_LOCK_HELD` marker survives sg, then (2) re-execs the
+    whole script through `with-cluster.sh` when not already inside a
+    live cell — a reboot now QUEUES behind a held lock instead of
+    colliding. Each destructive script's old inline `sg incus-admin`
+    block was replaced with a source + call of the shared preamble.
+    Unconditional lock (matches `cluster-setup.sh`, which locks the
+    legacy local cluster too — single dev-box mutex, fail toward
+    serialize). Read-only `test-connectivity.sh` left lock-free. New
+    `test/incus/cluster-cell-selftest.sh` (wired as
+    `make test-cluster-lock-lib`, which also runs the previously
+    orphaned `with-cluster-selftest.sh`): STATIC RED-on-revert — asserts
+    every destructive script sources `cluster-cell.sh` and takes the
+    lock before any node mutation, and that `test-connectivity.sh` stays
+    lock-free; BEHAVIORAL — private lock path + mocked incus prove a
+    standalone run acquires the lock, a concurrent run queues (exit 75)
+    instead of colliding, and a run inside a `with-cluster.sh` cell runs
+    lock-free (reentrant, no deadlock). Verified: RED-on-revert (restore
+    one script to origin/master → static check FAILs naming it),
+    shellcheck clean on all changed scripts + the new helper/selftest,
+    `go build ./...` green. No live cluster run — script-wiring fix
+    validated by reasoning + the no-cluster self-test.
+  - **File(s)**: test/incus/cluster-cell.sh (new),
+    test/incus/cluster-cell-selftest.sh (new), test/incus/test-failover.sh,
+    test/incus/test-ha-crash.sh, test/incus/test-double-failover.sh,
+    test/incus/test-stress-failover.sh, test/incus/test-chained-crash.sh,
+    test/incus/test-active-active.sh, test/incus/test-restart-connectivity.sh,
+    test/incus/test-private-rg.sh, Makefile, docs/engineering-style.md,
+    CLAUDE.md, _Log.md
