@@ -3319,6 +3319,7 @@ fn pool_snat_single_address_rewrites_src_and_port() {
         None,
         0,
         false,
+        false,
         &mut counter,
     ));
     assert_eq!(d.rewrite_src, Some("203.0.113.1".parse().unwrap()));
@@ -3369,6 +3370,7 @@ fn pool_snat_portless_protocols_translate_ip_only_no_port() {
             None,
             None,
             0,
+            false,
             false,
             &mut counter,
         ));
@@ -3458,6 +3460,8 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
             None,
             0,
             false,
+            // #4088: an identifier-bearing ICMP echo query.
+            true,
             &mut counter,
         ));
         let db = expect_snat_decision(match_source_nat_result_for_tuple(
@@ -3474,6 +3478,8 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
             None,
             0,
             false,
+            // #4088: an identifier-bearing ICMP echo query.
+            true,
             &mut counter,
         ));
         // Both hosts land on the single pool address (overload) ...
@@ -3511,10 +3517,161 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
     }
 }
 
-// #4074: a NON-identifier ICMP message (an error / control type, or any flow
-// the parser could not lift an id from — `src_port == 0`) keeps the
-// address-only path: the source IP is translated but NO id is allocated. This
-// pins that the `icmp_query` gate is `src_port != 0`, not "all ICMP".
+// #4088 FAIL-ON-REVERT (RFC 5508 §3.1): an ICMP echo whose Query Identifier is
+// 0 is a valid, keyable query (the id space is 0..=65535). Pool-mode source-NAT
+// must translate it exactly like any other id — two hosts pinging the same
+// target with id==0 behind one pool address must get DISTINCT translated ids so
+// their replies demux on the reverse tuple (pool_addr, translated_id).
+//
+// Before #4088 the query gate was `src_port != 0`, so an id==0 query flattened
+// to the same `src_port == 0` sentinel a non-query ICMP uses, took the
+// address-only path, and both id==0 flows collided on the reverse tuple
+// (pool_addr, 0) — the #4074 bug, residual for id==0. Reverting the source.rs
+// gate to `src_port != 0` makes `icmp_query` false for id==0, both decisions
+// carry `rewrite_src_port: None`, and the `is_some()` / distinctness assertions
+// go RED.
+//
+// The authoritative signal is `icmp_identifier_present` (the last positional
+// bool arg), set true here because the frame parser only builds a SessionFlow
+// for an identifier-bearing ICMP query — so id==0 is a real id, not "no id".
+#[test]
+fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
+    for proto in [PROTO_ICMP, PROTO_ICMPV6] {
+        let (src_a, src_b, dst): (IpAddr, IpAddr, IpAddr) = if proto == PROTO_ICMP {
+            (
+                "10.0.1.100".parse().unwrap(),
+                "10.0.1.101".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+            )
+        } else {
+            (
+                "2001:db8::100".parse().unwrap(),
+                "2001:db8::101".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+            )
+        };
+        let pool_addr = if proto == PROTO_ICMP {
+            "203.0.113.1/32".to_string()
+        } else {
+            "2001:db8:cafe::1/128".to_string()
+        };
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-snat".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec![if proto == PROTO_ICMP {
+                "0.0.0.0/0".to_string()
+            } else {
+                "::/0".to_string()
+            }],
+            pool_name: "my-pool".to_string(),
+            pool_addresses: vec![pool_addr],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        // Both hosts use the identifier 0 (a valid on-wire ICMP Query id).
+        let query_id = 0u16;
+        let mut counter = None;
+        let da = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src_a,
+            dst,
+            proto,
+            query_id,
+            0,
+            None,
+            None,
+            0,
+            false,
+            // #4088: identifier-bearing echo query — even though id==0.
+            true,
+            &mut counter,
+        ));
+        let db = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src_b,
+            dst,
+            proto,
+            query_id,
+            0,
+            None,
+            None,
+            0,
+            false,
+            true,
+            &mut counter,
+        ));
+        let expected_pool: IpAddr = if proto == PROTO_ICMP {
+            "203.0.113.1".parse().unwrap()
+        } else {
+            "2001:db8:cafe::1".parse().unwrap()
+        };
+        assert_eq!(da.rewrite_src, Some(expected_pool), "proto {proto}");
+        assert_eq!(db.rewrite_src, Some(expected_pool), "proto {proto}");
+        let id_a = da.rewrite_src_port.unwrap_or_else(|| {
+            panic!("proto {proto}: host A id==0 query must get a translated ICMP id")
+        });
+        let id_b = db.rewrite_src_port.unwrap_or_else(|| {
+            panic!("proto {proto}: host B id==0 query must get a translated ICMP id")
+        });
+        assert!(id_a >= 1024, "proto {proto}: id {id_a} out of pool range");
+        assert!(id_b >= 1024, "proto {proto}: id {id_b} out of pool range");
+        assert_ne!(
+            id_a, id_b,
+            "proto {proto}: two id==0 flows sharing a pool address must get DISTINCT translated ids",
+        );
+        let status = source_nat_pool_statuses(&rules);
+        assert_eq!(
+            status[0].used_ports, 2,
+            "proto {proto}: one pool id per id==0 ICMP query flow",
+        );
+
+        // Contrast: WITHOUT the identifier-present signal (a non-query ICMP that
+        // also flattens to src_port==0) the same id==0 tuple stays address-only.
+        // This pins that the gate is `icmp_identifier_present`, not the id value.
+        let mut counter2 = None;
+        let non_query = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src_a,
+            dst,
+            proto,
+            query_id,
+            0,
+            None,
+            None,
+            0,
+            false,
+            false,
+            &mut counter2,
+        ));
+        assert_eq!(
+            non_query.rewrite_src,
+            Some(expected_pool),
+            "proto {proto}: address still translated",
+        );
+        assert_eq!(
+            non_query.rewrite_src_port, None,
+            "proto {proto}: no identifier present => address-only, no id allocated",
+        );
+    }
+}
+
+// #4074/#4088: a NON-identifier ICMP message (an error / control type, or any
+// flow the parser could not lift an id from — no `SessionFlow`, so
+// `icmp_identifier_present` is false) keeps the address-only path: the source
+// IP is translated but NO id is allocated. This pins that the `icmp_query`
+// gate is the identifier-present signal, not "all ICMP" (and, post-#4088, not
+// `src_port != 0` either).
 #[test]
 fn pool_snat_icmp_without_query_id_is_address_only() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
@@ -3542,6 +3699,8 @@ fn pool_snat_icmp_without_query_id_is_address_only() {
         None,
         None,
         0,
+        false,
+        // #4088: no identifier-bearing query → address-only.
         false,
         &mut counter,
     ));
@@ -3594,6 +3753,7 @@ fn pool_snat_no_translation_preserves_source_port() {
         None,
         None,
         0,
+        false,
         false,
         &mut counter,
     ));
@@ -3981,6 +4141,7 @@ fn tuple_snat_lookup_from_src(
         None,
         None,
         now_ns,
+        false,
         false,
         &mut counter,
     )
@@ -4542,6 +4703,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         1,
         false,
+        false,
         &mut None,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
@@ -4559,6 +4721,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         None,
         2,
+        false,
         false,
         &mut None,
     );
@@ -4621,6 +4784,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         1,
         false,
+        false,
         &mut None,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
@@ -4638,6 +4802,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         None,
         2,
+        false,
         false,
         &mut None,
     );
@@ -5680,6 +5845,7 @@ fn pool_snat_address_persistent_userspace_v2_selects_pool_addresses() {
             None,
             0,
             false,
+            false,
             &mut None,
         ));
 
@@ -6222,6 +6388,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         None,
         1,
         true,
+        false,
         &mut None,
     );
     match frag {
@@ -6245,6 +6412,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         None,
         None,
         1,
+        false,
         false,
         &mut None,
     );
@@ -7457,6 +7625,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
         None,
         0,
         false,
+        false,
         &mut counter,
     );
     assert!(
@@ -7478,6 +7647,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
         egress_v4,
         None,
         0,
+        false,
         false,
         &mut counter,
     );
@@ -7521,6 +7691,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
         None,
         0,
         false,
+        false,
         &mut counter,
     );
     assert!(
@@ -7542,6 +7713,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
         egress_v4,
         None,
         0,
+        false,
         false,
         &mut counter,
     );
@@ -7589,6 +7761,7 @@ fn source_nat_match_application_constrains_protocol_and_port_3429() {
             egress_v4,
             None,
             0,
+            false,
             false,
             &mut counter,
         )
@@ -7657,6 +7830,7 @@ fn source_nat_match_application_constrains_source_port_3491() {
             None,
             0,
             false,
+            false,
             &mut counter,
         )
     };
@@ -7707,6 +7881,7 @@ fn source_nat_app_source_port_never_match_sentinel_3491() {
         egress_v4,
         None,
         0,
+        false,
         false,
         &mut counter,
     );
@@ -7816,6 +7991,7 @@ fn source_nat_never_match_port_sentinel_matches_nothing_3429() {
             None,
             0,
             false,
+            false,
             &mut counter,
         );
         assert_eq!(
@@ -7853,6 +8029,7 @@ fn source_nat_app_protocol_never_vs_any_3429() {
             egress_v4,
             None,
             0,
+            false,
             false,
             &mut counter,
         )

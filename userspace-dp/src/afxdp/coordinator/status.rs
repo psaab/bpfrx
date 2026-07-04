@@ -500,6 +500,9 @@ impl super::Coordinator {
             egress_v6,
             now_ns,
             false,
+            // #4088: this helper is exercised only with TCP/UDP tuples; ICMP
+            // id==0 classification is covered by the nat/ unit tests.
+            false,
             &mut counter,
         )
     }

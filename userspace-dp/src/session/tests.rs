@@ -2636,6 +2636,71 @@ fn icmp_query_id_translation_demuxes_reverse_wire_key() {
     );
 }
 
+// #4088: the reverse-recovery path must work for an ICMP Query Identifier of 0
+// (a valid on-wire id). Two hosts pinging the same target with id==0, both
+// behind one pool address, are given DISTINCT translated ids by pool SNAT
+// (source.rs, exercised in nat/tests.rs). Here we pin that the reverse keying
+// carries the TRANSLATED id — not the original 0 — so the id==0 replies demux
+// back to the right host and the original id (0) is recovered on the reverse.
+// If the reverse keys ignored `rewrite_src_port` and kept the original id, both
+// would collapse to `{T, P, 0, 0}` and the `assert_ne!` would go RED.
+#[test]
+fn icmp_query_id_zero_translation_demuxes_reverse_wire_key() {
+    let target = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+    let pool = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+    // The valid-but-uncommon id==0 case.
+    let query_id = 0u16;
+
+    let mk_forward = |host: Ipv4Addr| SessionKey {
+        addr_family: 2,
+        protocol: PROTO_ICMP,
+        src_ip: IpAddr::V4(host),
+        dst_ip: target,
+        src_port: query_id,
+        dst_port: 0,
+    };
+    let mk_nat = |translated_id: u16| NatDecision {
+        rewrite_src: Some(pool),
+        rewrite_src_port: Some(translated_id),
+        ..NatDecision::default()
+    };
+
+    let fwd_a = mk_forward(Ipv4Addr::new(10, 0, 0, 1));
+    let fwd_b = mk_forward(Ipv4Addr::new(10, 0, 0, 2));
+    let nat_a = mk_nat(40001);
+    let nat_b = mk_nat(40002);
+
+    let rev_a = reverse_wire_key(&fwd_a, nat_a);
+    let rev_b = reverse_wire_key(&fwd_b, nat_b);
+    assert_eq!(
+        rev_a.src_port, 40001,
+        "reverse key carries the translated id, not the original 0",
+    );
+    assert_ne!(
+        rev_a, rev_b,
+        "distinct translated ids MUST give distinct reverse keys even when the original id is 0",
+    );
+
+    // The reply carrying host A's translated id (40001) matches forward A only.
+    let reply_a = SessionKey {
+        addr_family: 2,
+        protocol: PROTO_ICMP,
+        src_ip: target,
+        dst_ip: pool,
+        src_port: 40001,
+        dst_port: 0,
+    };
+    assert!(reply_matches_forward_session(&fwd_a, nat_a, &reply_a));
+    assert!(!reply_matches_forward_session(&fwd_b, nat_b, &reply_a));
+
+    // The reverse companion keys differ per translated id (no (pool, 0) collision).
+    assert_ne!(
+        reverse_session_key(&fwd_a, nat_a),
+        reverse_session_key(&fwd_b, nat_b),
+        "id==0 reverse companion keys must differ per translated id",
+    );
+}
+
 #[test]
 fn find_forward_nat_match_with_dnat_port_rewrite() {
     let mut table = SessionTable::new();
