@@ -1,3 +1,40 @@
+## 2026-07-03 — #3975: `deactivate`/`activate` on a bracketed multi-value leaf errored + broke round-trip (setInactiveAtPath lacked the #2419 multi-value handling deletePath got in #3846)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-034 (MEDIUM, config-mode parity).
+    `setInactiveAtPath` (`pkg/config/ast_edit.go`), the shared
+    `deactivate`/`activate` config-mode edit, did NOT handle the bracketed
+    multi-value leaf shape (#2419) that `deletePath` got in #3846/#3848/#3879.
+    A `multi: true` value-list leaf collapses `[ a b c ]` onto ONE node's
+    `Keys=["field","a","b","c"]`, but the schema-driven traversal ate the
+    first member as an extra key (`nodeKeyCount == 2`) then treated the rest
+    as container tokens: `deactivate ... from protocol tcp udp icmp` — the
+    EXACT line `show | display set` emits for an inactive bracket leaf —
+    errored `container "protocol tcp" does not exist`. So an inactive
+    bracket leaf did NOT round-trip: replaying its display-set errored and
+    the leaf reloaded ACTIVE, silently losing the operator's deactivate
+    intent (the deactivate-side counterpart of the #3846 delete-side fail).
+  - **Fix**: added the same multi-leaf interception `deletePath` uses to
+    `setInactiveAtPath` (gate `multi && (children == nil || valueList) &&
+    args == 1`), routing to a new `markMultiLeafMembersInactive` helper that
+    mirrors `removeMultiLeafMembers`: no member → toggle the whole leaf;
+    named members → toggle the whole node when any rides on `Keys[1:]` (the
+    flat/bracket shape — `Inactive` is node-level, a bracket list is one
+    statement), and for a plain value-list leaf ALSO toggle named child nodes
+    (block shape); absent member → not-found error. `args == 1` gate keeps
+    keyed multi entries (`address <name> <prefix>`) on whole-node toggle.
+  - **Test**: `pkg/config/deactivate_multi_leaf_3975_test.go` — firewall
+    `from protocol` (whole expanded list / no-member / member /
+    absent-member-errors / activate-reverses / display-set round-trip),
+    policy match `source-address`, block-shape `system-services` member
+    toggle, single-value-leaf and keyed-entry non-regression. RED-on-revert
+    verified: reverting the branch makes the whole-list/member/round-trip/
+    activate assertions error `container "protocol tcp" does not exist`.
+    Full `go test ./pkg/config/...` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: `pkg/config/ast_edit.go`,
+    `pkg/config/deactivate_multi_leaf_3975_test.go`, `docs/config-schema.md`,
+    `_Log.md`.
+
 ## 2026-07-03 — #3968: non-exact CoS shaper path (`build_cos_batch_from_queue`) never cleared `pop_snapshot_stack` across batches → committed-batch snapshots accumulated on the hot path → unbounded scratch growth (realloc / stale re-read past the TX_BATCH_SIZE bound)
 
 - **Timestamp**: 2026-07-03

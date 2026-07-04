@@ -491,6 +491,26 @@ func setInactiveAtPath(current *[]*Node, path []string, schema *schemaNode, i in
 		return markMatchingNodeInactive(current, path[i:], inactive)
 	}
 
+	// Value-list multi-leaf: the same bracket-list class deletePath intercepts
+	// (see the deletePath comment). A `multi: true` leaf with a single value slot
+	// and no children (or a valueList leaf with modifier children, #3872) carries
+	// its members on Keys[1:] AND/OR one child node per member — the #2419 dual
+	// AST shape. Without this branch the schema-driven consumption below eats the
+	// first member as an extra key (nodeKeyCount == 2), then treats the remaining
+	// members as container tokens and errors ("container \"protocol tcp\" does not
+	// exist"): the display-set emit of an inactive bracket leaf is exactly
+	// `deactivate ... from protocol tcp udp icmp`, so an inactive multi-value leaf
+	// did NOT round-trip — it reloaded ACTIVE (#3975, the deactivate-side
+	// counterpart of the #3846 delete-side fail). Route it through the member
+	// matcher instead: a bare `deactivate ... protocol` toggles the whole leaf;
+	// naming members toggles the whole leaf (flat/bracket — Inactive is a
+	// node-level flag, a bracket list is one statement) or the named child nodes
+	// (block shape). Gate on args == 1 so keyed multi entries (address <name>
+	// <prefix>, args == 2) keep whole-node toggle semantics.
+	if childSchema.multi && (childSchema.children == nil || childSchema.valueList) && childSchema.args == 1 {
+		return markMultiLeafMembersInactive(current, keyword, path[i+1:], childSchema.valueList, inactive)
+	}
+
 	nodeKeyCount := 1 + childSchema.args
 	if i+nodeKeyCount > len(path) {
 		return markMatchingNodeInactive(current, path[i:], inactive)
@@ -627,6 +647,75 @@ func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string, mo
 	}
 	*nodes = out
 	if !removedAny {
+		return fmt.Errorf("path not found: no member %q of %q",
+			strings.Join(members, " "), keyword)
+	}
+	return nil
+}
+
+// markMultiLeafMembersInactive is the deactivate/activate counterpart of
+// removeMultiLeafMembers for a value-list multi-leaf (#3975). keyword is the
+// leaf's first key ("protocol", "system-services", "next-hop"); members are the
+// trailing tokens. Unlike delete, the Inactive marker is a NODE-level flag, so a
+// bracket list — collapsed onto ONE node's Keys[1:] — can only be toggled whole,
+// never per-value; block-shape members (one child node each) can be toggled
+// individually.
+//
+//   - members empty  → toggle the whole leaf (mirrors markMatchingNodeInactive's
+//     prefix match), so `deactivate ... protocol` toggles the list.
+//   - members named  → for every node whose first key is keyword, toggle the
+//     WHOLE node when any named member rides on Keys[1:] (the flat/bracket shape —
+//     this is what display-set emits: `deactivate ... protocol tcp udp icmp`), and
+//     for a plain value-list leaf ALSO toggle any child node the members name
+//     (the hierarchical block shape). This restores round-trip of an inactive
+//     bracket leaf, which errored before #3975.
+//
+// modifierChildren mirrors removeMultiLeafMembers: when true (a valueList leaf
+// whose children are MODIFIERS of the value, e.g. static next-hop's interface),
+// the children are never members, so only the Keys[1:] flat match applies.
+//
+// Returns an error when no named member was found anywhere, mirroring
+// removeMultiLeafMembers' not-found contract.
+func markMultiLeafMembersInactive(nodes *[]*Node, keyword string, members []string, modifierChildren, inactive bool) error {
+	if len(members) == 0 {
+		return markMatchingNodeInactive(nodes, []string{keyword}, inactive)
+	}
+	drop := make(map[string]bool, len(members))
+	for _, m := range members {
+		drop[m] = true
+	}
+	matched := false
+	for _, n := range *nodes {
+		if len(n.Keys) == 0 || n.Keys[0] != keyword {
+			continue
+		}
+		// Flat / bracket shape: members ride on Keys[1:]. Inactive is node-level,
+		// so any named member present toggles the whole statement.
+		flatMatch := false
+		for _, v := range n.Keys[1:] {
+			if drop[v] {
+				flatMatch = true
+				break
+			}
+		}
+		if flatMatch {
+			n.Inactive = inactive
+			matched = true
+			continue
+		}
+		if modifierChildren {
+			// valueList node: children are MODIFIERS, never members.
+			continue
+		}
+		// Block shape: one child node per member — toggle only the named ones.
+		for _, c := range n.Children {
+			if len(c.Keys) >= 1 && drop[c.Keys[0]] {
+				c.Inactive = inactive
+				matched = true
+			}
+		}
+	}
+	if !matched {
 		return fmt.Errorf("path not found: no member %q of %q",
 			strings.Join(members, " "), keyword)
 	}
