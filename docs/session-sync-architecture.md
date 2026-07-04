@@ -141,12 +141,30 @@ the new bulk is sent.
 4. skips reverse entries
 5. skips sessions not owned by this node for the ingress zone
 6. sends forward entries only
-7. sends `BulkEnd(epoch)`
-8. records `pendingBulkAckEpoch` and waits for peer acknowledgement
+7. records `pendingBulkAckEpoch` (**before** the `BulkEnd` write)
+8. sends `BulkEnd(epoch)` and then waits for peer acknowledgement
 
 The sender now treats outbound bulk acknowledgement as first-class state. A
 bulk transfer is not considered fully primed until the peer returns `BulkAck`
 for the current epoch.
+
+**Record-then-send ordering (#3912).** `pendingBulkAckEpoch` must be stored
+*before* the `BulkEnd` marker is written to the wire, not after. `BulkEnd` is
+what solicits the peer's `BulkAck`, and the ack is processed on the read
+goroutine (`handleMessage`, `syncMsgBulkAck`) independently of the send
+goroutine. If the pending epoch were recorded *after* the write, a peer that
+acked faster than the send goroutine could record the pending state would have
+its ack processed against `pendingBulkAckEpoch == 0` — the ack handler's
+`pending != 0` guard drops it — and the send goroutine would then latch a
+phantom pending epoch that no future ack ever clears. A latched phantom epoch
+permanently blocks manual failover, because the readiness gate waits on an
+outbound bulk ack that already arrived. Recording first (mirroring the
+#2170/#2198 gen-guard record-then-send discipline) guarantees an early ack can
+only ever observe the pending epoch already in place, so it clears it
+regardless of arrival timing. On a `BulkEnd` write failure the epoch is reset
+to 0 (and `handleDisconnect` also clears it), so a failed send cannot leave the
+pending state falsely armed. The same ordering applies to the empty-marker
+`sendBulkMarkers` path used after event-stream export.
 
 ### Receive Side
 
