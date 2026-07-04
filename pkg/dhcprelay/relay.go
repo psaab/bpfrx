@@ -81,6 +81,17 @@ const (
 	// sessionDrift means the interface's live kernel ifindex moved away from
 	// the bound ifindex (#2347); the supervisor rebuilds immediately to rebind.
 	sessionDrift
+	// sessionReaddr means the interface's PRIMARY IPv4 address changed while its
+	// ifindex stayed the same (#3960) — e.g. a DHCP-learned lease renewing to a
+	// different IP, a static readdress, or an HA VIP move on the same netdev. The
+	// session's giaddr (the source the DHCP server unicasts its reply back to) was
+	// resolved once at session start and is now STALE: the relay would keep
+	// stamping the old giaddr AND the server conn would stay bound to the old
+	// giaddr:67, so replies to the new address are blackholed and relayed clients
+	// stop getting leases. Like sessionDrift the supervisor rebuilds immediately,
+	// which re-resolves the giaddr, rebinds the server conn to the new address,
+	// and makes the new main loop stamp the current giaddr.
+	sessionReaddr
 	// sessionRetry means a TRANSIENT socket bind/listen failure occurred
 	// before the session could start (#2787). The supervisor waits the
 	// bounded, ctx-cancelable retry interval and rebuilds, so the relay
@@ -719,6 +730,17 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 			}
 			slog.Info("dhcp-relay: interface ifindex changed, rebinding listener",
 				"interface", ir.ifaceName)
+		case sessionReaddr:
+			// The interface's primary IPv4 changed under a stable ifindex
+			// (#3960): rebuild immediately so the giaddr is re-resolved, the
+			// server conn rebinds to the new giaddr:67, and the new main loop
+			// stamps the current address. No delay — the reply path is broken
+			// until the rebuild completes.
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Info("dhcp-relay: interface address changed, re-resolving giaddr",
+				"interface", ir.ifaceName)
 		case sessionRetry:
 			// A transient socket bind/listen failure (interface not yet up,
 			// IP not yet bound, EADDRINUSE on a quick reload). Do NOT kill the
@@ -769,10 +791,12 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// driftDetected is set by the watcher under no lock other than its own
-	// happens-before with wg.Wait(): the watcher writes it then the session
-	// returns after wg.Wait() joins the watcher, so the read below is safe.
+	// driftDetected (ifindex, #2347) and readdrDetected (primary-IPv4 change,
+	// #3960) are set by the watcher under no lock other than its own
+	// happens-before with wg.Wait(): the watcher writes them then the session
+	// returns after wg.Wait() joins the watcher, so the reads below are safe.
 	var driftDetected atomic.Bool
+	var readdrDetected atomic.Bool
 
 	// Axis C1: resolve giaddr with bounded, ctx-cancelable retry. Re-resolve
 	// the interface every attempt so a dynamic interface recreated under the
@@ -909,15 +933,20 @@ func (m *Manager) runRelaySession(ctx context.Context,
 		_ = serverConn.Close()
 	}()
 
-	// #2347 ifindex-drift watcher. Periodically re-resolve the interface name
-	// to its live ifindex and compare against the baseline captured at bind. On
-	// a real, differing index it records drift and cancels THIS session ctx,
-	// which trips the close-on-cancel watcher above (clean teardown) and makes
-	// runRelay rebuild bound to the new ifindex. A resolve FAILURE is treated
-	// as "no drift" (tolerant) so a transient netlink hiccup / mid-rename window
-	// never tears down a working listener. Disabled when ifindexCheck<=0 or no
-	// resolver, and a degraded baseline (boundIfindex==0) means we only treat a
-	// later real index as drift if the baseline was real — see the guard below.
+	// #2347 ifindex-drift + #3960 primary-IPv4 (giaddr) re-resolution watcher.
+	// Periodically re-resolve the interface. On a real, differing live ifindex it
+	// records drift (#2347); on a real, differing primary IPv4 it records a
+	// readdress (#3960). Either cancels THIS session ctx, which trips the
+	// close-on-cancel watcher above (clean teardown) and makes runRelay rebuild —
+	// rebinding to the new ifindex (#2347) and/or re-resolving the giaddr + the
+	// server conn's giaddr:67 bind (#3960). A resolve FAILURE (either lookup) is
+	// treated as "no change" (tolerant) so a transient netlink hiccup, a
+	// mid-rename window, or a momentarily unaddressed interface never tears down a
+	// working listener — and never stamps a bogus giaddr, since the session keeps
+	// its last-known-good giaddr until a real new address appears. Disabled when
+	// ifindexCheck<=0 or no ifindex resolver; a degraded ifindex baseline
+	// (boundIfindex==0) treats a later real index as drift only if the baseline
+	// was real (see the guard below).
 	if m.ifindexCheck > 0 && m.resolveIfindex != nil {
 		wg.Add(1)
 		go func() {
@@ -929,27 +958,48 @@ func (m *Manager) runRelaySession(ctx context.Context,
 				case <-sctx.Done():
 					return
 				case <-ticker.C:
-					live, lerr := m.resolveIfindex(ifaceName)
-					if lerr != nil {
+					// #2347: ifindex drift.
+					if live, lerr := m.resolveIfindex(ifaceName); lerr != nil {
 						// Tolerant: keep the listener; this is not drift.
 						slog.Debug("dhcp-relay: ifindex re-resolve failed, keeping listener",
 							"interface", ifaceName, "err", lerr)
-						continue
-					}
-					// Only a real baseline can be compared. boundIfindex==0
-					// (degraded capture) adopts the first real reading as the
-					// baseline rather than treating it as drift.
-					if boundIfindex == 0 {
+					} else if boundIfindex == 0 {
+						// Degraded capture: adopt the first real reading as the
+						// baseline rather than treating it as drift.
 						boundIfindex = live
-						continue
-					}
-					if live != boundIfindex {
+					} else if live != boundIfindex {
 						slog.Info("dhcp-relay: detected ifindex drift",
 							"interface", ifaceName,
 							"old_ifindex", boundIfindex, "new_ifindex", live)
 						driftDetected.Store(true)
 						cancel()
 						return
+					}
+
+					// #3960: primary-IPv4 (giaddr) change under a stable ifindex.
+					// Re-resolve the current primary address and compare against
+					// the giaddr this session bound at start. A differing address
+					// means the DHCP server would unicast its OFFER/ACK to the old
+					// (now-invalid) giaddr:67 and the reply is blackholed — rebuild
+					// so the giaddr is re-resolved, the server conn rebinds to the
+					// new giaddr:67, and the new main loop stamps the current
+					// address. Runs every tick regardless of the ifindex result
+					// (an address can change while the ifindex is stable).
+					if m.resolveGIAddr != nil {
+						if cur, gerr := m.resolveGIAddr(ifaceName); gerr != nil {
+							// Tolerant: a momentary unaddressed window keeps the
+							// last-known-good giaddr rather than tearing down (and
+							// so never stamps a bogus giaddr).
+							slog.Debug("dhcp-relay: giaddr re-resolve failed, keeping listener",
+								"interface", ifaceName, "err", gerr)
+						} else if !cur.Equal(giaddr) {
+							slog.Info("dhcp-relay: detected giaddr address change",
+								"interface", ifaceName,
+								"old_giaddr", giaddr, "new_giaddr", cur)
+							readdrDetected.Store(true)
+							cancel()
+							return
+						}
 					}
 				}
 			}
@@ -1062,10 +1112,15 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	// closed both conns and the response goroutine's ReadFrom is unblocked.
 	wg.Wait()
 
-	// The drift watcher (joined above) is the only writer of driftDetected; its
-	// store happens-before this read through wg.Wait().
+	// The watcher (joined above) is the only writer of driftDetected /
+	// readdrDetected; its store happens-before these reads through wg.Wait().
+	// Both outcomes rebuild immediately in runRelay (a giaddr change breaks the
+	// reply path just as an ifindex drift breaks the request path).
 	if driftDetected.Load() {
 		return sessionDrift
+	}
+	if readdrDetected.Load() {
+		return sessionReaddr
 	}
 	return sessionStop
 }

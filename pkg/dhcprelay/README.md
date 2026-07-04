@@ -309,6 +309,28 @@ OFFER/ACK to forward in the first place; clients still dedupe on
   rather than triggering a spurious rebind. Drift detection is per-interface,
   so a rebind on one segment never drops relays on the others. This mirrors
   the #2294 VRRP instance-restart-on-ifindex-drift fix for the relay listener.
+- **giaddr re-resolution on a same-ifindex readdress (#3960).** The `giaddr`
+  is the relay's own interface address — the source the upstream server
+  unicasts its `OFFER`/`ACK` back to (`giaddr:67`, above). It is resolved
+  **once** at session start and consumed in three places: the server conn's
+  `giaddr:67` bind, the per-packet `GatewayIPAddr` stamp, and the raw-L2 reply
+  source IP. If the interface's **primary IPv4 changes while its ifindex stays
+  the same** (a DHCP-learned lease renewing to a different IP, a static
+  readdress, or an HA VIP move on the same netdev), all three go **stale**: the
+  relay keeps stamping the old `giaddr`, the server replies to the old
+  (now-invalid) address, and even a corrected stamp would not help because the
+  server conn is still bound to the old `giaddr:67` — the reply is
+  **blackholed** and relayed clients silently stop getting leases. The
+  ifindex-drift watcher above now **also** re-resolves the primary IPv4 on each
+  tick and compares it against the `giaddr` the session bound at start; on a
+  real, differing address it records a **readdress** (`sessionReaddr`) and
+  cancels the session context, reusing the same #1915 teardown. The rebuild
+  re-resolves the `giaddr`, **rebinds the server conn** to the new
+  `giaddr:67`, and makes the new main loop stamp the current address — fixing
+  all three consumers atomically. Like the ifindex probe it is **tolerant**: a
+  momentarily unaddressed interface (resolve failure) keeps the last-known-good
+  `giaddr` and never tears down a working listener or stamps a bogus `giaddr`,
+  and it is **idempotent** (unchanged address => no rebuild).
 
 ## Gotchas
 
