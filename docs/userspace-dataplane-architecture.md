@@ -601,7 +601,20 @@ the NAT module applies it:
 - **SNAT (interface mode):** Rewrite source IP to egress interface address.
   Source port preserved.
 - **SNAT (pool mode):** Rewrite source IP to a configured source pool address
-  and allocate a source port from the pool range. By default, pool address
+  and allocate a source port from the pool range. For an ICMP/ICMPv6 echo or
+  query message the 16-bit **Query Identifier** plays the role of the L4 port
+  (RFC 5508 §3.1 "ICMP Query Mappings"): the flow parser lifts it into the
+  tuple `src_port` slot, so pool mode allocates a unique translated identifier
+  from the same pool id space, rewrites the ICMP Identifier field, and repairs
+  the ICMP checksum incrementally (`apply_nat_icmp_identifier_rewrite`,
+  #4074). This lets many internal hosts pinging one target with the same id
+  share a single pool address without colliding on the reverse tuple
+  `(pool_addr, id)`; the reverse companion session and the reply un-NAT are
+  keyed on the translated id. A non-identifier ICMP control/error message
+  parses flowless (`src_port == 0`) and, like a genuinely port-less protocol
+  (GRE/ESP/AH/OSPF), takes the address-only path — its L4 bytes are never
+  rewritten. `port no-translation` preserves the id just as it preserves a
+  TCP/UDP source port. By default, pool address
   selection is round-robin within the packet address family. With global source
   NAT `address-persistent`, the userspace dataplane hashes a domain-tag seed,
   address family, and canonical source IP bytes with a seeded non-cryptographic

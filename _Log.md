@@ -31951,3 +31951,37 @@ top.
   - **File(s)**: pkg/config/compiler_nat.go,
     pkg/config/compiler_nat_pool_alarm_test.go,
     docs/deterministic-nat-cgnat.md, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-07-04
+  - **Action**: #4074 (RFC 5508 §3.1 "ICMP Query Mappings") — pool-mode source
+    NAT now translates the ICMP/ICMPv6 Query Identifier. The flow parser lifts
+    an echo/query Identifier into the tuple `src_port` (dst_port 0), so it is
+    the ICMP demux key exactly like a TCP/UDP port. Before this, pool SNAT took
+    the port-less address-only path for ICMP (`rewrite_src_port` unset), so two
+    internal hosts pinging the same target with the same id, both hidden behind
+    one pool address, collided on the reverse tuple `(pool_addr, id)` → replies
+    mis-associated. Fix, three coordinated parts: (1) nat/source.rs — an
+    identifier-bearing ICMP flow (`src_port != 0`) now takes the PAT
+    `allocate_translation` path, drawing a unique translated id from the pool
+    id space (mirrors the TCP/UDP port allocation; `no_translation` and
+    flowless/non-identifier ICMP stay address-only). (2) session/key.rs — the
+    ICMP arm of forward_wire_key / reverse_wire_key / translated_session_key /
+    reverse_session_key folds the translated id into `src_port` (symmetric
+    field, dst_port stays 0), so the reverse index + companion session demux on
+    the translated id. No-op when `rewrite_src_port` is None (interface-mode,
+    static, DNAT, no-NAT unchanged). (3) afxdp/frame/mod.rs —
+    `apply_nat_icmp_identifier_rewrite` rewrites the Identifier at l4+4 and
+    repairs the ICMP checksum incrementally, both directions (forward
+    orig→translated via `rewrite_src_port`, reverse translated→orig via the
+    `rewrite_dst_port` produced by `NatDecision::reverse`); gated on an
+    identifier-bearing ICMP type so error/control messages are untouched; the
+    ICMPv6 pseudo-header address delta is already folded by the IP-rewrite
+    section, ICMPv4 has no pseudo-header. ICMP is never flow-cached, so the
+    TCP/UDP descriptor fast path is unaffected. RED-on-revert: distinct
+    translated ids per host + distinct reverse keys (nat + session tests);
+    on-wire identifier + checksum forward/reverse (frame v4 + v6 tests).
+    Validated: FULL `cargo test --release`, `go build ./...`, rustfmt.
+  - **File(s)**: userspace-dp/src/nat/source.rs,
+    userspace-dp/src/nat/tests.rs, userspace-dp/src/session/key.rs,
+    userspace-dp/src/session/tests.rs, userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    docs/userspace-dataplane-architecture.md, _Log.md
