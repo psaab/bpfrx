@@ -91,7 +91,8 @@ delegate to the owning domain. Exported types:
 - `VRFSpec` — `vrf.go`.
 - `KeepaliveState` — `tunnel.go`. Per-tunnel probe status.
 - `TunnelStatus` — `tunnel.go`.
-- `RouteEntry`, `TableRoutes` — `routes.go`.
+- `RouteEntry`, `NextHop`, `TableRoutes` — `routes.go`. `RouteEntry.NextHops`
+  lists every leg of a kernel ECMP route (see "Multipath / ECMP routes" below).
 - `PBRRule` — `rules.go`.
 - `InterfaceMonitorStatus` — `monitor.go`.
 - `New() (*Manager, error)` — `routing.go`.
@@ -366,6 +367,30 @@ peer behind a valid route read up forever and the fail-safe
 reconcile state. Restart residuals (documented): anchors/addresses/RI
 claims orphaned while the daemon was down are adopted as-is, not
 retroactively diffed.
+
+## Multipath / ECMP routes (#3944)
+
+A kernel ECMP route (multiple equal-cost next-hops for one prefix,
+installed by FRR or a `next-hop [ a b ]` static) carries its next-hops
+in the netlink `RTA_MULTIPATH` list (`route.MultiPath`, a
+`[]*netlink.NexthopInfo`), **not** in the single `route.Gw` — which is
+nil for such a route. `routeToEntry` (`routes.go`) therefore checks
+`route.MultiPath` first: when it is non-empty it populates
+`RouteEntry.NextHops` with one `NextHop{Gateway, Interface, Weight}`
+per leg (`multiPathNextHops`, resolving each leg's ifindex to a name and
+recording `netlink.NexthopInfo.Hops + 1` as the weight), and back-fills
+the single `NextHop`/`Interface` fields from the first leg so single-
+field consumers show a real next-hop instead of a bare "direct". A
+single-gateway, connected/direct, or discard route leaves `NextHops`
+nil and is bit-identical to before.
+
+Rendering: `formatTableJunos` (`routeformat.go`, the canonical Junos
+`show route` view used by both the local CLI and the gRPC text path)
+emits one `>  to <gw> via <if>` line per leg when `NextHops` is
+non-empty; the structured `GetRoutes` gRPC RPC emits one `RouteInfo`
+per leg (same idiom as the REST static-route handler). Before #3944 an
+ECMP route displayed as a single bare "direct"/empty next-hop, hiding
+which paths a prefix load-balances over.
 
 ## Gotchas
 
