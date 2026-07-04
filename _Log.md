@@ -1,3 +1,37 @@
+## 2026-07-03 — #4044: the LLDP received-neighbor table was unbounded → an LLDP frame flood (many spoofed chassis/port ids) grew it without limit → OOM (L2 DoS)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-177 (MEDIUM, DoS — unbounded LLDP neighbor
+    table). LLDP is an unauthenticated L2 protocol; any device on the segment
+    can send frames carrying arbitrary (spoofed) chassis-id / port-id pairs,
+    one distinct neighbor entry per distinct pair. `rxLoop` stored every
+    learned frame unconditionally (`m.neighbors[key] = neighbor`), so a flood
+    of distinct-id frames grew the map without bound until the daemon was
+    OOM-killed. `expiryLoop` reaps only *expired* entries every 10s, so a flood
+    faster than the reap interval — or advertising a large TTL — grew the table
+    unbounded between reaps.
+  - **Fix**: bounded the table per local interface. The receive path now routes
+    every learned neighbor through `learnNeighbor`, which caps at
+    `maxNeighborsPerInterface` (64) per interface: a refresh of an already-known
+    `ifname/chassis/port` key updates in place (never grows the map, so an
+    established neighbor's re-advertisements are never dropped), and a genuinely
+    new neighbor past the cap is DROPPED with a warn rate-limited to once per
+    60s per interface (so the flood floods neither the table nor the log). The
+    effective global bound is the cap times the operator-configured
+    LLDP-enabled interface count, so no separate global cap is needed.
+    `expiryLoop` still reaps aged-out entries, so once a transient flood stops
+    the table shrinks back below the cap. The warn dampener is reset alongside
+    the neighbor table in `Stop()`.
+  - **File(s)**: pkg/lldp/lldp.go, pkg/lldp/lldp_test.go,
+    pkg/lldp/socket_test.go, pkg/lldp/README.md
+  - **Validation**: `go test -race ./pkg/lldp/...` green; new
+    `TestLearnNeighborCapPerInterface` (cap/refresh/per-interface budget, RED on
+    revert), `TestLearnNeighborCapWarnsRateLimited` (exactly one warn for 10
+    drops), and `TestRxLoopBoundsNeighborTableUnderFlood` (real receive path,
+    cap+50 distinct-id frames bounded at the cap — grows to 114 on revert). All
+    three verified RED with the cap disabled. `go build ./...`, `gofmt`,
+    `go vet` clean.
+
 ## 2026-07-03 — #4043: received LLDP TLV strings logged/displayed without control-char sanitization → ANSI-escape / CRLF log-injection from a crafted L2 frame
 
 - **Timestamp**: 2026-07-03
