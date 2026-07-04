@@ -29,6 +29,16 @@ var errFileUnavailable = errors.New("audit log file unavailable (failed rotation
 // file always lives directly under this directory.
 var traceLogDir = "/var/log"
 
+// SetTraceLogDirForTest redirects the flow-trace output directory to dir and
+// returns a function that restores the previous value. It exists only so tests
+// in OTHER packages (the daemon #3932 single-callback reconcile test) can drive
+// NewTraceWriter against a writable temp dir; production never calls it.
+func SetTraceLogDirForTest(dir string) (restore func()) {
+	old := traceLogDir
+	traceLogDir = dir
+	return func() { traceLogDir = old }
+}
+
 // sanitizeTraceFileName validates an operator-supplied flow-trace filename.
 // The trace file always lives directly under traceLogDir, so only a bare
 // basename is accepted: path separators, "." / "..", and absolute paths are
