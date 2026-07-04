@@ -38,6 +38,32 @@ const maxLineBytes = 1 << 20 // 1 MiB
 // without the sample growing unbounded for a wholesale-garbage body.
 const maxInvalidSample = 5
 
+// maxFeedBodyBytes caps the total HTTP response body a single feed fetch will
+// buffer (#3934). Without a cap, a feed server that returns a huge (or
+// infinite/chunked) body — or a MITM on a plaintext-http feed URL — can make
+// the fetcher buffer an arbitrarily large body into memory and OOM the daemon
+// (a remote-triggerable DoS). The body is read through an io.LimitReader; a
+// body exceeding this cap fails the whole fetch (retain last-good) rather than
+// buffering unboundedly. 32 MiB is comfortably above any legitimate CIDR feed
+// yet well under the 64 MiB userspace-dp control-request cap
+// (MaxControlRequestBytes, #2744) so a single feed cannot dominate the apply
+// snapshot.
+const maxFeedBodyBytes = 32 << 20 // 32 MiB
+
+// maxFeedPrefixes caps the number of parsed entries a single feed may install
+// (#3934). This is a secondary guard on top of the byte cap: a body of many
+// short lines (e.g. bare IPv4 addresses) can stay under the byte cap while
+// producing an entry count that would blow the dataplane address-book map. A
+// feed exceeding this count fails the whole fetch (retain last-good) — a
+// partial-but-huge set is never installed. The count is measured on parsed
+// (pre-dedup) entries so memory is bounded during the parse loop.
+const maxFeedPrefixes = 1 << 20 // 1,048,576 entries
+
+// httpClientTimeout bounds a single feed fetch end-to-end (connect + headers +
+// body read), so a slow-loris feed server that dribbles bytes cannot hold the
+// fetch open indefinitely (#3934). The next refresh tick retries.
+const httpClientTimeout = 30 * time.Second
+
 // Manager manages dynamic address feed servers and their periodic updates.
 type Manager struct {
 	mu       sync.RWMutex
@@ -88,7 +114,7 @@ func New(onUpdate func()) *Manager {
 	return &Manager{
 		feeds: make(map[string]*feedState),
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: httpClientTimeout,
 		},
 		onUpdate: onUpdate,
 		now:      time.Now,
@@ -105,6 +131,18 @@ func resolveBaseURL(fsCfg *config.FeedServer) string {
 		return "https://" + strings.TrimRight(fsCfg.Hostname, "/")
 	}
 	return ""
+}
+
+// warnPlaintextFeed emits a one-time (per Apply) warning when a feed URL uses
+// plaintext http:// (#3934). A plaintext feed has no transport integrity: a
+// MITM can substitute an arbitrary body (including an over-size body aimed at
+// the OOM path guarded by maxFeedBodyBytes, or a hostile prefix set). https
+// is strongly preferred for any denylist/allowlist source.
+func warnPlaintextFeed(name, url string) {
+	if strings.HasPrefix(strings.ToLower(url), "http://") {
+		slog.Warn("dynamic-address: feed URL is plaintext http (no integrity — a MITM can substitute the feed body); prefer https",
+			"name", name, "url", url)
+	}
 }
 
 // resolveHoldInterval maps the configured hold-interval (seconds) to a
@@ -169,6 +207,7 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 					cancel:       cancel,
 				}
 				m.feeds[fe.Name] = fs
+				warnPlaintextFeed(fe.Name, feedURL)
 				go m.refreshLoop(feedCtx, fs, interval)
 				slog.Info("dynamic address feed started",
 					"name", fe.Name, "server", fsCfg.Name, "url", feedURL,
@@ -188,6 +227,7 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 				cancel:       cancel,
 			}
 			m.feeds[key] = fs
+			warnPlaintextFeed(key, baseURL)
 			go m.refreshLoop(feedCtx, fs, interval)
 			slog.Info("dynamic address feed started",
 				"name", key, "url", baseURL, "interval", interval, "hold", holdStr)
@@ -392,9 +432,11 @@ func (m *Manager) fetchFeed(ctx context.Context, fs *feedState) {
 // readFeed issues the HTTP request and parses the body into a canonical set.
 // It returns an error (and no snapshot is installed) on transport failure,
 // non-200 status, a scanner error (including bufio.ErrTooLong for an overlong
-// line), or a zero-prefix successful response (treated as suspect — a hijacked
-// or misconfigured endpoint serving an empty body must not silently wipe an
-// enforced set).
+// line), an over-size body / over-count entry set (maxFeedBodyBytes /
+// maxFeedPrefixes, #3934), or a zero-prefix successful response (treated as
+// suspect — a hijacked or misconfigured endpoint serving an empty body must
+// not silently wipe an enforced set). The transport itself is bounded by the
+// client's httpClientTimeout (slow-loris protection).
 func (m *Manager) readFeed(ctx context.Context, fs *feedState) (fetchResult, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", fs.url, nil)
 	if err != nil {
@@ -414,13 +456,41 @@ func (m *Manager) readFeed(ctx context.Context, fs *feedState) (fetchResult, err
 	return parseFeed(resp.Body)
 }
 
+// countingReader wraps an io.Reader and tracks the total number of bytes read
+// through it, so parseFeed can DETECT (not merely truncate at) an over-size
+// body: the body is read through io.LimitReader(r, maxFeedBodyBytes+1), and if
+// the counter passes maxFeedBodyBytes the feed exceeded the cap (#3934).
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // parseFeed reads CIDR/IP lines from r and returns a canonicalized set.
 // Reads io.Reader (not http.Response) so it is unit-testable in isolation.
+//
+// The body is bounded on TWO axes (#3934) so a huge/infinite body or a MITM on
+// a plaintext-http feed cannot OOM the daemon:
+//   - total bytes: read through io.LimitReader(r, maxFeedBodyBytes+1); a body
+//     larger than maxFeedBodyBytes fails the whole fetch (retain last-good),
+//   - parsed entries: a body producing more than maxFeedPrefixes parsed entries
+//     fails the whole fetch (never install a partial-but-huge set).
+//
+// Both over-limit conditions return an error so fetchFeed→recordFailure keeps
+// the last-good snapshot rather than wiping or truncating the enforced set.
 func parseFeed(r io.Reader) (fetchResult, error) {
 	var prefixes []string
 	var invalidLines int
 	var invalidSample []string
-	scanner := bufio.NewScanner(r)
+	// Cap the total bytes buffered. Read one byte past the cap so a body that
+	// exactly fills the cap is accepted while anything larger is detected.
+	cr := &countingReader{r: io.LimitReader(r, maxFeedBodyBytes+1)}
+	scanner := bufio.NewScanner(cr)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -449,11 +519,23 @@ func parseFeed(r io.Reader) (fetchResult, error) {
 				invalidSample = append(invalidSample, line)
 			}
 		}
+		// Entry cap: bail as soon as the parsed set exceeds the per-feed limit
+		// so the slice memory stays bounded during the loop and a huge feed is
+		// rejected rather than truncated-and-installed (#3934).
+		if len(prefixes) > maxFeedPrefixes {
+			return fetchResult{}, fmt.Errorf("feed exceeds max entry count %d", maxFeedPrefixes)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		// Overlong line (bufio.ErrTooLong) or transport read error mid-stream.
 		// Treat the entire read as failed — never install a truncated set.
 		return fetchResult{}, fmt.Errorf("read body: %w", err)
+	}
+	if cr.n > maxFeedBodyBytes {
+		// Body exceeded the size cap (the LimitReader delivered the extra
+		// sentinel byte). Fail the whole fetch — never install a truncated set,
+		// and keep the last-good snapshot (#3934).
+		return fetchResult{}, fmt.Errorf("feed body exceeds max size %d bytes", maxFeedBodyBytes)
 	}
 
 	canon := canonicalize(prefixes)

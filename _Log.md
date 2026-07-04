@@ -1,3 +1,38 @@
+## 2026-07-03 — #3934: dynamic address-feed fetch had no body-size / entry cap → remote OOM DoS (plaintext-http MITM can amplify)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-179 (MEDIUM, DoS). `pkg/feeds/parseFeed`
+    read the HTTP response body with an unbounded `bufio.Scanner` and parsed
+    ALL entries with no cap, so a feed server returning a huge/infinite/chunked
+    body — or a MITM on a plaintext-http feed URL — could buffer an arbitrarily
+    large body into memory and OOM the daemon (remote-triggerable DoS); a
+    legitimately large feed OOMs by accident.
+  - **Fix**: (a) body-size cap — `parseFeed` now reads through
+    `io.LimitReader(r, maxFeedBodyBytes+1)` (32 MiB) wrapped in a
+    `countingReader`; a body exceeding the cap fails the whole fetch. (b)
+    entry cap — the parse loop bails with an error once parsed entries exceed
+    `maxFeedPrefixes` (1,048,576), bounding slice memory during parse and never
+    installing a partial-but-huge set. (c) timeout — the pre-existing 30 s
+    client timeout is now the named const `httpClientTimeout` (slow-loris
+    protection). Both over-limit conditions return an error, so
+    `fetchFeed→recordFailure` KEEPS the last-good snapshot (the #2050 fail-safe)
+    rather than wiping or truncating the enforced set. Added a one-time
+    `slog.Warn` at `Apply` for plaintext `http://` feed URLs (integrity risk).
+    Caps sit well under the 64 MiB userspace-dp control-request cap
+    (`MaxControlRequestBytes`, #2744) so a single feed cannot dominate the
+    apply snapshot.
+  - **RED-on-revert**: `feeds_sizecap_3934_test.go` — over-size body rejected
+    with a size error (RED: unbounded read returns success), over-entry-count
+    body rejected (RED: unbounded entry set), full HTTP path retains last-good
+    on an over-size fetch (RED: clobbers with the over-size body's prefix), a
+    slow server hits the client timeout and retains last-good, an under-cap
+    feed still installs fully, plaintext-http predicate pinned. Verified all
+    three cap tests go RED under a simulated revert. `go test -count=1
+    ./pkg/feeds/...` green, `go build ./...`, gofmt, vet clean. Doc:
+    pkg/feeds/README.md (fail-safe + gotchas, corrected the stale #2744
+    "NOT bounded by a total-entry cap" note).
+  - **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_sizecap_3934_test.go,
+    pkg/feeds/README.md, _Log.md
 ## 2026-07-03 — #3931: cluster config-sync applied via unordered goroutines with no sequence number → a rapid commit pair could leave the standby on the OLDER config (no alarm)
 
 - **Timestamp**: 2026-07-03
