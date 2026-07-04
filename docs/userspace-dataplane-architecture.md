@@ -124,7 +124,10 @@ Packet arrives at NIC
   counter. Go exposes the per-reason map as `degraded_path_counters`; the
   pinned BPF map keeps the internal compatibility name
   `userspace_fallback_stats` until the mixed-version boundary is retired. The
-  userspace runtime does not require the legacy `xdp_main_prog` fallback path.
+  map is a **per-CPU** array (`#4113`) — native XDP increments it per RX-queue
+  CPU with a non-atomic RMW, so shared storage would drop counts under load;
+  the Go/helper readers sum across CPUs. The userspace runtime does not require
+  the legacy `xdp_main_prog` fallback path.
 
 - **Heartbeat watchdog**: Each worker writes a timestamp to a BPF array
   map every 250ms. The shim checks freshness (5s timeout) and refuses
