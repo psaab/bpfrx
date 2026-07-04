@@ -165,8 +165,21 @@ fi
 # iperf3 server is single-client — if a stale session from the previous
 # test lingers, some data streams may not connect. Accept MIN_SESSIONS
 # (control + some data) rather than requiring all IPERF_STREAMS.
-fw0_sessions=$(incus exec "$FW0" -- cli -c \
-	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
+#
+# #4052: the 8 TCP streams take a sub-second to finish their 3-way
+# handshakes, so a single immediate assert here can catch the
+# establishment window with only 0-3 Valid sessions and FALSE-FAIL a
+# healthy cluster (a settled cluster shows ~25 Valid sessions at
+# 23.4 Gbps / 0 retr). Poll up to 10s (20 × 0.5s), breaking as soon as
+# the count reaches MIN_SESSIONS; only fail if the streams genuinely
+# never establish within the timeout — a real establishment failure.
+fw0_sessions=0
+for _ in $(seq 1 20); do
+	fw0_sessions=$(incus exec "$FW0" -- cli -c \
+		"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
+	[[ "$fw0_sessions" -ge "$MIN_SESSIONS" ]] && break
+	sleep 0.5
+done
 if [[ "$fw0_sessions" -ge "$MIN_SESSIONS" ]]; then
 	pass "fw0 has $fw0_sessions established sessions"
 else

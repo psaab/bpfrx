@@ -1,3 +1,26 @@
+## 2026-07-03 — #4052: test-failover.sh preflight session-count check was a single immediate assert with no settle-wait → false FAIL on a healthy cluster (racy 8-stream handshake window)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the fable-161 batch-tf false-alarm. The Phase-1
+    preflight in `test/incus/test-failover.sh` asserted
+    `fw0_sessions >= MIN_SESSIONS(4)` the instant after starting
+    `iperf3 -P8`, before the 8 TCP 3-way handshakes complete, so it
+    could observe 0-3 Valid sessions and FALSE-FAIL a healthy cluster
+    (a settled cluster shows ~25 Valid sessions at 23.4 Gbps / 0 retr).
+    Replaced the single immediate assert with a poll-with-timeout loop
+    (20 iterations × 0.5s = 10s max) that re-queries
+    `show security flow session destination-prefix <target> |
+    grep -c "Session State: Valid"` each pass and breaks as soon as the
+    count reaches MIN_SESSIONS; it only fails if the streams genuinely
+    never establish within the timeout (a real establishment failure).
+    MIN_SESSIONS stays 4; pass/fail reporting and the fw0/target vars
+    are preserved; the other failover assertions already have their own
+    waits and are untouched. Used `for _ in` to avoid an SC2034.
+  - **File(s)**: test/incus/test-failover.sh
+  - **Validation**: `shellcheck -S warning` clean (only the pre-existing
+    SC2034 at line 338, unrelated); `go build ./...` green. No live
+    cluster run — this is a script-timing fix.
+
 ## 2026-07-03 — #4049: LLDP resolved its socket with the Junos slash name (ge-0/0/0) instead of the kernel dash name (ge-0-0-0) → net.InterfaceByName failed → LLDP never started on any renamed data port
 
 - **Timestamp**: 2026-07-03
