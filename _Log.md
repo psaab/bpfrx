@@ -1,3 +1,34 @@
+## 2026-07-03 — #3941: deleting an IPsec VPN never terminates its live SAs (--load-all only unloads config)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-175 (MEDIUM, security/correctness).
+    Deleting an IPsec VPN and committing applied the new config via
+    `swanctl --load-all`, which UNLOADS the removed connection's config but
+    does NOT terminate its already-established IKE/child SAs — so the deleted
+    tunnel stayed UP and forwarding until rekey/lifetime expiry. `Manager`
+    now remembers the previous applied connection-name set (`prevConnNames`,
+    sanitized VPN map keys) and on every `Apply`/`Clear` diffs it against the
+    new set (`swapConnNames`). For each connection that disappeared,
+    `terminateRemovedConns` reloads first (unloads the removed conn so it
+    can't re-initiate), queries live SAs (`liveConnNames` via the `sc` seam),
+    and issues `swanctl --terminate --ike <conn>` only for a removed conn
+    that actually has a live SA (deleting a never-up VPN is a clean no-op).
+    A failed live-SA query falls back to an unconditional idempotent
+    terminate. The diff keys off the VPN NAME (not renderability) so a VPN
+    that merely became unrenderable keeps its SAs; modified/added conns are
+    untouched. Ordering (reload-then-terminate) prevents a straggler SA from
+    being re-initiated from a still-loaded config mid-teardown. Added the
+    `sc` exec seam (Manager `swanctl` field + accessor) so all swanctl
+    shell-outs are mockable.
+  - **File(s)**: pkg/ipsec/manager.go, pkg/ipsec/delete_terminate_3941_test.go,
+    pkg/ipsec/README.md, _Log.md
+  - **Validation**: `go test ./pkg/ipsec/...` green (5 new tests: delete-with-
+    active-SA terminates; delete-last-VPN/Clear path terminates; delete-with-
+    no-SA is a no-op; add/modify never terminate nor probe SAs; list-SAs error
+    falls back to unconditional terminate). RED-on-revert verified: neutering
+    the `terminateRemovedConns` call fails all three terminate assertions.
+    `go build ./...` + `go vet ./pkg/ipsec/... ./pkg/daemon/...` clean.
+
 ## 2026-07-03 — #3942: GetBGPSummary scrapes text → phantom trailer peers + never sets PfxRcd
 
 - **Timestamp**: 2026-07-03
