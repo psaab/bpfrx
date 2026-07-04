@@ -46,6 +46,49 @@
     operator-triggered (not the recurring 15s scrape). They keep the
     per-policy read; `NewPolicyCounterReader` makes their later adoption a
     one-line change if desired.
+## 2026-07-03 — #3967: SNMP agent / trap-groups were start-once-at-boot → a day-2 commit that enabled SNMP, added a community/trap target, or disabled SNMP sat inert until a daemon restart
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-059 (MEDIUM, config-lifecycle). The SNMP
+    agent listener + link-state trap monitor were created ONCE at daemon
+    boot (`daemon_run.go` boot block). `applyConfigLocked` only did an
+    in-place `UpdateConfig` on an ALREADY-running agent (#2008), so
+    enabling SNMP on a running firewall (agent was nil) never started the
+    listener, disabling it never stopped it, and adding the FIRST trap
+    group never started the link-state monitor — the change sat in the
+    config, inert until a restart (a silent config-doesn't-take-effect +
+    monitoring-gap surprise).
+  - **Fix**: new `reconcileSNMP` (`pkg/daemon/daemon_snmp_reconcile.go`),
+    called from `applyConfigLocked` in place of the bare `UpdateConfig`
+    guard, reconciles the whole subsystem on every commit: disabled→enabled
+    starts the listener (+ monitor if trap groups), enabled→disabled stops
+    it, enabled→enabled swaps community/authorization/v3/trap-target state
+    in place (no listener bounce), and a newly-added trap group starts the
+    monitor without a restart. Idempotent: an unchanged SNMP stanza is a
+    no-op gated on `snmpConfigHash` (FNV over the raw secret-bearing
+    fields). The boot block now calls the shared `startSNMPLocked` + sets
+    `snmpBootReady` (the gate that keeps the boot apply and boot block from
+    double-starting); a shared `snmpEnabled` predicate makes boot and day-2
+    agree. Agent + monitor bind to a `d.daemonCtx`-derived lifetime context;
+    `teardownSNMP` stops them at shutdown. Concurrency: `teardownSNMPLocked`
+    cancels + joins the goroutines before nilling `d.snmpAgent`, so the
+    monitor's `emitLinkStateTrap` reads never race the clear (verified with
+    `-race`).
+  - **File(s)**: `pkg/daemon/daemon_snmp_reconcile.go` (new),
+    `pkg/daemon/daemon.go` (reconcile state fields + serve/boots seams),
+    `pkg/daemon/daemon_apply.go` (reconcileSNMP wiring),
+    `pkg/daemon/daemon_run.go` (boot block → startSNMPLocked +
+    snmpBootReady; shutdown teardownSNMP; drop now-unused imports),
+    `pkg/daemon/daemon_snmp_reconcile_test.go` (RED-on-revert lifecycle
+    tests), `pkg/snmp/README.md` (reconcile section).
+  - **Validation**: RED-on-revert confirmed (reverting the apply wiring to
+    the pre-fix `if d.snmpAgent != nil { UpdateConfig }` fails all three
+    lifecycle tests — enable, disable, trap-group-add). `go test
+    ./pkg/snmp/ ./pkg/daemon/` green; `-race` on the daemon SNMP/linkstate
+    paths clean; `go build ./...`, `gofmt`, `go vet` clean. (Pre-existing
+    unrelated `-race` flake in `pkg/snmp/traps_async_2991_test.go` —
+    `trapSender` package-var reassignment races `trapWorker`; untouched
+    by this change.)
 
 ## 2026-07-03 — #3962: buildScreenSnapshots ranged the zones map in nondeterministic order → wire byte order varied per build → snapshotContentHash dedup missed → dataplane re-applied the screen config on every reconcile
 
@@ -308,6 +351,30 @@
   - **File(s)**: pkg/routing/routes.go, pkg/routing/routeformat.go,
     pkg/grpcapi/server_routing.go, pkg/routing/routes_multipath_test.go,
     pkg/routing/README.md, _Log.md
+## 2026-07-03 — #3947: legacy address parser drops a bare `any` mixed with literals → deny narrows (fail-open)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-084 (MEDIUM, security fail-open on the
+    drift / hand-built-snapshot / mixed-version-decode legacy path). The
+    legacy address parser `parse_legacy_address_set` handled a bare `any`
+    token with a no-op match arm (`"any" | "" => {}`), leaning on the legacy
+    empty→`MatchAny` convention — which only yields match-all when the list
+    is otherwise empty. A list MIXING `any` with a literal (e.g.
+    `[ any 10.0.0.0/8 ]`) therefore DROPPED the `any` and NARROWED the match
+    set to just the literal. For a DENY term that narrowing is a fail-OPEN: a
+    deny meant to match every source matched only the listed literal, so
+    other sources fell through to a later permit / default-permit. Fix mirrors
+    `parse_v3_literal_set` EXACTLY: a bare `any` now sets BOTH per-family
+    match-all flags (`any_v4 = true; any_v6 = true`), so an `any` anywhere in
+    the list is match-all for both families regardless of accompanying
+    literals or family-scoped wildcards. The empty (`""`) token is split into
+    its own no-op arm (distinct from `any`), preserving the legacy
+    empty→`MatchAny` convention for an otherwise-empty list while a mixed
+    `[ "" 10.0.0.0/8 ]` keeps the literal scoping.
+  - **File(s)**: userspace-dp/src/policy.rs (arm + fn doc comment),
+    userspace-dp/src/policy_tests.rs (4 RED-on-revert unit tests),
+    docs/userspace-dataplane-architecture.md (#3947 paragraph), _Log.md.
+
 ## 2026-07-03 — #3941: deleting an IPsec VPN never terminates its live SAs (--load-all only unloads config)
 
 - **Timestamp**: 2026-07-03

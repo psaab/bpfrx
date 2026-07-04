@@ -1144,6 +1144,78 @@ fn legacy_address_valid_literals_and_wildcards_still_parse() {
 }
 
 #[test]
+fn legacy_address_any_mixed_with_literal_stays_match_all() {
+    // #3947 RED-on-revert: the LEGACY address parser must treat a bare `any`
+    // MIXED with literal addresses as match-all on both families, mirroring
+    // `parse_v3_literal_set`. The pre-fix no-op `"any" | "" => {}` arm DROPPED
+    // the `any` and let `[ any 10.0.0.0/8 ]` collapse to just the literal
+    // (10.0.0.0/8), NARROWING the match set. For a DENY term that narrowing is
+    // a fail-OPEN: a source outside 10.0.0.0/8 that should be denied would be
+    // permitted. Reverting the fix makes `v4.is_match_any()` false
+    // (Linear{10.0.0.0/8}), so this assertion goes RED — non-tautological.
+    let (v4, v6, malformed) =
+        parse_legacy_address_set(&["any".to_string(), "10.0.0.0/8".to_string()]);
+    assert!(malformed.is_none(), "no malformed token expected");
+    assert!(
+        v4.is_match_any(),
+        "`any` mixed with a v4 literal must be v4 match-all, not narrowed to the literal"
+    );
+    // A bare `any` sets BOTH families — the v6 side is match-all too.
+    assert!(
+        v6.is_match_any(),
+        "a bare `any` is match-all for v6 as well"
+    );
+    // Behavioral proof: an address OUTSIDE the literal still matches (match-all).
+    // A narrowed Linear{10.0.0.0/8} would reject it.
+    assert!(v4.contains("192.168.1.1".parse().unwrap()));
+}
+
+#[test]
+fn legacy_address_bare_any_alone_is_match_all_both_families() {
+    // #3947: a bare `any` alone stays match-all for both families. This was
+    // already correct via the empty→MatchAny convention; after the fix it is
+    // reached via the explicit any-flags. Guards against a regression that would
+    // drop the standalone-any case.
+    let (v4, v6, malformed) = parse_legacy_address_set(&["any".to_string()]);
+    assert!(malformed.is_none());
+    assert!(v4.is_match_any(), "bare `any` must be v4 match-all");
+    assert!(v6.is_match_any(), "bare `any` must be v6 match-all");
+}
+
+#[test]
+fn legacy_address_any_mixed_with_v6_literal_stays_match_all() {
+    // #3947 (v6 arm): `any` mixed with a v6 literal must be v6 (and v4)
+    // match-all, not narrowed to 2001:db8::/32. RED on revert:
+    // `v6.is_match_any()` is false (Linear{2001:db8::/32}).
+    let (v4, v6, malformed) =
+        parse_legacy_address_set(&["any".to_string(), "2001:db8::/32".to_string()]);
+    assert!(malformed.is_none());
+    assert!(
+        v6.is_match_any(),
+        "`any` mixed with a v6 literal must be v6 match-all"
+    );
+    assert!(v4.is_match_any(), "`any` is match-all for v4 as well");
+    // Behavioral proof: a v6 address outside 2001:db8::/32 still matches.
+    assert!(v6.contains("2001:4860::1".parse().unwrap()));
+}
+
+#[test]
+fn legacy_address_literal_only_list_is_not_widened() {
+    // #3947 guard: the fix must NOT widen a literal-only list. `[ 10.0.0.0/8 ]`
+    // with no `any` stays scoped to that prefix on v4 (matches 10.x, rejects
+    // others). The v4-only list leaves v6 at the pre-existing legacy
+    // empty→MatchAny convention — that is unchanged by this fix.
+    let (v4, _v6, malformed) = parse_legacy_address_set(&["10.0.0.0/8".to_string()]);
+    assert!(malformed.is_none());
+    assert!(
+        !v4.is_match_any(),
+        "a literal-only list must stay scoped, not match-all"
+    );
+    assert!(v4.contains("10.1.2.3".parse().unwrap()));
+    assert!(!v4.contains("192.168.1.1".parse().unwrap()));
+}
+
+#[test]
 fn go_unsupported_sentinel_fails_closed() {
     // Cross-language contract: the Go capability gate emits a "__unsupported__"
     // sentinel term for an unrepresentable application; Rust must drop it and
