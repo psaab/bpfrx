@@ -29165,3 +29165,39 @@ top.
   pkg/config/freetext_test.go (RED-on-revert injection + reject +
   helper tests), pkg/configstore/store_test.go
   (TestAnnotateRejectsCommentDelimiter), docs/phases.md (#3900 note)
+
+## 2026-07-03 — #3904 multi-value bracket-list truncation bundle (F-040/F-161/F-162/F-163)
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-040/F-161 — IKE/IPsec `proposals [ p1 p2 ]` no longer truncates
+  to the first reference. Schema leaves marked `multi: true`; `IKEPolicy.Proposals`
+  and `IPsecPolicyDef.Proposals` widened `string` → `[]string`; compiler reads all
+  via `firewallMatchValues`; strongSwan generator emits every resolvable proposal
+  comma-joined; strict validators require every reference to resolve; show/CLI
+  join the list.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_ipsec.go, pkg/config/compiler_validate_strict.go,
+  pkg/ipsec/ike.go, pkg/cli/cli_show_security_ipsec.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/config/compiler_ipsec_proposals_multivalue_3904_test.go,
+  pkg/ipsec/ike_proposals_multivalue_3904_test.go,
+  pkg/config/parser_security_test.go, pkg/config/ike_policy_chain_ref_test.go,
+  pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/ipsec/swanctl_render_test.go, pkg/ipsec/ike_chain_failclosed_test.go,
+  docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-162 — RIP `redistribute`/group `export`/`neighbor`/
+  `passive-interface` bracket lists no longer truncate to the first entry.
+  Declared RIP list-leaves marked `multi: true`; RIP compiler block reads every
+  value via `firewallMatchValues` into the already-plural RIPConfig slices.
+- **File(s)**: pkg/config/schema_routing.go, pkg/config/compiler_protocols.go,
+  pkg/config/compiler_rip_multivalue_3904_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-163 — routing-instance `interface [ i1 i2 ]` no longer keeps only
+  the first port (VRF isolation break). Compiler reads every interface via
+  `firewallMatchValues` into RoutingInstanceConfig.Interfaces (opaque implicit
+  leaf, no schema change needed).
+- **File(s)**: pkg/config/compiler_routing.go,
+  pkg/config/compiler_routing_instance_interface_3904_test.go, docs/config-schema.md

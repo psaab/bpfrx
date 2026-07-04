@@ -94,7 +94,7 @@ func TestIPsecPolicyResolvableProposalAccepted(t *testing.T) {
 	if pol.PFSGroup != 14 {
 		t.Errorf("PFSGroup = %d, want 14", pol.PFSGroup)
 	}
-	if pol.Proposals != "esp-p2" {
+	if len(pol.Proposals) != 1 || pol.Proposals[0] != "esp-p2" {
 		t.Errorf("Proposals = %q, want esp-p2", pol.Proposals)
 	}
 }

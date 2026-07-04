@@ -74,7 +74,12 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 			case "mode":
 				pol.Mode = v
 			case "proposals":
-				pol.Proposals = v
+				// Multi-value leaf (#3904): `proposals [ p1 p2 ]` collapses
+				// onto Keys[1:] (hierarchical / clean flat-set) and/or child
+				// nodes (declared-leaf flat-set split). Read EVERY reference
+				// via firewallMatchValues; reading only Keys[1] (nodeVal)
+				// dropped all but the first, narrowing phase-1 negotiation.
+				pol.Proposals = append(pol.Proposals, firewallMatchValues(p)...)
 			case "pre-shared-key":
 				// "pre-shared-key ascii-text VALUE" or children
 				if len(p.Keys) >= 3 {
@@ -261,10 +266,11 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 	for _, inst := range namedInstances(node.FindChildren("policy")) {
 		pol := &IPsecPolicyDef{Name: inst.name}
 		for _, p := range inst.node.Children {
-			v := nodeVal(p)
 			switch p.Name() {
 			case "proposals":
-				pol.Proposals = v
+				// Multi-value leaf (#3904): read EVERY ESP proposal reference
+				// (Keys[1:] + child nodes) — mirror of the IKE policy loop.
+				pol.Proposals = append(pol.Proposals, firewallMatchValues(p)...)
 			case "perfect-forward-secrecy":
 				for _, c := range p.Children {
 					if c.Name() == "keys" {

@@ -971,9 +971,14 @@ type IKEProposal struct {
 
 // IKEPolicy defines Phase 1 policy (mode, proposal reference, PSK).
 type IKEPolicy struct {
-	Name      string
-	Mode      string // "main" or "aggressive"
-	Proposals string // IKE proposal reference
+	Name string
+	Mode string // "main" or "aggressive"
+	// Proposals is the ordered list of IKE proposal references. Junos
+	// `proposals [ p1 p2 ]` offers every listed proposal for phase-1
+	// negotiation; reading only the first (the pre-#3904 scalar) narrowed
+	// crypto negotiation so a peer requiring the second proposal could not
+	// establish. Rendered comma-joined into the swanctl `proposals =` line.
+	Proposals []string
 	PSK       Secret // pre-shared key; redacted on JSON/YAML marshal (#2053)
 }
 
@@ -989,9 +994,13 @@ type IPsecProposal struct {
 
 // IPsecPolicyDef defines Phase 2 policy (PFS + proposal reference).
 type IPsecPolicyDef struct {
-	Name      string
-	PFSGroup  int    // PFS DH group number (0 = disabled)
-	Proposals string // IPsec proposal reference
+	Name     string
+	PFSGroup int // PFS DH group number (0 = disabled)
+	// Proposals is the ordered list of IPsec (ESP) proposal references.
+	// Junos `proposals [ p1 p2 ]` offers every listed proposal; the
+	// pre-#3904 scalar truncated to the first, narrowing negotiation.
+	// Rendered comma-joined into the swanctl `esp_proposals =` line.
+	Proposals []string
 }
 
 // IPsecGateway defines a remote IKE gateway.
