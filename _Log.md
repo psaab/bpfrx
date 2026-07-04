@@ -33261,3 +33261,23 @@ top.
     userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
     userspace-dp/src/afxdp/coordinator/tests.rs, userspace-dp/src/FEATURES.md,
     docs/config-schema.md, docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3888 PR #4145 Copilot fold (2 minor hardenings on the new NAT64
+    skip path, pre-merge). (1) Stale comment: the empty-prefix block still said
+    "fail closed" (the old abort-all wording) though the new behavior is
+    eprintln + skip — updated it to describe the loud per-rule skip so a future
+    maintainer debugging a disappeared rule is not misled. (2) split('/')
+    robustness: the /96 parse used `parts.get(1)`-only, so a corrupt/peer-synced
+    prefix with an EXTRA slash ("64:ff9b::/96/garbage" → 3 parts) was ACCEPTED
+    as a valid /96 with the trailing garbage silently ignored. Since this path
+    is the #1960 lenient/corrupt-snapshot backstop it must be strict: added a
+    `parts.len() != 2` check (mirroring nptv6.rs `parse_prefix`) so an
+    extra-slash or missing-mask prefix skips the whole rule. Added
+    `extra_slash_prefix_skips_rule` test ("64:ff9b::/96/garbage" skipped,
+    well-formed "64:ff9b::/96" still publishes) — RED on revert of the len check
+    (the extra-slash prefix would install 1 prefix). FULL cargo test --release
+    green; go build ./... green. No module-doc change (an extra-slash prefix is
+    already covered by the doc's "empty/malformed/non-/96 prefix" wording).
+  - **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+    _Log.md

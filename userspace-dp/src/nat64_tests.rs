@@ -225,6 +225,39 @@ fn malformed_prefix_address_skips_rule() {
 }
 
 #[test]
+fn extra_slash_prefix_skips_rule() {
+    // #3888 backstop hardening (Copilot): the corrupt/lenient-snapshot parse
+    // must require EXACTLY `<ipv6>/96`. A prefix with an EXTRA slash —
+    // "64:ff9b::/96/garbage" → split('/') = ["64:ff9b::", "96", "garbage"] —
+    // must be SKIPPED as malformed, NOT accepted with the trailing garbage
+    // silently ignored (parts[1]=="96" parses fine, parts[0]=="64:ff9b::"
+    // parses fine).
+    //
+    // FAIL-ON-REVERT: reverting the `parts.len() != 2` check makes the old
+    // `parts.get(1)`-only match accept this as a valid /96 → 1 published
+    // prefix, so `prefixes.is_empty()` FAILS (RED).
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "extra-slash".to_string(),
+        prefix: "64:ff9b::/96/garbage".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }]);
+    assert!(
+        !state.is_active() && state.prefixes.is_empty(),
+        "an extra-slash prefix must skip the rule, got {} prefixes",
+        state.prefixes.len()
+    );
+    // Control: the well-formed exact-2-parts prefix still publishes.
+    let ok = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "good".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }]);
+    assert!(ok.is_active() && ok.prefixes.len() == 1);
+}
+
+#[test]
 fn valid_nat64_rule_still_applies() {
     // #2212/#3888 companion: a wholly valid NAT64 config must still apply
     // cleanly through the infallible path (the fail-scoped skip does not

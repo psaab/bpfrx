@@ -256,7 +256,9 @@ impl Nat64State {
         'rules: for snap in snaps {
             // Every NAT64 rule on the wire is enabled (the Go side skips
             // empty-prefix rules in buildNAT64Snapshots), so an empty prefix
-            // here is anomalous: fail closed rather than silently dropping it.
+            // here is anomalous: skip THIS rule with a loud warning (#3888,
+            // consistent with the other malformed-rule skips below) rather than
+            // silently dropping it — a disappeared rule stays visible in logs.
             if snap.prefix.is_empty() {
                 eprintln!(
                     "xpf nat64: skipping malformed rule {:?}: empty prefix",
@@ -264,20 +266,22 @@ impl Nat64State {
                 );
                 continue;
             }
-            // Parse "64:ff9b::/96" — extract the prefix address and verify /96.
+            // Parse "64:ff9b::/96" — require EXACTLY `<ipv6>/96`: two
+            // '/'-split parts AND a /96 mask. This backstop is the corrupt /
+            // lenient-snapshot path (a #1960 leniently-loaded or HA
+            // peer-synced config the Go #3886/#3887 commit gate did not vet),
+            // so it must be strict: a missing mask (one part), an EXTRA slash
+            // ("64:ff9b::/96/garbage" → three parts, whose trailing garbage
+            // would otherwise be silently ignored), or a non-/96 length skips
+            // the whole rule (#3888) — loudly, so the drop is visible. Mirrors
+            // the exact-2-parts `parse_prefix` in nptv6.rs.
             let parts: Vec<&str> = snap.prefix.split('/').collect();
-            match parts.get(1).and_then(|s| s.parse::<u8>().ok()) {
-                Some(96) => {}
-                // Only /96 is supported by the translator today; a different
-                // length (or a missing/garbage mask) skips the whole rule
-                // (#3888) — loudly, so the drop is visible.
-                _ => {
-                    eprintln!(
-                        "xpf nat64: skipping malformed rule {:?}: prefix {:?} (only /96 is supported)",
-                        snap.name, snap.prefix
-                    );
-                    continue;
-                }
+            if parts.len() != 2 || parts[1].parse::<u8>().ok() != Some(96) {
+                eprintln!(
+                    "xpf nat64: skipping malformed rule {:?}: prefix {:?} (only <ipv6>/96 is supported)",
+                    snap.name, snap.prefix
+                );
+                continue;
             }
             let addr: Ipv6Addr = match parts[0].parse() {
                 Ok(a) => a,
