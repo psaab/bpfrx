@@ -1,3 +1,36 @@
+## 2026-07-03 — #4033: heartbeat goroutine leak + double-fire on comms restart (fable-161 F-168)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed two coupled HA-robustness defects on the cluster
+    comms-restart path. (1) `Manager.StartHeartbeat` overwrote a running
+    heartbeat (`m.hbSender`/`m.hbReceiver`) without stopping the old
+    sender+receiver, leaking their goroutines (stopCh never closed) and
+    doubling the on-wire heartbeat rate — N comms restarts leaked N goroutine
+    sets. (2) The daemon `startClusterComms` bind-retry goroutine looped with a
+    plain `time.Sleep(2s)` and never observed `commsCtx`, so on a
+    `stopClusterComms`→`startClusterComms` restart the old retry goroutine
+    survived (up to 60s) and could call `StartHeartbeat` after teardown, racing
+    the replacement.
+  - **Fix**: `StartHeartbeat` is now idempotent — it calls `StopHeartbeat`
+    (cancel + join) before installing the new pair, serialized by a new
+    `hbStartMu` so concurrent starts cannot interleave; exactly one heartbeat
+    goroutine set at a time. `heartbeatSender.stop()` now closes its send socket
+    (matched the receiver; fixes an accompanying FD leak). Extracted the retry
+    loop to `Daemon.startHeartbeatWithRetry(ctx,…)` with a per-iteration
+    `ctx.Err()` guard and ctx-aware `sleepCtx`, so a cancelled comms context
+    makes the goroutine exit promptly. Added exported `Manager.HeartbeatRunning`.
+  - **File(s)**: pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat.go,
+    pkg/cluster/manager.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/cluster/heartbeat_stop_previous_test.go (new),
+    pkg/daemon/heartbeat_retry_ctx_test.go (new),
+    docs/bug-heartbeat-vrf-rebind-split-brain.md
+  - **Tests**: `TestStartHeartbeatStopsPreviousHeartbeat` (RED-on-revert: N
+    sequential starts leave only the last pair running),
+    `TestStartHeartbeatWithRetryExits{BeforeStart,MidRetry}OnCancel` +
+    `TestSleepCtx*` (RED-on-revert: retry loop honours ctx cancel instead of
+    spinning the full 60s budget). Full `pkg/cluster` + `pkg/daemon` suites
+    green with `-race`. test-failover WARRANTED (HA heartbeat) — batch-validate.
+
 ## 2026-07-03 — #4031: monitorFabricState exits + leaks sibling netlink socket on ENOBUFS (fable-161 F-167)
 
 - **Timestamp**: 2026-07-03

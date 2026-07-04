@@ -453,32 +453,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// Retry on bind failure: the control interface address and VRF device
 	// may not be ready during daemon startup (networkd race).
 	if cc.ControlInterface != "" && cc.PeerAddress != "" {
-		go func() {
-			for i := 0; i < 30; i++ {
-				localIP := resolveClusterInterfaceAddr(cc.ControlInterface, cc.PeerAddress, "")
-				if localIP == "" {
-					if i == 0 {
-						slog.Info("cluster: control interface has no usable address yet, waiting",
-							"interface", cc.ControlInterface)
-					}
-					time.Sleep(2 * time.Second)
-					continue
-				}
-				if err := d.cluster.StartHeartbeat(localIP, cc.PeerAddress, vrfDevice); err != nil {
-					if i < 5 {
-						slog.Info("cluster: heartbeat bind not ready, retrying",
-							"err", err, "attempt", i+1)
-					} else {
-						slog.Warn("failed to start cluster heartbeat, retrying",
-							"err", err, "attempt", i+1)
-					}
-					time.Sleep(2 * time.Second)
-					continue
-				}
-				return
-			}
-			slog.Error("cluster heartbeat failed after retries")
-		}()
+		go d.startHeartbeatWithRetry(commsCtx, cc.ControlInterface, cc.PeerAddress, vrfDevice)
 	}
 
 	// Start session/config sync on the control link (same interface as
@@ -889,6 +864,67 @@ func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
 			slog.Warn("cluster: fence: failed to disable rg_active",
 				"rg", rg.ID, "err", err)
 		}
+	}
+}
+
+// startHeartbeatWithRetry resolves the control-link local address and starts
+// the cluster heartbeat, retrying on a not-ready bind (the control interface
+// address and VRF device may not be ready during daemon startup — a networkd
+// race). It runs in its own goroutine, owned by the comms sub-context.
+//
+// It exits immediately when ctx is cancelled (#4033): stopClusterComms cancels
+// the comms context before installing new comms, so without this the old retry
+// goroutine would survive the teardown and keep looping — up to 30 * 2s = 60s
+// — and could call StartHeartbeat AFTER stopClusterComms, installing a
+// heartbeat into a torn-down comms lifecycle and racing the replacement
+// goroutine. Every iteration (and every retry sleep) observes ctx so a comms
+// restart leaves exactly one retry goroutine and one heartbeat.
+func (d *Daemon) startHeartbeatWithRetry(ctx context.Context, controlIface, peerAddr, vrfDevice string) {
+	for i := 0; i < 30; i++ {
+		if ctx.Err() != nil {
+			slog.Info("cluster: heartbeat start aborted, comms context cancelled")
+			return
+		}
+		localIP := resolveClusterInterfaceAddr(controlIface, peerAddr, "")
+		if localIP == "" {
+			if i == 0 {
+				slog.Info("cluster: control interface has no usable address yet, waiting",
+					"interface", controlIface)
+			}
+			if !sleepCtx(ctx, 2*time.Second) {
+				return
+			}
+			continue
+		}
+		if err := d.cluster.StartHeartbeat(localIP, peerAddr, vrfDevice); err != nil {
+			if i < 5 {
+				slog.Info("cluster: heartbeat bind not ready, retrying",
+					"err", err, "attempt", i+1)
+			} else {
+				slog.Warn("failed to start cluster heartbeat, retrying",
+					"err", err, "attempt", i+1)
+			}
+			if !sleepCtx(ctx, 2*time.Second) {
+				return
+			}
+			continue
+		}
+		return
+	}
+	slog.Error("cluster heartbeat failed after retries")
+}
+
+// sleepCtx blocks for d or until ctx is cancelled, whichever comes first. It
+// returns true if the full duration elapsed and false if ctx was cancelled —
+// a false result tells a retry loop to stop rather than continue.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
