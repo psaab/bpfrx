@@ -697,26 +697,56 @@ deploy_vm_deb() {
 	info "Cut-over complete for $vm."
 }
 
-# deploy_rolling_deb sequences the deb cut across both nodes (secondary
-# first), so the cluster keeps forwarding through the whole upgrade.
+# rolling_detect_secondary queries node0's `show chassis cluster status` and
+# echoes the RG0 SECONDARY node index (0 or 1) — the node to upgrade FIRST so
+# the primary keeps forwarding. The parse lives in deploy_rolling_secondary_node
+# (deploy-lib.sh, unit-tested in deploy-lib-selftest.sh, #4009). Best-effort: a
+# failed query falls through to the parser default (node1) without aborting the
+# set -e pipeline.
 #
-# Determine which node is secondary by asking node0 for ITS OWN local RG
-# state via `show chassis cluster information` (FormatInformation emits
-# "  Local state: Primary|Secondary"). The legacy deploy_rolling grep
-# pattern "secondary:node0" never matched the space-separated status rows
-# (AGY r1) and silently always upgraded node1 first; this checks the real
-# field. If node0 is Secondary, upgrade it first; else node1.
-deploy_rolling_deb() {
-	local secondary=1 primary=0
-	if incus exec "$(r "$VM0")" -- cli -c "show chassis cluster information" 2>/dev/null \
-		| grep -qiE '^[[:space:]]*Local state:[[:space:]]+Secondary'; then
-		secondary=0
-		primary=1
+# #4009: this REPLACES two divergent, defective detections — deploy_rolling's
+# inline `grep "secondary:node0"` (never matched the space-separated status
+# rows, so it silently upgraded node1 first even when node0 was the secondary →
+# a spurious mid-deploy failover) and deploy_rolling_deb's `show chassis cluster
+# information` / `Local state:` grep — with ONE tested SSOT parser.
+rolling_detect_secondary() {
+	incus exec "$(r "$VM0")" -- cli -c "show chassis cluster status" 2>/dev/null \
+		| deploy_rolling_secondary_node || true
+}
+
+# reassert_primary_node0 leaves node0 the primary for EVERY redundancy group
+# after a rolling deploy, so downstream smoke (apply-cos-config, test-failover)
+# starts from the documented node0-primary steady state regardless of preempt
+# config — removing the force-node0-primary workaround the HA batch scripts
+# needed (#4009). Best-effort: a failed request is logged, never fatal.
+reassert_primary_node0() {
+	local status rg did=0
+	status=$(incus exec "$(r "$VM0")" -- cli -c "show chassis cluster status" 2>/dev/null || true)
+	while read -r rg; do
+		[[ -n "$rg" ]] || continue
+		incus exec "$(r "$VM0")" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
+		incus exec "$(r "$VM0")" -- cli -c "request chassis cluster failover redundancy-group $rg node 0" >/dev/null 2>&1 || true
+		did=1
+	done < <(printf '%s\n' "$status" | deploy_rolling_rg_ids)
+	if [[ "$did" == 1 ]]; then
+		info "Re-asserted node0 primary for all redundancy groups (post-deploy)."
+	else
+		warn "Post-deploy primary reassert skipped — could not read cluster status from node0."
 	fi
+}
+
+# deploy_rolling_deb sequences the deb cut across both nodes (secondary
+# first), so the cluster keeps forwarding through the whole upgrade, then
+# re-asserts node0 primary for a deterministic post-deploy state (#4009).
+deploy_rolling_deb() {
+	local secondary primary
+	secondary=$(rolling_detect_secondary)
+	primary=$(( secondary == 0 ? 1 : 0 ))
 	info "Rolling deb deploy: secondary=node${secondary}, primary=node${primary}"
 	deploy_vm_deb "$secondary"
 	sleep 5
 	deploy_vm_deb "$primary"
+	reassert_primary_node0
 	info "Rolling deb deploy complete."
 }
 
@@ -725,13 +755,15 @@ deploy_rolling_deb() {
 # the secondary upgrades, then the upgraded secondary takes over when
 # the primary restarts.
 deploy_rolling() {
-	# Determine which node is currently secondary (deploy it first).
-	local secondary=1
-	local primary=0
-	if incus exec "$(r "$VM0")" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "secondary:node0"; then
-		secondary=0
-		primary=1
-	fi
+	# Determine which node is currently the RG0 secondary (deploy it first).
+	# #4009: the old inline `grep "secondary:node0"` never matched the
+	# space-separated `show chassis cluster status` rows, so this ALWAYS fell
+	# through to node1-first — restarting the PRIMARY first (a spurious
+	# mid-deploy failover) whenever node0 was the secondary. Now via the
+	# tested parser in deploy-lib.sh.
+	local secondary primary
+	secondary=$(rolling_detect_secondary)
+	primary=$(( secondary == 0 ? 1 : 0 ))
 
 	info "Rolling deploy: secondary=node${secondary}, primary=node${primary}"
 
@@ -760,6 +792,10 @@ deploy_rolling() {
 	# Phase 2: Deploy to primary (secondary takes over via VRRP).
 	info "Phase 2: Deploying to primary (node${primary})..."
 	deploy_vm "$primary"
+
+	# #4009: leave node0 the primary so downstream smoke starts from a known
+	# state regardless of preempt config.
+	reassert_primary_node0
 
 	info "Rolling deploy complete."
 }
