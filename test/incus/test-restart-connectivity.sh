@@ -20,12 +20,15 @@
 
 set -euo pipefail
 
-# Re-exec under incus-admin group if needed
-if ! incus list &>/dev/null 2>&1; then
-	if getent group incus-admin &>/dev/null && id -nG | grep -qw incus-admin; then
-		exec sg incus-admin -c "$(printf '%q ' "$0" "$@")"
-	fi
-fi
+# #1875/#4020: this DESTRUCTIVE smoke reboots / force-stops / fails
+# over a node on the SHARED loss cluster. Re-exec under the
+# incus-admin group if needed, then serialize as a #1875 lock cell
+# so a concurrent deploy/smoke can't collide with our reboot (it
+# queues behind a held /tmp/xpf-cluster.lock instead of colliding).
+_CELL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=cluster-cell.sh
+source "${_CELL_DIR}/cluster-cell.sh"
+xpf_enter_destructive_cluster_cell "test-restart-connectivity $*" "$0" "$@"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test/incus/cluster-env.sh
