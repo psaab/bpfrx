@@ -1,3 +1,36 @@
+## 2026-07-04 — #4103 F12: WG engine-config secret carriers zeroized (fable-163)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the carriers were non-zeroized:
+    `WgEngineConfig.local_private_key` and `WgPeerConfig.preshared_key`
+    were plain `[u8; 32]` under `#[derive(Clone)]`, while the RUNTIME
+    copies are `Zeroizing` (engine `local_private_key`, `PeerConfig`
+    PSK), and the `forwarding_build/wg.rs` build sites deref-copied the
+    Zeroizing source (`*p.preshared_key`, `*endpoint.wg_local_privkey`)
+    into the plaintext carrier — so every WG commit left a 32-byte X25519
+    private key + all PSKs in freed heap/stack. FIX: both fields →
+    `zeroize::Zeroizing<[u8; 32]>` (Clone preserved — Zeroizing is Clone);
+    build sites clone the Zeroizing source (no plaintext hop); `new()`
+    moves the Zeroizing carrier straight into the engine and uses
+    `*config.local_private_key` only for the transient `mul_base_clamped`
+    argument; `reconcile` derefs `*cfg.preshared_key` into
+    `PeerConfig::new` (which re-wraps in Zeroizing); WgPeerConfig manual
+    Debug derefs for the PSK-unset check; WgEngineConfig gains a manual
+    REDACTING Debug (a derived Debug on `Zeroizing<[u8;32]>` prints the
+    raw key). 159 test construction sites updated to `.into()` (the
+    `From<[u8;32]>` for Zeroizing — identity-safe if a site targeted a
+    different struct). RED-on-revert: `wg_config_secret_carriers_are_zeroizing`
+    type-annotated bindings fail to compile if the fields revert to
+    `[u8; 32]`.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+    userspace-dp/src/afxdp/forwarding_build/wg.rs,
+    userspace-dp/src/afxdp/wg/engine_tests.rs,
+    userspace-dp/src/afxdp/wg/tests.rs,
+    userspace-dp/src/afxdp/coordinator/wg_control.rs,
+    userspace-dp/src/afxdp/frame/wg.rs,
+    userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+    docs/wireguard-interop.md, _Log.md
+
 ## 2026-07-04 — #4103 F5: WG responder TAI64N anti-replay high-water survives config-change engine rebuild (fable-163)
 
 - **Timestamp**: 2026-07-04

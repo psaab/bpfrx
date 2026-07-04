@@ -183,13 +183,15 @@ pub(crate) struct WgPeerConfig {
     /// Optional per-peer preshared key (#1434 B2). `WG_ZERO_PSK` (32
     /// zero bytes) when no PSK is configured — semantically identical
     /// to "no PSK" in Noise IKpsk2. SECRET: never logged (the manual
-    /// Debug below redacts it).
-    pub(crate) preshared_key: [u8; 32],
+    /// Debug below redacts it). #4103 F12: wrapped in `Zeroizing` so a
+    /// cloned/dropped config carrier does not leave a plaintext PSK in
+    /// freed heap/stack — matching the runtime copy (`PeerConfig`).
+    pub(crate) preshared_key: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for WgPeerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let psk_state = if self.preshared_key == WG_ZERO_PSK {
+        let psk_state = if *self.preshared_key == WG_ZERO_PSK {
             "<unset>"
         } else {
             "<redacted>"
@@ -205,11 +207,28 @@ impl std::fmt::Debug for WgPeerConfig {
 }
 
 /// Per-engine config.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct WgEngineConfig {
-    pub(crate) local_private_key: [u8; 32],
+    /// Local X25519 private key. #4103 F12: `Zeroizing` so a
+    /// cloned/dropped config carrier does not leave a plaintext private
+    /// key in freed heap/stack — matching the runtime copy (the engine's
+    /// own `local_private_key`). SECRET: never logged (the manual Debug
+    /// below redacts it — a derived Debug on `Zeroizing<[u8; 32]>` would
+    /// print the raw key).
+    pub(crate) local_private_key: Zeroizing<[u8; 32]>,
     pub(crate) listen_port: u16,
     pub(crate) peers: Vec<WgPeerConfig>,
+}
+
+impl std::fmt::Debug for WgEngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the private key; surface only non-secret fields.
+        f.debug_struct("WgEngineConfig")
+            .field("local_private_key", &"<redacted>")
+            .field("listen_port", &self.listen_port)
+            .field("peers", &self.peers)
+            .finish()
+    }
 }
 
 /// Stack scratch capacity for the padded plaintext on the encap
@@ -442,9 +461,11 @@ impl std::fmt::Debug for WgEngine {
 impl WgEngine {
     pub(crate) fn new(config: WgEngineConfig) -> Self {
         let local_public_key =
-            MontgomeryPoint::mul_base_clamped(config.local_private_key).to_bytes();
+            MontgomeryPoint::mul_base_clamped(*config.local_private_key).to_bytes();
         let engine = Self {
-            local_private_key: Zeroizing::new(config.local_private_key),
+            // Move the Zeroizing carrier straight into the engine (no
+            // intermediate plaintext copy). #4103 F12.
+            local_private_key: config.local_private_key,
             local_public_key,
             tai64n_clock: Tai64nClock::new(),
             pending: RwLock::new(FxHashMap::default()),
@@ -712,7 +733,7 @@ impl WgEngine {
             let config = Arc::new(PeerConfig::new(
                 cfg.endpoint,
                 cfg.persistent_keepalive,
-                cfg.preshared_key,
+                *cfg.preshared_key,
             ));
             new_peers.push(PeerEntry { peer, config });
             // r7 Codex/Claude nit: duplicate pubkeys in `configs`

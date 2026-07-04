@@ -65,7 +65,9 @@ pub(super) fn populate_wg_engines(
                 endpoint: p.endpoint,
                 persistent_keepalive: p.keepalive_secs,
                 allowed_ips: p.allowed_ips.clone(),
-                preshared_key: *p.preshared_key,
+                // #4103 F12: clone the Zeroizing carrier (no plaintext
+                // deref-copy) — both source and dest are Zeroizing<[u8; 32]>.
+                preshared_key: p.preshared_key.clone(),
             })
             .collect();
         // Identity-stable reuse: same endpoint id with an unchanged WG
@@ -84,7 +86,9 @@ pub(super) fn populate_wg_engines(
         // Config changed or new: fresh engine, seeded from the prior
         // engine's TAI64N high-water (if any) so monotonicity survives.
         let engine = WgEngine::new(WgEngineConfig {
-            local_private_key: *endpoint.wg_local_privkey,
+            // #4103 F12: clone the Zeroizing carrier (no plaintext
+            // deref-copy) — both are Zeroizing<[u8; 32]>.
+            local_private_key: endpoint.wg_local_privkey.clone(),
             listen_port: endpoint.wg_listen_port,
             peers,
         });
