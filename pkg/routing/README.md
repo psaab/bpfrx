@@ -373,7 +373,15 @@ peer behind a valid route read up forever and the fail-safe
   a live runner is retained rather than drained. A per-tunnel `linkGen`
   (`*atomic.Uint64`, read LOCK-FREE by the runner — it never takes
   `t.mu`) is the defense-in-depth backstop; the runner drops any
-  transition whose captured generation no longer matches.
+  transition whose captured generation no longer matches. The anchor
+  branch also bumps `linkGen` whenever the `LinkAdd` ends `created` (#4076):
+  its up-front `willRecreate` switch has no `default: return` (unlike the
+  legacy branch), so a transient (non-not-found) lookup error that masks a
+  device that had actually VANISHED — `LinkAdd` then SUCCEEDS — would
+  otherwise leave the new device on a stale generation. The `created &&
+  !willRecreate` bump gives every genuinely new device a fresh generation
+  without double-bumping the already-drained classified-recreate path and
+  without touching a plain reuse/adopt reconcile.
 
 `Clear()`/`ClearTunnels` keep delete-everything semantics and reset the
 reconcile state. Restart residuals (documented): anchors/addresses/RI
