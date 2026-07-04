@@ -4149,3 +4149,236 @@ fn empty_missing_set_passes_without_warn() {
     assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
     assert_eq!(state.missing_profile_warn_count(), 0);
 }
+
+// ================================================================
+// #3902: source-independent screens on the FLOWLESS path
+// ================================================================
+//
+// A non-first IP fragment and a non-query ICMP/ICMPv6 control message are
+// deliberately flowless (#2344 / #3290 — the dataplane never derives an L4
+// tuple for them). Before #3902 the flowless branch ran ONLY the three L3
+// fragment screens (ping-of-death / teardrop / icmp-fragment), so the
+// SOURCE-INDEPENDENT screens — LAND anti-spoof, ip-source-route, ICMP flood,
+// UDP flood — were BYPASSED for those packets (screen fail-open).
+// `check_flowless_screens` now runs them. Each drop test below goes RED if
+// the fix is reverted: the pre-#3902 `check_fragment_screens_l3` never
+// evaluated LAND / source-route / the flood counters.
+
+/// A flowless non-query ICMP/ICMPv6 packet (no fragment, no L4 flow).
+fn flowless_icmp_pkt(src: IpAddr, dst: IpAddr) -> ScreenPacketInfo {
+    let (proto, af) = match src {
+        IpAddr::V4(_) => (PROTO_ICMP, libc::AF_INET as u8),
+        IpAddr::V6(_) => (PROTO_ICMPV6, libc::AF_INET6 as u8),
+    };
+    ScreenPacketInfo {
+        addr_family: af,
+        protocol: proto,
+        tcp_flags: 0,
+        src_ip: src,
+        dst_ip: dst,
+        src_port: 0,
+        dst_port: 0,
+        tcp_seq: 0,
+        tcp_ack: 0,
+        tcp_mss: 0,
+        pkt_len: 84,
+        is_fragment: false,
+        is_first_fragment: false,
+        ip_ihl: 5,
+        ip_frag_off: 0,
+        ip_total_len: 84,
+        ip_payload_len: 0,
+        frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
+    }
+}
+
+/// A flowless non-first IPv4 fragment carrying `protocol` (no L4 flow). The
+/// fragment offset field is 185 (→ 1480 bytes, non-first) with MF=0 (tail
+/// fragment); the total length keeps the payload well above the teardrop
+/// threshold and the reassembled end below the ping-of-death ceiling so those
+/// two fragment screens do NOT fire — the source-independent screens under
+/// test are the only ones that can drop.
+fn flowless_nonfirst_fragment(src: IpAddr, dst: IpAddr, protocol: u8) -> ScreenPacketInfo {
+    ScreenPacketInfo {
+        addr_family: libc::AF_INET as u8,
+        protocol,
+        tcp_flags: 0,
+        src_ip: src,
+        dst_ip: dst,
+        src_port: 0,
+        dst_port: 0,
+        tcp_seq: 0,
+        tcp_ack: 0,
+        tcp_mss: 0,
+        pkt_len: 1400,
+        is_fragment: true,
+        is_first_fragment: false,
+        ip_ihl: 5,
+        ip_frag_off: 185, // offset field 185 (→ 1480 bytes), non-first, MF=0
+        ip_total_len: 1400,
+        ip_payload_len: 0,
+        frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
+    }
+}
+
+#[test]
+fn land_flowless_non_query_icmp_drops() {
+    // RED-on-revert: a crafted non-query ICMP whose src_ip == dst_ip is
+    // flowless (#3290) but LAND is source-independent and MUST drop it.
+    let mut profile = ScreenProfile::default();
+    profile.land = true;
+    let mut state = make_state("trust", profile);
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let pkt = flowless_icmp_pkt(ip, ip);
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_flowless_non_first_fragment_drops() {
+    // RED-on-revert: a non-first fragment whose src_ip == dst_ip must trip
+    // LAND on the flowless path.
+    let mut profile = ScreenProfile::default();
+    profile.land = true;
+    let mut state = make_state("trust", profile);
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 5, 5));
+    let pkt = flowless_nonfirst_fragment(ip, ip, PROTO_UDP);
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_flowless_addrs_unknown_skips() {
+    // When the caller could not derive the real L3 addresses (frame too
+    // short → addrs_known=false) LAND must be SKIPPED rather than fired on
+    // the unspecified==unspecified placeholder. The same tuple WITH
+    // addrs_known=true proves the guard is what suppresses it.
+    let mut profile = ScreenProfile::default();
+    profile.land = true;
+    let mut state = make_state("trust", profile);
+    let unspec = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    let pkt = flowless_icmp_pkt(unspec, unspec);
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, false, 1),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn source_route_flowless_non_first_fragment_drops() {
+    // RED-on-revert: ip-source-route is source-independent and must drop a
+    // flowless non-first fragment carrying an LSRR/SSRR option.
+    let mut profile = ScreenProfile::default();
+    profile.source_route = true;
+    let mut state = make_state("trust", profile);
+    let mut pkt = flowless_nonfirst_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+    );
+    pkt.saw_ipv4_source_route = true; // extractor decoded LSRR/SSRR
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Drop("ip-source-route")
+    );
+}
+
+#[test]
+fn icmp_flood_flowless_drops() {
+    // RED-on-revert: the per-zone ICMP flood counter is source-independent
+    // and must count flowless non-query ICMP packets.
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let pkt = flowless_icmp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 100),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 100),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 100),
+        ScreenVerdict::Drop("icmp-flood")
+    );
+}
+
+#[test]
+fn udp_flood_flowless_non_first_fragment_drops() {
+    // RED-on-revert: the per-zone UDP flood counter is source-independent
+    // and must count flowless non-first UDP fragments.
+    let mut profile = ScreenProfile::default();
+    profile.udp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let pkt = flowless_nonfirst_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 100),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 100),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 100),
+        ScreenVerdict::Drop("udp-flood")
+    );
+}
+
+#[test]
+fn teardrop_still_screened_on_flowless_path() {
+    // #3064 regression guard: the L3 fragment screens still fire on the
+    // flowless path through check_flowless_screens.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let mut pkt = flowless_nonfirst_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+    );
+    pkt.ip_frag_off = 0x0001; // offset field 1 (non-first)
+    pkt.ip_total_len = 24; // 20-byte header + 4-byte payload (< 8) → teardrop
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
+#[test]
+fn flowless_clean_non_first_fragment_passes() {
+    // A benign flowless non-first fragment (no screen tripped) must PASS —
+    // the fix must not over-drop. Uses the full default profile (LAND,
+    // source-route, all fragment screens enabled) with distinct src/dst.
+    let mut state = make_state("trust", default_profile());
+    let pkt = flowless_nonfirst_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Pass
+    );
+}
