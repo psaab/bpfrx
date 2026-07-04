@@ -1,3 +1,51 @@
+## 2026-07-04 — #4092: WireGuard responder handshake TAI64N anti-replay — enforce the per-peer greatest-timestamp gate
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed fable-161 F-190 (MEDIUM, WG handshake correctness).
+    VERIFY-FIRST: xpf HAND-ROLLS the WG handshake (snow Noise IKpsk2 +
+    `handshake` framing + `Tai64nClock`), it does NOT delegate to
+    boringtun. The TAI64N ENCODING is already correct (`wg/tai64n.rs`:
+    base `0x400000000000000a` = 2^62+10, big-endian, low-24-bit nanos
+    whitening, KAT-tested) — finding (a) is a non-issue. The
+    `Tai64nClock`/`high_water`/`seed_high_water` machinery is the
+    INITIATOR's monotonic clock (preserved across engine rebuilds in
+    `forwarding_build/wg.rs`), NOT the responder replay check. Finding
+    (b) was a GENUINE hand-rolled gap: the responder
+    (`consume_initiation_create_response_inner`) recovered the peer's
+    TAI64N into `ts_sink` but explicitly DID NOT enforce per-peer
+    anti-replay ("does not yet enforce per-peer TAI64N anti-replay —
+    that rides with the responder-hardening step"); no per-peer
+    greatest-timestamp store existed. A replayed msg1 was accepted and
+    installed a duplicate session. Fix: (1) `Peer.greatest_tai64n:
+    Mutex<[u8;12]>` + `check_and_update_tai64n` (accept iff strictly
+    greater, advance high-water; big-endian ⇒ lexicographic == numeric;
+    kernel `memcmp(ts,last)>0` / wireguard-go `t.After` parity);
+    (2) responder rejects with new `HandshakeError::ReplayedInitiation`
+    AFTER peer identification but BEFORE msg2 build / session install /
+    liveness stamp; (3) dedicated `hs_rx_drops_replayed_init` counter
+    (Rust wire + status.rs) surfaced end-to-end into Go
+    (protocol.go/metrics_userspace.go Prometheus /format/wireguard.go
+    CLI). RED-on-revert verified: disabling the gate makes the replayed
+    initiation return Ok and the test FAILS. FULL cargo green (the one
+    `test_paused_telemetry_eviction_does_not_poison_drain_2875` failure
+    is PRE-EXISTING — fails identically on pristine origin/master, a
+    known event_stream socket-timing flake, unrelated). go build +
+    affected go tests green. Peer-resident store survives config
+    commits; an engine crypto-identity rebuild resets it (WG-spec bounded
+    reset). No live operator doc enumerates the counter set (only
+    historical PR-plan docs) — none to update.
+  - **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+    userspace-dp/src/afxdp/wg/handshake_session.rs,
+    userspace-dp/src/afxdp/wg/counters.rs,
+    userspace-dp/src/afxdp/wg/tests.rs,
+    userspace-dp/src/protocol/control.rs,
+    userspace-dp/src/protocol/tests.rs,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    pkg/dataplane/userspace/protocol.go, pkg/api/metrics_userspace.go,
+    pkg/api/metrics_wireguard_test.go,
+    pkg/dataplane/userspace/format/wireguard.go,
+    pkg/dataplane/userspace/wg_status_test.go, _Log.md
+
 ## 2026-07-04 — #4078: `system archival configuration transfer-interval` periodic archive accepted-but-inert — add the runtime timer
 
 - **Timestamp**: 2026-07-04

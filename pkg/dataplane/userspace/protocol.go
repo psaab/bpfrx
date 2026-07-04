@@ -1684,10 +1684,14 @@ type WgTunnelStatus struct {
 	HsRxDropsUnknownPeer      uint64 `json:"hs_rx_drops_unknown_peer,omitempty"`
 	HsRxDropsStaleResponse    uint64 `json:"hs_rx_drops_stale_response,omitempty"`
 	HsRxDropsIndexExhausted   uint64 `json:"hs_rx_drops_index_exhausted,omitempty"`
-	HsRxCookieUnsupported     uint64 `json:"hs_rx_cookie_unsupported,omitempty"`
-	RxUnknownType             uint64 `json:"rx_unknown_type,omitempty"`
-	HsSendErrors              uint64 `json:"hs_send_errors,omitempty"`
-	HsRequestsArmed           uint64 `json:"hs_requests_armed,omitempty"`
+	// #4092 responder handshake anti-replay rejects: a type-1
+	// initiation whose TAI64N was <= the greatest already accepted from
+	// that peer. Distinct from the transport DecapDropsReplay window.
+	HsRxDropsReplayedInit uint64 `json:"hs_rx_drops_replayed_init,omitempty"`
+	HsRxCookieUnsupported uint64 `json:"hs_rx_cookie_unsupported,omitempty"`
+	RxUnknownType         uint64 `json:"rx_unknown_type,omitempty"`
+	HsSendErrors          uint64 `json:"hs_send_errors,omitempty"`
+	HsRequestsArmed       uint64 `json:"hs_requests_armed,omitempty"`
 
 	DecapPackets              uint64 `json:"decap_packets,omitempty"`
 	DecapBytes                uint64 `json:"decap_bytes,omitempty"`

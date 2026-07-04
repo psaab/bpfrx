@@ -70,6 +70,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			HsRxDropsUnknownPeer:      8,
 			HsRxDropsStaleResponse:    9,
 			HsRxDropsIndexExhausted:   10,
+			HsRxDropsReplayedInit:     45,
 			HsRxCookieUnsupported:     11,
 			RxUnknownType:             12,
 			HsSendErrors:              13,
@@ -151,6 +152,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=unknown_peer,tunnel=wg0":                  8,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=stale_response,tunnel=wg0":                9,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=index_exhausted,tunnel=wg0":               10,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=replayed_init,tunnel=wg0":                 45,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=cookie_unsupported,tunnel=wg0":            11,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=unknown_type,tunnel=wg0":                  12,
 		"xpf_userspace_wg_transport_packets_total,direction=encap,tunnel=wg0":                       26,
@@ -270,13 +272,13 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 			t.Errorf("last-handshake gauge emitted for a never-handshaked tunnel")
 		}
 	}
-	// 2 completions + 3 singles + 8 hs reasons + 2 pkts + 2 bytes +
-	// 1 keepalive + 15 drop reasons (incl. 2x expired, #1888) + 4 send
-	// kinds + 1 confirmed (per-peer, #1434; one peer here) + 3 rekey
-	// reasons + 2 keepalive-sent kinds + 1 sessions-expired +
-	// 1 attempts-aborted = 45.
-	if count != 45 {
-		t.Errorf("emitted %d series for a zeroed tunnel, want 45 (zeros are real signals)", count)
+	// 2 completions + 3 singles + 9 hs reasons (incl. replayed_init,
+	// #4092) + 2 pkts + 2 bytes + 1 keepalive + 15 drop reasons (incl.
+	// 2x expired, #1888) + 4 send kinds + 1 confirmed (per-peer, #1434;
+	// one peer here) + 3 rekey reasons + 2 keepalive-sent kinds +
+	// 1 sessions-expired + 1 attempts-aborted = 46.
+	if count != 46 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 46 (zeros are real signals)", count)
 	}
 }
 

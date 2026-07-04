@@ -3603,3 +3603,123 @@ mod s5_timer_tests {
         );
     }
 }
+
+/// #4092 responder handshake anti-replay. Drives the FULL framed
+/// handshake entry points (`create_initiation` →
+/// `consume_initiation_create_response`) so the responder's per-peer
+/// greatest-TAI64N gate is exercised end to end.
+mod tai64n_replay_tests {
+    use super::super::engine::{WgEngine, WgEngineConfig, WgPeerConfig};
+    use super::super::handshake_session::HandshakeError;
+    use super::super::{WG_MSG_INIT_LEN, WG_MSG_RESPONSE_LEN};
+    use super::keypair;
+    use std::sync::atomic::Ordering;
+
+    /// Two engines configured as each other's sole peer (no endpoints —
+    /// the handshake is driven by hand, not over UDP).
+    fn engine_pair() -> (WgEngine, WgEngine, [u8; 32], [u8; 32]) {
+        let (init_priv, init_pub) = keypair();
+        let (resp_priv, resp_pub) = keypair();
+        let init = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![],
+                preshared_key: [0u8; 32],
+            }],
+        });
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![],
+                preshared_key: [0u8; 32],
+            }],
+        });
+        (init, resp, init_pub, resp_pub)
+    }
+
+    #[test]
+    fn responder_rejects_replayed_initiation_by_tai64n() {
+        let (init_engine, resp_engine, _init_pub, resp_pub) = engine_pair();
+
+        // Build ONE framed type-1 initiation. Its TAI64N is stamped once
+        // here, so replaying the identical bytes re-presents that exact
+        // timestamp (no fresh monotonic tick).
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init_engine
+            .create_initiation(&resp_pub, &mut msg1)
+            .expect("initiator builds a framed initiation");
+
+        // First delivery: fresh timestamp — the responder accepts and
+        // builds a type-2 response.
+        let mut resp_out = [0u8; WG_MSG_RESPONSE_LEN];
+        let first = resp_engine.consume_initiation_create_response(&msg1, &mut resp_out);
+        assert!(first.is_ok(), "fresh initiation must be accepted: {first:?}");
+
+        // Replay the IDENTICAL initiation. Its TAI64N now equals the
+        // greatest already accepted from this peer, so the responder MUST
+        // reject it (#4092). On revert (no gate) this second call succeeds
+        // and installs a duplicate session — the RED signal.
+        let mut resp_out2 = [0u8; WG_MSG_RESPONSE_LEN];
+        let second = resp_engine.consume_initiation_create_response(&msg1, &mut resp_out2);
+        assert_eq!(
+            second,
+            Err(HandshakeError::ReplayedInitiation),
+            "a replayed initiation (TAI64N <= greatest accepted) must be rejected"
+        );
+
+        // The dedicated replay-reject counter moved exactly once; the
+        // response-created counter reflects only the one accepted msg1.
+        let c = resp_engine.counters();
+        assert_eq!(c.hs_rx_drops_replayed_init.load(Ordering::Relaxed), 1);
+        assert_eq!(c.hs_responses_created.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn responder_accepts_strictly_newer_initiation() {
+        // A DISTINCT, strictly-newer initiation (fresh monotonic TAI64N
+        // from the initiator clock) is accepted after a first one — the
+        // gate rejects only replays/reorders, never legitimate rekeys.
+        let (init_engine, resp_engine, _init_pub, resp_pub) = engine_pair();
+
+        let mut msg1a = [0u8; WG_MSG_INIT_LEN];
+        init_engine
+            .create_initiation(&resp_pub, &mut msg1a)
+            .expect("first initiation");
+        let mut out_a = [0u8; WG_MSG_RESPONSE_LEN];
+        assert!(
+            resp_engine
+                .consume_initiation_create_response(&msg1a, &mut out_a)
+                .is_ok()
+        );
+
+        // create_initiation stamps a strictly-greater monotonic TAI64N,
+        // so this second framed initiation is a fresh (re)key, not a
+        // replay.
+        let mut msg1b = [0u8; WG_MSG_INIT_LEN];
+        init_engine
+            .create_initiation(&resp_pub, &mut msg1b)
+            .expect("second initiation");
+        let mut out_b = [0u8; WG_MSG_RESPONSE_LEN];
+        let second = resp_engine.consume_initiation_create_response(&msg1b, &mut out_b);
+        assert!(
+            second.is_ok(),
+            "a strictly-newer initiation must be accepted: {second:?}"
+        );
+        assert_eq!(
+            resp_engine
+                .counters()
+                .hs_rx_drops_replayed_init
+                .load(Ordering::Relaxed),
+            0,
+            "a legitimate rekey must not count as a replay"
+        );
+    }
+}

@@ -52,6 +52,12 @@ pub(crate) enum HandshakeError {
     OutputTooSmall,
     /// Internal snow / engine error building the handshake state.
     Internal,
+    /// The initiation's recovered TAI64N is `<=` the greatest already
+    /// accepted from this peer — a replayed or reordered type-1 message.
+    /// Dropped per the WireGuard handshake anti-replay rule (#4092)
+    /// AFTER identifying the peer but BEFORE any msg2 crypto or session
+    /// install, so a replay costs the responder nothing.
+    ReplayedInitiation,
 }
 
 impl From<FramingError> for HandshakeError {
@@ -460,11 +466,10 @@ impl WgEngine {
             .map_err(|_| HandshakeError::Internal)?;
         let mut ts_sink = [0u8; TAI64N_LEN];
         // snow writes the recovered Noise payload (the peer's TAI64N) into
-        // ts_sink; the value is used by a compliant responder for handshake
-        // anti-replay. S1 derives the session and (per the (b+) boundary)
-        // does not yet enforce per-peer TAI64N anti-replay — that rides
-        // with the responder-hardening step. We still must READ it so snow
-        // advances the transcript.
+        // ts_sink. A compliant responder uses it for handshake anti-replay:
+        // after identifying the peer below (#4092) we reject an initiation
+        // whose TAI64N is `<=` the greatest already accepted from that peer.
+        // We must READ it here regardless so snow advances the transcript.
         if state.read_message(parsed.noise_body, &mut ts_sink).is_err() {
             return Err(HandshakeError::Crypto);
         }
@@ -481,6 +486,23 @@ impl WgEngine {
         let Some(peer_config) = self.peer_config(&peer_pubkey) else {
             return Err(HandshakeError::UnknownInitiator);
         };
+
+        // #4092 responder handshake anti-replay. The peer is now
+        // identified (from the static key snow recovered above); reject a
+        // replayed or reordered initiation — one whose TAI64N is `<=` the
+        // greatest we have already accepted from this peer — BEFORE the
+        // expensive msg2 build / session install / liveness stamp, matching
+        // the WireGuard whitepaper §5.1 rule and the kernel's
+        // `memcmp(timestamp, last_timestamp) > 0` gate. The check-and-update
+        // is atomic on the peer's own high-water lock, so two concurrent
+        // initiations from the same peer cannot both pass. A peer that
+        // vanished between the two table loads is treated as unknown.
+        let peer = self
+            .peer_arc(&peer_pubkey)
+            .ok_or(HandshakeError::UnknownInitiator)?;
+        if !peer.check_and_update_tai64n(&ts_sink) {
+            return Err(HandshakeError::ReplayedInitiation);
+        }
 
         // #1434 B2: the responder learns the peer only AFTER reading
         // msg1, but the PSK is mixed during the msg2 WRITE (the Psk(2)
@@ -548,10 +570,10 @@ impl WgEngine {
             self.now_ns(),
         ));
         // #1888 S5: a valid msg1 is an authenticated RECEIVE — stamp
-        // last_recv_any (clears the T7 no-reply arm), §3 rule.
-        if let Some(peer) = self.peer_arc(&peer_pubkey) {
-            peer.note_authenticated_recv(self.now_ns());
-        }
+        // last_recv_any (clears the T7 no-reply arm), §3 rule. Reuse the
+        // `peer` Arc resolved for the #4092 anti-replay check above (same
+        // pubkey → same long-lived `Arc<Peer>`).
+        peer.note_authenticated_recv(self.now_ns());
         // Install the live session (UNCONFIRMED — egress gated until the first
         // authenticated inbound transport record), then clear the reservation.
         // Both under the reconcile_lock we already hold.

@@ -170,6 +170,7 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 			{"unknown_peer", t.HsRxDropsUnknownPeer},
 			{"stale_response", t.HsRxDropsStaleResponse},
 			{"index_exhausted", t.HsRxDropsIndexExhausted},
+			{"replayed_init", t.HsRxDropsReplayedInit},
 			{"cookie_unsupported", t.HsRxCookieUnsupported},
 			{"unknown_type", t.RxUnknownType},
 		} {
