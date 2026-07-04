@@ -1,3 +1,35 @@
+## 2026-07-04 — #4116: VRRP address owner (priority 255) always preempts (fable-163 F22)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the defect at HEAD (890b69ea3):
+    `getPreempt()` (pkg/vrrp/instance.go) returned `cfg.Preempt` verbatim,
+    so the `handleBackupRx` master-down-reset gate
+    (`if !getPreempt() || pkt.Priority >= pri`) reset the timer on EVERY
+    advert for a no-preempt owner → an address owner (priority 255,
+    no-preempt) that returned after a lower-priority peer took over stayed
+    BACKUP indefinitely though it OWNS the VIP (RFC 5798 §6.1 requires the
+    owner to preempt irrespective of the flag). The existing owner-255
+    exemption covered only track-down demotion (`getPriority`, track.go),
+    NOT the preempt case — F22 is the preempt case. FIX: force effective
+    preempt=true for the address owner at the two runtime preempt-decision
+    sites, keyed on the CONFIGURED priority (255): `getPreempt()` returns
+    `cfg.Preempt || cfg.Priority == 255`; `shouldPreemptObservedMaster()`
+    early-return becomes `if !preempt && priority != 255`. Added named const
+    `addressOwnerPriority = 255`. Composes with the track-exempt demotion
+    (owner is never demoted, so configured 255 is authoritative); no-op for
+    every non-owner (priorities < 255) so cluster RETH failover, the #2082
+    sync-hold gate, and ~60ms timing are unaffected. Tests
+    (instance_owner_preempt_test.go): getPreempt truth table + sync-hold
+    suppression, shouldPreemptObservedMaster owner-vs-nonowner, preemptNowCh
+    wiring, end-to-end reclaim via the master-down timer, non-owner
+    no-regression twin, owner-preempt-enabled unchanged. RED-on-revert
+    verified (5 owner tests FAIL on pre-fix instance.go: getPreempt=false,
+    state=BACKUP, timer reset). go test -race ./pkg/vrrp/ green; go build
+    ./..., vet, gofmt clean. Docs: critical-patterns.md,
+    feature-coverage.md.
+  - **File(s)**: pkg/vrrp/instance.go,
+    pkg/vrrp/instance_owner_preempt_test.go, docs/critical-patterns.md,
+    docs/feature-coverage.md, _Log.md
 ## 2026-07-04 — #4117: ESP proposals fail closed on a dangling reference (fable-163 F24)
 
 - **Timestamp**: 2026-07-04

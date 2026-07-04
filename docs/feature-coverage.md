@@ -113,7 +113,9 @@ the userspace dataplane admission boundary is in
   runtime kernel rename: the link watcher keys rename detection on the stable
   ifindex, so when the tracked name is renamed away (a single `RTM_NEWLINK`
   with the same ifindex but a new name, no `RTM_DELLINK`) the instance demotes
-  rather than holding stale "up" state (#2944).
+  rather than holding stale "up" state (#2944). The IP address owner (priority
+  255) always preempts a lower-priority master irrespective of the `no-preempt`
+  flag (RFC 5798 §6.1, #4116) and is exempt from track-down demotion.
 - **Bondless RETH**: VRRP on physical member interfaces, per-node virtual
   MAC (`02:bf:72:CC:RR:NN`), no Linux bonding required.
 - **Session sync**: incremental 1s sweep + ring buffer + GC delete
