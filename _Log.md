@@ -29148,3 +29148,11 @@ top.
   pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
   pkg/ipsec/swanctl_render_test.go, pkg/ipsec/ike_chain_failclosed_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-162 — RIP `redistribute`/group `export`/`neighbor`/
+  `passive-interface` bracket lists no longer truncate to the first entry.
+  Declared RIP list-leaves marked `multi: true`; RIP compiler block reads every
+  value via `firewallMatchValues` into the already-plural RIPConfig slices.
+- **File(s)**: pkg/config/schema_routing.go, pkg/config/compiler_protocols.go,
+  pkg/config/compiler_rip_multivalue_3904_test.go, docs/config-schema.md

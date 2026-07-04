@@ -274,6 +274,18 @@ both AST shapes):
   `compiler_ipsec_proposals_multivalue_3904_test.go` (both AST shapes + dangling-
   second rejection) and `pkg/ipsec/ike_proposals_multivalue_3904_test.go` (both
   proposals comma-joined into the rendered swanctl config, PFS applied to all).
+- **RIP `redistribute` / group `export` / `neighbor` / `passive-interface`**
+  (`schema_routing.go` — the declared top-level leaves are now `multi: true`; the
+  `group` block stays an opaque `children: nil` container, so its `export` /
+  `neighbor` bracket list already collapses onto Keys[1:]). The RIP block in
+  `compileProtocols` (`compiler_protocols.go`) reads every value via
+  `firewallMatchValues` into the already-plural `RIPConfig.Redistribute` /
+  `Interfaces` / `Passive` slices. Before #3904 each read only `child.Keys[1]`, so
+  `redistribute [ static connected ]` or `export [ pa pb ]` kept ONE entry — a
+  RIP node silently advertised / redistributed less than configured. The existing
+  RIP export strict validator (`compiler_validate_strict.go`) already walks the
+  full slice, so a dangling non-first export name is rejected at commit. Coverage:
+  `compiler_rip_multivalue_3904_test.go` (both AST shapes).
 
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
