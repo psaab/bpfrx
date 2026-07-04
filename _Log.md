@@ -29558,3 +29558,38 @@ top.
     force-node0-primary gate.
   - **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
     docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3932 — flow-traceoptions leaked one EventReader callback per
+    commit. `updateFlowTrace`/`applyFlowTrace` (pkg/daemon/daemon_flow.go)
+    closed the old `TraceWriter` but still called
+    `EventReader.AddCallback(tw.HandleEvent)` every commit touching
+    `security flow traceoptions`, without removing the previous callback. After
+    N such commits the reader held N registered trace callbacks: each event was
+    dispatched to all N, and the stale (already-closed) writers still ran
+    `HandleEvent` and bumped `DroppedWrites` — an unbounded per-event cost plus
+    a leaked-writer drop storm on a long-lived daemon. Fix (issue option b, the
+    #2075/#3742 flowexport pattern): register a SINGLE stable indirection
+    callback `Daemon.flowTraceCallback` exactly once (guarded by `traceCBOnce`)
+    that reads the live writer lock-free from a new
+    `atomic.Pointer[logging.TraceWriter]` (`traceWriterPtr`, replacing the plain
+    `traceWriter` field); each reconcile only SWAPS the underlying writer and
+    closes the one it replaced (`reconcileFlowTrace`), guarded by `traceReconMu`
+    so exactly one writer is closed per swap while the event-path callback stays
+    lock-free. Disabling traceoptions swaps in nil (callback stays, no-op); a
+    NewTraceWriter build failure keeps the current writer running rather than
+    dropping tracing. Added exported test hook
+    `logging.SetTraceLogDirForTest` (trace.go) so the cross-package daemon test
+    can drive `NewTraceWriter` against a temp dir. RED-on-revert unit test
+    `TestFlowTraceSingleCallbackAcrossReconciles`: after 3 reconciles the reader
+    has exactly 1 callback (RED=2/3 on revert) + 1 live writer, the 2 superseded
+    writers are closed and receive ZERO dispatched events (their `DroppedWrites`
+    do not move — RED bumps them on revert), a single SESSION_CLOSE writes
+    exactly one trace line, and disabling clears the writer while the single
+    callback remains. Verified RED by simulating the per-commit AddCallback
+    (callbacks=2, want 1). `go test -race ./pkg/daemon/... ./pkg/logging/...`
+    green, `go build ./...`, gofmt, vet clean. Doc: pkg/logging/README.md
+    flow-trace single-callback bullet.
+  - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_flow.go,
+    pkg/daemon/daemon_flowtrace_3932_test.go, pkg/logging/trace.go,
+    pkg/logging/README.md, _Log.md

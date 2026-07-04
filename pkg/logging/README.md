@@ -328,6 +328,24 @@ client never reconnects once the receiver returns.
   `TestLocalLogWriter_NilFileDropObservable`,
   `TestLocalLogWriter_TightensExistingMode`,
   `TestLocalLogWriter_HardenedOpen`.
+- **Flow-trace uses ONE stable EventReader callback, writer swapped in place
+  (#3932).** The daemon registers a single indirection callback
+  (`Daemon.flowTraceCallback`, `pkg/daemon/daemon_flow.go`) on the
+  `EventReader` exactly once — guarded by `traceCBOnce` — and every config
+  commit that changes `security flow traceoptions` only SWAPS the underlying
+  `TraceWriter` behind an `atomic.Pointer`, closing the writer it replaced
+  (`reconcileFlowTrace`). Before #3932, `applyFlowTrace`/`updateFlowTrace`
+  called `EventReader.AddCallback` on every such commit without removing the
+  previous one, so a long-lived daemon accumulated N callbacks: each event was
+  dispatched to all N, and the stale (already-closed) writers still received
+  every event, bumping their `DroppedWrites` — a growing per-event cost plus a
+  leaked-writer drop storm. The callback reads the live writer lock-free;
+  `traceReconMu` serializes the build+swap on the commit path so exactly one
+  writer is closed per swap. Disabling traceoptions clears the pointer to nil
+  (the stable callback stays but becomes a no-op); a build failure keeps the
+  current writer running (the flowexport #3742 keep-old-on-failure posture).
+  `EventReader.CallbackCount()` is the leak witness. Pin:
+  `TestFlowTraceSingleCallbackAcrossReconciles` (`pkg/daemon`).
 - **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
   The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
   in its first 8 bytes (LE u64), stamped by the userspace-dp producer at
