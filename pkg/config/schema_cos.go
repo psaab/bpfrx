@@ -113,6 +113,22 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			}},
 			"scheduler-map": {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
 		}},
+		// #4021: interface-level (physical, no unit) bindings. In Junos these
+		// apply to every logical unit on the port; a unit-level binding
+		// overrides per knob. The compiler folds them into the configured
+		// units (applyCoSInterfaceLevelBindings). Same knobs as the unit
+		// level so flat-set grouping nests them identically.
+		"classifiers": {desc: "Classifiers applied at the interface level (all units)", children: map[string]*schemaNode{
+			"dscp":       {desc: "DSCP classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
+			"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
+		}},
+		"rewrite-rules": {desc: "Rewrite rules applied at the interface level (all units)", children: map[string]*schemaNode{
+			"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+		}},
+		"shaping-rate": {desc: "Shaping rate applied at the interface level in bits per second (k/m/g suffixes)", args: 1, placeholder: "<rate>", children: map[string]*schemaNode{
+			"burst-size": {desc: "Shaping burst size in bytes (k/m/g suffixes)", args: 1, placeholder: "<bytes>", children: nil},
+		}},
+		"scheduler-map": {desc: "Scheduler map to apply at the interface level (all units)", args: 1, placeholder: "<map-name>", children: nil},
 	}},
 	"fairness": {desc: "Dataplane fairness observability configuration", children: map[string]*schemaNode{
 		"rss-expectation": {desc: "Declarative RSS flow-distribution expectations evaluated against live dataplane status (shown in fairness output and exported as Prometheus gauges)", children: map[string]*schemaNode{

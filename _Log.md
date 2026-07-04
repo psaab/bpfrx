@@ -1,3 +1,37 @@
+## 2026-07-03 — #4021: interface-level class-of-service binding was silently dropped (fable-161 F-028)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the CoS interface-binding compiler dropping a binding
+    applied at the physical interface level (`class-of-service interfaces geX
+    { scheduler-map M; ... }` with no `unit`). Verified first with a scratch
+    repro: the interface-level form compiled AND passed SchemaValidate cleanly
+    but `cos.Interfaces[geX]` came back nil (only `unit N` children were read),
+    so the shaping/classification/marking never applied — a genuine
+    config-parity defect, unlike F-027.
+  - **Fix**: added `CoSInterface.Level` (`types_cos.go`); extracted the
+    per-unit knob reader into `parseCoSInterfaceUnitBody` and reused it to read
+    the interface node's direct knobs into `Level`
+    (`compiler_class_of_service.go`); a post-compile pass
+    `applyCoSInterfaceLevelBindings` (`compiler.go`, after both the interface
+    stanza and CoS are compiled) folds `Level` into each configured logical
+    unit with unit-level-overrides-interface-level precedence per knob. Added
+    the interface-level knobs (scheduler-map, shaping-rate+burst-size,
+    classifiers, rewrite-rules) as schema children of `interfaces geX` so
+    flat-set grouping nests them like the unit form and tab-completion offers
+    them (`schema_cos.go`). Dataplane snapshot + `show class-of-service`
+    consumers iterate `Units` and are UNCHANGED.
+  - **File(s)**: pkg/config/types_cos.go,
+    pkg/config/compiler_class_of_service.go, pkg/config/compiler.go,
+    pkg/config/schema_cos.go, pkg/config/parser_class_of_service_test.go,
+    pkg/dataplane/userspace/cos_iface_level_4021_test.go,
+    docs/cos-traffic-shaping.md
+  - **Validation**: new config tests (interface-level folds into all units;
+    unit overrides per knob while inheriting the rest; per-unit-only unchanged)
+    + a dataplane snapshot test proving the binding reaches the per-unit
+    InterfaceSnapshot the Rust dataplane consumes; all RED on revert of the
+    fold pass. `go test ./pkg/config/... ./pkg/dataplane/...` green, `go build
+    ./...`, gofmt, vet clean.
+
 ## 2026-07-03 — #4017: image bake signed the appliance manifest BEFORE the validation gate → a FAILED/invalid image got a minisign signature and was publishable (false trust)
 
 - **Timestamp**: 2026-07-03
