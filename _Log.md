@@ -1,3 +1,37 @@
+## 2026-07-04 — #4097: FRR community-list member / as-path regex render-side sanitize belt (fable-163 F2)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST on the reported HIGH frr.conf config-injection.
+    Confirmed the two render sites DO emit verbatim: `policy_render.go`
+    `bgp community-list %s %s permit %s` (member) and `bgp as-path
+    access-list %s permit %s` (`ap.Regex`), while every auth/description
+    field routes through `sanitizeFRRValue`. BUT the newline-injection
+    vector is ALREADY closed at HEAD by the pre-existing #1798/#3900
+    AST-level control-char defense in `pkg/config/freetext.go`, which
+    runs at the top of `compileExpanded` for EVERY compile and covers
+    community members + as-path regexes because they are ordinary AST
+    node values: strict commit hard-rejects any control char
+    (`validateNodesControlChars`), lenient load/HA-sync/rollback scrubs
+    it in place (`sanitizeNodesControlChars`). Proven by probe: with a
+    would-be new gate removed, strict `CompileConfig` still rejects the
+    `\n` as-path/community value; lenient load scrubs it to a
+    newline-free regex. So the injection is NOT exploitable — the issue's
+    "bypasses ALL sanitization" premise misses the AST layers.
+  - **Decision**: The genuine gap is layer-3 of the documented #1798
+    three-layer model — the render-side belt these two sites lacked while
+    every other frr.conf free-text field has it. Shipped ONLY the render
+    belt (route `member` + `ap.Regex` through `sanitizeFRRValue`; a space
+    stays legit because FRR reads both as a rest-of-line token). Did NOT
+    add the commit-time strict gate the issue asked for — it is fully
+    redundant with `validateNodesControlChars` (fires first) and would be
+    dead code. F20 (Junos→FRR as-path regex syntax translation) is
+    non-trivial (different regex semantics) — left for a separate issue.
+  - **File(s)**: `pkg/frr/policy_render.go` (2 render sites +
+    `sanitizeFRRValue` doc), `pkg/frr/policy_injection_4097_test.go`
+    (render RED-on-revert), `pkg/config/compiler_frr_policy_inject_4097_test.go`
+    (guards #1798 coverage of the two fields end-to-end),
+    `pkg/frr/README.md` (security section bullet).
+
 ## 2026-07-04 — #4092: WireGuard responder handshake TAI64N anti-replay — enforce the per-peer greatest-timestamp gate
 
 - **Timestamp**: 2026-07-04
