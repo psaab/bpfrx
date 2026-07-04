@@ -704,6 +704,36 @@ warning). The deny gate additionally unions `hasLog` across all deny nodes to
 match the compiler's per-node `applyCollapsedDenyModifiers` accumulation onto
 `pol.Log`.
 
+**Path-scoped `show configuration <path>` returns ALL siblings sharing the
+terminal keyword (#3980 — the display-side sibling of the #3377 all-nodes
+walk):** `navigatePath` (`ast.go`, the node selector behind every
+`FormatPath*` renderer — hierarchical text, `display set`, JSON, XML,
+inheritance) resolves a path that ends on a bare keyword. A hierarchy level
+may hold multiple DISTINCT statements with the same leading keyword — several
+`system ntp server <addr>`, repeated `system archival configuration
+archive-sites <url>`, many `routing-options static route <dest>`. The
+terminal single-key match previously returned `[]*Node{n}` (the FIRST
+sibling only), so `show configuration system ntp server` — and, worse, its
+`| display set` — showed only `server 1.1.1.1`, hiding the rest; a scoped
+`display set` backup taken that way silently dropped the hidden statements on
+restore. The fix gathers EVERY sibling whose first key equals the keyword
+(FindChildren-not-FindChild) at the terminal element. The FULL-tree
+serializers (`Format` / `FormatSet`, no path) already walked each sibling
+slice element and were never affected; naming a specific keyed value
+(`... server 2.2.2.2`) still resolves via the keyword+value multi-key branch
+to that one entry. Regression coverage:
+`pkg/config/show_config_repeated_keyword_3980_test.go` (path-scoped ntp +
+static-route render, static-route `display set` round-trip, full-tree
+control, single-statement no-regression). NOTE: a separate, orthogonal
+construction defect still collapses the *keyed-list leaves* `system ntp
+server` / `system archival configuration archive-sites` on flat-set replay —
+their `setSchema` entries are `args:1, children:nil` non-`multi`, so
+`SetPath`'s single-value-replace branch (`ast_edit.go`) keeps only the LAST
+on `set ...`/`load set`, even though the compiler reads all of them via
+`FindChildren` (`compiler_system.go`). That is a schema/SetPath fix (mark
+them keyed-list + read via `firewallMatchValues`), not a renderer change, and
+is tracked separately.
+
 **Security policies missing a required `match` criterion are rejected at commit
 (#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security
 policy `match` clause to specify all three core dimensions — `source-address`,
