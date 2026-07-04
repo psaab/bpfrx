@@ -81,13 +81,27 @@ set security nat source pool-utilization-alarm clear-threshold 70
 
 This is a single GLOBAL raise/clear pair (matching Junos `set security nat
 source pool-utilization-alarm` scope); the same thresholds apply to every
-source pool. Validation requires `0 < clear-threshold < raise-threshold <= 100`
-with the standard strict-vs-lenient split (`validatePoolUtilizationAlarm`,
+source pool. `clear-threshold` is OPTIONAL (#4077, Junos-faithful): a raise-only
+config —
+
+```
+set security nat source pool-utilization-alarm raise-threshold 90
+```
+
+— commits, with `clear-threshold` defaulted at parse time to a 10-point
+hysteresis margin below raise (`defaultPoolAlarmClearThreshold`, floored at 1),
+so raise 90 → clear 80, raise 50 → clear 40, raise 5 → clear 1. The default
+always lands inside `0 < clear < raise`, so the runtime monitor arms the alarm
+(it treats `clear <= 0` as disabled).
+
+When BOTH are set, validation requires `0 < clear-threshold < raise-threshold
+<= 100` with the standard strict-vs-lenient split (`validatePoolUtilizationAlarm`,
 `compiler_nat.go`): a bare `pool-utilization-alarm;` (raise=0/clear=0) and
-inverted/equal thresholds are hard `commit`/`commit check` errors, but the
-tolerant load / HA peer-sync path downgrades them to a warning so a node that
-committed a legacy config before this gate existed still boots (the runtime
-monitor treats raise<=0 as disabled, so a leniently-loaded bad config is inert).
+inverted/equal thresholds — and an EXPLICIT `clear-threshold 0` — are hard
+`commit`/`commit check` errors, but the tolerant load / HA peer-sync path
+downgrades them to a warning so a node that committed a legacy config before
+this gate existed still boots (the runtime monitor treats raise<=0 as disabled,
+so a leniently-loaded bad config is inert).
 
 Runtime behaviour (vSRX-faithful) is driven by a slow (10s) daemon-resident
 monitor (`pkg/natpoolalarm`) over the helper's LAST-APPLIED NAT pool snapshot

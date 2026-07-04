@@ -31889,3 +31889,28 @@ top.
     test-failover WARRANTED (VRRP failover timing) — batch-validate.
   - **File(s)**: pkg/vrrp/instance.go,
     pkg/vrrp/instance_master_interval_test.go, pkg/vrrp/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4077 — NAT source pool-utilization-alarm accept raise-only
+    config (clear-threshold optional). VERIFY-FIRST repro confirmed the
+    genuine defect: `set security nat source pool-utilization-alarm
+    raise-threshold 90` (no clear-threshold) was REJECTED at commit
+    (`validatePoolUtilizationAlarm`, clear=0 tripped `clear-threshold must be
+    in 1..raise-threshold-1`), and even had it been accepted the runtime
+    monitor (`pkg/natpoolalarm`) treats clear<=0 as disabled. Junos makes
+    clear-threshold optional. Fix: default clear-threshold at PARSE time in
+    `compiler_nat.go` when the operator supplies only raise — new
+    `defaultPoolAlarmClearThreshold(raise) = max(1, raise-10)` (10-point
+    hysteresis margin: raise 90 → clear 80, raise 5 → clear 1). A presence
+    flag (`clearSet`) distinguishes an OMITTED clear from an EXPLICIT one, so
+    an explicit `clear-threshold 0` (and inverted/equal/bare/out-of-range) is
+    still rejected — the #2079 gate is unchanged and only ever sees an
+    invalid clear the operator typed. RED-on-revert: neutralizing the default
+    makes `TestPoolUtilizationAlarmRaiseOnlyDefaultsClear` +
+    `...RaiseOnlyLowRaiseFloorsClear` fail (clear=0 raise=90/5 rejected).
+    Validated: `go test ./pkg/config/... ./pkg/natpoolalarm/...`, `go build
+    ./...`, gofmt + vet clean. Docs: docs/deterministic-nat-cgnat.md,
+    docs/config-schema.md.
+  - **File(s)**: pkg/config/compiler_nat.go,
+    pkg/config/compiler_nat_pool_alarm_test.go,
+    docs/deterministic-nat-cgnat.md, docs/config-schema.md, _Log.md

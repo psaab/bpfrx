@@ -3376,7 +3376,16 @@ a Tier-3 compiler-side validation with the standard **strict-vs-lenient** split
 (same doctrine as #1979 / tcp-mss). `validatePoolUtilizationAlarm`
 (`pkg/config/compiler_nat.go`, invoked from the typed-config phase of
 `compileExpanded` in `compiler.go`) requires `0 < clear-threshold <
-raise-threshold <= 100`:
+raise-threshold <= 100`.
+
+`clear-threshold` is OPTIONAL (#4077, Junos-faithful). A raise-only config
+(`raise-threshold` with no `clear-threshold`) is legal: the parser defaults the
+clear-threshold to a 10-point hysteresis margin below raise
+(`defaultPoolAlarmClearThreshold`, floored at 1 — raise 90 → clear 80, raise 5 →
+clear 1) BEFORE the gate runs, so the raise-only config both commits and arms
+the runtime monitor. The default always lands inside `0 < clear < raise`, so the
+gate below only ever sees a zero/invalid clear when the operator EXPLICITLY
+provided one (an explicit `clear-threshold 0` is still rejected).
 
 - **Strict (`commit` / `commit check`):** a bare `pool-utilization-alarm;`
   (raise=0/clear=0, an always-firing alarm) and inverted/equal thresholds are
@@ -3394,7 +3403,8 @@ raise-threshold <= 100`:
 The thresholds are a single GLOBAL pair (no per-pool override syntax in the
 parsed Junos grammar). Regression coverage:
 `pkg/config/compiler_nat_pool_alarm_test.go` (strict reject + lenient
-accept-with-warning + valid-no-warning). The runtime consumer (#2079) is
+accept-with-warning + valid-no-warning + raise-only default + explicit-clear
+still-validated). The runtime consumer (#2079) is
 documented in `docs/deterministic-nat-cgnat.md`.
 
 NOTE: `pool-utilization-alarm` is not yet a typed `setSchema` leaf (no
