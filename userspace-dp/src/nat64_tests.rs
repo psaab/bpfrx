@@ -4,7 +4,6 @@
 // `#[path = "nat64_tests.rs"]` from nat64.rs.
 
 use super::*;
-use crate::policy::SnapshotIntegrityError;
 
 fn well_known_prefix() -> NAT64RuleSnapshot {
     NAT64RuleSnapshot {
@@ -116,16 +115,21 @@ fn nat64_pool_mixed_bare_and_masked() {
 }
 
 #[test]
-fn nat64_pool_genuinely_invalid_rejects_snapshot() {
-    // #2212: a genuinely-malformed pool address must FAIL THE SNAPSHOT CLOSED
-    // (one bad entry rejects the whole rule), NOT be silently filtered while
-    // the rest of the pool installs. Silently dropping it narrows the pool —
-    // a fail-open in the retired-eBPF enforcement plane.
+fn nat64_pool_genuinely_invalid_skips_rule() {
+    // #2212/#3888: a genuinely-malformed pool address SKIPS the WHOLE rule
+    // (all-or-nothing), NOT narrowing the pool to just the good entries and NOT
+    // aborting the whole forwarding rebuild. Skipping the whole rule preserves
+    // #2212's anti-silent-narrowing intent — the surviving `100.64.0.7` must
+    // NOT install a pool-of-one — while #3888 scopes the blast radius to this
+    // one rule.
     //
-    // FAIL-ON-REVERT: the pre-fix `filter_map(parse_pool_v4)` returned a state
-    // with pool_v4 == [100.64.0.7] and never an Err, so this assert_matches
-    // FAILS if the silent-drop behavior is restored.
-    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+    // FAIL-ON-REVERT: reverting #3888 restores the fallible
+    // `try_from_snapshots -> Result` that returns `Err(Nat64UnparseableRule)`;
+    // the infallible `from_snapshots` wrapper then `.expect()`-PANICS on this
+    // bad rule, so this test PANICS (RED). Reverting further to the pre-#2212
+    // `filter_map` would install pool_v4 == [100.64.0.7] (pool-of-one) — the
+    // `prefixes.is_empty()` assert FAILS.
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
         name: "nat64-bad".to_string(),
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec![
@@ -133,119 +137,132 @@ fn nat64_pool_genuinely_invalid_rejects_snapshot() {
             "100.64.0.7/32".to_string(),
         ],
         no_v6_frag_header: false,
-    }])
-    .expect_err("a malformed pool address must reject the snapshot, not be dropped");
-    match err {
-        SnapshotIntegrityError::Nat64UnparseableRule { rule_name, field } => {
-            assert_eq!(rule_name, "nat64-bad");
-            assert!(
-                field.contains("not-an-ip"),
-                "error must name the offending pool address, got {field:?}"
-            );
-        }
-        other => panic!("expected Nat64UnparseableRule, got {other:?}"),
-    }
+    }]);
+    assert!(
+        !state.is_active() && state.prefixes.is_empty(),
+        "a malformed pool address must skip the WHOLE rule, not narrow the pool"
+    );
 }
 
 #[test]
-fn nat64_pool_non_host_mask_rejects_snapshot() {
-    // #2212: a non-host mask or garbage suffix on a pool address must REJECT
-    // the snapshot (fail closed), not be silently filtered while a valid /32
-    // alongside it survives. Each malformed form independently rejects.
-    //
-    // FAIL-ON-REVERT: pre-fix this produced pool_v4 == [100.64.0.9] with no
-    // Err; the expect_err below FAILS if silent-filter behavior returns.
+fn nat64_pool_non_host_mask_skips_rule() {
+    // #2212/#3888: a non-host mask or garbage suffix on a pool address SKIPS
+    // the WHOLE rule (fail-scoped), not narrowing it to the valid /32 alongside
+    // and not aborting the rebuild. Each malformed form independently skips.
     for bad in [
         "100.64.0.1/24",      // non-host prefix
         "100.64.0.2/notanum", // non-numeric mask
         "100.64.0.3/",        // empty mask
         "100.64.0.4//32",     // double slash
     ] {
-        let result = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+        let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
             name: "nat64-bad-mask".to_string(),
             prefix: "64:ff9b::/96".to_string(),
             pool_addresses: vec![bad.to_string(), "100.64.0.9/32".to_string()],
             no_v6_frag_header: false,
         }]);
         assert!(
-            matches!(result, Err(SnapshotIntegrityError::Nat64UnparseableRule { .. })),
-            "malformed pool entry {bad:?} must reject the snapshot, got {result:?}"
+            !state.is_active() && state.prefixes.is_empty(),
+            "malformed pool entry {bad:?} must skip the whole rule, got {} prefixes",
+            state.prefixes.len()
         );
     }
     // Verify the canonical /32-only pool DOES install (the good path still works).
-    let ok = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+    let ok = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
         name: "nat64-good-mask".to_string(),
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["100.64.0.9/32".to_string()],
         no_v6_frag_header: false,
-    }])
-    .expect("a canonical /32 host pool must install");
+    }]);
     assert_eq!(ok.prefixes[0].pool_v4, vec![Ipv4Addr::new(100, 64, 0, 9)]);
 }
 
 #[test]
-fn invalid_prefix_length_rejects_snapshot() {
-    // #2212: a non-/96 prefix length must REJECT the snapshot (fail closed),
-    // not be silently ignored leaving the rule absent at the dataplane.
-    //
-    // FAIL-ON-REVERT: pre-fix this `continue`d and produced an empty,
-    // !is_active() state with no Err; expect_err FAILS if the skip returns.
-    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+fn invalid_prefix_length_skips_rule() {
+    // #2212/#3888: a non-/96 prefix length SKIPS the rule (fail-scoped),
+    // leaving it absent at the dataplane WITHOUT aborting the whole rebuild.
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
         name: "bad".to_string(),
         prefix: "64:ff9b::/64".to_string(),
         pool_addresses: vec!["1.2.3.4".to_string()],
         no_v6_frag_header: false,
-    }])
-    .expect_err("a non-/96 prefix must reject the snapshot, not be silently ignored");
-    match err {
-        SnapshotIntegrityError::Nat64UnparseableRule { rule_name, field } => {
-            assert_eq!(rule_name, "bad");
-            assert!(field.contains("/96"), "error must mention the /96 requirement, got {field:?}");
-        }
-        other => panic!("expected Nat64UnparseableRule, got {other:?}"),
-    }
-}
-
-#[test]
-fn empty_prefix_rejects_snapshot() {
-    // #2212: an empty prefix is anomalous (the Go side never emits one) and
-    // must reject the snapshot rather than being silently dropped.
-    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
-        name: "empty-prefix".to_string(),
-        prefix: String::new(),
-        pool_addresses: vec!["198.51.100.1".to_string()],
-        no_v6_frag_header: false,
-    }])
-    .expect_err("an empty prefix must reject the snapshot");
+    }]);
     assert!(
-        matches!(err, SnapshotIntegrityError::Nat64UnparseableRule { .. }),
-        "empty prefix must surface a Nat64UnparseableRule, got {err:?}"
+        !state.is_active() && state.prefixes.is_empty(),
+        "a non-/96 prefix must skip the rule, got {} prefixes",
+        state.prefixes.len()
     );
 }
 
 #[test]
-fn malformed_prefix_address_rejects_snapshot() {
-    // #2212: a /96-masked but unparseable prefix address must reject (was
-    // silently `continue`d pre-fix).
-    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+fn empty_prefix_skips_rule() {
+    // #2212/#3888: an empty prefix is anomalous (the Go side never emits one)
+    // and SKIPS the rule rather than aborting the whole rebuild.
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "empty-prefix".to_string(),
+        prefix: String::new(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }]);
+    assert!(
+        !state.is_active() && state.prefixes.is_empty(),
+        "an empty prefix must skip the rule, got {} prefixes",
+        state.prefixes.len()
+    );
+}
+
+#[test]
+fn malformed_prefix_address_skips_rule() {
+    // #2212/#3888: a /96-masked but unparseable prefix address SKIPS the rule
+    // (was silently `continue`d pre-#2212, aborted the rebuild #2212..#3888).
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
         name: "bad-addr".to_string(),
         prefix: "not:an:ipv6::garbage::x/96".to_string(),
         pool_addresses: vec!["198.51.100.1".to_string()],
         no_v6_frag_header: false,
-    }])
-    .expect_err("a malformed prefix address must reject the snapshot");
-    assert!(matches!(
-        err,
-        SnapshotIntegrityError::Nat64UnparseableRule { .. }
-    ));
+    }]);
+    assert!(!state.is_active() && state.prefixes.is_empty());
 }
 
 #[test]
-fn valid_nat64_rule_still_applies_after_fail_closed() {
-    // #2212 companion: a wholly valid NAT64 config must still apply cleanly
-    // through the fallible path (the fail-closed gate does not over-reject).
-    let state = Nat64State::try_from_snapshots(&[well_known_prefix()])
-        .expect("a valid NAT64 rule must apply");
+fn extra_slash_prefix_skips_rule() {
+    // #3888 backstop hardening (Copilot): the corrupt/lenient-snapshot parse
+    // must require EXACTLY `<ipv6>/96`. A prefix with an EXTRA slash —
+    // "64:ff9b::/96/garbage" → split('/') = ["64:ff9b::", "96", "garbage"] —
+    // must be SKIPPED as malformed, NOT accepted with the trailing garbage
+    // silently ignored (parts[1]=="96" parses fine, parts[0]=="64:ff9b::"
+    // parses fine).
+    //
+    // FAIL-ON-REVERT: reverting the `parts.len() != 2` check makes the old
+    // `parts.get(1)`-only match accept this as a valid /96 → 1 published
+    // prefix, so `prefixes.is_empty()` FAILS (RED).
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "extra-slash".to_string(),
+        prefix: "64:ff9b::/96/garbage".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }]);
+    assert!(
+        !state.is_active() && state.prefixes.is_empty(),
+        "an extra-slash prefix must skip the rule, got {} prefixes",
+        state.prefixes.len()
+    );
+    // Control: the well-formed exact-2-parts prefix still publishes.
+    let ok = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "good".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }]);
+    assert!(ok.is_active() && ok.prefixes.len() == 1);
+}
+
+#[test]
+fn valid_nat64_rule_still_applies() {
+    // #2212/#3888 companion: a wholly valid NAT64 config must still apply
+    // cleanly through the infallible path (the fail-scoped skip does not
+    // over-drop a valid rule).
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
     assert!(state.is_active());
     assert_eq!(state.prefixes.len(), 1);
     assert_eq!(state.prefixes[0].pool_v4.len(), 2);
@@ -259,6 +276,61 @@ fn valid_nat64_rule_still_applies_after_fail_closed() {
     let v4 = translate_v6_to_v4(&pkt, snat, dst_v4, false).expect("forward translate");
     assert_eq!(v4[0], 0x45);
     assert_eq!(checksum16(&v4[..20]), 0, "header checksum must verify");
+}
+
+#[test]
+fn nat64_mixed_good_bad_good_publishes_good_rules() {
+    // #3888 RED-ON-REVERT GUARD: a snapshot of [good, BAD, good] NAT64 rules
+    // must build the TWO good rules and SKIP the one bad rule — a bad NAT64
+    // rule is a NAT64-only degradation, not a total forwarding freeze. The bad
+    // rule leaves no gap: the survivors keep their relative order.
+    //
+    // FAIL-ON-REVERT: reverting #3888 restores the fallible
+    // `try_from_snapshots -> Result` returning `Err(Nat64UnparseableRule)` on
+    // the bad rule; the infallible `from_snapshots` wrapper then
+    // `.expect()`-PANICS, so this test PANICS (RED) instead of observing the
+    // two published prefixes. This is the direct analogue of the whole-rebuild
+    // abort the fix removes (`Nat64State::from_snapshots` is called
+    // unconditionally inside `build_reconcile_forwarding`; a returned Err there
+    // froze every other rule type and every later commit).
+    let good_a = NAT64RuleSnapshot {
+        name: "good-a".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    };
+    let bad = NAT64RuleSnapshot {
+        name: "bad".to_string(),
+        prefix: "64:ff9b:1::/64".to_string(), // non-/96 => skipped
+        pool_addresses: vec!["198.51.100.2".to_string()],
+        no_v6_frag_header: false,
+    };
+    let good_b = NAT64RuleSnapshot {
+        name: "good-b".to_string(),
+        prefix: "2001:db8:64::/96".to_string(),
+        pool_addresses: vec!["203.0.113.9".to_string()],
+        no_v6_frag_header: false,
+    };
+    let state = Nat64State::from_snapshots(&[good_a, bad, good_b]);
+    assert!(state.is_active());
+    assert_eq!(
+        state.prefixes.len(),
+        2,
+        "the two good NAT64 rules must publish; the bad one is skipped"
+    );
+    // The survivors are the two good rules, in order — the bad rule left no gap.
+    assert_eq!(
+        state.prefixes[0].prefix_bytes,
+        [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        state.prefixes[0].pool_v4,
+        vec![Ipv4Addr::new(198, 51, 100, 1)]
+    );
+    assert_eq!(
+        state.prefixes[1].pool_v4,
+        vec![Ipv4Addr::new(203, 0, 113, 9)]
+    );
 }
 
 // --- Packet translation tests ---

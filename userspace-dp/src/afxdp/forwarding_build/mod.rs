@@ -312,11 +312,15 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     );
     state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules, nat_counters);
     state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules, nat_counters);
-    // #2212: fail CLOSED on an unparseable NAT64 rule. The preflight in the
-    // reconcile/refresh apply paths catches this Err and keeps the previous
-    // live forwarding state rather than installing a silently-narrower NAT64
-    // config (the helper-boundary backstop to the Go #2173 commit-time gate).
-    state.nat64 = Nat64State::try_from_snapshots(&snapshot.nat64_rules)?;
+    // #3888: fail SCOPED on an unparseable NAT64 rule — `from_snapshots` is
+    // infallible and SKIPS the offending rule (logging a loud warning),
+    // publishing the remaining NAT64 rules and every other rule type. Pre-#3888
+    // this returned a `SnapshotIntegrityError` that propagated via `?` and
+    // aborted the WHOLE forwarding rebuild, freezing the dataplane on one bad
+    // NAT64 rule from a mixed-version peer-sync or corrupt snapshot. The Go
+    // commit-time gate (#2173/#3886) remains the primary defense; this scopes
+    // the helper-boundary backstop's blast radius to the one NAT64 rule.
+    state.nat64 = Nat64State::from_snapshots(&snapshot.nat64_rules);
     // #2240: fail CLOSED on an unparseable / unsupported / mismatched NPTv6
     // rule. The preflight in the reconcile/refresh apply paths catches this
     // Err and keeps the previous live forwarding state rather than installing a

@@ -3537,8 +3537,8 @@ fn reconcile_policy_references_undefined_zone_still_fails_closed_3402() {
 /// the prior generation published AND the prior workers/state live — not
 /// merely record an observable stage post-teardown.
 ///
-/// Seam: a NAT64 rule with an empty prefix trips
-/// `Nat64State::try_from_snapshots` (Nat64UnparseableRule). That path is
+/// Seam: an NPTv6 rule with an unparseable internal prefix trips
+/// `Nptv6State::try_from_snapshots` (Nptv6UnparseableRule). That path is
 /// NOT checked by the top-of-reconcile policy preflight (which only parses
 /// the policy/address-book state), so before #2484 it reached the
 /// `apply_snapshot` integrity Err arm — which ran AFTER `tear_down`
@@ -3580,13 +3580,18 @@ fn reconcile_snapshot_integrity_error_preserves_prior_generation_and_state() {
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
 
-    // Sentinel-OK mandatory pins (preflight passes) + a NAT64 rule with
-    // an empty prefix (integrity Err in build_forwarding_state).
+    // Sentinel-OK mandatory pins (preflight passes) + an NPTv6 rule with an
+    // unparseable internal prefix (integrity Err in build_forwarding_state).
+    // #3888: NAT64 is now fail-scoped (skip-and-continue, never an integrity
+    // Err), so NPTv6 — which intentionally stays fail-CLOSED for its #2241
+    // order-dependent overlap guard — is the seam that still trips this
+    // pre-teardown-preflight regression check.
     let mut snap = fail_open_snapshot(21);
     snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
-    snap.nat64_rules = vec![crate::protocol::NAT64RuleSnapshot {
-        name: "bad-nat64".to_string(),
-        prefix: String::new(),
+    snap.nptv6_rules = vec![crate::protocol::Nptv6RuleSnapshot {
+        name: "bad-nptv6".to_string(),
+        internal_prefix: "not-a-prefix".to_string(),
+        external_prefix: "2001:db8:9::/48".to_string(),
         ..Default::default()
     }];
 
