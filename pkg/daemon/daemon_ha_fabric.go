@@ -793,37 +793,117 @@ func overlayOrParent(overlay, parent string) string {
 	return parent
 }
 
+// fabricStateResubBackoffDefault is the delay between a fabric netlink
+// subscription close (a recoverable ENOBUFS receive-buffer overflow or other
+// transient receive error) and the resubscribe attempt (#4031).
+const fabricStateResubBackoffDefault = 2 * time.Second
+
+// defaultFabricLinkSubscribe is the production fabricLinkSubscribe seam (#4031).
+func defaultFabricLinkSubscribe(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error {
+	return netlink.LinkSubscribe(ch, done)
+}
+
+// defaultFabricNeighSubscribe is the production fabricNeighSubscribe seam (#4031).
+func defaultFabricNeighSubscribe(ch chan<- netlink.NeighUpdate, done <-chan struct{}) error {
+	return netlink.NeighSubscribe(ch, done)
+}
+
 // monitorFabricState subscribes to netlink link and neighbor updates and
 // triggers immediate fabric_fwd refresh when fabric interfaces or their
 // neighbor entries change (#124). The 30s ticker in populateFabricFwd
 // remains as a safety net.
+//
+// The vishvananda/netlink subscribe goroutine treats ANY receive error as
+// terminal — on a recoverable ENOBUFS receive-buffer overflow (a burst of
+// link/neighbor events overruns the socket) it closes the update channel. The
+// pre-#4031 loop returned on that close, permanently disabling fabric
+// monitoring for the daemon's lifetime AND leaking the sibling subscription's
+// netlink socket (its done channel was never closed, so its done-watcher
+// goroutine never released the fd). A missed fabric up/down transition then
+// caused HA mis-behavior (stale fabric-up blackhole or a missed fabric-down
+// failover). The loop now delegates one subscription lifetime to
+// runFabricStateSubscription, which RESUBSCRIBES on a recoverable close and
+// closes BOTH netlink sockets on every path. Because ENOBUFS means events were
+// DROPPED, each fresh subscription re-syncs fabric forwarding via
+// triggerFabricRefresh to catch up on any transition missed during the
+// overflow. It exits only on context cancellation (#4031).
 func (d *Daemon) monitorFabricState(ctx context.Context) {
+	slog.Info("cluster: fabric state monitor started (link + neighbor)")
+	for {
+		if !d.runFabricStateSubscription(ctx) {
+			return // context cancelled — clean exit
+		}
+		// The subscription closed on a recoverable receive error (ENOBUFS or
+		// similar) or a subscribe failure. Back off briefly, then resubscribe.
+		// The catch-up refresh runs inside runFabricStateSubscription once the
+		// fresh subscriptions are live, so no fabric transition window is lost.
+		backoff := d.fabricStateResubBackoff
+		if backoff <= 0 {
+			backoff = fabricStateResubBackoffDefault
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+	}
+}
+
+// runFabricStateSubscription owns ONE pair of netlink subscriptions (link +
+// neighbor) for the fabric-state monitor. It returns true when a subscription
+// closed on a recoverable receive error (or a subscribe failure) — the caller
+// should back off and resubscribe — and false when ctx was cancelled (the
+// caller should exit). Both done channels are closed exactly once on every
+// path via defer, so neither netlink socket leaks on any exit or resubscribe
+// (the #4031 fd-leak fix) (#124).
+func (d *Daemon) runFabricStateSubscription(ctx context.Context) bool {
+	linkSubscribe := d.fabricLinkSubscribe
+	if linkSubscribe == nil {
+		linkSubscribe = defaultFabricLinkSubscribe
+	}
+	neighSubscribe := d.fabricNeighSubscribe
+	if neighSubscribe == nil {
+		neighSubscribe = defaultFabricNeighSubscribe
+	}
+
 	linkUpdates := make(chan netlink.LinkUpdate, 64)
 	linkDone := make(chan struct{})
-	if err := netlink.LinkSubscribe(linkUpdates, linkDone); err != nil {
+	if err := linkSubscribe(linkUpdates, linkDone); err != nil {
 		slog.Warn("cluster: failed to subscribe to link updates for fabric monitor", "err", err)
-		return
+		// The subscribe may have started its done-watcher goroutine before
+		// failing; close done to avoid leaking it. Recoverable — retry.
+		close(linkDone)
+		return true
 	}
+	defer close(linkDone)
 
 	neighUpdates := make(chan netlink.NeighUpdate, 64)
 	neighDone := make(chan struct{})
-	if err := netlink.NeighSubscribe(neighUpdates, neighDone); err != nil {
+	if err := neighSubscribe(neighUpdates, neighDone); err != nil {
 		slog.Warn("cluster: failed to subscribe to neigh updates for fabric monitor", "err", err)
-		close(linkDone)
-		return
+		// linkDone is closed by the deferred close above. Close neighDone too
+		// (defensive: a done-watcher may already be running). Recoverable.
+		close(neighDone)
+		return true
 	}
+	defer close(neighDone)
 
-	slog.Info("cluster: fabric state monitor started (link + neighbor)")
+	// Re-sync fabric forwarding now that both subscriptions are live so any
+	// link/neighbor transition missed during a prior overflow (or racing this
+	// enumeration) is caught up. Idempotent — a non-blocking refresh signal.
+	d.triggerFabricRefresh()
 
 	for {
 		select {
 		case <-ctx.Done():
-			close(linkDone)
-			close(neighDone)
-			return
+			return false // clean exit; both done channels closed by defer
 		case update, ok := <-linkUpdates:
 			if !ok {
-				return
+				// The netlink subscribe goroutine closes the channel on ANY
+				// receive error, including a recoverable ENOBUFS. Resubscribe;
+				// the deferred closes release BOTH netlink sockets (no leak).
+				slog.Warn("cluster: fabric link-update subscription closed, resubscribing")
+				return true
 			}
 			name := update.Attrs().Name
 			d.fabricMu.RLock()
@@ -837,7 +917,8 @@ func (d *Daemon) monitorFabricState(ctx context.Context) {
 			}
 		case update, ok := <-neighUpdates:
 			if !ok {
-				return
+				slog.Warn("cluster: fabric neigh-update subscription closed, resubscribing")
+				return true
 			}
 			d.fabricMu.RLock()
 			isPeer := (d.fabricPeerIP != nil && update.IP.Equal(d.fabricPeerIP)) ||

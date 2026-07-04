@@ -33,6 +33,70 @@
     `go test -race ./pkg/daemon/ ./pkg/cluster/` green; RED-on-revert proven
     (non-fatal tests drop to 0 peer pushes when the fix is reverted).
     test-failover WARRANTED (HA config-sync) — batch-validated.
+## 2026-07-03 — #4033: heartbeat goroutine leak + double-fire on comms restart (fable-161 F-168)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed two coupled HA-robustness defects on the cluster
+    comms-restart path. (1) `Manager.StartHeartbeat` overwrote a running
+    heartbeat (`m.hbSender`/`m.hbReceiver`) without stopping the old
+    sender+receiver, leaking their goroutines (stopCh never closed) and
+    doubling the on-wire heartbeat rate — N comms restarts leaked N goroutine
+    sets. (2) The daemon `startClusterComms` bind-retry goroutine looped with a
+    plain `time.Sleep(2s)` and never observed `commsCtx`, so on a
+    `stopClusterComms`→`startClusterComms` restart the old retry goroutine
+    survived (up to 60s) and could call `StartHeartbeat` after teardown, racing
+    the replacement.
+  - **Fix**: `StartHeartbeat` is now idempotent — it calls `StopHeartbeat`
+    (cancel + join) before installing the new pair, serialized by a new
+    `hbStartMu` so concurrent starts cannot interleave; exactly one heartbeat
+    goroutine set at a time. `heartbeatSender.stop()` now closes its send socket
+    (matched the receiver; fixes an accompanying FD leak). Extracted the retry
+    loop to `Daemon.startHeartbeatWithRetry(ctx,…)` with a per-iteration
+    `ctx.Err()` guard and ctx-aware `sleepCtx`, so a cancelled comms context
+    makes the goroutine exit promptly. Added exported `Manager.HeartbeatRunning`.
+  - **File(s)**: pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat.go,
+    pkg/cluster/manager.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/cluster/heartbeat_stop_previous_test.go (new),
+    pkg/daemon/heartbeat_retry_ctx_test.go (new),
+    docs/bug-heartbeat-vrf-rebind-split-brain.md
+  - **Tests**: `TestStartHeartbeatStopsPreviousHeartbeat` (RED-on-revert: N
+    sequential starts leave only the last pair running),
+    `TestStartHeartbeatWithRetryExits{BeforeStart,MidRetry}OnCancel` +
+    `TestSleepCtx*` (RED-on-revert: retry loop honours ctx cancel instead of
+    spinning the full 60s budget). Full `pkg/cluster` + `pkg/daemon` suites
+    green with `-race`. test-failover WARRANTED (HA heartbeat) — batch-validate.
+
+## 2026-07-03 — #4031: monitorFabricState exits + leaks sibling netlink socket on ENOBUFS (fable-161 F-167)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed `monitorFabricState` (the fabric link/neighbor netlink
+    monitor, #124) permanently exiting when either its `LinkSubscribe` or
+    `NeighSubscribe` update channel closed (`!ok`) on a recoverable ENOBUFS
+    receive-buffer overflow, AND leaking the SIBLING subscription's netlink
+    socket (the `!ok` return never closed the other `done` channel, so its
+    done-watcher never ran `s.Close()`). Fabric up/down + peer-neighbor changes
+    then went unobserved → HA mis-behavior (stale fabric-up blackhole / missed
+    fabric-down failover) plus an accumulating fd leak.
+  - **Fix**: mirrored the #3950 `monitorLinkState` resilient-resubscribe
+    pattern. `monitorFabricState` now delegates one subscription lifetime to
+    `runFabricStateSubscription`, which `defer`-closes BOTH `done` channels on
+    every path (no sibling leak), returns `true` on a recoverable channel close
+    or subscribe failure (caller backs off `fabricStateResubBackoffDefault` = 2s,
+    then resubscribes) and `false` only on context cancellation. Each fresh
+    subscription calls `triggerFabricRefresh` once both sockets are live to
+    re-sync fabric forwarding and catch up on transitions missed during the
+    overflow. Added `fabricLinkSubscribe` / `fabricNeighSubscribe` /
+    `fabricStateResubBackoff` seams on `Daemon`.
+  - **Tests**: `daemon_fabric_monitor_4031_test.go` — inject a channel close on
+    the link OR neighbor subscription; assert resubscribe (>=2 subscriptions),
+    sibling socket released (its `done` closed — no leak), refreshes keep firing,
+    and clean context-cancel exit. RED-on-revert verified (buggy single-function
+    version: `linkSubCalls=1`/`neighSubCalls=1`, no resubscribe → both resubscribe
+    tests FAIL; context-cancel still passes). `go test ./pkg/daemon/ -race` green.
+  - **File(s)**: `pkg/daemon/daemon_ha_fabric.go`, `pkg/daemon/daemon.go`,
+    `pkg/daemon/daemon_fabric_monitor_4031_test.go`, `docs/bugs.md`,
+    `docs/fabric-cross-chassis-fwd.md`
+  - **Follow-up**: test-failover WARRANTED (HA fabric) — batch-validated.
 
 ## 2026-07-03 — #4024: a flowless (session-less) MissingNeighbor transit packet was FIB-reinjected past the zone security policy → deny-all fail-open for flowless fragments
 

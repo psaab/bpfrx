@@ -367,6 +367,11 @@ func (s *heartbeatSender) send() {
 func (s *heartbeatSender) stop() {
 	close(s.stopCh)
 	s.wg.Wait()
+	// Close the send socket after the run loop has exited (wg.Wait above) so
+	// there is no write-after-close race. Without this the sender FD leaks on
+	// every heartbeat stop/restart (#4033); the receiver already closes its
+	// conn in stop().
+	s.conn.Close()
 }
 
 func newHeartbeatReceiver(mgr *Manager, conn *net.UDPConn, threshold int, interval time.Duration) *heartbeatReceiver {

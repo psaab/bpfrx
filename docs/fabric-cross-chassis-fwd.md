@@ -58,6 +58,17 @@ are never redirected back, preventing infinite loops.
 - Fabric interface ifindex + local MAC via `netlink.LinkByName()`
 - Peer MAC from ARP table via `netlink.NeighList()` (retries up to 30x at 2s intervals)
 
+**Event-driven refresh (`monitorFabricState`, #124):** a sibling goroutine
+subscribes to netlink link + neighbor updates and calls `triggerFabricRefresh()`
+when a fabric interface or the fabric peer's neighbor entry changes, so the
+`fabric_fwd` map is re-resolved sub-second instead of waiting for the 30s
+`populateFabricFwd` ticker. This monitor is resilient to netlink receive-buffer
+overflow (ENOBUFS): a recoverable close of EITHER the link or neighbor update
+channel resubscribes (via `runFabricStateSubscription`) after a 2s backoff and
+re-syncs the fabric state, rather than dying permanently, and it closes BOTH
+netlink sockets on every path so neither fd leaks (#4031). It exits only on
+context cancellation.
+
 ### Fix 2: VRRP Coordinated Preemption (Defense-in-depth)
 
 **Concept:** All VRRP instances preempt simultaneously when `ReleaseSyncHold()`
