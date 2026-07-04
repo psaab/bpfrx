@@ -32017,3 +32017,38 @@ top.
   - **File(s)**: userspace-dp/src/nat/destination.rs,
     userspace-dp/src/nat/static_nat.rs, userspace-dp/src/nat/tests.rs,
     userspace-dp/src/afxdp/frame/tests.rs, _Log.md
+- **Timestamp**: 2026-07-04
+  - **Action**: #4074 Copilot fold (PR #4086) — fix a PR-introduced ICMP
+    reply-accounting regression (Finding 1). `account_packet` (session/mod.rs)
+    folds a REVERSE ICMP packet's volume onto the canonical FORWARD entry by
+    calling `reverse_session_key(reverse_entry_key, reverse_decision)` to
+    recover the forward key. Pool-SNAT translated the ICMP id X->Y, so the
+    reverse entry is keyed on Y and `NatDecision::reverse` stored the ORIGINAL
+    id X in `rewrite_dst_port`. The PR's `reverse_session_key` ICMP arm read
+    only `rewrite_src_port` (None on the reverse decision) -> yielded Y ->
+    MISSED the forward entry {..,X,..} -> the reply volume was mis-accounted
+    onto the reverse entry, so the forward-only conntrack mirror / SESSION_CLOSE
+    / NetFlow / IPFIX under-counted reply-direction volume for translated ICMP.
+    Fix: the ICMP arm now reads `rewrite_src_port.or(rewrite_dst_port)` — the id
+    is a symmetric field and at most one of the two is set (SNAT sets only
+    src_port forward; its `.reverse()` sets only dst_port; ICMP DNAT is gated to
+    no L4 port), so `.or()` recovers Y forward->reverse and X reverse->forward.
+    Forward->reverse callers (session_delta/ha/bpf_map/publish_conntrack/
+    session_glue/coordinator/types) are UNCHANGED (rewrite_dst_port is None
+    there). `reverse_wire_key` (the demux, forward->reverse only) is correct and
+    untouched. RED-on-revert: account_packet_reverse_folds_onto_forward_
+    translated_icmp (v4 + v6) — a reverse ICMP packet bumps the FORWARD entry's
+    rev_* (reverting the arm to src_port-only misses the forward entry -> RED).
+    Finding 2 (id==0 edge): the `icmp_query = ... && src_port != 0` gate
+    misclassifies an identifier-bearing ICMP query with id==0 as flowless (both
+    Some((0,0)) and None flatten to src_port 0), so an id==0 echo is not
+    translated and two id==0 flows collide on (pool_addr, 0). REPORTED for a
+    follow-up rather than folded: the clean signal (parse_flow_ports Some vs
+    None) would thread a new bool through SessionFlow (83 construction literals,
+    a hot per-packet struct) or `match_source_nat_result_for_tuple` (28 call
+    sites) — a moderate-to-large refactor for a rare edge (standard ping uses a
+    nonzero PID as the id; id==0 is uncommon on-wire) that is strictly better
+    than pre-PR either way (pre-PR ALL ids collided; now only id==0). Validated:
+    FULL `cargo test --release`, `go build ./...`, rustfmt.
+  - **File(s)**: userspace-dp/src/session/key.rs,
+    userspace-dp/src/session/tests.rs, _Log.md

@@ -172,11 +172,31 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
 
 pub(crate) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        // #4074: the reverse (reply) companion is keyed on the translated ICMP
-        // identifier so the reply demuxes to the right forward flow. Symmetric
-        // field: `src_port` = translated id, `dst_port` = 0 (see
-        // `reverse_wire_key`). No translation => `key.src_port` unchanged.
-        (nat.rewrite_src_port.unwrap_or(key.src_port), key.dst_port)
+        // #4074: the ICMP Query Identifier is a symmetric field, and this
+        // function is called in BOTH directions:
+        //   - forward→reverse (build the reverse companion key from the FORWARD
+        //     entry + its FORWARD decision): the translated id lives in
+        //     `rewrite_src_port` (= Y), so the companion is keyed on Y and the
+        //     reply (which carries Y) demuxes to it.
+        //   - reverse→forward (`account_packet` recovers the FORWARD entry key
+        //     from the REVERSE entry + its REVERSE decision, session/mod.rs):
+        //     `NatDecision::reverse` moved the ORIGINAL id into
+        //     `rewrite_dst_port` (= X) and left `rewrite_src_port` None, so we
+        //     must read `rewrite_dst_port` to recover X and hit the forward
+        //     entry — reading only `rewrite_src_port` (=None → falls back to the
+        //     reverse key's Y) misses it and mis-accounts the reply volume onto
+        //     the reverse entry.
+        // At most one of the two port fields is ever set for an ICMP flow (SNAT
+        // sets only `rewrite_src_port` forward; its `.reverse()` sets only
+        // `rewrite_dst_port`; ICMP DNAT is gated to no L4 port), so `.or()`
+        // picks the right id in each direction. No translation => `key.src_port`
+        // unchanged; `dst_port` stays 0.
+        (
+            nat.rewrite_src_port
+                .or(nat.rewrite_dst_port)
+                .unwrap_or(key.src_port),
+            key.dst_port,
+        )
     } else {
         (
             nat.rewrite_dst_port.unwrap_or(key.dst_port),
