@@ -1104,6 +1104,20 @@ Junos adds `##` comments in the output for various conditions:
 - `inactive:` prefix -- deactivated config stanzas
 - `## Warning: 'ssh-dsa' is deprecated` -- deprecation notices
 
+**xpf secret redaction (#4051/#4060):** xpf masks secret leaf values with the
+placeholder `##SECRET-DATA##` on every raw-AST DISPLAY surface — the REST
+`show` / `export` / `search` endpoints and the gRPC `ShowConfig` /
+`ShowCompare` / `ShowRollback` RPCs. This mirrors Junos `## SECRET-DATA` and the
+typed-struct redaction on `GET /api/v1/config`. Consequently a REST `export`
+(or any `show configuration` render) is **secret-redacted, not a full-fidelity
+restorable backup**: re-applying it would commit `##SECRET-DATA##` as the
+literal secret for every secret leaf, so xpf **rejects the placeholder on
+commit-ingest** (`## SECRET-DATA` cannot round-trip). For a restorable backup use
+the cleartext DR/compliance archive or `request system configuration rescue
+save`; to restore, load from that archive/rescue or re-enter the secret in
+cleartext. (The cleartext SSOT still backs HA config sync, the DR archive and
+on-disk persistence — only the display surfaces redact.)
+
 ### 7.2 `{ ... }` Collapse in max-depth
 
 When `display max-depth` truncates children, it uses `{ ... }` notation.

@@ -1,5 +1,11 @@
 package config
 
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
 // ast_redact.go masks secret leaf VALUES in the raw-AST render paths.
 //
 // #2053 made the TYPED compiled-config render safe: the config.Secret newtype
@@ -155,4 +161,73 @@ func containsAnyOf(seq []string, names ...string) bool {
 		}
 	}
 	return false
+}
+
+// errRedactionPlaceholderIngest is returned by checkRedactionPlaceholder when a
+// SECRET leaf carries the raw-AST redaction placeholder (SecretDataPlaceholder,
+// "##SECRET-DATA##"). It is the symmetric commit-ingest guard for the raw-AST
+// display redaction, mirroring errRedactedSecretIngest (secret.go), which
+// refuses the typed-struct sentinel ("<redacted>") on a JSON round-trip.
+//
+// Why this exists (#4060): RedactedClone masks every secret leaf with the
+// placeholder for the REST config show / export + gRPC ShowConfig surfaces
+// (#4051). Those renders are DISPLAY-only and deliberately NOT restorable — the
+// cleartext SSOT still backs HA sync, the DR/compliance archive and persistence.
+// But an operator who does a REST `export` (now secret-redacted) and then
+// re-applies that text (a `load`/commit) would otherwise silently commit
+// "##SECRET-DATA##" as the LITERAL secret for every secret leaf — the IKE PSK,
+// key or community becomes the nonsense string and the tunnel/auth breaks. The
+// guard rejects that on commit-ingest so the redacted export cannot masquerade
+// as a restorable backup.
+var errRedactionPlaceholderIngest = errors.New(
+	"config contains the redaction placeholder " + SecretDataPlaceholder +
+		" — this is a redacted export (REST show/export / gRPC ShowConfig), not a " +
+		"restorable config; restore from the DR archive (request system " +
+		"configuration rescue) or re-enter the secret in cleartext")
+
+// checkRedactionPlaceholder rejects a tree whose SECRET leaf value is exactly
+// SecretDataPlaceholder ("##SECRET-DATA##"). It is invoked by the commit-ingest
+// schema gate (SchemaValidateWithDefinitions), so on the strict operator commit
+// / commit-check path it FAILS the commit, while the tolerant Load / SyncApply
+// path downgrades it to a warning (compileTreeLenient) — the same strict/lenient
+// doctrine the #1319 typed-leaf gate uses.
+//
+// Scope is exactly RedactedClone's: the SAME secret-leaf set (secretIndices) is
+// used to detect the placeholder that RedactedClone used to PRODUCE it. A
+// non-secret leaf that happens to carry the literal "##SECRET-DATA##" string is
+// NOT rejected — RedactedClone never masks it, so ingesting it is harmless and
+// rejecting it would be an over-reach. The returned error names the offending
+// config path for the operator.
+func checkRedactionPlaceholder(t *ConfigTree) error {
+	if t == nil {
+		return nil
+	}
+	if path := findRedactionPlaceholder(t.Children, nil); path != "" {
+		return fmt.Errorf("%w (at %q)", errRedactionPlaceholderIngest, path)
+	}
+	return nil
+}
+
+// findRedactionPlaceholder walks nodes maintaining the flattened key path of all
+// ancestors (base), mirroring redactNodes. It returns the flattened path (up to
+// and including the offending value token) of the FIRST secret leaf whose value
+// equals SecretDataPlaceholder, or "" if none. A secret index is only inspected
+// in whichever node's own Keys slice owns it (idx >= len(base)) — matching how
+// redactNodes masks the token — so the detection is exactly symmetric with the
+// masking regardless of the dual (hierarchical vs flat-set) AST shape.
+func findRedactionPlaceholder(nodes []*Node, base []string) string {
+	for _, n := range nodes {
+		full := append(append([]string(nil), base...), n.Keys...)
+		for _, idx := range secretIndices(full) {
+			if idx >= len(base) && idx < len(full) && n.Keys[idx-len(base)] == SecretDataPlaceholder {
+				return strings.Join(full[:idx+1], " ")
+			}
+		}
+		if !n.IsLeaf {
+			if hit := findRedactionPlaceholder(n.Children, full); hit != "" {
+				return hit
+			}
+		}
+	}
+	return ""
 }

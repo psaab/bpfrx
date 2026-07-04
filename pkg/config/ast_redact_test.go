@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -131,6 +132,111 @@ func TestRedactedCloneKeepsNonSecrets(t *testing.T) {
 	}
 	if !strings.Contains(out, SecretDataPlaceholder) {
 		t.Errorf("community NAME not masked; expected placeholder:\n%s", out)
+	}
+}
+
+// TestRedactionPlaceholderIngestRejected is the #4060 RED-on-revert net for
+// the symmetric commit-ingest guard: re-applying a secret-redacted REST export
+// (every secret leaf carries the "##SECRET-DATA##" placeholder) must be
+// REJECTED, not silently committed with the placeholder as a literal secret.
+//
+// It re-ingests the redacted render of the full secret set the way the config
+// store does (ParseSetCommand + SetPath), then asserts checkRedactionPlaceholder
+// AND the commit-ingest schema gate (SchemaValidate) reject it. It goes RED (a
+// redacted export commits with placeholder secrets) if the guard is a no-op.
+func TestRedactionPlaceholderIngestRejected(t *testing.T) {
+	// Build the cleartext tree, redact it (as REST export does), render it to
+	// `set` lines, and replay those lines back into a fresh tree — exactly the
+	// operator foot-gun the guard closes.
+	cleartext := buildRedactTree(t, redactionSecretSet)
+	redactedSet := cleartext.RedactedClone().FormatSet()
+	if !strings.Contains(redactedSet, SecretDataPlaceholder) {
+		t.Fatalf("redacted export did not contain the placeholder; test precondition broken:\n%s", redactedSet)
+	}
+
+	reingested := &ConfigTree{}
+	for _, line := range strings.Split(redactedSet, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		toks, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := reingested.SetPath(toks); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+
+	if err := checkRedactionPlaceholder(reingested); err == nil {
+		t.Fatal("checkRedactionPlaceholder accepted a redacted export; want rejection")
+	} else if !errors.Is(err, errRedactionPlaceholderIngest) {
+		t.Fatalf("checkRedactionPlaceholder err = %v, want errRedactionPlaceholderIngest", err)
+	}
+
+	// The commit-ingest schema gate (the production strict-commit hook) must
+	// also reject it.
+	if err := SchemaValidate(reingested, nil); err == nil {
+		t.Fatal("SchemaValidate accepted a redacted export; want rejection")
+	} else if !errors.Is(err, errRedactionPlaceholderIngest) {
+		t.Fatalf("SchemaValidate err = %v, want errRedactionPlaceholderIngest", err)
+	}
+}
+
+// TestRedactionPlaceholderIngest_PerSecretLeaf confirms the guard fires for
+// EVERY secret-leaf signature individually (mirroring RedactedClone's set), so
+// a redacted export of ANY single secret is rejected — not just the first in
+// the full-set render.
+func TestRedactionPlaceholderIngest_PerSecretLeaf(t *testing.T) {
+	for _, line := range redactionSecretSet {
+		line := line
+		// Skip the pure-selector lines that carry no secret value (they set a
+		// DDNS provider backend, not a secret).
+		if strings.Contains(line, "backend") {
+			continue
+		}
+		t.Run(line, func(t *testing.T) {
+			redacted := buildRedactTree(t, []string{line}).RedactedClone()
+			err := checkRedactionPlaceholder(redacted)
+			if err == nil {
+				t.Fatalf("guard missed a redacted secret leaf:\n%s", redacted.FormatSet())
+			}
+			if !errors.Is(err, errRedactionPlaceholderIngest) {
+				t.Fatalf("err = %v, want errRedactionPlaceholderIngest", err)
+			}
+		})
+	}
+}
+
+// TestRedactionPlaceholderIngest_NormalSecretPasses proves the guard rejects
+// ONLY the exact placeholder: a real cleartext secret (the un-redacted set)
+// still commits cleanly through the same gate.
+func TestRedactionPlaceholderIngest_NormalSecretPasses(t *testing.T) {
+	cleartext := buildRedactTree(t, redactionSecretSet)
+	if err := checkRedactionPlaceholder(cleartext); err != nil {
+		t.Fatalf("checkRedactionPlaceholder rejected a normal cleartext config: %v", err)
+	}
+	if err := SchemaValidate(cleartext, nil); err != nil {
+		t.Fatalf("SchemaValidate rejected a normal cleartext config: %v", err)
+	}
+}
+
+// TestRedactionPlaceholderIngest_NonSecretScoped confirms the guard is
+// secret-leaf-scoped (matching RedactedClone): a NON-secret leaf that happens to
+// carry the literal "##SECRET-DATA##" string is NOT rejected — RedactedClone
+// never masks such a leaf, so ingesting it is harmless.
+func TestRedactionPlaceholderIngest_NonSecretScoped(t *testing.T) {
+	tree := buildRedactTree(t, []string{
+		// host-name is not a secret leaf; even the literal placeholder value is
+		// fine here (it would never have been produced by RedactedClone).
+		`set system host-name "` + SecretDataPlaceholder + `"`,
+		// A GRE tunnel `key` is a non-secret generic keyword (secretIndices
+		// gates `key` to the OSPF md5 context only).
+		`set interfaces gr-0-0-0 unit 0 tunnel key "` + SecretDataPlaceholder + `"`,
+	})
+	if err := checkRedactionPlaceholder(tree); err != nil {
+		t.Fatalf("guard over-reached onto a non-secret leaf: %v", err)
 	}
 }
 

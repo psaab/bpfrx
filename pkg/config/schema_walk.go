@@ -81,6 +81,16 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	// no-op (no clone) when nothing is deactivated.
 	tree = tree.WithoutInactive()
 	defsSource = defsSource.WithoutInactive()
+	// #4060: reject the raw-AST redaction placeholder ("##SECRET-DATA##") on
+	// commit-ingest. This is the symmetric guard for the #4051 display
+	// redaction — re-applying a secret-redacted REST export must not silently
+	// commit the placeholder as a literal secret (breaking IPsec/auth with a
+	// nonsense key). Strict on the operator commit path (fails the commit),
+	// downgraded to a warning on the tolerant Load / SyncApply path
+	// (compileTreeLenient), the same doctrine as the typed-leaf gate below.
+	if err := checkRedactionPlaceholder(tree); err != nil {
+		return err
+	}
 	refs := collectSchemaRefs(tree)
 	if defsSource != nil {
 		for name := range collectSchemaRefs(defsSource).forwardingClasses {
