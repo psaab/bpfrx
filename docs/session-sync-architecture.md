@@ -402,6 +402,19 @@ event stream signals a FullResync after a #2874 sequence gap or a #2442
 delta-ring overflow (loss-of-sync), and the export republishes the full owned set
 from table truth. It is not the same thing as the steady-state delta drain.
 
+The `rgIDs` handed to the export are enumerated from the **configured
+redundancy-group set** — `handleEventStreamFullResync` calls
+`primaryOwnerRGIDs(cfg)`, which walks `cfg.Chassis.Cluster.RedundancyGroups`
+(the same live active config `buildZoneIDs` reads) and keeps every id the node
+is `IsLocalPrimary` for. It does **not** iterate a fixed `0..15` range. Junos
+redundancy-group ids are not bounded to 15 (the `<group-id>` config slot has no
+validator and is parsed via an unbounded `strconv.Atoi`), so the old hardcoded
+`for rgID := 0; rgID < 16` loop silently skipped any RG with id >= 16 — its
+owned sessions were never re-exported on a FullResync, so the standby never
+received them and they were dropped on a failover of that RG (#4028). This
+mirrors the live-config enumeration the watchdog/fence paths use
+(`currentRedundancyGroups`, #3917).
+
 **The export ack-wait runs OFF the global `ServerState` lock (#2962).** The
 helper-side control-socket dispatcher (`server/handlers/mod.rs`) holds a single
 `Mutex<ServerState>` across its request `match`, which serializes every control
