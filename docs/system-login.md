@@ -82,6 +82,38 @@ matcher the dispatcher uses, so an abbreviated `monitor tr` is gated
 identically to the fully-spelled form and cannot bypass the gate. Other
 `monitor` subcommands and read-only `show` commands are unaffected.
 
+**Secret redaction in `show configuration` (#4099).** The on-box interactive
+CLI config-render show paths — `show configuration` (hierarchical / `| display
+set` / `| display json` / `| display xml` / `| display inheritance`, including
+path-scoped subtrees), `show system rollback <N> [| display set | compare]`,
+`show system login` / `internet-options` / `root-authentication`, `show system
+configuration rescue`, and the config-mode `show` / `show | compare` — mask
+secret leaves (IKE pre-shared-keys, SNMP communities, BGP/OSPF
+authentication-keys, WireGuard private keys, encrypted passwords, DDNS
+tokens/keys) with `##SECRET-DATA##` for **every login class except
+`super-user`**. This mirrors Junos (which never renders a cleartext secret in
+`show configuration` for any class) and the always-redacted REST/gRPC
+`ShowConfig` path (#4051): a VIEW-only `read-only`, `config-viewer`, or
+`operator` login can no longer harvest cleartext firewall secrets through the
+console. The redaction predicate is `CLI.showConfigRedacted()`
+(`pkg/cli/permissions.go`): it routes rendering through the `*Redacted`
+configstore methods (the same `RedactedClone` renderers REST/gRPC use) for any
+class **without** `PermAll`.
+
+`super-user` still reads cleartext — it is the console root that already has
+direct config-DB filesystem access, so masking it would only obstruct the
+operator copying a secret while providing no protection (the deliberate #4057
+allowance). An **unset/empty** class (no `system login` configured — the legacy
+no-RBAC allow-everything mode) is likewise treated as privileged and reads
+cleartext, so a deployment with no login classes is bit-identical to before the
+change. An **unknown** class fails **closed** (redacted). Config mode requires
+`PermConfig` (super-user only today), so the config-mode candidate show paths
+render cleartext in practice; they are wired through the same gate as
+defense-in-depth should a lower class ever gain config-view access. The raw
+`rescue.conf` text (a full cleartext-secret config dump, #4056) is reparsed +
+redacted before display and fails **closed** — a parse error returns an error
+rather than the cleartext bytes.
+
 ### Generating a hash
 
 ```

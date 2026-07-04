@@ -42,66 +42,76 @@ func (c *CLI) handleShow(args []string) error {
 			}
 			cfgPath = append(cfgPath, a)
 		}
-		if strings.Contains(rest, "| display json") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathJSON(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveJSON())
+		// Secret redaction (#4099): a VIEW-only read-only / config-viewer (and
+		// operator) login class must see ##SECRET-DATA## in place of IKE PSKs,
+		// SNMP communities and authentication-keys — matching Junos and the
+		// always-redacted REST/gRPC ShowConfig (#4051). super-user (and the
+		// no-RBAC empty class) still reads cleartext. The *Redacted store
+		// methods take the path directly (nil/empty == whole tree), mirroring
+		// the gRPC/REST usage; the cleartext siblings back the whole-tree /
+		// subtree split for the privileged path.
+		redact := c.showConfigRedacted()
+		var output string
+		switch {
+		case strings.Contains(rest, "| display json"):
+			switch {
+			case redact:
+				output = c.store.ShowActiveJSONRedacted(cfgPath)
+			case len(cfgPath) > 0:
+				output = c.store.ShowActivePathJSON(cfgPath)
+			default:
+				output = c.store.ShowActiveJSON()
 			}
-		} else if strings.Contains(rest, "| display set") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathSet(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveSet())
+		case strings.Contains(rest, "| display set"):
+			switch {
+			case redact:
+				output = c.store.ShowActiveSetRedacted(cfgPath)
+			case len(cfgPath) > 0:
+				output = c.store.ShowActivePathSet(cfgPath)
+			default:
+				output = c.store.ShowActiveSet()
 			}
-		} else if strings.Contains(rest, "| display xml") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathXML(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveXML())
+		case strings.Contains(rest, "| display xml"):
+			switch {
+			case redact:
+				output = c.store.ShowActiveXMLRedacted(cfgPath)
+			case len(cfgPath) > 0:
+				output = c.store.ShowActivePathXML(cfgPath)
+			default:
+				output = c.store.ShowActiveXML()
 			}
-		} else if strings.Contains(rest, "| display inheritance") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathInheritance(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveInheritance())
+		case strings.Contains(rest, "| display inheritance"):
+			switch {
+			case redact:
+				output = c.store.ShowActiveInheritanceRedacted(cfgPath)
+			case len(cfgPath) > 0:
+				output = c.store.ShowActivePathInheritance(cfgPath)
+			default:
+				output = c.store.ShowActiveInheritance()
 			}
-		} else if idx := strings.Index(rest, "| "); idx >= 0 {
+		case strings.Index(rest, "| ") >= 0:
+			idx := strings.Index(rest, "| ")
 			pipeParts := strings.Fields(strings.TrimSpace(rest[idx+2:]))
 			if len(pipeParts) >= 2 && pipeParts[0] == "display" {
 				fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
 			} else if len(pipeParts) > 0 {
 				fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
 			}
-		} else if len(cfgPath) > 0 {
-			output := c.store.ShowActivePath(cfgPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-			} else {
-				fmt.Print(output)
+			return nil
+		default:
+			switch {
+			case redact:
+				output = c.store.ShowActiveRedacted(cfgPath)
+			case len(cfgPath) > 0:
+				output = c.store.ShowActivePath(cfgPath)
+			default:
+				output = c.store.ShowActive()
 			}
+		}
+		if len(cfgPath) > 0 && output == "" {
+			fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
 		} else {
-			fmt.Print(c.store.ShowActive())
+			fmt.Print(output)
 		}
 		return nil
 

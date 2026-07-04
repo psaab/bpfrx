@@ -41,6 +41,60 @@ func (c *CLI) checkPermission(parts []string) error {
 	return fmt.Errorf("permission denied: %q requires a higher login class", strings.Join(parts, " "))
 }
 
+// showConfigRedacted reports whether the config-render CLI show paths — `show
+// configuration` (all formats), `show system rollback`, `show system
+// login|internet-options|root-authentication`, `show system configuration
+// rescue`, and the config-mode `show`/`show | compare` — must mask secret
+// leaves for the current login class (#4099).
+//
+// Junos never renders cleartext secrets in `show configuration` (it shows the
+// $9$/##SECRET-DATA form to every class), and xpf already redacts the REST and
+// gRPC ShowConfig raw-AST render paths unconditionally (#4051/F-020). The
+// on-box CLI, however, historically printed cleartext for every class (the
+// deliberate #4057 scope note: "operator reads own secret, root has DB
+// access"). That rationale holds for the privileged super-user / root operator
+// working at the console, but NOT for a VIEW-only read-only or config-viewer
+// login class — both PermView (types_system.go) — which could run `show
+// configuration | display set` and harvest every IKE PSK, SNMP community and
+// authentication-key in cleartext.
+//
+// We therefore redact for every login class EXCEPT super-user (the only class
+// carrying PermAll). super-user == the console root that #4057 protected and
+// that already has direct DB filesystem access, so it still reads cleartext to
+// copy a secret; read-only, config-viewer and operator see ##SECRET-DATA##. An
+// UNSET login class (CLI spawned without RBAC configured — the legacy
+// allow-everything mode, mirroring checkPermission's empty-class shortcut) is
+// treated as privileged and reads cleartext, so a deployment with no `system
+// login` classes is bit-identical to before this change. An UNKNOWN class
+// fails closed (redacted).
+func (c *CLI) showConfigRedacted() bool {
+	if c.userClass == "" {
+		return false
+	}
+	perms, ok := config.LoginClassPermissions[c.userClass]
+	if !ok {
+		return true
+	}
+	for _, p := range perms {
+		if p == config.PermAll {
+			return false
+		}
+	}
+	return true
+}
+
+// showActiveConfigPath renders an active-config subtree as hierarchical text,
+// masking secret leaves when showConfigRedacted() flags the current login
+// class (#4099). It is the redaction-aware replacement for direct
+// store.ShowActivePath calls on secret-bearing subtrees (`show system login`,
+// `show system root-authentication`).
+func (c *CLI) showActiveConfigPath(path []string) string {
+	if c.showConfigRedacted() {
+		return c.store.ShowActiveRedacted(path)
+	}
+	return c.store.ShowActivePath(path)
+}
+
 // requiredPermission returns the login-class permission a resolved operational
 // command needs. Gating is on the top-level word (parts[0]) for almost every
 // command, with one important exception: `monitor traffic` spawns a root

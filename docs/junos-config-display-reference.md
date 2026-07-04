@@ -2,6 +2,14 @@
 
 Reference captured from a live Juniper vSRX cluster (JUNOS 24.4R1-S2.9) on 2026-02-15.
 
+> **Secret redaction (#4099).** For every login class except `super-user`, all
+> `show configuration` output — hierarchical, `| display set/json/xml/
+> inheritance`, path-scoped, and the `show system rollback` / `rescue` /
+> `root-authentication` variants — masks secret leaves with `##SECRET-DATA##`,
+> matching Junos and the REST/gRPC `ShowConfig` path (#4051). A VIEW-only
+> `read-only` / `config-viewer` / `operator` class never sees a cleartext IKE
+> PSK, SNMP community or auth-key. See `docs/system-login.md`.
+
 ---
 
 ## 1. `show configuration` Sub-Path Completions
