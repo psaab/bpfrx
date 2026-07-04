@@ -305,13 +305,22 @@ when the existing kernel link is genuinely incompatible:
   config-wants-none is identity-gated: only when the current master IS
   the claimed RI's `vrf-` device; transient errors retain the claim
   for retry.
-- **Keepalives** (legacy branch only — anchors never probe): runners
+- **Keepalives** (BOTH the anchor and the legacy branch, #4071): runners
   are reconciled by normalized identity `(remote, source, interval,
   retry<=0→3)` and survive unrelated applies; `LinkSetUp` is SKIPPED
   when a retained runner holds the tunnel down (the down-transition in
   `keepaliveLoop` is gated on `state.Up`, so re-upping would strand
   the link admin UP). A change to the tunnel SOURCE restarts the runner
-  (#1918 §5c): the source is the probe bind address.
+  (#1918 §5c): the source is the probe bind address. The prober is
+  dataplane-agnostic (raw ICMP over the underlay FIB), so the production
+  userspace-dp anchor path (`applyAnchorLocked`) starts the SAME engine as
+  the legacy kernel-tunnel branch (`applyKernelTunnelLocked`) — a
+  configured `keepalive` on a GRE anchor tunnel now probes the far end and
+  LinkSetDowns the anchor TUN on peer death (the down oif withdraws its
+  connected/overlay routes, driving OSPF/BGP/static-nexthop dependents to
+  reconverge — the Junos gr-/st0 interface-down semantic). Before #4071
+  the anchor path unconditionally stopped the runner, so a configured
+  keepalive was accepted-but-inert on the only production dataplane.
 
 ## Keepalive liveness probing (`tunnel_keepalive.go`, #1918)
 
@@ -355,12 +364,15 @@ peer behind a valid route read up forever and the fail-safe
   retries next tick (never a lost or half-applied transition), and a
   racing `GetStatus` never blocks behind a slow netlink op nor observes
   an uncommitted `Up`.
-- **Recreate safety**: `applyKernelTunnelLocked` cancels + DRAINS the
-  existing keepalive runner BEFORE it deletes/recreates the kernel link
-  (drain-before-recreate), so no stale runner can issue a `LinkSet*`
-  against a recreated link that reused the ifindex. A per-tunnel
-  `linkGen` (`*atomic.Uint64`, read LOCK-FREE by the runner — it never
-  takes `t.mu`) is the defense-in-depth backstop; the runner drops any
+- **Recreate safety**: both `applyKernelTunnelLocked` and (since #4071)
+  `applyAnchorLocked` cancel + DRAIN the existing keepalive runner BEFORE
+  they delete/recreate the kernel link (drain-before-recreate), so no
+  stale runner can issue a `LinkSet*` against a recreated link that reused
+  the ifindex. A transient (non-not-found) lookup error is NOT treated as
+  a recreate on either path — the EEXIST-adopt fallback keeps the link, so
+  a live runner is retained rather than drained. A per-tunnel `linkGen`
+  (`*atomic.Uint64`, read LOCK-FREE by the runner — it never takes
+  `t.mu`) is the defense-in-depth backstop; the runner drops any
   transition whose captured generation no longer matches.
 
 `Clear()`/`ClearTunnels` keep delete-everything semantics and reset the
