@@ -896,7 +896,7 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		return errors.New("userspace_local_v6 map not loaded")
 	}
 
-	desiredV4, desiredV6 := buildDesiredLocalAddressSets(snapshot)
+	desiredV4, desiredV6, enumComplete := m.buildDesiredLocalAddressSets(snapshot)
 	for key := range desiredV4 {
 		if err := localV4Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_local_v4 %08x: %w", key, err)
@@ -906,6 +906,23 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		if err := localV6Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_local_v6 %+v: %w", key, err)
 		}
+	}
+
+	// A transient netlink AddrList failure (or an interrupted/ENOBUFS
+	// partial dump) yields a NON-AUTHORITATIVE desired set that may be
+	// missing kernel-owned VIP addresses (VRRP VIPs, secondary locals).
+	// Pruning against that partial set would delete live VRRP VIP / local
+	// keys from userspace_local_v4/v6 and blackhole packets destined to
+	// the VIP / SSH / BGP / IKE local endpoints (#3924). Treat the
+	// incomplete enumeration as non-authoritative: the adds above already
+	// landed (adding is always safe — it only ever widens the local set),
+	// but SKIP the stale-key prune this cycle and warn. The next reconcile
+	// with a complete enumeration removes any genuinely stale keys.
+	if !enumComplete {
+		slog.Warn("userspace local-address sync: netlink AddrList enumeration incomplete; " +
+			"skipping stale-key prune to avoid removing VRRP VIP/local keys from " +
+			"userspace_local_v4/v6 (will reconcile on the next complete enumeration)")
+		return nil
 	}
 
 	var (
@@ -952,9 +969,30 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 	return nil
 }
 
-func buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}) {
-	desiredV4 := make(map[uint32]struct{})
-	desiredV6 := make(map[userspaceLocalV6Key]struct{})
+// addrListHook mirrors netlink.AddrList so tests can inject a transient
+// enumeration failure through the Manager (#3924).
+type addrListHook func(link netlink.Link, family int) ([]netlink.Addr, error)
+
+// addrListForLocalSync enumerates addresses for the local-address map
+// reconcile, dispatching to the test hook when one is installed and to
+// netlink.AddrList otherwise.
+func (m *Manager) addrListForLocalSync(link netlink.Link, family int) ([]netlink.Addr, error) {
+	if m.addrListForLocalSyncHook != nil {
+		return m.addrListForLocalSyncHook(link, family)
+	}
+	return netlink.AddrList(link, family)
+}
+
+// buildDesiredLocalAddressSets returns the desired userspace_local_v4/v6
+// key sets and reports whether the kernel-address enumeration was
+// COMPLETE. enumComplete is false when any netlink AddrList family dump
+// failed — in that case the returned sets are non-authoritative (they may
+// be missing kernel-owned VIP addresses), so the caller MUST NOT prune
+// existing map keys against them (#3924). Config-derived entries are
+// always present regardless of enumeration outcome.
+func (m *Manager) buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (desiredV4 map[uint32]struct{}, desiredV6 map[userspaceLocalV6Key]struct{}, enumComplete bool) {
+	desiredV4 = make(map[uint32]struct{})
+	desiredV6 = make(map[userspaceLocalV6Key]struct{})
 	for _, entry := range buildLocalAddressEntries(snapshot) {
 		if entry.v4 {
 			desiredV4[entry.v4Key] = struct{}{}
@@ -966,9 +1004,16 @@ func buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}
 	// config snapshot. Without this, the XDP shim doesn't recognize VIP
 	// destinations as local and redirects them to XSK instead of the kernel.
 	// Use AddrList(nil, ...) to enumerate ALL addresses on the system.
+	//
+	// A failed family dump means the enumeration is INCOMPLETE: record it
+	// via enumComplete so the caller skips the destructive prune. We still
+	// accumulate whatever the surviving family dump returned (adding is
+	// safe — only pruning against a partial set is dangerous).
+	enumComplete = true
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		addrs, err := netlink.AddrList(nil, family)
+		addrs, err := m.addrListForLocalSync(nil, family)
 		if err != nil {
+			enumComplete = false
 			continue
 		}
 		for _, addr := range addrs {
@@ -986,7 +1031,7 @@ func buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}
 			}
 		}
 	}
-	return desiredV4, desiredV6
+	return desiredV4, desiredV6, enumComplete
 }
 
 func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) error {

@@ -257,6 +257,11 @@ type Manager struct {
 
 	lookupUserspaceCtrlForFailClosedHook userspaceCtrlLookupHook
 
+	// addrListForLocalSyncHook, when non-nil, replaces netlink.AddrList in
+	// buildDesiredLocalAddressSets so tests can inject a transient
+	// enumeration failure (#3924). Production leaves it nil.
+	addrListForLocalSyncHook addrListHook
+
 	mode               DataplaneMode // current active runtime mode
 	configuredMode     DataplaneMode // user-configured desired mode (from config)
 	lastHASyncTime     time.Time     // throttle HA watchdog sync to avoid control socket contention
