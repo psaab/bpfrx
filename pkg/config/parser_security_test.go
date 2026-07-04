@@ -5747,3 +5747,39 @@ func TestIPsecDynamicHostnameNotResponderOnly(t *testing.T) {
 		t.Errorf("dynamic-hostname gateway must NOT be responder-only")
 	}
 }
+
+// TestIPsecDFBitSetSyntaxCompile verifies the df-bit action compiles through
+// the flat-set parse path (ParseSetCommand + tree.SetPath) into the stored
+// IPsecVPN.DFBit value for every Junos mode (copy|set|clear). The semantic
+// mapping to strongSwan copy_df (and the #4015 set/clear inversion fix) is
+// asserted in pkg/ipsec TestGenerateConfig_DFBit; this test guards the
+// config-compile leg that feeds it.
+func TestIPsecDFBitSetSyntaxCompile(t *testing.T) {
+	for _, mode := range []string{"copy", "set", "clear"} {
+		tree := &ConfigTree{}
+		cmds := []string{
+			"set security ipsec vpn tun bind-interface st0.0",
+			"set security ipsec vpn tun df-bit " + mode,
+		}
+		for _, cmd := range cmds {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("df-bit %q: CompileConfig: %v", mode, err)
+		}
+		vpn := cfg.Security.IPsec.VPNs["tun"]
+		if vpn == nil {
+			t.Fatalf("df-bit %q: VPN tun not compiled", mode)
+		}
+		if vpn.DFBit != mode {
+			t.Errorf("df-bit %q: compiled DFBit = %q, want %q", mode, vpn.DFBit, mode)
+		}
+	}
+}

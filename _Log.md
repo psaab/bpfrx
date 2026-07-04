@@ -30981,3 +30981,28 @@ top.
     Quick Start, docs/testing.md, docs/testing-procedures.md.
   - **File(s)**: Makefile, README.md, CLAUDE.md, docs/testing.md,
     docs/testing-procedures.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fix inverted IPsec `df-bit set`/`df-bit clear` action (#4015).
+    Traced the whole path — config parse → compile (`compiler_ipsec.go`
+    stores `DFBit` verbatim) → strongSwan config generation
+    (`pkg/ipsec/policy.go`). The df-bit action is applied entirely in Go via
+    strongSwan `copy_df`; NO Rust dataplane involvement (the only Rust DF
+    logic is NAT64, unrelated). strongSwan `copy_df`: `yes` (default) copies
+    the inner DF to the outer header (= Junos `copy`); `no` forces the outer
+    DF to 0 (= Junos `clear`, allow fragmentation). The old mapping emitted
+    `copy_df = no` for `set` (which CLEARS DF) and let `clear` fall through
+    to the default `copy_df = yes` (which COPIES/preserves DF) — set and
+    clear were inverted. Impact: `df-bit clear` (intended to allow
+    fragmentation into a tunnel) instead preserved/set DF → PMTUD blackhole
+    for oversized packets. Fix: single-point switch — `copy`/`set` →
+    `copy_df = yes` (strongSwan cannot force DF=1; copy_df=yes is the
+    DF-preserving/PMTUD behavior), `clear` → `copy_df = no`. Updated the
+    existing `TestGenerateConfig_DFBit` to encode the correct mapping
+    (RED-on-revert: `set`/`clear` subtests fail on the old branch) and added
+    `TestIPsecDFBitSetSyntaxCompile` (ParseSetCommand + tree.SetPath compile
+    leg). Schema desc `(copy|set)` → `(copy|set|clear)`; docs/phases.md
+    df-bit entry expanded to all three modes.
+  - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/ipsec_test.go,
+    pkg/config/parser_security_test.go, pkg/config/schema_security.go,
+    docs/phases.md, _Log.md
