@@ -1,3 +1,40 @@
+## 2026-07-04 — #4071: GRE keepalive accepted-but-inert on the userspace-dp (anchor) path — re-wire the #1918 engine onto `applyAnchorLocked`
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed fable-161 F-063 (MEDIUM, feature-gap). A configured
+    GRE `keepalive`/`keepalive-retry` compiled into `TunnelConfig` but was
+    a silent no-op on the production dataplane: the #1918 ICMP-echo
+    keepalive engine (`tunnel_keepalive.go` + `startKeepalive`/
+    `keepaliveLoop`/`keepaliveTick`) was started ONLY from the legacy
+    kernel-tunnel branch (`applyKernelTunnelLocked`), while the daemon
+    always takes the anchor branch (`anchorOnly=true`) →
+    `applyAnchorLocked`, which unconditionally `stopKeepaliveLocked`'d the
+    runner and never started one. So a dead GRE far-end was never detected
+    and the interface-down → route-withdrawal action never fired.
+    Fix (Go-only re-wire, `pkg/routing/tunnel.go` `applyAnchorLocked`):
+    start the EXISTING engine on the anchor path, reconciled by identity
+    exactly like the legacy branch — start when `tc.Keepalive > 0`, retain
+    an unchanged runner across applies, restart on a config change, stop
+    when keepalive is removed. Ported the legacy guards: drain-before-
+    recreate + `linkGen` bump (only a genuine recreate — present-but-
+    incompatible or not-found — drains; a transient lookup error keeps the
+    live runner via the EEXIST-adopt path), and skip-`LinkSetUp`-when-a-
+    retained-runner-holds-the-link-down. Down-action stays `LinkSetDown` on
+    the anchor TUN (the Junos-faithful semantic). The prober is dataplane-
+    agnostic (raw ICMP over the underlay FIB) so no Rust change is needed;
+    userspace-dp GRE local-origin TUN-reader tolerance of an admin-down
+    anchor is a loss-cluster VALIDATION item (TUN fd stays valid under
+    admin-down — expected safe).
+    RED-on-revert: `TestAnchorKeepaliveStartsRunnerLifecycle` (a keepalive
+    anchor config STARTS a runner — reverting to the old unconditional
+    `stopKeepaliveLocked` leaves no runner), plus retain/no-op, remove-
+    stops, and the anchor-started runner's `LinkSetDown` on threshold.
+    Validation: `go test ./pkg/routing/... ./pkg/daemon/...` green
+    (+ `-race` on the lifecycle test); `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/routing/tunnel.go,
+    pkg/routing/tunnel_anchor_keepalive_test.go,
+    pkg/routing/README.md, _Log.md
+
 ## 2026-07-04 — #4069: RG-activation reverse-prewarm used O(N·M) Vec::contains dedup on the failover critical path → slow prewarm on a busy cluster
 
 - **Timestamp**: 2026-07-04

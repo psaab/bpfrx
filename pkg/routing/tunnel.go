@@ -488,15 +488,44 @@ func anchorReusable(link netlink.Link) bool {
 
 // applyAnchorLocked reconciles one AnchorOnly TUN device (the
 // production userspace-dp path). Caller MUST hold mu.
+//
+// #4071: the #1918 keepalive engine now runs on the anchor path too. A
+// configured `keepalive`/`keepalive-retry` on a GRE anchor tunnel starts
+// the ICMP-echo prober whose down-action LinkSetDowns the anchor TUN on
+// peer death — the Junos-faithful "gr-/st0 interface-down →
+// route-withdrawal" semantic. The prober is dataplane-agnostic (raw ICMP
+// over the underlay FIB), identical to the legacy branch's runner; only
+// the START/STOP wiring differs. The keepalive is reconciled by identity
+// exactly like applyKernelTunnelLocked: an unchanged runner is retained
+// across applies (probe state survives commits), restarted on a config
+// change, and stopped when keepalive is removed.
 func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool) {
-	// A leftover keepalive runner (legacy→anchor mode change) must not
-	// keep probing: anchors never run keepalives (probes LinkSetDown
-	// the device on failure — a behavior the anchor path never had).
-	t.stopKeepaliveLocked(tc.Name)
+	// Drain-before-recreate + linkGen bump (#1918 §6 Axis D F7, ported to
+	// the anchor path in #4071). Decide up front whether this apply will
+	// recreate the anchor TUN. If so, CANCEL + DRAIN any existing keepalive
+	// runner BEFORE the LinkDel/LinkAdd and bump the generation, so no
+	// stale runner tick can LinkSet* a recreated device that reused the
+	// ifindex; linkGen is the lock-free defense-in-depth backstop. A
+	// TRANSIENT lookup error is NOT a recreate: the LinkAdd-EEXIST fallback
+	// below adopts a still-present TUN in place, so draining a live runner
+	// then would needlessly reset probe state (mirrors the legacy branch's
+	// transient-lookup discipline, TestApplyTransientLookupKeepsRunner).
+	existing, lookupErr := t.ops.LinkByName(tc.Name)
+	willRecreate := false
+	switch {
+	case lookupErr == nil:
+		willRecreate = !anchorReusable(existing)
+	case isLinkNotFound(lookupErr):
+		willRecreate = true
+	}
+	if willRecreate {
+		t.stopKeepaliveLocked(tc.Name)
+		t.bumpLinkGenLocked(tc.Name)
+	}
 
 	var link netlink.Link
 	created := false
-	if existing, lookupErr := t.ops.LinkByName(tc.Name); lookupErr == nil {
+	if lookupErr == nil {
 		if anchorReusable(existing) {
 			// Operate on the kernel-fetched link (real ifindex and
 			// attributes), never a fresh ifindex-less struct (#1706).
@@ -526,15 +555,15 @@ func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool
 			// KERNEL-FETCHED link (its Fds is nil, so the
 			// closeTuntapFiles below is skipped with it); anything else
 			// fails this apply (no unbounded retry).
-			existing, lkErr := t.ops.LinkByName(tc.Name)
-			if lkErr != nil || !anchorReusable(existing) {
+			existingAdopt, lkErr := t.ops.LinkByName(tc.Name)
+			if lkErr != nil || !anchorReusable(existingAdopt) {
 				slog.Warn("failed to create tunnel anchor",
 					"name", tc.Name, "err", addErr)
 				return
 			}
 			slog.Info("tunnel anchor already exists as TUN, reusing",
 				"name", tc.Name)
-			link = existing
+			link = existingAdopt
 		} else {
 			closeTuntapFiles(anchor.Fds)
 			link = anchor
@@ -555,7 +584,36 @@ func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool
 	if !created {
 		t.reconcileAnchorMTULocked(tc, link, adopting)
 	}
-	t.finishTunnelLocked(tc, link, false, "tunnel anchor")
+
+	// Keepalive reconcile (#4071, mirroring applyKernelTunnelLocked's
+	// #1884 A.7 identity reconcile). Retain an identity-unchanged runner
+	// so probe state survives commits; the retained-and-DOWN case must
+	// SKIP the LinkSetUp in finishTunnelLocked so the reconcile does not
+	// fight a keepalive-down state — keepaliveLoop's down-transition is
+	// gated on state.Up==true, so re-upping the link here would strand it
+	// admin UP forever while probes keep failing. When willRecreate drained
+	// the runner above, hasRunner is false → restartKA starts a fresh one.
+	runner, hasRunner := t.keepalives[tc.Name]
+	restartKA := tc.Keepalive > 0 && (!hasRunner || created || !runner.matches(tc))
+	skipUp := false
+	if tc.Keepalive > 0 && hasRunner && !restartKA {
+		runner.state.mu.Lock()
+		skipUp = !runner.state.Up
+		runner.state.mu.Unlock()
+	}
+
+	t.finishTunnelLocked(tc, link, skipUp, "tunnel anchor")
+
+	if tc.Keepalive > 0 {
+		if restartKA {
+			// startKeepalive stops+drains any predecessor itself; runs
+			// AFTER a recreate so the fresh runner probes the new device.
+			// tc.Source is the probe bind endpoint (#1918 §5c).
+			t.startKeepalive(tc.Name, tc.Source, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
+		}
+	} else if hasRunner {
+		t.stopKeepaliveLocked(tc.Name)
+	}
 }
 
 // reconcileAnchorMTULocked applies the #1884 MTU ownership rule to a
