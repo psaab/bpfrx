@@ -11,7 +11,7 @@ import (
 // .0, the legacy gwIP[3] = 1 computation landed OUTSIDE the subnet, sending the
 // directed probe to a foreign address.
 //
-// These tests pin gatewayProbeTarget directly. They are fail-on-revert: the
+// These tests pin GatewayProbeTarget directly. They are fail-on-revert: the
 // /28 case (VIP 10.0.61.18/28, network 10.0.61.16) wants 10.0.61.17; the
 // pre-#2377 code computed 10.0.61.1, which is OUTSIDE the .16-.31 subnet — so
 // asserting the target is in-subnet fails against master.
@@ -53,18 +53,18 @@ func TestGatewayProbeTargetInSubnet(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.cidr, func(t *testing.T) {
 			ipNet := mustCIDR(t, tc.cidr)
-			gw, ok := gatewayProbeTarget(ipNet)
+			gw, ok := GatewayProbeTarget(ipNet)
 			if ok != tc.wantOK {
-				t.Fatalf("gatewayProbeTarget(%s) ok = %v, want %v", tc.cidr, ok, tc.wantOK)
+				t.Fatalf("GatewayProbeTarget(%s) ok = %v, want %v", tc.cidr, ok, tc.wantOK)
 			}
 			if !ok {
 				return
 			}
 			if gw.String() != tc.wantGW {
-				t.Errorf("gatewayProbeTarget(%s) = %s, want %s", tc.cidr, gw, tc.wantGW)
+				t.Errorf("GatewayProbeTarget(%s) = %s, want %s", tc.cidr, gw, tc.wantGW)
 			}
 			if tc.inSubnet && !ipNet.Contains(gw) {
-				t.Errorf("gatewayProbeTarget(%s) = %s is OUTSIDE the subnet %s — #2377 regression",
+				t.Errorf("GatewayProbeTarget(%s) = %s is OUTSIDE the subnet %s — #2377 regression",
 					tc.cidr, gw, ipNet)
 			}
 		})

@@ -492,6 +492,13 @@ var (
 	directNABurstFn   = cluster.SendGratuitousIPv6BurstGated
 )
 
+// directARPProbeFn is the supplementary gateway ARP-probe sender used by
+// directSendGARPs. It is a package var so tests can capture the sender/target
+// that directSendGARPs passes — proving the probe carries the VIP as the ARP
+// sender (#2152) and targets the in-subnet first host (network+1, #3922) —
+// without performing real AF_PACKET I/O. Mirrors vrrp.arpProbeFn.
+var directARPProbeFn = cluster.SendARPProbe
+
 // directBurstStillValid returns a cluster.BurstStillValid predicate for the
 // direct-mode GARP/NA follow-up loops (#2898). seq is the directAnnounceSeq
 // captured at burst start. The predicate reports true only while this RG still
@@ -557,19 +564,27 @@ func (d *Daemon) directSendGARPs(rgID int) {
 				if err := directGARPBurstFn(ifName, ip, garpCount, stillValid); err != nil {
 					slog.Warn("directSendGARPs: GARP failed", "iface", ifName, "ip", ip, "err", err)
 				}
-				// Send ARP probe to gateway (.1) to update upstream ARP caches.
+				// Send a directed ARP probe to the subnet's first usable host
+				// (network address + 1, the most common gateway) so a router
+				// that ignores broadcast gratuitous ARP still re-binds the VIP
+				// to our MAC. The target derivation is the single source of
+				// truth vrrp.GatewayProbeTarget: it respects the actual prefix
+				// length and returns ok=false on /31 (RFC 3021) and /32 where
+				// no in-subnet gateway host exists. Pre-#3922 this site forced
+				// the network address's last octet to .1, which lands OUTSIDE
+				// the subnet on /25+ or a non-.0 network (e.g. 10.0.61.18/28 →
+				// 10.0.61.1, outside .16-.31) → the probe went to a foreign
+				// address and the real gateway's ARP cache was never updated →
+				// post-failover blackhole. #2377 fixed the analogous forced-.1
+				// in vrrp.sendGARP but missed this direct-mode site.
 				_, ipNet, _ := net.ParseCIDR(cidr)
 				if ipNet != nil {
-					gw := make(net.IP, len(ipNet.IP))
-					copy(gw, ipNet.IP)
-					gw[len(gw)-1] = 1
-					// Skip when the VIP is itself the subnet .1 — otherwise we
-					// would probe ourselves. Mirrors the guard in
-					// vrrp.sendGARP (Codex/AGY #2152 review).
-					if !gw.Equal(ip.To4()) {
-						// Use the VIP as the ARP sender so the gateway re-binds
-						// VIP -> our MAC, not the primary IP -> MAC (#2152).
-						if err := cluster.SendARPProbe(ifName, ip.To4(), gw); err != nil {
+					if gw, ok := vrrp.GatewayProbeTarget(ipNet); ok && !gw.Equal(ip.To4()) {
+						// Skip when network+1 is the VIP itself — otherwise we
+						// would probe ourselves. Use the VIP as the ARP sender
+						// so the gateway re-binds VIP -> our MAC, not the
+						// primary IP -> MAC (#2152).
+						if err := directARPProbeFn(ifName, ip.To4(), gw); err != nil {
 							slog.Warn("directSendGARPs: ARP probe failed", "iface", ifName, "gw", gw, "err", err)
 						}
 					}
