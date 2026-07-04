@@ -32917,3 +32917,27 @@ top.
   - **File(s)**: pkg/dataplane/loader_userspace_shim.go,
     pkg/dataplane/userspace_shim_loader_test.go,
     userspace-dp/src/afxdp/bpf_map/pin.rs, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3908 — flowless screen path missing-profile WARN parity.
+    check_flowless_screens returned ScreenVerdict::Pass SILENTLY on the None
+    branch (no resolved profile for the zone), whereas the flow-present
+    check_packet_with_zone_id None branch calls maybe_warn_missing_profile
+    (#3082 observability). A flowless packet (non-first fragment / non-query
+    ICMP) to a zone that REFERENCES an undefined screen profile therefore
+    produced no diagnostic. FIX: on the check_flowless_screens None branch call
+    self.maybe_warn_missing_profile(zone, now_secs) before returning Pass,
+    mirroring the flow path. Watch-log-only, no drop-behavior change — the
+    helper already distinguishes "zone references a MISSING profile" (rate-
+    limited WARN) from "zone has no screen configured" (silent Pass), so a zone
+    with no screen still passes without warning. O(1) (one hashmap lookup + a
+    rate-limited increment); no unwrap/panic on the hot flowless path. TESTS
+    (RED-on-revert, all three cases): a missing-profile zone WARNs-once-but-
+    Passes and is rate-limited on the flowless path; a no-screen zone Passes
+    flowless without WARN; a resolved-profile zone runs the real flowless checks
+    and never takes the missing-profile WARN path. Docs: screen/mod.rs #3082
+    module note + check_flowless_screens rustdoc + docs/syn-cookie-flood-
+    protection.md now state both paths share maybe_warn_missing_profile.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/screen/tests.rs, docs/syn-cookie-flood-protection.md,
+    _Log.md
