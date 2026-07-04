@@ -29365,3 +29365,35 @@ top.
   semantics), single-block bit-identical. natv6v4 inits struct once + ORs flag.
 - **File(s)**: pkg/config/compiler_nat.go,
   pkg/config/compiler_nat_dup_subblock_3915_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3922 — direct-mode (private-rg-election / no-reth-vrrp)
+    post-failover GARP blackhole on /25+ subnets. `directSendGARPs`
+    (`pkg/daemon/daemon_ha_vip.go`) computed the supplementary gateway ARP
+    probe target by forcing the network address's last octet to `.1`, a
+    pre-#2377 assumption that the gateway is `<subnet>.1`. On any /25-or-longer
+    prefix, or a subnet whose network does not end in `.0`, the forced `.1`
+    falls OUTSIDE the subnet (e.g. VIP 10.0.61.18/28 → 10.0.61.1, outside
+    .16-.31) → the directed probe hit a foreign address and the real gateway's
+    ARP cache was never re-bound to the new master's MAC → post-failover
+    blackhole until the stale entry aged out. #2377 fixed the identical
+    forced-.1 in `vrrp.sendGARP` but MISSED this direct-mode site. Fix: exported
+    the #2377 network-free helper `gatewayProbeTarget` → `vrrp.GatewayProbeTarget`
+    as the single source of truth (network address + 1, respects the prefix,
+    returns ok=false to SKIP the directed probe on /31 (RFC 3021) and /32) and
+    routed `directSendGARPs` through it, replacing the forced-.1 block. Added a
+    `directARPProbeFn` seam (mirrors `vrrp.arpProbeFn`) so the probe target is
+    unit-testable without AF_PACKET I/O. RED-on-revert table test in
+    `pkg/daemon/direct_garp_probe_target_test.go` exercises the full
+    directSendGARPs path: /24-.1 unchanged (green on both), /25 + /28 assert the
+    in-subnet network+1 target (RED against forced-.1 — out of subnet), /32 host
+    route + /30-VIP-is-first-host assert NO directed probe (RED against
+    forced-.1 — fires an out-of-range probe). Verified: 4/5 cases RED on a
+    reverted forced-.1, /24 stays green. `go test ./pkg/daemon/... ./pkg/vrrp/...`
+    green; `go build ./...`, gofmt, vet clean. test-failover WARRANTED (HA
+    post-failover GARP) — batched with the other HA-Medium fixes under the
+    force-node0-primary gate.
+  - **File(s)**: pkg/daemon/daemon_ha_vip.go,
+    pkg/daemon/direct_garp_probe_target_test.go, pkg/vrrp/instance.go,
+    pkg/vrrp/instance_garp_probe_target_test.go, pkg/vrrp/README.md,
+    pkg/daemon/README.md

@@ -47,6 +47,25 @@ Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).
 Absent → standalone. Cluster mode triggers the bondless-RETH naming
 convention (`fxp0`, `em0`, `ge-{0,7}-0-X`).
 
+### Direct-mode VIP failover (private-rg-election / no-reth-vrrp)
+
+When `no-reth-vrrp` or `private-rg-election` is configured, the daemon owns
+VIP add/remove and the post-failover GARP directly (there are no VRRP
+instances). `directSendGARPs` (`daemon_ha_vip.go`) sends a broadcast GARP
+burst per VIP plus a supplementary **directed** ARP probe to the subnet
+gateway so a router that ignores broadcast gratuitous ARP still re-binds the
+VIP to the new master's MAC. The probe target is derived by the single source
+of truth `vrrp.GatewayProbeTarget(ipNet)` — the subnet's first usable host
+(network address + 1), respecting the actual prefix length, returning
+`ok=false` (skip the directed probe) on /31 (RFC 3021) and /32 where no
+in-subnet gateway host exists. Before #3922 this site forced the last octet
+to `.1`, which lands OUTSIDE the subnet on /25+ or a non-.0 network (e.g. VIP
+`10.0.61.18/28` → `10.0.61.1`, outside `.16-.31`) → the directed probe hit a
+foreign address and the real gateway's ARP cache was never updated → post-
+failover blackhole until the stale entry aged out. #2377 fixed the identical
+forced-.1 in `vrrp.sendGARP` but missed this direct-mode site; #3922 routes
+both through the shared `vrrp.GatewayProbeTarget` helper.
+
 ## Interface management
 
 `enumerateAndRenameInterfaces()` runs at startup (in `linksetup.go`),
