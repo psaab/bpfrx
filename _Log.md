@@ -32168,3 +32168,35 @@ top.
     userspace-dp/src/afxdp/tx/cos_classify.rs,
     userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
     userspace-dp/src/filter/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4098 — IPsec traffic-selector local_ts/remote_ts swanctl
+    injection (config-injection → root RCE via `updown`). VERIFY-FIRST at HEAD
+    confirmed policy.go rendered child.LocalTS/RemoteTS with a bare `%s`
+    (unlike the sibling child.Name, which uses `sanitizeSwanctlValue`), sourced
+    from `traffic-selector local-ip/remote-ip` (+ `local-identity`/
+    `remote-identity` fallback) via `effectiveTrafficSelectors`. lexer.go
+    materializes `\n` in a quoted value. FINDING: the general free-text
+    control-char gate (`validateNodesControlChars`, freetext.go) ALREADY
+    rejects an embedded newline in ANY value at strict commit and sanitizes it
+    on the lenient path — so the pure-newline RCE-via-commit was not reachable
+    at HEAD; the issue's "NO commit validation" premise held only for
+    `compiler_validate*strict*.go`, missing the freetext gate. Still fixed the
+    two genuine residual gaps: (a) render-side belt — run local_ts/remote_ts
+    through `sanitizeSwanctlValue` (parity with child.Name), the defense for
+    any path that reaches render with an unsanitized typed config (direct
+    IPsecConfig construction / peer-sync); (b) new AST commit gate
+    `validateIPsecTrafficSelectorsStrict` — rejects a local-ip/remote-ip value
+    carrying a control char OR whitespace, or that is not a CIDR/host/range
+    (whitespace + shape are what the general gate misses). Strict on commit,
+    lenient-downgraded (warn) on load/sync per #1960; walks every value token
+    (both parser shapes + bracketed list #2419). RED-on-revert verified for
+    BOTH: reverting the render belt fails the direct-construction render test
+    (injected `updown =` line reaches the children block); neutralizing the
+    validator fails the whitespace + non-CIDR strict tests. go test
+    ./pkg/ipsec/... ./pkg/config/... green; go build ./... , go vet, gofmt
+    clean.
+  - **File(s)**: pkg/ipsec/policy.go,
+    pkg/config/compiler_ipsec_trafficselector.go, pkg/config/compiler.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
