@@ -31405,3 +31405,27 @@ top.
     test/incus/test-active-active.sh, test/incus/test-restart-connectivity.sh,
     test/incus/test-private-rg.sh, Makefile, docs/engineering-style.md,
     CLAUDE.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4038 — dual-fabric refresh: give fab1 its own refresh
+    channel. Dual-fabric (fabric-link + fabric-link-1) IS supported
+    (`populateFabricFwd1` launched from `startClusterComms` when
+    `cc.Fabric1Interface`/`Fabric1PeerAddress` are set). The fab0 loop
+    (`populateFabricFwd`) and fab1 loop (`populateFabricFwd1`) both
+    selected on ONE shared `fabricRefreshCh` (cap 1). `monitorFabricState`
+    does not tag events per fabric, so `triggerFabricRefresh()`'s single
+    non-blocking send was received by exactly ONE waiting goroutine —
+    fab0 OR fab1, whichever won the race — and the other fabric's
+    link/neighbor event was dropped until its 30s safety-net tick,
+    degrading the second fabric's sub-second convergence. Fix: add
+    `fabricRefreshCh1`; fab1 reads it; `triggerFabricRefresh()` signals
+    BOTH channels (non-blocking; a nil fab1 channel in single-fabric mode
+    falls through `default`). Mirrors the synchronous `RefreshFabricFwd()`,
+    which already refreshes both entries. RED-on-revert: dropping the fab1
+    send makes `TestTriggerFabricRefreshWakesBothFabrics` fail on the fab1
+    assertion. Validated: gofmt/vet clean, `go build ./...`, and
+    `go test -race ./pkg/daemon/... ./pkg/cluster/...` all green.
+    test-failover WARRANTED (HA fabric) — batch-validate.
+  - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_fabric.go,
+    pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_fabric_test.go,
+    docs/fabric-cross-chassis-fwd.md, _Log.md

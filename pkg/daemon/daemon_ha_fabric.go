@@ -220,7 +220,8 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerA
 	}
 
 	// Periodic refresh every 30s as safety net, plus event-driven
-	// refresh via fabricRefreshCh from netlink monitor (#124).
+	// refresh via fabricRefreshCh from the netlink monitor (#124). fab0
+	// reads its own channel; fab1 reads fabricRefreshCh1 (#4038).
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -613,7 +614,11 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peer
 	}
 
 	// Periodic refresh every 30s as safety net, plus event-driven
-	// refresh via fabricRefreshCh from netlink monitor (#124).
+	// refresh via fabricRefreshCh1 from netlink monitor (#124). fab1 has
+	// its OWN channel (#4038): a single shared channel is drained by
+	// exactly one waiting goroutine per send, so with both fab0 and fab1
+	// selecting on one channel a trigger woke only one of them and the
+	// other fabric's event was dropped until the 30s safety-net tick.
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -622,7 +627,7 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peer
 			return
 		case <-ticker.C:
 			d.refreshFabricFwd1(ctx, fabIface, overlay, peerIP, false)
-		case <-d.fabricRefreshCh:
+		case <-d.fabricRefreshCh1:
 			d.refreshFabricFwd1(ctx, fabIface, overlay, peerIP, false)
 		}
 	}
@@ -933,12 +938,28 @@ func (d *Daemon) runFabricStateSubscription(ctx context.Context) bool {
 	}
 }
 
-// triggerFabricRefresh sends a non-blocking signal to the fabric refresh
-// channel, waking populateFabricFwd/populateFabricFwd1 loops.
+// triggerFabricRefresh sends a non-blocking signal to BOTH fabric refresh
+// channels, waking the populateFabricFwd (fab0) and populateFabricFwd1
+// (fab1) loops. The netlink monitor and readiness gate do not tag events
+// per-fabric, so any fabric event re-resolves both entries — matching the
+// synchronous RefreshFabricFwd, which also refreshes fab0 and fab1.
+//
+// Each fabric owns its own channel (#4038). A single shared channel is
+// received by exactly one waiting goroutine per send, so a lone trigger
+// woke only fab0 or fab1 (whichever won the race) and the other fabric's
+// event was lost until the 30s safety-net tick. Signaling both channels
+// guarantees every configured fabric acts on the event immediately.
 func (d *Daemon) triggerFabricRefresh() {
 	select {
 	case d.fabricRefreshCh <- struct{}{}:
 	default:
-		// Already pending — no need to queue another.
+		// fab0 already has a refresh pending — no need to queue another.
+	}
+	select {
+	case d.fabricRefreshCh1 <- struct{}{}:
+	default:
+		// fab1 already has a refresh pending (or fab1 is not configured
+		// and its channel is nil — a nil-channel send never fires, so
+		// the default arm handles that too). No need to queue another.
 	}
 }
