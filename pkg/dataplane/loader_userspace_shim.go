@@ -16,6 +16,7 @@ package dataplane
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"unsafe"
@@ -30,6 +31,12 @@ const (
 	userspaceBindingsMapName           = "userspace_bindings"
 	userspaceIngressIfacesMapName      = "userspace_ingress_ifaces"
 	userspaceShimCompatibilityDNATName = "dnat_table"
+	// userspaceFallbackStatsMapName is the internal mixed-version compatibility
+	// name for the degraded-path counter map (operator surface:
+	// degraded_path_counters). #4113 changed its BPF type from Array to
+	// PerCpuArray; it is a collection-pinned map, so a stale incompatible pin
+	// must be reconciled on upgrade (see reconcileDisposableCollectionPin).
+	userspaceFallbackStatsMapName = "userspace_fallback_stats"
 )
 
 // pinnedMaps lists maps that survive daemon restarts via BPF
@@ -89,6 +96,20 @@ func (m *Manager) loadUserspaceShimObjectsOnce() (err error) {
 	for _, name := range userspacePinnedShimMaps() {
 		if ms, ok := userspaceSpec.Maps[name]; ok {
 			ms.Pinning = ebpf.PinByName
+		}
+	}
+
+	// #4113 upgrade migration: userspace_fallback_stats changed from Array to
+	// PerCpuArray. It is pinned by the collection load below (PinByName), whose
+	// compatibility check rejects a stale Array pin from a previous daemon with
+	// ErrMapIncompatible — aborting the whole shim load and bricking a rolling
+	// upgrade (#1917/#1960 class). Drop the incompatible pin first so the load
+	// recreates it fresh. Safe because it is a DISPOSABLE degraded-path counter
+	// (resets on every reload); DATA maps are never reset here.
+	if spec, ok := userspaceSpec.Maps[userspaceFallbackStatsMapName]; ok {
+		pinPath := filepath.Join(bpfPinPath, userspaceFallbackStatsMapName)
+		if err := reconcileDisposableCollectionPin(pinPath, spec); err != nil {
+			return err
 		}
 	}
 
@@ -359,6 +380,74 @@ func perCPUArrayMapSpec(name string, valueSize, maxEntries uint32) *ebpf.MapSpec
 func sizeOf[T any]() uint32 {
 	var zero T
 	return uint32(unsafe.Sizeof(zero))
+}
+
+// reconcileDisposableCollectionPin removes a stale pinned map whose on-disk
+// shape no longer matches the spec the collection is about to load with
+// PinByName, so NewCollectionWithOptions recreates it fresh instead of failing
+// with ErrMapIncompatible and bricking the shim load on a daemon upgrade.
+//
+// This is SAFE ONLY for DISPOSABLE maps — counters that reset to zero on every
+// reload anyway (userspace_fallback_stats / degraded_path_counters). DATA maps
+// (sessions, conntrack, dnat) must NEVER be silently reset; those go through
+// loadOrCreatePinnedShimMapWith, which deliberately REFUSES to reset an
+// incompatible pin (#2360). #4113 changed this counter's BPF type from Array to
+// PerCpuArray; without this reconcile, the stale Array pin from a previous
+// daemon is incompatible with the new PerCpuArray spec, PinByName's
+// compatibility check fails, and the whole collection load aborts (#1917/#1960
+// upgrade-brick class).
+//
+// A missing pin (fresh boot) or a shape-compatible pin (already migrated) is
+// left untouched, so accumulated counters survive an ordinary restart.
+func reconcileDisposableCollectionPin(pinPath string, spec *ebpf.MapSpec) error {
+	if spec == nil {
+		return nil
+	}
+	if _, err := os.Stat(pinPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil // fresh boot: nothing pinned yet
+		}
+		return fmt.Errorf("stat disposable pin %s: %w", pinPath, err)
+	}
+	existing, err := ebpf.LoadPinnedMap(pinPath, nil)
+	if err != nil {
+		return fmt.Errorf("inspect disposable pin %s: %w", pinPath, err)
+	}
+	defer existing.Close()
+	if disposablePinShapeMatches(existing.Type(), existing.KeySize(),
+		existing.ValueSize(), existing.MaxEntries(), spec) {
+		return nil
+	}
+	slog.Info("resetting incompatible disposable shim map pin on upgrade",
+		"path", pinPath,
+		"pinned_type", existing.Type().String(),
+		"pinned_value_size", existing.ValueSize(),
+		"pinned_max_entries", existing.MaxEntries(),
+		"want_type", spec.Type.String(),
+		"want_value_size", spec.ValueSize,
+		"want_max_entries", spec.MaxEntries)
+	if err := existing.Unpin(); err != nil {
+		return fmt.Errorf("unpin incompatible disposable pin %s: %w", pinPath, err)
+	}
+	return nil
+}
+
+// disposablePinShapeMatches reports whether an on-disk pinned map's shape
+// matches the spec closely enough that the PinByName collection load will
+// accept it. It compares the discriminating fields for the #4113 migration
+// (type is the changed field; key/value/entries are compared so a future shape
+// change also triggers a reset). Flags are intentionally excluded: this counter
+// is created with flags 0 on both sides, and a disposable map errs toward
+// resetting rather than bricking.
+func disposablePinShapeMatches(
+	pinnedType ebpf.MapType,
+	pinnedKeySize, pinnedValueSize, pinnedMaxEntries uint32,
+	spec *ebpf.MapSpec,
+) bool {
+	return pinnedType == spec.Type &&
+		pinnedKeySize == spec.KeySize &&
+		pinnedValueSize == spec.ValueSize &&
+		pinnedMaxEntries == spec.MaxEntries
 }
 
 func ensureUserspaceMapPinned(name string, m *ebpf.Map, path string) error {

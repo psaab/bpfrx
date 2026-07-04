@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
 )
 
@@ -159,6 +161,177 @@ func TestLoadOrCreatePinnedShimMapRefusesIncompatiblePinnedMap(t *testing.T) {
 	}
 	if got, err := os.ReadFile(pin); err != nil || string(got) != "existing state" {
 		t.Fatalf("pinned map marker = %q, %v; want preserved state", got, err)
+	}
+}
+
+func TestDisposablePinShapeMatches(t *testing.T) {
+	t.Parallel()
+
+	// The #4113 target spec: userspace_fallback_stats is a PerCpuArray<u64>
+	// with 16 reason slots keyed by u32.
+	want := &ebpf.MapSpec{Type: ebpf.PerCPUArray, KeySize: 4, ValueSize: 8, MaxEntries: 16}
+	tests := []struct {
+		name       string
+		pinType    ebpf.MapType
+		keySize    uint32
+		valueSize  uint32
+		maxEntries uint32
+		match      bool
+	}{
+		{"stale-array-from-old-daemon", ebpf.Array, 4, 8, 16, false},
+		{"already-migrated-percpu", ebpf.PerCPUArray, 4, 8, 16, true},
+		{"value-size-drift", ebpf.PerCPUArray, 4, 16, 16, false},
+		{"max-entries-drift", ebpf.PerCPUArray, 4, 8, 32, false},
+		{"key-size-drift", ebpf.PerCPUArray, 8, 8, 16, false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := disposablePinShapeMatches(tt.pinType, tt.keySize, tt.valueSize, tt.maxEntries, want)
+			if got != tt.match {
+				t.Fatalf("disposablePinShapeMatches(%v, k=%d v=%d n=%d) = %v, want %v",
+					tt.pinType, tt.keySize, tt.valueSize, tt.maxEntries, got, tt.match)
+			}
+		})
+	}
+}
+
+// TestReconcileDisposableCollectionPinMigratesArrayToPerCPUArray reproduces the
+// #4113 upgrade-brick: an old daemon left an Array pin for
+// userspace_fallback_stats; the new daemon's PerCpuArray spec is incompatible,
+// so the PinByName load fails with ErrMapIncompatible. The reconcile must drop
+// the stale pin so the load recreates it fresh. Requires root + bpffs.
+func TestReconcileDisposableCollectionPinMigratesArrayToPerCPUArray(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock (needs root): %v", err)
+	}
+
+	// Pins must live on a bpffs mount; t.TempDir() is tmpfs and cannot hold BPF
+	// pins. Use a unique subdir under the real bpffs.
+	dir := filepath.Join("/sys/fs/bpf", fmt.Sprintf("xpf-test-4113-%d", os.Getpid()))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Skipf("create bpffs test dir %s (needs root+bpffs): %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	pinPath := filepath.Join(dir, userspaceFallbackStatsMapName)
+
+	// Old daemon: a shared Array<u64> pinned counter map.
+	oldArray, err := ebpf.NewMap(&ebpf.MapSpec{
+		Name:       userspaceFallbackStatsMapName,
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  8,
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Skipf("create Array map (needs root): %v", err)
+	}
+	if err := oldArray.Pin(pinPath); err != nil {
+		oldArray.Close()
+		t.Skipf("pin Array map at %s: %v", pinPath, err)
+	}
+	oldArray.Close() // fd closed; pin persists, as across a daemon restart
+
+	// New daemon spec: PerCpuArray, pinned by name (mirrors the collection load).
+	newSpec := &ebpf.MapSpec{
+		Name:       userspaceFallbackStatsMapName,
+		Type:       ebpf.PerCPUArray,
+		KeySize:    4,
+		ValueSize:  8,
+		MaxEntries: 16,
+		Pinning:    ebpf.PinByName,
+	}
+
+	// Without the reconcile, PinByName load against the stale Array pin bricks.
+	bricked, err := ebpf.NewMapWithOptions(newSpec, ebpf.MapOptions{PinPath: dir})
+	if err == nil {
+		bricked.Close()
+		t.Fatal("PinByName load succeeded against stale Array pin; expected ErrMapIncompatible (brick)")
+	}
+	if !errors.Is(err, ebpf.ErrMapIncompatible) {
+		t.Fatalf("PinByName load err = %v, want ErrMapIncompatible", err)
+	}
+
+	// The reconcile drops the incompatible disposable pin.
+	if err := reconcileDisposableCollectionPin(pinPath, newSpec); err != nil {
+		t.Fatalf("reconcileDisposableCollectionPin: %v", err)
+	}
+	if _, statErr := os.Stat(pinPath); !os.IsNotExist(statErr) {
+		t.Fatalf("stale pin still present after reconcile: statErr=%v", statErr)
+	}
+
+	// Now the PinByName load succeeds and produces a PerCpuArray.
+	migrated, err := ebpf.NewMapWithOptions(newSpec, ebpf.MapOptions{PinPath: dir})
+	if err != nil {
+		t.Fatalf("PinByName load after reconcile: %v", err)
+	}
+	defer func() {
+		_ = migrated.Unpin()
+		_ = migrated.Close()
+	}()
+	if migrated.Type() != ebpf.PerCPUArray {
+		t.Fatalf("migrated map type = %v, want PerCPUArray", migrated.Type())
+	}
+
+	// Idempotent: a second reconcile against the now-compatible pin is a no-op
+	// (accumulated counters survive an ordinary restart).
+	if err := reconcileDisposableCollectionPin(pinPath, newSpec); err != nil {
+		t.Fatalf("reconcile on compatible pin: %v", err)
+	}
+	if _, statErr := os.Stat(pinPath); statErr != nil {
+		t.Fatalf("compatible pin was removed by reconcile: %v", statErr)
+	}
+}
+
+// TestReconcileDisposableCollectionPinNoOpOnRealEmbeddedSpec guards against a
+// silent regression where the reconcile resets the counter on EVERY restart
+// (losing accumulated counts) because the embedded PerCpuArray spec's reported
+// shape does not match what a freshly created+pinned map of that spec reads
+// back. It uses the REAL embedded userspace_fallback_stats spec, not a
+// hand-built one. Requires root + bpffs.
+func TestReconcileDisposableCollectionPinNoOpOnRealEmbeddedSpec(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock (needs root): %v", err)
+	}
+	collSpec, err := loadRustUserspaceXDP()
+	if err != nil {
+		t.Fatalf("load Rust userspace XDP spec: %v", err)
+	}
+	spec := collSpec.Maps[userspaceFallbackStatsMapName]
+	if spec == nil {
+		t.Fatalf("embedded spec missing %s", userspaceFallbackStatsMapName)
+	}
+	if spec.Type != ebpf.PerCPUArray {
+		t.Fatalf("embedded %s type = %v, want PerCPUArray (F13)", userspaceFallbackStatsMapName, spec.Type)
+	}
+
+	dir := filepath.Join("/sys/fs/bpf", fmt.Sprintf("xpf-test-4113r-%d", os.Getpid()))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Skipf("create bpffs test dir %s (needs root+bpffs): %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	pinPath := filepath.Join(dir, userspaceFallbackStatsMapName)
+
+	pinSpec := spec.Copy()
+	pinSpec.Pinning = ebpf.PinByName
+	m, err := ebpf.NewMapWithOptions(pinSpec, ebpf.MapOptions{PinPath: dir})
+	if err != nil {
+		t.Skipf("create+pin embedded spec (needs root): %v", err)
+	}
+	defer func() {
+		_ = m.Unpin()
+		_ = m.Close()
+	}()
+
+	// The reconcile must treat a pin created from the real embedded spec as
+	// compatible (no reset), so counters survive an ordinary restart.
+	if err := reconcileDisposableCollectionPin(pinPath, spec); err != nil {
+		t.Fatalf("reconcile on real-spec pin: %v", err)
+	}
+	if _, statErr := os.Stat(pinPath); statErr != nil {
+		t.Fatalf("reconcile removed a compatible real-spec pin: %v", statErr)
 	}
 }
 
