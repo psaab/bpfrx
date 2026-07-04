@@ -763,6 +763,31 @@ pub(super) fn poll_binding_process_descriptor(
                 let mut pre_routing_dnat_counter: Option<
                     std::sync::Arc<crate::nat::NatRuleCounter>,
                 > = None;
+                // #3918: snapshot the neighbor-MAC-change epoch BEFORE the
+                // neighbor MAC that backs this packet's forwarding decision is
+                // resolved. `resolve_flow_session_decision` (session-hit
+                // resolve) and the session-miss `finalize_new_flow_ha_
+                // resolution` below both consult `dynamic_neighbors`; the
+                // flow-cache entry built further down is stamped with THIS
+                // pre-resolve value (passed into `from_forward_decision`).
+                // Reading the epoch here — not after the resolve at stamp
+                // time — closes a TOCTOU that re-opened the #3048 stale-MAC
+                // blackhole: a kernel ARP/NDP update (a VRRP gateway failover
+                // changing the gateway MAC) landing between the resolve and the
+                // stamp would, on a post-resolve read, stamp the NEW epoch onto
+                // the cached OLD dst_mac — a fresh-looking stale entry that
+                // survives every fast-path hit until it ages out (blackhole).
+                // Reading first guarantees the stamped epoch <= the epoch
+                // observed at resolve time, so a subsequent MAC-change bump
+                // makes the entry stale on its next hit -> evicted -> re-
+                // resolved to the new MAC. Mirrors the #2170/#3912 record-
+                // before-use discipline. A Relaxed load suffices: this
+                // snapshot and the stamp run on this one worker thread (program
+                // order sequences the snapshot before the resolve), and the
+                // neighbor shard Mutex — not this counter — synchronizes the
+                // MAC bytes; the epoch is a monotonic invalidation signal that
+                // only needs eventual cross-thread visibility.
+                let neighbor_mac_epoch_at_resolve = worker_ctx.dynamic_neighbors.mac_change_epoch();
                 let mut decision = if let Some(flow) = flow.as_ref() {
                     if let Some(resolved) = resolve_flow_session_decision(
                         sessions,
@@ -3836,15 +3861,21 @@ pub(super) fn poll_binding_process_descriptor(
                                 worker_ctx.ha_state,
                                 apply_nat_on_fabric,
                                 &worker_ctx.rg_epochs,
+                                // #3048/#3918: stamp the neighbor-MAC-change
+                                // epoch SNAPSHOTTED BEFORE the resolve above
+                                // (`neighbor_mac_epoch_at_resolve`), not a
+                                // fresh post-resolve read. A later kernel
+                                // ARP/NDP MAC change for this descriptor's
+                                // next-hop advances the live epoch past this
+                                // stamp, evicting the cached stale dst_mac on
+                                // its next fast-path hit
+                                // (`neighbor_mac_epoch_stale`) — and a MAC
+                                // change racing the resolve is caught too,
+                                // because the pre-resolve snapshot cannot
+                                // already reflect it (closes the TOCTOU).
+                                neighbor_mac_epoch_at_resolve,
                             )
                         {
-                            // #3048: stamp the live neighbor-MAC-change
-                            // epoch so a later kernel ARP/NDP MAC change
-                            // for this descriptor's next-hop evicts the
-                            // cached stale dst_mac on the next fast-path
-                            // hit (see neighbor_mac_epoch_stale).
-                            entry.neighbor_mac_epoch =
-                                worker_ctx.dynamic_neighbors.mac_change_epoch();
                             // #3073: stamp the admitting rule's hit-counter handle
                             // onto the cached entry (the seed constructor leaves
                             // it 0). The flow-cache hit path

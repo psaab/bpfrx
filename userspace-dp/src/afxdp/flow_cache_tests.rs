@@ -626,6 +626,8 @@ fn from_forward_decision_round_trip() {
         )]),
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
     let entry = entry.expect("should produce a cache entry for ForwardCandidate");
 
@@ -820,6 +822,8 @@ fn from_forward_decision_skips_cache_for_dscp_matched_output_filter() {
         &ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
 
     assert!(
@@ -873,6 +877,8 @@ fn from_forward_decision_skips_cache_for_dscp_matched_input_filter() {
         &ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
 
     assert!(
@@ -926,6 +932,8 @@ fn from_forward_decision_skips_cache_for_per_packet_l4_input_filter() {
         &ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
 
     assert!(
@@ -975,6 +983,8 @@ fn from_forward_decision_skips_cache_for_per_packet_l4_output_filter() {
         &ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
 
     assert!(
@@ -1071,6 +1081,8 @@ fn dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
         &ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
 
     assert!(
@@ -1135,6 +1147,8 @@ fn dscp_output_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
         &ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
 
     assert!(
@@ -1259,6 +1273,8 @@ fn try_build_entry(
         ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     )
 }
 
@@ -1303,6 +1319,8 @@ fn from_forward_decision_preserves_input_filter_log_for_cached_hits() {
         &ha_state,
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     )
     .expect("cacheable entry");
 
@@ -1488,6 +1506,8 @@ fn from_forward_decision_returns_none_for_non_cacheable() {
         &BTreeMap::new(),
         false,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     );
     assert!(entry.is_none(), "NoRoute should not produce a cache entry");
 }
@@ -1564,6 +1584,8 @@ fn fabric_redirect_cache_entry_uses_flow_owner_rg_for_epoch_invalidation() {
         )]),
         true,
         &rg_epochs,
+        // #3918: pre-resolve neighbor_mac_epoch snapshot (0 = none).
+        0,
     )
     .expect("fabric redirect entry");
 
@@ -2656,5 +2678,158 @@ fn cached_descriptor_evicted_only_on_neighbor_mac_change() {
     assert!(
         entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
         "neighbor MAC change must evict the cached stale dst_mac (#3048)"
+    );
+}
+
+// ── #3918: resolve→stamp TOCTOU (re-opens the #3048 stale-MAC blackhole) ──
+// poll_descriptor resolves the next-hop neighbor MAC, then builds + stamps a
+// flow-cache entry with the neighbor mac_change_epoch. The stamp MUST use the
+// epoch SNAPSHOTTED BEFORE the resolve — not a fresh read at stamp time. If a
+// VRRP gateway failover REPLACES the gateway MAC in the window between the
+// resolve (which read the OLD MAC) and the stamp, a post-resolve read captures
+// the NEW epoch and stamps it onto the cached OLD dst_mac: the entry's epoch
+// then EQUALS the live epoch, so `neighbor_mac_epoch_stale` returns false, the
+// stale dst_mac is served on every fast-path hit, and traffic blackholes to
+// the dead gateway until the entry ages out.
+//
+// The fix threads the pre-resolve snapshot into `from_forward_decision`
+// (`neighbor_mac_epoch` value param) so the constructor cannot re-read the live
+// epoch. This test models the interleaved failover with the real primitives
+// (ShardedNeighborMap.insert_if_changed's genuine mac_change_epoch bump +
+// FlowCacheEntry.neighbor_mac_epoch_stale) and asserts the pre-resolve stamp is
+// correctly treated stale. RED-ON-REVERT: reverting the fix (dropping the param
+// + re-reading mac_change_epoch() at stamp time, i.e. AFTER the failover bump
+// modeled here) makes the stamped epoch equal the live epoch -> not stale ->
+// the blackhole; the explicit post-resolve-read contrast below encodes exactly
+// that failing state.
+#[test]
+fn flow_cache_stamps_pre_resolve_epoch_survives_interleaved_gateway_failover() {
+    use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
+    use crate::afxdp::types::NeighborEntry;
+
+    let neighbors = ShardedNeighborMap::new();
+    let nh = (6i32, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1)));
+    // Gateway resolved with its pre-failover MAC (first insert — no bump).
+    neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
+
+    // poll_descriptor snapshots the epoch BEFORE resolving the neighbor MAC.
+    let epoch_at_resolve = neighbors.mac_change_epoch();
+
+    // ── Interleaved VRRP gateway failover ──
+    // A kernel ARP/NDP update REPLACES the gateway MAC AFTER the resolve read
+    // the old MAC but BEFORE the flow-cache entry is stamped. This advances the
+    // live epoch past the pre-resolve snapshot.
+    neighbors.insert_if_changed(nh, NeighborEntry { mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x99] });
+    assert_ne!(
+        epoch_at_resolve,
+        neighbors.mac_change_epoch(),
+        "the interleaved failover must advance the live epoch past the \
+         pre-resolve snapshot (otherwise the test proves nothing)"
+    );
+
+    // Build + stamp the flow-cache entry exactly as poll_descriptor does after
+    // the resolve: `from_forward_decision` stamps the PRE-RESOLVE snapshot
+    // (`neighbor_mac_epoch` param), NOT a fresh post-resolve read.
+    let (flow, meta, validation, decision, forwarding, ha_state) = make_v4_round_trip_inputs();
+    let rg_epochs = default_rg_epochs();
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(3),
+        Some(7),
+        None,
+        crate::filter::CachedFilterCounters::default(),
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+        epoch_at_resolve, // #3918: pre-resolve snapshot, not a post-resolve read
+    )
+    .expect("v4 round-trip decision is cacheable");
+
+    // On the NEXT fast-path hit the entry's stamped (pre-failover) epoch != the
+    // current live epoch -> treated STALE -> evicted + re-resolved to the new
+    // MAC. This is the fix.
+    assert!(
+        entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        "an entry stamped with the pre-resolve epoch must be stale after an \
+         interleaved gateway-MAC failover so the stale dst_mac is re-resolved (#3918)"
+    );
+
+    // Contrast: the pre-#3918 behavior read the epoch AFTER the resolve (i.e.
+    // after the failover bump modeled above). That post-resolve value EQUALS
+    // the current live epoch, so the stale entry looks FRESH and is never
+    // evicted — the blackhole. Encoding it here makes the revert's failure mode
+    // explicit and guards against a regression that re-reads at stamp time.
+    let post_resolve_read = neighbors.mac_change_epoch();
+    let buggy_entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(3),
+        Some(7),
+        None,
+        crate::filter::CachedFilterCounters::default(),
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+        post_resolve_read,
+    )
+    .expect("v4 round-trip decision is cacheable");
+    assert!(
+        !buggy_entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        "a POST-resolve stamp (the pre-#3918 bug) looks fresh after failover — \
+         this is the stale-MAC blackhole the fix closes (#3918)"
+    );
+}
+
+// #3918 companion: the normal (no-interleave) resolve must still cache and
+// serve. A pre-resolve epoch snapshot taken with no intervening MAC change
+// equals the live epoch on the next hit, so the entry is NOT evicted — the fix
+// must not spuriously flush steady-state flows.
+#[test]
+fn flow_cache_normal_resolve_caches_and_serves_neighbor_mac() {
+    use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
+    use crate::afxdp::types::NeighborEntry;
+
+    let neighbors = ShardedNeighborMap::new();
+    let nh = (6i32, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1)));
+    neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
+
+    // Snapshot pre-resolve; NO failover interleaves.
+    let epoch_at_resolve = neighbors.mac_change_epoch();
+
+    let (flow, meta, validation, decision, forwarding, ha_state) = make_v4_round_trip_inputs();
+    let rg_epochs = default_rg_epochs();
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(3),
+        Some(7),
+        None,
+        crate::filter::CachedFilterCounters::default(),
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+        epoch_at_resolve,
+    )
+    .expect("v4 round-trip decision is cacheable");
+
+    // A same-MAC refresh does not advance the epoch, so the entry stays fresh.
+    neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
+    assert!(
+        !entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        "a normal resolve with no interleaved MAC change must serve the cached \
+         entry, not spuriously evict it (#3918)"
     );
 }
