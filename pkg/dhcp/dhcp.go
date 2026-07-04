@@ -924,7 +924,24 @@ func leaseFromACKv4(ifaceName string, ack *dhcpv4.DHCPv4) (*Lease, error) {
 	if mask == nil {
 		mask = net.CIDRMask(24, 32) // fallback
 	}
-	ones, _ := net.IPMask(mask).Size()
+	ones, bits := net.IPMask(mask).Size()
+
+	// Reject a degenerate subnet mask (untrusted input). net.IPMask.Size()
+	// returns ones=0 for a zero mask (0.0.0.0 → /0) and (0,0) for a
+	// non-contiguous mask (e.g. 255.255.0.255). Either would make the lease
+	// YourIP/0 and cause the kernel to install an on-link 0.0.0.0/0 connected
+	// route on this interface — blackholing/hijacking ALL IPv4 forwarding
+	// until the lease is replaced. A rogue or broken server can force this
+	// with a single crafted ACK, so refuse the lease rather than commit it.
+	// leaseFromACKv4's error propagates through v4Exchange → runDHCPv4, which
+	// retries a fresh DISCOVER (acquire) or falls through to T2/expiry keeping
+	// the existing valid lease (renew/rebind) — no YourIP/0 is ever installed.
+	// RFC 2131 requires option 1 to carry a valid subnet mask.
+	if bits != 32 || ones == 0 {
+		return nil, fmt.Errorf(
+			"DHCP ACK has invalid subnet mask %v on %s — refusing lease (would blackhole IPv4)",
+			net.IP(mask), ifaceName)
+	}
 
 	addr, ok := netip.AddrFromSlice(yourIP.To4())
 	if !ok {
