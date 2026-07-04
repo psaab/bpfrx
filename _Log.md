@@ -33041,3 +33041,26 @@ top.
     pkg/config/compiler_security.go, pkg/config/compiler_validate_strict.go,
     pkg/config/compiler_dup_match_then_3850_test.go, docs/config-schema.md,
     _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3850 fold (PR #4139 hostile-review MINOR) — reset the NAT
+    `then` translation spec per block for true last-wins. The #3850 NAT-then
+    merge iterated every `then {}` block but wrote fields by OVERWRITE, so a
+    duplicate then that switches translation TYPE (`then { source-nat
+    interface; }` then `then { source-nat pool poolB; }`) left BOTH
+    Interface=true AND PoolName=poolB on rule.Then → dataplane field-precedence
+    decided, latent stale field. Not a regression / not security-relevant, but
+    overstated "last-wins". FIX: `rule.Then = NATThen{}` at the top of each
+    then-block in compileNATSource (compiler_nat.go:1697) and
+    compileNATDestination (:1921); static NAT resets only the then-set fields
+    `rule.Then=""`/`IsNPTv6=false`/`MappedPort=0` (:2185-2187) so the match
+    fields set by the match loop persist. Reset runs BETWEEN blocks so
+    within-block `prefix X mapped-port P` coupling survives. compileFilterThen
+    (compiler_firewall.go:662) and pre-id-default-policy then are DELIBERATELY
+    NOT reset — they legitimately accumulate modifiers (count+accept /
+    LogSessionInit+Close). TEST: TestNATSourceDupThenTypeSwitchResetsStaleField
+    _3850 — interface→pool switch compiles pool-only (Interface=false); RED on
+    revert of the reset (verified: stale Interface=true). 14 #3850 tests green;
+    go build ./..., go vet, gofmt clean. Merged origin/master (auto-resolved).
+  - **File(s)**: pkg/config/compiler_nat.go,
+    pkg/config/compiler_dup_match_then_3850_test.go, _Log.md
