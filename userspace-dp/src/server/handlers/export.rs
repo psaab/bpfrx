@@ -8,9 +8,8 @@
 // runs `OwnerRgExportWait::wait_and_collect` (the blocking 15 s ack-wait)
 // lock-free, so a slow worker can no longer freeze the whole control plane.
 
-use super::super::helpers::refresh_status;
 use super::super::ServerState;
-use crate::afxdp::OwnerRgExportWait;
+use crate::afxdp::{AllSessionsExport, OwnerRgExportWait};
 use crate::{ControlResponse, SessionExportRequest};
 
 /// Locked phase: enqueue the owner-RG export to every worker and capture the
@@ -47,14 +46,35 @@ pub(super) fn owner_rg_collect(
     }
 }
 
-pub(super) fn all(guard: &mut ServerState, response: &mut ControlResponse) {
-    match guard.afxdp.export_all_sessions_to_event_stream() {
-        Ok(_count) => {
-            refresh_status(guard);
-        }
+/// Locked phase of `export_all_sessions` (#4054): snapshot the bulk export
+/// under the global `ServerState` lock and return the lock-free push handle.
+/// The (potentially blocking) `push_delta_lossless` loop runs in `all_push`
+/// AFTER the dispatcher drops the lock — mirroring the owner-RG `owner_rg_kick`
+/// split (#2962) — so a large or backpressured bulk export can no longer starve
+/// the status poll / trip the control plane's liveness deadline and self-inflict
+/// a needless helper restart. On error (event stream not started) the error is
+/// folded into `response` and `None` is returned, so the dispatcher runs no
+/// push phase.
+pub(super) fn all_kick(
+    guard: &mut ServerState,
+    response: &mut ControlResponse,
+) -> Option<AllSessionsExport> {
+    match guard.afxdp.snapshot_all_sessions_export() {
+        Ok(export) => Some(export),
         Err(err) => {
             response.ok = false;
             response.error = err;
+            None
         }
+    }
+}
+
+/// Lock-free phase of `export_all_sessions` (#4054): run the lossless push loop
+/// with the global `ServerState` lock RELEASED. Called by the dispatcher after
+/// it drops the lock. Mirrors `owner_rg_collect`.
+pub(super) fn all_push(export: AllSessionsExport, response: &mut ControlResponse) {
+    if let Err(err) = export.push() {
+        response.ok = false;
+        response.error = err;
     }
 }

@@ -1,3 +1,54 @@
+## 2026-07-03 — #4054: export_all_sessions ran push_delta_lossless / frame serialization UNDER the global ServerState lock → a large bulk session export could starve the status poll → false dp-failure → needless helper restart
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-086 (MEDIUM, HA availability). The
+    `export_all_sessions` control verb
+    (`Coordinator::export_all_sessions_to_event_stream`, `pkg` =
+    `userspace-dp/src/afxdp/ha.rs`) is the coordinator-driven bulk export used
+    on peer connect / FullResync. It iterated the shared session table and then
+    pushed each qualifying local forward session through the event stream via
+    `push_delta_lossless`, which retries a full/backpressured event-stream
+    channel up to a **5 s** per-delta lossless-queue timeout. The whole thing —
+    table iteration AND the serialization loop — ran inside the control-socket
+    dispatcher's `ServerState` `match` arm (`server/handlers/mod.rs`), i.e.
+    UNDER the single global lock that serializes every control RPC (status poll,
+    session install, snapshot/FIB bump, HA state update). On a firewall with
+    many sessions a bulk export against a slow peer stream could hold the lock
+    long enough for the status poll to miss the control plane's liveness
+    deadline → a false dataplane-failure → a needless helper restart (drops all
+    sessions + flaps forwarding) — exactly at failover, the worst time. The
+    session-TABLE lock (`sessions.synced`) was already released before the push
+    (a partial pre-existing correctness), but the GLOBAL lock was not. The
+    owner-RG export path was already fixed for exactly this in #2962; the
+    all-sessions path was not.
+  - **Fix**: split the handler off the global lock, mirroring #2962. New
+    `Coordinator::snapshot_all_sessions_export` runs the LOCKED phase (iterate
+    the table under a brief `sessions.synced` lock, copy each qualifying session
+    into an Open `SessionDelta`, capture the Arc-cheap event-stream handle + an
+    OWNED clone of the zone-name→id map) and returns an `AllSessionsExport`.
+    `AllSessionsExport::push` runs the `push_delta_lossless` loop with the
+    global lock RELEASED. Dispatcher: `export_all_sessions` now only calls
+    `all_kick` (snapshot) under the lock, captures `all_export`, drops the lock,
+    then runs `all_push` — with the deferred status attach re-derived under a
+    fresh short-lived lock (byte-identical to the #2962 `export_wait` pattern).
+    Correctness: the exported set is the same consistent point-in-time snapshot
+    (deltas built under `sessions.synced`, zone map cloned in the same locked
+    phase); event-stream ordering stays governed by `producer_seq_lock` inside
+    `push_delta_lossless`, not the `ServerState` lock, so the lossless seq
+    contract (#2874 / #3878) is untouched — only the GLOBAL lock scope shrinks.
+  - **Validation**: RED-on-revert proven — a dispatcher test
+    (`export_all_sessions_does_not_hold_state_lock_during_push`) installs a
+    connected single-slot event stream + 4 qualifying local forward sessions so
+    the bulk-export push blocks against the full channel, then asserts a
+    concurrent `status` poll is served in < 1 s. With the push moved back under
+    the lock (revert sim) the status poll blocked **4.85 s** (the 5 s lossless
+    timeout) → RED; with the fix it returns promptly. FULL cargo test --release
+    green; `go build ./...` green; rustfmt clean on changed lines. test-failover
+    WARRANTED (HA session export) — flagged for batch validation.
+  - **File(s)**: userspace-dp/src/afxdp/ha.rs,
+    userspace-dp/src/afxdp/mod.rs, userspace-dp/src/server/handlers/export.rs,
+    userspace-dp/src/server/handlers/mod.rs, userspace-dp/src/server/tests.rs,
+    docs/session-sync-architecture.md, _Log.md
 ## 2026-07-03 — #4051: raw-AST config render paths (REST show/export/search/rollback + gRPC ShowConfig) emitted cleartext secrets (IKE PSK, auth-keys, SNMP community, WG/DDNS keys) — #2053 only redacted the typed-struct /config JSON path
 
 - **Timestamp**: 2026-07-03
@@ -31716,3 +31767,28 @@ top.
     pkg/config/ast_redact_test.go,
     pkg/configstore/redaction_placeholder_4060_test.go,
     docs/junos-config-display-reference.md, _Log.md
+  - **Action**: #4061 VRRP RFC 5798 §6.1/§6.4.2 — a BACKUP now adopts the
+    MASTER's advertised interval (Master_Adver_Interval) when computing
+    Master_Down_Interval, instead of its own configured AdvertiseInterval.
+    `VRRPPacket.MaxAdvertInt` was parsed (packet.go) but never consumed:
+    `masterDownInterval()` used `vi.advertInterval()` (local cfg), so a
+    master/backup interval mismatch (a rolling `reth-advertise-interval`
+    change or a misconfig) timed the master out on the wrong cadence — a
+    shorter local interval failed over prematurely (flapping), a longer one
+    detected master-down too late (traffic loss). Fix: new sticky field
+    `masterAdverInterval` set in `recordMasterAdvert` from the received
+    advert's Max Adver Int (centiseconds on the wire → ×10 ms Duration,
+    zero-field guarded); `masterDownInterval()` and the #2082/#2850
+    staleness-horizon replicas (`shouldPreemptObservedMaster`,
+    `preemptingLiveLowerMaster`) now use the learned interval via a shared
+    `effectiveAdvertInterval` helper, falling back to the local interval
+    before any advert is heard. Skew_Time still uses the local priority
+    (§6.1). Matching-interval case (RETH 30 ms both sides) is bit-identical
+    → ~60 ms failover preserved. RED-on-revert: reverting
+    `masterDownInterval` to the local-only computation makes
+    `TestMasterAdverInterval_LearnedFromAdvert` fail (108 ms from local
+    30 ms vs 3.609 s from the master's advertised 1000 ms). Validated:
+    `go test -race ./pkg/vrrp/`, `go build ./...`, gofmt + vet clean.
+    test-failover WARRANTED (VRRP failover timing) — batch-validate.
+  - **File(s)**: pkg/vrrp/instance.go,
+    pkg/vrrp/instance_master_interval_test.go, pkg/vrrp/README.md, _Log.md

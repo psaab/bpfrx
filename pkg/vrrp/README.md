@@ -104,6 +104,21 @@ This is the package that drives chassis-cluster failover.
 ## Failover timing (CLAUDE.md authoritative)
 
 - ~60 ms with 30 ms RETH advertisements (masterDownInterval ~97 ms).
+- Master_Adver_Interval adoption (#4061, RFC 5798 §6.1/§6.4.2): a BACKUP
+  computes `Master_Down_Interval = 3×Master_Adver_Interval + Skew_Time`
+  from the interval the **current master advertises**, learned from the
+  received advert's Max Adver Int field (centiseconds on the wire, 10 ms
+  units), NOT from its own `cfg.AdvertiseInterval`. `recordMasterAdvert`
+  stores it in `masterAdverInterval` for every non-zero-priority advert;
+  `masterDownInterval()` (and the #2082/#2850 staleness-horizon replicas
+  `shouldPreemptObservedMaster`/`preemptingLiveLowerMaster`) use it, with
+  the local interval as the pre-first-advert fallback. Skew_Time still uses
+  the **local** priority (§6.1). When master and backup are configured with
+  the SAME interval (the common case — RETH 30 ms both sides) the learned
+  value equals the local one, so the ~60 ms failover is unchanged; a
+  mismatch (a rolling `reth-advertise-interval` change, or a misconfig) no
+  longer times the master out on the wrong cadence (a shorter local interval
+  → premature failover/flapping; a longer one → delayed detection/loss).
 - Planned shutdown: 3× priority-0 advert burst → peer takeover ~1 ms.
 - Heartbeat 200 ms, threshold 5 (1 s detection).
 - Async GARP: first pair <1 ms; remaining sent at 50 ms intervals in a

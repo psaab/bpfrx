@@ -88,6 +88,21 @@ type vrrpInstance struct {
 	lastMasterPriority int       // last non-zero peer advert priority
 	lastMasterSeen     time.Time // when lastMasterPriority was recorded
 
+	// masterAdverInterval is the advertisement interval LEARNED from the
+	// current master's advertisement — RFC 5798 §6.1/§6.4.2 Master_Adver_Interval
+	// — derived from the received advert's Max Adver Int field (centiseconds on
+	// the wire, 10 ms units, converted to a Duration). A BACKUP must compute its
+	// Master_Down_Interval + Skew_Time from the MASTER's advertised cadence, NOT
+	// its own locally-configured cfg.AdvertiseInterval: when the master and
+	// backup are configured with different intervals (a rolling change or a
+	// misconfig), timing the master out on the local interval fails over too
+	// early (shorter local interval → flapping) or too late (longer → traffic
+	// loss). Recorded by recordMasterAdvert for every non-zero-priority advert,
+	// alongside lastMasterPriority/lastMasterSeen. 0 = none learned yet
+	// (cold-start / pre-first-advert), in which case the local interval is the
+	// fallback. Guarded by mu.
+	masterAdverInterval time.Duration
+
 	state   VRRPState
 	iface   *net.Interface
 	eventCh chan<- VRRPEvent
@@ -529,6 +544,7 @@ func (vi *vrrpInstance) shouldPreemptObservedMaster() bool {
 	trackIface := vi.cfg.TrackInterface
 	trackCost := vi.cfg.TrackPriorityCost
 	advertMS := vi.cfg.AdvertiseInterval
+	masterAdver := vi.masterAdverInterval
 	lastMasterPriority := vi.lastMasterPriority
 	lastMasterSeen := vi.lastMasterSeen
 	vi.mu.RUnlock()
@@ -552,11 +568,11 @@ func (vi *vrrpInstance) shouldPreemptObservedMaster() bool {
 	}
 
 	// masterDownInterval staleness horizon — replicates masterDownInterval()
-	// (3*advert + skew) from the snapshot using the effective priority.
-	advert := time.Duration(advertMS) * time.Millisecond
-	if advertMS <= 0 {
-		advert = 1000 * time.Millisecond
-	}
+	// (3*advert + skew) from the snapshot using the effective priority AND the
+	// master's LEARNED advertised interval (RFC 5798 §6.1/§6.4.2), so the
+	// "is the observed master still live" horizon matches the master's cadence,
+	// not the local config, exactly as masterDownInterval() now does.
+	advert := effectiveAdvertInterval(advertMS, masterAdver)
 	skew := time.Duration(256-effective) * advert / 256
 	masterDown := 3*advert + skew
 
@@ -593,11 +609,38 @@ func (vi *vrrpInstance) advertInterval() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+// effectiveAdvertInterval picks the advertisement interval that drives the
+// Master_Down_Interval / Skew_Time computation. Per RFC 5798 §6.1/§6.4.2 a
+// BACKUP times the master out on the interval the MASTER advertises
+// (Master_Adver_Interval, learned from the received advert's Max Adver Int),
+// falling back to the locally-configured interval only before any advert has
+// been heard (cold-start). localMS is cfg.AdvertiseInterval in milliseconds;
+// learned is the last value recorded by recordMasterAdvert (0 = none yet).
+func effectiveAdvertInterval(localMS int, learned time.Duration) time.Duration {
+	if learned > 0 {
+		return learned
+	}
+	if localMS <= 0 {
+		return 1000 * time.Millisecond
+	}
+	return time.Duration(localMS) * time.Millisecond
+}
+
 // masterDownInterval returns the master-down timer value.
-// Per RFC 5798: Master_Down_Interval = (3 * Advertisement_Interval) + Skew_Time
-// Skew_Time = ((256 - priority) * Master_Advert_Interval) / 256
+// Per RFC 5798: Master_Down_Interval = (3 * Master_Adver_Interval) + Skew_Time
+// Skew_Time = ((256 - priority) * Master_Adver_Interval) / 256
+//
+// Master_Adver_Interval is the interval ADVERTISED BY THE CURRENT MASTER
+// (learned from the received advert's Max Adver Int, §6.4.2), NOT this node's
+// own configured AdvertiseInterval. Before any advert has been heard
+// (masterAdverInterval == 0) the local interval is the fallback. The local
+// priority is used for Skew_Time (RFC 5798 §6.1).
 func (vi *vrrpInstance) masterDownInterval() time.Duration {
-	advert := vi.advertInterval()
+	vi.mu.RLock()
+	localMS := vi.cfg.AdvertiseInterval
+	learned := vi.masterAdverInterval
+	vi.mu.RUnlock()
+	advert := effectiveAdvertInterval(localMS, learned)
 	skew := time.Duration(256-vi.getPriority()) * advert / 256
 	return 3*advert + skew
 }
@@ -636,6 +679,7 @@ func (vi *vrrpInstance) preemptingLiveLowerMaster() bool {
 	trackIface := vi.cfg.TrackInterface
 	trackCost := vi.cfg.TrackPriorityCost
 	advertMS := vi.cfg.AdvertiseInterval
+	masterAdver := vi.masterAdverInterval
 	lastMasterPriority := vi.lastMasterPriority
 	lastMasterSeen := vi.lastMasterSeen
 	vi.mu.RUnlock()
@@ -650,10 +694,10 @@ func (vi *vrrpInstance) preemptingLiveLowerMaster() bool {
 		}
 	}
 
-	advert := time.Duration(advertMS) * time.Millisecond
-	if advertMS <= 0 {
-		advert = 1000 * time.Millisecond
-	}
+	// Master-down staleness horizon from the master's LEARNED interval (RFC
+	// 5798 §6.1/§6.4.2), matching masterDownInterval(); falls back to the local
+	// interval before any advert is heard.
+	advert := effectiveAdvertInterval(advertMS, masterAdver)
 	skew := time.Duration(256-effective) * advert / 256
 	masterDown := 3*advert + skew
 
@@ -1424,6 +1468,14 @@ func (vi *vrrpInstance) recordMasterAdvert(pkt *VRRPPacket) {
 	vi.mu.Lock()
 	vi.lastMasterPriority = int(pkt.Priority)
 	vi.lastMasterSeen = time.Now()
+	// Adopt the master's advertised interval (RFC 5798 §6.1/§6.4.2
+	// Master_Adver_Interval). Max Adver Int is centiseconds on the wire (10 ms
+	// units); convert to a Duration. A zero/absent field is ignored so
+	// masterDownInterval falls back to the local interval rather than computing
+	// a zero (flapping) master-down timer from a malformed advert.
+	if pkt.MaxAdvertInt > 0 {
+		vi.masterAdverInterval = time.Duration(pkt.MaxAdvertInt) * 10 * time.Millisecond
+	}
 	vi.mu.Unlock()
 }
 
