@@ -1,3 +1,40 @@
+## 2026-07-03 — #3924: userspace local-address sync pruned VRRP VIP keys on a transient netlink AddrList failure → VIP/SSH/BGP/IKE blackhole
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-183 (MEDIUM, HA/robustness — VIP blackhole).
+    `syncLocalAddressMapsLocked` (`pkg/dataplane/userspace/maps_sync.go`) builds
+    the desired `userspace_local_v4`/`userspace_local_v6` key set partly from
+    `netlink.AddrList(nil, family)` to recover kernel-owned VRRP VIPs that are
+    absent from the config snapshot, then prunes every map key not in the
+    desired set. On a TRANSIENT `AddrList` error (or an interrupted / `ENOBUFS`
+    partial dump) the old code `continue`d silently, leaving the desired set
+    INCOMPLETE, and still ran the prune — removing the live VRRP VIP keys and
+    blackholing packets destined to the firewall's own VIP/SSH/BGP/IKE
+    endpoints, with the error swallowed.
+  - **Fix**: `buildDesiredLocalAddressSets` is now a `*Manager` method that
+    reports `enumComplete` (true only when every `AddrList` family dump
+    succeeded) and enumerates through a `m.addrListForLocalSync` seam
+    (test hook `addrListForLocalSyncHook` on the Manager). `syncLocalAddressMapsLocked`
+    still performs the adds (adding only widens the local set — always safe)
+    but SKIPS the stale-key prune and logs a `slog.Warn` when the enumeration
+    is incomplete; the next reconcile with a complete enumeration prunes any
+    genuinely stale keys. Only `userspace_local_v4`/`v6` enumerate the kernel —
+    the interface-NAT and config-derived sets are snapshot-only, unaffected.
+  - **Files**: `pkg/dataplane/userspace/maps_sync.go`,
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/dataplane/userspace/maps_sync_addrlist_prune_3924_test.go` (RED-on-revert
+    unit tests), `docs/userspace-xdp-pass-bootstrap-and-ipv6.md` (§3 hardening
+    note).
+  - **Validation**: `go build ./...`, `gofmt`, `go vet` clean.
+    `TestSyncLocalAddressMapsSkipsPruneOnAddrListError` (VIP keys preserved +
+    warning on injected `AddrList` error; adds still land) and
+    `TestSyncLocalAddressMapsPrunesStaleOnCompleteEnum` (stale keys still pruned
+    on complete enum) pass under sudo (ebpf maps need memlock); RED-on-revert
+    proven — simulating the pre-fix always-prune makes the VIP-preserved test
+    fail with "VRRP VIP v4 key pruned". Neighboring sudo-only failures
+    (ingress_ifaces / XDP-program tests) reproduce identically on clean
+    origin/master (kernel 7.0.13 env), unrelated to this change.
+
 ## 2026-07-03 — #3917: HA peer-fence iterated the STARTUP config snapshot → day-2 redundancy-groups never fenced → split-brain dual-active
 
 - **Timestamp**: 2026-07-03
