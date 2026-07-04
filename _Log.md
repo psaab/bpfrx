@@ -1,3 +1,40 @@
+## 2026-07-03 — #4027: `interfaces interface-range` created a phantom admin-down interface and dropped member config (fable-161 F-029)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed the compiler mishandling `interfaces interface-range
+    <name> { member <if>; <shared cfg> }`. Verified first with a scratch
+    repro (ParseSetCommand + tree.SetPath): the generic `interfaces` wildcard
+    treated `interface-range` as an interface NAME, so the compiler minted a
+    PHANTOM `InterfaceConfig` keyed `interface-range` (matching no kernel NIC,
+    later reconciled admin-down) while the shared config (mtu, unit/family
+    addresses) AND the member interfaces themselves were silently dropped — a
+    genuine config-parity defect (interface-range was entirely unimplemented,
+    only referenced in a Junos help-text doc).
+  - **Fix**: added `expandInterfaceRanges` (`compiler_interface_range.go`), an
+    AST pre-pass called in `compileExpanded` BEFORE section compilation and the
+    H9/H10 unsupported-stanza gate. It rewrites every interface-range stanza
+    into its member interfaces: the range's shared statements are flattened to
+    `set`-command suffixes and replayed through `ConfigTree.SetPath` under each
+    member's name (schema-driven re-nesting, so compileInterfaces reads them
+    identically to a normal per-interface config), merged with the member's own
+    config re-applied LAST so member-local knobs win on a scalar conflict while
+    additive statements (addresses) accumulate. `member-range <a> to <b>`
+    expands over the trailing decimal (prefix-shared, capped). Handles both the
+    flat-set (range name in each leaf's Keys[0]) and hierarchical (range name in
+    the node's Keys[1]) AST shapes, mutates the group-expanded/inactive-pruned
+    clone in place, and is a strict no-op when no interface-range is present.
+    No networkd change needed — the phantom never reaches the reconcile because
+    it never enters the compiled `cfg.Interfaces`.
+  - **File(s)**: pkg/config/compiler_interface_range.go,
+    pkg/config/compiler.go,
+    pkg/config/compiler_interface_range_4027_test.go,
+    docs/config-schema.md
+  - **Validation**: new config tests (member expansion + NO phantom; shared
+    unit/family deep-apply; member override precedence + address accumulation;
+    hierarchical shape; member-range; multiple flat-set ranges; no-stanza
+    no-op) — all RED on revert of the expansion pass except the no-op test.
+    `go test ./pkg/config/... ./pkg/networkd/...` green, `go build ./...`,
+    gofmt, vet clean.
 ## 2026-07-03 — #4028: full-resync RG enumeration hardcoded 0..15 → RG >= 16 never resynced (fable-161 F-166)
 
 - **Timestamp**: 2026-07-03

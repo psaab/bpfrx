@@ -1805,6 +1805,17 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #4027 interface-range expansion. Rewrites every `interfaces
+	// interface-range <name> { member <if>; <shared cfg> }` stanza into its
+	// member interfaces BEFORE section compilation (and before the
+	// unsupported-stanza gate below, so that gate and compileInterfaces both
+	// see the expanded members, not a phantom "interface-range" interface).
+	// Runs on the group-expanded, inactive-pruned clone (apply-groups-
+	// inherited ranges expanded; `inactive:` ranges already stripped) and
+	// MUTATES the clone in place. A config with no interface-range stanza is
+	// left byte-identical. See compiler_interface_range.go.
+	ifaceRangeWarnings := expandInterfaceRanges(tree)
+
 	// #2008 H9/H10 interface silent-drop gate. Runs on the group-expanded,
 	// inactive-pruned tree (apply-groups-inherited stanzas covered;
 	// `inactive:` stanzas already stripped upstream) and BEFORE section
@@ -2042,6 +2053,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, flowTraceFileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceFilterWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceSizeWarnings...)
+	cfg.Warnings = append(cfg.Warnings, ifaceRangeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyWarnings...)
