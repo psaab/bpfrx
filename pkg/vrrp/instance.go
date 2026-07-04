@@ -29,6 +29,14 @@ const (
 	StateMaster
 )
 
+// addressOwnerPriority is the VRRP priority reserved for the IP address owner
+// (RFC 5798 §5.2.4). An instance configured with this priority owns the virtual
+// address and, per RFC 5798 §6.1, MUST preempt a lower-priority master
+// "irrespective of the setting of" the preempt flag — the owner always reclaims
+// mastership. See getPreempt / shouldPreemptObservedMaster (owner-preempt), and
+// getPriority (track.go — the owner is also exempt from track-down demotion).
+const addressOwnerPriority = 255
+
 func (s VRRPState) String() string {
 	switch s {
 	case StateInitialize:
@@ -504,10 +512,25 @@ func (vi *vrrpInstance) triggerResign() {
 	}
 }
 
+// getPreempt reports the EFFECTIVE preempt mode. It is the configured
+// cfg.Preempt OR-ed with the address-owner override: an instance whose
+// configured priority is 255 (the IP address owner) always preempts,
+// irrespective of the no-preempt flag or a sync-hold suppression of
+// cfg.Preempt (RFC 5798 §6.1: "a Backup MUST preempt when it is the IP address
+// owner ... irrespective of the setting of this flag"). Without this override
+// an owner configured with `no-preempt` that returns after a peer took over
+// would reset its master-down timer on every lower-priority advert
+// (handleBackupRx) and stay BACKUP forever, though it OWNS the VIP (#4116).
+//
+// The override keys on cfg.Priority (the configured value), not the effective
+// tracked priority: an owner is track-exempt (getPriority never demotes 255),
+// so the configured 255 is authoritative here. It is a no-op for every
+// non-owner instance, so cluster RETH failover (weight-based priorities < 255)
+// is unaffected.
 func (vi *vrrpInstance) getPreempt() bool {
 	vi.mu.RLock()
 	defer vi.mu.RUnlock()
-	return vi.cfg.Preempt
+	return vi.cfg.Preempt || vi.cfg.Priority == addressOwnerPriority
 }
 
 // shouldPreemptObservedMaster decides whether the non-force sync-hold preempt
@@ -516,8 +539,10 @@ func (vi *vrrpInstance) getPreempt() bool {
 // only on a STRICTLY higher priority than the currently-observed master. It
 // returns true iff:
 //
-//   - preempt is configured (a non-preempting node never preempts on the
-//     shortcut), AND
+//   - preempt is effective — either configured, OR this instance is the IP
+//     address owner (priority 255), which always preempts irrespective of the
+//     no-preempt flag (RFC 5798 §6.1, #4116). A non-owner non-preempting node
+//     never preempts on the shortcut, AND
 //   - either no live master has been observed recently (lastMasterSeen is zero
 //     or older than masterDownInterval — the cold-start / peer-down /
 //     silent-master-death rescue, where becoming MASTER is correct), OR a
@@ -549,7 +574,11 @@ func (vi *vrrpInstance) shouldPreemptObservedMaster() bool {
 	lastMasterSeen := vi.lastMasterSeen
 	vi.mu.RUnlock()
 
-	if !preempt {
+	// The IP address owner (priority 255) always preempts, irrespective of the
+	// no-preempt flag or a sync-hold suppression of cfg.Preempt (RFC 5798 §6.1,
+	// #4116) — mirrors getPreempt(). This is a no-op for every non-owner
+	// instance, so the cluster RETH sync-hold gate (#2082) is unchanged.
+	if !preempt && priority != addressOwnerPriority {
 		return false
 	}
 
@@ -1514,6 +1543,10 @@ func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer, preempt
 	// If we don't preempt, or the incoming priority is >= ours, accept it:
 	// reset the master-down timer and abort any pending preempt hold-time —
 	// a worthy master is present, so there is nothing to preempt (#2850).
+	// getPreempt() returns true for the IP address owner (priority 255)
+	// irrespective of the no-preempt flag, so an owner hearing a LOWER-priority
+	// advert does NOT reset the timer here — the timer expires and the owner
+	// reclaims MASTER (RFC 5798 §6.1, #4116).
 	// Also clear the one-shot resign bypass: it was armed by a prior
 	// priority-0 resign to make the imminent 1ms masterDownTimer expiry
 	// promote immediately, but a worthy master returning before that fire
