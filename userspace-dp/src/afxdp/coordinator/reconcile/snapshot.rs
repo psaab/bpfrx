@@ -189,11 +189,12 @@ pub(super) fn preflight_map_fds(
 /// #2484: build the full forwarding state for `snapshot` BEFORE the
 /// orchestrator tears down the running workers. This is the SAME call
 /// `apply_snapshot` previously made internally — hoisted ahead of
-/// `tear_down` so a snapshot INTEGRITY fault (Nat64UnparseableRule,
-/// NPTv6 / static-NAT / address-book integrity faults reachable only
-/// inside the full build, NOT caught by the top-of-reconcile policy
-/// preflight) aborts the reconcile while the prior generation + workers
-/// are still live, instead of surfacing post-teardown.
+/// `tear_down` so a snapshot INTEGRITY fault (Nptv6UnparseableRule,
+/// NPTv6 overlap / address-book / unresolvable-zone integrity faults
+/// reachable only inside the full build, NOT caught by the
+/// top-of-reconcile policy preflight; NAT64 is fail-scoped per #3888 and
+/// no longer aborts) aborts the reconcile while the prior generation +
+/// workers are still live, instead of surfacing post-teardown.
 ///
 /// On success returns the built `ForwardingState` for the orchestrator to
 /// stash on `ReconcileSnapshotFds::forwarding` (build-once, reused by

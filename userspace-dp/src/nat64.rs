@@ -34,19 +34,30 @@
 //!   are `#[cfg(test)]`-only: the differential tests use them to assert the
 //!   `_into` cores are byte-identical to an owned-`Vec` translation. They are
 //!   NOT on the forwarding hot path and are absent from the release build.
-//! * **Fail CLOSED on an unparseable config rule (#2212).**
-//!   [`Nat64State::try_from_snapshots`] rejects the whole snapshot (returning a
-//!   [`crate::policy::SnapshotIntegrityError`]) on an empty/malformed/non-/96
-//!   prefix or a pool address that is neither a bare IPv4 nor a `/32` host —
-//!   one bad pool entry fails the rule rather than being silently filtered. The
-//!   apply preflight then keeps the previous live forwarding state. This is the
-//!   helper-boundary backstop to the Go commit-time gate
-//!   (`pkg/config/compiler_nat.go`, #2173), consistent with the
-//!   #2124/#2142/#2173/#2175 fail-closed family. The pre-fix parser silently
-//!   `continue`d/`filter_map`ped bad input, which could leave a prefix present
-//!   with an emptied pool — `allocate_v4_source` then returns `None` and NAT64
-//!   forward translation silently stops (a fail-open in the retired-eBPF
-//!   enforcement plane).
+//! * **Fail SCOPED on an unparseable config rule (#2212, refined by #3888).**
+//!   [`Nat64State::from_snapshots`] SKIPS the offending NAT64 rule — logging a
+//!   loud one-line warning naming which rule and why — on an empty/malformed
+//!   /non-`/96` prefix or a pool address that is neither a bare IPv4 nor a
+//!   `/32` host, and publishes the remaining NAT64 rules plus the rest of the
+//!   forwarding snapshot. The whole rule is dropped all-or-nothing: a single
+//!   bad pool entry drops its rule rather than silently NARROWING the pool
+//!   (preserving the #2212 anti-silent-narrowing intent), but one bad NAT64
+//!   rule no longer aborts the ENTIRE forwarding rebuild. Pre-#3888 the
+//!   fallible `try_from_snapshots` returned a
+//!   [`crate::policy::SnapshotIntegrityError`] that propagated via `?` out of
+//!   `build_reconcile_forwarding`, so ONE malformed NAT64 rule (from a
+//!   mixed-version HA peer-sync or a lenient/corrupt snapshot — paths the Go
+//!   commit gate does not cover) froze the whole control→dataplane pipeline,
+//!   blocking every OTHER rule type and every later commit. Skipping mirrors
+//!   the skip-and-continue posture of the sibling NAT tables (`DnatTable`,
+//!   `StaticNatTable`, source NAT — the #1960 lenient-load doctrine) and
+//!   downgrades a bad NAT64 rule to a NAT64-only degradation. The primary gate
+//!   remains the Go commit-time validation (`pkg/config/compiler_nat.go`,
+//!   #2173/#3886); this is the helper-boundary backstop. NPTv6
+//!   ([`crate::nptv6::Nptv6State::try_from_snapshots`]) intentionally stays
+//!   fail-CLOSED (abort-all): its #2241 overlap rejection is an
+//!   order-dependent determinism guard where a blind per-rule skip would be
+//!   ambiguous, so it is a flagged follow-up, out of #3888 scope.
 //!
 //! ## Incremental L4 checksum on translation (#3025)
 //!
@@ -203,68 +214,79 @@ fn parse_pool_v4(s: &str) -> Option<Ipv4Addr> {
 }
 
 impl Nat64State {
-    /// Build from config snapshot NAT64 rules, failing CLOSED on an
-    /// unparseable rule (#2212).
+    /// Build from config snapshot NAT64 rules, SKIPPING (fail-scoped) any
+    /// unparseable rule (#2212, refined by #3888).
     ///
     /// In a retired-eBPF world (#1373) the userspace helper is the enforcement
-    /// plane. The pre-fix parser silently `continue`d past a bad prefix and
+    /// plane. The pre-#2212 parser silently `continue`d past a bad prefix and
     /// `filter_map`ped malformed pool entries away, so a mixed-version control
     /// plane, a serialization bug, or a missed Go validation edge could install
     /// a NAT64 rule whose prefix is present but whose pool is silently empty —
     /// `allocate_v4_source` then returns `None` and NAT64 forward translation
     /// stops with no failure surfaced. The primary gate is the Go commit-time
-    /// validation (`pkg/config/compiler_nat.go`, #2173, host-mask + pool
-    /// representability); this is the helper-boundary backstop, consistent with
-    /// the #2124/#2142/#2173/#2175 fail-closed family.
+    /// validation (`pkg/config/compiler_nat.go`, #2173/#3886, host-mask + pool
+    /// representability); this is the helper-boundary backstop.
     ///
-    /// On any unparseable rule this returns a `SnapshotIntegrityError`; the
-    /// apply preflight (`forwarding_build`/`reconcile`/`refresh`) then keeps the
-    /// previous live forwarding state rather than installing a narrower NAT64
-    /// config. An empty pool that is genuinely UNCONFIGURED (no `pool_addresses`
-    /// on the wire — the legitimate "no source-pool" state the Go side emits)
-    /// is NOT an error: only a pool that was non-empty on the wire but parsed to
-    /// empty (every entry dropped) is rejected — that is the exact silent
-    /// pool-narrowing fail-open this guards against.
-    pub(crate) fn try_from_snapshots(
-        snaps: &[NAT64RuleSnapshot],
-    ) -> Result<Self, crate::policy::SnapshotIntegrityError> {
-        use crate::policy::SnapshotIntegrityError;
+    /// #3888: this is INFALLIBLE (`-> Self`) and skips the offending rule
+    /// all-or-nothing, mirroring the sibling `DnatTable::from_snapshots` /
+    /// `StaticNatTable::from_snapshots` / source-NAT skip-and-continue posture
+    /// (#1960 lenient-load doctrine). Each skip logs a loud one-line
+    /// `eprintln!` naming the rule and the reason, so a leniently-loaded bad
+    /// rule is VISIBLE, not silent. This preserves #2212's anti-silent-pool-
+    /// narrowing intent — a single bad pool entry drops its WHOLE rule rather
+    /// than narrowing the pool — while scoping the blast radius to that one
+    /// NAT64 rule: the remaining NAT64 rules and every OTHER rule type in the
+    /// forwarding snapshot still publish. Pre-#3888 the fallible variant
+    /// returned a `SnapshotIntegrityError` that propagated via `?` out of
+    /// `build_reconcile_forwarding`, aborting the whole rebuild and freezing
+    /// the dataplane on one malformed NAT64 rule.
+    ///
+    /// An empty pool that is genuinely UNCONFIGURED (no `pool_addresses` on the
+    /// wire — the legitimate "no source-pool" state the Go side emits) is NOT
+    /// an error and installs a poolless prefix as before: only a pool that was
+    /// non-empty on the wire but had an UNPARSEABLE entry drops its rule.
+    pub(crate) fn from_snapshots(snaps: &[NAT64RuleSnapshot]) -> Self {
         let mut prefixes = Vec::with_capacity(snaps.len());
         // The natv6v4 no-v6-frag-header option is global; the Go side stamps it
         // onto every rule snapshot. Treat the state as enabled if any rule
         // carries the flag (they all carry the same value in practice).
         let no_v6_frag_header = snaps.iter().any(|s| s.no_v6_frag_header);
-        for snap in snaps {
+        // Labeled so a bad pool entry can skip the WHOLE rule (all-or-nothing,
+        // #3888) rather than narrowing the pool (the #2212 fail-open).
+        'rules: for snap in snaps {
             // Every NAT64 rule on the wire is enabled (the Go side skips
             // empty-prefix rules in buildNAT64Snapshots), so an empty prefix
             // here is anomalous: fail closed rather than silently dropping it.
             if snap.prefix.is_empty() {
-                return Err(SnapshotIntegrityError::Nat64UnparseableRule {
-                    rule_name: snap.name.clone(),
-                    field: "prefix (empty)".to_string(),
-                });
+                eprintln!(
+                    "xpf nat64: skipping malformed rule {:?}: empty prefix",
+                    snap.name
+                );
+                continue;
             }
             // Parse "64:ff9b::/96" — extract the prefix address and verify /96.
             let parts: Vec<&str> = snap.prefix.split('/').collect();
             match parts.get(1).and_then(|s| s.parse::<u8>().ok()) {
                 Some(96) => {}
                 // Only /96 is supported by the translator today; a different
-                // length (or a missing/garbage mask) was silently dropped
-                // pre-fix, leaving the rule absent at the dataplane.
+                // length (or a missing/garbage mask) skips the whole rule
+                // (#3888) — loudly, so the drop is visible.
                 _ => {
-                    return Err(SnapshotIntegrityError::Nat64UnparseableRule {
-                        rule_name: snap.name.clone(),
-                        field: format!("prefix {:?} (only /96 is supported)", snap.prefix),
-                    });
+                    eprintln!(
+                        "xpf nat64: skipping malformed rule {:?}: prefix {:?} (only /96 is supported)",
+                        snap.name, snap.prefix
+                    );
+                    continue;
                 }
             }
             let addr: Ipv6Addr = match parts[0].parse() {
                 Ok(a) => a,
                 Err(_) => {
-                    return Err(SnapshotIntegrityError::Nat64UnparseableRule {
-                        rule_name: snap.name.clone(),
-                        field: format!("prefix address {:?}", parts[0]),
-                    });
+                    eprintln!(
+                        "xpf nat64: skipping malformed rule {:?}: unparseable prefix address {:?}",
+                        snap.name, parts[0]
+                    );
+                    continue;
                 }
             };
             let octets = addr.octets();
@@ -277,17 +299,20 @@ impl Nat64State {
             // before parse so range-form pools are not silently dropped,
             // leaving pool_v4 empty and NAT64 forward translation
             // non-functional. A non-host mask (`/24`) or garbage suffix is
-            // unparseable: fail CLOSED (#2212) — one bad pool entry rejects the
-            // whole rule rather than silently narrowing the pool.
+            // unparseable: skip the WHOLE rule (#3888, all-or-nothing) rather
+            // than silently NARROWING the pool by dropping just the bad entry
+            // (the #2212 fail-open). `continue 'rules` bails on the offending
+            // rule so no partially-installed pool reaches the dataplane.
             let mut pool_v4 = Vec::with_capacity(snap.pool_addresses.len());
             for s in &snap.pool_addresses {
                 match parse_pool_v4(s) {
                     Some(addr) => pool_v4.push(addr),
                     None => {
-                        return Err(SnapshotIntegrityError::Nat64UnparseableRule {
-                            rule_name: snap.name.clone(),
-                            field: format!("source-pool address {:?}", s),
-                        });
+                        eprintln!(
+                            "xpf nat64: skipping malformed rule {:?}: unparseable source-pool address {:?}",
+                            snap.name, s
+                        );
+                        continue 'rules;
                     }
                 }
             }
@@ -297,20 +322,10 @@ impl Nat64State {
                 pool_index: AtomicUsize::new(0),
             });
         }
-        Ok(Self {
+        Self {
             prefixes,
             no_v6_frag_header,
-        })
-    }
-
-    /// Infallible test/legacy convenience wrapper over [`try_from_snapshots`]
-    /// (#2212). Panics on a snapshot integrity error, which valid test
-    /// snapshots never produce. Production builds the state through
-    /// `try_from_snapshots` so an unparseable rule rejects the snapshot and
-    /// keeps the previous live state.
-    #[cfg(test)]
-    pub(crate) fn from_snapshots(snaps: &[NAT64RuleSnapshot]) -> Self {
-        Self::try_from_snapshots(snaps).expect("test snapshot must not produce a NAT64 integrity error")
+        }
     }
 
     /// Returns true if any NAT64 prefixes are configured.

@@ -161,21 +161,13 @@ pub(crate) enum SnapshotIntegrityError {
         family: &'static str,
         address: String,
     },
-    /// #2212: a NAT64 rule snapshot carried an unparseable field — a prefix
-    /// that is empty / malformed / not /96, or a pool address that is neither a
-    /// bare IPv4 nor a `/32` host. (A pool that is genuinely UNCONFIGURED — no
-    /// pool addresses on the wire — is the legitimate "no source-pool" state the
-    /// Go side emits and is NOT an error; only an entry that fails to parse,
-    /// which would silently narrow the pool, is rejected.) Silently dropping the
-    /// rule (the pre-fix `continue`/`filter_map`) is a fail-OPEN regression in a
-    /// retired-eBPF world where the userspace helper is the enforcement plane: a
-    /// present prefix with an emptied pool makes `allocate_v4_source` return
-    /// `None`, so NAT64 forward translation stops with no failure surfaced. The
-    /// Go commit-time validation (`pkg/config/compiler_nat.go`, #2173) is the
-    /// primary gate; this is the helper-boundary backstop. Rejecting the whole
-    /// snapshot keeps the previous live NAT64 state rather than installing a
-    /// silently narrower one.
-    Nat64UnparseableRule { rule_name: String, field: String },
+    // #2212/#3888: NAT64 unparseable rules no longer produce an integrity
+    // error. `Nat64State::from_snapshots` (nat64.rs) is infallible: it SKIPS
+    // the offending NAT64 rule (logging a loud warning) and publishes the rest,
+    // scoping a bad NAT64 rule to a NAT64-only degradation instead of aborting
+    // the whole forwarding rebuild. The former `Nat64UnparseableRule` variant
+    // was removed with that change. NPTv6 (below) intentionally stays
+    // fail-CLOSED — its #2241 overlap rejection is order-dependent.
     /// #2240: an NPTv6 (RFC 6296) rule snapshot carried an unparseable or
     /// unsupported prefix — a match/internal prefix that is empty / malformed /
     /// not a /48 or /64, or an internal/external pair whose prefix lengths do
@@ -680,11 +672,6 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "address book id={} ({:?}) has prefixes_{} entry {:?} that is not a parseable {} IP/CIDR literal (malformed, or a wrong-family token in the {} array) — refusing to fail open by dropping it (which collapses a book-backed deny to match-none) or by silently routing it to the other family",
                 book_id, book_name, family, address, family, family
-            ),
-            Self::Nat64UnparseableRule { rule_name, field } => write!(
-                f,
-                "nat64 rule {:?} has an unparseable {} — refusing to fail open by silently dropping the rule",
-                rule_name, field
             ),
             Self::Nptv6UnparseableRule { rule_name, field } => write!(
                 f,

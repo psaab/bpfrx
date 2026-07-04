@@ -204,8 +204,9 @@ impl Coordinator {
             // trilogy): build the full forwarding state HERE, BEFORE
             // `tear_down`. The top-of-reconcile policy preflight above only
             // parses policy/address-book state, so snapshot INTEGRITY faults
-            // reachable only inside the full build (e.g. Nat64UnparseableRule,
-            // NPTv6/static-NAT integrity faults) used to surface inside
+            // reachable only inside the full build (e.g. Nptv6UnparseableRule,
+            // NPTv6 overlap / unresolvable-zone faults; NAT64 is fail-scoped
+            // per #3888 and no longer aborts) used to surface inside
             // `apply_snapshot` — AFTER teardown stopped the workers and reset
             // `coord.validation` / `shared_validation`, stranding the helper
             // with no forwarding and no workers (residual fail-open). Building
