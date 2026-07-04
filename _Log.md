@@ -1,3 +1,34 @@
+## 2026-07-04 — #4067: read-only / config-viewer login class could run `monitor traffic` (root tcpdump packet capture) → unprivileged capture / privilege gap
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed fable-161 F-023 (MEDIUM, security/RBAC). The
+    `monitor traffic` operational command spawns a root `tcpdump` live
+    packet capture (`handleMonitorTraffic`, `pkg/cli/cli_request.go`), but
+    the CLI RBAC gate (`checkPermission`, `pkg/cli/permissions.go`) gated
+    it only on the top-level word `monitor` → `PermView`. A `read-only` /
+    `config-viewer` class (intended only to VIEW config/status) has
+    `PermView`, so those unprivileged roles could run a root packet capture
+    and read other users' cleartext traffic. `request`/shell-out commands
+    were already gated at `PermControl`; `monitor traffic` (the other
+    shell-out-to-root family) was not. Fix: made `checkPermission` take the
+    resolved command line (`parts []string`) and added a subcommand-aware
+    `requiredPermission` helper — `monitor traffic` now requires
+    `PermControl` (operator + super-user allowed; read-only /
+    config-viewer / unauthorized denied), mirroring Junos' maintenance
+    gating. The subcommand is resolved with the SAME prefix matcher the
+    `monitor` dispatcher uses, so `monitor tr` is gated identically and the
+    abbreviation cannot bypass the gate. Surgical: other `monitor`
+    subcommands (interface stats, security flow) and read-only `show`
+    stay view-level. RED-on-revert: dropping the `monitor traffic` special
+    case makes the read-only / config-viewer subtests of
+    `TestCheckPermission_MonitorTrafficRequiresControl` FAIL (capture
+    allowed). Validated: `go test ./pkg/cli/...`, `go build ./...`,
+    gofmt + vet clean (the cli.go:503 unreachable-code vet note is
+    pre-existing on origin/master, unrelated).
+  - **File(s)**: pkg/cli/permissions.go, pkg/cli/cli_dispatch.go,
+    pkg/cli/permissions_monitor_traffic_4067_test.go,
+    docs/system-login.md, _Log.md
+
 ## 2026-07-03 — #4054: export_all_sessions ran push_delta_lossless / frame serialization UNDER the global ServerState lock → a large bulk session export could starve the status poll → false dp-failure → needless helper restart
 
 - **Timestamp**: 2026-07-03

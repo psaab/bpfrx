@@ -221,7 +221,7 @@ func (c *CLI) dispatchOperational(line string) error {
 	}
 	parts[0] = resolved
 
-	if err := c.checkPermission(parts[0]); err != nil {
+	if err := c.checkPermission(parts); err != nil {
 		return err
 	}
 
