@@ -78,6 +78,67 @@ fn metadata() -> SessionMetadata {
     }
 }
 
+/// #4109: a TCP IPv6 forward key. The shared `key_v6()` is UDP, but the TCP
+/// state-machine tests need a v6 TCP flow to cover the second address family.
+fn tcp_key_v6() -> SessionKey {
+    SessionKey {
+        addr_family: 10,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().expect("v6 src")),
+        dst_ip: IpAddr::V6("2606:4700:4700::1111".parse::<Ipv6Addr>().expect("v6 dst")),
+        src_port: 51000,
+        dst_port: 443,
+    }
+}
+
+/// #4109: the reverse-companion key for a no-NAT forward session — the same
+/// `reverse_session_key` transform the forwarding hot path
+/// (`build_reverse_session_from_forward_match`) applies. `NatDecision::default`
+/// makes the transform a pure src/dst + port swap, and it is its own inverse,
+/// so `reverse_session_key(reverse_key_of(f), default) == f`.
+fn reverse_key_of(forward: &SessionKey) -> SessionKey {
+    reverse_session_key(forward, NatDecision::default())
+}
+
+/// #4109: install the forward entry AND its reverse companion for `forward`,
+/// mirroring the production two-entry install (`poll_descriptor`): both halves
+/// are installed from the SAME trigger flags, so a bare SYN starts both OPENING
+/// (matching `established: !(is_initial_syn(..))`). Zones swap on the reverse
+/// companion (faithful to `build_reverse_session_from_forward_match`, though the
+/// state-machine tests do not depend on them). Returns the reverse-companion
+/// key. Deltas emitted by the two installs are drained so a later assertion on
+/// close/open deltas sees only what the test itself produced.
+fn install_forward_reverse_pair(
+    table: &mut SessionTable,
+    forward: &SessionKey,
+    now_ns: u64,
+    tcp_flags: u8,
+) -> SessionKey {
+    assert!(table.install_with_protocol(
+        forward.clone(),
+        decision(),
+        metadata(),
+        now_ns,
+        PROTO_TCP,
+        tcp_flags,
+    ));
+    let reverse = reverse_key_of(forward);
+    let mut reverse_metadata = metadata();
+    reverse_metadata.is_reverse = true;
+    reverse_metadata.ingress_zone = TEST_WAN_ZONE_ID;
+    reverse_metadata.egress_zone = TEST_LAN_ZONE_ID;
+    assert!(table.install_with_protocol(
+        reverse.clone(),
+        decision(),
+        reverse_metadata,
+        now_ns,
+        PROTO_TCP,
+        tcp_flags,
+    ));
+    let _ = table.drain_deltas(8);
+    reverse
+}
+
 #[test]
 fn session_lookup_hits_after_install() {
     let mut table = SessionTable::new();
@@ -1255,31 +1316,48 @@ fn bare_syn_session_starts_opening_with_short_timeout() {
     );
 }
 
-/// #3152: a completed three-way handshake (SYN, SYN-ACK, ACK) promotes the
-/// session from OPENING to ESTABLISHED, at which point the established idle
-/// timeout applies. The reverse SYN-ACK and the forward completing ACK both
-/// carry the ACK bit, so the first ACK-bearing segment after the opening SYN
-/// promotes the entry. Promotion is sticky.
+/// #3152/#4109: a completed three-way handshake (SYN, SYN-ACK, ACK) promotes
+/// the session from OPENING to ESTABLISHED, at which point the established idle
+/// timeout applies. Modelled on the production TWO-entry conntrack (forward +
+/// reverse companion, #4109): the server's SYN-ACK arrives on the REVERSE half
+/// and promotes both companions; the forward completing ACK then re-stamps the
+/// forward entry's established idle window. Promotion is sticky.
 #[test]
 fn tcp_handshake_promotes_opening_to_established() {
     let mut table = SessionTable::new();
-    let key = key_v4();
+    let forward = key_v4();
     let now = 1_000_000_000u64;
-    // 1) Opening SYN.
-    assert!(table.install_with_protocol(
-        key.clone(),
-        decision(),
-        metadata(),
-        now,
-        PROTO_TCP,
-        TCP_SYN,
-    ));
-    assert!(!table.entry_by_key(&key).expect("opening").established);
-    // 2) Reverse SYN-ACK (carries ACK) — handshake response.
-    assert!(table.lookup(&key, now + 1_000_000, TCP_SYN | TCP_ACK).is_some());
-    // 3) Forward completing ACK.
-    assert!(table.lookup(&key, now + 2_000_000, TCP_ACK).is_some());
-    let entry = table.entry_by_key(&key).expect("established entry");
+    // 1) Opening SYN installs BOTH the forward entry and its reverse companion;
+    //    a bare SYN starts both OPENING.
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_SYN);
+    assert!(!table.entry_by_key(&forward).expect("opening fwd").established);
+    assert!(!table.entry_by_key(&reverse).expect("opening rev").established);
+    // 2) Reverse SYN-ACK (server's handshake response, carries ACK on the
+    //    reverse half). It promotes the reverse companion AND, via #4109
+    //    companion propagation, the forward entry.
+    assert!(
+        table
+            .lookup(&reverse, now + 1_000_000, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+    assert!(
+        table
+            .entry_by_key(&reverse)
+            .expect("rev after synack")
+            .established,
+        "the reverse SYN-ACK promotes the reverse companion"
+    );
+    assert!(
+        table
+            .entry_by_key(&forward)
+            .expect("fwd after synack")
+            .established,
+        "the reverse SYN-ACK promotes the forward companion too (#4109 F16)"
+    );
+    // 3) Forward completing ACK re-stamps the (already established) forward
+    //    entry's idle window.
+    assert!(table.lookup(&forward, now + 2_000_000, TCP_ACK).is_some());
+    let entry = table.entry_by_key(&forward).expect("established entry");
     assert!(
         entry.established,
         "a completed 3-way handshake must promote the session to ESTABLISHED"
@@ -1289,10 +1367,234 @@ fn tcp_handshake_promotes_opening_to_established() {
         "an established session must use the established idle timeout"
     );
     // Stickiness: a later non-ACK segment must not demote back to OPENING.
-    assert!(table.lookup(&key, now + 3_000_000, 0).is_some());
+    assert!(table.lookup(&forward, now + 3_000_000, 0).is_some());
     assert!(
-        table.entry_by_key(&key).expect("still established").established,
+        table
+            .entry_by_key(&forward)
+            .expect("still established")
+            .established,
         "establishment is sticky — a later segment must not revert to OPENING"
+    );
+}
+
+/// #4109 F16 FAIL-ON-REVERT (security/DoS): a bare SYN followed by a
+/// forward-direction bare ACK — with NO reverse SYN-ACK ever seen — must NOT
+/// promote the session to ESTABLISHED. `has_ack` alone on the FORWARD half is
+/// not handshake evidence; only the server's reverse SYN-ACK is. The forward
+/// entry therefore stays OPENING on the short 20s opening window, so the #3152
+/// half-open reap bounds a "SYN then bare-ACK" flood exactly like a bare-SYN
+/// flood. Before #4109 the forward ACK promoted the entry to the 300s
+/// established window (the 2-packet bypass); reverting makes the `established` /
+/// `expires_after_ns` asserts RED.
+fn forward_ack_without_reverse_synack_stays_opening(forward: SessionKey) {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_SYN);
+    // A forward-direction bare ACK (the attacker, with no server reply).
+    assert!(table.lookup(&forward, now + 1_000_000, TCP_ACK).is_some());
+    let fwd = table.entry_by_key(&forward).expect("fwd entry");
+    assert!(
+        !fwd.established,
+        "a client-only ACK with no reverse SYN-ACK must NOT establish (#4109 F16)"
+    );
+    assert_eq!(
+        fwd.expires_after_ns, DEFAULT_TCP_OPENING_TIMEOUT_NS,
+        "a half-open session pinged by a client-only ACK stays on the short opening window"
+    );
+    // The reverse companion, never having seen a reply, is likewise OPENING.
+    assert!(
+        !table
+            .entry_by_key(&reverse)
+            .expect("rev entry")
+            .established
+    );
+    // Reap proof: past the 20s opening window both halves reap — neither pinned
+    // the 300s established window.
+    let advance = now + 25 * WHEEL_TICK_NS;
+    table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    let expired = table.expire_stale_entries(advance);
+    assert_eq!(
+        expired.len(),
+        2,
+        "both half-open companions reap at the opening window, not the 300s established window"
+    );
+}
+
+#[test]
+fn forward_ack_without_reverse_synack_stays_opening_v4() {
+    forward_ack_without_reverse_synack_stays_opening(key_v4());
+}
+
+#[test]
+fn forward_ack_without_reverse_synack_stays_opening_v6() {
+    forward_ack_without_reverse_synack_stays_opening(tcp_key_v6());
+}
+
+/// #4109 FAIL-ON-REVERT (Copilot fold): the promotion gate requires a GENUINE
+/// reverse SYN-ACK (`is_syn_ack`), not merely any ACK-bearing reverse segment.
+/// A bare reverse ACK (ACK set, SYN clear) during OPENING cannot occur in a
+/// legitimate 3-way handshake — the server's only pre-established reverse
+/// segment is the SYN-ACK — but a server-spoofing attacker could inject one; it
+/// must NOT promote a half-open session to ESTABLISHED. Loosening the gate back
+/// to `has_ack` makes both `established` asserts RED. A subsequent genuine
+/// reverse SYN-ACK still promotes (control).
+fn reverse_bare_ack_does_not_promote_opening(forward: SessionKey) {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_SYN);
+    // A bare reverse ACK (ACK-only, no SYN) — not a handshake SYN-ACK.
+    assert!(table.lookup(&reverse, now + 1_000_000, TCP_ACK).is_some());
+    assert!(
+        !table.entry_by_key(&reverse).expect("rev entry").established,
+        "a bare reverse ACK (no SYN) must NOT promote the reverse companion (#4109)"
+    );
+    assert!(
+        !table.entry_by_key(&forward).expect("fwd entry").established,
+        "a bare reverse ACK must NOT promote the forward companion either (#4109)"
+    );
+    // Control: a genuine reverse SYN-ACK DOES promote both halves.
+    assert!(
+        table
+            .lookup(&reverse, now + 2_000_000, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+    assert!(
+        table.entry_by_key(&reverse).expect("rev").established,
+        "a genuine reverse SYN-ACK promotes the reverse companion"
+    );
+    assert!(
+        table.entry_by_key(&forward).expect("fwd").established,
+        "a genuine reverse SYN-ACK promotes the forward companion"
+    );
+}
+
+#[test]
+fn reverse_bare_ack_does_not_promote_opening_v4() {
+    reverse_bare_ack_does_not_promote_opening(key_v4());
+}
+
+#[test]
+fn reverse_bare_ack_does_not_promote_opening_v6() {
+    reverse_bare_ack_does_not_promote_opening(tcp_key_v6());
+}
+
+/// #4109 F17 FAIL-ON-REVERT (correctness/DoS): a unidirectional RST seen on ONE
+/// half of a flow must reap BOTH the forward entry and its reverse companion at
+/// the short 2s RST window. Before #4109 only the matched half moved to the 2s
+/// window; the other half stayed on the 300s established timeout, so the #3046
+/// reset reap was ~50% effective under a reset workload (every RST-closed flow
+/// still pinned one established-timeout entry). Reverting makes the companion's
+/// `closing`/`reset`/`expires_after_ns` asserts RED (it lingers at 300s).
+fn unidirectional_rst_reaps_both_companions(forward: SessionKey) {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    // Establish the flow (first packet carries ACK → both entries ESTABLISHED at
+    // install, 300s window) so the RST has a full-timeout companion to
+    // short-circuit.
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_ACK);
+    assert!(table.entry_by_key(&forward).expect("fwd").established);
+    assert!(table.entry_by_key(&reverse).expect("rev").established);
+    // A RST arrives on the REVERSE direction only (e.g. the server resets).
+    assert!(table.lookup(&reverse, now + 1_000_000, TCP_RST).is_some());
+    // The matched (reverse) half is on the 2s RST window...
+    let rev = table.entry_by_key(&reverse).expect("rev after rst");
+    assert!(rev.closing && rev.reset, "matched half is closing+reset");
+    assert_eq!(rev.expires_after_ns, TCP_RST_TIMEOUT_NS);
+    // ...and so is the forward companion (#4109 F17 propagation).
+    let fwd = table.entry_by_key(&forward).expect("fwd after rst");
+    assert!(fwd.closing, "the companion inherits closing (#4109 F17)");
+    assert!(fwd.reset, "the companion inherits reset (#4109 F17)");
+    assert_eq!(
+        fwd.expires_after_ns, TCP_RST_TIMEOUT_NS,
+        "the companion reaps on the 2s RST window, not the 300s established window (#4109 F17)"
+    );
+    // Reap proof: shortly past the 2s window BOTH halves are gone.
+    let advance = now + 1_000_000 + 4 * WHEEL_TICK_NS;
+    table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    let expired = table.expire_stale_entries(advance);
+    assert_eq!(
+        expired.len(),
+        2,
+        "a unidirectional RST reaps BOTH companions at the short 2s window"
+    );
+}
+
+#[test]
+fn unidirectional_rst_reaps_both_companions_v4() {
+    unidirectional_rst_reaps_both_companions(key_v4());
+}
+
+#[test]
+fn unidirectional_rst_reaps_both_companions_v6() {
+    unidirectional_rst_reaps_both_companions(tcp_key_v6());
+}
+
+/// #4109 F17 FAIL-ON-REVERT: a one-sided graceful FIN reaps BOTH companions at
+/// the 30s close window (#3489), not just the matched half. Same propagation as
+/// the RST case but on the longer FIN window and without the reset flag.
+fn unidirectional_fin_reaps_both_companions(forward: SessionKey) {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_ACK);
+    // A FIN arrives on the FORWARD direction only.
+    assert!(table.lookup(&forward, now + 1_000_000, TCP_FIN).is_some());
+    let fwd = table.entry_by_key(&forward).expect("fwd after fin");
+    assert!(fwd.closing && !fwd.reset, "matched half is FIN-closing, not reset");
+    assert_eq!(fwd.expires_after_ns, TCP_CLOSING_TIMEOUT_NS);
+    // The reverse companion inherits the FIN close window (#4109 F17).
+    let rev = table.entry_by_key(&reverse).expect("rev after fin");
+    assert!(rev.closing, "the companion inherits closing (#4109 F17)");
+    assert!(
+        !rev.reset,
+        "a graceful FIN must not set the companion's reset flag"
+    );
+    assert_eq!(
+        rev.expires_after_ns, TCP_CLOSING_TIMEOUT_NS,
+        "the companion reaps on the 30s FIN window, not the 300s established window (#4109 F17)"
+    );
+    // Reap proof: past the 30s window BOTH halves are gone.
+    let advance = now + 1_000_000 + 33 * WHEEL_TICK_NS;
+    table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    let expired = table.expire_stale_entries(advance);
+    assert_eq!(
+        expired.len(),
+        2,
+        "a unidirectional FIN reaps BOTH companions at the 30s close window"
+    );
+}
+
+#[test]
+fn unidirectional_fin_reaps_both_companions_v4() {
+    unidirectional_fin_reaps_both_companions(key_v4());
+}
+
+#[test]
+fn unidirectional_fin_reaps_both_companions_v6() {
+    unidirectional_fin_reaps_both_companions(tcp_key_v6());
+}
+
+/// #4109 negative control: an ALREADY-ESTABLISHED flow's forward ACK must not
+/// be disturbed by the F16 promotion gate — it stays ESTABLISHED on the 300s
+/// window. Guards against the gate accidentally demoting or shortening a
+/// legitimately established session.
+#[test]
+fn established_flow_forward_ack_unaffected() {
+    let mut table = SessionTable::new();
+    let forward = key_v4();
+    let now = 1_000_000_000u64;
+    // First packet carries ACK (mid-stream pickup) → ESTABLISHED at install.
+    let _reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_ACK);
+    assert!(table.entry_by_key(&forward).expect("established").established);
+    // A later forward data-ACK keeps it established on the 300s window.
+    assert!(table.lookup(&forward, now + 1_000_000, TCP_ACK).is_some());
+    let entry = table.entry_by_key(&forward).expect("still established");
+    assert!(
+        entry.established,
+        "an established flow's forward ACK must not demote it (#4109 F16 gate)"
+    );
+    assert_eq!(
+        entry.expires_after_ns, table.timeouts.tcp_established_ns,
+        "an established flow's forward ACK keeps the 300s established idle window"
     );
 }
 
@@ -1476,27 +1778,49 @@ fn per_zone_syn_flood_timeout_applies_on_opening_refresh() {
 #[test]
 fn opening_session_ignores_app_override_until_established() {
     let mut table = SessionTable::new();
-    let key = key_v4();
+    let forward = key_v4();
     let now = 1_000_000_000u64;
     let app = 120 * WHEEL_TICK_NS; // 120 s custom application idle timeout
+    // Two-entry model (#4109): the forward entry carries the per-app override;
+    // the reverse companion inherits it (build_reverse_session_from_forward_match
+    // mirrors inactivity_timeout_ns). Both start OPENING off the bare SYN.
     assert!(table.install_with_protocol(
-        key.clone(),
+        forward.clone(),
         decision(),
         metadata_with_app_timeout(app),
         now,
         PROTO_TCP,
         TCP_SYN,
     ));
-    let opening = table.entry_by_key(&key).expect("opening entry");
+    let reverse = reverse_key_of(&forward);
+    let mut reverse_meta = metadata_with_app_timeout(app);
+    reverse_meta.is_reverse = true;
+    assert!(table.install_with_protocol(
+        reverse.clone(),
+        decision(),
+        reverse_meta,
+        now,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    let _ = table.drain_deltas(8);
+    let opening = table.entry_by_key(&forward).expect("opening entry");
     assert!(!opening.established);
     assert_eq!(
         opening.expires_after_ns, DEFAULT_TCP_OPENING_TIMEOUT_NS,
         "a half-open session uses the short opening window even with a per-app \
          override stamped (the override is the established idle timeout)"
     );
-    // Complete the handshake — the per-app override now applies.
-    assert!(table.lookup(&key, now + 1_000_000, TCP_ACK).is_some());
-    let est = table.entry_by_key(&key).expect("established entry");
+    // Complete the handshake: the server's reverse SYN-ACK promotes both halves
+    // (#4109 F16), then the forward completing ACK re-stamps the forward entry —
+    // the per-app override now applies.
+    assert!(
+        table
+            .lookup(&reverse, now + 1_000_000, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+    assert!(table.lookup(&forward, now + 2_000_000, TCP_ACK).is_some());
+    let est = table.entry_by_key(&forward).expect("established entry");
     assert!(est.established);
     assert_eq!(
         est.expires_after_ns, app,
@@ -2712,9 +3036,12 @@ fn reference_update_session(
     // plain `=`, the in-place-vs-reference parity sweep would stay blind to the
     // #3489 bug (both sides would agree on the wrong non-sticky behavior).
     entry.closing |= matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-    // #3152: mirror update_session — promote OPENING -> ESTABLISHED on the
-    // first ACK-bearing segment, then select the timeout consulting the state.
-    entry.established |= matches!(protocol, PROTO_TCP) && has_ack(tcp_flags);
+    // #3152/#4109: mirror update_session — promote OPENING -> ESTABLISHED only
+    // on a genuine reverse SYN-ACK (is_syn_ack + is_reverse), then select the
+    // timeout consulting the state. Keeping this in lock-step with the
+    // production gate keeps the in-place-vs-reference parity sweep honest.
+    entry.established |=
+        matches!(protocol, PROTO_TCP) && is_syn_ack(tcp_flags) && metadata.is_reverse;
     entry.expires_after_ns = if entry.closing {
         if entry.reset {
             TCP_RST_TIMEOUT_NS

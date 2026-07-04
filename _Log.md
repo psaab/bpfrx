@@ -32547,6 +32547,68 @@ top.
     pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
 
 - **Timestamp**: 2026-07-04
+  - **Action**: #4109 (F16+F17+F15) — TCP state-machine hardening in the
+    userspace-dp conntrack. VERIFY-FIRST confirmed both findings at
+    origin/master. F16 (security/DoS): `lookup.rs` promoted OPENING→ESTABLISHED
+    on ANY ACK-bearing segment (`has_ack`, a pure bit test), so a bare SYN
+    followed by a bare forward ACK — with NO reverse SYN-ACK — pinned a 300 s
+    established entry with no peer replying, a 2-packet bypass of the #3152
+    half-open reap (a real vSRX syn-check does not establish on a client ACK
+    preceding the server SYN-ACK). FIX: promote ONLY on an ACK on the REVERSE
+    companion (`metadata.is_reverse`) — the server's SYN-ACK — and promote BOTH
+    halves; a client-only forward ACK never promotes. F17 (correctness/DoS): a
+    unidirectional FIN/RST advanced only the entry it hit into the short close
+    window; the sibling companion (a separate `SessionEntry`) kept the 300 s
+    established timeout, so #3046's 2 s reset-reap was ~50% effective. FIX: new
+    `SessionTable::propagate_tcp_state_to_companion` (recovers the companion via
+    `reverse_session_key(matched.key, matched.nat)`, exactly as `account_packet`
+    hops reverse→forward) stamps `closing`/`reset` onto the companion, pulls it
+    onto the 2 s RST / 30 s FIN window, and re-buckets it in the timer wheel so
+    both halves reap together. Gated behind close-or-reverse-promote (a plain
+    data-ACK pays no extra probe); missing companion (FabricRedirect / already
+    reaped) is a no-op. `update_session` (HA-promote mirror) gets the F16
+    `is_reverse` gate only (synced sessions import ESTABLISHED, so it's a no-op
+    there; cross-companion close on a cluster rides the peer's Close-delta).
+    install.rs seed unchanged (bare-SYN → OPENING). F15: added RED-on-revert
+    tests (v4+v6): forward-ACK-without-SYN-ACK stays OPENING + reaps both at 20 s;
+    unidirectional RST reaps both companions at 2 s; unidirectional FIN reaps
+    both at 30 s; negative controls (normal SYN→SYN-ACK→ACK promotes; established
+    flow's forward ACK unaffected). Rewrote the existing single-key
+    `tcp_handshake_promotes_opening_to_established` onto the two-entry model. FULL
+    cargo test --release (single-threaded) green; go build ./... green.
+    FLAG: companion propagation touches the HA-synced session path (a synced
+    session's local companion) → test-failover recommended before merge.
+  - **File(s)**: userspace-dp/src/session/lookup.rs,
+    userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+    userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4109 Copilot fold (PR #4128) — tighten the F16 promotion gate
+    from `has_ack` to `is_syn_ack`. Copilot flagged that the gate
+    `is_tcp && has_ack && is_reverse` promotes on ANY ack-bearing reverse
+    segment, not specifically a SYN-ACK, leaving a residual: a server-spoofed
+    bare reverse ACK (ACK set, SYN clear) during OPENING could still promote —
+    much harder to exploit than the original client-side F16 (needs a packet on
+    the REVERSE tuple, i.e. spoofing the server) but not matching the stated
+    "reverse SYN-ACK" intent. VERIFIED all three safety conditions before
+    tightening: (a) xpf is inline + control segments bypass the flow cache
+    (flow_cache `packet_eligible` = pure-ACK/UDP only), so a normal handshake's
+    SYN-ACK always reaches the slow-path promotion site; (b) mid-stream pickups
+    are seeded ESTABLISHED at install (install.rs `!is_initial_syn`), never
+    OPENING, so unaffected; (c) in a legit 3-way handshake (and simultaneous
+    open) the server's only pre-established reverse segment IS the SYN-ACK — a
+    bare reverse ACK during OPENING is not a legit promotion trigger. Changed
+    both gates (lookup.rs `promote_from_reverse`, mod.rs `update_session`) and
+    the in-place-vs-reference parity mirror (tests.rs) to `is_syn_ack`; removed
+    the now-unused `has_ack` import. Added RED-on-revert test
+    `reverse_bare_ack_does_not_promote_opening` (v4+v6): a bare reverse ACK does
+    NOT promote either half, a genuine reverse SYN-ACK does (control). Updated
+    README to say "genuine reverse SYN-ACK (is_syn_ack, not has_ack)" + document
+    the closed residual. All existing #4109 tests stay green (they promote via
+    SYN|ACK). FULL cargo test --release (single-threaded) green; go build green.
+  - **File(s)**: userspace-dp/src/session/lookup.rs,
+    userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
+    userspace-dp/src/session/README.md, _Log.md
   - **Action**: #4122 — fail-closed fabric gRPC allowlist interceptor. The
     cluster fabric listener (`RunFabricListener`, `pkg/grpcapi/server.go`)
     registered the identical full 48-RPC `BpfrxService` as the loopback
