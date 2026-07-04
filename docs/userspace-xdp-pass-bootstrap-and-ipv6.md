@@ -58,7 +58,27 @@ The XDP shim checks `USERSPACE_LOCAL_V6` to determine if a packet's destination 
 - NDP NAs for the VIP were not recognized as local
 - Any IPv6 traffic destined to the firewall's own WAN VIPs was misclassified
 
-**Fix:** `syncLocalAddressMapsLocked()` in `manager.go` now enumerates ALL kernel addresses via `netlink.AddrList(nil, family)`, including dynamically added VIPs. This runs periodically in the status update loop.
+**Fix:** `syncLocalAddressMapsLocked()` in `maps_sync.go` now enumerates ALL kernel addresses via `netlink.AddrList(nil, family)`, including dynamically added VIPs. This runs periodically in the status update loop.
+
+**Hardening — no prune on incomplete enumeration (#3924):** the reconcile
+adds the desired local keys and then prunes any map key not in the desired
+set. Because the desired set is built partly from `netlink.AddrList`, a
+transient netlink failure (or an interrupted / `ENOBUFS` partial dump)
+produced an INCOMPLETE desired set that was still treated as authoritative —
+so the prune removed the VRRP VIP keys (and any other kernel-owned local
+address) from `userspace_local_v4`/`userspace_local_v6`, blackholing
+VIP/SSH/BGP/IKE traffic destined to the firewall's own endpoints, and the
+`AddrList` error was swallowed silently. `buildDesiredLocalAddressSets` now
+reports whether the enumeration was COMPLETE (all `AddrList` family dumps
+succeeded). On an incomplete enumeration the reconcile still performs the
+adds (adding a key only ever widens the local set — always safe) but SKIPS
+the stale-key prune for that cycle and logs a warning; the next reconcile
+with a complete enumeration removes any genuinely stale keys. Pruning is
+therefore only ever performed against a known-complete desired set. This is
+the same fail-safe-reconcile posture used elsewhere: never act destructively
+on incomplete input. `userspace_local_v4`/`v6` are the only maps affected —
+the interface-NAT and config-derived local sets are snapshot-only and do not
+enumerate the kernel.
 
 ### 4. Kernel Never Learns ARP/NDP from XSK-Captured Packets
 
