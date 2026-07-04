@@ -152,49 +152,139 @@ func (m *Manager) GetOSPFNeighbors() ([]OSPFNeighbor, error) {
 // BGPPeerSummary represents a BGP peer in the summary.
 type BGPPeerSummary struct {
 	Neighbor string
-	AS       string
-	MsgRcvd  string
-	MsgSent  string
-	UpDown   string
-	State    string
-	PfxRcd   string
+	// AddressFamily is the AFI/SAFI the peer row belongs to
+	// (e.g. "ipv4-unicast", "ipv6-unicast"). A neighbor activated in
+	// more than one family produces one BGPPeerSummary per family, so
+	// this field disambiguates the otherwise-duplicate neighbor rows.
+	AddressFamily string
+	AS            string
+	MsgRcvd       string
+	MsgSent       string
+	UpDown        string
+	State         string
+	// PfxRcd is the count of prefixes received from the peer. FRR only
+	// tracks a non-zero value once the session reaches Established.
+	PfxRcd string
 }
 
-// GetBGPSummary queries FRR for BGP peer summary.
+// bgpSummaryFamilyJSON maps one AFI/SAFI object in the top level of
+// "show bgp summary json" (FRR keys the top level by camelCase AFI/SAFI
+// name — e.g. "ipv4Unicast", "ipv6Unicast" — each carrying a peers map).
+type bgpSummaryFamilyJSON struct {
+	RouterID string                 `json:"routerId"`
+	AS       int64                  `json:"as"`
+	VRFName  string                 `json:"vrfName"`
+	Peers    map[string]bgpPeerJSON `json:"peers"`
+}
+
+// bgpPeerJSON maps one peer object under a family's "peers" map. FRR
+// puts the real prefix-received count in "pfxRcd" (present, non-zero
+// once Established) and the session state string in "state" — the text
+// summary instead overloads a single "State/PfxRcd" column, which the
+// old scraper misread (it stored the pfxRcd digit as the State and never
+// populated PfxRcd). #3942.
+type bgpPeerJSON struct {
+	RemoteAs   int64  `json:"remoteAs"`
+	MsgRcvd    int64  `json:"msgRcvd"`
+	MsgSent    int64  `json:"msgSent"`
+	PeerUptime string `json:"peerUptime"`
+	State      string `json:"state"`
+	PfxRcd     int64  `json:"pfxRcd"`
+	PfxSnt     int64  `json:"pfxSnt"`
+}
+
+// GetBGPSummary queries FRR for the BGP peer summary via the structured
+// JSON output ("show bgp summary json") and parses it. JSON is used
+// instead of scraping the text table because the text table overloads a
+// single "State/PfxRcd" column and appends footer lines ("Total number
+// of neighbors N", blank/legend lines) that the old field-count scraper
+// misparsed as phantom peers with an empty PfxRcd. #3942.
 func (m *Manager) GetBGPSummary() ([]BGPPeerSummary, error) {
-	output, err := m.executor().Vtysh("show bgp summary")
+	output, err := m.executor().Vtysh("show bgp summary json")
 	if err != nil {
 		return nil, err
 	}
+	return parseBGPSummaryJSON(output)
+}
+
+// parseBGPSummaryJSON parses FRR's "show bgp summary json" output into
+// BGPPeerSummary entries, one per (address-family, neighbor). Output is
+// deterministic: AFI/SAFI keys and neighbor addresses are both sorted.
+// A non-JSON response (an older FRR "% BGP instance not found" banner, a
+// wedged vtysh) or an empty/peerless summary yields no peers and no
+// error — "no BGP peers" is a valid state on this observability path,
+// not a failure.
+func parseBGPSummaryJSON(data string) ([]BGPPeerSummary, error) {
+	data = strings.TrimSpace(data)
+	if data == "" {
+		return nil, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		// Not JSON at all — treat as "no peers" rather than surfacing a
+		// parse error on the show path.
+		return nil, nil
+	}
+
+	// Sort the AFI/SAFI keys for deterministic output.
+	afis := make([]string, 0, len(raw))
+	for k := range raw {
+		afis = append(afis, k)
+	}
+	sort.Strings(afis)
 
 	var peers []BGPPeerSummary
-	lines := strings.Split(output, "\n")
-	inTable := false
-	for _, line := range lines {
-		if strings.HasPrefix(line, "Neighbor") {
-			inTable = true
+	for _, afi := range afis {
+		var fam bgpSummaryFamilyJSON
+		if err := json.Unmarshal(raw[afi], &fam); err != nil {
+			// A non-family sibling value (e.g. {"warning": "..."}).
 			continue
 		}
-		if !inTable {
+		if len(fam.Peers) == 0 {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
+		// Sort neighbor addresses for deterministic output.
+		addrs := make([]string, 0, len(fam.Peers))
+		for a := range fam.Peers {
+			addrs = append(addrs, a)
 		}
-		p := BGPPeerSummary{
-			Neighbor: fields[0],
-			AS:       fields[2],
+		sort.Strings(addrs)
+
+		af := bgpAFILabel(afi)
+		for _, addr := range addrs {
+			pj := fam.Peers[addr]
+			peers = append(peers, BGPPeerSummary{
+				Neighbor:      addr,
+				AddressFamily: af,
+				AS:            strconv.FormatInt(pj.RemoteAs, 10),
+				MsgRcvd:       strconv.FormatInt(pj.MsgRcvd, 10),
+				MsgSent:       strconv.FormatInt(pj.MsgSent, 10),
+				UpDown:        pj.PeerUptime,
+				State:         pj.State,
+				PfxRcd:        strconv.FormatInt(pj.PfxRcd, 10),
+			})
 		}
-		if len(fields) >= 10 {
-			p.MsgRcvd = fields[3]
-			p.MsgSent = fields[4]
-			p.UpDown = fields[8]
-			p.State = fields[9]
-		}
-		peers = append(peers, p)
 	}
 	return peers, nil
+}
+
+// bgpAFILabel maps FRR's camelCase AFI/SAFI JSON key to a readable
+// hyphenated label; unknown keys are returned verbatim.
+func bgpAFILabel(key string) string {
+	switch key {
+	case "ipv4Unicast":
+		return "ipv4-unicast"
+	case "ipv6Unicast":
+		return "ipv6-unicast"
+	case "ipv4Multicast":
+		return "ipv4-multicast"
+	case "ipv6Multicast":
+		return "ipv6-multicast"
+	case "l2VpnEvpn":
+		return "l2vpn-evpn"
+	default:
+		return key
+	}
 }
 
 // BGPRoute represents a BGP route.
