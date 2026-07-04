@@ -472,25 +472,25 @@ mod mode_aware_segmentation_tests {
         let peer_ep: std::net::SocketAddr = "203.0.113.9:51820".parse().unwrap();
 
         let init_engine = WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: Some(peer_ep),
                 persistent_keepalive: 0,
                 allowed_ips: vec![peer_cidr.parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let resp_engine = WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
 

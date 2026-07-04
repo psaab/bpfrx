@@ -129,6 +129,16 @@ See the deploy backing table in
 - **Sync hold**: VRRP starts with `preempt=false`, released after bulk
   session sync (or 10s timeout); `preemptNowCh` triggers instant
   preemption.
+- **Address owner always preempts (#4116)**: an instance whose *configured*
+  priority is 255 (the IP address owner) preempts a lower-priority master
+  irrespective of the `no-preempt` flag or sync-hold suppression (RFC 5798
+  §6.1). `getPreempt()` and `shouldPreemptObservedMaster()` OR-in
+  `cfg.Priority == 255`, so an owner hearing a lower advert does NOT reset
+  its master-down timer (`handleBackupRx`) — the timer expires and the owner
+  reclaims MASTER. Keyed on the configured priority, this composes with the
+  owner-255 track-demotion exemption (`getPriority`, which never demotes 255)
+  and is a no-op for every non-owner (weight-based RETH priorities < 255), so
+  the #2082 sync-hold gate and ~60ms failover timing are unchanged.
 - **Heartbeat**: 200ms interval, threshold 5 (1s detection).
 
 ## Shutdown

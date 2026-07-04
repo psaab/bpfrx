@@ -95,25 +95,25 @@ fn install_session_same_peer_same_local_index_is_collision() {
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_priv,
+        local_private_key: peer_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
@@ -145,25 +145,25 @@ fn install_session_fresh_index_rekey_preserves_previous_demux() {
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_priv,
+        local_private_key: peer_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
@@ -188,25 +188,25 @@ fn install_session_second_rekey_evicts_dropped_session() {
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_priv,
+        local_private_key: peer_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
@@ -234,7 +234,7 @@ fn install_session_rejects_local_index_collision_across_peers() {
     let (peer_a_priv, peer_a_pub) = keypair();
     let (peer_b_priv, peer_b_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![
             WgPeerConfig {
@@ -242,37 +242,37 @@ fn install_session_rejects_local_index_collision_across_peers() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
         ],
     });
     let peer_a_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_a_priv,
+        local_private_key: peer_a_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let peer_b_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_b_priv,
+        local_private_key: peer_b_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let sa = make_session_for(&engine, peer_a_pub, &peer_a_engine, 0x1234_5678, 2);
@@ -295,25 +295,25 @@ fn encap_rejects_after_message_limit() {
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let resp = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_priv,
+        local_private_key: peer_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let mut init_hs = engine.build_initiator_handshake(&peer_pub).unwrap();
@@ -358,25 +358,25 @@ fn reconcile_peers_drains_dropped_peer_sessions_from_demux() {
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_priv,
+        local_private_key: peer_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     // Install two sessions on the peer (current + previous).
@@ -417,7 +417,7 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
     let (peer_a_priv, peer_a_pub) = keypair();
     let (peer_b_priv, peer_b_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![
             WgPeerConfig {
@@ -425,37 +425,37 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
         ],
     });
     let peer_a_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_a_priv,
+        local_private_key: peer_a_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let peer_b_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_b_priv,
+        local_private_key: peer_b_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let s_a = make_session_for(&engine, peer_a_pub, &peer_a_engine, 0xaaaa_0001, 2);
@@ -468,7 +468,7 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
-        preshared_key: [0u8; 32],
+        preshared_key: [0u8; 32].into(),
     }]);
     let by_index = engine.sessions_by_local_index.read().unwrap();
     assert!(
@@ -504,14 +504,14 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
     let (_peer_c_priv, peer_c_pub) = keypair();
     let _ = (peer_a_priv, peer_b_priv);
     let engine = Arc::new(WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_a_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     }));
     let stop = Arc::new(AtomicBool::new(false));
@@ -521,14 +521,14 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         },
         WgPeerConfig {
             pubkey: peer_c_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.2.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         },
     ];
     let config_orig = vec![WgPeerConfig {
@@ -536,7 +536,7 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-        preshared_key: [0u8; 32],
+        preshared_key: [0u8; 32].into(),
     }];
     let writer = {
         let engine = engine.clone();
@@ -634,25 +634,25 @@ fn install_session_serializes_with_reconcile_removal() {
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = Arc::new(WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     }));
     let peer_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_priv,
+        local_private_key: peer_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let cfg_with_peer = vec![WgPeerConfig {
@@ -660,7 +660,7 @@ fn install_session_serializes_with_reconcile_removal() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-        preshared_key: [0u8; 32],
+        preshared_key: [0u8; 32].into(),
     }];
     // Pre-build a batch of sessions off the hot path. Each one
     // gets a fresh local_index so installs never collide on the
@@ -796,25 +796,25 @@ fn encap_padded_plaintext_overflow_leaves_counter_and_buffer_untouched() {
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_priv,
+        local_private_key: peer_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: [0u8; 32],
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let session = make_session_for(&engine, peer_pub, &peer_engine, 0xdead_0001, 2);
@@ -867,7 +867,7 @@ fn peer_for_dest_lpm_selects_owning_peer() {
     let a_ep: std::net::SocketAddr = "203.0.113.1:51820".parse().unwrap();
     let b_ep: std::net::SocketAddr = "198.51.100.7:51820".parse().unwrap();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: local_priv,
+        local_private_key: local_priv.into(),
         listen_port: 51820,
         peers: vec![
             WgPeerConfig {
@@ -875,7 +875,7 @@ fn peer_for_dest_lpm_selects_owning_peer() {
                 endpoint: Some(a_ep),
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.1.0.0/16").unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
             WgPeerConfig {
                 pubkey: b_pub,
@@ -887,7 +887,7 @@ fn peer_for_dest_lpm_selects_owning_peer() {
                     ipnet::IpNet::from_str("10.2.0.0/16").unwrap(),
                     ipnet::IpNet::from_str("10.1.5.0/24").unwrap(),
                 ],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
         ],
     });
@@ -925,16 +925,16 @@ fn per_peer_psk_handshake_roundtrip() {
     let (resp_priv, resp_pub) = keypair();
     let psk = [0x5au8; 32];
 
-    let make = |local_priv, peer_pub, peer_psk: [u8; 32]| {
+    let make = |local_priv: [u8; 32], peer_pub, peer_psk: [u8; 32]| {
         WgEngine::new(WgEngineConfig {
-            local_private_key: local_priv,
+            local_private_key: local_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: peer_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
-                preshared_key: peer_psk,
+                preshared_key: peer_psk.into(),
             }],
         })
     };
@@ -980,4 +980,32 @@ fn per_peer_psk_handshake_roundtrip() {
             "a PSK mismatch must fail the msg2 AEAD"
         );
     }
+}
+
+#[test]
+fn wg_config_secret_carriers_are_zeroizing() {
+    // #4103 F12: the config carriers for the X25519 private key and the
+    // per-peer PSK must be `Zeroizing<[u8; 32]>` (matching the runtime
+    // copies — the engine's `local_private_key` and `PeerConfig`'s PSK) so
+    // a cloned/dropped WG config does not leave plaintext key material in
+    // freed heap/stack. Reverting either field back to a plain `[u8; 32]`
+    // makes these type-annotated bindings fail to compile (RED).
+    let cfg = WgEngineConfig {
+        local_private_key: [1u8; 32].into(),
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: [2u8; 32],
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+            preshared_key: [3u8; 32].into(),
+        }],
+    };
+    let priv_ref: &zeroize::Zeroizing<[u8; 32]> = &cfg.local_private_key;
+    let psk_ref: &zeroize::Zeroizing<[u8; 32]> = &cfg.peers[0].preshared_key;
+    assert_eq!(**priv_ref, [1u8; 32]);
+    assert_eq!(**psk_ref, [3u8; 32]);
+    // Clone preserves the Zeroizing wrapper (no plaintext copy escapes).
+    let cloned: zeroize::Zeroizing<[u8; 32]> = cfg.local_private_key.clone();
+    assert_eq!(*cloned, [1u8; 32]);
 }

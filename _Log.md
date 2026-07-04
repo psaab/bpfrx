@@ -1,3 +1,170 @@
+## 2026-07-04 — #4116: VRRP address owner (priority 255) always preempts (fable-163 F22)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the defect at HEAD (890b69ea3):
+    `getPreempt()` (pkg/vrrp/instance.go) returned `cfg.Preempt` verbatim,
+    so the `handleBackupRx` master-down-reset gate
+    (`if !getPreempt() || pkt.Priority >= pri`) reset the timer on EVERY
+    advert for a no-preempt owner → an address owner (priority 255,
+    no-preempt) that returned after a lower-priority peer took over stayed
+    BACKUP indefinitely though it OWNS the VIP (RFC 5798 §6.1 requires the
+    owner to preempt irrespective of the flag). The existing owner-255
+    exemption covered only track-down demotion (`getPriority`, track.go),
+    NOT the preempt case — F22 is the preempt case. FIX: force effective
+    preempt=true for the address owner at the two runtime preempt-decision
+    sites, keyed on the CONFIGURED priority (255): `getPreempt()` returns
+    `cfg.Preempt || cfg.Priority == 255`; `shouldPreemptObservedMaster()`
+    early-return becomes `if !preempt && priority != 255`. Added named const
+    `addressOwnerPriority = 255`. Composes with the track-exempt demotion
+    (owner is never demoted, so configured 255 is authoritative); no-op for
+    every non-owner (priorities < 255) so cluster RETH failover, the #2082
+    sync-hold gate, and ~60ms timing are unaffected. Tests
+    (instance_owner_preempt_test.go): getPreempt truth table + sync-hold
+    suppression, shouldPreemptObservedMaster owner-vs-nonowner, preemptNowCh
+    wiring, end-to-end reclaim via the master-down timer, non-owner
+    no-regression twin, owner-preempt-enabled unchanged. RED-on-revert
+    verified (5 owner tests FAIL on pre-fix instance.go: getPreempt=false,
+    state=BACKUP, timer reset). go test -race ./pkg/vrrp/ green; go build
+    ./..., vet, gofmt clean. Docs: critical-patterns.md,
+    feature-coverage.md.
+  - **File(s)**: pkg/vrrp/instance.go,
+    pkg/vrrp/instance_owner_preempt_test.go, docs/critical-patterns.md,
+    docs/feature-coverage.md, _Log.md
+## 2026-07-04 — #4117: ESP proposals fail closed on a dangling reference (fable-163 F24)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: LOW, security/ipsec/vsrx-parity. VERIFY-FIRST confirmed the
+    bug at HEAD: `resolveESPSettings` (`pkg/ipsec/ike.go`) only preserved
+    crypto intent for a dangling ESP-proposal reference when `pfsGroup > 0`
+    (the #2073 `aes256-sha256-modp<bits>` fallback); at `pfsGroup == 0` it
+    fell through to `return "default"`, and `policy.go:193` emits
+    `esp_proposals = %s` unconditionally — so a tolerant/peer-sync boot of a
+    config whose ipsec-policy references an UNDEFINED proposal with no PFS
+    silently negotiated strongSwan's built-in ESP suite instead of the
+    operator's cipher/integrity. Asymmetric vs the IKE path (#2270 SKIPs the
+    VPN). Fix: restructured `resolveESPSettings` to an ABSENT-vs-DANGLING
+    contract — `vpn.IPsecPolicy == ""` still returns `default` (legitimate,
+    the ONLY default path); ANY named-but-unresolved reference (dangling
+    proposal ref OR dangling policy ref) now emits a conservative FIXED suite
+    (`aes256-sha256`, plus `-modp<bits>` when PFS is set), never `default`.
+    Chose the fixed-suite fallback over the IKE-style whole-VPN skip for
+    parity with #2073 (which already emits the fallback for pfsGroup>0 rather
+    than skipping) — skipping only the no-PFS case would drop a no-PFS tunnel
+    while an identical with-PFS tunnel keeps a working fallback (availability
+    asymmetry). Also closed the sibling dangling-POLICY-reference hole (VPN
+    names an undefined ipsec-policy) which had the same silent-default
+    downgrade and no commit-time validator. RED-on-revert proven (3 tests go
+    RED when the fallback is restored to `default`). `go test ./pkg/ipsec/...
+    ./pkg/config/...` green, `go build ./...` clean, gofmt+vet clean.
+  - **File(s)**: pkg/ipsec/ike.go, pkg/ipsec/ipsec_test.go,
+    pkg/ipsec/README.md, _Log.md
+
+## 2026-07-04 — #4100: VRRPv3 IPv4 advert checksum RFC 5798 §5.2.8 pseudo-header (fable-163 F10)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: MEDIUM, vsrx-interop/HA. VERIFY-FIRST confirmed the bug at
+    HEAD: `pkg/vrrp/packet.go` marshalled+verified the IPv4 VRRPv3 checksum
+    over the VRRP message only (`onesComplementChecksum`, no pseudo-header),
+    while the IPv6 leg (`vrrpIPv6Checksum`) prepends the RFC-5798 pseudo-header
+    — `Marshal(false, srcIP, dstIP)` discarded the addresses on IPv4. A
+    conformant vSRX/Cisco/keepalived-v3 peer verifies IPv4 with the
+    pseudo-header → mutual advert rejection → dual-master split-brain on the
+    IPv4 VIP (latent in a pure-xpf cluster; surfaces on interop). Fix: added
+    `vrrpIPv4Checksum(src4, dst4, buf)` (pseudo-header = src 4B + dst 4B + zero
+    + protocol 112 + VRRP length 2B) mirroring the IPv6 helper; Marshal now
+    emits it (and requires src/dst on IPv4, like IPv6). Parse does
+    ROLLING-UPGRADE dual-accept: try the conformant pseudo-header checksum
+    first, fall back to the legacy no-pseudo-header checksum, so a new node
+    interoperates with BOTH a conformant peer and an old xpf node during an
+    upgrade; a corrupt checksum still fails both. Documented as a migration
+    aid (can tighten to pseudo-header-only later). RED-on-revert proven for
+    all three halves (parse pseudo-add / marshal pseudo-add / legacy
+    fallback). `go test -race ./pkg/vrrp/` green, `go build ./...` clean,
+    gofmt+vet clean.
+  - **File(s)**: pkg/vrrp/packet.go, pkg/vrrp/packet_checksum_test.go,
+    docs/vrrp-afpacket-receiver.md, _Log.md
+
+## 2026-07-04 — #4103 F12 fold: WgPeerConfig Debug compares PSK by reference (Copilot, PR #4123)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Copilot minor fold on PR #4123. WgPeerConfig's manual
+    Debug did `*self.preshared_key == WG_ZERO_PSK` for the PSK-unset
+    check. `==` already desugars to a by-reference `PartialEq::eq`, so no
+    real by-value copy occurred, but made the by-reference intent explicit
+    to align with F12 key hygiene: `&*self.preshared_key == &WG_ZERO_PSK`
+    (`engine.rs:197`). The other touched Debug impl (`WgEngineConfig`)
+    prints `<redacted>` and never derefs the key. The companion Copilot
+    comment (engine.rs:468 "borrowing config.peers after moving
+    config.local_private_key won't compile") is a confirmed FALSE POSITIVE
+    — Rust partial-move rules permit borrowing other fields after one is
+    moved; the crate builds and 3490 tests pass. cargo check --release
+    green; rustfmt clean on the changed line.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs, _Log.md
+
+## 2026-07-04 — #4103 F12: WG engine-config secret carriers zeroized (fable-163)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the carriers were non-zeroized:
+    `WgEngineConfig.local_private_key` and `WgPeerConfig.preshared_key`
+    were plain `[u8; 32]` under `#[derive(Clone)]`, while the RUNTIME
+    copies are `Zeroizing` (engine `local_private_key`, `PeerConfig`
+    PSK), and the `forwarding_build/wg.rs` build sites deref-copied the
+    Zeroizing source (`*p.preshared_key`, `*endpoint.wg_local_privkey`)
+    into the plaintext carrier — so every WG commit left a 32-byte X25519
+    private key + all PSKs in freed heap/stack. FIX: both fields →
+    `zeroize::Zeroizing<[u8; 32]>` (Clone preserved — Zeroizing is Clone);
+    build sites clone the Zeroizing source (no plaintext hop); `new()`
+    moves the Zeroizing carrier straight into the engine and uses
+    `*config.local_private_key` only for the transient `mul_base_clamped`
+    argument; `reconcile` derefs `*cfg.preshared_key` into
+    `PeerConfig::new` (which re-wraps in Zeroizing); WgPeerConfig manual
+    Debug derefs for the PSK-unset check; WgEngineConfig gains a manual
+    REDACTING Debug (a derived Debug on `Zeroizing<[u8;32]>` prints the
+    raw key). 159 test construction sites updated to `.into()` (the
+    `From<[u8;32]>` for Zeroizing — identity-safe if a site targeted a
+    different struct). RED-on-revert: `wg_config_secret_carriers_are_zeroizing`
+    type-annotated bindings fail to compile if the fields revert to
+    `[u8; 32]`.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+    userspace-dp/src/afxdp/forwarding_build/wg.rs,
+    userspace-dp/src/afxdp/wg/engine_tests.rs,
+    userspace-dp/src/afxdp/wg/tests.rs,
+    userspace-dp/src/afxdp/coordinator/wg_control.rs,
+    userspace-dp/src/afxdp/frame/wg.rs,
+    userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+    docs/wireguard-interop.md, _Log.md
+
+## 2026-07-04 — #4103 F5: WG responder TAI64N anti-replay high-water survives config-change engine rebuild (fable-163)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed F5 GENUINE. `populate_wg_engines`
+    (`forwarding_build/wg.rs`) reuses the whole engine `Arc` only when the
+    WG identity tuple is byte-identical (`wg_identity_unchanged` →
+    `wg_peers_eq` compares pubkey/allowed_ips/endpoint/keepalive/PSK). ANY
+    change to ANY peer field — or listen_port/privkey, add/remove a peer —
+    builds a fresh `WgEngine::new`, which starts from `PeerTable::empty()`
+    so every peer gets a fresh `Peer::new` with `greatest_tai64n = [0; 12]`.
+    The #1432 rebuild-seed only re-seeds the OUTGOING initiator clock
+    (`seed_tai64n_high_water`); the #4092 INCOMING per-peer responder
+    high-water had NO carry-over. So a benign commit (add allowed-ip, rotate
+    PSK, add a peer) reset every peer's responder high-water to 0 →
+    `check_and_update_tai64n(T0)` accepts a captured/replayed initiation.
+    The `reconcile_peers` reuse-by-pubkey logic is never exercised across a
+    rebuild (new engine starts empty). FIX: mirror the initiator plumbing
+    for the incoming side — `Peer::greatest_tai64n()` getter +
+    `seed_greatest_tai64n()` setter (max-only), engine
+    `greatest_tai64n_by_pubkey()` snapshot + `seed_greatest_tai64n()` seed,
+    and carry each SURVIVING peer's high-water forward in the rebuild branch
+    keyed by pubkey (new/changed pubkey starts fresh — a different identity,
+    matching kernel/wireguard-go). RED-on-revert: forwarding_build
+    integration test (add-allowed-ip → engine rebuilt → surviving peer
+    high-water == T_last not [0;12]) + wg-module unit test (carry-over then
+    replay `<= T_last` rejected, `>` accepted, new pubkey stays [0;12]).
+  - **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+    userspace-dp/src/afxdp/wg/engine.rs,
+    userspace-dp/src/afxdp/forwarding_build/wg.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs,
+    userspace-dp/src/afxdp/wg/tests.rs, docs/wireguard-interop.md, _Log.md
 ## 2026-07-04 — #4108: RBAC maintenance gate + system_action audit journal (fable-163 F21+F8)
 
 - **Timestamp**: 2026-07-04
@@ -32414,3 +32581,67 @@ top.
   - **File(s)**: userspace-dp/src/session/lookup.rs,
     userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
     userspace-dp/src/session/README.md, _Log.md
+  - **Action**: #4122 — fail-closed fabric gRPC allowlist interceptor. The
+    cluster fabric listener (`RunFabricListener`, `pkg/grpcapi/server.go`)
+    registered the identical full 48-RPC `BpfrxService` as the loopback
+    `Run()` listener, guarded only by `configLockInterceptor` (a stale-lock
+    reaper, not auth). Since the loopback listener binds 127.0.0.1 and the
+    fabric listener binds the sync/fabric IP, the fabric listener is the ONLY
+    network-exposed gRPC surface — exposing SystemAction reboot/halt/
+    power-off/zeroize + Commit/Delete/Rollback UNAUTH on the fabric IP. Fix:
+    added a default-deny allowlist interceptor PAIR
+    (`fabricAllowlistUnaryInterceptor` / `fabricAllowlistStreamInterceptor`)
+    on the FABRIC listener only, chained with the existing
+    `configLockInterceptor` via `ChainUnaryInterceptor`/`ChainStreamInterceptor`.
+    Allowlist = exactly the peer-proxied RPCs (verified against every
+    `dialPeer()->NewBpfrxServiceClient` call site): GetStatus, GetSessions,
+    GetSessionSummary, GetZonePairSummary, ShowText, ClearSessions (unary) +
+    MonitorInterface (stream). SystemAction DECISION = NESTED-ACTION (not
+    blanket exclude): it multiplexes fabric-safe cluster-failover with
+    destructive actions, so `isFabricSafeSystemAction` permits ONLY the two
+    proxied cross-node forms (`cluster-failover-data:node<N>`,
+    `cluster-failover:<rg>:node<N>`) and denies zeroize/reboot/halt/power-off.
+    Chose nested over exclude because excluding SystemAction would make a
+    cross-node `request chassis cluster failover ... node <peer>` return
+    PermissionDenied when the initiating node proxies to the peer's fabric
+    listener — a shipped HA operator workflow regression. Loopback `Run()`
+    listener UNCHANGED (127.0.0.1 trusted, full service). RED-on-revert:
+    weakening the fix (SystemAction added to the plain allowlist) makes
+    zeroize/reboot reachable and fails the nested-gate + set-guard tests;
+    committed fix GREEN. `go test ./pkg/grpcapi/...` green; go build ./...,
+    go vet, gofmt clean. FLAG: touches the fabric proxy path — behavior is
+    PRESERVED for the two failover forms (nested-action), so no failover
+    regression, but test-failover is still warranted hygiene before terminal.
+  - **File(s)**: pkg/grpcapi/server.go,
+    pkg/grpcapi/server_fabric_allowlist_4122_test.go, docs/architecture.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4122 fold — Copilot finding: the nested-action fabric
+    SystemAction gate (`isFabricSafeSystemAction`) used a loose
+    HasPrefix/Contains match that admitted syntactically invalid node targets
+    (`cluster-failover:1:node99`, `cluster-failover:garbage:node1`,
+    `cluster-failover:1:node1:node2`) past the interceptor. The handler then
+    made an OUTBOUND proxy dial (targetNode != local) BEFORE rejecting the
+    malformed action — an avoidable operational/DoS vector on the unauth
+    fabric surface (zeroize was already backstopped by the exact-case switch;
+    this is the distinct proxy-dial-amplification vector). Fix: added
+    `parseProxiedFailoverAction` (server.go) — the SSOT for a well-formed
+    peer-proxied cross-node failover: strict `strconv.Atoi` on rgID + nodeID
+    and `IsSupportedClusterNodeID` (0/1) range check on the node, fail-closed
+    (ok=false) for any malformed/out-of-range/non-failover action or trailing
+    garbage. `isFabricSafeSystemAction` now delegates to it. The parse mirrors
+    the handler's own Atoi + IsSupportedClusterNodeID validation
+    (server_diag.go) so gate and handler agree; the interceptor admits a
+    strict SUBSET of what the handler accepts, so no legit proxied failover is
+    denied. Did NOT refactor the handler's own parse (preserves its distinct
+    InvalidArgument messages + avoids test-failover-critical churn) — the
+    interceptor is the fail-closed backstop for the network-exposed surface.
+    Tests: `TestParseProxiedFailoverAction` pins the SSOT parse; the
+    nested-gate test now asserts malformed/out-of-range suffixes are DENIED at
+    the interceptor (handler not invoked). RED-on-revert verified: restoring
+    the loose gate admits node99/nodeX/node1:node2 past the interceptor and
+    fails the tests. go test -count=1 ./pkg/grpcapi/... green; go build ./...,
+    vet, gofmt clean.
+  - **File(s)**: pkg/grpcapi/server.go,
+    pkg/grpcapi/server_fabric_allowlist_4122_test.go, _Log.md
