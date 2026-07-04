@@ -30,6 +30,34 @@
   - **File(s)**: pkg/vrrp/instance.go,
     pkg/vrrp/instance_owner_preempt_test.go, docs/critical-patterns.md,
     docs/feature-coverage.md, _Log.md
+## 2026-07-04 — #4117: ESP proposals fail closed on a dangling reference (fable-163 F24)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: LOW, security/ipsec/vsrx-parity. VERIFY-FIRST confirmed the
+    bug at HEAD: `resolveESPSettings` (`pkg/ipsec/ike.go`) only preserved
+    crypto intent for a dangling ESP-proposal reference when `pfsGroup > 0`
+    (the #2073 `aes256-sha256-modp<bits>` fallback); at `pfsGroup == 0` it
+    fell through to `return "default"`, and `policy.go:193` emits
+    `esp_proposals = %s` unconditionally — so a tolerant/peer-sync boot of a
+    config whose ipsec-policy references an UNDEFINED proposal with no PFS
+    silently negotiated strongSwan's built-in ESP suite instead of the
+    operator's cipher/integrity. Asymmetric vs the IKE path (#2270 SKIPs the
+    VPN). Fix: restructured `resolveESPSettings` to an ABSENT-vs-DANGLING
+    contract — `vpn.IPsecPolicy == ""` still returns `default` (legitimate,
+    the ONLY default path); ANY named-but-unresolved reference (dangling
+    proposal ref OR dangling policy ref) now emits a conservative FIXED suite
+    (`aes256-sha256`, plus `-modp<bits>` when PFS is set), never `default`.
+    Chose the fixed-suite fallback over the IKE-style whole-VPN skip for
+    parity with #2073 (which already emits the fallback for pfsGroup>0 rather
+    than skipping) — skipping only the no-PFS case would drop a no-PFS tunnel
+    while an identical with-PFS tunnel keeps a working fallback (availability
+    asymmetry). Also closed the sibling dangling-POLICY-reference hole (VPN
+    names an undefined ipsec-policy) which had the same silent-default
+    downgrade and no commit-time validator. RED-on-revert proven (3 tests go
+    RED when the fallback is restored to `default`). `go test ./pkg/ipsec/...
+    ./pkg/config/...` green, `go build ./...` clean, gofmt+vet clean.
+  - **File(s)**: pkg/ipsec/ike.go, pkg/ipsec/ipsec_test.go,
+    pkg/ipsec/README.md, _Log.md
 
 ## 2026-07-04 — #4100: VRRPv3 IPv4 advert checksum RFC 5798 §5.2.8 pseudo-header (fable-163 F10)
 
