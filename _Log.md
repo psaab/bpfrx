@@ -1,3 +1,51 @@
+## 2026-07-03 — #3965: ReadPolicyCounters was O(P·(P+C)) under the policy mutex → every Prometheus scrape stalled + starved commit/apply at scale
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-073 (MEDIUM, perf/scalability). The
+    Prometheus `xpf_policy_hits_total` collector
+    (`pkg/api/metrics_counters.go collectPolicyCounters`) and the REST
+    `GET /api/v1/security/policies` inventory
+    (`pkg/api/security.go policiesHandler`) read per-policy hit counters by
+    looping the single-policy `dp.ReadPolicyCounters(policyID)`. Each call
+    rebuilt the whole ruleID->counter index (O(C)) and rescanned the config
+    (O(P)) UNDER the userspace dataplane's policy mutex `m.mu`, so a scrape
+    of P policies was O(P·(P+C)) with `m.mu` held the entire time. On a
+    firewall with hundreds–thousands of policies every scrape (~15s) stalled
+    for seconds AND starved every other `m.mu` user — commit/apply and
+    session classification — for the duration.
+  - **Fix**: new `Manager.ReadAllPolicyCounters(cfg)`
+    (`pkg/dataplane/userspace/policycounters.go`) snapshots the
+    helper-published counter slice under ONE brief lock, releases it, then
+    builds the ruleID->counter index ONCE and walks the config ONCE outside
+    the lock — O(P+C), lock held only for the copy. New
+    `dpuserspace.NewPolicyCounterReader(dp, cfg, fallback)` wraps that bulk
+    snapshot behind a per-policy reader closure: when the dataplane provides
+    the bulk snapshot (the real userspace Manager) it does O(1) map lookups;
+    otherwise (test fakes / retired eBPF) it returns the per-policy
+    `fallback` unchanged. The two `pkg/api` callers now build one reader per
+    read and look each policy up through it. The retired bpfShim
+    policy_counters array is not consulted (never incremented in userspace
+    mode). Counter values, the skip-and-bump (#3345/#3408) contract, and the
+    REST HTTP-500 degraded-read contract are all preserved.
+  - **Tests**: `pkg/dataplane/userspace/policycounters_bulk_test.go` —
+    (1) correctness: the bulk read matches the single ReadPolicyCounters for
+    zone-pair, global, and default-sentinel handles, and an unpublished
+    policy is absent (same skip/error signal); (2) O(P+C) RED-on-revert:
+    1024 policies build the index EXACTLY ONCE (the per-policy read builds it
+    1024×); (3) snapshot-and-release RED-on-revert: the policy mutex is free
+    during resolution (a resolve-phase observer's `TryLock` succeeds).
+    Verified RED-on-revert: the naive "hold-lock + rebuild-per-policy" form
+    fails tests (2) and (3). `go test ./pkg/dataplane/userspace/ ./pkg/api/`
+    green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/dataplane/userspace/policycounters.go,
+    pkg/dataplane/userspace/policycounters_bulk_test.go,
+    pkg/api/metrics_counters.go, pkg/api/security.go, pkg/api/README.md,
+    _Log.md
+  - **Scope note**: the gRPC text (`show security policies hit-count`) and
+    interactive CLI surfaces share the same per-policy loop but are
+    operator-triggered (not the recurring 15s scrape). They keep the
+    per-policy read; `NewPolicyCounterReader` makes their later adoption a
+    one-line change if desired.
 ## 2026-07-03 — #3967: SNMP agent / trap-groups were start-once-at-boot → a day-2 commit that enabled SNMP, added a community/trap target, or disabled SNMP sat inert until a daemon restart
 
 - **Timestamp**: 2026-07-03
