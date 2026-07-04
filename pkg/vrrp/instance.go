@@ -1888,7 +1888,7 @@ func (vi *vrrpInstance) garpSendAllowed(force bool, nowNanos int64) bool {
 // sender (#2152) without performing real AF_PACKET I/O.
 var arpProbeFn = cluster.SendARPProbe
 
-// gatewayProbeTarget computes the supplementary gateway-probe target for an
+// GatewayProbeTarget computes the supplementary gateway-probe target for an
 // IPv4 VIP subnet: the first usable host address (network address + 1), which
 // is the most common gateway address. The second return value reports whether
 // a sensible target exists; when it is false the caller MUST skip the
@@ -1910,7 +1910,12 @@ var arpProbeFn = cluster.SendARPProbe
 // OUTSIDE the subnet (.16-.31) and the probe went to a foreign address.
 // Computing network+1 from the masked CIDR keeps the target inside the subnet
 // for every prefix length.
-func gatewayProbeTarget(ipNet *net.IPNet) (net.IP, bool) {
+//
+// Exported as the single source of truth for the gateway-probe target so the
+// daemon's direct-mode (private-rg-election / no-reth-vrrp) GARP path in
+// pkg/daemon reuses the identical derivation instead of re-deriving the
+// forced-.1 target that #2377 removed here (#3922).
+func GatewayProbeTarget(ipNet *net.IPNet) (net.IP, bool) {
 	ip4 := ipNet.IP.To4()
 	if ip4 == nil {
 		return nil, false
@@ -1935,7 +1940,7 @@ func gatewayProbeTarget(ipNet *net.IPNet) (net.IP, bool) {
 // Uses burst mode: one immediate pair then background follow-ups at 50ms intervals.
 // After each IPv4 GARP burst, also sends a standard ARP probe to the subnet's
 // first usable host (network address + 1), the most common gateway address
-// (see gatewayProbeTarget; skipped on /31 and /32). Some routers ignore
+// (see GatewayProbeTarget; skipped on /31 and /32). Some routers ignore
 // gratuitous ARP but always update their ARP cache when they receive a
 // standard ARP Request with the VIP as the source address.
 //
@@ -1977,10 +1982,10 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 			// Probe the first usable host (network address + 1) of the
 			// VIP subnet — this is the most common gateway address. The
 			// ARP Request's source IP/MAC forces the gateway to update its
-			// ARP cache for our VIP. gatewayProbeTarget returns ok=false on
+			// ARP cache for our VIP. GatewayProbeTarget returns ok=false on
 			// /31 and /32, where no in-subnet gateway host exists; the
 			// broadcast GARP burst above still fires (#2377).
-			gwIP, ok := gatewayProbeTarget(ipNet)
+			gwIP, ok := GatewayProbeTarget(ipNet)
 			if ok && !gwIP.Equal(ip.To4()) {
 				// Send the probe with the VIP as the ARP sender so the
 				// gateway re-binds VIP -> our (new) MAC, not the primary
