@@ -98,75 +98,100 @@ func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authM
 // resolveESPSettings resolves the ESP (Phase 2) proposal string and lifetime
 // from the VPN's IPsec policy chain.
 func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, int) {
-	espProposals := "default"
-	pfsGroup := 0
-	if vpn.IPsecPolicy != "" {
-		if ipsecPol, ok := cfg.Policies[vpn.IPsecPolicy]; ok {
-			pfsGroup = ipsecPol.PFSGroup
-			// #3904: `proposals [ p1 p2 ]` offers every listed ESP proposal.
-			// Build each resolvable reference (the policy-level PFS group
-			// applies to all) and comma-join. An empty list falls back to a
-			// proposal named after the policy, as before.
-			propRefs := ipsecPol.Proposals
-			if len(propRefs) == 0 {
-				propRefs = []string{vpn.IPsecPolicy}
-			}
-			var built []string
-			var firstLifetime int
-			for _, propRef := range propRefs {
-				if prop, ok := cfg.Proposals[propRef]; ok {
-					if len(built) == 0 {
-						firstLifetime = prop.LifetimeSeconds
-					}
-					built = append(built, buildESPProposal(prop, pfsGroup))
-				}
-			}
-			if len(built) > 0 {
-				return strings.Join(built, ","), firstLifetime
-			}
-			// #2073: the IPsec policy resolves but its proposal reference
-			// does not. The commit-time strict validator
-			// (validateIPsecPolicyProposalReferencesStrict) hard-rejects
-			// this for new operator edits, so this branch is only reached
-			// on a tolerant-path boot of an already-persisted or
-			// peer-synced config (where the validator downgraded to a
-			// warning so the node still boots). Do NOT silently drop a
-			// configured perfect-forward-secrecy group by falling through
-			// to bare "default" (which has no modp term): carry the
-			// configured PFS group on a conservative fallback proposal so
-			// PFS is still negotiated. A non-AEAD (CBC) ESP transform
-			// requires an integrity algorithm, so the fallback includes
-			// both a cipher and integrity in addition to the modp term. The
-			// string is built directly with swanctl's canonical keyword
-			// spellings (aes256 / sha256 / modp<bits>). This is now the
-			// same integrity keyword buildESPProposal produces —
-			// normalizeAuthAlg maps hmac-sha-256-128 to the strongSwan base
-			// keyword "sha256" (#3851), not the invalid dash-stripped
-			// "sha256128" that strongSwan's proposal parser rejects (its
-			// keyword table has only "sha256"/"sha2_256" for
-			// AUTH_HMAC_SHA2_256_128). This fallback keeps the direct
-			// spelling because the proposal reference dangles (there is no
-			// proposal object to hand to buildESPProposal), not because the
-			// builder is unsafe.
-			//
-			// formatDHGroup renders the PFS group with its canonical
-			// swanctl keyword: modp<bits> for the MODP groups
-			// (1/2/5/14/15/16/...) and the ECP/curve spellings for the
-			// elliptic-curve groups (19->ecp256, 20->ecp384, ...). This
-			// fallback uses the same renderer as the normal-path builders,
-			// so the #2392 ECP fix applies here too — group 19/20 no longer
-			// emits the strongSwan-invalid modp256/modp384 token.
-			if pfsGroup > 0 {
-				slog.Warn("ipsec policy references undefined proposal; "+
-					"preserving configured PFS group on fallback proposal",
-					"policy", vpn.IPsecPolicy, "proposal", strings.Join(propRefs, ","),
-					"pfs_group", pfsGroup)
-				return fmt.Sprintf("aes256-sha256-%s", formatDHGroup(pfsGroup)), 0
-			}
-		} else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
-			return buildESPProposal(prop, 0), prop.LifetimeSeconds
-		}
+	// ABSENT vs DANGLING (#4117). A VPN that names NO ipsec-policy at all
+	// legitimately wants strongSwan's compiled-in "default" ESP suite — the
+	// operator made no crypto choice, so the built-in default is their
+	// explicit choice and nothing dangles. This is the ONLY path that emits
+	// esp_proposals = default. A NAMED-but-unresolved (dangling) reference
+	// must NEVER fall through to it (see the fail-closed fallback below).
+	if vpn.IPsecPolicy == "" {
+		return "default", 0
 	}
+
+	pfsGroup := 0
+	if ipsecPol, ok := cfg.Policies[vpn.IPsecPolicy]; ok {
+		pfsGroup = ipsecPol.PFSGroup
+		// #3904: `proposals [ p1 p2 ]` offers every listed ESP proposal.
+		// Build each resolvable reference (the policy-level PFS group
+		// applies to all) and comma-join. An empty list falls back to a
+		// proposal named after the policy, as before.
+		propRefs := ipsecPol.Proposals
+		if len(propRefs) == 0 {
+			propRefs = []string{vpn.IPsecPolicy}
+		}
+		var built []string
+		var firstLifetime int
+		for _, propRef := range propRefs {
+			if prop, ok := cfg.Proposals[propRef]; ok {
+				if len(built) == 0 {
+					firstLifetime = prop.LifetimeSeconds
+				}
+				built = append(built, buildESPProposal(prop, pfsGroup))
+			}
+		}
+		if len(built) > 0 {
+			return strings.Join(built, ","), firstLifetime
+		}
+		// Dangling proposal reference: the policy resolves but none of its
+		// proposal references do. Fall through to the conservative fixed
+		// fallback below — never bare "default".
+	} else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
+		// Legacy form: the ipsec-policy value is itself the NAME of a
+		// defined ESP proposal (no policy object). Render it directly.
+		return buildESPProposal(prop, 0), prop.LifetimeSeconds
+	}
+	// else: dangling POLICY reference — vpn.IPsecPolicy names neither a
+	// defined ipsec-policy nor a defined ESP proposal. Fail closed below.
+
+	// #4117 / #2073: a NAMED ipsec-policy reference did not resolve — either
+	// the policy is undefined, or the policy resolves but its proposal
+	// reference dangles. The commit-time strict validators
+	// (validateIPsecPolicyProposalReferencesStrict) hard-reject this for new
+	// operator edits, so this branch is only reached on a tolerant-path boot
+	// of an already-persisted or peer-synced config (where the validator
+	// downgraded to a warning so the node still boots).
+	//
+	// Do NOT fall through to bare "default" (strongSwan's compiled-in ESP
+	// suite): a NAMED reference carries operator crypto intent, and
+	// substituting the built-in default silently WEAKENS ESP — the same
+	// silent-downgrade class the IKE (Phase-1) path fails closed on (#2270).
+	// Emit a conservative FIXED suite instead: aes256-sha256, a strong known
+	// cipher+integrity pair, carrying the configured perfect-forward-secrecy
+	// group when one is set. A non-AEAD (CBC) ESP transform requires an
+	// integrity algorithm, so the fallback always pairs a cipher with an
+	// integrity alg (and a modp term when PFS is configured). The string is
+	// built directly with swanctl's canonical keyword spellings (aes256 /
+	// sha256 / modp<bits>): "sha256" is the strongSwan base keyword
+	// normalizeAuthAlg maps hmac-sha-256-128 to (#3851), not the invalid
+	// dash-stripped "sha256128" its proposal parser rejects. formatDHGroup
+	// renders the PFS group with its canonical swanctl keyword — modp<bits>
+	// for the MODP groups and the ECP/curve spellings for the elliptic-curve
+	// groups (19->ecp256, 20->ecp384, ...) — so the #2392 ECP fix applies
+	// here too. Direct spelling is used because the reference dangles (there
+	// is no proposal object to hand to buildESPProposal), not because the
+	// builder is unsafe.
+	//
+	// #4117 chose the conservative fixed fallback over the IKE-style
+	// whole-VPN SKIP for ESP parity with #2073, which already emits this
+	// fallback for the pfsGroup > 0 dangling case (with tests asserting the
+	// suite is EMITTED, not skipped). Skipping only when pfsGroup == 0 would
+	// fracture that: a no-PFS dangling config would lose its tunnel entirely
+	// while an otherwise-identical with-PFS config keeps a working fallback
+	// tunnel — a surprising availability asymmetry driven solely by whether
+	// PFS happened to be configured. The tolerant/peer-sync boot path's
+	// intent is to keep an already-persisted tunnel alive with strong,
+	// known crypto rather than drop it; this fallback honours that intent
+	// uniformly. IKE fails closed instead because it has no equivalent
+	// strong fixed suite to offer.
+	espProposals := "aes256-sha256"
+	if pfsGroup > 0 {
+		espProposals = fmt.Sprintf("aes256-sha256-%s", formatDHGroup(pfsGroup))
+	}
+	slog.Warn("ipsec policy reference does not resolve; emitting a "+
+		"conservative fixed ESP suite instead of the strongSwan default "+
+		"(a dangling reference must not silently weaken ESP crypto)",
+		"policy", vpn.IPsecPolicy, "esp_proposals", espProposals,
+		"pfs_group", pfsGroup)
 	return espProposals, 0
 }
 
