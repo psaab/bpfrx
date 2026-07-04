@@ -38,8 +38,22 @@ func NewDB(dir string) (*DB, error) {
 	// entry itself must survive power loss, or a commit that reported
 	// success can vanish with the whole directory. WriteFileDurable
 	// only fsyncs .configdb (the file's parent), not /etc/xpf.
-	if err := fsatomic.MkdirAllDurable(dir, 0755); err != nil {
+	//
+	// Owner-only 0700 (#4056): this directory holds master.key plus the
+	// active/candidate/rollback config DB — every file that may carry a
+	// cleartext IKE PSK / auth key when master-password is not set. It is
+	// a dedicated, xpf-owned subdirectory, so 0700 leaks nothing an
+	// operator needs. The FILES themselves are 0600 (writeTreeMarked); the
+	// dir mode is defense-in-depth so a non-owner cannot even enumerate
+	// the slot names.
+	if err := fsatomic.MkdirAllDurable(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
+	}
+	// MkdirAllDurable does not chmod an already-existing directory, so an
+	// upgrade from a pre-#4056 build inherits the old 0755. Enforce 0700
+	// here — the daemon owns the dir, so this is idempotent and cheap.
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, fmt.Errorf("restrict db dir perms: %w", err)
 	}
 	// Sweep temp files leaked by a crash mid-write (#1894). fsatomic
 	// names its temps ".<base>.tmp-<random>", so a daemon killed between
@@ -203,7 +217,13 @@ func (db *DB) writeTreeMarked(path string, tree *config.ConfigTree, committed bo
 	// committed stamps the #1922 step-0 marker.
 	data = wrapEnvelope(data, db.writerVersion, committed)
 
-	if err := fsatomic.WriteFileDurable(path, data, 0644); err != nil {
+	// Owner-only 0600 (#4056): active.json / candidate.json /
+	// rollback.N.json carry the full config, including secret leaves (IKE
+	// PSK, WireGuard/auth keys, SNMP community). When master-password is
+	// set the body is AES-GCM encrypted, but when it is not the secrets are
+	// cleartext — either way the DB must not be world-readable. The daemon
+	// runs as the owner, so 0600 does not affect read-back.
+	if err := fsatomic.WriteFileDurable(path, data, 0600); err != nil {
 		return fmt.Errorf("persist %s: %w", path, err)
 	}
 	return nil
