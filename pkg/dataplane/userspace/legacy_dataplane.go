@@ -457,6 +457,17 @@ func (a *LegacyDataPlaneAdapter) Status() (ProcessStatus, error) {
 	return m.Status()
 }
 
+// CachedStatus returns the last control-socket-captured ProcessStatus
+// without issuing a new request (#3970). Returns ok=false when the
+// manager is unavailable or no status has been captured yet.
+func (a *LegacyDataPlaneAdapter) CachedStatus() (ProcessStatus, bool) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return ProcessStatus{}, false
+	}
+	return m.CachedStatus()
+}
+
 func (a *LegacyDataPlaneAdapter) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	m, err := a.managerOrErr()
 	if err != nil {

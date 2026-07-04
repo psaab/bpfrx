@@ -3,7 +3,121 @@ package fwdstatus
 import (
 	"testing"
 	"time"
+
+	"github.com/psaab/xpf/pkg/dataplane/userspace"
 )
+
+// countingAccessor is a fwdstatus.DataPlaneAccessor that also exposes
+// both Status() and CachedStatus(), counting how many times each is
+// invoked. Used to prove the Sampler reads worker telemetry off the
+// cached status (no control-socket request) and never issues its own
+// Status() poll (#3970).
+type countingAccessor struct {
+	status       userspace.ProcessStatus
+	statusCalls  int // Status() → control-socket request (must stay 0)
+	cachedCalls  int // CachedStatus() → cache read (no control socket)
+	cachedHasVal bool
+}
+
+func (c *countingAccessor) IsLoaded() bool          { return true }
+func (c *countingAccessor) GetMapStats() []MapStats { return nil }
+
+func (c *countingAccessor) Status() (userspace.ProcessStatus, error) {
+	c.statusCalls++
+	return c.status, nil
+}
+
+func (c *countingAccessor) CachedStatus() (userspace.ProcessStatus, bool) {
+	c.cachedCalls++
+	if !c.cachedHasVal {
+		return userspace.ProcessStatus{}, false
+	}
+	return c.status, true
+}
+
+// fixedProcReader returns a valid /proc/self/stat so sample() reaches
+// the worker-telemetry path instead of dropping the sample early.
+type fixedProcReader struct{}
+
+func (fixedProcReader) ReadSelfStat() (ProcSelfStat, error) {
+	return ProcSelfStat{UtimeTicks: 10, StimeTicks: 5, StartTimeTicks: 1000}, nil
+}
+func (fixedProcReader) ReadSelfStatm() (ProcSelfStatm, error) { return ProcSelfStatm{}, nil }
+func (fixedProcReader) ReadStat() (ProcStat, error)           { return ProcStat{BootTime: 1}, nil }
+func (fixedProcReader) ReadMemInfo() (ProcMemInfo, error) {
+	return ProcMemInfo{MemTotalBytes: 1 << 30}, nil
+}
+func (fixedProcReader) ReadCgroupMemoryMax() (uint64, error) { return 0, nil }
+
+// The Sampler MUST read worker telemetry from the cached status the
+// primary 1 Hz poll already fetched, and MUST NOT issue its own
+// Status() control-socket request (#3970). This goes RED on revert:
+// reverting the Sampler to call Status() flips statusCalls from 0 to
+// N — a second redundant 1 Hz request (2/s total) on the shared
+// control socket.
+func TestSamplerConsumesCachedStatusNoControlSocketPoll(t *testing.T) {
+	acc := &countingAccessor{
+		status: userspace.ProcessStatus{
+			PID: 4242,
+			WorkerRuntime: []userspace.WorkerRuntimeStatus{
+				{ThreadCPUNS: 100, WallNS: 200},
+				{ThreadCPUNS: 300, WallNS: 400},
+			},
+		},
+		cachedHasVal: true,
+	}
+	s := NewSampler(acc, fixedProcReader{})
+
+	const ticks = 5
+	base := time.Now()
+	for i := 0; i < ticks; i++ {
+		s.sample(base.Add(time.Duration(i) * time.Second))
+	}
+
+	if acc.statusCalls != 0 {
+		t.Fatalf("Sampler issued %d Status() control-socket request(s); want 0 "+
+			"(worker telemetry must come from the shared cached status, #3970)",
+			acc.statusCalls)
+	}
+	if acc.cachedCalls != ticks {
+		t.Errorf("CachedStatus() called %d times; want %d (once per sample)",
+			acc.cachedCalls, ticks)
+	}
+
+	// The fwdstatus worker data must still be populated from the shared
+	// poll: the newest ring sample carries the summed worker counters.
+	snap := s.Snapshot()
+	if len(snap.Samples) != ticks {
+		t.Fatalf("snapshot has %d samples; want %d", len(snap.Samples), ticks)
+	}
+	newest := snap.Samples[len(snap.Samples)-1]
+	if newest.workerThreadNs != 400 || newest.workerWallNs != 600 {
+		t.Errorf("worker counters not populated from cached status: "+
+			"thread=%d wall=%d; want thread=400 wall=600",
+			newest.workerThreadNs, newest.workerWallNs)
+	}
+}
+
+// On a cache miss (helper not yet polled) the Sampler holds worker
+// counters at their previous values and still issues NO Status()
+// control-socket request.
+func TestSamplerCacheMissHoldsCountersNoPoll(t *testing.T) {
+	acc := &countingAccessor{cachedHasVal: false}
+	s := NewSampler(acc, fixedProcReader{})
+	s.sample(time.Now())
+
+	if acc.statusCalls != 0 {
+		t.Fatalf("Sampler issued %d Status() request(s) on cache miss; want 0", acc.statusCalls)
+	}
+	snap := s.Snapshot()
+	if len(snap.Samples) != 1 {
+		t.Fatalf("snapshot has %d samples; want 1", len(snap.Samples))
+	}
+	if snap.Samples[0].workerThreadNs != 0 || snap.Samples[0].workerWallNs != 0 {
+		t.Errorf("cache miss should hold worker counters at zero, got thread=%d wall=%d",
+			snap.Samples[0].workerThreadNs, snap.Samples[0].workerWallNs)
+	}
+}
 
 // buildSnapshot constructs a deterministic snapshot for testing
 // window lookups. Samples are 1s apart ending at `now`.
@@ -31,8 +145,8 @@ func TestComputeCPUWindows_Populated(t *testing.T) {
 	// Worker: 2 workers; active = 400 Mns per worker-second = 40%.
 	now := time.Now()
 	snap := buildSnapshot(now, 400,
-		500_000_000,          // daemonRate: 500 Mns per sec = 50%/core
-		800_000_000,          // activeRate: 800 Mns/total-sec → per 2 workers = 400 Mns/worker/sec = 40%
+		500_000_000, // daemonRate: 500 Mns per sec = 50%/core
+		800_000_000, // activeRate: 800 Mns/total-sec → per 2 workers = 400 Mns/worker/sec = 40%
 		2)
 
 	dPct, wPct, dValid, wValid := computeCPUWindows(snap)
@@ -166,7 +280,7 @@ func TestFindSampleAtOrBefore(t *testing.T) {
 		{base.Add(-1 * time.Second), -1}, // before all
 		{base.Add(0 * time.Second), 0},   // exact oldest
 		{base.Add(1500 * time.Millisecond), 1},
-		{base.Add(3 * time.Second), 3}, // exact newest
+		{base.Add(3 * time.Second), 3},  // exact newest
 		{base.Add(10 * time.Second), 3}, // after all → newest
 	}
 	for _, c := range cases {

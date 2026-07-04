@@ -30,6 +30,19 @@ root `pkg/dataplane` package, `pkg/cli`, or `pkg/grpcapi`.
   its own ring buffer and timer goroutine started via
   `Sampler.Start(ctx)`. The renderer consumes already-windowed
   values from the Sampler.
+- The Sampler reads worker telemetry off the **cached** ProcessStatus
+  (`DataPlaneAccessor.CachedStatus()`), NOT its own `Status()` call
+  (#3970). The userspace manager's primary 1 Hz status poll
+  (`statusLoop`) already fetches full `ProcessStatus` over the shared
+  control socket every second and caches it; the Sampler consumes that
+  cache so it adds **zero** control-socket traffic. A second periodic
+  `Status()` here would double the status rate (2/s) on the socket
+  shared with session installs and starve them during bulk sync
+  (CLAUDE.md "Control socket contention"). On a cache miss (helper not
+  yet polled) the worker counters hold at their previous values,
+  preserving series monotonicity. `Build()` (on-demand `show chassis
+  forwarding`) still calls `Status()` directly — that is a rare CLI
+  diagnostic, not a periodic poller, so it is not a rate violation.
 - The eBPF mode renders the worker-thread row as `N/A — eBPF path
   has no worker threads`. Don't add code that fakes a worker entry
   there; the N/A is informative.

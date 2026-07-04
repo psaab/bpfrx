@@ -1640,6 +1640,29 @@ func (m *Manager) Status() (ProcessStatus, error) {
 	return status, nil
 }
 
+// CachedStatus returns the most recent ProcessStatus captured by a
+// control-socket round-trip (primarily the 1 Hz statusLoop, which
+// refreshes m.lastStatus every second via applyHelperStatusLocked),
+// WITHOUT issuing a new control-socket request. The bool is false
+// when no status has been captured yet (helper not started or never
+// polled), in which case the caller should hold its previous values.
+//
+// This exists so low-priority periodic consumers -- specifically the
+// fwdstatus CPU sampler -- can read worker telemetry off the shared
+// status poll instead of issuing their own redundant 1 Hz "status"
+// request, which would double the control-socket status rate and
+// starve session installs during bulk sync (#3970; CLAUDE.md
+// "Control socket contention"). Unlike Status(), this MUST NOT touch
+// the control socket.
+func (m *Manager) CachedStatus() (ProcessStatus, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastStatus.PID == 0 {
+		return ProcessStatus{}, false
+	}
+	return m.lastStatus, true
+}
+
 func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
