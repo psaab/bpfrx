@@ -1,3 +1,30 @@
+## 2026-07-03 — #3956: DHCPv4 client kept a revoked address until T2 — a RENEWING DHCPNAK was treated like a renew timeout
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-173 (MEDIUM, DHCP correctness, RFC 2131
+    §4.4.5). The DHCPv4 client's `doDHCPv4` returned an indistinguishable
+    error string for both a renew TIMEOUT and a DHCPNAK, so `runDHCPv4`
+    could not tell them apart: a NAK in the RENEWING state fell through the
+    "waiting for T2" branch and the client kept configuring/using the
+    revoked address until the REBINDING attempt at T2 (minutes) — address
+    conflict / blackhole risk. A DHCPNAK is an explicit lease REVOCATION;
+    RFC 2131 §4.4.5 requires the client to stop using the address
+    immediately and return to INIT (restart DISCOVER). Added an
+    `errDHCPNAK` sentinel wrapped by `doDHCPv4` on a NAK reply, and made
+    `runDHCPv4` distinguish it via `errors.Is`. On a NAK at T1 (RENEWING)
+    or T2 (REBINDING) the new `abandonLeaseAfterNAK` deconfigures the
+    interface (removes the kernel address), drops the lease record, and
+    fires `onGatewayChange` outside `m.mu` — mirroring `finishClient`'s
+    removal ordering + the #1844 coupling rule — then the loop restarts a
+    fresh DORA from INIT with `committed=nil`. A genuine renew TIMEOUT
+    still falls through to the T2 rebind; the T2 timeout path keeps the
+    existing lease-expiry fallback. RED-on-revert proven: neutering the
+    two NAK branches makes the RENEWING test see a REBIND at exchange 2
+    (instead of a fresh DISCOVER) and the REBINDING test keep the revoked
+    lease recorded across the re-acquire. `go test ./pkg/dhcp/...` green,
+    `go build ./...` green, gofmt/vet clean.
+  - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/renew_test.go, pkg/dhcp/README.md
+
 ## 2026-07-03 — #3952: swanctl PSK secrets carried no `id` selectors → with 2+ PSK VPNs the wrong PSK matched a peer
 
 - **Timestamp**: 2026-07-03
