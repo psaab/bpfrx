@@ -210,15 +210,24 @@ func TestHungHelperTimesOutAtScaledDeadline(t *testing.T) {
 	}
 	defer ln.Close()
 
+	// done bounds the mock helper goroutine's lifetime to the test: it holds
+	// the connection open (never replying) so the client hits its deadline,
+	// then EXITS deterministically at test end instead of leaking a goroutine
+	// + unclosed conn that could perturb -race or later tests.
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		// Read the request, then hang forever without replying.
+		defer conn.Close()
+		// Read the request, then hold the connection without replying until
+		// the test signals shutdown — models a genuinely-hung helper.
 		var got ControlRequest
 		_ = json.NewDecoder(conn).Decode(&got)
-		select {} // block; the connection is closed when the process exits
+		<-done
 	}()
 
 	proc, err := os.FindProcess(os.Getpid())
