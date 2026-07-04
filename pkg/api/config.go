@@ -175,24 +175,27 @@ func (s *Server) configShowHandler(w http.ResponseWriter, r *http.Request) {
 	format := r.URL.Query().Get("format")
 	target := r.URL.Query().Get("target")
 
+	// Secrets are masked on every raw-AST render endpoint (#4051), matching
+	// the #2053 typed-struct redaction; the cleartext Show* SSOT still backs
+	// HA config sync, the DR archive and persistence.
 	var output string
 	switch {
 	case target == "active" && format == "set":
-		output = s.store.ShowActiveSet()
+		output = s.store.ShowActiveSetRedacted(nil)
 	case target == "active" && format == "json":
-		output = s.store.ShowActiveJSON()
+		output = s.store.ShowActiveJSONRedacted(nil)
 	case target == "active" && format == "xml":
-		output = s.store.ShowActiveXML()
+		output = s.store.ShowActiveXMLRedacted(nil)
 	case target == "active":
-		output = s.store.ShowActive()
+		output = s.store.ShowActiveRedacted(nil)
 	case format == "set":
-		output = s.store.ShowCandidateSet()
+		output = s.store.ShowCandidateSetRedacted(nil)
 	case format == "json":
-		output = s.store.ShowCandidateJSON()
+		output = s.store.ShowCandidateJSONRedacted(nil)
 	case format == "xml":
-		output = s.store.ShowCandidateXML()
+		output = s.store.ShowCandidateXMLRedacted(nil)
 	default:
-		output = s.store.ShowCandidate()
+		output = s.store.ShowCandidateRedacted(nil)
 	}
 	writeOK(w, TextResponse{Output: output})
 }
@@ -205,13 +208,13 @@ func (s *Server) configExportHandler(w http.ResponseWriter, r *http.Request) {
 	var output string
 	switch format {
 	case "set":
-		output = s.store.ShowActiveSet()
+		output = s.store.ShowActiveSetRedacted(nil)
 	case "text":
-		output = s.store.ShowActive()
+		output = s.store.ShowActiveRedacted(nil)
 	case "json":
-		output = s.store.ShowActiveJSON()
+		output = s.store.ShowActiveJSONRedacted(nil)
 	case "xml":
-		output = s.store.ShowActiveXML()
+		output = s.store.ShowActiveXMLRedacted(nil)
 	default:
 		writeError(w, http.StatusBadRequest, "unsupported format: "+format+"; use set, text, json, or xml")
 		return
@@ -230,7 +233,7 @@ func (s *Server) configCompareHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rollbackN > 0 {
-		diff, err := s.store.ShowCompareRollback(rollbackN)
+		diff, err := s.store.ShowCompareRollbackRedacted(rollbackN)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -238,7 +241,7 @@ func (s *Server) configCompareHandler(w http.ResponseWriter, r *http.Request) {
 		writeOK(w, TextResponse{Output: diff})
 		return
 	}
-	writeOK(w, TextResponse{Output: s.store.ShowCompare()})
+	writeOK(w, TextResponse{Output: s.store.ShowCompareRedacted()})
 }
 
 func (s *Server) configHistoryHandler(w http.ResponseWriter, _ *http.Request) {
@@ -259,7 +262,9 @@ func (s *Server) configSearchHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing q parameter")
 		return
 	}
-	text := s.store.ShowActive()
+	// Search over the redacted render so a matching line never returns a
+	// cleartext secret in its snippet (#4051).
+	text := s.store.ShowActiveRedacted(nil)
 	var results []ConfigSearchResult
 	for i, line := range strings.Split(text, "\n") {
 		if strings.Contains(line, query) {
@@ -354,9 +359,9 @@ func (s *Server) configShowRollbackHandler(w http.ResponseWriter, r *http.Reques
 	var output string
 	var err error
 	if format == "set" {
-		output, err = s.store.ShowRollbackSet(n)
+		output, err = s.store.ShowRollbackSetRedacted(n)
 	} else {
-		output, err = s.store.ShowRollback(n)
+		output, err = s.store.ShowRollbackRedacted(n)
 	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

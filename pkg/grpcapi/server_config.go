@@ -264,69 +264,37 @@ func configWarnings(cfg *config.Config) []string {
 }
 
 func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.ShowConfigResponse, error) {
+	// Secrets are masked on this raw-AST render RPC (#4051), matching the
+	// #2053 typed-struct redaction. The redacted renderers take the path
+	// directly (nil/empty selects the whole tree) and mirror the cleartext
+	// siblings' nil-source defaults; the cleartext Show* SSOT still backs HA
+	// config sync, the DR archive and persistence.
+	var path []string
+	if len(req.Path) > 0 {
+		path = req.Path
+	}
 	var output string
-	hasPath := len(req.Path) > 0
 	switch {
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_JSON:
-		if hasPath {
-			output = s.store.ShowActivePathJSON(req.Path)
-		} else {
-			output = s.store.ShowActiveJSON()
-		}
+		output = s.store.ShowActiveJSONRedacted(path)
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_SET:
-		if hasPath {
-			output = s.store.ShowActivePathSet(req.Path)
-		} else {
-			output = s.store.ShowActiveSet()
-		}
+		output = s.store.ShowActiveSetRedacted(path)
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_XML:
-		if hasPath {
-			output = s.store.ShowActivePathXML(req.Path)
-		} else {
-			output = s.store.ShowActiveXML()
-		}
+		output = s.store.ShowActiveXMLRedacted(path)
 	case req.Target == pb.ConfigTarget_ACTIVE && req.Format == pb.ConfigFormat_INHERITANCE:
-		if hasPath {
-			output = s.store.ShowActivePathInheritance(req.Path)
-		} else {
-			output = s.store.ShowActiveInheritance()
-		}
+		output = s.store.ShowActiveInheritanceRedacted(path)
 	case req.Target == pb.ConfigTarget_ACTIVE:
-		if hasPath {
-			output = s.store.ShowActivePath(req.Path)
-		} else {
-			output = s.store.ShowActive()
-		}
+		output = s.store.ShowActiveRedacted(path)
 	case req.Format == pb.ConfigFormat_JSON:
-		if hasPath {
-			output = s.store.ShowCandidatePathJSON(req.Path)
-		} else {
-			output = s.store.ShowCandidateJSON()
-		}
+		output = s.store.ShowCandidateJSONRedacted(path)
 	case req.Format == pb.ConfigFormat_SET:
-		if hasPath {
-			output = s.store.ShowCandidatePathSet(req.Path)
-		} else {
-			output = s.store.ShowCandidateSet()
-		}
+		output = s.store.ShowCandidateSetRedacted(path)
 	case req.Format == pb.ConfigFormat_XML:
-		if hasPath {
-			output = s.store.ShowCandidatePathXML(req.Path)
-		} else {
-			output = s.store.ShowCandidateXML()
-		}
+		output = s.store.ShowCandidateXMLRedacted(path)
 	case req.Format == pb.ConfigFormat_INHERITANCE:
-		if hasPath {
-			output = s.store.ShowCandidatePathInheritance(req.Path)
-		} else {
-			output = s.store.ShowCandidateInheritance()
-		}
+		output = s.store.ShowCandidateInheritanceRedacted(path)
 	default:
-		if hasPath {
-			output = s.store.ShowCandidatePath(req.Path)
-		} else {
-			output = s.store.ShowCandidate()
-		}
+		output = s.store.ShowCandidateRedacted(path)
 	}
 	return &pb.ShowConfigResponse{Output: output}, nil
 }
@@ -341,22 +309,22 @@ func (s *Server) ShowCompare(_ context.Context, req *pb.ShowCompareRequest) (*pb
 			"invalid rollback_n %d: must be non-negative (0 = candidate vs active)", req.RollbackN)
 	}
 	if req.RollbackN > 0 {
-		diff, err := s.store.ShowCompareRollback(int(req.RollbackN))
+		diff, err := s.store.ShowCompareRollbackRedacted(int(req.RollbackN))
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
 		return &pb.ShowCompareResponse{Output: diff}, nil
 	}
-	return &pb.ShowCompareResponse{Output: s.store.ShowCompare()}, nil
+	return &pb.ShowCompareResponse{Output: s.store.ShowCompareRedacted()}, nil
 }
 
 func (s *Server) ShowRollback(_ context.Context, req *pb.ShowRollbackRequest) (*pb.ShowRollbackResponse, error) {
 	var output string
 	var err error
 	if req.Format == pb.ConfigFormat_SET {
-		output, err = s.store.ShowRollbackSet(int(req.N))
+		output, err = s.store.ShowRollbackSetRedacted(int(req.N))
 	} else {
-		output, err = s.store.ShowRollback(int(req.N))
+		output, err = s.store.ShowRollbackRedacted(int(req.N))
 	}
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)

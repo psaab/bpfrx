@@ -1,3 +1,42 @@
+## 2026-07-03 — #4051: raw-AST config render paths (REST show/export/search/rollback + gRPC ShowConfig) emitted cleartext secrets (IKE PSK, auth-keys, SNMP community, WG/DDNS keys) — #2053 only redacted the typed-struct /config JSON path
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-020 (security, secret exposure). #2053
+    made the TYPED compiled-config marshal safe (`config.Secret` newtype ->
+    `GET /api/v1/config` redacts), but the RAW-AST render surface
+    (`pkg/config/ast_format.go` `Format`/`FormatSet`/`FormatJSON`/`FormatXML`/
+    `FormatInheritance`/`FormatCompare`) prints leaf tokens verbatim. The REST
+    config **show / export / search / rollback** handlers (`pkg/api/config.go`)
+    and the gRPC **ShowConfig / ShowCompare / ShowRollback** RPCs
+    (`pkg/grpcapi/server_config.go`) returned every operator secret in
+    CLEARTEXT to any API/gRPC client — worse with a non-loopback REST bind.
+  - **Fix**: `ConfigTree.RedactedClone()` (new `pkg/config/ast_redact.go`) —
+    a DISPLAY-only deep clone masking every secret leaf with
+    `config.SecretDataPlaceholder` (`##SECRET-DATA##`). Matches secrets on the
+    FLATTENED key path (handles both AST shapes). Secret-leaf set = #2053's
+    `config.Secret` field set resolved to keyword signatures (distinctive
+    keywords `pre-shared-key`/`authentication-key`/`authentication-password`/
+    `privacy-password`/`encrypted-password`/`simple-password`/`api-key`/
+    `tsig-secret`/`api-token`/`aws-secret-key`/`private-key`/`preshared-key`;
+    generic `key`/`password`/`community` disambiguated by ancestor context so
+    a GRE tunnel `key`, a chassis identity `key`, a routing-policy `community`
+    or a public `aws-access-key`/`username` are NOT masked). New redacted
+    `Store.Show*Redacted` variants (`pkg/configstore/store_format.go`) render
+    the clone; the REST + gRPC display handlers call them. The cleartext
+    `Show*` SSOT is UNCHANGED — HA config sync (`daemon_ha_sync.go`), the DR
+    archive (`daemon_flow.go`), persistence/rollback, and the on-box CLI still
+    get real secrets.
+  - **Validation**: RED-on-revert proven — with `RedactedClone` neutered, the
+    config, api and grpcapi redaction tests all FAIL with cleartext secrets
+    present (placeholder absent). `go test ./pkg/config/ ./pkg/configstore/
+    ./pkg/api/ ./pkg/grpcapi/ ./pkg/daemon/` all green; `go build ./...` green;
+    `gofmt`/`go vet` clean. On-box CLI kept cleartext (operator-reads-own-
+    secrets, Junos parity); remote `cli` covered transitively via gRPC.
+  - **File(s)**: pkg/config/ast_redact.go, pkg/config/ast_redact_test.go,
+    pkg/configstore/store_format.go, pkg/api/config.go,
+    pkg/api/config_raw_ast_redaction_test.go, pkg/grpcapi/server_config.go,
+    pkg/grpcapi/server_config_redaction_test.go, docs/config-schema.md, _Log.md
+
 ## 2026-07-03 — #4049: LLDP resolved its socket with the Junos slash name (ge-0/0/0) instead of the kernel dash name (ge-0-0-0) → net.InterfaceByName failed → LLDP never started on any renamed data port
 
 - **Timestamp**: 2026-07-03
