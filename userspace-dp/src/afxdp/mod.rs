@@ -820,7 +820,7 @@ impl BatchCounters {
     }
 }
 
-mod poll_descriptor;
+pub(in crate::afxdp) mod poll_descriptor;
 use poll_descriptor::poll_binding_process_descriptor;
 
 // #946 Phase 1: per-packet pipeline stages extracted from the
@@ -884,7 +884,7 @@ use disposition::update_last_resolution;
 // afxdp/forward_request.rs.
 mod forward_request;
 use forward_request::{
-    build_live_forward_request_from_frame, should_install_local_reverse_session,
+    ForwardRejectReply, build_live_forward_request_from_frame, should_install_local_reverse_session,
 };
 // `build_live_forward_request` is only referenced by tests in
 // afxdp/frame/tests.rs; gate its import behind cfg(test).

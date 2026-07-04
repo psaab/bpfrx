@@ -52,6 +52,12 @@ pub(super) struct CachedTxSelectionDescriptor {
     pub(super) queue_id: Option<u8>,
     pub(super) dscp_rewrite: Option<u8>,
     pub(super) drop: bool,
+    // #3608: `drop` collapses `then discard` and `then reject` (both
+    // non-`Accept` terminal actions) into one bit. `reject` isolates the
+    // `then reject` subset so the flow-cache-hit consumer can synthesize the
+    // active reject reply (TCP RST / ICMP admin-prohibited) rather than the
+    // silent drop `then discard` produces. Only ever true when `drop` is true.
+    pub(super) reject: bool,
     // #2573: all matched `then count` term counters for this flow, not just the
     // last — the cached replay must increment every fall-through count term.
     pub(super) filter_counters: crate::filter::CachedFilterCounters,

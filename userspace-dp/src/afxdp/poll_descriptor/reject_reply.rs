@@ -71,7 +71,7 @@ pub(super) fn enqueue_policy_reject_reply(
 /// behavior (the caller still drops the packet on a `false` return).
 #[cold]
 #[inline(never)]
-pub(super) fn enqueue_filter_reject_reply(
+pub(in crate::afxdp) fn enqueue_filter_reject_reply(
     tx_pipeline: &mut WorkerTxPipeline,
     forwarding: &ForwardingState,
     ingress_ifindex: i32,

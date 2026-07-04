@@ -3204,6 +3204,7 @@ fn build_live_forward_request_emits_output_filter_log_event() {
         Some(&event_handle),
         None,
         None,
+        None,
     )
     .expect("output filter log should not block forwarding");
 

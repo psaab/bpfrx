@@ -32917,3 +32917,37 @@ top.
   - **File(s)**: pkg/dataplane/loader_userspace_shim.go,
     pkg/dataplane/userspace_shim_loader_test.go,
     userspace-dp/src/afxdp/bpf_map/pin.rs, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3608 — OUTPUT firewall-filter `then reject` now emits an
+    active reject reply (TCP RST / ICMP admin-prohibited) on the transit
+    forward / TX-CoS path instead of the historical silent drop, mirroring
+    the input/lo0 reject (#2521). Added a `reject` bit to `CoSTxSelection`
+    and `CachedTxSelectionDescriptor` that isolates the `then reject` subset
+    of the collapsed `drop` bit (discard / red-policer stay silent). The
+    transit forward-request builder (`build_live_forward_request_from_frame`)
+    and the flow-cache-hit fast path now call the shared
+    `enqueue_filter_reject_reply` BEFORE dropping, reflecting the original
+    inbound frame back to the source via the ingress interface, and emit the
+    output filter-log with the truthful REJECT/DENY outcome (#3615). Reject
+    synthesis is passed the ingress TX pipeline via a new `ForwardRejectReply`
+    context. Widened `poll_descriptor`/`reject_reply` module + fn visibility
+    to `pub(in crate::afxdp)` so `forward_request` can reach the synthesis.
+    RED-on-revert tests: classification `reject` flag (cos_classify_tests)
+    and an end-to-end build-path test asserting the RST is enqueued +
+    `filter_reject_sent`/RT_FLOW REJECT (tests.rs). Full cargo suite green
+    (only the pre-existing unrelated `test_paused_telemetry_eviction_*`
+    fails, also red on clean master). go build + pkg/config green. Docs:
+    filter/README.md + docs/feature-gaps.md.
+  - **File(s)**: userspace-dp/src/afxdp/tx/cos_classify.rs,
+    userspace-dp/src/afxdp/flow_cache.rs,
+    userspace-dp/src/afxdp/forward_request.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+    userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+    userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+    userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/tests.rs,
+    userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+    userspace-dp/src/afxdp/umem/tests.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/filter/README.md, docs/feature-gaps.md

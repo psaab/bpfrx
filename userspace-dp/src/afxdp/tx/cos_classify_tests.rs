@@ -1469,6 +1469,9 @@ fn resolve_cos_tx_selection_drops_terminal_output_filter_without_log() {
     );
 
     assert!(selection.drop);
+    // #3608: `then discard` is a SILENT drop — it must NOT be flagged as a
+    // reject, so no active reply is synthesized for it.
+    assert!(!selection.reject, "then discard must not be a reject");
     assert_eq!(selection.queue_id, None);
     assert_eq!(selection.filter_log, None);
 }
@@ -1522,6 +1525,10 @@ fn resolve_cos_tx_selection_drops_reject_output_filter_without_log() {
     );
 
     assert!(selection.drop);
+    // #3608 RED-on-revert: `then reject` must be flagged as a reject (distinct
+    // from `then discard`) so the TX/CoS consumer synthesizes the active reply
+    // instead of a silent drop.
+    assert!(selection.reject, "then reject must set the reject flag");
     assert_eq!(selection.queue_id, None);
     assert_eq!(selection.filter_log, None);
 }

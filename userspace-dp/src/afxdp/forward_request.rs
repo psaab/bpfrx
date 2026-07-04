@@ -12,6 +12,21 @@
 // afxdp.rs into scope.
 
 use super::*;
+use super::worker::WorkerTxPipeline;
+
+/// #3608: the tx-pipeline + counters an output-filter `then reject` needs to
+/// synthesize its active reply (TCP RST / ICMP admin-prohibited) on the transit
+/// forward path. `build_live_forward_request_from_frame` resolves the output
+/// filter inline and, on a `then reject` drop, must emit the same active reply
+/// the input/lo0 path already does (#2521) instead of the historical silent
+/// drop (#3608). Passed by the poll-loop callers that own the ingress binding's
+/// TX pipeline; `None` on the test-only `build_live_forward_request` wrapper and
+/// any caller that cannot (or need not) emit a reply, in which case a reject
+/// degrades to the prior silent drop and the filter-log truthfully reports DENY.
+pub(super) struct ForwardRejectReply<'a> {
+    pub(super) tx_pipeline: &'a mut WorkerTxPipeline,
+    pub(super) counters: &'a mut BatchCounters,
+}
 
 pub(super) fn should_install_local_reverse_session(
     decision: SessionDecision,
@@ -55,6 +70,7 @@ pub(super) fn build_live_forward_request(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -74,6 +90,7 @@ pub(super) fn build_live_forward_request_from_frame(
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     hints: Option<PendingForwardHints>,
     precomputed_tx_selection: Option<&CachedTxSelectionDescriptor>,
+    reject_reply: Option<ForwardRejectReply<'_>>,
 ) -> Option<PendingForwardRequest> {
     let hints = hints.unwrap_or_default();
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
@@ -180,6 +197,10 @@ pub(super) fn build_live_forward_request_from_frame(
             queue_id: selection.queue_id,
             dscp_rewrite: selection.dscp_rewrite,
             drop: selection.drop,
+            // #3608: preserve the `then reject` subset so the active reject
+            // reply is synthesized on the precomputed (flow-cache fallback) path
+            // too, not just the freshly resolved path.
+            reject: selection.reject,
             filter_log: selection.filter_log,
         })
         .unwrap_or_else(|| {
@@ -197,6 +218,36 @@ pub(super) fn build_live_forward_request_from_frame(
                 now_ns,
             )
         });
+    // #3608: an output firewall-filter `then reject` on the transit forward path
+    // now emits the SAME active reply as the input/lo0 path (#2521) — a TCP RST
+    // for TCP, an ICMP/ICMPv6 admin-prohibited unreachable otherwise — instead
+    // of the historical silent drop. The reply reflects the ORIGINAL inbound
+    // frame back toward the source via the ingress interface (the source is
+    // reachable on the reverse path), reusing the shared reject-synthesis +
+    // #2238 output-classification + #2472 rate-limit + fail-closed budget gate.
+    // `then discard` and three-color-policer drops stay silent (`cos.reject`
+    // isolates the reject subset of `cos.drop`). Enqueue the reply FIRST so the
+    // filter-log below reports the TRUTHFUL action (#3615): a reject whose reply
+    // fail-closes (budget/rate/parse/output-filter, or a missing tx-pipeline
+    // context) logs DENY, not REJECT.
+    let reject_reply_enqueued = if cos.drop && cos.reject {
+        match (reject_reply, tx_selection_flow) {
+            (Some(reply), Some(flow)) => {
+                crate::afxdp::poll_descriptor::reject_reply::enqueue_filter_reject_reply(
+                    reply.tx_pipeline,
+                    forwarding,
+                    ingress_ident.ifindex,
+                    frame,
+                    meta,
+                    flow,
+                    reply.counters,
+                )
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
     if let (Some(filter_log), Some(flow)) = (cos.filter_log, tx_selection_flow) {
         let ingress_zone_id = fabric_ingress_zone
             .filter(|id| forwarding.zone_id_to_name.contains_key(id))
@@ -224,10 +275,10 @@ pub(super) fn build_live_forward_request_from_frame(
             FilterLogSource::Output,
             // #2520: AppID via the hot-path app_catalog.lookup.
             resolve_flow_app_id(&forwarding.app_catalog, flow),
-            // #3615: the TX/forward OUTPUT-filter path synthesizes no reject
-            // reply (that silent drop is #3608's deferred domain), so a `then
-            // reject` output term logs the truthful DENY rather than REJECT.
-            false,
+            // #3608/#3615: reports whether the `then reject` reply above actually
+            // went out; a `then accept`/`then discard` term, or a reject that
+            // fail-closed, keeps this false so the log is truthful.
+            reject_reply_enqueued,
             now_ns,
         );
     }

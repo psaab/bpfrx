@@ -1,4 +1,5 @@
 use super::test_fixtures::*;
+use super::worker::WorkerTxPipeline;
 use super::*;
 use crate::test_zone_ids::*;
 use crate::xsk_ffi::IfInfo;
@@ -250,6 +251,7 @@ fn build_live_forward_request_from_frame_uses_precomputed_hints() {
         None,
         Some(hints),
         None,
+        None,
     )
     .expect("request");
 
@@ -354,6 +356,7 @@ fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
         Some(&event_handle),
         None,
         None,
+        None,
     );
 
     assert!(req.is_none(), "terminal output filter must not forward");
@@ -371,6 +374,186 @@ fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
         event.reason,
         FilterLogSource::Output.wire_reason(),
         "live output filter source must not be mislabeled",
+    );
+}
+
+/// #3608 RED-on-revert: an OUTPUT firewall-filter `then reject` on the transit
+/// forward path must synthesize an ACTIVE reject reply (a TCP RST here), NOT the
+/// historical silent drop. On revert (the `CoSTxSelection.reject` flag or the
+/// `build_live_forward_request_from_frame` synthesis wiring removed) the reject
+/// collapses back to a silent discard: no RST is enqueued, `filter_reject_sent`
+/// stays 0, and the filter-log downgrades REJECT->DENY — every assertion below
+/// flips. `then discard` (the sibling test above) is unaffected.
+#[test]
+fn build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608() {
+    let lookup = WorkerBindingLookup::default();
+    let ingress_ident = BindingIdentity {
+        slot: 7,
+        queue_id: 3,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: 10,
+    };
+    let src_ip = Ipv4Addr::new(10, 0, 61, 100);
+    let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+    let src_port = 12345u16;
+    let dst_port = 443u16;
+    // A minimal, valid Ethernet/IPv4/TCP SYN so the RST builder + the generated-
+    // reply re-classify have real bytes to reflect. Unicast L2 addresses (a
+    // group/broadcast source would be suppressed by build_reject_rst_frame).
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[
+        0x02, 0xbf, 0x72, 0x00, 0x80, 0x08, // dst MAC (unicast)
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // src MAC
+        0x08, 0x00, // ethertype IPv4
+    ]);
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x28, 0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x00, 0x00, 0x00, 0x01, // seq
+        0x00, 0x00, 0x00, 0x00, // ack
+        0x50, 0x02, 0xfa, 0xf0, // data offset / SYN / window
+        0x00, 0x00, 0x00, 0x00, // checksum + urgent
+    ]);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 54,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(src_ip),
+        dst_ip: IpAddr::V4(dst_ip),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(src_ip),
+            dst_ip: IpAddr::V4(dst_ip),
+            src_port,
+            dst_port,
+        },
+    };
+    let forwarding = build_forwarding_state(&ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 12,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-reject".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-reject".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "reject-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "reject".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    });
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    // Size the pipeline above the SYN-cookie-shared TX-frame reserve so the
+    // reject reply's budget gate admits it (the reject path reuses that gate).
+    let mut tx_pipeline = WorkerTxPipeline {
+        free_tx_frames: (0..256u64).collect(),
+        pending_tx_prepared: std::collections::VecDeque::new(),
+        pending_tx_local: std::collections::VecDeque::new(),
+        max_pending_tx: 256,
+        outstanding_tx: 0,
+        pending_fill_frames: std::collections::VecDeque::new(),
+        in_flight_prepared_recycles: FastMap::default(),
+        tx_submit_ns: Vec::new().into_boxed_slice(),
+    };
+    let mut counters = BatchCounters::default();
+
+    let req = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        &frame,
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        Some(&event_handle),
+        None,
+        None,
+        Some(ForwardRejectReply {
+            tx_pipeline: &mut tx_pipeline,
+            counters: &mut counters,
+        }),
+    );
+
+    assert!(
+        req.is_none(),
+        "a `then reject` output term must NOT forward the original packet"
+    );
+    assert_eq!(
+        counters.filter_reject_sent, 1,
+        "#3608: output-filter `then reject` must enqueue exactly one active reply (RED on revert: silent drop leaves this 0)"
+    );
+    assert_eq!(
+        tx_pipeline.pending_tx_local.len(),
+        1,
+        "the reflected TCP RST must be queued on the ingress TX pipeline"
+    );
+    let event = event_rx
+        .try_recv()
+        .expect("output filter-log frame")
+        .decode_dataplane_event()
+        .expect("filter-log payload");
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::FilterLog
+    );
+    assert_eq!(
+        event.action, 2,
+        "#3608/#3615: an output `then reject` whose reply WAS sent must log RT_FLOW REJECT (2), not DENY (0)"
     );
 }
 
@@ -488,6 +671,7 @@ fn output_filter_matches_post_snat_source_forward_leg_3642() {
         false,
         123,
         Some(&event_handle),
+        None,
         None,
         None,
     );
@@ -615,6 +799,7 @@ fn output_filter_matches_post_snat_dest_reverse_leg_3642() {
         Some(&event_handle),
         None,
         None,
+        None,
     );
     assert!(
         req.is_none(),
@@ -733,6 +918,7 @@ fn output_filter_matches_post_dnat_dest_3642() {
         false,
         123,
         Some(&event_handle),
+        None,
         None,
         None,
     );
@@ -12380,6 +12566,7 @@ fn non_first_fragment_v4_not_dropped_by_port_matching_output_filter() {
         Some(&event_handle),
         None,
         None,
+        None,
     );
 
     let req = req.expect(
@@ -12476,6 +12663,7 @@ fn control_icmp_v4_installs_no_synthesized_tx_flow_key() {
         Some(&event_handle),
         None,
         None,
+        None,
     )
     .expect("control ICMP must still forward (TCP-only output filter does not match)");
 
@@ -12523,6 +12711,7 @@ fn flowless_non_fragmented_tcp_still_hits_port_matching_output_filter() {
         false,
         123,
         Some(&event_handle),
+        None,
         None,
         None,
     );
@@ -13114,6 +13303,7 @@ fn non_first_fragment_v6_not_dropped_by_port_matching_output_filter() {
         false,
         123,
         Some(&event_handle),
+        None,
         None,
         None,
     );
