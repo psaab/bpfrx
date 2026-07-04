@@ -420,6 +420,7 @@ they repeatedly bite:
   |---|---|
   | `cluster-setup.sh` deploy/start/stop/restart/create/destroy/init | self-locks (re-execs through `with-cluster.sh`; the build stays outside the lock) |
   | `apply-cos-config.sh` | self-locks the same way |
+  | Destructive HA smoke (`test-failover`, `test-ha-crash`, `test-double-failover`, `test-stress-failover`, `test-chained-crash`, `test-active-active`, `test-restart-connectivity`, `test-private-rg`) | self-locks the same way via the `cluster-cell.sh` preamble (#4020) — a reboot / force-stop / failover QUEUES behind a held lock instead of colliding with a concurrent deploy/smoke. Read-only `test-connectivity.sh` stays lock-free |
   | Multi-command measurement cells (deploy → apply-cos → measure) | wrap the WHOLE cell: `./test/incus/with-cluster.sh "purpose" -- cmd...` |
   | `wg-interop.sh` | self-locks per command standalone; runs lock-free inside a cell (marker-aware) |
   | Ad-hoc one-liners around commands that do NOT self-lock | `flock /tmp/xpf-cluster.lock sg incus-admin -c "..."` still valid |
@@ -441,6 +442,18 @@ they repeatedly bite:
     loops) to the cluster — they bypass the lock AND the #1864/#1869
     verify-dataplane gate. Deploys go through `cluster-setup.sh
     deploy` / `make cluster-deploy`.
+  - **Destructive HA smoke self-locks (#4020).** A `test-failover`
+    that reboots a node mid-iperf is FAR more disruptive than a
+    deploy, so the reboot/force-stop/failover smoke scripts share the
+    `cluster-cell.sh` preamble (`xpf_enter_destructive_cluster_cell`):
+    they re-exec through `with-cluster.sh` and QUEUE behind a held
+    lock rather than colliding with a concurrent agent's deploy/smoke.
+    Add a new destructive smoke script by sourcing `cluster-cell.sh`
+    in its preamble; the `make test-cluster-lock-lib` self-test (also
+    covers the `with-cluster.sh` contention matrix) asserts every
+    destructive script takes the lock before it mutates a node and
+    fails RED if one drops the wiring. No cluster needed — private
+    lock path, mocked incus.
   - Queue diagnosis: `cat /tmp/xpf-cluster.owner` +
     `fuser -v /tmp/xpf-cluster.lock`. A dead recorded pid with the
     lock still held means a child inherited the fd (pre-#1875 raw

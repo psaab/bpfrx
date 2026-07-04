@@ -77,6 +77,8 @@ make test-deploy     # Build -> push xpfd+cli+helper (each sha256-verified ==
                      #   sbin symlinks, #2162/#2176). Override target instance with
                      #   XPF_INSTANCE=<name> (default xpf-fw).
 make test-deploy-lib # Self-test the deploy reconcile/sha-verify helpers (no VM)
+make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
+                     #   lock preamble (no cluster — private lock path, mocked incus)
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
 make test-logs       # journalctl -u xpfd -n 50
@@ -109,13 +111,19 @@ The Makefile `cluster-*` targets now default to that userspace cluster via
 older loss cluster, and set `CLUSTER_ENV=` only when intentionally exercising
 the original local `xpf-fw0/xpf-fw1` regression environment.
 
-**Cluster ownership (#1875):** the loss cluster is SHARED. Deploys and
-`apply-cos-config.sh` self-lock `/tmp/xpf-cluster.lock` (they may
-visibly queue behind another agent — wait, NEVER kill another holder,
-NEVER `rm` the lock file). Wrap multi-command work in a lock cell:
-`./test/incus/with-cluster.sh "purpose" -- cmd...`. NEVER hand-roll
-`incus file push` binary deploys — they bypass the lock and the
-verify-dataplane gate. Full protocol: `docs/engineering-style.md`.
+**Cluster ownership (#1875):** the loss cluster is SHARED. Deploys,
+`apply-cos-config.sh`, AND the destructive HA smoke targets
+(`test-failover` / `test-ha-crash` / `test-double-failover` /
+`test-stress-failover` / `test-chained-crash` / `test-active-active` /
+`test-restart-connectivity` / `test-private-rg` — they reboot /
+force-stop / fail over a node) self-lock `/tmp/xpf-cluster.lock` via the
+`cluster-cell.sh` preamble (#4020), so a reboot QUEUES behind another
+agent's deploy/smoke instead of colliding — wait, NEVER kill another
+holder, NEVER `rm` the lock file. Wrap multi-command work in a lock
+cell: `./test/incus/with-cluster.sh "purpose" -- cmd...`. NEVER
+hand-roll `incus file push` binary deploys — they bypass the lock and
+the verify-dataplane gate. `make test-cluster-lock-lib` self-tests the
+lock (no cluster). Full protocol: `docs/engineering-style.md`.
 
 ```bash
 # === SMOKE (loss userspace cluster, default for all userspace-dp validation) ===

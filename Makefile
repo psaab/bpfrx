@@ -212,7 +212,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -232,6 +232,15 @@ test-deploy: build build-ctl
 # against a mocked fake VM. No incus, no cluster, no network — pure bash logic.
 test-deploy-lib:
 	bash ./test/incus/deploy-lib-selftest.sh
+
+# Self-test the #1875 shared-cluster lock cell (with-cluster.sh contention
+# matrix) and the #4020 destructive-smoke lock preamble (every reboot/
+# force-stop/failover smoke script routes through the lock, and the cell
+# serializes/queues/re-enters correctly). Private lock path, mocked incus —
+# no cluster, no network. Run this after touching the lock or smoke wiring.
+test-cluster-lock-lib:
+	bash ./test/incus/with-cluster-selftest.sh
+	bash ./test/incus/cluster-cell-selftest.sh
 
 test-ssh:
 	./test/incus/setup.sh ssh

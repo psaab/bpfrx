@@ -31155,3 +31155,46 @@ top.
   - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/ipsec_test.go,
     pkg/config/parser_security_test.go, pkg/config/schema_security.go,
     docs/phases.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4020 — route the destructive HA smoke targets through
+    the #1875 shared-cluster lock. The reboot / force-stop / failover
+    smoke scripts (`test-failover`, `test-ha-crash`,
+    `test-double-failover`, `test-stress-failover`, `test-chained-crash`,
+    `test-active-active`, `test-restart-connectivity`, `test-private-rg`)
+    historically took NO cluster lock — a `test-failover` that reboots
+    fw0 mid-iperf on the SHARED loss cluster could collide with a
+    concurrent agent's deploy/smoke (half-deployed node; garbage loss
+    numbers). Deploys (`cluster-setup.sh` mutating verbs) and
+    `apply-cos-config.sh` already self-lock; the destructive smoke did
+    not. New `test/incus/cluster-cell.sh` preamble exports
+    `xpf_enter_destructive_cluster_cell`, which (1) re-execs under the
+    incus-admin group forwarding BPFRX_*/XPF_* so the
+    `XPF_CLUSTER_LOCK_HELD` marker survives sg, then (2) re-execs the
+    whole script through `with-cluster.sh` when not already inside a
+    live cell — a reboot now QUEUES behind a held lock instead of
+    colliding. Each destructive script's old inline `sg incus-admin`
+    block was replaced with a source + call of the shared preamble.
+    Unconditional lock (matches `cluster-setup.sh`, which locks the
+    legacy local cluster too — single dev-box mutex, fail toward
+    serialize). Read-only `test-connectivity.sh` left lock-free. New
+    `test/incus/cluster-cell-selftest.sh` (wired as
+    `make test-cluster-lock-lib`, which also runs the previously
+    orphaned `with-cluster-selftest.sh`): STATIC RED-on-revert — asserts
+    every destructive script sources `cluster-cell.sh` and takes the
+    lock before any node mutation, and that `test-connectivity.sh` stays
+    lock-free; BEHAVIORAL — private lock path + mocked incus prove a
+    standalone run acquires the lock, a concurrent run queues (exit 75)
+    instead of colliding, and a run inside a `with-cluster.sh` cell runs
+    lock-free (reentrant, no deadlock). Verified: RED-on-revert (restore
+    one script to origin/master → static check FAILs naming it),
+    shellcheck clean on all changed scripts + the new helper/selftest,
+    `go build ./...` green. No live cluster run — script-wiring fix
+    validated by reasoning + the no-cluster self-test.
+  - **File(s)**: test/incus/cluster-cell.sh (new),
+    test/incus/cluster-cell-selftest.sh (new), test/incus/test-failover.sh,
+    test/incus/test-ha-crash.sh, test/incus/test-double-failover.sh,
+    test/incus/test-stress-failover.sh, test/incus/test-chained-crash.sh,
+    test/incus/test-active-active.sh, test/incus/test-restart-connectivity.sh,
+    test/incus/test-private-rg.sh, Makefile, docs/engineering-style.md,
+    CLAUDE.md, _Log.md
