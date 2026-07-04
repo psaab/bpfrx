@@ -240,10 +240,36 @@ fn enqueue_reject_reply(
     // shared bucket is unchanged; only the CONSUMPTION ORDERING moves. The
     // extra build under budget/rate pressure is on the already-cold reject
     // exception path.
+    // #3976: resolve the LOGICAL ingress unit ifindex ONCE, up here, so both
+    // the non-TCP ICMP/ICMPv6 reject BUILD below and the #3035 output-filter
+    // classify further down key off the same value. `forwarding.egress` (and
+    // `ingress_logical_ifindex`) are keyed by the LOGICAL unit ifindex
+    // (forwarding_build/interfaces.rs), but `ingress_ifindex` here is the
+    // PHYSICAL AF_XDP bind port. On a VLAN sub-interface (e.g. reth0.80 on
+    // parent reth0) the physical parent is NOT a key in `forwarding.egress`
+    // when it has no untagged unit of its own, so the old physical-keyed build
+    // missed the sub-if's `EgressInterface` — `primary_v4`/`primary_v6` came up
+    // None and `build_reject_icmp_unreachable` returned None → the reject
+    // silently degraded to a discard on every VLAN sub-if. Even when the parent
+    // DID have an entry, the ICMP source address and the egress `vlan_id`
+    // fallback were the parent's, not this unit's → wrong-source / untagged
+    // reply dropped on the tagged link. Keying the build off the logical unit
+    // ifindex sources the ICMP reply from the sub-if's own primary address and
+    // its own `vlan_id`, mirroring the Time Exceeded builder
+    // (`build_local_time_exceeded_request`), which already passes
+    // `ingress_ident.ifindex` (the logical unit). The TCP RST builder is
+    // self-contained (it reflects the inbound frame, no egress lookup), so it
+    // is unaffected. The physical `ingress_ifindex` is still used for the
+    // `TxRequest.egress_ifindex` (the XSK transmit device) below. For a
+    // non-VLAN port the logical and physical indexes coincide, so this is a
+    // no-op there.
+    let logical_ingress_ifindex =
+        resolve_ingress_logical_ifindex(forwarding, ingress_ifindex, meta.ingress_vlan_id)
+            .unwrap_or(ingress_ifindex);
     let bytes = if meta.protocol == PROTO_TCP {
         build_reject_rst_frame(packet_frame)
     } else {
-        build_reject_icmp_unreachable(packet_frame, meta, ingress_ifindex, forwarding)
+        build_reject_icmp_unreachable(packet_frame, meta, logical_ingress_ifindex, forwarding)
     };
     let Some(bytes) = bytes else {
         // Unreplyable: fail-closed to the silent drop the caller already
@@ -319,15 +345,13 @@ fn enqueue_reject_reply(
     // classifying by it applied the parent's (or first subinterface's) CoS
     // queue / DSCP rewrite / output filter instead of this unit's. Mirrors
     // the #3026 generated-ICMP-error fix and the filter/CoS sites via the
-    // `resolve_ingress_logical_ifindex` SSOT; the physical `ingress_ifindex`
-    // is still used for the reflected-reply build above and the XSK transmit
-    // (`egress_ifindex`) below. For a non-VLAN port the logical and physical
-    // indexes coincide, so this is a no-op there.
+    // `resolve_ingress_logical_ifindex` SSOT (#3976: the same
+    // `logical_ingress_ifindex` computed above also keys the ICMP reject
+    // build); the physical `ingress_ifindex` is still used for the XSK
+    // transmit (`egress_ifindex`) below. For a non-VLAN port the logical and
+    // physical indexes coincide, so this is a no-op there.
     let now_ns = monotonic_nanos();
-    let classify_ifindex =
-        resolve_ingress_logical_ifindex(forwarding, ingress_ifindex, meta.ingress_vlan_id)
-            .unwrap_or(ingress_ifindex);
-    let verdict = classify_generated_reply(forwarding, classify_ifindex, &bytes, now_ns);
+    let verdict = classify_generated_reply(forwarding, logical_ingress_ifindex, &bytes, now_ns);
     if verdict.drop {
         counters.touched = true;
         if verdict.parse_error {
@@ -1556,6 +1580,254 @@ mod tests {
         );
         assert_eq!(counters.policy_reject_output_filter_drops, 1);
         assert_eq!(counters.policy_reject_sent, 0);
+    }
+
+    /// #3976 fail-on-revert (IPv4): a non-TCP (ICMP) packet arriving on a VLAN
+    /// sub-interface that hits `then reject` must build its ICMP unreachable
+    /// from the INGRESS SUB-INTERFACE's own primary address and VLAN tag, not
+    /// the physical parent's. The logical unit reth0.80 (ifindex 202, parent
+    /// 11, VID 80) carries 172.16.80.8/24; the physical parent 11 has NO egress
+    /// entry of its own. Driving the real enqueue with the physical ingress
+    /// ifindex 11 must resolve the logical unit and source the reply from
+    /// 172.16.80.8 tagged VID 80. On revert (the build keys off the physical
+    /// `ingress_ifindex`), `forwarding.egress.get(&11)` misses, the builder
+    /// returns None, and the reject silently degrades to a discard
+    /// (`sent == false`, `pending_tx_local` empty) — RED.
+    #[test]
+    fn reject_reply_non_tcp_sources_from_logical_vlan_ifindex_3976() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
+        // reth0.80: logical ifindex 202, parent 11, VID 80, 172.16.80.8/24.
+        // The physical parent 11 is deliberately NOT a configured interface, so
+        // a physical-parent-keyed egress lookup misses entirely.
+        let snapshot = crate::ConfigSnapshot {
+            interfaces: vec![crate::InterfaceSnapshot {
+                name: "reth0.80".into(),
+                ifindex: 202,
+                parent_ifindex: 11,
+                vlan_id: 80,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "172.16.80.8/24".into(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let forwarding = build_forwarding_state(&snapshot);
+        // Fixture sanity: parent 11 / VID 80 resolves to the logical unit 202.
+        assert_eq!(
+            resolve_ingress_logical_ifindex(&forwarding, 11, 80),
+            Some(202),
+            "parent 11 / VLAN 80 must resolve to logical unit 202"
+        );
+
+        // Inbound ICMP echo (untagged frame; the hardware tag is carried in
+        // meta.ingress_vlan_id) from a VLAN-80 host to a unicast destination.
+        let client = std::net::Ipv4Addr::new(172, 16, 80, 55);
+        let server = std::net::Ipv4Addr::new(8, 8, 8, 8);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]); // dst (fw)
+        frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]); // src (host)
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_ICMP, 0, 0,
+        ]);
+        frame.extend_from_slice(&client.octets());
+        frame.extend_from_slice(&server.octets());
+        frame.extend_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1]); // ICMP echo
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 11,
+            ingress_vlan_id: 80,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: std::net::IpAddr::V4(client),
+            dst_ip: std::net::IpAddr::V4(server),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: std::net::IpAddr::V4(client),
+                dst_ip: std::net::IpAddr::V4(server),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let mut counters = BatchCounters::default();
+        // Drive the real enqueue with the PHYSICAL ingress ifindex 11.
+        let sent = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            11, // physical parent ingress ifindex
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(
+            sent,
+            "non-TCP reject on a VLAN sub-if must build + enqueue an ICMP \
+             unreachable (a physical-parent-keyed build misses the sub-if \
+             egress and silently drops)"
+        );
+        assert_eq!(counters.policy_reject_sent, 1);
+        let req = pipeline
+            .pending_tx_local
+            .pop_front()
+            .expect("reject ICMP request");
+        // Transmit on the PHYSICAL bind port (unchanged).
+        assert_eq!(req.egress_ifindex, 11);
+        // The reply carries the sub-if's VLAN tag (VID 80), from the egress
+        // vlan_id fallback (the inbound frame was untagged).
+        assert_eq!(
+            &req.bytes[12..14],
+            &[0x81, 0x00],
+            "reply must carry an 802.1Q tag"
+        );
+        let vid = u16::from_be_bytes([req.bytes[14], req.bytes[15]]) & 0x0fff;
+        assert_eq!(vid, 80, "reply VLAN id must be the sub-if VID 80");
+        assert_eq!(
+            &req.bytes[16..18],
+            &0x0800u16.to_be_bytes(),
+            "inner EtherType IPv4"
+        );
+        // ICMP source == the sub-if's own primary v4 (172.16.80.8), NOT parent.
+        assert_eq!(
+            &req.bytes[30..34],
+            &[172, 16, 80, 8],
+            "ICMP unreachable must be sourced from the ingress sub-if address"
+        );
+        // ICMP Destination Unreachable, admin-prohibited (type 3, code 13).
+        assert_eq!(req.bytes[38], 3, "ICMP type Destination Unreachable");
+        assert_eq!(req.bytes[39], 13, "ICMP code admin-prohibited");
+    }
+
+    /// #3976 fail-on-revert (IPv6): the same VLAN-sub-if reject fix on the
+    /// ICMPv6 path — the generated ICMPv6 admin-prohibited unreachable must be
+    /// sourced from the sub-if's primary v6 and carry the sub-if VLAN tag.
+    /// Uses the FILTER entry point to cover that source too. On revert the
+    /// physical-parent-keyed build misses the sub-if egress → None → drop.
+    #[test]
+    fn filter_reject_non_tcp_v6_sources_from_logical_vlan_ifindex_3976() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
+        let snapshot = crate::ConfigSnapshot {
+            interfaces: vec![crate::InterfaceSnapshot {
+                name: "reth0.80".into(),
+                ifindex: 202,
+                parent_ifindex: 11,
+                vlan_id: 80,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:559:8585:80::8/64".into(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let forwarding = build_forwarding_state(&snapshot);
+        let client: std::net::Ipv6Addr = "2001:559:8585:80::55".parse().unwrap();
+        let server: std::net::Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let src_ip: std::net::Ipv6Addr = "2001:559:8585:80::8".parse().unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]); // dst (fw)
+        frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]); // src (host)
+        frame.extend_from_slice(&0x86ddu16.to_be_bytes());
+        // IPv6 header: version 6, payload len 8 (ICMPv6 echo), next-hdr 58.
+        frame.extend_from_slice(&[0x60, 0, 0, 0, 0, 8, PROTO_ICMPV6, 64]);
+        frame.extend_from_slice(&client.octets());
+        frame.extend_from_slice(&server.octets());
+        frame.extend_from_slice(&[128, 0, 0, 0, 0x12, 0x34, 0, 1]); // ICMPv6 echo req
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 11,
+            ingress_vlan_id: 80,
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: std::net::IpAddr::V6(client),
+            dst_ip: std::net::IpAddr::V6(server),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_ICMPV6,
+                src_ip: std::net::IpAddr::V6(client),
+                dst_ip: std::net::IpAddr::V6(server),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_filter_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            11, // physical parent ingress ifindex
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(
+            sent,
+            "non-TCP v6 reject on a VLAN sub-if must build + enqueue an ICMPv6 unreachable"
+        );
+        assert_eq!(counters.filter_reject_sent, 1);
+        let req = pipeline
+            .pending_tx_local
+            .pop_front()
+            .expect("reject ICMPv6 request");
+        assert_eq!(req.egress_ifindex, 11);
+        assert_eq!(
+            &req.bytes[12..14],
+            &[0x81, 0x00],
+            "reply must carry an 802.1Q tag"
+        );
+        let vid = u16::from_be_bytes([req.bytes[14], req.bytes[15]]) & 0x0fff;
+        assert_eq!(vid, 80, "reply VLAN id must be the sub-if VID 80");
+        assert_eq!(
+            &req.bytes[16..18],
+            &0x86ddu16.to_be_bytes(),
+            "inner EtherType IPv6"
+        );
+        // ICMPv6 source (IPv6 header src at bytes 8..24 of the L3 packet;
+        // L2 is 18 bytes tagged, so the source octets are at [26..42]).
+        assert_eq!(
+            &req.bytes[26..42],
+            &src_ip.octets(),
+            "ICMPv6 unreachable must be sourced from the ingress sub-if v6 address"
+        );
+        // ICMPv6 Destination Unreachable, admin-prohibited (type 1, code 1).
+        assert_eq!(req.bytes[58], 1, "ICMPv6 type Destination Unreachable");
+        assert_eq!(req.bytes[59], 1, "ICMPv6 code admin-prohibited");
     }
 
     /// #3071: the unified deny-reply still drives explicit policy `reject`

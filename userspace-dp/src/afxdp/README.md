@@ -101,8 +101,21 @@ sync.
         LOGICAL egress unit ifindex resolved from the physical bind /
         ingress ifindex via the SSOT, NOT the raw physical index. These two
         pre-date #3034 (#2238) and were out of its scope; the physical
-        index is still used for the reflected-reply build and the XSK
-        transmit (`egress_ifindex`).
+        index is still used for the XSK transmit (`egress_ifindex`).
+      - **#3976 — non-TCP reject reply BUILD:** the ICMP/ICMPv6
+        admin-prohibited unreachable synthesized by `reject_reply.rs`
+        (`build_reject_icmp_unreachable`) also keys its egress lookup
+        (`forwarding.egress`, for the reply's SOURCE address and the
+        `vlan_id` tag fallback) off the LOGICAL unit ifindex — not the raw
+        physical `ingress_ifindex`. `forwarding.egress` is keyed by the
+        logical unit, so on a VLAN sub-interface (e.g. reth0.80) the
+        physical parent had no entry: the build missed, `primary_v4/v6`
+        came up None, the builder returned None, and `then reject`
+        silently degraded to `then discard`. Even when the parent had an
+        entry, the ICMP source and the VLAN tag were the parent's, not the
+        sub-if's. The TCP RST build is self-contained (it reflects the
+        inbound frame, no egress lookup) and is unaffected; this mirrors
+        the Time Exceeded builder, which already passed the logical unit.
       - **#3609 — per-interface host-inbound override:** the local-delivery
         host-inbound gate (`poll_descriptor/filter.rs::host_inbound_gated_lo0_action`
         → `forwarding::host_inbound_admits_iface`) looks up
@@ -112,7 +125,7 @@ sync.
         Before #3609 it passed the raw physical `meta.ingress_ifindex`, so a
         host-bound packet on a VLAN sub-interface missed its per-interface
         override and silently fell back to the zone set.
-    Untagged ports resolve physical == logical, so all seven sites are
+    Untagged ports resolve physical == logical, so all eight sites are
     no-ops there (non-VLAN behavior preserved).
   - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
     NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`

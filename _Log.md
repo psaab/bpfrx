@@ -30497,6 +30497,36 @@ top.
     pkg/dhcprelay/README.md, _Log.md
 
 - **Timestamp**: 2026-07-03
+  - **Action**: #3976 — non-TCP `then reject` sourced the ICMP-unreachable
+    reply from the PHYSICAL parent ifindex instead of the ingress VLAN
+    sub-interface, so on a VLAN sub-if (e.g. reth0.80) the reject degraded
+    to a silent discard (or emitted a wrong-source / untagged reply that
+    the tagged link dropped). Root cause: `forwarding.egress` is keyed by
+    the LOGICAL unit ifindex (`forwarding_build/interfaces.rs`), but
+    `enqueue_reject_reply` passed the raw physical bind port
+    (`binding.ifindex` / `meta.ingress_ifindex`) to
+    `build_reject_icmp_unreachable`, whose egress lookup
+    (`forwarding.egress.get(&ingress_ifindex)`) supplies the reply's SOURCE
+    address and the `vlan_id` tag fallback. On a VLAN sub-if the physical
+    parent has no egress entry → `primary_v4/v6` None → builder returns
+    None → reject → discard. Fix: resolve the logical unit ifindex ONCE via
+    the existing `resolve_ingress_logical_ifindex` SSOT and key the ICMP
+    build off it (the #3035 output-filter classify now reuses the same
+    value); the physical `ingress_ifindex` is still used for the
+    `TxRequest.egress_ifindex` (XSK transmit device). Mirrors the Time
+    Exceeded builder, which already passed the logical unit ifindex. The
+    TCP RST build is self-contained (reflects the inbound frame) and is
+    unchanged. RED-on-revert tests (reject_reply.rs):
+    `reject_reply_non_tcp_sources_from_logical_vlan_ifindex_3976` (v4) and
+    `filter_reject_non_tcp_v6_sources_from_logical_vlan_ifindex_3976` (v6)
+    build a VLAN sub-if (reth0.80, logical 202, parent 11, VID 80) with the
+    parent NOT configured, drive the real enqueue with physical ingress 11,
+    and assert the reply carries the sub-if VLAN tag + is sourced from the
+    sub-if primary address; both FAIL (sent == false → silent drop) when
+    the build is reverted to the physical ifindex. Confirmed RED; FULL
+    cargo test --release green; `go build ./...` green.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+    userspace-dp/src/afxdp/README.md, _Log.md
   - **Action**: #3972 — port-mirroring invalid-entry fail mode. VERIFY FIRST
     refuted the issue's stated fail-mode: the "warn + drop whole table" lived in
     `pkg/dataplane/userspace/mirrors.go` `buildMirrorConfigSnapshotsFailClosed`
