@@ -32334,3 +32334,39 @@ top.
     pkg/config/compiler_ipsec_trafficselector.go, pkg/config/compiler.go,
     pkg/ipsec/trafficselector_render_4098_test.go,
     pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4122 — fail-closed fabric gRPC allowlist interceptor. The
+    cluster fabric listener (`RunFabricListener`, `pkg/grpcapi/server.go`)
+    registered the identical full 48-RPC `BpfrxService` as the loopback
+    `Run()` listener, guarded only by `configLockInterceptor` (a stale-lock
+    reaper, not auth). Since the loopback listener binds 127.0.0.1 and the
+    fabric listener binds the sync/fabric IP, the fabric listener is the ONLY
+    network-exposed gRPC surface — exposing SystemAction reboot/halt/
+    power-off/zeroize + Commit/Delete/Rollback UNAUTH on the fabric IP. Fix:
+    added a default-deny allowlist interceptor PAIR
+    (`fabricAllowlistUnaryInterceptor` / `fabricAllowlistStreamInterceptor`)
+    on the FABRIC listener only, chained with the existing
+    `configLockInterceptor` via `ChainUnaryInterceptor`/`ChainStreamInterceptor`.
+    Allowlist = exactly the peer-proxied RPCs (verified against every
+    `dialPeer()->NewBpfrxServiceClient` call site): GetStatus, GetSessions,
+    GetSessionSummary, GetZonePairSummary, ShowText, ClearSessions (unary) +
+    MonitorInterface (stream). SystemAction DECISION = NESTED-ACTION (not
+    blanket exclude): it multiplexes fabric-safe cluster-failover with
+    destructive actions, so `isFabricSafeSystemAction` permits ONLY the two
+    proxied cross-node forms (`cluster-failover-data:node<N>`,
+    `cluster-failover:<rg>:node<N>`) and denies zeroize/reboot/halt/power-off.
+    Chose nested over exclude because excluding SystemAction would make a
+    cross-node `request chassis cluster failover ... node <peer>` return
+    PermissionDenied when the initiating node proxies to the peer's fabric
+    listener — a shipped HA operator workflow regression. Loopback `Run()`
+    listener UNCHANGED (127.0.0.1 trusted, full service). RED-on-revert:
+    weakening the fix (SystemAction added to the plain allowlist) makes
+    zeroize/reboot reachable and fails the nested-gate + set-guard tests;
+    committed fix GREEN. `go test ./pkg/grpcapi/...` green; go build ./...,
+    go vet, gofmt clean. FLAG: touches the fabric proxy path — behavior is
+    PRESERVED for the two failover forms (nested-action), so no failover
+    regression, but test-failover is still warranted hygiene before terminal.
+  - **File(s)**: pkg/grpcapi/server.go,
+    pkg/grpcapi/server_fabric_allowlist_4122_test.go, docs/architecture.md,
+    _Log.md
