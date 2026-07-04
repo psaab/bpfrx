@@ -42,6 +42,15 @@ fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
     wg_record_len + outer_ip_len + 8
 }
 
+/// Test-only seam: counts every entry into `outer_physical_egress_ifindex`
+/// (each one performs exactly one outer-underlay FIB LPM). `wg_encap_frame`
+/// resolves the outer route ONCE per packet (#3992); a test resets this to 0,
+/// builds one frame, and asserts the count is exactly 1 (it was 2 before the
+/// dedup). Relies on serial test execution (the suite runs `--test-threads=1`).
+#[cfg(test)]
+pub(super) static OUTER_ROUTE_RESOLVE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Resolve the PHYSICAL underlay egress ifindex the OUTER (WG/UDP) datagram
 /// actually leaves on, for a tunnel-resolved encap decision (#2680/#2701).
 ///
@@ -116,6 +125,12 @@ fn outer_physical_egress_ifindex(
     endpoint: &TunnelEndpoint,
     outer_dst: IpAddr,
 ) -> i32 {
+    // #3992: instrument the per-packet FIB-LPM count. `wg_encap_frame` must
+    // enter this helper exactly ONCE per encapped packet (the MTU guard and
+    // the outer-source lookup share the single resolution); a second entry per
+    // packet is the redundant lookup this fix removed.
+    #[cfg(test)]
+    OUTER_ROUTE_RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // #2734: WG outer underlay resolution is per-tunnel-endpoint, not
     // per-inner-flow — pass None (per-destination ECMP spread).
     let outer = match outer_dst {
@@ -345,12 +360,28 @@ pub(super) fn wg_encap_frame(
     // outer frame adds eth + outer IP + UDP(8). Drop oversize rather than
     // letting the kernel fragment the outer datagram.
     //
-    // #2680: the OUTER datagram must fit the PHYSICAL underlay egress MTU,
-    // NOT `decision.resolution.egress_ifindex` (the tunnel LOGICAL ifindex,
-    // MTU ~1420). Re-resolve the underlay egress via the route to the SELECTED
-    // peer endpoint (the real outer hop for WG) and use its MTU; the
-    // logical/inner MTU is a separate concern handled by the inner-MTU clamp.
-    let outer_mtu = outer_physical_egress_mtu(decision, forwarding, endpoint, peer_endpoint.ip());
+    // #2680/#2701/#3992: resolve the PHYSICAL underlay egress ONCE per packet
+    // (a single FIB LPM to the SELECTED peer endpoint — the real outer hop for
+    // WG) and reuse the result for BOTH the outer-MTU guard AND the outer IP
+    // SOURCE lookup below. The OUTER datagram must fit the PHYSICAL underlay
+    // egress MTU, NOT `decision.resolution.egress_ifindex` (the tunnel LOGICAL
+    // ifindex, MTU ~1420); the logical/inner MTU is a separate concern handled
+    // by the inner-MTU clamp.
+    //
+    // Pre-#3992 the identical route was resolved TWICE: once via
+    // `outer_physical_egress_mtu` here (for the MTU) and again via
+    // `outer_physical_egress_ifindex` at the source-write site below — same
+    // `peer_endpoint.ip()`, same `endpoint.transport_table`, so the two FIB
+    // LPMs always returned the same ifindex. The second lookup was pure
+    // redundant per-packet work on the encrypt hot path. Resolve once, thread
+    // the ifindex + egress row through. `outer_physical_egress_mtu` is still
+    // the SSOT used by the PTB path (`wg_endpoint_physical_outer_mtu`); here we
+    // inline its body against the single shared `egress` row so the guard MTU
+    // is byte-identical to what that helper would return for this ifindex.
+    let physical_egress_ifindex =
+        outer_physical_egress_ifindex(decision, forwarding, endpoint, peer_endpoint.ip());
+    let egress = forwarding.egress.get(&physical_egress_ifindex);
+    let outer_mtu = egress.map(|e| e.mtu).filter(|m| *m > 0).unwrap_or(1500);
     let wg_record_len = WG_DATA_HEADER_LEN + pad_to_16(inner_packet.len()) + POLY1305_TAG_LEN;
     if wg_encapped_size(inner_packet.len(), outer_v6) > outer_mtu {
         // #1865: the promised "follow-up" counter store — same
@@ -440,10 +471,9 @@ pub(super) fn wg_encap_frame(
     // SAME egress the #2680 MTU guard uses — NOT
     // `decision.resolution.egress_ifindex` (the tunnel LOGICAL ifindex,
     // whose primary is a tunnel address or absent → wrong source / None
-    // drop). Both follow `outer_physical_egress_ifindex`.
-    let physical_egress_ifindex =
-        outer_physical_egress_ifindex(decision, forwarding, endpoint, peer_endpoint.ip());
-    let egress = forwarding.egress.get(&physical_egress_ifindex);
+    // drop). #3992: reuse the `physical_egress_ifindex` / `egress` row
+    // resolved ONCE above (both the guard and this source share the single
+    // `outer_physical_egress_ifindex` FIB LPM) rather than re-resolving.
     let src_port = endpoint.wg_listen_port;
     let dst_port = peer_endpoint.port();
 
@@ -1140,6 +1170,56 @@ mod wg_frame_tests {
         assert_ne!(outer_src, &[10, 123, 0, 1], "outer source must not be the tunnel addr");
         // And the destination is the peer endpoint (203.0.113.7).
         assert_eq!(&out[30..34], &[203, 0, 113, 7], "outer dst is the peer endpoint");
+    }
+
+    #[test]
+    fn wg_encap_frame_resolves_outer_route_once_v4() {
+        // #3992 RED-on-revert: `wg_encap_frame` must resolve the outer underlay
+        // route (a FIB LPM via `outer_physical_egress_ifindex`) EXACTLY once
+        // per encapped packet. Pre-#3992 the outer-MTU guard and the outer IP
+        // SOURCE lookup each ran the IDENTICAL resolution (same peer endpoint,
+        // same transport table) → 2 FIB LPMs per packet on the encrypt hot
+        // path. Reverting the dedup makes this count 2 → red. Relies on serial
+        // test execution (the suite runs `--test-threads=1`).
+        let mut state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let peer_ep: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        state
+            .wg_engines
+            .insert(1, Arc::new(established_initiator_engine(peer_ep, "10.123.0.0/24")));
+        let decision = wg_encap_decision();
+        let frame = inner_v4_frame();
+
+        // Count only the resolutions performed INSIDE wg_encap_frame: reset
+        // immediately before the single call, read immediately after.
+        OUTER_ROUTE_RESOLVE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let out = wg_encap_frame(&frame, inner_v4_meta(), &decision, &state)
+            .expect("wg_encap_frame must build (established session, routed peer)");
+        let resolves = OUTER_ROUTE_RESOLVE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            resolves, 1,
+            "wg_encap_frame must resolve the outer underlay route ONCE per \
+             packet (got {resolves}; pre-#3992 it resolved twice — MTU guard + \
+             outer source)"
+        );
+
+        // Byte-identity of the outer header: the single-lookup dedup does NOT
+        // change WHICH route is chosen, so the emitted outer L2/L3 header is
+        // unchanged. Layout: eth(14) + IPv4(20); dst/src MAC in the eth header,
+        // outer src @ 26..30, outer dst @ 30..34, outer UDP dst port @ 36..38.
+        assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55], "outer dst MAC unchanged");
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08], "outer src MAC unchanged");
+        assert_eq!(&out[12..14], &[0x08, 0x00], "outer ethertype IPv4 unchanged");
+        assert_eq!(
+            &out[26..30],
+            &[172, 16, 80, 8],
+            "outer IPv4 source = PHYSICAL WAN primary (unchanged by the dedup)"
+        );
+        assert_eq!(&out[30..34], &[203, 0, 113, 7], "outer IPv4 dst = peer endpoint (unchanged)");
+        assert_eq!(
+            &out[36..38],
+            &51820u16.to_be_bytes(),
+            "outer UDP dst port = peer endpoint port (unchanged)"
+        );
     }
 
     /// Minimal L2/IPv6/UDP inner frame with dst in `fd00:123::/64` so
