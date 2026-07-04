@@ -1,3 +1,43 @@
+## 2026-07-03 — #3970: fwdstatus Sampler issued its OWN redundant 1 Hz control-socket status poll on top of the primary status poll → 2/s on the shared control socket, starving session installs during bulk sync
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-070 (MEDIUM, control-socket contention).
+    The forwarding-status CPU `Sampler` (`pkg/fwdstatus/sampler.go`) ran a
+    1 Hz timer goroutine and on every tick called `us.Status()` on the
+    dataplane accessor, which bottoms out in
+    `userspace.Manager.Status()` → `requestLocked({Type:"status"})` — a
+    control-socket round-trip. The userspace manager ALSO runs its own
+    primary 1 Hz status poll (`statusLoop`, `process.go`) that issues the
+    same `status` request and caches the result in `m.lastStatus`. Net =
+    two independent 1 Hz status requests (2/s) on the socket shared by
+    session installs, HA sync, and snapshot sync — violating the CLAUDE.md
+    ">1/s starves session installs during bulk sync" budget.
+  - **Fix**: added `Manager.CachedStatus() (ProcessStatus, bool)` that
+    returns the last-captured `m.lastStatus` under lock WITHOUT a
+    control-socket request (ok=false when nothing captured yet). Threaded
+    it through `LegacyDataPlaneAdapter.CachedStatus()` and the daemon
+    accessor (`forwardingStatusDaemonUserspaceDataPlane.CachedStatus()` +
+    `userspaceCachedStatusProbe`). The Sampler now type-asserts to
+    `CachedStatus()` and consumes the cache the primary poll already
+    fetched — it adds zero control-socket traffic. On a cache miss the
+    worker counters hold at their previous values, matching the old
+    Status()-error path (series monotonicity preserved). `Build()`
+    (on-demand `show chassis forwarding`) still calls `Status()` — a rare
+    CLI diagnostic, not a periodic poller, so not a rate violation.
+  - **Test**: `TestSamplerConsumesCachedStatusNoControlSocketPoll` +
+    `TestSamplerCacheMissHoldsCountersNoPoll` — a counting accessor mocks
+    both `Status()` (control socket) and `CachedStatus()` (cache) over N
+    sampler ticks and asserts `statusCalls==0`, `cachedCalls==N`, and the
+    worker counters are still populated from the cache. RED-on-revert
+    verified: reverting the Sampler to call `Status()` fails with "5
+    Status() control-socket request(s); want 0". `go test ./pkg/fwdstatus
+    ./pkg/daemon ./pkg/grpcapi ./pkg/cli ./pkg/dataplane/userspace` green,
+    `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/fwdstatus/sampler.go, pkg/fwdstatus/sampler_test.go,
+    pkg/fwdstatus/README.md, pkg/dataplane/userspace/manager.go,
+    pkg/dataplane/userspace/legacy_dataplane.go,
+    pkg/daemon/daemon_forwarding_status.go, _Log.md
+
 ## 2026-07-03 — #3967: SNMP agent / trap-groups were start-once-at-boot → a day-2 commit that enabled SNMP, added a community/trap target, or disabled SNMP sat inert until a daemon restart
 
 - **Timestamp**: 2026-07-03

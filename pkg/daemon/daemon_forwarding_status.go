@@ -63,6 +63,18 @@ func (a forwardingStatusDaemonUserspaceDataPlane) Status() (dpuserspace.ProcessS
 	return a.daemon.userspaceDataplaneStatus()
 }
 
+// CachedStatus returns the last control-socket-captured ProcessStatus
+// without issuing a new request (#3970). The fwdstatus CPU sampler
+// consumes this instead of Status() so it reads worker telemetry off
+// the primary 1 Hz status poll rather than doubling the shared
+// control-socket status rate.
+func (a forwardingStatusDaemonUserspaceDataPlane) CachedStatus() (dpuserspace.ProcessStatus, bool) {
+	if a.daemon == nil {
+		return dpuserspace.ProcessStatus{}, false
+	}
+	return a.daemon.userspaceDataplaneCachedStatus()
+}
+
 // userspaceStatusProbe matches the userspace adapter's Status()
 // method without re-importing the dataplane.DataPlane interface.
 // Satisfied by *dataplane/userspace.LegacyDataPlaneAdapter. The
@@ -74,6 +86,13 @@ type userspaceStatusProbe interface {
 	Status() (dpuserspace.ProcessStatus, error)
 }
 
+// userspaceCachedStatusProbe matches the userspace adapter's
+// CachedStatus() method (#3970), which reads the last captured
+// ProcessStatus without a control-socket request.
+type userspaceCachedStatusProbe interface {
+	CachedStatus() (dpuserspace.ProcessStatus, bool)
+}
+
 func (d *Daemon) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 	if d == nil || d.dp == nil {
 		return dpuserspace.ProcessStatus{}, errors.New("userspace status unavailable")
@@ -83,6 +102,17 @@ func (d *Daemon) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 		return dpuserspace.ProcessStatus{}, errors.New("userspace status unavailable")
 	}
 	return provider.Status()
+}
+
+func (d *Daemon) userspaceDataplaneCachedStatus() (dpuserspace.ProcessStatus, bool) {
+	if d == nil || d.dp == nil {
+		return dpuserspace.ProcessStatus{}, false
+	}
+	provider, ok := d.dp.(userspaceCachedStatusProbe)
+	if !ok {
+		return dpuserspace.ProcessStatus{}, false
+	}
+	return provider.CachedStatus()
 }
 
 // forwardingStatusDataplane builds the fwdstatus accessor used by
