@@ -1,3 +1,20 @@
+## 2026-07-04 — #4103 F12 fold: WgPeerConfig Debug compares PSK by reference (Copilot, PR #4123)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Copilot minor fold on PR #4123. WgPeerConfig's manual
+    Debug did `*self.preshared_key == WG_ZERO_PSK` for the PSK-unset
+    check. `==` already desugars to a by-reference `PartialEq::eq`, so no
+    real by-value copy occurred, but made the by-reference intent explicit
+    to align with F12 key hygiene: `&*self.preshared_key == &WG_ZERO_PSK`
+    (`engine.rs:197`). The other touched Debug impl (`WgEngineConfig`)
+    prints `<redacted>` and never derefs the key. The companion Copilot
+    comment (engine.rs:468 "borrowing config.peers after moving
+    config.local_private_key won't compile") is a confirmed FALSE POSITIVE
+    — Rust partial-move rules permit borrowing other fields after one is
+    moved; the crate builds and 3490 tests pass. cargo check --release
+    green; rustfmt clean on the changed line.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs, _Log.md
+
 ## 2026-07-04 — #4103 F12: WG engine-config secret carriers zeroized (fable-163)
 
 - **Timestamp**: 2026-07-04

@@ -191,7 +191,10 @@ pub(crate) struct WgPeerConfig {
 
 impl std::fmt::Debug for WgPeerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let psk_state = if *self.preshared_key == WG_ZERO_PSK {
+        // Compare by reference (`&[u8; 32]`), not by deref-to-value, so
+        // the PSK is never copied to the stack even transiently (#4103
+        // F12 key hygiene).
+        let psk_state = if &*self.preshared_key == &WG_ZERO_PSK {
             "<unset>"
         } else {
             "<redacted>"
