@@ -143,6 +143,25 @@ all N siblings) and the delete/deactivate-side #3846/#3975 (member-wise edit,
 which these leaves now inherit for free because `delete`/`deactivate` route a
 `multi: true, children: nil, args == 1` leaf through the member matcher).
 
+**`system archival configuration transfer-interval <minutes>` — periodic
+off-box archive (#4078).** Junos archives the running config to `archive-sites`
+every N minutes, independent of `transfer-on-commit` (a periodic backup for a
+config that rarely changes). The leaf compiled into
+`config.ArchivalConfig.TransferInterval` from the start, but no runtime consumer
+read it — so the timed archive never fired (accepted-but-inert). It is now a
+typed `setSchema` leaf (`ValueInteger`, `ValidateInteger(1, 2880)`) AND is wired
+to a runtime timer: `daemon.reconcileArchiveTimer` (called from
+`applyConfigLocked`, mirroring `reconcileRPM`) arms `runArchiveTimer`, which
+fires every N minutes and archives the CURRENT active config via the SAME
+`archiveToSites` transport `transfer-on-commit` uses (`daemon_flow.go`). The two
+compose — either, both, or neither. The timer is hash-gated on
+`(interval, sites)` so an unrelated commit never bounces a healthy timer; a
+change to the interval or the site set reschedules; removing the leaf (or
+dropping to interval 0 / no sites) stops it; and it re-arms on daemon restart
+because the boot apply runs the same reconcile against the active config.
+Periodic archival needs BOTH a positive interval AND at least one archive-site;
+a bare `transfer-on-commit` config never spins a periodic goroutine.
+
 **`valueList` — a bracketed value list on a multi leaf that ALSO has a
 modifier child (#3872).** The bracket-absorption above fires only for a
 `multi: true` leaf with `children: nil`. The static-route `next-hop` leaf is

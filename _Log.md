@@ -1,3 +1,40 @@
+## 2026-07-04 — #4078: `system archival configuration transfer-interval` periodic archive accepted-but-inert — add the runtime timer
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed fable-161 F-060 (MEDIUM, feature-gap). Junos
+    `transfer-interval <minutes>` archives the running config to
+    `archive-sites` every N minutes, independent of `transfer-on-commit`.
+    The leaf compiled into `config.ArchivalConfig.TransferInterval` (with
+    parser tests) but no runtime consumer read it — only `archiveConfig`
+    (gated on `TransferOnCommit`, called from `applyConfigLocked`) ran, so
+    the timed periodic archive never fired (accepted-but-inert). Fix
+    (Go-only): (1) extract the reusable archive-to-site transport
+    `archiveToSites(sites)` out of `archiveConfig` (`daemon_flow.go`) —
+    serialize `Store.ShowActive` to a 0600 temp file + scp to each site via
+    the `archiveTransfer` seam; `archiveConfig` now delegates to it, so
+    transfer-on-commit is unchanged. (2) Add `reconcileArchiveTimer` +
+    `runArchiveTimer` + `stopArchiveTimer` (`daemon_archive_timer.go`),
+    mirroring `reconcileRPM`: called from `applyConfigLocked` (new step
+    15c), hash-gated on `(interval, sites)` so an unrelated commit never
+    bounces a healthy timer; a change reschedules; removing the leaf (or
+    interval 0 / no sites) stops it; re-arms on restart via the boot apply;
+    the timer reuses `archiveToSites` (reads the LIVE active config on each
+    tick). (3) Added the `transfer-interval` typed `setSchema` leaf
+    (`ValueInteger`, `ValidateInteger(1,2880)`) for completion + commit-check.
+    (4) `stopArchiveTimer` added to the shutdown teardown. Tick source is
+    behind the `archiveNewTicker` seam so tests fire deterministically.
+  - **File(s)**: pkg/config/schema_system.go,
+    pkg/daemon/daemon_flow.go, pkg/daemon/daemon_archive_timer.go (new),
+    pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+    pkg/daemon/daemon_run.go, pkg/daemon/archive_timer_4078_test.go (new),
+    docs/config-schema.md
+  - **Validation**: `go build ./...`, `go vet`, `gofmt` clean;
+    `go test ./pkg/config/... ./pkg/daemon/... ./pkg/configstore/...`
+    green; archive tests green under `-race`. RED-on-revert proven:
+    neutering the `archiveToSites` call in `runArchiveTimer` makes
+    `TestArchiveTimerFiresPeriodicArchive` fail ("periodic archive never
+    fired — transfer-interval is inert").
+
 ## 2026-07-04 — #4071: GRE keepalive accepted-but-inert on the userspace-dp (anchor) path — re-wire the #1918 engine onto `applyAnchorLocked`
 
 - **Timestamp**: 2026-07-04

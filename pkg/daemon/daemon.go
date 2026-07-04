@@ -627,6 +627,22 @@ type Daemon struct {
 	// d.opts.ConfigFile (#3867).
 	archiveTransfer func(ctx context.Context, srcPath, dest string) error
 
+	// --- periodic configuration-archival timer (#4078) ---
+	// archiveTimerMu guards archiveTimerKey + archiveTimerStop.
+	archiveTimerMu sync.Mutex
+	// archiveTimerKey is the (interval|sites) hash the running periodic-archival
+	// timer was armed for; "" ⇒ no timer running. reconcileArchiveTimer compares
+	// against it so an unrelated commit never bounces a healthy timer.
+	archiveTimerKey string
+	// archiveTimerStop is closed to stop the running periodic-archival goroutine
+	// (reschedule on a transfer-interval/site change, or shutdown). nil ⇒ none.
+	archiveTimerStop chan struct{}
+	// archiveNewTicker builds the periodic-archival tick channel + a stop func.
+	// nil ⇒ realArchiveTicker (a wall-clock time.Ticker). Overridable so tests
+	// drive the periodic archive deterministically without a wall-clock wait
+	// and assert it reuses the archiveToSites transport (#4078).
+	archiveNewTicker func(d time.Duration) (<-chan time.Time, func())
+
 	// --- SNMP link-state monitor seams (#3950) ---
 	// linkStateSubscribe starts a netlink link-update subscription for the
 	// SNMP link-state monitor. It MUST stream updates to ch and close ch when
