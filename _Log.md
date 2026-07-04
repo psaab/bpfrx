@@ -1,3 +1,137 @@
+## 2026-07-04 — #4088: pool SNAT — id==0 ICMP echo is a valid keyable query
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (b9c2ee46c). Confirmed the #4086
+    residual: `nat/source.rs` computed `icmp_query = matches!(protocol,
+    PROTO_ICMP | PROTO_ICMPV6) && src_port != 0`, so an ICMP echo whose
+    Query Identifier is 0 (a valid on-wire value, 0..=65535) flattened to
+    the same `src_port == 0` sentinel a non-query ICMP uses, took the
+    address-only path, and two id==0 flows behind one pool address collided
+    on the reverse tuple `(pool_addr, 0)` — the #4074 bug, residual for
+    id==0. Root insight: the frame parser only builds a `SessionFlow` for an
+    ICMP protocol when `parse_flow_ports` matched an identifier-bearing
+    query type (`icmp_identifier_bearing`), so at the real call site a
+    SessionFlow existing for ICMP ⟺ it IS a query (id may be 0). FIX:
+    threaded an authoritative `icmp_identifier_present: bool` into
+    `match_source_nat_result_for_tuple` (last positional bool before
+    `matched_counter`) and changed the gate to `matches!(protocol, ICMP |
+    ICMPV6) && icmp_identifier_present` (dropping the `src_port != 0`
+    heuristic). The flow caller (`forwarding/mod.rs`
+    `match_source_nat_for_flow_result_at`) passes
+    `matches!(flow.forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6)`; the
+    address-only wrapper (`match_source_nat_result`, `protocol == 0`) and the
+    status.rs test helper pass `false`. The reverse arms
+    (`session/key.rs`) already key on `nat.rewrite_src_port`, so id==0
+    recovers once the forward allocates. Frame rewriter
+    (`apply_nat_icmp_identifier_rewrite`) re-gates on the real ICMP type byte
+    (defense in depth). Updated all 23 `match_source_nat_result_for_tuple`
+    call sites (2 ICMP-query → true, the rest → false).
+  - **File(s)**: userspace-dp/src/nat/source.rs,
+    userspace-dp/src/afxdp/forwarding/mod.rs,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    userspace-dp/src/nat/tests.rs (new
+    `pool_snat_translates_icmp_query_id_zero_distinct_per_host` RED-on-revert
+    + updated call sites/comments),
+    userspace-dp/src/session/tests.rs (new
+    `icmp_query_id_zero_translation_demuxes_reverse_wire_key`),
+    docs/userspace-dataplane-architecture.md.
+## 2026-07-04 — #4076: bump linkGen on anchor transient-lookup + device-vanished recreate
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (f1c54a5a4). Confirmed the #4075
+    follow-up gap in `applyAnchorLocked` (`pkg/routing/tunnel.go`): its
+    up-front `willRecreate` switch (`tunnel.go:515`) has only
+    `lookupErr == nil` and `isLinkNotFound` cases — NO `default: return`
+    (unlike the legacy `applyKernelTunnelLocked`, `tunnel.go:777`, which
+    aborts a transient non-not-found lookup error). So a TRANSIENT
+    (non-not-found) `LinkByName` error leaves `willRecreate=false` (no
+    up-front `stopKeepaliveLocked`/`bumpLinkGenLocked`), yet if the device
+    had simultaneously VANISHED the fall-through `LinkAdd` SUCCEEDS
+    (`created=true`, `tunnel.go:570`) against a genuinely NEW device with
+    a STALE `linkGen`. A stale keepalive runner still holding the previous
+    generation would then pass the lock-free gen guard
+    (`keepaliveTick`, `tunnel.go:1601`) and `LinkSet*` the fresh device in
+    the µs window before `startKeepalive` drains it. FIX: added a
+    `if created && !willRecreate { t.bumpLinkGenLocked(tc.Name) }` block
+    after the `LinkAdd`/`link==nil` reconcile (`tunnel.go` ~:584) — every
+    genuinely new device gets a fresh generation. Guarded on
+    `!willRecreate` so the classified-recreate path (already bumped +
+    drained up-front) is not double-bumped, and gated on `created` so a
+    plain reuse/adopt reconcile never needlessly bumps (no per-apply
+    re-resolve of a stable keepalive). Chose the issue's preferred
+    non-aborting one-line hardening over mirroring the legacy
+    `default: return`. TESTS:
+    `TestAnchorKeepaliveTransientLookupVanishedBumpsGen`
+    (byNameHardErr + addExisting=false → LinkAdd created → gen MUST bump;
+    RED on revert: 0->0) +
+    `TestAnchorKeepaliveReuseDoesNotBumpGen` (repeated reuse applies →
+    gen unchanged, no needless re-resolve). RED-on-revert verified. Full
+    `go test ./pkg/routing/...` green; `go build ./...`, `go vet`, gofmt
+    clean. Updated `pkg/routing/README.md` Recreate-safety bullet.
+  - **File(s)**: pkg/routing/tunnel.go,
+    pkg/routing/tunnel_anchor_keepalive_test.go, pkg/routing/README.md,
+    _Log.md
+
+## 2026-07-04 — #3860: warn at commit when a scheduler defines no window
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (113a1a0aa). Confirmed a degenerate
+    scheduler with no effective window (empty `scheduler x {}` or a bare
+    `daily;` — no start/stop time, no `all-day`, no per-day arm, no
+    start/stop date) compiles (`compileSchedulers`,
+    `pkg/config/compiler_system.go:1084`) to a `SchedulerConfig` with every
+    window field zero and NO commit warning. Post-#3849/#3858 the runtime
+    (`pkg/scheduler.isWithinWindow:278`) fail-closes such a scheduler to
+    INACTIVE (the security half of #3849; helpers `schedulerHasTimeWindow`
+    / `schedulerHasDateRange`). Only half-windows and unparseable
+    times/dates log today — the fully-degenerate always-on→INACTIVE flip
+    was silent. FIX: added a commit-time WARNING in `ValidateConfig`
+    (`pkg/config/compiler_validate_warn.go`) that iterates schedulers by
+    sorted name and, when `schedulerHasEffectiveWindow` is false, appends
+    `scheduler "X" defines no time window; policies bound to it will be
+    INACTIVE (use `+"`daily all-day`"+` for always-on)`. Warning, not
+    hard-reject (#1960-safe: degenerate scheduler is legal Junos; an
+    upgrade must not refuse an existing candidate). A scheduler with any
+    daily/weekday arm, `all-day`, or start/stop date does NOT warn.
+  - **File(s)**: pkg/config/compiler_validate_warn.go,
+    pkg/config/compiler_validate_scheduler_no_window_3860_test.go,
+    pkg/scheduler/README.md, _Log.md
+  - **Validation**: RED-on-revert proven (neutralizing the warn loop makes
+    the 3 no-window cases fire zero warnings → FAIL; has-window cases stay
+    green). `go test ./pkg/config/...` green, `go build ./...` clean,
+    gofmt clean, `go vet ./pkg/config/` clean.
+
+## 2026-07-04 — #3881: hierarchical inline-keys static route drops `interface` modifier
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the defect at HEAD (9cd280f1e). The
+    hierarchical INLINE-keys route form (`route 2001:db8::/32 next-hop fe80::1
+    interface reth0.50;` on one line, no braces) collapses the whole route onto
+    ONE leaf node `Keys=[route <dst> next-hop fe80::1 interface reth0.50]` with
+    NO children → `compileStaticRoutes` takes the inline-keys switch. The
+    `next-hop` case absorbed the gateway run (stopping at the `interface` route
+    keyword via `isRouteInlineKeyword`) but had NO logic to consume the trailing
+    `interface <if>` modifier → the egress interface was silently DROPPED. A
+    scratch repro compiled `nexthops=[{Address:fe80::1 Interface:""}]`. For an
+    IPv6 link-local next-hop the egress interface is REQUIRED (unresolvable
+    without it). FIX (`pkg/config/compiler_routing.go`): the inline-keys
+    `next-hop` case now collects the gateways into a slice, then consumes a
+    trailing `interface <if>` and applies it to the gateway(s), mirroring the
+    working child/brace form. Both the inline-keys case and the child/brace
+    read now treat `interface` as the modifier keyword ONLY after ≥1 gateway is
+    parsed (Copilot defect 2, negligible edge), so a next-hop value literally
+    named `interface` as the FIRST token stays a gateway value.
+  - **File(s)**: pkg/config/compiler_routing.go,
+    pkg/config/compiler_static_route_inline_iface_3881_test.go,
+    docs/config-schema.md, _Log.md
+  - **Validation**: 5 new tests (inline-keys / brace / flat-set interface
+    modifier + inline ECMP + literal-`interface`-first-value). RED-on-revert
+    proven: reverting the two edits fails `TestStaticRouteInlineKeysInterface
+    Modifier_3881` (Interface="") and `TestStaticRouteNextHopLiteralInterface
+    FirstValue_3881` (0 next-hops); brace + flat-set stay green.
+    `go test ./pkg/config/...` green, `go build ./...` clean, gofmt + go vet
+    clean.
+
 ## 2026-07-04 — #4120: drop leftover test-env `is_trust_flow` debug-log bypass (fable-163 F27)
 
 - **Timestamp**: 2026-07-04
@@ -32951,3 +33085,104 @@ top.
     userspace-dp/src/afxdp/umem/tests.rs,
     userspace-dp/src/afxdp/frame/tests.rs,
     userspace-dp/src/filter/README.md, docs/feature-gaps.md
+  - **Action**: #3908 — flowless screen path missing-profile WARN parity.
+    check_flowless_screens returned ScreenVerdict::Pass SILENTLY on the None
+    branch (no resolved profile for the zone), whereas the flow-present
+    check_packet_with_zone_id None branch calls maybe_warn_missing_profile
+    (#3082 observability). A flowless packet (non-first fragment / non-query
+    ICMP) to a zone that REFERENCES an undefined screen profile therefore
+    produced no diagnostic. FIX: on the check_flowless_screens None branch call
+    self.maybe_warn_missing_profile(zone, now_secs) before returning Pass,
+    mirroring the flow path. Watch-log-only, no drop-behavior change — the
+    helper already distinguishes "zone references a MISSING profile" (rate-
+    limited WARN) from "zone has no screen configured" (silent Pass), so a zone
+    with no screen still passes without warning. O(1) (one hashmap lookup + a
+    rate-limited increment); no unwrap/panic on the hot flowless path. TESTS
+    (RED-on-revert, all three cases): a missing-profile zone WARNs-once-but-
+    Passes and is rate-limited on the flowless path; a no-screen zone Passes
+    flowless without WARN; a resolved-profile zone runs the real flowless checks
+    and never takes the missing-profile WARN path. Docs: screen/mod.rs #3082
+    module note + check_flowless_screens rustdoc + docs/syn-cookie-flood-
+    protection.md now state both paths share maybe_warn_missing_profile.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/screen/tests.rs, docs/syn-cookie-flood-protection.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3850 — NAT-rule + firewall filter-term duplicate
+    `match`/`then`/`from` blocks read first-block-only (fail-open sibling of
+    #3842). #3842 fixed duplicate inner match/then blocks for SECURITY POLICIES
+    and #3915 for the `nat {}` SUB-blocks, but the same first-block-only class
+    survived in three sibling constructs. `compileNATSource`/`Destination`/
+    `Static` (compiler_nat.go) read `ruleInst.node.FindChild("match")` /
+    `FindChild("then")`; `compileFirewall` read `termInst.node.FindChild("from")`
+    / `FindChild("then")`; `compileSecurity` read the singleton
+    `pre-id-default-policy` `then` via FindChild. `parseStatements` APPENDS a
+    repeated hierarchical block as a sibling at EVERY level, so a
+    `load merge`/`load override` (or a hierarchical config authored twice) that
+    split a rule's/term's conditions across two `match`/`from` blocks had the
+    SECOND block SILENTLY DROPPED — the NAT rule / filter term matched a WIDER
+    set than configured (a fail-open widening), and a second `then` block's
+    action was lost. FIX: iterate EVERY sibling block with `FindChildren`
+    (two-nested-loop form preserving brace depth) so all match/from conditions
+    AND-combine and all then actions apply; a single translation / terminal
+    action resolves last-wins across duplicate then blocks (Junos merge, never a
+    silent drop). Flat-set is inherently safe — `SetPath` container-descent
+    (ast_edit.go) merges duplicate `match`/`from` containers onto one node, so
+    the fail-open is reachable ONLY via the hierarchical `NewParser` shape
+    (verified empirically). SECONDARY: `validatePolicyTerminalActionStrict`
+    (compiler_validate_strict.go) now DEDUPS `pol.terminalActions` by distinct
+    value before the #3043 count, so two IDENTICAL `then { permit; }` blocks
+    merge silently (Junos-faithful) instead of over-rejecting as "2 conflicting
+    terminal actions (permit, permit)"; permit+reject still rejected. TESTS
+    (RED-on-revert, 8 of 13 go RED on source revert): NAT source/destination/
+    static two-`match`-block merge, NAT source two-`then`-block last-wins,
+    filter term two-`from`/two-`then`-block merge, `pre-id-default-policy`
+    two-`then`-block; flat-set split-condition merge regression guards + single-
+    block bit-identical guards stay green; identical-permit merge + permit/reject
+    still-rejected for the dedup. `go test ./pkg/config/...` green; go build
+    ./..., go vet, gofmt clean. Docs: docs/config-schema.md #3850 entry
+    alongside #3842/#3915.
+  - **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_firewall.go,
+    pkg/config/compiler_security.go, pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_dup_match_then_3850_test.go, docs/config-schema.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3850 fold (PR #4139 hostile-review MINOR) — reset the NAT
+    `then` translation spec per block for true last-wins. The #3850 NAT-then
+    merge iterated every `then {}` block but wrote fields by OVERWRITE, so a
+    duplicate then that switches translation TYPE (`then { source-nat
+    interface; }` then `then { source-nat pool poolB; }`) left BOTH
+    Interface=true AND PoolName=poolB on rule.Then → dataplane field-precedence
+    decided, latent stale field. Not a regression / not security-relevant, but
+    overstated "last-wins". FIX: `rule.Then = NATThen{}` at the top of each
+    then-block in compileNATSource (compiler_nat.go:1697) and
+    compileNATDestination (:1921); static NAT resets only the then-set fields
+    `rule.Then=""`/`IsNPTv6=false`/`MappedPort=0` (:2185-2187) so the match
+    fields set by the match loop persist. Reset runs BETWEEN blocks so
+    within-block `prefix X mapped-port P` coupling survives. compileFilterThen
+    (compiler_firewall.go:662) and pre-id-default-policy then are DELIBERATELY
+    NOT reset — they legitimately accumulate modifiers (count+accept /
+    LogSessionInit+Close). TEST: TestNATSourceDupThenTypeSwitchResetsStaleField
+    _3850 — interface→pool switch compiles pool-only (Interface=false); RED on
+    revert of the reset (verified: stale Interface=true). 14 #3850 tests green;
+    go build ./..., go vet, gofmt clean. Merged origin/master (auto-resolved).
+  - **File(s)**: pkg/config/compiler_nat.go,
+    pkg/config/compiler_dup_match_then_3850_test.go, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3608 PR #4143 review fold (MERGE-NEEDS-MINOR). DEFECT A
+    (test-isolation flake): the new e2e reject test
+    `build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608`
+    read the PROCESS-GLOBAL Reject GCRA token bucket without holding
+    `global_bucket_test_lock()` or resetting it, unlike its reject_reply.rs
+    siblings — under parallel `--test-threads` a concurrent test could drain
+    the bucket (flake to `filter_reject_sent == 0`) and its rate-limit denial
+    could break a concurrent lock-test's before==after invariant. Fixed by
+    acquiring the shared lock for the whole reset→drive→assert window +
+    `reset_bucket_for_test(Reject, 0)`, mirroring
+    `reject_tcp_with_egress_enqueues_rst`. DEFECT B: rebased the branch onto
+    origin/master (was 14 behind); only `_Log.md` conflicted, resolved by
+    union (kept both blocks). No production code change this round.
+  - **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md

@@ -184,6 +184,25 @@ floating-backup leaf carrying its own per-next-hop preference (#3871): a plain
 `next-hop` list is equal-cost ECMP, a `qualified-next-hop` is a distance-N
 backup.
 
+**Fully-inline route-keys form drops the `interface` modifier (#3881).** The
+above covers the flat-set and hierarchical-brace shapes, where `next-hop` is
+its own leaf/child node. A THIRD shape exists: the hierarchical route written
+on ONE line with no braces (`route 2001:db8::/32 next-hop fe80::1 interface
+reth0.50;`) collapses the WHOLE route onto one leaf with NO children —
+`Keys=[route <dst> next-hop fe80::1 interface reth0.50]`. `compileStaticRoutes`
+(`compiler_routing.go`) reads this via the inline-keys switch, walking the route
+node's `Keys[2:]` clause by clause; `isRouteInlineKeyword` (which includes
+`interface`) bounds the multi-value gateway run so it stops before the modifier.
+Before #3881 the switch had a `next-hop` case but NO logic to consume the
+trailing `interface <if>` after the gateway run, so the egress interface was
+silently dropped — fatal for an IPv6 link-local next-hop (`fe80::/10`), whose
+gateway is unresolvable without a bound egress interface. The inline-keys
+`next-hop` case now consumes a trailing `interface <if>` and applies it to the
+gateway(s), mirroring the child/brace form. Both the inline-keys case and the
+child/brace read treat `interface` as the modifier keyword ONLY after ≥1
+gateway is parsed, so a next-hop value literally named `interface` as the FIRST
+token stays a gateway value rather than being misparsed as the modifier.
+
 **Delete-side contract: `delete` a member, not the whole list (#3846).**
 The read-side accumulate rule above has a mirror on the edit side. A
 `delete ... from protocol tcp` on a bracket-list leaf must remove ONLY the
@@ -1844,6 +1863,51 @@ reserved for whole-dataplane selection where a rewrite shim
   RED-on-revert for source/destination/static/nat64/proxy-arp, pool merge,
   single-block bit-identical guard — built with `NewParser` for the
   `LoadOverride` dup-block shape, driving `compileNAT` directly).
+- **#3850 (the NAT-RULE and filter-TERM analogue of #3842 — duplicate
+  `match {}`/`then {}` / `from {}` blocks UNDER ONE rule or term):** #3842 fixed
+  the duplicate inner `match`/`then` blocks for SECURITY POLICIES and #3915 for
+  the `nat {}` SUB-blocks, but the SAME first-block-only fail-open survived in
+  three sibling constructs. The per-rule / per-term body read only the FIRST
+  inner block via `FindChild`:
+  - **NAT rules** — `compileNATSource` / `compileNATDestination` /
+    `compileNATStatic` (`compiler_nat.go`) read `ruleInst.node.FindChild("match")`
+    and `FindChild("then")`. A rule with a duplicate `match {}` block had the
+    second block's constraint (e.g. a `destination-address` split into a second
+    block by `load merge`) silently dropped → the NAT rule matched a WIDER set of
+    traffic than configured (a fail-open widening / mis-translation).
+  - **Firewall filter terms** — `compileFirewall` read `termInst.node.FindChild(
+    "from")` and `FindChild("then")`. A term with duplicate `from {}` blocks
+    likewise dropped the second block's match conditions (fail-open widening);
+    a duplicate `then {}` dropped the second block's action.
+  - **`pre-id-default-policy`** — `compileSecurity` read the singleton `then {}`
+    with `FindChild` (narrow surface, session-log modes only).
+
+  The fix iterates EVERY sibling block with `FindChildren` (a two-nested-loop
+  form that preserves brace depth): the NAT rule loops read `match {}` and
+  `then {}` blocks in full; the filter term calls `compileFilterFrom` /
+  `compileFilterThen` once per block (both ACCUMULATE into the term, and
+  `compileFilterThen` still handles the leaf form `then accept;` where the
+  action rides on `Keys`, not `Children`). All match/from conditions AND-combine;
+  a NAT rule's single translation action and a filter term's terminal action
+  (accept/discard/reject) resolve last-wins across duplicate `then` blocks (Junos
+  merges duplicate stanzas — the second is applied, never silently dropped). The
+  flat-set path is INHERENTLY SAFE: `SetPath` container-descent (`ast_edit.go`)
+  merges two `set … match X` / `set … match Y` lines onto ONE `match` node, so
+  this fail-open is reachable ONLY via the hierarchical `NewParser` /
+  `LoadMerge`/`LoadOverride` shape. SECONDARY (same review): the #3843/#3043
+  conflicting-terminal-action gate `validatePolicyTerminalActionStrict`
+  (`compiler_validate_strict.go`) now DEDUPS `pol.terminalActions` by distinct
+  value before the count, so two IDENTICAL `then { permit; }` blocks merge
+  silently (Junos-faithful) instead of over-rejecting as "2 conflicting terminal
+  actions (permit, permit)"; only DIFFERENT actions (permit + reject) still trip
+  the gate. Regression coverage:
+  `pkg/config/compiler_dup_match_then_3850_test.go` (RED-on-revert: NAT
+  source/destination/static two-`match`-block merge, NAT source two-`then`-block
+  last-wins, filter term two-`from`/two-`then`-block merge, `pre-id-default-policy`
+  two-`then`-block; flat-set split-condition merge regression guards; single-block
+  bit-identical guards; identical-permit merge + permit/reject-still-rejected for
+  the dedup — built with `NewParser` for the `LoadOverride` shape, driving
+  `compileNAT`/`compileFirewall`/`compileSecurity` directly).
 - **#3473 (duplicate security-policy names — strict commit gate):**
   `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
   hard-rejects two security policies that share a name within the same

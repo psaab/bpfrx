@@ -1599,8 +1599,14 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &NATRule{Name: ruleInst.name}
 
-			matchNode := ruleInst.node.FindChild("match")
-			if matchNode != nil {
+			// #3850: iterate EVERY `match {}` block, not just the first — a
+			// duplicate block (a `load merge`/`load override` that splits its
+			// conditions, or a hierarchical config authored twice) must
+			// AND-combine every condition, never be dropped by a FindChild-first
+			// read (a fail-open widening of the NAT match). Flat-set is
+			// unaffected: SetPath merges duplicate containers into one node
+			// (ast_edit.go), so this only changes the hierarchical/parser shape.
+			for _, matchNode := range ruleInst.node.FindChildren("match") {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "source-address":
@@ -1675,8 +1681,20 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			thenNode := ruleInst.node.FindChild("then")
-			if thenNode != nil {
+			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
+			// rule carries a single translation action, so a duplicate then
+			// block resolves last-wins (Junos merges duplicate stanzas) — the
+			// second block's action is applied, never silently dropped. RESET
+			// the translation spec at the top of each block so only the LAST
+			// block's fields survive: a source-nat then-block is a COMPLETE,
+			// mutually-exclusive spec (interface | pool | off), so without the
+			// reset a first `interface` block would leave Interface=true stale
+			// under a second `pool` block (both fields set → the dataplane's
+			// field precedence, not true last-wins). NATThen carries only these
+			// translation-mode fields, so a whole-struct reset is safe (#3850
+			// review).
+			for _, thenNode := range ruleInst.node.FindChildren("then") {
+				rule.Then = NATThen{}
 				for _, t := range thenNode.Children {
 					if t.Name() == "source-nat" {
 						if len(t.Keys) >= 2 {
@@ -1815,8 +1833,14 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &NATRule{Name: ruleInst.name}
 
-			matchNode := ruleInst.node.FindChild("match")
-			if matchNode != nil {
+			// #3850: iterate EVERY `match {}` block, not just the first — a
+			// duplicate block (a `load merge`/`load override` that splits its
+			// conditions, or a hierarchical config authored twice) must
+			// AND-combine every condition, never be dropped by a FindChild-first
+			// read (a fail-open widening of the NAT match). Flat-set is
+			// unaffected: SetPath merges duplicate containers into one node
+			// (ast_edit.go), so this only changes the hierarchical/parser shape.
+			for _, matchNode := range ruleInst.node.FindChildren("match") {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
@@ -1884,8 +1908,17 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			thenNode := ruleInst.node.FindChild("then")
-			if thenNode != nil {
+			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
+			// rule carries a single translation action, so a duplicate then
+			// block resolves last-wins (Junos merges duplicate stanzas) — the
+			// second block's action is applied, never silently dropped. RESET
+			// the translation spec at the top of each block (see the source-NAT
+			// note) so a second `pool` block cannot inherit a first `off`
+			// block's stale field; a destination-nat then-block is a complete
+			// mutually-exclusive spec (pool | off) and NATThen carries only
+			// translation-mode fields (#3850 review).
+			for _, thenNode := range ruleInst.node.FindChildren("then") {
+				rule.Then = NATThen{}
 				for _, t := range thenNode.Children {
 					if t.Name() == "destination-nat" {
 						// #3844: `then destination-nat off` is a no-translate
@@ -2093,8 +2126,14 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &StaticNATRule{Name: ruleInst.name}
 
-			matchNode := ruleInst.node.FindChild("match")
-			if matchNode != nil {
+			// #3850: iterate EVERY `match {}` block, not just the first — a
+			// duplicate block (a `load merge`/`load override` that splits its
+			// conditions, or a hierarchical config authored twice) must
+			// AND-combine every condition, never be dropped by a FindChild-first
+			// read (a fail-open widening of the NAT match). Flat-set is
+			// unaffected: SetPath merges duplicate containers into one node
+			// (ast_edit.go), so this only changes the hierarchical/parser shape.
+			for _, matchNode := range ruleInst.node.FindChildren("match") {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
@@ -2130,8 +2169,22 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
-			thenNode := ruleInst.node.FindChild("then")
-			if thenNode != nil {
+			// #3850: iterate EVERY `then {}` block, not just the first. A NAT
+			// rule carries a single translation action, so a duplicate then
+			// block resolves last-wins (Junos merges duplicate stanzas) — the
+			// second block's action is applied, never silently dropped. RESET
+			// the static-nat target fields at the top of each block so only the
+			// LAST block's spec survives (no stale prefix/nptv6/mapped-port from
+			// an earlier block). The reset covers ONLY the then-set fields
+			// (Then/IsNPTv6/MappedPort) — the match fields (Match/SourceAddress
+			// (es)/MatchDestinationPort) are set by the match loop above and MUST
+			// persist. A single static-nat then-block is a complete spec, so
+			// `prefix X mapped-port P` within one block stays coupled: the reset
+			// runs BETWEEN blocks, then the whole block is read (#3850 review).
+			for _, thenNode := range ruleInst.node.FindChildren("then") {
+				rule.Then = ""
+				rule.IsNPTv6 = false
+				rule.MappedPort = 0
 				for _, t := range thenNode.Children {
 					if t.Name() == "static-nat" {
 						if len(t.Keys) >= 3 && t.Keys[1] == "nptv6-prefix" {

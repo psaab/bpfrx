@@ -106,6 +106,14 @@ evade the per-destination cap. A flowless non-first fragment carries no L4 port,
 so the UDP cap degrades to per-destination-IP there (the best available for a
 fragment).
 
+The two paths also agree on the missing-screen-profile signal (#3082/#3908):
+each None branch calls `maybe_warn_missing_profile`, so a zone that references a
+screen profile undefined at snapshot-build time emits the same rate-limited
+runtime WARN whether the packet is flow-bearing or flowless, while a zone with
+no screen configured passes silently on both. The verdict stays `Pass` in both
+cases (watch-log-only; the fail-closed-vs-pass posture is the deferred #3082
+design decision).
+
 ### SYN-flood sub-thresholds: source / destination / alarm / timeout (#3315)
 
 The Go compiler parses the full Junos `tcp syn-flood` shape (alarm/attack/

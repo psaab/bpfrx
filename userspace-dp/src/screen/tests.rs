@@ -4344,6 +4344,116 @@ fn empty_missing_set_passes_without_warn() {
 }
 
 // ================================================================
+// #3908 — missing-screen-profile signal on the FLOWLESS path
+// ================================================================
+//
+// The flow-present `check_packet_with_zone_id` None branch calls
+// `maybe_warn_missing_profile` (#3082), but before #3908 the flowless
+// `check_flowless_screens` None branch returned Pass SILENTLY — a flowless
+// packet (non-first fragment / non-query ICMP) to a broken-profile zone
+// produced no diagnostic. These tests assert the flowless path now mirrors the
+// flow path: WARN-but-Pass for a referenced-missing profile, silent Pass for a
+// zone with no screen, and no missing-warn for a resolved profile.
+
+// A zone that REFERENCES a screen profile undefined at snapshot-build time
+// must take the WARN path on the flowless None branch — yet still return Pass
+// (watch-log-only, no verdict change). FAIL-ON-REVERT: drop the
+// `maybe_warn_missing_profile` call from `check_flowless_screens` and
+// `missing_profile_warn_count()` stays 0 → this test goes RED.
+#[test]
+fn missing_profile_reference_warns_on_flowless_path_but_passes() {
+    let mut state = ScreenState::new();
+    let mut missing = FxHashMap::default();
+    missing.insert("trust".to_string(), "ghost".to_string());
+    state.update_missing_profiles(missing);
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let pkt = flowless_icmp_pkt(src, dst);
+
+    // First flowless packet in second 1: WARN emitted, verdict Pass.
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        1,
+        "first flowless packet to a missing-profile zone must emit exactly one WARN"
+    );
+
+    // Flood within the same second: rate-limited to the single WARN, all Pass.
+    for _ in 0..200 {
+        assert_eq!(
+            state.check_flowless_screens("trust", &pkt, true, 1),
+            ScreenVerdict::Pass
+        );
+    }
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        1,
+        "a flowless per-packet flood within one second must be rate-limited to 1 WARN"
+    );
+
+    // After a multi-second quiet gap a new flowless packet re-emits one WARN.
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 10),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        2,
+        "a flowless packet after a quiet gap must re-WARN"
+    );
+}
+
+// A zone with NO screen configured (absent from BOTH `profiles` and the
+// references-missing set) is the legit Pass case on the flowless path: it must
+// NOT warn. FAIL-SAFE: an over-broad flowless fix that warns on every None
+// would make this go RED.
+#[test]
+fn no_screen_configured_zone_passes_flowless_without_warn() {
+    let mut state = ScreenState::new();
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let pkt = flowless_icmp_pkt(src, dst);
+    for s in 1..6 {
+        assert_eq!(
+            state.check_flowless_screens("nozone", &pkt, true, s),
+            ScreenVerdict::Pass
+        );
+    }
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "a zone with no screen configured must never WARN on the flowless path"
+    );
+}
+
+// A zone with a RESOLVED screen profile runs the real flowless checks and never
+// takes the missing-profile WARN path.
+#[test]
+fn resolved_profile_zone_flowless_never_warns_missing() {
+    // icmp_flood_threshold high enough that a single ICMP packet passes; the
+    // point is that the resolved-profile branch is taken (never the None WARN).
+    let mut profile = default_profile();
+    profile.icmp_flood_threshold = 1000;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let pkt = flowless_icmp_pkt(src, dst);
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "a resolved-profile zone must not take the missing-profile WARN path on the flowless path"
+    );
+}
+
+// ================================================================
 // #3902: source-independent screens on the FLOWLESS path
 // ================================================================
 //
