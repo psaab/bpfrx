@@ -289,6 +289,16 @@ func (s *SessionSync) resetRecvGen() {
 	s.recvGenV4 = make(map[dataplane.SessionKey]uint64)
 	s.recvGenV6 = make(map[dataplane.SessionKeyV6]uint64)
 	s.recvGenMu.Unlock()
+	// #3931: also reset the last-applied config generation. A reconnecting
+	// peer may have REBOOTED, restarting its monotonic configGenCounter at a
+	// value LOWER than the generation we stored from its previous boot.
+	// Without this reset the config guard (admitConfigGen) would refuse the
+	// reconnect config re-push as stale (last > incoming) — the same
+	// stale-RETAIN inverse the session reset closes (#2198 F2). Resetting to
+	// 0 makes the next config apply unconditionally; it is always the peer's
+	// CURRENT config (pushConfigToPeer sends ShowActive), so the newest
+	// content still wins.
+	s.lastAppliedConfigGen.Store(0)
 }
 
 // Non-atomicity note (#2198 F3): the apply sequence — guard check
@@ -573,6 +583,14 @@ func (s *SessionSync) Start(ctx context.Context) error {
 	go func() {
 		defer s.wg.Done()
 		s.sendLoop(ctx)
+	}()
+	// #3931: single ordered consumer for config-sync apply. Started once here
+	// so it lives for the whole sync lifetime; it drains configApplyCh in
+	// receive order and enforces the monotonic config-generation guard.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.configApplyLoop(ctx)
 	}()
 	return nil
 }
@@ -974,13 +992,25 @@ func (s *SessionSync) rejournalTail(tail [][]byte) {
 	s.deleteJournal = merged
 }
 
-// QueueConfig sends the full config text to the peer for configuration synchronization.
+// nextConfigGen draws the next strictly-monotonic config generation stamped
+// on an outgoing config-sync message (#3931). The counter is seeded from
+// CLOCK_MONOTONIC nanos at construction so it never regresses below a value
+// the peer may already hold across this node's restarts within a boot.
+func (s *SessionSync) nextConfigGen() uint64 {
+	return s.configGenCounter.Add(1)
+}
+
+// QueueConfig sends the full config text to the peer for configuration
+// synchronization. The payload carries a monotonic config generation (#3931)
+// so the receiver can order a rapid commit pair and refuse a reordered older
+// config.
 func (s *SessionSync) QueueConfig(configText string) {
 	conn := s.getActiveConn()
 	if conn == nil {
 		return
 	}
-	payload := []byte(configText)
+	gen := s.nextConfigGen()
+	payload := encodeConfigPayload(configText, gen)
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgConfig, payload)
 	s.writeMu.Unlock()
@@ -991,7 +1021,50 @@ func (s *SessionSync) QueueConfig(configText string) {
 		return
 	}
 	s.stats.ConfigsSent.Add(1)
-	slog.Info("cluster sync: config sent to peer", "size", len(payload))
+	slog.Info("cluster sync: config sent to peer", "size", len(configText), "gen", gen)
+}
+
+// admitConfigGen implements the #3931 receiver-side config ordering guard. It
+// returns true if a config with generation gen should be applied — strictly
+// newer than the last-applied one, or gen==0 (a legacy sender / unknown, which
+// is applied unconditionally without advancing the high-water mark) — and
+// false if it is an out-of-order older config that must be dropped. On admit
+// of a non-zero gen it advances lastAppliedConfigGen. It is called ONLY from
+// the single-consumer configApplyLoop, so the load/store pair needs no CAS.
+func (s *SessionSync) admitConfigGen(gen uint64) bool {
+	last := s.lastAppliedConfigGen.Load()
+	if gen != 0 && last != 0 && gen <= last {
+		return false
+	}
+	if gen != 0 && gen > last {
+		s.lastAppliedConfigGen.Store(gen)
+	}
+	return true
+}
+
+// configApplyLoop is the single ordered consumer of config-sync messages
+// (#3931). It drains configApplyCh in receive order and applies a config only
+// when admitConfigGen accepts its generation, so a reordered older config from
+// a rapid commit pair (C1 after C2) is dropped and the standby always
+// converges to the newest config. Replaces the pre-#3931 racing
+// `go OnConfigReceived` per message.
+func (s *SessionSync) configApplyLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-s.configApplyCh:
+			if !s.admitConfigGen(item.gen) {
+				s.stats.ConfigsStaleIgnored.Add(1)
+				slog.Warn("cluster sync: dropping out-of-order config sync (stale generation) — standby retains newer config",
+					"incoming_gen", item.gen, "last_applied_gen", s.lastAppliedConfigGen.Load(), "size", len(item.text))
+				continue
+			}
+			if s.OnConfigReceived != nil {
+				s.OnConfigReceived(item.text)
+			}
+		}
+	}
 }
 
 // SendLivenessKeepalive writes a sync-level heartbeat to the active peer
@@ -1348,11 +1421,26 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 	case syncMsgConfig:
 		s.stats.ConfigsReceived.Add(1)
 		s.stats.LastConfigSyncTime.Store(time.Now().UnixNano())
-		s.stats.LastConfigSyncSize.Store(uint64(len(payload)))
-		if s.OnConfigReceived != nil {
-			configText := string(payload)
-			slog.Info("cluster sync: config received from peer", "size", len(payload))
-			go s.OnConfigReceived(configText)
+		configText, gen := decodeConfigPayload(payload)
+		s.stats.LastConfigSyncSize.Store(uint64(len(configText)))
+		slog.Info("cluster sync: config received from peer", "size", len(configText), "gen", gen)
+		// #3931: enqueue onto the single-consumer ordered apply queue instead
+		// of spawning a racing `go OnConfigReceived`. The receiveLoop is
+		// single-threaded per connection, so this preserves receive order;
+		// configApplyLoop then applies only strictly-newer generations. The
+		// enqueue is non-blocking so a slow apply never stalls session sync /
+		// heartbeats on this connection.
+		if s.configApplyCh != nil {
+			select {
+			case s.configApplyCh <- configApplyItem{gen: gen, text: configText}:
+			default:
+				// Ordered apply queue full — practically impossible (commits
+				// are seconds apart, apply is sub-second). Drop with an alarm;
+				// the next commit / reconnect re-push (fresh higher gen)
+				// re-converges the standby.
+				s.stats.Errors.Add(1)
+				slog.Error("cluster sync: config apply queue full, dropping config (will re-converge on next push)", "gen", gen, "size", len(configText))
+			}
 		}
 	case syncMsgIPsecSA:
 		s.stats.IPsecSAReceived.Add(1)

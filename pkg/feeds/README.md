@@ -22,6 +22,20 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
   per-line cap (`maxLineBytes`, 1 MiB); an overlong line (`bufio.ErrTooLong`)
   or a mid-stream read error returns an error. The whole read fails — a
   truncated set is never installed. `scanner.Err()` is checked after the loop.
+- **body-size + entry caps bound the fetch (#3934).** The response body is
+  read through an `io.LimitReader` capped at `maxFeedBodyBytes` (32 MiB) and the
+  parsed set is capped at `maxFeedPrefixes` (1,048,576 entries). A body larger
+  than the size cap, or one producing more than the entry cap, fails the whole
+  fetch (retain last-good) rather than buffering an arbitrarily large body into
+  memory or installing a partial-but-huge set. This closes a remote OOM DoS: a
+  feed server (or a MITM on a plaintext-http feed) returning a huge/infinite
+  body cannot exhaust daemon memory. The size cap sits well under the 64 MiB
+  userspace-dp control-request cap (`MaxControlRequestBytes`, #2744) so a single
+  feed cannot dominate the apply snapshot. The 30 s client timeout
+  (`httpClientTimeout`) bounds a slow-loris server that dribbles bytes.
+- **plaintext-http feeds are warned (#3934).** A feed URL using `http://`
+  (no transport integrity — a MITM can substitute the body) logs a one-time
+  `slog.Warn` at `Apply`. `https` is strongly preferred for any feed source.
 - **content-based change detection.** Prefixes are canonicalized (parsed to
   masked CIDR / `/32` / `/128`), deduped, sorted, and SHA-256 hashed. The
   `onUpdate` recompile callback fires only when the hash changes — a same-count
@@ -74,8 +88,9 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
 
 ## Gotchas
 
-- HTTP client timeout is 30 s. Timeouts log a warning but do not stop the
-  manager — the next refresh tick retries.
+- HTTP client timeout is 30 s (`httpClientTimeout`, slow-loris protection).
+  Timeouts log a warning but do not stop the manager — the next refresh tick
+  retries.
 - Multiple feeds can share a server; each feed's path is appended to the
   base URL.
 - Default refresh interval is 1 hour; the Junos config can override via
@@ -89,14 +104,17 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
 - A successful fetch always replaces the snapshot and stamps success, but
   the `onUpdate` recompile fires only when the canonical content hash
   changes — not on every fetch and not merely on a count change.
-- **Feed size vs. the dataplane control-socket cap (#2744):** feed prefixes
-  are carried inline as CIDR text in the userspace-dp `apply_snapshot`
+- **Feed size vs. the dataplane control-socket cap (#2744 / #3934):** feed
+  prefixes are carried inline as CIDR text in the userspace-dp `apply_snapshot`
   (`buildAddressBookTableWithFeeds`, `pkg/dataplane/userspace/policies.go`).
-  Feeds are bounded only by the per-line scanner cap above, NOT by a
-  total-entry cap, so a very large feed dominates the serialized snapshot
-  size. The control socket caps a single request at `MaxControlRequestBytes`
-  (64 MiB, in lockstep with the Rust `MAX_CONTROL_REQUEST_BYTES`); at
-  ~45 B per IPv6 CIDR that covers ~1.4M prefixes. A snapshot past the cap is
-  surfaced as a config error at apply time (Go pre-flight in
+  Each feed is now bounded at fetch time by BOTH a total body-size cap
+  (`maxFeedBodyBytes`, 32 MiB) and a total-entry cap (`maxFeedPrefixes`,
+  1,048,576) (#3934), so a single feed can no longer buffer an unbounded body
+  or dominate the serialized snapshot. The control socket separately caps a
+  single request at `MaxControlRequestBytes` (64 MiB, in lockstep with the Rust
+  `MAX_CONTROL_REQUEST_BYTES`); at ~45 B per IPv6 CIDR that covers ~1.4M
+  prefixes. The per-feed 32 MiB body cap keeps a single feed's serialized
+  contribution comfortably under that ceiling. A snapshot past the control cap
+  is still surfaced as a config error at apply time (Go pre-flight in
   `pkg/dataplane/userspace/process.go`) rather than silently rejected by the
   helper after commit.

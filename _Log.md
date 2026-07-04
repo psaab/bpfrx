@@ -32,6 +32,93 @@
     `pkg/ipsec/testdata/swanctl_list_sas_two.txt`,
     `pkg/cli/cli_show_security_ipsec.go`, `pkg/ipsec/README.md`
 
+## 2026-07-03 — #3934: dynamic address-feed fetch had no body-size / entry cap → remote OOM DoS (plaintext-http MITM can amplify)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-179 (MEDIUM, DoS). `pkg/feeds/parseFeed`
+    read the HTTP response body with an unbounded `bufio.Scanner` and parsed
+    ALL entries with no cap, so a feed server returning a huge/infinite/chunked
+    body — or a MITM on a plaintext-http feed URL — could buffer an arbitrarily
+    large body into memory and OOM the daemon (remote-triggerable DoS); a
+    legitimately large feed OOMs by accident.
+  - **Fix**: (a) body-size cap — `parseFeed` now reads through
+    `io.LimitReader(r, maxFeedBodyBytes+1)` (32 MiB) wrapped in a
+    `countingReader`; a body exceeding the cap fails the whole fetch. (b)
+    entry cap — the parse loop bails with an error once parsed entries exceed
+    `maxFeedPrefixes` (1,048,576), bounding slice memory during parse and never
+    installing a partial-but-huge set. (c) timeout — the pre-existing 30 s
+    client timeout is now the named const `httpClientTimeout` (slow-loris
+    protection). Both over-limit conditions return an error, so
+    `fetchFeed→recordFailure` KEEPS the last-good snapshot (the #2050 fail-safe)
+    rather than wiping or truncating the enforced set. Added a one-time
+    `slog.Warn` at `Apply` for plaintext `http://` feed URLs (integrity risk).
+    Caps sit well under the 64 MiB userspace-dp control-request cap
+    (`MaxControlRequestBytes`, #2744) so a single feed cannot dominate the
+    apply snapshot.
+  - **RED-on-revert**: `feeds_sizecap_3934_test.go` — over-size body rejected
+    with a size error (RED: unbounded read returns success), over-entry-count
+    body rejected (RED: unbounded entry set), full HTTP path retains last-good
+    on an over-size fetch (RED: clobbers with the over-size body's prefix), a
+    slow server hits the client timeout and retains last-good, an under-cap
+    feed still installs fully, plaintext-http predicate pinned. Verified all
+    three cap tests go RED under a simulated revert. `go test -count=1
+    ./pkg/feeds/...` green, `go build ./...`, gofmt, vet clean. Doc:
+    pkg/feeds/README.md (fail-safe + gotchas, corrected the stale #2744
+    "NOT bounded by a total-entry cap" note).
+  - **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_sizecap_3934_test.go,
+    pkg/feeds/README.md, _Log.md
+## 2026-07-03 — #3931: cluster config-sync applied via unordered goroutines with no sequence number → a rapid commit pair could leave the standby on the OLDER config (no alarm)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-156 (MEDIUM, HA config divergence). Config
+    sync applied the received config via a racing `go OnConfigReceived(...)`
+    goroutine per message (`sync_conn.go`, `syncMsgConfig` handler) with NO
+    sequence number / generation on the config-sync wire. A rapid commit pair
+    (C1 then C2) spawned two goroutines that could race: if the C1-apply ran
+    after the C2-apply, the standby ended on the OLDER C1 while the primary was
+    on C2 → the nodes DIVERGED with no alarm; on failover the standby served
+    the stale C1. Unlike the session-install path (#2170 gen-guard), config
+    sync had no ordering guard.
+  - **Fix**: (1) Wire — the config-sync payload now carries a monotonic config
+    generation as a trailing 16-byte framing
+    `[config text][configGenMagic (8)][gen u64 LE (8)]` (`encodeConfigPayload`/
+    `decodeConfigPayload`, `sync_protocol.go`). The magic (`\x00\xffxpfCG\x00`)
+    is non-printable so it cannot collide with Junos config text; a payload
+    without it is a legacy sender's raw text and decodes with gen=0 (applied
+    unconditionally). The sender (`QueueConfig`) stamps a strictly-monotonic
+    gen from `configGenCounter` (seeded from CLOCK_MONOTONIC nanos, same
+    cross-boot reasoning as the session `genCounter`). (2) Ordering + serialize
+    — the handler no longer spawns a racing goroutine; it enqueues
+    `{gen, text}` onto a bounded single-consumer queue (`configApplyCh`) drained
+    by `configApplyLoop` (started in `Start`). The receiveLoop is
+    single-threaded per connection, so this preserves receive order; the
+    non-blocking enqueue never stalls session sync / heartbeats behind a slow
+    apply. `admitConfigGen` applies a config only if its gen is strictly newer
+    than `lastAppliedConfigGen` (or gen=0 legacy); an out-of-order older config
+    is dropped with an alarm and counted in `ConfigsStaleIgnored`. The standby
+    always converges to the newest config. `resetRecvGen` (BulkStart) also
+    zeroes `lastAppliedConfigGen` so a rebooted primary's lower-seeded counter
+    is accepted, not refused as stale (#2198 F2 reasoning applied to config).
+    Deliberately NO `SessionSyncWireVersion` bump — the framing is additive and
+    self-detecting (the #2239 lesson); the only degraded direction is a new
+    sender → legacy receiver in the brief ISSU window, which fails SAFE (old
+    node's parser rejects the framing bytes → keeps its current config).
+  - **Test**: `pkg/cluster/sync_config_gen_test.go` — wire round-trip +
+    legacy/short/empty decode, `admitConfigGen` monotonic + legacy-unconditional
+    + reset, and the end-to-end RED-on-revert
+    `TestConfigSyncOrderedApplyDropsReorderedOlder` (delivers C2 then C1 →
+    standby ends on C2, drops stale C1, `ConfigsStaleIgnored=1`). RED-on-revert
+    VERIFIED: neutralizing `admitConfigGen` to always-accept makes the standby
+    end on the older C1 (`applied=[C2 C1]`) → test fails. `go test -race
+    ./pkg/cluster/...` and `go test ./pkg/daemon/...` green; `go build ./...`,
+    `go vet ./pkg/cluster/...`, gofmt clean.
+  - **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/sync_conn.go`,
+    `pkg/cluster/sync_protocol.go`, `pkg/cluster/status.go`,
+    `pkg/cluster/sync_config_gen_test.go`, `docs/sync-protocol.md`,
+    `docs/feature-coverage.md`, `_Log.md`
+  - **Validation flag**: test-failover WARRANTED (HA config convergence) —
+    parent batch-validates on the loss userspace cluster with the
+    force-node0-primary gate.
 ## 2026-07-03 — #3929: session-count stats (SessionCount + xpf_sessions_active/established) permanently 0 on the userspace dataplane
 
 - **Timestamp**: 2026-07-03

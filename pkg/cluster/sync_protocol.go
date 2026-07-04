@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"strings"
@@ -570,6 +571,53 @@ func decodeIPsecSAPayload(payload []byte) []string {
 		}
 	}
 	return names
+}
+
+// --- #3931 config-sync generation wire codec ------------------------------
+//
+// The config-sync payload historically was the raw UTF-8 config text with no
+// framing. #3931 appends a monotonic config generation so the receiver can
+// order a rapid commit pair (C1 then C2) and refuse a reordered older config.
+// Because the config text is arbitrary bytes (no fixed layout to length-gate a
+// leading field against), the generation is carried as a TRAILING framing:
+//
+//	[config text bytes][configGenMagic (8)][gen (uint64 LE, 8)]
+//
+// A NEW receiver (decodeConfigPayload) detects the magic at the tail and peels
+// off the trailing 16 bytes; a payload without the magic is a LEGACY sender's
+// raw config text and decodes with gen=0 (applied unconditionally, preserving
+// the pre-#3931 behavior). The magic bytes are deliberately non-printable so
+// they cannot collide with real Junos config text. NOTE the one asymmetric
+// direction: a NEW sender's framed payload reaching a LEGACY receiver (only
+// possible in the brief mixed-version ISSU window) is treated by that old
+// receiver as config text with 16 trailing binary bytes, which its Junos
+// parser rejects — the config-sync apply fails and the old node retains its
+// current config (fail-safe, no crash, no divergence worse than today). This
+// is why #3931 does NOT bump SessionSyncWireVersion: that gate governs whether
+// SESSIONS sync at all across a mixed pair, and bumping it would break session
+// sync for the whole mixed-base window (the #2239 lesson). Config-gen is
+// additive and self-detecting via the magic.
+var configGenMagic = [8]byte{0x00, 0xff, 'x', 'p', 'f', 'C', 'G', 0x00}
+
+// encodeConfigPayload builds a config-sync payload carrying the config text
+// and a trailing generation (see the codec note above).
+func encodeConfigPayload(configText string, gen uint64) []byte {
+	buf := make([]byte, 0, len(configText)+16)
+	buf = append(buf, configText...)
+	buf = append(buf, configGenMagic[:]...)
+	buf = binary.LittleEndian.AppendUint64(buf, gen)
+	return buf
+}
+
+// decodeConfigPayload splits a config-sync payload into its config text and
+// generation. A payload without the trailing configGenMagic is a legacy
+// sender's raw config text and yields gen=0.
+func decodeConfigPayload(payload []byte) (configText string, gen uint64) {
+	if len(payload) >= 16 && bytes.Equal(payload[len(payload)-16:len(payload)-8], configGenMagic[:]) {
+		gen = binary.LittleEndian.Uint64(payload[len(payload)-8:])
+		return string(payload[:len(payload)-16]), gen
+	}
+	return string(payload), 0
 }
 
 // --- #2239 HA DHCP-server lease sync wire codec ---------------------------
