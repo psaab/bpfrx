@@ -1,3 +1,56 @@
+## 2026-07-03 — #3931: cluster config-sync applied via unordered goroutines with no sequence number → a rapid commit pair could leave the standby on the OLDER config (no alarm)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-156 (MEDIUM, HA config divergence). Config
+    sync applied the received config via a racing `go OnConfigReceived(...)`
+    goroutine per message (`sync_conn.go`, `syncMsgConfig` handler) with NO
+    sequence number / generation on the config-sync wire. A rapid commit pair
+    (C1 then C2) spawned two goroutines that could race: if the C1-apply ran
+    after the C2-apply, the standby ended on the OLDER C1 while the primary was
+    on C2 → the nodes DIVERGED with no alarm; on failover the standby served
+    the stale C1. Unlike the session-install path (#2170 gen-guard), config
+    sync had no ordering guard.
+  - **Fix**: (1) Wire — the config-sync payload now carries a monotonic config
+    generation as a trailing 16-byte framing
+    `[config text][configGenMagic (8)][gen u64 LE (8)]` (`encodeConfigPayload`/
+    `decodeConfigPayload`, `sync_protocol.go`). The magic (`\x00\xffxpfCG\x00`)
+    is non-printable so it cannot collide with Junos config text; a payload
+    without it is a legacy sender's raw text and decodes with gen=0 (applied
+    unconditionally). The sender (`QueueConfig`) stamps a strictly-monotonic
+    gen from `configGenCounter` (seeded from CLOCK_MONOTONIC nanos, same
+    cross-boot reasoning as the session `genCounter`). (2) Ordering + serialize
+    — the handler no longer spawns a racing goroutine; it enqueues
+    `{gen, text}` onto a bounded single-consumer queue (`configApplyCh`) drained
+    by `configApplyLoop` (started in `Start`). The receiveLoop is
+    single-threaded per connection, so this preserves receive order; the
+    non-blocking enqueue never stalls session sync / heartbeats behind a slow
+    apply. `admitConfigGen` applies a config only if its gen is strictly newer
+    than `lastAppliedConfigGen` (or gen=0 legacy); an out-of-order older config
+    is dropped with an alarm and counted in `ConfigsStaleIgnored`. The standby
+    always converges to the newest config. `resetRecvGen` (BulkStart) also
+    zeroes `lastAppliedConfigGen` so a rebooted primary's lower-seeded counter
+    is accepted, not refused as stale (#2198 F2 reasoning applied to config).
+    Deliberately NO `SessionSyncWireVersion` bump — the framing is additive and
+    self-detecting (the #2239 lesson); the only degraded direction is a new
+    sender → legacy receiver in the brief ISSU window, which fails SAFE (old
+    node's parser rejects the framing bytes → keeps its current config).
+  - **Test**: `pkg/cluster/sync_config_gen_test.go` — wire round-trip +
+    legacy/short/empty decode, `admitConfigGen` monotonic + legacy-unconditional
+    + reset, and the end-to-end RED-on-revert
+    `TestConfigSyncOrderedApplyDropsReorderedOlder` (delivers C2 then C1 →
+    standby ends on C2, drops stale C1, `ConfigsStaleIgnored=1`). RED-on-revert
+    VERIFIED: neutralizing `admitConfigGen` to always-accept makes the standby
+    end on the older C1 (`applied=[C2 C1]`) → test fails. `go test -race
+    ./pkg/cluster/...` and `go test ./pkg/daemon/...` green; `go build ./...`,
+    `go vet ./pkg/cluster/...`, gofmt clean.
+  - **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/sync_conn.go`,
+    `pkg/cluster/sync_protocol.go`, `pkg/cluster/status.go`,
+    `pkg/cluster/sync_config_gen_test.go`, `docs/sync-protocol.md`,
+    `docs/feature-coverage.md`, `_Log.md`
+  - **Validation flag**: test-failover WARRANTED (HA config convergence) —
+    parent batch-validates on the loss userspace cluster with the
+    force-node0-primary gate.
+
 ## 2026-07-03 — #3918: flow-cache neighbor_mac_epoch stamped AFTER neighbor resolve → resolve→stamp TOCTOU re-opens the #3048 stale-MAC blackhole on VRRP gateway failover
 
 - **Timestamp**: 2026-07-03
