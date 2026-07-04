@@ -297,6 +297,60 @@ pub(super) fn stage_classify_fabric_ingress(
     }
 }
 
+/// #3902: read the real L3 source/destination addresses from the IP header
+/// for the flowless screen path. A non-first IP fragment or a non-query
+/// ICMP/ICMPv6 control message carries a full IP header, so its addresses are
+/// present even though the packet has no transport flow. Returns
+/// `(src, dst, true)` when the captured frame holds the full base header, or
+/// `(unspecified, unspecified, false)` when it is too short — the caller then
+/// skips the address-dependent LAND screen rather than false-dropping on
+/// `unspecified == unspecified`. The IPv6 base header (and thus its addresses)
+/// is already guaranteed present by `extract_screen_info`'s fail-closed
+/// `l3_off + 40 <= frame.len()` gate; the IPv4 base header is a fixed 20 bytes.
+fn flowless_l3_addrs(frame: &[u8], addr_family: u8, l3_off: usize) -> (IpAddr, IpAddr, bool) {
+    if addr_family == libc::AF_INET6 as u8 {
+        if l3_off + 40 <= frame.len()
+            && let (Ok(src), Ok(dst)) = (
+                <[u8; 16]>::try_from(&frame[l3_off + 8..l3_off + 24]),
+                <[u8; 16]>::try_from(&frame[l3_off + 24..l3_off + 40]),
+            )
+        {
+            return (
+                IpAddr::V6(Ipv6Addr::from(src)),
+                IpAddr::V6(Ipv6Addr::from(dst)),
+                true,
+            );
+        }
+        return (
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            false,
+        );
+    }
+    // IPv4 (and any other family falls back to an unspecified V4 tuple, matching
+    // the pre-#3902 placeholder default).
+    if addr_family == libc::AF_INET as u8 && l3_off + 20 <= frame.len() {
+        let src = IpAddr::V4(Ipv4Addr::new(
+            frame[l3_off + 12],
+            frame[l3_off + 13],
+            frame[l3_off + 14],
+            frame[l3_off + 15],
+        ));
+        let dst = IpAddr::V4(Ipv4Addr::new(
+            frame[l3_off + 16],
+            frame[l3_off + 17],
+            frame[l3_off + 18],
+            frame[l3_off + 19],
+        ));
+        return (src, dst, true);
+    }
+    (
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        false,
+    )
+}
+
 /// Stage 10 — screen / IDS slow-path check.
 ///
 /// Only runs when screen profiles are configured (the `has_profiles`
@@ -373,45 +427,42 @@ pub(super) fn stage_screen_check(
     } else {
         14
     };
-    // #3064: a non-first IP fragment has no transport flow —
-    // `parse_session_flow_from_bytes` returns `None` for it (#2344, so the
-    // fragment payload is never parsed as L4 ports). Such a fragment used to
-    // return `Pass` here, which made the PER-FRAGMENT L3-header screens
-    // (ping-of-death, teardrop, icmp-fragment) DEAD in the live pipeline —
-    // hostile Teardrop / Ping-of-Death fragment contributions transited
-    // unscreened. Run ONLY the L3-header fragment screens on the flowless
-    // path: extract a header-only `ScreenPacketInfo` straight from the IP
-    // header (placeholder L4 tuple — we never parse the fragment payload, so
-    // the #2344 flowless fast path is NOT reintroduced) and evaluate the
-    // three L3 fragment screens. Flow/session-dependent screens (land,
-    // TCP-flag, flood counters, scan/sweep, SYN-cookie) stay on the
-    // flow-present path below.
+    // #3064 + #3902: a non-first IP fragment (or a non-query ICMP/ICMPv6
+    // control message) has no transport flow — `parse_session_flow_from_bytes`
+    // returns `None` for it (#2344, so the payload is never parsed as L4
+    // ports). Such a packet used to `Pass` here, which made the per-fragment
+    // L3-header screens (ping-of-death, teardrop, icmp-fragment) DEAD (#3064)
+    // AND — until #3902 — bypassed the SOURCE-INDEPENDENT screens (LAND,
+    // ip-source-route, ICMP/UDP flood) that need no flow. The flowless branch
+    // below now runs ALL of those (see the detailed #3902 note in the branch).
+    // Only the genuinely FLOW/session-dependent screens (TCP-flag, SYN-flood
+    // sketches, scan/sweep, SYN-cookie) stay on the flow-present path below —
+    // they require a real TCP header / per-flow tuple. The #2344 flowless fast
+    // path is NOT reintroduced (no L4 parse / session lookup happens here).
     let Some(flow) = flow else {
-        // Placeholder L4 tuple: the L3 fragment screens (ping-of-death /
-        // teardrop / icmp-fragment) never read src/dst IP or ports — they
-        // operate purely on fragment offset / total/payload length /
-        // protocol. tcp_flags is 0 because a non-first fragment carries no
-        // L4 header. Unspecified addresses keep the drop-event log sane
-        // without re-deriving the L3 addresses (out of scope for #3064).
-        let (placeholder_src, placeholder_dst) = if meta.addr_family == libc::AF_INET6 as u8 {
-            (
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            )
-        } else {
-            (
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            )
-        };
+        // #3902: the flowless path (a non-first IP fragment or a non-query
+        // ICMP/ICMPv6 control message) must still run the SOURCE-INDEPENDENT
+        // screens — LAND anti-spoof, ip-source-route, ICMP/UDP flood — which
+        // need no transport flow. Before #3902 only the three L3 fragment
+        // screens ran here, so those source-independent screens were BYPASSED
+        // on the flowless path (screen fail-open). LAND compares src_ip ==
+        // dst_ip, so derive the REAL L3 addresses from the IP header (a
+        // fragment / ICMP control message carries a full IP header) rather
+        // than the pre-#3902 unspecified placeholder, which would have made
+        // every flowless packet look like a LAND spoof. tcp_flags is 0
+        // because a non-first fragment carries no L4 header; the fragment
+        // screens never read ports, so no session lookup / L4 parse happens
+        // and the #2344 flowless fast path is NOT reintroduced.
+        let (screen_src, screen_dst, addrs_known) =
+            flowless_l3_addrs(packet_frame, meta.addr_family, l3_off);
         let screen_pkt = match extract_screen_info(
             packet_frame,
             meta.addr_family,
             meta.protocol,
             0,
             meta.pkt_len,
-            placeholder_src,
-            placeholder_dst,
+            screen_src,
+            screen_dst,
             0,
             0,
             l3_off,
@@ -435,7 +486,7 @@ pub(super) fn stage_screen_check(
                 return StageOutcome::RecycleAndContinue;
             }
         };
-        return match screen.check_fragment_screens_l3(zone_name, &screen_pkt) {
+        return match screen.check_flowless_screens(zone_name, &screen_pkt, addrs_known, now_secs) {
             ScreenVerdict::Drop(reason) => {
                 emit_screen_drop_event(
                     worker_ctx.event_stream,
@@ -448,9 +499,9 @@ pub(super) fn stage_screen_check(
                 counters.record_screen_drop(reason);
                 StageOutcome::RecycleAndContinue
             }
-            // The L3 fragment screens only ever return Pass or Drop — they
-            // never mint a SYN-cookie challenge/bypass (those are
-            // flow/TCP-only and stay on the flow-present path).
+            // The flowless source-independent screens only ever return Pass
+            // or Drop — they never mint a SYN-cookie challenge/bypass (those
+            // are flow/TCP-only and stay on the flow-present path).
             _ => StageOutcome::Continue(ScreenCheckOutcome::Pass),
         };
     };

@@ -775,36 +775,57 @@ impl ScreenState {
         }
     }
 
-    /// #3064: run ONLY the L3-header-based fragment screens
-    /// (ping-of-death, teardrop, icmp-fragment) for a packet that has NO
-    /// transport flow — i.e. a non-first IP fragment that
-    /// `parse_session_flow_from_bytes` deliberately leaves flowless
-    /// (#2344, to avoid treating fragment payload as L4 ports).
+    /// #3064 + #3902: run the SOURCE-INDEPENDENT screens for a packet that
+    /// has NO transport flow — a non-first IP fragment or a non-query
+    /// ICMP/ICMPv6 control message that `parse_session_flow_from_bytes`
+    /// deliberately leaves flowless (#2344, to avoid treating fragment
+    /// payload as L4 ports; #3290, to avoid keying a session on a non-port
+    /// ICMP control word). Every screen evaluated here is genuinely
+    /// flow/session-INDEPENDENT — it reads only the L3 header (and per-zone
+    /// rate counters keyed on protocol), never a per-flow tuple:
     ///
-    /// `stateless.rs` documents these three checks as PER-FRAGMENT, but
-    /// the live pipeline previously short-circuited every flowless packet
-    /// to `Pass` in `stage_screen_check`, so they were DEAD for non-first
-    /// fragments — hostile Teardrop / Ping-of-Death contributions transited
-    /// unscreened. The three checks read purely the IP-header fields already
-    /// captured in `ScreenPacketInfo` (fragment offset, total/payload
-    /// length, protocol) and never touch L4 ports or any per-flow/zone
-    /// counter state, so they are safe to evaluate without a `SessionFlow`
-    /// and WITHOUT reintroducing the transport classification #2344
-    /// removed.
+    ///   - **LAND anti-spoof** (`src_ip == dst_ip`): reads only the L3
+    ///     addresses. The caller derives the REAL source/destination from
+    ///     the IP header and sets `addrs_known`; when it could not (frame too
+    ///     short to hold the addresses) LAND is skipped so a placeholder
+    ///     `src == dst == unspecified` is not mistaken for a spoofed frame.
+    ///   - **ping-of-death / teardrop / icmp-fragment** (#3064): the L3
+    ///     fragment screens — fragment offset, total/payload length,
+    ///     protocol only.
+    ///   - **ip-source-route** (IPv4 LSRR/SSRR, IPv6 RH0/RH1): read from the
+    ///     IP-header options / extension-header chain by `extract.rs`.
+    ///   - **ICMP flood / UDP flood**: per-zone rate counters keyed purely
+    ///     on protocol.
     ///
-    /// Flow/session-dependent screens (land, TCP-flag, the
-    /// icmp/udp/syn-flood rate counters, scan/sweep, SYN-cookie) are
-    /// intentionally NOT run here — they require a flow and stay gated on
-    /// the flow-present `check_packet_with_zone_id` path. The drop
-    /// precedence of these three checks matches that method exactly.
-    pub(crate) fn check_fragment_screens_l3(
-        &self,
+    /// Before #3902 the flowless branch ran ONLY the three fragment screens,
+    /// so a crafted non-first fragment / non-query ICMP BYPASSED LAND,
+    /// ip-source-route, and the ICMP/UDP flood counters (screen fail-open) —
+    /// an attack the operator explicitly enabled the screen to block
+    /// transited on the flowless path.
+    ///
+    /// Flow/session-dependent screens (TCP-flag bits, the SYN-flood
+    /// per-source/per-destination sketches, scan/sweep, SYN-cookie) require
+    /// a flow / real TCP header and stay gated on the flow-present
+    /// `check_packet_with_zone_id` path. The drop precedence of the screens
+    /// run here matches that method's relative order exactly (LAND →
+    /// ping-of-death → teardrop → icmp-fragment → source-route → icmp-flood
+    /// → udp-flood).
+    pub(crate) fn check_flowless_screens(
+        &mut self,
         zone: &str,
         pkt: &ScreenPacketInfo,
+        addrs_known: bool,
+        now_secs: u64,
     ) -> ScreenVerdict {
         let Some(profile) = self.profiles.get(zone) else {
             return ScreenVerdict::Pass;
         };
+        // --- Stateless, source-independent checks (side-effect-free) ---
+        // LAND is address-dependent: only evaluate it when the caller
+        // supplied the real L3 addresses (`addrs_known`).
+        if addrs_known && let Some(reason) = stateless::check_land(profile, pkt) {
+            return ScreenVerdict::Drop(reason);
+        }
         if let Some(reason) = stateless::check_ping_of_death(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
@@ -814,6 +835,35 @@ impl ScreenState {
         if let Some(reason) = stateless::check_icmp_fragment(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
+        if let Some(reason) = stateless::check_source_route(profile, pkt) {
+            return ScreenVerdict::Drop(reason);
+        }
+        // --- Rate-based flood checks (source-independent, per-zone) ---
+        // Copy the scalar thresholds out so the immutable `self.profiles`
+        // borrow is released before the `&mut self` per-zone counter maps
+        // (mirrors `check_packet_with_zone_id`).
+        let icmp_flood_threshold = profile.icmp_flood_threshold;
+        let udp_flood_threshold = profile.udp_flood_threshold;
+        // `profile` borrow ends here (NLL): no further reads of `self.profiles`.
+
+        // ICMP flood
+        if icmp_flood_threshold > 0
+            && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
+            && let Some(counter) = self.icmp_counters.get_mut(zone)
+            && counter.increment(now_secs, icmp_flood_threshold)
+        {
+            return ScreenVerdict::Drop("icmp-flood");
+        }
+
+        // UDP flood
+        if udp_flood_threshold > 0
+            && pkt.protocol == PROTO_UDP
+            && let Some(counter) = self.udp_counters.get_mut(zone)
+            && counter.increment(now_secs, udp_flood_threshold)
+        {
+            return ScreenVerdict::Drop("udp-flood");
+        }
+
         ScreenVerdict::Pass
     }
 
