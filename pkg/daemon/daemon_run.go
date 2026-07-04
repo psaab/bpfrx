@@ -1647,6 +1647,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.rpm.StopAll()
 	}
 
+	// Stop the periodic configuration-archival timer (#4078). Its goroutine
+	// binds to a per-generation stop channel (not the run WaitGroup), so this
+	// explicit stop is the authoritative shutdown for the boot-armed timer,
+	// whose captured daemon-stop context may predate applyCancelContext.
+	d.stopArchiveTimer()
+
 	// Stop the event-options action worker (after RPM so no events arrive
 	// during teardown). Close drains in-flight lock-retry backoffs (#2157).
 	if d.eventEngine != nil {

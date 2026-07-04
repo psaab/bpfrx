@@ -68,6 +68,14 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	"archival": {desc: "Configuration archival", children: map[string]*schemaNode{
 		"configuration": {desc: "Configuration archival", children: map[string]*schemaNode{
 			"transfer-on-commit": {desc: "Transfer on commit", children: nil},
+			// #4078: periodic off-box archive every N minutes, independent of
+			// transfer-on-commit. Parsed+compiled since the leaf was added, but
+			// the runtime periodic timer (reconcileArchiveTimer) that consumes
+			// it landed in #4078 — before that this leaf was accepted-but-inert.
+			"transfer-interval": {desc: "Periodic archive interval (minutes)", args: 1,
+				valueType: ValueInteger, valueDesc: "Minutes between periodic archives",
+				valueExamples: []string{"30", "60", "1440"},
+				validator:     ValidateInteger(1, 2880), placeholder: "<minutes>", children: nil},
 			// #3984: a repeated keyed-list leaf — an operator writes one
 			// `set ... archive-sites <url>` per site and the compiler reads
 			// every sibling via FindChildren (compiler_system.go). Without

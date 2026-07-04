@@ -1443,6 +1443,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		d.store.SetArchiveConfig("", 0)
 	}
 
+	// 15c. Reconcile the periodic configuration-archival timer (#4078). Junos
+	// `transfer-interval N` archives the running config to the archive-sites
+	// every N minutes, independent of transfer-on-commit. Hash-gated so an
+	// unrelated commit never bounces a healthy timer; re-armed on daemon
+	// restart via this same boot apply; stopped when the leaf is removed.
+	d.reconcileArchiveTimer(cfg)
+
 	// 16. Update flow traceoptions (trace file + filters)
 	d.updateFlowTrace(cfg)
 
