@@ -27,11 +27,28 @@ func (t *ConfigTree) CopyPath(src, dst []string) error {
 }
 
 // RenamePath moves a subtree from src to dst path.
+//
+// The source node is resolved by its FULL identity (the named key, e.g.
+// `policy <name>` / `term <name>`) via findNodeWithParent, which prefers the
+// longest key match over the first keyword match. This is what lets a
+// NON-FIRST same-keyword sibling be renamed: the earlier removeNode-based
+// implementation broke on the first child whose FIRST key matched, so
+// `rename policy B to B2` with siblings [A B C] resolved `policy A`, descended
+// into it, and failed "source not found" (the #3982 read-all-siblings defect,
+// the config-edit sibling of #3842/#2419/#3975/#3980).
+//
+// A rename that only changes the name (the common case: destination parent ==
+// source parent) is performed IN PLACE so sibling order is preserved. A rename
+// that moves the node under a different parent removes it from the source and
+// appends it to the destination. Either way the renamed node keeps its
+// children / sub-config. A rename whose new identity collides with an existing
+// sibling under the destination parent is rejected rather than creating a
+// duplicate.
 func (t *ConfigTree) RenamePath(src, dst []string) error {
 	if len(src) == 0 || len(dst) == 0 {
 		return fmt.Errorf("empty path")
 	}
-	srcNode, err := t.removeNode(src)
+	srcNode, srcParent, err := t.findNodeWithParent(src)
 	if err != nil {
 		return fmt.Errorf("source not found: %s", strings.Join(src, " "))
 	}
@@ -39,9 +56,62 @@ func (t *ConfigTree) RenamePath(src, dst []string) error {
 	if len(dst) < nk {
 		return fmt.Errorf("destination path too short")
 	}
-	srcNode.Keys = append([]string(nil), dst[len(dst)-nk:]...)
+	newKeys := append([]string(nil), dst[len(dst)-nk:]...)
 	dstParentPath := dst[:len(dst)-nk]
-	return t.insertNode(dstParentPath, srcNode)
+	dstParent, err := t.childrenAtPath(dstParentPath)
+	if err != nil {
+		return fmt.Errorf("destination parent not found: %s", strings.Join(dstParentPath, " "))
+	}
+	// Collision guard: reject a rename whose new identity duplicates an
+	// existing sibling under the destination parent (excluding the node being
+	// renamed, so renaming to the same name is a no-op rather than an error).
+	for _, n := range *dstParent {
+		if n != srcNode && keysEqual(n.Keys, newKeys) {
+			return fmt.Errorf("rename target already exists: %s", strings.Join(dst, " "))
+		}
+	}
+	if dstParent == srcParent {
+		// Same parent: rename in place, preserving sibling order and children.
+		srcNode.Keys = newKeys
+		return nil
+	}
+	// Different parent: detach from the source parent and append to the
+	// destination parent, keeping the node's children/sub-config.
+	for i, n := range *srcParent {
+		if n == srcNode {
+			*srcParent = append((*srcParent)[:i], (*srcParent)[i+1:]...)
+			break
+		}
+	}
+	srcNode.Keys = newKeys
+	*dstParent = append(*dstParent, srcNode)
+	return nil
+}
+
+// childrenAtPath navigates to the node identified by path and returns a pointer
+// to its children slice. An empty path returns the tree root's children. Like
+// findNodeWithParent it prefers the longest key match at each level so a
+// same-keyword sibling in the path is resolved by full identity.
+func (t *ConfigTree) childrenAtPath(path []string) (*[]*Node, error) {
+	children := &t.Children
+	pos := 0
+	for pos < len(path) {
+		var bestChild *Node
+		bestConsumed := 0
+		for _, child := range *children {
+			consumed := matchNodeKeys(child, path, pos)
+			if consumed > bestConsumed {
+				bestChild = child
+				bestConsumed = consumed
+			}
+		}
+		if bestChild == nil {
+			return nil, fmt.Errorf("path element %q not found", path[pos])
+		}
+		children = &bestChild.Children
+		pos += bestConsumed
+	}
+	return children, nil
 }
 
 // InsertBefore moves an existing element before another element in the same
@@ -491,6 +561,26 @@ func setInactiveAtPath(current *[]*Node, path []string, schema *schemaNode, i in
 		return markMatchingNodeInactive(current, path[i:], inactive)
 	}
 
+	// Value-list multi-leaf: the same bracket-list class deletePath intercepts
+	// (see the deletePath comment). A `multi: true` leaf with a single value slot
+	// and no children (or a valueList leaf with modifier children, #3872) carries
+	// its members on Keys[1:] AND/OR one child node per member — the #2419 dual
+	// AST shape. Without this branch the schema-driven consumption below eats the
+	// first member as an extra key (nodeKeyCount == 2), then treats the remaining
+	// members as container tokens and errors ("container \"protocol tcp\" does not
+	// exist"): the display-set emit of an inactive bracket leaf is exactly
+	// `deactivate ... from protocol tcp udp icmp`, so an inactive multi-value leaf
+	// did NOT round-trip — it reloaded ACTIVE (#3975, the deactivate-side
+	// counterpart of the #3846 delete-side fail). Route it through the member
+	// matcher instead: a bare `deactivate ... protocol` toggles the whole leaf;
+	// naming members toggles the whole leaf (flat/bracket — Inactive is a
+	// node-level flag, a bracket list is one statement) or the named child nodes
+	// (block shape). Gate on args == 1 so keyed multi entries (address <name>
+	// <prefix>, args == 2) keep whole-node toggle semantics.
+	if childSchema.multi && (childSchema.children == nil || childSchema.valueList) && childSchema.args == 1 {
+		return markMultiLeafMembersInactive(current, keyword, path[i+1:], childSchema.valueList, inactive)
+	}
+
 	nodeKeyCount := 1 + childSchema.args
 	if i+nodeKeyCount > len(path) {
 		return markMatchingNodeInactive(current, path[i:], inactive)
@@ -627,6 +717,75 @@ func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string, mo
 	}
 	*nodes = out
 	if !removedAny {
+		return fmt.Errorf("path not found: no member %q of %q",
+			strings.Join(members, " "), keyword)
+	}
+	return nil
+}
+
+// markMultiLeafMembersInactive is the deactivate/activate counterpart of
+// removeMultiLeafMembers for a value-list multi-leaf (#3975). keyword is the
+// leaf's first key ("protocol", "system-services", "next-hop"); members are the
+// trailing tokens. Unlike delete, the Inactive marker is a NODE-level flag, so a
+// bracket list — collapsed onto ONE node's Keys[1:] — can only be toggled whole,
+// never per-value; block-shape members (one child node each) can be toggled
+// individually.
+//
+//   - members empty  → toggle the whole leaf (mirrors markMatchingNodeInactive's
+//     prefix match), so `deactivate ... protocol` toggles the list.
+//   - members named  → for every node whose first key is keyword, toggle the
+//     WHOLE node when any named member rides on Keys[1:] (the flat/bracket shape —
+//     this is what display-set emits: `deactivate ... protocol tcp udp icmp`), and
+//     for a plain value-list leaf ALSO toggle any child node the members name
+//     (the hierarchical block shape). This restores round-trip of an inactive
+//     bracket leaf, which errored before #3975.
+//
+// modifierChildren mirrors removeMultiLeafMembers: when true (a valueList leaf
+// whose children are MODIFIERS of the value, e.g. static next-hop's interface),
+// the children are never members, so only the Keys[1:] flat match applies.
+//
+// Returns an error when no named member was found anywhere, mirroring
+// removeMultiLeafMembers' not-found contract.
+func markMultiLeafMembersInactive(nodes *[]*Node, keyword string, members []string, modifierChildren, inactive bool) error {
+	if len(members) == 0 {
+		return markMatchingNodeInactive(nodes, []string{keyword}, inactive)
+	}
+	drop := make(map[string]bool, len(members))
+	for _, m := range members {
+		drop[m] = true
+	}
+	matched := false
+	for _, n := range *nodes {
+		if len(n.Keys) == 0 || n.Keys[0] != keyword {
+			continue
+		}
+		// Flat / bracket shape: members ride on Keys[1:]. Inactive is node-level,
+		// so any named member present toggles the whole statement.
+		flatMatch := false
+		for _, v := range n.Keys[1:] {
+			if drop[v] {
+				flatMatch = true
+				break
+			}
+		}
+		if flatMatch {
+			n.Inactive = inactive
+			matched = true
+			continue
+		}
+		if modifierChildren {
+			// valueList node: children are MODIFIERS, never members.
+			continue
+		}
+		// Block shape: one child node per member — toggle only the named ones.
+		for _, c := range n.Children {
+			if len(c.Keys) >= 1 && drop[c.Keys[0]] {
+				c.Inactive = inactive
+				matched = true
+			}
+		}
+	}
+	if !matched {
 		return fmt.Errorf("path not found: no member %q of %q",
 			strings.Join(members, " "), keyword)
 	}

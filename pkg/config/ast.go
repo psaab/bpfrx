@@ -216,10 +216,29 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 		found := false
 		for _, n := range current {
 			if len(n.Keys) > 0 && n.Keys[0] == keyword {
-				i++
-				if i >= len(path) {
-					return []*Node{n}
+				if i+1 >= len(path) {
+					// Terminal path element on a bare keyword: return
+					// EVERY sibling sharing this leading keyword (#3980),
+					// not just the first. A hierarchy level may hold
+					// multiple DISTINCT statements with the same leading
+					// keyword — e.g. `ntp server 1.1.1.1` /
+					// `ntp server 2.2.2.2`, several `from-zone` policy
+					// contexts, repeated `archive-sites`. Returning only
+					// the first hid the rest from a path-scoped
+					// `show configuration <path>` and, worse, from its
+					// `| display set`, so a scoped display-set backup
+					// silently dropped the hidden statements on restore.
+					// FindChildren-not-FindChild, the display-side sibling
+					// of the #3842 / #2419 read-all-siblings class.
+					var all []*Node
+					for _, sib := range current {
+						if len(sib.Keys) > 0 && sib.Keys[0] == keyword {
+							all = append(all, sib)
+						}
+					}
+					return all
 				}
+				i++
 				current = n.Children
 				found = true
 				break
@@ -284,45 +303,6 @@ func navigateToNode(children []*Node, path []string) (*Node, error) {
 // Handles multi-key nodes by consuming multiple path elements per node.
 func (t *ConfigTree) findNode(path []string) (*Node, error) {
 	return navigateToNode(t.Children, path)
-}
-
-// removeNode removes and returns a node at the given path.
-func (t *ConfigTree) removeNode(path []string) (*Node, error) {
-	if len(path) == 0 {
-		return nil, fmt.Errorf("empty path")
-	}
-	// Navigate to the parent, then find and remove the target child.
-	parentChildren := &t.Children
-	pos := 0
-	// We need to find where the last node starts.
-	// Walk until we can identify the target node at the end.
-	for pos < len(path) {
-		// Try to match a child and see if it's the final node.
-		var bestChild *Node
-		bestConsumed := 0
-		bestIdx := -1
-		for i, child := range *parentChildren {
-			consumed := matchNodeKeys(child, path, pos)
-			if consumed > 0 {
-				bestChild = child
-				bestConsumed = consumed
-				bestIdx = i
-				break
-			}
-		}
-		if bestChild == nil {
-			return nil, fmt.Errorf("path element %q not found", path[pos])
-		}
-		if pos+bestConsumed >= len(path) {
-			// This is the target node — remove it.
-			*parentChildren = append((*parentChildren)[:bestIdx], (*parentChildren)[bestIdx+1:]...)
-			return bestChild, nil
-		}
-		// Descend into this child's children.
-		parentChildren = &bestChild.Children
-		pos += bestConsumed
-	}
-	return nil, fmt.Errorf("path not found")
 }
 
 // insertNode inserts a node as a child at the given parent path.

@@ -1,3 +1,149 @@
+## 2026-07-03 — #3985: `monitor interface` leaked a stdin-reader goroutine that stole the next command's keystroke
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-021 (MEDIUM, CLI UX). Both
+    `monitorInterfaceSingle` and `monitorInterfaceTraffic`
+    (`pkg/cli/monitor_interface.go`) spawned a goroutine that looped on a
+    blocking `os.Stdin.Read` to detect the quit key. `setRawMode` used
+    `VMIN=1`/`VTIME=0`, so the read blocked indefinitely. When the monitor
+    returned on `q`/ESC/Ctrl-C the goroutine was left parked mid-read; the
+    operator's NEXT command's first keystroke went to the dead monitor's
+    reader instead of the CLI prompt, and each `monitor interface`
+    invocation leaked another reader competing for stdin.
+  - **Fix**: switched `setRawMode` to `VMIN=0`/`VTIME=1` (poll-with-timeout:
+    Read returns immediately with data, else `(0, nil)` after ~100ms).
+    Extracted the reader loop into a testable `keyReader(r, keyCh, done)`
+    that re-checks `done` between polls (`continue` on `n==0`) and discards a
+    byte read after `done` is closed rather than forwarding it. Added
+    `startKeyReader(r) -> (keyCh, stop)`; `stop` closes `done` and
+    `wg.Wait()`s the goroutine (idempotent via `sync.Once`). Both monitors
+    now `defer stop()`, ordered (LIFO) to stop the reader BEFORE the terminal
+    is restored — so once the command returns no goroutine is competing for
+    stdin.
+  - **Test**: `pkg/cli/monitor_interface_stdin_3985_test.go` — a `fakeTTY`
+    poll reader drives `keyReader`/`startKeyReader`. Asserts keys forward
+    while running, the goroutine stays alive across idle polls and returns
+    promptly once `done` closes, a post-`done` key is not forwarded, and
+    `stop()` blocks until the goroutine drains (and is idempotent).
+    RED-on-revert verified: reverting `keyReader` to the pre-fix body fails
+    both `TestKeyReaderLifecycle` ("returned while running") and
+    `TestKeyReaderDiscardsKeyAfterDone` ("key forwarded after done closed").
+    `go test ./pkg/cli/ -race` green; `go build ./...`, gofmt clean (vet
+    unchanged — pre-existing `cli.go:503` unreachable-code note only).
+  - **File(s)**: `pkg/cli/monitor_interface.go`,
+    `pkg/cli/monitor_interface_stdin_3985_test.go`,
+    `docs/monitor-interface-research.md`, `_Log.md`.
+
+## 2026-07-03 — #3982: config-mode `rename` of a non-first same-keyword sibling failed (matched only the first sibling)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-036 (MEDIUM, config-mode edit parity).
+    `RenamePath` (`pkg/config/ast_edit.go`) — the `rename <old> to <new>`
+    config-mode verb — resolved the source through `removeNode`
+    (`pkg/config/ast.go`), whose per-level loop broke on the FIRST child
+    whose FIRST key matched (`matchNodeKeys > 0` returns `1` for a
+    keyword-only match). With several same-keyword siblings (`policy A/B/C`,
+    `term X/Y/Z`) renaming a NON-FIRST one — `rename policy B to B2` with
+    `[A B C]` — matched `policy A`, descended into it for `B`, and failed
+    `source not found` (other shapes could rename the wrong first node). The
+    operator could not rename the 2nd+ occurrence; the only recourse was
+    delete + re-add, losing ordering and sub-config. This is the config-edit
+    sibling of the #3842 / #2419 / #3975 / #3980 read-all-siblings class.
+  - **Fix**: rewrote `RenamePath` to resolve the source through
+    `findNodeWithParent` (prefers the LONGEST key match, so it selects
+    `policy B` by full identity, not the first `policy` keyword). A rename
+    that only changes the name (destination parent == source parent) is done
+    IN PLACE, preserving sibling order and the node's children/sub-config; a
+    cross-parent rename detaches and re-appends via a new `childrenAtPath`
+    helper, keeping the subtree. Added a collision guard: a rename whose new
+    identity duplicates an existing sibling under the destination parent
+    (`rename policy B to C` when `C` exists) is rejected rather than creating
+    a duplicate. Removed the now-dead first-keyword-match `removeNode` helper.
+  - **File(s)**: `pkg/config/ast_edit.go` (RenamePath rewrite + childrenAtPath),
+    `pkg/config/ast.go` (removeNode deleted), `pkg/config/parser_ast_test.go`
+    (TestRenameNonFirstSibling — RED on revert), `docs/config-schema.md`
+    (rename-side contract section).
+  - **Validation**: `TestRenameNonFirstSibling` RED on revert (`source not
+    found: ... policy B`), GREEN with the fix; `go test ./pkg/config/...`,
+    `go build ./...`, `gofmt`, `go vet ./pkg/config/` all clean.
+## 2026-07-03 — #3980: path-scoped `show configuration <path>` / `| display set` showed only the FIRST sibling at a repeated-keyword level (navigatePath terminal single-key match was FindChild-first)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-037 (MEDIUM, config-display fidelity).
+    `navigatePath` (`pkg/config/ast.go`), the node selector behind every
+    path-scoped `FormatPath*` renderer (`show configuration <path>`,
+    `| display set`, JSON, XML, inheritance), resolved a path ending on a
+    bare keyword by returning `[]*Node{n}` — the FIRST matching sibling
+    only. A hierarchy level may hold multiple DISTINCT statements with the
+    same leading keyword (several `system ntp server <addr>`, many
+    `routing-options static route <dest>`, repeated `archive-sites`), so
+    `show configuration system ntp server` and its `| display set` showed
+    only the first entry, hiding the rest; a scoped `display set` backup
+    taken that way silently dropped the hidden statements on restore. The
+    full-tree `Format`/`FormatSet` (no path) already walked each sibling and
+    were unaffected — this was the path-scoped selector only.
+  - **Fix**: at the terminal path element, gather EVERY sibling whose first
+    key equals the keyword (FindChildren-not-FindChild), the display-side
+    sibling of the #3377 all-nodes walk / #3842 / #2419 read-all-siblings
+    class. Naming a specific keyed value (`... server 2.2.2.2`) still routes
+    through the keyword+value multi-key branch to that one entry.
+  - **Test**: `pkg/config/show_config_repeated_keyword_3980_test.go` —
+    path-scoped ntp-server render (hierarchical + display set), path-scoped
+    static-route render, static-route `display set` round-trip (render →
+    ParseSetCommand re-apply → all routes reproduced), full-tree control,
+    single-statement no-regression. RED-on-revert verified: reverting
+    `ast.go` renders only the first sibling and the render/round-trip
+    assertions fail; control + no-regression stay green. Full
+    `go test ./pkg/config/...` green; `go build ./...`, gofmt, vet clean.
+  - **Note**: a separate, orthogonal construction defect still collapses the
+    keyed-list LEAVES `system ntp server` / `archive-sites` on flat-set
+    replay — non-`multi` `args:1` schema entries hit `SetPath`'s
+    single-value-replace branch and keep only the LAST, though the compiler
+    reads all via `FindChildren`. That is a schema/SetPath fix (mark
+    keyed-list + read `firewallMatchValues`), not a renderer change; tracked
+    separately. The round-trip test uses static routes (a keyed container
+    that round-trips cleanly) to isolate the display-side fix.
+  - **File(s)**: `pkg/config/ast.go`,
+    `pkg/config/show_config_repeated_keyword_3980_test.go`,
+    `pkg/config/README.md`, `_Log.md`.
+
+## 2026-07-03 — #3975: `deactivate`/`activate` on a bracketed multi-value leaf errored + broke round-trip (setInactiveAtPath lacked the #2419 multi-value handling deletePath got in #3846)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-034 (MEDIUM, config-mode parity).
+    `setInactiveAtPath` (`pkg/config/ast_edit.go`), the shared
+    `deactivate`/`activate` config-mode edit, did NOT handle the bracketed
+    multi-value leaf shape (#2419) that `deletePath` got in #3846/#3848/#3879.
+    A `multi: true` value-list leaf collapses `[ a b c ]` onto ONE node's
+    `Keys=["field","a","b","c"]`, but the schema-driven traversal ate the
+    first member as an extra key (`nodeKeyCount == 2`) then treated the rest
+    as container tokens: `deactivate ... from protocol tcp udp icmp` — the
+    EXACT line `show | display set` emits for an inactive bracket leaf —
+    errored `container "protocol tcp" does not exist`. So an inactive
+    bracket leaf did NOT round-trip: replaying its display-set errored and
+    the leaf reloaded ACTIVE, silently losing the operator's deactivate
+    intent (the deactivate-side counterpart of the #3846 delete-side fail).
+  - **Fix**: added the same multi-leaf interception `deletePath` uses to
+    `setInactiveAtPath` (gate `multi && (children == nil || valueList) &&
+    args == 1`), routing to a new `markMultiLeafMembersInactive` helper that
+    mirrors `removeMultiLeafMembers`: no member → toggle the whole leaf;
+    named members → toggle the whole node when any rides on `Keys[1:]` (the
+    flat/bracket shape — `Inactive` is node-level, a bracket list is one
+    statement), and for a plain value-list leaf ALSO toggle named child nodes
+    (block shape); absent member → not-found error. `args == 1` gate keeps
+    keyed multi entries (`address <name> <prefix>`) on whole-node toggle.
+  - **Test**: `pkg/config/deactivate_multi_leaf_3975_test.go` — firewall
+    `from protocol` (whole expanded list / no-member / member /
+    absent-member-errors / activate-reverses / display-set round-trip),
+    policy match `source-address`, block-shape `system-services` member
+    toggle, single-value-leaf and keyed-entry non-regression. RED-on-revert
+    verified: reverting the branch makes the whole-list/member/round-trip/
+    activate assertions error `container "protocol tcp" does not exist`.
+    Full `go test ./pkg/config/...` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: `pkg/config/ast_edit.go`,
+    `pkg/config/deactivate_multi_leaf_3975_test.go`, `docs/config-schema.md`,
+    `_Log.md`.
+
 ## 2026-07-03 — #3968: non-exact CoS shaper path (`build_cos_batch_from_queue`) never cleared `pop_snapshot_stack` across batches → committed-batch snapshots accumulated on the hot path → unbounded scratch growth (realloc / stale re-read past the TX_BATCH_SIZE bound)
 
 - **Timestamp**: 2026-07-03
@@ -30381,3 +30527,75 @@ top.
     cargo test --release green; `go build ./...` green.
   - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
     userspace-dp/src/afxdp/README.md, _Log.md
+  - **Action**: #3972 — port-mirroring invalid-entry fail mode. VERIFY FIRST
+    refuted the issue's stated fail-mode: the "warn + drop whole table" lived in
+    `pkg/dataplane/userspace/mirrors.go` `buildMirrorConfigSnapshotsFailClosed`
+    (the LIVE userspace snapshot path — `pkg/dataplane/compiler.go` port-mirror
+    compile is retired eBPF), NOT the Go compiler, and the Go compiler
+    (`compilePortMirroring`) did NO validation at all (silently accepted a
+    negative rate and a duplicate ingress). The #1376 plan
+    (docs/pr/1373-retire-ebpf-dataplane/plan-1376-port-mirroring.md line 19)
+    intended the reject at COMMIT TIME; the implementation deferred it to the
+    snapshot builder, where one bad entry (duplicate ingress ifindex or negative
+    rate) returned an error that `buildMirrorConfigSnapshotsFailClosed` turned
+    into a whole-table drop with only a `slog.Warn` — 3 valid mirror sessions +
+    1 typo → all 4 lost silently. FIX = HARD-REJECT at commit (the issue's
+    preferred mode, matching the project's strict-commit-reject posture):
+    `config.compilePortMirroring` now returns a specific error naming the
+    offending instance on a duplicate ingress source (normalized via
+    `LinuxIfName` so vSRX/Linux spellings collide — one output per ingress
+    interface), a negative input rate, or a non-numeric rate (previously
+    swallowed → silently became rate 0 = mirror-all). `rate 0` stays valid
+    (mirror every packet, per the #1376 sampling model), so only negative /
+    non-numeric are rejected. Defense-in-depth: `buildMirrorConfigSnapshots`
+    converted from whole-table-fail-closed to SCOPE-DROP (skip only the bad
+    entry + specific warn, keep the valid sessions) and its `FailClosed` wrapper
+    removed (builder.go calls it directly). RED-on-revert (proven by restoring
+    origin/master source via `git show` in the worktree): the 3 new pkg/config
+    reject tests (`TestPortMirroringRejectsNegativeRateFlatSet`,
+    `...RejectsNonNumericRateFlatSet`, `...RejectsDuplicateIngressFlatSet`, all
+    ParseSetCommand+SetPath per CLAUDE.md) FAIL against the old compiler
+    (CompileConfig went green). All-valid config compiles all 3 instances
+    (`...AllValidFlatSetCompilesAllEntries`). Updated userspace tests to assert
+    scope-drop (`...ScopeDropsDuplicateIngressIfindex`,
+    `...ScopeDropsNegativeInputRate`). `go test ./pkg/config/...` +
+    `./pkg/dataplane/...` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/config/compiler_services.go,
+    pkg/config/parser_routing_test.go,
+    pkg/dataplane/userspace/mirrors.go, pkg/dataplane/userspace/builder.go,
+    pkg/dataplane/userspace/manager_test.go,
+    docs/pr/1373-retire-ebpf-dataplane/plan-1376-port-mirroring.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3979 — `configure exclusive` lock never released on session
+    exit → permanent config lockout. VERIFY FIRST confirmed the defect (also
+    already flagged in `cmd/cli/shared.go` #1563 comment): `EnterConfigureExclusive`
+    records the holder in `exclusiveHolder` and leaves `configHolder` empty, but
+    `ExitConfigureSession`'s release guard compared only `configHolder`. So an
+    exclusive holder's own exit saw `configHolder("") != sessionID` and returned
+    false WITHOUT clearing anything → the exclusive lock persisted with no live
+    holder → every subsequent `configure` / `configure exclusive` /
+    `configure private` rejected until daemon restart. The disconnect
+    auto-release (`configLockInterceptor`, pkg/grpcapi/server.go) routes through
+    `ExitConfigureSession`, so it silently failed too — a single operator running
+    `configure exclusive` then disconnecting bricked all future config edits.
+    FIX (pkg/configstore/store_lock.go): added `effectiveHolderLocked()`
+    (exclusiveHolder if set, else configHolder); `ExitConfigureSession` now
+    compares the session against the effective holder, releasing whichever lock
+    THIS session actually holds. Matching the effective holder ALSO restores the
+    stale-holder reclaim on disconnect (the interceptor path). `ConfigHolder()`
+    now reports the effective holder so `clear system config-lock` / diag
+    attributes an exclusive lock to its real holder instead of an empty string.
+    Live-holder-blocks-others preserved (`EnterConfigure*` still rejects with
+    ErrConfigLocked while configDir set; a non-holder exit can't steal the lock);
+    shared/private release unchanged. RED-on-revert (proven by restoring the old
+    `configHolder` guard): TestExclusiveLockReleasedOnSessionExit,
+    TestExclusiveLockReacquireCycle, TestLiveExclusiveHolderBlocksOthers all FAIL
+    on the old guard while TestSharedLockUnaffected stays GREEN (shared mode was
+    never broken). `go test ./pkg/cli/... ./pkg/configstore/...` green;
+    `go build ./...`, gofmt, vet clean. Docs: pkg/configstore/README.md new
+    "Config lock: shared/private vs. exclusive holders (#3979)" section; updated
+    the now-outdated cmd/cli/shared.go #1563 comment.
+  - **File(s)**: pkg/configstore/store_lock.go,
+    pkg/configstore/store_lock_3979_test.go, pkg/configstore/README.md,
+    cmd/cli/shared.go, _Log.md

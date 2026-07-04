@@ -161,6 +161,42 @@ config to the dataplane. A subsequent restart therefore re-classifies into
 bootstrap (the marker disambiguates never-committed from
 operator-committed-empty).
 
+### Config lock: shared/private vs. exclusive holders (#3979)
+
+Only one session edits config at a time. The store tracks the holder in
+two fields depending on the mode the session entered:
+
+- **shared / private** (`EnterConfigure`, `EnterConfigureSession`) —
+  holder recorded in `configHolder`.
+- **exclusive** (`EnterConfigureExclusive`, from `configure exclusive`) —
+  holder recorded in `exclusiveHolder`; `configHolder` stays empty.
+  `IsExclusiveLocked()` keys off `exclusiveHolder != ""`.
+
+The release path (`ExitConfigureSession`) must match the session against
+**whichever field its acquiring mode set**. It compares against
+`effectiveHolderLocked()` — `exclusiveHolder` when set, else
+`configHolder` — so a session releases the exact lock it holds.
+
+**#3979 (fixed):** the release guard previously compared only
+`configHolder`. An exclusive holder sets `exclusiveHolder` and leaves
+`configHolder` empty, so the guard saw `configHolder("") != sessionID`
+and returned `false` **without clearing anything**. The exclusive lock
+then persisted with no live holder, and every subsequent
+`configure` / `configure exclusive` / `configure private` was rejected
+until daemon restart — a single operator running `configure exclusive`
+then disconnecting bricked all future config edits. The disconnect
+auto-release (`configLockInterceptor` in `pkg/grpcapi/server.go`) routes
+through `ExitConfigureSession`, so it silently failed too; matching the
+effective holder restores that stale-holder reclaim on disconnect.
+
+`ConfigHolder()` likewise reports the effective holder, so
+`clear system config-lock` / diagnostic output attributes an exclusive
+lock to its real holder instead of an empty string. A genuinely-active
+holder still blocks other sessions (`EnterConfigure*` rejects with
+`ErrConfigLocked` while `configDir` is set), and a non-holder's exit
+cannot steal the lock. `ForceExitConfigure` (`clear system config-lock`)
+remains the unconditional operator override.
+
 ### Cluster read-only gate (#3893)
 
 On an HA chassis cluster the RG0 primary is the sole config authority;
