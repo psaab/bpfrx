@@ -649,11 +649,19 @@ type NATPool struct {
 	// unaffected), and it would otherwise leak into configstore.ExportJSON's
 	// debug dump of the compiled *config.Config as a redundant duplicate of
 	// Port. The tag keeps it out of any json.Marshal of NATPool.
-	PortRaw       string `json:"-"`
-	PortLow       int    // source pool port range low (default 1024)
-	PortHigh      int    // source pool port range high (default 65535)
-	PersistentNAT *PersistentNATConfig
-	Deterministic *DeterministicNATConfig
+	PortRaw  string `json:"-"`
+	PortLow  int    // source pool port range low (default 1024)
+	PortHigh int    // source pool port range high (default 65535)
+	// PortNoTranslation records the source-pool `port no-translation` modifier
+	// (#3906). When true the pool translates the source ADDRESS but PRESERVES
+	// the original source port (Junos 1:1 source-port behaviour) — the
+	// dataplane takes the address-only path and leaves rewrite_src_port unset,
+	// so the packet keeps its L4 source port. PortLow/PortHigh are irrelevant
+	// in this mode. Before #3906 the token was silently dropped and the pool
+	// PAT-translated the port anyway.
+	PortNoTranslation bool
+	PersistentNAT     *PersistentNATConfig
+	Deterministic     *DeterministicNATConfig
 }
 
 // PersistentNATPermit selects the remote-endpoint scope of a persistent

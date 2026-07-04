@@ -2682,6 +2682,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3906 source-NAT pool port-range gate. The pool `port range <low> to
+	// <high>` was parsed with the wrong keyword shape and silently ignored (the
+	// pool defaulted to 1024-65535 PAT), so an operator narrowing the range got
+	// the full default range and a reversed/out-of-range range committed green
+	// then dropped the rule at runtime. Reject a reversed (low > high) or
+	// out-of-range (not 1-65535) explicitly-configured range. Strict on commit /
+	// commit-check (hard-reject); lenient on load / peer-sync (downgrade to a
+	// warning so a config persisted before this gate existed still boots — #1960
+	// no-brick; the snapshot builder independently fails CLOSED via
+	// sourceNATPoolPortRange). Shares the lenientDestNATAddresses flag (same NAT
+	// silent-drop / wrong-translate doctrine). Runs after the DNAT pool gate.
+	if err := validateSourceNATPoolStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("source-nat pool (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates
