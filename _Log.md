@@ -1,3 +1,32 @@
+## 2026-07-03 — #3942: GetBGPSummary scrapes text → phantom trailer peers + never sets PfxRcd
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-064 (MEDIUM, observability). `GetBGPSummary`
+    (`pkg/frr/status_parse.go`) scraped the `show bgp summary` TEXT table with a
+    `strings.Fields` field-count heuristic. Two defects: (a) the footer line
+    `Total number of neighbors N` has exactly 5 fields, passing the
+    `len(fields) < 5` guard, so it became a PHANTOM peer (`Neighbor="Total"`,
+    `AS="of"`); (b) the FRR text table overloads ONE `State/PfxRcd` column — for
+    an Established peer that column is the prefix count, not a state word — so
+    the scraper stored the pfxRcd digit in `State` and never populated `PfxRcd`.
+    Every real peer showed 0 prefixes and a bogus extra peer appeared in
+    `show bgp summary` (+ the gRPC/REST BGP status). Switched `GetBGPSummary` to
+    `show bgp summary json` and added `parseBGPSummaryJSON` (mirrors the existing
+    `parseRouteJSON` JSON-vtysh pattern): decodes FRR's per-AFI/SAFI peer map
+    (`ipv4Unicast`/`ipv6Unicast`/…), reads the real `state`, `pfxRcd`,
+    `remoteAs`, `msgRcvd`/`msgSent`, `peerUptime` fields — no column overload, no
+    footer to misparse. Added an `AddressFamily` field to `BGPPeerSummary` so a
+    neighbor active in multiple families produces one disambiguated (labelled +
+    sorted) row per family. Non-JSON / peerless / empty output → no peers, no
+    error (valid observability state). CLI / REST / gRPC `show bgp summary`
+    renderers now surface `AF` + `PfxRcd` columns. Added golden fixtures + a
+    RED-on-revert test (text + JSON responses both injected: NEW code parses
+    JSON → 2 peers, PfxRcd 3/1; reverted text scraper → 3 peers incl. phantom
+    `Total`, empty PfxRcd, State="3"/"1" — proven RED). Updated `pkg/frr/README.md`.
+  - **File(s)**: pkg/frr/status_parse.go, pkg/frr/bgp_summary_3942_test.go,
+    pkg/cli/cli_show_routing.go, pkg/api/routing.go,
+    pkg/grpcapi/server_routing.go, pkg/frr/README.md, _Log.md
+
 ## 2026-07-03 — #3939: NetFlow v9 / IPFIX protocolIdentifier was 0 for GRE/ESP/AH (parsed protocol NAME, not rec.ProtocolNum) → exported flows misattributed
 
 - **Timestamp**: 2026-07-03
