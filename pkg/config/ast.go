@@ -286,45 +286,6 @@ func (t *ConfigTree) findNode(path []string) (*Node, error) {
 	return navigateToNode(t.Children, path)
 }
 
-// removeNode removes and returns a node at the given path.
-func (t *ConfigTree) removeNode(path []string) (*Node, error) {
-	if len(path) == 0 {
-		return nil, fmt.Errorf("empty path")
-	}
-	// Navigate to the parent, then find and remove the target child.
-	parentChildren := &t.Children
-	pos := 0
-	// We need to find where the last node starts.
-	// Walk until we can identify the target node at the end.
-	for pos < len(path) {
-		// Try to match a child and see if it's the final node.
-		var bestChild *Node
-		bestConsumed := 0
-		bestIdx := -1
-		for i, child := range *parentChildren {
-			consumed := matchNodeKeys(child, path, pos)
-			if consumed > 0 {
-				bestChild = child
-				bestConsumed = consumed
-				bestIdx = i
-				break
-			}
-		}
-		if bestChild == nil {
-			return nil, fmt.Errorf("path element %q not found", path[pos])
-		}
-		if pos+bestConsumed >= len(path) {
-			// This is the target node — remove it.
-			*parentChildren = append((*parentChildren)[:bestIdx], (*parentChildren)[bestIdx+1:]...)
-			return bestChild, nil
-		}
-		// Descend into this child's children.
-		parentChildren = &bestChild.Children
-		pos += bestConsumed
-	}
-	return nil, fmt.Errorf("path not found")
-}
-
 // insertNode inserts a node as a child at the given parent path.
 func (t *ConfigTree) insertNode(parentPath []string, node *Node) error {
 	children := &t.Children
