@@ -1620,6 +1620,33 @@ reserved for whole-dataplane selection where a rewrite shim
   unsupported-modifier #3114 rejection incl. the lenient-warn surface, split
   required dimensions merged, single-block regression guard — built with
   `NewParser` for the `LoadOverride` shape).
+- **#3915 (the NAT-node analogue of #3842 — duplicate `source`/`destination`/
+  `static`/`nat64`/`natv6v4`/`proxy-arp` blocks UNDER ONE `nat {}` node):**
+  `compileNAT` (`compiler_nat.go`) read each of these six sub-blocks with
+  `node.FindChild(<name>)` (FIRST match only). `parseStatements` appends a
+  repeated hierarchical block as a sibling at EVERY level, so a
+  `LoadMerge`/`LoadOverride` that produced a SECOND `source {}` (or
+  `destination`/`static`/`nat64`/`proxy-arp`) block under one `nat {}` had that
+  block's rule-sets SILENTLY DROPPED — the SNAT/DNAT/static rule-set vanished
+  and traffic that should have been translated egressed UNtranslated (a NAT
+  bypass / connectivity break) with a clean commit. The fix iterates EVERY
+  same-named sub-block via the shared `forEachChild(node.Children, <name>, fn)`
+  primitive. Each sub-block compiler (`compileNATSource` / `compileNATDestination`
+  / `compileNATStatic` / `compileNAT64` and the inline proxy-arp loop) already
+  APPENDS its rule-sets (`sec.NAT.Source` / `Destination.RuleSets` / `Static` /
+  `NAT64` / `ProxyARP`) and map-assigns its pools, so invoking it once per
+  duplicate block MERGES the blocks exactly as Junos merges duplicate
+  hierarchical stanzas; with a single block the callback fires exactly once,
+  bit-identical to the prior `FindChild` read. `natv6v4` additionally
+  initializes its struct once and ORs the flag so a second block cannot reset an
+  already-observed `no-v6-frag-header`. This is the sub-block-level sibling of
+  #3444/#3562 (which fixed the `security`/`nat`/`destination` CONTAINER levels of
+  the DNAT-`to` strict gate) and of #3842 (the same defect at the policy
+  `match`/`then` level). Regression coverage:
+  `pkg/config/compiler_nat_dup_subblock_3915_test.go` (per-sub-block merge
+  RED-on-revert for source/destination/static/nat64/proxy-arp, pool merge,
+  single-block bit-identical guard — built with `NewParser` for the
+  `LoadOverride` dup-block shape, driving `compileNAT` directly).
 - **#3473 (duplicate security-policy names — strict commit gate):**
   `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
   hard-rejects two security policies that share a name within the same

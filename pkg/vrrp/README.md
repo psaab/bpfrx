@@ -124,12 +124,16 @@ This is the package that drives chassis-cluster failover.
   so a router that ignores broadcast gratuitous ARP still re-binds the VIP.
   This is belt-and-suspenders: the broadcast GARP burst always fires; the
   directed probe is supplementary. The target comes from the network-free
-  helper `gatewayProbeTarget`, which computes network+1 from the masked CIDR
+  helper `GatewayProbeTarget`, which computes network+1 from the masked CIDR
   (`net.ParseCIDR`) — it returns `ok=false` to SKIP the directed probe on
   /31 (RFC 3021) and /32, where no in-subnet gateway host exists. Pre-#2377
   the target was the network address with its last octet forced to .1, which
   fell OUTSIDE the subnet for /25-or-longer prefixes whose network does not
   end in .0 (e.g. VIP 10.0.61.18/28 → 10.0.61.1, outside .16-.31).
+  `GatewayProbeTarget` is exported so the daemon's direct-mode
+  (private-rg-election / no-reth-vrrp) GARP path (`directSendGARPs` in
+  `pkg/daemon`) reuses the identical derivation — that site had the same
+  forced-.1 bug and was missed by #2377 (fixed in #3922).
 - Burst follow-up abdication gate (#2867): the cluster burst helpers send the
   first GARP/NA frame synchronously, then fan the remaining `count-1` frames
   out over a detached goroutine spanning `(count-1)*50 ms`. `sendGARP` captures

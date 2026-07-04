@@ -40,6 +40,33 @@ Example for cluster_id=1:
 5. **GARP/NA** -- automatically use the kernel MAC (called at send time)
 6. **`bpf_fib_lookup`** -- automatically returns new MAC as `fib.smac`
 
+## Rename Owns the Link UP (#3920)
+
+A RETH member must be administratively DOWN to be renamed (kernel
+requirement). `renameRethMember` therefore downs the link, renames it,
+and then brings it back UP — the function that downs a link owns
+bringing it back up.
+
+It must NOT delegate the UP to the subsequent `programRethMAC`.
+`programRethMAC` early-returns (no UP) when the virtual MAC already
+matches, and that is precisely the situation after a rename:
+`renameRethMember` locates the interface by matching that same virtual
+MAC, so on a just-renamed member the MAC always already matches and
+`programRethMAC` always no-ops. (A second facet: even in the MAC-change
+path, `programRethMAC`'s fast path sets the MAC while the link is still
+DOWN, which succeeds without a cycle and returns without an UP.) If the
+UP were skipped, the RETH data link would be left DOWN → the interface
+track detects link-down → the redundancy group demotes → traffic
+blackhole.
+
+There is no flap: whenever a rename happens the MAC already matches so
+`programRethMAC` no-ops, leaving `renameRethMember`'s UP as the final
+state; and even in the defensive case where `programRethMAC` does cycle,
+the member still ends UP. Bringing the member UP before `programRethMAC`
+also restores that function's live-address-change detection, which
+requires an UP link to distinguish `IFF_LIVE_ADDR_CHANGE` drivers from
+those that need a cycle.
+
 ## Reboot Safety
 
 - Bootstrap `.link` files (from `setup.sh`) use the physical MAC for udev rename
@@ -55,7 +82,8 @@ Example for cluster_id=1:
 |------|----------|
 | `pkg/cluster/reth.go` | `RethMAC(clusterID, rgID)` -- returns deterministic MAC |
 | `pkg/cluster/reth.go` | `IsVirtualRethMAC(mac)` -- detects virtual RETH pattern |
-| `pkg/daemon/daemon.go` | `programRethMAC()` -- sets MAC via netlink (step 2.6 in applyConfig) |
+| `pkg/daemon/daemon_reth.go` | `renameRethMember()` -- renames a member found by virtual MAC (down → rename → **up**, #3920) |
+| `pkg/daemon/daemon_reth.go` | `programRethMAC()` -- sets MAC via netlink (step 2.6 in applyConfig) |
 | `pkg/dataplane/compiler.go` | Skips `.link` file when RETH member has virtual MAC |
 
 ## Impact

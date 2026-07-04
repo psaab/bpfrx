@@ -43,6 +43,126 @@
     `docs/flow-cache-simplification.md`, `_Log.md`
   - **Validation flag**: test-failover WARRANTED (HA VRRP gateway failover →
     stale-MAC scenario) — parent batch-validates on the loss userspace cluster.
+## 2026-07-03 — #3924: userspace local-address sync pruned VRRP VIP keys on a transient netlink AddrList failure → VIP/SSH/BGP/IKE blackhole
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-183 (MEDIUM, HA/robustness — VIP blackhole).
+    `syncLocalAddressMapsLocked` (`pkg/dataplane/userspace/maps_sync.go`) builds
+    the desired `userspace_local_v4`/`userspace_local_v6` key set partly from
+    `netlink.AddrList(nil, family)` to recover kernel-owned VRRP VIPs that are
+    absent from the config snapshot, then prunes every map key not in the
+    desired set. On a TRANSIENT `AddrList` error (or an interrupted / `ENOBUFS`
+    partial dump) the old code `continue`d silently, leaving the desired set
+    INCOMPLETE, and still ran the prune — removing the live VRRP VIP keys and
+    blackholing packets destined to the firewall's own VIP/SSH/BGP/IKE
+    endpoints, with the error swallowed.
+  - **Fix**: `buildDesiredLocalAddressSets` is now a `*Manager` method that
+    reports `enumComplete` (true only when every `AddrList` family dump
+    succeeded) and enumerates through a `m.addrListForLocalSync` seam
+    (test hook `addrListForLocalSyncHook` on the Manager). `syncLocalAddressMapsLocked`
+    still performs the adds (adding only widens the local set — always safe)
+    but SKIPS the stale-key prune and logs a `slog.Warn` when the enumeration
+    is incomplete; the next reconcile with a complete enumeration prunes any
+    genuinely stale keys. Only `userspace_local_v4`/`v6` enumerate the kernel —
+    the interface-NAT and config-derived sets are snapshot-only, unaffected.
+  - **Files**: `pkg/dataplane/userspace/maps_sync.go`,
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/dataplane/userspace/maps_sync_addrlist_prune_3924_test.go` (RED-on-revert
+    unit tests), `docs/userspace-xdp-pass-bootstrap-and-ipv6.md` (§3 hardening
+    note).
+  - **Validation**: `go build ./...`, `gofmt`, `go vet` clean.
+    `TestSyncLocalAddressMapsSkipsPruneOnAddrListError` (VIP keys preserved +
+    warning on injected `AddrList` error; adds still land) and
+    `TestSyncLocalAddressMapsPrunesStaleOnCompleteEnum` (stale keys still pruned
+    on complete enum) pass under sudo (ebpf maps need memlock); RED-on-revert
+    proven — simulating the pre-fix always-prune makes the VIP-preserved test
+    fail with "VRRP VIP v4 key pruned". Neighboring sudo-only failures
+    (ingress_ifaces / XDP-program tests) reproduce identically on clean
+    origin/master (kernel 7.0.13 env), unrelated to this change.
+
+## 2026-07-03 — #3917: HA peer-fence iterated the STARTUP config snapshot → day-2 redundancy-groups never fenced → split-brain dual-active
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-165 (MEDIUM, HA — split-brain dual-active).
+    In `pkg/daemon/daemon_ha_sync.go`, `startClusterComms` wired
+    `d.sessionSync.OnFenceReceived` as a closure over the `cfg` snapshot it
+    captured at startup. On a peer fence the callback iterated
+    `cfg.Chassis.Cluster.RedundancyGroups` from that snapshot. `startClusterComms`
+    is only restarted on a **transport-field** change (`clusterTransportKey`
+    — control/fabric interfaces + peer addresses), so a redundancy-group added
+    by a day-2 commit is absent from the snapshot. Such a day-2 RG was therefore
+    NEVER fenced on a peer fence → it stayed active on this node while the peer
+    also became active for it → split-brain dual-active (the exact failure the
+    fence exists to prevent).
+  - **Fix**: Extracted the fence handler into `d.fenceAllRedundancyGroups(ctx)`
+    plus a shared live-config reader `d.currentRedundancyGroups()` that reads
+    `d.store.ActiveConfig()` (the CURRENT compiled config, RLock-guarded) —
+    mirroring how `pushConfigToPeer` and other HA reconcilers read live config.
+    Every RG in the current config, including day-2 additions, is now fenced.
+    Nil-safe: `d.dp == nil` (config-only mode) skips deactivation with the same
+    diagnostic; `d.store == nil` / no-cluster config returns an empty slice.
+  - **Audit / second stale-snapshot fix**: the per-RG watchdog-heartbeat
+    goroutine in the same function iterated the same startup `cc.RedundancyGroups`
+    every 500ms → a day-2 RG got no watchdog write → its watchdog stayed stale →
+    the dataplane refused to forward for it. Fixed to re-read
+    `d.currentRedundancyGroups()` each tick and gated on `d.dp != nil` alone
+    (dropped the startup RG-count precondition so a cluster that boots with zero
+    RGs still picks up its first day-2 RG). Transport/feature-flag fields
+    (heartbeat/sync/fabric endpoints, IPsecSASync, DHCPLeaseSync) legitimately
+    rely on the #87 transport-restart and are out of the RG-membership class.
+  - **Test**: `pkg/daemon/daemon_ha_fence_3917_test.go` —
+    `TestFenceAllRedundancyGroups_ReadsCurrentConfig` commits a day-2 RG2 after
+    building the startup config and asserts the fence deactivates {0,1,2} (RED
+    on revert: a simulated stale snapshot fences only {0,1});
+    `_StartupRGsFenced` (base case preserved), `_ConfigOnlyModeSafe`
+    (`d.dp == nil` no panic), `_NoClusterSafe` (nil store + non-cluster config),
+    and `TestCurrentRedundancyGroups` (2 → 3 after day-2 commit). RED-on-revert
+    verified by injecting a snapshot-truncation bug: day-2 test failed with
+    `fenced RGs = [0 1], want [0 1 2]`.
+  - **File(s)**: pkg/daemon/daemon_ha_sync.go,
+    pkg/daemon/daemon_ha_fence_3917_test.go, docs/ha-failover-status.md, _Log.md
+  - **Validation**: `go test ./pkg/daemon/... ./pkg/cluster/...` green;
+    `go build ./...`; gofmt clean; `go vet ./pkg/daemon/...` clean.
+    test-failover WARRANTED (HA fence/split-brain) — batched with the other
+    HA-Medium fixes under the force-node0-primary gate.
+## 2026-07-03 — #3920: RETH member left DOWN after rename — renameRethMember downs the member for the rename but never brings it UP, and programRethMAC early-returns (no UP) on MAC-match → RG demote/blackhole
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-057 (MEDIUM, HA — data-link-down
+    blackhole). `renameRethMember` (`pkg/daemon/daemon_reth.go`) brings a
+    RETH member DOWN to rename it (kernel requires the link be down to
+    rename) but never brought it back UP. It relied on the caller's next
+    step, `programRethMAC` (`daemon_apply.go:936`), for the UP — but
+    `programRethMAC` early-returns with no UP when the virtual MAC already
+    matches. That MAC-match no-op is the *common* path here:
+    `renameRethMember` finds the interface by matching that same virtual
+    MAC, so on a just-renamed member the MAC always already matches and
+    `programRethMAC` always no-ops → the member is left administratively
+    DOWN → interface track detects link-down → redundancy group demotes →
+    blackhole. Secondary facet: even the MAC-change fast path in
+    `programRethMAC` sets the MAC while the link is still DOWN (from the
+    rename), which succeeds without a cycle and returns without an UP.
+  - **Fix (option a)**: the function that downs the link owns bringing it
+    back up. `renameRethMember` now brings the member UP after a successful
+    rename (and best-effort UP on a failed rename, since it had already
+    downed the link). No flap: whenever a rename happens the MAC already
+    matches so `programRethMAC` no-ops, leaving the rename's UP as the final
+    state; even if `programRethMAC` did cycle, the member still ends UP.
+    Both functions now route netlink through a small `rethLinkOps` seam
+    (`rethLinkOpsFn`) so the admin link state is unit-testable without a
+    real netlink socket.
+  - **Test**: `pkg/daemon/daemon_reth_rename_up_test.go` —
+    `TestRenameRethMemberBringsLinkUpWhenMACMatches` (RED-on-revert:
+    removing the post-rename UP leaves the member DOWN → fails with the
+    blackhole message), `TestRenameRethMemberUpOnFailedRename`,
+    `TestProgramRethMACCyclePathEndsUp` (MAC-changing cycle still ends UP),
+    `TestProgramRethMACLiveChangeNoCycle`. RED-on-revert proven; all pass;
+    `go test ./pkg/daemon/` green; `go build ./...`, `go vet`, gofmt clean.
+    test-failover WARRANTED (HA RETH member link → RG demote) — batch with
+    the other HA-Medium fixes under the force-node0-primary gate.
+  - **File(s)**: `pkg/daemon/daemon_reth.go`,
+    `pkg/daemon/daemon_reth_rename_up_test.go`, `docs/reth-mac.md`,
+    `_Log.md`.
 
 ## 2026-07-03 — #3912: cluster-sync bulk-ack TOCTOU — pendingBulkAckEpoch stored AFTER BulkEnd write → early ack latches a phantom pending epoch that blocks manual failover
 
@@ -29360,3 +29480,81 @@ top.
   leaf, no schema change needed).
 - **File(s)**: pkg/config/compiler_routing.go,
   pkg/config/compiler_routing_instance_interface_3904_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3915 (F-158) — compileNAT accumulates ALL duplicate NAT
+  sub-blocks. Each source/destination/static/nat64/natv6v4/proxy-arp block
+  under a `nat {}` node was read FindChild-first, so a `load override`/`merge`
+  second block (e.g. a 2nd `source {}` with extra rule-sets) was SILENTLY
+  DROPPED -> SNAT/DNAT vanished, traffic egressed untranslated. Converted all
+  six sub-block reads to iterate via forEachChild; sub-block compilers already
+  append rule-sets + map-assign pools, so per-block invocation merges (Junos
+  semantics), single-block bit-identical. natv6v4 inits struct once + ORs flag.
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_nat_dup_subblock_3915_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3922 — direct-mode (private-rg-election / no-reth-vrrp)
+    post-failover GARP blackhole on /25+ subnets. `directSendGARPs`
+    (`pkg/daemon/daemon_ha_vip.go`) computed the supplementary gateway ARP
+    probe target by forcing the network address's last octet to `.1`, a
+    pre-#2377 assumption that the gateway is `<subnet>.1`. On any /25-or-longer
+    prefix, or a subnet whose network does not end in `.0`, the forced `.1`
+    falls OUTSIDE the subnet (e.g. VIP 10.0.61.18/28 → 10.0.61.1, outside
+    .16-.31) → the directed probe hit a foreign address and the real gateway's
+    ARP cache was never re-bound to the new master's MAC → post-failover
+    blackhole until the stale entry aged out. #2377 fixed the identical
+    forced-.1 in `vrrp.sendGARP` but MISSED this direct-mode site. Fix: exported
+    the #2377 network-free helper `gatewayProbeTarget` → `vrrp.GatewayProbeTarget`
+    as the single source of truth (network address + 1, respects the prefix,
+    returns ok=false to SKIP the directed probe on /31 (RFC 3021) and /32) and
+    routed `directSendGARPs` through it, replacing the forced-.1 block. Added a
+    `directARPProbeFn` seam (mirrors `vrrp.arpProbeFn`) so the probe target is
+    unit-testable without AF_PACKET I/O. RED-on-revert table test in
+    `pkg/daemon/direct_garp_probe_target_test.go` exercises the full
+    directSendGARPs path: /24-.1 unchanged (green on both), /25 + /28 assert the
+    in-subnet network+1 target (RED against forced-.1 — out of subnet), /32 host
+    route + /30-VIP-is-first-host assert NO directed probe (RED against
+    forced-.1 — fires an out-of-range probe). Verified: 4/5 cases RED on a
+    reverted forced-.1, /24 stays green. `go test ./pkg/daemon/... ./pkg/vrrp/...`
+    green; `go build ./...`, gofmt, vet clean. test-failover WARRANTED (HA
+    post-failover GARP) — batched with the other HA-Medium fixes under the
+    force-node0-primary gate.
+  - **File(s)**: pkg/daemon/daemon_ha_vip.go,
+    pkg/daemon/direct_garp_probe_target_test.go, pkg/vrrp/instance.go,
+    pkg/vrrp/instance_garp_probe_target_test.go, pkg/vrrp/README.md,
+    pkg/daemon/README.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #3926 — flush the session-delete journal while CONNECTED. A
+    session DELETE generated while the sync link is UP but `sendCh` is full
+    (backpressure) is journaled by `QueueDeleteV4`/`V6`, but the journal was
+    flushed ONLY on a full disconnect/reconnect (`handleNewConnection` →
+    `flushDeleteJournal`). The periodic sweep replayed INSTALLS but never the
+    journaled deletes, so a delete journaled while the link stayed up was never
+    delivered until an unrelated disconnect — the standby retained the dead
+    session and made a wrong forwarding decision on failover. Fix (chose the
+    sweep-replay option, mirroring the existing install-replay — it reuses the
+    tested #2121 `flushDeleteJournal`/`rejournalTail` requeue path with no
+    hot-path mutex, no O(N^2) take-all churn, and bounded ≤1s convergence since
+    delete backpressure sets `syncBackfillNeeded` which holds the sweep at the
+    1s active cadence): `syncSweep` now calls `flushDeleteJournal` every tick
+    while connected, before the `s.sessions == nil` early-return (the flush is
+    independent of the kernel session iteration). `flushDeleteJournal` is a
+    no-op on an empty journal, re-sends each entry at most once (take-all under
+    the journal lock, `DeletesSent` counted on success), preserves the encoded
+    #2170/#2221 delete generation (no re-stamp — a stale journaled delete that
+    replays after a same-key replacement was re-synced is still refused by the
+    peer's delete guard), and re-journals any un-sent tail if `sendCh` is still
+    full (retried next tick). RED-on-revert unit test
+    `TestDeleteJournalConnectedFlushViaSweep`: connected + full `sendCh` →
+    delete journaled with a fresh gen > install gen, `DeletesSent==0`; drain
+    `sendCh` WITHOUT a disconnect; `syncSweep()` flushes the delete (journal
+    empty, `DeletesSent==1`, wire gen preserved); a second sweep does not
+    double-send. Verified RED on a reverted flush line (delete stuck in journal,
+    1 remain). `go test ./pkg/cluster/...` green, `-race` on the journal tests
+    green, `go build ./...`, gofmt, vet clean. test-failover WARRANTED (HA
+    session-sync convergence) — batch with the other HA-Medium fixes under the
+    force-node0-primary gate.
+  - **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
+    docs/session-sync-architecture.md, _Log.md
