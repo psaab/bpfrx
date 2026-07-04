@@ -3264,7 +3264,24 @@ func validatePolicyTerminalActionStrict(cfg *Config) error {
 		if pol == nil {
 			return nil
 		}
-		switch len(pol.terminalActions) {
+		// #3850: two IDENTICAL terminal-action blocks (e.g. a `load merge` that
+		// duplicates the SAME `then { permit; }`, now both accumulated by the
+		// #3842 policyThenChildren read) are NOT a conflict — Junos merges them
+		// silently. Dedup by distinct action VALUE before the count so an
+		// identical duplicate collapses to one (commit succeeds, Junos-faithful)
+		// and only DIFFERENT terminal actions (e.g. permit + reject) trip the
+		// conflict gate. Before this the #3043 gate over-rejected `permit,permit`
+		// as "2 conflicting terminal actions (permit, permit)" — fail-closed but
+		// imprecise.
+		seen := make(map[PolicyAction]bool, len(pol.terminalActions))
+		distinct := make([]PolicyAction, 0, len(pol.terminalActions))
+		for _, a := range pol.terminalActions {
+			if !seen[a] {
+				seen[a] = true
+				distinct = append(distinct, a)
+			}
+		}
+		switch len(distinct) {
 		case 1:
 			return nil
 		case 0:
@@ -3274,15 +3291,15 @@ func validatePolicyTerminalActionStrict(cfg *Config) error {
 					"count-only or typo'd policy silently PERMITTED all matching "+
 					"traffic; it now defaults to deny on load)")
 		default:
-			names := make([]string, 0, len(pol.terminalActions))
-			for _, a := range pol.terminalActions {
+			names := make([]string, 0, len(distinct))
+			for _, a := range distinct {
 				names = append(names, policyActionName(a))
 			}
 			return policyTerminalActionError(scope, pol.Name, fmt.Sprintf(
 				"%d conflicting terminal actions (%s); a policy must specify "+
 					"exactly one of permit/deny/reject (the enforced action would "+
 					"otherwise depend on parse order)",
-				len(pol.terminalActions), strings.Join(names, ", ")))
+				len(distinct), strings.Join(names, ", ")))
 		}
 	}
 	for _, zpp := range cfg.Security.Policies {

@@ -33001,3 +33001,66 @@ top.
   - **File(s)**: userspace-dp/src/screen/mod.rs,
     userspace-dp/src/screen/tests.rs, docs/syn-cookie-flood-protection.md,
     _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3850 — NAT-rule + firewall filter-term duplicate
+    `match`/`then`/`from` blocks read first-block-only (fail-open sibling of
+    #3842). #3842 fixed duplicate inner match/then blocks for SECURITY POLICIES
+    and #3915 for the `nat {}` SUB-blocks, but the same first-block-only class
+    survived in three sibling constructs. `compileNATSource`/`Destination`/
+    `Static` (compiler_nat.go) read `ruleInst.node.FindChild("match")` /
+    `FindChild("then")`; `compileFirewall` read `termInst.node.FindChild("from")`
+    / `FindChild("then")`; `compileSecurity` read the singleton
+    `pre-id-default-policy` `then` via FindChild. `parseStatements` APPENDS a
+    repeated hierarchical block as a sibling at EVERY level, so a
+    `load merge`/`load override` (or a hierarchical config authored twice) that
+    split a rule's/term's conditions across two `match`/`from` blocks had the
+    SECOND block SILENTLY DROPPED — the NAT rule / filter term matched a WIDER
+    set than configured (a fail-open widening), and a second `then` block's
+    action was lost. FIX: iterate EVERY sibling block with `FindChildren`
+    (two-nested-loop form preserving brace depth) so all match/from conditions
+    AND-combine and all then actions apply; a single translation / terminal
+    action resolves last-wins across duplicate then blocks (Junos merge, never a
+    silent drop). Flat-set is inherently safe — `SetPath` container-descent
+    (ast_edit.go) merges duplicate `match`/`from` containers onto one node, so
+    the fail-open is reachable ONLY via the hierarchical `NewParser` shape
+    (verified empirically). SECONDARY: `validatePolicyTerminalActionStrict`
+    (compiler_validate_strict.go) now DEDUPS `pol.terminalActions` by distinct
+    value before the #3043 count, so two IDENTICAL `then { permit; }` blocks
+    merge silently (Junos-faithful) instead of over-rejecting as "2 conflicting
+    terminal actions (permit, permit)"; permit+reject still rejected. TESTS
+    (RED-on-revert, 8 of 13 go RED on source revert): NAT source/destination/
+    static two-`match`-block merge, NAT source two-`then`-block last-wins,
+    filter term two-`from`/two-`then`-block merge, `pre-id-default-policy`
+    two-`then`-block; flat-set split-condition merge regression guards + single-
+    block bit-identical guards stay green; identical-permit merge + permit/reject
+    still-rejected for the dedup. `go test ./pkg/config/...` green; go build
+    ./..., go vet, gofmt clean. Docs: docs/config-schema.md #3850 entry
+    alongside #3842/#3915.
+  - **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_firewall.go,
+    pkg/config/compiler_security.go, pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_dup_match_then_3850_test.go, docs/config-schema.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #3850 fold (PR #4139 hostile-review MINOR) — reset the NAT
+    `then` translation spec per block for true last-wins. The #3850 NAT-then
+    merge iterated every `then {}` block but wrote fields by OVERWRITE, so a
+    duplicate then that switches translation TYPE (`then { source-nat
+    interface; }` then `then { source-nat pool poolB; }`) left BOTH
+    Interface=true AND PoolName=poolB on rule.Then → dataplane field-precedence
+    decided, latent stale field. Not a regression / not security-relevant, but
+    overstated "last-wins". FIX: `rule.Then = NATThen{}` at the top of each
+    then-block in compileNATSource (compiler_nat.go:1697) and
+    compileNATDestination (:1921); static NAT resets only the then-set fields
+    `rule.Then=""`/`IsNPTv6=false`/`MappedPort=0` (:2185-2187) so the match
+    fields set by the match loop persist. Reset runs BETWEEN blocks so
+    within-block `prefix X mapped-port P` coupling survives. compileFilterThen
+    (compiler_firewall.go:662) and pre-id-default-policy then are DELIBERATELY
+    NOT reset — they legitimately accumulate modifiers (count+accept /
+    LogSessionInit+Close). TEST: TestNATSourceDupThenTypeSwitchResetsStaleField
+    _3850 — interface→pool switch compiles pool-only (Interface=false); RED on
+    revert of the reset (verified: stale Interface=true). 14 #3850 tests green;
+    go build ./..., go vet, gofmt clean. Merged origin/master (auto-resolved).
+  - **File(s)**: pkg/config/compiler_nat.go,
+    pkg/config/compiler_dup_match_then_3850_test.go, _Log.md
