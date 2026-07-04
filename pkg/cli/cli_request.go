@@ -489,10 +489,29 @@ func (c *CLI) handleMonitor(args []string) error {
 	}
 }
 
-// handleMonitorTraffic wraps tcpdump for live packet capture.
-func (c *CLI) handleMonitorTraffic(args []string) error {
-	var iface, filter string
-	count := "0" // 0 = unlimited
+// monitorTrafficKeywords are the option keywords the monitor traffic
+// grammar recognizes. They terminate a greedy `matching <filter>`
+// expression so a multi-token filter never swallows a following option
+// (e.g. `matching tcp port 80 count 20`).
+var monitorTrafficKeywords = map[string]bool{
+	"interface": true,
+	"matching":  true,
+	"count":     true,
+}
+
+// parseMonitorTrafficArgs parses the `monitor traffic ...` argument
+// vector into the interface name, the pcap/BPF filter expression, and the
+// packet count. The CLI tokenizer (strings.Fields) splits on whitespace
+// and does NOT honor shell quoting, so a multi-token filter typed as
+// `matching "tcp port 80"` arrives as the separate tokens `"tcp`, `port`,
+// `80"`. The `matching` clause therefore consumes EVERY following token up
+// to the next recognized option keyword (none of which are pcap
+// primitives), joins them into one filter expression, and strips any
+// surrounding quotes the operator typed. Reading only the first token
+// truncated `tcp port 80` down to `tcp` and silently captured far more
+// traffic than requested (#4005).
+func parseMonitorTrafficArgs(args []string) (iface, filter, count string) {
+	count = "0" // 0 = unlimited
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -502,10 +521,15 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 				iface = args[i]
 			}
 		case "matching":
-			if i+1 < len(args) {
-				i++
-				filter = args[i]
+			rest := make([]string, 0, len(args)-i-1)
+			for j := i + 1; j < len(args); j++ {
+				if monitorTrafficKeywords[args[j]] {
+					break
+				}
+				rest = append(rest, args[j])
 			}
+			i += len(rest)
+			filter = stripSurroundingQuotes(strings.Join(rest, " "))
 		case "count":
 			if i+1 < len(args) {
 				i++
@@ -513,6 +537,45 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 			}
 		}
 	}
+	return iface, filter, count
+}
+
+// stripSurroundingQuotes removes one layer of matching leading/trailing
+// single or double quotes. The CLI tokenizer does not honor shell quoting,
+// so an operator who wraps a multi-token pcap filter in quotes
+// (`matching "tcp port 80"`) leaves literal quote characters on the first
+// and last tokens; tcpdump/libpcap would reject those literal quotes, so
+// peel one balanced layer here.
+func stripSurroundingQuotes(s string) string {
+	if len(s) >= 2 {
+		q := s[0]
+		if (q == '"' || q == '\'') && s[len(s)-1] == q {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// buildMonitorTrafficArgv assembles the tcpdump argv for a live capture.
+// The full filter expression is passed as trailing arguments exactly as
+// tcpdump/libpcap expects a filter (all tokens, verbatim).
+func buildMonitorTrafficArgv(iface, filter, count string) []string {
+	cmdArgs := []string{"tcpdump", "-i", iface, "-n", "-l"}
+	if count != "0" {
+		cmdArgs = append(cmdArgs, "-c", count)
+	}
+	if filter != "" {
+		// tcpdump accepts the filter expression as separate argv tokens;
+		// splitting on whitespace keeps a multi-token filter intact and
+		// matches how tcpdump joins its own trailing filter arguments.
+		cmdArgs = append(cmdArgs, strings.Fields(filter)...)
+	}
+	return cmdArgs
+}
+
+// handleMonitorTraffic wraps tcpdump for live packet capture.
+func (c *CLI) handleMonitorTraffic(args []string) error {
+	iface, filter, count := parseMonitorTrafficArgs(args)
 
 	if iface == "" {
 		fmt.Println("usage: monitor traffic interface <name> [matching <filter>] [count <N>]")
@@ -530,13 +593,7 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 		fmt.Println()
 	}
 
-	cmdArgs := []string{"tcpdump", "-i", iface, "-n", "-l"}
-	if count != "0" {
-		cmdArgs = append(cmdArgs, "-c", count)
-	}
-	if filter != "" {
-		cmdArgs = append(cmdArgs, filter)
-	}
+	cmdArgs := buildMonitorTrafficArgv(iface, filter, count)
 
 	fmt.Printf("Monitoring traffic on %s (Ctrl+C to stop)...\n", iface)
 
