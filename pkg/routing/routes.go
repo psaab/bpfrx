@@ -11,12 +11,28 @@ import (
 )
 
 // RouteEntry represents a kernel routing table entry.
+//
+// NextHop/Interface carry the single (or, for a multipath route, the
+// first) next-hop so existing single-field consumers keep working.
+// NextHops is populated only for a kernel ECMP route (one whose
+// next-hops live in the netlink RTA_MULTIPATH list rather than the
+// single route.Gw); it lists every equal-cost path so `show route`
+// can render all of them Junos-style. It is nil for a single-gateway,
+// connected/direct, or discard route.
 type RouteEntry struct {
 	Destination string
 	NextHop     string
 	Interface   string
 	Protocol    string
 	Preference  int
+	NextHops    []NextHop
+}
+
+// NextHop is one path of a (possibly multipath/ECMP) route.
+type NextHop struct {
+	Gateway   string // gateway IP; "" for a directly-connected leg
+	Interface string // egress interface name (or numeric index on lookup miss)
+	Weight    int    // ECMP weight (netlink Hops+1); 1 for equal-cost
 }
 
 // TableRoutes groups routes by their routing table name.
@@ -198,7 +214,54 @@ func (rr *routeReader) routeToEntry(r netlink.Route, family int) RouteEntry {
 		}
 	}
 
+	// ECMP / multipath: the kernel carries the per-path next-hops in the
+	// RTA_MULTIPATH list, not in the single route.Gw (which is nil here).
+	// Surface every leg so `show route` can render all of them, and back-
+	// fill the single NextHop/Interface fields from the first leg so
+	// single-field consumers show a real next-hop rather than "direct".
+	if len(r.MultiPath) > 0 {
+		entry.NextHops = rr.multiPathNextHops(r.MultiPath)
+		if len(entry.NextHops) > 0 {
+			first := entry.NextHops[0]
+			if first.Gateway != "" {
+				entry.NextHop = first.Gateway
+			}
+			if first.Interface != "" {
+				entry.Interface = first.Interface
+			}
+		}
+	}
+
 	return entry
+}
+
+// multiPathNextHops converts a netlink RTA_MULTIPATH next-hop list into
+// the display NextHop slice, resolving each leg's ifindex to a name.
+func (rr *routeReader) multiPathNextHops(mp []*netlink.NexthopInfo) []NextHop {
+	nhs := make([]NextHop, 0, len(mp))
+	for _, nh := range mp {
+		if nh == nil {
+			continue
+		}
+		var gw string
+		if nh.Gw != nil {
+			gw = nh.Gw.String()
+		}
+		iface := ""
+		if nh.LinkIndex > 0 {
+			if link, err := rr.ops.LinkByIndex(nh.LinkIndex); err == nil {
+				iface = link.Attrs().Name
+			} else {
+				iface = strconv.Itoa(nh.LinkIndex)
+			}
+		}
+		nhs = append(nhs, NextHop{
+			Gateway:   gw,
+			Interface: iface,
+			Weight:    nh.Hops + 1,
+		})
+	}
+	return nhs
 }
 
 // rtprotZStatic is FRR's private rtnetlink protocol value for staticd-

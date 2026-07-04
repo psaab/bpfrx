@@ -247,7 +247,19 @@ func formatTableJunos(buf *strings.Builder, tableName string, totalDests int, en
 			dest = fmt.Sprintf("%-19s", dest)
 		}
 		fmt.Fprintf(buf, "%s *[%s/%d]\n", dest, proto, e.Preference)
-		if e.NextHop != "" && e.NextHop != "direct" {
+		if len(e.NextHops) > 0 {
+			// ECMP route: one next-hop line per equal-cost path.
+			for _, nh := range e.NextHops {
+				switch {
+				case nh.Gateway != "" && nh.Interface != "":
+					fmt.Fprintf(buf, "                    >  to %s via %s\n", nh.Gateway, nh.Interface)
+				case nh.Gateway != "":
+					fmt.Fprintf(buf, "                    >  to %s\n", nh.Gateway)
+				case nh.Interface != "":
+					fmt.Fprintf(buf, "                    >  via %s\n", nh.Interface)
+				}
+			}
+		} else if e.NextHop != "" && e.NextHop != "direct" {
 			fmt.Fprintf(buf, "                    >  to %s via %s\n", e.NextHop, e.Interface)
 		} else if e.Interface != "" {
 			fmt.Fprintf(buf, "                    >  via %s\n", e.Interface)

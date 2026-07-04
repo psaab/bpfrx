@@ -24,6 +24,41 @@
     pkg/config/compiler_snmp_trapgroup_2990_test.go, pkg/snmp/README.md,
     _Log.md
 
+## 2026-07-03 — #3944: routeToEntry ignored netlink MultiPath → ECMP routes displayed as a bare 'direct' route with one/no next-hop
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-065 (MEDIUM, observability). `routeToEntry`
+    (`pkg/routing/routes.go`) converted a netlink route into `RouteEntry` but
+    only read the single `route.Gw`. A kernel ECMP route carries its equal-cost
+    next-hops in the `RTA_MULTIPATH` list (`route.MultiPath`,
+    `[]*netlink.NexthopInfo`), NOT in `route.Gw` (nil for such a route), so a
+    multipath route showed as a bare "direct"/empty next-hop in `show route` and
+    the gRPC/REST route view — the operator could not see which paths a prefix
+    load-balances over.
+  - **Fix**: added `RouteEntry.NextHops []NextHop` (`NextHop{Gateway, Interface,
+    Weight}`) and a `multiPathNextHops` helper. `routeToEntry` now checks
+    `route.MultiPath` first: when non-empty it emits one leg per next-hop
+    (resolving each leg's ifindex to a name, weight = `NexthopInfo.Hops + 1`) and
+    back-fills the single `NextHop`/`Interface` from the first leg. Single-
+    gateway, connected/direct, and discard routes leave `NextHops` nil and are
+    bit-identical. Render: `formatTableJunos` (`routeformat.go`, the canonical
+    Junos `show route` used by local CLI + gRPC text) emits one `>  to <gw> via
+    <if>` line per leg; the structured `GetRoutes` gRPC RPC
+    (`grpcapi/server_routing.go`) emits one `RouteInfo` per leg (same idiom as
+    the REST static-route handler).
+  - **RED-on-revert**: `pkg/routing/routes_multipath_test.go` builds a
+    `netlink.Route` with a 2-entry `MultiPath` list and asserts `routeToEntry`
+    emits 2 `NextHops` (gw+if+weight) + 2 rendered `>  to … via …` lines; a
+    single-gateway route → 1 next-hop / empty `NextHops` / 1 line; a connected
+    route → `NextHop` "direct" / empty `NextHops` / a `via`-only line. Verified
+    RED by neutralizing the `route.MultiPath` read: `TestRouteToEntryMultiPath`
+    failed with 0 next-hops (want 2); single/connected stayed green. `go test
+    ./pkg/routing/... ./pkg/grpcapi/... ./pkg/cli/...` green, `go build ./...`,
+    gofmt, vet clean. Doc: pkg/routing/README.md ("Multipath / ECMP routes"
+    subsection + RouteEntry entry-point note).
+  - **File(s)**: pkg/routing/routes.go, pkg/routing/routeformat.go,
+    pkg/grpcapi/server_routing.go, pkg/routing/routes_multipath_test.go,
+    pkg/routing/README.md, _Log.md
 ## 2026-07-03 — #3941: deleting an IPsec VPN never terminates its live SAs (--load-all only unloads config)
 
 - **Timestamp**: 2026-07-03
