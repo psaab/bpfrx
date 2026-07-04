@@ -1,4 +1,5 @@
-//! Per-zone SYN-flood per-source / per-destination rate limiter (#3315).
+//! Per-zone per-key flood rate limiter — a count-min sketch of `RateCounter`s
+//! (#3315 SYN-flood per-source/per-destination; #4112 ICMP/UDP per-destination).
 //!
 //! `source-threshold` and `destination-threshold` cap the SYN/s rate for a
 //! single source IP or destination IP, distinct from the aggregate per-zone
@@ -6,6 +7,13 @@
 //! destination (a victim, possibly flooded from spoofed sources) can be driven
 //! hard while the zone aggregate stays under budget, and `destination-threshold`
 //! exists precisely to cap that.
+//!
+//! The same substrate backs the per-destination ICMP/UDP flood caps (#4112):
+//! Junos measures `icmp flood` / `udp flood threshold` PER DESTINATION (UDP
+//! additionally per destination PORT), not per zone aggregate. `increment` keys
+//! on the destination IP (ICMP); `increment_ip_port` mixes the destination port
+//! in (UDP). The per-zone aggregate `RateCounter` is retained as a coarser
+//! SECONDARY ceiling above these per-destination caps.
 //!
 //! ## Substrate — count-min sketch of `RateCounter`s, NO eviction
 //!
@@ -165,6 +173,43 @@ impl SynRateSketch {
         let mut over_all = true;
         for row in 0..ROWS {
             let idx = self.cell_index(row, ip);
+            let over = self.rows[row][idx].increment(now_secs, threshold);
+            over_all &= over;
+        }
+        over_all
+    }
+
+    /// Cell index for `(ip, port)` in row `row`: the seeded per-row hash of the
+    /// address WITH the L4 destination port mixed in. Keys the per-DESTINATION
+    /// UDP flood sketch on `(dst_ip, dst_port)` — matching Junos `udp flood
+    /// threshold`, which caps the rate to a destination IP AND port (#4112).
+    #[inline]
+    fn cell_index_ip_port(&self, row: usize, ip: &IpAddr, port: u16) -> usize {
+        let mut h = FxHasher::default();
+        h.write_u64(ROW_SEEDS[row]);
+        match ip {
+            IpAddr::V4(a) => h.write(&a.octets()),
+            IpAddr::V6(a) => h.write(&a.octets()),
+        }
+        h.write_u16(port);
+        (h.finish() as usize) & self.mask
+    }
+
+    /// Count one packet for `(ip, port)` and report whether it is over
+    /// `threshold` in the trailing 1-second window. Mirrors `increment` but keys
+    /// on the L4 destination port too — the UDP per-destination-port flood cap
+    /// (#4112 F18). Every row cell is still incremented (non-short-circuiting
+    /// AND), so the count-min side effect happens in all rows.
+    pub(super) fn increment_ip_port(
+        &mut self,
+        ip: &IpAddr,
+        port: u16,
+        now_secs: u64,
+        threshold: u32,
+    ) -> bool {
+        let mut over_all = true;
+        for row in 0..ROWS {
+            let idx = self.cell_index_ip_port(row, ip, port);
             let over = self.rows[row][idx].increment(now_secs, threshold);
             over_all &= over;
         }

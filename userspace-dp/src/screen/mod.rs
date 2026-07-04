@@ -22,8 +22,11 @@
 //! - ICMP fragment
 //! - IP source route — IPv4 LSRR/SSRR options and IPv6 Routing Header
 //!   (source-route routing type), not every IHL>5 packet (#2973)
-//! - Rate limiting (ICMP, UDP flood)
-//! - SYN flood (per-zone rate)
+//! - Rate limiting (ICMP, UDP flood) — per-DESTINATION cap (Junos parity:
+//!   ICMP per destination IP, UDP per destination IP+port; #4112) with the
+//!   per-zone aggregate retained as a coarser secondary zone-saturation ceiling
+//! - SYN flood (per-zone aggregate + per-source/per-destination sub-caps, #3315;
+//!   per-destination evaluated before the aggregate cookie/Drop verdict, #4112)
 //!
 //! ## Missing-screen-profile signal (#3082)
 //!
@@ -61,6 +64,7 @@
 //! - `tests`         — relocated screen_tests.rs (loaded via #[path]).
 
 use rustc_hash::FxHashMap;
+use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod extract;
@@ -153,10 +157,23 @@ use syncookie::SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC;
 /// Per-zone screen state with mutable rate counters and advanced trackers.
 pub(crate) struct ScreenState {
     profiles: FxHashMap<String, ScreenProfile>, // zone_name -> profile
-    // Per-zone rate counters
+    // Per-zone AGGREGATE rate counters. #4112: for ICMP/UDP these are now the
+    // SECONDARY zone-saturation ceiling (checked at `SECONDARY_FLOOD_CEILING_MULT
+    // × threshold`) above the PRIMARY per-destination sketches below; Junos
+    // measures the ICMP/UDP flood rate per destination, not per zone.
     icmp_counters: FxHashMap<String, RateCounter>,
     udp_counters: FxHashMap<String, RateCounter>,
     syn_counters: FxHashMap<String, RateCounter>,
+    /// #4112: per-zone per-DESTINATION-IP ICMP flood sketch (Junos `icmp flood
+    /// threshold` is per destination). Present (Some) only for zones whose
+    /// `icmp_flood_threshold > 0`; reuses the #3315 count-min `SynRateSketch`
+    /// substrate. PRIMARY cap — checked before the per-zone aggregate ceiling.
+    icmp_dst_sketch: FxHashMap<String, SynRateSketch>,
+    /// #4112: per-zone per-DESTINATION (IP + PORT) UDP flood sketch (Junos `udp
+    /// flood threshold` is per destination IP AND port). Present only for zones
+    /// whose `udp_flood_threshold > 0`; reuses the #3315 sketch via
+    /// `increment_ip_port`. PRIMARY cap — checked before the per-zone aggregate.
+    udp_dst_sketch: FxHashMap<String, SynRateSketch>,
     syn_cookie_active_until_secs: FxHashMap<String, u64>,
     syn_cookie_standby_ack_counters: FxHashMap<String, RateCounter>,
     syn_cookie_codec: Option<SynCookieCodec>,
@@ -241,6 +258,21 @@ pub(crate) struct ScreenState {
 /// #3082: at most one missing-screen-profile WARN per zone per second.
 const MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC: u32 = 1;
 
+/// #4112: multiplier for the per-zone ICMP/UDP flood aggregate SECONDARY
+/// ceiling. Junos measures the ICMP/UDP flood rate PER DESTINATION, so the
+/// per-destination sketch (threshold `T`) is the PRIMARY cap. The per-zone
+/// aggregate `RateCounter` is retained as a coarse zone-saturation backstop that
+/// fires at `SECONDARY_FLOOD_CEILING_MULT × T`: a zone with up to this many
+/// simultaneously-hot legitimate destinations (each under the per-destination
+/// cap) is NOT false-dropped (the #4112 F18 fix — two legit high-volume services
+/// no longer SUM into one counter), while a flood spread thin across many
+/// destinations is still bounded zone-wide (an operator relying on the zone-wide
+/// cap still gets it). The aggregate counts only per-destination-ADMITTED
+/// packets (the per-destination check short-circuits first), so it bounds the
+/// admitted zone-wide rate. There is no separate Junos knob for this ceiling, so
+/// it is derived from the single configured per-destination threshold.
+const SECONDARY_FLOOD_CEILING_MULT: u32 = 8;
+
 impl ScreenState {
     pub fn new() -> Self {
         Self {
@@ -248,6 +280,8 @@ impl ScreenState {
             icmp_counters: FxHashMap::default(),
             udp_counters: FxHashMap::default(),
             syn_counters: FxHashMap::default(),
+            icmp_dst_sketch: FxHashMap::default(),
+            udp_dst_sketch: FxHashMap::default(),
             syn_cookie_active_until_secs: FxHashMap::default(),
             syn_cookie_standby_ack_counters: FxHashMap::default(),
             syn_cookie_codec: None,
@@ -325,6 +359,13 @@ impl ScreenState {
         self.icmp_counters.retain(|k, _| profiles.contains_key(k));
         self.udp_counters.retain(|k, _| profiles.contains_key(k));
         self.syn_counters.retain(|k, _| profiles.contains_key(k));
+        // #4112: drop the per-destination ICMP/UDP flood sketches for zones that
+        // lost the corresponding threshold (memory tracks live config), mirroring
+        // the #3315 SYN sketches below.
+        self.icmp_dst_sketch
+            .retain(|k, _| profiles.get(k).is_some_and(|p| p.icmp_flood_threshold > 0));
+        self.udp_dst_sketch
+            .retain(|k, _| profiles.get(k).is_some_and(|p| p.udp_flood_threshold > 0));
         self.syn_cookie_active_until_secs
             .retain(|k, _| profiles.contains_key(k));
         self.syn_cookie_standby_ack_counters
@@ -340,6 +381,20 @@ impl ScreenState {
             self.icmp_counters.entry(zone.clone()).or_default();
             self.udp_counters.entry(zone.clone()).or_default();
             self.syn_counters.entry(zone.clone()).or_default();
+            // #4112: allocate the per-destination ICMP/UDP flood sketches ONCE
+            // per zone that configures the threshold (`or_insert_with` preserves
+            // in-flight counters across an unrelated profile edit; the
+            // per-increment threshold means a threshold change needs no realloc).
+            if profiles[zone].icmp_flood_threshold > 0 {
+                self.icmp_dst_sketch
+                    .entry(zone.clone())
+                    .or_insert_with(SynRateSketch::for_dst);
+            }
+            if profiles[zone].udp_flood_threshold > 0 {
+                self.udp_dst_sketch
+                    .entry(zone.clone())
+                    .or_insert_with(SynRateSketch::for_dst);
+            }
             self.syn_cookie_active_until_secs
                 .entry(zone.clone())
                 .or_insert(0);
@@ -511,6 +566,67 @@ impl ScreenState {
             .unwrap_or(true)
     }
 
+    /// #4112 F18: ICMP flood admission. Junos measures the ICMP flood rate PER
+    /// DESTINATION IP, not per zone. (1) the per-destination count-min sketch is
+    /// the PRIMARY cap at the configured `threshold`; (2) the per-zone aggregate
+    /// counter is a coarse SECONDARY zone-saturation ceiling at
+    /// `SECONDARY_FLOOD_CEILING_MULT × threshold`. The per-destination check
+    /// short-circuits, so the aggregate counts only per-destination-admitted
+    /// packets (it bounds the admitted zone-wide rate). Returns true when the
+    /// packet must be dropped as an ICMP flood. Shared by the flow-present and
+    /// flowless (`check_flowless_screens`) paths so both enforce identically.
+    fn icmp_flood_drop(
+        &mut self,
+        zone: &str,
+        dst_ip: &IpAddr,
+        threshold: u32,
+        now_secs: u64,
+    ) -> bool {
+        // (1) per-DESTINATION cap — PRIMARY (Junos parity).
+        if let Some(sketch) = self.icmp_dst_sketch.get_mut(zone)
+            && sketch.increment(dst_ip, now_secs, threshold)
+        {
+            return true;
+        }
+        // (2) per-zone aggregate — SECONDARY ceiling.
+        if let Some(counter) = self.icmp_counters.get_mut(zone) {
+            return counter.increment(
+                now_secs,
+                threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT),
+            );
+        }
+        false
+    }
+
+    /// #4112 F18: UDP flood admission — like `icmp_flood_drop`, but the PRIMARY
+    /// per-destination cap keys on `(dst_ip, dst_port)` (Junos `udp flood
+    /// threshold` caps the rate to a destination IP AND port). On the flowless
+    /// path a non-first fragment carries no L4 port, so `dst_port` is 0 there and
+    /// the cap degrades to per-destination-IP (the best available for a fragment).
+    fn udp_flood_drop(
+        &mut self,
+        zone: &str,
+        dst_ip: &IpAddr,
+        dst_port: u16,
+        threshold: u32,
+        now_secs: u64,
+    ) -> bool {
+        // (1) per-DESTINATION (IP + PORT) cap — PRIMARY (Junos parity).
+        if let Some(sketch) = self.udp_dst_sketch.get_mut(zone)
+            && sketch.increment_ip_port(dst_ip, dst_port, now_secs, threshold)
+        {
+            return true;
+        }
+        // (2) per-zone aggregate — SECONDARY ceiling.
+        if let Some(counter) = self.udp_counters.get_mut(zone) {
+            return counter.increment(
+                now_secs,
+                threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT),
+            );
+        }
+        false
+    }
+
     /// Returns true if any zone has a screen profile configured.
     pub fn has_profiles(&self) -> bool {
         !self.profiles.is_empty()
@@ -606,35 +722,47 @@ impl ScreenState {
 
         let mut syn_cookie_bypassed = false;
 
-        // ICMP flood
+        // ICMP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
+        // (SECONDARY). Junos measures this rate per destination IP (#4112 F18).
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
+            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_secs)
         {
-            if let Some(counter) = self.icmp_counters.get_mut(zone) {
-                if counter.increment(now_secs, icmp_flood_threshold) {
-                    return ScreenVerdict::Drop("icmp-flood");
-                }
-            }
+            return ScreenVerdict::Drop("icmp-flood");
         }
 
-        // UDP flood
-        if udp_flood_threshold > 0 && pkt.protocol == PROTO_UDP {
-            if let Some(counter) = self.udp_counters.get_mut(zone) {
-                if counter.increment(now_secs, udp_flood_threshold) {
-                    return ScreenVerdict::Drop("udp-flood");
-                }
-            }
+        // UDP flood — per-DESTINATION (IP + PORT) cap (PRIMARY) + per-zone
+        // aggregate ceiling (SECONDARY). Junos caps per destination IP AND port
+        // (#4112 F18).
+        if udp_flood_threshold > 0
+            && pkt.protocol == PROTO_UDP
+            && self.udp_flood_drop(
+                zone,
+                &pkt.dst_ip,
+                pkt.dst_port,
+                udp_flood_threshold,
+                now_secs,
+            )
+        {
+            return ScreenVerdict::Drop("udp-flood");
         }
 
         // SYN flood: count TCP SYN (without ACK) per zone.
         //
-        // #3315 enforcement order (aggregate authoritative, per-IP additive):
-        //   1. aggregate `attack-threshold` (+ `alarm-threshold`) — UNCHANGED
-        //      cookie-mint / Drop behaviour; the aggregate ALWAYS counts so its
-        //      cookie-activation side-effect can never be skipped.
-        //   2. per-DESTINATION cap (primary, spoof-resistant) — runs even when
-        //      the zone is cookie-active.
-        //   3. per-SOURCE cap (secondary) — SKIPPED while the zone is cookie-
+        // #3315 + #4112 F19 enforcement order (aggregate counts first, per-dst
+        // authoritative over the aggregate cookie/Drop verdict, per-src additive):
+        //   1. aggregate `attack-threshold` (+ `alarm-threshold`) — ALWAYS counts
+        //      via a SINGLE window advance so its cookie-activation side-effect
+        //      can never be skipped. It does NOT return here.
+        //   2. per-DESTINATION cap (primary, spoof-resistant) — evaluated BEFORE
+        //      the aggregate over-attack early-return (#4112 F19), so a per-dst
+        //      trip HARD-DROPS the flooded victim even while the zone is over
+        //      attack-threshold and minting cookies for validated clients. Runs
+        //      even when cookie-active.
+        //   3. aggregate over-attack verdict — mint a SYN-cookie challenge (or
+        //      Drop when cookies are disabled); UNCHANGED for the case where the
+        //      per-dst cap did not trip.
+        //   4. per-SOURCE cap (secondary) — SKIPPED while the zone is cookie-
         //      active (the cookie governs the spoofed-flood regime; per-source is
         //      spoof-defeated there and the sketch would over-throttle).
         // A validated returning SYN-cookie client bypasses ALL of the above.
@@ -673,6 +801,26 @@ impl ScreenState {
                             )
                         })
                         .unwrap_or((false, false));
+                    // (2) per-DESTINATION cap — PRIMARY. Evaluated BEFORE the
+                    // aggregate over-attack early-return (#4112 F19) so a
+                    // per-destination trip HARD-DROPS the flooded victim even
+                    // while the zone is over attack-threshold and minting cookies
+                    // for validated clients. destination-threshold's purpose
+                    // (shield a single over-threshold backend even from
+                    // cookie-completing clients) was otherwise defeated in exactly
+                    // the high-load regime it is configured for: `if over_attack`
+                    // returned the cookie challenge before the per-dst sketch at
+                    // the old site (2) was ever reached. The aggregate counter
+                    // above ALWAYS counts first (its cookie-activation side-effect
+                    // is never skipped); a per-dst trip never flips zone cookie
+                    // state. Runs even when the zone is cookie-active.
+                    if syn_dst_threshold > 0
+                        && let Some(sketch) = self.syn_dst_sketch.get_mut(zone)
+                        && sketch.increment(&pkt.dst_ip, now_secs, syn_dst_threshold)
+                    {
+                        self.syn_flood_dst_drops = self.syn_flood_dst_drops.wrapping_add(1);
+                        return ScreenVerdict::Drop("syn-flood");
+                    }
                     if over_attack {
                         if syn_cookie {
                             if let Some(active_until) =
@@ -715,16 +863,6 @@ impl ScreenState {
                         *last = now_secs;
                         self.syn_alarm_pending = true;
                         self.syn_flood_alarm_events = self.syn_flood_alarm_events.wrapping_add(1);
-                    }
-                    // (2) per-DESTINATION cap — PRIMARY, always runs (even when
-                    // cookie-active). A trip HARD-DROPS and never flips zone
-                    // cookie state.
-                    if syn_dst_threshold > 0
-                        && let Some(sketch) = self.syn_dst_sketch.get_mut(zone)
-                        && sketch.increment(&pkt.dst_ip, now_secs, syn_dst_threshold)
-                    {
-                        self.syn_flood_dst_drops = self.syn_flood_dst_drops.wrapping_add(1);
-                        return ScreenVerdict::Drop("syn-flood");
                     }
                     // (3) per-SOURCE cap — SECONDARY, skipped while the zone is
                     // SYN-cookie active (D3). The cookie-active window is the
@@ -846,20 +984,28 @@ impl ScreenState {
         let udp_flood_threshold = profile.udp_flood_threshold;
         // `profile` borrow ends here (NLL): no further reads of `self.profiles`.
 
-        // ICMP flood
+        // ICMP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
+        // (SECONDARY), same as the flow-present path (#4112 F18). Keeps a
+        // fragment-based flood from evading the per-destination cap.
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && let Some(counter) = self.icmp_counters.get_mut(zone)
-            && counter.increment(now_secs, icmp_flood_threshold)
+            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_secs)
         {
             return ScreenVerdict::Drop("icmp-flood");
         }
 
-        // UDP flood
+        // UDP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
+        // (SECONDARY). A flowless non-first fragment has no L4 port, so `dst_port`
+        // is 0 here and the cap degrades to per-destination-IP (#4112 F18).
         if udp_flood_threshold > 0
             && pkt.protocol == PROTO_UDP
-            && let Some(counter) = self.udp_counters.get_mut(zone)
-            && counter.increment(now_secs, udp_flood_threshold)
+            && self.udp_flood_drop(
+                zone,
+                &pkt.dst_ip,
+                pkt.dst_port,
+                udp_flood_threshold,
+                now_secs,
+            )
         {
             return ScreenVerdict::Drop("udp-flood");
         }

@@ -32705,6 +32705,42 @@ top.
     pkg/grpcapi/server_fabric_allowlist_4122_test.go, _Log.md
 
 - **Timestamp**: 2026-07-04
+  **Action**: #4112 — screen ICMP/UDP flood per-DESTINATION (F18) + SYN per-dst
+    ordering (F19), userspace-dp Rust. F18: `icmp flood`/`udp flood threshold`
+    were enforced per-ZONE AGGREGATE (`icmp_counters`/`udp_counters` keyed by
+    zone name), but Junos measures per DESTINATION IP (UDP also per dest PORT).
+    Two legit high-volume services in one zone summed into one counter →
+    false-drop; an attacker spreading a modest flood across destinations evaded
+    the operator's per-destination expectation. Fix: PRIMARY per-destination
+    count-min sketch reusing the #3315 `SynRateSketch` substrate — new
+    `icmp_dst_sketch` (keyed on dst_ip via `increment`) + `udp_dst_sketch` (keyed
+    on dst_ip+dst_port via new `increment_ip_port`), allocated per zone that
+    configures the threshold and freed when removed. The per-zone aggregate is
+    retained as a coarse SECONDARY zone-saturation ceiling at
+    `SECONDARY_FLOOD_CEILING_MULT (8) × threshold` (counts only
+    per-destination-admitted packets, so it bounds the admitted zone-wide rate —
+    an operator relying on the zone-wide cap still gets it). Shared
+    `icmp_flood_drop`/`udp_flood_drop` helpers used by BOTH the flow-present
+    (`check_packet_with_zone_id`) and flowless (`check_flowless_screens`,
+    non-first fragment / non-query ICMP) paths so a fragment flood cannot evade
+    the per-dest cap (flowless UDP has no port → degrades to per-dest-IP). F19:
+    the SYN per-DESTINATION sketch sat AFTER the aggregate `over_attack`
+    early-return, so a real-client flood over `attack-threshold` took the
+    cookie-mint branch on every SYN and the per-dest sketch was NEVER reached —
+    `destination-threshold` (shield a single victim even from validated clients)
+    was defeated in exactly the high-load regime it exists for. Fix: evaluate the
+    per-dst sketch BEFORE the over_attack early-return (aggregate still ALWAYS
+    counts first via `increment_and_classify`, so its cookie-activation
+    side-effect is never skipped). RED-on-revert PROVEN for both: F19 temp-revert
+    (gate per-dst on !over_attack) → 3rd SYN returns SynCookieChallenge not
+    Drop; F18 temp-revert (aggregate-only at threshold T) → distinct
+    destinations / dest-ports summed into a false Drop. FULL cargo test --release
+    green (3495 lib + 16 + 1 + 46 + 8, 0 failed); go build ./... green; rustfmt
+    clean on added lines (pre-existing whole-crate drift left untouched). Not an
+    HA/session-sync path (per-packet ingress screen) — no test-failover needed.
+  **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/screen/syn_rate.rs, userspace-dp/src/screen/tests.rs,
+    docs/syn-cookie-flood-protection.md, _Log.md
   - **Action**: #4118 — honor RFC 3442 classless static routes (DHCPv4
     option 121 / legacy 249) in the DHCP client. Verified at HEAD:
     `leaseFromACKv4` extracted only `ack.Router()` (option 3); grep of
