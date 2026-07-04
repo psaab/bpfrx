@@ -184,7 +184,8 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 				fmt.Fprintf(&b, "        rekey_time = %ds\n", espLifetime)
 				b.WriteString("        rand_time = 0s\n")
 			}
-			// Junos df-bit → strongSwan copy_df (outer/ESP-header DF handling).
+			// Junos df-bit → strongSwan copy_df (outer IP-header DF handling;
+			// the DF bit lives in the outer encapsulating IP header, not ESP).
 			// strongSwan copy_df has two states: yes (default) copies the inner
 			// DF bit to the outer header; no forces the outer DF bit to 0
 			// (XFRM_STATE_NOPMTUDISC), which allows the encapsulated packet to be
