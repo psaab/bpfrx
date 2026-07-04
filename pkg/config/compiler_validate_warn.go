@@ -382,6 +382,34 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #3860: warn when a scheduler defines no effective window. Post-#3849/
+	// #3858 the runtime evaluator (pkg/scheduler.isWithinWindow) fail-closes
+	// such a scheduler to INACTIVE — an absent window is never treated as
+	// always-on. That direction is safe (the config is degenerate), but an
+	// operator migrating a config that relied on the old always-on bug loses
+	// enforcement silently. Surface the flip at commit. A scheduler carrying
+	// any time-of-day window (daily/weekday arm or all-day) or a start/stop
+	// calendar range is well-formed and does NOT warn. Iterate by sorted name
+	// so warnings are deterministic across commits (map iteration is
+	// randomized).
+	schedNames := make([]string, 0, len(cfg.Schedulers))
+	for name := range cfg.Schedulers {
+		schedNames = append(schedNames, name)
+	}
+	sort.Strings(schedNames)
+	for _, name := range schedNames {
+		sched := cfg.Schedulers[name]
+		if sched == nil {
+			continue
+		}
+		if schedulerHasEffectiveWindow(sched) {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"scheduler %q defines no time window; policies bound to it will "+
+				"be INACTIVE (use `daily all-day` for always-on)", name))
+	}
+
 	// Validate routing-instance interface references
 	for _, ri := range cfg.RoutingInstances {
 		if ri == nil { // #3494: tolerant/HA-sync path may carry a nil routing-instance
@@ -1188,6 +1216,27 @@ func validateFilterNoCatchAllWarnings(cfg *Config) []string {
 		}
 	}
 	return warnings
+}
+
+// schedulerHasEffectiveWindow reports whether a compiled scheduler carries any
+// window the runtime evaluator (pkg/scheduler.isWithinWindow) can act on: a
+// daily/weekday time-of-day arm, an all-day flag, or a start/stop calendar
+// range. A scheduler with none of these resolves to fail-closed INACTIVE at
+// runtime (#3849/#3858) — ValidateConfig warns on it (#3860). The predicate
+// mirrors pkg/scheduler.schedulerHasTimeWindow || schedulerHasDateRange; a
+// bare `daily;` or an empty `scheduler x {}` leaves every field zero and
+// therefore has no effective window.
+func schedulerHasEffectiveWindow(s *SchedulerConfig) bool {
+	if s == nil {
+		return false
+	}
+	if s.AllDay || s.StartTime != "" || s.StopTime != "" || len(s.Days) > 0 {
+		return true
+	}
+	if s.StartDate != "" || s.StopDate != "" {
+		return true
+	}
+	return false
 }
 
 // firewallFilterHasCatchAllTerminator reports whether the filter contains a

@@ -1,3 +1,63 @@
+## 2026-07-04 — #3860: warn at commit when a scheduler defines no window
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (113a1a0aa). Confirmed a degenerate
+    scheduler with no effective window (empty `scheduler x {}` or a bare
+    `daily;` — no start/stop time, no `all-day`, no per-day arm, no
+    start/stop date) compiles (`compileSchedulers`,
+    `pkg/config/compiler_system.go:1084`) to a `SchedulerConfig` with every
+    window field zero and NO commit warning. Post-#3849/#3858 the runtime
+    (`pkg/scheduler.isWithinWindow:278`) fail-closes such a scheduler to
+    INACTIVE (the security half of #3849; helpers `schedulerHasTimeWindow`
+    / `schedulerHasDateRange`). Only half-windows and unparseable
+    times/dates log today — the fully-degenerate always-on→INACTIVE flip
+    was silent. FIX: added a commit-time WARNING in `ValidateConfig`
+    (`pkg/config/compiler_validate_warn.go`) that iterates schedulers by
+    sorted name and, when `schedulerHasEffectiveWindow` is false, appends
+    `scheduler "X" defines no time window; policies bound to it will be
+    INACTIVE (use `+"`daily all-day`"+` for always-on)`. Warning, not
+    hard-reject (#1960-safe: degenerate scheduler is legal Junos; an
+    upgrade must not refuse an existing candidate). A scheduler with any
+    daily/weekday arm, `all-day`, or start/stop date does NOT warn.
+  - **File(s)**: pkg/config/compiler_validate_warn.go,
+    pkg/config/compiler_validate_scheduler_no_window_3860_test.go,
+    pkg/scheduler/README.md, _Log.md
+  - **Validation**: RED-on-revert proven (neutralizing the warn loop makes
+    the 3 no-window cases fire zero warnings → FAIL; has-window cases stay
+    green). `go test ./pkg/config/...` green, `go build ./...` clean,
+    gofmt clean, `go vet ./pkg/config/` clean.
+
+## 2026-07-04 — #3881: hierarchical inline-keys static route drops `interface` modifier
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the defect at HEAD (9cd280f1e). The
+    hierarchical INLINE-keys route form (`route 2001:db8::/32 next-hop fe80::1
+    interface reth0.50;` on one line, no braces) collapses the whole route onto
+    ONE leaf node `Keys=[route <dst> next-hop fe80::1 interface reth0.50]` with
+    NO children → `compileStaticRoutes` takes the inline-keys switch. The
+    `next-hop` case absorbed the gateway run (stopping at the `interface` route
+    keyword via `isRouteInlineKeyword`) but had NO logic to consume the trailing
+    `interface <if>` modifier → the egress interface was silently DROPPED. A
+    scratch repro compiled `nexthops=[{Address:fe80::1 Interface:""}]`. For an
+    IPv6 link-local next-hop the egress interface is REQUIRED (unresolvable
+    without it). FIX (`pkg/config/compiler_routing.go`): the inline-keys
+    `next-hop` case now collects the gateways into a slice, then consumes a
+    trailing `interface <if>` and applies it to the gateway(s), mirroring the
+    working child/brace form. Both the inline-keys case and the child/brace
+    read now treat `interface` as the modifier keyword ONLY after ≥1 gateway is
+    parsed (Copilot defect 2, negligible edge), so a next-hop value literally
+    named `interface` as the FIRST token stays a gateway value.
+  - **File(s)**: pkg/config/compiler_routing.go,
+    pkg/config/compiler_static_route_inline_iface_3881_test.go,
+    docs/config-schema.md, _Log.md
+  - **Validation**: 5 new tests (inline-keys / brace / flat-set interface
+    modifier + inline ECMP + literal-`interface`-first-value). RED-on-revert
+    proven: reverting the two edits fails `TestStaticRouteInlineKeysInterface
+    Modifier_3881` (Interface="") and `TestStaticRouteNextHopLiteralInterface
+    FirstValue_3881` (0 next-hops); brace + flat-set stay green.
+    `go test ./pkg/config/...` green, `go build ./...` clean, gofmt + go vet
+    clean.
+
 ## 2026-07-04 — #4120: drop leftover test-env `is_trust_flow` debug-log bypass (fable-163 F27)
 
 - **Timestamp**: 2026-07-04

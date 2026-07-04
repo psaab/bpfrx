@@ -184,6 +184,25 @@ floating-backup leaf carrying its own per-next-hop preference (#3871): a plain
 `next-hop` list is equal-cost ECMP, a `qualified-next-hop` is a distance-N
 backup.
 
+**Fully-inline route-keys form drops the `interface` modifier (#3881).** The
+above covers the flat-set and hierarchical-brace shapes, where `next-hop` is
+its own leaf/child node. A THIRD shape exists: the hierarchical route written
+on ONE line with no braces (`route 2001:db8::/32 next-hop fe80::1 interface
+reth0.50;`) collapses the WHOLE route onto one leaf with NO children —
+`Keys=[route <dst> next-hop fe80::1 interface reth0.50]`. `compileStaticRoutes`
+(`compiler_routing.go`) reads this via the inline-keys switch, walking the route
+node's `Keys[2:]` clause by clause; `isRouteInlineKeyword` (which includes
+`interface`) bounds the multi-value gateway run so it stops before the modifier.
+Before #3881 the switch had a `next-hop` case but NO logic to consume the
+trailing `interface <if>` after the gateway run, so the egress interface was
+silently dropped — fatal for an IPv6 link-local next-hop (`fe80::/10`), whose
+gateway is unresolvable without a bound egress interface. The inline-keys
+`next-hop` case now consumes a trailing `interface <if>` and applies it to the
+gateway(s), mirroring the child/brace form. Both the inline-keys case and the
+child/brace read treat `interface` as the modifier keyword ONLY after ≥1
+gateway is parsed, so a next-hop value literally named `interface` as the FIRST
+token stays a gateway value rather than being misparsed as the modifier.
+
 **Delete-side contract: `delete` a member, not the whole list (#3846).**
 The read-side accumulate rule above has a mirror on the edit side. A
 `delete ... from protocol tcp` on a bracket-list leaf must remove ONLY the
