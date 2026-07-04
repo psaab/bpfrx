@@ -306,6 +306,18 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 			Name:  inst.name,
 			Units: make(map[int]*CoSInterfaceUnit),
 		}
+		// Interface-level (physical, no `unit`) binding. In Junos a
+		// scheduler-map / shaping-rate / classifier / rewrite-rule bound
+		// directly under `interfaces geX` applies to every logical unit on
+		// the port. Read the same knobs from the interface node itself; the
+		// per-unit `unit` children are separate nodes and are unaffected.
+		// applyCoSInterfaceLevelBindings folds this into each configured
+		// logical unit once the interface stanza is known (#4021).
+		level := &CoSInterfaceUnit{Unit: -1}
+		parseCoSInterfaceUnitBody(inst.node, level)
+		if coSInterfaceUnitHasBinding(level) {
+			iface.Level = level
+		}
 		for _, unitNode := range inst.node.FindChildren("unit") {
 			if len(unitNode.Keys) < 2 {
 				continue
@@ -315,96 +327,12 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 				continue
 			}
 			unit := &CoSInterfaceUnit{Unit: unitID}
-			if shapingNode := unitNode.FindChild("shaping-rate"); shapingNode != nil {
-				if v := nodeVal(shapingNode); v != "" {
-					unit.ShapingRateBytes = parseBandwidthLimit(v)
-				}
-				if burstNode := shapingNode.FindChild("burst-size"); burstNode != nil {
-					if v := nodeVal(burstNode); v != "" {
-						unit.BurstSizeBytes = parseBurstSizeLimit(v)
-					}
-				}
-			}
-			if schedMapNode := unitNode.FindChild("scheduler-map"); schedMapNode != nil {
-				unit.SchedulerMap = nodeVal(schedMapNode)
-			}
-			if classifiersNode := unitNode.FindChild("classifiers"); classifiersNode != nil {
-				if dscpNode := classifiersNode.FindChild("dscp"); dscpNode != nil {
-					unit.DSCPClassifier = nodeVal(dscpNode)
-				}
-				if ieeeNode := classifiersNode.FindChild("ieee-802.1"); ieeeNode != nil {
-					unit.IEEE8021Classifier = nodeVal(ieeeNode)
-				}
-			}
-			if rewriteRulesNode := unitNode.FindChild("rewrite-rules"); rewriteRulesNode != nil {
-				if dscpNode := rewriteRulesNode.FindChild("dscp"); dscpNode != nil {
-					unit.DSCPRewriteRule = nodeVal(dscpNode)
-				}
-			}
-			// #1614 A1: oversubscription-policy { guarantee-rate <X> | proportional }
-			//
-			// Junos set syntax `set ... oversubscription-policy guarantee-rate 0.7`
-			// produces a flat-keys leaf node whose Keys are
-			// ["oversubscription-policy", "guarantee-rate", "0.7"]. The
-			// hierarchical text shape produces a parent node with a
-			// child sub-node for "guarantee-rate" carrying "0.7" as a
-			// trailing key or leaf value. Handle both forms.
-			if oversubNode := unitNode.FindChild("oversubscription-policy"); oversubNode != nil {
-				// Flat-keys path: Keys = [policy_name, value, ...] all on
-				// the parent node.
-				if len(oversubNode.Keys) >= 2 && oversubNode.Keys[1] == "guarantee-rate" {
-					unit.OversubscriptionPolicy = "guarantee-rate"
-					if len(oversubNode.Keys) >= 3 {
-						if f, err := strconv.ParseFloat(oversubNode.Keys[2], 64); err == nil {
-							if f < 0 {
-								f = 0
-							} else if f > 1 {
-								f = 1
-							}
-							unit.OversubscriptionGuaranteeFraction = f
-						}
-					}
-				} else if len(oversubNode.Keys) >= 2 && oversubNode.Keys[1] == "proportional" {
-					unit.OversubscriptionPolicy = "proportional"
-				} else if grNode := oversubNode.FindChild("guarantee-rate"); grNode != nil {
-					// Hierarchical child-node path.
-					unit.OversubscriptionPolicy = "guarantee-rate"
-					var raw string
-					if v := nodeVal(grNode); v != "" {
-						raw = v
-					} else if len(grNode.Keys) >= 2 {
-						raw = grNode.Keys[len(grNode.Keys)-1]
-					}
-					if raw != "" {
-						if f, err := strconv.ParseFloat(raw, 64); err == nil {
-							if f < 0 {
-								f = 0
-							} else if f > 1 {
-								f = 1
-							}
-							unit.OversubscriptionGuaranteeFraction = f
-						}
-					}
-				} else if oversubNode.FindChild("proportional") != nil {
-					unit.OversubscriptionPolicy = "proportional"
-				} else if v := nodeVal(oversubNode); v != "" {
-					unit.OversubscriptionPolicy = v
-				}
-			}
-			// #1614 A2: priority-low-min-share <bps>
-			if minShareNode := unitNode.FindChild("priority-low-min-share"); minShareNode != nil {
-				if v := nodeVal(minShareNode); v != "" {
-					unit.PriorityLowMinShareBytes = parseBandwidthLimit(v)
-				}
-			}
-			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" ||
-				unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" ||
-				unit.DSCPRewriteRule != "" || unit.OversubscriptionPolicy != "" ||
-				unit.PriorityLowMinShareBytes > 0 {
+			parseCoSInterfaceUnitBody(unitNode, unit)
+			if coSInterfaceUnitHasBinding(unit) {
 				iface.Units[unitID] = unit
 			}
 		}
-		if len(iface.Units) > 0 {
+		if len(iface.Units) > 0 || iface.Level != nil {
 			cos.Interfaces[iface.Name] = iface
 		}
 	}
@@ -456,6 +384,185 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	}
 
 	return nil
+}
+
+// parseCoSInterfaceUnitBody reads the CoS binding knobs (shaping-rate +
+// burst-size, scheduler-map, classifiers, rewrite-rules, and the #1614
+// oversubscription / priority-low-min-share scheduler knobs) from the
+// direct children of node into unit. node may be a `unit N` node or, for
+// an interface-level binding, the `interfaces geX` node itself (#4021) —
+// both expose the same knob children, and the interface node's `unit`
+// children are separate nodes that are not read here.
+func parseCoSInterfaceUnitBody(node *Node, unit *CoSInterfaceUnit) {
+	if shapingNode := node.FindChild("shaping-rate"); shapingNode != nil {
+		if v := nodeVal(shapingNode); v != "" {
+			unit.ShapingRateBytes = parseBandwidthLimit(v)
+		}
+		if burstNode := shapingNode.FindChild("burst-size"); burstNode != nil {
+			if v := nodeVal(burstNode); v != "" {
+				unit.BurstSizeBytes = parseBurstSizeLimit(v)
+			}
+		}
+	}
+	if schedMapNode := node.FindChild("scheduler-map"); schedMapNode != nil {
+		unit.SchedulerMap = nodeVal(schedMapNode)
+	}
+	if classifiersNode := node.FindChild("classifiers"); classifiersNode != nil {
+		if dscpNode := classifiersNode.FindChild("dscp"); dscpNode != nil {
+			unit.DSCPClassifier = nodeVal(dscpNode)
+		}
+		if ieeeNode := classifiersNode.FindChild("ieee-802.1"); ieeeNode != nil {
+			unit.IEEE8021Classifier = nodeVal(ieeeNode)
+		}
+	}
+	if rewriteRulesNode := node.FindChild("rewrite-rules"); rewriteRulesNode != nil {
+		if dscpNode := rewriteRulesNode.FindChild("dscp"); dscpNode != nil {
+			unit.DSCPRewriteRule = nodeVal(dscpNode)
+		}
+	}
+	// #1614 A1: oversubscription-policy { guarantee-rate <X> | proportional }
+	//
+	// Junos set syntax `set ... oversubscription-policy guarantee-rate 0.7`
+	// produces a flat-keys leaf node whose Keys are
+	// ["oversubscription-policy", "guarantee-rate", "0.7"]. The
+	// hierarchical text shape produces a parent node with a
+	// child sub-node for "guarantee-rate" carrying "0.7" as a
+	// trailing key or leaf value. Handle both forms.
+	if oversubNode := node.FindChild("oversubscription-policy"); oversubNode != nil {
+		// Flat-keys path: Keys = [policy_name, value, ...] all on
+		// the parent node.
+		if len(oversubNode.Keys) >= 2 && oversubNode.Keys[1] == "guarantee-rate" {
+			unit.OversubscriptionPolicy = "guarantee-rate"
+			if len(oversubNode.Keys) >= 3 {
+				if f, err := strconv.ParseFloat(oversubNode.Keys[2], 64); err == nil {
+					if f < 0 {
+						f = 0
+					} else if f > 1 {
+						f = 1
+					}
+					unit.OversubscriptionGuaranteeFraction = f
+				}
+			}
+		} else if len(oversubNode.Keys) >= 2 && oversubNode.Keys[1] == "proportional" {
+			unit.OversubscriptionPolicy = "proportional"
+		} else if grNode := oversubNode.FindChild("guarantee-rate"); grNode != nil {
+			// Hierarchical child-node path.
+			unit.OversubscriptionPolicy = "guarantee-rate"
+			var raw string
+			if v := nodeVal(grNode); v != "" {
+				raw = v
+			} else if len(grNode.Keys) >= 2 {
+				raw = grNode.Keys[len(grNode.Keys)-1]
+			}
+			if raw != "" {
+				if f, err := strconv.ParseFloat(raw, 64); err == nil {
+					if f < 0 {
+						f = 0
+					} else if f > 1 {
+						f = 1
+					}
+					unit.OversubscriptionGuaranteeFraction = f
+				}
+			}
+		} else if oversubNode.FindChild("proportional") != nil {
+			unit.OversubscriptionPolicy = "proportional"
+		} else if v := nodeVal(oversubNode); v != "" {
+			unit.OversubscriptionPolicy = v
+		}
+	}
+	// #1614 A2: priority-low-min-share <bps>
+	if minShareNode := node.FindChild("priority-low-min-share"); minShareNode != nil {
+		if v := nodeVal(minShareNode); v != "" {
+			unit.PriorityLowMinShareBytes = parseBandwidthLimit(v)
+		}
+	}
+}
+
+// coSInterfaceUnitHasBinding reports whether any CoS knob is set on unit.
+// An all-zero unit carries no binding and is dropped so it never reaches
+// the dataplane snapshot.
+func coSInterfaceUnitHasBinding(unit *CoSInterfaceUnit) bool {
+	if unit == nil {
+		return false
+	}
+	return unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" ||
+		unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" ||
+		unit.DSCPRewriteRule != "" || unit.OversubscriptionPolicy != "" ||
+		unit.PriorityLowMinShareBytes > 0
+}
+
+// applyCoSInterfaceLevelBindings folds each interface-level CoS binding
+// (CoSInterface.Level, parsed from `class-of-service interfaces geX` with
+// no `unit`) into the configured logical units of that interface (#4021).
+//
+// Junos precedence: an interface-level binding applies to every logical
+// unit on the port, and a unit-level binding overrides it PER KNOB. This
+// runs as a post-compile pass because the CoS compiler walks only the
+// class-of-service subtree and does not know which logical units the
+// interface stanza declares; here cfg.Interfaces is fully populated.
+//
+// After the fold, cos.Interfaces[name].Units carries the EFFECTIVE
+// per-unit binding, so the dataplane snapshot and `show class-of-service`
+// — which both iterate Units — apply interface-level CoS without any
+// interface-level awareness of their own. An interface with an
+// interface-level binding but no configured logical unit contributes no
+// unit here (a CoS binding needs a logical interface to attach to); Level
+// is retained for `show configuration` fidelity.
+func applyCoSInterfaceLevelBindings(cfg *Config) {
+	if cfg == nil || cfg.ClassOfService == nil {
+		return
+	}
+	for name, cosIface := range cfg.ClassOfService.Interfaces {
+		if cosIface == nil || cosIface.Level == nil {
+			continue
+		}
+		ifCfg := cfg.Interfaces.Interfaces[name]
+		if ifCfg == nil {
+			continue
+		}
+		for unitNum := range ifCfg.Units {
+			unit := cosIface.Units[unitNum]
+			if unit == nil {
+				unit = &CoSInterfaceUnit{Unit: unitNum}
+				cosIface.Units[unitNum] = unit
+			}
+			mergeCoSInterfaceLevelInto(unit, cosIface.Level)
+		}
+	}
+}
+
+// mergeCoSInterfaceLevelInto fills any knob unset on unit from the
+// interface-level binding level. The unit-level value wins whenever it is
+// set (unit-level overrides interface-level).
+func mergeCoSInterfaceLevelInto(unit, level *CoSInterfaceUnit) {
+	if unit == nil || level == nil {
+		return
+	}
+	if unit.ShapingRateBytes == 0 {
+		unit.ShapingRateBytes = level.ShapingRateBytes
+	}
+	if unit.BurstSizeBytes == 0 {
+		unit.BurstSizeBytes = level.BurstSizeBytes
+	}
+	if unit.SchedulerMap == "" {
+		unit.SchedulerMap = level.SchedulerMap
+	}
+	if unit.DSCPClassifier == "" {
+		unit.DSCPClassifier = level.DSCPClassifier
+	}
+	if unit.IEEE8021Classifier == "" {
+		unit.IEEE8021Classifier = level.IEEE8021Classifier
+	}
+	if unit.DSCPRewriteRule == "" {
+		unit.DSCPRewriteRule = level.DSCPRewriteRule
+	}
+	if unit.OversubscriptionPolicy == "" {
+		unit.OversubscriptionPolicy = level.OversubscriptionPolicy
+		unit.OversubscriptionGuaranteeFraction = level.OversubscriptionGuaranteeFraction
+	}
+	if unit.PriorityLowMinShareBytes == 0 {
+		unit.PriorityLowMinShareBytes = level.PriorityLowMinShareBytes
+	}
 }
 
 func collectCoSFairnessRSSExpectation(queueNode *Node) (string, error) {

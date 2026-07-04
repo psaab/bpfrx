@@ -123,6 +123,16 @@ type CoSSchedulerMapEntry struct {
 type CoSInterface struct {
 	Name  string
 	Units map[int]*CoSInterfaceUnit
+	// Level holds a CoS binding applied at the physical interface level
+	// (`class-of-service interfaces geX { scheduler-map M; ... }` with no
+	// `unit`). In Junos an interface-level binding applies to every
+	// logical unit on the port; a unit-level binding overrides it per
+	// knob. The compiler folds Level into each configured logical unit
+	// after the interface stanza is known (applyCoSInterfaceLevelBindings),
+	// so the dataplane snapshot and `show class-of-service` — which both
+	// iterate Units — need no interface-level awareness. Nil when the
+	// operator configured only per-unit bindings.
+	Level *CoSInterfaceUnit
 }
 
 // CoSInterfaceUnit defines the Phase 1 root shaper attached to a logical unit.

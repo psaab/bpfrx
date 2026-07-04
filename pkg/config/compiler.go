@@ -2141,6 +2141,14 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #4021: fold interface-level CoS bindings (`class-of-service interfaces
+	// geX { scheduler-map M; ... }` with no `unit`) into the interface's
+	// configured logical units. Runs after the child loop so both the
+	// interface stanza (cfg.Interfaces) and class-of-service are populated
+	// regardless of their order under root; a unit-level binding overrides
+	// the interface-level one per knob (Junos precedence).
+	applyCoSInterfaceLevelBindings(cfg)
+
 	// Post-compilation fixup: resolve vSRX-style fabric member-interfaces.
 	// For fab0/fab1 with fabric-options member-interfaces, resolve which member
 	// belongs to the local node using FPC slot → node-id mapping (slot 0 → node0,
