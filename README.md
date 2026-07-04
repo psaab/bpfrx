@@ -238,7 +238,12 @@ make build              # Build xpfd daemon (uses the git-tracked shim object;
                         # does NOT require make generate)
 make build-ctl          # Build remote CLI client
 make build-userspace-dp # Build the Rust AF_XDP dataplane binary (needs cargo)
-make test               # Run the Go test suite
+make test               # Run BOTH suites: Go (test-go) + Rust userspace-dp
+                        # cargo suite (test-rust). A Rust dataplane
+                        # regression fails `make test` (#4006). The Rust
+                        # leg needs cargo and takes a few minutes.
+make test-go            # Go test suite only
+make test-rust          # Rust userspace-dp cargo suite only (needs cargo)
 make deb                # Package the binaries into a .deb
 make image              # Bake the appliance image (qcow2 + incus metadata)
 ```

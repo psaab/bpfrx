@@ -177,10 +177,26 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 			// type/code constraint (junos-icmp-all, a user protocol-only ICMP app)
 			// is unaffected and still ships its protocol-only row.
 			if !icmpTypeConstrained(app) {
-				// Omitted protocol means "any L4"; compileApplications installs
-				// both TCP and UDP entries (ICMP is excluded from that fan-out).
+				// An OMITTED protocol (empty spec) means "any L4":
+				// compileApplications installs one entry per TCP and UDP (the
+				// Junos custom-application default). An EXPLICIT protocol —
+				// including `protocol 0` (HOPOPT), which ProtocolNumber resolves
+				// to (0, true) — matches that single protocol only.
+				//
+				// #4008: the old trigger keyed the fan-out on the RESOLVED number
+				// being 0 (`proto == 0`), which conflated three distinct cases
+				// that all yield proto 0: an omitted protocol (the intended
+				// fan-out), an EXPLICIT `protocol 0` (a specific IANA protocol,
+				// NOT a wildcard), and an unrepresentable token on the tolerant-
+				// load path (ProtocolNumber ok=false). So a single-protocol
+				// `protocol 0` app fanned out to BOTH TCP and UDP → a policy
+				// referencing it over-matched (a TCP-only intent also matched the
+				// UDP flow). Key the fan-out on the protocol being ABSENT instead:
+				// only an omitted spec fans out; an explicit protocol (0 or any
+				// other) stays single. The `app.Protocol != "icmp"` guard is now
+				// subsumed — a non-empty protocol never fans out.
 				protos := []uint8{proto}
-				if proto == 0 && app.Protocol != "icmp" {
+				if strings.TrimSpace(app.Protocol) == "" {
 					protos = []uint8{6, 17}
 				}
 				for _, p := range protos {

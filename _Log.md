@@ -42,6 +42,43 @@
     `test/incus/cluster-setup.sh`, `test/incus/deploy-lib-selftest.sh`,
     `docs/ha-cluster-test-plan.md`, `_Log.md`
 
+## 2026-07-03 — #4008: explicit `protocol 0` in an application fanned out to TCP+UDP (over-broad app match)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-164 (MEDIUM, appid — over-broad protocol
+    match). The app-identification catalog builder keyed its "any L4" TCP+UDP
+    fan-out on the RESOLVED protocol number being 0 (`proto == 0`), which
+    conflated three distinct cases that all resolve to 0: an OMITTED protocol
+    (the intended fan-out), an EXPLICIT `protocol 0` (IANA HOPOPT, which
+    `appid.ProtocolNumber("0")` resolves to `(0, true)` — a specific protocol,
+    NOT a wildcard), and an unrepresentable token on the tolerant-load path
+    (`ok == false`). So a single-protocol `protocol 0` application compiled to
+    BOTH a TCP (6) and a UDP (17) catalog entry, and a policy referencing that
+    app over-matched — a TCP-only intent also matched the UDP flow on the same
+    port (over-permit / over-broad classification). Verified genuine and Go-
+    scoped (the fan-out is in the Go compile, NOT the Rust dataplane match):
+    scratch catalog build showed `protocol 0` → `[6 17]` (bug), `protocol tcp`
+    → `[6]` (correct), omitted → `[6 17]` (deliberate default).
+  - **Fix**: key the fan-out on the protocol being ABSENT
+    (`strings.TrimSpace(app.Protocol) == ""`) instead of the resolved number
+    being 0. Only an omitted spec fans out to TCP+UDP; every explicit protocol
+    (including `protocol 0`) stays a single entry. The redundant
+    `app.Protocol != "icmp"` guard is subsumed — a non-empty protocol never
+    fans out. Applied to `pkg/appid/catalog.go` (the LIVE catalog shipped to
+    the userspace-dp helper via `pkg/dataplane/userspace/flow.go` →
+    `AppCatalogEntrySnapshot`) and mirrored in `pkg/dataplane/compiler.go`
+    (retired-eBPF; its `SetApplication`/`SetAppRange` writes are no-ops, but
+    keeping the fan-out identical preserves the documented parity invariant).
+    The omitted-protocol default (`any-l4` fan-out, `TestAppCatalogEntryPorts
+    AndProtos`) is unchanged.
+  - **Validation**: added `pkg/appid/catalog_proto0_4008_test.go` — RED-on-
+    revert on both `TestCatalogExplicitProtocol0DoesNotFanOut` and the full
+    config-parse `TestCatalogProtocol0FromParsedConfig` (revert → `protocol 0`
+    → `[6 17]`, both FAIL; fix → `[0]`, PASS). `go test ./pkg/appid/...
+    ./pkg/config/... ./pkg/dataplane/` green; `go build ./...`, `go vet`,
+    `gofmt` clean.
+  - **File(s)**: pkg/appid/catalog.go, pkg/dataplane/compiler.go,
+    pkg/appid/catalog_proto0_4008_test.go, pkg/appid/README.md, _Log.md
 ## 2026-07-03 — #4005: `monitor traffic matching "<filter>"` truncated the pcap filter to the first token
 
 - **Timestamp**: 2026-07-03
@@ -30920,3 +30957,27 @@ top.
     pkg/config/parser_security_test.go, pkg/ipsec/ike.go, pkg/ipsec/ipsec_test.go,
     pkg/cli/cli_show_security_ipsec.go, pkg/grpcapi/server_show_security_text.go,
     pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-03
+  - **Action**: #4006 — `make test` now runs BOTH the Go suite AND the Rust
+    userspace-dp cargo suite. Before this change `test` ran only `go vet` +
+    `go test ./...`, so a regression in the Rust AF_XDP dataplane — the ONLY
+    runtime forwarding path after the #1373/#1476 eBPF retirement — passed
+    `make test` green (a false all-clear for the most critical code). Split the
+    old `test` recipe into `test-go` (unchanged: `go vet ./pkg/flowexport/...`
+    then `go test ./...`) and a new `test-rust`
+    (`cargo test --manifest-path userspace-dp/Cargo.toml --release --bins
+    --tests -- --test-threads=1`), and made `test: test-go test-rust`. Each leg
+    is a plain prerequisite recipe, so a non-zero exit from either aborts the
+    target — a Rust test failure now fails `make test` (verified: a throwaway
+    Makefile with the same prerequisite shape and a `false` in test-rust exited
+    non-zero and never ran the trailing line; RED-on-revert semantics hold).
+    userspace-dp is a binary-only crate (no [lib]), so `--bins` reaches its
+    unit tests and `--tests` adds integration tests; benches are excluded
+    (criterion `harness = false` rejects libtest's `--test-threads`, and they
+    are perf gates run via `cargo bench`). `--test-threads=1` dodges the
+    intermittent `__skb_wait_for_more_packets` socket-test hang. `go build
+    ./...` unaffected (green). Docs updated: README build section, CLAUDE.md
+    Quick Start, docs/testing.md, docs/testing-procedures.md.
+  - **File(s)**: Makefile, README.md, CLAUDE.md, docs/testing.md,
+    docs/testing-procedures.md, _Log.md

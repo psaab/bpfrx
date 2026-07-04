@@ -11,7 +11,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test test-go test-rust audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
 
 all: generate build build-ctl
 
@@ -67,7 +67,19 @@ install: build build-ctl
 	install -m 0755 $(BINARY) $(PREFIX)/sbin/$(BINARY)
 	install -m 0755 cli $(PREFIX)/bin/cli
 
-test:
+# The single pre-commit gate. `test` runs BOTH the Go suite AND the Rust
+# userspace-dp cargo suite (#4006). The Rust AF_XDP dataplane is the only
+# runtime forwarding path after the #1373/#1476 eBPF retirement, so a
+# forwarding / CoS / NAT / session-correctness regression there must fail
+# `make test`. Before #4006 this target ran only `go test ./...`, giving a
+# false all-clear for the most critical code (a broken Rust dataplane test
+# passed `make test` green). Each prerequisite recipe is a plain command,
+# so a non-zero exit from either leg aborts the target (Make stops at the
+# first failing prerequisite) — a Rust test failure now fails `make test`.
+test: test-go test-rust
+
+# Go suite. Invocation preserved exactly from the pre-#4006 `test` target.
+test-go:
 	# go vet gate scoped to pkg/flowexport (#2224): catches the
 	# atomic.Uint64-copy regression class (ExportConfig embeds the live
 	# 1-in-N sampleCounter and must never be copied by value). NOT
@@ -76,6 +88,32 @@ test:
 	# code); widen to ./... once those are resolved.
 	$(GO) vet ./pkg/flowexport/...
 	$(GO) test ./...
+
+# Rust userspace-dp correctness suite (#4006). userspace-dp is a
+# binary-only crate (no [lib] target), so its unit tests live in the bin
+# and are reached via --bins; --tests adds any tests/ integration tests.
+# Run in --release, matching build-userspace-dp so compiled artifacts are
+# shared rather than rebuilt.
+#
+#   --bins --tests         select the correctness suite. Benches are
+#                          deliberately excluded: they are performance
+#                          gates run via `cargo bench`, and criterion's
+#                          harness (harness = false) rejects libtest's
+#                          --test-threads flag, so running them here would
+#                          break the run.
+#   -- --test-threads=1    serialize the harness. Some dataplane socket
+#                          tests can wedge in __skb_wait_for_more_packets
+#                          when run concurrently; single-threaded execution
+#                          avoids the intermittent hang. Runtime for the
+#                          full suite is a few minutes (thousands of tests)
+#                          — slower than the Go suite but a real gate.
+#
+# A non-zero cargo exit propagates: this is a plain recipe line, so Make
+# fails the target on any command that exits non-zero (no `-` prefix / no
+# `|| true` swallows the failure).
+test-rust:
+	$(CARGO) test --manifest-path userspace-dp/Cargo.toml --release \
+		--bins --tests -- --test-threads=1
 
 # Drift guard for the committed refactoring heatmap (#1661 item 8).
 # Regenerates scripts/refactoring-audit.sh output to a temp file and
