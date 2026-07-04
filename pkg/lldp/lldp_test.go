@@ -3,8 +3,10 @@ package lldp
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 )
 
 func TestEncodeTLV(t *testing.T) {
@@ -301,6 +303,125 @@ func TestParseTLVs_ValidShutdownTTL(t *testing.T) {
 	}
 	if n.PortID != "trust0" {
 		t.Errorf("port ID: got %s, want trust0", n.PortID)
+	}
+}
+
+// TestSanitizeTLVString unit-tests the LLDP-receive control-char sanitizer
+// (#4043): every C0/C1/DEL control character is replaced by a space, a normal
+// ASCII or multi-byte UTF-8 string is returned unchanged, and no control byte
+// survives. LLDP TLV strings are untrusted L2 input; leaving ESC/CR/LF raw
+// would let a crafted neighbor inject ANSI sequences into an operator's
+// terminal or forge/split a syslog line.
+func TestSanitizeTLVString(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain ascii unchanged", "switch-core-1", "switch-core-1"},
+		{"utf8 preserved", "café-λ-世界", "café-λ-世界"},
+		{"ansi escape stripped", "\x1b[31mred", " [31mred"},
+		{"crlf log injection", "a\r\nDROP", "a  DROP"},
+		{"nul and c0", "x\x00y\x07z", "x y z"},
+		{"del stripped", "a\x7fb", "a b"},
+		{"c1 stripped", "aC", "a C"},
+		{"trailing newline", "port0\n", "port0 "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeTLVString(tc.in)
+			if got != tc.want {
+				t.Errorf("sanitizeTLVString(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if i := strings.IndexFunc(got, unicode.IsControl); i >= 0 {
+				t.Errorf("sanitizeTLVString(%q) retained a control char at byte %d: %q", tc.in, i, got)
+			}
+		})
+	}
+}
+
+// TestParseTLVs_SanitizesControlChars asserts the end-to-end store boundary:
+// a received LLDP frame whose free-text TLVs (system-name, system-desc,
+// port-desc, port-id, non-MAC chassis-id) carry ESC + CRLF + C0/DEL control
+// characters is parsed into a neighbor whose stored strings are control-char
+// free, so neither expiryLoop's log line nor the `show lldp neighbors` table
+// can be poisoned by a hostile neighbor (#4043). Readable payload survives.
+func TestParseTLVs_SanitizesControlChars(t *testing.T) {
+	sysName := "\x1b[31mroot\r\nfake-log-line"
+	sysDesc := "desc\x1b]0;title\x07"
+	portDesc := "port\x00\x0bdesc"
+	portID := "eth\x1b[2J0\n"
+	// Non-MAC chassis-id subtype (7 = locally assigned) carrying a CRLF.
+	chassisRaw := append([]byte{7}, []byte("host\r\nA")...)
+
+	data := concat(
+		rawTLV(tlvChassisID, chassisRaw),
+		mustEncodeTLV(tlvPortID, encodePortID(portID)),
+		mustEncodeTLV(tlvTTL, encodeTTL(120)),
+		mustEncodeTLV(tlvSystemName, []byte(sysName)),
+		mustEncodeTLV(tlvSystemDesc, []byte(sysDesc)),
+		mustEncodeTLV(tlvPortDesc, []byte(portDesc)),
+		mustEncodeTLV(tlvEnd, nil),
+	)
+
+	n := ParseTLVs(data)
+	if n == nil {
+		t.Fatal("ParseTLVs returned nil for a valid (if hostile) frame")
+	}
+
+	for name, got := range map[string]string{
+		"SystemName": n.SystemName,
+		"SystemDesc": n.SystemDesc,
+		"PortDesc":   n.PortDesc,
+		"PortID":     n.PortID,
+		"ChassisID":  n.ChassisID,
+	} {
+		if i := strings.IndexFunc(got, unicode.IsControl); i >= 0 {
+			t.Errorf("%s retained a control char at byte %d: %q", name, i, got)
+		}
+	}
+
+	// The printable payload survives (control chars become spaces, not drops).
+	if !strings.Contains(n.SystemName, "root") || !strings.Contains(n.SystemName, "fake-log-line") {
+		t.Errorf("SystemName lost readable text: %q", n.SystemName)
+	}
+	if strings.ContainsAny(n.PortID, "\x1b\n") {
+		t.Errorf("PortID still carries ESC/LF: %q", n.PortID)
+	}
+	if !strings.HasPrefix(n.ChassisID, "host") {
+		t.Errorf("ChassisID lost readable text: %q", n.ChassisID)
+	}
+}
+
+// TestParseTLVs_CleanStringsUnchanged is the negative control for #4043: a
+// frame whose TLV strings contain no control characters is stored verbatim, so
+// the sanitizer never mangles a normal neighbor name.
+func TestParseTLVs_CleanStringsUnchanged(t *testing.T) {
+	mac := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
+	data := concat(
+		mustEncodeTLV(tlvChassisID, encodeChassisID(mac)),
+		mustEncodeTLV(tlvPortID, encodePortID("ge-0/0/1")),
+		mustEncodeTLV(tlvTTL, encodeTTL(120)),
+		mustEncodeTLV(tlvSystemName, []byte("switch-core-1")),
+		mustEncodeTLV(tlvSystemDesc, []byte("Juniper EX4300")),
+		mustEncodeTLV(tlvPortDesc, []byte("uplink to spine")),
+		mustEncodeTLV(tlvEnd, nil),
+	)
+	n := ParseTLVs(data)
+	if n == nil {
+		t.Fatal("ParseTLVs returned nil for a valid clean frame")
+	}
+	if n.PortID != "ge-0/0/1" {
+		t.Errorf("PortID: got %q, want %q", n.PortID, "ge-0/0/1")
+	}
+	if n.SystemName != "switch-core-1" {
+		t.Errorf("SystemName: got %q, want %q", n.SystemName, "switch-core-1")
+	}
+	if n.SystemDesc != "Juniper EX4300" {
+		t.Errorf("SystemDesc: got %q, want %q", n.SystemDesc, "Juniper EX4300")
+	}
+	if n.PortDesc != "uplink to spine" {
+		t.Errorf("PortDesc: got %q, want %q", n.PortDesc, "uplink to spine")
 	}
 }
 

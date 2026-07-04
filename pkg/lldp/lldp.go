@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/psaab/xpf/pkg/linuxsock"
 	"golang.org/x/sys/unix"
@@ -638,6 +640,35 @@ func encodeTTL(seconds int) []byte {
 	return val
 }
 
+// sanitizeTLVString neutralizes control characters in an LLDP TLV string
+// received from the wire before it is stored in the neighbor table — and so
+// before expiryLoop logs it or `show lldp neighbors` displays it. LLDP is an
+// unauthenticated L2 protocol: any device on the segment can send a frame
+// whose system-name / system-description / port-description / port-id /
+// chassis-id TLV carries ANSI escape sequences, CR/LF, or other control
+// characters. Left raw, those bytes reach an operator's terminal (cursor
+// moves, screen clears, spoofed output via `show lldp neighbors`) or forge /
+// split a syslog line (log injection). Every Unicode control character — the
+// C0 set (0x00-0x1F, which includes ESC 0x1B, CR and LF), DEL (0x7F), and the
+// C1 set (0x80-0x9F) — is replaced by a single space. This is the
+// LLDP-receive counterpart of the #1798/#3900 free-text control-char
+// sanitizer. strings.Map is rune-aware, so a legitimate multi-byte UTF-8
+// system name passes through unchanged and only control runes are
+// neutralized; an invalid UTF-8 byte decodes to U+FFFD (not a control rune)
+// so no raw byte escapes. Replacing rather than deleting keeps adjacent words
+// readable.
+func sanitizeTLVString(s string) string {
+	if strings.IndexFunc(s, unicode.IsControl) < 0 {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
 // ParseTLVs parses LLDP TLVs from raw payload (after Ethernet header).
 // Returns nil if any mandatory TLV (Chassis ID, Port ID, TTL) is missing OR
 // truncated: a mandatory TLV is only counted present once its value parsed
@@ -678,14 +709,19 @@ func ParseTLVs(data []byte) *Neighbor {
 				// MAC subtype with len 2..6 is truncated for its own subtype —
 				// do not accept it.
 			} else if len(value) >= 2 {
-				n.ChassisID = string(value[1:])
+				// Non-MAC chassis-id subtypes carry a free-text identifier
+				// straight off the wire — sanitize control chars (#4043).
+				n.ChassisID = sanitizeTLVString(string(value[1:]))
 				hasChassis = true
 			}
 		case tlvPortID:
 			// Same gating as Chassis ID: a subtype byte with no identifier
 			// (len < 2) is truncated, so leave hasPort false (#2551).
 			if len(value) >= 2 {
-				n.PortID = string(value[1:])
+				// Port-id is untrusted L2 input — sanitize control chars so a
+				// crafted TLV can't inject ANSI/CRLF into the log or the
+				// `show lldp neighbors` table (#4043).
+				n.PortID = sanitizeTLVString(string(value[1:]))
 				hasPort = true
 			}
 		case tlvTTL:
@@ -698,11 +734,13 @@ func ParseTLVs(data []byte) *Neighbor {
 				hasTTL = true
 			}
 		case tlvSystemName:
-			n.SystemName = string(value)
+			// Operator-visible free-text TLVs from an untrusted neighbor —
+			// sanitize control chars before storing (#4043).
+			n.SystemName = sanitizeTLVString(string(value))
 		case tlvSystemDesc:
-			n.SystemDesc = string(value)
+			n.SystemDesc = sanitizeTLVString(string(value))
 		case tlvPortDesc:
-			n.PortDesc = string(value)
+			n.PortDesc = sanitizeTLVString(string(value))
 		}
 	}
 
