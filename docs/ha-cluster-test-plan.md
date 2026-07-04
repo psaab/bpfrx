@@ -435,6 +435,30 @@ make cluster-start/stop/restart  # Service lifecycle (NODE=0|1|all)
 4. Ensure `/etc/xpf/node-id` exists
 5. Install and enable systemd service
 
+### Rolling order for `deploy all` (secondary first, #4009)
+
+`deploy all` upgrades the **SECONDARY node first** so the primary keeps
+forwarding, then upgrades the primary (the standby, now upgraded, takes over
+via VRRP). The secondary is detected by running `show chassis cluster status`
+on node0 and reading node0's own **RG0 Status** row — parsed by
+`deploy_rolling_secondary_node` in `test/incus/deploy-lib.sh`
+(unit-tested in `deploy-lib-selftest.sh`, run by `make test-deploy-lib`).
+
+Before #4009 the detection used an inline `grep "secondary:node0"` that never
+matched the space-separated, lowercase status rows, so the deploy always fell
+through to a fixed "node1 first" order. Whenever node0 was the RG0 **secondary**
+that restarted the **primary (node1) first** — a spurious mid-deploy failover
+that churned cluster state and left downstream smoke (`apply-cos-config.sh`,
+`test-failover`) starting from an unexpected primary ~50% of the time (the root
+cause of the force-node0-primary workaround in the HA batch scripts).
+
+After the correct-order deploy, `reassert_primary_node0` best-effort resets
+manual failover and forces node0 primary for **every** redundancy group (RG ids
+enumerated by `deploy_rolling_rg_ids`), so smoke always starts from the
+documented node0-primary steady state regardless of the cluster's preempt
+setting. Both the raw-push (`deploy_rolling`) and dogfood-deb
+(`deploy_rolling_deb`) paths share the same detection + reassert helpers.
+
 ## Test Cases
 
 ### TC-1: Cluster Formation
