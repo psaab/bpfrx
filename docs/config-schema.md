@@ -286,6 +286,16 @@ both AST shapes):
   RIP export strict validator (`compiler_validate_strict.go`) already walks the
   full slice, so a dangling non-first export name is rejected at commit. Coverage:
   `compiler_rip_multivalue_3904_test.go` (both AST shapes).
+- **routing-instance `interface`** (`compiler_routing.go`) — the
+  `interface [ i1 i2 ]` list is compiled through `firewallMatchValues` into the
+  already-plural `RoutingInstanceConfig.Interfaces`. `interface` is an OPAQUE
+  implicit leaf under the `routing-instances` wildcard (not a declared schema
+  child — like `instance-type`), so the flat-set bracket already collapses onto
+  Keys[1:] and no schema change is required. Before #3904 the read was
+  `nodeVal(prop)` (Keys[1] only), so `interface [ ge-0/0/1 ge-0/0/2 ]` bound only
+  the first port to the VRF and the rest stayed in the DEFAULT table — a VRF
+  isolation break. Coverage: `compiler_routing_instance_interface_3904_test.go`
+  (both AST shapes + single-value back-compat).
 
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 

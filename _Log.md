@@ -29156,3 +29156,11 @@ top.
   value via `firewallMatchValues` into the already-plural RIPConfig slices.
 - **File(s)**: pkg/config/schema_routing.go, pkg/config/compiler_protocols.go,
   pkg/config/compiler_rip_multivalue_3904_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-163 — routing-instance `interface [ i1 i2 ]` no longer keeps only
+  the first port (VRF isolation break). Compiler reads every interface via
+  `firewallMatchValues` into RoutingInstanceConfig.Interfaces (opaque implicit
+  leaf, no schema change needed).
+- **File(s)**: pkg/config/compiler_routing.go,
+  pkg/config/compiler_routing_instance_interface_3904_test.go, docs/config-schema.md
