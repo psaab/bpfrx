@@ -597,10 +597,16 @@ func (s *Store) saveRollbackFiles() {
 		path := s.rollbackPath(i + 1)
 		data := entry.Config.Format()
 		var err error
+		// Owner-only 0600 (#4056): the rollback slots (xpf.conf.N) hold the
+		// full committed config TEXT, which always includes cleartext secret
+		// leaves (IKE PSK, auth keys, SNMP community) — Format() does not
+		// redact or encrypt. World-readable 0644 exposed every firewall
+		// secret to any local user; 0600 keeps them owner-only. The daemon
+		// owns the files, so loadRollbackHistory still reads them back.
 		if i == 0 {
-			err = rbWriteFileDurable(path, []byte(data), 0644)
+			err = rbWriteFileDurable(path, []byte(data), 0600)
 		} else {
-			err = rbWriteFileAtomic(path, []byte(data), 0644)
+			err = rbWriteFileAtomic(path, []byte(data), 0600)
 		}
 		if err != nil {
 			slog.Warn("failed to write rollback file", "path", path, "err", err)

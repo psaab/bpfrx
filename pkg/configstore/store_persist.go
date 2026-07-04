@@ -308,7 +308,12 @@ func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
 // rotateArchives uses stays chronological (ts dominates; the 20-digit
 // zero-padded seq only breaks same-ts ties, in monotonic commit order).
 func writeArchive(archiveDir string, maxArchives int, data string, ts time.Time, seq uint64) error {
-	if err := os.MkdirAll(archiveDir, 0755); err != nil {
+	// Owner-only 0700 (#4056): the archive directory holds only timestamped
+	// copies of the full config text (each with cleartext secrets), so it
+	// must not be world-traversable. MkdirAll does not chmod an existing
+	// dir, so an upgrade keeps its old mode; the archive FILES are 0600
+	// regardless, which is the load-bearing protection.
+	if err := os.MkdirAll(archiveDir, 0700); err != nil {
 		return fmt.Errorf("create archive dir: %w", err)
 	}
 
@@ -317,7 +322,11 @@ func writeArchive(archiveDir string, maxArchives int, data string, ts time.Time,
 	// AtomicGeneratedConfig (#1894): archives are best-effort history
 	// copies — atomic so a crash never leaves a torn archive, but not
 	// worth an fsync.
-	if err := rbWriteFileAtomic(path, []byte(data), 0644); err != nil {
+	//
+	// Owner-only 0600 (#4056): an archive is the full committed config TEXT
+	// with cleartext secret leaves (IKE PSK, auth keys); 0644 leaked them to
+	// any local user.
+	if err := rbWriteFileAtomic(path, []byte(data), 0600); err != nil {
 		return fmt.Errorf("write archive: %w", err)
 	}
 
@@ -386,7 +395,12 @@ func (s *Store) SaveRescueConfig() error {
 	path := s.rescuePath()
 	// DurableState (#1894): the rescue config is the operator's
 	// explicitly-requested safety net — it must survive power loss.
-	if err := fsatomic.WriteFileDurable(path, []byte(data), 0644); err != nil {
+	//
+	// Owner-only 0600 (#4056): rescue.conf is the full active config TEXT
+	// with cleartext secret leaves (IKE PSK, auth keys, SNMP community);
+	// 0644 exposed them to any local user. The daemon owns the file, so
+	// LoadRescueConfig still reads it back.
+	if err := fsatomic.WriteFileDurable(path, []byte(data), 0600); err != nil {
 		return fmt.Errorf("save rescue config: %w", err)
 	}
 	slog.Info("rescue configuration saved", "path", path)

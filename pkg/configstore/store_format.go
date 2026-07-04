@@ -294,6 +294,189 @@ func (s *Store) ShowCompare() string {
 	return diff
 }
 
+// --- Redacted display renderers (#4051) ---------------------------------
+//
+// The raw-AST render endpoints (REST config show / export / search /
+// rollback + gRPC ShowConfig / ShowCompare / ShowRollback) must not leak
+// operator secrets in cleartext the way the typed-struct /config JSON stopped
+// leaking them in #2053. These variants render a RedactedClone of the source
+// tree — secrets masked with config.SecretDataPlaceholder — so all AST-render
+// display formats (text/set/json/xml/inheritance/compare) are redacted at one
+// place. The cleartext Show* siblings above stay unchanged: they back HA
+// config sync (daemon_ha_sync.go), the DR/compliance archive (daemon_flow.go),
+// persistence + rollback, and the on-box CLI, none of which may lose the real
+// secret. Each redacted method mirrors its cleartext sibling's nil-source
+// default so behaviour is identical except for the masking, and each accepts a
+// path (nil/empty selects the whole tree, matching FormatPath(nil) == Format).
+
+// forDisplay returns a redacted deep clone of t, or nil if t is nil.
+func forDisplay(t *config.ConfigTree) *config.ConfigTree {
+	return t.RedactedClone()
+}
+
+// ShowActiveRedacted renders the active config (optional subtree) as
+// hierarchical text with secrets masked.
+func (s *Store) ShowActiveRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return forDisplay(s.active).FormatPath(path)
+}
+
+// ShowActiveSetRedacted renders the active config (optional subtree) as flat
+// set commands with secrets masked.
+func (s *Store) ShowActiveSetRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return forDisplay(s.active).FormatPathSet(path)
+}
+
+// ShowActiveJSONRedacted renders the active config (optional subtree) as JSON
+// with secrets masked.
+func (s *Store) ShowActiveJSONRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return forDisplay(s.active).FormatPathJSON(path)
+}
+
+// ShowActiveXMLRedacted renders the active config (optional subtree) as XML
+// with secrets masked.
+func (s *Store) ShowActiveXMLRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return forDisplay(s.active).FormatPathXML(path)
+}
+
+// ShowActiveInheritanceRedacted renders the active config (optional subtree)
+// with inheritance annotations and secrets masked.
+func (s *Store) ShowActiveInheritanceRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return forDisplay(s.active).FormatPathInheritance(path)
+}
+
+// ShowCandidateRedacted renders the candidate config (optional subtree) as
+// hierarchical text with secrets masked.
+func (s *Store) ShowCandidateRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		return ""
+	}
+	return forDisplay(s.candidate).FormatPath(path)
+}
+
+// ShowCandidateSetRedacted renders the candidate config (optional subtree) as
+// flat set commands with secrets masked.
+func (s *Store) ShowCandidateSetRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		return ""
+	}
+	return forDisplay(s.candidate).FormatPathSet(path)
+}
+
+// ShowCandidateJSONRedacted renders the candidate config (optional subtree) as
+// JSON with secrets masked. Mirrors the split nil default: "{}\n" for the
+// whole tree, "" for a subtree path.
+func (s *Store) ShowCandidateJSONRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		if len(path) == 0 {
+			return "{}\n"
+		}
+		return ""
+	}
+	return forDisplay(s.candidate).FormatPathJSON(path)
+}
+
+// ShowCandidateXMLRedacted renders the candidate config (optional subtree) as
+// XML with secrets masked. Mirrors the split nil default: the empty-config XML
+// document for the whole tree, "" for a subtree path.
+func (s *Store) ShowCandidateXMLRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		if len(path) == 0 {
+			return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration>\n</configuration>\n"
+		}
+		return ""
+	}
+	return forDisplay(s.candidate).FormatPathXML(path)
+}
+
+// ShowCandidateInheritanceRedacted renders the candidate config (optional
+// subtree) with inheritance annotations and secrets masked.
+func (s *Store) ShowCandidateInheritanceRedacted(path []string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		return ""
+	}
+	return forDisplay(s.candidate).FormatPathInheritance(path)
+}
+
+// ShowRollbackRedacted renders rollback slot n (1-based) as hierarchical text
+// with secrets masked.
+func (s *Store) ShowRollbackRedacted(n int) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, err := s.history.Get(n - 1)
+	if err != nil {
+		return "", err
+	}
+	return forDisplay(entry.Config).Format(), nil
+}
+
+// ShowRollbackSetRedacted renders rollback slot n (1-based) as flat set
+// commands with secrets masked.
+func (s *Store) ShowRollbackSetRedacted(n int) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, err := s.history.Get(n - 1)
+	if err != nil {
+		return "", err
+	}
+	return forDisplay(entry.Config).FormatSet(), nil
+}
+
+// ShowCompareRedacted returns a hierarchical diff between the active and
+// candidate configs with secrets masked on BOTH sides. A secret CHANGE
+// therefore shows as no-change (both masked) rather than leaking either
+// value — the safe display choice absent a Junos-style $9$ ciphertext.
+func (s *Store) ShowCompareRedacted() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		return ""
+	}
+	diff := config.FormatCompare(forDisplay(s.active), forDisplay(s.candidate))
+	if diff == "" {
+		return "[no changes]\n"
+	}
+	return diff
+}
+
+// ShowCompareRollbackRedacted returns a diff between rollback slot n and the
+// candidate with secrets masked on both sides.
+func (s *Store) ShowCompareRollbackRedacted(n int) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		return "", fmt.Errorf("not in configuration mode")
+	}
+	entry, err := s.history.Get(n - 1)
+	if err != nil {
+		return "", err
+	}
+	diff := config.FormatCompare(forDisplay(entry.Config), forDisplay(s.candidate))
+	if diff == "" {
+		return "[no changes]\n", nil
+	}
+	return diff, nil
+}
+
 // splitLines splits a string into non-empty lines.
 func splitLines(s string) []string {
 	var lines []string

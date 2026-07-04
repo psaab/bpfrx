@@ -13,6 +13,41 @@ dereferences the DB, so the old "falling back to file-only" warning was
 describing code that never existed, followed by a nil-pointer panic on
 the first Load/Save/commit.
 
+## File permissions — secrets at rest (#4056)
+
+Every persisted copy of the full config carries the config's secret
+leaves (IKE/IPsec PSKs, WireGuard/auth keys, SNMP community, routing
+auth). Those leaves are stored **cleartext** unless `system
+master-password` is set (which AES-GCM-encrypts only the JSON DB body,
+not the text copies). So all secret-bearing files are written
+**owner-only 0600**, never world-readable 0644 — a 0644 copy exposed
+every firewall secret to any local user and defeated the point of
+master-password encryption. `fsatomic` enforces the mode on the temp fd
+before the rename (`WriteFileAtomic`/`WriteFileDurable` replace the
+inode on every write), so an existing 0644 file from a pre-#4056 build is
+re-created 0600 on the next commit.
+
+| File | Path | Mode | Writer |
+|------|------|------|--------|
+| Active / candidate / rollback DB | `.configdb/{active,candidate,rollback.N}.json` | 0600 | `db.go writeTreeMarked` |
+| `master.key` | `.configdb/master.key` | 0600 | `crypto.go readOrCreateMasterKey` |
+| Text rollback slots | `<config>.N` (e.g. `xpf.conf.1`) | 0600 | `store_commit.go saveRollbackFiles` |
+| Rescue config | `rescue.conf` | 0600 | `store_persist.go SaveRescueConfig` |
+| Config archives | `<archive-dir>/config-*.conf` | 0600 | `store_persist.go writeArchive` |
+
+The `.configdb` and archive directories are created **0700** (they hold
+only secret-bearing files); the daemon owns them, so read-back is
+unaffected. The v2 audit journal (`.config.journal`) stays 0644 by
+design — it is compact metadata only (timestamp/action/detail), never
+config content or secret values (#1896).
+
+**Follow-up (design, not shipped here):** when master-password is set,
+the text rollback/archive/rescue copies still hold **cleartext** secrets
+(only the JSON DB body is encrypted). Encrypting or redacting secrets in
+those persisted text copies — with a decrypt-on-restore round-trip —
+needs a design decision (see the #4056 issue comment). This change ships
+the 0600 perms fix only.
+
 ## Entry points
 
 - `Store` — high-level API. Public methods include `ShowCandidate`,
