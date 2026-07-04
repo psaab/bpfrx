@@ -1,3 +1,39 @@
+## 2026-07-03 — #3912: cluster-sync bulk-ack TOCTOU — pendingBulkAckEpoch stored AFTER BulkEnd write → early ack latches a phantom pending epoch that blocks manual failover
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-025 (MEDIUM, HA — permanently blocks manual
+    failover). In `pkg/cluster/sync_bulk.go`, `BulkSync` (and the empty-marker
+    `sendBulkMarkers` path) stored `pendingBulkAckEpoch` AFTER writing the
+    `BulkEnd` marker to the wire. `BulkEnd` solicits the peer's `BulkAck`,
+    which is processed on the read goroutine (`handleMessage`,
+    `syncMsgBulkAck`) independently of the send goroutine. A peer that acked
+    faster than the send goroutine could record the pending epoch had its ack
+    processed against `pendingBulkAckEpoch == 0` — the ack handler's
+    `pending != 0` guard dropped it — and only then did the send goroutine
+    latch the epoch → a phantom pending epoch that no future ack ever clears →
+    the failover readiness gate waits on an outbound bulk ack that already
+    arrived → `request chassis cluster failover` blocked indefinitely.
+  - **Fix**: Record `pendingBulkAckEpoch`/`pendingBulkAckSince` BEFORE the
+    `BulkEnd` write (record-then-send, mirroring the #2170/#2198 gen-guard
+    discipline). An early ack can now only observe the pending epoch already
+    in place, so it clears it regardless of arrival timing. On a `BulkEnd`
+    write failure the epoch resets to 0 (handleDisconnect also clears), so a
+    failed send cannot leave the pending state falsely armed. Both the full
+    `BulkSync` path and the `sendBulkMarkers` empty-marker path corrected.
+  - **Test**: `TestBulkSyncPendingAckRecordedBeforeBulkEnd` — a mock conn
+    (`ackOnBulkEndConn`) synchronously feeds `BulkAck` back through
+    `handleMessage` the instant `BulkEnd` is written (the TOCTOU); asserts no
+    phantom pending epoch is latched. RED-on-revert verified (store-after-write
+    latches epoch 1 → failover would block). `TestBulkSyncPendingAckClearedByLaterAck`
+    confirms the normal (ack-after-store) barrier flow still clears.
+    Full `go test ./pkg/cluster/...` green (incl. -race on the bulk tests).
+  - **File(s)**: `pkg/cluster/sync_bulk.go`, `pkg/cluster/sync_test.go`,
+    `docs/session-sync-architecture.md`, `docs/sync-protocol.md`, `_Log.md`
+  - **Validation**: `go build ./...`, `gofmt`, `go vet ./pkg/cluster/...`,
+    `go test ./pkg/cluster/...`. test-failover WARRANTED (HA manual-failover
+    path) — batched with the other HA-Medium fixes under the
+    force-node0-primary gate.
+
 ## 2026-07-03 — #3902: flowless screen path bypassed the source-independent screens (LAND, ip-source-route, ICMP/UDP flood) — fail-open on non-query ICMP + non-first fragments
 
 - **Timestamp**: 2026-07-03

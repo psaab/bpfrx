@@ -1629,6 +1629,102 @@ func TestBulkSyncSkipsReverseEntries(t *testing.T) {
 	}
 }
 
+// ackOnBulkEndConn simulates a peer that acks a BulkEnd the instant it lands
+// on the wire — the #3912 TOCTOU. When BulkSync writes the BulkEnd marker,
+// this conn synchronously feeds the matching BulkAck back through
+// handleMessage (the read-goroutine path), mimicking a peer that acks faster
+// than the send goroutine can record the pending epoch. If pendingBulkAckEpoch
+// is stored AFTER the write, the ack observes pending==0, drops it, and a
+// phantom pending epoch is latched that never clears.
+type ackOnBulkEndConn struct {
+	net.Conn
+	ss    *SessionSync
+	acked bool
+}
+
+func (c *ackOnBulkEndConn) SetDeadline(time.Time) error      { return nil }
+func (c *ackOnBulkEndConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *ackOnBulkEndConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *ackOnBulkEndConn) Write(b []byte) (int, error) {
+	if len(b) >= syncHeaderSize && string(b[0:4]) == "BPSY" && b[4] == syncMsgBulkEnd {
+		// Peer receives BulkEnd and immediately acks. The BulkEnd payload is
+		// the 8-byte epoch — reuse it directly as the BulkAck payload.
+		c.ss.handleMessage(c, syncMsgBulkAck, b[syncHeaderSize:])
+		c.acked = true
+	}
+	return len(b), nil
+}
+
+// TestBulkSyncPendingAckRecordedBeforeBulkEnd is the #3912 regression guard.
+// It drives a bulk sync whose peer acks the BulkEnd synchronously as it is
+// written. With record-then-send the pending epoch is already stored, so the
+// early ack clears it — no phantom latch. Reverting the fix (store after the
+// write) re-latches the phantom epoch and this test goes RED.
+func TestBulkSyncPendingAckRecordedBeforeBulkEnd(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, DstIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				State: dataplane.SessStateEstablished, IsReverse: 0, IngressZone: 1,
+			},
+		},
+	}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+
+	conn := &ackOnBulkEndConn{ss: ss}
+	ss.mu.Lock()
+	ss.conn0 = conn
+	ss.mu.Unlock()
+
+	if err := ss.BulkSync(); err != nil {
+		t.Fatalf("BulkSync failed: %v", err)
+	}
+	if !conn.acked {
+		t.Fatal("test setup broken: BulkEnd was never written, no ack delivered")
+	}
+	// The immediate ack must have cleared the pending epoch. A latched phantom
+	// pending epoch here would permanently block manual failover (#3912).
+	if epoch, _, ok := ss.PendingBulkAck(); ok {
+		t.Fatalf("phantom pending bulk-ack epoch latched (%d) — manual failover would block (#3912 regression)", epoch)
+	}
+}
+
+// TestBulkSyncPendingAckClearedByLaterAck confirms the normal barrier flow is
+// intact: a pending epoch is armed by BulkSync and cleared by an ack that
+// arrives after the store (the common case, unaffected by the ordering fix).
+func TestBulkSyncPendingAckClearedByLaterAck(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, DstIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				State: dataplane.SessStateEstablished, IsReverse: 0, IngressZone: 1,
+			},
+		},
+	}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+
+	cw := &countingWriter{}
+	ss.mu.Lock()
+	ss.conn0 = cw
+	ss.mu.Unlock()
+
+	if err := ss.BulkSync(); err != nil {
+		t.Fatalf("BulkSync failed: %v", err)
+	}
+	epoch, _, ok := ss.PendingBulkAck()
+	if !ok {
+		t.Fatal("expected a pending bulk-ack epoch after BulkSync with no ack yet")
+	}
+	// Peer acks the epoch afterward — this must clear the pending state.
+	var payload [8]byte
+	binary.LittleEndian.PutUint64(payload[:], epoch)
+	ss.handleMessage(cw, syncMsgBulkAck, payload[:])
+	if latched, _, stillOK := ss.PendingBulkAck(); stillOK {
+		t.Fatalf("pending bulk-ack epoch %d should be cleared after peer ack", latched)
+	}
+}
+
 func TestReconcileStaleSessions(t *testing.T) {
 	// Simulate: we're secondary for zone 2 (RG 2 owned by peer).
 	// We have 3 sessions in zone 2: sessionA, sessionB, sessionC.

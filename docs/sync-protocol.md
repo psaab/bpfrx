@@ -315,11 +315,19 @@ Triggered once when the `connectLoop` successfully dials the peer:
 ```
 connectLoop() establishes TCP connection
   → BulkSync()
-    → writeMsg(BulkStart, nil)           // signal start
+    → writeMsg(BulkStart, epoch)         // signal start
     → IterateSessions(all v4)            // send every v4 session as SessionV4
     → IterateSessionsV6(all v6)          // send every v6 session as SessionV6
-    → writeMsg(BulkEnd, nil)             // signal complete
+    → record pendingBulkAckEpoch=epoch   // record-then-send (#3912): BEFORE BulkEnd
+    → writeMsg(BulkEnd, epoch)           // solicit peer BulkAck(epoch)
 ```
+
+The pending-ack epoch is recorded **before** the `BulkEnd` write, not after.
+`BulkEnd` solicits the peer's `BulkAck`, which is processed on the read
+goroutine; recording after the write races a fast peer whose ack would then
+latch a phantom pending epoch that never clears and permanently blocks manual
+failover (#3912). See `docs/session-sync-architecture.md` "Record-then-send
+ordering".
 
 Both forward and reverse entries are sent during bulk sync. The receiver calls `SetSessionV4/V6` to install each session directly into the BPF map.
 
