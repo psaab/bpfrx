@@ -348,6 +348,86 @@ func maybeRestoreDefault(iface string, queues int, execer rssExecutor) {
 		"reason", "workers>=queues with stale constrained table")
 }
 
+// indirectionRow is one parsed data row of the `ethtool -x` RSS
+// indirection table: the printed row index (the value before the colon,
+// e.g. 0, 8, 16 for an 8-column dump) and the queue indices that follow
+// it, in column order.
+type indirectionRow struct {
+	idx     int
+	entries []int
+}
+
+// parseIndirectionTable extracts the indirection-table data rows from
+// `ethtool -x <iface>` output. Each row carries its printed index and the
+// queue entries in column order.
+//
+// The scan is bounded to the indirection-table section and STOPS at the
+// "RSS hash key:" (or "RSS hash function:") header. This bound is
+// load-bearing (#3954): the hash-key line that follows the table is
+// colon-separated hex, e.g.
+//
+//	RSS hash key:
+//	09:5c:8e:3a:7f:...
+//
+// When the first key byte is a decimal-looking hex value — 0x00-0x09,
+// 0x10-0x19, ..., 0x90-0x99, i.e. both nibbles in 0-9 (100 of 256 byte
+// values, ~39% of randomly generated keys) — strconv.Atoi("09") succeeds,
+// so without this bound the key line is misread as indirection row "9"
+// whose remaining hex bytes ("5c", "8e", ...) then fail to parse. That
+// produced a spurious "current != desired" verdict on ~39% of boots and an
+// unnecessary `ethtool -X` rewrite mid-traffic, re-steering in-flight flows
+// to different RX queues (and, on the AF_XDP path, forcing a queue rebind).
+//
+// A second, order-independent guard rejects any candidate row whose
+// post-colon remainder still contains a colon: real indirection rows carry
+// only whitespace-separated integers after the row index, whereas the
+// hash-key line is ":"-separated hex. This defends the misparse even if a
+// future ethtool reorders its output sections.
+//
+// ok is false when an in-section row carried a non-integer queue token (a
+// genuinely unparseable table); callers treat that as "cannot confirm the
+// desired layout" and fall through to a rewrite.
+func parseIndirectionTable(output []byte) (rows []indirectionRow, ok bool) {
+	for _, line := range bytes.Split(output, []byte{'\n'}) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		// Everything from the "RSS hash key" / "RSS hash function" header
+		// onward is colon-separated hex or key:value pairs, not table
+		// rows — stop here so the hash-key line is never parsed (#3954).
+		if len(trimmed) >= 8 && bytes.EqualFold(trimmed[:8], []byte("RSS hash")) {
+			break
+		}
+		colon := bytes.IndexByte(trimmed, ':')
+		if colon <= 0 {
+			continue
+		}
+		rowIdx, err := strconv.Atoi(string(trimmed[:colon]))
+		if err != nil {
+			continue
+		}
+		remainder := trimmed[colon+1:]
+		// A real indirection row has only whitespace-separated integers
+		// after the colon; the hash-key line has further colons. Reject
+		// any remainder that still contains a colon (#3954, belt-and-braces
+		// so the fix holds regardless of ethtool section ordering).
+		if bytes.IndexByte(remainder, ':') >= 0 {
+			continue
+		}
+		row := indirectionRow{idx: rowIdx}
+		for _, tok := range bytes.Fields(remainder) {
+			q, err := strconv.Atoi(string(tok))
+			if err != nil {
+				return rows, false
+			}
+			row.entries = append(row.entries, q)
+		}
+		rows = append(rows, row)
+	}
+	return rows, true
+}
+
 // indirectionTableIsDefault reports true iff the live `ethtool -x`
 // output describes a round-robin indirection table where
 // entry[i] == i mod queueCount. This is the exact shape mlx5
@@ -366,26 +446,14 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
 	if queueCount <= 0 {
 		return false
 	}
+	rows, ok := parseIndirectionTable(output)
+	if !ok {
+		return false
+	}
 	sawAnyEntry := false
-	for _, line := range bytes.Split(output, []byte{'\n'}) {
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			continue
-		}
-		colon := bytes.IndexByte(trimmed, ':')
-		if colon <= 0 {
-			continue
-		}
-		rowIdx, err := strconv.Atoi(string(trimmed[:colon]))
-		if err != nil {
-			continue
-		}
-		for j, tok := range bytes.Fields(trimmed[colon+1:]) {
-			q, err := strconv.Atoi(string(tok))
-			if err != nil {
-				return false
-			}
-			expected := (rowIdx + j) % queueCount
+	for _, row := range rows {
+		for j, q := range row.entries {
+			expected := (row.idx + j) % queueCount
 			if q != expected {
 				return false
 			}
@@ -439,7 +507,9 @@ func computeWeightVector(workers, queues int) ([]int, string) {
 //
 // i.e. no queue index >= activeCount appears. We conservatively treat any
 // appearance of a queue >= activeCount as a mismatch so the reapply goes
-// through.
+// through. Parsing is delegated to parseIndirectionTable, which bounds the
+// scan to the indirection-table section so the trailing "RSS hash key:"
+// line is never misread as a table row (#3954).
 func indirectionTableMatches(output []byte, weights []int) bool {
 	if len(weights) == 0 {
 		return false
@@ -454,34 +524,21 @@ func indirectionTableMatches(output []byte, weights []int) bool {
 		return false
 	}
 
-	// Lines of interest start with whitespace + digits + ':', e.g.
-	// "    0:      0     1     2     3     0     1".
-	sawAnyRow := false
-	for _, line := range bytes.Split(output, []byte{'\n'}) {
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			continue
-		}
-		// Only parse lines of the form "<index>: <qn> <qn> ..."
-		colon := bytes.IndexByte(trimmed, ':')
-		if colon <= 0 {
-			continue
-		}
-		if _, err := strconv.Atoi(string(trimmed[:colon])); err != nil {
-			continue
-		}
-		sawAnyRow = true
-		for _, tok := range bytes.Fields(trimmed[colon+1:]) {
-			q, err := strconv.Atoi(string(tok))
-			if err != nil {
-				return false
-			}
+	// Parse only the indirection-table rows (parseIndirectionTable stops
+	// at the "RSS hash key:" section so a decimal-looking key byte cannot
+	// be misread as a table row — #3954).
+	rows, ok := parseIndirectionTable(output)
+	if !ok {
+		return false
+	}
+	for _, row := range rows {
+		for _, q := range row.entries {
 			if q < 0 || q >= active {
 				return false
 			}
 		}
 	}
-	return sawAnyRow
+	return len(rows) > 0
 }
 
 // isExecNotFound returns true if err indicates the ethtool binary is

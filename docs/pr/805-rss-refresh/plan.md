@@ -92,6 +92,43 @@ once" (Codex MED #3): a custom table that hits every queue once
 in non-round-robin order would fail this check, so the daemon
 would correctly reset it to true round-robin on the next apply.
 
+### 4.1 Row-scan must stop at the "RSS hash key:" section (#3954)
+
+`ethtool -x` prints the indirection table first, then an
+`RSS hash key:` section whose bytes render as colon-separated hex,
+e.g.:
+
+```
+RSS hash key:
+09:5c:8e:3a:7f:...
+```
+
+The idempotence probe (`indirectionTableMatches` /
+`indirectionTableIsDefault`) originally scanned every colon-bearing
+line for a numeric prefix. When the first key byte was a
+decimal-looking hex value — both nibbles in 0-9: `00-09`, `10-19`,
+..., `90-99` = 100 of 256 values, ~39% of randomly generated keys —
+`strconv.Atoi("09")` succeeded, so the key line was misread as
+indirection row "9" whose remaining hex bytes (`5c`, `8e`, ...)
+then failed to parse. That returned a false "current != desired"
+verdict and issued a **spurious `ethtool -X` rewrite mid-traffic**
+on ~39% of boots/reconciles, re-steering in-flight flows to
+different RX queues (and forcing an AF_XDP queue rebind).
+
+Fix (`parseIndirectionTable`, `pkg/daemon/rss_indirection.go`): a
+single shared parser bounds the row scan to the indirection-table
+section — it stops at the first line whose first eight bytes fold
+to `RSS hash` (the key / hash-function headers). A second,
+order-independent guard rejects any candidate row whose post-colon
+remainder still contains a colon (real rows carry only
+whitespace-separated integers; the key line is `:`-separated hex).
+Both `indirectionTableMatches` and `indirectionTableIsDefault`
+consume the parser's rows, so an already-correct RSS config now
+compares EQUAL and the probe skips the rewrite. Pinned by a golden
+fixture (captured-shape 128-entry table + 40-byte Toeplitz key
+beginning `09:`) with a RED-on-revert test asserting the `-X` call
+count.
+
 ## 5. Skip-reason discrimination (Codex R1 MED #5 fix)
 
 Don't parse the human string from `computeWeightVector`. The

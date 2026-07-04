@@ -25,6 +25,43 @@
     `go build ./...` green, gofmt/vet clean.
   - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/renew_test.go, pkg/dhcp/README.md
 
+## 2026-07-03 — #3954: RSS idempotence probe misparsed `ethtool -x` when the hash key's first byte was decimal-looking → spurious `ethtool -X` rewrite mid-traffic (~39% of boots)
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-056 (MEDIUM, robustness). The D3 RSS
+    idempotence probe (`indirectionTableMatches` /
+    `indirectionTableIsDefault` in `pkg/daemon/rss_indirection.go`) parses
+    `ethtool -x <iface>` to decide skip-vs-rewrite. `ethtool -x` prints the
+    indirection table first, then an `RSS hash key:` section whose bytes
+    render as colon-separated hex (e.g. `09:5c:8e:...`). The row scanner
+    treated any colon-bearing line with a numeric prefix as a table row.
+    When the first key byte was a decimal-looking hex value (both nibbles
+    0-9: `00-09`, `10-19`, ..., `90-99` = 100/256 ≈ 39% of random keys),
+    `strconv.Atoi("09")` succeeded, so the key line was misread as row "9"
+    whose remaining hex bytes then failed to parse → false "current !=
+    desired" verdict → a spurious `ethtool -X` rewrite on ~39% of
+    boots/reconciles, re-steering in-flight flows to other RX queues (and
+    forcing an AF_XDP queue rebind).
+  - **Fix**: added a single shared `parseIndirectionTable` helper that
+    bounds the row scan to the indirection-table section — it breaks at the
+    first line whose first 8 bytes fold to `RSS hash` (the key /
+    hash-function headers) and, as an order-independent belt-and-braces
+    guard, rejects any candidate row whose post-colon remainder still
+    contains a colon (real rows carry only whitespace-separated integers;
+    the key line is `:`-separated hex). Both idempotence functions now
+    consume the parser's rows, so an already-correct RSS config compares
+    EQUAL and the probe skips the rewrite. WHAT RSS config is desired is
+    unchanged — only the parse/compare is corrected.
+  - **Validation**: added golden fixtures (captured-shape 128-entry table +
+    40-byte Toeplitz key beginning `09:`, plus a round-robin-default variant)
+    and 5 tests, including a RED-on-revert end-to-end test asserting the
+    `ethtool -X` call count. Temporarily neutered the two guards to confirm
+    RED — the neutered parser reproduced the exact spurious
+    `-X ge-0-0-2 weight 1 1 1 1 0 0` rewrite; restored → green.
+    `go test ./pkg/daemon/` green (3.9s), `go build ./...`, gofmt, vet clean.
+  - **File(s)**: `pkg/daemon/rss_indirection.go`,
+    `pkg/daemon/rss_indirection_test.go`, `docs/pr/805-rss-refresh/plan.md`,
+    `_Log.md`
 ## 2026-07-03 — #3952: swanctl PSK secrets carried no `id` selectors → with 2+ PSK VPNs the wrong PSK matched a peer
 
 - **Timestamp**: 2026-07-03
