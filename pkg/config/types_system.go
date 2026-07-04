@@ -544,7 +544,15 @@ const (
 	PermClear                               // clear commands
 	PermControl                             // restart/request commands
 	PermConfig                              // configure mode
-	PermAll                                 // super-user: everything
+	// PermMaint gates the destructive maintenance verbs — `request system
+	// {reboot,halt,power-off,zeroize}` and `request chassis cluster failover`
+	// — that on Junos require the `maintenance` permission the predefined
+	// `operator` class LACKS (#4108 F21). It is intentionally NOT held by any
+	// non-super class; super-user reaches these verbs through PermAll (which
+	// matches every required permission), so PermMaint need not appear in
+	// super-user's list to allow them.
+	PermMaint
+	PermAll // super-user: everything (subsumes every permission incl. PermMaint)
 )
 
 // LoginClassPermissions maps class names to their allowed permissions.
@@ -553,6 +561,11 @@ const (
 // classes xpf accepts; ValidLoginClasses (and the schema `class` enum, #2008
 // H6) is derived from it so the commit-time validator and the runtime RBAC
 // table can never drift apart.
+//
+// PermMaint (destructive maintenance) is deliberately absent from every
+// non-super class: only `super-user` (via PermAll) may reboot/halt/power-off/
+// zeroize the box or trigger a chassis-cluster failover, matching Junos where
+// the predefined `operator` class has no `maintenance` permission (#4108 F21).
 var LoginClassPermissions = map[string][]LoginClassPermission{
 	"super-user": {PermAll},
 	"operator":   {PermView, PermClear, PermControl},

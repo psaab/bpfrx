@@ -113,6 +113,18 @@ func requiredPermission(parts []string) config.LoginClassPermission {
 		return config.PermControl
 	}
 
+	// `request system {reboot,halt,power-off,zeroize}` and `request chassis
+	// cluster failover` are DESTRUCTIVE maintenance verbs. On Junos the
+	// predefined `operator` class lacks the `maintenance` permission and so
+	// cannot reboot/zeroize; xpf mirrors that by gating them at the
+	// super-user-only PermMaint level instead of the plain PermControl the
+	// rest of the `request` family (request session, request security, etc.)
+	// keeps, so `operator` retains benign request verbs but not the ones that
+	// take the box down or wipe it (#4108 F21).
+	if action == "request" && requestSubcommandIsMaintenance(parts[1:]) {
+		return config.PermMaint
+	}
+
 	switch action {
 	case "show", "ping", "traceroute", "monitor":
 		return config.PermView
@@ -125,6 +137,72 @@ func requiredPermission(parts []string) config.LoginClassPermission {
 	default:
 		return config.PermAll
 	}
+}
+
+// requestSubcommandIsMaintenance reports whether the `request` arguments
+// resolve to a destructive maintenance verb: `request system
+// {reboot,halt,power-off,zeroize}` or `request chassis cluster failover ...`.
+// It applies the same prefix resolution the CLI dispatcher uses (resolveCommand
+// over the cmdtree children), so an abbreviated `request system zero` or
+// `request sys reboot` is gated identically to the fully-spelled form and
+// cannot bypass the gate. Resolution errs toward the dispatcher: an
+// unresolvable/ambiguous token that would never actually run returns false
+// (plain control), while every token the dispatcher would execute as a
+// destructive verb resolves here and elevates to PermMaint (fail-closed).
+func requestSubcommandIsMaintenance(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	reqNode, ok := operationalTree["request"]
+	if !ok || reqNode == nil {
+		return false
+	}
+	target, err := resolveCommand(args[0], keysFromTree(reqNode.Children))
+	if err != nil {
+		return false
+	}
+	switch target {
+	case "system":
+		if len(args) < 2 {
+			return false
+		}
+		sysNode := reqNode.Children["system"]
+		if sysNode == nil {
+			return false
+		}
+		verb, err := resolveCommand(args[1], keysFromTree(sysNode.Children))
+		if err != nil {
+			return false
+		}
+		switch verb {
+		case "reboot", "halt", "power-off", "zeroize":
+			return true
+		}
+		return false
+	case "chassis":
+		// request chassis cluster failover ...
+		if len(args) < 3 {
+			return false
+		}
+		chNode := reqNode.Children["chassis"]
+		if chNode == nil {
+			return false
+		}
+		clusterTok, err := resolveCommand(args[1], keysFromTree(chNode.Children))
+		if err != nil || clusterTok != "cluster" {
+			return false
+		}
+		clNode := chNode.Children["cluster"]
+		if clNode == nil {
+			return false
+		}
+		failoverTok, err := resolveCommand(args[2], keysFromTree(clNode.Children))
+		if err != nil {
+			return false
+		}
+		return failoverTok == "failover"
+	}
+	return false
 }
 
 // monitorSubcommandIsTraffic reports whether the monitor arguments resolve to
