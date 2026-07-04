@@ -1,3 +1,49 @@
+## 2026-07-03 — #3918: flow-cache neighbor_mac_epoch stamped AFTER neighbor resolve → resolve→stamp TOCTOU re-opens the #3048 stale-MAC blackhole on VRRP gateway failover
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-089 (MEDIUM, HA — stale-MAC blackhole on
+    failover). `poll_descriptor/mod.rs` stamped the flow-cache entry's
+    `neighbor_mac_epoch` by reading the LIVE
+    `dynamic_neighbors.mac_change_epoch()` at insert time — AFTER the neighbor
+    MAC backing the decision was resolved. A VRRP gateway failover (a kernel
+    ARP/NDP update replacing the gateway MAC) landing between the resolve
+    (which read the OLD MAC) and the stamp captured the NEW epoch onto the
+    cached OLD `dst_mac`: the entry's epoch then EQUALS the live epoch, so
+    `neighbor_mac_epoch_stale` returns false and the stale MAC is served on
+    every fast-path hit → blackhole until the entry ages out (re-opening the
+    #3048 class the epoch mechanism was added to prevent).
+  - **Fix**: Read-before-resolve. Capture the epoch into
+    `neighbor_mac_epoch_at_resolve` at the top of per-descriptor processing
+    (before `resolve_flow_session_decision` / session-miss
+    `finalize_new_flow_ha_resolution` consult the neighbor table) and thread it
+    into `FlowCacheEntry::from_forward_decision` as a `neighbor_mac_epoch`
+    VALUE parameter. The constructor has no `dynamic_neighbors` handle, so it
+    structurally cannot re-read the live epoch — the only source is the
+    caller's pre-resolve snapshot. The separate post-construction stamp is
+    removed. A subsequent MAC-change bump now makes the stamped (older) epoch
+    != current on the next hit → evict + re-resolve to the new MAC. Relaxed
+    load suffices (snapshot + stamp on one worker thread, program-ordered
+    before the resolve; the neighbor shard Mutex synchronizes the MAC bytes;
+    the epoch is a monotonic invalidation signal). Mirrors #2170/#3912
+    record-before-use.
+  - **Test**: `flow_cache_stamps_pre_resolve_epoch_survives_interleaved_gateway_failover`
+    (flow_cache_tests.rs) models the interleaved failover with real primitives
+    (ShardedNeighborMap genuine `mac_change_epoch` bump + real
+    `from_forward_decision` + `neighbor_mac_epoch_stale`): stamps a pre-resolve
+    snapshot, asserts the entry is stale after failover, and asserts a
+    POST-resolve read looks fresh (the blackhole). RED-on-revert VERIFIED:
+    reverting the constructor to ignore the pre-resolve param fails the
+    blackhole assertion. `flow_cache_normal_resolve_caches_and_serves_neighbor_mac`
+    is the no-interleave companion (no spurious eviction). FULL
+    `cargo test --release` green (3456 lib + 71 others, 0 failed).
+    `go build ./...` green.
+  - **File(s)**: `userspace-dp/src/afxdp/flow_cache.rs`,
+    `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+    `userspace-dp/src/afxdp/flow_cache_tests.rs`,
+    `docs/flow-cache-simplification.md`, `_Log.md`
+  - **Validation flag**: test-failover WARRANTED (HA VRRP gateway failover →
+    stale-MAC scenario) — parent batch-validates on the loss userspace cluster.
+
 ## 2026-07-03 — #3912: cluster-sync bulk-ack TOCTOU — pendingBulkAckEpoch stored AFTER BulkEnd write → early ack latches a phantom pending epoch that blocks manual failover
 
 - **Timestamp**: 2026-07-03
