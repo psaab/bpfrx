@@ -386,6 +386,21 @@ fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
 /// flips. `then discard` (the sibling test above) is unaffected.
 #[test]
 fn build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608() {
+    // #2472/#2955: the reject reply is gated by the PROCESS-GLOBAL Reject GCRA
+    // token bucket, whose TAT advances monotonically across the whole test
+    // binary. Hold the shared global-bucket test lock for the entire
+    // reset→drive→assert window and reset the Reject bucket to full, exactly as
+    // the reject_reply.rs success-path siblings do (e.g.
+    // `reject_tcp_with_egress_enqueues_rst`). Without this a parallel test can
+    // drain the bucket out from under us (this assertion would flake to
+    // `filter_reject_sent == 0`) AND the resulting rate-limit denial would bump
+    // the global rate_limited_count and break a concurrent lock-test's
+    // before==after invariant.
+    let _bucket_guard = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
     let lookup = WorkerBindingLookup::default();
     let ingress_ident = BindingIdentity {
         slot: 7,
