@@ -183,13 +183,18 @@ pub(crate) struct WgPeerConfig {
     /// Optional per-peer preshared key (#1434 B2). `WG_ZERO_PSK` (32
     /// zero bytes) when no PSK is configured — semantically identical
     /// to "no PSK" in Noise IKpsk2. SECRET: never logged (the manual
-    /// Debug below redacts it).
-    pub(crate) preshared_key: [u8; 32],
+    /// Debug below redacts it). #4103 F12: wrapped in `Zeroizing` so a
+    /// cloned/dropped config carrier does not leave a plaintext PSK in
+    /// freed heap/stack — matching the runtime copy (`PeerConfig`).
+    pub(crate) preshared_key: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for WgPeerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let psk_state = if self.preshared_key == WG_ZERO_PSK {
+        // Compare by reference (`&[u8; 32]`), not by deref-to-value, so
+        // the PSK is never copied to the stack even transiently (#4103
+        // F12 key hygiene).
+        let psk_state = if &*self.preshared_key == &WG_ZERO_PSK {
             "<unset>"
         } else {
             "<redacted>"
@@ -205,11 +210,28 @@ impl std::fmt::Debug for WgPeerConfig {
 }
 
 /// Per-engine config.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct WgEngineConfig {
-    pub(crate) local_private_key: [u8; 32],
+    /// Local X25519 private key. #4103 F12: `Zeroizing` so a
+    /// cloned/dropped config carrier does not leave a plaintext private
+    /// key in freed heap/stack — matching the runtime copy (the engine's
+    /// own `local_private_key`). SECRET: never logged (the manual Debug
+    /// below redacts it — a derived Debug on `Zeroizing<[u8; 32]>` would
+    /// print the raw key).
+    pub(crate) local_private_key: Zeroizing<[u8; 32]>,
     pub(crate) listen_port: u16,
     pub(crate) peers: Vec<WgPeerConfig>,
+}
+
+impl std::fmt::Debug for WgEngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the private key; surface only non-secret fields.
+        f.debug_struct("WgEngineConfig")
+            .field("local_private_key", &"<redacted>")
+            .field("listen_port", &self.listen_port)
+            .field("peers", &self.peers)
+            .finish()
+    }
 }
 
 /// Stack scratch capacity for the padded plaintext on the encap
@@ -442,9 +464,11 @@ impl std::fmt::Debug for WgEngine {
 impl WgEngine {
     pub(crate) fn new(config: WgEngineConfig) -> Self {
         let local_public_key =
-            MontgomeryPoint::mul_base_clamped(config.local_private_key).to_bytes();
+            MontgomeryPoint::mul_base_clamped(*config.local_private_key).to_bytes();
         let engine = Self {
-            local_private_key: Zeroizing::new(config.local_private_key),
+            // Move the Zeroizing carrier straight into the engine (no
+            // intermediate plaintext copy). #4103 F12.
+            local_private_key: config.local_private_key,
             local_public_key,
             tai64n_clock: Tai64nClock::new(),
             pending: RwLock::new(FxHashMap::default()),
@@ -615,6 +639,52 @@ impl WgEngine {
         self.tai64n_clock.high_water()
     }
 
+    /// #4103: snapshot every configured peer's responder anti-replay
+    /// high-water mark (`greatest_tai64n`), keyed by pubkey, so a fresh
+    /// engine built on an identity-changing config commit can carry each
+    /// SURVIVING peer's mark forward. This is the per-peer INCOMING
+    /// mirror of `tai64n_high_water` (which snapshots the single
+    /// engine-wide OUTGOING initiator clock). Without it, any WG config
+    /// change (add allowed-ip, rotate a PSK, add/remove a peer) rebuilds
+    /// the engine via `WgEngine::new` — starting from an empty peer
+    /// table, so every peer gets a fresh `Peer::new` with
+    /// `greatest_tai64n = [0; 12]` — silently disarming the #4092
+    /// responder anti-replay for every peer. Slow path / build-time only.
+    pub(crate) fn greatest_tai64n_by_pubkey(
+        &self,
+    ) -> Vec<([u8; WG_KEY_LEN], [u8; super::tai64n::TAI64N_LEN])> {
+        self.load_table()
+            .peers
+            .iter()
+            .map(|e| (e.peer.pubkey, e.peer.greatest_tai64n()))
+            .collect()
+    }
+
+    /// #4103: seed this engine's per-peer responder anti-replay high-water
+    /// marks from a prior engine's snapshot (see `greatest_tai64n_by_pubkey`)
+    /// across an identity-change rebuild. A pubkey present in BOTH
+    /// `snapshot` and this engine's peer table carries its mark forward
+    /// (only advancing, never regressing — see `Peer::seed_greatest_tai64n`);
+    /// a pubkey NOT in the snapshot (a new or re-keyed peer) keeps the
+    /// fresh `[0; 12]`, because a pubkey change is a different peer
+    /// identity for which a reset is correct (matches the kernel /
+    /// wireguard-go behaviour of retaining per-peer `last_timestamp`
+    /// across a reconfigure while a new peer starts clean). Slow path /
+    /// build-time only.
+    pub(crate) fn seed_greatest_tai64n(
+        &self,
+        snapshot: &[([u8; WG_KEY_LEN], [u8; super::tai64n::TAI64N_LEN])],
+    ) {
+        let table = self.load_table();
+        for (pubkey, hw) in snapshot {
+            if let Some(&idx) = table.peer_index_by_pubkey.get(pubkey) {
+                if let Some(entry) = table.peers.get(idx as usize) {
+                    entry.peer.seed_greatest_tai64n(*hw);
+                }
+            }
+        }
+    }
+
     /// Reconcile the engine's peer table against a new config
     /// snapshot. Slow path only.
     ///
@@ -666,7 +736,7 @@ impl WgEngine {
             let config = Arc::new(PeerConfig::new(
                 cfg.endpoint,
                 cfg.persistent_keepalive,
-                cfg.preshared_key,
+                *cfg.preshared_key,
             ));
             new_peers.push(PeerEntry { peer, config });
             // r7 Codex/Claude nit: duplicate pubkeys in `configs`

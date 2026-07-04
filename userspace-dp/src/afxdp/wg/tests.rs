@@ -48,25 +48,25 @@ fn established_pair(
     let (resp_priv, resp_pub) = keypair();
 
     let init_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: init_allowed_for_resp,
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let resp_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: resp_priv,
+        local_private_key: resp_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: resp_allowed_for_init,
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
 
@@ -247,7 +247,7 @@ fn cryptokey_routing_overlapping_allowed_ips() {
     let (peer_b_priv, peer_b_pub) = keypair();
 
     let init_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![
             WgPeerConfig {
@@ -255,38 +255,38 @@ fn cryptokey_routing_overlapping_allowed_ips() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
         ],
     });
     // Stand up real engines for both peers.
     let resp_a = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_a_priv,
+        local_private_key: peer_a_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let resp_b = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_b_priv,
+        local_private_key: peer_b_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
 
@@ -541,7 +541,7 @@ fn decap_lpm_rejects_spoofed_source_inside_more_specific_peer_prefix() {
     // Initiator engine owns AllowedIPs for both peers: A=/8 (less
     // specific) and B=/24 (more specific, inside A's prefix).
     let init_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![
             WgPeerConfig {
@@ -549,38 +549,38 @@ fn decap_lpm_rejects_spoofed_source_inside_more_specific_peer_prefix() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.1.1.0/24".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             },
         ],
     });
     // Responder engines mirror that view from each peer's side.
     let resp_a = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_a_priv,
+        local_private_key: peer_a_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let _resp_b = WgEngine::new(WgEngineConfig {
-        local_private_key: peer_b_priv,
+        local_private_key: peer_b_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.1.1.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
 
@@ -859,14 +859,14 @@ fn handshake_prologue_is_required_for_authentication() {
 
     // Production initiator: prologue set via our `build_initiator_handshake`.
     let init_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let mut init_hs = init_engine.build_initiator_handshake(&resp_pub).unwrap();
@@ -898,14 +898,14 @@ fn handshake_prologue_is_required_for_authentication() {
     // message. This shows the rejection above is the prologue
     // difference, not some unrelated handshake mismatch.
     let good_resp_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: resp_priv,
+        local_private_key: resp_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let mut init_hs2 = init_engine.build_initiator_handshake(&resp_pub).unwrap();
@@ -937,25 +937,25 @@ fn responder_session_blocks_encap_until_initiator_data_authenticated() {
     let (resp_priv, resp_pub) = keypair();
 
     let init_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let resp_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: resp_priv,
+        local_private_key: resp_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
 
@@ -1059,14 +1059,14 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
     let (init_priv, _init_pub) = keypair();
     let (_peer_priv, peer_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: Some(SocketAddr::from(([192, 0, 2, 1], 51820))),
             persistent_keepalive: 25,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
 
@@ -1089,7 +1089,7 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
         endpoint: Some(SocketAddr::from(([198, 51, 100, 7], 51900))),
         persistent_keepalive: 60,
         allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-        preshared_key: [0u8; 32],
+        preshared_key: [0u8; 32].into(),
     }]);
 
     let table = engine.table_for_test();
@@ -1112,7 +1112,7 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-        preshared_key: [0u8; 32],
+        preshared_key: [0u8; 32].into(),
     }]);
     let table = engine.table_for_test();
     let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
@@ -1152,14 +1152,14 @@ fn old_snapshot_observes_old_config_after_concurrent_reconcile() {
     let (init_priv, _init_pub) = keypair();
     let (_peer_priv, peer_pub) = keypair();
     let engine = Arc::new(WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: peer_pub,
             endpoint: Some(ep_old),
             persistent_keepalive: 25,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: psk_old,
+            preshared_key: psk_old.into(),
         }],
     }));
 
@@ -1188,7 +1188,7 @@ fn old_snapshot_observes_old_config_after_concurrent_reconcile() {
                 endpoint: Some(ep_new),
                 persistent_keepalive: 60,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                preshared_key: psk_new,
+                preshared_key: psk_new.into(),
             }]);
         })
     };
@@ -1568,25 +1568,25 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
     let (resp_priv, resp_pub) = keypair();
 
     let init_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: init_priv,
+        local_private_key: init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let resp_engine = WgEngine::new(WgEngineConfig {
-        local_private_key: resp_priv,
+        local_private_key: resp_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: init_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
 
@@ -1673,25 +1673,25 @@ mod framed_handshake {
         let (resp_priv, resp_pub) = keypair();
         let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let init = WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4.clone(),
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4,
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         (init, resp, init_pub, resp_pub)
@@ -1952,14 +1952,14 @@ mod framed_handshake {
         let (other_priv, _other_pub) = keypair();
         let (_init2_priv, init2_pub) = keypair();
         let other = WgEngine::new(WgEngineConfig {
-            local_private_key: other_priv,
+            local_private_key: other_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init2_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
@@ -1979,27 +1979,27 @@ mod framed_handshake {
         // Responder knows only some OTHER peer, not our initiator.
         let (_known_priv, known_pub) = keypair();
         let resp = WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: known_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         // A stranger initiator that targets the real responder pubkey.
         let (stranger_priv, _stranger_pub) = keypair();
         let stranger = WgEngine::new(WgEngineConfig {
-            local_private_key: stranger_priv,
+            local_private_key: stranger_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let mut msg1 = [0u8; WG_MSG_INIT_LEN];
@@ -2199,7 +2199,7 @@ mod framed_handshake {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }]);
         let mut msg1b = [0u8; WG_MSG_INIT_LEN];
         init.create_initiation(&resp_pub, &mut msg1b).unwrap();
@@ -2278,10 +2278,10 @@ mod framed_handshake {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }];
         let init = StdArc::new(WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: cfg.clone(),
         }));
@@ -2340,25 +2340,25 @@ mod framed_handshake {
         let (resp_priv, resp_pub) = keypair();
         let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let init = StdArc::new(WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4.clone(),
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         }));
         let resp = StdArc::new(WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4,
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         }));
 
@@ -2406,7 +2406,7 @@ mod framed_handshake {
                     endpoint: None,
                     persistent_keepalive: 0,
                     allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                    preshared_key: [0u8; 32],
+                    preshared_key: [0u8; 32].into(),
                 }];
                 let mut flip = false;
                 while !stop.load(AOrd::Relaxed) {
@@ -2460,7 +2460,7 @@ mod framed_handshake {
 fn wg_request_handshake_is_rate_limited_per_interval() {
     use super::engine::WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS;
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: keypair().0,
+        local_private_key: keypair().0.into(),
         listen_port: 51820,
         peers: vec![],
     });
@@ -2483,7 +2483,7 @@ fn wg_request_handshake_is_rate_limited_per_interval() {
 #[test]
 fn wg_take_handshake_request_consumes_a_single_edge() {
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: keypair().0,
+        local_private_key: keypair().0.into(),
         listen_port: 51820,
         peers: vec![],
     });
@@ -2505,14 +2505,14 @@ fn wg_no_session_encap_triggers_single_init_per_interval() {
     let (_init_priv, init_pub) = keypair();
     let (_resp_priv, resp_pub) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
-        local_private_key: _init_priv,
+        local_private_key: _init_priv.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     let _ = init_pub;
@@ -2554,14 +2554,14 @@ fn wg_first_peer_pubkey_and_confirmed_session_helpers() {
     );
     // An engine with a peer but no session reports no confirmed session.
     let no_session = WgEngine::new(WgEngineConfig {
-        local_private_key: keypair().0,
+        local_private_key: keypair().0.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     assert!(!no_session.peer_has_confirmed_session(&resp_pub));
@@ -2575,14 +2575,14 @@ fn wg_tai64n_high_water_seed_round_trips_across_engines() {
     let priv_key = keypair().0;
     let resp_pub = keypair().1;
     let old = WgEngine::new(WgEngineConfig {
-        local_private_key: priv_key,
+        local_private_key: priv_key.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     // Drive an initiation so the clock advances past its initial state.
@@ -2591,14 +2591,14 @@ fn wg_tai64n_high_water_seed_round_trips_across_engines() {
     let hw = old.tai64n_high_water().expect("clock advanced");
 
     let fresh = WgEngine::new(WgEngineConfig {
-        local_private_key: priv_key,
+        local_private_key: priv_key.into(),
         listen_port: 51820,
         peers: vec![WgPeerConfig {
             pubkey: resp_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }],
     });
     fresh.seed_tai64n_high_water(hw);
@@ -2606,6 +2606,87 @@ fn wg_tai64n_high_water_seed_round_trips_across_engines() {
     assert!(
         fresh_hw >= hw,
         "seeded high-water must be >= the prior engine's: {fresh_hw:?} >= {hw:?}"
+    );
+}
+
+#[test]
+fn wg_greatest_tai64n_carry_over_preserves_responder_anti_replay() {
+    // #4103: the #4092 responder anti-replay high-water is per-peer, so
+    // an identity-change engine rebuild must carry each surviving peer's
+    // `greatest_tai64n` forward — keyed by pubkey — or the anti-replay is
+    // silently disarmed. Reverting the engine carry-over API resets the
+    // fresh peer to [0; 12] and the replayed-stamp assertions below go RED
+    // (the replay would be accepted).
+    let priv_key = keypair().0;
+    let resp_pub = keypair().1;
+    let mk = || WgEngineConfig {
+        local_private_key: priv_key.into(),
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+            preshared_key: [0u8; 32].into(),
+        }],
+    };
+    let old = WgEngine::new(mk());
+    // Simulate a valid accepted initiation advancing the high-water.
+    let t_last: [u8; super::tai64n::TAI64N_LEN] =
+        [0x40, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    old.seed_greatest_tai64n(&[(resp_pub, t_last)]);
+    assert_eq!(old.greatest_tai64n_by_pubkey(), vec![(resp_pub, t_last)]);
+
+    // Identity-change rebuild starts from a fresh (all-zero) peer; carry
+    // the prior engine's per-peer high-water forward.
+    let fresh = WgEngine::new(mk());
+    fresh.seed_greatest_tai64n(&old.greatest_tai64n_by_pubkey());
+    assert_eq!(
+        fresh.greatest_tai64n_by_pubkey(),
+        vec![(resp_pub, t_last)],
+        "carried-over high-water must equal the prior engine's"
+    );
+
+    // The carried value gates the anti-replay: a stamp `<= t_last` is a
+    // replay (reject); a strictly greater stamp is fresh (accept).
+    let table = fresh.load_table();
+    let idx = table.peer_index_by_pubkey[&resp_pub];
+    let peer = &table.peers[idx as usize].peer;
+    assert!(
+        !peer.check_and_update_tai64n(&t_last),
+        "equal-stamp replay must be rejected after carry-over"
+    );
+    let older = [0x40u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert!(
+        !peer.check_and_update_tai64n(&older),
+        "older-stamp replay must be rejected after carry-over"
+    );
+    let newer: [u8; super::tai64n::TAI64N_LEN] =
+        [0x40, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x89];
+    assert!(
+        peer.check_and_update_tai64n(&newer),
+        "strictly newer stamp must be accepted"
+    );
+
+    // A pubkey NOT in the snapshot (a re-keyed / new peer) correctly
+    // starts fresh at [0; 12] — seeding is a no-op for it.
+    let other_pub = keypair().1;
+    let other = WgEngine::new(WgEngineConfig {
+        local_private_key: priv_key.into(),
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: other_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+            preshared_key: [0u8; 32].into(),
+        }],
+    });
+    other.seed_greatest_tai64n(&old.greatest_tai64n_by_pubkey());
+    assert_eq!(
+        other.greatest_tai64n_by_pubkey(),
+        vec![(other_pub, [0u8; super::tai64n::TAI64N_LEN])],
+        "a new/changed pubkey must NOT inherit another peer's high-water"
     );
 }
 
@@ -2619,7 +2700,7 @@ fn wg_request_handshake_single_edge_under_concurrent_callers() {
     use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let engine = StdArc::new(WgEngine::new(WgEngineConfig {
-        local_private_key: keypair().0,
+        local_private_key: keypair().0.into(),
         listen_port: 51820,
         peers: vec![],
     }));
@@ -2766,14 +2847,14 @@ mod telemetry_counters {
         let (other_priv, _) = keypair();
         let (_, init2_pub) = keypair();
         let other = WgEngine::new(WgEngineConfig {
-            local_private_key: other_priv,
+            local_private_key: other_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init2_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let mut msg2 = [0u8; crate::afxdp::wg::WG_MSG_RESPONSE_LEN];
@@ -2960,7 +3041,7 @@ mod telemetry_counters {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-            preshared_key: [0u8; 32],
+            preshared_key: [0u8; 32].into(),
         }]);
         assert_eq!(
             init.counters().hs_initiations_created.load(Ordering::Relaxed),
@@ -2999,25 +3080,25 @@ mod telemetry_counters {
         let (resp_priv, resp_pub) = keypair();
         let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let init = WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4.clone(),
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4,
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         (init, resp, init_pub, resp_pub)
@@ -3477,25 +3558,25 @@ mod s5_timer_tests {
         let (init_priv, init_pub) = super::keypair();
         let (resp_priv, resp_pub) = super::keypair();
         let init = WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let mut msg1 = [0u8; 1024];
@@ -3534,25 +3615,25 @@ mod s5_timer_tests {
         let (init_priv, init_pub) = super::keypair();
         let (resp_priv, resp_pub) = super::keypair();
         let init = WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         init.set_mock_now_ns(7_000 * SEC);
@@ -3621,25 +3702,25 @@ mod tai64n_replay_tests {
         let (init_priv, init_pub) = keypair();
         let (resp_priv, resp_pub) = keypair();
         let init = WgEngine::new(WgEngineConfig {
-            local_private_key: init_priv,
+            local_private_key: init_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: resp_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
-            local_private_key: resp_priv,
+            local_private_key: resp_priv.into(),
             listen_port: 51820,
             peers: vec![WgPeerConfig {
                 pubkey: init_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![],
-                preshared_key: [0u8; 32],
+                preshared_key: [0u8; 32].into(),
             }],
         });
         (init, resp, init_pub, resp_pub)

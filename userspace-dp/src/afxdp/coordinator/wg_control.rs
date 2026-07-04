@@ -1706,14 +1706,14 @@ mod tests {
         use std::os::fd::FromRawFd;
         let engine = std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
             crate::afxdp::wg::WgEngineConfig {
-                local_private_key: [7u8; 32],
+                local_private_key: [7u8; 32].into(),
                 listen_port: 0,
                 peers: vec![crate::afxdp::wg::WgPeerConfig {
                     pubkey: [9u8; 32],
                     endpoint: None, // responder-only: no bring-up sends
                     persistent_keepalive: 0,
                     allowed_ips: vec![],
-                    preshared_key: [0u8; 32],
+                    preshared_key: [0u8; 32].into(),
                 }],
             },
         ));
@@ -1881,14 +1881,14 @@ mod tests {
     fn keepalive_engine(keepalive_secs: u16) -> std::sync::Arc<crate::afxdp::wg::WgEngine> {
         std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
             crate::afxdp::wg::WgEngineConfig {
-                local_private_key: [7u8; 32],
+                local_private_key: [7u8; 32].into(),
                 listen_port: 0,
                 peers: vec![crate::afxdp::wg::WgPeerConfig {
                     pubkey: [9u8; 32],
                     endpoint: None,
                     persistent_keepalive: keepalive_secs,
                     allowed_ips: vec![],
-                    preshared_key: [0u8; 32],
+                    preshared_key: [0u8; 32].into(),
                 }],
             },
         ))

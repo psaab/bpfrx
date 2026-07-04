@@ -23,6 +23,87 @@
   - **File(s)**: pkg/vrrp/packet.go, pkg/vrrp/packet_checksum_test.go,
     docs/vrrp-afpacket-receiver.md, _Log.md
 
+## 2026-07-04 — #4103 F12 fold: WgPeerConfig Debug compares PSK by reference (Copilot, PR #4123)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Copilot minor fold on PR #4123. WgPeerConfig's manual
+    Debug did `*self.preshared_key == WG_ZERO_PSK` for the PSK-unset
+    check. `==` already desugars to a by-reference `PartialEq::eq`, so no
+    real by-value copy occurred, but made the by-reference intent explicit
+    to align with F12 key hygiene: `&*self.preshared_key == &WG_ZERO_PSK`
+    (`engine.rs:197`). The other touched Debug impl (`WgEngineConfig`)
+    prints `<redacted>` and never derefs the key. The companion Copilot
+    comment (engine.rs:468 "borrowing config.peers after moving
+    config.local_private_key won't compile") is a confirmed FALSE POSITIVE
+    — Rust partial-move rules permit borrowing other fields after one is
+    moved; the crate builds and 3490 tests pass. cargo check --release
+    green; rustfmt clean on the changed line.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs, _Log.md
+
+## 2026-07-04 — #4103 F12: WG engine-config secret carriers zeroized (fable-163)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed the carriers were non-zeroized:
+    `WgEngineConfig.local_private_key` and `WgPeerConfig.preshared_key`
+    were plain `[u8; 32]` under `#[derive(Clone)]`, while the RUNTIME
+    copies are `Zeroizing` (engine `local_private_key`, `PeerConfig`
+    PSK), and the `forwarding_build/wg.rs` build sites deref-copied the
+    Zeroizing source (`*p.preshared_key`, `*endpoint.wg_local_privkey`)
+    into the plaintext carrier — so every WG commit left a 32-byte X25519
+    private key + all PSKs in freed heap/stack. FIX: both fields →
+    `zeroize::Zeroizing<[u8; 32]>` (Clone preserved — Zeroizing is Clone);
+    build sites clone the Zeroizing source (no plaintext hop); `new()`
+    moves the Zeroizing carrier straight into the engine and uses
+    `*config.local_private_key` only for the transient `mul_base_clamped`
+    argument; `reconcile` derefs `*cfg.preshared_key` into
+    `PeerConfig::new` (which re-wraps in Zeroizing); WgPeerConfig manual
+    Debug derefs for the PSK-unset check; WgEngineConfig gains a manual
+    REDACTING Debug (a derived Debug on `Zeroizing<[u8;32]>` prints the
+    raw key). 159 test construction sites updated to `.into()` (the
+    `From<[u8;32]>` for Zeroizing — identity-safe if a site targeted a
+    different struct). RED-on-revert: `wg_config_secret_carriers_are_zeroizing`
+    type-annotated bindings fail to compile if the fields revert to
+    `[u8; 32]`.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+    userspace-dp/src/afxdp/forwarding_build/wg.rs,
+    userspace-dp/src/afxdp/wg/engine_tests.rs,
+    userspace-dp/src/afxdp/wg/tests.rs,
+    userspace-dp/src/afxdp/coordinator/wg_control.rs,
+    userspace-dp/src/afxdp/frame/wg.rs,
+    userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+    docs/wireguard-interop.md, _Log.md
+
+## 2026-07-04 — #4103 F5: WG responder TAI64N anti-replay high-water survives config-change engine rebuild (fable-163)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST confirmed F5 GENUINE. `populate_wg_engines`
+    (`forwarding_build/wg.rs`) reuses the whole engine `Arc` only when the
+    WG identity tuple is byte-identical (`wg_identity_unchanged` →
+    `wg_peers_eq` compares pubkey/allowed_ips/endpoint/keepalive/PSK). ANY
+    change to ANY peer field — or listen_port/privkey, add/remove a peer —
+    builds a fresh `WgEngine::new`, which starts from `PeerTable::empty()`
+    so every peer gets a fresh `Peer::new` with `greatest_tai64n = [0; 12]`.
+    The #1432 rebuild-seed only re-seeds the OUTGOING initiator clock
+    (`seed_tai64n_high_water`); the #4092 INCOMING per-peer responder
+    high-water had NO carry-over. So a benign commit (add allowed-ip, rotate
+    PSK, add a peer) reset every peer's responder high-water to 0 →
+    `check_and_update_tai64n(T0)` accepts a captured/replayed initiation.
+    The `reconcile_peers` reuse-by-pubkey logic is never exercised across a
+    rebuild (new engine starts empty). FIX: mirror the initiator plumbing
+    for the incoming side — `Peer::greatest_tai64n()` getter +
+    `seed_greatest_tai64n()` setter (max-only), engine
+    `greatest_tai64n_by_pubkey()` snapshot + `seed_greatest_tai64n()` seed,
+    and carry each SURVIVING peer's high-water forward in the rebuild branch
+    keyed by pubkey (new/changed pubkey starts fresh — a different identity,
+    matching kernel/wireguard-go). RED-on-revert: forwarding_build
+    integration test (add-allowed-ip → engine rebuilt → surviving peer
+    high-water == T_last not [0;12]) + wg-module unit test (carry-over then
+    replay `<= T_last` rejected, `>` accepted, new pubkey stays [0;12]).
+  - **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+    userspace-dp/src/afxdp/wg/engine.rs,
+    userspace-dp/src/afxdp/forwarding_build/wg.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs,
+    userspace-dp/src/afxdp/wg/tests.rs, docs/wireguard-interop.md, _Log.md
 ## 2026-07-04 — #4108: RBAC maintenance gate + system_action audit journal (fable-163 F21+F8)
 
 - **Timestamp**: 2026-07-04

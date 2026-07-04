@@ -4076,6 +4076,57 @@ fn wg_engine_survives_unrelated_tunnel_removal() {
     );
 }
 
+/// #4103: a routine WG config change (here: adding an allowed-ip to a
+/// peer) forces an identity-change engine rebuild via `WgEngine::new`,
+/// which starts from an empty peer table and gives every peer a fresh
+/// `Peer::new` with `greatest_tai64n = [0; 12]`. The #4092 responder
+/// anti-replay high-water for each SURVIVING peer must be carried forward
+/// across that rebuild, else a benign commit silently disarms the
+/// anti-replay (an attacker could replay a captured type-1 initiation).
+/// This pins `populate_wg_engines`' `seed_greatest_tai64n` carry-over:
+/// reverting it leaves the fresh peer at `[0; 12]` and this assert goes
+/// RED.
+#[test]
+fn wg_responder_high_water_survives_config_change_rebuild() {
+    let prev = build_forwarding_state(&wg_snapshot(51820, &["10.0.0.0/24"], "203.0.113.1:51820"));
+    let prev_engine = prev.wg_engines.get(&7).expect("prev WG engine").clone();
+
+    // Simulate a valid accepted type-1 initiation advancing this peer's
+    // responder high-water (as `check_and_update_tai64n` would on a real
+    // handshake). Key by the peer's own pubkey (read back from the engine).
+    let pubkey = prev_engine.greatest_tai64n_by_pubkey()[0].0;
+    let t_last: [u8; 12] = [0x40, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    prev_engine.seed_greatest_tai64n(&[(pubkey, t_last)]);
+    assert_eq!(prev_engine.greatest_tai64n_by_pubkey(), vec![(pubkey, t_last)]);
+
+    // Add an allowed-ip — a benign change that flips `wg_peers_eq` and so
+    // rebuilds the whole engine.
+    let snap2 = wg_snapshot(51820, &["10.0.0.0/24", "192.168.0.0/24"], "203.0.113.1:51820");
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &snap2,
+        &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    let next_engine = next.wg_engines.get(&7).expect("next WG engine");
+
+    // The engine was genuinely rebuilt (different Arc) — this is the case
+    // that resets the high-water without the #4103 carry-over.
+    assert!(
+        !std::sync::Arc::ptr_eq(&prev_engine, next_engine),
+        "adding an allowed-ip must rebuild the WG engine (identity change)"
+    );
+    // #4103: the surviving peer's responder high-water is carried forward,
+    // NOT reset to [0; 12] — so a replayed type-1 (recovered TAI64N
+    // `<= t_last`) still fails `check_and_update_tai64n`.
+    assert_eq!(
+        next_engine.greatest_tai64n_by_pubkey(),
+        vec![(pubkey, t_last)],
+        "responder anti-replay high-water must survive an identity-change rebuild (#4103)"
+    );
+}
+
 /// #1873 R-D purge-set pins: (a) vanished id purged, (b) owner-name
 /// change purged, (c) cosmetic linux_name change NOT purged,
 /// (d) untouched ids NOT purged.
