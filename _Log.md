@@ -31985,3 +31985,35 @@ top.
     userspace-dp/src/session/tests.rs, userspace-dp/src/afxdp/frame/mod.rs,
     userspace-dp/src/afxdp/frame/tests.rs,
     docs/userspace-dataplane-architecture.md, _Log.md
+- **Timestamp**: 2026-07-04
+  - **Action**: #4074 review fold (PR #4086, MERGE-NEEDS-MINOR) — fix a
+    reachable DNAT regression introduced by the ICMP query-id rewriter. The new
+    `apply_nat_icmp_identifier_rewrite` fires on `rewrite_src_port.or(rewrite_
+    dst_port)`. A forward DNAT to a POOLED PORT that is UNSCOPED by protocol/
+    destination-port (`validateDNATPoolStrict` does NOT require a
+    `match destination-port`, unlike static NAT) produces, for an ICMP echo, a
+    NatDecision `{rewrite_dst_port=Some(pool_port)}` → the `.or()` fired the
+    identifier rewrite for the DNAT case too → ICMP ping through that rule got
+    its Query Identifier corrupted to the pool port (pre-PR it was address-
+    only). Fix in the DECISION layer, NOT the frame fn (the LEGITIMATE reverse
+    pool-SNAT reply is also ICMP-with-rewrite_dst_port, from
+    `NatDecision::reverse`, and MUST still fire): gate `rewrite_dst_port` on
+    `has_l4_ports(protocol)` in the DNAT lookup
+    (`DnatTable::lookup_with_counter_scoped`, destination.rs — capture the
+    predicate before `protocol` is widened to the u16 key space). A port-less
+    protocol (ICMP/ICMPv6/GRE) now keeps `rewrite_dst_port = None` (address-only
+    DNAT). Static NAT needs no gate — it is ICMP-safe by construction (the build
+    maps `match_destination_port == 0` to `(None, None)`, so a port-mapped entry
+    is always keyed `(ip, Some(nonzero))` which dst_port-0 ICMP can never match,
+    and the whole-address `(ip, None)` bucket only holds `mapped_port = None`);
+    documented at the static DNAT decision site. NAT64 already sets
+    `rewrite_dst_port: None`. RED-on-revert: `dnat_pooled_port_does_not_
+    translate_icmp_identifier` (decision-layer: ICMP DNAT → rewrite_dst_port
+    None, TCP control still Some(8080)) +
+    `rewrite_forwarded_frame_in_place_dnat_preserves_icmpv4_identifier` (wire-
+    level: identifier preserved, checksum valid). Existing pool-SNAT id tests +
+    the reverse pool-SNAT reply still pass. Validated: FULL `cargo test
+    --release`, `go build ./...`, rustfmt.
+  - **File(s)**: userspace-dp/src/nat/destination.rs,
+    userspace-dp/src/nat/static_nat.rs, userspace-dp/src/nat/tests.rs,
+    userspace-dp/src/afxdp/frame/tests.rs, _Log.md

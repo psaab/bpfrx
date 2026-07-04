@@ -2221,6 +2221,68 @@ fn rewrite_forwarded_frame_in_place_translates_icmpv6_echo_identifier() {
     );
 }
 
+// #4074: end-to-end — a DNAT'd ICMP echo (address-only, `rewrite_dst` set,
+// `rewrite_dst_port` None, which is what the gated DNAT lookup now produces for
+// a port-less protocol) must PRESERVE the ICMP Query Identifier and leave the
+// checksum valid. This is the wire-level counterpart to the decision-layer test
+// `dnat_pooled_port_does_not_translate_icmp_identifier`: the gate keeps
+// `rewrite_dst_port` None, so `apply_nat_icmp_identifier_rewrite` no-ops here.
+#[test]
+fn rewrite_forwarded_frame_in_place_dnat_preserves_icmpv4_identifier() {
+    let client = Ipv4Addr::new(198, 51, 100, 1);
+    let public = Ipv4Addr::new(203, 0, 113, 10);
+    let internal = Ipv4Addr::new(10, 0, 0, 5);
+    let orig_id: u16 = 0x1234;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        flow_src_port: orig_id,
+        ..UserspaceDpMeta::default()
+    };
+    let frame = build_icmp_frame_v4(client, public, 64, 8, orig_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    // Address-only DNAT decision (the gated lookup's output for ICMP).
+    let dnat = NatDecision {
+        rewrite_dst: Some(IpAddr::V4(internal)),
+        rewrite_dst_port: None,
+        ..NatDecision::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(dnat),
+        false,
+        None,
+    )
+    .expect("dnat rewrite");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("dnat out");
+    assert_eq!(&out[30..34], &internal.octets(), "dst translated by DNAT");
+    assert_eq!(
+        u16::from_be_bytes([out[38], out[39]]),
+        orig_id,
+        "ICMP identifier PRESERVED through address-only DNAT",
+    );
+    assert_eq!(
+        checksum16(&out[34..]),
+        0,
+        "ICMPv4 checksum valid (identifier untouched)",
+    );
+}
+
 fn tcp_ports_ipv6(packet: &[u8]) -> (u16, u16) {
     (
         u16::from_be_bytes([packet[40], packet[41]]),

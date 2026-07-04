@@ -1685,6 +1685,71 @@ fn dnat_basic_lookup_tcp() {
     );
 }
 
+// #4074 FAIL-ON-REVERT: an UNSCOPED pool DNAT rule (no `match destination-port`)
+// whose pool carries a `port` must NOT attach that port to a port-less ICMP
+// flow. `validateDNATPoolStrict` does not require a destination-port, so such a
+// rule commits; the snapshot builder emits protocol="" (ANY) + destination_port
+// 0 (wildcard) + pool_port=8080, and the ICMP DNAT lookup runs with dst_port 0.
+// Pre-gate, `rewrite_dst_port` became `Some(8080)` and the SNAT ICMP-identifier
+// rewriter (`apply_nat_icmp_identifier_rewrite`) then corrupted the ICMP Query
+// Identifier to 8080, breaking ping through the DNAT rule. The `has_l4_ports`
+// gate keeps ICMP DNAT address-only (pre-#4074 behaviour).
+//
+// Reverting the gate in destination.rs makes `rewrite_dst_port` `Some(8080)` for
+// the ICMP lookup, turning the `None` assertion RED. The TCP control (which DOES
+// carry an L4 port) still receives the port translation.
+#[test]
+fn dnat_pooled_port_does_not_translate_icmp_identifier() {
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 0,     // unscoped by destination-port
+            protocol: String::new(), // any protocol (matches ICMP)
+            pool_address: "10.0.0.5".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // ICMP echo (dst_port 0): the destination address is translated, but the
+    // pool port must NOT be attached — ICMP has no L4 port.
+    let icmp = table.lookup(
+        PROTO_ICMP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        0,
+        "",
+    );
+    assert_eq!(
+        icmp,
+        Some(NatDecision {
+            rewrite_dst: Some("10.0.0.5".parse().unwrap()),
+            rewrite_dst_port: None,
+            ..NatDecision::default()
+        }),
+        "ICMP DNAT must be address-only — no pooled L4 port on a port-less flow",
+    );
+    // TCP control: a port-carrying protocol still gets the pool port.
+    let tcp = table.lookup(
+        PROTO_TCP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        80,
+        "",
+    );
+    assert_eq!(
+        tcp,
+        Some(NatDecision {
+            rewrite_dst: Some("10.0.0.5".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        }),
+        "TCP DNAT still translates the destination port",
+    );
+}
+
 // #3844: `then destination-nat off` is a no-translate EXEMPTION. An off entry
 // that matches must return NO DNAT decision AND short-circuit later DNAT rules
 // for the same destination — a translate rule keyed identically must NOT
