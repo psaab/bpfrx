@@ -1,9 +1,13 @@
 package lldp
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
+	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
@@ -545,4 +549,146 @@ func TestStopIdempotent(t *testing.T) {
 	m := New()
 	m.Stop() // should not panic
 	m.Stop() // double stop should be fine
+}
+
+// mkNeighbor builds a Neighbor for the cap tests.
+func mkNeighbor(iface, chassis, port string) *Neighbor {
+	return &Neighbor{
+		ChassisID: chassis,
+		PortID:    port,
+		TTL:       120,
+		Interface: iface,
+		LastSeen:  time.Now(),
+		ExpiresAt: time.Now().Add(120 * time.Second),
+	}
+}
+
+func neighborKey(iface, chassis, port string) string {
+	return fmt.Sprintf("%s/%s/%s", iface, chassis, port)
+}
+
+// TestLearnNeighborCapPerInterface is the fail-on-revert unit test for the
+// #4044 neighbor-table cap. It asserts:
+//   - exactly maxNeighborsPerInterface distinct neighbors are admitted on one
+//     interface;
+//   - a genuinely NEW neighbor past the cap is DROPPED (returns false) and does
+//     not grow the table (so a flood of distinct spoofed ids cannot OOM the
+//     daemon);
+//   - a refresh of an already-known key still succeeds at the cap and updates in
+//     place without growing the table (an established neighbor's periodic
+//     re-advertisement is never dropped);
+//   - the cap is PER INTERFACE — a second interface has its own budget.
+//
+// On revert (learnNeighbor storing unconditionally) the over-cap add grows the
+// table to cap+1, so the bounded-length assertions fail.
+func TestLearnNeighborCapPerInterface(t *testing.T) {
+	m := New()
+
+	// Fill eth0 exactly to the cap. Every add is a distinct new key.
+	for i := 0; i < maxNeighborsPerInterface; i++ {
+		chassis := fmt.Sprintf("02:00:00:00:00:%02x", i)
+		if !m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
+			t.Fatalf("add %d within cap should be admitted", i)
+		}
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
+		t.Fatalf("after filling to cap: got %d neighbors, want %d", got, maxNeighborsPerInterface)
+	}
+
+	// One more DISTINCT neighbor on eth0 must be dropped, not stored.
+	overChassis := "02:00:00:00:ff:ff"
+	if m.learnNeighbor(neighborKey("eth0", overChassis, "p"), mkNeighbor("eth0", overChassis, "p")) {
+		t.Fatal("a new neighbor past the per-interface cap must be dropped (returned true)")
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
+		t.Fatalf("table grew past the cap: got %d, want %d", got, maxNeighborsPerInterface)
+	}
+
+	// A refresh of an EXISTING key must still be accepted at the cap and update
+	// in place (no growth). Bump the TTL so we can confirm the update landed.
+	refreshChassis := "02:00:00:00:00:00"
+	refreshed := mkNeighbor("eth0", refreshChassis, "p")
+	refreshed.TTL = 999
+	if !m.learnNeighbor(neighborKey("eth0", refreshChassis, "p"), refreshed) {
+		t.Fatal("a refresh of an existing neighbor must be accepted even at the cap")
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
+		t.Fatalf("refresh must not grow the table: got %d, want %d", got, maxNeighborsPerInterface)
+	}
+	m.mu.RLock()
+	gotTTL := m.neighbors[neighborKey("eth0", refreshChassis, "p")].TTL
+	m.mu.RUnlock()
+	if gotTTL != 999 {
+		t.Fatalf("refresh did not update in place: TTL got %d, want 999", gotTTL)
+	}
+
+	// The cap is per interface: a neighbor on eth1 has its own budget.
+	if !m.learnNeighbor(neighborKey("eth1", "02:00:00:00:01:00", "p"), mkNeighbor("eth1", "02:00:00:00:01:00", "p")) {
+		t.Fatal("a neighbor on a different interface must be admitted (cap is per-interface)")
+	}
+	if got := len(m.Neighbors()); got != maxNeighborsPerInterface+1 {
+		t.Fatalf("per-interface cap should allow eth1 entry: got %d, want %d", got, maxNeighborsPerInterface+1)
+	}
+}
+
+// captureHandler is a slog.Handler that records emitted records for assertions.
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.records = append(h.records, r.Clone())
+	h.mu.Unlock()
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestLearnNeighborCapWarnsRateLimited asserts the cap fires a warn when a new
+// neighbor is dropped, and that the warn is rate-limited to once per interval
+// per interface so an ongoing flood cannot flood the log too (#4044).
+func TestLearnNeighborCapWarnsRateLimited(t *testing.T) {
+	h := &captureHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	m := New()
+	// Fill to the cap (no drops, no warns yet).
+	for i := 0; i < maxNeighborsPerInterface; i++ {
+		chassis := fmt.Sprintf("02:00:00:00:00:%02x", i)
+		m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p"))
+	}
+	// Now drop 10 distinct new neighbors past the cap.
+	for i := 0; i < 10; i++ {
+		chassis := fmt.Sprintf("02:00:00:00:aa:%02x", i)
+		if m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
+			t.Fatalf("over-cap add %d should have been dropped", i)
+		}
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	warns := 0
+	var lastIface string
+	for _, r := range h.records {
+		if r.Level == slog.LevelWarn && strings.Contains(r.Message, "neighbor table full") {
+			warns++
+			r.Attrs(func(a slog.Attr) bool {
+				if a.Key == "interface" {
+					lastIface = a.Value.String()
+				}
+				return true
+			})
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("expected exactly 1 rate-limited cap warn for 10 drops, got %d", warns)
+	}
+	if lastIface != "eth0" {
+		t.Fatalf("cap warn carried interface %q, want eth0", lastIface)
+	}
 }
