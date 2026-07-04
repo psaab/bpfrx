@@ -1,3 +1,29 @@
+## 2026-07-03 — #3952: swanctl PSK secrets carried no `id` selectors → with 2+ PSK VPNs the wrong PSK matched a peer
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-176 (MEDIUM, IPsec correctness). The
+    generated swanctl `secrets { ike-<conn> { secret = ... } }` PSK entries
+    carried NO `id` selector. In swanctl a PSK with no id matches ANY peer,
+    so with two or more PSK VPNs strongSwan could bind the wrong secret to a
+    peer — IKE authentication fails, or a peer authenticates against another
+    VPN's PSK. Added `pskIDSelectors` (`pkg/ipsec/policy.go`) and emit
+    `id-<n>` selector(s) on each PSK secret block. The discriminator is the
+    remote peer's IKE identity: the configured `remote-id` when set, else the
+    concrete remote gateway address (strongSwan's default peer identity when
+    no id is negotiated); a configured `local-id` rides along as a harmless
+    extra owner. The secrets loop now resolves the remote endpoint + gateway
+    once via `resolveRemoteAddr` (shared with the PSK-chain lookup). Skip
+    cases preserved: a responder-only `%any` peer with no remote-id emits no
+    id (never a literal `id = "%any"` that would match all), and a cert/EAP
+    VPN with no PSK emits no secret block. Selector values reuse the #1798/
+    #2126 sanitize+escape quoting. RED-on-revert proven: reverting to the
+    pre-fix secrets loop leaves every id list empty, failing the two-PSK-VPN,
+    explicit-id, and single-VPN assertions. `go test ./pkg/ipsec/...` green,
+    `go build ./...`, gofmt, vet clean. Doc: pkg/ipsec/README.md PSK id
+    selector bullet.
+  - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/swanctl_render_test.go,
+    pkg/ipsec/README.md, _Log.md
+
 ## 2026-07-03 — #3950: monitorLinkState exited permanently on netlink ENOBUFS → SNMP link traps went dark for the daemon's lifetime
 
 - **Timestamp**: 2026-07-03

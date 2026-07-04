@@ -444,6 +444,227 @@ func TestGenerateConfig_IdentityWithCommaQuoted(t *testing.T) {
 	}
 }
 
+// secretBlock is a parsed `secrets { ike-<name> { ... } }` entry.
+type secretBlock struct {
+	secret string
+	ids    []string
+}
+
+// parseSecretBlocks extracts every ike-<name> secret block from a rendered
+// swanctl config, keyed by block name (e.g. "ike-vpn-a"), with its secret
+// value and the ordered id-<n> selector values (surrounding quotes
+// stripped). It is deliberately small: the rendered secrets are simple
+// enough that a leading/trailing double-quote trim recovers the value.
+func parseSecretBlocks(cfg string) map[string]secretBlock {
+	out := map[string]secretBlock{}
+	inSecrets := false
+	cur := ""
+	var blk secretBlock
+	flush := func() {
+		if cur != "" {
+			out[cur] = blk
+		}
+		cur = ""
+		blk = secretBlock{}
+	}
+	unquote := func(s string) string { return strings.Trim(strings.TrimSpace(s), `"`) }
+	for _, line := range strings.Split(cfg, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case t == "secrets {":
+			inSecrets = true
+		case !inSecrets:
+			// outside the secrets block — ignore.
+		case strings.HasPrefix(t, "ike-") && strings.HasSuffix(t, "{"):
+			flush()
+			cur = strings.TrimSpace(strings.TrimSuffix(t, "{"))
+		case cur != "" && strings.HasPrefix(t, "secret = "):
+			blk.secret = unquote(strings.TrimPrefix(t, "secret = "))
+		case cur != "" && strings.HasPrefix(t, "id-"):
+			if idx := strings.Index(t, "= "); idx >= 0 {
+				blk.ids = append(blk.ids, unquote(t[idx+2:]))
+			}
+		case t == "}" && cur != "":
+			// close the ike-<name> block.
+			flush()
+		case t == "}" && cur == "":
+			// close the secrets block.
+			inSecrets = false
+		}
+	}
+	flush()
+	return out
+}
+
+func containsStr(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestGenerateConfig_PSKIDSelectors_TwoVPNs is the #3952 regression: two
+// PSK VPNs to DIFFERENT peers must each render a secret scoped to ITS peer
+// with an id selector, so strongSwan never binds the wrong PSK. A PSK
+// secret with no id matches ANY peer; with two PSKs strongSwan could pick
+// the wrong secret for a peer and IKE auth fails. Goes RED on revert
+// (no id selectors emitted → the id-contains assertions fail).
+func TestGenerateConfig_PSKIDSelectors_TwoVPNs(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"vpn-a": {Gateway: "gw-a", PSK: "psk-alpha"},
+			"vpn-b": {Gateway: "gw-b", PSK: "psk-bravo"},
+		},
+		Gateways: map[string]*config.IPsecGateway{
+			// Same local firewall, two distinct remote peers.
+			"gw-a": {Name: "gw-a", Address: "203.0.113.1", LocalAddress: "198.51.100.10"},
+			"gw-b": {Name: "gw-b", Address: "203.0.113.2", LocalAddress: "198.51.100.10"},
+		},
+	}
+	blocks := parseSecretBlocks(m.generateConfig(cfg))
+
+	a, ok := blocks["ike-vpn-a"]
+	if !ok {
+		t.Fatalf("missing ike-vpn-a secret block")
+	}
+	b, ok := blocks["ike-vpn-b"]
+	if !ok {
+		t.Fatalf("missing ike-vpn-b secret block")
+	}
+	if a.secret != "psk-alpha" || b.secret != "psk-bravo" {
+		t.Fatalf("wrong PSKs: a=%q b=%q", a.secret, b.secret)
+	}
+	// Each secret carries an id selector for ITS own peer address.
+	if len(a.ids) == 0 {
+		t.Errorf("ike-vpn-a has no id selector (PSK matches any peer — #3952)")
+	}
+	if len(b.ids) == 0 {
+		t.Errorf("ike-vpn-b has no id selector (PSK matches any peer — #3952)")
+	}
+	if !containsStr(a.ids, "203.0.113.1") {
+		t.Errorf("ike-vpn-a id selectors %v missing its peer 203.0.113.1", a.ids)
+	}
+	if !containsStr(b.ids, "203.0.113.2") {
+		t.Errorf("ike-vpn-b id selectors %v missing its peer 203.0.113.2", b.ids)
+	}
+	// Scoping: neither secret claims the OTHER peer's identity.
+	if containsStr(a.ids, "203.0.113.2") {
+		t.Errorf("ike-vpn-a id selectors %v wrongly claim vpn-b's peer", a.ids)
+	}
+	if containsStr(b.ids, "203.0.113.1") {
+		t.Errorf("ike-vpn-b id selectors %v wrongly claim vpn-a's peer", b.ids)
+	}
+}
+
+// TestGenerateConfig_PSKIDSelectors_ExplicitIDs asserts that when a gateway
+// configures explicit remote/local IKE identities, the PSK secret is
+// scoped by those identities (the values the peer actually negotiates),
+// not the gateway address. The remote-id is the discriminator; the
+// local-id rides along as a harmless extra owner (#3952).
+func TestGenerateConfig_PSKIDSelectors_ExplicitIDs(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"vpn": {Gateway: "gw", PSK: "k"},
+		},
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {
+				Name:          "gw",
+				Address:       "203.0.113.9",
+				LocalAddress:  "198.51.100.10",
+				RemoteIDType:  "hostname",
+				RemoteIDValue: "peer.example.com",
+				LocalIDType:   "hostname",
+				LocalIDValue:  "fw.example.com",
+			},
+		},
+	}
+	blocks := parseSecretBlocks(m.generateConfig(cfg))
+	blk, ok := blocks["ike-vpn"]
+	if !ok {
+		t.Fatalf("missing ike-vpn secret block")
+	}
+	// Remote-id (formatted @fqdn) must be present as the peer selector.
+	if !containsStr(blk.ids, "@peer.example.com") {
+		t.Errorf("id selectors %v missing configured remote-id @peer.example.com", blk.ids)
+	}
+	// Local-id rides along.
+	if !containsStr(blk.ids, "@fw.example.com") {
+		t.Errorf("id selectors %v missing configured local-id @fw.example.com", blk.ids)
+	}
+	// The remote-id supersedes the address as the peer identity.
+	if containsStr(blk.ids, "203.0.113.9") {
+		t.Errorf("id selectors %v used the address instead of the configured remote-id", blk.ids)
+	}
+}
+
+// TestGenerateConfig_PSKIDSelectors_SingleVPN confirms a single PSK VPN
+// still renders a valid secret (now carrying an id — harmless with one
+// PSK) so the fix does not regress the common single-tunnel case (#3952).
+func TestGenerateConfig_PSKIDSelectors_SingleVPN(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"solo": {Gateway: "10.0.2.1", PSK: "onlysecret", BindInterface: "st0.0"},
+		},
+	}
+	blocks := parseSecretBlocks(m.generateConfig(cfg))
+	blk, ok := blocks["ike-solo"]
+	if !ok {
+		t.Fatalf("missing ike-solo secret block")
+	}
+	if blk.secret != "onlysecret" {
+		t.Errorf("wrong PSK: %q", blk.secret)
+	}
+	// Legacy inline gateway shape: the peer address is the id selector.
+	if !containsStr(blk.ids, "10.0.2.1") {
+		t.Errorf("single-VPN id selectors %v missing the inline peer 10.0.2.1", blk.ids)
+	}
+}
+
+// TestGenerateConfig_PSKIDSelectors_ResponderAnyAndCert covers the two
+// no-scoping cases (#3952): a responder-only %any peer with no configured
+// remote-id emits NO id (%any is not a usable identity — legacy any-peer
+// behavior preserved, never a literal `id = "%any"`), and a cert VPN with
+// no PSK emits no secret block at all (so no stray id leaks).
+func TestGenerateConfig_PSKIDSelectors_ResponderAnyAndCert(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"roadwarrior": {Gateway: "gw-dyn", PSK: "dynsecret"},
+			"cert-vpn":    {Gateway: "gw-cert"},
+		},
+		Gateways: map[string]*config.IPsecGateway{
+			// Dynamic responder-only peer, no remote-id → nothing to scope by.
+			"gw-dyn": {Name: "gw-dyn", ResponderOnly: true, LocalAddress: "198.51.100.10"},
+			// Cert gateway, no PSK anywhere.
+			"gw-cert": {Name: "gw-cert", Address: "203.0.113.20", LocalCertificate: "fw-cert"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	blocks := parseSecretBlocks(got)
+
+	rw, ok := blocks["ike-roadwarrior"]
+	if !ok {
+		t.Fatalf("missing ike-roadwarrior secret block")
+	}
+	if len(rw.ids) != 0 {
+		t.Errorf("responder-only %%any peer should emit no id selector, got %v", rw.ids)
+	}
+	if strings.Contains(got, `%any`) && strings.Contains(got, "id-") {
+		// Belt: a literal id = "%any" would defeat the scoping and match all.
+		if containsStr(rw.ids, "%any") {
+			t.Errorf("emitted a literal %%any id selector")
+		}
+	}
+	if _, ok := blocks["ike-cert-vpn"]; ok {
+		t.Errorf("cert VPN with no PSK must not emit a secret block")
+	}
+}
+
 // assertBalancedSecretQuotes verifies every "secret = " line has exactly
 // the opening + closing quote with no unescaped interior double-quote —
 // i.e. the rendered secret block is parseable by the swanctl lexer.
