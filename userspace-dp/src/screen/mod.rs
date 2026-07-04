@@ -37,11 +37,15 @@
 //! (older-binary `active.json` on upgrade, or an HA sync from an un-upgraded
 //! primary). The Go control plane now threads the set of zones that reference a
 //! missing profile (`ConfigSnapshot.screen_missing_profile_zones`) so the
-//! `check_packet` None branch can distinguish "zone has no screen configured"
-//! (legit Pass, silent) from "zone references a MISSING screen". For the latter
-//! it emits a runtime WARN, rate-limited to one per zone per second (sustained
-//! traffic produces essentially one WARN until it subsides) so a packet flood
-//! to a misconfigured zone cannot spam the log. The verdict STILL stays
+//! None branch can distinguish "zone has no screen configured" (legit Pass,
+//! silent) from "zone references a MISSING screen". For the latter it emits a
+//! runtime WARN, rate-limited to one per zone per second (sustained traffic
+//! produces essentially one WARN until it subsides) so a packet flood to a
+//! misconfigured zone cannot spam the log. BOTH the flow-present
+//! (`check_packet_with_zone_id`) and the flowless (`check_flowless_screens`,
+//! #3908) None branches call `maybe_warn_missing_profile`, so a flowless packet
+//! (non-first fragment / non-query ICMP) to a broken-profile zone is as
+//! observable as a flow-bearing one. The verdict STILL stays
 //! `ScreenVerdict::Pass` — a runtime fail-CLOSED posture would itself be an
 //! availability brick (the #1960 no-brick rationale), so the fail-closed-vs-pass
 //! posture is a deferred design decision (the /research half of #3082). This
@@ -948,6 +952,13 @@ impl ScreenState {
     /// run here matches that method's relative order exactly (LAND →
     /// ping-of-death → teardrop → icmp-fragment → source-route → icmp-flood
     /// → udp-flood).
+    ///
+    /// When the zone has no resolved profile this mirrors the flow-present
+    /// path's None branch (#3908): a zone that REFERENCES a screen profile
+    /// undefined at snapshot-build time gets a rate-limited runtime WARN via
+    /// `maybe_warn_missing_profile`, while a zone with no screen configured
+    /// passes silently. The verdict is `Pass` in both cases (watch-log-only,
+    /// no drop-behavior change — see the #3082 module note).
     pub(crate) fn check_flowless_screens(
         &mut self,
         zone: &str,
@@ -956,6 +967,17 @@ impl ScreenState {
         now_secs: u64,
     ) -> ScreenVerdict {
         let Some(profile) = self.profiles.get(zone) else {
+            // #3908: mirror the flow-present `check_packet_with_zone_id` None
+            // branch so the flowless path is as observable as the flow path.
+            // A zone that REFERENCES a screen profile undefined at
+            // snapshot-build time (lenient/HA-sync fail-open) gets a
+            // rate-limited runtime WARN; a zone with no screen configured
+            // passes silently (the helper distinguishes the two). Verdict is
+            // still Pass in BOTH cases — watch-log-only, no drop-behavior
+            // change (the fail-closed-vs-pass posture is the deferred #3082
+            // design decision). O(1): one hashmap lookup + a rate-limited
+            // increment; no unwrap/panic on the hot flowless path.
+            self.maybe_warn_missing_profile(zone, now_secs);
             return ScreenVerdict::Pass;
         };
         // --- Stateless, source-independent checks (side-effect-free) ---
