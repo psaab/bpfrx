@@ -3613,6 +3613,27 @@ strict-vs-lenient gates:
   (a `description` is accepted as metadata); it runs EARLIER than Finding B, so a
   typo'd keyword is reported as "unknown member statement" rather than a dangling
   reference. Same strict-reject / lenient-warn discipline (`lenientApplicationSpecs`).
+  **Predefined application-set bundles (#4102, fable-review-163 F14):**
+  `ResolveApplicationSet` / `ExpandApplicationSet` (`pkg/config/predefined.go`)
+  fall back to a `PredefinedApplicationSets` table AFTER user-defined sets —
+  mirroring `ResolveApplication`'s user-then-predefined order — so the standard
+  Junos `junos-defaults` bundles resolve without an operator having to redefine
+  them. Seeded from a real `show configuration groups junos-defaults` dump:
+  `junos-ms-rpc` = {`junos-ms-rpc-tcp`, `junos-ms-rpc-udp`}, `junos-sun-rpc` =
+  {`junos-sun-rpc-tcp`, `junos-sun-rpc-udp`}, `junos-cifs` =
+  {`junos-netbios-session`, `junos-smb-session`}, `junos-routing-inbound` =
+  {`junos-bgp`, `junos-rip`, `junos-ldp-tcp`, `junos-ldp-udp`}. Every member is
+  in the `PredefinedApplications` table, so each set expands to >= 1 member and
+  clears the empty-set fail-open gate (#3146). Before #4102 only the
+  protocol-split members shipped and the bundle names were nowhere, so a stock
+  vSRX policy `match application junos-ms-rpc` hard-failed at commit
+  (`validatePolicyMatchApplicationsStrict`) and, on the tolerant path, at runtime
+  (`resolveUserspaceApplicationNames` → `__unsupported__` →
+  `SnapshotIntegrityError`). Both the commit gate and the runtime resolver route
+  through these two functions, so the one table fixes every surface. A
+  user-defined set of the same name still shadows the predefined bundle (user
+  wins), and an unknown set name still hard-fails. Coverage:
+  `predefined_app_sets_4102_test.go`.
 - **Finding C — `then routing-instance <name>` (FBF) →
   `validateFirewallRoutingInstanceReferencesStrict`.** A firewall-filter term
   whose filter-based-forwarding steer names a routing-instance not defined under
