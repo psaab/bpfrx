@@ -150,14 +150,38 @@ requires of an authoritative engine:
 
 ## Live reconfigure (commit-time reconcile)
 
-The agent is created once at daemon startup and keeps serving on UDP/161.
-`UpdateConfig(cfg *config.SNMPConfig)` swaps the live authorization/identity
-config and rederives the USM v3 user table in place, so a commit that changes
-community authorization (`read-write` -> `read-only`, or a deleted community)
-or the v3 user set reaches the running agent without a restart — restarting
-would drop the UDP listener and interrupt in-flight polls. The daemon calls it
-from `applyConfigLocked` (guarded on a non-nil agent; enabling SNMP for the
-first time still requires a restart, like the other start-once subsystems).
+The full SNMP subsystem is reconciled on **every** commit, not just at boot
+(#3967). The daemon's `reconcileSNMP` (`pkg/daemon/daemon_snmp_reconcile.go`),
+called from `applyConfigLocked`, matches the running agent + link-state trap
+monitor to the committed config:
+
+- **disabled → enabled** — a commit that enables SNMP (an `snmp` stanza with a
+  community or v3 user, `snmpd` not `disable`d) creates and starts the agent
+  listener via `startSNMPLocked`, and the link-state trap monitor if trap
+  groups are configured. No restart needed.
+- **enabled → disabled** — a commit that removes SNMP (or `set system processes
+  snmpd disable`) stops the listener and the monitor (`teardownSNMPLocked`
+  cancels the lifetime context, joins the goroutines, and closes UDP/161).
+- **enabled → enabled (changed)** — `UpdateConfig(cfg *config.SNMPConfig)` swaps
+  the live authorization/identity config and rederives the USM v3 user table
+  **in place**, so a commit that changes community authorization (`read-write`
+  -> `read-only`, or a deleted community), the v3 user set, or a trap-group
+  target reaches the running agent without dropping the UDP listener or
+  interrupting in-flight polls. Trap targets are read live from `snapshotCfg`,
+  so an added/changed target takes effect immediately; a newly-added trap group
+  also starts the link-state monitor if it was not already running.
+- **enabled → enabled (unchanged)** — a no-op, gated on an FNV fingerprint of
+  the SNMP stanza (`snmpConfigHash`): an unchanged stanza never bounces the
+  listener.
+
+`snmpEnabled` is the single predicate both the boot start (`daemon_run.go`) and
+`reconcileSNMP` use, so boot and day-2 can never disagree on what "SNMP is on"
+means. The boot block performs the FIRST start (it runs even in config-only /
+bootstrap mode, unlike the boot `applyConfig`) and sets `snmpBootReady`, which
+hands day-2 lifecycle changes to `reconcileSNMP`; the `snmpBootReady` gate keeps
+the boot apply and the boot block from double-starting the agent. The agent +
+monitor goroutines bind to a lifetime context derived from `d.daemonCtx` and are
+torn down explicitly at shutdown (`teardownSNMP`).
 
 The reconcile runs **early** in `applyConfigLocked` — before the dataplane
 apply, which can abort the reconcile pipeline early (it returns on

@@ -1,3 +1,47 @@
+## 2026-07-03 — #3967: SNMP agent / trap-groups were start-once-at-boot → a day-2 commit that enabled SNMP, added a community/trap target, or disabled SNMP sat inert until a daemon restart
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-059 (MEDIUM, config-lifecycle). The SNMP
+    agent listener + link-state trap monitor were created ONCE at daemon
+    boot (`daemon_run.go` boot block). `applyConfigLocked` only did an
+    in-place `UpdateConfig` on an ALREADY-running agent (#2008), so
+    enabling SNMP on a running firewall (agent was nil) never started the
+    listener, disabling it never stopped it, and adding the FIRST trap
+    group never started the link-state monitor — the change sat in the
+    config, inert until a restart (a silent config-doesn't-take-effect +
+    monitoring-gap surprise).
+  - **Fix**: new `reconcileSNMP` (`pkg/daemon/daemon_snmp_reconcile.go`),
+    called from `applyConfigLocked` in place of the bare `UpdateConfig`
+    guard, reconciles the whole subsystem on every commit: disabled→enabled
+    starts the listener (+ monitor if trap groups), enabled→disabled stops
+    it, enabled→enabled swaps community/authorization/v3/trap-target state
+    in place (no listener bounce), and a newly-added trap group starts the
+    monitor without a restart. Idempotent: an unchanged SNMP stanza is a
+    no-op gated on `snmpConfigHash` (FNV over the raw secret-bearing
+    fields). The boot block now calls the shared `startSNMPLocked` + sets
+    `snmpBootReady` (the gate that keeps the boot apply and boot block from
+    double-starting); a shared `snmpEnabled` predicate makes boot and day-2
+    agree. Agent + monitor bind to a `d.daemonCtx`-derived lifetime context;
+    `teardownSNMP` stops them at shutdown. Concurrency: `teardownSNMPLocked`
+    cancels + joins the goroutines before nilling `d.snmpAgent`, so the
+    monitor's `emitLinkStateTrap` reads never race the clear (verified with
+    `-race`).
+  - **File(s)**: `pkg/daemon/daemon_snmp_reconcile.go` (new),
+    `pkg/daemon/daemon.go` (reconcile state fields + serve/boots seams),
+    `pkg/daemon/daemon_apply.go` (reconcileSNMP wiring),
+    `pkg/daemon/daemon_run.go` (boot block → startSNMPLocked +
+    snmpBootReady; shutdown teardownSNMP; drop now-unused imports),
+    `pkg/daemon/daemon_snmp_reconcile_test.go` (RED-on-revert lifecycle
+    tests), `pkg/snmp/README.md` (reconcile section).
+  - **Validation**: RED-on-revert confirmed (reverting the apply wiring to
+    the pre-fix `if d.snmpAgent != nil { UpdateConfig }` fails all three
+    lifecycle tests — enable, disable, trap-group-add). `go test
+    ./pkg/snmp/ ./pkg/daemon/` green; `-race` on the daemon SNMP/linkstate
+    paths clean; `go build ./...`, `gofmt`, `go vet` clean. (Pre-existing
+    unrelated `-race` flake in `pkg/snmp/traps_async_2991_test.go` —
+    `trapSender` package-var reassignment races `trapWorker`; untouched
+    by this change.)
+
 ## 2026-07-03 — #3962: buildScreenSnapshots ranged the zones map in nondeterministic order → wire byte order varied per build → snapshotContentHash dedup missed → dataplane re-applied the screen config on every reconcile
 
 - **Timestamp**: 2026-07-03
