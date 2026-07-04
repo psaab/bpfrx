@@ -289,6 +289,28 @@ dropped scope is impossible. Coverage:
 `compiler_prefix_list_hier_leaf_3843_test.go` (single-name source/dest/except +
 undefined-reject fail-on-revert, plus block / flat-set regression guards).
 
+**The prefix-list DEFINITION body is dual-AST too (#3996).** Distinct from the
+`from source/destination-prefix-list` *reference* above, this is the
+`policy-options prefix-list NAME { <p1>; <p2>; ... }` *definition*. Its schema
+leaf (`schemaPolicyOptions`, `schema_routing.go`) is `args: 1` (the name) with
+`children: nil`, so every prefix under the name lands as a CHILD of the named
+node. Two child shapes occur: one child per prefix (a `set ... prefix-list NAME
+<p>` per line, or a brace block with one `<p>;` per line — each child holds a
+single prefix in `Keys[0]`), OR the bracketed-list form `set ... prefix-list
+NAME [ p1 p2 p3 ]`, where the lexer strips `[`/`]` and packs EVERY prefix onto a
+SINGLE child node's `Keys`. `compilePolicyOptions` (`compiler_routing.go`) reads
+the FULL `Keys` slice of each child — note it reads from `Keys[0]`, NOT
+`Keys[1:]`, because a prefix-list entry carries no field-name prefix (the child's
+keys ARE the prefix values), so `firewallMatchValues` (which skips `Keys[0]`) is
+the WRONG helper here. Before #3996 the loop read only `entry.Keys[0]`, so a
+bracketed list kept just the FIRST prefix and silently dropped the rest → an
+under-populated prefix-list (a route-filter, firewall filter, or dynamic address
+group matched a partial prefix set with no commit error). The separate-command
+and single-prefix shapes were unaffected (each child had exactly one key).
+Coverage: `compiler_prefix_list_bracket_3996_test.go` (bracketed all-three +
+display-set round-trip fail-on-revert, plus separate-command / single-prefix
+regression guards); the multi-block MERGE case is `compiler_prefix_list_merge_2641_test.go`.
+
 **NAT `match` axes are multi-value (#3431).** The source/destination NAT rule
 `match` leaves `application`, `protocol` (DNAT), `source-address-name`, and
 `destination-address-name` are all `multi: true` (alongside the already-plural

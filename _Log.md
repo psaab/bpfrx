@@ -1,3 +1,35 @@
+## 2026-07-03 — #3996: policy-options prefix-list bracketed-list definition collapsed to first prefix
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-042 (MEDIUM, config-parity). A
+    `policy-options prefix-list NAME` definition written as a bracketed
+    list — `set policy-options prefix-list NAME [ p1 p2 p3 ]` — compiled to
+    only its FIRST prefix. The lexer strips `[`/`]` and packs every prefix
+    onto a SINGLE child node's `Keys` (the #2419/#3842 dual-AST class), but
+    `compilePolicyOptions` (`pkg/config/compiler_routing.go`) read only
+    `entry.Keys[0]` for each child, so the bracketed list dropped all but the
+    first prefix → an under-populated prefix-list (a route-filter, firewall
+    filter, or dynamic address group matched a partial prefix set with no
+    commit error). The separate-command form (`set ... prefix-list NAME <p>`
+    per line), the brace-block form, and the multi-block merge (#2641) were
+    already correct — each produced one child per prefix — which is why the
+    defect hid.
+  - **Fix**: read the FULL `Keys` slice of every child (`for _, p := range
+    entry.Keys`), not just `Keys[0]`. Read from index 0 (NOT `Keys[1:]`)
+    because a prefix-list entry carries no field-name prefix — the child's
+    keys ARE the prefix values — so `firewallMatchValues` (which skips
+    `Keys[0]`) is the wrong helper here. Single-key children (the existing
+    shapes) are unaffected. Validation: new
+    `compiler_prefix_list_bracket_3996_test.go` — bracketed all-three +
+    display-set round-trip (both RED on revert to the `Keys[0]`-only read),
+    plus separate-command / single-prefix regression guards.
+    `go test ./pkg/config/...` green; `go build ./...`, gofmt, vet clean.
+    Doc: docs/config-schema.md new "prefix-list DEFINITION body is dual-AST
+    too (#3996)" note.
+  - **File(s)**: pkg/config/compiler_routing.go,
+    pkg/config/compiler_prefix_list_bracket_3996_test.go,
+    docs/config-schema.md, _Log.md
+
 ## 2026-07-03 — #3988: scheduler start/stop date parsed as UTC instead of system local time
 
 - **Timestamp**: 2026-07-03
