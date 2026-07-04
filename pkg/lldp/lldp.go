@@ -100,6 +100,12 @@ type Manager struct {
 	// re-Apply (which would Stop()/rebuild the generation and wipe the neighbor
 	// table). Atomic so a test reading it does not race a concurrent Apply.
 	applyCount atomic.Uint64
+
+	// capDropLastWarn rate-limits the "neighbor table full" warning per local
+	// interface so an LLDP flood (a dropped frame every packet) cannot itself
+	// become a log flood. Keyed by interface name, guarded by mu (only touched
+	// from learnNeighbor, which already holds mu). See #4044.
+	capDropLastWarn map[string]time.Time
 }
 
 // ifSession owns the RX and TX AF_PACKET sockets for one interface for the life
@@ -214,7 +220,8 @@ func (s *ifSession) close() {
 // New creates a new LLDP manager.
 func New() *Manager {
 	return &Manager{
-		neighbors: make(map[string]*Neighbor),
+		neighbors:       make(map[string]*Neighbor),
+		capDropLastWarn: make(map[string]time.Time),
 	}
 }
 
@@ -324,6 +331,7 @@ func (m *Manager) Stop() {
 
 	m.mu.Lock()
 	m.neighbors = make(map[string]*Neighbor)
+	m.capDropLastWarn = make(map[string]time.Time)
 	m.mu.Unlock()
 }
 
@@ -496,10 +504,76 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 		neighbor.ExpiresAt = time.Now().Add(time.Duration(neighbor.TTL) * time.Second)
 
 		key := fmt.Sprintf("%s/%s/%s", iface.Name, neighbor.ChassisID, neighbor.PortID)
-		m.mu.Lock()
-		m.neighbors[key] = neighbor
-		m.mu.Unlock()
+		m.learnNeighbor(key, neighbor)
 	}
+}
+
+// maxNeighborsPerInterface bounds the number of distinct LLDP neighbors the
+// receive path caches per local interface. LLDP is an unauthenticated L2
+// protocol: any device on the segment can flood frames carrying arbitrary
+// (spoofed) chassis-id / port-id values, and each distinct pair would create a
+// new neighbor entry. Without a cap the table grows without bound until the
+// daemon is OOM-killed — an L2-local DoS: whoever can put frames on the wire
+// (or a switching loop that multiplies frames) can exhaust memory. A real
+// switch port sees one, occasionally a handful, of LLDP neighbors; 64 is far
+// above any legitimate topology while still bounding a flood. The effective
+// global bound is this cap times the number of LLDP-enabled interfaces (a
+// small, operator-configured set), so no separate global cap is needed (#4044).
+const maxNeighborsPerInterface = 64
+
+// capDropWarnInterval rate-limits the per-interface "neighbor table full"
+// warning so an ongoing flood (one drop per frame) does not itself flood the
+// log.
+const capDropWarnInterval = 60 * time.Second
+
+// learnNeighbor installs or refreshes a received neighbor under the
+// per-interface cap. A refresh of an already-known (ifname/chassis/port) key
+// updates in place and never grows the table, so an established neighbor's
+// periodic re-advertisements always take effect. A genuinely NEW neighbor is
+// admitted only while its interface is below maxNeighborsPerInterface; past the
+// cap it is DROPPED with a rate-limited warn, so an LLDP flood of distinct
+// spoofed ids cannot grow the table without bound (#4044). expiryLoop still
+// reaps aged-out entries, so once a transient flood stops advertising the table
+// shrinks back below the cap and new legitimate neighbors are admitted again.
+// Returns true if the neighbor was stored, false if it was dropped by the cap.
+func (m *Manager) learnNeighbor(key string, n *Neighbor) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.neighbors[key]; exists {
+		// Refresh of a known neighbor: update in place. Does not grow the map,
+		// so it is always allowed even at the cap.
+		m.neighbors[key] = n
+		return true
+	}
+
+	// New neighbor: enforce the per-interface cap. The table is bounded at the
+	// cap per interface, so this count iterates a small, bounded set.
+	count := 0
+	for _, existing := range m.neighbors {
+		if existing.Interface == n.Interface {
+			count++
+		}
+	}
+	if count >= maxNeighborsPerInterface {
+		m.warnNeighborCapDroppedLocked(n.Interface)
+		return false
+	}
+	m.neighbors[key] = n
+	return true
+}
+
+// warnNeighborCapDroppedLocked logs (at most once per capDropWarnInterval per
+// interface) that the neighbor table is full and a new neighbor was dropped.
+// The caller must hold m.mu.
+func (m *Manager) warnNeighborCapDroppedLocked(iface string) {
+	now := time.Now()
+	if last, ok := m.capDropLastWarn[iface]; ok && now.Sub(last) < capDropWarnInterval {
+		return
+	}
+	m.capDropLastWarn[iface] = now
+	slog.Warn("LLDP: neighbor table full, dropping new neighbor",
+		"interface", iface, "cap", maxNeighborsPerInterface)
 }
 
 // expiryLoop periodically removes expired neighbors.
