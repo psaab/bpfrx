@@ -125,3 +125,17 @@ Two properties keep this safe (#2372 review findings 3 + 6):
   rejected rather than cached under an empty `ifname//` key with TTL 0
   (#2551). A valid 2-byte TTL of 0 is a legitimate shutdown advert and is
   still accepted (the gate is "the TLV parsed", not "TTL != 0").
+- **Control-char sanitization on receive (#4043):** LLDP is an
+  unauthenticated L2 protocol — any device on the segment can craft a frame
+  whose free-text TLVs carry ANSI escape sequences, CR/LF, or other control
+  characters. `ParseTLVs` runs every operator-visible received string
+  (system-name, system-description, port-description, port-id, and the
+  non-MAC chassis-id) through `sanitizeTLVString` at the store boundary
+  before it lands in the neighbor table, so both the expiry log line and the
+  `show lldp neighbors` table read already-clean strings. Each Unicode
+  control rune (C0 `0x00-0x1F` including ESC/CR/LF, DEL `0x7F`, and C1
+  `0x80-0x9F`) is replaced by a space; a legitimate multi-byte UTF-8 name is
+  preserved unchanged (`strings.Map` is rune-aware). This is the
+  LLDP-receive counterpart of the #1798/#3900 free-text sanitizer and
+  neutralizes terminal-escape spoofing (`show lldp neighbors`) and syslog
+  log-injection (a forged/split log line) from a hostile neighbor.

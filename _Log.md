@@ -1,3 +1,30 @@
+## 2026-07-03 — #4043: received LLDP TLV strings logged/displayed without control-char sanitization → ANSI-escape / CRLF log-injection from a crafted L2 frame
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-178 (MEDIUM, security — log/terminal
+    injection via LLDP). LLDP is an unauthenticated L2 protocol; any device on
+    the segment can send a frame whose free-text TLVs (system-name,
+    system-description, port-description, port-id, non-MAC chassis-id) carry
+    ANSI escape sequences, CR/LF, or other control characters. `ParseTLVs`
+    stored those strings verbatim in the neighbor table, so `expiryLoop`'s log
+    line and the `show lldp neighbors` table (both grpcapi and CLI) emitted the
+    raw bytes — cursor/screen ANSI spoofing on an operator terminal and
+    forged/split syslog lines (log injection).
+  - **Fix**: added `sanitizeTLVString` (rune-aware `strings.Map` +
+    `unicode.IsControl`, replacing every C0/C1/DEL control rune with a space,
+    preserving legitimate multi-byte UTF-8) and applied it at the parse/store
+    boundary in `ParseTLVs` for all five wire-sourced operator-visible fields.
+    Sanitizing at store means the neighbor table holds clean strings, so the
+    log AND both show paths read already-sanitized values from one chokepoint.
+    This is the LLDP-receive counterpart of the #1798/#3900 free-text
+    control-char sanitizer.
+  - **File(s)**: pkg/lldp/lldp.go, pkg/lldp/lldp_test.go, pkg/lldp/README.md
+  - **Validation**: `go test ./pkg/lldp/...` green; new `TestSanitizeTLVString`
+    (table-driven helper unit test) + `TestParseTLVs_SanitizesControlChars`
+    (end-to-end store boundary, RED-on-revert across all five fields) +
+    `TestParseTLVs_CleanStringsUnchanged` (negative control — a clean name is
+    stored verbatim). `go build ./...`, `gofmt`, `go vet` clean.
+
 ## 2026-07-03 — #4034: a non-fatal error in the tail of the config apply path skipped syncConfigToPeer → the standby never got the committed config (HA divergence)
 
 - **Timestamp**: 2026-07-03
