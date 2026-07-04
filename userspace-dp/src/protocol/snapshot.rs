@@ -302,7 +302,31 @@ pub(crate) struct ConfigSnapshot {
     /// these zones; the verdict still stays Pass.
     #[serde(rename = "screen_missing_profile_zones", default)]
     pub screen_missing_profile_zones: Vec<ScreenMissingProfileRef>,
-    #[serde(rename = "syn_cookie_master_key", default)]
+    /// SYN-cookie master key, hex-encoded (32 chars for 16 bytes). This
+    /// is the secret that makes XDP-generated SYN-ACK cookies unforgeable
+    /// — the source-validation check hashes the incoming ACK against it.
+    ///
+    /// SECRET: this field is intentionally `skip_serializing`, exactly
+    /// like `wg_local_privkey_hex` / `wg_preshared_key_hex`. The helper
+    /// persists a JSON snapshot of `ServerState` to `state.json` via
+    /// `server::helpers::write_state`, and that file is created with the
+    /// process umask (world-readable 0644). A local unprivileged user who
+    /// could read the key would be able to forge valid SYN cookies and
+    /// defeat SYN-flood source validation (#3909). `skip_serializing`
+    /// keeps the key off disk while deserialization (control-socket
+    /// delivery via `apply_snapshot`) still populates it through the
+    /// `default` path.
+    ///
+    /// No Rust-side regeneration is needed or wanted: the key is
+    /// DETERMINISTIC — the Go control plane derives it from the root
+    /// secret + cluster-id + screened zones (`buildSYNCookieMasterKey`,
+    /// pkg/dataplane/userspace/screens.go) and re-delivers it on every
+    /// config push. `ServerState.snapshot` starts `None` on boot and is
+    /// never restored from `state.json`, so the control plane always
+    /// supplies the key. A fresh random per-boot key would instead break
+    /// HA: both chassis must derive the SAME key for cross-node SYN-cookie
+    /// validation to survive failover.
+    #[serde(rename = "syn_cookie_master_key", default, skip_serializing)]
     pub syn_cookie_master_key: String,
     #[serde(default)]
     pub filters: Vec<FirewallFilterSnapshot>,

@@ -743,7 +743,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueType: ValueEnumOf, valueDesc: "IKE phase 1 negotiation mode",
 				valueExamples: []string{"main", "aggressive"},
 				validator:     ValidateEnum([]string{"main", "aggressive"}), children: nil},
-			"proposals":      {desc: "IKE proposal reference", args: 1, placeholder: "<proposal-name>", children: nil},
+			// multi (#3904): `proposals [ p1 p2 ]` offers every listed IKE
+			// proposal for phase-1 negotiation. Without multi the flat-set
+			// path strands every reference past the first as a child node and
+			// the compiler dropped them (crypto-negotiation narrowing).
+			"proposals":      {desc: "IKE proposal reference(s)", args: 1, multi: true, placeholder: "<proposal-name>", children: nil},
 			"pre-shared-key": {desc: "Pre-shared key (ascii-text <key>)", children: nil},
 		}},
 		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
@@ -806,7 +810,9 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 		"policy": {desc: "IPsec policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
 			"perfect-forward-secrecy": {desc: "Perfect forward secrecy (keys group<N>)", children: nil},
-			"proposals":               {desc: "IPsec proposal reference", args: 1, placeholder: "<proposal-name>", children: nil},
+			// multi (#3904): mirror of the IKE proposals leaf — offer every
+			// listed ESP proposal for phase-2 negotiation.
+			"proposals": {desc: "IPsec proposal reference(s)", args: 1, multi: true, placeholder: "<proposal-name>", children: nil},
 		}},
 		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
 			"address":            {desc: "Remote gateway address", args: 1, placeholder: "<address>", children: nil},

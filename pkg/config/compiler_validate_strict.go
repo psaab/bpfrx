@@ -210,30 +210,36 @@ func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
 		if pol == nil {
 			continue
 		}
-		propRef := pol.Proposals
-		explicitRef := propRef != ""
+		// #3904: `proposals` is now a list — EVERY referenced proposal must
+		// resolve (mirror the NAT bracket-list strict gate: a dangling
+		// trailing reference is an operator typo the commit-check must catch,
+		// not silently ignore as the pre-#3904 truncation did).
+		propRefs := pol.Proposals
+		explicitRef := len(propRefs) > 0
 		if !explicitRef {
 			// Mirror resolveESPSettings' policy-name fallback: a policy
 			// with no `proposals` leaf resolves against a proposal named
 			// after the policy itself.
-			propRef = pol.Name
+			propRefs = []string{pol.Name}
 		}
-		if _, ok := proposals[propRef]; ok {
-			continue
+		for _, propRef := range propRefs {
+			if _, ok := proposals[propRef]; ok {
+				continue
+			}
+			if explicitRef {
+				return fmt.Errorf("ipsec policy %q references undefined ipsec proposal %q "+
+					"(the configured proposal set, including any perfect-forward-secrecy "+
+					"group, would be silently dropped to the strongSwan default)",
+					pol.Name, propRef)
+			}
+			// No explicit `proposals` leaf was given, so do not blame a
+			// phantom proposal named after the policy — describe the actual
+			// gap instead.
+			return fmt.Errorf("ipsec policy %q has no resolvable ipsec proposal "+
+				"(no `proposals` reference and no proposal named %q); the configured "+
+				"perfect-forward-secrecy group would be silently dropped — define a "+
+				"proposal or reference one", pol.Name, pol.Name)
 		}
-		if explicitRef {
-			return fmt.Errorf("ipsec policy %q references undefined ipsec proposal %q "+
-				"(the configured proposal set, including any perfect-forward-secrecy "+
-				"group, would be silently dropped to the strongSwan default)",
-				pol.Name, propRef)
-		}
-		// No explicit `proposals` leaf was given, so do not blame a
-		// phantom proposal named after the policy — describe the actual
-		// gap instead.
-		return fmt.Errorf("ipsec policy %q has no resolvable ipsec proposal "+
-			"(no `proposals` reference and no proposal named %q); the configured "+
-			"perfect-forward-secrecy group would be silently dropped — define a "+
-			"proposal or reference one", pol.Name, pol.Name)
 	}
 	return nil
 }
@@ -303,8 +309,21 @@ func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
 	// name).
 	chainResolves := func(ikePolicyName string) bool {
 		if pol, ok := ikePolicies[ikePolicyName]; ok && pol != nil {
-			if _, ok := ikeProposals[pol.Proposals]; ok {
-				return true
+			// #3904: `proposals` is a list — the chain resolves only when
+			// EVERY referenced ike-proposal is defined. A partially-dangling
+			// list is an operator typo the commit-check must catch (the
+			// pre-#3904 scalar checked only the first reference).
+			if len(pol.Proposals) > 0 {
+				allResolve := true
+				for _, ref := range pol.Proposals {
+					if _, ok := ikeProposals[ref]; !ok {
+						allResolve = false
+						break
+					}
+				}
+				if allResolve {
+					return true
+				}
 			}
 		}
 		// Legacy fallback: a gateway's ike-policy value naming an IPsec
@@ -357,23 +376,33 @@ func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
 				gw.Name, vpnName, gw.IKEPolicy)
 		}
 		pol := ikePolicies[gw.IKEPolicy]
-		if pol.Proposals == "" {
-			// The ike-policy exists but has no `proposals` leaf at all, so
-			// pol.Proposals is the empty string. Reporting an "undefined
-			// ike-proposal \"\"" misleads the operator into hunting for a
-			// proposal named "" — say plainly that the policy is missing its
-			// proposals configuration.
+		if len(pol.Proposals) == 0 {
+			// The ike-policy exists but has no `proposals` leaf at all.
+			// Reporting an "undefined ike-proposal \"\"" misleads the operator
+			// into hunting for a proposal named "" — say plainly that the
+			// policy is missing its proposals configuration.
 			return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
 				"has no proposals configured; phase-1 would silently negotiate "+
 				"with the strongSwan default proposal set instead of the "+
 				"configured crypto",
 				gw.IKEPolicy, gw.Name, vpnName)
 		}
+		// #3904: name the FIRST dangling reference in the list (chainResolves
+		// was false, so at least one reference does not resolve).
+		for _, ref := range pol.Proposals {
+			if _, ok := ikeProposals[ref]; !ok {
+				return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
+					"references undefined ike-proposal %q; phase-1 would silently "+
+					"negotiate with the strongSwan default proposal set instead of "+
+					"the configured crypto",
+					gw.IKEPolicy, gw.Name, vpnName, ref)
+			}
+		}
 		return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
-			"references undefined ike-proposal %q; phase-1 would silently "+
+			"references undefined ike-proposal(s) %q; phase-1 would silently "+
 			"negotiate with the strongSwan default proposal set instead of "+
 			"the configured crypto",
-			gw.IKEPolicy, gw.Name, vpnName, pol.Proposals)
+			gw.IKEPolicy, gw.Name, vpnName, strings.Join(pol.Proposals, " "))
 	}
 	return nil
 }

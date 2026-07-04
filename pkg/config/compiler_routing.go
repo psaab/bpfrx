@@ -384,9 +384,14 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 			case "instance-type":
 				ri.InstanceType = nodeVal(prop)
 			case "interface":
-				if v := nodeVal(prop); v != "" {
-					ri.Interfaces = append(ri.Interfaces, v)
-				}
+				// Multi-value leaf (#3904): `interface [ i1 i2 ]` collapses
+				// onto Keys[1:] (this is an opaque implicit leaf) and/or child
+				// nodes in both AST shapes. Read EVERY interface via
+				// firewallMatchValues; the prior nodeVal(prop) read kept only
+				// the first, stranding the remaining ports OUTSIDE the routing-
+				// instance (they stayed in the default table — a VRF isolation
+				// break).
+				ri.Interfaces = append(ri.Interfaces, firewallMatchValues(prop)...)
 			case "routing-options":
 				var ro RoutingOptionsConfig
 				if err := compileRoutingOptions(prop, &ro); err != nil {

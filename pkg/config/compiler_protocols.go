@@ -577,29 +577,26 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			switch child.Name() {
 			case "group":
 				for _, gc := range child.Children {
+					// Multi-value leaves (#3904): a bracket list collapses onto
+					// Keys[1:] (opaque group) or child nodes; read EVERY value
+					// via firewallMatchValues. The pre-#3904 Keys[1]-only read
+					// truncated `export [ a b ]` / `neighbor [ i1 i2 ]` to the
+					// first entry.
 					switch gc.Name() {
 					case "neighbor":
-						if len(gc.Keys) >= 2 {
-							proto.RIP.Interfaces = append(proto.RIP.Interfaces, gc.Keys[1])
-						}
+						proto.RIP.Interfaces = append(proto.RIP.Interfaces, firewallMatchValues(gc)...)
 					case "export":
-						if len(gc.Keys) >= 2 {
-							proto.RIP.Redistribute = append(proto.RIP.Redistribute, gc.Keys[1])
-						}
+						proto.RIP.Redistribute = append(proto.RIP.Redistribute, firewallMatchValues(gc)...)
 					}
 				}
 			case "neighbor":
-				if len(child.Keys) >= 2 {
-					proto.RIP.Interfaces = append(proto.RIP.Interfaces, child.Keys[1])
-				}
+				// Multi-value leaf (#3904): read EVERY neighbor via
+				// firewallMatchValues (Keys[1:] + child nodes).
+				proto.RIP.Interfaces = append(proto.RIP.Interfaces, firewallMatchValues(child)...)
 			case "passive-interface":
-				if len(child.Keys) >= 2 {
-					proto.RIP.Passive = append(proto.RIP.Passive, child.Keys[1])
-				}
+				proto.RIP.Passive = append(proto.RIP.Passive, firewallMatchValues(child)...)
 			case "redistribute":
-				if len(child.Keys) >= 2 {
-					proto.RIP.Redistribute = append(proto.RIP.Redistribute, child.Keys[1])
-				}
+				proto.RIP.Redistribute = append(proto.RIP.Redistribute, firewallMatchValues(child)...)
 			case "authentication-key":
 				if v := nodeVal(child); v != "" {
 					proto.RIP.AuthKey = Secret(v)

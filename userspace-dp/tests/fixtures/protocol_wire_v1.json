@@ -300,7 +300,6 @@
       "scheduler_count": 0,
       "zone_count": 0
     },
-    "syn_cookie_master_key": "",
     "three_color_policers": [],
     "tunnel_endpoints": [],
     "userspace": null,

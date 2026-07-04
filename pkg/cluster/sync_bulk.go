@@ -61,16 +61,24 @@ func (s *SessionSync) sendBulkMarkers() error {
 		return err
 	}
 
+	// Record the pending bulk-ack epoch BEFORE writing the BulkEnd marker
+	// (record-then-send, #3912 — same TOCTOU as BulkSync). The BulkEnd
+	// marker is what solicits the peer's ack; recording the pending epoch
+	// first guarantees the read goroutine cannot process an early ack
+	// against a not-yet-set pending epoch and leave a phantom latched.
+	s.pendingBulkAckEpoch.Store(epoch)
+	s.pendingBulkAckSince.Store(time.Now().UnixNano())
+
 	s.writeMu.Lock()
 	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
 	s.writeMu.Unlock()
 	if err != nil {
+		s.pendingBulkAckEpoch.Store(0)
+		s.pendingBulkAckSince.Store(0)
 		s.handleDisconnect(conn)
 		return err
 	}
 
-	s.pendingBulkAckEpoch.Store(epoch)
-	s.pendingBulkAckSince.Store(time.Now().UnixNano())
 	s.stats.BulkSyncs.Add(1)
 	slog.Info("cluster sync: bulk markers sent", "epoch", epoch)
 	return nil
@@ -192,6 +200,20 @@ func (s *SessionSync) BulkSync() error {
 		"sessions", count,
 		"skipped", skipped)
 
+	// Record the pending bulk-ack epoch BEFORE writing the BulkEnd marker
+	// to the wire (record-then-send, mirroring the #2170/#2198 gen-guard
+	// discipline). The peer's ack is processed on the read goroutine
+	// (handleMessage, syncMsgBulkAck), which is independent of this send
+	// goroutine. If we stored the pending epoch AFTER the write, a fast
+	// peer could ack the BulkEnd and have the read goroutine process the
+	// ack (seeing pendingBulkAckEpoch==0, so it drops it) before this
+	// goroutine recorded the pending state. We would then latch a phantom
+	// pending epoch that no future ack ever clears — permanently blocking
+	// manual failover (#3912). Recording first guarantees the ack can only
+	// ever observe the pending epoch already in place.
+	s.pendingBulkAckEpoch.Store(epoch)
+	s.pendingBulkAckSince.Store(time.Now().UnixNano())
+
 	// Send bulk end marker with matching epoch.
 	slog.Info("cluster sync: bulk sync writing end marker", "epoch", epoch, "sessions", count, "skipped", skipped)
 	s.writeMu.Lock()
@@ -203,8 +225,6 @@ func (s *SessionSync) BulkSync() error {
 		s.handleDisconnect(conn)
 		return err
 	}
-	s.pendingBulkAckEpoch.Store(epoch)
-	s.pendingBulkAckSince.Store(time.Now().UnixNano())
 
 	s.stats.BulkSyncs.Add(1)
 	slog.Info("cluster sync: bulk sync complete", "sessions", count, "skipped", skipped, "epoch", epoch)

@@ -1,3 +1,76 @@
+## 2026-07-03 — #3912: cluster-sync bulk-ack TOCTOU — pendingBulkAckEpoch stored AFTER BulkEnd write → early ack latches a phantom pending epoch that blocks manual failover
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-025 (MEDIUM, HA — permanently blocks manual
+    failover). In `pkg/cluster/sync_bulk.go`, `BulkSync` (and the empty-marker
+    `sendBulkMarkers` path) stored `pendingBulkAckEpoch` AFTER writing the
+    `BulkEnd` marker to the wire. `BulkEnd` solicits the peer's `BulkAck`,
+    which is processed on the read goroutine (`handleMessage`,
+    `syncMsgBulkAck`) independently of the send goroutine. A peer that acked
+    faster than the send goroutine could record the pending epoch had its ack
+    processed against `pendingBulkAckEpoch == 0` — the ack handler's
+    `pending != 0` guard dropped it — and only then did the send goroutine
+    latch the epoch → a phantom pending epoch that no future ack ever clears →
+    the failover readiness gate waits on an outbound bulk ack that already
+    arrived → `request chassis cluster failover` blocked indefinitely.
+  - **Fix**: Record `pendingBulkAckEpoch`/`pendingBulkAckSince` BEFORE the
+    `BulkEnd` write (record-then-send, mirroring the #2170/#2198 gen-guard
+    discipline). An early ack can now only observe the pending epoch already
+    in place, so it clears it regardless of arrival timing. On a `BulkEnd`
+    write failure the epoch resets to 0 (handleDisconnect also clears), so a
+    failed send cannot leave the pending state falsely armed. Both the full
+    `BulkSync` path and the `sendBulkMarkers` empty-marker path corrected.
+  - **Test**: `TestBulkSyncPendingAckRecordedBeforeBulkEnd` — a mock conn
+    (`ackOnBulkEndConn`) synchronously feeds `BulkAck` back through
+    `handleMessage` the instant `BulkEnd` is written (the TOCTOU); asserts no
+    phantom pending epoch is latched. RED-on-revert verified (store-after-write
+    latches epoch 1 → failover would block). `TestBulkSyncPendingAckClearedByLaterAck`
+    confirms the normal (ack-after-store) barrier flow still clears.
+    Full `go test ./pkg/cluster/...` green (incl. -race on the bulk tests).
+  - **File(s)**: `pkg/cluster/sync_bulk.go`, `pkg/cluster/sync_test.go`,
+    `docs/session-sync-architecture.md`, `docs/sync-protocol.md`, `_Log.md`
+  - **Validation**: `go build ./...`, `gofmt`, `go vet ./pkg/cluster/...`,
+    `go test ./pkg/cluster/...`. test-failover WARRANTED (HA manual-failover
+    path) — batched with the other HA-Medium fixes under the
+    force-node0-primary gate.
+
+## 2026-07-03 — #3902: flowless screen path bypassed the source-independent screens (LAND, ip-source-route, ICMP/UDP flood) — fail-open on non-query ICMP + non-first fragments
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-085 (MEDIUM, screen/IDS fail-open). In
+    `stage_screen_check` the flowless branch (`flow == None` — a non-first IP
+    fragment #2344 or a non-query ICMP/ICMPv6 control message #3290) ran ONLY
+    the three L3 fragment screens restored by #3064 (ping-of-death, teardrop,
+    icmp-fragment). It did NOT run the SOURCE-INDEPENDENT screens — LAND
+    anti-spoof, ip-source-route, and the per-zone ICMP/UDP flood counters —
+    which need no transport flow. A crafted non-query ICMP or non-first
+    fragment therefore BYPASSED those screens (screen fail-open).
+  - **Fix**: Replaced `ScreenState::check_fragment_screens_l3` (&self, 3
+    fragment screens) with `ScreenState::check_flowless_screens` (&mut self)
+    that also runs LAND, ip-source-route, ICMP flood, and UDP flood, in the
+    same relative drop precedence as `check_packet_with_zone_id` (LAND →
+    ping-of-death → teardrop → icmp-fragment → source-route → icmp-flood →
+    udp-flood). Flow/session-dependent screens (TCP-flag, SYN-flood
+    per-source/dest sketches, scan/sweep, SYN-cookie) stay on the flow-present
+    path — no double-run on the flow path, flow path untouched. LAND compares
+    `src_ip == dst_ip`, so `poll_stages.rs` now derives the REAL L3 addresses
+    from the IP header (`flowless_l3_addrs`) instead of the pre-#3902
+    unspecified placeholder (which would have made every flowless packet look
+    like `src == dst`); when the frame is too short to hold them, LAND is
+    skipped (`addrs_known == false`) rather than false-dropped. No L4 port
+    read / session lookup is added, so the #2344 flowless fast path is NOT
+    reintroduced.
+  - **Validation**: 8 new `check_flowless_screens` unit tests (LAND on
+    flowless ICMP + non-first fragment, addrs-unknown skip, source-route,
+    ICMP flood, UDP flood, teardrop regression guard, clean-pass). RED-on-
+    revert proven: neutering the source-independent checks to the pre-#3902
+    behavior fails the 6 source-independent drop tests while the fragment +
+    clean tests stay green. FULL `cargo test --release` green; `go build
+    ./...` green.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/screen/tests.rs,
+    userspace-dp/src/afxdp/README.md
+
 ## 2026-07-03 — #3882: WireGuard responder rekey promoted an UNCONFIRMED session straight to `current` (no `next` slot) — 3-slot keypair lifecycle fix
 
 - **Timestamp**: 2026-07-03
@@ -29175,3 +29248,69 @@ top.
   pkg/dataplane/userspace/nat_source_pool_port_3906_test.go,
   userspace-dp/src/nat/tests.rs (no-translation match test),
   docs/userspace-dataplane-gaps.md (#3906 note)
+- **Action**: #3909 — keep the SYN-cookie master key out of the
+  world-readable state.json (secret exposure, MEDIUM). The helper persists
+  a JSON snapshot of `ServerState` to `state.json` via
+  `server::helpers::write_state`; that file is created with the process
+  umask (world-readable 0644). `ConfigSnapshot::syn_cookie_master_key` was
+  serialized into it in plaintext — a local unprivileged user could read
+  the master key, forge valid SYN cookies, and defeat SYN-flood source
+  validation. WG private keys / PSKs already avoid this via
+  `#[serde(skip_serializing)]`; mirror that exactly. FINDING: the key is
+  DETERMINISTIC, not random — the Go control plane derives it from the
+  cluster-synced root secret + cluster-id + screened zones
+  (`buildSYNCookieMasterKey`, pkg/dataplane/userspace/screens.go) and
+  re-delivers it on every config push via `apply_snapshot`.
+  `ServerState.snapshot` starts `None` on boot and is never restored from
+  `state.json`, so the control plane always re-supplies the key after a
+  restart — no Rust-side regeneration needed. A fresh random per-boot key
+  would BREAK HA (both chassis must derive the identical key for
+  cross-node cookie validation across failover), so skip-serialize +
+  control-plane re-delivery is the correct fix, not regenerate-on-boot.
+  Verified no OTHER secret leaks into the snapshot the same way — only
+  wg_local_privkey_hex, wg_preshared_key_hex (both already
+  skip_serializing), and this key. RED-on-revert: removing
+  `skip_serializing` makes `syn_cookie_master_key_is_skipped_in_state_snapshot`
+  go RED (field name + key bytes reappear in the serialized snapshot).
+  Full cargo test --release green; go build ./... clean.
+- **File(s)**: userspace-dp/src/protocol/snapshot.rs (skip_serializing +
+  doc), userspace-dp/src/protocol/tests.rs
+  (syn_cookie_master_key_is_skipped_in_state_snapshot RED-on-revert +
+  control-socket-delivery decode), userspace-dp/src/afxdp/forwarding_build/tests.rs
+  (syn_cookie_master_key_from_snapshot_reaches_forwarding_state),
+  docs/syn-cookie-flood-protection.md (on-disk state hygiene section)
+## 2026-07-03 — #3904 multi-value bracket-list truncation bundle (F-040/F-161/F-162/F-163)
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-040/F-161 — IKE/IPsec `proposals [ p1 p2 ]` no longer truncates
+  to the first reference. Schema leaves marked `multi: true`; `IKEPolicy.Proposals`
+  and `IPsecPolicyDef.Proposals` widened `string` → `[]string`; compiler reads all
+  via `firewallMatchValues`; strongSwan generator emits every resolvable proposal
+  comma-joined; strict validators require every reference to resolve; show/CLI
+  join the list.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_ipsec.go, pkg/config/compiler_validate_strict.go,
+  pkg/ipsec/ike.go, pkg/cli/cli_show_security_ipsec.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/config/compiler_ipsec_proposals_multivalue_3904_test.go,
+  pkg/ipsec/ike_proposals_multivalue_3904_test.go,
+  pkg/config/parser_security_test.go, pkg/config/ike_policy_chain_ref_test.go,
+  pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/ipsec/swanctl_render_test.go, pkg/ipsec/ike_chain_failclosed_test.go,
+  docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-162 — RIP `redistribute`/group `export`/`neighbor`/
+  `passive-interface` bracket lists no longer truncate to the first entry.
+  Declared RIP list-leaves marked `multi: true`; RIP compiler block reads every
+  value via `firewallMatchValues` into the already-plural RIPConfig slices.
+- **File(s)**: pkg/config/schema_routing.go, pkg/config/compiler_protocols.go,
+  pkg/config/compiler_rip_multivalue_3904_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-03
+- **Action**: F-163 — routing-instance `interface [ i1 i2 ]` no longer keeps only
+  the first port (VRF isolation break). Compiler reads every interface via
+  `firewallMatchValues` into RoutingInstanceConfig.Interfaces (opaque implicit
+  leaf, no schema change needed).
+- **File(s)**: pkg/config/compiler_routing.go,
+  pkg/config/compiler_routing_instance_interface_3904_test.go, docs/config-schema.md

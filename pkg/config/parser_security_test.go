@@ -1786,7 +1786,7 @@ func TestIKEAdvancedFeatures(t *testing.T) {
 	if ikePol.Mode != "main" {
 		t.Errorf("IKE policy mode = %q", ikePol.Mode)
 	}
-	if ikePol.Proposals != "ike-phase1" {
+	if len(ikePol.Proposals) != 1 || ikePol.Proposals[0] != "ike-phase1" {
 		t.Errorf("IKE policy proposals = %q", ikePol.Proposals)
 	}
 	if ikePol.PSK != "secret123" {
@@ -1831,7 +1831,7 @@ func TestIKEAdvancedFeatures(t *testing.T) {
 	if ipsecPol.PFSGroup != 14 {
 		t.Errorf("IPsec policy PFS group = %d, want 14", ipsecPol.PFSGroup)
 	}
-	if ipsecPol.Proposals != "esp-phase2" {
+	if len(ipsecPol.Proposals) != 1 || ipsecPol.Proposals[0] != "esp-phase2" {
 		t.Errorf("IPsec policy proposals = %q", ipsecPol.Proposals)
 	}
 	vpn := cfg.Security.IPsec.VPNs["site-a"]
@@ -2609,7 +2609,7 @@ func TestIKEProposalSetSyntax(t *testing.T) {
 	if pol.Mode != "main" {
 		t.Errorf("mode = %q, want main", pol.Mode)
 	}
-	if pol.Proposals != "ike-aes256" {
+	if len(pol.Proposals) != 1 || pol.Proposals[0] != "ike-aes256" {
 		t.Errorf("proposals = %q, want ike-aes256", pol.Proposals)
 	}
 	gw := cfg.Security.IPsec.Gateways["remote-gw"]
@@ -2660,7 +2660,7 @@ func TestIPsecProposalSetSyntax(t *testing.T) {
 	if pol == nil {
 		t.Fatal("missing IPsec policy ipsec-strong")
 	}
-	if pol.Proposals != "esp-aes256" {
+	if len(pol.Proposals) != 1 || pol.Proposals[0] != "esp-aes256" {
 		t.Errorf("proposals = %q, want esp-aes256", pol.Proposals)
 	}
 }
