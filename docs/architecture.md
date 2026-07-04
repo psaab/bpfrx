@@ -123,7 +123,27 @@ editing cmdtree.
 ## APIs
 
 - **gRPC** on `127.0.0.1:50051` — 48+ RPCs (config, sessions, stats,
-  routes, IPsec, DHCP, cluster).
+  routes, IPsec, DHCP, cluster). The loopback listener (`Server.Run`) is
+  the trusted local surface and serves the full service.
+- **Cluster fabric gRPC listener** (`Server.RunFabricListener`) — in
+  cluster mode xpfd binds a second gRPC listener on the sync/fabric IP
+  (`<fabric-ip>:50051`) so a node can proxy monitor requests to its peer
+  over the fabric link. This is the **only** network-exposed gRPC surface,
+  so it is **fail-closed** (#4122): a default-deny allowlist interceptor
+  pair (`fabricAllowlistUnaryInterceptor` / `fabricAllowlistStreamInterceptor`
+  in `pkg/grpcapi/server.go`) serves **only** the RPCs a node actually
+  proxies to its peer — `GetStatus`, `GetSessions`, `GetSessionSummary`,
+  `GetZonePairSummary`, `ShowText`, `ClearSessions` (unary) and
+  `MonitorInterface` (stream). Every other method (Commit, Delete,
+  Rollback, the config-mode surface) returns `PermissionDenied`.
+  `SystemAction` multiplexes fabric-safe cross-node cluster-failover with
+  destructive node actions under one method, so it is gated by request
+  action (`isFabricSafeSystemAction`): only the two proxied cross-node
+  forms (`cluster-failover-data:node<N>`, `cluster-failover:<rg>:node<N>`)
+  pass; `zeroize`/`reboot`/`halt`/`power-off` are denied on the fabric.
+  The interceptors are installed on the fabric listener only; the loopback
+  listener keeps the full service. (Peer-identity auth — PSK/HMAC/mTLS — is
+  the deferred half of #4107.)
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
 - **CLI** — interactive Junos-style with tab completion, `?` help, pipe

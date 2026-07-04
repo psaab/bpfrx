@@ -32378,3 +32378,69 @@ top.
     pkg/config/compiler_ipsec_trafficselector.go, pkg/config/compiler.go,
     pkg/ipsec/trafficselector_render_4098_test.go,
     pkg/config/compiler_ipsec_ts_4098_test.go, pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4122 — fail-closed fabric gRPC allowlist interceptor. The
+    cluster fabric listener (`RunFabricListener`, `pkg/grpcapi/server.go`)
+    registered the identical full 48-RPC `BpfrxService` as the loopback
+    `Run()` listener, guarded only by `configLockInterceptor` (a stale-lock
+    reaper, not auth). Since the loopback listener binds 127.0.0.1 and the
+    fabric listener binds the sync/fabric IP, the fabric listener is the ONLY
+    network-exposed gRPC surface — exposing SystemAction reboot/halt/
+    power-off/zeroize + Commit/Delete/Rollback UNAUTH on the fabric IP. Fix:
+    added a default-deny allowlist interceptor PAIR
+    (`fabricAllowlistUnaryInterceptor` / `fabricAllowlistStreamInterceptor`)
+    on the FABRIC listener only, chained with the existing
+    `configLockInterceptor` via `ChainUnaryInterceptor`/`ChainStreamInterceptor`.
+    Allowlist = exactly the peer-proxied RPCs (verified against every
+    `dialPeer()->NewBpfrxServiceClient` call site): GetStatus, GetSessions,
+    GetSessionSummary, GetZonePairSummary, ShowText, ClearSessions (unary) +
+    MonitorInterface (stream). SystemAction DECISION = NESTED-ACTION (not
+    blanket exclude): it multiplexes fabric-safe cluster-failover with
+    destructive actions, so `isFabricSafeSystemAction` permits ONLY the two
+    proxied cross-node forms (`cluster-failover-data:node<N>`,
+    `cluster-failover:<rg>:node<N>`) and denies zeroize/reboot/halt/power-off.
+    Chose nested over exclude because excluding SystemAction would make a
+    cross-node `request chassis cluster failover ... node <peer>` return
+    PermissionDenied when the initiating node proxies to the peer's fabric
+    listener — a shipped HA operator workflow regression. Loopback `Run()`
+    listener UNCHANGED (127.0.0.1 trusted, full service). RED-on-revert:
+    weakening the fix (SystemAction added to the plain allowlist) makes
+    zeroize/reboot reachable and fails the nested-gate + set-guard tests;
+    committed fix GREEN. `go test ./pkg/grpcapi/...` green; go build ./...,
+    go vet, gofmt clean. FLAG: touches the fabric proxy path — behavior is
+    PRESERVED for the two failover forms (nested-action), so no failover
+    regression, but test-failover is still warranted hygiene before terminal.
+  - **File(s)**: pkg/grpcapi/server.go,
+    pkg/grpcapi/server_fabric_allowlist_4122_test.go, docs/architecture.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4122 fold — Copilot finding: the nested-action fabric
+    SystemAction gate (`isFabricSafeSystemAction`) used a loose
+    HasPrefix/Contains match that admitted syntactically invalid node targets
+    (`cluster-failover:1:node99`, `cluster-failover:garbage:node1`,
+    `cluster-failover:1:node1:node2`) past the interceptor. The handler then
+    made an OUTBOUND proxy dial (targetNode != local) BEFORE rejecting the
+    malformed action — an avoidable operational/DoS vector on the unauth
+    fabric surface (zeroize was already backstopped by the exact-case switch;
+    this is the distinct proxy-dial-amplification vector). Fix: added
+    `parseProxiedFailoverAction` (server.go) — the SSOT for a well-formed
+    peer-proxied cross-node failover: strict `strconv.Atoi` on rgID + nodeID
+    and `IsSupportedClusterNodeID` (0/1) range check on the node, fail-closed
+    (ok=false) for any malformed/out-of-range/non-failover action or trailing
+    garbage. `isFabricSafeSystemAction` now delegates to it. The parse mirrors
+    the handler's own Atoi + IsSupportedClusterNodeID validation
+    (server_diag.go) so gate and handler agree; the interceptor admits a
+    strict SUBSET of what the handler accepts, so no legit proxied failover is
+    denied. Did NOT refactor the handler's own parse (preserves its distinct
+    InvalidArgument messages + avoids test-failover-critical churn) — the
+    interceptor is the fail-closed backstop for the network-exposed surface.
+    Tests: `TestParseProxiedFailoverAction` pins the SSOT parse; the
+    nested-gate test now asserts malformed/out-of-range suffixes are DENIED at
+    the interceptor (handler not invoked). RED-on-revert verified: restoring
+    the loose gate admits node99/nodeX/node1:node2 past the interceptor and
+    fails the tests. go test -count=1 ./pkg/grpcapi/... green; go build ./...,
+    vet, gofmt clean.
+  - **File(s)**: pkg/grpcapi/server.go,
+    pkg/grpcapi/server_fabric_allowlist_4122_test.go, _Log.md
