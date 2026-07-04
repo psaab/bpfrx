@@ -148,6 +148,30 @@ the bad entry — never MISLABEL a session as a wrong-but-plausible application:
   fixed identically; `TestAppCatalogParityOnTolerantLoadPortEdges` pins them
   byte-identical and dangling-free.
 
+## Protocol fan-out: omitted vs explicit `protocol 0` (#4008)
+
+An application with **no** `protocol` spec means "any L4": `BuildCatalog`
+(`catalog.go`) and the retired-eBPF mirror `compileApplications`
+(`pkg/dataplane/compiler.go`) each install ONE `CatalogEntry` per **TCP (6)**
+and **UDP (17)** under a single shared `app_id` (the Junos custom-application
+default). ICMP is naturally excluded — an ICMP app carries a non-empty
+protocol.
+
+An **explicit** `protocol <n>` — including `protocol 0` (IANA HOPOPT) — names a
+single, specific protocol and compiles to exactly one `CatalogEntry` for that
+protocol. Before #4008 the fan-out was keyed on the *resolved* protocol number
+being 0 (`proto == 0`), which conflated three distinct cases that all resolve to
+0: an omitted protocol (intended fan-out), an explicit `protocol 0`
+(`ProtocolNumber("0") == (0, true)`), and an unrepresentable token on the
+tolerant-load path (`ok == false`). So a single-protocol `protocol 0` app fanned
+out to BOTH TCP and UDP, and a policy referencing it over-matched (a TCP-only
+intent also matched the UDP flow on the same port). The fan-out is now keyed on
+the protocol being **absent** (`strings.TrimSpace(app.Protocol) == ""`), so only
+an omitted spec fans out; every explicit protocol stays single. Regression pins:
+`TestCatalogExplicitProtocol0DoesNotFanOut`,
+`TestCatalogProtocol0FromParsedConfig`, and `TestCatalogOmittedProtocolFansOut`
+in `catalog_proto0_4008_test.go`.
+
 ## ICMP type/code labeling (#3781 interim)
 
 The catalog wire (`AppCatalogEntrySnapshot`, `CatalogEntry`) is **L3/L4 only** —
