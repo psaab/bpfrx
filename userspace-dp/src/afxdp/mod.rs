@@ -444,6 +444,10 @@ pub(crate) use self::coordinator::ReconcileError;
 // kick_owner_rg_export so it can run the blocking ack-wait off the
 // global ServerState lock.
 pub(crate) use self::ha::OwnerRgExportWait;
+// #4054: re-export the two-phase all-sessions bulk export handle so the
+// control-socket dispatcher can run the lossless push loop off the global
+// ServerState lock (mirrors the OwnerRgExportWait split, #2962).
+pub(crate) use self::ha::AllSessionsExport;
 // #1636: re-export the warmer types/consts into afxdp scope so the
 // neighbor-warmer loop in neighbor.rs (which uses `use super::*`) and
 // the unit tests can name them without a fully-qualified path.

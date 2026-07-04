@@ -110,6 +110,14 @@ pub(crate) fn handle_stream(
     // the post-match status attach is also deferred until after the wait so
     // the reported status reflects the drained state.
     let mut export_wait: Option<crate::afxdp::OwnerRgExportWait> = None;
+    // #4054: the all-sessions bulk export follows the same off-lock split. The
+    // locked `match` arm only SNAPSHOTS the export (session-table copy + Arc
+    // handle + cloned zone map); the blocking `push_delta_lossless` loop runs
+    // below, AFTER the lock is dropped, so a large/backpressured bulk export can
+    // no longer freeze status polls, session installs, snapshot/FIB bumps, and
+    // HA state updates. As with `export_wait`, the post-match status attach is
+    // deferred until after the push.
+    let mut all_export: Option<crate::afxdp::AllSessionsExport> = None;
 
     {
         let mut guard = state.lock().expect("server state poisoned");
@@ -218,7 +226,11 @@ pub(crate) fn handle_stream(
                 // handle. The blocking ack-wait runs after the lock drops.
                 export_wait = Some(export::owner_rg_kick(&mut guard, request.session_export));
             }
-            "export_all_sessions" => export::all(&mut guard, &mut response),
+            "export_all_sessions" => {
+                // #4054: locked phase only — snapshot + capture the push
+                // handle. The blocking push loop runs after the lock drops.
+                all_export = export::all_kick(&mut guard, &mut response);
+            }
             "rebind" => rebind::handle(&mut guard, &mut persist_state),
             "stop_workers" => stop_workers::handle(&mut guard, &mut persist_state),
             "shutdown" => {
@@ -231,10 +243,11 @@ pub(crate) fn handle_stream(
                 response.error = format!("unknown request type {other}");
             }
         }
-        // #2962: defer status attach for the export verb — it is computed
-        // after the lock-free ack-wait below so it reflects the drained
-        // state (and is not produced while holding the lock across a wait).
-        if export_wait.is_none() && !suppress_status {
+        // #2962/#4054: defer status attach for the export verbs — it is
+        // computed after the lock-free ack-wait / push below so it reflects the
+        // drained state (and is not produced while holding the lock across a
+        // wait or a blocking push).
+        if export_wait.is_none() && all_export.is_none() && !suppress_status {
             refresh_status(&mut guard);
             response.status = Some(guard.status.clone());
         }
@@ -246,6 +259,19 @@ pub(crate) fn handle_stream(
     // lock acquisition (the wait is already done).
     if let Some(wait) = export_wait {
         export::owner_rg_collect(wait, &mut response, &mut persist_state);
+        if !suppress_status {
+            let mut guard = state.lock().expect("server state poisoned");
+            refresh_status(&mut guard);
+            response.status = Some(guard.status.clone());
+        }
+    }
+
+    // #4054: all-sessions bulk export push runs here, with the global
+    // ServerState lock RELEASED, so the control plane stays responsive while a
+    // large/backpressured bulk export serializes. Status is then re-derived
+    // under a fresh short-lived lock acquisition (the push is already done).
+    if let Some(export) = all_export {
+        export::all_push(export, &mut response);
         if !suppress_status {
             let mut guard = state.lock().expect("server state poisoned");
             refresh_status(&mut guard);

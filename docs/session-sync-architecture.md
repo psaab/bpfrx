@@ -441,6 +441,40 @@ advance their ack atomics (monotonic seq) and push into their delta buffers —
 both `Arc`-shared and lock-free — so the snapshot observes their progress
 faithfully. The 15 s deadline and the timeout error are preserved verbatim.
 
+**The all-sessions bulk export push ALSO runs OFF the global `ServerState`
+lock (#4054).** The `export_all_sessions` verb
+(`Coordinator::snapshot_all_sessions_export` → `AllSessionsExport::push`) is the
+coordinator-driven bulk export used on peer connect / FullResync. It iterates the
+shared session table and pushes each qualifying local forward session as an Open
+delta through the event stream via `push_delta_lossless`, which retries a full
+event-stream channel up to a **5 s** per-delta lossless-queue timeout. Pre-#4054
+the whole export — the table iteration AND the `push_delta_lossless` serialization
+loop — ran inside the dispatcher's `ServerState` `match` arm, i.e. UNDER the global
+lock. On a firewall with many sessions, a bulk export against a slow/backpressured
+peer stream could hold the lock long enough for the status poll to miss the control
+plane's liveness deadline → a false dataplane-failure → a needless helper restart
+(which drops all sessions and flaps forwarding) — precisely at failover, the worst
+time. The handler is therefore split like the owner-RG path:
+
+- **Locked phase** (`Coordinator::snapshot_all_sessions_export`, dispatcher
+  `all_kick`): under the global lock, iterate the session table once under a brief
+  `sessions.synced` lock, copy each qualifying session into an Open `SessionDelta`,
+  and capture the Arc-cheap event-stream worker handle plus an OWNED clone of the
+  zone-name→id map. Returns an `AllSessionsExport` immediately — no push yet.
+- **Lock-free phase** (`AllSessionsExport::push`): the dispatcher drops the
+  `ServerState` lock, then runs the `push_delta_lossless` loop over the captured
+  snapshot. Status is re-derived afterward under a fresh short-lived lock. While
+  one bulk export serializes/backpressures, all other control RPCs proceed.
+
+The exported set is a consistent point-in-time snapshot (deltas built under
+`sessions.synced`, zone map cloned in the same locked phase), so a session or zone
+mutation racing the push is simply not in THIS bulk export — it rides the
+incremental delta stream — identical to the pre-#4054 semantics, which already
+snapshotted the deltas under `sessions.synced` before serializing (only the GLOBAL
+lock scope changes). Event-stream ordering stays governed by `producer_seq_lock`
+inside `push_delta_lossless`, not the `ServerState` lock, so releasing the latter
+does not affect the lossless seq contract (#2874 / #3878).
+
 ### Delta-ring overflow → loss-of-sync resync (#2442)
 
 Each worker buffers session open/close deltas in an in-worker ring

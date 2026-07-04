@@ -601,22 +601,43 @@ impl super::Coordinator {
         0
     }
 
-    /// Export all locally-owned forward sessions through the event stream.
+    /// Snapshot all locally-owned forward sessions for a bulk HA export
+    /// WITHOUT pushing them (#4054).
     ///
     /// Called on peer connect instead of the old BulkSync path. Iterates the
-    /// shared session table and pushes each qualifying session as an Open event
-    /// through the event stream, where the Go daemon's handleEventStreamDelta
-    /// callback will queue it to the peer via QueueSessionV4/V6.
+    /// shared session table once under a BRIEF `sessions.synced` lock, copies
+    /// each qualifying session into an Open [`SessionDelta`], and captures the
+    /// (Arc-cheap) event-stream handle plus an OWNED clone of the zone-name→id
+    /// map. The returned [`AllSessionsExport`] carries everything the push loop
+    /// needs, so the caller can run the potentially-blocking
+    /// `push_delta_lossless` serialization with the global `ServerState` lock
+    /// RELEASED — mirroring the owner-RG two-phase split (#2962). Before #4054
+    /// the whole export (iteration + serialization + up to a 5 s per-delta
+    /// lossless-queue backpressure wait) ran under the global lock, so a large
+    /// bulk export at failover could starve the status poll / trip the control
+    /// plane's liveness deadline and self-inflict a needless helper restart.
     ///
-    /// Returns the number of sessions exported.
-    pub fn export_all_sessions_to_event_stream(&self) -> Result<usize, String> {
+    /// The exported set is a consistent point-in-time snapshot: the delta
+    /// vector is built under the `sessions.synced` lock, and the zone map is
+    /// cloned within the same locked dispatcher phase, so a session or zone
+    /// mutation racing the subsequent push is simply not reflected in THIS bulk
+    /// export (it rides the incremental delta stream instead) — identical
+    /// semantics to the pre-#4054 code, which likewise snapshotted the deltas
+    /// under the same lock before serializing. Event-stream ordering is still
+    /// governed by `producer_seq_lock` inside `push_delta_lossless`, not the
+    /// `ServerState` lock, so releasing the latter does not affect the lossless
+    /// seq contract (#2874 / #3878).
+    pub fn snapshot_all_sessions_export(&self) -> Result<AllSessionsExport, String> {
         let es = self
             .event_stream
             .as_ref()
             .ok_or_else(|| "event stream not started".to_string())?;
         let handle = es.worker_handle();
 
-        let zone_name_to_id = &self.forwarding.zone_name_to_id;
+        // Clone the zone map so the push loop can run off the global lock:
+        // `push_delta_lossless` borrows it, and a borrow of `self.forwarding`
+        // would otherwise pin coordinator state across the (blocking) push.
+        let zone_name_to_id = self.forwarding.zone_name_to_id.clone();
 
         let sessions = self
             .sessions.synced
@@ -677,14 +698,97 @@ impl super::Coordinator {
         }
         drop(sessions);
 
-        let count = deltas.len();
-        for delta in &deltas {
-            handle.push_delta_lossless(delta, zone_name_to_id)?;
+        Ok(AllSessionsExport {
+            handle,
+            zone_name_to_id,
+            deltas,
+        })
+    }
+
+    /// #4054 test seam: install a qualifying LOCAL forward session (owner-RG 0
+    /// so the RG-active gate is bypassed, `ForwardCandidate` disposition, local
+    /// `ForwardFlow` origin so it is not skipped as peer-synced) so a dispatcher
+    /// test can drive a non-empty bulk export against a backpressured event
+    /// stream. `idx` gives each call a distinct 5-tuple.
+    #[cfg(test)]
+    pub(crate) fn test_install_local_forward_session(&self, idx: u16) {
+        use std::net::{IpAddr, Ipv4Addr};
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 40000 + idx,
+            dst_port: 5201,
+        };
+        let resolution = ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: Some([6, 7, 8, 9, 10, 11]),
+            tx_vlan_id: 0,
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 3,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        };
+        self.upsert_synced_session(SyncedSessionEntry {
+            key,
+            decision: SessionDecision {
+                resolution,
+                nat: NatDecision::default(),
+            },
+            metadata,
+            origin: SessionOrigin::ForwardFlow,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+            generation: 0,
+        });
+    }
+}
+
+/// A prepared bulk session export captured by
+/// [`Coordinator::snapshot_all_sessions_export`] under the global
+/// `ServerState` lock, so the (potentially blocking) lossless push loop can
+/// run with that lock RELEASED (#4054). Mirrors [`OwnerRgExportWait`]'s
+/// off-lock design (#2962): everything the push needs — the Arc-cheap
+/// event-stream worker handle, an OWNED zone-name→id map, and the point-in-time
+/// session-delta snapshot — is captured by value, so no coordinator borrow is
+/// held across `push`.
+pub struct AllSessionsExport {
+    handle: crate::event_stream::EventStreamWorkerHandle,
+    zone_name_to_id: FxHashMap<String, u16>,
+    deltas: Vec<crate::session::SessionDelta>,
+}
+
+impl AllSessionsExport {
+    /// Push the snapshotted Open deltas through the lossless event-stream
+    /// producer. Runs WITHOUT the global `ServerState` lock (#4054), so a large
+    /// or backpressured bulk export (each `push_delta_lossless` retries up to
+    /// the 5 s lossless-queue timeout) can no longer freeze status polls,
+    /// session installs, or HA state updates on that lock. Returns the number
+    /// of sessions pushed on success.
+    pub fn push(self) -> Result<usize, String> {
+        let count = self.deltas.len();
+        for delta in &self.deltas {
+            self.handle
+                .push_delta_lossless(delta, &self.zone_name_to_id)?;
         }
-        eprintln!(
-            "xpf-ha: exported {} sessions to event stream for bulk sync",
-            count
-        );
+        eprintln!("xpf-ha: exported {count} sessions to event stream for bulk sync");
         Ok(count)
     }
 }

@@ -1643,6 +1643,79 @@ fn export_owner_rg_does_not_hold_state_lock_during_ack_wait() {
     ack_thread.join().expect("ack thread");
 }
 
+// --- #4054: all-sessions bulk export must not hold the ServerState lock ----
+
+/// Fail-on-revert: the all-sessions bulk export (`export_all_sessions`) must run
+/// its (potentially blocking) `push_delta_lossless` serialization WITHOUT
+/// holding the global `ServerState` lock, so a large or backpressured bulk
+/// export at failover cannot freeze the control plane and self-inflict a
+/// needless helper restart. This installs a CONNECTED event stream whose
+/// channel holds a single slot and several qualifying local forward sessions,
+/// so after the first delta the push loop blocks against the full channel (up
+/// to the 5 s lossless-queue timeout). It then proves a concurrent `status`
+/// poll is still served promptly. If the push runs under the lock again (the
+/// bug), the status poll blocks until the push drains/times out — RED.
+#[test]
+fn export_all_sessions_does_not_hold_state_lock_during_push() {
+    use crate::event_stream::EventStreamSender;
+    use std::time::{Duration, Instant};
+
+    let state = new_state(ProcessStatus::default());
+
+    // Connected event stream, single-slot channel: the first pushed delta fills
+    // it, and every later delta retries against the full channel. Keep `rx`
+    // alive — dropping it disconnects the channel, which makes push fail
+    // IMMEDIATELY instead of blocking (and would mask the bug on revert).
+    let rx = {
+        let mut guard = state.lock().expect("lock state");
+        let (sender, rx) = EventStreamSender::test_sender(true, 1);
+        guard.afxdp.event_stream = Some(sender);
+        for i in 0..4u16 {
+            guard.afxdp.test_install_local_forward_session(i);
+        }
+        rx
+    };
+
+    // Kick the bulk export in the background: it snapshots the session set under
+    // a BRIEF lock, releases the global ServerState lock, then blocks in the
+    // push loop against the full channel.
+    let export_state = state.clone();
+    let export_thread =
+        std::thread::spawn(move || run_request(export_state, req("export_all_sessions")));
+
+    // Let the export reach its (blocked) push.
+    std::thread::sleep(Duration::from_millis(150));
+
+    // The control plane MUST answer a status poll WHILE the export's push loop
+    // is blocked. With the push under the global lock (the #4054 bug) this
+    // blocks until the 5 s lossless timeout releases the lock → RED.
+    let t0 = Instant::now();
+    let resp = run_request(state.clone(), req("status"));
+    let elapsed = t0.elapsed();
+    assert!(resp.ok, "status poll failed: {}", resp.error);
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "status poll blocked {elapsed:?} during all-sessions bulk export — \
+         ServerState lock held across push_delta_lossless (#4054 regression)"
+    );
+
+    // Drain the channel so the blocked push loop makes progress and the export
+    // thread finishes promptly instead of waiting the full 5 s per-delta
+    // timeout. Stop once no frame arrives for a short grace period (export done
+    // pushing).
+    let drainer = std::thread::spawn(move || {
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+    });
+
+    let export_resp = export_thread.join().expect("export thread");
+    drainer.join().expect("drainer thread");
+    assert!(
+        export_resp.ok,
+        "bulk export failed: {}",
+        export_resp.error
+    );
+}
+
 /// #3773 (L4): an `update_fabrics` that CHANGES the fabric set must fold the
 /// freshly-resolved FabricSnapshots into the STORED snapshot AND persist. The
 /// helper starts with `snapshot: None` and never self-restores, so the
