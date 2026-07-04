@@ -1,3 +1,38 @@
+## 2026-07-03 — #4001: proxyARPReassertLoop re-installs responders without the apply semaphore
+
+- **Timestamp**: 2026-07-03
+  - **Action**: Fixed fable-161 F-170 (MEDIUM, HA/config race). The always-on
+    proxy-ARP re-assert loop (`proxyARPReassertLoop`, #2197 item 2) read
+    `d.store.ActiveConfig()` and ran `reconcileProxyARP` WITHOUT holding
+    `d.applySem` — the same semaphore the commit/config-apply path holds
+    across `store.Commit` + `applyConfigLocked` (which calls
+    `reconcileProxyARP`). A tick could interleave with a commit that REMOVES
+    a proxy-arp responder: the loop captured the pre-commit config (still
+    listing the responder), and after the commit's reconcile had already torn
+    the responder down, re-installed it from that stale snapshot — the #2475
+    diff then remembered it as enabled, so the firewall kept answering ARP for
+    a removed/moved VIP until the next commit (an HA blackhole / mis-steer when
+    the VIP had moved to the peer).
+  - **Fix**: extracted `reassertProxyARPOnce(ctx)` which acquires `applySem`
+    FIRST, then reads `ActiveConfig()` under the lock and reconciles. Lock
+    order matches the commit path (applySem -> proxyARPEnabledMu); the
+    reconcile never re-acquires applySem, so no self-deadlock. The reconcile
+    is netlink + procfs only on a 30s cadence, so holding applySem for it does
+    not starve commits. On shutdown the loop ctx cancels and Acquire returns
+    promptly. Relationship to #2197: #2197 item 2 is the feature that CREATED
+    this loop; #4001 hardens it against the commit race (distinct, not a dup —
+    #2197 stays open for items 1/3).
+  - **Tests**: `TestReassertProxyARPOnce_HoldsApplySem` (RED-on-revert: probes
+    that the reconcile runs under a held applySem via a non-blocking
+    TryAcquire from inside the fake reconcile) and
+    `TestReassertProxyARPOnce_SerializesWithCommit` (RED-on-revert: a commit
+    holds applySem + promotes a proxy-arp-removed config; the re-assert must
+    block, then reconcile the post-commit config — never the stale snapshot).
+    Both go RED when the Acquire is reverted. Existing loop tests updated to
+    construct the Daemon with a real `applySem`.
+  - **File(s)**: `pkg/daemon/daemon_proxyarp.go`, `pkg/daemon/daemon.go`,
+    `pkg/daemon/daemon_proxyarp_test.go`, `docs/feature-gaps.md`, `_Log.md`
+
 ## 2026-07-03 — #3992: WG wg_encap_frame resolved the outer underlay route TWICE per packet
 
 - **Timestamp**: 2026-07-03
