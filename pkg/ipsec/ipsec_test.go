@@ -233,11 +233,15 @@ func TestResolveESPSettings_DanglingProposalPreservesPFS(t *testing.T) {
 	}
 }
 
-// TestResolveESPSettings_DanglingProposalNoPFSStaysDefault verifies that a
-// dangling proposal reference with NO configured PFS still falls to
-// "default" — there is no security control to preserve, so the render
-// behavior is unchanged from before #2073.
-func TestResolveESPSettings_DanglingProposalNoPFSStaysDefault(t *testing.T) {
+// TestResolveESPSettings_DanglingProposalNoPFSFailsClosed is the #4117
+// regression. A dangling proposal reference with NO configured PFS must NOT
+// silently fall through to "default" (strongSwan's compiled-in ESP suite):
+// the NAMED proposal reference carries the operator's cipher/integrity
+// intent, and substituting the built-in default silently weakens ESP. The
+// renderer emits the conservative fixed fallback aes256-sha256 — parity with
+// the pfsGroup > 0 case (#2073), which already emits aes256-sha256-modp
+// rather than skipping. On revert this returns "default" and goes RED.
+func TestResolveESPSettings_DanglingProposalNoPFSFailsClosed(t *testing.T) {
 	cfg := &config.IPsecConfig{
 		Policies: map[string]*config.IPsecPolicyDef{
 			"ipsec-pol": {
@@ -246,12 +250,71 @@ func TestResolveESPSettings_DanglingProposalNoPFSStaysDefault(t *testing.T) {
 				Proposals: []string{"does-not-exist"},
 			},
 		},
+		// Proposals deliberately omits "does-not-exist" — dangling ref.
+	}
+	vpn := &config.IPsecVPN{IPsecPolicy: "ipsec-pol"}
+
+	got, lifetime := resolveESPSettings(cfg, vpn)
+	if got == "default" {
+		t.Fatalf("dangling ESP proposal ref silently downgraded to the "+
+			"strongSwan default suite: got %q", got)
+	}
+	if got != "aes256-sha256" {
+		t.Fatalf("resolveESPSettings = %q, want conservative fixed fallback "+
+			"aes256-sha256 (dangling ref, no PFS)", got)
+	}
+	if lifetime != 0 {
+		t.Errorf("lifetime = %d, want 0 (no resolvable proposal to take a lifetime from)", lifetime)
+	}
+}
+
+// TestResolveESPSettings_DanglingPolicyRefFailsClosed covers the sibling
+// dangling case (#4117): the VPN names an ipsec-policy that is not defined at
+// all (neither a policy object nor a legacy proposal of that name). This too
+// must fail closed to the conservative fixed suite rather than silently emit
+// esp_proposals = default. No policy resolves, so no PFS group is available
+// and the fallback carries no modp term.
+func TestResolveESPSettings_DanglingPolicyRefFailsClosed(t *testing.T) {
+	cfg := &config.IPsecConfig{
+		// Neither Policies nor Proposals defines "ipsec-pol".
 	}
 	vpn := &config.IPsecVPN{IPsecPolicy: "ipsec-pol"}
 
 	got, _ := resolveESPSettings(cfg, vpn)
-	if got != "default" {
-		t.Errorf("resolveESPSettings = %q, want default (no PFS configured)", got)
+	if got == "default" {
+		t.Fatalf("dangling ESP policy ref silently downgraded to the "+
+			"strongSwan default suite: got %q", got)
+	}
+	if got != "aes256-sha256" {
+		t.Fatalf("resolveESPSettings = %q, want conservative fixed fallback "+
+			"aes256-sha256 (dangling policy ref)", got)
+	}
+}
+
+// TestGenerateConfig_DanglingProposalNoPFSFailsClosed is the #4117 full-render
+// regression: a dangling ESP proposal reference with no PFS must render
+// esp_proposals = aes256-sha256, never esp_proposals = default.
+func TestGenerateConfig_DanglingProposalNoPFSFailsClosed(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"tun1": {
+				Gateway:     "172.16.0.1",
+				IPsecPolicy: "ipsec-pol",
+				LocalID:     "10.0.1.0/24",
+				RemoteID:    "10.0.2.0/24",
+			},
+		},
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {Name: "ipsec-pol", PFSGroup: 0, Proposals: []string{"does-not-exist"}},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if strings.Contains(got, "esp_proposals = default") {
+		t.Errorf("dangling ESP ref silently downgraded to esp_proposals = default:\n%s", got)
+	}
+	if !strings.Contains(got, "esp_proposals = aes256-sha256\n") {
+		t.Errorf("expected conservative fixed esp_proposals = aes256-sha256, got:\n%s", got)
 	}
 }
 
