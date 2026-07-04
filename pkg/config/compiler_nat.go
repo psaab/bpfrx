@@ -8,16 +8,44 @@ import (
 	"strings"
 )
 
+// defaultPoolAlarmHysteresis is the gap, in utilization percentage points,
+// placed below the raise-threshold when an operator configures a raise-only
+// pool-utilization-alarm (no explicit clear-threshold). A 10-point gap gives
+// the alarm state machine hysteresis so it does not flap around the raise
+// boundary, and keeps the defaulted clear inside the valid 1..raise-1 band for
+// every realistic raise (>= 2). Junos allows a raise-only alarm; xpf mirrors
+// that by synthesizing this clear rather than requiring the operator to name
+// one (#4077).
+const defaultPoolAlarmHysteresis = 10
+
+// defaultPoolAlarmClearThreshold returns the clear-threshold to use when the
+// operator supplied only a raise-threshold. It is raise minus a fixed
+// hysteresis margin, floored at 1 so it stays a valid percentage. For raise >=
+// 2 the result is strictly less than raise (0 < clear < raise), so it passes
+// the commit gate and enables the runtime alarm; e.g. raise 90 -> clear 80,
+// raise 50 -> clear 40, raise 5 -> clear 1.
+func defaultPoolAlarmClearThreshold(raise int) int {
+	clear := raise - defaultPoolAlarmHysteresis
+	if clear < 1 {
+		clear = 1
+	}
+	return clear
+}
+
 // validatePoolUtilizationAlarm is the #2079 strict-vs-lenient gate for the
 // `security nat source pool-utilization-alarm raise-threshold/clear-threshold`
-// thresholds. Junos requires raise > clear; a bare `pool-utilization-alarm;`
-// compiles to raise=0/clear=0 (an always-firing alarm) and inverted/equal
-// thresholds make hysteresis meaningless. Strict (commit / commit-check):
-// hard-reject. Lenient (load / peer-sync, #1979 doctrine): return the message
-// as a warning so a config committed before this gate existed still boots
-// (#1960 fail-closed-on-compile-failure would otherwise brick the daemon on
-// restart). The runtime monitor treats raise<=0 as disabled, so a leniently
-// loaded bad config is inert, not always-firing.
+// thresholds. Junos requires only raise-threshold; clear-threshold is optional
+// and, when omitted, is defaulted at parse time to a hysteresis margin below
+// raise (defaultPoolAlarmClearThreshold, #4077) so a raise-only alarm both
+// commits and runs. This gate therefore only ever sees a zero/invalid
+// clear-threshold when the operator EXPLICITLY provided one. A bare
+// `pool-utilization-alarm;` compiles to raise=0/clear=0 (an always-firing
+// alarm) and inverted/equal thresholds make hysteresis meaningless. Strict
+// (commit / commit-check): hard-reject. Lenient (load / peer-sync, #1979
+// doctrine): return the message as a warning so a config committed before this
+// gate existed still boots (#1960 fail-closed-on-compile-failure would
+// otherwise brick the daemon on restart). The runtime monitor treats raise<=0
+// as disabled, so a leniently loaded bad config is inert, not always-firing.
 func validatePoolUtilizationAlarm(cfg *Config, lenient bool) ([]string, error) {
 	if cfg == nil {
 		return nil, nil
@@ -1449,6 +1477,15 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 	// Parse pool-utilization-alarm
 	if alarmNode := node.FindChild("pool-utilization-alarm"); alarmNode != nil {
 		alarm := &PoolUtilizationAlarmConfig{}
+		// clearSet records whether the operator explicitly provided a
+		// clear-threshold token. Junos makes clear-threshold OPTIONAL: a
+		// raise-only alarm is legal (#4077). When it is omitted we default it
+		// to a hysteresis margin below raise (defaultPoolAlarmClearThreshold),
+		// so the raise-only config compiles AND the runtime monitor enables the
+		// alarm (it treats clear<=0 as disabled). An EXPLICIT clear-threshold —
+		// even an invalid one like 0 or >= raise — is preserved verbatim so the
+		// commit gate still rejects it.
+		clearSet := false
 		for _, ap := range alarmNode.Children {
 			switch ap.Name() {
 			case "raise-threshold":
@@ -1458,6 +1495,7 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					}
 				}
 			case "clear-threshold":
+				clearSet = true
 				if v := nodeVal(ap); v != "" {
 					if n, err := strconv.Atoi(v); err == nil {
 						alarm.ClearThreshold = n
@@ -1473,10 +1511,16 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				}
 			}
 			if alarmNode.Keys[i] == "clear-threshold" && i+1 < len(alarmNode.Keys) {
+				clearSet = true
 				if n, err := strconv.Atoi(alarmNode.Keys[i+1]); err == nil {
 					alarm.ClearThreshold = n
 				}
 			}
+		}
+		// Raise-only config: default the clear-threshold to a hysteresis margin
+		// below raise so the alarm is usable without an explicit clear.
+		if alarm.RaiseThreshold > 0 && !clearSet {
+			alarm.ClearThreshold = defaultPoolAlarmClearThreshold(alarm.RaiseThreshold)
 		}
 		sec.NAT.PoolUtilizationAlarm = alarm
 	}
