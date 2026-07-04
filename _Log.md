@@ -29166,6 +29166,40 @@ top.
   helper tests), pkg/configstore/store_test.go
   (TestAnnotateRejectsCommentDelimiter), docs/phases.md (#3900 note)
 
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3909 — keep the SYN-cookie master key out of the
+  world-readable state.json (secret exposure, MEDIUM). The helper persists
+  a JSON snapshot of `ServerState` to `state.json` via
+  `server::helpers::write_state`; that file is created with the process
+  umask (world-readable 0644). `ConfigSnapshot::syn_cookie_master_key` was
+  serialized into it in plaintext — a local unprivileged user could read
+  the master key, forge valid SYN cookies, and defeat SYN-flood source
+  validation. WG private keys / PSKs already avoid this via
+  `#[serde(skip_serializing)]`; mirror that exactly. FINDING: the key is
+  DETERMINISTIC, not random — the Go control plane derives it from the
+  cluster-synced root secret + cluster-id + screened zones
+  (`buildSYNCookieMasterKey`, pkg/dataplane/userspace/screens.go) and
+  re-delivers it on every config push via `apply_snapshot`.
+  `ServerState.snapshot` starts `None` on boot and is never restored from
+  `state.json`, so the control plane always re-supplies the key after a
+  restart — no Rust-side regeneration needed. A fresh random per-boot key
+  would BREAK HA (both chassis must derive the identical key for
+  cross-node cookie validation across failover), so skip-serialize +
+  control-plane re-delivery is the correct fix, not regenerate-on-boot.
+  Verified no OTHER secret leaks into the snapshot the same way — only
+  wg_local_privkey_hex, wg_preshared_key_hex (both already
+  skip_serializing), and this key. RED-on-revert: removing
+  `skip_serializing` makes `syn_cookie_master_key_is_skipped_in_state_snapshot`
+  go RED (field name + key bytes reappear in the serialized snapshot).
+  Full cargo test --release green; go build ./... clean.
+- **File(s)**: userspace-dp/src/protocol/snapshot.rs (skip_serializing +
+  doc), userspace-dp/src/protocol/tests.rs
+  (syn_cookie_master_key_is_skipped_in_state_snapshot RED-on-revert +
+  control-socket-delivery decode), userspace-dp/src/afxdp/forwarding_build/tests.rs
+  (syn_cookie_master_key_from_snapshot_reaches_forwarding_state),
+  docs/syn-cookie-flood-protection.md (on-disk state hygiene section)
 ## 2026-07-03 — #3904 multi-value bracket-list truncation bundle (F-040/F-161/F-162/F-163)
 
 - **Timestamp**: 2026-07-03

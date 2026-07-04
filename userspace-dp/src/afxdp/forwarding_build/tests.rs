@@ -69,6 +69,30 @@ fn parse_syn_cookie_master_key_rejects_malformed_keys() {
     }
 }
 
+// #3909: the SYN-cookie master key is `skip_serializing` (kept out of the
+// world-readable state.json), but it is STILL delivered on the control socket
+// via `apply_snapshot` and must reach the dataplane so source validation
+// functions. This asserts that a snapshot carrying the key (the control-plane
+// delivery path — i.e. the post-restart re-push) produces a live
+// `syn_cookie_master_key` in the forwarding state. A valid key present here is
+// what makes the SYN-cookie source-validation check work.
+#[test]
+fn syn_cookie_master_key_from_snapshot_reaches_forwarding_state() {
+    let snapshot = ConfigSnapshot {
+        syn_cookie_master_key: "00112233445566778899aabbccddeeff".into(),
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(
+        state.syn_cookie_master_key,
+        Some([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]),
+        "control-plane-delivered key must reach the dataplane for source validation"
+    );
+}
+
 #[test]
 fn forwarding_state_refresh_preserves_three_color_runtime_state() {
     let policy_counters = PolicyCounterStore::default();

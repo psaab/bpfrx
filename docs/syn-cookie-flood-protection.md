@@ -302,6 +302,33 @@ omits the key and fails closed instead of minting predictable cookies; config
 validation also warns and userspace capability admission refuses active
 SYN-cookie screen profiles until the secret exists.
 
+### On-disk state hygiene: the master key is never persisted (#3909)
+
+The SYN-cookie master key is the secret that makes minted cookies
+unforgeable — the source-validation check hashes a returning ACK against
+it. The helper persists a JSON snapshot of its `ServerState` to
+`state.json` (via `server::helpers::write_state`), and that file is
+created with the process umask (world-readable, mode 0644). The master
+key therefore carries `#[serde(skip_serializing)]` on
+`ConfigSnapshot::syn_cookie_master_key`, exactly like the WireGuard
+private key (`wg_local_privkey_hex`) and per-peer PSK
+(`wg_preshared_key_hex`), so it is NEVER written into that world-readable
+file. A local unprivileged user who could read the key would be able to
+forge valid SYN cookies and defeat source validation.
+
+No Rust-side regeneration is needed: the key is deterministic — the Go
+control plane derives it from the cluster-synced root secret + cluster-id
++ screened zones (`buildSYNCookieMasterKey`,
+`pkg/dataplane/userspace/screens.go`) and re-delivers it on every config
+push over the control socket (`apply_snapshot`). `ServerState.snapshot`
+starts `None` on boot and is never restored from `state.json`, so the
+control plane always supplies the key after a restart. A fresh random
+per-boot key would instead break HA: both chassis must derive the SAME
+key for cross-node cookie validation to survive failover. The
+skip-serialize omission is pinned by
+`syn_cookie_master_key_is_skipped_in_state_snapshot`
+(`userspace-dp/src/protocol/tests.rs`).
+
 Cookie replies are host-generated flood-control frames. They intentionally
 bypass output filters, CoS classification, DSCP rewrite, and mirroring, matching
 the legacy eBPF `XDP_TX` behavior instead of treating replies as forwarded
