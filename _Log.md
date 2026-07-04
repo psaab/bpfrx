@@ -29128,3 +29128,50 @@ top.
   pkg/config/freetext_test.go (RED-on-revert injection + reject +
   helper tests), pkg/configstore/store_test.go
   (TestAnnotateRejectsCommentDelimiter), docs/phases.md (#3900 note)
+
+## 2026-07-03
+
+- **Timestamp**: 2026-07-03
+- **Action**: #3906 — apply SNAT pool `port range <low> to <high>` +
+  `port no-translation` (both were silently ignored) and add a strict
+  commit gate for a reversed/out-of-range source-pool port range.
+  ROOT: `compiler_nat.go` accepted only the non-Junos `range low <lo>
+  high <hi>` shape, so the Junos `port range <low> to <high>` never
+  applied → the pool defaulted to 1024-65535 PAT; `no-translation` was
+  dropped → the pool PAT-translated the port anyway; a reversed /
+  out-of-range range committed green then dropped the rule at runtime.
+  FIX: (parse) new `parseSourcePoolPortRange` accepts BOTH the Junos
+  `<low> to <high>` (and bare `<low>`) and the legacy `low <lo> high
+  <hi>` shapes, wired into the flat-leaf AND schema-grouped-child `port`
+  parsing; `port no-translation` sets a new `NATPool.PortNoTranslation`
+  flag. (apply) `no-translation` preserves the source port in the
+  dataplane via a new `pool_no_translation` wire bool → Rust
+  `SourceNatRule.no_translation` → the match path takes the address-only
+  branch (pick pool address, leave `rewrite_src_port` unset →
+  checksum.rs `unwrap_or(key.src_port)` keeps the port; per-flow cached
+  in flow_cache; no pool port consumed), mirroring the #3111 port-less
+  path. (validate) `validateSourceNATPoolStrict` hard-rejects a reversed
+  (low > high) or out-of-range (not 1-65535) explicitly-configured range
+  at commit; lenient-load downgrades to a warning (#1960); the snapshot
+  builder independently fails closed via `sourceNATPoolPortRange`.
+  Wire fixture regenerated (one added key `pool_no_translation`).
+  RED-on-revert: `port range 5000 to 6000` → pool + snapshot 5000/6000
+  (default 1024/65535 on revert); `port no-translation` → preserve flag
+  + Rust `rewrite_src_port: None` + used_ports 0 (Some(_) + PAT on
+  revert); reversed `6000 to 5000` rejected at commit (accepted on
+  revert). go test ./pkg/config/... ./pkg/dataplane/... green; targeted
+  cargo test green; go build ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/config/types_security.go (NATPool.PortNoTranslation),
+  pkg/config/compiler_nat.go (parseSourcePoolPortRange + port parse),
+  pkg/config/compiler_validate_strict.go (validateSourceNATPoolStrict),
+  pkg/config/compiler.go (gate registration),
+  pkg/config/schema_security.go (port range desc + no-translation leaf),
+  pkg/dataplane/userspace/protocol.go (PoolNoTranslation wire field),
+  pkg/dataplane/userspace/nat.go (set PoolNoTranslation),
+  userspace-dp/src/protocol/nat.rs (pool_no_translation),
+  userspace-dp/src/nat/source.rs (no_translation field + match path +
+  runtime_compatible), userspace-dp/tests/fixtures/protocol_wire_v1.json
+  (regen), pkg/config/compiler_nat_source_pool_port_3906_test.go,
+  pkg/dataplane/userspace/nat_source_pool_port_3906_test.go,
+  userspace-dp/src/nat/tests.rs (no-translation match test),
+  docs/userspace-dataplane-gaps.md (#3906 note)
