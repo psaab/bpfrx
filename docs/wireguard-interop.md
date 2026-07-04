@@ -416,6 +416,23 @@ S1 makes xpf's WireGuard **handshake bytes** standards-compliant:
   whitened nanoseconds (`& 0xFF000000`). The clock is strictly monotonic
   in-process so xpf never DoSes its own re-handshakes with a backwards
   timestamp. Carried as the encrypted Noise payload of message 1.
+- **Responder handshake anti-replay** (`Peer::greatest_tai64n`,
+  `check_and_update_tai64n`, #4092): the greatest TAI64N ever accepted in a
+  type-1 initiation from a peer is held per-peer; an initiation whose
+  recovered TAI64N is `<=` that high-water is a replay/reorder and is
+  rejected (whitepaper §5.1; kernel `memcmp(timestamp, last_timestamp) > 0`).
+  **Reload survival (#4103):** an identity-changing WG config commit (add an
+  allowed-ip, rotate a PSK, add/remove a peer) rebuilds the engine via
+  `WgEngine::new`, which starts from an empty peer table and would give every
+  surviving peer a fresh `greatest_tai64n = [0; 12]`. `populate_wg_engines`
+  (`forwarding_build/wg.rs`) carries each surviving peer's high-water forward
+  across the rebuild, keyed by pubkey (`greatest_tai64n_by_pubkey` /
+  `seed_greatest_tai64n`) — the incoming-side mirror of the #1432 initiator
+  clock re-seed. A new or re-keyed pubkey correctly starts fresh (a different
+  peer identity). Without the carry-over, a benign commit would silently
+  disarm the anti-replay for every peer, letting an attacker replay a
+  captured initiation. Matches kernel / wireguard-go, which retain per-peer
+  `last_timestamp` across a reconfigure.
 - **Handshake framing** (`userspace-dp/src/afxdp/wg/handshake.rs`): the WG
   type-1 MessageInitiation (148 bytes) and type-2 MessageResponse (92 bytes)
   on-wire framing — type byte, reserved, sender/receiver index, and

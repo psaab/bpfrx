@@ -243,6 +243,31 @@ impl Peer {
         }
     }
 
+    /// #4103: snapshot this peer's responder anti-replay high-water mark
+    /// (`greatest_tai64n`) so a fresh engine built on an identity-changing
+    /// config commit can carry it forward. This is the incoming-side
+    /// mirror of the initiator clock's #1432 rebuild-survival seeding
+    /// (`WgEngine::tai64n_high_water`): the outgoing clock is one
+    /// engine-wide value, but the responder high-water is per-peer, so it
+    /// must be snapshotted and re-seeded per pubkey. Slow control-thread
+    /// path only.
+    pub(crate) fn greatest_tai64n(&self) -> [u8; TAI64N_LEN] {
+        *self.greatest_tai64n.lock().unwrap()
+    }
+
+    /// #4103: seed this peer's responder anti-replay high-water from a
+    /// prior engine's snapshot across an identity-change rebuild. Only
+    /// advances the mark (never regresses it), mirroring
+    /// `Tai64nClock::seed_high_water`, so a concurrent inbound initiation
+    /// that already advanced the fresh peer cannot be pulled backwards by
+    /// a stale seed. Slow path / build-time only.
+    pub(crate) fn seed_greatest_tai64n(&self, hw: [u8; TAI64N_LEN]) {
+        let mut cur = self.greatest_tai64n.lock().unwrap();
+        if hw > *cur {
+            *cur = hw;
+        }
+    }
+
     /// Record any authenticated packet SENT (transport data,
     /// keepalive, or handshake message). Clears the T6 passive-
     /// keepalive arm — we just proved liveness to the peer.

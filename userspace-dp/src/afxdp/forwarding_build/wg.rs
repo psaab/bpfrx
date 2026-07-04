@@ -26,9 +26,17 @@
 //!   - **Identity changed (or new)** — construct a fresh `WgEngine` (which
 //!     reconciles the new peer set at construction) and **seed its TAI64N
 //!     high-water from the prior engine** so initiator-timestamp
-//!     monotonicity survives the rebuild. Live sessions are dropped (a
-//!     real config change re-handshakes once, seeded so the peer accepts
-//!     it); S5 adds session migration if needed.
+//!     monotonicity survives the rebuild. This has two sides: the
+//!     OUTGOING initiator clock (one engine-wide value, #1432) via
+//!     `seed_tai64n_high_water`, and the #4092 INCOMING per-peer
+//!     responder anti-replay high-water (`Peer::greatest_tai64n`) via
+//!     `seed_greatest_tai64n`, keyed by pubkey (#4103). Without the
+//!     incoming side, a routine WG commit (add allowed-ip, rotate a PSK,
+//!     add/remove a peer) would reset every surviving peer's responder
+//!     high-water to `[0; 12]` and silently disarm the anti-replay. Live
+//!     sessions are dropped (a real config change re-handshakes once,
+//!     seeded so the peer accepts it); S5 adds session migration if
+//!     needed.
 
 use super::super::wg::{WgEngine, WgEngineConfig, WgPeerConfig};
 use super::super::*;
@@ -85,6 +93,19 @@ pub(super) fn populate_wg_engines(
                 if let Some(hw) = prev_engine.tai64n_high_water() {
                     engine.seed_tai64n_high_water(hw);
                 }
+                // #4103: `seed_tai64n_high_water` above only re-seeds the
+                // OUTGOING initiator clock (#1432). The #4092 INCOMING
+                // per-peer responder anti-replay high-water
+                // (`Peer::greatest_tai64n`) would otherwise reset to
+                // [0; 12] on this identity-change rebuild, so a routine WG
+                // commit (add allowed-ip, rotate a PSK, add/remove a peer)
+                // would silently disarm the anti-replay: an attacker who
+                // captured a valid type-1 initiation could replay it. Carry
+                // each SURVIVING peer's high-water forward, keyed by pubkey
+                // (a new/changed pubkey correctly starts fresh — a
+                // different peer identity). Matches kernel / wireguard-go,
+                // which retain per-peer `last_timestamp` across reconfigure.
+                engine.seed_greatest_tai64n(&prev_engine.greatest_tai64n_by_pubkey());
             }
         }
         state.wg_engines.insert(id, Arc::new(engine));

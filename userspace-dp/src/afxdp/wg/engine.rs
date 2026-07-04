@@ -615,6 +615,52 @@ impl WgEngine {
         self.tai64n_clock.high_water()
     }
 
+    /// #4103: snapshot every configured peer's responder anti-replay
+    /// high-water mark (`greatest_tai64n`), keyed by pubkey, so a fresh
+    /// engine built on an identity-changing config commit can carry each
+    /// SURVIVING peer's mark forward. This is the per-peer INCOMING
+    /// mirror of `tai64n_high_water` (which snapshots the single
+    /// engine-wide OUTGOING initiator clock). Without it, any WG config
+    /// change (add allowed-ip, rotate a PSK, add/remove a peer) rebuilds
+    /// the engine via `WgEngine::new` — starting from an empty peer
+    /// table, so every peer gets a fresh `Peer::new` with
+    /// `greatest_tai64n = [0; 12]` — silently disarming the #4092
+    /// responder anti-replay for every peer. Slow path / build-time only.
+    pub(crate) fn greatest_tai64n_by_pubkey(
+        &self,
+    ) -> Vec<([u8; WG_KEY_LEN], [u8; super::tai64n::TAI64N_LEN])> {
+        self.load_table()
+            .peers
+            .iter()
+            .map(|e| (e.peer.pubkey, e.peer.greatest_tai64n()))
+            .collect()
+    }
+
+    /// #4103: seed this engine's per-peer responder anti-replay high-water
+    /// marks from a prior engine's snapshot (see `greatest_tai64n_by_pubkey`)
+    /// across an identity-change rebuild. A pubkey present in BOTH
+    /// `snapshot` and this engine's peer table carries its mark forward
+    /// (only advancing, never regressing — see `Peer::seed_greatest_tai64n`);
+    /// a pubkey NOT in the snapshot (a new or re-keyed peer) keeps the
+    /// fresh `[0; 12]`, because a pubkey change is a different peer
+    /// identity for which a reset is correct (matches the kernel /
+    /// wireguard-go behaviour of retaining per-peer `last_timestamp`
+    /// across a reconfigure while a new peer starts clean). Slow path /
+    /// build-time only.
+    pub(crate) fn seed_greatest_tai64n(
+        &self,
+        snapshot: &[([u8; WG_KEY_LEN], [u8; super::tai64n::TAI64N_LEN])],
+    ) {
+        let table = self.load_table();
+        for (pubkey, hw) in snapshot {
+            if let Some(&idx) = table.peer_index_by_pubkey.get(pubkey) {
+                if let Some(entry) = table.peers.get(idx as usize) {
+                    entry.peer.seed_greatest_tai64n(*hw);
+                }
+            }
+        }
+    }
+
     /// Reconcile the engine's peer table against a new config
     /// snapshot. Slow path only.
     ///

@@ -2610,6 +2610,87 @@ fn wg_tai64n_high_water_seed_round_trips_across_engines() {
 }
 
 #[test]
+fn wg_greatest_tai64n_carry_over_preserves_responder_anti_replay() {
+    // #4103: the #4092 responder anti-replay high-water is per-peer, so
+    // an identity-change engine rebuild must carry each surviving peer's
+    // `greatest_tai64n` forward — keyed by pubkey — or the anti-replay is
+    // silently disarmed. Reverting the engine carry-over API resets the
+    // fresh peer to [0; 12] and the replayed-stamp assertions below go RED
+    // (the replay would be accepted).
+    let priv_key = keypair().0;
+    let resp_pub = keypair().1;
+    let mk = || WgEngineConfig {
+        local_private_key: priv_key,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+            preshared_key: [0u8; 32],
+        }],
+    };
+    let old = WgEngine::new(mk());
+    // Simulate a valid accepted initiation advancing the high-water.
+    let t_last: [u8; super::tai64n::TAI64N_LEN] =
+        [0x40, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    old.seed_greatest_tai64n(&[(resp_pub, t_last)]);
+    assert_eq!(old.greatest_tai64n_by_pubkey(), vec![(resp_pub, t_last)]);
+
+    // Identity-change rebuild starts from a fresh (all-zero) peer; carry
+    // the prior engine's per-peer high-water forward.
+    let fresh = WgEngine::new(mk());
+    fresh.seed_greatest_tai64n(&old.greatest_tai64n_by_pubkey());
+    assert_eq!(
+        fresh.greatest_tai64n_by_pubkey(),
+        vec![(resp_pub, t_last)],
+        "carried-over high-water must equal the prior engine's"
+    );
+
+    // The carried value gates the anti-replay: a stamp `<= t_last` is a
+    // replay (reject); a strictly greater stamp is fresh (accept).
+    let table = fresh.load_table();
+    let idx = table.peer_index_by_pubkey[&resp_pub];
+    let peer = &table.peers[idx as usize].peer;
+    assert!(
+        !peer.check_and_update_tai64n(&t_last),
+        "equal-stamp replay must be rejected after carry-over"
+    );
+    let older = [0x40u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert!(
+        !peer.check_and_update_tai64n(&older),
+        "older-stamp replay must be rejected after carry-over"
+    );
+    let newer: [u8; super::tai64n::TAI64N_LEN] =
+        [0x40, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x89];
+    assert!(
+        peer.check_and_update_tai64n(&newer),
+        "strictly newer stamp must be accepted"
+    );
+
+    // A pubkey NOT in the snapshot (a re-keyed / new peer) correctly
+    // starts fresh at [0; 12] — seeding is a no-op for it.
+    let other_pub = keypair().1;
+    let other = WgEngine::new(WgEngineConfig {
+        local_private_key: priv_key,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: other_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+            preshared_key: [0u8; 32],
+        }],
+    });
+    other.seed_greatest_tai64n(&old.greatest_tai64n_by_pubkey());
+    assert_eq!(
+        other.greatest_tai64n_by_pubkey(),
+        vec![(other_pub, [0u8; super::tai64n::TAI64N_LEN])],
+        "a new/changed pubkey must NOT inherit another peer's high-water"
+    );
+}
+
+#[test]
 fn wg_request_handshake_single_edge_under_concurrent_callers() {
     // Copilot: a plain load+store let multiple concurrent NoSession
     // callers all observe the stale `last` and each re-arm the edge. The
