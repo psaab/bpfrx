@@ -34507,3 +34507,24 @@ top.
   pkg/config/fable167_advisory_test.go, userspace-dp/src/policy.rs,
   docs/junos-cli-reference.md, docs/config-schema.md, docs/feature-gaps.md,
   _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: fable-167 hostile-review fold (PR #4237). Corrected a
+  FACTUALLY INVERTED sync-icmp-session advisory. Re-verified against
+  source: ICMP sessions are synced to the HA peer UNCONDITIONALLY (the
+  session-sync path is protocol-agnostic — publish_shared_session
+  shared_ops.rs:875, snapshot_all_sessions_export ha.rs:630 has no
+  protocol filter, pkg/cluster wire serializes any protocol;
+  issue-history corroborates standby aging at "60s UDP/ICMP"). The knob
+  is a no-op because syncing already happens, NOT because ICMP is
+  unenforced. Reworded every copy (advisory string, schema desc,
+  FlowConfig comment, feature-gaps.md, config-schema.md) + updated the
+  test (TestFable167P3SyncICMPSessionNoOpAdvisory asserts the accurate
+  wording + guards against the inverted regression). Also tightened
+  route-change-timeout / multicast-session-lifetime schema validators to
+  the Junos 6..1800s bounds. Merged origin/master (#4228 Gap 7 CoS show,
+  no code overlap; _Log union). go test ./pkg/config/... green; build +
+  gofmt + vet clean; no cargo (no Rust change in this fold).
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/fable167_advisory_test.go, docs/config-schema.md,
+  docs/feature-gaps.md, _Log.md
