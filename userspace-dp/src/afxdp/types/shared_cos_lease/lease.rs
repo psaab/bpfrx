@@ -1181,6 +1181,19 @@ impl SharedCoSQueueLease {
         }
     }
 
+    /// #4260 (hb166 R-3) test hook: expose the private seqlock snapshot so
+    /// the writer/reader ordering-correctness test can observe the raw
+    /// `(cap, share, grace, tag)` tuple and assert the cross-field
+    /// tag/grace invariant a torn read would violate. Test-only — never
+    /// compiled into the shipping helper.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn test_snapshot_epoch_v8(
+        &self,
+        worker_id: usize,
+    ) -> Option<(u64, u64, u64, u32)> {
+        self.snapshot_epoch_v8(worker_id)
+    }
+
     // pub(super): called by the co-located `tests` module (equal-flow cap
     // unit tests). Inherent-private before the split.
     pub(super) fn equal_flow_cap_v8(

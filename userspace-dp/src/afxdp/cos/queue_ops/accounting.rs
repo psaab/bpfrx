@@ -127,6 +127,27 @@ pub(super) fn account_cos_queue_flow_dequeue(
         // enqueue re-anchors at the live `queue.vtime`.
         ff.flow_bucket_head_finish_bytes[bucket] = 0;
         ff.flow_bucket_tail_finish_bytes[bucket] = 0;
+        // #4259 (hb166 R-1) — bucket identity ends here. Also reset the
+        // per-bucket TX-rate EWMA state written by
+        // `account_flow_bucket_tx` (cos/fairness.rs). Without this, the
+        // observed-rate EWMA survives flow death: it decays only on TX
+        // commits (which require service), and its skip-ramp arms only at
+        // 0 — so a bucket driven high by a departed elephant keeps that
+        // rate indefinitely. A new flow that hashes into the recycled
+        // bucket is then deferred by the cap-aware MQFQ selector
+        // (queue_ops/mod.rs `observed_bps > target_bps`) as if it were the
+        // old elephant, inverting the mechanism's purpose (it throttles the
+        // coolest flow — a newcomer). Zeroing `observed_bps` re-arms the
+        // skip-ramp; zeroing `last_tx_ns` routes the next commit through
+        // the first-commit stamp path; zeroing `pending_bytes` drops the
+        // departed flow's un-rolled accumulation. This mirrors the
+        // head/tail reset above — a drain to 0 is treated as idle/recycled,
+        // consistent with the enqueue-side re-anchor. The monotonic
+        // lifetime counter `flow_bucket_tx_bytes` is left intact (its
+        // "never decremented" diagnostic contract).
+        ff.flow_bucket_observed_bps[bucket] = 0;
+        ff.flow_bucket_last_tx_ns[bucket] = 0;
+        ff.flow_bucket_pending_bytes[bucket] = 0;
         // #941 Work item A: bucket-empty vacate. When this worker's
         // last active bucket on a shared_exact queue empties, vacate
         // the V_min slot so peers don't see a phantom-participating

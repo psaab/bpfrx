@@ -1536,6 +1536,73 @@ alternative** to (or co-factor of) the transport-physics floor.
   it eliminates a genuine over-charge that parked mid-rate classes early.
   Needs a cluster CoS mid-rate multi-class smoke to measure the recovery.
 
+#### Fairness-accounting lifecycle fixes (hb166 R-1/R-3/R-4)
+
+Three further fable-review-166 findings are state-lifecycle defects in
+already-shipped fairness mechanisms — invisible to steady-state iperf
+smoke, real under flow churn / low-rate classes / weak-memory CPUs. All
+three are pure accounting corrections (no policy change). R-1 and R-4
+carry RED-on-revert unit tests (the fix reverted, the named assertion
+fails). R-3 is a memory-ordering fix whose failure is only observable on
+a weakly-ordered CPU (ARM/POWER) or under a loom model — it is NOT
+reproducible on the x86-TSO CI/deploy host — so it carries a structural
+ordering guard that asserts a cross-field snapshot invariant a torn read
+would break, not a RED-on-revert test.
+
+- **R-1 — recycled MQFQ bucket inherits a dead flow's rate (#4259).** The
+  cap-aware per-flow selector (`cos_queue_min_finish_bucket`,
+  `queue_ops/mod.rs`) defers any bucket whose per-bucket observed-rate
+  EWMA (`account_flow_bucket_tx`, `cos/fairness.rs`) exceeds the fair-
+  share target. That EWMA decays only on TX commits (which need service)
+  and its skip-ramp re-arms only at 0, but the bucket-idle reset in
+  `account_cos_queue_flow_dequeue` (`queue_ops/accounting.rs`) cleared
+  only the head/tail finish tags — the observed rate survived flow death.
+  A newcomer hashing into a recycled bucket was throttled with the
+  departed elephant's rate (the mechanism built to protect cool flows
+  throttling the coolest). Fix: on the bucket nonzero→0 transition (the
+  bucket-identity boundary) also zero `flow_bucket_observed_bps` /
+  `flow_bucket_last_tx_ns` / `flow_bucket_pending_bytes`, mirroring the
+  existing finish-tag reset (a drain to 0 is treated as idle/recycled).
+  The monotonic lifetime counter `flow_bucket_tx_bytes` is preserved. The
+  positive action of the cap-aware selector (defer-at-finite-target) was
+  previously untested and is now pinned.
+
+- **R-3 — v8 epoch seqlock writer missing the Release fence (#4260).**
+  `maybe_rotate_epoch_v8` claims the rotation with an AcqRel EVEN→ODD CAS,
+  writes the payload with Relaxed stores, and publishes with the final
+  Release ODD→EVEN store (the #1643 reader-fence's partner). The AcqRel
+  claim's Release half orders only writes *before* the CAS; no reader
+  synchronizes-with it by reading the ODD value. So on a weakly-ordered
+  CPU a payload store could become visible before the ODD claim, and a
+  reader could read seq=EVEN(old) / new payload / seq=EVEN(old) and accept
+  a cross-epoch mix (the #1619 tearing class, of which #1643 fixed only
+  the reader half). Fix: `fence(Ordering::Release)` immediately after the
+  successful claim CAS (Boehm's seqlock recipe) — one fence per rotation
+  (~200 µs). Latent on the x86-TSO deploy targets; a real hazard on
+  ARM/POWER. The crate has no loom dependency, so the guard is a
+  contention test asserting the cross-field `grace == tag*EPOCH + EPOCH/2`
+  invariant a torn snapshot would break.
+
+- **R-4 — token-bucket refill drops fractional dust (#4261).**
+  `refill_cos_tokens` (`cos/token_bucket.rs`) floored the byte grant
+  (`added = elapsed×rate / 1e9`) but advanced `last_refill_ns` fully to
+  `now_ns`, discarding `< 1` byte of accrued credit every refill. At
+  64 kbps on the ~200 µs drain cadence that is 1.6→1 B/interval — a 37.5%
+  shortfall a kbps voice/control class never recovers (~2% at 1 Mbps,
+  negligible ≥100 Mbps). Same failure shape as #1630 cause-1, one decade
+  lower — the ns-integer-division dust layer under the epoch/visit-cap
+  layer #1630 fixed. Fix: carry the fractional remainder in the timestamp
+  — rewind `last_refill_ns` by the time-equivalent of the ungranted
+  fraction (`remainder / rate`) instead of advancing to `now_ns`, so
+  cumulative granted == `floor(total_elapsed × rate / 1e9)`. No new field
+  or signature change; the remainder lives in the timestamp, mirroring the
+  #1630 byte-carry precedent one decade up.
+
+All three need a cluster CoS smoke (a fairness-mechanism change): the
+per-class SOLO/simul-load harness for R-1/R-4, and — because R-3 cannot
+be reproduced on x86-TSO — a functional CoS smoke to confirm the added
+writer fence is behavior-neutral on the deploy targets.
+
 ### Non-exact guaranteed classes are metered class-wide (#4265, R-2)
 
 A **non-exact** guaranteed class whose transmit-rate trips
