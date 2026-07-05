@@ -17,6 +17,29 @@ import (
 // on the top-level word alone, but a few privileged subcommands need a finer
 // gate (see requiredPermission). If userClass is empty (not set), all actions
 // are allowed for backward compatibility.
+// resolveClassPerms returns the coarse permission set for a login class,
+// consulting the system-defined built-ins FIRST and then any custom `system
+// login class <name>` defined in the active config (#4304 S-2). A custom
+// class's Junos permissions were mapped to the coarse model at compile
+// (config.LoginClass.MappedPermissions); without this resolution a
+// custom-class user would be locked out of every command at runtime even
+// though the config committed cleanly.
+func (c *CLI) resolveClassPerms(class string) ([]config.LoginClassPermission, bool) {
+	if perms, ok := config.LoginClassPermissions[class]; ok {
+		return perms, true
+	}
+	if c.store != nil {
+		if cfg := c.store.ActiveConfig(); cfg != nil && cfg.System.Login != nil {
+			for _, lc := range cfg.System.Login.Classes {
+				if lc != nil && lc.Name == class {
+					return lc.MappedPermissions, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
 func (c *CLI) checkPermission(parts []string) error {
 	if c.userClass == "" {
 		return nil
@@ -25,7 +48,7 @@ func (c *CLI) checkPermission(parts []string) error {
 		return nil
 	}
 
-	perms, ok := config.LoginClassPermissions[c.userClass]
+	perms, ok := c.resolveClassPerms(c.userClass)
 	if !ok {
 		return fmt.Errorf("permission denied: unknown login class %q", c.userClass)
 	}
@@ -71,7 +94,7 @@ func (c *CLI) showConfigRedacted() bool {
 	if c.userClass == "" {
 		return false
 	}
-	perms, ok := config.LoginClassPermissions[c.userClass]
+	perms, ok := c.resolveClassPerms(c.userClass)
 	if !ok {
 		return true
 	}

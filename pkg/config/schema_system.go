@@ -32,6 +32,30 @@ func syslogFacilitySeverityLeaf() *schemaNode {
 	}
 }
 
+// syslogDestinationModifiers builds the named (non-facility) sub-statements a
+// system-syslog host/file/user destination accepts. These MUST be modelled as
+// named children so they take precedence over the `<facility> <severity>`
+// wildcard: without an exact-match entry a `source-address 10.0.1.1` /
+// `port 5514` / `match "re"` hits the severity-enum wildcard and the strict
+// commit-check REJECTS it (the value is not a Junos severity). `extra` folds
+// in per-destination keywords (host: source-address/port; file: archive).
+// Fresh maps/nodes per call so destinations never alias (#4303 S-1).
+func syslogDestinationModifiers(extra map[string]*schemaNode) map[string]*schemaNode {
+	children := map[string]*schemaNode{
+		"allow-duplicates":  {desc: "Do not suppress duplicate messages", children: nil},
+		"match":             {desc: "Regular-expression message filter", args: 1, placeholder: "<regex>", children: nil},
+		"match-strings":     {desc: "Message string filter", args: 1, placeholder: "<string>", children: nil},
+		"explicit-priority": {desc: "Include priority in the logged message", children: nil},
+		"structured-data": {desc: "Log in RFC 5424 structured-data format", children: map[string]*schemaNode{
+			"brief": {desc: "Omit the English-language message text", children: nil},
+		}},
+	}
+	for k, v := range extra {
+		children[k] = v
+	}
+	return children
+}
+
 var schemaSystem = &schemaNode{desc: "System configuration", children: map[string]*schemaNode{
 	"host-name":     {desc: "System hostname", args: 1, scalar: true, placeholder: "<hostname>", children: nil},
 	"domain-name":   {desc: "Domain name", args: 1, placeholder: "<domain>", children: nil},
@@ -124,26 +148,70 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// `allow-duplicates` is an explicit presence-only flag so it is
 		// not mistaken for a facility with a missing severity.
 		"user": {desc: "Syslog user destination", args: 1, placeholder: "<user>",
-			wildcard: syslogFacilitySeverityLeaf()},
+			wildcard: syslogFacilitySeverityLeaf(),
+			children: syslogDestinationModifiers(nil)},
 		"host": {desc: "Syslog host destination", args: 1, placeholder: "<host>",
-			wildcard: syslogFacilitySeverityLeaf(), children: map[string]*schemaNode{
-				"allow-duplicates": {desc: "Do not suppress duplicate messages", children: nil},
-			}},
+			wildcard: syslogFacilitySeverityLeaf(),
+			// #4303 S-1: host-only modifiers wired into the runtime syslog
+			// client (source-address, port). log-prefix / facility-override /
+			// routing-instance / exclude-hostname are recognized so a valid
+			// vSRX config commits (not yet enforced — S-5 advisory territory).
+			children: syslogDestinationModifiers(map[string]*schemaNode{
+				"source-address": {desc: "Local source address for outgoing syslog", args: 1, placeholder: "<ip>",
+					valueType: ValueIPAddress, valueDesc: "IPv4 or IPv6 source address",
+					valueExamples: []string{"10.0.1.1", "2001:db8::1"},
+					validator:     ValidateIPAddress, children: nil},
+				"port": {desc: "Destination syslog port", args: 1, placeholder: "<port>",
+					valueType: ValueInteger, valueDesc: "syslog UDP destination port (1-65535)",
+					valueExamples: []string{"514", "5514"},
+					validator:     ValidateInteger(1, 65535), children: nil},
+				"log-prefix":        {desc: "Prefix prepended to each forwarded message", args: 1, placeholder: "<prefix>", children: nil},
+				"facility-override": {desc: "Override the facility of forwarded messages", args: 1, placeholder: "<facility>", children: nil},
+				"routing-instance":  {desc: "Routing instance used to reach the host", args: 1, placeholder: "<instance>", children: nil},
+				"exclude-hostname":  {desc: "Omit the local hostname field", children: nil},
+			})},
 		"file": {desc: "Syslog file destination", args: 1, placeholder: "<filename>",
-			wildcard: syslogFacilitySeverityLeaf()},
+			wildcard: syslogFacilitySeverityLeaf(),
+			children: syslogDestinationModifiers(map[string]*schemaNode{
+				"archive": {desc: "Archive-file rotation settings", children: map[string]*schemaNode{
+					"size":              {desc: "Maximum file size before rotation", args: 1, placeholder: "<size>", children: nil},
+					"files":             {desc: "Number of archive files to retain", args: 1, placeholder: "<count>", children: nil},
+					"world-readable":    {desc: "Archives readable by all users", children: nil},
+					"no-world-readable": {desc: "Archives readable only by root", children: nil},
+					"start-time":        {desc: "Scheduled archive start time", args: 1, placeholder: "<time>", children: nil},
+					"transfer-interval": {desc: "Periodic archive interval (minutes)", args: 1, placeholder: "<minutes>", children: nil},
+					"archive-sites":     {desc: "Off-box archive site URL", args: 1, multi: true, placeholder: "<url>", children: nil},
+				}},
+			})},
 	}},
 	"login": {desc: "Login configuration", children: map[string]*schemaNode{
+		// #4304 S-2: custom `login class <name>` RBAC definition. Recognized so
+		// a real vSRX config commits; the Junos permission set is mapped onto
+		// xpf's coarse permission model at compile (compiler_system.go). The
+		// fine-grained allow/deny-command regexes are accepted structurally but
+		// not enforced (see the compile advisory).
+		"class": {desc: "Login class definition", args: 1, placeholder: "<class-name>", children: map[string]*schemaNode{
+			"permissions":         {desc: "Permission bits granted to the class", args: 1, multi: true, placeholder: "<permission>", children: nil},
+			"idle-timeout":        {desc: "Idle timeout (minutes)", args: 1, placeholder: "<minutes>", valueType: ValueInteger, validator: ValidateInteger(0, 4294967295), children: nil},
+			"allow-commands":      {desc: "Regex of operational commands to allow", args: 1, placeholder: "<regex>", children: nil},
+			"deny-commands":       {desc: "Regex of operational commands to deny", args: 1, placeholder: "<regex>", children: nil},
+			"allow-configuration": {desc: "Regex of configuration to allow", args: 1, placeholder: "<regex>", children: nil},
+			"deny-configuration":  {desc: "Regex of configuration to deny", args: 1, placeholder: "<regex>", children: nil},
+			"login-alarms":        {desc: "Display system alarms on login", children: nil},
+			"login-tip":           {desc: "Display a tip on login", children: nil},
+		}},
 		"user": {desc: "User name", args: 1, placeholder: "<username>", children: map[string]*schemaNode{
 			"uid": {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
-			// #2008 H6: enum-validate the login class at commit (RBAC is
-			// already enforced in pkg/cli/permissions.go; this closes the
-			// commit-accepts-any-string hole). The allowed set is derived from
-			// LoginClassPermissions so the schema enum and the runtime RBAC
-			// table cannot drift. Mirrors the SNMP `authorization` enum leaf.
+			// #2008 H6 / #4304 S-2: the class is validated against the
+			// system-defined built-ins UNION any custom `login class <name>`
+			// defined in the SAME candidate tree. The tree-aware validator
+			// replaces the fixed enum so a valid custom-RBAC config is no
+			// longer hard-rejected at commit, while an undefined class still
+			// fails closed. RBAC enforcement is in pkg/cli/permissions.go.
 			"class": {desc: "Login class", args: 1, placeholder: "<class>",
-				valueType: ValueEnumOf, valueDesc: "System-defined login class (super-user | operator | read-only | config-viewer | unauthorized)",
+				valueType: ValueEnumOf, valueDesc: "System-defined class (super-user | operator | read-only | config-viewer | unauthorized) or a custom `login class <name>`",
 				valueExamples: []string{"super-user", "operator", "read-only"},
-				validator:     ValidateEnum(ValidLoginClasses()), children: nil},
+				treeValidator: validateLoginClassRef, children: nil},
 			// #1944: close the schema asymmetry the compiler already
 			// half-implemented — give `authentication` a value-bearing
 			// children map (encrypted-password typed leaf + ssh-* keys).
@@ -332,6 +400,23 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 				placeholder: "<key-exchange-method>",
 				children:    nil,
 			},
+			// #4305 S-4: sshd hardening knobs rendered into the xpf drop-in.
+			// ciphers/macs are free-form algorithm lists (sshd validates the
+			// spellings at reload, so no enum). The numeric knobs are bounded
+			// to the Junos ranges.
+			"ciphers": {desc: "SSH ciphers (sshd Ciphers)", args: 1, multi: true, placeholder: "<cipher>", children: nil},
+			"macs":    {desc: "SSH message-authentication codes (sshd MACs)", args: 1, multi: true, placeholder: "<mac>", children: nil},
+			"connection-limit": {desc: "Maximum concurrent SSH connections (sshd MaxStartups)", args: 1, placeholder: "<limit>",
+				valueType: ValueInteger, valueDesc: "1-250", validator: ValidateInteger(1, 250), children: nil},
+			"rate-limit": {desc: "SSH connection attempts per minute", args: 1, placeholder: "<limit>",
+				valueType: ValueInteger, valueDesc: "1-250", validator: ValidateInteger(1, 250), children: nil},
+			"client-alive-interval": {desc: "sshd ClientAliveInterval (seconds; 0 disables)", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "0-65535", validator: ValidateInteger(0, 65535), children: nil},
+			"client-alive-count-max": {desc: "sshd ClientAliveCountMax", args: 1, placeholder: "<count>",
+				valueType: ValueInteger, valueDesc: "0-255", validator: ValidateInteger(0, 255), children: nil},
+			"protocol-version": {desc: "SSH protocol version (sshd is SSH-2 only)", args: 1, placeholder: "<version>",
+				valueType: ValueEnumOf, valueDesc: "v1 | v2", valueExamples: []string{"v2"},
+				validator: ValidateEnum([]string{"v1", "v2"}), children: nil},
 		}},
 		"netconf": {desc: "NETCONF service", children: map[string]*schemaNode{
 			"ssh": {desc: "NETCONF over SSH", children: nil},

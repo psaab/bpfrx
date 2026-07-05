@@ -1,3 +1,109 @@
+## 2026-07-05 — system: fable-167 PR #4311 review fixes (S-2 priv-esc + deny-commands advisory + S-4 sshd -t gate)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Hostile review of PR #4311 found a REAL privilege escalation
+    in the S-2 permission mapping + two hardenings.
+    (FIX 1, priv-esc) `mapJunosPermissions` (types_system.go) mapped Junos
+    `reset` → PermMaint and `rollback` → PermConfig — over-grants. `reset` is
+    daemon-restart (`restart <process>`), NOT the destructive box verbs
+    PermMaint gates (reboot/halt/power-off/zeroize + cluster failover), so a
+    class `permissions reset` could `request system zeroize`. Fixed: `reset`
+    → PermControl, `rollback` → PermView floor; only `maintenance` → PermMaint,
+    only `configure` → PermConfig.
+    (FIX 2, deny-commands advisory) `all` + `deny-commands X` means
+    "everything EXCEPT X"; xpf drops deny-commands so the class is MORE
+    PERMISSIVE than the source config. Reframed the advisory
+    (`loginClassAdvisoryWarnings`) to state deny-commands/deny-configuration
+    make the class MORE PERMISSIVE (denied verbs stay ALLOWED) as an explicit
+    WARNING, separated from the neutral allow-*/idle-timeout not-enforced note.
+    (FIX 3, sshd -t gate) `applySSHConfig` (daemon_system.go) rendered
+    Ciphers/MACs/KexAlgorithms verbatim and relied on the base-image
+    ExecReload=sshd -t. Added `sshdValidateCmd` (`sshd -t`) run after writing
+    the drop-in but BEFORE the reload; on failure the drop-in is reverted and
+    the reload is SKIPPED, so a cipher typo cannot SIGHUP sshd into an invalid
+    config and drop its listener. Self-contained lockout protection.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_system.go,
+    pkg/daemon/daemon_system.go, pkg/daemon/daemon_ssh_test.go,
+    pkg/config/login_custom_class_4304_test.go,
+    pkg/cli/permissions_custom_class_4304_test.go, docs/system-login.md,
+    docs/config-schema.md
+
+## 2026-07-05 — system/SNMP: fable-167 S-5 accept-with-advisory for grouped inert knobs (#4306)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4306 (S-5) — a cluster of system/SNMP knobs committed clean
+    but did nothing (several security-relevant). Added `snmpInertKnobWarnings`
+    (view / community view / trap-options source-address / health-monitor /
+    rmon) and `systemInertKnobWarnings` (login message/announcement/
+    retry-options, ntp boot-server/authentication-key/source-address,
+    internet-options extras, ssh rate-limit) emitting loud
+    accept-with-advisory `cfg.Warnings`. Messages are built from the node
+    IDENTITY only — the SNMP community string and NTP authentication-key value
+    are never echoed. Advisory-only (no schema reject) since the knobs already
+    commit clean.
+  - **File(s)**: pkg/config/compiler_system.go,
+    pkg/config/compiler_inert_knobs_4306_test.go, docs/config-schema.md
+
+## 2026-07-05 — system: fable-167 S-4 implement SSH hardening knobs (#4305)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4305 (S-4) — `system services ssh` ciphers/macs/
+    connection-limit/client-alive-interval/client-alive-count-max/
+    protocol-version were silently inert (the SSH compiler read only
+    root-login + key-exchange). Added the schema leaves, parsed them into
+    `SSHServiceConfig`, and rendered Ciphers/MACs/MaxStartups/
+    ClientAliveInterval/ClientAliveCountMax into the sshd drop-in
+    (`buildSSHDConfig`). protocol-version is accept-with-advisory (sshd is
+    SSH-2 only). client-alive-* use presence flags (0 is meaningful).
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_system.go,
+    pkg/config/schema_system.go, pkg/config/compiler.go,
+    pkg/daemon/daemon_system.go,
+    pkg/config/compiler_ssh_hardening_4305_test.go,
+    pkg/daemon/daemon_ssh_test.go, docs/config-schema.md
+
+## 2026-07-05 — system: fable-167 S-2 accept custom `system login class <name>` (#4304)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4304 (S-2) — a custom `system login class <name>` RBAC
+    definition was hard-rejected at commit (the `user ... class` leaf was a
+    fixed enum over the built-ins), blocking the WHOLE config. Accept-with-
+    advisory: added the `login class` schema container, switched the
+    `user ... class` validator to the tree-aware `validateLoginClassRef`
+    (built-ins UNION custom names via `schemaRefs.loginClasses`), parsed the
+    class definitions into `LoginConfig.Classes` with `mapJunosPermissions`
+    folding Junos permission tokens onto xpf's coarse model (least-privilege
+    view floor for non-whole-box tokens), emitted a per-class advisory, and
+    wired the runtime RBAC (`resolveClassPerms` in pkg/cli/permissions.go) so
+    a custom-class user is enforced instead of locked out.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_system.go,
+    pkg/config/schema_system.go, pkg/config/schema_walk.go,
+    pkg/config/schema_validators.go, pkg/config/compiler.go,
+    pkg/cli/permissions.go, pkg/config/login_custom_class_4304_test.go,
+    pkg/cli/permissions_custom_class_4304_test.go, docs/system-login.md,
+    docs/config-schema.md
+
+## 2026-07-05 — system/logging/SNMP: fable-167 S-1 syslog host/file sub-statement misparse (#4303)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4303 (S-1) — `system syslog host/file/user` bodies mixed
+    `<facility> <severity>` pairs with non-facility modifiers
+    (`source-address`, `port`, `match`, `structured-data`,
+    `explicit-priority`, `archive`). The compiler captured EVERY
+    non-`allow-duplicates` child as a facility/severity pair, so
+    `source-address 10.0.1.1` became `{Facility:source-address,
+    Severity:10.0.1.1}` and polluted `Facilities[0]`, which
+    `applySystemSyslog` reads for the forwarding client's facility. Strict
+    commit ALSO rejected the modifiers (their value is not a valid severity
+    under the wildcard leaf). Fixed the compiler to switch on the known
+    modifiers first (`syslogFacilitySeverity` helper), captured host
+    `source-address`/`port` into `SyslogHostConfig`, modelled the modifiers
+    in the schema (`syslogDestinationModifiers`), and wired source-address +
+    port into the daemon syslog client.
+  - **File(s)**: pkg/config/compiler_system.go, pkg/config/types_system.go,
+    pkg/config/schema_system.go, pkg/daemon/daemon_system.go,
+    pkg/config/compiler_syslog_hostmods_4303_test.go, docs/config-schema.md
+
+
 ## 2026-07-05 — fable-review-167 I-4 (#4309): DHCP relay overrides
 
 - **Timestamp**: 2026-07-05

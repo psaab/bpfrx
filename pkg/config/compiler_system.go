@@ -84,6 +84,36 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			}
 		case "login":
 			sys.Login = &LoginConfig{}
+			// #4304 S-2: parse custom `login class <name>` RBAC definitions so
+			// a real vSRX config commits (the `user ... class` enum accepts
+			// the defined names) and maps its Junos permission set onto xpf's
+			// coarse permission model. Compiled BEFORE users so the class set
+			// is complete regardless of stanza order.
+			for _, classInst := range namedInstances(child.FindChildren("class")) {
+				lc := &LoginClass{Name: classInst.name}
+				for _, prop := range classInst.node.Children {
+					switch prop.Name() {
+					case "permissions":
+						lc.Permissions = append(lc.Permissions, firewallMatchValues(prop)...)
+					case "idle-timeout":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								lc.IdleTimeout = n
+							}
+						}
+					case "allow-commands":
+						lc.AllowCommands = nodeVal(prop)
+					case "deny-commands":
+						lc.DenyCommands = nodeVal(prop)
+					case "allow-configuration":
+						lc.AllowConfiguration = nodeVal(prop)
+					case "deny-configuration":
+						lc.DenyConfiguration = nodeVal(prop)
+					}
+				}
+				lc.MappedPermissions, _ = mapJunosPermissions(lc.Permissions)
+				sys.Login.Classes = append(sys.Login.Classes, lc)
+			}
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
 				user := &LoginUser{Name: userInst.name}
 				for _, prop := range userInst.node.Children {
@@ -265,14 +295,38 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, slInst := range namedInstances(child.FindChildren("host")) {
 				host := &SyslogHostConfig{Address: slInst.name}
 				for _, prop := range slInst.node.Children {
+					// #4303 S-1: switch on the KNOWN host sub-statements
+					// before the facility/severity fallback. Without this
+					// every non-`allow-duplicates` child (source-address,
+					// port, match, structured-data, ...) was captured as a
+					// bogus SyslogFacility{Facility:Keys[0], Severity:Keys[1]}
+					// that polluted the facility filter — applySystemSyslog
+					// reads Facilities[0].Facility, so a leading
+					// `source-address` set the whole client's facility to
+					// garbage.
 					switch prop.Name() {
 					case "allow-duplicates":
 						host.AllowDuplicates = true
+					case "source-address":
+						host.SourceAddress = nodeVal(prop)
+					case "port":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								host.Port = n
+							}
+						}
+					case "match", "match-strings", "structured-data",
+						"explicit-priority", "log-prefix", "facility-override",
+						"routing-instance", "exclude-hostname":
+						// Recognized Junos host modifiers that are NOT
+						// facility/severity pairs. Accepted so a valid
+						// config commits; not (yet) wired into the runtime
+						// syslog client — see the S-5 advisory path.
 					default:
-						if len(prop.Keys) >= 2 {
+						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
 							host.Facilities = append(host.Facilities, SyslogFacility{
-								Facility: prop.Keys[0],
-								Severity: prop.Keys[1],
+								Facility: fac,
+								Severity: sev,
 							})
 						}
 					}
@@ -282,9 +336,16 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, fileInst := range namedInstances(child.FindChildren("file")) {
 				file := &SyslogFileConfig{Name: fileInst.name}
 				for _, prop := range fileInst.node.Children {
-					if len(prop.Keys) >= 2 {
-						file.Facility = prop.Keys[0]
-						file.Severity = prop.Keys[1]
+					switch prop.Name() {
+					case "archive", "match", "match-strings", "structured-data",
+						"explicit-priority", "allow-duplicates":
+						// #4303 S-1: recognized file modifiers, not a
+						// facility/severity pair — do not append as one.
+					default:
+						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
+							file.Facility = fac
+							file.Severity = sev
+						}
 					}
 				}
 				sys.Syslog.Files = append(sys.Syslog.Files, file)
@@ -293,9 +354,15 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
 				user := &SyslogUserConfig{User: userInst.name}
 				for _, prop := range userInst.node.Children {
-					if len(prop.Keys) >= 2 {
-						user.Facility = prop.Keys[0]
-						user.Severity = prop.Keys[1]
+					switch prop.Name() {
+					case "match", "match-strings", "structured-data",
+						"explicit-priority", "allow-duplicates":
+						// #4303 S-1: recognized user modifiers, not a pair.
+					default:
+						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
+							user.Facility = fac
+							user.Severity = sev
+						}
 					}
 				}
 				sys.Syslog.Users = append(sys.Syslog.Users, user)
@@ -330,6 +397,35 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				if v := nodeVal(kx); v != "" {
 					sys.Services.SSH.KeyExchange = append(sys.Services.SSH.KeyExchange, v)
 				}
+			}
+			// #4305 S-4: SSH hardening knobs. ciphers/macs are repeatable
+			// (bracketed list or one-per-child); read every value via
+			// firewallMatchValues so a `[ a b c ]` list is not truncated.
+			for _, cn := range sshNode.FindChildren("ciphers") {
+				sys.Services.SSH.Ciphers = append(sys.Services.SSH.Ciphers, firewallMatchValues(cn)...)
+			}
+			for _, mn := range sshNode.FindChildren("macs") {
+				sys.Services.SSH.MACs = append(sys.Services.SSH.MACs, firewallMatchValues(mn)...)
+			}
+			if cl := sshNode.FindChild("connection-limit"); cl != nil {
+				if n, err := strconv.Atoi(nodeVal(cl)); err == nil {
+					sys.Services.SSH.ConnectionLimit = n
+				}
+			}
+			if ci := sshNode.FindChild("client-alive-interval"); ci != nil {
+				if n, err := strconv.Atoi(nodeVal(ci)); err == nil {
+					sys.Services.SSH.ClientAliveInterval = n
+					sys.Services.SSH.ClientAliveIntervalSet = true
+				}
+			}
+			if cc := sshNode.FindChild("client-alive-count-max"); cc != nil {
+				if n, err := strconv.Atoi(nodeVal(cc)); err == nil {
+					sys.Services.SSH.ClientAliveCountMax = n
+					sys.Services.SSH.ClientAliveCountMaxSet = true
+				}
+			}
+			if pv := sshNode.FindChild("protocol-version"); pv != nil {
+				sys.Services.SSH.ProtocolVersion = nodeVal(pv)
 			}
 		}
 		// DNS service
@@ -397,6 +493,13 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 		if err := compileSNMP(snmpNode, sys, cfg, opts.lenientSNMPTrapGroup); err != nil {
 			return err
 		}
+	}
+
+	// #4306 S-5: make the grouped `system` inert knobs (login banner/retry,
+	// ntp boot-server/authentication-key/source-address, internet-options
+	// extras, ssh rate-limit) loud instead of a silent no-op.
+	if cfg != nil {
+		cfg.Warnings = append(cfg.Warnings, systemInertKnobWarnings(node)...)
 	}
 
 	return nil
@@ -711,6 +814,131 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 	return nil
 }
 
+// syslogFacilitySeverity extracts the `<facility> <severity>` pair from a
+// system-syslog destination child. The pair is normally flat
+// (`daemon warning;` → Keys=["daemon","warning"]) but tolerates the
+// hierarchical shape (`daemon { warning; }` → Keys=["daemon"], child
+// Keys=["warning"]). Returns ok=false when the node carries no severity
+// token, so a bare/garbage leaf is dropped rather than appended as a
+// half-populated filter entry (#4303 S-1). Callers must pre-filter the
+// known non-facility host/file/user modifiers by keyword.
+func syslogFacilitySeverity(prop *Node) (facility, severity string, ok bool) {
+	if prop == nil || len(prop.Keys) == 0 {
+		return "", "", false
+	}
+	if len(prop.Keys) >= 2 {
+		return prop.Keys[0], prop.Keys[1], true
+	}
+	for _, c := range prop.Children {
+		if len(c.Keys) > 0 && c.Keys[0] != "" {
+			return prop.Keys[0], c.Keys[0], true
+		}
+	}
+	return "", "", false
+}
+
+// loginClassPermName renders a coarse xpf permission for the advisory.
+func loginClassPermName(p LoginClassPermission) string {
+	switch p {
+	case PermView:
+		return "view"
+	case PermClear:
+		return "clear"
+	case PermControl:
+		return "control"
+	case PermConfig:
+		return "configure"
+	case PermMaint:
+		return "maintenance"
+	case PermAll:
+		return "super-user"
+	default:
+		return "unknown"
+	}
+}
+
+// loginClassAdvisoryWarnings emits one accept-with-advisory warning per custom
+// `system login class <name>` (#4304 S-2). The class is RECOGNIZED (a valid
+// vSRX RBAC config commits instead of being hard-rejected), but xpf's coarse
+// permission model cannot faithfully represent every Junos permission or the
+// per-command allow/deny regexes, so the advisory states exactly what maps and
+// what is recognized-but-not-enforced. Deterministic order for stable output.
+func loginClassAdvisoryWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) == 0 {
+		return nil
+	}
+	var warnings []string
+	for _, lc := range cfg.System.Login.Classes {
+		mapped, folded := mapJunosPermissions(lc.Permissions)
+		names := make([]string, 0, len(mapped))
+		for _, p := range mapped {
+			names = append(names, loginClassPermName(p))
+		}
+		mappedStr := "none"
+		if len(names) > 0 {
+			sort.Strings(names)
+			mappedStr = strings.Join(names, ",")
+		}
+		msg := fmt.Sprintf("system login class %q: recognized (custom RBAC); Junos permissions [%s] mapped to xpf coarse permissions {%s}",
+			lc.Name, strings.Join(lc.Permissions, " "), mappedStr)
+		if len(folded) > 0 {
+			sort.Strings(folded)
+			msg += fmt.Sprintf("; fine-grained permissions [%s] folded to view-only (xpf has no finer bucket)", strings.Join(folded, " "))
+		}
+		// Neutral not-enforced knobs (allow-* is a whitelist EXTENSION and
+		// idle-timeout is a session-lifetime knob; dropping them cannot make
+		// the class more permissive than the source config).
+		var inert []string
+		if lc.AllowCommands != "" {
+			inert = append(inert, "allow-commands")
+		}
+		if lc.AllowConfiguration != "" {
+			inert = append(inert, "allow-configuration")
+		}
+		if lc.IdleTimeout > 0 {
+			inert = append(inert, "idle-timeout")
+		}
+		if len(inert) > 0 {
+			msg += fmt.Sprintf("; %s accepted but NOT enforced by xpf's coarse RBAC", strings.Join(inert, "/"))
+		}
+		// SECURITY: deny-commands / deny-configuration are BLACKLISTS. Dropping
+		// them makes the class MORE PERMISSIVE than the Junos config — the
+		// denied verbs stay ALLOWED. State that explicitly so the operator
+		// knows the posture is WEAKER, not merely "not enforced" (per-command
+		// deny enforcement is a larger follow-up).
+		var deny []string
+		if lc.DenyCommands != "" {
+			deny = append(deny, "deny-commands")
+		}
+		if lc.DenyConfiguration != "" {
+			deny = append(deny, "deny-configuration")
+		}
+		if len(deny) > 0 {
+			msg += fmt.Sprintf("; WARNING: %s is NOT enforced, so this class is MORE PERMISSIVE than the Junos config (denied commands/configuration remain ALLOWED); per-command deny enforcement is a follow-up", strings.Join(deny, "/"))
+		}
+		warnings = append(warnings, msg)
+	}
+	return warnings
+}
+
+// sshHardeningAdvisoryWarnings notes the SSH knobs xpf recognizes but does not
+// (or cannot) render into the sshd drop-in (#4305 S-4). protocol-version is the
+// main one: modern sshd is SSH-2 only, so `v2` is a silent no-op and any other
+// value cannot be honored (SSH-1 is unsupported).
+func sshHardeningAdvisoryWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.System.Services == nil || cfg.System.Services.SSH == nil {
+		return nil
+	}
+	ssh := cfg.System.Services.SSH
+	var warnings []string
+	if ssh.ProtocolVersion != "" && ssh.ProtocolVersion != "v2" {
+		warnings = append(warnings, fmt.Sprintf(
+			"system services ssh protocol-version %q: sshd is SSH-2 only; SSH-1 is not supported, so this is accepted but NOT enforced",
+			ssh.ProtocolVersion))
+	}
+	return warnings
+}
+
 // userspaceRetiredKnobWarnings turns each retired DPDK-era `system
 // dataplane` knob recorded by compileUserspaceDataplane into a commit
 // warning (#1892). The knobs (cores, memory, socket-mem, rx-mode, ports)
@@ -973,7 +1201,129 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 	}
 
 	sys.SNMP = snmp
+	if cfg != nil {
+		cfg.Warnings = append(cfg.Warnings, snmpInertKnobWarnings(node)...)
+	}
 	return nil
+}
+
+// snmpInertKnobWarnings emits accept-with-advisory notes for the top-level
+// `snmp` knobs xpf recognizes but does not enforce (#4306 S-5). The
+// security-relevant ones are called out explicitly: a MIB `view` (on a
+// community or standalone) is NOT enforced, so a view-scoped community is
+// silently promoted to full ifTable exposure; `trap-options source-address`
+// is NOT bound, so traps leave from the default egress IP. Messages are built
+// from the node IDENTITY (keywords) only — never the community NAME (an SNMP
+// community string is a secret). Deterministic, deduplicated output.
+func snmpInertKnobWarnings(node *Node) []string {
+	if node == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var warnings []string
+	add := func(msg string) {
+		if !seen[msg] {
+			seen[msg] = true
+			warnings = append(warnings, msg)
+		}
+	}
+	nodeHasSub := func(n *Node, keyword string) bool {
+		if n == nil {
+			return false
+		}
+		if n.FindChild(keyword) != nil {
+			return true
+		}
+		for _, k := range n.Keys[1:] {
+			if k == keyword {
+				return true
+			}
+		}
+		return false
+	}
+	for _, child := range node.Children {
+		switch child.Name() {
+		case "view":
+			add("snmp view: MIB view scoping is accepted but NOT enforced by the SNMP agent (the full ifTable MIB is exposed regardless)")
+		case "trap-options":
+			if nodeHasSub(child, "source-address") {
+				add("snmp trap-options source-address: accepted but NOT enforced (traps are sent from the default egress IP)")
+			}
+		case "health-monitor":
+			add("snmp health-monitor: accepted but NOT implemented (no-op)")
+		case "rmon":
+			add("snmp rmon: accepted but NOT implemented (no-op)")
+		case "community":
+			// The community NAME is a secret — never echo it. Name only the
+			// keyword. A view-scoped community answers the full ifTable.
+			if nodeHasSub(child, "view") {
+				add("snmp community view: per-community MIB view scoping is accepted but NOT enforced (the community answers the full ifTable)")
+			}
+		}
+	}
+	return warnings
+}
+
+// systemInertKnobWarnings emits accept-with-advisory notes for the grouped
+// `system` knobs that commit clean but do nothing (#4306 S-5): login banners /
+// retry-options, NTP boot-server / authentication-key / source-address, and
+// `internet-options` leaves beyond the one xpf models. Messages name the
+// keyword only — never a leaf value (the NTP authentication-key is a secret).
+func systemInertKnobWarnings(sysNode *Node) []string {
+	if sysNode == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var warnings []string
+	add := func(msg string) {
+		if !seen[msg] {
+			seen[msg] = true
+			warnings = append(warnings, msg)
+		}
+	}
+	if login := sysNode.FindChild("login"); login != nil {
+		if login.FindChild("message") != nil {
+			add("system login message: pre-login banner accepted but NOT applied")
+		}
+		if login.FindChild("announcement") != nil {
+			add("system login announcement: post-login announcement accepted but NOT applied")
+		}
+		if login.FindChild("retry-options") != nil {
+			add("system login retry-options: login retry/lockout policy accepted but NOT enforced")
+		}
+	}
+	if ntp := sysNode.FindChild("ntp"); ntp != nil {
+		if ntp.FindChild("boot-server") != nil {
+			add("system ntp boot-server: accepted but NOT enforced (no one-shot boot-time sync)")
+		}
+		if ntp.FindChild("authentication-key") != nil {
+			// The key VALUE is a secret — name the keyword only.
+			add("system ntp authentication-key: NTP authentication accepted but NOT enforced")
+		}
+		if ntp.FindChild("source-address") != nil {
+			add("system ntp source-address: accepted but NOT bound (NTP uses the default source IP)")
+		}
+	}
+	if io := sysNode.FindChild("internet-options"); io != nil {
+		var extra []string
+		for _, c := range io.Children {
+			if c.Name() != "no-ipv6-reject-zero-hop-limit" {
+				extra = append(extra, c.Name())
+			}
+		}
+		if len(extra) > 0 {
+			sort.Strings(extra)
+			add(fmt.Sprintf("system internet-options [%s]: accepted but NOT implemented (xpf models only no-ipv6-reject-zero-hop-limit)", strings.Join(extra, " ")))
+		}
+	}
+	if svc := sysNode.FindChild("services"); svc != nil {
+		if ssh := svc.FindChild("ssh"); ssh != nil {
+			if ssh.FindChild("rate-limit") != nil {
+				add("system services ssh rate-limit: accepted but NOT enforced (sshd has no per-minute connection-rate limiter)")
+			}
+		}
+	}
+	return warnings
 }
 
 // compileSNMPv3 parses the v3 { usm { local-engine { user <name> { ... } } } } hierarchy.

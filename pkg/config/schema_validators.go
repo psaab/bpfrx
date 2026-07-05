@@ -644,6 +644,28 @@ func validateForwardingClassRef(raw string, refs *schemaRefs) error {
 	return fmt.Errorf("forwarding-class %q is not defined; add `set class-of-service forwarding-classes queue <queue-id> %s` in the same commit (xpf does not implicitly define the Junos default classes other than best-effort)", raw, raw)
 }
 
+// validateLoginClassRef accepts a `system login user <n> class <c>` value that
+// is EITHER a system-defined built-in class (super-user/operator/read-only/
+// config-viewer/unauthorized, from LoginClassPermissions) OR a custom `system
+// login class <c>` defined in the same candidate tree (#4304 S-2). It replaces
+// the fixed enum so a valid vSRX RBAC config that defines its own class is no
+// longer hard-rejected at commit, while an undefined class still fails closed.
+func validateLoginClassRef(raw string, refs *schemaRefs) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected a login class name)")
+	}
+	if _, ok := LoginClassPermissions[raw]; ok {
+		return nil
+	}
+	if refs != nil {
+		if _, ok := refs.loginClasses[raw]; ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("login class %q is not defined; use a system-defined class (one of: %s) or add `set system login class %s permissions <...>` in the same commit",
+		raw, strings.Join(ValidLoginClasses(), ", "), raw)
+}
+
 // validatePercent returns a closure that accepts a real number in
 // [min, max] inclusive. The input must parse as a float.
 func ValidatePercent(min, max float64) LeafValidator {

@@ -332,6 +332,21 @@ func (p *DDNSProvider) String() string {
 type SSHServiceConfig struct {
 	RootLogin   string   // "allow", "deny", "deny-password"
 	KeyExchange []string // sshd KexAlgorithms (key-exchange methods)
+	// #4305 S-4: sshd hardening knobs rendered into the xpf sshd drop-in.
+	Ciphers         []string // sshd Ciphers
+	MACs            []string // sshd MACs
+	ConnectionLimit int      // sshd MaxStartups (0 = unset)
+	// ClientAlive* use presence flags because 0 is a meaningful sshd value
+	// (interval 0 disables keepalives; count-max 0 drops on the first miss).
+	ClientAliveInterval    int
+	ClientAliveIntervalSet bool
+	ClientAliveCountMax    int
+	ClientAliveCountMaxSet bool
+	// ProtocolVersion is recognized but accept-with-advisory: sshd is
+	// SSH-2-only, so v2 is a no-op and any other value gets a compile
+	// advisory (no `Protocol` line is emitted — the directive is gone from
+	// modern sshd).
+	ProtocolVersion string
 }
 
 // WebManagementConfig holds web management settings.
@@ -372,8 +387,15 @@ type SyslogUserConfig struct {
 
 // SyslogHostConfig defines a syslog host destination.
 type SyslogHostConfig struct {
-	Address         string
-	Facilities      []SyslogFacility // multiple facility/severity pairs
+	Address    string
+	Facilities []SyslogFacility // multiple facility/severity pairs
+	// SourceAddress binds the outgoing syslog socket to a specific local
+	// source IP (`host <h> source-address <ip>`). Empty = OS-selected
+	// source. Wired into logging.SyslogClient's source-bind (#4303 S-1).
+	SourceAddress string
+	// Port overrides the destination UDP port (`host <h> port <n>`).
+	// 0 = the RFC 3164 default 514 (#4303 S-1).
+	Port            int
 	AllowDuplicates bool
 }
 
@@ -611,6 +633,98 @@ func ValidLoginClasses() []string {
 // LoginConfig holds user account definitions.
 type LoginConfig struct {
 	Users []*LoginUser
+	// Classes are custom `system login class <name>` RBAC definitions
+	// (#4304 S-2). xpf recognizes them so a real vSRX RBAC config commits,
+	// and maps their Junos permission set onto the coarse xpf permission
+	// model (LoginClass.MappedPermissions) consulted by pkg/cli/permissions.
+	Classes []*LoginClass
+}
+
+// LoginClass is a custom `system login class <name>` definition (#4304 S-2).
+//
+// Junos ships a large fine-grained permission vocabulary and per-command
+// allow/deny regexes; xpf's runtime RBAC is coarse
+// (view/clear/control/config/maint/all, types_system.go LoginClassPermission).
+// So xpf recognizes the class (a valid config commits instead of being
+// hard-rejected at the `user ... class` enum) and maps the whole-box Junos
+// permission tokens onto the nearest coarse bucket. Fine-grained
+// allow-commands / deny-commands / idle-timeout are recorded but NOT enforced
+// by the coarse gate; the compiler emits an advisory saying so.
+type LoginClass struct {
+	Name               string
+	Permissions        []string               // raw Junos permission tokens as written
+	MappedPermissions  []LoginClassPermission // coarse xpf perms derived from Permissions
+	IdleTimeout        int                    // minutes; recognized, not enforced
+	AllowCommands      string                 // regex; recognized, not enforced
+	DenyCommands       string                 // regex; recognized, not enforced
+	AllowConfiguration string                 // regex; recognized, not enforced
+	DenyConfiguration  string                 // regex; recognized, not enforced
+}
+
+// mapJunosPermissions folds a custom login class's Junos permission tokens onto
+// xpf's coarse permission model (#4304 S-2). Only the unambiguous whole-box
+// tokens map precisely; every other recognized subsystem/-control token folds
+// DOWN to a PermView floor (least-privilege — never silently grant config,
+// control, or maintenance from a narrow subsystem token) and is returned in
+// foldedToView so the compiler advisory can list what is coarsely mapped. The
+// PermView floor lets the class holder log in and view even when no token maps
+// precisely; `unauthorized` (empty token set) grants nothing.
+//
+// CRITICAL (no privilege escalation, review of #4311): the mapping must never
+// grant MORE than the Junos token permits. Two Junos tokens are deceptive:
+//   - `reset` permits restarting software DAEMONS (`restart <process>`), NOT
+//     rebooting/halting/zeroizing the box. It must map to PermControl, NOT
+//     PermMaint — PermMaint is exactly the destructive box verbs (request
+//     system reboot/halt/power-off/zeroize + chassis cluster failover), which
+//     `reset` does not authorize.
+//   - `rollback` permits reverting to a prior commit only, NOT arbitrary
+//     set/delete. It must map to the PermView floor, NOT PermConfig (which
+//     gates entering configure to make arbitrary changes).
+//
+// Only `maintenance` maps to PermMaint (the correct whole-box-destructive
+// grant), and only `configure` maps to PermConfig.
+func mapJunosPermissions(tokens []string) (perms []LoginClassPermission, foldedToView []string) {
+	have := map[LoginClassPermission]bool{}
+	add := func(p LoginClassPermission) {
+		if !have[p] {
+			have[p] = true
+			perms = append(perms, p)
+		}
+	}
+	for _, tok := range tokens {
+		switch tok {
+		case "all", "super-user":
+			add(PermAll)
+		case "maintenance":
+			add(PermMaint)
+		case "clear":
+			add(PermClear)
+		case "control", "reset":
+			// `reset` = restart daemons (restart <process>); NOT the
+			// box-destructive reboot/halt/zeroize verbs that PermMaint gates.
+			add(PermControl)
+		case "configure":
+			add(PermConfig)
+		case "rollback":
+			// `rollback` reverts to a prior commit only, not arbitrary
+			// set/delete; fold to the least-privilege view floor rather than
+			// PermConfig.
+			add(PermView)
+		case "view", "view-configuration":
+			add(PermView)
+		default:
+			// Any other recognized Junos permission (a subsystem read like
+			// `network`/`interface`/`routing`/`firewall`, a `*-control`
+			// write token, `shell`, `secret`, ...) is coarsely folded to a
+			// view-only floor. Under-granting is the safe direction: xpf's
+			// coarse model cannot faithfully represent per-subsystem write
+			// scope, so it must not over-grant config/control from a narrow
+			// token.
+			add(PermView)
+			foldedToView = append(foldedToView, tok)
+		}
+	}
+	return perms, foldedToView
 }
 
 // LoginUser defines a system user account.

@@ -33,11 +33,13 @@ does not hash plaintext for you.
 set system login user <name> class <class>
 ```
 
-The `class` value is **enum-validated at commit** against the set of
-system-defined Junos login classes xpf supports. An unrecognized class
-(e.g. `superuser`, `admin`) is hard-rejected by the `#1319` typed-leaf
-gate, closing the previous commit-accepts-any-string hole. The accepted
-classes are:
+The `class` value is **validated at commit** against the set of
+system-defined Junos login classes xpf supports **UNION any custom
+`system login class <name>` defined in the same candidate tree** (#4304 S-2,
+see below). An unrecognized class that is neither built-in nor defined
+(e.g. `superuser`, `admin` with no matching `class` definition) is still
+hard-rejected by the `#1319` typed-leaf gate, closing the previous
+commit-accepts-any-string hole. The system-defined classes are:
 
 | Class | Permissions |
 |---|---|
@@ -60,6 +62,61 @@ enum is **derived from** `LoginClassPermissions`
 runtime RBAC table can never drift apart: adding a class in one place
 without the other is impossible. An empty/unset class keeps the legacy
 allow-everything behavior (no class configured = no RBAC restriction).
+
+### Custom login classes (accept-with-advisory, #4304 S-2)
+
+Real vSRX configs define their own RBAC classes:
+
+```
+set system login class noc-admin permissions all
+set system login class noc-admin idle-timeout 30
+set system login user bob class noc-admin
+```
+
+Before #4304 the `class` leaf was a **fixed enum** over the built-ins only, so
+`class noc-admin` was **hard-rejected at commit** — which blocked the WHOLE
+config from committing. xpf now **recognizes** the custom `login class <name>`
+definition (`permissions`, `idle-timeout`, `allow-commands`, `deny-commands`,
+`allow-configuration`, `deny-configuration`), feeds the defined names into the
+`class` validator (a tree-aware cross-reference, `validateLoginClassRef`), and
+maps the Junos `permissions` token set onto xpf's coarse permission model at
+compile (`LoginClass.MappedPermissions`, consulted at runtime by
+`resolveClassPerms`).
+
+Because xpf's runtime RBAC is **coarse** (view/clear/control/config/maintenance/
+all) it cannot faithfully represent every fine-grained Junos permission or the
+per-command allow/deny regexes. The mapping is therefore
+**accept-with-advisory** — the commit succeeds and the compiler emits a
+per-class advisory (`show system commit` / warnings) describing exactly what
+maps and what does not:
+
+- `all` / `super-user` → `super-user` (PermAll); `maintenance` → maintenance;
+  `clear` → clear; `control` / `reset` → control; `configure` → configure;
+  `view` / `view-configuration` → view.
+- **No privilege escalation** — the mapping never grants more than the Junos
+  token permits. Two Junos tokens are deceptive and are folded conservatively:
+  `reset` permits restarting software *daemons* (`restart <process>`), **not**
+  rebooting/halting/zeroizing the box, so it maps to **control**, never
+  `maintenance` (the destructive box verbs). `rollback` permits reverting to a
+  prior commit only, not arbitrary `set`/`delete`, so it folds to the
+  **view-only floor**, never `configure`.
+- **Every other** recognized token (a subsystem read like `network` /
+  `interface` / `routing` / `firewall`, a `*-control` write token, `shell`,
+  `secret`, …) folds **down** to a **view-only floor**. Under-granting is
+  deliberate: the coarse model must never silently grant config / control /
+  maintenance from a narrow subsystem token.
+- `allow-commands` / `allow-configuration` / `idle-timeout` are **recognized
+  but NOT enforced** by the coarse gate (dropping a whitelist extension or a
+  session-lifetime knob cannot make the class more permissive); the advisory
+  names them.
+- **`deny-commands` / `deny-configuration` are blacklists** — because xpf does
+  not enforce them, the denied verbs stay **allowed**, so the class is **more
+  permissive than the Junos config**, not merely "unenforced". The advisory
+  states this explicitly as a `WARNING` so the operator knows the security
+  posture is weaker. Full per-command deny enforcement is a follow-up.
+
+An undefined class (referenced by a user but never defined, and not a built-in)
+still **fails closed** at commit.
 
 ### Command-to-permission mapping
 

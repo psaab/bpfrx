@@ -93,8 +93,12 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	}
 	refs := collectSchemaRefs(tree)
 	if defsSource != nil {
-		for name := range collectSchemaRefs(defsSource).forwardingClasses {
+		defRefs := collectSchemaRefs(defsSource)
+		for name := range defRefs.forwardingClasses {
 			refs.forwardingClasses[name] = struct{}{}
+		}
+		for name := range defRefs.loginClasses {
+			refs.loginClasses[name] = struct{}{}
 		}
 	}
 	vc := &walkContext{cfg: cfg, refs: refs}
@@ -161,6 +165,12 @@ type schemaRefs struct {
 	// that group, and node0/node1-variable configs legitimately keep
 	// peer-node definitions un-applied locally).
 	forwardingClasses map[string]struct{}
+	// loginClasses are the custom names defined via `system login class
+	// <name>` anywhere in the tree (including group bodies, applied or
+	// not — same permissive rationale as forwardingClasses). The
+	// `system login user <n> class <c>` leaf validates against the
+	// built-in classes UNION this set (#4304 S-2).
+	loginClasses map[string]struct{}
 }
 
 // collectSchemaRefs walks the tree for cross-referenceable definitions.
@@ -170,7 +180,10 @@ type schemaRefs struct {
 // whose queue number does not parse are skipped, as the compiler skips
 // them.
 func collectSchemaRefs(tree *ConfigTree) *schemaRefs {
-	refs := &schemaRefs{forwardingClasses: map[string]struct{}{}}
+	refs := &schemaRefs{
+		forwardingClasses: map[string]struct{}{},
+		loginClasses:      map[string]struct{}{},
+	}
 	if tree == nil {
 		return refs
 	}
@@ -190,6 +203,28 @@ func collectSchemaRefs(tree *ConfigTree) *schemaRefs {
 			refs.forwardingClasses[queueNode.Keys[2]] = struct{}{}
 		}
 	}
+	// collectLoginClasses records custom `login class <name>` names under a
+	// `system` node (#4304 S-2). Mirrors the compiler's namedInstances over
+	// `system login class`: the class name is the leading Keys arg.
+	collectLoginClasses := func(sysNode *Node) {
+		loginNode := sysNode.FindChild("login")
+		if loginNode == nil {
+			return
+		}
+		for _, classNode := range loginNode.FindChildren("class") {
+			if len(classNode.Keys) >= 2 && classNode.Keys[1] != "" {
+				refs.loginClasses[classNode.Keys[1]] = struct{}{}
+				continue
+			}
+			// Hierarchical shape: `class { noc-admin { ... } }` — the name
+			// is a child of the bare `class` node.
+			for _, c := range classNode.Children {
+				if len(c.Keys) > 0 && c.Keys[0] != "" {
+					refs.loginClasses[c.Keys[0]] = struct{}{}
+				}
+			}
+		}
+	}
 	for _, top := range tree.Children {
 		if top == nil || len(top.Keys) == 0 {
 			continue
@@ -197,6 +232,8 @@ func collectSchemaRefs(tree *ConfigTree) *schemaRefs {
 		switch top.Name() {
 		case "class-of-service":
 			collectCoS(top)
+		case "system":
+			collectLoginClasses(top)
 		case "groups":
 			for _, group := range top.Children {
 				if group == nil {
@@ -204,6 +241,9 @@ func collectSchemaRefs(tree *ConfigTree) *schemaRefs {
 				}
 				if cos := group.FindChild("class-of-service"); cos != nil {
 					collectCoS(cos)
+				}
+				if sys := group.FindChild("system"); sys != nil {
+					collectLoginClasses(sys)
 				}
 			}
 		}
