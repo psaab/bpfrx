@@ -1,3 +1,24 @@
+## 2026-07-04 — hb166 V-10: align smoke CoV to the Rust fairness SSOT
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-10 — the simul-load smoke reducer computed CoV with
+  the SAMPLE stddev (statistics.stdev, N-1) AND filtered zero-bps streams,
+  so its printed CoV could not reproduce a fairness-eval verdict and a
+  fully starved class printed CoV 0 (the "perfectly fair" value). Extracted
+  the population-CoV estimator into test/incus/fairness_cov.py as the single
+  Python mirror of userspace-dp/src/fairness.rs::compute_observed_cov
+  (population stddev over the full vector including zeros, 0.0 for
+  empty/zero-mean). Imported it into cos-simul-load-smoke.sh, stopped
+  filtering zero-bps flows, relabelled the printed column wrCoV% (whole-run)
+  with a legend + verdict provenance field. Added fairness_cov_test.py
+  pinning population_cov to the exact fairness.rs unit-test values (0.5
+  skewed, 0.0 balanced/empty/zero-mean) plus a starved-flow-not-filtered
+  assertion (RED-on-revert: sample stddev gives 0.5774; zero-filter gives
+  0.0). Documented the CoV semantics in docs/fairness-regimes.md. Closes
+  #4247.
+- **File(s)**: test/incus/fairness_cov.py, test/incus/fairness_cov_test.py,
+  test/incus/cos-simul-load-smoke.sh, docs/fairness-regimes.md, _Log.md
+
 ## 2026-07-04 — #4228 Gap 7: vSRX CoS show commands
 
 - **Timestamp**: 2026-07-04

@@ -1411,6 +1411,20 @@ with per-class achievement, CoV, retransmits, and gate booleans.
 This is now part of the canonical smoke matrix for any PR that
 touches CoS scheduling.
 
+**CoV column semantics (#4239 V-10):** the printed `wrCoV%` column is a
+**whole-run population CoV** computed by `test/incus/fairness_cov.py`,
+the single Python mirror of the Rust fairness SSOT
+(`userspace-dp/src/fairness.rs::compute_observed_cov`). It uses the
+population estimator (denominator N, not the sample N-1 that
+`statistics.stdev` returns) and counts starved (0 bps) flows rather than
+filtering them, so a fully starved class raises CoV instead of printing
+`0.0` (the "perfectly fair" value). It is labelled *whole-run* because it
+covers the entire run including warmup, whereas `fairness.rs` reduces the
+steady-state window — the estimator FORM matches; the window does not.
+The CoV column is decorative context, not a gate (per the #1614
+re-scope). `test/incus/fairness_cov_test.py` pins `population_cov` to the
+exact values asserted by the `fairness.rs` unit tests.
+
 **Exit-code contract (#4239/#4240):** the reducer propagates the gate
 verdict as the process exit status — the script exits **0 only when
 every gate passes**, and **nonzero on any gate failure** (a starved
