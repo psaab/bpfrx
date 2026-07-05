@@ -1206,6 +1206,9 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 		if v := nodeVal(n); v != "" {
 			if id, err := strconv.Atoi(v); err == nil {
 				ch.Cluster.NodeID = id
+				// Mark the leaf as explicitly present so the node-identity
+				// cross-check (#4185) can tell "node 0" from an absent leaf.
+				ch.Cluster.NodeIDSet = true
 			}
 		}
 	}

@@ -273,10 +273,58 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	if err := schemaValidateExpandedTreeForNode(tree, nodeID); err != nil {
 		return nil, err
 	}
+	var compiled *config.Config
+	var err error
 	if nodeID >= 0 {
-		return config.CompileConfigForNode(tree, nodeID)
+		compiled, err = config.CompileConfigForNode(tree, nodeID)
+	} else {
+		compiled, err = config.CompileConfig(tree)
 	}
-	return config.CompileConfig(tree)
+	if err != nil {
+		return nil, err
+	}
+	if err := crossCheckNodeID(compiled, nodeID); err != nil {
+		return nil, err
+	}
+	return compiled, nil
+}
+
+// crossCheckNodeID rejects a config whose compiled `chassis cluster node`
+// leaf disagrees with the effective node identity (#4185). nodeID is the
+// SSOT node identity: the /etc/xpf/node-id file value on an operator commit
+// (Store.compileTree passes s.nodeID) or the `-node-id` flag on
+// `xpfd check-config` (CheckText). The file drives ${node} apply-group
+// expansion + boot class; the leaf drives FPC naming + heartbeat identity —
+// a divergence yields two half-identities (node 0's per-node IPs duplicated
+// on the wire) with no diagnostic. We reject the commit/check while the
+// operator can still fix it rather than let it boot half-standalone.
+//
+// This runs ONLY on the strict commit/commit-check path (compileTreeStrict).
+// The tolerant Store.Load / Store.SyncApply ingress uses compileTreeLenient,
+// which is deliberately NOT cross-checked: a config-sync push carries the
+// primary's expanded text, and the standby re-expands ${node} for its own
+// node, so the leaf already agrees with the standby's file after expansion —
+// and even a legacy/laxly-authored synced config must not blackout-boot the
+// standby (same doctrine as the #1319/#1798 lenient gates).
+//
+// Standalone (nodeID < 0) and configs without an explicit node leaf
+// (NodeIDSet false) never cross-check — an absent leaf on a node-1 box must
+// not false-reject as "node 0".
+func crossCheckNodeID(compiled *config.Config, nodeID int) error {
+	if compiled == nil || nodeID < 0 {
+		return nil
+	}
+	cc := compiled.Chassis.Cluster
+	if cc == nil || !cc.NodeIDSet {
+		return nil
+	}
+	if cc.NodeID != nodeID {
+		return fmt.Errorf("node identity mismatch: the node-id file / -node-id is %d but "+
+			"'chassis cluster node' resolves to %d after ${node} expansion — these MUST agree "+
+			"(the file drives ${node} apply-group expansion and boot class; the leaf drives FPC "+
+			"naming and heartbeat identity). Fix one so both name the same node", nodeID, cc.NodeID)
+	}
+	return nil
 }
 
 // compileTreeLenient is compileTree with the tolerant-path validator
