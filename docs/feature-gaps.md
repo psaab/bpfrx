@@ -184,7 +184,7 @@ User-based policy enforcement integrating with directory services. Not implement
 
 ## 8. NAT Enhancements
 
-xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, destination-address-name match (#3229), protocol-only match, port rewriting, multi-port matching, destination-nat off exemption (#3844)), static 1:1 (host AND block-to-block subnet mappings, #3031), NAT64, and exemption rules. These are additional NAT features from the vSRX.
+xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, destination-address-name match (#3229), protocol-only match, port rewriting, multi-port matching, destination-nat off exemption (#3844)), static 1:1 (host AND block-to-block subnet mappings, #3031; named translation target `then static-nat prefix-name <addr>`, #4290), NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
 > **DNAT `match destination-address` now honors a multi-host prefix
 > (#3164 — supersedes the #3029 exact-host limitation).** The userspace
@@ -222,6 +222,42 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 > The commit gate REJECTS a block pair that also specifies a port, and the
 > dataplane lenient-load path drops it rather than mis-installing an
 > all-port block (#3202).
+>
+> **Named static-NAT target `then static-nat prefix-name <addr>` (#4290,
+> fable-167 N-1).** The named form of `then static-nat prefix <ip>`:
+> `prefix-name` references a global address-book entry whose literal prefix
+> is the 1:1 translation target. Before #4290 the target keyword fell
+> through the compiler's `then` switch (which recognized only
+> `nptv6-prefix` / `prefix` / `inet`), leaving `rule.Then == ""` — the rule
+> committed clean and installed with an **empty translation target** (a
+> silent broken static NAT). The compiler now resolves the referenced
+> address-book entry to its prefix (`resolveStaticNATThenPrefixNames`, run
+> after the zone-local books are folded into the global book). A defensive
+> **empty-target guard** (`validateStaticNATThenTargetStrict`) now REJECTS
+> at strict commit ANY `then static-nat` that produced an empty target —
+> an unresolvable `prefix-name` OR an unhandled/misspelled target keyword —
+> so no static-NAT rule can commit with no translation. Lenient load /
+> peer-sync downgrades to a warning (#1960) and the dataplane fails closed
+> (the empty prefix does not parse as an IP).
+
+> **Accepted-only NAT knobs (advisory, not enforced).** Three NAT knobs are
+> now schema-typed and committed but the userspace AF_XDP dataplane does not
+> enforce them; each emits a commit-time accepted-only advisory (mirroring
+> the #2078 / #4231 doctrine) instead of the prior silent drop:
+> - `security nat source interface port-overloading off` and pool
+>   `port-overloading-factor <n>` (#4291, fable-167 N-2) — the SNAT allocator
+>   always overloads source ports, so `off` hardened NOTHING; the advisory
+>   makes the false hardening operator-visible. Unique-src-port-per-mapping
+>   and factor-scaled port budgeting are a userspace-dp SNAT-allocator
+>   follow-up.
+> - the NAT translation-**target** routing-instance — `then static-nat
+>   {inet|prefix <ip>} routing-instance <ri>` and a source / destination
+>   pool `routing-instance <ri>` (#4292, fable-167 N-3) — the dataplane
+>   routes the post-translation packet against the ingress / default routing
+>   instance, so the target RI was silently dropped. This is DISTINCT from
+>   the #3096 from/to **scope** routing-instance, which IS enforced. Placing
+>   the translated packet in a non-ingress table (cross-VRF NAT) is a
+>   userspace-dp follow-up.
 
 > **NAT64 inbound policy now matches the real internal IPv4 host (#2358,
 > resolved).** For inbound NAT64 flows the security policy is evaluated

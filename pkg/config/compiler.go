@@ -2326,6 +2326,14 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// tokens and synthetic global entries.
 	resolveZoneLocalAddressBooks(&cfg.Security)
 
+	// #4290 — resolve `then static-nat prefix-name <name>` translation targets
+	// into their literal prefix now that the global address book is fully
+	// folded (compileNAT can run before compileAddressBook within a `security {}`
+	// root, so this cannot happen inline in the then switch). An unresolvable
+	// reference leaves Then=="" and is rejected below by
+	// validateStaticNATThenTargetStrict (warn on the tolerant path).
+	resolveStaticNATThenPrefixNames(&cfg.Security)
+
 	// #1538 — accumulate independent strict-validator families so
 	// `commit check` surfaces one error per family in a single
 	// response. This saves operator round-trips on first-touch
@@ -3505,6 +3513,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFirewallRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("NAT address-name reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #4290: reject a static-NAT rule that would install with an EMPTY
+	// translation target — an unresolvable `then static-nat prefix-name` or a
+	// misspelled / unhandled target keyword the free-form static-nat leaf
+	// accepted. Both silently installed a 1:1 NAT with no translation. Strict on
+	// commit / commit-check (hard reject so the broken target is operator-
+	// visible); lenient on load / peer-sync (warn — #1960; the dataplane then
+	// fails closed on the empty prefix). Reuses lenientFirewallRefs, the same
+	// opt the NAT address-name gate above uses.
+	if err := validateStaticNATThenTargetStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("static NAT translation target (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

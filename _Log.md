@@ -35339,3 +35339,70 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
   userspace-dp/src/filter/README.md, _Log.md
+
+## 2026-07-05 — fable-review-167 NAT parity N-1/N-2/N-3 (#4290/#4291/#4292)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Three NAT compiler parity fixes (Go-only, pkg/config).
+  - **N-1 (#4290, real fix)**: `then static-nat prefix-name <addr>` used to
+    fall through the compiler's then-target switch, leaving `rule.Then == ""`
+    — a static NAT that committed clean and installed with an EMPTY
+    translation target. Added a `prefix-name` case (records
+    `StaticNATRule.ThenPrefixName`), a post-address-book-fold resolver
+    (`resolveStaticNATThenPrefixNames`, compiler.go — resolves the named
+    global address-book entry to its literal prefix into `rule.Then`), and a
+    defensive empty-target guard (`validateStaticNATThenTargetStrict`) that
+    hard-rejects at strict commit ANY non-NPTv6 static rule whose then-target
+    is empty (unresolvable prefix-name OR unhandled/typo'd keyword). Lenient
+    load / peer-sync warns (#1960); dataplane fails closed.
+  - **N-2 (#4291, typed leaf + advisory)**: `nat source interface
+    port-overloading off` + pool `port-overloading-factor <n>` were unmodeled
+    and silently dropped (`off` hardened nothing). Added typed setSchema
+    leaves (`interface { port-overloading (off) }`, pool
+    `port-overloading-factor` int 1..32), typed fields
+    (`NATConfig.SourceInterfacePortOverloadingOff`,
+    `NATPool.PortOverloadingFactor`), and an accepted-only advisory. Full
+    SNAT-allocator enforcement = userspace-dp follow-up (noted).
+  - **N-3 (#4292, typed leaf + advisory)**: the NAT translation-TARGET
+    routing-instance (`then static-nat {inet|prefix} routing-instance <ri>`,
+    source/destination pool `routing-instance <ri>`) was silently dropped
+    (distinct from the enforced #3096 from/to SCOPE RI). Added parsing (static
+    then + both pool loops), typed fields (`StaticNATRule.ThenRoutingInstance`,
+    `NATPool.RoutingInstance`), source-pool `routing-instance` schema leaf, and
+    an accepted-only advisory. Cross-VRF-NAT enforcement = userspace-dp
+    follow-up (noted).
+  - **Validation**: 11 new RED-on-revert tests
+    (compiler_nat_target_parity_hb167_test.go) — proven RED by neutering just
+    the behavioral logic (types/schema kept) and observing all 11 fail, then
+    green after restore. `go test ./pkg/config/...` green; `go build ./...`
+    clean; gofmt + vet clean; `go test ./pkg/dataplane/userspace/...` green
+    (additive type fields, snapshot builder unchanged).
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go,
+  pkg/config/compiler.go, pkg/config/schema_security.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_nat_target_parity_hb167_test.go,
+  docs/feature-gaps.md, docs/config-schema.md, _Log.md
+
+## 2026-07-05 — fable-167 NAT PR #4294 Copilot fold: trailing-RI last-occurrence (#4292)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Folded a Copilot correctness edge on PR #4294.
+  `staticNATRoutingInstanceFromKeys` (compiler_nat.go) scanned the collapsed
+  static-nat then-leaf Keys forward and returned the FIRST "routing-instance"
+  occurrence. The Junos grammar is TRAILING (`then static-nat <target>
+  routing-instance <ri>` — the target RI is at the tail), so an earlier
+  "routing-instance" token in the key list (e.g. a `prefix-name` whose
+  address-book entry is pathologically NAMED "routing-instance") made
+  first-match return the wrong token → ThenRoutingInstance + the advisory
+  referenced the wrong RI. Changed the scan to iterate BACKWARD and return the
+  LAST occurrence. The sibling N-3 key captures (pool `routing-instance` via
+  `nodeVal`, the `t.FindChild("routing-instance")` single-leaf path) do NOT use
+  a trailing key-scan, so no other site needed the fix.
+- **Validation**: 2 new tests (last-occurrence pathological entry-named-
+  "routing-instance" → MYVRF; normal `prefix-name FOO routing-instance MYVRF`
+  → MYVRF), proven RED under the first-match revert (recorded "routing-instance"
+  instead of MYVRF), green after. Full `go test ./pkg/config/...` green;
+  `go build ./...` clean; gofmt + vet clean. Rebased origin/master (#4293
+  routing merge, clean auto-merge of _Log.md).
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_nat_target_parity_hb167_test.go, _Log.md

@@ -9,6 +9,22 @@ import (
 	"strings"
 )
 
+// sortedPoolNames returns the keys of a NAT pool map in deterministic sorted
+// order, so advisory / warning messages that enumerate pools are stable across
+// compiles (Go map iteration order is randomized). Used by the #4291/#4292
+// accepted-only NAT advisories.
+func sortedPoolNames(pools map[string]*NATPool) []string {
+	if len(pools) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(pools))
+	for name := range pools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // ValidateConfig performs non-fatal validation on a compiled config.
 // Returns warnings for unresolved references and operator-visible
 // compatibility/deprecation conditions.
@@ -608,6 +624,93 @@ func ValidateConfig(cfg *Config) []string {
 		if flow.SyncICMPSession {
 			warnings = append(warnings,
 				"security flow sync-icmp-session configured but has no effect — xpf syncs ICMP sessions to the HA peer UNCONDITIONALLY (the session-sync path is protocol-agnostic), so this Junos opt-in knob is a no-op: ICMP session sync is already always on and cannot be turned off (config-only parity, #4231)")
+		}
+	}
+
+	// #4291 (fable-167 N-2): the NAT `port-overloading` knobs are now typed +
+	// committed (schema leaves + compileNAT) but the userspace AF_XDP SNAT
+	// allocator enforces neither. `security nat source interface port-overloading
+	// off` disables source-port reuse across destinations (a src-port-uniqueness
+	// hardening posture) — xpf's allocator always overloads source ports, so
+	// `off` hardens NOTHING. `port-overloading-factor <n>` scales the concurrent
+	// translations per pool address — xpf has no factor-scaled port budget.
+	// Mirror the #2078/#4231 accepted-only doctrine: warn so an operator is not
+	// silently misled into believing `off` is a real control. Full enforcement is
+	// a userspace-dp SNAT-allocator follow-up.
+	{
+		var poParts []string
+		if cfg.Security.NAT.SourceInterfacePortOverloadingOff {
+			poParts = append(poParts, "interface port-overloading off")
+		}
+		var poFactorPools []string
+		for _, name := range sortedPoolNames(cfg.Security.NAT.SourcePools) {
+			if p := cfg.Security.NAT.SourcePools[name]; p != nil && p.PortOverloadingFactor > 0 {
+				poFactorPools = append(poFactorPools, name)
+			}
+		}
+		if len(poFactorPools) > 0 {
+			poParts = append(poParts, fmt.Sprintf("pool %s port-overloading-factor", strings.Join(poFactorPools, ", ")))
+		}
+		if len(poParts) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"security nat source %s configured but accepted-only — the "+
+					"userspace dataplane always overloads source ports, so "+
+					"port-overloading off hardens nothing and "+
+					"port-overloading-factor has no effect (config-only parity, "+
+					"#4291)",
+				strings.Join(poParts, " / ")))
+		}
+	}
+
+	// #4292 (fable-167 N-3): NAT translation-TARGET routing-instance is now typed
+	// + recorded (compileNAT) but not enforced. `then static-nat {inet|prefix
+	// <ip>} routing-instance <ri>` and a source / destination NAT pool
+	// `routing-instance <ri>` would place the TRANSLATED packet in a different
+	// routing table (cross-VRF NAT) — distinct from the #3096 from/to SCOPE
+	// routing-instance, which IS enforced. The dataplane does not route the
+	// post-translation packet against a non-ingress table, so the target RI is
+	// dropped. Mirror the #2078/#4231 accepted-only doctrine: warn so the dropped
+	// target is operator-visible. Full enforcement is a cross-VRF-NAT userspace-dp
+	// follow-up.
+	{
+		targetRISeen := make(map[string]bool)
+		var targetRIParts []string
+		addRI := func(part string) {
+			if !targetRISeen[part] {
+				targetRISeen[part] = true
+				targetRIParts = append(targetRIParts, part)
+			}
+		}
+		for _, rs := range cfg.Security.NAT.Static {
+			if rs == nil {
+				continue
+			}
+			for _, rule := range rs.Rules {
+				if rule != nil && rule.ThenRoutingInstance != "" {
+					addRI(fmt.Sprintf("static rule-set %q rule %q then static-nat routing-instance %q", rs.Name, rule.Name, rule.ThenRoutingInstance))
+				}
+			}
+		}
+		for _, name := range sortedPoolNames(cfg.Security.NAT.SourcePools) {
+			if p := cfg.Security.NAT.SourcePools[name]; p != nil && p.RoutingInstance != "" {
+				addRI(fmt.Sprintf("source pool %q routing-instance %q", name, p.RoutingInstance))
+			}
+		}
+		if cfg.Security.NAT.Destination != nil {
+			for _, name := range sortedPoolNames(cfg.Security.NAT.Destination.Pools) {
+				if p := cfg.Security.NAT.Destination.Pools[name]; p != nil && p.RoutingInstance != "" {
+					addRI(fmt.Sprintf("destination pool %q routing-instance %q", name, p.RoutingInstance))
+				}
+			}
+		}
+		if len(targetRIParts) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"security nat translation-target routing-instance configured but "+
+					"accepted-only — the userspace dataplane routes the "+
+					"post-translation packet against the ingress / default "+
+					"routing instance, so the target routing-instance is not "+
+					"applied (%s) (config-only parity, #4292)",
+				strings.Join(targetRIParts, "; ")))
 		}
 	}
 

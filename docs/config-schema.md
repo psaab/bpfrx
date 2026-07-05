@@ -1543,8 +1543,10 @@ reserved for whole-dataplane selection where a rewrite shim
     port-mapped static-NAT rule matches on. The companion
     `then static-nat prefix <ip> mapped-port <port>` carries the internal
     (post-translation) port. `static-nat` deliberately stays a
-    `children: nil` free-form leaf (so `prefix <ip> mapped-port <port>`
-    collapses onto ONE leaf node and SetPath grouping is preserved); the
+    `children: nil` free-form leaf (so `prefix <ip> mapped-port <port>`,
+    `prefix-name <addr>` (#4290), and a trailing
+    `... routing-instance <ri>` (#4292) all collapse onto ONE leaf node and
+    SetPath grouping is preserved); the
     `mapped-port` token therefore bypasses the schema value validator and
     is range-checked in the compiler (`validateNATHostMaskStrict`,
     `compiler_nat.go`), which ALSO rejects a `mapped-port` with no
@@ -1609,6 +1611,40 @@ reserved for whole-dataplane selection where a rewrite shim
     combinations (the #3303 snapshot tests call the builder directly and
     bypass the strict validator, which is how the over-reject survived for
     the three combinations the #3425 SNAT-source test did not cover).
+  - `security nat static rule-set rule then static-nat prefix-name <addr>`
+    (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
+    references a global `security address-book` entry whose literal prefix
+    is the 1:1 translation target. The compiler records the raw name
+    (`StaticNATRule.ThenPrefixName`) and `resolveStaticNATThenPrefixNames`
+    (compiler.go, run AFTER `resolveZoneLocalAddressBooks` folds the
+    zone-local books into the global book — `compileNAT` can run before
+    `compileAddressBook` within a `security {}` root, so resolution cannot
+    happen inline in the then switch) resolves it to the single prefix and
+    writes `rule.Then`. A single `address <name> <prefix>` resolves to its
+    prefix; a one-member `address-set` resolves to that member's prefix;
+    anything else (undefined / prefix-less / multi-member / dangling) leaves
+    `Then == ""`. Before #4290 the target keyword fell through the then
+    switch and the rule installed with an EMPTY translation target (silent
+    broken static NAT). A defensive **empty-target guard**
+    (`validateStaticNATThenTargetStrict`) now rejects at strict commit ANY
+    non-NPTv6 `then static-nat` that produced `Then == ""` — the unresolvable
+    `prefix-name` AND any unhandled/misspelled target keyword — reusing the
+    `lenientFirewallRefs` downgrade (warn on load / peer-sync, #1960; the
+    dataplane fails closed since the empty prefix does not parse as an IP).
+  - **Accepted-only NAT knobs (typed + advisory, not enforced).** Three
+    knobs are now schema-typed so they complete and commit, but the
+    userspace dataplane does not enforce them — commit emits an accepted-only
+    advisory (`ValidateConfig`, mirroring the #2078/#4231 doctrine) instead
+    of the prior silent drop: `security nat source interface port-overloading`
+    (enum `{off}`) and pool `port-overloading-factor <n>` (`ValueInteger`
+    1..32) (#4291 — the SNAT allocator always overloads source ports, so
+    `off` hardens nothing); and the NAT translation-TARGET routing-instance —
+    the source/destination pool `routing-instance <ri>` leaf and the free-form
+    `then static-nat {inet|prefix <ip>} routing-instance <ri>` trailing token
+    (#4292 — the dataplane routes the post-translation packet against the
+    ingress / default instance; DISTINCT from the enforced #3096 from/to SCOPE
+    routing-instance). Full enforcement of all three is a userspace-dp
+    follow-up.
   - `protocols router-advertisement interface` — typed the
     second-denominated leaves (`max/min-advertisement-interval`,
     `default-lifetime`, `link-mtu`; the latter was tightened from
