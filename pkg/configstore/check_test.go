@@ -109,3 +109,54 @@ apply-groups "${node}";
 		t.Fatalf("CheckText(standalone with ${node} groups) = %v, want nil", err)
 	}
 }
+
+// #4185 (H-12): the strict gate must reject a config whose `chassis cluster
+// node` leaf disagrees with the effective node identity (the /etc/xpf/node-id
+// file value on commit, or -node-id on check-config). A silent mismatch yields
+// two half-identities on the wire with no diagnostic. RED-on-revert: without
+// the crossCheckNodeID gate, the -node-id 1 case below PASSES.
+func TestCheckTextNodeIDMismatchRejected(t *testing.T) {
+	// Literal `chassis cluster node 0` (as if copied from node 0's config).
+	conf := checkValidConfig + `
+chassis {
+    cluster {
+        cluster-id 1;
+        node 0;
+    }
+}
+`
+	// File/flag says node 1, leaf resolves to 0 → mismatch → reject.
+	if _, err := CheckText(conf, 1); err == nil {
+		t.Fatal("CheckText(node leaf 0, -node-id 1) = nil, want node-identity mismatch reject")
+	} else if !strings.Contains(err.Error(), "node identity mismatch") {
+		t.Fatalf("CheckText mismatch error = %v, want 'node identity mismatch'", err)
+	}
+
+	// Agreement (leaf 0, node 0) must pass.
+	if _, err := CheckText(conf, 0); err != nil {
+		t.Fatalf("CheckText(node leaf 0, -node-id 0) = %v, want nil (identities agree)", err)
+	}
+
+	// Standalone (-1) never cross-checks — the leaf is advisory there.
+	if _, err := CheckText(conf, -1); err != nil {
+		t.Fatalf("CheckText(node leaf 0, standalone) = %v, want nil (no cross-check)", err)
+	}
+}
+
+// #4185: a config with a cluster stanza but NO explicit `node` leaf must NOT
+// false-reject on a node-1 box — an absent leaf is not "node 0". RED-on-revert
+// if the cross-check keyed off NodeID's zero default instead of NodeIDSet.
+func TestCheckTextNoNodeLeafNoFalseReject(t *testing.T) {
+	conf := checkValidConfig + `
+chassis {
+    cluster {
+        cluster-id 1;
+    }
+}
+`
+	for _, nodeID := range []int{0, 1} {
+		if _, err := CheckText(conf, nodeID); err != nil {
+			t.Fatalf("CheckText(no node leaf, -node-id %d) = %v, want nil (absent leaf != node 0)", nodeID, err)
+		}
+	}
+}

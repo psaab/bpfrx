@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -581,6 +582,15 @@ type Daemon struct {
 	compileLastError        string // text of the most recent compile error
 	compileLastErrorUnixSec int64  // timestamp of the most recent compile error
 
+	// #4184: the day-0 / bootstrap config-import outcome, recorded once at
+	// boot so a FAILED import is visible beyond a single journald WARN.
+	// Surfaced via /health (bootstrap_import_status) and an event. See
+	// recordBootstrapImport / BootstrapImportSnapshot (daemon_health.go).
+	bootstrapMu            sync.Mutex
+	bootstrapImportStatus  string // "" until recorded; then a bootstrapImport* constant
+	bootstrapImportError   string // error detail when status == bootstrapImportFailed
+	bootstrapImportUnixSec int64  // Unix seconds the outcome was recorded
+
 	// priorTunables stores the pre-xpfd values of every host-scope
 	// tunable xpfd has touched, so that restore-on-disable (B2) can
 	// revert to what the operator had before xpfd claimed the host.
@@ -714,6 +724,21 @@ type CompileHealth struct {
 
 const standbyNeighborRefreshMinInterval = time.Second
 
+// parseNodeIDFileContent parses /etc/xpf/node-id content to the SAME strict
+// contract every other node-id consumer enforces (#4185): a trimmed, whole
+// integer restricted to 0|1. It returns ok=false for empty, non-integer,
+// trailing-garbage ("1garbage"), or out-of-range ("2", "-1") input — all
+// forms the historical fmt.Sscanf("%d") silently accepted (it would parse
+// "1garbage" as 1). The `-node-id` flag on `xpfd check-config` and the day-0
+// loader already enforce 0|1|-1; this brings the daemon's file reader in line.
+func parseNodeIDFileContent(s string) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 || n > 1 {
+		return 0, false
+	}
+	return n, true
+}
+
 // New creates a new Daemon. It fails when the config store cannot be
 // constructed (#1893 — the store is fail-closed on an unusable
 // .configdb): a daemon that cannot persist configuration must not
@@ -738,11 +763,23 @@ func New(opts Options) (*Daemon, error) {
 	// valid integer, the daemon runs in cluster mode with ${node} variable
 	// expansion in apply-groups. If the file does not exist, standalone mode.
 	if data, err := os.ReadFile(nodeIDFile); err == nil {
+		// #4185: parse to the SAME strict contract every other node-id
+		// consumer enforces — a trimmed, whole-string Atoi restricted to
+		// 0|1. The historical fmt.Sscanf("%d") accepted "1garbage" and any
+		// integer, laxer than `xpfd check-config -node-id` (0|1|-1) and the
+		// day-0 loader. A present-but-unparseable/out-of-range file leaves
+		// the store at nodeID=-1 while hasNodeIDFile() (stat-only) still
+		// forces the HA boot class, so ${node} silently expands with the
+		// node-0 fallback — log LOUDLY instead of going half-standalone.
 		s := strings.TrimSpace(string(data))
-		var nodeID int
-		if _, err := fmt.Sscanf(s, "%d", &nodeID); err == nil {
+		if nodeID, ok := parseNodeIDFileContent(s); ok {
 			store.SetNodeID(nodeID)
 			slog.Info("cluster node ID loaded from file", "node", nodeID, "file", nodeIDFile)
+		} else {
+			slog.Error("cluster node-id file is present but not a valid node id (must be exactly "+
+				"0 or 1); the node will boot in the HA class but ${node} expansion falls back to "+
+				"node0 and heartbeat/FPC identity may diverge — FIX the file",
+				"file", nodeIDFile, "content", s)
 		}
 	}
 

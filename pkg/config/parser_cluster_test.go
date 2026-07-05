@@ -1217,3 +1217,42 @@ func TestPerUnitTunnelConfig(t *testing.T) {
 		t.Errorf("unit 1 Tunnel.Addresses = %v, want 3 entries", unit1.Tunnel.Addresses)
 	}
 }
+
+// TestClusterNodeIDSet pins #4185: the compiler records whether the
+// `chassis cluster node` leaf was actually present (NodeIDSet), so the
+// node-identity cross-check can tell an explicit "node 0" from an absent
+// leaf (whose NodeID sits at its zero default). RED-on-revert: without the
+// NodeIDSet flag the "no node leaf" case below reports NodeIDSet==true.
+func TestClusterNodeIDSet(t *testing.T) {
+	withLeaf := buildTree(t, []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+	})
+	cfg, err := CompileConfig(withLeaf)
+	if err != nil {
+		t.Fatalf("CompileConfig(with node leaf): %v", err)
+	}
+	if cfg.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil")
+	}
+	if !cfg.Chassis.Cluster.NodeIDSet {
+		t.Error("NodeIDSet must be true when `chassis cluster node` is present")
+	}
+	if cfg.Chassis.Cluster.NodeID != 0 {
+		t.Errorf("NodeID = %d, want 0", cfg.Chassis.Cluster.NodeID)
+	}
+
+	noLeaf := buildTree(t, []string{
+		"set chassis cluster cluster-id 1",
+	})
+	cfg2, err := CompileConfig(noLeaf)
+	if err != nil {
+		t.Fatalf("CompileConfig(no node leaf): %v", err)
+	}
+	if cfg2.Chassis.Cluster == nil {
+		t.Fatal("Cluster is nil (no leaf)")
+	}
+	if cfg2.Chassis.Cluster.NodeIDSet {
+		t.Error("NodeIDSet must be false when the node leaf is absent (zero default is not node 0)")
+	}
+}

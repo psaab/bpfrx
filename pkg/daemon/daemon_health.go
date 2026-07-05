@@ -6,7 +6,75 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/logging"
 )
+
+// Bootstrap-import outcome constants (#4184). Recorded once at boot by
+// recordBootstrapImport and surfaced via /health + an event.
+const (
+	// bootstrapImportOK: the text config file was imported and committed.
+	bootstrapImportOK = "ok"
+	// bootstrapImportLoadedDB: an active config was already present in the DB;
+	// no file import was attempted (normal steady-state boot).
+	bootstrapImportLoadedDB = "loaded-from-db"
+	// bootstrapImportNoConfig: no text config file present (factory/fresh
+	// boot). Expected — NOT a failure and NOT health-degrading.
+	bootstrapImportNoConfig = "no-config"
+	// bootstrapImportFailed: a text config file was present but could not be
+	// read/parsed/committed (or was rejected by the device-map preflight).
+	bootstrapImportFailed = "import-failed"
+)
+
+// BootstrapImport is a snapshot of the day-0 / bootstrap config-import
+// outcome (#4184). Consumed by /health so a FAILED import is visible beyond
+// the single boot-time journald WARN it used to be.
+type BootstrapImport struct {
+	Status  string // a bootstrapImport* constant ("" if not yet recorded)
+	Error   string // detail when Status == bootstrapImportFailed
+	UnixSec int64  // when the outcome was recorded
+	// Failed is true only for bootstrapImportFailed — a real read/parse/
+	// commit/preflight failure. The expected factory no-config state is NOT
+	// failed, so a health probe does not flap on a fresh box.
+	Failed bool
+}
+
+// recordBootstrapImport stores the boot-time config-import outcome and, on a
+// real failure, emits an event so the cause is observable beyond journald
+// (#4184). Called exactly once during Run after the bootstrap decision.
+func (d *Daemon) recordBootstrapImport(status, detail string) {
+	d.bootstrapMu.Lock()
+	d.bootstrapImportStatus = status
+	d.bootstrapImportError = detail
+	d.bootstrapImportUnixSec = time.Now().Unix()
+	d.bootstrapMu.Unlock()
+
+	if status != bootstrapImportFailed {
+		return
+	}
+	// Emit a durable, in-band event so `monitor`/event-stream subscribers and
+	// the ring buffer carry the cause — not just a one-shot journald WARN.
+	if d.eventBuf != nil {
+		d.eventBuf.Add(logging.EventRecord{
+			Time:   time.Now(),
+			Type:   "BOOTSTRAP_IMPORT_FAILED",
+			Reason: detail,
+		})
+	}
+}
+
+// BootstrapImportSnapshot returns the recorded day-0 / bootstrap import
+// outcome for /health and operator-facing surfaces. Safe to call
+// concurrently.
+func (d *Daemon) BootstrapImportSnapshot() BootstrapImport {
+	d.bootstrapMu.Lock()
+	defer d.bootstrapMu.Unlock()
+	return BootstrapImport{
+		Status:  d.bootstrapImportStatus,
+		Error:   d.bootstrapImportError,
+		UnixSec: d.bootstrapImportUnixSec,
+		Failed:  d.bootstrapImportStatus == bootstrapImportFailed,
+	}
+}
 
 // recordCompileFailure tracks a dataplane compile failure and emits an
 // escalating log (#758). The first failure remains a single WARN;

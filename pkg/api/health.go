@@ -32,6 +32,25 @@ func (s *Server) healthHandler(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 	}
+	// #4184: surface the day-0 / bootstrap config-import outcome. This is a
+	// non-fatal field (like rollback_history_degraded): a failed import leaves
+	// the box in the lifeline-safe bootstrap state, so it does NOT force a 503
+	// — the point is visibility of "why didn't my config apply" beyond a
+	// single boot-time journald WARN. The factory no-config state reports
+	// bootstrap_import_status without bootstrap_import_failed set.
+	if s.bootstrapImportFn != nil {
+		b := s.bootstrapImportFn()
+		if b.Status != "" {
+			payload["bootstrap_import_status"] = b.Status
+			payload["bootstrap_import_failed"] = b.Failed
+			if b.Error != "" {
+				payload["bootstrap_import_error"] = b.Error
+			}
+			if b.UnixSec != 0 {
+				payload["bootstrap_import_unix"] = b.UnixSec
+			}
+		}
+	}
 	if s.configPersistDegradedFn != nil {
 		degraded := s.configPersistDegradedFn()
 		payload["config_persist_degraded"] = degraded

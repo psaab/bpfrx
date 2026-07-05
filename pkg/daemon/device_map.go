@@ -32,6 +32,11 @@ type presentNIC = devicemap.PresentNIC
 var (
 	enumerateAndRenameMappedFn     = enumerateAndRenameMapped
 	enumerateAndRenameInterfacesFn = enumerateAndRenameInterfaces
+	// enumeratePresentNICsFn is the seam every strand-management preflight
+	// reads the live NIC inventory through (#4183), so the commit / day-0
+	// bootstrap / check-config strand checks are unit-testable without a
+	// live VM. Production leaves it pointing at the real sysfs+netlink scan.
+	enumeratePresentNICsFn = enumeratePresentNICs
 )
 
 // enumeratePresentNICs reads the live host NIC inventory (sysfs + netlink).
@@ -421,7 +426,7 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 	if !candActive && !rbActive {
 		return nil
 	}
-	nics, err := enumeratePresentNICs()
+	nics, err := enumeratePresentNICsFn()
 	if err != nil {
 		// Cannot enumerate hardware — do not block the commit on a
 		// transient sysfs error; the #1922 lifeline is the backstop.
@@ -450,6 +455,63 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 		}
 	}
 	return nil
+}
+
+// CheckDeviceMapStrandsManagement runs the #1956 device-map strand-management
+// preflight against the LIVE host NIC inventory for a config that has NOT been
+// committed — the day-0 `xpfd check-config` gate (#4183). It is the daemon-free
+// analogue of deviceMapCommitPreflight: cmd/xpfd's check-config subcommand has
+// no *Daemon, so this package-level helper enumerates present NICs, resolves
+// the lifeline + protected set from the candidate config itself, and reports
+// whether the map would strand management on next boot.
+//
+// Returns:
+//   - reason != ""            -> the map WOULD strand management (hard-FAIL).
+//   - reason == "", off==true -> SKIPPED: none of the mapped identities are
+//     present, the OFF-TARGET signal (see below). Not a strand — the on-target
+//     first-boot preflight is the real gate; the caller warns, never fails.
+//   - reason == "", off==false -> checked and safe (or device-map inactive).
+//   - err != nil              -> NIC enumeration failed (transient/environmental).
+//
+// Off-target guard (#4191 review, MAJOR): `xpfd check-config` is invoked OFF
+// the target hardware by the standard day-0 pipeline — the config-drive is
+// built on the BUILD host (scripts/image/make_config_drive.py) and installed
+// from the DEPLOY host (scripts/deploy/xpf-deploy.py). There
+// enumeratePresentNICs SUCCEEDS but returns the BUILD host's NICs, NONE at the
+// target's mapped PCI/MAC identities, so every entry lands BindUnbound and a
+// naive strand check would false-reject a PERFECTLY VALID bare-metal map. When
+// NO mapped identity resolves to any present NIC (every binding is BindUnbound;
+// a bound OR refused entry means the slot IS populated, so that is on-target),
+// skip the check. This keeps the on-target genuine-strand rejection (mapped
+// NICs present but management lost) and the on-target card-swap refusal intact.
+func CheckDeviceMapStrandsManagement(cfg *config.Config) (reason string, offTarget bool, err error) {
+	if cfg == nil || !cfg.Chassis.DeviceMap.Active() {
+		return "", false, nil
+	}
+	nics, err := enumeratePresentNICsFn()
+	if err != nil {
+		return "", false, err
+	}
+	if !anyMappedIdentityPresent(cfg, nics) {
+		return "", true, nil
+	}
+	lifelineName, _ := resolveLifelineCurrentName()
+	return deviceMapStrandsManagement(cfg, nics, protectedForConfig(cfg), lifelineName), false, nil
+}
+
+// anyMappedIdentityPresent reports whether ANY device-map entry resolves to a
+// present NIC by identity — i.e. at least one binding is Decisive (bound OR
+// refused: a refused entry means the pinned PCI slot IS populated, just with a
+// swapped card). All-BindUnbound means none of the target's identities are on
+// this host — the off-target signal used by CheckDeviceMapStrandsManagement.
+func anyMappedIdentityPresent(cfg *config.Config, nics []presentNIC) bool {
+	dm := cfg.Chassis.DeviceMap
+	for _, b := range resolveDeviceMap(dm.Entries, nics, rethMembersFromConfig(cfg)) {
+		if b.Status.Decisive() {
+			return true
+		}
+	}
+	return false
 }
 
 // protectedForConfig resolves the #1922 protected set using the SPECIFIC
