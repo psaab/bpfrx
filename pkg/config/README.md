@@ -156,6 +156,21 @@ parser treats newlines as whitespace and merges multiple set lines into
 one giant node. This trap has bitten the project repeatedly — see
 CLAUDE.md.
 
+**Comments (`# ...`, `// ...`, `/* ... */`) and unterminated blocks
+(M-8):** the lexer (`skipWhitespaceAndComments`) skips `#`/`//` line
+comments to end-of-line and `/* */` block comments to their closing
+`*/`. An **unterminated** `/*` — one that reaches EOF with no closing
+`*/` — used to be swallowed silently to end-of-input, dropping every
+stanza after it while `Parse()` reported zero errors: one typo'd comment
+could delete an arbitrary tail of the config (e.g. security policies) and
+still `commit` successfully — a fail-open config-integrity path. The
+lexer now stashes a `TokenError{"unterminated block comment"}` (keyed to
+the opening `/*` line/column, mirroring `readString`'s "unterminated
+string"), surfaced via `Lexer.pending` at the top of `Next`, so
+`parseStatements` records a `ParseError` and the load/commit paths reject
+the truncated config. Single-line `/* x */` and `#`/`//` comments are
+unaffected — only the unterminated multi-line block is rejected.
+
 **Security-policy terminal action is fail-closed (#3043):** `PolicyAction`'s
 zero value is `PolicyPermit`, so a policy whose `then` stanza names no
 terminal action (log-only/count-only or a typo'd `then`) historically
