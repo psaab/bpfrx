@@ -1,3 +1,37 @@
+## 2026-07-05 — cos: #4272 div_ceil .max(1) hardening + fable-166 R-10 CoS test-coverage gaps (#4280)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4272 — extracted `flow_share_div_ceil(buffer_limit,
+    prospective_active)` helper that guards the divisor with `.max(1)` and
+    routed BOTH flow-share div_ceil sites through it (the shared_exact
+    rate-aware cap already inlined `.max(1)`; the owner-local legacy cap
+    divided by the raw count — a latent divide-by-zero if a future caller
+    reached it with 0; `cos_queue_prospective_active_flows` already clamps
+    to >=1 so it is unreachable today). Added
+    `flow_share_div_ceil_zero_divisor_is_panic_free` (admission_tests.rs) —
+    RED-on-revert: dropping `.max(1)` panics "attempt to divide by zero"
+    (verified).
+  - **Action**: fable-166 R-10 (#4280) — enumerated the consolidated CoS
+    test-coverage gaps, verified which the merged fable-166 wave already
+    covers (R-1/R-2/R-3/R-4-refill/R-5b/R-7/bucket-reuse-EWMA/FlowRrRing-
+    wrap/timer-cascade/demotion) and added tests for the 3 still-open
+    paths: (1) `apply_cos_send_result` / `apply_cos_prepared_result` with a
+    NON-empty retry deque (batch-vs-retry queued_bytes reconciliation —
+    every prior test passed an empty deque); (2) the `flow_fair &&
+    shared_exact` ECN aggregate arm (#785 Phase 3, previously only the
+    owner-local per-flow arm was tested); (3) `cos_refill_ns_until` direct
+    unit test (all 3 branches + div_ceil rounding). Deferred the two R-10
+    owner cross-checks (binding.live.tx bump; dehydrate counterpart) as
+    behavior/design work, out of scope for a test-only PR.
+  - **File(s)**: userspace-dp/src/afxdp/cos/admission.rs,
+    userspace-dp/src/afxdp/cos/admission_tests.rs,
+    userspace-dp/src/afxdp/cos/token_bucket_tests.rs,
+    userspace-dp/src/afxdp/cos/tx_completion_tests.rs, _Log.md
+  - **Validation**: FULL `cargo test --release --bins --tests
+    -- --test-threads=1` green (main bin 3572 passed / 0 failed / 2
+    ignored; all other bins pass). 5 new tests pass; #4272 fix verified
+    RED-on-revert.
+
 ## 2026-07-05 — fairness-eval reducer: six accuracy fixes (hb166 V-3..V-9)
 
 - **Timestamp**: 2026-07-05

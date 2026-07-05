@@ -154,6 +154,24 @@ fn clamp_flow_share_to_buffer(value: u64, buffer_limit: u64) -> u64 {
     value.clamp(floor, buffer_limit)
 }
 
+/// #4272: per-flow fair share = `buffer_limit.div_ceil(prospective_active)`
+/// with a defensive `.max(1)` on the divisor.
+///
+/// `cos_queue_prospective_active_flows` already clamps its result to
+/// `>= 1` (`flow_hash.rs`), so `prospective_active` is `>= 1` on every
+/// real call path and the `.max(1)` here is currently unreachable
+/// headroom. But `u64::div_ceil(0)` panics, so both flow-share div_ceil
+/// sites — the shared_exact rate-aware cap AND the owner-local legacy
+/// cap — must funnel through one guarded helper. Previously only the
+/// shared_exact site inlined `prospective.max(1)`; the owner-local site
+/// divided by the raw count, an asymmetry that would panic if a future
+/// caller ever reached it with 0. Centralizing removes that latent
+/// hazard and keeps the two paths bit-identical.
+#[inline]
+fn flow_share_div_ceil(buffer_limit: u64, prospective_active: u64) -> u64 {
+    buffer_limit.div_ceil(prospective_active.max(1))
+}
+
 #[inline]
 pub(in crate::afxdp) fn cos_queue_flow_share_limit(
     queue: &CoSQueueRuntime,
@@ -201,7 +219,7 @@ pub(in crate::afxdp) fn cos_queue_flow_share_limit(
         // `buffer_limit` is not divisible by `prospective`, increasing
         // boundary-condition tail-drops. The legacy path picked
         // div_ceil for that reason; shared_exact should follow.
-        let fair_share = buffer_limit.div_ceil(prospective.max(1));
+        let fair_share = flow_share_div_ceil(buffer_limit, prospective);
         let bdp = bdp_floor_bytes(queue.transmit_rate_bytes(), prospective);
         return clamp_flow_share_to_buffer(
             fair_share
@@ -211,7 +229,10 @@ pub(in crate::afxdp) fn cos_queue_flow_share_limit(
         );
     }
     let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
-    clamp_flow_share_to_buffer(buffer_limit.div_ceil(prospective_active), buffer_limit)
+    clamp_flow_share_to_buffer(
+        flow_share_div_ceil(buffer_limit, prospective_active),
+        buffer_limit,
+    )
 }
 
 /// Effective buffer cap for the admission check. Grows with the

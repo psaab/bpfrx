@@ -62,6 +62,36 @@ fn flow_share_limit_shared_exact_scales_with_rate() {
     );
 }
 
+/// #4272: both flow-share `div_ceil` paths (the shared_exact
+/// rate-aware cap and the owner-local legacy cap) route through
+/// `flow_share_div_ceil`, which guards the divisor with `.max(1)`.
+/// `cos_queue_prospective_active_flows` already clamps its result to
+/// `>= 1`, so a 0 divisor is unreachable on every real call path — but
+/// `u64::div_ceil(0)` panics, so the guard lives at the arithmetic
+/// itself, not only at the caller. Before this change the owner-local
+/// path divided by the raw count while shared_exact inlined `.max(1)`,
+/// an asymmetry that would panic if a future caller reached the
+/// owner-local site with 0.
+///
+/// RED-on-revert: drop the `.max(1)` inside `flow_share_div_ceil` and
+/// the first assertion panics with "attempt to divide by zero".
+#[test]
+fn flow_share_div_ceil_zero_divisor_is_panic_free() {
+    // A 0 divisor degenerates to div_ceil-by-1 == buffer_limit, never a
+    // panic. This is the defensive branch the .max(1) exists for.
+    assert_eq!(flow_share_div_ceil(96_000, 0), 96_000);
+    assert_eq!(flow_share_div_ceil(0, 0), 0);
+    // Non-zero divisors are unaffected by the guard — the .max(1) is a
+    // no-op once the count is already >= 1, so the helper equals a plain
+    // div_ceil.
+    assert_eq!(flow_share_div_ceil(96_000, 6), 96_000u64.div_ceil(6));
+    assert_eq!(flow_share_div_ceil(100_001, 7), 100_001u64.div_ceil(7));
+    // Rounding is UP, matching the legacy owner-local path's original
+    // choice (a divisor that does not evenly divide rounds up, never
+    // down — the #4272 consistency goal for the two unified sites).
+    assert_eq!(flow_share_div_ceil(10, 3), 4);
+}
+
 /// #914: at low N, `bdp_floor` exceeds `buffer_limit`; the formula
 /// must clamp to buffer_limit and degenerate to today's behavior
 /// rather than capping below per-flow BDP (which would collapse
@@ -534,6 +564,74 @@ fn admission_ecn_does_not_mark_when_both_thresholds_below() {
             ECN_ECT_0,
             "packet bytes must be byte-identical below threshold",
         );
+    } else {
+        panic!("item must stay Local variant");
+    }
+}
+
+/// hb166 R-10: the `flow_fair && shared_exact` ECN branch (#785 Phase 3)
+/// was untested — both existing ECN policy tests exercise only the
+/// owner-local `flow_fair && !shared_exact` per-flow arm. A shared_exact
+/// queue uses the AGGREGATE arm: per-flow fairness is enforced by MQFQ
+/// virtual-finish-time ordering in the dequeue path, so per-flow ECN on
+/// top would double-signal a throttled flow. This test drives the exact
+/// state the owner-local sibling
+/// (`admission_ecn_does_not_mark_when_only_aggregate_above_threshold`)
+/// asserts must NOT mark — aggregate strictly above, per-flow strictly
+/// below — and asserts the shared_exact queue DOES mark. That contrast
+/// pins the branch: if the `should_mark` selector ever routes
+/// shared_exact through the per-flow arm, this flips to `!marked`.
+#[test]
+fn admission_ecn_shared_exact_marks_on_aggregate_arm() {
+    let mut root = test_flow_fair_exact_queue_16_flows();
+    let queue = &mut root.queues[0];
+    // Flip to the #785 Phase 3 branch (flow_fair stays on via the
+    // fixture's flow_fair_state; shared_exact is a config-read accessor).
+    queue.config.shared_exact = true;
+    assert!(
+        queue.flow_fair() && queue.shared_exact(),
+        "fixture must be on the flow_fair && shared_exact branch",
+    );
+    let target = 0usize;
+
+    // Per-flow bucket well BELOW its threshold, aggregate strictly ABOVE
+    // — the ONE state where the owner-local per-flow arm stays silent, so
+    // a mark here can only come from the aggregate arm.
+    let target_bucket_bytes = 500;
+    let _ = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
+    let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
+    let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
+    let aggregate_ecn_threshold =
+        buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+    let flow_ecn_threshold =
+        share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+    queue.hot.queued_bytes = aggregate_ecn_threshold + 1; // strictly above
+    assert!(queue.hot.queued_bytes > aggregate_ecn_threshold);
+    assert!(
+        test_flow_fair_state(queue).flow_bucket_bytes[target] <= flow_ecn_threshold,
+        "per-flow bucket must be below its threshold so only the aggregate arm can fire",
+    );
+
+    let before = snapshot_counters(queue);
+    let mut item = test_local_ipv4_item(ECN_ECT_0);
+    let umem = test_admission_umem();
+    let marked =
+        apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item, &umem);
+
+    assert!(
+        marked,
+        "#785 Phase 3: a shared_exact queue MUST mark on the aggregate arm \
+         even when the per-flow bucket is below threshold (the owner-local \
+         queue would NOT mark on this exact state)",
+    );
+    let after = snapshot_counters(queue);
+    assert_eq!(
+        after.admission_ecn_marked,
+        before.admission_ecn_marked + 1,
+        "ECN counter must advance by exactly 1",
+    );
+    if let CoSPendingTxItem::Local(req) = &item {
+        assert_eq!(req.bytes[15] & ECN_MASK, ECN_CE, "CE bit must be set");
     } else {
         panic!("item must stay Local variant");
     }
