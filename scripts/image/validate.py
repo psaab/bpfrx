@@ -207,6 +207,16 @@ class Harness:
                  check=False).returncode != 0:
             fail("in-guest verify-dataplane REJECTED — image must not ship")
         self.wait_fxp0_dhcp("xpf-image-a")
+        # #4172: frr-pythontools (/usr/lib/frr/frr-reload.py) MUST be present
+        # or every FRR reload silently degrades to the additive `vtysh -f`
+        # fallback and stale-config removal never converges (a deleted route
+        # keeps forwarding). It is NOT pulled in transitively by `frr`, so
+        # assert presence here — package-name drift fails with a clear cause
+        # rather than as the downstream "deleted route still active" symptom.
+        if not guest_sh("xpf-image-a", 'test -x /usr/lib/frr/frr-reload.py'):
+            fail("frr-reload.py missing (/usr/lib/frr/frr-reload.py) — "
+                 "frr-pythontools not installed (#4172 FRR reload permanently "
+                 "degraded; stale-config removal never converges)")
         if not guest_sh("xpf-image-a", 'ss -tln | grep -q ":22 "'):
             fail("sshd not listening")
         if not guest_sh("xpf-image-a",
