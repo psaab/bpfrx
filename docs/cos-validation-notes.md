@@ -16,6 +16,39 @@ exact, then 5203..5210 / 6203..6210 step through 3G, 6G, 9G, 12G, 15G,
 interface root shaper. Older measurements below may cite the pre-grid
 class names (`iperf-a`/`iperf-b`/`iperf-c`) and queue IDs.
 
+## vSRX CoS show commands (#4228 Gap 7)
+
+In addition to `show class-of-service interface` (the detailed per-queue
+runtime dump described below), xpf renders the four Junos-style CoS
+operational commands whose backing data already existed but had no
+operational-tree surface. All are pure presentation over existing data —
+`cfg.ClassOfService` (the compiled config) and `CoSQueueStatus` (the
+userspace status) — with no dataplane change:
+
+- `show interfaces queue [<interface>]` — per-egress-queue Queued /
+  Transmitted / Dropped counters, sourced from `CoSQueueStatus`
+  (`QueuedPackets/Bytes`, `DrainSentBytes`, the admission-drop counters).
+  Optional interface filter; a physical-name selector (`ge-0-0-2`)
+  matches the unit-qualified runtime label (`ge-0-0-2.80`).
+- `show class-of-service classifier [name <n>] [type <dscp|ieee-802.1>]`
+  — the configured classifiers, rendering the code point as 6-bit binary
+  (DSCP) or 3-bit binary (802.1p PCP), with forwarding-class and loss
+  priority (defaulting to `low` when the config omits it).
+- `show class-of-service scheduler-map [<name>]` — each scheduler-map's
+  forwarding-class -> scheduler bindings, resolved to the scheduler's
+  transmit rate, priority, buffer, and exact flag plus the mapped queue.
+- `show class-of-service forwarding-class` — the forwarding-class to
+  queue table (ID == queue, per the FC<->queue bijection).
+
+`clear class-of-service statistics` is deferred (#4228 Gap 7 note): the
+userspace CoS queue counters have no stat-reset RPC — they reset only on
+config change — so a reset path is a separate follow-up.
+
+Renderers live in `pkg/dataplane/userspace/format/cos_show.go` (the
+shared SSOT used by both the local CLI in `pkg/cli` and the gRPC
+`ShowText` path in `pkg/grpcapi`); the operational-tree entries and
+tab-completion are in `pkg/cmdtree/tree.go`.
+
 ## How to read admission drop counters live
 
 Since #724, `show class-of-service interface` renders three per-queue

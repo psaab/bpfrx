@@ -288,6 +288,64 @@ func (s *Server) showClassOfService(req *pb.ShowTextRequest, cfg *config.Config,
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }
 
+// showInterfacesQueue renders `show interfaces queue [<interface>]` (#4228
+// Gap 7) from the live userspace CoS runtime snapshot. Topic form is
+// "interfaces-queue" or "interfaces-queue:<selector>".
+func (s *Server) showInterfacesQueue(req *pb.ShowTextRequest, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	selector := strings.TrimPrefix(req.Topic, "interfaces-queue")
+	selector = strings.TrimPrefix(selector, ":")
+	if selector == "" {
+		selector = req.Filter
+	}
+	var status *dpuserspace.ProcessStatus
+	if userspaceStatus, err := s.userspaceDataplaneStatus(); err == nil {
+		status = &userspaceStatus
+	}
+	buf.WriteString(dpformat.FormatInterfacesQueue(status, selector))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// showCoSClassifier renders `show class-of-service classifier [name <n>]
+// [type <dscp|ieee-802.1>]` (#4228 Gap 7). Topic form is "cos-classifier" or
+// "cos-classifier:name=<n>,type=<t>".
+func (s *Server) showCoSClassifier(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	nameFilter, typeFilter := "", ""
+	params := strings.TrimPrefix(req.Topic, "cos-classifier")
+	params = strings.TrimPrefix(params, ":")
+	for _, kv := range strings.Split(params, ",") {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			switch k {
+			case "name":
+				nameFilter = v
+			case "type":
+				typeFilter = v
+			}
+		}
+	}
+	buf.WriteString(dpformat.FormatCoSClassifiers(cfg, nameFilter, typeFilter))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// showCoSSchedulerMap renders `show class-of-service scheduler-map [<name>]`
+// (#4228 Gap 7). Topic form is "cos-scheduler-map" or "cos-scheduler-map:<name>".
+func (s *Server) showCoSSchedulerMap(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	name := strings.TrimPrefix(req.Topic, "cos-scheduler-map")
+	name = strings.TrimPrefix(name, ":")
+	buf.WriteString(dpformat.FormatCoSSchedulerMaps(cfg, name))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// showCoSForwardingClass renders `show class-of-service forwarding-class`
+// (#4228 Gap 7) — the forwarding-class to queue table.
+func (s *Server) showCoSForwardingClass(cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	buf.WriteString(dpformat.FormatCoSForwardingClasses(cfg))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
 func (s *Server) showVLANs(cfg *config.Config, buf *strings.Builder) {
 	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
 		buf.WriteString("No VLANs configured\n")
