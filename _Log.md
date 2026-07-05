@@ -1,3 +1,24 @@
+## 2026-07-05 — PR #4264 review fold (Copilot doc/comment accuracy, R-1/R-3/R-4)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Folded two Copilot doc/comment-accuracy items on PR #4264
+    (hostile review = MERGE-READY; R-3 seqlock fence verified CORRECT).
+    NO code change — the fence is unchanged. (1)
+    `docs/fairness-regimes.md`: reworded "each carries a RED-on-revert unit
+    test" — R-1/R-4 carry RED-on-revert tests; R-3 carries a structural
+    cross-field-invariant ordering guard (its tear is only observable on a
+    weakly-ordered CPU [ARM/POWER] or under loom, NOT on the x86-TSO
+    CI/deploy host). (2) `rotate_epoch_v8.rs` fence comment: reworded to
+    state both framings — (a) writer-side store-store barrier intuition and
+    (b) the formal [atomics.fences]/2 fence-fence guarantee — and made it
+    precise that the reader's Relaxed LOAD (ordered by its Acquire fence),
+    not the fence itself, reads the post-Release-fence payload store that
+    establishes the synchronizes-with edge. Confirmed comment-only diff
+    (no non-comment line changed); `cargo build --release` exit 0; rustfmt
+    clean on the touched lines.
+  - **File(s)**: docs/fairness-regimes.md,
+    userspace-dp/src/afxdp/types/shared_cos_lease/rotate_epoch_v8.rs, _Log.md
+
 ## 2026-07-04 — fable-review-166 R-1/R-3/R-4: CoS/MQFQ fairness-accounting lifecycle fixes (#4259/#4260/#4261)
 
 - **Timestamp**: 2026-07-04

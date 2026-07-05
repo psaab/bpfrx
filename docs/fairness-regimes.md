@@ -1541,8 +1541,13 @@ alternative** to (or co-factor of) the transport-physics floor.
 Three further fable-review-166 findings are state-lifecycle defects in
 already-shipped fairness mechanisms — invisible to steady-state iperf
 smoke, real under flow churn / low-rate classes / weak-memory CPUs. All
-three are pure accounting corrections (no policy change) and each carries
-a RED-on-revert unit test.
+three are pure accounting corrections (no policy change). R-1 and R-4
+carry RED-on-revert unit tests (the fix reverted, the named assertion
+fails). R-3 is a memory-ordering fix whose failure is only observable on
+a weakly-ordered CPU (ARM/POWER) or under a loom model — it is NOT
+reproducible on the x86-TSO CI/deploy host — so it carries a structural
+ordering guard that asserts a cross-field snapshot invariant a torn read
+would break, not a RED-on-revert test.
 
 - **R-1 — recycled MQFQ bucket inherits a dead flow's rate (#4259).** The
   cap-aware per-flow selector (`cos_queue_min_finish_bucket`,

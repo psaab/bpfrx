@@ -56,25 +56,37 @@ impl SharedCoSQueueLease {
             return; // peer claimed first
         }
 
-        // #4260 (hb166 R-3) — seqlock writer half. The EVEN→ODD claim CAS
-        // above is AcqRel: its Release half orders only writes SEQUENCED-
-        // BEFORE the CAS, and no reader synchronizes-with it by reading the
-        // ODD value (readers spin on ODD, they never accept it). It does
-        // NOT order the Relaxed payload stores below relative to the ODD
-        // claim becoming visible. Without this fence, on a weakly-ordered
-        // CPU (ARM/POWER) a payload store can become globally visible
-        // before the ODD claim, so a reader can read seq=EVEN(old), read
-        // new-epoch payload (torn), re-read seq=EVEN(old), and pass the
-        // even-equal validation against a cross-epoch mix — the #1619
-        // tearing class, of which #1643 fixed only the reader half.
+        // #4260 (hb166 R-3) — seqlock writer half (Boehm's seqlock recipe).
+        // The EVEN→ODD claim CAS above is AcqRel, but its Release half
+        // orders only writes SEQUENCED-BEFORE the CAS, and no reader
+        // synchronizes-with it by reading the ODD value (readers spin on
+        // ODD, they never accept it). So the CAS does NOT order the Relaxed
+        // payload stores below relative to the ODD claim.
         //
-        // The Release fence pairs with the reader's `fence(Acquire)` in
-        // `snapshot_epoch_v8` (lease.rs): a reader whose Acquire fence
-        // observes any payload store issued after this fence synchronizes-
-        // with it, so the ODD claim (sequenced-before the fence) happens-
-        // before the reader's trailing `seq_after` load, which then reads
-        // ODD (or the later EVEN) and forces a retry. Boehm's seqlock
-        // recipe — one fence per rotation (~200 µs, EPOCH_DURATION_NS).
+        // (a) Writer-side intuition. This Release fence is a store-store
+        // ordering barrier: it prevents the Relaxed payload stores that
+        // follow it from becoming visible before the ODD claim that
+        // precedes it. Without it, on a weakly-ordered CPU (ARM/POWER) a
+        // payload store could publish before the ODD claim, so a reader
+        // could read seq=EVEN(old), read new-epoch payload (torn), re-read
+        // seq=EVEN(old), and pass the even-equal validation against a
+        // cross-epoch mix — the #1619 tearing class, of which #1643 fixed
+        // only the reader half.
+        //
+        // (b) Formal guarantee ([atomics.fences]/2, the fence-fence rule).
+        // The reader's payload reads in `snapshot_epoch_v8` (lease.rs) are
+        // Relaxed LOADS sealed by an Acquire FENCE before its trailing
+        // `seq_after` load. If the reader's Relaxed payload LOAD (not the
+        // fence — a fence performs no access) reads the value written by a
+        // Relaxed payload STORE that is sequenced-AFTER this Release fence,
+        // then this Release fence (FA) synchronizes-with the reader's
+        // Acquire fence (FB). Everything sequenced-before FA — the ODD
+        // claim CAS — therefore happens-before everything sequenced-after
+        // FB — the reader's `seq_after` load — so `seq_after` observes the
+        // ODD claim (or the later EVEN publish) and the reader retries. The
+        // fence orders the reader's LOAD; the LOAD is what reads the store.
+        // This is the write-side partner of the #1643 reader-fence half.
+        // One fence per rotation (~200 µs, EPOCH_DURATION_NS).
         std::sync::atomic::fence(Ordering::Release);
 
         // We are the rotation winner; seq is now ODD.
