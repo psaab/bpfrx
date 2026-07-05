@@ -45,9 +45,13 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 //     applyConfig wrapper, which logs slog.Warn and swallows the error —
 //     the node boots through (warn, not brick).
 //   - Peer config-sync goes through syncAndApply, which DOES propagate the
-//     error, but its caller (handleConfigSync) logs slog.Error and returns;
-//     the store is already promoted by SyncApply, so the node stays
-//     consistent with the peer (helper disarmed, not bricked).
+//     error; its caller (handleConfigSync) logs slog.Error and returns the
+//     error to configApplyLoop, which counts ConfigsApplyFailed and leaves the
+//     config high-water mark UNADVANCED so the primary's re-push re-converges
+//     the standby (M-2/#4151). When SyncApply already promoted the store, the
+//     re-push short-circuits on the "already matches active" check and heals
+//     the high-water; the node stays consistent with the peer (helper
+//     disarmed, not bricked).
 //
 // Only the operator-facing commit path (commitAndApply /
 // commitConfirmedAndApply) returns the abort to the committer.

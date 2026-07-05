@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -340,14 +341,28 @@ func (d *Daemon) pushConfigToPeer() {
 	d.sessionSync.QueueConfig(configText)
 }
 
+// errConfigSyncRejectedPrimary is returned by handleConfigSync when this node
+// believes it is the RG0 primary (config authority) and therefore refuses the
+// peer's config. It is NOT an apply failure per se, but the config was not
+// applied, so the caller (configApplyLoop) must NOT advance the config
+// high-water mark — the transient dual-active window must heal via the peer's
+// re-push once this node settles into secondary (M-2/#4151).
+var errConfigSyncRejectedPrimary = errors.New("config sync rejected: this node is RG0 primary")
+
 // handleConfigSync processes a config received from the cluster peer.
 // Config sync is unidirectional: primary → secondary only. If this node
 // is the RG0 primary (config authority), incoming config is rejected to
 // prevent a reconnecting secondary from overwriting the authoritative config.
-func (d *Daemon) handleConfigSync(configText string) {
+//
+// It returns nil ONLY when the config was actually applied (or already matches
+// the active config); a non-nil error means the apply did not take effect. The
+// config high-water mark advances ONLY on a nil return (M-2/#4151), so a
+// rejection or a compile/promote failure leaves the standby eligible for the
+// primary's re-push instead of being silently stranded on the prior config.
+func (d *Daemon) handleConfigSync(configText string) error {
 	if d.cluster != nil && d.cluster.IsLocalPrimary(0) {
 		slog.Warn("cluster: rejecting config sync (this node is RG0 primary)")
-		return
+		return errConfigSyncRejectedPrimary
 	}
 	if d.store != nil {
 		activeText := strings.TrimSpace(d.store.ShowActive())
@@ -355,7 +370,9 @@ func (d *Daemon) handleConfigSync(configText string) {
 		if activeText == incomingText {
 			slog.Info("cluster: skipping config sync apply (config already matches active)",
 				"size", len(configText))
-			return
+			// Already converged to this config — a nil return lets the
+			// high-water advance so a duplicate re-push is correctly skipped.
+			return nil
 		}
 	}
 	slog.Info("cluster: accepting config sync from peer", "size", len(configText))
@@ -367,9 +384,10 @@ func (d *Daemon) handleConfigSync(configText string) {
 	// disagreeing.
 	if _, err := d.syncAndApply(context.Background(), configText, nil); err != nil {
 		slog.Error("cluster: config sync apply failed", "err", err)
-		return
+		return err
 	}
 	slog.Info("cluster: config sync applied successfully")
+	return nil
 }
 
 // watchClusterEvents monitors cluster state transitions and toggles
@@ -568,9 +586,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.cluster.SetSyncStats(d.sessionSync)
 
 			// Wire config sync callback: when secondary receives config from primary.
-			d.sessionSync.OnConfigReceived = func(configText string) {
+			d.sessionSync.OnConfigReceived = func(configText string) error {
 				d.cluster.RecordEvent(cluster.EventConfigSync, -1, fmt.Sprintf("Config received (%d bytes)", len(configText)))
-				d.handleConfigSync(configText)
+				return d.handleConfigSync(configText)
 			}
 
 			// Wire peer connected callback: push config to returning peer.
