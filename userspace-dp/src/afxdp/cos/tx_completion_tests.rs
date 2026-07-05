@@ -4,6 +4,7 @@
 // `#[path = "tx_completion_tests.rs"]` from tx_completion.rs.
 
 use super::*;
+use crate::afxdp::PROTO_TCP;
 use crate::afxdp::TX_BATCH_SIZE;
 use crate::afxdp::cos::queue_service::{
     select_cos_guarantee_batch, select_exact_cos_guarantee_queue_with_fast_path,
@@ -12,7 +13,7 @@ use crate::afxdp::cos::token_bucket::COS_MIN_BURST_BYTES;
 use crate::afxdp::tx::test_support::*;
 use crate::afxdp::types::{
     COS_FLOW_FAIR_BUCKETS, CoSQueueDropCounters, CoSQueueOwnerProfile, CoSQueueWaterfillCounters,
-    FlowRrRing, SharedCoSExactBacklog, SharedCoSQueueLease,
+    FlowRrRing, PreparedTxRecycle, SharedCoSExactBacklog, SharedCoSQueueLease,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -507,6 +508,162 @@ fn apply_cos_prepared_result_debits_shared_residual_surplus_budget() {
         after,
         before - 1500,
         "non-exact surplus prepared send must debit the shared residual budget, not a per-worker bucket"
+    );
+}
+
+/// hb166 R-10: every prior `apply_cos_send_result` test passed an EMPTY
+/// retry deque, so the batch-vs-retry `queued_bytes` reconciliation —
+/// `queued_bytes.saturating_sub(batch_bytes).saturating_add(retry_bytes)`
+/// — was never exercised for a non-zero `retry_bytes`. A partial-commit
+/// retry pushes the unsent tail back onto the queue; those bytes must be
+/// re-added or the queue undercounts its backlog and can settle to a
+/// false-empty demotion. This drives a real non-empty retry and pins
+/// the add-back.
+///
+/// RED-on-revert: drop the `.saturating_add(retry_bytes)` and the
+/// queued_bytes assertion fails (9000 instead of 10500), and the
+/// items-restored assertion fails.
+#[test]
+fn apply_cos_send_result_nonempty_retry_readds_restored_bytes() {
+    let root = test_mixed_class_root_with_primed_queues();
+    // Queue 1 is non-exact, primed with 8 × 1500 = 12000 queued bytes.
+    let queue_idx = 1;
+    let initial_queued = 8 * 1500u64;
+    assert_eq!(root.queues[queue_idx].hot.queued_bytes, initial_queued);
+
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        0,
+        vec![
+            (0, test_queue_fast_path(false, 0, None, None)),
+            (1, test_queue_fast_path(false, 0, None, None)),
+            (2, test_queue_fast_path(false, 0, None, None)),
+            (3, test_queue_fast_path(false, 0, None, None)),
+        ],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    let items_before = binding.cos.cos_interfaces.get(&42).unwrap().queues[queue_idx]
+        .hot
+        .items
+        .len();
+
+    // Drain a 3000-byte batch, then retry one 1500-byte item back.
+    let batch_bytes = 3000u64;
+    let retry = std::collections::VecDeque::from([TxRequest {
+        bytes: vec![0u8; 1500],
+        expected_ports: None,
+        expected_addr_family: libc::AF_INET as u8,
+        expected_protocol: PROTO_TCP,
+        flow_key: None,
+        egress_ifindex: 80,
+        cos_queue_id: Some(1),
+        dscp_rewrite: None,
+        mirror_clone: false,
+        enqueue_ns: 0,
+    }]);
+    apply_cos_send_result(
+        &mut binding,
+        42,
+        queue_idx,
+        CoSServicePhase::Surplus,
+        batch_bytes,
+        1500,
+        retry,
+    );
+
+    let queue = &binding.cos.cos_interfaces.get(&42).unwrap().queues[queue_idx];
+    // 12000 − 3000 (batch drained) + 1500 (retry restored) = 10500.
+    assert_eq!(
+        queue.hot.queued_bytes,
+        initial_queued - batch_bytes + 1500,
+        "queued_bytes must subtract the drained batch AND re-add the retried bytes",
+    );
+    assert_ne!(
+        queue.hot.queued_bytes,
+        initial_queued - batch_bytes,
+        "if the retry_bytes add-back were dropped, queued_bytes would be 9000",
+    );
+    assert_eq!(
+        queue.hot.items.len(),
+        items_before + 1,
+        "the retried item must be restored onto the queue",
+    );
+}
+
+/// hb166 R-10: the prepared (zero-copy UMEM) sibling of
+/// `apply_cos_send_result_nonempty_retry_readds_restored_bytes`. Same
+/// batch-vs-retry `queued_bytes` reconciliation, same empty-deque gap in
+/// the prior tests. `restore_cos_prepared_items_inner` sums `len` for
+/// the retry byte count, so a single 1500-byte prepared request adds
+/// 1500 back.
+#[test]
+fn apply_cos_prepared_result_nonempty_retry_readds_restored_bytes() {
+    let root = test_mixed_class_root_with_primed_queues();
+    let queue_idx = 1;
+    let initial_queued = 8 * 1500u64;
+    assert_eq!(root.queues[queue_idx].hot.queued_bytes, initial_queued);
+
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        0,
+        vec![
+            (0, test_queue_fast_path(false, 0, None, None)),
+            (1, test_queue_fast_path(false, 0, None, None)),
+            (2, test_queue_fast_path(false, 0, None, None)),
+            (3, test_queue_fast_path(false, 0, None, None)),
+        ],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    let items_before = binding.cos.cos_interfaces.get(&42).unwrap().queues[queue_idx]
+        .hot
+        .items
+        .len();
+
+    let batch_bytes = 3000u64;
+    let retry = std::collections::VecDeque::from([PreparedTxRequest {
+        offset: 64,
+        len: 1500,
+        recycle: PreparedTxRecycle::FreeTxFrame,
+        expected_ports: None,
+        expected_addr_family: libc::AF_INET as u8,
+        expected_protocol: PROTO_TCP,
+        flow_key: None,
+        egress_ifindex: 80,
+        cos_queue_id: Some(1),
+        dscp_rewrite: None,
+        mirror_clone: false,
+        enqueue_ns: 0,
+    }]);
+    apply_cos_prepared_result(
+        &mut binding,
+        42,
+        queue_idx,
+        CoSServicePhase::Surplus,
+        batch_bytes,
+        1500,
+        retry,
+    );
+
+    let queue = &binding.cos.cos_interfaces.get(&42).unwrap().queues[queue_idx];
+    assert_eq!(
+        queue.hot.queued_bytes,
+        initial_queued - batch_bytes + 1500,
+        "prepared path must subtract the drained batch AND re-add the retried bytes",
+    );
+    assert_eq!(
+        queue.hot.items.len(),
+        items_before + 1,
+        "the retried prepared item must be restored onto the queue",
     );
 }
 

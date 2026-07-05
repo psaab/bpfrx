@@ -569,6 +569,74 @@ fn admission_ecn_does_not_mark_when_both_thresholds_below() {
     }
 }
 
+/// hb166 R-10: the `flow_fair && shared_exact` ECN branch (#785 Phase 3)
+/// was untested — both existing ECN policy tests exercise only the
+/// owner-local `flow_fair && !shared_exact` per-flow arm. A shared_exact
+/// queue uses the AGGREGATE arm: per-flow fairness is enforced by MQFQ
+/// virtual-finish-time ordering in the dequeue path, so per-flow ECN on
+/// top would double-signal a throttled flow. This test drives the exact
+/// state the owner-local sibling
+/// (`admission_ecn_does_not_mark_when_only_aggregate_above_threshold`)
+/// asserts must NOT mark — aggregate strictly above, per-flow strictly
+/// below — and asserts the shared_exact queue DOES mark. That contrast
+/// pins the branch: if the `should_mark` selector ever routes
+/// shared_exact through the per-flow arm, this flips to `!marked`.
+#[test]
+fn admission_ecn_shared_exact_marks_on_aggregate_arm() {
+    let mut root = test_flow_fair_exact_queue_16_flows();
+    let queue = &mut root.queues[0];
+    // Flip to the #785 Phase 3 branch (flow_fair stays on via the
+    // fixture's flow_fair_state; shared_exact is a config-read accessor).
+    queue.config.shared_exact = true;
+    assert!(
+        queue.flow_fair() && queue.shared_exact(),
+        "fixture must be on the flow_fair && shared_exact branch",
+    );
+    let target = 0usize;
+
+    // Per-flow bucket well BELOW its threshold, aggregate strictly ABOVE
+    // — the ONE state where the owner-local per-flow arm stays silent, so
+    // a mark here can only come from the aggregate arm.
+    let target_bucket_bytes = 500;
+    let _ = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
+    let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
+    let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
+    let aggregate_ecn_threshold =
+        buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+    let flow_ecn_threshold =
+        share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+    queue.hot.queued_bytes = aggregate_ecn_threshold + 1; // strictly above
+    assert!(queue.hot.queued_bytes > aggregate_ecn_threshold);
+    assert!(
+        test_flow_fair_state(queue).flow_bucket_bytes[target] <= flow_ecn_threshold,
+        "per-flow bucket must be below its threshold so only the aggregate arm can fire",
+    );
+
+    let before = snapshot_counters(queue);
+    let mut item = test_local_ipv4_item(ECN_ECT_0);
+    let umem = test_admission_umem();
+    let marked =
+        apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item, &umem);
+
+    assert!(
+        marked,
+        "#785 Phase 3: a shared_exact queue MUST mark on the aggregate arm \
+         even when the per-flow bucket is below threshold (the owner-local \
+         queue would NOT mark on this exact state)",
+    );
+    let after = snapshot_counters(queue);
+    assert_eq!(
+        after.admission_ecn_marked,
+        before.admission_ecn_marked + 1,
+        "ECN counter must advance by exactly 1",
+    );
+    if let CoSPendingTxItem::Local(req) = &item {
+        assert_eq!(req.bytes[15] & ECN_MASK, ECN_CE, "CE bit must be set");
+    } else {
+        panic!("item must stay Local variant");
+    }
+}
+
 #[test]
 fn admission_ecn_does_not_mark_when_flow_share_already_exceeded() {
     // Per-flow above threshold BUT the caller has also decided the

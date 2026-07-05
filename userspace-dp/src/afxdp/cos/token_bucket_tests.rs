@@ -587,3 +587,32 @@ fn refill_cos_tokens_carries_fractional_dust_for_low_rate_class() {
         1_000_000_000 / RATE_BYTES_PER_SEC,
     );
 }
+
+/// hb166 R-10 / R-4: `cos_refill_ns_until` had no direct unit test — it
+/// was exercised only transitively through the wakeup-tick estimator.
+/// Pin all three branches plus the div_ceil rounding: the wait math
+/// must round UP so the caller never wakes one tick early with the
+/// bucket still short of `need`.
+#[test]
+fn cos_refill_ns_until_covers_all_branches() {
+    // Branch 1 — already have `need` tokens: zero wait, regardless of rate.
+    assert_eq!(cos_refill_ns_until(1_500, 1_500, 1_000_000), Some(0));
+    assert_eq!(cos_refill_ns_until(3_000, 1_500, 1_000_000), Some(0));
+    // The token-sufficiency check precedes the rate check, so a rate of 0
+    // with enough tokens is still Some(0), NOT None.
+    assert_eq!(cos_refill_ns_until(10, 10, 0), Some(0));
+
+    // Branch 2 — unshaped (rate 0) and short: never refills.
+    assert_eq!(cos_refill_ns_until(0, 1_500, 0), None);
+    assert_eq!(cos_refill_ns_until(500, 1_500, 0), None);
+
+    // Branch 3 — wait = ceil(deficit * 1e9 / rate).
+    // Exact division: deficit 1000 B at 1_000_000 B/s = 1_000_000 ns.
+    assert_eq!(cos_refill_ns_until(500, 1_500, 1_000_000), Some(1_000_000));
+    // Non-divisible: deficit 1 B at 3 B/s = 1e9 / 3 = 333_333_333.33 ns.
+    // RED-on-revert if div_ceil is swapped for truncating division
+    // (which yields 333_333_333, waking a tick early with the bucket
+    // still one byte short).
+    assert_eq!(cos_refill_ns_until(0, 1, 3), Some(333_333_334));
+    assert_eq!(cos_refill_ns_until(0, 2, 3), Some(666_666_667));
+}
