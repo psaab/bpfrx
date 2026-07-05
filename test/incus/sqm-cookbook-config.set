@@ -36,4 +36,13 @@
 # that inject their own delete list strip non-`set` lines).
 delete class-of-service
 
+# reth0 unit 80 must be a configured logical interface, otherwise the CoS
+# binding below is a silent no-op (the dataplane applier only visits CoS
+# bindings that resolve against [interfaces]; hb166 G-6 now warns on the
+# inert case). This mirrors the loss-userspace-cluster WAN unit
+# (reth0.80 / 172.16.80.0/24) that the recipe shapes.
+set interfaces reth0 vlan-tagging
+set interfaces reth0 unit 80 vlan-id 80
+set interfaces reth0 unit 80 family inet address 172.16.80.8/24
+
 set class-of-service interfaces reth0 unit 80 shaping-rate 3g
