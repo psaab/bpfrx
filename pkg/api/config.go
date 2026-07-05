@@ -12,6 +12,14 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// maxConfigBodyBytes caps the REST config-load POST body (fable-review-164
+// H-2). Without it the body is buffered unbounded and fed to the parser, which
+// a sub-4 MiB pathological payload can crash. It is 2x
+// configstore.MaxConfigSize (16 MiB) to leave headroom for JSON string
+// escaping of the config content; the post-decode configstore size ceiling is
+// the authoritative limit on the config itself.
+const maxConfigBodyBytes = 2 * (16 << 20) // 32 MiB
+
 func (s *Server) configHandler(w http.ResponseWriter, _ *http.Request) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
@@ -275,8 +283,18 @@ func (s *Server) configSearchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
+	// Bound the request body so an oversized config-load payload is rejected
+	// before it reaches the parser (H-2). configstore.LoadOverride/LoadMerge/
+	// LoadSet re-check the decoded content against MaxConfigSize.
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfigBodyBytes)
 	var req ConfigLoadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("config body exceeds %d bytes", maxConfigBodyBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
