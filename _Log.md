@@ -34189,3 +34189,17 @@ top.
   table row and docs/deploy-quickstart.md "libvirt instead of incus".
 - **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/README.md,
   docs/deploy-quickstart.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-165 H-27 — deployer robustness. Added preflight_incus /
+  preflight_libvirt (image/golden + every NIC source + free instance name checked
+  BEFORE any mutation; skipped in dry-run), cleanup-on-failure (deploy_incus
+  deletes the half-created instance; deploy_libvirt undefines the domain + removes
+  the overlay via _cleanup_libvirt), and a `destroy <yaml>` verb (destroy_incus /
+  destroy_libvirt + cmd_destroy, wired into main()'s subcommand table + dispatch).
+  Refactored deploy_libvirt body into _deploy_libvirt_inner so the outer wraps it
+  in the cleanup try/except. New RED-on-revert tests in
+  test_xpf_deploy_robustness.py cover H-21/H-26/H-27 (14 tests). Verified H-21
+  RED-on-revert (reverted Runner.run raises CalledProcessError, test fails).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_robustness.py, _Log.md
