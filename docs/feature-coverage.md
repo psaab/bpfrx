@@ -198,7 +198,12 @@ the userspace dataplane admission boundary is in
   collector, source}` labelset and Prometheus either rejects the duplicate
   (scrape error) or silently collapses the failing group.
 - **Prometheus metrics** (`/metrics` endpoint).
-- **SNMP**: system + ifTable MIB.
+- **SNMP**: system + ifTable MIB. Community `clients` source-IP restriction
+  ENFORCED (#4289): `snmp community <c> clients { <prefix> [restrict]; }`
+  scopes a community to the listed source prefixes — a v2c query from a source
+  outside the allowlist is dropped (longest-prefix match, `restrict` denies; a
+  community without `clients` is allow-all). Enforced in the agent v2c path
+  (`pkg/snmp/agent.go` `handleV2cPacket` → `SNMPCommunity.AllowsSource`).
 - **RPM probes**, dynamic address feeds.
 - **Dataplane buffer utilization** (`show system buffers`): AF_XDP
   UMEM/TX-ring capacity, CoS queued-byte capacity, helper-published

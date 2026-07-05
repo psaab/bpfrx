@@ -24,6 +24,23 @@
     pkg/config/compiler_interfaces.go,
     pkg/config/vrrp_authentication_4288_test.go,
     docs/feature-coverage.md, _Log.md
+  - **Action**: S-3 (#4289) — SNMP `community <c> clients <ip>` source-IP
+    restriction was silently ignored (agent answered every source). Added
+    `SNMPClient`/`Clients` to `SNMPCommunity`, `parseSNMPClients` +
+    `AllowsSource` (longest-prefix match, `restrict` deny, default-deny
+    when clients set, allow-all when absent), `clients` schema leaf, and
+    threaded the UDP source IP into the agent v2c path
+    (`handlePacket`→`handlePacketFrom`→`handleV2cPacket`) to drop a query
+    from a non-permitted source. Tests `snmp_clients_4289_test.go` (config)
+    + `agent_clients_4289_test.go` (agent enforcement). Removed the VRRP
+    auth key from the pkg/api strict-commit redaction fixture (now rejected
+    by #4288); its redaction stays covered by the Secret type + AST leaf.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/snmp_clients.go,
+    pkg/config/compiler_system.go, pkg/config/schema_system.go,
+    pkg/config/snmp_clients_4289_test.go, pkg/snmp/agent.go,
+    pkg/snmp/agent_clients_4289_test.go,
+    pkg/api/config_secret_redaction_test.go, docs/feature-coverage.md,
+    _Log.md
 
 ## 2026-07-05 — cos: #4272 div_ceil .max(1) hardening + fable-166 R-10 CoS test-coverage gaps (#4280)
 

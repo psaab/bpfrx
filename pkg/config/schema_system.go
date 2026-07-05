@@ -859,6 +859,11 @@ var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*s
 			validator:     ValidateEnum([]string{"read-only", "read-write"}),
 			children:      nil,
 		},
+		// #4289: source-IP allowlist. `clients <prefix> [restrict]` — multi so a
+		// bracketed list / repeated set lines collapse onto the leaf; the
+		// trailing optional `restrict` deny modifier rides on the same run and
+		// is paired to its prefix by parseSNMPClients.
+		"clients": {desc: "Source-IP allowlist for this community (<prefix> [restrict])", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 	}},
 	"trap-group": {desc: "Trap group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
 		"targets": {

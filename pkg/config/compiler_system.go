@@ -880,8 +880,16 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 					commChildren = child.Children[0].Children
 				}
 				for _, prop := range commChildren {
-					if prop.Name() == "authorization" {
+					switch prop.Name() {
+					case "authorization":
 						comm.Authorization = nodeVal(prop)
+					case "clients":
+						// #4289: Junos `clients` source-IP allowlist.
+						// parseSNMPClients handles both AST shapes and the
+						// per-entry `restrict` modifier. Accumulate so a
+						// clients block split across load-merge / flat-set
+						// replays is not dropped.
+						comm.Clients = append(comm.Clients, parseSNMPClients(prop)...)
 					}
 				}
 				// Flat form: community public authorization read-only

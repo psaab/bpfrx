@@ -487,7 +487,11 @@ func (a *Agent) Start(ctx context.Context) error {
 			continue
 		}
 
-		resp := a.handlePacket(buf[:n])
+		var srcIP net.IP
+		if remoteAddr != nil {
+			srcIP = remoteAddr.IP
+		}
+		resp := a.handlePacketFrom(buf[:n], srcIP)
 		if resp != nil {
 			if _, err := conn.WriteToUDP(resp, remoteAddr); err != nil {
 				slog.Error("SNMP write error", "err", err, "remote", remoteAddr)
@@ -508,8 +512,19 @@ func (a *Agent) Stop() {
 	slog.Info("SNMP agent stopped")
 }
 
-// handlePacket decodes an SNMP v2c or v3 request and produces a response.
+// handlePacket decodes an SNMP v2c or v3 request and produces a response. It is
+// the source-agnostic entry point (tests / non-IP transports); the real serving
+// path in Start() calls handlePacketFrom with the UDP source so the #4289
+// community `clients` source-IP restriction is enforced.
 func (a *Agent) handlePacket(data []byte) []byte {
+	return a.handlePacketFrom(data, nil)
+}
+
+// handlePacketFrom decodes an SNMP v2c or v3 request and produces a response,
+// carrying the request source IP so the v2c community `clients` allowlist
+// (#4289) can be enforced. A nil srcIP disables the source check (see
+// SNMPCommunity.AllowsSource).
+func (a *Agent) handlePacketFrom(data []byte, srcIP net.IP) []byte {
 	// Save raw packet for v3 auth verification.
 	a.lastPacket = make([]byte, len(data))
 	copy(a.lastPacket, data)
@@ -530,7 +545,7 @@ func (a *Agent) handlePacket(data []byte) []byte {
 
 	switch version {
 	case snmpVersion2c:
-		return a.handleV2cPacket(rest)
+		return a.handleV2cPacket(rest, srcIP)
 	case snmpVersion3:
 		if !a.hasV3Users() {
 			slog.Debug("SNMP: v3 not configured")
@@ -544,7 +559,9 @@ func (a *Agent) handlePacket(data []byte) []byte {
 }
 
 // handleV2cPacket processes an SNMP v2c message (version already decoded).
-func (a *Agent) handleV2cPacket(rest []byte) []byte {
+// srcIP is the request source (nil disables the source check); it enforces the
+// community `clients` source-IP allowlist (#4289).
+func (a *Agent) handleV2cPacket(rest []byte, srcIP net.IP) []byte {
 	// Decode community string.
 	community, rest, err := berDecodeOctetString(rest)
 	if err != nil {
@@ -556,6 +573,16 @@ func (a *Agent) handleV2cPacket(rest []byte) []byte {
 	comm := a.getCommunity(string(community))
 	if comm == nil {
 		slog.Debug("SNMP: invalid community", "community", string(community))
+		return nil
+	}
+
+	// #4289: enforce the community `clients` source-IP restriction. A community
+	// scoped to specific prefixes must be answered ONLY from those sources; a
+	// query from a non-permitted source is silently dropped (no response, as
+	// with an unknown community). A community without `clients` is allow-all.
+	if !comm.AllowsSource(srcIP) {
+		slog.Debug("SNMP: community source not permitted",
+			"community", string(community), "src", srcIP)
 		return nil
 	}
 
