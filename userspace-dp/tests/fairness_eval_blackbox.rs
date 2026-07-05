@@ -1062,6 +1062,228 @@ fn exit2_out_of_range_worker_id() {
     );
 }
 
+#[test]
+fn gate3_expect_saturation_below_cap_fails() {
+    let tmp = TempGuard::new("gate3_below");
+    // 6 balanced ~1 Gbps streams → aggregate ~6 Gbps. Structural cap =
+    // shaper_rate(20g) × Nₐ(6)/Nᵥ(6) = 20 Gbps → NOT saturated. Without
+    // --expect-saturation the aggregate leg is diagnostic and the run
+    // PASSes (V-3: previously unenforceable); with it, Gate 3 FAILs.
+    let (_sockets, json_str) = make_balanced_pass_inputs(6, 60);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(60), "ge-0-0-2");
+
+    // Diagnostic-only (no flag): PASS even below the cap.
+    let (diag_out, diag_v) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+        "--shaper-rate-bps", "20000000000",
+    ]);
+    assert_eq!(diag_out.status.code(), Some(0), "no flag → aggregate is diagnostic, run PASSes; stderr={}", String::from_utf8_lossy(&diag_out.stderr));
+    let diag = diag_v.expect("verdict JSON");
+    assert_eq!(diag["saturated"], false);
+    assert_eq!(diag["aggregate_throughput_gate_enforced"], false);
+
+    // Enforced: FAIL below the cap.
+    let (output, verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+        "--shaper-rate-bps", "20000000000",
+        "--expect-saturation",
+    ]);
+    assert_eq!(output.status.code(), Some(1),
+        "expect-saturation below cap must FAIL Gate 3; stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+    let v = verdict.expect("verdict JSON");
+    assert_eq!(v["verdict"], "FAIL");
+    assert_eq!(v["saturated"], false);
+    assert_eq!(v["aggregate_throughput_gate_enforced"], true);
+    let reasons = v["failure_reasons"].as_array().expect("failure_reasons array");
+    assert!(
+        reasons.iter().any(|r| r.as_str().unwrap_or("").contains("Gate 3")),
+        "must contain a Gate 3 aggregate-throughput reason; got: {reasons:?}"
+    );
+}
+
+#[test]
+fn gate3_expect_saturation_at_cap_passes() {
+    let tmp = TempGuard::new("gate3_at");
+    // Aggregate ~6 Gbps against a 6 Gbps scaled cap (>=95%) → saturated
+    // → Gate 3 PASSes even with --expect-saturation (not always-firing).
+    let (_sockets, json_str) = make_balanced_pass_inputs(6, 60);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(60), "ge-0-0-2");
+    let (output, verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+        "--shaper-rate-bps", "6000000000",
+        "--expect-saturation",
+    ]);
+    assert_eq!(output.status.code(), Some(0),
+        "expect-saturation at cap must PASS; stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+    let v = verdict.expect("verdict JSON");
+    assert_eq!(v["verdict"], "PASS");
+    assert_eq!(v["saturated"], true);
+    assert_eq!(v["aggregate_throughput_gate_enforced"], true);
+}
+
+#[test]
+fn truncated_intervals_below_min_window_rejected() {
+    let tmp = TempGuard::new("truncated_window");
+    // V-7: declared duration 120s clears the ss_dur>=60 declared gate,
+    // but only 10 one-second intervals are present. The reducer must
+    // reject on OBSERVED sample count (exit 2, explicit error), not
+    // produce a verdict from a handful of buckets.
+    let sockets: Vec<u64> = (5..11).collect();
+    let mut intervals = Vec::new();
+    for i in 0..10u64 {
+        let mut iv = Vec::new();
+        for &sock in &sockets {
+            iv.push(StreamSample { socket: sock, start: i as f64, end: i as f64 + 1.0, bits_per_second: 1.0e9 });
+        }
+        intervals.push(iv);
+    }
+    let json_str = synth_iperf3_json(120, &sockets, intervals);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(10), "ge-0-0-2");
+    let (output, _verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+    ]);
+    assert_eq!(output.status.code(), Some(2),
+        "truncated interval set must be rejected with exit 2; stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("buckets"),
+        "error must cite the observed bucket count: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains('{'), "rejected run must not emit a verdict: {stdout}");
+}
+
+#[test]
+fn verdict_emits_doc_mandated_required_metrics() {
+    let tmp = TempGuard::new("required_metrics");
+    // V-9: per-flow quantiles (item 1), steady-state window timestamps
+    // (item 12), and the saturation time-series (item 6) must be in the
+    // routine verdict JSON.
+    let (_sockets, json_str) = make_balanced_pass_inputs(6, 60);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(60), "ge-0-0-2");
+    let (output, verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+        "--shaper-rate-bps", "6000000000",
+    ]);
+    assert!(output.status.success(),
+        "required-metrics fixture must PASS; stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+    let v = verdict.expect("verdict JSON");
+
+    // item 1: per-flow throughput quantiles + stream count.
+    let q = &v["per_flow_throughput_mbps"];
+    for k in ["stream_count", "min_mbps", "p25_mbps", "median_mbps", "p75_mbps", "max_mbps"] {
+        assert!(q.get(k).is_some(), "per_flow_throughput_mbps.{k} missing: {v}");
+    }
+    assert_eq!(q["stream_count"], 6);
+    assert!(q["median_mbps"].as_f64().unwrap() > 0.0, "median must be >0: {v}");
+    assert!(q["max_mbps"].as_f64().unwrap() >= q["min_mbps"].as_f64().unwrap());
+
+    // item 12: steady-state window timestamps.
+    let w = &v["steady_state_window"];
+    for k in ["iperf_epoch_start", "iperf_epoch_end", "relative_start_sec", "relative_end_sec"] {
+        assert!(w.get(k).is_some(), "steady_state_window.{k} missing: {v}");
+    }
+    assert_eq!(w["relative_start_sec"].as_f64(), Some(0.0));
+    assert_eq!(w["relative_end_sec"].as_f64(), Some(60.0));
+
+    // item 6: saturation determination time-series.
+    let ss = &v["saturation_series"];
+    assert!(ss["aggregate_buckets_bps"].is_array(), "aggregate_buckets_bps must be array: {v}");
+    assert_eq!(ss["aggregate_buckets_bps"].as_array().unwrap().len(), 60,
+        "one bucket per steady-state second");
+    assert!(ss.get("structural_cap_bps").is_some());
+    assert!(ss.get("saturated_bucket_fraction").is_some());
+    assert_eq!(v["aggregate_throughput_gate_enforced"], false);
+}
+
+#[test]
+fn per_flow_metric_includes_starved_zero_streams() {
+    let tmp = TempGuard::new("starved_metric");
+    // Copilot #1 (V-9 accuracy): 6 connected streams, but socket 10
+    // never appears in any interval → it produced no steady-state
+    // throughput (starved). The per_flow_throughput_mbps metric must
+    // count all 6 streams with the starved one at 0 Mb/s, NOT drop it.
+    let sockets = [5u64, 6, 7, 8, 9, 10];
+    let mut intervals: Vec<Vec<StreamSample>> = Vec::new();
+    for i in 0..60u64 {
+        let mut iv = Vec::new();
+        // Only the first 5 sockets send; socket 10 is absent from every
+        // interval → empty bucket vec → starved.
+        for &sock in &sockets[..5] {
+            iv.push(StreamSample {
+                socket: sock,
+                start: i as f64,
+                end: i as f64 + 1.0,
+                bits_per_second: 1.0e9,
+            });
+        }
+        intervals.push(iv);
+    }
+    let json_str = synth_iperf3_json(60, &sockets, intervals);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(60), "ge-0-0-2");
+    let (_output, verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+    ]);
+    // Gate 1 fails on the starved stream, but the verdict JSON is still
+    // emitted on exit 1.
+    let v = verdict.expect("verdict JSON");
+    assert_eq!(v["starved_flow_count"], 1, "socket 10 must be starved: {v}");
+    let q = &v["per_flow_throughput_mbps"];
+    assert_eq!(
+        q["stream_count"], 6,
+        "starved stream must be counted, not dropped: {v}"
+    );
+    assert_eq!(
+        q["min_mbps"].as_f64(),
+        Some(0.0),
+        "starved stream contributes 0 Mb/s to the quantiles: {v}"
+    );
+    assert!(
+        q["max_mbps"].as_f64().unwrap() > 0.0,
+        "live streams still contribute >0: {v}"
+    );
+}
+
+#[test]
+fn expect_saturation_without_shaper_rate_is_arg_error() {
+    let tmp = TempGuard::new("expect_sat_no_shaper");
+    // Copilot #2: --expect-saturation without --shaper-rate-bps is an
+    // operator CLI mistake → arg-validation error (exit 2), NOT a Gate-3
+    // FAIL (exit 1) that automation would misread as a fairness
+    // regression.
+    let (_sockets, json_str) = make_balanced_pass_inputs(6, 60);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(60), "ge-0-0-2");
+    let (output, _verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+        "--expect-saturation",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expect-saturation without --shaper-rate-bps must be an arg error (exit 2); stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shaper-rate"),
+        "stderr must explain the missing --shaper-rate-bps: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains('{'),
+        "arg error must not emit a verdict: {stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared input builders.
 // ---------------------------------------------------------------------------

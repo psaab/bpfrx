@@ -32,6 +32,52 @@
     ignored; all other bins pass). 5 new tests pass; #4272 fix verified
     RED-on-revert.
 
+## 2026-07-05 — fairness-eval reducer: six accuracy fixes (hb166 V-3..V-9)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Fixed six fable-review-166 fairness_eval REDUCER accuracy
+    bugs (the Rust SSOT that computes the CoS fairness verdict).
+    - **V-6 (#4276)**: the per-worker scrape aggregation anchored its
+      steady-state window to the scrape-file min/max timestamp, letting
+      stale pre-run/cooldown scrapes leak in. Now anchored to the iperf
+      run epoch (`start.timestamp.timesecs` + warmup/final-burst);
+      falls back to min/max only when timesecs is absent. New
+      `steady_window_bounds` helper; `Iperf3Timestamp.timesecs` added.
+    - **V-5 (#4275)**: CoS-source `{aᵢ}` medians ignored absent (zero)
+      samples, so a worker whose flows died mid-window stayed "active".
+      New `median_per_worker_zero_filled` zero-fills each worker across
+      the in-window scrape-timestamp universe before the median (a
+      no-op for the already-zero-filling binding source).
+    - **V-7 (#4277)**: the ≥60 s steady-state minimum checked the
+      DECLARED iperf duration, not observed samples. Now rejects on the
+      observed non-omitted 1-second bucket count (60 − 5 slack) and
+      filters iperf `-O` omitted intervals. `Iperf3IntervalSum.omitted`
+      added.
+    - **V-4 (#4274)**: the a_i overcount trim removes from the LARGEST
+      bucket, which can RAISE Cstruct and LOOSEN Gate 2. Verdict now
+      gates on `min(Cstruct_raw, Cstruct_trimmed)` (fail-closed): the
+      trim may only tighten the ceiling. Legit #1281 stale-overcount
+      cases (trim LOWERS Cstruct) still normalize.
+    - **V-3 (#4273)**: Gate 3 (aggregate throughput) was vacuous — the
+      `saturated` label and the gate used the same `is_saturated`
+      predicate, so no run could FAIL on aggregate. New
+      `--expect-saturation` operator declaration breaks the circularity:
+      when set, the observed aggregate MUST reach ≥95% of the Nₐ/Nᵥ-scaled
+      cap, else Gate 3 fails. The label stays report-only. The non-shaped
+      ±5%-of-baseline clause still needs a baseline-artifact input
+      (deferred; noted in the doc + issue).
+    - **V-9 (#4278)**: the verdict omitted doc-mandated required metrics.
+      Report now emits `per_flow_throughput_mbps` (item 1 quantiles),
+      `steady_state_window` (item 12 timestamps), and `saturation_series`
+      (item 6 per-bucket series + cap + fraction), plus
+      `aggregate_throughput_gate_enforced`.
+  - **File(s)**: userspace-dp/src/fairness_eval/{inputs,per_worker,
+    windowing,verdict,args,report,mod}.rs,
+    userspace-dp/tests/fairness_eval_blackbox.rs,
+    docs/fairness-regimes.md
+  - **Validation**: FULL `cargo test --release` green; per-fix
+    RED-on-revert unit + black-box tests. Reducer/harness-only — no
+    dataplane change, no cluster smoke needed.
 ## 2026-07-05 — cos: fable-166 R-8 LOW fixes + R-9 false-sharing/alloc perf (#4269, #4270)
 
 - **Timestamp**: 2026-07-05

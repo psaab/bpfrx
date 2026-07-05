@@ -277,24 +277,45 @@ A measurement run **PASSES** iff ALL of:
    `Cstruct` is computed from the per-worker active-flow
    distribution measured during the steady-state window.
 
-3. **Aggregate throughput** (saturated regime only):
-   For runs labeled saturated (per "Saturation detection" below): the
-   structural-throughput gate
+3. **Aggregate throughput** (declared-saturating runs only):
+   The structural-throughput gate
    `observed_aggregate ≥ (Nₐ / Nᵥ) × shaper_rate × 0.95` applies
-   for shaped queues. For non-shaped (best-effort) saturated
+   for shaped queues **when the operator declares the offered load is
+   expected to saturate the structural cap** (`fairness-eval
+   --expect-saturation`). For non-shaped (best-effort) saturated
    runs: ±5% of the cluster's measured baseline for the same
    `{aᵢ}` distribution from a known-good prior run.
 
-   For runs labeled **non-saturated**: aggregate throughput is
-   NOT gated. The contract assumes non-saturated runs are
-   cwnd-bound or application-bound; the test simply records
-   `observed_aggregate` for diagnostic context but does not
-   apply a fail/pass on it. Per-flow fairness (Gate 2),
-   starved-flow (Gate 1), and mouse p99 (Gate 4) remain
-   active for non-saturated runs.
+   **This gate is driven by the operator declaration, NOT by the
+   observed `saturated` label (hb166 V-3).** Enforcing it off the
+   `saturated` label alone is vacuous by construction: the label is
+   `is_saturated()` over the observed aggregate, so a run that fails to
+   reach the cap is simply labeled non-saturated and thereby exempted —
+   no run could ever FAIL on aggregate throughput. The declaration is an
+   independent input observed data cannot launder: it asserts the run
+   *ought* to reach the cap, so the observed aggregate is then required
+   to actually hit ≥ 95% of the `Nₐ/Nᵥ`-scaled cap for ≥ 80% of buckets.
+   `--expect-saturation` requires `--shaper-rate-bps` and `--n-workers`;
+   passing it with a missing/zero `--shaper-rate-bps` or `--n-workers` is
+   an operator CLI mistake and fails fast with an arg-validation error
+   (exit 2), not a Gate-3 FAIL (exit 1), so automation does not
+   misclassify a config error as a fairness regression.
+   The non-shaped "±5% of measured baseline" clause still needs a
+   baseline-artifact input and is not yet implemented; the
+   `--expect-saturation` shaped leg is the enforceable part today.
 
-   Rationale: non-saturated runs by definition do not push
-   enough load to fill the structural cap; failing them on a
+   When `--expect-saturation` is **not** passed: aggregate throughput is
+   NOT gated (the run is treated as diagnostic on this leg regardless of
+   the `saturated` label). The contract assumes such runs are cwnd-bound
+   or application-bound; the test records `observed_aggregate`, the
+   per-bucket `saturation_series`, and the `saturated` label for
+   diagnostic context but does not apply a fail/pass on aggregate. The
+   verdict field `aggregate_throughput_gate_enforced` reports whether the
+   gate was active. Per-flow fairness (Gate 2), starved-flow (Gate 1),
+   and mouse p99 (Gate 4) remain active for all runs.
+
+   Rationale: a run that does not declare saturating offered load may not
+   push enough load to fill the structural cap; failing it on a
    throughput floor would be a category error.
 
 4. **Mouse p99** (only when mouse probes are present): mouse
@@ -328,9 +349,10 @@ the active workers can deliver".
 
 Gates 1, 2, and 4 apply to **all** runs (saturated and
 non-saturated). Gate 3 (aggregate throughput) applies to
-**saturated runs only** (see Gate 3 above). The two regimes
-differ only in *expected observed_CoV*, not in the CoV gate
-formula:
+**runs the operator declares saturating** (`--expect-saturation`,
+see Gate 3 above) — NOT to the observed `saturated` label, which is
+report-only. The two regimes differ only in *expected observed_CoV*,
+not in the CoV gate formula:
 
 - **Saturated**: `observed_CoV` will approach `Cstruct` from
   below as the per-worker scheduler does its job. Pass iff the
@@ -343,10 +365,17 @@ formula:
   trivially because `observed_CoV << Cstruct`, leaving a
   large negative gap.
 
-The gate formula does NOT change between regimes. Saturation
-labeling is for diagnostic context (operators can see "we're
-in saturated regime and CoV is at the structural floor") but
-does not change pass/fail.
+The CoV gate formula (Gate 2) does NOT change between regimes.
+Saturation **labeling** (`is_saturated()` over the observed
+aggregate) is for diagnostic context (operators can see "we're in
+saturated regime and CoV is at the structural floor") and never by
+itself changes pass/fail. Gate 3 enforcement is a separate mechanism
+driven by the operator's `--expect-saturation` declaration (hb166
+V-3): with that flag the observed aggregate must reach the scaled cap;
+without it the aggregate leg is diagnostic. This resolves the earlier
+apparent contradiction between "Gate 3 applies for saturated runs" and
+"labeling does not change pass/fail" — the *label* never gates, the
+*declaration* does.
 
 ## Required metrics — exported from the harness
 
@@ -377,6 +406,24 @@ Any fairness measurement run MUST report:
    window (e.g. heavily shaped streams) legitimately drop out of
    `{a_i}` between packets. Consumers (#1746) get a trustworthy
    "recently-seen flows" gauge, not a session count.
+
+   **Reducer aggregation semantics (`fairness-eval`, hb166 V-5/V-6).**
+   The per-worker `{aᵢ}` is the **median** of the per-`(timestamp,
+   worker)` summed active-flow count over the steady-state window. Two
+   correctness rules apply. (V-6) The window is anchored to the **iperf
+   run epoch** (`start.timestamp.timesecs` + warmup/final-burst), NOT to
+   the scrape file's min/max timestamp — the binding/CoS TSV timestamps
+   share the same epoch-seconds clock, so stale pre-run / cooldown-era
+   scrapes that sit inside the file but outside the run are excluded.
+   (V-5) The median **zero-fills** each worker's absent samples across
+   the full in-window scrape-timestamp universe: a worker whose flows
+   die partway through the window is correctly seen as inactive
+   (median 0), not left "active" on the median of its live head samples.
+   The CoS active-flow exporter emits rows only for live flows, so the
+   reducer enforces the zero-fill; the binding exporter already zero-fills
+   every worker every scrape, so for that source it is a no-op. A whole
+   missing scrape (no worker on the source emitted) is not fabricated
+   into spurious zeros.
 5. **Computed `Cstruct`**: the structural CoV ceiling for the
    observed `{aᵢ}`.
 6. **Saturation determination**: which regime the run is in (per
@@ -397,10 +444,26 @@ Any fairness measurement run MUST report:
 11. **Mouse p99 latency** (when mouse probes are present).
 12. **Steady-state window**: explicit start/end timestamps,
     excluding the first 5 seconds (warmup) and any final
-    sender-shutdown bursts.
+    sender-shutdown bursts. `fairness-eval` emits these as
+    `steady_state_window` (iperf-epoch and run-relative start/end) and
+    (hb166 V-7) rejects a run whose OBSERVED non-omitted 1-second bucket
+    count falls below the 60 s minimum — the check is on measured
+    samples, not the self-reported iperf duration, so a truncated JSON
+    that merely *declares* a long run is rejected with an explicit error
+    rather than producing a CoV from a handful of buckets. iperf `-O`
+    omitted intervals are filtered out of the steady-state window.
 
-The `fairness-eval` verdict always includes `iperf_retransmits` and
-`iperf_reverse`. When iperf3 exports `end.cpu_utilization_percent`, the
+The `fairness-eval` verdict always includes the doc-mandated required
+metrics (hb166 V-9): `per_flow_throughput_mbps` (item 1: `stream_count`
+plus `min/p25/median/p75/max_mbps`, computed over the FULL iperf stream
+set — a starved / zero-throughput stream is counted as 0 Mb/s, not
+dropped, so a failing run's per-flow distribution surfaces the starved
+flow instead of undercounting it), `steady_state_window` (item 12:
+`iperf_epoch_start/end`, `relative_start/end_sec`), and
+`saturation_series` (item 6: the per-bucket `aggregate_buckets_bps`
+series, the `structural_cap_bps` it is judged against, and
+`saturated_bucket_fraction`). It also always includes `iperf_retransmits`
+and `iperf_reverse`. When iperf3 exports `end.cpu_utilization_percent`, the
 verdict also includes `iperf_cpu_host_total_percent`,
 `iperf_cpu_host_user_percent`, `iperf_cpu_host_system_percent`,
 `iperf_cpu_remote_total_percent`, `iperf_cpu_remote_user_percent`,
@@ -1157,7 +1220,12 @@ Every measurement run requires:
 A run shorter than 60 seconds steady-state cannot pass the per-flow
 fairness gate (insufficient samples for stable CoV). The harness
 must reject such runs with an explicit error, not pass them
-trivially.
+trivially. `fairness-eval` enforces this on the **observed** in-window
+1-second bucket count (with a small boundary slack), not on the
+self-reported iperf `duration` (hb166 V-7): a truncated JSON that
+declares a 120 s run but carries only a handful of intervals is
+rejected, and iperf `-O` omitted intervals are filtered out before the
+count.
 
 ## Regression bounds
 
