@@ -346,7 +346,7 @@ re-resolves and re-syncs the fabric MACs within seconds. The persisted
 fabric set is therefore the **observability snapshot** (so `show` reflects
 the resolved truth), not the restore source.
 
-## Screens are not re-run on fabric-redirected traffic (#4155)
+## Rate-based flood screens are not re-counted on fabric-redirected traffic (#4155)
 
 A packet that ingresses the **non-owner** node for a session the RG **owner**
 owns is screened on the ingress node and then fabric-redirected to the owner

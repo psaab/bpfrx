@@ -259,7 +259,7 @@ sync.
     per-destination thresholds (which would false-trip a flood Drop on a legit
     synced session). The per-`(zone, src)` scan/sweep new-flow counter is
     skipped the same way (`packet_fabric_ingress`) at the session-miss decision
-    in `poll_descriptor.rs`; the per-IP session-limit check there still runs.
+    in `poll_descriptor/mod.rs`; the per-IP session-limit check there still runs.
     The per-destination flood sketches (#4132) are untouched — the fix skips the
     re-count, it does not disable the screen. vSRX parity: screens fire once, on
     the true cluster-ingress node.
