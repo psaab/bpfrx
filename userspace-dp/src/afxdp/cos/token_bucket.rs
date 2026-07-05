@@ -320,12 +320,36 @@ pub(in crate::afxdp) fn refill_cos_tokens(
         return;
     }
     let elapsed_ns = now_ns - *last_refill_ns;
-    let added = ((elapsed_ns as u128) * (rate_bytes_per_sec as u128) / 1_000_000_000u128) as u64;
+    let scaled = (elapsed_ns as u128) * (rate_bytes_per_sec as u128);
+    let added = (scaled / 1_000_000_000u128) as u64;
     if added == 0 {
+        // No whole byte accrued this call. Leave `last_refill_ns`
+        // untouched so the sub-byte credit keeps accumulating against
+        // the original timestamp (advancing it here would discard it —
+        // the #4261 dust bug for low-rate classes).
         return;
     }
     *tokens = tokens.saturating_add(added).min(burst_bytes);
-    *last_refill_ns = now_ns;
+    // #4261 (hb166 R-4) — carry the fractional remainder across refills.
+    // `added` floors the byte grant; advancing `last_refill_ns` fully to
+    // `now_ns` would discard `scaled % 1e9` byte-nanoseconds of accrued-
+    // but-ungranted credit EVERY refill. At 64 kbps (8000 B/s) on the
+    // ~200 µs drain cadence that is added = 1.6 → 1 with 0.6 B dropped per
+    // interval — a 37.5% shortfall the low-rate class never recovers.
+    // Instead of advancing to `now_ns`, rewind by the time-equivalent of
+    // the ungranted fraction so it stays on the clock for the next refill.
+    // `remainder` is the leftover byte-nanoseconds (`< 1e9`); dividing by
+    // the rate converts it back to the elapsed time not yet turned into a
+    // whole byte. Conservation: cumulative granted == floor(total_elapsed ×
+    // rate / 1e9), matching the #1630 byte-carry precedent one decade up.
+    // Bounds: `leftover_ns = remainder / rate ≤ elapsed_ns` (remainder ≤
+    // elapsed×rate), so `now_ns - leftover_ns` stays in
+    // `[*last_refill_ns, now_ns]` — the timestamp never moves backward and
+    // never overshoots. `rate_bytes_per_sec != 0` is guaranteed by the
+    // early return above, so the division is safe.
+    let remainder = scaled - (added as u128) * 1_000_000_000u128;
+    let leftover_ns = (remainder / (rate_bytes_per_sec as u128)) as u64;
+    *last_refill_ns = now_ns - leftover_ns;
 }
 
 /// Time-until-refill helper. Returns `Some(ns)` for the wait-time
