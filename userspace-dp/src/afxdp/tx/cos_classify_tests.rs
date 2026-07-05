@@ -14,28 +14,44 @@ use crate::{
     FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot,
 };
 
+// #hb166 T-4: an explicit request for a queue this interface does NOT
+// materialize must fall back to the default (best-effort) queue — forward on
+// best-effort, never blackhole. Pre-fix `resolve_cos_queue_idx` returned `None`
+// for the miss, which the sole enqueue caller turned into an `Err` → drop
+// (the 100% silent blackhole a BA classifier code-point steering to a
+// forwarding-class with no scheduler-map entry produced).
+//
+// FAIL-ON-REVERT: restoring the pre-fix `position()`-returns-None body flips
+// the `Some(4)`/`Some(9)` assertions to `None`.
 #[test]
-fn resolve_cos_queue_idx_rejects_explicit_queue_miss() {
+fn resolve_cos_queue_idx_falls_back_to_default_on_explicit_queue_miss() {
+    let queue = |queue_id: u8, forwarding_class: &str| CoSQueueConfig {
+        queue_id,
+        forwarding_class: forwarding_class.into(),
+        priority: 5,
+        transmit_rate_bytes: 10_000_000,
+        guarantee_enabled: true,
+        exact: false,
+        surplus_sharing: false,
+        equal_flow_enforcement: false,
+        equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+        surplus_weight: 1,
+        buffer_bytes: COS_MIN_BURST_BYTES,
+        dscp_rewrite: None,
+        codel_target_ns: 0,
+    };
+    // Materializes queue 0 (best-effort, the default) at index 0 and queue 5 at
+    // index 1. Queue 9 is never built.
     let root = test_cos_runtime_with_queues(
         10_000_000,
-        vec![CoSQueueConfig {
-            queue_id: 5,
-            forwarding_class: "best-effort".into(),
-            priority: 5,
-            transmit_rate_bytes: 10_000_000,
-            guarantee_enabled: true,
-            exact: false,
-            surplus_sharing: false,
-            equal_flow_enforcement: false,
-            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
-            surplus_weight: 1,
-            buffer_bytes: COS_MIN_BURST_BYTES,
-            dscp_rewrite: None,
-            codel_target_ns: 0,
-        }],
+        vec![queue(0, "best-effort"), queue(5, "voice")],
     );
 
-    assert_eq!(resolve_cos_queue_idx(&root, Some(4)), None);
+    // Unmaterialized queue 9 -> default (best-effort) queue index, NOT None.
+    assert_eq!(resolve_cos_queue_idx(&root, Some(9)), Some(0));
+    // A materialized non-default queue still resolves to its own index.
+    assert_eq!(resolve_cos_queue_idx(&root, Some(5)), Some(1));
+    // No request -> default queue.
     assert_eq!(resolve_cos_queue_idx(&root, None), Some(0));
 }
 
@@ -3917,4 +3933,187 @@ fn cache_hit_replays_input_count_exactly_once_v4() {
         "#4085: seed (1) + 2 cache hits (1 each) == 3 — hits must count once, \
          not zero or two"
     );
+}
+
+// #hb166 T-3 middle case: an INPUT filter assigns a forwarding-class and a
+// counter/log-only OUTPUT filter (no `then forwarding-class`) is ALSO attached
+// to the egress interface. Junos semantics are output-OVERRIDES-when-set, not
+// output-PRESENCE-clears-ingress, so the input-filter class must survive: the
+// packet must land in the `expedited-forwarding` queue (1), NOT best-effort (0).
+//
+// This is the case commit `a15a6120` left broken (it fixed only the
+// zero-effect / non-matching output-filter subcase). FAIL-ON-REVERT: restoring
+// the `!has_output_filter` gate on `ingress_forwarding_class` flips the queue
+// back to best-effort (0).
+fn hb166_t3_middle_case_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        interfaces: vec![
+            // Ingress interface with an input filter that classifies to ef.
+            InterfaceSnapshot {
+                name: "reth1.0".into(),
+                ifindex: 101,
+                parent_ifindex: 5,
+                vlan_id: 0,
+                hardware_addr: "02:bf:72:00:61:01".into(),
+                filter_input_v4: "cos-classify".into(),
+                ..Default::default()
+            },
+            // Egress interface with CoS queues AND a counter-only output filter.
+            InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                filter_output_v4: "wan-count".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        filters: vec![
+            FirewallFilterSnapshot {
+                name: "cos-classify".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "voice".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    forwarding_class: "expedited-forwarding".into(),
+                    ..Default::default()
+                }],
+            },
+            // Output filter counts only — NO `then forwarding-class`.
+            FirewallFilterSnapshot {
+                name: "wan-count".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "count-only".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    count: "wan-hits".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "expedited-forwarding".into(),
+                    queue: 1,
+                },
+            ],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "ef-sched".into(),
+                    transmit_rate_bytes: 6_000_000,
+                    transmit_rate_exact: false,
+                    priority: "strict-high".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "expedited-forwarding".into(),
+                        scheduler: "ef-sched".into(),
+                    },
+                ],
+            }],
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn resolve_cos_queue_id_preserves_input_fc_under_counter_only_output_filter() {
+    let snapshot = hb166_t3_middle_case_snapshot();
+    let forwarding = build_forwarding_state(&snapshot);
+    let queue_id = resolve_cos_queue_id(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 5,
+            ingress_vlan_id: 0,
+            addr_family: libc::AF_INET as u8,
+            dscp: 0,
+            ..Default::default()
+        },
+        Some(&SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        }),
+    );
+    assert_eq!(
+        queue_id,
+        Some(1),
+        "a counter-only output filter must NOT clear the input-filter forwarding-class"
+    );
+}
+
+#[test]
+fn resolve_cached_cos_tx_selection_preserves_input_fc_under_counter_only_output_filter() {
+    let snapshot = hb166_t3_middle_case_snapshot();
+    let forwarding = build_forwarding_state(&snapshot);
+    let cached = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 5,
+            ingress_vlan_id: 0,
+            addr_family: libc::AF_INET as u8,
+            dscp: 0,
+            ..Default::default()
+        },
+        Some(&SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        }),
+    );
+    assert_eq!(
+        cached.queue_id,
+        Some(1),
+        "cached resolver must also keep the input-filter forwarding-class under a counter-only output filter"
+    );
+    // The output filter still counts (its counter term runs), and the ingress
+    // input filter's class survives — output-overrides-when-set semantics.
+    assert!(!cached.filter_counters.is_empty());
 }

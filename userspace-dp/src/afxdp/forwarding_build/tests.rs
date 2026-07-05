@@ -4503,3 +4503,112 @@ fn build_forwarding_state_carries_gre_acceleration() {
         "ForwardingState.gre_acceleration must equal snapshot.flow.gre_acceleration"
     );
 }
+
+// #hb166 T-4: an admitted interface whose scheduler-map materializes ONLY
+// best-effort (queue 0) but whose DSCP classifier steers a code-point to
+// `voice` (queue 5, NOT materialized) must NOT write the unmaterialized queue
+// id into the per-interface table — that id has no queue at runtime and the
+// enqueue path DROPS every packet of that code-point (a 100% silent
+// blackhole). It must fail SAFE: fall back to the interface default queue so
+// the traffic forwards on best-effort.
+//
+// FAIL-ON-REVERT: dropping the materialized-queue filter in
+// build_cos_dscp_queue_table (writing `queue_id` verbatim) makes
+// dscp_queue_by_dscp[46] == 5 again, reproducing the blackhole.
+#[test]
+fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 77,
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_scheduler_map: "be-only".into(),
+            cos_dscp_classifier: "wan-classifier".into(),
+            cos_ieee8021_classifier: "wan-pcp".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "voice".into(),
+                    queue: 5,
+                },
+            ],
+            dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                name: "wan-classifier".into(),
+                entries: vec![
+                    // DSCP 46 -> voice (queue 5) is NOT materialized by the
+                    // scheduler-map -> must fall back to default queue 0.
+                    CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "low".into(),
+                        dscp_values: vec![46],
+                    },
+                    // DSCP 0 -> best-effort (queue 0) IS materialized -> admits
+                    // the interface and stays queue 0.
+                    CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        loss_priority: "low".into(),
+                        dscp_values: vec![0],
+                    },
+                ],
+            }],
+            ieee8021_classifiers: vec![CoSIEEE8021ClassifierSnapshot {
+                name: "wan-pcp".into(),
+                entries: vec![CoSIEEE8021ClassifierEntrySnapshot {
+                    // PCP 5 -> voice (queue 5) unmaterialized -> default 0.
+                    forwarding_class: "voice".into(),
+                    loss_priority: "low".into(),
+                    code_points: vec![5],
+                }],
+            }],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![CoSSchedulerSnapshot {
+                name: "be".into(),
+                transmit_rate_bytes: 1_000_000,
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 0,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            }],
+            // Materializes ONLY best-effort (queue 0). voice/queue 5 is never
+            // built on this interface.
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "be-only".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: "be".into(),
+                }],
+            }],
+        }),
+        ..Default::default()
+    };
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&77).expect("missing CoS interface");
+    // The interface materializes only queue 0.
+    assert!(
+        iface.queues.iter().all(|queue| queue.queue_id == 0),
+        "scheduler-map materializes only best-effort (queue 0)"
+    );
+    assert_eq!(iface.default_queue, 0);
+    // The blackhole code-points now resolve to the default queue, NOT the
+    // unmaterialized queue 5.
+    assert_eq!(
+        iface.dscp_queue_by_dscp[46], 0,
+        "DSCP 46 -> unmaterialized queue 5 must fall back to default queue 0 (no blackhole)"
+    );
+    assert_eq!(
+        iface.ieee8021_queue_by_pcp[5], 0,
+        "PCP 5 -> unmaterialized queue 5 must fall back to default queue 0 (no blackhole)"
+    );
+    // The materialized best-effort code-point is unchanged.
+    assert_eq!(iface.dscp_queue_by_dscp[0], 0);
+}
