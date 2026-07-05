@@ -122,3 +122,65 @@ fn cancelled_prepared_local_fill_stays_on_pending_fill() {
     assert_eq!(pending_fill_frames, VecDeque::from([42]));
     assert!(shared_recycles.is_empty());
 }
+
+// #hb166 T-6(d): when `transmit_batch` hits an oversized frame mid-batch it
+// unwinds the already-staged prefix back onto the head of `pending`. The
+// unwind MUST preserve the original front-to-back order so same-flow (in-
+// order TCP) segments are not reordered on the error path.
+//
+// FAIL-ON-REVERT: dropping the `.rev()` from the unwind drain reverses the
+// restored prefix, flipping the recovered enqueue_ns order from [1, 2, 4]
+// to [2, 1, 4].
+#[test]
+fn transmit_batch_oversized_unwind_preserves_pending_order() {
+    use crate::afxdp::tx::test_support::{
+        test_cos_fast_interfaces, test_cos_runtime_with_queues, test_queue_fast_path,
+    };
+    use crate::afxdp::types::TxRequest;
+
+    let mk = |len: usize, id: u64| TxRequest {
+        bytes: vec![0u8; len],
+        expected_ports: None,
+        expected_addr_family: 0,
+        expected_protocol: 0,
+        flow_key: None,
+        egress_ifindex: 42,
+        cos_queue_id: None,
+        dscp_rewrite: None,
+        mirror_clone: false,
+        // enqueue_ns doubles as an identity marker for order assertions.
+        enqueue_ns: id,
+    };
+
+    let root = test_cos_runtime_with_queues(10_000_000, vec![]);
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        0,
+        vec![(0, test_queue_fast_path(false, 0, None, None))],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    // A(128), B(128) stage; the oversized item (> tx_frame_capacity()) trips
+    // the Drop-unwind; D(128) is never reached (loop returns on the Err).
+    let mut pending = VecDeque::from([
+        mk(128, 1),
+        mk(128, 2),
+        mk(tx_frame_capacity() + 1, 3),
+        mk(128, 4),
+    ]);
+    let mut shared_recycles = Vec::new();
+
+    let result = transmit_batch(&mut binding, &mut pending, 0, &mut shared_recycles);
+    assert!(matches!(result, Err(TxError::Drop(_))));
+
+    let order: Vec<u64> = pending.iter().map(|r| r.enqueue_ns).collect();
+    assert_eq!(
+        order,
+        vec![1, 2, 4],
+        "oversized-unwind must keep the staged prefix in original order (A before B)",
+    );
+}

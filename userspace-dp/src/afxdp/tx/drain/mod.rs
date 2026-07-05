@@ -43,10 +43,12 @@ pub(in crate::afxdp) fn bound_pending_tx_local(binding: &mut BindingWorker) {
                 .live
                 .pending_tx_local_overflow_drops
                 .fetch_add(1, Ordering::Relaxed);
-            binding.live.set_error(format!(
-                "pending TX local overflow on slot {}",
-                binding.slot
-            ));
+            // #hb166 T-6(g): no per-drop `set_error(format!())` here — this
+            // is a `while overflow` loop, so the String alloc fired once per
+            // evicted packet under backpressure (hot-path-allocation-rule
+            // violation, CLAUDE.md). The dedicated
+            // `pending_tx_local_overflow_drops` counter above (a subset of
+            // `tx_errors`) already attributes the drop without allocating.
         }
     }
 }
@@ -74,10 +76,8 @@ pub(in crate::afxdp) fn bound_pending_tx_prepared(
                 .live
                 .pending_tx_local_overflow_drops
                 .fetch_add(1, Ordering::Relaxed);
-            binding.live.set_error(format!(
-                "pending TX prepared overflow on slot {}",
-                binding.slot
-            ));
+            // #hb166 T-6(g): no per-drop `set_error(format!())` — same
+            // hot-path String alloc removal as the local overflow loop above.
         }
     }
 }
