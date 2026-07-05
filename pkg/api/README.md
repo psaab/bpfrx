@@ -246,6 +246,21 @@ under the daemon's errgroup. Nothing else imports this package.
   Read-only GET handlers do not read a body and are out of scope. Add a new
   mutation handler via `decodeJSONBody`, not a bare `json.NewDecoder(r.Body)`,
   so the cap and 413 are inherited. Pinned by `http_dos_hardening_4150_test.go`.
+- **Constant-time credential comparison (#4157).** `authMiddleware` /
+  `checkAuthorization` (`auth.go`) validate every credential in constant
+  time to avoid a network-timing side channel. API keys and Bearer tokens
+  go through `constantTimeAPIKeyMatch`, which compares the presented token
+  against EVERY configured key with `subtle.ConstantTimeCompare` and OR-s
+  the results — it never short-circuits on the first match (so *which* key
+  matched does not leak either) and never uses the old `cfg.APIKeys[token]`
+  map lookup (whose latency varied with hash-bucket collisions / presence).
+  Basic-auth passwords already used `ConstantTimeCompare`; the username path
+  no longer early-returns on `!exists` — it always runs the password compare
+  and AND-s with existence, so a known vs. unknown username is not
+  distinguishable by response timing. `ConstantTimeCompare` returns 0 on a
+  length mismatch (reveals length, not content — acceptable). Pinned by
+  `auth_consttime_4157_test.go`, including an AST regression guard that fails
+  if any auth path reverts to a bare `cfg.APIKeys[...]` lookup.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
