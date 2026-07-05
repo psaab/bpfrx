@@ -493,6 +493,24 @@ pub(crate) enum SnapshotIntegrityError {
         forwarding_class: String,
         target_policy: String,
     },
+    /// #hb166 T-7: a CoS scheduler snapshot carried a NON-EMPTY `priority`
+    /// wire string that is not one of the known Junos scheduler priorities
+    /// (`strict-high` / `high` / `medium-high` / `medium` / `medium-low` /
+    /// `low`). The pre-fix `cos_priority_rank` mapped any unrecognized
+    /// string to rank 5 (`low`, the strict-priority FLOOR) via a catch-all
+    /// match arm — so a typo or a mixed-version snapshot silently demoted a
+    /// class to lowest priority with no failure surfaced. Fail-closed here,
+    /// directly mirroring the #2458 `CosUnknownEqualFlowTargetPolicy` parse
+    /// on the SAME queue a few fields over. The Go commit-time gate is the
+    /// primary defense; this is the helper-boundary backstop for
+    /// version/snapshot drift, consistent with the #2447/#2458 CoS
+    /// fail-closed family. A MISSING scheduler, or a present scheduler with
+    /// an EMPTY priority string, is the legitimate legacy default (rank
+    /// `low`) and is NOT an error.
+    CosUnknownSchedulerPriority {
+        forwarding_class: String,
+        priority: String,
+    },
     /// #3365: a policy rule's `action` field, or the snapshot `default_policy`,
     /// carried a NON-EMPTY string that is not one of `permit` / `reject` /
     /// `deny`. The pre-fix `parse_action` mapped any unrecognized string to
@@ -825,6 +843,14 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "cos forwarding-class {:?} has equal-flow-target-policy {:?} that is not one of slowest | mean | ideal-share — refusing to silently map it to the \"slowest\" default (which would change queue fairness with no failure surfaced)",
                 forwarding_class, target_policy
+            ),
+            Self::CosUnknownSchedulerPriority {
+                forwarding_class,
+                priority,
+            } => write!(
+                f,
+                "cos forwarding-class {:?} has scheduler priority {:?} that is not one of strict-high | high | medium-high | medium | medium-low | low — refusing to silently rank it lowest (\"low\"), which would demote the class with no failure surfaced",
+                forwarding_class, priority
             ),
             Self::UnknownPolicyAction { context, action } => write!(
                 f,

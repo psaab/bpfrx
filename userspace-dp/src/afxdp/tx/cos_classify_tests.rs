@@ -4311,3 +4311,49 @@ fn resolve_cached_cos_tx_selection_preserves_input_fc_under_counter_only_output_
     // input filter's class survives — output-overrides-when-set semantics.
     assert!(!cached.filter_counters.is_empty());
 }
+
+#[test]
+fn ieee8021_classifier_fails_closed_on_out_of_range_pcp() {
+    // #hb166 T-7: a PCP outside the 3-bit 0..=7 domain must NOT be clamped
+    // into a valid index. Pre-fix `pcp.min(7)` routed pcp 8 to the PCP-7
+    // class (here queue 3); the fix returns None so the frame falls
+    // through to the default queue, matching the #2447 build-side
+    // fail-closed posture. RED-on-revert: restoring `.min(7)` flips the
+    // pcp-8/255 assertions from None back to Some(3).
+    let mut pcp_table = [u8::MAX; 8];
+    pcp_table[7] = 3;
+    let iface = CoSInterfaceConfig {
+        shaping_rate_bytes: 1_000_000,
+        burst_bytes: COS_MIN_BURST_BYTES,
+        default_queue: 0,
+        dscp_classifier: String::new(),
+        ieee8021_classifier: "wan-pcp".into(),
+        dscp_queue_by_dscp: [u8::MAX; 64],
+        ieee8021_queue_by_pcp: pcp_table,
+        queue_by_forwarding_class: FastMap::default(),
+        queues: vec![],
+        oversubscription_policy: crate::afxdp::types::CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
+    };
+    // Valid PCP 7 resolves to its configured queue.
+    assert_eq!(
+        resolve_cos_ieee8021_classifier_queue_id(&iface, 7, true),
+        Some(3)
+    );
+    // Out-of-range PCP fails closed to None (default queue), NOT clamped to
+    // the PCP-7 queue.
+    assert_eq!(
+        resolve_cos_ieee8021_classifier_queue_id(&iface, 8, true),
+        None
+    );
+    assert_eq!(
+        resolve_cos_ieee8021_classifier_queue_id(&iface, 255, true),
+        None
+    );
+    // Untagged frames never classify.
+    assert_eq!(
+        resolve_cos_ieee8021_classifier_queue_id(&iface, 7, false),
+        None
+    );
+}
