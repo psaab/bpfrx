@@ -1097,7 +1097,16 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				// the standby eligible for the primary's re-push so it
 				// re-converges instead of being silently stranded (M-2/#4151).
 				s.stats.ConfigsApplyFailed.Add(1)
-				slog.Warn("cluster sync: config apply failed — retaining prior high-water so the peer re-push re-converges",
+				// Debug, not Warn: handleConfigSync (the callback) already logs
+				// the authoritative one-time reason WHY the apply failed
+				// (RG0-primary rejection at Warn, compile/promote failure at
+				// Error). This line is the per-retry diagnostic detail of the
+				// M-2/#4151 high-water retention, and the same generation may be
+				// re-pushed on every reconnect while the condition persists — a
+				// Warn here would spam (CLAUDE.md logging rule). The
+				// rate-independent observable is the ConfigsApplyFailed counter
+				// above (surfaced in cluster status), not this log.
+				slog.Debug("cluster sync: config apply failed — retaining prior high-water so the peer re-push re-converges",
 					"incoming_gen", item.gen, "last_applied_gen", s.lastAppliedConfigGen.Load(), "size", len(item.text), "err", err)
 				continue
 			}
