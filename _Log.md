@@ -34169,3 +34169,12 @@ top.
   still pass `xpfd check-config` (standalone; ha-pair -node-id 0 and 1) —
   strict parse + schema + compile.
 - **File(s)**: examples/deploy/standalone.conf, examples/deploy/ha-pair.conf, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-165 H-21 — hypervisor-command failures now die() with the
+  real stderr instead of a bare CalledProcessError traceback. Added a shared
+  `run_capture(argv, dry)` helper (capture stdout+stderr; on nonzero exit die
+  with `command failed (rc=N): <cmd>\n<stderr>`). `Runner.run` now funnels
+  through it; the config-drive mkiso build and the `sudo install` golden-copy
+  fallback route through it too. Issues #4204/#4205/#4206 filed.
+- **File(s)**: scripts/deploy/xpf-deploy.py, _Log.md

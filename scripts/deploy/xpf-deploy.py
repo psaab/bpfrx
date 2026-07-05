@@ -85,6 +85,25 @@ def die(msg):
     sys.exit(f"ERROR: {msg}")
 
 
+def run_capture(argv, dry=False):
+    """Run argv, capturing stdout+stderr. On a nonzero exit, die() with the
+    command, the return code, and the captured stderr — the hypervisor tool's
+    REAL message (missing bridge, existing instance, unknown image alias) —
+    instead of letting a bare CalledProcessError traceback swallow it
+    (fable-165 H-21). In dry-run, print the command and return "" (never
+    execute). Returns stdout on success. This is the single capture-and-report
+    helper every hypervisor-command call site funnels through."""
+    if dry:
+        print(" ".join(shlex.quote(a) for a in argv))
+        return ""
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode != 0:
+        cmd = " ".join(shlex.quote(a) for a in argv)
+        detail = (r.stderr or r.stdout or "").strip() or "(no output on stderr)"
+        die(f"command failed (rc={r.returncode}): {cmd}\n    {detail}")
+    return r.stdout
+
+
 # ── naming contract ───────────────────────────────────────────────────
 def expected_name(idx, mode, node_id):
     """vSRX name the guest assigns to the NIC at position idx (0-based);
@@ -302,7 +321,7 @@ def build_config_drive(ap, runner):
                     "-J", "-r", "-o", iso, stage]
         else:
             argv = [mkiso, "-quiet", "-V", "xpf-config", "-J", "-r", "-o", iso, stage]
-        subprocess.run(argv, check=True, capture_output=True, text=True)
+        run_capture(argv)   # die with the mkiso error, not a bare traceback (H-21)
         print(f"==> built day-0 drive {iso} (label xpf-config)")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -338,10 +357,9 @@ class Runner:
         self.dry = dry
 
     def run(self, argv):
-        if self.dry:
-            print(" ".join(shlex.quote(a) for a in argv))
-            return ""
-        return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+        # Funnel through run_capture so a failing hypervisor command dies with
+        # its real stderr, not a bare CalledProcessError traceback (H-21).
+        return run_capture(argv, self.dry)
 
 
 # ── deploy backends ───────────────────────────────────────────────────
@@ -432,8 +450,8 @@ def _install_libvirt_golden(srcq, image):
         shutil.copyfile(srcq, golden)
     except OSError:
         # /var/lib/libvirt/images is normally root-owned; -D creates the dir.
-        subprocess.run(["sudo", "install", "-m", "0644", "-D", srcq, golden],
-                       check=True)
+        # run_capture so a failing install reports its stderr, not a traceback.
+        run_capture(["sudo", "install", "-m", "0644", "-D", srcq, golden])
     return golden
 
 
