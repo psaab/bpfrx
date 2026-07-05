@@ -94,7 +94,9 @@ non-trivial code. This page is the quick-reference gotcha list.
   reconcile wires the config onto the interfaces. No daemon restart is
   needed; it mirrors bootstrap-exit re-naming but does NOT re-arm the
   dataplane (this node is not in bootstrap mode). A standalone config or
-  any later commit is a no-op.
+  any later commit is a no-op. The flag is consumed ONLY on a successful
+  re-name — a transient enumeration/netlink error leaves it set so the
+  next config apply retries (never strand the node on one blip).
 - **`.network` files** configure addresses, DHCP avoidance, RA disable,
   VLAN parent flags. `KeepConfiguration=static` on RETH interfaces
   preserves VRRP VIPs across `networkctl reload`.

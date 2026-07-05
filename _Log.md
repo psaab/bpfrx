@@ -41,6 +41,21 @@
     fails the H-7 corruption test (fxp0 stays on A, ge-0-0-0 empty);
     no-op revert fails the H-10 re-naming test. `go test ./pkg/daemon/...`
     green; `go build ./...`, gofmt, vet clean.
+  - **Review folds (PR #4182, Copilot)**: (1) REAL robustness bug —
+    maybeReapplyConfigArrivalNaming consumed the one-shot flag via CAS
+    BEFORE calling applyStartupNamingForConfig, so a transient naming
+    error stranded the config-less HA node on standalone names forever.
+    Restructured to Load()-gate, attempt naming, and Store(false) to
+    consume ONLY on success; on error the flag stays set + slog.Warn, so
+    the next config apply retries (bounded to once per commit; applies
+    serialized under d.applySem). New test
+    TestConfigArrivalRenamingRetriesOnFailure (fail-then-succeed);
+    RED-on-revert proven (consume-first fails it). (2) Test hermeticity —
+    newStoreDaemon now pins lifelineRecordFileForTest to a temp path so
+    resolveProtectedInterfaces does not read the host /etc/xpf lifeline
+    record. (3) Log-prefix threading — breakNameCollisions takes a
+    logPrefix param ("linksetup" | "device-map") so a device-map
+    collision logs "device-map:" not "linksetup:".
   - **File(s)**: pkg/daemon/linksetup.go, pkg/daemon/device_map.go,
     pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
     pkg/daemon/daemon_apply.go,
