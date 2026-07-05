@@ -86,14 +86,18 @@ func TestOSPFInterfacePriorityUnsetSentinel_4285(t *testing.T) {
 // passive, hold-time, and per-group local-as must survive the parser +
 // compiler and reach every neighbor in the group. RED-on-revert: the leaves
 // drop silently.
+//
+// The peer is eBGP-shaped (peer-as 65002 != router local-as 65001): FRR's
+// `neighbor X local-as` is an eBGP-oriented knob and can be rejected on an
+// iBGP-shaped peer, so the local-as case is modelled on an eBGP peer.
 func TestBGPGroupLocalAddressCompiled_4286(t *testing.T) {
 	c := compileSetsAdj4285(t, []string{
-		"set protocols bgp group ibgp local-address 10.255.0.1",
-		"set protocols bgp group ibgp local-as 65100",
-		"set protocols bgp group ibgp hold-time 30",
-		"set protocols bgp group ibgp passive",
+		"set protocols bgp group ext local-address 10.255.0.1",
+		"set protocols bgp group ext local-as 65100",
+		"set protocols bgp group ext hold-time 30",
+		"set protocols bgp group ext passive",
 		"set protocols bgp local-as 65001",
-		"set protocols bgp group ibgp neighbor 10.255.0.2 peer-as 65001",
+		"set protocols bgp group ext neighbor 10.255.0.2 peer-as 65002",
 	})
 
 	if c.Protocols.BGP == nil || len(c.Protocols.BGP.Neighbors) != 1 {

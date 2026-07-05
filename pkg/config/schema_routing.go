@@ -261,10 +261,10 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 				"no-passive":          {desc: "Non-passive interface", children: nil},
 				"interface-type":      {desc: "Interface type", args: 1, placeholder: "<type>", children: nil},
 				"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
-				"hello-interval":      {desc: "Hello interval (seconds)", args: 1, placeholder: "<seconds>", children: nil},
-				"dead-interval":       {desc: "Dead interval (seconds)", args: 1, placeholder: "<seconds>", children: nil},
-				"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, placeholder: "<seconds>", children: nil},
-				"priority":            {desc: "Router priority for DR election", args: 1, placeholder: "<priority>", children: nil},
+				"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+				"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+				"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+				"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
 				"authentication": {desc: "Authentication", children: map[string]*schemaNode{
 					"md5": {desc: "MD5 authentication", args: 1, placeholder: "<key-id>", children: map[string]*schemaNode{
 						"key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
@@ -294,8 +294,12 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"export":    {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"area": {desc: "OSPFv3 area", args: 1, placeholder: "<area-id>", children: map[string]*schemaNode{
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-				"passive": {desc: "Passive interface", children: nil},
-				"cost":    {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+				"passive":             {desc: "Passive interface", children: nil},
+				"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+				"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+				"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+				"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+				"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
 				"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
 					"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
 					"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
@@ -323,9 +327,9 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"import": {desc: "Import policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"group": {desc: "BGP group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
 			"peer-as":            {desc: "Peer AS number", args: 1, placeholder: "<as-number>", children: nil},
-			"local-as":           {desc: "Local AS number for this peering", args: 1, placeholder: "<as-number>", children: nil},
+			"local-as":           {desc: "Local AS number for this peering", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 			"local-address":      {desc: "Local address (BGP update-source)", args: 1, placeholder: "<address>", children: nil},
-			"hold-time":          {desc: "Hold time (seconds)", args: 1, placeholder: "<seconds>", children: nil},
+			"hold-time":          {desc: "Hold time (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateBGPHoldTime, children: nil},
 			"passive":            {desc: "Passive mode (do not initiate connections)", children: nil},
 			"description":        {desc: "Description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 			"multihop":           {desc: "Multihop TTL", args: 1, placeholder: "<ttl>", children: nil},
@@ -358,9 +362,9 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			"neighbor": {desc: "BGP neighbor", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 				"description":            {desc: "Description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 				"peer-as":                {desc: "Peer AS number", args: 1, placeholder: "<as-number>", children: nil},
-				"local-as":               {desc: "Local AS number for this peering", args: 1, placeholder: "<as-number>", children: nil},
+				"local-as":               {desc: "Local AS number for this peering", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 				"local-address":          {desc: "Local address (BGP update-source)", args: 1, placeholder: "<address>", children: nil},
-				"hold-time":              {desc: "Hold time (seconds)", args: 1, placeholder: "<seconds>", children: nil},
+				"hold-time":              {desc: "Hold time (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateBGPHoldTime, children: nil},
 				"passive":                {desc: "Passive mode (do not initiate connections)", children: nil},
 				"multihop":               {desc: "Multihop TTL", args: 1, placeholder: "<ttl>", children: nil},
 				"export":                 {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
@@ -663,10 +667,14 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 			"passive":             {desc: "Passive mode", children: nil},
 			"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", children: map[string]*schemaNode{
 				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-					"passive":        {desc: "Passive interface", children: nil},
-					"no-passive":     {desc: "Non-passive interface", children: nil},
-					"interface-type": {desc: "Interface type", args: 1, placeholder: "<type>", children: nil},
-					"cost":           {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+					"passive":             {desc: "Passive interface", children: nil},
+					"no-passive":          {desc: "Non-passive interface", children: nil},
+					"interface-type":      {desc: "Interface type", args: 1, placeholder: "<type>", children: nil},
+					"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+					"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+					"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+					"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+					"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
 					"authentication": {desc: "Authentication", children: map[string]*schemaNode{
 						"md5": {desc: "MD5 authentication", args: 1, placeholder: "<key-id>", children: map[string]*schemaNode{
 							"key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
@@ -698,10 +706,10 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 					"passive":             {desc: "Passive interface", children: nil},
 					"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
-					"hello-interval":      {desc: "Hello interval (seconds)", args: 1, placeholder: "<seconds>", children: nil},
-					"dead-interval":       {desc: "Dead interval (seconds)", args: 1, placeholder: "<seconds>", children: nil},
-					"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, placeholder: "<seconds>", children: nil},
-					"priority":            {desc: "Router priority for DR election", args: 1, placeholder: "<priority>", children: nil},
+					"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+					"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+					"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+					"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
 					"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
 						"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
 						"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
