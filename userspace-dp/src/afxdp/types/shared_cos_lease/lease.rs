@@ -404,7 +404,7 @@ impl SharedCoSQueueLease {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let worker_active_flow_buckets = (0..len)
-            .map(|_| AtomicU32::new(0))
+            .map(|_| PaddedAtomicU32(AtomicU32::new(0)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let worker_fair_share = (0..len)
@@ -593,7 +593,7 @@ impl SharedCoSQueueLease {
         let active_flows = v8
             .worker_active_flow_buckets
             .get(worker_id)
-            .map(|a| a.load(Ordering::Relaxed))
+            .map(|a| a.0.load(Ordering::Relaxed))
             .unwrap_or(0);
         let active = active_flows > 0;
         if active {
@@ -850,7 +850,14 @@ impl SharedCoSQueueLease {
         &self,
         worker_id: usize,
     ) -> Option<&AtomicU32> {
-        self.v8.as_ref()?.worker_active_flow_buckets.get(worker_id)
+        // #4270 (R-9): slots are cache-line-padded (`PaddedAtomicU32`);
+        // hand callers the inner `&AtomicU32` so the four mutation sites
+        // stay unchanged.
+        self.v8
+            .as_ref()?
+            .worker_active_flow_buckets
+            .get(worker_id)
+            .map(|s| &s.0)
     }
 
     /// #1229 Phase 6 v8: worker-side rehydration at lease install.
@@ -881,7 +888,7 @@ impl SharedCoSQueueLease {
             return;
         }
         if let Some(slot) = v8.worker_active_flow_buckets.get(worker_id) {
-            slot.fetch_add(count, Ordering::Relaxed);
+            slot.0.fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -1229,7 +1236,7 @@ impl SharedCoSQueueLease {
         let active_flows = v8
             .worker_active_flow_buckets
             .get(worker_id)
-            .map(|a| a.load(Ordering::Relaxed) as u64)
+            .map(|a| a.0.load(Ordering::Relaxed) as u64)
             .unwrap_or(0);
         if active_flows == 0 {
             return Some(0);

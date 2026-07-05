@@ -177,7 +177,7 @@ pub(super) fn publish_equal_flow_epoch_v8(
             let total_flows: u64 = v8
                 .worker_active_flow_buckets
                 .iter()
-                .map(|c| c.load(Ordering::Relaxed) as u64)
+                .map(|c| c.0.load(Ordering::Relaxed) as u64)
                 .sum::<u64>()
                 .max(1);
             nominal_epoch_bytes / total_flows
