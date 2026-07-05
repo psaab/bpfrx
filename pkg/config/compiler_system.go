@@ -398,6 +398,35 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					sys.Services.SSH.KeyExchange = append(sys.Services.SSH.KeyExchange, v)
 				}
 			}
+			// #4305 S-4: SSH hardening knobs. ciphers/macs are repeatable
+			// (bracketed list or one-per-child); read every value via
+			// firewallMatchValues so a `[ a b c ]` list is not truncated.
+			for _, cn := range sshNode.FindChildren("ciphers") {
+				sys.Services.SSH.Ciphers = append(sys.Services.SSH.Ciphers, firewallMatchValues(cn)...)
+			}
+			for _, mn := range sshNode.FindChildren("macs") {
+				sys.Services.SSH.MACs = append(sys.Services.SSH.MACs, firewallMatchValues(mn)...)
+			}
+			if cl := sshNode.FindChild("connection-limit"); cl != nil {
+				if n, err := strconv.Atoi(nodeVal(cl)); err == nil {
+					sys.Services.SSH.ConnectionLimit = n
+				}
+			}
+			if ci := sshNode.FindChild("client-alive-interval"); ci != nil {
+				if n, err := strconv.Atoi(nodeVal(ci)); err == nil {
+					sys.Services.SSH.ClientAliveInterval = n
+					sys.Services.SSH.ClientAliveIntervalSet = true
+				}
+			}
+			if cc := sshNode.FindChild("client-alive-count-max"); cc != nil {
+				if n, err := strconv.Atoi(nodeVal(cc)); err == nil {
+					sys.Services.SSH.ClientAliveCountMax = n
+					sys.Services.SSH.ClientAliveCountMaxSet = true
+				}
+			}
+			if pv := sshNode.FindChild("protocol-version"); pv != nil {
+				sys.Services.SSH.ProtocolVersion = nodeVal(pv)
+			}
 		}
 		// DNS service
 		if dnsNode := svcNode.FindChild("dns"); dnsNode != nil {
@@ -863,6 +892,24 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 			msg += fmt.Sprintf("; %s accepted but NOT enforced by xpf's coarse RBAC", strings.Join(inert, " + "))
 		}
 		warnings = append(warnings, msg)
+	}
+	return warnings
+}
+
+// sshHardeningAdvisoryWarnings notes the SSH knobs xpf recognizes but does not
+// (or cannot) render into the sshd drop-in (#4305 S-4). protocol-version is the
+// main one: modern sshd is SSH-2 only, so `v2` is a silent no-op and any other
+// value cannot be honored (SSH-1 is unsupported).
+func sshHardeningAdvisoryWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.System.Services == nil || cfg.System.Services.SSH == nil {
+		return nil
+	}
+	ssh := cfg.System.Services.SSH
+	var warnings []string
+	if ssh.ProtocolVersion != "" && ssh.ProtocolVersion != "v2" {
+		warnings = append(warnings, fmt.Sprintf(
+			"system services ssh protocol-version %q: sshd is SSH-2 only; SSH-1 is not supported, so this is accepted but NOT enforced",
+			ssh.ProtocolVersion))
 	}
 	return warnings
 }

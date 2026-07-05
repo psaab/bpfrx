@@ -4799,3 +4799,33 @@ blocking the whole config. This is accept-with-advisory now:
   mapping + advisory + undefined-still-rejected);
   `pkg/cli/permissions_custom_class_4304_test.go` (runtime enforcement +
   redaction).
+
+## SSH hardening knobs (#4305 S-4)
+
+The SSH compiler read only `root-login` + `key-exchange`, so the standard
+sshd-hardening knobs committed clean (unknown-key accepted-inert) and never
+reached the `sshd_config.d/xpf.conf` drop-in — the box kept base-image cipher/
+MAC defaults even when the operator configured hardened algorithms.
+
+- **schema** (`schema_system.go`) — `services ssh` gains `ciphers` (multi),
+  `macs` (multi), `connection-limit` (int 1-250), `rate-limit` (int 1-250),
+  `client-alive-interval` (int 0-65535), `client-alive-count-max` (int 0-255),
+  `protocol-version` (enum v1|v2). ciphers/macs are free-form (sshd validates
+  spellings at reload). OpenSSH `@`-suffixed algorithm names are configurable
+  via quoting (`ciphers "aes256-gcm@openssh.com"`).
+- **compiler** (`compiler_system.go`) — parses them into `SSHServiceConfig`.
+  ciphers/macs read every value via `firewallMatchValues` so a `[ a b ]`
+  bracketed list is not truncated. client-alive-* carry presence flags because
+  0 is a meaningful sshd value.
+- **runtime** (`daemon_system.go buildSSHDConfig`) — renders `Ciphers`, `MACs`,
+  `MaxStartups` (connection-limit's nearest sshd equivalent),
+  `ClientAliveInterval`, `ClientAliveCountMax`. A bad value fails the sshd
+  reload, which `applySSHConfig` reverts.
+- **advisory** — `protocol-version` is accept-with-advisory: modern sshd is
+  SSH-2 only, so `v2` is a silent no-op and any other value emits a
+  `cfg.Warnings` advisory (`sshHardeningAdvisoryWarnings`). `rate-limit` has no
+  clean sshd equivalent; it is accepted and covered by the S-5 inert-knob
+  advisory scan.
+- **tests** — `pkg/config/compiler_ssh_hardening_4305_test.go`,
+  `pkg/daemon/daemon_ssh_test.go` (`TestBuildSSHDConfigHardeningKnobs`,
+  `TestBuildSSHDConfigClientAlivePresence`).

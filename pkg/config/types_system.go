@@ -332,6 +332,21 @@ func (p *DDNSProvider) String() string {
 type SSHServiceConfig struct {
 	RootLogin   string   // "allow", "deny", "deny-password"
 	KeyExchange []string // sshd KexAlgorithms (key-exchange methods)
+	// #4305 S-4: sshd hardening knobs rendered into the xpf sshd drop-in.
+	Ciphers         []string // sshd Ciphers
+	MACs            []string // sshd MACs
+	ConnectionLimit int      // sshd MaxStartups (0 = unset)
+	// ClientAlive* use presence flags because 0 is a meaningful sshd value
+	// (interval 0 disables keepalives; count-max 0 drops on the first miss).
+	ClientAliveInterval    int
+	ClientAliveIntervalSet bool
+	ClientAliveCountMax    int
+	ClientAliveCountMaxSet bool
+	// ProtocolVersion is recognized but accept-with-advisory: sshd is
+	// SSH-2-only, so v2 is a no-op and any other value gets a compile
+	// advisory (no `Protocol` line is emitted — the directive is gone from
+	// modern sshd).
+	ProtocolVersion string
 }
 
 // WebManagementConfig holds web management settings.

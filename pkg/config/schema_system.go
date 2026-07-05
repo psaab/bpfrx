@@ -400,6 +400,23 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 				placeholder: "<key-exchange-method>",
 				children:    nil,
 			},
+			// #4305 S-4: sshd hardening knobs rendered into the xpf drop-in.
+			// ciphers/macs are free-form algorithm lists (sshd validates the
+			// spellings at reload, so no enum). The numeric knobs are bounded
+			// to the Junos ranges.
+			"ciphers": {desc: "SSH ciphers (sshd Ciphers)", args: 1, multi: true, placeholder: "<cipher>", children: nil},
+			"macs":    {desc: "SSH message-authentication codes (sshd MACs)", args: 1, multi: true, placeholder: "<mac>", children: nil},
+			"connection-limit": {desc: "Maximum concurrent SSH connections (sshd MaxStartups)", args: 1, placeholder: "<limit>",
+				valueType: ValueInteger, valueDesc: "1-250", validator: ValidateInteger(1, 250), children: nil},
+			"rate-limit": {desc: "SSH connection attempts per minute", args: 1, placeholder: "<limit>",
+				valueType: ValueInteger, valueDesc: "1-250", validator: ValidateInteger(1, 250), children: nil},
+			"client-alive-interval": {desc: "sshd ClientAliveInterval (seconds; 0 disables)", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "0-65535", validator: ValidateInteger(0, 65535), children: nil},
+			"client-alive-count-max": {desc: "sshd ClientAliveCountMax", args: 1, placeholder: "<count>",
+				valueType: ValueInteger, valueDesc: "0-255", validator: ValidateInteger(0, 255), children: nil},
+			"protocol-version": {desc: "SSH protocol version (sshd is SSH-2 only)", args: 1, placeholder: "<version>",
+				valueType: ValueEnumOf, valueDesc: "v1 | v2", valueExamples: []string{"v2"},
+				validator: ValidateEnum([]string{"v1", "v2"}), children: nil},
 		}},
 		"netconf": {desc: "NETCONF service", children: map[string]*schemaNode{
 			"ssh": {desc: "NETCONF over SSH", children: nil},

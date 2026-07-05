@@ -1,3 +1,20 @@
+## 2026-07-05 — system: fable-167 S-4 implement SSH hardening knobs (#4305)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4305 (S-4) — `system services ssh` ciphers/macs/
+    connection-limit/client-alive-interval/client-alive-count-max/
+    protocol-version were silently inert (the SSH compiler read only
+    root-login + key-exchange). Added the schema leaves, parsed them into
+    `SSHServiceConfig`, and rendered Ciphers/MACs/MaxStartups/
+    ClientAliveInterval/ClientAliveCountMax into the sshd drop-in
+    (`buildSSHDConfig`). protocol-version is accept-with-advisory (sshd is
+    SSH-2 only). client-alive-* use presence flags (0 is meaningful).
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_system.go,
+    pkg/config/schema_system.go, pkg/config/compiler.go,
+    pkg/daemon/daemon_system.go,
+    pkg/config/compiler_ssh_hardening_4305_test.go,
+    pkg/daemon/daemon_ssh_test.go, docs/config-schema.md
+
 ## 2026-07-05 — system: fable-167 S-2 accept custom `system login class <name>` (#4304)
 
 - **Timestamp**: 2026-07-05

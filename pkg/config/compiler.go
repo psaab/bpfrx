@@ -4080,6 +4080,11 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// model and which sub-statements are recognized-but-not-enforced.
 	cfg.Warnings = append(cfg.Warnings, loginClassAdvisoryWarnings(cfg)...)
 
+	// #4305 S-4: SSH hardening knobs are rendered into the sshd drop-in; the
+	// ones sshd cannot honor (protocol-version on an SSH-2-only daemon) get an
+	// advisory instead of silently doing nothing.
+	cfg.Warnings = append(cfg.Warnings, sshHardeningAdvisoryWarnings(cfg)...)
+
 	// #1539: the structural invariant `cfg.System.DPDKDataplane = nil`
 	// was added on master (PR #1553) as a runtime safeguard against
 	// AST leakage of retired DPDK sub-tree fields. After this PR

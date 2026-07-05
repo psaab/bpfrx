@@ -1193,6 +1193,27 @@ func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
 	if len(ssh.KeyExchange) > 0 {
 		lines = append(lines, "KexAlgorithms "+strings.Join(ssh.KeyExchange, ","))
 	}
+	// #4305 S-4: sshd hardening knobs. sshd validates the algorithm
+	// spellings and numeric ranges at reload, so xpf renders them verbatim
+	// (a bad value fails the reload, which applySSHConfig reverts).
+	if len(ssh.Ciphers) > 0 {
+		lines = append(lines, "Ciphers "+strings.Join(ssh.Ciphers, ","))
+	}
+	if len(ssh.MACs) > 0 {
+		lines = append(lines, "MACs "+strings.Join(ssh.MACs, ","))
+	}
+	if ssh.ConnectionLimit > 0 {
+		// Junos `connection-limit` bounds concurrent sessions; sshd's
+		// nearest knob is MaxStartups (concurrent unauthenticated
+		// connections). Not an exact equivalent, but the standard mapping.
+		lines = append(lines, fmt.Sprintf("MaxStartups %d", ssh.ConnectionLimit))
+	}
+	if ssh.ClientAliveIntervalSet {
+		lines = append(lines, fmt.Sprintf("ClientAliveInterval %d", ssh.ClientAliveInterval))
+	}
+	if ssh.ClientAliveCountMaxSet {
+		lines = append(lines, fmt.Sprintf("ClientAliveCountMax %d", ssh.ClientAliveCountMax))
+	}
 	if len(lines) == 0 {
 		return ""
 	}

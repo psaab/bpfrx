@@ -413,3 +413,40 @@ func TestApplySSHConfig_NoChange(t *testing.T) {
 		t.Errorf("unexpected reload on no-change: %d", r.reloads)
 	}
 }
+
+// TestBuildSSHDConfigHardeningKnobs is the RED-on-revert guard for #4305 S-4:
+// the ciphers/macs/connection-limit/client-alive-* hardening knobs must render
+// into the sshd drop-in. Before the fix buildSSHDConfig read only root-login +
+// key-exchange, so these committed clean and never reached sshd.
+func TestBuildSSHDConfigHardeningKnobs(t *testing.T) {
+	ssh := &config.SSHServiceConfig{
+		Ciphers:                []string{"aes256-gcm@openssh.com", "chacha20-poly1305@openssh.com"},
+		MACs:                   []string{"hmac-sha2-512-etm@openssh.com"},
+		ConnectionLimit:        10,
+		ClientAliveInterval:    120,
+		ClientAliveIntervalSet: true,
+		ClientAliveCountMax:    0,
+		ClientAliveCountMaxSet: true,
+	}
+	got := buildSSHDConfig(ssh)
+	for _, want := range []string{
+		"Ciphers aes256-gcm@openssh.com,chacha20-poly1305@openssh.com",
+		"MACs hmac-sha2-512-etm@openssh.com",
+		"MaxStartups 10",
+		"ClientAliveInterval 120",
+		"ClientAliveCountMax 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("buildSSHDConfig missing %q; got:\n%s", want, got)
+		}
+	}
+}
+
+// TestBuildSSHDConfigClientAlivePresence proves the presence flags: a config
+// with ClientAliveCountMaxSet=false must NOT emit a ClientAliveCountMax line,
+// so "unset" is distinguishable from an explicit 0.
+func TestBuildSSHDConfigClientAlivePresence(t *testing.T) {
+	if got := buildSSHDConfig(&config.SSHServiceConfig{ClientAliveCountMax: 0}); strings.Contains(got, "ClientAliveCountMax") {
+		t.Errorf("unset ClientAliveCountMax should not render; got:\n%s", got)
+	}
+}
