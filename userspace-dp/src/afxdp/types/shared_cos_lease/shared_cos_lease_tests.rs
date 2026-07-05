@@ -63,6 +63,25 @@ fn shared_cos_lease_state_is_cacheline_aligned() {
 }
 
 #[test]
+fn vtime_publish_clamps_below_not_participating_sentinel() {
+    // #4269 (R-8b): a saturated live vtime must NEVER be published as the
+    // NOT_PARTICIPATING sentinel (u64::MAX), or peers would skip a
+    // participating worker in the V_min reduction. publish() clamps to
+    // MAX-1, so the slot reads back as participating.
+    let slot = PaddedVtimeSlot::not_participating();
+    slot.publish(u64::MAX);
+    assert_eq!(
+        slot.read(),
+        Some(NOT_PARTICIPATING - 1),
+        "u64::MAX vtime must clamp to the participating value MAX-1, not the sentinel"
+    );
+    // A below-boundary value passes through unchanged.
+    let slot2 = PaddedVtimeSlot::not_participating();
+    slot2.publish(4242);
+    assert_eq!(slot2.read(), Some(4242));
+}
+
+#[test]
 fn shared_cos_lease_config_clamps_burst_to_packed_range() {
     let lease = SharedCoSRootLease::new(10_000_000, u64::MAX, 1);
     assert_eq!(lease.config.burst_bytes, u32::MAX as u64);

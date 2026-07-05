@@ -1564,3 +1564,42 @@ fn cos_flow_aware_buffer_limit_delay_cap_scales_linearly_with_rate() {
          (1 Gbps → {cap_1g}, 10 Gbps → {cap_10g})"
     );
 }
+
+#[test]
+fn clamp_flow_share_to_buffer_never_panics_below_min_share() {
+    // #4269 (R-8c): buffer_limit below the 24 KB min-share floor is legal
+    // config (`buffer-size 16k`). The old `clamp(MIN, buffer_limit)` form
+    // panicked (min > max); the panic-free form caps at buffer_limit.
+    let buffer_limit = 16 * 1024; // 16k, below COS_FLOW_FAIR_MIN_SHARE_BYTES (24000)
+    assert!(buffer_limit < COS_FLOW_FAIR_MIN_SHARE_BYTES);
+    // Any value clamps into [min(floor, buffer_limit), buffer_limit] without
+    // panicking; a value above the aggregate caps at the aggregate.
+    assert_eq!(
+        clamp_flow_share_to_buffer(1_000_000, buffer_limit),
+        buffer_limit
+    );
+    assert_eq!(clamp_flow_share_to_buffer(0, buffer_limit), buffer_limit);
+    assert_eq!(clamp_flow_share_to_buffer(4096, buffer_limit), buffer_limit);
+}
+
+#[test]
+fn clamp_flow_share_to_buffer_matches_clamp_when_buffer_above_floor() {
+    // Above the floor the helper is exactly clamp(MIN, buffer_limit).
+    let buffer_limit = 200 * 1024;
+    assert!(buffer_limit >= COS_FLOW_FAIR_MIN_SHARE_BYTES);
+    assert_eq!(
+        clamp_flow_share_to_buffer(1_000, buffer_limit),
+        COS_FLOW_FAIR_MIN_SHARE_BYTES,
+        "below-floor value clamps up to the min-share floor"
+    );
+    assert_eq!(
+        clamp_flow_share_to_buffer(1_000_000, buffer_limit),
+        buffer_limit,
+        "above-aggregate value clamps down to buffer_limit"
+    );
+    assert_eq!(
+        clamp_flow_share_to_buffer(100 * 1024, buffer_limit),
+        100 * 1024,
+        "in-range value passes through"
+    );
+}

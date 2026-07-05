@@ -138,6 +138,22 @@ pub(in crate::afxdp) fn bdp_floor_bytes(transmit_rate_bytes: u64, active_flows: 
     per_flow_rate.saturating_mul(RTT_TARGET_NS) / 1_000_000_000
 }
 
+/// #4269 (R-8c): panic-free equivalent of
+/// `value.clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit)`.
+///
+/// `u64::clamp(min, max)` PANICS when `min > max`. That fires when
+/// `buffer_limit < COS_FLOW_FAIR_MIN_SHARE_BYTES` (24 KB), which is a
+/// LEGAL operator configuration (`set class-of-service ... buffer-size
+/// 16k`). When the aggregate queue buffer is smaller than the per-flow
+/// min-share floor, the aggregate ceiling is the binding constraint, so
+/// the per-flow cap is `buffer_limit` itself. Lowering the floor to
+/// `min(floor, buffer_limit)` keeps `lo <= hi` for every input.
+#[inline]
+fn clamp_flow_share_to_buffer(value: u64, buffer_limit: u64) -> u64 {
+    let floor = COS_FLOW_FAIR_MIN_SHARE_BYTES.min(buffer_limit);
+    value.clamp(floor, buffer_limit)
+}
+
 #[inline]
 pub(in crate::afxdp) fn cos_queue_flow_share_limit(
     queue: &CoSQueueRuntime,
@@ -187,15 +203,15 @@ pub(in crate::afxdp) fn cos_queue_flow_share_limit(
         // div_ceil for that reason; shared_exact should follow.
         let fair_share = buffer_limit.div_ceil(prospective.max(1));
         let bdp = bdp_floor_bytes(queue.transmit_rate_bytes(), prospective);
-        return fair_share
-            .saturating_mul(SHARED_EXACT_BURST_HEADROOM)
-            .max(bdp)
-            .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit);
+        return clamp_flow_share_to_buffer(
+            fair_share
+                .saturating_mul(SHARED_EXACT_BURST_HEADROOM)
+                .max(bdp),
+            buffer_limit,
+        );
     }
     let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
-    buffer_limit
-        .div_ceil(prospective_active)
-        .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit)
+    clamp_flow_share_to_buffer(buffer_limit.div_ceil(prospective_active), buffer_limit)
 }
 
 /// Effective buffer cap for the admission check. Grows with the
