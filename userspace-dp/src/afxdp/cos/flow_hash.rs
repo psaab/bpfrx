@@ -73,12 +73,40 @@ pub(in crate::afxdp) fn cos_item_flow_key(item: &CoSPendingTxItem) -> Option<&Se
     }
 }
 
+/// #hb166 T-7: dedicated SFQ lane for keyless / flowless traffic
+/// (non-TCP/UDP frames, pre-session packets — anything with no
+/// `SessionKey`). Reserving a fixed bucket keeps all such items in ONE
+/// lane (the anti-splay intent of #693, so they don't inflate
+/// `active_flow_buckets`) WITHOUT sharing that lane with a real 5-tuple
+/// flow that happens to hash to the same slot. The pre-fix code routed
+/// BOTH keyless AND any real flow whose salted hash masked onto bucket 0
+/// into bucket 0, so one unlucky victim flow contended for SFQ
+/// virtual-finish time against ALL keyless traffic.
+pub(in crate::afxdp) const COS_FLOW_FAIR_KEYLESS_BUCKET: usize = 0;
+
+/// Fallback lane for the rare real flow whose salted hash masks onto the
+/// reserved keyless bucket. Steering it to bucket 1 adds at most a
+/// 1-in-`COS_FLOW_FAIR_BUCKETS` skew to bucket 1's occupancy — negligible
+/// for SFQ — and is strictly better than diluting the victim flow's share
+/// with keyless traffic.
+const COS_FLOW_FAIR_KEYLESS_REAL_FALLBACK: usize = 1;
+
 #[inline(always)]
 pub(in crate::afxdp) fn cos_flow_bucket_index(
     queue_seed: u64,
     flow_key: Option<&SessionKey>,
 ) -> usize {
-    usize::from(exact_cos_flow_bucket(queue_seed, flow_key)) & COS_FLOW_FAIR_BUCKET_MASK
+    if flow_key.is_none() {
+        return COS_FLOW_FAIR_KEYLESS_BUCKET;
+    }
+    let idx = usize::from(exact_cos_flow_bucket(queue_seed, flow_key)) & COS_FLOW_FAIR_BUCKET_MASK;
+    // Reserve the keyless lane: a real flow that masks onto it is steered
+    // to a dedicated fallback bucket instead of colliding with keyless.
+    if idx == COS_FLOW_FAIR_KEYLESS_BUCKET {
+        COS_FLOW_FAIR_KEYLESS_REAL_FALLBACK
+    } else {
+        idx
+    }
 }
 
 /// Prospective distinct-flow count: current `active_flow_buckets` plus

@@ -86,12 +86,41 @@ fn exact_cos_flow_bucket_preserves_legacy_behavior_at_zero_seed() {
 #[test]
 fn exact_cos_flow_bucket_handles_missing_flow_key() {
     // An item without a flow_key (e.g. a non-TCP/UDP frame, or a
-    // pre-session packet) must still produce a valid bucket. Pick
-    // bucket 0 deterministically so these items share one SFQ lane
-    // rather than splaying across the ring and inflating
-    // active_flow_buckets.
-    assert_eq!(cos_flow_bucket_index(0, None), 0);
-    assert_eq!(cos_flow_bucket_index(0x1234_5678_9abc_def0, None), 0);
+    // pre-session packet) must still produce a valid bucket. All keyless
+    // items share ONE dedicated SFQ lane rather than splaying across the
+    // ring and inflating active_flow_buckets — the reserved keyless
+    // bucket, independent of the queue seed.
+    assert_eq!(cos_flow_bucket_index(0, None), COS_FLOW_FAIR_KEYLESS_BUCKET);
+    assert_eq!(
+        cos_flow_bucket_index(0x1234_5678_9abc_def0, None),
+        COS_FLOW_FAIR_KEYLESS_BUCKET
+    );
+}
+
+#[test]
+fn keyless_lane_is_reserved_from_real_flows() {
+    // #hb166 T-7: no real 5-tuple flow may land on the reserved keyless
+    // SFQ lane, so keyless traffic never dilutes a real flow's fair
+    // share. Pre-fix, real flows masked into the keyless bucket with
+    // probability 1/COS_FLOW_FAIR_BUCKETS, so scanning this many
+    // (seed, flow) pairs is virtually certain to hit it on the un-fixed
+    // code (RED-on-revert); the fix steers every such flow off the
+    // reserved bucket onto the fallback lane.
+    let mut real_flows_on_reserved = 0usize;
+    for seed in 0u64..64 {
+        for port in 0u16..2048 {
+            let flow = test_session_key(10_000 + port, 5201);
+            if cos_flow_bucket_index(seed, Some(&flow)) == COS_FLOW_FAIR_KEYLESS_BUCKET {
+                real_flows_on_reserved += 1;
+            }
+        }
+    }
+    assert_eq!(
+        real_flows_on_reserved, 0,
+        "a real 5-tuple flow landed on the reserved keyless SFQ bucket {} \
+         ({} of 131072 scanned flows)",
+        COS_FLOW_FAIR_KEYLESS_BUCKET, real_flows_on_reserved
+    );
 }
 
 #[test]

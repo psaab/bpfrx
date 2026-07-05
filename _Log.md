@@ -35219,3 +35219,66 @@ top.
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   pkg/dataplane/userspace/protocol.go,
   docs/fairness-regimes.md, _Log.md
+
+## 2026-07-05 — fable-166 T-7 (TX-path LOW cluster + stats-that-lie) + R-6 re-verify
+
+- **Timestamp**: 2026-07-05
+- **Action**: Drove fable-166 T-7 grouped LOW cluster — fixed 8 READY
+  sub-items, deferred the design ones, plus re-verified R-6 (confirmed
+  NOT-MATERIAL). Branch `fix/hb166-t7-low-cluster`.
+- **Fixes (each with a RED-on-revert test)**:
+    - head-finish u64::MAX sentinel: `cos_queue_min_finish_bucket[_no_cap]`
+      gate on `is_none()` so a saturated head-finish bucket stays
+      selectable (distinct from R-8(b)/#4271 vtime sentinel).
+    - snapshot-push-before-fallible-pop: reorder pop before snapshot push
+      in `cos_queue_pop_known_bucket_inner` (avoid release-mode panic).
+    - keyless SFQ bucket: reserve a dedicated keyless lane; steer real
+      flows off it (`cos_flow_bucket_index`).
+    - pcp fail-closed: `resolve_cos_ieee8021_classifier_queue_id` returns
+      None for pcp>7 instead of `.min(7)` clamp (#2447 posture).
+    - unknown scheduler priority fail-closed: `cos_priority_rank` → Option,
+      new `SnapshotIntegrityError::CosUnknownSchedulerPriority` (#2458
+      mirror).
+    - buffer_bytes N× inflation: MAX not SUM across worker instances
+      (worker + coordinator folds).
+    - defensive None arms leak: 2 flow-fair local scratch None arms recycle
+      free_tx_frames offsets (queue_service).
+    - dead deferred-CoS dispatch path deletion (dispatch/mod.rs + cos.rs +
+      test), carrying 2 latent bugs.
+- **R-6**: confirmed NOT-MATERIAL — shared-consume bounds the long-run
+  rate; budget==0 gate hard-stops surplus; bounded transient burst only.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_ops/{mod,pop,fused_diff_tests}.rs,
+  userspace-dp/src/afxdp/cos/flow_hash{,_tests}.rs,
+  userspace-dp/src/afxdp/tx/cos_classify{,_tests}.rs,
+  userspace-dp/src/afxdp/worker/cos/{queue_row,tests}.rs,
+  userspace-dp/src/afxdp/coordinator/{cos_leases,tests}.rs,
+  userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/forwarding_build/{cos,tests}.rs,
+  userspace-dp/src/afxdp/cos/queue_service/{mod,tests}.rs,
+  userspace-dp/src/afxdp/tx/dispatch/{mod,cos,dispatch_tests}.rs,
+  userspace-dp/src/afxdp/cos/README.md, _Log.md
+
+## 2026-07-05 — fable-166 T-7 hostile-review fold (M1 doc + M2 dead field)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Folded the two non-blocking MINOR items from the PR #4284
+  hostile review (MERGE-NEEDS-MINOR).
+    - **M2**: removed `PendingForwardRequest.filter_match_extra` — the #8
+      dead-path deletion left it write-only (sole reader was the deleted
+      `resolve_pending_forward_cos_tx_selection`). Removed the field def,
+      all 4 population sites (forward_request.rs, icmp.rs,
+      poll_descriptor/mod.rs, dispatch_tests.rs), and the now-pointless
+      per-forwarded-packet `term_match_extra_from_frame(..).to_static()`
+      snapshot. Confirmed zero `.filter_match_extra` read access; the
+      poll_descriptor:3922 local of the same name is the unrelated
+      flow-cache-log arg to `evaluate_non_pbr_input_filter_log_only`.
+    - **M1**: corrected 2 stale refs in `src/filter/README.md` to the
+      deleted symbol/field, including the affirmatively-false "reject bit
+      available there for a future wiring" claim.
+- **Validation**: cargo build --release clean; FULL cargo test --release
+  (--test-threads=1) 0 failed (3578+54+8+22+1).
+- **File(s)**: userspace-dp/src/afxdp/types/tx.rs,
+  userspace-dp/src/afxdp/forward_request.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+  userspace-dp/src/filter/README.md, _Log.md

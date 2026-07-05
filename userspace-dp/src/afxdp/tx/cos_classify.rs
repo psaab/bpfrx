@@ -669,7 +669,14 @@ fn resolve_cos_ieee8021_classifier_queue_id(
     if !vlan_present {
         return None;
     }
-    let queue_id = iface.ieee8021_queue_by_pcp[usize::from(pcp.min(7))];
+    // #hb166 T-7: fail-closed on an out-of-range PCP instead of the
+    // pre-fix `pcp.min(7)` clamp, which silently misclassified any value
+    // >7 as the PCP-7 traffic class — the exact fail-OPEN the #2447
+    // build-side gate refuses (see forwarding_build/cos.rs). The wire PCP
+    // field is structurally 3-bit, so this guards only a malformed shim
+    // meta / version drift: a bad value falls through to the default
+    // queue (None) rather than being routed to the wrong class.
+    let queue_id = *iface.ieee8021_queue_by_pcp.get(usize::from(pcp))?;
     (queue_id != u8::MAX).then_some(queue_id)
 }
 

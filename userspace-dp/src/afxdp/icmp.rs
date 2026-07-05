@@ -266,12 +266,9 @@ pub(super) fn build_local_time_exceeded_request(
         cos_queue_id: verdict.cos_queue_id,
         dscp_rewrite: verdict.dscp_rewrite,
         cos_tx_selection_resolved: true,
-        // #2362 fold B: TX-selection already resolved above via
-        // classify_generated_reply (which read the prebuilt frame), so the
-        // deferred recompute path is never taken for this request — Default is
-        // unused. The prebuilt frame was moved into `frame`, so it cannot be
-        // re-read here regardless.
-        filter_match_extra: crate::filter::TermMatchExtra::default(),
+        // #hb166 T-7: `filter_match_extra` removed (was write-only; the
+        // deferred recompute that consumed it is deleted). TX selection is
+        // already resolved above via `classify_generated_reply`.
     })
 }
 

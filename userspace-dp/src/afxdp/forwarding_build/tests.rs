@@ -612,6 +612,67 @@ fn build_cos_state_fails_closed_on_unknown_equal_flow_target_policy() {
 }
 
 #[test]
+fn build_cos_state_fails_closed_on_unknown_scheduler_priority() {
+    // #hb166 T-7: a scheduler carrying a NON-EMPTY `priority` string that
+    // is not a known Junos scheduler priority fails the snapshot CLOSED
+    // (the helper-boundary backstop for a typo / version-drifted snapshot)
+    // rather than silently ranking it lowest ("low") — mirroring the #2458
+    // equal-flow-policy backstop a few fields over. RED-on-revert: the
+    // pre-fix `_ => 5` catch-all returned `Ok` with the class demoted to
+    // rank 5.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "fc-bad".into(),
+                queue: 4,
+            }],
+            schedulers: vec![CoSSchedulerSnapshot {
+                name: "s-bad".into(),
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                transmit_rate_exact: true,
+                priority: "hgh".into(),
+                buffer_size_bytes: 128 * 1024,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            }],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "fc-bad".into(),
+                    scheduler: "s-bad".into(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+
+    match super::cos::build_cos_state(&snapshot) {
+        Err(crate::policy::SnapshotIntegrityError::CosUnknownSchedulerPriority {
+            forwarding_class,
+            priority,
+        }) => {
+            assert_eq!(forwarding_class, "fc-bad");
+            assert_eq!(priority, "hgh");
+        }
+        Err(other) => panic!("wrong integrity error: {other}"),
+        Ok(_) => panic!("unknown scheduler priority must fail the snapshot closed"),
+    }
+}
+
+#[test]
 fn build_cos_state_falls_back_to_default_best_effort_queue() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {

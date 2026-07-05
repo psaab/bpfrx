@@ -266,7 +266,11 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                     .flow_fair_buckets_occupied
                     .saturating_add(queue.flow_fair_buckets_occupied);
                 q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
-                q.buffer_bytes = q.buffer_bytes.saturating_add(queue.buffer_bytes);
+                // #hb166 T-7: MAX, not SUM — `buffer_bytes` is a per-queue
+                // CONFIG value identical across workers; summing reported N×
+                // the configured buffer. Matches the worker-side fold in
+                // queue_row.rs and the `transmit_rate_bytes` MAX above.
+                q.buffer_bytes = q.buffer_bytes.max(queue.buffer_bytes);
                 q.worker_instances = q.worker_instances.saturating_add(queue.worker_instances);
                 q.queued_packets = q.queued_packets.saturating_add(queue.queued_packets);
                 q.queued_bytes = q.queued_bytes.saturating_add(queue.queued_bytes);

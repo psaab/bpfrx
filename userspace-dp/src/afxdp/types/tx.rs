@@ -85,22 +85,15 @@ pub(in crate::afxdp) struct PendingForwardRequest {
     pub(in crate::afxdp) cos_queue_id: Option<u8>,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
     pub(in crate::afxdp) cos_tx_selection_resolved: bool,
-    /// #2362 fold B: the per-packet L4 firewall-filter match inputs (tcp-flags
-    /// / is-fragment / icmp-type / icmp-code), captured from the live frame at
-    /// request-build time. The deferred TX-selection / CoS path
-    /// (resolve_pending_forward_cos_tx_selection) runs after the UMEM frame may
-    /// have been recycled, so it cannot re-read the frame — it consumes this
-    /// snapshot. Built fragment-safe (a non-first fragment zeroes the
-    /// L4-derived fields). Default for non-frame-derived requests.
-    ///
-    /// #3077: this is a `'static` snapshot — it carries NO borrowed frame slice.
-    /// The deferred CoS/TX-selection path runs after the UMEM frame may be
-    /// recycled, so the flexible-match-range byte-offset condition cannot be
-    /// re-evaluated and fails closed here (under-matches → default
-    /// forwarding-class). Use `TermMatchExtra::to_static()` to build this from a
-    /// frame-derived value. The security ACCEPT/DISCARD decision is taken on the
-    /// immediate filter-eval path, which retains the live slice.
-    pub(in crate::afxdp) filter_match_extra: crate::filter::TermMatchExtra<'static>,
+    // #hb166 T-7: the `filter_match_extra` snapshot field was removed. Its
+    // sole reader was the deferred TX-selection / CoS dispatch path
+    // (`resolve_pending_forward_cos_tx_selection`), which was deleted as
+    // dead code — every request is built with `cos_tx_selection_resolved =
+    // true`, so CoS TX selection is always resolved upstream at build time
+    // (via `resolve_cos_tx_selection_at`, which reads the LIVE frame). With
+    // no reader, the field was write-only and its per-request
+    // `term_match_extra_from_frame(..).to_static()` snapshot was wasted
+    // work on every forwarded packet.
 }
 
 pub(in crate::afxdp) struct PreparedTxRequest {

@@ -88,6 +88,13 @@ mod.rs for further file-level breakdown.
   the residual/best-effort
   queue-level → flow-level item from the #1731 research plan (its
   finding #7; NOT GitHub issue #7, which is an unrelated SNAT bug).
+  Both scans (cap-aware and no-cap) gate their "chosen bucket" on
+  `Option::is_none()`, NOT a bare `finish < best` compare against a
+  `best = u64::MAX` seed (#hb166 T-7): a `flow_bucket_head_finish_bytes`
+  that ever SATURATES to `u64::MAX` would otherwise be indistinguishable
+  from the not-found sentinel and become a permanently unselectable
+  active bucket whose packets never drain. This mirrors the R-8(b)/#4271
+  vtime-sentinel clamp for the head-finish domain #4271 did not cover.
 - Single-writer per FlowFairState. The owner worker that polls a
   binding is the same worker that owns the queue's
   `FlowFairState`; therefore `observed_bps` updates and reads do not

@@ -75,9 +75,12 @@ pub(super) fn accumulate_queue_row(
     status.exact = queue.config.exact;
     status.guarantee_enabled = queue.config.guarantee_enabled;
     status.transmit_rate_bytes = status.transmit_rate_bytes.max(queue.transmit_rate_bytes());
-    status.buffer_bytes = status
-        .buffer_bytes
-        .saturating_add(queue.config.buffer_bytes);
+    // #hb166 T-7: `buffer_bytes` is a per-queue CONFIG value, identical on
+    // every worker-instance of the queue. Aggregate by MAX (like
+    // `transmit_rate_bytes` above), NOT saturating_add — summing reported
+    // N× the configured buffer for an N-worker queue (a "stats-that-lie"
+    // inflation). The coordinator-side fold uses MAX to match.
+    status.buffer_bytes = status.buffer_bytes.max(queue.config.buffer_bytes);
     status.worker_instances = status.worker_instances.saturating_add(1);
     status.queued_packets = status
         .queued_packets

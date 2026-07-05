@@ -38,8 +38,7 @@ mod slow_path;
 
 use cos::{
     cos_owner_live_for_request, enqueue_local_request_to_target_or_owner,
-    pending_forward_needs_cos_tx_selection, request_runs_under_shared_exact_policy,
-    resolve_pending_forward_cos_tx_selection,
+    request_runs_under_shared_exact_policy,
 };
 pub(in crate::afxdp) use shared_recycle::{
     apply_shared_recycles, apply_shared_recycles_to_bindings, resolve_tx_binding_ifindex,
@@ -148,8 +147,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
         return;
     }
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
-    let tx_selection_enabled_v4 = forwarding.tx_selection_enabled_v4;
-    let tx_selection_enabled_v6 = forwarding.tx_selection_enabled_v6;
     post_recycles.clear();
     // Walk the scratch vector in place. Moving large PendingForwardRequest
     // values through the iterator path was still forcing per-request memcpy
@@ -157,20 +154,19 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
     for request in pending_forwards.iter_mut() {
         let source_offset = request.desc.addr;
         let ingress_slot = ingress_binding.slot;
-        if pending_forward_needs_cos_tx_selection(
-            request,
-            tx_selection_enabled_v4,
-            tx_selection_enabled_v6,
-        ) {
-            let cos = resolve_pending_forward_cos_tx_selection(forwarding, &request, now_ns);
-            if cos.drop {
-                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                continue;
-            }
-            request.cos_queue_id = cos.queue_id;
-            request.dscp_rewrite = cos.dscp_rewrite;
-            request.cos_tx_selection_resolved = true;
-        }
+        // #hb166 T-7: the deferred CoS-TX-selection resolution that used to
+        // live here was DEAD. Every PendingForwardRequest is constructed
+        // with `cos_tx_selection_resolved = true` (forward_request.rs,
+        // icmp.rs, poll_descriptor/mod.rs), so CoS TX selection is always
+        // resolved upstream and never deferred to this dispatch loop. The
+        // removed block also carried two latent bugs that only mattered if
+        // it ever went live: an UNCONDITIONAL `recycle_ingress_frame` that
+        // mis-/double-recycled Prebuilt/Owned frames (whose `source_offset`
+        // is not a live ingress frame), and a fully UNCOUNTED drop (no
+        // tx_errors / CoS drop / fabric_redirect_unsendable_drops). Deleting
+        // the dead path drops both. The `cos_tx_selection_resolved` field is
+        // retained as the load-bearing invariant marker (asserted by the
+        // constructor tests).
         let target_binding_index = request.target_binding_index.or_else(|| {
             binding_lookup.target_index(
                 ingress_index,

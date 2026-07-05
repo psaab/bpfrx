@@ -4056,3 +4056,69 @@ fn nonexact_guarantee_shared_lease_bounds_aggregate_admission_across_workers() {
          (expected ~{expected} B) — the shared lease is over-throttling the class"
     );
 }
+
+// #hb166 T-7: the flow-fair local scratch None arms (queue torn down
+// mid-drain) must recycle the popped `free_tx_frames` UMEM offsets, not
+// leak them. Pre-fix they bare-`.clear()`ed the scratch, unlike the FIFO
+// sibling `settle_exact_local_fifo_submission`. RED-on-revert: the
+// recycled offsets stay absent from `free_tx_frames`.
+fn t7_local_scratch_entry(offset: u64, len: usize) -> (u64, TxRequest) {
+    (
+        offset,
+        TxRequest {
+            bytes: vec![0u8; len],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(5),
+            dscp_rewrite: None,
+            mirror_clone: false,
+            enqueue_ns: 0,
+        },
+    )
+}
+
+#[test]
+fn settle_local_scratch_flow_fair_recycles_offsets_when_queue_gone() {
+    let mut free_tx_frames: VecDeque<u64> = VecDeque::new();
+    let mut scratch_local_tx: Vec<(u64, TxRequest)> =
+        vec![t7_local_scratch_entry(64, 4), t7_local_scratch_entry(128, 4)];
+    let (packets, bytes) = settle_exact_local_scratch_submission_flow_fair(
+        None,
+        &mut free_tx_frames,
+        &mut scratch_local_tx,
+        0,
+        0,
+    );
+    assert_eq!((packets, bytes), (0, 0));
+    assert!(scratch_local_tx.is_empty(), "scratch must be drained");
+    let mut recycled: Vec<u64> = free_tx_frames.into_iter().collect();
+    recycled.sort_unstable();
+    assert_eq!(
+        recycled,
+        vec![64, 128],
+        "both UMEM offsets must be recycled to free_tx_frames, not leaked"
+    );
+}
+
+#[test]
+fn restore_local_scratch_flow_fair_recycles_offsets_when_queue_gone() {
+    let mut free_tx_frames: VecDeque<u64> = VecDeque::new();
+    let mut scratch_local_tx: Vec<(u64, TxRequest)> =
+        vec![t7_local_scratch_entry(64, 4), t7_local_scratch_entry(128, 4)];
+    restore_exact_local_scratch_to_queue_head_flow_fair(
+        None,
+        &mut free_tx_frames,
+        &mut scratch_local_tx,
+    );
+    assert!(scratch_local_tx.is_empty(), "scratch must be drained");
+    let mut recycled: Vec<u64> = free_tx_frames.into_iter().collect();
+    recycled.sort_unstable();
+    assert_eq!(
+        recycled,
+        vec![64, 128],
+        "both UMEM offsets must be recycled to free_tx_frames, not leaked"
+    );
+}

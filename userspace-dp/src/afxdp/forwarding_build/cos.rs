@@ -175,14 +175,20 @@ fn cos_surplus_weight(rate_bytes: u64, root_rate_bytes: u64) -> u32 {
         .clamp(1, 16) as u32
 }
 
-fn cos_priority_rank(priority: &str) -> u8 {
+/// Map a Junos scheduler priority string to an internal strict-priority
+/// rank (0 = highest, 5 = lowest). Returns `None` for an unrecognized
+/// non-empty string so the caller can fail the snapshot CLOSED (#hb166
+/// T-7) — mirroring the #2458 equal-flow-policy parse on the same queue
+/// rather than silently ranking an unknown priority lowest ("low").
+fn cos_priority_rank(priority: &str) -> Option<u8> {
     match priority {
-        "strict-high" => 0,
-        "high" => 1,
-        "medium-high" => 2,
-        "medium" => 3,
-        "medium-low" => 4,
-        _ => 5,
+        "strict-high" => Some(0),
+        "high" => Some(1),
+        "medium-high" => Some(2),
+        "medium" => Some(3),
+        "medium-low" => Some(4),
+        "low" => Some(5),
+        _ => None,
     }
 }
 
@@ -389,11 +395,19 @@ pub(super) fn build_cos_iface_config(
             queues.push(CoSQueueConfig {
                 queue_id,
                 forwarding_class: entry.forwarding_class.clone(),
-                priority: cos_priority_rank(
-                    scheduler
-                        .map(|sched| sched.priority.as_str())
-                        .unwrap_or("low"),
-                ),
+                // #hb166 T-7: fail-closed on an unknown non-empty priority
+                // (mirrors the #2458 equal-flow-policy parse above). A
+                // missing scheduler, or one with an empty (unset) priority
+                // string, keeps the byte-unchanged legacy "low" default.
+                priority: match scheduler.map(|sched| sched.priority.as_str()) {
+                    Some(p) if !p.is_empty() => cos_priority_rank(p).ok_or_else(|| {
+                        crate::policy::SnapshotIntegrityError::CosUnknownSchedulerPriority {
+                            forwarding_class: entry.forwarding_class.clone(),
+                            priority: p.to_string(),
+                        }
+                    })?,
+                    _ => 5,
+                },
                 transmit_rate_bytes,
                 guarantee_enabled,
                 exact: scheduler
@@ -511,7 +525,7 @@ pub(super) fn build_cos_iface_config(
         queues.push(CoSQueueConfig {
             queue_id: 0,
             forwarding_class: "best-effort".to_string(),
-            priority: cos_priority_rank("low"),
+            priority: cos_priority_rank("low").expect("\"low\" is a known scheduler priority"),
             transmit_rate_bytes: iface.cos_shaping_rate_bytes_per_sec,
             guarantee_enabled: true,
             exact: false,

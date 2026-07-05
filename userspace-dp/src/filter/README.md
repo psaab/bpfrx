@@ -400,11 +400,14 @@ The L4 byte fields are also zeroed (defense-in-depth) but the gate is the flag.
 The L3-derived `is_fragment` bit is NOT gated by `l4_present` and stays true
 (a non-first fragment IS a fragment). This applies on the
 CoS / TX-selection leg too (`tx/cos_classify.rs`): the TX-selection evaluators
-thread the same `TermMatchExtra`, and the deferred path snapshots it on
-`PendingForwardRequest.filter_match_extra` because the UMEM frame may be
-recycled before the deferred recompute runs. The flow-cache decline (output and
-input legs) keeps the precomputed TX-selection descriptor from being built for a
-per-packet-L4 filter, so the live per-packet evaluator always runs.
+thread the same `TermMatchExtra`, built from the LIVE frame at
+request-build time. The flow-cache decline (output and input legs) keeps
+the precomputed TX-selection descriptor from being built for a
+per-packet-L4 filter, so the live per-packet evaluator always runs. (There
+is no deferred snapshot: the `PendingForwardRequest.filter_match_extra`
+field and the deferred-recompute path that consumed it were removed as
+dead code in #hb166 T-7 — CoS TX selection is always resolved upstream on
+the live frame.)
 
 #2449 also covers a NON-FRAGMENTED but TRUNCATED ICMP/ICMPv6 frame (shorter than
 `l4_offset + 2`, so the type/code bytes are absent): the frame builders force
@@ -841,9 +844,9 @@ deny`.
 
 **Scope (resolved #3608):** output-firewall-filter `then reject` on the
 TX/CoS path is now an active reject too — see the OUTPUT-filter paragraph
-above. The remaining collapse-to-drop site is the deferred-CoS dispatch
-path (`tx/dispatch/mod.rs`, `resolve_pending_forward_cos_tx_selection`),
-which is unreachable in production today (every `PendingForwardRequest` is
-built with `cos_tx_selection_resolved: true`, so the deferred re-resolve
-never runs); the `reject` bit is available there for a future wiring if a
-deferred-CoS request path is ever introduced.
+above. There is no remaining collapse-to-drop site: the deferred-CoS
+dispatch path (`resolve_pending_forward_cos_tx_selection` in
+`tx/dispatch/`) that used to be one was deleted as dead code in #hb166 T-7
+(every `PendingForwardRequest` is built with `cos_tx_selection_resolved:
+true`, so the deferred re-resolve never ran). CoS TX selection — including
+its `reject` bit — is resolved entirely on the live build-time path.
