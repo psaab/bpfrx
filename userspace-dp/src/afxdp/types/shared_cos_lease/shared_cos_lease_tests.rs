@@ -2284,6 +2284,47 @@ fn v8_release_unused_v8_caps_at_worker_grant_preserving_class_total() {
 }
 
 #[test]
+fn v8_release_unused_v8_counter_excludes_step3_noop() {
+    // The #1630 diagnostic counter must count ONLY bytes actually
+    // re-credited to packed_granted. If step 3 (the class-ledger decrement)
+    // no-ops because a rotation swapped the class tag between the
+    // worker-slot claim (step 2) and step 3, release_recredited_bytes must
+    // NOT increment. RED before the conditional-increment fix: the counter
+    // over-reported by `credit`.
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 256 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let g = lease.acquire_v8(0, EPOCH_DURATION_NS, 100_000);
+    assert!(g > 0);
+
+    // Simulate the rotation window: advance packed_granted's tag WITHOUT
+    // touching worker_grants[0] (rotation swaps packed_granted first — at
+    // rotate_epoch_v8 STEP 1 — before the per-worker slots at STEP 3).
+    let worker_grant = {
+        let v8 = lease.v8.as_ref().unwrap();
+        let (t, wg) = PackedEpochGrant::unpack(v8.worker_grants[0].0.load(Ordering::Acquire));
+        v8.epoch.packed_granted.0.store(
+            PackedEpochGrant::pack(t.wrapping_add(1), 500),
+            Ordering::Release,
+        );
+        wg
+    };
+    assert!(worker_grant > 0, "worker slot still carries the grant");
+
+    // Give back: step 2 claims from worker_grants[0] (its own tag matches),
+    // step 3 finds packed_granted at a different tag and no-ops.
+    lease.release_unused_v8(0, worker_grant as u64);
+
+    let v8 = lease.v8.as_ref().unwrap();
+    let (_wt, wg_after) = PackedEpochGrant::unpack(v8.worker_grants[0].0.load(Ordering::Acquire));
+    assert_eq!(wg_after, 0, "step 2 claimed the worker-slot credit");
+    assert_eq!(
+        lease.v8_release_recredited_bytes(),
+        0,
+        "counter must exclude bytes step 3 did not re-credit (rotation window)"
+    );
+}
+
+#[test]
 fn v8_release_unused_v8_concurrent_preserves_ledger_invariant() {
     // N worker threads hammer acquire+release on their own slots within a
     // single epoch (fixed clock -> no rotation). Under ANY interleaving the

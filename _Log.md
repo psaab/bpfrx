@@ -8,7 +8,7 @@
     `worker_grants[worker_id]`, but `release_unused` only decremented the
     legacy word — so released bytes stayed charged, a mid-rate class
     oscillating empty↔backlogged hit ClassCap early and parked to rotation
-    (~94% service). Added `SharedCoSLease::release_unused_v8(worker_id,
+    (~94% service). Added `SharedCoSQueueLease::release_unused_v8(worker_id,
     bytes)` mirroring `tag_checked_rollback`: free the legacy word, claim
     the credit from the worker's current-epoch grant slot via a tag-checked
     CAS (capped at what the slot holds → cross-epoch release safely no-ops;
@@ -33,6 +33,21 @@
     userspace-dp/src/afxdp/cos/token_bucket.rs,
     userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
     docs/fairness-regimes.md, _Log.md
+  - **Follow-up (PR #4253 Copilot fold)**: (comment 3, real bug) the
+    #1630 diagnostic counter `release_recredited_bytes` was incremented
+    unconditionally by `credit` after `tag_checked_rollback`, but that CAS
+    can no-op (rotation between step 2 and step 3, or retry-budget
+    exhaustion) → the counter OVER-REPORTED bytes not actually re-credited
+    to `packed_granted`, skewing the cause-2 falsification test. Fixed:
+    `tag_checked_rollback` now RETURNS the amount it actually decremented
+    (`min(take, curr_granted)` on CAS success, 0 on tag-mismatch/exhaustion;
+    the two acquire-rollback callers ignore it); `release_unused_v8`
+    increments the counter by that actual amount only when > 0. Added
+    `v8_release_unused_v8_counter_excludes_step3_noop` (forces the class
+    ledger to a different tag so step 3 misses → counter stays 0;
+    RED-on-revert). (comments 1+2) corrected the `SharedCoSLease` type name
+    to `SharedCoSQueueLease` in docs/fairness-regimes.md and this log (no
+    `SharedCoSLease` type exists).
 
 ## 2026-07-04 — fable-review-166 T-3 / T-4: TX-path CoS classification fixes (#4243, #4244)
 

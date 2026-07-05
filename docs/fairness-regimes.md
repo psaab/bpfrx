@@ -1460,7 +1460,7 @@ alternative** to (or co-factor of) the transport-physics floor.
   → better. So the discriminator the doc used to rule out a fairness
   defect ("improves with parallelism ⇒ transport physics") does NOT rule
   out T-1.
-- **The fix.** `SharedCoSLease::release_unused_v8(worker_id, bytes)`
+- **The fix.** `SharedCoSQueueLease::release_unused_v8(worker_id, bytes)`
   (`types/shared_cos_lease/lease.rs`) mirrors the acquire path's
   `tag_checked_rollback` CAS discipline: claim the credit from the
   worker's current-epoch grant slot (tag-checked, capped at what the slot
