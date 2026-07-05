@@ -545,6 +545,29 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #4233: `security policies policy-rematch [extensive]` is typed and
+	// recorded (compiler_security_policy.go) but xpf performs NO session
+	// invalidation on commit yet — a session permitted by a since-deleted
+	// or modified policy keeps forwarding until its idle timeout. Junos
+	// re-evaluates in-progress sessions under policy-rematch (and drops the
+	// sessions of a DELETED policy even without it). Warn so the operator is
+	// not silently misled into believing existing sessions are re-checked.
+	// Mirrors the #2078 / #2008 H13 accepted-only doctrine. Enforcement
+	// (the bounded deletion-clear + the modified-policy re-eval) is tracked
+	// as #4234.
+	if cfg.Security.PolicyRematch {
+		knob := "policy-rematch"
+		if cfg.Security.PolicyRematchExtensive {
+			knob = "policy-rematch extensive"
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"security policies %s configured but accepted-only — xpf does not "+
+				"yet re-evaluate or invalidate in-progress sessions on a policy "+
+				"change; a session permitted by a since-deleted/modified policy "+
+				"keeps forwarding until its idle timeout (config-only parity, "+
+				"#4233; enforcement tracked in #4234)", knob))
+	}
+
 	// #3440 H1: `security flow aging` (early-ageout / high-watermark /
 	// low-watermark) drives the Go-side conntrack GC watermark hysteresis
 	// (pkg/conntrack/gc.go), but that GC sweep is skipped entirely whenever

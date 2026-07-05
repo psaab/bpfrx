@@ -108,6 +108,19 @@ type SecurityConfig struct {
 	// there (commit emits a WARNING — validateDefaultPolicyLogWarnings).
 	DefaultPolicyLogSessionInit  bool
 	DefaultPolicyLogSessionClose bool
+	// PolicyRematch / PolicyRematchExtensive carry `security policies
+	// policy-rematch [extensive]` (#4233). In Junos this re-evaluates
+	// in-progress sessions against the changed policy set on commit; xpf
+	// does not yet perform any session invalidation on commit (tracked as
+	// the enforcement feature #4234). The knob is accepted and recorded so
+	// it no longer commits-clean-and-is-silently-dropped, and commit emits
+	// an accepted-only advisory (validateConfig, mirroring the #2078 /
+	// #2008 H13 doctrine). Extensive is the Junos sub-mode that additionally
+	// re-evaluates sessions matched by an unchanged policy when referenced
+	// address-book/application objects change; it is recorded for the same
+	// advisory and future enforcement.
+	PolicyRematch          bool
+	PolicyRematchExtensive bool
 }
 
 // FlowConfig holds flow/session timeout configuration.
