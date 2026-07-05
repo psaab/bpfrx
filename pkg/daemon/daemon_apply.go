@@ -214,6 +214,11 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 		}
 	}
 
+	// Capture the pre-commit active config BEFORE Commit promotes the candidate,
+	// so applyAndSyncCommitted can diff it against the new config and clear the
+	// sessions of any deleted policy (#4234).
+	oldActive := d.store.ActiveConfig()
+
 	var compiled *config.Config
 	var err error
 	if comment != "" {
@@ -224,7 +229,7 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 	if err != nil {
 		return nil, err
 	}
-	return d.applyAndSyncCommitted(compiled, syncPeer)
+	return d.applyAndSyncCommitted(oldActive, compiled, syncPeer)
 }
 
 // applyAndSyncCommitted runs the reconcile pipeline for a config the store has
@@ -247,15 +252,23 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 // from a non-fatal subsystem error that must NOT. On a non-fatal error the
 // committed config is returned alongside the error so the operator sees the
 // failure while the standby still converges.
-func (d *Daemon) applyAndSyncCommitted(compiled *config.Config, syncPeer bool) (*config.Config, error) {
+func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncPeer bool) (*config.Config, error) {
 	applyErr := d.applyConfigLocked(d.applyCancelCtx(), compiled)
 	if applyErrSkipsPeerSync(applyErr) {
 		// Fatal (required-protocol-gate: dataplane disarmed / fail-closed) or a
 		// daemon-stop context abort (#2926 boundary): report failure and do NOT
 		// push. Pushing a disarm-config to the standby is strictly worse, and a
-		// shutdown-aborted apply reconverges on next boot + reverse-sync.
+		// shutdown-aborted apply reconverges on next boot + reverse-sync. Skip the
+		// deletion-clear too: the dataplane is disarmed / tearing down, so there is
+		// no live forwarding state to invalidate.
 		return nil, applyErr
 	}
+	// #4234 Junos-default deletion-clear: the config is committed + active and
+	// the dataplane armed, so any session admitted by a now-deleted policy must
+	// stop forwarding immediately (and be dropped on the standby too) rather than
+	// linger until idle timeout. Runs under d.applySem (the caller holds it),
+	// after the dataplane apply so the new policy set is already live.
+	d.clearSessionsForDeletedPolicies(oldActive, compiled)
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
 	// standby has to receive the committed config or the nodes diverge.
@@ -312,6 +325,13 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 	}
 	defer d.applySem.Release(1)
 
+	// Pre-sync active config for the #4234 deletion-clear (see commitAndApply).
+	// A peer-pushed config that deletes a policy must drop that policy's synced
+	// sessions on THIS node too; the standby is not primary, so its own clear
+	// deletes locally without re-propagating (belt-and-suspenders alongside the
+	// primary's delete-sync).
+	oldActive := d.store.ActiveConfig()
+
 	compiled, err := d.store.SyncApply(configText, chassisPreserve)
 	if err != nil {
 		return nil, err
@@ -320,6 +340,7 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
 			return nil, err
 		}
+		d.clearSessionsForDeletedPolicies(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict
 		// commit can only validate ITS OWN hardware (R-8), so a synced
@@ -385,11 +406,14 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 		}
 	}
 
+	// Pre-commit active config for the #4234 deletion-clear (see commitAndApply).
+	oldActive := d.store.ActiveConfig()
+
 	compiled, err := d.store.CommitConfirmed(minutes)
 	if err != nil {
 		return nil, err
 	}
-	return d.applyAndSyncCommitted(compiled, syncPeer)
+	return d.applyAndSyncCommitted(oldActive, compiled, syncPeer)
 }
 
 // executeConfirmedRollback is the daemon-owned commit-confirmed timeout
@@ -413,6 +437,11 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
+
+	// Pre-rollback active config (the abandoned unconfirmed config, C2) for the
+	// #4234 deletion-clear: a rollback that removes a policy the abandoned commit
+	// added must drop that policy's sessions, same as any commit.
+	oldActive := d.store.ActiveConfig()
 
 	prevCfg, ok := d.store.PromoteRollback(gen)
 	if !ok {
@@ -457,6 +486,7 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	if err := d.applyConfigLocked(context.Background(), prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
 	}
+	d.clearSessionsForDeletedPolicies(oldActive, prevCfg)
 	// #3868: RE-SYNC the rolled-back config (C1) to the cluster peer. The
 	// standby already received the unconfirmed config (C2) via config-sync
 	// SyncApply, which arms NO confirm timer, so it holds C2 as its PERMANENT
