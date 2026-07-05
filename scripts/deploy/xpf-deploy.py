@@ -59,7 +59,26 @@ except ImportError:
     yaml = None
 
 VALID_BACKINGS = {"net", "bridge", "macvlan", "sriov", "physical", "pci"}
+
+# Guest PCI enumeration classes. The guest names interfaces positionally
+# (assignName), but ONLY after enumeratePCINICs() sorts NICs with a
+# virtio-first tiebreaker: sk=0 for driver "virtio_net", sk=1 for
+# everything else, then by PCI bus address (pkg/daemon/linksetup.go). A
+# virtio-backed device (net/bridge/macvlan attach as `virtio_net`) always
+# sorts ahead of a passthrough device (sriov/physical/pci attach as the
+# real hardware driver), regardless of the order the tool attaches them.
+# So the config's list position only equals the guest's vSRX name when
+# every virtio-class NIC precedes every hardware-class NIC.
+VIRTIO_BACKINGS = {"net", "bridge", "macvlan"}
+HARDWARE_BACKINGS = {"sriov", "physical", "pci"}
 SYS_NET = "/sys/class/net"
+
+
+def backing_sort_key(backing):
+    """Guest enumeration sort key for a backing, mirroring the sk=0
+    (virtio) / sk=1 (hardware) tiebreaker in enumeratePCINICs()
+    (pkg/daemon/linksetup.go). Lower sorts earlier in the guest."""
+    return 0 if backing in VIRTIO_BACKINGS else 1
 
 
 def die(msg):
@@ -186,6 +205,33 @@ def validate_appliance(ap, where):
             die(f"{where}: interface {i + 1} declares role '{ic['role']}' but position {i + 1} "
                 f"is '{want}' — reorder or fix; position is the contract.")
         ic["_name"] = want
+
+    # Guest virtio-first tiebreaker (enumeratePCINICs, linksetup.go): the
+    # guest sorts virtio-class NICs ahead of hardware-class ones BEFORE it
+    # assigns positional vSRX names. "Position is the contract" therefore
+    # only holds when the list order already matches that sort — i.e. every
+    # virtio-class NIC precedes every hardware-class one. A virtio-class NIC
+    # listed AFTER a hardware-class NIC would be renamed to an earlier slot
+    # in the guest, silently swapping the zones/policies/NAT bound to those
+    # vSRX names (trust/untrust inversion). Fail closed — the deployer holds
+    # every backing's class, so it can and must catch this (fable-165 H-22).
+    first_hw = None
+    for i, ic in enumerate(ap["interfaces"]):
+        if backing_sort_key(ic["backing"]) == 1:
+            if first_hw is None:
+                first_hw = i
+        elif first_hw is not None:
+            hw = ap["interfaces"][first_hw]
+            die(f"{where}: interface {i + 1} ({ic['backing']}:{ic['source']}, "
+                f"declared '{ic['_name']}') is a virtio-class NIC listed after "
+                f"the hardware-class interface {first_hw + 1} "
+                f"({hw['backing']}:{hw['source']}, declared '{hw['_name']}'). "
+                f"The guest enumerates virtio before hardware "
+                f"(enumeratePCINICs, linksetup.go), so it renames this NIC to "
+                f"an earlier slot and SWAPS the zones on '{ic['_name']}' and "
+                f"'{hw['_name']}'. Reorder so every virtio-class NIC "
+                f"(net/bridge/macvlan) comes before every hardware-class NIC "
+                f"(sriov/physical/pci); position is the contract.")
 
 
 def load_yaml_appliance(path):
