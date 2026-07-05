@@ -659,6 +659,29 @@ impl ScreenState {
         pkt: &ScreenPacketInfo,
         now_secs: u64,
     ) -> ScreenVerdict {
+        self.check_packet_with_zone_id_opts(zone, zone_id, pkt, now_secs, false)
+    }
+
+    /// As `check_packet_with_zone_id`, but `skip_rate_flood` suppresses the
+    /// rate-based flood counters (icmp/udp/syn-flood + SYN-cookie) while still
+    /// running the stateless per-packet screens.
+    ///
+    /// #4155: fabric-redirected traffic in a chassis cluster was already
+    /// rate-screened on the ingress node before it crossed the fabric link.
+    /// The RG owner must NOT re-run the rate counters on that same packet —
+    /// re-counting double-counts it against the per-zone / per-destination
+    /// flood thresholds, so a legit high-pps synced session can false-trip a
+    /// flood Drop and defeat fabric cross-chassis forwarding
+    /// (`docs/fabric-cross-chassis-fwd.md`). The caller passes
+    /// `skip_rate_flood = (meta.meta_flags & FABRIC_INGRESS_FLAG) != 0`.
+    pub fn check_packet_with_zone_id_opts(
+        &mut self,
+        zone: &str,
+        zone_id: u16,
+        pkt: &ScreenPacketInfo,
+        now_secs: u64,
+        skip_rate_flood: bool,
+    ) -> ScreenVerdict {
         // #2209 perf: borrow the profile instead of cloning it. The
         // stateless/rate checks below read `self.profiles` immutably while
         // mutating disjoint per-zone counter fields (`icmp_counters`,
@@ -699,6 +722,25 @@ impl ScreenState {
         }
         if let Some(reason) = stateless::check_source_route(profile, pkt) {
             return ScreenVerdict::Drop(reason);
+        }
+
+        // #4155: fabric-redirected traffic was already rate-screened on the
+        // ingress node before it crossed the fabric link. Skip the rate-based
+        // flood counters (icmp/udp/syn-flood + SYN-cookie) so the same packet
+        // is not counted a SECOND time against the per-zone / per-destination
+        // flood thresholds on the RG owner. Re-counting would let a legit
+        // high-pps synced session false-trip a flood Drop, dropping exactly
+        // the traffic fabric cross-chassis forwarding exists to protect during
+        // failback / asymmetric-routing windows (vSRX does not re-screen
+        // fabric-forwarded traffic). The stateless per-packet screens above
+        // already ran and are idempotent; only the RATE counters must fire
+        // once, on the true ingress node. The per-destination flood sketches
+        // (#4132) are left intact — this skips the re-count, it does not
+        // disable the screen. A `SynCookieBypass` verdict is likewise
+        // suppressed: a fabric-redirected SYN belongs to a session the peer
+        // already admitted, so the owner mints no cookie challenge/bypass.
+        if skip_rate_flood {
+            return ScreenVerdict::Pass;
         }
 
         // --- Rate-based flood checks ---
@@ -966,6 +1008,24 @@ impl ScreenState {
         addrs_known: bool,
         now_secs: u64,
     ) -> ScreenVerdict {
+        self.check_flowless_screens_opts(zone, pkt, addrs_known, now_secs, false)
+    }
+
+    /// As `check_flowless_screens`, but `skip_rate_flood` suppresses the
+    /// source-independent rate-based flood counters (icmp/udp-flood) while
+    /// still running the stateless source-independent screens.
+    ///
+    /// #4155: a fabric-redirected non-first fragment / non-query ICMP control
+    /// message was already rate-screened on the ingress node; the RG owner
+    /// must not re-count it. See `check_packet_with_zone_id_opts`.
+    pub(crate) fn check_flowless_screens_opts(
+        &mut self,
+        zone: &str,
+        pkt: &ScreenPacketInfo,
+        addrs_known: bool,
+        now_secs: u64,
+        skip_rate_flood: bool,
+    ) -> ScreenVerdict {
         let Some(profile) = self.profiles.get(zone) else {
             // #3908: mirror the flow-present `check_packet_with_zone_id` None
             // branch so the flowless path is as observable as the flow path.
@@ -997,6 +1057,13 @@ impl ScreenState {
         }
         if let Some(reason) = stateless::check_source_route(profile, pkt) {
             return ScreenVerdict::Drop(reason);
+        }
+        // #4155: fabric-redirected flowless traffic was already rate-screened
+        // on the ingress node — skip the re-count (see
+        // `check_packet_with_zone_id_opts`). Stateless source-independent
+        // screens above already ran and are idempotent.
+        if skip_rate_flood {
+            return ScreenVerdict::Pass;
         }
         // --- Rate-based flood checks (source-independent, per-zone) ---
         // Copy the scalar thresholds out so the immutable `self.profiles`

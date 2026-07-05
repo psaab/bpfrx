@@ -38,6 +38,96 @@
     pkg/dataplane/userspace/nat_scope_precedence_4161_test.go,
     userspace-dp/src/nat/source.rs,
     docs/userspace-dataplane-architecture.md, _Log.md
+## 2026-07-04 — #4163 (fable-review-164 L-12): DHCP-relay reply source validation
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Closed a rogue-DHCP-reply injection hole in the DHCPv4
+    relay. `handleServerResponses` (`pkg/dhcprelay/relay.go`) forwarded
+    server replies (OFFER/ACK/NAK/FORCERENEW) to clients based on packet
+    contents alone (OpCode==BootReply + relayable MessageType); the
+    reply's source IP was read via `ReadFrom` but used only in a
+    `slog.Debug` line, never validated. The server-facing socket is
+    `ListenPacket("udp4", giaddr:67)` — bound, not `connect()`-ed — so it
+    accepts datagrams from ANY host that can route to `giaddr:67`. An
+    off-path attacker could inject a forged OFFER/ACK (hostile
+    gateway/DNS → MITM) or a forged NAK (client restart).
+  - **Fix**: threaded the already-resolved server set
+    (`servers []*net.UDPAddr`, from `computeDesired` via `runRelaySession`)
+    into `handleServerResponses` (signature + the one call site, ~line
+    1016). Built an IP allow-set once, and before `dhcpv4.FromBytes` drop
+    any reply whose source IP is not a configured server (compared with
+    `net.IP.Equal`; source port not load-bearing), incrementing a new
+    `repliesDroppedUnknownServer` counter (mirrored to
+    `RelayStats.RepliesDroppedUnknownServer`, populated in `Stats()`,
+    surfaced in `show ... dhcp-relay`). Enforced by DEFAULT (RFC 3046
+    relay practice). The drop is LOUD: first drop per session at `Warn`,
+    subsequent at `Debug` (counter is the durable signal — a forged-reply
+    flood cannot spam the log), so the one benign edge (a multi-homed
+    server unicasting from an unlisted source) is diagnosable, not a
+    silent black-hole. An extra-reply-source allow-list knob is a
+    deliberate follow-up, not shipped now. Helpers: `replySourceAllowed`,
+    `udpAddrIP` (handles *net.UDPAddr / *net.IPAddr / string fallback).
+    Existing OpCode/MessageType gates preserved (source check added
+    alongside). DHCPv4-only (no DHCPv6 relay exists).
+  - **Tests**: `pkg/dhcprelay/delivery_test.go` — added
+    configurable-source support to `fakeConn`; new tests: configured
+    source forwarded (counter stays 0); UNCONFIGURED source dropped +
+    counter==1 (RED on revert — under a neutered check the rogue OFFER
+    reaches the client, `repliesForwarded=1`, counter=0, proven);
+    multi-server group accepts from ANY member (2nd member forwarded);
+    configured-source-wrong-OpCode dropped by the OpCode gate WITHOUT
+    counting as an unknown-server drop. `go test ./pkg/dhcprelay/...
+    ./pkg/cli/...` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/delivery_test.go,
+    pkg/dhcprelay/relay_test.go, pkg/cli/cli_show_services.go,
+    pkg/dhcprelay/README.md, _Log.md
+## 2026-07-04 — #4162 (fable-review-164 L-5): /metrics session-walk TTL cache + auth posture
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Closed an unauthenticated-DoS / hot-path-contention
+    vector on the Prometheus `/metrics` endpoint. The seven
+    `xpf_sessions_*` aggregate gauges walked the shared v4+v6 conntrack
+    BPF hash maps (up to ~10M entries, ~20M syscalls each taking a bucket
+    lock) on EVERY scrape, with no cache/throttle and no scrape
+    timeout/concurrency limit — a tight-loop or (when web-management
+    binds a routable interface) unauthenticated remote scraper could
+    amplify that O(sessions) scan against the live forwarding path.
+  - **Fix (B, primary — the DoS)**: added a short-TTL
+    (`sessionGaugeTTL` = 3s), singleflight-coalesced cache around the
+    session-gauge walk (`sessionGaugeSnapshotCached` +
+    `walkSessionGauges` in `pkg/api/metrics_sessions.go`; cache fields on
+    `xpfCollector` in `pkg/api/metrics.go`). A scrape inside the TTL
+    serves the cached seven aggregates (O(1)); the first scrape after it
+    does exactly one refresh walk; `singleflight` collapses concurrent
+    stale scrapes onto ONE in-flight walk. 3s is below the conventional
+    15-60s scrape interval so normal scraping always sees fresh counts
+    while a tight loop is capped at ≤1 walk/3s. The `#2469` fail-loud
+    contract is preserved (walk error → `scrape_ok=0`, gauges omitted,
+    cache NOT poisoned). Also set
+    `promhttp.HandlerOpts{Timeout: 10s, MaxRequestsInFlight: 3}` at the
+    `/metrics` registration (`pkg/api/server.go`).
+  - **Fix (A, secondary — auth posture)**: `/metrics` stays
+    unauthenticated on the loopback default (standard Prometheus
+    posture), but when the HTTP API is rebound to a NON-loopback
+    interface AND auth is configured, `/metrics` now requires credentials
+    like every other endpoint. `authMiddleware` gained a
+    `metricsRequireAuth bool`; `isLoopbackBindAddr(cfg.Addr)` (new, in
+    `pkg/api/auth.go`) drives it — wildcard / hostname / unparseable
+    binds are treated as non-loopback (fail safe: gate rather than
+    expose). `/health` remains always-exempt.
+  - **Tests** (`pkg/api/metrics_sessions_cache_test.go`): walk-once-per-TTL
+    over 25 rapid scrapes (RED on revert — walks == scrapes without the
+    cache), singleflight coalescing of 16 concurrent scrapes onto one walk
+    (RED on revert), refresh-after-TTL-expiry, cached aggregates ==
+    fresh cache-bypassing walk (reverse entries excluded),
+    `isLoopbackBindAddr` classification table, and the non-loopback
+    `/metrics` auth gate (401 without key / 200 with basic or API key /
+    `/health` still open; RED on revert of the unconditional bypass).
+    Existing `authMiddleware` callers updated for the new signature.
+  - **Files**: `pkg/api/metrics_sessions.go`, `pkg/api/metrics.go`,
+    `pkg/api/server.go`, `pkg/api/auth.go`, `pkg/api/auth_test.go`,
+    `pkg/api/auth_consttime_4157_test.go`,
+    `pkg/api/metrics_sessions_cache_test.go`, `docs/architecture.md`.
 
 ## 2026-07-04 — #4157 (fable-review-164 L-6): constant-time API-key/Bearer/username auth
 
@@ -33475,6 +33565,40 @@ top.
     _Log.md
 
 - **Timestamp**: 2026-07-04
+  - **Action**: #4155 (fable-review-164 M-4) — rate-based flood screens re-run
+    on the RG owner for fabric-redirected (already-screened) traffic,
+    double-counting against the per-zone / per-destination flood thresholds. In
+    a chassis cluster a packet ingressing the non-owner node is screened there,
+    fabric-redirected to the owner, and the owner re-ran `stage_screen_check` →
+    the SAME packet ticked the icmp/udp/syn-flood counters a second time, so a
+    legit high-pps synced session could false-trip a flood Drop and defeat
+    fabric cross-chassis forwarding (vSRX does not re-screen fabric traffic).
+    Fix: stage 9 already sets `FABRIC_INGRESS_FLAG` on `meta.meta_flags`;
+    `stage_screen_check` now derives
+    `skip_rate_flood = (meta.meta_flags & FABRIC_INGRESS_FLAG) != 0` and threads
+    it into new `ScreenState::check_packet_with_zone_id_opts` /
+    `check_flowless_screens_opts` entry points (the old signatures are thin
+    wrappers passing `false`, so ~55 existing callers/tests are untouched). When
+    set, the stateless per-packet screens (land, ping-of-death, teardrop,
+    icmp-fragment, source-route) still run — idempotent — and the method returns
+    Pass BEFORE the rate flood counters, so the owner does not re-count. The
+    per-`(zone,src)` scan/sweep new-flow counter is skipped the same way
+    (`packet_fabric_ingress`) at the session-miss decision in
+    `poll_descriptor/mod.rs`; the per-IP session-limit check there still runs
+    (it guards the owner's own SessionTable). The #4132 per-destination flood
+    sketches are untouched — the fix skips the re-count, not the screen.
+    RED-on-revert: 7 screen-runtime unit tests + 1 poll_stages integration test
+    driving the LIVE `stage_screen_check` (fabric UDP fragment never drops; a
+    direct-ingress stream drops at the correct threshold+1). Verified by
+    neutering both gates — the 6 rate-flood tests go RED, the 2 stateless-scope
+    guards stay green (proving the skip is rate-only). FULL cargo test --release
+    green; go build ./... green. Docs: docs/fabric-cross-chassis-fwd.md +
+    userspace-dp/src/afxdp/README.md screen bullet.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/screen/tests.rs, docs/fabric-cross-chassis-fwd.md,
+    userspace-dp/src/afxdp/README.md, _Log.md
   - **Action**: fable-review-164 M-2 / #4151 — HA config-sync receiver advanced
     the generation high-water mark BEFORE applying the config, silently
     stranding a diverged standby on apply failure. `admitConfigGen` stored the

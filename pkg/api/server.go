@@ -303,6 +303,19 @@ const (
 	// apiMaxHeaderBytes bounds total request header size so an attacker cannot
 	// buffer unbounded header data before the timeouts fire.
 	apiMaxHeaderBytes = 1 << 20 // 1 MiB
+
+	// metricsScrapeTimeout bounds a single /metrics scrape (#4162). promhttp
+	// aborts the handler and returns 503 if a scrape runs longer than this,
+	// so a scrape that stalls inside a slow dataplane read cannot pin a
+	// goroutine indefinitely. Generous relative to a healthy scrape (the
+	// session walk is now cached) but a hard ceiling on a wedged one.
+	metricsScrapeTimeout = 10 * time.Second
+	// metricsMaxInFlight bounds concurrent /metrics scrapes (#4162). promhttp
+	// returns 503 to scrapes beyond this many in flight, so a burst of parallel
+	// scrapers cannot each spin up a collector pass at once. The session walk
+	// is coalesced by the TTL cache, but this is the belt-and-suspenders limit
+	// on the rest of the collector's per-scrape work.
+	metricsMaxInFlight = 3
 )
 
 // NewServer creates a new API server.
@@ -350,7 +363,13 @@ func NewServer(cfg Config) *Server {
 	// Prometheus metrics with isolated registry
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(newCollector(s))
-	mux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		// #4162: bound slow / concurrent scrapes. Empty opts left both zero
+		// (no timeout, unlimited concurrency), so a stalled or bursty scraper
+		// could pile up collector passes over the dataplane.
+		Timeout:             metricsScrapeTimeout,
+		MaxRequestsInFlight: metricsMaxInFlight,
+	}))
 
 	// REST API v1
 	mux.HandleFunc("GET /api/v1/status", s.statusHandler)
@@ -446,7 +465,18 @@ func NewServer(cfg Config) *Server {
 
 	var handler http.Handler = mux
 	if cfg.Auth != nil {
-		handler = authMiddleware(*cfg.Auth, mux)
+		// #4162 (auth posture): /metrics is unauthenticated by default, which
+		// is the standard Prometheus posture and safe on the loopback default
+		// bind (127.0.0.1). But when web-management rebinds the HTTP API to a
+		// routable management interface (daemon_run.go resolveInterfaceAddr),
+		// an unauthenticated /metrics becomes remotely reachable. When auth is
+		// configured AND the bind is non-loopback, require credentials for
+		// /metrics too. A routable-interface Prometheus scraper must then
+		// present the configured API key / basic-auth, same as every other
+		// endpoint (documented in docs/architecture.md). /health stays exempt
+		// (it exposes no table walk and no sensitive data).
+		metricsRequireAuth := !isLoopbackBindAddr(cfg.Addr)
+		handler = authMiddleware(*cfg.Auth, metricsRequireAuth, mux)
 	}
 
 	s.httpServer = &http.Server{

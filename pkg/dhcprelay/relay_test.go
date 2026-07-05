@@ -389,6 +389,11 @@ type fakeConn struct {
 	// readErr, if set, is returned by ReadFrom (instead of blocking) once
 	// pending is exhausted — used to simulate an early one-sided close.
 	readErr error
+	// srcAddr, when non-nil, is the source address ReadFrom reports for each
+	// pending datagram. nil falls back to the default 10.0.0.1:68 — this lets
+	// the #4163 source-validation tests drive a reply from a non-configured
+	// source without disturbing the existing reply-path tests.
+	srcAddr net.Addr
 }
 
 type fakeWrite struct {
@@ -406,9 +411,13 @@ func (f *fakeConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if len(f.pending) > 0 {
 		d := f.pending[0]
 		f.pending = f.pending[1:]
+		src := f.srcAddr
 		f.mu.Unlock()
 		n := copy(p, d)
-		return n, &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 68}, nil
+		if src == nil {
+			src = &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 68}
+		}
+		return n, src, nil
 	}
 	rerr := f.readErr
 	f.mu.Unlock()

@@ -246,6 +246,23 @@ sync.
     on the flow-present `check_packet_with_zone_id` path — unchanged, with no
     screen double-run on the flow path. A truncated/unparseable header fails
     CLOSED (drop), matching the flow path (`#2146`).
+  - **#4155 — no screen rate double-count on fabric-redirected traffic:**
+    a packet that ingressed the non-owner node was already screened there
+    before being fabric-redirected to the RG owner (`docs/fabric-cross-chassis-fwd.md`).
+    Stage 9 sets `FABRIC_INGRESS_FLAG` on `meta.meta_flags`; `stage_screen_check`
+    now derives `skip_rate_flood` from it and threads it into
+    `check_packet_with_zone_id_opts` / `check_flowless_screens_opts`. When set,
+    the stateless per-packet screens (land, ping-of-death, teardrop,
+    icmp-fragment, source-route) still run on the owner — they are idempotent —
+    but the RATE-based flood counters (icmp/udp/syn-flood + SYN-cookie) are
+    skipped so the same packet is not counted twice against the per-zone /
+    per-destination thresholds (which would false-trip a flood Drop on a legit
+    synced session). The per-`(zone, src)` scan/sweep new-flow counter is
+    skipped the same way (`packet_fabric_ingress`) at the session-miss decision
+    in `poll_descriptor/mod.rs`; the per-IP session-limit check there still runs.
+    The per-destination flood sketches (#4132) are untouched — the fix skips the
+    re-count, it does not disable the screen. vSRX parity: screens fire once, on
+    the true cluster-ingress node.
   - **#3291 — zone policy / input filter / PBR on the flowless TRANSIT
     arm:** #3064 restored only the *screen* engine on the flowless path;
     zone security policy, the interface input filter, and firewall-filter

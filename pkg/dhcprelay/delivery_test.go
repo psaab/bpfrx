@@ -85,7 +85,26 @@ var (
 	testYiaddr = net.IPv4(10, 0, 0, 50)
 	testCiaddr = net.IPv4(10, 0, 0, 60)
 	testChaddr = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x99}
+	// testServerIP matches the default source IP fakeConn.ReadFrom reports for
+	// pending datagrams (10.0.0.1), so the #4163 source-validation check admits
+	// the existing reply-path tests. Drive a drop by pointing fakeConn.srcAddr
+	// at a different IP.
+	testServerIP = net.IPv4(10, 0, 0, 1)
 )
+
+// testServerSet returns the configured-server allow-set passed into
+// handleServerResponses. With no args it is the single default server
+// (testServerIP) that matches fakeConn's default reply source.
+func testServerSet(ips ...net.IP) []*net.UDPAddr {
+	if len(ips) == 0 {
+		ips = []net.IP{testServerIP}
+	}
+	set := make([]*net.UDPAddr, 0, len(ips))
+	for _, ip := range ips {
+		set = append(set, &net.UDPAddr{IP: ip, Port: relayPort})
+	}
+	return set
+}
 
 // TestDeliverReply_Matrix is the §7.1 decision-matrix oracle: every row of the
 // reply-destination table maps to exactly one delivery path and one counter.
@@ -462,7 +481,7 @@ func TestHandleServerResponses_NakForwarded(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr)
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr, testServerSet())
 		close(done)
 	}()
 
@@ -576,7 +595,7 @@ func TestHandleServerResponses_ForceRenewForwarded(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr)
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr, testServerSet())
 		close(done)
 	}()
 
@@ -638,7 +657,7 @@ func TestHandleServerResponses_L2SourceIsSavedGiaddr(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr)
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr, testServerSet())
 		close(done)
 	}()
 
@@ -655,6 +674,218 @@ func TestHandleServerResponses_L2SourceIsSavedGiaddr(t *testing.T) {
 	fl2.mu.Unlock()
 	if !c.srcIP.Equal(testGiaddr) {
 		t.Errorf("L2 srcIP = %v, want saved giaddr %v", c.srcIP, testGiaddr)
+	}
+
+	cancel()
+	serverConn.Close()
+	<-done
+}
+
+// waitClientWrite polls until the client conn has ≥1 write or the deadline, then
+// returns a snapshot of its writes.
+func waitClientWrite(clientConn *fakeConn) []fakeWrite {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		clientConn.mu.Lock()
+		n := len(clientConn.writes)
+		clientConn.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	clientConn.mu.Lock()
+	defer clientConn.mu.Unlock()
+	return append([]fakeWrite(nil), clientConn.writes...)
+}
+
+// TestHandleServerResponses_ConfiguredSourceForwarded is the #4163 positive
+// gate: a reply whose source IP IS a configured server is forwarded to the
+// client and the drop counter stays zero. It pins the srcAddr explicitly (a
+// configured member other than the default) so the accept path is not an
+// accident of fakeConn's default source.
+func TestHandleServerResponses_ConfiguredSourceForwarded(t *testing.T) {
+	srv := net.IPv4(192, 0, 2, 10)
+	offer := newReply(t, true, testYiaddr, nil, testChaddr) // broadcast flag → client write
+	serverConn := newFakeConn()
+	serverConn.mu.Lock()
+	serverConn.pending = [][]byte{offer.ToBytes()}
+	serverConn.srcAddr = &net.UDPAddr{IP: srv, Port: relayPort}
+	serverConn.mu.Unlock()
+	clientConn := newFakeConn()
+	defer clientConn.Close()
+	fl2 := &fakeL2{}
+	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr, testServerSet(srv))
+		close(done)
+	}()
+
+	writes := waitClientWrite(clientConn)
+	if len(writes) != 1 {
+		t.Fatalf("reply from configured server not forwarded: got %d writes, want 1", len(writes))
+	}
+	if ir.repliesForwarded.Load() != 1 {
+		t.Errorf("repliesForwarded = %d, want 1", ir.repliesForwarded.Load())
+	}
+	if got := ir.repliesDroppedUnknownServer.Load(); got != 0 {
+		t.Errorf("repliesDroppedUnknownServer = %d, want 0 (legit reply must not count as a drop)", got)
+	}
+
+	cancel()
+	serverConn.Close()
+	<-done
+}
+
+// TestHandleServerResponses_UnconfiguredSourceDropped is the #4163 fail-on-revert
+// gate: a syntactically valid OFFER whose SOURCE IP is not a configured server
+// MUST be dropped before it reaches the client (rogue-reply injection), and the
+// repliesDroppedUnknownServer counter MUST increment. Reverting the source
+// check makes this RED — the forged OFFER is forwarded (a client write appears)
+// and the counter stays 0.
+func TestHandleServerResponses_UnconfiguredSourceDropped(t *testing.T) {
+	rogue := net.IPv4(192, 0, 2, 66) // NOT in the configured set
+	offer := newReply(t, true, testYiaddr, nil, testChaddr)
+	offer.GatewayIPAddr = testGiaddr
+	serverConn := newFakeConn()
+	serverConn.mu.Lock()
+	serverConn.pending = [][]byte{offer.ToBytes()}
+	serverConn.srcAddr = &net.UDPAddr{IP: rogue, Port: relayPort}
+	serverConn.mu.Unlock()
+	clientConn := newFakeConn()
+	defer clientConn.Close()
+	fl2 := &fakeL2{}
+	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		// Configured server set is 10.0.0.1 only; the reply comes from 192.0.2.66.
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr, testServerSet())
+		close(done)
+	}()
+
+	// Wait for the drop to register (bounded); the datagram is consumed but
+	// never forwarded, so poll the counter rather than a client write.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ir.repliesDroppedUnknownServer.Load() > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if got := ir.repliesDroppedUnknownServer.Load(); got != 1 {
+		t.Errorf("repliesDroppedUnknownServer = %d, want 1 (rogue reply must be dropped+counted)", got)
+	}
+	clientConn.mu.Lock()
+	nWrites := len(clientConn.writes)
+	clientConn.mu.Unlock()
+	if nWrites != 0 {
+		t.Errorf("rogue reply reached the client: got %d client writes, want 0", nWrites)
+	}
+	if ir.repliesForwarded.Load() != 0 {
+		t.Errorf("repliesForwarded = %d, want 0 (rogue reply must not be forwarded)", ir.repliesForwarded.Load())
+	}
+	if fl2.callCount() != 0 {
+		t.Errorf("rogue reply used raw-L2: got %d calls, want 0", fl2.callCount())
+	}
+
+	cancel()
+	serverConn.Close()
+	<-done
+}
+
+// TestHandleServerResponses_MultiServerGroupAnyMemberForwarded proves the check
+// is set-membership, not first-only: with a two-server group, a reply from the
+// SECOND configured member is forwarded (not just the first). Reverting to a
+// single-server or "==first" check would drop the legitimate reply.
+func TestHandleServerResponses_MultiServerGroupAnyMemberForwarded(t *testing.T) {
+	srvA := net.IPv4(10, 0, 0, 1)
+	srvB := net.IPv4(10, 0, 0, 2)
+	offer := newReply(t, true, testYiaddr, nil, testChaddr)
+	serverConn := newFakeConn()
+	serverConn.mu.Lock()
+	serverConn.pending = [][]byte{offer.ToBytes()}
+	serverConn.srcAddr = &net.UDPAddr{IP: srvB, Port: relayPort} // second member
+	serverConn.mu.Unlock()
+	clientConn := newFakeConn()
+	defer clientConn.Close()
+	fl2 := &fakeL2{}
+	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr, testServerSet(srvA, srvB))
+		close(done)
+	}()
+
+	writes := waitClientWrite(clientConn)
+	if len(writes) != 1 {
+		t.Fatalf("reply from 2nd configured server not forwarded: got %d writes, want 1", len(writes))
+	}
+	if got := ir.repliesDroppedUnknownServer.Load(); got != 0 {
+		t.Errorf("repliesDroppedUnknownServer = %d, want 0", got)
+	}
+
+	cancel()
+	serverConn.Close()
+	<-done
+}
+
+// TestHandleServerResponses_ConfiguredSourceWrongOpCodeDropped confirms the
+// #4163 source check is added ALONGSIDE the existing OpCode gate, not in place
+// of it: a datagram from a CONFIGURED server that is a BOOTREQUEST (wrong
+// OpCode for the reply path) is still dropped — and because the source WAS
+// valid, it is NOT counted as an unknown-server drop.
+func TestHandleServerResponses_ConfiguredSourceWrongOpCodeDropped(t *testing.T) {
+	offer := newReply(t, true, testYiaddr, nil, testChaddr)
+	offer.OpCode = dhcpv4.OpcodeBootRequest // wrong direction for the reply path
+	serverConn := newFakeConn()
+	serverConn.mu.Lock()
+	serverConn.pending = [][]byte{offer.ToBytes()}
+	// default srcAddr (10.0.0.1) is a configured server
+	serverConn.mu.Unlock()
+	clientConn := newFakeConn()
+	defer clientConn.Close()
+	fl2 := &fakeL2{}
+	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr, testServerSet())
+		close(done)
+	}()
+
+	// Let the datagram be consumed (two reads: the pending datagram, then block).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if serverConn.readCalls.Load() >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	clientConn.mu.Lock()
+	nWrites := len(clientConn.writes)
+	clientConn.mu.Unlock()
+	if nWrites != 0 {
+		t.Errorf("BOOTREQUEST on the reply path was forwarded: got %d client writes, want 0", nWrites)
+	}
+	if got := ir.repliesDroppedUnknownServer.Load(); got != 0 {
+		t.Errorf("repliesDroppedUnknownServer = %d, want 0 (source WAS configured; OpCode gate dropped it)", got)
+	}
+	if ir.repliesForwarded.Load() != 0 {
+		t.Errorf("repliesForwarded = %d, want 0", ir.repliesForwarded.Load())
 	}
 
 	cancel()
