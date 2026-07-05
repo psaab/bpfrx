@@ -34051,3 +34051,20 @@ top.
   section mirroring the HA form: br-mgmt + br-wan NAT/DHCP-bearing, br-lan
   plain L2 (ge-0/0/0 is the static gateway running dhcp-local-server).
 - **File(s)**: docs/deploy-quickstart.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 H-29 (#4196) — add root-authentication to the
+  example day-0 configs. standalone.conf and ha-pair.conf enabled ssh
+  host-inbound but shipped no credentials, so SSH was unusable and a real
+  vSRX would refuse to commit (Junos requires root-authentication; xpf
+  accepts one silently). The baked sshd is PermitRootLogin
+  prohibit-password (scripts/image/bake.py), so an ssh KEY — not a
+  password — is what enables `ssh root@fxp0`. Added an active
+  `system root-authentication { ssh-ed25519 "...REPLACE..."; }` stanza to
+  both confs with a loud REPLACE-ME comment: it parses + commits (schema
+  node pkg/config/schema_system.go:58-67; no format validator on the key)
+  and gives vSRX parity, but the placeholder authenticates no one so it
+  fails closed if deployed unmodified. Verified all three personalities
+  still pass `xpfd check-config` (standalone; ha-pair -node-id 0 and 1) —
+  strict parse + schema + compile.
+- **File(s)**: examples/deploy/standalone.conf, examples/deploy/ha-pair.conf, _Log.md
