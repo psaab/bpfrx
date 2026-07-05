@@ -10,19 +10,31 @@ never the shared loss cluster) and proves the first-boot contract:
   b  valid day-0 drive -> config validated + installed + committed at first
      boot (hostname applied); a reboot does NOT re-apply (stamp).
   c  invalid day-0 drive -> commit-check REJECT logged, nothing installed,
-     boot survives, factory bootstrap still reachable.
+     boot survives, factory bootstrap still reachable; THEN the operator
+     swaps in a VALID drive and reboots and the config now applies (the
+     fix->reboot->applied retry contract, #4209 H-9 / pairs with H-1).
   d  resized disk (#1925) -> first-boot root auto-grow fills a LARGER root
      disk (partition + ext4), stamps, is idempotent on reboot, and leaves the
      ESP/boot substrate intact; a control boot at the bake size is a clean
      no-op.
+  e  cluster node-id drive (#4209 H-9) -> a node-id=1 day-0 drive persists
+     /etc/xpf/node-id=1, boots into cluster mode, and (with >=3 NICs) the
+     daemon assigns the node-1 vSRX names em0 + ge-7/0/N (FPC 7).
+  q  libvirt/plain-QEMU bootability (#4209 H-9) -> the SAME qcow2 the docs
+     sell for "libvirt/KVM, plain QEMU" is a valid, non-corrupt qcow2 of at
+     least the bake floor (always), and — gated on qemu-system-x86_64 +
+     /dev/kvm + OVMF — actually boots under direct QEMU with the day-0 config
+     on a cdrom (the cdrom day-0 attach path incus never exercises).
 
 Usage:
-  validate.py --qcow2 <img> --metadata <tar.gz> [a|b|c|d|all]
+  validate.py --qcow2 <img> --metadata <tar.gz> [a|b|c|d|e|q|all]
 """
 
 import argparse
+import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +48,62 @@ import make_config_drive  # noqa: E402
 import sign  # noqa: E402  (#1924 signed-distribution helper)
 
 ALIAS = "xpf-image-validate"
+
+# The bake provisions an 8 GiB root disk (see scripts/image/bake.py); a qcow2
+# whose virtual size is below this floor is truncated / an incomplete artifact
+# that no hypervisor could boot correctly.
+BAKE_MIN_BYTES = 8 * 1024 ** 3
+
+# Scenario registry — the single source of truth for the CLI choices AND the
+# dispatch map, so a new scenario is wired in one place and is introspectable
+# by the hermetic unit test (test_validate_scenarios.py). "q" (QEMU) and "e"
+# (node-id) are the #4209 H-9 additions.
+SCENARIO_METHODS = {
+    "a": "scenario_a", "b": "scenario_b", "c": "scenario_c",
+    "d": "scenario_d", "e": "scenario_e", "q": "scenario_qemu",
+}
+SCENARIO_ORDER = ["a", "b", "c", "d", "e", "q"]
+
+# Preference order: a NON-secboot OVMF_CODE first so shim->grub->kernel boots
+# without needing MOK enrollment in the firmware var store (the shipped image
+# is Secure-Boot-signed, but plain-QEMU bootability is proven fine with SB off).
+_OVMF_CODE_CANDIDATES = (
+    "/usr/share/OVMF/OVMF_CODE_4M.fd",
+    "/usr/share/OVMF/OVMF_CODE.fd",
+    "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+    "/usr/share/qemu/OVMF_CODE.fd",
+    "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+    "/usr/share/OVMF/OVMF_CODE.secboot.fd",
+)
+_OVMF_VARS_CANDIDATES = (
+    "/usr/share/OVMF/OVMF_VARS_4M.fd",
+    "/usr/share/OVMF/OVMF_VARS.fd",
+    "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+    "/usr/share/qemu/OVMF_VARS.fd",
+)
+
+
+def _qemu_img_verdict(imginfo, min_bytes):
+    """Pure verdict over `qemu-img info --output=json` output: is this a
+    bootable qcow2 of at least `min_bytes` virtual size? Returns (ok, reason).
+    Split out so the config-level bootability check is unit-testable without a
+    real image (#4209 H-9)."""
+    fmt = imginfo.get("format")
+    if fmt != "qcow2":
+        return False, (f"image format is {fmt!r}, not qcow2 — libvirt/plain-QEMU "
+                       "consume the qcow2 export")
+    vsize = imginfo.get("virtual-size")
+    if not isinstance(vsize, int) or vsize < min_bytes:
+        return False, (f"virtual-size {vsize} below the {min_bytes}-byte bake floor "
+                       "— truncated / incomplete image")
+    return True, f"qcow2, virtual-size {vsize / (1024 ** 3):.1f}GiB"
+
+
+def _find_first(candidates):
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def info(m):
@@ -128,7 +196,7 @@ class Harness:
         info(f"importing image into local incus as {ALIAS}")
         incus("image", "import", self.metadata, self.qcow2, "--alias", ALIAS)
 
-    def launch(self, name, iso=None, root_size=None):
+    def launch(self, name, iso=None, root_size=None, extra_nics=0):
         incus("delete", "-f", name, check=False, capture=True)
         incus("init", ALIAS, name, "--vm", "--network", self.net,
               "-c", "limits.cpu=2", "-c", "limits.memory=2GiB", capture=True)
@@ -139,6 +207,12 @@ class Harness:
             # before the VM ever boots — the operator-resized-disk case.
             incus("config", "device", "override", name, "root",
                   f"size={root_size}", capture=True)
+        # Additional NICs beyond the default fxp0 slot, so the daemon's
+        # positional namer has em0 (idx 1) + ge-*/0/* (idx >= 2) to assign —
+        # required to prove the cluster node-id naming (#4209 H-9 scenario e).
+        for i in range(extra_nics):
+            incus("config", "device", "add", name, f"extranic{i}", "nic",
+                  f"network={self.net}", capture=True)
         if iso:
             incus("config", "device", "add", name, "day0", "disk",
                   f"source={os.path.realpath(iso)}", capture=True)
@@ -293,7 +367,42 @@ class Harness:
         self.wait_fxp0_dhcp("xpf-image-c")
         if not guest_sh("xpf-image-c", '[ "$(hostname)" != xpf-day0-c ]'):
             fail("invalid config changed the hostname")
-        info("Scenario C PASS (fallback reachable, boot survived)")
+        info("Scenario C reject leg PASS (fallback reachable, boot survived)")
+
+        # ── Retry leg (#4209 H-9, pairs with H-1): the REJECT wrote no stamp
+        # and left no committed active.json, so the box is still factory-
+        # default. Swap the bad drive for a VALID one and reboot — the day-0
+        # loader must re-probe and apply it. A regression that guarded on the
+        # bare .configdb directory (H-1) would have declared "already
+        # configured" here and never retried. ──
+        info("C retry: swapping in a VALID drive and rebooting...")
+        good = os.path.join(self.work, "day0-c-fixed.conf")
+        with open(good, "w") as f:
+            f.write("system {\n    host-name xpf-day0-c-fixed;\n}\n"
+                    "interfaces {\n    fxp0 {\n        unit 0 {\n"
+                    "            family inet {\n                dhcp;\n"
+                    "            }\n        }\n    }\n}\n")
+        good_iso = make_config_drive.build_config_drive(
+            good, os.path.join(self.work, "day0-c-fixed.iso"), validate=False)
+        # Replace the day0 medium in place, then reboot.
+        incus("config", "device", "remove", "xpf-image-c", "day0", capture=True)
+        incus("config", "device", "add", "xpf-image-c", "day0", "disk",
+              f"source={os.path.realpath(good_iso)}", capture=True)
+        incus("restart", "xpf-image-c")
+        self.wait_agent("xpf-image-c")
+        self.wait_xpfd("xpf-image-c")
+        if guest("xpf-image-c", "test", "-e", "/etc/xpf/.day0-config-applied",
+                 check=False).returncode != 0:
+            fail("retry: day-0 stamp missing after fix+reboot — the retry "
+                 "contract is broken (a rejected first boot could never be fixed)")
+        if not guest_sh("xpf-image-c",
+                        'journalctl -u xpf-day0-config -b --no-pager | grep -q '
+                        '"day-0 config installed"'):
+            fail("retry: day-0 loader did not install the fixed config on reboot")
+        self._wait("xpf-image-c",
+                   lambda: guest_sh("xpf-image-c", '[ "$(hostname)" = xpf-day0-c-fixed ]'),
+                   20, 3, "retry: fixed hostname xpf-day0-c-fixed not applied")
+        info("Scenario C PASS (reject survived, fix+reboot applied — retry contract)")
         self.drop("xpf-image-c")
 
     def _root_fs_gib(self, name):
@@ -388,6 +497,132 @@ class Harness:
         self.drop("xpf-image-d2")
         info("Scenario D PASS")
 
+    def scenario_e(self):
+        info("── Scenario E: cluster node-id day-0 drive (#4209 H-9) ──")
+        conf = os.path.join(self.work, "day0-node1.conf")
+        with open(conf, "w") as f:
+            f.write("system {\n    host-name xpf-node1;\n}\n"
+                    "interfaces {\n    fxp0 {\n        unit 0 {\n"
+                    "            family inet {\n                dhcp;\n"
+                    "            }\n        }\n    }\n}\n")
+        # node_id=1 writes a `node-id` file (contents "1") alongside xpf.conf on
+        # the drive; the loader persists it to /etc/xpf/node-id and the daemon
+        # reads it BEFORE positional naming (fpc=7 for node 1).
+        iso = make_config_drive.build_config_drive(
+            conf, os.path.join(self.work, "day0-node1.iso"), node_id=1,
+            validate=False)
+        # Two extra NICs so the namer has em0 (idx 1) and ge-7/0/0 (idx 2).
+        self.launch("xpf-image-e", iso, extra_nics=2)
+        self.wait_xpfd("xpf-image-e")
+        if guest("xpf-image-e", "test", "-e", "/etc/xpf/.day0-config-applied",
+                 check=False).returncode != 0:
+            fail("node-id drive: day-0 stamp missing")
+        # node-id persisted verbatim.
+        nid = guest("xpf-image-e", "sh", "-c",
+                    "cat /etc/xpf/node-id 2>/dev/null",
+                    capture=True).stdout.strip()
+        if nid != "1":
+            fail(f"/etc/xpf/node-id is '{nid}', expected '1' — node-id not "
+                 "persisted from the day-0 drive")
+        # Cluster-mode naming: node 1 uses FPC 7. em0 is assigned only in
+        # cluster mode (position 2); ge-7/0/0 proves the node-1 FPC branch.
+        if not guest_sh("xpf-image-e", 'ip link show em0 >/dev/null 2>&1'):
+            fail("em0 not present — daemon did not enter cluster naming mode "
+                 "for a node-id-present image")
+        if not guest_sh("xpf-image-e", 'ip link show ge-7/0/0 >/dev/null 2>&1'):
+            fail("ge-7/0/0 not present — node-1 FPC-7 positional naming did not "
+                 "run (a node-0 image would name it ge-0/0/0)")
+        info("Scenario E PASS (node-id=1 persisted, cluster em0 + ge-7/0/N naming)")
+        self.drop("xpf-image-e")
+
+    def scenario_qemu(self):
+        info("── Scenario Q: libvirt/plain-QEMU bootability (#4209 H-9) ──")
+        # ── Config-level probe (always runs when qemu-img is present): the
+        # qcow2 the docs sell for libvirt/KVM + plain QEMU must be a valid,
+        # non-corrupt qcow2 of at least the bake floor. Catches a truncated /
+        # wrong-format / corrupt export that incus import might still accept
+        # but a raw qcow2 consumer (libvirt) would refuse. ──
+        if not shutil.which("qemu-img"):
+            info("SKIP: qemu-img not installed (qemu-utils) — cannot probe the "
+                 "qcow2's libvirt bootability")
+            return
+        raw = subprocess.run(["qemu-img", "info", "--output=json", self.qcow2],
+                             capture_output=True, text=True)
+        if raw.returncode != 0:
+            fail(f"qemu-img info failed on {self.qcow2}: {raw.stderr.strip()}")
+        ok, reason = _qemu_img_verdict(json.loads(raw.stdout), BAKE_MIN_BYTES)
+        if not ok:
+            fail(f"qcow2 is not libvirt-bootable: {reason}")
+        info(f"qcow2 structural probe OK: {reason}")
+        chk = subprocess.run(["qemu-img", "check", "-q", self.qcow2],
+                             capture_output=True, text=True)
+        # qemu-img check exits 0 clean, 2/3 on leaked/corrupt clusters.
+        if chk.returncode not in (0,):
+            fail("qemu-img check reported qcow2 corruption:\n"
+                 f"{chk.stdout}{chk.stderr}")
+        info("qcow2 consistency check OK (no corruption)")
+
+        # ── Boot leg (gated): actually boot the SAME qcow2 under direct QEMU
+        # with a valid day-0 config on a cdrom, and confirm via the serial
+        # console that the appliance booted its userland and the day-0 loader
+        # applied the config off the cdrom — the plain-QEMU + cdrom-day-0 path
+        # incus never exercises. Needs qemu-system + KVM + OVMF; SKIP (probe
+        # stands) when any is absent, mirroring the root-required skips. ──
+        qsys = shutil.which("qemu-system-x86_64")
+        ovmf = _find_first(_OVMF_CODE_CANDIDATES)
+        ovmf_vars = _find_first(_OVMF_VARS_CANDIDATES)
+        if not qsys or not os.path.exists("/dev/kvm") or not ovmf or not ovmf_vars:
+            info("SKIP boot leg: need qemu-system-x86_64 + /dev/kvm + OVMF "
+                 f"(qemu={bool(qsys)} kvm={os.path.exists('/dev/kvm')} "
+                 f"ovmf_code={bool(ovmf)} ovmf_vars={bool(ovmf_vars)}) — "
+                 "the structural probe above stands")
+            return
+        conf = os.path.join(self.work, "day0-qemu.conf")
+        with open(conf, "w") as f:
+            f.write("system {\n    host-name xpf-qemu;\n}\n")
+        iso = make_config_drive.build_config_drive(
+            conf, os.path.join(self.work, "day0-qemu.iso"), validate=False)
+        vars_copy = os.path.join(self.work, "OVMF_VARS.fd")
+        shutil.copyfile(ovmf_vars, vars_copy)
+        serial = os.path.join(self.work, "qemu-serial.log")
+        argv = [qsys, "-machine", "q35,accel=kvm", "-cpu", "host",
+                "-m", "2048", "-smp", "2", "-nographic",
+                "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
+                "-drive", f"if=pflash,format=raw,file={vars_copy}",
+                # snapshot=on: never mutate the artifact under test.
+                "-drive", f"file={self.qcow2},if=virtio,format=qcow2,snapshot=on",
+                "-drive", f"file={os.path.realpath(iso)},media=cdrom",
+                "-serial", f"file:{serial}", "-nic", "none"]
+        info("booting the qcow2 under direct QEMU (serial-captured, snapshot)...")
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 360
+            txt = ""
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    _, err = proc.communicate()
+                    fail(f"QEMU exited early (rc={proc.returncode}): "
+                         f"{(err or b'').decode(errors='replace')[-400:]}")
+                if os.path.isfile(serial):
+                    txt = open(serial, errors="replace").read()
+                    if "day-0 config installed" in txt:
+                        info("QEMU boot: day-0 config installed off the cdrom")
+                        break
+                    if "REJECTED by commit-check" in txt:
+                        fail("QEMU boot: day-0 loader REJECTED a valid config")
+                time.sleep(3)
+            else:
+                fail("QEMU boot: no 'day-0 config installed' on the serial "
+                     f"console within 360s (serial tail:\n{txt[-600:]})")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        info("Scenario Q PASS (qcow2 valid + boots under plain QEMU with cdrom day-0)")
+
 
 def _kver_ge(ver, floor):
     try:
@@ -427,7 +662,7 @@ def main():
                    const=False, help="skip image signature verification (dev)")
     p.set_defaults(verify_sig=True)  # default: verify if a .minisig is present
     p.add_argument("scenario", nargs="?", default="all",
-                   choices=["a", "b", "c", "d", "all"])
+                   choices=SCENARIO_ORDER + ["all"])
     a = p.parse_args()
     if not os.path.isfile(a.qcow2):
         fail(f"--qcow2 not found: {a.qcow2}")
@@ -438,12 +673,9 @@ def main():
     try:
         h.ensure_network()
         h.import_image()
-        scenarios = {"a": [h.scenario_a], "b": [h.scenario_b], "c": [h.scenario_c],
-                     "d": [h.scenario_d],
-                     "all": [h.scenario_a, h.scenario_b, h.scenario_c,
-                             h.scenario_d]}[a.scenario]
-        for s in scenarios:
-            s()
+        keys = SCENARIO_ORDER if a.scenario == "all" else [a.scenario]
+        for k in keys:
+            getattr(h, SCENARIO_METHODS[k])()
         info("Validation complete.")
         return 0
     finally:
