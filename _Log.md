@@ -35219,3 +35219,41 @@ top.
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   pkg/dataplane/userspace/protocol.go,
   docs/fairness-regimes.md, _Log.md
+
+## 2026-07-05 — fable-166 T-7 (TX-path LOW cluster + stats-that-lie) + R-6 re-verify
+
+- **Timestamp**: 2026-07-05
+- **Action**: Drove fable-166 T-7 grouped LOW cluster — fixed 8 READY
+  sub-items, deferred the design ones, plus re-verified R-6 (confirmed
+  NOT-MATERIAL). Branch `fix/hb166-t7-low-cluster`.
+- **Fixes (each with a RED-on-revert test)**:
+    - head-finish u64::MAX sentinel: `cos_queue_min_finish_bucket[_no_cap]`
+      gate on `is_none()` so a saturated head-finish bucket stays
+      selectable (distinct from R-8(b)/#4271 vtime sentinel).
+    - snapshot-push-before-fallible-pop: reorder pop before snapshot push
+      in `cos_queue_pop_known_bucket_inner` (avoid release-mode panic).
+    - keyless SFQ bucket: reserve a dedicated keyless lane; steer real
+      flows off it (`cos_flow_bucket_index`).
+    - pcp fail-closed: `resolve_cos_ieee8021_classifier_queue_id` returns
+      None for pcp>7 instead of `.min(7)` clamp (#2447 posture).
+    - unknown scheduler priority fail-closed: `cos_priority_rank` → Option,
+      new `SnapshotIntegrityError::CosUnknownSchedulerPriority` (#2458
+      mirror).
+    - buffer_bytes N× inflation: MAX not SUM across worker instances
+      (worker + coordinator folds).
+    - defensive None arms leak: 2 flow-fair local scratch None arms recycle
+      free_tx_frames offsets (queue_service).
+    - dead deferred-CoS dispatch path deletion (dispatch/mod.rs + cos.rs +
+      test), carrying 2 latent bugs.
+- **R-6**: confirmed NOT-MATERIAL — shared-consume bounds the long-run
+  rate; budget==0 gate hard-stops surplus; bounded transient burst only.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_ops/{mod,pop,fused_diff_tests}.rs,
+  userspace-dp/src/afxdp/cos/flow_hash{,_tests}.rs,
+  userspace-dp/src/afxdp/tx/cos_classify{,_tests}.rs,
+  userspace-dp/src/afxdp/worker/cos/{queue_row,tests}.rs,
+  userspace-dp/src/afxdp/coordinator/{cos_leases,tests}.rs,
+  userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/forwarding_build/{cos,tests}.rs,
+  userspace-dp/src/afxdp/cos/queue_service/{mod,tests}.rs,
+  userspace-dp/src/afxdp/tx/dispatch/{mod,cos,dispatch_tests}.rs,
+  userspace-dp/src/afxdp/cos/README.md, _Log.md

@@ -132,43 +132,10 @@ pub(super) fn enqueue_local_request_to_target_or_owner(
     Ok(())
 }
 
-#[inline]
-pub(super) fn resolve_pending_forward_cos_tx_selection(
-    forwarding: &ForwardingState,
-    request: &PendingForwardRequest,
-    now_ns: u64,
-) -> CoSTxSelection {
-    // #2362 fold B: the deferred forward request runs after the UMEM frame may
-    // have been recycled, so it consumes the per-packet match inputs snapshotted
-    // at build time from the live frame rather than re-reading the frame.
-    // #3642: the egress output filter matches the POST-NAT on-wire tuple. The
-    // stored `flow_key` is the PRE-NAT key (kept for CoS flow-bucket hashing),
-    // so derive the egress wire key here from that key + the request's NAT
-    // decision (apply-to-this-packet form, correct for both directions).
-    let tx_selection_wire_key = request
-        .flow_key
-        .as_ref()
-        .map(|key| crate::session::forward_wire_key(key, request.decision.nat));
-    resolve_cos_tx_selection_at(
-        forwarding,
-        request.decision.resolution.egress_ifindex,
-        request.meta,
-        tx_selection_wire_key.as_ref(),
-        request.filter_match_extra,
-        now_ns,
-    )
-}
-
-#[inline]
-pub(super) fn pending_forward_needs_cos_tx_selection(
-    request: &PendingForwardRequest,
-    tx_selection_enabled_v4: bool,
-    tx_selection_enabled_v6: bool,
-) -> bool {
-    let tx_selection_enabled = if request.meta.addr_family as i32 == libc::AF_INET6 {
-        tx_selection_enabled_v6
-    } else {
-        tx_selection_enabled_v4
-    };
-    tx_selection_enabled && !request.cos_tx_selection_resolved
-}
+// #hb166 T-7: the deferred forward-request CoS-TX-selection helpers
+// (`resolve_pending_forward_cos_tx_selection` +
+// `pending_forward_needs_cos_tx_selection`) were removed as dead code.
+// Every PendingForwardRequest is built with `cos_tx_selection_resolved =
+// true`, so the dispatch loop never deferred CoS selection to them. The
+// live resolution path uses `resolve_cos_tx_selection_at` directly at
+// build time (forward_request.rs / icmp.rs / poll_descriptor).
