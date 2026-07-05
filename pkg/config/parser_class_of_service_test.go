@@ -1002,10 +1002,15 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
             }
         }
     }
+    schedulers {
+        be-sched {
+            transmit-rate percent 10;
+        }
+    }
     scheduler-maps {
         edge-map {
             forwarding-class best-effort {
-                scheduler missing-sched;
+                scheduler be-sched;
             }
         }
     }
@@ -1045,8 +1050,15 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 		t.Fatalf("compile error: %v", err)
 	}
 	warnings := strings.Join(cfg.Warnings, "\n")
-	if !strings.Contains(warnings, `scheduler-map "edge-map" references undefined scheduler "missing-sched"`) {
-		t.Fatalf("expected undefined scheduler warning, got: %s", warnings)
+	// A dangling scheduler reference in a scheduler-map is no longer
+	// warn-only: it is hard-rejected at strict commit
+	// (validateClassOfServiceSchedulerMapRefsStrict), covered by
+	// TestSchedulerMapDanglingSchedulerRejectedStrict. The scheduler-map
+	// above references the DEFINED scheduler "be-sched" so this
+	// warn-collection test still exercises the surviving warn-only refs
+	// (undefined forwarding-class + undefined classifier / rewrite refs).
+	if strings.Contains(warnings, `references undefined scheduler`) {
+		t.Fatalf("did not expect an undefined-scheduler warning for a defined scheduler, got: %s", warnings)
 	}
 	if !strings.Contains(warnings, `dscp classifier "edge-classifier" references undefined forwarding-class "missing-class"`) {
 		t.Fatalf("expected undefined forwarding-class warning, got: %s", warnings)
@@ -1074,6 +1086,88 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 	}
 	if strings.Contains(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane") {
 		t.Fatalf("unexpected dataplane warning for default userspace path: %s", warnings)
+	}
+}
+
+// TestSchedulerMapDanglingSchedulerRejectedStrict pins the #1960
+// strict-on-commit / lenient-on-load contract for a scheduler-map entry
+// that references an undefined scheduler. Before the gate the reference
+// was warn-only at commit and then fail-open in the dataplane (the class
+// silently lost its guarantee and won the maximum best-effort surplus
+// share). The strict commit path must now REJECT it; the tolerant load /
+// peer-sync path must DOWNGRADE it to a warning so an already-persisted
+// or peer-synced config still boots.
+func TestSchedulerMapDanglingSchedulerRejectedStrict(t *testing.T) {
+	const danglingRef = `class-of-service {
+    forwarding-classes {
+        queue 0 best-effort;
+        queue 1 ef;
+    }
+    schedulers {
+        ef-sched {
+            transmit-rate percent 30;
+            priority strict-high;
+        }
+    }
+    scheduler-maps {
+        edge-map {
+            forwarding-class ef {
+                scheduler ef-typo;
+            }
+        }
+    }
+    interfaces {
+        ge-0/0/1 {
+            unit 0 {
+                shaping-rate 10g;
+                scheduler-map edge-map;
+            }
+        }
+    }
+}
+`
+	compile := func(t *testing.T, input string) *ConfigTree {
+		t.Helper()
+		tree, errs := NewParser(input).Parse()
+		if len(errs) > 0 {
+			t.Fatalf("parse errors: %v", errs)
+		}
+		return tree
+	}
+
+	// Strict commit path rejects the dangling reference.
+	strictTree := compile(t, danglingRef)
+	_, err := CompileConfig(strictTree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted a scheduler-map with a dangling scheduler reference; want rejection")
+	}
+	if !strings.Contains(err.Error(), `references undefined scheduler "ef-typo"`) {
+		t.Fatalf("strict error missing the dangling-scheduler substring: %q", err.Error())
+	}
+
+	// Tolerant load path downgrades to a warning and still compiles.
+	lenientTree := compile(t, danglingRef)
+	cfg, err := CompileConfigLenient(lenientTree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient rejected a persistable config with a dangling scheduler reference (#1960 brick): %v", err)
+	}
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(warnings, "scheduler-map reference (downgraded to warning on tolerant path)") ||
+		!strings.Contains(warnings, `references undefined scheduler "ef-typo"`) {
+		t.Fatalf("lenient path missing the downgraded scheduler-map warning, got: %s", warnings)
+	}
+
+	// A valid scheduler reference is unchanged on BOTH paths.
+	validInput := strings.Replace(danglingRef, "scheduler ef-typo;", "scheduler ef-sched;", 1)
+	if _, err := CompileConfig(compile(t, validInput)); err != nil {
+		t.Fatalf("CompileConfig rejected a scheduler-map with a DEFINED scheduler: %v", err)
+	}
+	validCfg, err := CompileConfigLenient(compile(t, validInput))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient rejected a valid scheduler-map: %v", err)
+	}
+	if strings.Contains(strings.Join(validCfg.Warnings, "\n"), "references undefined scheduler") {
+		t.Fatalf("unexpected undefined-scheduler warning for a defined scheduler: %v", validCfg.Warnings)
 	}
 }
 

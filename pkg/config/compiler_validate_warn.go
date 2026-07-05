@@ -696,20 +696,21 @@ func ValidateConfig(cfg *Config) []string {
 			if schedMap == nil {
 				continue
 			}
-			for className, entry := range schedMap.Entries {
+			for className := range schedMap.Entries {
 				if _, ok := cos.ForwardingClasses[className]; !ok {
 					warnings = append(warnings, fmt.Sprintf(
 						"class-of-service scheduler-map %q references undefined forwarding-class %q",
 						schedMap.Name, className))
 				}
-				if entry == nil || entry.Scheduler == "" {
-					continue
-				}
-				if _, ok := cos.Schedulers[entry.Scheduler]; !ok {
-					warnings = append(warnings, fmt.Sprintf(
-						"class-of-service scheduler-map %q references undefined scheduler %q",
-						schedMap.Name, entry.Scheduler))
-				}
+				// A scheduler-map entry naming an undefined scheduler is no
+				// longer warn-only: validateClassOfServiceSchedulerMapRefsStrict
+				// hard-rejects it at strict commit / commit-check and downgrades
+				// it to a cfg.Warnings entry on the tolerant load / peer-sync
+				// paths (#1960). Leaving a parallel warning here would
+				// double-report it on the lenient path and duplicates a rule
+				// that now lives in one place, consistent with every other
+				// cross-reference gate (IPsec proposal, policy zone/scheduler,
+				// log-stream, feed-name), none of which warn from ValidateConfig.
 			}
 		}
 		for _, classifier := range cos.DSCPClassifiers {
