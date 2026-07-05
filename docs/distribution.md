@@ -68,10 +68,18 @@ XPF_GPG_KEY=<keyid> make dist-repo
 XPF_SIGN_SECKEY=/secure/xpf-image.sec \
   python3 scripts/dist/publish.py make-latest --channel stable --version <ver>
 
-# 4. (optional) sign install.sh so Tier-B verify-before-run works.
-minisign -S -s /secure/xpf-image.sec -m scripts/dist/install.sh \
+# 4. Stamp install.sh (SUBSTITUTE the real archive key + apt base URL +
+#    default channel), THEN sign the STAMPED copy. Never sign the placeholder:
+#    the publish gate refuses an installer that still carries the placeholder
+#    key or an unsubstituted %%…%% marker, and REQUIRES install.sh be present
+#    (the Tier-A one-liner URL 404s without it — pass --no-installer to opt
+#    out). The stamp bakes the apt base URL so the piped one-liner needs no env.
+XPF_APT_BASE_URL=https://dl.example.com/xpf/apt \
+  python3 scripts/dist/publish.py stamp-installer \
+    --out dist/install.sh --channel stable
+#    (uses scripts/dist/xpf-archive-keyring.asc; --archive-key PATH to override)
+minisign -S -s /secure/xpf-image.sec -m dist/install.sh \
          -x dist/install.sh.minisig
-cp scripts/dist/install.sh dist/install.sh
 
 # 5. Fail-closed publish (refuses unsigned artifacts; uploads per URL).
 XPF_IMAGE_BASE_URL=https://dl.example.com/xpf \
@@ -144,14 +152,24 @@ Any mismatch fails the publish. `selftest.sh` (§5d) exercises the gate.
 ### Install (Tier A — one-liner)
 
 ```bash
-curl -fsSL https://dl.example.com/xpf/install.sh | sh
+curl -fsSL https://dl.example.com/xpf/install.sh | sudo sh
 ```
 
+`sudo` is required — the installer mutates the host (keyring, apt source, apt
+install), so a non-root run refuses before touching anything. The apt base URL
++ default channel are BAKED into `install.sh` at publish time
+(`publish.py stamp-installer`); a piped run needs no environment. Set
+`XPF_APT_BASE_URL` only to override the baked value or when running an unbaked
+copy.
+
 Trust level: TLS + first-fetch trust of `install.sh` (the same level
-Tailscale/Docker/rustup accept). `install.sh` preflights arch/distro/kernel
-(refuses kernel < 6.18 — use the appliance image on older hosts), installs the
-pinned archive keyring, writes the deb822 apt source, and `apt install
-xpf-appliance`.
+Tailscale/Docker/rustup accept). `install.sh` first VALIDATES all inputs
+(root, arch/distro/kernel — refuses kernel < 6.18, use the appliance image on
+older hosts — the archive key, and the apt URL/channel) BEFORE any mutation,
+then installs the pinned archive keyring, writes the deb822 apt source, and
+`apt install xpf-appliance`. If the `apt` step fails it removes the apt source
+it wrote, so a failed install never leaves a dangling repo that breaks
+`apt update`.
 
 ### Install (Tier B — verify before run)
 
@@ -161,8 +179,8 @@ git clone https://github.com/psaab/xpf && cp xpf/scripts/dist/xpf-image.pub .
 curl -fsSLO https://dl.example.com/xpf/install.sh
 curl -fsSLO https://dl.example.com/xpf/install.sh.minisig
 minisign -V -p xpf-image.pub -m install.sh -x install.sh.minisig
-# read install.sh, then:
-sh install.sh
+# read install.sh, then (the fetched installer is baked — no env needed):
+sudo sh install.sh
 ```
 
 ### Verify + import an image

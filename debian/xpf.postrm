@@ -70,6 +70,15 @@ CURRENT="$VERSIONS/current"
 # violation) and on a pre-B downgrade (the old postrm never learns about it).
 STAGED_GEN=/var/lib/xpf/staged-gen
 DROPIN=/etc/systemd/system/xpfd.service.d/10-xpf-version.conf
+# apt source that the Tailscale-style install.sh writes (#1924, H-16). It is
+# NOT a dpkg payload file (install.sh writes it, not the package), so dpkg
+# never removes it — but its Signed-By keyring IS package payload
+# (/usr/share/keyrings, debian/rules). On `apt remove` dpkg deletes the keyring
+# and would leave this source pointing at a now-missing keyring, breaking every
+# later `apt update`. We purge it here, but ONLY if WE wrote it (its marker
+# comment is present) so an operator-authored source is never touched.
+XPF_APT_SRC=/etc/apt/sources.list.d/xpf.sources
+XPF_APT_SRC_MARKER="Managed by install.sh"
 # #1985 hardened-layout version floor. This is the first package whose postrm
 # manages the #1964 versioned-runtime layout (versions/current + the unit
 # drop-in) on downgrade and whose xpfd answers `seed-runtime
@@ -141,6 +150,21 @@ remove_owned_sbin_links() {
     done
 }
 
+# remove_install_sh_apt_source removes the apt source that install.sh wrote,
+# but ONLY when it carries our marker comment (a "we wrote it" check mirroring
+# link_is_owned) — an operator-authored xpf.sources is left untouched (#1924,
+# H-16). Without this, `apt remove xpf` deletes the package-payload keyring and
+# strands this source, breaking `apt update` until a hand-delete. Best-effort /
+# idempotent (safe if absent).
+remove_install_sh_apt_source() {
+    [ -f "$XPF_APT_SRC" ] || return 0
+    if grep -qF "$XPF_APT_SRC_MARKER" "$XPF_APT_SRC" 2>/dev/null; then
+        echo "xpf: removing install.sh-written $XPF_APT_SRC so the removed" \
+             "keyring does not strand apt update." >&2
+        rm -f "$XPF_APT_SRC"
+    fi
+}
+
 # remove_runtime_dropin removes the #1964 versioned-runtime unit drop-in and
 # the now-empty .service.d dir, then boot-guarded daemon-reloads so systemd
 # drops the removed drop-in. Shared by the remove/purge and downgrade paths
@@ -209,6 +233,11 @@ case "$1" in
         # drop-in pins ExecStart to a deleted versions/<ver>/xpfd path and
         # leaves a broken unit. Safe if absent (legacy/never-seeded hosts).
         remove_runtime_dropin
+        # Purge the install.sh-written apt source (#1924, H-16): the keyring it
+        # references is package payload dpkg is deleting now, so leaving the
+        # source would break `apt update`. Marker-gated so operator sources are
+        # untouched.
+        remove_install_sh_apt_source
         if [ "$1" = "purge" ]; then
             # versions/ and staged-gen/ are package-derived (copied binaries),
             # not operator config — remove the whole trees on purge. staged-gen/
