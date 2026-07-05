@@ -638,11 +638,53 @@ pub(super) fn build_shared_cos_queue_leases_reusing_existing(
             .unwrap_or(1)
             .max(1);
         for queue in &iface.queues {
-            if !queue.exact || queue.transmit_rate_bytes == 0 {
+            if queue.transmit_rate_bytes == 0 {
                 continue;
             }
             let burst_bytes = queue.buffer_bytes.max(64 * 1500);
             let key = (ifindex, queue.queue_id);
+            if !queue.exact {
+                // #4265 (R-2): a non-exact GUARANTEED queue that runs the
+                // sharded `shared_exact` execution policy (its rate trips
+                // `COS_SHARED_EXACT_MIN_RATE_BYTES`, so it drains locally on
+                // EVERY worker rather than being funnelled to one owner) is
+                // serviced through `select_nonexact_cos_guarantee_batch`,
+                // which refilled a PRIVATE per-worker token bucket at the
+                // FULL configured rate — admitting the guarantee at up to
+                // N_workers x its rate. Attach a SHARED LEGACY lease
+                // (`SharedCoSQueueLease::new`, v8=None: one greedy-aggregate
+                // token bucket all workers draw from) so the class-wide
+                // guarantee admission is metered to the configured rate
+                // while staying work-conserving (a single busy worker can
+                // drain the whole shared pool). Low-rate non-exact queues
+                // stay single-owner (one worker services them; no
+                // over-admission) and get no lease. The legacy lease has no
+                // v8 epoch ledger, so it sidesteps the #4246 T-1 / R-5(a)
+                // accounting hole. `active_shards` sizing means a worker
+                // join/leave rebuilds the lease via `matches_config`, the
+                // same discipline the exact v8 lease uses.
+                if !queue.guarantee_enabled
+                    || queue.transmit_rate_bytes
+                        < crate::afxdp::worker::COS_SHARED_EXACT_MIN_RATE_BYTES
+                {
+                    continue;
+                }
+                if let Some(lease) = existing.get(&key).filter(|lease| {
+                    lease.matches_config(queue.transmit_rate_bytes, burst_bytes, active_shards)
+                }) {
+                    out.insert(key, lease.clone());
+                    continue;
+                }
+                out.insert(
+                    key,
+                    Arc::new(SharedCoSQueueLease::new(
+                        queue.transmit_rate_bytes,
+                        burst_bytes,
+                        active_shards,
+                    )),
+                );
+                continue;
+            }
             let rate_mode = if queue.equal_flow_enforcement {
                 V8RateMode::EqualFlowSuppress
             } else {

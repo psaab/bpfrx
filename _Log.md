@@ -1,3 +1,44 @@
+## 2026-07-05 — cos: meter non-exact guaranteed classes class-wide (#4265, R-2)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Fixed fable-review-166 finding R-2 — a non-exact
+    guaranteed class served by N workers on a shared (sharded) egress was
+    admitted at up to N_workers × its configured guaranteed rate because
+    each worker refilled a PRIVATE token bucket at the full rate in
+    `select_nonexact_cos_guarantee_batch` with no class-wide metering (a
+    shared lease was attached only to `exact` queues). Fix per the #4245
+    converged plan, option 1 (shared legacy lease): the coordinator
+    (`build_shared_cos_queue_leases_reusing_existing`) now builds a shared
+    LEGACY `SharedCoSQueueLease::new` (v8=None greedy-aggregate token
+    bucket) for non-exact guarantee_enabled queues whose rate trips
+    `COS_SHARED_EXACT_MIN_RATE_BYTES` (the sharded ones), Arc-reused via
+    `matches_config` (worker join/leave rebuilds on `active_shards`
+    change). The worker attaches whatever lease exists (dropped the
+    `queue.exact` gate). `select_nonexact_cos_guarantee_batch` now takes
+    the fast-path slice and refills through `maybe_top_up_cos_queue_lease`
+    (its pre-existing but unreachable non-exact-with-lease branch) instead
+    of `refill_cos_tokens`, so all N workers draw from ONE metered pool —
+    aggregate admission == configured rate, still work-conserving.
+    `apply_cos_send_result` / `apply_cos_prepared_result` now debit the
+    serviced queue's lease in the Guarantee phase regardless of `exact`
+    (renamed `exact_queue_idx` → `lease_consume_queue_idx`); the
+    queue-empty give-back in `refresh_cos_interface_activity` now fires for
+    any leased queue (gated on `has_lease`, not `exact`), routing through
+    `release_unused_v8` which reduces to legacy `release_unused` for a
+    v8=None lease. Single-owner low-rate non-exact queues are unchanged
+    (no lease → same per-worker refill). Legacy lease sidesteps the #4246
+    T-1 / R-5(a) v8-ledger hole. Added two tests
+    (`nonexact_guarantee_shared_lease_bounds_aggregate_admission_across_workers`,
+    `nonexact_guarantee_refill_is_gated_by_shared_lease_pool`), both RED on
+    revert. Docs: fairness-regimes.md (new R-2 subsection). Flagged: needs
+    a cluster CoS smoke with a non-exact guaranteed class on a shared
+    multi-worker egress (standard fixtures use exact classes).
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/cos_leases.rs,
+    userspace-dp/src/afxdp/worker/cos/mod.rs,
+    userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+    userspace-dp/src/afxdp/cos/queue_service/tests.rs,
+    userspace-dp/src/afxdp/cos/tx_completion.rs, docs/fairness-regimes.md
+
 ## 2026-07-05 — PR #4264 review fold (Copilot doc/comment accuracy, R-1/R-3/R-4)
 
 - **Timestamp**: 2026-07-05

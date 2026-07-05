@@ -73,7 +73,7 @@ fn nonexact_guarantee_skips_residual_only_scheduler_map_queue() {
     root.runnable_queues = 1;
 
     assert!(
-        select_nonexact_cos_guarantee_batch(&mut root, 1).is_none(),
+        select_nonexact_cos_guarantee_batch(&mut root, &[], 1).is_none(),
         "residual-only queue must not consume non-exact guarantee service"
     );
     assert!(matches!(
@@ -390,7 +390,7 @@ fn nonexact_guarantee_selects_explicit_transmit_rate_queue() {
     root.runnable_queues = 1;
 
     assert!(matches!(
-        select_nonexact_cos_guarantee_batch(&mut root, 1),
+        select_nonexact_cos_guarantee_batch(&mut root, &[], 1),
         Some(CoSBatch::Local {
             phase: CoSServicePhase::Guarantee,
             ..
@@ -427,7 +427,7 @@ fn fallback_root_shaped_default_queue_has_guarantee_service() {
     root.runnable_queues = 1;
 
     assert!(matches!(
-        select_nonexact_cos_guarantee_batch(&mut root, 1),
+        select_nonexact_cos_guarantee_batch(&mut root, &[], 1),
         Some(CoSBatch::Local {
             phase: CoSServicePhase::Guarantee,
             ..
@@ -933,7 +933,7 @@ fn exact_and_nonexact_guarantee_rr_cursors_advance_independently() {
     );
 
     // Serving a non-exact queue must not disturb the exact cursor.
-    let batch = select_nonexact_cos_guarantee_batch(&mut root, 1).expect("nonexact queue batch");
+    let batch = select_nonexact_cos_guarantee_batch(&mut root, &[], 1).expect("nonexact queue batch");
     match batch {
         CoSBatch::Local { queue_idx, .. } => assert_eq!(queue_idx, 1),
         CoSBatch::Prepared { .. } => panic!("expected local batch"),
@@ -980,7 +980,7 @@ fn exact_guarantee_rr_walks_exact_queues_in_order_independent_of_nonexact() {
         exact_order.push(selection.queue_idx);
         // Service a non-exact queue to simulate concurrent class activity;
         // ignore the result.
-        let _ = select_nonexact_cos_guarantee_batch(&mut root, 1);
+        let _ = select_nonexact_cos_guarantee_batch(&mut root, &[], 1);
     }
     assert_eq!(exact_order, vec![0, 2, 0, 2]);
 }
@@ -995,7 +995,7 @@ fn nonexact_guarantee_rr_walks_nonexact_queues_in_order_independent_of_exact() {
 
     let mut nonexact_order = Vec::new();
     for _ in 0..4 {
-        let batch = select_nonexact_cos_guarantee_batch(&mut root, 1).expect("nonexact batch");
+        let batch = select_nonexact_cos_guarantee_batch(&mut root, &[], 1).expect("nonexact batch");
         let queue_idx = match batch {
             CoSBatch::Local { queue_idx, .. } => queue_idx,
             CoSBatch::Prepared { queue_idx, .. } => queue_idx,
@@ -2489,7 +2489,7 @@ fn waterfill_guarantee_rate_skips_non_exact_queues() {
         let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
     }
     // After draining exacts, non-exact selector still works.
-    let batch = select_nonexact_cos_guarantee_batch(&mut root, 1);
+    let batch = select_nonexact_cos_guarantee_batch(&mut root, &[], 1);
     assert!(batch.is_some(), "non-exact RR must remain reachable");
 }
 
@@ -3893,5 +3893,166 @@ fn service_exact_guarantee_zero_tx_refunds_phase1_honor() {
     assert_eq!(
         counters.phase1_selected_no_progress, 1,
         "the refunded no-progress visit is recorded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #4265 (R-2): non-exact guaranteed classes must be metered class-wide, not
+// admitted at N_workers x their configured rate on a shared (sharded) egress.
+// ---------------------------------------------------------------------------
+
+/// A single non-exact GUARANTEED queue config with an explicit high
+/// transmit-rate — the shape that runs the sharded `shared_exact`
+/// execution policy (rate >= COS_SHARED_EXACT_MIN_RATE_BYTES) yet is
+/// serviced through `select_nonexact_cos_guarantee_batch` because it is
+/// not `exact`.
+fn nonexact_guarantee_queue(rate_bytes: u64) -> CoSQueueConfig {
+    CoSQueueConfig {
+        queue_id: 4,
+        forwarding_class: "iperf-be".into(),
+        priority: 5,
+        transmit_rate_bytes: rate_bytes,
+        guarantee_enabled: true,
+        exact: false,
+        surplus_sharing: false,
+        equal_flow_enforcement: false,
+        equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+        surplus_weight: 1,
+        buffer_bytes: 512 * 1024,
+        dscp_rewrite: None,
+        codel_target_ns: 0,
+    }
+}
+
+#[test]
+fn nonexact_guarantee_refill_is_gated_by_shared_lease_pool() {
+    // #4265 (R-2): the non-exact guarantee selector must meter its refill
+    // through the attached shared lease, NOT refill a private per-worker
+    // bucket at the full configured rate. Attach a lease whose shared pool
+    // is fully drained and cannot replenish within the call (no elapsed
+    // time), and confirm the selector grants ZERO tokens -> the queue stays
+    // token-starved and returns no batch, with `hot.tokens` left at 0.
+    //
+    // RED on revert: the pre-fix selector called `refill_cos_tokens`, which
+    // ignores the lease and refills `hot.tokens` to the buffer cap on the
+    // first refill -> a batch is returned and `hot.tokens > 0`.
+    let rate = 3_000_000_000u64 / 8; // 3 Gbps, >= COS_SHARED_EXACT_MIN_RATE_BYTES
+    let lease = Arc::new(SharedCoSQueueLease::new(rate, 256 * 1024, 6));
+
+    let t0 = 8 * TEST_EPOCH_DURATION_NS;
+    // Drain the shared pool to empty at t0 (a fresh lease starts with a
+    // burst of credit).
+    let drained = lease.acquire(t0, u64::MAX);
+    assert!(
+        drained > 0,
+        "a fresh legacy lease starts with a burst to drain"
+    );
+
+    let mut root = test_cos_runtime_with_queues(rate, vec![nonexact_guarantee_queue(rate)]);
+    root.tokens = u64::MAX / 2; // root shaper never caps
+    root.queues[0].hot.tokens = 0;
+    root.queues[0].hot.runnable = true;
+    root.queues[0].v_min.worker_id = 0;
+    for _ in 0..8 {
+        cos_queue_push_back(&mut root.queues[0], test_flow_cos_item(10_000, 1500));
+    }
+    let fp = vec![test_queue_fast_path(true, 0, None, Some(lease.clone()))];
+
+    // Same timestamp as the drain: no elapsed time, so the pool refills
+    // nothing and the queue must be starved of guarantee credit.
+    let batch = select_nonexact_cos_guarantee_batch(&mut root, &fp, t0);
+    assert!(
+        batch.is_none(),
+        "an empty shared lease must starve the non-exact guarantee; a batch here \
+         means the per-worker full-rate refill leaked through (the R-2 bug)"
+    );
+    assert_eq!(
+        root.queues[0].hot.tokens, 0,
+        "the selector must not refill a private per-worker bucket past the shared lease"
+    );
+}
+
+#[test]
+fn nonexact_guarantee_shared_lease_bounds_aggregate_admission_across_workers() {
+    // #4265 (R-2): a non-exact guaranteed class sharded across N workers
+    // must admit at AGGREGATE == its configured rate, not N x it. Before
+    // the fix each worker's `select_nonexact_cos_guarantee_batch` refilled a
+    // PRIVATE token bucket at the FULL rate, so N backlogged workers each
+    // admitted a full rate -> ~N x over-admit at guarantee priority. With
+    // the shared legacy lease attached, all N workers draw from ONE metered
+    // pool, so the class-wide admission is bounded near the configured rate.
+    //
+    // Model: N per-worker replicas of the same queue, each backlogged, all
+    // sharing one lease. Each tick every worker tops up through the selector
+    // then "sends" all the credit it acquired (draining `hot.tokens` and
+    // debiting the shared lease). The summed sends are the class-wide
+    // admission over the window.
+    //
+    // RED on revert: without the lease routing the per-worker refill makes
+    // the aggregate ~N x the configured rate.
+    const N: usize = 6;
+    let rate = 3_000_000_000u64 / 8; // 3 Gbps, >= COS_SHARED_EXACT_MIN_RATE_BYTES
+    let burst = 256 * 1024u64;
+    let lease = Arc::new(SharedCoSQueueLease::new(rate, burst, N));
+
+    let mut roots: Vec<CoSInterfaceRuntime> = Vec::with_capacity(N);
+    let mut fps: Vec<Vec<WorkerCoSQueueFastPath>> = Vec::with_capacity(N);
+    for w in 0..N {
+        let mut root = test_cos_runtime_with_queues(rate, vec![nonexact_guarantee_queue(rate)]);
+        root.queues[0].hot.runnable = true;
+        root.queues[0].v_min.worker_id = w as u32;
+        roots.push(root);
+        fps.push(vec![test_queue_fast_path(
+            true,
+            w as u32,
+            None,
+            Some(lease.clone()),
+        )]);
+    }
+
+    let start = 8 * TEST_EPOCH_DURATION_NS;
+    let step = TEST_EPOCH_DURATION_NS; // 200 us == one lease window
+    let ticks = 100u64; // 20 ms observation window
+    let mut aggregate_admitted = 0u64;
+
+    let mut now = start;
+    for _ in 0..ticks {
+        now += step;
+        for w in 0..N {
+            let root = &mut roots[w];
+            // Keep the queue backlogged and the root shaper uncapped so the
+            // per-queue shared lease is the only admission gate under test.
+            root.tokens = u64::MAX / 2;
+            while root.queues[0].hot.items.len() < 96 {
+                cos_queue_push_back(
+                    &mut root.queues[0],
+                    test_flow_cos_item(10_000 + w as u16, 500),
+                );
+            }
+            root.queues[0].hot.runnable = true;
+
+            let _ = select_nonexact_cos_guarantee_batch(root, &fps[w], now);
+
+            // A fully-backlogged worker sends everything it was granted this
+            // tick; debit the shared lease for those bytes.
+            let admitted = root.queues[0].hot.tokens;
+            aggregate_admitted = aggregate_admitted.saturating_add(admitted);
+            lease.consume(admitted);
+            root.queues[0].hot.tokens = 0;
+        }
+    }
+
+    let window_ns = ticks * step;
+    let expected = ((rate as u128) * (window_ns as u128) / 1_000_000_000u128) as u64;
+    assert!(
+        aggregate_admitted < 3 * expected,
+        "aggregate non-exact guarantee admission {aggregate_admitted} B over {window_ns} ns must \
+         stay bounded near the configured rate (expected ~{expected} B, N={N}); an aggregate \
+         approaching N x expected means each worker refilled a private full-rate bucket (the R-2 bug)"
+    );
+    assert!(
+        aggregate_admitted > expected / 2,
+        "aggregate admission {aggregate_admitted} B collapsed well below the configured rate \
+         (expected ~{expected} B) — the shared lease is over-throttling the class"
     );
 }
