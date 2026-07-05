@@ -1,3 +1,36 @@
+## 2026-07-04 — #4214 / #4215 (fable-review-165 H-5 / H-13): publish default-deny sweep + per-channel latest.json gate
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Closed two publish-gate escapes in `scripts/dist/publish.py`.
+    H-5 (#4214): the image orphan sweep was suffix-shaped — it only inspected
+    `.qcow2` / `.incus-metadata.tar.gz` and skipped every other file, so an
+    unsigned `dist/deb/*.deb` (staged there by `make deb`, which `make image`
+    invokes) rode the whole-tree upload to `XPF_IMAGE_BASE_URL` unsigned.
+    Rewrote the sweep as DEFAULT-DENY via `_is_allowed_publish_file`: every
+    file under the publish root (outside `apt/`) must be a manifest-covered
+    image artifact OR an expected sidecar (`*.SHA256SUMS`, `*.minisig`,
+    top-level `install.sh` / `xpf-image.pub` / `xpf-<ver>.manifest`, per-channel
+    `latest.json`); anything else blocks the publish. Also moved `DEB_OUT` out
+    of the publish root to a `dist-deb/` sibling so the mainline
+    `make image && make dist-publish` does not trip the stricter gate
+    (Makefile, bake.py, build-apt-repo.sh, cluster-setup.sh, README,
+    .gitignore).
+    H-13 (#4215): `gate_latest` verified only `--channel`'s `latest.json`;
+    other channels' pointers rode the tree unverified. Split out
+    `_gate_one_latest` and made `gate_latest` enumerate every
+    `dist/*/latest.json` — target channel keeps the version-present contract,
+    every other channel's pointer must carry a verifying signature (mirrors
+    `gate_apt`'s per-suite InRelease posture).
+  - selftest.sh: new §8g (default-deny sweep — clean set passes, stray `.deb`
+    refused) and §8h (every channel's latest.json signature-gated — unsigned
+    edge refused, signed edge passes); test debs stage in `dist-deb/`. All 39
+    checks pass. RED-on-revert confirmed independently: reverting the sweep
+    fails §8g H-5 only; reverting the loop fails §8h H-13 only. py_compile
+    publish.py + bake.py OK; shellcheck touched shell files rc=0.
+- **File(s)**: scripts/dist/publish.py, scripts/dist/selftest.sh,
+  scripts/image/bake.py, scripts/dist/build-apt-repo.sh, Makefile,
+  test/incus/cluster-setup.sh, README.md, .gitignore, _Log.md
+
 ## 2026-07-04 — #4197 / #4198 / #4199 (fable-review-165 H-2 / H-14 / H-16): install.sh + publish tooling
 
 - **Timestamp**: 2026-07-04
