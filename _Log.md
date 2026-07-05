@@ -35745,3 +35745,23 @@ top.
   pkg/config/compiler_firewall.go, pkg/config/compiler_cos_tcp_hb167_test.go,
   pkg/config/compiler_f3_hb167_test.go, docs/cos-traffic-shaping.md,
   docs/config-schema.md, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-05
+- **Action**: fable-167 C-1c review MINOR fold on PR #4317. The `request
+  security policies check` lint (policyMatchIsSuperset) disqualified only
+  the EARLIER policy's excluded match sense, ignoring
+  source/destination-address-excluded on the LATER candidate-shadowed
+  policy — so earlier `permit source-address [A]` vs later `deny
+  source-address [A] source-address-excluded` (DISJOINT match sets, fully
+  reachable) was falsely reported SHADOWED/UNREACHABLE. Added a b-excluded
+  guard (both src + dst) in cli_request_policies_check.go so an inverted
+  sense on EITHER side returns not-a-superset (no-false-positive contract).
+  Also merged origin/master (10 commits incl. #4311 System / #4303 syslog);
+  unioned _Log.md + docs/config-schema.md (both additive).
+- **Validation**: new no-FP test green + proven RED under the guard revert
+  (both src+dst-excluded later policies falsely SHADOWED); genuine-shadow
+  case still reported. go test ./pkg/config/... ./pkg/cli/...
+  ./pkg/cmdtree/... ./pkg/natshow/... green; go build ./... clean;
+  gofmt + vet clean.
+- **File(s)**: pkg/cli/cli_request_policies_check.go,
+  pkg/cli/cli_request_policies_check_test.go, _Log.md

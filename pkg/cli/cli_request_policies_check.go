@@ -84,14 +84,31 @@ func analyzePolicyShadowing(cfg *config.Config) []string {
 }
 
 // policyMatchIsSuperset reports whether policy a matches a superset of the
-// traffic policy b matches, using conservative name-set containment. a is
-// disqualified as a shadower if it inverts a match sense or is schedule-gated.
+// traffic policy b matches, using conservative name-set containment. It is
+// disqualified (returns false, the safe no-shadow answer) whenever EITHER
+// policy inverts a match sense, or a is schedule-gated.
+//
+// An excluded (`source-address-excluded` / `destination-address-excluded`)
+// sense makes the match set the COMPLEMENT of the named set, so a plain
+// name-set containment no longer proves coverage. It must disqualify on BOTH
+// sides, not just a: if b (the later, candidate-shadowed policy) is excluded,
+// the two match sets can be disjoint even when the named sets are identical —
+// e.g. earlier `permit source-address [A]` vs later `deny source-address [A]
+// source-address-excluded` matches src∈{A} vs src∉{A}, which is FULLY
+// reachable, not shadowed. Ignoring b's excluded flags produced that false
+// positive (fable-167 C-1c review MINOR); a lint that cries wolf on an
+// advisory erodes trust, so the no-false-positive contract wins over
+// completeness here.
 func policyMatchIsSuperset(a, b *config.Policy) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	// An inverted or schedule-gated policy does not cover a plain superset.
+	// An inverted match sense on EITHER policy breaks plain name-set
+	// containment; a schedule-gated shadower is not always active.
 	if a.Match.SourceAddressExcluded || a.Match.DestinationAddressExcluded {
+		return false
+	}
+	if b.Match.SourceAddressExcluded || b.Match.DestinationAddressExcluded {
 		return false
 	}
 	if a.SchedulerName != "" {
