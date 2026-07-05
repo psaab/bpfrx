@@ -801,12 +801,32 @@ func ValidateConfig(cfg *Config) []string {
 			if iface == nil {
 				continue
 			}
+			// #hb166 G-6: a class-of-service binding whose interface (or
+			// logical unit) is not configured under [interfaces] commits
+			// cleanly but shapes nothing — the dataplane applier only
+			// visits CoS bindings inside the cfg.Interfaces iteration, so
+			// a typo'd interface name or an unconfigured unit is a silent
+			// no-op. Warn (not reject: the interface could be added
+			// later) so the operator knows the binding is currently inert.
+			ifCfg := cfg.Interfaces.Interfaces[iface.Name]
+			if ifCfg == nil {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service interface %s is bound but not configured under [interfaces]; its shaping/classifiers are inert until the interface is configured",
+					iface.Name))
+			}
 			if iface.Level != nil {
 				warnPriorityLowMinShareInert(iface.Level.PriorityLowMinShareBytes)
 			}
 			for _, unit := range iface.Units {
 				if unit == nil {
 					continue
+				}
+				if ifCfg != nil {
+					if _, ok := ifCfg.Units[unit.Unit]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d is bound but unit %d is not configured under [interfaces %s]; its shaping/classifiers are inert",
+							iface.Name, unit.Unit, unit.Unit, iface.Name))
+					}
 				}
 				warnPriorityLowMinShareInert(unit.PriorityLowMinShareBytes)
 				if unit.SchedulerMap != "" {

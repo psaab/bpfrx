@@ -731,11 +731,11 @@ func FormatFairnessRSS(status userspace.ProcessStatus, expectations []userspace.
 	if results := userspace.EvaluateFairnessRSSExpectations(status, expectations); len(results) > 0 {
 		fmt.Fprintln(&b)
 		fmt.Fprintln(&b, "RSS expectations:")
-		fmt.Fprintf(&b, "  %-8s %-7s %-28s %-6s %-11s %-13s %-10s %s\n",
-			"Ifindex", "Queue", "Expectation", "Pass", "ActiveFlows", "ActiveWorkers", "Cstruct", "Reason")
+		fmt.Fprintf(&b, "  %-12s %-7s %-28s %-6s %-11s %-13s %-10s %s\n",
+			"Interface", "Queue", "Expectation", "Pass", "ActiveFlows", "ActiveWorkers", "Cstruct", "Reason")
 		for _, result := range results {
-			fmt.Fprintf(&b, "  %-8d %-7d %-28s %-6t %-11d %-13d %-10.6f %s\n",
-				result.Ifindex,
+			fmt.Fprintf(&b, "  %-12s %-7d %-28s %-6t %-11d %-13d %-10.6f %s\n",
+				result.Interface,
 				result.QueueID,
 				result.Expectation,
 				result.Pass,
