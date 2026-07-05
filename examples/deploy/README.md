@@ -31,10 +31,20 @@ shown below, and the config layer translates):
 
 You write the `role` you expect at each position; the tool computes the
 real name and refuses to launch on a mismatch — a miswired definition
-fails on your laptop, not in production. (The guest applies a
-`virtio-first` tiebreaker so mgmt/control stay `fxp0`/`em0`; identical
-to pure position in every normal layout. Confirm with `show interfaces
-terse` after boot.)
+fails on your laptop, not in production.
+
+**Order virtio-class NICs before hardware-class NICs.** The guest does
+not name NICs purely by attach order: `enumeratePCINICs()`
+(`pkg/daemon/linksetup.go`) sorts **virtio-class** backings
+(`net`/`bridge`/`macvlan` → `virtio_net`) *ahead of* **hardware-class**
+backings (`sriov`/`physical`/`pci` → the passthrough driver) before it
+assigns the positional names above. So the position → name contract only
+holds when every virtio-class NIC precedes every hardware-class NIC in
+your list. If you list a virtio-class NIC *after* a hardware-class one,
+the guest renames it to an earlier slot and the zones/policies/NAT land
+on **swapped ports** (e.g. trust ↔ untrust). The tool rejects that
+layout at validate time and names the two interfaces to reorder. Always
+confirm the final map with `show interfaces terse` after boot.
 
 ## Files
 

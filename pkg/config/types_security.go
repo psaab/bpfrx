@@ -753,6 +753,17 @@ type ScreenProfile struct {
 	UDP          UDPScreen
 	LimitSession LimitSessionScreen
 
+	// AlarmWithoutDrop is the Junos `alarm-without-drop` ids-option: a
+	// profile-wide audit/log-only mode. When set, every check in this
+	// screen profile that would otherwise DROP a packet instead raises a
+	// log-only ALARM event (the same reason string a drop would emit) and
+	// FORWARDS the packet. It is the standard vSRX threshold-tuning posture
+	// (observe the attack under live traffic without impacting forwarding).
+	// It applies to ALL ids-options in the profile, including the
+	// rate-based flood / SYN-cookie checks. Default false = today's
+	// drop-on-trip behavior.
+	AlarmWithoutDrop bool
+
 	// BadNumeric records screen numeric leaves whose explicitly-provided value
 	// failed to parse as a positive integer (#3317). compileScreen previously
 	// swallowed the strconv.Atoi error and fell back to a Junos default or to

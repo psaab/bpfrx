@@ -29,6 +29,7 @@ fn default_profile() -> ScreenProfile {
         session_limit_dst: 0,
         port_scan_threshold: 0,
         ip_sweep_threshold: 0,
+        alarm_without_drop: false,
     }
 }
 
@@ -3110,6 +3111,87 @@ fn syn_cookie_invalid_ack_does_not_validate_client() {
         SynCookieAckVerdict::Invalid
     );
     assert_eq!(state.syn_cookie_validated_len(), 0);
+}
+
+// fable-review-164 L-10 fold: under `alarm-without-drop`, the SYN-cookie path
+// must stay profile-wide -- FORWARD + alarm, never drop. A zone in syn-cookie
+// mode that crosses attack-threshold marks itself cookie-active as a
+// SIDE-EFFECT of `check_packet` (BEFORE the challenge verdict is converted to a
+// log-only alarm + Pass by the consumer). Because audit mode never actually
+// mints cookies on the wire, any returning session-miss ACK is unvalidatable;
+// if the zone were marked cookie-active, `validate_syn_cookie_ack_on_session_miss`
+// would DROP it as `Invalid`. Gating the cookie-active marking on
+// `!alarm_without_drop` keeps `locally_active` false so the ACK is
+// `NotApplicable` (forwards). The non-audit control proves the normal
+// SYN-cookie flow is UNCHANGED (still Invalid -> drop).
+//
+// FAIL-ON-REVERT: remove the `!alarm_without_drop` gate on the
+// `syn_cookie_active_until_secs` set and the audit assertion flips to Invalid.
+#[test]
+fn syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10() {
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = 0xdead_beefu32; // not a valid cookie
+
+    // Audit mode: crossing SYN still mints a challenge (the consumer converts
+    // it to alarm + Pass), but the zone is NOT marked cookie-active, so the
+    // returning invalid ACK is NotApplicable (forwards) rather than Invalid.
+    let mut audit = ScreenProfile::default();
+    audit.syn_flood_threshold = 1;
+    audit.syn_cookie = true;
+    audit.alarm_without_drop = true;
+    let mut astate = make_state("trust", audit);
+    astate.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    astate.set_syn_cookie_full_epoch_for_test(1);
+    assert_eq!(
+        astate.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    assert!(
+        matches!(
+            astate.check_packet_with_zone_id("trust", 7, &syn, 128),
+            ScreenVerdict::SynCookieChallenge(_)
+        ),
+        "audit mode still mints the challenge verdict (converted to alarm+Pass \
+         by the consumer)"
+    );
+    assert_eq!(
+        astate.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::NotApplicable,
+        "alarm-without-drop must FORWARD the returning session-miss ACK, not \
+         drop it as Invalid"
+    );
+
+    // Non-audit control (identical inputs, alarm_without_drop = false): the
+    // zone IS marked cookie-active and the invalid ACK is dropped as Invalid.
+    // Proves the normal SYN-cookie flow is unchanged by the fold.
+    let mut normal = ScreenProfile::default();
+    normal.syn_flood_threshold = 1;
+    normal.syn_cookie = true;
+    let mut nstate = make_state("trust", normal);
+    nstate.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    nstate.set_syn_cookie_full_epoch_for_test(1);
+    assert_eq!(
+        nstate.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    assert!(matches!(
+        nstate.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::SynCookieChallenge(_)
+    ));
+    assert_eq!(
+        nstate.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::Invalid,
+        "non-audit syn-cookie flow must still drop the invalid ACK (unchanged)"
+    );
 }
 
 #[test]

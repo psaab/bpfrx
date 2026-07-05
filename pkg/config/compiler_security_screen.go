@@ -246,6 +246,20 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			switch fam.Name() {
 			case "icmp", "ip", "tcp", "udp", "limit-session":
 				// handled below
+			case "alarm-without-drop":
+				// Junos profile-wide audit/log-only mode. A boolean flag
+				// leaf directly under the ids-option (no value, no
+				// sub-stanza). When set, every check in this profile that
+				// would drop instead raises a log-only alarm and forwards
+				// (the dataplane converts the Drop verdict to a
+				// PERMIT/alarm). Record any trailing garbage so the #3318
+				// unknown-leaf gate still rejects it. Because the leaf is a
+				// known childless schema node, a flat-set trailing token
+				// (`alarm-without-drop bogus`) parks as a CHILD rather than
+				// collapsing onto Keys, so both shapes are checked.
+				profile.AlarmWithoutDrop = true
+				recordKeyExtras("alarm-without-drop", fam, 1)
+				recordChildExtras("alarm-without-drop", fam)
 			default:
 				profile.UnknownLeaves = append(profile.UnknownLeaves, fam.Name())
 			}

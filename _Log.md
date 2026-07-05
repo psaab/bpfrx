@@ -47,6 +47,81 @@
     pkg/daemon/linksetup_collision_4178_test.go,
     pkg/daemon/config_arrival_naming_4179_test.go,
     docs/critical-patterns.md, docs/bare-metal-device-map.md, _Log.md
+## 2026-07-04 — #4180 (fable-review-165 H-22): deploy role validation ignored the guest virtio-first PCI tiebreaker — virtio-after-hardware silently swaps zones
+
+- **Timestamp**: 2026-07-04
+  - **Action**: `scripts/deploy/xpf-deploy.py` `validate_appliance()`
+    checked each declared `role` against its raw LIST INDEX only
+    (`expected_name(i, ...)`), but the guest does not name NICs by attach
+    order. `enumeratePCINICs()` (`pkg/daemon/linksetup.go:189-204`) sorts
+    NICs with a virtio-first tiebreaker (`sk=0` for `virtio_net`, `sk=1`
+    for hardware) BEFORE `assignName()` assigns positional vSRX names. So
+    a YAML/`--nic` list that put a virtio-class NIC (`net`/`bridge`/
+    `macvlan`) AFTER a hardware-class NIC (`sriov`/`physical`/`pci`)
+    passed validation but booted with the firewall zones/policies/NAT on
+    SWAPPED ports (trust/untrust inverted) — a silent security miswiring.
+  - **Fix**: classify each backing virtio-class vs hardware-class
+    (`VIRTIO_BACKINGS`/`HARDWARE_BACKINGS` + `backing_sort_key()`,
+    mirroring the guest `sk=0`/`sk=1` rule) and FAIL CLOSED (`die()`) in
+    `validate_appliance` when a virtio-class interface appears after a
+    hardware-class one, naming both offending positions and telling the
+    operator to reorder. Chose reject over silent reorder because the
+    zone→vSRX-name binding lives in the operator's day-0 `.conf` (which
+    the tool does not rewrite); reordering could still land the intended
+    backing on a different vSRX name invisibly. Reject keeps the existing
+    "position is the contract" guarantee honest.
+  - **Test**: `scripts/deploy/test_xpf_deploy_nicorder.py` (11 tests,
+    mirrors the H-20 `test_xpf_deploy_disk.py` pattern) — asserts the
+    virtio-after-hardware layout is rejected (with/without roles,
+    standalone + cluster), the reordered set validates with correct
+    positional names, pure-virtio/pure-hardware pass, and all shipped
+    example YAMLs satisfy the guard. RED-on-revert verified: dropping the
+    guard un-raises the four rejection tests.
+  - **Docs**: `docs/deploy-quickstart.md` "60-second mental model" and
+    `examples/deploy/README.md` "naming contract is positional" — replaced
+    the "identical to pure position in every normal layout" hand-wave
+    with the explicit virtio-first rule + the new validate-time reject.
+  - **File(s)**: `scripts/deploy/xpf-deploy.py`,
+    `scripts/deploy/test_xpf_deploy_nicorder.py`,
+    `docs/deploy-quickstart.md`, `examples/deploy/README.md`, `_Log.md`
+
+## 2026-07-04 — #4175 (fable-review-165 H-1): day-0 config-drive retry permanently dead — loader guarded on bare .configdb directory
+
+- **Timestamp**: 2026-07-04
+  - **Action**: The day-0 config-drive loader's "already configured,
+    skip the probe" guard tested bare directory existence
+    (`[ -e "$XPF_DIR/.configdb" ]`, `scripts/image/xpf-day0-config`).
+    But xpfd durably creates that directory on EVERY start
+    (`pkg/configstore/db.go` `NewDB` → `MkdirAllDurable`, via
+    `configstore.New` → `daemon.New`, before any commit). So after the
+    very first boot the empty `.configdb` dir exists → the loader logged
+    "system already configured" and NEVER re-probed the medium,
+    permanently defeating its own documented reject → fix → reboot retry
+    contract (`xpf-day0-config` Retriability note; `docs/install-images.md`
+    Recovery). The COMMITTED config is `active.json`, written only on
+    commit/sync/rollback; a rejected/absent drive enters factory
+    bootstrap without ever writing it.
+  - **Fix**: guard on the COMMITTED artifact, not the directory. Changed
+    the guard to `have_committed_config()` testing
+    `[ -e "$XPF_DIR/.configdb/active.json" ]`, and fixed the misleading
+    log line to "committed config present (…/active.json) — system
+    already configured". Chose the script-only active.json path (smallest,
+    version-skew-safe) over an `xpfd config-state`/EverCommitted
+    subcommand: reading the #1922 committed marker needs envelope-header
+    parsing + master-key handling, not trivial, and the subcommand adds a
+    version-skew surface the script-only fix avoids. Added a source-guard
+    (`XPF_DAY0_SOURCE_ONLY=1`) so the loader can be sourced for unit tests.
+    Updated the loader header comment and `docs/install-images.md`
+    (first-boot contract table + loader specifics).
+  - **Test**: new `test/image/day0-configdb-guard-test.sh` — 5 scenarios
+    (3 unit on `have_committed_config`, 2 integration driving `main()`
+    with stubbed probes). RED-on-revert proven: reverting the guard to
+    the bare `.configdb` dir makes scenarios A (empty dir must re-probe)
+    and D (main must reach the probe) FAIL with exit 1. shellcheck clean
+    on both the loader and the test.
+  - **File(s)**: scripts/image/xpf-day0-config,
+    test/image/day0-configdb-guard-test.sh, docs/install-images.md,
+    _Log.md
 
 ## 2026-07-04 — #4172 (fable-review-165 H-3): frr-pythontools missing from baked image + metapackage
 
@@ -33800,6 +33875,82 @@ top.
   _Log.md
 
 - **Timestamp**: 2026-07-04
+- **Action**: Implement Junos `alarm-without-drop` screen ids-option
+  (audit/log-only mode) — fable-review-164 L-10 / issue #4170. The
+  profile-wide option was hard-rejected at commit: the `compileScreen`
+  top-level family switch accepted only icmp/ip/tcp/udp/limit-session, so
+  `alarm-without-drop` landed in UnknownLeaves and
+  `validateScreenUnknownStrict` (#3318) failed the commit. Wired the full
+  Go→Rust path so a tripped screen still ALARMS (logs the attack, counts
+  it) but FORWARDS the packet — the standard vSRX threshold-tuning
+  posture. Go: `ScreenProfile.AlarmWithoutDrop`, the `case
+  "alarm-without-drop"` compiler arm (recordKeyExtras + recordChildExtras
+  so a flat-set trailing token still rejects), the `ids-option` schema
+  flag leaf, and the `ScreenProfileSnapshot.AlarmWithoutDrop` wire field
+  (omitempty). Rust: the snapshot field (`skip_serializing_if =
+  bool_is_false` to keep the protocol_wire_v1 fixture byte-identical),
+  the runtime `ScreenProfile.alarm_without_drop`, the forwarding-build
+  mapping, and `ScreenState::alarm_without_drop`/`record_alarm_without_drop`.
+  The verdict consumers (`stage_screen_check` flowless + flow paths in
+  poll_stages.rs, and the scan/sweep + session-limit site in
+  poll_descriptor) convert a `ScreenVerdict::Drop` (and the flow-path
+  `SynCookieChallenge`) into a log-only PERMIT alarm carrying the tripped
+  reason (via `emit_screen_alarm_event`, mirroring the #3315
+  syn-flood-alarm path) and return Pass instead of dropping. Applies
+  profile-wide to every check including the rate-based flood / SYN-cookie
+  paths. A check-less alarm-without-drop profile is a no-op (not
+  published). RED-on-revert: pkg/config test (compile-threads + schema-
+  accept + trailing-token-reject), pkg/dataplane/userspace test (snapshot
+  carries the flag + JSON round-trip + legacy skew + check-less not
+  published), and Rust `alarm_without_drop_forwards_but_alarms_l10`
+  (flowless teardrop AND flow-path land: baseline DROPS, alarm mode
+  FORWARDS with alarm counter == 1). go test ./pkg/config/... +
+  ./pkg/dataplane/userspace/... green; FULL `cargo test --release
+  --test-threads=1` green (3527 lib + 46 + 8 + 16 + 1, 0 failed);
+  `go build ./...` clean; rustfmt/gofmt/vet clean. Docs: feature-gaps.md
+  Screen/IDS row marked Done.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_screen.go, pkg/config/schema_security.go,
+  pkg/config/screen_alarm_without_drop_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/screens.go,
+  pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-gaps.md,
+  _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fold hostile-review MINOR on PR #4176 (alarm-without-drop) —
+  close the SYN-cookie ACK gap so the "profile-wide including SYN-cookie"
+  contract genuinely holds. `check_packet` marks a zone SYN-cookie-active
+  (`syn_cookie_active_until_secs[zone]`) as a side-effect when it crosses
+  attack-threshold, BEFORE the `SynCookieChallenge` verdict is converted
+  to a log-only alarm + Pass by the consumer. Since audit mode never
+  mints cookies on the wire, that marking armed
+  `validate_syn_cookie_ack_on_session_miss` to DROP every returning
+  session-miss ACK as `Invalid` (the only drop branch, reachable only
+  when `locally_active`) — escaping the audit contract for that path.
+  Root-cause fix (approach a): gate the cookie-active marking at
+  screen/mod.rs on `!alarm_without_drop` (copied from the profile with
+  the other scalars). In audit mode `locally_active` stays false → the
+  ACK validation returns `NotApplicable` → the ACK forwards; the per-source
+  cap is also no longer skipped (correct — the check should still run and
+  alarm). The challenge is still minted and returned (consumer converts to
+  alarm + Pass), and the non-audit flow is bit-identical (gate is a no-op
+  when the flag is false). No change to the consumer stage was needed
+  (Invalid is unreachable for an audit zone). Test:
+  `syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10` — audit
+  zone crossing attack-threshold still mints the challenge but a returning
+  invalid ACK is `NotApplicable` (forwards); a non-audit control with
+  identical inputs still returns `Invalid` (drops) — RED-on-revert of the
+  gate. FULL `cargo test --release --test-threads=1` green (3528 + 46 + 8
+  + 16 + 1, 0 failed; wire-invariant fixture unchanged/byte-identical);
+  `go build ./...` clean; rustfmt clean. Doc: feature-gaps.md SYN-cookie
+  claim made precise.
+- **File(s)**: userspace-dp/src/screen/mod.rs,
+  userspace-dp/src/screen/tests.rs, docs/feature-gaps.md, _Log.md
 - **Action**: fable-165 H-20 — libvirt deploy attached the shared golden
   qcow2 to every VM as a WRITABLE `--disk`, so an HA pair booted two live
   domains off ONE file (qcow2 is not a cluster filesystem → concurrent
