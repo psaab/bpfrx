@@ -3491,6 +3491,30 @@ the value sits in a single typed slot:
     invalid values from persisting, it does not make the knob enforced.
     Per-application `inactivity-timeout` (#3227) is a separate, fully-enforced
     idle-timeout knob and is unaffected.
+  - `security flow` accepted-only knobs (#4231, fable-167 P-3): five leaves
+    that previously had no schema entry and no compiler case, so they committed
+    clean and did nothing with zero operator signal. Now typed +
+    compiler-recorded: `route-change-timeout` and `multicast-session-lifetime`
+    (`ValidateInteger(0, MaxDurationSeconds)`, seconds, 0 = unset), and three
+    presence flags `sync-icmp-session`, `force-ip-reassembly`,
+    `preserve-incoming-fragment-size`. None reach the dataplane wire; each
+    emits an accepted-only commit advisory (`compiler_validate_warn.go`,
+    `security flow ... accepted-only`, the #2078 doctrine).
+    `sync-icmp-session` carries a stronger, HA-specific advisory because the
+    userspace dataplane does NOT sync ICMP sessions to the peer — those flows
+    are not replicated and will not survive a failover.
+  - Container-level accepted-but-inert advisories (#4232, fable-167 P-4): the
+    `setSchema` gate is opt-in (unknown keywords pass to the compiler), and the
+    exhaustive policy `match`/`then` gates (#3113/#3114/#3115) do NOT cover the
+    `policy <name>` level itself or the `security alg <proto>` level, so a
+    typo'd direct policy child (`descripton`, `scheduler-nam`) and an
+    unimplemented ALG proto (`h323`, `msrpc`, ...) were silently dropped.
+    `compilePolicy` now records unrecognized policy children
+    (`Policy.UnknownChildren`) and `compileALG` records unwired ALG protos
+    (`ALGConfig.UnsupportedProtos`); `compiler_validate_warn.go` emits an
+    accepted-but-inert / probable-typo advisory for each. These are advisories,
+    not strict rejects — a harder allowlist-reject at these container levels is
+    the deeper parity move and is deferred.
   - `forwarding-options sampling instance <i> input rate` —
     `ValidateInteger(0, maxWireU32)`. **0 is accepted** (the documented
     `0 = sample all` sentinel, `types_system.go`; Layer A normalizes

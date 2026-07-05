@@ -631,6 +631,36 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		sec.Flow.PowerModeDisable = true
 	}
 
+	// #4231 (fable-167 P-3): five accepted-only knobs. Record presence so
+	// validateSecurityFlowAcceptedOnly (compiler_validate_warn.go) can emit
+	// the #2078-style advisory. A non-integer value on the two duration knobs
+	// is rejected at strict commit by the schema typed-leaf validator; on the
+	// tolerant load path it is left at 0 (treated as unset). None of these
+	// reach the dataplane wire — they capture operator intent only.
+	if n := node.FindChild("route-change-timeout"); n != nil {
+		if len(n.Keys) >= 2 {
+			if v, err := strconv.Atoi(n.Keys[1]); err == nil {
+				sec.Flow.RouteChangeTimeout = v
+			}
+		}
+	}
+	if node.FindChild("sync-icmp-session") != nil {
+		sec.Flow.SyncICMPSession = true
+	}
+	if node.FindChild("force-ip-reassembly") != nil {
+		sec.Flow.ForceIPReassembly = true
+	}
+	if n := node.FindChild("multicast-session-lifetime"); n != nil {
+		if len(n.Keys) >= 2 {
+			if v, err := strconv.Atoi(n.Keys[1]); err == nil {
+				sec.Flow.MulticastSessionLifetime = v
+			}
+		}
+	}
+	if node.FindChild("preserve-incoming-fragment-size") != nil {
+		sec.Flow.PreserveIncomingFragmentSize = true
+	}
+
 	// syn-flood-protection-mode
 	if spNode := node.FindChild("syn-flood-protection-mode"); spNode != nil {
 		if len(spNode.Keys) >= 2 {
