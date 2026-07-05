@@ -345,3 +345,42 @@ restart the daemon re-applies the full snapshot and re-runs
 re-resolves and re-syncs the fabric MACs within seconds. The persisted
 fabric set is therefore the **observability snapshot** (so `show` reflects
 the resolved truth), not the restore source.
+
+## Screens are not re-run on fabric-redirected traffic (#4155)
+
+A packet that ingresses the **non-owner** node for a session the RG **owner**
+owns is screened on the ingress node and then fabric-redirected to the owner
+(the Fix 1 path above). Before #4155 the owner **re-ran** the full screen stage
+on that redirected packet, so the **rate-based flood counters** (`icmp-flood`,
+`udp-flood`, `syn-flood`) counted the **same packet twice** against the
+per-zone / per-destination flood thresholds. A legitimate high-pps synced
+session could then false-trip a flood `Drop` on the owner — dropping exactly the
+traffic fabric forwarding exists to keep alive during failback /
+asymmetric-routing windows. This also diverges from vSRX, which does not
+re-apply screens to fabric-forwarded traffic.
+
+**Fix.** Stage 9 (`stage_classify_fabric_ingress`, `afxdp/poll_stages.rs`)
+already sets `FABRIC_INGRESS_FLAG` on `meta.meta_flags` for a fabric-redirected
+packet. Stage 10 (`stage_screen_check`) now derives
+`skip_rate_flood = (meta.meta_flags & FABRIC_INGRESS_FLAG) != 0` and threads it
+into `ScreenState::check_packet_with_zone_id_opts` /
+`check_flowless_screens_opts` (`screen/mod.rs`). When set, the screen runtime
+runs the **stateless** per-packet screens (land, ping-of-death, teardrop,
+icmp-fragment, source-route — idempotent, so re-running them on the owner is
+correct) and then returns before the **rate-based** flood counters, so the
+owner never re-counts the packet. The per-destination flood sketches (#4132) are
+left intact — the fix skips the re-count, it does not disable the screen. The
+per-`(zone, src)` **scan/sweep** new-flow counter is skipped the same way at the
+session-miss decision in `poll_descriptor/mod.rs` (gated on
+`packet_fabric_ingress`), for the sync-race window in which a fabric-redirected
+packet arrives before its synced session installs; the per-IP session-limit
+check there still runs because it guards the owner's own `SessionTable`, which
+the ingress node did not populate.
+
+The flood screen therefore fires **once**, on the true cluster-ingress node.
+RED-on-revert coverage: `screen/tests.rs`
+(`fabric_skip_does_not_count_{icmp,udp,syn}_flood_4155`,
+`fabric_skip_leaves_direct_ingress_counting_intact_4155`, plus the stateless
+scope guards) and `afxdp/poll_stages.rs`
+(`fabric_ingress_skips_rate_flood_direct_still_counts_4155`, driving the live
+`stage_screen_check`).

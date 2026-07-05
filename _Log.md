@@ -33351,3 +33351,39 @@ top.
     already covered by the doc's "empty/malformed/non-/96 prefix" wording).
   - **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
     _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: #4155 (fable-review-164 M-4) — rate-based flood screens re-run
+    on the RG owner for fabric-redirected (already-screened) traffic,
+    double-counting against the per-zone / per-destination flood thresholds. In
+    a chassis cluster a packet ingressing the non-owner node is screened there,
+    fabric-redirected to the owner, and the owner re-ran `stage_screen_check` →
+    the SAME packet ticked the icmp/udp/syn-flood counters a second time, so a
+    legit high-pps synced session could false-trip a flood Drop and defeat
+    fabric cross-chassis forwarding (vSRX does not re-screen fabric traffic).
+    Fix: stage 9 already sets `FABRIC_INGRESS_FLAG` on `meta.meta_flags`;
+    `stage_screen_check` now derives
+    `skip_rate_flood = (meta.meta_flags & FABRIC_INGRESS_FLAG) != 0` and threads
+    it into new `ScreenState::check_packet_with_zone_id_opts` /
+    `check_flowless_screens_opts` entry points (the old signatures are thin
+    wrappers passing `false`, so ~55 existing callers/tests are untouched). When
+    set, the stateless per-packet screens (land, ping-of-death, teardrop,
+    icmp-fragment, source-route) still run — idempotent — and the method returns
+    Pass BEFORE the rate flood counters, so the owner does not re-count. The
+    per-`(zone,src)` scan/sweep new-flow counter is skipped the same way
+    (`packet_fabric_ingress`) at the session-miss decision in
+    `poll_descriptor/mod.rs`; the per-IP session-limit check there still runs
+    (it guards the owner's own SessionTable). The #4132 per-destination flood
+    sketches are untouched — the fix skips the re-count, not the screen.
+    RED-on-revert: 7 screen-runtime unit tests + 1 poll_stages integration test
+    driving the LIVE `stage_screen_check` (fabric UDP fragment never drops; a
+    direct-ingress stream drops at the correct threshold+1). Verified by
+    neutering both gates — the 6 rate-flood tests go RED, the 2 stateless-scope
+    guards stay green (proving the skip is rate-only). FULL cargo test --release
+    green; go build ./... green. Docs: docs/fabric-cross-chassis-fwd.md +
+    userspace-dp/src/afxdp/README.md screen bullet.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/screen/tests.rs, docs/fabric-cross-chassis-fwd.md,
+    userspace-dp/src/afxdp/README.md, _Log.md

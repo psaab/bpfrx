@@ -4685,3 +4685,156 @@ fn flowless_clean_non_first_fragment_passes() {
         ScreenVerdict::Pass
     );
 }
+
+// ================================================================
+// #4155: fabric-redirected traffic must NOT re-run the rate-based
+// flood counters on the RG owner (already screened on ingress).
+// The `_opts(..., skip_rate_flood = true)` entry points model the
+// FABRIC_INGRESS_FLAG path; the stateless screens still run.
+// ================================================================
+
+#[test]
+fn fabric_skip_does_not_count_icmp_flood_4155() {
+    // RED-on-revert: with skip_rate_flood=true the per-zone/per-dst ICMP
+    // flood counter must NOT tick, so an ICMP stream well past threshold 2
+    // keeps passing. Reverting the skip lets the counter run and the 3rd
+    // packet Drops → this Pass assertion goes RED.
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    for i in 0..8 {
+        assert_eq!(
+            state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, true),
+            ScreenVerdict::Pass,
+            "fabric-redirected ICMP #{i} must not be re-counted on the owner"
+        );
+    }
+}
+
+#[test]
+fn fabric_skip_does_not_count_udp_flood_4155() {
+    let mut profile = ScreenProfile::default();
+    profile.udp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    for i in 0..8 {
+        let mut pkt = udp_pkt(src, dst);
+        pkt.dst_ip = dst;
+        assert_eq!(
+            state.check_packet_with_zone_id_opts("trust", 3, &pkt, 100, true),
+            ScreenVerdict::Pass,
+            "fabric-redirected UDP #{i} must not be re-counted on the owner"
+        );
+    }
+}
+
+#[test]
+fn fabric_skip_does_not_count_syn_flood_4155() {
+    // A fabric-redirected SYN belongs to a session the peer already admitted:
+    // the owner must neither count it toward syn-flood nor mint a cookie.
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    for i in 0..8 {
+        let pkt = tcp_pkt(src, dst, 1234 + i, 80, TCP_SYN);
+        assert_eq!(
+            state.check_packet_with_zone_id_opts("trust", 3, &pkt, 100, true),
+            ScreenVerdict::Pass,
+            "fabric-redirected SYN #{i} must not be re-counted (no syn-flood, no cookie)"
+        );
+    }
+}
+
+#[test]
+fn fabric_skip_still_runs_stateless_land_4155() {
+    // Scope guard: the skip is RATE-only. A stateless LAND attack must still
+    // Drop on a fabric-redirected packet (idempotent per-packet check).
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let pkt = tcp_pkt(src, src, 80, 80, TCP_SYN);
+    assert_eq!(
+        state.check_packet_with_zone_id_opts("trust", 3, &pkt, 1, true),
+        ScreenVerdict::Drop("land-attack"),
+        "stateless LAND must still fire on fabric traffic"
+    );
+}
+
+#[test]
+fn fabric_skip_flowless_does_not_count_icmp_flood_4155() {
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    for i in 0..8 {
+        assert_eq!(
+            state.check_flowless_screens_opts("trust", &flowless_icmp_pkt(src, dst), true, 100, true),
+            ScreenVerdict::Pass,
+            "fabric-redirected flowless ICMP #{i} must not be re-counted"
+        );
+    }
+}
+
+#[test]
+fn fabric_skip_flowless_still_runs_teardrop_4155() {
+    // Scope guard on the flowless path: stateless fragment screens still run.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let mut pkt = flowless_nonfirst_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+    );
+    pkt.ip_frag_off = 0x0001; // offset 1 unit (non-first)
+    pkt.ip_total_len = 24; // 20-byte header + 4-byte payload (< 8) → teardrop
+    assert_eq!(
+        state.check_flowless_screens_opts("trust", &pkt, true, 1, true),
+        ScreenVerdict::Drop("teardrop"),
+        "stateless teardrop must still fire on fabric flowless traffic"
+    );
+}
+
+#[test]
+fn fabric_skip_leaves_direct_ingress_counting_intact_4155() {
+    // The skip is scoped to fabric traffic: a burst of fabric-redirected ICMP
+    // must NOT advance the counter, so a subsequent DIRECT-ingress stream
+    // reaches the flood threshold at the CORRECT count (threshold + 1), not
+    // halved by a phantom fabric double-count.
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = 3;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    // 5 fabric packets — none may count.
+    for _ in 0..5 {
+        assert_eq!(
+            state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, true),
+            ScreenVerdict::Pass
+        );
+    }
+    // Direct ingress: 3 pass (threshold 3), 4th drops. If fabric packets had
+    // polluted the counter the drop would come EARLY (RED-on-revert of scope).
+    assert_eq!(
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        ScreenVerdict::Drop("icmp-flood"),
+        "direct ingress reaches the flood threshold at the correct count"
+    );
+}
