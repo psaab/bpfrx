@@ -326,6 +326,21 @@ func compilePolicy(polInst struct {
 		pol.SchedulerName = nodeVal(snNode)
 	}
 
+	// #4232 (fable-167 P-4b): record any DIRECT child of `policy <name>` whose
+	// keyword the compiler does not read. match/then/description/scheduler-name
+	// are the recognized leaves; anything else (a typo like `descripton`, or an
+	// unimplemented policy option) was silently dropped. Recording it lets the
+	// compiler emit an accepted-but-inert / probable-typo advisory. Iterate in
+	// config order for a deterministic warning.
+	for _, child := range polInst.node.Children {
+		switch child.Name() {
+		case "match", "then", "description", "scheduler-name":
+			// recognized above
+		default:
+			pol.UnknownChildren = append(pol.UnknownChildren, child.Name())
+		}
+	}
+
 	return pol
 }
 

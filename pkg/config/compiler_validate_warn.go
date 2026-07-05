@@ -545,6 +545,101 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #4231 (fable-167 P-3): five `security flow` knobs are now typed +
+	// committed (schema leaves + compileFlow) but the userspace AF_XDP
+	// dataplane enforces none of them today. Mirror the #2078 tcp-session
+	// accepted-only doctrine: warn so an operator who sets one is not silently
+	// misled into believing it has runtime effect. sync-icmp-session gets its
+	// own, distinct line because it is a no-op for a DIFFERENT reason than the
+	// other four: xpf ALREADY syncs ICMP sessions to the HA peer
+	// UNCONDITIONALLY — the session-sync path is protocol-agnostic at every
+	// layer (publish_shared_session / snapshot_all_sessions_export in
+	// userspace-dp; the Go pkg/cluster wire has no protocol filter), so the
+	// Junos opt-in knob has nothing to turn on. The two duration knobs
+	// (route-change-timeout, multicast-session-lifetime) are "present" when > 0
+	// (0 = unset / disabled, no behavior to warn about); the toggles warn on
+	// presence.
+	{
+		flow := cfg.Security.Flow
+		var flowUnenforced []string
+		if flow.RouteChangeTimeout > 0 {
+			flowUnenforced = append(flowUnenforced, "route-change-timeout")
+		}
+		if flow.ForceIPReassembly {
+			flowUnenforced = append(flowUnenforced, "force-ip-reassembly")
+		}
+		if flow.MulticastSessionLifetime > 0 {
+			flowUnenforced = append(flowUnenforced, "multicast-session-lifetime")
+		}
+		if flow.PreserveIncomingFragmentSize {
+			flowUnenforced = append(flowUnenforced, "preserve-incoming-fragment-size")
+		}
+		if len(flowUnenforced) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"security flow %s configured but accepted-only — the userspace dataplane does not enforce these knobs (config-only parity, #4231)",
+				strings.Join(flowUnenforced, ", ")))
+		}
+		if flow.SyncICMPSession {
+			warnings = append(warnings,
+				"security flow sync-icmp-session configured but has no effect — xpf syncs ICMP sessions to the HA peer UNCONDITIONALLY (the session-sync path is protocol-agnostic), so this Junos opt-in knob is a no-op: ICMP session sync is already always on and cannot be turned off (config-only parity, #4231)")
+		}
+	}
+
+	// #4232 (fable-167 P-4a): a `security alg <proto>` stanza whose proto is
+	// not one of the four the dataplane wires (dns/ftp/sip/tftp) was silently
+	// dropped. Warn so the operator knows the stanza is accepted-but-inert
+	// (e.g. h323, msrpc) rather than silently enforced. Dedup across repeated
+	// `security {}` blocks (compileALG runs per security root) for a clean,
+	// deterministic message.
+	if protos := cfg.Security.ALG.UnsupportedProtos; len(protos) > 0 {
+		seen := make(map[string]bool, len(protos))
+		var uniq []string
+		for _, p := range protos {
+			if !seen[p] {
+				seen[p] = true
+				uniq = append(uniq, p)
+			}
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"security alg %s accepted but inert — the userspace dataplane implements ALG control only for dns/ftp/sip/tftp, so this stanza has no effect (#4232)",
+			strings.Join(uniq, ", ")))
+	}
+
+	// #4232 (fable-167 P-4b): a DIRECT child of `policy <name>` whose keyword
+	// the compiler does not read (anything but match/then/description/
+	// scheduler-name) was silently dropped — a typo'd `descripton` /
+	// `scheduler-nam` vanished. Junos rejects the unknown keyword at commit;
+	// this advisory at least surfaces it. Report the fully-qualified policy
+	// path so the operator can find the offending line.
+	var policyUnknown []string
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol == nil {
+				continue
+			}
+			for _, kw := range pol.UnknownChildren {
+				policyUnknown = append(policyUnknown,
+					fmt.Sprintf("%s->%s/%s `%s`", zpp.FromZone, zpp.ToZone, pol.Name, kw))
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol == nil {
+			continue
+		}
+		for _, kw := range pol.UnknownChildren {
+			policyUnknown = append(policyUnknown, fmt.Sprintf("global/%s `%s`", pol.Name, kw))
+		}
+	}
+	if len(policyUnknown) > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"security policy: unrecognized child keyword(s) accepted but dropped (probable typo — xpf reads only match/then/description/scheduler-name at the policy level; Junos rejects unknown keywords at commit): %s (#4232)",
+			strings.Join(policyUnknown, ", ")))
+	}
+
 	// #3440 H1: `security flow aging` (early-ageout / high-watermark /
 	// low-watermark) drives the Go-side conntrack GC watermark hysteresis
 	// (pkg/conntrack/gc.go), but that GC sweep is skipped entirely whenever

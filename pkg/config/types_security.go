@@ -134,6 +134,18 @@ type FlowConfig struct {
 	// validateFlowAgingStrict can reject them at commit (mirrors
 	// ScreenProfile.UnknownLeaves / #3318).
 	AgingUnknownLeaves []string
+	// #4231 (fable-167 P-3): five `security flow` knobs that commit but are
+	// NOT enforced by the userspace AF_XDP dataplane. Typed here (with schema
+	// leaves + compileFlow parsing) so the operator gets completion + value
+	// validation and an accepted-only commit advisory
+	// (compiler_validate_warn.go, the #2078 doctrine) instead of the previous
+	// silent drop. The two duration knobs are seconds (0 = unset / absent); the
+	// three toggles are presence booleans. None reach the dataplane wire.
+	RouteChangeTimeout           int  // seconds (0 = unset)
+	SyncICMPSession              bool // no-op: xpf syncs ICMP sessions to the HA peer unconditionally
+	ForceIPReassembly            bool // accepted-only
+	MulticastSessionLifetime     int  // seconds (0 = unset)
+	PreserveIncomingFragmentSize bool // accepted-only
 }
 
 // FlowTraceoptions holds flow trace debugging configuration.
@@ -173,6 +185,14 @@ type ALGConfig struct {
 	FTPDisable  bool
 	SIPDisable  bool
 	TFTPDisable bool
+	// UnsupportedProtos records `security alg <proto>` stanzas whose proto is
+	// NOT one of the four the compiler wires (dns/ftp/sip/tftp) — e.g. h323,
+	// msrpc, rsh, sql, talk, pptp (#4232, fable-167 P-4a). Junos configures ALG
+	// behavior for these; xpf silently dropped the whole stanza. compileALG now
+	// records the unrecognized proto names so validateSecurityAcceptedOnly
+	// (compiler_validate_warn.go) can emit an accepted-but-inert advisory. The
+	// names are recorded in config order so the warning is deterministic.
+	UnsupportedProtos []string
 }
 
 // TCPSessionConfig holds TCP session timeout configuration.
@@ -339,6 +359,16 @@ type Policy struct {
 	// visitation order). The typed Config is never serialized, so this
 	// unexported field carries no persistence / back-compat obligation.
 	terminalActions []PolicyAction
+	// UnknownChildren records DIRECT children of a `policy <name>` node whose
+	// keyword is not one the compiler reads (match / then / description /
+	// scheduler-name) — e.g. a typo'd `descripton` or `scheduler-nam`, which
+	// Junos rejects at commit but xpf silently dropped (#4232, fable-167 P-4b).
+	// The exhaustive #3113/#3114/#3115 gates cover the `match`/`then` subtrees
+	// but not the policy level itself. compilePolicy records the unrecognized
+	// keywords so validateSecurityAcceptedOnly (compiler_validate_warn.go) can
+	// emit an accepted-but-inert / probable-typo advisory. Recorded in config
+	// order so the warning is deterministic.
+	UnknownChildren []string
 }
 
 // PolicyMatch defines what traffic a policy matches.

@@ -687,6 +687,24 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		"allow-embedded-icmp":          {desc: "Allow ICMP error packets for existing sessions", children: nil},
 		"gre-performance-acceleration": {desc: "Enable GRE performance acceleration", children: nil},
 		"power-mode-disable":           {desc: "Disable power mode", children: nil},
+		// #4231 (fable-167 P-3): five `security flow` knobs previously had no
+		// schema leaf and no compiler case, so they committed clean and did
+		// nothing with zero operator signal. Typing them here makes them
+		// first-class (completion + value validation); compileFlow records
+		// their presence and compiler_validate_warn.go emits an accepted-only
+		// advisory (the #2078 tcp-session doctrine) because the userspace
+		// AF_XDP dataplane does not enforce any of them yet. The two duration
+		// leaves are bounded seconds (0 = unset); the three toggles are
+		// presence-only.
+		// Junos bounds: route-change-timeout / multicast-session-lifetime are
+		// 6..1800 seconds. Match them so an out-of-range value is rejected at
+		// commit (as Junos does) instead of accepted into a no-op knob.
+		"route-change-timeout": {desc: "Timeout after a route change before flushing affected sessions (accepted-only)", args: 1, placeholder: "<seconds>",
+			valueType: ValueInteger, valueDesc: "Seconds (6..1800)", valueExamples: []string{"30"}, validator: ValidateInteger(6, 1800), children: nil},
+		"sync-icmp-session":               {desc: "Sync ICMP sessions to the HA peer (no-op — xpf already syncs ICMP sessions unconditionally)", children: nil},
+		"force-ip-reassembly":             {desc: "Force IP fragment reassembly before forwarding (accepted-only)", children: nil},
+		"multicast-session-lifetime":      {desc: "Multicast session lifetime in seconds (accepted-only)", args: 1, placeholder: "<seconds>", valueType: ValueInteger, valueDesc: "Seconds (6..1800)", valueExamples: []string{"30"}, validator: ValidateInteger(6, 1800), children: nil},
+		"preserve-incoming-fragment-size": {desc: "Preserve incoming fragment size when forwarding (accepted-only)", children: nil},
 		"traceoptions": {desc: "Flow trace debugging options", children: map[string]*schemaNode{
 			"file": {desc: "Trace file name (with size/files options)", args: 1, placeholder: "<filename>", children: nil},
 			// #3984: repeated keyed-list leaf — the compiler accumulates
