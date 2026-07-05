@@ -31,11 +31,21 @@ func twoPolicyConfig(zonePair []string, global []string) *config.Config {
 }
 
 func TestDeletedPolicyRuntimeIDs(t *testing.T) {
-	old := twoPolicyConfig([]string{"allow-web", "allow-ssh"}, []string{"glob-a"})
+	// Three policies in one zone pair: p-first(id 0), p-web(id 1), p-ssh(id 2),
+	// plus a global policy (id = 1*MaxRulesPerPolicy = 256, after the single
+	// zone-pair set). p-first sits on the overloaded wire id 0.
+	old := twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"})
 	oldIDs := dpuserspace.PolicyIDsByStableKey(old)
-	webID := oldIDs["trust->untrust/allow-web"]
-	sshID := oldIDs["trust->untrust/allow-ssh"]
+	firstID := oldIDs["trust->untrust/p-first"]
+	webID := oldIDs["trust->untrust/p-web"]
+	sshID := oldIDs["trust->untrust/p-ssh"]
 	globID := oldIDs["junos-global->junos-global/glob-a"]
+	if firstID != 0 {
+		t.Fatalf("precondition: first policy id = %d, want 0", firstID)
+	}
+	if webID == 0 || globID == 0 {
+		t.Fatalf("precondition: web=%d glob=%d must be non-zero", webID, globID)
+	}
 
 	t.Run("nil old config yields nothing", func(t *testing.T) {
 		if got := deletedPolicyRuntimeIDs(nil, old); got != nil {
@@ -43,26 +53,47 @@ func TestDeletedPolicyRuntimeIDs(t *testing.T) {
 		}
 	})
 
-	t.Run("deleted zone-pair policy is reported by its OLD id", func(t *testing.T) {
-		// Delete allow-web; keep allow-ssh (which shifts to a new numeric id).
-		newCfg := twoPolicyConfig([]string{"allow-ssh"}, []string{"glob-a"})
+	t.Run("deleted zone-pair policy (id>=1) is reported by its OLD id", func(t *testing.T) {
+		// Delete p-web (id 1); keep p-first and p-ssh (p-ssh shifts numeric id).
+		newCfg := twoPolicyConfig([]string{"p-first", "p-ssh"}, []string{"glob-a"})
 		got := deletedPolicyRuntimeIDs(old, newCfg)
 		if _, ok := got[webID]; !ok {
-			t.Errorf("deleted set %v missing allow-web old id %d", got, webID)
+			t.Errorf("deleted set %v missing p-web old id %d", got, webID)
 		}
 		if _, ok := got[sshID]; ok {
-			t.Errorf("deleted set %v must NOT contain surviving allow-ssh id %d", got, sshID)
+			t.Errorf("deleted set %v must NOT contain surviving p-ssh id %d", got, sshID)
 		}
 		if _, ok := got[globID]; ok {
 			t.Errorf("deleted set %v must NOT contain surviving global id %d", got, globID)
 		}
 	})
 
+	t.Run("deleting the FIRST policy never puts overloaded id 0 in the set", func(t *testing.T) {
+		// p-first (id 0) deleted, p-web/p-ssh kept. policy_id 0 is the overloaded
+		// wire value carried by host-local/fabric/tunnel/pre-#3056 sessions, so it
+		// must be excluded from the clear set even though p-first was deleted.
+		newCfg := twoPolicyConfig([]string{"p-web", "p-ssh"}, []string{"glob-a"})
+		got := deletedPolicyRuntimeIDs(old, newCfg)
+		if _, ok := got[0]; ok {
+			t.Fatalf("policy_id 0 must never enter the deleted set (overloaded wire value); got %v", got)
+		}
+	})
+
+	t.Run("renaming the first policy never puts id 0 in the set", func(t *testing.T) {
+		// A rename is delete(old-name)+add(new-name) by stable key; the deleted
+		// old-name sits at id 0, which must still be excluded.
+		newCfg := twoPolicyConfig([]string{"p-first-v2", "p-web", "p-ssh"}, []string{"glob-a"})
+		got := deletedPolicyRuntimeIDs(old, newCfg)
+		if _, ok := got[0]; ok {
+			t.Fatalf("renaming the first policy wrongly put id 0 in the deleted set: %v", got)
+		}
+	})
+
 	t.Run("modified policy (same zones+name) is NOT reported", func(t *testing.T) {
-		// allow-ssh keeps its name+zones but flips permit->deny. Its stable key
-		// is unchanged, so it is a MODIFIED policy, not a deleted one — the
-		// deferred #4234 policy-rematch half, out of scope for the deletion-clear.
-		newCfg := twoPolicyConfig([]string{"allow-web", "allow-ssh"}, []string{"glob-a"})
+		// p-web keeps its name+zones but flips permit->deny. Its stable key is
+		// unchanged, so it is a MODIFIED policy, not a deleted one — the deferred
+		// #4234 policy-rematch half, out of scope for the deletion-clear.
+		newCfg := twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"})
 		newCfg.Security.Policies[0].Policies[1].Action = config.PolicyDeny
 		if got := deletedPolicyRuntimeIDs(old, newCfg); len(got) != 0 {
 			t.Fatalf("a modified (not deleted) policy triggered a clear set %v, want empty", got)
@@ -70,7 +101,7 @@ func TestDeletedPolicyRuntimeIDs(t *testing.T) {
 	})
 
 	t.Run("deleted global policy is reported", func(t *testing.T) {
-		newCfg := twoPolicyConfig([]string{"allow-web", "allow-ssh"}, nil)
+		newCfg := twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, nil)
 		got := deletedPolicyRuntimeIDs(old, newCfg)
 		if _, ok := got[globID]; !ok {
 			t.Errorf("deleted set %v missing global glob-a id %d", got, globID)
@@ -85,17 +116,21 @@ func TestDeletedPolicyRuntimeIDs(t *testing.T) {
 }
 
 // TestClearSessionsForDeletedPolicies is the RED-on-revert test: a session
-// admitted under a policy that the commit DELETES is invalidated, while a
-// session under a surviving (or merely modified) policy keeps forwarding.
+// admitted under a policy that the commit DELETES (id >= 1) is invalidated,
+// while a session under a surviving (or merely modified) policy keeps
+// forwarding — and a session on the overloaded id 0 is never swept even though
+// the first policy was deleted.
 func TestClearSessionsForDeletedPolicies(t *testing.T) {
-	old := twoPolicyConfig([]string{"allow-web", "allow-ssh"}, nil)
+	old := twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, nil)
 	oldIDs := dpuserspace.PolicyIDsByStableKey(old)
-	webID := oldIDs["trust->untrust/allow-web"]
-	sshID := oldIDs["trust->untrust/allow-ssh"]
+	webID := oldIDs["trust->untrust/p-web"] // 1
+	sshID := oldIDs["trust->untrust/p-ssh"] // 2
 
-	// allow-web deleted; allow-ssh kept but modified (permit->deny) — the
-	// modified one must NOT be cleared.
-	newCfg := twoPolicyConfig([]string{"allow-ssh"}, nil)
+	// Delete p-first (id 0) AND p-web (id 1); keep p-ssh, modified permit->deny.
+	// The clear is ACTIVE (deleted set = {1}) so this also proves the id-0 guard
+	// holds while the sweep runs.
+	newCfg := twoPolicyConfig([]string{"p-ssh"}, nil)
+	newCfg.Security.Policies[0].Policies[0].Action = config.PolicyDeny
 
 	webSess := dataplane.SessionKey{
 		SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2},
@@ -105,6 +140,12 @@ func TestClearSessionsForDeletedPolicies(t *testing.T) {
 		SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2},
 		SrcPort: 40002, DstPort: 22, Protocol: 6,
 	}
+	// Stand-in for a host-inbound / fabric / tunnel / pre-#3056 synced session:
+	// carries the overloaded policy_id 0.
+	hostLocalSess := dataplane.SessionKey{
+		SrcIP: [4]byte{169, 254, 0, 1}, DstIP: [4]byte{169, 254, 0, 2},
+		SrcPort: 0, DstPort: 179, Protocol: 6,
+	}
 	webSessV6 := dataplane.SessionKeyV6{
 		SrcIP: [16]byte{0x20, 0x01, 15: 0x01}, DstIP: [16]byte{0x20, 0x01, 15: 0x02},
 		SrcPort: 40003, DstPort: 80, Protocol: 6,
@@ -112,8 +153,9 @@ func TestClearSessionsForDeletedPolicies(t *testing.T) {
 
 	dp := &policyInvalTestDP{
 		v4: map[dataplane.SessionKey]dataplane.SessionValue{
-			webSess: {State: dataplane.SessStateEstablished, PolicyID: webID},
-			sshSess: {State: dataplane.SessStateEstablished, PolicyID: sshID},
+			webSess:       {State: dataplane.SessStateEstablished, PolicyID: webID},
+			sshSess:       {State: dataplane.SessStateEstablished, PolicyID: sshID},
+			hostLocalSess: {State: dataplane.SessStateEstablished, PolicyID: 0},
 		},
 		v6: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{
 			webSessV6: {State: dataplane.SessStateEstablished, PolicyID: webID},
@@ -124,13 +166,76 @@ func TestClearSessionsForDeletedPolicies(t *testing.T) {
 	d.clearSessionsForDeletedPolicies(old, newCfg)
 
 	if _, ok := dp.v4[webSess]; ok {
-		t.Errorf("session under DELETED policy allow-web (id %d) survived the commit clear", webID)
+		t.Errorf("session under DELETED policy p-web (id %d) survived the commit clear", webID)
 	}
 	if _, ok := dp.v6[webSessV6]; ok {
-		t.Errorf("v6 session under DELETED policy allow-web (id %d) survived the commit clear", webID)
+		t.Errorf("v6 session under DELETED policy p-web (id %d) survived the commit clear", webID)
 	}
 	if _, ok := dp.v4[sshSess]; !ok {
-		t.Errorf("session under SURVIVING (modified) policy allow-ssh (id %d) was wrongly cleared", sshID)
+		t.Errorf("session under SURVIVING (modified) policy p-ssh (id %d) was wrongly cleared", sshID)
+	}
+	if _, ok := dp.v4[hostLocalSess]; !ok {
+		t.Errorf("id-0 host-local session was swept when the first policy was deleted (overloaded wire value must be excluded)")
+	}
+}
+
+// TestClearSessionsForDeletedPolicies_FirstPolicyIdZeroNotSwept pins the id-0
+// guard directly: deleting the FIRST policy (policy_id 0) must NOT clear the
+// host-local / fabric / peer-synced sessions that also carry policy_id 0. RED on
+// revert: without the id-0 exclusion in deletedPolicyRuntimeIDs, deleting the
+// first policy puts 0 in the set and mass-clears every id-0 session (a
+// rolling-upgrade / host-local forwarding outage, amplified by delete-sync).
+func TestClearSessionsForDeletedPolicies_FirstPolicyIdZeroNotSwept(t *testing.T) {
+	old := twoPolicyConfig([]string{"p-first", "p-web"}, nil)
+	// Delete the first policy (id 0). p-web survives.
+	newCfg := twoPolicyConfig([]string{"p-web"}, nil)
+
+	hostSess := dataplane.SessionKey{SrcIP: [4]byte{169, 254, 0, 1}, SrcPort: 0, DstPort: 179, Protocol: 6}
+	fabricSess := dataplane.SessionKey{SrcIP: [4]byte{10, 99, 0, 1}, SrcPort: 5000, DstPort: 5001, Protocol: 17}
+	syncedV6 := dataplane.SessionKeyV6{SrcIP: [16]byte{0xfe, 0x80, 15: 0x01}, SrcPort: 100, DstPort: 200, Protocol: 6}
+
+	dp := &policyInvalTestDP{
+		v4: map[dataplane.SessionKey]dataplane.SessionValue{
+			hostSess:   {State: dataplane.SessStateEstablished, PolicyID: 0},
+			fabricSess: {State: dataplane.SessStateEstablished, PolicyID: 0},
+		},
+		v6: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{
+			syncedV6: {State: dataplane.SessStateEstablished, PolicyID: 0},
+		},
+	}
+	d := &Daemon{dp: dp}
+	d.clearSessionsForDeletedPolicies(old, newCfg)
+
+	if _, ok := dp.v4[hostSess]; !ok {
+		t.Errorf("host-inbound id-0 session cleared on first-policy delete")
+	}
+	if _, ok := dp.v4[fabricSess]; !ok {
+		t.Errorf("fabric id-0 session cleared on first-policy delete")
+	}
+	if _, ok := dp.v6[syncedV6]; !ok {
+		t.Errorf("v6 synced id-0 session cleared on first-policy delete")
+	}
+}
+
+// TestClearSessionsForDeletedPolicies_RenameFirstPolicyNotSwept pins that
+// renaming the first policy (delete old-name + add new-name at id 0) does not
+// wipe id-0 sessions. RED on revert: without the guard, the rename puts 0 in the
+// set, the sweep runs, and the id-0 session is cleared.
+func TestClearSessionsForDeletedPolicies_RenameFirstPolicyNotSwept(t *testing.T) {
+	old := twoPolicyConfig([]string{"p-first", "p-web"}, nil)
+	newCfg := twoPolicyConfig([]string{"p-first-v2", "p-web"}, nil)
+
+	hostSess := dataplane.SessionKey{SrcIP: [4]byte{169, 254, 0, 1}, SrcPort: 0, DstPort: 179, Protocol: 6}
+	dp := &policyInvalTestDP{
+		v4: map[dataplane.SessionKey]dataplane.SessionValue{
+			hostSess: {State: dataplane.SessStateEstablished, PolicyID: 0},
+		},
+	}
+	d := &Daemon{dp: dp}
+	d.clearSessionsForDeletedPolicies(old, newCfg)
+
+	if _, ok := dp.v4[hostSess]; !ok {
+		t.Errorf("id-0 host-local session wiped when the first policy was RENAMED")
 	}
 }
 

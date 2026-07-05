@@ -12,15 +12,47 @@ import (
 // value stamped on an admitted session's policy_id, #3056) belonging to
 // policies present in oldCfg but ABSENT from newCfg. Identity is the stable
 // string key (userspace.StablePolicyRuleID: "<from>-><to>/<name>"), so a
-// sibling policy's deletion never shifts a survivor's key and a deleted
-// policy's still-live sessions remain identifiable by the ID they already
-// carry.
+// sibling policy's deletion never shifts a survivor's key.
 //
 // Only DELETED policies are reported. A policy whose match/action CHANGED but
 // whose zones+name are unchanged keeps the same stable key, is present in both
 // maps, and is therefore NOT reported here — that in-progress re-evaluation is
 // the deferred #4234 modified-policy (policy-rematch) half, intentionally out of
 // scope for the Junos-default deletion-clear.
+//
+// policy_id 0 is EXCLUDED from the returned set even when the literal first
+// policy (PolicySetID 0, RuleIndex 0 — policyID() == 0) is deleted or renamed.
+// The wire value 0 is OVERLOADED: it is both that first policy's id AND the
+// "unspecified"/legacy zero-value carried by non-security sessions
+// (host-inbound / neighbor-seed / fabric / tunnel installs stamp policy_id 0)
+// and by any pre-#3056 or older-HA-peer session that only ever carried the wire
+// scalar. userspace-dp already special-cases 0 for exactly this reason —
+// policy.rs `DuplicatePolicyId` (M01) excludes 0 from its uniqueness check, and
+// `reresolve_session_policy_id` treats the idx-0 non-policy sessions as
+// unbound. Clearing every policy_id==0 session because the first policy was
+// deleted/renamed (a rename is delete+add by stable key) would sweep all those
+// host-local/fabric/tunnel/synced sessions — a forwarding blip on a common op,
+// and during a rolling upgrade an old peer syncs its WHOLE table with
+// policy_id 0, so a first-policy delete would wipe it (mass loss / TCP resets
+// on failover, the #1960 rolling-upgrade class, amplified by the #2468
+// delete-sync propagation). Excluding 0 is a fail-SAFE under-clear: only the
+// literal first policy's OWN sessions idle out instead of clearing (identical
+// to the pre-#4234 behavior for that one policy); every OTHER deleted policy
+// (id >= 1) still clears correctly, and no should-be-denied session that a
+// DIFFERENT deleted policy covered is kept — so it is not a security
+// regression.
+//
+// Correctness depends on running BEFORE the ~1s live-row refresh
+// (#3395 reresolve_session_policy_id) re-stamps a session's policy_id: a
+// deleted policy's rule_id no longer resolves, so after a refresh tick its
+// sessions carry DEFAULT_POLICY_SENTINEL_ID (u32::MAX) rather than their old
+// numeric id and would no longer match. The clear runs synchronously in the
+// apply path (right after the dataplane ApplyConfig), before the next refresh
+// tick, so the deleted-policy sessions still carry the OLD id this set targets.
+// A narrow residual remains for two commits inside one refresh window
+// (reorder-then-delete): a session re-stamped between them could carry an id
+// this diff no longer recognizes — bounded and self-healing (the next refresh
+// or idle timeout resolves it), accepted for the Junos-default deletion-clear.
 //
 // Returns nil when oldCfg is nil (boot / first commit — nothing to invalidate)
 // or nothing was deleted.
@@ -35,6 +67,11 @@ func deletedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 	newIDs := dpuserspace.PolicyIDsByStableKey(newCfg)
 	var deleted map[uint32]struct{}
 	for key, id := range oldIDs {
+		if id == 0 {
+			// Overloaded wire value — never sweep policy_id==0 sessions. See the
+			// doc comment above (mirrors policy.rs DuplicatePolicyId M01).
+			continue
+		}
 		if _, stillPresent := newIDs[key]; stillPresent {
 			continue
 		}

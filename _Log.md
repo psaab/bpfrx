@@ -1,3 +1,32 @@
+## 2026-07-04 — #4234 review fix: exclude overloaded policy_id 0 from the clear
+
+- **Timestamp**: 2026-07-04
+- **Action**: Hostile review of PR #4252 = MERGE-NEEDS-MINOR: an id-0
+  over-clear hazard. `policyID()` gives the first policy of the first
+  zone-pair `policy_id == 0`, but 0 is the OVERLOADED wire value also
+  carried by host-inbound / neighbor-seed / fabric / tunnel installs AND
+  pre-#3056 / older-HA-peer synced sessions (userspace-dp already
+  special-cases it: policy.rs `DuplicatePolicyId` M01 excludes 0,
+  `reresolve_session_policy_id` treats idx-0 as non-policy). So deleting OR
+  renaming (delete+add by stable key) the first policy put 0 in the deleted
+  set and swept every id-0 session — a host-local forwarding blip on a
+  common op, and during a rolling upgrade an old peer syncs its WHOLE table
+  with id 0 -> a first-policy delete wipes it (mass loss / TCP resets on
+  failover, #1960 class, amplified by #2468 delete-sync). FIX: exclude
+  policy_id 0 from `deletedPolicyRuntimeIDs` (`if id == 0 { continue }`,
+  single chokepoint feeding both v4/v6 filters). Fail-SAFE under-clear: only
+  the literal first policy's own sessions idle out (pre-#4234 behavior for
+  that one policy); every other deleted policy (id>=1) still clears; not a
+  security regression (no should-be-denied session a DIFFERENT deleted
+  policy covered is kept). Added the id-0 delete + rename guard tests
+  (RED-on-revert: removing the guard mass-clears the id-0 stand-ins).
+  Honestly documented the run-before-~1s-refresh (#3395
+  reresolve_session_policy_id re-stamps deleted-policy sessions to the
+  DEFAULT sentinel) dependency and the sub-1s reorder-then-delete residual.
+  Rebased on origin/master (union _Log.md).
+- **File(s)**: pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/daemon_policy_invalidate_test.go, _Log.md
+
 ## 2026-07-04 — #4234: clear sessions of deleted policies at commit (Junos default)
 
 - **Timestamp**: 2026-07-04
