@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -10,8 +11,9 @@ import (
 // #3931 — HA config-sync generation ordering guard tests.
 //
 // These exercise the config-sync wire codec (encodeConfigPayload /
-// decodeConfigPayload), the receiver-side ordering guard (admitConfigGen), and
-// the single-consumer ordered apply loop (configApplyLoop). Every test is
+// decodeConfigPayload), the receiver-side ordering guard (shouldApplyConfigGen
+// admission + recordAppliedConfigGen apply-then-advance, M-2/#4151), and the
+// single-consumer ordered apply loop (configApplyLoop). Every test is
 // written so it FAILS against the pre-#3931 behavior, where a config was
 // applied via a racing `go OnConfigReceived` with NO generation on the wire:
 // a rapid commit pair (C1 then C2) could apply out of order and leave the
@@ -64,22 +66,27 @@ func TestConfigPayloadEmptyText(t *testing.T) {
 
 // --- ordering guard --------------------------------------------------------
 
-func TestAdmitConfigGenMonotonic(t *testing.T) {
+// The admission gate (shouldApplyConfigGen) is strictly monotonic against the
+// last SUCCESSFULLY-applied generation (advanced only via recordAppliedConfigGen
+// after a confirmed apply, M-2/#4151).
+func TestShouldApplyConfigGenMonotonic(t *testing.T) {
 	s := &SessionSync{}
-	// First real config admits and sets the high-water mark.
-	if !s.admitConfigGen(5) {
+	// First real config admits; the caller records it on successful apply.
+	if !s.shouldApplyConfigGen(5) {
 		t.Fatal("gen 5 should admit (first config)")
 	}
+	s.recordAppliedConfigGen(5)
 	// A strictly-newer config admits.
-	if !s.admitConfigGen(6) {
+	if !s.shouldApplyConfigGen(6) {
 		t.Fatal("gen 6 should admit (newer than 5)")
 	}
+	s.recordAppliedConfigGen(6)
 	// An older config (the reordered C1) is refused.
-	if s.admitConfigGen(5) {
+	if s.shouldApplyConfigGen(5) {
 		t.Fatal("gen 5 must be refused after gen 6 applied (stale)")
 	}
 	// The same generation is refused (not strictly newer).
-	if s.admitConfigGen(6) {
+	if s.shouldApplyConfigGen(6) {
 		t.Fatal("gen 6 must be refused after gen 6 applied (not strictly newer)")
 	}
 	if got := s.lastAppliedConfigGen.Load(); got != 6 {
@@ -87,22 +94,50 @@ func TestAdmitConfigGenMonotonic(t *testing.T) {
 	}
 }
 
-// gen==0 (legacy sender) is always applied and does NOT advance the
-// high-water mark, so a subsequent real generation still orders correctly.
-func TestAdmitConfigGenLegacyUnconditional(t *testing.T) {
+// The gate does NOT advance the high-water mark on its own: admitting a
+// generation must not record it. Only a confirmed apply (recordAppliedConfigGen)
+// advances the mark — the M-2/#4151 apply-then-advance separation.
+func TestShouldApplyConfigGenDoesNotAdvance(t *testing.T) {
 	s := &SessionSync{}
-	if !s.admitConfigGen(0) {
+	if !s.shouldApplyConfigGen(9) {
+		t.Fatal("gen 9 should admit (first config)")
+	}
+	if got := s.lastAppliedConfigGen.Load(); got != 0 {
+		t.Fatalf("the admission gate must NOT advance the high-water mark, got %d (want 0)", got)
+	}
+	// Admitting it again (no apply recorded yet) must still succeed — the same
+	// generation stays eligible until an apply confirms it.
+	if !s.shouldApplyConfigGen(9) {
+		t.Fatal("gen 9 must stay admissible until a successful apply records it")
+	}
+	s.recordAppliedConfigGen(9)
+	if got := s.lastAppliedConfigGen.Load(); got != 9 {
+		t.Fatalf("recordAppliedConfigGen must advance the mark to 9, got %d", got)
+	}
+	if s.shouldApplyConfigGen(9) {
+		t.Fatal("gen 9 must be refused once recorded (not strictly newer)")
+	}
+}
+
+// gen==0 (legacy sender) is always admitted and never advances the high-water
+// mark, so a subsequent real generation still orders correctly.
+func TestShouldApplyConfigGenLegacyUnconditional(t *testing.T) {
+	s := &SessionSync{}
+	if !s.shouldApplyConfigGen(0) {
 		t.Fatal("legacy gen 0 must always admit")
 	}
+	s.recordAppliedConfigGen(0)
 	if got := s.lastAppliedConfigGen.Load(); got != 0 {
 		t.Fatalf("gen 0 must not advance high-water mark, got %d", got)
 	}
-	if !s.admitConfigGen(3) {
+	if !s.shouldApplyConfigGen(3) {
 		t.Fatal("real gen 3 should admit after a legacy gen 0")
 	}
-	if !s.admitConfigGen(0) {
+	s.recordAppliedConfigGen(3)
+	if !s.shouldApplyConfigGen(0) {
 		t.Fatal("legacy gen 0 must still admit after a real gen")
 	}
+	s.recordAppliedConfigGen(0)
 	if got := s.lastAppliedConfigGen.Load(); got != 3 {
 		t.Fatalf("high-water mark should remain 3, got %d", got)
 	}
@@ -115,32 +150,46 @@ func TestResetRecvGenResetsConfigGen(t *testing.T) {
 	s := &SessionSync{}
 	s.recvGenV4 = nil
 	s.recvGenV6 = nil
-	if !s.admitConfigGen(100) {
+	if !s.shouldApplyConfigGen(100) {
 		t.Fatal("gen 100 should admit")
 	}
+	s.recordAppliedConfigGen(100)
 	s.resetRecvGen()
 	if got := s.lastAppliedConfigGen.Load(); got != 0 {
 		t.Fatalf("resetRecvGen must zero the config gen, got %d", got)
 	}
 	// A lower generation (rebooted peer) now applies.
-	if !s.admitConfigGen(3) {
+	if !s.shouldApplyConfigGen(3) {
 		t.Fatal("gen 3 should admit after reset (rebooted peer)")
 	}
 }
 
 // --- end-to-end ordered apply (RED-on-revert) ------------------------------
 
-// configRecorder captures the sequence of applied config texts under a mutex
-// so the ordered-apply consumer can be observed deterministically.
+// configRecorder captures the sequence of SUCCESSFULLY applied config texts
+// under a mutex so the ordered-apply consumer can be observed deterministically.
+//
+// failN, if > 0, makes the next failN record() calls return an error WITHOUT
+// recording the text — simulating an apply that failed before promoting the
+// store (a compile/promote failure or a transient RG0-primary rejection). This
+// exercises the M-2/#4151 apply-then-advance contract.
 type configRecorder struct {
-	mu      sync.Mutex
-	applied []string
+	mu       sync.Mutex
+	applied  []string
+	failN    int
+	attempts int
 }
 
-func (r *configRecorder) record(text string) {
+func (r *configRecorder) record(text string) error {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.attempts++
+	if r.failN > 0 {
+		r.failN--
+		return fmt.Errorf("simulated config apply failure for %q", text)
+	}
 	r.applied = append(r.applied, text)
-	r.mu.Unlock()
+	return nil
 }
 
 func (r *configRecorder) last() (string, int) {
@@ -247,6 +296,71 @@ func TestConfigSyncSinglePushApplies(t *testing.T) {
 	last, count := rec.last()
 	if last != "config-only" || count != 1 {
 		t.Fatalf("single push should apply once, got %q count=%d", last, count)
+	}
+}
+
+// TestConfigSyncApplyFailureRetainsHighWater is the M-2 (#4151) RED-on-revert
+// test. When the apply FAILS, the config high-water mark must NOT advance, so
+// the primary's re-push of the SAME generation is re-admitted and re-attempted
+// (the standby re-converges) instead of being silently dropped as stale.
+//
+// Under the pre-fix advance-before-apply order (admitConfigGen advanced the
+// high-water BEFORE OnConfigReceived and ignored its result), the high-water
+// jumped to the failed generation, the re-push was dropped as "not strictly
+// newer," and the standby stayed stranded on the prior config — so this test
+// fails on revert.
+func TestConfigSyncApplyFailureRetainsHighWater(t *testing.T) {
+	s := NewSessionSync("127.0.0.1:0", "127.0.0.1:0", nil)
+	rec := &configRecorder{failN: 1} // fail the first apply, succeed after
+	s.OnConfigReceived = rec.record
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.configApplyLoop(ctx)
+
+	// (1) First delivery of gen 7 fails to apply.
+	s.configApplyCh <- configApplyItem{gen: 7, text: "config-C7"}
+	drainConfigApply(t, s)
+
+	if got := s.lastAppliedConfigGen.Load(); got != 0 {
+		t.Fatalf("apply failure must NOT advance the high-water mark, got %d (want 0)", got)
+	}
+	if got := s.stats.ConfigsApplyFailed.Load(); got != 1 {
+		t.Fatalf("a failed apply must be counted in ConfigsApplyFailed, got %d", got)
+	}
+	if got := s.stats.ConfigsStaleIgnored.Load(); got != 0 {
+		t.Fatalf("a failed apply must NOT be counted as stale-dropped, got %d", got)
+	}
+	if _, count := rec.last(); count != 0 {
+		t.Fatalf("no config should have been recorded after the failed apply, got %d", count)
+	}
+
+	// (2) Primary re-pushes the SAME generation 7; it must be re-admitted (not
+	// dropped as stale) and now applies successfully — the standby re-converges.
+	s.configApplyCh <- configApplyItem{gen: 7, text: "config-C7"}
+	drainConfigApply(t, s)
+
+	last, count := rec.last()
+	if last != "config-C7" || count != 1 {
+		t.Fatalf("re-push of gen 7 must re-apply after the earlier failure, got %q count=%d", last, count)
+	}
+	if got := s.stats.ConfigsStaleIgnored.Load(); got != 0 {
+		t.Fatalf("the re-push must NOT be dropped as stale, ConfigsStaleIgnored=%d", got)
+	}
+	if got := s.lastAppliedConfigGen.Load(); got != 7 {
+		t.Fatalf("high-water must advance to 7 only AFTER the successful apply, got %d", got)
+	}
+
+	// (3) A THIRD push of gen 7, now AFTER a successful apply, is correctly
+	// skipped as stale — proving the skip is legitimate only once the apply
+	// actually succeeded (distinguishes it from the fail case in step 1).
+	s.configApplyCh <- configApplyItem{gen: 7, text: "config-C7"}
+	drainConfigApply(t, s)
+	if _, count := rec.last(); count != 1 {
+		t.Fatalf("a same-gen push after a successful apply must be skipped, applies=%d", count)
+	}
+	if got := s.stats.ConfigsStaleIgnored.Load(); got != 1 {
+		t.Fatalf("the post-success same-gen push must be dropped as stale, ConfigsStaleIgnored=%d", got)
 	}
 }
 

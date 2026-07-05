@@ -10,8 +10,32 @@ nothing internal.
 
 ## Entry points
 
-- `Lexer` — `lexer.go`.
-- `Parser` — `parser.go`. **Hierarchical** input.
+- `Lexer` — `lexer.go`. Bracket-list delimiters (`[ a b c ]`) are stripped
+  **iteratively** in the leading whitespace/comment loop of `Next()`, not via
+  self-recursion — see the recursion-bound note below.
+- `Parser` — `parser.go`. **Hierarchical** input. Block nesting is capped at
+  `maxParseDepth` (256) — see the recursion-bound note below.
+
+**Recursion and size bounds are load-bearing security guards (H-2).** The
+lexer and recursive-descent parser are reachable, unauthenticated, from the
+localhost gRPC/REST config-load API AND the HA peer config-sync ingress
+(`configstore.Store.SyncApply`). A single sub-4 MiB payload of consecutive
+`[` (the lexer once recursed one goroutine-stack frame per bracket) or a
+deeply nested `a{a{…}` brace payload (the parser had no depth guard) grew the
+goroutine stack past Go's 1 GiB `maxstacksize` and aborted xpfd with
+`fatal error: stack overflow` — an unrecoverable runtime throw, not a
+recoverable panic. Three layers now bound this: (1) the lexer strips brackets
+iteratively (O(1) stack); (2) `parseStatements` caps nesting at
+`maxParseDepth` (256, far above any real Junos hierarchy), recording one
+`ParseError` and draining the over-deep block via the non-recursive
+`skipToBlockClose` past the cap; (3) `configstore.MaxConfigSize` (16 MiB)
+rejects an over-large payload before `NewParser`, backed by
+`grpc.MaxRecvMsgSize` and `http.MaxBytesReader` at the two transports. Do NOT
+reintroduce `return l.Next()` bracket recursion or remove the depth cap.
+Regression coverage: `pkg/config/parser_recursion_dos_hb164_test.go`,
+`pkg/configstore/config_size_ceiling_hb164_test.go`,
+`pkg/api/config_load_bodycap_hb164_test.go`,
+`pkg/grpcapi/server_recvsize_hb164_test.go`.
 - `ParseSetCommand(input string) ([]string, error)` — `parser.go`.
   Parses one flat-set line into the path components. The caller then
   applies that path with `tree.SetPath()` to build the AST.

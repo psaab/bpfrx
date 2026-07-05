@@ -41,6 +41,14 @@ import (
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
+// maxRecvMsgSize caps an inbound gRPC message (fable-review-164 H-2). grpc-go
+// defaults to 4 MiB, which is already enough to crash the pre-fix config
+// parser; this explicit 16 MiB cap matches configstore.MaxConfigSize (the
+// transport-independent parse ceiling) so an oversized Load/config-sync body
+// is rejected at the transport with ResourceExhausted rather than buffered and
+// fed to the parser.
+const maxRecvMsgSize = 16 << 20 // 16 MiB
+
 // Config configures the gRPC server.
 type Config struct {
 	Store         *configstore.Store
@@ -210,6 +218,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	srv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.UnaryInterceptor(s.configLockInterceptor),
 	)
 	pb.RegisterBpfrxServiceServer(srv, s)
@@ -265,6 +274,7 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 	// reach a handler. The loopback listener is left UNCHANGED (127.0.0.1 is
 	// the trusted local surface, full service).
 	srv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.ChainUnaryInterceptor(s.fabricAllowlistUnaryInterceptor, s.configLockInterceptor),
 		grpc.ChainStreamInterceptor(s.fabricAllowlistStreamInterceptor),
 	)

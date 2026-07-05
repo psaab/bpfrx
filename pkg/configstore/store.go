@@ -35,6 +35,27 @@ import (
 // full trees live in the rollback slots; see journal.Entry).
 type JournalEntry = journal.Entry
 
+// MaxConfigSize bounds a single configuration payload accepted by any parse
+// entry point: LoadOverride, LoadMerge, LoadSet, and the HA SyncApply ingress.
+// Real configurations are well under 1 MiB; this generous 16 MiB ceiling
+// rejects a hostile or corrupt payload with a clean error before the parser
+// runs, so a pathological input cannot exhaust memory or (together with the
+// pkg/config lexer/depth guards) the goroutine stack. It is the
+// transport-independent backstop for the grpc.MaxRecvMsgSize / http
+// .MaxBytesReader caps, covering any caller — a future one, or an HA peer —
+// that reaches these methods without passing through the gRPC/REST limits
+// (fable-review-164 H-2).
+const MaxConfigSize = 16 << 20 // 16 MiB
+
+// checkConfigSize rejects an over-large payload before it reaches the parser.
+func checkConfigSize(content string) error {
+	if len(content) > MaxConfigSize {
+		return fmt.Errorf("config too large: %d bytes exceeds maximum %d bytes",
+			len(content), MaxConfigSize)
+	}
+	return nil
+}
+
 // Store manages the candidate and active configuration.
 type Store struct {
 	mu        sync.RWMutex
@@ -354,6 +375,13 @@ func schemaValidateExpandedTreeForNode(tree *config.ConfigTree, nodeID int) erro
 // lets the caller patch the parsed tree before compiling (e.g. to preserve
 // local chassis cluster settings).
 func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTree)) (*config.Config, error) {
+	// H-2: the HA peer config-sync ingress is a network-reachable parse entry
+	// point (a hostile/corrupt peer config over the fabric). Reject an
+	// over-large payload before parsing so one bad peer cannot crash the
+	// standby.
+	if err := checkConfigSize(content); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

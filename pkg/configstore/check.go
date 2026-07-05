@@ -24,6 +24,14 @@ import (
 // thin composition of the same functions Store.Commit uses — do not
 // fork the gate logic here.
 func CheckText(content string, nodeID int) (*config.Config, error) {
+	// Size-gate the untrusted day-0 config-drive input (#1879) for parity with
+	// the Load/SyncApply parse entry points (H-2): the parser layer is now
+	// recursion-bounded so this is not a crash vector, but rejecting an
+	// over-large payload up front keeps allocation bounded and honors the
+	// "checked at every parse entry point" contract.
+	if err := checkConfigSize(content); err != nil {
+		return nil, err
+	}
 	tree, errs := config.NewParser(content).Parse()
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("parse error: %v", errs[0])

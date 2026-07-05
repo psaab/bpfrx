@@ -325,11 +325,29 @@ older C1 with no alarm. The receiver now:
    queue (`configApplyLoop`) — the `receiveLoop` is single-threaded per
    connection, so this preserves receive order. The non-blocking enqueue never
    stalls session sync / heartbeats behind a slow config apply.
-3. Applies a config only when `admitConfigGen` accepts its generation
+3. Applies a config only when `shouldApplyConfigGen` accepts its generation
    (strictly newer than the last-applied high-water mark, or `gen=0`). An
    out-of-order older config is **dropped with an alarm** and counted in
    `ConfigsStaleIgnored`. The standby therefore always converges to the newest
    config the primary sent.
+
+**Apply-then-advance (M-2/#4151).** The high-water mark (`lastAppliedConfigGen`)
+advances ONLY AFTER the apply succeeds — `OnConfigReceived` now returns an
+`error`, and `configApplyLoop` calls `recordAppliedConfigGen` to advance the
+mark only on a `nil` return. If the apply does NOT take effect — a
+compile/promote failure (a mixed-build ISSU syntax error), a store rejection, or
+a transient RG0-primary rejection (`handleConfigSync` refuses the config while
+this node believes it is the RG0 config authority) — the loop counts
+`ConfigsApplyFailed` and leaves the high-water at the last-applied generation.
+The primary's re-push of the SAME generation is then re-admitted (not dropped as
+stale) and the standby re-converges. The pre-#4151 order advanced the mark on
+admission, BEFORE the apply, so an apply failure left the mark ahead of the
+actually-applied config: the re-push was silently dropped and the standby stayed
+stranded on the prior config (the failure class #4034 fixed on the *sender*,
+reintroduced on the *receiver* by the #3931 ordering guard). This preserves the
+#1960 lenient-load posture: whatever `syncAndApply` reports as its outcome
+(nil = store promoted + applied; error = not applied) is exactly what gates the
+mark, so the high-water always reflects the config actually in effect.
 
 The last-applied high-water mark is reset to 0 on a peer bulk re-prime
 (`resetRecvGen`, fired on `BulkStart`) so a **rebooted primary** — whose
@@ -349,7 +367,9 @@ and the config-sync apply fails — the old node retains its current config
 (fail-safe, no crash, no divergence worse than today).
 
 The secondary's `OnConfigReceived` callback invokes `load override` + commit to
-apply the accepted config.
+apply the accepted config, and returns an `error` so the ordered apply loop
+advances the high-water mark only on a successful apply (see Apply-then-advance
+above).
 
 ## IPsec SA Payload (Variable)
 
@@ -458,7 +478,7 @@ This is **additive** to the periodic sweep — it provides sub-millisecond sync 
 | DeleteV4/V6 | Lookup → delete reverse → delete dnat_table (SNAT) → delete forward |
 | BulkStart/End | Log markers; BulkEnd triggers `OnBulkSyncReceived` (releases VRRP sync hold) |
 | Heartbeat | No-op (resets read deadline) |
-| Config | Decode `(text, gen)` → enqueue on the single-consumer ordered apply queue (`configApplyLoop`); `admitConfigGen` drops out-of-order older gens, then `OnConfigReceived` applies (#3931) |
+| Config | Decode `(text, gen)` → enqueue on the single-consumer ordered apply queue (`configApplyLoop`); `shouldApplyConfigGen` drops out-of-order older gens, then `OnConfigReceived` applies and the high-water advances (`recordAppliedConfigGen`) ONLY on a successful apply — a failure counts `ConfigsApplyFailed` and re-admits the peer's re-push (#3931, M-2/#4151) |
 | IPsecSA | Store names, call `OnIPsecSAReceived` |
 
 ### Session Reconstruction on Receiver
@@ -513,6 +533,7 @@ All counters are `atomic.Uint64` / `atomic.Bool`, lock-free:
 | BulkSyncs | Completed bulk sync operations |
 | ConfigsSent/Received | Config sync messages |
 | ConfigsStaleIgnored | Config messages dropped by the #3931 ordering guard (incoming generation not strictly newer than last-applied) |
+| ConfigsApplyFailed | Config messages admitted by the ordering guard but whose apply did NOT take effect (compile/promote failure or a transient RG0-primary rejection). The high-water is left unadvanced so the peer's re-push re-converges the standby (M-2/#4151) |
 | IPsecSASent/Received | IPsec SA list messages |
 | Errors | Send failures, channel overflows, bad magic |
 | Connected | Peer TCP connection active |

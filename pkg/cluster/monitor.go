@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -64,6 +65,11 @@ type Monitor struct {
 	// network is "udp4" or "udp6".
 	icmpDialer func(network string) (icmpConn, error)
 
+	// icmpSeq is a monotonically increasing per-probe ICMP echo sequence
+	// counter. Each probe stamps a fresh sequence into its request so a
+	// stale reply from an earlier poll cycle is rejected.
+	icmpSeq atomic.Uint32
+
 	// Dampening thresholds (0 means use default).
 	FailThreshold int
 	PassThreshold int
@@ -83,6 +89,12 @@ type icmpConn interface {
 	WriteTo(b []byte, dst net.Addr) (int, error)
 	ReadFrom(b []byte) (int, net.Addr, error)
 	SetReadDeadline(t time.Time) error
+	// LocalAddr reports the socket's bound address. For the Linux
+	// SOCK_DGRAM ICMP socket used by the probe, the port carried here is
+	// the value the kernel writes into the ICMP identifier field of every
+	// echo request (and demuxes inbound replies by), so it is the
+	// identifier a reply must carry to be considered a match.
+	LocalAddr() net.Addr
 	Close() error
 }
 
@@ -373,12 +385,34 @@ func (mon *Monitor) probeICMP(addr string) bool {
 	}
 	defer conn.Close()
 
+	// Identifier the reply must carry. This code uses a Linux SOCK_DGRAM
+	// ICMP socket ("udp4"/"udp6"); the kernel OVERWRITES the identifier we
+	// marshal with the socket's local port and demuxes inbound replies by
+	// that value, so the identifier to match against is the socket port,
+	// not the constant placed in the request. Each probe opens a fresh
+	// socket, so this identifier is per-probe unique. Fall back to the
+	// marshalled constant when a port is unavailable (e.g. a raw-socket or
+	// test connection that reports no port).
+	const probeID = 0xbf
+	wantID := probeID
+	if la := conn.LocalAddr(); la != nil {
+		if ua, ok := la.(*net.UDPAddr); ok && ua.Port != 0 {
+			wantID = ua.Port
+		}
+	}
+
+	// Per-probe sequence number, cycling 1..0xffff in the 16-bit ICMP
+	// sequence space (never 0). The kernel preserves the sequence field, so
+	// a matching reply must echo the exact value we sent; a stale reply from
+	// an earlier poll cycle carries a different value and is rejected.
+	wantSeq := int(mon.icmpSeq.Add(1)%0xffff) + 1
+
 	msg := icmp.Message{
 		Type: echoType,
 		Code: 0,
 		Body: &icmp.Echo{
-			ID:   0xbf,
-			Seq:  1,
+			ID:   probeID,
+			Seq:  wantSeq,
 			Data: []byte("xpf"),
 		},
 	}
@@ -392,18 +426,59 @@ func (mon *Monitor) probeICMP(addr string) bool {
 		return false
 	}
 
+	// Read replies until one matches the request or the deadline expires.
+	// A non-matching reply (wrong responder, identifier, or sequence) must
+	// NOT be counted as a successful probe, and must NOT consume the single
+	// read and cause a false timeout — so keep reading until the deadline.
+	// The deadline is absolute, so subsequent ReadFrom calls inherit it.
 	conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
 	reply := make([]byte, 1500)
-	n, _, err := conn.ReadFrom(reply)
-	if err != nil {
-		return false
-	}
+	for {
+		n, peer, err := conn.ReadFrom(reply)
+		if err != nil {
+			return false
+		}
 
-	parsed, err := icmp.ParseMessage(proto, reply[:n])
-	if err != nil {
+		// The responder source address must equal the probed target.
+		if !icmpPeerMatchesTarget(peer, ip) {
+			continue
+		}
+
+		parsed, err := icmp.ParseMessage(proto, reply[:n])
+		if err != nil {
+			continue
+		}
+		if parsed.Type != replyType {
+			continue
+		}
+		echo, ok := parsed.Body.(*icmp.Echo)
+		if !ok {
+			continue
+		}
+		if echo.ID != wantID || echo.Seq != wantSeq {
+			continue
+		}
+		return true
+	}
+}
+
+// icmpPeerMatchesTarget reports whether the source address of a received
+// ICMP reply equals the probed target. Datagram ICMP sockets report the
+// peer as *net.UDPAddr; raw sockets report *net.IPAddr.
+func icmpPeerMatchesTarget(peer net.Addr, target net.IP) bool {
+	if peer == nil {
 		return false
 	}
-	return parsed.Type == replyType
+	var pip net.IP
+	switch a := peer.(type) {
+	case *net.UDPAddr:
+		pip = a.IP
+	case *net.IPAddr:
+		pip = a.IP
+	default:
+		return false
+	}
+	return pip != nil && pip.Equal(target)
 }
 
 func defaultICMPDialer(network string) (icmpConn, error) {

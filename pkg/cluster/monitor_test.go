@@ -8,6 +8,9 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // mockLink implements netlink.Link for testing.
@@ -627,13 +630,63 @@ func TestMonitor_InvalidAddress(t *testing.T) {
 	}
 }
 
-// mockICMPConn simulates ICMP for testing.
+// mockICMPConn simulates a Linux datagram ICMP socket. On WriteTo it records
+// the request's target and sequence; on ReadFrom it synthesizes a matching
+// echo reply — source == target, identifier == the simulated kernel-assigned
+// socket port, sequence == the request's sequence — modeling the real
+// SOCK_DGRAM behavior where the kernel overwrites the identifier with the
+// socket port and preserves the sequence. Adversarial overrides let a test
+// model a spoofed / stale reply (wrong source, identifier, or sequence).
 type mockICMPConn struct {
 	reachable bool
 	v6        bool // if true, return ICMPv6 echo reply
+
+	// localPort is the simulated kernel-assigned identifier reported by
+	// LocalAddr and echoed as the reply identifier. 0 means use 0xbf.
+	localPort int
+
+	// Adversarial overrides. When set, the reply deviates from a faithful
+	// echo of the request so validation can be exercised.
+	badSource net.IP // reply source instead of the probed target
+	badID     *int   // reply identifier instead of localPort
+	badSeq    *int   // reply sequence instead of the request's sequence
+
+	// Captured from the most recent WriteTo.
+	lastTarget net.IP
+	lastSeq    int
+
+	// readCount models a socket that delivers at most one reply before the
+	// read deadline expires, so the validation loop terminates.
+	readCount int
+}
+
+func (c *mockICMPConn) proto() int {
+	if c.v6 {
+		return 58
+	}
+	return 1
+}
+
+func (c *mockICMPConn) port() int {
+	if c.localPort != 0 {
+		return c.localPort
+	}
+	return 0xbf
+}
+
+func (c *mockICMPConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{Port: c.port()}
 }
 
 func (c *mockICMPConn) WriteTo(b []byte, dst net.Addr) (int, error) {
+	if ua, ok := dst.(*net.UDPAddr); ok {
+		c.lastTarget = ua.IP
+	}
+	if m, err := icmp.ParseMessage(c.proto(), b); err == nil {
+		if e, ok := m.Body.(*icmp.Echo); ok {
+			c.lastSeq = e.Seq
+		}
+	}
 	return len(b), nil
 }
 
@@ -641,24 +694,142 @@ func (c *mockICMPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if !c.reachable {
 		return 0, nil, net.UnknownNetworkError("timeout")
 	}
-	if c.v6 {
-		// ICMPv6 echo reply: Type=129, Code=0, Checksum, ID, Seq
-		reply := []byte{0x81, 0x00, 0x00, 0x00, 0x00, 0xbf, 0x00, 0x01}
-		// Checksum is validated by kernel for UDP-based ICMP, set to zero.
-		n := copy(b, reply)
-		return n, &net.UDPAddr{IP: net.ParseIP("2001:db8::1")}, nil
+	c.readCount++
+	if c.readCount > 1 {
+		// Model the read deadline expiring with no further replies, so a
+		// probe that rejected the first (non-matching) reply gives up.
+		return 0, nil, net.UnknownNetworkError("timeout")
 	}
-	// ICMPv4 echo reply: Type=0, Code=0, Checksum, ID, Seq
-	reply := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0xbf, 0x00, 0x01}
-	// Fix checksum
-	reply[2] = 0xff
-	reply[3] = 0x40
+
+	id := c.port()
+	if c.badID != nil {
+		id = *c.badID
+	}
+	seq := c.lastSeq
+	if c.badSeq != nil {
+		seq = *c.badSeq
+	}
+
+	var replyType icmp.Type
+	if c.v6 {
+		replyType = ipv6.ICMPTypeEchoReply
+	} else {
+		replyType = ipv4.ICMPTypeEchoReply
+	}
+	reply, err := (&icmp.Message{
+		Type: replyType,
+		Code: 0,
+		Body: &icmp.Echo{ID: id, Seq: seq, Data: []byte("xpf")},
+	}).Marshal(nil)
+	if err != nil {
+		return 0, nil, err
+	}
 	n := copy(b, reply)
-	return n, &net.UDPAddr{IP: net.ParseIP("10.0.1.1")}, nil
+
+	src := c.lastTarget
+	if c.badSource != nil {
+		src = c.badSource
+	}
+	return n, &net.UDPAddr{IP: src}, nil
 }
 
 func (c *mockICMPConn) SetReadDeadline(t time.Time) error { return nil }
 func (c *mockICMPConn) Close() error                      { return nil }
+
+// TestProbeICMP_ReplyValidation verifies that probeICMP only counts an echo
+// reply as a successful probe when the responder source address, the ICMP
+// identifier (the datagram socket's local port), and the sequence number all
+// match the request. A reply failing any check must be ignored — otherwise a
+// stray or spoofed reply falsely reports a down path as up and suppresses the
+// intended failover (the L-3 finding).
+func TestProbeICMP_ReplyValidation(t *testing.T) {
+	intp := func(v int) *int { return &v }
+
+	cases := []struct {
+		name   string
+		v6     bool
+		target string
+		mutate func(c *mockICMPConn)
+		want   bool
+	}{
+		{
+			name:   "v4 correct reply accepted",
+			target: "10.0.1.1",
+			want:   true,
+		},
+		{
+			name:   "v4 wrong source rejected",
+			target: "10.0.1.1",
+			mutate: func(c *mockICMPConn) { c.badSource = net.ParseIP("10.0.1.99") },
+			want:   false,
+		},
+		{
+			name:   "v4 wrong identifier rejected",
+			target: "10.0.1.1",
+			// 0xbf is the constant the request marshals; the kernel would
+			// have rewritten it to the socket port, so a reply still bearing
+			// 0xbf is a foreign/spoofed reply.
+			mutate: func(c *mockICMPConn) { c.badID = intp(0xbf) },
+			want:   false,
+		},
+		{
+			name:   "v4 stale sequence rejected",
+			target: "10.0.1.1",
+			mutate: func(c *mockICMPConn) { c.badSeq = intp(1) },
+			want:   false,
+		},
+		{
+			name:   "v6 correct reply accepted",
+			v6:     true,
+			target: "2001:db8::1",
+			want:   true,
+		},
+		{
+			name:   "v6 wrong source rejected",
+			v6:     true,
+			target: "2001:db8::1",
+			mutate: func(c *mockICMPConn) { c.badSource = net.ParseIP("2001:db8::99") },
+			want:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockICMPConn{reachable: true, v6: tc.v6, localPort: 45502}
+			if tc.mutate != nil {
+				tc.mutate(mc)
+			}
+			mon := &Monitor{
+				icmpDialer: func(network string) (icmpConn, error) { return mc, nil },
+			}
+			if got := mon.probeICMP(tc.target); got != tc.want {
+				t.Errorf("probeICMP(%s) = %v, want %v", tc.target, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeICMP_StaleSequenceAcrossProbes verifies that a reply carrying the
+// sequence from a PREVIOUS probe (a delayed/duplicated reply) is not accepted
+// by a later probe, since each probe stamps a fresh sequence.
+func TestProbeICMP_StaleSequenceAcrossProbes(t *testing.T) {
+	first := &mockICMPConn{reachable: true, localPort: 45502}
+	mon := &Monitor{
+		icmpDialer: func(network string) (icmpConn, error) { return first, nil },
+	}
+	if !mon.probeICMP("10.0.1.1") {
+		t.Fatal("first probe should succeed")
+	}
+
+	// Second probe: a reply that replays the FIRST probe's exact sequence
+	// (captured in first.lastSeq) must be rejected because the second probe
+	// stamped a fresh sequence.
+	replay := &mockICMPConn{reachable: true, localPort: 45502, badSeq: &first.lastSeq}
+	mon.icmpDialer = func(network string) (icmpConn, error) { return replay, nil }
+	if mon.probeICMP("10.0.1.1") {
+		t.Error("probe accepted a reply carrying the previous probe's sequence")
+	}
+}
 
 func TestMonitor_LocalStatusesConcurrent(t *testing.T) {
 	m := NewManager(0, 1)

@@ -116,6 +116,19 @@ the userspace dataplane admission boundary is in
   rather than holding stale "up" state (#2944). The IP address owner (priority
   255) always preempts a lower-priority master irrespective of the `no-preempt`
   flag (RFC 5798 §6.1, #4116) and is exempt from track-down demotion.
+- **Redundancy-group IP monitoring** (`chassis cluster redundancy-group N
+  ip-monitoring`): each configured target is ICMP-echo probed every poll and
+  its `weight` is subtracted from the RG priority while the target is
+  unreachable, driving weight-based failover. The probe **validates the echo
+  reply against the request** before counting it as reachable — the responder
+  source must equal the probed target, the ICMP identifier must equal the
+  one the request used, and the sequence must match the value just sent. The
+  probe uses a Linux SOCK_DGRAM ICMP socket, where the kernel overwrites the
+  identifier with the socket's local port and demuxes replies by it, so the
+  matched identifier is that port (per-probe unique), not a fixed constant;
+  the sequence is stamped per probe. A reply failing any check is ignored, so
+  a stray or spoofed echo reply cannot mask a genuinely down path and
+  suppress the intended failover (#4156). `pkg/cluster/monitor.go`.
 - **Bondless RETH**: VRRP on physical member interfaces, per-node virtual
   MAC (`02:bf:72:CC:RR:NN`), no Linux bonding required.
 - **Session sync**: incremental 1s sweep + ring buffer + GC delete
