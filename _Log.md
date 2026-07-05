@@ -1,3 +1,41 @@
+## 2026-07-04 — #4180 (fable-review-165 H-22): deploy role validation ignored the guest virtio-first PCI tiebreaker — virtio-after-hardware silently swaps zones
+
+- **Timestamp**: 2026-07-04
+  - **Action**: `scripts/deploy/xpf-deploy.py` `validate_appliance()`
+    checked each declared `role` against its raw LIST INDEX only
+    (`expected_name(i, ...)`), but the guest does not name NICs by attach
+    order. `enumeratePCINICs()` (`pkg/daemon/linksetup.go:189-204`) sorts
+    NICs with a virtio-first tiebreaker (`sk=0` for `virtio_net`, `sk=1`
+    for hardware) BEFORE `assignName()` assigns positional vSRX names. So
+    a YAML/`--nic` list that put a virtio-class NIC (`net`/`bridge`/
+    `macvlan`) AFTER a hardware-class NIC (`sriov`/`physical`/`pci`)
+    passed validation but booted with the firewall zones/policies/NAT on
+    SWAPPED ports (trust/untrust inverted) — a silent security miswiring.
+  - **Fix**: classify each backing virtio-class vs hardware-class
+    (`VIRTIO_BACKINGS`/`HARDWARE_BACKINGS` + `backing_sort_key()`,
+    mirroring the guest `sk=0`/`sk=1` rule) and FAIL CLOSED (`die()`) in
+    `validate_appliance` when a virtio-class interface appears after a
+    hardware-class one, naming both offending positions and telling the
+    operator to reorder. Chose reject over silent reorder because the
+    zone→vSRX-name binding lives in the operator's day-0 `.conf` (which
+    the tool does not rewrite); reordering could still land the intended
+    backing on a different vSRX name invisibly. Reject keeps the existing
+    "position is the contract" guarantee honest.
+  - **Test**: `scripts/deploy/test_xpf_deploy_nicorder.py` (11 tests,
+    mirrors the H-20 `test_xpf_deploy_disk.py` pattern) — asserts the
+    virtio-after-hardware layout is rejected (with/without roles,
+    standalone + cluster), the reordered set validates with correct
+    positional names, pure-virtio/pure-hardware pass, and all shipped
+    example YAMLs satisfy the guard. RED-on-revert verified: dropping the
+    guard un-raises the four rejection tests.
+  - **Docs**: `docs/deploy-quickstart.md` "60-second mental model" and
+    `examples/deploy/README.md` "naming contract is positional" — replaced
+    the "identical to pure position in every normal layout" hand-wave
+    with the explicit virtio-first rule + the new validate-time reject.
+  - **File(s)**: `scripts/deploy/xpf-deploy.py`,
+    `scripts/deploy/test_xpf_deploy_nicorder.py`,
+    `docs/deploy-quickstart.md`, `examples/deploy/README.md`, `_Log.md`
+
 ## 2026-07-04 — #4175 (fable-review-165 H-1): day-0 config-drive retry permanently dead — loader guarded on bare .configdb directory
 
 - **Timestamp**: 2026-07-04
