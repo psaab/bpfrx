@@ -1,3 +1,18 @@
+## 2026-07-05 — fable-review-167 parity SECURITY: family any v6 fail-open (#4287), VRRP auth false-security (#4288), SNMP community clients (#4289)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: F-1 (#4287) — `compileFirewall` folded a `family any`
+    firewall filter into the IPv4 pool only, losing its IPv6 arm (a
+    `family any` discard/deny failed OPEN for v6). Fixed to compile a
+    `family any` filter into BOTH `FiltersInet` and `FiltersInet6`;
+    extended `validateFirewallFilterFamilyCollisionsAST` with an
+    `any`+`inet6` same-name collision cross-check (strict reject / lenient
+    warn) since `any` now folds into the inet6 pool too. Test
+    `compiler_firewall_family_any_4287_test.go`.
+  - **File(s)**: pkg/config/compiler_firewall.go,
+    pkg/config/compiler_firewall_family_any_4287_test.go,
+    docs/config-schema.md, _Log.md
+
 ## 2026-07-05 — cos: #4272 div_ceil .max(1) hardening + fable-166 R-10 CoS test-coverage gaps (#4280)
 
 - **Timestamp**: 2026-07-05

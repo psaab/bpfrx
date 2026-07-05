@@ -878,12 +878,13 @@ and break the symmetry in the other direction. Pinned by
 
 Junos namespaces firewall filters **per family**, so `family inet filter blockX`
 and `family mpls filter blockX` are two distinct filters. xpf cannot: `compileFirewall`
-(`compiler_firewall.go`) selects the destination map with `dest := fw.FiltersInet`
-and only switches to `fw.FiltersInet6` when the family is literally `inet6`, so
-EVERY other family (`inet`, `any`, `mpls`, `ccc`, `vpls`, `bridge`, and any
-not-yet-modelled token — `SchemaValidate` does not reject an unknown family
-keyword) folds into the single `fw.FiltersInet` pool, then writes
-`dest[filter.Name] = filter` **unconditionally**. Two same-name filters authored
+(`compiler_firewall.go`) selects the destination pool(s) — `fw.FiltersInet` for
+most families, `fw.FiltersInet6` for `inet6`, and BOTH for `any` (#4287, see
+below) — so EVERY family except `inet6` and `any` (`inet`, `mpls`, `ccc`,
+`vpls`, `bridge`, and any not-yet-modelled token — `SchemaValidate` does not
+reject an unknown family keyword) folds into the single `fw.FiltersInet` pool,
+then writes `dest[filter.Name] = filter` **unconditionally**. Two same-name
+filters authored
 under two different non-inet6 families therefore silently collapse — the later
 definition last-write-wins over the earlier with no commit error. If the `family
 inet` filter was a `discard`/deny and the colliding-family filter is accept-all,
@@ -924,6 +925,34 @@ peer-synced config an older binary silently accepted still BOOTS. Fail-on-revert
 `CompileConfig`, warn-not-brick on `CompileConfigLenient` with the surviving
 accept asserted, plus the inet/inet6 dual-stack and single-family no-false-reject
 cases).
+
+## Firewall-filter `family any` applies to BOTH v4 and v6 (#4287)
+
+Junos `family any` firewall filters are **protocol-independent** — they match
+BOTH IPv4 and IPv6. Before #4287, `compileFirewall` folded every non-inet6
+family (including `any`) into the single `fw.FiltersInet` (IPv4) pool, so a
+uniquely-named `family any` discard/deny filter was enforced on IPv4 **only**
+and silently let IPv6 through — a security **fail-open** (an operator writes a
+`family any` deny expecting it to block both families; the v6 arm is lost).
+This is distinct from the #3884 same-name cross-family overwrite above: here a
+*uniquely-named* filter loses its v6 arm.
+
+`compileFirewall` now compiles a `family any` filter into **both**
+`fw.FiltersInet` and `fw.FiltersInet6` (the `dests` slice in
+`compiler_firewall.go`), so the deny applies to both address families. Because
+`family any` now folds into the inet6 pool as well,
+`validateFirewallFilterFamilyCollisionsAST` was extended with an `any`+`inet6`
+cross-check: a `family any` filter name shared with a distinct `family inet6`
+filter would silently overwrite in `FiltersInet6`, so it is rejected at strict
+commit / warned on the lenient load path (same #1960 no-brick doctrine).
+
+Reachability is the same as #3884: the schema-driven flat `set` grammar does
+not model `family any`, so a flat `set firewall family any ...` collapses and
+never mints a structured filter; the fail-open is reachable only via a
+hierarchical config-file parse or a directly-constructed / peer-synced AST.
+Fail-on-revert: `pkg/config/compiler_firewall_family_any_4287_test.go` (both
+pools populated for a `family any` discard; strict reject + lenient warn for
+the any+inet6 collision; lone `family any` no-false-reject).
 
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
