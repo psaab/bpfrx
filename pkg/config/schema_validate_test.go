@@ -423,14 +423,17 @@ func TestSchemaValidate_AcceptsLegacyDPDKSubStanza(t *testing.T) {
 // validated even though the walker now descends all subtrees. This guards
 // the "opt-in per leaf" scope contract.
 func TestSchemaValidate_OutsideSchedulersIgnored(t *testing.T) {
-	// `buffer-size purple` under a different parent should not error
-	// at SchemaValidate (no typed-leaf metadata for it elsewhere).
+	// A still-untyped CoS reference leaf (the dscp classifier NAME bound
+	// to an interface unit is resolved at compile-warn, not schema-typed)
+	// should not error at SchemaValidate. shaping-rate/burst-size — the
+	// prior example here — are now typed by #4217, so they no longer
+	// illustrate an untyped leaf.
 	if err := schemaCheck(t, `class-of-service {
     interfaces {
         ge-0/0/1 {
             unit 0 {
-                shaping-rate 10g {
-                    burst-size purple-not-validated;
+                classifiers {
+                    dscp purple-not-validated;
                 }
                 scheduler-map edge-map;
             }
