@@ -235,6 +235,24 @@ type compileOpts struct {
 	// boot). Same doctrine as lenientPolicyMatchAddress.
 	lenientIPsecPolicyProposalRef bool
 
+	// lenientSchedulerMapRef downgrades the class-of-service
+	// scheduler-map -> scheduler cross-reference check
+	// (validateClassOfServiceSchedulerMapRefsStrict) from a hard error to
+	// a warning on the tolerant load / peer-sync paths. A scheduler-map
+	// entry naming an undefined scheduler was warn-only at commit before
+	// this gate, so a config persisted by an older binary — or synced
+	// from a peer — may carry the dangling reference; an upgrading /
+	// receiving node must still boot through it (warn) rather than
+	// fail-closed-on-load (#1960 class). Commit / commit-check stay strict
+	// — a new operator edit that would silently strip a class's
+	// scheduling guarantee and (pre-fix) hand it the MAXIMUM best-effort
+	// surplus share in the dataplane is rejected. The render-path safety
+	// net (the scheduler-unresolved SAFE default in
+	// userspace-dp forwarding_build/cos.rs, surplus_weight pinned to 1)
+	// preserves the fail-SAFE posture on that boot. Same doctrine as
+	// lenientIPsecPolicyProposalRef.
+	lenientSchedulerMapRef bool
+
 	// lenientIPsecGatewayRefs (#2074) downgrades the IPsec VPN -> IKE
 	// gateway cross-reference check from a hard error to a warning on the
 	// tolerant load / peer-sync paths (CompileConfigLenient /
@@ -1401,6 +1419,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientLogEventModeFormat:              true,
 		lenientEventAttributesMatch:            true,
 		lenientIPsecPolicyProposalRef:          true,
+		lenientSchedulerMapRef:                 true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
@@ -1582,6 +1601,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientLogEventModeFormat:              true,
 		lenientEventAttributesMatch:            true,
 		lenientIPsecPolicyProposalRef:          true,
+		lenientSchedulerMapRef:                 true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
@@ -2344,6 +2364,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// commit-time rejection has nothing left to guard.
 	if err := errors.Join(strictErrs...); err != nil {
 		return nil, err
+	}
+
+	// class-of-service scheduler-map -> scheduler cross-reference gate.
+	// Strict on commit / commit-check (hard-reject a scheduler-map entry
+	// naming an undefined scheduler — such a reference was only warned,
+	// then compiled and KEPT, and the userspace dataplane resolved the
+	// dangling name to no scheduler: the class silently lost its
+	// guarantee and, pre-fix, won the MAXIMUM best-effort surplus share).
+	// Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config with a stale scheduler reference still boots —
+	// #1960 no-brick; the dataplane applies the scheduler-unresolved SAFE
+	// default on that boot). Runs AFTER the strict accumulator +
+	// device-map so a structural CoS/policer/device-map error still wins
+	// the first-error slot.
+	if err := validateClassOfServiceSchedulerMapRefsStrict(cfg.ClassOfService); err != nil {
+		if opts.lenientSchedulerMapRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("class-of-service scheduler-map reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
 	}
 
 	// #1956 device-map cross-entry validation. Strict on commit /

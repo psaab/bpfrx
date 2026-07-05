@@ -224,6 +224,27 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 					)
 					continue
 				}
+				// A scheduler-map entry naming an undefined scheduler is
+				// hard-rejected at strict commit
+				// (validateClassOfServiceSchedulerMapRefsStrict) but a
+				// leniently-loaded / peer-synced config can still carry it
+				// (#1960). Unlike the undefined-forwarding-class case above we
+				// KEEP the entry on the wire so the class's queue stays
+				// materialized — dropping it would blackhole any traffic a
+				// classifier steers to the class's queue. The Rust helper
+				// applies the scheduler-unresolved SAFE default (minimal
+				// best-effort surplus weight, no guarantee), NOT the fail-open
+				// maximum share. Log a breadcrumb so the degraded shaping is
+				// visible in the daemon journal.
+				if entry.Scheduler != "" {
+					if _, ok := cos.Schedulers[entry.Scheduler]; !ok {
+						slog.Warn("cos scheduler-map references undefined scheduler; dataplane applies safe best-effort default (degraded shaping)",
+							"scheduler_map", schedMap.Name,
+							"forwarding_class", entry.ForwardingClass,
+							"scheduler", entry.Scheduler,
+						)
+					}
+				}
 				mapSnap.Entries = append(mapSnap.Entries, CoSSchedulerMapEntrySnapshot{
 					ForwardingClass: entry.ForwardingClass,
 					Scheduler:       entry.Scheduler,

@@ -808,6 +808,66 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
 }
 
 #[test]
+fn build_cos_state_dangling_scheduler_reference_uses_safe_best_effort_default() {
+    // A scheduler-map entry naming a scheduler that is NOT defined (a
+    // commit-time typo, hard-rejected on the strict path but downgraded
+    // to a warning on the lenient load / peer-sync path, so it can still
+    // reach the dataplane) must fail SAFE, not OPEN. Before the fix the
+    // unresolved reference fell through to `transmit_rate_bytes = the
+    // whole interface shaping rate`, deriving `surplus_weight = 16` (the
+    // maximum) — the class did not merely lose its guarantee, it won the
+    // LARGEST best-effort surplus share. The queue must stay materialized
+    // (so a classifier steering traffic to its queue still forwards) but
+    // be pinned to the minimal best-effort surplus weight, with no
+    // guarantee and no fabricated priority.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 9,
+            cos_shaping_rate_bytes_per_sec: 1_000_000,
+            cos_scheduler_map: "test-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "ef".into(),
+                queue: 1,
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            // The referenced scheduler "ef-typo" is intentionally absent.
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "test-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "ef".into(),
+                    scheduler: "ef-typo".into(),
+                }],
+            }],
+        }),
+        ..Default::default()
+    };
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&9).expect("missing CoS interface");
+    // Queue stays materialized under its real queue id / class.
+    assert_eq!(iface.queues.len(), 1);
+    assert_eq!(iface.queues[0].queue_id, 1);
+    assert_eq!(iface.queues[0].forwarding_class, "ef");
+    // SAFE default: minimal best-effort surplus share, NOT the fail-open
+    // maximum (16) the whole-interface effective rate would have derived.
+    assert_eq!(
+        iface.queues[0].surplus_weight, 1,
+        "dangling scheduler reference must fail SAFE to the minimal best-effort surplus weight, not fail OPEN to the max"
+    );
+    // No guarantee, no exact, priority stays "low" (rank 5) — nothing is
+    // fabricated for the unresolved reference.
+    assert!(!iface.queues[0].guarantee_enabled);
+    assert!(!iface.queues[0].exact);
+    assert_eq!(iface.queues[0].priority, 5, "low priority rank");
+}
+
+#[test]
 fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {

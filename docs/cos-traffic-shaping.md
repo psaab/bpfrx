@@ -910,6 +910,21 @@ Important current behavior:
   when an admitted CoS interface has no real scheduler-map queues remains the
   sole root-shaped guarantee queue; admission can come from shaping or from a
   classifier/rewrite rule that targets that default queue/class.
+- a scheduler-map entry naming a scheduler that is NOT defined (a
+  dangling reference) is hard-rejected at strict commit
+  (`validateClassOfServiceSchedulerMapRefsStrict`), so an operator can
+  never create one. If a config persisted by an older binary — or synced
+  from a peer — still carries one, it is downgraded to a warning on load
+  (`lenientSchedulerMapRef`, #1960) and the helper applies a SAFE
+  best-effort default: the queue stays materialized under its real queue
+  id / forwarding-class (so classified traffic still forwards) but is
+  pinned to the MINIMAL surplus weight (1), not the whole-interface-rate
+  MAXIMUM (16) the effective-rate derivation used before. This distinguishes
+  a dangling reference (no scheduler; minimal share) from a defined
+  scheduler that merely omits `transmit-rate` (residual-only above; full
+  surplus weight). Before the fix a scheduler typo silently handed the
+  class the LARGEST best-effort surplus share instead of its intended
+  guarantee — a fail-open now closed.
 - `transmit-rate exact` prevents that queue from borrowing surplus by default
 - adding `surplus-sharing` on the scheduler (#915) opts an `exact` queue
   into surplus participation while keeping the per-queue rate as a

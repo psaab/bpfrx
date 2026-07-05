@@ -169,6 +169,74 @@ func validatePolicySchedulerReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateClassOfServiceSchedulerMapRefsStrict hard-rejects a
+// class-of-service scheduler-map entry whose `scheduler <name>`
+// reference does not resolve to a defined `class-of-service schedulers`
+// entry — a commit-time typo. Junos hard-rejects an unresolved
+// scheduler reference at commit; this restores that behavior.
+//
+// Before this gate the reference was warn-only at commit
+// (ValidateConfig, compiler_validate_warn.go) and then FAILED OPEN in
+// the dataplane: the userspace helper's per-queue builder
+// (userspace-dp forwarding_build/cos.rs) resolves the dangling name to
+// `None`, leaves `guarantee_enabled` false, sets the queue's transmit
+// rate to the WHOLE interface shaping rate, and derives the MAXIMUM
+// surplus weight (16). So a premium class (e.g. `ef`) whose scheduler
+// name is a typo did not merely lose its guarantee — it silently won
+// the LARGEST best-effort surplus share, invisible outside the runtime
+// queue rows.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this
+// to a warning (opts.lenientSchedulerMapRef) so a config persisted by
+// an older binary (which only warned) or synced from a peer still boots
+// (#1960 no-brick). The dataplane's render-path safety net (the
+// scheduler-unresolved SAFE default in forwarding_build/cos.rs, which
+// pins surplus_weight to 1) keeps a leniently-loaded dangling reference
+// from fail-opening to the maximum best-effort share on that boot.
+// Mirrors validatePolicySchedulerReferencesStrict, which rejects an
+// undefined scheduler reference from a security policy.
+//
+// An EMPTY scheduler string is skipped: the grammar requires a name, so
+// an empty value arises only in constructed configs and is the same
+// "no scheduler assigned" placeholder the warn / strict buffer
+// validators skip.
+func validateClassOfServiceSchedulerMapRefsStrict(cos *ClassOfServiceConfig) error {
+	if cos == nil {
+		return nil
+	}
+	// Iterate scheduler-maps and their entries in sorted order so
+	// commit-check surfaces a STABLE first-error message (Go map
+	// iteration order is randomized).
+	mapNames := make([]string, 0, len(cos.SchedulerMaps))
+	for name := range cos.SchedulerMaps {
+		mapNames = append(mapNames, name)
+	}
+	sort.Strings(mapNames)
+	for _, mapName := range mapNames {
+		schedMap := cos.SchedulerMaps[mapName]
+		if schedMap == nil {
+			continue
+		}
+		classNames := make([]string, 0, len(schedMap.Entries))
+		for className := range schedMap.Entries {
+			classNames = append(classNames, className)
+		}
+		sort.Strings(classNames)
+		for _, className := range classNames {
+			entry := schedMap.Entries[className]
+			if entry == nil || entry.Scheduler == "" {
+				continue
+			}
+			if _, ok := cos.Schedulers[entry.Scheduler]; !ok {
+				return fmt.Errorf(
+					"class-of-service scheduler-map %q forwarding-class %q references undefined scheduler %q",
+					schedMap.Name, className, entry.Scheduler)
+			}
+		}
+	}
+	return nil
+}
+
 // validateIPsecPolicyProposalReferencesStrict hard-rejects an IPsec
 // (Phase 2) policy whose `proposals` reference does not resolve to a
 // defined IPsec proposal (#2073). resolveESPSettings (pkg/ipsec/ike.go)
