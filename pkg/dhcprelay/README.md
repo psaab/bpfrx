@@ -115,10 +115,49 @@ RFC 768).
 - **Counters.** `Stats()` exposes a per-reason breakdown
   (`RepliesL2Unicast`, `RepliesUnicastCiaddr`, `RepliesBroadcastFlag1`,
   `RepliesBroadcastForced`, `RepliesBroadcastNoTarget`,
-  `RepliesBroadcastL2Fallback`, `RepliesBroadcastNak`). **`RepliesBroadcastL2Fallback` is the one
+  `RepliesBroadcastL2Fallback`, `RepliesBroadcastNak`,
+  `RepliesDroppedUnknownServer`). **`RepliesBroadcastL2Fallback` is the one
   to alert on** — it means the raw-L2 path failed (CAP_NET_RAW, driver, or
-  MTU) and the relay degraded to broadcast. `show ... dhcp-relay` prints
-  this breakdown.
+  MTU) and the relay degraded to broadcast. **`RepliesDroppedUnknownServer`
+  (#4163)** counts replies dropped because their source IP was not a
+  configured server — a non-zero value is a rogue-reply injection attempt (or
+  a multi-homed server unicasting from an unlisted source IP); see "Reply
+  source validation" below. `show ... dhcp-relay` prints this breakdown.
+
+## Reply source validation (#4163)
+
+`handleServerResponses` validates every server reply's **source IP against the
+configured server set before parsing or forwarding it**. The server-facing
+socket is *bound* to `giaddr:67` (see the socket-lifecycle notes below), not
+`connect()`-ed, so the kernel delivers any datagram routed to `giaddr:67` —
+from **any** source — up to the relay. Without a source check an off-path
+attacker (or a compromised transit host) that can route a UDP datagram to
+`giaddr:67` could inject a forged `OFFER`/`ACK` (steering the client to a
+hostile gateway/DNS → MITM) or a forged `NAK` (forcing a client restart) and
+the relay would deliver it. RFC 3046 relay practice is to forward replies only
+from the relay's explicit, configured server list.
+
+- The resolved server set (`[]*net.UDPAddr`, IP + port 67, from the group's
+  active `server-group`) is threaded from `runRelaySession` into
+  `handleServerResponses`, which builds an IP allow-set once. Each reply's
+  source IP (from `ReadFrom`) is compared with `net.IP.Equal` (form-agnostic;
+  the source **port** is not part of the trust decision). A reply from an
+  unlisted source is **dropped before `dhcpv4.FromBytes`** and counted in
+  `RepliesDroppedUnknownServer`.
+- **Enforced by default** — there is no legitimate case for a relay forwarding
+  a reply from a source outside its configured set. The drop is made **loud**:
+  the first drop per session logs at `Warn` (subsequent ones at `Debug` so a
+  forged-reply flood cannot spam the log) and every drop bumps the counter, so
+  the one benign edge case — a strictly **multi-homed server** that unicasts
+  its reply from a source IP different from the one the operator listed — is
+  diagnosable from `RepliesDroppedUnknownServer` (and the `Warn`) rather than
+  presenting as a silent black-hole. If a real deployment needs that, a
+  follow-up can add an explicit extra-reply-source allow-list knob; it is not
+  needed to close the injection hole.
+- `giaddr`-echo and Option-82 correlation are strictly-stronger secondary
+  checks and are **out of scope** here (Option 82 is stripped on the reply, but
+  not echo-validated); source-set membership is the primary, highest-value
+  control. This is DHCPv4-only (there is no DHCPv6 relay — see below).
 
 ### `overrides always-broadcast` config
 

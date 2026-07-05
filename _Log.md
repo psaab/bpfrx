@@ -1,3 +1,46 @@
+## 2026-07-04 — #4163 (fable-review-164 L-12): DHCP-relay reply source validation
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Closed a rogue-DHCP-reply injection hole in the DHCPv4
+    relay. `handleServerResponses` (`pkg/dhcprelay/relay.go`) forwarded
+    server replies (OFFER/ACK/NAK/FORCERENEW) to clients based on packet
+    contents alone (OpCode==BootReply + relayable MessageType); the
+    reply's source IP was read via `ReadFrom` but used only in a
+    `slog.Debug` line, never validated. The server-facing socket is
+    `ListenPacket("udp4", giaddr:67)` — bound, not `connect()`-ed — so it
+    accepts datagrams from ANY host that can route to `giaddr:67`. An
+    off-path attacker could inject a forged OFFER/ACK (hostile
+    gateway/DNS → MITM) or a forged NAK (client restart).
+  - **Fix**: threaded the already-resolved server set
+    (`servers []*net.UDPAddr`, from `computeDesired` via `runRelaySession`)
+    into `handleServerResponses` (signature + the one call site, ~line
+    1016). Built an IP allow-set once, and before `dhcpv4.FromBytes` drop
+    any reply whose source IP is not a configured server (compared with
+    `net.IP.Equal`; source port not load-bearing), incrementing a new
+    `repliesDroppedUnknownServer` counter (mirrored to
+    `RelayStats.RepliesDroppedUnknownServer`, populated in `Stats()`,
+    surfaced in `show ... dhcp-relay`). Enforced by DEFAULT (RFC 3046
+    relay practice). The drop is LOUD: first drop per session at `Warn`,
+    subsequent at `Debug` (counter is the durable signal — a forged-reply
+    flood cannot spam the log), so the one benign edge (a multi-homed
+    server unicasting from an unlisted source) is diagnosable, not a
+    silent black-hole. An extra-reply-source allow-list knob is a
+    deliberate follow-up, not shipped now. Helpers: `replySourceAllowed`,
+    `udpAddrIP` (handles *net.UDPAddr / *net.IPAddr / string fallback).
+    Existing OpCode/MessageType gates preserved (source check added
+    alongside). DHCPv4-only (no DHCPv6 relay exists).
+  - **Tests**: `pkg/dhcprelay/delivery_test.go` — added
+    configurable-source support to `fakeConn`; new tests: configured
+    source forwarded (counter stays 0); UNCONFIGURED source dropped +
+    counter==1 (RED on revert — under a neutered check the rogue OFFER
+    reaches the client, `repliesForwarded=1`, counter=0, proven);
+    multi-server group accepts from ANY member (2nd member forwarded);
+    configured-source-wrong-OpCode dropped by the OpCode gate WITHOUT
+    counting as an unknown-server drop. `go test ./pkg/dhcprelay/...
+    ./pkg/cli/...` green; `go build ./...`, gofmt, vet clean.
+  - **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/delivery_test.go,
+    pkg/dhcprelay/relay_test.go, pkg/cli/cli_show_services.go,
+    pkg/dhcprelay/README.md, _Log.md
 ## 2026-07-04 — #4162 (fable-review-164 L-5): /metrics session-walk TTL cache + auth posture
 
 - **Timestamp**: 2026-07-04
