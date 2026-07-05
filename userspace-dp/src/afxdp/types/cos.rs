@@ -1500,6 +1500,29 @@ pub(in crate::afxdp) struct CoSTimerWheelRuntime {
     pub(in crate::afxdp) current_tick: u64,
     pub(in crate::afxdp) level0: [Vec<usize>; COS_TIMER_WHEEL_L0_SLOTS],
     pub(in crate::afxdp) level1: [Vec<usize>; COS_TIMER_WHEEL_L1_SLOTS],
+    /// #4270 (R-9): persistent per-drain scratch buffers reused across
+    /// every `cascade_cos_timer_wheel_level1` / `wake_due_cos_timer_slot`
+    /// call so the per-tick catch-up loop performs no allocator ops. The
+    /// slot being processed is *swapped* with `drain` (preserving the
+    /// slot's own capacity for the next park), and the rearm/wake decision
+    /// lists reuse the persistent vectors instead of `Vec::with_capacity`
+    /// temporaries. See the two functions in cos/tx_completion.rs.
+    pub(in crate::afxdp) scratch: CoSTimerWheelScratch,
+}
+
+/// #4270 (R-9): reusable scratch for the timer-wheel drain path. All
+/// three vectors retain capacity across calls; the two consumers
+/// (`cascade_cos_timer_wheel_level1`, `wake_due_cos_timer_slot`) run
+/// sequentially on the owner thread and never nest, so sharing is safe.
+#[derive(Default)]
+pub(in crate::afxdp) struct CoSTimerWheelScratch {
+    /// Swapped with the slot Vec being processed so the slot keeps a
+    /// capacity-retaining buffer (never a fresh 0-capacity Vec).
+    pub(in crate::afxdp) drain: Vec<usize>,
+    /// Reused list of `(queue_idx, wake_tick)` to re-park after the scan.
+    pub(in crate::afxdp) rearm: Vec<(usize, u64)>,
+    /// Reused list of queue indices to wake after the scan.
+    pub(in crate::afxdp) wake: Vec<usize>,
 }
 
 /// #751: per-queue owner-side drain telemetry. Written by the owner

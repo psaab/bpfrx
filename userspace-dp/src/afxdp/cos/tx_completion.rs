@@ -331,9 +331,17 @@ fn snap_cos_timer_wheel_over_horizon(root: &mut CoSInterfaceRuntime, now_tick: u
 fn cascade_cos_timer_wheel_level1(root: &mut CoSInterfaceRuntime) {
     let slot = ((root.timer_wheel.current_tick / COS_TIMER_WHEEL_L0_SLOTS as u64)
         % COS_TIMER_WHEEL_L1_SLOTS as u64) as usize;
-    let queued = core::mem::take(&mut root.timer_wheel.level1[slot]);
-    let mut rearm = Vec::with_capacity(queued.len());
-    for queue_idx in queued {
+    // #4270 (R-9): take the persistent scratch out of `root` so the
+    // `&mut root` rearm calls below borrow cleanly; restored before return.
+    let mut drain = core::mem::take(&mut root.timer_wheel.scratch.drain);
+    let mut rearm = core::mem::take(&mut root.timer_wheel.scratch.rearm);
+    drain.clear();
+    rearm.clear();
+    // Swap the slot's queued indices into `drain` WITHOUT freeing the
+    // slot's capacity: the slot receives `drain`'s emptied buffer, so the
+    // next park into it reuses that capacity instead of reallocating.
+    core::mem::swap(&mut drain, &mut root.timer_wheel.level1[slot]);
+    for queue_idx in drain.iter().copied() {
         let Some(queue) = root.queues.get(queue_idx) else {
             continue;
         };
@@ -342,17 +350,28 @@ fn cascade_cos_timer_wheel_level1(root: &mut CoSInterfaceRuntime) {
         }
         rearm.push((queue_idx, queue.hot.next_wakeup_tick));
     }
-    for (queue_idx, wake_tick) in rearm {
+    for (queue_idx, wake_tick) in rearm.iter().copied() {
         rearm_cos_queue(root, queue_idx, wake_tick);
     }
+    drain.clear();
+    rearm.clear();
+    root.timer_wheel.scratch.drain = drain;
+    root.timer_wheel.scratch.rearm = rearm;
 }
 
 fn wake_due_cos_timer_slot(root: &mut CoSInterfaceRuntime) {
     let slot = (root.timer_wheel.current_tick % COS_TIMER_WHEEL_L0_SLOTS as u64) as usize;
-    let queued = core::mem::take(&mut root.timer_wheel.level0[slot]);
-    let mut rearm = Vec::with_capacity(queued.len());
-    let mut wake = Vec::with_capacity(queued.len());
-    for queue_idx in queued {
+    // #4270 (R-9): reuse the persistent scratch (drain/rearm/wake) — no
+    // per-slot allocation on the per-tick catch-up loop.
+    let mut drain = core::mem::take(&mut root.timer_wheel.scratch.drain);
+    let mut rearm = core::mem::take(&mut root.timer_wheel.scratch.rearm);
+    let mut wake = core::mem::take(&mut root.timer_wheel.scratch.wake);
+    drain.clear();
+    rearm.clear();
+    wake.clear();
+    // Swap out the slot (capacity-preserving, see cascade above).
+    core::mem::swap(&mut drain, &mut root.timer_wheel.level0[slot]);
+    for queue_idx in drain.iter().copied() {
         let Some(queue) = root.queues.get(queue_idx) else {
             continue;
         };
@@ -365,12 +384,18 @@ fn wake_due_cos_timer_slot(root: &mut CoSInterfaceRuntime) {
             rearm.push((queue_idx, queue.hot.next_wakeup_tick));
         }
     }
-    for queue_idx in wake {
+    for queue_idx in wake.iter().copied() {
         wake_cos_queue(root, queue_idx);
     }
-    for (queue_idx, wake_tick) in rearm {
+    for (queue_idx, wake_tick) in rearm.iter().copied() {
         rearm_cos_queue(root, queue_idx, wake_tick);
     }
+    drain.clear();
+    rearm.clear();
+    wake.clear();
+    root.timer_wheel.scratch.drain = drain;
+    root.timer_wheel.scratch.rearm = rearm;
+    root.timer_wheel.scratch.wake = wake;
 }
 
 /// Conservative pre-prime gate for `drain_shaped_tx`.
