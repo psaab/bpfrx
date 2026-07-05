@@ -230,6 +230,61 @@ func TestStaticNATThenInetRoutingInstanceAdvisory(t *testing.T) {
 	}
 }
 
+// Copilot edge (#4292): the trailing-routing-instance grammar. The RI scan must
+// return the LAST "routing-instance" occurrence, not the first — otherwise an
+// earlier "routing-instance" token in the collapsed key list wins. The
+// pathological case: the address-book entry referenced by prefix-name is itself
+// literally NAMED "routing-instance", and the target RI trails at the tail.
+//
+// RED on revert (first-match scan): ThenRoutingInstance is recorded as the entry
+// name "routing-instance" instead of the trailing "MYVRF".
+func TestStaticNATThenRoutingInstanceLastOccurrence(t *testing.T) {
+	cmds := []string{
+		// An address-book entry pathologically NAMED "routing-instance".
+		"set security address-book global address routing-instance 10.0.0.9/32",
+		"set security nat static rule-set S rule R1 match destination-address 203.0.113.5/32",
+		// then static-nat prefix-name <entry=routing-instance> routing-instance MYVRF
+		"set security nat static rule-set S rule R1 then static-nat prefix-name routing-instance routing-instance MYVRF",
+	}
+	cfg, err := CompileConfig(buildTree(t, cmds))
+	if err != nil {
+		t.Fatalf("prefix-name entry named routing-instance + trailing routing-instance must compile, got: %v", err)
+	}
+	rule := cfg.Security.NAT.Static[0].Rules[0]
+	if rule.ThenPrefixName != "routing-instance" {
+		t.Fatalf("ThenPrefixName = %q, want routing-instance (the pathological entry name)", rule.ThenPrefixName)
+	}
+	if rule.Then != "10.0.0.9/32" {
+		t.Fatalf("Then = %q, want 10.0.0.9/32 (prefix-name must resolve the entry named routing-instance)", rule.Then)
+	}
+	if rule.ThenRoutingInstance != "MYVRF" {
+		t.Fatalf("ThenRoutingInstance = %q, want MYVRF (trailing RI; a first-match scan wrongly returns the entry name %q)", rule.ThenRoutingInstance, "routing-instance")
+	}
+	if !natWarnContains(cfg, "#4292") || !natWarnContains(cfg, "MYVRF") {
+		t.Fatalf("advisory must reference the TRAILING RI MYVRF, not the entry name; warnings=%v", cfg.Warnings)
+	}
+}
+
+// The normal prefix-name + trailing routing-instance case stays correct.
+func TestStaticNATThenPrefixNameRoutingInstanceNormal(t *testing.T) {
+	cmds := []string{
+		"set security address-book global address FOO 10.0.0.7/32",
+		"set security nat static rule-set S rule R1 match destination-address 203.0.113.5/32",
+		"set security nat static rule-set S rule R1 then static-nat prefix-name FOO routing-instance MYVRF",
+	}
+	cfg, err := CompileConfig(buildTree(t, cmds))
+	if err != nil {
+		t.Fatalf("prefix-name FOO routing-instance MYVRF must compile, got: %v", err)
+	}
+	rule := cfg.Security.NAT.Static[0].Rules[0]
+	if rule.Then != "10.0.0.7/32" {
+		t.Fatalf("Then = %q, want 10.0.0.7/32", rule.Then)
+	}
+	if rule.ThenRoutingInstance != "MYVRF" {
+		t.Fatalf("ThenRoutingInstance = %q, want MYVRF", rule.ThenRoutingInstance)
+	}
+}
+
 // RED on revert: the DNAT pool routing-instance is silently dropped.
 func TestDNATPoolRoutingInstanceAdvisory(t *testing.T) {
 	cmds := []string{

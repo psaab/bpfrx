@@ -35382,3 +35382,27 @@ top.
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_nat_target_parity_hb167_test.go,
   docs/feature-gaps.md, docs/config-schema.md, _Log.md
+
+## 2026-07-05 — fable-167 NAT PR #4294 Copilot fold: trailing-RI last-occurrence (#4292)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Folded a Copilot correctness edge on PR #4294.
+  `staticNATRoutingInstanceFromKeys` (compiler_nat.go) scanned the collapsed
+  static-nat then-leaf Keys forward and returned the FIRST "routing-instance"
+  occurrence. The Junos grammar is TRAILING (`then static-nat <target>
+  routing-instance <ri>` — the target RI is at the tail), so an earlier
+  "routing-instance" token in the key list (e.g. a `prefix-name` whose
+  address-book entry is pathologically NAMED "routing-instance") made
+  first-match return the wrong token → ThenRoutingInstance + the advisory
+  referenced the wrong RI. Changed the scan to iterate BACKWARD and return the
+  LAST occurrence. The sibling N-3 key captures (pool `routing-instance` via
+  `nodeVal`, the `t.FindChild("routing-instance")` single-leaf path) do NOT use
+  a trailing key-scan, so no other site needed the fix.
+- **Validation**: 2 new tests (last-occurrence pathological entry-named-
+  "routing-instance" → MYVRF; normal `prefix-name FOO routing-instance MYVRF`
+  → MYVRF), proven RED under the first-match revert (recorded "routing-instance"
+  instead of MYVRF), green after. Full `go test ./pkg/config/...` green;
+  `go build ./...` clean; gofmt + vet clean. Rebased origin/master (#4293
+  routing merge, clean auto-merge of _Log.md).
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_nat_target_parity_hb167_test.go, _Log.md

@@ -2165,13 +2165,21 @@ func staticNATMappedPortFromKeys(keys []string) int {
 }
 
 // staticNATRoutingInstanceFromKeys scans a collapsed static-nat `then` leaf's
-// Keys for a trailing `routing-instance <ri>` translation target (#4292) and
-// returns the instance name (or "" when absent). Mirrors
-// staticNATMappedPortFromKeys — the free-form static-nat leaf absorbs the whole
-// `then static-nat <target> routing-instance <ri>` line onto one node's Keys in
-// the flat-set shape.
+// Keys for the trailing `routing-instance <ri>` translation target (#4292) and
+// returns the instance name (or "" when absent). The free-form static-nat leaf
+// absorbs the whole `then static-nat <target> routing-instance <ri>` line onto
+// one node's Keys in the flat-set shape.
+//
+// It scans from the END and returns the LAST occurrence, because the Junos
+// grammar places the target routing-instance at the TAIL of the line. Scanning
+// forward (first match) would return the wrong token if an earlier
+// "routing-instance" appeared in the key list — e.g. `then static-nat
+// prefix-name routing-instance routing-instance MYVRF`, where the address-book
+// entry is pathologically NAMED "routing-instance": first-match would return
+// that entry name instead of the trailing "MYVRF". Last-match is strictly more
+// correct for the trailing-routing-instance grammar.
 func staticNATRoutingInstanceFromKeys(keys []string) string {
-	for i := 0; i+1 < len(keys); i++ {
+	for i := len(keys) - 2; i >= 0; i-- {
 		if keys[i] == "routing-instance" {
 			return keys[i+1]
 		}
