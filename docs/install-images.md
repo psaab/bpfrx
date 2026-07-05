@@ -204,6 +204,12 @@ virt-install --name xpf1 --memory 4096 --vcpus 4 \
 Plain QEMU works the same way (`-drive file=xpf-<ver>.qcow2`
 `-cdrom day0.iso`); the image boots UEFI or BIOS.
 
+The tool-driven path is `xpf-deploy.py --hypervisor libvirt deploy`, which
+reads the golden qcow2 from `/var/lib/libvirt/images/<image>.qcow2` and gives
+each VM its own copy-on-write overlay. Put the verified image there with
+`xpf-deploy.py fetch --version <ver> --qcow2-only --install-libvirt` (see
+`docs/distribution.md`) so fetch and deploy use the same path.
+
 ## First-boot contract (vSRX parity)
 
 | vSRX | xpf image |

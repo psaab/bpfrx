@@ -149,9 +149,22 @@ sh install.sh
 # downloads + verifies the EXACT bytes against the signed manifest, then
 # imports to a local incus alias
 xpf-deploy.py fetch --version <ver> --image-url https://dl.example.com/xpf
-# libvirt/KVM (qcow2 only):
+
+# libvirt/KVM: verify the qcow2 AND install it to the golden path that
+# `deploy --hypervisor libvirt` reads (/var/lib/libvirt/images/<image>.qcow2,
+# basename from --alias, default xpf-appliance) so fetch and deploy connect:
+xpf-deploy.py fetch --version <ver> --image-url ... --qcow2-only --install-libvirt
+xpf-deploy.py --hypervisor libvirt deploy <appliance.yaml>
+
+# Verify only (no install): fetch prints the exact `install` command that
+# copies the verified qcow2 into the golden path.
 xpf-deploy.py fetch --version <ver> --image-url ... --qcow2-only
 ```
+
+`deploy --hypervisor libvirt` never boots the golden directly — it creates a
+per-VM copy-on-write overlay backed read-only by the golden. `--install-libvirt`
+is the one step that moves the *verified* qcow2 to the shared golden path; both
+sides derive that path from the same helper so they cannot drift.
 
 ### CAUTION — interface takeover (#1879)
 

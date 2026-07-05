@@ -69,7 +69,7 @@ That is the switch — the tool never guesses:
 | `macvlan` | host dev | `nic nictype=macvlan` | `--network type=direct` | virtio (vhost) |
 | `sriov` | **PF name** | `nic nictype=sriov` (incus carves a VF, pins MAC) | `<PF>-vfpool` network | mlx5 native / iavf generic |
 | `pci` | **PCI address** | `pci address=` (VFIO) | `--hostdev` / hostdev-network | native (real driver) |
-| `physical` | host dev | `nic nictype=physical` | `--hostdev` | native (real driver) |
+| `physical` | host dev name | `nic nictype=physical` | `--hostdev` (the netdev name is resolved to its PCI address) | native (real driver) |
 
 - **`sriov:<PF>`** = "give me a VF off this PF" — incus allocates a free
   VF and pins its MAC. incus convenience.
@@ -78,6 +78,12 @@ That is the switch — the tool never guesses:
   tool pins it on the parent PF). **`pci:<vf-addr>,mac=` deploys
   identically on incus and libvirt** — use it when one definition must
   serve both.
+- **`physical:<dev>`** = "pass through the whole card behind this
+  interface name". incus takes the netdev name directly
+  (`nictype=physical parent=<dev>`); on libvirt the tool resolves the
+  netdev to its PCI address for `--hostdev` (which requires a PCI/USB
+  address, not an interface name). A raw `physical:<pci-addr>` is accepted
+  too. Prefer `pci:` when you already have the PCI BDF.
 
 `xpf-deploy.py inventory` prints PF names, per-PF VFs, and PCI addresses
 ready to drop into `source`.
