@@ -1536,6 +1536,65 @@ alternative** to (or co-factor of) the transport-physics floor.
   it eliminates a genuine over-charge that parked mid-rate classes early.
   Needs a cluster CoS mid-rate multi-class smoke to measure the recovery.
 
+### Non-exact guaranteed classes are metered class-wide (#4265, R-2)
+
+A **non-exact** guaranteed class whose transmit-rate trips
+`COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps) runs the sharded
+`shared_exact` execution policy — it drains locally on EVERY worker
+rather than being funnelled to one owner (#1598 admitted non-exact
+high-rate queues to sharded service to lift the single-worker AF_XDP
+UMEM ceiling). But its GUARANTEE-phase service goes through
+`select_nonexact_cos_guarantee_batch` (not the exact waterfill), which
+until #4265 refilled a **private per-worker** token bucket at the FULL
+configured rate. With N workers each independently refilling at the full
+rate, the class was admitted at up to **N × its configured guaranteed
+rate** at guarantee priority — e.g. a 1g non-exact guarantee could take
+~6 Gb/s on the 6-worker loss cluster. The excess bypassed both the
+surplus-phase DWRR and the `SharedCoSExactBacklog` residual bound (the
+whole cross-worker constraint machinery constrains only the surplus
+leg). Same CLASS of over-admission as the closed #4002 / #2955 (split
+per-worker state), different still-open site.
+
+- **The mechanism.** `worker/cos/mod.rs` attached a `shared_queue_lease`
+  to the queue fast-path only when `queue.exact`; the coordinator
+  (`build_shared_cos_queue_leases_reusing_existing`) only ever built a
+  `SharedCoSQueueLease` for exact queues. So the class-wide metered
+  refill path in `maybe_top_up_cos_queue_lease` was unreachable for
+  non-exact queues, and the selector fell to the unmetered per-worker
+  `refill_cos_tokens`.
+- **The fix.** The coordinator now builds a **shared LEGACY lease**
+  (`SharedCoSQueueLease::new` — v8=None, a greedy-aggregate shared token
+  bucket all workers draw from) for non-exact guaranteed queues whose
+  rate qualifies for sharded service, keyed and Arc-reuse-disciplined the
+  same way as the exact v8 leases (a worker join/leave changes
+  `active_shards` and rebuilds the lease via `matches_config`). The
+  worker attaches it unconditionally; `select_nonexact_cos_guarantee_batch`
+  refills through `maybe_top_up_cos_queue_lease` (its pre-existing but
+  previously-unreachable non-exact-with-lease branch); the guarantee-phase
+  send debits the lease via `maybe_consume_exact_queue_lease` (no longer
+  gated on `exact`); and the queue-empty give-back returns unspent credit
+  through `release_unused_v8`, which reduces to the legacy `release_unused`
+  for a v8=None lease. Aggregate guarantee admission is therefore metered
+  to the configured rate while staying work-conserving — a single busy
+  worker can drain the whole shared pool when its peers are idle
+  (rate-division would instead cap that worker at rate/N; the shared lease
+  avoids that starvation/waste tradeoff). Because the legacy lease has no
+  v8 epoch ledger, it is not subject to the #4246 T-1 / R-5(a) hole.
+- **Single-owner queues are unchanged.** A non-exact queue below the
+  sharded-service rate threshold stays single-owner (one worker services
+  it; no over-admission) and gets no lease; the selector still refills its
+  private bucket exactly as before.
+- **Test.** `nonexact_guarantee_shared_lease_bounds_aggregate_admission_across_workers`
+  (queue_service tests) drives N=6 worker replicas sharing one lease over
+  a 20 ms window and asserts the summed admission stays near the
+  configured rate (RED — ~N× — on revert to the per-worker refill);
+  `nonexact_guarantee_refill_is_gated_by_shared_lease_pool` pins that an
+  empty shared pool starves the selector rather than leaking a private
+  full-rate refill. Needs a cluster CoS smoke with a non-exact guaranteed
+  class on a shared multi-worker egress to confirm the aggregate cap on
+  real traffic (the standard fixtures use exact classes, so this does not
+  fire on the canonical smoke matrix).
+
 ### Simul-load harness
 
 `test/incus/cos-simul-load-smoke.sh [push|reverse]` runs all 11

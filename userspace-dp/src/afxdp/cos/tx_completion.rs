@@ -720,7 +720,15 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
     if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
         for (queue_idx, queue) in root.queues.iter_mut().enumerate() {
             normalize_cos_queue_state(queue);
-            if cos_queue_is_empty(queue) && queue.config.exact && queue.hot.tokens > 0 {
+            // #4265 (R-2): give back an empty queue's banked burst whenever a
+            // shared lease is attached — this now includes the non-exact
+            // guaranteed sharded queue's legacy lease, not just exact
+            // queues. The `has_lease` probe is still the actual gate for the
+            // `mem::take` (R-5(a)): a no-lease queue (single-owner exact OR
+            // single-owner non-exact) keeps its banked burst intact, since
+            // there is nowhere to give it back. `release_unused_v8` reduces
+            // to the legacy `release_unused` for a legacy (v8=None) lease.
+            if cos_queue_is_empty(queue) && queue.hot.tokens > 0 {
                 let has_lease = iface_fast
                     .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
                     .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
@@ -779,7 +787,15 @@ pub(in crate::afxdp) fn apply_cos_send_result(
     sent_bytes: u64,
     retry: VecDeque<TxRequest>,
 ) {
-    let mut exact_queue_idx = None;
+    // #4265 (R-2): the serviced queue's shared lease is debited in the
+    // Guarantee phase regardless of `exact` — a non-exact guaranteed
+    // sharded queue now carries a legacy lease that meters its class-wide
+    // admission, so its guarantee-phase sends must debit that lease too.
+    // `maybe_consume_exact_queue_lease` still gates on phase == Guarantee
+    // and lease-presence, so a non-leased queue or a surplus-phase send is
+    // a no-op (surplus draws from root tokens, not the per-queue lease —
+    // the #915 rationale).
+    let mut lease_consume_queue_idx = None;
     let binding_slot = binding.slot;
     let shared_exact_backlog = binding
         .cos
@@ -808,7 +824,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
             && interface_has_backlogged_exact_queue(root, peer_exact_backlogged);
         let mut debit_nonexact_surplus_budget = false;
         if let Some(queue) = root.queues.get_mut(queue_idx) {
-            exact_queue_idx = queue.config.exact.then_some(queue_idx);
+            lease_consume_queue_idx = Some(queue_idx);
             debit_nonexact_surplus_budget = sent_bytes > 0
                 && !queue.config.exact
                 && matches!(phase, CoSServicePhase::Surplus)
@@ -863,7 +879,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
     // #915: phase-gate `shared_queue_lease` consumption to the
     // Guarantee phase only. See `maybe_consume_exact_queue_lease`
     // for rationale.
-    if let Some(queue_idx) = exact_queue_idx {
+    if let Some(queue_idx) = lease_consume_queue_idx {
         let shared_queue_lease = binding
             .cos
             .cos_fast_interfaces
@@ -885,7 +901,15 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
     sent_bytes: u64,
     retry: VecDeque<PreparedTxRequest>,
 ) {
-    let mut exact_queue_idx = None;
+    // #4265 (R-2): the serviced queue's shared lease is debited in the
+    // Guarantee phase regardless of `exact` — a non-exact guaranteed
+    // sharded queue now carries a legacy lease that meters its class-wide
+    // admission, so its guarantee-phase sends must debit that lease too.
+    // `maybe_consume_exact_queue_lease` still gates on phase == Guarantee
+    // and lease-presence, so a non-leased queue or a surplus-phase send is
+    // a no-op (surplus draws from root tokens, not the per-queue lease —
+    // the #915 rationale).
+    let mut lease_consume_queue_idx = None;
     let binding_slot = binding.slot;
     let shared_exact_backlog = binding
         .cos
@@ -914,7 +938,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
             && interface_has_backlogged_exact_queue(root, peer_exact_backlogged);
         let mut debit_nonexact_surplus_budget = false;
         if let Some(queue) = root.queues.get_mut(queue_idx) {
-            exact_queue_idx = queue.config.exact.then_some(queue_idx);
+            lease_consume_queue_idx = Some(queue_idx);
             debit_nonexact_surplus_budget = sent_bytes > 0
                 && !queue.config.exact
                 && matches!(phase, CoSServicePhase::Surplus)
@@ -971,7 +995,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
     // #915: phase-gate `shared_queue_lease` consumption to the
     // Guarantee phase only. See `maybe_consume_exact_queue_lease`
     // for rationale.
-    if let Some(queue_idx) = exact_queue_idx {
+    if let Some(queue_idx) = lease_consume_queue_idx {
         let shared_queue_lease = binding
             .cos
             .cos_fast_interfaces
