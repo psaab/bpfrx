@@ -230,6 +230,8 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_suspended_batches_scratch: 0,
+                    v_min_suspension_window: super::queue_ops::V_MIN_SUSPENSION_BATCHES,
                     v_min_pop_count: 0,
                 },
                 telemetry: CoSQueueTelemetry {

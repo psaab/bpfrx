@@ -48,6 +48,7 @@
     "tx_submit_latency_sum_ns": 0,
     "umem_inflight_frames": 0,
     "umem_total_frames": 0,
+    "v_min_suspended_batches": 0,
     "v_min_throttle_hard_cap_overrides": 0,
     "v_min_throttles": 0,
     "worker_id": 0
@@ -212,6 +213,7 @@
     "umem_inflight_frames": 0,
     "umem_total_frames": 0,
     "unsupported_packets": 0,
+    "v_min_suspended_batches": 0,
     "v_min_throttle_hard_cap_overrides": 0,
     "v_min_throttles": 0,
     "validated_bytes": 0,

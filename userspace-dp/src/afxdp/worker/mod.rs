@@ -1338,6 +1338,8 @@ pub(crate) struct BindingLiveSnapshot {
     /// so operators can tell the fairness brake is engaged from the
     /// escape-hatch firing.
     pub(crate) v_min_throttles: u64,
+    /// #hb166 T-6(a): V_min suspended-batch count on this binding.
+    pub(crate) v_min_suspended_batches: u64,
     pub(crate) session_hits: u64,
     pub(crate) session_misses: u64,
     pub(crate) session_creates: u64,
