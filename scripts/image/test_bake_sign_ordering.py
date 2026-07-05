@@ -132,5 +132,48 @@ class ValidationGateStepTests(unittest.TestCase):
         bake.validation_gate_step(True, "/nonexistent.qcow2", "/nonexistent.meta")
 
 
+class RuntimePackageSyncTests(unittest.TestCase):
+    """#4172: frr-pythontools (provider of /usr/lib/frr/frr-reload.py, the
+    daemon's primary FRR reload path) MUST appear in BOTH the bake's
+    RUNTIME_PACKAGES and the xpf-appliance metapackage Depends, kept in sync
+    per the bake.py comment. Missing it silently degrades every appliance's
+    FRR reload to the additive `vtysh -f` fallback (stale-config removal
+    never converges). RED on revert: dropping it from either list fails
+    here."""
+
+    @staticmethod
+    def _appliance_depends():
+        control = Path(__file__).resolve().parents[2] / "debian" / "control"
+        text = control.read_text()
+        stanza = text.split("Package: xpf-appliance", 1)[1]
+        # Depends runs until the next control field at column 0 (Description:).
+        depends = stanza.split("Depends:", 1)[1].split("\nDescription:", 1)[0]
+        pkgs = set()
+        for entry in depends.split(","):
+            tok = entry.strip()
+            if tok:
+                # Drop any version constraint / arch qualifier after the name.
+                pkgs.add(tok.split()[0])
+        return pkgs
+
+    def test_frr_pythontools_in_runtime_packages(self):
+        self.assertIn(
+            "frr-pythontools", bake.RUNTIME_PACKAGES,
+            "frr-pythontools missing from bake RUNTIME_PACKAGES "
+            "(#4172: /usr/lib/frr/frr-reload.py provider)")
+
+    def test_frr_pythontools_in_appliance_depends(self):
+        self.assertIn(
+            "frr-pythontools", self._appliance_depends(),
+            "frr-pythontools missing from xpf-appliance Depends in "
+            "debian/control (#4172; keep in sync with RUNTIME_PACKAGES)")
+
+    def test_frr_present_as_baseline(self):
+        # Guard the split/parse logic itself: `frr` must resolve in both
+        # lists, so a false-negative parse can't mask a real regression.
+        self.assertIn("frr", bake.RUNTIME_PACKAGES)
+        self.assertIn("frr", self._appliance_depends())
+
+
 if __name__ == "__main__":
     unittest.main()

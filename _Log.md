@@ -1,3 +1,34 @@
+## 2026-07-04 — #4172 (fable-review-165 H-3): frr-pythontools missing from baked image + metapackage
+
+- **Timestamp**: 2026-07-04
+  - **Action**: The baked appliance never installed `frr-pythontools`,
+    so `/usr/lib/frr/frr-reload.py` (the daemon's primary FRR reload
+    path — `pkg/frr/vtysh.go` `frrReloadScript`, invoked from
+    `pkg/frr/manager.go:641/824`) was permanently absent. Every reload
+    silently fell back to the additive `vtysh -f` path and the
+    degraded-retry loop re-execed the missing script forever, so a
+    deleted route/BGP neighbor kept forwarding/advertising. The dev/test
+    cluster installs `frr-pythontools` (`cluster-setup.sh:452`), so the
+    real reload path was the one combination never exercised.
+  - **Fix**: (a) added `frr-pythontools` to `RUNTIME_PACKAGES`
+    (`scripts/image/bake.py`, right after `frr`) with a comment; (b)
+    added `frr-pythontools,` to the `xpf-appliance` `Depends`
+    (`debian/control`, right after `frr,`) — kept in sync per the
+    bake.py comment; (c) added a bake-time HARD-ASSERT
+    `test -x /usr/lib/frr/frr-reload.py` (mirrors the growpart assert)
+    so future frr package-name drift FAILS THE BAKE instead of silently
+    degrading; (d) added a `validate.py` scenario-A presence check
+    (mirrors the growpart presence check).
+  - **Test**: `test_bake_sign_ordering.py` new `RuntimePackageSyncTests`
+    asserts `frr-pythontools` membership in BOTH lists + a `frr`
+    baseline guard on the parse logic. RED-on-revert proven: removing
+    the additions makes 2 membership tests FAIL; baseline stays green.
+    `debian/control` re-parses cleanly (RFC822 paragraph parse). Doc:
+    `docs/install-images.md` bake-steps note.
+  - **File(s)**: scripts/image/bake.py, debian/control,
+    scripts/image/validate.py, scripts/image/test_bake_sign_ordering.py,
+    docs/install-images.md, _Log.md
+
 ## 2026-07-04 — #4161 (fable-review-164 M-3) + L-9: source-NAT most-specific-scope-wins
 
 - **Timestamp**: 2026-07-04

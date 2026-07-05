@@ -68,7 +68,16 @@ Pipeline (offline — the image is never booted to provision it):
    (a competing network manager), snapd, and the virtual-kernel
    metapackages, systemd-networkd + resolved enabled, FRR + chrony
    enabled (default NTP pools neutered; xpfd manages
-   `sources.d/xpf.sources`), sysctls, `init_on_alloc=0` (via an
+   `sources.d/xpf.sources`). FRR is installed WITH `frr-pythontools`
+   (`RUNTIME_PACKAGES` + the `xpf-appliance` `Depends`, kept in sync):
+   it provides `/usr/lib/frr/frr-reload.py`, the daemon's primary FRR
+   reload path (`pkg/frr`). It is NOT pulled in transitively by the
+   `frr` package, so it is listed explicitly and a bake-time
+   `test -x /usr/lib/frr/frr-reload.py` assert (plus a `validate.py`
+   presence check) fails the build if it is ever missing — without it
+   every reload silently degrades to the additive `vtysh -f` fallback
+   and stale-config removal (a deleted route/BGP neighbor) never
+   converges (#4172). Then sysctls, `init_on_alloc=0` (via an
    `/etc/default/grub.d` drop-in — Ubuntu cloud images override
    `GRUB_CMDLINE_LINUX_DEFAULT` there), and `apt-get install ./xpf.deb`.
    The package's `postinst` always stages the binary set into
