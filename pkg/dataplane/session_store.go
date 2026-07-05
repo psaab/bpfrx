@@ -16,6 +16,11 @@ type DeleteReason string
 const (
 	DeleteReasonClusterStale DeleteReason = "cluster-stale"
 	DeleteReasonGCExpired    DeleteReason = "gc-expired"
+	// DeleteReasonPolicyDeleted labels the commit-time invalidation of a
+	// session whose admitting policy was removed from the config (#4234, the
+	// Junos-default deletion-clear). Like the other reasons it is a documentary
+	// label — DeleteBatchKnownV4/V6 ignore it — but it names the call site.
+	DeleteReasonPolicyDeleted DeleteReason = "policy-deleted"
 )
 
 const sessionDeleteBatchSize = 64

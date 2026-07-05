@@ -545,27 +545,30 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// #4233: `security policies policy-rematch [extensive]` is typed and
-	// recorded (compiler_security_policy.go) but xpf performs NO session
-	// invalidation on commit yet — a session permitted by a since-deleted
-	// or modified policy keeps forwarding until its idle timeout. Junos
-	// re-evaluates in-progress sessions under policy-rematch (and drops the
-	// sessions of a DELETED policy even without it). Warn so the operator is
-	// not silently misled into believing existing sessions are re-checked.
-	// Mirrors the #2078 / #2008 H13 accepted-only doctrine. Enforcement
-	// (the bounded deletion-clear + the modified-policy re-eval) is tracked
-	// as #4234.
+	// #4233/#4234: `security policies policy-rematch [extensive]` is typed and
+	// recorded (compiler_security_policy.go). The Junos-DEFAULT deletion-clear
+	// now ships (#4234): a session admitted by a policy that a commit DELETES is
+	// invalidated immediately at commit (daemon_apply.go →
+	// clearSessionsForDeletedPolicies), independent of this knob. What
+	// policy-rematch additionally promises — re-evaluating an in-progress session
+	// against a MODIFIED (not deleted) policy set — is still accepted-only: xpf
+	// does not re-classify live sessions, so a session admitted by a policy whose
+	// match/action later changed keeps forwarding until its idle timeout. Warn so
+	// the operator is not silently misled into believing modified-policy
+	// re-evaluation is active. Mirrors the #2078 / #2008 H13 accepted-only
+	// doctrine; the modified-policy re-eval half stays tracked in #4234.
 	if cfg.Security.PolicyRematch {
 		knob := "policy-rematch"
 		if cfg.Security.PolicyRematchExtensive {
 			knob = "policy-rematch extensive"
 		}
 		warnings = append(warnings, fmt.Sprintf(
-			"security policies %s configured but accepted-only — xpf does not "+
-				"yet re-evaluate or invalidate in-progress sessions on a policy "+
-				"change; a session permitted by a since-deleted/modified policy "+
-				"keeps forwarding until its idle timeout (config-only parity, "+
-				"#4233; enforcement tracked in #4234)", knob))
+			"security policies %s configured but only partially enforced — a "+
+				"DELETED policy's sessions are now dropped at commit (Junos "+
+				"default, #4234), but xpf does not yet re-evaluate an in-progress "+
+				"session against a MODIFIED policy; such a session keeps forwarding "+
+				"until its idle timeout (#4233; modified-policy re-eval tracked in "+
+				"#4234)", knob))
 	}
 
 	// #4231 (fable-167 P-3): five `security flow` knobs are now typed +

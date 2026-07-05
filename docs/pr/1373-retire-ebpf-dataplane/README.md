@@ -282,6 +282,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/conntrack/gc.go` | GC still uses root package session-domain types until those move out of `pkg/dataplane`; constructors no longer accept `DataPlane`. |
 | `pkg/daemon/daemon.go` | Daemon owns `dataplane.RuntimeDataPlane`; `legacyDP()` accessor was deleted in #1519 (sub-#1451 S4). Only the `RuntimeDataPlane` field and `LastApplyResultOf` adapter remain. |
 | `pkg/daemon/daemon_apply.go` | Apply path still adapts legacy compile/apply metadata. |
+| `pkg/daemon/daemon_policy_invalidate.go` | #4234 commit-time deletion-clear names root dataplane session types (`SessionEntryV4/V6`, `DeleteReasonPolicyDeleted`) to invalidate a deleted policy's live sessions via `SessionStore.DeleteBatchKnown*`; control-plane session lifecycle, no legacy enforcement path. |
 | `pkg/daemon/daemon_proxyarp.go` | #2197: extracted proxy-ARP/NDP reconcile + periodic re-assert call `dataplane.ReconcileProxyARP` (control-plane kernel responder reconcile relocated from `daemon_apply.go`). |
 | `pkg/daemon/daemon_flow.go` | Flow logging still names legacy `dataplane.GlobalCtr*` counter indices read via `dataplane.Telemetry`. |
 | `pkg/daemon/daemon_nft.go` | #3436: lo0/host-inbound nft generation resolves DSCP names through the `dataplane.DSCPValues` SSOT to emit numeric nft (avoids unloadable Junos DSCP tokens); generation-only, no legacy enforcement path. |
