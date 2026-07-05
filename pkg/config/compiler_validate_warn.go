@@ -1223,6 +1223,74 @@ func ValidateConfig(cfg *Config) []string {
 	// matrix.md "to-zone junos-host and the direct host-bound path".
 	warnings = append(warnings, validateJunosHostDirectDeliveryWarnings(cfg)...)
 
+	// #4308 (fable-review-167 I-3): interface parity knobs that are typed +
+	// compiled so they stop silently vanishing, but are ACCEPTED-ONLY today.
+	warnings = append(warnings, validateInterfaceParityWarnings(cfg)...)
+
+	return warnings
+}
+
+// validateInterfaceParityWarnings emits WARN-only commit-time advisories for
+// the #4308 (fable-review-167 I-3) interface knobs. Each is typed in the
+// schema and compiled into the typed config so it no longer silently vanishes,
+// but the runtime does not enforce it yet: native-vlan-id needs the QinQ
+// tagging pipeline (#2354); unnumbered-address needs a networkd borrow-address
+// implementation; the gratuitous-ARP knobs map to per-interface sysctls the
+// apply path does not write; targeted-broadcast needs dataplane directed-
+// broadcast forwarding. The advisory mirrors the #2078 accepted-only doctrine
+// so an operator who sets one is not misled into believing it has effect.
+// Interfaces are reported in sorted order for a deterministic message.
+func validateInterfaceParityWarnings(cfg *Config) []string {
+	if cfg.Interfaces.Interfaces == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var warnings []string
+	for _, name := range names {
+		ifc := cfg.Interfaces.Interfaces[name]
+		if ifc == nil {
+			continue
+		}
+		var knobs []string
+		if ifc.NativeVlanID != 0 {
+			knobs = append(knobs, "native-vlan-id")
+		}
+		if ifc.GratuitousARPReply {
+			knobs = append(knobs, "gratuitous-arp-reply")
+		}
+		if ifc.NoGratuitousARPRequest {
+			knobs = append(knobs, "no-gratuitous-arp-request")
+		}
+		// family inet knobs live per-unit; report them qualified so the
+		// operator can find the offending unit.
+		unitNums := make([]int, 0, len(ifc.Units))
+		for un := range ifc.Units {
+			unitNums = append(unitNums, un)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := ifc.Units[un]
+			if unit == nil {
+				continue
+			}
+			if unit.UnnumberedInet != "" {
+				knobs = append(knobs, fmt.Sprintf("unit %d family inet unnumbered-address", un))
+			}
+			if unit.TargetedBroadcast {
+				knobs = append(knobs, fmt.Sprintf("unit %d family inet targeted-broadcast", un))
+			}
+		}
+		if len(knobs) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"interfaces %s: %s configured but accepted-only — typed and stored but not enforced by the runtime yet (parity, #4308)",
+				name, strings.Join(knobs, ", ")))
+		}
+	}
 	return warnings
 }
 

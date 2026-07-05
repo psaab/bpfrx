@@ -1737,6 +1737,28 @@ reserved for whole-dataplane selection where a rewrite shim
   `pkg/ra/sender.go buildRA`. 0 keeps the pre-#4307 unspecified default.
   Coverage: `pkg/config/parser_routing_test.go` (compile) +
   `pkg/ra/sender_marshal_4307_test.go` (wire round-trip).
+- **#4308 (interface ARP/addressing parity knobs, fable-review-167
+  I-3):** five common Junos interface knobs were accepted by the
+  permissive parser but never modeled or compiled, so they silently
+  vanished at commit. They are now typed leaves + compiled fields +
+  carry an accepted-only advisory (the #2078 doctrine), because full
+  enforcement needs design/cluster work:
+  - `native-vlan-id <id>` (interface-level, `ValidateInteger(1, 4094)`)
+    — folds into the QinQ tagging pipeline (#2354).
+  - `gratuitous-arp-reply` / `no-gratuitous-arp-request`
+    (interface-level flags) — map to per-interface ARP sysctls the
+    interface apply path does not write yet.
+  - `family inet unnumbered-address <interface>` — needs a networkd
+    borrow-address implementation (resolve the donor unit's address).
+  - `family inet targeted-broadcast` — needs dataplane directed-
+    broadcast forwarding.
+  Compiled into `InterfaceConfig.{NativeVlanID,GratuitousARPReply,
+  NoGratuitousARPRequest}` and `InterfaceUnit.{UnnumberedInet,
+  TargetedBroadcast}`; `validateInterfaceParityWarnings`
+  (compiler_validate_warn.go) emits one deterministic per-interface
+  accepted-only warning at commit. Coverage:
+  `pkg/config/interface_parity_4308_test.go` (compile + advisory +
+  no-false-positive).
 - **#2008 H7 (security log profile):** declared the `security log
   profile <name>` stanza — `stream-name` (`ValueHintStreamName`
   completion), `default-profile` (presence flag), and

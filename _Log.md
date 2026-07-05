@@ -1,3 +1,23 @@
+## 2026-07-05 — fable-review-167 I-3 (#4308): interface ARP/addressing parity knobs
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Type + compile five interface knobs that were silently
+    dropped (native-vlan-id, gratuitous-arp-reply,
+    no-gratuitous-arp-request at interface level; unnumbered-address,
+    targeted-broadcast under family inet). All accept-with-advisory
+    (#2078 doctrine): typed schema leaves, compiled into
+    InterfaceConfig/InterfaceUnit fields, and a per-interface
+    accepted-only advisory (validateInterfaceParityWarnings) at commit —
+    full enforcement is design/cluster work (native-vlan-id → QinQ
+    pipeline #2354; unnumbered-address → networkd borrow; ARP knobs →
+    sysctls; targeted-broadcast → dataplane). RED-on-revert: compile +
+    advisory tests go empty on revert.
+  - **File(s)**: pkg/config/schema_interfaces.go,
+    pkg/config/types_interfaces.go, pkg/config/compiler_interfaces.go,
+    pkg/config/compiler_validate_warn.go,
+    pkg/config/interface_parity_4308_test.go, docs/config-schema.md,
+    _Log.md
+
 ## 2026-07-05 — fable-review-167 I-2 (#4307): RA reachable-time / retransmit-timer
 
 - **Timestamp**: 2026-07-05
