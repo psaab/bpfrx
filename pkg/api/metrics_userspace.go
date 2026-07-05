@@ -868,6 +868,17 @@ func (c *xpfCollector) emitFairnessRSSExpectationGauges(
 	expectations []dpuserspace.FairnessRSSExpectation,
 ) {
 	for _, result := range dpuserspace.EvaluateFairnessRSSExpectations(status, expectations) {
+		// #hb166 F2: skip expectations whose interface name did not resolve
+		// to a live kernel ifindex. Their Ifindex is 0, so two distinct
+		// unresolved names on the same queue+kind would emit identical
+		// (ifindex=0, queue_id, kind) label sets — a duplicate-metric error
+		// that Gather() turns into an HTTP 500 for the ENTIRE /metrics
+		// scrape. Operator visibility of the unresolved expectation is
+		// retained on the `show ... fairness` text path (no uniqueness
+		// constraint there); only the Prometheus gauge is suppressed.
+		if !result.Resolved {
+			continue
+		}
 		ifindexLabel := strconv.Itoa(result.Ifindex)
 		queueLabel := strconv.FormatUint(uint64(result.QueueID), 10)
 		ch <- prometheus.MustNewConstMetric(

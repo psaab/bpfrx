@@ -31,7 +31,14 @@ type FairnessRSSExpectation struct {
 }
 
 type FairnessRSSExpectationResult struct {
-	Interface           string
+	Interface string
+	// Resolved reports whether Interface mapped to a live kernel ifindex
+	// in the evaluated status snapshot. When false, Ifindex is the zero
+	// value and callers that key on ifindex (e.g. Prometheus gauges) MUST
+	// skip the row — two distinct unresolved interface names on the same
+	// queue+kind would otherwise collapse to identical ifindex=0 labels
+	// and 500 the whole /metrics scrape (#hb166 F2).
+	Resolved            bool
 	Ifindex             int
 	QueueID             uint8
 	Expectation         string
@@ -290,6 +297,7 @@ func EvaluateFairnessRSSExpectations(
 		}
 		out = append(out, FairnessRSSExpectationResult{
 			Interface:           expectation.Interface,
+			Resolved:            resolved,
 			Ifindex:             ifindex,
 			QueueID:             expectation.QueueID,
 			Expectation:         canonical,

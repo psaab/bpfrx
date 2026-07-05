@@ -34385,3 +34385,23 @@ top.
   pkg/dataplane/userspace/format/status_test.go,
   pkg/api/metrics_test.go, test/incus/sqm-cookbook-config.set,
   docs/per-5-tuple/state.md, docs/cos-traffic-shaping.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 F2 fold — the G-9 ifindex->name re-key introduced a
+  duplicate-Prometheus-label regression: an UNRESOLVED rss-expectation
+  emitted its gauge with ifindex=0, so two distinct unresolved interface
+  names on the same queue+kind (both valid config under the new
+  interface/queue dedup key) collapsed to identical (ifindex=0,queue,kind)
+  labels -> Gather() duplicate error -> HTTP 500 across the WHOLE /metrics
+  endpoint. Fix: add `Resolved bool` to FairnessRSSExpectationResult (true
+  only when the name mapped to a live ifindex) and skip unresolved rows in
+  emitFairnessRSSExpectationGauges. The `show ... fairness` text path keeps
+  reporting the unresolved reason (no uniqueness constraint). New api test
+  Gathers a real registry with two distinct unresolved names on the same
+  queue+kind and asserts no duplicate/500 (RED on revert). Also rebased on
+  origin/master (#4224 CoS schema typing): reconciled schema_cos.go (rss
+  interface node + #4224 shaping-rate typing both kept) and
+  compiler_validate_warn.go (G-6 warns + #4224 priority-low-min-share warns
+  both kept), unioned _Log.md + cos-traffic-shaping.md.
+- **File(s)**: pkg/dataplane/userspace/fairness.go,
+  pkg/api/metrics_userspace.go, pkg/api/metrics_test.go, _Log.md
