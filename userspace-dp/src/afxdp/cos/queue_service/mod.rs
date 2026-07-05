@@ -604,11 +604,17 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
 ) -> Option<ExactCoSQueueSelection> {
     // #1614 A1: in GuaranteeRate mode (operator opt-in), dispatch to
     // the small-first waterfill selector. The default Proportional
-    // mode falls through to the legacy round-robin selector below,
-    // bit-for-bit unchanged when priority_low_min_share_bytes == 0
-    // (see service_exact_guarantee_queue_direct_with_info for the
-    // cap_eff subtraction that handles priority-low orthogonality
-    // per AGY r3 finding B).
+    // mode falls through to the legacy round-robin selector below.
+    //
+    // NOTE (#4220): priority_low_min_share_bytes is WIRE-SURFACE ONLY
+    // and is NOT enforced by this or any other selector — no cap_eff
+    // subtraction exists anywhere in the tree (matching the honest
+    // field note at afxdp/types/cos.rs, "Currently UNUSED"). The
+    // intended per-pass reservation of the priority-low min-share
+    // before the A1 selector is deferred research. Because no code
+    // consults the field, the Proportional fall-through is bit-for-bit
+    // unchanged for ANY value of priority_low_min_share_bytes, not just
+    // 0.
     if matches!(
         root.oversubscription_policy,
         CoSOversubscriptionPolicy::GuaranteeRate

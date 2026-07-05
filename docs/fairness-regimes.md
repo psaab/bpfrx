@@ -1308,9 +1308,17 @@ guarantee-rate runs assert:
    The ≥95% guarantee for 3g/6g under multi-class contention is a
    CONFIRMED-but-mechanism-UNRESOLVED defect tracked in **#1692**; it
    is not asserted here until that issue resolves.
-2. **Priority-low minimum share**: when configured, the
-   priority-low queue receives ≥ 95% of its configured
-   `priority-low-min-share`.
+2. **Priority-low minimum share**: **DEFERRED / NOT IMPLEMENTED.**
+   The intended gate — when configured, the priority-low queue
+   receives ≥ 95% of its configured `priority-low-min-share` — is
+   NOT satisfied by any engine path. `priority-low-min-share`
+   (#1614 A2) is wire-surface only: it is typed, validated at
+   commit, and stored, but no scheduler code consults it (the
+   `cap_eff` per-pass reservation that would enforce it does not
+   exist; see `afxdp/types/cos.rs` "Currently UNUSED" and the note
+   in `afxdp/cos/queue_service/mod.rs`). A commit warning surfaces
+   the inertness. Enforcement is deferred research (#4220); until it
+   ships this gate must not be asserted.
 3. **Retransmit floor**: per class ≤ 100 retransmits per 30 s
    under all-class simul load (gate 3 of plan.md §7). Achieved by
    the A3 CoDel-style sojourn-time AQM (default disabled; opt-in

@@ -151,8 +151,8 @@ Architecture: amd64
 Maintainer: selftest <selftest@xpf.invalid>
 Description: xpf selftest fake package
 EOF
-mkdir -p "$ROOT/dist/deb"
-FAKEDEB="$ROOT/dist/deb/xpf-appliance_${VER}_amd64.selftest.deb"
+mkdir -p "$ROOT/dist-deb"
+FAKEDEB="$ROOT/dist-deb/xpf-appliance_${VER}_amd64.selftest.deb"
 dpkg-deb --build "$DEBDIR" "$FAKEDEB" >/dev/null 2>&1
 cleanup_deb() { rm -f "$FAKEDEB"; }
 trap 'cleanup; cleanup_deb' EXIT INT TERM
@@ -222,7 +222,7 @@ fi
 
 # ── 5c. apt channel isolation (#4201, HB165 H-4) ──────────────────────────
 info "5c. apt channel isolation: a stable rebuild after edge must not list edge"
-EDGEDEB="$ROOT/dist/deb/xpf-appliance_0.0.0-edge.selftest.deb"
+EDGEDEB="$ROOT/dist-deb/xpf-appliance_0.0.0-edge.selftest.deb"
 EDGEDIR="$WORK/pkg-edge"; mkdir -p "$EDGEDIR/DEBIAN"
 cat > "$EDGEDIR/DEBIAN/control" <<EOF
 Package: xpf-appliance
@@ -446,6 +446,60 @@ if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
     ok "publish --no-installer opts out of the install.sh requirement"
 else
     bad "publish --no-installer MUST pass without install.sh but FAILED"
+fi
+
+# ── 8g. HB165 H-5: default-deny sweep refuses a stray non-image file ────────
+info "8g. publish default-deny sweep refuses a stray file under dist/ (HB165 H-5)"
+GOOD="$WORK/hb165"; mkdir -p "$GOOD"
+cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$GOOD/"
+XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
+    --channel stable --version "$VER" --dist "$GOOD" >/dev/null 2>&1
+$PY "$DIST/publish.py" stamp-installer --out "$GOOD/install.sh" \
+    --archive-key "$AKEY" --apt-base-url "https://dl.selftest.invalid/apt" \
+    --channel stable >/dev/null 2>&1
+minisign -S -W -s "$WORK/img.sec" -m "$GOOD/install.sh" \
+    -x "$GOOD/install.sh.minisig" >/dev/null 2>&1
+# Baseline: the clean signed set (image + manifest + install.sh + latest.json)
+# passes the default-deny sweep.
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GOOD" --channel stable --no-apt >/dev/null 2>&1; then
+    ok "clean signed image set passes the default-deny sweep"
+else
+    bad "clean signed image set MUST pass the default-deny sweep but FAILED"
+fi
+# H-5: an unsigned .deb staged under the publish root must be REFUSED — the
+# whole dist/ tree is uploaded to the image URL, and the old suffix-shaped
+# sweep skipped every non-image file.
+mkdir -p "$GOOD/deb"
+printf 'not-a-real-signed-package\n' > "$GOOD/deb/xpf_0.0.0_amd64.deb"
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GOOD" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse an unsigned .deb under dist/ but PASSED (H-5)"
+else
+    ok "publish refuses an unsigned .deb under the image publish root (H-5)"
+fi
+rm -rf "$GOOD/deb"
+
+# ── 8h. HB165 H-13: every channel's latest.json is signature-gated ──────────
+info "8h. publish signature-gates every channel's latest.json (HB165 H-13)"
+# An UNSIGNED edge pointer beside the signed stable pointer must be refused,
+# even when publishing --channel stable (the whole tree is uploaded).
+mkdir -p "$GOOD/edge"
+printf '{"channel":"edge","version":"%s"}\n' "$VER" > "$GOOD/edge/latest.json"
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GOOD" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse an unsigned edge latest.json but PASSED (H-13)"
+else
+    ok "publish refuses an unsigned non-target channel latest.json (H-13)"
+fi
+# A properly SIGNED edge pointer passes the whole gate.
+XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
+    --channel edge --version "$VER" --dist "$GOOD" >/dev/null 2>&1
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GOOD" --channel stable --no-apt >/dev/null 2>&1; then
+    ok "publish passes when the edge latest.json is properly signed (H-13)"
+else
+    bad "publish MUST pass a signed edge latest.json but FAILED (H-13)"
 fi
 
 # ── 9. install.sh H-16: validate-before-mutate + cleanup-on-failure ─────────

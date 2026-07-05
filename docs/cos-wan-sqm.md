@@ -218,10 +218,20 @@ in one line, keep the rates versioned in one place.
   Phase 1 sojourn telemetry. A per-scheduler `codel-target` knob exists
   in the compiler today but is **inert** (write-only in the engine),
   and the bare-shaping synthetic queue hardcodes `codel_target_ns: 0`
-  (`forwarding_build/cos.rs`). When/if Phase 2 ships, the planned
-  `smart-queueing` unit leaf (#1828 Option B, gated rider) becomes the
-  way to arm CoDel on a bare-shaped unit without rewriting into
-  scheduler-maps. Do not set `codel-target` expecting AQM today.
+  (`forwarding_build/cos.rs`). As of #4218 the leaf is typed (so
+  `codel-target banana` is rejected at commit and `set ... codel-target
+  ?` completes) and a **commit warning** fires when it is set, stating
+  the value is accepted but has no runtime effect. When/if Phase 2
+  ships, the planned `smart-queueing` unit leaf (#1828 Option B, gated
+  rider) becomes the way to arm CoDel on a bare-shaped unit without
+  rewriting into scheduler-maps. Do not set `codel-target` expecting AQM
+  today.
+- **`priority-low-min-share` (#1614 A2)** — typed + validated at commit
+  (#4219) and completes, but the dataplane does **not** enforce it: it
+  is wire-surface only (no `cap_eff` reservation exists — #4220). A
+  commit warning surfaces the inertness; enforcement is deferred
+  research. `docs/fairness-regimes.md` acceptance gate 2 is marked
+  DEFERRED/NOT-IMPLEMENTED accordingly.
 - **Per-packet overhead compensation** (CAKE `overhead`/`atm`) —
   [#1849](https://github.com/psaab/xpf/issues/1849); until then use
   the 85-95% headroom guidance above.

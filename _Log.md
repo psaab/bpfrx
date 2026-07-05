@@ -1,3 +1,75 @@
+## 2026-07-04 — #4217 / #4218 / #4219 / #4220 (fable-review-166 G-4 / G-3 / G-5 / G-1): CoS config-schema typing
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Typed four class-of-service config-schema leaves that
+    were untyped/missing/inert so garbage HARD-REJECTS at commit instead
+    of compiling to a silent 0, and added accepted-but-inert commit
+    warnings for the two knobs the dataplane does not enforce. G-4
+    (#4217): `shaping-rate` typed via the container `keyValidator`
+    (ValueRate — it carries the burst-size child, so `valueType` would
+    mis-treat burst-size as a modifier) + `burst-size` ValueByteSize, at
+    both unit and #4021 interface level; before this `shaping-rate 10gg`
+    committed as 0 and the root shaper vanished (unshaped ~25G). G-3
+    (#4218): typed `codel-target` (ValueInteger/ValidateIntegerMin(0)) +
+    a commit warning when CodelTargetNS>0 (CoDel AQM never shipped,
+    #1829 Phase 2 PLAN-KILLED). G-5 (#4219): added
+    `oversubscription-policy` (container `{ guarantee-rate <frac 0..1> |
+    proportional }`, fraction validated ValidatePercent(0,1) so 1.7 is
+    rejected not clamped) + `priority-low-min-share` (ValueRate) at unit
+    + interface level. G-1 (#4220): priority-low-min-share is INERT
+    (wire-surface only; no cap_eff reservation) — added a commit
+    warning, corrected the misleading `queue_service/mod.rs` comment
+    that cited a nonexistent cap_eff subtraction, and marked
+    fairness-regimes.md gate 2 DEFERRED/NOT-IMPLEMENTED. Enforcement
+    (cap_eff) is separate deferred research, out of scope.
+  - **File(s)**: pkg/config/schema_cos.go (typed leaves + 3 shared
+    constructors), pkg/config/compiler_validate_warn.go (codel-target +
+    priority-low-min-share inert warnings),
+    pkg/config/schema_cos_hb166_test.go (new RED-on-revert tests),
+    pkg/config/schema_validate_test.go (repointed the "untyped leaf
+    ignored" test off now-typed shaping-rate/burst-size onto the
+    still-untyped classifiers dscp reference),
+    userspace-dp/src/afxdp/cos/queue_service/mod.rs (comment fix),
+    docs/config-schema.md, docs/cos-traffic-shaping.md (+ fixed a buggy
+    two-line shaping-rate/burst-size example), docs/cos-wan-sqm.md,
+    docs/fairness-regimes.md.
+  - **Validation**: `go test ./pkg/config/...` green; `go build ./...`;
+    gofmt + `go vet ./pkg/config/...` clean. RED-on-revert proven: with
+    the validators removed the shaping-rate/burst-size/codel-target
+    garbage values commit clean again.
+## 2026-07-04 — #4214 / #4215 (fable-review-165 H-5 / H-13): publish default-deny sweep + per-channel latest.json gate
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Closed two publish-gate escapes in `scripts/dist/publish.py`.
+    H-5 (#4214): the image orphan sweep was suffix-shaped — it only inspected
+    `.qcow2` / `.incus-metadata.tar.gz` and skipped every other file, so an
+    unsigned `dist/deb/*.deb` (staged there by `make deb`, which `make image`
+    invokes) rode the whole-tree upload to `XPF_IMAGE_BASE_URL` unsigned.
+    Rewrote the sweep as DEFAULT-DENY via `_is_allowed_publish_file`: every
+    file under the publish root (outside `apt/`) must be a manifest-covered
+    image artifact OR an expected sidecar (`*.SHA256SUMS`, `*.minisig`,
+    top-level `install.sh` / `xpf-image.pub` / `xpf-<ver>.manifest`, per-channel
+    `latest.json`); anything else blocks the publish. Also moved `DEB_OUT` out
+    of the publish root to a `dist-deb/` sibling so the mainline
+    `make image && make dist-publish` does not trip the stricter gate
+    (Makefile, bake.py, build-apt-repo.sh, cluster-setup.sh, README,
+    .gitignore).
+    H-13 (#4215): `gate_latest` verified only `--channel`'s `latest.json`;
+    other channels' pointers rode the tree unverified. Split out
+    `_gate_one_latest` and made `gate_latest` enumerate every
+    `dist/*/latest.json` — target channel keeps the version-present contract,
+    every other channel's pointer must carry a verifying signature (mirrors
+    `gate_apt`'s per-suite InRelease posture).
+  - selftest.sh: new §8g (default-deny sweep — clean set passes, stray `.deb`
+    refused) and §8h (every channel's latest.json signature-gated — unsigned
+    edge refused, signed edge passes); test debs stage in `dist-deb/`. All 39
+    checks pass. RED-on-revert confirmed independently: reverting the sweep
+    fails §8g H-5 only; reverting the loop fails §8h H-13 only. py_compile
+    publish.py + bake.py OK; shellcheck touched shell files rc=0.
+- **File(s)**: scripts/dist/publish.py, scripts/dist/selftest.sh,
+  scripts/image/bake.py, scripts/dist/build-apt-repo.sh, Makefile,
+  test/incus/cluster-setup.sh, README.md, .gitignore, _Log.md
+
 ## 2026-07-04 — #4197 / #4198 / #4199 (fable-review-165 H-2 / H-14 / H-16): install.sh + publish tooling
 
 - **Timestamp**: 2026-07-04

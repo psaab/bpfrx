@@ -569,14 +569,18 @@ def main():
         #    it picks up the embedded #1864 shim and the pinned cargo helper,
         #    then packages the freshly-built binaries. The image consumes the
         #    .deb instead of raw --copy-in binaries.
-        deb_dir = os.path.join(ROOT, "dist", "deb")
+        # Staging dir for the built .deb — a `dist-deb/` SIBLING of the image
+        # publish root `dist/`, NOT under it (HB165 H-5): `make dist-publish`
+        # uploads the whole `dist/` tree and publish.py's default-deny sweep
+        # refuses any stray file there, so the deb must stage outside `dist/`.
+        deb_dir = os.path.join(ROOT, "dist-deb")
         if not a.skip_build:
             info("building xpf .deb (xpfd, cli, xpf-userspace-dp -> staged)...")
             run(["make", "-C", ROOT, "deb"])
         # The git-derived version is computed by the Makefile; glob for the
         # binary package (NOT the xpf-appliance metapackage) and pick the
         # NEWEST by mtime so a stale deb from an earlier (e.g. dirty-tree)
-        # build in dist/deb/ is never selected over the one just built.
+        # build in dist-deb/ is never selected over the one just built.
         debs = sorted((g for g in glob.glob(os.path.join(deb_dir, "xpf_*.deb"))
                        if "xpf-appliance" not in os.path.basename(g)),
                       key=os.path.getmtime)
