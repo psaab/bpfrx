@@ -17,7 +17,21 @@ pub(crate) struct Iperf3Output {
 pub(crate) struct Iperf3Start {
     #[serde(default)]
     pub(crate) connected: Vec<Iperf3Connected>,
+    /// Wall-clock start of the iperf run. `timesecs` is UNIX epoch
+    /// seconds; the binding/CoS scrape TSV timestamps share the same
+    /// clock, so this anchors the steady-state window to the actual run
+    /// interval rather than the scrape-file extent (V-6). Absent in
+    /// synthetic/legacy JSON, in which case the aggregation falls back
+    /// to the min/max scrape heuristic.
+    #[serde(default)]
+    pub(crate) timestamp: Iperf3Timestamp,
     pub(crate) test_start: Iperf3TestStart,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct Iperf3Timestamp {
+    #[serde(default)]
+    pub(crate) timesecs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +55,18 @@ pub(crate) struct Iperf3TestStart {
 #[derive(Debug, Deserialize)]
 pub(crate) struct Iperf3Interval {
     pub(crate) streams: Vec<Iperf3StreamInterval>,
+    /// Interval-summary flags. iperf3 marks warmup/omitted intervals
+    /// (`-O`) with `sum.omitted=true`; those must not count as
+    /// steady-state data (V-7). Absent in synthetic JSON → defaults
+    /// to a non-omitted summary.
+    #[serde(default)]
+    pub(crate) sum: Iperf3IntervalSum,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct Iperf3IntervalSum {
+    #[serde(default)]
+    pub(crate) omitted: bool,
 }
 
 #[derive(Debug, Deserialize)]
