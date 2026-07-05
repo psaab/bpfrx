@@ -426,6 +426,15 @@ func (c *CLI) showDHCPRelay() error {
 					s.RepliesBroadcastNoTarget, s.RepliesBroadcastL2Fallback,
 					s.RepliesBroadcastNak)
 			}
+			// Reply source validation (#4163). A non-zero count means a reply
+			// arrived from a source IP that is NOT one of the configured DHCP
+			// servers and was dropped — a rogue-reply injection attempt, or a
+			// multi-homed server unicasting from an unlisted source IP.
+			fmt.Println("\nReply source validation (#4163):")
+			fmt.Printf("  %-16s %s\n", "Interface", "Dropped (unknown server)")
+			for _, s := range stats {
+				fmt.Printf("  %-16s %d\n", s.Interface, s.RepliesDroppedUnknownServer)
+			}
 		}
 	}
 	return nil

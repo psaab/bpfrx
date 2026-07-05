@@ -115,6 +115,16 @@ type RelayStats struct {
 	// BACKUP for the interface's redundancy group (#2456 HA relay gate).
 	RequestsDroppedBackup uint64
 
+	// RepliesDroppedUnknownServer counts server replies dropped because their
+	// source IP is NOT one of the configured DHCP servers (#4163). The
+	// server-facing socket is bound (not connected), so it accepts datagrams
+	// from any host that can route to giaddr:67; RFC 3046 relay practice
+	// forwards replies only from the configured server set. A non-zero value
+	// means a non-configured source tried to inject a reply (rogue-DHCP /
+	// lease-hijack attempt) or a legitimately multi-homed server unicast from
+	// an unlisted source IP — either way it MUST be visible, not silent.
+	RepliesDroppedUnknownServer uint64
+
 	// Reply-delivery breakdown (#2076). These distinguish WHY a reply was
 	// broadcast vs L2-unicast so an L2/CAP_NET_RAW/driver/MTU regression is
 	// observable in operations. RepliesBroadcastL2Fallback is the one to
@@ -178,6 +188,12 @@ type interfaceRelay struct {
 	// the observability signal that the HA relay gate is suppressing duplicate
 	// upstream relays on the standby node.
 	requestsDroppedBackup atomic.Uint64
+
+	// repliesDroppedUnknownServer counts server replies dropped by the reply
+	// path because their source IP is not one of the configured DHCP servers
+	// (#4163). It is the observability signal for a rogue-reply injection
+	// attempt (or a multi-homed server unicasting from an unlisted source IP).
+	repliesDroppedUnknownServer atomic.Uint64
 
 	// spec is the desired-config snapshot this relay was started with. Apply
 	// (#2348) compares it against the new desired spec to detect a changed
@@ -661,17 +677,18 @@ func (m *Manager) Stats() []RelayStats {
 	stats := make([]RelayStats, 0, len(m.relays))
 	for _, ir := range m.relays {
 		stats = append(stats, RelayStats{
-			Interface:                  ir.ifaceName,
-			RequestsRelayed:            ir.requestsRelayed.Load(),
-			RepliesForwarded:           ir.repliesForwarded.Load(),
-			RequestsDroppedBackup:      ir.requestsDroppedBackup.Load(),
-			RepliesL2Unicast:           ir.repliesL2Unicast.Load(),
-			RepliesUnicastCiaddr:       ir.repliesUnicastCiaddr.Load(),
-			RepliesBroadcastFlag1:      ir.repliesBroadcastFlag1.Load(),
-			RepliesBroadcastForced:     ir.repliesBroadcastForced.Load(),
-			RepliesBroadcastNoTarget:   ir.repliesBroadcastNoTarget.Load(),
-			RepliesBroadcastL2Fallback: ir.repliesBroadcastL2Fallback.Load(),
-			RepliesBroadcastNak:        ir.repliesBroadcastNak.Load(),
+			Interface:                   ir.ifaceName,
+			RequestsRelayed:             ir.requestsRelayed.Load(),
+			RepliesForwarded:            ir.repliesForwarded.Load(),
+			RequestsDroppedBackup:       ir.requestsDroppedBackup.Load(),
+			RepliesDroppedUnknownServer: ir.repliesDroppedUnknownServer.Load(),
+			RepliesL2Unicast:            ir.repliesL2Unicast.Load(),
+			RepliesUnicastCiaddr:        ir.repliesUnicastCiaddr.Load(),
+			RepliesBroadcastFlag1:       ir.repliesBroadcastFlag1.Load(),
+			RepliesBroadcastForced:      ir.repliesBroadcastForced.Load(),
+			RepliesBroadcastNoTarget:    ir.repliesBroadcastNoTarget.Load(),
+			RepliesBroadcastL2Fallback:  ir.repliesBroadcastL2Fallback.Load(),
+			RepliesBroadcastNak:         ir.repliesBroadcastNak.Load(),
 		})
 	}
 	return stats
@@ -1013,7 +1030,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		handleServerResponses(sctx, serverConn, conn, ir, l2, giaddr)
+		handleServerResponses(sctx, serverConn, conn, ir, l2, giaddr, servers)
 	}()
 
 	// Main read loop in its OWN func scope so its `defer cancel()` fires on
@@ -1168,9 +1185,35 @@ func (m *Manager) resolveGIAddrWithRetry(ctx context.Context, ifaceName string) 
 // srcIP is the saved interface giaddr (the IPv4 source the server saw in the
 // relayed request); it MUST come from the caller, not from pkt.GatewayIPAddr,
 // which is zeroed below before sending.
+//
+// Source validation (#4163): the server-facing socket is bound (not
+// connect()-ed) to giaddr:67, so it accepts datagrams from ANY host that can
+// route there. Before parsing or forwarding, each reply's source IP is checked
+// against the configured server set (RFC 3046 relay practice — a relay forwards
+// replies only from its explicit server list); a reply from an unlisted source
+// is DROPPED and counted (repliesDroppedUnknownServer) so an off-path
+// rogue-DHCP / lease-hijack injection cannot reach the client. The check is by
+// IP with net.IP.Equal (the source port is not load-bearing); an empty server
+// set admits nothing (fail-closed — a session is only started with a non-empty
+// set, so this cannot black-hole a legitimately-configured relay).
 func handleServerResponses(ctx context.Context, serverConn, clientConn net.PacketConn,
-	ir *interfaceRelay, l2 l2Replier, srcIP net.IP) {
+	ir *interfaceRelay, l2 l2Replier, srcIP net.IP, servers []*net.UDPAddr) {
 	ifaceName := ir.ifaceName
+	// Build the server-IP allow-set ONCE, outside the read loop. Keep the raw
+	// net.IP (compared with net.IP.Equal) rather than a string key so a 4-in-6
+	// vs 4-byte form never causes a false miss.
+	allow := make([]net.IP, 0, len(servers))
+	for _, s := range servers {
+		if s != nil && s.IP != nil {
+			allow = append(allow, s.IP)
+		}
+	}
+	// warnedUnknownSrc: log the FIRST rogue-source drop of this session at Warn
+	// (loud, so an operator sees the injection attempt / multi-homed
+	// misconfiguration) and subsequent ones at Debug — the counter is the
+	// durable signal, so a flood of forged replies cannot spam the log. Mirrors
+	// the resolveGIAddrWithRetry warn-once pattern.
+	warnedUnknownSrc := false
 	buf := make([]byte, readBufSize)
 	for {
 		n, srcAddr, err := serverConn.ReadFrom(buf)
@@ -1181,6 +1224,23 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 			}
 			slog.Warn("dhcp-relay: server read error",
 				"interface", ifaceName, "err", err)
+			continue
+		}
+
+		// #4163: drop any reply whose source IP is not a configured server,
+		// BEFORE parsing or forwarding. This closes the rogue-reply injection
+		// hole (a forged OFFER/ACK steering the client to a hostile
+		// gateway/DNS, or a forged NAK forcing a client restart).
+		if !replySourceAllowed(srcAddr, allow) {
+			ir.repliesDroppedUnknownServer.Add(1)
+			if !warnedUnknownSrc {
+				slog.Warn("dhcp-relay: dropping server reply from unconfigured source",
+					"interface", ifaceName, "src", srcAddr)
+				warnedUnknownSrc = true
+			} else {
+				slog.Debug("dhcp-relay: dropping server reply from unconfigured source",
+					"interface", ifaceName, "src", srcAddr)
+			}
 			continue
 		}
 
@@ -1231,6 +1291,49 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 		if deliverReply(ir, clientConn, l2, srcIP, pkt, replyData) {
 			ir.repliesForwarded.Add(1)
 		}
+	}
+}
+
+// replySourceAllowed reports whether a server reply's source address is one of
+// the configured DHCP servers (#4163). Comparison is by IP with net.IP.Equal so
+// a 4-in-6 vs 4-byte form never yields a false miss; the source port is NOT
+// checked (a strict-RFC server unicasts its reply from BOOTPS/67, but the port
+// is not load-bearing for the trust decision). An empty allow-set admits
+// nothing — a relay session is only started with a non-empty resolved server
+// set, so this fail-closed default never black-holes a legitimately-configured
+// relay.
+func replySourceAllowed(srcAddr net.Addr, allow []net.IP) bool {
+	src := udpAddrIP(srcAddr)
+	if src == nil {
+		return false
+	}
+	for _, ip := range allow {
+		if ip.Equal(src) {
+			return true
+		}
+	}
+	return false
+}
+
+// udpAddrIP extracts the source IP from a ReadFrom address. It handles the
+// *net.UDPAddr a UDP PacketConn returns (and *net.IPAddr for completeness), and
+// falls back to parsing the string form for any other net.Addr implementation.
+// Returns nil when no IP can be extracted (a nil addr or an unparseable form),
+// which replySourceAllowed treats as "not a configured server" (drop).
+func udpAddrIP(addr net.Addr) net.IP {
+	switch a := addr.(type) {
+	case nil:
+		return nil
+	case *net.UDPAddr:
+		return a.IP
+	case *net.IPAddr:
+		return a.IP
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			host = addr.String()
+		}
+		return net.ParseIP(host)
 	}
 }
 
