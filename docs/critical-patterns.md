@@ -71,6 +71,30 @@ non-trivial code. This page is the quick-reference gotcha list.
     MAC alternates between physical (boot) and virtual (daemon), so
     `MACAddress=` is unreliable. `ensureRethLinkOriginalName()`
     auto-fixes stale files.
+  - **Collision-safe positional rename (#4178).** The positional loop
+    (`renamePositional`) is two-pass, like device-map mode: it captures
+    every NIC's `OriginalName=` from the existing `.link` set BEFORE
+    writing any file, then breaks target-name collisions with `xpf-tmp-N`
+    names (shared helper `breakNameCollisions`), then writes each `.link`
+    and renames to the final name. This keeps an enumeration shift (a NIC
+    added/removed/reordered changes the positional index→name map) from
+    corrupting the `OriginalName=` chain or EEXIST-stranding a rename —
+    the old single-pass loop wrote a `.link` then re-read it in a later
+    iteration, so a NIC added at a lower PCI bus scrambled the rename
+    database and shifted port↔zone bindings for a boot.
+- **HA config-arrival re-naming (#4179).** An HA node with
+  `/etc/xpf/node-id` but no committed config boots NOT in bootstrap mode
+  (HA-node guard) and names its NICs STANDALONE (`fxp0`, `ge-0-0-X`)
+  because the nil active config carries no cluster stanza. The one-shot
+  `emptyHANamingPending` flag makes the first non-empty config that
+  arrives (a cluster SyncApply from the primary, or a local commit)
+  re-run startup naming with the config's cluster identity —
+  `em0` + `ge-<fpc>-0-X` (node 1 → FPC 7) — via
+  `maybeReapplyConfigArrivalNaming` in `applyConfigLocked`, BEFORE the
+  reconcile wires the config onto the interfaces. No daemon restart is
+  needed; it mirrors bootstrap-exit re-naming but does NOT re-arm the
+  dataplane (this node is not in bootstrap mode). A standalone config or
+  any later commit is a no-op.
 - **`.network` files** configure addresses, DHCP avoidance, RA disable,
   VLAN parent flags. `KeepConfiguration=static` on RETH interfaces
   preserves VRRP VIPs across `networkctl reload`.
