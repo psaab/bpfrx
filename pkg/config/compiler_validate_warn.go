@@ -646,6 +646,7 @@ func ValidateConfig(cfg *Config) []string {
 	if cos := cfg.ClassOfService; cos != nil {
 		warnedClassifierLossPriority := false
 		warnedRewriteLossPriority := false
+		warnedPriorityLowMinShare := false
 		for _, class := range cos.ForwardingClasses {
 			if class == nil {
 				continue
@@ -690,6 +691,17 @@ func ValidateConfig(cfg *Config) []string {
 						"class-of-service scheduler %q equal-flow-target-policy %s is non-work-conserving: it clips fast flows and reduces aggregate class throughput; it cannot lift slow flows",
 						sched.Name, sched.EqualFlowTargetPolicy))
 				}
+			}
+			// #4218: codel-target (#1614 A3 CoDel AQM) is typed and stored
+			// (CodelTargetNS) so a garbage value is rejected at commit, but
+			// the AQM itself is NOT enforced — #1829 Phase 2 was PLAN-KILLED.
+			// Warn so an operator who sets it is not misled into believing it
+			// bounds queue latency. Mirrors the accepted-but-inert doctrine
+			// used for loss-priority and the #2078/#3440 knobs.
+			if sched.CodelTargetNS > 0 {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service scheduler %q codel-target is accepted for compatibility but inert: the userspace dataplane has no CoDel AQM (#1829 Phase 2 not shipped), so the configured target has no runtime effect",
+					sched.Name))
 			}
 		}
 		for _, schedMap := range cos.SchedulerMaps {
@@ -769,14 +781,34 @@ func ValidateConfig(cfg *Config) []string {
 				}
 			}
 		}
+		// #4220 / #4219: priority-low-min-share (#1614 A2) is typed and
+		// stored (PriorityLowMinShareBytes) so garbage is rejected at
+		// commit, but the knob is INERT — it is wire-surface-only and no
+		// scheduler code consults it (the cap_eff per-pass reservation that
+		// would enforce it is deferred research). Warn ONCE (map iteration
+		// is randomized; a generic message stays deterministic) so an
+		// operator is not misled into believing the priority-low queue has
+		// a protected minimum. The enforcement itself is a separate
+		// deferred item.
+		warnPriorityLowMinShareInert := func(bytes uint64) {
+			if bytes > 0 && !warnedPriorityLowMinShare {
+				warnings = append(warnings,
+					"class-of-service priority-low-min-share is accepted for compatibility but inert: the userspace dataplane does not yet enforce a priority-low minimum share (#1614 A2; the cap_eff reservation is deferred), so the configured value has no runtime effect")
+				warnedPriorityLowMinShare = true
+			}
+		}
 		for _, iface := range cos.Interfaces {
 			if iface == nil {
 				continue
+			}
+			if iface.Level != nil {
+				warnPriorityLowMinShareInert(iface.Level.PriorityLowMinShareBytes)
 			}
 			for _, unit := range iface.Units {
 				if unit == nil {
 					continue
 				}
+				warnPriorityLowMinShareInert(unit.PriorityLowMinShareBytes)
 				if unit.SchedulerMap != "" {
 					if _, ok := cos.SchedulerMaps[unit.SchedulerMap]; !ok {
 						warnings = append(warnings, fmt.Sprintf(
