@@ -180,9 +180,23 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 				}
 			}
 
-			dest := fw.FiltersInet
-			if af == "inet6" {
-				dest = fw.FiltersInet6
+			// #4287: a Junos `family any` filter is protocol-independent —
+			// it matches BOTH IPv4 and IPv6. Folding it into FiltersInet
+			// only (the pre-#4287 behavior for every non-inet6 family) lost
+			// its IPv6 arm: a `family any` discard/deny filter enforced on
+			// v4 only silently let v6 through (a security fail-open). Compile
+			// it into BOTH pools so the deny applies to both families. The
+			// #3884 cross-family same-name collision gate
+			// (validateFirewallFilterFamilyCollisionsAST) now also treats an
+			// `any`+`inet6` same-name reuse as a collision, since `any` folds
+			// into FiltersInet6 too — a name shared with a distinct inet6
+			// filter would otherwise silently overwrite in FiltersInet6.
+			dests := []map[string]*FirewallFilter{fw.FiltersInet}
+			switch af {
+			case "inet6":
+				dests = []map[string]*FirewallFilter{fw.FiltersInet6}
+			case "any":
+				dests = []map[string]*FirewallFilter{fw.FiltersInet, fw.FiltersInet6}
 			}
 
 			for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
@@ -232,7 +246,9 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 					filter.Terms = append(filter.Terms, term)
 				}
 
-				dest[filter.Name] = filter
+				for _, dest := range dests {
+					dest[filter.Name] = filter
+				}
 			}
 		}
 	}
@@ -288,6 +304,11 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 	filterFamilies := map[string][]string{}
 	// order preserves first-seen filter-name order for a deterministic error.
 	order := []string{}
+	// inet6Names records filter names defined under `family inet6` (their own
+	// FiltersInet6 pool). #4287 compiles a `family any` filter into BOTH pools,
+	// so an `any` name that ALSO names a distinct inet6 filter now collides in
+	// FiltersInet6 — tracked here and flagged below.
+	inet6Names := map[string]bool{}
 
 	record := func(name, fam string) {
 		for _, f := range filterFamilies[name] {
@@ -325,7 +346,15 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 					}
 				}
 				if af == "inet6" {
-					// Its own dest map (FiltersInet6) — cannot collide with the pool.
+					// Its own dest map (FiltersInet6). It cannot collide with
+					// the FiltersInet pool, but #4287 dual-applies `family any`
+					// into FiltersInet6 too, so record inet6 names for the
+					// any+inet6 cross-check below.
+					for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
+						if filterInst.name != "" {
+							inet6Names[filterInst.name] = true
+						}
+					}
 					continue
 				}
 				for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
@@ -351,6 +380,37 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 				"earlier (a discard filter can become accept-all — fail-open); "+
 				"Junos namespaces filters per family, so rename one of them (#3884)",
 			name, strings.Join(fams, ", "))
+		if !lenient {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+	}
+	// #4287 any+inet6 cross-check: a `family any` filter now folds into the
+	// FiltersInet6 pool as well, so a name shared with a distinct `family inet6`
+	// filter silently overwrites in FiltersInet6 (the same fail-open the pool
+	// gate above defends against, but on the v6 side). `any` names are recorded
+	// in filterFamilies (and thus `order`), so iterating order catches them.
+	for _, name := range order {
+		if !inet6Names[name] {
+			continue
+		}
+		hasAny := false
+		for _, f := range filterFamilies[name] {
+			if f == "any" {
+				hasAny = true
+				break
+			}
+		}
+		if !hasAny {
+			continue
+		}
+		msg := fmt.Sprintf(
+			"firewall filter %q is defined under both family any and family "+
+				"inet6 — xpf compiles a family any filter into BOTH the inet and "+
+				"inet6 pools (#4287), so the any definition and the inet6 "+
+				"definition collide in the inet6 pool and one silently overwrites "+
+				"the other (fail-open); rename one of them",
+			name)
 		if !lenient {
 			return nil, fmt.Errorf("%s", msg)
 		}
