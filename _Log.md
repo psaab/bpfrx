@@ -34474,6 +34474,41 @@ top.
 - **File(s)**: pkg/dataplane/userspace/fairness.go,
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go, _Log.md
 - **Timestamp**: 2026-07-04
+- **Action**: fable-review-167 P-2 / P-5 / D-1. P-2 (policy-rematch):
+  `security policies policy-rematch [extensive]` committed clean and was
+  silently dropped (absent from setSchema + compilePolicies). Added the
+  accepted-with-advisory wiring (mirrors #2078 tcp-session / #2008 H13):
+  schema leaf under `security policies`, SecurityConfig.PolicyRematch /
+  PolicyRematchExtensive recorded in compilePolicies (flat + hierarchical
+  shapes), and a commit-time accepted-only advisory in ValidateConfig
+  stating xpf does not yet re-evaluate/invalidate in-progress sessions on
+  a policy change. Filed #4233 (advisory, closed by PR) + #4234
+  (session-invalidation-on-commit enhancement, STAYS OPEN with a converged
+  plan). Verdict on the deeper session-invalidation: DRIVEABLE for the
+  bounded deletion-clear core (diff pre/post policies -> stable-id delta ->
+  clear sessions whose #3056 policy_id matches, reusing the ClearSessions
+  filtered-clear path + #2468 reverse/companion/HA propagation) but the
+  modified-policy re-eval half NEEDS-RESEARCH (which changes trigger,
+  commit-time full-sweep cost, extensive semantics) -> filed as #4234 for a
+  follow-up /engineer, too big for this PR. RED-on-revert verified (removing
+  the compiler case drops the knob + no advisory). P-5: added policy-based
+  IPsec VPN gap row to feature-gaps.md §15 — verified rejected at commit via
+  #3114 (compiler_policy_then.go validatePolicyThenPermitStrict, empty
+  supportedPolicyThenPermitChildren); only route-based st0/XFRM VPN exists.
+  D-1: corrected the parity docs against code reality — vsrx-gaps.md got a
+  hard STALE banner enumerating now-shipped sections (verified DHCPv6 PD,
+  apply-groups, BFD; sole parse-only survivor = license autoupdate url);
+  feature-gaps.md NAT #3029 callout rewritten for #3164 LPM DNAT (reject
+  removed); screen count reconciled UP to 12 (accurate enumerated set) in
+  feature-gaps.md/feature-coverage.md/CLAUDE.md; Rescue Configuration row
+  Missing -> Done (SaveRescueConfig, store_persist.go); total-drift note +
+  VPN/TOTAL rows updated for the added gap row. go build ./... + gofmt +
+  go vet clean; full pkg/config suite green.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_policy.go, pkg/config/schema_security.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/policy_rematch_advisory_test.go, docs/feature-gaps.md,
+  docs/vsrx-gaps.md, docs/feature-coverage.md, CLAUDE.md, _Log.md
 - **Action**: fable-review-167 P-1/P-3/P-4 (issues #4230/#4231/#4232).
   P-1: reject the zone-pair `from-zone junos-host to-zone <z>` policy at
   strict commit (host-ORIGINATED traffic egresses via the kernel TX path,
@@ -34528,3 +34563,33 @@ top.
   pkg/config/schema_security.go, pkg/config/types_security.go,
   pkg/config/fable167_advisory_test.go, docs/config-schema.md,
   docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: Merged origin/master (#4237 P-1/P-3/P-4) into the #4238
+  branch. UNION-resolved the sole conflict in compiler_validate_warn.go:
+  kept BOTH #4237's P-3 five-flow-knob advisories (incl. the corrected
+  sync-icmp-session no-op wording) + P-4 alg/unknown-policy-child
+  advisories AND my #4233 policy-rematch advisory (added the missing
+  closing brace to my `if cfg.Security.PolicyRematch {` block so braces
+  balance; origin's trailing `}` closes its `if len(policyUnknown) > 0`).
+  Verified both field sets survived the types_security.go auto-merge
+  (#4237's 5 FlowConfig fields RouteChangeTimeout/SyncICMPSession/
+  ForceIPReassembly/MulticastSessionLifetime/PreserveIncomingFragmentSize
+  AND my PolicyRematch/PolicyRematchExtensive). _Log.md unioned (both
+  fable-167 entries present).
+  Copilot D-1 screen-count follow-up: re-verified the EXACT count against
+  code. Both the old "11" and my "12" were wrong curated numbers. The
+  accurate, auditable count is 16 distinct dataplane-enforced checks (land,
+  syn-flood, ping-death, teardrop, winnuke, ip-sweep, port-scan, syn-fin,
+  no-flag, fin-no-ack, syn-frag, source-route-option, icmp-flood, udp-flood,
+  icmp-fragment, limit-session). Anchored to userspace-dp/src/screen/mod.rs:
+  15 carry dedicated per-reason drop counters (SCREEN_REASON_DROP_COUNT=15,
+  screen_reason_drop_index; session-limit-src/dst fold to one) + icmp-fragment
+  (check_icmp_fragment) folds to the aggregate screen_drops; SYN-cookie flood
+  protection is a separate mechanism. Set 16 CONSISTENTLY across all three
+  docs (feature-gaps.md enumerated with the code anchor, feature-coverage.md
+  x2, CLAUDE.md) — resolves the 3 Copilot comments. Other D-1 corrections
+  re-confirmed intact post-merge (NAT #3164 supersedes-#3029 callout, Rescue
+  Config Done, vsrx-gaps.md STALE banner). go build ./... + go test
+  ./pkg/config/... + gofmt + vet all green.
+- **File(s)**: pkg/config/compiler_validate_warn.go, docs/feature-gaps.md,
+  docs/feature-coverage.md, CLAUDE.md, _Log.md

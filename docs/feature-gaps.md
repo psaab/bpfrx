@@ -31,7 +31,7 @@ Last updated: 2026-05-24
 | Security Logging Enhancements | 0 | 0 | 0 | 0 |
 | PKI / Certificates | 3 | 1 | 0 | 4 |
 | Routing Enhancements | 10 | 3 | 0 | 13 |
-| VPN Enhancements | 9 | 0 | 0 | 9 |
+| VPN Enhancements | 10 | 0 | 0 | 10 |
 | HA Enhancements | 0 | 2 | 0 | 2 |
 | Firewall Filter Enhancements | 2 | 1 | 0 | 3 |
 | QoS / Class of Service | 2 | 4 | 0 | 6 |
@@ -40,7 +40,14 @@ Last updated: 2026-05-24
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **119** | **19** | **0** | **138** |
+| **TOTAL** | **120** | **19** | **0** | **139** |
+
+> The per-section counts and grand total above are a hand-maintained
+> summary and drift by ±1 against a strict machine row-parse of
+> `docs/authoritative-backlog.md` (a known maintenance artifact, not a
+> missing feature). Treat the individual section tables below and
+> `docs/feature-coverage.md` as authoritative for any specific feature's
+> status; the totals are an at-a-glance scale indicator only.
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -179,20 +186,31 @@ User-based policy enforcement integrating with directory services. Not implement
 
 xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, destination-address-name match (#3229), protocol-only match, port rewriting, multi-port matching, destination-nat off exemption (#3844)), static 1:1 (host AND block-to-block subnet mappings, #3031), NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
-> **DNAT `match destination-address` is exact-host only (#3029).** The
-> userspace `DnatTable` keys on an exact destination `IpAddr` (no prefix /
-> LPM match), so a destination-NAT rule whose `match destination-address` is
-> a multi-host prefix (e.g. `198.51.100.0/24`) cannot be honored — the
-> snapshot builder would strip the mask and translate only the network
-> address, silently bypassing every other host in the block. Such a rule is
-> **hard-rejected at commit** (`validateDestinationNATAddressesStrict`),
-> downgraded to a warning on the tolerant load / peer-sync path (#1960
-> no-brick). Single-host destinations (a bare IP, an explicit `/32`, or
-> `/128`) are accepted unchanged. Block-to-block destination NAT (the Junos
-> 1:1-offset / many:one block-mapping semantics) is a separate dataplane
-> feature — see #3029. This is the DNAT-table limitation only; the
-> **static-NAT** sibling block mapping (`static-nat prefix <subnet>`, 1:1
-> by offset) is now **supported** (#3031): an equal-length source/
+> **DNAT `match destination-address` now honors a multi-host prefix
+> (#3164 — supersedes the #3029 exact-host limitation).** The userspace
+> `DnatTable` installs a longest-prefix-match entry, so a destination-NAT
+> rule whose `match destination-address` is a non-host CIDR (e.g.
+> `198.51.100.0/24`) translates EVERY host in the block to the rule's pool
+> (many:1). The Go builder carries the canonical prefix on the additive
+> `destination_prefix` wire field; overlapping prefixes resolve by longest
+> match, and an exact-host entry (the longest possible prefix) always wins
+> over a covering block via the O(1) exact-host fast path. The
+> `docs/feature-coverage.md` §"Destination NAT" row is the current truth.
+> Single-host destinations (a bare IP, `/32`, or `/128`), bracket lists of
+> hosts (#2395, one table entry per host), and non-host prefixes (#3164)
+> are all accepted. The #3029 commit-time reject of a multi-host prefix
+> destination (`validateDestinationNATAddressesStrict`, which existed as a
+> fail-closed guard against the old silent-narrowing) has been **removed**
+> now that the prefix is honored. Whole-block local-address registration
+> (proxy-ARP/ND) is bounded: a block at or below 4096 usable hosts (a v4
+> /20 or longer) is expanded host-by-host; a larger block registers only
+> its network base and must be ROUTED to the firewall (the DNAT match
+> itself is independent of this set). Block-mapping semantics (a 1:1
+> host-N -> host-N offset map) remain out of scope for DNAT; the many:1
+> prefix translation above is what is implemented.
+>
+> The **static-NAT** sibling block mapping (`static-nat prefix <subnet>`,
+> 1:1 by offset) is **supported** (#3031): an equal-length source/
 > destination prefix pair installs an offset-preserving `StaticNatTable`
 > block rule (forward DNAT + reverse SNAT, host bits preserved), and the
 > commit gate accepts the valid equal-length pair while still rejecting
@@ -201,10 +219,9 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 > `then static-nat mapped-port` (per-port translation is a host-scope
 > construct on a `/32`; `StaticNatBlock` has no port fields and would
 > silently widen "port 80 of this /24 -> 8080" into an all-port /24 NAT).
-> The commit gate now REJECTS a block pair that also specifies a port,
-> and the dataplane lenient-load path drops it rather than mis-installing
-> an all-port block (#3202). Honoring a DNAT destination prefix still
-> needs a prefix-match table plus confirmed Junos block-mapping semantics.
+> The commit gate REJECTS a block pair that also specifies a port, and the
+> dataplane lenient-load path drops it rather than mis-installing an
+> all-port block (#3202).
 
 > **NAT64 inbound policy now matches the real internal IPv4 host (#2358,
 > resolved).** For inbound NAT64 flows the security policy is evaluated
@@ -242,7 +259,20 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 
 ## 9. Screen/IDS Enhancements
 
-xpf implements 12 screen checks (land, syn-flood, ping-death, icmp-fragment, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack) plus per-IP session limiting. These are additional vSRX screen options.
+xpf implements 16 distinct screen checks, each mapping to real dataplane
+enforcement (not a parsed-but-inert leaf): **land, syn-flood, ping-death,
+teardrop, winnuke, ip-sweep, port-scan, syn-fin, no-flag (tcp-no-flag),
+fin-no-ack, syn-frag, source-route-option (ip-source-route), icmp-flood,
+udp-flood, icmp-fragment, and limit-session** (per-source / per-destination
+session limiting). This count is auditable against
+`userspace-dp/src/screen/mod.rs`: 15 of these carry a dedicated per-reason
+drop counter — `screen_reason_drop_index` maps exactly `SCREEN_REASON_DROP_COUNT
+= 15` ordinals, with `session-limit-src` / `session-limit-dst` folding onto one
+`session-limit` ordinal — and the 16th, icmp-fragment, is enforced by
+`stateless::check_icmp_fragment` and folds to the aggregate `screen_drops`
+counter. SYN-cookie flood protection (`security flow syn-flood-protection-mode
+syn-cookie`) is a separate stateless mechanism, not one of the 16. These are
+additional vSRX screen options.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -407,6 +437,7 @@ xpf has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfaces
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
+| **Policy-Based IPsec VPN** | `security policies ... then permit tunnel ipsec-vpn <vpn>` | Bind an IPsec tunnel to a security policy (traffic matched by the policy enters the tunnel) instead of routing it out a route-based st0/XFRM interface. A top-5 vSRX idiom operators reach for immediately. | Medium | **Missing — rejected at commit (#3114).** xpf supports only route-based (st0/XFRM) IPsec: the `tunnel` modifier under `then permit` is hard-rejected at commit (`validatePolicyThenPermitStrict`, `pkg/config/compiler_policy_then.go`; lenient-warn on load/peer-sync per #1960) because `supportedPolicyThenPermitChildren` is empty and a silently-dropped `then permit` modifier would turn a permit-with-tunnel rule into an unconditional permit (a fail-open). Route the traffic to an st0 unit / XFRM interface bound to the IPsec VPN instead. |
 | **SSL VPN / Juniper Secure Connect** | `security remote-access ...` | Client-based SSL VPN for remote access (Windows, Mac, Android, iOS). Web portal login. | Medium | Missing |
 | **Remote Access IPsec VPN** | `security ike / ipsec + remote-access or access-profile workflow` | Road-warrior / client remote-access IPsec VPN distinct from site-to-site tunnels. The deployment guide explicitly calls out remote-access IPsec VPN support in addition to site-to-site. | Medium | Missing |
 | **Dynamic VPN** | `security dynamic-vpn ...` | Simplified IPsec remote access with web-based client provisioning and access profiles | Medium | Missing |
@@ -682,7 +713,7 @@ xpf has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheus 
 | **Cloud-init / Metadata User-Data Bootstrap** | `N/A (deployment/bootstrap workflow)` | Initialize a vSRX instance from validated Junos configuration passed through cloud metadata or config-drive user-data. Extensively documented for OpenStack, AWS, and GCP. | Medium | Missing |
 | **Bootstrap ISO Provisioning** | `N/A (deployment/bootstrap workflow)` | Provision first-boot configuration from a bootstrap ISO image attached as a virtual disk. Documented in the deployment guide for KVM and VMware workflows. | Low | Missing |
 | **Junos Space / Security Director** | N/A (external management platform) | Centralized multi-device policy management. Not applicable as a feature of xpf itself. | Low | Missing (N/A) |
-| **Rescue Configuration** | `request system configuration rescue save` | Saved fallback configuration that can be loaded on boot if active config fails | Low | Missing |
+| **Rescue Configuration** | `request system configuration rescue save` | Saved fallback configuration that can be loaded on boot if active config fails | Low | **Done.** `request system configuration rescue save`/`delete` are implemented — `SaveRescueConfig`/`DeleteRescueConfig` persist the active config text to `rescue.conf` (owner-only 0600, #4056; DurableState #1894) in `pkg/configstore/store_persist.go`, wired through `pkg/cli/cli_request.go`. |
 
 ---
 
