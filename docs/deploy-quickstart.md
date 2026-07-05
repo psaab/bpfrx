@@ -54,6 +54,19 @@ incus image import dist/xpf-<ver>.incus-metadata.tar.gz \
 
 ## Standalone in two commands
 
+`standalone.yaml` (and the `launch` form below) source three bridges —
+`br-mgmt`, `br-lan`, `br-wan`. Create them first so the deploy runs
+unedited. `br-mgmt` and `br-wan` are **NAT/DHCP-bearing** so `fxp0`
+(mgmt, DHCP) and `ge-0/0/1` (WAN, DHCP-from-upstream) get addresses and
+reach the internet; `br-lan` is a plain L2 segment — `ge-0/0/0` is the
+static LAN gateway that runs the DHCP server itself:
+
+```bash
+incus network create br-mgmt ipv4.address=10.167.0.1/24 ipv4.nat=true ipv6.address=none
+incus network create br-wan  ipv4.address=10.168.0.1/24 ipv4.nat=true ipv6.address=none
+incus network create br-lan  ipv4.address=none ipv6.address=none
+```
+
 ```bash
 scripts/deploy/xpf-deploy.py inventory                              # see your NICs/VFs/bridges
 scripts/deploy/xpf-deploy.py deploy examples/deploy/standalone.yaml # build drive + launch
