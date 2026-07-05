@@ -15,6 +15,45 @@ type ClassOfServiceConfig struct {
 	SchedulerMaps        map[string]*CoSSchedulerMap
 	Interfaces           map[string]*CoSInterface
 	FairnessExpectations []*CoSFairnessExpectation
+	// INetPrecedenceClassifiers / INetPrecedenceRewriteRules / EXPRewriteRules
+	// record the NAMES of `inet-precedence` classifiers, `inet-precedence`
+	// rewrite-rules, and `exp` rewrite-rules configured (fable-167 F-3b,
+	// #4316). These behavior-aggregate maps are accepted for Junos
+	// compatibility but INERT — the userspace dataplane classifies and
+	// rewrites on dscp / ieee-802.1 only. Names are recorded solely to drive
+	// the accepted-but-inert commit advisory; no runtime structure is built.
+	INetPrecedenceClassifiers  []string
+	INetPrecedenceRewriteRules []string
+	EXPRewriteRules            []string
+	// TrafficControlProfiles holds the Junos hierarchical shaping profiles
+	// (`class-of-service traffic-control-profiles <name>`). A profile is
+	// bound to a logical interface's egress by
+	// `interfaces <if> unit N output-traffic-control-profile <name>`;
+	// resolveCoSTrafficControlProfiles folds the bounded knobs
+	// (shaping-rate, scheduler-map) into the referencing CoSInterfaceUnit so
+	// the existing per-unit shaper enforces them. Before this modeling the
+	// whole binding was silently dropped — a clean commit with ZERO shaping
+	// (fable-167 F-2, #4315).
+	TrafficControlProfiles map[string]*CoSTrafficControlProfile
+}
+
+// CoSTrafficControlProfile models one Junos traffic-control-profile
+// (`class-of-service traffic-control-profiles <name>`). The BOUNDED knobs
+// map onto xpf's existing per-unit shaper: ShapingRateBytes becomes the
+// unit root shaper and SchedulerMap the unit scheduler-map when the profile
+// is bound via output-traffic-control-profile
+// (resolveCoSTrafficControlProfiles). GuaranteedRateBytes and
+// DelayBufferRateBytes are captured for `show configuration` fidelity and a
+// commit advisory but have NO per-unit dataplane consumer yet
+// (accepted-but-not-enforced) — there is no absolute per-unit guaranteed-rate
+// or delay-buffer reservation in the userspace shaper (the #1614 A1
+// guarantee-rate is a proportional FRACTION, a distinct mechanism).
+type CoSTrafficControlProfile struct {
+	Name                 string
+	ShapingRateBytes     uint64 // bytes/sec; 0 = unset
+	GuaranteedRateBytes  uint64 // bytes/sec; 0 = unset (accepted-but-inert)
+	DelayBufferRateBytes uint64 // bytes/sec; 0 = unset (accepted-but-inert)
+	SchedulerMap         string
 }
 
 // CoSForwardingClass maps a forwarding-class name to a queue number.
@@ -144,6 +183,15 @@ type CoSInterfaceUnit struct {
 	DSCPClassifier     string
 	IEEE8021Classifier string
 	DSCPRewriteRule    string
+	// OutputTrafficControlProfile is the raw
+	// `output-traffic-control-profile <name>` reference bound to this unit's
+	// egress (fable-167 F-2, #4315). resolveCoSTrafficControlProfiles (run
+	// after applyCoSInterfaceLevelBindings) looks up the named profile and
+	// folds its shaping-rate + scheduler-map into ShapingRateBytes /
+	// SchedulerMap when those are not already set directly on the unit
+	// (a direct unit-level knob wins). Retained on the unit for
+	// `show configuration` fidelity and the undefined-reference advisory.
+	OutputTrafficControlProfile string
 	// OversubscriptionPolicy (#1614 A1) is the operator-selectable
 	// behaviour when sum of exact-class transmit-rates exceeds the
 	// interface's shaping-rate. Empty or "proportional" (default)

@@ -25,6 +25,17 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				}},
 			}},
 		}},
+		// #4316 (fable-167 F-3b): IP-precedence classifier. Accepted for
+		// Junos compatibility (completion + ? help) but INERT — the userspace
+		// dataplane classifies only on dscp / ieee-802.1. A commit advisory
+		// surfaces the inertness.
+		"inet-precedence": {desc: "IP-precedence classifier (accepted for Junos compatibility; NOT enforced — the dataplane classifies on dscp / ieee-802.1 only)", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
+			"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+					"code-points": {desc: "IP-precedence code points to match (0..7)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
+				}},
+			}},
+		}},
 	}},
 	"rewrite-rules": {desc: "Egress rewrite rules mapping forwarding classes to code points", children: map[string]*schemaNode{
 		"dscp": {desc: "DSCP rewrite rule", args: 1, multi: true, placeholder: "<rewrite-rule-name>", children: map[string]*schemaNode{
@@ -32,6 +43,25 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
 					"code-point":  {desc: "DSCP code point to write (alias such as ef, af11, cs6, or numeric 0..63)", args: 1, placeholder: "<code-point>", children: nil},
 					"code-points": {desc: "DSCP code point to write (alias of code-point; first value is used)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
+				}},
+			}},
+		}},
+		// #4316 (fable-167 F-3b): IP-precedence and MPLS EXP egress rewrite.
+		// Accepted for Junos compatibility (completion + ? help) but INERT —
+		// the userspace dataplane rewrites only dscp on egress. Commit advisory.
+		"inet-precedence": {desc: "IP-precedence rewrite rule (accepted for Junos compatibility; NOT enforced — the dataplane rewrites dscp only)", args: 1, multi: true, placeholder: "<rewrite-rule-name>", children: map[string]*schemaNode{
+			"forwarding-class": {desc: "Forwarding class whose packets get the rewritten code point", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+					"code-point":  {desc: "IP-precedence code point to write (0..7)", args: 1, placeholder: "<code-point>", children: nil},
+					"code-points": {desc: "IP-precedence code point to write (alias of code-point; first value is used)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
+				}},
+			}},
+		}},
+		"exp": {desc: "MPLS EXP rewrite rule (accepted for Junos compatibility; NOT enforced — the dataplane rewrites dscp only)", args: 1, multi: true, placeholder: "<rewrite-rule-name>", children: map[string]*schemaNode{
+			"forwarding-class": {desc: "Forwarding class whose packets get the rewritten code point", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+					"code-point":  {desc: "MPLS EXP code point to write (0..7)", args: 1, placeholder: "<code-point>", children: nil},
+					"code-points": {desc: "MPLS EXP code point to write (alias of code-point; first value is used)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
 				}},
 			}},
 		}},
@@ -115,6 +145,49 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			"scheduler": {desc: "Scheduler to apply to this forwarding class", args: 1, placeholder: "<scheduler-name>", children: nil},
 		}},
 	}},
+	// #4315 (fable-167 F-2): the Junos hierarchical shaping profile. A
+	// profile is bound to a logical interface's egress via
+	// `interfaces <if> unit N output-traffic-control-profile <name>`;
+	// resolveCoSTrafficControlProfiles folds shaping-rate + scheduler-map
+	// into the referencing unit's existing per-unit shaper. shaping-rate is
+	// a plain typed rate leaf here (no burst-size child, unlike the
+	// interface-level cosShapingRateSchema — Junos sizes the buffer via
+	// delay-buffer-rate, not burst-size). guaranteed-rate / delay-buffer-rate
+	// are typed (garbage rejected at commit) but currently INERT — no
+	// per-unit dataplane consumer — and carry a commit advisory.
+	"traffic-control-profiles": {desc: "Hierarchical traffic-shaping profiles bound to an interface via output-traffic-control-profile", args: 1, multi: true, placeholder: "<profile-name>", children: map[string]*schemaNode{
+		"shaping-rate": {
+			desc:          "Peak shaping rate in bits per second (k/m/g suffix) — enforced as the root shaper on the bound unit",
+			args:          1,
+			placeholder:   "<rate>",
+			valueType:     ValueRate,
+			valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps",
+			valueExamples: []string{"10m", "1g", "10g"},
+			validator:     ValidateRate,
+			children:      nil,
+		},
+		"guaranteed-rate": {
+			desc:          "Guaranteed minimum rate in bits per second (accepted for Junos compatibility; NOT yet enforced per-unit by the userspace dataplane)",
+			args:          1,
+			placeholder:   "<rate>",
+			valueType:     ValueRate,
+			valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps (accepted but currently inert)",
+			valueExamples: []string{"5m", "500m"},
+			validator:     ValidateRate,
+			children:      nil,
+		},
+		"delay-buffer-rate": {
+			desc:          "Delay-buffer sizing rate in bits per second (accepted for Junos compatibility; NOT yet enforced by the userspace dataplane)",
+			args:          1,
+			placeholder:   "<rate>",
+			valueType:     ValueRate,
+			valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps (accepted but currently inert)",
+			valueExamples: []string{"10m", "1g"},
+			validator:     ValidateRate,
+			children:      nil,
+		},
+		"scheduler-map": {desc: "Scheduler map applied to the unit bound to this profile", args: 1, placeholder: "<map-name>", children: nil},
+	}},
 	"interfaces": {desc: "Apply CoS to an interface", args: 1, multi: true, placeholder: "<interface-name>", children: map[string]*schemaNode{
 		"unit": {desc: "Logical unit number", args: 1, multi: true, placeholder: "<unit-number>", children: map[string]*schemaNode{
 			"classifiers": {desc: "Classifiers applied to traffic arriving on this unit", children: map[string]*schemaNode{
@@ -124,10 +197,11 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", children: map[string]*schemaNode{
 				"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 			}},
-			"shaping-rate":            cosShapingRateSchema("Shaping rate for this unit in bits per second (k/m/g suffixes)"),
-			"scheduler-map":           {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
-			"oversubscription-policy": cosOversubscriptionPolicySchema(),
-			"priority-low-min-share":  cosPriorityLowMinShareSchema(),
+			"shaping-rate":                   cosShapingRateSchema("Shaping rate for this unit in bits per second (k/m/g suffixes)"),
+			"scheduler-map":                  {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
+			"output-traffic-control-profile": {desc: "Bind a traffic-control-profile to this unit's egress (applies its shaping-rate + scheduler-map)", args: 1, placeholder: "<profile-name>", children: nil},
+			"oversubscription-policy":        cosOversubscriptionPolicySchema(),
+			"priority-low-min-share":         cosPriorityLowMinShareSchema(),
 		}},
 		// #4021: interface-level (physical, no unit) bindings. In Junos these
 		// apply to every logical unit on the port; a unit-level binding
@@ -141,10 +215,11 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 		"rewrite-rules": {desc: "Rewrite rules applied at the interface level (all units)", children: map[string]*schemaNode{
 			"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 		}},
-		"shaping-rate":            cosShapingRateSchema("Shaping rate applied at the interface level in bits per second (k/m/g suffixes)"),
-		"scheduler-map":           {desc: "Scheduler map to apply at the interface level (all units)", args: 1, placeholder: "<map-name>", children: nil},
-		"oversubscription-policy": cosOversubscriptionPolicySchema(),
-		"priority-low-min-share":  cosPriorityLowMinShareSchema(),
+		"shaping-rate":                   cosShapingRateSchema("Shaping rate applied at the interface level in bits per second (k/m/g suffixes)"),
+		"scheduler-map":                  {desc: "Scheduler map to apply at the interface level (all units)", args: 1, placeholder: "<map-name>", children: nil},
+		"output-traffic-control-profile": {desc: "Bind a traffic-control-profile at the interface level (all units)", args: 1, placeholder: "<profile-name>", children: nil},
+		"oversubscription-policy":        cosOversubscriptionPolicySchema(),
+		"priority-low-min-share":         cosPriorityLowMinShareSchema(),
 	}},
 	"fairness": {desc: "Dataplane fairness observability configuration", children: map[string]*schemaNode{
 		"rss-expectation": {desc: "Declarative RSS flow-distribution expectations evaluated against live dataplane status (shown in fairness output and exported as Prometheus gauges)", children: map[string]*schemaNode{
@@ -276,6 +351,12 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 	"family": {desc: "Protocol family for firewall filters", compoundKey: true, children: map[string]*schemaNode{
 		"inet": {desc: "IPv4 firewall filters", children: map[string]*schemaNode{
 			"filter": {desc: "Firewall filter", args: 1, placeholder: "<filter-name>", children: map[string]*schemaNode{
+				// #4316 (fable-167 F-3a): interface-specific instantiates a
+				// per-interface counter/policer instance in Junos. xpf accepts
+				// it (completion + ? help) but keeps a single shared counter;
+				// a commit advisory (compiler_validate_warn.go) surfaces the
+				// divergence.
+				"interface-specific": {desc: "Instantiate per-interface counter/policer instances (accepted; xpf keeps a single shared counter — advisory at commit)", children: nil},
 				"term": {desc: "Filter term", args: 1, placeholder: "<term-name>", children: map[string]*schemaNode{
 					"from": {desc: "Match conditions", children: map[string]*schemaNode{
 						"source-address":          {desc: "Match source address", args: 1, multi: true, placeholder: "<address>", children: nil},
@@ -336,6 +417,12 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 		}},
 		"inet6": {desc: "IPv6 firewall filters", children: map[string]*schemaNode{
 			"filter": {desc: "Firewall filter", args: 1, placeholder: "<filter-name>", children: map[string]*schemaNode{
+				// #4316 (fable-167 F-3a): interface-specific instantiates a
+				// per-interface counter/policer instance in Junos. xpf accepts
+				// it (completion + ? help) but keeps a single shared counter;
+				// a commit advisory (compiler_validate_warn.go) surfaces the
+				// divergence.
+				"interface-specific": {desc: "Instantiate per-interface counter/policer instances (accepted; xpf keeps a single shared counter — advisory at commit)", children: nil},
 				"term": {desc: "Filter term", args: 1, placeholder: "<term-name>", children: map[string]*schemaNode{
 					"from": {desc: "Match conditions", children: map[string]*schemaNode{
 						"source-address":          {desc: "Match source address", args: 1, multi: true, placeholder: "<address>", children: nil},

@@ -898,6 +898,43 @@ func ValidateConfig(cfg *Config) []string {
 		warnedClassifierLossPriority := false
 		warnedRewriteLossPriority := false
 		warnedPriorityLowMinShare := false
+		// #4315 (fable-167 F-2): a traffic-control-profile's guaranteed-rate
+		// and delay-buffer-rate are typed + stored so garbage is rejected at
+		// commit, but the userspace shaper has no per-unit consumer for them
+		// (there is no absolute per-unit guaranteed-rate reservation — the
+		// #1614 A1 guarantee-rate is a proportional fraction, a distinct
+		// mechanism). shaping-rate + scheduler-map ARE enforced (folded into
+		// the bound unit). Warn once so an operator who sets guaranteed-rate /
+		// delay-buffer-rate is not misled into believing they bound the
+		// minimum rate or buffer. Mirrors the #4218/#4220 accepted-but-inert
+		// doctrine.
+		warnedTCPInert := false
+		for _, tcp := range cos.TrafficControlProfiles {
+			if tcp == nil {
+				continue
+			}
+			if (tcp.GuaranteedRateBytes > 0 || tcp.DelayBufferRateBytes > 0) && !warnedTCPInert {
+				warnings = append(warnings,
+					"class-of-service traffic-control-profiles guaranteed-rate / delay-buffer-rate are accepted for compatibility but inert: the userspace dataplane enforces only the profile's shaping-rate and scheduler-map on the bound unit (#4315), so those values have no runtime effect")
+				warnedTCPInert = true
+			}
+		}
+		// #4316 (fable-167 F-3b): inet-precedence classifiers/rewrite and exp
+		// rewrite are accepted for Junos compatibility but INERT — the
+		// userspace dataplane classifies/rewrites on dscp / ieee-802.1 only.
+		// Warn once per category so the operator is not misled.
+		if len(cos.INetPrecedenceClassifiers) > 0 {
+			warnings = append(warnings,
+				"class-of-service classifiers inet-precedence is accepted for compatibility but inert: the userspace dataplane classifies on dscp / ieee-802.1 only, so IP-precedence classification has no runtime effect")
+		}
+		if len(cos.INetPrecedenceRewriteRules) > 0 {
+			warnings = append(warnings,
+				"class-of-service rewrite-rules inet-precedence is accepted for compatibility but inert: the userspace dataplane rewrites dscp on egress only, so IP-precedence rewrite has no runtime effect")
+		}
+		if len(cos.EXPRewriteRules) > 0 {
+			warnings = append(warnings,
+				"class-of-service rewrite-rules exp is accepted for compatibility but inert: the userspace dataplane rewrites dscp on egress only, so MPLS EXP rewrite has no runtime effect")
+		}
 		for _, class := range cos.ForwardingClasses {
 			if class == nil {
 				continue
@@ -1088,6 +1125,17 @@ func ValidateConfig(cfg *Config) []string {
 							iface.Name, unit.Unit, unit.SchedulerMap))
 					}
 				}
+				// #4315 (fable-167 F-2): a dangling output-traffic-control-profile
+				// reference resolves to no shaper — the binding shapes nothing.
+				// Warn so the operator sees the inert binding rather than a silent
+				// zero-shaping commit.
+				if unit.OutputTrafficControlProfile != "" {
+					if _, ok := cos.TrafficControlProfiles[unit.OutputTrafficControlProfile]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined output-traffic-control-profile %q; the unit is not shaped",
+							iface.Name, unit.Unit, unit.OutputTrafficControlProfile))
+					}
+				}
 				if unit.DSCPClassifier != "" {
 					if _, ok := cos.DSCPClassifiers[unit.DSCPClassifier]; !ok {
 						warnings = append(warnings, fmt.Sprintf(
@@ -1186,6 +1234,11 @@ func ValidateConfig(cfg *Config) []string {
 	// the QoS action is inert. Same principle as #2486 (ipsec-vpn): never
 	// silently accept config the dataplane cannot enforce.
 	warnings = append(warnings, validateFilterLossPriorityWarnings(cfg)...)
+
+	// #4316 (fable-167 F-3a): `firewall filter <n> interface-specific` is
+	// accepted but xpf keeps a single shared counter (not per-interface
+	// instances). WARN so the operator knows `show firewall` aggregates.
+	warnings = append(warnings, validateFirewallInterfaceSpecificWarnings(cfg)...)
 
 	// #3445: an lo0 INPUT filter is mirrored onto a kernel nftables chain
 	// (the PRIMARY enforcement for host-bound traffic the XDP shim shunts to the
@@ -1596,6 +1649,50 @@ func validateFilterLossPriorityWarnings(cfg *Config) []string {
 						"dataplane (no per-packet loss-priority action is enforced)",
 					family, name, term.Name, term.LossPriority))
 			}
+		}
+	}
+	emit("inet", cfg.Firewall.FiltersInet)
+	emit("inet6", cfg.Firewall.FiltersInet6)
+	return warnings
+}
+
+// validateFirewallInterfaceSpecificWarnings emits a WARN-only commit-time
+// message for each firewall filter carrying `interface-specific` (fable-167
+// F-3a, #4316). Junos instantiates a distinct counter/policer instance per
+// interface the filter is attached to; xpf keeps a single shared counter, so
+// `show firewall` aggregates across interfaces. The flag is accepted (never a
+// hard reject — it is valid Junos) but its per-interface-instance semantics
+// are not honored. WARN once per filter, naming it.
+func validateFirewallInterfaceSpecificWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	seen := make(map[string]struct{})
+	emit := func(family string, filters map[string]*FirewallFilter) {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil || !filter.InterfaceSpecific {
+				continue
+			}
+			// A `family any` filter is folded into both pools; dedup by name
+			// so it is not double-reported.
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			warnings = append(warnings, fmt.Sprintf(
+				"firewall filter %q interface-specific is accepted for compatibility "+
+					"but inert: xpf keeps a single shared counter/policer instance "+
+					"(not a distinct per-interface instance), so `show firewall` "+
+					"aggregates counts across every interface the filter is attached to",
+				name))
+			_ = family
 		}
 	}
 	emit("inet", cfg.Firewall.FiltersInet)

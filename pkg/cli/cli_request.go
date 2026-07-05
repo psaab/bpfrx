@@ -1136,9 +1136,40 @@ func (c *CLI) handleRequestSecurity(args []string) error {
 		return nil
 	case "wireguard":
 		return c.handleRequestSecurityWireguard(args[1:])
+	case "policies":
+		return c.handleRequestSecurityPolicies(args[1:])
 	default:
 		return fmt.Errorf("unknown request security target: %s", args[0])
 	}
+}
+
+// handleRequestSecurityPolicies implements `request security policies check`
+// (fable-167 C-1c, #4314): a static analysis of the configured policy set
+// that reports shadowed / redundant rules. Junos `request security policies
+// check` validates the compiled policy DB; xpf runs a conservative
+// name-set-containment pass over config.ZonePairPolicies (no dataplane call —
+// this is a config lint). It never mutates config.
+func (c *CLI) handleRequestSecurityPolicies(args []string) error {
+	if len(args) == 0 || args[0] != "check" {
+		fmt.Println("request security policies:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children["policies"].Children))
+		return nil
+	}
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	findings := analyzePolicyShadowing(cfg)
+	if len(findings) == 0 {
+		fmt.Println("Policy check complete: no shadowed or redundant policies detected.")
+		return nil
+	}
+	fmt.Printf("Policy check complete: %d issue(s) detected.\n\n", len(findings))
+	for _, f := range findings {
+		fmt.Println(f)
+	}
+	return nil
 }
 
 // handleRequestSecurityWireguard implements `request security wireguard

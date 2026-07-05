@@ -1142,6 +1142,14 @@ type ThreeColorPolicerConfig struct {
 type FirewallFilter struct {
 	Name  string
 	Terms []*FirewallFilterTerm
+	// InterfaceSpecific records the Junos `interface-specific` flag
+	// (fable-167 F-3a, #4316). In Junos it instantiates a distinct
+	// counter/policer instance per interface the filter is attached to; xpf
+	// keeps a single shared counter, so the flag is accepted but inert. It
+	// is recorded here only to drive the commit advisory
+	// (validateFirewallInterfaceSpecificWarnings); the dataplane never reads
+	// it.
+	InterfaceSpecific bool
 }
 
 // FirewallFilterTerm is a single match/action term within a filter.

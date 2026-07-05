@@ -847,6 +847,40 @@ stays 0 and the dataplane applies its rate-independent
 `shaping-rate`) still inherits both the level rate and the level burst as
 a pair.
 
+### Hierarchical traffic-control-profiles (#4315, fable-167 F-2)
+
+The Junos hierarchical shaping binding is modeled and **wired** to the
+per-unit shaper:
+
+```
+set class-of-service traffic-control-profiles wan-tcp shaping-rate 9g
+set class-of-service traffic-control-profiles wan-tcp scheduler-map edge-map
+set class-of-service interfaces ge-0-0-2 unit 80 output-traffic-control-profile wan-tcp
+```
+
+A `traffic-control-profiles <name>` profile carries `shaping-rate`,
+`scheduler-map`, `guaranteed-rate`, and `delay-buffer-rate`. Binding it to a
+logical unit's egress with `output-traffic-control-profile <name>` folds the
+profile's **shaping-rate** and **scheduler-map** into that unit's existing
+per-unit shaper (`resolveCoSTrafficControlProfiles` in
+`pkg/config/compiler.go`, run after the interface-level fold), so the shaper
+materializes exactly as if the operator had set `shaping-rate` /
+`scheduler-map` directly on the unit. A **direct unit-level knob wins** over
+the profile (Junos precedence), and an interface-level
+`output-traffic-control-profile` applies to every configured logical unit.
+
+Before #4315 both `traffic-control-profiles` and
+`output-traffic-control-profile` were unmodeled: the binding committed
+cleanly and was **silently dropped** — the shaper never materialized (ZERO
+shaping while the operator believed shaping was applied). `guaranteed-rate`
+and `delay-buffer-rate` are typed (garbage rejected at commit) and captured
+for `show configuration` fidelity, but are **accepted-but-inert** — the
+userspace shaper has no per-unit absolute guaranteed-rate reservation or
+delay-buffer sizing (the #1614 A1 `guarantee-rate` is a proportional
+*fraction*, a distinct mechanism); a commit advisory surfaces the inertness.
+A dangling `output-traffic-control-profile` reference (no such profile) also
+warns (the unit is not shaped).
+
 A `class-of-service interfaces <name>` binding whose interface — or a
 bound `unit N` — is **not configured under `[interfaces]`** is a silent
 no-op: the dataplane applier only visits CoS bindings that resolve

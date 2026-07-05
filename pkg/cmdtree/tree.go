@@ -449,9 +449,13 @@ var OperationalTree = map[string]*Node{
 					}},
 					"rule-set": {Desc: "Show destination NAT rule sets"},
 				}},
-				"static": {Desc: "Show static NAT"},
-				"nptv6":  {Desc: "Show NPTv6 prefix translation rules"},
-				"nat64":  {Desc: "Show NAT64 rules"},
+				"static": {Desc: "Show static NAT", Children: map[string]*Node{
+					"rule": {Desc: "Show static NAT rules", Children: map[string]*Node{
+						"detail": {Desc: "Show detailed static NAT rules (source restriction, mapped-port, prefix-name, routing-instance)"},
+					}},
+				}},
+				"nptv6": {Desc: "Show NPTv6 prefix translation rules"},
+				"nat64": {Desc: "Show NAT64 rules"},
 			}},
 			"address-book": {Desc: "Show address book entries"},
 			"applications": {Desc: "Show application definitions"},
@@ -473,11 +477,15 @@ var OperationalTree = map[string]*Node{
 				"detail": {Desc: "Show detailed statistics with screen and session breakdown"},
 			}},
 			"ike": {Desc: "Show Internet Key Exchange information", Children: map[string]*Node{
-				"security-associations": {Desc: "Show IKE SAs"},
+				"security-associations": {Desc: "Show IKE SAs", Children: map[string]*Node{
+					"detail": {Desc: "Show detailed IKE SA information"},
+				}},
 			}},
 			"ipsec": {Desc: "Show IP Security information", Children: map[string]*Node{
-				"security-associations": {Desc: "Show IPsec SAs"},
-				"statistics":            {Desc: "Show IPsec statistics"},
+				"security-associations": {Desc: "Show IPsec SAs", Children: map[string]*Node{
+					"detail": {Desc: "Show detailed IPsec SA information (bytes, packets, SPI, lifetime)"},
+				}},
+				"statistics": {Desc: "Show IPsec statistics"},
 			}},
 			"vrrp": {Desc: "Show VRRP high availability status"},
 			"wireguard": {Desc: "Show WireGuard tunnel status", Children: map[string]*Node{
@@ -932,6 +940,9 @@ var OperationalTree = map[string]*Node{
 				"sa": {Desc: "IPsec SA operations", Children: map[string]*Node{
 					"clear": {Desc: "Clear all IPsec SAs"},
 				}},
+			}},
+			"policies": {Desc: "Security policy operations", Children: map[string]*Node{
+				"check": {Desc: "Check the configured policy set for shadowed / redundant rules"},
 			}},
 			"wireguard": {Desc: "WireGuard operations", Children: map[string]*Node{
 				"generate-private-key": {Desc: "Generate a fresh WireGuard private key and its public key"},

@@ -1326,6 +1326,27 @@ Index   State  Initiator cookie  Responder cookie  Mode           Remote Address
 - **Mode:** `IKEv2` or `Main` (for IKEv1), ~15 chars.
 - **Remote Address:** IP address.
 
+### Drill-downs (fable-167 C-1, #4314)
+
+The operational tree (`pkg/cmdtree`) now advertises these grouped
+drill-downs (tab-completion + `?` help):
+
+- `show security ike security-associations detail` — per-SA local/remote
+  traffic selectors, SPI in/out, and lifetime (was: bare list only).
+- `show security ipsec security-associations detail` — already rendered by
+  the handler; now surfaced in completion/help.
+- `show security nat static rule [detail]` — per-rule drill-down mirroring
+  source/destination NAT; `detail` adds the source-address restriction,
+  destination-port / mapped-port translation, `prefix-name`, and the
+  translation-target routing-instance.
+- `request security policies check` — a config lint that reports **shadowed**
+  (an earlier terminal policy matches a superset with a *different* action →
+  the later rule is unreachable) and **redundant** (same action) policies. It
+  is a conservative name-set containment pass over the configured zone-pair
+  policies; it never resolves address-book names to prefixes (no false
+  positives) and never treats an inverted-match or schedule-gated policy as a
+  shadower. It does not mutate config.
+
 ---
 
 ## Security: Log

@@ -174,6 +174,7 @@ func (c *CLI) showIKE(args []string) error {
 	}
 
 	if len(args) > 0 && args[0] == "security-associations" {
+		detail := len(args) >= 2 && args[1] == "detail"
 		// Show IKE SA status from strongSwan
 		if c.ipsec != nil {
 			sas, err := c.ipsec.GetSAStatus()
@@ -191,6 +192,20 @@ func (c *CLI) showIKE(args []string) error {
 				}
 				if sa.RemoteAddr != "" {
 					fmt.Printf("  Remote: %s\n", sa.RemoteAddr)
+				}
+				if detail {
+					if sa.LocalTS != "" {
+						fmt.Printf("  Local TS:  %s\n", sa.LocalTS)
+					}
+					if sa.RemoteTS != "" {
+						fmt.Printf("  Remote TS: %s\n", sa.RemoteTS)
+					}
+					if sa.SPIIn != "" || sa.SPIOut != "" {
+						fmt.Printf("  SPI In/Out: %s/%s\n", sa.SPIIn, sa.SPIOut)
+					}
+					if sa.Rekey != "" {
+						fmt.Printf("  Lifetime:   %s\n", sa.Rekey)
+					}
 				}
 				fmt.Println()
 			}
