@@ -524,9 +524,21 @@ fn refund_phase1_waterfill_honor(
     queue_idx: usize,
     refund: Phase1HonorRefund,
 ) {
-    let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-        return;
-    };
+    if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
+        apply_phase1_waterfill_honor_refund(root, queue_idx, refund);
+    }
+}
+
+/// Root-scoped body of the Phase-1 honor refund (see
+/// `refund_phase1_waterfill_honor`), split out so it is exercisable
+/// without a full `BindingWorker`. Restores the debited budget, clears
+/// the honored-epoch bit, and corrects the telemetry.
+#[inline]
+fn apply_phase1_waterfill_honor_refund(
+    root: &mut CoSInterfaceRuntime,
+    queue_idx: usize,
+    refund: Phase1HonorRefund,
+) {
     root.waterfill_pass1_remaining_bytes = root
         .waterfill_pass1_remaining_bytes
         .saturating_add(refund.cost_bytes);

@@ -34874,3 +34874,37 @@ top.
   userspace-dp/src/afxdp/tx/test_support.rs,
   userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
   docs/fairness-regimes.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fix two TX-path CoS queue-service bugs (fable-review-166
+  T-2 HIGH + T-5 Medium). T-2 (#4256): the guarantee-rate waterfill
+  selector debited the Phase-1 budget and set the honored-epoch bit at
+  SELECTION; a zero-byte TX (ring full / no free frame / build Drop)
+  did not refund, burning the small class's 200 µs epoch guarantee
+  while Phase-2 classes stayed re-selectable. Fix: carry the committed
+  honor (debit bytes + ordinal) out of the selector on the returned
+  selection and REFUND it in the service wrapper on progress == false
+  (add debit back, clear bit); phase1_admissions now counts progressing
+  services and a new phase1_selected_no_progress counter records the
+  refunded no-progress visits (surfaced Rust runtime -> snapshot ->
+  protocol -> Go mirror, additive + omitempty). Interface-wide TX
+  pressure means refund+retry does not differentially starve peers. T-5
+  (#4257): cos_flow_aware_buffer_limit's #717 delay_cap = rate × 5 ms
+  computed 0 for an unshaped (rate == 0) flow-fair queue, pinning the
+  aggregate cap at base and dropping a new flow's first packet (rate-0
+  twin of #704/#707). Fix: anchor the delay rate to a 10 Gb/s physical
+  link-rate floor (COS_FLOW_FAIR_UNSHAPED_DRAIN_RATE_BYTES) when
+  unshaped; shaped path bit-identical. RED-on-revert tests added for
+  both (waterfill_phase1_honor_refund_* + service_exact_guarantee_zero_
+  tx_refunds_phase1_honor; cos_flow_aware_buffer_limit_expands_for_
+  unshaped_rate0_queue). Needs a cluster CoS smoke (TX-path fairness).
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests.rs,
+  userspace-dp/src/afxdp/cos/admission.rs,
+  userspace-dp/src/afxdp/cos/admission_tests.rs,
+  userspace-dp/src/afxdp/types/cos.rs,
+  userspace-dp/src/afxdp/worker/cos/queue_row.rs,
+  userspace-dp/src/afxdp/coordinator/cos_leases.rs,
+  userspace-dp/src/protocol/cos.rs,
+  pkg/dataplane/userspace/protocol.go,
+  docs/fairness-regimes.md, _Log.md
