@@ -34509,3 +34509,87 @@ top.
   pkg/config/compiler_validate_warn.go,
   pkg/config/policy_rematch_advisory_test.go, docs/feature-gaps.md,
   docs/vsrx-gaps.md, docs/feature-coverage.md, CLAUDE.md, _Log.md
+- **Action**: fable-review-167 P-1/P-3/P-4 (issues #4230/#4231/#4232).
+  P-1: reject the zone-pair `from-zone junos-host to-zone <z>` policy at
+  strict commit (host-ORIGINATED traffic egresses via the kernel TX path,
+  never the AF_XDP RX gate, so it committed clean and was silently inert;
+  policyZoneSpecialTokens exempted junos-host from the undefined-zone check).
+  New arm in validatePolicyZoneReferencesStrict mirrors the existing GLOBAL
+  `match from-zone junos-host` gate (#3611 Piece A) and gets the same #1960
+  lenient-load downgrade (warn, not brick). `to-zone junos-host`
+  (host-INBOUND, #3019/#3639) stays supported. Corrected the false "rejected
+  at commit" claims in userspace-dp/src/policy.rs (evaluate_junos_host_policy
+  doc comment) and docs/junos-cli-reference.md — both now state BOTH forms
+  are rejected at STRICT commit (global since #3611 Piece A, zone-pair since
+  #4230). Host-TX-path wiring is a deferred follow-up.
+  P-3: five accepted-only `security flow` knobs (route-change-timeout,
+  sync-icmp-session, force-ip-reassembly, multicast-session-lifetime,
+  preserve-incoming-fragment-size) now typed in setSchema + recorded by
+  compileFlow + emit an accepted-only commit advisory (the #2078
+  tcp-session doctrine). sync-icmp-session gets a stronger HA-specific
+  advisory (ICMP sessions do NOT sync to the peer / survive failover).
+  P-4: accepted-but-inert advisories for unimplemented `security alg <proto>`
+  stanzas (ALGConfig.UnsupportedProtos) and unrecognized direct `policy
+  <name>` children (Policy.UnknownChildren) — both were silently dropped.
+  RED-on-revert tests in pkg/config/fable167_advisory_test.go. go test
+  ./pkg/config/... green; go build ./... green; gofmt/vet clean on touched
+  files. Rust change is comment-only (no cargo run — a full cargo validation
+  is running elsewhere, ≤1 concurrent).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/compiler_security_flow.go,
+  pkg/config/compiler_security_alg.go, pkg/config/compiler_security_policy.go,
+  pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/fable167_advisory_test.go, userspace-dp/src/policy.rs,
+  docs/junos-cli-reference.md, docs/config-schema.md, docs/feature-gaps.md,
+  _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: fable-167 hostile-review fold (PR #4237). Corrected a
+  FACTUALLY INVERTED sync-icmp-session advisory. Re-verified against
+  source: ICMP sessions are synced to the HA peer UNCONDITIONALLY (the
+  session-sync path is protocol-agnostic — publish_shared_session
+  shared_ops.rs:875, snapshot_all_sessions_export ha.rs:630 has no
+  protocol filter, pkg/cluster wire serializes any protocol;
+  issue-history corroborates standby aging at "60s UDP/ICMP"). The knob
+  is a no-op because syncing already happens, NOT because ICMP is
+  unenforced. Reworded every copy (advisory string, schema desc,
+  FlowConfig comment, feature-gaps.md, config-schema.md) + updated the
+  test (TestFable167P3SyncICMPSessionNoOpAdvisory asserts the accurate
+  wording + guards against the inverted regression). Also tightened
+  route-change-timeout / multicast-session-lifetime schema validators to
+  the Junos 6..1800s bounds. Merged origin/master (#4228 Gap 7 CoS show,
+  no code overlap; _Log union). go test ./pkg/config/... green; build +
+  gofmt + vet clean; no cargo (no Rust change in this fold).
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/fable167_advisory_test.go, docs/config-schema.md,
+  docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: Merged origin/master (#4237 P-1/P-3/P-4) into the #4238
+  branch. UNION-resolved the sole conflict in compiler_validate_warn.go:
+  kept BOTH #4237's P-3 five-flow-knob advisories (incl. the corrected
+  sync-icmp-session no-op wording) + P-4 alg/unknown-policy-child
+  advisories AND my #4233 policy-rematch advisory (added the missing
+  closing brace to my `if cfg.Security.PolicyRematch {` block so braces
+  balance; origin's trailing `}` closes its `if len(policyUnknown) > 0`).
+  Verified both field sets survived the types_security.go auto-merge
+  (#4237's 5 FlowConfig fields RouteChangeTimeout/SyncICMPSession/
+  ForceIPReassembly/MulticastSessionLifetime/PreserveIncomingFragmentSize
+  AND my PolicyRematch/PolicyRematchExtensive). _Log.md unioned (both
+  fable-167 entries present).
+  Copilot D-1 screen-count follow-up: re-verified the EXACT count against
+  code. Both the old "11" and my "12" were wrong curated numbers. The
+  accurate, auditable count is 16 distinct dataplane-enforced checks (land,
+  syn-flood, ping-death, teardrop, winnuke, ip-sweep, port-scan, syn-fin,
+  no-flag, fin-no-ack, syn-frag, source-route-option, icmp-flood, udp-flood,
+  icmp-fragment, limit-session). Anchored to userspace-dp/src/screen/mod.rs:
+  15 carry dedicated per-reason drop counters (SCREEN_REASON_DROP_COUNT=15,
+  screen_reason_drop_index; session-limit-src/dst fold to one) + icmp-fragment
+  (check_icmp_fragment) folds to the aggregate screen_drops; SYN-cookie flood
+  protection is a separate mechanism. Set 16 CONSISTENTLY across all three
+  docs (feature-gaps.md enumerated with the code anchor, feature-coverage.md
+  x2, CLAUDE.md) — resolves the 3 Copilot comments. Other D-1 corrections
+  re-confirmed intact post-merge (NAT #3164 supersedes-#3029 callout, Rescue
+  Config Done, vsrx-gaps.md STALE banner). go build ./... + go test
+  ./pkg/config/... + gofmt + vet all green.
+- **File(s)**: pkg/config/compiler_validate_warn.go, docs/feature-gaps.md,
+  docs/feature-coverage.md, CLAUDE.md, _Log.md

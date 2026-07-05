@@ -2810,6 +2810,28 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 		if zpp == nil {
 			continue
 		}
+		// #4230 (fable-167 P-1): the reserved self-traffic zone `junos-host`
+		// on the FROM side of a zone-pair is host-ORIGINATED traffic — the
+		// firewall's own sockets egress via the kernel TX path, never the
+		// AF_XDP RX gate, so a `from-zone junos-host to-zone <z>` zone-pair
+		// commits but silently never matches. Reject it at commit for the same
+		// fail-closed parity as the GLOBAL `match from-zone junos-host` gate in
+		// the GlobalPolicies loop below (#3611 Piece A closed only the global
+		// form). policyZoneSpecialTokens exempts `junos-host` from the
+		// undefined-zone check, so without this the zone-pair spelling escaped
+		// every gate — committing clean while the dataplane never consulted it
+		// (userspace-dp/src/policy.rs evaluate_junos_host_policy). The lenient
+		// load / peer-sync path downgrades this to a warning
+		// (lenientPolicyZoneRefs, the shared #1960 no-brick doctrine) so an
+		// already-persisted or peer-synced config an older binary accepted
+		// still boots. `to-zone junos-host` (host-INBOUND) stays supported —
+		// it is consulted on the LocalDelivery gate (#3019/#3639) and is only
+		// checked by the ordinary defined() gate below.
+		if zpp.FromZone == "junos-host" {
+			return fmt.Errorf(
+				"security policy from-zone %q to-zone %q: from-zone junos-host (host-originated / locally-generated traffic) is not supported — such traffic egresses via the kernel TX path, not the AF_XDP RX gate, so the rule would commit but silently never match; remove the junos-host from-zone (#3611 Piece A, #4230)",
+				zpp.FromZone, zpp.ToZone)
+		}
 		if !defined(zpp.FromZone) {
 			return fmt.Errorf(
 				"security policy from-zone %q to-zone %q references undefined from-zone %q; define `set security zones security-zone %s` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
