@@ -1,3 +1,38 @@
+## 2026-07-04 — #4188 / #4189 / #4190 (fable-review-165 H-23 / H-25 / H-30): xpf-deploy correctness
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed three `scripts/deploy/xpf-deploy.py` correctness
+    bugs. H-23 (#4188): the libvirt `physical` backing passed the raw
+    netdev NAME (e.g. `enp8s0`) to `virt-install --hostdev`, which needs
+    a PCI/USB address — the domain fails to define / mis-attaches. Now
+    the netdev is resolved to its PCI BDF via the existing `pci_of()`
+    helper (a raw PCI address under `physical:` is accepted too, and an
+    unresolvable name dies with a clear message); incus is unchanged
+    (`nictype=physical parent=<dev>` correctly takes the netdev name).
+    H-25 (#4189): the fetch anti-rollback watermark compared git-describe
+    suffixes as whole strings, so `1.2.3-10-gabc` ranked OLDER than
+    `1.2.3-9-gdef` and `rc10` below `rc9` — false "possible rollback"
+    refusals. `_ver_key` is now module-level and numeric-splits the
+    suffix (`_suffix_key`, int/text-tagged so no mixed compare raises)
+    while keeping the rc < release < post-release category rank. H-30
+    (#4190): `fetch` left the verified qcow2 at `<out>/xpf-<ver>.qcow2`
+    but `deploy --hypervisor libvirt` reads the golden at
+    `/var/lib/libvirt/images/<image>.qcow2` — nothing bridged the gap.
+    Added `libvirt_golden_path()` as the shared SSOT used by BOTH
+    `libvirt_disk` (deploy) and a new `fetch --install-libvirt` (which
+    installs the verified qcow2 there via `_install_libvirt_golden`,
+    falling back to `sudo install` for the root-owned images dir); the
+    `--qcow2-only` hint now prints the exact install command.
+  - **File(s)**: `scripts/deploy/xpf-deploy.py`,
+    `scripts/deploy/test_xpf_deploy_correctness.py` (new — 12 RED-on-revert
+    tests), `examples/deploy/README.md`, `docs/distribution.md`,
+    `docs/install-images.md`, `_Log.md`.
+  - **Validation**: `python3 -m py_compile`; full `scripts/deploy`
+    unittest suite 27/27 (12 new + 15 existing); RED-on-revert proven for
+    each finding (H-23 physical→PCI resolution fails when the netdev name
+    is passed; H-25 rc10/count-10 ordering inverts on whole-string
+    compare; H-30 shared golden helper removed → agreement test fails).
+
 ## 2026-07-04 — #4178 / #4179 (fable-review-165 H-7 / H-10): interface-naming daemon bugs
 
 - **Timestamp**: 2026-07-04
