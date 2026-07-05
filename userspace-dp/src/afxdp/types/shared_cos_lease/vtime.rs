@@ -191,4 +191,39 @@ impl SharedCoSQueueVtimeFloor {
             (participating, Some(v_min))
         }
     }
+
+    /// #4254 (R-7) — peer virtual-time **frontier** for seeding a
+    /// (re)joining worker's fresh `queue_vtime`. Returns the MAX
+    /// committed vtime across participating peers (excluding
+    /// `worker_id`'s own slot), or `None` if no peer participates.
+    ///
+    /// `queue_vtime` is cumulative served-bytes with no shared epoch, so
+    /// a worker whose runtime was just rebuilt (config commit / XDP
+    /// rebind / per-binding reset) restarts at 0 on a baseline that no
+    /// longer matches its surviving peers. Publishing that near-zero
+    /// value pins the cross-worker V_min to ~0 and traps every survivor
+    /// in the throttle → hard-cap → suspend duty cycle. Seeding the
+    /// rejoiner to this frontier re-anchors it on the survivors'
+    /// baseline before its first publish.
+    ///
+    /// Why MAX (not the participating V_min): the frontier is the
+    /// do-no-harm seed — a rejoiner placed at the max can never become a
+    /// NEW cross-worker V_min below any existing peer, so it does not
+    /// alter the survivors' throttle decisions at the join instant, and
+    /// it still defers to a genuine laggard (whose real, lower slot
+    /// remains the V_min everyone obeys). Same Acquire-load,
+    /// non-atomic-across-slots contract as `participating_v_min_snapshot`.
+    #[inline]
+    pub(in crate::afxdp) fn peer_frontier_vtime(&self, worker_id: u32) -> Option<u64> {
+        let mut frontier: Option<u64> = None;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if idx == worker_id as usize {
+                continue;
+            }
+            if let Some(peer) = slot.read() {
+                frontier = Some(frontier.map_or(peer, |f| f.max(peer)));
+            }
+        }
+        frontier
+    }
 }

@@ -526,7 +526,42 @@ fn promote_cos_queue_flow_fair(
         // #1755: new_boxed builds the ~352 KB FlowFairState directly into
         // the heap, so the giant struct never lands on this build-time
         // frame.
-        Some(FlowFairState::new_boxed(cos_flow_hash_seed_from_os()))
+        let mut ff = FlowFairState::new_boxed(cos_flow_hash_seed_from_os());
+        // #4254 (R-7): seed a (re)joining shared_exact worker's virtual
+        // clock to the current cross-worker peer frontier. This is the
+        // sole reconstruction site for a shared_exact FlowFairState
+        // (exact queues never demote — queue_ops/mod.rs
+        // `maybe_demote_drained_best_effort`), so it is reached on every
+        // runtime rebuild — config commit, XDP rebind, per-binding
+        // `reset_binding_cos_runtime` — via
+        // `ensure_cos_interface_runtime_cold`. Without this, the fresh
+        // queue_vtime starts at 0 and the worker's first post-settle
+        // publish broadcasts a near-zero vtime into the shared V_min
+        // floor. `queue_vtime` is cumulative served-bytes with no shared
+        // epoch, so a surviving peer terabytes ahead then fails the
+        // absolute-vtime gate (v_min.rs `cos_queue_v_min_continue`) every
+        // batch, burns the hard-cap, and arms 1000 suspended drains — the
+        // fairness brake pinned OFF ~99% of the rejoiner's re-warmup.
+        //
+        // Seeding to the MAX participating peer slot (the frontier) is
+        // the do-no-harm choice: the rejoiner can never become a NEW
+        // V_min below an existing peer (survivors' throttle decisions are
+        // unchanged at the join instant) yet still defers to a genuine
+        // laggard, whose real lower slot remains the V_min everyone
+        // obeys. A genuine laggard never reaches this construction site
+        // (its FlowFairState is not being rebuilt), so it is never
+        // reseeded — this distinguishes "rejoining at 0" (reseed) from
+        // "legitimately behind" (leave alone). Cold start / full
+        // simultaneous reset → no participating peer → frontier None →
+        // keep 0 (unchanged). `vtime_floor` is Some only on shared_exact
+        // queues (set from the fast path above), so non-shared exact
+        // queues keep the plain 0 seed.
+        if let Some(floor) = queue.v_min.vtime_floor.as_ref() {
+            if let Some(frontier) = floor.peer_frontier_vtime(worker_id) {
+                ff.queue_vtime = frontier;
+            }
+        }
+        Some(ff)
     } else {
         None
     };
