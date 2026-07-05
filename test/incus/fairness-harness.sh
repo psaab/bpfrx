@@ -224,8 +224,13 @@ if [[ "$MIXED_COS" -eq 1 ]]; then
     fi
 else
     if [[ -z "$SHAPER_RATE_BPS" ]]; then
+        # Mirror the mixed-cos branch: a port with no canonical shaper rate
+        # is a misconfiguration, NOT a 25G-capped class. Silently defaulting
+        # to 25G masked a bad PORT as a pass against the largest cap; fail
+        # hard instead and require an explicit rate (#4241 V-11).
         if ! SHAPER_RATE_BPS=$(canonical_shaper_rate_for_port "$PORT"); then
-            SHAPER_RATE_BPS=25000000000
+            echo "fairness-harness: cannot infer SHAPER_RATE_BPS for PORT=$PORT; set SHAPER_RATE_BPS explicitly" >&2
+            exit 2
         fi
     fi
 fi

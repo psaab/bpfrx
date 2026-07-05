@@ -33,8 +33,10 @@ echo "#1630 Gate1 small-four-alone: dir=$DIRECTION af=$AF target=$TARGET dur=${D
 declare -a PIDS=()
 for port in "${PORTS[@]}"; do
   (
+    rc=0
     sg incus-admin -c "incus exec $HOST -- iperf3 -c $TARGET -P $STREAMS -t $DURATION -p $port $REV_FLAG --json" \
-      > "$ART/g1_${port}.json" 2>"$ART/g1_${port}.err" || true
+      > "$ART/g1_${port}.json" 2>"$ART/g1_${port}.err" || rc=$?
+    echo "$rc" > "$ART/g1_${port}.rc"
   ) &
   PIDS+=($!)
 done
@@ -49,6 +51,18 @@ shape = {5201: 0.1, 5202: 1.0, 5203: 3.0, 5204: 6.0}
 rows = []
 all_pass = True
 for p in ports:
+    # Generator health: a crashed or unlaunched iperf3 sender leaves a
+    # nonzero (or missing) .rc sidecar. Treat it as a hard failure — do
+    # not read a stale/partial JSON as a pass (#4240 V-2).
+    rcf = os.path.join(art, f"g1_{p}.rc")
+    try:
+        rc = int(open(rcf).read().strip())
+    except Exception:
+        rc = 1  # missing/unreadable .rc == generator never completed
+    if rc != 0:
+        rows.append((p, names[p], shape[p], None, None, f"ERR generator rc={rc}"))
+        all_pass = False
+        continue
     f = os.path.join(art, f"g1_{p}.json")
     try:
         d = json.load(open(f))
@@ -71,4 +85,10 @@ for p, n, sh, recv, pct, v in rows:
     else:
         print(f"{p:<6}{n:<14}{sh:>6.2f}G {recv:>7.2f}G {pct:>7.1f}%  {v}")
 print(f"\nGATE1 {'PASS' if all_pass else 'FAIL'} (all four >= 95% of shape)")
+# Propagate the verdict as the process exit status. Under `set -euo
+# pipefail` this heredoc is the last command, so a nonzero exit here
+# becomes the script's exit status. A JSON parse error or a nonzero
+# generator rc already flips all_pass, so malformed/missing output
+# correctly yields exit 1 (#4240 V-2).
+sys.exit(0 if all_pass else 1)
 PYEOF

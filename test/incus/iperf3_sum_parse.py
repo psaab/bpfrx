@@ -9,6 +9,15 @@ Final summary lines look like:
 
 Per-stream lines start with `[N]` where N is a digit; they must NOT
 match. Anchored regex on `[SUM]` only.
+
+CAUTION (hb166 V-12): the regex is NOT anchored at end-of-line, so BOTH
+the final-summary rows above AND warmup `(omitted)` rows —
+    [SUM]   0.00-1.00   sec  1.00 GBytes  8.59 Gbits/sec  ...  (omitted)
+— match `parse_sum_line`. Current callers pass runs without `-O`, so no
+omitted rows exist, and they explicitly drop the trailing final-summary
+rows. A future caller that scrapes a run started with `-O` (omit N
+warmup seconds) MUST filter the leading omitted rows itself; this parser
+returns them as ordinary per-second rows.
 """
 
 import re

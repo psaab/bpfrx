@@ -52,6 +52,26 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 			}
 			continue
 		}
+		// #4233: `security policies policy-rematch [extensive]`. In Junos this
+		// re-evaluates in-progress sessions against the changed policy set on
+		// commit (and, WITHOUT the knob, Junos still drops the sessions of a
+		// DELETED policy). xpf performs no session invalidation on commit yet
+		// (enforcement tracked as #4234), so the knob is recorded here only so
+		// it is no longer silently dropped, and ValidateConfig emits an
+		// accepted-only advisory. `extensive` may arrive as a flat trailing
+		// key (Keys=["policy-rematch","extensive"]) or a hierarchical child.
+		if child.Name() == "policy-rematch" {
+			sec.PolicyRematch = true
+			if len(child.Keys) >= 2 && child.Keys[1] == "extensive" {
+				sec.PolicyRematchExtensive = true
+			}
+			for _, sub := range child.Children {
+				if sub.Name() == "extensive" {
+					sec.PolicyRematchExtensive = true
+				}
+			}
+			continue
+		}
 		// "global { policy ... }" - global policies applied to all zone pairs
 		if child.Name() == "global" {
 			for _, polInst := range namedInstances(child.FindChildren("policy")) {
@@ -324,6 +344,21 @@ func compilePolicy(polInst struct {
 	}
 	if snNode := polInst.node.FindChild("scheduler-name"); snNode != nil {
 		pol.SchedulerName = nodeVal(snNode)
+	}
+
+	// #4232 (fable-167 P-4b): record any DIRECT child of `policy <name>` whose
+	// keyword the compiler does not read. match/then/description/scheduler-name
+	// are the recognized leaves; anything else (a typo like `descripton`, or an
+	// unimplemented policy option) was silently dropped. Recording it lets the
+	// compiler emit an accepted-but-inert / probable-typo advisory. Iterate in
+	// config order for a deterministic warning.
+	for _, child := range polInst.node.Children {
+		switch child.Name() {
+		case "match", "then", "description", "scheduler-name":
+			// recognized above
+		default:
+			pol.UnknownChildren = append(pol.UnknownChildren, child.Name())
+		}
 	}
 
 	return pol

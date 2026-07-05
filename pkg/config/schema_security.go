@@ -220,6 +220,16 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// container whose bracket tail mis-nested session-close under session-init
 		// and dropped it — losing the most security-relevant fallback-path audit.
 		"default-policy-log": sessionLogModeLeaf("RT_FLOW session logging for the implicit default-policy verdict"),
+		// #4233: `policy-rematch [extensive]` re-evaluates in-progress
+		// sessions against the changed policy set on commit in Junos. xpf
+		// records the knob (compiler_security_policy.go) but does not yet
+		// enforce it — commit emits an accepted-only advisory
+		// (compiler_validate_warn.go), and enforcement is tracked as #4234.
+		// Modeled so the leaf gains structural/`?` completion and the
+		// optional `extensive` sub-token is grouped rather than mis-parsed.
+		"policy-rematch": {desc: "Re-evaluate in-progress sessions on policy change (accepted-only; unenforced)", children: map[string]*schemaNode{
+			"extensive": {desc: "Also re-evaluate sessions matched by an unchanged policy when referenced objects change", children: nil},
+		}},
 		"from-zone": {desc: "From zone", args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
 				"description": {desc: "Policy description", args: 1, scalar: true, placeholder: "<text>", children: nil},
@@ -687,6 +697,24 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		"allow-embedded-icmp":          {desc: "Allow ICMP error packets for existing sessions", children: nil},
 		"gre-performance-acceleration": {desc: "Enable GRE performance acceleration", children: nil},
 		"power-mode-disable":           {desc: "Disable power mode", children: nil},
+		// #4231 (fable-167 P-3): five `security flow` knobs previously had no
+		// schema leaf and no compiler case, so they committed clean and did
+		// nothing with zero operator signal. Typing them here makes them
+		// first-class (completion + value validation); compileFlow records
+		// their presence and compiler_validate_warn.go emits an accepted-only
+		// advisory (the #2078 tcp-session doctrine) because the userspace
+		// AF_XDP dataplane does not enforce any of them yet. The two duration
+		// leaves are bounded seconds (0 = unset); the three toggles are
+		// presence-only.
+		// Junos bounds: route-change-timeout / multicast-session-lifetime are
+		// 6..1800 seconds. Match them so an out-of-range value is rejected at
+		// commit (as Junos does) instead of accepted into a no-op knob.
+		"route-change-timeout": {desc: "Timeout after a route change before flushing affected sessions (accepted-only)", args: 1, placeholder: "<seconds>",
+			valueType: ValueInteger, valueDesc: "Seconds (6..1800)", valueExamples: []string{"30"}, validator: ValidateInteger(6, 1800), children: nil},
+		"sync-icmp-session":               {desc: "Sync ICMP sessions to the HA peer (no-op — xpf already syncs ICMP sessions unconditionally)", children: nil},
+		"force-ip-reassembly":             {desc: "Force IP fragment reassembly before forwarding (accepted-only)", children: nil},
+		"multicast-session-lifetime":      {desc: "Multicast session lifetime in seconds (accepted-only)", args: 1, placeholder: "<seconds>", valueType: ValueInteger, valueDesc: "Seconds (6..1800)", valueExamples: []string{"30"}, validator: ValidateInteger(6, 1800), children: nil},
+		"preserve-incoming-fragment-size": {desc: "Preserve incoming fragment size when forwarding (accepted-only)", children: nil},
 		"traceoptions": {desc: "Flow trace debugging options", children: map[string]*schemaNode{
 			"file": {desc: "Trace file name (with size/files options)", args: 1, placeholder: "<filename>", children: nil},
 			// #3984: repeated keyed-list leaf — the compiler accumulates

@@ -37,6 +37,67 @@
     build test), pkg/config/compiler_validate_warn.go
     (classOfServiceClassifierQueueWarnings), pkg/config/schema_cos_hb166_test.go
     (T-4 warn tests), docs/cos-traffic-shaping.md, docs/config-schema.md.
+## 2026-07-04 — hb166 V-12: minor CoS harness cleanups
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-12 grouped minor notes. (1) Deleted dead
+  _last_n_sum_bps from mouse_latency_orchestrate.py (no callers). (2)
+  Documented in iperf3_sum_parse.py that the non-end-anchored [SUM] regex
+  also matches warmup (omitted) rows — current callers safe (no -O), a
+  future -O consumer must filter them. (3) Added a comment at the
+  fairness_equal_flow_capture.py fail-closed raise explaining the
+  deliberate posture (one bad scrape fails the reduction; kept, not
+  loosened). (4) Documented the fairness-cos-class-sweep.sh scrape-cadence
+  drift (serial max-time-1 curl + sleep 1 → ~2s under load) and noted ts
+  is captured at scrape START so windowing stays correct. Closes #4249.
+- **File(s)**: test/incus/mouse_latency_orchestrate.py,
+  test/incus/iperf3_sum_parse.py, test/incus/fairness_equal_flow_capture.py,
+  test/incus/fairness-cos-class-sweep.sh, _Log.md
+
+## 2026-07-04 — hb166 V-8: surplus give-back handback series cross-checks
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-8 — fairness_surplus_giveback_validate.py accepted the
+  first list-order sample matching the post-handback thresholds with no
+  monotonic-t_sec check, no pre-handback baseline, and no density
+  requirement, so a one-element artifact with a single settled snapshot
+  trivially passed the <=5s handback gate on a self-attested t_sec.
+  Hardened _handback_from_samples to require >=min_handback_samples
+  (default 2), strictly increasing t_sec, consecutive gaps within
+  max_handback_sample_gap_sec (default 5s), and a pre-handback baseline
+  before the first post-handback sample; the handback time is derived as
+  the first post-handback sample following a pre-handback one. Added CLI
+  flags --min-handback-samples / --max-handback-sample-gap-sec and 4 unit
+  tests (single-sample, non-monotonic, no-pre-baseline, too-sparse).
+  Documented that timestamps remain generator-supplied (the ordered-series
+  is the auditability bound in a reduced artifact) and that NO live runner
+  produces phases.json yet — the validator is a MANUAL gate until a live
+  reducer is built (deferred half of V-8). Updated docs/fairness-regimes.md
+  and the validator docstring. Closes #4248.
+- **File(s)**: test/incus/fairness_surplus_giveback_validate.py,
+  test/incus/fairness_surplus_giveback_validate_test.py,
+  docs/fairness-regimes.md, _Log.md
+
+## 2026-07-04 — hb166 V-10: align smoke CoV to the Rust fairness SSOT
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-10 — the simul-load smoke reducer computed CoV with
+  the SAMPLE stddev (statistics.stdev, N-1) AND filtered zero-bps streams,
+  so its printed CoV could not reproduce a fairness-eval verdict and a
+  fully starved class printed CoV 0 (the "perfectly fair" value). Extracted
+  the population-CoV estimator into test/incus/fairness_cov.py as the single
+  Python mirror of userspace-dp/src/fairness.rs::compute_observed_cov
+  (population stddev over the full vector including zeros, 0.0 for
+  empty/zero-mean). Imported it into cos-simul-load-smoke.sh, stopped
+  filtering zero-bps flows, relabelled the printed column wrCoV% (whole-run)
+  with a legend + verdict provenance field. Added fairness_cov_test.py
+  pinning population_cov to the exact fairness.rs unit-test values (0.5
+  skewed, 0.0 balanced/empty/zero-mean) plus a starved-flow-not-filtered
+  assertion (RED-on-revert: sample stddev gives 0.5774; zero-filter gives
+  0.0). Documented the CoV semantics in docs/fairness-regimes.md. Closes
+  #4247.
+- **File(s)**: test/incus/fairness_cov.py, test/incus/fairness_cov_test.py,
+  test/incus/cos-simul-load-smoke.sh, docs/fairness-regimes.md, _Log.md
 
 ## 2026-07-04 — #4228 Gap 7: vSRX CoS show commands
 
@@ -34513,3 +34574,161 @@ top.
   both kept), unioned _Log.md + cos-traffic-shaping.md.
 - **File(s)**: pkg/dataplane/userspace/fairness.go,
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-167 P-2 / P-5 / D-1. P-2 (policy-rematch):
+  `security policies policy-rematch [extensive]` committed clean and was
+  silently dropped (absent from setSchema + compilePolicies). Added the
+  accepted-with-advisory wiring (mirrors #2078 tcp-session / #2008 H13):
+  schema leaf under `security policies`, SecurityConfig.PolicyRematch /
+  PolicyRematchExtensive recorded in compilePolicies (flat + hierarchical
+  shapes), and a commit-time accepted-only advisory in ValidateConfig
+  stating xpf does not yet re-evaluate/invalidate in-progress sessions on
+  a policy change. Filed #4233 (advisory, closed by PR) + #4234
+  (session-invalidation-on-commit enhancement, STAYS OPEN with a converged
+  plan). Verdict on the deeper session-invalidation: DRIVEABLE for the
+  bounded deletion-clear core (diff pre/post policies -> stable-id delta ->
+  clear sessions whose #3056 policy_id matches, reusing the ClearSessions
+  filtered-clear path + #2468 reverse/companion/HA propagation) but the
+  modified-policy re-eval half NEEDS-RESEARCH (which changes trigger,
+  commit-time full-sweep cost, extensive semantics) -> filed as #4234 for a
+  follow-up /engineer, too big for this PR. RED-on-revert verified (removing
+  the compiler case drops the knob + no advisory). P-5: added policy-based
+  IPsec VPN gap row to feature-gaps.md §15 — verified rejected at commit via
+  #3114 (compiler_policy_then.go validatePolicyThenPermitStrict, empty
+  supportedPolicyThenPermitChildren); only route-based st0/XFRM VPN exists.
+  D-1: corrected the parity docs against code reality — vsrx-gaps.md got a
+  hard STALE banner enumerating now-shipped sections (verified DHCPv6 PD,
+  apply-groups, BFD; sole parse-only survivor = license autoupdate url);
+  feature-gaps.md NAT #3029 callout rewritten for #3164 LPM DNAT (reject
+  removed); screen count reconciled UP to 12 (accurate enumerated set) in
+  feature-gaps.md/feature-coverage.md/CLAUDE.md; Rescue Configuration row
+  Missing -> Done (SaveRescueConfig, store_persist.go); total-drift note +
+  VPN/TOTAL rows updated for the added gap row. go build ./... + gofmt +
+  go vet clean; full pkg/config suite green.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_policy.go, pkg/config/schema_security.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/policy_rematch_advisory_test.go, docs/feature-gaps.md,
+  docs/vsrx-gaps.md, docs/feature-coverage.md, CLAUDE.md, _Log.md
+- **Action**: fable-review-167 P-1/P-3/P-4 (issues #4230/#4231/#4232).
+  P-1: reject the zone-pair `from-zone junos-host to-zone <z>` policy at
+  strict commit (host-ORIGINATED traffic egresses via the kernel TX path,
+  never the AF_XDP RX gate, so it committed clean and was silently inert;
+  policyZoneSpecialTokens exempted junos-host from the undefined-zone check).
+  New arm in validatePolicyZoneReferencesStrict mirrors the existing GLOBAL
+  `match from-zone junos-host` gate (#3611 Piece A) and gets the same #1960
+  lenient-load downgrade (warn, not brick). `to-zone junos-host`
+  (host-INBOUND, #3019/#3639) stays supported. Corrected the false "rejected
+  at commit" claims in userspace-dp/src/policy.rs (evaluate_junos_host_policy
+  doc comment) and docs/junos-cli-reference.md — both now state BOTH forms
+  are rejected at STRICT commit (global since #3611 Piece A, zone-pair since
+  #4230). Host-TX-path wiring is a deferred follow-up.
+  P-3: five accepted-only `security flow` knobs (route-change-timeout,
+  sync-icmp-session, force-ip-reassembly, multicast-session-lifetime,
+  preserve-incoming-fragment-size) now typed in setSchema + recorded by
+  compileFlow + emit an accepted-only commit advisory (the #2078
+  tcp-session doctrine). sync-icmp-session gets a stronger HA-specific
+  advisory (ICMP sessions do NOT sync to the peer / survive failover).
+  P-4: accepted-but-inert advisories for unimplemented `security alg <proto>`
+  stanzas (ALGConfig.UnsupportedProtos) and unrecognized direct `policy
+  <name>` children (Policy.UnknownChildren) — both were silently dropped.
+  RED-on-revert tests in pkg/config/fable167_advisory_test.go. go test
+  ./pkg/config/... green; go build ./... green; gofmt/vet clean on touched
+  files. Rust change is comment-only (no cargo run — a full cargo validation
+  is running elsewhere, ≤1 concurrent).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/compiler_security_flow.go,
+  pkg/config/compiler_security_alg.go, pkg/config/compiler_security_policy.go,
+  pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/fable167_advisory_test.go, userspace-dp/src/policy.rs,
+  docs/junos-cli-reference.md, docs/config-schema.md, docs/feature-gaps.md,
+  _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: fable-167 hostile-review fold (PR #4237). Corrected a
+  FACTUALLY INVERTED sync-icmp-session advisory. Re-verified against
+  source: ICMP sessions are synced to the HA peer UNCONDITIONALLY (the
+  session-sync path is protocol-agnostic — publish_shared_session
+  shared_ops.rs:875, snapshot_all_sessions_export ha.rs:630 has no
+  protocol filter, pkg/cluster wire serializes any protocol;
+  issue-history corroborates standby aging at "60s UDP/ICMP"). The knob
+  is a no-op because syncing already happens, NOT because ICMP is
+  unenforced. Reworded every copy (advisory string, schema desc,
+  FlowConfig comment, feature-gaps.md, config-schema.md) + updated the
+  test (TestFable167P3SyncICMPSessionNoOpAdvisory asserts the accurate
+  wording + guards against the inverted regression). Also tightened
+  route-change-timeout / multicast-session-lifetime schema validators to
+  the Junos 6..1800s bounds. Merged origin/master (#4228 Gap 7 CoS show,
+  no code overlap; _Log union). go test ./pkg/config/... green; build +
+  gofmt + vet clean; no cargo (no Rust change in this fold).
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/fable167_advisory_test.go, docs/config-schema.md,
+  docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: Merged origin/master (#4237 P-1/P-3/P-4) into the #4238
+  branch. UNION-resolved the sole conflict in compiler_validate_warn.go:
+  kept BOTH #4237's P-3 five-flow-knob advisories (incl. the corrected
+  sync-icmp-session no-op wording) + P-4 alg/unknown-policy-child
+  advisories AND my #4233 policy-rematch advisory (added the missing
+  closing brace to my `if cfg.Security.PolicyRematch {` block so braces
+  balance; origin's trailing `}` closes its `if len(policyUnknown) > 0`).
+  Verified both field sets survived the types_security.go auto-merge
+  (#4237's 5 FlowConfig fields RouteChangeTimeout/SyncICMPSession/
+  ForceIPReassembly/MulticastSessionLifetime/PreserveIncomingFragmentSize
+  AND my PolicyRematch/PolicyRematchExtensive). _Log.md unioned (both
+  fable-167 entries present).
+  Copilot D-1 screen-count follow-up: re-verified the EXACT count against
+  code. Both the old "11" and my "12" were wrong curated numbers. The
+  accurate, auditable count is 16 distinct dataplane-enforced checks (land,
+  syn-flood, ping-death, teardrop, winnuke, ip-sweep, port-scan, syn-fin,
+  no-flag, fin-no-ack, syn-frag, source-route-option, icmp-flood, udp-flood,
+  icmp-fragment, limit-session). Anchored to userspace-dp/src/screen/mod.rs:
+  15 carry dedicated per-reason drop counters (SCREEN_REASON_DROP_COUNT=15,
+  screen_reason_drop_index; session-limit-src/dst fold to one) + icmp-fragment
+  (check_icmp_fragment) folds to the aggregate screen_drops; SYN-cookie flood
+  protection is a separate mechanism. Set 16 CONSISTENTLY across all three
+  docs (feature-gaps.md enumerated with the code anchor, feature-coverage.md
+  x2, CLAUDE.md) — resolves the 3 Copilot comments. Other D-1 corrections
+  re-confirmed intact post-merge (NAT #3164 supersedes-#3029 callout, Rescue
+  Config Done, vsrx-gaps.md STALE banner). go build ./... + go test
+  ./pkg/config/... + gofmt + vet all green.
+- **File(s)**: pkg/config/compiler_validate_warn.go, docs/feature-gaps.md,
+  docs/feature-coverage.md, CLAUDE.md, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-1 — wire cos-simul-load-smoke.sh reducer to exit
+  nonzero on gate failure (was always exit 0 = false-green). Added a
+  heterogeneous-gate `_ok` extractor + `sys.exit`, an all-error length
+  guard on gate_1, a gate_0 generator-health check, and replaced the
+  `|| true` iperf launchers with per-port .rc capture. Closes #4239.
+- **File(s)**: test/incus/cos-simul-load-smoke.sh, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-2 — wire cos-gate1-small-four-alone.sh reducer to
+  exit nonzero on GATE1 FAIL (was always exit 0). Added sys.exit(0 if
+  all_pass else 1), per-port .rc generator-health capture, replaced
+  `|| true` launchers. Closes #4240.
+- **File(s)**: test/incus/cos-gate1-small-four-alone.sh, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-11 — fairness-harness.sh single mode now fails hard
+  (exit 2) on a port with no canonical shaper rate, mirroring the
+  mixed-cos branch, instead of silently defaulting SHAPER_RATE_BPS=25G
+  (which masked a misconfigured port as a 25G-cap pass). Documented the
+  new harness exit-code contract in docs/fairness-regimes.md. Closes #4241.
+- **File(s)**: test/incus/fairness-harness.sh, docs/fairness-regimes.md,
+  _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-1 Copilot fold (PR #4242) — close the gate_0
+  row-readability hole. gate_0 previously checked only the per-port .rc
+  EXIT CODE, so an iperf3 run that exits 0 yet emits an {"error": ...} or
+  truncated JSON payload passed gate_0; if no throughput floor read that
+  class (a mid-class parse error), the whole harness still exited 0.
+  Extended the existing parse loop to tag each row with gen_error
+  (iperf-error / truncated — using bits_per_second key MEMBERSHIP so a
+  genuinely 0-Gbps but complete row is NOT flagged), and gate_0 now fails
+  on nonzero/missing rc OR unparseable/iperf-error/truncated row. Reused
+  the existing per-port parse (no duplicate parse logic). RED-on-revert:
+  the rc-only gate_0 passes both garbage inputs. Closes the Copilot gap.
+- **File(s)**: test/incus/cos-simul-load-smoke.sh, docs/fairness-regimes.md,
+  _Log.md

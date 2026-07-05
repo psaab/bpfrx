@@ -31,7 +31,7 @@ Last updated: 2026-05-24
 | Security Logging Enhancements | 0 | 0 | 0 | 0 |
 | PKI / Certificates | 3 | 1 | 0 | 4 |
 | Routing Enhancements | 10 | 3 | 0 | 13 |
-| VPN Enhancements | 9 | 0 | 0 | 9 |
+| VPN Enhancements | 10 | 0 | 0 | 10 |
 | HA Enhancements | 0 | 2 | 0 | 2 |
 | Firewall Filter Enhancements | 2 | 1 | 0 | 3 |
 | QoS / Class of Service | 2 | 4 | 0 | 6 |
@@ -40,7 +40,14 @@ Last updated: 2026-05-24
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **119** | **19** | **0** | **138** |
+| **TOTAL** | **120** | **19** | **0** | **139** |
+
+> The per-section counts and grand total above are a hand-maintained
+> summary and drift by ±1 against a strict machine row-parse of
+> `docs/authoritative-backlog.md` (a known maintenance artifact, not a
+> missing feature). Treat the individual section tables below and
+> `docs/feature-coverage.md` as authoritative for any specific feature's
+> status; the totals are an at-a-glance scale indicator only.
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -179,20 +186,31 @@ User-based policy enforcement integrating with directory services. Not implement
 
 xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, destination-address-name match (#3229), protocol-only match, port rewriting, multi-port matching, destination-nat off exemption (#3844)), static 1:1 (host AND block-to-block subnet mappings, #3031), NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
-> **DNAT `match destination-address` is exact-host only (#3029).** The
-> userspace `DnatTable` keys on an exact destination `IpAddr` (no prefix /
-> LPM match), so a destination-NAT rule whose `match destination-address` is
-> a multi-host prefix (e.g. `198.51.100.0/24`) cannot be honored — the
-> snapshot builder would strip the mask and translate only the network
-> address, silently bypassing every other host in the block. Such a rule is
-> **hard-rejected at commit** (`validateDestinationNATAddressesStrict`),
-> downgraded to a warning on the tolerant load / peer-sync path (#1960
-> no-brick). Single-host destinations (a bare IP, an explicit `/32`, or
-> `/128`) are accepted unchanged. Block-to-block destination NAT (the Junos
-> 1:1-offset / many:one block-mapping semantics) is a separate dataplane
-> feature — see #3029. This is the DNAT-table limitation only; the
-> **static-NAT** sibling block mapping (`static-nat prefix <subnet>`, 1:1
-> by offset) is now **supported** (#3031): an equal-length source/
+> **DNAT `match destination-address` now honors a multi-host prefix
+> (#3164 — supersedes the #3029 exact-host limitation).** The userspace
+> `DnatTable` installs a longest-prefix-match entry, so a destination-NAT
+> rule whose `match destination-address` is a non-host CIDR (e.g.
+> `198.51.100.0/24`) translates EVERY host in the block to the rule's pool
+> (many:1). The Go builder carries the canonical prefix on the additive
+> `destination_prefix` wire field; overlapping prefixes resolve by longest
+> match, and an exact-host entry (the longest possible prefix) always wins
+> over a covering block via the O(1) exact-host fast path. The
+> `docs/feature-coverage.md` §"Destination NAT" row is the current truth.
+> Single-host destinations (a bare IP, `/32`, or `/128`), bracket lists of
+> hosts (#2395, one table entry per host), and non-host prefixes (#3164)
+> are all accepted. The #3029 commit-time reject of a multi-host prefix
+> destination (`validateDestinationNATAddressesStrict`, which existed as a
+> fail-closed guard against the old silent-narrowing) has been **removed**
+> now that the prefix is honored. Whole-block local-address registration
+> (proxy-ARP/ND) is bounded: a block at or below 4096 usable hosts (a v4
+> /20 or longer) is expanded host-by-host; a larger block registers only
+> its network base and must be ROUTED to the firewall (the DNAT match
+> itself is independent of this set). Block-mapping semantics (a 1:1
+> host-N -> host-N offset map) remain out of scope for DNAT; the many:1
+> prefix translation above is what is implemented.
+>
+> The **static-NAT** sibling block mapping (`static-nat prefix <subnet>`,
+> 1:1 by offset) is **supported** (#3031): an equal-length source/
 > destination prefix pair installs an offset-preserving `StaticNatTable`
 > block rule (forward DNAT + reverse SNAT, host bits preserved), and the
 > commit gate accepts the valid equal-length pair while still rejecting
@@ -201,10 +219,9 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 > `then static-nat mapped-port` (per-port translation is a host-scope
 > construct on a `/32`; `StaticNatBlock` has no port fields and would
 > silently widen "port 80 of this /24 -> 8080" into an all-port /24 NAT).
-> The commit gate now REJECTS a block pair that also specifies a port,
-> and the dataplane lenient-load path drops it rather than mis-installing
-> an all-port block (#3202). Honoring a DNAT destination prefix still
-> needs a prefix-match table plus confirmed Junos block-mapping semantics.
+> The commit gate REJECTS a block pair that also specifies a port, and the
+> dataplane lenient-load path drops it rather than mis-installing an
+> all-port block (#3202).
 
 > **NAT64 inbound policy now matches the real internal IPv4 host (#2358,
 > resolved).** For inbound NAT64 flows the security policy is evaluated
@@ -242,7 +259,20 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 
 ## 9. Screen/IDS Enhancements
 
-xpf implements 12 screen checks (land, syn-flood, ping-death, icmp-fragment, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack) plus per-IP session limiting. These are additional vSRX screen options.
+xpf implements 16 distinct screen checks, each mapping to real dataplane
+enforcement (not a parsed-but-inert leaf): **land, syn-flood, ping-death,
+teardrop, winnuke, ip-sweep, port-scan, syn-fin, no-flag (tcp-no-flag),
+fin-no-ack, syn-frag, source-route-option (ip-source-route), icmp-flood,
+udp-flood, icmp-fragment, and limit-session** (per-source / per-destination
+session limiting). This count is auditable against
+`userspace-dp/src/screen/mod.rs`: 15 of these carry a dedicated per-reason
+drop counter — `screen_reason_drop_index` maps exactly `SCREEN_REASON_DROP_COUNT
+= 15` ordinals, with `session-limit-src` / `session-limit-dst` folding onto one
+`session-limit` ordinal — and the 16th, icmp-fragment, is enforced by
+`stateless::check_icmp_fragment` and folds to the aggregate `screen_drops`
+counter. SYN-cookie flood protection (`security flow syn-flood-protection-mode
+syn-cookie`) is a separate stateless mechanism, not one of the 16. These are
+additional vSRX screen options.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -298,12 +328,12 @@ was dead config.
 | **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | **Config-only (#2078)** — the legacy BPF `flow_config` `tcp_flags` bit (`2114333`) was retired with the eBPF dataplane (#1373/#1476). The userspace dataplane does not enforce syn-check, so this opt-out is inert. Accepted-but-not-enforced; commit emits an advisory. Intentional parity gap (see #2008 M9). |
 | **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | **Config-only (#2078)** — the legacy per-interface `IFACE_FLAG_TUNNEL`/`META_FLAG_TUNNEL` path (`2114333`) was eBPF; retired with the dataplane (#1373/#1476). No tunnel-decap session-create signal exists on the userspace path, so the knob is inert. Accepted-but-not-enforced; commit emits an advisory. |
 | **TCP RST Invalidate Session** | `security flow tcp-session rst-invalidate-session` | Immediately invalidate session on TCP RST instead of waiting for timeout | Medium | **Config-only (#2078)** — the legacy eBPF teardown (`2114333`, timeout=0/last_seen=0 on RST) was retired with the dataplane (#1373/#1476). The userspace dataplane shortens the session to a 30s closing timeout on RST/FIN but does not invalidate immediately and does not honor this opt-in. Accepted-but-not-enforced; commit emits an advisory. Design rationale: `docs/active-active-new-connections.md` (suppress RST→CLOSED, keep this as the opt-in override). |
-| **Force IP Reassembly** | `security flow force-ip-reassembly` | Force reassembly of all IP fragments before processing (protects against fragment-based evasion) | Medium | Missing — the dataplane does NOT reassemble. NOTE (#3291): a non-first fragment is flowless (#2344) but is no longer fail-OPEN — the flowless transit arm now applies zone security policy, the interface input filter, and PBR (`then routing-instance`) on its L3 identity (`l4_present = false`, so port-bearing terms fail closed; `application any`/address/protocol/`is-fragment` match). A `deny-all` zone pair, `from is-fragment then discard`, and `from is-fragment then routing-instance <ri>` now act on non-first fragments. A flow PERMITTED only by an L4-specific term still drops its non-first fragments (no reassembly + no fragment-association cache yet); full reassembly / fragment association is the remaining gap (tracked in #3291). |
-| **Route Change Timeout** | `security flow route-change-timeout N` | Session timeout (6-1800s) applied when route changes to nonexistent route. Prevents sessions hanging on dead routes. | Low | Missing |
+| **Force IP Reassembly** | `security flow force-ip-reassembly` | Force reassembly of all IP fragments before processing (protects against fragment-based evasion) | Medium | Missing — the dataplane does NOT reassemble. NOTE (#3291): a non-first fragment is flowless (#2344) but is no longer fail-OPEN — the flowless transit arm now applies zone security policy, the interface input filter, and PBR (`then routing-instance`) on its L3 identity (`l4_present = false`, so port-bearing terms fail closed; `application any`/address/protocol/`is-fragment` match). A `deny-all` zone pair, `from is-fragment then discard`, and `from is-fragment then routing-instance <ri>` now act on non-first fragments. A flow PERMITTED only by an L4-specific term still drops its non-first fragments (no reassembly + no fragment-association cache yet); full reassembly / fragment association is the remaining gap (tracked in #3291). **Config-only (#4231):** the `force-ip-reassembly` knob itself is now schema-typed and commit emits an accepted-only advisory instead of the prior silent drop. |
+| **Route Change Timeout** | `security flow route-change-timeout N` | Session timeout (6-1800s) applied when route changes to nonexistent route. Prevents sessions hanging on dead routes. | Low | **Config-only (#4231)** — schema-typed leaf; accepted-but-not-enforced (no route-change session flush on the userspace dataplane). Commit emits an accepted-only advisory instead of the prior silent drop. |
 | **Aggressive Session Aging** | `security flow aging early-ageout N; high-watermark N; low-watermark N` | Accelerate session timeout when session table exceeds watermark threshold | Medium | **Config-only (#3440)** — the Go-side GC watermark hysteresis (`2114333`, `pkg/conntrack/gc.go`) is real, but the GC sweep is skipped entirely on the userspace AF_XDP dataplane (`daemon_run.go` installs `gc.SkipSweep=true` for the only runtime forwarding path post #1373/#1476). The userspace session expiry (`userspace-dp/src/session/expire.rs`) ages each entry on its own idle timeout only — no watermark-driven shedding. Accepted-but-not-enforced; commit emits an advisory. The schema is now typed (early-ageout `0..86400`, watermarks `0..100`, `low < high`) so invalid values are rejected instead of silently dropped. NOTE: per-application `inactivity-timeout` (#3227) is a separate, fully-enforced knob. |
-| **ICMP Session Sync** | `security flow sync-icmp-session` | Synchronize ICMP sessions between HA cluster nodes | Low | Missing |
-| **Multicast Session Timeout** | `security flow multicast-session ...` | Custom timeout values for multicast flow sessions | Low | Missing |
-| **Preserve Incoming Fragment Size** | `security flow preserve-incoming-fragment-size` | Maintain original fragment sizes through the device instead of reassemble-and-re-fragment | Low | Missing |
+| **ICMP Session Sync** | `security flow sync-icmp-session` | Synchronize ICMP sessions between HA cluster nodes | Low | **No-op (#4231)** — schema-typed leaf. In Junos this is an OPT-IN; in xpf it has no effect because ICMP sessions are ALREADY synced to the HA peer unconditionally: the session-sync path is protocol-agnostic at every layer (`publish_shared_session` / `snapshot_all_sessions_export` in `userspace-dp` apply no protocol filter; `pkg/cluster` wire serializes any protocol). So ICMP flows already replicate and survive failover regardless of this knob — it cannot be turned off. Commit emits a distinct advisory saying the knob is a no-op because syncing already happens (previously a silent drop). |
+| **Multicast Session Timeout** | `security flow multicast-session-lifetime N` | Custom timeout values for multicast flow sessions | Low | **Config-only (#4231)** — schema-typed leaf (seconds); accepted-but-not-enforced. Commit emits an accepted-only advisory instead of the prior silent drop. |
+| **Preserve Incoming Fragment Size** | `security flow preserve-incoming-fragment-size` | Maintain original fragment sizes through the device instead of reassemble-and-re-fragment | Low | **Config-only (#4231)** — schema-typed leaf; accepted-but-not-enforced. Commit emits an accepted-only advisory instead of the prior silent drop. |
 
 ---
 
@@ -323,6 +353,15 @@ the Junos semantics of `alg disable` — the ALG is turned **off**, traffic is
 **never dropped**. (xpf does not yet implement the active ALG transforms
 themselves — payload doctoring / dynamic pinholes — so a non-disabled ALG only
 sets the type; see "DNS ALG with NAT" below.)
+
+The unimplemented ALG protos below (H.323, MGCP, SCCP, MSRPC, SunRPC, PPTP,
+RTSP, RSH, IKE-ESP) are **accepted-but-inert (#4232, fable-167 P-4a)**:
+`compileALG` recognizes only `dns`/`ftp`/`sip`/`tftp`, so a `security alg
+<proto>` stanza for any other proto (bare `disable` or a richer child) was
+silently dropped. Commit now emits an accepted-but-inert advisory naming the
+unrecognized protos, so an operator knows the stanza has no effect rather than
+believing an ALG was configured. A harder allowlist-reject at the `security
+alg <proto>` level is the deeper parity move and is deferred.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -398,6 +437,7 @@ xpf has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfaces
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
+| **Policy-Based IPsec VPN** | `security policies ... then permit tunnel ipsec-vpn <vpn>` | Bind an IPsec tunnel to a security policy (traffic matched by the policy enters the tunnel) instead of routing it out a route-based st0/XFRM interface. A top-5 vSRX idiom operators reach for immediately. | Medium | **Missing — rejected at commit (#3114).** xpf supports only route-based (st0/XFRM) IPsec: the `tunnel` modifier under `then permit` is hard-rejected at commit (`validatePolicyThenPermitStrict`, `pkg/config/compiler_policy_then.go`; lenient-warn on load/peer-sync per #1960) because `supportedPolicyThenPermitChildren` is empty and a silently-dropped `then permit` modifier would turn a permit-with-tunnel rule into an unconditional permit (a fail-open). Route the traffic to an st0 unit / XFRM interface bound to the IPsec VPN instead. |
 | **SSL VPN / Juniper Secure Connect** | `security remote-access ...` | Client-based SSL VPN for remote access (Windows, Mac, Android, iOS). Web portal login. | Medium | Missing |
 | **Remote Access IPsec VPN** | `security ike / ipsec + remote-access or access-profile workflow` | Road-warrior / client remote-access IPsec VPN distinct from site-to-site tunnels. The deployment guide explicitly calls out remote-access IPsec VPN support in addition to site-to-site. | Medium | Missing |
 | **Dynamic VPN** | `security dynamic-vpn ...` | Simplified IPsec remote access with web-based client provisioning and access profiles | Medium | Missing |
@@ -673,7 +713,7 @@ xpf has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheus 
 | **Cloud-init / Metadata User-Data Bootstrap** | `N/A (deployment/bootstrap workflow)` | Initialize a vSRX instance from validated Junos configuration passed through cloud metadata or config-drive user-data. Extensively documented for OpenStack, AWS, and GCP. | Medium | Missing |
 | **Bootstrap ISO Provisioning** | `N/A (deployment/bootstrap workflow)` | Provision first-boot configuration from a bootstrap ISO image attached as a virtual disk. Documented in the deployment guide for KVM and VMware workflows. | Low | Missing |
 | **Junos Space / Security Director** | N/A (external management platform) | Centralized multi-device policy management. Not applicable as a feature of xpf itself. | Low | Missing (N/A) |
-| **Rescue Configuration** | `request system configuration rescue save` | Saved fallback configuration that can be loaded on boot if active config fails | Low | Missing |
+| **Rescue Configuration** | `request system configuration rescue save` | Saved fallback configuration that can be loaded on boot if active config fails | Low | **Done.** `request system configuration rescue save`/`delete` are implemented — `SaveRescueConfig`/`DeleteRescueConfig` persist the active config text to `rescue.conf` (owner-only 0600, #4056; DurableState #1894) in `pkg/configstore/store_persist.go`, wired through `pkg/cli/cli_request.go`. |
 
 ---
 

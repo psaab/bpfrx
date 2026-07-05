@@ -39,6 +39,8 @@ def _validate(artifact):
         min_reclaim_alone_ratio=0.90,
         root_cap_tolerance_ratio=0.02,
         max_peer_steady_drops=0,
+        min_handback_samples=2,
+        max_handback_sample_gap_sec=5.0,
     )
 
 
@@ -129,12 +131,66 @@ class SurplusGivebackValidateTests(unittest.TestCase):
         artifact["phases"][0]["throughput_mbps"]["borrower"] = 10600
         artifact["phases"][2]["throughput_mbps"]["borrower"] = 9000
         artifact["phases"][3]["throughput_mbps"]["borrower"] = 9700
+        # A valid pre->post series so the reclaim failure is isolated (the
+        # handback cross-checks are exercised by their own tests below).
         artifact["handback_samples"] = [
+            {"t_sec": 0.5, "throughput_mbps": {"borrower": 17000, "peer": 1000}},
             {"t_sec": 3.0, "throughput_mbps": {"borrower": 9000, "peer": 9800}},
         ]
         verdict = _validate(artifact)
         self.assertEqual(verdict["verdict"], "FAIL")
         self.assertTrue(any("did not reclaim surplus" in r for r in verdict["failure_reasons"]))
+
+    def test_fails_single_self_attested_handback_sample(self):
+        # hb166 V-8: a one-element artifact carrying a single already
+        # settled snapshot must NOT satisfy the handback gate.
+        artifact = _artifact()
+        artifact["handback_samples"] = [
+            {"t_sec": 0.1, "throughput_mbps": {"borrower": 9000, "peer": 9800}},
+        ]
+        verdict = _validate(artifact)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertTrue(any("at least 2" in r for r in verdict["failure_reasons"]))
+        self.assertTrue(
+            any("no pre-handback baseline" in r for r in verdict["failure_reasons"])
+        )
+
+    def test_fails_non_monotonic_handback_samples(self):
+        artifact = _artifact()
+        artifact["handback_samples"] = [
+            {"t_sec": 3.0, "throughput_mbps": {"borrower": 17000, "peer": 1000}},
+            {"t_sec": 0.5, "throughput_mbps": {"borrower": 9000, "peer": 9800}},
+        ]
+        verdict = _validate(artifact)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertTrue(
+            any("not strictly increasing" in r for r in verdict["failure_reasons"])
+        )
+
+    def test_fails_first_sample_already_post_handback(self):
+        # No pre-handback baseline: both samples already show the guarantee
+        # restored, so the handback point is not an observed transition.
+        artifact = _artifact()
+        artifact["handback_samples"] = [
+            {"t_sec": 0.5, "throughput_mbps": {"borrower": 9000, "peer": 9800}},
+            {"t_sec": 3.0, "throughput_mbps": {"borrower": 9000, "peer": 9800}},
+        ]
+        verdict = _validate(artifact)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertTrue(
+            any("no pre-handback baseline" in r for r in verdict["failure_reasons"])
+        )
+
+    def test_fails_sparse_handback_samples(self):
+        # A wide blind gap leaves the derived handback time unbounded.
+        artifact = _artifact()
+        artifact["handback_samples"] = [
+            {"t_sec": 0.5, "throughput_mbps": {"borrower": 17000, "peer": 1000}},
+            {"t_sec": 100.0, "throughput_mbps": {"borrower": 9000, "peer": 9800}},
+        ]
+        verdict = _validate(artifact)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertTrue(any("too sparse" in r for r in verdict["failure_reasons"]))
 
     def test_fails_when_reclaim_not_near_borrow_alone(self):
         artifact = _artifact()
