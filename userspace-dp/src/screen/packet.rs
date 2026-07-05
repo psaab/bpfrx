@@ -105,6 +105,15 @@ pub(crate) struct ScreenProfile {
     pub session_limit_dst: u32, // max sessions per destination IP, 0 = disabled
     pub port_scan_threshold: u32, // unique dst ports per src IP within window, 0 = disabled
     pub ip_sweep_threshold: u32, // unique dst IPs per src IP within window, 0 = disabled
+    /// Junos profile-wide `alarm-without-drop` audit/log-only mode. When true,
+    /// the consumer of a `ScreenVerdict::Drop` (and the flow-path
+    /// `SynCookieChallenge`) for this zone raises a log-only ALARM event
+    /// (carrying the tripped drop reason) and FORWARDS the packet instead of
+    /// dropping it. The check still RUNS, COUNTS (its sketch/tracker state is
+    /// unchanged), and LOGS — only the packet drop is suppressed. Applies
+    /// profile-wide to every check, including the rate-based flood / SYN-cookie
+    /// paths. Default false = drop-on-trip.
+    pub alarm_without_drop: bool,
 }
 
 /// Result of a screen check.

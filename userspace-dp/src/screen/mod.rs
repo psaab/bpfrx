@@ -257,6 +257,15 @@ pub(crate) struct ScreenState {
     syn_flood_dst_drops: u64,
     syn_flood_src_drops: u64,
     syn_flood_alarm_events: u64,
+    /// Count of screen DROP verdicts SUPPRESSED because the ingress zone's
+    /// profile is in `alarm-without-drop` (audit/log-only) mode: the packet
+    /// forwarded and a log-only alarm event was raised instead. Bumped by the
+    /// verdict consumers (`poll_stages`/`poll_descriptor`) via
+    /// `record_alarm_without_drop`. Like `syn_flood_alarm_events` this is a
+    /// per-worker test/diagnostic seam — the production signal is the emitted
+    /// screen ALARM event; surfacing it on `show security screen` is a tracked
+    /// follow-up.
+    alarm_without_drop_events: u64,
 }
 
 /// #3082: at most one missing-screen-profile WARN per zone per second.
@@ -309,6 +318,7 @@ impl ScreenState {
             syn_flood_dst_drops: 0,
             syn_flood_src_drops: 0,
             syn_flood_alarm_events: 0,
+            alarm_without_drop_events: 0,
         }
     }
 
@@ -464,6 +474,28 @@ impl ScreenState {
         pending
     }
 
+    /// True when the ingress zone's screen profile is in Junos
+    /// `alarm-without-drop` (audit/log-only) mode. The verdict consumers
+    /// (`poll_stages`/`poll_descriptor`) query this AFTER a `ScreenVerdict::Drop`
+    /// (or the flow-path `SynCookieChallenge`) to decide whether to suppress the
+    /// packet drop and raise a log-only alarm instead. An absent profile (no
+    /// screen configured for the zone) returns false — a zone with no profile
+    /// never produces a drop verdict in the first place.
+    #[inline]
+    pub(crate) fn alarm_without_drop(&self, zone: &str) -> bool {
+        self.profiles
+            .get(zone)
+            .is_some_and(|p| p.alarm_without_drop)
+    }
+
+    /// Record one screen drop SUPPRESSED by `alarm-without-drop` mode (the
+    /// packet forwarded and a log-only alarm was emitted instead). Called by the
+    /// verdict consumers once per suppressed drop.
+    #[inline]
+    pub(crate) fn record_alarm_without_drop(&mut self) {
+        self.alarm_without_drop_events = self.alarm_without_drop_events.wrapping_add(1);
+    }
+
     /// #3315: sub-attribution test seams (per-destination / per-source drops,
     /// alarm events). Used by unit tests to assert WHICH SYN-flood sub-threshold
     /// tripped without scraping the event stream.
@@ -478,6 +510,11 @@ impl ScreenState {
     #[cfg(test)]
     pub(crate) fn syn_flood_alarm_events(&self) -> u64 {
         self.syn_flood_alarm_events
+    }
+    /// Test seam: count of drops suppressed by `alarm-without-drop` mode.
+    #[cfg(test)]
+    pub(crate) fn alarm_without_drop_events(&self) -> u64 {
+        self.alarm_without_drop_events
     }
 
     /// #2446: the SYN-cookie-relevant slice of a zone profile. Two profiles

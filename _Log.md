@@ -33717,3 +33717,50 @@ top.
 - **File(s)**: userspace-dp/src/screen/extract.rs,
   userspace-dp/src/screen/packet.rs, userspace-dp/src/screen/tests.rs,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Implement Junos `alarm-without-drop` screen ids-option
+  (audit/log-only mode) — fable-review-164 L-10 / issue #4170. The
+  profile-wide option was hard-rejected at commit: the `compileScreen`
+  top-level family switch accepted only icmp/ip/tcp/udp/limit-session, so
+  `alarm-without-drop` landed in UnknownLeaves and
+  `validateScreenUnknownStrict` (#3318) failed the commit. Wired the full
+  Go→Rust path so a tripped screen still ALARMS (logs the attack, counts
+  it) but FORWARDS the packet — the standard vSRX threshold-tuning
+  posture. Go: `ScreenProfile.AlarmWithoutDrop`, the `case
+  "alarm-without-drop"` compiler arm (recordKeyExtras + recordChildExtras
+  so a flat-set trailing token still rejects), the `ids-option` schema
+  flag leaf, and the `ScreenProfileSnapshot.AlarmWithoutDrop` wire field
+  (omitempty). Rust: the snapshot field (`skip_serializing_if =
+  bool_is_false` to keep the protocol_wire_v1 fixture byte-identical),
+  the runtime `ScreenProfile.alarm_without_drop`, the forwarding-build
+  mapping, and `ScreenState::alarm_without_drop`/`record_alarm_without_drop`.
+  The verdict consumers (`stage_screen_check` flowless + flow paths in
+  poll_stages.rs, and the scan/sweep + session-limit site in
+  poll_descriptor) convert a `ScreenVerdict::Drop` (and the flow-path
+  `SynCookieChallenge`) into a log-only PERMIT alarm carrying the tripped
+  reason (via `emit_screen_alarm_event`, mirroring the #3315
+  syn-flood-alarm path) and return Pass instead of dropping. Applies
+  profile-wide to every check including the rate-based flood / SYN-cookie
+  paths. A check-less alarm-without-drop profile is a no-op (not
+  published). RED-on-revert: pkg/config test (compile-threads + schema-
+  accept + trailing-token-reject), pkg/dataplane/userspace test (snapshot
+  carries the flag + JSON round-trip + legacy skew + check-less not
+  published), and Rust `alarm_without_drop_forwards_but_alarms_l10`
+  (flowless teardrop AND flow-path land: baseline DROPS, alarm mode
+  FORWARDS with alarm counter == 1). go test ./pkg/config/... +
+  ./pkg/dataplane/userspace/... green; FULL `cargo test --release
+  --test-threads=1` green (3527 lib + 46 + 8 + 16 + 1, 0 failed);
+  `go build ./...` clean; rustfmt/gofmt/vet clean. Docs: feature-gaps.md
+  Screen/IDS row marked Done.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_screen.go, pkg/config/schema_security.go,
+  pkg/config/screen_alarm_without_drop_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/screens.go,
+  pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-gaps.md,
+  _Log.md

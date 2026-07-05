@@ -29,6 +29,7 @@ fn default_profile() -> ScreenProfile {
         session_limit_dst: 0,
         port_scan_threshold: 0,
         ip_sweep_threshold: 0,
+        alarm_without_drop: false,
     }
 }
 

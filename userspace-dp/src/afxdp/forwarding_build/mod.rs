@@ -110,6 +110,7 @@ pub(super) fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<Stri
                 session_limit_dst: sp.session_limit_dst,
                 port_scan_threshold: sp.port_scan_threshold,
                 ip_sweep_threshold: sp.ip_sweep_threshold,
+                alarm_without_drop: sp.alarm_without_drop,
             },
         );
     }

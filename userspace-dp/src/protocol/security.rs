@@ -71,6 +71,20 @@ pub(crate) struct ScreenProfileSnapshot {
     pub port_scan_threshold: u32,
     #[serde(rename = "ip_sweep_threshold", default)]
     pub ip_sweep_threshold: u32,
+    /// Junos profile-wide `alarm-without-drop` audit/log-only mode. When true,
+    /// every screen check that would DROP a packet in this zone instead raises
+    /// a log-only alarm (carrying the tripped reason) and the packet forwards.
+    /// Mirror of the Go `ScreenProfileSnapshot.AlarmWithoutDrop`.
+    /// `#[serde(default)]` keeps wire parity with an older Go control plane
+    /// that omits the field (decode to false = drop-on-trip — #1961 skew
+    /// tolerance). `skip_serializing_if` mirrors the Go `omitempty` and keeps
+    /// the default specimen (protocol_wire_v1 fixture) byte-identical.
+    #[serde(
+        rename = "alarm_without_drop",
+        default,
+        skip_serializing_if = "crate::protocol::bool_is_false"
+    )]
+    pub alarm_without_drop: bool,
 }
 
 /// #3082: a zone that references a screen profile which was NOT defined when
