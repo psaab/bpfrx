@@ -99,13 +99,16 @@ func TestGenerateProtocols_OSPFPriorityUnsetOmitted(t *testing.T) {
 func TestGenerateProtocols_BGPUpdateSourcePassiveHoldTimeLocalAS(t *testing.T) {
 	m := New()
 
+	// eBGP-shaped peer (PeerAS 65002 != router LocalAS 65001): FRR's
+	// `neighbor X local-as` is an eBGP-oriented knob, so the local-as line
+	// is modelled on an eBGP peer rather than an FRR-rejected iBGP combo.
 	bgp := &config.BGPConfig{
 		LocalAS:  65001,
 		RouterID: "10.255.0.1",
 		Neighbors: []*config.BGPNeighbor{
 			{
 				Address:      "10.255.0.2",
-				PeerAS:       65001,
+				PeerAS:       65002,
 				LocalAS:      65100,
 				LocalAddress: "10.255.0.1",
 				HoldTime:     30,

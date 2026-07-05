@@ -634,7 +634,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 						fmt.Fprintf(&b, " ipv6 ospf6 cost %d\n", iface.Cost)
 					}
 					// Adjacency timers + DR priority (#4285): hello/dead must
-					// match the neighbor. Priority < 0 = unset (0 = "never DR").
+					// match the neighbor. HasPriority gates the priority line;
+					// priority 0 ("never DR") emits, unset omits.
 					if iface.HelloInterval > 0 {
 						fmt.Fprintf(&b, " ipv6 ospf6 hello-interval %d\n", iface.HelloInterval)
 					}

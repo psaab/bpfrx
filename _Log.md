@@ -26,6 +26,34 @@
   - **Validation**: `go test ./pkg/config/... ./pkg/frr/...` green; RED-on-
     revert verified (neutralizing the render emit drops the frr.conf lines →
     tests fail). `go build ./...`, gofmt, go vet clean.
+  - **Action**: PR #4293 review follow-up (MERGE-NEEDS-MINOR) — added
+    commit-time range validators to the new numeric leaves so an
+    out-of-range value is REJECTED at strict commit instead of rendering
+    an frr-reload-BREAKING stanza (one bad leaf fails the whole reload).
+    OSPF/OSPFv3 hello/dead/retransmit `ValidateInteger(1, 65535)`,
+    priority `ValidateInteger(0, 255)`; BGP local-as
+    `ValidateInteger(1, 4294967295)`; BGP hold-time a new
+    `ValidateBGPHoldTime` accepting {0, or 3..65535} — FRR rejects a
+    hold-time of 1/2 (keepalive = hold/3) which would fail the reload, so
+    1/2 are rejected at commit while 0 (disabled) is kept. Discovered +
+    fixed a pre-existing schema gap: the leaves had landed in only ONE of
+    the two duplicated `protocols` subtrees per family (top-level `ospf3`
+    and `routing-instances ospf` were missing them); all FOUR OSPF
+    interface copies now carry the leaves + validators (the shared
+    `compileProtocols` already handled both scopes, and SchemaValidate is
+    lenient on unknown leaves so out-of-range slipped through where the
+    schema was incomplete). Fixed the stale `Priority < 0 = unset` comment
+    left from the abandoned -1 sentinel. Made the local-as-bearing tests
+    eBGP-shaped (FRR restricts `neighbor local-as` to eBGP peers).
+  - **File(s)**: pkg/config/schema_validators.go (ValidateBGPHoldTime),
+    pkg/config/schema_routing.go (validators on all 4 OSPF copies + BGP
+    group/neighbor), pkg/config/schema_validate_routing_4285_test.go (new
+    reject matrix), pkg/frr/policy_render.go (comment), pkg/frr/README.md,
+    pkg/config/routing_adjacency_4285_test.go +
+    pkg/frr/routing_adjacency_4285_test.go (eBGP-shaped local-as)
+  - **Validation**: reject matrix green (RED-on-revert verified — stripping
+    the validators lets out-of-range through); full
+    `go test ./pkg/config/... ./pkg/frr/...` green; build/gofmt/vet clean.
 
 ## 2026-07-05 — cos: #4272 div_ceil .max(1) hardening + fable-166 R-10 CoS test-coverage gaps (#4280)
 
