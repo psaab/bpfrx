@@ -48,6 +48,69 @@
     RED-on-revert). (comments 1+2) corrected the `SharedCoSLease` type name
     to `SharedCoSQueueLease` in docs/fairness-regimes.md and this log (no
     `SharedCoSLease` type exists).
+## 2026-07-04 — #4234 review fix: exclude overloaded policy_id 0 from the clear
+
+- **Timestamp**: 2026-07-04
+- **Action**: Hostile review of PR #4252 = MERGE-NEEDS-MINOR: an id-0
+  over-clear hazard. `policyID()` gives the first policy of the first
+  zone-pair `policy_id == 0`, but 0 is the OVERLOADED wire value also
+  carried by host-inbound / neighbor-seed / fabric / tunnel installs AND
+  pre-#3056 / older-HA-peer synced sessions (userspace-dp already
+  special-cases it: policy.rs `DuplicatePolicyId` M01 excludes 0,
+  `reresolve_session_policy_id` treats idx-0 as non-policy). So deleting OR
+  renaming (delete+add by stable key) the first policy put 0 in the deleted
+  set and swept every id-0 session — a host-local forwarding blip on a
+  common op, and during a rolling upgrade an old peer syncs its WHOLE table
+  with id 0 -> a first-policy delete wipes it (mass loss / TCP resets on
+  failover, #1960 class, amplified by #2468 delete-sync). FIX: exclude
+  policy_id 0 from `deletedPolicyRuntimeIDs` (`if id == 0 { continue }`,
+  single chokepoint feeding both v4/v6 filters). Fail-SAFE under-clear: only
+  the literal first policy's own sessions idle out (pre-#4234 behavior for
+  that one policy); every other deleted policy (id>=1) still clears; not a
+  security regression (no should-be-denied session a DIFFERENT deleted
+  policy covered is kept). Added the id-0 delete + rename guard tests
+  (RED-on-revert: removing the guard mass-clears the id-0 stand-ins).
+  Honestly documented the run-before-~1s-refresh (#3395
+  reresolve_session_policy_id re-stamps deleted-policy sessions to the
+  DEFAULT sentinel) dependency and the sub-1s reorder-then-delete residual.
+  Rebased on origin/master (union _Log.md).
+- **File(s)**: pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/daemon_policy_invalidate_test.go, _Log.md
+
+## 2026-07-04 — #4234: clear sessions of deleted policies at commit (Junos default)
+
+- **Timestamp**: 2026-07-04
+- **Action**: Implemented the DRIVEABLE deletion-clear half of #4234. On
+  commit, diff the pre-commit active config vs the just-applied config by
+  STABLE policy identity (`StablePolicyRuleID` "<from>-><to>/<name>",
+  invariant to sibling deletion); for each policy present before but absent
+  after, collect the OLD numeric runtime `policy_id` (#3056, the value the
+  dataplane stamps on each admitted session) and invalidate every live
+  session carrying that id via the companion-aware
+  `SessionStore.DeleteBatchKnownV4/V6` (forward + reverse + DNAT/NAT64
+  companions), propagating each delete to the HA peer through the identical
+  #2468 delete-sync channel the GC uses (`QueueDeleteV4/V6`, primary-gated).
+  Bounded + safe: runs ONLY when a policy was actually deleted (no
+  commit-time full-table scan otherwise); a MODIFIED policy (same
+  zones+name) keeps its stable key and is NOT cleared — that in-progress
+  re-evaluation is the deferred policy-rematch half, left to #4234
+  needs-research. Handles zone-pair AND global (junos-global) policies.
+  Wired into all commit/sync/rollback paths (commitAndApply,
+  commitConfirmedAndApply → applyAndSyncCommitted; syncAndApply;
+  executeConfirmedRollback), each capturing the pre-commit active config
+  before the store promotes. Added `PolicyIDsByStableKey` (SSOT reuse of
+  walkPolicyRuleSlots) and `DeleteReasonPolicyDeleted`. Refined the #4233
+  policy-rematch advisory from "accepted-only" to "partially enforced"
+  (deleted-policy half now enforced). Updated the retirement-boundary
+  canary allowlist + #1373 docs table + feature-gaps parity row. RED-on-
+  revert test: a session under a DELETED policy is cleared while a
+  surviving/modified policy's session keeps forwarding.
+- **File(s)**: pkg/daemon/daemon_policy_invalidate.go (new),
+  pkg/daemon/daemon_policy_invalidate_test.go (new),
+  pkg/daemon/daemon_apply.go, pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/session_store.go, pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/policy_rematch_advisory_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md, docs/feature-gaps.md, _Log.md
 
 ## 2026-07-04 — fable-review-166 T-3 / T-4: TX-path CoS classification fixes (#4243, #4244)
 
@@ -88,6 +151,7 @@
     build test), pkg/config/compiler_validate_warn.go
     (classOfServiceClassifierQueueWarnings), pkg/config/schema_cos_hb166_test.go
     (T-4 warn tests), docs/cos-traffic-shaping.md, docs/config-schema.md.
+
 ## 2026-07-04 — hb166 V-12: minor CoS harness cleanups
 
 - **Timestamp**: 2026-07-04

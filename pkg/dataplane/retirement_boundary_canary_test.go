@@ -61,6 +61,7 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/conntrack/gc.go":                      "GC still uses root session-domain types until those move out of pkg/dataplane",
 	"pkg/daemon/daemon.go":                     "daemon owns dataplane.RuntimeDataPlane; legacyDP() accessor was deleted in #1519 — only the RuntimeDataPlane field + LastApplyResultOf adapter remain",
 	"pkg/daemon/daemon_apply.go":               "apply path still adapts legacy compile/apply metadata",
+	"pkg/daemon/daemon_policy_invalidate.go":   "#4234 commit-time deletion-clear names root dataplane session types (SessionEntryV4/V6, DeleteReasonPolicyDeleted) to invalidate a deleted policy's live sessions via SessionStore.DeleteBatchKnown*; control-plane session lifecycle, no legacy enforcement path",
 	"pkg/daemon/daemon_proxyarp.go":            "#2197: extracted proxy-ARP/NDP reconcile + periodic re-assert still call dataplane.ReconcileProxyARP (control-plane kernel responder reconcile relocated from daemon_apply.go)",
 	"pkg/daemon/daemon_flow.go":                "flow logging still names legacy dataplane.GlobalCtr* counter indices via dataplane.Telemetry",
 	"pkg/daemon/daemon_nft.go":                 "#3436: lo0/host-inbound nft generation resolves DSCP names through the dataplane.DSCPValues SSOT to emit numeric nft (avoids unloadable Junos DSCP tokens); generation-only, no legacy enforcement path",
