@@ -269,6 +269,11 @@ func (s *Server) configSearchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
+	// Bound the request body (M-7 shared decoder, 16 MiB -> 413) so an
+	// oversized config-load payload is rejected at the transport before it
+	// reaches the parser (H-2). configstore.LoadOverride/LoadMerge/LoadSet
+	// re-check the decoded content against MaxConfigSize (also 16 MiB), the
+	// transport-independent parser-layer ceiling.
 	var req ConfigLoadRequest
 	if !decodeJSONBody(w, r, &req) {
 		return

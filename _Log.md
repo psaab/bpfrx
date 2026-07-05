@@ -1,3 +1,53 @@
+## 2026-07-04 — #4148 (fable-review-164 H-2): bound config lexer/parser recursion + payload size
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed an unrecoverable stack-overflow DoS in the Junos
+    config parse path. The lexer stripped bracket-list delimiters with
+    `l.advance(); return l.Next()` (one goroutine-stack frame per `[`/`]`)
+    and the recursive-descent parser (`parseStatement` <->
+    `parseStatements`) had no nesting-depth guard, so a single sub-4 MiB
+    payload of consecutive `[` or a deeply nested `a{a{…}` brace payload
+    grew the stack past Go's 1 GiB `maxstacksize` and aborted xpfd with
+    `fatal error: stack overflow` (a runtime throw, not a recoverable
+    panic). Reachable unauthenticated from the localhost gRPC/REST
+    config-load API AND the HA peer config-sync ingress
+    (`configstore.Store.SyncApply`), so one hostile/corrupt peer config
+    could crash a cluster standby.
+  - **Fix**: (a) lexer strips brackets iteratively in the leading
+    whitespace/comment loop of `Next()` (O(1) stack); (b) `parseStatements`
+    caps nesting at `maxParseDepth` (256), recording one `ParseError` and
+    draining the over-deep block via the non-recursive `skipToBlockClose`;
+    (c) `configstore.MaxConfigSize` (16 MiB) rejects an over-large payload
+    before `NewParser` in LoadOverride/LoadMerge/LoadSet/SyncApply, backed
+    by `grpc.MaxRecvMsgSize` (16 MiB, both NewServer sites) and
+    `http.MaxBytesReader` (32 MiB, REST config-load body -> clean 413).
+  - **Validation**: RED-on-revert proven — reverting the iterative lexer
+    (6M-bracket flood) and neutering the depth cap (2M-deep braces) both
+    reproduce `fatal error: stack overflow`; a moderate 356-deep nest fails
+    without the cap. Size ceilings reject oversized input at all four store
+    paths + REST 413 + gRPC ResourceExhausted (bufconn). `[ a b c ]` still
+    collapses (#2419). `go test ./pkg/config/... ./pkg/configstore/...
+    ./pkg/api/... ./pkg/grpcapi/...` green; `go build ./...`, gofmt, vet
+    clean.
+  - **File(s)**: `pkg/config/lexer.go`, `pkg/config/parser.go`,
+    `pkg/config/parser_recursion_dos_hb164_test.go`,
+    `pkg/configstore/store.go`, `pkg/configstore/store_command.go`,
+    `pkg/configstore/config_size_ceiling_hb164_test.go`,
+    `pkg/grpcapi/server.go`, `pkg/grpcapi/server_recvsize_hb164_test.go`,
+    `pkg/api/config.go`, `pkg/api/config_load_bodycap_hb164_test.go`,
+    `pkg/config/README.md`, `pkg/configstore/README.md`.
+  - **Rebase (merge origin/master 426cc3f78)**: reconciled with #4149
+    (M-8 unterminated block comment) and #4152/#4150 (M-7 HTTP body cap).
+    lexer.go: merged the `l.pending` unterminated-comment check INSIDE the
+    new bracket-skip loop and BEFORE the EOF return (an unterminated `/* */`
+    consumes to EOF AND sets pending — EOF-first would swallow the error and
+    reopen the #4147 fail-open); `TestUnterminatedBlockComment` stays green.
+    api/config.go: dropped the inline 32 MiB decoder + `maxConfigBodyBytes`
+    and routed the config-load body through M-7's shared `decodeJSONBody`
+    (16 MiB → 413), matching `MaxConfigSize`; the H-2 load-body test now uses
+    `maxRequestBodyBytes` + the streaming `repeatReader`. Added
+    `checkConfigSize` to `CheckText` (day-0 config-drive) for parse-entry
+    parity. `_Log.md` unioned.
 
 ## 2026-07-04 — #4150 (M-6 + M-7): management HTTP server DoS hardening
 
@@ -68,6 +118,7 @@
     Gotchas.
   - **File(s)**: pkg/config/lexer.go, pkg/config/parser_ast_test.go,
     pkg/config/README.md, _Log.md
+
 ## 2026-07-04 — #4088: pool SNAT — id==0 ICMP echo is a valid keyable query
 
 - **Timestamp**: 2026-07-04

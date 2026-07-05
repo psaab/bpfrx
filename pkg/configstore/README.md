@@ -57,6 +57,17 @@ the 0600 perms fix only.
   `EnterConfigureExclusive`, `ExitConfigure`, `SyncApply`. (See
   `store.go` for the full surface — there's no shorthand
   `Candidate()` or `History()`; use the `Show*` / `List*` forms.)
+- `MaxConfigSize` (16 MiB) + `checkConfigSize` — `store.go`. The
+  transport-independent input-size ceiling checked at the head of every
+  parse entry point: `LoadOverride`, `LoadMerge`, `LoadSet`, the HA
+  `SyncApply` ingress, and the `CheckText` day-0 config-drive validator
+  (#1879). It rejects an over-large or corrupt payload with a
+  clean `config too large` error before `config.NewParser`, so a
+  pathological input cannot exhaust memory or (with the pkg/config
+  lexer/depth guards) crash xpfd with a stack overflow (H-2). It backstops
+  the `grpc.MaxRecvMsgSize` / `http.MaxBytesReader` transport caps for the
+  HA peer-sync path and any non-transport caller. Real configs are well
+  under 1 MiB, so the ceiling never rejects a legitimate config.
 - `DB` — `db.go`. Low-level durable file I/O (via `pkg/fsatomic`).
   `NewDB` sweeps crash-leaked `.*.tmp-*` temps from `.configdb`.
 - `History` — `history.go`. Bounded ring of recent commits.

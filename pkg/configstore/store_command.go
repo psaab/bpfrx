@@ -219,6 +219,9 @@ func (s *Store) Annotate(path []string, comment string) error {
 // LoadOverride replaces the entire candidate config with the parsed input.
 // The input can be hierarchical Junos config or flat "set" commands.
 func (s *Store) LoadOverride(content string) error {
+	if err := checkConfigSize(content); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -243,6 +246,9 @@ func (s *Store) LoadOverride(content string) error {
 // For flat "set" commands, each line is applied individually.
 // For hierarchical input, it's converted to set commands and merged.
 func (s *Store) LoadMerge(content string) error {
+	if err := checkConfigSize(content); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -381,6 +387,9 @@ func applyEditLine(tree *config.ConfigTree, line string) error {
 // round-trippable: previously a `deactivate <path>` line was skipped here,
 // so an inactive node reloaded ACTIVE.
 func (s *Store) LoadSet(content string) (int, error) {
+	if err := checkConfigSize(content); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureWritableLocked(); err != nil {
