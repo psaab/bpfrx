@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/subtle"
 	"encoding/base64"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -13,12 +14,19 @@ type AuthConfig struct {
 	APIKeys map[string]bool   // valid API key tokens
 }
 
-// authMiddleware wraps an http.Handler with Basic Auth / Bearer / X-API-Key checks.
-// Requests to /health and /metrics bypass authentication.
-func authMiddleware(cfg AuthConfig, next http.Handler) http.Handler {
+// authMiddleware wraps an http.Handler with Basic Auth / Bearer / X-API-Key
+// checks. /health always bypasses authentication (it exposes no sensitive data
+// and is a liveness probe). /metrics bypasses authentication only when
+// metricsRequireAuth is false — the loopback-bind default, the standard
+// Prometheus posture. When the HTTP API is rebound to a routable management
+// interface (metricsRequireAuth true), /metrics requires credentials like every
+// other endpoint so the aggregate session/counter surface is not exposed
+// unauthenticated on a routable interface (#4162).
+func authMiddleware(cfg AuthConfig, metricsRequireAuth bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health and metrics endpoints
-		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+		// /health is always exempt; /metrics is exempt unless the bind is
+		// non-loopback and auth-gating was requested.
+		if r.URL.Path == "/health" || (r.URL.Path == "/metrics" && !metricsRequireAuth) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -102,4 +110,28 @@ func constantTimeAPIKeyMatch(cfg AuthConfig, presented string) bool {
 		match |= subtle.ConstantTimeCompare(presentedBytes, []byte(key))
 	}
 	return match == 1
+}
+
+// isLoopbackBindAddr reports whether the API listen address binds only the
+// loopback interface (#4162). It parses host:port and returns true only for a
+// literal loopback IP (127.0.0.0/8 or ::1). Anything else — a routable IP, the
+// wildcard bind (":8080" / "0.0.0.0" / "::"), an empty/unparseable host, or a
+// hostname — is treated as NON-loopback (returns false), the conservative
+// default: when in doubt, gate /metrics behind auth rather than expose it.
+func isLoopbackBindAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Not host:port (e.g. a bare host). Try the whole string as an IP.
+		host = addr
+	}
+	if host == "" {
+		// Wildcard bind (":8080") — listens on all interfaces.
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// A hostname or malformed address — cannot prove it is loopback.
+		return false
+	}
+	return ip.IsLoopback()
 }

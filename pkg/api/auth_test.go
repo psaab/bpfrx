@@ -24,7 +24,9 @@ func TestAuthMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	handler := authMiddleware(cfg, ok)
+	// metricsRequireAuth=false: the loopback-bind default, under which /metrics
+	// stays exempt (the "metrics bypass" case below asserts 200).
+	handler := authMiddleware(cfg, false, ok)
 
 	tests := []struct {
 		name   string
