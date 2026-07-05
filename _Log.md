@@ -35535,3 +35535,48 @@ top.
 - **File(s)**: pkg/config/compiler_ipsec_proposalset.go,
   pkg/config/compiler_ipsec_hb167_parity_test.go, pkg/ipsec/README.md,
   _Log.md
+
+- **Timestamp**: 2026-07-05
+- **Action**: fable-167 findings C-1, F-2, F-3 (issues #4314/#4315/#4316).
+  **C-1 (CLI drill-downs):** added `show security ike/ipsec
+  security-associations detail`, `show security nat static rule [detail]`,
+  and `request security policies check` to the operational tree (cmdtree
+  SSOT) + handlers. IKE SA `detail` now renders TS/SPI/lifetime; static NAT
+  `rule detail` surfaces source restriction / mapped-port / prefix-name /
+  routing-instance (RenderStaticRule in pkg/natshow/static.go); `policies
+  check` is a conservative shadow/redundancy lint over zone-pair policies
+  (analyzePolicyShadowing, cli_request_policies_check.go). **F-2
+  (make-or-break):** modeled Junos hierarchical shaping —
+  `traffic-control-profiles <n> { shaping-rate; guaranteed-rate;
+  scheduler-map; delay-buffer-rate; }` + `output-traffic-control-profile`
+  at unit + interface level (schema_cos.go), captured on
+  ClassOfServiceConfig.TrafficControlProfiles + CoSInterfaceUnit.
+  OutputTrafficControlProfile (types_cos.go), and WIRED the bounded knobs:
+  resolveCoSTrafficControlProfiles folds shaping-rate + scheduler-map into
+  the per-unit shaper so shaping ACTUALLY applies (direct unit knob wins).
+  guaranteed-rate / delay-buffer-rate accepted-but-inert + dangling-ref =
+  commit advisories. This closes the silent zero-shaping: pre-fix the
+  binding committed clean and shaped nothing. **F-3 (schema gaps):**
+  `firewall filter interface-specific` (accepted-but-inert, single shared
+  counter advisory) + CoS `classifiers inet-precedence` and `rewrite-rules
+  inet-precedence`/`exp` (accepted-but-inert advisories).
+- **Validation**: go test ./pkg/config/ ./pkg/cli/ ./pkg/cmdtree/
+  ./pkg/natshow/ green; go build ./... clean; gofmt + vet clean on all
+  touched files (pre-existing cli.go:503 vet + 4 unrelated gofmt files
+  untouched). RED-on-revert proven for F-2 (unit shaping-rate = 0 without
+  resolveCoSTrafficControlProfiles) and via focused C-1/F-3 tests.
+  No cargo leg — F-2 wires into the existing per-unit shaper snapshot
+  (interfaces.go reads ShapingRateBytes/SchedulerMap), no userspace-dp
+  change; guaranteed-rate/delay-buffer-rate hierarchical enforcement is a
+  noted dataplane follow-up.
+- **File(s)**: pkg/cmdtree/tree.go, pkg/cmdtree/tree_hb167_test.go,
+  pkg/cli/cli_show_security_ipsec.go, pkg/cli/cli_show_nat.go,
+  pkg/cli/cli_show_nat_shared_test.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_request_policies_check.go,
+  pkg/cli/cli_request_policies_check_test.go, pkg/natshow/static.go,
+  pkg/config/schema_cos.go, pkg/config/types_cos.go,
+  pkg/config/compiler_class_of_service.go, pkg/config/compiler.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/types_system.go,
+  pkg/config/compiler_firewall.go, pkg/config/compiler_cos_tcp_hb167_test.go,
+  pkg/config/compiler_f3_hb167_test.go, docs/cos-traffic-shaping.md,
+  docs/config-schema.md, docs/junos-cli-reference.md, _Log.md

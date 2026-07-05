@@ -49,7 +49,7 @@ func (c *CLI) handleShowNAT(args []string) error {
 	case "destination":
 		return c.showNATDestination(cfg, args[1:])
 	case "static":
-		return c.showNATStatic(cfg)
+		return c.showNATStatic(cfg, args[1:])
 	case "nat64":
 		return c.showNAT64(cfg)
 	case "nptv6":
@@ -844,8 +844,14 @@ func (c *CLI) showNATDestinationRuleDetail(cfg *config.Config) error {
 	return nil
 }
 
-func (c *CLI) showNATStatic(cfg *config.Config) error {
+func (c *CLI) showNATStatic(cfg *config.Config, args []string) error {
 	// #1687: shared with the gRPC ShowText path via pkg/natshow.
+	// C-1b (#4314): `rule [detail]` drill-down mirrors source/destination NAT.
+	if len(args) > 0 && args[0] == "rule" {
+		detail := len(args) >= 2 && args[1] == "detail"
+		natshow.RenderStaticRule(os.Stdout, cfg, detail)
+		return nil
+	}
 	natshow.RenderStatic(os.Stdout, cfg)
 	return nil
 }

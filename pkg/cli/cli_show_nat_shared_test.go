@@ -84,8 +84,13 @@ func TestCLINATWrappersMatchSharedRenderers(t *testing.T) {
 		},
 		{
 			"static",
-			func() error { return c.showNATStatic(cfg) },
+			func() error { return c.showNATStatic(cfg, nil) },
 			func(b *strings.Builder) { natshow.RenderStatic(b, cfg) },
+		},
+		{
+			"static-rule-detail",
+			func() error { return c.showNATStatic(cfg, []string{"rule", "detail"}) },
+			func(b *strings.Builder) { natshow.RenderStaticRule(b, cfg, true) },
 		},
 		{
 			"nptv6",
