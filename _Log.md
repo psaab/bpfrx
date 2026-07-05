@@ -1,3 +1,41 @@
+## 2026-07-04 — fable-review-166 R-1/R-3/R-4: CoS/MQFQ fairness-accounting lifecycle fixes (#4259/#4260/#4261)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Three state-lifecycle defects in shipped fairness
+    mechanisms. R-1 (#4259): the MQFQ bucket-idle reset in
+    `account_cos_queue_flow_dequeue` cleared only head/tail finish tags;
+    the per-bucket observed-rate EWMA survived flow death, so a newcomer
+    hashing into a recycled bucket was deferred by the cap-aware selector
+    as the departed elephant. Now also zero
+    `flow_bucket_observed_bps`/`last_tx_ns`/`pending_bytes` on the
+    nonzero→0 transition (monotonic `tx_bytes` preserved). Added the
+    missing selector-defers-at-finite-target test + a RED-on-revert
+    recycle test. R-3 (#4260): the v8 epoch seqlock writer
+    (`maybe_rotate_epoch_v8`) had no ordering after the EVEN→ODD claim CAS
+    — the Relaxed payload stores could publish before the ODD claim on a
+    weakly-ordered CPU (torn cross-epoch snapshot, #1619 class; #1643
+    fixed only the reader half). Added `fence(Ordering::Release)` right
+    after the successful claim CAS (Boehm seqlock recipe), pairing with
+    the reader's existing `fence(Acquire)`. Added a contention test
+    asserting `grace == tag*EPOCH + EPOCH/2` (a cross-field invariant a
+    torn read breaks) + a `#[cfg(test)]` snapshot accessor; x86-TSO cannot
+    reproduce the tear so it is a documented structural guard, not
+    RED-on-revert on the CI host. R-4 (#4261): `refill_cos_tokens` floored
+    the byte grant but advanced `last_refill_ns` to `now_ns`, discarding
+    <1 byte of credit per refill (37.5% under at 64 kbps / 200 µs). Now
+    carry the remainder in the timestamp (rewind by `remainder/rate`) so
+    cumulative granted == floor(elapsed×rate/1e9). Added a conservation
+    unit test. All three need a cluster CoS smoke (fairness-mechanism
+    change); R-3 especially needs careful memory-model review.
+  - **File(s)**: userspace-dp/src/afxdp/cos/queue_ops/accounting.rs,
+    userspace-dp/src/afxdp/cos/queue_ops/tests.rs,
+    userspace-dp/src/afxdp/cos/token_bucket.rs,
+    userspace-dp/src/afxdp/cos/token_bucket_tests.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/rotate_epoch_v8.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/lease.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
+    docs/fairness-regimes.md, _Log.md
+
 ## 2026-07-04 — fable-review-166 T-1: v8 lease give-back re-credits the epoch ledger (#4246, folds R-5(a))
 
 - **Timestamp**: 2026-07-04
