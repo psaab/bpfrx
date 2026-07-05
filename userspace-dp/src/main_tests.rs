@@ -1643,6 +1643,7 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
         flow_cache_capacity: 4096,
         v_min_throttle_hard_cap_overrides: 28,
         v_min_throttles: 29,
+        v_min_suspended_batches: 30,
     };
     let value: serde_json::Value =
         serde_json::to_value(&snap).expect("serialize snapshot to Value");
@@ -2288,6 +2289,7 @@ fn tx_latency_hist_serialization_roundtrip() {
         flow_cache_capacity: 0,
         v_min_throttle_hard_cap_overrides: 18,
         v_min_throttles: 19,
+        v_min_suspended_batches: 20,
     };
     let json = serde_json::to_string(&snap).expect("serialize snapshot");
     let back: BindingCountersSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");

@@ -35036,3 +35036,64 @@ top.
   userspace-dp/src/protocol/cos.rs,
   pkg/dataplane/userspace/protocol.go,
   docs/fairness-regimes.md, _Log.md
+
+- **Timestamp**: 2026-07-05
+- **Action**: hb166 T-6 (#4267) — TX-path MEDIUM cluster: drove 6 of the 7
+  READY sub-items (a, b, d, e, g, m) to fixes; deferred (k) + the original
+  6 (c/f/h/i/j/l) with recorded reasons. Verified each reproduces at HEAD
+  (origin/master 81e8f381f); none already-fixed by R-7/#4255, T-1/#4253,
+  T-2+T-5/#4258, R-1/R-3/R-4/#4264. (g) admission drop no longer
+  double-reports as tx_errors nor allocates a per-drop set_error(format!)
+  String (~1M allocs/sec hot-path violation) — kept the dedicated
+  admission_*_drops + dbg_cos_queue_overflow counters; same per-drop
+  format! removed from bound_pending_tx_* overflow loops. (d)
+  transmit_batch oversized-frame Drop-unwind now drains in reverse
+  (.drain(..).rev()) so same-flow TCP segments keep order. (m)
+  fragments/flowless (flow_key None) now get BA (DSCP→802.1p→default)
+  classification in both resolve_cos_tx_selection_internal and
+  resolve_cached_cos_tx_selection instead of default-queue. (e)
+  submit_local/submit_prepared now call publish_committed_queue_vtime on
+  the 5th V_min settle boundary (surplus-phase shared_exact was advancing
+  vtime unpublished). (a) added v_min_suspended_batches counter (full
+  scratch→atomic→snapshot→wire + Go VMinSuspendedBatches) + a decaying
+  re-arm (halve the suspension window per consecutive hard-cap toward
+  V_MIN_SUSPENSION_MIN_BATCHES=64, reset on a clean check). (b) gated BOTH
+  the local root_exact_demand_queue_mask and the published
+  exact_backlog_queue_mask on a shared cos_exact_queue_serviceable
+  predicate so a v8-starved exact class releases its BE-surplus reservation
+  (work conservation); serviceable_exact_backlog_bytes refactored to share
+  it. RED-on-revert unit tests added for all six (d/g/b spot-verified: the
+  named tests FAIL against reverted code). FULL cargo test --release green
+  (3631 tests, 0 failed); regenerated tests/fixtures/protocol_wire_v1.json
+  for the additive v_min_suspended_batches wire key; Go userspace parity
+  tests green. (a) telemetry + (b) reservation contract change need a
+  cluster CoS smoke before merge.
+- **File(s)**: userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/tx/drain/mod.rs,
+  userspace-dp/src/afxdp/tx/transmit/mod.rs,
+  userspace-dp/src/afxdp/tx/transmit_tests.rs,
+  userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_local.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_prepared.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests.rs,
+  userspace-dp/src/afxdp/cos/tx_completion.rs,
+  userspace-dp/src/afxdp/cos/queue_ops/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_ops/v_min.rs,
+  userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
+  userspace-dp/src/afxdp/cos/builders.rs,
+  userspace-dp/src/afxdp/cos/mod.rs,
+  userspace-dp/src/afxdp/types/cos.rs,
+  userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/debug_state.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/umem/tests.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/worker/cos/tests.rs,
+  userspace-dp/src/afxdp/cos/tx_completion_tests.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/src/main_tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go,
+  docs/fairness-regimes.md, _Log.md

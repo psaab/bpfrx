@@ -110,6 +110,81 @@ fn enqueue_exact_queue_publishes_shared_backlog_slot() {
     );
 }
 
+// #hb166 T-6(g): a CoS admission drop (buffer / flow-share exceeded) is
+// DESIGNED shaping. It is attributed to the dedicated per-reason
+// `admission_buffer_drops` / `admission_flow_share_drops` counters and must
+// NOT also inflate the aggregate `tx_errors` (an operator reads a saturated
+// shaper as a fault) nor allocate a per-drop `set_error(format!())` String.
+//
+// FAIL-ON-REVERT: restoring the `tx_errors.fetch_add(1)` on the CoS
+// admission-overflow path flips the `tx_errors == 0` assertion.
+#[test]
+fn cos_admission_drop_counts_dedicated_counter_not_tx_errors() {
+    // FIFO (non-flow-fair) queue with a small buffer so accumulated
+    // queued bytes exceed the buffer limit without any drain.
+    let root = test_cos_runtime_with_queues(
+        10_000_000,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "best-effort".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000,
+            guarantee_enabled: false,
+            exact: false,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        0,
+        vec![(0, test_queue_fast_path(false, 0, None, None))],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    // Push 1500-byte items without draining until the buffer limit trips.
+    // 400 * 1500 = 600 KB dwarfs any COS_MIN_BURST_BYTES-derived limit.
+    for _ in 0..400 {
+        let _ = enqueue_cos_item(
+            &mut binding,
+            42,
+            Some(0),
+            1500,
+            test_flow_cos_item(5201, 1500),
+            0,
+            None,
+        );
+    }
+
+    let buffer_drops = binding
+        .cos
+        .cos_interfaces
+        .get(&42)
+        .and_then(|root| root.queues.first())
+        .map(|q| q.telemetry.drop_counters.admission_buffer_drops)
+        .expect("queue present");
+    assert!(
+        buffer_drops > 0,
+        "test premise: the buffer cap must trip at least one admission drop",
+    );
+    assert_eq!(
+        binding.live.tx_errors.load(Ordering::Relaxed),
+        0,
+        "a designed CoS admission (shaping) drop must NOT inflate tx_errors",
+    );
+    // The #804 disambiguation debug counter still records the overflow.
+    assert!(binding.telemetry.dbg_cos_queue_overflow > 0);
+}
+
 #[test]
 fn clone_prepared_request_for_cos_returns_local_copy_with_metadata() {
     let mut area = MmapArea::new(4096).expect("mmap");
@@ -764,6 +839,125 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
     );
 
     assert_eq!(queue_id, Some(1));
+}
+
+// #hb166 T-6(m): fragments / flowless packets (flow_key == None) still carry
+// a DSCP. Behavior-aggregate (DSCP) classification is 5-tuple-independent, so
+// a marked fragment must land in its BA queue rather than the default queue.
+//
+// FAIL-ON-REVERT: restoring the `queue_id: iface.map(|i| i.default_queue)`
+// None-branch (in BOTH resolve_cos_tx_selection_internal and
+// resolve_cached_cos_tx_selection) flips the dscp==46 assertions from
+// Some(1) back to Some(0).
+#[test]
+fn flowless_packet_gets_ba_classification_from_dscp() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            cos_dscp_classifier: "ba".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "expedited-forwarding".into(),
+                    queue: 1,
+                },
+            ],
+            dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                name: "ba".into(),
+                entries: vec![CoSDSCPClassifierEntrySnapshot {
+                    forwarding_class: "expedited-forwarding".into(),
+                    loss_priority: String::new(),
+                    dscp_values: vec![46],
+                }],
+            }],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "ef-sched".into(),
+                    transmit_rate_bytes: 6_000_000,
+                    transmit_rate_exact: false,
+                    priority: "strict-high".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "expedited-forwarding".into(),
+                        scheduler: "ef-sched".into(),
+                    },
+                ],
+            }],
+        }),
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let ef_meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        dscp: 46,
+        ..Default::default()
+    };
+    let be_meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        dscp: 0,
+        ..Default::default()
+    };
+
+    // Non-cached path (resolve_cos_tx_selection_internal via resolve_cos_queue_id).
+    assert_eq!(
+        resolve_cos_queue_id(&forwarding, 202, ef_meta, None),
+        Some(1),
+        "EF-marked flowless packet must hit the BA (EF) queue, not the default",
+    );
+    assert_eq!(
+        resolve_cos_queue_id(&forwarding, 202, be_meta, None),
+        Some(0),
+        "an unmarked flowless packet falls back to the default queue",
+    );
+
+    // Cached-descriptor path.
+    assert_eq!(
+        resolve_cached_cos_tx_selection(&forwarding, 202, ef_meta, None).queue_id,
+        Some(1),
+        "cached flowless BA classification must also hit the EF queue",
+    );
 }
 
 #[test]

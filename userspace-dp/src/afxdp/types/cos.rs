@@ -1195,6 +1195,23 @@ pub(in crate::afxdp) struct VMinQueueState {
     /// (working-as-designed fairness brake) and the hard-cap
     /// override path (escape hatch when the brake is too tight).
     pub(in crate::afxdp) v_min_throttles_scratch: u32,
+    /// #hb166 T-6(a): per-queue scratch counter for V_min *suspended*
+    /// drain batches — every batch where `cos_queue_v_min_consume_suspension`
+    /// burned a suspension slot (the fairness brake was OFF because a
+    /// prior hard-cap armed suspension). Pre-fix these were UNCOUNTED, so
+    /// telemetry read "brake idle" while it was suppressed. Flushed to
+    /// `BindingLiveState::v_min_suspended_batches` in
+    /// `update_binding_debug_state` alongside the throttle/hard-cap
+    /// counters. `v_min_suspended_batches / v_min_throttle_hard_cap_overrides`
+    /// is the "how long is the brake staying off per activation" diagnostic.
+    pub(in crate::afxdp) v_min_suspended_batches_scratch: u32,
+    /// #hb166 T-6(a): current decaying re-arm window for the V_min
+    /// suspension. Initialized to `V_MIN_SUSPENSION_BATCHES`; each
+    /// consecutive hard-cap activation (no intervening passing V_min
+    /// check) halves it toward `V_MIN_SUSPENSION_MIN_BATCHES`, and a
+    /// clean V_min check resets it to `V_MIN_SUSPENSION_BATCHES`. This
+    /// makes a persistently-skewed queue re-engage the brake sooner.
+    pub(in crate::afxdp) v_min_suspension_window: u32,
     /// #2624: persistent V_min cadence pop counter. The cross-worker
     /// V_min sync (`cos_queue_v_min_continue` → the expensive
     /// `participating_v_min_snapshot` Acquire-load scan of every peer

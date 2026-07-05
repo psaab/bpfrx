@@ -2345,15 +2345,20 @@ type BindingStatus struct {
 	// rescued throughput". Ratio is the LAG_THRESHOLD diagnostic.
 	VMinThrottleHardCapOverrides uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
 	VMinThrottles                uint64 `json:"v_min_throttles,omitempty"`
-	SessionHits                  uint64 `json:"session_hits,omitempty"`
-	SessionMisses                uint64 `json:"session_misses,omitempty"`
-	SessionCreates               uint64 `json:"session_creates,omitempty"`
-	SessionExpires               uint64 `json:"session_expires,omitempty"`
-	SessionDeltaPending          uint64 `json:"session_delta_pending,omitempty"`
-	SessionDeltaGenerated        uint64 `json:"session_delta_generated,omitempty"`
-	SessionDeltaDropped          uint64 `json:"session_delta_dropped,omitempty"`
-	SessionDeltaDrained          uint64 `json:"session_delta_drained,omitempty"`
-	PolicyDeniedPackets          uint64 `json:"policy_denied_packets,omitempty"`
+	// #hb166 T-6(a): count of V_min suspended drain batches — batches
+	// where the fairness brake was OFF because a prior hard-cap armed
+	// suspension. VMinSuspendedBatches / VMinThrottleHardCapOverrides is
+	// the effective suspension-window-length diagnostic.
+	VMinSuspendedBatches  uint64 `json:"v_min_suspended_batches,omitempty"`
+	SessionHits           uint64 `json:"session_hits,omitempty"`
+	SessionMisses         uint64 `json:"session_misses,omitempty"`
+	SessionCreates        uint64 `json:"session_creates,omitempty"`
+	SessionExpires        uint64 `json:"session_expires,omitempty"`
+	SessionDeltaPending   uint64 `json:"session_delta_pending,omitempty"`
+	SessionDeltaGenerated uint64 `json:"session_delta_generated,omitempty"`
+	SessionDeltaDropped   uint64 `json:"session_delta_dropped,omitempty"`
+	SessionDeltaDrained   uint64 `json:"session_delta_drained,omitempty"`
+	PolicyDeniedPackets   uint64 `json:"policy_denied_packets,omitempty"`
 	// #3326: host-bound packets dropped by the zone host-inbound admission
 	// gate. Mirrored into dataplane.GlobalCtrHostInboundDeny by
 	// syncBPFCountersLocked so REST (host_inbound_denies), Prometheus
@@ -2637,6 +2642,8 @@ type BindingCountersSnapshot struct {
 	// projects zeros even when the atomics flushed real values.
 	VMinThrottleHardCapOverrides uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
 	VMinThrottles                uint64 `json:"v_min_throttles,omitempty"`
+	// #hb166 T-6(a): V_min suspended-batch count (per_binding lean view).
+	VMinSuspendedBatches uint64 `json:"v_min_suspended_batches,omitempty"`
 }
 
 type ExceptionStatus struct {

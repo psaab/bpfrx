@@ -269,6 +269,16 @@ pub(in crate::afxdp) const V_MIN_CONSECUTIVE_SKIP_HARD_CAP: u32 = 8;
 /// short enough that mouse-latency budgets (#905) are unaffected.
 pub(in crate::afxdp) const V_MIN_SUSPENSION_BATCHES: u32 = 1000;
 
+/// #hb166 T-6(a) — floor for the decaying re-arm of the V_min
+/// suspension window. Each consecutive hard-cap activation (no
+/// intervening passing V_min check) halves the suspension window from
+/// `V_MIN_SUSPENSION_BATCHES` toward this floor, so a PERSISTENTLY
+/// skewed shared_exact queue re-engages the fairness brake far sooner
+/// than the fixed 1000-batch (~200 ms) window would — instead of the
+/// brake staying off ~99% of the time. A clean V_min check resets the
+/// window back to `V_MIN_SUSPENSION_BATCHES`.
+pub(in crate::afxdp) const V_MIN_SUSPENSION_MIN_BATCHES: u32 = 64;
+
 /// #1735: consecutive quiescent batch settles required before a
 /// lazily-promoted non-exact flow-fair queue is demoted back to FIFO
 /// (dropping its ~232 KB `FlowFairState`). Hysteresis so a queue
@@ -338,6 +348,34 @@ pub(in crate::afxdp) fn cos_item_len(item: &CoSPendingTxItem) -> u64 {
         CoSPendingTxItem::Local(req) => req.bytes.len() as u64,
         CoSPendingTxItem::Prepared(req) => req.len as u64,
     }
+}
+
+/// #hb166 T-6(b): a guaranteed exact queue counts as REAL (serviceable)
+/// demand for the surplus-reservation masks only when it can actually ship
+/// its head packet right now — runnable, non-empty, and both the root and
+/// per-queue token buckets cover the head length. A v8-starved /
+/// token-parked exact class that ships zero bytes is NOT serviceable, so it
+/// must release its reserved rate to best-effort (work conservation)
+/// instead of zeroing the BE residual while the link idles.
+///
+/// This is exactly the per-queue predicate the shared_exact backlog already
+/// publishes as `serviceable_exact_backlog_bytes`; gating the demand MASKS
+/// on it makes the reservation consistent with the published serviceability
+/// signal. Callers still apply the `exact && guarantee_enabled` config
+/// gate separately.
+#[inline]
+pub(in crate::afxdp) fn cos_exact_queue_serviceable(
+    root_tokens: u64,
+    queue: &CoSQueueRuntime,
+) -> bool {
+    if !queue.hot.runnable {
+        return false;
+    }
+    let Some(head) = cos_queue_front(queue) else {
+        return false;
+    };
+    let head_len = cos_item_len(head);
+    root_tokens >= head_len && queue.hot.tokens >= head_len
 }
 
 #[cfg(test)]

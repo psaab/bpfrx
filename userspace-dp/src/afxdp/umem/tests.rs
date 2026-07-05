@@ -1389,15 +1389,24 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
     // Manually populate scratches as if v_min check fired.
     runtime.queues[0].v_min.v_min_hard_cap_overrides_scratch = 3;
     runtime.queues[0].v_min.v_min_throttles_scratch = 17;
+    // #hb166 T-6(a): suspended-batch scratch flushes alongside.
+    runtime.queues[0].v_min.v_min_suspended_batches_scratch = 100;
     runtime.queues[1].v_min.v_min_hard_cap_overrides_scratch = 5;
     runtime.queues[1].v_min.v_min_throttles_scratch = 23;
+    runtime.queues[1].v_min.v_min_suspended_batches_scratch = 200;
 
     let hard_cap = std::sync::atomic::AtomicU64::new(0);
     let throttles = std::sync::atomic::AtomicU64::new(0);
+    let suspended = std::sync::atomic::AtomicU64::new(0);
     let mut interfaces = std::collections::BTreeMap::new();
     interfaces.insert(1, runtime);
 
-    crate::afxdp::umem::flush_v_min_scratches_into(interfaces.values_mut(), &hard_cap, &throttles);
+    crate::afxdp::umem::flush_v_min_scratches_into(
+        interfaces.values_mut(),
+        &hard_cap,
+        &throttles,
+        &suspended,
+    );
 
     // Atomics carry the sums.
     assert_eq!(
@@ -1410,13 +1419,22 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
         17 + 23,
         "throttles atomic must equal sum across queues",
     );
+    // FAIL-ON-REVERT for T-6(a): the suspended-batch atomic must equal
+    // the sum of the per-queue scratches.
+    assert_eq!(
+        suspended.load(std::sync::atomic::Ordering::Relaxed),
+        100 + 200,
+        "suspended-batches atomic must equal sum across queues",
+    );
 
     // Per-queue scratches reset to 0.
     let r = interfaces.get(&1).unwrap();
     assert_eq!(r.queues[0].v_min.v_min_hard_cap_overrides_scratch, 0);
     assert_eq!(r.queues[0].v_min.v_min_throttles_scratch, 0);
+    assert_eq!(r.queues[0].v_min.v_min_suspended_batches_scratch, 0);
     assert_eq!(r.queues[1].v_min.v_min_hard_cap_overrides_scratch, 0);
     assert_eq!(r.queues[1].v_min.v_min_throttles_scratch, 0);
+    assert_eq!(r.queues[1].v_min.v_min_suspended_batches_scratch, 0);
 }
 
 /// #943: a second flush call with all scratches zero must NOT bump
@@ -1460,14 +1478,21 @@ fn flush_v_min_scratches_no_op_when_all_zero() {
     // doesn't accidentally store-zero.
     let hard_cap = std::sync::atomic::AtomicU64::new(42);
     let throttles = std::sync::atomic::AtomicU64::new(99);
+    let suspended = std::sync::atomic::AtomicU64::new(7);
     let mut interfaces = std::collections::BTreeMap::new();
     interfaces.insert(1, runtime);
 
-    crate::afxdp::umem::flush_v_min_scratches_into(interfaces.values_mut(), &hard_cap, &throttles);
+    crate::afxdp::umem::flush_v_min_scratches_into(
+        interfaces.values_mut(),
+        &hard_cap,
+        &throttles,
+        &suspended,
+    );
 
     // Atomics unchanged — the no-zero-scratch path skips the fetch_add.
     assert_eq!(hard_cap.load(std::sync::atomic::Ordering::Relaxed), 42);
     assert_eq!(throttles.load(std::sync::atomic::Ordering::Relaxed), 99);
+    assert_eq!(suspended.load(std::sync::atomic::Ordering::Relaxed), 7);
 }
 
 fn debug_state_test_timers() -> WorkerTimers {

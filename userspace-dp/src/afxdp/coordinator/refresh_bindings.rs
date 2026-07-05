@@ -96,6 +96,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     // wire surface (BindingCountersSnapshot) sees them.
     binding.v_min_throttle_hard_cap_overrides = snap.v_min_throttle_hard_cap_overrides;
     binding.v_min_throttles = snap.v_min_throttles;
+    binding.v_min_suspended_batches = snap.v_min_suspended_batches;
     binding.session_hits = snap.session_hits;
     binding.session_misses = snap.session_misses;
     binding.session_creates = snap.session_creates;
@@ -292,6 +293,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.flow_cache_capacity = 0;
     binding.v_min_throttle_hard_cap_overrides = 0;
     binding.v_min_throttles = 0;
+    binding.v_min_suspended_batches = 0;
     binding.session_hits = 0;
     binding.session_misses = 0;
     binding.session_creates = 0;

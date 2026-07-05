@@ -693,6 +693,123 @@ fn vmin_hard_cap_force_continue_activates_suspension() {
     );
 }
 
+// #hb166 T-6(a): consecutive hard-cap activations (no intervening
+// passing V_min check) must DECAY the suspension re-arm window — halving
+// it toward V_MIN_SUSPENSION_MIN_BATCHES — so a persistently-skewed queue
+// re-engages the fairness brake progressively sooner instead of parking
+// it off for the fixed 1000-batch window every time. A clean V_min check
+// resets the window to full.
+//
+// FAIL-ON-REVERT: restoring the fixed
+// `v_min_suspended_remaining = V_MIN_SUSPENSION_BATCHES` arm flips the
+// 2nd/3rd activation assertions from 500/250 back to 1000.
+#[test]
+fn vmin_hard_cap_rearm_decays_suspension_window() {
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+    floor.slots[0].publish(0);
+    test_flow_fair_state_mut(queue).queue_vtime = 100 * 1024 * 1024;
+
+    // Drive one full hard-cap cycle: 7 throttles then the force-continue.
+    let fire_hard_cap = |queue: &mut CoSQueueRuntime| {
+        for _ in 1..V_MIN_CONSECUTIVE_SKIP_HARD_CAP {
+            assert!(!cos_queue_v_min_continue(queue, 1), "throttle expected");
+        }
+        assert!(cos_queue_v_min_continue(queue, 1), "hard-cap force-continue");
+    };
+
+    fire_hard_cap(queue);
+    assert_eq!(
+        queue.v_min.v_min_suspended_remaining, V_MIN_SUSPENSION_BATCHES,
+        "1st activation arms the full window",
+    );
+    fire_hard_cap(queue);
+    assert_eq!(
+        queue.v_min.v_min_suspended_remaining,
+        V_MIN_SUSPENSION_BATCHES / 2,
+        "2nd consecutive activation halves the window",
+    );
+    fire_hard_cap(queue);
+    assert_eq!(
+        queue.v_min.v_min_suspended_remaining,
+        V_MIN_SUSPENSION_BATCHES / 4,
+        "3rd consecutive activation halves again",
+    );
+
+    // A clean V_min check (queue within lag of the peer) resets the window.
+    test_flow_fair_state_mut(queue).queue_vtime = 0;
+    assert!(cos_queue_v_min_continue(queue, 1), "queue is now within lag");
+    assert_eq!(
+        queue.v_min.v_min_suspension_window, V_MIN_SUSPENSION_BATCHES,
+        "a passing V_min check restores the full window",
+    );
+    // ...and the next activation re-arms at the full window.
+    test_flow_fair_state_mut(queue).queue_vtime = 100 * 1024 * 1024;
+    fire_hard_cap(queue);
+    assert_eq!(
+        queue.v_min.v_min_suspended_remaining, V_MIN_SUSPENSION_BATCHES,
+        "after reset the window re-arms at full",
+    );
+}
+
+// #hb166 T-6(a): every consumed suspension slot must increment the
+// per-queue scratch counter so telemetry stops reading "brake idle" while
+// the brake is actually suppressed.
+//
+// FAIL-ON-REVERT: dropping the scratch increment in
+// `cos_queue_v_min_consume_suspension` leaves the counter at 0.
+#[test]
+fn vmin_consume_suspension_counts_suspended_batches() {
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let _floor = attach_test_vtime_floor(queue, 4, 1);
+    queue.v_min.v_min_suspended_remaining = 5;
+    for _ in 0..5 {
+        assert!(cos_queue_v_min_consume_suspension(queue));
+    }
+    // Drained — no further count.
+    assert!(!cos_queue_v_min_consume_suspension(queue));
+    assert_eq!(
+        queue.v_min.v_min_suspended_batches_scratch, 5,
+        "each consumed suspension slot must be counted exactly once",
+    );
+}
+
 /// #941 Work item D: `cos_queue_v_min_consume_suspension` decrements
 /// the counter once per call and returns the suspension state.
 #[test]

@@ -342,6 +342,14 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// Flushed from each queue's `v_min_throttles_scratch` in
     /// `update_binding_debug_state` (mirrors flow_cache_collision_evictions).
     pub(super) v_min_throttles: AtomicU64,
+    /// #hb166 T-6(a): count of V_min *suspended* drain batches — batches
+    /// where the fairness brake was OFF because a prior hard-cap armed
+    /// suspension. Flushed from each queue's
+    /// `v_min_suspended_batches_scratch` in `update_binding_debug_state`.
+    /// `v_min_suspended_batches / v_min_throttle_hard_cap_overrides` is
+    /// the effective suspension-window-length diagnostic; a large ratio
+    /// means the brake spends most of its time suppressed.
+    pub(super) v_min_suspended_batches: AtomicU64,
     pub(super) session_hits: AtomicU64,
     pub(super) session_misses: AtomicU64,
     pub(super) session_creates: AtomicU64,
@@ -809,6 +817,7 @@ impl BindingLiveState {
             cos_active_flow_counts: ArcSwap::from_pointee(Vec::new()),
             v_min_throttle_hard_cap_overrides: AtomicU64::new(0),
             v_min_throttles: AtomicU64::new(0),
+            v_min_suspended_batches: AtomicU64::new(0),
             session_hits: AtomicU64::new(0),
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),

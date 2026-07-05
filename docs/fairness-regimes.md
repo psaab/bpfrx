@@ -1603,6 +1603,89 @@ per-class SOLO/simul-load harness for R-1/R-4, and — because R-3 cannot
 be reproduced on x86-TSO — a functional CoS smoke to confirm the added
 writer fence is behavior-neutral on the deploy targets.
 
+#### TX-path MEDIUM cluster fixes (hb166 T-6, #4267)
+
+The fable-review-166 T-6 grouped TX-path cluster enumerated 13 CoS
+correctness/robustness sub-items (a–m). #4245 classified them 7 READY /
+6 DEFER; #4267 drives the six that are cleanly bounded at current master
+(after R-7/#4255, T-1/#4253, T-2+T-5/#4258, R-1/R-3/R-4/#4264 merged).
+Each carries a RED-on-revert unit test.
+
+- **T-6(a) — V_min suspended-batch telemetry + decaying re-arm.** The
+  V_min hard-cap arms `V_MIN_SUSPENSION_BATCHES` (1000) suspended drains
+  (`queue_ops/v_min.rs`), but `cos_queue_v_min_consume_suspension` counted
+  none of them — only the activation (`v_min_hard_cap_overrides`) — so
+  telemetry read "brake idle" while it was actually suppressed ~99% of the
+  time under persistent skew. Fix: a `v_min_suspended_batches` counter
+  (full scratch→atomic→snapshot→wire plumbing, mirrors `v_min_throttles`,
+  Go `VMinSuspendedBatches`) plus a decaying re-arm — each consecutive
+  hard-cap (no intervening passing V_min check) halves the suspension
+  window toward `V_MIN_SUSPENSION_MIN_BATCHES` (64), and a clean check
+  restores the full window — so a persistently-skewed queue re-engages the
+  brake progressively sooner. R-7/#4255 fixed the *root cause* of the trap
+  (rejoiner reseed); this is the telemetry + re-arm half of the same pair.
+
+- **T-6(b) — work-conserving exact-demand surplus reservation.** The
+  best-effort surplus reservation counted an exact guarantee class as full
+  demand (reserving its whole rate from the BE residual) merely for being
+  non-empty (`root_exact_demand_queue_mask`, `queue_service/mod.rs`;
+  `exact_backlog_queue_mask`, `tx_completion.rs`) — even when the class was
+  v8-starved / token-parked and shipping zero bytes, starving BE while the
+  link idled. Fix: a shared `cos_exact_queue_serviceable` predicate
+  (`queue_ops/mod.rs`) — runnable ∧ non-empty ∧ root/queue tokens cover the
+  head — gates BOTH the local demand mask AND the published peer-demand
+  mask, aligning them with the serviceability signal
+  `serviceable_exact_backlog_bytes` already publishes. A non-serviceable
+  class now releases its residual to best-effort. This touches the
+  #1368/#1371 BE-vs-exact contention contract — **needs a cluster CoS smoke
+  before merge** (confirm BE reclaims idle bandwidth without under-serving
+  a briefly-parked exact class). The "budget-0 queues never park / no wake
+  source" half of (b) is a separate wake-source design and stays deferred.
+
+- **T-6(e) — V_min publish on the CoSBatch settle path.** The CoSBatch
+  submit path (`submit_local`/`submit_prepared`) was the 5th of 5 V_min
+  settle boundaries but never called `publish_committed_queue_vtime`; the
+  four direct-service sites in `service.rs` do. Surplus-phase shared_exact
+  service advanced `queue_vtime` during batch build but never broadcast it,
+  so peers read a stale-low V_min slot and self-throttled exactly when
+  surplus works hardest. Fix: add the post-settle publish (no-op for
+  non-flow-fair / non-shared queues).
+
+- **T-6(g) — admission drops stop double-reporting as tx_errors + stop
+  allocating.** A designed CoS admission drop (`flow_share`/`buffer`
+  exceeded, `tx/cos_classify.rs`) — already counted in the dedicated
+  `admission_flow_share_drops`/`admission_buffer_drops` counters — ALSO
+  bumped the aggregate `tx_errors` (an operator reads a saturated shaper as
+  a fault) and allocated a per-drop `set_error(format!())` String, ~1M
+  allocs/sec under a shaping-drop storm (a hot-path-allocation-rule
+  violation). Fix: drop both; keep the non-allocating `dbg_cos_queue_overflow`
+  disambiguation counter. The per-drop `format!` in the `bound_pending_tx_*`
+  overflow loops (`tx/drain/mod.rs`) is removed for the same reason.
+
+- **T-6(d) — transmit_batch Drop-unwind order.** The oversized-frame
+  error unwind in `transmit_batch` (`tx/transmit/mod.rs`) drained the
+  staged prefix forward and `push_front`-ed each item, REVERSING same-flow
+  (in-order TCP) segments back onto `pending`. Fix: `.drain(..).rev()`
+  (the idiom already used in `tcp_segmentation.rs`).
+
+- **T-6(m) — BA classification for fragments / flowless packets.**
+  `resolve_cos_tx_selection` / `resolve_cached_cos_tx_selection` returned
+  the default queue whenever `flow_key == None` (fragments, flowless),
+  bypassing DSCP / 802.1p behavior-aggregate classification despite the
+  DSCP being present — so EF fragments straddled queues. BA classification
+  is 5-tuple-independent; the fix runs the DSCP→802.1p→default lookup from
+  `meta` in both None branches.
+
+**Deferred T-6 sub-items (recorded in #4267):** (k) coordinator-side
+scrub on binding unregister — overlaps R-7's reseed + the existing
+worker-side `vacate_all_shared_exact_slots_for_binding`; a safe scrub that
+distinguishes membership-change from legit Arc-reuse (without clobbering
+the deliberate additive `rehydrate_worker_active_count` or scrubbing live
+vtime slots) needs its own analysis + failover smoke. (c) ECN aggregate
+arm, (f) sidecar desync, (h) inbox-overflow fallbacks, (i)
+`max_total_leased` bank floor, (j) equal-flow divisor, (l) truncating-zip
+/ FIFO-settle sojourn — each needs its own design decision or repro.
+
 ### Non-exact guaranteed classes are metered class-wide (#4265, R-2)
 
 A **non-exact** guaranteed class whose transmit-rate trips

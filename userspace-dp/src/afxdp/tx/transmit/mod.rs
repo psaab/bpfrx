@@ -111,8 +111,13 @@ pub(in crate::afxdp) fn transmit_batch(
             let _ = apply_dscp_rewrite_to_frame(&mut req.bytes, dscp_rewrite);
         }
         if req.bytes.len() > tx_frame_capacity() {
-            // Unwind already-prepared entries before returning.
-            for (off, r) in binding.scratch.scratch_local_tx.drain(..) {
+            // #hb166 T-6(d): unwind already-prepared entries before
+            // returning. Drain in REVERSE so the successive push_front
+            // calls restore the ORIGINAL front-to-back order at the head of
+            // `pending`; a forward drain reverses the staged prefix and
+            // reorders same-flow (e.g. in-order TCP) segments on this error
+            // path. free_tx_frames are fungible, so their order is moot.
+            for (off, r) in binding.scratch.scratch_local_tx.drain(..).rev() {
                 binding.tx_pipeline.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }
@@ -133,8 +138,10 @@ pub(in crate::afxdp) fn transmit_batch(
                 .slice_mut_unchecked(offset as usize, req.bytes.len())
         }) else {
             binding.tx_pipeline.free_tx_frames.push_front(offset);
-            // Unwind already-prepared entries before returning.
-            for (off, r) in binding.scratch.scratch_local_tx.drain(..) {
+            // #hb166 T-6(d): reverse-drain unwind (see the capacity-drop
+            // site above) so the staged prefix keeps its original order at
+            // the head of `pending`.
+            for (off, r) in binding.scratch.scratch_local_tx.drain(..).rev() {
                 binding.tx_pipeline.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }

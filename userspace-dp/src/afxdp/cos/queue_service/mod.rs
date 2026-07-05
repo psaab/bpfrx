@@ -29,7 +29,7 @@ use crate::afxdp::{FastMap, TX_BATCH_SIZE, tx_frame_capacity};
 use crate::xsk_ffi::xdp::XdpDesc;
 
 use super::{
-    COS_MIN_BURST_BYTES, CoSQueueLeaseAcquireTelemetry, cos_item_len,
+    COS_MIN_BURST_BYTES, CoSQueueLeaseAcquireTelemetry, cos_exact_queue_serviceable, cos_item_len,
     cos_queue_clear_orphan_snapshot_after_drop, cos_queue_front, cos_queue_front_with_cap,
     cos_queue_is_empty, cos_queue_peek_min_bucket, cos_queue_pop_known_bucket, cos_queue_push_front,
     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue, cos_refill_ns_until,
@@ -313,11 +313,21 @@ fn build_nonexact_cos_batch(
 
 #[inline]
 fn root_exact_demand_queue_mask(root: &CoSInterfaceRuntime) -> u64 {
+    // #hb166 T-6(b): reserve residual best-effort surplus ONLY for exact
+    // guarantee queues that are actually SERVICEABLE (can ship their head
+    // right now). A v8-starved / token-parked exact class shipping zero
+    // bytes must NOT zero the BE residual while the link idles — gate on
+    // the same serviceability predicate the shared_exact backlog already
+    // publishes (`serviceable_exact_backlog_bytes`) instead of the loose
+    // `!cos_queue_is_empty`.
+    let root_tokens = root.tokens;
     root.queues
         .iter()
         .enumerate()
         .filter(|(_, queue)| {
-            queue.config.exact && queue.config.guarantee_enabled && !cos_queue_is_empty(queue)
+            queue.config.exact
+                && queue.config.guarantee_enabled
+                && cos_exact_queue_serviceable(root_tokens, queue)
         })
         .fold(0u64, |acc, (queue_idx, _)| {
             if queue_idx < u64::BITS as usize {

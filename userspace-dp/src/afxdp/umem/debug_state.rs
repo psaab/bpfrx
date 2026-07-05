@@ -271,35 +271,39 @@ fn publish_binding_debug_state(binding: &mut BindingWorker) {
             })
             .collect(),
     );
-    // #941 Work item D + #943: flush each queue's per-queue scratch
-    // counters (hard-cap overrides AND regular V_min throttles) into
-    // the binding-wide AtomicU64s. Mirrors the
-    // flow_cache_collision_evictions pattern. Single-writer (worker
-    // thread) on both ends, so no atomicity issue. The body is in
-    // `flush_v_min_scratches_into` so it's directly unit-testable
-    // without needing to construct a full `BindingWorker`.
+    // #941 Work item D + #943 + #hb166 T-6(a): flush each queue's
+    // per-queue scratch counters (hard-cap overrides, regular V_min
+    // throttles, AND suspended-batch count) into the binding-wide
+    // AtomicU64s. Mirrors the flow_cache_collision_evictions pattern.
+    // Single-writer (worker thread) on both ends, so no atomicity issue.
+    // The body is in `flush_v_min_scratches_into` so it's directly
+    // unit-testable without needing to construct a full `BindingWorker`.
     flush_v_min_scratches_into(
         binding.cos.cos_interfaces.values_mut(),
         &binding.live.v_min_throttle_hard_cap_overrides,
         &binding.live.v_min_throttles,
+        &binding.live.v_min_suspended_batches,
     );
 }
 
 /// Flush each queue's per-queue V_min scratch counters
-/// (`v_min_hard_cap_overrides_scratch` + `v_min_throttles_scratch`)
-/// into the binding-wide `AtomicU64`s and zero the scratches. Single
-/// pass over `roots`, single-writer discipline. Extracted from
-/// `update_binding_debug_state` so the flush is testable without
-/// constructing a `BindingWorker` (which has ~40 fields).
+/// (`v_min_hard_cap_overrides_scratch` + `v_min_throttles_scratch` +
+/// `v_min_suspended_batches_scratch`) into the binding-wide `AtomicU64`s
+/// and zero the scratches. Single pass over `roots`, single-writer
+/// discipline. Extracted from `update_binding_debug_state` so the flush
+/// is testable without constructing a `BindingWorker` (which has ~40
+/// fields).
 pub(in crate::afxdp) fn flush_v_min_scratches_into<'a, I>(
     roots: I,
     hard_cap_target: &AtomicU64,
     throttles_target: &AtomicU64,
+    suspended_batches_target: &AtomicU64,
 ) where
     I: IntoIterator<Item = &'a mut crate::afxdp::types::CoSInterfaceRuntime>,
 {
     let mut hard_cap_overrides_total = 0u64;
     let mut throttles_total = 0u64;
+    let mut suspended_batches_total = 0u64;
     for root in roots {
         for queue in &mut root.queues {
             if queue.v_min.v_min_hard_cap_overrides_scratch != 0 {
@@ -312,6 +316,12 @@ pub(in crate::afxdp) fn flush_v_min_scratches_into<'a, I>(
                     throttles_total.saturating_add(u64::from(queue.v_min.v_min_throttles_scratch));
                 queue.v_min.v_min_throttles_scratch = 0;
             }
+            // #hb166 T-6(a): flush the suspended-batch scratch too.
+            if queue.v_min.v_min_suspended_batches_scratch != 0 {
+                suspended_batches_total = suspended_batches_total
+                    .saturating_add(u64::from(queue.v_min.v_min_suspended_batches_scratch));
+                queue.v_min.v_min_suspended_batches_scratch = 0;
+            }
         }
     }
     if hard_cap_overrides_total != 0 {
@@ -319,5 +329,8 @@ pub(in crate::afxdp) fn flush_v_min_scratches_into<'a, I>(
     }
     if throttles_total != 0 {
         throttles_target.fetch_add(throttles_total, Ordering::Relaxed);
+    }
+    if suspended_batches_total != 0 {
+        suspended_batches_target.fetch_add(suspended_batches_total, Ordering::Relaxed);
     }
 }

@@ -106,15 +106,32 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
 ) -> CachedTxSelectionDescriptor {
     let iface = forwarding.cos.interfaces.get(&egress_ifindex);
     let Some(flow_key) = flow_key else {
+        // #hb166 T-6(m): fragments / flowless packets carry no 5-tuple but
+        // still carry a DSCP (and 802.1p PCP). Behavior-aggregate
+        // classification is 5-tuple-independent — resolve it from `meta` so
+        // an EF fragment lands in its BA queue instead of straddling the
+        // default queue. Filter forwarding-class / rewrite needs the flow
+        // key, so those stay unset (as before).
         return CachedTxSelectionDescriptor {
-            queue_id: iface.map(|iface| iface.default_queue),
+            queue_id: iface.map(|iface| {
+                resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                    .or_else(|| {
+                        resolve_cos_ieee8021_classifier_queue_id(
+                            iface,
+                            meta.ingress_pcp,
+                            meta.ingress_vlan_present != 0,
+                        )
+                    })
+                    .unwrap_or(iface.default_queue)
+            }),
             dscp_rewrite: None,
             drop: false,
             reject: false,
             filter_counters: crate::filter::CachedFilterCounters::default(),
             three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
             filter_log: None,
-            // No flow key => default-queue only; nothing to re-classify.
+            // Flowless packets are re-resolved per packet (no cache entry),
+            // so there is nothing to mark for hit-path re-classification.
             ba_reclassify: false,
         };
     };
@@ -384,8 +401,22 @@ fn resolve_cos_tx_selection_internal(
     }
     let iface = forwarding.cos.interfaces.get(&egress_ifindex);
     let Some(flow_key) = flow_key else {
+        // #hb166 T-6(m): flowless / fragment classification — run the
+        // 5-tuple-independent behavior-aggregate (DSCP / 802.1p) lookup from
+        // `meta` so a marked fragment lands in its BA queue rather than the
+        // default queue. Mirrors the cached-path None branch.
         return CoSTxSelection {
-            queue_id: iface.map(|iface| iface.default_queue),
+            queue_id: iface.map(|iface| {
+                resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                    .or_else(|| {
+                        resolve_cos_ieee8021_classifier_queue_id(
+                            iface,
+                            meta.ingress_pcp,
+                            meta.ingress_vlan_present != 0,
+                        )
+                    })
+                    .unwrap_or(iface.default_queue)
+            }),
             dscp_rewrite: None,
             drop: false,
             reject: false,
@@ -1063,7 +1094,7 @@ fn enqueue_cos_item(
     }
     let mut root_became_nonempty = false;
     let mut accepted_exact = false;
-    let (accepted, queue_id, recycle) = {
+    let (accepted, _queue_id, recycle) = {
         // Split-borrow: `umem` sits alongside `cos_interfaces` on
         // `BindingWorker`, so we can take a shared borrow on the umem
         // field while holding `&mut binding.cos.cos_interfaces` for the
@@ -1204,11 +1235,15 @@ fn enqueue_cos_item(
     // separate counters so operators can disambiguate CoS shaping
     // pressure from bound-pending pressure.
     binding.telemetry.dbg_cos_queue_overflow += 1;
-    binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-    binding.live.set_error(format!(
-        "class-of-service queue overflow on ifindex {} queue {}",
-        egress_ifindex, queue_id
-    ));
+    // #hb166 T-6(g): a CoS admission drop is DESIGNED shaping, not a TX
+    // error. It is already attributed above to the dedicated per-reason
+    // `admission_flow_share_drops` / `admission_buffer_drops` counters, so
+    // do NOT also inflate the aggregate `tx_errors` (an operator reads a
+    // saturated shaper as a fault) and do NOT allocate a per-drop
+    // `set_error(format!())` String: under a sustained shaping-drop storm
+    // this classify path runs once per excess packet (~1M allocs/sec), a
+    // hot-path-allocation-rule violation (CLAUDE.md). `dbg_cos_queue_overflow`
+    // (plain, non-allocating) keeps the #804 disambiguation signal.
     Ok(())
 }
 

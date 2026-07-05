@@ -116,6 +116,12 @@ fn compute_v_min_lag_threshold(queue_rate_bytes: u64, participating: u32) -> u64
 pub(in crate::afxdp) fn cos_queue_v_min_consume_suspension(queue: &mut CoSQueueRuntime) -> bool {
     if queue.v_min.v_min_suspended_remaining > 0 {
         queue.v_min.v_min_suspended_remaining -= 1;
+        // #hb166 T-6(a): count every batch the fairness brake is OFF
+        // because a prior hard-cap armed suspension. Pre-fix these were
+        // uncounted, so telemetry read "brake idle" while it was actually
+        // suppressed ~99% of the time under persistent skew.
+        queue.v_min.v_min_suspended_batches_scratch =
+            queue.v_min.v_min_suspended_batches_scratch.saturating_add(1);
         return true;
     }
     false
@@ -185,6 +191,15 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
     // and gating decision are byte-identical to before.
     if transmit_rate_bytes == 0 {
         queue.v_min.consecutive_v_min_skips = 0;
+        // #hb166 T-6(a): the decaying suspension window (see the hard-cap
+        // arm below) is RESTORED to full on the skew-clear / not-applicable
+        // paths — this unshaped path, the no-peer path, and a passing
+        // V_min check. The hard-cap path is the ONLY place that resets the
+        // skip counter WITHOUT restoring the window (it deliberately keeps
+        // the halved value, the decaying re-arm), so this is not a global
+        // "window==full iff skips==0" invariant — it is a reset on the
+        // three not-throttled outcomes.
+        queue.v_min.v_min_suspension_window = V_MIN_SUSPENSION_BATCHES;
         return true;
     }
     // Invariant: shared_exact queues are also flow_fair (set together
@@ -210,6 +225,8 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
     let Some(v_min) = v_min else {
         // No peers — reset hard-cap counter and continue.
         queue.v_min.consecutive_v_min_skips = 0;
+        // #hb166 T-6(a): not throttled -> reset the decaying window.
+        queue.v_min.v_min_suspension_window = V_MIN_SUSPENSION_BATCHES;
         return true;
     };
     let lag = compute_v_min_lag_threshold(transmit_rate_bytes, participating + 1);
@@ -219,6 +236,9 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
         // single throttled batch followed by 7 ok ones doesn't
         // accumulate.
         queue.v_min.consecutive_v_min_skips = 0;
+        // #hb166 T-6(a): the skew cleared -> restore the full decaying
+        // suspension window (see the hard-cap arm below).
+        queue.v_min.v_min_suspension_window = V_MIN_SUSPENSION_BATCHES;
         return true;
     }
     // #941 Work item D: hard-cap accounting. After
@@ -231,7 +251,15 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
     queue.v_min.consecutive_v_min_skips = queue.v_min.consecutive_v_min_skips.saturating_add(1);
     if queue.v_min.consecutive_v_min_skips >= V_MIN_CONSECUTIVE_SKIP_HARD_CAP {
         queue.v_min.consecutive_v_min_skips = 0;
-        queue.v_min.v_min_suspended_remaining = V_MIN_SUSPENSION_BATCHES;
+        // #hb166 T-6(a): decaying re-arm. Suspend for the CURRENT window,
+        // then halve it toward V_MIN_SUSPENSION_MIN_BATCHES so a queue
+        // that keeps tripping the hard-cap (no intervening passing V_min
+        // check to reset the window) re-engages the brake progressively
+        // sooner, instead of the fixed 1000-batch window keeping the
+        // brake off ~99% of the time under persistent skew.
+        queue.v_min.v_min_suspended_remaining = queue.v_min.v_min_suspension_window;
+        queue.v_min.v_min_suspension_window =
+            (queue.v_min.v_min_suspension_window / 2).max(V_MIN_SUSPENSION_MIN_BATCHES);
         queue.v_min.v_min_hard_cap_overrides_scratch = queue
             .v_min
             .v_min_hard_cap_overrides_scratch
