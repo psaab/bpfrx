@@ -3,10 +3,45 @@
 Comprehensive gap analysis between xpf and Juniper vSRX. Organized by category.
 Last updated: 2026-02-13
 
-> Status: Historical snapshot.  
-> This file is superseded for active planning by `docs/feature-gaps.md` and
-> `docs/authoritative-backlog.md`. Some statuses here are stale relative to
-> later HA/interface/monitor implementation sprints.
+> # ⚠️ STALE — DO NOT USE FOR PLANNING OR GAP-REPORTING
+>
+> Status: Historical snapshot (2026-02-13). Superseded by
+> `docs/feature-gaps.md`, `docs/feature-coverage.md`, and
+> `docs/authoritative-backlog.md`, which are the authoritative truth for
+> any feature's status. The section tables below are preserved for history
+> only. A parity review that re-reports a row below as a "gap" without
+> cross-checking the authoritative docs will chase phantom gaps.
+>
+> **Concretely, the following whole sections have SHIPPED since this
+> snapshot and their rows below are WRONG:**
+>
+> - **§5 High Availability — the ENTIRE section (all 8 rows) shipped:**
+>   Chassis Cluster, Session Sync, Redundancy Groups, Redundant Ethernet
+>   (bondless-RETH runtime), Fabric Links (dual fab0/fab1 + cross-chassis
+>   forwarding), ISSU, Graceful Switchover (priority-0 burst, ~1ms
+>   takeover), IP Monitoring for Failover (#1827).
+> - **§3 Routing:** BFD (OSPF/OSPFv3/IS-IS/BGP), OSPFv3, and BGP import
+>   all shipped; the routing-policy row's claims are stale.
+> - **§2 NAT:** Twice NAT, NAT Proxy ARP, deterministic / address-shifting
+>   NAT — all Done.
+> - **§4 VPN:** IPsec DPD (#3994) and traffic selectors — Done. (Policy-
+>   based IPsec VPN remains a real gap — rejected at commit, #3114; see
+>   `docs/feature-gaps.md` §15.)
+> - **§6 Management:** apply-groups, System Login Classes (RBAC), SNMP v2c
+>   traps (linkUp/Down), SNMPv3 USM (partial), event policies — all
+>   shipped or partial (rows say "No").
+> - **§7 QoS:** policing, shaping, scheduling, BA classification, rewrite
+>   rules — all shipped or partial (rows say "No").
+> - **§9 Logging:** structured RT_FLOW syslog, binary streaming, top-K
+>   aggregation (#3099), event-mode, `monitor security flow` / packet
+>   capture — all Done (rows say "No").
+> - **§8 IPv6:** DHCPv6 Prefix Delegation (IA_PD) is wired
+>   (`pkg/dhcp/commit.go` / `renew.go`).
+> - **§11 + the 16-item "Parse-Only" summary:** primary/preferred address,
+>   point-to-point, master-password, NTP threshold action, LAG/ae,
+>   `log.mode`, reth/fabric — all now Done. The **only survivor** of that
+>   parse-only list is `system license autoupdate url`
+>   (`types_system.go:45` `LicenseAutoUpdate`, parsed but not runtime-wired).
 
 ---
 
