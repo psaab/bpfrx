@@ -1203,6 +1203,87 @@ fn verdict_emits_doc_mandated_required_metrics() {
     assert_eq!(v["aggregate_throughput_gate_enforced"], false);
 }
 
+#[test]
+fn per_flow_metric_includes_starved_zero_streams() {
+    let tmp = TempGuard::new("starved_metric");
+    // Copilot #1 (V-9 accuracy): 6 connected streams, but socket 10
+    // never appears in any interval → it produced no steady-state
+    // throughput (starved). The per_flow_throughput_mbps metric must
+    // count all 6 streams with the starved one at 0 Mb/s, NOT drop it.
+    let sockets = [5u64, 6, 7, 8, 9, 10];
+    let mut intervals: Vec<Vec<StreamSample>> = Vec::new();
+    for i in 0..60u64 {
+        let mut iv = Vec::new();
+        // Only the first 5 sockets send; socket 10 is absent from every
+        // interval → empty bucket vec → starved.
+        for &sock in &sockets[..5] {
+            iv.push(StreamSample {
+                socket: sock,
+                start: i as f64,
+                end: i as f64 + 1.0,
+                bits_per_second: 1.0e9,
+            });
+        }
+        intervals.push(iv);
+    }
+    let json_str = synth_iperf3_json(60, &sockets, intervals);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(60), "ge-0-0-2");
+    let (_output, verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+    ]);
+    // Gate 1 fails on the starved stream, but the verdict JSON is still
+    // emitted on exit 1.
+    let v = verdict.expect("verdict JSON");
+    assert_eq!(v["starved_flow_count"], 1, "socket 10 must be starved: {v}");
+    let q = &v["per_flow_throughput_mbps"];
+    assert_eq!(
+        q["stream_count"], 6,
+        "starved stream must be counted, not dropped: {v}"
+    );
+    assert_eq!(
+        q["min_mbps"].as_f64(),
+        Some(0.0),
+        "starved stream contributes 0 Mb/s to the quantiles: {v}"
+    );
+    assert!(
+        q["max_mbps"].as_f64().unwrap() > 0.0,
+        "live streams still contribute >0: {v}"
+    );
+}
+
+#[test]
+fn expect_saturation_without_shaper_rate_is_arg_error() {
+    let tmp = TempGuard::new("expect_sat_no_shaper");
+    // Copilot #2: --expect-saturation without --shaper-rate-bps is an
+    // operator CLI mistake → arg-validation error (exit 2), NOT a Gate-3
+    // FAIL (exit 1) that automation would misread as a fairness
+    // regression.
+    let (_sockets, json_str) = make_balanced_pass_inputs(6, 60);
+    let tsv_str = make_balanced_tsv(6, &timestamps_for(60), "ge-0-0-2");
+    let (output, _verdict) = run_with_inputs(&tmp, &json_str, &tsv_str, &[
+        "--iface", "ge-0-0-2", "--n-workers", "6",
+        "--warmup-secs", "0", "--final-burst-secs", "0",
+        "--expect-saturation",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expect-saturation without --shaper-rate-bps must be an arg error (exit 2); stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shaper-rate"),
+        "stderr must explain the missing --shaper-rate-bps: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains('{'),
+        "arg error must not emit a verdict: {stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared input builders.
 // ---------------------------------------------------------------------------

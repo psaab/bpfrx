@@ -105,6 +105,22 @@ pub(crate) fn parse_args() -> Args {
             std::process::exit(2);
         }
     };
+    // --expect-saturation requires the Nₐ/Nᵥ-scaled cap inputs. A missing
+    // --shaper-rate-bps or a zero --n-workers is an operator CLI mistake,
+    // not a fairness regression, so fail fast with an arg-validation error
+    // (exit 2) instead of letting it surface as a Gate-3 FAIL (exit 1) —
+    // otherwise automation would misclassify a config error as a
+    // fairness failure (Copilot #2).
+    if expect_saturation && shaper_rate_bps == 0 {
+        eprintln!(
+            "fairness-eval: --expect-saturation requires --shaper-rate-bps > 0 to compute the Na/Nv-scaled structural cap"
+        );
+        std::process::exit(2);
+    }
+    if expect_saturation && n_workers == 0 {
+        eprintln!("fairness-eval: --expect-saturation requires --n-workers > 0");
+        std::process::exit(2);
+    }
     Args {
         iperf_json,
         binding_flows,

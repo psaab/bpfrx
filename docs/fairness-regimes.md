@@ -295,7 +295,11 @@ A measurement run **PASSES** iff ALL of:
    independent input observed data cannot launder: it asserts the run
    *ought* to reach the cap, so the observed aggregate is then required
    to actually hit ≥ 95% of the `Nₐ/Nᵥ`-scaled cap for ≥ 80% of buckets.
-   `--expect-saturation` requires `--shaper-rate-bps` and `--n-workers`.
+   `--expect-saturation` requires `--shaper-rate-bps` and `--n-workers`;
+   passing it with a missing/zero `--shaper-rate-bps` or `--n-workers` is
+   an operator CLI mistake and fails fast with an arg-validation error
+   (exit 2), not a Gate-3 FAIL (exit 1), so automation does not
+   misclassify a config error as a fairness regression.
    The non-shaped "±5% of measured baseline" clause still needs a
    baseline-artifact input and is not yet implemented; the
    `--expect-saturation` shaped leg is the enforceable part today.
@@ -451,7 +455,10 @@ Any fairness measurement run MUST report:
 
 The `fairness-eval` verdict always includes the doc-mandated required
 metrics (hb166 V-9): `per_flow_throughput_mbps` (item 1: `stream_count`
-plus `min/p25/median/p75/max_mbps`), `steady_state_window` (item 12:
+plus `min/p25/median/p75/max_mbps`, computed over the FULL iperf stream
+set — a starved / zero-throughput stream is counted as 0 Mb/s, not
+dropped, so a failing run's per-flow distribution surfaces the starved
+flow instead of undercounting it), `steady_state_window` (item 12:
 `iperf_epoch_start/end`, `relative_start/end_sec`), and
 `saturation_series` (item 6: the per-bucket `aggregate_buckets_bps`
 series, the `structural_cap_bps` it is judged against, and
