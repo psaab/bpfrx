@@ -1,0 +1,99 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestCustomLoginClassCommitsWithAdvisory is the RED-on-revert guard for
+// #4304 S-2. A real vSRX RBAC config that defines a custom `login class` and
+// assigns a user to it must COMMIT (SchemaValidate accepts) — the pre-fix
+// fixed enum hard-rejected `class noc-admin`, blocking the WHOLE config. The
+// class must compile with the Junos permission set mapped to the coarse xpf
+// model, and the compiler must emit the accept-with-advisory warning.
+func TestCustomLoginClassCommitsWithAdvisory(t *testing.T) {
+	tree := buildTree4303(t, []string{
+		"set system login class noc-admin permissions all",
+		"set system login class noc-admin idle-timeout 30",
+		"set system login user bob class noc-admin",
+		"set system login user bob uid 2001",
+	})
+	c, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// RED-on-revert: the fixed enum rejected the custom class name here.
+	if err := SchemaValidate(tree, c); err != nil {
+		t.Fatalf("SchemaValidate hard-rejected a valid custom-RBAC config: %v", err)
+	}
+	if c.System.Login == nil || len(c.System.Login.Classes) != 1 {
+		t.Fatalf("expected one custom login class, got %+v", c.System.Login)
+	}
+	lc := c.System.Login.Classes[0]
+	if lc.Name != "noc-admin" {
+		t.Fatalf("class name = %q, want noc-admin", lc.Name)
+	}
+	if len(lc.MappedPermissions) != 1 || lc.MappedPermissions[0] != PermAll {
+		t.Fatalf("permissions all -> %v, want [PermAll]", lc.MappedPermissions)
+	}
+	if lc.IdleTimeout != 30 {
+		t.Fatalf("idle-timeout = %d, want 30", lc.IdleTimeout)
+	}
+	// Accept-with-advisory: an advisory naming the class must be present.
+	found := false
+	for _, w := range c.Warnings {
+		if strings.Contains(w, "noc-admin") && strings.Contains(w, "recognized") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an accept-with-advisory warning for noc-admin; warnings=%v", c.Warnings)
+	}
+}
+
+// TestCustomLoginClassPermissionMapping checks the least-privilege folding:
+// unambiguous whole-box tokens map precisely, and any other subsystem/-control
+// token folds DOWN to a view-only floor (never silently grants config/control
+// from a narrow token).
+func TestCustomLoginClassPermissionMapping(t *testing.T) {
+	tree := buildTree4303(t, []string{
+		"set system login class ops permissions [ view clear network interface-control ]",
+		"set system login user carol class ops",
+	})
+	c, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := SchemaValidate(tree, c); err != nil {
+		t.Fatalf("SchemaValidate rejected ops class: %v", err)
+	}
+	lc := c.System.Login.Classes[0]
+	perms := map[LoginClassPermission]bool{}
+	for _, p := range lc.MappedPermissions {
+		perms[p] = true
+	}
+	if !perms[PermView] || !perms[PermClear] {
+		t.Fatalf("expected view+clear in %v", lc.MappedPermissions)
+	}
+	// `network` and `interface-control` fold to view-only — they must NOT
+	// silently grant config/control/maint.
+	if perms[PermConfig] || perms[PermControl] || perms[PermMaint] || perms[PermAll] {
+		t.Fatalf("subsystem tokens over-granted: %v", lc.MappedPermissions)
+	}
+}
+
+// TestUndefinedLoginClassStillRejected proves the gate did not go fail-open:
+// a user referencing a class that is neither built-in nor defined must still
+// be rejected at commit.
+func TestUndefinedLoginClassStillRejected(t *testing.T) {
+	tree := buildTree4303(t, []string{
+		"set system login user dave class ghost-class",
+	})
+	c, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := SchemaValidate(tree, c); err == nil {
+		t.Fatalf("SchemaValidate accepted an undefined login class (fail-open regression)")
+	}
+}

@@ -84,6 +84,36 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			}
 		case "login":
 			sys.Login = &LoginConfig{}
+			// #4304 S-2: parse custom `login class <name>` RBAC definitions so
+			// a real vSRX config commits (the `user ... class` enum accepts
+			// the defined names) and maps its Junos permission set onto xpf's
+			// coarse permission model. Compiled BEFORE users so the class set
+			// is complete regardless of stanza order.
+			for _, classInst := range namedInstances(child.FindChildren("class")) {
+				lc := &LoginClass{Name: classInst.name}
+				for _, prop := range classInst.node.Children {
+					switch prop.Name() {
+					case "permissions":
+						lc.Permissions = append(lc.Permissions, firewallMatchValues(prop)...)
+					case "idle-timeout":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								lc.IdleTimeout = n
+							}
+						}
+					case "allow-commands":
+						lc.AllowCommands = nodeVal(prop)
+					case "deny-commands":
+						lc.DenyCommands = nodeVal(prop)
+					case "allow-configuration":
+						lc.AllowConfiguration = nodeVal(prop)
+					case "deny-configuration":
+						lc.DenyConfiguration = nodeVal(prop)
+					}
+				}
+				lc.MappedPermissions, _ = mapJunosPermissions(lc.Permissions)
+				sys.Login.Classes = append(sys.Login.Classes, lc)
+			}
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
 				user := &LoginUser{Name: userInst.name}
 				for _, prop := range userInst.node.Children {
@@ -769,6 +799,72 @@ func syslogFacilitySeverity(prop *Node) (facility, severity string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+// loginClassPermName renders a coarse xpf permission for the advisory.
+func loginClassPermName(p LoginClassPermission) string {
+	switch p {
+	case PermView:
+		return "view"
+	case PermClear:
+		return "clear"
+	case PermControl:
+		return "control"
+	case PermConfig:
+		return "configure"
+	case PermMaint:
+		return "maintenance"
+	case PermAll:
+		return "super-user"
+	default:
+		return "unknown"
+	}
+}
+
+// loginClassAdvisoryWarnings emits one accept-with-advisory warning per custom
+// `system login class <name>` (#4304 S-2). The class is RECOGNIZED (a valid
+// vSRX RBAC config commits instead of being hard-rejected), but xpf's coarse
+// permission model cannot faithfully represent every Junos permission or the
+// per-command allow/deny regexes, so the advisory states exactly what maps and
+// what is recognized-but-not-enforced. Deterministic order for stable output.
+func loginClassAdvisoryWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) == 0 {
+		return nil
+	}
+	var warnings []string
+	for _, lc := range cfg.System.Login.Classes {
+		mapped, folded := mapJunosPermissions(lc.Permissions)
+		names := make([]string, 0, len(mapped))
+		for _, p := range mapped {
+			names = append(names, loginClassPermName(p))
+		}
+		mappedStr := "none"
+		if len(names) > 0 {
+			sort.Strings(names)
+			mappedStr = strings.Join(names, ",")
+		}
+		msg := fmt.Sprintf("system login class %q: recognized (custom RBAC); Junos permissions [%s] mapped to xpf coarse permissions {%s}",
+			lc.Name, strings.Join(lc.Permissions, " "), mappedStr)
+		if len(folded) > 0 {
+			sort.Strings(folded)
+			msg += fmt.Sprintf("; fine-grained permissions [%s] folded to view-only (xpf has no finer bucket)", strings.Join(folded, " "))
+		}
+		var inert []string
+		if lc.AllowCommands != "" || lc.DenyCommands != "" {
+			inert = append(inert, "allow-commands/deny-commands")
+		}
+		if lc.AllowConfiguration != "" || lc.DenyConfiguration != "" {
+			inert = append(inert, "allow-configuration/deny-configuration")
+		}
+		if lc.IdleTimeout > 0 {
+			inert = append(inert, "idle-timeout")
+		}
+		if len(inert) > 0 {
+			msg += fmt.Sprintf("; %s accepted but NOT enforced by xpf's coarse RBAC", strings.Join(inert, " + "))
+		}
+		warnings = append(warnings, msg)
+	}
+	return warnings
 }
 
 // userspaceRetiredKnobWarnings turns each retired DPDK-era `system

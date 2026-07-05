@@ -1,3 +1,24 @@
+## 2026-07-05 — system: fable-167 S-2 accept custom `system login class <name>` (#4304)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4304 (S-2) — a custom `system login class <name>` RBAC
+    definition was hard-rejected at commit (the `user ... class` leaf was a
+    fixed enum over the built-ins), blocking the WHOLE config. Accept-with-
+    advisory: added the `login class` schema container, switched the
+    `user ... class` validator to the tree-aware `validateLoginClassRef`
+    (built-ins UNION custom names via `schemaRefs.loginClasses`), parsed the
+    class definitions into `LoginConfig.Classes` with `mapJunosPermissions`
+    folding Junos permission tokens onto xpf's coarse model (least-privilege
+    view floor for non-whole-box tokens), emitted a per-class advisory, and
+    wired the runtime RBAC (`resolveClassPerms` in pkg/cli/permissions.go) so
+    a custom-class user is enforced instead of locked out.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_system.go,
+    pkg/config/schema_system.go, pkg/config/schema_walk.go,
+    pkg/config/schema_validators.go, pkg/config/compiler.go,
+    pkg/cli/permissions.go, pkg/config/login_custom_class_4304_test.go,
+    pkg/cli/permissions_custom_class_4304_test.go, docs/system-login.md,
+    docs/config-schema.md
+
 ## 2026-07-05 — system/logging/SNMP: fable-167 S-1 syslog host/file sub-statement misparse (#4303)
 
 - **Timestamp**: 2026-07-05

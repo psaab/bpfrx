@@ -4763,3 +4763,39 @@ enum and rejected (an IP is not a severity).
   hardcoded 514.
 - **tests** — `pkg/config/compiler_syslog_hostmods_4303_test.go` (facilities
   not polluted, source-address/port captured, strict commit accepts).
+
+## Custom system login class (#4304 S-2)
+
+The `system login user <n> class <c>` leaf was a fixed enum over the
+system-defined built-ins (`ValidLoginClasses()`), so a config that defined
+its own RBAC class (`set system login class noc-admin permissions all` +
+`set system login user bob class noc-admin`) was HARD-REJECTED at commit —
+blocking the whole config. This is accept-with-advisory now:
+
+- **schema** — a new `system login class <name>` container
+  (`schema_system.go`) with children `permissions` (multi), `idle-timeout`
+  (int), `allow-commands`, `deny-commands`, `allow-configuration`,
+  `deny-configuration`, `login-alarms`, `login-tip`. The `user ... class`
+  leaf switched from `ValidateEnum(ValidLoginClasses())` to the tree-aware
+  `treeValidator: validateLoginClassRef`, which accepts the built-ins UNION
+  the custom class names collected from the tree (`schemaRefs.loginClasses`,
+  `collectSchemaRefs`, merged from `defsSource` too). An undefined class
+  still fails closed.
+- **compiler** — `compileSystem` login loop parses the `class` definitions
+  (before users) into `LoginConfig.Classes`, folding the Junos `permissions`
+  tokens onto the coarse xpf model via `mapJunosPermissions`
+  (`LoginClass.MappedPermissions`). Only whole-box tokens map precisely;
+  everything else folds DOWN to a PermView floor (never over-grants
+  config/control/maint from a narrow subsystem token).
+- **advisory** — `loginClassAdvisoryWarnings` emits one `cfg.Warnings` entry
+  per custom class naming the mapped permissions and the recognized-but-not-
+  enforced sub-statements (allow/deny-commands, idle-timeout).
+- **runtime** — `pkg/cli/permissions.go` `resolveClassPerms` consults the
+  built-ins first, then `store.ActiveConfig().System.Login.Classes`, so a
+  custom-class user is enforced against the mapped permissions instead of
+  being locked out as an "unknown login class". Both `checkPermission` and
+  `showConfigRedacted` route through it.
+- **tests** — `pkg/config/login_custom_class_4304_test.go` (commit accepts +
+  mapping + advisory + undefined-still-rejected);
+  `pkg/cli/permissions_custom_class_4304_test.go` (runtime enforcement +
+  redaction).

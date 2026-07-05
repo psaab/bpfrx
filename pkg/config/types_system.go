@@ -618,6 +618,77 @@ func ValidLoginClasses() []string {
 // LoginConfig holds user account definitions.
 type LoginConfig struct {
 	Users []*LoginUser
+	// Classes are custom `system login class <name>` RBAC definitions
+	// (#4304 S-2). xpf recognizes them so a real vSRX RBAC config commits,
+	// and maps their Junos permission set onto the coarse xpf permission
+	// model (LoginClass.MappedPermissions) consulted by pkg/cli/permissions.
+	Classes []*LoginClass
+}
+
+// LoginClass is a custom `system login class <name>` definition (#4304 S-2).
+//
+// Junos ships a large fine-grained permission vocabulary and per-command
+// allow/deny regexes; xpf's runtime RBAC is coarse
+// (view/clear/control/config/maint/all, types_system.go LoginClassPermission).
+// So xpf recognizes the class (a valid config commits instead of being
+// hard-rejected at the `user ... class` enum) and maps the whole-box Junos
+// permission tokens onto the nearest coarse bucket. Fine-grained
+// allow-commands / deny-commands / idle-timeout are recorded but NOT enforced
+// by the coarse gate; the compiler emits an advisory saying so.
+type LoginClass struct {
+	Name               string
+	Permissions        []string               // raw Junos permission tokens as written
+	MappedPermissions  []LoginClassPermission // coarse xpf perms derived from Permissions
+	IdleTimeout        int                    // minutes; recognized, not enforced
+	AllowCommands      string                 // regex; recognized, not enforced
+	DenyCommands       string                 // regex; recognized, not enforced
+	AllowConfiguration string                 // regex; recognized, not enforced
+	DenyConfiguration  string                 // regex; recognized, not enforced
+}
+
+// mapJunosPermissions folds a custom login class's Junos permission tokens onto
+// xpf's coarse permission model (#4304 S-2). Only the unambiguous whole-box
+// tokens map precisely; every other recognized subsystem/-control token folds
+// DOWN to a PermView floor (least-privilege — never silently grant config,
+// control, or maintenance from a narrow subsystem token) and is returned in
+// foldedToView so the compiler advisory can list what is coarsely mapped. The
+// PermView floor lets the class holder log in and view even when no token maps
+// precisely; `unauthorized` (empty token set) grants nothing.
+func mapJunosPermissions(tokens []string) (perms []LoginClassPermission, foldedToView []string) {
+	have := map[LoginClassPermission]bool{}
+	add := func(p LoginClassPermission) {
+		if !have[p] {
+			have[p] = true
+			perms = append(perms, p)
+		}
+	}
+	for _, tok := range tokens {
+		switch tok {
+		case "all", "super-user":
+			add(PermAll)
+		case "maintenance", "reset":
+			add(PermMaint)
+		case "clear":
+			add(PermClear)
+		case "control":
+			add(PermControl)
+		case "configure", "rollback":
+			add(PermConfig)
+		case "view", "view-configuration":
+			add(PermView)
+		default:
+			// Any other recognized Junos permission (a subsystem read like
+			// `network`/`interface`/`routing`/`firewall`, a `*-control`
+			// write token, `shell`, `secret`, ...) is coarsely folded to a
+			// view-only floor. Under-granting is the safe direction: xpf's
+			// coarse model cannot faithfully represent per-subsystem write
+			// scope, so it must not over-grant config/control from a narrow
+			// token.
+			add(PermView)
+			foldedToView = append(foldedToView, tok)
+		}
+	}
+	return perms, foldedToView
 }
 
 // LoginUser defines a system user account.

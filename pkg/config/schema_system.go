@@ -185,17 +185,33 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			})},
 	}},
 	"login": {desc: "Login configuration", children: map[string]*schemaNode{
+		// #4304 S-2: custom `login class <name>` RBAC definition. Recognized so
+		// a real vSRX config commits; the Junos permission set is mapped onto
+		// xpf's coarse permission model at compile (compiler_system.go). The
+		// fine-grained allow/deny-command regexes are accepted structurally but
+		// not enforced (see the compile advisory).
+		"class": {desc: "Login class definition", args: 1, placeholder: "<class-name>", children: map[string]*schemaNode{
+			"permissions":         {desc: "Permission bits granted to the class", args: 1, multi: true, placeholder: "<permission>", children: nil},
+			"idle-timeout":        {desc: "Idle timeout (minutes)", args: 1, placeholder: "<minutes>", valueType: ValueInteger, validator: ValidateInteger(0, 4294967295), children: nil},
+			"allow-commands":      {desc: "Regex of operational commands to allow", args: 1, placeholder: "<regex>", children: nil},
+			"deny-commands":       {desc: "Regex of operational commands to deny", args: 1, placeholder: "<regex>", children: nil},
+			"allow-configuration": {desc: "Regex of configuration to allow", args: 1, placeholder: "<regex>", children: nil},
+			"deny-configuration":  {desc: "Regex of configuration to deny", args: 1, placeholder: "<regex>", children: nil},
+			"login-alarms":        {desc: "Display system alarms on login", children: nil},
+			"login-tip":           {desc: "Display a tip on login", children: nil},
+		}},
 		"user": {desc: "User name", args: 1, placeholder: "<username>", children: map[string]*schemaNode{
 			"uid": {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
-			// #2008 H6: enum-validate the login class at commit (RBAC is
-			// already enforced in pkg/cli/permissions.go; this closes the
-			// commit-accepts-any-string hole). The allowed set is derived from
-			// LoginClassPermissions so the schema enum and the runtime RBAC
-			// table cannot drift. Mirrors the SNMP `authorization` enum leaf.
+			// #2008 H6 / #4304 S-2: the class is validated against the
+			// system-defined built-ins UNION any custom `login class <name>`
+			// defined in the SAME candidate tree. The tree-aware validator
+			// replaces the fixed enum so a valid custom-RBAC config is no
+			// longer hard-rejected at commit, while an undefined class still
+			// fails closed. RBAC enforcement is in pkg/cli/permissions.go.
 			"class": {desc: "Login class", args: 1, placeholder: "<class>",
-				valueType: ValueEnumOf, valueDesc: "System-defined login class (super-user | operator | read-only | config-viewer | unauthorized)",
+				valueType: ValueEnumOf, valueDesc: "System-defined class (super-user | operator | read-only | config-viewer | unauthorized) or a custom `login class <name>`",
 				valueExamples: []string{"super-user", "operator", "read-only"},
-				validator:     ValidateEnum(ValidLoginClasses()), children: nil},
+				treeValidator: validateLoginClassRef, children: nil},
 			// #1944: close the schema asymmetry the compiler already
 			// half-implemented — give `authentication` a value-bearing
 			// children map (encrypted-password typed leaf + ssh-* keys).
