@@ -95,6 +95,33 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								iface.Cost = n
 							}
 						}
+					case "hello-interval":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.HelloInterval = n
+							}
+						}
+					case "dead-interval":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.DeadInterval = n
+							}
+						}
+					case "retransmit-interval":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.RetransmitInt = n
+							}
+						}
+					case "priority":
+						// OSPF priority 0 is valid ("never DR"), so mark
+						// HasPriority to distinguish it from unset.
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.Priority = n
+								iface.HasPriority = true
+							}
+						}
 					case "authentication":
 						for _, authChild := range prop.Children {
 							switch authChild.Name() {
@@ -256,6 +283,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 
 		for _, groupInst := range namedInstances(bgpNode.FindChildren("group")) {
 			var peerAS uint32
+			var groupLocalAS uint32
+			var groupLocalAddress string
+			var groupHoldTime int
+			var groupPassive bool
 			var groupDesc string
 			var groupMultihop int
 			var groupExport []string
@@ -277,6 +308,22 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							peerAS = uint32(n)
 						}
 					}
+				case "local-as":
+					if v := nodeVal(child); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							groupLocalAS = uint32(n)
+						}
+					}
+				case "local-address":
+					groupLocalAddress = nodeVal(child)
+				case "hold-time":
+					if v := nodeVal(child); v != "" {
+						if n, err := strconv.Atoi(v); err == nil {
+							groupHoldTime = n
+						}
+					}
+				case "passive":
+					groupPassive = true
 				case "description":
 					groupDesc = nodeVal(child)
 				case "multihop":
@@ -382,6 +429,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						neighbor := &BGPNeighbor{
 							Address:          nAddr,
 							PeerAS:           peerAS,
+							LocalAS:          groupLocalAS,
+							LocalAddress:     groupLocalAddress,
+							HoldTime:         groupHoldTime,
+							Passive:          groupPassive,
 							Description:      groupDesc,
 							MultihopTTL:      groupMultihop,
 							Export:           groupExport,
@@ -416,6 +467,22 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 										neighbor.PeerAS = uint32(n)
 									}
 								}
+							case "local-as":
+								if v := nodeVal(prop); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										neighbor.LocalAS = uint32(n)
+									}
+								}
+							case "local-address":
+								neighbor.LocalAddress = nodeVal(prop)
+							case "hold-time":
+								if v := nodeVal(prop); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										neighbor.HoldTime = n
+									}
+								}
+							case "passive":
+								neighbor.Passive = true
 							case "authentication-key":
 								neighbor.AuthPassword = Secret(nodeVal(prop))
 							case "route-reflector-client":
@@ -541,6 +608,31 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						if v := nodeVal(prop); v != "" {
 							if n, err := strconv.Atoi(v); err == nil {
 								iface.Cost = n
+							}
+						}
+					case "hello-interval":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.HelloInterval = n
+							}
+						}
+					case "dead-interval":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.DeadInterval = n
+							}
+						}
+					case "retransmit-interval":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.RetransmitInt = n
+							}
+						}
+					case "priority":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								iface.Priority = n
+								iface.HasPriority = true
 							}
 						}
 					case "bfd-liveness-detection":

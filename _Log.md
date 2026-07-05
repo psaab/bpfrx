@@ -1,3 +1,60 @@
+## 2026-07-05 — routing: fable-167 R-1/R-2 OSPF timers + BGP update-source adjacency parity (#4285/#4286)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4285 (R-1) — OSPF/OSPFv3 interface `hello-interval`,
+    `dead-interval`, `retransmit-interval`, and `priority` were parsed by
+    no layer and dropped silently, so FRR kept its default 10s/40s hello/dead
+    and an adjacency to a fast-timer neighbor never formed. Added the leaves
+    to `setSchema` (OSPFv2 + OSPFv3 interface), the `OSPFInterface` /
+    `OSPFv3Interface` structs (with a `HasPriority` presence flag so a valid
+    priority 0 = "never DR" is not conflated with unset), the
+    `compiler_protocols.go` interface switches, and the FRR renderer
+    (`ip ospf hello-interval/dead-interval/retransmit-interval/priority` and
+    the `ipv6 ospf6 ...` equivalents).
+  - **Action**: #4286 (R-2) — BGP group-level (and per-neighbor override)
+    `local-address`, `passive`, `hold-time`, and `local-as` were dropped, so
+    iBGP loopback peering emitted no `update-source` and the session sourced
+    from the egress IP the peer had no `neighbor` for → never established.
+    Added the leaves to `setSchema` (group + neighbor), `BGPNeighbor`
+    (`LocalAddress`/`Passive`/`HoldTime`/`LocalAS`), the group + per-neighbor
+    compiler switches, and the renderer (`neighbor X update-source`, `passive`,
+    `timers <keepalive> <hold>` with keepalive = hold/3, `local-as`).
+  - **File(s)**: pkg/config/schema_routing.go, pkg/config/types_routing.go,
+    pkg/config/compiler_protocols.go, pkg/frr/policy_render.go,
+    pkg/config/routing_adjacency_4285_test.go,
+    pkg/frr/routing_adjacency_4285_test.go, pkg/frr/README.md
+  - **Validation**: `go test ./pkg/config/... ./pkg/frr/...` green; RED-on-
+    revert verified (neutralizing the render emit drops the frr.conf lines →
+    tests fail). `go build ./...`, gofmt, go vet clean.
+  - **Action**: PR #4293 review follow-up (MERGE-NEEDS-MINOR) — added
+    commit-time range validators to the new numeric leaves so an
+    out-of-range value is REJECTED at strict commit instead of rendering
+    an frr-reload-BREAKING stanza (one bad leaf fails the whole reload).
+    OSPF/OSPFv3 hello/dead/retransmit `ValidateInteger(1, 65535)`,
+    priority `ValidateInteger(0, 255)`; BGP local-as
+    `ValidateInteger(1, 4294967295)`; BGP hold-time a new
+    `ValidateBGPHoldTime` accepting {0, or 3..65535} — FRR rejects a
+    hold-time of 1/2 (keepalive = hold/3) which would fail the reload, so
+    1/2 are rejected at commit while 0 (disabled) is kept. Discovered +
+    fixed a pre-existing schema gap: the leaves had landed in only ONE of
+    the two duplicated `protocols` subtrees per family (top-level `ospf3`
+    and `routing-instances ospf` were missing them); all FOUR OSPF
+    interface copies now carry the leaves + validators (the shared
+    `compileProtocols` already handled both scopes, and SchemaValidate is
+    lenient on unknown leaves so out-of-range slipped through where the
+    schema was incomplete). Fixed the stale `Priority < 0 = unset` comment
+    left from the abandoned -1 sentinel. Made the local-as-bearing tests
+    eBGP-shaped (FRR restricts `neighbor local-as` to eBGP peers).
+  - **File(s)**: pkg/config/schema_validators.go (ValidateBGPHoldTime),
+    pkg/config/schema_routing.go (validators on all 4 OSPF copies + BGP
+    group/neighbor), pkg/config/schema_validate_routing_4285_test.go (new
+    reject matrix), pkg/frr/policy_render.go (comment), pkg/frr/README.md,
+    pkg/config/routing_adjacency_4285_test.go +
+    pkg/frr/routing_adjacency_4285_test.go (eBGP-shaped local-as)
+  - **Validation**: reject matrix green (RED-on-revert verified — stripping
+    the validators lets out-of-range through); full
+    `go test ./pkg/config/... ./pkg/frr/...` green; build/gofmt/vet clean.
+
 ## 2026-07-05 — cos: #4272 div_ceil .max(1) hardening + fable-166 R-10 CoS test-coverage gaps (#4280)
 
 - **Timestamp**: 2026-07-05

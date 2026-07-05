@@ -233,6 +233,31 @@ func ValidateInteger(min, max int64) LeafValidator {
 	}
 }
 
+// ValidateBGPHoldTime accepts a BGP hold-time in seconds: 0, or 3..65535.
+// FRR (and RFC 4271 §4.2 / §10) require the hold-time to be either 0
+// (hold timer disabled) or at least 3 seconds — the keepalive interval is
+// hold-time/3, so a hold-time of 1 or 2 yields a sub-second/zero keepalive
+// that FRR's `neighbor X timers <keepalive> <hold>` command REJECTS, and a
+// rejected line fails the WHOLE frr-reload (a single `vtysh -f` add-batch
+// exits non-zero on any CMD_WARNING_CONFIG_FAILED) — one bad leaf takes
+// down every routing change on that reload. The renderer treats 0 as "unset"
+// via its `> 0` gate (no `timers` line), an accepted documented tradeoff, so
+// 0 is permitted here; 1 and 2 are the values that must be rejected at commit
+// before they can reach frr-reload. Upper bound is the 16-bit on-wire max.
+func ValidateBGPHoldTime(raw string, _ *Config) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected integer)")
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("not an integer: %q", raw)
+	}
+	if v != 0 && (v < 3 || v > 65535) {
+		return fmt.Errorf("BGP hold-time must be 0 or 3..65535 seconds (got %d); FRR rejects 1/2 and a rejected timers line fails the whole reload", v)
+	}
+	return nil
+}
+
 // ValidateDHGroup accepts a Diffie-Hellman group as either a bare integer
 // (e.g. "14") or the Junos "group<N>" spelling (e.g. "group14") — both are
 // configured in the wild and both compile (compiler_ipsec.go strips the
