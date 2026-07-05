@@ -34600,3 +34600,10 @@ top.
   guard on gate_1, a gate_0 generator-health check, and replaced the
   `|| true` iperf launchers with per-port .rc capture. Closes #4239.
 - **File(s)**: test/incus/cos-simul-load-smoke.sh, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-2 — wire cos-gate1-small-four-alone.sh reducer to
+  exit nonzero on GATE1 FAIL (was always exit 0). Added sys.exit(0 if
+  all_pass else 1), per-port .rc generator-health capture, replaced
+  `|| true` launchers. Closes #4240.
+- **File(s)**: test/incus/cos-gate1-small-four-alone.sh, _Log.md
