@@ -4,6 +4,11 @@
 Subcommands:
   deploy <appliance.yaml> [...]   launch from YAML definition(s); a cluster
                                   is two files. (Default if args are *.yaml.)
+                                  Preflights every prerequisite before it
+                                  mutates, and cleans up a half-created VM on a
+                                  mid-deploy failure so the re-run starts clean.
+  destroy <appliance.yaml> [...]  tear down the deployed VM(s) + per-VM overlay
+                                  + day-0 drive so a re-deploy is clean.
   launch --name … --nic …         imperative launch without a YAML file.
   inventory                       list host NICs, SR-IOV VFs, bridges → the
                                   values you drop into a definition.
@@ -83,6 +88,25 @@ def backing_sort_key(backing):
 
 def die(msg):
     sys.exit(f"ERROR: {msg}")
+
+
+def run_capture(argv, dry=False):
+    """Run argv, capturing stdout+stderr. On a nonzero exit, die() with the
+    command, the return code, and the captured stderr — the hypervisor tool's
+    REAL message (missing bridge, existing instance, unknown image alias) —
+    instead of letting a bare CalledProcessError traceback swallow it
+    (fable-165 H-21). In dry-run, print the command and return "" (never
+    execute). Returns stdout on success. This is the single capture-and-report
+    helper every hypervisor-command call site funnels through."""
+    if dry:
+        print(" ".join(shlex.quote(a) for a in argv))
+        return ""
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode != 0:
+        cmd = " ".join(shlex.quote(a) for a in argv)
+        detail = (r.stderr or r.stdout or "").strip() or "(no output on stderr)"
+        die(f"command failed (rc={r.returncode}): {cmd}\n    {detail}")
+    return r.stdout
 
 
 # ── naming contract ───────────────────────────────────────────────────
@@ -302,7 +326,7 @@ def build_config_drive(ap, runner):
                     "-J", "-r", "-o", iso, stage]
         else:
             argv = [mkiso, "-quiet", "-V", "xpf-config", "-J", "-r", "-o", iso, stage]
-        subprocess.run(argv, check=True, capture_output=True, text=True)
+        run_capture(argv)   # die with the mkiso error, not a bare traceback (H-21)
         print(f"==> built day-0 drive {iso} (label xpf-config)")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -338,10 +362,9 @@ class Runner:
         self.dry = dry
 
     def run(self, argv):
-        if self.dry:
-            print(" ".join(shlex.quote(a) for a in argv))
-            return ""
-        return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+        # Funnel through run_capture so a failing hypervisor command dies with
+        # its real stderr, not a bare CalledProcessError traceback (H-21).
+        return run_capture(argv, self.dry)
 
 
 # ── deploy backends ───────────────────────────────────────────────────
@@ -352,9 +375,103 @@ def print_map(ap):
         print(f"      pos {i + 1}: {ic['_name']:<10} <- {ic['backing']}:{ic['source']}")
 
 
+# ── preflight / existence probes (query-only; never mutate) ────────────
+def _incus_exists(kind, name):
+    """True if an incus object exists. kind in {instance,image,network}.
+    Query-only; tolerant of a missing incus binary (returns False)."""
+    argv = {"instance": ["incus", "info", name],
+            "image": ["incus", "image", "info", name],
+            "network": ["incus", "network", "info", name]}[kind]
+    try:
+        return subprocess.run(argv, capture_output=True, text=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _virsh_domain_exists(name):
+    """True if a libvirt domain of this name is defined (query-only)."""
+    try:
+        return subprocess.run(["virsh", "dominfo", name],
+                              capture_output=True, text=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _netdev_exists(dev):
+    return os.path.isdir(os.path.join(SYS_NET, dev))
+
+
+def preflight_incus(ap, runner):
+    """Fail BEFORE mutating (fable-165 H-27): the image alias, every NIC source
+    (managed network / host bridge / PF / PCI device), and a free instance name
+    must all exist/be-free. A missing prerequisite is the most common first-run
+    failure — catching it here turns an opaque mid-deploy error into one clear
+    message, and a name that is already taken points at `destroy` instead of a
+    bare "already exists". Skipped in dry-run (resources may be created between
+    plan and apply)."""
+    if runner.dry:
+        return
+    name = ap["name"]
+    problems = []
+    if not _incus_exists("image", ap["image"]):
+        problems.append(f"image alias '{ap['image']}' not found — "
+                        f"fetch/import it first (xpf-deploy.py fetch ...)")
+    for i, ic in enumerate(ap["interfaces"]):
+        b, src = ic["backing"], str(ic["source"])
+        if b == "net":
+            if not _incus_exists("network", src):
+                problems.append(f"interface {i + 1}: incus network '{src}' not "
+                                f"found (incus network create {src})")
+        elif b in ("bridge", "macvlan", "sriov", "physical"):
+            if not _netdev_exists(src):
+                problems.append(f"interface {i + 1}: host netdev '{src}' not "
+                                f"present ({b}: parent must exist)")
+        elif b == "pci":
+            if not os.path.isdir(os.path.join("/sys/bus/pci/devices", src)):
+                problems.append(f"interface {i + 1}: PCI device '{src}' not present")
+    if _incus_exists("instance", name):
+        problems.append(f"instance '{name}' already exists — tear it down first "
+                        f"(xpf-deploy.py destroy ...) or it is already deployed")
+    if problems:
+        die("preflight failed (nothing was changed):\n    - "
+            + "\n    - ".join(problems))
+
+
+def preflight_libvirt(ap, runner):
+    """Fail BEFORE mutating (fable-165 H-27): the golden qcow2, every bridge/
+    macvlan/physical NIC source, and a free domain name must exist/be-free.
+    net/sriov sources (libvirt network / operator-defined VF pool) are left to
+    libvirt. Skipped in dry-run."""
+    if runner.dry:
+        return
+    problems = []
+    golden = libvirt_golden_path(ap["image"])
+    if not os.path.isfile(golden):
+        problems.append(f"golden image not found: {golden} — fetch it "
+                        f"(xpf-deploy.py fetch --install-libvirt ...)")
+    for i, ic in enumerate(ap["interfaces"]):
+        b, src = ic["backing"], str(ic["source"])
+        if b in ("bridge", "macvlan"):
+            if not _netdev_exists(src):
+                problems.append(f"interface {i + 1}: host netdev '{src}' not present")
+        elif b == "physical":
+            # a netdev NAME is resolved to PCI at deploy; a PCI addr passes through.
+            if not is_pci_addr(src) and not _netdev_exists(src):
+                problems.append(f"interface {i + 1}: physical source '{src}' not "
+                                f"present (netdev name or PCI address)")
+    if _virsh_domain_exists(ap["name"]):
+        problems.append(f"domain '{ap['name']}' already exists — tear it down "
+                        f"first (xpf-deploy.py --hypervisor libvirt destroy ...) "
+                        f"or it is already deployed")
+    if problems:
+        die("preflight failed (nothing was changed):\n    - "
+            + "\n    - ".join(problems))
+
+
 def deploy_incus(ap, runner, start):
     name = ap["name"]
     print_map(ap)
+    preflight_incus(ap, runner)
     iso = build_config_drive(ap, runner)
     # --no-profiles: the default profile usually carries an `eth0` NIC,
     # which would be an extra virtio device the guest names positionally
@@ -363,50 +480,65 @@ def deploy_incus(ap, runner, start):
     # disk explicitly from the storage pool (default "default", override
     # with `pool:` in YAML) so the device set is EXACTLY the declared NICs.
     pool = ap.get("pool", "default")
-    # incus -d sets ONE key=value per flag (<device>,<key>=<value>), so the
-    # root disk needs three -d flags, not one comma-joined value.
-    runner.run(["incus", "init", ap["image"], name, "--vm", "--no-profiles",
-                "-c", f"limits.cpu={ap['cpu']}", "-c", f"limits.memory={ap['memory']}",
-                "-d", "root,type=disk", "-d", f"root,pool={pool}", "-d", "root,path=/"])
-    pins = []
-    for i, ic in enumerate(ap["interfaces"]):
-        dev = f"dev{i:02d}"
-        b, src, mac = ic["backing"], str(ic["source"]), ic.get("mac")
-        if b == "net":
-            args = ["nic", f"network={src}"]
-        elif b == "bridge":
-            args = ["nic", "nictype=bridged", f"parent={src}"]
-        elif b == "macvlan":
-            args = ["nic", "nictype=macvlan", f"parent={src}"]
-        elif b == "sriov":
-            args = ["nic", "nictype=sriov", f"parent={src}"]
-        elif b == "physical":
-            args = ["nic", "nictype=physical", f"parent={src}"]
-        elif b == "pci":
-            args = ["pci", f"address={src}"]
-        if mac and b in ("net", "bridge", "macvlan", "sriov"):
-            args.append(f"hwaddr={mac}")
-        if mac and b == "pci":
-            par = None if runner.dry else vf_parent(src)
-            if par:
-                pins.append(["sudo", "ip", "link", "set", "dev", par[0], "vf", par[1], "mac", mac])
-            elif runner.dry:
-                print(f"      (dry-run) would pin VF MAC for pci:{src}")
-            else:
-                die(f"pci:{src} with mac= is not an SR-IOV VF here (drop mac= for whole-PF)")
-        runner.run(["incus", "config", "device", "add", name, dev] + args)
-    if iso:
-        runner.run(["incus", "config", "device", "add", name, "day0", "disk", f"source={iso}"])
-    for pin in pins:
-        runner.run(["sudo", "ip", "link", "set", "dev", pin[5], "up"])
-        print(f"==> pinning VF MAC: {' '.join(pin)}")
-        runner.run(pin)
-    if start:
-        runner.run(["incus", "start", name])
-        print(f"\n{name} launched. Verify the NIC->name map:\n"
-              f"  incus exec {name} -- cli -c \"show interfaces terse\"")
-    else:
-        print(f"{name} created (not started): incus start {name}")
+    created = False   # True once `incus init` created the instance (ours to clean)
+    try:
+        # incus -d sets ONE key=value per flag (<device>,<key>=<value>), so the
+        # root disk needs three -d flags, not one comma-joined value.
+        runner.run(["incus", "init", ap["image"], name, "--vm", "--no-profiles",
+                    "-c", f"limits.cpu={ap['cpu']}", "-c", f"limits.memory={ap['memory']}",
+                    "-d", "root,type=disk", "-d", f"root,pool={pool}", "-d", "root,path=/"])
+        created = True
+        pins = []
+        for i, ic in enumerate(ap["interfaces"]):
+            dev = f"dev{i:02d}"
+            b, src, mac = ic["backing"], str(ic["source"]), ic.get("mac")
+            if b == "net":
+                args = ["nic", f"network={src}"]
+            elif b == "bridge":
+                args = ["nic", "nictype=bridged", f"parent={src}"]
+            elif b == "macvlan":
+                args = ["nic", "nictype=macvlan", f"parent={src}"]
+            elif b == "sriov":
+                args = ["nic", "nictype=sriov", f"parent={src}"]
+            elif b == "physical":
+                args = ["nic", "nictype=physical", f"parent={src}"]
+            elif b == "pci":
+                args = ["pci", f"address={src}"]
+            if mac and b in ("net", "bridge", "macvlan", "sriov"):
+                args.append(f"hwaddr={mac}")
+            if mac and b == "pci":
+                par = None if runner.dry else vf_parent(src)
+                if par:
+                    pins.append(["sudo", "ip", "link", "set", "dev", par[0], "vf", par[1], "mac", mac])
+                elif runner.dry:
+                    print(f"      (dry-run) would pin VF MAC for pci:{src}")
+                else:
+                    die(f"pci:{src} with mac= is not an SR-IOV VF here (drop mac= for whole-PF)")
+            runner.run(["incus", "config", "device", "add", name, dev] + args)
+        if iso:
+            runner.run(["incus", "config", "device", "add", name, "day0", "disk", f"source={iso}"])
+        for pin in pins:
+            runner.run(["sudo", "ip", "link", "set", "dev", pin[5], "up"])
+            print(f"==> pinning VF MAC: {' '.join(pin)}")
+            runner.run(pin)
+        if start:
+            runner.run(["incus", "start", name])
+            print(f"\n{name} launched. Verify the NIC->name map:\n"
+                  f"  incus exec {name} -- cli -c \"show interfaces terse\"")
+        else:
+            print(f"{name} created (not started): incus start {name}")
+    except BaseException:
+        # Cleanup on partial failure (fable-165 H-27): a mid-deploy die() (a
+        # device-add against a missing bridge, a failed VF pin, a start error)
+        # otherwise leaves a half-created instance that dead-ends the re-run on
+        # "already exists". Delete the instance WE created so the retry is clean,
+        # then re-raise the original error (SystemExit keeps its message).
+        if created and not runner.dry:
+            print(f"==> deploy of '{name}' failed after creating it; cleaning up "
+                  f"(incus delete --force {name}) so a re-run starts clean")
+            subprocess.run(["incus", "delete", "--force", name],
+                           capture_output=True, text=True)
+        raise
 
 
 # Directory libvirt/KVM keeps its qcow2 disks in (the default pool path).
@@ -432,8 +564,8 @@ def _install_libvirt_golden(srcq, image):
         shutil.copyfile(srcq, golden)
     except OSError:
         # /var/lib/libvirt/images is normally root-owned; -D creates the dir.
-        subprocess.run(["sudo", "install", "-m", "0644", "-D", srcq, golden],
-                       check=True)
+        # run_capture so a failing install reports its stderr, not a traceback.
+        run_capture(["sudo", "install", "-m", "0644", "-D", srcq, golden])
     return golden
 
 
@@ -472,10 +604,68 @@ def libvirt_disk(ap, runner):
     return overlay
 
 
+def _virsh_define(runner, name, xml):
+    """Define (persistent, NOT started) a libvirt domain from virt-install's
+    generated XML. `virt-install --import` DEFINES AND BOOTS the guest, so the
+    only way to honor `--no-start` on libvirt is to generate the domain XML
+    (`--print-xml`) and `virsh define` it — the domain is then persistent but
+    stopped, so the pinned-guest-PCI workflow (edit slots via `virsh edit`
+    BEFORE first boot) works (fable-165 H-26)."""
+    if runner.dry:
+        runner.run(["virsh", "define", f"{name}.xml"])
+        return
+    fd, path = tempfile.mkstemp(suffix=".xml", prefix=f"xpf-{name}-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(xml)
+        runner.run(["virsh", "define", path])
+    finally:
+        os.unlink(path)
+
+
 def deploy_libvirt(ap, runner, start):
     name = ap["name"]
     print_map(ap)
+    preflight_libvirt(ap, runner)
     iso = build_config_drive(ap, runner)
+    try:
+        _deploy_libvirt_inner(ap, runner, start, iso)
+    except BaseException:
+        # Cleanup on partial failure (fable-165 H-27): a die() partway through
+        # (bad hostdev resolve, virt-install/virsh error) otherwise leaves the
+        # per-VM overlay (and maybe a defined domain) behind, dead-ending the
+        # re-run. Undefine the domain + remove the overlay we created, then
+        # re-raise the original error (SystemExit keeps its message).
+        if not runner.dry:
+            overlay = os.path.join(LIBVIRT_IMAGES, f"{name}.qcow2")
+            _cleanup_libvirt(name, overlay)
+        raise
+
+
+def _cleanup_libvirt(name, overlay):
+    """Best-effort teardown of a half-created libvirt VM: destroy+undefine the
+    domain (if it got defined) and remove the per-VM overlay. Tolerant of a
+    missing domain / file (fable-165 H-27)."""
+    if _virsh_domain_exists(name):
+        print(f"==> deploy of '{name}' failed; cleaning up the libvirt domain "
+              f"so a re-run starts clean")
+        subprocess.run(["virsh", "destroy", name], capture_output=True, text=True)
+        r = subprocess.run(["virsh", "undefine", "--nvram", name],
+                           capture_output=True, text=True)
+        if r.returncode != 0:   # domains without NVRAM reject --nvram
+            subprocess.run(["virsh", "undefine", name],
+                           capture_output=True, text=True)
+    if os.path.isfile(overlay):
+        try:
+            os.remove(overlay)
+            print(f"==> removed overlay {overlay}")
+        except OSError:
+            subprocess.run(["sudo", "rm", "-f", overlay],
+                           capture_output=True, text=True)
+
+
+def _deploy_libvirt_inner(ap, runner, start, iso):
+    name = ap["name"]
     disk = libvirt_disk(ap, runner)
     argv = ["virt-install", "--name", name, "--memory", str(memory_mb(ap["memory"])),
             "--vcpus", str(ap["cpu"]), "--import",
@@ -530,10 +720,19 @@ def deploy_libvirt(ap, runner, start):
     print("# virt-install — NIC order = guest PCI-slot order = positional names.")
     for n in notes:
         print(f"# NOTE: {n}")
-    runner.run(argv)
     if start:
+        runner.run(argv)   # --import DEFINES AND BOOTS the domain.
         print(f"\n{name}: verify with `virsh console {name}` then "
               f"`cli -c \"show interfaces terse\"`.")
+    else:
+        # Honor --no-start: --import would boot the guest, so generate the
+        # domain XML and `virsh define` it (defined, persistent, NOT started)
+        # — makes the pinned-guest-PCI `virsh edit` before first boot workflow
+        # possible (fable-165 H-26).
+        xml = runner.run(argv + ["--print-xml"])
+        _virsh_define(runner, name, xml)
+        print(f"\n{name} defined (not started): start it with `virsh start {name}` "
+              f"(edit guest PCI slots first with `virsh edit {name}` if pinning).")
 
 
 def deploy(ap, args):
@@ -544,12 +743,72 @@ def deploy(ap, args):
         ap, runner, not args.no_start)
 
 
+# ── destroy (teardown for a clean re-deploy, fable-165 H-27) ───────────
+def destroy_incus(ap, runner):
+    name = ap["name"]
+    iso = os.path.join(os.getcwd(), f"{name}-day0.iso")
+    if runner.dry:
+        runner.run(["incus", "delete", "--force", name])
+    elif _incus_exists("instance", name):
+        print(f"==> destroying incus instance '{name}'")
+        run_capture(["incus", "delete", "--force", name])
+    else:
+        print(f"==> incus instance '{name}' not present (nothing to destroy)")
+    if os.path.isfile(iso) and not runner.dry:
+        os.remove(iso)
+        print(f"==> removed day-0 drive {iso}")
+
+
+def destroy_libvirt(ap, runner):
+    name = ap["name"]
+    overlay = os.path.join(LIBVIRT_IMAGES, f"{name}.qcow2")
+    iso = os.path.join(os.getcwd(), f"{name}-day0.iso")
+    if runner.dry:
+        runner.run(["virsh", "destroy", name])
+        runner.run(["virsh", "undefine", "--nvram", name])
+        runner.run(["rm", "-f", overlay])
+        return
+    if _virsh_domain_exists(name):
+        print(f"==> destroying libvirt domain '{name}'")
+        # destroy (power off) is best-effort — the domain may already be stopped.
+        subprocess.run(["virsh", "destroy", name], capture_output=True, text=True)
+        r = subprocess.run(["virsh", "undefine", "--nvram", name],
+                           capture_output=True, text=True)
+        if r.returncode != 0:   # domains without NVRAM reject --nvram
+            run_capture(["virsh", "undefine", name])
+    else:
+        print(f"==> libvirt domain '{name}' not present (nothing to destroy)")
+    for f in (overlay, iso):
+        if os.path.isfile(f):
+            try:
+                os.remove(f)
+                print(f"==> removed {f}")
+            except OSError:
+                subprocess.run(["sudo", "rm", "-f", f], capture_output=True, text=True)
+                print(f"==> removed {f} (sudo)")
+
+
+def destroy(ap, args):
+    runner = Runner(args.dry_run)
+    if args.image:
+        ap["image"] = args.image
+    (destroy_incus if args.hypervisor == "incus" else destroy_libvirt)(ap, runner)
+
+
 # ── subcommands ───────────────────────────────────────────────────────
 def cmd_deploy(args):
     if not args.yamls:
         die("deploy needs at least one YAML file")
     for path in args.yamls:
         deploy(load_yaml_appliance(path), args)
+    return 0
+
+
+def cmd_destroy(args):
+    if not args.yamls:
+        die("destroy needs at least one YAML file (the appliance to tear down)")
+    for path in args.yamls:
+        destroy(load_yaml_appliance(path), args)
     return 0
 
 
@@ -1408,7 +1667,7 @@ def main():
     # `rest` now holds only the subcommand + its own args. The first token
     # is the subcommand; if it isn't one, treat the whole of `rest` as
     # YAML files for `deploy` (the bare-`xpf-deploy.py foo.yaml` shorthand).
-    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch",
+    if rest and rest[0] in ("deploy", "destroy", "launch", "inventory", "fetch",
                             "kernel-roll", "image-roll"):
         cmd, cmd_argv = rest[0], rest[1:]
     else:
@@ -1500,6 +1759,10 @@ def main():
                          help="proceed node-by-node even if the mixed-base gate "
                               "fails (sessions WILL drop at the failover)")
         args = sub.parse_args(cmd_argv)
+    elif cmd == "destroy":
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py destroy", add_help=False)
+        sub.add_argument("yamls", nargs="*")
+        args = sub.parse_args(cmd_argv)
     else:  # deploy
         sub = argparse.ArgumentParser(prog="xpf-deploy.py deploy", add_help=False)
         sub.add_argument("yamls", nargs="*")
@@ -1522,6 +1785,8 @@ def main():
         return cmd_kernel_roll(args)
     if cmd == "image-roll":
         return cmd_image_roll(args)
+    if cmd == "destroy":
+        return cmd_destroy(args)
     return cmd_deploy(args)
 
 

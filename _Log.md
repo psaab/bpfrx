@@ -34205,6 +34205,39 @@ top.
   strict parse + schema + compile.
 - **File(s)**: examples/deploy/standalone.conf, examples/deploy/ha-pair.conf, _Log.md
 
+- **Timestamp**: 2026-07-04
+- **Action**: fable-165 H-21 — hypervisor-command failures now die() with the
+  real stderr instead of a bare CalledProcessError traceback. Added a shared
+  `run_capture(argv, dry)` helper (capture stdout+stderr; on nonzero exit die
+  with `command failed (rc=N): <cmd>\n<stderr>`). `Runner.run` now funnels
+  through it; the config-drive mkiso build and the `sudo install` golden-copy
+  fallback route through it too. Issues #4204/#4205/#4206 filed.
+- **File(s)**: scripts/deploy/xpf-deploy.py, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-165 H-26 — honor `--no-start` on the libvirt path. `--import`
+  defines AND boots, so when start=False deploy_libvirt now runs
+  `virt-install ... --print-xml` and `virsh define`s the XML (new `_virsh_define`
+  helper) — domain defined, persistent, NOT started, so `virsh edit`
+  before-first-boot PCI pinning works. Fixed both docs that wrongly said the tool
+  "emits a virt-install command you run" (it EXECUTES it): examples/deploy/README.md
+  table row and docs/deploy-quickstart.md "libvirt instead of incus".
+- **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/README.md,
+  docs/deploy-quickstart.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-165 H-27 — deployer robustness. Added preflight_incus /
+  preflight_libvirt (image/golden + every NIC source + free instance name checked
+  BEFORE any mutation; skipped in dry-run), cleanup-on-failure (deploy_incus
+  deletes the half-created instance; deploy_libvirt undefines the domain + removes
+  the overlay via _cleanup_libvirt), and a `destroy <yaml>` verb (destroy_incus /
+  destroy_libvirt + cmd_destroy, wired into main()'s subcommand table + dispatch).
+  Refactored deploy_libvirt body into _deploy_libvirt_inner so the outer wraps it
+  in the cleanup try/except. New RED-on-revert tests in
+  test_xpf_deploy_robustness.py cover H-21/H-26/H-27 (14 tests). Verified H-21
+  RED-on-revert (reverted Runner.run raises CalledProcessError, test fails).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_robustness.py, _Log.md
 ## 2026-07-04 — HB165 apt/deb/signing packaging (H-4, H-6, H-15)
 
 - **Timestamp**: 2026-07-04

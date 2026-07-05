@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Unit tests for three xpf-deploy robustness/UX fixes (fable-review-165).
+
+H-21  a failing hypervisor command dies with the tool's REAL stderr
+      ("command failed (rc=N): <cmd>\\n<stderr>"), not a bare
+      CalledProcessError traceback. On revert (Runner.run does
+      check=True with the output swallowed) the failing command raises
+      CalledProcessError instead of SystemExit and the assertions go RED.
+
+H-26  `--no-start` on libvirt DEFINES but does not START the domain — the
+      deployer runs `virt-install --print-xml` and `virsh define`s the XML
+      instead of `virt-install --import` (which boots). The docs say the
+      tool RUNS virt-install, not "emits a command you run". On revert
+      (unconditional --import boot; docs say "emits") both go RED.
+
+H-27  a preflight fails BEFORE mutating on a missing image/golden/bridge or
+      an already-taken name; a mid-deploy failure cleans up the half-created
+      instance; and a `destroy` verb tears a VM down. On revert (no
+      preflight/cleanup/destroy) the assertions go RED.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+_SPEC = importlib.util.spec_from_file_location(
+    "xpf_deploy", Path(__file__).with_name("xpf-deploy.py")
+)
+xpf_deploy = importlib.util.module_from_spec(_SPEC)
+assert _SPEC.loader is not None
+_SPEC.loader.exec_module(xpf_deploy)
+
+_REPO = Path(__file__).resolve().parents[2]
+
+
+class RecordingRunner:
+    """Runner that records every argv instead of executing it (dry=True)."""
+
+    def __init__(self):
+        self.dry = True
+        self.calls = []
+
+    def run(self, argv):
+        self.calls.append(list(argv))
+        return ""
+
+
+def _find_call(calls, prog):
+    for c in calls:
+        if c and c[0] == prog:
+            return c
+    return None
+
+
+def _bridge_ap(name="fw"):
+    return {
+        "name": name, "mode": "standalone", "node_id": None,
+        "image": "xpf-appliance", "cpu": 2, "memory": "4G",
+        "interfaces": [
+            {"_name": "fxp0", "backing": "bridge", "source": "br-mgmt"}],
+    }
+
+
+# ── H-21: failing hypervisor command reports its stderr, not a traceback ──
+class StderrOnFailureTests(unittest.TestCase):
+    def test_run_capture_dies_with_command_and_stderr(self):
+        with self.assertRaises(SystemExit) as cm:
+            xpf_deploy.run_capture(
+                ["sh", "-c", "echo real-error-detail >&2; exit 3"])
+        msg = str(cm.exception.code)
+        # RED on revert: run_capture does not exist / does not surface stderr.
+        self.assertIn("real-error-detail", msg)
+        self.assertIn("rc=3", msg)
+        self.assertIn("sh", msg)
+
+    def test_runner_run_surfaces_stderr_not_bare_traceback(self):
+        # The finding's cited symbol: Runner.run. On revert it does
+        # subprocess.run(check=True) and raises CalledProcessError (NOT
+        # SystemExit) with the stderr swallowed -> assertRaises(SystemExit) RED.
+        runner = xpf_deploy.Runner(dry=False)
+        with self.assertRaises(SystemExit) as cm:
+            runner.run(["sh", "-c", "echo boom-from-tool >&2; exit 1"])
+        self.assertIn("boom-from-tool", str(cm.exception.code))
+
+    def test_run_capture_dry_run_prints_and_does_not_execute(self):
+        # dry-run must never raise and never run the command.
+        self.assertEqual(
+            xpf_deploy.run_capture(["false"], dry=True), "")
+
+
+# ── H-26: --no-start on libvirt defines-but-does-not-start; docs say "runs" ─
+class LibvirtNoStartTests(unittest.TestCase):
+    def test_no_start_defines_via_print_xml_and_virsh_define(self):
+        r = RecordingRunner()
+        xpf_deploy.deploy_libvirt(_bridge_ap("fw-ns"), r, start=False)
+        virt = _find_call(r.calls, "virt-install")
+        self.assertIsNotNone(virt, "virt-install was not invoked")
+        # RED on revert: no --print-xml (it just runs --import, which boots).
+        self.assertIn("--print-xml", virt)
+        vdef = _find_call(r.calls, "virsh")
+        self.assertIsNotNone(vdef, "virsh define was not invoked for --no-start")
+        self.assertEqual(vdef[:2], ["virsh", "define"])
+
+    def test_start_path_boots_without_print_xml_or_virsh_define(self):
+        r = RecordingRunner()
+        xpf_deploy.deploy_libvirt(_bridge_ap("fw-go"), r, start=True)
+        virt = _find_call(r.calls, "virt-install")
+        self.assertIsNotNone(virt)
+        self.assertNotIn("--print-xml", virt)
+        self.assertIsNone(_find_call(r.calls, "virsh"),
+                          "start=True must not virsh define")
+
+    def test_docs_say_runs_not_emits(self):
+        readme = (_REPO / "examples/deploy/README.md").read_text()
+        quick = (_REPO / "docs/deploy-quickstart.md").read_text()
+        # RED on revert: the docs claim the tool "emits a command you run".
+        self.assertNotIn("emits a `virt-install` command", readme)
+        self.assertNotIn("the tool emits a", quick)
+        self.assertIn("runs `virt-install", readme)
+        self.assertIn("runs\n`virt-install`", quick)
+
+
+# ── H-27: preflight, cleanup-on-failure, destroy verb ─────────────────────
+class DestroyVerbTests(unittest.TestCase):
+    def test_destroy_incus_deletes_instance(self):
+        r = RecordingRunner()
+        xpf_deploy.destroy_incus(_bridge_ap("fw-del"), r)
+        # RED on revert: destroy_incus does not exist.
+        self.assertEqual(_find_call(r.calls, "incus"),
+                         ["incus", "delete", "--force", "fw-del"])
+
+    def test_destroy_libvirt_undefines_and_removes_overlay(self):
+        r = RecordingRunner()
+        xpf_deploy.destroy_libvirt(_bridge_ap("fw-dl"), r)
+        progs = [c[0] for c in r.calls]
+        self.assertIn("virsh", progs)
+        # destroy + undefine + overlay rm are all planned.
+        joined = [" ".join(c) for c in r.calls]
+        self.assertTrue(any("virsh undefine" in j for j in joined))
+        self.assertTrue(any(j.startswith("rm -f") and ".qcow2" in j
+                            for j in joined))
+
+    def test_destroy_subcommand_is_wired(self):
+        # End-to-end: the CLI actually dispatches `destroy` (RED on revert:
+        # "destroy" is not a recognized subcommand -> treated as a YAML file).
+        script = _REPO / "scripts/deploy/xpf-deploy.py"
+        out = subprocess.run(
+            ["python3", str(script), "--dry-run", "destroy",
+             str(_REPO / "examples/deploy/standalone.yaml")],
+            capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("incus delete --force", out.stdout)
+
+
+class PreflightTests(unittest.TestCase):
+    def test_incus_preflight_dies_on_missing_prereqs(self):
+        # No incus objects exist -> preflight fails BEFORE any mutation.
+        with mock.patch.object(xpf_deploy, "_incus_exists",
+                               side_effect=lambda kind, name: False):
+            runner = xpf_deploy.Runner(dry=False)
+            with self.assertRaises(SystemExit) as cm:
+                xpf_deploy.preflight_incus(_bridge_ap("fw-pf"), runner)
+        msg = str(cm.exception.code)
+        self.assertIn("preflight failed", msg)
+        self.assertIn("image alias", msg)
+
+    def test_incus_preflight_points_existing_name_at_destroy(self):
+        # A re-run against an already-deployed name must NOT dead-end on a bare
+        # "already exists" — it points at `destroy` (idempotency UX, H-27).
+        with mock.patch.object(xpf_deploy, "_incus_exists",
+                               side_effect=lambda kind, name: True):
+            runner = xpf_deploy.Runner(dry=False)
+            with self.assertRaises(SystemExit) as cm:
+                xpf_deploy.preflight_incus(_bridge_ap("fw-dup"), runner)
+        msg = str(cm.exception.code)
+        self.assertIn("already exists", msg)
+        self.assertIn("destroy", msg)
+
+    def test_libvirt_preflight_dies_on_missing_golden(self):
+        orig = xpf_deploy.LIBVIRT_IMAGES
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                xpf_deploy.LIBVIRT_IMAGES = os.path.join(tmp, "images")
+                ap = _bridge_ap("fw-lv")
+                ap["interfaces"] = [
+                    {"_name": "fxp0", "backing": "bridge", "source": "lo"}]
+                runner = xpf_deploy.Runner(dry=False)
+                with self.assertRaises(SystemExit) as cm:
+                    xpf_deploy.preflight_libvirt(ap, runner)
+            msg = str(cm.exception.code)
+            self.assertIn("golden image not found", msg)
+        finally:
+            xpf_deploy.LIBVIRT_IMAGES = orig
+
+    def test_preflight_skipped_in_dry_run(self):
+        # Dry-run plans against resources that may not exist yet -> no die.
+        runner = xpf_deploy.Runner(dry=True)
+        xpf_deploy.preflight_incus(_bridge_ap("fw-dry"), runner)   # must not raise
+        xpf_deploy.preflight_libvirt(_bridge_ap("fw-dry"), runner)
+
+
+class CleanupOnFailureTests(unittest.TestCase):
+    def test_incus_cleanup_deletes_half_created_instance(self):
+        class FailAtRunner:
+            """Succeeds through `incus init`, then dies on the device add —
+            mirrors a real Runner hitting a missing bridge mid-deploy."""
+
+            def __init__(self):
+                self.dry = False
+                self.calls = []
+
+            def run(self, argv):
+                self.calls.append(list(argv))
+                if "device" in argv and "add" in argv:
+                    xpf_deploy.die("simulated: incus network br-lan not found")
+                return ""
+
+        ap = _bridge_ap("fw-clean")
+        runner = FailAtRunner()
+        recorder = mock.MagicMock(
+            return_value=subprocess.CompletedProcess([], 0, "", ""))
+        with mock.patch.object(xpf_deploy, "preflight_incus",
+                               lambda a, r: None), \
+             mock.patch.object(xpf_deploy, "build_config_drive",
+                               lambda a, r: None), \
+             mock.patch.object(xpf_deploy.subprocess, "run", recorder):
+            with self.assertRaises(SystemExit):
+                xpf_deploy.deploy_incus(ap, runner, start=False)
+        # RED on revert: no cleanup -> the failed instance is never deleted.
+        deletes = [c.args[0] for c in recorder.call_args_list
+                   if c.args and c.args[0][:3] == ["incus", "delete", "--force"]]
+        self.assertTrue(deletes, "half-created instance was not cleaned up")
+        self.assertEqual(deletes[0], ["incus", "delete", "--force", "fw-clean"])
+
+
+if __name__ == "__main__":
+    unittest.main()

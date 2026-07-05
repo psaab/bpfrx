@@ -92,16 +92,45 @@ scripts/deploy/xpf-deploy.py launch --name fw1 --config examples/deploy/standalo
 
 ## libvirt instead of incus
 
-The same definition, `--hypervisor libvirt` — the tool emits a
-`virt-install` command (NIC order = guest PCI-slot order = positional
+The same definition, `--hypervisor libvirt` — the tool runs
+`virt-install` for you (NIC order = guest PCI-slot order = positional
 names):
 
 ```bash
 scripts/deploy/xpf-deploy.py --hypervisor libvirt deploy examples/deploy/standalone-passthrough.yaml
 ```
 
+`--import` DEFINES AND BOOTS the domain. Add `--no-start` to define it
+without booting (the tool runs `virt-install --print-xml | virsh define`)
+so you can pin the guest PCI slots with `virsh edit <name>` before the
+first boot:
+
+```bash
+scripts/deploy/xpf-deploy.py --hypervisor libvirt --no-start deploy examples/deploy/standalone-passthrough.yaml
+virsh edit fw1        # pin guest PCI slots, then:
+virsh start fw1
+```
+
 See `examples/deploy/README.md` for the full incus-vs-libvirt
 comparison and the SR-IOV VF-pool / pinned-guest-PCI details.
+
+## Tearing down / re-deploying
+
+`destroy` removes a deployed VM and its per-VM overlay + day-0 drive so a
+re-deploy starts clean (incus instance / libvirt domain, whichever
+`--hypervisor` selects):
+
+```bash
+scripts/deploy/xpf-deploy.py destroy examples/deploy/standalone-passthrough.yaml
+scripts/deploy/xpf-deploy.py --hypervisor libvirt destroy examples/deploy/standalone-passthrough.yaml
+```
+
+`deploy` runs a **preflight** before it mutates anything — the image /
+golden qcow2, every NIC source (managed network / host bridge / PF / PCI
+device), and a free instance name must all exist, or it fails with one
+clear message instead of a half-created VM. If a step still fails
+mid-deploy, the partially-created instance / overlay is cleaned up so the
+re-run does not dead-end on "already exists".
 
 ## HA pair
 
