@@ -38,6 +38,20 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		return s.showClassOfService(req, cfg, &buf)
 	}
 
+	// #4228 Gap 7: vSRX CoS show commands over existing data.
+	if req.Topic == "interfaces-queue" || strings.HasPrefix(req.Topic, "interfaces-queue:") {
+		return s.showInterfacesQueue(req, &buf)
+	}
+	if req.Topic == "cos-classifier" || strings.HasPrefix(req.Topic, "cos-classifier:") {
+		return s.showCoSClassifier(req, cfg, &buf)
+	}
+	if req.Topic == "cos-scheduler-map" || strings.HasPrefix(req.Topic, "cos-scheduler-map:") {
+		return s.showCoSSchedulerMap(req, cfg, &buf)
+	}
+	if req.Topic == "cos-forwarding-class" {
+		return s.showCoSForwardingClass(cfg, &buf)
+	}
+
 	if strings.HasPrefix(req.Topic, "screen-ids-option:") {
 		return s.showScreenIDSOption(req, cfg, &buf)
 	}

@@ -115,3 +115,57 @@ func TestCompleteFromTree_RequestSystemDynamicDNS(t *testing.T) {
 		t.Fatalf("expected update/check completions under request system dynamic-dns, got %v", cands)
 	}
 }
+
+// #4228 Gap 7: the vSRX CoS show commands are registered in the operational
+// tree with tab-completion + descriptions.
+func TestCompleteFromTree_ShowClassOfServiceGap7(t *testing.T) {
+	cands := CompleteFromTree(OperationalTree, []string{"show", "class-of-service"}, "", nil)
+	for _, want := range []string{"interface", "classifier", "scheduler-map", "forwarding-class"} {
+		if !contains(cands, want) {
+			t.Fatalf("expected %q under show class-of-service, got %v", want, cands)
+		}
+	}
+
+	// classifier type filter completes to the two supported code-point types.
+	cands = CompleteFromTree(OperationalTree, []string{"show", "class-of-service", "classifier", "type"}, "", nil)
+	if !contains(cands, "dscp") || !contains(cands, "ieee-802.1") {
+		t.Fatalf("expected dscp/ieee-802.1 under classifier type, got %v", cands)
+	}
+
+	// Descriptions are present for the new leaves.
+	if got := LookupDesc([]string{"show", "class-of-service"}, "forwarding-class", false); got == "" {
+		t.Fatalf("missing description for show class-of-service forwarding-class")
+	}
+}
+
+func TestCompleteFromTree_ShowInterfacesQueueGap7(t *testing.T) {
+	cands := CompleteFromTree(OperationalTree, []string{"show", "interfaces"}, "", nil)
+	if !contains(cands, "queue") {
+		t.Fatalf("expected 'queue' under show interfaces, got %v", cands)
+	}
+}
+
+// The classifier/scheduler-map DynamicFn surface the configured names.
+func TestCompleteFromTree_ShowClassOfServiceDynamicNames(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			DSCPClassifiers: map[string]*config.CoSDSCPClassifier{
+				"wan-classifier": {Name: "wan-classifier"},
+			},
+			IEEE8021Classifiers: map[string]*config.CoSIEEE8021Classifier{
+				"wan-pcp": {Name: "wan-pcp"},
+			},
+			SchedulerMaps: map[string]*config.CoSSchedulerMap{
+				"bandwidth-limit": {Name: "bandwidth-limit"},
+			},
+		},
+	}
+	cands := CompleteFromTree(OperationalTree, []string{"show", "class-of-service", "classifier"}, "", cfg)
+	if !contains(cands, "wan-classifier") || !contains(cands, "wan-pcp") {
+		t.Fatalf("expected configured classifier names, got %v", cands)
+	}
+	cands = CompleteFromTree(OperationalTree, []string{"show", "class-of-service", "scheduler-map"}, "", cfg)
+	if !contains(cands, "bandwidth-limit") {
+		t.Fatalf("expected configured scheduler-map name, got %v", cands)
+	}
+}

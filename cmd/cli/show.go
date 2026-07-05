@@ -122,12 +122,47 @@ func (c *ctl) handleShow(args []string) error {
 		return nil
 
 	case "class-of-service":
-		if len(args) >= 2 && args[1] == "interface" {
-			topic := "class-of-service"
-			if len(args) >= 3 {
-				topic += ":" + args[2]
+		if len(args) >= 2 {
+			switch args[1] {
+			case "interface":
+				topic := "class-of-service"
+				if len(args) >= 3 {
+					topic += ":" + args[2]
+				}
+				return c.showText(topic)
+			case "classifier":
+				// #4228 Gap 7: encode optional `name <n>` / `type <t>`
+				// filters into the topic params.
+				var params []string
+				rest := args[2:]
+				for i := 0; i < len(rest); i++ {
+					switch rest[i] {
+					case "name":
+						if i+1 < len(rest) {
+							params = append(params, "name="+rest[i+1])
+							i++
+						}
+					case "type":
+						if i+1 < len(rest) {
+							params = append(params, "type="+rest[i+1])
+							i++
+						}
+					}
+				}
+				topic := "cos-classifier"
+				if len(params) > 0 {
+					topic += ":" + strings.Join(params, ",")
+				}
+				return c.showText(topic)
+			case "scheduler-map":
+				topic := "cos-scheduler-map"
+				if len(args) >= 3 {
+					topic += ":" + args[2]
+				}
+				return c.showText(topic)
+			case "forwarding-class":
+				return c.showText("cos-forwarding-class")
 			}
-			return c.showText(topic)
 		}
 		printRemoteTreeHelp("show class-of-service:", "show", "class-of-service")
 		return nil
@@ -1627,6 +1662,14 @@ func (c *ctl) showIPsec(args []string) error {
 }
 
 func (c *ctl) showInterfaces(args []string) error {
+	if len(args) > 0 && args[0] == "queue" {
+		// #4228 Gap 7: per-queue CoS statistics, optional interface filter.
+		selector := ""
+		if len(args) > 1 {
+			selector = args[1]
+		}
+		return c.showTextFiltered("interfaces-queue", selector)
+	}
 	if len(args) > 0 && args[0] == "tunnel" {
 		return c.showText("tunnels")
 	}

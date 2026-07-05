@@ -1,3 +1,32 @@
+## 2026-07-04 — #4228 Gap 7: vSRX CoS show commands
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Added the four missing Junos-style CoS operational show
+    commands whose backing data already existed but had no operational-
+    tree surface (#4228 Gap 7, fable-review-166 G-8). Pure presentation
+    over existing data — `cfg.ClassOfService` (compiled config) and
+    `CoSQueueStatus` (userspace status) — no dataplane change, no new
+    gRPC RPC (reuses `ShowText`). Commands: `show interfaces queue
+    [<interface>]` (per-queue Queued/Transmitted/Dropped from
+    CoSQueueStatus), `show class-of-service classifier [name <n>] [type
+    <dscp|ieee-802.1>]` (code point as 6-bit/3-bit binary), `show
+    class-of-service scheduler-map [<name>]` (FC->scheduler bindings
+    resolved to rate/priority/buffer/exact + queue), and `show
+    class-of-service forwarding-class` (FC->queue table). Wired through
+    cmdtree (tab-completion + `?` help + DynamicFn names), the local CLI
+    (`pkg/cli`), the remote CLI (`cmd/cli`), and the gRPC `ShowText`
+    topics (`interfaces-queue`, `cos-classifier`, `cos-scheduler-map`,
+    `cos-forwarding-class`). `clear class-of-service statistics` DEFERRED
+    — no CoS-queue stat-reset RPC exists; filed as a follow-up.
+  - **File(s)**: pkg/dataplane/userspace/format/cos_show.go (new, four
+    formatters), pkg/dataplane/userspace/format/cos_show_test.go (new),
+    pkg/cmdtree/tree.go (+cosClassifierNames helper, show subtree
+    entries), pkg/cmdtree/tree_test.go, pkg/cli/cli_show_services.go,
+    pkg/cli/cli_show_interfaces.go, cmd/cli/show.go,
+    pkg/grpcapi/server_show.go, pkg/grpcapi/server_show_interfaces_text.go
+    (four handler methods), pkg/grpcapi/server_show_cos_gap7_test.go
+    (new), docs/cos-validation-notes.md.
+
 ## 2026-07-04 — #4217 / #4218 / #4219 / #4220 (fable-review-166 G-4 / G-3 / G-5 / G-1): CoS config-schema typing
 
 - **Timestamp**: 2026-07-04

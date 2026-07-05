@@ -60,6 +60,15 @@ func (c *CLI) showTunnelInterfaces() error {
 }
 
 func (c *CLI) showInterfaces(args []string) error {
+	// Handle "show interfaces queue [<interface>]" sub-command (#4228 Gap 7)
+	if len(args) > 0 && args[0] == "queue" {
+		selector := ""
+		if len(args) > 1 {
+			selector = args[1]
+		}
+		return c.showInterfacesQueue(selector)
+	}
+
 	// Handle "show interfaces tunnel" sub-command
 	if len(args) > 0 && args[0] == "tunnel" {
 		return c.showTunnelInterfaces()
