@@ -13,8 +13,11 @@ artifact in the publish set is properly signed:
       404s without it; opt out with --no-installer), carries NO placeholder
       key and NO unsubstituted %%…%% marker (it must be stamped first), and
       has a verifying install.sh.minisig;
-  (d) the per-channel latest.json verifies against the image pubkey AND names
-      a version present in the image set.
+  (d) the TARGET channel's latest.json verifies against the image pubkey AND
+      names a version present in the image set, AND every OTHER channel's
+      latest.json present in the tree also carries a verifying signature — the
+      whole dist tree is uploaded, so a stale/unsigned pointer for a non-target
+      channel must not ship unverified (HB165 H-13).
 
 The bake may be fail-OPEN (a dev bake without a key still produces artifacts),
 but PUBLISH is fail-CLOSED — an unsigned dev bake can never reach the channel.
@@ -81,6 +84,31 @@ def image_pubkey():
 # `dist` that is NOT covered by a verified manifest blocks the publish, because
 # the whole dist tree is uploaded.
 IMAGE_ARTIFACT_SUFFIXES = (".qcow2", ".incus-metadata.tar.gz")
+
+
+def _is_allowed_publish_file(name, at_top):
+    """Default-deny allowlist for NON-image files in the image publish tree
+    (HB165 H-5). The whole dist tree is uploaded RECURSIVELY, so a file that is
+    neither a verified image artifact nor an expected sidecar must NOT ride
+    along — an unsigned `dist/deb/*.deb` (or any stray file) is the motivating
+    case: `make image` stages debs under the publish root and the suffix-shaped
+    orphan sweep skipped every non-`.qcow2`/`.incus-metadata.tar.gz` file.
+
+    Allowed (everything else is refused):
+      - `*.minisig` / `*.SHA256SUMS` — inert signature + checksum material,
+        anywhere in the tree;
+      - top-level bake outputs: `install.sh` (its minisign signature is
+        verified in gate_images), `xpf-image.pub` (the pinned pubkey convenience
+        copy), and `xpf-<ver>.manifest` (build metadata read by
+        `xpf-deploy image-roll`);
+      - a per-channel `latest.json` in a channel subdir — gate_latest verifies
+        its signature.
+    """
+    if name.endswith((".minisig", ".SHA256SUMS")):
+        return True
+    if at_top:
+        return name in ("install.sh", "xpf-image.pub") or name.endswith(".manifest")
+    return name == "latest.json"
 
 
 def archive_pubkey():
@@ -387,11 +415,13 @@ def gate_images(dist, require_installer=True):
                 die(f"image artifact {base} failed verify: {e}")
             covered.add(base)
         info(f"image set {ver}: signature + {len(checks)} file hashes OK")
-    # Orphan sweep (Codex-r2-1 / r3): the WHOLE dist tree is uploaded
-    # RECURSIVELY (rsync -a / aws s3 sync), so walk the tree — not just the top
-    # level — and refuse any image artifact NOT covered by a verified manifest,
-    # wherever it sits (e.g. a nested dist/stable/xpf-evil.qcow2). The apt pool
-    # is gated separately (gate_apt) so skip apt/.
+    # Default-deny sweep (Codex-r2-1 / r3 + HB165 H-5): the WHOLE dist tree is
+    # uploaded RECURSIVELY (rsync -a / aws s3 sync), so walk the tree — not just
+    # the top level — and refuse EVERY file that is neither a verified image
+    # artifact nor an expected sidecar (see _is_allowed_publish_file). A
+    # suffix-shaped allowlist let unsigned non-image files (a dist/deb/*.deb)
+    # ride to the image URL; default-deny closes that. The apt pool is gated
+    # separately (gate_apt) so skip apt/.
     apt_dir = os.path.join(dist, "apt")
     for root, dirs, files in os.walk(dist):
         if root == apt_dir or root.startswith(apt_dir + os.sep):
@@ -407,28 +437,45 @@ def gate_images(dist, require_installer=True):
                 die(f"symlinked directory in the image publish set: {rel} — "
                     "refusing (a dereferencing backend could upload "
                     "unverified bytes).")
+        at_top = os.path.abspath(root) == os.path.abspath(dist)
         for name in sorted(files):
             full = os.path.join(root, name)
             if os.path.islink(full):
                 rel = os.path.relpath(full, dist)
                 die(f"symlink in the image publish set: {rel} — refusing "
                     "(a dereferencing backend could upload unverified bytes).")
-            if not name.endswith(IMAGE_ARTIFACT_SUFFIXES):
+            rel = os.path.relpath(full, dist)
+            if name.endswith(IMAGE_ARTIFACT_SUFFIXES):
+                # Image artifacts live ONLY at the top level (the bake writes
+                # dist/xpf-<ver>.*). A nested one (e.g. dist/stable/xpf-evil.qcow2)
+                # can never be a verified artifact — a manifest binds BASENAMES,
+                # so a nested duplicate basename would also escape a basename-only
+                # `covered` check. Refuse any image artifact below the top level.
+                if not at_top:
+                    die(f"image artifact outside the top-level dist dir: {rel} — "
+                        "images belong at dist/xpf-<ver>.*; refusing to publish "
+                        "unverified nested bytes.")
+                if name not in covered:
+                    die(f"orphan image artifact in the publish set: {rel} is not "
+                        "listed in any verified manifest — refusing to publish "
+                        "unverified bytes. Remove it or sign a manifest covering "
+                        "it.")
                 continue
-            rel = os.path.relpath(os.path.join(root, name), dist)
-            # Image artifacts live ONLY at the top level (the bake writes
-            # dist/xpf-<ver>.*). A nested one (e.g. dist/stable/xpf-evil.qcow2)
-            # can never be a verified artifact — a manifest binds BASENAMES, so
-            # a nested duplicate basename would also escape a basename-only
-            # `covered` check. Refuse any image artifact below the top level.
-            if os.path.abspath(root) != os.path.abspath(dist):
-                die(f"image artifact outside the top-level dist dir: {rel} — "
-                    "images belong at dist/xpf-<ver>.*; refusing to publish "
-                    "unverified nested bytes.")
-            if name not in covered:
-                die(f"orphan image artifact in the publish set: {rel} is not "
-                    "listed in any verified manifest — refusing to publish "
-                    "unverified bytes. Remove it or sign a manifest covering it.")
+            # Default-deny (HB165 H-5): the whole dist tree is uploaded, so a
+            # file that is neither a verified image artifact nor an expected
+            # signed/metadata sidecar must NOT ride along. The motivating case
+            # is an unsigned dist/deb/*.deb — the suffix-shaped sweep skipped
+            # every non-image file, so a deb staged under the publish root
+            # shipped to the image URL with no signature. Refuse anything
+            # unrecognised.
+            if not _is_allowed_publish_file(name, at_top):
+                die(f"unexpected file in the image publish set: {rel} — the "
+                    "whole dist tree is uploaded, so every file must be a "
+                    "verified image artifact or an expected sidecar "
+                    "(*.SHA256SUMS, *.minisig, install.sh, latest.json, "
+                    "xpf-image.pub, xpf-<ver>.manifest). Refusing to publish "
+                    "unverified bytes — build .deb packages OUTSIDE dist/ (see "
+                    "DEB_OUT) and remove any stray file.")
     # (c) install.sh — PRESENT (mandatory unless --no-installer), stamped
     # (no placeholder key, no unsubstituted marker), AND signed. Presence is
     # mandatory by default because a missing installer makes the Tier-A
@@ -479,8 +526,12 @@ def gate_images(dist, require_installer=True):
     return versions, pub
 
 
-def gate_latest(dist, channel, versions, pub):
-    """(d): latest.json verifies and names a present version."""
+def _gate_one_latest(dist, channel, pub, require_present):
+    """Verify one channel's signed latest.json. `require_present`, when not
+    None, is the set of versions the pointer's `version` MUST name (the target
+    channel's freshness contract); pass None to enforce only the signature (a
+    non-target channel may legitimately point at a version outside THIS
+    publish's dist set)."""
     latest = os.path.join(dist, channel, "latest.json")
     if not os.path.isfile(latest):
         die(f"{channel}/latest.json missing — run "
@@ -494,14 +545,33 @@ def gate_latest(dist, channel, versions, pub):
     try:
         data = json.loads(sign.verify_and_read(latest, sig, pub).decode())
     except sign.SignError as e:
-        die(f"latest.json signature failed verify: {e}")
+        die(f"{channel}/latest.json signature failed verify: {e}")
     except (ValueError, UnicodeDecodeError) as e:
-        die(f"latest.json is not valid JSON after verify: {e}")
+        die(f"{channel}/latest.json is not valid JSON after verify: {e}")
     ver = data.get("version")
-    if ver not in versions:
-        die(f"latest.json names version {ver!r} which is NOT in the publish set "
-            f"{sorted(versions)} — refusing to advertise a missing version.")
+    if require_present is not None and ver not in require_present:
+        die(f"{channel}/latest.json names version {ver!r} which is NOT in the "
+            f"publish set {sorted(require_present)} — refusing to advertise a "
+            "missing version.")
     info(f"latest.json OK (channel {channel} -> {ver})")
+
+
+def gate_latest(dist, channel, versions, pub):
+    """(d): the TARGET channel's latest.json verifies and names a present
+    version, AND every OTHER dist/<chan>/latest.json in the tree also carries a
+    verifying signature (HB165 H-13). The whole dist tree is uploaded, so a
+    stale/tampered/unsigned pointer for a non-target channel would otherwise
+    ship unverified — mirror gate_apt's per-suite InRelease posture and gate
+    EVERY channel's freshness pointer, not just `--channel`'s."""
+    # Target channel: mandatory + must name a version present in this publish.
+    _gate_one_latest(dist, channel, pub, require_present=versions)
+    # Every other channel pointer present in the tree: signature only.
+    for entry in sorted(os.listdir(dist)):
+        cdir = os.path.join(dist, entry)
+        if entry == channel or not os.path.isdir(cdir):
+            continue
+        if os.path.isfile(os.path.join(cdir, "latest.json")):
+            _gate_one_latest(dist, entry, pub, require_present=None)
 
 
 def gate_apt(dist, channel):

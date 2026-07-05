@@ -679,9 +679,9 @@ deploy_vm_deb() {
 		die "Instance $vm does not exist. Run '$0 create' first."
 	fi
 	# Locate the freshly-built .deb (Makefile deb: target output dir is
-	# dist/deb/; install the runtime xpf_*.deb, NOT the xpf-appliance meta).
-	deb=$(ls -t "$PROJECT_ROOT"/dist/deb/xpf_*.deb 2>/dev/null | head -1 || true)
-	[[ -n "$deb" ]] || die "no xpf_*.deb found in dist/deb/ — run 'make deb' first (XPF_DEPLOY_DEB build)"
+	# dist-deb/; install the runtime xpf_*.deb, NOT the xpf-appliance meta).
+	deb=$(ls -t "$PROJECT_ROOT"/dist-deb/xpf_*.deb 2>/dev/null | head -1 || true)
+	[[ -n "$deb" ]] || die "no xpf_*.deb found in dist-deb/ — run 'make deb' first (XPF_DEPLOY_DEB build)"
 
 	info "Pushing $(basename "$deb") to $vm..."
 	incus file push "$deb" "${rinst}/tmp/$(basename "$deb")"
