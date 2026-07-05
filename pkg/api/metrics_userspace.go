@@ -1599,6 +1599,16 @@ func (c *xpfCollector) emitCoSWaterfillTelemetry(ch chan<- prometheus.Metric, st
 				float64(queue.WaterfillEligibleVisits),
 				ifindexLabel, queueLabel,
 			)
+			// hb166 T-2: Phase-1 honored selections that made zero TX
+			// progress (budget + honored bit refunded). Climbing here
+			// with flat phase1_admissions = TX-ring pressure eating a
+			// small class's guarantee pass (#1630/#4256).
+			ch <- prometheus.MustNewConstMetric(
+				c.cosWaterfillPhase1SelectedNoProgress,
+				prometheus.CounterValue,
+				float64(queue.WaterfillPhase1SelectedNoProgress),
+				ifindexLabel, queueLabel,
+			)
 		}
 	}
 }

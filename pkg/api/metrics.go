@@ -257,13 +257,15 @@ type xpfCollector struct {
 	cosDrainParkRootTokens       *prometheus.Desc
 	cosDrainParkQueueTokens      *prometheus.Desc
 	// #1628: per-class waterfill-selector trace counters. Per-queue
-	// (admissions/visits) plus per-interface (epochs/breaks/min-epochs).
-	cosWaterfillPhase1Admissions   *prometheus.Desc
-	cosWaterfillPhase2Admissions   *prometheus.Desc
-	cosWaterfillEligibleVisits     *prometheus.Desc
-	cosWaterfillEpochs             *prometheus.Desc
-	cosWaterfillPhase1BudgetBreaks *prometheus.Desc
-	cosWaterfillMinEpochsPerWorker *prometheus.Desc
+	// (admissions/visits/no-progress) plus per-interface
+	// (epochs/breaks/min-epochs).
+	cosWaterfillPhase1Admissions         *prometheus.Desc
+	cosWaterfillPhase2Admissions         *prometheus.Desc
+	cosWaterfillEligibleVisits           *prometheus.Desc
+	cosWaterfillPhase1SelectedNoProgress *prometheus.Desc
+	cosWaterfillEpochs                   *prometheus.Desc
+	cosWaterfillPhase1BudgetBreaks       *prometheus.Desc
+	cosWaterfillMinEpochsPerWorker       *prometheus.Desc
 	// #1863 Step-0: per-(queue, worker) v8 lease claim-flow counters
 	// (requested vs granted bytes) + per-queue admission-path drop
 	// counters. The claim-flow pair attributes the honored-realization
@@ -666,6 +668,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosWaterfillPhase1Admissions
 	ch <- c.cosWaterfillPhase2Admissions
 	ch <- c.cosWaterfillEligibleVisits
+	ch <- c.cosWaterfillPhase1SelectedNoProgress
 	ch <- c.cosWaterfillEpochs
 	ch <- c.cosWaterfillPhase1BudgetBreaks
 	ch <- c.cosWaterfillMinEpochsPerWorker

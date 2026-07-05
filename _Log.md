@@ -1,3 +1,32 @@
+## 2026-07-05 — cos: surface waterfill phase1_selected_no_progress (#4262)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Surfaced the hb166 T-2 `waterfill_phase1_selected_no_progress`
+    counter (added in #4256/#4258) via Prometheus + the `show
+    class-of-service` formatter, mirroring its sibling
+    `waterfill_phase1_admissions`. Added the per-`{ifindex, queue_id}`
+    gauge `cosWaterfillPhase1SelectedNoProgress`
+    (`xpf_userspace_cos_waterfill_phase1_selected_no_progress_total`): the
+    Desc struct field + Describe emit in metrics.go, the NewDesc in
+    metrics_descriptors.go, and the CounterValue emit in the per-queue loop
+    of `emitCoSWaterfillTelemetry` (metrics_userspace.go). Added
+    `phase1_no_progress=%d` to the per-queue Waterfill row in
+    format/cos.go, with the view field, the copy-through in
+    buildCoSQueueViews, and the `hasWaterfillTelemetry` gate. Also folded a
+    comment-accuracy fix in protocol.go (~1979): a missing JSON field
+    decodes to 0 regardless of omitempty; omitempty only suppresses
+    emitting 0 on the wire. Extended the Prometheus test
+    (TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics) and added
+    a formatter test (TestFormatCoSInterfaceSummaryRendersWaterfillNoProgress).
+    Docs: cos-validation-notes.md (show example + per-queue bullet +
+    Prometheus list) and fairness-regimes.md (observability pointer).
+  - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+    pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
+    pkg/dataplane/userspace/format/cos.go,
+    pkg/dataplane/userspace/format/cos_test.go,
+    pkg/dataplane/userspace/protocol.go, docs/cos-validation-notes.md,
+    docs/fairness-regimes.md
+
 ## 2026-07-04 — fable-review-166 T-1: v8 lease give-back re-credits the epoch ledger (#4246, folds R-5(a))
 
 - **Timestamp**: 2026-07-04
