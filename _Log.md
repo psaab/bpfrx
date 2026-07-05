@@ -1,3 +1,27 @@
+## 2026-07-04 — hb166 V-8: surplus give-back handback series cross-checks
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-8 — fairness_surplus_giveback_validate.py accepted the
+  first list-order sample matching the post-handback thresholds with no
+  monotonic-t_sec check, no pre-handback baseline, and no density
+  requirement, so a one-element artifact with a single settled snapshot
+  trivially passed the <=5s handback gate on a self-attested t_sec.
+  Hardened _handback_from_samples to require >=min_handback_samples
+  (default 2), strictly increasing t_sec, consecutive gaps within
+  max_handback_sample_gap_sec (default 5s), and a pre-handback baseline
+  before the first post-handback sample; the handback time is derived as
+  the first post-handback sample following a pre-handback one. Added CLI
+  flags --min-handback-samples / --max-handback-sample-gap-sec and 4 unit
+  tests (single-sample, non-monotonic, no-pre-baseline, too-sparse).
+  Documented that timestamps remain generator-supplied (the ordered-series
+  is the auditability bound in a reduced artifact) and that NO live runner
+  produces phases.json yet — the validator is a MANUAL gate until a live
+  reducer is built (deferred half of V-8). Updated docs/fairness-regimes.md
+  and the validator docstring. Closes #4248.
+- **File(s)**: test/incus/fairness_surplus_giveback_validate.py,
+  test/incus/fairness_surplus_giveback_validate_test.py,
+  docs/fairness-regimes.md, _Log.md
+
 ## 2026-07-04 — hb166 V-10: align smoke CoV to the Rust fairness SSOT
 
 - **Timestamp**: 2026-07-04

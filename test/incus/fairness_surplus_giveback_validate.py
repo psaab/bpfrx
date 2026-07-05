@@ -23,6 +23,27 @@ Input is a JSON artifact with four named phases:
 The script deliberately validates reduced artifacts only. It does not run
 traffic; shell harnesses can feed it summaries from iperf, dataplane status,
 or Prometheus as those live runners evolve.
+
+Handback auditability (hb166 V-8): the ``handback_samples`` series must
+PROVE a give-back transition, not merely assert a settled snapshot. The
+validator requires at least ``--min-handback-samples`` samples (default 2),
+strictly increasing ``t_sec``, consecutive gaps within
+``--max-handback-sample-gap-sec`` (default 5s), and a pre-handback baseline
+sample (peer guarantee not yet restored) BEFORE the first post-handback
+sample. The derived handback time is the first post-handback sample that
+follows a pre-handback one, so the accepted ``t_sec`` is bracketed by an
+observed transition rather than trusted on its own. Note the timestamps
+themselves remain generator-supplied; the ordered-series cross-check is the
+auditability bound available in a reduced artifact, and an independent
+wall-clock derivation belongs in the live reducer (see below).
+
+No live runner exists yet (hb166 V-8): NOTHING in the tree produces
+``phases.json`` — the 100E100M give-back contract is exercised only by
+hand-built artifacts today. Building the live reducer (iperf interval JSON
++ Prometheus/dataplane-status → ``phases.json`` + ``handback_samples`` with
+wall-clock ``t_sec``) is tracked separately; until then this validator is a
+MANUAL gate, run by hand against a reduced artifact, and the structural
+cross-checks above are what keep a hand-built artifact honest.
 """
 
 from __future__ import annotations
@@ -103,15 +124,32 @@ def _handback_from_samples(
     min_peer_guarantee_ratio: float,
     borrow_alone_bps: float,
     max_borrower_demand_ratio: float,
-) -> Tuple[Optional[float], Optional[str]]:
+    min_samples: int,
+    max_sample_gap_sec: float,
+) -> Tuple[Optional[float], str, list[str]]:
+    """Derive the handback time from the ordered sample series.
+
+    Returns ``(handback_sec, source, structural_issues)``. The handback
+    time is only accepted when the series proves a give-back TRANSITION:
+    at least ``min_samples`` samples, strictly increasing ``t_sec``,
+    consecutive gaps within ``max_sample_gap_sec``, and a pre-handback
+    sample (peer guarantee not yet restored) preceding the first
+    post-handback sample. Each violated invariant is returned as a
+    structural-issue string so the caller can fail the artifact. Without
+    these cross-checks a one-element artifact carrying a single already
+    settled snapshot trivially satisfies the handback gate — the sample's
+    self-attested ``t_sec`` is the only evidence (hb166 V-8).
+    """
     samples = artifact.get("handback_samples")
     if samples is None:
-        return None, "missing_handback_samples"
+        return None, "missing_handback_samples", []
     if not isinstance(samples, list) or not samples:
         raise ValueError("handback_samples must be a non-empty list when present")
 
     threshold_peer = peer_guarantee * min_peer_guarantee_ratio
     threshold_borrower = borrow_alone_bps * max_borrower_demand_ratio
+
+    parsed: list[Tuple[float, float, float]] = []  # (t_sec, borrower, peer)
     for index, sample in enumerate(samples):
         if not isinstance(sample, dict):
             raise ValueError(f"handback_samples[{index}] must be an object")
@@ -127,9 +165,59 @@ def _handback_from_samples(
             throughputs.get("peer"),
             f"handback_samples[{index}].throughput_mbps.peer",
         )
-        if peer >= threshold_peer and borrower <= threshold_borrower:
-            return t_sec, "handback_samples"
-    return None, "handback_samples_no_match"
+        parsed.append((t_sec, borrower, peer))
+
+    issues: list[str] = []
+    if len(parsed) < min_samples:
+        issues.append(
+            f"handback_samples has {len(parsed)} sample(s); at least {min_samples} "
+            "are required to prove a give-back transition (a single self-attested "
+            "snapshot is not auditable)"
+        )
+    for i in range(1, len(parsed)):
+        if parsed[i][0] <= parsed[i - 1][0]:
+            issues.append(
+                f"handback_samples t_sec not strictly increasing at index {i}: "
+                f"{parsed[i][0]:.3f} <= {parsed[i - 1][0]:.3f}"
+            )
+        gap = parsed[i][0] - parsed[i - 1][0]
+        if gap > max_sample_gap_sec:
+            issues.append(
+                f"handback_samples gap {gap:.3f}s between index {i - 1} and {i} "
+                f"exceeds max {max_sample_gap_sec:.3f}s (series too sparse to bound "
+                "the handback time)"
+            )
+
+    def _is_post(borrower: float, peer: float) -> bool:
+        return peer >= threshold_peer and borrower <= threshold_borrower
+
+    if parsed and _is_post(parsed[0][1], parsed[0][2]):
+        issues.append(
+            "first handback sample is already in the post-handback state (peer "
+            "guarantee restored while borrower gave back surplus); no pre-handback "
+            "baseline captured, so the handback point is not derived from an "
+            "observed transition"
+        )
+
+    handback_time: Optional[float] = None
+    seen_pre = False
+    saw_post = False
+    for t_sec, borrower, peer in parsed:
+        if _is_post(borrower, peer):
+            saw_post = True
+            if seen_pre and handback_time is None:
+                handback_time = t_sec
+        else:
+            seen_pre = True
+    if handback_time is not None:
+        return handback_time, "handback_samples", issues
+    if saw_post:
+        # A post-handback state exists but no pre-handback sample precedes
+        # it — the "already post / no pre-baseline" structural issue above
+        # is the precise reason; do not also claim the series never showed
+        # restoration.
+        return None, "handback_samples_no_pre_baseline", issues
+    return None, "handback_samples_no_match", issues
 
 
 def validate(
@@ -144,6 +232,8 @@ def validate(
     min_reclaim_alone_ratio: float,
     root_cap_tolerance_ratio: float,
     max_peer_steady_drops: float,
+    min_handback_samples: int = 2,
+    max_handback_sample_gap_sec: float = 5.0,
 ) -> dict[str, Any]:
     phases = _phase_map(artifact)
     root_cap = _nonnegative_number(artifact.get("root_cap_mbps"), "root_cap_mbps")
@@ -164,12 +254,14 @@ def validate(
     steady_peer = _throughput(peer_steady, "peer")
     reclaim_borrower = _throughput(reclaim, "borrower")
     steady_peer_drops = _drops(peer_steady, "peer")
-    handback, handback_source = _handback_from_samples(
+    handback, handback_source, handback_issues = _handback_from_samples(
         artifact,
         peer_guarantee=peer_guarantee,
         min_peer_guarantee_ratio=min_peer_guarantee_ratio,
         borrow_alone_bps=borrow_alone_bps,
         max_borrower_demand_ratio=max_borrower_demand_ratio,
+        min_samples=min_handback_samples,
+        max_sample_gap_sec=max_handback_sample_gap_sec,
     )
     if handback is None:
         handback = max_handback_sec + 1.0
@@ -207,6 +299,11 @@ def validate(
         failures.append(
             "handback_samples are required; scalar handback evidence is not auditable"
         )
+    # Structural cross-checks on the sample series (>=N samples, strictly
+    # increasing t_sec, bounded gap, pre-handback baseline) prove the
+    # handback is an OBSERVED transition rather than a single self-attested
+    # snapshot (hb166 V-8).
+    failures.extend(handback_issues)
     if steady_borrower > borrow_alone_bps * max_borrower_demand_ratio:
         failures.append(
             f"borrower did not give back surplus: steady {steady_borrower:.3f} Mbps "
@@ -252,6 +349,8 @@ def validate(
             "min_reclaim_alone_ratio": min_reclaim_alone_ratio,
             "root_cap_tolerance_ratio": root_cap_tolerance_ratio,
             "max_peer_steady_drops": max_peer_steady_drops,
+            "min_handback_samples": min_handback_samples,
+            "max_handback_sample_gap_sec": max_handback_sample_gap_sec,
         },
         "metrics": {
             "borrow_alone_borrower_mbps": borrow_alone_bps,
@@ -288,6 +387,24 @@ def main() -> int:
     parser.add_argument("--min-reclaim-alone-ratio", type=float, default=0.90)
     parser.add_argument("--root-cap-tolerance-ratio", type=float, default=0.02)
     parser.add_argument("--max-peer-steady-drops", type=float, default=0.0)
+    parser.add_argument(
+        "--min-handback-samples",
+        type=int,
+        default=2,
+        help=(
+            "minimum number of handback_samples required to prove a give-back "
+            "transition; a single self-attested snapshot is not auditable"
+        ),
+    )
+    parser.add_argument(
+        "--max-handback-sample-gap-sec",
+        type=float,
+        default=5.0,
+        help=(
+            "maximum allowed gap between consecutive handback_samples; a wider "
+            "gap leaves the derived handback time unbounded"
+        ),
+    )
     args = parser.parse_args()
 
     with open(args.input) as f:
@@ -303,6 +420,8 @@ def main() -> int:
         min_reclaim_alone_ratio=args.min_reclaim_alone_ratio,
         root_cap_tolerance_ratio=args.root_cap_tolerance_ratio,
         max_peer_steady_drops=args.max_peer_steady_drops,
+        min_handback_samples=args.min_handback_samples,
+        max_handback_sample_gap_sec=args.max_handback_sample_gap_sec,
     )
     with open(args.out, "w") as f:
         json.dump(verdict, f, indent=2, sort_keys=True)

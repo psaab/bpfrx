@@ -719,7 +719,37 @@ phases: `borrow_alone`, `peer_demand`, `peer_steady`, and
 throughput samples in `handback_samples`. Scalar
 `handback_window_sec` values and self-attested handback labels are not
 accepted as substitutes because the validator must derive the handback
-point from auditable data. The default gates are:
+point from auditable data.
+
+**Handback series cross-checks (#4239 V-8).** A single already-settled
+snapshot cannot prove a give-back transition — its self-attested `t_sec`
+would be the only evidence, and a one-element artifact trivially clears
+the ≤5 s gate. The validator therefore requires the `handback_samples`
+series to demonstrate an OBSERVED transition:
+
+- at least `--min-handback-samples` samples (default 2);
+- strictly increasing `t_sec` (an ordered time series);
+- consecutive gaps within `--max-handback-sample-gap-sec` (default 5 s),
+  so the derived handback time is bounded rather than hidden inside a
+  wide blind gap;
+- a pre-handback baseline sample (peer guarantee not yet restored)
+  BEFORE the first post-handback sample.
+
+The derived handback time is the first post-handback sample that follows
+a pre-handback one, so the accepted `t_sec` is bracketed by the observed
+transition. The timestamps themselves are still generator-supplied; the
+ordered-series cross-check is the auditability bound available in a
+reduced artifact, and an independent wall-clock derivation belongs in the
+live reducer.
+
+**No live runner yet (#4239 V-8).** Nothing in the tree produces
+`phases.json`; the 100E100M give-back contract is exercised only by
+hand-built artifacts today, so this validator is a MANUAL gate. The
+structural cross-checks above are what keep a hand-built artifact honest
+until a live reducer (iperf interval JSON + Prometheus/dataplane status
+→ `phases.json` + `handback_samples` with wall-clock `t_sec`) is built.
+
+The default gates are:
 
 - borrower-alone throughput exceeds 105% of the borrower guarantee
 - peer-demand throughput is non-zero (at least 1% of the peer guarantee)
