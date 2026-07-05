@@ -326,9 +326,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// importable xpf.conf. Resolved to NOT-bootstrap so takeover is not
 		// silently suppressed on a normal deploy, but HA availability is NOT
 		// promised — this is an operator misconfiguration. Log loudly.
+		//
+		// #4179: the nil active config carries no cluster stanza, so the boot
+		// naming below runs in STANDALONE mode (clusterMode=false → fxp0 +
+		// ge-0-0-X, no em0 / FPC). Arm the one-shot re-naming flag so the first
+		// non-empty config that arrives (a cluster SyncApply from the primary,
+		// or a local commit) re-runs startup naming with the config's real
+		// cluster identity. Naming reconciles on config arrival — no daemon
+		// restart is required.
+		d.emptyHANamingPending.Store(true)
 		slog.Error("xpf HA node has /etc/xpf/node-id but no committed config and no importable "+
-			"xpf.conf; proceeding with EMPTY config takeover (NOT bootstrap mode). HA availability "+
-			"is NOT promised in this state — push the cluster config and commit",
+			"xpf.conf; proceeding with EMPTY config takeover (NOT bootstrap mode) using STANDALONE "+
+			"interface names. HA availability is NOT promised until the cluster config is pushed and "+
+			"committed; interface naming will reconcile to the node's cluster names (em0, ge-<fpc>-0-X) "+
+			"automatically when that config arrives (no restart required)",
 			"node_id_file", nodeIDFile)
 	}
 
@@ -1839,23 +1850,16 @@ func enableForwarding() {
 	slog.Info("IP forwarding enabled, RA acceptance disabled")
 }
 
-// runBootstrapExitStartup performs the one-time startup TAKEOVER steps that
-// bootstrap mode suppressed at boot — interface rename, IP forwarding, and
-// dataplane arm — when the daemon leaves bootstrap on its first non-empty
-// config apply (#1922 Item 2). It runs under d.applySem (the apply caller
-// holds it) and strictly BEFORE the reconcile that wires the config onto
-// these subsystems. It mirrors the boot block in Run; bootstrap exit is
-// one-way, so this runs at most once.
-func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
-	if d.opts.NoDataplane {
+// namingParamsFromConfig derives the startup-naming inputs from a config: the
+// cluster node ID and mode (from the chassis cluster stanza) and the
+// userspace-dp RSS-indirection knobs. Shared by the boot naming site, the
+// bootstrap-exit takeover, and the #4179 config-arrival re-naming so all three
+// derive naming identically from the SAME config.
+func namingParamsFromConfig(cfg *config.Config) (nodeID int, clusterMode bool, userspaceWorkers int, rssEnabled bool, rssAllowed []string) {
+	rssEnabled = true
+	if cfg == nil {
 		return
 	}
-
-	clusterMode := false
-	nodeID := 0
-	userspaceWorkers := 0
-	rssEnabled := true
-	var rssAllowed []string
 	if cfg.Chassis.Cluster != nil {
 		clusterMode = true
 		nodeID = cfg.Chassis.Cluster.NodeID
@@ -1868,6 +1872,85 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 		}
 		rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
 	}
+	return
+}
+
+// applyStartupNamingForConfig runs the startup naming policy (positional or
+// device-map) for a given config, deriving the naming inputs from that config.
+// It is the shared naming action used by the bootstrap-exit takeover and the
+// #4179 config-arrival re-naming. It does NOT arm the dataplane or enable
+// forwarding — those are the caller's concern (the config-arrival path is NOT
+// bootstrap, so the dataplane was already armed at boot).
+func (d *Daemon) applyStartupNamingForConfig(cfg *config.Config) error {
+	if d.opts.NoDataplane {
+		return nil
+	}
+	nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed := namingParamsFromConfig(cfg)
+	return applyStartupNamingPolicy(cfg, nodeID, clusterMode, userspaceWorkers,
+		rssEnabled, rssAllowed, d.resolveProtectedInterfaces())
+}
+
+// maybeReapplyConfigArrivalNaming re-runs startup naming exactly once, when a
+// config-less HA node (emptyHANamingPending, set on the #4179 HA-guard
+// EMPTY-takeover boot) receives its FIRST non-empty config. That boot named the
+// NICs with STANDALONE names because the nil active config carried no cluster
+// stanza; the arriving config finally supplies the node's cluster identity, so
+// the NICs must be renamed to em0 + ge-<fpc>-0-X (the names the config
+// references) instead of stranding on standalone names until a restart.
+//
+// It mirrors the bootstrap-exit re-naming but WITHOUT re-arming the dataplane
+// (this node is NOT in bootstrap mode — the dataplane was armed at boot). The
+// caller places it BEFORE the reconcile so the config is wired onto the
+// correctly-named links. The config-less node forwards no real traffic yet
+// (empty config at boot), so the mid-apply rename is safe. Returns true if
+// naming was re-run AND succeeded (the one-shot flag was consumed). An empty
+// config does NOT consume the flag — naming waits for the real cluster config.
+//
+// The flag is consumed only on SUCCESS: if applyStartupNamingForConfig errors
+// (a transient NIC enumeration / netlink failure), the flag STAYS SET so the
+// next config apply retries. Otherwise a single transient error would strand
+// the config-less HA node on standalone names forever. The retry is bounded to
+// once per config apply (a commit / SyncApply, not a hot loop); a persistently
+// failing enumeration re-attempts on each commit, which is acceptable and
+// logged. Both call sites run under d.applySem, so applies are serialized and
+// the success path cannot double-run.
+func (d *Daemon) maybeReapplyConfigArrivalNaming(cfg *config.Config) bool {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		return false
+	}
+	if !d.emptyHANamingPending.Load() {
+		return false
+	}
+	_, clusterMode, _, _, _ := namingParamsFromConfig(cfg)
+	slog.Info("config-arrival interface naming: a config-less HA node received its first "+
+		"non-empty config; re-running startup naming with the config's cluster identity",
+		"cluster_mode", clusterMode)
+	if err := d.applyStartupNamingForConfig(cfg); err != nil {
+		// Leave the flag SET so the next config apply retries — a transient
+		// enumeration/netlink error must not permanently strand this node on
+		// standalone names.
+		slog.Warn("config-arrival interface naming failed; will retry on the next config apply",
+			"err", err)
+		return false
+	}
+	// Consume the one-shot flag only now that naming succeeded.
+	d.emptyHANamingPending.Store(false)
+	return true
+}
+
+// runBootstrapExitStartup performs the one-time startup TAKEOVER steps that
+// bootstrap mode suppressed at boot — interface rename, IP forwarding, and
+// dataplane arm — when the daemon leaves bootstrap on its first non-empty
+// config apply (#1922 Item 2). It runs under d.applySem (the apply caller
+// holds it) and strictly BEFORE the reconcile that wires the config onto
+// these subsystems. It mirrors the boot block in Run; bootstrap exit is
+// one-way, so this runs at most once.
+func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
+	if d.opts.NoDataplane {
+		return
+	}
+
+	nodeID, _, _, _, _ := namingParamsFromConfig(cfg)
 
 	// Full rename loop — the lifeline-gated path only renamed fxp0 (or
 	// nothing). Now claim the NICs per the active naming policy.
@@ -1876,8 +1959,7 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	// device-map first appears, so this site must branch too — otherwise
 	// day-0 bare metal claims every NIC positionally before the map ever
 	// applies.
-	if err := applyStartupNamingPolicy(cfg, nodeID, clusterMode, userspaceWorkers,
-		rssEnabled, rssAllowed, d.resolveProtectedInterfaces()); err != nil {
+	if err := d.applyStartupNamingForConfig(cfg); err != nil {
 		slog.Warn("bootstrap exit: interface naming failed", "err", err)
 	}
 

@@ -1,3 +1,102 @@
+## 2026-07-04 — #4188 / #4189 / #4190 (fable-review-165 H-23 / H-25 / H-30): xpf-deploy correctness
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed three `scripts/deploy/xpf-deploy.py` correctness
+    bugs. H-23 (#4188): the libvirt `physical` backing passed the raw
+    netdev NAME (e.g. `enp8s0`) to `virt-install --hostdev`, which needs
+    a PCI/USB address — the domain fails to define / mis-attaches. Now
+    the netdev is resolved to its PCI BDF via the existing `pci_of()`
+    helper (a raw PCI address under `physical:` is accepted too, and an
+    unresolvable name dies with a clear message); incus is unchanged
+    (`nictype=physical parent=<dev>` correctly takes the netdev name).
+    H-25 (#4189): the fetch anti-rollback watermark compared git-describe
+    suffixes as whole strings, so `1.2.3-10-gabc` ranked OLDER than
+    `1.2.3-9-gdef` and `rc10` below `rc9` — false "possible rollback"
+    refusals. `_ver_key` is now module-level and numeric-splits the
+    suffix (`_suffix_key`, int/text-tagged so no mixed compare raises)
+    while keeping the rc < release < post-release category rank. H-30
+    (#4190): `fetch` left the verified qcow2 at `<out>/xpf-<ver>.qcow2`
+    but `deploy --hypervisor libvirt` reads the golden at
+    `/var/lib/libvirt/images/<image>.qcow2` — nothing bridged the gap.
+    Added `libvirt_golden_path()` as the shared SSOT used by BOTH
+    `libvirt_disk` (deploy) and a new `fetch --install-libvirt` (which
+    installs the verified qcow2 there via `_install_libvirt_golden`,
+    falling back to `sudo install` for the root-owned images dir); the
+    `--qcow2-only` hint now prints the exact install command.
+  - **File(s)**: `scripts/deploy/xpf-deploy.py`,
+    `scripts/deploy/test_xpf_deploy_correctness.py` (new — 12 RED-on-revert
+    tests), `examples/deploy/README.md`, `docs/distribution.md`,
+    `docs/install-images.md`, `_Log.md`.
+  - **Validation**: `python3 -m py_compile`; full `scripts/deploy`
+    unittest suite 27/27 (12 new + 15 existing); RED-on-revert proven for
+    each finding (H-23 physical→PCI resolution fails when the netdev name
+    is passed; H-25 rc10/count-10 ordering inverts on whole-string
+    compare; H-30 shared golden helper removed → agreement test fails).
+
+## 2026-07-04 — #4178 / #4179 (fable-review-165 H-7 / H-10): interface-naming daemon bugs
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed two positional interface-naming defects. H-7
+    (#4178): the positional startup rename loop
+    (`enumerateAndRenameInterfaces`) was single-pass — it wrote a `.link`
+    file then let a later iteration's `recoverOriginalName` read that
+    just-overwritten file, and EEXIST renames were warn-and-continue with
+    no collision break. An enumeration shift (a NIC added at a lower PCI
+    bus) corrupted the `.link` `OriginalName=` chain and shifted
+    port↔zone bindings for a boot. H-10 (#4179): an HA node with
+    `/etc/xpf/node-id` but no committed config boots NOT in bootstrap
+    mode (HA-node guard) and names its NICs STANDALONE (nil active config
+    → clusterMode=false); startup naming never re-ran when the cluster
+    config arrived via config-sync, so the NICs kept wrong standalone
+    names (no `em0`, FPC 0 instead of the node's FPC) until a restart.
+  - **Fix H-7**: extracted the collision-safe two-pass rename into
+    `renamePositional` + a shared `breakNameCollisions` helper (used by
+    BOTH the positional path and device-map's `enumerateAndRenameMapped`,
+    de-duplicating the phase-1 collision break). Captures every
+    `OriginalName=` BEFORE any write, breaks target-name collisions via
+    `xpf-tmp-N`, then writes `.link` + renames to final. Refactored
+    device_map.go phase 1 to call the shared helper (behavior preserved
+    bit-for-bit incl. the AGY MEDIUM-3 leftover-temp guard and phase-3
+    stranded restore).
+  - **Fix H-10**: one-shot `emptyHANamingPending` atomic flag set in the
+    HA-guard EMPTY-takeover branch (`daemon_run.go`); the first non-empty
+    config to arrive re-runs startup naming via
+    `maybeReapplyConfigArrivalNaming` in `applyConfigLocked` (BEFORE the
+    reconcile), deriving cluster mode/nodeID from the ARRIVING config.
+    Mirrors bootstrap-exit re-naming but does NOT re-arm the dataplane
+    (node not in bootstrap). Extracted shared `namingParamsFromConfig`
+    + `applyStartupNamingForConfig`. Corrected the boot error text: no
+    restart required. Low-risk — the config-less node forwards no real
+    traffic yet (empty config at boot).
+  - **Test**: `linksetup_collision_4178_test.go` (enumeration-shift no
+    corruption, first-boot no temp renames, steady-state no churn) and
+    `config_arrival_naming_4179_test.go` (HA node re-names to cluster
+    node 1 / FPC 7, empty config does not consume the flag, normal node
+    never re-names). RED-on-revert PROVEN for both: single-pass revert
+    fails the H-7 corruption test (fxp0 stays on A, ge-0-0-0 empty);
+    no-op revert fails the H-10 re-naming test. `go test ./pkg/daemon/...`
+    green; `go build ./...`, gofmt, vet clean.
+  - **Review folds (PR #4182, Copilot)**: (1) REAL robustness bug —
+    maybeReapplyConfigArrivalNaming consumed the one-shot flag via CAS
+    BEFORE calling applyStartupNamingForConfig, so a transient naming
+    error stranded the config-less HA node on standalone names forever.
+    Restructured to Load()-gate, attempt naming, and Store(false) to
+    consume ONLY on success; on error the flag stays set + slog.Warn, so
+    the next config apply retries (bounded to once per commit; applies
+    serialized under d.applySem). New test
+    TestConfigArrivalRenamingRetriesOnFailure (fail-then-succeed);
+    RED-on-revert proven (consume-first fails it). (2) Test hermeticity —
+    newStoreDaemon now pins lifelineRecordFileForTest to a temp path so
+    resolveProtectedInterfaces does not read the host /etc/xpf lifeline
+    record. (3) Log-prefix threading — breakNameCollisions takes a
+    logPrefix param ("linksetup" | "device-map") so a device-map
+    collision logs "device-map:" not "linksetup:".
+  - **File(s)**: pkg/daemon/linksetup.go, pkg/daemon/device_map.go,
+    pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
+    pkg/daemon/daemon_apply.go,
+    pkg/daemon/linksetup_collision_4178_test.go,
+    pkg/daemon/config_arrival_naming_4179_test.go,
+    docs/critical-patterns.md, docs/bare-metal-device-map.md, _Log.md
 ## 2026-07-04 — #4180 (fable-review-165 H-22): deploy role validation ignored the guest virtio-first PCI tiebreaker — virtio-after-hardware silently swaps zones
 
 - **Timestamp**: 2026-07-04
@@ -33826,6 +33925,82 @@ top.
   _Log.md
 
 - **Timestamp**: 2026-07-04
+- **Action**: Implement Junos `alarm-without-drop` screen ids-option
+  (audit/log-only mode) — fable-review-164 L-10 / issue #4170. The
+  profile-wide option was hard-rejected at commit: the `compileScreen`
+  top-level family switch accepted only icmp/ip/tcp/udp/limit-session, so
+  `alarm-without-drop` landed in UnknownLeaves and
+  `validateScreenUnknownStrict` (#3318) failed the commit. Wired the full
+  Go→Rust path so a tripped screen still ALARMS (logs the attack, counts
+  it) but FORWARDS the packet — the standard vSRX threshold-tuning
+  posture. Go: `ScreenProfile.AlarmWithoutDrop`, the `case
+  "alarm-without-drop"` compiler arm (recordKeyExtras + recordChildExtras
+  so a flat-set trailing token still rejects), the `ids-option` schema
+  flag leaf, and the `ScreenProfileSnapshot.AlarmWithoutDrop` wire field
+  (omitempty). Rust: the snapshot field (`skip_serializing_if =
+  bool_is_false` to keep the protocol_wire_v1 fixture byte-identical),
+  the runtime `ScreenProfile.alarm_without_drop`, the forwarding-build
+  mapping, and `ScreenState::alarm_without_drop`/`record_alarm_without_drop`.
+  The verdict consumers (`stage_screen_check` flowless + flow paths in
+  poll_stages.rs, and the scan/sweep + session-limit site in
+  poll_descriptor) convert a `ScreenVerdict::Drop` (and the flow-path
+  `SynCookieChallenge`) into a log-only PERMIT alarm carrying the tripped
+  reason (via `emit_screen_alarm_event`, mirroring the #3315
+  syn-flood-alarm path) and return Pass instead of dropping. Applies
+  profile-wide to every check including the rate-based flood / SYN-cookie
+  paths. A check-less alarm-without-drop profile is a no-op (not
+  published). RED-on-revert: pkg/config test (compile-threads + schema-
+  accept + trailing-token-reject), pkg/dataplane/userspace test (snapshot
+  carries the flag + JSON round-trip + legacy skew + check-less not
+  published), and Rust `alarm_without_drop_forwards_but_alarms_l10`
+  (flowless teardrop AND flow-path land: baseline DROPS, alarm mode
+  FORWARDS with alarm counter == 1). go test ./pkg/config/... +
+  ./pkg/dataplane/userspace/... green; FULL `cargo test --release
+  --test-threads=1` green (3527 lib + 46 + 8 + 16 + 1, 0 failed);
+  `go build ./...` clean; rustfmt/gofmt/vet clean. Docs: feature-gaps.md
+  Screen/IDS row marked Done.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_screen.go, pkg/config/schema_security.go,
+  pkg/config/screen_alarm_without_drop_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/screens.go,
+  pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-gaps.md,
+  _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fold hostile-review MINOR on PR #4176 (alarm-without-drop) —
+  close the SYN-cookie ACK gap so the "profile-wide including SYN-cookie"
+  contract genuinely holds. `check_packet` marks a zone SYN-cookie-active
+  (`syn_cookie_active_until_secs[zone]`) as a side-effect when it crosses
+  attack-threshold, BEFORE the `SynCookieChallenge` verdict is converted
+  to a log-only alarm + Pass by the consumer. Since audit mode never
+  mints cookies on the wire, that marking armed
+  `validate_syn_cookie_ack_on_session_miss` to DROP every returning
+  session-miss ACK as `Invalid` (the only drop branch, reachable only
+  when `locally_active`) — escaping the audit contract for that path.
+  Root-cause fix (approach a): gate the cookie-active marking at
+  screen/mod.rs on `!alarm_without_drop` (copied from the profile with
+  the other scalars). In audit mode `locally_active` stays false → the
+  ACK validation returns `NotApplicable` → the ACK forwards; the per-source
+  cap is also no longer skipped (correct — the check should still run and
+  alarm). The challenge is still minted and returned (consumer converts to
+  alarm + Pass), and the non-audit flow is bit-identical (gate is a no-op
+  when the flag is false). No change to the consumer stage was needed
+  (Invalid is unreachable for an audit zone). Test:
+  `syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10` — audit
+  zone crossing attack-threshold still mints the challenge but a returning
+  invalid ACK is `NotApplicable` (forwards); a non-audit control with
+  identical inputs still returns `Invalid` (drops) — RED-on-revert of the
+  gate. FULL `cargo test --release --test-threads=1` green (3528 + 46 + 8
+  + 16 + 1, 0 failed; wire-invariant fixture unchanged/byte-identical);
+  `go build ./...` clean; rustfmt clean. Doc: feature-gaps.md SYN-cookie
+  claim made precise.
+- **File(s)**: userspace-dp/src/screen/mod.rs,
+  userspace-dp/src/screen/tests.rs, docs/feature-gaps.md, _Log.md
 - **Action**: fable-165 H-20 — libvirt deploy attached the shared golden
   qcow2 to every VM as a WRITABLE `--disk`, so an HA pair booted two live
   domains off ONE file (qcow2 is not a cluster filesystem → concurrent
@@ -33893,3 +34068,33 @@ top.
   pkg/configstore/check_test.go, pkg/api/server.go, pkg/api/health.go,
   pkg/api/health_test.go, cmd/xpfd/main.go, docs/bare-metal-device-map.md,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-164 L-1 test-gap — add NAT64 cross-family (V6 src,
+  V4 dst) policy `*-address-excluded` inversion + empty-set fail-closed
+  coverage (issue #4187). Behavior verified CORRECT (test-gap, not a
+  bug); this PR is TEST-ONLY, no production change. The NAT64 inbound
+  arm in `try_match_rule`
+  (`userspace-dp/src/policy.rs`, the `(IpAddr::V6(src), IpAddr::V4(dst))`
+  branch) re-implements the `source-address-excluded` /
+  `destination-address-excluded` inversion AND the both-families-empty
+  fail-closed guard independently against per-family fields (source ->
+  v6 sets, dest -> v4 sets); the pre-existing #2358 NAT64 tests only
+  exercised the non-excluded match/any/wrong-host paths, so a future
+  field-swap could silently make a NAT64 `deny *-address-excluded
+  <host>` fail OPEN. Added four tests to the #2358 block of
+  `policy_tests.rs`:
+  `nat64_inbound_destination_excluded_denies_listed_permits_other`
+  (excluded v4 dst .200 denied, .201 permitted),
+  `nat64_inbound_source_excluded_denies_listed_permits_other`
+  (v6 src inside excluded prefix denied, outside permitted),
+  `nat64_inbound_empty_excluded_destination_fails_closed`,
+  `nat64_inbound_empty_excluded_source_fails_closed`. RED-on-revert
+  PROVEN with two scratch flips on the NAT64 arm: dropping the
+  `!(v4_empty && v6_empty)` guard (fail-open) -> the two empty-set tests
+  FAIL; disabling the exclusion inversion (`if false`) -> the two
+  inversion tests FAIL; policy.rs restored pristine. FULL cargo test
+  --release green (3532 lib tests + all bin/integration binaries, 0
+  failed); go build ./... green. No doc change: no doc documents the
+  Rust policy-engine per-arm test coverage.
+- **File(s)**: userspace-dp/src/policy_tests.rs, _Log.md

@@ -4260,6 +4260,68 @@ func TestBuildScreenSnapshotsSynFloodSubThresholds(t *testing.T) {
 	}
 }
 
+// fable-review-164 L-10: the profile-wide `alarm-without-drop` audit modifier
+// must thread from the typed config across the Go->Rust screen snapshot wire.
+// FAIL-ON-REVERT: drop the AlarmWithoutDrop assignment in buildScreenSnapshots
+// (or the wire field) and the AlarmWithoutDrop assertion goes RED.
+func TestBuildScreenSnapshotsAlarmWithoutDrop(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"untrust": {Name: "untrust", ScreenProfile: "audit"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"audit": {
+			Name:             "audit",
+			TCP:              config.TCPScreen{Land: true},
+			AlarmWithoutDrop: true,
+		},
+	}
+	snaps := buildScreenSnapshots(cfg)
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 screen snapshot, got %d", len(snaps))
+	}
+	if !snaps[0].AlarmWithoutDrop {
+		t.Fatalf("AlarmWithoutDrop not carried into the snapshot")
+	}
+
+	// JSON round-trip preserves the flag; a legacy blob without the key
+	// decodes false (drop-on-trip) rather than failing (#1961 skew tolerance).
+	blob, err := json.Marshal(snaps[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back ScreenProfileSnapshot
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !back.AlarmWithoutDrop {
+		t.Fatalf("round-trip lost AlarmWithoutDrop: %+v", back)
+	}
+	var legacy ScreenProfileSnapshot
+	if err := json.Unmarshal([]byte(`{"zone":"untrust","land":true}`), &legacy); err != nil {
+		t.Fatalf("legacy decode: %v", err)
+	}
+	if legacy.AlarmWithoutDrop {
+		t.Fatalf("legacy snapshot must decode AlarmWithoutDrop as false")
+	}
+}
+
+// A profile carrying ONLY alarm-without-drop (no enabled check) is a no-op and
+// must NOT be published — the modifier is intentionally excluded from the
+// emit gate (nothing to alarm on without a check).
+func TestBuildScreenSnapshotsAlarmWithoutDropAloneNotPublished(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"untrust": {Name: "untrust", ScreenProfile: "audit"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"audit": {Name: "audit", AlarmWithoutDrop: true},
+	}
+	if snaps := buildScreenSnapshots(cfg); len(snaps) != 0 {
+		t.Fatalf("a check-less alarm-without-drop profile must not publish, got %d", len(snaps))
+	}
+}
+
 func TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"

@@ -168,65 +168,32 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		}
 	}
 
-	// Phase 1: break name collisions. Any present NIC whose CURRENT name
-	// equals a desired final name, but which is NOT the NIC we want there,
-	// is moved to a unique temp name first (V-2).
-	tempStranded := make(map[string]presentNIC) // tempName -> original NIC info
-	// Track names currently in use (present NICs) so a leftover xpf-tmp-N
-	// from a prior crashed run does not cause an EEXIST temp-rename (AGY
-	// MEDIUM-3). freeTempName picks the first unused xpf-tmp-N.
-	inUse := make(map[string]bool, len(nics))
+	// Phase 1: break name collisions via the shared collision-safe primitive
+	// (#4178 — the SAME discipline the positional path now uses). Any present
+	// NIC whose CURRENT name equals a desired final name, but which is NOT the
+	// NIC we want there (a stale-udev misrename, or the intended NIC is
+	// elsewhere), is moved to a unique xpf-tmp-N first (V-2). breakNameCollisions
+	// seeds its temp-name allocator from every present NIC name, so a leftover
+	// xpf-tmp-N from a prior crashed run does not cause an EEXIST temp rename
+	// (AGY MEDIUM-3), and re-keys desiredByCurrent/originalByCurrent across the
+	// temp rename so phase 2 writes the correct OriginalName= (not xpf-tmp-N).
+	nicByName := make(map[string]presentNIC, len(nics))
+	currentNames := make([]string, len(nics))
 	for i := range nics {
-		inUse[nics[i].Name] = true
+		nicByName[nics[i].Name] = nics[i]
+		currentNames[i] = nics[i].Name
 	}
-	freeTempName := func() string {
-		for k := 0; ; k++ {
-			cand := fmt.Sprintf("xpf-tmp-%d", k)
-			if !inUse[cand] {
-				inUse[cand] = true
-				return cand
-			}
-		}
-	}
-	for i := range nics {
-		n := &nics[i]
-		if !desiredNames[n.Name] {
-			continue
-		}
-		// Is this NIC the intended occupant of n.Name?
-		if final, ok := desiredByCurrent[n.Name]; ok && final == n.Name {
-			continue // already correctly named, leave it
-		}
-		// A different NIC occupies a desired name (stale-udev misrename, or
-		// the intended NIC is elsewhere). Move it out of the way.
-		tmpName := freeTempName()
-		if err := renameInterface(n.Name, tmpName); err != nil {
-			slog.Warn("device-map: temp-rename to break collision failed",
-				"from", n.Name, "to", tmpName, "err", err)
-			continue
-		}
-		slog.Info("device-map: temp-renamed conflicting interface", "from", n.Name, "to", tmpName)
-		stranded := *n
-		// Update desiredByCurrent if THIS nic was itself a desired source.
-		if final, ok := desiredByCurrent[n.Name]; ok {
-			delete(desiredByCurrent, n.Name)
-			desiredByCurrent[tmpName] = final
-			// Carry the TRUE original name across the temp rename so phase 2
-			// writes the correct OriginalName= (not xpf-tmp-N).
-			if orig, ok := originalByCurrent[n.Name]; ok {
-				delete(originalByCurrent, n.Name)
-				originalByCurrent[tmpName] = orig
-			}
-		} else {
-			// Unmapped NIC that was wearing a desired name — strand it for
-			// predictable-name restore in phase 3.
-			tempStranded[tmpName] = stranded
-		}
-		n.Name = tmpName
+	strandedTmp, changed := breakNameCollisions("device-map", currentNames, desiredNames,
+		desiredByCurrent, originalByCurrent, renameInterface)
+	// A temp-stranded UNMAPPED NIC (not a desired source) is carried into phase
+	// 3 keyed by its temp name; the presentNIC keeps its ORIGINAL (pre-temp)
+	// name for the predictable-name lookup, matching the pre-#4178 behavior.
+	tempStranded := make(map[string]presentNIC, len(strandedTmp))
+	for tmp, origName := range strandedTmp {
+		tempStranded[tmp] = nicByName[origName]
 	}
 
 	// Phase 2: rename each mapped NIC to its final logical name.
-	changed := false
 	for current, final := range desiredByCurrent {
 		// The OriginalName= is the TRUE pre-rename kernel name captured
 		// before any temp rename; fall back to recovering it if absent.

@@ -317,6 +317,14 @@ def memory_mb(val):
     return int(m.group(1)) * 1024 if (m.group(2) or "M").upper().startswith("G") else int(m.group(1))
 
 
+def is_pci_addr(s):
+    """True if s is a PCI BDF address (DDDD:BB:DD.F), not a netdev name.
+    Used to tell a libvirt --hostdev PCI address from an interface name
+    (fable-165 H-23)."""
+    return bool(re.fullmatch(
+        r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", str(s)))
+
+
 def pci_parts(addr):
     m = re.fullmatch(r"([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])", addr)
     if not m:
@@ -405,6 +413,30 @@ def deploy_incus(ap, runner, start):
 LIBVIRT_IMAGES = "/var/lib/libvirt/images"
 
 
+def libvirt_golden_path(image):
+    """The libvirt golden qcow2 path — the SINGLE source of truth shared by
+    `deploy --hypervisor libvirt` (reads it as the read-only overlay backing)
+    AND `fetch --install-libvirt` (writes the verified image here). One helper
+    so the two halves can't drift (fable-165 H-30)."""
+    return os.path.join(LIBVIRT_IMAGES, f"{image}.qcow2")
+
+
+def _install_libvirt_golden(srcq, image):
+    """Install a verified qcow2 to the libvirt golden path deploy reads
+    (fable-165 H-30). Falls back to `sudo install` when the images dir is
+    root-owned (the common case). Returns the destination path."""
+    golden = libvirt_golden_path(image)
+    print(f"==> installing verified qcow2 -> {golden} (libvirt golden)")
+    try:
+        os.makedirs(os.path.dirname(golden), exist_ok=True)
+        shutil.copyfile(srcq, golden)
+    except OSError:
+        # /var/lib/libvirt/images is normally root-owned; -D creates the dir.
+        subprocess.run(["sudo", "install", "-m", "0644", "-D", srcq, golden],
+                       check=True)
+    return golden
+
+
 def libvirt_disk(ap, runner):
     """Return a per-VM writable qcow2 backed READ-ONLY by the golden image.
 
@@ -424,7 +456,7 @@ def libvirt_disk(ap, runner):
     redefine a live domain, so a running VM's overlay is not clobbered
     out from under it.
     """
-    golden = os.path.join(LIBVIRT_IMAGES, f"{ap['image']}.qcow2")
+    golden = libvirt_golden_path(ap['image'])
     overlay = os.path.join(LIBVIRT_IMAGES, f"{ap['name']}.qcow2")
     if os.path.abspath(overlay) == os.path.abspath(golden):
         die(f"VM name '{ap['name']}' collides with the golden image basename "
@@ -461,7 +493,23 @@ def deploy_libvirt(ap, runner, start):
             net = f"type=direct,source={src},source_mode=bridge,model=virtio"
             argv += ["--network", net + (f",mac.address={mac}" if mac else "")]
         elif b == "physical":
-            argv += ["--hostdev", src]
+            # libvirt --hostdev takes a PCI (or USB) address, NOT a netdev
+            # name — a bare `--hostdev enp8s0` is an invalid hostdev spec, so
+            # the domain fails to define / mis-attaches (fable-165 H-23). The
+            # incus backend's `nictype=physical parent=<dev>` DOES take the
+            # netdev name (incus resolves it), so translate here for libvirt.
+            # Accept a raw PCI address too (physical:0000:08:00.0).
+            addr = src if is_pci_addr(src) else pci_of(src)
+            if not is_pci_addr(addr):
+                if runner.dry:
+                    addr = f"pci-of:{src}"   # host may lack the NIC at plan time
+                else:
+                    die(f"physical:{src}: cannot resolve netdev '{src}' to a "
+                        f"PCI address on this host (is it a physical NIC?). "
+                        f"libvirt --hostdev requires a PCI address, not an "
+                        f"interface name — pass the PCI addr via `pci:` or fix "
+                        f"the source.")
+            argv += ["--hostdev", addr]
         elif b == "pci":
             if mac:
                 p = pci_parts(src)
@@ -529,6 +577,44 @@ def cmd_launch(args):
     return 0
 
 
+def _suffix_key(suffix):
+    """Split a pre-release / git-describe suffix into a comparable tuple of
+    alternating text/number runs, coercing the number runs to int so `rc10`
+    sorts ABOVE `rc9` and describe-count `10` above `9` (fable-165 H-25 — the
+    prior whole-string compare inverted BOTH). Each element is tagged
+    (0=number, 1=text) so a number run never string-compares against a text
+    run (which would raise TypeError in Python 3)."""
+    key = []
+    for part in re.split(r"(\d+)", suffix):
+        if not part:
+            continue
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    return tuple(key)
+
+
+def _ver_key(v):
+    """Order key for the fetch anti-rollback watermark. Compare on the
+    dotted-numeric RELEASE, then a pre-release rank so a pre-release sorts
+    BEFORE its base release (AGY: 1.2.3-rc1 < 1.2.3, so upgrading rc -> final
+    is NOT a rollback). git-describe tails like "-N-gHASH[-dirty]" are commits
+    AHEAD of the tag -> rank them AFTER the base. WITHIN each rank the suffix is
+    numeric-split (`_suffix_key`) so counts / rc numbers compare numerically,
+    not lexically (fable-165 H-25). Split on the FIRST '-': left = release,
+    right = suffix."""
+    s = str(v)
+    rel, _, suffix = s.partition("-")
+    rel_key = []
+    for tok in rel.split("."):
+        rel_key.append((0, int(tok)) if tok.isdigit() else (1, tok))
+    if not suffix:
+        pre_rank = (1,)                          # base release: after pre-release
+    elif suffix[:1].isdigit():
+        pre_rank = (2,) + _suffix_key(suffix)    # git-describe "N-gHASH": post-release
+    else:
+        pre_rank = (0,) + _suffix_key(suffix)    # rc/alpha/beta/...: before the base
+    return (rel_key, pre_rank)
+
+
 def cmd_fetch(args):
     """Download an appliance image from XPF_IMAGE_BASE_URL, VERIFY the exact
     downloaded bytes against the signed per-version manifest (#1924 §5.2),
@@ -558,25 +644,8 @@ def cmd_fetch(args):
         "~/.local/state")
     wm_path = os.path.join(state_home, "xpf", "image-watermark.json")
 
-    def _ver_key(v):
-        # Compare on the dotted-numeric RELEASE, then a pre-release rank so a
-        # pre-release sorts BEFORE its base release (AGY: 1.2.3-rc1 < 1.2.3, so
-        # upgrading rc -> final is NOT a rollback). git-describe tails like
-        # "-N-gHASH-dirty" are post-release commits ahead of the tag → rank
-        # them AFTER the base. Split on the FIRST '-': left = release, right =
-        # suffix.
-        s = str(v)
-        rel, _, suffix = s.partition("-")
-        rel_key = []
-        for tok in rel.split("."):
-            rel_key.append((0, int(tok)) if tok.isdigit() else (1, tok))
-        if not suffix:
-            pre_rank = (1,)           # base release: after any pre-release
-        elif suffix[:1].isdigit():
-            pre_rank = (2, suffix)    # git-describe "N-gHASH": post-release
-        else:
-            pre_rank = (0, suffix)    # rc/alpha/beta/...: before the base
-        return (rel_key, pre_rank)
+    # Version ordering for the watermark lives at module scope (`_ver_key`,
+    # unit-tested) — numeric-split so rc10 > rc9 and describe-count 10 > 9.
 
     def read_watermark():
         try:
@@ -652,13 +721,32 @@ def cmd_fetch(args):
         except OSError:
             pass  # best-effort; never block a verified fetch on watermark I/O
 
-    if args.no_import or args.qcow2_only:
-        print(f"==> verified into {out} (not imported — use the qcow2 with "
-              "virt-install --import, or re-run without --qcow2-only/--no-import "
-              "for an incus image import).")
+    # libvirt golden basename = deploy's `image:` default, so the incus alias
+    # and the libvirt golden name AGREE (fable-165 H-30).
+    img_name = args.alias or "xpf-appliance"
+    qcow2_src = os.path.join(out, names["qcow2"])
+
+    # H-30: bridge the fetch -> libvirt gap. `deploy --hypervisor libvirt`
+    # reads the golden at libvirt_golden_path(image); --install-libvirt puts
+    # the verified qcow2 there (shared path helper — the two can't drift).
+    if args.install_libvirt:
+        _install_libvirt_golden(qcow2_src, img_name)
+        print(f"==> done. Deploy with: xpf-deploy.py --hypervisor libvirt "
+              f"deploy <appliance.yaml>  (image: {img_name})")
         return 0
 
-    alias = args.alias or "xpf-appliance"
+    if args.no_import or args.qcow2_only:
+        golden = libvirt_golden_path(img_name)
+        print(f"==> verified into {out} (not imported). For libvirt/KVM, install "
+              f"it to the golden path deploy reads:\n"
+              f"      sudo install -m 0644 -D {qcow2_src} {golden}\n"
+              f"   (or re-run fetch with --install-libvirt), then: "
+              f"xpf-deploy.py --hypervisor libvirt deploy <appliance.yaml> "
+              f"(image: {img_name}). For incus, re-run without "
+              f"--qcow2-only/--no-import.")
+        return 0
+
+    alias = img_name
     subprocess.run(["incus", "image", "delete", alias],
                    capture_output=True, text=True)
     print(f"==> importing verified image as incus alias '{alias}'")
@@ -1339,6 +1427,13 @@ def main():
                               "recorded watermark (deliberate downgrade)")
         sub.add_argument("--qcow2-only", action="store_true",
                          help="fetch+verify only the qcow2 (libvirt/KVM path)")
+        sub.add_argument("--install-libvirt", action="store_true",
+                         dest="install_libvirt",
+                         help="after verifying, install the qcow2 to the "
+                              "libvirt golden path "
+                              "(/var/lib/libvirt/images/<image>.qcow2; basename "
+                              "from --alias, default xpf-appliance) that "
+                              "`deploy --hypervisor libvirt` reads")
         sub.add_argument("--no-import", action="store_true",
                          help="verify only; do not incus image import")
         args = sub.parse_args(cmd_argv)

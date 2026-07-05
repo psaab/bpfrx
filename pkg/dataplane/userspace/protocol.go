@@ -837,6 +837,13 @@ type ScreenProfileSnapshot struct {
 	SessionLimitDst   uint32 `json:"session_limit_dst,omitempty"`
 	PortScanThreshold uint32 `json:"port_scan_threshold,omitempty"`
 	IPSweepThreshold  uint32 `json:"ip_sweep_threshold,omitempty"`
+	// AlarmWithoutDrop is the Junos profile-wide `alarm-without-drop`
+	// audit/log-only mode. When true, the dataplane converts every screen
+	// DROP verdict for this zone into a log-only PERMIT alarm (carrying the
+	// tripped reason) and forwards the packet. Additive + omitempty: an old
+	// helper missing the field decodes false (drop-on-trip — today's
+	// behavior), so version skew degrades safely (#1961 no-transit class).
+	AlarmWithoutDrop bool `json:"alarm_without_drop,omitempty"`
 }
 
 // ScreenMissingProfileRef names a zone that references a screen profile which

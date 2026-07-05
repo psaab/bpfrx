@@ -559,6 +559,16 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		d.runBootstrapExitStartup(cfg)
 	}
 
+	// #4179 config-arrival re-naming: a config-less HA node (node-id present,
+	// no committed config at boot) is NOT in bootstrap mode, so the block above
+	// never fires for it. That node named its NICs STANDALONE at boot; the
+	// first non-empty config to arrive (a cluster SyncApply from the primary,
+	// or a local commit) finally supplies its cluster identity, so re-run
+	// startup naming here — BEFORE the reconcile below wires the config onto
+	// the interfaces — to reconcile them to the node's cluster names. One-shot;
+	// a no-op on a standalone config or any later commit.
+	d.maybeReapplyConfigArrivalNaming(cfg)
+
 	// Reset VIP warning suppression so new config gets fresh warnings.
 	d.vipWarnedIfaces = nil
 

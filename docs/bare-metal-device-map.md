@@ -8,7 +8,11 @@ controlled-topology VMs, but it is hazardous on real bare metal:
 
 - **Unstable naming** — adding a card, a BIOS bus renumber, or onboard +
   add-in + BMC-NIC ordering shifts the index→name binding, so `ge-0/0/3`
-  silently becomes a different physical port.
+  silently becomes a different physical port. (Since #4178 the positional
+  rename is at least collision-safe — an enumeration shift no longer
+  corrupts the `.link` `OriginalName=` chain via `breakNameCollisions`,
+  the same phase-1 discipline device-map mode uses — but the index→name
+  binding still MOVES on a hardware change. Only the device-map pins it.)
 - **Claims everything** — a real host has NICs xpf must not touch: a
   BMC/IPMI shared NIC, a storage/cluster fabric, the admin's own management
   path. Positional mode renames them all and, if unconfigured, forces them
