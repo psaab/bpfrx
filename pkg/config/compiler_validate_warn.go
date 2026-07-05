@@ -627,6 +627,33 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #4299 (fable-167 V-3): `security ipsec vpn <v> vpn-monitor` is typed +
+	// captured (schema leaf + compileIPsec) but xpf does not implement its
+	// ICMP-probe tunnel-liveness monitoring or st0 interface-state coupling.
+	// Mirror the #2078/#4231 accepted-only doctrine: warn so an operator who
+	// configures it is not silently misled into believing the tunnel is being
+	// probed. IKE-layer DPD (dead-peer-detection, #3994) IS enforced and is a
+	// partial substitute for peer liveness, but not for vpn-monitor's
+	// interface-state coupling. Full enforcement is a monitoring follow-up.
+	{
+		var monVPNs []string
+		for name := range cfg.Security.IPsec.VPNs {
+			if vpn := cfg.Security.IPsec.VPNs[name]; vpn != nil && vpn.VPNMonitor {
+				monVPNs = append(monVPNs, name)
+			}
+		}
+		if len(monVPNs) > 0 {
+			sort.Strings(monVPNs)
+			warnings = append(warnings, fmt.Sprintf(
+				"security ipsec vpn %s vpn-monitor configured but accepted-only "+
+					"— xpf does not implement vpn-monitor ICMP-probe liveness or "+
+					"st0 interface-state coupling; configure ike gateway "+
+					"dead-peer-detection for IKE-layer peer liveness "+
+					"(config-only parity, #4299)",
+				strings.Join(monVPNs, ", ")))
+		}
+	}
+
 	// #4291 (fable-167 N-2): the NAT `port-overloading` knobs are now typed +
 	// committed (schema leaves + compileNAT) but the userspace AF_XDP SNAT
 	// allocator enforces neither. `security nat source interface port-overloading

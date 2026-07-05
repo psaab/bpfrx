@@ -73,6 +73,13 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 			switch p.Name() {
 			case "mode":
 				pol.Mode = v
+			case "proposal-set":
+				// #4297 (V-1): predefined proposal-set shorthand. Captured
+				// here and expanded into concrete synthetic proposals after
+				// both the proposal and policy maps are built
+				// (expandIKEProposalSets), so the common vSRX idiom commits a
+				// working tunnel instead of being silently dropped.
+				pol.ProposalSet = v
 			case "proposals":
 				// Multi-value leaf (#3904): `proposals [ p1 p2 ]` collapses
 				// onto Keys[1:] (hierarchical / clean flat-set) and/or child
@@ -95,6 +102,10 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 		}
 		sec.IPsec.IKEPolicies[pol.Name] = pol
 	}
+
+	// #4297 (V-1): expand any predefined IKE proposal-set into concrete
+	// synthetic proposals now that both the proposal and policy maps exist.
+	expandIKEProposalSets(sec)
 
 	// IKE gateways
 	for _, inst := range namedInstances(node.FindChildren("gateway")) {
@@ -304,6 +315,10 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 		pol := &IPsecPolicyDef{Name: inst.name}
 		for _, p := range inst.node.Children {
 			switch p.Name() {
+			case "proposal-set":
+				// #4297 (V-1): predefined ESP proposal-set shorthand;
+				// expanded after the maps are built (expandIPsecProposalSets).
+				pol.ProposalSet = nodeVal(p)
 			case "proposals":
 				// Multi-value leaf (#3904): read EVERY ESP proposal reference
 				// (Keys[1:] + child nodes) — mirror of the IKE policy loop.
@@ -320,6 +335,10 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 		}
 		sec.IPsec.Policies[pol.Name] = pol
 	}
+
+	// #4297 (V-1): expand any predefined ESP proposal-set into concrete
+	// synthetic proposals now that both maps exist.
+	expandIPsecProposalSets(sec)
 
 	// Gateways (may appear under ipsec or ike)
 	if sec.IPsec.Gateways == nil {
@@ -450,6 +469,27 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				vpn.PSK = Secret(v)
 			case "local-address":
 				vpn.LocalAddr = v
+			case "manual":
+				// #4300 (V-4): manual-key SA block. Captured (not compiled
+				// into an SA — xpf has no manual-key path) so
+				// validateIPsecManualKeyStrict rejects it at commit rather
+				// than leaving a silent dead tunnel.
+				vpn.Manual = true
+			case "vpn-monitor":
+				// #4299 (V-3): accepted-but-not-enforced. Capture the stanza
+				// so ValidateConfig emits an advisory; xpf has no ICMP-probe
+				// liveness / st0 interface-state coupling yet.
+				vpn.VPNMonitor = true
+				for _, c := range p.Children {
+					switch c.Name() {
+					case "source-interface":
+						vpn.VPNMonitorSourceInterface = nodeVal(c)
+					case "destination-ip":
+						vpn.VPNMonitorDestinationIP = nodeVal(c)
+					case "optimized":
+						vpn.VPNMonitorOptimized = true
+					}
+				}
 			}
 		}
 		for _, tsInst := range namedInstances(inst.node.FindChildren("traffic-selector")) {

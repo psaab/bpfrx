@@ -86,6 +86,25 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 			return "", fmt.Errorf("vpn %s: %w", name, err)
 		}
 
+		// #4298 (V-2): a proposal with `protocol ah` (Authentication Header)
+		// has no ESP render path — buildESPProposal would default the empty
+		// encryption to aes256 and renderConfig would emit esp_proposals, so
+		// the operator would silently get ESP with a fabricated cipher instead
+		// of the AH (integrity-only) they asked for. The commit-time gate
+		// (validateIPsecProposalProtocolStrict) hard-rejects AH, so this belt
+		// only fires on the tolerant load / peer-sync path or a directly-
+		// constructed IPsecConfig: SKIP the VPN rather than emit a fabricated
+		// ESP tunnel, mirroring the errIKEChainUnresolved skip above.
+		if vpnUsesAHProposal(ipsecCfg, vpn) {
+			skipped[name] = true
+			slog.Warn("skipping IPsec VPN: ipsec proposal uses protocol ah "+
+				"(Authentication Header) which xpf does not support — use "+
+				"protocol esp (rendering ESP would fabricate a cipher the "+
+				"operator never specified)",
+				"vpn", name, "ipsec_policy", vpn.IPsecPolicy)
+			continue
+		}
+
 		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
 		espProposals, espLifetime := resolveESPSettings(ipsecCfg, vpn)
 		dpd := deriveDPD(gw, vpn)

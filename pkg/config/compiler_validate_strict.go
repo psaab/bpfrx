@@ -475,6 +475,97 @@ func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateIPsecProposalProtocolStrict hard-rejects an IPsec (Phase 2)
+// proposal whose `protocol` is `ah` (#4298, V-2). AH (Authentication
+// Header) is integrity-only with no encryption; swanctl expresses it via
+// `ah_proposals`, not `esp_proposals`. xpf has no AH render path:
+// buildESPProposal (pkg/ipsec) ignores the protocol and defaults empty
+// encryption to aes256, and renderConfig always emits `esp_proposals`, so a
+// `protocol ah` proposal used to render as ESP with a fabricated cipher —
+// the operator asked for AH (integrity only) and silently got ESP with a
+// made-up aes256 cipher. That is a crypto misrepresentation, so we reject it
+// at commit rather than silently substitute.
+//
+// Only proposals that are actually referenced by an ipsec-policy (directly,
+// via the policy-name fallback, or as a synthetic proposal-set member) reach
+// render, but an unreferenced AH proposal is still an operator error worth
+// surfacing, so every defined proposal is checked. Proposal names are sorted
+// for a deterministic first error.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientIPsecProposalProtocol) so an already-persisted or
+// peer-synced config still boots; the render-path belt in pkg/ipsec
+// (vpnUsesAHProposal -> renderConfig skips the VPN) keeps the fabricated
+// ESP tunnel out of the generated swanctl.conf rather than emitting it.
+// Commit / commit-check stay strict. Mirrors
+// validateIPsecPolicyProposalReferencesStrict.
+func validateIPsecProposalProtocolStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	proposals := cfg.Security.IPsec.Proposals
+	names := make([]string, 0, len(proposals))
+	for name := range proposals {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		prop := proposals[name]
+		if prop == nil {
+			continue
+		}
+		if strings.EqualFold(prop.Protocol, "ah") {
+			return fmt.Errorf("ipsec proposal %q uses protocol ah "+
+				"(Authentication Header), which xpf does not support — xpf "+
+				"renders ESP only and will not silently substitute ESP with a "+
+				"fabricated cipher; use `protocol esp` (or remove the proposal)",
+				prop.Name)
+		}
+	}
+	return nil
+}
+
+// validateIPsecManualKeyStrict hard-rejects an IPsec VPN that carries a
+// `manual { ... }` manual-key SA block (#4300, V-4). xpf negotiates all SAs
+// via IKE (strongSwan); there is no manual-key path, so compileIPsec used to
+// drop the block silently and the VPN compiled to an empty shell that
+// committed OK — a silent dead tunnel (no gateway, no policy, no SA).
+// Rejecting it at commit gives the operator an immediate, clear diagnostic
+// instead of a tunnel that is configured but forwards nothing.
+//
+// VPN names are sorted so a multi-VPN config reports a deterministic first
+// failure. On the tolerant load / peer-sync paths the call site downgrades
+// this to a warning (opts.lenientIPsecManualKey) so an already-persisted or
+// peer-synced config still boots (#1960 fail-closed-on-load class) — the
+// manual block was already inert (never compiled to an SA), so the boot is
+// fail-safe. Commit / commit-check stay strict. Mirrors
+// validateIPsecGatewayReferencesStrict.
+func validateIPsecManualKeyStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	vpns := cfg.Security.IPsec.VPNs
+	names := make([]string, 0, len(vpns))
+	for name := range vpns {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		vpn := vpns[name]
+		if vpn == nil {
+			continue
+		}
+		if vpn.Manual {
+			return fmt.Errorf("ipsec vpn %q configures a manual-key SA "+
+				"(`manual { ... }`), which xpf does not support — a manual-key "+
+				"tunnel would commit but forward nothing (silent dead tunnel); "+
+				"use an IKE-negotiated VPN (ike { gateway ...; ipsec-policy ...; })",
+				vpn.Name)
+		}
+	}
+	return nil
+}
+
 // validateLogProfileStreamReferencesStrict hard-rejects a
 // `security log profile <name>` whose `stream-name` reference does not
 // resolve to a configured `security log stream` (#2008 H7). xpf routes
