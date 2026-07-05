@@ -34103,3 +34103,27 @@ top.
   still pass `xpfd check-config` (standalone; ha-pair -node-id 0 and 1) —
   strict parse + schema + compile.
 - **File(s)**: examples/deploy/standalone.conf, examples/deploy/ha-pair.conf, _Log.md
+
+## 2026-07-04 — HB165 apt/deb/signing packaging (H-4, H-6, H-15)
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fixed fable-review-165 H-4/H-6/H-15 (issues #4201/#4202/#4203).
+  - H-4 (#4201): isolate the apt pool PER SUITE
+    (`pool/<suite>/<component>/x/xpf`) and scan only that suite's pool in
+    `apt-ftparchive packages` so a stable rebuild after an edge build never
+    lists the edge version (channel isolation). Reprepro path unaffected.
+  - H-6 (#4202): stage `xpf-kernel-promote-failed.service` (the promote unit's
+    `OnFailure=` recovery target) in the `.deb` via `dh_installsystemd
+    --no-enable --no-start`; add a build-time parity assert that the
+    `OnFailure=` target is actually staged.
+  - H-15 (#4203): add `_gate_key_agreement` to `publish.py gate_apt` —
+    cross-check that install.sh's embedded key, the packaged keyring, and the
+    InRelease signer agree by fingerprint (installer subset of keyring; signer
+    covered by both), dying on mismatch.
+  - selftest.sh: new §5c (channel isolation), §5d (key-agreement gate), §5e
+    (recovery unit staged). All 23 checks pass. RED-on-revert confirmed for
+    H-4 (shared pool bleeds edge into stable) and H-15 (non-signer key
+    rejected). shellcheck build-apt-repo.sh rc=0; py_compile publish.py OK.
+- **File(s)**: scripts/dist/build-apt-repo.sh, debian/rules,
+  scripts/dist/publish.py, scripts/dist/selftest.sh, docs/distribution.md,
+  docs/in-place-upgrade.md, _Log.md
