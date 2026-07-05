@@ -9,8 +9,10 @@ artifact in the publish set is properly signed:
       present and hash-match;
   (b) the apt InRelease verifies against the archive pubkey (when an apt tree
       is being published);
-  (c) install.sh has a verifying install.sh.minisig (when install.sh is in
-      the image set);
+  (c) install.sh is PRESENT (required by default — the Tier-A one-liner URL
+      404s without it; opt out with --no-installer), carries NO placeholder
+      key and NO unsubstituted %%…%% marker (it must be stamped first), and
+      has a verifying install.sh.minisig;
   (d) the per-channel latest.json verifies against the image pubkey AND names
       a version present in the image set.
 
@@ -31,14 +33,18 @@ The two operator decisions (hosting URLs, signing identity) are config inputs:
 XPF_IMAGE_BASE_URL / XPF_APT_BASE_URL and the pinned pubkeys / signing keys.
 
 Usage:
-  publish.py --channel stable [--dist DIR] [--no-image] [--no-apt] [--dry-run]
+  publish.py --channel stable [--dist DIR] [--no-image] [--no-apt]
+             [--no-installer] [--dry-run]
   publish.py make-latest --channel stable --version V [--dist DIR]   # sign latest.json
+  publish.py stamp-installer --out dist/install.sh [--apt-base-url URL]
+             [--channel stable] [--archive-key PATH]  # bake key+URL then sign
 """
 
 import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -98,6 +104,238 @@ def _is_placeholder(path):
         return False
 
 
+INSTALLSH_SRC = os.path.join(HERE, "install.sh")
+PGP_BLOCK_RE = re.compile(
+    r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?-----END PGP PUBLIC KEY BLOCK-----",
+    re.DOTALL,
+)
+MARKER_RE = re.compile(r"%%[A-Za-z0-9_]+%%")
+
+
+def _installer_key_block(text):
+    """Return install.sh's embedded ASCII-armored ARCHIVE_KEY block, or None.
+    Isolating the block matters: the placeholder token also appears OUTSIDE the
+    key (in the is_placeholder_key grep pattern), so a whole-file substring
+    scan cannot tell a stamped installer from an unstamped one — the check must
+    look at the key block alone."""
+    m = PGP_BLOCK_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _read_real_archive_key(path):
+    """Return the ASCII-armored archive PUBLIC KEY block from `path`, refusing
+    the placeholder. The stamp bakes this block into install.sh in place of the
+    placeholder key so a fresh install can verify the apt repo."""
+    if not os.path.isfile(path):
+        die(f"archive key not found: {path} — commit the real "
+            "scripts/dist/xpf-archive-keyring.asc (drop the .placeholder) or "
+            "pass --archive-key <path> before stamping install.sh.")
+    if _is_placeholder(path):
+        die(f"archive key {path} is the #1924 PLACEHOLDER — refusing to stamp "
+            "an installer that cannot verify the repo. Supply the real key.")
+    with open(path) as f:
+        text = f.read()
+    m = PGP_BLOCK_RE.search(text)
+    if not m:
+        die(f"archive key {path} has no PGP PUBLIC KEY BLOCK — expected an "
+            "ASCII-armored OpenPGP public key.")
+    return m.group(0)
+
+
+def stamp_installer(out, src=INSTALLSH_SRC, archive_key=None, apt_url=None,
+                    channel="stable"):
+    """Bake the real archive key + apt base URL + default channel into
+    install.sh (H-2/H-14), producing the publishable installer at `out`. The
+    piped Tier-A one-liner then needs no env. This is the substitute half of
+    the substitute-THEN-sign flow: sign `out` with minisign afterwards. The
+    output is asserted to carry no placeholder key and no unsubstituted %%…%%
+    marker, so publish gate_images accepts it."""
+    if not apt_url:
+        die("apt base URL required — set XPF_APT_BASE_URL or pass "
+            "--apt-base-url. It is baked into install.sh so the Tier-A "
+            "one-liner needs no env.")
+    if channel not in ("stable", "edge"):
+        die(f"channel must be stable|edge (got {channel!r}).")
+    if archive_key is None:
+        archive_key = archive_pubkey()
+    key_block = _read_real_archive_key(archive_key)
+
+    if not os.path.isfile(src):
+        die(f"installer source not found: {src}")
+    with open(src) as f:
+        text = f.read()
+    src_block = _installer_key_block(text)
+    if src_block is None:
+        die(f"{src} has no PGP PUBLIC KEY BLOCK to substitute.")
+    if "PLACEHOLDER-xpf-archive-keyring" not in src_block:
+        die(f"{src} key block is not the placeholder (already stamped?) — "
+            "refusing to re-stamp an installer of unclear key provenance.")
+    for marker in ("%%XPF_APT_BASE_URL%%", "%%XPF_CHANNEL%%"):
+        if marker not in text:
+            die(f"{src} is missing the {marker} substitution marker — cannot "
+                "bake the installer. Restore the marker.")
+
+    # 1. swap the placeholder PGP block for the real armored key (once). A
+    #    function replacement keeps backslashes in the key literal.
+    text, n = PGP_BLOCK_RE.subn(lambda _m: key_block, text, count=1)
+    if n != 1:
+        die(f"{src} has no PGP PUBLIC KEY BLOCK to substitute.")
+    # 2. bake the apt base URL + default channel (literal token replace).
+    text = text.replace("%%XPF_APT_BASE_URL%%", apt_url)
+    text = text.replace("%%XPF_CHANNEL%%", channel)
+
+    # 3. fail-closed: assert NOTHING unsubstituted survived. Check the KEY
+    #    BLOCK (not the whole file — the placeholder token also lives in the
+    #    is_placeholder_key grep pattern, which correctly stays).
+    out_block = _installer_key_block(text)
+    if out_block is None or "PLACEHOLDER-xpf-archive-keyring" in out_block:
+        die("internal: placeholder archive key survived stamping.")
+    leftover = MARKER_RE.search(text)
+    if leftover:
+        die(f"internal: unsubstituted marker {leftover.group(0)} survived "
+            "stamping — refusing to write a half-baked installer.")
+
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "w") as f:
+        f.write(text)
+    os.chmod(out, 0o755)
+    info(f"stamped installer -> {out} (apt={apt_url} channel={channel}; real "
+         "archive key baked). Sign it next, then publish.")
+
+
+def _primary_fprs_from_gpg_colons(colon_text):
+    """Extract the set of PRIMARY key fingerprints from `gpg --with-colons`
+    output. The `fpr:` line immediately following a `pub:` record is the
+    primary key's fingerprint; `fpr:` lines after `sub:` records (subkeys) are
+    ignored so we compare primary fingerprints consistently with the InRelease
+    signer's primary fpr (the last VALIDSIG field)."""
+    fprs = set()
+    want = False
+    for line in colon_text.splitlines():
+        f = line.split(":")
+        if not f:
+            continue
+        if f[0] == "pub":
+            want = True
+        elif f[0] == "sub":
+            want = False
+        elif f[0] == "fpr" and want:
+            if len(f) > 9 and f[9]:
+                fprs.add(f[9])
+            want = False
+    return fprs
+
+
+def _key_fingerprints(key_source):
+    """Return the set of PRIMARY key fingerprints in an armored key file by
+    importing it into an ephemeral keyring (matching gate_apt's import style)
+    so we never touch the publisher's global gpg keyring."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as gnupghome:
+        os.chmod(gnupghome, 0o700)
+        env = dict(os.environ, GNUPGHOME=gnupghome)
+        r = subprocess.run(["gpg", "--batch", "--import", key_source],
+                           env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"could not import key {key_source} for fingerprint "
+                f"cross-check: {r.stderr.strip()}")
+        r = subprocess.run(
+            ["gpg", "--batch", "--with-colons", "--fingerprint", "--list-keys"],
+            env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"could not list fingerprints for {key_source}: "
+                f"{r.stderr.strip()}")
+        return _primary_fprs_from_gpg_colons(r.stdout)
+
+
+def _extract_installsh_key(installsh_path):
+    """Return install.sh's embedded ASCII-armored OpenPGP key block (the exact
+    bytes between the PGP BEGIN/END markers), or None if there is no block. The
+    block sits in a single-quoted heredoc so it is literal armor with no shell
+    interpolation."""
+    try:
+        with open(installsh_path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    begin = "-----BEGIN PGP PUBLIC KEY BLOCK-----"
+    end = "-----END PGP PUBLIC KEY BLOCK-----"
+    i = text.find(begin)
+    j = text.find(end)
+    if i == -1 or j == -1 or j < i:
+        return None
+    return text[i:j + len(end)] + "\n"
+
+
+def _gate_key_agreement(dist, archive_pub, signer_fprs):
+    """H-15: cross-check that the installer's embedded key, the packaged
+    keyring, and the InRelease signer AGREE by fingerprint. publish.py
+    otherwise only checked each source for placeholder-ness independently, so a
+    stale install.sh (an old, real, retired key) could publish cleanly after a
+    rotation and brick every new Tier-A install at `apt-get update`.
+
+    Requires (fingerprints are PRIMARY key fprs):
+      - the InRelease signer(s) S are covered by the packaged keyring K
+        (existing hosts verify the repo on `apt upgrade`); and, when install.sh
+        is in the publish set,
+      - install.sh's embedded key set I is a SUBSET of K (a keyring superset is
+        allowed during a documented dual-sign window), and
+      - the InRelease signer(s) S are covered by I so a fresh Tier-A install's
+        `apt-get update` (which runs against install.sh's embedded key BEFORE
+        the packaged keyring lands) verifies the published repo.
+    """
+    keyring_fprs = _key_fingerprints(archive_pub)
+    if not keyring_fprs:
+        die("archive keyring has no importable keys — cannot cross-check the "
+            "InRelease signer against the packaged keyring.")
+    if not signer_fprs:
+        die("could not determine the InRelease signer fingerprint — refusing "
+            "to publish without confirming key agreement.")
+    if not signer_fprs <= keyring_fprs:
+        die(f"InRelease signer {sorted(signer_fprs)} is NOT in the packaged "
+            f"keyring {sorted(keyring_fprs)} — the repo is signed by a key the "
+            "shipped keyring does not carry; existing hosts would fail apt "
+            "update. Ship the signing key in the keyring or re-sign the repo.")
+
+    installsh = os.path.join(dist, "install.sh")
+    if not os.path.isfile(installsh):
+        info("key-agreement: install.sh not in publish set — "
+             "installer cross-check skipped (signer vs keyring OK)")
+        return
+    armored = _extract_installsh_key(installsh)
+    if armored is None:
+        die("install.sh is in the publish set but has no embedded PGP key "
+            "block to cross-check against the keyring/InRelease signer.")
+    if "PLACEHOLDER-xpf-archive-keyring" in armored:
+        die("install.sh embeds the #1924 PLACEHOLDER archive key — cannot "
+            "cross-check key agreement. Substitute the real key first.")
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".asc", delete=False) as tf:
+        tf.write(armored)
+        keypath = tf.name
+    try:
+        inst_fprs = _key_fingerprints(keypath)
+    finally:
+        os.unlink(keypath)
+    if not inst_fprs:
+        die("install.sh embedded key could not be parsed for fingerprints — "
+            "refusing to publish without confirming key agreement.")
+    if not inst_fprs <= keyring_fprs:
+        die(f"install.sh embedded key {sorted(inst_fprs)} is NOT a subset of "
+            f"the packaged keyring {sorted(keyring_fprs)} — the installer "
+            "trusts a key the shipped keyring lacks (stale installer or "
+            "un-rotated keyring). Re-embed the current archive key in "
+            "install.sh (a keyring superset is allowed during dual-sign).")
+    if not signer_fprs <= inst_fprs:
+        die(f"InRelease signer {sorted(signer_fprs)} is NOT covered by "
+            f"install.sh's embedded key {sorted(inst_fprs)} — a fresh Tier-A "
+            "install would fail `apt-get update` against the published repo "
+            "(stale install.sh key). Re-embed the signing key in install.sh "
+            "before publishing.")
+    info(f"key-agreement OK (installer {sorted(inst_fprs)} subset of keyring; "
+         f"InRelease signer {sorted(signer_fprs)} covered by installer + keyring)")
+
+
 def list_versions(dist):
     """Discover baked versions from manifests in `dist`. FAIL-CLOSED
     (Codex-H1/AGY-A2): if ANY xpf-*.SHA256SUMS lacks a .minisig, refuse the
@@ -116,11 +354,12 @@ def list_versions(dist):
     return out
 
 
-def gate_images(dist):
+def gate_images(dist, require_installer=True):
     """(a)+(c): every signed image manifest verifies and the listed files
     hash-match; EVERY image artifact in dist is covered by a verified manifest
-    (no orphans); install.sh has a verifying signature and is not the
-    placeholder."""
+    (no orphans); install.sh is PRESENT (unless require_installer is False),
+    has a verifying signature, is not the placeholder, and carries no
+    unsubstituted %%…%% marker."""
     versions = list_versions(dist)
     if not versions:
         die(f"no signed image manifests (xpf-*.SHA256SUMS + .minisig) in {dist} "
@@ -190,23 +429,53 @@ def gate_images(dist):
                 die(f"orphan image artifact in the publish set: {rel} is not "
                     "listed in any verified manifest — refusing to publish "
                     "unverified bytes. Remove it or sign a manifest covering it.")
-    # (c) install.sh — signed AND not the placeholder.
+    # (c) install.sh — PRESENT (mandatory unless --no-installer), stamped
+    # (no placeholder key, no unsubstituted marker), AND signed. Presence is
+    # mandatory by default because a missing installer makes the Tier-A
+    # one-liner URL 404 (H-14): shipping no install.sh must not silently pass.
     installsh = os.path.join(dist, "install.sh")
-    if os.path.isfile(installsh):
-        with open(installsh) as f:
-            if "PLACEHOLDER-xpf-archive-keyring" in f.read():
-                die("install.sh in the publish set still embeds the PLACEHOLDER "
-                    "archive key — refusing to publish an installer that cannot "
-                    "verify the repo. Substitute the real key first.")
-        isig = installsh + ".minisig"
-        if not os.path.isfile(isig):
-            die("install.sh is in the publish set but install.sh.minisig is "
-                "missing — sign it before publishing.")
-        try:
-            sign.verify_signature(installsh, isig, pub)
-            info("install.sh signature OK")
-        except sign.SignError as e:
-            die(f"install.sh signature failed verify: {e}")
+    if not os.path.isfile(installsh):
+        if require_installer:
+            die("install.sh is MISSING from the image publish set — the Tier-A "
+                "one-liner (curl … | sudo sh) URL would 404. Stamp + sign it "
+                "(`publish.py stamp-installer --out dist/install.sh` then "
+                "`minisign -S`), or pass --no-installer to publish images "
+                "without the one-liner.")
+        info("install.sh absent (--no-installer) — Tier-A one-liner unavailable")
+        return versions, pub
+    with open(installsh) as f:
+        content = f.read()
+    # Inspect the KEY BLOCK, not the whole file: the placeholder token also
+    # appears in the is_placeholder_key grep pattern (which correctly stays in
+    # a stamped installer), so a whole-file substring scan would reject even a
+    # properly stamped install.sh.
+    key_block = _installer_key_block(content)
+    if key_block is None:
+        die("install.sh in the publish set has no ASCII-armored archive key "
+            "block — refusing to publish a malformed installer.")
+    if "PLACEHOLDER-xpf-archive-keyring" in key_block:
+        die("install.sh in the publish set still embeds the PLACEHOLDER "
+            "archive key — refusing to publish an installer that cannot "
+            "verify the repo. Stamp it first (`publish.py stamp-installer`).")
+    # H-2: refuse an installer whose apt base URL / channel was never baked —
+    # a piped `curl … | sudo sh` cannot deliver these via env, so an
+    # unsubstituted marker means a 100%-failing one-liner. Mirror the
+    # placeholder-KEY refusal above.
+    for marker in ("%%XPF_APT_BASE_URL%%", "%%XPF_CHANNEL%%"):
+        if marker in content:
+            die(f"install.sh in the publish set still carries the unsubstituted "
+                f"{marker} marker — the piped one-liner cannot receive it via "
+                "env. Run `publish.py stamp-installer` to bake the apt base URL "
+                "+ channel before signing/publishing.")
+    isig = installsh + ".minisig"
+    if not os.path.isfile(isig):
+        die("install.sh is in the publish set but install.sh.minisig is "
+            "missing — sign it before publishing.")
+    try:
+        sign.verify_signature(installsh, isig, pub)
+        info("install.sh signature OK")
+    except sign.SignError as e:
+        die(f"install.sh signature failed verify: {e}")
     return versions, pub
 
 
@@ -273,17 +542,30 @@ def gate_apt(dist, channel):
                            env=env, capture_output=True, text=True)
         if r.returncode != 0:
             die(f"could not import archive pubkey {pub}: {r.stderr.strip()}")
+        signer_fprs = set()
         for suite in suites:
             inrel = os.path.join(distsdir, suite, "InRelease")
             if not os.path.isfile(inrel):
                 die(f"suite {suite} under dists/ has no InRelease — the whole "
                     "apt tree is uploaded, so every suite must be signed. "
                     "Rebuild or remove it.")
-            r = subprocess.run(["gpg", "--batch", "--verify", inrel],
+            # --status-fd 1 emits a machine-readable VALIDSIG line whose LAST
+            # field is the signer's PRIMARY key fingerprint (#4203 key
+            # agreement). rc still reflects verify success/failure.
+            r = subprocess.run(["gpg", "--batch", "--status-fd", "1",
+                                "--verify", inrel],
                                env=env, capture_output=True, text=True)
             if r.returncode != 0:
                 die(f"apt InRelease ({suite}) signature FAILED: {r.stderr.strip()}")
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "VALIDSIG":
+                    signer_fprs.add(parts[-1])
             info(f"apt InRelease ({suite}) signature OK")
+        # H-15 (#4203): the installer's embedded key, the packaged keyring, and
+        # the InRelease signer must AGREE by fingerprint — three independent
+        # placeholder checks never caught a stale-but-real install.sh key.
+        _gate_key_agreement(dist, pub, signer_fprs)
     # The pooled .deb must not carry the PLACEHOLDER archive keyring
     # (Codex-r2-2): a package built before the real key existed would, once
     # installed, overwrite a host's real /usr/share/keyrings key with the
@@ -360,15 +642,35 @@ def main(argv):
     ml.add_argument("--version", required=True)
     ml.add_argument("--dist", default=os.path.join(ROOT, "dist"))
 
+    st = sub.add_parser("stamp-installer",
+                        help="bake the real archive key + apt base URL + "
+                             "channel into install.sh (substitute-then-sign)")
+    st.add_argument("--out", required=True,
+                    help="output path for the baked installer (e.g. dist/install.sh)")
+    st.add_argument("--src", default=INSTALLSH_SRC)
+    st.add_argument("--archive-key", default=None,
+                    help="ASCII-armored archive pubkey (default: the pinned "
+                         "scripts/dist/xpf-archive-keyring.asc)")
+    st.add_argument("--apt-base-url", default=os.environ.get("XPF_APT_BASE_URL"))
+    st.add_argument("--channel", default=os.environ.get("XPF_CHANNEL", "stable"))
+
     p.add_argument("--channel", default="stable")
     p.add_argument("--dist", default=os.path.join(ROOT, "dist"))
     p.add_argument("--no-image", action="store_true")
     p.add_argument("--no-apt", action="store_true")
+    p.add_argument("--no-installer", action="store_true",
+                   help="publish images WITHOUT install.sh (Tier-A one-liner "
+                        "unavailable); default REQUIRES a stamped+signed one")
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args(argv)
 
     if a.cmd == "make-latest":
         make_latest(a.dist, a.channel, a.version)
+        return 0
+
+    if a.cmd == "stamp-installer":
+        stamp_installer(a.out, src=a.src, archive_key=a.archive_key,
+                        apt_url=a.apt_base_url, channel=a.channel)
         return 0
 
     dist = a.dist
@@ -387,7 +689,7 @@ def main(argv):
 
     # ── fail-closed gate ──
     if not a.no_image:
-        versions, pub = gate_images(dist)
+        versions, pub = gate_images(dist, require_installer=not a.no_installer)
         gate_latest(dist, a.channel, versions, pub)
     if not a.no_apt:
         gate_apt(dist, a.channel)

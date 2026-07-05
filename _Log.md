@@ -1,3 +1,38 @@
+## 2026-07-04 — #4197 / #4198 / #4199 (fable-review-165 H-2 / H-14 / H-16): install.sh + publish tooling
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Made the signed-distribution install path actually work
+    end to end. H-2 (#4197): install.sh could never install from the
+    piped Tier-A one-liner — XPF_APT_BASE_URL had no publish-time bake
+    and a piped `curl … | sh` cannot deliver it via env. Added `%%…%%`
+    substitution markers (XPF_APT_BASE_URL / XPF_CHANNEL) seeded near the
+    key section, with env-override > baked > default precedence; the
+    unsubstituted guard keys on the `%%` shape so a global substitution
+    cannot defeat it. publish.py now refuses an installer that still
+    carries the marker, and the docs one-liner is `curl … | sudo sh`.
+    H-14 (#4198): the publisher runbook dead-ended — nothing substituted
+    the real archive key into install.sh, and the gate treated install.sh
+    as optional. Added `publish.py stamp-installer` (substitute the real
+    archive key + apt URL + channel, then sign the STAMPED copy) and made
+    install.sh MANDATORY to the image gate (present, stamped, signed;
+    `--no-installer` opt-out). Fixed a latent whole-file placeholder
+    check that would reject even a stamped installer (the placeholder
+    token also lives in is_placeholder_key's grep pattern) by inspecting
+    the KEY BLOCK only. H-16 (#4199): install.sh mutated the host before
+    validating inputs and left a dangling apt source on failure. Hoisted
+    ALL input validation into validate() BEFORE any mutation, added an
+    EXIT-trap cleanup that removes the written xpf.sources on a failed
+    install, and added a marker-gated postrm purge of the
+    install.sh-written source on package remove/purge (so `apt remove`
+    does not strand it). Validation: shellcheck install.sh/postrm rc=0,
+    py_compile publish.py, selftest 29/29 (10 new checks: stamp bake +
+    baked-default render + gate mandatory/marker/signed/opt-out +
+    cleanup-on-failure + validate-before-mutate), RED-on-revert proven
+    for the trap and the validate-first reorder.
+  - **File(s)**: scripts/dist/install.sh, scripts/dist/publish.py,
+    scripts/dist/selftest.sh, scripts/dist/README.md,
+    docs/distribution.md, debian/xpf.postrm, _Log.md
+
 ## 2026-07-04 — #4188 / #4189 / #4190 (fable-review-165 H-23 / H-25 / H-30): xpf-deploy correctness
 
 - **Timestamp**: 2026-07-04
@@ -34203,3 +34238,26 @@ top.
   RED-on-revert (reverted Runner.run raises CalledProcessError, test fails).
 - **File(s)**: scripts/deploy/xpf-deploy.py,
   scripts/deploy/test_xpf_deploy_robustness.py, _Log.md
+## 2026-07-04 — HB165 apt/deb/signing packaging (H-4, H-6, H-15)
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fixed fable-review-165 H-4/H-6/H-15 (issues #4201/#4202/#4203).
+  - H-4 (#4201): isolate the apt pool PER SUITE
+    (`pool/<suite>/<component>/x/xpf`) and scan only that suite's pool in
+    `apt-ftparchive packages` so a stable rebuild after an edge build never
+    lists the edge version (channel isolation). Reprepro path unaffected.
+  - H-6 (#4202): stage `xpf-kernel-promote-failed.service` (the promote unit's
+    `OnFailure=` recovery target) in the `.deb` via `dh_installsystemd
+    --no-enable --no-start`; add a build-time parity assert that the
+    `OnFailure=` target is actually staged.
+  - H-15 (#4203): add `_gate_key_agreement` to `publish.py gate_apt` —
+    cross-check that install.sh's embedded key, the packaged keyring, and the
+    InRelease signer agree by fingerprint (installer subset of keyring; signer
+    covered by both), dying on mismatch.
+  - selftest.sh: new §5c (channel isolation), §5d (key-agreement gate), §5e
+    (recovery unit staged). All 23 checks pass. RED-on-revert confirmed for
+    H-4 (shared pool bleeds edge into stable) and H-15 (non-signer key
+    rejected). shellcheck build-apt-repo.sh rc=0; py_compile publish.py OK.
+- **File(s)**: scripts/dist/build-apt-repo.sh, debian/rules,
+  scripts/dist/publish.py, scripts/dist/selftest.sh, docs/distribution.md,
+  docs/in-place-upgrade.md, _Log.md

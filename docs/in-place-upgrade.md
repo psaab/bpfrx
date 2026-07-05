@@ -646,7 +646,14 @@ carrying traffic:
    On a gate HANG/timeout the unit's `OnFailure=` triggers
    `xpf-kernel-promote-failed.service`, which reboots once to known-good
    (the firmware-cleared BootNext + un-reordered BootOrder land it there)
-   so a hung verify never leaves the node held secondary forever.
+   so a hung verify never leaves the node held secondary forever. Both
+   units ship in the `.deb` — `debian/rules` stages the promote unit AND
+   its `OnFailure=` recovery unit (installed via `dh_installsystemd
+   --no-enable --no-start`, since the recovery unit has no `[Install]`
+   section), with a build-time parity assert that the `OnFailure=` target
+   is actually staged. Before #4202 only the bake staged the recovery
+   unit, so a deb-installed / foreign host had a dangling `OnFailure=`
+   reference ("Unit not found") and a hung gate got no recovery reboot.
 2. **Lease-suppressed self-recovery.** If the orchestrator CRASHES while a
    node is drained+rebooting, the node would sit passive forever. The
    bounded local self-recovery (`pkg/upgrade/KernelSelfRecovery`,

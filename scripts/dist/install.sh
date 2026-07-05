@@ -1,7 +1,11 @@
 #!/bin/sh
 # xpf appliance installer (#1924 §5.4) — Tailscale-style one-command install.
 #
-#   curl -fsSL <XPF_IMAGE_BASE_URL>/install.sh | sh        # Tier A (one-liner)
+#   curl -fsSL <XPF_IMAGE_BASE_URL>/install.sh | sudo sh   # Tier A (one-liner)
+#
+# The apt base URL + default channel + archive key are BAKED into this script
+# at publish time (scripts/dist/publish.py stamp-installer), so the piped
+# one-liner needs no env — `sudo sh` is required because it mutates the host.
 #
 # Tier B (verify-before-run): get xpf-image.pub from the SOURCE REPO (git
 # clone / GitHub — the out-of-band trust root, NEVER from the dist host),
@@ -19,19 +23,48 @@
 #   5. Print next steps + the interface-takeover caveat (#1879).
 #
 # Config inputs (the operator decisions — NOT hardcoded):
-#   XPF_APT_BASE_URL   apt repo base (dists/+pool/ host). REQUIRED to install.
-#   XPF_CHANNEL        stable (default) | edge
+#   XPF_APT_BASE_URL   apt repo base (dists/+pool/ host). Baked at publish
+#                      time; set to override, or when running an unbaked copy.
+#   XPF_CHANNEL        stable (default) | edge. Baked at publish time.
 #   XPF_DRY_RUN=1      print the actions, mutate nothing (CI / review).
 #
 # The archive keyring below is a PLACEHOLDER (its secret is held by no one).
-# The release build substitutes the real ASCII-armored archive public key
-# between the BEGIN/END markers. The SAME keyring also ships in the xpf
-# package (/usr/share/keyrings via debian/rules) so existing hosts get
-# rotated keys via `apt upgrade` even though they never re-run this script.
+# The release build (publish.py stamp-installer) substitutes the real
+# ASCII-armored archive public key between the BEGIN/END markers AND bakes
+# the apt base URL + default channel into the %%…%% markers below. The SAME
+# keyring also ships in the xpf package (/usr/share/keyrings via debian/rules)
+# so existing hosts get rotated keys via `apt upgrade` even though they never
+# re-run this script.
 set -eu
 
-CHANNEL="${XPF_CHANNEL:-stable}"
+# ── publish-time substitution markers ────────────────────────────────────
+# publish.py stamp-installer replaces the two %%…%% tokens below with the real
+# apt repo base URL and default channel, so a piped `curl … | sudo sh` needs
+# NO env. The "unsubstituted?" guard keys on the `%%` shape (a real URL or
+# channel never contains `%%`), so a global substitution that also touched a
+# literal marker copy elsewhere cannot silently defeat it. Precedence for each
+# value: env override > baked marker > default (channel) / die (URL).
+XPF_APT_BASE_URL_BAKED='%%XPF_APT_BASE_URL%%'
+XPF_CHANNEL_BAKED='%%XPF_CHANNEL%%'
+case "$XPF_APT_BASE_URL_BAKED" in
+    *'%%'*) _baked_url='' ;;                 # unsubstituted marker -> ignore
+    *)      _baked_url="$XPF_APT_BASE_URL_BAKED" ;;
+esac
+case "$XPF_CHANNEL_BAKED" in
+    *'%%'*) _baked_channel='' ;;             # unsubstituted marker -> ignore
+    *)      _baked_channel="$XPF_CHANNEL_BAKED" ;;
+esac
+
+XPF_APT_BASE_URL="${XPF_APT_BASE_URL:-$_baked_url}"
+CHANNEL="${XPF_CHANNEL:-${_baked_channel:-stable}}"
 DRY="${XPF_DRY_RUN:-0}"
+
+# Cleanup-on-failure state (H-16): if we fail AFTER writing the apt source but
+# before a successful install, remove xpf.sources so a half-done install does
+# not brick `apt update` forever (a source pointing at an unreachable / not-
+# yet-configured repo makes every subsequent apt update error out).
+SRC_WRITTEN=0
+INSTALL_OK=0
 # /usr/share/keyrings (NOT /etc/apt/keyrings): the xpf package ships the same
 # keyring here as a package-owned (non-conffile) file, so this bootstrap write
 # and the later `apt install` agree without a dpkg conffile prompt, and key
@@ -44,6 +77,22 @@ info() { echo "xpf-install: $*"; }
 run() {
     if [ "$DRY" = "1" ]; then echo "  (dry-run) $*"; else eval "$*"; fi
 }
+
+# cleanup_on_fail removes a half-written apt source on any non-success exit
+# (H-16). It runs from the EXIT trap: a failure at `apt-get update/install`
+# (or any error under `set -e`) after write_source would otherwise leave
+# xpf.sources on disk pointing at a repo that may not resolve, breaking every
+# later `apt update` until an operator hand-deletes a file they never knew
+# existed. Only removes what THIS run wrote, and never in dry-run.
+cleanup_on_fail() {
+    _rc=$?
+    if [ "$INSTALL_OK" != "1" ] && [ "$SRC_WRITTEN" = "1" ] && [ "$DRY" != "1" ]; then
+        info "install failed (rc=$_rc) — removing $SRC so it does not break apt update"
+        rm -f "$SRC"
+    fi
+    exit "$_rc"
+}
+trap cleanup_on_fail EXIT
 
 # ── embedded archive public key (PLACEHOLDER until release) ──────────────
 # Replace the block between the markers with the real ASCII-armored key.
@@ -104,8 +153,14 @@ in, but verify the host can run networkd (xpfd owns all interfaces)."
     info "preflight OK (arch=$arch kernel=$kver)"
 }
 
-# ── 2. keyring ─────────────────────────────────────────────────────────────
-install_keyring() {
+# ── validate ALL inputs BEFORE any host mutation (H-16) ────────────────────
+# Everything here is read-only (preflight probes; the rest are pure checks) so
+# a bad input fails CLEANLY with the host untouched — no half-configured host
+# with a keyring written but no working apt source.
+validate() {
+    [ "$(id -u)" = "0" ] || [ "$DRY" = "1" ] || die "run as root (or sudo)."
+    preflight
+    # archive key must be the real one (a release build substitutes it).
     if is_placeholder_key; then
         if [ "$DRY" = "1" ]; then
             info "WARNING (dry-run): archive key is the #1924 PLACEHOLDER — a \
@@ -115,6 +170,14 @@ real install would fail at apt update until the release key is issued (OQ-2)."
 keyring that cannot verify the repo. A release build substitutes the real key."
         fi
     fi
+    [ -n "${XPF_APT_BASE_URL:-}" ] || die "XPF_APT_BASE_URL is required (the \
+apt repo base URL — a dists/+pool/ directory host). It is baked into install.sh \
+at publish time; set it explicitly to override, or when running an unbaked copy."
+    case "$CHANNEL" in stable|edge) ;; *) die "XPF_CHANNEL must be stable|edge";; esac
+}
+
+# ── 2. keyring ─────────────────────────────────────────────────────────────
+install_keyring() {
     info "installing archive keyring -> $KEYRING"
     run "install -d -m 0755 /usr/share/keyrings"
     if [ "$DRY" = "1" ]; then
@@ -127,10 +190,8 @@ keyring that cannot verify the repo. A release build substitutes the real key."
 }
 
 # ── 3. apt source ──────────────────────────────────────────────────────────
+# Inputs are already validated in validate(); this function only WRITES.
 write_source() {
-    [ -n "${XPF_APT_BASE_URL:-}" ] || die "XPF_APT_BASE_URL is required \
-(the apt repo base URL — a dists/+pool/ directory host). Set it and re-run."
-    case "$CHANNEL" in stable|edge) ;; *) die "XPF_CHANNEL must be stable|edge";; esac
     info "writing apt source -> $SRC (suite=$CHANNEL uri=$XPF_APT_BASE_URL)"
     body=$(cat <<EOF
 # xpf appliance apt source (#1924). Managed by install.sh.
@@ -146,6 +207,7 @@ EOF
         echo "  (dry-run) $SRC contents:"; printf '%s\n' "$body" | sed 's/^/      /'
     else
         printf '%s\n' "$body" > "$SRC"
+        SRC_WRITTEN=1   # arm the cleanup trap (H-16)
     fi
 }
 
@@ -178,11 +240,11 @@ EOF
 }
 
 main() {
-    [ "$(id -u)" = "0" ] || [ "$DRY" = "1" ] || die "run as root (or sudo)."
-    preflight
-    install_keyring
+    validate        # ALL input checks first — no host mutation yet (H-16)
+    install_keyring # ── mutation begins here ──
     write_source
     do_install
+    INSTALL_OK=1    # success — disarm the cleanup trap (keep xpf.sources)
     next_steps
 }
 

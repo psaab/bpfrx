@@ -10,8 +10,8 @@ Mechanism for a signed, hosted appliance distribution. Spec:
 |---|---|
 | `sign.py` | minisign sign/verify + per-version manifest helpers (shared by bake/validate/deploy/publish) |
 | `build-apt-repo.sh` | builds a flat signed apt repo (default) or reprepro (opt-in) |
-| `install.sh` | Tailscale-style one-command installer (preflight + keyring + apt source + install) |
-| `publish.py` | fail-closed publish gate + `XPF_PUBLISH_CMD` dispatch |
+| `install.sh` | Tailscale-style one-command installer (validate-all-inputs → keyring + apt source + install, with cleanup-on-failure). Ships with `%%…%%` markers baked at publish time. |
+| `publish.py` | fail-closed publish gate + `XPF_PUBLISH_CMD` dispatch. `stamp-installer` bakes the real archive key + apt base URL + channel into `install.sh` (substitute-then-sign); the gate REQUIRES a stamped+signed `install.sh` unless `--no-installer`. |
 | `xpf-image.pub.placeholder` | PLACEHOLDER minisign public key (see below) |
 | `xpf-archive-keyring.asc.placeholder` | PLACEHOLDER OpenPGP apt archive key (see below) |
 
