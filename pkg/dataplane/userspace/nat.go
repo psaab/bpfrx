@@ -272,7 +272,73 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			})
 		}
 	}
+	// #4161: Junos source-NAT rule-set precedence is MOST-SPECIFIC-SCOPE-WINS,
+	// not config-order first-match. Among overlapping rule-sets whose scopes
+	// all match a flow, Junos selects by the specificity of the match context
+	// — interface > zone > routing-instance (interface most specific) — and
+	// only then applies within-set rule order. The Rust matcher
+	// (userspace-dp/src/nat/source.rs match_source_nat_result_for_tuple) is
+	// first-match on slice order, so we make "first match" == "most-specific
+	// match" by STABLE-sorting the emitted snapshot by context tier here. A
+	// stable sort keeps config order WITHIN a tier (Junos within-rule-set order
+	// plus equal-specificity rule-set-definition order) and keeps each
+	// rule-set's rules contiguous, so rule-sets never interleave. The tier is a
+	// pure function of the six scope fields already stamped above — no new wire
+	// plumbing (they were carried since #3096). This is why the Rust first-match
+	// loop is deliberately left unchanged: it reads a pre-tiered Vec.
+	//
+	// Scope note: DNAT (destination.rs match_entries) and static
+	// (static_nat.rs pick_scoped) tier only zone-SCOPED vs zone-WILDCARD — a
+	// narrower axis that does NOT rank interface above zone. Extending this full
+	// interface>zone>routing-instance hierarchy to them is a separate,
+	// out-of-scope follow-up.
+	sort.SliceStable(out, func(i, j int) bool {
+		return sourceNATScopeTier(out[i]) < sourceNATScopeTier(out[j])
+	})
 	return out
+}
+
+// Source-NAT context-specificity tiers (#4161). LOWER = more specific = higher
+// precedence, matching Junos rule-set selection (interface most specific).
+const (
+	snatTierInterface       = 0
+	snatTierZone            = 1
+	snatTierRoutingInstance = 2
+	snatTierUnscoped        = 3
+)
+
+// sourceNATScopeTier returns the Junos context-specificity tier of a
+// source-NAT rule-set snapshot (#4161). A rule-set may carry both a `from` and
+// a `to` context, and they may be of different kinds; either context narrows
+// the match, so the MORE-SPECIFIC of the two governs the rule-set's
+// precedence: tier = MIN(from-tier, to-tier). This MIN default is the
+// vSRX-pinned semantic (confirmed by the L-9 overlap tests).
+func sourceNATScopeTier(s SourceNATRuleSnapshot) int {
+	from := scopeContextTier(s.FromInterface, s.FromZone, s.FromRoutingInstance)
+	to := scopeContextTier(s.ToInterface, s.ToZone, s.ToRoutingInstance)
+	if to < from {
+		return to
+	}
+	return from
+}
+
+// scopeContextTier maps a single from/to context to its specificity tier
+// (#4161): interface=0, zone=1, routing-instance=2, none/wildcard=3. A Junos
+// from/to clause names exactly one kind of context; a hostile config that sets
+// more than one is ranked by its most-specific present field (the Rust
+// scope_matches AND-filters every set field regardless, so this only affects
+// precedence, never eligibility).
+func scopeContextTier(iface, zone, routingInstance string) int {
+	switch {
+	case iface != "":
+		return snatTierInterface
+	case zone != "":
+		return snatTierZone
+	case routingInstance != "":
+		return snatTierRoutingInstance
+	default:
+		return snatTierUnscoped
+	}
 }
 
 // natProtoAny is the source-NAT match-term protocol wildcard, mirroring the
