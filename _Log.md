@@ -33657,3 +33657,30 @@ top.
   issue #4156. Doc: docs/feature-coverage.md HA section.
 - **File(s)**: pkg/cluster/monitor.go, pkg/cluster/monitor_test.go,
   docs/feature-coverage.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: #4146 (H-1 slice c) — commit-time WARNING for the `to-zone
+  junos-host` enforcement gap on the direct host-bound path. Ordinary traffic
+  to a firewall interface IP is delivered by the kernel (XDP shim shunts
+  local-destined packets on a session miss via `is_local_destination` ->
+  `cpumap_or_pass`); the nft `xpf_hostinbound` chain is permit-by-service only
+  (admits configured system-services from ANY source, no per-source/per-app
+  deny), and the fine `junos_host_local_policy` runs only on the userspace XSK
+  `LocalDelivery` path — which a direct-to-interface packet never reaches. So a
+  configured `to-zone junos-host` deny (or source-scoped permit) is silently
+  unenforced there. Added `validateJunosHostDirectDeliveryWarnings` +
+  `junosHostPolicyStricterThanCoarseGate` + `junosHostPolicySourceScoped` to
+  `ValidateConfig`: WARN-only, per `to-zone junos-host` policy (zone-pair or
+  global) that is stricter than the coarse gate — a deny/reject, or a
+  source-restricted permit. Conservative trigger: plain permit-any mirrors the
+  coarse gate and does NOT warn; application-only scope is not a standalone
+  trigger. Never a hard reject (legal Junos; reject would brick a committed
+  config). The actual enforcement (directions a/b) stays PLAN-DEFERRED on #4146
+  (availability-vs-security). New unit tests: warn on deny/reject/source-permit/
+  global-deny, no-warn on permit-any / no-junos-host, nil-safety. Fail-on-revert:
+  removing the ValidateConfig call drops the warning and TestJunosHostDirect
+  DeliveryWarns goes RED. `go test ./pkg/config/...` green; `go build ./...`,
+  gofmt, vet clean. PR: Refs #4146 (keep #4146 open for the deferred enforcement).
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_junos_host_direct_warn_4146_test.go,
+  docs/host-inbound-service-matrix.md, _Log.md
