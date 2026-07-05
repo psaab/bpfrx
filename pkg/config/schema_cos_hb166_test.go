@@ -232,3 +232,74 @@ func TestHB166_Completion_NewLeavesPresent(t *testing.T) {
 		}
 	}
 }
+
+// --- T-4: BA classifier code-point -> unmaterialized queue commit warning ---
+
+// TestHB166_T4_ClassifierUnmaterializedQueue_Warns pins the fable-review-166
+// T-4 commit-time visibility: a DSCP classifier that steers a code-point to a
+// forwarding-class whose queue is NOT in the interface's scheduler-map (so the
+// dataplane never materializes it) must WARN at commit — the pre-fix dataplane
+// silently blackholed such traffic, and the post-fix dataplane forwards it on
+// the best-effort queue, so the operator needs to know the intended queue does
+// not exist on this interface.
+//
+// It is a WARN, not a strict reject: a classifier steering to a
+// forwarding-class without a scheduler-map entry is a valid Junos config
+// (queues exist by default), so the config must still COMPILE.
+//
+// FAIL-ON-REVERT: dropping classOfServiceClassifierQueueWarnings (or its call
+// site in compiler_validate_warn.go) makes the warn assertion go RED — the
+// unmaterialized-queue classifier commits silently again, exactly the
+// pre-fix blackhole-with-no-diagnostic behavior.
+func TestHB166_T4_ClassifierUnmaterializedQueue_Warns(t *testing.T) {
+	cmds := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service forwarding-classes queue 5 ef",
+		"set class-of-service schedulers sched-be priority low",
+		// Scheduler-map materializes ONLY best-effort (queue 0); ef (queue 5)
+		// is never built on the interface.
+		"set class-of-service scheduler-maps be-only forwarding-class best-effort scheduler sched-be",
+		// Classifier steers dscp 46 -> ef (queue 5, unmaterialized) and
+		// dscp 0 -> best-effort (queue 0, materialized -> admits the iface).
+		"set class-of-service classifiers dscp cls forwarding-class ef loss-priority low code-points 46",
+		"set class-of-service classifiers dscp cls forwarding-class best-effort loss-priority low code-points 0",
+		"set class-of-service interfaces reth0 unit 80 shaping-rate 10g",
+		"set class-of-service interfaces reth0 unit 80 scheduler-map be-only",
+		"set class-of-service interfaces reth0 unit 80 classifiers dscp cls",
+	}
+	cfg := hb166Compile(t, cmds...) // must COMPILE (WARN, not reject)
+	if !hb166HasWarning(cfg, `forwarding-class "ef"`) ||
+		!hb166HasWarning(cfg, "no scheduler-map entry on this interface") {
+		t.Fatalf("expected an unmaterialized-queue classifier warning naming ef; got warnings: %v", cfg.Warnings)
+	}
+	// The best-effort code-point (queue 0, materialized) must NOT warn.
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, `forwarding-class "best-effort"`) &&
+			strings.Contains(w, "no scheduler-map entry on this interface") {
+			t.Fatalf("best-effort maps to a materialized queue; must not warn: %q", w)
+		}
+	}
+}
+
+// TestHB166_T4_ClassifierMaterializedQueue_NoWarn is the control: when the
+// scheduler-map materializes every forwarding-class the classifier references,
+// no unmaterialized-queue warning fires.
+func TestHB166_T4_ClassifierMaterializedQueue_NoWarn(t *testing.T) {
+	cmds := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service forwarding-classes queue 5 ef",
+		"set class-of-service schedulers sched-be priority low",
+		"set class-of-service schedulers sched-ef priority strict-high",
+		"set class-of-service scheduler-maps full forwarding-class best-effort scheduler sched-be",
+		"set class-of-service scheduler-maps full forwarding-class ef scheduler sched-ef",
+		"set class-of-service classifiers dscp cls forwarding-class ef loss-priority low code-points 46",
+		"set class-of-service classifiers dscp cls forwarding-class best-effort loss-priority low code-points 0",
+		"set class-of-service interfaces reth0 unit 80 shaping-rate 10g",
+		"set class-of-service interfaces reth0 unit 80 scheduler-map full",
+		"set class-of-service interfaces reth0 unit 80 classifiers dscp cls",
+	}
+	cfg := hb166Compile(t, cmds...)
+	if hb166HasWarning(cfg, "no scheduler-map entry on this interface") {
+		t.Fatalf("all classifier classes are materialized; must not warn; got: %v", cfg.Warnings)
+	}
+}
