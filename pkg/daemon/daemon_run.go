@@ -264,10 +264,33 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// config and then take over interfaces, defeating the fail-closed intent.
 	if shouldBootstrapFromFile(d.store.ActiveConfig() != nil, configCompileFailed) {
 		if err := d.bootstrapFromFile(); err != nil {
-			slog.Warn("failed to bootstrap config from file", "err", err)
+			// #4186 (H-17): a missing text config file is the EXPECTED
+			// factory/fresh-boot state, not a failure — log it at Info, not
+			// Warn, so operators triaging a real day-0 failure aren't taught
+			// to ignore a benign line. Keep Warn for a REAL failure (file
+			// present but unreadable/unparseable/uncommittable, incl. the
+			// #4183 device-map strand rejection).
+			// #4184 (H-11): record the outcome so a failed import is visible
+			// on /health + an event, not just here in journald.
+			if errors.Is(err, os.ErrNotExist) {
+				slog.Info("no text config present to bootstrap from (factory/fresh boot)",
+					"file", d.opts.ConfigFile)
+				d.recordBootstrapImport(bootstrapImportNoConfig, "")
+			} else {
+				slog.Warn("failed to bootstrap config from file", "err", err)
+				d.recordBootstrapImport(bootstrapImportFailed, err.Error())
+			}
+		} else {
+			d.recordBootstrapImport(bootstrapImportOK, "")
 		}
 	} else if d.store.ActiveConfig() != nil {
 		slog.Info("configuration loaded from db")
+		d.recordBootstrapImport(bootstrapImportLoadedDB, "")
+	} else {
+		// No DB config and bootstrap-from-file suppressed (e.g. a present
+		// committed config that failed to compile, #1960). Record no-config
+		// so /health reflects that no active config is installed.
+		d.recordBootstrapImport(bootstrapImportNoConfig, "")
 	}
 
 	// #1922 Item 2: the five-case boot predicate, computed ONCE here after
@@ -1143,6 +1166,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 					FailureCount:     h.FailureCount,
 					LastError:        h.LastError,
 					LastErrorUnixSec: h.LastErrorUnixSec,
+				}
+			},
+			// #4184: surface the day-0 / bootstrap config-import outcome so a
+			// failed import is visible on /health, not just a boot-time WARN.
+			BootstrapImportFn: func() api.BootstrapImportSnapshot {
+				b := d.BootstrapImportSnapshot()
+				return api.BootstrapImportSnapshot{
+					Status:  b.Status,
+					Error:   b.Error,
+					UnixSec: b.UnixSec,
+					Failed:  b.Failed,
 				}
 			},
 			// #1780 Path A: expose the per-phase age of the Go periodic

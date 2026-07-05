@@ -199,11 +199,26 @@ func main() {
 				path, len(data), int64(maxCheckConfigBytes))
 			os.Exit(1)
 		}
-		if _, err := configstore.CheckText(string(data), *nodeID); err != nil {
+		compiled, err := configstore.CheckText(string(data), *nodeID)
+		if err != nil {
 			fmt.Printf("FAIL %s\n%v\n", path, err)
 			os.Exit(2)
 		}
-		fmt.Printf("PASS %s (strict commit-check: parse + schema + compile)\n", path)
+		// #4183: the strict parse+schema+compile gate above does NOT catch a
+		// device-map that would strand management on next boot — the same
+		// preflight an interactive commit runs. check-config runs ON THE
+		// TARGET HARDWARE (the day-0 NIC inventory is available), so run it
+		// here and hard-FAIL, converting a first-boot console-only lockout
+		// into a day-0 rejection while it can still be fixed.
+		if reason, derr := daemon.CheckDeviceMapStrandsManagement(compiled); derr != nil {
+			// NIC enumeration failed (transient/environmental). Warn but do
+			// not fail the check — the runtime lifeline is the backstop.
+			fmt.Fprintf(os.Stderr, "check-config: device-map strand preflight skipped: %v\n", derr)
+		} else if reason != "" {
+			fmt.Printf("FAIL %s\ndevice-map would strand management on next boot: %s\n", path, reason)
+			os.Exit(2)
+		}
+		fmt.Printf("PASS %s (strict commit-check: parse + schema + compile + device-map preflight)\n", path)
 		return
 	}
 

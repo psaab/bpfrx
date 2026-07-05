@@ -33857,3 +33857,39 @@ top.
 - **File(s)**: scripts/deploy/xpf-deploy.py,
   scripts/deploy/test_xpf_deploy_disk.py, examples/deploy/README.md,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 daemon bootstrap/day-0/identity batch — H-8
+  (#4183), H-11 (#4184), H-12 (#4185), H-17 (#4186). One PR.
+  - **H-8**: the #1956 device-map strand-management pre-flight now runs on
+    the day-0 paths, not just interactive commits. `xpfd check-config`
+    hard-FAILs a stranding map (new exported `CheckDeviceMapStrandsManagement`
+    in pkg/daemon wired into cmd/xpfd/main.go after the strict gate);
+    `bootstrapFromFile` runs `deviceMapCommitPreflight` before Commit and
+    REFUSES to commit a stranding config, staying lifeline-safe. Added a
+    `enumeratePresentNICsFn` seam so the pre-flight is unit-testable.
+  - **H-11**: bootstrap/day-0 import outcome recorded at boot
+    (recordBootstrapImport / BootstrapImportSnapshot in daemon_health.go) and
+    surfaced on /health (`bootstrap_import_status` + `_failed` + `_error`,
+    non-fatal) plus a `BOOTSTRAP_IMPORT_FAILED` event. Wired
+    api.Server.BootstrapImportFn.
+  - **H-12**: node identity cross-check — compileTreeStrict now rejects a
+    config whose compiled `chassis cluster node` leaf disagrees with the
+    effective node-id (file value / -node-id flag), via crossCheckNodeID +
+    new ClusterConfig.NodeIDSet (set in compiler_system.go). Lenient
+    Load/SyncApply path deliberately NOT cross-checked. Tightened the
+    daemon's node-id file parser to a strict trimmed-Atoi 0|1 contract
+    (parseNodeIDFileContent) with a loud error on a bad file.
+  - **H-17**: factory boot with no /etc/xpf/xpf.conf logs at Info
+    ("no text config present"), not Warn; Warn kept for real failures.
+  - RED-on-revert PROVEN for all four (neuter each fix -> its test FAILs,
+    restored). go test ./pkg/daemon/... ./pkg/config/... ./pkg/configstore/...
+    ./pkg/api/... green; go build ./... + go vet clean.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_health.go,
+  pkg/daemon/device_map.go, pkg/daemon/hb165_bootstrap_batch_test.go,
+  pkg/config/types_chassis.go, pkg/config/compiler_system.go,
+  pkg/config/parser_cluster_test.go, pkg/configstore/store.go,
+  pkg/configstore/check_test.go, pkg/api/server.go, pkg/api/health.go,
+  pkg/api/health_test.go, cmd/xpfd/main.go, docs/bare-metal-device-map.md,
+  _Log.md

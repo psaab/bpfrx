@@ -69,6 +69,22 @@ func (d *Daemon) bootstrapFromFile() error {
 		d.store.ExitConfigure()
 		return fmt.Errorf("load override: %w", err)
 	}
+	// #4183: run the SAME device-map strand-management preflight an
+	// interactive commit runs, so a day-0/bootstrap config that would strand
+	// management on next boot (a device-map losing the mgmt NIC, #1956) is
+	// caught BEFORE it is committed and takes over interfaces. Without this,
+	// the day-0 import committed unchecked and the box could come up
+	// console-only from the very first boot. Refusing to commit here leaves
+	// the daemon in the lifeline-safe bootstrap state instead.
+	if cand, err := d.store.CompileCandidate(); err == nil {
+		if perr := d.deviceMapCommitPreflight(cand, nil); perr != nil {
+			d.store.ExitConfigure()
+			slog.Error("bootstrap config REJECTED: its device-map would strand management on next "+
+				"boot; NOT committing — staying in lifeline-safe bootstrap mode. Fix the device-map "+
+				"and re-import.", "err", perr, "file", d.opts.ConfigFile)
+			return fmt.Errorf("bootstrap device-map preflight: %w", perr)
+		}
+	}
 	if _, err := d.store.Commit(); err != nil {
 		d.store.ExitConfigure()
 		return fmt.Errorf("commit: %w", err)
@@ -328,7 +344,7 @@ func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
 	if synced == nil || !synced.Chassis.DeviceMap.Active() {
 		return
 	}
-	nics, err := enumeratePresentNICs()
+	nics, err := enumeratePresentNICsFn()
 	if err != nil {
 		// AGY MINOR-5: do not let a transient hardware-lookup failure
 		// silently bypass the admission gate — log loudly so the operator

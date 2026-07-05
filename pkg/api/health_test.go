@@ -201,6 +201,81 @@ func TestHealthHandler_ReportsRollbackHistoryDegraded(t *testing.T) {
 	}
 }
 
+// TestHealthHandler_ReportsBootstrapImportFailed pins #4184 (H-11): a failed
+// day-0 / bootstrap config import is surfaced on /health via
+// bootstrap_import_status + bootstrap_import_failed + the error detail — so
+// "why didn't my config apply" has an in-band answer beyond a boot-time WARN.
+// It is NON-fatal (200/ok): the box is in the lifeline-safe bootstrap state,
+// so a probe must not pull it from rotation. RED-on-revert: without the
+// bootstrap_import_status field, this assertion fails.
+func TestHealthHandler_ReportsBootstrapImportFailed(t *testing.T) {
+	s := &Server{
+		bootstrapImportFn: func() BootstrapImportSnapshot {
+			return BootstrapImportSnapshot{
+				Status:  "import-failed",
+				Error:   "commit: parse error: unexpected token",
+				UnixSec: 1_700_000_000,
+				Failed:  true,
+			}
+		},
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/health", nil)
+	s.healthHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Errorf("status = %d, want 200 (bootstrap import failure is non-fatal)", rr.Code)
+	}
+	var resp Response
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	data, ok := resp.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("data = %T, want map", resp.Data)
+	}
+	if st, _ := data["bootstrap_import_status"].(string); st != "import-failed" {
+		t.Errorf("bootstrap_import_status = %q, want \"import-failed\"", st)
+	}
+	if failed, _ := data["bootstrap_import_failed"].(bool); !failed {
+		t.Error("bootstrap_import_failed should be true")
+	}
+	if msg, _ := data["bootstrap_import_error"].(string); msg == "" {
+		t.Error("bootstrap_import_error should be populated")
+	}
+}
+
+// TestHealthHandler_BootstrapImportNoConfigNotFailed pins the factory-boot
+// half: the expected no-config state reports its status without marking the
+// import failed and without degrading /health.
+func TestHealthHandler_BootstrapImportNoConfigNotFailed(t *testing.T) {
+	s := &Server{
+		bootstrapImportFn: func() BootstrapImportSnapshot {
+			return BootstrapImportSnapshot{Status: "no-config", UnixSec: 1_700_000_000}
+		},
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/health", nil)
+	s.healthHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	var resp Response
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	data, _ := resp.Data.(map[string]any)
+	if st, _ := data["bootstrap_import_status"].(string); st != "no-config" {
+		t.Errorf("bootstrap_import_status = %q, want \"no-config\"", st)
+	}
+	if failed, _ := data["bootstrap_import_failed"].(bool); failed {
+		t.Error("bootstrap_import_failed should be false for the factory no-config state")
+	}
+}
+
 // TestHealthHandler_RollbackHistoryHealthy pins the complementary half:
 // with the fn wired and reporting healthy, the field is present and false.
 func TestHealthHandler_RollbackHistoryHealthy(t *testing.T) {

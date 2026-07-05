@@ -73,6 +73,17 @@ type CompileHealthSnapshot struct {
 	LastErrorUnixSec int64
 }
 
+// BootstrapImportSnapshot mirrors daemon.BootstrapImport without the import,
+// so pkg/api -> pkg/daemon stays a one-way edge (#4184). The daemon injects a
+// callback returning this; /health surfaces the day-0 config-import outcome so
+// a failed bootstrap import is visible beyond a single journald WARN.
+type BootstrapImportSnapshot struct {
+	Status  string // "ok" | "loaded-from-db" | "no-config" | "import-failed" | ""
+	Error   string // detail when Status == "import-failed"
+	UnixSec int64
+	Failed  bool // true only for a real import failure (not the factory no-config state)
+}
+
 // Config configures the API server.
 type Config struct {
 	Addr      string
@@ -101,6 +112,13 @@ type Config struct {
 	// instead of reading "status: ok" alongside a one-shot WARN in the
 	// journal. Optional; if nil, /health keeps the pre-#758 behaviour.
 	CompileHealthFn func() CompileHealthSnapshot
+	// BootstrapImportFn surfaces the day-0 / bootstrap config-import outcome
+	// via /health (#4184, mirrors CompileHealthFn). It is reported as a
+	// non-fatal field (like rollback_history_degraded): a failed import means
+	// the box is in the lifeline-safe bootstrap state, so surfacing the cause
+	// is the goal — not pulling a still-reachable box from a probe-gated
+	// rotation. Optional; if nil, the field is omitted.
+	BootstrapImportFn func() BootstrapImportSnapshot
 	// ConfigPersistDegradedFn surfaces the configstore's persist-degraded
 	// state via /health and the xpf_daemon_config_persist_degraded gauge
 	// (#1799, mirrors the CompileHealthFn pattern). Returning true means
@@ -251,6 +269,7 @@ type Server struct {
 	commitFn                         func(ctx context.Context, comment string) (*config.Config, error)
 	commitConfirmedFn                func(ctx context.Context, minutes int) (*config.Config, error)
 	compileHealthFn                  func() CompileHealthSnapshot
+	bootstrapImportFn                func() BootstrapImportSnapshot
 	configPersistDegradedFn          func() bool
 	rollbackHistoryDegradedFn        func() bool
 	neighborPhaseAgeFn               func() map[string]float64
@@ -333,6 +352,7 @@ func NewServer(cfg Config) *Server {
 		commitFn:                         cfg.CommitFn,
 		commitConfirmedFn:                cfg.CommitConfirmedFn,
 		compileHealthFn:                  cfg.CompileHealthFn,
+		bootstrapImportFn:                cfg.BootstrapImportFn,
 		configPersistDegradedFn:          cfg.ConfigPersistDegradedFn,
 		rollbackHistoryDegradedFn:        cfg.RollbackHistoryDegradedFn,
 		neighborPhaseAgeFn:               cfg.NeighborPhaseAgeFn,

@@ -32,6 +32,11 @@ type presentNIC = devicemap.PresentNIC
 var (
 	enumerateAndRenameMappedFn     = enumerateAndRenameMapped
 	enumerateAndRenameInterfacesFn = enumerateAndRenameInterfaces
+	// enumeratePresentNICsFn is the seam every strand-management preflight
+	// reads the live NIC inventory through (#4183), so the commit / day-0
+	// bootstrap / check-config strand checks are unit-testable without a
+	// live VM. Production leaves it pointing at the real sysfs+netlink scan.
+	enumeratePresentNICsFn = enumeratePresentNICs
 )
 
 // enumeratePresentNICs reads the live host NIC inventory (sysfs + netlink).
@@ -454,7 +459,7 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 	if !candActive && !rbActive {
 		return nil
 	}
-	nics, err := enumeratePresentNICs()
+	nics, err := enumeratePresentNICsFn()
 	if err != nil {
 		// Cannot enumerate hardware — do not block the commit on a
 		// transient sysfs error; the #1922 lifeline is the backstop.
@@ -483,6 +488,32 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 		}
 	}
 	return nil
+}
+
+// CheckDeviceMapStrandsManagement runs the #1956 device-map strand-management
+// preflight against the LIVE host NIC inventory for a config that has NOT been
+// committed — the day-0 `xpfd check-config` gate (#4183). It is the daemon-free
+// analogue of deviceMapCommitPreflight: cmd/xpfd's check-config subcommand has
+// no *Daemon, so this package-level helper enumerates present NICs, resolves
+// the lifeline + protected set from the candidate config itself, and reports
+// whether the map would strand management on next boot.
+//
+// Returns ("", nil) when the config is safe or does not engage device-map mode.
+// A non-empty reason means the config WOULD strand management (check-config
+// must hard-FAIL). err is non-nil ONLY when the NIC inventory could not be
+// read — a transient environmental failure the caller should surface as a
+// warning without failing the check (mirroring deviceMapCommitPreflight's
+// non-blocking stance: the #1922 lifeline is the runtime backstop).
+func CheckDeviceMapStrandsManagement(cfg *config.Config) (string, error) {
+	if cfg == nil || !cfg.Chassis.DeviceMap.Active() {
+		return "", nil
+	}
+	nics, err := enumeratePresentNICsFn()
+	if err != nil {
+		return "", err
+	}
+	lifelineName, _ := resolveLifelineCurrentName()
+	return deviceMapStrandsManagement(cfg, nics, protectedForConfig(cfg), lifelineName), nil
 }
 
 // protectedForConfig resolves the #1922 protected set using the SPECIFIC
