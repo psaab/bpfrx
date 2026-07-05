@@ -1,3 +1,34 @@
+
+## 2026-07-04 — #4147 (M-8): unterminated /* */ block comment silently truncates config
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (origin/master d70851156) then FIX.
+    fable-review-164 M-8. Confirmed empirically: the block-comment scanner
+    in `skipWhitespaceAndComments` (`pkg/config/lexer.go`) consumed input to
+    EOF when a `/*` had no closing `*/`, `continue`d, and returned no error —
+    so everything after the unclosed `/*` was swallowed as comment text,
+    `Parse()` returned 0 errors, and `commit` applied a config with dropped
+    stanzas (a scratch repro dropped an entire trailing `security { policies
+    { default-policy { deny-all; } } }` stanza — 0 errors, 1 top-level node).
+    A fail-open config-integrity path, in contrast to `readString` which
+    returns `TokenError{"unterminated string"}`. FIX: the block-comment loop
+    now tracks a `terminated` flag and the opening `/*` line/column; on EOF
+    with no `*/` it stashes a `TokenError{"unterminated block comment"}` in a
+    new `Lexer.pending` field, drained at the top of `Next` (since
+    `skipWhitespaceAndComments` cannot return a token). `parseStatements`
+    already surfaces a `TokenError` Peek as a `ParseError`, so the load /
+    commit paths now reject the truncated config (#1960-correct strict
+    reject). `Peek` also saves/restores `pending` to stay a pure no-op.
+    Single-line `/* x */`, `#`, and `//` comments are unaffected — only the
+    unterminated multi-line block is rejected. Added
+    `TestUnterminatedBlockComment` (RED on revert: without the fix it fails
+    "expected a parse error, got none (config silently truncated to 1
+    top-level node)"; terminated-comment case asserts the post-comment
+    `system` stanza SURVIVES). go test ./pkg/config/... green; go build
+    ./... green; gofmt + go vet clean. Documented in pkg/config/README.md
+    Gotchas.
+  - **File(s)**: pkg/config/lexer.go, pkg/config/parser_ast_test.go,
+    pkg/config/README.md, _Log.md
 ## 2026-07-04 — #4088: pool SNAT — id==0 ICMP echo is a valid keyable query
 
 - **Timestamp**: 2026-07-04
