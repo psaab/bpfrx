@@ -1,3 +1,39 @@
+## 2026-07-04 — fable-review-166 T-1: v8 lease give-back re-credits the epoch ledger (#4246, folds R-5(a))
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed the T-1 v8 epoch-ledger double-charge (highest-value
+    fable-review-166 fairness finding; candidate #1630 cause-2 mechanism).
+    `acquire_v8_with_cause` charges each grant to `packed_granted` (class
+    ledger the ClassCap gate reads), the legacy `outstanding` word, AND
+    `worker_grants[worker_id]`, but `release_unused` only decremented the
+    legacy word — so released bytes stayed charged, a mid-rate class
+    oscillating empty↔backlogged hit ClassCap early and parked to rotation
+    (~94% service). Added `SharedCoSLease::release_unused_v8(worker_id,
+    bytes)` mirroring `tag_checked_rollback`: free the legacy word, claim
+    the credit from the worker's current-epoch grant slot via a tag-checked
+    CAS (capped at what the slot holds → cross-epoch release safely no-ops;
+    keeps `sum(worker_grants) == packed_granted`), then tag-checked-CAS
+    decrement `packed_granted` by the same credit. Swapped both v8
+    queue-lease release sites (`tx_completion.rs`
+    `refresh_cos_interface_activity`, `token_bucket.rs`
+    `release_all_cos_queue_leases`) to it; left the ROOT-lease release
+    (`token_bucket.rs:381`) on the legacy path. Folded R-5(a): the
+    `tx_completion.rs` site used to `mem::take` `hot.tokens` unconditionally
+    for every empty exact queue, destroying a no-lease queue's banked
+    burst — now gated on lease presence (disjoint `cos_fast_interfaces`
+    probe). Added a diagnostic `release_recredited_bytes` counter +
+    `v8_release_recredited_bytes()` accessor for the #1630 cause-2
+    falsification test. Added 5 tests (the v8 consume/release pair had
+    zero); 3 are RED-on-revert. Full `cargo test --release` green (3541
+    lib + integration). Updated `docs/fairness-regimes.md` cause-2 section.
+    NEEDS a cluster CoS mid-rate multi-class smoke before merge.
+  - **File(s)**: userspace-dp/src/afxdp/types/shared_cos_lease/lease.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/epoch.rs,
+    userspace-dp/src/afxdp/cos/tx_completion.rs,
+    userspace-dp/src/afxdp/cos/token_bucket.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
+    docs/fairness-regimes.md, _Log.md
+
 ## 2026-07-04 — fable-review-166 T-3 / T-4: TX-path CoS classification fixes (#4243, #4244)
 
 - **Timestamp**: 2026-07-04

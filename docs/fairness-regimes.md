@@ -1433,6 +1433,55 @@ This floor is therefore a documented characteristic of the per-CPU
 AF_XDP + token-bucket transport, NOT a `guarantee-rate` Gate failure, and
 is intentionally not a pass/fail bar.
 
+#### Candidate recoverable mechanism: v8 epoch-ledger double-charge (#4246, T-1)
+
+The "transport physics" attribution above is a *default* explanation, not
+a proof. #4246 (fable-review-166 finding T-1) identified and fixed a v8
+shared-CoS-lease accounting bug that reproduces cause-2's exact
+parallelism fingerprint and is therefore a **plausible, falsifiable
+alternative** to (or co-factor of) the transport-physics floor.
+
+- **The bug.** `acquire_v8_with_cause` charges every grant to THREE
+  ledgers — the per-epoch class ledger `packed_granted` (the word the
+  ClassCap gate reads), the legacy `outstanding` credit, and the
+  per-worker `worker_grants[worker_id]`. The give-back `release_unused`
+  only freed the legacy `outstanding` word; it never decremented
+  `packed_granted` or `worker_grants`. Rotation banks only `cap -
+  granted`, so released-but-not-recredited bytes stayed charged for the
+  rest of the epoch. A mid-rate exact class oscillating empty↔backlogged
+  at epoch timescale hit ClassCap early and parked until the next
+  rotation (~94% service).
+- **Why it matches the cause-2 fingerprint.** T-1 is NOT a cross-worker
+  fair-share bug (those worsen with more workers). It is a *per-queue*
+  epoch-ledger double-charge whose FREQUENCY is driven by the
+  empty↔backlogged transition rate. At `-P1` a bursty single flow empties
+  the queue often → many releases → more double-charging → worse. At
+  `-P12` the queue stays backlogged → fewer empties → less double-charging
+  → better. So the discriminator the doc used to rule out a fairness
+  defect ("improves with parallelism ⇒ transport physics") does NOT rule
+  out T-1.
+- **The fix.** `SharedCoSLease::release_unused_v8(worker_id, bytes)`
+  (`types/shared_cos_lease/lease.rs`) mirrors the acquire path's
+  `tag_checked_rollback` CAS discipline: claim the credit from the
+  worker's current-epoch grant slot (tag-checked, capped at what the slot
+  holds so a cross-epoch release safely no-ops), then decrement
+  `packed_granted` by the same claimed amount. Both v8 queue-lease
+  give-back sites (`tx_completion.rs` on queue-empty, `token_bucket.rs` on
+  teardown) route through it. Folds R-5(a): the same `tx_completion.rs`
+  site used to destroy a no-lease exact queue's banked burst by
+  `mem::take`-ing `hot.tokens` unconditionally; the take is now gated on
+  lease presence.
+- **Falsification test.** `release_unused_v8` accumulates a diagnostic
+  `release_recredited_bytes` counter (per-lease, `v8_release_recredited_bytes()`).
+  Sum give-back bytes against the per-class undershoot on a mid-rate
+  on/off iperf pattern: if re-credited bytes correlate with the
+  undershoot, cause-2 is (at least partly) this ledger bug. If the ~6%
+  residual persists on the loss userspace cluster after this fix with no
+  correlation, cause-2 is confirmed transport physics. **The accounting
+  fix is correct on its own merits regardless of the cause-2 outcome** —
+  it eliminates a genuine over-charge that parked mid-rate classes early.
+  Needs a cluster CoS mid-rate multi-class smoke to measure the recovery.
+
 ### Simul-load harness
 
 `test/incus/cos-simul-load-smoke.sh [push|reverse]` runs all 11
