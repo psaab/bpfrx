@@ -2383,3 +2383,110 @@ fn v8_release_unused_v8_concurrent_preserves_ledger_invariant() {
         "ledger invariant sum(worker_grants) == packed_granted after concurrent churn"
     );
 }
+
+/// #4260 (hb166 R-3) — v8 epoch seqlock writer/reader ordering.
+///
+/// The rotation winner (`maybe_rotate_epoch_v8`) now issues a
+/// `fence(Ordering::Release)` immediately after the EVEN→ODD claim CAS so
+/// the Relaxed payload stores are published AFTER the ODD claim becomes
+/// visible. That is the writer half of the #1643 reader `fence(Acquire)`;
+/// together they close the #1619 cross-epoch tearing window.
+///
+/// This test drives many concurrent snapshots against a single rotating
+/// writer and asserts a CROSS-FIELD invariant that a torn snapshot would
+/// violate. All rotations here happen at `now_ns = k*EPOCH`, which
+/// publishes `grace = now_ns + EPOCH/2` and `tag = k` from the SAME
+/// rotation, so any consistent snapshot MUST satisfy
+/// `grace == tag*EPOCH + EPOCH/2`. A reader that paired a fresh `tag`
+/// with a stale `grace` (or vice-versa — a torn cross-epoch read) breaks
+/// the equality.
+///
+/// NOTE: x86-TSO does not reorder plain stores, so on the CI host this
+/// test cannot deterministically REPRODUCE the tear — it passes with and
+/// without the writer fence there. It is a structural ordering-correctness
+/// guard plus executable documentation of the invariant: on a weakly-
+/// ordered CPU (ARM/POWER), or under a loom model, the missing-fence
+/// writer would let this equality fail. The crate carries no loom
+/// dependency, so this contention test is the available regression
+/// surface for the writer half.
+#[test]
+fn v8_epoch_seqlock_snapshot_never_tears_tag_grace() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    const MAX_WORKER_ID: usize = 3;
+    // rate_bytes / burst are irrelevant to the tag/grace invariant; any
+    // v8 lease rotates on the same schedule.
+    let lease = Arc::new(SharedCoSQueueLease::new_v8(
+        100_000_000,
+        64 * 1024,
+        MAX_WORKER_ID + 1,
+        MAX_WORKER_ID,
+    ));
+
+    const ROTATIONS: u64 = 4_000;
+    // The writer's last-rotated now_ns, published for the readers. 0 =
+    // "no rotation yet".
+    let clock = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Reader threads: pure snapshots (no rotation) racing the writer's
+    // payload publish. Each verifies the tag/grace invariant.
+    let mut readers = Vec::new();
+    for worker_id in 0..=MAX_WORKER_ID {
+        let lease = Arc::clone(&lease);
+        let clock = Arc::clone(&clock);
+        let stop = Arc::clone(&stop);
+        readers.push(std::thread::spawn(move || -> u64 {
+            let mut checked: u64 = 0;
+            while !stop.load(AtomicOrdering::Relaxed) {
+                if clock.load(AtomicOrdering::Relaxed) == 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                // Pure seqlock read — snapshot_epoch_v8 does NOT rotate.
+                if let Some((_cap, _share, grace, tag)) = lease.test_snapshot_epoch_v8(worker_id) {
+                    if tag >= 1 {
+                        let expected = tag as u64 * EPOCH_DURATION_NS + EPOCH_DURATION_NS / 2;
+                        assert_eq!(
+                            grace, expected,
+                            "torn seqlock snapshot: tag {} paired with grace \
+                             {} (expected {}) — writer publish ordering broken",
+                            tag, grace, expected,
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            checked
+        }));
+    }
+
+    // Single writer: the ONLY rotation driver, stepping the clock one
+    // epoch per iteration so rotation k lands at now_ns = k*EPOCH with
+    // tag == k and grace == k*EPOCH + EPOCH/2.
+    for k in 1..=ROTATIONS {
+        let now = k * EPOCH_DURATION_NS;
+        // acquire_v8 runs maybe_rotate_epoch_v8(now) then the snapshot.
+        let _ = lease.acquire_v8(0, now, 1);
+        clock.store(now, AtomicOrdering::Relaxed);
+    }
+    stop.store(true, AtomicOrdering::Relaxed);
+
+    let total_checked: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(
+        total_checked > 0,
+        "readers must have validated at least one snapshot (test not vacuous)"
+    );
+
+    // Writer completed all rotations: final tag == ROTATIONS.
+    let (_c, _s, grace, tag) = lease
+        .test_snapshot_epoch_v8(0)
+        .expect("final snapshot must succeed with no concurrent writer");
+    assert_eq!(tag as u64, ROTATIONS, "writer must reach the final epoch");
+    assert_eq!(
+        grace,
+        ROTATIONS * EPOCH_DURATION_NS + EPOCH_DURATION_NS / 2,
+        "final grace must match the final epoch's tag",
+    );
+}
