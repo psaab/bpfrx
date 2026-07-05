@@ -1,3 +1,20 @@
+## 2026-07-04 — hb166 V-12: minor CoS harness cleanups
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-12 grouped minor notes. (1) Deleted dead
+  _last_n_sum_bps from mouse_latency_orchestrate.py (no callers). (2)
+  Documented in iperf3_sum_parse.py that the non-end-anchored [SUM] regex
+  also matches warmup (omitted) rows — current callers safe (no -O), a
+  future -O consumer must filter them. (3) Added a comment at the
+  fairness_equal_flow_capture.py fail-closed raise explaining the
+  deliberate posture (one bad scrape fails the reduction; kept, not
+  loosened). (4) Documented the fairness-cos-class-sweep.sh scrape-cadence
+  drift (serial max-time-1 curl + sleep 1 → ~2s under load) and noted ts
+  is captured at scrape START so windowing stays correct. Closes #4249.
+- **File(s)**: test/incus/mouse_latency_orchestrate.py,
+  test/incus/iperf3_sum_parse.py, test/incus/fairness_equal_flow_capture.py,
+  test/incus/fairness-cos-class-sweep.sh, _Log.md
+
 ## 2026-07-04 — hb166 V-8: surplus give-back handback series cross-checks
 
 - **Timestamp**: 2026-07-04
