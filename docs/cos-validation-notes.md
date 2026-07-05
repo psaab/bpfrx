@@ -509,7 +509,7 @@ show class-of-service interface reth0.80
   ...
   Waterfill:                epochs=412 phase1_budget_breaks=9 min_epochs_per_worker=3
     Queue 5 ...
-           Waterfill:    phase1_admit=0  phase2_admit=512  eligible_visits=540
+           Waterfill:    phase1_admit=0  phase2_admit=512  eligible_visits=540  phase1_no_progress=44
 ```
 
 Per-queue (a queue has ONE owner worker, so the row reflects that
@@ -519,6 +519,13 @@ worker):
   (small-first honored) vs Phase-2 (descending residual) walk.
 - `eligible_visits` — times the selector reached this queue eligible and
   evaluated it (both phases, BEFORE the token gate).
+- `phase1_no_progress` (hb166 T-2) — times Phase 1 HONORED this queue but
+  it made ZERO TX progress, so the budget debit and the honored bit were
+  refunded. Climbing here while `phase1_admit` stays flat on a backlogged
+  small class = TX-ring pressure eating the guarantee pass (the
+  #1630/#4256 mid-rate-residual signal). It is the direct counterpart to
+  `phase1_admit`: `phase1_admit` counts Phase-1 visits that made TX
+  progress, `phase1_no_progress` counts the ones that did not.
 
 Per-interface (summed across workers, except the MIN):
 
@@ -555,8 +562,9 @@ queue is `!runnable` and skipped at the eligibility gate, so it shows LOW
 idle).
 
 Prometheus: `xpf_userspace_cos_waterfill_phase1_admissions_total`,
-`..._phase2_admissions_total`, `..._eligible_visits_total` (per
-`{ifindex, queue_id}`); `xpf_userspace_cos_waterfill_epochs_total`,
+`..._phase2_admissions_total`, `..._eligible_visits_total`,
+`..._phase1_selected_no_progress_total` (per `{ifindex, queue_id}`);
+`xpf_userspace_cos_waterfill_epochs_total`,
 `..._phase1_budget_breaks_total`, and the gauge
 `xpf_userspace_cos_waterfill_min_epochs_per_worker` (per `{ifindex}`).
 

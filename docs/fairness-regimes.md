@@ -1264,7 +1264,12 @@ unit policy:
   counts the refunded no-progress visits (climbing there with flat
   `phase1_admissions` on a backlogged small class = TX-ring pressure
   eating the guarantee pass). A queue that DID transmit keeps its honor
-  consumed — no double-consume, no honor leak.
+  consumed — no double-consume, no honor leak. Both counters are
+  surfaced (#4262): `show class-of-service interface` renders
+  `phase1_no_progress` in the per-queue Waterfill row next to
+  `phase1_admit`, and Prometheus exports
+  `xpf_userspace_cos_waterfill_phase1_selected_no_progress_total` per
+  `{ifindex, queue_id}` (see docs/cos-validation-notes.md).
 
   **Claim-side work conservation (#1863, Path A-ii):** the per-class
   v8 lease that fuels the selector's token banks publishes a per-epoch
