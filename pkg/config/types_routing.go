@@ -273,6 +273,11 @@ type OSPFv3Interface struct {
 	Name          string
 	Passive       bool
 	Cost          int
+	HelloInterval int  // hello-interval in seconds, 0 = ospf6d default (10)
+	DeadInterval  int  // dead-interval in seconds, 0 = ospf6d default (40)
+	RetransmitInt int  // retransmit-interval in seconds, 0 = ospf6d default (5)
+	Priority      int  // DR-election priority (valid when HasPriority)
+	HasPriority   bool // priority explicitly set; 0 is a valid value ("never DR")
 	BFD           bool // enable BFD on this interface
 	BFDInterval   int  // BFD minimum-interval in ms (0 = default)
 	BFDMultiplier int  // BFD detect-multiplier (0 = default)
@@ -376,6 +381,11 @@ type OSPFInterface struct {
 	Passive       bool   // passive interface (no hello)
 	NoPassive     bool   // override passive-default (explicitly active)
 	Cost          int    // OSPF cost, 0 = default
+	HelloInterval int    // hello-interval in seconds, 0 = FRR default (10)
+	DeadInterval  int    // dead-interval (router-dead-interval) in seconds, 0 = FRR default (40)
+	RetransmitInt int    // retransmit-interval in seconds, 0 = FRR default (5)
+	Priority      int    // DR-election priority (valid when HasPriority)
+	HasPriority   bool   // priority explicitly set; 0 is a valid value ("never DR"), so a bare int cannot distinguish it from unset
 	NetworkType   string // "point-to-point", "broadcast", "" (default)
 	AuthType      string // "md5", "simple", "" (none)
 	AuthKey       Secret // authentication key/password; redacted on marshal (#2053)
@@ -409,6 +419,10 @@ type BGPConfig struct {
 type BGPNeighbor struct {
 	Address              string // peer IP
 	PeerAS               uint32
+	LocalAS              uint32 // per-peering local-as (FRR `neighbor X local-as`); 0 = inherit router AS
+	LocalAddress         string // BGP session source (FRR `neighbor X update-source`); "" = none
+	HoldTime             int    // hold-time in seconds (FRR `neighbor X timers <keepalive> <hold>`); 0 = FRR default (180)
+	Passive              bool   // do not initiate — wait for the peer (FRR `neighbor X passive`)
 	Description          string
 	MultihopTTL          int      // 0 = directly connected
 	Export               []string // export policies (route-map out): group default + per-neighbor override; last wins (most-specific)
