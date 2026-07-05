@@ -604,6 +604,18 @@ type Daemon struct {
 	// every subsystem.
 	bootstrapMode atomic.Bool
 
+	// emptyHANamingPending is the #4179 one-shot flag for the HA-guard
+	// EMPTY-config takeover. A node with /etc/xpf/node-id but no committed
+	// config resolves NOT-bootstrap (computeBootClass HA-node guard) and names
+	// its NICs with STANDALONE names at boot because the nil active config
+	// carries no cluster stanza (clusterMode=false). Set here so the FIRST
+	// non-empty config that arrives (a cluster SyncApply from the primary, or a
+	// local commit) re-runs startup naming with the config's real cluster
+	// identity — em0 + ge-<fpc>-0-X — instead of stranding the interfaces on
+	// standalone names until a daemon restart. Consumed once, then never again
+	// (a normal day-2 commit does not re-name).
+	emptyHANamingPending atomic.Bool
+
 	// proxyARPEnabled tracks the (interface name → enabled families) set the
 	// proxy-ARP/NDP responder sysctl was last enabled for (#2475). On each
 	// reconcile the daemon diffs the new desired set against this remembered

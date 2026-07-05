@@ -1,3 +1,67 @@
+## 2026-07-04 — #4178 / #4179 (fable-review-165 H-7 / H-10): interface-naming daemon bugs
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed two positional interface-naming defects. H-7
+    (#4178): the positional startup rename loop
+    (`enumerateAndRenameInterfaces`) was single-pass — it wrote a `.link`
+    file then let a later iteration's `recoverOriginalName` read that
+    just-overwritten file, and EEXIST renames were warn-and-continue with
+    no collision break. An enumeration shift (a NIC added at a lower PCI
+    bus) corrupted the `.link` `OriginalName=` chain and shifted
+    port↔zone bindings for a boot. H-10 (#4179): an HA node with
+    `/etc/xpf/node-id` but no committed config boots NOT in bootstrap
+    mode (HA-node guard) and names its NICs STANDALONE (nil active config
+    → clusterMode=false); startup naming never re-ran when the cluster
+    config arrived via config-sync, so the NICs kept wrong standalone
+    names (no `em0`, FPC 0 instead of the node's FPC) until a restart.
+  - **Fix H-7**: extracted the collision-safe two-pass rename into
+    `renamePositional` + a shared `breakNameCollisions` helper (used by
+    BOTH the positional path and device-map's `enumerateAndRenameMapped`,
+    de-duplicating the phase-1 collision break). Captures every
+    `OriginalName=` BEFORE any write, breaks target-name collisions via
+    `xpf-tmp-N`, then writes `.link` + renames to final. Refactored
+    device_map.go phase 1 to call the shared helper (behavior preserved
+    bit-for-bit incl. the AGY MEDIUM-3 leftover-temp guard and phase-3
+    stranded restore).
+  - **Fix H-10**: one-shot `emptyHANamingPending` atomic flag set in the
+    HA-guard EMPTY-takeover branch (`daemon_run.go`); the first non-empty
+    config to arrive re-runs startup naming via
+    `maybeReapplyConfigArrivalNaming` in `applyConfigLocked` (BEFORE the
+    reconcile), deriving cluster mode/nodeID from the ARRIVING config.
+    Mirrors bootstrap-exit re-naming but does NOT re-arm the dataplane
+    (node not in bootstrap). Extracted shared `namingParamsFromConfig`
+    + `applyStartupNamingForConfig`. Corrected the boot error text: no
+    restart required. Low-risk — the config-less node forwards no real
+    traffic yet (empty config at boot).
+  - **Test**: `linksetup_collision_4178_test.go` (enumeration-shift no
+    corruption, first-boot no temp renames, steady-state no churn) and
+    `config_arrival_naming_4179_test.go` (HA node re-names to cluster
+    node 1 / FPC 7, empty config does not consume the flag, normal node
+    never re-names). RED-on-revert PROVEN for both: single-pass revert
+    fails the H-7 corruption test (fxp0 stays on A, ge-0-0-0 empty);
+    no-op revert fails the H-10 re-naming test. `go test ./pkg/daemon/...`
+    green; `go build ./...`, gofmt, vet clean.
+  - **Review folds (PR #4182, Copilot)**: (1) REAL robustness bug —
+    maybeReapplyConfigArrivalNaming consumed the one-shot flag via CAS
+    BEFORE calling applyStartupNamingForConfig, so a transient naming
+    error stranded the config-less HA node on standalone names forever.
+    Restructured to Load()-gate, attempt naming, and Store(false) to
+    consume ONLY on success; on error the flag stays set + slog.Warn, so
+    the next config apply retries (bounded to once per commit; applies
+    serialized under d.applySem). New test
+    TestConfigArrivalRenamingRetriesOnFailure (fail-then-succeed);
+    RED-on-revert proven (consume-first fails it). (2) Test hermeticity —
+    newStoreDaemon now pins lifelineRecordFileForTest to a temp path so
+    resolveProtectedInterfaces does not read the host /etc/xpf lifeline
+    record. (3) Log-prefix threading — breakNameCollisions takes a
+    logPrefix param ("linksetup" | "device-map") so a device-map
+    collision logs "device-map:" not "linksetup:".
+  - **File(s)**: pkg/daemon/linksetup.go, pkg/daemon/device_map.go,
+    pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
+    pkg/daemon/daemon_apply.go,
+    pkg/daemon/linksetup_collision_4178_test.go,
+    pkg/daemon/config_arrival_naming_4179_test.go,
+    docs/critical-patterns.md, docs/bare-metal-device-map.md, _Log.md
 ## 2026-07-04 — #4180 (fable-review-165 H-22): deploy role validation ignored the guest virtio-first PCI tiebreaker — virtio-after-hardware silently swaps zones
 
 - **Timestamp**: 2026-07-04
