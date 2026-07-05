@@ -164,10 +164,12 @@ type CoSInterfaceUnit struct {
 }
 
 // CoSFairnessExpectation declares an opt-in RSS/workload expectation for
-// one egress CoS queue. Ifindex is used intentionally because the
-// userspace status snapshot reports the same kernel identity.
+// one egress CoS queue. Interface is the STABLE xpf interface name (e.g.
+// ge-0-0-2); the kernel ifindex it maps to is transient across
+// re-enumeration, so the name is resolved to the current ifindex at
+// evaluate time from the live status snapshot (#hb166 G-9).
 type CoSFairnessExpectation struct {
-	Ifindex        int
+	Interface      string
 	QueueID        uint8
 	RSSExpectation string
 }

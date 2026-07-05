@@ -340,41 +340,46 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	if fairnessNode := node.FindChild("fairness"); fairnessNode != nil {
 		if rssNode := fairnessNode.FindChild("rss-expectation"); rssNode != nil {
 			seen := make(map[string]string)
-			for _, ifindexNode := range rssNode.FindChildren("ifindex") {
-				if len(ifindexNode.Keys) < 2 {
+			// #hb166 G-9: rss-expectation is keyed by the STABLE xpf
+			// interface name (e.g. ge-0-0-2), not the transient kernel
+			// ifindex. The name is resolved to the current ifindex at
+			// evaluate time from the live status snapshot, so the
+			// expectation survives NIC re-enumeration.
+			for _, ifaceNode := range rssNode.FindChildren("interface") {
+				if len(ifaceNode.Keys) < 2 {
 					continue
 				}
-				ifindex, err := strconv.Atoi(ifindexNode.Keys[1])
-				if err != nil || ifindex <= 0 {
-					return fmt.Errorf("class-of-service fairness rss-expectation ifindex %q: expected positive integer", ifindexNode.Keys[1])
+				ifaceName := ifaceNode.Keys[1]
+				if ifaceName == "" {
+					return fmt.Errorf("class-of-service fairness rss-expectation interface: expected non-empty interface name")
 				}
-				for _, queueNode := range ifindexNode.FindChildren("queue") {
+				for _, queueNode := range ifaceNode.FindChildren("queue") {
 					if len(queueNode.Keys) < 2 {
 						continue
 					}
 					queue, err := strconv.Atoi(queueNode.Keys[1])
 					if err != nil || queue < 0 || queue > 255 {
-						return fmt.Errorf("class-of-service fairness rss-expectation ifindex %d queue %q: expected queue 0..255", ifindex, queueNode.Keys[1])
+						return fmt.Errorf("class-of-service fairness rss-expectation interface %s queue %q: expected queue 0..255", ifaceName, queueNode.Keys[1])
 					}
 					expr, err := collectCoSFairnessRSSExpectation(queueNode)
 					if err != nil {
-						return fmt.Errorf("class-of-service fairness rss-expectation ifindex %d queue %d: %w", ifindex, queue, err)
+						return fmt.Errorf("class-of-service fairness rss-expectation interface %s queue %d: %w", ifaceName, queue, err)
 					}
 					parsed, err := fairnesscontract.ParseRSSExpectation(expr)
 					if err != nil {
-						return fmt.Errorf("class-of-service fairness rss-expectation ifindex %d queue %d: %w", ifindex, queue, err)
+						return fmt.Errorf("class-of-service fairness rss-expectation interface %s queue %d: %w", ifaceName, queue, err)
 					}
-					key := fmt.Sprintf("%d/%d", ifindex, queue)
+					key := fmt.Sprintf("%s/%d", ifaceName, queue)
 					canonical := parsed.Canonical()
 					if existing, ok := seen[key]; ok {
 						if existing == canonical {
 							continue
 						}
-						return fmt.Errorf("class-of-service fairness rss-expectation ifindex %d queue %d: duplicate expectation %q conflicts with %q", ifindex, queue, canonical, existing)
+						return fmt.Errorf("class-of-service fairness rss-expectation interface %s queue %d: duplicate expectation %q conflicts with %q", ifaceName, queue, canonical, existing)
 					}
 					seen[key] = canonical
 					cos.FairnessExpectations = append(cos.FairnessExpectations, &CoSFairnessExpectation{
-						Ifindex:        ifindex,
+						Interface:      ifaceName,
 						QueueID:        uint8(queue),
 						RSSExpectation: canonical,
 					})
@@ -540,9 +545,20 @@ func mergeCoSInterfaceLevelInto(unit, level *CoSInterfaceUnit) {
 	}
 	if unit.ShapingRateBytes == 0 {
 		unit.ShapingRateBytes = level.ShapingRateBytes
-	}
-	if unit.BurstSizeBytes == 0 {
-		unit.BurstSizeBytes = level.BurstSizeBytes
+		// #hb166 G-10: burst-size is grammatically a child of
+		// shaping-rate (see parseCoSInterfaceUnitBody), so a shaper is a
+		// coupled (rate, burst) pair. Inherit the level burst-size ONLY
+		// when the unit is also inheriting the level's rate. A unit that
+		// overrides shaping-rate defines its own shaper; pairing the
+		// level burst with the unit rate would mismatch them (a level
+		// burst sized for a level rate applied to a different unit rate).
+		// When the override unit leaves burst unset it stays 0 and the
+		// dataplane applies its rate-independent COS_MIN_BURST_BYTES
+		// floor, consistent with a fresh unit that sets shaping-rate
+		// alone.
+		if unit.BurstSizeBytes == 0 {
+			unit.BurstSizeBytes = level.BurstSizeBytes
+		}
 	}
 	if unit.SchedulerMap == "" {
 		unit.SchedulerMap = level.SchedulerMap

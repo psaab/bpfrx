@@ -446,9 +446,9 @@ func TestCompileClassOfServiceBothBufferFieldsRejected(t *testing.T) {
 
 func TestCompileClassOfServiceFairnessRSSExpectations(t *testing.T) {
 	lines := []string{
-		"set class-of-service fairness rss-expectation ifindex 5 queue 4 balanced",
-		"set class-of-service fairness rss-expectation ifindex 5 queue 5 max-worker-flow-share 0.5",
-		"set class-of-service fairness rss-expectation ifindex 6 queue 7 cstruct-max 0.25",
+		"set class-of-service fairness rss-expectation interface ge-0/0/2 queue 4 balanced",
+		"set class-of-service fairness rss-expectation interface ge-0/0/2 queue 5 max-worker-flow-share 0.5",
+		"set class-of-service fairness rss-expectation interface ge-0/0/3 queue 7 cstruct-max 0.25",
 		"set system dataplane-type userspace",
 	}
 	tree := &ConfigTree{}
@@ -471,19 +471,19 @@ func TestCompileClassOfServiceFairnessRSSExpectations(t *testing.T) {
 	}
 	tests := []struct {
 		idx     int
-		ifindex int
+		iface   string
 		queueID uint8
 		expect  string
 	}{
-		{idx: 0, ifindex: 5, queueID: 4, expect: "balanced"},
-		{idx: 1, ifindex: 5, queueID: 5, expect: "max-worker-flow-share:0.5"},
-		{idx: 2, ifindex: 6, queueID: 7, expect: "cstruct-max:0.25"},
+		{idx: 0, iface: "ge-0/0/2", queueID: 4, expect: "balanced"},
+		{idx: 1, iface: "ge-0/0/2", queueID: 5, expect: "max-worker-flow-share:0.5"},
+		{idx: 2, iface: "ge-0/0/3", queueID: 7, expect: "cstruct-max:0.25"},
 	}
 	for _, tt := range tests {
 		row := got[tt.idx]
-		if row.Ifindex != tt.ifindex || row.QueueID != tt.queueID || row.RSSExpectation != tt.expect {
-			t.Fatalf("expectation[%d] = ifindex=%d queue=%d expectation=%q, want ifindex=%d queue=%d expectation=%q",
-				tt.idx, row.Ifindex, row.QueueID, row.RSSExpectation, tt.ifindex, tt.queueID, tt.expect)
+		if row.Interface != tt.iface || row.QueueID != tt.queueID || row.RSSExpectation != tt.expect {
+			t.Fatalf("expectation[%d] = interface=%s queue=%d expectation=%q, want interface=%s queue=%d expectation=%q",
+				tt.idx, row.Interface, row.QueueID, row.RSSExpectation, tt.iface, tt.queueID, tt.expect)
 		}
 	}
 }
@@ -491,8 +491,8 @@ func TestCompileClassOfServiceFairnessRSSExpectations(t *testing.T) {
 func TestCompileClassOfServiceFairnessRSSExpectationRejectsDuplicateConflict(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, line := range []string{
-		"set class-of-service fairness rss-expectation ifindex 5 queue 4 balanced",
-		"set class-of-service fairness rss-expectation ifindex 5 queue 4 cstruct-max 0.25",
+		"set class-of-service fairness rss-expectation interface ge-0/0/2 queue 4 balanced",
+		"set class-of-service fairness rss-expectation interface ge-0/0/2 queue 4 cstruct-max 0.25",
 	} {
 		path, err := ParseSetCommand(line)
 		if err != nil {
@@ -514,8 +514,8 @@ func TestCompileClassOfServiceFairnessRSSExpectationRejectsDuplicateConflict(t *
 func TestCompileClassOfServiceFairnessRSSExpectationSetDuplicateSameValueDedupes(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, line := range []string{
-		"set class-of-service fairness rss-expectation ifindex 5 queue 4 balanced",
-		"set class-of-service fairness rss-expectation ifindex 5 queue 4 balanced",
+		"set class-of-service fairness rss-expectation interface ge-0/0/2 queue 4 balanced",
+		"set class-of-service fairness rss-expectation interface ge-0/0/2 queue 4 balanced",
 	} {
 		path, err := ParseSetCommand(line)
 		if err != nil {
@@ -539,7 +539,7 @@ func TestCompileClassOfServiceFairnessRSSExpectationRejectsHierarchicalDuplicate
 class-of-service {
     fairness {
         rss-expectation {
-            ifindex 5 {
+            interface ge-0/0/2 {
                 queue 4 {
                     balanced;
                     balanced;
@@ -1834,5 +1834,148 @@ func TestCompileClassOfServicePerUnitStillWorks4021(t *testing.T) {
 	}
 	if ci.Units[0] == nil || ci.Units[0].SchedulerMap != "edge-map" {
 		t.Fatalf("per-unit scheduler-map = %#v, want edge-map", ci.Units[0])
+	}
+}
+
+// cosWarnings returns the compile warnings that mention class-of-service.
+func cosWarnings(cfg *Config) []string {
+	var out []string
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "class-of-service") {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// #hb166 G-6: a CoS binding on an interface that is NOT configured under
+// [interfaces] is a silent no-op (the dataplane applier only visits CoS
+// bindings that resolve against cfg.Interfaces). Commit must warn.
+// RED on revert: the warn validator never checks interface existence, so
+// no warning is emitted and the operator believes CoS is applied.
+func TestCompileClassOfServiceBindingNonexistentInterfaceWarnsHB166G6(t *testing.T) {
+	lines := []string{
+		// reth0 is shaped but never configured under [interfaces].
+		"set class-of-service interfaces reth0 unit 80 shaping-rate 3g",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	var found bool
+	for _, w := range cosWarnings(cfg) {
+		if strings.Contains(w, "interface reth0 is bound but not configured under [interfaces]") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an inert-CoS-binding warning for reth0; got %v", cosWarnings(cfg))
+	}
+}
+
+// #hb166 G-6: the interface exists but the bound logical unit does not.
+func TestCompileClassOfServiceBindingUnconfiguredUnitWarnsHB166G6(t *testing.T) {
+	lines := []string{
+		// ge-0/0/2 is configured with unit 0 only; the CoS binding targets
+		// unit 5 which is never configured.
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.1/24",
+		"set class-of-service interfaces ge-0/0/2 unit 5 shaping-rate 3g",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	var found bool
+	for _, w := range cosWarnings(cfg) {
+		if strings.Contains(w, "unit 5 is bound but unit 5 is not configured") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an inert-CoS-unit warning for ge-0/0/2 unit 5; got %v", cosWarnings(cfg))
+	}
+}
+
+// #hb166 G-6: a fully-configured interface + unit must NOT warn.
+func TestCompileClassOfServiceBindingConfiguredInterfaceNoWarnHB166G6(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.1/24",
+		"set class-of-service interfaces ge-0/0/2 unit 0 shaping-rate 3g",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	for _, w := range cosWarnings(cfg) {
+		if strings.Contains(w, "bound but not configured") || strings.Contains(w, "is bound but unit") {
+			t.Fatalf("configured interface/unit must not warn inert; got %q", w)
+		}
+	}
+}
+
+// #hb166 G-10: a unit that overrides shaping-rate but sets no burst-size
+// must NOT inherit the interface-level burst-size (a shaper is a coupled
+// (rate, burst) pair). RED on revert: mergeCoSInterfaceLevelInto inherits
+// level.BurstSizeBytes unconditionally, pairing a level burst with a unit
+// rate.
+func TestCompileClassOfServiceUnitRateOverrideDropsLevelBurstHB166G10(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.1/24",
+		// Interface-level shaper: 100m with an explicit 200000-byte burst.
+		"set class-of-service interfaces ge-0/0/2 shaping-rate 100m burst-size 200000",
+		// Unit overrides the rate to 1g and sets NO burst.
+		"set class-of-service interfaces ge-0/0/2 unit 0 shaping-rate 1g",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	u := cfg.ClassOfService.Interfaces["ge-0/0/2"].Units[0]
+	if u == nil {
+		t.Fatal("expected ge-0/0/2 unit 0")
+	}
+	if u.ShapingRateBytes != parseBandwidthLimit("1g") {
+		t.Fatalf("unit shaping-rate override lost: got %d, want %d", u.ShapingRateBytes, parseBandwidthLimit("1g"))
+	}
+	if u.BurstSizeBytes != 0 {
+		t.Fatalf("unit rate override must not inherit the level burst-size: got %d, want 0 (dataplane applies its rate-independent floor)", u.BurstSizeBytes)
+	}
+}
+
+// #hb166 G-10: a unit that inherits the rate (sets no shaping-rate) still
+// inherits BOTH the level rate and the level burst-size as a pair.
+func TestCompileClassOfServiceUnitInheritsLevelRateAndBurstHB166G10(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.1/24",
+		"set class-of-service interfaces ge-0/0/2 shaping-rate 100m burst-size 200000",
+		// Unit overrides only the scheduler-map; shaper inherits fully.
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service schedulers be-sched transmit-rate 5g",
+		"set class-of-service scheduler-maps m forwarding-class best-effort scheduler be-sched",
+		"set class-of-service interfaces ge-0/0/2 unit 0 scheduler-map m",
+		"set system dataplane-type userspace",
+	}
+	tree := buildCoSTree4021(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	u := cfg.ClassOfService.Interfaces["ge-0/0/2"].Units[0]
+	if u == nil {
+		t.Fatal("expected ge-0/0/2 unit 0")
+	}
+	if u.ShapingRateBytes != parseBandwidthLimit("100m") {
+		t.Fatalf("unit must inherit level rate: got %d, want %d", u.ShapingRateBytes, parseBandwidthLimit("100m"))
+	}
+	if u.BurstSizeBytes != parseBurstSizeLimit("200000") {
+		t.Fatalf("unit inheriting the rate must also inherit the level burst: got %d, want %d", u.BurstSizeBytes, parseBurstSizeLimit("200000"))
 	}
 }

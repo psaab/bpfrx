@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
@@ -24,12 +25,20 @@ type CoSFairnessRSSSummary struct {
 }
 
 type FairnessRSSExpectation struct {
-	Ifindex        int
+	Interface      string
 	QueueID        uint8
 	RSSExpectation string
 }
 
 type FairnessRSSExpectationResult struct {
+	Interface string
+	// Resolved reports whether Interface mapped to a live kernel ifindex
+	// in the evaluated status snapshot. When false, Ifindex is the zero
+	// value and callers that key on ifindex (e.g. Prometheus gauges) MUST
+	// skip the row — two distinct unresolved interface names on the same
+	// queue+kind would otherwise collapse to identical ifindex=0 labels
+	// and 500 the whole /metrics scrape (#hb166 F2).
+	Resolved            bool
 	Ifindex             int
 	QueueID             uint8
 	Expectation         string
@@ -195,12 +204,36 @@ func FairnessRSSExpectationsFromConfig(cfg *config.Config) []FairnessRSSExpectat
 			continue
 		}
 		out = append(out, FairnessRSSExpectation{
-			Ifindex:        row.Ifindex,
+			Interface:      row.Interface,
 			QueueID:        row.QueueID,
 			RSSExpectation: row.RSSExpectation,
 		})
 	}
 	return out
+}
+
+// fairnessInterfaceIfindexMap resolves stable interface names to the
+// current kernel ifindex from the live status snapshot. The mapping is
+// re-read every evaluation, so a name-keyed rss-expectation always tracks
+// the named interface across NIC re-enumeration (#hb166 G-9). Both the
+// CoS-interface list and the binding list are consulted so an interface
+// with active egress CoS queues resolves even if it carries no explicit
+// CoS shaping binding.
+func fairnessInterfaceIfindexMap(status ProcessStatus) map[string]int {
+	m := make(map[string]int)
+	for _, ci := range status.CoSInterfaces {
+		if ci.InterfaceName != "" && ci.Ifindex > 0 {
+			m[ci.InterfaceName] = ci.Ifindex
+		}
+	}
+	for _, b := range status.Bindings {
+		if b.Interface != "" && b.Ifindex > 0 {
+			if _, ok := m[b.Interface]; !ok {
+				m[b.Interface] = b.Ifindex
+			}
+		}
+	}
+	return m
 }
 
 func EvaluateFairnessRSSExpectations(
@@ -215,12 +248,19 @@ func EvaluateFairnessRSSExpectations(
 	for _, summary := range summaries {
 		byQueue[cosFairnessRSSKey{ifindex: summary.Ifindex, queueID: summary.QueueID}] = summary
 	}
+	// #hb166 G-9: resolve each expectation's stable interface name to its
+	// current kernel ifindex from THIS snapshot, so the queue lookup
+	// tracks the named interface even after NIC re-enumeration.
+	nameToIfindex := fairnessInterfaceIfindexMap(status)
 	out := make([]FairnessRSSExpectationResult, 0, len(expectations))
 	for _, expectation := range expectations {
 		parsed, err := fairnesscontract.ParseRSSExpectation(expectation.RSSExpectation)
-		key := cosFairnessRSSKey{ifindex: expectation.Ifindex, queueID: expectation.QueueID}
-		summary, ok := byQueue[key]
-		if !ok {
+		ifindex, resolved := nameToIfindex[expectation.Interface]
+		key := cosFairnessRSSKey{ifindex: ifindex, queueID: expectation.QueueID}
+		var summary CoSFairnessRSSSummary
+		if s, ok := byQueue[key]; ok && resolved {
+			summary = s
+		} else {
 			summary = summarizeCoSFairnessRSSDistribution(
 				key,
 				make([]uint32, boundedFairnessRSSWorkerSlots(status.Workers, 0)),
@@ -232,7 +272,19 @@ func EvaluateFairnessRSSExpectations(
 		kind := "invalid"
 		var value float64
 		hasValue := false
-		if err == nil {
+		if err != nil {
+			// parse error already captured in result.Reason
+		} else if !resolved {
+			// Named interface is not present in the current dataplane
+			// snapshot; report it rather than silently judging ifindex 0.
+			canonical = parsed.Canonical()
+			kind = parsed.MetricKind()
+			value, hasValue = parsed.MetricValue()
+			result = fairnesscontract.RSSExpectationResult{
+				Pass:   false,
+				Reason: fmt.Sprintf("interface %q not present in dataplane status", expectation.Interface),
+			}
+		} else {
 			canonical = parsed.Canonical()
 			kind = parsed.MetricKind()
 			value, hasValue = parsed.MetricValue()
@@ -244,7 +296,9 @@ func EvaluateFairnessRSSExpectations(
 			)
 		}
 		out = append(out, FairnessRSSExpectationResult{
-			Ifindex:             expectation.Ifindex,
+			Interface:           expectation.Interface,
+			Resolved:            resolved,
+			Ifindex:             ifindex,
 			QueueID:             expectation.QueueID,
 			Expectation:         canonical,
 			ExpectationKind:     kind,
@@ -258,8 +312,8 @@ func EvaluateFairnessRSSExpectations(
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Ifindex != out[j].Ifindex {
-			return out[i].Ifindex < out[j].Ifindex
+		if out[i].Interface != out[j].Interface {
+			return out[i].Interface < out[j].Interface
 		}
 		if out[i].QueueID != out[j].QueueID {
 			return out[i].QueueID < out[j].QueueID

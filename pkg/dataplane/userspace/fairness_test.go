@@ -80,8 +80,14 @@ func TestBoundedFairnessRSSWorkerSlots(t *testing.T) {
 }
 
 func TestEvaluateFairnessRSSExpectationsFailsMissingQueue(t *testing.T) {
-	results := EvaluateFairnessRSSExpectations(ProcessStatus{Workers: 4}, []FairnessRSSExpectation{
-		{Ifindex: 80, QueueID: 4, RSSExpectation: "max-worker-flow-share:0.5"},
+	// The interface resolves (present in the snapshot) but has no active
+	// flows on the queue → "no active flows observed".
+	status := ProcessStatus{
+		Workers:  4,
+		Bindings: []BindingStatus{{Interface: "ge-0-0-2", Ifindex: 80}},
+	}
+	results := EvaluateFairnessRSSExpectations(status, []FairnessRSSExpectation{
+		{Interface: "ge-0-0-2", QueueID: 4, RSSExpectation: "max-worker-flow-share:0.5"},
 	})
 	if len(results) != 1 {
 		t.Fatalf("EvaluateFairnessRSSExpectations returned %d rows, want 1", len(results))
@@ -89,7 +95,69 @@ func TestEvaluateFairnessRSSExpectationsFailsMissingQueue(t *testing.T) {
 	if results[0].Pass {
 		t.Fatalf("missing queue expectation passed: %+v", results[0])
 	}
+	if results[0].Ifindex != 80 {
+		t.Fatalf("resolved ifindex = %d, want 80", results[0].Ifindex)
+	}
 	if !strings.Contains(results[0].Reason, "no active flows observed") {
 		t.Fatalf("missing queue reason = %q, want no active flows observed", results[0].Reason)
+	}
+}
+
+// #hb166 G-9: an rss-expectation keyed by a STABLE interface name must
+// track the named interface across NIC re-enumeration. When the kernel
+// ifindex of "ge-0-0-2" changes from 80 to 91 between snapshots, the
+// expectation must resolve to the CURRENT ifindex (91) and evaluate the
+// distribution reported under 91 — not the stale 80. RED on revert: the
+// pre-fix ifindex-keyed config baked in the ifindex and would judge
+// whichever interface now holds 80 (here, none), or the wrong port.
+func TestEvaluateFairnessRSSExpectationsNameKeyedSurvivesReenumeration(t *testing.T) {
+	// After re-enumeration ge-0-0-2 is ifindex 91 and carries a balanced
+	// 2-worker distribution; ifindex 80 now belongs to a different port
+	// (ge-0-0-1) with a single-worker (skewed) distribution.
+	status := ProcessStatus{
+		Workers: 2,
+		Bindings: []BindingStatus{
+			{Interface: "ge-0-0-2", Ifindex: 91},
+			{Interface: "ge-0-0-1", Ifindex: 80},
+		},
+		CoSActiveFlowCounts: []CoSActiveFlowCountStatus{
+			// ge-0-0-2 (ifindex 91): balanced across two workers, 10 flows.
+			{Ifindex: 91, QueueID: 4, WorkerID: 0, ActiveFlowCount: 5},
+			{Ifindex: 91, QueueID: 4, WorkerID: 1, ActiveFlowCount: 5},
+			// ge-0-0-1 (ifindex 80): all 7 flows on one worker (skewed).
+			{Ifindex: 80, QueueID: 4, WorkerID: 0, ActiveFlowCount: 7},
+		},
+	}
+	results := EvaluateFairnessRSSExpectations(status, []FairnessRSSExpectation{
+		{Interface: "ge-0-0-2", QueueID: 4, RSSExpectation: "balanced"},
+	})
+	if len(results) != 1 {
+		t.Fatalf("results len = %d, want 1: %+v", len(results), results)
+	}
+	if results[0].Ifindex != 91 {
+		t.Fatalf("resolved ifindex = %d, want 91 (re-enumerated ge-0-0-2)", results[0].Ifindex)
+	}
+	if !results[0].Pass {
+		t.Fatalf("balanced expectation on ge-0-0-2 (ifindex 91) failed: %+v", results[0])
+	}
+	if results[0].ActiveFlows != 10 {
+		t.Fatalf("evaluated the wrong interface: active flows = %d, want 10 (ge-0-0-2)", results[0].ActiveFlows)
+	}
+}
+
+// #hb166 G-9: a name that is not present in the current dataplane
+// snapshot is reported explicitly instead of silently judging ifindex 0.
+func TestEvaluateFairnessRSSExpectationsUnresolvedInterface(t *testing.T) {
+	results := EvaluateFairnessRSSExpectations(ProcessStatus{Workers: 4}, []FairnessRSSExpectation{
+		{Interface: "ge-9-9-9", QueueID: 4, RSSExpectation: "balanced"},
+	})
+	if len(results) != 1 {
+		t.Fatalf("results len = %d, want 1", len(results))
+	}
+	if results[0].Pass {
+		t.Fatalf("unresolved interface passed: %+v", results[0])
+	}
+	if !strings.Contains(results[0].Reason, "not present in dataplane status") {
+		t.Fatalf("unresolved reason = %q, want not present in dataplane status", results[0].Reason)
 	}
 }

@@ -2017,6 +2017,9 @@ func TestEmitFairnessRSSExpectationGauges(t *testing.T) {
 	}
 	status := dpuserspace.ProcessStatus{
 		Workers: 4,
+		Bindings: []dpuserspace.BindingStatus{
+			{Interface: "reth0", Ifindex: 80},
+		},
 		CoSActiveFlowCounts: []dpuserspace.CoSActiveFlowCountStatus{
 			{Ifindex: 80, QueueID: 4, WorkerID: 0, ActiveFlowCount: 3},
 			{Ifindex: 80, QueueID: 4, WorkerID: 1, ActiveFlowCount: 1},
@@ -2032,9 +2035,9 @@ func TestEmitFairnessRSSExpectationGauges(t *testing.T) {
 	ch := make(chan prometheus.Metric)
 	go func() {
 		c.emitFairnessRSSExpectationGauges(ch, status, []dpuserspace.FairnessRSSExpectation{
-			{Ifindex: 80, QueueID: 4, RSSExpectation: "balanced"},
-			{Ifindex: 80, QueueID: 5, RSSExpectation: "balanced"},
-			{Ifindex: 80, QueueID: 6, RSSExpectation: "cstruct-max:0.25"},
+			{Interface: "reth0", QueueID: 4, RSSExpectation: "balanced"},
+			{Interface: "reth0", QueueID: 5, RSSExpectation: "balanced"},
+			{Interface: "reth0", QueueID: 6, RSSExpectation: "cstruct-max:0.25"},
 		})
 		close(ch)
 	}()
@@ -2057,6 +2060,74 @@ func TestEmitFairnessRSSExpectationGauges(t *testing.T) {
 	assertGaugeClose(t, got, c.fairnessRSSExpectation, labelsQ6, 1)
 	assertGaugeClose(t, got, c.fairnessRSSExpectationValue, labelsQ6, 0.25)
 	assertGaugeClose(t, got, c.fairnessRSSSkewViolation, labelsQ6, 1)
+}
+
+// fairnessExpectationCollector adapts emitFairnessRSSExpectationGauges to
+// the prometheus.Collector interface so a real registry Gather() runs the
+// same duplicate-label detection the live /metrics scrape does.
+type fairnessExpectationCollector struct {
+	c            *xpfCollector
+	status       dpuserspace.ProcessStatus
+	expectations []dpuserspace.FairnessRSSExpectation
+}
+
+func (fc fairnessExpectationCollector) Describe(chan<- *prometheus.Desc) {}
+
+func (fc fairnessExpectationCollector) Collect(ch chan<- prometheus.Metric) {
+	fc.c.emitFairnessRSSExpectationGauges(ch, fc.status, fc.expectations)
+}
+
+// #hb166 F2: two rss-expectations for two DISTINCT interface names on the
+// same queue+kind are both valid config (the dedup key is
+// interface/queue). When BOTH are unresolved (their names are absent from
+// the dataplane status snapshot) they resolve to ifindex 0, so emitting
+// the Prometheus gauge for both would produce two identical
+// (ifindex="0", queue_id, kind) label sets — a duplicate-metric error
+// that Gather() turns into an HTTP 500 for the ENTIRE /metrics endpoint.
+// The fix skips unresolved rows. RED on revert: without the skip both
+// rows emit ifindex=0 and Gather() fails.
+func TestEmitFairnessRSSExpectationGaugesUnresolvedNoDuplicateLabels(t *testing.T) {
+	c := &xpfCollector{
+		fairnessRSSExpectation: prometheus.NewDesc(
+			"xpf_fairness_rss_expectation_configured",
+			"test desc",
+			[]string{"ifindex", "queue_id", "kind"},
+			nil,
+		),
+		fairnessRSSExpectationValue: prometheus.NewDesc(
+			"xpf_fairness_rss_expectation_value",
+			"test desc",
+			[]string{"ifindex", "queue_id", "kind"},
+			nil,
+		),
+		fairnessRSSSkewViolation: prometheus.NewDesc(
+			"xpf_fairness_rss_skew_violation",
+			"test desc",
+			[]string{"ifindex", "queue_id", "kind"},
+			nil,
+		),
+	}
+	// No Bindings / CoSInterfaces: both interface names are unresolved.
+	status := dpuserspace.ProcessStatus{Workers: 4}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(fairnessExpectationCollector{
+		c:      c,
+		status: status,
+		expectations: []dpuserspace.FairnessRSSExpectation{
+			{Interface: "ge-0-0-2", QueueID: 4, RSSExpectation: "balanced"},
+			{Interface: "ge-0-0-9", QueueID: 4, RSSExpectation: "balanced"},
+		},
+	})
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather failed — unresolved rss-expectations collide on ifindex=0 and 500 the whole /metrics scrape: %v", err)
+	}
+	for _, fam := range families {
+		if len(fam.GetMetric()) != 0 {
+			t.Fatalf("unresolved rss-expectations must emit no Prometheus gauge, got %d metric(s) for %s",
+				len(fam.GetMetric()), fam.GetName())
+		}
+	}
 }
 
 func TestEmitFairnessEqualFlowEstimateGauges(t *testing.T) {

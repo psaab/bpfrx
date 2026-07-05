@@ -2337,6 +2337,58 @@ reserved for whole-dataplane selection where a rewrite shim
   `reservations` render, **dotted/uppercase MAC canonicalization**,
   no-binding omits the key).
 
+### #4217/#4218/#4219/#4220 — CoS interface-binding + scheduler typed leaves (fable-review-166 G-3/G-4/G-5/G-1)
+
+Four class-of-service config-schema gaps where a leaf was untyped,
+missing, or inert. All four are typed in `schema_cos.go` (shared
+constructors `cosShapingRateSchema` / `cosOversubscriptionPolicySchema` /
+`cosPriorityLowMinShareSchema` keep the unit level and the #4021
+interface level identical), so garbage HARD-REJECTS at commit instead of
+compiling to a silent 0.
+
+- **#4217 (G-4) `shaping-rate` / `burst-size`.** Both untyped, so `set
+  class-of-service interfaces reth0 unit 80 shaping-rate 10gg` committed:
+  `parseBandwidthLimit("10gg")` returns 0, the compiler reads 0 as
+  "unset", and the root shaper silently disappeared (unshaped ~25G
+  egress). `shaping-rate` is a CONTAINER (it carries the `burst-size`
+  child), so it uses the typed-KEY-slot feature (`keyValueType:
+  ValueRate`, `keyValidator: ValidateRate`) — NOT `valueType`, which
+  would flip the walker into the typed-LEAF branch and mis-treat
+  `burst-size` as a presence-only modifier. `burst-size` is a plain typed
+  value leaf (`ValueByteSize` / `ValidateByteSize`); bare-integer
+  burst-size is now rejected as ambiguous (same tightening `buffer-size`
+  got in #1319).
+- **#4218 (G-3) `codel-target`.** Absent from `setSchema`, so no
+  completion and `codel-target banana` was silently dropped by the
+  compiler's `err == nil` parse guard. Now a typed `ValueInteger` /
+  `ValidateIntegerMin(0)` leaf under `schedulers`. The CoDel AQM is still
+  NOT enforced (#1829 Phase 2 PLAN-KILLED), so a commit warning fires
+  when `CodelTargetNS > 0` (`compiler_validate_warn.go` scheduler loop).
+- **#4219 (G-5) `oversubscription-policy` / `priority-low-min-share`.**
+  Both absent from `setSchema` — no completion, no validation, unknown
+  policy strings committing. `oversubscription-policy` is now a container
+  `{ guarantee-rate <fraction 0..1> | proportional }` (adding it to the
+  schema changes SetPath grouping flat→hierarchical; the compiler already
+  handled both shapes). The guarantee-rate fraction is validated
+  `ValidatePercent(0,1)`, so `1.7` is rejected at commit instead of
+  silently clamping to 1.0. `priority-low-min-share` is `ValueRate` /
+  `ValidateRate`.
+- **#4220 (G-1) `priority-low-min-share` truth-in-labeling.** The knob is
+  INERT — it is wire-surface-only and no scheduler code consults it (the
+  `cap_eff` per-pass reservation does not exist). The typed leaf + commit
+  warning (`compiler_validate_warn.go` interface loop) surface the
+  inertness; a misleading `queue_service/mod.rs` comment that cited a
+  nonexistent `cap_eff` subtraction is corrected, and
+  `docs/fairness-regimes.md` gate 2 is marked DEFERRED/NOT-IMPLEMENTED.
+  The ENFORCEMENT (cap_eff reservation) is a separate deferred-research
+  item, out of scope here.
+
+Regression coverage: `pkg/config/schema_cos_hb166_test.go` (flat-set
+schema reject-on-garbage for all four, valid-value accept, the two inert
+warnings, and completion presence of the new leaves at unit + interface
+level). FAIL-ON-REVERT: dropping the validators / warnings makes the
+garbage values commit clean again and the inert knobs go silent.
+
 ### #3043 — Security-policy missing/conflicting terminal action (commit fail-closed)
 
 `PolicyAction`'s zero value is `PolicyPermit` (`types_security.go`:

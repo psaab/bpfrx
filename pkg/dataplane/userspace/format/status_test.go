@@ -554,6 +554,9 @@ func TestFormatStatusSummarySaturatesCoSAdmissionAttribution(t *testing.T) {
 func TestFormatFairnessRSS(t *testing.T) {
 	status := userspace.ProcessStatus{
 		CoSActiveFlowCountsTruncated: true,
+		Bindings: []userspace.BindingStatus{
+			{Interface: "reth0", Ifindex: 80},
+		},
 		CoSActiveFlowCounts: []userspace.CoSActiveFlowCountStatus{
 			{Ifindex: 80, QueueID: 4, WorkerID: 0, ActiveFlowCount: 1},
 			{Ifindex: 80, QueueID: 4, WorkerID: 1, ActiveFlowCount: 3},
@@ -564,8 +567,8 @@ func TestFormatFairnessRSS(t *testing.T) {
 	}
 
 	out := FormatFairnessRSS(status, []userspace.FairnessRSSExpectation{
-		{Ifindex: 80, QueueID: 4, RSSExpectation: "balanced"},
-		{Ifindex: 80, QueueID: 5, RSSExpectation: "max-worker-flow-share:50%"},
+		{Interface: "reth0", QueueID: 4, RSSExpectation: "balanced"},
+		{Interface: "reth0", QueueID: 5, RSSExpectation: "max-worker-flow-share:50%"},
 	})
 	for _, want := range []string{
 		"Userspace fairness RSS structure:",
@@ -577,9 +580,11 @@ func TestFormatFairnessRSS(t *testing.T) {
 		"80       4       4           2             0.577350   75.00%",
 		"80       5       4           2             0.000000   50.00%",
 		"RSS expectations:",
-		"80       4       balanced                     false",
+		"Interface",
+		"reth0",
+		"balanced                     false",
 		"balanced: active_workers=2 expected",
-		"80       5       max-worker-flow-share:0.5    true",
+		"max-worker-flow-share:0.5    true",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("fairness output missing %q:\n%s", want, out)
@@ -588,14 +593,19 @@ func TestFormatFairnessRSS(t *testing.T) {
 }
 
 func TestFormatFairnessRSSShowsExpectationsWithoutRows(t *testing.T) {
-	out := FormatFairnessRSS(userspace.ProcessStatus{Workers: 4}, []userspace.FairnessRSSExpectation{
-		{Ifindex: 80, QueueID: 4, RSSExpectation: "cstruct-max:0.25"},
+	status := userspace.ProcessStatus{
+		Workers:  4,
+		Bindings: []userspace.BindingStatus{{Interface: "reth0", Ifindex: 80}},
+	}
+	out := FormatFairnessRSS(status, []userspace.FairnessRSSExpectation{
+		{Interface: "reth0", QueueID: 4, RSSExpectation: "cstruct-max:0.25"},
 	})
 	for _, want := range []string{
 		"Userspace fairness RSS structure:",
 		"  none",
 		"RSS expectations:",
-		"80       4       cstruct-max:0.25",
+		"reth0",
+		"cstruct-max:0.25",
 		"false",
 		"cstruct-max: no active flows observed",
 	} {

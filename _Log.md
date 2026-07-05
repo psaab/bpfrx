@@ -1,3 +1,42 @@
+## 2026-07-04 — #4217 / #4218 / #4219 / #4220 (fable-review-166 G-4 / G-3 / G-5 / G-1): CoS config-schema typing
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Typed four class-of-service config-schema leaves that
+    were untyped/missing/inert so garbage HARD-REJECTS at commit instead
+    of compiling to a silent 0, and added accepted-but-inert commit
+    warnings for the two knobs the dataplane does not enforce. G-4
+    (#4217): `shaping-rate` typed via the container `keyValidator`
+    (ValueRate — it carries the burst-size child, so `valueType` would
+    mis-treat burst-size as a modifier) + `burst-size` ValueByteSize, at
+    both unit and #4021 interface level; before this `shaping-rate 10gg`
+    committed as 0 and the root shaper vanished (unshaped ~25G). G-3
+    (#4218): typed `codel-target` (ValueInteger/ValidateIntegerMin(0)) +
+    a commit warning when CodelTargetNS>0 (CoDel AQM never shipped,
+    #1829 Phase 2 PLAN-KILLED). G-5 (#4219): added
+    `oversubscription-policy` (container `{ guarantee-rate <frac 0..1> |
+    proportional }`, fraction validated ValidatePercent(0,1) so 1.7 is
+    rejected not clamped) + `priority-low-min-share` (ValueRate) at unit
+    + interface level. G-1 (#4220): priority-low-min-share is INERT
+    (wire-surface only; no cap_eff reservation) — added a commit
+    warning, corrected the misleading `queue_service/mod.rs` comment
+    that cited a nonexistent cap_eff subtraction, and marked
+    fairness-regimes.md gate 2 DEFERRED/NOT-IMPLEMENTED. Enforcement
+    (cap_eff) is separate deferred research, out of scope.
+  - **File(s)**: pkg/config/schema_cos.go (typed leaves + 3 shared
+    constructors), pkg/config/compiler_validate_warn.go (codel-target +
+    priority-low-min-share inert warnings),
+    pkg/config/schema_cos_hb166_test.go (new RED-on-revert tests),
+    pkg/config/schema_validate_test.go (repointed the "untyped leaf
+    ignored" test off now-typed shaping-rate/burst-size onto the
+    still-untyped classifiers dscp reference),
+    userspace-dp/src/afxdp/cos/queue_service/mod.rs (comment fix),
+    docs/config-schema.md, docs/cos-traffic-shaping.md (+ fixed a buggy
+    two-line shaping-rate/burst-size example), docs/cos-wan-sqm.md,
+    docs/fairness-regimes.md.
+  - **Validation**: `go test ./pkg/config/...` green; `go build ./...`;
+    gofmt + `go vet ./pkg/config/...` clean. RED-on-revert proven: with
+    the validators removed the shaping-rate/burst-size/codel-target
+    garbage values commit clean again.
 ## 2026-07-04 — #4214 / #4215 (fable-review-165 H-5 / H-13): publish default-deny sweep + per-channel latest.json gate
 
 - **Timestamp**: 2026-07-04
@@ -34364,3 +34403,44 @@ top.
   userspace-dp/src/afxdp/forwarding_build/cos.rs,
   userspace-dp/src/afxdp/forwarding_build/tests.rs,
   docs/config-schema.md, docs/cos-traffic-shaping.md, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 CoS correctness — G-6 (warn on inert CoS binding to
+  unconfigured interface/unit), G-9 (name-key `fairness rss-expectation`,
+  resolve name->ifindex at evaluate time from the live snapshot so it
+  survives NIC re-enumeration; Prometheus label stays ifindex-keyed with
+  the resolved id), G-10 (a unit `shaping-rate` override no longer
+  inherits the interface-level `burst-size` — burst inheritance moved
+  inside the rate-inheritance block; override units fall back to the
+  dataplane `COS_MIN_BURST_BYTES` floor). Issues #4221/#4222/#4223.
+  Go-only, no Rust/cargo, no wire change. RED-on-revert proven for all
+  three (G-6 no warning; G-9 stale-ifindex judges wrong interface; G-10
+  inherits mismatched 200000 burst).
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_class_of_service.go, pkg/config/types_cos.go,
+  pkg/config/schema_cos.go, pkg/config/parser_class_of_service_test.go,
+  pkg/dataplane/userspace/fairness.go,
+  pkg/dataplane/userspace/fairness_test.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/dataplane/userspace/format/status_test.go,
+  pkg/api/metrics_test.go, test/incus/sqm-cookbook-config.set,
+  docs/per-5-tuple/state.md, docs/cos-traffic-shaping.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 F2 fold — the G-9 ifindex->name re-key introduced a
+  duplicate-Prometheus-label regression: an UNRESOLVED rss-expectation
+  emitted its gauge with ifindex=0, so two distinct unresolved interface
+  names on the same queue+kind (both valid config under the new
+  interface/queue dedup key) collapsed to identical (ifindex=0,queue,kind)
+  labels -> Gather() duplicate error -> HTTP 500 across the WHOLE /metrics
+  endpoint. Fix: add `Resolved bool` to FairnessRSSExpectationResult (true
+  only when the name mapped to a live ifindex) and skip unresolved rows in
+  emitFairnessRSSExpectationGauges. The `show ... fairness` text path keeps
+  reporting the unresolved reason (no uniqueness constraint). New api test
+  Gathers a real registry with two distinct unresolved names on the same
+  queue+kind and asserts no duplicate/500 (RED on revert). Also rebased on
+  origin/master (#4224 CoS schema typing): reconciled schema_cos.go (rss
+  interface node + #4224 shaping-rate typing both kept) and
+  compiler_validate_warn.go (G-6 warns + #4224 priority-low-min-share warns
+  both kept), unioned _Log.md + cos-traffic-shaping.md.
+- **File(s)**: pkg/dataplane/userspace/fairness.go,
+  pkg/api/metrics_userspace.go, pkg/api/metrics_test.go, _Log.md

@@ -93,6 +93,22 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			}),
 			children: nil,
 		},
+		// #1614 A3 CoDel AQM target queue delay in milliseconds. The
+		// value is typed so `codel-target banana` is REJECTED at commit
+		// (the compiler otherwise swallows the parse error and drops the
+		// value silently), but the AQM itself is NOT enforced — #1829
+		// Phase 2 was PLAN-KILLED. A commit warning
+		// (compiler_validate_warn.go CoS scheduler loop) surfaces the
+		// inertness when CodelTargetNS>0 (#4218).
+		"codel-target": {
+			desc:          "CoDel AQM target queue delay in milliseconds (accepted for Junos compatibility; AQM not yet enforced by the userspace dataplane)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "CoDel target queue delay in milliseconds (non-negative integer; AQM not yet enforced)",
+			valueExamples: []string{"5", "10"},
+			validator:     ValidateIntegerMin(0),
+			children:      nil,
+		},
 	}},
 	"scheduler-maps": {desc: "Scheduler map assigning schedulers to forwarding classes", args: 1, multi: true, placeholder: "<map-name>", children: map[string]*schemaNode{
 		"forwarding-class": {desc: "Forwarding class entry in this map", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
@@ -108,10 +124,10 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", children: map[string]*schemaNode{
 				"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 			}},
-			"shaping-rate": {desc: "Shaping rate for this unit in bits per second (k/m/g suffixes)", args: 1, placeholder: "<rate>", children: map[string]*schemaNode{
-				"burst-size": {desc: "Shaping burst size in bytes (k/m/g suffixes)", args: 1, placeholder: "<bytes>", children: nil},
-			}},
-			"scheduler-map": {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
+			"shaping-rate":            cosShapingRateSchema("Shaping rate for this unit in bits per second (k/m/g suffixes)"),
+			"scheduler-map":           {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
+			"oversubscription-policy": cosOversubscriptionPolicySchema(),
+			"priority-low-min-share":  cosPriorityLowMinShareSchema(),
 		}},
 		// #4021: interface-level (physical, no unit) bindings. In Junos these
 		// apply to every logical unit on the port; a unit-level binding
@@ -125,14 +141,14 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 		"rewrite-rules": {desc: "Rewrite rules applied at the interface level (all units)", children: map[string]*schemaNode{
 			"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 		}},
-		"shaping-rate": {desc: "Shaping rate applied at the interface level in bits per second (k/m/g suffixes)", args: 1, placeholder: "<rate>", children: map[string]*schemaNode{
-			"burst-size": {desc: "Shaping burst size in bytes (k/m/g suffixes)", args: 1, placeholder: "<bytes>", children: nil},
-		}},
-		"scheduler-map": {desc: "Scheduler map to apply at the interface level (all units)", args: 1, placeholder: "<map-name>", children: nil},
+		"shaping-rate":            cosShapingRateSchema("Shaping rate applied at the interface level in bits per second (k/m/g suffixes)"),
+		"scheduler-map":           {desc: "Scheduler map to apply at the interface level (all units)", args: 1, placeholder: "<map-name>", children: nil},
+		"oversubscription-policy": cosOversubscriptionPolicySchema(),
+		"priority-low-min-share":  cosPriorityLowMinShareSchema(),
 	}},
 	"fairness": {desc: "Dataplane fairness observability configuration", children: map[string]*schemaNode{
 		"rss-expectation": {desc: "Declarative RSS flow-distribution expectations evaluated against live dataplane status (shown in fairness output and exported as Prometheus gauges)", children: map[string]*schemaNode{
-			"ifindex": {desc: "Kernel interface index to evaluate (positive integer)", args: 1, multi: true, placeholder: "<ifindex>", children: map[string]*schemaNode{
+			"interface": {desc: "Stable interface name to evaluate (resolved to the current kernel ifindex at evaluate time)", args: 1, multi: true, placeholder: "<interface-name>", children: map[string]*schemaNode{
 				"queue": {desc: "CoS queue ID to evaluate (0..255; exactly one expectation per queue)", args: 1, multi: true, placeholder: "<queue-id>", children: map[string]*schemaNode{
 					"any":                     {desc: "No expectation; always passes", children: nil},
 					"balanced":                {desc: "Expect flows spread across min(flows, workers) workers with per-worker flow counts within 1", children: nil},
@@ -146,6 +162,83 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 		}},
 	}},
 }}
+
+// cosShapingRateSchema builds the `shaping-rate` CoS binding leaf shared by
+// the unit level and the #4021 interface level. shaping-rate is a CONTAINER
+// (it carries the burst-size child), so its rate value is typed via the
+// container `keyValidator` (ValidateRate) — NOT `valueType`, which would flip
+// the walker into the typed-LEAF branch and mis-treat burst-size as a
+// presence-only modifier. Before #4217 both leaves were untyped, so
+// `shaping-rate 10gg` committed as 0 (parseBandwidthLimit's silent
+// zero-on-garbage), which the compiler reads as "unset" — the root shaper
+// silently disappeared and egress ran unshaped.
+func cosShapingRateSchema(desc string) *schemaNode {
+	return &schemaNode{
+		desc:             desc,
+		args:             1,
+		placeholder:      "<rate>",
+		keyValueType:     ValueRate,
+		keyValueDesc:     "Shaping rate (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps",
+		keyValueExamples: []string{"10m", "1g", "10g"},
+		keyValidator:     ValidateRate,
+		children: map[string]*schemaNode{
+			"burst-size": {
+				desc:          "Shaping burst size in bytes (explicit k/m/g suffix)",
+				args:          1,
+				placeholder:   "<bytes>",
+				valueType:     ValueByteSize,
+				valueDesc:     "Byte-size with an explicit k/m/g suffix (e.g. 15k, 1m)",
+				valueExamples: []string{"15k", "1m"},
+				validator:     ValidateByteSize,
+			},
+		},
+	}
+}
+
+// cosOversubscriptionPolicySchema builds the #1614 A1 `oversubscription-policy`
+// binding leaf shared by the unit level and the interface level. It is a
+// container `{ guarantee-rate <fraction 0..1> | proportional }`; the compiler
+// (parseCoSInterfaceUnitBody) reads guarantee-rate's fraction and clamps to
+// [0,1], so the schema rejects an out-of-range fraction at commit rather than
+// silently clamping (#4219). Before #4219 the whole leaf was absent from the
+// schema — no completion, no validation, unknown policy strings committing.
+func cosOversubscriptionPolicySchema() *schemaNode {
+	return &schemaNode{
+		desc: "Oversubscription allocation policy when exact-class transmit-rates exceed the shaping-rate (#1614)",
+		children: map[string]*schemaNode{
+			"guarantee-rate": {
+				desc:          "Fraction of the shaping-rate guaranteed to each exact class before proportional sharing (0..1)",
+				args:          1,
+				placeholder:   "<fraction>",
+				valueType:     ValuePercent,
+				valueDesc:     "Guaranteed fraction of the shaping-rate in the range 0..1 (e.g. 0.7)",
+				valueExamples: []string{"0.5", "0.7", "1"},
+				validator:     ValidatePercent(0, 1),
+			},
+			"proportional": {desc: "Share the shaping-rate proportionally to configured rates (default)", children: nil},
+		},
+	}
+}
+
+// cosPriorityLowMinShareSchema builds the #1614 A2 `priority-low-min-share`
+// binding leaf shared by the unit level and the interface level. The value is
+// typed + validated at commit (so garbage is rejected, not silently zeroed by
+// parseBandwidthLimit) and offers `?` completion, but the knob is currently
+// INERT in the dataplane: it is WIRE-SURFACE-ONLY (the cap_eff reservation
+// that would enforce it is deferred research). A commit warning
+// (compiler_validate_warn.go CoS interface loop) surfaces the inertness
+// (#4220 / #4219).
+func cosPriorityLowMinShareSchema() *schemaNode {
+	return &schemaNode{
+		desc:          "Minimum guaranteed share for the priority-low queue in bits/sec (#1614 A2; accepted but NOT yet enforced by the dataplane)",
+		args:          1,
+		placeholder:   "<rate>",
+		valueType:     ValueRate,
+		valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps (accepted but currently inert)",
+		valueExamples: []string{"100m", "1g"},
+		validator:     ValidateRate,
+	}
+}
 
 var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children: map[string]*schemaNode{
 	"policer": {desc: "Traffic policer", args: 1, multi: true, placeholder: "<name>", children: map[string]*schemaNode{
