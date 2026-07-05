@@ -34593,3 +34593,10 @@ top.
   ./pkg/config/... + gofmt + vet all green.
 - **File(s)**: pkg/config/compiler_validate_warn.go, docs/feature-gaps.md,
   docs/feature-coverage.md, CLAUDE.md, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-1 — wire cos-simul-load-smoke.sh reducer to exit
+  nonzero on gate failure (was always exit 0 = false-green). Added a
+  heterogeneous-gate `_ok` extractor + `sys.exit`, an all-error length
+  guard on gate_1, a gate_0 generator-health check, and replaced the
+  `|| true` iperf launchers with per-port .rc capture. Closes #4239.
+- **File(s)**: test/incus/cos-simul-load-smoke.sh, _Log.md

@@ -71,12 +71,17 @@ fi
 sg incus-admin -c "incus exec $HOST -- mpstat -P ALL 1 $DURATION" > "$ART/mpstat.txt" 2>&1 &
 MPSTAT_PID=$!
 
-# Launch the 11 iperf3 senders in parallel.
+# Launch the 11 iperf3 senders in parallel. Capture each generator's exit
+# code to a .rc sidecar (instead of swallowing it with `|| true`) so the
+# reducer can fail hard on a generator failure — a crashed or unlaunched
+# sender must not read as a silent pass (#4239 V-1).
 declare -a IPERF_PIDS=()
 for port in "${PORTS[@]}"; do
   (
+    rc=0
     sg incus-admin -c "incus exec $HOST -- iperf3 -c $TARGET_V4 -P $STREAMS -t $DURATION -p $port $REV_FLAG --json" \
-      > "$ART/sim_${port}.json" 2>"$ART/sim_${port}.err" || true
+      > "$ART/sim_${port}.json" 2>"$ART/sim_${port}.err" || rc=$?
+    echo "$rc" > "$ART/sim_${port}.rc"
   ) &
   IPERF_PIDS+=($!)
 done
@@ -164,6 +169,25 @@ print(f"{'':<6} {'Sum':<16} {'':>7} {total_recv:>6.2f}G")
 # Gate verdict.
 verdict = {"direction": direction, "aggregate_gbps": round(total_recv, 3), "rows": rows}
 gates = {}
+# Gate 0 (both directions): every generator exited 0. A crashed or
+# unlaunched iperf3 sender leaves a nonzero (or missing) .rc sidecar; a
+# generator failure must be a hard fail, not a silent pass. Rows that
+# error on JSON parse are ALSO caught by the per-gate floors below, but
+# this makes a middle-class generator failure (a class no floor reads)
+# fail too (#4239 V-1).
+gen_failures = []
+for port in ports:
+    rcf = os.path.join(art_dir, f"sim_{port}.rc")
+    try:
+        rc = int(open(rcf).read().strip())
+    except Exception:
+        rc = 1  # missing/unreadable .rc == generator never completed
+    if rc != 0:
+        gen_failures.append({"port": port, "class": class_names[port], "rc": rc})
+gates["gate_0_generators_healthy"] = {
+    "failures": gen_failures,
+    "pass": len(gen_failures) == 0,
+}
 if direction == "reverse":
     # Phase 0 / R8 gate 8: aggregate ≥ 22 G means firewall (not generator) is the bottleneck.
     gates["gate_8_reverse_simul_22g"] = total_recv >= 22.0
@@ -208,7 +232,11 @@ else:
                       "NOT the >=95% guarantee (SOLO-only via #1630 "
                       "cos-gate1-small-four-alone.sh; 3g/6g guarantee = #1692)"),
         "classes": gate1_classes,
-        "pass": all(c["pass"] for c in gate1_classes),
+        # `all([]) == True`: if EVERY small-class row errored, gate1_classes
+        # is empty and would vacuously pass. Require the full expected set
+        # (#4239 V-1 all-error guard).
+        "pass": (all(c["pass"] for c in gate1_classes)
+                 and len(gate1_classes) == len(SIMUL_FLOOR_PCT)),
     }
     # Gate 2: priority-low ≥ 5% of cluster ceiling.
     ceiling = 18.0
@@ -230,4 +258,21 @@ with open(verdict_path, "w") as f:
     json.dump(verdict, f, indent=2)
 print(f"\nVerdict written: {verdict_path}")
 print(json.dumps(gates, indent=2))
+
+# Propagate the verdict as the process exit status. Gates are
+# HETEROGENEOUS: dict gates carry a "pass" key; bare-bool gates are
+# themselves the verdict. A naive `all(gates.values())` is WRONG — a
+# failing DICT gate is still truthy as a raw dict. Under `set -euo
+# pipefail` this heredoc is the LAST command, so a nonzero exit here
+# becomes the script's exit status with no extra bash wiring (#4239 V-1).
+def _ok(v):
+    return v["pass"] if isinstance(v, dict) else bool(v)
+
+
+failed = [name for name, v in gates.items() if not _ok(v)]
+if failed:
+    print(f"\nFAIL: gates not satisfied: {', '.join(failed)}")
+    sys.exit(1)
+print("\nPASS: all gates satisfied")
+sys.exit(0)
 PYEOF
