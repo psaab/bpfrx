@@ -389,14 +389,22 @@ the full helper-reported snapshot, or
 cap.
 
 The runtime expectation slice adds opt-in production evaluation via
-`class-of-service fairness rss-expectation ifindex <n> queue <q>
+`class-of-service fairness rss-expectation interface <name> queue <q>
 <expectation>`, where `<expectation>` uses the same vocabulary as
 `fairness-eval` in Junos-style set syntax (`balanced`,
 `at-least-active-workers <N>`, `max-worker-flow-share <X>`, or
 `cstruct-max <X>`; threshold values use fractions such as `0.5` in
-set syntax). The key is intentionally ifindex-only: the userspace
-status snapshot and Prometheus labels are keyed by kernel ifindex, and
-interface names can be renamed or absent during dataplane restarts.
+set syntax). The key is the STABLE xpf interface name (e.g. `ge-0-0-2`),
+not the kernel ifindex (#hb166 G-9): xpf renames every interface to a
+fixed vSRX name, while the kernel ifindex is transient across
+reboot/hotplug/re-enumeration. The name is resolved to the current
+kernel ifindex at evaluate time from the live status snapshot (which
+re-reports the ifindex<->name mapping every poll), so an expectation
+always tracks the named interface even after re-enumeration; a name that
+is absent from the current snapshot is reported as
+"interface … not present in dataplane status" rather than silently
+judging ifindex 0. The Prometheus labels remain ifindex-keyed, now
+populated with the freshly-resolved ifindex.
 Configured expectations are rendered under
 `show chassis cluster data-plane fairness` and exported as:
 

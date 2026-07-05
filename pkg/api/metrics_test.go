@@ -2017,6 +2017,9 @@ func TestEmitFairnessRSSExpectationGauges(t *testing.T) {
 	}
 	status := dpuserspace.ProcessStatus{
 		Workers: 4,
+		Bindings: []dpuserspace.BindingStatus{
+			{Interface: "reth0", Ifindex: 80},
+		},
 		CoSActiveFlowCounts: []dpuserspace.CoSActiveFlowCountStatus{
 			{Ifindex: 80, QueueID: 4, WorkerID: 0, ActiveFlowCount: 3},
 			{Ifindex: 80, QueueID: 4, WorkerID: 1, ActiveFlowCount: 1},
@@ -2032,9 +2035,9 @@ func TestEmitFairnessRSSExpectationGauges(t *testing.T) {
 	ch := make(chan prometheus.Metric)
 	go func() {
 		c.emitFairnessRSSExpectationGauges(ch, status, []dpuserspace.FairnessRSSExpectation{
-			{Ifindex: 80, QueueID: 4, RSSExpectation: "balanced"},
-			{Ifindex: 80, QueueID: 5, RSSExpectation: "balanced"},
-			{Ifindex: 80, QueueID: 6, RSSExpectation: "cstruct-max:0.25"},
+			{Interface: "reth0", QueueID: 4, RSSExpectation: "balanced"},
+			{Interface: "reth0", QueueID: 5, RSSExpectation: "balanced"},
+			{Interface: "reth0", QueueID: 6, RSSExpectation: "cstruct-max:0.25"},
 		})
 		close(ch)
 	}()

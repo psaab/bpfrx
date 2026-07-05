@@ -822,6 +822,28 @@ Before #4021 an interface-level binding compiled and committed cleanly but
 was silently dropped (only `unit N` children were read), so the shaping /
 classification / marking never applied.
 
+`shaping-rate` and its `burst-size` are a coupled pair (`burst-size` is
+grammatically a child of `shaping-rate`). A unit that **overrides**
+`shaping-rate` therefore defines its own shaper and does **not** inherit
+the interface-level `burst-size` (#hb166 G-10): pairing a level burst
+sized for the level rate with a different unit rate would mismatch them
+(e.g. a level `shaping-rate 100m burst-size 200000` with a unit override
+`shaping-rate 1g` would otherwise carry a 200000-byte burst computed for
+100m — 10x of intent). When such an override leaves `burst-size` unset it
+stays 0 and the dataplane applies its rate-independent
+`COS_MIN_BURST_BYTES` floor, exactly as for a fresh unit that sets
+`shaping-rate` alone. A unit that inherits the rate (sets no
+`shaping-rate`) still inherits both the level rate and the level burst as
+a pair.
+
+A `class-of-service interfaces <name>` binding whose interface — or a
+bound `unit N` — is **not configured under `[interfaces]`** is a silent
+no-op: the dataplane applier only visits CoS bindings that resolve
+against `cfg.Interfaces`, so a typo'd interface name or an unconfigured
+unit shapes nothing. The commit now emits a WARNING (not a reject — the
+interface may be added later) so the operator knows the binding is
+currently inert (#hb166 G-6).
+
 Scheduler `buffer-size` may be configured as an explicit byte size
 (`4m`, `256k`, `1g`) or as a Junos percent value (`10%`). Percent values
 are carried over the userspace protocol as `buffer_size_percent`, not as

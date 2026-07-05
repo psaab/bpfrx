@@ -34291,3 +34291,25 @@ top.
   scripts/image/test_validate_scenarios.py,
   scripts/deploy/test_xpf_deploy_gate.py, scripts/run-selftests.sh, Makefile,
   docs/install-images.md, CLAUDE.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 CoS correctness — G-6 (warn on inert CoS binding to
+  unconfigured interface/unit), G-9 (name-key `fairness rss-expectation`,
+  resolve name->ifindex at evaluate time from the live snapshot so it
+  survives NIC re-enumeration; Prometheus label stays ifindex-keyed with
+  the resolved id), G-10 (a unit `shaping-rate` override no longer
+  inherits the interface-level `burst-size` — burst inheritance moved
+  inside the rate-inheritance block; override units fall back to the
+  dataplane `COS_MIN_BURST_BYTES` floor). Issues #4221/#4222/#4223.
+  Go-only, no Rust/cargo, no wire change. RED-on-revert proven for all
+  three (G-6 no warning; G-9 stale-ifindex judges wrong interface; G-10
+  inherits mismatched 200000 burst).
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_class_of_service.go, pkg/config/types_cos.go,
+  pkg/config/schema_cos.go, pkg/config/parser_class_of_service_test.go,
+  pkg/dataplane/userspace/fairness.go,
+  pkg/dataplane/userspace/fairness_test.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/dataplane/userspace/format/status_test.go,
+  pkg/api/metrics_test.go, test/incus/sqm-cookbook-config.set,
+  docs/per-5-tuple/state.md, docs/cos-traffic-shaping.md, _Log.md
