@@ -242,6 +242,152 @@ else
     fi
 fi
 
+# ── 7. install.sh publish-time bake (H-2 / H-14) ───────────────────────────
+info "7. install.sh stamp (bake key + apt URL) + baked-default render"
+# A fabricated non-placeholder armored block is enough: stamp checks BEGIN/END
+# + not-placeholder, and gate_images verifies install.sh's MINISIGN signature
+# (independent of the OpenPGP archive key baked here).
+AKEY="$WORK/archive.asc"
+cat > "$AKEY" <<'EOF'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEZmFakeArchiveKeyForSelftestOnlyNotARealKeyAAAAAAAAAAAAAAAAAAAA
+=SelF
+-----END PGP PUBLIC KEY BLOCK-----
+EOF
+BAKED="$WORK/install.baked.sh"
+if $PY "$DIST/publish.py" stamp-installer --out "$BAKED" \
+     --archive-key "$AKEY" --apt-base-url "https://dl.selftest.invalid/apt" \
+     --channel stable >/dev/null 2>&1; then
+    ok "stamp-installer bakes install.sh"
+else
+    bad "stamp-installer failed"
+fi
+if ! grep -q "%%XPF_APT_BASE_URL%%" "$BAKED" 2>/dev/null \
+   && ! grep -q "%%XPF_CHANNEL%%" "$BAKED" 2>/dev/null; then
+    ok "baked install.sh has no unsubstituted marker"
+else
+    bad "baked install.sh still carries a %% marker"
+fi
+# Baked install.sh renders the baked apt URL with NO env (the H-2 fix — a piped
+# one-liner cannot deliver env). Accept a rendered baked URI OR a host preflight
+# refusal, but NEVER a missing-URL die.
+if XPF_DRY_RUN=1 sh "$BAKED" >"$WORK/baked.out" 2>&1; then
+    if grep -q "URIs: https://dl.selftest.invalid/apt" "$WORK/baked.out"; then
+        ok "baked install.sh renders the baked apt URL with no env"
+    else
+        bad "baked install.sh did not render the baked URL"; cat "$WORK/baked.out" >&2
+    fi
+else
+    if grep -q "URIs: https://dl.selftest.invalid/apt" "$WORK/baked.out" \
+       || grep -qE "kernel|arch|distro|os-release" "$WORK/baked.out"; then
+        ok "baked install.sh reached the baked URL (or host preflight refused)"
+    else
+        bad "baked install.sh errored without the baked URL"; cat "$WORK/baked.out" >&2
+    fi
+fi
+# stamp refuses a placeholder archive key.
+if $PY "$DIST/publish.py" stamp-installer --out "$WORK/np.sh" \
+     --archive-key "$DIST/xpf-archive-keyring.asc.placeholder" \
+     --apt-base-url "https://x.invalid/apt" >/dev/null 2>&1; then
+    bad "stamp MUST refuse a placeholder archive key but PASSED"
+else
+    ok "stamp refuses a placeholder archive key"
+fi
+
+# ── 8. publish gate: install.sh mandatory + stamped + signed ────────────────
+info "8. publish gate — install.sh mandatory, stamped, signed"
+GD="$WORK/gate"; mkdir -p "$GD"
+cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$GD/"
+XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
+    --channel stable --version "$VER" --dist "$GD" >/dev/null 2>&1
+# 8a. install.sh MISSING -> refuse (mandatory).
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GD" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST require install.sh but PASSED with it missing"
+else
+    ok "publish requires install.sh (mandatory)"
+fi
+# 8b. unstamped install.sh (placeholder key) -> refuse.
+cp "$DIST/install.sh" "$GD/install.sh"
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GD" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse an unstamped install.sh but PASSED"
+else
+    ok "publish refuses an unstamped (placeholder) install.sh"
+fi
+# 8c. stamped install.sh with an unsubstituted apt-URL marker -> refuse (H-2).
+$PY "$DIST/publish.py" stamp-installer --out "$GD/install.sh" \
+    --archive-key "$AKEY" --apt-base-url "https://dl.selftest.invalid/apt" \
+    --channel stable >/dev/null 2>&1
+sed 's#https://dl.selftest.invalid/apt#%%XPF_APT_BASE_URL%%#' "$GD/install.sh" \
+    > "$WORK/marker.sh" && cp "$WORK/marker.sh" "$GD/install.sh"
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GD" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse an unsubstituted apt-URL marker but PASSED"
+else
+    ok "publish refuses an unsubstituted apt-URL marker"
+fi
+# 8d. stamped but UNSIGNED -> refuse (missing .minisig).
+$PY "$DIST/publish.py" stamp-installer --out "$GD/install.sh" \
+    --archive-key "$AKEY" --apt-base-url "https://dl.selftest.invalid/apt" \
+    --channel stable >/dev/null 2>&1
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GD" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse a stamped-but-unsigned install.sh but PASSED"
+else
+    ok "publish refuses a stamped-but-unsigned install.sh"
+fi
+# 8e. stamped + SIGNED -> full gate PASSES.
+minisign -S -W -s "$WORK/img.sec" -m "$GD/install.sh" \
+    -x "$GD/install.sh.minisig" >/dev/null 2>&1
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GD" --channel stable --no-apt >/dev/null 2>&1; then
+    ok "publish gate PASSES a stamped + signed install.sh"
+else
+    bad "publish gate MUST pass a stamped + signed install.sh but FAILED"
+fi
+# 8f. --no-installer opts out of the requirement.
+rm -f "$GD/install.sh" "$GD/install.sh.minisig"
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$GD" --channel stable --no-apt --no-installer >/dev/null 2>&1; then
+    ok "publish --no-installer opts out of the install.sh requirement"
+else
+    bad "publish --no-installer MUST pass without install.sh but FAILED"
+fi
+
+# ── 9. install.sh H-16: validate-before-mutate + cleanup-on-failure ─────────
+info "9. install.sh validate-before-mutate + cleanup-on-failure (H-16)"
+H16="$WORK/h16"; mkdir -p "$H16/bin" "$H16/keyrings" "$H16/sources"
+printf '#!/bin/sh\necho 0\n' > "$H16/bin/id"; chmod +x "$H16/bin/id"
+printf '#!/bin/sh\nexit 0\n' > "$H16/bin/systemctl"; chmod +x "$H16/bin/systemctl"
+printf '#!/bin/sh\nexit 100\n' > "$H16/bin/apt-get"; chmod +x "$H16/bin/apt-get"  # simulate install failure
+# 9a. non-dry install whose apt step FAILS after write_source -> the trap must
+#     remove the apt source (else a dangling repo bricks apt update). Redirect
+#     the system paths so the test never touches the real host.
+sed -e "s#^KEYRING=/usr/share/keyrings/xpf-archive-keyring.asc#KEYRING=$H16/keyrings/k.asc#" \
+    -e "s#^SRC=/etc/apt/sources.list.d/xpf.sources#SRC=$H16/sources/xpf.sources#" \
+    "$BAKED" > "$H16/install.sh"
+PATH="$H16/bin:$PATH" sh "$H16/install.sh" >/dev/null 2>&1 || true
+if [ ! -f "$H16/sources/xpf.sources" ]; then
+    ok "cleanup-on-failure removed the dangling apt source"
+else
+    bad "cleanup-on-failure did NOT remove the apt source"
+fi
+# 9b. real key but NO apt URL (marker restored, no env) -> validate() must die
+#     BEFORE writing the keyring (host untouched).
+rm -f "$H16/keyrings/k.asc" "$H16/sources/xpf.sources"
+sed -e "s#^KEYRING=/usr/share/keyrings/xpf-archive-keyring.asc#KEYRING=$H16/keyrings/k.asc#" \
+    -e "s#^SRC=/etc/apt/sources.list.d/xpf.sources#SRC=$H16/sources/xpf.sources#" \
+    -e "s#^XPF_APT_BASE_URL_BAKED=.*#XPF_APT_BASE_URL_BAKED='%%XPF_APT_BASE_URL%%'#" \
+    "$BAKED" > "$H16/nourl.sh"
+PATH="$H16/bin:$PATH" sh "$H16/nourl.sh" >"$H16/nourl.out" 2>&1 || true
+if [ ! -f "$H16/keyrings/k.asc" ] && grep -q "XPF_APT_BASE_URL is required" "$H16/nourl.out"; then
+    ok "validate-before-mutate: missing URL fails with the host untouched"
+else
+    bad "validate-before-mutate: keyring written before validation failed"; cat "$H16/nourl.out" >&2
+fi
+
 # ── tally ──────────────────────────────────────────────────────────────────
 echo
 echo "==> selftest: $PASS passed, $FAIL failed"
