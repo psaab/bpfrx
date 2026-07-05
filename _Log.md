@@ -1,3 +1,66 @@
+## 2026-07-05 — fable-167 PR #4295 Copilot fold: scrub two secret-leak-to-logs paths (VRRP auth-key + SNMP community)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Copilot review of PR #4295 found the security PR's OWN
+    error/log paths echoed the secrets they protect.
+    (1) I-1 VRRP reject built nodePath from the full vrrp-group Keys run;
+    in the Keys-packed spelling (`vrrp-group 1 authentication-key <sec>;`)
+    that run carries the auth-key VALUE, so the strict error / lenient
+    warning leaked the secret into logs + CLI. Fixed with `vrrpGroupIDKeys`
+    (identity-only `vrrp-group <id>`); message now value-free in BOTH AST
+    shapes. New RED-on-revert tests
+    `TestVRRPAuthenticationRejectDoesNotLeakSecret_{KeysPacked,FlatSet}` +
+    `...WarnDoesNotLeakSecret_KeysPacked`.
+    (2) S-3 SNMP source-denied path logged the v2c community string (the
+    shared secret). Scrubbed to log only `src` + `known_community=true`.
+    Pre-existing `"SNMP: invalid community"` leak (commit c10fc9a1f) left
+    as-is (out of scope).
+  - **File(s)**: pkg/config/compiler_interfaces.go,
+    pkg/config/vrrp_authentication_4288_test.go, pkg/snmp/agent.go, _Log.md
+
+## 2026-07-05 — fable-review-167 parity SECURITY: family any v6 fail-open (#4287), VRRP auth false-security (#4288), SNMP community clients (#4289)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: F-1 (#4287) — `compileFirewall` folded a `family any`
+    firewall filter into the IPv4 pool only, losing its IPv6 arm (a
+    `family any` discard/deny failed OPEN for v6). Fixed to compile a
+    `family any` filter into BOTH `FiltersInet` and `FiltersInet6`;
+    extended `validateFirewallFilterFamilyCollisionsAST` with an
+    `any`+`inet6` same-name collision cross-check (strict reject / lenient
+    warn) since `any` now folds into the inet6 pool too. Test
+    `compiler_firewall_family_any_4287_test.go`.
+  - **File(s)**: pkg/config/compiler_firewall.go,
+    pkg/config/compiler_firewall_family_any_4287_test.go,
+    docs/config-schema.md, _Log.md
+  - **Action**: I-1 (#4288) — VRRP authentication-type/authentication-key
+    are parsed + stored + copied into the VRRP instance but never enforced
+    (the dataplane is RFC 5798 VRRPv3, which removed auth). Silently
+    accepting them is a false-security posture (rogue host can hijack
+    mastership). Added `validateVRRPAuthenticationAST` +
+    `lenientVRRPAuthentication` opt: strict commit hard-rejects, lenient
+    load/peer-sync warns (#1960 no-brick). Test
+    `vrrp_authentication_4288_test.go`.
+  - **File(s)**: pkg/config/compiler.go,
+    pkg/config/compiler_interfaces.go,
+    pkg/config/vrrp_authentication_4288_test.go,
+    docs/feature-coverage.md, _Log.md
+  - **Action**: S-3 (#4289) — SNMP `community <c> clients <ip>` source-IP
+    restriction was silently ignored (agent answered every source). Added
+    `SNMPClient`/`Clients` to `SNMPCommunity`, `parseSNMPClients` +
+    `AllowsSource` (longest-prefix match, `restrict` deny, default-deny
+    when clients set, allow-all when absent), `clients` schema leaf, and
+    threaded the UDP source IP into the agent v2c path
+    (`handlePacket`→`handlePacketFrom`→`handleV2cPacket`) to drop a query
+    from a non-permitted source. Tests `snmp_clients_4289_test.go` (config)
+    + `agent_clients_4289_test.go` (agent enforcement). Removed the VRRP
+    auth key from the pkg/api strict-commit redaction fixture (now rejected
+    by #4288); its redaction stays covered by the Secret type + AST leaf.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/snmp_clients.go,
+    pkg/config/compiler_system.go, pkg/config/schema_system.go,
+    pkg/config/snmp_clients_4289_test.go, pkg/snmp/agent.go,
+    pkg/snmp/agent_clients_4289_test.go,
+    pkg/api/config_secret_redaction_test.go, docs/feature-coverage.md,
+    _Log.md
 ## 2026-07-05 — routing: fable-167 R-1/R-2 OSPF timers + BGP update-source adjacency parity (#4285/#4286)
 
 - **Timestamp**: 2026-07-05

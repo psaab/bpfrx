@@ -492,17 +492,34 @@ func (s SNMPConfig) MarshalYAML() (any, error) {
 type SNMPCommunity struct {
 	Name          string
 	Authorization string // "read-only" or "read-write"
+	// Clients is the Junos `clients` source-IP allowlist (#4289). When
+	// non-empty, only a query whose source IP matches the allowlist (by
+	// longest-prefix match, honoring the per-entry `restrict` deny modifier)
+	// is served — a query from any other source is dropped. An empty Clients
+	// is allow-all (the Junos default). Enforced by the SNMP agent via
+	// AllowsSource (snmp_clients.go).
+	Clients []SNMPClient
+}
+
+// SNMPClient is one entry of an SNMP community `clients` source-IP allowlist:
+// an address prefix and an optional Junos `restrict` (deny) modifier. See
+// SNMPCommunity.AllowsSource (snmp_clients.go).
+type SNMPClient struct {
+	Prefix   string // CIDR (10.0.0.0/24) or bare address (192.168.1.5 == /32 or /128)
+	Restrict bool   // true = deny this prefix (Junos `restrict`)
 }
 
 // MarshalJSON redacts the community string (the secret) on the JSON
-// surface, e.g. GET /api/v1/config, while leaving Authorization in the
-// clear. See the type doc for why Name stays a plain string (#2053).
+// surface, e.g. GET /api/v1/config, while leaving Authorization and the
+// (non-secret) clients allowlist in the clear. See the type doc for why
+// Name stays a plain string (#2053).
 func (c SNMPCommunity) MarshalJSON() ([]byte, error) {
 	type alias struct {
 		Name          Secret
 		Authorization string
+		Clients       []SNMPClient `json:",omitempty"`
 	}
-	return json.Marshal(alias{Name: Secret(c.Name), Authorization: c.Authorization})
+	return json.Marshal(alias{Name: Secret(c.Name), Authorization: c.Authorization, Clients: c.Clients})
 }
 
 // MarshalYAML mirrors MarshalJSON for the gopkg.in/yaml.v3 marshaller
@@ -511,7 +528,8 @@ func (c SNMPCommunity) MarshalYAML() (any, error) {
 	return struct {
 		Name          Secret
 		Authorization string
-	}{Name: Secret(c.Name), Authorization: c.Authorization}, nil
+		Clients       []SNMPClient `yaml:",omitempty"`
+	}{Name: Secret(c.Name), Authorization: c.Authorization, Clients: c.Clients}, nil
 }
 
 // SNMPTrapGroup defines an SNMP trap destination group.

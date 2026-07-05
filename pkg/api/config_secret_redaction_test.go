@@ -23,7 +23,6 @@ var secretSentinels = []string{
 	"LEAK-ISIS-AREA-AUTHKEY",  // ISISConfig.AuthKey
 	"LEAK-ISIS-IFACE-AUTHKEY", // ISISInterface.AuthKey
 	"LEAK-BGP-AUTHPW",         // BGPNeighbor.AuthPassword (group-level)
-	"LEAK-VRRP-AUTHKEY",       // VRRPGroup.AuthKey
 	"LEAK-API-USER-PW",        // APIAuthUser.Password
 	"LEAK-API-KEY-TOKEN",      // APIAuthConfig.APIKeys
 	"LEAK-SNMPV3-AUTHPW",      // SNMPv3User.AuthPassword
@@ -80,10 +79,16 @@ var secretSetCommands = []string{
 	"set protocols bgp group external peer-as 65002",
 	"set protocols bgp group external authentication-key LEAK-BGP-AUTHPW",
 	"set protocols bgp group external neighbor 10.0.2.1",
-	// VRRP auth key.
+	// VRRP group (no authentication: VRRP authentication-type/-key are
+	// hard-rejected at strict commit since #4288 — the dataplane is RFC 5798
+	// VRRPv3, which has no authentication, so an operator commit carrying it
+	// is refused rather than silently accepted as a false-security posture).
+	// VRRPGroup.AuthKey is a config.Secret, so its JSON/YAML redaction is
+	// covered by the dozen other Secret sentinels here; the AST-level
+	// `authentication-key` leaf redaction is covered by the RIP/ISIS/BGP lines
+	// above (same leaf name) and by pkg/config/ast_redact_test.go, which stage
+	// a VRRP auth key through the AST RedactedClone path (no strict commit).
 	"set interfaces ge-0-0-3 unit 0 family inet address 10.0.3.1/24 vrrp-group 1 virtual-address 10.0.3.254/24",
-	"set interfaces ge-0-0-3 unit 0 family inet address 10.0.3.1/24 vrrp-group 1 authentication-type md5",
-	"set interfaces ge-0-0-3 unit 0 family inet address 10.0.3.1/24 vrrp-group 1 authentication-key LEAK-VRRP-AUTHKEY",
 	// REST API basic-auth password + API key.
 	"set system services web-management http",
 	"set system services web-management api-auth user admin password LEAK-API-USER-PW",
