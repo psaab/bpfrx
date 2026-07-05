@@ -35513,3 +35513,25 @@ top.
   pkg/config/compiler_validate_warn.go, pkg/ipsec/ike.go, pkg/ipsec/policy.go,
   pkg/ipsec/README.md, pkg/config/compiler_ipsec_hb167_parity_test.go,
   pkg/ipsec/proposalset_ah_hb167_test.go, _Log.md
+
+## 2026-07-05 — fable-167 review fold: basic proposal-set DH group 2 -> 1 (#4297, V-1)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Hostile-review fold on PR #4310. The `basic` IKE proposal-set
+  used DH group 2 in both member rows, but Junos documents `basic` = DH
+  group 1 (group2 belongs to `compatible`/`standard`). A real vSRX peer with
+  `proposal-set basic` offers group1/DES in Phase-1, so offering group2 would
+  mismatch the DH group and no common proposal would negotiate — an interop
+  failure in the make-or-break class. Fixed both IKE `basic` rows in
+  `expandIKEProposalSets` (compiler_ipsec_proposalset.go) from group 2 -> 1
+  (des/sha1/g1 + des/md5/g1). The ESP `basic` rows are unchanged and correct
+  (no PFS — DHGroup 0; Junos basic ESP is no-PFS). compatible/standard/suiteb
+  are verified exact and untouched. Updated the file + README doc comments
+  and added TestProposalSetBasicDHGroup1_4297 asserting group 1.
+- **Validation**: new test green; proven RED under the group-2 revert
+  (DHGroup:2 want g1). `go test ./pkg/config/... ./pkg/ipsec/...` green;
+  `go build ./...` clean; gofmt + vet clean. Merged origin/master
+  (dd5cdbcf, clean).
+- **File(s)**: pkg/config/compiler_ipsec_proposalset.go,
+  pkg/config/compiler_ipsec_hb167_parity_test.go, pkg/ipsec/README.md,
+  _Log.md

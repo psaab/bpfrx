@@ -22,8 +22,9 @@ import "fmt"
 // deliberate: the crypto is auditable and correctable, never fabricated.
 //
 // Members follow Juniper's published predefined-proposal tables:
-//   - basic / compatible / standard: legacy DES/3DES/SHA1/MD5 sets, DH
-//     group 2. These are weak by modern standards and a hardened strongSwan
+//   - basic / compatible / standard: legacy DES/3DES/SHA1/MD5 sets. `basic`
+//     is DH group 1 in Phase-1; `compatible` and `standard` are DH group 2.
+//     These are weak by modern standards and a hardened strongSwan
 //     build may not have the `des` plugin loaded; the operator asked for the
 //     legacy set, so we expand it faithfully rather than silently upgrading.
 //   - suiteb-gcm-128 / suiteb-gcm-256: RFC 6379 Suite-B — AES-GCM AEAD with
@@ -50,8 +51,12 @@ type espProposalSetSpec struct {
 // proposals, in negotiation-preference order.
 var ikeProposalSets = map[string][]ikeProposalSetSpec{
 	"basic": {
-		{"pre-shared-keys", "des-cbc", "sha1", 2},
-		{"pre-shared-keys", "des-cbc", "md5", 2},
+		// Junos `basic` IKE set is DH GROUP 1 (not group 2 — that is
+		// `compatible`/`standard`). A real vSRX peer with `proposal-set basic`
+		// offers group1/DES in Phase-1, so offering group2 here would mismatch
+		// the DH group and no common proposal would negotiate.
+		{"pre-shared-keys", "des-cbc", "sha1", 1},
+		{"pre-shared-keys", "des-cbc", "md5", 1},
 	},
 	"compatible": {
 		{"pre-shared-keys", "3des-cbc", "sha1", 2},

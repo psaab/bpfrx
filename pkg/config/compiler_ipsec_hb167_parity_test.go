@@ -121,6 +121,47 @@ func TestProposalSetSuiteB128Expands_4297(t *testing.T) {
 	}
 }
 
+// V-1: the `basic` set is DH group 1 in Phase-1 (Junos documents `basic` =
+// group1; `compatible`/`standard` are group2). A real vSRX peer with
+// `proposal-set basic` offers group1/DES in Phase-1, so offering group2 would
+// mismatch the DH group and no proposal would negotiate.
+//
+// FAIL-ON-REVERT: the old group-2 basic rows make the DHGroup assertions RED.
+// The ESP `basic` set carries NO PFS group (0) — Junos `basic` is no-PFS.
+func TestProposalSetBasicDHGroup1_4297(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security ike policy ike-b proposal-set basic",
+		"set security ipsec policy esp-b proposal-set basic",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("proposal-set basic must compile, got: %v", err)
+	}
+	ike := resolvedIKE(t, cfg, "ike-b")
+	if len(ike) != 2 {
+		t.Fatalf("IKE basic set = %d proposals, want 2", len(ike))
+	}
+	if ike[0].EncryptionAlg != "des-cbc" || ike[0].AuthAlg != "sha1" || ike[0].DHGroup != 1 {
+		t.Errorf("IKE basic[0] = %+v, want des-cbc/sha1/g1 (Junos basic is DH group 1)", ike[0])
+	}
+	if ike[1].EncryptionAlg != "des-cbc" || ike[1].AuthAlg != "md5" || ike[1].DHGroup != 1 {
+		t.Errorf("IKE basic[1] = %+v, want des-cbc/md5/g1", ike[1])
+	}
+	// ESP basic is no-PFS (DHGroup 0) with DES + SHA1/MD5.
+	esp := resolvedESP(t, cfg, "esp-b")
+	if len(esp) != 2 {
+		t.Fatalf("ESP basic set = %d proposals, want 2", len(esp))
+	}
+	for i, p := range esp {
+		if p.EncryptionAlg != "des-cbc" || p.DHGroup != 0 {
+			t.Errorf("ESP basic[%d] = %+v, want des-cbc + no PFS (DHGroup 0)", i, p)
+		}
+	}
+	if esp[0].AuthAlg != "hmac-sha1-96" || esp[1].AuthAlg != "hmac-md5-96" {
+		t.Errorf("ESP basic auth = %q/%q, want hmac-sha1-96/hmac-md5-96", esp[0].AuthAlg, esp[1].AuthAlg)
+	}
+}
+
 // V-1: an explicit proposals list wins over proposal-set (mutually exclusive
 // in Junos; the set only fills an empty list).
 func TestProposalSetYieldsToExplicitProposals_4297(t *testing.T) {

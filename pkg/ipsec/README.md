@@ -372,9 +372,10 @@ all files stay in `package ipsec`, so the public API is unchanged.
   uses Junos algorithm spellings that `buildIKEProposalFromIKE` /
   `buildESPProposal` normalize. Members follow Juniper's published tables:
   `basic` / `compatible` / `standard` are the legacy DES/3DES/SHA1/MD5 sets
-  (DH group 2 — weak by modern standards and possibly not loaded in a
-  hardened strongSwan, but expanded faithfully because the operator asked
-  for the legacy set); `suiteb-gcm-128` / `suiteb-gcm-256` are RFC 6379
+  (`basic` is DH group 1 in Phase-1, `compatible`/`standard` are DH group 2
+  — weak by modern standards and possibly not loaded in a hardened
+  strongSwan, but expanded faithfully because the operator asked for the
+  legacy set); `suiteb-gcm-128` / `suiteb-gcm-256` are RFC 6379
   Suite-B (AES-GCM + ECDSA + ECP group 19/20). An explicit `proposals` list
   wins (proposal-set only fills an empty list); an unknown set keyword is
   rejected by the schema enum at commit. The crypto is an explicit, tested
