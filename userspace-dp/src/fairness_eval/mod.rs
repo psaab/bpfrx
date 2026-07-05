@@ -11,7 +11,7 @@ use crate::fairness::{compute_observed_cov, starved_flow_count};
 use self::args::Args;
 use self::inputs::Inputs;
 use self::per_worker::{aggregate_cos_per_worker, aggregate_per_worker};
-use self::report::Report;
+use self::report::{per_flow_quantiles_mbps, Report, SaturationSeries, SteadyStateWindow};
 use self::rss::parse_rss_expectation;
 use self::verdict::{evaluate, VerdictInput, EPSILON};
 use self::windowing::extract_window;
@@ -19,6 +19,15 @@ use self::windowing::extract_window;
 pub(crate) fn run_evaluation(args: &Args, inputs: Inputs) -> Result<Report, String> {
     let window = extract_window(&inputs.iperf, args.warmup_secs, args.final_burst_secs)?;
     let n_total_workers = args.n_workers;
+
+    // Anchor the per-worker scrape aggregation to the actual iperf run
+    // interval (V-6): the binding/CoS TSV timestamps share the same
+    // epoch-seconds clock as start.timestamp.timesecs, so stale pre-run /
+    // cooldown scrapes that sit inside the scrape file but outside the run
+    // are excluded. When timesecs is absent the aggregation falls back to
+    // the scrape-file extent.
+    let iperf_epoch = inputs.iperf.start.timestamp.timesecs;
+    let iperf_total_dur = inputs.iperf.start.test_start.duration;
 
     let observed_cov = compute_observed_cov(&window.per_flow_throughputs);
 
@@ -48,6 +57,8 @@ pub(crate) fn run_evaluation(args: &Args, inputs: Inputs) -> Result<Report, Stri
         n_total_workers,
         args.warmup_secs,
         args.final_burst_secs,
+        iperf_epoch,
+        iperf_total_dur,
     )?;
     let binding_distribution_a_i = agg.distribution_a_i;
     let mut iface_filter_active = agg.iface_filter_active;
@@ -70,6 +81,8 @@ pub(crate) fn run_evaluation(args: &Args, inputs: Inputs) -> Result<Report, Stri
             n_total_workers,
             args.warmup_secs,
             args.final_burst_secs,
+            iperf_epoch,
+            iperf_total_dur,
         )?;
         iface_filter_active = true;
         cstruct_source = "cos_queue";
@@ -163,7 +176,36 @@ pub(crate) fn run_evaluation(args: &Args, inputs: Inputs) -> Result<Report, Stri
         n_total_workers,
         iface_filter_active,
         rss_expectation: &rss_expectation,
+        expect_saturation: args.expect_saturation,
     });
+
+    // Required metrics (docs/fairness-regimes.md): per-flow throughput
+    // quantiles (item 1), the steady-state window timestamps (item 12),
+    // and the saturation determination time-series (item 6). A routine
+    // verdict must carry these to satisfy the MUST list without a
+    // separate artifact dump (V-9).
+    let per_flow_throughput_mbps = per_flow_quantiles_mbps(&window.per_flow_throughputs);
+    let steady_state_window = SteadyStateWindow {
+        iperf_epoch_start: if iperf_epoch > 0 {
+            iperf_epoch.saturating_add(args.warmup_secs)
+        } else {
+            0
+        },
+        iperf_epoch_end: if iperf_epoch > 0 {
+            iperf_epoch
+                .saturating_add(iperf_total_dur)
+                .saturating_sub(args.final_burst_secs)
+        } else {
+            0
+        },
+        relative_start_sec: args.warmup_secs as f64,
+        relative_end_sec: iperf_total_dur.saturating_sub(args.final_burst_secs) as f64,
+    };
+    let saturation_series = SaturationSeries {
+        structural_cap_bps: decision.structural_cap_bps,
+        saturated_bucket_fraction: decision.saturated_bucket_fraction,
+        aggregate_buckets_bps: window.aggregate_buckets_bps.clone(),
+    };
 
     Ok(Report {
         cstruct_source,
@@ -185,6 +227,10 @@ pub(crate) fn run_evaluation(args: &Args, inputs: Inputs) -> Result<Report, Stri
         gap: decision.gap,
         epsilon: EPSILON,
         saturated: decision.saturated,
+        aggregate_throughput_gate_enforced: decision.aggregate_throughput_gate_enforced,
+        per_flow_throughput_mbps,
+        steady_state_window,
+        saturation_series,
         aggregate_mbps,
         iperf_retransmits,
         iperf_reverse,

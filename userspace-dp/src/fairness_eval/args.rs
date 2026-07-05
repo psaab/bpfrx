@@ -15,6 +15,13 @@ pub(crate) struct Args {
     pub(crate) n_workers: u32,
     pub(crate) shaper_rate_bps: u64,
     pub(crate) rss_expectation: String,
+    /// Operator declaration that the offered load is expected to
+    /// saturate the Nₐ/Nᵥ-scaled structural cap. When set, Gate 3
+    /// (aggregate throughput) is enforced: the observed aggregate must
+    /// reach >=95% of the scaled cap, else the run FAILs. Without it the
+    /// aggregate leg stays diagnostic-only (the doc's non-saturated
+    /// exemption).
+    pub(crate) expect_saturation: bool,
 }
 
 pub(crate) fn parse_args() -> Args {
@@ -29,6 +36,7 @@ pub(crate) fn parse_args() -> Args {
     let mut n_workers: u32 = 6;
     let mut shaper_rate_bps: u64 = 0;
     let mut rss_expectation: String = "any".to_string();
+    let mut expect_saturation: bool = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -68,9 +76,12 @@ pub(crate) fn parse_args() -> Args {
             "--rss-expectation" => {
                 rss_expectation = parse_required_string_arg("--rss-expectation", args.next());
             }
+            "--expect-saturation" => {
+                expect_saturation = true;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: fairness-eval --iperf-json PATH --binding-flows PATH \\\n  [--cos-flows PATH --cos-ifindex N --cos-queue-id N] \\\n  [--iface NAME] [--warmup-secs N] [--final-burst-secs N] \\\n  [--n-workers N] [--shaper-rate-bps N] [--rss-expectation EXPR]\n\n--iface NAME: filter binding-flows rows to this interface (recommended for legacy per-binding mode).\n--cos-flows: class-specific CoS active-flow TSV; when present, Cstruct uses the selected CoS queue.\n--rss-expectation: any, balanced, at-least-active-workers:N, max-worker-flow-share:X, or cstruct-max:X."
+                    "Usage: fairness-eval --iperf-json PATH --binding-flows PATH \\\n  [--cos-flows PATH --cos-ifindex N --cos-queue-id N] \\\n  [--iface NAME] [--warmup-secs N] [--final-burst-secs N] \\\n  [--n-workers N] [--shaper-rate-bps N] [--rss-expectation EXPR] \\\n  [--expect-saturation]\n\n--iface NAME: filter binding-flows rows to this interface (recommended for legacy per-binding mode).\n--cos-flows: class-specific CoS active-flow TSV; when present, Cstruct uses the selected CoS queue.\n--rss-expectation: any, balanced, at-least-active-workers:N, max-worker-flow-share:X, or cstruct-max:X.\n--expect-saturation: declare the offered load >= structural cap; enforces Gate 3 (aggregate >= 95% of the Na/Nv-scaled cap)."
                 );
                 std::process::exit(0);
             }
@@ -106,6 +117,7 @@ pub(crate) fn parse_args() -> Args {
         n_workers,
         shaper_rate_bps,
         rss_expectation,
+        expect_saturation,
     }
 }
 
