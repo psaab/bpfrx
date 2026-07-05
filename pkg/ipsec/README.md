@@ -356,6 +356,64 @@ all files stay in `package ipsec`, so the public API is unchanged.
     tunnel. A non-chain resolve error (e.g. an unknown auth-method token
     from `authMethodToSwan`) is a different class and still aborts the
     whole render.
+- **Predefined proposal-set expansion (#4297, fable-167 V-1).** Junos
+  `security ike policy P proposal-set <set>` and the `security ipsec policy`
+  equivalent are the standard vSRX shorthand for "use a Juniper-curated
+  proposal set instead of hand-defining proposals". The keyword used to be
+  silently dropped (unknown compiler-switch key), so the policy carried no
+  resolvable proposal and the tunnel could not be built (the IPsec side
+  hard-rejected with "no resolvable ipsec proposal"; the IKE side left the
+  chain unresolved). The compiler now expands each set into concrete
+  synthetic proposals — `expandIKEProposalSets` / `expandIPsecProposalSets`
+  in `pkg/config/compiler_ipsec_proposalset.go`, run after the proposal and
+  policy maps are built — and points the policy's `Proposals` list at them,
+  so the whole downstream (strict cross-ref validators + the renderer here)
+  works unchanged. The expansion table is the single source of truth and
+  uses Junos algorithm spellings that `buildIKEProposalFromIKE` /
+  `buildESPProposal` normalize. Members follow Juniper's published tables:
+  `basic` / `compatible` / `standard` are the legacy DES/3DES/SHA1/MD5 sets
+  (DH group 2 — weak by modern standards and possibly not loaded in a
+  hardened strongSwan, but expanded faithfully because the operator asked
+  for the legacy set); `suiteb-gcm-128` / `suiteb-gcm-256` are RFC 6379
+  Suite-B (AES-GCM + ECDSA + ECP group 19/20). An explicit `proposals` list
+  wins (proposal-set only fills an empty list); an unknown set keyword is
+  rejected by the schema enum at commit. The crypto is an explicit, tested
+  table, never a hidden default substitution.
+- **AH (`protocol ah`) is rejected, never faked as ESP (#4298, fable-167
+  V-2, SECURITY).** A `security ipsec proposal P protocol ah` selects
+  Authentication Header (integrity only, no encryption; swanctl expresses it
+  via `ah_proposals`). xpf has no AH render path — `buildESPProposal`
+  ignores the protocol and defaults empty encryption to `aes256`, and
+  `renderConfig` always emits `esp_proposals` — so a `protocol ah` proposal
+  used to render as ESP with a fabricated cipher (the operator asked for AH
+  and silently got ESP-with-made-up-crypto, a misrepresentation). The
+  commit-time gate `validateIPsecProposalProtocolStrict`
+  (`pkg/config/compiler_validate_strict.go`) hard-rejects `protocol ah` with
+  a clear "use `protocol esp`" message; the render belt `vpnUsesAHProposal`
+  (`ike.go`) makes `renderConfig` SKIP any VPN whose ipsec-policy resolves to
+  an AH proposal (tolerant-boot path) rather than emit the fabricated ESP
+  tunnel. Full AH support (`ah_proposals`) is a possible follow-up; the
+  invariant is: **never substitute ESP for AH silently.**
+- **`vpn-monitor` accepted-but-not-enforced (#4299, fable-167 V-3).**
+  `security ipsec vpn V vpn-monitor { source-interface; destination-ip;
+  optimized; }` drives ICMP-probe tunnel liveness + st0 interface-state
+  coupling. xpf implements neither; the stanza used to be silently dropped.
+  It is now typed + captured (`compileIPsec`) and `ValidateConfig` emits an
+  accepted-only advisory (mirroring the #2078/#4231 doctrine) pointing the
+  operator at IKE-layer `dead-peer-detection` for peer liveness. Full
+  probe-driven monitoring is a follow-up.
+- **Manual-key SA rejected (#4300, fable-167 V-4).** `security ipsec vpn V
+  manual { ... }` configures a manual-key SA (no IKE). xpf negotiates all
+  SAs via IKE; the block used to be dropped silently, leaving a VPN that
+  committed OK but forwarded nothing (a silent dead tunnel).
+  `validateIPsecManualKeyStrict` now hard-rejects it at commit with a "use
+  an IKE-negotiated VPN" message (lenient warn on load — the block was
+  already inert).
+- **`establish-tunnels` enum validated (#4301, fable-167 V-5).** The leaf
+  was untyped, so a typo (`on-tarffic`) or a newer value stored verbatim and
+  silently degraded to on-traffic. It is now
+  `ValidateEnum([immediately, on-traffic, responder-only])` in
+  `setSchema` — a typo fails closed at commit.
 - **AES-GCM IKE PRF + ICV-suffix canonicalization (#2125).** The
   load-bearing fix: a strongSwan IKEv2 AEAD (AES-GCM) proposal MUST
   name a PRF explicitly — an AEAD cipher carries no integrity algorithm

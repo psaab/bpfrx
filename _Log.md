@@ -35406,3 +35406,47 @@ top.
   routing merge, clean auto-merge of _Log.md).
 - **File(s)**: pkg/config/compiler_nat.go,
   pkg/config/compiler_nat_target_parity_hb167_test.go, _Log.md
+
+## 2026-07-05 — fable-review-167 IPsec/VPN parity (V-1..V-5, #4297-4301)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Filed issues #4297-#4301 and implemented the five fable-167
+  IPsec/VPN parity findings on branch `fix/hb167-ipsec-parity`.
+  - **V-1 (#4297) — proposal-set IMPLEMENTED.** `security ike|ipsec policy P
+    proposal-set <set>` was silently dropped, so the common vSRX shorthand
+    could not commit a working tunnel. Added `ProposalSet` to `IKEPolicy` /
+    `IPsecPolicyDef`, captured it in `compileIKE`/`compileIPsec`, and expand it
+    into concrete synthetic proposals via a new SSOT table
+    (`compiler_ipsec_proposalset.go`: `expandIKEProposalSets` /
+    `expandIPsecProposalSets`). standard/basic/compatible = Juniper legacy
+    tables (DH group 2, DES/3DES/SHA1/MD5); suiteb-gcm-128/256 = RFC 6379
+    Suite-B. Schema `proposal-set` enum rejects a typo. Downstream strict
+    cross-ref validators + the renderer work unchanged because the policy now
+    references real proposals.
+  - **V-2 (#4298, SECURITY) — protocol ah REJECTED (never silent-ESP).**
+    `protocol ah` used to render as ESP with a fabricated aes256 cipher.
+    Added `validateIPsecProposalProtocolStrict` (hard-reject at commit,
+    lenient warn) + a render belt `vpnUsesAHProposal` (ike.go) that SKIPS an
+    AH VPN in `renderConfig` on the tolerant-boot path. Schema types
+    `protocol` as esp|ah. AH support left as a follow-up; the invariant is
+    never to substitute ESP for AH.
+  - **V-3 (#4299) — vpn-monitor accept-with-advisory.** Typed + captured;
+    `ValidateConfig` emits an accepted-but-not-enforced advisory (mirrors
+    #2078/#4231), pointing at IKE-layer dead-peer-detection.
+  - **V-4 (#4300) — manual-key SA REJECTED.** `manual { ... }` was dropped
+    silently, leaving a dead tunnel; `validateIPsecManualKeyStrict` now
+    hard-rejects it (lenient warn).
+  - **V-5 (#4301) — establish-tunnels enum validated.**
+    `ValidateEnum([immediately, on-traffic, responder-only])`.
+- **Validation**: new RED-on-revert tests in
+  `pkg/config/compiler_ipsec_hb167_parity_test.go` (proposal-set expands /
+  compiles; ah reject; manual reject; vpn-monitor advisory; establish-tunnels
+  enum) and `pkg/ipsec/proposalset_ah_hb167_test.go` (proposal-set standard +
+  suiteb render tokens; AH-VPN render skip). `go test ./pkg/config/...
+  ./pkg/ipsec/...` green; `go build ./...` clean; gofmt + vet clean.
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_ipsec.go,
+  pkg/config/compiler_ipsec_proposalset.go, pkg/config/schema_security.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_warn.go, pkg/ipsec/ike.go, pkg/ipsec/policy.go,
+  pkg/ipsec/README.md, pkg/config/compiler_ipsec_hb167_parity_test.go,
+  pkg/ipsec/proposalset_ah_hb167_test.go, _Log.md
