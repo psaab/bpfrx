@@ -495,6 +495,13 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #4306 S-5: make the grouped `system` inert knobs (login banner/retry,
+	// ntp boot-server/authentication-key/source-address, internet-options
+	// extras, ssh rate-limit) loud instead of a silent no-op.
+	if cfg != nil {
+		cfg.Warnings = append(cfg.Warnings, systemInertKnobWarnings(node)...)
+	}
+
 	return nil
 }
 
@@ -1176,7 +1183,129 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 	}
 
 	sys.SNMP = snmp
+	if cfg != nil {
+		cfg.Warnings = append(cfg.Warnings, snmpInertKnobWarnings(node)...)
+	}
 	return nil
+}
+
+// snmpInertKnobWarnings emits accept-with-advisory notes for the top-level
+// `snmp` knobs xpf recognizes but does not enforce (#4306 S-5). The
+// security-relevant ones are called out explicitly: a MIB `view` (on a
+// community or standalone) is NOT enforced, so a view-scoped community is
+// silently promoted to full ifTable exposure; `trap-options source-address`
+// is NOT bound, so traps leave from the default egress IP. Messages are built
+// from the node IDENTITY (keywords) only — never the community NAME (an SNMP
+// community string is a secret). Deterministic, deduplicated output.
+func snmpInertKnobWarnings(node *Node) []string {
+	if node == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var warnings []string
+	add := func(msg string) {
+		if !seen[msg] {
+			seen[msg] = true
+			warnings = append(warnings, msg)
+		}
+	}
+	nodeHasSub := func(n *Node, keyword string) bool {
+		if n == nil {
+			return false
+		}
+		if n.FindChild(keyword) != nil {
+			return true
+		}
+		for _, k := range n.Keys[1:] {
+			if k == keyword {
+				return true
+			}
+		}
+		return false
+	}
+	for _, child := range node.Children {
+		switch child.Name() {
+		case "view":
+			add("snmp view: MIB view scoping is accepted but NOT enforced by the SNMP agent (the full ifTable MIB is exposed regardless)")
+		case "trap-options":
+			if nodeHasSub(child, "source-address") {
+				add("snmp trap-options source-address: accepted but NOT enforced (traps are sent from the default egress IP)")
+			}
+		case "health-monitor":
+			add("snmp health-monitor: accepted but NOT implemented (no-op)")
+		case "rmon":
+			add("snmp rmon: accepted but NOT implemented (no-op)")
+		case "community":
+			// The community NAME is a secret — never echo it. Name only the
+			// keyword. A view-scoped community answers the full ifTable.
+			if nodeHasSub(child, "view") {
+				add("snmp community view: per-community MIB view scoping is accepted but NOT enforced (the community answers the full ifTable)")
+			}
+		}
+	}
+	return warnings
+}
+
+// systemInertKnobWarnings emits accept-with-advisory notes for the grouped
+// `system` knobs that commit clean but do nothing (#4306 S-5): login banners /
+// retry-options, NTP boot-server / authentication-key / source-address, and
+// `internet-options` leaves beyond the one xpf models. Messages name the
+// keyword only — never a leaf value (the NTP authentication-key is a secret).
+func systemInertKnobWarnings(sysNode *Node) []string {
+	if sysNode == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var warnings []string
+	add := func(msg string) {
+		if !seen[msg] {
+			seen[msg] = true
+			warnings = append(warnings, msg)
+		}
+	}
+	if login := sysNode.FindChild("login"); login != nil {
+		if login.FindChild("message") != nil {
+			add("system login message: pre-login banner accepted but NOT applied")
+		}
+		if login.FindChild("announcement") != nil {
+			add("system login announcement: post-login announcement accepted but NOT applied")
+		}
+		if login.FindChild("retry-options") != nil {
+			add("system login retry-options: login retry/lockout policy accepted but NOT enforced")
+		}
+	}
+	if ntp := sysNode.FindChild("ntp"); ntp != nil {
+		if ntp.FindChild("boot-server") != nil {
+			add("system ntp boot-server: accepted but NOT enforced (no one-shot boot-time sync)")
+		}
+		if ntp.FindChild("authentication-key") != nil {
+			// The key VALUE is a secret — name the keyword only.
+			add("system ntp authentication-key: NTP authentication accepted but NOT enforced")
+		}
+		if ntp.FindChild("source-address") != nil {
+			add("system ntp source-address: accepted but NOT bound (NTP uses the default source IP)")
+		}
+	}
+	if io := sysNode.FindChild("internet-options"); io != nil {
+		var extra []string
+		for _, c := range io.Children {
+			if c.Name() != "no-ipv6-reject-zero-hop-limit" {
+				extra = append(extra, c.Name())
+			}
+		}
+		if len(extra) > 0 {
+			sort.Strings(extra)
+			add(fmt.Sprintf("system internet-options [%s]: accepted but NOT implemented (xpf models only no-ipv6-reject-zero-hop-limit)", strings.Join(extra, " ")))
+		}
+	}
+	if svc := sysNode.FindChild("services"); svc != nil {
+		if ssh := svc.FindChild("ssh"); ssh != nil {
+			if ssh.FindChild("rate-limit") != nil {
+				add("system services ssh rate-limit: accepted but NOT enforced (sshd has no per-minute connection-rate limiter)")
+			}
+		}
+	}
+	return warnings
 }
 
 // compileSNMPv3 parses the v3 { usm { local-engine { user <name> { ... } } } } hierarchy.

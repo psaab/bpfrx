@@ -4829,3 +4829,31 @@ MAC defaults even when the operator configured hardened algorithms.
 - **tests** — `pkg/config/compiler_ssh_hardening_4305_test.go`,
   `pkg/daemon/daemon_ssh_test.go` (`TestBuildSSHDConfigHardeningKnobs`,
   `TestBuildSSHDConfigClientAlivePresence`).
+
+## Grouped system/SNMP inert knobs — accept-with-advisory (#4306 S-5)
+
+A cluster of `system`/`snmp` knobs commit clean but do nothing, several
+security-relevant. Rather than silently dropping them, the compiler now emits
+a loud accept-with-advisory (`cfg.Warnings`) so the operator learns the knob is
+inert. Advisory messages are built from the node IDENTITY (keywords) only —
+never a leaf value — so an SNMP community string or an NTP authentication-key
+is never echoed into a warning.
+
+- **SNMP** (`snmpInertKnobWarnings`, `compiler_system.go`) — `view` /
+  community `view` (MIB view scoping is NOT enforced → full ifTable exposure),
+  `trap-options source-address` (traps use the default egress IP),
+  `health-monitor`, `rmon` (no-ops).
+- **system** (`systemInertKnobWarnings`) — `login message` / `announcement`
+  (banners not applied), `login retry-options` (lockout not enforced), `ntp
+  boot-server` / `authentication-key` / `source-address`, and
+  `internet-options` leaves beyond `no-ipv6-reject-zero-hop-limit`. Also the
+  S-4 `services ssh rate-limit` (no sshd equivalent).
+- These are advisory-only by design: the knobs already committed clean
+  (unknown keys under a known container are accepted-inert by the opt-in
+  typed-leaf gate), so no valid config is newly rejected. The security-relevant
+  ones (community view scoping, trap source-address) get an explicit
+  "accepted but NOT enforced" note rather than an implicit full-exposure
+  surprise. Note: SNMP community `clients` source-IP restriction is tracked
+  separately (S-3, not this change).
+- **tests** — `pkg/config/compiler_inert_knobs_4306_test.go` (advisories fire,
+  no secret echoed).

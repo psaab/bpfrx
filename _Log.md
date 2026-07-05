@@ -1,3 +1,19 @@
+## 2026-07-05 — system/SNMP: fable-167 S-5 accept-with-advisory for grouped inert knobs (#4306)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4306 (S-5) — a cluster of system/SNMP knobs committed clean
+    but did nothing (several security-relevant). Added `snmpInertKnobWarnings`
+    (view / community view / trap-options source-address / health-monitor /
+    rmon) and `systemInertKnobWarnings` (login message/announcement/
+    retry-options, ntp boot-server/authentication-key/source-address,
+    internet-options extras, ssh rate-limit) emitting loud
+    accept-with-advisory `cfg.Warnings`. Messages are built from the node
+    IDENTITY only — the SNMP community string and NTP authentication-key value
+    are never echoed. Advisory-only (no schema reject) since the knobs already
+    commit clean.
+  - **File(s)**: pkg/config/compiler_system.go,
+    pkg/config/compiler_inert_knobs_4306_test.go, docs/config-schema.md
+
 ## 2026-07-05 — system: fable-167 S-4 implement SSH hardening knobs (#4305)
 
 - **Timestamp**: 2026-07-05
