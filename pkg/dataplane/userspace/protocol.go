@@ -1974,8 +1974,10 @@ type CoSQueueStatus struct {
 	// hb166 T-2: Phase-1 honored selections that made ZERO TX progress and
 	// had their budget debit + honored bit refunded. Climbing here with
 	// flat WaterfillPhase1Admissions = TX-ring pressure eating a small
-	// class's guarantee pass. omitempty keeps a pre-hb166 daemon's absent
-	// field at 0 (rolling-upgrade safe).
+	// class's guarantee pass. Additive field: a pre-hb166 daemon that omits
+	// it decodes to 0 here regardless of omitempty (a missing JSON field
+	// unmarshals to the zero value), so this is rolling-upgrade safe;
+	// omitempty only suppresses emitting it on the wire when 0.
 	WaterfillPhase1SelectedNoProgress uint64 `json:"waterfill_phase1_selected_no_progress,omitempty"`
 	// #1829 Phase 1: dequeue-time sojourn telemetry. JSON tags MUST
 	// match the Rust serde rename(...) in protocol/cos.rs exactly.

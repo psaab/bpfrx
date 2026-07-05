@@ -753,6 +753,11 @@ func newCollector(srv *Server) *xpfCollector {
 			"Times the guarantee-rate waterfill selector reached this CoS queue eligible (nonempty/runnable/guarantee/exact) and evaluated it (both phases, before the token gate). Low value + high *_starvation_parks = backlogged-but-parked; low + low parks + zero queued = idle on this owner (#1628).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		cosWaterfillPhase1SelectedNoProgress: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_selected_no_progress_total",
+			"Times this CoS queue was honored by the guarantee-rate waterfill Phase-1 walk but made ZERO TX progress, so its budget debit and honored bit were refunded (hb166 T-2). Climbing here while waterfill_phase1_admissions stays flat = TX-ring pressure eating a small class's guarantee pass (the #1630/#4256 mid-rate-residual signal).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
 		cosWaterfillEpochs: prometheus.NewDesc(
 			"xpf_userspace_cos_waterfill_epochs_total",
 			"Completed guarantee-rate waterfill epochs (Phase-1 budget refills) on this CoS interface, summed across workers (#1628).",
