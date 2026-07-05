@@ -128,6 +128,21 @@ pub(super) fn submit_local(
                     .drain_sent_bytes_shaped_unconditional
                     .fetch_add(bytes, Ordering::Relaxed);
             }
+            // #hb166 T-6(e): publish the committed queue_vtime on THIS
+            // CoSBatch settle boundary. The four direct-service settle
+            // sites in service.rs already publish; the CoSBatch submit path
+            // (surplus-phase shared_exact service) advanced queue_vtime
+            // during batch build but never broadcast it, so peers read a
+            // stale-low V_min slot and self-throttle exactly when surplus
+            // works hardest. No-op for non-flow-fair / non-shared queues
+            // (vtime_floor is None).
+            publish_committed_queue_vtime(
+                binding
+                    .cos
+                    .cos_interfaces
+                    .get(&root_ifindex)
+                    .and_then(|root| root.queues.get(queue_idx)),
+            );
             cos_batch_tx_made_progress(Ok((packets, bytes)))
         }
         Err(TxError::Retry(err)) => {

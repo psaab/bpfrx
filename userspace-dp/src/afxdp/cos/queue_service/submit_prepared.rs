@@ -108,6 +108,17 @@ pub(super) fn submit_prepared(
                     .drain_sent_bytes_shaped_unconditional
                     .fetch_add(bytes, Ordering::Relaxed);
             }
+            // #hb166 T-6(e): publish the committed queue_vtime on the
+            // Prepared CoSBatch settle boundary too — see the matching
+            // block + rationale in submit_local.rs. No-op for
+            // non-flow-fair / non-shared queues.
+            publish_committed_queue_vtime(
+                binding
+                    .cos
+                    .cos_interfaces
+                    .get(&root_ifindex)
+                    .and_then(|root| root.queues.get(queue_idx)),
+            );
             cos_batch_tx_made_progress(Ok((packets, bytes)))
         }
         Err(TxError::Retry(err)) => {

@@ -85,6 +85,56 @@ fn nonexact_guarantee_skips_residual_only_scheduler_map_queue() {
     ));
 }
 
+// #hb166 T-6(b): the exact-demand mask that reserves best-effort surplus
+// must count only SERVICEABLE exact guarantee queues (can ship their head
+// right now), not merely non-empty ones. A v8-starved / token-parked exact
+// class that ships zero bytes must release its reserved rate to best-effort.
+//
+// FAIL-ON-REVERT: restoring the `!cos_queue_is_empty` predicate re-includes
+// the starved queue, flipping the `mask & 0b10 == 0` assertion.
+#[test]
+fn exact_demand_mask_excludes_starved_exact_queue() {
+    let queue = |queue_id: u8, fc: &str| CoSQueueConfig {
+        queue_id,
+        forwarding_class: fc.into(),
+        priority: 5,
+        transmit_rate_bytes: 1_000_000_000,
+        guarantee_enabled: true,
+        exact: true,
+        surplus_sharing: false,
+        equal_flow_enforcement: false,
+        equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+        surplus_weight: 1,
+        buffer_bytes: COS_MIN_BURST_BYTES,
+        dscp_rewrite: None,
+        codel_target_ns: 0,
+    };
+    let mut root = test_cos_runtime_with_queues(
+        25_000_000_000 / 8,
+        vec![queue(0, "iperf-a"), queue(1, "iperf-b")],
+    );
+    root.tokens = 100_000;
+    // Queue 0: serviceable — runnable, tokens cover the head, non-empty.
+    root.queues[0].hot.runnable = true;
+    root.queues[0].hot.tokens = 10_000;
+    root.queues[0].hot.items.push_back(test_cos_item(1500));
+    root.queues[0].hot.queued_bytes = 1500;
+    // Queue 1: v8-starved — runnable + non-empty, but NO per-queue tokens,
+    // so it cannot ship a byte this round.
+    root.queues[1].hot.runnable = true;
+    root.queues[1].hot.tokens = 0;
+    root.queues[1].hot.items.push_back(test_cos_item(1500));
+    root.queues[1].hot.queued_bytes = 1500;
+
+    let mask = root_exact_demand_queue_mask(&root);
+    assert_eq!(mask & 0b01, 0b01, "serviceable exact queue counts as demand");
+    assert_eq!(
+        mask & 0b10,
+        0,
+        "a token-starved (ships-zero) exact queue must NOT reserve BE surplus",
+    );
+}
+
 fn residual_and_exact_test_root(exact_surplus_sharing: bool) -> CoSInterfaceRuntime {
     let mut root = test_cos_runtime_with_queues(
         25_000_000_000 / 8,
@@ -2202,6 +2252,8 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
             v_min_suspended_remaining: 0,
             v_min_hard_cap_overrides_scratch: 0,
             v_min_throttles_scratch: 0,
+            v_min_suspended_batches_scratch: 0,
+            v_min_suspension_window: 0,
             v_min_pop_count: 0,
         },
         telemetry: crate::afxdp::types::CoSQueueTelemetry {
@@ -2273,6 +2325,8 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
             v_min_suspended_remaining: 0,
             v_min_hard_cap_overrides_scratch: 0,
             v_min_throttles_scratch: 0,
+            v_min_suspended_batches_scratch: 0,
+            v_min_suspension_window: 0,
             v_min_pop_count: 0,
         },
         telemetry: crate::afxdp::types::CoSQueueTelemetry {
@@ -3466,6 +3520,88 @@ fn sojourn_recorded_end_to_end_via_submit_local() {
     assert_eq!(
         queue.telemetry.sojourn, expected,
         "committed send through submit_local must sample exactly once",
+    );
+}
+
+// #hb166 T-6(e): the CoSBatch submit path (submit_local / submit_prepared)
+// is the 5th V_min settle boundary. Like the four direct-service settle
+// sites in service.rs, it must publish the committed queue_vtime so peers'
+// V_min reduction sees this worker's real progress. Without it a
+// surplus-phase shared_exact queue advances vtime unpublished and peers
+// self-throttle against a stale-low slot.
+//
+// FAIL-ON-REVERT: removing the `publish_committed_queue_vtime(...)` call
+// added to submit_local's Ok arm leaves the floor slot at None.
+#[test]
+fn submit_local_publishes_committed_vtime_on_settle() {
+    let now_ns = 1_000_000_000u64;
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: true,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    root.tokens = 1500;
+    root.queues[0].hot.tokens = 1500;
+    // shared_exact flow-fair queue with a V_min floor for worker 0 of 2.
+    let floor = attach_test_vtime_floor(&mut root.queues[0], 2, 0);
+    // Pretend a drain has already advanced this queue's committed vtime.
+    test_flow_fair_state_mut(&mut root.queues[0]).queue_vtime = 54_321;
+
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        0,
+        vec![(0, test_queue_fast_path(false, 0, None, None))],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    assert_eq!(floor.slots[0].read(), None, "test premise: slot starts unpublished");
+
+    let items = VecDeque::from([TxRequest {
+        bytes: vec![0u8; 128],
+        expected_ports: None,
+        expected_addr_family: 0,
+        expected_protocol: 0,
+        flow_key: None,
+        egress_ifindex: 42,
+        cos_queue_id: Some(0),
+        dscp_rewrite: None,
+        mirror_clone: false,
+        enqueue_ns: now_ns,
+    }]);
+    let mut shared_recycles = Vec::new();
+
+    submit_local(
+        &mut binding,
+        42,
+        0,
+        CoSServicePhase::Surplus,
+        128,
+        items,
+        now_ns,
+        &mut shared_recycles,
+    );
+
+    assert_eq!(
+        floor.slots[0].read(),
+        Some(54_321),
+        "submit_local settle must publish the committed queue_vtime to the V_min floor slot",
     );
 }
 

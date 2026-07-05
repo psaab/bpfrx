@@ -17,8 +17,8 @@ use crate::afxdp::types::{
 use crate::afxdp::worker::BindingWorker;
 
 use super::queue_ops::{
-    cos_item_len, cos_queue_front, cos_queue_is_empty, cos_queue_push_front,
-    maybe_demote_drained_best_effort,
+    cos_exact_queue_serviceable, cos_item_len, cos_queue_front, cos_queue_is_empty,
+    cos_queue_push_front, maybe_demote_drained_best_effort,
 };
 use super::token_bucket::{maybe_top_up_cos_root_lease, release_cos_root_lease};
 
@@ -490,25 +490,36 @@ fn exact_backlog_bytes(root: &CoSInterfaceRuntime) -> u64 {
 
 #[inline]
 fn serviceable_exact_backlog_bytes(root: &CoSInterfaceRuntime) -> u64 {
+    // #hb166 T-6(b): share the serviceability predicate with the demand
+    // masks (queue_ops::cos_exact_queue_serviceable) so the published
+    // serviceable-bytes signal and the demand mask agree byte-for-byte.
+    let root_tokens = root.tokens;
     root.queues
         .iter()
-        .filter(|queue| queue.config.exact && queue.config.guarantee_enabled && queue.hot.runnable)
-        .filter_map(|queue| {
-            let head = cos_queue_front(queue)?;
-            let head_len = cos_item_len(head);
-            (root.tokens >= head_len && queue.hot.tokens >= head_len)
-                .then_some(queue.hot.queued_bytes)
+        .filter(|queue| {
+            queue.config.exact
+                && queue.config.guarantee_enabled
+                && cos_exact_queue_serviceable(root_tokens, queue)
         })
-        .fold(0u64, |acc, bytes| acc.saturating_add(bytes))
+        .fold(0u64, |acc, queue| acc.saturating_add(queue.hot.queued_bytes))
 }
 
 #[inline]
 fn exact_backlog_queue_mask(root: &CoSInterfaceRuntime) -> u64 {
+    // #hb166 T-6(b): the published exact-demand MASK (read by peer workers
+    // as `peer_exact_demand_queue_mask` for their BE-surplus reservation)
+    // must also reflect serviceability, not just non-emptiness — otherwise
+    // a peer over-reserves for this node's starved/parked exact class and
+    // starves best-effort while the link idles. Same predicate as
+    // `serviceable_exact_backlog_bytes` / `root_exact_demand_queue_mask`.
+    let root_tokens = root.tokens;
     root.queues
         .iter()
         .enumerate()
         .filter(|(_, queue)| {
-            queue.config.exact && queue.config.guarantee_enabled && !cos_queue_is_empty(queue)
+            queue.config.exact
+                && queue.config.guarantee_enabled
+                && cos_exact_queue_serviceable(root_tokens, queue)
         })
         .fold(0u64, |acc, (queue_idx, _)| {
             if queue_idx < u64::BITS as usize {
