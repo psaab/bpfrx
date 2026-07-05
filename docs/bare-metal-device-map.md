@@ -60,8 +60,16 @@ the console is your lifeline.
    ```
    commit confirmed 5
    ... verify reachability + forwarding ...
-   commit check        # or just `commit` to confirm
+   commit              # confirms the pending commit-confirmed
    ```
+
+   Confirm with a plain **`commit`** (Junos semantics: any subsequent
+   explicit `commit` confirms a pending `commit confirmed` —
+   `pkg/configstore/store_commit.go:106-120`). Do **not** rely on `commit
+   check` — it only VALIDATES the candidate and never touches the confirm
+   timer (`CommitCheck`, `store_commit.go:26-41`), so the window still
+   expires and the daemon auto-rolls-back the just-verified device-map at
+   T+5m.
 
 4. Verify the resolved bindings:
 

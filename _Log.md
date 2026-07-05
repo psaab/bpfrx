@@ -34027,3 +34027,15 @@ top.
   failed); go build ./... green. No doc change: no doc documents the
   Rust policy-engine per-arm test coverage.
 - **File(s)**: userspace-dp/src/policy_tests.rs, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 H-18 (#4194) — fix docs/bare-metal-device-map.md
+  quick-start step 3, which told the operator `commit check` confirms a
+  `commit confirmed`. It does not: `CommitCheck`
+  (`pkg/configstore/store_commit.go:26-41`) only validates and never
+  touches the confirm timer, so following the doc lets the T+5m window
+  expire and auto-rollback the just-verified device-map. The confirming
+  command is a plain `commit` (`store_commit.go:106-120`:
+  `clearPendingConfirmLocked` cancels the timer). Rewrote step 3 to
+  confirm with `commit` and warn that `commit check` alone rolls back.
+- **File(s)**: docs/bare-metal-device-map.md, _Log.md
