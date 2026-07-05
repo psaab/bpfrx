@@ -1,3 +1,43 @@
+## 2026-07-04 — #4161 (fable-review-164 M-3) + L-9: source-NAT most-specific-scope-wins
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Source-NAT rule-set precedence was config-order
+    first-match, scope-BLIND to specificity — a broader-scope rule-set
+    defined earlier in the config won over a more-specific rule-set
+    defined later, so a vSRX-correct config could pick the wrong
+    translation (or bypass a more-specific `then source-nat off`
+    exemption) purely from text ordering.
+  - **Fix**: STABLE-sort the emitted `SourceNATRuleSnapshot` slice by
+    Junos context tier in `buildSourceNATSnapshotsWithFeeds`
+    (`pkg/dataplane/userspace/nat.go`) — interface=0, zone=1,
+    routing-instance=2, unscoped=3, `tier = MIN(from-tier, to-tier)`
+    when a rule-set carries both a `from` and a `to` context. Same-tier
+    ties keep config order (stable sort → within-rule-set order + no
+    interleaving). Tier is a pure function of the six scope fields
+    already stamped since #3096; no new wire plumbing. The Rust matcher
+    (`nat/source.rs match_source_nat_result_for_tuple`) is left as a
+    first-match loop — a tier-sorted Vec makes first-match ==
+    most-specific-match. Comments added at both the Go sort site and the
+    Rust loop record that precedence now lives in the snapshot ORDER.
+    New helpers `sourceNATScopeTier` / `scopeContextTier` + tier consts.
+  - **L-9 test-gap (paired)**: `nat_scope_precedence_4161_test.go` —
+    tier-value table (incl. from-vs-to MIN), interface-defined-LAST
+    still wins (the finding's own trace), full
+    interface>zone>routing-instance>unscoped ordering declared in
+    reverse, same-tier config-order + rule contiguity, from-vs-to MIN
+    wins, and single-scope identity (existing configs unaffected).
+    Verified RED-on-revert: removing the sort turns the ordering tests
+    RED (`[rs-zone rs-if]`, `[rs-unscoped rs-ri rs-zone rs-if]`); the
+    tier-value + identity tests stay green. `go test ./pkg/dataplane/...`
+    green; `go build ./...`, gofmt, vet clean.
+  - **Scope note**: SNAT only. DNAT (`destination.rs match_entries`) and
+    static (`static_nat.rs pick_scoped`) tier only zone-scoped-vs-zone-
+    wildcard — the same latent interface-vs-zone gap — a SEPARATE
+    out-of-scope follow-up.
+  - **File(s)**: pkg/dataplane/userspace/nat.go,
+    pkg/dataplane/userspace/nat_scope_precedence_4161_test.go,
+    userspace-dp/src/nat/source.rs,
+    docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-07-04 — #4163 (fable-review-164 L-12): DHCP-relay reply source validation
 
 - **Timestamp**: 2026-07-04

@@ -825,6 +825,14 @@ pub(crate) fn match_source_nat_result_for_tuple(
         src_port,
         dst_port,
     };
+    // #4161: this is first-match on slice order, and that is INTENTIONALLY
+    // most-specific-scope-wins. The Go snapshot builder
+    // (pkg/dataplane/userspace/nat.go buildSourceNATSnapshotsWithFeeds) STABLE-
+    // sorts the rule-sets by Junos context specificity (interface > zone >
+    // routing-instance > unscoped) before publishing, with config order as the
+    // tie-break, so the first rule that matches here is the most-specific one.
+    // Precedence therefore lives in the snapshot ORDER, not in this loop — do
+    // not re-sort or assume raw config order.
     for rule in rules {
         if !rule.matches(
             scope, from_zone, to_zone, src_ip, dst_ip, protocol, src_port, dst_port,

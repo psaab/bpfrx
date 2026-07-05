@@ -652,6 +652,25 @@ the NAT module applies it:
   helper restart does not. #1449 closes HA behavior as an explicit userspace
   capability gate: HA configs using persistent source-NAT pools are not
   admitted because persistent leases are not synchronized.
+- **Rule-set precedence — most-specific-scope-wins (#4161).** When several
+  source-NAT rule-sets overlap on a flow, selection follows Junos: the rule-set
+  whose match CONTEXT is most specific wins — **interface > zone >
+  routing-instance > unscoped** — and only THEN does within-rule-set rule order
+  apply. This is NOT config-order first-match. The Rust matcher
+  (`match_source_nat_result_for_tuple`, `nat/source.rs`) is a first-match loop
+  over the published slice; precedence is achieved entirely on the Go side by
+  **stable-sorting** the emitted `SourceNATRuleSnapshot` slice by context tier
+  in `buildSourceNATSnapshotsWithFeeds` (`pkg/dataplane/userspace/nat.go`)
+  before publishing, so "first match" == "most-specific match". The tier is a
+  pure function of the six scope fields already carried since #3096
+  (From/To Zone/Interface/RoutingInstance); a rule-set carrying both a `from`
+  and a `to` context of different kinds is ranked by the MORE-specific of the
+  two (`tier = MIN(from-tier, to-tier)`, the vSRX default). Same-tier ties keep
+  config order (stable sort), and each rule-set's rules stay contiguous, so
+  rule-sets never interleave. This aligns SNAT with the DNAT/static
+  most-specific-wins DIRECTION, though those two tables currently rank only
+  zone-scoped-vs-zone-wildcard (a narrower axis that does not yet rank interface
+  above zone) — extending the full hierarchy to them is a tracked follow-up.
 - **Checksum update:** Incremental RFC 1624 checksum adjustment for
   IP header + TCP/UDP pseudo-header. Avoids full recomputation.
 
