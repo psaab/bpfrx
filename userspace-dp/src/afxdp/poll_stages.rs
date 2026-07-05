@@ -376,6 +376,15 @@ pub(super) fn stage_screen_check(
     if !screen.has_profiles() {
         return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     }
+    // #4155: a fabric-redirected packet (stage 9 set FABRIC_INGRESS_FLAG on
+    // `meta.meta_flags`) was already rate-screened on the peer ingress node
+    // before it crossed the fabric link. Skip the rate-based flood counters
+    // (icmp/udp/syn-flood) on the RG owner so the same packet is not counted
+    // twice against the per-zone / per-destination flood thresholds — a legit
+    // high-pps synced session would otherwise false-trip a flood Drop and
+    // defeat fabric cross-chassis forwarding. The stateless per-packet screens
+    // still run (idempotent). See docs/fabric-cross-chassis-fwd.md.
+    let skip_rate_flood = (meta.meta_flags & FABRIC_INGRESS_FLAG) != 0;
     // Zone resolution is flow-INDEPENDENT: it is keyed on the packet's
     // ingress context (logical ifindex / VLAN / fabric override), not on the
     // transport flow. Resolving it BEFORE branching on `flow` lets the
@@ -486,7 +495,13 @@ pub(super) fn stage_screen_check(
                 return StageOutcome::RecycleAndContinue;
             }
         };
-        return match screen.check_flowless_screens(zone_name, &screen_pkt, addrs_known, now_secs) {
+        return match screen.check_flowless_screens_opts(
+            zone_name,
+            &screen_pkt,
+            addrs_known,
+            now_secs,
+            skip_rate_flood,
+        ) {
             ScreenVerdict::Drop(reason) => {
                 emit_screen_drop_event(
                     worker_ctx.event_stream,
@@ -539,7 +554,8 @@ pub(super) fn stage_screen_check(
             return StageOutcome::RecycleAndContinue;
         }
     };
-    let verdict = screen.check_packet_with_zone_id(zone_name, zone_id, &screen_pkt, now_secs);
+    let verdict = screen
+        .check_packet_with_zone_id_opts(zone_name, zone_id, &screen_pkt, now_secs, skip_rate_flood);
     // #3315: drain a pending SYN-flood alarm (alarm-threshold crossed below
     // attack-threshold). Like scan-table-pressure this is a log-only PERMIT
     // alarm — it does NOT drop and is rate-limited to ≤1/sec/zone in the screen
@@ -2541,6 +2557,79 @@ mod tests {
             !dropped && drops == 0,
             "regression: a benign non-fragmented packet still passes the \
              flow path with no false positive"
+        );
+    }
+
+    /// Zone `lan` screen arming ONLY the UDP flood counter (per-zone /
+    /// per-destination), threshold `n`. Used to prove the #4155 fabric skip:
+    /// a fabric-redirected packet must NOT tick this counter on the owner.
+    fn udp_flood_screen(n: u32) -> ScreenState {
+        let mut profiles = FxHashMap::default();
+        profiles.insert(
+            "lan".to_string(),
+            ScreenProfile {
+                udp_flood_threshold: n,
+                ..ScreenProfile::default()
+            },
+        );
+        let mut screen = ScreenState::new();
+        screen.update_profiles(profiles);
+        screen
+    }
+
+    /// #4155 fail-on-revert (integration, flood double-count): drive the LIVE
+    /// `stage_screen_check` with a benign flowless non-first UDP fragment on
+    /// zone `lan` well past a UDP flood threshold of 2, once with a
+    /// FABRIC-INGRESS meta (`meta_flags = FABRIC_INGRESS_FLAG`, as stage 9
+    /// sets for a fabric-redirected packet) and once with a DIRECT-ingress
+    /// meta. The fabric packet must NEVER drop (the ingress node already
+    /// counted it; the owner must not re-count), while the direct packet
+    /// crosses the threshold and drops. Reverting the
+    /// `skip_rate_flood`/`FABRIC_INGRESS_FLAG` gate re-counts the fabric
+    /// packet and turns the fabric-Pass assertion RED.
+    #[test]
+    fn fabric_ingress_skips_rate_flood_direct_still_counts_4155() {
+        // frag_off field 185 (offset 1480 bytes, MF=0) → benign non-first
+        // tail fragment: flowless (#2344) and trips no L3 fragment screen
+        // (payload 100 ≥ 8; 1480 + 120 < 65535). Only the source-independent
+        // UDP flood counter can act on it.
+        const FRAG_PROTO_UDP: u8 = 17;
+        let frame = ipv4_fragment_frame(0x00B9, FRAG_PROTO_UDP, 100);
+        let direct_meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+        assert!(
+            parse_session_flow_from_bytes(&frame, direct_meta).is_none(),
+            "benign non-first fragment must be flowless so the flowless \
+             screen path (with the rate flood counter) runs"
+        );
+        let mut fabric_meta = direct_meta;
+        fabric_meta.meta_flags |= FABRIC_INGRESS_FLAG;
+
+        // Fabric-redirected: the owner must NOT tick the UDP flood counter,
+        // so the packet passes on every iteration regardless of rate.
+        let mut fab_screen = udp_flood_screen(2);
+        for i in 0..8 {
+            let (dropped, drops) = run_stage_screen(&mut fab_screen, &frame, fabric_meta, None);
+            assert!(
+                !dropped && drops == 0,
+                "iteration {i}: a FABRIC-redirected packet was already \
+                 flood-screened on the ingress node; the owner must not \
+                 re-count it (double-count would false-trip udp-flood)"
+            );
+        }
+
+        // Direct ingress on the SAME zone: the counter runs and the third
+        // packet (threshold 2) drops — proving the skip is scoped to fabric
+        // traffic and the flood screen still protects direct ingress at the
+        // CORRECT count (not halved by a phantom fabric double-count).
+        let mut direct_screen = udp_flood_screen(2);
+        let (d1, c1) = run_stage_screen(&mut direct_screen, &frame, direct_meta, None);
+        let (d2, c2) = run_stage_screen(&mut direct_screen, &frame, direct_meta, None);
+        let (d3, c3) = run_stage_screen(&mut direct_screen, &frame, direct_meta, None);
+        assert!(!d1 && c1 == 0, "1st direct packet under threshold passes");
+        assert!(!d2 && c2 == 0, "2nd direct packet at threshold passes");
+        assert!(
+            d3 && c3 == 1,
+            "3rd direct packet crosses udp-flood threshold 2 and DROPS"
         );
     }
 }

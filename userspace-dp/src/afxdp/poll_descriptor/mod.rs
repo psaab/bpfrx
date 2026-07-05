@@ -1780,14 +1780,28 @@ pub(super) fn poll_binding_process_descriptor(
                             l3_off,
                         )
                         .unwrap_or_else(|_| screen_parse_error_info(&meta, flow));
-                        let new_flow_screen_reason = screen
-                            .scan_sweep_drop_on_new_flow(
+                        let new_flow_screen_reason = (if packet_fabric_ingress {
+                            // #4155: a fabric-redirected packet was already
+                            // scan/sweep-screened on the peer ingress node
+                            // before it crossed the fabric link. In the
+                            // session-sync race window it can arrive here as a
+                            // session MISS; re-running the per-(zone,src)
+                            // scan/sweep counter on the RG owner would
+                            // double-count the same new flow. The ingress node
+                            // owns scan/sweep for this packet — skip it here.
+                            // (Session-limit enforcement below still runs: it
+                            // guards the owner's own SessionTable, which the
+                            // ingress node did not populate.)
+                            None
+                        } else {
+                            screen.scan_sweep_drop_on_new_flow(
                                 from_zone,
                                 from_zone_id,
                                 &screen_pkt,
                                 now_secs,
                             )
-                            // #2134: per-IP session-limit enforcement at the
+                        })
+                        // #2134: per-IP session-limit enforcement at the
                             // new-flow decision. This dominates BOTH counted
                             // install sites below (LocalMiss host-inbound and
                             // ForwardFlow transit), fires exactly once per new
