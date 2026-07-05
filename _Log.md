@@ -1,3 +1,23 @@
+## 2026-07-05 — fable-167 PR #4295 Copilot fold: scrub two secret-leak-to-logs paths (VRRP auth-key + SNMP community)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Copilot review of PR #4295 found the security PR's OWN
+    error/log paths echoed the secrets they protect.
+    (1) I-1 VRRP reject built nodePath from the full vrrp-group Keys run;
+    in the Keys-packed spelling (`vrrp-group 1 authentication-key <sec>;`)
+    that run carries the auth-key VALUE, so the strict error / lenient
+    warning leaked the secret into logs + CLI. Fixed with `vrrpGroupIDKeys`
+    (identity-only `vrrp-group <id>`); message now value-free in BOTH AST
+    shapes. New RED-on-revert tests
+    `TestVRRPAuthenticationRejectDoesNotLeakSecret_{KeysPacked,FlatSet}` +
+    `...WarnDoesNotLeakSecret_KeysPacked`.
+    (2) S-3 SNMP source-denied path logged the v2c community string (the
+    shared secret). Scrubbed to log only `src` + `known_community=true`.
+    Pre-existing `"SNMP: invalid community"` leak (commit c10fc9a1f) left
+    as-is (out of scope).
+  - **File(s)**: pkg/config/compiler_interfaces.go,
+    pkg/config/vrrp_authentication_4288_test.go, pkg/snmp/agent.go, _Log.md
+
 ## 2026-07-05 — fable-review-167 parity SECURITY: family any v6 fail-open (#4287), VRRP auth false-security (#4288), SNMP community clients (#4289)
 
 - **Timestamp**: 2026-07-05

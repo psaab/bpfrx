@@ -911,11 +911,21 @@ func validateVRRPAuthenticationAST(nodes []*Node, prefix string, lenient bool) (
 		nodePath := joinNodePath(prefix, n.Keys)
 		if n.Name() == "vrrp-group" {
 			if leaf := vrrpAuthLeaf(n); leaf != "" {
+				// SECURITY: build the message path from the group IDENTITY
+				// ONLY (`vrrp-group <id>`), never n.Keys — in the Keys-packed
+				// spelling (`vrrp-group 1 authentication-key <secret>;`) the
+				// node's Keys run carries the authentication-key VALUE, so
+				// joinNodePath(prefix, n.Keys) would ECHO the secret into the
+				// commit error / lenient warning (logs + CLI). vrrpGroupIDKeys
+				// truncates to the value-free identity; `prefix` is composed of
+				// ancestor container keys (interface/unit/family/address) which
+				// carry no secret leaf value.
+				idPath := joinNodePath(prefix, vrrpGroupIDKeys(n))
 				msg := fmt.Sprintf("%s: VRRP %s is configured but NOT enforced — "+
 					"the dataplane is RFC 5798 VRRPv3, which removed authentication; "+
 					"adverts are unauthenticated regardless, so a rogue host can hijack "+
 					"mastership. Remove the authentication statement (#4288)",
-					nodePath, leaf)
+					idPath, leaf)
 				if !lenient {
 					return nil, fmt.Errorf("%s", msg)
 				}
@@ -929,6 +939,19 @@ func validateVRRPAuthenticationAST(nodes []*Node, prefix string, lenient bool) (
 		}
 	}
 	return warnings, nil
+}
+
+// vrrpGroupIDKeys returns the value-free identity keys of a vrrp-group node —
+// `["vrrp-group", "<id>"]` — dropping any trailing tokens that the Keys-packed
+// spelling (`vrrp-group 1 authentication-key <secret>;`) folds onto the same
+// Keys run. Used to build a diagnostic path that never echoes a leaf VALUE (the
+// authentication-key is a secret; see validateVRRPAuthenticationAST). vrrp-group
+// is `args: 1`, so the identity is exactly the first two keys.
+func vrrpGroupIDKeys(n *Node) []string {
+	if len(n.Keys) >= 2 {
+		return n.Keys[:2]
+	}
+	return n.Keys
 }
 
 // vrrpAuthLeaf returns the first authentication leaf name

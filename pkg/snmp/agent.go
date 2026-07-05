@@ -581,8 +581,14 @@ func (a *Agent) handleV2cPacket(rest []byte, srcIP net.IP) []byte {
 	// query from a non-permitted source is silently dropped (no response, as
 	// with an unknown community). A community without `clients` is allow-all.
 	if !comm.AllowsSource(srcIP) {
-		slog.Debug("SNMP: community source not permitted",
-			"community", string(community), "src", srcIP)
+		// SECURITY: do NOT log the community string — it is the v2c shared
+		// secret (SNMPCommunity.Name, redacted everywhere else). Log only the
+		// source; known_community=true distinguishes this source-denied KNOWN
+		// community from the unknown-community drop above (which also logs no
+		// secret value here) so a source-restriction denial can be correlated
+		// without exposing the secret (#4289).
+		slog.Debug("SNMP: source not permitted for community",
+			"src", srcIP, "known_community", true)
 		return nil
 	}
 

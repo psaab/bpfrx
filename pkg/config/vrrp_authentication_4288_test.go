@@ -122,3 +122,86 @@ func TestVRRPNoAuthenticationCommits(t *testing.T) {
 		t.Fatal("expected the vrrp-group to compile")
 	}
 }
+
+// SECURITY (Copilot fable-167 review): the reject error / lenient warning must
+// NOT echo the authentication-key VALUE (it is a secret). In the Keys-packed
+// hierarchical leaf spelling `vrrp-group 1 authentication-key <secret>;` the
+// value rides on the vrrp-group node's Keys run, so a message built from the
+// full Keys would leak it into logs + CLI. The message must carry only the
+// group IDENTITY (`vrrp-group 1`). RED-on-revert: building the path from n.Keys
+// puts the secret into the error string.
+const vrrpAuthSecret = "SUPERSECRETVRRPKEY"
+
+func TestVRRPAuthenticationRejectDoesNotLeakSecret_KeysPacked(t *testing.T) {
+	// Hierarchical leaf form packs the value onto the vrrp-group node's Keys.
+	tree := parseHier(t, `interfaces {
+    reth0 {
+        unit 0 {
+            family inet {
+                address 10.0.61.10/24 {
+                    vrrp-group 1 authentication-key `+vrrpAuthSecret+`;
+                }
+            }
+        }
+    }
+}`)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected rejection of Keys-packed VRRP authentication-key, got nil")
+	}
+	if strings.Contains(err.Error(), vrrpAuthSecret) {
+		t.Fatalf("reject error LEAKED the authentication-key secret: %v", err)
+	}
+	// It must still identify the offending group without any leaf value.
+	if !strings.Contains(err.Error(), "vrrp-group 1") || !strings.Contains(err.Error(), "#4288") {
+		t.Fatalf("reject error must name the group identity + #4288, got: %v", err)
+	}
+}
+
+func TestVRRPAuthenticationRejectDoesNotLeakSecret_FlatSet(t *testing.T) {
+	tree := replaySetLines(t, []string{
+		"set interfaces reth0 unit 0 family inet address 10.0.61.10/24 vrrp-group 1 virtual-address 10.0.61.1/24",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.10/24 vrrp-group 1 authentication-key " + vrrpAuthSecret,
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected rejection of flat-set VRRP authentication-key, got nil")
+	}
+	if strings.Contains(err.Error(), vrrpAuthSecret) {
+		t.Fatalf("reject error LEAKED the authentication-key secret: %v", err)
+	}
+	if !strings.Contains(err.Error(), "vrrp-group 1") || !strings.Contains(err.Error(), "#4288") {
+		t.Fatalf("reject error must name the group identity + #4288, got: %v", err)
+	}
+}
+
+// The lenient warning must also be value-free.
+func TestVRRPAuthenticationWarnDoesNotLeakSecret_KeysPacked(t *testing.T) {
+	tree := parseHier(t, `interfaces {
+    reth0 {
+        unit 0 {
+            family inet {
+                address 10.0.61.10/24 {
+                    vrrp-group 1 authentication-key `+vrrpAuthSecret+`;
+                }
+            }
+        }
+    }
+}`)
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	sawWarn := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#4288") {
+			sawWarn = true
+			if strings.Contains(w, vrrpAuthSecret) {
+				t.Fatalf("lenient warning LEAKED the authentication-key secret: %q", w)
+			}
+		}
+	}
+	if !sawWarn {
+		t.Fatalf("expected a #4288 lenient warning, got: %v", cfg.Warnings)
+	}
+}
