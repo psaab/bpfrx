@@ -355,13 +355,53 @@ def deploy_incus(ap, runner, start):
         print(f"{name} created (not started): incus start {name}")
 
 
+# Directory libvirt/KVM keeps its qcow2 disks in (the default pool path).
+LIBVIRT_IMAGES = "/var/lib/libvirt/images"
+
+
+def libvirt_disk(ap, runner):
+    """Return a per-VM writable qcow2 backed READ-ONLY by the golden image.
+
+    The golden image ({image}.qcow2) must NEVER be attached writable:
+    qcow2 is not a cluster filesystem, so an HA pair booting two live
+    domains off one file corrupts it (concurrent metadata/refcount
+    writes), and even a single `virt-install --import` would mutate the
+    golden master in place — the day-0 stamp, host keys, and configstore
+    DB would get baked into it, and the NEXT VM launched "from the image"
+    would inherit the previous VM's identity and skip its own config.
+
+    Each domain gets its OWN copy-on-write overlay instead
+    (`qemu-img create -f qcow2 -b <golden> -F qcow2 <overlay>`), so the
+    golden stays an immutable shared backing store and each VM writes
+    only to its distinct {name}.qcow2. A re-deploy re-creates the overlay
+    (a fresh boot from golden); `virt-install --name` still refuses to
+    redefine a live domain, so a running VM's overlay is not clobbered
+    out from under it.
+    """
+    golden = os.path.join(LIBVIRT_IMAGES, f"{ap['image']}.qcow2")
+    overlay = os.path.join(LIBVIRT_IMAGES, f"{ap['name']}.qcow2")
+    if os.path.abspath(overlay) == os.path.abspath(golden):
+        die(f"VM name '{ap['name']}' collides with the golden image basename "
+            f"'{ap['image']}' — the per-VM overlay would overwrite the golden "
+            f"image. Rename the appliance (name:) or the image (image:).")
+    if not runner.dry and not os.path.isfile(golden):
+        die(f"golden image not found: {golden} — fetch/import it first "
+            f"(see `xpf-deploy.py fetch`) or set image: in the YAML.")
+    # Fresh overlay per deploy so the VM boots clean from golden; the
+    # golden is the read-only -b backing store and is never written.
+    runner.run(["qemu-img", "create", "-f", "qcow2",
+                "-b", golden, "-F", "qcow2", overlay])
+    return overlay
+
+
 def deploy_libvirt(ap, runner, start):
     name = ap["name"]
     print_map(ap)
     iso = build_config_drive(ap, runner)
+    disk = libvirt_disk(ap, runner)
     argv = ["virt-install", "--name", name, "--memory", str(memory_mb(ap["memory"])),
             "--vcpus", str(ap["cpu"]), "--import",
-            "--disk", f"path=/var/lib/libvirt/images/{ap['image']}.qcow2",
+            "--disk", f"path={disk}",
             "--osinfo", "ubuntu26.04", "--noautoconsole"]
     if iso:
         argv += ["--disk", f"path={iso},device=cdrom"]
