@@ -914,6 +914,23 @@ func ValidateConfig(cfg *Config) []string {
 	// must not brick a previously-committed config).
 	warnings = append(warnings, validateDefaultPolicyLogWarnings(cfg)...)
 
+	// #4146 (H-1 slice c): warn when a `to-zone junos-host` policy expresses a
+	// constraint STRICTER than the coarse kernel host-inbound gate can enforce
+	// on the DIRECT host-bound path. Ordinary traffic to a firewall interface
+	// IP is delivered by the Linux kernel — the XDP shim shunts local-destined
+	// packets to the kernel on a session miss (userspace-xdp/src/lib.rs
+	// is_local_destination) — and the nft xpf_hostinbound chain admits
+	// configured system-services from ANY source with no per-source /
+	// per-application deny. The fine junos-host restriction is enforced only on
+	// the userspace AF_XDP LocalDelivery path (e.g. DNAT/static-NAT to a
+	// firewall-local address), which the direct host-bound packet never
+	// reaches, so a configured deny (or source-scoped permit) is silently
+	// unenforced there — a false sense of security. WARN-only: the config is
+	// legal Junos and the enforcement decision (a/b) is PLAN-DEFERRED
+	// (availability-vs-security tradeoff). See docs/host-inbound-service-
+	// matrix.md "to-zone junos-host and the direct host-bound path".
+	warnings = append(warnings, validateJunosHostDirectDeliveryWarnings(cfg)...)
+
 	return warnings
 }
 
@@ -955,6 +972,133 @@ func validateDefaultPolicyLogWarnings(cfg *Config) []string {
 			"is already logged via the policy-deny RT_FLOW record). These flags "+
 			"take effect only with `default-policy permit-all`",
 		strings.Join(modes, "/"), action)}
+}
+
+// junosHostPolicySourceScoped reports whether a policy match carries a genuine
+// source-address restriction — i.e. it is narrower than "any source". A match
+// with only the reserved wildcards (`any`/`any-ipv4`/`any-ipv6`/the empty
+// token) is NOT scoped; a match naming a concrete address-book entry, literal
+// prefix, or feed binding IS. `source-address-excluded` is inherently a
+// restriction (permit/deny all EXCEPT the named sources) and so counts as
+// scoped regardless of the token. Mirrors the wildcard set recognized by
+// policyMatchAddressTokenRecognized (#3958) so the two agree on "any".
+func junosHostPolicySourceScoped(m PolicyMatch) bool {
+	if m.SourceAddressExcluded {
+		return true
+	}
+	for _, a := range m.SourceAddresses {
+		switch a {
+		case "", "any", "any-ipv4", "any-ipv6":
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// junosHostPolicyStricterThanCoarseGate reports whether a `to-zone junos-host`
+// policy expresses a constraint the coarse kernel host-inbound gate cannot
+// enforce on the direct host-bound path, and if so a short human label for the
+// reason. The nft `xpf_hostinbound` chain (the PRIMARY enforcement for
+// host-bound traffic the XDP shim shunts to the kernel) is permit-by-service
+// only: it admits configured `system-services`/`protocols` to a firewall-local
+// address from ANY source, with no per-source or per-application DENY. So a
+// junos-host policy is stricter — and therefore silently unenforced on the
+// direct path — when it:
+//   - denies/rejects: the coarse gate cannot deny a service it permits, OR
+//   - permits but restricts the source: the coarse gate admits any source.
+//
+// A plain `then permit` from any source only mirrors (or loosens) the coarse
+// permit-by-service gate and adds no restriction the coarse gate lacks, so it
+// does NOT warn — the conservative trigger the #4146 plan calls for (warn only
+// on a genuinely stricter-than-coarse-gate junos-host policy, not every one).
+// An application-only scope is deliberately not a standalone trigger: the
+// coarse gate already filters by service/dport, so a narrow single-port
+// application largely overlaps it; only the deny and the source restriction are
+// dimensions the coarse gate has no expression for at all.
+func junosHostPolicyStricterThanCoarseGate(action PolicyAction, m PolicyMatch) (bool, string) {
+	switch action {
+	case PolicyDeny:
+		return true, "deny"
+	case PolicyReject:
+		return true, "reject"
+	}
+	if junosHostPolicySourceScoped(m) {
+		return true, "source-restricted permit"
+	}
+	return false, ""
+}
+
+// validateJunosHostDirectDeliveryWarnings emits a WARN-only commit-time message
+// for each `to-zone junos-host` security policy — zone-pair or global — that is
+// stricter than the coarse kernel host-inbound gate can enforce on the DIRECT
+// host-bound path (#4146 H-1 slice c).
+//
+// The gap: ordinary traffic to a firewall interface IP is delivered by the
+// Linux kernel (the XDP shim shunts local-destined packets to the kernel on a
+// session miss — userspace-xdp/src/lib.rs is_local_destination →
+// cpumap_or_pass), whose nft `xpf_hostinbound` chain has no junos-host
+// awareness: it admits configured system-services from any source with no
+// per-source / per-application deny. The fine `to-zone junos-host` restriction
+// runs only on the userspace AF_XDP LocalDelivery path
+// (junos_host_local_policy), which a direct host-bound packet never reaches.
+// So a configured deny (or source-scoped permit) to junos-host is silently
+// unenforced on the primary host-bound path — a false sense of security this
+// warning surfaces at commit.
+//
+// It is never an error: the config is legal Junos, and the actual enforcement
+// fix (withhold the IP from the local set / mirror the policy into nft) is a
+// PLAN-DEFERRED availability-vs-security decision (#4146 directions a/b) — a
+// hard reject would also brick a previously-committed config. Iteration is over
+// the ordered policy slices (deterministic by config order), so the warnings
+// are stable across commits.
+func validateJunosHostDirectDeliveryWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	msg := func(who, reason string) string {
+		return fmt.Sprintf(
+			"security policy %s expresses a %s to-zone junos-host that the kernel "+
+				"host-inbound gate cannot enforce on the direct host-bound path: "+
+				"traffic to a firewall interface IP is delivered by the kernel (the "+
+				"XDP shim shunts local-destined packets to it on a session miss) and "+
+				"nft xpf_hostinbound admits configured system-services from ANY "+
+				"source with no per-source/per-application deny. The junos-host "+
+				"restriction is enforced only on the userspace AF_XDP local-delivery "+
+				"path (e.g. DNAT/static-NAT to a firewall-local address), so this "+
+				"management-plane restriction may not fully apply to the direct path "+
+				"(#4146, known vSRX-parity limitation — see "+
+				"docs/host-inbound-service-matrix.md)",
+			who, reason)
+	}
+	// Zone-pair policies: `from-zone X to-zone junos-host { policy ... }`.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil || zpp.ToZone != "junos-host" {
+			continue
+		}
+		for _, p := range zpp.Policies {
+			if p == nil {
+				continue
+			}
+			if stricter, reason := junosHostPolicyStricterThanCoarseGate(p.Action, p.Match); stricter {
+				warnings = append(warnings, msg(fmt.Sprintf(
+					"%q (from-zone %q)", p.Name, zpp.FromZone), reason))
+			}
+		}
+	}
+	// Global policies with a `match to-zone junos-host` context (#3639). A
+	// `match from-zone junos-host` global is already hard-rejected at commit
+	// (validatePolicyZoneReferencesStrict), so it never reaches here.
+	for _, p := range cfg.Security.GlobalPolicies {
+		if p == nil || p.Match.ToZone != "junos-host" {
+			continue
+		}
+		if stricter, reason := junosHostPolicyStricterThanCoarseGate(p.Action, p.Match); stricter {
+			warnings = append(warnings, msg(fmt.Sprintf("global %q", p.Name), reason))
+		}
+	}
+	return warnings
 }
 
 // validatePreIDDefaultPolicyLogWarnings emits a WARN-only commit-time message

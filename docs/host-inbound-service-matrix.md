@@ -391,6 +391,75 @@ path ingress-scoped. Two follow-ons are tracked on #3718:
   distinct host-inbound policies (which Option B rejects). A larger architectural
   fork; deferred until there is demand.
 
+## `to-zone junos-host` policy and the direct host-bound path (#4146)
+
+vSRX layers management-plane admission in two places: the coarse
+`host-inbound-traffic system-services <svc>` port gate above, PLUS a fine
+`security policies from-zone <z> to-zone junos-host` (or a global
+`match to-zone junos-host`) policy that can restrict the source or application
+and can `then deny`. On xpf the fine junos-host policy is **not enforced on the
+primary (direct) host-bound path**, so a stricter-than-coarse junos-host policy
+gives a false sense of security.
+
+### The gap
+
+Ordinary traffic to a firewall interface IP is delivered by the **Linux kernel**,
+not the userspace dataplane. On a session miss the XDP shim's `is_local_destination`
+(`userspace-xdp/src/lib.rs`) returns true for any address in the local set and
+shunts the packet to the kernel (`cpumap_or_pass`). The nft `xpf_hostinbound`
+chain — the PRIMARY enforcement surface documented above — is **permit-by-service
+only**: it admits configured `system-services`/`protocols` to a firewall-local
+address from **any** source, with **no per-source and no per-application deny**.
+The fine `to-zone junos-host` policy runs **only** on the userspace AF_XDP
+`LocalDelivery` path (`junos_host_local_policy`), which is reached only by the
+subset of host-bound traffic that arrives on the XSK fast path (e.g. DNAT /
+static-NAT to a firewall-local address) — never by a direct-to-interface-IP
+packet, which was already shunted to the kernel. Net: a
+`from-zone X to-zone junos-host { match source-address ...; then deny; }` (or a
+source-scoped permit) on a plain interface IP is silently unenforced for the
+direct path; hit counters stay zero. This is distinct from #3019 (which wired the
+deny into the XSK `LocalDelivery` arm) and #3292 (the flowless arm): those are the
+XSK paths that DO enforce it.
+
+### Commit-time warning (direction c — shipped)
+
+`config.validateJunosHostDirectDeliveryWarnings` (`pkg/config/compiler_validate_warn.go`,
+run inside `ValidateConfig`) emits a WARN-only commit message for each `to-zone
+junos-host` policy — zone-pair or global — that is **stricter than the coarse
+gate**: a `then deny`/`then reject` (the coarse gate cannot deny a service it
+permits), or a `then permit` with a source-address restriction (the coarse gate
+admits any source). The trigger is deliberately conservative — a plain
+`permit`-from-any to junos-host only mirrors the coarse permit-by-service gate and
+does **not** warn, and an application-only scope is not a standalone trigger
+because the coarse gate already filters by service/dport. It is **never a hard
+reject**: the config is legal Junos, and a reject would brick a previously
+committed config. The warning names the policy and points here.
+
+### Enforcement (directions a/b — deferred on #4146)
+
+Actually enforcing the fine junos-host restriction on the direct path is a
+security-vs-availability decision, not a mechanical fix, so it stays open on #4146:
+
+- **(a) Withhold junos-host-policy'd interface IPs from the local set**
+  (`buildLocalAddressEntries` / `buildDesiredLocalAddressSets`,
+  `pkg/dataplane/userspace/maps_sync.go`). `is_local_destination` then returns
+  false, the packet falls through to the XSK redirect, and the existing
+  `LocalDelivery` junos-host gate enforces the deny. **Cost:** the XSK
+  redirect-error arm is fail-CLOSED (`drop_degraded_transit` → `XDP_DROP`,
+  `lib.rs`), so a withheld IP is **dropped** while the dataplane helper is down —
+  turning "management always reachable" into "reachable only while the helper is
+  healthy", the exact moment an operator needs to log in. Rejected as specified.
+- **(a′) Route LOCAL destinations to the kernel on the redirect-error arm** plus
+  (a)'s withholding — steady-state enforces the deny, helper-down falls open to
+  kernel delivery. A moderate shim change with a bounded (crash-window-only)
+  fail-open on the deny.
+- **(b) Mirror source/application-scoped junos-host policy into the kernel nft
+  `xpf_hostinbound`/`xpf_lo0` chains** — preserves availability, but nft can
+  express only daddr-set + service/dport, not full application/ALG/feed semantics,
+  so it would be a partial mirror that itself introduces a new (coarser) parity
+  gap, and it doubles the enforcement SSOT. The right long-term parity answer, but
+  needs an nft-representability spec.
+
 ## Adding a new host-inbound service
 
 Adding or changing a token is a coordinated edit across all three surfaces so the
