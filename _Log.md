@@ -34847,3 +34847,30 @@ top.
   the rc-only gate_0 passes both garbage inputs. Closes the Copilot gap.
 - **File(s)**: test/incus/cos-simul-load-smoke.sh, docs/fairness-regimes.md,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 R-7 fix (#4254) — cross-worker V_min gate compared
+  ABSOLUTE `queue_vtime` values, so a reset/rejoining shared_exact worker
+  that restarts at `queue_vtime = 0` broadcast a near-zero vtime and
+  trapped surviving peers (terabytes ahead) in the throttle → hard-cap →
+  1000-suspended-drain duty cycle forever. Root cause: `queue_vtime` is
+  cumulative served-bytes with no shared epoch; a fresh 0 is not
+  comparable to a survivor's absolute value. Fix: seed a rebuilt
+  shared_exact queue's fresh `FlowFairState.queue_vtime` to the current
+  cross-worker peer frontier (MAX participating peer slot) in
+  `promote_cos_queue_flow_fair` — the sole reconstruction site (exact
+  queues never demote). New `SharedCoSQueueVtimeFloor::peer_frontier_vtime`
+  helper. MAX (not the participating V_min) is the do-no-harm seed: a
+  rejoiner at the frontier never lowers an existing peer's V_min and
+  still defers to a GENUINE laggard (a live peer never reconstructed,
+  hence never reseeded — distinguishes "rejoining at 0" from
+  "legitimately behind"). Cold start / full reset → no peer → seed stays
+  0. Added 4 tests incl. the T-7 trap scenario (RED-on-revert proven: the
+  survivor-not-trapped + seed assertions both fail with the seed
+  disabled) and the genuine-laggard-still-deferred distinction. Needs a
+  cluster CoS fairness smoke (fairness-mechanism change).
+- **File(s)**: userspace-dp/src/afxdp/types/shared_cos_lease/vtime.rs,
+  userspace-dp/src/afxdp/cos/admission.rs,
+  userspace-dp/src/afxdp/tx/test_support.rs,
+  userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
+  docs/fairness-regimes.md, _Log.md

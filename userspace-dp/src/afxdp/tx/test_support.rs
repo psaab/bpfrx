@@ -535,6 +535,24 @@ pub(in crate::afxdp) fn test_queue_fast_path_for_promotion(
     }
 }
 
+/// #4254 (R-7): promotion fast-path carrying a real
+/// `SharedCoSQueueVtimeFloor` Arc so tests can drive the production
+/// `promote_cos_queue_flow_fair` reseed path with pre-populated peer
+/// slots. Mirrors `test_queue_fast_path_for_promotion` but attaches the
+/// shared floor the coordinator would clone onto a shared_exact queue.
+pub(in crate::afxdp) fn test_queue_fast_path_for_promotion_with_floor(
+    shared_exact: bool,
+    vtime_floor: Option<Arc<SharedCoSQueueVtimeFloor>>,
+) -> WorkerCoSQueueFastPath {
+    WorkerCoSQueueFastPath {
+        shared_exact,
+        owner_worker_id: 0,
+        owner_live: None,
+        shared_queue_lease: None,
+        vtime_floor,
+    }
+}
+
 /// Build a Prepared CoS item whose frame lives in `umem` at the
 /// given offset. Copies `packet_bytes` into the UMEM in place,
 /// then returns the `CoSPendingTxItem::Prepared` referencing

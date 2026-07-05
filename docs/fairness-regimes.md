@@ -1072,7 +1072,32 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   drain force-continues and arms suspension (#941 work item D).
   Counted distinctly from (not a subset of) the throttle counter; the
   overrides/throttles ratio is the diagnostic for LAG_THRESHOLD tuned
-  too tight.
+  too tight. **Rejoin reseed (#4254, R-7):** `queue_vtime` is a
+  cumulative served-bytes counter with NO shared epoch, so an absolute
+  cross-worker comparison is only meaningful while every participant
+  shares a baseline. A worker whose per-interface CoS runtime is rebuilt
+  — config commit, XDP rebind, per-binding `reset_binding_cos_runtime` —
+  restarts its `FlowFairState` at `queue_vtime = 0`. Left uncorrected,
+  its first post-settle publish broadcasts a near-zero vtime; a
+  surviving peer terabytes ahead then fails the gate every batch and
+  rides the hard-cap → 1000-suspended-drain escape hatch continuously
+  (fairness brake effectively OFF, `hard_cap_overrides` the only counter
+  climbing). To prevent this, `promote_cos_queue_flow_fair`
+  (`cos/admission.rs`) SEEDS a rebuilt shared_exact queue's fresh
+  `queue_vtime` to the current cross-worker **peer frontier** — the MAX
+  participating peer slot, via
+  `SharedCoSQueueVtimeFloor::peer_frontier_vtime`. This is the sole
+  reconstruction site for a shared_exact `FlowFairState` (exact queues
+  never demote). The MAX (rather than the participating V_min) is the
+  do-no-harm seed: a rejoiner placed at the frontier can never become a
+  new V_min below an existing peer, so it does not perturb the
+  survivors' throttle decisions, yet it still defers to a GENUINE
+  laggard (a live peer at a real lower vtime, never reconstructed, hence
+  never reseeded — the reseed distinguishes "rejoining at 0" from
+  "legitimately behind"). Cold start / full simultaneous reset → no
+  participating peer → frontier `None` → seed stays 0 (unchanged). Only
+  shared_exact queues carry a `vtime_floor`, so owner-local exact queues
+  keep the plain 0 seed.
 - **`xpf_userspace_cos_sojourn_windowed_min_ns{ifindex=..., queue_id=...}`**
   gauge (#1829 Phase 1): minimum per-packet queue sojourn over the
   last 1-2 100 ms windows, MAX-merged across workers (worst
