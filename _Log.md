@@ -34444,3 +34444,37 @@ top.
   both kept), unioned _Log.md + cos-traffic-shaping.md.
 - **File(s)**: pkg/dataplane/userspace/fairness.go,
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-167 P-1/P-3/P-4 (issues #4230/#4231/#4232).
+  P-1: reject the zone-pair `from-zone junos-host to-zone <z>` policy at
+  strict commit (host-ORIGINATED traffic egresses via the kernel TX path,
+  never the AF_XDP RX gate, so it committed clean and was silently inert;
+  policyZoneSpecialTokens exempted junos-host from the undefined-zone check).
+  New arm in validatePolicyZoneReferencesStrict mirrors the existing GLOBAL
+  `match from-zone junos-host` gate (#3611 Piece A) and gets the same #1960
+  lenient-load downgrade (warn, not brick). `to-zone junos-host`
+  (host-INBOUND, #3019/#3639) stays supported. Corrected the false "rejected
+  at commit" claims in userspace-dp/src/policy.rs (evaluate_junos_host_policy
+  doc comment) and docs/junos-cli-reference.md — both now state BOTH forms
+  are rejected at STRICT commit (global since #3611 Piece A, zone-pair since
+  #4230). Host-TX-path wiring is a deferred follow-up.
+  P-3: five accepted-only `security flow` knobs (route-change-timeout,
+  sync-icmp-session, force-ip-reassembly, multicast-session-lifetime,
+  preserve-incoming-fragment-size) now typed in setSchema + recorded by
+  compileFlow + emit an accepted-only commit advisory (the #2078
+  tcp-session doctrine). sync-icmp-session gets a stronger HA-specific
+  advisory (ICMP sessions do NOT sync to the peer / survive failover).
+  P-4: accepted-but-inert advisories for unimplemented `security alg <proto>`
+  stanzas (ALGConfig.UnsupportedProtos) and unrecognized direct `policy
+  <name>` children (Policy.UnknownChildren) — both were silently dropped.
+  RED-on-revert tests in pkg/config/fable167_advisory_test.go. go test
+  ./pkg/config/... green; go build ./... green; gofmt/vet clean on touched
+  files. Rust change is comment-only (no cargo run — a full cargo validation
+  is running elsewhere, ≤1 concurrent).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/compiler_security_flow.go,
+  pkg/config/compiler_security_alg.go, pkg/config/compiler_security_policy.go,
+  pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/fable167_advisory_test.go, userspace-dp/src/policy.rs,
+  docs/junos-cli-reference.md, docs/config-schema.md, docs/feature-gaps.md,
+  _Log.md
