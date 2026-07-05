@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -44,8 +43,7 @@ func (s *Server) configStatusHandler(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) configSetHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -61,8 +59,7 @@ func (s *Server) configSetHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -83,8 +80,7 @@ func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 // applyEditLine switch and the path is never mangled into a junk "set" node.
 func (s *Server) configDeactivateHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -102,8 +98,7 @@ func (s *Server) configDeactivateHandler(w http.ResponseWriter, r *http.Request)
 // (#2051), the REST equivalent of the interactive `activate <path>` verb.
 func (s *Server) configActivateHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -160,8 +155,7 @@ func (s *Server) configCommitCheckHandler(w http.ResponseWriter, _ *http.Request
 
 func (s *Server) configRollbackHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigRollbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if err := s.store.Rollback(req.N); err != nil {
@@ -276,8 +270,7 @@ func (s *Server) configSearchHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigLoadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Content == "" {
@@ -316,8 +309,7 @@ func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Request) {
 	var req CommitConfirmedRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if s.commitConfirmedFn == nil {
@@ -372,8 +364,7 @@ func (s *Server) configShowRollbackHandler(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) configAnnotateHandler(w http.ResponseWriter, r *http.Request) {
 	var req AnnotateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, Response{Error: err.Error()})
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Path == "" || req.Comment == "" {
