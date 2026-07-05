@@ -80,6 +80,15 @@ impl PaddedVtimeSlot {
     /// The test `vmin_no_first_enqueue_publish` enforces this
     /// invariant.
     pub(in crate::afxdp) fn publish(&self, vtime: u64) {
+        // #4269 (R-8b): clamp a live vtime strictly below the
+        // NOT_PARTICIPATING sentinel. `queue_vtime` is a saturating
+        // cumulative served-bytes counter; if it ever reached u64::MAX it
+        // would be indistinguishable from the sentinel, and peers would
+        // skip a genuinely-participating worker in the V_min reduction.
+        // Unreachable in practice (~46 yr at 100G) but the clamp is a
+        // one-instruction defense that keeps the sentinel domain disjoint
+        // from the live domain in release builds too.
+        let vtime = vtime.min(NOT_PARTICIPATING - 1);
         debug_assert_ne!(
             vtime, NOT_PARTICIPATING,
             "live vtime must not equal sentinel"
