@@ -465,22 +465,53 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 // the lifeline + protected set from the candidate config itself, and reports
 // whether the map would strand management on next boot.
 //
-// Returns ("", nil) when the config is safe or does not engage device-map mode.
-// A non-empty reason means the config WOULD strand management (check-config
-// must hard-FAIL). err is non-nil ONLY when the NIC inventory could not be
-// read — a transient environmental failure the caller should surface as a
-// warning without failing the check (mirroring deviceMapCommitPreflight's
-// non-blocking stance: the #1922 lifeline is the runtime backstop).
-func CheckDeviceMapStrandsManagement(cfg *config.Config) (string, error) {
+// Returns:
+//   - reason != ""            -> the map WOULD strand management (hard-FAIL).
+//   - reason == "", off==true -> SKIPPED: none of the mapped identities are
+//     present, the OFF-TARGET signal (see below). Not a strand — the on-target
+//     first-boot preflight is the real gate; the caller warns, never fails.
+//   - reason == "", off==false -> checked and safe (or device-map inactive).
+//   - err != nil              -> NIC enumeration failed (transient/environmental).
+//
+// Off-target guard (#4191 review, MAJOR): `xpfd check-config` is invoked OFF
+// the target hardware by the standard day-0 pipeline — the config-drive is
+// built on the BUILD host (scripts/image/make_config_drive.py) and installed
+// from the DEPLOY host (scripts/deploy/xpf-deploy.py). There
+// enumeratePresentNICs SUCCEEDS but returns the BUILD host's NICs, NONE at the
+// target's mapped PCI/MAC identities, so every entry lands BindUnbound and a
+// naive strand check would false-reject a PERFECTLY VALID bare-metal map. When
+// NO mapped identity resolves to any present NIC (every binding is BindUnbound;
+// a bound OR refused entry means the slot IS populated, so that is on-target),
+// skip the check. This keeps the on-target genuine-strand rejection (mapped
+// NICs present but management lost) and the on-target card-swap refusal intact.
+func CheckDeviceMapStrandsManagement(cfg *config.Config) (reason string, offTarget bool, err error) {
 	if cfg == nil || !cfg.Chassis.DeviceMap.Active() {
-		return "", nil
+		return "", false, nil
 	}
 	nics, err := enumeratePresentNICsFn()
 	if err != nil {
-		return "", err
+		return "", false, err
+	}
+	if !anyMappedIdentityPresent(cfg, nics) {
+		return "", true, nil
 	}
 	lifelineName, _ := resolveLifelineCurrentName()
-	return deviceMapStrandsManagement(cfg, nics, protectedForConfig(cfg), lifelineName), nil
+	return deviceMapStrandsManagement(cfg, nics, protectedForConfig(cfg), lifelineName), false, nil
+}
+
+// anyMappedIdentityPresent reports whether ANY device-map entry resolves to a
+// present NIC by identity — i.e. at least one binding is Decisive (bound OR
+// refused: a refused entry means the pinned PCI slot IS populated, just with a
+// swapped card). All-BindUnbound means none of the target's identities are on
+// this host — the off-target signal used by CheckDeviceMapStrandsManagement.
+func anyMappedIdentityPresent(cfg *config.Config, nics []presentNIC) bool {
+	dm := cfg.Chassis.DeviceMap
+	for _, b := range resolveDeviceMap(dm.Entries, nics, rethMembersFromConfig(cfg)) {
+		if b.Status.Decisive() {
+			return true
+		}
+	}
+	return false
 }
 
 // protectedForConfig resolves the #1922 protected set using the SPECIFIC

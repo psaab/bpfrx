@@ -125,20 +125,24 @@ the present hardware while you are still connected:
   (the config restored on timeout), so a confirmed-commit timeout reverts to
   a known-safe config and applies it unconditionally (no split-brain).
 
-The SAME pre-flight now runs on the **day-0 / bootstrap paths** (#4183), which
-also execute on the target hardware (the NIC inventory is available there):
+The SAME pre-flight now runs on the **day-0 / bootstrap paths** (#4183):
 
 - `xpfd check-config <file>` runs the strand pre-flight after the strict
-  parse/schema/compile gate and **hard-FAILs** (exit 2) a device-map that would
-  strand management — so a fat-fingered mgmt PCI BDF on the day-0 drive is
-  caught before the box is installed. (If NIC enumeration fails — e.g. running
-  check-config off-box — the strand check is skipped with a warning, never a
-  false FAIL; the runtime lifeline is the backstop.)
-- `bootstrapFromFile` (first-boot import of `/etc/xpf/xpf.conf`) runs the
-  pre-flight before it commits and **refuses to commit** a stranding config,
-  leaving the daemon in the lifeline-safe bootstrap state instead of coming up
-  console-only from the very first boot. The refusal is recorded as a failed
-  bootstrap import (see the bootstrap-import status below).
+  parse/schema/compile gate. **On the target hardware** (the mapped NICs are
+  present) it **hard-FAILs** (exit 2) a device-map that would strand
+  management — so a fat-fingered mgmt PCI BDF is caught before install. **Run
+  off-target** — the config-drive is normally built on a build host and
+  installed from a deploy host, where none of the target's mapped PCI/MAC
+  identities are present — the check is **skipped with a warning** (NOT a
+  FAIL): with no mapped identity resolving there is no basis to judge a strand,
+  and false-rejecting a valid bare-metal map would break the normal day-0
+  pipeline. The on-target `bootstrapFromFile` pre-flight below is the real gate
+  in that case. (A NIC-enumeration error is likewise a skip-with-warning.)
+- `bootstrapFromFile` (first-boot import of `/etc/xpf/xpf.conf`, which runs ON
+  the target) runs the pre-flight before it commits and **refuses to commit** a
+  stranding config, leaving the daemon in the lifeline-safe bootstrap state
+  instead of coming up console-only from the very first boot. The refusal is
+  recorded as a failed bootstrap import (see the bootstrap-import status below).
 
 ## Day-0 import visibility
 

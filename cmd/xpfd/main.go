@@ -206,14 +206,22 @@ func main() {
 		}
 		// #4183: the strict parse+schema+compile gate above does NOT catch a
 		// device-map that would strand management on next boot — the same
-		// preflight an interactive commit runs. check-config runs ON THE
-		// TARGET HARDWARE (the day-0 NIC inventory is available), so run it
-		// here and hard-FAIL, converting a first-boot console-only lockout
-		// into a day-0 rejection while it can still be fixed.
-		if reason, derr := daemon.CheckDeviceMapStrandsManagement(compiled); derr != nil {
+		// preflight an interactive commit runs. When check-config runs ON THE
+		// TARGET HARDWARE (the mapped NICs are present) this hard-FAILs,
+		// converting a first-boot console-only lockout into a day-0 rejection
+		// while it can still be fixed. When run OFF-target (the config-drive is
+		// built/deployed off-box — #4191 review), none of the mapped identities
+		// resolve, so the check is SKIPPED with a warning rather than
+		// false-rejecting a valid map; the on-target first-boot preflight is the
+		// real gate there.
+		if reason, offTarget, derr := daemon.CheckDeviceMapStrandsManagement(compiled); derr != nil {
 			// NIC enumeration failed (transient/environmental). Warn but do
 			// not fail the check — the runtime lifeline is the backstop.
 			fmt.Fprintf(os.Stderr, "check-config: device-map strand preflight skipped: %v\n", derr)
+		} else if offTarget {
+			fmt.Fprintf(os.Stderr, "check-config: device-map strand check skipped: none of the "+
+				"mapped NICs are present (running off-target?); the on-target first-boot preflight "+
+				"is the real gate\n")
 		} else if reason != "" {
 			fmt.Printf("FAIL %s\ndevice-map would strand management on next boot: %s\n", path, reason)
 			os.Exit(2)

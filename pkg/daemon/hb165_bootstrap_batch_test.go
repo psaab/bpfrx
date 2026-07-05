@@ -71,35 +71,83 @@ func withInjectedNICs(t *testing.T, fn func() ([]devicemap.PresentNIC, error)) {
 	t.Cleanup(func() { enumeratePresentNICsFn = old })
 }
 
-// TestCheckDeviceMapStrandsManagement pins #4183 (H-8): the day-0
-// check-config helper reports a management-stranding device-map so the
-// subcommand can hard-FAIL. RED-on-revert: the helper (and its check-config
-// wiring) does not exist, so a strand config passes check-config.
+// offTargetNICs is a BUILD/DEPLOY-host inventory whose PCI addresses do NOT
+// match any of the day-0 map's identities (the config-drive is built/deployed
+// off the target). None of the mapped entries resolve here.
+func offTargetNICs() ([]devicemap.PresentNIC, error) {
+	return []devicemap.PresentNIC{
+		{Name: "eno1", PCIAddr: "0000:aa:00.0"},
+		{Name: "eno2", PCIAddr: "0000:bb:00.0"},
+	}, nil
+}
+
+// TestCheckDeviceMapStrandsManagement pins #4183 (H-8), on-target: the day-0
+// check-config helper reports a management-stranding device-map (when the
+// mapped NICs are present) so the subcommand can hard-FAIL. RED-on-revert: the
+// helper (and its check-config wiring) does not exist, so a strand config
+// passes check-config.
 func TestCheckDeviceMapStrandsManagement(t *testing.T) {
 	withInjectedNICs(t, strandNICs)
 
 	strand := compileText(t, strandDeviceMapConfig)
-	reason, err := CheckDeviceMapStrandsManagement(strand)
+	reason, offTarget, err := CheckDeviceMapStrandsManagement(strand)
 	if err != nil {
 		t.Fatalf("CheckDeviceMapStrandsManagement(strand) err = %v, want nil", err)
+	}
+	if offTarget {
+		t.Fatal("mapped NICs ARE present (on-target) — must not be flagged off-target")
 	}
 	if reason == "" {
 		t.Fatal("expected a strand reason for a device-map that leaves no NIC with a management name")
 	}
 
 	safe := compileText(t, safeDeviceMapConfig)
-	reason, err = CheckDeviceMapStrandsManagement(safe)
+	reason, offTarget, err = CheckDeviceMapStrandsManagement(safe)
 	if err != nil {
 		t.Fatalf("CheckDeviceMapStrandsManagement(safe) err = %v, want nil", err)
 	}
-	if reason != "" {
-		t.Fatalf("safe device-map must not strand, got %q", reason)
+	if offTarget || reason != "" {
+		t.Fatalf("safe on-target device-map must not strand: reason=%q offTarget=%v", reason, offTarget)
 	}
 
 	// A config with no device-map is always safe (positional mode).
 	plain := compileText(t, "system { host-name plain; }")
-	if reason, err := CheckDeviceMapStrandsManagement(plain); err != nil || reason != "" {
-		t.Fatalf("plain config: reason=%q err=%v, want empty/nil", reason, err)
+	if reason, offTarget, err := CheckDeviceMapStrandsManagement(plain); err != nil || reason != "" || offTarget {
+		t.Fatalf("plain config: reason=%q offTarget=%v err=%v, want empty/false/nil", reason, offTarget, err)
+	}
+}
+
+// TestCheckDeviceMapStrandsManagementOffTargetSkips pins the #4191-review
+// MAJOR fix: `xpfd check-config` is invoked OFF the target hardware by the
+// standard day-0 pipeline (config-drive built on the build host, installed
+// from the deploy host). There enumeratePresentNICs SUCCEEDS but returns the
+// build host's NICs — NONE at the target's mapped PCI addresses — so a naive
+// strand check would false-reject a PERFECTLY VALID bare-metal map. When no
+// mapped identity resolves, the check must SKIP (offTarget=true, reason="")
+// instead of hard-failing. RED-on-revert: without the guard the same
+// (valid) config is reported as a strand (reason != "").
+func TestCheckDeviceMapStrandsManagementOffTargetSkips(t *testing.T) {
+	withInjectedNICs(t, offTargetNICs)
+
+	// A VALID bare-metal map (maps a NIC to fxp0) whose identities are simply
+	// absent on the build host. Must be SKIPPED, never false-rejected.
+	safe := compileText(t, safeDeviceMapConfig)
+	reason, offTarget, err := CheckDeviceMapStrandsManagement(safe)
+	if err != nil {
+		t.Fatalf("off-target err = %v, want nil", err)
+	}
+	if !offTarget {
+		t.Fatal("off-target (no mapped NIC present) must be reported as offTarget=true")
+	}
+	if reason != "" {
+		t.Fatalf("off-target must NOT false-reject a valid map, got reason=%q", reason)
+	}
+
+	// Even a config that WOULD strand on-target must be skipped off-target
+	// (its mapped identities are not present here — no basis to judge).
+	strand := compileText(t, strandDeviceMapConfig)
+	if reason, offTarget, err := CheckDeviceMapStrandsManagement(strand); err != nil || !offTarget || reason != "" {
+		t.Fatalf("off-target strand config: reason=%q offTarget=%v err=%v, want empty/true/nil", reason, offTarget, err)
 	}
 }
 
