@@ -885,7 +885,15 @@ actually honors today for a simple outbound `iperf3` check from the LAN side.
 Important current behavior:
 
 - shaping is enforced on the **egress** interface
-- queue selection prefers the shaped interface **egress output filter**
+- queue selection prefers the shaped interface **egress output filter** when it
+  sets a forwarding-class — **output-overrides-when-set**, not
+  presence-clears-ingress (#hb166 T-3). An output filter that assigns a
+  forwarding-class (`then forwarding-class`) wins; an output filter that only
+  counts/logs/terminates (`then count` / `then log` / `then discard`) and does
+  NOT set a forwarding-class PRESERVES the class an ingress input filter
+  assigned. Before the fix, attaching ANY output filter — even an audit-only
+  `then count` — silently reclassified the traffic to the default best-effort
+  queue
 - the egress output filter matches the **post-NAT (on-wire) tuple** (#3642):
   Junos applies an interface `filter output` AFTER NAT, so a filter term
   matching source/destination address or port sees the TRANSLATED
@@ -893,14 +901,25 @@ Important current behavior:
   output filter. Forwarding-class selection, DSCP rewrite, counters,
   `then log`, and terminal accept/discard on the output filter are all
   driven by the on-wire tuple, not the pre-NAT ingress tuple
-- if no egress CoS filter is configured, queue selection falls back to the
-  current **ingress interface input filter**
+- when the output filter sets no forwarding-class, queue selection falls back to
+  the forwarding-class the current **ingress interface input filter** assigned
+  (whether or not a counter/log-only output filter is also attached)
 - if neither filter assigns a forwarding class, queue selection falls back to
   the shaped interface's attached BA classifiers:
   - DSCP under
     `class-of-service interfaces <if> unit <u> classifiers dscp <name>`
   - 802.1p under
     `class-of-service interfaces <if> unit <u> classifiers ieee-802.1 <name>`
+- a BA classifier code-point that maps to a forwarding-class whose queue the
+  interface does NOT materialize (the forwarding-class has no `scheduler-map`
+  entry on that interface) falls back to the interface **default best-effort
+  queue** — forward on best-effort, never blackhole (#hb166 T-4). Before the
+  fix such a code-point resolved to a non-existent queue and every matching
+  packet was silently dropped, while the config committed cleanly. The commit
+  path now emits an operator warning naming the forwarding-class and queue that
+  has no scheduler-map entry on the interface; it is a WARN (not a strict
+  reject) because a classifier steering to a forwarding-class without a
+  scheduler-map entry is a valid Junos config (queues exist by default there)
 - non-`exact` scheduler `transmit-rate` values act as guarantees and may borrow
   surplus bandwidth up to the root shaper
 - scheduler-map entries whose scheduler has no explicit positive
