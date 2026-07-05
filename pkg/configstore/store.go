@@ -273,10 +273,58 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	if err := schemaValidateExpandedTreeForNode(tree, nodeID); err != nil {
 		return nil, err
 	}
+	var compiled *config.Config
+	var err error
 	if nodeID >= 0 {
-		return config.CompileConfigForNode(tree, nodeID)
+		compiled, err = config.CompileConfigForNode(tree, nodeID)
+	} else {
+		compiled, err = config.CompileConfig(tree)
 	}
-	return config.CompileConfig(tree)
+	if err != nil {
+		return nil, err
+	}
+	if err := crossCheckNodeID(compiled, nodeID); err != nil {
+		return nil, err
+	}
+	return compiled, nil
+}
+
+// crossCheckNodeID rejects a config whose compiled `chassis cluster node`
+// leaf disagrees with the effective node identity (#4185). nodeID is the
+// SSOT node identity: the /etc/xpf/node-id file value on an operator commit
+// (Store.compileTree passes s.nodeID) or the `-node-id` flag on
+// `xpfd check-config` (CheckText). The file drives ${node} apply-group
+// expansion + boot class; the leaf drives FPC naming + heartbeat identity —
+// a divergence yields two half-identities (node 0's per-node IPs duplicated
+// on the wire) with no diagnostic. We reject the commit/check while the
+// operator can still fix it rather than let it boot half-standalone.
+//
+// This runs ONLY on the strict commit/commit-check path (compileTreeStrict).
+// The tolerant Store.Load / Store.SyncApply ingress uses compileTreeLenient,
+// which is deliberately NOT cross-checked: a config-sync push carries the
+// primary's expanded text, and the standby re-expands ${node} for its own
+// node, so the leaf already agrees with the standby's file after expansion —
+// and even a legacy/laxly-authored synced config must not blackout-boot the
+// standby (same doctrine as the #1319/#1798 lenient gates).
+//
+// Standalone (nodeID < 0) and configs without an explicit node leaf
+// (NodeIDSet false) never cross-check — an absent leaf on a node-1 box must
+// not false-reject as "node 0".
+func crossCheckNodeID(compiled *config.Config, nodeID int) error {
+	if compiled == nil || nodeID < 0 {
+		return nil
+	}
+	cc := compiled.Chassis.Cluster
+	if cc == nil || !cc.NodeIDSet {
+		return nil
+	}
+	if cc.NodeID != nodeID {
+		return fmt.Errorf("node identity mismatch: the node-id file / -node-id is %d but "+
+			"'chassis cluster node' resolves to %d after ${node} expansion — these MUST agree "+
+			"(the file drives ${node} apply-group expansion and boot class; the leaf drives FPC "+
+			"naming and heartbeat identity). Fix one so both name the same node", nodeID, cc.NodeID)
+	}
+	return nil
 }
 
 // compileTreeLenient is compileTree with the tolerant-path validator
@@ -315,10 +363,29 @@ func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, err
 		slog.Warn("typed-leaf schema violation in tolerated config; continuing (a strict commit would reject this)",
 			"err", err, "issue", "#1319")
 	}
+	var compiled *config.Config
+	var err error
 	if s.nodeID >= 0 {
-		return config.CompileConfigForNodeLenient(tree, s.nodeID)
+		compiled, err = config.CompileConfigForNodeLenient(tree, s.nodeID)
+	} else {
+		compiled, err = config.CompileConfigLenient(tree)
 	}
-	return config.CompileConfigLenient(tree)
+	// #4185 (review Finding 2): the lenient Load/SyncApply path must NOT
+	// hard-reject a node-id mismatch (that would blackout-boot the node or
+	// alarm-loop HA config sync — the #1960 doctrine), but a silent literal
+	// `chassis cluster node` leaf that disagrees with this node's identity
+	// (e.g. leaf 0 reaching a node-1 box via config-sync) causes a heartbeat-id
+	// collision + wrong FPC naming with no diagnostic. Warn (non-fatal) so the
+	// observability hole is closed without bricking the standby. The operator's
+	// next strict commit rejects it outright (crossCheckNodeID).
+	if err == nil {
+		if mismatch := crossCheckNodeID(compiled, s.nodeID); mismatch != nil {
+			slog.Warn("node identity mismatch in tolerated config; continuing (a strict commit would "+
+				"reject this) — heartbeat identity and FPC naming may diverge from ${node} expansion",
+				"err", mismatch, "issue", "#4185")
+		}
+	}
+	return compiled, err
 }
 
 func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {

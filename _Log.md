@@ -34069,6 +34069,42 @@ top.
   _Log.md
 
 - **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 daemon bootstrap/day-0/identity batch — H-8
+  (#4183), H-11 (#4184), H-12 (#4185), H-17 (#4186). One PR.
+  - **H-8**: the #1956 device-map strand-management pre-flight now runs on
+    the day-0 paths, not just interactive commits. `xpfd check-config`
+    hard-FAILs a stranding map (new exported `CheckDeviceMapStrandsManagement`
+    in pkg/daemon wired into cmd/xpfd/main.go after the strict gate);
+    `bootstrapFromFile` runs `deviceMapCommitPreflight` before Commit and
+    REFUSES to commit a stranding config, staying lifeline-safe. Added a
+    `enumeratePresentNICsFn` seam so the pre-flight is unit-testable.
+  - **H-11**: bootstrap/day-0 import outcome recorded at boot
+    (recordBootstrapImport / BootstrapImportSnapshot in daemon_health.go) and
+    surfaced on /health (`bootstrap_import_status` + `_failed` + `_error`,
+    non-fatal) plus a `BOOTSTRAP_IMPORT_FAILED` event. Wired
+    api.Server.BootstrapImportFn.
+  - **H-12**: node identity cross-check — compileTreeStrict now rejects a
+    config whose compiled `chassis cluster node` leaf disagrees with the
+    effective node-id (file value / -node-id flag), via crossCheckNodeID +
+    new ClusterConfig.NodeIDSet (set in compiler_system.go). Lenient
+    Load/SyncApply path deliberately NOT cross-checked. Tightened the
+    daemon's node-id file parser to a strict trimmed-Atoi 0|1 contract
+    (parseNodeIDFileContent) with a loud error on a bad file.
+  - **H-17**: factory boot with no /etc/xpf/xpf.conf logs at Info
+    ("no text config present"), not Warn; Warn kept for real failures.
+  - RED-on-revert PROVEN for all four (neuter each fix -> its test FAILs,
+    restored). go test ./pkg/daemon/... ./pkg/config/... ./pkg/configstore/...
+    ./pkg/api/... green; go build ./... + go vet clean.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_health.go,
+  pkg/daemon/device_map.go, pkg/daemon/hb165_bootstrap_batch_test.go,
+  pkg/config/types_chassis.go, pkg/config/compiler_system.go,
+  pkg/config/parser_cluster_test.go, pkg/configstore/store.go,
+  pkg/configstore/check_test.go, pkg/api/server.go, pkg/api/health.go,
+  pkg/api/health_test.go, cmd/xpfd/main.go, docs/bare-metal-device-map.md,
+  _Log.md
+
+- **Timestamp**: 2026-07-04
 - **Action**: fable-164 L-1 test-gap — add NAT64 cross-family (V6 src,
   V4 dst) policy `*-address-excluded` inversion + empty-set fail-closed
   coverage (issue #4187). Behavior verified CORRECT (test-gap, not a
@@ -34097,3 +34133,98 @@ top.
   failed); go build ./... green. No doc change: no doc documents the
   Rust policy-engine per-arm test coverage.
 - **File(s)**: userspace-dp/src/policy_tests.rs, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: PR #4191 hostile-review fixes (MERGE-NEEDS-MAJOR → resolved).
+  - **Finding 1 (MAJOR, H-8 false-reject off-target)**: `xpfd check-config` is
+    run OFF the target by the day-0 pipeline (config-drive built on the build
+    host / installed from the deploy host); there enumeratePresentNICs SUCCEEDS
+    with the build host's NICs, none at the target's mapped PCI/MAC, so every
+    entry landed BindUnbound and the strand check false-rejected a VALID
+    bare-metal map (exit 2 -> die). Fix: CheckDeviceMapStrandsManagement now
+    returns (reason, offTarget, err); when NO mapped identity resolves
+    (anyMappedIdentityPresent: all bindings BindUnbound — a bound OR refused
+    entry means the slot is populated = on-target) it SKIPS with offTarget=true
+    and the caller warns instead of failing. On-target genuine-strand rejection
+    and on-target card-swap refusal are preserved. Fixed the misleading doc.
+  - **Finding 2 (MINOR, H-12 lenient observability)**: the tolerant
+    Load/SyncApply path (compileTreeLenient) now emits a NON-FATAL slog.Warn on
+    a node-id leaf/identity mismatch (e.g. literal `node 0` reaching a node-1
+    box via config-sync) — closes the silent-heartbeat-collision hole without
+    bricking the standby (#1960 doctrine: no hard-reject on the lenient path).
+  - **Finding 5 (rebase)**: merged origin/master (#4182 config-arrival naming +
+    #4192). Only _Log.md conflicted (unioned); daemon_run.go / daemon_apply.go
+    auto-composed (my H-8 bootstrap preflight before Commit + H-11/H-17
+    recording vs #4182's maybeReapplyConfigArrivalNaming on config arrival —
+    they compose, verified both present).
+  - Tests: new TestCheckDeviceMapStrandsManagementOffTargetSkips (off-target =
+    skip, not false-reject) + TestLenientNodeIDMismatchWarnsNotRejects
+    (lenient warns, does not reject). RED-on-revert PROVEN for both (neuter
+    each -> its test FAILs; restored). go test ./pkg/daemon/... ./pkg/config/...
+    ./pkg/configstore/... ./pkg/api/... green; go build + vet + gofmt clean.
+- **File(s)**: pkg/daemon/device_map.go, pkg/daemon/hb165_bootstrap_batch_test.go,
+  pkg/configstore/store.go, pkg/configstore/nodeid_lenient_test.go,
+  cmd/xpfd/main.go, docs/bare-metal-device-map.md, _Log.md
+- **Action**: fable-review-165 H-18 (#4194) — fix docs/bare-metal-device-map.md
+  quick-start step 3, which told the operator `commit check` confirms a
+  `commit confirmed`. It does not: `CommitCheck`
+  (`pkg/configstore/store_commit.go:26-41`) only validates and never
+  touches the confirm timer, so following the doc lets the T+5m window
+  expire and auto-rollback the just-verified device-map. The confirming
+  command is a plain `commit` (`store_commit.go:106-120`:
+  `clearPendingConfirmLocked` cancels the timer). Rewrote step 3 to
+  confirm with `commit` and warn that `commit check` alone rolls back.
+- **File(s)**: docs/bare-metal-device-map.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 H-28 (#4195) — fix docs/deploy-quickstart.md
+  standalone quickstart. standalone.yaml (and the `launch` form) source
+  br-mgmt/br-lan/br-wan, but the only `incus network create` block lived
+  in the HA section, so a fresh-host standalone deploy failed on an
+  unknown source network; and a bare bridge has no DHCP, so fxp0 (mgmt)
+  and ge-0/0/1 (WAN) — both `dhcp` in standalone.conf — came up with no
+  address. Added a copy-pasteable bridge-create block to the standalone
+  section mirroring the HA form: br-mgmt + br-wan NAT/DHCP-bearing, br-lan
+  plain L2 (ge-0/0/0 is the static gateway running dhcp-local-server).
+- **File(s)**: docs/deploy-quickstart.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 H-29 (#4196) — add root-authentication to the
+  example day-0 configs. standalone.conf and ha-pair.conf enabled ssh
+  host-inbound but shipped no credentials, so SSH was unusable and a real
+  vSRX would refuse to commit (Junos requires root-authentication; xpf
+  accepts one silently). The baked sshd is PermitRootLogin
+  prohibit-password (scripts/image/bake.py), so an ssh KEY — not a
+  password — is what enables `ssh root@fxp0`. Added an active
+  `system root-authentication { ssh-ed25519 "...REPLACE..."; }` stanza to
+  both confs with a loud REPLACE-ME comment: it parses + commits (schema
+  node pkg/config/schema_system.go:58-67; no format validator on the key)
+  and gives vSRX parity, but the placeholder authenticates no one so it
+  fails closed if deployed unmodified. Verified all three personalities
+  still pass `xpfd check-config` (standalone; ha-pair -node-id 0 and 1) —
+  strict parse + schema + compile.
+- **File(s)**: examples/deploy/standalone.conf, examples/deploy/ha-pair.conf, _Log.md
+
+## 2026-07-04 — HB165 apt/deb/signing packaging (H-4, H-6, H-15)
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fixed fable-review-165 H-4/H-6/H-15 (issues #4201/#4202/#4203).
+  - H-4 (#4201): isolate the apt pool PER SUITE
+    (`pool/<suite>/<component>/x/xpf`) and scan only that suite's pool in
+    `apt-ftparchive packages` so a stable rebuild after an edge build never
+    lists the edge version (channel isolation). Reprepro path unaffected.
+  - H-6 (#4202): stage `xpf-kernel-promote-failed.service` (the promote unit's
+    `OnFailure=` recovery target) in the `.deb` via `dh_installsystemd
+    --no-enable --no-start`; add a build-time parity assert that the
+    `OnFailure=` target is actually staged.
+  - H-15 (#4203): add `_gate_key_agreement` to `publish.py gate_apt` —
+    cross-check that install.sh's embedded key, the packaged keyring, and the
+    InRelease signer agree by fingerprint (installer subset of keyring; signer
+    covered by both), dying on mismatch.
+  - selftest.sh: new §5c (channel isolation), §5d (key-agreement gate), §5e
+    (recovery unit staged). All 23 checks pass. RED-on-revert confirmed for
+    H-4 (shared pool bleeds edge into stable) and H-15 (non-signer key
+    rejected). shellcheck build-apt-repo.sh rc=0; py_compile publish.py OK.
+- **File(s)**: scripts/dist/build-apt-repo.sh, debian/rules,
+  scripts/dist/publish.py, scripts/dist/selftest.sh, docs/distribution.md,
+  docs/in-place-upgrade.md, _Log.md

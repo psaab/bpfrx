@@ -203,6 +203,139 @@ def stamp_installer(out, src=INSTALLSH_SRC, archive_key=None, apt_url=None,
          "archive key baked). Sign it next, then publish.")
 
 
+def _primary_fprs_from_gpg_colons(colon_text):
+    """Extract the set of PRIMARY key fingerprints from `gpg --with-colons`
+    output. The `fpr:` line immediately following a `pub:` record is the
+    primary key's fingerprint; `fpr:` lines after `sub:` records (subkeys) are
+    ignored so we compare primary fingerprints consistently with the InRelease
+    signer's primary fpr (the last VALIDSIG field)."""
+    fprs = set()
+    want = False
+    for line in colon_text.splitlines():
+        f = line.split(":")
+        if not f:
+            continue
+        if f[0] == "pub":
+            want = True
+        elif f[0] == "sub":
+            want = False
+        elif f[0] == "fpr" and want:
+            if len(f) > 9 and f[9]:
+                fprs.add(f[9])
+            want = False
+    return fprs
+
+
+def _key_fingerprints(key_source):
+    """Return the set of PRIMARY key fingerprints in an armored key file by
+    importing it into an ephemeral keyring (matching gate_apt's import style)
+    so we never touch the publisher's global gpg keyring."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as gnupghome:
+        os.chmod(gnupghome, 0o700)
+        env = dict(os.environ, GNUPGHOME=gnupghome)
+        r = subprocess.run(["gpg", "--batch", "--import", key_source],
+                           env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"could not import key {key_source} for fingerprint "
+                f"cross-check: {r.stderr.strip()}")
+        r = subprocess.run(
+            ["gpg", "--batch", "--with-colons", "--fingerprint", "--list-keys"],
+            env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"could not list fingerprints for {key_source}: "
+                f"{r.stderr.strip()}")
+        return _primary_fprs_from_gpg_colons(r.stdout)
+
+
+def _extract_installsh_key(installsh_path):
+    """Return install.sh's embedded ASCII-armored OpenPGP key block (the exact
+    bytes between the PGP BEGIN/END markers), or None if there is no block. The
+    block sits in a single-quoted heredoc so it is literal armor with no shell
+    interpolation."""
+    try:
+        with open(installsh_path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    begin = "-----BEGIN PGP PUBLIC KEY BLOCK-----"
+    end = "-----END PGP PUBLIC KEY BLOCK-----"
+    i = text.find(begin)
+    j = text.find(end)
+    if i == -1 or j == -1 or j < i:
+        return None
+    return text[i:j + len(end)] + "\n"
+
+
+def _gate_key_agreement(dist, archive_pub, signer_fprs):
+    """H-15: cross-check that the installer's embedded key, the packaged
+    keyring, and the InRelease signer AGREE by fingerprint. publish.py
+    otherwise only checked each source for placeholder-ness independently, so a
+    stale install.sh (an old, real, retired key) could publish cleanly after a
+    rotation and brick every new Tier-A install at `apt-get update`.
+
+    Requires (fingerprints are PRIMARY key fprs):
+      - the InRelease signer(s) S are covered by the packaged keyring K
+        (existing hosts verify the repo on `apt upgrade`); and, when install.sh
+        is in the publish set,
+      - install.sh's embedded key set I is a SUBSET of K (a keyring superset is
+        allowed during a documented dual-sign window), and
+      - the InRelease signer(s) S are covered by I so a fresh Tier-A install's
+        `apt-get update` (which runs against install.sh's embedded key BEFORE
+        the packaged keyring lands) verifies the published repo.
+    """
+    keyring_fprs = _key_fingerprints(archive_pub)
+    if not keyring_fprs:
+        die("archive keyring has no importable keys — cannot cross-check the "
+            "InRelease signer against the packaged keyring.")
+    if not signer_fprs:
+        die("could not determine the InRelease signer fingerprint — refusing "
+            "to publish without confirming key agreement.")
+    if not signer_fprs <= keyring_fprs:
+        die(f"InRelease signer {sorted(signer_fprs)} is NOT in the packaged "
+            f"keyring {sorted(keyring_fprs)} — the repo is signed by a key the "
+            "shipped keyring does not carry; existing hosts would fail apt "
+            "update. Ship the signing key in the keyring or re-sign the repo.")
+
+    installsh = os.path.join(dist, "install.sh")
+    if not os.path.isfile(installsh):
+        info("key-agreement: install.sh not in publish set — "
+             "installer cross-check skipped (signer vs keyring OK)")
+        return
+    armored = _extract_installsh_key(installsh)
+    if armored is None:
+        die("install.sh is in the publish set but has no embedded PGP key "
+            "block to cross-check against the keyring/InRelease signer.")
+    if "PLACEHOLDER-xpf-archive-keyring" in armored:
+        die("install.sh embeds the #1924 PLACEHOLDER archive key — cannot "
+            "cross-check key agreement. Substitute the real key first.")
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".asc", delete=False) as tf:
+        tf.write(armored)
+        keypath = tf.name
+    try:
+        inst_fprs = _key_fingerprints(keypath)
+    finally:
+        os.unlink(keypath)
+    if not inst_fprs:
+        die("install.sh embedded key could not be parsed for fingerprints — "
+            "refusing to publish without confirming key agreement.")
+    if not inst_fprs <= keyring_fprs:
+        die(f"install.sh embedded key {sorted(inst_fprs)} is NOT a subset of "
+            f"the packaged keyring {sorted(keyring_fprs)} — the installer "
+            "trusts a key the shipped keyring lacks (stale installer or "
+            "un-rotated keyring). Re-embed the current archive key in "
+            "install.sh (a keyring superset is allowed during dual-sign).")
+    if not signer_fprs <= inst_fprs:
+        die(f"InRelease signer {sorted(signer_fprs)} is NOT covered by "
+            f"install.sh's embedded key {sorted(inst_fprs)} — a fresh Tier-A "
+            "install would fail `apt-get update` against the published repo "
+            "(stale install.sh key). Re-embed the signing key in install.sh "
+            "before publishing.")
+    info(f"key-agreement OK (installer {sorted(inst_fprs)} subset of keyring; "
+         f"InRelease signer {sorted(signer_fprs)} covered by installer + keyring)")
+
+
 def list_versions(dist):
     """Discover baked versions from manifests in `dist`. FAIL-CLOSED
     (Codex-H1/AGY-A2): if ANY xpf-*.SHA256SUMS lacks a .minisig, refuse the
@@ -409,17 +542,30 @@ def gate_apt(dist, channel):
                            env=env, capture_output=True, text=True)
         if r.returncode != 0:
             die(f"could not import archive pubkey {pub}: {r.stderr.strip()}")
+        signer_fprs = set()
         for suite in suites:
             inrel = os.path.join(distsdir, suite, "InRelease")
             if not os.path.isfile(inrel):
                 die(f"suite {suite} under dists/ has no InRelease — the whole "
                     "apt tree is uploaded, so every suite must be signed. "
                     "Rebuild or remove it.")
-            r = subprocess.run(["gpg", "--batch", "--verify", inrel],
+            # --status-fd 1 emits a machine-readable VALIDSIG line whose LAST
+            # field is the signer's PRIMARY key fingerprint (#4203 key
+            # agreement). rc still reflects verify success/failure.
+            r = subprocess.run(["gpg", "--batch", "--status-fd", "1",
+                                "--verify", inrel],
                                env=env, capture_output=True, text=True)
             if r.returncode != 0:
                 die(f"apt InRelease ({suite}) signature FAILED: {r.stderr.strip()}")
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "VALIDSIG":
+                    signer_fprs.add(parts[-1])
             info(f"apt InRelease ({suite}) signature OK")
+        # H-15 (#4203): the installer's embedded key, the packaged keyring, and
+        # the InRelease signer must AGREE by fingerprint — three independent
+        # placeholder checks never caught a stale-but-real install.sh key.
+        _gate_key_agreement(dist, pub, signer_fprs)
     # The pooled .deb must not carry the PLACEHOLDER archive keyring
     # (Codex-r2-2): a package built before the real key existed would, once
     # installed, overwrite a host's real /usr/share/keyrings key with the

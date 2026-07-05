@@ -91,8 +91,16 @@ func (d *DeviceMapConfig) Active() bool {
 
 // ClusterConfig defines chassis cluster settings for HA.
 type ClusterConfig struct {
-	ClusterID             int
-	NodeID                int
+	ClusterID int
+	NodeID    int
+	// NodeIDSet records whether the `chassis cluster node` leaf was
+	// actually present (and parsed to an integer) in the compiled config,
+	// as opposed to NodeID sitting at its zero default. It is load-bearing
+	// for the node-identity cross-check (#4185): a config that carries a
+	// cluster stanza but no explicit `node` leaf must NOT be treated as
+	// "node 0" when reconciling against the /etc/xpf/node-id file, or an
+	// absent leaf on a node-1 box would false-reject as a mismatch.
+	NodeIDSet             bool
 	RethCount             int
 	HeartbeatInterval     int    // milliseconds, 0=default(1000)
 	HeartbeatThreshold    int    // missed heartbeats before lost, 0=default(3)

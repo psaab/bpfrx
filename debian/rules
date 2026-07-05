@@ -70,6 +70,22 @@ override_dh_auto_build:
 	@# the promotion gate).
 	cp scripts/image/xpf-uefi-slots.service debian/xpf.xpf-uefi-slots.service
 	cp scripts/image/xpf-kernel-promote.service debian/xpf.xpf-kernel-promote.service
+	@# #4202: the promote unit's OnFailure= recovery unit MUST ship in the .deb
+	@# too. bake.py stages it into the image, but a deb-installed / foreign host
+	@# had a DANGLING OnFailure= target ("Unit not found") — a hung promotion
+	@# gate then left the node on the unverified candidate held SECONDARY with no
+	@# recovery reboot. Stage it under the package-canonical name. It has no
+	@# [Install] section (OnFailure=-triggered, never enabled) so it is installed
+	@# without dh_installsystemd enable/start (see override_dh_installsystemd).
+	cp scripts/image/xpf-kernel-promote-failed.service \
+	    debian/xpf.xpf-kernel-promote-failed.service
+	@# Parity assert: the OnFailure= target the promote unit references MUST be a
+	@# unit we actually stage into the .deb, else the recovery reboot is a
+	@# dangling reference on every deb-installed host. A future edit that drops
+	@# the staging (or renames the target) must FAIL the build, not ship the gap.
+	onfail=$$(sed -n 's/^OnFailure=//p' scripts/image/xpf-kernel-promote.service | head -n1); \
+	    test -n "$$onfail" || { echo "FATAL: xpf-kernel-promote.service has no OnFailure= target" >&2; exit 1; }; \
+	    test -f "debian/xpf.$$onfail" || { echo "FATAL: OnFailure= target $$onfail not staged in the .deb (dangling recovery unit)" >&2; exit 1; }
 
 # Nothing to test in the package build itself; the project test suite
 # is run separately. Skip dh's auto test (it would try `go test`).
@@ -137,10 +153,17 @@ override_dh_installsystemd:
 	@# NOT ordered Before=xpfd, so enabling them cannot block the daemon.
 	dh_installsystemd --no-stop-on-upgrade --name=xpf-uefi-slots
 	dh_installsystemd --no-stop-on-upgrade --name=xpf-kernel-promote
+	@# #4202: install the OnFailure= recovery unit into /lib/systemd/system but
+	@# do NOT enable/start it — it has no [Install] section and is triggered only
+	@# via the promote unit's OnFailure=. dh_installsystemd still installs the
+	@# unit file; --no-enable/--no-start suppress the enable + start snippets.
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade \
+	    --name=xpf-kernel-promote-failed
 
 override_dh_clean:
 	rm -f debian/xpf.xpfd.service debian/xpf.xpf-day0-config.service \
-	      debian/xpf.xpf-uefi-slots.service debian/xpf.xpf-kernel-promote.service
+	      debian/xpf.xpf-uefi-slots.service debian/xpf.xpf-kernel-promote.service \
+	      debian/xpf.xpf-kernel-promote-failed.service
 	dh_clean
 
 # xpf is an APPLIANCE package, not a Debian-archive package: it

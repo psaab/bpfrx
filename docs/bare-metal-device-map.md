@@ -60,8 +60,16 @@ the console is your lifeline.
    ```
    commit confirmed 5
    ... verify reachability + forwarding ...
-   commit check        # or just `commit` to confirm
+   commit              # confirms the pending commit-confirmed
    ```
+
+   Confirm with a plain **`commit`** (Junos semantics: any subsequent
+   explicit `commit` confirms a pending `commit confirmed` —
+   `pkg/configstore/store_commit.go:106-120`). Do **not** rely on `commit
+   check` — it only VALIDATES the candidate and never touches the confirm
+   timer (`CommitCheck`, `store_commit.go:26-41`), so the window still
+   expires and the daemon auto-rolls-back the just-verified device-map at
+   T+5m.
 
 4. Verify the resolved bindings:
 
@@ -125,6 +133,46 @@ the present hardware while you are still connected:
   (the config restored on timeout), so a confirmed-commit timeout reverts to
   a known-safe config and applies it unconditionally (no split-brain).
 
+The SAME pre-flight now runs on the **day-0 / bootstrap paths** (#4183):
+
+- `xpfd check-config <file>` runs the strand pre-flight after the strict
+  parse/schema/compile gate. **On the target hardware** (the mapped NICs are
+  present) it **hard-FAILs** (exit 2) a device-map that would strand
+  management — so a fat-fingered mgmt PCI BDF is caught before install. **Run
+  off-target** — the config-drive is normally built on a build host and
+  installed from a deploy host, where none of the target's mapped PCI/MAC
+  identities are present — the check is **skipped with a warning** (NOT a
+  FAIL): with no mapped identity resolving there is no basis to judge a strand,
+  and false-rejecting a valid bare-metal map would break the normal day-0
+  pipeline. The on-target `bootstrapFromFile` pre-flight below is the real gate
+  in that case. (A NIC-enumeration error is likewise a skip-with-warning.)
+- `bootstrapFromFile` (first-boot import of `/etc/xpf/xpf.conf`, which runs ON
+  the target) runs the pre-flight before it commits and **refuses to commit** a
+  stranding config, leaving the daemon in the lifeline-safe bootstrap state
+  instead of coming up console-only from the very first boot. The refusal is
+  recorded as a failed bootstrap import (see the bootstrap-import status below).
+
+## Day-0 import visibility
+
+A day-0 / bootstrap config-import outcome is recorded at boot and surfaced on
+`/health` (#4184) so "why didn't my config apply" has an in-band answer beyond
+a single journald line:
+
+- `bootstrap_import_status`: `ok` (imported + committed), `loaded-from-db`
+  (an active config was already present), `no-config` (no text config present —
+  the expected factory/fresh-boot state), or `import-failed` (the file was
+  present but could not be read/parsed/committed, incl. a device-map strand
+  rejection).
+- `bootstrap_import_failed` is true ONLY for a real `import-failed`; it does
+  NOT force a 503 (the box is in the lifeline-safe bootstrap state — surfacing
+  the cause is the goal, not pulling a still-reachable box from rotation). A
+  failed import also emits a `BOOTSTRAP_IMPORT_FAILED` event.
+
+A factory boot with NO `/etc/xpf/xpf.conf` is the EXPECTED fresh state and is
+logged at Info ("no text config present"), not Warn (#4186) — so an operator
+triaging a real day-0 failure is not taught to ignore a benign line. The Warn
+is kept for a real read/parse/commit failure.
+
 ## HA clusters
 
 The device-map is **per-node** (hardware differs between nodes). Use
@@ -133,6 +181,18 @@ apply-groups: `groups node0 { chassis device-map { ... } }` /
 carries. Each node resolves its own section against its own hardware. In
 cluster mode, a logical name's FPC slot must align with the node-id
 (`ge-7/0/x` is node 1) — a mismatch is rejected at commit.
+
+**Node identity (`/etc/xpf/node-id` file vs `chassis cluster node` leaf).**
+The file drives `${node}` apply-group expansion + boot class; the leaf drives
+FPC naming + heartbeat identity. They MUST agree. At commit / `check-config`
+(#4185) a config whose compiled `chassis cluster node` leaf disagrees with the
+effective node identity (the file value, or the `-node-id` flag) is rejected —
+a silent mismatch otherwise yields two half-identities on the wire with no
+diagnostic. The correct apply-group form above always agrees after expansion
+(node0 group → `node 0`); only a literal-mismatched leaf is rejected. The
+daemon's node-id file parser also enforces the same strict `0|1` contract the
+other consumers use (a present-but-unparseable/out-of-range file is logged
+loudly instead of silently falling back to node0).
 
 When the primary pushes a config whose device-map section would strand the
 **passive** node's management on next boot, the passive node raises a loud
