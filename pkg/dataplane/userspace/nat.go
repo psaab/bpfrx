@@ -323,11 +323,28 @@ func sourceNATScopeTier(s SourceNATRuleSnapshot) int {
 }
 
 // scopeContextTier maps a single from/to context to its specificity tier
-// (#4161): interface=0, zone=1, routing-instance=2, none/wildcard=3. A Junos
-// from/to clause names exactly one kind of context; a hostile config that sets
-// more than one is ranked by its most-specific present field (the Rust
-// scope_matches AND-filters every set field regardless, so this only affects
-// precedence, never eligibility).
+// (#4161): interface=0, zone=1, routing-instance=2.
+//
+// The wildcard / match-any context is the EMPTY string on every axis (all
+// three args ""), which falls through to snatTierUnscoped (3). That empty
+// value is exactly what the compiler emits for an absent `from`/`to` clause:
+// collectNATScopes (pkg/config/compiler_nat.go:1083-1088) defaults a missing
+// side to {kind:"zone", value:""} → FromZone/ToZone "" — the legacy
+// global/match-any scope. So "wildcard" here means empty, NOT a zone named
+// "any": a NON-EMPTY zone (tier 1) is always a SPECIFIC zone, and a literal
+// `from zone any` is FromZone="any", a specific zone literally named "any", not
+// a wildcard. This is CONSISTENT with the Rust eligibility check
+// (source.rs scope_matches: `!from_zone.is_empty() && from_zone != ingress`),
+// which only special-cases the empty string and matches "any" literally. NAT
+// rule-set from/to-contexts do NOT treat "any" as a wildcard (unlike security
+// policies' from-zone/to-zone). A future maintainer must not special-case
+// "any" as tier-unscoped — that would diverge from the matcher and mis-tier a
+// legitimately-named zone.
+//
+// A Junos from/to clause names exactly one kind of context; a hostile config
+// that sets more than one is ranked by its most-specific present field (the
+// Rust scope_matches AND-filters every set field regardless, so this only
+// affects precedence, never eligibility).
 func scopeContextTier(iface, zone, routingInstance string) int {
 	switch {
 	case iface != "":

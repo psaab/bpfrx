@@ -73,6 +73,19 @@ func TestSourceNATScopeTierValue(t *testing.T) {
 		{"ri-from", SourceNATRuleSnapshot{FromRoutingInstance: "VR1"}, snatTierRoutingInstance},
 		{"ri-to", SourceNATRuleSnapshot{ToRoutingInstance: "VR1"}, snatTierRoutingInstance},
 		{"unscoped", SourceNATRuleSnapshot{}, snatTierUnscoped},
+		// Wildcard / match-any is the EMPTY zone string (what the compiler
+		// emits for an absent from/to clause, compiler_nat.go collectNATScopes
+		// {kind:"zone", value:""}) — tiers UNSCOPED, so a match-any rule-set
+		// loses to any specifically-scoped one. This is the same shape as the
+		// bare `unscoped` case above but named to pin the wildcard==empty
+		// contract explicitly.
+		{"empty-zone-wildcard-is-unscoped", SourceNATRuleSnapshot{FromZone: "", ToZone: ""}, snatTierUnscoped},
+		// A literal zone NAMED "any" is a SPECIFIC zone, NOT a wildcard: it
+		// tiers as ZONE (1), consistent with the Rust scope_matches treating a
+		// non-empty from_zone literally. Guards against a future change that
+		// wrongly special-cases "any" as a wildcard (which would make it
+		// tier-unscoped and diverge from the matcher).
+		{"literal-zone-any-is-zone", SourceNATRuleSnapshot{FromZone: "any"}, snatTierZone},
 		// from-vs-to = MIN: from zone (1) + to interface (0) => 0.
 		{"from-zone-to-interface-min0", SourceNATRuleSnapshot{FromZone: "trust", ToInterface: "ge-0/0/2.0"}, snatTierInterface},
 		// from routing-instance (2) + to zone (1) => 1.
