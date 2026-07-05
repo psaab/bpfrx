@@ -55,8 +55,8 @@ case "$SUITE" in stable|edge) ;; *) die "suite must be stable|edge (got $SUITE)"
 
 # Default deb set: the freshly built binary + appliance packages.
 if [ -z "$DEBS" ]; then
-    DEBS=$(ls "$ROOT"/dist/deb/xpf_*.deb "$ROOT"/dist/deb/xpf-appliance_*.deb 2>/dev/null || true)
-    [ -n "$DEBS" ] || die "no debs in dist/deb (run 'make deb' first, or pass --debs)"
+    DEBS=$(ls "$ROOT"/dist-deb/xpf_*.deb "$ROOT"/dist-deb/xpf-appliance_*.deb 2>/dev/null || true)
+    [ -n "$DEBS" ] || die "no debs in dist-deb (run 'make deb' first, or pass --debs)"
 fi
 
 APT="$OUT/apt"
