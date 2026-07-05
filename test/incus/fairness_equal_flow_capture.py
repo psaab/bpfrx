@@ -467,6 +467,14 @@ def main(argv: list[str]) -> int:
     try:
         raw = args.raw.read_text(encoding="utf-8")
         scrapes, empty_timestamps, error_timestamps = split_scrapes(raw)
+        # Fail-closed on ANY empty or errored scrape (hb166 V-12): a single
+        # transient curl hiccup fails the whole reduction, which can burn a
+        # sweep run. This is a DELIBERATE posture — the equal-flow estimator
+        # is only meaningful over a clean, gap-free steady-state window, and
+        # silently dropping a bad scrape would let a partially-observed run
+        # read as a valid verdict. If a future run needs transient-error
+        # tolerance, add an explicit, bounded budget (e.g. an allowed error
+        # fraction) here rather than making the failure silent.
         if empty_timestamps:
             raise CaptureError(
                 "empty metrics scrape(s): " + ", ".join(empty_timestamps[:5])

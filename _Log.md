@@ -1,3 +1,65 @@
+## 2026-07-04 — hb166 V-12: minor CoS harness cleanups
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-12 grouped minor notes. (1) Deleted dead
+  _last_n_sum_bps from mouse_latency_orchestrate.py (no callers). (2)
+  Documented in iperf3_sum_parse.py that the non-end-anchored [SUM] regex
+  also matches warmup (omitted) rows — current callers safe (no -O), a
+  future -O consumer must filter them. (3) Added a comment at the
+  fairness_equal_flow_capture.py fail-closed raise explaining the
+  deliberate posture (one bad scrape fails the reduction; kept, not
+  loosened). (4) Documented the fairness-cos-class-sweep.sh scrape-cadence
+  drift (serial max-time-1 curl + sleep 1 → ~2s under load) and noted ts
+  is captured at scrape START so windowing stays correct. Closes #4249.
+- **File(s)**: test/incus/mouse_latency_orchestrate.py,
+  test/incus/iperf3_sum_parse.py, test/incus/fairness_equal_flow_capture.py,
+  test/incus/fairness-cos-class-sweep.sh, _Log.md
+
+## 2026-07-04 — hb166 V-8: surplus give-back handback series cross-checks
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-8 — fairness_surplus_giveback_validate.py accepted the
+  first list-order sample matching the post-handback thresholds with no
+  monotonic-t_sec check, no pre-handback baseline, and no density
+  requirement, so a one-element artifact with a single settled snapshot
+  trivially passed the <=5s handback gate on a self-attested t_sec.
+  Hardened _handback_from_samples to require >=min_handback_samples
+  (default 2), strictly increasing t_sec, consecutive gaps within
+  max_handback_sample_gap_sec (default 5s), and a pre-handback baseline
+  before the first post-handback sample; the handback time is derived as
+  the first post-handback sample following a pre-handback one. Added CLI
+  flags --min-handback-samples / --max-handback-sample-gap-sec and 4 unit
+  tests (single-sample, non-monotonic, no-pre-baseline, too-sparse).
+  Documented that timestamps remain generator-supplied (the ordered-series
+  is the auditability bound in a reduced artifact) and that NO live runner
+  produces phases.json yet — the validator is a MANUAL gate until a live
+  reducer is built (deferred half of V-8). Updated docs/fairness-regimes.md
+  and the validator docstring. Closes #4248.
+- **File(s)**: test/incus/fairness_surplus_giveback_validate.py,
+  test/incus/fairness_surplus_giveback_validate_test.py,
+  docs/fairness-regimes.md, _Log.md
+
+## 2026-07-04 — hb166 V-10: align smoke CoV to the Rust fairness SSOT
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-10 — the simul-load smoke reducer computed CoV with
+  the SAMPLE stddev (statistics.stdev, N-1) AND filtered zero-bps streams,
+  so its printed CoV could not reproduce a fairness-eval verdict and a
+  fully starved class printed CoV 0 (the "perfectly fair" value). Extracted
+  the population-CoV estimator into test/incus/fairness_cov.py as the single
+  Python mirror of userspace-dp/src/fairness.rs::compute_observed_cov
+  (population stddev over the full vector including zeros, 0.0 for
+  empty/zero-mean). Imported it into cos-simul-load-smoke.sh, stopped
+  filtering zero-bps flows, relabelled the printed column wrCoV% (whole-run)
+  with a legend + verdict provenance field. Added fairness_cov_test.py
+  pinning population_cov to the exact fairness.rs unit-test values (0.5
+  skewed, 0.0 balanced/empty/zero-mean) plus a starved-flow-not-filtered
+  assertion (RED-on-revert: sample stddev gives 0.5774; zero-filter gives
+  0.0). Documented the CoV semantics in docs/fairness-regimes.md. Closes
+  #4247.
+- **File(s)**: test/incus/fairness_cov.py, test/incus/fairness_cov_test.py,
+  test/incus/cos-simul-load-smoke.sh, docs/fairness-regimes.md, _Log.md
+
 ## 2026-07-04 — #4228 Gap 7: vSRX CoS show commands
 
 - **Timestamp**: 2026-07-04

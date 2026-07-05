@@ -174,6 +174,12 @@ scrape_equal_flow_metrics() {
 
     : > "$raw"
     : > "$stderr"
+    # Cadence is best-effort ~1s but can stretch toward ~2s under a slow
+    # endpoint (the --max-time 1 curl and the sleep 1 are serial; hb166
+    # V-12). That only thins the sample count — `ts` is captured at scrape
+    # START, before curl, so the steady-window filter in
+    # fairness_equal_flow_capture.py keys each scrape by its true start
+    # time and stays correct regardless of curl latency.
     while true; do
         local ts
         local metrics

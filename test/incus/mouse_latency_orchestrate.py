@@ -305,15 +305,6 @@ _BYTE_UNIT_MULTIPLIER = {
 }
 
 
-def _last_n_sum_bps(text: str, n: int) -> list:
-    out = []
-    for line in text.splitlines():
-        bps = parse_sum_bps(line)
-        if bps is not None:
-            out.append(bps)
-    return out[-n:]
-
-
 def _parse_iperf_interval_rows(text: str) -> list[dict]:
     """Parse iperf3 text interval rows, including stream-level TCP fields."""
     rows = []
