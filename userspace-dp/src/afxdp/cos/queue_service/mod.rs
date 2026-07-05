@@ -273,9 +273,21 @@ fn build_nonexact_cos_batch(
         .as_ref()
         .map(|backlog| backlog.peer_exact_demand_queue_mask(binding.slot))
         .unwrap_or(0);
+    // #4265 (R-2): the non-exact guarantee refill now routes through the
+    // shared queue lease (when the coordinator built one for a sharded
+    // non-exact guaranteed queue) so admission is metered class-wide
+    // instead of per-worker. The fast-path slice reads the disjoint
+    // `cos_fast_interfaces` field, so it coexists with the `cos_interfaces`
+    // mutable borrow below (same borrow-split the exact direct path uses).
+    let queue_fast_path = binding
+        .cos
+        .cos_fast_interfaces
+        .get(&root_ifindex)
+        .map(|iface_fast| iface_fast.queue_fast_path.as_slice())
+        .unwrap_or(&[]);
     let selected = {
         let root = binding.cos.cos_interfaces.get_mut(&root_ifindex)?;
-        select_nonexact_cos_guarantee_batch(root, now_ns).or_else(|| {
+        select_nonexact_cos_guarantee_batch(root, queue_fast_path, now_ns).or_else(|| {
             // Strict priority applies to surplus service only. Non-exact
             // queues with explicit transmit-rate guarantees keep their
             // guarantee pass. Residual/best-effort surplus remains
@@ -1341,6 +1353,7 @@ fn select_exact_cos_guarantee_queue_waterfill(
 #[inline]
 pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch(
     root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
     now_ns: u64,
 ) -> Option<CoSBatch> {
     let queue_count = root.queues.len();
@@ -1358,12 +1371,20 @@ pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch(
         {
             continue;
         }
-        let transmit_rate_bytes = queue.transmit_rate_bytes();
-        refill_cos_tokens(
-            &mut queue.hot.tokens,
-            transmit_rate_bytes,
-            queue.config.buffer_bytes.max(COS_MIN_BURST_BYTES),
-            &mut queue.hot.last_refill_ns,
+        // #4265 (R-2): meter the guarantee refill through the shared queue
+        // lease when the coordinator attached one (a sharded non-exact
+        // guaranteed queue, rate >= COS_SHARED_EXACT_MIN_RATE_BYTES). All
+        // workers draw from the one legacy lease -> aggregate admission ==
+        // configured rate. When no lease is attached (single-owner low-rate
+        // non-exact queue), `maybe_top_up_cos_queue_lease` falls through to
+        // the same per-worker `refill_cos_tokens` used before this change,
+        // so single-owner behaviour is unchanged. The legacy lease returns
+        // default (no-v8) telemetry, so nothing is dropped by ignoring it.
+        let _ = maybe_top_up_cos_queue_lease(
+            queue,
+            queue_fast_path
+                .get(queue_idx)
+                .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref()),
             now_ns,
         );
         let Some(head) = cos_queue_front(queue) else {

@@ -108,13 +108,24 @@ where
 ///   throughput collapse from PR #680.
 ///
 /// The exact/non-exact distinction does NOT live here — it lives in
-/// the lease/V_min allocation gates at `coordinator/mod.rs:1058`
-/// (`SharedCoSQueueLease`) and `coordinator/mod.rs:1145`
-/// (`SharedCoSQueueVtimeFloor`), both of which remain exact-only.
-/// Non-exact high-rate queues admitted here run via the
-/// `shared_exact` execution policy in `cross_binding.rs` (Step1 bail)
-/// and drain locally per worker, but they do NOT get a per-queue rate
-/// lease or V_min coordination — those are exact-queue-only concepts.
+/// the lease/V_min allocation gates in `coordinator/cos_leases.rs`
+/// (`build_shared_cos_queue_leases_reusing_existing` for
+/// `SharedCoSQueueLease`,
+/// `build_shared_cos_queue_vtime_floors_reusing_existing` for
+/// `SharedCoSQueueVtimeFloor`). The V_min flow-fair coordination
+/// (`SharedCoSQueueVtimeFloor`) and the v8 per-worker epoch-ledger
+/// lease remain exact-only. The per-queue RATE lease is NO LONGER
+/// exact-only: #4265 (R-2) attaches a legacy (v8=None)
+/// `SharedCoSQueueLease` to a GUARANTEED non-exact queue at or above
+/// this threshold so its guarantee-phase admission is metered as an
+/// aggregate across the sharded workers (each worker otherwise refilled
+/// a private full-rate bucket → up to N_workers × over-admit). So a
+/// non-exact high-rate queue admitted here runs via the `shared_exact`
+/// execution policy in `cross_binding.rs` (Step1 bail) and drains
+/// locally per worker; if it is ALSO guaranteed its guarantee refill
+/// draws from that shared legacy rate lease, but it still gets no V_min
+/// coordination and no v8 epoch ledger — those stay exact-queue-only
+/// concepts.
 ///
 /// Before PR #697 the threshold was `max(iface_rate / 4, MIN)`. That
 /// scaled with iface rate, which is the wrong direction: the
@@ -195,10 +206,17 @@ pub(super) fn build_worker_cos_fast_interfaces(
                     .copied()
                     .unwrap_or(current_worker_id),
                 owner_live: owner_live_by_queue.get(&queue_key).cloned(),
-                shared_queue_lease: queue
-                    .exact
-                    .then(|| shared_queue_leases.get(&queue_key).cloned())
-                    .flatten(),
+                // #4265 (R-2): attach whatever lease the coordinator built
+                // for this queue. Previously gated on `queue.exact`, which
+                // starved the non-exact guaranteed sharded queue of any
+                // class-wide metering (each worker refilled a private
+                // full-rate bucket -> N x over-admit). The coordinator
+                // (`build_shared_cos_queue_leases_reusing_existing`) now
+                // emits a shared LEGACY lease for those queues too, so the
+                // map entry only exists for queues that should be metered
+                // (exact -> v8 lease; non-exact high-rate guaranteed ->
+                // legacy lease); attach unconditionally.
+                shared_queue_lease: shared_queue_leases.get(&queue_key).cloned(),
                 // #917 Phase 2b: V_min coordination Arc, allocated
                 // once per shared_exact CoS queue by the coordinator
                 // (per `build_shared_cos_queue_vtime_floors_reusing_existing`
