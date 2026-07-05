@@ -51,10 +51,10 @@ Install xpf onto an existing Debian/Ubuntu host. **Requires kernel ≥
 ```bash
 # On the build host (Go + cargo toolchain):
 make deb                       # builds xpfd + xpf-userspace-dp + cli,
-                               # packages them into dist/deb/xpf_<ver>_amd64.deb
+                               # packages them into dist-deb/xpf_<ver>_amd64.deb
                                # (+ the xpf-appliance metapackage)
 
-# Copy dist/deb/xpf_<ver>_amd64.deb to the target host, then there:
+# Copy dist-deb/xpf_<ver>_amd64.deb to the target host, then there:
 sudo apt install ./xpf_<ver>_amd64.deb     # ${shlibs:Depends} pulled in by apt
 ```
 

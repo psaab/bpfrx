@@ -414,7 +414,8 @@ loss-cluster-restart:
 
 # Build the xpf Debian package (#1917 increment A). Produces ../xpf_*.deb
 # and ../xpf-appliance_*.deb relative to the source tree (dpkg's default
-# parent-dir output), then copies them into dist/deb/.
+# parent-dir output), then copies them into dist-deb/ (a staging dir OUTSIDE
+# the image publish root dist/ — see DEB_OUT below).
 #
 # The package build delegates to `make build build-ctl build-userspace-dp`
 # (see debian/rules), so it picks up the embedded #1864 shim and the
@@ -429,7 +430,12 @@ DEB_GIT_COUNT ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 0)
 DEB_GIT_SHA   ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 DEB_GIT_DIRTY ?= $(shell git diff --quiet 2>/dev/null || echo .dirty)
 DEB_VERSION ?= 0.0.$(DEB_GIT_COUNT)+g$(DEB_GIT_SHA)$(DEB_GIT_DIRTY)
-DEB_OUT ?= $(CURDIR)/dist/deb
+# DEB_OUT is a build-STAGING dir and MUST live OUTSIDE the image publish root
+# `dist/` (HB165 H-5): `make image` runs `make deb` and `make dist-publish`
+# uploads the WHOLE `dist/` tree to the image URL, so a deb staged under
+# `dist/` would ship unsigned. publish.py's default-deny sweep now REFUSES any
+# stray file under `dist/`, so debs stage in the `dist-deb/` sibling instead.
+DEB_OUT ?= $(CURDIR)/dist-deb
 
 .PHONY: deb
 deb:
@@ -443,7 +449,7 @@ deb:
 	@# only the top changelog line's version token is rewritten so the rest
 	@# of the entry/trailer stays dpkg-parseable. dpkg-buildpackage writes
 	@# the .deb/.changes/.buildinfo to the PARENT dir (not configurable);
-	@# we keep the canonical copies in dist/deb/ and scrub the parent so it
+	@# we keep the canonical copies in dist-deb/ and scrub the parent so it
 	@# never litters the tree above the source dir (a git worktree parent).
 	@# Signal traps re-raise the caught signal after cleanup (trap - SIG;
 	@# kill -SIG $$) so an interrupted build returns the SIGNAL exit status,
