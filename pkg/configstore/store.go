@@ -363,10 +363,29 @@ func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, err
 		slog.Warn("typed-leaf schema violation in tolerated config; continuing (a strict commit would reject this)",
 			"err", err, "issue", "#1319")
 	}
+	var compiled *config.Config
+	var err error
 	if s.nodeID >= 0 {
-		return config.CompileConfigForNodeLenient(tree, s.nodeID)
+		compiled, err = config.CompileConfigForNodeLenient(tree, s.nodeID)
+	} else {
+		compiled, err = config.CompileConfigLenient(tree)
 	}
-	return config.CompileConfigLenient(tree)
+	// #4185 (review Finding 2): the lenient Load/SyncApply path must NOT
+	// hard-reject a node-id mismatch (that would blackout-boot the node or
+	// alarm-loop HA config sync — the #1960 doctrine), but a silent literal
+	// `chassis cluster node` leaf that disagrees with this node's identity
+	// (e.g. leaf 0 reaching a node-1 box via config-sync) causes a heartbeat-id
+	// collision + wrong FPC naming with no diagnostic. Warn (non-fatal) so the
+	// observability hole is closed without bricking the standby. The operator's
+	// next strict commit rejects it outright (crossCheckNodeID).
+	if err == nil {
+		if mismatch := crossCheckNodeID(compiled, s.nodeID); mismatch != nil {
+			slog.Warn("node identity mismatch in tolerated config; continuing (a strict commit would "+
+				"reject this) — heartbeat identity and FPC naming may diverge from ${node} expansion",
+				"err", mismatch, "issue", "#4185")
+		}
+	}
+	return compiled, err
 }
 
 func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {

@@ -34098,3 +34098,35 @@ top.
   failed); go build ./... green. No doc change: no doc documents the
   Rust policy-engine per-arm test coverage.
 - **File(s)**: userspace-dp/src/policy_tests.rs, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: PR #4191 hostile-review fixes (MERGE-NEEDS-MAJOR → resolved).
+  - **Finding 1 (MAJOR, H-8 false-reject off-target)**: `xpfd check-config` is
+    run OFF the target by the day-0 pipeline (config-drive built on the build
+    host / installed from the deploy host); there enumeratePresentNICs SUCCEEDS
+    with the build host's NICs, none at the target's mapped PCI/MAC, so every
+    entry landed BindUnbound and the strand check false-rejected a VALID
+    bare-metal map (exit 2 -> die). Fix: CheckDeviceMapStrandsManagement now
+    returns (reason, offTarget, err); when NO mapped identity resolves
+    (anyMappedIdentityPresent: all bindings BindUnbound — a bound OR refused
+    entry means the slot is populated = on-target) it SKIPS with offTarget=true
+    and the caller warns instead of failing. On-target genuine-strand rejection
+    and on-target card-swap refusal are preserved. Fixed the misleading doc.
+  - **Finding 2 (MINOR, H-12 lenient observability)**: the tolerant
+    Load/SyncApply path (compileTreeLenient) now emits a NON-FATAL slog.Warn on
+    a node-id leaf/identity mismatch (e.g. literal `node 0` reaching a node-1
+    box via config-sync) — closes the silent-heartbeat-collision hole without
+    bricking the standby (#1960 doctrine: no hard-reject on the lenient path).
+  - **Finding 5 (rebase)**: merged origin/master (#4182 config-arrival naming +
+    #4192). Only _Log.md conflicted (unioned); daemon_run.go / daemon_apply.go
+    auto-composed (my H-8 bootstrap preflight before Commit + H-11/H-17
+    recording vs #4182's maybeReapplyConfigArrivalNaming on config arrival —
+    they compose, verified both present).
+  - Tests: new TestCheckDeviceMapStrandsManagementOffTargetSkips (off-target =
+    skip, not false-reject) + TestLenientNodeIDMismatchWarnsNotRejects
+    (lenient warns, does not reject). RED-on-revert PROVEN for both (neuter
+    each -> its test FAILs; restored). go test ./pkg/daemon/... ./pkg/config/...
+    ./pkg/configstore/... ./pkg/api/... green; go build + vet + gofmt clean.
+- **File(s)**: pkg/daemon/device_map.go, pkg/daemon/hb165_bootstrap_batch_test.go,
+  pkg/configstore/store.go, pkg/configstore/nodeid_lenient_test.go,
+  cmd/xpfd/main.go, docs/bare-metal-device-map.md, _Log.md
