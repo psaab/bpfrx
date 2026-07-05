@@ -1,3 +1,62 @@
+## 2026-07-05 — fable-review-167 I-4 (#4309): DHCP relay overrides
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Extend the dhcp-relay `overrides` block (previously
+    always-broadcast only). IMPLEMENTED maximum-hop-count: the relay's
+    hop limit was hardcoded 16, now the group's configured value
+    (default 16) — request at limit dropped, RequestsDroppedMaxHops
+    counts it, relaySpec.maxHopCount participates in the restart diff.
+    ACCEPTED-ONLY forward-only + relay-agent-option (typed + compiled,
+    commit-time advisory) — the relay already forwards statelessly and
+    always inserts Option 82, so each matches the default. Both AST
+    shapes (inline Keys + block children). CLI show surfaces the new
+    overrides + hop-drop stat. RED-on-revert: hop check pinned to 16
+    relays a hops=4 request.
+  - **File(s)**: pkg/config/schema_routing.go,
+    pkg/config/types_system.go, pkg/config/compiler_services.go,
+    pkg/config/compiler_validate_warn.go, pkg/dhcprelay/relay.go,
+    pkg/cli/cli_show_services.go,
+    pkg/config/compiler_dhcp_relay_overrides_test.go,
+    pkg/dhcprelay/relay_test.go, pkg/dhcprelay/README.md,
+    docs/config-schema.md, _Log.md
+
+## 2026-07-05 — fable-review-167 I-3 (#4308): interface ARP/addressing parity knobs
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Type + compile five interface knobs that were silently
+    dropped (native-vlan-id, gratuitous-arp-reply,
+    no-gratuitous-arp-request at interface level; unnumbered-address,
+    targeted-broadcast under family inet). All accept-with-advisory
+    (#2078 doctrine): typed schema leaves, compiled into
+    InterfaceConfig/InterfaceUnit fields, and a per-interface
+    accepted-only advisory (validateInterfaceParityWarnings) at commit —
+    full enforcement is design/cluster work (native-vlan-id → QinQ
+    pipeline #2354; unnumbered-address → networkd borrow; ARP knobs →
+    sysctls; targeted-broadcast → dataplane). RED-on-revert: compile +
+    advisory tests go empty on revert.
+  - **File(s)**: pkg/config/schema_interfaces.go,
+    pkg/config/types_interfaces.go, pkg/config/compiler_interfaces.go,
+    pkg/config/compiler_validate_warn.go,
+    pkg/config/interface_parity_4308_test.go, docs/config-schema.md,
+    _Log.md
+
+## 2026-07-05 — fable-review-167 I-2 (#4307): RA reachable-time / retransmit-timer
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Implement the RFC 4861 §4.2 Reachable Time / Retrans
+    Timer RA header fields, which were silently dropped (no schema leaf,
+    no config field, sender never set them → both went on the wire as 0).
+    Added typed millisecond leaves `reachable-time` / `retransmit-timer`
+    (bounded at the 32-bit ms max so they cannot silently wrap in ndp),
+    `RAInterfaceConfig.ReachableTime` / `RetransTimer`, the compiler cases,
+    and set them on the ndp RA in `buildRA`. RED-on-revert tests: parser
+    compile + sender wire round-trip.
+  - **File(s)**: pkg/config/schema_routing.go,
+    pkg/config/types_routing.go, pkg/config/compiler_protocols.go,
+    pkg/ra/sender.go, pkg/config/parser_routing_test.go,
+    pkg/ra/sender_marshal_4307_test.go, docs/embedded-radvd.md,
+    docs/config-schema.md, _Log.md
+
 ## 2026-07-05 — fable-167 PR #4295 Copilot fold: scrub two secret-leak-to-logs paths (VRRP auth-key + SNMP community)
 
 - **Timestamp**: 2026-07-05

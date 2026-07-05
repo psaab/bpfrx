@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -240,5 +241,147 @@ func TestDHCPRelayOverrides_SchemaCompletion(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("overrides completion missing always-broadcast; got %v", comps)
+	}
+}
+
+// #4309 (fable-review-167 I-4): the additional relay overrides
+// (maximum-hop-count / forward-only / relay-agent-option) must compile from
+// the flat-set path. RED-on-revert: without the compiler cases each field
+// reads back its zero value (silent drop).
+func TestDHCPRelayOverrides_4309_FlatSet(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set forwarding-options dhcp-relay server-group sg 10.1.1.1",
+		"set forwarding-options dhcp-relay group lan active-server-group sg",
+		"set forwarding-options dhcp-relay group lan interface ge-0/0/0.0",
+		"set forwarding-options dhcp-relay group lan overrides maximum-hop-count 4",
+		"set forwarding-options dhcp-relay group lan overrides forward-only",
+		"set forwarding-options dhcp-relay group lan overrides relay-agent-option",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	g := relayGroup(t, cfg, "lan")
+	if g.MaximumHopCount != 4 {
+		t.Errorf("MaximumHopCount = %d, want 4", g.MaximumHopCount)
+	}
+	if !g.ForwardOnly {
+		t.Error("ForwardOnly = false, want true")
+	}
+	if !g.RelayAgentOption {
+		t.Error("RelayAgentOption = false, want true")
+	}
+	// The interface list must stay clean — the new override keywords/value
+	// must not be swallowed into it.
+	if len(g.Interfaces) != 1 || g.Interfaces[0] != "ge-0/0/0.0" {
+		t.Errorf("Interfaces = %v, want [ge-0/0/0.0]", g.Interfaces)
+	}
+}
+
+// Merged-Keys shape: `maximum-hop-count 4` packed inline with a value token in
+// one group node exercises the inline-Keys override loop's value consumption
+// (the loop must advance past the value, not treat "4" as an override keyword).
+func TestDHCPRelayOverrides_4309_MergedKeysHopCountValue(t *testing.T) {
+	relayNode := &Node{
+		Keys: []string{"dhcp-relay"},
+		Children: []*Node{
+			{Keys: []string{"server-group", "sg", "10.1.1.1"}, IsLeaf: true},
+			{
+				Keys: []string{
+					"group", "lan",
+					"overrides", "maximum-hop-count", "4",
+					"interface", "ge-0/0/0.0",
+				},
+				IsLeaf: true,
+			},
+		},
+	}
+	fo := &ForwardingOptionsConfig{}
+	if err := compileDHCPRelay(relayNode, fo); err != nil {
+		t.Fatalf("compileDHCPRelay: %v", err)
+	}
+	g := fo.DHCPRelay.Groups["lan"]
+	if g == nil {
+		t.Fatal("relay group lan not found")
+	}
+	if g.MaximumHopCount != 4 {
+		t.Errorf("MaximumHopCount = %d, want 4 (merged-Keys value)", g.MaximumHopCount)
+	}
+	if len(g.Interfaces) != 1 || g.Interfaces[0] != "ge-0/0/0.0" {
+		t.Errorf("Interfaces = %v, want [ge-0/0/0.0] (hop-count value swallowed?)", g.Interfaces)
+	}
+}
+
+// Block form: `overrides { maximum-hop-count 4; forward-only; }` as child
+// nodes exercises the children-based override loop.
+func TestDHCPRelayOverrides_4309_BlockForm(t *testing.T) {
+	relayNode := &Node{
+		Keys: []string{"dhcp-relay"},
+		Children: []*Node{
+			{Keys: []string{"server-group", "sg", "10.1.1.1"}, IsLeaf: true},
+			{
+				Keys: []string{"group", "lan"},
+				Children: []*Node{
+					{Keys: []string{"interface", "ge-0/0/0.0"}, IsLeaf: true},
+					{Keys: []string{"overrides"}, Children: []*Node{
+						{Keys: []string{"maximum-hop-count", "4"}, IsLeaf: true},
+						{Keys: []string{"forward-only"}, IsLeaf: true},
+						{Keys: []string{"relay-agent-option"}, IsLeaf: true},
+					}},
+				},
+			},
+		},
+	}
+	fo := &ForwardingOptionsConfig{}
+	if err := compileDHCPRelay(relayNode, fo); err != nil {
+		t.Fatalf("compileDHCPRelay: %v", err)
+	}
+	g := fo.DHCPRelay.Groups["lan"]
+	if g == nil {
+		t.Fatal("relay group lan not found")
+	}
+	if g.MaximumHopCount != 4 {
+		t.Errorf("MaximumHopCount = %d, want 4 (block form)", g.MaximumHopCount)
+	}
+	if !g.ForwardOnly {
+		t.Error("ForwardOnly = false, want true (block form)")
+	}
+	if !g.RelayAgentOption {
+		t.Error("RelayAgentOption = false, want true (block form)")
+	}
+}
+
+// forward-only / relay-agent-option must surface an accepted-only advisory;
+// maximum-hop-count is enforced and must NOT (it is a real behavior, not a
+// no-op).
+func TestDHCPRelayOverrides_4309_Advisory(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set forwarding-options dhcp-relay server-group sg 10.1.1.1",
+		"set forwarding-options dhcp-relay group lan active-server-group sg",
+		"set forwarding-options dhcp-relay group lan interface ge-0/0/0.0",
+		"set forwarding-options dhcp-relay group lan overrides forward-only",
+		"set forwarding-options dhcp-relay group lan overrides relay-agent-option",
+		"set forwarding-options dhcp-relay group lan overrides maximum-hop-count 4",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	var warn string
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "#4309") && strings.Contains(w, "lan") {
+			warn = w
+		}
+	}
+	if warn == "" {
+		t.Fatalf("expected a #4309 accepted-only advisory for group lan, got: %v", ValidateConfig(cfg))
+	}
+	if !strings.Contains(warn, "forward-only") || !strings.Contains(warn, "relay-agent-option") {
+		t.Errorf("advisory missing an accepted-only knob: %s", warn)
+	}
+	// maximum-hop-count is enforced — it must not appear in the accepted-only
+	// advisory.
+	if strings.Contains(warn, "maximum-hop-count") {
+		t.Errorf("maximum-hop-count is enforced and must not be in the accepted-only advisory: %s", warn)
 	}
 }

@@ -1723,6 +1723,59 @@ reserved for whole-dataplane selection where a rewrite shim
   configs). New validators `ValidateIPv6Address` / `ValidatePREF64CIDR`
   live in `schema_validators.go`. Regression coverage:
   `pkg/config/schema_validate_2497_test.go`.
+- **#4307 (router-advertisement reachable-time / retransmit-timer,
+  fable-review-167 I-2):** the RFC 4861 §4.2 Reachable Time and Retrans
+  Timer RA header fields had no schema leaf, no `RAInterfaceConfig`
+  field, and the sender never set them, so both went on the wire as 0
+  ("unspecified") and hosts could not be tuned via RA. Added
+  `reachable-time` / `retransmit-timer` as typed millisecond leaves
+  (`ValidateInteger(0, raReachableRetransMaxMillis)` — the 32-bit ms
+  field maximum so an over-large value does not silently wrap in ndp's
+  `Duration/time.Millisecond -> uint32`), compiled into
+  `RAInterfaceConfig.ReachableTime` / `RetransTimer`, and set on
+  `ndp.RouterAdvertisement.ReachableTime` / `RetransmitTimer` in
+  `pkg/ra/sender.go buildRA`. 0 keeps the pre-#4307 unspecified default.
+  Coverage: `pkg/config/parser_routing_test.go` (compile) +
+  `pkg/ra/sender_marshal_4307_test.go` (wire round-trip).
+- **#4308 (interface ARP/addressing parity knobs, fable-review-167
+  I-3):** five common Junos interface knobs were accepted by the
+  permissive parser but never modeled or compiled, so they silently
+  vanished at commit. They are now typed leaves + compiled fields +
+  carry an accepted-only advisory (the #2078 doctrine), because full
+  enforcement needs design/cluster work:
+  - `native-vlan-id <id>` (interface-level, `ValidateInteger(1, 4094)`)
+    — folds into the QinQ tagging pipeline (#2354).
+  - `gratuitous-arp-reply` / `no-gratuitous-arp-request`
+    (interface-level flags) — map to per-interface ARP sysctls the
+    interface apply path does not write yet.
+  - `family inet unnumbered-address <interface>` — needs a networkd
+    borrow-address implementation (resolve the donor unit's address).
+  - `family inet targeted-broadcast` — needs dataplane directed-
+    broadcast forwarding.
+  Compiled into `InterfaceConfig.{NativeVlanID,GratuitousARPReply,
+  NoGratuitousARPRequest}` and `InterfaceUnit.{UnnumberedInet,
+  TargetedBroadcast}`; `validateInterfaceParityWarnings`
+  (compiler_validate_warn.go) emits one deterministic per-interface
+  accepted-only warning at commit. Coverage:
+  `pkg/config/interface_parity_4308_test.go` (compile + advisory +
+  no-false-positive).
+- **#4309 (DHCP relay overrides, fable-review-167 I-4):** the dhcp-relay
+  `overrides` block modeled only `always-broadcast`; three standard
+  relay knobs were silently dropped. Added under group `overrides`:
+  - `maximum-hop-count <1..16>` (`ValidateInteger(1, 16)`) — **enforced**.
+    The relay's hop limit was hardcoded at 16; it is now the group's
+    configured value (default 16), a request at the limit is dropped, and
+    `RelayStats.RequestsDroppedMaxHops` counts the drop. Compiled into
+    `DHCPRelayGroup.MaximumHopCount` and flows into `relaySpec.maxHopCount`.
+  - `forward-only` / `relay-agent-option` — **accepted-only**. The xpf
+    relay already forwards statelessly and always inserts Option 82, so
+    each matches the default; compiled into `DHCPRelayGroup.ForwardOnly`
+    / `RelayAgentOption` with a commit-time accepted-only advisory
+    (`validateDHCPRelayParityWarnings`). Both AST shapes handled (inline
+    flat-set Keys and block-form children). Coverage:
+    `pkg/config/compiler_dhcp_relay_overrides_test.go` (compile flat-set
+    + merged-Keys value + block form + advisory) and
+    `pkg/dhcprelay/relay_test.go` (`TestRunRelay_ConfiguredMaxHopCount`).
 - **#2008 H7 (security log profile):** declared the `security log
   profile <name>` stanza — `stream-name` (`ValueHintStreamName`
   completion), `default-profile` (presence flag), and

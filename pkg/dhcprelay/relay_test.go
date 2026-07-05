@@ -373,6 +373,69 @@ func TestRunRelay_HopCountLimit(t *testing.T) {
 	}
 }
 
+// TestRunRelay_ConfiguredMaxHopCount asserts the #4309 configurable hop limit:
+// `overrides maximum-hop-count <n>` lowers the drop threshold from the default
+// 16, a request AT the configured limit is dropped, one below it is relayed,
+// and the drop increments RequestsDroppedMaxHops. RED-on-revert: with the hop
+// check pinned to the hardcoded 16 (or ir.maxHopCount unwired), the hops=4
+// request would relay instead of drop.
+func TestRunRelay_ConfiguredMaxHopCount(t *testing.T) {
+	cfg := singleInterfaceConfig()
+	cfg.Groups["g"].MaximumHopCount = 4
+
+	cases := []struct {
+		name        string
+		hops        uint8
+		wantRelayed bool
+	}{
+		{"below_configured_limit", 3, true},
+		{"at_configured_limit", 4, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := dhcpv4.New()
+			if err != nil {
+				t.Fatalf("dhcpv4.New: %v", err)
+			}
+			req.OpCode = dhcpv4.OpcodeBootRequest
+			req.ClientHWAddr = net.HardwareAddr{0x02, 0, 0, 0, 0, 1}
+			req.HopCount = tc.hops
+			req.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeRequest))
+
+			client := newFakeConn()
+			client.pending = [][]byte{req.ToBytes()}
+			server := newFakeConn()
+			factory, _ := recordingFactory(client, server)
+			m := testManager(factory)
+			m.Apply(context.Background(), cfg)
+			defer m.Stop()
+
+			deadline := time.Now().Add(1 * time.Second)
+			for client.readCalls.Load() < 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+
+			got := server.writeCount()
+			if tc.wantRelayed && got == 0 {
+				t.Fatalf("hops=%d limit=4: expected relay, got none", tc.hops)
+			}
+			if !tc.wantRelayed {
+				if got != 0 {
+					t.Fatalf("hops=%d limit=4: expected drop, but %d datagram(s) relayed", tc.hops, got)
+				}
+				// The drop must be counted.
+				var dropped uint64
+				for _, s := range m.Stats() {
+					dropped += s.RequestsDroppedMaxHops
+				}
+				if dropped == 0 {
+					t.Errorf("hops=%d limit=4: dropped but RequestsDroppedMaxHops stayed 0", tc.hops)
+				}
+			}
+		})
+	}
+}
+
 // --- Lifecycle test scaffolding (#1915) ---
 
 // fakeConn is a fake net.PacketConn whose ReadFrom blocks until Close (unless

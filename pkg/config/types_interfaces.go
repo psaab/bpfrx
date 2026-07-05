@@ -29,6 +29,15 @@ type InterfaceConfig struct {
 	AggregatedEtherOpts *AggregatedEtherOptions // ae interface options (LACP, etc.)
 	Units               map[int]*InterfaceUnit
 	Tunnel              *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
+	// #4308 (fable-review-167 I-3): parity knobs that are typed + compiled
+	// so they stop silently vanishing, but are ACCEPTED-ONLY today (a
+	// commit-time advisory warns they are not enforced). native-vlan-id
+	// needs the QinQ tagging pipeline (#2354); the gratuitous-ARP knobs
+	// map to per-interface sysctls not yet written by the interface apply
+	// path. See validateInterfaceParityWarnings.
+	NativeVlanID           int  // native-vlan-id <id> (0 = unset) — accepted-only (#4308)
+	GratuitousARPReply     bool // gratuitous-arp-reply — accepted-only (#4308)
+	NoGratuitousARPRequest bool // no-gratuitous-arp-request — accepted-only (#4308)
 }
 
 // AggregatedEtherOptions defines LAG/ae interface parameters.
@@ -55,15 +64,22 @@ type InterfaceUnit struct {
 	DHCPOptions      *DHCPInetOptions // dhcp sub-options (lease-time, etc.)
 	DHCPv6           bool             // family inet6 { dhcpv6; }
 	DHCPv6Client     *DHCPv6ClientConfig
-	DADDisable       bool                  // family inet6 { dad-disable; }
-	SamplingInput    bool                  // family inet/inet6 { sampling { input; } }
-	SamplingOutput   bool                  // family inet/inet6 { sampling { output; } }
-	FilterInputV4    string                // family inet { filter { input NAME; } }
-	FilterOutputV4   string                // family inet { filter { output NAME; } }
-	FilterInputV6    string                // family inet6 { filter { input NAME; } }
-	FilterOutputV6   string                // family inet6 { filter { output NAME; } }
-	VRRPGroups       map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
-	Tunnel           *TunnelConfig         // per-unit tunnel config (for multi-unit GRE/IPIP)
+	DADDisable       bool // family inet6 { dad-disable; }
+	// #4308 (fable-review-167 I-3): family inet parity knobs, typed +
+	// compiled so they stop silently vanishing but ACCEPTED-ONLY today
+	// (commit-time advisory; see validateInterfaceParityWarnings).
+	// unnumbered-address needs a networkd borrow-address implementation;
+	// targeted-broadcast needs dataplane directed-broadcast forwarding.
+	UnnumberedInet    string                // family inet unnumbered-address <donor> — accepted-only (#4308)
+	TargetedBroadcast bool                  // family inet targeted-broadcast — accepted-only (#4308)
+	SamplingInput     bool                  // family inet/inet6 { sampling { input; } }
+	SamplingOutput    bool                  // family inet/inet6 { sampling { output; } }
+	FilterInputV4     string                // family inet { filter { input NAME; } }
+	FilterOutputV4    string                // family inet { filter { output NAME; } }
+	FilterInputV6     string                // family inet6 { filter { input NAME; } }
+	FilterOutputV6    string                // family inet6 { filter { output NAME; } }
+	VRRPGroups        map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
+	Tunnel            *TunnelConfig         // per-unit tunnel config (for multi-unit GRE/IPIP)
 	// DynamicDNSInet / DynamicDNSInet6 are the per-family Surface A
 	// router/interface-address DDNS bindings (#2691 P2, plan §5.9): publish
 	// THIS interface unit's learned v4 / v6 address as a configured FQDN through

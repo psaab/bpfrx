@@ -700,6 +700,12 @@ func (s *sender) buildRA() *ndp.RouterAdvertisement {
 		ManagedConfiguration: s.cfg.ManagedConfig,
 		OtherConfiguration:   s.cfg.OtherStateful,
 		RouterLifetime:       time.Duration(lifetime) * time.Second,
+		// RFC 4861 §4.2 Reachable Time / Retrans Timer (#4307). ndp
+		// marshals these as ms (Duration/time.Millisecond -> uint32); a
+		// configured 0 keeps the "unspecified" default the RA carried
+		// before these leaves existed.
+		ReachableTime:   time.Duration(s.cfg.ReachableTime) * time.Millisecond,
+		RetransmitTimer: time.Duration(s.cfg.RetransTimer) * time.Millisecond,
 	}
 
 	// Router selection preference.

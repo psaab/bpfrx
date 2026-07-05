@@ -901,6 +901,18 @@ type DHCPRelayGroup struct {
 	// client's broadcast flag and raw-L2-unicasts flag-clear replies to
 	// chaddr+yiaddr (#2076).
 	AlwaysBroadcast bool
+	// #4309 (fable-review-167 I-4): additional relay overrides.
+	//
+	// MaximumHopCount is the RFC 1542 §4.1.1 loop-protection hop limit —
+	// the relay drops a client request whose hops field has reached this
+	// value. 0 = unset = the pre-#4309 hardcoded default (16). ENFORCED.
+	MaximumHopCount int
+	// ForwardOnly / RelayAgentOption are ACCEPTED-ONLY (a commit-time
+	// advisory notes each matches the relay's existing default behavior):
+	// the xpf relay already forwards statelessly (no persistent per-client
+	// binding), and it always inserts Option 82 (circuit-id).
+	ForwardOnly      bool
+	RelayAgentOption bool
 }
 
 // SamplingConfig holds sampling instance definitions.
