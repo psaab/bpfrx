@@ -110,18 +110,26 @@ func TestFable167P3FlowKnobAdvisories(t *testing.T) {
 	}
 }
 
-// TestFable167P3SyncICMPSessionStrongAdvisory asserts sync-icmp-session gets its
-// own, HA-specific advisory (ICMP sessions do NOT sync / survive failover).
-func TestFable167P3SyncICMPSessionStrongAdvisory(t *testing.T) {
+// TestFable167P3SyncICMPSessionNoOpAdvisory asserts sync-icmp-session gets its
+// own, DISTINCT advisory: it is a no-op because xpf already syncs ICMP sessions
+// to the HA peer UNCONDITIONALLY (the session-sync path is protocol-agnostic).
+// The advisory must NOT claim the inverse (that ICMP is not synced / would not
+// survive failover) — that was the factually-inverted wording the fable-167
+// hostile review caught.
+func TestFable167P3SyncICMPSessionNoOpAdvisory(t *testing.T) {
 	tree := buildTree(t, []string{"set security flow sync-icmp-session"})
 	cfg, err := CompileConfig(tree)
 	if err != nil {
 		t.Fatalf("sync-icmp-session should commit (accepted-only): %v", err)
 	}
 	if !warn167Has(cfg, "sync-icmp-session") ||
-		!warn167Has(cfg, "NOT sync") ||
-		!warn167Has(cfg, "failover") {
-		t.Fatalf("sync-icmp-session advisory should warn ICMP sessions do NOT sync / survive failover; warnings=%v", cfg.Warnings)
+		!warn167Has(cfg, "UNCONDITIONALLY") ||
+		!warn167Has(cfg, "no-op") {
+		t.Fatalf("sync-icmp-session advisory should state the knob is a no-op because ICMP is synced unconditionally; warnings=%v", cfg.Warnings)
+	}
+	// Guard against a regression to the inverted wording.
+	if warn167Has(cfg, "NOT sync") || warn167Has(cfg, "not replicated") {
+		t.Fatalf("sync-icmp-session advisory must NOT claim ICMP is not synced (inverted); warnings=%v", cfg.Warnings)
 	}
 }
 

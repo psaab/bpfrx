@@ -142,7 +142,7 @@ type FlowConfig struct {
 	// silent drop. The two duration knobs are seconds (0 = unset / absent); the
 	// three toggles are presence booleans. None reach the dataplane wire.
 	RouteChangeTimeout           int  // seconds (0 = unset)
-	SyncICMPSession              bool // HA: ICMP sessions do NOT sync (accepted-only)
+	SyncICMPSession              bool // no-op: xpf syncs ICMP sessions to the HA peer unconditionally
 	ForceIPReassembly            bool // accepted-only
 	MulticastSessionLifetime     int  // seconds (0 = unset)
 	PreserveIncomingFragmentSize bool // accepted-only

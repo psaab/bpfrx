@@ -550,12 +550,15 @@ func ValidateConfig(cfg *Config) []string {
 	// dataplane enforces none of them today. Mirror the #2078 tcp-session
 	// accepted-only doctrine: warn so an operator who sets one is not silently
 	// misled into believing it has runtime effect. sync-icmp-session gets its
-	// own, stronger line because it is the most dangerous in an HA deployment:
-	// an operator reasonably assumes ICMP sessions replicate to the peer and
-	// survive failover, but the userspace dataplane does not sync ICMP
-	// sessions at all. The two duration knobs (route-change-timeout,
-	// multicast-session-lifetime) are "present" when > 0 (0 = unset / disabled,
-	// no behavior to warn about); the toggles warn on presence.
+	// own, distinct line because it is a no-op for a DIFFERENT reason than the
+	// other four: xpf ALREADY syncs ICMP sessions to the HA peer
+	// UNCONDITIONALLY — the session-sync path is protocol-agnostic at every
+	// layer (publish_shared_session / snapshot_all_sessions_export in
+	// userspace-dp; the Go pkg/cluster wire has no protocol filter), so the
+	// Junos opt-in knob has nothing to turn on. The two duration knobs
+	// (route-change-timeout, multicast-session-lifetime) are "present" when > 0
+	// (0 = unset / disabled, no behavior to warn about); the toggles warn on
+	// presence.
 	{
 		flow := cfg.Security.Flow
 		var flowUnenforced []string
@@ -578,7 +581,7 @@ func ValidateConfig(cfg *Config) []string {
 		}
 		if flow.SyncICMPSession {
 			warnings = append(warnings,
-				"security flow sync-icmp-session configured but accepted-only — the userspace dataplane does NOT sync ICMP sessions to the HA peer; ICMP flows are not replicated and will NOT survive a failover, so do not rely on this knob for ICMP session continuity (config-only parity, #4231)")
+				"security flow sync-icmp-session configured but has no effect — xpf syncs ICMP sessions to the HA peer UNCONDITIONALLY (the session-sync path is protocol-agnostic), so this Junos opt-in knob is a no-op: ICMP session sync is already always on and cannot be turned off (config-only parity, #4231)")
 		}
 	}
 

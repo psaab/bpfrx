@@ -3495,14 +3495,16 @@ the value sits in a single typed slot:
     that previously had no schema entry and no compiler case, so they committed
     clean and did nothing with zero operator signal. Now typed +
     compiler-recorded: `route-change-timeout` and `multicast-session-lifetime`
-    (`ValidateInteger(0, MaxDurationSeconds)`, seconds, 0 = unset), and three
+    (`ValidateInteger(6, 1800)`, seconds — the Junos bounds), and three
     presence flags `sync-icmp-session`, `force-ip-reassembly`,
     `preserve-incoming-fragment-size`. None reach the dataplane wire; each
-    emits an accepted-only commit advisory (`compiler_validate_warn.go`,
-    `security flow ... accepted-only`, the #2078 doctrine).
-    `sync-icmp-session` carries a stronger, HA-specific advisory because the
-    userspace dataplane does NOT sync ICMP sessions to the peer — those flows
-    are not replicated and will not survive a failover.
+    emits a commit advisory (`compiler_validate_warn.go`, the #2078 doctrine).
+    `sync-icmp-session` carries a DISTINCT advisory: it is a no-op not because
+    it is unenforced but because xpf already syncs ICMP sessions to the HA peer
+    UNCONDITIONALLY — the session-sync path is protocol-agnostic
+    (`publish_shared_session` / `snapshot_all_sessions_export` in `userspace-dp`
+    apply no protocol filter, and `pkg/cluster` has no protocol filter), so the
+    Junos opt-in knob has nothing to turn on and cannot turn it off.
   - Container-level accepted-but-inert advisories (#4232, fable-167 P-4): the
     `setSchema` gate is opt-in (unknown keywords pass to the compiler), and the
     exhaustive policy `match`/`then` gates (#3113/#3114/#3115) do NOT cover the

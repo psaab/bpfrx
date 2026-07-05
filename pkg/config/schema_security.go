@@ -696,11 +696,14 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// AF_XDP dataplane does not enforce any of them yet. The two duration
 		// leaves are bounded seconds (0 = unset); the three toggles are
 		// presence-only.
+		// Junos bounds: route-change-timeout / multicast-session-lifetime are
+		// 6..1800 seconds. Match them so an out-of-range value is rejected at
+		// commit (as Junos does) instead of accepted into a no-op knob.
 		"route-change-timeout": {desc: "Timeout after a route change before flushing affected sessions (accepted-only)", args: 1, placeholder: "<seconds>",
-			valueType: ValueInteger, valueDesc: "Seconds (0 = unset)", valueExamples: []string{"30"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
-		"sync-icmp-session":               {desc: "Sync ICMP sessions to the HA peer (accepted-only — NOT enforced; ICMP sessions do NOT sync)", children: nil},
+			valueType: ValueInteger, valueDesc: "Seconds (6..1800)", valueExamples: []string{"30"}, validator: ValidateInteger(6, 1800), children: nil},
+		"sync-icmp-session":               {desc: "Sync ICMP sessions to the HA peer (no-op — xpf already syncs ICMP sessions unconditionally)", children: nil},
 		"force-ip-reassembly":             {desc: "Force IP fragment reassembly before forwarding (accepted-only)", children: nil},
-		"multicast-session-lifetime":      {desc: "Multicast session lifetime in seconds (accepted-only)", args: 1, placeholder: "<seconds>", valueType: ValueInteger, valueDesc: "Seconds (0 = unset)", valueExamples: []string{"30"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
+		"multicast-session-lifetime":      {desc: "Multicast session lifetime in seconds (accepted-only)", args: 1, placeholder: "<seconds>", valueType: ValueInteger, valueDesc: "Seconds (6..1800)", valueExamples: []string{"30"}, validator: ValidateInteger(6, 1800), children: nil},
 		"preserve-incoming-fragment-size": {desc: "Preserve incoming fragment size when forwarding (accepted-only)", children: nil},
 		"traceoptions": {desc: "Flow trace debugging options", children: map[string]*schemaNode{
 			"file": {desc: "Trace file name (with size/files options)", args: 1, placeholder: "<filename>", children: nil},
