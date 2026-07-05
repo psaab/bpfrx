@@ -33,6 +33,9 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	if cos.Interfaces == nil {
 		cos.Interfaces = make(map[string]*CoSInterface)
 	}
+	if cos.TrafficControlProfiles == nil {
+		cos.TrafficControlProfiles = make(map[string]*CoSTrafficControlProfile)
+	}
 	if fcNode := node.FindChild("forwarding-classes"); fcNode != nil {
 		// Enforce the FC ↔ queue bijection. Junos semantics give
 		// each queue ID one forwarding class, and each FC one
@@ -192,9 +195,22 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 				cos.IEEE8021Classifiers[classifier.Name] = classifier
 			}
 		}
+		// #4316 (fable-167 F-3b): inet-precedence classifiers are accepted
+		// but inert; record their names for the commit advisory.
+		for _, inst := range namedInstances(classifiersNode.FindChildren("inet-precedence")) {
+			cos.INetPrecedenceClassifiers = append(cos.INetPrecedenceClassifiers, inst.name)
+		}
 	}
 
 	if rewriteRulesNode := node.FindChild("rewrite-rules"); rewriteRulesNode != nil {
+		// #4316 (fable-167 F-3b): inet-precedence and exp rewrite-rules are
+		// accepted but inert; record their names for the commit advisory.
+		for _, inst := range namedInstances(rewriteRulesNode.FindChildren("inet-precedence")) {
+			cos.INetPrecedenceRewriteRules = append(cos.INetPrecedenceRewriteRules, inst.name)
+		}
+		for _, inst := range namedInstances(rewriteRulesNode.FindChildren("exp")) {
+			cos.EXPRewriteRules = append(cos.EXPRewriteRules, inst.name)
+		}
 		for _, inst := range namedInstances(rewriteRulesNode.FindChildren("dscp")) {
 			rewriteRule := &CoSDSCPRewriteRule{Name: inst.name}
 			for _, fcNode := range inst.node.FindChildren("forwarding-class") {
@@ -275,6 +291,34 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 			}
 		}
 		cos.Schedulers[sched.Name] = sched
+	}
+
+	// #4315 (fable-167 F-2): traffic-control-profiles. Each profile carries
+	// the Junos hierarchical shaping knobs. The bounded ones (shaping-rate,
+	// scheduler-map) are folded into the referencing interface unit by
+	// resolveCoSTrafficControlProfiles; guaranteed-rate / delay-buffer-rate
+	// are captured but currently inert (see CoSTrafficControlProfile).
+	for _, inst := range namedInstances(node.FindChildren("traffic-control-profiles")) {
+		tcp := &CoSTrafficControlProfile{Name: inst.name}
+		if shapingNode := inst.node.FindChild("shaping-rate"); shapingNode != nil {
+			if v := nodeVal(shapingNode); v != "" {
+				tcp.ShapingRateBytes = parseBandwidthLimit(v)
+			}
+		}
+		if grNode := inst.node.FindChild("guaranteed-rate"); grNode != nil {
+			if v := nodeVal(grNode); v != "" {
+				tcp.GuaranteedRateBytes = parseBandwidthLimit(v)
+			}
+		}
+		if dbNode := inst.node.FindChild("delay-buffer-rate"); dbNode != nil {
+			if v := nodeVal(dbNode); v != "" {
+				tcp.DelayBufferRateBytes = parseBandwidthLimit(v)
+			}
+		}
+		if smNode := inst.node.FindChild("scheduler-map"); smNode != nil {
+			tcp.SchedulerMap = nodeVal(smNode)
+		}
+		cos.TrafficControlProfiles[tcp.Name] = tcp
 	}
 
 	for _, inst := range namedInstances(node.FindChildren("scheduler-maps")) {
@@ -412,6 +456,9 @@ func parseCoSInterfaceUnitBody(node *Node, unit *CoSInterfaceUnit) {
 	if schedMapNode := node.FindChild("scheduler-map"); schedMapNode != nil {
 		unit.SchedulerMap = nodeVal(schedMapNode)
 	}
+	if tcpNode := node.FindChild("output-traffic-control-profile"); tcpNode != nil {
+		unit.OutputTrafficControlProfile = nodeVal(tcpNode)
+	}
 	if classifiersNode := node.FindChild("classifiers"); classifiersNode != nil {
 		if dscpNode := classifiersNode.FindChild("dscp"); dscpNode != nil {
 			unit.DSCPClassifier = nodeVal(dscpNode)
@@ -493,7 +540,7 @@ func coSInterfaceUnitHasBinding(unit *CoSInterfaceUnit) bool {
 	return unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" ||
 		unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" ||
 		unit.DSCPRewriteRule != "" || unit.OversubscriptionPolicy != "" ||
-		unit.PriorityLowMinShareBytes > 0
+		unit.PriorityLowMinShareBytes > 0 || unit.OutputTrafficControlProfile != ""
 }
 
 // applyCoSInterfaceLevelBindings folds each interface-level CoS binding
@@ -563,6 +610,9 @@ func mergeCoSInterfaceLevelInto(unit, level *CoSInterfaceUnit) {
 	if unit.SchedulerMap == "" {
 		unit.SchedulerMap = level.SchedulerMap
 	}
+	if unit.OutputTrafficControlProfile == "" {
+		unit.OutputTrafficControlProfile = level.OutputTrafficControlProfile
+	}
 	if unit.DSCPClassifier == "" {
 		unit.DSCPClassifier = level.DSCPClassifier
 	}
@@ -578,6 +628,57 @@ func mergeCoSInterfaceLevelInto(unit, level *CoSInterfaceUnit) {
 	}
 	if unit.PriorityLowMinShareBytes == 0 {
 		unit.PriorityLowMinShareBytes = level.PriorityLowMinShareBytes
+	}
+}
+
+// resolveCoSTrafficControlProfiles folds each interface unit's
+// output-traffic-control-profile binding (fable-167 F-2, #4315) into the
+// unit's existing per-unit shaper. For every CoSInterfaceUnit that names a
+// profile, the referenced profile's shaping-rate and scheduler-map fill the
+// unit's ShapingRateBytes / SchedulerMap when those are not already set
+// directly on the unit — a DIRECT unit-level knob wins (Junos gives an
+// explicit unit binding precedence over a profile). After this pass the
+// dataplane snapshot and `show class-of-service`, which iterate Units and
+// read ShapingRateBytes / SchedulerMap, enforce the profile's shaping with no
+// awareness of traffic-control-profiles. This is what stops the silent
+// zero-shaping: before modeling, output-traffic-control-profile was dropped
+// and the shaper never materialized.
+//
+// A dangling reference (no such profile) leaves the unit's shaper knobs
+// unset; ValidateConfig warns so the operator sees the inert binding.
+// guaranteed-rate / delay-buffer-rate are NOT folded — the userspace shaper
+// has no per-unit consumer for them (accepted-but-inert; warned separately).
+//
+// Runs AFTER applyCoSInterfaceLevelBindings so an interface-level
+// output-traffic-control-profile has already been copied into each unit.
+func resolveCoSTrafficControlProfiles(cfg *Config) {
+	if cfg == nil || cfg.ClassOfService == nil {
+		return
+	}
+	cos := cfg.ClassOfService
+	resolve := func(unit *CoSInterfaceUnit) {
+		if unit == nil || unit.OutputTrafficControlProfile == "" {
+			return
+		}
+		tcp := cos.TrafficControlProfiles[unit.OutputTrafficControlProfile]
+		if tcp == nil {
+			return
+		}
+		if unit.ShapingRateBytes == 0 {
+			unit.ShapingRateBytes = tcp.ShapingRateBytes
+		}
+		if unit.SchedulerMap == "" {
+			unit.SchedulerMap = tcp.SchedulerMap
+		}
+	}
+	for _, iface := range cos.Interfaces {
+		if iface == nil {
+			continue
+		}
+		resolve(iface.Level)
+		for _, unit := range iface.Units {
+			resolve(unit)
+		}
 	}
 }
 

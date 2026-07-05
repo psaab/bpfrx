@@ -202,6 +202,12 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 			for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
 				filter := &FirewallFilter{Name: filterInst.name}
 
+				// #4316 (fable-167 F-3a): record interface-specific so the
+				// commit advisory can flag the single-shared-counter divergence.
+				if filterInst.node.FindChild("interface-specific") != nil {
+					filter.InterfaceSpecific = true
+				}
+
 				for _, termInst := range namedInstances(filterInst.node.FindChildren("term")) {
 					term := &FirewallFilterTerm{
 						Name: termInst.name,

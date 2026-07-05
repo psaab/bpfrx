@@ -4673,3 +4673,42 @@ packed the whole line onto one leaf node and the compiler dropped it.
   per-day evaluation: `pkg/scheduler/scheduler_3849_test.go` and the
   updated `pkg/scheduler/scheduler_test.go`
   (`TestIsWithinWindow_NoWindowFailsClosed`).
+
+## fable-167 F-2 / F-3: CoS traffic-control-profiles + filter/CoS schema gaps
+
+**F-2 — hierarchical traffic-control-profiles (#4315).** The Junos
+hierarchical shaping binding is now modeled in `schemaClassOfService`
+(`schema_cos.go`) and **wired**:
+
+- `traffic-control-profiles <name>` — typed leaves `shaping-rate`,
+  `guaranteed-rate`, `delay-buffer-rate` (all `ValueRate` + `ValidateRate`)
+  and `scheduler-map`.
+- `output-traffic-control-profile <name>` — a binding leaf at BOTH the
+  interface-unit level and the interface level (mirroring `scheduler-map`).
+
+`resolveCoSTrafficControlProfiles` (`compiler_class_of_service.go`, called
+from `compiler.go` after `applyCoSInterfaceLevelBindings`) folds a bound
+profile's `shaping-rate` + `scheduler-map` into the referencing
+`CoSInterfaceUnit.ShapingRateBytes` / `SchedulerMap` — so the existing
+per-unit shaper enforces it. A **direct unit-level knob wins** over the
+profile. Before #4315 the whole binding was silently dropped (SchemaValidate
+ignores unknown keywords, no compiler read it) → a clean commit with **zero
+shaping**. `guaranteed-rate` / `delay-buffer-rate` are typed + captured but
+**accepted-but-inert** (no per-unit absolute reservation in the shaper); a
+commit advisory (`compiler_validate_warn.go`) surfaces the inertness, and a
+dangling `output-traffic-control-profile` reference also warns.
+
+**F-3a — firewall `interface-specific` (#4316).** Added as a presence flag
+under `firewall family {inet,inet6} filter <name>`; captured on
+`FirewallFilter.InterfaceSpecific`. It is **accepted-but-inert** — xpf keeps
+a single shared counter rather than a per-interface instance — with a commit
+advisory (`validateFirewallInterfaceSpecificWarnings`).
+
+**F-3b — CoS `inet-precedence` + `exp` (#4316).** Added
+`classifiers inet-precedence`, `rewrite-rules inet-precedence`, and
+`rewrite-rules exp` to `schemaClassOfService` (completion + `?` help). They
+are **accepted-but-inert** — the userspace dataplane classifies / rewrites on
+`dscp` / `ieee-802.1` only. Their names are recorded on
+`ClassOfServiceConfig` (`INetPrecedenceClassifiers` /
+`INetPrecedenceRewriteRules` / `EXPRewriteRules`) solely to drive a commit
+advisory; no runtime structure is built.

@@ -2285,6 +2285,14 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// the interface-level one per knob (Junos precedence).
 	applyCoSInterfaceLevelBindings(cfg)
 
+	// #4315 (fable-167 F-2): resolve output-traffic-control-profile bindings
+	// into each unit's per-unit shaper (shaping-rate + scheduler-map). Runs
+	// AFTER the interface-level fold so an interface-level profile binding is
+	// already present on each unit. Before modeling, the hierarchical
+	// traffic-control-profile binding was silently dropped — a clean commit
+	// with ZERO shaping; now the shaper actually materializes.
+	resolveCoSTrafficControlProfiles(cfg)
+
 	// Post-compilation fixup: resolve vSRX-style fabric member-interfaces.
 	// For fab0/fab1 with fabric-options member-interfaces, resolve which member
 	// belongs to the local node using FPC slot → node-id mapping (slot 0 → node0,
