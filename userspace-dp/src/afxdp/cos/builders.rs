@@ -249,6 +249,7 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
             current_tick: cos_tick_for_ns(now_ns),
             level0: std::array::from_fn(|_| Vec::new()),
             level1: std::array::from_fn(|_| Vec::new()),
+            scratch: Default::default(),
         },
     }
 }

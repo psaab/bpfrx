@@ -707,6 +707,18 @@ All shared buckets should be padded and isolated per cache line.
 
 Without that, coherence traffic will dominate the hot path on many-core boxes.
 
+Every per-worker, per-acquire-written array on the v8 shared lease is
+therefore `#[repr(align(64))]`: `PackedEpochGrant` (worker grants,
+starvation/demand events, equal-flow samples) and `PaddedAtomicU64`
+(cumulative requested/granted bytes). `worker_active_flow_buckets` was
+the one exception — a raw `Box<[AtomicU32]>` that packed 16 workers onto
+a single cache line and false-shared on every per-flow-churn write.
+#4270 (fable-166 R-9) wraps it in `PaddedAtomicU32` so it conforms to the
+same isolation rule; compile-time `align_of`/`size_of` asserts pin the
+padding. The interface timer wheel additionally reuses persistent
+drain/rearm/wake scratch vectors (`CoSTimerWheelScratch`) so the per-tick
+catch-up loop performs no allocator work.
+
 ## Failure Modes
 
 ### Queue Overflow

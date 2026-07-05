@@ -146,7 +146,7 @@ impl SharedCoSQueueLease {
             let active = v8
                 .worker_active_flow_buckets
                 .get(id)
-                .map(|c| c.load(Ordering::Relaxed))
+                .map(|c| c.0.load(Ordering::Relaxed))
                 .unwrap_or(0);
             active_by_worker[id] = active > 0;
             demanded_by_worker[id] = old_demand_count > 0;
@@ -416,7 +416,7 @@ impl SharedCoSQueueLease {
         let total_flows: u64 = v8
             .worker_active_flow_buckets
             .iter()
-            .map(|c| c.load(Ordering::Relaxed) as u64)
+            .map(|c| c.0.load(Ordering::Relaxed) as u64)
             .sum::<u64>()
             .max(1);
         // #1643: payload store downgraded to Relaxed — the single Release
@@ -430,7 +430,7 @@ impl SharedCoSQueueLease {
             .epoch_grace_expires_ns
             .store(grace_ns, Ordering::Relaxed);
         for (id, count_atom) in v8.worker_active_flow_buckets.iter().enumerate() {
-            let my_count = count_atom.load(Ordering::Relaxed) as u64;
+            let my_count = count_atom.0.load(Ordering::Relaxed) as u64;
             let my_share = ((new_cap as u128) * (my_count as u128) / (total_flows as u128)) as u64;
             if let Some(share_atom) = v8.worker_fair_share.get(id) {
                 share_atom.store(my_share, Ordering::Relaxed);

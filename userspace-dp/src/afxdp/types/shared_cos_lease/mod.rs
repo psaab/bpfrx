@@ -70,7 +70,7 @@ pub(in crate::afxdp) use epoch::{AcquireV8ShortfallCause, V8EqualFlowFailOpenRea
 use epoch::{
     CARRY_DRAIN_MAX_EPOCHS, CARRY_MAX_EPOCHS, EPOCH_DURATION_NS, EQUAL_FLOW_MIN_WORKER_UTIL_DEN,
     EQUAL_FLOW_MIN_WORKER_UTIL_NUM, EQUAL_FLOW_VALID_STREAK_REQUIRED, MAX_ROLLBACK_RETRIES,
-    MAX_ROTATION_LAG_EPOCHS, MAX_SEQ_SPINS, PackedEpochGrant, PaddedAtomicU64,
+    MAX_ROTATION_LAG_EPOCHS, MAX_SEQ_SPINS, PackedEpochGrant, PaddedAtomicU32, PaddedAtomicU64,
     STALL_THRESHOLD_EPOCHS, SharedCoSEpochState, V8EqualFlowSuppressState, V8RotationScratch,
     V8State,
 };

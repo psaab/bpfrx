@@ -127,6 +127,26 @@ pub(super) struct PackedEpochGrant(pub(super) AtomicU64);
 #[repr(align(64))]
 pub(super) struct PaddedAtomicU64(pub(super) AtomicU64);
 
+/// #4270 (R-9): cache-line-aligned per-worker `AtomicU32` slot. Same
+/// 64-byte isolation contract as `PackedEpochGrant` / `PaddedAtomicU64`,
+/// for `worker_active_flow_buckets` — the per-worker active-flow counter
+/// written per flow-bucket activation/teardown by each worker on its OWN
+/// slot (single-writer-per-slot) and read on every `acquire_v8` /
+/// `equal_flow_cap_v8`. Before this padding, 16 raw `AtomicU32`s packed
+/// onto one cache line and false-shared on every per-flow-churn write —
+/// the one per-acquire-written per-worker array the isolation rule had
+/// missed.
+// pub(super): named (as the `V8State::worker_active_flow_buckets` element
+// type) + `.0`-accessed by `lease.rs` / `rotate_epoch_v8.rs` /
+// `publish_equal_flow_epoch_v8.rs`.
+#[repr(align(64))]
+pub(super) struct PaddedAtomicU32(pub(super) AtomicU32);
+
+// #4270 (R-9): pin the padding at compile time — RED if the
+// `#[repr(align(64))]` is dropped or the atomic grows past a line.
+const _: () = assert!(core::mem::align_of::<PaddedAtomicU32>() == 64);
+const _: () = assert!(core::mem::size_of::<PaddedAtomicU32>() == 64);
+
 impl PackedEpochGrant {
     // pub(super): pack/unpack/new called from `lease.rs` and
     // `rotate_epoch_v8.rs`. `store_for_new_epoch` retained at its
@@ -254,7 +274,7 @@ pub(super) struct V8State {
     /// Per-worker active flow bucket count. Length = max_worker_id + 1.
     /// Single-writer-per-slot: only worker `id` writes its own slot
     /// (deltas via active_buckets.rs helpers, install via rehydrate).
-    pub(super) worker_active_flow_buckets: Box<[AtomicU32]>,
+    pub(super) worker_active_flow_buckets: Box<[PaddedAtomicU32]>,
     /// Per-worker fair share (bytes/epoch) snapshot, recomputed at
     /// rotation. Length = max_worker_id + 1.
     pub(super) worker_fair_share: Box<[AtomicU64]>,

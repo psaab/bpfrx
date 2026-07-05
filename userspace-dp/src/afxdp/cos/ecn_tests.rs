@@ -91,6 +91,37 @@ fn mark_ecn_ce_ipv4_rejects_short_buffer() {
 }
 
 #[test]
+fn mark_ecn_ce_ipv4_rejects_wrong_version_nibble() {
+    // #4269 (R-8h): a full-length ECT(0) frame whose L3 version nibble is
+    // NOT 4 (e.g. a mislabeled / rewritten header) must be refused so its
+    // "IPv4 checksum" is never recomputed over a non-IPv4 header.
+    let tos = (0x28u8 << 2) | ECN_ECT_0;
+    let mut pkt = build_ipv4_test_packet(tos);
+    pkt[14] = 0x65; // version = 6, IHL = 5 — wrong version, ECT still set
+    let before = pkt.clone();
+    assert!(
+        !mark_ecn_ce_ipv4(&mut pkt, 14),
+        "non-v4 version nibble must be rejected even with ECT bits set"
+    );
+    assert_eq!(pkt, before, "rejected frame must be byte-identical");
+}
+
+#[test]
+fn mark_ecn_ce_ipv6_rejects_wrong_version_nibble() {
+    // #4269 (R-8h): mirror guard for the IPv6 marker — reject a header
+    // whose version nibble is not 6.
+    let tclass = (0x2eu8 << 2) | ECN_ECT_0;
+    let mut pkt = build_ipv6_test_packet(tclass);
+    pkt[14] = 0x40 | (pkt[14] & 0x0f); // version = 4, keep tclass-high bits
+    let before = pkt.clone();
+    assert!(
+        !mark_ecn_ce_ipv6(&mut pkt, 14),
+        "non-v6 version nibble must be rejected even with ECT bits set"
+    );
+    assert_eq!(pkt, before, "rejected frame must be byte-identical");
+}
+
+#[test]
 fn mark_ecn_ce_ipv6_converts_ect0_to_ce() {
     // DSCP 46 (EF) + ECT(0) → full tclass 0xba.
     let tclass = (0x2eu8 << 2) | ECN_ECT_0;

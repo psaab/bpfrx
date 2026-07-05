@@ -104,6 +104,15 @@ pub(in crate::afxdp) fn mark_ecn_ce_ipv4(bytes: &mut [u8], l3_offset: usize) -> 
     if bytes.len() < end {
         return false;
     }
+    // #4269 (R-8h): the ethertype-based dispatch is the primary guard, but
+    // verify the IP version nibble too. A frame whose ethertype was
+    // trusted but whose L3 header is not actually IPv4 (mislabeled tag,
+    // NAT64/tunnel rewrite drift, injected frame) would otherwise have its
+    // TOS byte flipped and its "IPv4 checksum" recomputed over a non-IPv4
+    // header. Reject anything but version 4.
+    if (bytes[l3_offset] >> 4) != 4 {
+        return false;
+    }
     let tos_idx = l3_offset + 1;
     let old_tos = bytes[tos_idx];
     let ecn = old_tos & ECN_MASK;
@@ -154,6 +163,12 @@ pub(in crate::afxdp) fn mark_ecn_ce_ipv6(bytes: &mut [u8], l3_offset: usize) -> 
     // nibble of byte[l3_offset+1]. We need both bytes in range.
     let end = l3_offset.saturating_add(2);
     if bytes.len() < end {
+        return false;
+    }
+    // #4269 (R-8h): defensive version-nibble check (mirror of the IPv4
+    // marker). The ethertype dispatch is primary, but verify the header is
+    // actually IPv6 before rewriting its traffic-class ECN bits.
+    if (bytes[l3_offset] >> 4) != 6 {
         return false;
     }
     // Version/tclass-high byte: [vvvv tttt]. ECN bits are the low 2

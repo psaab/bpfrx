@@ -44,6 +44,47 @@
   - **Validation**: FULL `cargo test --release` green; per-fix
     RED-on-revert unit + black-box tests. Reducer/harness-only — no
     dataplane change, no cluster smoke needed.
+## 2026-07-05 — cos: fable-166 R-8 LOW fixes + R-9 false-sharing/alloc perf (#4269, #4270)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Filed #4269 (R-8, grouped LOW dataplane) and #4270 (R-9,
+    perf). R-8 READY sub-items fixed: (b) `PaddedVtimeSlot::publish` clamps
+    a live vtime to `NOT_PARTICIPATING-1` so a saturated cumulative
+    `queue_vtime` can never collide with the `u64::MAX` sentinel; (c)
+    `cos_queue_flow_share_limit` no longer panics when `buffer_limit <
+    24_000` (legal `buffer-size 16k`) — new `clamp_flow_share_to_buffer`
+    helper lowers the floor to `min(floor, buffer_limit)`; (h)
+    `mark_ecn_ce_ipv4`/`_ipv6` reject a header whose version nibble is not
+    4/6 (defensive, ethertype was the only guard). R-8 DEFERRED with
+    rationale in #4269: (a) drain work-conservation [core hot path], (d)
+    non-optional shared_recycles param [cascades through 12 Option
+    signatures, several genuine None], (e) zero-length latent [no repro],
+    (f) empty-snapshot tripwire [needs caller-threaded flag; mismatch
+    tripwire already exists], (g) tag-mismatched grant bump [deliberate
+    existing behavior], (i) over-horizon park [already analyzed/deferred by
+    #1782 — snap covers idle case, parked residual is the reviewed
+    not-worth-the-risk option (b)], (j) budget-miss gate memo [perf memo >
+    LOW]. R-9 (a): `worker_active_flow_buckets` was the only
+    per-worker-per-acquire array left unpadded (raw `Box<[AtomicU32]>`, 16
+    workers/cache line, genuine false sharing — single-writer-per-slot
+    confirmed). Wrapped in new `PaddedAtomicU32` (`#[repr(align(64))]`,
+    mirrors `PaddedAtomicU64`); accessor still hands out `&AtomicU32` so the
+    four mutation sites are unchanged; compile-time `align_of`/`size_of`
+    const-asserts pin the padding (proven RED-on-revert: E0080). R-9 (b):
+    timer-wheel `cascade_cos_timer_wheel_level1` /
+    `wake_due_cos_timer_slot` eliminated the per-slot `mem::take`
+    capacity-destruction + `Vec::with_capacity` temporaries — new
+    `CoSTimerWheelScratch` (persistent drain/rearm/wake vectors, swapped
+    with the slot to preserve slot capacity). Validation: FULL cargo test
+    --release green (3638 tests, 0 failed); 5 new RED-on-revert tests.
+  - **File(s)**: userspace-dp/src/afxdp/types/shared_cos_lease/{vtime.rs,
+    epoch.rs,lease.rs,mod.rs,rotate_epoch_v8.rs,
+    publish_equal_flow_epoch_v8.rs,shared_cos_lease_tests.rs},
+    userspace-dp/src/afxdp/cos/{admission.rs,admission_tests.rs,ecn.rs,
+    ecn_tests.rs,tx_completion.rs}, userspace-dp/src/afxdp/types/cos.rs,
+    userspace-dp/src/afxdp/cos/builders.rs,
+    userspace-dp/src/afxdp/worker/cos/tests.rs,
+    docs/cos-traffic-shaping.md, _Log.md
 
 ## 2026-07-05 — cos: meter non-exact guaranteed classes class-wide (#4265, R-2)
 
