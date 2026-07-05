@@ -34593,3 +34593,41 @@ top.
   ./pkg/config/... + gofmt + vet all green.
 - **File(s)**: pkg/config/compiler_validate_warn.go, docs/feature-gaps.md,
   docs/feature-coverage.md, CLAUDE.md, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-1 — wire cos-simul-load-smoke.sh reducer to exit
+  nonzero on gate failure (was always exit 0 = false-green). Added a
+  heterogeneous-gate `_ok` extractor + `sys.exit`, an all-error length
+  guard on gate_1, a gate_0 generator-health check, and replaced the
+  `|| true` iperf launchers with per-port .rc capture. Closes #4239.
+- **File(s)**: test/incus/cos-simul-load-smoke.sh, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-2 — wire cos-gate1-small-four-alone.sh reducer to
+  exit nonzero on GATE1 FAIL (was always exit 0). Added sys.exit(0 if
+  all_pass else 1), per-port .rc generator-health capture, replaced
+  `|| true` launchers. Closes #4240.
+- **File(s)**: test/incus/cos-gate1-small-four-alone.sh, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-11 — fairness-harness.sh single mode now fails hard
+  (exit 2) on a port with no canonical shaper rate, mirroring the
+  mixed-cos branch, instead of silently defaulting SHAPER_RATE_BPS=25G
+  (which masked a misconfigured port as a 25G-cap pass). Documented the
+  new harness exit-code contract in docs/fairness-regimes.md. Closes #4241.
+- **File(s)**: test/incus/fairness-harness.sh, docs/fairness-regimes.md,
+  _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-1 Copilot fold (PR #4242) — close the gate_0
+  row-readability hole. gate_0 previously checked only the per-port .rc
+  EXIT CODE, so an iperf3 run that exits 0 yet emits an {"error": ...} or
+  truncated JSON payload passed gate_0; if no throughput floor read that
+  class (a mid-class parse error), the whole harness still exited 0.
+  Extended the existing parse loop to tag each row with gen_error
+  (iperf-error / truncated — using bits_per_second key MEMBERSHIP so a
+  genuinely 0-Gbps but complete row is NOT flagged), and gate_0 now fails
+  on nonzero/missing rc OR unparseable/iperf-error/truncated row. Reused
+  the existing per-port parse (no duplicate parse logic). RED-on-revert:
+  the rc-only gate_0 passes both garbage inputs. Closes the Copilot gap.
+- **File(s)**: test/incus/cos-simul-load-smoke.sh, docs/fairness-regimes.md,
+  _Log.md
