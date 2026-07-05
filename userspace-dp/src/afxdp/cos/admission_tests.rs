@@ -62,6 +62,36 @@ fn flow_share_limit_shared_exact_scales_with_rate() {
     );
 }
 
+/// #4272: both flow-share `div_ceil` paths (the shared_exact
+/// rate-aware cap and the owner-local legacy cap) route through
+/// `flow_share_div_ceil`, which guards the divisor with `.max(1)`.
+/// `cos_queue_prospective_active_flows` already clamps its result to
+/// `>= 1`, so a 0 divisor is unreachable on every real call path — but
+/// `u64::div_ceil(0)` panics, so the guard lives at the arithmetic
+/// itself, not only at the caller. Before this change the owner-local
+/// path divided by the raw count while shared_exact inlined `.max(1)`,
+/// an asymmetry that would panic if a future caller reached the
+/// owner-local site with 0.
+///
+/// RED-on-revert: drop the `.max(1)` inside `flow_share_div_ceil` and
+/// the first assertion panics with "attempt to divide by zero".
+#[test]
+fn flow_share_div_ceil_zero_divisor_is_panic_free() {
+    // A 0 divisor degenerates to div_ceil-by-1 == buffer_limit, never a
+    // panic. This is the defensive branch the .max(1) exists for.
+    assert_eq!(flow_share_div_ceil(96_000, 0), 96_000);
+    assert_eq!(flow_share_div_ceil(0, 0), 0);
+    // Non-zero divisors are unaffected by the guard — the .max(1) is a
+    // no-op once the count is already >= 1, so the helper equals a plain
+    // div_ceil.
+    assert_eq!(flow_share_div_ceil(96_000, 6), 96_000u64.div_ceil(6));
+    assert_eq!(flow_share_div_ceil(100_001, 7), 100_001u64.div_ceil(7));
+    // Rounding is UP, matching the legacy owner-local path's original
+    // choice (a divisor that does not evenly divide rounds up, never
+    // down — the #4272 consistency goal for the two unified sites).
+    assert_eq!(flow_share_div_ceil(10, 3), 4);
+}
+
 /// #914: at low N, `bdp_floor` exceeds `buffer_limit`; the formula
 /// must clamp to buffer_limit and degenerate to today's behavior
 /// rather than capping below per-flow BDP (which would collapse
