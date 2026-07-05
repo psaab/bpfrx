@@ -6,7 +6,20 @@ use super::inputs::Iperf3Output;
 pub(crate) struct Window {
     pub(crate) per_stream_buckets: BTreeMap<u64, Vec<u64>>,
     pub(crate) aggregate_buckets_bps: Vec<u64>,
+    /// Per-stream window-mean throughput (bytes/sec) over the ACTIVE flow
+    /// set only — streams that produced no steady-state samples are
+    /// dropped. This feeds the observed-CoV / Gate-2 input, whose
+    /// contract is defined over the active flow set (a starved flow is
+    /// caught by Gate 1, not folded into the CoV).
     pub(crate) per_flow_throughputs: Vec<u64>,
+    /// Per-stream window-mean throughput (bytes/sec) over EVERY seeded
+    /// stream, mapping a stream absent from the steady window to 0. This
+    /// is the FULL iperf stream set (seeded from `start.connected[]`),
+    /// so the V-9 required per-flow quantiles + stream_count include
+    /// starved-at-0 flows rather than silently undercounting them — a
+    /// starved flow at 0 Mb/s is exactly the fairness violation a failing
+    /// run's per-flow distribution must surface.
+    pub(crate) per_flow_throughputs_all: Vec<u64>,
 }
 
 pub(crate) fn extract_window(
@@ -105,10 +118,27 @@ pub(crate) fn extract_window(
         })
         .collect();
 
+    // Full-stream-set variant for the V-9 required metric: every seeded
+    // stream contributes, with an empty (absent-from-window) stream
+    // counted as 0 rather than dropped. Mirrors the V-5 "absent == 0,
+    // don't drop" principle so the per-flow quantiles + stream_count
+    // reflect the true iperf stream set including starved flows.
+    let per_flow_throughputs_all: Vec<u64> = per_stream_buckets
+        .values()
+        .map(|v| {
+            if v.is_empty() {
+                0
+            } else {
+                v.iter().sum::<u64>() / v.len() as u64
+            }
+        })
+        .collect();
+
     Ok(Window {
         per_stream_buckets,
         aggregate_buckets_bps,
         per_flow_throughputs,
+        per_flow_throughputs_all,
     })
 }
 

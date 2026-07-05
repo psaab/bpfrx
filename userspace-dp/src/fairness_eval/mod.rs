@@ -183,8 +183,13 @@ pub(crate) fn run_evaluation(args: &Args, inputs: Inputs) -> Result<Report, Stri
     // quantiles (item 1), the steady-state window timestamps (item 12),
     // and the saturation determination time-series (item 6). A routine
     // verdict must carry these to satisfy the MUST list without a
-    // separate artifact dump (V-9).
-    let per_flow_throughput_mbps = per_flow_quantiles_mbps(&window.per_flow_throughputs);
+    // separate artifact dump (V-9). The per-flow quantiles use the FULL
+    // stream set (starved streams counted as 0), NOT the active-only
+    // per_flow_throughputs that feeds observed_cov — otherwise a
+    // starved-at-0 flow (the fairness violation a failing run must
+    // surface) would be silently dropped and stream_count would
+    // undercount (Copilot #1).
+    let per_flow_throughput_mbps = per_flow_quantiles_mbps(&window.per_flow_throughputs_all);
     let steady_state_window = SteadyStateWindow {
         iperf_epoch_start: if iperf_epoch > 0 {
             iperf_epoch.saturating_add(args.warmup_secs)
