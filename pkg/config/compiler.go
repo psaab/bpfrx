@@ -312,6 +312,28 @@ type compileOpts struct {
 	// line stays inert. Same doctrine as lenientIKEPolicyChainRef.
 	lenientIPsecTrafficSelectors bool
 
+	// lenientIPsecProposalProtocol (#4298, V-2) downgrades the IPsec
+	// proposal `protocol ah` reject (validateIPsecProposalProtocolStrict)
+	// from a hard error to a warning on the tolerant load / peer-sync paths.
+	// AH is integrity-only (no encryption) and xpf has no AH render path, so
+	// a `protocol ah` proposal used to render as ESP with a fabricated
+	// cipher — a crypto misrepresentation. Commit / commit-check hard-reject
+	// it; an already-persisted or peer-synced config carrying it must still
+	// BOOT (warn), and the render-path belt (vpnUsesAHProposal ->
+	// renderConfig skips the VPN) keeps the fabricated ESP tunnel out of the
+	// generated swanctl.conf. Same doctrine as lenientIKEPolicyChainRef.
+	lenientIPsecProposalProtocol bool
+
+	// lenientIPsecManualKey (#4300, V-4) downgrades the IPsec VPN
+	// manual-key SA reject (validateIPsecManualKeyStrict) from a hard error
+	// to a warning on the tolerant load / peer-sync paths. xpf has no
+	// manual-key path; the block was silently dropped, leaving a dead
+	// tunnel. Commit / commit-check hard-reject it so a new operator edit
+	// fails loudly; an already-persisted or peer-synced config still boots
+	// (warn) — the manual block was already inert, so the boot is fail-safe.
+	// Same doctrine as lenientIPsecGatewayRefs.
+	lenientIPsecManualKey bool
+
 	// lenientLogProfileStreamRef (#2008 H7) downgrades the
 	// `security log profile <name> stream-name <stream>` cross-reference
 	// from a hard error to a warning on the tolerant load / peer-sync
@@ -1436,6 +1458,8 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
+		lenientIPsecProposalProtocol:           true,
+		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
 		lenientDynamicAddressFeedRef:           true,
 		lenientNATPoolAlarmThreshold:           true,
@@ -1619,6 +1643,8 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
+		lenientIPsecProposalProtocol:           true,
+		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
 		lenientDynamicAddressFeedRef:           true,
 		lenientNATPoolAlarmThreshold:           true,
@@ -3286,6 +3312,37 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientIKEPolicyChainRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("ike-policy chain reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #4298 (V-2): reject an IPsec proposal with `protocol ah`. AH is
+	// integrity-only and xpf has no AH render path, so a `protocol ah`
+	// proposal used to render as ESP with a fabricated cipher — a crypto
+	// misrepresentation. Strict on commit / commit-check (hard reject);
+	// lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — the render belt skips the VPN rather
+	// than emitting the fabricated ESP tunnel).
+	if err := validateIPsecProposalProtocolStrict(cfg); err != nil {
+		if opts.lenientIPsecProposalProtocol {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec proposal protocol (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #4300 (V-4): reject an IPsec VPN configuring a `manual { ... }`
+	// manual-key SA. xpf has no manual-key path; the block was silently
+	// dropped, leaving a dead tunnel that committed OK. Strict on commit /
+	// commit-check (hard reject with a clear "use an IKE-negotiated VPN"
+	// message); lenient on load / peer-sync (warn — the block was already
+	// inert, so the boot is fail-safe).
+	if err := validateIPsecManualKeyStrict(cfg); err != nil {
+		if opts.lenientIPsecManualKey {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec manual-key SA (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

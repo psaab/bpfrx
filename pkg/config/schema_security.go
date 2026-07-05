@@ -818,7 +818,16 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// proposal for phase-1 negotiation. Without multi the flat-set
 			// path strands every reference past the first as a child node and
 			// the compiler dropped them (crypto-negotiation narrowing).
-			"proposals":      {desc: "IKE proposal reference(s)", args: 1, multi: true, placeholder: "<proposal-name>", children: nil},
+			"proposals": {desc: "IKE proposal reference(s)", args: 1, multi: true, placeholder: "<proposal-name>", children: nil},
+			// #4297 (V-1): predefined IKE proposal-set shorthand. Typed so a
+			// typo (`proposal-set standrd`) fails closed at commit; the
+			// compiler (expandIKEProposalSets) expands a valid keyword into
+			// concrete synthetic proposals so the common vSRX idiom commits a
+			// working tunnel instead of being silently dropped.
+			"proposal-set": {desc: "Predefined IKE proposal set", args: 1, placeholder: "<set>",
+				valueType: ValueEnumOf, valueDesc: "predefined IKE proposal set",
+				valueExamples: []string{"standard", "suiteb-gcm-128"},
+				validator:     ValidateEnum(ProposalSetNames()), children: nil},
 			"pre-shared-key": {desc: "Pre-shared key (ascii-text <key>)", children: nil},
 		}},
 		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
@@ -869,7 +878,15 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// gate deliberately rejected the prefixed spelling to stay
 		// compiler-faithful; the compiler fix lets both gates accept it.
 		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", children: map[string]*schemaNode{
-			"protocol":                 {desc: "IPsec protocol (esp|ah)", args: 1, placeholder: "<protocol>", children: nil},
+			// #4298 (V-2): type the protocol so a typo fails closed. `ah`
+			// is an accepted value here (grammar-valid) but hard-rejected at
+			// commit by validateIPsecProposalProtocolStrict — xpf does not
+			// support AH and must NOT silently render it as ESP with a
+			// fabricated cipher.
+			"protocol": {desc: "IPsec protocol (esp|ah)", args: 1, placeholder: "<protocol>",
+				valueType: ValueEnumOf, valueDesc: "IPsec security protocol",
+				valueExamples: []string{"esp", "ah"},
+				validator:     ValidateEnum([]string{"esp", "ah"}), children: nil},
 			"encryption-algorithm":     {desc: "Encryption algorithm (e.g. aes-256-cbc, aes-256-gcm)", args: 1, placeholder: "<algorithm>", children: nil},
 			"authentication-algorithm": {desc: "Authentication/integrity algorithm (e.g. hmac-sha-256-128)", args: 1, placeholder: "<algorithm>", children: nil},
 			"dh-group": {desc: "Diffie-Hellman group for PFS (e.g. 14 or group14)", args: 1, placeholder: "<dh-group>",
@@ -884,6 +901,12 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// multi (#3904): mirror of the IKE proposals leaf — offer every
 			// listed ESP proposal for phase-2 negotiation.
 			"proposals": {desc: "IPsec proposal reference(s)", args: 1, multi: true, placeholder: "<proposal-name>", children: nil},
+			// #4297 (V-1): predefined IPsec (ESP) proposal-set shorthand;
+			// mirror of the IKE policy leaf (expandIPsecProposalSets).
+			"proposal-set": {desc: "Predefined IPsec proposal set", args: 1, placeholder: "<set>",
+				valueType: ValueEnumOf, valueDesc: "predefined IPsec proposal set",
+				valueExamples: []string{"standard", "suiteb-gcm-128"},
+				validator:     ValidateEnum(ProposalSetNames()), children: nil},
 		}},
 		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
 			"address":            {desc: "Remote gateway address", args: 1, placeholder: "<address>", children: nil},
@@ -914,13 +937,40 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			}},
 		}},
 		"vpn": {desc: "IPsec VPN tunnel name", args: 1, placeholder: "<vpn-name>", children: map[string]*schemaNode{
-			"bind-interface":    {desc: "XFRM tunnel interface to bind", args: 1, placeholder: "<interface-name>", children: nil},
-			"df-bit":            {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>", children: nil},
-			"establish-tunnels": {desc: "Tunnel establishment (immediately = initiate at commit)", args: 1, placeholder: "<mode>", children: nil},
-			"local-identity":    {desc: "Local identity (default local traffic selector)", args: 1, placeholder: "<identity>", children: nil},
-			"remote-identity":   {desc: "Remote identity (default remote traffic selector)", args: 1, placeholder: "<identity>", children: nil},
-			"pre-shared-key":    {desc: "Pre-shared key for this VPN", args: 1, placeholder: "<key>", children: nil},
-			"local-address":     {desc: "Local tunnel endpoint address", args: 1, placeholder: "<address>", children: nil},
+			"bind-interface": {desc: "XFRM tunnel interface to bind", args: 1, placeholder: "<interface-name>", children: nil},
+			"df-bit":         {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>", children: nil},
+			// #4301 (V-5): type the enum so a typo (`on-tarffic`) fails closed
+			// at commit instead of storing verbatim and silently degrading to
+			// on-traffic. Only `immediately` is acted on (start_action =
+			// start); on-traffic / responder-only are the initiate-later modes.
+			"establish-tunnels": {desc: "Tunnel establishment (immediately|on-traffic|responder-only)", args: 1, placeholder: "<mode>",
+				valueType: ValueEnumOf, valueDesc: "tunnel establishment mode",
+				valueExamples: []string{"immediately", "on-traffic", "responder-only"},
+				validator:     ValidateEnum([]string{"immediately", "on-traffic", "responder-only"}), children: nil},
+			// #4300 (V-4): manual-key SA block. Grammar present for completion,
+			// but validateIPsecManualKeyStrict hard-rejects any VPN carrying it
+			// at commit — xpf has no manual-key path and must not leave a silent
+			// dead tunnel.
+			"manual": {desc: "Manual-key SA (NOT supported — rejected at commit; use an IKE-negotiated VPN)", children: map[string]*schemaNode{
+				"protocol":                 {desc: "Manual SA protocol (esp|ah)", args: 1, placeholder: "<protocol>", children: nil},
+				"spi":                      {desc: "Security parameter index", args: 1, placeholder: "<spi>", children: nil},
+				"encryption":               {desc: "Manual SA encryption (algorithm + key)", children: nil},
+				"authentication":           {desc: "Manual SA authentication (algorithm + key)", children: nil},
+				"encryption-algorithm":     {desc: "Manual SA encryption algorithm", args: 1, placeholder: "<algorithm>", children: nil},
+				"authentication-algorithm": {desc: "Manual SA authentication algorithm", args: 1, placeholder: "<algorithm>", children: nil},
+			}},
+			// #4299 (V-3): vpn-monitor. Accepted-but-not-enforced — captured so
+			// ValidateConfig emits an advisory; xpf has no ICMP-probe liveness /
+			// st0 interface-state coupling yet.
+			"vpn-monitor": {desc: "Tunnel liveness monitoring (accepted-but-not-enforced advisory)", children: map[string]*schemaNode{
+				"source-interface": {desc: "Probe source interface", args: 1, placeholder: "<interface-name>", children: nil},
+				"destination-ip":   {desc: "Probe destination IP", args: 1, placeholder: "<address>", children: nil},
+				"optimized":        {desc: "Send probes only when there is no outbound traffic", children: nil},
+			}},
+			"local-identity":  {desc: "Local identity (default local traffic selector)", args: 1, placeholder: "<identity>", children: nil},
+			"remote-identity": {desc: "Remote identity (default remote traffic selector)", args: 1, placeholder: "<identity>", children: nil},
+			"pre-shared-key":  {desc: "Pre-shared key for this VPN", args: 1, placeholder: "<key>", children: nil},
+			"local-address":   {desc: "Local tunnel endpoint address", args: 1, placeholder: "<address>", children: nil},
 			"traffic-selector": {desc: "Traffic selector name", args: 1, placeholder: "<selector-name>", children: map[string]*schemaNode{
 				"local-ip":  {desc: "Local traffic selector prefix", args: 1, placeholder: "<prefix>", children: nil},
 				"remote-ip": {desc: "Remote traffic selector prefix", args: 1, placeholder: "<prefix>", children: nil},

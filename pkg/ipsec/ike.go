@@ -95,6 +95,40 @@ func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authM
 	return "", "", 0, aggressive, fmt.Errorf("%w: ike-policy %q", errIKEChainUnresolved, gw.IKEPolicy)
 }
 
+// vpnUsesAHProposal reports whether the VPN's ipsec-policy resolves to any
+// proposal with `protocol ah`. AH (Authentication Header) is integrity-only
+// and has no ESP render path — buildESPProposal would fabricate an aes256
+// cipher and renderConfig would emit esp_proposals — so renderConfig skips
+// such a VPN (#4298, V-2) rather than misrepresent AH as ESP. It mirrors
+// resolveESPSettings' resolution order exactly: the policy's proposal list,
+// the policy-name fallback for a policy with no explicit proposals, and the
+// legacy form where the ipsec-policy value is itself a proposal name.
+func vpnUsesAHProposal(cfg *config.IPsecConfig, vpn *config.IPsecVPN) bool {
+	if cfg == nil || vpn == nil || vpn.IPsecPolicy == "" {
+		return false
+	}
+	isAH := func(name string) bool {
+		if p, ok := cfg.Proposals[name]; ok && p != nil {
+			return strings.EqualFold(p.Protocol, "ah")
+		}
+		return false
+	}
+	if pol, ok := cfg.Policies[vpn.IPsecPolicy]; ok && pol != nil {
+		refs := pol.Proposals
+		if len(refs) == 0 {
+			refs = []string{vpn.IPsecPolicy}
+		}
+		for _, r := range refs {
+			if isAH(r) {
+				return true
+			}
+		}
+		return false
+	}
+	// Legacy form: the ipsec-policy value is itself a defined proposal name.
+	return isAH(vpn.IPsecPolicy)
+}
+
 // resolveESPSettings resolves the ESP (Phase 2) proposal string and lifetime
 // from the VPN's IPsec policy chain.
 func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, int) {

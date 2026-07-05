@@ -1077,6 +1077,13 @@ type IKEProposal struct {
 type IKEPolicy struct {
 	Name string
 	Mode string // "main" or "aggressive"
+	// ProposalSet is a Junos predefined IKE proposal-set keyword
+	// (standard, basic, compatible, suiteb-gcm-128, suiteb-gcm-256).
+	// When set and no explicit Proposals are given, the compiler expands
+	// it into concrete synthetic IKE proposals (expandIKEProposalSets,
+	// #4297) so the common vSRX shorthand commits a working tunnel instead
+	// of being silently dropped.
+	ProposalSet string
 	// Proposals is the ordered list of IKE proposal references. Junos
 	// `proposals [ p1 p2 ]` offers every listed proposal for phase-1
 	// negotiation; reading only the first (the pre-#3904 scalar) narrowed
@@ -1100,6 +1107,12 @@ type IPsecProposal struct {
 type IPsecPolicyDef struct {
 	Name     string
 	PFSGroup int // PFS DH group number (0 = disabled)
+	// ProposalSet is a Junos predefined IPsec proposal-set keyword
+	// (standard, basic, compatible, suiteb-gcm-128, suiteb-gcm-256).
+	// When set and no explicit Proposals are given, the compiler expands
+	// it into concrete synthetic ESP proposals (expandIPsecProposalSets,
+	// #4297). Mirror of IKEPolicy.ProposalSet.
+	ProposalSet string
 	// Proposals is the ordered list of IPsec (ESP) proposal references.
 	// Junos `proposals [ p1 p2 ]` offers every listed proposal; the
 	// pre-#3904 scalar truncated to the first, narrowing negotiation.
@@ -1161,6 +1174,21 @@ type IPsecVPN struct {
 	LocalAddr        string // local address
 	BindInterface    string // tunnel interface (e.g. "st0.0") — creates xfrmi with if_id
 	DFBit            string // "copy", "set", "clear"
-	EstablishTunnels string // "immediately", "on-traffic"
+	EstablishTunnels string // "immediately", "on-traffic", "responder-only"
 	TrafficSelectors map[string]*IPsecTrafficSelector
+	// Manual records a `manual { ... }` manual-key SA block (#4300, V-4).
+	// xpf does not support manual-key SAs; the block used to be silently
+	// dropped, leaving a dead tunnel that committed OK. It is now captured
+	// so validateIPsecManualKeyStrict can hard-reject it at commit with a
+	// clear "use an IKE-negotiated VPN" message (lenient warn on load).
+	Manual bool
+	// VPNMonitor records a `vpn-monitor { ... }` block (#4299, V-3). xpf
+	// does not implement vpn-monitor's ICMP-probe liveness / st0
+	// interface-state coupling; the stanza is accepted and captured so
+	// ValidateConfig can emit an accepted-but-not-enforced advisory
+	// (mirroring the #2078/#4231 doctrine) rather than silently dropping it.
+	VPNMonitor                bool
+	VPNMonitorSourceInterface string
+	VPNMonitorDestinationIP   string
+	VPNMonitorOptimized       bool
 }
