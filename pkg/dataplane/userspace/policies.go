@@ -226,6 +226,40 @@ func RuntimePolicyIDs(cfg *config.Config) map[[2]uint32]uint32 {
 	return out
 }
 
+// PolicyIDsByStableKey maps every configured policy's STABLE string identity
+// (StablePolicyRuleID: "<from>-><to>/<name>", global policies keyed with
+// from==to=="junos-global") to the numeric runtime policy ID the dataplane
+// stamps on each admitted session's policy_id (#3056). It is the same
+// span-accumulated base ID walkPolicyRuleSlots writes to
+// PolicyRuleSnapshot.PolicyID, so the value round-trips to what a live session
+// carries.
+//
+// Unlike RuntimePolicyIDs — keyed by the POSITIONAL [policySetID, sliceIndex] —
+// the key here is invariant to a sibling policy's deletion: removing policy B
+// does not shift policy A's key, only (possibly) its numeric ID. A caller can
+// therefore diff two configs by key and recover, from the OLD config, the
+// numeric IDs of policies present before but absent after — the exact IDs the
+// deleted policies' still-live sessions carry. The commit-time deletion-clear
+// (#4234) uses this to invalidate those sessions.
+//
+// The numeric IDs are unique per policy within a single config (the userspace
+// preflight rejects a duplicate policy_id, policy.rs DuplicatePolicyId), so the
+// returned values collide only across the DIFFERENT configs a caller diffs —
+// which is exactly the intended semantics (a deleted policy's OLD ID identifies
+// its OLD sessions, independent of any NEW policy that inherits that slot).
+//
+// A config that would overflow MaxRulesPerPolicy stops the walk early (as in
+// RuntimePolicyIDs); such a config is rejected at apply and never enforced, so a
+// partial map is harmless.
+func PolicyIDsByStableKey(cfg *config.Config) map[string]uint32 {
+	out := make(map[string]uint32)
+	_ = walkPolicyRuleSlots(cfg, func(slot policyRuleSlot) error {
+		out[stablePolicyRuleID(slot.FromZone, slot.ToZone, slot.Policy.Name)] = slot.policyID()
+		return nil
+	})
+	return out
+}
+
 // walkPolicyRuleSlots invokes fn for every configured policy in config order,
 // assigning each policy its slot in the runtime policy-ID namespace. It is the
 // SHARED contract behind both the snapshot builder (the ID-WRITE side, #3145)
