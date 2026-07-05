@@ -33462,3 +33462,33 @@ top.
     pkg/cluster/status.go, pkg/cluster/sync_config_gen_test.go,
     pkg/daemon/daemon_ha_sync.go, pkg/dataplane/userspace/manager.go,
     docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fix hb164 L-3 — cluster redundancy-group IP monitoring
+  (`chassis cluster redundancy-group N ip-monitoring`, `pkg/cluster/monitor.go`
+  `probeICMP`) accepted ANY ICMP echo reply as a successful probe: it read one
+  packet and returned on `parsed.Type == replyType`, never checking the
+  responder source, the ICMP identifier, or the sequence number. A stray or
+  off-path-spoofed echo reply landing in the 800 ms window reported a genuinely
+  down monitored target as reachable, suppressing the RG weight demotion and the
+  intended WAN failover. Fix: validate the reply against the request before
+  counting it — source IP must equal the probed target, identifier must match,
+  sequence must match — looping until a matching reply or the deadline so a
+  non-matching reply neither counts nor consumes the single read. Identifier
+  handling accounts for the Linux SOCK_DGRAM ICMP socket this code uses: the
+  kernel overwrites the marshalled identifier with the socket's local port and
+  demuxes replies by it (empirically confirmed: a request marshalled with
+  ID 0xbf comes back as the socket port), so the identifier matched against is
+  `LocalAddr().(*net.UDPAddr).Port` (per-probe unique — each probe opens a fresh
+  socket), not the 0xbf constant. Sequence is stamped per probe from an atomic
+  counter cycling 1..0xffff. Added `LocalAddr()` to the `icmpConn` interface;
+  rewrote `mockICMPConn` into a faithful datagram responder (echoes port as ID,
+  request seq, target as source) with adversarial overrides (badSource/badID/
+  badSeq) + one-reply-then-timeout. RED-on-revert: restoring the type-only
+  accept makes TestProbeICMP_ReplyValidation (wrong source / wrong id / stale
+  seq) and TestProbeICMP_StaleSequenceAcrossProbes fail (bad reply accepted →
+  false "path up"); correct-reply and genuinely-down cases stay green.
+  `go test ./pkg/cluster/` green; `go build ./...`, gofmt, vet clean. Filed
+  issue #4156. Doc: docs/feature-coverage.md HA section.
+- **File(s)**: pkg/cluster/monitor.go, pkg/cluster/monitor_test.go,
+  docs/feature-coverage.md, _Log.md
