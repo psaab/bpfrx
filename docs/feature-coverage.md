@@ -121,6 +121,14 @@ the userspace dataplane admission boundary is in
   rather than holding stale "up" state (#2944). The IP address owner (priority
   255) always preempts a lower-priority master irrespective of the `no-preempt`
   flag (RFC 5798 §6.1, #4116) and is exempt from track-down demotion.
+  **VRRP `authentication-type` / `authentication-key` are REJECTED at commit**
+  (#4288): RFC 5798 VRRPv3 removed authentication (VRRPv2 had it), so the
+  native dataplane cannot authenticate adverts. Accepting the auth config
+  silently would be a false-security posture — an operator would believe
+  mastership is protected when a rogue host can still hijack it. The compiler
+  hard-rejects the statement on operator commit and warns (does not brick) on
+  the tolerant load / peer-sync path (`validateVRRPAuthenticationAST`,
+  `pkg/config/compiler_interfaces.go`).
 - **Redundancy-group IP monitoring** (`chassis cluster redundancy-group N
   ip-monitoring`): each configured target is ICMP-echo probed every poll and
   its `weight` is subtracted from the RG priority while the target is

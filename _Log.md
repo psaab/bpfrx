@@ -12,6 +12,18 @@
   - **File(s)**: pkg/config/compiler_firewall.go,
     pkg/config/compiler_firewall_family_any_4287_test.go,
     docs/config-schema.md, _Log.md
+  - **Action**: I-1 (#4288) — VRRP authentication-type/authentication-key
+    are parsed + stored + copied into the VRRP instance but never enforced
+    (the dataplane is RFC 5798 VRRPv3, which removed auth). Silently
+    accepting them is a false-security posture (rogue host can hijack
+    mastership). Added `validateVRRPAuthenticationAST` +
+    `lenientVRRPAuthentication` opt: strict commit hard-rejects, lenient
+    load/peer-sync warns (#1960 no-brick). Test
+    `vrrp_authentication_4288_test.go`.
+  - **File(s)**: pkg/config/compiler.go,
+    pkg/config/compiler_interfaces.go,
+    pkg/config/vrrp_authentication_4288_test.go,
+    docs/feature-coverage.md, _Log.md
 
 ## 2026-07-05 — cos: #4272 div_ceil .max(1) hardening + fable-166 R-10 CoS test-coverage gaps (#4280)
 

@@ -79,6 +79,18 @@ type compileOpts struct {
 	// #1319 PR 2 SchemaValidate violations only warn on tolerant paths).
 	lenientVRRPTrackDuplicates bool
 
+	// lenientVRRPAuthentication (#4288) downgrades the VRRP authentication
+	// reject (a vrrp-group carrying authentication-type / authentication-key)
+	// from a hard compile error to a cfg.Warnings entry. The native dataplane
+	// is RFC 5798 VRRPv3, which REMOVED authentication — the auth config is
+	// parsed but never enforced, so silently accepting it lets an operator
+	// believe adverts are authenticated when they are not (a rogue host can
+	// hijack mastership). Strict (commit / commit-check): hard-reject so the
+	// operator is not misled into a false-security posture. Set ONLY on the
+	// tolerant load / peer-sync paths so an already-persisted or peer-synced
+	// config an older binary silently accepted still boots (#1960).
+	lenientVRRPAuthentication bool
+
 	// lenientDeviceMap (#1956 V-1) downgrades the cross-entry device-map
 	// validator (validateDeviceMapStrict) from a hard compile error to a
 	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths
@@ -1408,6 +1420,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
 		sanitizeFreeTextControlChars:           true,
 		lenientVRRPTrackDuplicates:             true,
+		lenientVRRPAuthentication:              true,
 		lenientDeviceMap:                       true,
 		lenientPolicyMatchAddress:              true,
 		lenientTCPMSSRange:                     true,
@@ -1590,6 +1603,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
 		sanitizeFreeTextControlChars:           true,
 		lenientVRRPTrackDuplicates:             true,
+		lenientVRRPAuthentication:              true,
 		lenientDeviceMap:                       true,
 		lenientPolicyMatchAddress:              true,
 		lenientTCPMSSRange:                     true,
@@ -1758,6 +1772,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// from here too — the typed config cannot distinguish them
 	// post-compile.
 	trackWarnings, err := validateVRRPTrackInterfaceAST(tree.Children, "", opts.lenientVRRPTrackDuplicates)
+	if err != nil {
+		return nil, err
+	}
+
+	// #4288 VRRP authentication reject. The native dataplane is RFC 5798
+	// VRRPv3, which REMOVED authentication (VRRPv2 had it; v3 does not). xpf
+	// parses authentication-type / authentication-key
+	// (compiler_interfaces.go), stores them on the VRRPGroup, and copies them
+	// into the VRRP instance (pkg/vrrp/vrrp.go) — but the packet build/receive
+	// path NEVER references them, so the config is inert. Silently accepting it
+	// lets an operator believe adverts are authenticated when they are not: a
+	// rogue host on the segment can send higher-priority adverts and hijack
+	// mastership. Runs on the group-expanded, inactive-pruned tree so an
+	// apply-groups-inherited auth statement is covered. Strict (commit /
+	// commit-check): hard-reject so the operator is not misled into a
+	// false-security posture. Lenient (load / peer-sync): warn so an
+	// already-persisted or peer-synced config an older binary silently
+	// accepted still boots (#1960).
+	vrrpAuthWarnings, err := validateVRRPAuthenticationAST(tree.Children, "", opts.lenientVRRPAuthentication)
 	if err != nil {
 		return nil, err
 	}
@@ -2110,6 +2143,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, ctrlCharWarnings...)
 	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
+	cfg.Warnings = append(cfg.Warnings, vrrpAuthWarnings...)
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logStreamPortWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)

@@ -893,6 +893,64 @@ func validateVRRPTrackInterfaceAST(nodes []*Node, prefix string, lenient bool) (
 	return warnings, nil
 }
 
+// validateVRRPAuthenticationAST walks every vrrp-group node and rejects
+// (strict) or warns (lenient) a configured authentication-type /
+// authentication-key. #4288: the native dataplane is RFC 5798 VRRPv3, which
+// REMOVED authentication (VRRPv2 had it; v3 does not). The compiler parses the
+// auth statements (nodeVal above), stores them on the VRRPGroup, and copies
+// them into the VRRP instance (pkg/vrrp/vrrp.go), but the packet build/receive
+// path never references them — the config is inert. Silently accepting it lets
+// an operator believe adverts are authenticated when they are not: a rogue host
+// on the segment can send higher-priority adverts and hijack mastership. The
+// honest posture is to REJECT the dead-security config at strict commit so the
+// operator is not misled, and warn (not brick) on the tolerant load / peer-sync
+// path. Mirrors validateVRRPTrackInterfaceAST's recursive vrrp-group walk.
+func validateVRRPAuthenticationAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, n := range nodes {
+		nodePath := joinNodePath(prefix, n.Keys)
+		if n.Name() == "vrrp-group" {
+			if leaf := vrrpAuthLeaf(n); leaf != "" {
+				msg := fmt.Sprintf("%s: VRRP %s is configured but NOT enforced — "+
+					"the dataplane is RFC 5798 VRRPv3, which removed authentication; "+
+					"adverts are unauthenticated regardless, so a rogue host can hijack "+
+					"mastership. Remove the authentication statement (#4288)",
+					nodePath, leaf)
+				if !lenient {
+					return nil, fmt.Errorf("%s", msg)
+				}
+				warnings = append(warnings, msg)
+			}
+		}
+		w, err := validateVRRPAuthenticationAST(n.Children, nodePath, lenient)
+		warnings = append(warnings, w...)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return warnings, nil
+}
+
+// vrrpAuthLeaf returns the first authentication leaf name
+// ("authentication-type" or "authentication-key") present on a vrrp-group node,
+// across BOTH the Keys-packed flat-set spelling (the token appears in the
+// group node's Keys run) and the child-node / hierarchical spelling (a child
+// node named authentication-type / authentication-key). Returns "" when no
+// authentication statement is present.
+func vrrpAuthLeaf(vg *Node) string {
+	for _, k := range vg.Keys {
+		if k == "authentication-type" || k == "authentication-key" {
+			return k
+		}
+	}
+	for _, c := range vg.Children {
+		if name := c.Name(); name == "authentication-type" || name == "authentication-key" {
+			return name
+		}
+	}
+	return ""
+}
+
 // parseTrackCost parses a priority-cost value, returning 0 (tracking
 // has no effect) for anything outside the schema's 1..254 range — a
 // negative cost would RAISE priority on link-down (Codex review on PR
