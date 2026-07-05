@@ -791,6 +791,11 @@ impl ScreenState {
         let udp_flood_threshold = profile.udp_flood_threshold;
         let syn_flood_threshold = profile.syn_flood_threshold;
         let syn_cookie = profile.syn_cookie;
+        // Profile-wide `alarm-without-drop` audit mode. Copied up front with the
+        // other scalars (the immutable `profile` borrow is released before the
+        // SYN-cookie sub-state needs `&mut self`). Used to gate the cookie-active
+        // marking below so audit mode does not arm the returning-ACK drop.
+        let alarm_without_drop = profile.alarm_without_drop;
         // #3315: SYN-flood sub-thresholds (0 = disabled). Pulled up front with
         // the other scalars so the immutable `self.profiles` borrow is released
         // before the per-source/per-destination sketches and the alarm map need
@@ -906,16 +911,33 @@ impl ScreenState {
                     }
                     if over_attack {
                         if syn_cookie {
-                            if let Some(active_until) =
-                                self.syn_cookie_active_until_secs.get_mut(zone)
-                            {
-                                *active_until =
-                                    now_secs.saturating_add(SynCookieCodec::EPOCH_SECS);
-                            } else {
-                                debug_assert!(
-                                    false,
-                                    "screen profile update prepopulates SYN-cookie active state"
-                                );
+                            // In `alarm-without-drop` (audit) mode do NOT mark
+                            // the zone SYN-cookie-active. The challenge minted
+                            // below is converted to a log-only alarm + Pass by
+                            // the verdict consumer (no cookie is actually put on
+                            // the wire), so a returning session-miss ACK never
+                            // carries a valid cookie. Marking the zone active
+                            // would flip `locally_active` true in
+                            // `validate_syn_cookie_ack_on_session_miss`, which
+                            // then DROPS every such ACK as `Invalid` -- escaping
+                            // the profile-wide audit contract (observe the flood,
+                            // forward the traffic). Leaving it inactive makes
+                            // that path return `NotApplicable` so the ACK
+                            // forwards. The per-source cap below is likewise not
+                            // skipped in audit mode, which is correct: the check
+                            // should still run and alarm.
+                            if !alarm_without_drop {
+                                if let Some(active_until) =
+                                    self.syn_cookie_active_until_secs.get_mut(zone)
+                                {
+                                    *active_until =
+                                        now_secs.saturating_add(SynCookieCodec::EPOCH_SECS);
+                                } else {
+                                    debug_assert!(
+                                        false,
+                                        "screen profile update prepopulates SYN-cookie active state"
+                                    );
+                                }
                             }
                             let Some(codec) = self.syn_cookie_codec else {
                                 return ScreenVerdict::Drop("syn-cookie-unavailable");

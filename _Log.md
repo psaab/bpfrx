@@ -33764,3 +33764,34 @@ top.
   userspace-dp/src/afxdp/poll_stages.rs,
   userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-gaps.md,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fold hostile-review MINOR on PR #4176 (alarm-without-drop) —
+  close the SYN-cookie ACK gap so the "profile-wide including SYN-cookie"
+  contract genuinely holds. `check_packet` marks a zone SYN-cookie-active
+  (`syn_cookie_active_until_secs[zone]`) as a side-effect when it crosses
+  attack-threshold, BEFORE the `SynCookieChallenge` verdict is converted
+  to a log-only alarm + Pass by the consumer. Since audit mode never
+  mints cookies on the wire, that marking armed
+  `validate_syn_cookie_ack_on_session_miss` to DROP every returning
+  session-miss ACK as `Invalid` (the only drop branch, reachable only
+  when `locally_active`) — escaping the audit contract for that path.
+  Root-cause fix (approach a): gate the cookie-active marking at
+  screen/mod.rs on `!alarm_without_drop` (copied from the profile with
+  the other scalars). In audit mode `locally_active` stays false → the
+  ACK validation returns `NotApplicable` → the ACK forwards; the per-source
+  cap is also no longer skipped (correct — the check should still run and
+  alarm). The challenge is still minted and returned (consumer converts to
+  alarm + Pass), and the non-audit flow is bit-identical (gate is a no-op
+  when the flag is false). No change to the consumer stage was needed
+  (Invalid is unreachable for an audit zone). Test:
+  `syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10` — audit
+  zone crossing attack-threshold still mints the challenge but a returning
+  invalid ACK is `NotApplicable` (forwards); a non-audit control with
+  identical inputs still returns `Invalid` (drops) — RED-on-revert of the
+  gate. FULL `cargo test --release --test-threads=1` green (3528 + 46 + 8
+  + 16 + 1, 0 failed; wire-invariant fixture unchanged/byte-identical);
+  `go build ./...` clean; rustfmt clean. Doc: feature-gaps.md SYN-cookie
+  claim made precise.
+- **File(s)**: userspace-dp/src/screen/mod.rs,
+  userspace-dp/src/screen/tests.rs, docs/feature-gaps.md, _Log.md
