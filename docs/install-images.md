@@ -68,7 +68,16 @@ Pipeline (offline — the image is never booted to provision it):
    (a competing network manager), snapd, and the virtual-kernel
    metapackages, systemd-networkd + resolved enabled, FRR + chrony
    enabled (default NTP pools neutered; xpfd manages
-   `sources.d/xpf.sources`), sysctls, `init_on_alloc=0` (via an
+   `sources.d/xpf.sources`). FRR is installed WITH `frr-pythontools`
+   (`RUNTIME_PACKAGES` + the `xpf-appliance` `Depends`, kept in sync):
+   it provides `/usr/lib/frr/frr-reload.py`, the daemon's primary FRR
+   reload path (`pkg/frr`). It is NOT pulled in transitively by the
+   `frr` package, so it is listed explicitly and a bake-time
+   `test -x /usr/lib/frr/frr-reload.py` assert (plus a `validate.py`
+   presence check) fails the build if it is ever missing — without it
+   every reload silently degrades to the additive `vtysh -f` fallback
+   and stale-config removal (a deleted route/BGP neighbor) never
+   converges (#4172). Then sysctls, `init_on_alloc=0` (via an
    `/etc/default/grub.d` drop-in — Ubuntu cloud images override
    `GRUB_CMDLINE_LINUX_DEFAULT` there), and `apt-get install ./xpf.deb`.
    The package's `postinst` always stages the binary set into
@@ -203,7 +212,7 @@ Plain QEMU works the same way (`-drive file=xpf-<ver>.qcow2`
 | Factory default: fxp0 DHCP, root console login, no password | Identical: fxp0 DHCP bootstrap; root login on the hypervisor console with empty password; sshd refuses empty/root-password auth |
 | Day-0 config: ISO with `juniper.conf` at the root, attached as CD-ROM | ISO (or any volume labeled `xpf-config`) with `xpf.conf` at the root — `juniper.conf` accepted as an alias; optional `node-id` file (`0`/`1`) for cluster members |
 | Bad day-0 config: boots factory-default | Identical, but stricter: the config is validated with the REAL commit-check gate (`xpfd check-config`) BEFORE install; a REJECT logs loudly and the system stays factory-default |
-| Day-0 applied once | Applied at most once: stamped after success; never clobbers an existing config (`.configdb` or preseeded `xpf.conf`). A REJECTED medium does not stamp — fix the config and reboot to retry while the system is still factory-default |
+| Day-0 applied once | Applied at most once: stamped after success; never clobbers an existing config (a COMMITTED `.configdb/active.json` or a preseeded `xpf.conf`). A REJECTED medium does not stamp — fix the config and reboot to retry while the system is still factory-default |
 
 Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
 `Before=xpfd.service`):
@@ -219,6 +228,14 @@ Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
 - Failures never block the boot: the unit is ordering-only (no
   `Requires=`), the script always exits 0, and `TimeoutStartSec`
   backstops a hung mount. Fallback is always the factory bootstrap.
+- The "already configured, skip the probe" guard tests
+  `/etc/xpf/.configdb/active.json` (a COMMITTED config), NOT the bare
+  `.configdb` directory. xpfd creates that directory on EVERY start
+  (`configstore.NewDB` → `MkdirAllDurable`, before any commit), so its
+  mere existence is not a "configured" signal — guarding on it would
+  make a box that booted once (empty `.configdb` present) permanently
+  skip the probe, killing the fix-and-reboot retry above. A box in
+  factory bootstrap has no `active.json`, so the loader re-probes.
 
 Build a config drive:
 

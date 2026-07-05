@@ -59,7 +59,26 @@ except ImportError:
     yaml = None
 
 VALID_BACKINGS = {"net", "bridge", "macvlan", "sriov", "physical", "pci"}
+
+# Guest PCI enumeration classes. The guest names interfaces positionally
+# (assignName), but ONLY after enumeratePCINICs() sorts NICs with a
+# virtio-first tiebreaker: sk=0 for driver "virtio_net", sk=1 for
+# everything else, then by PCI bus address (pkg/daemon/linksetup.go). A
+# virtio-backed device (net/bridge/macvlan attach as `virtio_net`) always
+# sorts ahead of a passthrough device (sriov/physical/pci attach as the
+# real hardware driver), regardless of the order the tool attaches them.
+# So the config's list position only equals the guest's vSRX name when
+# every virtio-class NIC precedes every hardware-class NIC.
+VIRTIO_BACKINGS = {"net", "bridge", "macvlan"}
+HARDWARE_BACKINGS = {"sriov", "physical", "pci"}
 SYS_NET = "/sys/class/net"
+
+
+def backing_sort_key(backing):
+    """Guest enumeration sort key for a backing, mirroring the sk=0
+    (virtio) / sk=1 (hardware) tiebreaker in enumeratePCINICs()
+    (pkg/daemon/linksetup.go). Lower sorts earlier in the guest."""
+    return 0 if backing in VIRTIO_BACKINGS else 1
 
 
 def die(msg):
@@ -186,6 +205,33 @@ def validate_appliance(ap, where):
             die(f"{where}: interface {i + 1} declares role '{ic['role']}' but position {i + 1} "
                 f"is '{want}' — reorder or fix; position is the contract.")
         ic["_name"] = want
+
+    # Guest virtio-first tiebreaker (enumeratePCINICs, linksetup.go): the
+    # guest sorts virtio-class NICs ahead of hardware-class ones BEFORE it
+    # assigns positional vSRX names. "Position is the contract" therefore
+    # only holds when the list order already matches that sort — i.e. every
+    # virtio-class NIC precedes every hardware-class one. A virtio-class NIC
+    # listed AFTER a hardware-class NIC would be renamed to an earlier slot
+    # in the guest, silently swapping the zones/policies/NAT bound to those
+    # vSRX names (trust/untrust inversion). Fail closed — the deployer holds
+    # every backing's class, so it can and must catch this (fable-165 H-22).
+    first_hw = None
+    for i, ic in enumerate(ap["interfaces"]):
+        if backing_sort_key(ic["backing"]) == 1:
+            if first_hw is None:
+                first_hw = i
+        elif first_hw is not None:
+            hw = ap["interfaces"][first_hw]
+            die(f"{where}: interface {i + 1} ({ic['backing']}:{ic['source']}, "
+                f"declared '{ic['_name']}') is a virtio-class NIC listed after "
+                f"the hardware-class interface {first_hw + 1} "
+                f"({hw['backing']}:{hw['source']}, declared '{hw['_name']}'). "
+                f"The guest enumerates virtio before hardware "
+                f"(enumeratePCINICs, linksetup.go), so it renames this NIC to "
+                f"an earlier slot and SWAPS the zones on '{ic['_name']}' and "
+                f"'{hw['_name']}'. Reorder so every virtio-class NIC "
+                f"(net/bridge/macvlan) comes before every hardware-class NIC "
+                f"(sriov/physical/pci); position is the contract.")
 
 
 def load_yaml_appliance(path):
@@ -355,13 +401,53 @@ def deploy_incus(ap, runner, start):
         print(f"{name} created (not started): incus start {name}")
 
 
+# Directory libvirt/KVM keeps its qcow2 disks in (the default pool path).
+LIBVIRT_IMAGES = "/var/lib/libvirt/images"
+
+
+def libvirt_disk(ap, runner):
+    """Return a per-VM writable qcow2 backed READ-ONLY by the golden image.
+
+    The golden image ({image}.qcow2) must NEVER be attached writable:
+    qcow2 is not a cluster filesystem, so an HA pair booting two live
+    domains off one file corrupts it (concurrent metadata/refcount
+    writes), and even a single `virt-install --import` would mutate the
+    golden master in place — the day-0 stamp, host keys, and configstore
+    DB would get baked into it, and the NEXT VM launched "from the image"
+    would inherit the previous VM's identity and skip its own config.
+
+    Each domain gets its OWN copy-on-write overlay instead
+    (`qemu-img create -f qcow2 -b <golden> -F qcow2 <overlay>`), so the
+    golden stays an immutable shared backing store and each VM writes
+    only to its distinct {name}.qcow2. A re-deploy re-creates the overlay
+    (a fresh boot from golden); `virt-install --name` still refuses to
+    redefine a live domain, so a running VM's overlay is not clobbered
+    out from under it.
+    """
+    golden = os.path.join(LIBVIRT_IMAGES, f"{ap['image']}.qcow2")
+    overlay = os.path.join(LIBVIRT_IMAGES, f"{ap['name']}.qcow2")
+    if os.path.abspath(overlay) == os.path.abspath(golden):
+        die(f"VM name '{ap['name']}' collides with the golden image basename "
+            f"'{ap['image']}' — the per-VM overlay would overwrite the golden "
+            f"image. Rename the appliance (name:) or the image (image:).")
+    if not runner.dry and not os.path.isfile(golden):
+        die(f"golden image not found: {golden} — fetch/import it first "
+            f"(see `xpf-deploy.py fetch`) or set image: in the YAML.")
+    # Fresh overlay per deploy so the VM boots clean from golden; the
+    # golden is the read-only -b backing store and is never written.
+    runner.run(["qemu-img", "create", "-f", "qcow2",
+                "-b", golden, "-F", "qcow2", overlay])
+    return overlay
+
+
 def deploy_libvirt(ap, runner, start):
     name = ap["name"]
     print_map(ap)
     iso = build_config_drive(ap, runner)
+    disk = libvirt_disk(ap, runner)
     argv = ["virt-install", "--name", name, "--memory", str(memory_mb(ap["memory"])),
             "--vcpus", str(ap["cpu"]), "--import",
-            "--disk", f"path=/var/lib/libvirt/images/{ap['image']}.qcow2",
+            "--disk", f"path={disk}",
             "--osinfo", "ubuntu26.04", "--noautoconsole"]
     if iso:
         argv += ["--disk", f"path={iso},device=cdrom"]

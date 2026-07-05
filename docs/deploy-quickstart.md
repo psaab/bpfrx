@@ -26,9 +26,21 @@ So a deployment is one ordered table: each interface gets a **role**
 YAML; the tool validates the role↔position match, builds the day-0
 config drive, and launches the VM with the NICs attached in order.
 
-(The guest applies a `virtio-first` tiebreaker so mgmt/control stay
-`fxp0`/`em0`; identical to pure position in every normal layout. Verify
-with `show interfaces terse`.)
+**The virtio-first tiebreaker (get the NIC order right).** The guest
+does not name NICs purely by the order the tool attaches them — before
+assigning positional names it sorts **virtio-class** backings
+(`net`/`bridge`/`macvlan`, which attach as `virtio_net`) *ahead of*
+**hardware-class** backings (`sriov`/`physical`/`pci`, which attach as
+the real passthrough driver). See `enumeratePCINICs()` in
+`pkg/daemon/linksetup.go`. So "position is the contract" holds only when
+your interface list already puts **every virtio-class NIC before every
+hardware-class NIC**. If you list a virtio-class NIC *after* a
+hardware-class one, the guest renames it to an earlier slot and the
+firewall zones/policies/NAT land on **swapped ports** (e.g. trust and
+untrust inverted). The deploy tool now rejects such a layout at validate
+time (`validate_appliance`) and tells you which two interfaces to
+reorder — so this is caught before launch, not discovered in production.
+Still verify the final map with `show interfaces terse` after boot.
 
 ## Prerequisites
 

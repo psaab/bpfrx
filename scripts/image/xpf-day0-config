@@ -6,9 +6,17 @@
 # applied at first boot while the system is factory-default. This is
 # the xpf analog, run as a oneshot systemd unit ordered Before=xpfd:
 #
-#   1. If the system has ever had a config (stamp file, configstore DB,
-#      or a preseeded /etc/xpf/xpf.conf), do nothing. A day-0 config is
+#   1. If the system has ever been configured (stamp file, a COMMITTED
+#      configstore DB — active.json, written only on commit/sync — or a
+#      preseeded /etc/xpf/xpf.conf), do nothing. A day-0 config is
 #      applied at most once; later boots never re-apply or clobber.
+#      The guard tests active.json, NOT the bare .configdb directory:
+#      xpfd creates that directory on EVERY start (NewDB ->
+#      MkdirAllDurable, before any commit), so its mere existence is not
+#      a "configured" signal. Guarding on the bare directory silently
+#      defeated the fix-and-reboot retry contract (see Retriability
+#      below): after the first boot the empty .configdb existed, so a
+#      rejected/absent drive could never be retried.
 #   2. Probe attached block devices for a config medium: any volume
 #      labeled `xpf-config` (any filesystem type), plus any ISO9660
 #      medium (the vSRX cdrom convention). The medium must carry
@@ -184,6 +192,20 @@ try_device() {
 	return 0
 }
 
+# have_committed_config — true (0) when the box already holds a COMMITTED
+# configstore DB, i.e. .configdb/active.json exists. active.json is written
+# only by a successful commit / HA sync / rollback (pkg/configstore/db.go
+# WriteActive*); the bare .configdb DIRECTORY is created on EVERY xpfd start
+# by NewDB -> MkdirAllDurable (before any commit), so its existence is NOT a
+# "configured" signal. Testing active.json — not the directory — is what
+# makes the fix-and-reboot retry contract work: a rejected/absent drive
+# leaves the box in factory bootstrap with no active.json, so the loader
+# re-probes on the next boot instead of falsely declaring "already
+# configured" forever.
+have_committed_config() {
+	[ -e "$XPF_DIR/.configdb/active.json" ]
+}
+
 main() {
 	regen_ssh_host_keys
 
@@ -191,8 +213,8 @@ main() {
 		log "day-0 config already applied ($STAMP) — skipping"
 		return 0
 	fi
-	if [ -e "$XPF_DIR/.configdb" ]; then
-		log "configstore DB exists — system already configured, skipping day-0 probe"
+	if have_committed_config; then
+		log "committed config present ($XPF_DIR/.configdb/active.json) — system already configured, skipping day-0 probe"
 		return 0
 	fi
 	if [ -e "$XPF_DIR/xpf.conf" ]; then
@@ -228,5 +250,11 @@ main() {
 	return 0
 }
 
-main "$@"
-exit 0
+# Run main unless the file is sourced for unit tests. A test sets
+# XPF_DAY0_SOURCE_ONLY=1 and sources this script to exercise the individual
+# helpers (e.g. have_committed_config, main with stubbed probes) without
+# actually running the day-0 loader.
+if [ "${XPF_DAY0_SOURCE_ONLY:-}" != "1" ]; then
+	main "$@"
+	exit 0
+fi

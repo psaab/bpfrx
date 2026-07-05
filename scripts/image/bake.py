@@ -55,7 +55,17 @@ import sign  # noqa: E402
 # entry point (e.g. from a future hosted repo, #1924). Keep this list and
 # the metapackage Depends in debian/control in sync.
 RUNTIME_PACKAGES = [
-    "frr", "strongswan", "strongswan-swanctl",
+    # #4172: frr-pythontools provides /usr/lib/frr/frr-reload.py, the
+    # daemon's PRIMARY FRR reload path (pkg/frr/vtysh.go frrReloadScript,
+    # invoked from pkg/frr/manager.go). It is NOT pulled in transitively by
+    # the `frr` package, so it MUST be listed explicitly here (and in the
+    # xpf-appliance Depends, kept in sync per the comment above). Without it
+    # every reload silently falls back to the additive `vtysh -f` path and
+    # the degraded-retry loop never converges stale-config removal — a
+    # deleted route/BGP neighbor keeps forwarding/advertising. A bake-time
+    # hard-assert below (`test -x /usr/lib/frr/frr-reload.py`) fails the bake
+    # loudly if a future frr package-name drift drops the tool.
+    "frr", "frr-pythontools", "strongswan", "strongswan-swanctl",
     "kea-dhcp4-server", "kea-dhcp6-server", "chrony",
     "iproute2", "nftables", "ethtool", "tcpdump", "pciutils",
     "iputils-ping", "traceroute", "openssh-server", "openssh-client",
@@ -433,6 +443,18 @@ def virt_customize(work_qcow, xpf_deb):
         'command -v resize2fs >/dev/null || { echo "FATAL: resize2fs missing '
         '(#1925; e2fsprogs not installed)" >&2; exit 1; }; '
         'echo "#1925: growpart + resize2fs present ($(command -v growpart), $(command -v resize2fs))"',
+        # HARD-ASSERT the FRR reload tool survived the package install. It is
+        # provided by frr-pythontools (RUNTIME_PACKAGES above), NOT the base
+        # `frr` package. If a future frr package-name drift drops it, FAIL THE
+        # BAKE here rather than silently ship an image whose FRR reload is
+        # permanently degraded — the additive `vtysh -f` fallback never
+        # converges stale-config removal, so a deleted route/BGP neighbor
+        # keeps forwarding/advertising (#4172). Mirrors the growpart assert.
+        "--run-command",
+        'test -x /usr/lib/frr/frr-reload.py || { echo "FATAL: /usr/lib/frr/'
+        'frr-reload.py missing (#4172 FRR reload permanently degraded; '
+        'frr-pythontools not installed)" >&2; exit 1; }; '
+        'echo "#4172: frr-reload.py present (/usr/lib/frr/frr-reload.py)"',
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",

@@ -39,6 +39,7 @@ Architecture: amd64
 Depends: ${misc:Depends},
  xpf (= ${binary:Version}),
  frr,
+ frr-pythontools,
  strongswan,
  strongswan-swanctl,
  kea-dhcp4-server,

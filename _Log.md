@@ -1,3 +1,110 @@
+## 2026-07-04 — #4180 (fable-review-165 H-22): deploy role validation ignored the guest virtio-first PCI tiebreaker — virtio-after-hardware silently swaps zones
+
+- **Timestamp**: 2026-07-04
+  - **Action**: `scripts/deploy/xpf-deploy.py` `validate_appliance()`
+    checked each declared `role` against its raw LIST INDEX only
+    (`expected_name(i, ...)`), but the guest does not name NICs by attach
+    order. `enumeratePCINICs()` (`pkg/daemon/linksetup.go:189-204`) sorts
+    NICs with a virtio-first tiebreaker (`sk=0` for `virtio_net`, `sk=1`
+    for hardware) BEFORE `assignName()` assigns positional vSRX names. So
+    a YAML/`--nic` list that put a virtio-class NIC (`net`/`bridge`/
+    `macvlan`) AFTER a hardware-class NIC (`sriov`/`physical`/`pci`)
+    passed validation but booted with the firewall zones/policies/NAT on
+    SWAPPED ports (trust/untrust inverted) — a silent security miswiring.
+  - **Fix**: classify each backing virtio-class vs hardware-class
+    (`VIRTIO_BACKINGS`/`HARDWARE_BACKINGS` + `backing_sort_key()`,
+    mirroring the guest `sk=0`/`sk=1` rule) and FAIL CLOSED (`die()`) in
+    `validate_appliance` when a virtio-class interface appears after a
+    hardware-class one, naming both offending positions and telling the
+    operator to reorder. Chose reject over silent reorder because the
+    zone→vSRX-name binding lives in the operator's day-0 `.conf` (which
+    the tool does not rewrite); reordering could still land the intended
+    backing on a different vSRX name invisibly. Reject keeps the existing
+    "position is the contract" guarantee honest.
+  - **Test**: `scripts/deploy/test_xpf_deploy_nicorder.py` (11 tests,
+    mirrors the H-20 `test_xpf_deploy_disk.py` pattern) — asserts the
+    virtio-after-hardware layout is rejected (with/without roles,
+    standalone + cluster), the reordered set validates with correct
+    positional names, pure-virtio/pure-hardware pass, and all shipped
+    example YAMLs satisfy the guard. RED-on-revert verified: dropping the
+    guard un-raises the four rejection tests.
+  - **Docs**: `docs/deploy-quickstart.md` "60-second mental model" and
+    `examples/deploy/README.md` "naming contract is positional" — replaced
+    the "identical to pure position in every normal layout" hand-wave
+    with the explicit virtio-first rule + the new validate-time reject.
+  - **File(s)**: `scripts/deploy/xpf-deploy.py`,
+    `scripts/deploy/test_xpf_deploy_nicorder.py`,
+    `docs/deploy-quickstart.md`, `examples/deploy/README.md`, `_Log.md`
+
+## 2026-07-04 — #4175 (fable-review-165 H-1): day-0 config-drive retry permanently dead — loader guarded on bare .configdb directory
+
+- **Timestamp**: 2026-07-04
+  - **Action**: The day-0 config-drive loader's "already configured,
+    skip the probe" guard tested bare directory existence
+    (`[ -e "$XPF_DIR/.configdb" ]`, `scripts/image/xpf-day0-config`).
+    But xpfd durably creates that directory on EVERY start
+    (`pkg/configstore/db.go` `NewDB` → `MkdirAllDurable`, via
+    `configstore.New` → `daemon.New`, before any commit). So after the
+    very first boot the empty `.configdb` dir exists → the loader logged
+    "system already configured" and NEVER re-probed the medium,
+    permanently defeating its own documented reject → fix → reboot retry
+    contract (`xpf-day0-config` Retriability note; `docs/install-images.md`
+    Recovery). The COMMITTED config is `active.json`, written only on
+    commit/sync/rollback; a rejected/absent drive enters factory
+    bootstrap without ever writing it.
+  - **Fix**: guard on the COMMITTED artifact, not the directory. Changed
+    the guard to `have_committed_config()` testing
+    `[ -e "$XPF_DIR/.configdb/active.json" ]`, and fixed the misleading
+    log line to "committed config present (…/active.json) — system
+    already configured". Chose the script-only active.json path (smallest,
+    version-skew-safe) over an `xpfd config-state`/EverCommitted
+    subcommand: reading the #1922 committed marker needs envelope-header
+    parsing + master-key handling, not trivial, and the subcommand adds a
+    version-skew surface the script-only fix avoids. Added a source-guard
+    (`XPF_DAY0_SOURCE_ONLY=1`) so the loader can be sourced for unit tests.
+    Updated the loader header comment and `docs/install-images.md`
+    (first-boot contract table + loader specifics).
+  - **Test**: new `test/image/day0-configdb-guard-test.sh` — 5 scenarios
+    (3 unit on `have_committed_config`, 2 integration driving `main()`
+    with stubbed probes). RED-on-revert proven: reverting the guard to
+    the bare `.configdb` dir makes scenarios A (empty dir must re-probe)
+    and D (main must reach the probe) FAIL with exit 1. shellcheck clean
+    on both the loader and the test.
+  - **File(s)**: scripts/image/xpf-day0-config,
+    test/image/day0-configdb-guard-test.sh, docs/install-images.md,
+    _Log.md
+
+## 2026-07-04 — #4172 (fable-review-165 H-3): frr-pythontools missing from baked image + metapackage
+
+- **Timestamp**: 2026-07-04
+  - **Action**: The baked appliance never installed `frr-pythontools`,
+    so `/usr/lib/frr/frr-reload.py` (the daemon's primary FRR reload
+    path — `pkg/frr/vtysh.go` `frrReloadScript`, invoked from
+    `pkg/frr/manager.go:641/824`) was permanently absent. Every reload
+    silently fell back to the additive `vtysh -f` path and the
+    degraded-retry loop re-execed the missing script forever, so a
+    deleted route/BGP neighbor kept forwarding/advertising. The dev/test
+    cluster installs `frr-pythontools` (`cluster-setup.sh:452`), so the
+    real reload path was the one combination never exercised.
+  - **Fix**: (a) added `frr-pythontools` to `RUNTIME_PACKAGES`
+    (`scripts/image/bake.py`, right after `frr`) with a comment; (b)
+    added `frr-pythontools,` to the `xpf-appliance` `Depends`
+    (`debian/control`, right after `frr,`) — kept in sync per the
+    bake.py comment; (c) added a bake-time HARD-ASSERT
+    `test -x /usr/lib/frr/frr-reload.py` (mirrors the growpart assert)
+    so future frr package-name drift FAILS THE BAKE instead of silently
+    degrading; (d) added a `validate.py` scenario-A presence check
+    (mirrors the growpart presence check).
+  - **Test**: `test_bake_sign_ordering.py` new `RuntimePackageSyncTests`
+    asserts `frr-pythontools` membership in BOTH lists + a `frr`
+    baseline guard on the parse logic. RED-on-revert proven: removing
+    the additions makes 2 membership tests FAIL; baseline stays green.
+    `debian/control` re-parses cleanly (RFC822 paragraph parse). Doc:
+    `docs/install-images.md` bake-steps note.
+  - **File(s)**: scripts/image/bake.py, debian/control,
+    scripts/image/validate.py, scripts/image/test_bake_sign_ordering.py,
+    docs/install-images.md, _Log.md
+
 ## 2026-07-04 — #4161 (fable-review-164 M-3) + L-9: source-NAT most-specific-scope-wins
 
 - **Timestamp**: 2026-07-04
@@ -33795,3 +33902,34 @@ top.
   claim made precise.
 - **File(s)**: userspace-dp/src/screen/mod.rs,
   userspace-dp/src/screen/tests.rs, docs/feature-gaps.md, _Log.md
+- **Action**: fable-165 H-20 — libvirt deploy attached the shared golden
+  qcow2 to every VM as a WRITABLE `--disk`, so an HA pair booted two live
+  domains off ONE file (qcow2 is not a cluster filesystem → concurrent
+  metadata/refcount writes corrupt it), and even a single
+  `virt-install --import` mutated the golden master in place (day-0
+  stamp/host keys/configstore DB baked in; the next VM inherited the
+  prior identity and skipped its own config). Added `libvirt_disk()` in
+  `scripts/deploy/xpf-deploy.py`: each domain now gets its OWN
+  copy-on-write overlay `qemu-img create -f qcow2 -b <golden> -F qcow2
+  /var/lib/libvirt/images/<name>.qcow2`, and virt-install attaches that
+  overlay; the golden is an immutable read-only backing store shared by
+  all nodes and is never written. A re-deploy re-creates the overlay
+  (fresh boot from golden); `virt-install --name` still refuses to
+  redefine a live domain so a running VM's overlay is not clobbered. A
+  name==image collision (overlay would overwrite the golden) is
+  hard-rejected; a missing golden fails with a fetch/import hint before
+  qemu-img runs. This matches the incus backend, which already clones per
+  instance via `incus init`. Added
+  `scripts/deploy/test_xpf_deploy_disk.py` (unittest, importlib-loads the
+  hyphenated module): HA pair → two DISTINCT non-golden writable disks,
+  each overlay `-b` the golden read-only, virt-install attaches exactly
+  the created overlay, standalone gets its own overlay, name==image
+  rejected. RED-on-revert PROVEN: reverting to the shared-golden `--disk`
+  makes all 4 tests FAIL (no qemu-img overlay created; both VMs share the
+  golden). `python3 -m py_compile` clean; unittest 4/4 OK. Updated
+  `examples/deploy/README.md` "incus vs libvirt" (was "Both run the
+  *same* qcow2" — now documents per-VM overlay / per-instance clone +
+  a Root-disk table row). Refs fable-165 H-20 (issue #4171).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_disk.py, examples/deploy/README.md,
+  _Log.md
