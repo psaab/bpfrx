@@ -554,6 +554,22 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if iface.Cost > 0 {
 					fmt.Fprintf(&b, " ip ospf cost %d\n", iface.Cost)
 				}
+				// Adjacency timers + DR priority (#4285). hello/dead MUST
+				// match the neighbor or the adjacency never forms; FRR keeps
+				// its defaults (hello 10s, dead 40s, priority 1) when unset.
+				if iface.HelloInterval > 0 {
+					fmt.Fprintf(&b, " ip ospf hello-interval %d\n", iface.HelloInterval)
+				}
+				if iface.DeadInterval > 0 {
+					fmt.Fprintf(&b, " ip ospf dead-interval %d\n", iface.DeadInterval)
+				}
+				if iface.RetransmitInt > 0 {
+					fmt.Fprintf(&b, " ip ospf retransmit-interval %d\n", iface.RetransmitInt)
+				}
+				// HasPriority gates the line; 0 is a valid value ("never DR").
+				if iface.HasPriority {
+					fmt.Fprintf(&b, " ip ospf priority %d\n", iface.Priority)
+				}
 				if iface.NetworkType != "" {
 					fmt.Fprintf(&b, " ip ospf network %s\n", iface.NetworkType)
 				}
@@ -607,13 +623,30 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		b.WriteString("exit\n!\n")
 		for _, area := range ospfv3.Areas {
 			for _, iface := range area.Interfaces {
-				if iface.Cost > 0 || iface.Passive || iface.BFD {
+				if iface.Cost > 0 || iface.Passive || iface.BFD ||
+					iface.HelloInterval > 0 || iface.DeadInterval > 0 ||
+					iface.RetransmitInt > 0 || iface.HasPriority {
 					fmt.Fprintf(&b, "interface %s\n", iface.Name)
 					if iface.Passive {
 						b.WriteString(" ipv6 ospf6 passive\n")
 					}
 					if iface.Cost > 0 {
 						fmt.Fprintf(&b, " ipv6 ospf6 cost %d\n", iface.Cost)
+					}
+					// Adjacency timers + DR priority (#4285): hello/dead must
+					// match the neighbor. HasPriority gates the priority line;
+					// priority 0 ("never DR") emits, unset omits.
+					if iface.HelloInterval > 0 {
+						fmt.Fprintf(&b, " ipv6 ospf6 hello-interval %d\n", iface.HelloInterval)
+					}
+					if iface.DeadInterval > 0 {
+						fmt.Fprintf(&b, " ipv6 ospf6 dead-interval %d\n", iface.DeadInterval)
+					}
+					if iface.RetransmitInt > 0 {
+						fmt.Fprintf(&b, " ipv6 ospf6 retransmit-interval %d\n", iface.RetransmitInt)
+					}
+					if iface.HasPriority {
+						fmt.Fprintf(&b, " ipv6 ospf6 priority %d\n", iface.Priority)
 					}
 					if iface.BFD {
 						if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
@@ -680,6 +713,32 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				continue
 			}
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
+			// Per-peering local-as (#4286): present a different AS than the
+			// router's own to this peer.
+			if n.LocalAS > 0 {
+				fmt.Fprintf(&b, " neighbor %s local-as %d\n", n.Address, n.LocalAS)
+			}
+			// update-source (#4286): iBGP peers over loopbacks need the TCP
+			// session sourced from the loopback the peer has a `neighbor`
+			// statement for, not the egress interface IP — otherwise the peer
+			// rejects the connection and the session never establishes.
+			if n.LocalAddress != "" {
+				fmt.Fprintf(&b, " neighbor %s update-source %s\n", n.Address, sanitizeFRRValue(n.LocalAddress))
+			}
+			// passive (#4286): do not initiate — wait for the peer to connect.
+			if n.Passive {
+				fmt.Fprintf(&b, " neighbor %s passive\n", n.Address)
+			}
+			// hold-time (#4286): FRR `timers <keepalive> <holdtime>`; keepalive
+			// defaults to hold/3 per the BGP convention (Junos derives the same
+			// way). A mismatched hold-time shortens or breaks the session.
+			if n.HoldTime > 0 {
+				keepalive := n.HoldTime / 3
+				if keepalive < 1 {
+					keepalive = 1
+				}
+				fmt.Fprintf(&b, " neighbor %s timers %d %d\n", n.Address, keepalive, n.HoldTime)
+			}
 			if n.Description != "" {
 				fmt.Fprintf(&b, " neighbor %s description %s\n", n.Address, sanitizeFRRValue(n.Description))
 			}
