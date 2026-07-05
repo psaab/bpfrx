@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -93,8 +92,7 @@ func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 	var req PingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Target == "" {
@@ -130,8 +128,7 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 	var req TracerouteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Target == "" {
@@ -261,8 +258,7 @@ func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) systemActionHandler(w http.ResponseWriter, r *http.Request) {
 	var req SystemActionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 
