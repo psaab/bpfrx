@@ -1364,6 +1364,41 @@ reserved for whole-dataplane selection where a rewrite shim
   live CoS state). The Go commit-time gate above stays the PRIMARY
   defense; this is the helper-boundary backstop against version /
   snapshot drift, consistent with the #2447 CoS fail-closed family.
+- **scheduler-map dangling `scheduler` reference (strict commit +
+  Rust safe default):** a `scheduler-map <m> forwarding-class <fc>
+  scheduler <name>` entry naming a scheduler that is NOT defined under
+  `class-of-service schedulers` was previously WARN-only at commit
+  (`ValidateConfig`) and then FAIL-OPEN in the helper: the per-queue
+  builder (`userspace-dp forwarding_build/cos.rs`) resolved the dangling
+  name to `None`, left `guarantee_enabled` false, set the queue's
+  transmit rate to the WHOLE interface shaping rate, and derived the
+  MAXIMUM surplus weight (16). So a premium class (e.g. `ef`) whose
+  scheduler name was a typo did not merely lose its guarantee — it
+  silently won the LARGEST best-effort surplus share, invisible outside
+  the runtime queue rows. `validateClassOfServiceSchedulerMapRefsStrict`
+  (`compiler_validate_strict.go`) now HARD-REJECTS the dangling
+  reference at strict commit / commit-check, mirroring
+  `validatePolicySchedulerReferencesStrict` (the policy → scheduler
+  sibling) and Junos, which rejects an unresolved scheduler reference.
+  The call site downgrades it to a `cfg.Warnings` entry on the tolerant
+  load / peer-sync paths (`lenientSchedulerMapRef`, #1960 no-brick) so a
+  config persisted by an older binary — which only warned — still boots.
+  The helper-side backstop keeps that leniently-loaded reference
+  fail-SAFE rather than fail-OPEN: an UNRESOLVED scheduler pins the
+  queue to the minimal best-effort surplus weight (1) instead of the
+  whole-interface-rate maximum, while KEEPING the queue materialized
+  under its real queue id / forwarding-class (dropping the entry — the
+  undefined-forwarding-class treatment — would blackhole any traffic a
+  classifier steers to the class's queue). `guarantee_enabled` stays
+  false and priority stays `low`, so no guarantee or priority is
+  fabricated. A DEFINED scheduler that merely omits `transmit-rate` is
+  unchanged (it keeps `surplus_weight = 16`). The redundant
+  `ValidateConfig` scheduler warn was removed (single SSOT), consistent
+  with every other cross-reference gate. Coverage:
+  `TestSchedulerMapDanglingSchedulerRejectedStrict` (strict reject +
+  lenient downgrade + valid-scheduler control, `pkg/config`) and
+  `build_cos_state_dangling_scheduler_reference_uses_safe_best_effort_default`
+  (`userspace-dp forwarding_build/tests.rs`).
 - **#1956 (chassis device-map):** added the bare-metal stable-identity
   managed allowlist under `chassis device-map` (a SIBLING of `cluster`, so
   per-node apply-groups compose). New value types `ValuePCIAddr` /

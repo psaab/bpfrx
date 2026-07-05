@@ -34324,3 +34324,43 @@ top.
   scripts/image/test_validate_scenarios.py,
   scripts/deploy/test_xpf_deploy_gate.py, scripts/run-selftests.sh, Makefile,
   docs/install-images.md, CLAUDE.md, _Log.md
+
+## 2026-07-04 — CoS scheduler-map dangling scheduler ref: strict-reject + dataplane safe default (fable-166 G-2)
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fixed a CoS fail-open: a `scheduler-map <m> forwarding-class
+  <fc> scheduler <name>` entry naming an UNDEFINED scheduler was warn-only
+  at commit (`ValidateConfig`) and then FAIL-OPEN in the helper — the
+  per-queue builder resolved the dangling name to `None`, left
+  `guarantee_enabled` false, set the queue rate to the WHOLE interface
+  shaping rate, and derived the MAXIMUM surplus weight (16). A premium
+  class (e.g. `ef`) whose scheduler name was a typo did not merely lose its
+  guarantee, it silently won the LARGEST best-effort surplus share
+  (`cos_surplus_quantum_bytes = COS_SURPLUS_ROUND_QUANTUM_BYTES *
+  surplus_weight`). Applied the #1960 doctrine: (a) Go
+  `validateClassOfServiceSchedulerMapRefsStrict` HARD-REJECTS the dangling
+  reference at strict commit / commit-check (lenient downgrade to a
+  `cfg.Warnings` entry on the tolerant load / peer-sync path via
+  `lenientSchedulerMapRef`, so an older-binary / peer-synced config still
+  boots); (b) the Rust helper now fails SAFE — an unresolved scheduler
+  (`scheduler.is_none()`) pins the queue to the minimal best-effort surplus
+  weight (1) instead of the whole-interface-rate maximum, while KEEPING the
+  queue materialized (dropping it — the undefined-forwarding-class
+  treatment — would blackhole classified traffic). `guarantee_enabled`
+  stays false and priority stays `low`; a DEFINED scheduler that merely
+  omits `transmit-rate` is unchanged (`surplus_weight = 16`). Removed the
+  redundant `ValidateConfig` scheduler warn (single SSOT, consistent with
+  every other cross-ref gate) and kept the undefined-forwarding-class warn.
+  Added a daemon-journal breadcrumb in the Go emitter
+  (`pkg/dataplane/userspace/cos.go`). RED-on-revert proven for BOTH tests
+  (Go strict-reject; Rust surplus_weight==1). Full Go build + `go test
+  ./pkg/config/... ./pkg/dataplane/...` green; full cargo suite green except
+  the pre-existing, unrelated
+  `event_stream::tests::test_paused_telemetry_eviction_does_not_poison_drain_2875`
+  (confirmed FAILING on clean origin/master without this change).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/parser_class_of_service_test.go,
+  pkg/dataplane/userspace/cos.go,
+  userspace-dp/src/afxdp/forwarding_build/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  docs/config-schema.md, docs/cos-traffic-shaping.md, _Log.md
