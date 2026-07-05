@@ -1028,6 +1028,111 @@ impl SharedCoSQueueLease {
         shared_cos_lease_release_unused(self.config, &self.state, bytes);
     }
 
+    /// #4246 (T-1, folds R-5(a)): v8-aware lease give-back. The legacy
+    /// `release_unused` only moves `outstanding -> available` in the
+    /// `state.credits` word — it never touches the v8 epoch ledger. But
+    /// `acquire_v8_with_cause` charges every grant to THREE places:
+    /// `packed_granted` (the class ledger the ClassCap gate reads),
+    /// `outstanding` (state.credits), and `worker_grants[worker_id]`. So a
+    /// release that only frees `outstanding` leaves the class + worker
+    /// ledgers charged for bytes the queue returned — a mid-rate exact
+    /// class oscillating empty<->backlogged at epoch timescale hits
+    /// ClassCap early and parks until the next rotation (~94% service; the
+    /// plausible #1630 cause-2 mechanism).
+    ///
+    /// This re-credits the epoch ledger, mirroring the `tag_checked_rollback`
+    /// CAS discipline the acquire path uses when `try_bump_outstanding`
+    /// fails after a class CAS:
+    ///
+    ///  1. Free the legacy `outstanding` word (unchanged behaviour).
+    ///  2. Claim the credit from THIS worker's current-epoch grant slot via
+    ///     a tag-checked CAS, capped at what the slot still holds. The CAS
+    ///     serialises concurrent releases (each claims a disjoint slice) and
+    ///     a rotation between grant and release safely no-ops: rotation
+    ///     swaps the slot to `(new_tag, 0)`, so `consumed` reads 0 ->
+    ///     `credit == 0` -> return. Capping at the worker's current-epoch
+    ///     grant is what keeps the invariant `sum(worker_grants) ==
+    ///     packed_granted` intact when banked burst tokens span an epoch
+    ///     boundary — without it a release carrying prior-epoch bytes could
+    ///     decrement the class total below the sum of the OTHER workers'
+    ///     grants (over-admission).
+    ///  3. Decrement `packed_granted` by the SAME claimed credit, tag-
+    ///     checked. A rotation between the worker-slot claim (step 2) and
+    ///     here fails the tag match and no-ops (rotation reset
+    ///     `packed_granted` first, at rotate_epoch_v8 STEP 1).
+    ///
+    /// For a legacy (non-v8) shared queue lease `self.v8` is `None` and this
+    /// reduces to `release_unused`, so every queue-lease give-back site can
+    /// route through it unconditionally.
+    pub(in crate::afxdp) fn release_unused_v8(&self, worker_id: usize, bytes: u64) {
+        // Step 1: legacy leg — free the outstanding/credits word.
+        shared_cos_lease_release_unused(self.config, &self.state, bytes);
+        let Some(v8) = self.v8.as_ref() else {
+            return;
+        };
+        if bytes == 0 {
+            return;
+        }
+        let Some(my_pg) = v8.worker_grants.get(worker_id) else {
+            debug_assert!(
+                false,
+                "release_unused_v8 worker_id {} out of range (len {})",
+                worker_id,
+                v8.worker_grants.len()
+            );
+            return;
+        };
+        // Step 2: claim the credit from this worker's current-epoch grant.
+        let (tag, credit) = loop {
+            let curr = my_pg.0.load(Ordering::Acquire);
+            let (tag, consumed) = PackedEpochGrant::unpack(curr);
+            // Cap at the worker's current-epoch grant: a release carrying
+            // banked bytes granted in a PRIOR epoch must not decrement more
+            // than this worker holds this epoch.
+            let credit = bytes.min(consumed as u64) as u32;
+            if credit == 0 {
+                return; // nothing granted this epoch, or rotated — no-op
+            }
+            let new = PackedEpochGrant::pack(tag, consumed - credit);
+            if my_pg
+                .0
+                .compare_exchange_weak(curr, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break (tag, credit);
+            }
+        };
+        // Step 3: decrement the class ledger by the SAME claimed credit.
+        // A rotation between step 2 and here (tag mismatch) or retry-budget
+        // exhaustion makes this a no-op — `recredited` reports what actually
+        // reached packed_granted (0 in those cases).
+        let recredited = tag_checked_rollback(
+            &v8.epoch.packed_granted,
+            tag,
+            credit,
+            &v8.epoch.rollback_retry_exceeded,
+        );
+        // #1630 cause-2 empirical hook: accumulate ONLY bytes genuinely
+        // re-credited to the class ledger so give-back can be summed
+        // against per-class undershoot without over-reporting (#4246
+        // Copilot comment 3). A step-3 no-op contributes nothing here.
+        if recredited > 0 {
+            v8.epoch
+                .release_recredited_bytes
+                .fetch_add(recredited as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// #4246 (T-1): cumulative bytes re-credited to the epoch ledger by
+    /// `release_unused_v8`. Returns 0 for legacy leases. Diagnostic hook
+    /// for the #1630 cause-2 falsification test.
+    pub(in crate::afxdp) fn v8_release_recredited_bytes(&self) -> u64 {
+        self.v8
+            .as_ref()
+            .map(|v| v.epoch.release_recredited_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// #1229 Phase 6 v8: seqlock-protected snapshot of stable epoch
     /// fields. Returns `None` if MAX_SEQ_SPINS is exceeded
     /// (pathological rotation churn or preempted rotation winner).
@@ -1260,13 +1365,20 @@ fn worker_grant_bump(pg: &PackedEpochGrant, my_tag: u32, take: u32) -> bool {
 /// is exhausted with the tag still matching, increment the metric
 /// and bail; failure mode is undergrant (extra outstanding bytes
 /// stay debited until next rotation), NOT overshoot.
+///
+/// Returns the amount ACTUALLY decremented from `pg`: `min(take,
+/// curr_granted)` on a successful tag-matched CAS, or 0 when a rotation
+/// (tag mismatch) or retry-budget exhaustion prevented the decrement.
+/// The acquire-rollback callers ignore the return; `release_unused_v8`
+/// uses it so its #1630 diagnostic counter only counts bytes that
+/// genuinely reached `packed_granted` (#4246 Copilot comment 3).
 #[inline]
-fn tag_checked_rollback(pg: &PackedEpochGrant, my_tag: u32, take: u32, metric: &AtomicU64) {
+fn tag_checked_rollback(pg: &PackedEpochGrant, my_tag: u32, take: u32, metric: &AtomicU64) -> u32 {
     for _retry in 0..MAX_ROLLBACK_RETRIES {
         let curr = pg.0.load(Ordering::Acquire);
         let (curr_tag, curr_granted) = PackedEpochGrant::unpack(curr);
         if curr_tag != my_tag {
-            return; // rotation occurred; rollback unnecessary
+            return 0; // rotation occurred; rollback unnecessary
         }
         let new_granted = curr_granted.saturating_sub(take);
         let new = PackedEpochGrant::pack(curr_tag, new_granted);
@@ -1275,10 +1387,12 @@ fn tag_checked_rollback(pg: &PackedEpochGrant, my_tag: u32, take: u32, metric: &
             .compare_exchange_weak(curr, new, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return;
+            // saturating_sub means the real delta is min(take, curr_granted).
+            return curr_granted - new_granted;
         }
     }
     metric.fetch_add(1, Ordering::Relaxed);
+    0
 }
 
 impl SharedCoSRootLease {

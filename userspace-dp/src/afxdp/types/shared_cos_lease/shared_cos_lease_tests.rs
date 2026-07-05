@@ -2108,3 +2108,278 @@ fn v8_concurrent_acquires_and_rotations_respect_the_budget_bound() {
     );
     assert!(granted > 0, "some grants must land");
 }
+
+// === #4246 (T-1, folds R-5(a)): v8 lease give-back re-credits the epoch
+// ledger. Before the fix `release_unused` touched only `state.credits`,
+// leaving `packed_granted`/`worker_grants` charged for returned bytes. ===
+
+/// Read the v8 epoch ledger for a worker: (class_granted, worker_grant).
+fn v8_ledger(lease: &SharedCoSQueueLease, worker_id: usize) -> (u32, u32) {
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    let (_c_tag, class_granted) =
+        PackedEpochGrant::unpack(v8.epoch.packed_granted.0.load(Ordering::Acquire));
+    let (_w_tag, worker_grant) =
+        PackedEpochGrant::unpack(v8.worker_grants[worker_id].0.load(Ordering::Acquire));
+    (class_granted, worker_grant)
+}
+
+#[test]
+fn v8_release_unused_v8_recredits_epoch_ledger() {
+    // 100 Mbps = 12.5 MB/s, EPOCH = 200µs -> cap = 2500 B. Large burst so
+    // the outstanding cap does not bind before the class cap.
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 256 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let granted = lease.acquire_v8(0, EPOCH_DURATION_NS, 100_000);
+    assert!(
+        granted >= 2,
+        "acquire must grant a divisible amount (got {granted})"
+    );
+    let (class_before, worker_before) = v8_ledger(&lease, 0);
+    assert_eq!(class_before as u64, granted, "class ledger charged the grant");
+    assert_eq!(
+        worker_before as u64, granted,
+        "worker ledger charged the grant"
+    );
+
+    // Queue drained early: return half the grant.
+    let released = granted / 2;
+    lease.release_unused_v8(0, released);
+
+    let (class_after, worker_after) = v8_ledger(&lease, 0);
+    // RED before the fix: release_unused touched only state.credits, so
+    // both ledgers stayed == granted and the class stayed at ClassCap.
+    assert_eq!(
+        class_after as u64,
+        granted - released,
+        "class ledger must be re-credited on give-back"
+    );
+    assert_eq!(
+        worker_after as u64,
+        granted - released,
+        "worker ledger must be re-credited on give-back"
+    );
+    assert_eq!(
+        lease.v8_release_recredited_bytes(),
+        released,
+        "recredit counter tracks the returned bytes"
+    );
+}
+
+#[test]
+fn v8_release_unused_v8_reopens_classcap_same_epoch() {
+    // The T-1 scenario: a mid-rate exact class drains the whole epoch cap,
+    // empties, and returns part of the grant. Before the fix the class
+    // ledger stayed at cap, so same-epoch re-arrivals broke ClassCap and
+    // parked until the next rotation (~94% service). After the fix the
+    // returned bytes re-open the class within the same epoch.
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 256 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let now = EPOCH_DURATION_NS;
+
+    // Claim the whole class cap in one shot.
+    let g1 = lease.acquire_v8(0, now, 100_000);
+    assert!(g1 > 0);
+    // A further same-epoch acquire must be refused (ClassCap / share).
+    let g2 = lease.acquire_v8(0, now, 4_096);
+    assert_eq!(g2, 0, "class is at cap; further same-epoch grant refused");
+
+    // Queue drains early and returns part of the grant.
+    let released = g1 / 2;
+    assert!(released > 0);
+    lease.release_unused_v8(0, released);
+
+    // Same epoch, same clock: the returned budget must be re-grantable.
+    let g3 = lease.acquire_v8(0, now, 100_000);
+    assert!(
+        g3 > 0,
+        "returned budget must re-open the class within the epoch \
+         (RED before fix: parked at ClassCap, g3 == 0)"
+    );
+    assert!(
+        g3 <= released,
+        "re-grant bounded by the returned budget (got {g3}, released {released})"
+    );
+}
+
+#[test]
+fn v8_release_unused_v8_cross_epoch_is_noop() {
+    // A give-back that arrives after rotation reset this worker's grant
+    // slot must not decrement the NEW epoch's ledger. Worker 1 triggers the
+    // rotation; worker 0 (which does not re-acquire) then issues a stale
+    // release of its epoch-N grant. Guards the cap/tag check — a naive
+    // decrement of `packed_granted` by `bytes` would underflow worker 0's
+    // now-zero slot and corrupt the new epoch's class total.
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 256 * 1024, 2, 1);
+    lease.rehydrate_worker_active_count(0, 1);
+    lease.rehydrate_worker_active_count(1, 1);
+
+    // Epoch N: worker 0 grabs its share.
+    let g0 = lease.acquire_v8(0, EPOCH_DURATION_NS, 100_000);
+    assert!(g0 > 0);
+
+    // Rotate to epoch N+1 via worker 1 (worker 0 stays quiet).
+    let g1 = lease.acquire_v8(1, 5 * EPOCH_DURATION_NS, 100_000);
+    assert!(g1 > 0);
+    let (class_before, worker0_before) = v8_ledger(&lease, 0);
+    let (_, worker1_before) = v8_ledger(&lease, 1);
+    assert_eq!(worker0_before, 0, "rotation reset worker 0's grant slot");
+
+    // Stale release of worker 0's epoch-N grant.
+    lease.release_unused_v8(0, g0);
+
+    let (class_after, worker0_after) = v8_ledger(&lease, 0);
+    let (_, worker1_after) = v8_ledger(&lease, 1);
+    assert_eq!(
+        class_after, class_before,
+        "class ledger unchanged (cross-epoch give-back is a no-op)"
+    );
+    assert_eq!(worker0_after, 0, "worker 0 slot stays zero (no underflow)");
+    assert_eq!(worker1_after, worker1_before, "worker 1 slot untouched");
+    assert_eq!(
+        lease.v8_release_recredited_bytes(),
+        0,
+        "cross-epoch give-back re-credits nothing"
+    );
+}
+
+#[test]
+fn v8_release_unused_v8_caps_at_worker_grant_preserving_class_total() {
+    // Over-release (more bytes than this worker was granted this epoch —
+    // e.g. banked burst from a prior epoch) must decrement the class total
+    // by AT MOST this worker's grant, never below the sum of the OTHER
+    // workers' grants (which would be over-admission). Guards the
+    // `bytes.min(consumed)` cap that keeps sum(worker_grants) ==
+    // packed_granted intact.
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 256 * 1024, 2, 1);
+    lease.rehydrate_worker_active_count(0, 1);
+    lease.rehydrate_worker_active_count(1, 1);
+    let now = EPOCH_DURATION_NS;
+
+    let g0 = lease.acquire_v8(0, now, 100_000);
+    let g1 = lease.acquire_v8(1, now, 100_000);
+    assert!(g0 > 0 && g1 > 0);
+    let (class_before, worker0_before) = v8_ledger(&lease, 0);
+    assert_eq!(class_before as u64, g0 + g1, "class total = sum of grants");
+    assert_eq!(worker0_before as u64, g0);
+
+    // Release far more than worker 0 was granted this epoch.
+    lease.release_unused_v8(0, g0 + 50_000);
+
+    let (class_after, worker0_after) = v8_ledger(&lease, 0);
+    let (_, worker1_after) = v8_ledger(&lease, 1);
+    assert_eq!(
+        worker0_after, 0,
+        "worker 0 grant capped to zero, not underflowed"
+    );
+    assert_eq!(worker1_after as u64, g1, "worker 1 grant untouched");
+    assert_eq!(
+        class_after as u64, g1,
+        "class total decremented by at most worker 0's grant (never below worker 1's)"
+    );
+    assert_eq!(
+        lease.v8_release_recredited_bytes(),
+        g0,
+        "recredit capped at worker 0's current-epoch grant"
+    );
+}
+
+#[test]
+fn v8_release_unused_v8_counter_excludes_step3_noop() {
+    // The #1630 diagnostic counter must count ONLY bytes actually
+    // re-credited to packed_granted. If step 3 (the class-ledger decrement)
+    // no-ops because a rotation swapped the class tag between the
+    // worker-slot claim (step 2) and step 3, release_recredited_bytes must
+    // NOT increment. RED before the conditional-increment fix: the counter
+    // over-reported by `credit`.
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 256 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let g = lease.acquire_v8(0, EPOCH_DURATION_NS, 100_000);
+    assert!(g > 0);
+
+    // Simulate the rotation window: advance packed_granted's tag WITHOUT
+    // touching worker_grants[0] (rotation swaps packed_granted first — at
+    // rotate_epoch_v8 STEP 1 — before the per-worker slots at STEP 3).
+    let worker_grant = {
+        let v8 = lease.v8.as_ref().unwrap();
+        let (t, wg) = PackedEpochGrant::unpack(v8.worker_grants[0].0.load(Ordering::Acquire));
+        v8.epoch.packed_granted.0.store(
+            PackedEpochGrant::pack(t.wrapping_add(1), 500),
+            Ordering::Release,
+        );
+        wg
+    };
+    assert!(worker_grant > 0, "worker slot still carries the grant");
+
+    // Give back: step 2 claims from worker_grants[0] (its own tag matches),
+    // step 3 finds packed_granted at a different tag and no-ops.
+    lease.release_unused_v8(0, worker_grant as u64);
+
+    let v8 = lease.v8.as_ref().unwrap();
+    let (_wt, wg_after) = PackedEpochGrant::unpack(v8.worker_grants[0].0.load(Ordering::Acquire));
+    assert_eq!(wg_after, 0, "step 2 claimed the worker-slot credit");
+    assert_eq!(
+        lease.v8_release_recredited_bytes(),
+        0,
+        "counter must exclude bytes step 3 did not re-credit (rotation window)"
+    );
+}
+
+#[test]
+fn v8_release_unused_v8_concurrent_preserves_ledger_invariant() {
+    // N worker threads hammer acquire+release on their own slots within a
+    // single epoch (fixed clock -> no rotation). Under ANY interleaving the
+    // class ledger must equal the sum of the per-worker grants at
+    // quiescence, stay within [0, cap], and never underflow. An over- or
+    // under-decrement in the release CAS would break the invariant.
+    use std::sync::Arc as StdArc;
+    let lease = StdArc::new(SharedCoSQueueLease::new_v8(12_500_000, 4 * 1024 * 1024, 4, 3));
+    for w in 0..4 {
+        lease.rehydrate_worker_active_count(w, 1);
+    }
+    // Publish the epoch once (single-threaded) so all threads share a tag.
+    let now = EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, now, 1);
+    const ROUNDS: u64 = 3_000;
+    let mut handles = Vec::new();
+    for w in 0..4usize {
+        let lease = StdArc::clone(&lease);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                let g = lease.acquire_v8(w, now, 512);
+                if g > 0 {
+                    lease.release_unused_v8(w, g);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let v8 = lease.v8.as_ref().unwrap();
+    let (_c_tag, class_granted) =
+        PackedEpochGrant::unpack(v8.epoch.packed_granted.0.load(Ordering::Acquire));
+    let mut sum: u64 = 0;
+    for slot in v8.worker_grants.iter() {
+        let (_t, g) = PackedEpochGrant::unpack(slot.0.load(Ordering::Acquire));
+        sum += g as u64;
+    }
+    // sum <= class always (release under-decrement / mid-acquire is the only
+    // slack, both keep class >= sum). cap = 12.5MB/s * 200µs = 2500 B.
+    assert!(
+        sum <= class_granted as u64,
+        "class ledger {class_granted} must never drop below sum of grants {sum} (over-admission)"
+    );
+    assert!(
+        class_granted as u64 <= 2_500,
+        "class total {class_granted} must never exceed the epoch cap 2500"
+    );
+    assert_eq!(
+        lease.v8_rollback_retry_exceeded(),
+        0,
+        "no tag-checked-rollback exhaustion expected under this contention"
+    );
+    assert_eq!(
+        sum, class_granted as u64,
+        "ledger invariant sum(worker_grants) == packed_granted after concurrent churn"
+    );
+}

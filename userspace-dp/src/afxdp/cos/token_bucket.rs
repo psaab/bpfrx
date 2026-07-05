@@ -408,13 +408,22 @@ pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker
         })
         .collect::<Vec<_>>();
     for (root_ifindex, queue_idx) in queue_keys {
-        let released = binding
+        // Capture the worker id alongside the take — the v8 give-back needs
+        // it to re-credit the right per-worker grant slot (#4246 T-1).
+        let taken = binding
             .cos
             .cos_interfaces
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx))
-            .map(|queue| core::mem::take(&mut queue.hot.tokens))
-            .unwrap_or(0);
+            .map(|queue| {
+                (
+                    queue.v_min.worker_id as usize,
+                    core::mem::take(&mut queue.hot.tokens),
+                )
+            });
+        let Some((worker_id, released)) = taken else {
+            continue;
+        };
         if released == 0 {
             continue;
         }
@@ -425,7 +434,10 @@ pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker
             .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
             .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
         {
-            shared_queue_lease.release_unused(released);
+            // #4246 (T-1): re-credit the v8 epoch ledger on teardown too, so
+            // a rebind/config-swap does not leave the class parked at
+            // ClassCap. No-op v8 leg for legacy leases.
+            shared_queue_lease.release_unused_v8(worker_id, released);
         }
     }
 }

@@ -700,18 +700,41 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
 ) {
     let mut new_nonempty = 0usize;
     let mut new_runnable = 0usize;
-    let mut released_queue_leases = Vec::<(usize, u64)>::new();
+    // (queue_idx, worker_id, released_bytes)
+    let mut released_queue_leases = Vec::<(usize, usize, u64)>::new();
     let old_nonempty = binding
         .cos
         .cos_interfaces
         .get(&root_ifindex)
         .map(|root| root.nonempty_queues)
         .unwrap_or(0);
+    // #4246 R-5(a): only zero (and give back) an empty exact queue's
+    // banked burst when a shared lease will actually RECEIVE it. A
+    // single-owner exact queue (exact but no lease attached) previously had
+    // `hot.tokens` zeroed unconditionally with nowhere to give it back —
+    // destroying the token-bucket burst on every brief drain (a burst-less
+    // rate limiter for on/off traffic). The lease-presence probe reads the
+    // disjoint `cos_fast_interfaces` field, so it coexists with the
+    // `cos_interfaces` mutable borrow below.
+    let iface_fast = binding.cos.cos_fast_interfaces.get(&root_ifindex);
     if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
         for (queue_idx, queue) in root.queues.iter_mut().enumerate() {
             normalize_cos_queue_state(queue);
             if cos_queue_is_empty(queue) && queue.config.exact && queue.hot.tokens > 0 {
-                released_queue_leases.push((queue_idx, core::mem::take(&mut queue.hot.tokens)));
+                let has_lease = iface_fast
+                    .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
+                    .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
+                    .is_some();
+                if has_lease {
+                    let worker_id = queue.v_min.worker_id as usize;
+                    released_queue_leases.push((
+                        queue_idx,
+                        worker_id,
+                        core::mem::take(&mut queue.hot.tokens),
+                    ));
+                }
+                // No lease: leave `hot.tokens` intact (R-5(a)) — nowhere to
+                // give it back, so keep the banked burst for this queue.
             }
             if cos_queue_is_empty(queue) {
                 continue;
@@ -732,13 +755,15 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
         release_cos_root_lease(binding, root_ifindex);
     }
     if let Some(iface_fast) = binding.cos.cos_fast_interfaces.get(&root_ifindex) {
-        for (queue_idx, released) in released_queue_leases {
+        for (queue_idx, worker_id, released) in released_queue_leases {
             if let Some(shared_queue_lease) = iface_fast
                 .queue_fast_path
                 .get(queue_idx)
                 .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
             {
-                shared_queue_lease.release_unused(released);
+                // #4246 (T-1): re-credit the v8 epoch ledger, not just the
+                // legacy outstanding word. No-op v8 leg for legacy leases.
+                shared_queue_lease.release_unused_v8(worker_id, released);
             }
         }
     }
