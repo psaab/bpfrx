@@ -500,3 +500,90 @@ fn transparent_root_preserves_per_queue_exact_cap() {
         root.queues[0].hot.tokens,
     );
 }
+
+/// #4261 (hb166 R-4) — refill dust conservation.
+///
+/// A 64 kbps class (8000 B/s) refilled at the ~200 µs drain cadence
+/// accrues 1.6 B/interval. The pre-fix `refill_cos_tokens` floored to 1
+/// B AND advanced `last_refill_ns` to `now_ns`, discarding the 0.6 B
+/// remainder every interval → 5000 B/s delivered (37.5% under the 8000
+/// B/s shape). The fix carries the fractional remainder in the
+/// timestamp so cumulative granted tracks `rate × elapsed`.
+///
+/// RED-on-revert: with the timestamp advanced fully to `now_ns`, the
+/// class delivers ~5000 B/s and this test's `>= 7900` floor fails.
+#[test]
+fn refill_cos_tokens_carries_fractional_dust_for_low_rate_class() {
+    // 64 kbps = 8000 bytes/sec.
+    const RATE_BYTES_PER_SEC: u64 = 8_000;
+    // ~200 µs drain cadence — deliberately NON-integral bytes/interval
+    // (8000 * 200_000 / 1e9 = 1.6 B).
+    const INTERVAL_NS: u64 = 200_000;
+    // 1 second of refills.
+    const INTERVALS: u64 = 5_000;
+    // Burst large enough that the bucket never saturates — we are
+    // measuring pure refill accounting, not the cap.
+    const BURST_BYTES: u64 = 1_000_000;
+
+    // Consume tokens each interval so the bucket never fills and we can
+    // sum the actual grants. Start "primed" (last_refill_ns != 0) so we
+    // exercise the rate path, not the first-refill fill-to-burst path.
+    let mut tokens: u64 = 0;
+    let mut last_refill_ns: u64 = 1_000_000_000;
+    let mut now = last_refill_ns;
+    let mut granted_total: u64 = 0;
+
+    for _ in 0..INTERVALS {
+        now += INTERVAL_NS;
+        let before = tokens;
+        refill_cos_tokens(
+            &mut tokens,
+            RATE_BYTES_PER_SEC,
+            BURST_BYTES,
+            &mut last_refill_ns,
+            now,
+        );
+        let added = tokens - before;
+        granted_total += added;
+        // Drain everything granted so the bucket cannot approach BURST.
+        tokens = 0;
+    }
+
+    let elapsed_ns = now - 1_000_000_000;
+    let ideal = (elapsed_ns as u128 * RATE_BYTES_PER_SEC as u128 / 1_000_000_000u128) as u64;
+    // ideal == 8000 B over 1 s.
+    assert_eq!(ideal, 8_000, "fixture sanity: 1 s at 8000 B/s = 8000 B");
+
+    // Conservation: cumulative granted must equal ideal within a
+    // small bounded error (sub-nanosecond flooring in the leftover
+    // rewind). The pre-fix behavior delivered ~5000 B (37.5% under)
+    // and fails this floor.
+    assert!(
+        granted_total >= 7_900,
+        "low-rate class under-ran: granted {} B over 1 s vs 8000 B ideal \
+         (dust discarded each refill — #4261 regression)",
+        granted_total,
+    );
+    assert!(
+        granted_total <= 8_000,
+        "low-rate class over-ran: granted {} B > 8000 B ideal (dust \
+         carry must not manufacture credit)",
+        granted_total,
+    );
+
+    // The carried remainder lives in the timestamp: after the last
+    // granting refill, `last_refill_ns` trails `now` by the ungranted
+    // fraction (< one byte's worth of time), never advancing past it.
+    assert!(
+        last_refill_ns <= now,
+        "last_refill_ns {} overshot now {}",
+        last_refill_ns,
+        now,
+    );
+    assert!(
+        now - last_refill_ns < (1_000_000_000 / RATE_BYTES_PER_SEC),
+        "carried leftover {} ns must be under one byte's time ({} ns)",
+        now - last_refill_ns,
+        1_000_000_000 / RATE_BYTES_PER_SEC,
+    );
+}
