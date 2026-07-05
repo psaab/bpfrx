@@ -317,6 +317,10 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 q.waterfill_eligible_visits = q
                     .waterfill_eligible_visits
                     .saturating_add(queue.waterfill_eligible_visits);
+                // hb166 T-2: refunded zero-TX Phase-1 honored selections.
+                q.waterfill_phase1_selected_no_progress = q
+                    .waterfill_phase1_selected_no_progress
+                    .saturating_add(queue.waterfill_phase1_selected_no_progress);
                 // #1829 Phase 1: sojourn telemetry MAX-merges across
                 // workers (worst instance), matching the worker-side
                 // MAX in queue_row.rs — see the AGGREGATION contract

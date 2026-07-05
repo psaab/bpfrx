@@ -3639,3 +3639,123 @@ fn build_cos_batch_clears_pop_snapshot_stack_across_batches() {
         "#3968: stack must not realloc past TX_BATCH_SIZE",
     );
 }
+
+// hb166 T-2: a Phase-1 honored waterfill selection whose service makes
+// ZERO TX progress must have its epoch honor REFUNDED, not burned.
+
+/// Unit-level: the refund helper restores the debited Phase-1 budget,
+/// clears the honored-epoch bit, and corrects the telemetry
+/// (phase1_admissions back to 0, phase1_selected_no_progress = 1).
+#[test]
+fn waterfill_phase1_honor_refund_restores_budget_clears_bit_and_counts() {
+    let mut root = waterfill_guarantee_rate_root(1.0);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("phase-1 selection");
+
+    // The smallest exact queue is ascending ordinal 0.
+    let refund = s
+        .phase1_honor
+        .expect("a Phase-1 honored selection must carry refund info");
+    assert!(refund.cost_bytes > 0, "a Phase-1 honor debits real bytes");
+    assert_eq!(refund.bit_ordinal, 0, "smallest exact queue is ordinal 0");
+
+    let budget_debited = root.waterfill_pass1_remaining_bytes;
+    assert_ne!(
+        root.waterfill_honored_epoch_bits & 0b1,
+        0,
+        "selection set the ordinal-0 honored bit"
+    );
+    assert_eq!(
+        root.queues[s.queue_idx]
+            .telemetry
+            .waterfill_counters
+            .phase1_admissions,
+        1,
+        "selection bumped phase1_admissions"
+    );
+
+    // Zero-byte TX: refund the honor.
+    apply_phase1_waterfill_honor_refund(&mut root, s.queue_idx, refund);
+
+    assert_eq!(
+        root.waterfill_pass1_remaining_bytes,
+        budget_debited + refund.cost_bytes,
+        "refund adds the debited cost back to the Phase-1 budget"
+    );
+    assert_eq!(
+        root.waterfill_honored_epoch_bits & 0b1,
+        0,
+        "refund clears the honored bit so the class is re-selectable this epoch"
+    );
+    let counters = root.queues[s.queue_idx].telemetry.waterfill_counters;
+    assert_eq!(
+        counters.phase1_admissions, 0,
+        "refund undoes the over-counted admission (counts services, not selections)"
+    );
+    assert_eq!(
+        counters.phase1_selected_no_progress, 1,
+        "refund records the no-progress visit"
+    );
+}
+
+/// End-to-end wiring: with the TX free-frame pool exhausted, the
+/// service wrapper's Phase-1 honored selection makes zero progress and
+/// the honor is refunded via the production
+/// `service_exact_guarantee_queue_direct_with_info` path. RED-on-revert:
+/// without the refund the honored bit stays set (`0b1`) and the class is
+/// skipped for the rest of the epoch.
+#[test]
+fn service_exact_guarantee_zero_tx_refunds_phase1_honor() {
+    let root = waterfill_guarantee_rate_root(1.0);
+    let root_lease = Arc::new(SharedCoSRootLease::new(
+        root.shaping_rate_bytes,
+        root.burst_bytes,
+        1,
+    ));
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        0,
+        vec![
+            (0, test_queue_fast_path(false, 0, None, None)),
+            (1, test_queue_fast_path(false, 0, None, None)),
+            (2, test_queue_fast_path(false, 0, None, None)),
+            (3, test_queue_fast_path(false, 0, None, None)),
+        ],
+        None,
+        Some(root_lease),
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    // Force every service call to make zero TX progress: no free UMEM
+    // frames and nothing to reap. This is the interface-wide TX-pressure
+    // condition that the pre-fix code let burn the small class's epoch.
+    binding.tx_pipeline.free_tx_frames.clear();
+
+    let mut shared_recycles = Vec::new();
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let out =
+        service_exact_guarantee_queue_direct_with_info(&mut binding, 42, 1, &mut shared_recycles, &mut tel);
+    assert!(
+        matches!(out, Some(None)),
+        "exact selection fired but service made no TX progress"
+    );
+
+    let root = binding.cos.cos_interfaces.get(&42).expect("cos root");
+    assert_eq!(
+        root.waterfill_honored_epoch_bits & 0b1,
+        0,
+        "zero-TX Phase-1 selection must REFUND the honored bit (T-2), not burn the epoch"
+    );
+    let counters = root.queues[0].telemetry.waterfill_counters;
+    assert_eq!(
+        counters.phase1_admissions, 0,
+        "a no-progress selection must not count as an admission"
+    );
+    assert_eq!(
+        counters.phase1_selected_no_progress, 1,
+        "the refunded no-progress visit is recorded"
+    );
+}

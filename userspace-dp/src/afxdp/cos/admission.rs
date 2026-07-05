@@ -47,6 +47,24 @@ pub(in crate::afxdp) const COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS: u64 = 5_000_000;
 // no room to grow cwnd past a handful of packets.
 const _: () = assert!(COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS >= 1_000_000);
 
+/// #717 hb166 T-5: assumed drain rate for the delay cap on an UNSHAPED
+/// (transparent) flow-fair queue. `transmit_rate_bytes == 0` means
+/// "no shaper / full bucket", NOT "zero drain rate" — an unshaped queue
+/// drains at the physical link rate. Anchoring the #717 delay cap to
+/// this floor (instead of the literal 0 rate) keeps the flow-aware
+/// aggregate buffer expanding for a new flow on an unshaped queue, so a
+/// mouse's first packet is not dropped at the aggregate cap while
+/// resident elephant bytes stay — the #704/#707 regression that a
+/// rate-0 `delay_cap == 0` resurrected. 10 Gb/s (1.25 GB/s) matches the
+/// cluster VF line rate and yields a 6.25 MB delay cap, consistent with
+/// a 10 G SHAPED queue rather than the ~98 MB an uncapped rate-0 queue
+/// would otherwise reach.
+pub(in crate::afxdp) const COS_FLOW_FAIR_UNSHAPED_DRAIN_RATE_BYTES: u64 = 1_250_000_000;
+
+// Compile-time sanity: a positive floor is the whole point — a zero
+// floor would re-collapse the delay cap to 0 for unshaped queues.
+const _: () = assert!(COS_FLOW_FAIR_UNSHAPED_DRAIN_RATE_BYTES > 0);
+
 /// ECN CE-marking threshold as a fraction of the relevant cap.
 /// Applied to both the aggregate `buffer_limit` and the per-flow
 /// `share_cap` in `apply_cos_admission_ecn_policy`.
@@ -214,6 +232,14 @@ pub(in crate::afxdp) fn cos_queue_flow_share_limit(
 /// explicit `buffer-size`, so an operator who asked for a deeper
 /// buffer still gets it. Adds one u128 multiply + divide per admission
 /// decision, not per packet.
+///
+/// hb166 T-5: for an UNSHAPED (`transmit_rate_bytes == 0`) flow-fair
+/// queue the delay rate is anchored to
+/// `COS_FLOW_FAIR_UNSHAPED_DRAIN_RATE_BYTES` (physical link rate),
+/// NOT the literal 0. A 0 rate collapses `delay_cap` to 0, which pins
+/// the aggregate cap at `base` and drops a new flow's first packet
+/// (the rate-0 twin of the #704/#707 regression this expansion exists
+/// to prevent).
 #[inline]
 pub(in crate::afxdp) fn cos_flow_aware_buffer_limit(
     queue: &CoSQueueRuntime,
@@ -224,10 +250,21 @@ pub(in crate::afxdp) fn cos_flow_aware_buffer_limit(
         return base;
     }
     let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
+    // #717 hb166 T-5: rate 0 means "unshaped", not "zero drain rate". A
+    // literal 0 rate collapses `delay_cap` to 0, so `.min(delay_cap.max(
+    // base))` pins the aggregate cap at `base` regardless of flow count —
+    // the flow-aware expansion never fires and a new flow's first packet is
+    // dropped at the aggregate cap (the #704/#707 regression, rate-0 twin).
+    // An unshaped queue drains at the physical link rate, so anchor the
+    // delay cap to the link-rate floor when unshaped; the shaped (rate > 0)
+    // path is bit-identical.
+    let delay_rate = match queue.transmit_rate_bytes() {
+        0 => COS_FLOW_FAIR_UNSHAPED_DRAIN_RATE_BYTES,
+        rate => rate,
+    };
     // u128 to keep the intermediate product safe at 10 Gbps × 5 ms
     // (plus any plausible operator-configured rate inflation).
-    let delay_cap = ((queue.transmit_rate_bytes() as u128)
-        * (COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS as u128)
+    let delay_cap = ((delay_rate as u128) * (COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS as u128)
         / 1_000_000_000u128) as u64;
     base.max(prospective_active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
         .min(delay_cap.max(base))

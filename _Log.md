@@ -35,6 +35,34 @@
     userspace-dp/src/afxdp/types/shared_cos_lease/lease.rs,
     userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
     docs/fairness-regimes.md, _Log.md
+## 2026-07-05 — cos: surface waterfill phase1_selected_no_progress (#4262)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Surfaced the hb166 T-2 `waterfill_phase1_selected_no_progress`
+    counter (added in #4256/#4258) via Prometheus + the `show
+    class-of-service` formatter, mirroring its sibling
+    `waterfill_phase1_admissions`. Added the per-`{ifindex, queue_id}`
+    gauge `cosWaterfillPhase1SelectedNoProgress`
+    (`xpf_userspace_cos_waterfill_phase1_selected_no_progress_total`): the
+    Desc struct field + Describe emit in metrics.go, the NewDesc in
+    metrics_descriptors.go, and the CounterValue emit in the per-queue loop
+    of `emitCoSWaterfillTelemetry` (metrics_userspace.go). Added
+    `phase1_no_progress=%d` to the per-queue Waterfill row in
+    format/cos.go, with the view field, the copy-through in
+    buildCoSQueueViews, and the `hasWaterfillTelemetry` gate. Also folded a
+    comment-accuracy fix in protocol.go (~1979): a missing JSON field
+    decodes to 0 regardless of omitempty; omitempty only suppresses
+    emitting 0 on the wire. Extended the Prometheus test
+    (TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics) and added
+    a formatter test (TestFormatCoSInterfaceSummaryRendersWaterfillNoProgress).
+    Docs: cos-validation-notes.md (show example + per-queue bullet +
+    Prometheus list) and fairness-regimes.md (observability pointer).
+  - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+    pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
+    pkg/dataplane/userspace/format/cos.go,
+    pkg/dataplane/userspace/format/cos_test.go,
+    pkg/dataplane/userspace/protocol.go, docs/cos-validation-notes.md,
+    docs/fairness-regimes.md
 
 ## 2026-07-04 — fable-review-166 T-1: v8 lease give-back re-credits the epoch ledger (#4246, folds R-5(a))
 
@@ -34911,4 +34939,38 @@ top.
   userspace-dp/src/afxdp/cos/admission.rs,
   userspace-dp/src/afxdp/tx/test_support.rs,
   userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
+  docs/fairness-regimes.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fix two TX-path CoS queue-service bugs (fable-review-166
+  T-2 HIGH + T-5 Medium). T-2 (#4256): the guarantee-rate waterfill
+  selector debited the Phase-1 budget and set the honored-epoch bit at
+  SELECTION; a zero-byte TX (ring full / no free frame / build Drop)
+  did not refund, burning the small class's 200 µs epoch guarantee
+  while Phase-2 classes stayed re-selectable. Fix: carry the committed
+  honor (debit bytes + ordinal) out of the selector on the returned
+  selection and REFUND it in the service wrapper on progress == false
+  (add debit back, clear bit); phase1_admissions now counts progressing
+  services and a new phase1_selected_no_progress counter records the
+  refunded no-progress visits (surfaced Rust runtime -> snapshot ->
+  protocol -> Go mirror, additive + omitempty). Interface-wide TX
+  pressure means refund+retry does not differentially starve peers. T-5
+  (#4257): cos_flow_aware_buffer_limit's #717 delay_cap = rate × 5 ms
+  computed 0 for an unshaped (rate == 0) flow-fair queue, pinning the
+  aggregate cap at base and dropping a new flow's first packet (rate-0
+  twin of #704/#707). Fix: anchor the delay rate to a 10 Gb/s physical
+  link-rate floor (COS_FLOW_FAIR_UNSHAPED_DRAIN_RATE_BYTES) when
+  unshaped; shaped path bit-identical. RED-on-revert tests added for
+  both (waterfill_phase1_honor_refund_* + service_exact_guarantee_zero_
+  tx_refunds_phase1_honor; cos_flow_aware_buffer_limit_expands_for_
+  unshaped_rate0_queue). Needs a cluster CoS smoke (TX-path fairness).
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests.rs,
+  userspace-dp/src/afxdp/cos/admission.rs,
+  userspace-dp/src/afxdp/cos/admission_tests.rs,
+  userspace-dp/src/afxdp/types/cos.rs,
+  userspace-dp/src/afxdp/worker/cos/queue_row.rs,
+  userspace-dp/src/afxdp/coordinator/cos_leases.rs,
+  userspace-dp/src/protocol/cos.rs,
+  pkg/dataplane/userspace/protocol.go,
   docs/fairness-regimes.md, _Log.md

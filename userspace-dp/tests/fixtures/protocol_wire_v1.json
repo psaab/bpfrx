@@ -428,6 +428,7 @@
     "tx_ring_full_submit_stalls": 0,
     "waterfill_eligible_visits": 0,
     "waterfill_phase1_admissions": 0,
+    "waterfill_phase1_selected_no_progress": 0,
     "waterfill_phase2_admissions": 0,
     "worker_instances": 0
   },

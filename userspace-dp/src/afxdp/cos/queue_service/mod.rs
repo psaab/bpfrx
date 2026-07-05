@@ -103,6 +103,30 @@ pub(in crate::afxdp) struct ExactCoSQueueSelection {
     pub(in crate::afxdp) queue_idx: usize,
     pub(in crate::afxdp) secondary_budget: u64,
     kind: ExactCoSQueueKind,
+    /// hb166 T-2: `Some` only for a Phase-1 HONORED waterfill selection,
+    /// carrying the epoch honor that must be UNDONE if the service call
+    /// makes zero TX progress. The waterfill selector debits the Phase-1
+    /// budget and sets the honored-epoch bit at selection time; a
+    /// zero-byte TX (ring full / no free frame / build Drop) must not
+    /// burn the small class's 200 us epoch guarantee, so the service
+    /// wrapper refunds the debit + clears the bit on `progress == false`.
+    /// `None` for fast-path, Phase-2, and legacy-RR selections (which set
+    /// no honor bit and debit no budget), so they refund nothing.
+    phase1_honor: Option<Phase1HonorRefund>,
+}
+
+/// hb166 T-2: the Phase-1 waterfill honor to refund on a zero-byte-TX
+/// service failure. Captured at selection so the service wrapper can undo
+/// exactly what the selector committed, without re-deriving it.
+#[derive(Clone, Copy)]
+struct Phase1HonorRefund {
+    /// Bytes debited from `waterfill_pass1_remaining_bytes` at selection
+    /// (the queue's stable `phase1_cost`), to add back on no-progress.
+    cost_bytes: u64,
+    /// Ascending-vec ordinal `i` whose bit was set in
+    /// `waterfill_honored_epoch_bits`. `>= 64` means the ordinal was out
+    /// of the u64 bitset range and no bit was set (nothing to clear).
+    bit_ordinal: u32,
 }
 
 pub(in crate::afxdp) enum ExactCoSScratchBuild {
@@ -452,6 +476,12 @@ fn service_exact_guarantee_queue_direct_with_info(
         ),
     };
 
+    if !progress {
+        if let Some(refund) = selection.phase1_honor {
+            refund_phase1_waterfill_honor(binding, root_ifindex, selection.queue_idx, refund);
+        }
+    }
+
     Some(if progress {
         queue_id.map(|queue_id| DrainedQueueRef {
             root_ifindex,
@@ -461,6 +491,66 @@ fn service_exact_guarantee_queue_direct_with_info(
     } else {
         None
     })
+}
+
+/// hb166 T-2: undo the Phase-1 waterfill honor for a queue that was
+/// SELECTED via the Phase-1 honored walk but transmitted zero bytes (TX
+/// ring full / no free UMEM frame / frame-build Drop → service returned
+/// `progress == false`).
+///
+/// The waterfill selector commits the honor at SELECTION: it debits
+/// `waterfill_pass1_remaining_bytes` by the queue's stable `phase1_cost`
+/// and sets the queue's ascending-ordinal bit in
+/// `waterfill_honored_epoch_bits`, marking it "already took its guarantee
+/// this epoch" so BOTH phases skip it until the epoch refills (~200 us).
+/// A zero-byte TX must NOT burn that guarantee — the small class should
+/// keep its honor and retry once the interface-wide TX-ring / free-frame
+/// pressure clears. This refund restores the debit and clears the bit so
+/// the queue is re-selectable this same epoch.
+///
+/// Correctness: the debit is undone by the exact `cost_bytes` captured at
+/// selection, and nothing else mutates `waterfill_pass1_remaining_bytes`
+/// between selection and this refund on the single-threaded owner (so the
+/// `saturating_add` cannot exceed the pre-selection budget → no honor
+/// leak). A queue that DID transmit keeps its honor consumed (this runs
+/// only on `progress == false` → no double-consume). Telemetry:
+/// `phase1_admissions` was bumped at selection, so decrement it (it must
+/// count only progressing services) and record the no-progress in
+/// `phase1_selected_no_progress`.
+#[inline]
+fn refund_phase1_waterfill_honor(
+    binding: &mut BindingWorker,
+    root_ifindex: i32,
+    queue_idx: usize,
+    refund: Phase1HonorRefund,
+) {
+    if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
+        apply_phase1_waterfill_honor_refund(root, queue_idx, refund);
+    }
+}
+
+/// Root-scoped body of the Phase-1 honor refund (see
+/// `refund_phase1_waterfill_honor`), split out so it is exercisable
+/// without a full `BindingWorker`. Restores the debited budget, clears
+/// the honored-epoch bit, and corrects the telemetry.
+#[inline]
+fn apply_phase1_waterfill_honor_refund(
+    root: &mut CoSInterfaceRuntime,
+    queue_idx: usize,
+    refund: Phase1HonorRefund,
+) {
+    root.waterfill_pass1_remaining_bytes = root
+        .waterfill_pass1_remaining_bytes
+        .saturating_add(refund.cost_bytes);
+    if refund.bit_ordinal < 64 {
+        root.waterfill_honored_epoch_bits &= !(1u64 << refund.bit_ordinal);
+    }
+    if let Some(queue) = root.queues.get_mut(queue_idx) {
+        let counters = &mut queue.telemetry.waterfill_counters;
+        counters.phase1_admissions = counters.phase1_admissions.saturating_sub(1);
+        counters.phase1_selected_no_progress =
+            counters.phase1_selected_no_progress.wrapping_add(1);
+    }
 }
 
 #[cfg(test)]
@@ -757,6 +847,9 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
             queue_idx,
             secondary_budget,
             kind,
+            // Legacy Proportional RR selector: no Phase-1 waterfill honor
+            // to refund (it debits no budget and sets no honored bit).
+            phase1_honor: None,
         });
     }
     None
@@ -1098,6 +1191,15 @@ fn select_exact_cos_guarantee_queue_waterfill(
             queue_idx,
             secondary_budget: send_budget,
             kind,
+            // hb166 T-2: carry the epoch honor just committed above
+            // (budget debit at `:1104`, honored bit at `:1112`) so the
+            // service wrapper can REFUND it if this queue transmits zero
+            // bytes. `cost_bytes` is always debited; the bit was set only
+            // when `i < 64`, so the refund clears it under the same guard.
+            phase1_honor: Some(Phase1HonorRefund {
+                cost_bytes: phase1_cost,
+                bit_ordinal: i as u32,
+            }),
         });
     }
     // Phase 2: descending-rate walk over queues NOT honored in Phase 1
@@ -1214,6 +1316,9 @@ fn select_exact_cos_guarantee_queue_waterfill(
             queue_idx,
             secondary_budget: candidate_budget,
             kind,
+            // Phase 2 debits no Phase-1 budget and sets no honored bit, so
+            // a zero-byte TX here loses nothing — nothing to refund.
+            phase1_honor: None,
         });
     }
     // Genuine Phase-2 WRAP: a full descending cycle serviced nothing, so the

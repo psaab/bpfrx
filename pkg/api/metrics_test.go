@@ -1509,6 +1509,9 @@ func TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics(t *testing.T) {
 		cosWaterfillEligibleVisits: prometheus.NewDesc(
 			"xpf_userspace_cos_waterfill_eligible_visits_total", "t",
 			[]string{"ifindex", "queue_id"}, nil),
+		cosWaterfillPhase1SelectedNoProgress: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_selected_no_progress_total", "t",
+			[]string{"ifindex", "queue_id"}, nil),
 		cosWaterfillEpochs: prometheus.NewDesc(
 			"xpf_userspace_cos_waterfill_epochs_total", "t",
 			[]string{"ifindex"}, nil),
@@ -1526,10 +1529,11 @@ func TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics(t *testing.T) {
 			WaterfillPhase1BudgetBreaks: 7,
 			WaterfillMinEpochsPerWorker: 3,
 			Queues: []dpuserspace.CoSQueueStatus{{
-				QueueID:                   5,
-				WaterfillPhase1Admissions: 12,
-				WaterfillPhase2Admissions: 34,
-				WaterfillEligibleVisits:   56,
+				QueueID:                           5,
+				WaterfillPhase1Admissions:         12,
+				WaterfillPhase2Admissions:         34,
+				WaterfillEligibleVisits:           56,
+				WaterfillPhase1SelectedNoProgress: 78,
 			}},
 		}},
 	}
@@ -1563,11 +1567,12 @@ func TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics(t *testing.T) {
 	}
 
 	want := map[*prometheus.Desc]float64{
-		c.cosWaterfillPhase1Admissions:   12,
-		c.cosWaterfillPhase2Admissions:   34,
-		c.cosWaterfillEligibleVisits:     56,
-		c.cosWaterfillEpochs:             1000,
-		c.cosWaterfillPhase1BudgetBreaks: 7,
+		c.cosWaterfillPhase1Admissions:         12,
+		c.cosWaterfillPhase2Admissions:         34,
+		c.cosWaterfillEligibleVisits:           56,
+		c.cosWaterfillPhase1SelectedNoProgress: 78,
+		c.cosWaterfillEpochs:                   1000,
+		c.cosWaterfillPhase1BudgetBreaks:       7,
 	}
 	if !reflect.DeepEqual(counters, want) {
 		t.Fatalf("waterfill counter values: got %+v, want %+v", counters, want)
