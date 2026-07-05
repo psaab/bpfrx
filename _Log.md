@@ -33684,3 +33684,36 @@ top.
 - **File(s)**: pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_junos_host_direct_warn_4146_test.go,
   docs/host-inbound-service-matrix.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: screen: IPv4 L3-header extraction now FAILS CLOSED on a
+  too-short header, symmetric with the IPv6 #2146 contract (#4167,
+  fable-review-164 L-11). Before this, `extract_screen_info`'s IPv4 arm
+  was gated by `addr_family == AF_INET && l3_offset + 20 <= frame.len()`;
+  a too-short IPv4 header failed that gate, fell through neither branch,
+  and returned `Ok(defaults)` (`is_fragment=false`, `ip_ihl=5`,
+  `saw_ipv4_source_route=false`). Those defaults made
+  `check_ping_of_death` / `check_teardrop` / `check_icmp_fragment` /
+  `check_source_route` all early-return, so a malformed/truncated IPv4
+  frame passed UNSCREENED — a fail-open asymmetry vs the IPv6 arm, which
+  returns `Err(TruncatedIpv6ExtChain)` (drop) on `l3_offset + 40 >
+  frame.len()`. Fix: split the AF_INET check from the length check; a
+  base header shorter than 20 bytes, or an IHL claiming `l3_offset +
+  ihl*4 > frame.len()` (options region uncaptured → a source-route
+  option would be silently missed), now returns the new
+  `ScreenParseError::TruncatedIpv4Header` (mapped to the same
+  `ip-malformed` reason as IPv6), which the poll_stages caller already
+  treats as a screen-drop. A valid minimal 20-byte IPv4 header (IHL=5, no
+  options) is NOT over-dropped. RED-on-revert: reverting extract.rs to
+  the fail-open gate (variant kept) makes
+  `extract_screen_info_ipv4_truncated_base_header_fails_closed` and
+  `extract_screen_info_ipv4_ihl_claims_past_frame_fails_closed` FAIL
+  (expect_err panics — the malformed frame is admitted), while
+  `extract_screen_info_ipv4_minimal_header_not_overdropped` stays green.
+  Module docs updated in the extract.rs `extract_screen_info` doc comment
+  and the packet.rs `ScreenParseError` variant comment (no separate
+  markdown documents the screen extractor). FULL `cargo test --release`
+  green (3526 lib + integration suites, 0 failed); `go build ./...` clean.
+- **File(s)**: userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/packet.rs, userspace-dp/src/screen/tests.rs,
+  _Log.md

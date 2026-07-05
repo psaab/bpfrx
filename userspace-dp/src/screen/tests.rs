@@ -1357,6 +1357,93 @@ fn extract_screen_info_ipv6_truncated_base_header_fails_closed() {
 }
 
 #[test]
+fn extract_screen_info_ipv4_truncated_base_header_fails_closed() {
+    // #4167 (L-11): AF_INET metadata but the captured frame is shorter
+    // than the mandatory 20-byte IPv4 base header at l3_offset 14. Pre-
+    // fix, the `addr_family == AF_INET && l3_offset + 20 <= frame.len()`
+    // gate fell through to `Ok(defaults)` (is_fragment=false, ip_ihl=5,
+    // no source-route) and the frame passed UNSCREENED. Now it is FAIL-
+    // CLOSED, symmetric with the IPv6 base-header case above. Goes RED
+    // on revert (the Err becomes Ok → an unparseable frame is admitted).
+    let frame = vec![0u8; 14 + 15]; // 5 bytes short of the 20-byte header
+    let res = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        29,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    );
+    assert_eq!(
+        res.expect_err("short IPv4 base header must fail closed"),
+        ScreenParseError::TruncatedIpv4Header
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv4_ihl_claims_past_frame_fails_closed() {
+    // #4167 (L-11): the 20-byte base header IS captured, but the IHL
+    // field claims 6 words = 24 bytes while only 20 are present. The
+    // options region (bytes 20..24) cannot be read, so a source-route
+    // option would be silently missed. FAIL-CLOSED rather than skip the
+    // scan (the pre-fix `l3_offset + ihl_bytes <= frame.len()` guard let
+    // this fall through with saw_ipv4_source_route=false). Goes RED on
+    // revert.
+    let mut frame = vec![0u8; 14 + 20]; // exactly 20 IPv4 bytes captured
+    let ip = 14;
+    frame[ip] = 0x46; // version=4, ihl=6 → claims 24 header bytes
+    frame[ip + 9] = 6; // protocol = TCP
+    let res = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        34,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    );
+    assert_eq!(
+        res.expect_err("IHL claiming more than captured must fail closed"),
+        ScreenParseError::TruncatedIpv4Header
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv4_minimal_header_not_overdropped() {
+    // #4167 (L-11) over-drop guard: a VALID minimal 20-byte IPv4 header
+    // (IHL=5, no options) must still parse Ok — the fail-closed fix must
+    // NOT drop a legitimate runt-but-complete IPv4 packet. Frame carries
+    // exactly the 20-byte base header at l3_offset 14 and nothing more.
+    let mut frame = vec![0u8; 14 + 20];
+    let ip = 14;
+    frame[ip] = 0x45; // version=4, ihl=5 → 20-byte header, no options
+    frame[ip + 9] = 6; // protocol = TCP
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        34,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    )
+    .expect("valid minimal 20-byte IPv4 header must NOT be over-dropped");
+    assert!(!info.is_fragment, "no MF/offset → not a fragment");
+    assert!(!info.saw_ipv4_source_route, "no options → no source route");
+    assert_eq!(info.ip_ihl, 5, "IHL=5 parsed from the minimal header");
+}
+
+#[test]
 fn extract_screen_info_ipv6_truncated_hopbyhop_fails_closed() {
     // NextHdr=HOP-BY-HOP (0) at the base header, but the chain is cut
     // off before the hop-by-hop header's own 2 length bytes — the walk
