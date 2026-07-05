@@ -1554,7 +1554,15 @@ fn restore_exact_local_scratch_to_queue_head_flow_fair(
     scratch_local_tx: &mut Vec<(u64, TxRequest)>,
 ) {
     let Some(queue) = queue else {
-        scratch_local_tx.clear();
+        // #hb166 T-7: the queue was torn down mid-drain, but each scratch
+        // entry still owns a `free_tx_frames` UMEM offset popped at
+        // scratch-build time. Recycle them before dropping — the pre-fix
+        // bare `.clear()` leaked every offset (an uncounted UMEM-frame
+        // leak), unlike the FIFO sibling `settle_exact_local_fifo_submission`
+        // (via `release_exact_local_scratch_frames`).
+        while let Some((offset, _req)) = scratch_local_tx.pop() {
+            free_tx_frames.push_front(offset);
+        }
         return;
     };
     while let Some((offset, req)) = scratch_local_tx.pop() {
@@ -1623,7 +1631,13 @@ pub(in crate::afxdp) fn settle_exact_local_scratch_submission_flow_fair(
     now_ns: u64,
 ) -> (u64, u64) {
     let Some(queue) = queue else {
-        scratch_local_tx.clear();
+        // #hb166 T-7: recycle the UMEM offsets before dropping the scratch
+        // (queue torn down mid-drain) — the pre-fix `.clear()` leaked them,
+        // uncounted. Mirrors the FIFO `settle_exact_local_fifo_submission`
+        // None arm and `restore_exact_local_scratch_to_queue_head_flow_fair`.
+        while let Some((offset, _req)) = scratch_local_tx.pop() {
+            free_tx_frames.push_front(offset);
+        }
         return (0, 0);
     };
     // #1229 v7: per-bucket TX rate accounting. Capture the
