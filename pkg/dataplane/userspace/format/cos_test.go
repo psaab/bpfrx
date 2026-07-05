@@ -1104,6 +1104,64 @@ func TestFormatCoSInterfaceSummaryRendersSojournLine(t *testing.T) {
 	}
 }
 
+// #4262 (hb166 T-2): the per-queue Waterfill row must render the
+// phase1_no_progress counter alongside its phase1/phase2/eligible
+// siblings, and the row's gate must fire when only no_progress is
+// non-zero (climbing no_progress with flat phase1_admit is the
+// TX-ring-pressure signal an operator needs to see).
+func TestFormatCoSInterfaceSummaryRendersWaterfillNoProgress(t *testing.T) {
+	owner := uint32(1)
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []userspace.CoSQueueStatus{
+					{
+						QueueID:                           4,
+						OwnerWorkerID:                     &owner,
+						ForwardingClass:                   "bandwidth-10mb",
+						Priority:                          5,
+						Exact:                             true,
+						TransmitRateBytes:                 1_250_000,
+						BufferBytes:                       32 * 1024,
+						WaterfillPhase1Admissions:         12,
+						WaterfillPhase2Admissions:         34,
+						WaterfillEligibleVisits:           56,
+						WaterfillPhase1SelectedNoProgress: 78,
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	want := "Waterfill:    phase1_admit=12  phase2_admit=34  eligible_visits=56  phase1_no_progress=78"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in output:\n%s", want, out)
+	}
+
+	// The gate must fire when ONLY no_progress is non-zero — a queue that
+	// was honored but never made TX progress still needs the row.
+	q := &status.CoSInterfaces[0].Queues[0]
+	q.WaterfillPhase1Admissions = 0
+	q.WaterfillPhase2Admissions = 0
+	q.WaterfillEligibleVisits = 0
+	out = FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	if !strings.Contains(out, "phase1_no_progress=78") {
+		t.Fatalf("no_progress-only queue must still render the Waterfill row:\n%s", out)
+	}
+
+	// An all-zero waterfill queue must stay silent. Match the per-queue
+	// row marker (phase1_admit) rather than the bare "Waterfill:" prefix,
+	// which the interface-scoped epochs/breaks line also carries.
+	q.WaterfillPhase1SelectedNoProgress = 0
+	out = FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	if strings.Contains(out, "phase1_admit") {
+		t.Fatalf("idle queue must not render a per-queue Waterfill row:\n%s", out)
+	}
+}
+
 // #1829: formatSojournNS unit pin — ns/µs/ms scaling boundaries.
 func TestFormatSojournNS(t *testing.T) {
 	cases := []struct {

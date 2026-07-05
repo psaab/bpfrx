@@ -79,6 +79,11 @@ type cosQueueView struct {
 	waterfillPhase1Admissions uint64
 	waterfillPhase2Admissions uint64
 	waterfillEligibleVisits   uint64
+	// hb166 T-2: Phase-1 honored selections that made zero TX progress
+	// (budget + honored bit refunded). Climbing here with flat
+	// waterfillPhase1Admissions = TX-ring pressure eating a small class's
+	// guarantee pass (#1630/#4256).
+	waterfillPhase1SelectedNoProgress uint64
 	// #1829 Phase 1: dequeue-time sojourn telemetry (queue-scoped,
 	// MAX-merged across workers). Rendered only once the queue has
 	// recorded at least one sample (peak > 0) so idle queues stay
@@ -334,10 +339,11 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *userspace.ProcessStat
 				// above-cutoff class, or idle: no backlog/parks).
 				fmt.Fprintf(
 					&b,
-					"           Waterfill:    phase1_admit=%d  phase2_admit=%d  eligible_visits=%d\n",
+					"           Waterfill:    phase1_admit=%d  phase2_admit=%d  eligible_visits=%d  phase1_no_progress=%d\n",
 					queue.waterfillPhase1Admissions,
 					queue.waterfillPhase2Admissions,
 					queue.waterfillEligibleVisits,
+					queue.waterfillPhase1SelectedNoProgress,
 				)
 			}
 		}
@@ -360,7 +366,8 @@ func (q cosQueueView) hasDrainShapeTelemetry() bool {
 func (q cosQueueView) hasWaterfillTelemetry() bool {
 	return q.waterfillPhase1Admissions != 0 ||
 		q.waterfillPhase2Admissions != 0 ||
-		q.waterfillEligibleVisits != 0
+		q.waterfillEligibleVisits != 0 ||
+		q.waterfillPhase1SelectedNoProgress != 0
 }
 
 // #709: render a histogram percentile as microseconds. The Rust side
@@ -717,6 +724,7 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.waterfillPhase1Admissions = runtimeQueue.WaterfillPhase1Admissions
 			qv.waterfillPhase2Admissions = runtimeQueue.WaterfillPhase2Admissions
 			qv.waterfillEligibleVisits = runtimeQueue.WaterfillEligibleVisits
+			qv.waterfillPhase1SelectedNoProgress = runtimeQueue.WaterfillPhase1SelectedNoProgress
 			queueViews[qv.queueID] = qv
 		}
 	}
