@@ -18,6 +18,17 @@ use super::packet::{PROTO_TCP, ScreenPacketInfo, ScreenParseError};
 /// IDS-evasion the screen claims to defend against now that the BPF
 /// screen path (#1373/#1476) that masked it is gone.
 ///
+/// #4167 (fable-review-164 L-11): the IPv4 arm is now SYMMETRIC with the
+/// IPv6 fail-closed contract. A too-short IPv4 base header (fewer than
+/// the fixed 20 bytes captured at `l3_offset`) or an IHL that claims a
+/// header longer than the captured frame (`l3_offset + ihl*4 >
+/// frame.len()`) returns `Err(TruncatedIpv4Header)` instead of falling
+/// through to `Ok(defaults)`. The old fall-through left `is_fragment=
+/// false`/`ip_ihl=5`/`saw_ipv4_source_route=false`, so a malformed IPv4
+/// frame bypassed `check_ping_of_death`/`check_teardrop`/
+/// `check_icmp_fragment`/`check_source_route` — the IPv4 mirror of the
+/// IPv6 fail-open the #2146 hardening closed.
+///
 /// #3120: the IPv6 walk now CONTINUES past the Fragment header for a
 /// FIRST fragment (fragment offset == 0) instead of stopping at it, so a
 /// `Fragment → Destination-Options → TCP` chain (RFC 8200 permits an
@@ -65,7 +76,25 @@ pub(crate) fn extract_screen_info(
 
     let mut tcp_offset: Option<usize> = None;
 
-    if addr_family == libc::AF_INET as u8 && l3_offset + 20 <= frame.len() {
+    if addr_family == libc::AF_INET as u8 {
+        // FAIL-CLOSED (#4167 / fable-review-164 L-11): a too-short IPv4
+        // base header — fewer than the mandatory 20 bytes captured at
+        // `l3_offset` — cannot be parsed to evaluate the fragment /
+        // source-route / ICMP screens. Return an `Err` so the caller
+        // fail-closes (drop), MIRRORING the IPv6 `l3_offset + 40 >
+        // frame.len()` arm below. Before this, the too-short IPv4 case
+        // fell through to the terminal `Ok(info)` with defaults
+        // (`is_fragment=false`, `ip_ihl=5`, `saw_ipv4_source_route=
+        // false`), which made `check_ping_of_death` / `check_teardrop` /
+        // `check_icmp_fragment` / `check_source_route` all early-return
+        // and let a truncated frame pass UNSCREENED — a fail-open
+        // asymmetry vs the IPv6 #2146 fail-closed contract. A valid
+        // minimal 20-byte IPv4 header (IHL=5, no options) is NOT
+        // dropped; only a runt/malformed capture shorter than the base
+        // header its own layout requires.
+        if l3_offset + 20 > frame.len() {
+            return Err(ScreenParseError::TruncatedIpv4Header);
+        }
         // IPv4: extract IHL, total_len, frag_off from the fixed 20-byte
         // base header. frag_off is bytes 6-7, big-endian.
         let ip_hdr = &frame[l3_offset..];
@@ -77,6 +106,19 @@ pub(crate) fn extract_screen_info(
         info.is_fragment = (info.ip_frag_off & 0x3FFF) != 0;
         info.is_first_fragment =
             (info.ip_frag_off & 0x2000) != 0 && (info.ip_frag_off & 0x1FFF) == 0;
+        // FAIL-CLOSED (#4167): the header's own IHL claims a header
+        // (`ihl*4`) longer than the captured frame, so the options
+        // region — and thus any LSRR/SSRR source-route option — cannot
+        // be parsed. Drop rather than silently skip the scan below,
+        // which would leave `saw_ipv4_source_route=false` for a route
+        // the extractor was UNABLE to read (a fail-open on the
+        // `source-route` screen). Mirrors the IPv6 extension-header
+        // overshoot fail-closed check. A minimal IHL=5 header always
+        // survives — `l3_offset + 20 <= frame.len()` was just asserted.
+        let ihl_bytes = (info.ip_ihl as usize) * 4;
+        if l3_offset + ihl_bytes > frame.len() {
+            return Err(ScreenParseError::TruncatedIpv4Header);
+        }
         // #2973: scan the IPv4 options region (bytes 20..ihl*4) for an
         // actual source-route option. The `source-route` screen used to
         // drop on ANY IHL>5 (any options present), which also dropped
@@ -84,8 +126,9 @@ pub(crate) fn extract_screen_info(
         // Detect only LSRR (option type 131 = copied|control|9) and
         // SSRR (137 = copied|control|11). Bounded TLV walk; EOOL(0) ends,
         // NOP(1) is one byte, every other option is length-prefixed.
-        let ihl_bytes = (info.ip_ihl as usize) * 4;
-        if info.ip_ihl > 5 && l3_offset + ihl_bytes <= frame.len() {
+        // The options region is guaranteed captured by the fail-closed
+        // `l3_offset + ihl_bytes > frame.len()` check above.
+        if info.ip_ihl > 5 {
             const IPOPT_EOOL: u8 = 0;
             const IPOPT_NOP: u8 = 1;
             const IPOPT_LSRR: u8 = 131;

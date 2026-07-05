@@ -135,6 +135,17 @@ pub(crate) enum ScreenParseError {
     /// otherwise leave `is_first_fragment=false` and silently bypass
     /// the `syn-frag` screen.
     TruncatedIpv6ExtChain,
+    /// The IPv4 L3 header was truncated: fewer than the fixed 20 base
+    /// bytes were captured at `l3_offset`, or the header's own IHL field
+    /// claims a header (`ihl*4`) longer than the captured frame. The
+    /// symmetric IPv4 counterpart to `TruncatedIpv6ExtChain` (#4167 /
+    /// fable-review-164 L-11): before this, a too-short IPv4 header fell
+    /// through to `Ok(defaults)` (`is_fragment=false`, `ip_ihl=5`, no
+    /// source-route), so `check_ping_of_death`/`check_teardrop`/
+    /// `check_icmp_fragment`/`check_source_route` all early-returned and
+    /// the malformed frame passed unscreened — a fail-open asymmetry vs
+    /// the IPv6 #2146 fail-closed contract.
+    TruncatedIpv4Header,
 }
 
 impl ScreenParseError {
@@ -148,6 +159,7 @@ impl ScreenParseError {
     pub(crate) fn screen_reason(self) -> &'static str {
         match self {
             ScreenParseError::TruncatedIpv6ExtChain => "ip-malformed",
+            ScreenParseError::TruncatedIpv4Header => "ip-malformed",
         }
     }
 }
