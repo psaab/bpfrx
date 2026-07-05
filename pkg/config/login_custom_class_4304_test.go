@@ -97,3 +97,74 @@ func TestUndefinedLoginClassStillRejected(t *testing.T) {
 		t.Fatalf("SchemaValidate accepted an undefined login class (fail-open regression)")
 	}
 }
+
+// TestCustomLoginClassNoPrivEsc pins the #4311-review privilege-escalation fix:
+// the deceptive Junos tokens must NOT over-grant.
+//   - `reset` (restart daemons) maps to PermControl, NOT PermMaint (the
+//     destructive box verbs). RED on revert: reset->PermMaint lets a class
+//     scoped to daemon restarts run `request system zeroize`.
+//   - `rollback` (revert to a prior commit) maps to the PermView floor, NOT
+//     PermConfig (arbitrary set/delete).
+//   - only `maintenance` maps to PermMaint.
+func TestCustomLoginClassNoPrivEsc(t *testing.T) {
+	has := func(perms []LoginClassPermission, want LoginClassPermission) bool {
+		for _, p := range perms {
+			if p == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// `reset` -> PermControl, and crucially NOT PermMaint.
+	resetPerms, _ := mapJunosPermissions([]string{"reset"})
+	if !has(resetPerms, PermControl) {
+		t.Errorf("permissions reset should map to PermControl; got %v", resetPerms)
+	}
+	if has(resetPerms, PermMaint) {
+		t.Errorf("PRIV-ESC: permissions reset must NOT map to PermMaint (would grant reboot/zeroize); got %v", resetPerms)
+	}
+	if has(resetPerms, PermAll) {
+		t.Errorf("permissions reset must NOT map to PermAll; got %v", resetPerms)
+	}
+
+	// `rollback` -> PermView floor, NOT PermConfig.
+	rbPerms, _ := mapJunosPermissions([]string{"rollback"})
+	if has(rbPerms, PermConfig) {
+		t.Errorf("permissions rollback must NOT map to PermConfig; got %v", rbPerms)
+	}
+	if !has(rbPerms, PermView) {
+		t.Errorf("permissions rollback should map to the PermView floor; got %v", rbPerms)
+	}
+
+	// `maintenance` is the ONLY token that legitimately maps to PermMaint.
+	maintPerms, _ := mapJunosPermissions([]string{"maintenance"})
+	if !has(maintPerms, PermMaint) {
+		t.Errorf("permissions maintenance should map to PermMaint; got %v", maintPerms)
+	}
+}
+
+// TestCustomLoginClassDenyCommandsAdvisory pins FIX 2: a class with
+// deny-commands must get an advisory that explicitly states the class becomes
+// MORE PERMISSIVE than the Junos config (not merely "not enforced").
+func TestCustomLoginClassDenyCommandsAdvisory(t *testing.T) {
+	tree := buildTree4303(t, []string{
+		"set system login class limited permissions all",
+		`set system login class limited deny-commands "request system reboot"`,
+		"set system login user carol class limited",
+	})
+	c, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	found := false
+	for _, w := range c.Warnings {
+		if strings.Contains(w, "limited") && strings.Contains(w, "deny-commands") &&
+			strings.Contains(w, "MORE PERMISSIVE") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a MORE-PERMISSIVE deny-commands advisory for class limited; warnings=%v", c.Warnings)
+	}
+}

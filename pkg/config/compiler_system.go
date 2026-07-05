@@ -885,18 +885,36 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 			sort.Strings(folded)
 			msg += fmt.Sprintf("; fine-grained permissions [%s] folded to view-only (xpf has no finer bucket)", strings.Join(folded, " "))
 		}
+		// Neutral not-enforced knobs (allow-* is a whitelist EXTENSION and
+		// idle-timeout is a session-lifetime knob; dropping them cannot make
+		// the class more permissive than the source config).
 		var inert []string
-		if lc.AllowCommands != "" || lc.DenyCommands != "" {
-			inert = append(inert, "allow-commands/deny-commands")
+		if lc.AllowCommands != "" {
+			inert = append(inert, "allow-commands")
 		}
-		if lc.AllowConfiguration != "" || lc.DenyConfiguration != "" {
-			inert = append(inert, "allow-configuration/deny-configuration")
+		if lc.AllowConfiguration != "" {
+			inert = append(inert, "allow-configuration")
 		}
 		if lc.IdleTimeout > 0 {
 			inert = append(inert, "idle-timeout")
 		}
 		if len(inert) > 0 {
-			msg += fmt.Sprintf("; %s accepted but NOT enforced by xpf's coarse RBAC", strings.Join(inert, " + "))
+			msg += fmt.Sprintf("; %s accepted but NOT enforced by xpf's coarse RBAC", strings.Join(inert, "/"))
+		}
+		// SECURITY: deny-commands / deny-configuration are BLACKLISTS. Dropping
+		// them makes the class MORE PERMISSIVE than the Junos config — the
+		// denied verbs stay ALLOWED. State that explicitly so the operator
+		// knows the posture is WEAKER, not merely "not enforced" (per-command
+		// deny enforcement is a larger follow-up).
+		var deny []string
+		if lc.DenyCommands != "" {
+			deny = append(deny, "deny-commands")
+		}
+		if lc.DenyConfiguration != "" {
+			deny = append(deny, "deny-configuration")
+		}
+		if len(deny) > 0 {
+			msg += fmt.Sprintf("; WARNING: %s is NOT enforced, so this class is MORE PERMISSIVE than the Junos config (denied commands/configuration remain ALLOWED); per-command deny enforcement is a follow-up", strings.Join(deny, "/"))
 		}
 		warnings = append(warnings, msg)
 	}

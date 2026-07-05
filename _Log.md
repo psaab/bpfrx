@@ -1,3 +1,33 @@
+## 2026-07-05 — system: fable-167 PR #4311 review fixes (S-2 priv-esc + deny-commands advisory + S-4 sshd -t gate)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Hostile review of PR #4311 found a REAL privilege escalation
+    in the S-2 permission mapping + two hardenings.
+    (FIX 1, priv-esc) `mapJunosPermissions` (types_system.go) mapped Junos
+    `reset` → PermMaint and `rollback` → PermConfig — over-grants. `reset` is
+    daemon-restart (`restart <process>`), NOT the destructive box verbs
+    PermMaint gates (reboot/halt/power-off/zeroize + cluster failover), so a
+    class `permissions reset` could `request system zeroize`. Fixed: `reset`
+    → PermControl, `rollback` → PermView floor; only `maintenance` → PermMaint,
+    only `configure` → PermConfig.
+    (FIX 2, deny-commands advisory) `all` + `deny-commands X` means
+    "everything EXCEPT X"; xpf drops deny-commands so the class is MORE
+    PERMISSIVE than the source config. Reframed the advisory
+    (`loginClassAdvisoryWarnings`) to state deny-commands/deny-configuration
+    make the class MORE PERMISSIVE (denied verbs stay ALLOWED) as an explicit
+    WARNING, separated from the neutral allow-*/idle-timeout not-enforced note.
+    (FIX 3, sshd -t gate) `applySSHConfig` (daemon_system.go) rendered
+    Ciphers/MACs/KexAlgorithms verbatim and relied on the base-image
+    ExecReload=sshd -t. Added `sshdValidateCmd` (`sshd -t`) run after writing
+    the drop-in but BEFORE the reload; on failure the drop-in is reverted and
+    the reload is SKIPPED, so a cipher typo cannot SIGHUP sshd into an invalid
+    config and drop its listener. Self-contained lockout protection.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_system.go,
+    pkg/daemon/daemon_system.go, pkg/daemon/daemon_ssh_test.go,
+    pkg/config/login_custom_class_4304_test.go,
+    pkg/cli/permissions_custom_class_4304_test.go, docs/system-login.md,
+    docs/config-schema.md
+
 ## 2026-07-05 — system/SNMP: fable-167 S-5 accept-with-advisory for grouped inert knobs (#4306)
 
 - **Timestamp**: 2026-07-05

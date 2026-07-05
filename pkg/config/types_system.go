@@ -669,6 +669,20 @@ type LoginClass struct {
 // foldedToView so the compiler advisory can list what is coarsely mapped. The
 // PermView floor lets the class holder log in and view even when no token maps
 // precisely; `unauthorized` (empty token set) grants nothing.
+//
+// CRITICAL (no privilege escalation, review of #4311): the mapping must never
+// grant MORE than the Junos token permits. Two Junos tokens are deceptive:
+//   - `reset` permits restarting software DAEMONS (`restart <process>`), NOT
+//     rebooting/halting/zeroizing the box. It must map to PermControl, NOT
+//     PermMaint — PermMaint is exactly the destructive box verbs (request
+//     system reboot/halt/power-off/zeroize + chassis cluster failover), which
+//     `reset` does not authorize.
+//   - `rollback` permits reverting to a prior commit only, NOT arbitrary
+//     set/delete. It must map to the PermView floor, NOT PermConfig (which
+//     gates entering configure to make arbitrary changes).
+//
+// Only `maintenance` maps to PermMaint (the correct whole-box-destructive
+// grant), and only `configure` maps to PermConfig.
 func mapJunosPermissions(tokens []string) (perms []LoginClassPermission, foldedToView []string) {
 	have := map[LoginClassPermission]bool{}
 	add := func(p LoginClassPermission) {
@@ -681,14 +695,21 @@ func mapJunosPermissions(tokens []string) (perms []LoginClassPermission, foldedT
 		switch tok {
 		case "all", "super-user":
 			add(PermAll)
-		case "maintenance", "reset":
+		case "maintenance":
 			add(PermMaint)
 		case "clear":
 			add(PermClear)
-		case "control":
+		case "control", "reset":
+			// `reset` = restart daemons (restart <process>); NOT the
+			// box-destructive reboot/halt/zeroize verbs that PermMaint gates.
 			add(PermControl)
-		case "configure", "rollback":
+		case "configure":
 			add(PermConfig)
+		case "rollback":
+			// `rollback` reverts to a prior commit only, not arbitrary
+			// set/delete; fold to the least-privilege view floor rather than
+			// PermConfig.
+			add(PermView)
 		case "view", "view-configuration":
 			add(PermView)
 		default:

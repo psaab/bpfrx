@@ -115,6 +115,11 @@ type sshdSeamRecorder struct {
 	// writes succeed. failNthWrite<=0 means every write returns writeErr.
 	writeErr     error
 	failNthWrite int
+
+	// validateErr, when set, makes `sshd -t` validation fail (models a bad
+	// Ciphers/MACs/KexAlgorithms spelling). validates counts invocations.
+	validateErr error
+	validates   int
 }
 
 // installSSHDSeam swaps the package-level seam vars to route through the
@@ -128,6 +133,7 @@ func installSSHDSeam(t *testing.T, r *sshdSeamRecorder) {
 	origRemove := sshdRemoveFile
 	origMkdir := sshdMkdirAll
 	origReload := sshdReloadCmd
+	origValidate := sshdValidateCmd
 
 	sshdConfPath = "/test/sshd_config.d/xpf.conf"
 	sshdReadFile = func(string) ([]byte, error) {
@@ -161,6 +167,13 @@ func installSSHDSeam(t *testing.T, r *sshdSeamRecorder) {
 		return nil
 	}
 	sshdMkdirAll = func(string, os.FileMode) error { return nil }
+	sshdValidateCmd = func() ([]byte, error) {
+		r.validates++
+		if r.validateErr != nil {
+			return []byte("bad configuration"), r.validateErr
+		}
+		return nil, nil
+	}
 	sshdReloadCmd = func() ([]byte, error) {
 		r.reloads++
 		if r.reloadErr != nil && (r.failNthReload <= 0 || r.reloads == r.failNthReload) {
@@ -176,6 +189,7 @@ func installSSHDSeam(t *testing.T, r *sshdSeamRecorder) {
 		sshdRemoveFile = origRemove
 		sshdMkdirAll = origMkdir
 		sshdReloadCmd = origReload
+		sshdValidateCmd = origValidate
 	})
 }
 
@@ -448,5 +462,94 @@ func TestBuildSSHDConfigHardeningKnobs(t *testing.T) {
 func TestBuildSSHDConfigClientAlivePresence(t *testing.T) {
 	if got := buildSSHDConfig(&config.SSHServiceConfig{ClientAliveCountMax: 0}); strings.Contains(got, "ClientAliveCountMax") {
 		t.Errorf("unset ClientAliveCountMax should not render; got:\n%s", got)
+	}
+}
+
+// TestApplySSHConfig_ValidationGateBlocksReload is the RED-on-revert guard for
+// the #4311 review's sshd -t gate: a bad Ciphers/MACs/KexAlgorithms line must
+// be caught by `sshd -t` BEFORE the reload, so the drop-in is reverted to its
+// prior content and the reload (SIGHUP) is never issued — the running sshd is
+// never disturbed. Pre-gate, the bad content went straight to reload and could
+// drop sshd's listener → SSH lockout. Reverting the gate (dropping sshdValidateCmd)
+// makes this go RED: reload is called and the bad content is applied.
+func TestApplySSHConfig_ValidationGateBlocksReload(t *testing.T) {
+	priorContent := buildSSHDConfig(&config.SSHServiceConfig{RootLogin: "deny"})
+	r := &sshdSeamRecorder{
+		present:     []byte(priorContent),
+		validateErr: errors.New("sshd: unsupported cipher"),
+	}
+	installSSHDSeam(t, r)
+
+	d := &Daemon{}
+	// A bad cipher: write succeeds, sshd -t fails, reload must be skipped.
+	d.applySSHConfig(sshConfig(&config.SSHServiceConfig{
+		RootLogin: "deny",
+		Ciphers:   []string{"aes999-bogus"},
+	}))
+
+	if r.validates != 1 {
+		t.Errorf("sshd -t should be invoked exactly once, got %d", r.validates)
+	}
+	if r.reloads != 0 {
+		t.Errorf("reload MUST be skipped when validation fails, got %d reload(s)", r.reloads)
+	}
+	if r.present == nil {
+		t.Fatalf("drop-in removed on validation failure but a prior existed; want prior restored")
+	}
+	if string(r.present) != priorContent {
+		t.Fatalf("drop-in not reverted to prior after validation failure\n got: %q\nwant: %q", r.present, priorContent)
+	}
+	if strings.Contains(string(r.present), "aes999-bogus") {
+		t.Errorf("bad cipher left on disk after validation failure: %q", r.present)
+	}
+}
+
+// TestApplySSHConfig_ValidationGateRemovesWhenNoPrior verifies the no-prior
+// branch: when validation fails and there was no prior drop-in, the just-written
+// bad drop-in is REMOVED (not left on disk to break the next sshd restart).
+func TestApplySSHConfig_ValidationGateRemovesWhenNoPrior(t *testing.T) {
+	r := &sshdSeamRecorder{
+		present:     nil, // no drop-in on disk
+		validateErr: errors.New("sshd: unsupported MAC"),
+	}
+	installSSHDSeam(t, r)
+
+	d := &Daemon{}
+	d.applySSHConfig(sshConfig(&config.SSHServiceConfig{
+		RootLogin: "allow",
+		MACs:      []string{"hmac-bogus"},
+	}))
+
+	if r.reloads != 0 {
+		t.Errorf("reload MUST be skipped when validation fails, got %d", r.reloads)
+	}
+	if r.present != nil {
+		t.Fatalf("bad drop-in left on disk after validation failure with no prior; want removed: %q", r.present)
+	}
+	if r.removed != 1 {
+		t.Errorf("Remove should be called once to clear the bad drop-in, got %d", r.removed)
+	}
+}
+
+// TestApplySSHConfig_ValidationPassesThenReloads confirms the happy path is
+// unchanged: valid content passes sshd -t and IS reloaded.
+func TestApplySSHConfig_ValidationPassesThenReloads(t *testing.T) {
+	r := &sshdSeamRecorder{present: nil} // no prior; validateErr nil = passes
+	installSSHDSeam(t, r)
+
+	d := &Daemon{}
+	d.applySSHConfig(sshConfig(&config.SSHServiceConfig{
+		RootLogin: "deny",
+		Ciphers:   []string{"aes256-ctr"},
+	}))
+
+	if r.validates != 1 {
+		t.Errorf("sshd -t should be invoked once, got %d", r.validates)
+	}
+	if r.reloads != 1 {
+		t.Errorf("reload should run once after validation passes, got %d", r.reloads)
+	}
+	if r.present == nil || !strings.Contains(string(r.present), "Ciphers aes256-ctr") {
+		t.Fatalf("valid drop-in should be applied; got %q", r.present)
 	}
 }

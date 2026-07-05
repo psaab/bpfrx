@@ -4786,10 +4786,18 @@ blocking the whole config. This is accept-with-advisory now:
   tokens onto the coarse xpf model via `mapJunosPermissions`
   (`LoginClass.MappedPermissions`). Only whole-box tokens map precisely;
   everything else folds DOWN to a PermView floor (never over-grants
-  config/control/maint from a narrow subsystem token).
+  config/control/maint from a narrow subsystem token). **No privilege
+  escalation** (#4311 review): `reset` = restart daemons → PermControl (NOT
+  PermMaint — the destructive reboot/halt/zeroize verbs); `rollback` = revert
+  to a prior commit → PermView floor (NOT PermConfig); only `maintenance` →
+  PermMaint and only `configure` → PermConfig.
 - **advisory** — `loginClassAdvisoryWarnings` emits one `cfg.Warnings` entry
-  per custom class naming the mapped permissions and the recognized-but-not-
-  enforced sub-statements (allow/deny-commands, idle-timeout).
+  per custom class naming the mapped permissions. `allow-commands` /
+  `allow-configuration` / `idle-timeout` are named as accepted-but-not-enforced
+  (neutral). `deny-commands` / `deny-configuration` get an explicit `WARNING`
+  that, because they are unenforced blacklists, the class is **more permissive
+  than the Junos config** (the denied verbs stay allowed) — a weaker posture,
+  not merely "unenforced". Full per-command deny enforcement is a follow-up.
 - **runtime** — `pkg/cli/permissions.go` `resolveClassPerms` consults the
   built-ins first, then `store.ActiveConfig().System.Login.Classes`, so a
   custom-class user is enforced against the mapped permissions instead of
@@ -4819,8 +4827,16 @@ MAC defaults even when the operator configured hardened algorithms.
   0 is a meaningful sshd value.
 - **runtime** (`daemon_system.go buildSSHDConfig`) — renders `Ciphers`, `MACs`,
   `MaxStartups` (connection-limit's nearest sshd equivalent),
-  `ClientAliveInterval`, `ClientAliveCountMax`. A bad value fails the sshd
-  reload, which `applySSHConfig` reverts.
+  `ClientAliveInterval`, `ClientAliveCountMax`.
+- **validation gate** (#4311 review) — `applySSHConfig` runs `sshd -t`
+  (`sshdValidateCmd`) on the merged config AFTER writing the drop-in but BEFORE
+  the reload. A bad `Ciphers`/`MACs`/`KexAlgorithms` spelling fails `sshd -t`,
+  the drop-in is reverted to its prior content (or removed when there was
+  none), and the reload (SIGHUP) is **skipped entirely** — so a cipher typo can
+  never make sshd re-exec into an invalid config and drop its listener (SSH
+  lockout on the appliance). This makes the lockout protection self-contained
+  rather than relying on the base-image `ExecReload=sshd -t`; the reload-failure
+  revert stays as a backstop.
 - **advisory** — `protocol-version` is accept-with-advisory: modern sshd is
   SSH-2 only, so `v2` is a silent no-op and any other value emits a
   `cfg.Warnings` advisory (`sshHardeningAdvisoryWarnings`). `rate-limit` has no
@@ -4828,7 +4844,9 @@ MAC defaults even when the operator configured hardened algorithms.
   advisory scan.
 - **tests** — `pkg/config/compiler_ssh_hardening_4305_test.go`,
   `pkg/daemon/daemon_ssh_test.go` (`TestBuildSSHDConfigHardeningKnobs`,
-  `TestBuildSSHDConfigClientAlivePresence`).
+  `TestBuildSSHDConfigClientAlivePresence`, and the validation-gate guards
+  `TestApplySSHConfig_ValidationGateBlocksReload` /
+  `...ValidationGateRemovesWhenNoPrior` / `...ValidationPassesThenReloads`).
 
 ## Grouped system/SNMP inert knobs — accept-with-advisory (#4306 S-5)
 

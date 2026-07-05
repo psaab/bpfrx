@@ -66,3 +66,44 @@ func TestCustomLoginClassRuntimeRBAC(t *testing.T) {
 		t.Errorf("viewer-plus (view/clear only) SHOULD redact secrets")
 	}
 }
+
+// TestCustomLoginClassResetCannotZeroize is the runtime half of the #4311
+// priv-esc fix: a class with `permissions reset` (daemon restart) must be able
+// to run benign control verbs but must NOT be able to run the destructive
+// maintenance verbs (request system reboot/halt/power-off/zeroize + chassis
+// cluster failover). Pre-fix reset->PermMaint let those through.
+func TestCustomLoginClassResetCannotZeroize(t *testing.T) {
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure(): %v", err)
+	}
+	sets := []string{
+		"set system login class daemon-op permissions reset",
+		"set system login user dan class daemon-op",
+	}
+	if _, err := store.LoadSet(strings.Join(sets, "\n")); err != nil {
+		t.Fatalf("LoadSet(): %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit(): %v", err)
+	}
+
+	c := &CLI{store: store, userClass: "daemon-op"}
+
+	// Destructive maintenance verbs MUST be denied (reset != maintenance).
+	for _, parts := range [][]string{
+		{"request", "system", "reboot"},
+		{"request", "system", "zeroize"},
+		{"request", "system", "halt"},
+		{"request", "chassis", "cluster", "failover", "redundancy-group", "1", "node", "0"},
+	} {
+		if err := c.checkPermission(parts); err == nil {
+			t.Errorf("PRIV-ESC: %q ALLOWED for `permissions reset` class (want denied — that is maintenance, not reset)",
+				strings.Join(parts, " "))
+		}
+	}
+	// A benign control verb IS allowed (reset -> PermControl).
+	if err := c.checkPermission([]string{"request", "session"}); err != nil {
+		t.Errorf("benign control verb denied for `permissions reset` class: %v", err)
+	}
+}
