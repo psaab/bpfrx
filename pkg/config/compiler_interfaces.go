@@ -75,6 +75,24 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 			ifc.FlexibleVlanTagging = true
 		}
 
+		// #4308 (fable-review-167 I-3): accepted-only interface-level parity
+		// knobs — typed + compiled so they stop silently vanishing, with a
+		// commit-time advisory (validateInterfaceParityWarnings) noting they
+		// are not enforced yet.
+		if nvNode := child.FindChild("native-vlan-id"); nvNode != nil {
+			if v := nodeVal(nvNode); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					ifc.NativeVlanID = n
+				}
+			}
+		}
+		if child.FindChild("gratuitous-arp-reply") != nil {
+			ifc.GratuitousARPReply = true
+		}
+		if child.FindChild("no-gratuitous-arp-request") != nil {
+			ifc.NoGratuitousARPRequest = true
+		}
+
 		// Check for encapsulation
 		if encapNode := child.FindChild("encapsulation"); encapNode != nil {
 			ifc.Encapsulation = nodeVal(encapNode)
@@ -387,6 +405,17 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 							if outputNode := filterNode.FindChild("output"); outputNode != nil {
 								unit.FilterOutputV4 = nodeVal(outputNode)
 							}
+						}
+						// #4308 (fable-review-167 I-3): accepted-only family
+						// inet parity knobs — typed + compiled so they stop
+						// silently vanishing, with a commit-time advisory
+						// (validateInterfaceParityWarnings) noting they are not
+						// enforced yet.
+						if unNode := afNode.FindChild("unnumbered-address"); unNode != nil {
+							unit.UnnumberedInet = nodeVal(unNode)
+						}
+						if afNode.FindChild("targeted-broadcast") != nil {
+							unit.TargetedBroadcast = true
 						}
 						// Surface A router/interface-address DDNS (#2691 P2): the
 						// per-family `dynamic-dns` binding may appear as a child node

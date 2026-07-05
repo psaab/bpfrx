@@ -340,6 +340,11 @@ type RAInterfaceConfig struct {
 	NAT64PrefixLife    int      // PREF64 lifetime in seconds (0 = default)
 	LinkMTU            int      // advertised link MTU, 0 = omit
 	SourceLinkLocal    string   // explicit link-local to use as RA source (overrides auto-selected)
+	// ReachableTime / RetransTimer are the RFC 4861 §4.2 RA header fields,
+	// in milliseconds (#4307). 0 = "unspecified" (host uses its own
+	// default), which is the pre-#4307 wire behavior.
+	ReachableTime int // reachable-time (ms), 0 = unspecified
+	RetransTimer  int // retransmit-timer (ms), 0 = unspecified
 }
 
 // RAPrefix defines a prefix advertised via RA.

@@ -601,8 +601,15 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 
 	var clients []*logging.SyslogClient
 	for _, host := range cfg.System.Syslog.Hosts {
+		// #4303 S-1: honor `host <h> port <n>` and `source-address <ip>`.
+		// Both were previously misparsed into bogus facility entries and
+		// never reached the client; the port stayed pinned at 514 and the
+		// source bind was ignored.
 		port := 514
-		c, err := logging.NewSyslogClient(host.Address, port)
+		if host.Port > 0 {
+			port = host.Port
+		}
+		c, err := logging.NewSyslogClientWithSource(host.Address, port, host.SourceAddress)
 		if err != nil {
 			slog.Warn("failed to create system syslog client",
 				"host", host.Address, "err", err)
@@ -1040,6 +1047,16 @@ var (
 	sshdReloadCmd  = func() ([]byte, error) {
 		return runCommandTimeout("systemctl", "reload", "sshd")
 	}
+	// sshdValidateCmd runs `sshd -t`, which parses the full merged sshd
+	// configuration (/etc/ssh/sshd_config plus the sshd_config.d drop-ins,
+	// including the xpf drop-in) and fails on a bad Ciphers/MACs/
+	// KexAlgorithms spelling or any other syntax error. applySSHConfig gates
+	// the reload on this passing so a cipher/MAC typo never reaches a SIGHUP
+	// that could drop sshd's listener (#4311 review). Overridden in
+	// daemon_ssh_test.go.
+	sshdValidateCmd = func() ([]byte, error) {
+		return runCommandTimeout("/usr/sbin/sshd", "-t")
+	}
 )
 
 // applySSHConfig configures sshd from system { services { ssh { ... } } }.
@@ -1119,31 +1136,51 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 		return
 	}
 
-	// Reload sshd to pick up changes. On failure the drop-in we just wrote is
-	// syntactically/semantically bad (e.g. an invalid key-exchange algorithm)
-	// and would break the next sshd RESTART, so revert it to the prior state:
-	// restore the previous content, or remove the file if there was none.
-	if out, err := sshdReloadCmd(); err != nil {
-		slog.Error("failed to reload sshd",
-			"err", err, "output", strings.TrimSpace(string(out)))
-		// Revert. Only restore the prior content when we actually read it
-		// (priorReadable); an unreadable-but-present prior is unknown, so
-		// fail safe by removing the drop-in instead of restoring garbage.
+	// revertDropIn restores the drop-in to its prior state after a validation
+	// or reload failure: restore the previously-read content, else remove the
+	// file. Only restore the prior content when we actually read it
+	// (priorReadable); an unreadable-but-present prior is unknown, so fail safe
+	// by removing the drop-in instead of restoring garbage. No drop-in is safer
+	// than the known-bad content we just wrote (which would break the next sshd
+	// restart).
+	revertDropIn := func(reason string) {
 		if priorReadable {
 			if rerr := sshdWriteFile(sshdConfPath, prior, 0644); rerr != nil {
-				// Restoring the prior content failed too. No drop-in is safer
-				// than the known-bad content we just wrote (which would break
-				// the next sshd restart), so fall back to removing the file.
-				slog.Warn("failed to restore prior sshd config after reload failure; removing drop-in", "err", rerr)
+				slog.Warn("failed to restore prior sshd config; removing drop-in",
+					"reason", reason, "err", rerr)
 				if rmErr := sshdRemoveFile(sshdConfPath); rmErr != nil && !os.IsNotExist(rmErr) {
 					slog.Warn("failed to remove bad sshd config after failed restore", "err", rmErr)
 				}
 			}
 		} else {
 			if rerr := sshdRemoveFile(sshdConfPath); rerr != nil && !os.IsNotExist(rerr) {
-				slog.Warn("failed to remove bad sshd config after reload failure", "err", rerr)
+				slog.Warn("failed to remove bad sshd config", "reason", reason, "err", rerr)
 			}
 		}
+	}
+
+	// Validate the merged sshd config BEFORE reloading (#4311 review). A bad
+	// Ciphers/MACs/KexAlgorithms line reaching a reload (SIGHUP) can make sshd
+	// re-exec into an invalid config and drop its listener → SSH lockout on the
+	// appliance. `sshd -t` catches the typo first. On failure revert the
+	// drop-in and SKIP the reload entirely: the running sshd is never disturbed
+	// and the next restart reads the good prior config. This makes the
+	// cipher-typo-lockout protection self-contained rather than relying on the
+	// base-image ExecReload=sshd -t.
+	if out, err := sshdValidateCmd(); err != nil {
+		slog.Error("sshd config validation failed; SSH drop-in not applied",
+			"err", err, "output", strings.TrimSpace(string(out)))
+		revertDropIn("validation-failed")
+		return
+	}
+
+	// Reload sshd to pick up changes. Validation passed, so this should
+	// succeed; the reload-failure revert stays as a backstop (e.g. a runtime
+	// reload error unrelated to config syntax).
+	if out, err := sshdReloadCmd(); err != nil {
+		slog.Error("failed to reload sshd",
+			"err", err, "output", strings.TrimSpace(string(out)))
+		revertDropIn("reload-failed")
 		// Best-effort reload of the restored content so the running sshd is
 		// not left referencing a drop-in we just rewrote/removed underneath
 		// it. The original reload already failed; a second failure here is
@@ -1185,6 +1222,27 @@ func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
 	}
 	if len(ssh.KeyExchange) > 0 {
 		lines = append(lines, "KexAlgorithms "+strings.Join(ssh.KeyExchange, ","))
+	}
+	// #4305 S-4: sshd hardening knobs. sshd validates the algorithm
+	// spellings and numeric ranges at reload, so xpf renders them verbatim
+	// (a bad value fails the reload, which applySSHConfig reverts).
+	if len(ssh.Ciphers) > 0 {
+		lines = append(lines, "Ciphers "+strings.Join(ssh.Ciphers, ","))
+	}
+	if len(ssh.MACs) > 0 {
+		lines = append(lines, "MACs "+strings.Join(ssh.MACs, ","))
+	}
+	if ssh.ConnectionLimit > 0 {
+		// Junos `connection-limit` bounds concurrent sessions; sshd's
+		// nearest knob is MaxStartups (concurrent unauthenticated
+		// connections). Not an exact equivalent, but the standard mapping.
+		lines = append(lines, fmt.Sprintf("MaxStartups %d", ssh.ConnectionLimit))
+	}
+	if ssh.ClientAliveIntervalSet {
+		lines = append(lines, fmt.Sprintf("ClientAliveInterval %d", ssh.ClientAliveInterval))
+	}
+	if ssh.ClientAliveCountMaxSet {
+		lines = append(lines, fmt.Sprintf("ClientAliveCountMax %d", ssh.ClientAliveCountMax))
 	}
 	if len(lines) == 0 {
 		return ""

@@ -174,6 +174,30 @@ inline-interface consumer treats `overrides` as a property boundary so it
 is not swallowed into the interface list (#2076 / dual-AST harness case
 `forwarding-options-dhcp-relay-overrides`).
 
+### Additional overrides (#4309)
+
+```
+set forwarding-options dhcp-relay group <g> overrides maximum-hop-count <1..16>
+set forwarding-options dhcp-relay group <g> overrides forward-only
+set forwarding-options dhcp-relay group <g> overrides relay-agent-option
+```
+
+- **`maximum-hop-count` — ENFORCED.** The relay drops a client request
+  whose BOOTP `hops` field has reached this value (RFC 1542 §4.1.1 loop
+  protection), and increments `RelayStats.RequestsDroppedMaxHops`.
+  Previously the limit was hardcoded at 16; that stays the default when
+  the override is unset (`resolveMaxHopCount`). Compiles to
+  `DHCPRelayGroup.MaximumHopCount` and flows into `relaySpec.maxHopCount`
+  (a change restarts the per-interface relay).
+- **`forward-only` — accepted-only.** The xpf relay already forwards
+  statelessly (no persistent per-client binding), so this matches the
+  default behavior. Typed + compiled so it stops silently vanishing; a
+  commit-time advisory (`validateDHCPRelayParityWarnings`) notes it is
+  accepted and inert.
+- **`relay-agent-option` — accepted-only.** The relay ALWAYS inserts
+  Option 82 (`circuit-id`); this knob is accepted and matches the
+  default, with the same accepted-only advisory.
+
 ### IPv6 / DHCPv6 parity
 
 There is **no DHCPv6 relay agent** in the codebase, and DHCPv6 (RFC 8415)

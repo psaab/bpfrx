@@ -1723,6 +1723,59 @@ reserved for whole-dataplane selection where a rewrite shim
   configs). New validators `ValidateIPv6Address` / `ValidatePREF64CIDR`
   live in `schema_validators.go`. Regression coverage:
   `pkg/config/schema_validate_2497_test.go`.
+- **#4307 (router-advertisement reachable-time / retransmit-timer,
+  fable-review-167 I-2):** the RFC 4861 §4.2 Reachable Time and Retrans
+  Timer RA header fields had no schema leaf, no `RAInterfaceConfig`
+  field, and the sender never set them, so both went on the wire as 0
+  ("unspecified") and hosts could not be tuned via RA. Added
+  `reachable-time` / `retransmit-timer` as typed millisecond leaves
+  (`ValidateInteger(0, raReachableRetransMaxMillis)` — the 32-bit ms
+  field maximum so an over-large value does not silently wrap in ndp's
+  `Duration/time.Millisecond -> uint32`), compiled into
+  `RAInterfaceConfig.ReachableTime` / `RetransTimer`, and set on
+  `ndp.RouterAdvertisement.ReachableTime` / `RetransmitTimer` in
+  `pkg/ra/sender.go buildRA`. 0 keeps the pre-#4307 unspecified default.
+  Coverage: `pkg/config/parser_routing_test.go` (compile) +
+  `pkg/ra/sender_marshal_4307_test.go` (wire round-trip).
+- **#4308 (interface ARP/addressing parity knobs, fable-review-167
+  I-3):** five common Junos interface knobs were accepted by the
+  permissive parser but never modeled or compiled, so they silently
+  vanished at commit. They are now typed leaves + compiled fields +
+  carry an accepted-only advisory (the #2078 doctrine), because full
+  enforcement needs design/cluster work:
+  - `native-vlan-id <id>` (interface-level, `ValidateInteger(1, 4094)`)
+    — folds into the QinQ tagging pipeline (#2354).
+  - `gratuitous-arp-reply` / `no-gratuitous-arp-request`
+    (interface-level flags) — map to per-interface ARP sysctls the
+    interface apply path does not write yet.
+  - `family inet unnumbered-address <interface>` — needs a networkd
+    borrow-address implementation (resolve the donor unit's address).
+  - `family inet targeted-broadcast` — needs dataplane directed-
+    broadcast forwarding.
+  Compiled into `InterfaceConfig.{NativeVlanID,GratuitousARPReply,
+  NoGratuitousARPRequest}` and `InterfaceUnit.{UnnumberedInet,
+  TargetedBroadcast}`; `validateInterfaceParityWarnings`
+  (compiler_validate_warn.go) emits one deterministic per-interface
+  accepted-only warning at commit. Coverage:
+  `pkg/config/interface_parity_4308_test.go` (compile + advisory +
+  no-false-positive).
+- **#4309 (DHCP relay overrides, fable-review-167 I-4):** the dhcp-relay
+  `overrides` block modeled only `always-broadcast`; three standard
+  relay knobs were silently dropped. Added under group `overrides`:
+  - `maximum-hop-count <1..16>` (`ValidateInteger(1, 16)`) — **enforced**.
+    The relay's hop limit was hardcoded at 16; it is now the group's
+    configured value (default 16), a request at the limit is dropped, and
+    `RelayStats.RequestsDroppedMaxHops` counts the drop. Compiled into
+    `DHCPRelayGroup.MaximumHopCount` and flows into `relaySpec.maxHopCount`.
+  - `forward-only` / `relay-agent-option` — **accepted-only**. The xpf
+    relay already forwards statelessly and always inserts Option 82, so
+    each matches the default; compiled into `DHCPRelayGroup.ForwardOnly`
+    / `RelayAgentOption` with a commit-time accepted-only advisory
+    (`validateDHCPRelayParityWarnings`). Both AST shapes handled (inline
+    flat-set Keys and block-form children). Coverage:
+    `pkg/config/compiler_dhcp_relay_overrides_test.go` (compile flat-set
+    + merged-Keys value + block form + advisory) and
+    `pkg/dhcprelay/relay_test.go` (`TestRunRelay_ConfiguredMaxHopCount`).
 - **#2008 H7 (security log profile):** declared the `security log
   profile <name>` stanza — `stream-name` (`ValueHintStreamName`
   completion), `default-profile` (presence flag), and
@@ -4712,3 +4765,152 @@ are **accepted-but-inert** — the userspace dataplane classifies / rewrites on
 `ClassOfServiceConfig` (`INetPrecedenceClassifiers` /
 `INetPrecedenceRewriteRules` / `EXPRewriteRules`) solely to drive a commit
 advisory; no runtime structure is built.
+
+## System syslog host/file sub-statements (#4303 S-1)
+
+A `system syslog host <h>` / `file <f>` / `user <u>` destination body is a
+mix of `<facility> <severity>` pairs (`any warning;`, `daemon info;`) and
+NON-facility modifiers (`source-address 10.0.1.1;`, `port 5514;`,
+`match "re";`, `structured-data;`, `explicit-priority;`, `archive size 1m
+files 5;`). The compiler previously treated EVERY non-`allow-duplicates`
+child as a `<facility> <severity>` pair via a `len(Keys) >= 2` fallback, so
+`source-address 10.0.1.1` was captured as
+`SyslogFacility{Facility:"source-address", Severity:"10.0.1.1"}`.
+`applySystemSyslog` reads `Facilities[0].Facility` for the remote client's
+facility, so a leading `source-address` set the whole forwarding client's
+facility to garbage. The strict commit-check ALSO rejected these lines: the
+schema `host`/`file`/`user` nodes carried only the `<facility> <severity>`
+wildcard, so `source-address 10.0.1.1` was validated against the severity
+enum and rejected (an IP is not a severity).
+
+- **compiler** — `compileSystem` syslog loop (`compiler_system.go`) now
+  switches on the known modifier keywords before the pair fallback. Host
+  `source-address`/`port` are captured into `SyslogHostConfig.SourceAddress`
+  / `.Port`; `match`/`structured-data`/`explicit-priority`/`log-prefix`/
+  `facility-override`/`archive` are recognized-and-skipped. The
+  `syslogFacilitySeverity` helper extracts the pair (flat `Keys[0]/Keys[1]`
+  or hierarchical `Keys[0]` + child) and returns ok=false for a valueless
+  leaf, so a bare/garbage keyword is dropped instead of appended as a
+  half-populated filter.
+- **schema** — `syslogDestinationModifiers` models the modifiers as named
+  children so they take precedence over the wildcard. `source-address` is
+  `ValueIPAddress`, `port` is `ValueInteger(1,65535)`; the rest are accepted
+  structurally. No valid syslog config is newly rejected.
+- **runtime** — `applySystemSyslog` (`pkg/daemon/daemon_system.go`) now binds
+  the outgoing socket to `host.SourceAddress` (via
+  `logging.NewSyslogClientWithSource`) and honors `host.Port` instead of the
+  hardcoded 514.
+- **tests** — `pkg/config/compiler_syslog_hostmods_4303_test.go` (facilities
+  not polluted, source-address/port captured, strict commit accepts).
+
+## Custom system login class (#4304 S-2)
+
+The `system login user <n> class <c>` leaf was a fixed enum over the
+system-defined built-ins (`ValidLoginClasses()`), so a config that defined
+its own RBAC class (`set system login class noc-admin permissions all` +
+`set system login user bob class noc-admin`) was HARD-REJECTED at commit —
+blocking the whole config. This is accept-with-advisory now:
+
+- **schema** — a new `system login class <name>` container
+  (`schema_system.go`) with children `permissions` (multi), `idle-timeout`
+  (int), `allow-commands`, `deny-commands`, `allow-configuration`,
+  `deny-configuration`, `login-alarms`, `login-tip`. The `user ... class`
+  leaf switched from `ValidateEnum(ValidLoginClasses())` to the tree-aware
+  `treeValidator: validateLoginClassRef`, which accepts the built-ins UNION
+  the custom class names collected from the tree (`schemaRefs.loginClasses`,
+  `collectSchemaRefs`, merged from `defsSource` too). An undefined class
+  still fails closed.
+- **compiler** — `compileSystem` login loop parses the `class` definitions
+  (before users) into `LoginConfig.Classes`, folding the Junos `permissions`
+  tokens onto the coarse xpf model via `mapJunosPermissions`
+  (`LoginClass.MappedPermissions`). Only whole-box tokens map precisely;
+  everything else folds DOWN to a PermView floor (never over-grants
+  config/control/maint from a narrow subsystem token). **No privilege
+  escalation** (#4311 review): `reset` = restart daemons → PermControl (NOT
+  PermMaint — the destructive reboot/halt/zeroize verbs); `rollback` = revert
+  to a prior commit → PermView floor (NOT PermConfig); only `maintenance` →
+  PermMaint and only `configure` → PermConfig.
+- **advisory** — `loginClassAdvisoryWarnings` emits one `cfg.Warnings` entry
+  per custom class naming the mapped permissions. `allow-commands` /
+  `allow-configuration` / `idle-timeout` are named as accepted-but-not-enforced
+  (neutral). `deny-commands` / `deny-configuration` get an explicit `WARNING`
+  that, because they are unenforced blacklists, the class is **more permissive
+  than the Junos config** (the denied verbs stay allowed) — a weaker posture,
+  not merely "unenforced". Full per-command deny enforcement is a follow-up.
+- **runtime** — `pkg/cli/permissions.go` `resolveClassPerms` consults the
+  built-ins first, then `store.ActiveConfig().System.Login.Classes`, so a
+  custom-class user is enforced against the mapped permissions instead of
+  being locked out as an "unknown login class". Both `checkPermission` and
+  `showConfigRedacted` route through it.
+- **tests** — `pkg/config/login_custom_class_4304_test.go` (commit accepts +
+  mapping + advisory + undefined-still-rejected);
+  `pkg/cli/permissions_custom_class_4304_test.go` (runtime enforcement +
+  redaction).
+
+## SSH hardening knobs (#4305 S-4)
+
+The SSH compiler read only `root-login` + `key-exchange`, so the standard
+sshd-hardening knobs committed clean (unknown-key accepted-inert) and never
+reached the `sshd_config.d/xpf.conf` drop-in — the box kept base-image cipher/
+MAC defaults even when the operator configured hardened algorithms.
+
+- **schema** (`schema_system.go`) — `services ssh` gains `ciphers` (multi),
+  `macs` (multi), `connection-limit` (int 1-250), `rate-limit` (int 1-250),
+  `client-alive-interval` (int 0-65535), `client-alive-count-max` (int 0-255),
+  `protocol-version` (enum v1|v2). ciphers/macs are free-form (sshd validates
+  spellings at reload). OpenSSH `@`-suffixed algorithm names are configurable
+  via quoting (`ciphers "aes256-gcm@openssh.com"`).
+- **compiler** (`compiler_system.go`) — parses them into `SSHServiceConfig`.
+  ciphers/macs read every value via `firewallMatchValues` so a `[ a b ]`
+  bracketed list is not truncated. client-alive-* carry presence flags because
+  0 is a meaningful sshd value.
+- **runtime** (`daemon_system.go buildSSHDConfig`) — renders `Ciphers`, `MACs`,
+  `MaxStartups` (connection-limit's nearest sshd equivalent),
+  `ClientAliveInterval`, `ClientAliveCountMax`.
+- **validation gate** (#4311 review) — `applySSHConfig` runs `sshd -t`
+  (`sshdValidateCmd`) on the merged config AFTER writing the drop-in but BEFORE
+  the reload. A bad `Ciphers`/`MACs`/`KexAlgorithms` spelling fails `sshd -t`,
+  the drop-in is reverted to its prior content (or removed when there was
+  none), and the reload (SIGHUP) is **skipped entirely** — so a cipher typo can
+  never make sshd re-exec into an invalid config and drop its listener (SSH
+  lockout on the appliance). This makes the lockout protection self-contained
+  rather than relying on the base-image `ExecReload=sshd -t`; the reload-failure
+  revert stays as a backstop.
+- **advisory** — `protocol-version` is accept-with-advisory: modern sshd is
+  SSH-2 only, so `v2` is a silent no-op and any other value emits a
+  `cfg.Warnings` advisory (`sshHardeningAdvisoryWarnings`). `rate-limit` has no
+  clean sshd equivalent; it is accepted and covered by the S-5 inert-knob
+  advisory scan.
+- **tests** — `pkg/config/compiler_ssh_hardening_4305_test.go`,
+  `pkg/daemon/daemon_ssh_test.go` (`TestBuildSSHDConfigHardeningKnobs`,
+  `TestBuildSSHDConfigClientAlivePresence`, and the validation-gate guards
+  `TestApplySSHConfig_ValidationGateBlocksReload` /
+  `...ValidationGateRemovesWhenNoPrior` / `...ValidationPassesThenReloads`).
+
+## Grouped system/SNMP inert knobs — accept-with-advisory (#4306 S-5)
+
+A cluster of `system`/`snmp` knobs commit clean but do nothing, several
+security-relevant. Rather than silently dropping them, the compiler now emits
+a loud accept-with-advisory (`cfg.Warnings`) so the operator learns the knob is
+inert. Advisory messages are built from the node IDENTITY (keywords) only —
+never a leaf value — so an SNMP community string or an NTP authentication-key
+is never echoed into a warning.
+
+- **SNMP** (`snmpInertKnobWarnings`, `compiler_system.go`) — `view` /
+  community `view` (MIB view scoping is NOT enforced → full ifTable exposure),
+  `trap-options source-address` (traps use the default egress IP),
+  `health-monitor`, `rmon` (no-ops).
+- **system** (`systemInertKnobWarnings`) — `login message` / `announcement`
+  (banners not applied), `login retry-options` (lockout not enforced), `ntp
+  boot-server` / `authentication-key` / `source-address`, and
+  `internet-options` leaves beyond `no-ipv6-reject-zero-hop-limit`. Also the
+  S-4 `services ssh rate-limit` (no sshd equivalent).
+- These are advisory-only by design: the knobs already committed clean
+  (unknown keys under a known container are accepted-inert by the opt-in
+  typed-leaf gate), so no valid config is newly rejected. The security-relevant
+  ones (community view scoping, trap source-address) get an explicit
+  "accepted but NOT enforced" note rather than an implicit full-exposure
+  surprise. Note: SNMP community `clients` source-IP restriction is tracked
+  separately (S-3, not this change).
+- **tests** — `pkg/config/compiler_inert_knobs_4306_test.go` (advisories fire,
+  no secret echoed).

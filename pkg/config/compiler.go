@@ -4082,6 +4082,17 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// inert instead of silently dropping it.
 	cfg.Warnings = append(cfg.Warnings, userspaceRetiredKnobWarnings(cfg)...)
 
+	// #4304 S-2: custom `system login class <name>` definitions are
+	// accepted-with-advisory — recognized so a valid vSRX RBAC config commits,
+	// with a per-class note on which Junos permissions map to xpf's coarse
+	// model and which sub-statements are recognized-but-not-enforced.
+	cfg.Warnings = append(cfg.Warnings, loginClassAdvisoryWarnings(cfg)...)
+
+	// #4305 S-4: SSH hardening knobs are rendered into the sshd drop-in; the
+	// ones sshd cannot honor (protocol-version on an SSH-2-only daemon) get an
+	// advisory instead of silently doing nothing.
+	cfg.Warnings = append(cfg.Warnings, sshHardeningAdvisoryWarnings(cfg)...)
+
 	// #1539: the structural invariant `cfg.System.DPDKDataplane = nil`
 	// was added on master (PR #1553) as a runtime safeguard against
 	// AST leakage of retired DPDK sub-tree fields. After this PR

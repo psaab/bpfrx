@@ -595,7 +595,7 @@ func TestForwardingInstanceType(t *testing.T) {
 
 func TestRouterAdvertisement(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{"set protocols router-advertisement interface vlan100 managed-configuration", "set protocols router-advertisement interface vlan100 other-stateful-configuration", "set protocols router-advertisement interface vlan100 default-lifetime 1800", "set protocols router-advertisement interface vlan100 max-advertisement-interval 600", "set protocols router-advertisement interface vlan100 link-mtu 1500", "set protocols router-advertisement interface vlan100 prefix 2001:db8:1::/64 on-link", "set protocols router-advertisement interface vlan100 prefix 2001:db8:1::/64 autonomous", "set protocols router-advertisement interface vlan100 dns-server-address 2001:db8::53", "set protocols router-advertisement interface vlan100 dns-server-address 2001:db8::54", "set protocols router-advertisement interface vlan100 nat64prefix 64:ff9b::/96", "set protocols router-advertisement interface vlan200 prefix 2001:db8:2::/64"}
+	setCommands := []string{"set protocols router-advertisement interface vlan100 managed-configuration", "set protocols router-advertisement interface vlan100 other-stateful-configuration", "set protocols router-advertisement interface vlan100 default-lifetime 1800", "set protocols router-advertisement interface vlan100 max-advertisement-interval 600", "set protocols router-advertisement interface vlan100 link-mtu 1500", "set protocols router-advertisement interface vlan100 reachable-time 30000", "set protocols router-advertisement interface vlan100 retransmit-timer 1000", "set protocols router-advertisement interface vlan100 prefix 2001:db8:1::/64 on-link", "set protocols router-advertisement interface vlan100 prefix 2001:db8:1::/64 autonomous", "set protocols router-advertisement interface vlan100 dns-server-address 2001:db8::53", "set protocols router-advertisement interface vlan100 dns-server-address 2001:db8::54", "set protocols router-advertisement interface vlan100 nat64prefix 64:ff9b::/96", "set protocols router-advertisement interface vlan200 prefix 2001:db8:2::/64"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -633,6 +633,14 @@ func TestRouterAdvertisement(t *testing.T) {
 	}
 	if ra100.LinkMTU != 1500 {
 		t.Errorf("vlan100: link-mtu = %d", ra100.LinkMTU)
+	}
+	// #4307 (I-2): reachable-time / retransmit-timer must survive compile.
+	// Before the leaves existed both were silently dropped and stayed 0.
+	if ra100.ReachableTime != 30000 {
+		t.Errorf("vlan100: reachable-time = %d, want 30000", ra100.ReachableTime)
+	}
+	if ra100.RetransTimer != 1000 {
+		t.Errorf("vlan100: retransmit-timer = %d, want 1000", ra100.RetransTimer)
 	}
 	if len(ra100.Prefixes) != 1 || ra100.Prefixes[0].Prefix != "2001:db8:1::/64" {
 		t.Errorf("vlan100: prefixes = %+v", ra100.Prefixes)

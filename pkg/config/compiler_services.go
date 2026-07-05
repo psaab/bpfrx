@@ -1596,12 +1596,26 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 				// Inline flat-set spelling (#2076):
 				// `group g overrides always-broadcast`. Consume the
 				// override sub-keywords until the next group property.
+				// #4309: forward-only / relay-agent-option are flags;
+				// maximum-hop-count consumes a following value token.
 				for i+1 < len(keys) && keys[i+1] != "interface" &&
 					keys[i+1] != "active-server-group" &&
 					keys[i+1] != "overrides" {
 					i++
-					if keys[i] == "always-broadcast" {
+					switch keys[i] {
+					case "always-broadcast":
 						g.AlwaysBroadcast = true
+					case "forward-only":
+						g.ForwardOnly = true
+					case "relay-agent-option":
+						g.RelayAgentOption = true
+					case "maximum-hop-count":
+						if i+1 < len(keys) {
+							i++
+							if n, err := strconv.Atoi(keys[i]); err == nil {
+								g.MaximumHopCount = n
+							}
+						}
 					}
 				}
 			}
@@ -1627,14 +1641,41 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 				g.ActiveServerGroup = nodeVal(prop)
 			case "overrides":
 				// Block form (#2076): `overrides { always-broadcast; }`.
-				// always-broadcast may also ride in Keys[1:] when the
-				// override block collapses to a single inline value.
-				if prop.FindChild("always-broadcast") != nil {
-					g.AlwaysBroadcast = true
-				}
-				for _, k := range prop.Keys[1:] {
-					if k == "always-broadcast" {
+				// #4309 adds forward-only / relay-agent-option (flags) and
+				// maximum-hop-count (value). Each may appear as a child node
+				// OR ride in Keys[1:] when the override block collapses to
+				// inline values.
+				for _, oc := range prop.Children {
+					switch oc.Name() {
+					case "always-broadcast":
 						g.AlwaysBroadcast = true
+					case "forward-only":
+						g.ForwardOnly = true
+					case "relay-agent-option":
+						g.RelayAgentOption = true
+					case "maximum-hop-count":
+						if v := nodeVal(oc); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								g.MaximumHopCount = n
+							}
+						}
+					}
+				}
+				for i := 1; i < len(prop.Keys); i++ {
+					switch prop.Keys[i] {
+					case "always-broadcast":
+						g.AlwaysBroadcast = true
+					case "forward-only":
+						g.ForwardOnly = true
+					case "relay-agent-option":
+						g.RelayAgentOption = true
+					case "maximum-hop-count":
+						if i+1 < len(prop.Keys) {
+							i++
+							if n, err := strconv.Atoi(prop.Keys[i]); err == nil {
+								g.MaximumHopCount = n
+							}
+						}
 					}
 				}
 			}

@@ -278,6 +278,8 @@ Map `RAInterfaceConfig` fields directly to `ndp.RouterAdvertisement`:
 | `DNSServers` | Option: `ndp.RecursiveDNSServer{Servers, Lifetime}` |
 | `NAT64Prefix` | Option: `ndp.PREF64{Prefix, Lifetime}` |
 | `LinkMTU` | Option: `ndp.NewMTU(mtu)` |
+| `ReachableTime` | `ReachableTime` (time.Duration, ms; RFC 4861 §4.2 — #4307) |
+| `RetransTimer` | `RetransmitTimer` (time.Duration, ms; RFC 4861 §4.2 — #4307) |
 | (interface MAC) | Option: `ndp.LinkLayerAddress{Direction: ndp.Source, Addr: mac}` |
 
 Additionally, `CurrentHopLimit` should default to 64 (standard for Linux).

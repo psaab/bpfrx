@@ -247,6 +247,13 @@ const (
 	// 32-bit seconds fields (0xffffffff = infinity). A larger value silently
 	// truncates in ndp's uint32(lifetime); bound at the 32-bit maximum.
 	raPrefixMaxLifetimeSeconds = 4294967295
+	// RFC 4861 §4.2: the RA header Reachable Time and Retrans Timer are
+	// 32-bit unsigned millisecond fields. The RA sender marshals them via
+	// ndp as time.Duration/time.Millisecond -> uint32, so a larger value
+	// silently wraps on the wire. Bound both at the 32-bit millisecond
+	// maximum; 0 is the RFC "unspecified" sentinel (host uses its own
+	// defaults) and is the pre-existing behavior.
+	raReachableRetransMaxMillis = 4294967295
 )
 
 var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map[string]*schemaNode{
@@ -471,6 +478,17 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			"link-mtu": {desc: "Link MTU option advertised to hosts", args: 1, placeholder: "<mtu>",
 				valueType: ValueInteger, valueDesc: "advertised link MTU (RFC 8200 §5 minimum 1280)",
 				valueExamples: []string{"1280", "1500"}, validator: ValidateIntegerMin(1280), children: nil},
+			// #4307 (I-2): the RFC 4861 §4.2 Reachable Time / Retrans Timer
+			// header fields. Both are 32-bit millisecond values the sender
+			// emits verbatim on the RA; before this leaf existed they were
+			// silently dropped and went on the wire as 0 ("unspecified"), so
+			// hosts could not be tuned. 0 keeps the unspecified default.
+			"reachable-time": {desc: "Reachable Time advertised to hosts (milliseconds; 0 = unspecified)", args: 1, placeholder: "<milliseconds>",
+				valueType: ValueInteger, valueDesc: "RFC 4861 §4.2 Reachable Time in milliseconds (0 = unspecified)",
+				valueExamples: []string{"0", "30000"}, validator: ValidateInteger(0, raReachableRetransMaxMillis), children: nil},
+			"retransmit-timer": {desc: "Retrans Timer advertised to hosts (milliseconds; 0 = unspecified)", args: 1, placeholder: "<milliseconds>",
+				valueType: ValueInteger, valueDesc: "RFC 4861 §4.2 Retrans Timer in milliseconds (0 = unspecified)",
+				valueExamples: []string{"0", "1000"}, validator: ValidateInteger(0, raReachableRetransMaxMillis), children: nil},
 			// #2497: each address is appended to an RFC 8106 RecursiveDNSServer
 			// (RDNSS) option, which is IPv6-only. The runtime skips an
 			// unparseable string but does NOT family-gate, so a bare IPv4
@@ -631,6 +649,16 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 			"interface":           {desc: "Interface to relay on", args: 1, multi: true, placeholder: "<interface>", children: nil},
 			"overrides": {desc: "Relay overrides", children: map[string]*schemaNode{
 				"always-broadcast": {desc: "Always broadcast replies to clients", children: nil},
+				// #4309 (fable-review-167 I-4): maximum-hop-count is enforced
+				// (the relay's RFC 1542 §4.1.1 loop-protection hop limit,
+				// previously hardcoded at 16). forward-only and
+				// relay-agent-option are accepted-only (a commit-time advisory
+				// notes each matches the relay's existing default behavior).
+				"maximum-hop-count": {desc: "Drop relayed requests whose hop count reaches this limit", args: 1, placeholder: "<count>",
+					valueType: ValueInteger, valueDesc: "relay hop limit (RFC 1542 §4.1.1; 1..16)",
+					valueExamples: []string{"4", "16"}, validator: ValidateInteger(1, 16), children: nil},
+				"forward-only":       {desc: "Forward without retaining relay state (accepted-only; matches default — #4309)", children: nil},
+				"relay-agent-option": {desc: "Insert Option 82 relay agent information (accepted-only; always inserted — #4309)", children: nil},
 			}},
 		}},
 	}},

@@ -28,6 +28,23 @@ const relayPort = 67
 // clientPort is the standard DHCP client port.
 const clientPort = 68
 
+// defaultMaxHopCount is the RFC 1542 §4.1.1 relay hop limit applied when a
+// group does not configure `overrides maximum-hop-count`. A client request
+// whose hops field has reached this value is dropped for loop protection.
+// This preserves the historical hardcoded limit (#4309).
+const defaultMaxHopCount uint8 = 16
+
+// resolveMaxHopCount maps a configured hop limit to the value the relay
+// enforces: 0 (unset) or out-of-range falls back to defaultMaxHopCount. The
+// schema bounds the leaf to 1..16 (`ValidateInteger(1, 16)`), so the clamp
+// only backstops a config that predates the bound (e.g. a loaded active.json).
+func resolveMaxHopCount(n int) uint8 {
+	if n <= 0 || n > int(defaultMaxHopCount) {
+		return defaultMaxHopCount
+	}
+	return uint8(n)
+}
+
 // readBufSize is the size of the per-loop read buffer for both the
 // client-facing and server-facing UDP sockets.
 //
@@ -115,6 +132,11 @@ type RelayStats struct {
 	// BACKUP for the interface's redundancy group (#2456 HA relay gate).
 	RequestsDroppedBackup uint64
 
+	// RequestsDroppedMaxHops counts client requests dropped because their hops
+	// field reached the group's `overrides maximum-hop-count` limit (default
+	// 16) — the RFC 1542 §4.1.1 loop-protection drop (#4309).
+	RequestsDroppedMaxHops uint64
+
 	// RepliesDroppedUnknownServer counts server replies dropped because their
 	// source IP is NOT one of the configured DHCP servers (#4163). The
 	// server-facing socket is bound (not connected), so it accepts datagrams
@@ -157,11 +179,19 @@ type l2Replier interface {
 type relaySpec struct {
 	servers         []string // server IPs in config order
 	alwaysBroadcast bool
+	// maxHopCount is the RFC 1542 §4.1.1 loop-protection hop limit (#4309):
+	// a client request whose hops field has reached this value is dropped.
+	// 0 = unset = the default (defaultMaxHopCount, 16). A change requires a
+	// fresh session, so it participates in equal().
+	maxHopCount int
 }
 
 // equal reports whether two specs would produce an identical relay session.
 func (s relaySpec) equal(o relaySpec) bool {
 	if s.alwaysBroadcast != o.alwaysBroadcast {
+		return false
+	}
+	if s.maxHopCount != o.maxHopCount {
 		return false
 	}
 	if len(s.servers) != len(o.servers) {
@@ -204,6 +234,17 @@ type interfaceRelay struct {
 	// alwaysBroadcast forces every reply to broadcast (overrides
 	// always-broadcast). Set once at start; read-only thereafter.
 	alwaysBroadcast bool
+
+	// maxHopCount is the resolved RFC 1542 §4.1.1 hop limit (#4309) — a
+	// client request whose hops field has reached it is dropped. Resolved
+	// from the group's overrides maximum-hop-count (default 16). Set once
+	// at start; read-only thereafter.
+	maxHopCount uint8
+
+	// requestsDroppedMaxHops counts client requests dropped because their
+	// hops field reached maxHopCount (#4309). Observability for a relay loop
+	// or a misconfigured downstream relay chain.
+	requestsDroppedMaxHops atomic.Uint64
 
 	// Reply-delivery counters (#2076).
 	repliesL2Unicast           atomic.Uint64
@@ -559,6 +600,7 @@ func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
 				spec: relaySpec{
 					servers:         serverIPs,
 					alwaysBroadcast: group.AlwaysBroadcast,
+					maxHopCount:     group.MaximumHopCount,
 				},
 				servers: serverAddrs,
 			}
@@ -637,6 +679,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			done:            make(chan struct{}),
 			spec:            d.spec,
 			alwaysBroadcast: d.spec.alwaysBroadcast,
+			maxHopCount:     resolveMaxHopCount(d.spec.maxHopCount),
 		}
 		m.relays[name] = ir
 		toStart = append(toStart, struct {
@@ -681,6 +724,7 @@ func (m *Manager) Stats() []RelayStats {
 			RequestsRelayed:             ir.requestsRelayed.Load(),
 			RepliesForwarded:            ir.repliesForwarded.Load(),
 			RequestsDroppedBackup:       ir.requestsDroppedBackup.Load(),
+			RequestsDroppedMaxHops:      ir.requestsDroppedMaxHops.Load(),
 			RepliesDroppedUnknownServer: ir.repliesDroppedUnknownServer.Load(),
 			RepliesL2Unicast:            ir.repliesL2Unicast.Load(),
 			RepliesUnicastCiaddr:        ir.repliesUnicastCiaddr.Load(),
@@ -1099,12 +1143,14 @@ func (m *Manager) runRelaySession(ctx context.Context,
 
 			// Enforce the RFC 1542 §4.1.1 hop limit BEFORE incrementing.
 			// HopCount is uint8: checking after a ++ lets an incoming value
-			// of 255 wrap to 0 and slip past a post-increment "> 16" test,
-			// defeating loop protection. A request that already carries 16
-			// hops has reached the limit and must be dropped.
-			if pkt.HopCount >= 16 {
+			// of 255 wrap to 0 and slip past a post-increment ">= limit"
+			// test, defeating loop protection. A request that already carries
+			// the limit has reached it and must be dropped. The limit is the
+			// group's `overrides maximum-hop-count` (default 16) — #4309.
+			if pkt.HopCount >= ir.maxHopCount {
+				ir.requestsDroppedMaxHops.Add(1)
 				slog.Warn("dhcp-relay: hop count exceeded, dropping",
-					"interface", ifaceName, "hops", pkt.HopCount)
+					"interface", ifaceName, "hops", pkt.HopCount, "limit", ir.maxHopCount)
 				continue
 			}
 			pkt.HopCount++
