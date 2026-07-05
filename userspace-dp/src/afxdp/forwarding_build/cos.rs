@@ -304,6 +304,30 @@ pub(super) fn build_cos_iface_config(
                 });
             };
             let scheduler = tables.schedulers.get(&entry.scheduler).copied();
+            // A scheduler-map entry naming a scheduler that is NOT defined
+            // in `class-of-service schedulers` resolves to `None` here. The
+            // strict commit validator
+            // (validateClassOfServiceSchedulerMapRefsStrict, pkg/config)
+            // now hard-rejects such a reference, but a config persisted by
+            // an older binary — or peer-synced — can still carry it on the
+            // lenient load path (#1960 no-brick), so the dataplane must fail
+            // SAFE, not OPEN. Before this fix `None` fell through to
+            // `transmit_rate_bytes = iface.cos_shaping_rate_bytes_per_sec`
+            // (the WHOLE interface shaping rate), which drove
+            // `surplus_weight` to the MAX (16, cos_surplus_weight at the
+            // root rate): the class did not merely lose its guarantee, it
+            // silently won the LARGEST best-effort surplus share. Pin the
+            // queue to the minimal best-effort surplus weight (1) for an
+            // unresolved reference instead. The queue stays materialized
+            // under its real queue_id / forwarding_class so a classifier
+            // steering traffic to it still forwards (dropping the entry
+            // would blackhole that traffic) — it just never gets MORE than
+            // a plain best-effort class. `guarantee_enabled` stays false and
+            // priority stays "low" below, so no guarantee or priority is
+            // fabricated. A DEFINED scheduler that merely omits a
+            // transmit-rate keeps its `surplus_weight = 16` (scheduler is
+            // Some), unchanged.
+            let scheduler_unresolved = scheduler.is_none();
             let explicit_transmit_rate_bytes = scheduler.and_then(|sched| {
                 (sched.transmit_rate_bytes > 0).then_some(sched.transmit_rate_bytes)
             });
@@ -360,10 +384,17 @@ pub(super) fn build_cos_iface_config(
                 // equal_flow_enforcement; parsed above so an unknown
                 // non-empty value fails the snapshot closed.
                 equal_flow_target_policy,
-                surplus_weight: cos_surplus_weight(
-                    transmit_rate_bytes.max(1),
-                    iface.cos_shaping_rate_bytes_per_sec,
-                ),
+                surplus_weight: if scheduler_unresolved {
+                    // SAFE default for a dangling scheduler reference:
+                    // minimal best-effort surplus share, never the fail-open
+                    // maximum the whole-interface effective rate would derive.
+                    1
+                } else {
+                    cos_surplus_weight(
+                        transmit_rate_bytes.max(1),
+                        iface.cos_shaping_rate_bytes_per_sec,
+                    )
+                },
                 buffer_bytes: cos_scheduler_buffer_bytes(
                     scheduler,
                     burst_bytes,
