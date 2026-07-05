@@ -834,6 +834,18 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 						ra.LinkMTU = n
 					}
 				}
+			case "reachable-time":
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						ra.ReachableTime = n
+					}
+				}
+			case "retransmit-timer":
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						ra.RetransTimer = n
+					}
+				}
 			case "dns-server-address":
 				if len(prop.Keys) >= 2 {
 					ra.DNSServers = append(ra.DNSServers, nodeVal(prop))

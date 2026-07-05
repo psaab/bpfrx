@@ -1,3 +1,20 @@
+## 2026-07-05 — fable-review-167 I-2 (#4307): RA reachable-time / retransmit-timer
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Implement the RFC 4861 §4.2 Reachable Time / Retrans
+    Timer RA header fields, which were silently dropped (no schema leaf,
+    no config field, sender never set them → both went on the wire as 0).
+    Added typed millisecond leaves `reachable-time` / `retransmit-timer`
+    (bounded at the 32-bit ms max so they cannot silently wrap in ndp),
+    `RAInterfaceConfig.ReachableTime` / `RetransTimer`, the compiler cases,
+    and set them on the ndp RA in `buildRA`. RED-on-revert tests: parser
+    compile + sender wire round-trip.
+  - **File(s)**: pkg/config/schema_routing.go,
+    pkg/config/types_routing.go, pkg/config/compiler_protocols.go,
+    pkg/ra/sender.go, pkg/config/parser_routing_test.go,
+    pkg/ra/sender_marshal_4307_test.go, docs/embedded-radvd.md,
+    docs/config-schema.md, _Log.md
+
 ## 2026-07-05 — fable-167 PR #4295 Copilot fold: scrub two secret-leak-to-logs paths (VRRP auth-key + SNMP community)
 
 - **Timestamp**: 2026-07-05

@@ -1723,6 +1723,20 @@ reserved for whole-dataplane selection where a rewrite shim
   configs). New validators `ValidateIPv6Address` / `ValidatePREF64CIDR`
   live in `schema_validators.go`. Regression coverage:
   `pkg/config/schema_validate_2497_test.go`.
+- **#4307 (router-advertisement reachable-time / retransmit-timer,
+  fable-review-167 I-2):** the RFC 4861 §4.2 Reachable Time and Retrans
+  Timer RA header fields had no schema leaf, no `RAInterfaceConfig`
+  field, and the sender never set them, so both went on the wire as 0
+  ("unspecified") and hosts could not be tuned via RA. Added
+  `reachable-time` / `retransmit-timer` as typed millisecond leaves
+  (`ValidateInteger(0, raReachableRetransMaxMillis)` — the 32-bit ms
+  field maximum so an over-large value does not silently wrap in ndp's
+  `Duration/time.Millisecond -> uint32`), compiled into
+  `RAInterfaceConfig.ReachableTime` / `RetransTimer`, and set on
+  `ndp.RouterAdvertisement.ReachableTime` / `RetransmitTimer` in
+  `pkg/ra/sender.go buildRA`. 0 keeps the pre-#4307 unspecified default.
+  Coverage: `pkg/config/parser_routing_test.go` (compile) +
+  `pkg/ra/sender_marshal_4307_test.go` (wire round-trip).
 - **#2008 H7 (security log profile):** declared the `security log
   profile <name>` stanza — `stream-name` (`ValueHintStreamName`
   completion), `default-profile` (presence flag), and
