@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -55,6 +56,39 @@ func writeOK(w http.ResponseWriter, data any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, Response{Success: false, Error: msg})
+}
+
+// maxRequestBodyBytes bounds every REST mutation request body (M-7). Without
+// it, a mutating handler `json.Decode`s r.Body with no ceiling: a crafted or
+// accidental multi-gigabyte POST — e.g. `POST /api/v1/config/load` with a huge
+// `Content` string — is buffered whole by the decoder and then parsed a second
+// time by the configstore, spiking daemon RSS to an OOM-kill (gosec
+// resource-exhaustion; the gRPC side is already bounded by grpc-go's 4 MiB
+// default recv cap, so this is REST-specific). 16 MiB is orders of magnitude
+// above any legitimate payload — the largest real body is a full candidate
+// config, well under a megabyte — while keeping even thousands of concurrent
+// maxed-out requests bounded. This is the transport-layer guard; it is
+// independent of any parser-layer config-size ceiling (which bounds the parsed
+// string, not the wire body).
+const maxRequestBodyBytes = 16 << 20 // 16 MiB
+
+// decodeJSONBody caps r.Body at maxRequestBodyBytes, then decodes JSON into
+// dst. It returns true on success. On an oversized body it writes HTTP 413; on
+// any other decode failure it writes HTTP 400. In BOTH failure cases it has
+// already written the error response, so a false return means the caller must
+// return from the handler immediately without writing anything else.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
 }
 
 func (s *Server) applyResult() *dataplane.ApplyResult {

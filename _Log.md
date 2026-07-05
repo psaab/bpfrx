@@ -1,4 +1,43 @@
 
+## 2026-07-04 — #4150 (M-6 + M-7): management HTTP server DoS hardening
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (origin/master ~d70851156, worktree
+    4a784dd1b) then FIX. fable-review-164 M-6 + M-7, both pre-auth (or
+    low-priv) mgmt-plane DoS on the `pkg/api` HTTP/HTTPS server.
+    M-6: both `http.Server` literals in `NewServer`
+    (`pkg/api/server.go`) set only `Addr`/`Handler`(/`TLSConfig`) — every
+    timeout field zero (no limit). Header read precedes `authMiddleware`, so a
+    pre-auth slowloris (dribbled headers/body) pins a goroutine/socket per
+    conn indefinitely once web-management binds a non-loopback interface. FIX:
+    set `ReadHeaderTimeout` 10s (slowloris-header defense), `ReadTimeout` 30s
+    (slow-body), `IdleTimeout` 120s, `MaxHeaderBytes` 1 MiB on BOTH literals
+    via a package const block. WriteTimeout deliberately left 0 (unlimited) —
+    the SSE event/log streams + large metrics/session-table scrapes are legit
+    slow responses a WriteTimeout would sever; the read-side timeouts are the
+    slowloris-critical ones and the response side is bounded by per-handler
+    ctx deadlines.
+    M-7: every mutating handler did `json.NewDecoder(r.Body).Decode(&req)`
+    with no `http.MaxBytesReader` (config load/merge/override buffers the whole
+    `Content` then parses it a second time → OOM-kill). FIX: new shared
+    `decodeJSONBody(w, r, dst)` helper (`pkg/api/api.go`) wraps r.Body in
+    `MaxBytesReader(maxRequestBodyBytes=16 MiB)` and returns HTTP 413 on
+    overflow, 400 on other decode errors. Converted all 12 mutation decode
+    sites (config.go ×8 incl. annotate, system.go ×3 ping/traceroute/action,
+    dhcp.go ×1 clear) to the helper; dropped the now-unused `encoding/json`
+    import from those three files. 16 MiB is orders of magnitude above any
+    legit config body; independent transport-layer guard (pairs with H-2's
+    parser-layer ceiling). Read-only GETs untouched.
+  - **Files**: `pkg/api/server.go`, `pkg/api/api.go`, `pkg/api/config.go`,
+    `pkg/api/system.go`, `pkg/api/dhcp.go`,
+    `pkg/api/http_dos_hardening_4150_test.go` (new), `pkg/api/README.md`,
+    `_Log.md`.
+  - **Validation**: `go test ./pkg/api/...` green; `go build ./...` green;
+    gofmt clean; `go vet ./pkg/api/...` clean. RED-on-revert proven: removing
+    the timeout fields → `TestManagementServerTimeoutsSetM6` fails (all fields
+    0); removing the MaxBytesReader wrap → `TestConfigMutationBodyCappedM7`
+    returns 200 not 413. Normal-size body still 200, malformed body still 400.
+
 ## 2026-07-04 — #4147 (M-8): unterminated /* */ block comment silently truncates config
 
 - **Timestamp**: 2026-07-04
