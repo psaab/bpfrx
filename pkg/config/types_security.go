@@ -504,6 +504,14 @@ type NATConfig struct {
 	NATv6v4              *NATv6v4Config // natv6v4 options
 	PoolUtilizationAlarm *PoolUtilizationAlarmConfig
 	ProxyARP             []*ProxyARPEntry
+	// SourceInterfacePortOverloadingOff records `security nat source interface
+	// port-overloading off` (#4291). Junos `off` disables source-port reuse
+	// across destinations (a src-port-uniqueness hardening posture). xpf accepts
+	// and records it but does NOT enforce it — source-port overloading is always
+	// on in the SNAT allocator — so `off` hardens nothing. An accept-with-
+	// advisory (ValidateConfig) surfaces the false-hardening. Enforcement is a
+	// userspace-dp SNAT-allocator follow-up.
+	SourceInterfacePortOverloadingOff bool
 }
 
 // ProxyARPEntry configures proxy ARP responses for NAT addresses.
@@ -703,8 +711,21 @@ type NATPool struct {
 	// in this mode. Before #3906 the token was silently dropped and the pool
 	// PAT-translated the port anyway.
 	PortNoTranslation bool
-	PersistentNAT     *PersistentNATConfig
-	Deterministic     *DeterministicNATConfig
+	// PortOverloadingFactor records the source-pool `port-overloading-factor
+	// <n>` knob (#4291). Junos scales the number of concurrent translations a
+	// single pool address may serve. xpf accepts and records it but does NOT
+	// enforce it — the SNAT allocator has no factor-scaled port budget — so an
+	// accept-with-advisory (ValidateConfig) surfaces the accepted-but-inert
+	// state. 0 = not configured. Enforcement is a userspace-dp SNAT-allocator
+	// follow-up.
+	PortOverloadingFactor int
+	// RoutingInstance records the source / destination NAT pool `routing-
+	// instance <ri>` translation-TARGET routing instance (#4292). Accepted +
+	// recorded for the advisory; not enforced (the dataplane does not route the
+	// post-translation packet against a non-ingress table). "" = unset.
+	RoutingInstance string
+	PersistentNAT   *PersistentNATConfig
+	Deterministic   *DeterministicNATConfig
 }
 
 // PersistentNATPermit selects the remote-endpoint scope of a persistent
@@ -766,7 +787,28 @@ type StaticNATRule struct {
 	// mirrored into SourceAddress for back-compat. Empty = match any source.
 	SourceAddresses []string
 	Then            string // static-nat prefix (internal/private IP), or "inet" for NAT64
-	IsNPTv6         bool   // true if this is an nptv6-prefix rule (RFC 6296)
+	// ThenPrefixName is the raw `then static-nat prefix-name <name>` reference
+	// (#4290). Junos static NAT `prefix-name` names a global address-book entry
+	// whose literal prefix is the 1:1 translation target — the named twin of
+	// `then static-nat prefix <ip>`. The compiler records the raw name here and
+	// resolveStaticNATThenPrefixNames (run post-address-book-fold) resolves it
+	// into Then. Before #4290 the target keyword fell through the then switch,
+	// leaving Then=="" — the rule committed with an EMPTY translation target
+	// (silent broken static NAT). An unresolvable reference is rejected at
+	// strict commit (validateStaticNATThenTargetStrict); lenient load / peer-
+	// sync downgrades to a warning (#1960) and the dataplane fails closed (the
+	// empty prefix does not parse as an IP → no translation installed).
+	ThenPrefixName string
+	// ThenRoutingInstance is the raw `then static-nat {inet|prefix <ip>}
+	// routing-instance <ri>` translation-TARGET routing instance (#4292). It is
+	// distinct from the rule-set `from` SCOPE routing-instance (#3096): the
+	// scope selects which ingress traffic the rule matches, the target RI would
+	// place the TRANSLATED packet in a different routing table (cross-VRF NAT).
+	// Recorded so the accepted-but-unenforced advisory (ValidateConfig) can
+	// surface it; the dataplane does not yet route the post-translation packet
+	// against a non-ingress table, so the token is otherwise silently dropped.
+	ThenRoutingInstance string
+	IsNPTv6             bool // true if this is an nptv6-prefix rule (RFC 6296)
 	// MatchDestinationPort is the external (pre-translation) destination
 	// port the inbound packet must carry for this rule to apply (Junos
 	// `match destination-port`). 0 = match any port (whole-address 1:1,

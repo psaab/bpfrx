@@ -1292,6 +1292,28 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		sec.NAT.AddressPersistent = true
 	}
 
+	// #4291: `nat source interface port-overloading off` disables source-port
+	// reuse across destinations (a src-port-uniqueness hardening posture).
+	// Accepted + recorded for the advisory (ValidateConfig); NOT enforced —
+	// source-port overloading is always on in the SNAT allocator, so `off`
+	// hardens nothing. Handle both the flat-set collapse
+	// (["interface","port-overloading","off"]) and the hierarchical
+	// `interface { port-overloading off; }` shape.
+	if ifNode := node.FindChild("interface"); ifNode != nil {
+		poOff := false
+		for i := 0; i+1 < len(ifNode.Keys); i++ {
+			if ifNode.Keys[i] == "port-overloading" && ifNode.Keys[i+1] == "off" {
+				poOff = true
+			}
+		}
+		if po := ifNode.FindChild("port-overloading"); po != nil && nodeVal(po) == "off" {
+			poOff = true
+		}
+		if poOff {
+			sec.NAT.SourceInterfacePortOverloadingOff = true
+		}
+	}
+
 	// Parse source NAT pools
 	for _, inst := range namedInstances(node.FindChildren("pool")) {
 		pool := &NATPool{Name: inst.name}
@@ -1463,6 +1485,25 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					}
 				}
 				pool.PersistentNAT = pnat
+			case "port-overloading-factor":
+				// #4291: source-pool port-overloading-factor <n>. Accepted +
+				// recorded for the advisory (ValidateConfig); not enforced —
+				// the SNAT allocator has no factor-scaled port budget. Flat-set
+				// collapses ["port-overloading-factor","<n>"] onto Keys; the
+				// hierarchical shape carries the value as nodeVal.
+				if v := nodeVal(prop); v != "" {
+					if n, err := strconv.Atoi(v); err == nil {
+						pool.PortOverloadingFactor = n
+					}
+				}
+			case "routing-instance":
+				// #4292: source-pool translation-target routing-instance.
+				// Accepted + recorded for the advisory; not enforced (the
+				// dataplane does not route the post-translation packet against
+				// a non-ingress table).
+				if v := nodeVal(prop); v != "" {
+					pool.RoutingInstance = v
+				}
 			}
 		}
 		if pool.PortLow == 0 {
@@ -1811,6 +1852,14 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 						pool.Port = n
 					}
 				}
+			case "routing-instance":
+				// #4292: destination-pool translation-target routing-instance.
+				// Accepted + recorded for the advisory (ValidateConfig); not
+				// enforced (the dataplane does not route the post-translation
+				// packet against a non-ingress table).
+				if v := nodeVal(prop); v != "" {
+					pool.RoutingInstance = v
+				}
 			}
 		}
 
@@ -2115,6 +2164,124 @@ func staticNATMappedPortFromKeys(keys []string) int {
 	return 0
 }
 
+// staticNATRoutingInstanceFromKeys scans a collapsed static-nat `then` leaf's
+// Keys for a trailing `routing-instance <ri>` translation target (#4292) and
+// returns the instance name (or "" when absent). Mirrors
+// staticNATMappedPortFromKeys — the free-form static-nat leaf absorbs the whole
+// `then static-nat <target> routing-instance <ri>` line onto one node's Keys in
+// the flat-set shape.
+func staticNATRoutingInstanceFromKeys(keys []string) string {
+	for i := 0; i+1 < len(keys); i++ {
+		if keys[i] == "routing-instance" {
+			return keys[i+1]
+		}
+	}
+	return ""
+}
+
+// resolveStaticNATThenPrefixName resolves a `then static-nat prefix-name <name>`
+// reference (#4290) to the single literal prefix that names the 1:1 translation
+// target. Junos `prefix-name` references a single global address-book entry: an
+// `address <name> <prefix>` resolves to its prefix; an `address-set` that
+// expands to exactly one address resolves to that address's prefix; anything
+// else (undefined, an address with no prefix, an empty / multi-member set,
+// dangling) is not a valid scalar 1:1 target and returns ok=false so the caller
+// leaves Then=="" and the strict guard rejects it.
+func resolveStaticNATThenPrefixName(ab *AddressBook, name string) (string, bool) {
+	if ab == nil || name == "" {
+		return "", false
+	}
+	if a, ok := ab.Addresses[name]; ok && a != nil && a.Value != "" {
+		return a.Value, true
+	}
+	if _, ok := ab.AddressSets[name]; ok {
+		members, err := ExpandAddressSet(name, ab)
+		if err != nil || len(members) != 1 {
+			return "", false
+		}
+		if a, ok := ab.Addresses[members[0]]; ok && a != nil && a.Value != "" {
+			return a.Value, true
+		}
+	}
+	return "", false
+}
+
+// resolveStaticNATThenPrefixNames resolves every `then static-nat prefix-name`
+// reference recorded during compileNATStatic into the rule's literal Then
+// target (#4290). It runs AFTER the zone-local address books are folded into the
+// global book (compiler.go), so the fully-resolved global book is available
+// (compileNAT can run before compileAddressBook within a single `security {}`
+// root, so resolution cannot happen inline in the then switch). An unresolvable
+// reference leaves Then=="" — validateStaticNATThenTargetStrict then rejects it
+// at strict commit (warns on the lenient load / peer-sync path, #1960).
+func resolveStaticNATThenPrefixNames(sec *SecurityConfig) {
+	ab := sec.AddressBook
+	for _, rs := range sec.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.ThenPrefixName == "" || rule.Then != "" {
+				continue
+			}
+			if prefix, ok := resolveStaticNATThenPrefixName(ab, rule.ThenPrefixName); ok {
+				rule.Then = prefix
+			}
+		}
+	}
+}
+
+// validateStaticNATThenTargetStrict rejects a static-NAT rule that would install
+// with an EMPTY translation target (#4290). Two causes both leave Then=="":
+//
+//   - an unresolvable `then static-nat prefix-name <name>` (undefined /
+//     multi-member / prefix-less address-book entry — resolveStaticNATThen-
+//     PrefixNames could not fill Then); and
+//   - a bare / misspelled `then static-nat` target keyword (a typo the free-form
+//     static-nat leaf accepted — the then switch matched no case).
+//
+// Both previously committed cleanly and installed a static NAT with no
+// translation (silent broken 1:1). NPTv6 rules are skipped (their Then holds the
+// nptv6 prefix and buildStaticNATSnapshots handles them on a separate path).
+// Strict on commit / commit-check (hard reject); the call site downgrades to a
+// warning on the tolerant load / peer-sync path (#1960) where the dataplane then
+// fails closed (the empty prefix does not parse as an IP → no translation).
+// Rule-sets are walked in slice order for a deterministic first error.
+func validateStaticNATThenTargetStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.IsNPTv6 || rule.Then != "" {
+				continue
+			}
+			if rule.ThenPrefixName != "" {
+				return fmt.Errorf(
+					"static NAT rule-set %q rule %q references `then static-nat "+
+						"prefix-name %q`, which does not resolve to a single "+
+						"address-book prefix (define `security address-book "+
+						"global address %s <prefix>`, or fix the name — the "+
+						"translation target would otherwise be silently empty "+
+						"and the 1:1 NAT would install with no target) (#4290)",
+					rs.Name, rule.Name, rule.ThenPrefixName, rule.ThenPrefixName)
+			}
+			return fmt.Errorf(
+				"static NAT rule-set %q rule %q has an empty `then static-nat` "+
+					"translation target (an unhandled or misspelled target "+
+					"keyword — expected prefix | prefix-name | nptv6-prefix | "+
+					"inet) — the rule would otherwise install with no "+
+					"translation and silently forward the packet untranslated "+
+					"(#4290)",
+				rs.Name, rule.Name)
+		}
+	}
+	return nil
+}
+
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
 		// #3096: capture from scope across zone | interface |
@@ -2185,6 +2352,11 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				rule.Then = ""
 				rule.IsNPTv6 = false
 				rule.MappedPort = 0
+				// #4290 / #4292: reset the named-target reference and the
+				// translation-target routing-instance alongside the other
+				// then-set fields so only the LAST then-block's spec survives.
+				rule.ThenPrefixName = ""
+				rule.ThenRoutingInstance = ""
 				for _, t := range thenNode.Children {
 					if t.Name() == "static-nat" {
 						if len(t.Keys) >= 3 && t.Keys[1] == "nptv6-prefix" {
@@ -2195,6 +2367,20 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// static-nat { nptv6-prefix { PREFIX; } }
 							rule.Then = nodeVal(np)
 							rule.IsNPTv6 = true
+						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix-name" {
+							// #4290: set ... then static-nat prefix-name NAME.
+							// The named form of `prefix <ip>`: NAME references a
+							// global address-book entry whose literal prefix is
+							// the 1:1 translation target. Recorded raw here and
+							// resolved into rule.Then post-address-book-fold by
+							// resolveStaticNATThenPrefixNames (the book may not
+							// be compiled yet at this point). Before #4290 this
+							// keyword fell through, leaving Then=="" (empty
+							// translation target, silent broken static NAT).
+							rule.ThenPrefixName = t.Keys[2]
+						} else if pn := t.FindChild("prefix-name"); pn != nil {
+							// static-nat { prefix-name NAME; }
+							rule.ThenPrefixName = nodeVal(pn)
 						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
 							rule.Then = t.Keys[2]
 							// #2491: optional trailing `mapped-port <port>`.
@@ -2224,6 +2410,30 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {
 							// static-nat { inet; } — NAT64 translation
 							rule.Then = "inet"
+						}
+						// #4292: a translation-target `routing-instance <ri>`
+						// may trail ANY of the targets above (Junos allows it on
+						// inet and prefix). It rides on the free-form static-nat
+						// leaf in one of three AST shapes: collapsed onto t.Keys
+						// (["static-nat","prefix","<ip>","routing-instance",
+						// "<ri>"]); on the TARGET child leaf's Keys (the common
+						// flat-set shape — static-nat has a `prefix`/`inet` child
+						// whose Keys carry the trailing routing-instance pair); or
+						// as a distinct sibling `routing-instance` child. Captured
+						// for the accepted-but-unenforced advisory; the dataplane
+						// does not route the post-translation packet against a
+						// non-ingress table.
+						if ri := staticNATRoutingInstanceFromKeys(t.Keys); ri != "" {
+							rule.ThenRoutingInstance = ri
+						} else if riNode := t.FindChild("routing-instance"); riNode != nil {
+							rule.ThenRoutingInstance = nodeVal(riNode)
+						} else {
+							for _, c := range t.Children {
+								if ri := staticNATRoutingInstanceFromKeys(c.Keys); ri != "" {
+									rule.ThenRoutingInstance = ri
+									break
+								}
+							}
 						}
 					}
 				}

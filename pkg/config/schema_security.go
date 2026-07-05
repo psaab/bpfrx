@@ -377,6 +377,40 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 						children:      nil,
 					},
 				}},
+				// #4291: per-pool port-overloading-factor. Typed so the knob
+				// completes and commits; accepted-but-unenforced (advisory in
+				// ValidateConfig) — the SNAT allocator has no factor-scaled port
+				// budget.
+				"port-overloading-factor": {
+					desc:          "Concurrent translations per pool address (accepted, not enforced)",
+					args:          1,
+					valueType:     ValueInteger,
+					valueDesc:     "Overloading factor",
+					valueExamples: []string{"1", "2", "4"},
+					validator:     ValidateInteger(1, 32),
+					children:      nil,
+				},
+				// #4292: per-pool translation-target routing-instance. Typed so
+				// it completes and commits; accepted-but-unenforced (advisory in
+				// ValidateConfig) — the dataplane does not route the post-
+				// translation packet against a non-ingress table.
+				"routing-instance": {desc: "Translation-target routing instance (accepted, not enforced)", args: 1, placeholder: "<routing-instance>", children: nil},
+			}},
+			// #4291: `nat source interface port-overloading off` disables
+			// source-port reuse across destinations. Typed so it completes and
+			// commits; accepted-but-unenforced (advisory in ValidateConfig) —
+			// source-port overloading is always on in the SNAT allocator, so
+			// `off` hardens nothing.
+			"interface": {desc: "Source NAT interface-address translation options", children: map[string]*schemaNode{
+				"port-overloading": {
+					desc:          "Source-port overloading control (off = unique src port per mapping; accepted, not enforced)",
+					args:          1,
+					valueType:     ValueEnumOf,
+					valueDesc:     "port-overloading mode",
+					valueExamples: []string{"off"},
+					validator:     ValidateEnum([]string{"off"}),
+					children:      nil,
+				},
 			}},
 			"address-persistent": {desc: "Always map a source IP to the same pool address", children: nil},
 			"rule-set": {desc: "Source NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
@@ -492,7 +526,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					// nil is the replace-vs-container signal). The mapped-port
 					// range is validated in the compiler (compileNATStatic).
 					"then": {desc: "Static NAT action", children: map[string]*schemaNode{
-						"static-nat": {desc: "Static NAT translation (prefix [mapped-port <port>]|nptv6-prefix|inet)", children: nil},
+						"static-nat": {desc: "Static NAT translation (prefix [mapped-port <port>]|prefix-name <name>|nptv6-prefix|inet [routing-instance <ri>])", children: nil},
 					}},
 				}},
 			}},
