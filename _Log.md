@@ -33717,3 +33717,36 @@ top.
 - **File(s)**: userspace-dp/src/screen/extract.rs,
   userspace-dp/src/screen/packet.rs, userspace-dp/src/screen/tests.rs,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-165 H-20 — libvirt deploy attached the shared golden
+  qcow2 to every VM as a WRITABLE `--disk`, so an HA pair booted two live
+  domains off ONE file (qcow2 is not a cluster filesystem → concurrent
+  metadata/refcount writes corrupt it), and even a single
+  `virt-install --import` mutated the golden master in place (day-0
+  stamp/host keys/configstore DB baked in; the next VM inherited the
+  prior identity and skipped its own config). Added `libvirt_disk()` in
+  `scripts/deploy/xpf-deploy.py`: each domain now gets its OWN
+  copy-on-write overlay `qemu-img create -f qcow2 -b <golden> -F qcow2
+  /var/lib/libvirt/images/<name>.qcow2`, and virt-install attaches that
+  overlay; the golden is an immutable read-only backing store shared by
+  all nodes and is never written. A re-deploy re-creates the overlay
+  (fresh boot from golden); `virt-install --name` still refuses to
+  redefine a live domain so a running VM's overlay is not clobbered. A
+  name==image collision (overlay would overwrite the golden) is
+  hard-rejected; a missing golden fails with a fetch/import hint before
+  qemu-img runs. This matches the incus backend, which already clones per
+  instance via `incus init`. Added
+  `scripts/deploy/test_xpf_deploy_disk.py` (unittest, importlib-loads the
+  hyphenated module): HA pair → two DISTINCT non-golden writable disks,
+  each overlay `-b` the golden read-only, virt-install attaches exactly
+  the created overlay, standalone gets its own overlay, name==image
+  rejected. RED-on-revert PROVEN: reverting to the shared-golden `--disk`
+  makes all 4 tests FAIL (no qemu-img overlay created; both VMs share the
+  golden). `python3 -m py_compile` clean; unittest 4/4 OK. Updated
+  `examples/deploy/README.md` "incus vs libvirt" (was "Both run the
+  *same* qcow2" — now documents per-VM overlay / per-instance clone +
+  a Root-disk table row). Refs fable-165 H-20 (issue #4171).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_disk.py, examples/deploy/README.md,
+  _Log.md

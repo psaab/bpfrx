@@ -74,13 +74,20 @@ ready to drop into `source`.
 
 ## incus vs libvirt
 
-Both run the *same* qcow2 and *same* day-0 drive; only the VM/NIC
-declaration differs. Pick with `--hypervisor` (default `incus`):
+Both build from the *same* golden qcow2 and the *same* day-0 drive; only
+the VM/NIC declaration differs. Pick with `--hypervisor` (default
+`incus`). Neither backend attaches the golden image writable: incus
+clones a per-instance root disk via `incus init`, and libvirt creates a
+per-VM copy-on-write overlay (`qemu-img create -b <golden>`) so the
+golden stays a read-only backing store. An HA pair therefore gets two
+DISTINCT writable disks — attaching one shared writable qcow2 to two
+live VMs would corrupt it.
 
 | | incus | libvirt / KVM |
 |---|---|---|
 | **Best for** | quick, scriptable, VM fleets; the project's own test cluster | existing `virsh` shops; fine-grained guest PCI control |
 | **Tool action** | runs `incus init` + `device add…` + `start` end-to-end | emits a `virt-install` command you run |
+| **Root disk** | per-instance clone from the image store (`incus init`) | per-VM `qemu-img` overlay `<name>.qcow2` backed read-only by `<image>.qcow2` |
 | **NIC ordering** | device-name order (`dev00…`) → PCI slot → positional name | `--network`/`--hostdev` order → persisted `<address>` slots (pin in `virsh edit` for full control) |
 | **SR-IOV auto-VF** | `nictype=sriov parent=<PF>` | one-time `<forward mode='hostdev'>` VF pool (tool prints the XML) |
 | **SR-IOV specific VF** | `pci:<vf-addr>,mac=` | `pci:<vf-addr>,mac=` (same definition) |
