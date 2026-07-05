@@ -273,6 +273,38 @@ type Server struct {
 	startTime                        time.Time
 }
 
+// Management HTTP/HTTPS server timeouts (M-6). Both http.Server literals used
+// to set only Addr/Handler(/TLSConfig), leaving every timeout field zero (no
+// limit). Header reads happen BEFORE authMiddleware, so a pre-auth slowloris —
+// N connections dribbling request headers or a request body one byte at a time
+// — could pin a goroutine/socket per connection indefinitely and wedge the
+// control-plane API once web-management binds a non-loopback interface (gosec
+// G112/G114). The read-side timeouts below are the slowloris-critical defense.
+//
+// WriteTimeout is deliberately left UNSET (0 = unlimited): the SSE event/log
+// streams (GET /api/v1/events/stream, /api/v1/logs/stream) are long-lived, and
+// a full metrics or session-table scrape is a large, legitimately slow
+// response. A WriteTimeout would sever those. The response side is bounded by
+// per-handler context deadlines instead, so leaving it unlimited does not
+// reopen a slow-read DoS on the request side.
+const (
+	// apiReadHeaderTimeout bounds the time to read the request headers — the
+	// slow-header slowloris defense, and the pre-auth guard since header read
+	// precedes authMiddleware.
+	apiReadHeaderTimeout = 10 * time.Second
+	// apiReadTimeout bounds the time to read the ENTIRE request (headers +
+	// body) — the slow-body slowloris defense. 30s is generous for any
+	// legitimate mutation body (bodies are small; capped by
+	// maxRequestBodyBytes) while cutting off a dribbled body.
+	apiReadTimeout = 30 * time.Second
+	// apiIdleTimeout caps how long an idle keep-alive connection is held open
+	// awaiting the next request.
+	apiIdleTimeout = 120 * time.Second
+	// apiMaxHeaderBytes bounds total request header size so an attacker cannot
+	// buffer unbounded header data before the timeouts fire.
+	apiMaxHeaderBytes = 1 << 20 // 1 MiB
+)
+
 // NewServer creates a new API server.
 func NewServer(cfg Config) *Server {
 	s := &Server{
@@ -418,8 +450,14 @@ func NewServer(cfg Config) *Server {
 	}
 
 	s.httpServer = &http.Server{
-		Addr:    cfg.Addr,
-		Handler: handler,
+		Addr:              cfg.Addr,
+		Handler:           handler,
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		IdleTimeout:       apiIdleTimeout,
+		MaxHeaderBytes:    apiMaxHeaderBytes,
+		// WriteTimeout intentionally unset — see the const block above (SSE
+		// streams + large scrapes must not be severed).
 	}
 
 	// Set up HTTPS server with auto-generated self-signed certificate
@@ -429,8 +467,13 @@ func NewServer(cfg Config) *Server {
 			slog.Warn("failed to generate self-signed certificate", "err", err)
 		} else {
 			s.httpsServer = &http.Server{
-				Addr:    cfg.HTTPSAddr,
-				Handler: handler,
+				Addr:              cfg.HTTPSAddr,
+				Handler:           handler,
+				ReadHeaderTimeout: apiReadHeaderTimeout,
+				ReadTimeout:       apiReadTimeout,
+				IdleTimeout:       apiIdleTimeout,
+				MaxHeaderBytes:    apiMaxHeaderBytes,
+				// WriteTimeout intentionally unset — see the const block above.
 				TLSConfig: &tls.Config{
 					Certificates: []tls.Certificate{tlsCert},
 					MinVersion:   tls.VersionTLS12,
