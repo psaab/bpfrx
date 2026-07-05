@@ -163,6 +163,27 @@ python3 scripts/image/validate.py --qcow2 dist/xpf-<ver>.qcow2 \
     --metadata dist/xpf-<ver>.incus-metadata.tar.gz all
 ```
 
+Scenarios (`a|b|c|d|e|q|all`, default `all`):
+
+| key | proves |
+|-----|--------|
+| `a` | factory bootstrap (no drive): xpfd active, fxp0 DHCP, sshd, in-guest `verify-dataplane` |
+| `b` | valid day-0 drive: validated + installed + committed; reboot does NOT re-apply |
+| `c` | invalid drive: commit-check REJECT, nothing installed, boot survives; **then** a fixed drive + reboot DOES apply (the fix→reboot→applied retry contract, pairs with the day-0 `active.json` guard) |
+| `d` | resized disk: first-boot root auto-grow, idempotent on reboot, ESP intact |
+| `e` | cluster node-id drive: `node-id=1` persisted to `/etc/xpf/node-id`, cluster naming (`em0` + node-1 `ge-7/0/N`) |
+| `q` | libvirt/plain-QEMU bootability: the qcow2 is a valid, non-corrupt qcow2 ≥ the 8 GiB bake floor (always), and — gated on `qemu-system-x86_64` + `/dev/kvm` + OVMF — actually boots under direct QEMU with the day-0 config on a cdrom |
+
+Scenarios `a`–`e` need local incus; `q`'s boot leg needs qemu + KVM +
+OVMF and SKIPs (its config-level qcow2 probe still runs) when they are
+absent, like the root-required skips.
+
+Hermetic self-tests (no hypervisor, run in the `make selftest` runner —
+see below): `scripts/image/test_validate_scenarios.py` covers the pure
+pieces the incus/QEMU scenarios hinge on (the qcow2 bootability verdict,
+OVMF discovery order, the scenario registry, and the node-id drive
+round-trip).
+
 > **Deploying at scale?** `docs/deploy-quickstart.md` +
 > `examples/deploy/README.md` are the operator runbook: the positional
 > naming contract, the Python deployer (`scripts/deploy/xpf-deploy.py`
@@ -378,6 +399,37 @@ single ≥6.18 kernel, in-guest `verify-dataplane`, day-0 valid/invalid),
 Tier 2 (standalone forwarding + SNAT, manual), and Tier 3 (HA pair
 forwarding + failover, manual). Tier 1 gates the bake; Tiers 2–3 push
 real traffic and prove the image actually routes.
+
+### Self-tests — `make selftest`
+
+The day-0/image/dist/deploy tooling has a suite of hermetic self-tests
+(no root, no incus, no cluster, no network). `make selftest`
+(`scripts/run-selftests.sh`) is the single entry point that discovers and
+runs them all in one fast pass — before this they were reachable from no
+target and a regression re-introducing sign-before-validate (#4017) or
+breaking the grow-root stamp discipline (#2047) merged green. A leg whose
+external tool is missing SKIPs rather than fails, so the runner is green
+on a minimal host and only goes RED on a genuine regression. It covers:
+
+- shell parse-check (`sh`/`bash -n`) + `shellcheck` over the image/dist
+  shell scripts (`xpf-day0-config`, `xpf-grow-root`, `selftest.sh`, …);
+- `scripts/image/test-grow-root.sh` — grow-root device resolution + stamp
+  discipline (#1925);
+- `scripts/image/test_bake_sign_ordering.py` — VALIDATE-before-SIGN
+  ordering (#4017) + frr-pythontools presence;
+- `scripts/image/test_validate_scenarios.py` — the `validate.py` scenario
+  pure helpers (#4209 H-9);
+- `scripts/dist/selftest.sh` — the signed-distribution roundtrip
+  (sign → verify → tamper-fails → apt repo → `install.sh --dry-run`,
+  throwaway key; SKIPs without minisign/gpg/apt-ftparchive);
+- `scripts/deploy/test_xpf_deploy_*.py` — the deployer's pure functions,
+  NIC ordering, per-VM disks, and the **mixed-base HA safety gate**
+  (`_gate_mixed_base`, the Python mirror of `upgrade.GateMixedBaseSwap`)
+  with the same parity vectors as the Go test (#4211 H-24).
+
+The incus/QEMU image boot matrix (`validate.py`) and the loss-cluster
+smokes need a hypervisor and are NOT part of `make selftest` — they have
+their own entry points (above, and `make test-failover` / `docs/…`).
 
 ## What the image does NOT solve
 

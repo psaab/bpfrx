@@ -34261,3 +34261,33 @@ top.
 - **File(s)**: scripts/dist/build-apt-repo.sh, debian/rules,
   scripts/dist/publish.py, scripts/dist/selftest.sh, docs/distribution.md,
   docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: Fixed fable-review-165 H-9/H-19/H-24 (issues #4209/#4210/#4211) —
+  CI/self-test coverage gaps.
+  - H-9 (#4209): validate.py exercised first boot only under incus. Added
+    scenario `q` (libvirt/plain-QEMU bootability: an always-on qcow2 probe —
+    qemu-img info format==qcow2 + virtual-size >= 8 GiB bake floor + qemu-img
+    check — plus a gated direct-QEMU boot with the day-0 config on a cdrom,
+    SKIP without qemu-system/KVM/OVMF); scenario `e` (cluster node-id=1 drive
+    → /etc/xpf/node-id persisted + em0/ge-7/0/N cluster naming); and extended
+    scenario `c` with the reject→fix→reboot→applied retry leg (pairs with the
+    H-1 active.json guard). Scenario map is now a single registry
+    (SCENARIO_ORDER/SCENARIO_METHODS). New hermetic test
+    test_validate_scenarios.py (12 tests) covers _qemu_img_verdict, OVMF
+    discovery order, the registry, and the node-id drive round-trip.
+  - H-19 (#4210): the day-0/image/dist/deploy self-tests were wired into no
+    target. Added scripts/run-selftests.sh + `make selftest`: discovers and
+    runs all hermetic self-tests (shell parse-check + shellcheck, grow-root,
+    bake sign-order, validate helpers, dist roundtrip, all deploy tests) in
+    one pass; tool-gated legs SKIP. 27 legs green.
+  - H-24 (#4211): the xpf-deploy mixed-base HA safety gate (_gate_mixed_base,
+    Python mirror of upgrade.GateMixedBaseSwap) + core pure funcs were
+    untested. New test_xpf_deploy_gate.py (28 tests): gate parity vectors
+    SHARED with pkg/upgrade/imageversions_test.go, _u16, manifest round-trip,
+    peer-probe parse, expected_name, memory_mb, --nic parser. RED-on-revert
+    confirmed (dropping the session-sync exact-match flips the mismatch test).
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_scenarios.py,
+  scripts/deploy/test_xpf_deploy_gate.py, scripts/run-selftests.sh, Makefile,
+  docs/install-images.md, CLAUDE.md, _Log.md

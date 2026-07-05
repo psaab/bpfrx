@@ -64,6 +64,11 @@ make test            # Run BOTH the Go suite AND the Rust userspace-dp
                      # cargo suite (#4006) — a Rust dataplane regression
                      # fails `make test`. `make test-go` / `make test-rust`
                      # run one leg. The Rust leg needs cargo (~minutes).
+make selftest        # Run ALL day-0/image/dist/deploy self-tests
+                     # (scripts/run-selftests.sh) in one fast hermetic pass —
+                     # grow-root, bake sign-order, dist roundtrip, validate.py
+                     # helpers, xpf-deploy mixed-base HA gate. Tool-gated legs
+                     # SKIP. Run before touching image/day-0/dist/deploy tooling.
 ```
 
 ## Test Environment (Incus VM)

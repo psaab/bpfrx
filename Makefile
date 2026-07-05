@@ -150,6 +150,24 @@ audit-check:
 docs-check:
 	bash scripts/docs/check-upgrade-docs.sh
 
+# Single entry point for the day-0/image/dist/deploy self-tests (#4210 H-19).
+# Before this, scripts/image/test-grow-root.sh, test_bake_sign_ordering.py,
+# scripts/dist/selftest.sh, and scripts/deploy/test_xpf_deploy_*.py all passed
+# but were reachable from NO target — a regression re-introducing
+# sign-before-validate (#4017) or breaking the grow-root stamp discipline
+# (#2047) merged green because nothing ran them. `make selftest` discovers and
+# runs them all in one fast (<a few seconds), hermetic pass (no root, no incus,
+# no cluster, no network); a leg whose external tool is missing SKIPs rather
+# than fails. Standalone by design — same posture as audit-check / docs-check /
+# test-deploy-lib (this repo has no CI; every gate is developer-invoked). It is
+# the one command to run before touching image/day-0/dist/deploy tooling, and
+# the single hook a future CI would call. The incus/QEMU image boot matrix
+# (scripts/image/validate.py) and the loss-cluster smokes are NOT included —
+# they need a hypervisor and have their own entry points.
+.PHONY: selftest
+selftest:
+	sh scripts/run-selftests.sh
+
 # Bake the distributable appliance image (#1879 Path C): one
 # offline-built bootable root disk (LATEST Ubuntu server cloudimg base
 # discovered at bake time — XPF_BASE_RELEASE pins; linux-generic
