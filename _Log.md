@@ -33933,3 +33933,33 @@ top.
 - **File(s)**: scripts/deploy/xpf-deploy.py,
   scripts/deploy/test_xpf_deploy_disk.py, examples/deploy/README.md,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-164 L-1 test-gap — add NAT64 cross-family (V6 src,
+  V4 dst) policy `*-address-excluded` inversion + empty-set fail-closed
+  coverage (issue #4187). Behavior verified CORRECT (test-gap, not a
+  bug); this PR is TEST-ONLY, no production change. The NAT64 inbound
+  arm in `try_match_rule`
+  (`userspace-dp/src/policy.rs`, the `(IpAddr::V6(src), IpAddr::V4(dst))`
+  branch) re-implements the `source-address-excluded` /
+  `destination-address-excluded` inversion AND the both-families-empty
+  fail-closed guard independently against per-family fields (source ->
+  v6 sets, dest -> v4 sets); the pre-existing #2358 NAT64 tests only
+  exercised the non-excluded match/any/wrong-host paths, so a future
+  field-swap could silently make a NAT64 `deny *-address-excluded
+  <host>` fail OPEN. Added four tests to the #2358 block of
+  `policy_tests.rs`:
+  `nat64_inbound_destination_excluded_denies_listed_permits_other`
+  (excluded v4 dst .200 denied, .201 permitted),
+  `nat64_inbound_source_excluded_denies_listed_permits_other`
+  (v6 src inside excluded prefix denied, outside permitted),
+  `nat64_inbound_empty_excluded_destination_fails_closed`,
+  `nat64_inbound_empty_excluded_source_fails_closed`. RED-on-revert
+  PROVEN with two scratch flips on the NAT64 arm: dropping the
+  `!(v4_empty && v6_empty)` guard (fail-open) -> the two empty-set tests
+  FAIL; disabling the exclusion inversion (`if false`) -> the two
+  inversion tests FAIL; policy.rs restored pristine. FULL cargo test
+  --release green (3532 lib tests + all bin/integration binaries, 0
+  failed); go build ./... green. No doc change: no doc documents the
+  Rust policy-engine per-arm test coverage.
+- **File(s)**: userspace-dp/src/policy_tests.rs, _Log.md

@@ -5854,6 +5854,231 @@ fn nat46_v4_src_v6_dst_tuple_never_matches() {
     );
 }
 
+// === #4187: NAT64 cross-family (V6 src, V4 dst) *-excluded inversion +
+// empty-set fail-closed coverage ===========================================
+//
+// The NAT64 inbound arm (`(IpAddr::V6(src), IpAddr::V4(dst))` in
+// `try_match_rule`) re-implements the `source-address-excluded` /
+// `destination-address-excluded` inversion AND the both-families-empty
+// fail-closed guard INDEPENDENTLY against per-family fields (source -> v6
+// sets, dest -> v4 sets). The tests above only exercise the NON-excluded
+// match/any/wrong-host paths, so a future edit swapping a field on this arm
+// (e.g. reading the wrong family literal, or dropping the empty-set guard)
+// could silently make a NAT64 `deny *-address-excluded <host>` fail OPEN
+// with nothing failing. These four tests pin the exclusion inversion and the
+// empty-set fail-closed guard on BOTH sides of the arm. They mirror the
+// same-family `test_policy_source_address_excluded_inverts_match` /
+// `test_empty_excluded_*_fails_closed_*` tests, but drive the mixed
+// (V6 src, V4 dst) tuple that only NAT64 produces.
+//
+// The source side uses the v6 literal set (v3-shaped `source_literals`); the
+// destination side uses the v4 literal set (`destination_literals`).
+
+#[test]
+fn nat64_inbound_destination_excluded_denies_listed_permits_other() {
+    // `destination-address-excluded [172.16.80.200/32]`: with the v6 source
+    // in the rule's IPv6 source prefix, the excluded v4 host (.200) is DENIED
+    // while any other v4 host (.201) is PERMITTED — proving the arm inverts
+    // the v4 destination set (not a blanket match/deny).
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "deny-nat64-dst-excluded".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_literals: vec!["2001:559:8585:ef00::/64".to_string()],
+            destination_literals: vec!["172.16.80.200/32".to_string()],
+            destination_address_excluded: true,
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    // The excluded v4 destination must NOT match -> default-deny.
+    // FAIL-ON-REVERT: flip the arm's `dst_ok` excluded branch to the
+    // non-inverted `contains(dst)` and this returns Permit.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("v6 src"),
+            "172.16.80.200".parse().expect("excluded v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "an excluded v4 destination must NOT match on the NAT64 arm"
+    );
+    // A v4 destination OUTSIDE the excluded set matches -> permit.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("v6 src"),
+            "172.16.80.201".parse().expect("non-excluded v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "a non-excluded v4 destination must match on the NAT64 arm"
+    );
+}
+
+#[test]
+fn nat64_inbound_source_excluded_denies_listed_permits_other() {
+    // `source-address-excluded [2001:559:8585:ef00::/64]`: a v6 source INSIDE
+    // the excluded prefix is DENIED while a v6 source OUTSIDE it is PERMITTED
+    // (with the v4 destination matching) — proving the arm inverts the v6
+    // source set.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "deny-nat64-src-excluded".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_literals: vec!["2001:559:8585:ef00::/64".to_string()],
+            source_address_excluded: true,
+            destination_literals: vec!["172.16.80.200/32".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    // A v6 source INSIDE the excluded prefix must NOT match -> default-deny.
+    // FAIL-ON-REVERT: flip the arm's `src_ok` excluded branch to the
+    // non-inverted `contains(src)` and this returns Permit.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("excluded v6 src"),
+            "172.16.80.200".parse().expect("v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a v6 source inside the excluded prefix must NOT match on the NAT64 arm"
+    );
+    // A v6 source OUTSIDE the excluded prefix matches -> permit.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:dead::1".parse().expect("non-excluded v6 src"),
+            "172.16.80.200".parse().expect("v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "a v6 source outside the excluded prefix must match on the NAT64 arm"
+    );
+}
+
+#[test]
+fn nat64_inbound_empty_excluded_destination_fails_closed() {
+    // An empty-string destination literal is a valid no-op token that yields
+    // a fully-empty destination set (both families empty). On the NAT64 arm
+    // the `destination_excluded` branch must fail CLOSED via the
+    // `!(destination_v4_empty && destination_v6_empty)` guard — inverting an
+    // empty excluded set into match-all would be a security fail-OPEN.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "deny-nat64-empty-dst-excluded".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_literals: vec!["2001:559:8585:ef00::/64".to_string()],
+            destination_literals: vec!["".to_string()],
+            destination_address_excluded: true,
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    // Confirm the empty flags are set so the fail-closed guard is genuinely
+    // exercised (not a source mismatch).
+    assert!(
+        state.rules[0].destination_v4_empty && state.rules[0].destination_v6_empty,
+        "an empty excluded destination set must be flagged empty on both families"
+    );
+    // Source matches; the ONLY reason for deny is the empty-excluded-dst
+    // fail-closed guard. FAIL-ON-REVERT: drop the `!(v4_empty && v6_empty)`
+    // guard from the arm's `dst_ok` and this returns Permit (match-all).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("v6 src"),
+            "172.16.80.200".parse().expect("v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "an empty excluded destination set must fail-closed on the NAT64 arm"
+    );
+}
+
+#[test]
+fn nat64_inbound_empty_excluded_source_fails_closed() {
+    // The source-side mirror: an empty-string source literal yields a
+    // fully-empty source set (both families empty). On the NAT64 arm the
+    // `source_excluded` branch must fail CLOSED via the
+    // `!(source_v4_empty && source_v6_empty)` guard.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "deny-nat64-empty-src-excluded".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_literals: vec!["".to_string()],
+            source_address_excluded: true,
+            destination_literals: vec!["172.16.80.200/32".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    assert!(
+        state.rules[0].source_v4_empty && state.rules[0].source_v6_empty,
+        "an empty excluded source set must be flagged empty on both families"
+    );
+    // Destination matches; the ONLY reason for deny is the empty-excluded-src
+    // fail-closed guard. FAIL-ON-REVERT: drop the `!(v4_empty && v6_empty)`
+    // guard from the arm's `src_ok` and this returns Permit (match-all).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("v6 src"),
+            "172.16.80.200".parse().expect("v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "an empty excluded source set must fail-closed on the NAT64 arm"
+    );
+}
+
 // ===========================================================================
 // #3346: application-term precedence is CONFIG ORDER (Junos first-term-wins),
 // not the old class heuristic (exact-port always beats range beats
