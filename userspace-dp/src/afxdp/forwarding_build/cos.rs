@@ -29,9 +29,38 @@ pub(super) struct ClassifierTables<'a> {
     pub scheduler_maps: FastMap<String, &'a CoSSchedulerMapSnapshot>,
 }
 
+/// #hb166 T-4: substitute the interface default queue for a classifier
+/// code-point whose forwarding-class resolves to a queue the interface does
+/// NOT materialize (no scheduler-map entry / no synthetic queue for it).
+///
+/// A behavior-aggregate classifier maps a DSCP / PCP code-point to a
+/// forwarding-class, which maps to a `queue_id` via the GLOBAL
+/// `class_to_queue`. But an interface only materializes the queues named by
+/// its scheduler-map (plus the synthetic best-effort). A code-point steering
+/// to a queue the interface never built used to be written verbatim into the
+/// per-interface table; at runtime `resolve_cos_queue_idx` then found no such
+/// queue and the enqueue path DROPPED every packet of that code-point — a
+/// 100% silent blackhole that still committed cleanly. Fail SAFE instead:
+/// forward on the interface default (best-effort) queue. The dataplane
+/// enqueue path carries a matching runtime fallback (#hb166 T-4 in
+/// `tx/cos_classify.rs::resolve_cos_queue_idx`).
+fn materialized_queue_or_default(
+    queue_id: u8,
+    materialized_queues: &[u8],
+    default_queue: u8,
+) -> u8 {
+    if materialized_queues.contains(&queue_id) {
+        queue_id
+    } else {
+        default_queue
+    }
+}
+
 fn build_cos_dscp_queue_table(
     classifier_name: &str,
     classifiers: &FastMap<String, CoSDSCPClassifierConfig>,
+    materialized_queues: &[u8],
+    default_queue: u8,
 ) -> Result<[u8; 64], crate::policy::SnapshotIntegrityError> {
     let mut table = [u8::MAX; 64];
     if classifier_name.is_empty() {
@@ -54,7 +83,7 @@ fn build_cos_dscp_queue_table(
                     },
                 );
             };
-            *slot = queue_id;
+            *slot = materialized_queue_or_default(queue_id, materialized_queues, default_queue);
         }
     }
     Ok(table)
@@ -63,6 +92,8 @@ fn build_cos_dscp_queue_table(
 fn build_cos_ieee8021_queue_table(
     classifier_name: &str,
     classifiers: &FastMap<String, CoSIEEE8021ClassifierConfig>,
+    materialized_queues: &[u8],
+    default_queue: u8,
 ) -> Result<[u8; 8], crate::policy::SnapshotIntegrityError> {
     let mut table = [u8::MAX; 8];
     if classifier_name.is_empty() {
@@ -83,7 +114,7 @@ fn build_cos_ieee8021_queue_table(
                     },
                 );
             };
-            *slot = queue_id;
+            *slot = materialized_queue_or_default(queue_id, materialized_queues, default_queue);
         }
     }
     Ok(table)
@@ -475,12 +506,6 @@ pub(super) fn build_cos_iface_config(
     if !contributes_usable_cos_state {
         return Ok(None);
     }
-    let dscp_queue_by_dscp =
-        build_cos_dscp_queue_table(&iface.cos_dscp_classifier, &tables.dscp_classifiers)?;
-    let ieee8021_queue_by_pcp = build_cos_ieee8021_queue_table(
-        &iface.cos_ieee8021_classifier,
-        &tables.ieee8021_classifiers,
-    )?;
 
     if queues.is_empty() {
         queues.push(CoSQueueConfig {
@@ -515,6 +540,25 @@ pub(super) fn build_cos_iface_config(
         .find(|queue| queue.forwarding_class == "best-effort")
         .map(|queue| queue.queue_id)
         .unwrap_or_else(|| queues[0].queue_id);
+    // #hb166 T-4: the queue ids this interface actually materializes at
+    // runtime. Built AFTER the synthetic best-effort fallback + sort so it is
+    // the FINAL queue set. The behavior-aggregate classifier tables below use
+    // it to fail-SAFE — a code-point whose forwarding-class resolves to a queue
+    // outside this set falls back to `default_queue` (forward on best-effort)
+    // instead of writing an unmaterialized queue id that blackholes at enqueue.
+    let materialized_queues: Vec<u8> = queues.iter().map(|queue| queue.queue_id).collect();
+    let dscp_queue_by_dscp = build_cos_dscp_queue_table(
+        &iface.cos_dscp_classifier,
+        &tables.dscp_classifiers,
+        &materialized_queues,
+        default_queue,
+    )?;
+    let ieee8021_queue_by_pcp = build_cos_ieee8021_queue_table(
+        &iface.cos_ieee8021_classifier,
+        &tables.ieee8021_classifiers,
+        &materialized_queues,
+        default_queue,
+    )?;
     // #1614 A1: parse the operator-selectable oversubscription
     // policy. "" or "proportional" (default) maps to Proportional
     // (current scheduler unchanged); "guarantee-rate" activates the

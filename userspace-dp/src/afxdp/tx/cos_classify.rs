@@ -184,7 +184,17 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
     let mut three_color_policers = output_result.three_color_policers;
     let filter_log = output_result.log_match;
 
-    if (output_filter.is_none() && has_input_tx_selection) || has_input_three_color_policer {
+    // #hb166 T-3 (cached mirror): evaluate the ingress input filter for its
+    // forwarding-class whenever an input tx-selection filter (or policer)
+    // exists, INCLUDING when an output filter is attached. `forwarding_class`
+    // is folded with `.or()` so a `then forwarding-class` on the output filter
+    // still wins and the input class only fills the gap — output-overrides-
+    // when-set, not presence-clears-ingress. The cached counter set stays the
+    // output filter's when an output filter is present (the ingress input
+    // filter's counters are captured separately on the cached hit path via
+    // `evaluate_interface_input_filter_counters_cached`, #3777/#4085), so the
+    // `if output_filter.is_none()` gate on `filter_counters` is preserved.
+    if has_input_tx_selection || has_input_three_color_policer {
         let ingress_ifindex = resolve_ingress_logical_ifindex(
             forwarding,
             meta.ingress_ifindex as i32,
@@ -205,8 +215,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
                 .map(Arc::as_ref)
         };
         if let Some(ingress_filter) = ingress_filter.filter(|filter| {
-            (output_filter.is_none() && filter.affects_tx_selection)
-                || filter.has_three_color_policer_terms
+            filter.affects_tx_selection || filter.has_three_color_policer_terms
         }) {
             let ingress_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
                 ingress_filter,
@@ -218,8 +227,8 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
                 meta.dscp,
             );
             effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
+            forwarding_class = forwarding_class.or(ingress_result.forwarding_class);
             if output_filter.is_none() {
-                forwarding_class = ingress_result.forwarding_class;
                 filter_counters = ingress_result.counters;
             }
             three_color_policers.extend(ingress_result.three_color_policers);
@@ -423,36 +432,44 @@ fn resolve_cos_tx_selection_internal(
     } else {
         None
     };
-    let has_output_filter = output_filter.is_some();
-    let ingress_ifindex =
-        if (!has_output_filter && has_input_tx_selection) || has_input_three_color_policer {
-            resolve_ingress_logical_ifindex(
-                forwarding,
-                meta.ingress_ifindex as i32,
-                meta.ingress_vlan_id,
-            )
-            .unwrap_or(meta.ingress_ifindex as i32)
+    // #hb166 T-3: evaluate the INGRESS input filter for its forwarding-class /
+    // dscp-rewrite whenever an input tx-selection filter (or an input
+    // three-color policer) exists — INCLUDING when an OUTPUT filter is also
+    // attached. Junos semantics are output-OVERRIDES-when-set, not
+    // output-PRESENCE-clears-ingress: a counter/log/terminal-only output filter
+    // with no `then forwarding-class` must NOT wipe the class an input filter
+    // assigned. The output result still wins when it sets a class (resolved
+    // first below); the ingress class only fills the gap. The `then count`
+    // double-count is already avoided by the counter-suppressed ingress variant
+    // (#4085), so evaluating the ingress leg here is side-effect free.
+    let need_ingress_eval = has_input_tx_selection || has_input_three_color_policer;
+    let ingress_ifindex = if need_ingress_eval {
+        resolve_ingress_logical_ifindex(
+            forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32)
+    } else {
+        0
+    };
+    let ingress_filter = if need_ingress_eval {
+        if is_v6 {
+            forwarding
+                .filter_state
+                .iface_filter_v6_fast
+                .get(&ingress_ifindex)
+                .map(Arc::as_ref)
         } else {
-            0
-        };
-    let ingress_filter =
-        if (!has_output_filter && has_input_tx_selection) || has_input_three_color_policer {
-            if is_v6 {
-                forwarding
-                    .filter_state
-                    .iface_filter_v6_fast
-                    .get(&ingress_ifindex)
-                    .map(Arc::as_ref)
-            } else {
-                forwarding
-                    .filter_state
-                    .iface_filter_v4_fast
-                    .get(&ingress_ifindex)
-                    .map(Arc::as_ref)
-            }
-        } else {
-            None
-        };
+            forwarding
+                .filter_state
+                .iface_filter_v4_fast
+                .get(&ingress_ifindex)
+                .map(Arc::as_ref)
+        }
+    } else {
+        None
+    };
     let output_result = if let Some(output_filter) = output_filter.filter(|filter| {
         filter.affects_tx_selection
             || filter.has_counter_terms
@@ -501,7 +518,7 @@ fn resolve_cos_tx_selection_internal(
     let mut ingress_forwarding_class = None;
     let filter_log = output_result.log_match;
     if let Some(ingress_filter) = ingress_filter.filter(|filter| {
-        (!has_output_filter && filter.affects_tx_selection) || filter.has_three_color_policer_terms
+        filter.affects_tx_selection || filter.has_three_color_policer_terms
     }) {
         // #4085: the INGRESS input filter's `then count` terms are already
         // recorded exactly once by the input-filter ACTION evaluation
@@ -540,9 +557,11 @@ fn resolve_cos_tx_selection_internal(
         };
         effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
         drop |= ingress_result.policer_drop;
-        if !has_output_filter {
-            ingress_forwarding_class = ingress_result.forwarding_class;
-        }
+        // #hb166 T-3: always capture the ingress forwarding-class. The resolver
+        // below tries the OUTPUT filter's class FIRST, so a `then
+        // forwarding-class` on the output filter still wins; the ingress class
+        // is only consulted when the output filter set none (or is absent).
+        ingress_forwarding_class = ingress_result.forwarding_class;
     }
     let Some(iface) = iface else {
         return CoSTxSelection {
@@ -840,16 +859,34 @@ pub(super) fn resolve_cos_queue_idx(
     if root.queues.is_empty() {
         return None;
     }
-    if let Some(queue_id) = requested_queue {
-        return root
-            .queues
+    // The default-queue index. `queues` is non-empty here, so index 0 is always
+    // a valid fallback when the interface has no queue tagged as its
+    // `default_queue`.
+    let default_idx = || {
+        root.queues
             .iter()
-            .position(|queue| queue.queue_id() == queue_id);
+            .position(|queue| queue.queue_id() == root.default_queue)
+            .unwrap_or(0)
+    };
+    if let Some(queue_id) = requested_queue {
+        // #hb166 T-4: a requested queue that this interface does not
+        // materialize (e.g. a BA classifier code-point steering to a
+        // forwarding-class with no scheduler-map entry, or a cached descriptor
+        // that froze a queue id which a later config drop un-materialized) MUST
+        // fall back to the default/best-effort queue — forward on best-effort,
+        // NEVER blackhole. Pre-fix `position()` returned `None` for an
+        // unmaterialized queue, and the sole enqueue caller turned that `None`
+        // into an `Err` → drop. The build-time classifier table (#hb166 T-4 in
+        // forwarding_build/cos.rs) already substitutes the default queue, so
+        // this runtime fallback is the belt-and-suspenders second layer.
+        return Some(
+            root.queues
+                .iter()
+                .position(|queue| queue.queue_id() == queue_id)
+                .unwrap_or_else(default_idx),
+        );
     }
-    root.queues
-        .iter()
-        .position(|queue| queue.queue_id() == root.default_queue)
-        .or_else(|| (!root.queues.is_empty()).then_some(0))
+    Some(default_idx())
 }
 
 pub(in crate::afxdp) fn demote_prepared_cos_queue_to_local(
@@ -1040,12 +1077,16 @@ fn enqueue_cos_item(
         let Some(root) = binding.cos.cos_interfaces.get_mut(&egress_ifindex) else {
             return Err(item);
         };
-        let Some(mut queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
+        // #hb166 T-4: `resolve_cos_queue_idx` always returns a `position()` into
+        // `root.queues` (or `None` only when the interface has no queues at
+        // all), so the resolved index is in-bounds by construction. The prior
+        // `if queue_idx >= root.queues.len() { queue_idx = 0; }` clamp was
+        // dead code that implied a fallback the resolver did not actually
+        // provide for an unmaterialized requested queue — the real fallback now
+        // lives inside `resolve_cos_queue_idx` (default-queue substitution).
+        let Some(queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
             return Err(item);
         };
-        if queue_idx >= root.queues.len() {
-            queue_idx = 0;
-        }
         let root_was_empty = root.nonempty_queues == 0;
         let queue = &mut root.queues[queue_idx];
         // #707: aggregate cap scales with prospective-active flow count
