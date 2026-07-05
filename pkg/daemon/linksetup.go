@@ -249,7 +249,7 @@ func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(fr
 	// After this every desired final name is free. The positional path names
 	// every present NIC, so there are no unmapped stranded NICs — the stranded
 	// set is empty and ignored.
-	_, changed := breakNameCollisions(currentNames, desiredNames,
+	_, changed := breakNameCollisions("linksetup", currentNames, desiredNames,
 		desiredByCurrent, originalByCurrent, renameFn)
 
 	// Phase 2: write each .link with its pre-captured OriginalName and rename
@@ -299,8 +299,12 @@ func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(fr
 // occupancy and to pick an xpf-tmp-N that is not already in use (a leftover
 // temp name from a prior crashed run must not cause an EEXIST temp rename).
 // renameFn is injected so both callers reuse renameInterface (and tests can
-// model EEXIST semantics).
+// model EEXIST semantics). logPrefix ("linksetup" or "device-map") tags the
+// temp-rename logs so they match the surrounding mode's log lines (an operator
+// / log-based alerting reading a device-map collision sees "device-map:", not
+// a misleading "linksetup:").
 func breakNameCollisions(
+	logPrefix string,
 	currentNames []string,
 	desiredNames map[string]bool,
 	desiredByCurrent map[string]string,
@@ -330,11 +334,11 @@ func breakNameCollisions(
 		}
 		tmp := freeTempName()
 		if err := renameFn(name, tmp); err != nil {
-			slog.Warn("linksetup: temp-rename to break collision failed",
+			slog.Warn(logPrefix+": temp-rename to break collision failed",
 				"from", name, "to", tmp, "err", err)
 			continue
 		}
-		slog.Info("linksetup: temp-renamed conflicting interface", "from", name, "to", tmp)
+		slog.Info(logPrefix+": temp-renamed conflicting interface", "from", name, "to", tmp)
 		changed = true
 		if final, ok := desiredByCurrent[name]; ok {
 			// This NIC is itself a desired source — carry its mapping and its

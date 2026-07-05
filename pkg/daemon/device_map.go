@@ -178,7 +178,7 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		nicByName[nics[i].Name] = nics[i]
 		currentNames[i] = nics[i].Name
 	}
-	strandedTmp, changed := breakNameCollisions(currentNames, desiredNames,
+	strandedTmp, changed := breakNameCollisions("device-map", currentNames, desiredNames,
 		desiredByCurrent, originalByCurrent, renameInterface)
 	// A temp-stranded UNMAPPED NIC (not a desired source) is carried into phase
 	// 3 keyed by its temp name; the presentNIC keeps its ORIGINAL (pre-temp)

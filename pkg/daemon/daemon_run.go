@@ -1869,13 +1869,22 @@ func (d *Daemon) applyStartupNamingForConfig(cfg *config.Config) error {
 // caller places it BEFORE the reconcile so the config is wired onto the
 // correctly-named links. The config-less node forwards no real traffic yet
 // (empty config at boot), so the mid-apply rename is safe. Returns true if
-// naming was re-run (the one-shot flag was consumed). An empty config does NOT
-// consume the flag — naming waits for the real cluster config.
+// naming was re-run AND succeeded (the one-shot flag was consumed). An empty
+// config does NOT consume the flag — naming waits for the real cluster config.
+//
+// The flag is consumed only on SUCCESS: if applyStartupNamingForConfig errors
+// (a transient NIC enumeration / netlink failure), the flag STAYS SET so the
+// next config apply retries. Otherwise a single transient error would strand
+// the config-less HA node on standalone names forever. The retry is bounded to
+// once per config apply (a commit / SyncApply, not a hot loop); a persistently
+// failing enumeration re-attempts on each commit, which is acceptable and
+// logged. Both call sites run under d.applySem, so applies are serialized and
+// the success path cannot double-run.
 func (d *Daemon) maybeReapplyConfigArrivalNaming(cfg *config.Config) bool {
 	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
 		return false
 	}
-	if !d.emptyHANamingPending.CompareAndSwap(true, false) {
+	if !d.emptyHANamingPending.Load() {
 		return false
 	}
 	_, clusterMode, _, _, _ := namingParamsFromConfig(cfg)
@@ -1883,8 +1892,15 @@ func (d *Daemon) maybeReapplyConfigArrivalNaming(cfg *config.Config) bool {
 		"non-empty config; re-running startup naming with the config's cluster identity",
 		"cluster_mode", clusterMode)
 	if err := d.applyStartupNamingForConfig(cfg); err != nil {
-		slog.Warn("config-arrival interface naming failed", "err", err)
+		// Leave the flag SET so the next config apply retries — a transient
+		// enumeration/netlink error must not permanently strand this node on
+		// standalone names.
+		slog.Warn("config-arrival interface naming failed; will retry on the next config apply",
+			"err", err)
+		return false
 	}
+	// Consume the one-shot flag only now that naming succeeded.
+	d.emptyHANamingPending.Store(false)
 	return true
 }
 
