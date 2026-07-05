@@ -298,6 +298,10 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"source-ip-based":      {desc: "Source IP based limit", args: 1, placeholder: "<number>", children: nil},
 				"destination-ip-based": {desc: "Destination IP based limit", args: 1, placeholder: "<number>", children: nil},
 			}},
+			// Profile-wide audit/log-only mode: a tripped check raises a
+			// log-only alarm and forwards the packet instead of dropping it
+			// (Junos threshold-tuning posture). Boolean flag leaf, no value.
+			"alarm-without-drop": {desc: "Alarm but do not drop (audit/log-only mode)", children: nil},
 		}},
 	}},
 	"nat": {desc: "Network Address Translation", children: map[string]*schemaNode{

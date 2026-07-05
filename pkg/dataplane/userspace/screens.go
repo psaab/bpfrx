@@ -48,6 +48,12 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 			Teardrop:     sp.IP.TearDrop,
 			SynFrag:      sp.TCP.SynFrag, // #1137 — port from typed config
 			SourceRoute:  sp.IP.SourceRouteOption,
+			// Profile-wide audit/log-only modifier. Not a "check" itself —
+			// it is intentionally omitted from the emit-gate below, so a
+			// profile carrying ONLY alarm-without-drop (no enabled check)
+			// is a no-op and is not published. When any check IS enabled it
+			// rides along and flips every drop to a log-only alarm.
+			AlarmWithoutDrop: sp.AlarmWithoutDrop,
 		}
 		if sp.ICMP.FloodThreshold > 0 {
 			snap.ICMPFloodThreshold = uint32(sp.ICMP.FloodThreshold)

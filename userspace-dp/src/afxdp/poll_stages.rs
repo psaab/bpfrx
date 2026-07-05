@@ -495,24 +495,42 @@ pub(super) fn stage_screen_check(
                 return StageOutcome::RecycleAndContinue;
             }
         };
-        return match screen.check_flowless_screens_opts(
+        let flowless_verdict = screen.check_flowless_screens_opts(
             zone_name,
             &screen_pkt,
             addrs_known,
             now_secs,
             skip_rate_flood,
-        ) {
+        );
+        return match flowless_verdict {
             ScreenVerdict::Drop(reason) => {
-                emit_screen_drop_event(
-                    worker_ctx.event_stream,
-                    &screen_pkt,
-                    meta,
-                    zone_id,
-                    reason,
-                    event_now_ns_from_secs(now_secs),
-                );
-                counters.record_screen_drop(reason);
-                StageOutcome::RecycleAndContinue
+                // Junos `alarm-without-drop`: the check already RAN and
+                // updated its counters; suppress only the packet drop and
+                // raise a log-only alarm (PERMIT) carrying the tripped
+                // reason, then forward.
+                if screen.alarm_without_drop(zone_name) {
+                    emit_screen_alarm_event(
+                        worker_ctx.event_stream,
+                        &screen_pkt,
+                        meta,
+                        zone_id,
+                        reason,
+                        event_now_ns_from_secs(now_secs),
+                    );
+                    screen.record_alarm_without_drop();
+                    StageOutcome::Continue(ScreenCheckOutcome::Pass)
+                } else {
+                    emit_screen_drop_event(
+                        worker_ctx.event_stream,
+                        &screen_pkt,
+                        meta,
+                        zone_id,
+                        reason,
+                        event_now_ns_from_secs(now_secs),
+                    );
+                    counters.record_screen_drop(reason);
+                    StageOutcome::RecycleAndContinue
+                }
             }
             // The flowless source-independent screens only ever return Pass
             // or Drop — they never mint a SYN-cookie challenge/bypass (those
@@ -579,32 +597,65 @@ pub(super) fn stage_screen_check(
             StageOutcome::Continue(ScreenCheckOutcome::Pass)
         }
         ScreenVerdict::Drop(reason) => {
-            emit_screen_drop_event(
-                worker_ctx.event_stream,
-                &screen_pkt,
-                meta,
-                zone_id,
-                reason,
-                event_now_ns_from_secs(now_secs),
-            );
-            counters.record_screen_drop(reason);
-            if reason == "syn-cookie-unavailable" {
-                counters.syn_cookie_secret_unavailable += 1;
+            // Junos `alarm-without-drop`: the check ran and counted; suppress
+            // only the drop and raise a log-only alarm carrying the tripped
+            // reason, then forward. Applies profile-wide (land, teardrop,
+            // rate-based flood, session-limit, syn-cookie-unavailable, ...).
+            if screen.alarm_without_drop(zone_name) {
+                emit_screen_alarm_event(
+                    worker_ctx.event_stream,
+                    &screen_pkt,
+                    meta,
+                    zone_id,
+                    reason,
+                    event_now_ns_from_secs(now_secs),
+                );
+                screen.record_alarm_without_drop();
+                StageOutcome::Continue(ScreenCheckOutcome::Pass)
+            } else {
+                emit_screen_drop_event(
+                    worker_ctx.event_stream,
+                    &screen_pkt,
+                    meta,
+                    zone_id,
+                    reason,
+                    event_now_ns_from_secs(now_secs),
+                );
+                counters.record_screen_drop(reason);
+                if reason == "syn-cookie-unavailable" {
+                    counters.syn_cookie_secret_unavailable += 1;
+                }
+                StageOutcome::RecycleAndContinue
             }
-            StageOutcome::RecycleAndContinue
         }
         ScreenVerdict::SynCookieChallenge(challenge) => {
-            emit_screen_drop_event(
-                worker_ctx.event_stream,
-                &screen_pkt,
-                meta,
-                zone_id,
-                "syn-cookie",
-                event_now_ns_from_secs(now_secs),
-            );
-            counters.record_screen_drop("syn-cookie");
-            counters.syn_cookie_challenges += 1;
-            StageOutcome::Continue(ScreenCheckOutcome::SynCookieChallenge(challenge))
+            // In `alarm-without-drop` audit mode, do NOT perturb the TCP
+            // handshake with a SYN-cookie challenge: log the flood as a
+            // PERMIT alarm and forward the original SYN untouched.
+            if screen.alarm_without_drop(zone_name) {
+                emit_screen_alarm_event(
+                    worker_ctx.event_stream,
+                    &screen_pkt,
+                    meta,
+                    zone_id,
+                    "syn-cookie",
+                    event_now_ns_from_secs(now_secs),
+                );
+                screen.record_alarm_without_drop();
+                StageOutcome::Continue(ScreenCheckOutcome::Pass)
+            } else {
+                emit_screen_drop_event(
+                    worker_ctx.event_stream,
+                    &screen_pkt,
+                    meta,
+                    zone_id,
+                    "syn-cookie",
+                    event_now_ns_from_secs(now_secs),
+                );
+                counters.record_screen_drop("syn-cookie");
+                counters.syn_cookie_challenges += 1;
+                StageOutcome::Continue(ScreenCheckOutcome::SynCookieChallenge(challenge))
+            }
         }
     }
 }
@@ -2557,6 +2608,91 @@ mod tests {
             !dropped && drops == 0,
             "regression: a benign non-fragmented packet still passes the \
              flow path with no false positive"
+        );
+    }
+
+    /// A `fragment_screen()` profile plus the Junos profile-wide
+    /// `alarm-without-drop` audit modifier.
+    fn fragment_screen_alarm_without_drop() -> ScreenState {
+        let mut profiles = FxHashMap::default();
+        profiles.insert(
+            "lan".to_string(),
+            ScreenProfile {
+                ping_death: true,
+                teardrop: true,
+                icmp_fragment: true,
+                land: true,
+                syn_fin: true,
+                no_flag: true,
+                alarm_without_drop: true,
+                ..ScreenProfile::default()
+            },
+        );
+        let mut screen = ScreenState::new();
+        screen.update_profiles(profiles);
+        screen
+    }
+
+    /// fable-review-164 L-10 fail-on-revert: Junos `alarm-without-drop` audit
+    /// mode FORWARDS a packet that would otherwise trip a screen — exercising
+    /// BOTH verdict consumers (the flowless L3 teardrop path AND the flow-path
+    /// land screen) — while still raising a log-only alarm and counting it.
+    /// Without the modifier the identical packets DROP (the baseline arms
+    /// prove the drop is real). Reverting either consumer's alarm branch turns
+    /// the `!dropped`/`drops == 0`/`alarm_without_drop_events == 1` asserts RED.
+    #[test]
+    fn alarm_without_drop_forwards_but_alarms_l10() {
+        // (1) Flowless teardrop fragment (offset 1 unit, payload 4 < 8).
+        let frag = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+        let frag_meta = ipv4_fragment_meta(&frag, FRAG_PROTO_UDP);
+        assert!(
+            parse_session_flow_from_bytes(&frag, frag_meta).is_none(),
+            "teardrop non-first fragment is flowless"
+        );
+        let mut base = fragment_screen();
+        let (d0, n0) = run_stage_screen(&mut base, &frag, frag_meta, None);
+        assert!(d0 && n0 == 1, "baseline: teardrop fragment must DROP");
+
+        let mut alarm = fragment_screen_alarm_without_drop();
+        let (d1, n1) = run_stage_screen(&mut alarm, &frag, frag_meta, None);
+        assert!(
+            !d1 && n1 == 0,
+            "alarm-without-drop must FORWARD the teardrop fragment on the \
+             flowless path (no drop, no screen_drop counter)"
+        );
+        assert_eq!(
+            alarm.alarm_without_drop_events(),
+            1,
+            "alarm-without-drop raises exactly one log-only alarm (flowless)"
+        );
+
+        // (2) Flow-path land screen (src == dst) on a non-fragmented SYN.
+        let land = tcp_v4_frame(
+            Ipv4Addr::new(203, 0, 113, 7),
+            Ipv4Addr::new(203, 0, 113, 7),
+            40000,
+            443,
+            TCP_FLAG_SYN,
+            1,
+            0,
+        );
+        let land_meta = tcp_v4_meta(&land, TCP_FLAG_SYN);
+        let land_flow = parse_session_flow_from_bytes(&land, land_meta)
+            .expect("non-fragmented TCP yields a session flow (flow path)");
+        let mut base2 = fragment_screen();
+        let (d2, n2) = run_stage_screen(&mut base2, &land, land_meta, Some(&land_flow));
+        assert!(d2 && n2 == 1, "baseline: land (src == dst) must DROP");
+
+        let mut alarm2 = fragment_screen_alarm_without_drop();
+        let (d3, n3) = run_stage_screen(&mut alarm2, &land, land_meta, Some(&land_flow));
+        assert!(
+            !d3 && n3 == 0,
+            "alarm-without-drop must FORWARD the land packet on the flow path"
+        );
+        assert_eq!(
+            alarm2.alarm_without_drop_events(),
+            1,
+            "alarm-without-drop raises exactly one log-only alarm (flow path)"
         );
     }
 

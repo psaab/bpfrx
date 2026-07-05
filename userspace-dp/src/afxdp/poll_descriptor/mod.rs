@@ -1847,19 +1847,36 @@ pub(super) fn poll_binding_process_descriptor(
                         }
                         if let Some(reason) = new_flow_screen_reason {
                             // The screen verdict is already decided; reuse
-                            // the single parse above for the drop event's
-                            // 5-tuple.
-                            emit_screen_drop_event(
-                                worker_ctx.event_stream,
-                                &screen_pkt,
-                                meta,
-                                from_zone_id,
-                                reason,
-                                event_now_ns_from_secs(now_secs),
-                            );
-                            telemetry.counters.record_screen_drop(reason);
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
+                            // the single parse above for the drop/alarm
+                            // event's 5-tuple.
+                            if screen.alarm_without_drop(from_zone) {
+                                // Junos `alarm-without-drop`: the scan/sweep
+                                // (or session-limit) check already ran and
+                                // updated its tracker; suppress only the drop
+                                // and raise a log-only alarm, then fall
+                                // through and install the new flow normally.
+                                emit_screen_alarm_event(
+                                    worker_ctx.event_stream,
+                                    &screen_pkt,
+                                    meta,
+                                    from_zone_id,
+                                    reason,
+                                    event_now_ns_from_secs(now_secs),
+                                );
+                                screen.record_alarm_without_drop();
+                            } else {
+                                emit_screen_drop_event(
+                                    worker_ctx.event_stream,
+                                    &screen_pkt,
+                                    meta,
+                                    from_zone_id,
+                                    reason,
+                                    event_now_ns_from_secs(now_secs),
+                                );
+                                telemetry.counters.record_screen_drop(reason);
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
                         }
                         decision.resolution = finalize_new_flow_ha_resolution(
                             worker_ctx.forwarding,
