@@ -127,12 +127,24 @@ fn cos_queue_min_finish_bucket(ff: &FlowFairState, target_bps: u64) -> Option<u1
     for bucket in ff.flow_rr_buckets.iter() {
         let b = usize::from(bucket);
         let finish = ff.flow_bucket_head_finish_bytes[b];
-        if finish < fallback_finish {
+        // #hb166 T-7: distinguish "no bucket chosen yet" from a real
+        // head-finish that has SATURATED to u64::MAX. `head_finish` is a
+        // saturating cumulative byte counter; if it ever reaches u64::MAX
+        // (the same value seeded into `*_finish` as the not-found
+        // sentinel), the bare `finish < *_finish` compare would skip that
+        // bucket forever — a permanently unselectable active bucket whose
+        // packets never drain. Gating on `is_none()` selects the FIRST
+        // active bucket regardless of its finish value, keeping the
+        // domains disjoint. Byte-identical to the pre-fix selection for
+        // every non-saturated input (strict `<` still gives first-wins on
+        // ties). Mirrors the R-8(b)/#4271 vtime-sentinel clamp for the
+        // head-finish domain (which #4271 did NOT cover).
+        if fallback.is_none() || finish < fallback_finish {
             fallback_finish = finish;
             fallback = Some(bucket);
         }
         let observed = ff.flow_bucket_observed_bps[b];
-        if observed <= target_bps && finish < eligible_finish {
+        if observed <= target_bps && (eligible.is_none() || finish < eligible_finish) {
             eligible_finish = finish;
             eligible = Some(bucket);
         }
@@ -152,7 +164,14 @@ fn cos_queue_min_finish_bucket_no_cap(ff: &FlowFairState) -> Option<u16> {
     let mut best_finish = u64::MAX;
     for bucket in ff.flow_rr_buckets.iter() {
         let finish = ff.flow_bucket_head_finish_bytes[usize::from(bucket)];
-        if finish < best_finish {
+        // #hb166 T-7: gate on `is_none()` so a head-finish that has
+        // SATURATED to u64::MAX (the same value seeded as the not-found
+        // sentinel) is still selectable — otherwise it becomes a
+        // permanently unselectable active bucket. Byte-identical to the
+        // pre-fix selection for every non-saturated input (strict `<`
+        // keeps first-wins on ties); stays in lockstep with the cap-aware
+        // `cos_queue_min_finish_bucket` scan above.
+        if best.is_none() || finish < best_finish {
             best_finish = finish;
             best = Some(bucket);
         }

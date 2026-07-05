@@ -27,7 +27,8 @@ use crate::afxdp::cos::queue_ops::{
     cos_queue_pop_known_bucket, cos_queue_push_back, cos_queue_push_front,
 };
 use crate::afxdp::tx::test_support::{
-    enable_test_flow_fair, test_cos_runtime_with_queues, test_flow_fair_state, test_session_key,
+    enable_test_flow_fair, test_cos_runtime_with_queues, test_flow_fair_state,
+    test_flow_fair_state_mut, test_session_key,
 };
 use crate::afxdp::types::{CoSPendingTxItem, CoSQueueConfig, CoSQueueRuntime, TxRequest};
 use crate::afxdp::{PROTO_TCP, TX_BATCH_SIZE};
@@ -595,6 +596,75 @@ fn no_cap_fast_path_equals_two_pass_at_max() {
         // Also confirm the no_cap specialization directly matches.
         assert_eq!(cos_queue_min_finish_bucket_no_cap(ff), want);
     }
+}
+
+#[test]
+fn min_finish_bucket_selects_a_saturated_head_finish_bucket() {
+    // #hb166 T-7: a bucket whose head-finish has SATURATED to u64::MAX
+    // (the same value seeded as the "no bucket found" sentinel) must still
+    // be selectable — otherwise it becomes a permanently unselectable
+    // active bucket whose packets never drain. Pre-fix, the bare
+    // `finish < *_finish` compare skipped it (both scans returned None);
+    // the fix gates on `is_none()` so the first active bucket is always
+    // chosen. Mirrors the R-8(b)/#4271 vtime-sentinel guard for the
+    // head-finish domain #4271 did NOT cover.
+    let mut queue = make_flow_fair_queue();
+    let ff = test_flow_fair_state_mut(&mut queue);
+    let bucket: u16 = 7;
+    let bi = usize::from(bucket);
+    ff.flow_bucket_head_finish_bytes[bi] = u64::MAX;
+    ff.flow_bucket_tail_finish_bytes[bi] = u64::MAX;
+    ff.flow_bucket_observed_bps[bi] = 0;
+    ff.flow_rr_buckets.push_back(bucket);
+
+    assert_eq!(
+        cos_queue_min_finish_bucket_no_cap(ff),
+        Some(bucket),
+        "no-cap scan must select the sole active bucket even at u64::MAX head-finish"
+    );
+    assert_eq!(
+        cos_queue_min_finish_bucket(ff, u64::MAX),
+        Some(bucket),
+        "dispatch must select the sole active bucket even at u64::MAX head-finish"
+    );
+    // Cap-aware path (finite target, observed under cap) must also fall
+    // back to a saturated-finish bucket rather than returning None.
+    assert_eq!(
+        cos_queue_min_finish_bucket(ff, 1_000),
+        Some(bucket),
+        "cap-aware fallback must select a u64::MAX head-finish bucket"
+    );
+}
+
+#[test]
+fn pop_known_bucket_on_empty_selected_bucket_leaves_no_orphan_snapshot() {
+    // #hb166 T-7: a desync where the selected min-finish bucket is in the
+    // active ring but its item deque is empty must NOT leave an orphaned
+    // rollback snapshot on the per-queue LIFO stack — a later push_front
+    // would match against it and `assert!(false)`-panic the worker in
+    // release. Pre-fix, the snapshot was pushed BEFORE the fallible pop, so
+    // the `None` return orphaned it; the fix pops first and only pushes the
+    // snapshot on success. RED-on-revert: the pre-fix ordering grows the
+    // stack by 1.
+    let mut queue = make_flow_fair_queue();
+    let bucket: u16 = 3;
+    {
+        let ff = test_flow_fair_state_mut(&mut queue);
+        // Active bucket with the smallest finish so the min-finish scan
+        // selects it, but with an EMPTY item deque (the desync).
+        ff.flow_bucket_head_finish_bytes[usize::from(bucket)] = 1;
+        ff.flow_bucket_tail_finish_bytes[usize::from(bucket)] = 1;
+        ff.flow_rr_buckets.push_back(bucket);
+        assert!(ff.pop_snapshot_stack.is_empty());
+    }
+    let popped = cos_queue_pop_known_bucket(&mut queue, bucket, u64::MAX);
+    assert!(popped.is_none(), "empty selected bucket must yield None");
+    let ff = test_flow_fair_state_mut(&mut queue);
+    assert!(
+        ff.pop_snapshot_stack.is_empty(),
+        "a None pop must not leave an orphaned rollback snapshot ({} entries)",
+        ff.pop_snapshot_stack.len()
+    );
 }
 
 #[test]

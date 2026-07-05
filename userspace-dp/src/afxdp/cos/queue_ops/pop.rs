@@ -175,6 +175,18 @@ fn cos_queue_pop_known_bucket_inner(
             .as_mut()
             .expect("cos_queue_pop_known_bucket_inner: flow_fair queue without flow_fair_state");
         let bucket = usize::from(bucket_u16);
+        // #913: capture served_finish (the popped packet's finish time)
+        // BEFORE pop_front + head-advance below mutate it.
+        let served_finish = ff.flow_bucket_head_finish_bytes[bucket];
+        // #hb166 T-7: perform the FALLIBLE pop BEFORE pushing the rollback
+        // snapshot. On an empty bucket `pop_front()` returns None and we
+        // exit WITHOUT leaving an orphaned wrong-bucket snapshot on the
+        // per-queue LIFO stack — the pre-fix push-then-`?` ordering left a
+        // stale snapshot that a later `push_front` matched against and
+        // `assert!(false)`-panicked the worker thread in release. `bucket`
+        // (from the fused peek that selected it) is normally non-empty, so
+        // this is a defensive-desync guard, not a hot-path change.
+        let item = ff.flow_bucket_items[bucket].pop_front()?;
         if push_snapshot {
             // #785 Phase 3 — Codex round-3 HIGH + NEW-1: snapshot
             // pre-pop bucket + vtime state BEFORE we mutate anything,
@@ -209,17 +221,16 @@ fn cos_queue_pop_known_bucket_inner(
                  cos_queue_pop_front_no_snapshot",
                 TX_BATCH_SIZE,
             );
+            // #hb166 T-7: `served_finish` holds the pre-pop head-finish;
+            // tail-finish and queue_vtime are still pre-pop here (the
+            // vtime/head advances below run AFTER this push).
             ff.pop_snapshot_stack.push(CoSQueuePopSnapshot {
                 bucket: bucket_u16,
-                pre_pop_head_finish: ff.flow_bucket_head_finish_bytes[bucket],
+                pre_pop_head_finish: served_finish,
                 pre_pop_tail_finish: ff.flow_bucket_tail_finish_bytes[bucket],
                 pre_pop_queue_vtime: ff.queue_vtime,
             });
         }
-        // #913: capture served_finish (the popped packet's finish
-        // time) BEFORE pop_front + head-advance below mutate it.
-        let served_finish = ff.flow_bucket_head_finish_bytes[bucket];
-        let item = ff.flow_bucket_items[bucket].pop_front()?;
         // #913: branched vtime advance.
         // - push_snapshot=true (hot path / `cos_queue_pop_front`):
         //   MQFQ served-finish semantics — `vtime = max(vtime,
