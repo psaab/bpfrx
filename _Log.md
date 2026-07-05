@@ -1,3 +1,33 @@
+## 2026-07-04 — #4157 (fable-review-164 L-6): constant-time API-key/Bearer/username auth
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Closed a timing side channel in the HTTP API auth
+    middleware. `authMiddleware` (X-API-Key) and `checkAuthorization`
+    (Bearer) validated tokens with a plain `cfg.APIKeys[token]` map
+    lookup — non-constant-time (latency varies with hash-bucket
+    collisions / key presence), so a network-timing attacker on an
+    interface-bound API could probe whether a submitted token/prefix was
+    valid. The Basic-auth username path also early-returned on
+    `!exists`, skipping the constant-time password compare entirely and
+    leaking username existence by timing. The password compare itself
+    already used `subtle.ConstantTimeCompare`.
+  - **Fix**: added `constantTimeAPIKeyMatch(cfg, presented)` — compares
+    the presented token against EVERY configured key with
+    `subtle.ConstantTimeCompare`, OR-ing results, never short-circuiting
+    on first match (so which key matched does not leak). Routed both the
+    X-API-Key and Bearer paths through it. Removed the username
+    early-return: always run `ConstantTimeCompare` against the looked-up
+    value, then AND with existence.
+  - **Tests**: `auth_consttime_4157_test.go` — functional (valid /
+    invalid / wrong-length / shared-prefix / false-valued key / empty
+    set), unknown-user rejection, HTTP integration, and an AST
+    regression guard (`TestAuthPathsUseConstantTimeCompare`) that fails
+    if any auth path reverts to a bare `cfg.APIKeys[...]` lookup.
+    Verified RED-on-revert: the guard fails on the reverted map-lookup
+    source, passes on the fix.
+  - **File(s)**: pkg/api/auth.go, pkg/api/auth_consttime_4157_test.go,
+    pkg/api/README.md, _Log.md
+
 ## 2026-07-04 — #4148 (fable-review-164 H-2): bound config lexer/parser recursion + payload size
 
 - **Timestamp**: 2026-07-04
