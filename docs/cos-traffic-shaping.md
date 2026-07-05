@@ -792,8 +792,7 @@ set class-of-service schedulers be-sched buffer-size 16m
 set class-of-service scheduler-maps my-map forwarding-class best-effort scheduler be-sched
 set class-of-service scheduler-maps my-map forwarding-class expedited-forwarding scheduler ef-sched
 
-set class-of-service interfaces ge-0-0-1 unit 0 shaping-rate 10g
-set class-of-service interfaces ge-0-0-1 unit 0 shaping-rate burst-size 125m
+set class-of-service interfaces ge-0-0-1 unit 0 shaping-rate 10g burst-size 125m
 set class-of-service interfaces ge-0-0-1 unit 0 scheduler-map my-map
 ```
 
@@ -821,6 +820,25 @@ keeps that map while still inheriting the interface-level `shaping-rate`.
 Before #4021 an interface-level binding compiled and committed cleanly but
 was silently dropped (only `unit N` children were read), so the shaping /
 classification / marking never applied.
+
+**Commit-time validation of the interface-binding leaves (fable-review-166).**
+The `shaping-rate`, `burst-size`, `oversubscription-policy` (its
+`guarantee-rate` fraction), and `priority-low-min-share` leaves are typed
+in `setSchema`, at BOTH the unit level and the interface level. A garbage
+value now HARD-REJECTS at `commit` / `commit check` instead of silently
+compiling to 0 and removing the shaper: before this, `shaping-rate 10gg`
+parsed to 0 (`parseBandwidthLimit` silent-zero), the compiler read 0 as
+"unset", and egress ran **unshaped** (#4217). `oversubscription-policy
+guarantee-rate 1.7` is rejected rather than silently clamped to 1.0
+(#4219). `priority-low-min-share` is typed + validated and completes, but
+the dataplane does not yet enforce it (wire-surface only; a commit warning
+surfaces the inertness — #4220). `bare-integer` burst-size is now rejected
+as ambiguous — use an explicit `k`/`m`/`g` suffix (e.g. `125m`). Put the
+rate and its `burst-size` on the SAME `set` line (`shaping-rate 10g
+burst-size 125m`): a separate `set ... shaping-rate burst-size 125m`
+line creates a second sibling `shaping-rate` node whose value is the
+literal `burst-size` — which the commit gate now rejects (before this it
+silently dropped the burst-size).
 
 Scheduler `buffer-size` may be configured as an explicit byte size
 (`4m`, `256k`, `1g`) or as a Junos percent value (`10%`). Percent values
