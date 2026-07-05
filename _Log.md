@@ -1,3 +1,41 @@
+## 2026-07-04 — #4175 (fable-review-165 H-1): day-0 config-drive retry permanently dead — loader guarded on bare .configdb directory
+
+- **Timestamp**: 2026-07-04
+  - **Action**: The day-0 config-drive loader's "already configured,
+    skip the probe" guard tested bare directory existence
+    (`[ -e "$XPF_DIR/.configdb" ]`, `scripts/image/xpf-day0-config`).
+    But xpfd durably creates that directory on EVERY start
+    (`pkg/configstore/db.go` `NewDB` → `MkdirAllDurable`, via
+    `configstore.New` → `daemon.New`, before any commit). So after the
+    very first boot the empty `.configdb` dir exists → the loader logged
+    "system already configured" and NEVER re-probed the medium,
+    permanently defeating its own documented reject → fix → reboot retry
+    contract (`xpf-day0-config` Retriability note; `docs/install-images.md`
+    Recovery). The COMMITTED config is `active.json`, written only on
+    commit/sync/rollback; a rejected/absent drive enters factory
+    bootstrap without ever writing it.
+  - **Fix**: guard on the COMMITTED artifact, not the directory. Changed
+    the guard to `have_committed_config()` testing
+    `[ -e "$XPF_DIR/.configdb/active.json" ]`, and fixed the misleading
+    log line to "committed config present (…/active.json) — system
+    already configured". Chose the script-only active.json path (smallest,
+    version-skew-safe) over an `xpfd config-state`/EverCommitted
+    subcommand: reading the #1922 committed marker needs envelope-header
+    parsing + master-key handling, not trivial, and the subcommand adds a
+    version-skew surface the script-only fix avoids. Added a source-guard
+    (`XPF_DAY0_SOURCE_ONLY=1`) so the loader can be sourced for unit tests.
+    Updated the loader header comment and `docs/install-images.md`
+    (first-boot contract table + loader specifics).
+  - **Test**: new `test/image/day0-configdb-guard-test.sh` — 5 scenarios
+    (3 unit on `have_committed_config`, 2 integration driving `main()`
+    with stubbed probes). RED-on-revert proven: reverting the guard to
+    the bare `.configdb` dir makes scenarios A (empty dir must re-probe)
+    and D (main must reach the probe) FAIL with exit 1. shellcheck clean
+    on both the loader and the test.
+  - **File(s)**: scripts/image/xpf-day0-config,
+    test/image/day0-configdb-guard-test.sh, docs/install-images.md,
+    _Log.md
+
 ## 2026-07-04 — #4172 (fable-review-165 H-3): frr-pythontools missing from baked image + metapackage
 
 - **Timestamp**: 2026-07-04
