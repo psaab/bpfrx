@@ -78,10 +78,25 @@ func NewLexer(input string) *Lexer {
 
 // Next returns the next token, advancing the position.
 func (l *Lexer) Next() Token {
-	l.skipWhitespaceAndComments()
-
-	if l.pos >= len(l.input) {
-		return Token{Type: TokenEOF, Line: l.line, Column: l.column}
+	// Skip leading whitespace, comments, and bracket-list delimiters. The
+	// bracket characters of a Junos list (`[ a b c ]`) are structural sugar:
+	// the lexer strips them and yields the enclosed words as ordinary tokens
+	// (#2419). Consuming them in this loop — rather than the old
+	// `l.advance(); return l.Next()` self-recursion — keeps bracket handling
+	// O(1) stack. Otherwise a payload of N consecutive '[' recurses one
+	// goroutine-stack frame per bracket and a sub-4 MiB config overflows Go's
+	// 1 GiB maxstacksize with an unrecoverable `fatal error: stack overflow`
+	// (fable-review-164 H-2).
+	for {
+		l.skipWhitespaceAndComments()
+		if l.pos >= len(l.input) {
+			return Token{Type: TokenEOF, Line: l.line, Column: l.column}
+		}
+		if c := l.input[l.pos]; c == '[' || c == ']' {
+			l.advance()
+			continue
+		}
+		break
 	}
 
 	ch := l.input[l.pos]
@@ -100,13 +115,6 @@ func (l *Lexer) Next() Token {
 	case '|':
 		l.advance()
 		return Token{Type: TokenPipe, Value: "|", Line: line, Column: col}
-	case '[':
-		// Bracket list: [ a b c ] — skip brackets, treat contents as regular tokens
-		l.advance()
-		return l.Next()
-	case ']':
-		l.advance()
-		return l.Next()
 	case '"':
 		return l.readString(line, col)
 	default:

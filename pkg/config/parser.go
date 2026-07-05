@@ -13,10 +13,20 @@ func (e ParseError) Error() string {
 	return fmt.Sprintf("line %d, column %d: %s", e.Line, e.Column, e.Message)
 }
 
+// maxParseDepth caps recursive-descent block nesting. parseStatement recurses
+// into parseStatements for every `{ ... }` block, so a payload of deeply nested
+// braces (`a{a{a{…}`) would otherwise grow the goroutine stack past Go's 1 GiB
+// maxstacksize and abort xpfd with an unrecoverable `fatal error: stack
+// overflow` (fable-review-164 H-2). 256 levels is far above any real Junos
+// configuration; past it the parser records a ParseError and stops descending
+// rather than recursing.
+const maxParseDepth = 256
+
 // Parser implements a recursive descent parser for Junos configuration syntax.
 type Parser struct {
 	lexer  *Lexer
 	errors []ParseError
+	depth  int // current block-nesting depth (bounded by maxParseDepth)
 }
 
 // NewParser creates a new Parser for the given configuration text.
@@ -107,6 +117,28 @@ func ParseSetVerb(input string) (verb string, path []string, err error) {
 
 // parseStatements parses zero or more statements until EOF or '}'.
 func (p *Parser) parseStatements() []*Node {
+	// Bound block-nesting recursion (H-2). parseStatement recurses back into
+	// parseStatements for every `{` block; without this guard a deeply nested
+	// brace payload overflows the goroutine stack (an unrecoverable throw, not
+	// a panic). Past the cap we record a ParseError at the current position and
+	// stop descending. The caller's error-recovery path then drains the
+	// remaining tokens linearly (parseKeys yields nothing on `{`/`}`, so each
+	// parseStatement consumes one token), so parsing terminates cleanly with an
+	// error instead of crashing.
+	p.depth++
+	defer func() { p.depth-- }()
+	if p.depth > maxParseDepth {
+		tok := p.lexer.Peek()
+		p.addError(tok.Line, tok.Column,
+			fmt.Sprintf("configuration nesting exceeds maximum depth of %d", maxParseDepth))
+		// Drain the remainder of this over-deep block iteratively (no
+		// recursion) so a pathological payload records exactly one error and
+		// leaves the caller's matching '}' in place, rather than spamming one
+		// error per leftover token and holding O(N) ParseError structs.
+		p.skipToBlockClose()
+		return nil
+	}
+
 	var nodes []*Node
 	for {
 		tok := p.lexer.Peek()
@@ -124,6 +156,34 @@ func (p *Parser) parseStatements() []*Node {
 		}
 	}
 	return nodes
+}
+
+// skipToBlockClose consumes tokens until the '}' that closes the block whose
+// opening '{' the caller already consumed (or EOF), tracking brace balance
+// iteratively so it never recurses. The closing '}' at balance 0 is left in
+// place for the caller to consume. It is used only on the depth-cap path so a
+// maliciously deep payload is drained in O(remaining) with no additional
+// goroutine-stack growth (H-2).
+func (p *Parser) skipToBlockClose() {
+	balance := 0
+	for {
+		tok := p.lexer.Peek()
+		switch tok.Type {
+		case TokenEOF:
+			return
+		case TokenLBrace:
+			balance++
+			p.lexer.Next()
+		case TokenRBrace:
+			if balance == 0 {
+				return // closes the caller's block; leave it for the caller
+			}
+			balance--
+			p.lexer.Next()
+		default:
+			p.lexer.Next()
+		}
+	}
 }
 
 // inactiveMarker is the Junos `inactive:` statement prefix (#2008 H1).
