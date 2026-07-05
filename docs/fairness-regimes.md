@@ -1418,8 +1418,10 @@ class, a missing/errored generator, or a nonzero iperf3 rc). Both
 `cos-simul-load-smoke.sh` and the SOLO `cos-gate1-small-four-alone.sh`
 follow this contract, so `&&`-chained or CI invocation fails loudly
 instead of passing on a printed `FAIL`. The generators no longer swallow
-failures with `|| true`: each writes a per-port `.rc` sidecar and a
-nonzero (or missing) rc is a hard gate failure.
+failures with `|| true`: each writes a per-port `.rc` sidecar, and
+`gate_0` fails on a nonzero (or missing) rc **or** on a rc==0 run that
+emitted an unparseable, `{"error": ...}`, or truncated JSON payload —
+even for a class no throughput floor reads.
 
 ### Bit-for-bit preservation of proportional mode
 

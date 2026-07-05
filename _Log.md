@@ -34616,3 +34616,18 @@ top.
   new harness exit-code contract in docs/fairness-regimes.md. Closes #4241.
 - **File(s)**: test/incus/fairness-harness.sh, docs/fairness-regimes.md,
   _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-1 Copilot fold (PR #4242) — close the gate_0
+  row-readability hole. gate_0 previously checked only the per-port .rc
+  EXIT CODE, so an iperf3 run that exits 0 yet emits an {"error": ...} or
+  truncated JSON payload passed gate_0; if no throughput floor read that
+  class (a mid-class parse error), the whole harness still exited 0.
+  Extended the existing parse loop to tag each row with gen_error
+  (iperf-error / truncated — using bits_per_second key MEMBERSHIP so a
+  genuinely 0-Gbps but complete row is NOT flagged), and gate_0 now fails
+  on nonzero/missing rc OR unparseable/iperf-error/truncated row. Reused
+  the existing per-port parse (no duplicate parse logic). RED-on-revert:
+  the rc-only gate_0 passes both garbage inputs. Closes the Copilot gap.
+- **File(s)**: test/incus/cos-simul-load-smoke.sh, docs/fairness-regimes.md,
+  _Log.md
