@@ -33312,3 +33312,33 @@ top.
     already covered by the doc's "empty/malformed/non-/96 prefix" wording).
   - **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
     _Log.md
+
+- **Timestamp**: 2026-07-04
+  - **Action**: fable-review-164 M-2 / #4151 — HA config-sync receiver advanced
+    the generation high-water mark BEFORE applying the config, silently
+    stranding a diverged standby on apply failure. `admitConfigGen` stored the
+    incoming gen then `configApplyLoop` invoked `OnConfigReceived` with no error
+    path; `handleConfigSync` returns without applying on a transient
+    RG0-primary belief or a `syncAndApply` compile/promote failure. The mark
+    then read gen N while the active config was still N-1, and the primary's
+    re-push of gen N was dropped as "not strictly newer" → stranded. Fix =
+    apply-then-advance: split `admitConfigGen` into `shouldApplyConfigGen`
+    (pure admission gate, no advance) + `recordAppliedConfigGen` (advance);
+    `OnConfigReceived`/`handleConfigSync` now return an `error`, and the loop
+    advances the mark ONLY on a nil return. On failure it counts a new
+    `ConfigsApplyFailed` counter and leaves the high-water at the last-applied
+    gen so the peer's re-push is re-admitted and the standby re-converges. The
+    `activeText == incomingText` short-circuit returns nil (already converged →
+    advance). Preserves the #1960 lenient-load posture — whatever
+    `syncAndApply` reports gates the mark, so the high-water always reflects the
+    config actually in effect. Added `ConfigsApplyFailed` to SyncStats +
+    snapshot + `show ... status` display. RED-on-revert:
+    `TestConfigSyncApplyFailureRetainsHighWater` fails ("apply failure must NOT
+    advance the high-water mark, got 7 want 0") when the advance-before-apply
+    order is restored. `go test ./pkg/cluster/... ./pkg/daemon/...` green;
+    `go build ./...`, gofmt, vet clean. Docs: docs/sync-protocol.md
+    apply-then-advance section + message/stats tables.
+  - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+    pkg/cluster/status.go, pkg/cluster/sync_config_gen_test.go,
+    pkg/daemon/daemon_ha_sync.go, pkg/dataplane/userspace/manager.go,
+    docs/sync-protocol.md, _Log.md
