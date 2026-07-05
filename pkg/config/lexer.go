@@ -65,6 +65,11 @@ type Lexer struct {
 	pos    int
 	line   int
 	column int
+	// pending holds a TokenError produced while skipping whitespace and
+	// comments (an unterminated block comment) that must be surfaced by the
+	// next call to Next. skipWhitespaceAndComments cannot return a token, so
+	// the error is stashed here and drained at the top of Next.
+	pending *Token
 }
 
 // NewLexer creates a new Lexer for the given input string.
@@ -89,6 +94,21 @@ func (l *Lexer) Next() Token {
 	// (fable-review-164 H-2).
 	for {
 		l.skipWhitespaceAndComments()
+
+		// An unterminated block comment detected during skipping surfaces as a
+		// TokenError here so parseStatements records a ParseError and the load
+		// / commit paths reject the config instead of silently accepting a
+		// truncated one (matching the unterminated-string behavior, M-8
+		// #4149). This MUST be checked BEFORE the EOF return: an unterminated
+		// `/* */` consumes to EOF AND sets l.pending, so an EOF-first check
+		// would swallow the error and return TokenEOF — reopening the #4147
+		// fail-open (a truncated config parses with zero errors).
+		if l.pending != nil {
+			tok := *l.pending
+			l.pending = nil
+			return tok
+		}
+
 		if l.pos >= len(l.input) {
 			return Token{Type: TokenEOF, Line: l.line, Column: l.column}
 		}
@@ -136,10 +156,12 @@ func (l *Lexer) Peek() Token {
 	savedPos := l.pos
 	savedLine := l.line
 	savedCol := l.column
+	savedPending := l.pending
 	tok := l.Next()
 	l.pos = savedPos
 	l.line = savedLine
 	l.column = savedCol
+	l.pending = savedPending
 	return tok
 }
 
@@ -175,15 +197,33 @@ func (l *Lexer) skipWhitespaceAndComments() {
 
 		// Block comment: /* ... */
 		if ch == '/' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '*' {
+			startLine, startCol := l.line, l.column
 			l.advance() // /
 			l.advance() // *
+			terminated := false
 			for l.pos+1 < len(l.input) {
 				if l.input[l.pos] == '*' && l.input[l.pos+1] == '/' {
 					l.advance() // *
 					l.advance() // /
+					terminated = true
 					break
 				}
 				l.advance()
+			}
+			if !terminated {
+				// Reached EOF without a closing */. Consume the final byte the
+				// pos+1 loop bound left behind and stash an error keyed to the
+				// opening /* so the truncation is reported, not swallowed.
+				for l.pos < len(l.input) {
+					l.advance()
+				}
+				l.pending = &Token{
+					Type:   TokenError,
+					Value:  "unterminated block comment",
+					Line:   startLine,
+					Column: startCol,
+				}
+				return
 			}
 			continue
 		}

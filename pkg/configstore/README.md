@@ -59,8 +59,9 @@ the 0600 perms fix only.
   `Candidate()` or `History()`; use the `Show*` / `List*` forms.)
 - `MaxConfigSize` (16 MiB) + `checkConfigSize` — `store.go`. The
   transport-independent input-size ceiling checked at the head of every
-  parse entry point: `LoadOverride`, `LoadMerge`, `LoadSet`, and the HA
-  `SyncApply` ingress. It rejects an over-large or corrupt payload with a
+  parse entry point: `LoadOverride`, `LoadMerge`, `LoadSet`, the HA
+  `SyncApply` ingress, and the `CheckText` day-0 config-drive validator
+  (#1879). It rejects an over-large or corrupt payload with a
   clean `config too large` error before `config.NewParser`, so a
   pathological input cannot exhaust memory or (with the pkg/config
   lexer/depth guards) crash xpfd with a stack overflow (H-2). It backstops

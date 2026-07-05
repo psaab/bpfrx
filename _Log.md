@@ -36,6 +36,88 @@
     `pkg/grpcapi/server.go`, `pkg/grpcapi/server_recvsize_hb164_test.go`,
     `pkg/api/config.go`, `pkg/api/config_load_bodycap_hb164_test.go`,
     `pkg/config/README.md`, `pkg/configstore/README.md`.
+  - **Rebase (merge origin/master 426cc3f78)**: reconciled with #4149
+    (M-8 unterminated block comment) and #4152/#4150 (M-7 HTTP body cap).
+    lexer.go: merged the `l.pending` unterminated-comment check INSIDE the
+    new bracket-skip loop and BEFORE the EOF return (an unterminated `/* */`
+    consumes to EOF AND sets pending — EOF-first would swallow the error and
+    reopen the #4147 fail-open); `TestUnterminatedBlockComment` stays green.
+    api/config.go: dropped the inline 32 MiB decoder + `maxConfigBodyBytes`
+    and routed the config-load body through M-7's shared `decodeJSONBody`
+    (16 MiB → 413), matching `MaxConfigSize`; the H-2 load-body test now uses
+    `maxRequestBodyBytes` + the streaming `repeatReader`. Added
+    `checkConfigSize` to `CheckText` (day-0 config-drive) for parse-entry
+    parity. `_Log.md` unioned.
+
+## 2026-07-04 — #4150 (M-6 + M-7): management HTTP server DoS hardening
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (origin/master ~d70851156, worktree
+    4a784dd1b) then FIX. fable-review-164 M-6 + M-7, both pre-auth (or
+    low-priv) mgmt-plane DoS on the `pkg/api` HTTP/HTTPS server.
+    M-6: both `http.Server` literals in `NewServer`
+    (`pkg/api/server.go`) set only `Addr`/`Handler`(/`TLSConfig`) — every
+    timeout field zero (no limit). Header read precedes `authMiddleware`, so a
+    pre-auth slowloris (dribbled headers/body) pins a goroutine/socket per
+    conn indefinitely once web-management binds a non-loopback interface. FIX:
+    set `ReadHeaderTimeout` 10s (slowloris-header defense), `ReadTimeout` 30s
+    (slow-body), `IdleTimeout` 120s, `MaxHeaderBytes` 1 MiB on BOTH literals
+    via a package const block. WriteTimeout deliberately left 0 (unlimited) —
+    the SSE event/log streams + large metrics/session-table scrapes are legit
+    slow responses a WriteTimeout would sever; the read-side timeouts are the
+    slowloris-critical ones and the response side is bounded by per-handler
+    ctx deadlines.
+    M-7: every mutating handler did `json.NewDecoder(r.Body).Decode(&req)`
+    with no `http.MaxBytesReader` (config load/merge/override buffers the whole
+    `Content` then parses it a second time → OOM-kill). FIX: new shared
+    `decodeJSONBody(w, r, dst)` helper (`pkg/api/api.go`) wraps r.Body in
+    `MaxBytesReader(maxRequestBodyBytes=16 MiB)` and returns HTTP 413 on
+    overflow, 400 on other decode errors. Converted all 12 mutation decode
+    sites (config.go ×8 incl. annotate, system.go ×3 ping/traceroute/action,
+    dhcp.go ×1 clear) to the helper; dropped the now-unused `encoding/json`
+    import from those three files. 16 MiB is orders of magnitude above any
+    legit config body; independent transport-layer guard (pairs with H-2's
+    parser-layer ceiling). Read-only GETs untouched.
+  - **Files**: `pkg/api/server.go`, `pkg/api/api.go`, `pkg/api/config.go`,
+    `pkg/api/system.go`, `pkg/api/dhcp.go`,
+    `pkg/api/http_dos_hardening_4150_test.go` (new), `pkg/api/README.md`,
+    `_Log.md`.
+  - **Validation**: `go test ./pkg/api/...` green; `go build ./...` green;
+    gofmt clean; `go vet ./pkg/api/...` clean. RED-on-revert proven: removing
+    the timeout fields → `TestManagementServerTimeoutsSetM6` fails (all fields
+    0); removing the MaxBytesReader wrap → `TestConfigMutationBodyCappedM7`
+    returns 200 not 413. Normal-size body still 200, malformed body still 400.
+
+## 2026-07-04 — #4147 (M-8): unterminated /* */ block comment silently truncates config
+
+- **Timestamp**: 2026-07-04
+  - **Action**: VERIFY-FIRST at HEAD (origin/master d70851156) then FIX.
+    fable-review-164 M-8. Confirmed empirically: the block-comment scanner
+    in `skipWhitespaceAndComments` (`pkg/config/lexer.go`) consumed input to
+    EOF when a `/*` had no closing `*/`, `continue`d, and returned no error —
+    so everything after the unclosed `/*` was swallowed as comment text,
+    `Parse()` returned 0 errors, and `commit` applied a config with dropped
+    stanzas (a scratch repro dropped an entire trailing `security { policies
+    { default-policy { deny-all; } } }` stanza — 0 errors, 1 top-level node).
+    A fail-open config-integrity path, in contrast to `readString` which
+    returns `TokenError{"unterminated string"}`. FIX: the block-comment loop
+    now tracks a `terminated` flag and the opening `/*` line/column; on EOF
+    with no `*/` it stashes a `TokenError{"unterminated block comment"}` in a
+    new `Lexer.pending` field, drained at the top of `Next` (since
+    `skipWhitespaceAndComments` cannot return a token). `parseStatements`
+    already surfaces a `TokenError` Peek as a `ParseError`, so the load /
+    commit paths now reject the truncated config (#1960-correct strict
+    reject). `Peek` also saves/restores `pending` to stay a pure no-op.
+    Single-line `/* x */`, `#`, and `//` comments are unaffected — only the
+    unterminated multi-line block is rejected. Added
+    `TestUnterminatedBlockComment` (RED on revert: without the fix it fails
+    "expected a parse error, got none (config silently truncated to 1
+    top-level node)"; terminated-comment case asserts the post-comment
+    `system` stanza SURVIVES). go test ./pkg/config/... green; go build
+    ./... green; gofmt + go vet clean. Documented in pkg/config/README.md
+    Gotchas.
+  - **File(s)**: pkg/config/lexer.go, pkg/config/parser_ast_test.go,
+    pkg/config/README.md, _Log.md
 
 ## 2026-07-04 — #4088: pool SNAT — id==0 ICMP echo is a valid keyable query
 

@@ -50,6 +50,90 @@ security {
 	}
 }
 
+// TestUnterminatedBlockComment guards the fable-review-164 M-8 fix: an
+// unterminated /* */ block comment must produce a lexer/parse error rather
+// than silently swallowing the remainder of the config to EOF. Before the
+// fix the block-comment scanner consumed to EOF and returned no error, so a
+// single accidental unterminated comment dropped an arbitrary tail of the
+// config (e.g. security policies) while Parse() reported success — a
+// fail-open config-integrity path (contrast readString's "unterminated
+// string" TokenError). This test goes RED on revert:
+//   - unterminated  -> Parse() must report an "unterminated block comment"
+//     error (RED on revert: 0 errors + dropped stanza).
+//   - terminated    -> parses clean AND the post-comment stanza survives.
+//   - single-line   -> /* x */ on one line is unchanged (no error).
+//   - line comments -> # and // are unchanged (no error).
+func TestUnterminatedBlockComment(t *testing.T) {
+	// The trailing `security { policies { ... } }` stanza sits AFTER the
+	// unclosed /* and would be silently eaten before the fix.
+	unterminated := `security {
+    zones {
+        security-zone trust;
+    }
+} /* oops I never closed this comment
+security {
+    policies {
+        default-policy {
+            deny-all;
+        }
+    }
+}`
+	tree, errs := NewParser(unterminated).Parse()
+	if len(errs) == 0 {
+		t.Fatalf("unterminated block comment: expected a parse error, got none "+
+			"(config silently truncated to %d top-level node(s))", len(tree.Children))
+	}
+	foundUnterm := false
+	for _, e := range errs {
+		if strings.Contains(e.Message, "unterminated block comment") {
+			foundUnterm = true
+		}
+	}
+	if !foundUnterm {
+		t.Fatalf("expected an 'unterminated block comment' error, got: %v", errs)
+	}
+
+	// A properly terminated block comment must parse clean AND preserve the
+	// stanza that follows it — the fix must not reject well-formed comments.
+	terminated := `security {
+    zones {
+        security-zone trust;
+    }
+} /* this comment is properly closed */
+system {
+    host-name after-comment;
+}`
+	tree, errs = NewParser(terminated).Parse()
+	if len(errs) != 0 {
+		t.Fatalf("terminated block comment: unexpected parse errors: %v", errs)
+	}
+	var haveSystem bool
+	for _, n := range tree.Children {
+		if len(n.Keys) > 0 && n.Keys[0] == "system" {
+			haveSystem = true
+		}
+	}
+	if !haveSystem {
+		t.Fatalf("terminated block comment: post-comment `system` stanza was "+
+			"dropped; top-level nodes: %d", len(tree.Children))
+	}
+
+	// A single-line /* x */ comment must remain valid (no error).
+	if _, errs := NewParser("system { /* inline */ host-name h; }").Parse(); len(errs) != 0 {
+		t.Fatalf("single-line block comment: unexpected parse errors: %v", errs)
+	}
+
+	// Line comments (# and //) are untouched by the fix.
+	lineComments := `# hash comment
+system {
+    // slash comment
+    host-name h;
+}`
+	if _, errs := NewParser(lineComments).Parse(); len(errs) != 0 {
+		t.Fatalf("line comments: unexpected parse errors: %v", errs)
+	}
+}
+
 func TestBracketList(t *testing.T) {
 	// server1/2/3 are declared as address-book entries so the policy
 	// match-address strict validator (#2008) accepts the bracket-list

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,14 +10,6 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 )
-
-// maxConfigBodyBytes caps the REST config-load POST body (fable-review-164
-// H-2). Without it the body is buffered unbounded and fed to the parser, which
-// a sub-4 MiB pathological payload can crash. It is 2x
-// configstore.MaxConfigSize (16 MiB) to leave headroom for JSON string
-// escaping of the config content; the post-decode configstore size ceiling is
-// the authoritative limit on the config itself.
-const maxConfigBodyBytes = 2 * (16 << 20) // 32 MiB
 
 func (s *Server) configHandler(w http.ResponseWriter, _ *http.Request) {
 	cfg := s.store.ActiveConfig()
@@ -52,8 +43,7 @@ func (s *Server) configStatusHandler(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) configSetHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -69,8 +59,7 @@ func (s *Server) configSetHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -91,8 +80,7 @@ func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 // applyEditLine switch and the path is never mangled into a junk "set" node.
 func (s *Server) configDeactivateHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -110,8 +98,7 @@ func (s *Server) configDeactivateHandler(w http.ResponseWriter, r *http.Request)
 // (#2051), the REST equivalent of the interactive `activate <path>` verb.
 func (s *Server) configActivateHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigSetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Input == "" {
@@ -168,8 +155,7 @@ func (s *Server) configCommitCheckHandler(w http.ResponseWriter, _ *http.Request
 
 func (s *Server) configRollbackHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConfigRollbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if err := s.store.Rollback(req.N); err != nil {
@@ -283,19 +269,13 @@ func (s *Server) configSearchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
-	// Bound the request body so an oversized config-load payload is rejected
-	// before it reaches the parser (H-2). configstore.LoadOverride/LoadMerge/
-	// LoadSet re-check the decoded content against MaxConfigSize.
-	r.Body = http.MaxBytesReader(w, r.Body, maxConfigBodyBytes)
+	// Bound the request body (M-7 shared decoder, 16 MiB -> 413) so an
+	// oversized config-load payload is rejected at the transport before it
+	// reaches the parser (H-2). configstore.LoadOverride/LoadMerge/LoadSet
+	// re-check the decoded content against MaxConfigSize (also 16 MiB), the
+	// transport-independent parser-layer ceiling.
 	var req ConfigLoadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("config body exceeds %d bytes", maxConfigBodyBytes))
-			return
-		}
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Content == "" {
@@ -334,8 +314,7 @@ func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Request) {
 	var req CommitConfirmedRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if s.commitConfirmedFn == nil {
@@ -390,8 +369,7 @@ func (s *Server) configShowRollbackHandler(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) configAnnotateHandler(w http.ResponseWriter, r *http.Request) {
 	var req AnnotateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, Response{Error: err.Error()})
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.Path == "" || req.Comment == "" {

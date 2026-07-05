@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -68,8 +67,7 @@ func (s *Server) clearDHCPIdentifiersHandler(w http.ResponseWriter, r *http.Requ
 
 	var req ClearDHCPIdentifierRequest
 	if r.ContentLength > 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
+		if !decodeJSONBody(w, r, &req) {
 			return
 		}
 	}
