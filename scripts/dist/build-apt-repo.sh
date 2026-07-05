@@ -60,7 +60,13 @@ if [ -z "$DEBS" ]; then
 fi
 
 APT="$OUT/apt"
-POOL="$APT/pool/$COMPONENT/x/xpf"
+# Pool is keyed PER SUITE (#4201): a shared pool/<component> made each suite's
+# Packages scan the WHOLE component pool, so a stable rebuild after an edge
+# build listed the edge version in stable (validly signed) and a stable
+# subscriber could pull an edge build. Isolate the pool under the suite so each
+# suite's apt-ftparchive scan sees ONLY its own debs. The reprepro path (below)
+# isolates suites in its own database and does not use $POOL.
+POOL="$APT/pool/$SUITE/$COMPONENT/x/xpf"
 DISTDIR="$APT/dists/$SUITE/$COMPONENT/binary-$ARCH"
 mkdir -p "$POOL" "$DISTDIR"
 
@@ -114,7 +120,10 @@ done
 set +f
 
 # Packages index (paths in the index are relative to the repo root $APT).
-( cd "$APT" && apt-ftparchive packages "pool/$COMPONENT" > "dists/$SUITE/$COMPONENT/binary-$ARCH/Packages" )
+# Scan ONLY this suite's pool (#4201) so a stable rebuild never indexes an edge
+# deb sitting in a sibling suite's pool; the emitted Filename: fields then point
+# at pool/$SUITE/$COMPONENT/... which apt clients fetch relative to the base URL.
+( cd "$APT" && apt-ftparchive packages "pool/$SUITE/$COMPONENT" > "dists/$SUITE/$COMPONENT/binary-$ARCH/Packages" )
 gzip -9 -kf "$DISTDIR/Packages"
 info "wrote Packages ($(wc -l < "$DISTDIR/Packages") lines) + Packages.gz"
 

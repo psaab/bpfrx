@@ -220,6 +220,98 @@ else
     ok "publish refuses a symlink in the image set"
 fi
 
+# ── 5c. apt channel isolation (#4201, HB165 H-4) ──────────────────────────
+info "5c. apt channel isolation: a stable rebuild after edge must not list edge"
+EDGEDEB="$ROOT/dist/deb/xpf-appliance_0.0.0-edge.selftest.deb"
+EDGEDIR="$WORK/pkg-edge"; mkdir -p "$EDGEDIR/DEBIAN"
+cat > "$EDGEDIR/DEBIAN/control" <<EOF
+Package: xpf-appliance
+Version: 0.0.0-edge
+Architecture: amd64
+Maintainer: selftest <selftest@xpf.invalid>
+Description: xpf selftest edge package
+EOF
+dpkg-deb --build "$EDGEDIR" "$EDGEDEB" >/dev/null 2>&1
+trap 'cleanup; cleanup_deb; rm -f "$EDGEDEB"' EXIT INT TERM
+XPF_GPG_KEY="$GPGKEY" sh "$DIST/build-apt-repo.sh" --out "$OUT" --suite edge \
+    --debs "$EDGEDEB" >/dev/null 2>&1 || bad "edge repo build failed"
+# Rebuild stable AFTER edge exists — the exact H-4 trigger.
+XPF_GPG_KEY="$GPGKEY" sh "$DIST/build-apt-repo.sh" --out "$OUT" --suite stable \
+    --debs "$FAKEDEB" >/dev/null 2>&1 || bad "stable rebuild failed"
+SPKG="$OUT/apt/dists/stable/main/binary-amd64/Packages"
+if grep -q "Version: 0.0.0-edge" "$SPKG"; then
+    bad "stable Packages lists the EDGE version (channel bleed)"
+else
+    ok "stable Packages does not list the edge version (isolated per-suite pool)"
+fi
+if grep -q "^Filename: pool/stable/main/x/xpf/" "$SPKG"; then
+    ok "stable Filename points at the suite-scoped pool"
+else
+    bad "stable Filename is not suite-scoped"
+fi
+
+# ── 5d. publish key-agreement gate (#4203, HB165 H-15) ────────────────────
+info "5d. publish key-agreement: installer/keyring/InRelease signer must match"
+mk_installsh() {  # mk_installsh <dest-install.sh> <armored-key-file>
+    { echo '#!/bin/sh'
+      echo "ARCHIVE_KEY=\$(cat <<'KEYEOF'"
+      cat "$2"
+      echo "KEYEOF"
+      echo ")"
+    } > "$1"
+}
+ARCHASC="$WORK/archive.asc"
+gpg --batch --armor --export selftest@xpf.invalid > "$ARCHASC"
+# Positive: install.sh embeds the SIGNER key -> gate passes.
+KAOK="$WORK/kagree-ok"; mkdir -p "$KAOK"; cp -r "$OUT/apt" "$KAOK/apt"
+mk_installsh "$KAOK/install.sh" "$ARCHASC"
+if XPF_ARCHIVE_PUBKEY="$ARCHASC" $PY "$DIST/publish.py" \
+     --dist "$KAOK" --channel stable --no-image >/dev/null 2>&1; then
+    ok "publish passes when install.sh embeds the signer key"
+else
+    bad "publish should PASS when install.sh embeds the signer key"
+fi
+# Negative: a DIFFERENT (stale) embedded key must be rejected.
+cat > "$WORK/gpg-batch2" <<EOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Key-Usage: sign
+Name-Real: xpf selftest stale
+Name-Email: stale@xpf.invalid
+Expire-Date: 0
+%commit
+EOF
+gpg --batch --gen-key "$WORK/gpg-batch2" >/dev/null 2>&1
+gpg --batch --armor --export stale@xpf.invalid > "$WORK/stale.asc"
+KABAD="$WORK/kagree-bad"; mkdir -p "$KABAD"; cp -r "$OUT/apt" "$KABAD/apt"
+mk_installsh "$KABAD/install.sh" "$WORK/stale.asc"
+if XPF_ARCHIVE_PUBKEY="$ARCHASC" $PY "$DIST/publish.py" \
+     --dist "$KABAD" --channel stable --no-image >/dev/null 2>&1; then
+    bad "publish MUST reject a stale install.sh key but PASSED"
+else
+    ok "publish rejects install.sh embedding a non-signer key"
+fi
+# Negative: InRelease signer absent from the packaged keyring must be rejected.
+if XPF_ARCHIVE_PUBKEY="$WORK/stale.asc" $PY "$DIST/publish.py" \
+     --dist "$KAOK" --channel stable --no-image >/dev/null 2>&1; then
+    bad "publish MUST reject a signer absent from the keyring but PASSED"
+else
+    ok "publish rejects an InRelease signer absent from the packaged keyring"
+fi
+
+# ── 5e. deb ships the kernel-promote OnFailure= recovery unit (#4202, H-6) ─
+info "5e. packaging: the promote unit's OnFailure= recovery unit ships in the .deb"
+PROMOTE="$ROOT/scripts/image/xpf-kernel-promote.service"
+ONFAIL=$(sed -n 's/^OnFailure=//p' "$PROMOTE" | head -n1)
+if [ -n "$ONFAIL" ] && [ -f "$ROOT/scripts/image/$ONFAIL" ] \
+   && grep -q "cp scripts/image/$ONFAIL" "$ROOT/debian/rules" \
+   && grep -q "name=${ONFAIL%.service}" "$ROOT/debian/rules"; then
+    ok "debian/rules stages the OnFailure= recovery unit ($ONFAIL)"
+else
+    bad "debian/rules does NOT stage the promote OnFailure= unit ($ONFAIL) — dangling recovery reference"
+fi
+
 # ── 6. install.sh dry-run ──────────────────────────────────────────────────
 info "6. install.sh --dry-run (preflight + source rendering)"
 if XPF_DRY_RUN=1 XPF_APT_BASE_URL="https://example.invalid/apt" XPF_CHANNEL=stable \
