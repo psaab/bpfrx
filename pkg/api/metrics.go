@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
@@ -16,6 +17,30 @@ import (
 type xpfCollector struct {
 	srv *Server
 	mu  sync.Mutex
+
+	// #4162: short-TTL, singleflight-coalesced cache for the seven scalar
+	// session-aggregate gauges (active/established/ipv4/ipv6/snat/dnat +
+	// scrape_ok). collectSessionGauges walks the shared v4+v6 conntrack BPF
+	// hash maps (up to ~10M forward+reverse entries, 2 syscalls/entry each
+	// taking a bucket lock) concurrently with the helper's conntrack-publish
+	// path. Without this cache every /metrics scrape re-ran that O(sessions)
+	// walk, so an unauthenticated (non-loopback web-management bind) or
+	// tight-loop scraper could amplify the scan without bound. The export is
+	// only seven scalar aggregates (no per-session cardinality), so the O(N)
+	// walk yields O(1) output and is fully cacheable without losing a label.
+	// A scrape inside sessionGaugeTTL serves the cached snapshot (O(1)); the
+	// first scrape after it does exactly one refresh walk; sessionGaugeSF
+	// coalesces concurrent stale-scrapes onto a single in-flight walk so N
+	// parallel scrapes never fan out to N walks. The zero value is usable, so
+	// literal-constructed test collectors get the default TTL and a working
+	// cache. sessionGaugeTTLOverride is 0 in production (=> the default const);
+	// tests set it to drive TTL boundaries deterministically.
+	sessionGaugeMu          sync.Mutex
+	sessionGaugeSF          singleflight.Group
+	sessionGaugeSnap        sessionGaugeSnapshot
+	sessionGaugeComputedAt  time.Time
+	sessionGaugeValid       bool
+	sessionGaugeTTLOverride time.Duration
 
 	// Global counters
 	packetsTotal         *prometheus.Desc

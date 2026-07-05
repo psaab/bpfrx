@@ -175,7 +175,7 @@ func TestAuthMiddlewareConstantTimeIntegration(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	handler := authMiddleware(cfg, next)
+	handler := authMiddleware(cfg, false, next)
 
 	cases := []struct {
 		name   string
