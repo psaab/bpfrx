@@ -448,8 +448,24 @@ func (c *CLI) showDHCPRelay() error {
 			fmt.Printf("  %s:\n", name)
 			fmt.Printf("    Interfaces: %s\n", strings.Join(g.Interfaces, ", "))
 			fmt.Printf("    Active server group: %s\n", g.ActiveServerGroup)
+			var overrides []string
 			if g.AlwaysBroadcast {
-				fmt.Printf("    Overrides: always-broadcast\n")
+				overrides = append(overrides, "always-broadcast")
+			}
+			// #4309: maximum-hop-count is enforced; forward-only /
+			// relay-agent-option are accepted-only (annotated so the operator
+			// sees they match the relay's existing default behavior).
+			if g.MaximumHopCount > 0 {
+				overrides = append(overrides, fmt.Sprintf("maximum-hop-count %d", g.MaximumHopCount))
+			}
+			if g.ForwardOnly {
+				overrides = append(overrides, "forward-only (accepted-only)")
+			}
+			if g.RelayAgentOption {
+				overrides = append(overrides, "relay-agent-option (accepted-only)")
+			}
+			if len(overrides) > 0 {
+				fmt.Printf("    Overrides: %s\n", strings.Join(overrides, ", "))
 			}
 		}
 	}
@@ -459,9 +475,9 @@ func (c *CLI) showDHCPRelay() error {
 		stats := c.dhcpRelay.Stats()
 		if len(stats) > 0 {
 			fmt.Println("\nRelay statistics:")
-			fmt.Printf("  %-16s %-20s %s\n", "Interface", "Requests relayed", "Replies forwarded")
+			fmt.Printf("  %-16s %-20s %-20s %s\n", "Interface", "Requests relayed", "Replies forwarded", "Dropped (max-hops)")
 			for _, s := range stats {
-				fmt.Printf("  %-16s %-20d %d\n", s.Interface, s.RequestsRelayed, s.RepliesForwarded)
+				fmt.Printf("  %-16s %-20d %-20d %d\n", s.Interface, s.RequestsRelayed, s.RepliesForwarded, s.RequestsDroppedMaxHops)
 			}
 			// Reply-delivery breakdown (#2076). L2-fallback is the one to
 			// alert on: it means the raw-L2 path failed (CAP_NET_RAW,

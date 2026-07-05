@@ -649,6 +649,16 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 			"interface":           {desc: "Interface to relay on", args: 1, multi: true, placeholder: "<interface>", children: nil},
 			"overrides": {desc: "Relay overrides", children: map[string]*schemaNode{
 				"always-broadcast": {desc: "Always broadcast replies to clients", children: nil},
+				// #4309 (fable-review-167 I-4): maximum-hop-count is enforced
+				// (the relay's RFC 1542 §4.1.1 loop-protection hop limit,
+				// previously hardcoded at 16). forward-only and
+				// relay-agent-option are accepted-only (a commit-time advisory
+				// notes each matches the relay's existing default behavior).
+				"maximum-hop-count": {desc: "Drop relayed requests whose hop count reaches this limit", args: 1, placeholder: "<count>",
+					valueType: ValueInteger, valueDesc: "relay hop limit (RFC 1542 §4.1.1; 1..16)",
+					valueExamples: []string{"4", "16"}, validator: ValidateInteger(1, 16), children: nil},
+				"forward-only":       {desc: "Forward without retaining relay state (accepted-only; matches default — #4309)", children: nil},
+				"relay-agent-option": {desc: "Insert Option 82 relay agent information (accepted-only; always inserted — #4309)", children: nil},
 			}},
 		}},
 	}},

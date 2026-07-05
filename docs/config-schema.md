@@ -1759,6 +1759,23 @@ reserved for whole-dataplane selection where a rewrite shim
   accepted-only warning at commit. Coverage:
   `pkg/config/interface_parity_4308_test.go` (compile + advisory +
   no-false-positive).
+- **#4309 (DHCP relay overrides, fable-review-167 I-4):** the dhcp-relay
+  `overrides` block modeled only `always-broadcast`; three standard
+  relay knobs were silently dropped. Added under group `overrides`:
+  - `maximum-hop-count <1..16>` (`ValidateInteger(1, 16)`) — **enforced**.
+    The relay's hop limit was hardcoded at 16; it is now the group's
+    configured value (default 16), a request at the limit is dropped, and
+    `RelayStats.RequestsDroppedMaxHops` counts the drop. Compiled into
+    `DHCPRelayGroup.MaximumHopCount` and flows into `relaySpec.maxHopCount`.
+  - `forward-only` / `relay-agent-option` — **accepted-only**. The xpf
+    relay already forwards statelessly and always inserts Option 82, so
+    each matches the default; compiled into `DHCPRelayGroup.ForwardOnly`
+    / `RelayAgentOption` with a commit-time accepted-only advisory
+    (`validateDHCPRelayParityWarnings`). Both AST shapes handled (inline
+    flat-set Keys and block-form children). Coverage:
+    `pkg/config/compiler_dhcp_relay_overrides_test.go` (compile flat-set
+    + merged-Keys value + block form + advisory) and
+    `pkg/dhcprelay/relay_test.go` (`TestRunRelay_ConfiguredMaxHopCount`).
 - **#2008 H7 (security log profile):** declared the `security log
   profile <name>` stanza — `stream-name` (`ValueHintStreamName`
   completion), `default-profile` (presence flag), and

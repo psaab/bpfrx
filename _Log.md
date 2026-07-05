@@ -1,3 +1,25 @@
+## 2026-07-05 — fable-review-167 I-4 (#4309): DHCP relay overrides
+
+- **Timestamp**: 2026-07-05
+  - **Action**: Extend the dhcp-relay `overrides` block (previously
+    always-broadcast only). IMPLEMENTED maximum-hop-count: the relay's
+    hop limit was hardcoded 16, now the group's configured value
+    (default 16) — request at limit dropped, RequestsDroppedMaxHops
+    counts it, relaySpec.maxHopCount participates in the restart diff.
+    ACCEPTED-ONLY forward-only + relay-agent-option (typed + compiled,
+    commit-time advisory) — the relay already forwards statelessly and
+    always inserts Option 82, so each matches the default. Both AST
+    shapes (inline Keys + block children). CLI show surfaces the new
+    overrides + hop-drop stat. RED-on-revert: hop check pinned to 16
+    relays a hops=4 request.
+  - **File(s)**: pkg/config/schema_routing.go,
+    pkg/config/types_system.go, pkg/config/compiler_services.go,
+    pkg/config/compiler_validate_warn.go, pkg/dhcprelay/relay.go,
+    pkg/cli/cli_show_services.go,
+    pkg/config/compiler_dhcp_relay_overrides_test.go,
+    pkg/dhcprelay/relay_test.go, pkg/dhcprelay/README.md,
+    docs/config-schema.md, _Log.md
+
 ## 2026-07-05 — fable-review-167 I-3 (#4308): interface ARP/addressing parity knobs
 
 - **Timestamp**: 2026-07-05

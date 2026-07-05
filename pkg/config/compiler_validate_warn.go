@@ -1227,6 +1227,50 @@ func ValidateConfig(cfg *Config) []string {
 	// compiled so they stop silently vanishing, but are ACCEPTED-ONLY today.
 	warnings = append(warnings, validateInterfaceParityWarnings(cfg)...)
 
+	// #4309 (fable-review-167 I-4): DHCP relay overrides accepted-only advisory.
+	warnings = append(warnings, validateDHCPRelayParityWarnings(cfg)...)
+
+	return warnings
+}
+
+// validateDHCPRelayParityWarnings emits WARN-only commit-time advisories for
+// the #4309 (fable-review-167 I-4) DHCP relay override knobs that are
+// accepted-only. maximum-hop-count is ENFORCED (the relay's hop limit) so it
+// gets no advisory; forward-only and relay-agent-option are typed + compiled
+// so they stop silently vanishing but the relay already behaves as they
+// request (it forwards statelessly and always inserts Option 82), so the
+// advisory tells the operator the knob is accepted and matches the default.
+// Groups are reported in sorted order for a deterministic message.
+func validateDHCPRelayParityWarnings(cfg *Config) []string {
+	relay := cfg.ForwardingOptions.DHCPRelay
+	if relay == nil || len(relay.Groups) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(relay.Groups))
+	for name := range relay.Groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var warnings []string
+	for _, name := range names {
+		g := relay.Groups[name]
+		if g == nil {
+			continue
+		}
+		var knobs []string
+		if g.ForwardOnly {
+			knobs = append(knobs, "forward-only (the relay already forwards statelessly)")
+		}
+		if g.RelayAgentOption {
+			knobs = append(knobs, "relay-agent-option (Option 82 circuit-id is always inserted)")
+		}
+		if len(knobs) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"forwarding-options dhcp-relay group %s: %s configured but accepted-only — accepted and matches the relay's default behavior (#4309)",
+				name, strings.Join(knobs, ", ")))
+		}
+	}
 	return warnings
 }
 
