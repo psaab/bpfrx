@@ -173,6 +173,28 @@ var OperationalTree = map[string]*Node{
 		}},
 		"class-of-service": {Desc: "Show class-of-service information", Children: map[string]*Node{
 			"interface": {Desc: "Show per-interface CoS configuration"},
+			"classifier": {Desc: "Show configured CoS classifiers", DynamicFn: func(cfg *config.Config) []string {
+				return cosClassifierNames(cfg)
+			}, Children: map[string]*Node{
+				"name": {Desc: "Filter by classifier name", DynamicFn: func(cfg *config.Config) []string {
+					return cosClassifierNames(cfg)
+				}},
+				"type": {Desc: "Filter by code-point type", Children: map[string]*Node{
+					"dscp":       {Desc: "DSCP classifiers"},
+					"ieee-802.1": {Desc: "IEEE 802.1p classifiers"},
+				}},
+			}},
+			"scheduler-map": {Desc: "Show configured CoS scheduler-maps", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil || cfg.ClassOfService == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.ClassOfService.SchedulerMaps))
+				for name := range cfg.ClassOfService.SchedulerMaps {
+					names = append(names, name)
+				}
+				return names
+			}},
+			"forwarding-class": {Desc: "Show the forwarding-class to queue table"},
 		}},
 		"configuration": {Desc: "Show active configuration", Children: map[string]*Node{
 			"applications":       {Desc: "Application protocol definitions"},
@@ -493,6 +515,16 @@ var OperationalTree = map[string]*Node{
 			"extensive":  {Desc: "Display extensive output"},
 			"statistics": {Desc: "Display statistics and detailed output"},
 			"tunnel":     {Desc: "Show tunnel interfaces"},
+			"queue": {Desc: "Show per-queue CoS statistics", DynamicFn: func(cfg *config.Config) []string {
+				if cfg == nil || cfg.Interfaces.Interfaces == nil {
+					return nil
+				}
+				names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+				for name := range cfg.Interfaces.Interfaces {
+					names = append(names, name)
+				}
+				return names
+			}},
 		}},
 		"protocols": {Desc: "Show protocol information", Children: map[string]*Node{
 			"ospf": {Desc: "Show OSPF information", Children: map[string]*Node{
@@ -1471,6 +1503,23 @@ func KeysOf(m map[string]*Node) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// cosClassifierNames returns the configured CoS classifier names (DSCP and
+// IEEE-802.1p) for tab-completion of `show class-of-service classifier`.
+func cosClassifierNames(cfg *config.Config) []string {
+	if cfg == nil || cfg.ClassOfService == nil {
+		return nil
+	}
+	names := make([]string, 0,
+		len(cfg.ClassOfService.DSCPClassifiers)+len(cfg.ClassOfService.IEEE8021Classifiers))
+	for name := range cfg.ClassOfService.DSCPClassifiers {
+		names = append(names, name)
+	}
+	for name := range cfg.ClassOfService.IEEE8021Classifiers {
+		names = append(names, name)
+	}
+	return names
 }
 
 // FilterPrefix returns only items that start with the given prefix.
