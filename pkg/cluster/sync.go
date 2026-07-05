@@ -107,8 +107,18 @@ type SyncStats struct {
 	// guard prevented a rapid-commit reorder (C1 applied after C2) from
 	// leaving the standby on the older config.
 	ConfigsStaleIgnored atomic.Uint64
-	IPsecSASent         atomic.Uint64
-	IPsecSAReceived     atomic.Uint64
+	// ConfigsApplyFailed counts config-sync messages that were admitted by the
+	// #3931 ordering guard but whose apply did NOT take effect on this node —
+	// a compile/promote failure (a mixed-build ISSU syntax error, a store
+	// rejection) or a transient RG0-primary rejection. On such a failure the
+	// config high-water mark (lastAppliedConfigGen) is deliberately NOT
+	// advanced, so the primary's re-push of the SAME generation is re-admitted
+	// and the standby re-converges instead of being silently stranded on the
+	// prior config (M-2/#4151). A persistently-nonzero value means a standby is
+	// repeatedly failing to apply the peer's config — investigate divergence.
+	ConfigsApplyFailed atomic.Uint64
+	IPsecSASent        atomic.Uint64
+	IPsecSAReceived    atomic.Uint64
 	// #2239 HA DHCP-server lease sync counters. Sent/Received count
 	// full-set lease push MESSAGES (one per family per push); Seeded counts
 	// leases written into a freshly-started Kea on takeover; errors fold
@@ -162,6 +172,7 @@ type SyncStatsSnapshot struct {
 	ConfigsSent          uint64
 	ConfigsReceived      uint64
 	ConfigsStaleIgnored  uint64
+	ConfigsApplyFailed   uint64
 	IPsecSASent          uint64
 	IPsecSAReceived      uint64
 	DHCPLeasesSent       uint64
@@ -242,8 +253,15 @@ type SessionSync struct {
 	// during ordered handoff operations.
 	incrementalPauseDepth atomic.Int32
 
-	// OnConfigReceived is called when a config sync message arrives from the peer.
-	OnConfigReceived func(configText string)
+	// OnConfigReceived is called when a config sync message arrives from the
+	// peer. It returns nil ONLY when the config was actually applied (or is
+	// already the active config); a non-nil error means the apply did not take
+	// effect (a compile/promote failure, or a transient RG0-primary rejection).
+	// The single-consumer configApplyLoop advances the config high-water mark
+	// (lastAppliedConfigGen) ONLY on a nil return, so an apply failure leaves
+	// the standby eligible for the primary's re-push instead of silently
+	// stranded on the prior config (M-2/#4151).
+	OnConfigReceived func(configText string) error
 	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
 	OnIPsecSAReceived func(connectionNames []string)
 	// OnDHCPLeasesReceived is called when a DHCP-server lease set arrives from
@@ -369,13 +387,19 @@ type SessionSync struct {
 	// Receiver side: the config-sync handler no longer spawns a racing
 	// goroutine per message (the pre-#3931 `go OnConfigReceived` hazard). It
 	// enqueues (gen, text) onto configApplyCh, and a single ordered consumer
-	// (configApplyLoop) drains it in receive order, applying a config only
+	// (configApplyLoop) drains it in receive order, attempting a config only
 	// when its generation is strictly newer than lastAppliedConfigGen
-	// (admitConfigGen). An out-of-order older config is dropped with an alarm
-	// (ConfigsStaleIgnored). lastAppliedConfigGen is reset to 0 on a peer
-	// bulk re-prime (resetRecvGen) so a rebooted primary — whose monotonic
-	// counter restarts lower — is accepted instead of refused as stale (the
-	// #2198 F2 inverse-of-stale-RETAIN reasoning, applied to config).
+	// (shouldApplyConfigGen). An out-of-order older config is dropped with an
+	// alarm (ConfigsStaleIgnored). lastAppliedConfigGen advances ONLY AFTER a
+	// successful apply (recordAppliedConfigGen, gated on OnConfigReceived
+	// returning nil) — an apply failure counts ConfigsApplyFailed and leaves
+	// the high-water at the last-applied generation so the primary's re-push of
+	// the same generation is re-admitted and the standby re-converges instead
+	// of being silently stranded on the prior config (M-2/#4151). The mark is
+	// reset to 0 on a peer bulk re-prime (resetRecvGen) so a rebooted primary —
+	// whose monotonic counter restarts lower — is accepted instead of refused
+	// as stale (the #2198 F2 inverse-of-stale-RETAIN reasoning, applied to
+	// config).
 	configGenCounter     atomic.Uint64
 	lastAppliedConfigGen atomic.Uint64
 	configApplyCh        chan configApplyItem
@@ -640,7 +664,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.
