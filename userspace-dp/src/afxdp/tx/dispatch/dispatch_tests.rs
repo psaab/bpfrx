@@ -94,7 +94,6 @@ fn test_live_forward_request_for_frame(
         cos_queue_id: None,
         dscp_rewrite: None,
         cos_tx_selection_resolved: true,
-        filter_match_extra: crate::filter::TermMatchExtra::default(),
     }
 }
 

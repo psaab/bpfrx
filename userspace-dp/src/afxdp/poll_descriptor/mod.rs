@@ -2346,11 +2346,11 @@ pub(super) fn poll_binding_process_descriptor(
                                                     cos_queue_id: cos.queue_id,
                                                     dscp_rewrite: cos.dscp_rewrite,
                                                     cos_tx_selection_resolved: true,
-                                                    // #2362 fold B: resolved
-                                                    // above; deferred recompute
-                                                    // not taken.
-                                                    filter_match_extra:
-                                                        crate::filter::TermMatchExtra::default(),
+                                                    // #hb166 T-7:
+                                                    // filter_match_extra
+                                                    // removed (write-only;
+                                                    // deferred recompute
+                                                    // deleted).
                                                 },
                                             );
                                             recycle_now = false;
