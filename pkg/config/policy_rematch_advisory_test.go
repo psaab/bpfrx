@@ -8,10 +8,12 @@ import (
 // #4233: `security policies policy-rematch [extensive]` was absent from
 // setSchema and from compilePolicies' child handling, so it committed clean
 // and was silently dropped — an operator who set it believed in-progress
-// sessions would be re-evaluated on a policy change, but xpf performs no
-// session invalidation on commit at all. Per the #2078 / #2008 H13
-// accepted-with-advisory doctrine the knob is now recorded and commit emits
-// an accepted-only advisory. These tests pin that the leaf compiles (no
+// sessions would be re-evaluated on a policy change. Per the #2078 / #2008 H13
+// accepted-with-advisory doctrine the knob is now recorded and commit emits an
+// advisory. #4234 then shipped the Junos-DEFAULT deletion-clear (a deleted
+// policy's sessions are dropped at commit), so the advisory now reports PARTIAL
+// enforcement: the deleted-policy half is enforced; only the MODIFIED-policy
+// re-evaluation stays accepted-only. These tests pin that the leaf compiles (no
 // silent drop) AND that the advisory fires. RED on revert: without the
 // compiler/schema/warn wiring the advisory is never emitted.
 
@@ -20,7 +22,7 @@ import (
 func findPolicyRematchAdvisory(cfg *Config) string {
 	for _, w := range cfg.Warnings {
 		if strings.Contains(w, "security policies policy-rematch") &&
-			strings.Contains(w, "accepted-only") &&
+			strings.Contains(w, "partially enforced") &&
 			strings.Contains(w, "#4233") {
 			return w
 		}
