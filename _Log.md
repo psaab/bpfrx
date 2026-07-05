@@ -35257,3 +35257,28 @@ top.
   userspace-dp/src/afxdp/cos/queue_service/{mod,tests}.rs,
   userspace-dp/src/afxdp/tx/dispatch/{mod,cos,dispatch_tests}.rs,
   userspace-dp/src/afxdp/cos/README.md, _Log.md
+
+## 2026-07-05 — fable-166 T-7 hostile-review fold (M1 doc + M2 dead field)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Folded the two non-blocking MINOR items from the PR #4284
+  hostile review (MERGE-NEEDS-MINOR).
+    - **M2**: removed `PendingForwardRequest.filter_match_extra` — the #8
+      dead-path deletion left it write-only (sole reader was the deleted
+      `resolve_pending_forward_cos_tx_selection`). Removed the field def,
+      all 4 population sites (forward_request.rs, icmp.rs,
+      poll_descriptor/mod.rs, dispatch_tests.rs), and the now-pointless
+      per-forwarded-packet `term_match_extra_from_frame(..).to_static()`
+      snapshot. Confirmed zero `.filter_match_extra` read access; the
+      poll_descriptor:3922 local of the same name is the unrelated
+      flow-cache-log arg to `evaluate_non_pbr_input_filter_log_only`.
+    - **M1**: corrected 2 stale refs in `src/filter/README.md` to the
+      deleted symbol/field, including the affirmatively-false "reject bit
+      available there for a future wiring" claim.
+- **Validation**: cargo build --release clean; FULL cargo test --release
+  (--test-threads=1) 0 failed (3578+54+8+22+1).
+- **File(s)**: userspace-dp/src/afxdp/types/tx.rs,
+  userspace-dp/src/afxdp/forward_request.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+  userspace-dp/src/filter/README.md, _Log.md
