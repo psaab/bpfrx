@@ -226,6 +226,26 @@ under the daemon's errgroup. Nothing else imports this package.
 
 ## Gotchas
 
+- **Management-plane DoS hardening (#4150).** Both `http.Server` literals in
+  `NewServer` carry read-side timeouts and a header cap — `ReadHeaderTimeout`
+  (`apiReadHeaderTimeout`, 10s), `ReadTimeout` (`apiReadTimeout`, 30s),
+  `IdleTimeout` (`apiIdleTimeout`, 120s), and `MaxHeaderBytes`
+  (`apiMaxHeaderBytes`, 1 MiB). Header reads happen BEFORE `authMiddleware`, so
+  without these a pre-auth slowloris (dribbled headers/body) could pin a
+  goroutine/socket per connection once web-management binds a non-loopback
+  interface. `WriteTimeout` is deliberately left UNSET (0/unlimited): the SSE
+  event/log streams (`/api/v1/events/stream`, `/api/v1/logs/stream`) are
+  long-lived and a full metrics/session-table scrape is a large slow response —
+  a `WriteTimeout` would sever them; the response side is bounded by per-handler
+  context deadlines instead. Separately, every REST MUTATION handler decodes its
+  body through `decodeJSONBody`, which wraps `r.Body` in
+  `http.MaxBytesReader(maxRequestBodyBytes)` (16 MiB) and returns **HTTP 413** on
+  overflow instead of buffering a multi-gigabyte POST to an OOM-kill (config
+  `set`/`delete`/`activate`/`deactivate`/`load`/`rollback`/`commit-confirmed`/
+  `annotate`, `system/action`, `ping`/`traceroute`, `dhcp/identifiers/clear`).
+  Read-only GET handlers do not read a body and are out of scope. Add a new
+  mutation handler via `decodeJSONBody`, not a bare `json.NewDecoder(r.Body)`,
+  so the cap and 413 are inherited. Pinned by `http_dos_hardening_4150_test.go`.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
