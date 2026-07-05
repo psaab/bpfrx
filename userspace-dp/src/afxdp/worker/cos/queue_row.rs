@@ -273,6 +273,15 @@ pub(super) fn accumulate_queue_row(
     status.waterfill_eligible_visits = status
         .waterfill_eligible_visits
         .saturating_add(queue.telemetry.waterfill_counters.eligible_visits);
+    // hb166 T-2: refunded zero-TX Phase-1 honored selections.
+    status.waterfill_phase1_selected_no_progress = status
+        .waterfill_phase1_selected_no_progress
+        .saturating_add(
+            queue
+                .telemetry
+                .waterfill_counters
+                .phase1_selected_no_progress,
+        );
     // #1829 Phase 1: sojourn telemetry, MAX-merged across worker
     // instances (NOT summed — each instance measures its own queue
     // runtime's delay; the row reports the worst instance, matching

@@ -1032,6 +1032,88 @@ fn cos_flow_aware_buffer_limit_scales_with_prospective_active_flow_count() {
     );
 }
 
+/// hb166 T-5: the rate-0 twin of
+/// `cos_flow_aware_buffer_limit_scales_with_prospective_active_flow_count`.
+/// An UNSHAPED (`transmit_rate_bytes == 0`) flow-fair queue must STILL
+/// expand its aggregate cap with the prospective flow count. Before the
+/// fix the #717 `delay_cap = rate × 5 ms` computed 0 at rate 0, so
+/// `.min(delay_cap.max(base))` pinned the cap at `base` regardless of
+/// flow count — the flow-aware expansion collapsed and a new flow's
+/// first packet was dropped at the aggregate cap (the rate-0 twin of the
+/// #704/#707 regression). The fix anchors the delay rate to the physical
+/// link-rate floor when unshaped, so the cap expands exactly as a shaped
+/// queue at that rate would.
+#[test]
+fn cos_flow_aware_buffer_limit_expands_for_unshaped_rate0_queue() {
+    // transmit_rate_bytes == 0 → "unshaped / full bucket". base = 125 KB
+    // (< 16 × 24 KB) so the flow-aware expansion is observable.
+    let mut root = test_cos_runtime_with_queues(
+        // Root is transparent too (shaping_rate_bytes irrelevant to this
+        // per-queue admission cap; the queue's own rate is what collapsed).
+        0,
+        vec![CoSQueueConfig {
+            queue_id: 4,
+            forwarding_class: "unshaped-a".into(),
+            priority: 5,
+            transmit_rate_bytes: 0,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: 125_000,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    enable_test_flow_fair(queue);
+    assert_eq!(
+        queue.transmit_rate_bytes(),
+        0,
+        "precondition: this exercises the unshaped rate-0 regime"
+    );
+
+    // Low flow count: base still wins (prospective × MIN_SHARE < base).
+    test_flow_fair_state_mut(queue).active_flow_buckets = 2;
+    assert_eq!(
+        cos_flow_aware_buffer_limit(queue, 0),
+        queue.config.buffer_bytes.max(COS_MIN_BURST_BYTES),
+        "3 prospective × 24 KB = 72 KB < 125 KB base, so base wins even unshaped"
+    );
+
+    // High flow count: the aggregate cap MUST expand to
+    // prospective × MIN_SHARE. Pre-fix this collapsed back to `base`
+    // because delay_cap was 0 — the RED-on-revert assertion.
+    test_flow_fair_state_mut(queue).active_flow_buckets = 16;
+    for bucket in 0..16 {
+        test_flow_fair_state_mut(queue).flow_bucket_bytes[bucket] = 1_000;
+    }
+    assert_eq!(
+        cos_flow_aware_buffer_limit(queue, 0),
+        16 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
+        "unshaped rate-0 queue must still expand to 16 × 24 KB = 384 KB, \
+         not collapse to the 125 KB base (T-5: delay_cap must not be 0)"
+    );
+
+    // New-flow first-packet protection (#704/#707): with 15 resident
+    // flows and the target bucket EMPTY, prospective = 16, so the
+    // aggregate cap reserves room for the arriving 16th flow rather than
+    // pinning at base and dropping its first packet.
+    test_flow_fair_state_mut(queue).active_flow_buckets = 15;
+    for bucket in 0..15 {
+        test_flow_fair_state_mut(queue).flow_bucket_bytes[bucket] = 1_000;
+    }
+    let new_flow_bucket = 15;
+    test_flow_fair_state_mut(queue).flow_bucket_bytes[new_flow_bucket] = 0;
+    assert_eq!(
+        cos_flow_aware_buffer_limit(queue, new_flow_bucket),
+        16 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
+        "unshaped queue must reserve aggregate room for a new flow's first packet"
+    );
+}
+
 #[test]
 fn cos_flow_aware_buffer_limit_matches_share_limit_at_new_flow_boundary() {
     // #716 review: the aggregate cap and the per-flow clamp must

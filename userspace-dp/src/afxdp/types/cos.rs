@@ -1465,6 +1465,18 @@ pub(in crate::afxdp) struct CoSQueueWaterfillCounters {
     /// (low visits + high parks) from "genuinely idle on this owner"
     /// (low visits + low parks + zero queued_bytes).
     pub(in crate::afxdp) eligible_visits: u64,
+    /// hb166 T-2: times this queue was selected via the Phase-1 honored
+    /// walk but the subsequent service call transmitted zero bytes (TX
+    /// ring full / no free UMEM frame / frame-build Drop). On such a
+    /// no-progress visit the Phase-1 budget debit and honored-epoch bit
+    /// are REFUNDED (the class keeps its guarantee for a retry), so
+    /// `phase1_admissions` counts only visits that actually made TX
+    /// progress. A climbing `phase1_selected_no_progress` with flat
+    /// `phase1_admissions` on a backlogged small class is the fingerprint
+    /// of sustained TX-ring / completion-reap pressure eating the
+    /// guarantee pass (previously invisible: the pre-hb166 code counted
+    /// the failed selection as an admission and burned the epoch).
+    pub(in crate::afxdp) phase1_selected_no_progress: u64,
 }
 
 pub(in crate::afxdp) struct CoSTimerWheelRuntime {

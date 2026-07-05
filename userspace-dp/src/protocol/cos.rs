@@ -399,6 +399,14 @@ pub(crate) struct CoSQueueStatus {
     pub waterfill_phase2_admissions: u64,
     #[serde(rename = "waterfill_eligible_visits", default)]
     pub waterfill_eligible_visits: u64,
+    // hb166 T-2: times a Phase-1 honored selection made ZERO TX progress
+    // (ring full / no free frame / build Drop) and had its budget debit +
+    // honored bit REFUNDED. Climbing here with flat waterfill_phase1_
+    // admissions on a backlogged small class = TX-ring pressure eating the
+    // guarantee pass. `default` keeps a pre-hb166 daemon's absent field at
+    // 0 (rolling-upgrade safe).
+    #[serde(rename = "waterfill_phase1_selected_no_progress", default)]
+    pub waterfill_phase1_selected_no_progress: u64,
     // #1829 Phase 1: dequeue-time sojourn telemetry, sampled as
     // `now_ns - item.enqueue_ns` at the COMMITTED-PREFIX settle points
     // (after the TX insert accepts the item — Codex review on PR

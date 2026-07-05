@@ -505,7 +505,16 @@ exact classes deeper buffers than the implicit admission/buffer cap:
 `max(transmit_rate_bytes/100, 96_000)` (10 ms of bytes with a 96 KB
 floor), then admission applies the flow-aware
 `prospective_active * 24 KB` expansion plus the #717 5 ms envelope clamp
-(`.min(delay_cap.max(base))`). #1312 showed that those implicit caps
+(`.min(delay_cap.max(base))`). For an UNSHAPED flow-fair queue
+(`transmit_rate_bytes == 0`, i.e. no per-queue shaper) the delay cap is
+anchored to a physical link-rate floor
+(`COS_FLOW_FAIR_UNSHAPED_DRAIN_RATE_BYTES`, 10 Gb/s) rather than the
+literal 0 rate — an unshaped queue drains at line rate, not zero. Before
+hb166 T-5 the rate-0 `delay_cap` computed 0, so `.min(delay_cap.max(base))`
+pinned the aggregate cap at `base` regardless of flow count: the
+flow-aware expansion collapsed and a new flow's first packet was dropped
+at the aggregate cap (the rate-0 twin of the #704/#707 regression). #1312
+showed that those implicit caps
 reproduce reverse-mode tail-drop under `-P 12` even when equal-flow
 suppression is disabled: the 100M class hit aggregate admission drops,
 and the 1G class hit per-flow share drops. The fixture overrides
@@ -1241,6 +1250,21 @@ unit policy:
   proportionally across the queues NOT fully honoured in Phase 1
   (with the partial-honour queue carrying its REMAINING quantum,
   not its full quantum, so total alloc per queue ≤ Q_i).
+
+  **Zero-TX honor refund (hb166 T-2):** the selector debits the
+  Phase-1 budget and sets the honored-epoch bit at SELECTION, but the
+  service wrapper REFUNDS both (adds the debit back, clears the bit) if
+  the selected queue transmits zero bytes — a transient TX failure (TX
+  ring full, no free UMEM frame, frame-build Drop) must not burn the
+  small class's 200 µs epoch guarantee. The failure is interface-wide
+  (all CoS queues share one TX ring / UMEM pool), so a refund + retry
+  does not differentially starve other queues; the worker reaps
+  completions between drain passes. `phase1_admissions` therefore counts
+  only visits that made TX progress; `phase1_selected_no_progress`
+  counts the refunded no-progress visits (climbing there with flat
+  `phase1_admissions` on a backlogged small class = TX-ring pressure
+  eating the guarantee pass). A queue that DID transmit keeps its honor
+  consumed — no double-consume, no honor leak.
 
   **Claim-side work conservation (#1863, Path A-ii):** the per-class
   v8 lease that fuels the selector's token banks publishes a per-epoch

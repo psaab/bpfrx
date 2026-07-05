@@ -1971,6 +1971,12 @@ type CoSQueueStatus struct {
 	WaterfillPhase1Admissions uint64 `json:"waterfill_phase1_admissions,omitempty"`
 	WaterfillPhase2Admissions uint64 `json:"waterfill_phase2_admissions,omitempty"`
 	WaterfillEligibleVisits   uint64 `json:"waterfill_eligible_visits,omitempty"`
+	// hb166 T-2: Phase-1 honored selections that made ZERO TX progress and
+	// had their budget debit + honored bit refunded. Climbing here with
+	// flat WaterfillPhase1Admissions = TX-ring pressure eating a small
+	// class's guarantee pass. omitempty keeps a pre-hb166 daemon's absent
+	// field at 0 (rolling-upgrade safe).
+	WaterfillPhase1SelectedNoProgress uint64 `json:"waterfill_phase1_selected_no_progress,omitempty"`
 	// #1829 Phase 1: dequeue-time sojourn telemetry. JSON tags MUST
 	// match the Rust serde rename(...) in protocol/cos.rs exactly.
 	// All three are MAX-merged across worker instances and across
