@@ -490,6 +490,25 @@ def libvirt_disk(ap, runner):
     return overlay
 
 
+def _virsh_define(runner, name, xml):
+    """Define (persistent, NOT started) a libvirt domain from virt-install's
+    generated XML. `virt-install --import` DEFINES AND BOOTS the guest, so the
+    only way to honor `--no-start` on libvirt is to generate the domain XML
+    (`--print-xml`) and `virsh define` it — the domain is then persistent but
+    stopped, so the pinned-guest-PCI workflow (edit slots via `virsh edit`
+    BEFORE first boot) works (fable-165 H-26)."""
+    if runner.dry:
+        runner.run(["virsh", "define", f"{name}.xml"])
+        return
+    fd, path = tempfile.mkstemp(suffix=".xml", prefix=f"xpf-{name}-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(xml)
+        runner.run(["virsh", "define", path])
+    finally:
+        os.unlink(path)
+
+
 def deploy_libvirt(ap, runner, start):
     name = ap["name"]
     print_map(ap)
@@ -548,10 +567,19 @@ def deploy_libvirt(ap, runner, start):
     print("# virt-install — NIC order = guest PCI-slot order = positional names.")
     for n in notes:
         print(f"# NOTE: {n}")
-    runner.run(argv)
     if start:
+        runner.run(argv)   # --import DEFINES AND BOOTS the domain.
         print(f"\n{name}: verify with `virsh console {name}` then "
               f"`cli -c \"show interfaces terse\"`.")
+    else:
+        # Honor --no-start: --import would boot the guest, so generate the
+        # domain XML and `virsh define` it (defined, persistent, NOT started)
+        # — makes the pinned-guest-PCI `virsh edit` before first boot workflow
+        # possible (fable-165 H-26).
+        xml = runner.run(argv + ["--print-xml"])
+        _virsh_define(runner, name, xml)
+        print(f"\n{name} defined (not started): start it with `virsh start {name}` "
+              f"(edit guest PCI slots first with `virsh edit {name}` if pinning).")
 
 
 def deploy(ap, args):

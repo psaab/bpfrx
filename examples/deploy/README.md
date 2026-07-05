@@ -102,7 +102,7 @@ live VMs would corrupt it.
 | | incus | libvirt / KVM |
 |---|---|---|
 | **Best for** | quick, scriptable, VM fleets; the project's own test cluster | existing `virsh` shops; fine-grained guest PCI control |
-| **Tool action** | runs `incus init` + `device add…` + `start` end-to-end | emits a `virt-install` command you run |
+| **Tool action** | runs `incus init` + `device add…` + `start` end-to-end | runs `virt-install --import` end-to-end (with `--no-start`: `virt-install --print-xml \| virsh define`, so the domain is defined but not booted) |
 | **Root disk** | per-instance clone from the image store (`incus init`) | per-VM `qemu-img` overlay `<name>.qcow2` backed read-only by `<image>.qcow2` |
 | **NIC ordering** | device-name order (`dev00…`) → PCI slot → positional name | `--network`/`--hostdev` order → persisted `<address>` slots (pin in `virsh edit` for full control) |
 | **SR-IOV auto-VF** | `nictype=sriov parent=<PF>` | one-time `<forward mode='hostdev'>` VF pool (tool prints the XML) |

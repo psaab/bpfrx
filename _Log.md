@@ -34178,3 +34178,14 @@ top.
   through it; the config-drive mkiso build and the `sudo install` golden-copy
   fallback route through it too. Issues #4204/#4205/#4206 filed.
 - **File(s)**: scripts/deploy/xpf-deploy.py, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-165 H-26 — honor `--no-start` on the libvirt path. `--import`
+  defines AND boots, so when start=False deploy_libvirt now runs
+  `virt-install ... --print-xml` and `virsh define`s the XML (new `_virsh_define`
+  helper) — domain defined, persistent, NOT started, so `virsh edit`
+  before-first-boot PCI pinning works. Fixed both docs that wrongly said the tool
+  "emits a virt-install command you run" (it EXECUTES it): examples/deploy/README.md
+  table row and docs/deploy-quickstart.md "libvirt instead of incus".
+- **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/README.md,
+  docs/deploy-quickstart.md, _Log.md
