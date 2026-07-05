@@ -34130,3 +34130,42 @@ top.
 - **File(s)**: pkg/daemon/device_map.go, pkg/daemon/hb165_bootstrap_batch_test.go,
   pkg/configstore/store.go, pkg/configstore/nodeid_lenient_test.go,
   cmd/xpfd/main.go, docs/bare-metal-device-map.md, _Log.md
+- **Action**: fable-review-165 H-18 (#4194) — fix docs/bare-metal-device-map.md
+  quick-start step 3, which told the operator `commit check` confirms a
+  `commit confirmed`. It does not: `CommitCheck`
+  (`pkg/configstore/store_commit.go:26-41`) only validates and never
+  touches the confirm timer, so following the doc lets the T+5m window
+  expire and auto-rollback the just-verified device-map. The confirming
+  command is a plain `commit` (`store_commit.go:106-120`:
+  `clearPendingConfirmLocked` cancels the timer). Rewrote step 3 to
+  confirm with `commit` and warn that `commit check` alone rolls back.
+- **File(s)**: docs/bare-metal-device-map.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 H-28 (#4195) — fix docs/deploy-quickstart.md
+  standalone quickstart. standalone.yaml (and the `launch` form) source
+  br-mgmt/br-lan/br-wan, but the only `incus network create` block lived
+  in the HA section, so a fresh-host standalone deploy failed on an
+  unknown source network; and a bare bridge has no DHCP, so fxp0 (mgmt)
+  and ge-0/0/1 (WAN) — both `dhcp` in standalone.conf — came up with no
+  address. Added a copy-pasteable bridge-create block to the standalone
+  section mirroring the HA form: br-mgmt + br-wan NAT/DHCP-bearing, br-lan
+  plain L2 (ge-0/0/0 is the static gateway running dhcp-local-server).
+- **File(s)**: docs/deploy-quickstart.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 H-29 (#4196) — add root-authentication to the
+  example day-0 configs. standalone.conf and ha-pair.conf enabled ssh
+  host-inbound but shipped no credentials, so SSH was unusable and a real
+  vSRX would refuse to commit (Junos requires root-authentication; xpf
+  accepts one silently). The baked sshd is PermitRootLogin
+  prohibit-password (scripts/image/bake.py), so an ssh KEY — not a
+  password — is what enables `ssh root@fxp0`. Added an active
+  `system root-authentication { ssh-ed25519 "...REPLACE..."; }` stanza to
+  both confs with a loud REPLACE-ME comment: it parses + commits (schema
+  node pkg/config/schema_system.go:58-67; no format validator on the key)
+  and gives vSRX parity, but the placeholder authenticates no one so it
+  fails closed if deployed unmodified. Verified all three personalities
+  still pass `xpfd check-config` (standalone; ha-pair -node-id 0 and 1) —
+  strict parse + schema + compile.
+- **File(s)**: examples/deploy/standalone.conf, examples/deploy/ha-pair.conf, _Log.md
