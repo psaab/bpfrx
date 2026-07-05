@@ -146,6 +146,24 @@ editing cmdtree.
   the deferred half of #4107.)
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
+  - **`/metrics` posture (#4162).** The Prometheus endpoint is
+    unauthenticated on the loopback default bind — the standard Prometheus
+    posture. When `system services web-management http interface <if>`
+    rebinds the HTTP API to a routable management address AND auth is
+    configured, `/metrics` requires the same credentials as every other
+    endpoint (`isLoopbackBindAddr` → `authMiddleware` gate); a
+    routable-interface Prometheus scraper must then present the configured
+    API key / basic-auth. `/health` stays exempt (no sensitive data, no
+    table walk).
+  - The seven `xpf_sessions_*` aggregate gauges are backed by a full walk
+    of the shared v4+v6 conntrack tables (up to ~10M entries). That walk is
+    served from a short-TTL (`sessionGaugeTTL`, 3s), singleflight-coalesced
+    cache, so the walk rate is capped at ≤1 per TTL regardless of scrape
+    frequency or concurrency — a tight-loop or unauthenticated scraper
+    cannot amplify the O(sessions) scan. Normal scrape intervals (15-60s)
+    always land outside the window and see fresh counts. `/metrics` is also
+    registered with `promhttp.HandlerOpts{Timeout, MaxRequestsInFlight}` to
+    bound slow/concurrent scrapes.
 - **CLI** — interactive Junos-style with tab completion, `?` help, pipe
   filters (`| match`, `| count`, `| except`).
 - **Remote CLI** — the `cli` binary connects via gRPC with full tab/`?`

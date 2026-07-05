@@ -1,3 +1,51 @@
+## 2026-07-04 — #4162 (fable-review-164 L-5): /metrics session-walk TTL cache + auth posture
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Closed an unauthenticated-DoS / hot-path-contention
+    vector on the Prometheus `/metrics` endpoint. The seven
+    `xpf_sessions_*` aggregate gauges walked the shared v4+v6 conntrack
+    BPF hash maps (up to ~10M entries, ~20M syscalls each taking a bucket
+    lock) on EVERY scrape, with no cache/throttle and no scrape
+    timeout/concurrency limit — a tight-loop or (when web-management
+    binds a routable interface) unauthenticated remote scraper could
+    amplify that O(sessions) scan against the live forwarding path.
+  - **Fix (B, primary — the DoS)**: added a short-TTL
+    (`sessionGaugeTTL` = 3s), singleflight-coalesced cache around the
+    session-gauge walk (`sessionGaugeSnapshotCached` +
+    `walkSessionGauges` in `pkg/api/metrics_sessions.go`; cache fields on
+    `xpfCollector` in `pkg/api/metrics.go`). A scrape inside the TTL
+    serves the cached seven aggregates (O(1)); the first scrape after it
+    does exactly one refresh walk; `singleflight` collapses concurrent
+    stale scrapes onto ONE in-flight walk. 3s is below the conventional
+    15-60s scrape interval so normal scraping always sees fresh counts
+    while a tight loop is capped at ≤1 walk/3s. The `#2469` fail-loud
+    contract is preserved (walk error → `scrape_ok=0`, gauges omitted,
+    cache NOT poisoned). Also set
+    `promhttp.HandlerOpts{Timeout: 10s, MaxRequestsInFlight: 3}` at the
+    `/metrics` registration (`pkg/api/server.go`).
+  - **Fix (A, secondary — auth posture)**: `/metrics` stays
+    unauthenticated on the loopback default (standard Prometheus
+    posture), but when the HTTP API is rebound to a NON-loopback
+    interface AND auth is configured, `/metrics` now requires credentials
+    like every other endpoint. `authMiddleware` gained a
+    `metricsRequireAuth bool`; `isLoopbackBindAddr(cfg.Addr)` (new, in
+    `pkg/api/auth.go`) drives it — wildcard / hostname / unparseable
+    binds are treated as non-loopback (fail safe: gate rather than
+    expose). `/health` remains always-exempt.
+  - **Tests** (`pkg/api/metrics_sessions_cache_test.go`): walk-once-per-TTL
+    over 25 rapid scrapes (RED on revert — walks == scrapes without the
+    cache), singleflight coalescing of 16 concurrent scrapes onto one walk
+    (RED on revert), refresh-after-TTL-expiry, cached aggregates ==
+    fresh cache-bypassing walk (reverse entries excluded),
+    `isLoopbackBindAddr` classification table, and the non-loopback
+    `/metrics` auth gate (401 without key / 200 with basic or API key /
+    `/health` still open; RED on revert of the unconditional bypass).
+    Existing `authMiddleware` callers updated for the new signature.
+  - **Files**: `pkg/api/metrics_sessions.go`, `pkg/api/metrics.go`,
+    `pkg/api/server.go`, `pkg/api/auth.go`, `pkg/api/auth_test.go`,
+    `pkg/api/auth_consttime_4157_test.go`,
+    `pkg/api/metrics_sessions_cache_test.go`, `docs/architecture.md`.
+
 ## 2026-07-04 — #4157 (fable-review-164 L-6): constant-time API-key/Bearer/username auth
 
 - **Timestamp**: 2026-07-04
