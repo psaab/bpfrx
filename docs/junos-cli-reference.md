@@ -589,10 +589,17 @@ From zone: guest, To zone: lan
     junos-host` wildcard, AND a GLOBAL `set security policies global policy <p>
     match to-zone junos-host` (#3639 / #3611 Piece B). The three are consulted
     most-specific-first (exact → from-any → global). `from-zone junos-host`
-    (host-ORIGINATED / locally-generated traffic) rules — zone-pair or global —
-    are NOT consulted: locally-generated traffic does not traverse the ingress
-    LocalDelivery path (it egresses via the kernel TX path), so that direction
-    is rejected at commit and remains a documented follow-up (#3611 Piece A).
+    (host-ORIGINATED / locally-generated traffic) rules — the zone-pair
+    `from-zone junos-host to-zone <z>` form OR the global
+    `match from-zone junos-host` form — are NOT consulted: locally-generated
+    traffic does not traverse the ingress LocalDelivery path (it egresses via
+    the kernel TX path), so that direction would commit but silently never
+    match. BOTH forms are therefore rejected at STRICT commit: the global form
+    since #3611 Piece A, the zone-pair form since #4230 (which previously
+    committed clean and was silently inert). The lenient load / peer-sync path
+    downgrades either to a warning so an already-persisted config still boots.
+    Actually wiring host-originated policy against the kernel TX path remains a
+    documented follow-up.
 
 ### Filtering
 
@@ -761,7 +768,9 @@ Global policies:
   junos-host` wildcard. A `match from-zone junos-host` global (host-ORIGINATED)
   is still rejected: locally generated traffic egresses via the kernel TX path,
   not the AF_XDP RX gate, so it could only ever silently never-match (#3611
-  Piece A, documented not built).
+  Piece A, documented not built). The zone-pair `from-zone junos-host to-zone
+  <z>` spelling is rejected at strict commit for the same reason (#4230); before
+  #4230 it committed clean and was silently inert.
 - **#3286 — scope shown on EVERY inventory surface.** Before #3286 only the
   dataplane enforced the scope; the show/inventory surfaces dropped it and
   rendered scoped globals as all-zones. All surfaces now reflect the configured

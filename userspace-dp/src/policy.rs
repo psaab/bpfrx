@@ -3600,11 +3600,16 @@ fn resolve_policy_zone_id(
 /// rule. The stricter Junos "configured zone-pair implies default-deny"
 /// posture is intentionally deferred (see docs/junos-cli-reference.md).
 ///
-/// `from-zone junos-host` (host-ORIGINATED) rules — whether zone-pair or a
-/// GLOBAL `match from-zone junos-host` — are NOT consulted here: locally
+/// `from-zone junos-host` (host-ORIGINATED) rules — whether the zone-pair
+/// `from-zone junos-host to-zone <z>` form or the GLOBAL
+/// `match from-zone junos-host` form — are NOT consulted here: locally
 /// generated traffic egresses via the kernel TX path and does not traverse the
-/// ingress LocalDelivery path. That direction is rejected at commit and is a
-/// documented follow-up (#3611 Piece A).
+/// ingress LocalDelivery path. BOTH forms are rejected at STRICT commit (the
+/// global form since #3611 Piece A; the zone-pair form since #4230 — earlier it
+/// committed clean and was silently inert); the lenient load / peer-sync path
+/// downgrades either to a warning so an already-persisted config still boots.
+/// Actually wiring host-originated policy against the kernel TX path is a
+/// documented follow-up.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_junos_host_policy(
     state: &PolicyState,
