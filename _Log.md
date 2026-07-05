@@ -1,3 +1,42 @@
+## 2026-07-04 — #4217 / #4218 / #4219 / #4220 (fable-review-166 G-4 / G-3 / G-5 / G-1): CoS config-schema typing
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Typed four class-of-service config-schema leaves that
+    were untyped/missing/inert so garbage HARD-REJECTS at commit instead
+    of compiling to a silent 0, and added accepted-but-inert commit
+    warnings for the two knobs the dataplane does not enforce. G-4
+    (#4217): `shaping-rate` typed via the container `keyValidator`
+    (ValueRate — it carries the burst-size child, so `valueType` would
+    mis-treat burst-size as a modifier) + `burst-size` ValueByteSize, at
+    both unit and #4021 interface level; before this `shaping-rate 10gg`
+    committed as 0 and the root shaper vanished (unshaped ~25G). G-3
+    (#4218): typed `codel-target` (ValueInteger/ValidateIntegerMin(0)) +
+    a commit warning when CodelTargetNS>0 (CoDel AQM never shipped,
+    #1829 Phase 2 PLAN-KILLED). G-5 (#4219): added
+    `oversubscription-policy` (container `{ guarantee-rate <frac 0..1> |
+    proportional }`, fraction validated ValidatePercent(0,1) so 1.7 is
+    rejected not clamped) + `priority-low-min-share` (ValueRate) at unit
+    + interface level. G-1 (#4220): priority-low-min-share is INERT
+    (wire-surface only; no cap_eff reservation) — added a commit
+    warning, corrected the misleading `queue_service/mod.rs` comment
+    that cited a nonexistent cap_eff subtraction, and marked
+    fairness-regimes.md gate 2 DEFERRED/NOT-IMPLEMENTED. Enforcement
+    (cap_eff) is separate deferred research, out of scope.
+  - **File(s)**: pkg/config/schema_cos.go (typed leaves + 3 shared
+    constructors), pkg/config/compiler_validate_warn.go (codel-target +
+    priority-low-min-share inert warnings),
+    pkg/config/schema_cos_hb166_test.go (new RED-on-revert tests),
+    pkg/config/schema_validate_test.go (repointed the "untyped leaf
+    ignored" test off now-typed shaping-rate/burst-size onto the
+    still-untyped classifiers dscp reference),
+    userspace-dp/src/afxdp/cos/queue_service/mod.rs (comment fix),
+    docs/config-schema.md, docs/cos-traffic-shaping.md (+ fixed a buggy
+    two-line shaping-rate/burst-size example), docs/cos-wan-sqm.md,
+    docs/fairness-regimes.md.
+  - **Validation**: `go test ./pkg/config/...` green; `go build ./...`;
+    gofmt + `go vet ./pkg/config/...` clean. RED-on-revert proven: with
+    the validators removed the shaping-rate/burst-size/codel-target
+    garbage values commit clean again.
 ## 2026-07-04 — #4214 / #4215 (fable-review-165 H-5 / H-13): publish default-deny sweep + per-channel latest.json gate
 
 - **Timestamp**: 2026-07-04
