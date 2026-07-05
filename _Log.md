@@ -34473,3 +34473,39 @@ top.
   both kept), unioned _Log.md + cos-traffic-shaping.md.
 - **File(s)**: pkg/dataplane/userspace/fairness.go,
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go, _Log.md
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-167 P-2 / P-5 / D-1. P-2 (policy-rematch):
+  `security policies policy-rematch [extensive]` committed clean and was
+  silently dropped (absent from setSchema + compilePolicies). Added the
+  accepted-with-advisory wiring (mirrors #2078 tcp-session / #2008 H13):
+  schema leaf under `security policies`, SecurityConfig.PolicyRematch /
+  PolicyRematchExtensive recorded in compilePolicies (flat + hierarchical
+  shapes), and a commit-time accepted-only advisory in ValidateConfig
+  stating xpf does not yet re-evaluate/invalidate in-progress sessions on
+  a policy change. Filed #4233 (advisory, closed by PR) + #4234
+  (session-invalidation-on-commit enhancement, STAYS OPEN with a converged
+  plan). Verdict on the deeper session-invalidation: DRIVEABLE for the
+  bounded deletion-clear core (diff pre/post policies -> stable-id delta ->
+  clear sessions whose #3056 policy_id matches, reusing the ClearSessions
+  filtered-clear path + #2468 reverse/companion/HA propagation) but the
+  modified-policy re-eval half NEEDS-RESEARCH (which changes trigger,
+  commit-time full-sweep cost, extensive semantics) -> filed as #4234 for a
+  follow-up /engineer, too big for this PR. RED-on-revert verified (removing
+  the compiler case drops the knob + no advisory). P-5: added policy-based
+  IPsec VPN gap row to feature-gaps.md §15 — verified rejected at commit via
+  #3114 (compiler_policy_then.go validatePolicyThenPermitStrict, empty
+  supportedPolicyThenPermitChildren); only route-based st0/XFRM VPN exists.
+  D-1: corrected the parity docs against code reality — vsrx-gaps.md got a
+  hard STALE banner enumerating now-shipped sections (verified DHCPv6 PD,
+  apply-groups, BFD; sole parse-only survivor = license autoupdate url);
+  feature-gaps.md NAT #3029 callout rewritten for #3164 LPM DNAT (reject
+  removed); screen count reconciled UP to 12 (accurate enumerated set) in
+  feature-gaps.md/feature-coverage.md/CLAUDE.md; Rescue Configuration row
+  Missing -> Done (SaveRescueConfig, store_persist.go); total-drift note +
+  VPN/TOTAL rows updated for the added gap row. go build ./... + gofmt +
+  go vet clean; full pkg/config suite green.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_policy.go, pkg/config/schema_security.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/policy_rematch_advisory_test.go, docs/feature-gaps.md,
+  docs/vsrx-gaps.md, docs/feature-coverage.md, CLAUDE.md, _Log.md
