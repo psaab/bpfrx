@@ -191,9 +191,14 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
     // and gating decision are byte-identical to before.
     if transmit_rate_bytes == 0 {
         queue.v_min.consecutive_v_min_skips = 0;
-        // #hb166 T-6(a): not throttled -> reset the decaying suspension
-        // window (see the hard-cap arm below). Invariant: the window is
-        // full whenever the consecutive-skip counter is 0.
+        // #hb166 T-6(a): the decaying suspension window (see the hard-cap
+        // arm below) is RESTORED to full on the skew-clear / not-applicable
+        // paths — this unshaped path, the no-peer path, and a passing
+        // V_min check. The hard-cap path is the ONLY place that resets the
+        // skip counter WITHOUT restoring the window (it deliberately keeps
+        // the halved value, the decaying re-arm), so this is not a global
+        // "window==full iff skips==0" invariant — it is a reset on the
+        // three not-throttled outcomes.
         queue.v_min.v_min_suspension_window = V_MIN_SUSPENSION_BATCHES;
         return true;
     }
