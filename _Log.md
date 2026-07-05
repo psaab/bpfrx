@@ -34607,3 +34607,12 @@ top.
   all_pass else 1), per-port .rc generator-health capture, replaced
   `|| true` launchers. Closes #4240.
 - **File(s)**: test/incus/cos-gate1-small-four-alone.sh, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: hb166 V-11 — fairness-harness.sh single mode now fails hard
+  (exit 2) on a port with no canonical shaper rate, mirroring the
+  mixed-cos branch, instead of silently defaulting SHAPER_RATE_BPS=25G
+  (which masked a misconfigured port as a 25G-cap pass). Documented the
+  new harness exit-code contract in docs/fairness-regimes.md. Closes #4241.
+- **File(s)**: test/incus/fairness-harness.sh, docs/fairness-regimes.md,
+  _Log.md
