@@ -188,6 +188,14 @@ pub(super) struct SharedCoSEpochState {
     /// undergrant (class shows extra outstanding bytes until next
     /// rotation), NOT overshoot.
     pub(super) rollback_retry_exceeded: AtomicU64,
+    /// #4246 (T-1): cumulative bytes re-credited to `packed_granted` by
+    /// `release_unused_v8` on lease give-back (queue drained mid-epoch).
+    /// Monotonic, relaxed. Exposed so an operator can sum give-back
+    /// against per-class undershoot on a mid-rate on/off pattern — the
+    /// falsification test for the #1630 cause-2 attribution (the ~6%
+    /// mid-rate residual may be this ledger double-charge). Diagnostic
+    /// only; not part of the seqlock-published epoch payload.
+    pub(super) release_recredited_bytes: AtomicU64,
     /// #1231 v5: 'all peers CPU-bound' bypass-grace countdown. When
     /// set to N > 0 by rotation, the next N rotations open the surplus
     /// path immediately (no grace-period gate) for active workers.
@@ -218,6 +226,7 @@ impl SharedCoSEpochState {
             epoch_grace_expires_ns: AtomicU64::new(0),
             packed_granted: PackedEpochGrant::new(),
             rollback_retry_exceeded: AtomicU64::new(0),
+            release_recredited_bytes: AtomicU64::new(0),
             bypass_grace_rotations_remaining: AtomicU32::new(0),
             bypass_grace_arm_count: AtomicU64::new(0),
             bypass_grace_use_count: AtomicU64::new(0),
