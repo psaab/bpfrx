@@ -1239,7 +1239,10 @@ fn aggregate_cos_statuses_sums_drop_counters_across_worker_snapshots() {
     let q = &iface.queues[0];
     assert_eq!(q.queue_id, 4);
     assert_eq!(q.owner_worker_id, Some(3));
-    assert_eq!(q.buffer_bytes, 128 * 1024);
+    // #hb166 T-7: buffer_bytes is a per-queue CONFIG value identical across
+    // workers — aggregate by MAX, not SUM. Pre-fix summed 64 KB + 64 KB =
+    // 128 KB (an N× "stats-that-lie" inflation). RED-on-revert.
+    assert_eq!(q.buffer_bytes, 64 * 1024);
     assert_eq!(q.queued_bytes, 64 * 1024);
     // Each counter is non-coprime-prime on both sides to catch
     // accidental re-attribution between counters.
