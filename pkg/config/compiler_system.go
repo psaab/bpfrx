@@ -265,14 +265,38 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, slInst := range namedInstances(child.FindChildren("host")) {
 				host := &SyslogHostConfig{Address: slInst.name}
 				for _, prop := range slInst.node.Children {
+					// #4303 S-1: switch on the KNOWN host sub-statements
+					// before the facility/severity fallback. Without this
+					// every non-`allow-duplicates` child (source-address,
+					// port, match, structured-data, ...) was captured as a
+					// bogus SyslogFacility{Facility:Keys[0], Severity:Keys[1]}
+					// that polluted the facility filter — applySystemSyslog
+					// reads Facilities[0].Facility, so a leading
+					// `source-address` set the whole client's facility to
+					// garbage.
 					switch prop.Name() {
 					case "allow-duplicates":
 						host.AllowDuplicates = true
+					case "source-address":
+						host.SourceAddress = nodeVal(prop)
+					case "port":
+						if v := nodeVal(prop); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								host.Port = n
+							}
+						}
+					case "match", "match-strings", "structured-data",
+						"explicit-priority", "log-prefix", "facility-override",
+						"routing-instance", "exclude-hostname":
+						// Recognized Junos host modifiers that are NOT
+						// facility/severity pairs. Accepted so a valid
+						// config commits; not (yet) wired into the runtime
+						// syslog client — see the S-5 advisory path.
 					default:
-						if len(prop.Keys) >= 2 {
+						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
 							host.Facilities = append(host.Facilities, SyslogFacility{
-								Facility: prop.Keys[0],
-								Severity: prop.Keys[1],
+								Facility: fac,
+								Severity: sev,
 							})
 						}
 					}
@@ -282,9 +306,16 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, fileInst := range namedInstances(child.FindChildren("file")) {
 				file := &SyslogFileConfig{Name: fileInst.name}
 				for _, prop := range fileInst.node.Children {
-					if len(prop.Keys) >= 2 {
-						file.Facility = prop.Keys[0]
-						file.Severity = prop.Keys[1]
+					switch prop.Name() {
+					case "archive", "match", "match-strings", "structured-data",
+						"explicit-priority", "allow-duplicates":
+						// #4303 S-1: recognized file modifiers, not a
+						// facility/severity pair — do not append as one.
+					default:
+						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
+							file.Facility = fac
+							file.Severity = sev
+						}
 					}
 				}
 				sys.Syslog.Files = append(sys.Syslog.Files, file)
@@ -293,9 +324,15 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
 				user := &SyslogUserConfig{User: userInst.name}
 				for _, prop := range userInst.node.Children {
-					if len(prop.Keys) >= 2 {
-						user.Facility = prop.Keys[0]
-						user.Severity = prop.Keys[1]
+					switch prop.Name() {
+					case "match", "match-strings", "structured-data",
+						"explicit-priority", "allow-duplicates":
+						// #4303 S-1: recognized user modifiers, not a pair.
+					default:
+						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
+							user.Facility = fac
+							user.Severity = sev
+						}
 					}
 				}
 				sys.Syslog.Users = append(sys.Syslog.Users, user)
@@ -709,6 +746,29 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 		}
 	}
 	return nil
+}
+
+// syslogFacilitySeverity extracts the `<facility> <severity>` pair from a
+// system-syslog destination child. The pair is normally flat
+// (`daemon warning;` → Keys=["daemon","warning"]) but tolerates the
+// hierarchical shape (`daemon { warning; }` → Keys=["daemon"], child
+// Keys=["warning"]). Returns ok=false when the node carries no severity
+// token, so a bare/garbage leaf is dropped rather than appended as a
+// half-populated filter entry (#4303 S-1). Callers must pre-filter the
+// known non-facility host/file/user modifiers by keyword.
+func syslogFacilitySeverity(prop *Node) (facility, severity string, ok bool) {
+	if prop == nil || len(prop.Keys) == 0 {
+		return "", "", false
+	}
+	if len(prop.Keys) >= 2 {
+		return prop.Keys[0], prop.Keys[1], true
+	}
+	for _, c := range prop.Children {
+		if len(c.Keys) > 0 && c.Keys[0] != "" {
+			return prop.Keys[0], c.Keys[0], true
+		}
+	}
+	return "", "", false
 }
 
 // userspaceRetiredKnobWarnings turns each retired DPDK-era `system

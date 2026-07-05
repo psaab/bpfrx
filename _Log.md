@@ -1,3 +1,25 @@
+## 2026-07-05 — system/logging/SNMP: fable-167 S-1 syslog host/file sub-statement misparse (#4303)
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4303 (S-1) — `system syslog host/file/user` bodies mixed
+    `<facility> <severity>` pairs with non-facility modifiers
+    (`source-address`, `port`, `match`, `structured-data`,
+    `explicit-priority`, `archive`). The compiler captured EVERY
+    non-`allow-duplicates` child as a facility/severity pair, so
+    `source-address 10.0.1.1` became `{Facility:source-address,
+    Severity:10.0.1.1}` and polluted `Facilities[0]`, which
+    `applySystemSyslog` reads for the forwarding client's facility. Strict
+    commit ALSO rejected the modifiers (their value is not a valid severity
+    under the wildcard leaf). Fixed the compiler to switch on the known
+    modifiers first (`syslogFacilitySeverity` helper), captured host
+    `source-address`/`port` into `SyslogHostConfig`, modelled the modifiers
+    in the schema (`syslogDestinationModifiers`), and wired source-address +
+    port into the daemon syslog client.
+  - **File(s)**: pkg/config/compiler_system.go, pkg/config/types_system.go,
+    pkg/config/schema_system.go, pkg/daemon/daemon_system.go,
+    pkg/config/compiler_syslog_hostmods_4303_test.go, docs/config-schema.md
+
+
 ## 2026-07-05 — fable-review-167 I-4 (#4309): DHCP relay overrides
 
 - **Timestamp**: 2026-07-05

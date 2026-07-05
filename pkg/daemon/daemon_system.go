@@ -601,8 +601,15 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 
 	var clients []*logging.SyslogClient
 	for _, host := range cfg.System.Syslog.Hosts {
+		// #4303 S-1: honor `host <h> port <n>` and `source-address <ip>`.
+		// Both were previously misparsed into bogus facility entries and
+		// never reached the client; the port stayed pinned at 514 and the
+		// source bind was ignored.
 		port := 514
-		c, err := logging.NewSyslogClient(host.Address, port)
+		if host.Port > 0 {
+			port = host.Port
+		}
+		c, err := logging.NewSyslogClientWithSource(host.Address, port, host.SourceAddress)
 		if err != nil {
 			slog.Warn("failed to create system syslog client",
 				"host", host.Address, "err", err)

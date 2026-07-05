@@ -372,8 +372,15 @@ type SyslogUserConfig struct {
 
 // SyslogHostConfig defines a syslog host destination.
 type SyslogHostConfig struct {
-	Address         string
-	Facilities      []SyslogFacility // multiple facility/severity pairs
+	Address    string
+	Facilities []SyslogFacility // multiple facility/severity pairs
+	// SourceAddress binds the outgoing syslog socket to a specific local
+	// source IP (`host <h> source-address <ip>`). Empty = OS-selected
+	// source. Wired into logging.SyslogClient's source-bind (#4303 S-1).
+	SourceAddress string
+	// Port overrides the destination UDP port (`host <h> port <n>`).
+	// 0 = the RFC 3164 default 514 (#4303 S-1).
+	Port            int
 	AllowDuplicates bool
 }
 

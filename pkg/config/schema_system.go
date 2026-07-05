@@ -32,6 +32,30 @@ func syslogFacilitySeverityLeaf() *schemaNode {
 	}
 }
 
+// syslogDestinationModifiers builds the named (non-facility) sub-statements a
+// system-syslog host/file/user destination accepts. These MUST be modelled as
+// named children so they take precedence over the `<facility> <severity>`
+// wildcard: without an exact-match entry a `source-address 10.0.1.1` /
+// `port 5514` / `match "re"` hits the severity-enum wildcard and the strict
+// commit-check REJECTS it (the value is not a Junos severity). `extra` folds
+// in per-destination keywords (host: source-address/port; file: archive).
+// Fresh maps/nodes per call so destinations never alias (#4303 S-1).
+func syslogDestinationModifiers(extra map[string]*schemaNode) map[string]*schemaNode {
+	children := map[string]*schemaNode{
+		"allow-duplicates":  {desc: "Do not suppress duplicate messages", children: nil},
+		"match":             {desc: "Regular-expression message filter", args: 1, placeholder: "<regex>", children: nil},
+		"match-strings":     {desc: "Message string filter", args: 1, placeholder: "<string>", children: nil},
+		"explicit-priority": {desc: "Include priority in the logged message", children: nil},
+		"structured-data": {desc: "Log in RFC 5424 structured-data format", children: map[string]*schemaNode{
+			"brief": {desc: "Omit the English-language message text", children: nil},
+		}},
+	}
+	for k, v := range extra {
+		children[k] = v
+	}
+	return children
+}
+
 var schemaSystem = &schemaNode{desc: "System configuration", children: map[string]*schemaNode{
 	"host-name":     {desc: "System hostname", args: 1, scalar: true, placeholder: "<hostname>", children: nil},
 	"domain-name":   {desc: "Domain name", args: 1, placeholder: "<domain>", children: nil},
@@ -124,13 +148,41 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// `allow-duplicates` is an explicit presence-only flag so it is
 		// not mistaken for a facility with a missing severity.
 		"user": {desc: "Syslog user destination", args: 1, placeholder: "<user>",
-			wildcard: syslogFacilitySeverityLeaf()},
+			wildcard: syslogFacilitySeverityLeaf(),
+			children: syslogDestinationModifiers(nil)},
 		"host": {desc: "Syslog host destination", args: 1, placeholder: "<host>",
-			wildcard: syslogFacilitySeverityLeaf(), children: map[string]*schemaNode{
-				"allow-duplicates": {desc: "Do not suppress duplicate messages", children: nil},
-			}},
+			wildcard: syslogFacilitySeverityLeaf(),
+			// #4303 S-1: host-only modifiers wired into the runtime syslog
+			// client (source-address, port). log-prefix / facility-override /
+			// routing-instance / exclude-hostname are recognized so a valid
+			// vSRX config commits (not yet enforced — S-5 advisory territory).
+			children: syslogDestinationModifiers(map[string]*schemaNode{
+				"source-address": {desc: "Local source address for outgoing syslog", args: 1, placeholder: "<ip>",
+					valueType: ValueIPAddress, valueDesc: "IPv4 or IPv6 source address",
+					valueExamples: []string{"10.0.1.1", "2001:db8::1"},
+					validator:     ValidateIPAddress, children: nil},
+				"port": {desc: "Destination syslog port", args: 1, placeholder: "<port>",
+					valueType: ValueInteger, valueDesc: "syslog UDP destination port (1-65535)",
+					valueExamples: []string{"514", "5514"},
+					validator:     ValidateInteger(1, 65535), children: nil},
+				"log-prefix":        {desc: "Prefix prepended to each forwarded message", args: 1, placeholder: "<prefix>", children: nil},
+				"facility-override": {desc: "Override the facility of forwarded messages", args: 1, placeholder: "<facility>", children: nil},
+				"routing-instance":  {desc: "Routing instance used to reach the host", args: 1, placeholder: "<instance>", children: nil},
+				"exclude-hostname":  {desc: "Omit the local hostname field", children: nil},
+			})},
 		"file": {desc: "Syslog file destination", args: 1, placeholder: "<filename>",
-			wildcard: syslogFacilitySeverityLeaf()},
+			wildcard: syslogFacilitySeverityLeaf(),
+			children: syslogDestinationModifiers(map[string]*schemaNode{
+				"archive": {desc: "Archive-file rotation settings", children: map[string]*schemaNode{
+					"size":              {desc: "Maximum file size before rotation", args: 1, placeholder: "<size>", children: nil},
+					"files":             {desc: "Number of archive files to retain", args: 1, placeholder: "<count>", children: nil},
+					"world-readable":    {desc: "Archives readable by all users", children: nil},
+					"no-world-readable": {desc: "Archives readable only by root", children: nil},
+					"start-time":        {desc: "Scheduled archive start time", args: 1, placeholder: "<time>", children: nil},
+					"transfer-interval": {desc: "Periodic archive interval (minutes)", args: 1, placeholder: "<minutes>", children: nil},
+					"archive-sites":     {desc: "Off-box archive site URL", args: 1, multi: true, placeholder: "<url>", children: nil},
+				}},
+			})},
 	}},
 	"login": {desc: "Login configuration", children: map[string]*schemaNode{
 		"user": {desc: "User name", args: 1, placeholder: "<username>", children: map[string]*schemaNode{

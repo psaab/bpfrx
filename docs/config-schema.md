@@ -4726,3 +4726,40 @@ packed the whole line onto one leaf node and the compiler dropped it.
   per-day evaluation: `pkg/scheduler/scheduler_3849_test.go` and the
   updated `pkg/scheduler/scheduler_test.go`
   (`TestIsWithinWindow_NoWindowFailsClosed`).
+
+## System syslog host/file sub-statements (#4303 S-1)
+
+A `system syslog host <h>` / `file <f>` / `user <u>` destination body is a
+mix of `<facility> <severity>` pairs (`any warning;`, `daemon info;`) and
+NON-facility modifiers (`source-address 10.0.1.1;`, `port 5514;`,
+`match "re";`, `structured-data;`, `explicit-priority;`, `archive size 1m
+files 5;`). The compiler previously treated EVERY non-`allow-duplicates`
+child as a `<facility> <severity>` pair via a `len(Keys) >= 2` fallback, so
+`source-address 10.0.1.1` was captured as
+`SyslogFacility{Facility:"source-address", Severity:"10.0.1.1"}`.
+`applySystemSyslog` reads `Facilities[0].Facility` for the remote client's
+facility, so a leading `source-address` set the whole forwarding client's
+facility to garbage. The strict commit-check ALSO rejected these lines: the
+schema `host`/`file`/`user` nodes carried only the `<facility> <severity>`
+wildcard, so `source-address 10.0.1.1` was validated against the severity
+enum and rejected (an IP is not a severity).
+
+- **compiler** — `compileSystem` syslog loop (`compiler_system.go`) now
+  switches on the known modifier keywords before the pair fallback. Host
+  `source-address`/`port` are captured into `SyslogHostConfig.SourceAddress`
+  / `.Port`; `match`/`structured-data`/`explicit-priority`/`log-prefix`/
+  `facility-override`/`archive` are recognized-and-skipped. The
+  `syslogFacilitySeverity` helper extracts the pair (flat `Keys[0]/Keys[1]`
+  or hierarchical `Keys[0]` + child) and returns ok=false for a valueless
+  leaf, so a bare/garbage keyword is dropped instead of appended as a
+  half-populated filter.
+- **schema** — `syslogDestinationModifiers` models the modifiers as named
+  children so they take precedence over the wildcard. `source-address` is
+  `ValueIPAddress`, `port` is `ValueInteger(1,65535)`; the rest are accepted
+  structurally. No valid syslog config is newly rejected.
+- **runtime** — `applySystemSyslog` (`pkg/daemon/daemon_system.go`) now binds
+  the outgoing socket to `host.SourceAddress` (via
+  `logging.NewSyslogClientWithSource`) and honors `host.Port` instead of the
+  hardcoded 514.
+- **tests** — `pkg/config/compiler_syslog_hostmods_4303_test.go` (facilities
+  not polluted, source-address/port captured, strict commit accepts).
