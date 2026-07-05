@@ -78,32 +78,13 @@ func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers
 		fpc = 7
 	}
 
-	changed := false
-	for idx, nic := range nics {
-		target := assignName(idx, fpc, clusterMode)
-
-		// Determine original kernel name — if the interface was already
-		// renamed in a previous run, recover OriginalName from the
-		// existing .link file.
-		original := recoverOriginalName(nic.name)
-
-		// Write .link file with OriginalName= for boot persistence.
-		if wrote := writeLinkFile(target, original); wrote {
-			changed = true
-		}
-
-		// Rename immediately if current name doesn't match target.
-		if nic.name != target {
-			if err := renameInterface(nic.name, target); err != nil {
-				slog.Warn("linksetup: rename failed",
-					"from", nic.name, "to", target, "err", err)
-			} else {
-				slog.Info("linksetup: renamed interface",
-					"from", nic.name, "to", target)
-				changed = true
-			}
-		}
-	}
+	// #4178: collision-safe two-pass rename. Capturing every OriginalName
+	// BEFORE any write, then breaking target-name collisions with temp
+	// names, keeps an enumeration shift (a NIC added/removed/reordered
+	// changes the positional index→name map) from corrupting the .link
+	// OriginalName= chain or EEXIST-stranding a rename — the discipline
+	// device-map mode already had and positional mode previously lacked.
+	changed := renamePositional(nics, fpc, clusterMode, renameInterface)
 
 	// Ensure fxp0 has a bootstrap DHCP .network file (needed before
 	// the daemon writes its own networkd configs).
@@ -235,6 +216,140 @@ func assignName(idx, fpc int, clusterMode bool) string {
 		return fmt.Sprintf("ge-%d-0-%d", fpc, idx-2)
 	}
 	return fmt.Sprintf("ge-0-0-%d", idx-1)
+}
+
+// renamePositional performs the collision-safe two-pass positional rename
+// (#4178). It captures every NIC's OriginalName from the EXISTING .link set
+// BEFORE writing any file (so a mid-pass overwrite can never feed a corrupted
+// OriginalName into a later NIC's recovery), breaks target-name collisions via
+// temp names (so an enumeration shift does not EEXIST-strand a rename), then
+// writes each .link with the pre-captured OriginalName and renames to the
+// final name. renameFn is injected so production passes renameInterface and
+// tests can model EEXIST semantics. Returns true if any .link changed or any
+// rename ran.
+func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(from, to string) error) bool {
+	// Phase 0: snapshot targets and capture EVERY OriginalName up-front, from
+	// the .link set as it exists BEFORE this pass writes anything. This is the
+	// core of the #4178 fix: the previous single-pass loop wrote .link file idx
+	// then let idx+1's recoverOriginalName read that just-overwritten file, so
+	// an enumeration shift corrupted the OriginalName chain.
+	desiredByCurrent := make(map[string]string, len(nics))
+	originalByCurrent := make(map[string]string, len(nics))
+	desiredNames := make(map[string]bool, len(nics))
+	currentNames := make([]string, len(nics))
+	for idx, nic := range nics {
+		target := assignName(idx, fpc, clusterMode)
+		desiredByCurrent[nic.name] = target
+		originalByCurrent[nic.name] = recoverOriginalName(nic.name)
+		desiredNames[target] = true
+		currentNames[idx] = nic.name
+	}
+
+	// Phase 1: break target-name collisions (shared with the device-map path).
+	// After this every desired final name is free. The positional path names
+	// every present NIC, so there are no unmapped stranded NICs — the stranded
+	// set is empty and ignored.
+	_, changed := breakNameCollisions(currentNames, desiredNames,
+		desiredByCurrent, originalByCurrent, renameFn)
+
+	// Phase 2: write each .link with its pre-captured OriginalName and rename
+	// to the final name. Collisions are already broken, so no EEXIST here.
+	for current, final := range desiredByCurrent {
+		original := originalByCurrent[current]
+		if original == "" {
+			original = recoverOriginalName(current)
+		}
+		if writeLinkFile(final, original) {
+			changed = true
+		}
+		if current != final {
+			if err := renameFn(current, final); err != nil {
+				slog.Warn("linksetup: rename failed",
+					"from", current, "to", final, "err", err)
+			} else {
+				slog.Info("linksetup: renamed interface",
+					"from", current, "to", final)
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// breakNameCollisions is the shared phase-1 collision break used by BOTH the
+// positional (renamePositional) and device-map (enumerateAndRenameMapped)
+// rename paths (#4178). A single-pass rename that renames in enumeration order
+// deadlocks when NIC A must take the final name NIC B still holds (a stale-udev
+// misrename, or a positional enumeration shift): the rename EEXISTs and is
+// dropped. This moves every present NIC that currently wears a DESIRED final
+// name — but is not that name's intended final occupant — to a unique
+// xpf-tmp-N name first, so the subsequent rename-to-final pass always finds its
+// target free.
+//
+// It mutates desiredByCurrent/originalByCurrent in place: when a NIC that is
+// itself a desired SOURCE is temp-renamed, its entry is re-keyed to the temp
+// name, carrying the TRUE OriginalName across the temp rename (a transient
+// xpf-tmp-N name must never be recorded as OriginalName= — it would not match
+// udev on next boot). A temp-stranded NIC that is NOT a desired source is
+// returned in stranded (tempName → its pre-temp current name) so the caller can
+// restore it to a host-predictable name; the positional caller has no unmapped
+// NICs, so it receives an empty map.
+//
+// currentNames MUST list every present NIC name — it is used both to decide
+// occupancy and to pick an xpf-tmp-N that is not already in use (a leftover
+// temp name from a prior crashed run must not cause an EEXIST temp rename).
+// renameFn is injected so both callers reuse renameInterface (and tests can
+// model EEXIST semantics).
+func breakNameCollisions(
+	currentNames []string,
+	desiredNames map[string]bool,
+	desiredByCurrent map[string]string,
+	originalByCurrent map[string]string,
+	renameFn func(from, to string) error,
+) (stranded map[string]string, changed bool) {
+	inUse := make(map[string]bool, len(currentNames))
+	for _, name := range currentNames {
+		inUse[name] = true
+	}
+	freeTempName := func() string {
+		for k := 0; ; k++ {
+			cand := fmt.Sprintf("xpf-tmp-%d", k)
+			if !inUse[cand] {
+				inUse[cand] = true
+				return cand
+			}
+		}
+	}
+	stranded = make(map[string]string)
+	for _, name := range currentNames {
+		if !desiredNames[name] {
+			continue // this NIC's current name is not wanted by anyone
+		}
+		if final, ok := desiredByCurrent[name]; ok && final == name {
+			continue // already correctly named — leave it
+		}
+		tmp := freeTempName()
+		if err := renameFn(name, tmp); err != nil {
+			slog.Warn("linksetup: temp-rename to break collision failed",
+				"from", name, "to", tmp, "err", err)
+			continue
+		}
+		slog.Info("linksetup: temp-renamed conflicting interface", "from", name, "to", tmp)
+		changed = true
+		if final, ok := desiredByCurrent[name]; ok {
+			// This NIC is itself a desired source — carry its mapping and its
+			// TRUE OriginalName across the temp rename.
+			delete(desiredByCurrent, name)
+			desiredByCurrent[tmp] = final
+			if orig, ok := originalByCurrent[name]; ok {
+				delete(originalByCurrent, name)
+				originalByCurrent[tmp] = orig
+			}
+		} else {
+			stranded[tmp] = name
+		}
+	}
+	return stranded, changed
 }
 
 // recoverOriginalName returns the OriginalName from an existing .link file
