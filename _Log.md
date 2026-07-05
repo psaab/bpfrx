@@ -34039,3 +34039,15 @@ top.
   `clearPendingConfirmLocked` cancels the timer). Rewrote step 3 to
   confirm with `commit` and warn that `commit check` alone rolls back.
 - **File(s)**: docs/bare-metal-device-map.md, _Log.md
+
+- **Timestamp**: 2026-07-04
+- **Action**: fable-review-165 H-28 (#4195) — fix docs/deploy-quickstart.md
+  standalone quickstart. standalone.yaml (and the `launch` form) source
+  br-mgmt/br-lan/br-wan, but the only `incus network create` block lived
+  in the HA section, so a fresh-host standalone deploy failed on an
+  unknown source network; and a bare bridge has no DHCP, so fxp0 (mgmt)
+  and ge-0/0/1 (WAN) — both `dhcp` in standalone.conf — came up with no
+  address. Added a copy-pasteable bridge-create block to the standalone
+  section mirroring the HA form: br-mgmt + br-wan NAT/DHCP-bearing, br-lan
+  plain L2 (ge-0/0/0 is the static gateway running dhcp-local-server).
+- **File(s)**: docs/deploy-quickstart.md, _Log.md
