@@ -1399,6 +1399,37 @@ reserved for whole-dataplane selection where a rewrite shim
   lenient downgrade + valid-scheduler control, `pkg/config`) and
   `build_cos_state_dangling_scheduler_reference_uses_safe_best_effort_default`
   (`userspace-dp forwarding_build/tests.rs`).
+- **BA classifier code-point → unmaterialized queue (commit warn + Rust
+  safe default, #hb166 T-4):** a DSCP / IEEE-802.1p classifier code-point
+  that maps to a forwarding-class whose queue the interface does NOT
+  materialize (the forwarding-class has no `scheduler-map` entry on that
+  interface, and the interface is still admitted to CoS via shaping or
+  another materialized code-point) was a 100% SILENT BLACKHOLE: the
+  per-interface classifier table (`build_cos_dscp_queue_table` /
+  `build_cos_ieee8021_queue_table`, `userspace-dp forwarding_build/cos.rs`)
+  copied the unmaterialized queue id verbatim, `resolve_cos_queue_idx`
+  (`tx/cos_classify.rs`) found no such queue and returned `None`, and the
+  enqueue path turned that into a drop — while the config committed
+  cleanly. The helper now fails SAFE: the build-time table substitutes the
+  interface default (best-effort) queue for any code-point whose queue is
+  not in the interface's materialized set, and `resolve_cos_queue_idx`
+  carries a matching runtime fallback (unmaterialized requested queue →
+  default queue). The commit path emits an operator WARNING
+  (`classOfServiceClassifierQueueWarnings`, `compiler_validate_warn.go`)
+  naming the forwarding-class and queue that has no scheduler-map entry on
+  the interface. Unlike the dangling-SCHEDULER case above this is a WARN,
+  NOT a strict reject: a classifier steering to a forwarding-class that
+  merely lacks a scheduler-map entry is a VALID Junos config (all queues
+  exist by default in Junos regardless of scheduler-map), so a hard reject
+  would refuse configs Junos accepts and configs the xpf test suite already
+  asserts compile (`TestCompileClassOfServiceHierarchicalDSCPClassifier`).
+  The commit warn fires iff the dataplane would have blackholed — its
+  materialization + admission model mirrors `build_cos_iface_config`
+  exactly. Coverage: `TestHB166_T4_ClassifierUnmaterializedQueue_Warns` /
+  `TestHB166_T4_ClassifierMaterializedQueue_NoWarn` (`pkg/config`),
+  `build_cos_state_classifier_unmaterialized_queue_falls_back_to_default`
+  and `resolve_cos_queue_idx_falls_back_to_default_on_explicit_queue_miss`
+  (`userspace-dp`).
 - **#1956 (chassis device-map):** added the bare-metal stable-identity
   managed allowlist under `chassis device-map` (a SIBLING of `cluster`, so
   per-node apply-groups compose). New value types `ValuePCIAddr` /

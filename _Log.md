@@ -1,3 +1,43 @@
+## 2026-07-04 — fable-review-166 T-3 / T-4: TX-path CoS classification fixes (#4243, #4244)
+
+- **Timestamp**: 2026-07-04
+  - **Action**: Fixed two HIGH TX-path CoS classification bugs from
+    fable-review-166. T-3 (#4243): any egress OUTPUT firewall filter —
+    even counter/log-only, no `then forwarding-class` — silently cancelled
+    the forwarding-class an INPUT filter assigned (fell back to
+    best-effort). Fix: in `resolve_cos_tx_selection_internal` and the
+    cached mirror `resolve_cached_cos_tx_selection`, evaluate the ingress
+    input filter for its forwarding-class whenever an input tx-selection
+    filter exists (regardless of output-filter presence) and fold
+    `output.or(ingress)` so a set output class still wins —
+    output-overrides-when-set, not presence-clears-ingress. The `then
+    count` double-count is already avoided by the counter-suppressed
+    ingress variant (#4085). T-4 (#4244): a BA classifier code-point
+    mapping to a forwarding-class whose queue the interface does not
+    materialize (no scheduler-map entry) was a 100% silent blackhole that
+    committed cleanly. Fix (3 layers): (a) build-time — the per-interface
+    DSCP/PCP classifier tables substitute the interface default queue for
+    any code-point whose queue is not materialized (fail-SAFE, forward on
+    best-effort); (b) runtime — `resolve_cos_queue_idx` falls back to the
+    default queue on an explicit unmaterialized-queue miss instead of
+    returning None (drop), and the dead `queue_idx >= len -> 0` branch was
+    removed; (c) commit-time — a WARN (not strict reject, unlike the
+    dangling-scheduler G-2 gate) naming the forwarding-class/queue with no
+    scheduler-map entry, because a classifier -> queue-without-scheduler-map
+    is a valid Junos config (queues exist by default) and xpf's own
+    `TestCompileClassOfServiceHierarchicalDSCPClassifier` asserts it
+    compiles. RED-on-revert proven for all 4 Rust tests (restored original
+    source -> blackhole + FC-clobber reproduced) and the Go warn test.
+  - **File(s)**: userspace-dp/src/afxdp/tx/cos_classify.rs (T-3 non-cached
+    + cached FC preservation; T-4 resolve_cos_queue_idx default fallback +
+    dead-branch removal), userspace-dp/src/afxdp/tx/cos_classify_tests.rs
+    (T-3 middle-case + T-4 resolve tests),
+    userspace-dp/src/afxdp/forwarding_build/cos.rs (T-4 materialized-queue
+    table filter), userspace-dp/src/afxdp/forwarding_build/tests.rs (T-4
+    build test), pkg/config/compiler_validate_warn.go
+    (classOfServiceClassifierQueueWarnings), pkg/config/schema_cos_hb166_test.go
+    (T-4 warn tests), docs/cos-traffic-shaping.md, docs/config-schema.md.
+
 ## 2026-07-04 — #4228 Gap 7: vSRX CoS show commands
 
 - **Timestamp**: 2026-07-04
