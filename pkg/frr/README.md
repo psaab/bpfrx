@@ -227,6 +227,28 @@ also carries operator content:
   frr.conf for a config that arrives via the lenient path (an older-binary
   persisted config or a peer-synced one) — keeping the rest of the reload
   alive instead of bricking it for every other peer.
+- **OSPF/OSPFv3 interface adjacency timers + DR priority (#4285).** The
+  per-interface `hello-interval`, `dead-interval`, `retransmit-interval`, and
+  `priority` leaves (schema + `OSPFInterface`/`OSPFv3Interface` structs +
+  `compiler_protocols.go`) render under the interface stanza as
+  `ip ospf hello-interval/dead-interval/retransmit-interval/priority` (v4) and
+  `ipv6 ospf6 hello-interval/dead-interval/retransmit-interval/priority` (v6).
+  hello/dead MUST match a neighbor or the adjacency never forms (stuck in
+  Init/ExStart) — a fast-timer neighbor (hello 1s) never adjacencies with FRR's
+  silent default 10s/40s. Priority uses a `HasPriority` presence flag (mirroring
+  `HasMetric`/`HasLocalPreference`): priority **0** is a valid value ("never
+  DR"), so a bare-int gate can't tell it from unset — the renderer emits the
+  line IFF `HasPriority`, so an interface with no `priority` leaf keeps FRR's
+  default and never emits a stray `ip ospf priority 0`.
+- **BGP update-source / passive / hold-time / local-as (#4286).** The group-level
+  (and per-neighbor override) `local-address`, `passive`, `hold-time`, and
+  `local-as` leaves flatten onto each `BGPNeighbor` and render as
+  `neighbor <peer> update-source <local-address>`, `neighbor <peer> passive`,
+  `neighbor <peer> timers <keepalive> <hold-time>` (keepalive = hold/3, floor
+  1), and `neighbor <peer> local-as <asn>`. `update-source` is load-bearing for
+  iBGP loopback peering: without it the BGP TCP session sources from the egress
+  interface IP, not the loopback the peer has a `neighbor` statement for, so the
+  peer rejects the connection and the session never establishes.
 - **An OSPF/OSPFv3/BGP router-id is validated at commit (#2980).** `router-id`
   is parsed as a raw string with no validation, so a malformed value (not a
   32-bit IPv4 dotted-quad — e.g. garbage, an out-of-range octet, or an IPv6
