@@ -229,6 +229,31 @@ func (p *Parser) parseStatement() *Node {
 		}
 	}
 
+	// Detect an INLINE `inactive:` marker (#4335). Junos also collapses a
+	// deactivated sub-statement onto its parent statement's line, e.g.
+	//   address 2001:db8::7aef/128 inactive: port 32400;
+	// where the `inactive:` deactivates the `port 32400` modifier, NOT the
+	// address. Because `:` is an identifier character the lexer tokenizes
+	// `inactive:` as one identifier, so it lands mid-keys instead of leading.
+	// A node carries a single Inactive flag for its whole identity and cannot
+	// mark only part of a flat leaf inactive; consistent with the #2008 H1
+	// doctrine that a deactivated statement behaves as if it were absent, drop
+	// the marker and every token it governs (the remainder of this statement)
+	// from the active keys. The parent statement (here the address) stays
+	// active; the governed sub-statement (the port) is simply absent, exactly
+	// as a deactivated leaf would be for compilation. A leading marker is
+	// already lifted above, so any remaining marker is strictly inline (index
+	// > 0) and leaves at least the statement's identity key intact.
+	for i, k := range keys {
+		if i > 0 && k == inactiveMarker {
+			keys = keys[:i]
+			// The governed tokens were only on the key line of a leaf; a
+			// trailing `{ ... }` cannot follow an inline marker in valid
+			// Junos, so nothing more to consume here.
+			break
+		}
+	}
+
 	line := p.lexer.Peek().Line
 	col := p.lexer.Peek().Column
 
