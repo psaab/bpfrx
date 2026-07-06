@@ -36061,3 +36061,27 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md,
   docs/userspace-dataplane-architecture.md,
   docs/research/3616-ipsec-host-inbound/*.md (materialized + status stamp).
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4070 PR-A — fix the mixed-shape apply-groups leaf-list
+  DUPLICATE-NODE bug (CASE-D). A leaf-list can be expressed as a COLLAPSED
+  leaf (`name-server 1.1.1.1 2.2.2.2`, Keys[0]=="name-server") or a BLOCK
+  container (`name-server { 1.1.1.1; 2.2.2.2; }`, Keys==["name-server"]).
+  Before the fix, `mergeNodes` only cross-recognized the SAME shape
+  (leaf-vs-leaf override, container-vs-container union); a MIXED shape for
+  the same key emitted BOTH a leaf AND a container — a duplicate that is
+  never correct. Made the group-inheritance merge shape-agnostic on Keys[0]:
+  broadened `hasMatchingLeaf` to also match a single-key CONTAINER sharing
+  Keys[0] (a block-shaped leaf-list), and added a symmetric guard in the
+  container branch so a group block container is suppressed when the stanza
+  already holds the same leaf-list as a collapsed leaf. Multi-key containers
+  (e.g. `["family","inet"]`) are never cross-suppressed (len==1 gate). Only
+  the DUPLICATE-NODE bug is fixed; the union-vs-override VALUE decision for
+  SAME-shape leaf-lists (CASE-B override / CASE-C union preserved unchanged)
+  remains the deferred half of #4070. Added dual-shape RED-on-revert tests
+  (both mixed orderings collapse to ONE node; same-shape override/union
+  unchanged; multi-key sibling containers both survive). Verified RED on
+  Edit-revert (2 nodes) and GREEN with the fix; full pkg/config suite,
+  gofmt, vet, and `go build ./...` all clean.
+- **File(s)**: pkg/config/ast_groups.go,
+  pkg/config/apply_groups_leaflist_test.go
