@@ -609,7 +609,7 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 // it never opens SSH/HTTPS/SNMP/NETCONF on the box.
 func hostInboundAllowsAll(v dpuserspace.ZoneHostInboundView) bool {
 	for _, s := range v.SystemServices {
-		if s == "all" || s == "any-service" {
+		if config.HostInboundFullAdmitService(s) {
 			return true
 		}
 	}
@@ -709,178 +709,113 @@ func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []hos
 // hostInboundServiceMatches maps a Junos `system-services` token to nft match
 // fragments for the given family. Returns nil for `all` / `any-service`
 // (handled by hostInboundAllowsAll) and for unrecognised tokens (fail-closed).
+//
+// #3627 B1a: the token->tuple truth now lives in the structured SSOT
+// config.HostInboundServiceMatch (shared with the match-policies host-inbound
+// classifier); this function RENDERS those tuples to nft match fragments. The
+// render is byte-identical to the pre-#3627 hand-written switch — proven by
+// TestHostInboundNftRenderGoldenByteIdentical — so the nft kernel mirror is
+// unchanged. The family gate (dhcp=v4, dhcpv6=v6, ...) is applied inside
+// HostInboundServiceMatch via config.HostInboundServiceFamily.
 func hostInboundServiceMatches(token, family string) []string {
-	// #3225: family-specific services (dhcp=v4, dhcpv6=v6) emit ONLY on their
-	// own family. emitHostInboundZone calls this once per family with the same
-	// token set, so a family-mismatched token must contribute no match (it would
-	// otherwise be emitted under the wrong `ip`/`ip6 daddr`). The family map is
-	// the SSOT shared with the Rust classifier (config.HostInboundServiceFamily).
-	if fam, ok := config.HostInboundServiceFamily[token]; ok && fam != family {
-		return nil
-	}
-	icmp := "icmp"
-	if family == "ip6" {
-		icmp = "icmpv6"
-	}
-	switch token {
-	case "ssh":
-		return []string{"tcp dport 22"}
-	case "telnet":
-		return []string{"tcp dport 23"}
-	case "ftp":
-		return []string{"tcp dport 21"}
-	case "http", "webapi-clear-text":
-		return []string{"tcp dport 80"}
-	case "https", "webapi-ssl":
-		return []string{"tcp dport 443"}
-	case "ping":
-		return []string{icmp + " type echo-request"}
-	case "dns":
-		return []string{"udp dport 53", "tcp dport 53"}
-	case "dhcp", "bootp":
-		return []string{"udp dport { 67, 68 }"}
-	case "dhcpv6":
-		return []string{"udp dport { 546, 547 }"}
-	case "ntp":
-		return []string{"udp dport 123"}
-	case "snmp":
-		return []string{"udp dport 161"}
-	case "snmp-trap":
-		return []string{"udp dport 162"}
-	case "ike", "ipsec":
-		// `ipsec` is the Junos system-service that permits host-terminated
-		// IPsec: IKE negotiation (udp 500 / NAT-T 4500) plus the ESP/AH data
-		// plane. The raw ESP (50) / AH (51) data plane is already accepted
-		// globally in buildHostInboundFilterPayload (so the kernel XFRM stack
-		// can decrypt), so the per-zone match only needs to open IKE — making
-		// `ipsec` a superset of `ike`. Treating them as one case keeps the nft
-		// mirror in parity with the Rust classifier.
-		return []string{"udp dport { 500, 4500 }"}
-	case "tftp":
-		return []string{"udp dport 69"}
-	case "netconf":
-		return []string{"tcp dport 830"}
-	case "ssh-netconf", "netconf-ssh":
-		return []string{"tcp dport { 22, 830 }"}
-	case "finger":
-		return []string{"tcp dport 79"}
-	case "ident-reset":
-		return []string{"tcp dport 113"}
-	case "lsping":
-		return []string{"udp dport 3503"}
-	case "sip":
-		return []string{"udp dport 5060", "tcp dport 5060"}
-	case "r-login", "rlogin":
-		return []string{"tcp dport 513"}
-	case "r-sh", "rsh":
-		return []string{"tcp dport 514"}
-	case "r-exec", "rexec":
-		return []string{"tcp dport 512"}
-	case "xnm-clear-text":
-		return []string{"tcp dport 3221"}
-	case "xnm-ssl":
-		return []string{"tcp dport 3220"}
-	case "traceroute":
-		return []string{"udp dport 33434-33523"}
-	case "gre":
-		return []string{"meta l4proto 47"}
-	default:
-		return nil
-	}
+	return renderHostInboundMatches(config.HostInboundServiceMatch(token, family), family)
 }
 
 // hostInboundProtocolMatches maps a Junos `protocols` (routing-protocol) token
 // to nft match fragments. `all` expands to the full routing-protocol set
 // (#3199) — NOT a blanket accept (that would open every system-service). Returns
 // nil for unrecognised tokens (fail-closed).
+//
+// #3627 B1a: renders the structured SSOT config.HostInboundProtocolMatch (which
+// owns the `all` expansion, the #3225 family gating, and the #3311 L2 no-op) to
+// byte-identical nft fragments.
 func hostInboundProtocolMatches(token, family string) []string {
-	// #3225: family-specific routing protocols (ospf=v4 / ospf3=v6, rip=v4 /
-	// ripng=v6, igmp=v4) emit ONLY on their own family — the SSOT is
-	// config.HostInboundProtocolFamily, shared with the Rust classifier. `all`
-	// is dual-family (absent from the map) and recurses into the per-token set,
-	// each of which family-gates itself here.
-	if fam, ok := config.HostInboundProtocolFamily[token]; ok && fam != family {
-		return nil
-	}
-	switch token {
-	case "all":
-		// `protocols all` = every recognized routing protocol, scoped to
-		// protocol traffic (#3199) — NOT a blanket accept. The expansion set is
-		// the SSOT-derived config.HostInboundAllExpansionProtocols()
-		// (KnownHostInboundProtocols minus `all` minus the L2/non-IP set
-		// config.HostInboundL2Protocols), so an L2 protocol like IS-IS is
-		// AUTOMATICALLY excluded from the IP expansion — adding one to the SSOT
-		// requires no edit here (#3311). ospf+ospf3 both appear (#3225): both
-		// ride IP protocol 89 but on different families; hostInboundProtocolMatches
-		// family-gates each, so proto 89 emits once per family. The Rust `all`
-		// arm mirrors this exclusion via routing_protocol_all_expansion().
-		var out []string
-		for _, p := range config.HostInboundAllExpansionProtocols() {
-			out = append(out, hostInboundProtocolMatches(p, family)...)
+	return renderHostInboundMatches(config.HostInboundProtocolMatch(token, family), family)
+}
+
+// renderHostInboundMatches renders a slice of structured host-inbound L4 match
+// tuples (config.L4Match, the #3627 B1a SSOT) into nft match fragments,
+// preserving the authored per-token order. The render is byte-identical to the
+// pre-#3627 hand-written strings (guarded by
+// TestHostInboundNftRenderGoldenByteIdentical):
+//
+//   - TCP/UDP -> "tcp dport <spec>" / "udp dport <spec>" (renderHostInboundPortSpec)
+//   - ICMP/ICMPv6 -> "icmp type <spec>" / "icmpv6 type <spec>", coalescing
+//     consecutive same-proto ICMP tuples into ONE type set so router-discovery
+//     stays `icmp type { 9, 10 }` (one rule) rather than two
+//   - a bare IP protocol -> "meta l4proto <n>"
+//
+// The Reject marker (ident-reset) does not affect the match fragment — the nft
+// VERDICT is applied separately by hostInboundServiceAction — so this render is
+// verdict-agnostic.
+func renderHostInboundMatches(ms []config.L4Match, family string) []string {
+	var out []string
+	for i := 0; i < len(ms); {
+		m := ms[i]
+		switch m.Proto {
+		case config.HostInboundProtoICMP, config.HostInboundProtoICMPv6:
+			kw := "icmp"
+			if m.Proto == config.HostInboundProtoICMPv6 {
+				kw = "icmpv6"
+			}
+			var types []uint8
+			for i < len(ms) && ms[i].Proto == m.Proto && ms[i].ICMPType != nil {
+				types = append(types, *ms[i].ICMPType)
+				i++
+			}
+			out = append(out, kw+" type "+renderHostInboundICMPSpec(types, m.Proto))
+		case config.HostInboundProtoTCP:
+			out = append(out, "tcp dport "+renderHostInboundPortSpec(m.Ports))
+			i++
+		case config.HostInboundProtoUDP:
+			out = append(out, "udp dport "+renderHostInboundPortSpec(m.Ports))
+			i++
+		default:
+			out = append(out, "meta l4proto "+strconv.Itoa(int(m.Proto)))
+			i++
 		}
-		return out
-	case "ospf", "ospf3":
-		// OSPFv2 (ospf, IPv4) and OSPFv3 (ospf3, IPv6) both ride IP protocol 89;
-		// the family gate above scopes each to its own family.
-		return []string{"meta l4proto 89"}
-	case "bgp":
-		return []string{"tcp dport 179"}
-	case "rip":
-		return []string{"udp dport 520"}
-	case "ripng":
-		return []string{"udp dport 521"}
-	case "igmp":
-		// v6 multicast group membership is MLD (icmpv6), reached via the ND
-		// accept; the family gate restricts igmp to IPv4.
-		return []string{"meta l4proto 2"}
-	case "pim":
-		return []string{"meta l4proto 103"}
-	case "vrrp":
-		return []string{"meta l4proto 112"}
-	case "bfd":
-		// #3299: single-hop control (3784) + echo (3785) AND multi-hop
-		// control (4784, RFC 5883). Keep this set in lockstep with the
-		// AF_XDP host_inbound classifier (host_inbound.rs "bfd" arm).
-		return []string{"udp dport { 3784, 3785, 4784 }"}
-	case "ldp":
-		return []string{"tcp dport 646", "udp dport 646"}
-	case "msdp":
-		return []string{"tcp dport 639"}
-	case "nhrp":
-		return []string{"meta l4proto 54"}
-	case "rsvp":
-		// #3341: RSVP rides directly over IP, protocol 46 (dual-family).
-		return []string{"meta l4proto 46"}
-	case "pgm":
-		// #3341: PGM (Pragmatic General Multicast) rides over IP, protocol 113
-		// (dual-family).
-		return []string{"meta l4proto 113"}
-	case "sap":
-		// #3341: SAP (Session Announcement Protocol) is UDP/9875 (dual-family).
-		return []string{"udp dport 9875"}
-	case "dvmrp":
-		// #3341: DVMRP is carried inside IGMP (IP protocol 2) and is IPv4-only;
-		// the family gate above (config.HostInboundProtocolFamily["dvmrp"]="ip")
-		// restricts it to IPv4, matching igmp.
-		return []string{"meta l4proto 2"}
-	case "isis":
-		// #3311: IS-IS rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT
-		// IP), so it cannot be expressed as an ip/ip6 host-inbound match. It is
-		// a recognized-but-no-op token (config.HostInboundL2Protocols): the
-		// kernel delivers IS-IS PDUs to FRR's isisd via an LLC packet socket,
-		// outside this IP host-inbound filter. Returning nil keeps this surface
-		// consistent with the Rust classifier's isis no-op arm. The nft parity
-		// test skips L2 protocols and asserts they produce no IP match.
-		return nil
-	case "router-discovery":
-		if family == "ip6" {
-			// v6 RS/RA are part of the always-accepted ND set above.
-			return nil
-		}
-		return []string{"icmp type { 9, 10 }"}
-	default:
-		return nil
 	}
+	return out
+}
+
+// renderHostInboundPortSpec renders a TCP/UDP destination-port spec: a single
+// port ("22"), a contiguous range ("33434-33523"), or an nft anonymous set of
+// multiple ports ("{ 67, 68 }").
+func renderHostInboundPortSpec(ports []config.PortRange) string {
+	if len(ports) == 1 {
+		return renderHostInboundPort(ports[0])
+	}
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = renderHostInboundPort(p)
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
+}
+
+func renderHostInboundPort(p config.PortRange) string {
+	if p.Lo == p.Hi {
+		return strconv.Itoa(int(p.Lo))
+	}
+	return strconv.Itoa(int(p.Lo)) + "-" + strconv.Itoa(int(p.Hi))
+}
+
+// renderHostInboundICMPSpec renders an ICMP/ICMPv6 type spec. A single
+// echo-request type (v4 8 / v6 128) renders as the nft named type
+// "echo-request" — the only named ICMP type the per-token host-inbound rules
+// use; every other type renders numerically ("{ 9, 10 }" for router-discovery).
+func renderHostInboundICMPSpec(types []uint8, proto uint8) string {
+	if len(types) == 1 {
+		if (proto == config.HostInboundProtoICMP && types[0] == 8) ||
+			(proto == config.HostInboundProtoICMPv6 && types[0] == 128) {
+			return "echo-request"
+		}
+		return strconv.Itoa(int(types[0]))
+	}
+	parts := make([]string, len(types))
+	for i, t := range types {
+		parts[i] = strconv.Itoa(int(t))
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
 }
 
 // nftAddrSet renders a single address as a bare token or multiple as an nft
