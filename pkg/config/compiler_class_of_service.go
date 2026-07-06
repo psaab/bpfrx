@@ -797,7 +797,12 @@ func resolveCoSPercentRateBytes(baseBytesPerSec uint64, percent float64) uint64 
 	if scaled < 1 {
 		return 1
 	}
-	if scaled > float64(^uint64(0)) {
+	// float64(^uint64(0)) rounds UP to 2^64 (MaxUint64 is not float64-exact),
+	// so a `scaled` of exactly 2^64 would slip past a `>` compare and then
+	// overflow the float->uint64 conversion (out-of-range is implementation-
+	// defined in Go, unlike Rust's saturating `as`). Use `>=` to clamp the
+	// exact-boundary case deterministically to MaxUint64.
+	if scaled >= float64(^uint64(0)) {
 		return ^uint64(0)
 	}
 	return uint64(scaled)
