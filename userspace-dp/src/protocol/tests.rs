@@ -1979,6 +1979,8 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         // field must be nonzero for the wire-invariant populated pin).
         hs_rx_drops_replayed_init: 45,
         hs_rx_cookie_unsupported: 11,
+        // #4094 PR-B initiator cookie-replies consumed (50, off-ladder).
+        hs_rx_cookie_consumed: 50,
         // #4094 PR-A responder cookie / MAC2 under-load accounting
         // (46.. off-ladder, mirror of the Go-side series-set values).
         hs_cookie_replies_sent: 46,
@@ -2044,6 +2046,7 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(wire_row["rekeys_initiated_age"], 39);
     assert_eq!(wire_row["keepalives_tx_persistent"], 43);
     assert_eq!(wire_row["hs_cookie_replies_sent"], 46);
+    assert_eq!(wire_row["hs_rx_cookie_consumed"], 50);
     assert_eq!(wire_row["hs_rx_under_load_no_mac2"], 47);
     let back: ProcessStatus =
         serde_json::from_value(value).expect("deserialize ProcessStatus");

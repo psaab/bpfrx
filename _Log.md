@@ -32,6 +32,146 @@
   session-sync change — parent runs `test-failover` before merge (a mid-bulk
   fabric flap during failover is the target scenario).
 
+## 2026-07-06 — #4107 F1 fold: arm the fabric downgrade-guard off the heartbeat (post-restart window)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Hostile-review fold on PR #4357. The fabric downgrade-guard
+  (`fabricPeerAuthSeen`) armed ONLY when the peer proxied an on-demand fabric
+  RPC (operator show/clear/failover). Unlike the heartbeat — which arms its own
+  `peerAuthSeen` within ~200ms because heartbeats flow continuously — nothing
+  periodically dials the fabric listener, so after EVERY restart of a keyed node
+  there was a window (until the next cross-node command) where the fabric
+  GRACE-ACCEPTED tokenless calls (incl. `ClearSessions` / cross-node failover)
+  from any on-segment host. Fix: arm fabric enforcement off the heartbeat too.
+  Converted `heartbeatReceiver.peerAuthSeen` bool → `atomic.Bool` (now read
+  cross-goroutine), added `heartbeatReceiver.peerAuthenticated()` +
+  `Manager.HeartbeatPeerAuthSeen()` (reads `m.hbReceiver` under `m.mu`, nil →
+  false). In `checkFabricAuth` the tokenless-reject gate now fires when EITHER
+  the fabric sticky flag OR `HeartbeatPeerAuthSeen()` is armed, so enforcement
+  engages within ~one heartbeat interval of the peer coming up. Dual-accept
+  preserved: a not-yet-keyed peer signs neither channel, so the rolling-upgrade
+  grace still holds. No-key path unchanged. Documented residual #2 (clock skew
+  >30s exceeds the ±1-window tolerance → cross-node fabric RPCs fail
+  `Unauthenticated`; an operational NTP fault). New RED-on-revert test
+  (`TestFabricAuthUnary_HeartbeatArmsDowngradeGuard`: tokenless rejected when
+  heartbeat-armed even with fabric sticky NOT armed; grace holds when not armed)
+  + cluster accessor test (`TestManagerHeartbeatPeerAuthSeen`). `-race` clean on
+  both packages.
+- **File(s)**: `pkg/cluster/heartbeat.go`, `pkg/cluster/peer_state.go`,
+  `pkg/cluster/heartbeat_auth_test.go`, `pkg/grpcapi/fabric_auth.go`,
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_fabric_auth_4107_test.go`,
+  `docs/architecture.md`, `pkg/cluster/README.md`, `_Log.md`
+
+## 2026-07-06 — #4107 F1: authenticate the cluster fabric gRPC listener with the control-link PSK
+
+- **Timestamp**: 2026-07-06
+- **Action**: Closed the HIGH F1 hole. The network-exposed fabric gRPC
+  listener (`RunFabricListener`, bound on the sync/fabric IP) had a
+  fail-closed method allowlist (#4122) but NO authentication — any host on
+  the shared control segment could invoke the allowlisted read/monitor/
+  `ClearSessions`/cross-node-failover RPCs with no credential. Added a PSK
+  auth interceptor pair (`fabricAuthUnaryInterceptor` /
+  `fabricAuthStreamInterceptor` in new `pkg/grpcapi/fabric_auth.go`) chained
+  BEFORE the allowlist. It reuses the #4326 control-link PSK
+  (`Manager.ControlLinkAuthKey()`, new exported accessor). The caller carries
+  a time-windowed HMAC bearer token — `HMAC-SHA256(PSK, domain‖window)`,
+  30 s window with ±1 skew tolerance, hex in the `xpf-fabric-auth` metadata
+  header, verified constant-time (`hmac.Equal`). The local node attaches it
+  on every `dialPeer` RPC via `fabricAuthCreds` (per-RPC, insecure-transport
+  OK). Dual-accept mirrors `cluster.heartbeatAuthDecision`
+  (`fabricAuthDecision`): no local key → accept; valid token → accept +
+  set sticky `fabricPeerAuthSeen`; present-but-invalid → `Unauthenticated`;
+  tokenless before peer ever authed → grace accept (key rollout);
+  tokenless after peer authed → reject (downgrade attack). The loopback
+  (127.0.0.1) listener is UNCHANGED. RED-on-revert tests in
+  `server_fabric_auth_4107_test.go` (verified: invalid-token, downgrade, and
+  stream cases go RED with the auth check disabled). F23 (session-sync stream
+  HMAC) deferred as a documented follow-up — it needs a connection-setup
+  capability handshake (a stream can't use the heartbeat's transparent
+  trailer) and must pass `make test-failover`; it is LOW severity.
+- **File(s)**: `pkg/grpcapi/fabric_auth.go` (new),
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_diag.go`,
+  `pkg/grpcapi/server_fabric_auth_4107_test.go` (new),
+  `pkg/cluster/manager.go`, `docs/architecture.md`,
+  `pkg/cluster/README.md`, `_Log.md`
+## 2026-07-06 — #4094 PR-B: WireGuard INITIATOR-side cookie-reply consume
+
+- **Timestamp**: 2026-07-06
+- **Action**: Completed #4094 (PR-A #4330 shipped the RESPONDER half). Taught
+  the INITIATOR to consume an inbound type-3 CookieReply and attach a real MAC2
+  to its retried handshake-init, so xpf-as-initiator now completes a handshake
+  against a peer that is itself under load. Added `cookie::InitiatorCookie` (the
+  wireguard-go `CookieGenerator` analog): per-peer state (last-sent MAC1 + last
+  decrypted cookie + receive time) held in `WgEngine::cookie_gen`
+  (`Mutex<FxHashMap<pubkey, InitiatorCookie>>`). `InitiatorCookie::add_macs`,
+  called from `create_initiation` AFTER `build_initiation` writes MAC1 + zeroes
+  MAC2, records the MAC1 (the AEAD AAD for a future reply) and — if we hold a
+  cookie younger than `COOKIE_ROTATION_TIME_NS` (120 s, reusing PR-A's constant)
+  — stamps `MAC2 = keyed-BLAKE2s-128(cookie, msg[0..132])`; an expired/absent
+  cookie leaves MAC2 zero. `WgEngine::consume_cookie_reply` (wired in
+  `dispatch_inbound`'s `WG_TYPE_COOKIE` arm, replacing the S7 drop stub) parses
+  the reply's `receiver_index`, looks it up in `pending` to attribute the reply
+  to a peer, decrypts via `CookieChecker::decrypt_cookie_reply` (promoted from a
+  `#[cfg(test)]` mirror to production) with the peer's pubkey-derived key + the
+  stored last-MAC1 as AAD, and stores the cookie. Fails CLOSED (no state change,
+  no panic) for an unattributable or undecryptable reply; a cookie-reply is not
+  authenticated for endpoint-learning. Counters: new `hs_rx_cookie_consumed` on
+  success (Prometheus `xpf_userspace_wg_cookie_replies_total{event=consumed}`),
+  and `hs_rx_cookie_unsupported` (its former S7-placeholder wire name) now a real
+  drop site. Counter bump lives inside `consume_cookie_reply` (mirroring
+  `classify_initiation`'s self-contained counter discipline) so the engine
+  method is self-testable. Tests (all RED-on-revert): 4 cookie.rs unit tests
+  (round-trip stamps-accepted MAC2 + source-binding, expired→zero MAC2,
+  undecryptable→fail-closed, reply-before-any-send ignored) + engine-wired
+  end-to-end `initiator_consume_completes_handshake_under_load`. Neutering the
+  MAC2 stamp fails the 3 stamping tests (verified). FULL cargo serial + Go
+  build/tests green.
+- **File(s)**: userspace-dp/src/afxdp/wg/cookie.rs (`InitiatorCookie` struct +
+  `add_macs`/`consume_reply`, `decrypt_cookie_reply` un-gated to production, 4
+  unit tests), userspace-dp/src/afxdp/wg/handshake_session.rs
+  (`add_initiator_macs`, `consume_cookie_reply` + `_inner`,
+  `peer_for_pending_index`, `create_initiation_inner` stamp call),
+  userspace-dp/src/afxdp/coordinator/wg_control.rs (`WG_TYPE_COOKIE` arm),
+  userspace-dp/src/afxdp/wg/engine.rs (`cookie_gen` field + init),
+  userspace-dp/src/afxdp/wg/engine_tests.rs (end-to-end interop test),
+  userspace-dp/src/afxdp/wg/counters.rs (`hs_rx_cookie_consumed` + docs),
+  userspace-dp/src/afxdp/coordinator/status.rs + userspace-dp/src/protocol/
+  control.rs + userspace-dp/src/protocol/tests.rs (wire field),
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics_userspace.go +
+  metrics_descriptors.go + metrics_wireguard_test.go (Prometheus `consumed`
+  event), docs/wireguard-interop.md.
+
+## 2026-07-06 — #4332: WireGuard per-SOURCE cookie-reply token bucket
+
+- **Timestamp**: 2026-07-06
+- **Action**: Followed up #4094/#4330. The responder cookie-reply budget
+  (`COOKIE_REPLY_BUDGET_PER_WINDOW`, 40) is GLOBAL per tunnel, so a determined
+  valid-MAC1 flood from ONE source could drain the shared budget and
+  budget-suppress a legit peer's first cookie challenge from a DIFFERENT source.
+  Added a per-SOURCE token bucket (`CookieChecker::source_reply_allowed`,
+  mirroring wireguard-go `device/ratelimiter.go`): `SOURCE_REPLIES_PER_SEC` 20/s
+  sustained, `SOURCE_REPLY_BURST` 5 burst, `PACKET_COST_NS`/`MAX_TOKENS_NS`
+  accrued-time credit. Layered BEFORE the global budget in
+  `classify_initiation` (both gates must pass), so a flood from one source
+  throttles only its own bucket. The `HashMap<IpAddr, SourceBucket>` table is
+  GC-swept every `SOURCE_GC_INTERVAL_NS` (1 s; idle buckets dropped) and
+  hard-capped at `SOURCE_TABLE_MAX` (2048): a NEW source over the cap is DENIED
+  (fail closed, no reply), never inserted — bounding the map against the
+  spoofed-source-IP amplification vector this hardening could otherwise
+  introduce. Refill obeys the #4330/#4321 monotonic-clock discipline: a
+  backwards `now_ns` credits nothing (`saturating_sub`) and never lowers the
+  bucket's `last_ns` high-water mark (`.max(now_ns)`). Per-source throttle drops
+  and the full-table fail-closed are counted under the existing
+  `hs_cookie_reply_budget_drops` family (no new control-protocol field). Tests:
+  engine-level `classify_initiation_per_source_budget_isolation` (RED on revert —
+  A's flood drains the global budget from B) plus cookie.rs unit tests for burst,
+  isolation, table-cap fail-closed, GC reclaim, and the backwards-clock guard.
+- **File(s)**: userspace-dp/src/afxdp/wg/cookie.rs (constants, `SourceBucket`/
+  `SourceTable`, `CookieChecker.per_source`, `source_reply_allowed`, test hooks +
+  5 unit tests), userspace-dp/src/afxdp/wg/engine.rs (`classify_initiation`
+  per-source gate), userspace-dp/src/afxdp/wg/engine_tests.rs (isolation test),
+  userspace-dp/src/afxdp/wg/counters.rs + userspace-dp/src/protocol/control.rs
+  (counter doc), docs/wireguard-interop.md.
 ## 2026-07-06 — #4313 PR-B: first production closed-world subtree flip (destination-NAT then)
 
 - **Timestamp**: 2026-07-06
@@ -93,6 +233,7 @@
   accepts inner-vlan-id with nil error, lenient emits no warning); single-tag
   negative passes with and without the gate; `go build ./...`, `go vet
   ./pkg/config/`, gofmt on modified files all clean.
+
 ## 2026-07-06 — #4348: gate the `inactive:` marker on TokenIdentifier not TokenString
 
 - **Timestamp**: 2026-07-06

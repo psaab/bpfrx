@@ -1389,10 +1389,22 @@ fn dispatch_inbound(
             }
         },
         crate::afxdp::wg::WG_TYPE_COOKIE => {
-            // Cookie/MAC2 reply handling is S7; drop for now. Not
-            // authenticated for endpoint-learning purposes.
-            WgCounters::bump(&engine.counters().hs_rx_cookie_unsupported);
-            debug_log!("WG[{}]: drop cookie (S7)", tunnel_name);
+            // #4094 PR-B: initiator-side cookie-reply consume. A responder
+            // under load answers our valid-MAC1 initiation with a type-3
+            // cookie-reply instead of a handshake response; decrypt it and
+            // store the cookie so our NEXT initiation to that peer carries a
+            // valid MAC2 (completing the handshake under load). NOT
+            // authenticated for endpoint-learning: a cookie-reply is
+            // XChaCha-sealed under our own public-key-derived key and proves
+            // nothing about whether the source holds the peer's keys.
+            // consume_cookie_reply counts internally (hs_rx_cookie_consumed
+            // on success, hs_rx_cookie_unsupported on a drop).
+            if !engine.consume_cookie_reply(datagram, engine.now_ns()) {
+                // Reply we could not attribute (no matching in-flight
+                // initiation) or could not decrypt (wrong key / bad AAD /
+                // tampered).
+                debug_log!("WG[{}]: drop cookie (unconsumable)", tunnel_name);
+            }
             InboundOutcome::Unauthenticated
         }
         crate::afxdp::wg::WG_TYPE_DATA => {

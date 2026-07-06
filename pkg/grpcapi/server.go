@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -151,6 +152,21 @@ type Server struct {
 	// dials the real peer; a unit test wires it to observe the forwarded
 	// request (x-peer-forwarded metadata) without a live peer.
 	peerZonePairSummaryFn func(ctx context.Context, req *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error)
+	// fabricAuthKeyFn is a test seam for the #4107 fabric-listener PSK auth.
+	// Production leaves it nil and fabricAuthKey() reads the live control-link
+	// key from the cluster manager; a unit test wires it to inject a key
+	// without building a full cluster.Manager.
+	fabricAuthKeyFn func() []byte
+	// heartbeatAuthSeenFn is a test seam for the #4107 fabric downgrade-guard
+	// arming signal. Production leaves it nil and heartbeatPeerAuthSeen() reads
+	// cluster.Manager.HeartbeatPeerAuthSeen(); a unit test wires it to drive the
+	// heartbeat-armed state without a live heartbeat receiver.
+	heartbeatAuthSeenFn func() bool
+	// fabricPeerAuthSeen is the sticky #4107 downgrade guard: set true once a
+	// valid PSK token has authenticated on the fabric listener. After that, a
+	// tokenless fabric RPC is rejected (a downgrade to cleartext once both
+	// nodes are keyed is an attack), not treated as a key-rollout grace case.
+	fabricPeerAuthSeen atomic.Bool
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
@@ -265,18 +281,21 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 		return
 	}
 
-	// #4122: the fabric listener is the ONLY network-exposed gRPC surface
-	// (the loopback Run() listener binds 127.0.0.1). Fail-close it to the
-	// exact set of read/monitor RPCs the peer actually proxies over the
-	// fabric; the allowlist interceptors run BEFORE the handler so
-	// destructive RPCs (Commit/Delete/Rollback, SystemAction{zeroize,
-	// reboot,halt,power-off}) are rejected with PermissionDenied and never
-	// reach a handler. The loopback listener is left UNCHANGED (127.0.0.1 is
-	// the trusted local surface, full service).
+	// #4122 + #4107: the fabric listener is the ONLY network-exposed gRPC
+	// surface (the loopback Run() listener binds 127.0.0.1). Two interceptor
+	// layers protect it, both absent from the loopback listener (127.0.0.1 is
+	// the trusted local surface, full service):
+	//   1. fabricAuth* (#4107) AUTHENTICATES the caller with the control-link
+	//      PSK (HMAC token in metadata) so an unauthenticated host on the
+	//      shared control segment cannot invoke ANY fabric RPC. Runs FIRST.
+	//   2. fabricAllowlist* (#4122) AUTHORIZES only the read/monitor/failover
+	//      RPCs the peer legitimately proxies; destructive RPCs
+	//      (Commit/Delete/Rollback, SystemAction{zeroize,reboot,halt,power-off})
+	//      are rejected with PermissionDenied and never reach a handler.
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		grpc.ChainUnaryInterceptor(s.fabricAllowlistUnaryInterceptor, s.configLockInterceptor),
-		grpc.ChainStreamInterceptor(s.fabricAllowlistStreamInterceptor),
+		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor, s.configLockInterceptor),
+		grpc.ChainStreamInterceptor(s.fabricAuthStreamInterceptor, s.fabricAllowlistStreamInterceptor),
 	)
 	pb.RegisterBpfrxServiceServer(srv, s)
 

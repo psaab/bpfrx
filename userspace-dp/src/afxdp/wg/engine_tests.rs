@@ -1072,9 +1072,16 @@ fn classify_initiation_under_load_requires_mac2() {
         "under threshold, a normal initiation must proceed with no cookie"
     );
 
-    // Drive the arrival rate past the threshold within the same 1 s window.
-    for _ in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
-        engine.classify_initiation(&init, from, &mut out, now);
+    // Drive the arrival rate past the threshold within the same 1 s window,
+    // each arrival from a DISTINCT source so the #4332 per-source reply bucket
+    // is not the limiting factor here — this test isolates the MAC2 requirement
+    // (a single source's own budget is covered by the cookie.rs unit tests and
+    // `classify_initiation_per_source_budget_isolation`). `from` itself is not
+    // used in the flood, so its per-source bucket stays full for the assertions
+    // below.
+    for i in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
+        let s: SocketAddr = format!("192.0.2.{}:51820", (i % 250) + 1).parse().unwrap();
+        engine.classify_initiation(&init, s, &mut out, now);
     }
 
     // Under load, an initiation with NO valid MAC2 is cookie-challenged and
@@ -1125,6 +1132,48 @@ fn classify_initiation_under_load_requires_mac2() {
         "the primed initiation counted as an under-load MAC2 pass"
     );
     assert!(c.hs_rx_under_load_no_mac2.load(Ordering::Relaxed) >= 2);
+}
+
+/// #4332 RED-on-revert: the cookie-reply budget is isolated PER SOURCE, so a
+/// valid-MAC1 flood from ONE source cannot drain the GLOBAL per-window budget
+/// away from a legit peer at a DIFFERENT source. Source A floods far past
+/// `COOKIE_REPLY_BUDGET_PER_WINDOW`; without the per-source layer A would
+/// consume every global cookie-reply slot and B's FIRST challenge would be
+/// budget-suppressed (Drop). With the per-source bucket A is throttled after
+/// its own burst — consuming only a handful of the global slots — so B still
+/// gets its cookie challenge. Reverting the `source_reply_allowed` gate in
+/// `classify_initiation` makes B's assertion fail (the shared budget is drained
+/// by A's flood).
+#[test]
+fn classify_initiation_per_source_budget_isolation() {
+    use crate::afxdp::wg::cookie::{COOKIE_REPLY_BUDGET_PER_WINDOW, INITIATIONS_UNDER_LOAD_THRESHOLD};
+    use std::net::SocketAddr;
+
+    let (engine, _our_pub, init) = under_load_fixture();
+    let now = 10_000_000_000u64; // frozen: A's bucket never refills mid-flood
+    engine.set_mock_now_ns(now);
+    let mut out = [0u8; 256];
+
+    let flood: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+    let legit: SocketAddr = "198.51.100.7:51820".parse().unwrap();
+
+    // Trip under-load, then flood source A well past the GLOBAL budget. The
+    // first INITIATIONS_UNDER_LOAD_THRESHOLD arrivals just build load (Process);
+    // the remainder are valid-MAC1 / no-MAC2 under-load challenges. On revert
+    // these would consume every one of COOKIE_REPLY_BUDGET_PER_WINDOW slots.
+    let shots = INITIATIONS_UNDER_LOAD_THRESHOLD + COOKIE_REPLY_BUDGET_PER_WINDOW + 20;
+    for _ in 0..shots {
+        engine.classify_initiation(&init, flood, &mut out, now);
+    }
+
+    // A legit peer at a DIFFERENT source is still challenged — its first cookie
+    // is NOT starved by A's flood (the #4332 per-source isolation).
+    let action = engine.classify_initiation(&init, legit, &mut out, now);
+    assert!(
+        matches!(action, InitiationAction::SendCookie(_)),
+        "a legit source must still be cookie-challenged despite a flood from \
+         another source (per-source budget isolation), got {action:?}"
+    );
 }
 
 /// A bad-MAC1 initiation under load is NOT reflected: it returns `Process`
@@ -1218,5 +1267,137 @@ fn classify_initiation_fails_closed_without_secure_randomness() {
             .load(Ordering::Relaxed)
             >= 1,
         "the fail-closed drop is counted"
+    );
+}
+
+/// #4094 PR-B end-to-end interop through the wired engine paths: an
+/// INITIATOR (this PR) whose first initiation is cookie-challenged by a
+/// RESPONDER under load (PR-A) consumes the cookie-reply and, on its RETRY
+/// via `create_initiation`, stamps a valid MAC2 that the responder's
+/// `classify_initiation` accepts (`Process`) — the two halves complete a
+/// full cookie handshake. RED on revert: without the PR-B consume+stamp the
+/// retry carries a zero MAC2 and the responder re-challenges it
+/// (`SendCookie`) forever.
+#[test]
+fn initiator_consume_completes_handshake_under_load() {
+    use crate::afxdp::wg::cookie::INITIATIONS_UNDER_LOAD_THRESHOLD;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+
+    let (init_priv, init_pub) = keypair();
+    let (resp_priv, resp_pub) = keypair();
+    let i_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv.into(),
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32].into(),
+        }],
+    });
+    let r_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: resp_priv.into(),
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32].into(),
+        }],
+    });
+    let now = 10_000_000_000u64;
+    i_engine.set_mock_now_ns(now);
+    r_engine.set_mock_now_ns(now);
+    // The initiator's source as the responder observes it.
+    let from: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+    let mut out = [0u8; 256];
+
+    // 1. Initiator builds its FIRST real initiation toward the responder.
+    //    No cookie held yet → MAC2 is zero.
+    let mut init_buf = [0u8; 256];
+    i_engine.create_initiation(&resp_pub, &mut init_buf).unwrap();
+    let init = init_buf[..crate::afxdp::wg::WG_MSG_INIT_LEN].to_vec();
+    assert_eq!(
+        &init[132..148],
+        &[0u8; 16],
+        "the first initiation carries a zero MAC2"
+    );
+
+    // 2. Drive the responder under load with filler valid-MAC1 initiations
+    //    from DISTINCT sources (so the per-source reply bucket is not the
+    //    limiter), then challenge the initiator's real initiation.
+    let noise = [0x3Cu8; crate::afxdp::wg::handshake::MSG_INIT_NOISE_LEN];
+    let mut filler = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
+    crate::afxdp::wg::handshake::build_initiation(&mut filler, 0x1234_5678, &noise, &resp_pub)
+        .unwrap();
+    for i in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
+        let s: SocketAddr = format!("192.0.2.{}:51820", (i % 250) + 1).parse().unwrap();
+        r_engine.classify_initiation(&filler, s, &mut out, now);
+    }
+
+    // 3. The responder challenges the initiator's initiation → cookie-reply.
+    let action = r_engine.classify_initiation(&init, from, &mut out, now);
+    let len = match action {
+        InitiationAction::SendCookie(l) => l,
+        other => panic!("expected a cookie challenge, got {other:?}"),
+    };
+    let reply = out[..len].to_vec();
+    assert_eq!(reply[0], crate::afxdp::wg::WG_TYPE_COOKIE);
+
+    // 4. Initiator consumes the cookie-reply (wired path).
+    assert!(
+        i_engine.consume_cookie_reply(&reply, now),
+        "the initiator must consume the responder's cookie-reply"
+    );
+    assert_eq!(
+        i_engine
+            .counters()
+            .hs_rx_cookie_consumed
+            .load(Ordering::Relaxed),
+        1,
+        "a consumed cookie-reply is counted"
+    );
+
+    // 5. Initiator RETRIES — create_initiation now stamps a NON-ZERO MAC2.
+    let mut retry_buf = [0u8; 256];
+    i_engine
+        .create_initiation(&resp_pub, &mut retry_buf)
+        .unwrap();
+    let retry = retry_buf[..crate::afxdp::wg::WG_MSG_INIT_LEN].to_vec();
+    assert_ne!(
+        &retry[132..148],
+        &[0u8; 16],
+        "after consuming a cookie the retried initiation carries a MAC2"
+    );
+
+    // 6. The responder, still under load, ACCEPTS the retried initiation —
+    //    the cookie-derived MAC2 verifies against its own recomputation.
+    assert_eq!(
+        r_engine.classify_initiation(&retry, from, &mut out, now),
+        InitiationAction::Process,
+        "the responder must admit the initiator's cookie-derived MAC2 (full \
+         cookie handshake completes under load)"
+    );
+    assert!(
+        r_engine
+            .counters()
+            .hs_rx_under_load_mac2_ok
+            .load(Ordering::Relaxed)
+            >= 1,
+        "the primed retry counts as an under-load MAC2 pass on the responder"
+    );
+
+    // Control: the SAME retried MAC2 replayed from a DIFFERENT source is
+    // still challenged — the cookie binds to the source that received it.
+    let spoof: SocketAddr = "198.51.100.7:51820".parse().unwrap();
+    assert!(
+        matches!(
+            r_engine.classify_initiation(&retry, spoof, &mut out, now),
+            InitiationAction::SendCookie(_)
+        ),
+        "a cookie-derived MAC2 must not authorize a handshake from a different source"
     );
 }

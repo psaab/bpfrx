@@ -467,6 +467,17 @@ pub(crate) struct WgEngine {
     /// this engine's responder static public key. Consulted by
     /// `classify_initiation` before the expensive Noise responder path.
     pub(in crate::afxdp::wg) cookie: super::cookie::CookieChecker,
+    /// #4094 PR-B: initiator-side per-peer cookie state — the last
+    /// cookie-reply we decrypted from each responder (used to stamp MAC2 on
+    /// our retried initiations until it ages past
+    /// `cookie::COOKIE_ROTATION_TIME_NS`) plus the MAC1 of our last-sent
+    /// initiation to that peer (the AEAD AAD to decrypt an incoming
+    /// cookie-reply). Keyed by peer static public key. Slow-path only
+    /// (control thread: `create_initiation` on send, `consume_cookie_reply`
+    /// on receive); the `Mutex` provides `&self` interior mutability and is
+    /// effectively uncontended.
+    pub(in crate::afxdp::wg) cookie_gen:
+        std::sync::Mutex<FxHashMap<[u8; WG_KEY_LEN], super::cookie::InitiatorCookie>>,
     /// #1888 S5 test hook: when nonzero, `now_ns()` returns this value
     /// instead of CLOCK_MONOTONIC, making the timer semantics
     /// deterministically testable. Compiled out of release builds.
@@ -514,6 +525,7 @@ impl WgEngine {
             counters: WgCounters::default(),
             rekey_request_pending: std::sync::atomic::AtomicBool::new(false),
             cookie: super::cookie::CookieChecker::new(&local_public_key),
+            cookie_gen: std::sync::Mutex::new(FxHashMap::default()),
             #[cfg(test)]
             mock_now_ns: std::sync::atomic::AtomicU64::new(0),
         };
@@ -608,7 +620,14 @@ impl WgEngine {
             return InitiationAction::Process;
         }
         // Valid MAC1, under load, no valid MAC2 → challenge with a cookie
-        // reply (budget-gated) and drop the initiation.
+        // reply. #4332: gate on the per-SOURCE bucket FIRST so a flood from one
+        // source throttles only itself and cannot drain the global per-window
+        // budget away from a legit peer at a different source. BOTH the
+        // per-source bucket and the global budget must pass.
+        if !self.cookie.source_reply_allowed(from.ip(), now_ns) {
+            WgCounters::bump(&self.counters.hs_cookie_reply_budget_drops);
+            return InitiationAction::Drop;
+        }
         if !self.cookie.reply_budget_available(now_ns) {
             WgCounters::bump(&self.counters.hs_cookie_reply_budget_drops);
             return InitiationAction::Drop;

@@ -254,3 +254,24 @@ func TestHeartbeatAuthDecision_ForgedFrameRejected(t *testing.T) {
 		t.Error("correctly-signed heartbeat rejected")
 	}
 }
+
+// TestManagerHeartbeatPeerAuthSeen pins the #4107 arming wire the gRPC fabric
+// listener reads to close its post-restart downgrade window: nil receiver (no
+// heartbeat path) and an unarmed receiver report false; a receiver whose sticky
+// flag is set (a verified authed heartbeat arrived) reports true.
+func TestManagerHeartbeatPeerAuthSeen(t *testing.T) {
+	m := &Manager{}
+	if m.HeartbeatPeerAuthSeen() {
+		t.Error("no receiver wired: expected false")
+	}
+	r := &heartbeatReceiver{mgr: m}
+	m.hbReceiver = r
+	if m.HeartbeatPeerAuthSeen() {
+		t.Error("receiver unarmed (peer not yet authenticated): expected false")
+	}
+	// A verified authed heartbeat arms the sticky flag (readLoop does this).
+	r.peerAuthSeen.Store(true)
+	if !m.HeartbeatPeerAuthSeen() {
+		t.Error("receiver armed: expected true")
+	}
+}

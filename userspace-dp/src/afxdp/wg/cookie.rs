@@ -55,7 +55,8 @@
 //! mutability, not cross-thread contention. NEVER log a secret, a cookie,
 //! or the encryption key.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
 use blake2::Blake2s256;
@@ -106,6 +107,35 @@ pub(crate) const INITIATIONS_UNDER_LOAD_THRESHOLD: u64 = 25;
 /// UDP socket (not the AF_XDP TX ring), so this bounds CPU/socket load
 /// rather than TX-ring descriptors.
 pub(crate) const COOKIE_REPLY_BUDGET_PER_WINDOW: u64 = 40;
+
+/// #4332 per-SOURCE cookie-reply token bucket. The [`COOKIE_REPLY_BUDGET_PER_WINDOW`]
+/// cap above is GLOBAL per tunnel, so a determined valid-MAC1 flood from ONE
+/// source can drain the shared budget and budget-suppress a legit peer's first
+/// cookie challenge from a DIFFERENT source. These constants mirror
+/// wireguard-go `device/ratelimiter.go` (`packetsPerSecond` /
+/// `packetsBurstable` / `packetCost` / `maxTokens` / `garbageCollectTime`) so a
+/// flood from one source throttles only itself. Sustained rate and burst:
+pub(crate) const SOURCE_REPLIES_PER_SEC: u64 = 20;
+/// Burst depth: how many replies a fresh source may draw back-to-back before
+/// the sustained [`SOURCE_REPLIES_PER_SEC`] rate applies.
+pub(crate) const SOURCE_REPLY_BURST: u64 = 5;
+/// Token cost of one reply, in nanoseconds of accrued time
+/// (`1e9 / SOURCE_REPLIES_PER_SEC` = 50 ms). One second of idle accrues exactly
+/// `SOURCE_REPLIES_PER_SEC` tokens.
+pub(crate) const PACKET_COST_NS: u64 = 1_000_000_000 / SOURCE_REPLIES_PER_SEC;
+/// Token ceiling: a bucket never accrues more than one burst's worth of tokens
+/// (`PACKET_COST_NS * SOURCE_REPLY_BURST` = 250 ms). Signed to make the
+/// refill/spend arithmetic and the monotonic-clock guard total.
+pub(crate) const MAX_TOKENS_NS: i64 = (PACKET_COST_NS * SOURCE_REPLY_BURST) as i64;
+/// Run the per-source table GC at most this often (mirrors wireguard-go
+/// `garbageCollectTime`, 1 s); a bucket idle for a full interval is dropped.
+const SOURCE_GC_INTERVAL_NS: u64 = 1_000_000_000;
+/// Hard cap on distinct source IPs tracked at once. Bounds the map against a
+/// SPOOFED-source-IP flood (the memory-amplification vector this hardening must
+/// not itself introduce): a NEW source that would overflow the cap is DENIED
+/// (fail closed), never inserted. Idle buckets are GC-reclaimed, so the cap
+/// only bites during an active flood of > `SOURCE_TABLE_MAX` live sources.
+const SOURCE_TABLE_MAX: usize = 2048;
 
 /// Cookie MAC length (keyed-BLAKE2s-128 output).
 pub(crate) const WG_COOKIE_LEN: usize = 16;
@@ -246,6 +276,23 @@ struct BudgetState {
     emitted: u64,
 }
 
+/// #4332 per-source token bucket. `last_ns` is a MONOTONIC high-water mark of
+/// the last refill (never lowered by a backwards clock step — #4330/#4321),
+/// `tokens_ns` the accrued-time credit (signed, capped at [`MAX_TOKENS_NS`]).
+struct SourceBucket {
+    last_ns: u64,
+    tokens_ns: i64,
+}
+
+/// #4332 bounded per-source-IP reply-bucket table + its GC clock, guarded as a
+/// unit by one mutex so a sweep and an admit never observe a torn table.
+/// `last_gc_ns` is an `Option` (not a 0 sentinel) for the same #4094 BUG-1
+/// reason as [`LoadState`]: `now_ns == 0` is a legitimate first sweep time.
+struct SourceTable {
+    buckets: HashMap<IpAddr, SourceBucket>,
+    last_gc_ns: Option<u64>,
+}
+
 /// Responder cookie checker: secret rotation + load detection + reply
 /// budget + MAC2 verification, all keyed to one tunnel's responder static
 /// key. One per [`super::WgEngine`].
@@ -256,6 +303,10 @@ pub(crate) struct CookieChecker {
     secret: Mutex<SecretState>,
     load: Mutex<LoadState>,
     budget: Mutex<BudgetState>,
+    /// #4332 per-source cookie-reply token buckets, layered BEFORE the global
+    /// `budget` so one flooding source cannot drain the shared per-window cap
+    /// away from a legit peer at a different source.
+    per_source: Mutex<SourceTable>,
     /// Test hook: when true, [`Self::draw_random`] simulates a `getrandom`
     /// failure so the #4094 BUG-2 fail-closed path is exercisable without
     /// mocking the OS CSPRNG. Compiled out of release builds.
@@ -299,6 +350,10 @@ impl CookieChecker {
             budget: Mutex::new(BudgetState {
                 window_start_ns: None,
                 emitted: 0,
+            }),
+            per_source: Mutex::new(SourceTable {
+                buckets: HashMap::new(),
+                last_gc_ns: None,
             }),
             #[cfg(test)]
             rng_fail: std::sync::atomic::AtomicBool::new(false),
@@ -356,6 +411,71 @@ impl CookieChecker {
         }
         b.emitted += 1;
         true
+    }
+
+    /// #4332: per-SOURCE cookie-reply admission. A small token bucket keyed by
+    /// the initiation's source IP (mirrors wireguard-go `device/ratelimiter.go`)
+    /// that admits at most [`SOURCE_REPLIES_PER_SEC`] replies/s per source with a
+    /// [`SOURCE_REPLY_BURST`] burst. Layered BEFORE the GLOBAL per-window
+    /// [`Self::reply_budget_available`] in the cookie-reply path (BOTH must
+    /// pass), so a flood from ONE source throttles only its OWN bucket and
+    /// cannot drain the shared budget away from a legit peer at a DIFFERENT
+    /// source (the isolation #4332 adds over #4330's global-only cap).
+    ///
+    /// Fail CLOSED against the amplification vector this very hardening could
+    /// introduce: the table is GC-swept every [`SOURCE_GC_INTERVAL_NS`] (idle
+    /// buckets dropped) and hard-capped at [`SOURCE_TABLE_MAX`] — a NEW source
+    /// that would overflow the cap is DENIED (no reply) rather than growing the
+    /// map without bound under a spoofed-source-IP flood.
+    ///
+    /// Monotonic-clock discipline mirrors #4330/#4321: elapsed is
+    /// `saturating_sub` (a backwards `now_ns` credits nothing) and `last_ns` is
+    /// a high-water mark (`.max(now_ns)`, never lowered), so a clock glitch
+    /// cannot be replayed into an over-credit to the ceiling on the next forward
+    /// step — the exact weakening that guard prevents.
+    pub(crate) fn source_reply_allowed(&self, src_ip: IpAddr, now_ns: u64) -> bool {
+        let mut t = self.per_source.lock().unwrap();
+
+        // Periodic GC — at most once per interval — drops buckets idle for a
+        // full GC interval, so a transient spoofed-IP burst does not keep the
+        // table full once it stops. Runs BEFORE the cap check so reclaimed
+        // slots are available to a legit new source in the same call.
+        let gc_due = match t.last_gc_ns {
+            None => true,
+            Some(last) => now_ns.saturating_sub(last) >= SOURCE_GC_INTERVAL_NS,
+        };
+        if gc_due {
+            t.last_gc_ns = Some(now_ns);
+            t.buckets
+                .retain(|_, b| now_ns.saturating_sub(b.last_ns) < SOURCE_GC_INTERVAL_NS);
+        }
+
+        // Table cap: a NEW source that would overflow the bound is denied
+        // WITHOUT inserting — fail closed against a spoofed-source-IP flood.
+        // An already-tracked source is never refused here (it is one of the
+        // bounded set and gets its normal token check below).
+        if !t.buckets.contains_key(&src_ip) && t.buckets.len() >= SOURCE_TABLE_MAX {
+            return false;
+        }
+
+        // A fresh bucket starts full (one whole burst of credit) so a legit
+        // source's first challenge is never throttled by table churn.
+        let bucket = t.buckets.entry(src_ip).or_insert(SourceBucket {
+            last_ns: now_ns,
+            tokens_ns: MAX_TOKENS_NS,
+        });
+        // Refill by elapsed time (never negative — saturating_sub), cap at the
+        // burst ceiling; keep last_ns a monotonic high-water mark.
+        let elapsed = now_ns.saturating_sub(bucket.last_ns) as i64;
+        bucket.last_ns = bucket.last_ns.max(now_ns);
+        bucket.tokens_ns = (bucket.tokens_ns + elapsed).min(MAX_TOKENS_NS);
+        let cost = PACKET_COST_NS as i64;
+        if bucket.tokens_ns >= cost {
+            bucket.tokens_ns -= cost;
+            true
+        } else {
+            false
+        }
     }
 
     /// Rotate the secret if `current` is older than one rotation window,
@@ -510,23 +630,27 @@ impl CookieChecker {
         Ok(WG_MSG_COOKIE_LEN)
     }
 
-    // --- test-only mirrors of the PR-B initiator decrypt + secret peek ---
+    // --- initiator-side cookie-reply decrypt (#4094 PR-B) + test peek ---
 
-    /// Decrypt a type-3 CookieReply the way the xpf-as-initiator half
-    /// (PR-B) will: recover the 16-byte cookie with the responder's
-    /// public-key-derived AEAD key, the reply's nonce, and the AAD MAC1 of
-    /// the initiation that triggered it. `#[cfg(test)]` reference until
-    /// PR-B wires it into the initiator path.
-    #[cfg(test)]
+    /// Decrypt a type-3 CookieReply as the xpf-as-initiator half (#4094
+    /// PR-B): recover the 16-byte cookie with the RESPONDER's public-key-
+    /// derived AEAD key (`BLAKE2s-256("cookie--" || responder_static_pub)`),
+    /// the reply's carried nonce, and the AAD MAC1 of the initiation that
+    /// triggered it. From the initiator's view `responder_static_pub` is the
+    /// PEER's static public key (the responder we are handshaking toward);
+    /// the responder-side round-trip test passes its own public key, which
+    /// is the same value from its own perspective. Returns `None` on a
+    /// malformed reply or an AEAD authentication failure (wrong key / wrong
+    /// AAD / tampered ciphertext) — fail closed, no panic, cookie ignored.
     pub(crate) fn decrypt_cookie_reply(
         reply: &[u8],
-        our_static_pub: &[u8; WG_KEY_LEN],
+        responder_static_pub: &[u8; WG_KEY_LEN],
         aad_mac1: &[u8],
     ) -> Option<[u8; WG_COOKIE_LEN]> {
         if reply.len() != WG_MSG_COOKIE_LEN || reply[0] != WG_TYPE_COOKIE {
             return None;
         }
-        let key = cookie_encryption_key(our_static_pub);
+        let key = cookie_encryption_key(responder_static_pub);
         let nonce = &reply[M3_NONCE..M3_COOKIE];
         let mut buf = [0u8; WG_COOKIE_LEN];
         buf.copy_from_slice(&reply[M3_COOKIE..M3_COOKIE + WG_COOKIE_LEN]);
@@ -571,6 +695,138 @@ impl CookieChecker {
             s.has_previous = false;
             s.generated_at_ns = None;
         }
+    }
+
+    /// #4332 test hook: number of distinct source IPs currently tracked in the
+    /// per-source reply-bucket table (asserts the [`SOURCE_TABLE_MAX`] bound and
+    /// GC reclaim).
+    #[cfg(test)]
+    pub(crate) fn source_table_len_for_test(&self) -> usize {
+        self.per_source.lock().unwrap().buckets.len()
+    }
+
+    /// #4332 test hook: whether a specific source IP has a live bucket.
+    #[cfg(test)]
+    pub(crate) fn source_contains_for_test(&self, ip: IpAddr) -> bool {
+        self.per_source.lock().unwrap().buckets.contains_key(&ip)
+    }
+}
+
+/// Initiator-side per-peer cookie state (#4094 PR-B) — the counterpart to
+/// the responder's [`CookieChecker`]. Mirrors wireguard-go
+/// `CookieGenerator`'s `mac2` sub-struct: the last cookie we decrypted from
+/// a responder's cookie-reply (used to stamp MAC2 on our RETRIED
+/// handshake-initiations until it ages past [`COOKIE_ROTATION_TIME_NS`])
+/// plus the MAC1 of our most recently sent initiation (the XChaCha20-
+/// Poly1305 AAD needed to decrypt an incoming cookie-reply).
+///
+/// One per peer, held in the [`super::WgEngine`] under a mutex and consulted
+/// only on the slow control-thread path (`create_initiation` on send,
+/// `consume_cookie_reply` on receive). SECRET-adjacent: the cookie authorizes
+/// our initiations under load, so it is never logged.
+pub(crate) struct InitiatorCookie {
+    /// MAC1 of the last initiation we sent to this peer — the AEAD
+    /// associated data for decrypting a cookie-reply. `None` until we have
+    /// sent at least one initiation (a cookie-reply arriving before we ever
+    /// sent an initiation cannot be attributed, so it is dropped).
+    last_mac1: Option<[u8; WG_MAC_LEN]>,
+    /// The last cookie decrypted from a cookie-reply and the monotonic-ns
+    /// time we stored it. `None` until a reply is consumed. Expiry is
+    /// evaluated lazily at stamp time (a cookie older than
+    /// [`COOKIE_ROTATION_TIME_NS`] yields a zero MAC2), not on a timer.
+    cookie: Option<([u8; WG_COOKIE_LEN], u64)>,
+}
+
+impl InitiatorCookie {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_mac1: None,
+            cookie: None,
+        }
+    }
+
+    /// Called on EVERY outbound initiation we send to this peer, AFTER
+    /// [`super::handshake::build_initiation`] has written MAC1 and zeroed
+    /// MAC2. Two effects, mirroring wireguard-go `CookieGenerator::AddMacs`:
+    ///
+    /// 1. Record the message's MAC1 (`msg[116..132]`) as [`Self::last_mac1`]
+    ///    so a subsequent cookie-reply — whose AEAD AAD is exactly this
+    ///    MAC1 — can be decrypted.
+    /// 2. If we hold a cookie that has NOT aged past
+    ///    [`COOKIE_ROTATION_TIME_NS`], stamp
+    ///    `mac2 = keyed-BLAKE2s-128(cookie, msg[0..132])` into the MAC2 slot
+    ///    (`msg[132..148]`). Otherwise leave MAC2 zero — the spec-correct
+    ///    value when we have no valid cookie (a first, un-challenged
+    ///    initiation, or one whose cookie has expired).
+    ///
+    /// Returns `true` iff a non-zero MAC2 was stamped. A too-short `msg`
+    /// (never happens at the sole caller, which passes the 148-byte framed
+    /// message) is a no-op returning `false`.
+    pub(crate) fn add_macs(&mut self, msg: &mut [u8], now_ns: u64) -> bool {
+        if msg.len() < WG_MSG_INIT_LEN {
+            return false;
+        }
+        let mut mac1 = [0u8; WG_MAC_LEN];
+        mac1.copy_from_slice(&msg[M1_MAC1..M1_MAC2]);
+        self.last_mac1 = Some(mac1);
+
+        // A cookie is fresh iff strictly younger than one rotation window.
+        // `saturating_sub` makes a backwards monotonic clock read as
+        // zero-elapsed (still fresh) rather than a huge age — conservative,
+        // and the cookie is our own so this weakens nothing.
+        match self.cookie {
+            Some((cookie, set_ns)) if now_ns.saturating_sub(set_ns) < COOKIE_ROTATION_TIME_NS => {
+                let mac2 = keyed_blake2s_128(&cookie, &msg[..M1_MAC2]);
+                msg[M1_MAC2..WG_MSG_INIT_LEN].copy_from_slice(&mac2);
+                true
+            }
+            _ => {
+                // No cookie, or expired: keep MAC2 zero (build_initiation
+                // already zeroed it; re-zero defensively in case a stale
+                // MAC2 was left by a caller that reused the buffer).
+                msg[M1_MAC2..WG_MSG_INIT_LEN].fill(0);
+                false
+            }
+        }
+    }
+
+    /// Consume an inbound type-3 cookie-reply from this peer. Decrypts the
+    /// sealed cookie with the responder's public-key-derived key and OUR
+    /// stored [`Self::last_mac1`] as the AEAD AAD; on success stores the
+    /// cookie + `now_ns` so the next [`Self::add_macs`] stamps a valid MAC2.
+    ///
+    /// Fails closed (`false`, cookie state untouched) when we never sent an
+    /// initiation (`last_mac1` unset — nothing to attribute the reply to) or
+    /// when decryption fails (wrong key / wrong AAD / tampered ciphertext).
+    pub(crate) fn consume_reply(
+        &mut self,
+        reply: &[u8],
+        responder_static_pub: &[u8; WG_KEY_LEN],
+        now_ns: u64,
+    ) -> bool {
+        let Some(aad_mac1) = self.last_mac1 else {
+            return false;
+        };
+        match CookieChecker::decrypt_cookie_reply(reply, responder_static_pub, &aad_mac1) {
+            Some(cookie) => {
+                self.cookie = Some((cookie, now_ns));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// #4094 PR-B test hook: whether a (non-expired-agnostic) cookie is
+    /// currently stored.
+    #[cfg(test)]
+    pub(crate) fn has_cookie_for_test(&self) -> bool {
+        self.cookie.is_some()
+    }
+}
+
+impl Default for InitiatorCookie {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -885,5 +1141,295 @@ mod tests {
         assert!(fill_random(&mut b));
         assert_ne!(a, [0u8; 32], "a healthy CSPRNG does not yield all-zero");
         assert_ne!(a, b, "two draws differ");
+    }
+
+    // ===================================================================
+    // #4332 per-SOURCE cookie-reply token bucket.
+    // ===================================================================
+
+    fn ipv4(a: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, a))
+    }
+
+    /// A fresh source draws exactly [`SOURCE_REPLY_BURST`] replies back-to-back
+    /// (same instant, no refill) and is then throttled; one [`PACKET_COST_NS`]
+    /// of accrued time refills exactly one token.
+    #[test]
+    fn source_bucket_burst_then_throttle() {
+        let cc = CookieChecker::new(&[0x81u8; 32]);
+        let now = 10_000_000_000u64;
+        let s = ipv4(1);
+        let mut granted = 0u64;
+        for _ in 0..(SOURCE_REPLY_BURST + 10) {
+            if cc.source_reply_allowed(s, now) {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, SOURCE_REPLY_BURST,
+            "a source may burst exactly SOURCE_REPLY_BURST replies, then throttles"
+        );
+        // One packet-cost of accrued time → exactly one more token, then dry.
+        assert!(cc.source_reply_allowed(s, now + PACKET_COST_NS));
+        assert!(!cc.source_reply_allowed(s, now + PACKET_COST_NS));
+    }
+
+    /// The isolation #4332 buys over the global-only budget: a source that has
+    /// exhausted its bucket does NOT starve a DIFFERENT source, which still
+    /// draws its full burst. RED on revert (no per-source layer, the direct
+    /// method disappears; and at the engine level A's flood drains the shared
+    /// budget — see `classify_initiation_per_source_budget_isolation`).
+    #[test]
+    fn source_bucket_isolates_sources() {
+        let cc = CookieChecker::new(&[0x82u8; 32]);
+        let now = 10_000_000_000u64;
+        let a = ipv4(1);
+        let b = ipv4(2);
+        for _ in 0..(SOURCE_REPLY_BURST + 5) {
+            cc.source_reply_allowed(a, now);
+        }
+        assert!(
+            !cc.source_reply_allowed(a, now),
+            "source A is throttled after exhausting its own bucket"
+        );
+        let mut granted_b = 0u64;
+        for _ in 0..(SOURCE_REPLY_BURST + 5) {
+            if cc.source_reply_allowed(b, now) {
+                granted_b += 1;
+            }
+        }
+        assert_eq!(
+            granted_b, SOURCE_REPLY_BURST,
+            "a different source is unaffected by A's flood (per-source isolation)"
+        );
+    }
+
+    /// The table is hard-capped at [`SOURCE_TABLE_MAX`]: a spoofed-source-IP
+    /// flood cannot grow the map without bound. A NEW source over the cap fails
+    /// CLOSED (no reply, not inserted); an already-tracked source is still
+    /// served.
+    #[test]
+    fn source_table_cap_fails_closed() {
+        let cc = CookieChecker::new(&[0x83u8; 32]);
+        let now = 10_000_000_000u64;
+        // Fill to the cap with distinct sources, all within one GC interval
+        // (same `now`) so none are reclaimed.
+        for i in 0..SOURCE_TABLE_MAX {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000u32 + i as u32));
+            assert!(
+                cc.source_reply_allowed(ip, now),
+                "a fresh source under the cap is admitted"
+            );
+        }
+        assert_eq!(cc.source_table_len_for_test(), SOURCE_TABLE_MAX);
+        // A NEW source over the cap is DENIED and NOT inserted — fail closed
+        // against the memory-amplification vector.
+        let overflow = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+        assert!(
+            !cc.source_reply_allowed(overflow, now),
+            "a new source over the table cap fails closed (denied, no reply)"
+        );
+        assert!(!cc.source_contains_for_test(overflow));
+        assert_eq!(
+            cc.source_table_len_for_test(),
+            SOURCE_TABLE_MAX,
+            "the table never grows past its cap under a spoofed-IP flood"
+        );
+        // An already-tracked source (drew 1 of its burst) is still served.
+        let tracked = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000u32));
+        assert!(
+            cc.source_reply_allowed(tracked, now),
+            "an already-tracked source is not refused by the cap"
+        );
+    }
+
+    /// GC reclaims buckets idle for a full [`SOURCE_GC_INTERVAL_NS`]: as
+    /// spoofed sources come and go the table shrinks back, so a burst of
+    /// short-lived sources does not permanently pin the map at its cap.
+    #[test]
+    fn source_gc_reclaims_idle_buckets() {
+        let cc = CookieChecker::new(&[0x84u8; 32]);
+        let base = 10_000_000_000u64;
+        let idle = ipv4(1);
+        let active = ipv4(2);
+        assert!(cc.source_reply_allowed(idle, base));
+        assert_eq!(cc.source_table_len_for_test(), 1);
+        // A full GC interval later a DIFFERENT source sends: the sweep drops
+        // the idle bucket before admitting the active one.
+        let later = base + SOURCE_GC_INTERVAL_NS + 1;
+        assert!(cc.source_reply_allowed(active, later));
+        assert_eq!(
+            cc.source_table_len_for_test(),
+            1,
+            "the idle source was GC-reclaimed; only the active source remains"
+        );
+        assert!(!cc.source_contains_for_test(idle));
+        assert!(cc.source_contains_for_test(active));
+    }
+
+    /// Monotonic-clock discipline (#4330/#4321): a backwards `now_ns` credits
+    /// nothing and never lowers the bucket's `last_ns` high-water mark, so the
+    /// glitch cannot be replayed into an over-credit on the next forward step.
+    #[test]
+    fn source_bucket_ignores_backwards_clock() {
+        let cc = CookieChecker::new(&[0x85u8; 32]);
+        let s = ipv4(1);
+        let t_hi = 10_000_000_000u64;
+        // Drain the burst at t_hi.
+        for _ in 0..SOURCE_REPLY_BURST {
+            assert!(cc.source_reply_allowed(s, t_hi));
+        }
+        assert!(!cc.source_reply_allowed(s, t_hi), "burst exhausted at t_hi");
+        // A backwards step must NOT credit (saturating_sub → 0 elapsed) and must
+        // NOT lower last_ns — else the following forward jump back to t_hi would
+        // credit the whole (t_hi - t_lo) span and refill to the ceiling.
+        let t_lo = t_hi - 5 * SOURCE_GC_INTERVAL_NS;
+        assert!(
+            !cc.source_reply_allowed(s, t_lo),
+            "a backwards clock step credits nothing"
+        );
+        assert!(
+            !cc.source_reply_allowed(s, t_hi),
+            "the forward jump after a backwards step is not replayed into an over-credit"
+        );
+    }
+
+    // ===================================================================
+    // #4094 PR-B initiator-side cookie-reply consume + MAC2 stamping.
+    // ===================================================================
+
+    /// Full cookie handshake round-trip across BOTH halves: the responder
+    /// (PR-A [`CookieChecker`]) issues a cookie-reply; the initiator (PR-B
+    /// [`InitiatorCookie`]) consumes it and stamps a MAC2 on its RETRIED
+    /// initiation that the responder's [`CookieChecker::verify_initiation_mac2`]
+    /// accepts. RED on revert: without the consume+stamp the retried MAC2
+    /// stays zero and the responder rejects it (re-challenging forever — the
+    /// handshake never completes under load).
+    #[test]
+    fn initiator_cookie_roundtrip_stamps_accepted_mac2() {
+        let responder_pub = [0x91u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let now = 10_000_000_000u64;
+        let from = src(51820); // the initiator's source as the responder sees it
+
+        // 1. Initiator sends its FIRST initiation (MAC2 zero) and records its
+        //    MAC1 via add_macs.
+        let mut ic = InitiatorCookie::new();
+        let mut first = valid_mac1_init(&responder_pub, 0x1111);
+        assert!(
+            !ic.add_macs(&mut first, now),
+            "no cookie yet → MAC2 stays zero"
+        );
+        assert_eq!(&first[M1_MAC2..], &[0u8; 16]);
+
+        // 2. Responder issues a cookie-reply for that initiation from `from`.
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, now, &mut reply).unwrap();
+
+        // 3. Initiator consumes the reply → stores the cookie.
+        assert!(ic.consume_reply(&reply, &responder_pub, now));
+        assert!(ic.has_cookie_for_test());
+
+        // 4. Initiator retries — add_macs now stamps a NON-ZERO MAC2.
+        let mut retry = valid_mac1_init(&responder_pub, 0x2222);
+        assert!(ic.add_macs(&mut retry, now), "a fresh cookie stamps MAC2");
+        assert_ne!(&retry[M1_MAC2..], &[0u8; 16]);
+
+        // 5. The responder's MAC2 verifier accepts the retried initiation
+        //    from the SAME source (RED on revert: zero MAC2 is rejected).
+        assert!(
+            cc.verify_initiation_mac2(&retry, from, now),
+            "responder must accept the initiator's cookie-derived MAC2"
+        );
+        // A DIFFERENT source is still rejected — the cookie binds the source.
+        assert!(
+            !cc.verify_initiation_mac2(&retry, src(51821), now),
+            "a cookie-derived MAC2 must not verify from a different source"
+        );
+    }
+
+    /// A cookie-reply that fails AEAD authentication (tampered ciphertext or
+    /// wrong responder key) is DROPPED: no cookie is stored, no panic, and a
+    /// subsequent retry still carries a zero MAC2 (fail-closed).
+    #[test]
+    fn initiator_drops_undecryptable_cookie_reply() {
+        let responder_pub = [0x92u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let now = 10_000_000_000u64;
+        let from = src(51820);
+
+        let mut ic = InitiatorCookie::new();
+        let mut first = valid_mac1_init(&responder_pub, 7);
+        ic.add_macs(&mut first, now);
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, now, &mut reply).unwrap();
+
+        // (a) Tampered ciphertext → AEAD tag mismatch → not consumed.
+        let mut tampered = reply;
+        tampered[M3_COOKIE] ^= 0xFF;
+        assert!(!ic.consume_reply(&tampered, &responder_pub, now));
+        assert!(!ic.has_cookie_for_test());
+
+        // (b) Wrong responder key → wrong AEAD key → not consumed.
+        let wrong_pub = [0x93u8; 32];
+        assert!(!ic.consume_reply(&reply, &wrong_pub, now));
+        assert!(!ic.has_cookie_for_test());
+
+        // Sanity: the untampered reply with the RIGHT key DOES consume — the
+        // failures above were the tamper/key, not a broken reply. (`last_mac1`
+        // is still the first initiation's MAC1 — we have not sent another —
+        // so the AAD still matches.)
+        assert!(ic.consume_reply(&reply, &responder_pub, now));
+        assert!(ic.has_cookie_for_test());
+    }
+
+    /// An EXPIRED cookie (older than [`COOKIE_ROTATION_TIME_NS`], 120 s) is
+    /// NOT used: add_macs leaves MAC2 zero rather than stamping a stale
+    /// cookie. Just inside the window it is still stamped.
+    #[test]
+    fn initiator_expired_cookie_yields_zero_mac2() {
+        let responder_pub = [0x94u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let t0 = 10_000_000_000u64;
+        let from = src(51820);
+
+        let mut ic = InitiatorCookie::new();
+        let mut first = valid_mac1_init(&responder_pub, 1);
+        ic.add_macs(&mut first, t0);
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, t0, &mut reply).unwrap();
+        assert!(ic.consume_reply(&reply, &responder_pub, t0));
+
+        // Just within the TTL → MAC2 stamped.
+        let mut in_window = valid_mac1_init(&responder_pub, 2);
+        assert!(ic.add_macs(&mut in_window, t0 + COOKIE_ROTATION_TIME_NS - 1));
+        assert_ne!(&in_window[M1_MAC2..], &[0u8; 16]);
+
+        // Past the TTL (> 120 s) → MAC2 zero (a stale cookie is not used).
+        let mut expired = valid_mac1_init(&responder_pub, 3);
+        assert!(!ic.add_macs(&mut expired, t0 + COOKIE_ROTATION_TIME_NS + 1));
+        assert_eq!(&expired[M1_MAC2..], &[0u8; 16]);
+    }
+
+    /// A cookie-reply that arrives before the initiator ever sent an
+    /// initiation (no stored MAC1 to use as the AEAD AAD) is ignored — the
+    /// reply cannot be attributed, so it is dropped fail-closed.
+    #[test]
+    fn initiator_ignores_cookie_reply_before_any_initiation() {
+        let responder_pub = [0x95u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let now = 10_000_000_000u64;
+        let from = src(51820);
+
+        let first = valid_mac1_init(&responder_pub, 9);
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, now, &mut reply).unwrap();
+
+        let mut ic = InitiatorCookie::new();
+        assert!(
+            !ic.consume_reply(&reply, &responder_pub, now),
+            "a reply with no prior sent initiation cannot be attributed"
+        );
+        assert!(!ic.has_cookie_for_test());
     }
 }
