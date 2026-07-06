@@ -1583,24 +1583,96 @@ func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertT
 		// Higher priority — step down unconditionally.
 		vi.becomeBackup(masterDownTimer, advertTimer)
 	} else if pktPri == pri && pkt.SrcIP != nil {
-		// Equal priority — RFC 5798 §6.4.3 tie-break: higher IP wins.
-		// Handle both IPv4 and IPv6 address families.
-		localIP := vi.getLocalIP()
-		localIPv6 := vi.getLocalIPv6()
-		var peerHigher bool
-		if pkt.SrcIP.To4() != nil && localIP != nil {
-			peerHigher = bytes.Compare(pkt.SrcIP.To4(), localIP.To4()) > 0
-		} else if pkt.SrcIP.To4() == nil && localIPv6 != nil {
-			peerHigher = bytes.Compare(pkt.SrcIP.To16(), localIPv6.To16()) > 0
-		}
-		if peerHigher {
-			slog.Info("vrrp: equal priority tie-break, peer IP is higher — stepping down",
-				"key", vi.key(), "our_ip", localIP, "our_ipv6", localIPv6,
-				"peer_ip", pkt.SrcIP, "priority", pri)
-			vi.becomeBackup(masterDownTimer, advertTimer)
-		}
+		// Equal priority — RFC 5798 §6.4.3 tie-break: higher source IP wins.
+		// The comparison is anchored to ONE address family so both nodes
+		// decide off the SAME ordering (#4376) — see resolveEqualPriorityMaster.
+		vi.resolveEqualPriorityMaster(pkt, masterDownTimer, advertTimer)
 	}
 	// Lower priority, or equal with our IP higher: stay Master.
+}
+
+// resolveEqualPriorityMaster runs the RFC 5798 §6.4.3 MASTER-MASTER tie-break
+// for an equal-priority peer advert while we are MASTER.
+//
+// A single instance is genuinely dual-stack: CollectRethInstances puts all of a
+// unit's v4+v6 addresses on ONE instance, and sendAdvert emits BOTH a v4 advert
+// (from getLocalIP, the lowest primary v4) and a v6 advert (from getLocalIPv6,
+// the link-local) from two UNRELATED sources. If the tie-break keyed off
+// whichever family happened to arrive, two equal-priority nodes with DISAGREEING
+// v4-vs-v6 orderings (A: higher-v4/lower-LL, B: lower-v4/higher-LL) would each
+// step down on the other family's advert — both go BACKUP, both masterDown
+// timers expire, both re-elect: permanent no-master oscillation (#4376).
+//
+// Fix: anchor the tie-break to ONE family so both nodes compare the SAME pair of
+// addresses. A v4-bearing instance (dual-stack or v4-only, i.e. it advertises a
+// v4 VIP) decides ONLY off v4 adverts and ignores the peer's v6-family advert;
+// a v6-only instance decides off the link-local v6 advert. The classifier keys
+// off the configured VIP families (immutable per instance), NOT the resolved
+// local address, so a transient address flush cannot flip a dual-stack instance
+// to the v6 ordering and reintroduce the split.
+func (vi *vrrpInstance) resolveEqualPriorityMaster(pkt *VRRPPacket, masterDownTimer, advertTimer *time.Timer) {
+	peerV4 := pkt.SrcIP.To4() != nil
+
+	var localCmp, peerCmp net.IP
+	if vi.hasIPv4VIP() {
+		// v4-bearing: anchor on v4. Ignore the peer's v6-family advert — the
+		// peer's v4 advert drives the symmetric decision on both nodes.
+		if !peerV4 {
+			return
+		}
+		localCmp, peerCmp = vi.getLocalIP().To4(), pkt.SrcIP.To4()
+	} else {
+		// v6-only: anchor on the link-local v6 address.
+		if peerV4 {
+			return
+		}
+		if lip6 := vi.getLocalIPv6(); lip6 != nil {
+			localCmp = lip6.To16()
+		}
+		peerCmp = pkt.SrcIP.To16()
+	}
+
+	if localCmp == nil {
+		// Unresolved local advert source: we cannot run the tie-break and must
+		// NOT treat that as "we win" (#4376 secondary defect — the old code let
+		// peerHigher stay false and stay MASTER by default). Yield to the
+		// actively advertising equal-priority peer. This does NOT oscillate: a
+		// node that cannot determine its own source address cannot put a valid
+		// advert of this family on the wire (sendPacket errors), so the peer
+		// never receives a same-family advert from it and only one side steps
+		// down. The address re-resolves on the advert-send path and a healthy
+		// node re-elects cleanly.
+		slog.Info("vrrp: equal priority tie-break, local source unresolved — stepping down",
+			"key", vi.key(), "peer_ip", pkt.SrcIP, "priority", vi.getPriority())
+		vi.becomeBackup(masterDownTimer, advertTimer)
+		return
+	}
+
+	if bytes.Compare(peerCmp, localCmp) > 0 {
+		slog.Info("vrrp: equal priority tie-break, peer IP is higher — stepping down",
+			"key", vi.key(), "our_ip", localCmp, "peer_ip", pkt.SrcIP,
+			"priority", vi.getPriority())
+		vi.becomeBackup(masterDownTimer, advertTimer)
+	}
+	// Peer lower/equal: stay Master.
+}
+
+// hasIPv4VIP reports whether this instance advertises at least one IPv4 virtual
+// address (dual-stack or IPv4-only). It anchors the equal-priority MASTER-MASTER
+// tie-break to the v4 family so both nodes decide off the same ordering (#4376).
+// cfg.VirtualAddresses is immutable per instance (VIP changes rebuild the
+// instance), so no lock is needed — same rationale as vipAddrSet.
+func (vi *vrrpInstance) hasIPv4VIP() bool {
+	for _, vip := range vi.cfg.VirtualAddresses {
+		addr := vip
+		if idx := strings.Index(addr, "/"); idx >= 0 {
+			addr = addr[:idx]
+		}
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // becomeMaster transitions to Master state: add VIPs, send advert, emit event,

@@ -1,3 +1,29 @@
+## 2026-07-06 — #4376: VRRP dual-stack equal-priority tie-break family-consistency
+
+- **Timestamp**: 2026-07-06 16:53 PDT
+- **Action**: Fixed the dual-stack VRRP equal-priority tie-break split. The old
+  `handleMasterRx` tie-break keyed off the ARRIVING advert's family (v4 advert
+  vs `getLocalIP`, v6 advert vs `getLocalIPv6` link-local). A single instance is
+  dual-stack (`CollectRethInstances` puts v4+v6 on one instance; `sendAdvert`
+  emits BOTH a v4 and a v6 advert from unrelated sources), so two equal-priority
+  nodes with DISAGREEING v4-vs-v6 orderings each stepped down on the other
+  family's advert → both BACKUP → both masterDown timers expire → both MASTER →
+  permanent no-master oscillation (RG outage, #4376). Replaced the inline
+  branch with `resolveEqualPriorityMaster`, which anchors the tie-break to ONE
+  family via `hasIPv4VIP()` (classified from the immutable configured VIP set):
+  a v4-bearing (dual-stack or v4-only) instance decides ONLY off v4 adverts and
+  ignores v6-family adverts; a v6-only instance decides off the link-local v6
+  advert — both nodes then compare the same pair. Also fixed the secondary
+  defect: a nil (unresolved) local source now YIELDS (`becomeBackup`) instead of
+  defaulting to stay-MASTER (the old "treat unresolved as we-win"); no
+  oscillation because a node that cannot resolve its source cannot put a valid
+  same-family advert on the wire. Added 4 unit tests (3 RED on revert to the
+  family-split code, verified). Updated `pkg/vrrp/README.md` with a new
+  "Equal-priority tie-break — dual-stack family-consistency (#4376)" section.
+  HA VRRP state-machine change — parent runs `make test-failover` before merge.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/vrrp_test.go, pkg/vrrp/README.md,
+  _Log.md
+
 ## 2026-07-06 — #4228 Gap 2: resolve CoS transmit-rate / shaping-rate percent
 
 - **Timestamp**: 2026-07-06

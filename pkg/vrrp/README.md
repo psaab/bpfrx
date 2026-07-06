@@ -226,6 +226,53 @@ blackholing on takeover. Compiled to `Instance.PreemptHoldTime` (seconds);
   preempt and is not wired to interface `preempt hold-time` (out of scope
   for #2850).
 
+## Equal-priority tie-break — dual-stack family-consistency (#4376)
+
+RFC 5798 §6.4.3 resolves a MASTER-MASTER collision at **equal priority** by
+higher source IP. `handleMasterRx` runs this only against an equal-priority
+peer advert (a higher-priority advert steps down unconditionally; priority-0
+is a peer resignation). `resolveEqualPriorityMaster` performs the comparison.
+
+A single instance is genuinely **dual-stack**: `CollectRethInstances` puts all
+of a unit's v4+v6 addresses on ONE instance, and `sendAdvert` emits BOTH a v4
+advert (source `getLocalIP`, the lowest primary v4) and a v6 advert (source
+`getLocalIPv6`, the link-local) from two **unrelated** sources. The v4 and v6
+orderings between two nodes can therefore **disagree**.
+
+The tie-break must NOT key off whichever family's advert happened to arrive. If
+it did, two equal-priority nodes with disagreeing orderings (A: higher-v4 /
+lower link-local, B: lower-v4 / higher link-local) would each step down on the
+**other** family's advert — A backs down on B's higher-v6, B backs down on A's
+higher-v4 — so BOTH go BACKUP, both `masterDown` timers expire, both re-elect:
+a permanent no-master oscillation (RG outage). Equal priority is reachable — a
+simultaneous cold boot leaves both at 100, and a control/heartbeat-only
+partition leaves both at 200.
+
+Fix: **anchor the tie-break to ONE address family** so both nodes compare the
+same pair of addresses. `hasIPv4VIP()` classifies the instance from its
+**configured VIP families** (immutable per instance — a transient address flush
+cannot flip the anchor):
+
+- **v4-bearing** (dual-stack or v4-only): resolve the collision on **v4 adverts
+  only**, comparing `getLocalIP()`. A v6-family advert is **ignored** for the
+  tie-break (the peer's v4 advert drives the symmetric decision on both sides).
+- **v6-only** (no v4 VIP): resolve on the **link-local v6** advert via
+  `getLocalIPv6()`.
+
+Secondary defect (same fix): when the anchored family's local source is **nil**
+(unresolved — e.g. the #2528 RETH-MAC-flush window), the old code let
+`peerHigher` stay false and **stayed MASTER by default** ("treat unresolved as
+we-win"). It now **yields** (`becomeBackup`) to the actively advertising
+equal-priority peer. This does not oscillate: a node that cannot resolve its own
+source cannot put a valid same-family advert on the wire (`sendPacket` errors),
+so the peer never receives an advert from it and only one side steps down; the
+source re-resolves on the advert-send path and a healthy node re-elects cleanly.
+
+Regression coverage: `TestHandleMasterRx_DualStack_DisagreeingOrderings_ConvergeOneMaster`
+(both converge to one master), `..._DualStack_IgnoresV6Advert`,
+`..._V6Only_TieBreaksOnLinkLocal`, `..._NilLocal_DoesNotStayMaster` in
+`vrrp_test.go`.
+
 ## Interface tracking (#1814)
 
 Single-interface tracking per VRRP group:
