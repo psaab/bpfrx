@@ -41,12 +41,45 @@ unaffected. The v2 audit journal (`.config.journal`) stays 0644 by
 design — it is compact metadata only (timestamp/action/detail), never
 config content or secret values (#1896).
 
-**Follow-up (design, not shipped here):** when master-password is set,
-the text rollback/archive/rescue copies still hold **cleartext** secrets
-(only the JSON DB body is encrypted). Encrypting or redacting secrets in
-those persisted text copies — with a decrypt-on-restore round-trip —
-needs a design decision (see the #4056 issue comment). This change ships
-the 0600 perms fix only.
+### Threat model — what 0600 + 0700 defends, and what it does not (#4056)
+
+The `0600` file perms plus `0700` directory perms defend against
+**non-root local users** (a compromised low-privilege process or an
+interactive account without root) reading the secret leaves, and against
+**casual leakage** of an individual file. That is the exposure #4058
+closed — the world-readable 0644 copies previously handed every firewall
+secret to any local user.
+
+They do **not** defend against **root compromise** or **physical disk
+theft** (a stolen disk, backup, or VM snapshot). At-rest encryption of
+the config store is intentionally **not** applied to the persisted text
+copies, and encrypting them with the on-box `master.key` would add **no
+real defense** against those two threats: this is an **unattended-boot
+appliance**, so the decryption key must live on the box (`rollback N` /
+`loadRollbackHistory` and a future rescue-load must restore secrets with
+no operator present). `master.key` is a plain random 0600 file
+(`crypto.go readOrCreateMasterKey`) in the same 0700 `.configdb`
+directory as the ciphertext, with **no TPM/HSM substrate** in the tree
+to seal it. An attacker who can read `xpf.conf.N` can equally read
+`master.key` one directory over and decrypt — so on-box encryption is
+theater against the root/disk-theft threat, not defense. A genuine
+at-rest feature therefore requires a **TPM/HSM-sealed key** (a separate,
+maintainer-gated work item — deferred, see #4056), not symmetric
+encryption with an on-box key.
+
+The JSON DB body is the one copy that IS AES-GCM encrypted when
+`system master-password` is set; the text rollback slots, archives, and
+`rescue.conf` stay cleartext-at-rest (0600) by the reasoning above.
+
+**Off-box copy — `transfer-on-commit`:** the honest place to control the
+residual is the off-box transfer, not on-box encryption. When
+`system archival configuration transfer-on-commit` is set, the daemon
+`scp`s the raw config file (cleartext secret leaves included) to the
+operator-configured archive sites on every commit
+(`daemon_flow.go scpArchiveTransfer`, `StrictHostKeyChecking=no`). This
+is the one genuine off-box copy of the secrets; the operator must secure
+the destination host and transport (extends the #651 warning about
+inline archive-site passwords).
 
 ## Entry points
 
