@@ -172,10 +172,18 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 			{"index_exhausted", t.HsRxDropsIndexExhausted},
 			{"replayed_init", t.HsRxDropsReplayedInit},
 			{"cookie_unsupported", t.HsRxCookieUnsupported},
+			// #4094 PR-A responder under-load cookie gate drops.
+			{"under_load_no_mac2", t.HsRxUnderLoadNoMac2},
+			{"cookie_reply_budget", t.HsCookieReplyBudgetDrops},
 			{"unknown_type", t.RxUnknownType},
 		} {
 			counter(c.wgHandshakeRxDropsTotal, r.v, t.Tunnel, r.reason)
 		}
+
+		// #4094 PR-A responder cookie mechanism working signals: challenges
+		// issued and primed peers that completed under load.
+		counter(c.wgCookieRepliesTotal, t.HsCookieRepliesSent, t.Tunnel, "sent")
+		counter(c.wgCookieRepliesTotal, t.HsRxUnderLoadMac2Ok, t.Tunnel, "mac2_ok")
 
 		counter(c.wgTransportPacketsTotal, t.EncapPackets, t.Tunnel, "encap")
 		counter(c.wgTransportPacketsTotal, t.DecapPackets, t.Tunnel, "decap")

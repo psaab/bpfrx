@@ -113,7 +113,8 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
 | brief egress drop right after a peer-initiated rekey | stricter-than-spec unconfirmed-responder TX gate (`engine.rs` try_encap; no `peer.previous` TX fallback) — ms-scale vs kernel wg | file if >1 s measured |
 | keys are hex in xpf config, base64 in `wg` | minimal S2a grammar | S6 (#1434) |
 | ~~no `wg show`-equivalent / WG counters on the xpf side~~ | RESOLVED by #1865: `show security wireguard [detail]` + `xpf_userspace_wg_*` Prometheus family + `wg_tunnels` status rows | done (#1865) |
-| cookie (type 3) messages dropped | cookie/MAC2 consume unimplemented | S7 |
+| responder under an init-flood answers valid-MAC1 initiations with a type-3 CookieReply + validates MAC2 before the Noise handshake | #4094 PR-A responder DoS mitigation (whitepaper §5.4.7) — intended | done (#4094 PR-A) |
+| INBOUND cookie (type 3) messages still dropped (`hs_rx_cookie_unsupported`); xpf-as-initiator cannot complete against a peer that is itself under load | initiator-side CookieReply consume unimplemented | PR-B (#4094) |
 | PSK must be absent/zero on the peer | PSK plumbing unimplemented | S4 |
 | WG tunnel removed from config keeps the persistent wgN TUN link (by design — tearing it flaps the device + live peer) but now PRUNES the kernel addresses this manager applied (#1919), so they no longer route; the kernel connected route (and any FRR direct→connected redistribution of it) goes with the address | link kept = S2a persistent-TUN tradeoff; address prune fixed in #1919 | link teardown S6 (#1434); harness teardown still `ip link del`s the persistent link |
 | WG tunnel removed while the daemon was DOWN is not address-pruned on the next start | restart-adoption: the manager only prunes WG addresses it tracked applying | S6 (#1434) restart-time WG reconcile |
