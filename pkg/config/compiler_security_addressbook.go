@@ -6,15 +6,17 @@ import (
 )
 
 // zoneLocalNamePrefix marks a zone-qualified internal address-book name
-// minted by resolveZoneLocalAddressBooks (#3061). The `/` separators make
-// the synthetic name collision-proof against operator-typed names: the lexer
-// permits `/` in an identifier (needed for IP literals like 10.0.0.0/24), but
-// validateAddressBookEntryNamesStrict hard-rejects `/` in any address-book
-// entry name and any security-zone name at commit, so no operator name can
-// contain `/` and therefore none can equal a synthetic `zone-local/...` name.
-// The fold also skips a key already present in the global book as a
-// defence-in-depth no-clobber for the tolerant load path (a persisted
-// pre-validator config that an older binary accepted).
+// minted by resolveZoneLocalAddressBooks (#3061). The synthetic name is kept
+// collision-proof against operator-typed names by two narrow gates in
+// validateAddressBookEntryNamesStrict (relaxed in #4340): an operator
+// address-book entry name may NOT begin with this "zone-local/" prefix, and a
+// security-zone name may NOT contain `/`. A `/` is otherwise permitted inside
+// an entry NAME so real vSRX configs can name an object after its prefix
+// (net_10.0.0.0/8) — the zone is the `/`-free first segment after the prefix,
+// so ZoneLocalUnqualify still splits zone from a `/`-bearing name on the first
+// `/` unambiguously. The fold also skips a key already present in the global
+// book as a defence-in-depth no-clobber for the tolerant load path (a
+// persisted pre-validator config that an older binary accepted).
 const zoneLocalNamePrefix = "zone-local/"
 
 // zoneLocalQualify mints the global-book key for a zone-local address-book
@@ -27,9 +29,13 @@ func zoneLocalQualify(zone, name string) string {
 // ZoneLocalUnqualify reverses zoneLocalQualify. If qualified is a synthetic
 // zone-local key minted by the #3061 fold ("zone-local/<zone>/<name>"), it
 // returns the authored zone and address-book name with ok=true; any other
-// token returns ok=false. validateAddressBookEntryNamesStrict forbids `/` in
-// every operator-typed zone and address-book name, so the single `/` after the
-// prefix always splits zone from name unambiguously.
+// token returns ok=false. The zone component is the `/`-free first segment
+// after the prefix (validateAddressBookEntryNamesStrict forbids `/` in a
+// security-zone name), so strings.Cut on the first `/` splits zone from name
+// unambiguously even when <name> itself contains `/` (net_10.0.0.0/8) — the
+// #4340 prefix-in-name convention. Only the reserved "zone-local/" prefix is
+// withheld from operator entry names, so a non-synthetic `/`-bearing operator
+// name (net_10.0.0.0/8) never matches the prefix and returns ok=false.
 func ZoneLocalUnqualify(qualified string) (zone, name string, ok bool) {
 	rest, found := strings.CutPrefix(qualified, zoneLocalNamePrefix)
 	if !found {

@@ -1,3 +1,174 @@
+## 2026-07-06 — #4340 allow "/" in address-object names (vSRX prefix-in-name drop-in blocker)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Real vSRX configs name address objects after their prefix
+  (`net_10.0.0.0/8`, `net4_sfmix_72.52.96.201/32`,
+  `net_2001:559:8585:200::/64`) — the near-universal convention. xpf
+  HARD-REJECTED every such name ("address-book entry name … must not
+  contain '/'"), so a mechanical drop-in was impossible (194 objects +
+  every policy reference would need lockstep renaming). DIAGNOSIS: `/`
+  was reserved by `validateAddressBookEntryNamesStrict` (#3061,
+  `compiler_validate_strict.go`) purely to keep the zone-local fold's
+  synthetic `zone-local/<zone>/<name>` internal key collision-proof —
+  NOT because any consumer treats the object NAME as a path. Every
+  resolver (policyMatchNamedAddressRefs, resolveUserspaceAddressBookEntry,
+  classifyPolicyAddresses, the wire snapshot) keys objects by the FULL
+  name via direct map lookups, so a `/`-bearing name resolves end to end
+  unchanged. FIX: narrow the reservation from "any `/`" to the two
+  invariants the synthetic key actually needs — (1) an operator
+  address-book entry name may not BEGIN with the reserved `zone-local/`
+  prefix (collision guard), (2) a security-zone NAME may not contain `/`
+  (it is the `/`-free first segment `ZoneLocalUnqualify` splits on). `/`
+  is now permitted freely elsewhere in an entry name. ZoneLocalUnqualify
+  already splits on the FIRST `/` only, so a `/`-bearing zone-local name
+  round-trips (`zone-local/trust/net_10.0.0.0/8` → zone trust, name
+  net_10.0.0.0/8). RED-on-revert proven: with the old any-`/` reject,
+  `TestAddressBookSlashNameCommits` /
+  `TestAddressBookSlashNameZoneLocalFoldRoundTrips` fail with the exact
+  "must not contain '/'" error; the userspace resolution test passes on
+  both revisions (confirming no consumer depended on the ban). Full
+  pkg/config + pkg/dataplane/userspace + policymatch + grpcapi + api +
+  cli suites, gofmt, vet, go build ./... clean.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_security_addressbook.go, pkg/config/compiler.go,
+  pkg/config/addressbook_name_slash_3061_test.go,
+  pkg/config/addressbook_name_slash_4340_test.go,
+  pkg/dataplane/userspace/addressbook_slash_name_4340_test.go,
+  docs/config-schema.md, _Log.md
+## 2026-07-06 — #4335: parser prunes an INLINE `inactive:` token (drop-in blocker)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed the parser so an INLINE `inactive:` marker (mid-statement,
+  not just leading) is pruned. Junos collapses a deactivated sub-statement onto
+  its parent statement's line, e.g. a destination-NAT pool address with a
+  deactivated port: `address 2001:559:8585:80::7aef/128 inactive: port 32400;`.
+  The lexer tokenizes `inactive:` as one identifier, so an inline marker landed
+  mid-`Keys` (`[address, 2001:...::7aef/128, inactive:, port, 32400]`); the
+  DNAT-pool compiler (`parseDNATPoolAddress`) then overwrote `pool.Address` with
+  the literal `"inactive:"` token, hard-rejecting a valid drop-in vSRX config
+  with "destination-nat pool: address inactive: is not a single host address".
+  The leading-only pruning (keys[0]=="inactive:") already lifted the whole
+  statement into `Node.Inactive`; extended `parseStatement` to also detect an
+  inline marker (index > 0) and drop the marker plus every token it governs (the
+  remainder of the statement) from the active `Keys`. A leaf carries one
+  `Inactive` flag and cannot mark part of its identity inactive, so — per the
+  #2008 H1 "deactivated == absent" doctrine — the governed sub-statement (the
+  port) is dropped: the address stays active as the pool member, the port
+  collapses to preserve-destination-port. Semantics: inline `inactive:`
+  deactivates the FOLLOWING sub-statement/modifier, NOT the parent statement.
+- **File(s)**: pkg/config/parser.go (parseStatement inline-marker branch),
+  pkg/config/inline_inactive_4335_test.go (new, RED-on-revert),
+  docs/config-schema.md ("Inline `inactive:` (mid-statement, #4335)").
+- **Validation**: `go test ./pkg/config/...` green; RED-on-revert proven
+  (neutralizing the branch fails the DNAT-pool commit + generic-prune tests
+  while the active-port and leading-marker control tests stay green);
+  `go build ./...`, gofmt, `go vet ./pkg/config/` clean.
+
+## 2026-07-06 — #4328 follow-up: non-reth Junos-name kernel resolution + comment/speed nits
+
+- **Timestamp**: 2026-07-06
+- **Action**: Copilot review of PR #4333 found a real RELATED bug at the same
+  lookup sites: for a NON-reth interface the summary/detail lookup used the raw
+  config `physName` (Junos-form "ge-0/0/2" or an alias), but
+  netlink.LinkByName / net.InterfaceByName need the Linux kernel ifname
+  ("ge-0-0-2") — so a VALID interface authored in Junos form rendered
+  "Physical interface: <name>, Not present". Verified the bug MANIFESTS
+  (zone/interface refs are stored verbatim slash-form; nothing normalized
+  upstream). Fixed both physical-lookup sites to resolve via
+  `cfg.ResolveKernelIfName(physName)` — the same helper Server.GetInterfaces
+  uses (#3460) — before the netlink lookup, keeping the reth branch's
+  member resolution: pkg/cli/cli_show_interfaces.go showInterfaces (summary),
+  pkg/grpcapi/server_show_interfaces.go ShowInterfacesDetail. Also (#4341)
+  the CLI summary's readLinkSpeed/readLinkDuplex now read from the resolved
+  kernel name (a reth has no /sys/class/net/reth0, and a Junos-form physName
+  has no sysfs entry either) — the gRPC summary already read speed/duplex
+  from kernelLookup. Fixed the rethMemberLinkState doc comment to match the
+  impl (absent device → admin stays "up", only link "down"; the comment said
+  both "down"). Added portable RED-on-revert tests (pkg/cli + pkg/grpcapi)
+  that discover a real dash-named host interface, reference it via its
+  Junos-slash form, and assert the summary / RPC do NOT render "Not present"
+  (skip when no dash-named netdev exists); reverting the resolution to raw
+  physName reproduces "Not present". go build ./... clean; gofmt clean;
+  go test ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/... green. Merged
+  origin/master (#4331/#4334 etc.) cleanly into the branch first.
+- **File(s)**: pkg/cli/cli_show_interfaces.go,
+  pkg/grpcapi/server_show_interfaces.go,
+  pkg/cli/cli_show_interfaces_reth_4328_test.go,
+  pkg/grpcapi/server_show_interfaces_reth_4328_test.go
+
+## 2026-07-06 — #4328: teach all `show interfaces` text surfaces to resolve a bondless reth
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed operator-visibility bug where every operational
+  `show interfaces` variant EXCEPT `terse` failed to find a bondless reth
+  (no kernel netdev is named `reth0`). Root cause: `cfg.RethToPhysical()` /
+  the physical<->reth reverse map was built in EXACTLY ONE place — the terse
+  handler; every other path did a raw kernel-netdev lookup that could not
+  resolve a reth, so `show interfaces reth0` → "Not present",
+  `reth0 detail` → empty, `reth0 extensive` → "not found". Extracted the
+  terse map-building into a shared resolver `config.RethShowMaps` +
+  `LookupReth`/`LookupMember`/`RethShowUnits` (new `pkg/config/reth_show.go`,
+  dual-keyed Junos + kernel ifname). Taught the four text surfaces to
+  synthesize the reth aggregate over its local physical member (link
+  state/MAC from the member netdev, addresses/units from config) and to
+  annotate a physical member with its `aenet --> reth<N>.<unit>` aggregation:
+  CLI summary/detail/extensive (`pkg/cli/cli_show_interfaces.go`), the gRPC
+  `ShowInterfacesDetail` RPC + its ShowText detail/extensive twins
+  (`pkg/grpcapi/server_show_interfaces.go`,
+  `server_show_interfaces_text.go`). Refactored both terse handlers (CLI +
+  gRPC) to consume the same shared maps so they cannot drift again. Rendering
+  works when the member kernel device is absent (peer-owned member or a unit
+  test host) — mirrors terse's config-sourced addresses. Did NOT touch the
+  structured `GetInterfaces` RPC (#3460 fixed that surface separately). Added
+  RED-on-revert unit tests in pkg/cli + pkg/grpcapi (a 2-unit reth over member
+  ge-0/0/2); neutralizing `RethShowMaps` reproduces the exact issue symptoms
+  ("Not present"/"not found"/empty). Normal non-reth interface show verified
+  unchanged. `go build ./...` clean; gofmt clean;
+  `go test ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/...` green.
+- **File(s)**: pkg/config/reth_show.go (new),
+  pkg/cli/cli_show_interfaces.go, pkg/grpcapi/server_show_interfaces.go,
+  pkg/grpcapi/server_show_interfaces_text.go,
+  pkg/cli/cli_show_interfaces_reth_4328_test.go (new),
+  pkg/grpcapi/server_show_interfaces_reth_4328_test.go (new),
+  docs/junos-cli-reference.md
+## 2026-07-06 — #4336 + #4337: application vSRX drop-in parity (0-N port floor, unknown per-app alg)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed two OPEN vSRX drop-in blockers in application
+  definitions (fable-review-170 B-6/B-7).
+  - **#4336** — a `source-port`/`destination-port` `0-N` range was
+    hard-rejected (`invalid port 0: must be 1-65535`). Junos accepts 0 as
+    the range FLOOR (multi-term app defs split port space `0-N` /
+    `N+1-65535`, e.g. FaceTime `source-port 0-41640`). Fixed in
+    `resolveAppPort` (the single canonicalization chokepoint for BOTH
+    direct-match and inline-term ports): normalize a floor of 0 to 1. Port
+    0 never appears on the wire so `0-N` ≡ `1-N`; normalizing at this one
+    point keeps `validatePortSpec`, the `userspacePortSpecRepresentable`
+    #2124 gate, and Rust `parse_port_spec` all in agreement (the latter two
+    reject a raw 0 floor, so merely relaxing the validator would have
+    created a commit-succeeds / apply-fails split). A bare single port 0
+    stays invalid.
+  - **#4337** — an unknown per-application `alg <name>` (outside
+    dns/ftp/sip/tftp) was HARD-rejected at commit though the
+    per-application ALG is not carried to the dataplane at all (only the
+    global `alg_disable_flags` bitfield is on the wire), so xpf rejected an
+    ALG it does not even enforce. Relaxed the #3353 strict reject to an
+    accepted-but-inert advisory in `ValidateConfig`
+    (`application <a>: alg "<name>" accepted but not enforced …`, mirroring
+    the global #4232 advisory). Known names still commit silently;
+    enforcement deferred to the per-application ALG slice of #2008.
+  - RED-on-revert proven for both (Edit-revert, not git): #4336 → the exact
+    issue error `invalid port 0: must be 1-65535`; #4337 → re-instating the
+    strict reject fails the accept-with-advisory assertions. Full
+    `go test ./pkg/config/...` green, `go vet`, `go build ./...`, gofmt all
+    clean. No Rust/cargo change.
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_application_port_range_zero_4336_test.go,
+  pkg/config/compiler_application_term_alg_3352_3353_test.go,
+  pkg/config/parser_ast_test.go, docs/config-schema.md, _Log.md
+
 ## 2026-07-06 — #4282 part (a): lock CoS-submit owner TX accounting (tx_packets/tx_bytes)
 
 - **Timestamp**: 2026-07-06
@@ -36210,3 +36381,152 @@ top.
 - **File(s)**: pkg/config/compiler_validate_vrf_overlap.go,
   pkg/config/compiler_validate_vrf_overlap_2387_test.go, pkg/config/compiler.go,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+
+## 2026-07-06 — #4329 flat vSRX reth mis-resolves node identity on secondary
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix #4329 — a canonical vSRX chassis-cluster config (both
+  `ge-0/0/0` and `ge-7/0/0` carrying `redundant-parent reth0`, NO groups, NO
+  `chassis cluster node` leaf) silently mis-bound EVERY reth to the node-0
+  physical member on node 1 (wrong VIP placement, wrong HA-group interfaces).
+  Root cause: `Config.RethToPhysical()` scores members by
+  `SlotToNodeID(name) == Cluster.NodeID`, but `Cluster.NodeID` is populated
+  ONLY from the config leaf `chassis cluster node <id>` (guarded NodeIDSet).
+  The leaf-less flat vSRX form left `Cluster.NodeID` at its `0` default on BOTH
+  nodes, and `CompileConfigForNode(tree, nodeID)` used `nodeID` only for the
+  `${node}` group-expansion var, never the compiled cluster identity — so on
+  node 1 both members scored by the node-0 fallback and the alphabetical
+  tiebreak picked `ge-0/0/0` on both nodes. Fix: in
+  `compileConfigForNodeWithOpts` (pkg/config/compiler.go), after
+  `compileExpanded`, STAMP `cfg.Chassis.Cluster.NodeID = nodeID` guarded by
+  `nodeID >= 0 && cfg.Chassis.Cluster != nil && !cfg.Chassis.Cluster.NodeIDSet`.
+  Guard rationale: (1) `nodeID >= 0` — standalone compile routes through
+  `CompileConfig` (nodeID -1) and never reaches this path, so single-node
+  resolution is unchanged; (2) `Cluster != nil` — never fabricate a cluster
+  stanza, so a config-less HA node (node-id present, empty config — the
+  EMPTY-config takeover in pkg/daemon/daemon.go) keeps `Cluster == nil` and the
+  daemon's `haMode` / ~30 `Cluster != nil` gates do not flip on an empty
+  config (a real reth config always carries a `chassis cluster` stanza, so this
+  never suppresses a genuine fix); (3) `!NodeIDSet` — an explicit `chassis
+  cluster node <id>` leaf is the operator SSOT and must win, so the GROUPS form
+  (loss cluster: `groups node0/node1` each carry an explicit `node` leaf) is
+  bit-identical and `test-failover` is unaffected. RethToPhysical's alphabetical
+  tiebreak is left as-is: with the stamp the local member scores strictly higher
+  (2 vs 0), so the tiebreak is never reached for the 2-member case and never
+  decides between two nodes' members. RED-on-revert proven: reverting the stamp
+  makes node-1 bind `ge-0/0/0` (the exact bug); the explicit-leaf / groups /
+  standalone tests correctly stay GREEN on revert (not falsely coupled). Full
+  `go test ./pkg/config/...` + `./pkg/configstore/...` green, gofmt, go vet,
+  `go build ./...` all clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go,
+  docs/ha-cluster-test-plan.md, _Log.md
+
+## 2026-07-06 — #4329 fold: relocate NodeID stamp before fabric derivation
+
+- **Timestamp**: 2026-07-06
+- **Action**: Copilot review of PR #4331 found a REAL incompleteness in the
+  first stamp placement. The stamp ran in `compileConfigForNodeWithOpts` AFTER
+  `compileExpanded` returned, but `compileExpanded` ALREADY derives two
+  NodeID-dependent COMPILE-TIME fabric fields under the stale default NodeID=0
+  (compiler.go fabric fixup, `SlotToNodeID(member) == cc.NodeID`):
+  `InterfaceConfig.LocalFabricMember` (which fab member is local to this node)
+  and the auto-detected `Cluster.FabricInterface` / `Fabric1Interface`. So the
+  first fix corrected reth resolution (RethToPhysical reads NodeID at runtime,
+  after the stamp) but left the fabric fields WRONG on node 1 for a leaf-less
+  flat config — the same class of bug, still present for fabric. Fix: thread
+  the node identity into `compileExpanded` via two new `compileOpts` fields
+  (`nodeAware bool`, `stampNodeID int`), set only by the node-aware entry
+  `compileConfigForNodeWithOpts`, and MOVE the stamp INSIDE `compileExpanded`
+  to run immediately after the top-level child loop (Cluster + interfaces
+  populated) and BEFORE every NodeID-dependent derivation: the fabric fixup
+  AND `validateDeviceMapStrict` (compiler.go, called later, also reads
+  cc.NodeID). Same three guards preserved:
+  `opts.nodeAware && opts.stampNodeID >= 0 && Cluster != nil && !NodeIDSet`
+  (standalone `CompileConfig` leaves nodeAware false → unchanged; never
+  fabricate Cluster → daemon.go EMPTY-config haMode reasoning holds; explicit
+  `chassis cluster node` leaf wins → GROUPS form bit-identical). RethToPhysical
+  and its alphabetical tiebreak are still unchanged (stamp now sets NodeID
+  during compile, so the runtime read still sees the correct value). Added
+  fabric regression test (canonical vSRX fab0=FPC-0 member / fab1=FPC-7 member,
+  NO node leaf): node 0 → fab0.LocalFabricMember=ge-0/0/1 + FabricInterface
+  fab0; node 1 → fab1.LocalFabricMember=ge-7/0/1 + FabricInterface fab1. RED on
+  revert PROVEN for BOTH reth (node 1 → ge-0/0/0) and fabric (node 1 fab1
+  LocalFabricMember empty, FabricInterface picks fab0); the reth/fabric GROUPS
+  forms + explicit-leaf + standalone tests correctly stay GREEN on revert (not
+  falsely coupled). GROUPS form confirmed unaffected (loss cluster carries an
+  explicit `node` leaf per group → NodeIDSet true → stamp skipped → no
+  test-failover impact). Full `go test ./pkg/config/...` +
+  `./pkg/configstore/...` green, gofmt, go vet, `go build ./...` clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4313 PR-A — land the per-subtree closed-world validation
+  MECHANISM in the schema walker (mechanism only; no production subtree
+  flipped). The config schema is opt-in at the KEYWORD level: when
+  walkSchemaNode resolves a keyword to a nil schema child it returns nil
+  and the unmodeled leaf commits clean, then is silently dropped (the
+  compiler has no case for it either). A BLANKET closed-world flip is
+  infeasible — it breaks the deliberately-lenient accept-with-advisory
+  paths (#1960/#3307/#3318, #2078/#4231) and false-rejects
+  valid-but-not-yet-modeled Junos (#4191 strand-preflight class). PR-A
+  adds an additive `closedWorld bool` to schemaNode (schema.go): default
+  false = byte-identical legacy behaviour; true rejects an unmodeled child
+  keyword under that subtree at strict commit. The walker now threads a
+  `closed` param down walkSchemaChildren / walkSchemaNode /
+  walkInstanceChildren; the top-level call passes closed=false, and each
+  container descent folds in the node's flag
+  (childClosed := closed || childSchema.closedWorld), so the flag inherits
+  to every descendant level. The ONE behavioural branch is at the
+  keyword-resolution gate (childSchema == nil): closed=true → typedLeafErrorf
+  reject mirroring the modifier-level unknown-keyword rejects; closed=false
+  (every production subtree today) → return nil, unchanged. NO production
+  schemaNode sets closedWorld — the mechanism is dormant, so every existing
+  config validates identically (zero false-reject risk). The per-subtree
+  production flips (security ipsec / security nat then / snmp community /
+  protocols {ospf,bgp} interface / interfaces family) are deferred PR-B..N,
+  each gated on a Junos-leaf completeness audit for that subtree; #4313
+  stays open for them. White-box tested with a SYNTHETIC closedWorld
+  subtree (schema_walk_internal_test.go, TestClosedWorld_*): unmodeled →
+  rejected under closed / silently accepted under open (RED-on-revert
+  discriminator proven by disabling the gate: the two rejection tests fail,
+  the open/modeled tests stay green); modeled → accepted; closed-world
+  inherits to descendants. Full pkg/config suite (-count=1), gofmt, vet,
+  go build ./... all clean.
+- **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go,
+  pkg/config/schema_walk_internal_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix two vSRX drop-in blockers (#4338 filter 0/0+except
+  over-strict, #4339 NPTv6 self-overlap). #4338: relaxed the #3359
+  firewall-filter positive-vs-except ADDRESS mutual-exclusion gate
+  (validateFilterAddressExceptStrict) so a MATCH-ANY positive
+  (`source-address 0.0.0.0/0` / `::/0` / `any`) combined with an
+  `except` prefix-list is ACCEPTED — it composes to "any address NOT in
+  X" (the canonical Junos lockdown idiom). A SPECIFIC positive literal
+  (10.0.0.0/8) or a positive prefix-list + except stays rejected (no
+  faithful single-term representation). Fixed the reject wording that
+  falsely claimed "Junos rejects this". The runtime lowering
+  (ResolveFilterPrefixListAddrs, addrsAllMatchAny) now DROPS the
+  redundant match-any universe and emits the term as except=true over X
+  — without this the term folded positive-wins (0/0 wins → match ALL,
+  fail-OPEN). #4339: validateNPTv6Strict now SKIPS comparing a rule
+  against itself. A single NPTv6 rule bound to >1 from-scope
+  (`from zone A; from zone B`) is scope-expanded by compileNATStatic
+  into one StaticNATRuleSet entry per scope (shared rule-set + rule
+  name); the shared seen-lists made the second expansion match the
+  first exactly → "rule map-v6-neutral overlaps rule-set NPTv6-INBOUND
+  rule map-v6-neutral" (overlaps itself). Skip the same (rule-set,rule)
+  identity; genuine overlaps between DISTINCT rules still detected.
+  RED-on-revert proven for all three: config accept (#4338), runtime
+  compose (#4338), NPTv6 multi-scope commit (#4339). Full pkg/config +
+  pkg/dataplane suites, gofmt, vet, go build ./... clean.
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/dataplane/userspace/filters.go,
+  pkg/config/firewall_address_except_matchany_4338_test.go,
+  pkg/config/compiler_nptv6_self_overlap_4339_test.go,
+  pkg/config/firewall_address_except_mutex_3359_test.go,
+  pkg/dataplane/userspace/filters_address_matchany_except_4338_test.go,
+  docs/feature-coverage.md, _Log.md

@@ -4040,26 +4040,20 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 					"with its value, widening the term to match more than intended)",
 				name, app.UnknownTermLeaves[0])
 		}
-		// #3353: a per-application `alg` name that is not one xpf supports. The
-		// `alg` leaf is a raw string with no schema validator, so a typo
-		// (`alg ftpp`) committed cleanly and the operator believed an ALG was
-		// pinned when none existed (a silent no-op on a security knob). Validate
-		// it against supportedApplicationALGs — the same DNS/FTP/SIP/TFTP set the
-		// global `security alg` control exposes. This is VALIDATION only: the
-		// per-application ALG is still not carried to the userspace dataplane
-		// (the wire has only the global alg_disable_flags bitfield), so a valid
-		// `alg` name remains informational until the enforcement half lands. That
-		// dataplane half is a genuine fork (new snapshot field + Rust) tracked as
-		// the per-application slice of #2008.
-		if app.ALG != "" && !validApplicationALG(app.ALG) {
-			return fmt.Errorf(
-				"application %q: unknown alg %q; supported application ALGs are "+
-					"dns/ftp/sip/tftp (the same set the global `security alg` control "+
-					"exposes). NOTE: a per-application alg is validated at commit but "+
-					"is not yet enforced by the userspace dataplane — enforcement is "+
-					"deferred to the per-application ALG slice of #2008",
-				name, app.ALG)
-		}
+		// #4337: a per-application `alg <name>` outside the four xpf implements
+		// (dns/ftp/sip/tftp) is NO LONGER hard-rejected here. The #3353 commit
+		// reject is deliberately relaxed to an accepted-but-inert advisory
+		// (ValidateConfig, compiler_validate_warn.go). Rationale: the
+		// per-application ALG is NOT carried into the userspace dataplane
+		// snapshot (the only ALG signal on the wire is the GLOBAL
+		// alg_disable_flags bitfield), so even a KNOWN name is informational
+		// today — rejecting an UNKNOWN one blocked real vSRX drop-in configs
+		// that tag applications with ALGs xpf does not implement (e.g.
+		// `alg ssh`) for a knob with no functional effect. The unknown name now
+		// commits with an advisory naming the unenforced alg so a typo is still
+		// surfaced; a KNOWN name commits silently, keeping its (informational)
+		// behavior. Enforcement of the per-application ALG is deferred to the
+		// per-application slice of #2008.
 	}
 	// #3890: an unrecognized member statement inside an opaque application-set
 	// body. The schema declares `application-set` as an args:1 leaf
@@ -4769,16 +4763,29 @@ func validateFilterPortExceptStrict(cfg *Config) error {
 }
 
 // validateFilterAddressExceptStrict hard-rejects any firewall-filter term that
-// mixes a POSITIVE address match (a literal `source-address`/`destination-address`
-// OR a non-except `source-prefix-list`/`destination-prefix-list`) with an
-// `except` prefix-list in the SAME direction — #3359.
+// mixes a SPECIFIC positive address match (a non-match-any literal
+// `source-address`/`destination-address` OR a non-except
+// `source-prefix-list`/`destination-prefix-list`) with an `except` prefix-list
+// in the SAME direction — #3359, relaxed for the match-any case in #4338.
 //
-// Junos treats a positive address match and an `except` prefix-list as mutually
-// exclusive in one term and rejects the combination at commit. xpf's parser,
-// however, lands literal addresses on term.SourceAddresses / term.DestAddresses
-// and prefix-list references (positive AND except) on term.SourcePrefixLists /
+// The mixed SPECIFIC-positive + except shape has no faithful single-term
+// representation in xpf's boolean-inversion matcher (one direction would need
+// both a positive set AND a negated set), so it is rejected. xpf's parser lands
+// literal addresses on term.SourceAddresses / term.DestAddresses and prefix-list
+// references (positive AND except) on term.SourcePrefixLists /
 // term.DestPrefixLists (compileFilterFrom), so a positive set and an except set
 // can coexist on one direction of one term.
+//
+// #4338 (match-any composes): the canonical Junos lockdown idiom `from {
+// source-address 0.0.0.0/0; source-prefix-list mgmt except; }` (match any source
+// EXCEPT the management prefixes, then reject) is ACCEPTED by Junos and is NOT
+// rejected here. A match-any positive (`0.0.0.0/0` / `::/0` / `any`) does not
+// constrain the positive set, so `any AND NOT X` reduces exactly to the
+// sole-`except` representation ("any address not in X"). The runtime lowering
+// (ResolveFilterPrefixListAddrs) drops the redundant match-any universe and
+// emits the term as `except=true` over X, so the compiled semantics match the
+// operator's intent. Pre-#4338 this idiom was rejected with an error that
+// wrongly claimed "Junos rejects this" (false for the 0/0+except shape).
 //
 // The userspace lowering (pkg/dataplane/userspace/filters.go
 // resolvePrefixListAddrs) has no single boolean-inversion representation for the
@@ -4823,6 +4830,36 @@ func validateFilterAddressExceptStrict(cfg *Config) error {
 		}
 		return false
 	}
+	// hasSpecificAddr reports whether the literal address list carries a
+	// CONSTRAINING positive match — i.e. any literal that is NOT the match-any
+	// universe. A match-any literal (`0.0.0.0/0`, `::/0`, or the `any` / empty
+	// placeholder) does NOT constrain the positive set, so it COMPOSES with an
+	// `except` prefix-list rather than conflicting with it (#4338): the term
+	// `source-address 0.0.0.0/0; source-prefix-list X except;` is the canonical
+	// Junos "match any EXCEPT the listed prefixes" lockdown idiom, which lowers
+	// cleanly to the sole-`except` representation (the universe AND-NOT X = "any
+	// address not in X"). Only a SPECIFIC positive literal (e.g. 10.0.0.0/8)
+	// alongside an except list is a genuine conflict — it would require both a
+	// positive set and a negated set in one direction, which the boolean-
+	// inversion matcher cannot represent, so that shape stays rejected.
+	hasSpecificAddr := func(addrs []string) bool {
+		for _, a := range addrs {
+			if a == "" || a == "any" {
+				continue
+			}
+			_, ipnet, err := net.ParseCIDR(a)
+			if err != nil {
+				// Not a parseable CIDR — a malformed literal is caught by
+				// validateFilterAddressLiteralsStrict; treat it as specific
+				// (constraining) here so this gate never masks it.
+				return true
+			}
+			if ones, _ := ipnet.Mask.Size(); ones != 0 {
+				return true
+			}
+		}
+		return false
+	}
 	check := func(family string, filters map[string]*FirewallFilter) error {
 		names := make([]string, 0, len(filters))
 		for name := range filters {
@@ -4838,28 +4875,35 @@ func validateFilterAddressExceptStrict(cfg *Config) error {
 				if term == nil {
 					continue
 				}
-				srcPositive := len(term.SourceAddresses) > 0 || hasPositiveRef(term.SourcePrefixLists)
+				srcPositive := hasSpecificAddr(term.SourceAddresses) || hasPositiveRef(term.SourcePrefixLists)
 				if srcPositive && hasExcept(term.SourcePrefixLists) {
 					return fmt.Errorf(
-						"firewall family %s filter %q term %q: a positive source "+
-							"address match (`from source-address` or a non-except "+
-							"`from source-prefix-list`) and an `except` "+
-							"source-prefix-list are mutually exclusive in the same "+
-							"term (Junos rejects this; split into separate terms — the "+
-							"mixed shape cannot be enforced faithfully and would "+
-							"fail open for discard/reject)",
+						"firewall family %s filter %q term %q: a SPECIFIC positive "+
+							"source address match (a non-match-any `from source-address` "+
+							"or a non-except `from source-prefix-list`) and an `except` "+
+							"source-prefix-list have no faithful single-term "+
+							"representation in xpf (the direction would need both a "+
+							"positive and a negated set) and would fail open for "+
+							"discard/reject; split into separate terms. A match-any "+
+							"`from source-address 0.0.0.0/0`/`::/0` combined with an "+
+							"`except` source-prefix-list IS accepted — it composes to "+
+							"\"any source except the listed prefixes\"",
 						family, name, term.Name)
 				}
-				dstPositive := len(term.DestAddresses) > 0 || hasPositiveRef(term.DestPrefixLists)
+				dstPositive := hasSpecificAddr(term.DestAddresses) || hasPositiveRef(term.DestPrefixLists)
 				if dstPositive && hasExcept(term.DestPrefixLists) {
 					return fmt.Errorf(
-						"firewall family %s filter %q term %q: a positive destination "+
-							"address match (`from destination-address` or a non-except "+
-							"`from destination-prefix-list`) and an `except` "+
-							"destination-prefix-list are mutually exclusive in the same "+
-							"term (Junos rejects this; split into separate terms — the "+
-							"mixed shape cannot be enforced faithfully and would "+
-							"fail open for discard/reject)",
+						"firewall family %s filter %q term %q: a SPECIFIC positive "+
+							"destination address match (a non-match-any `from "+
+							"destination-address` or a non-except `from "+
+							"destination-prefix-list`) and an `except` "+
+							"destination-prefix-list have no faithful single-term "+
+							"representation in xpf (the direction would need both a "+
+							"positive and a negated set) and would fail open for "+
+							"discard/reject; split into separate terms. A match-any "+
+							"`from destination-address 0.0.0.0/0`/`::/0` combined with "+
+							"an `except` destination-prefix-list IS accepted — it "+
+							"composes to \"any destination except the listed prefixes\"",
 						family, name, term.Name)
 				}
 			}
@@ -6731,25 +6775,44 @@ func validateHostInboundStanzaStrict(zone, ifName string, hib *HostInboundTraffi
 	return nil
 }
 
-// validateAddressBookEntryNamesStrict (#3061) hard-rejects a `/` character in
-// any address-book entry NAME — a global `address`/`address-set` name, a
-// zone-local `address`/`address-set` name — or any security-zone NAME. Junos
-// object-naming rules disallow `/` in such identifiers, but the xpf lexer
-// permits `/` in an identifier token (it is needed for IP-literal values like
-// 10.0.0.0/24), and no other validator rejected it.
+// validateAddressBookEntryNamesStrict (#3061, relaxed in #4340) enforces the
+// two naming invariants the zone-local address-book fold
+// (resolveZoneLocalAddressBooks) depends on, while otherwise PERMITTING the
+// prefix-in-name convention every real vSRX config uses: an address object is
+// almost universally named after its prefix — net_10.0.0.0/8,
+// net4_sfmix_72.52.96.201/32, net_2001:559:8585:200::/64. The `/` in such a
+// name is only a display identifier, never a structural token; the whole
+// downstream resolution path (policyMatchNamedAddressRefs,
+// resolveUserspaceAddressBookEntry, the wire snapshot) keys address objects by
+// the FULL name string via direct map lookups, so a `/` in the name resolves
+// correctly end to end.
 //
-// This is load-bearing for the zone-local address-book fold
-// (resolveZoneLocalAddressBooks): the fold mints synthetic global names of the
-// form zone-local/<zone>/<name>. If an operator could type a name containing
-// `/` (e.g. a global address literally named zone-local/trust/web-server),
-// that name could collide with a synthetic name and be silently clobbered by
-// the fold — wrong policy address resolution with no commit error. Rejecting
-// `/` in every operator-typed name makes the synthetic `zone-local/...`
-// namespace collision-proof.
+// The fold mints synthetic global names of the form zone-local/<zone>/<name>.
+// Only two invariants keep that namespace collision-proof and unambiguously
+// reversible (ZoneLocalUnqualify) — and neither needs a blanket `/` ban:
+//
+//  1. No operator-typed address-book ENTRY name (global or zone-local
+//     address / address-set) may begin with the reserved "zone-local/"
+//     prefix. If it could, a global address literally named
+//     zone-local/trust/web-server would collide with the synthetic name the
+//     fold mints for a zone-local `web-server` in zone trust, and the fold's
+//     no-clobber guard would silently drop the zone-local entry (wrong
+//     address resolution, no commit error — the #3061 hazard). Reserving only
+//     this PREFIX, not every `/`, lets `/` appear freely elsewhere in a name.
+//
+//  2. No security-zone NAME may contain `/`. The zone is the FIRST segment
+//     after the reserved prefix, and ZoneLocalUnqualify splits zone from name
+//     on the first `/`; a `/`-free zone keeps that split unambiguous even
+//     when the address NAME that follows contains `/`
+//     (zone-local/trust/net_10.0.0.0/8 unqualifies to zone=trust,
+//     name=net_10.0.0.0/8 because strings.Cut stops at the first `/`). Zones
+//     never carry a prefix-in-name convention, so this costs nothing real.
 //
 // IMPORTANT: only the NAME token is checked, never an address VALUE/prefix —
-// `address web-server 10.0.0.0/24` is fine (the name is web-server; the
-// 10.0.0.0/24 prefix is the value, not validated here).
+// `address web-server 10.0.0.0/24` has always been fine (the name is
+// web-server; the 10.0.0.0/24 prefix is the value). After #4340
+// `address net_10.0.0.0/8 10.0.0.0/8` is ALSO fine: the `/` in the NAME is
+// permitted, matching the prefix-in-name convention.
 //
 // MUST run on the PRISTINE global book, i.e. BEFORE resolveZoneLocalAddressBooks
 // injects the `/`-bearing synthetic names; the caller enforces that ordering.
@@ -6757,12 +6820,26 @@ func validateAddressBookEntryNamesStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
-	checkName := func(kind, name string) error {
+	// checkEntryName reserves ONLY the synthetic zone-local/ prefix on an
+	// operator-typed address-book entry name (#4340); any other `/` is allowed.
+	checkEntryName := func(kind, name string) error {
+		if strings.HasPrefix(name, zoneLocalNamePrefix) {
+			return fmt.Errorf(
+				"%s name %q must not begin with the reserved %q prefix; that "+
+					"namespace is reserved for the internal zone-local "+
+					"address book — rename the object", kind, name, zoneLocalNamePrefix)
+		}
+		return nil
+	}
+	// checkZoneName keeps the full `/` ban on a security-zone name: the zone is
+	// the unambiguous first segment of the synthetic zone-local/<zone>/<name>
+	// key, so it must stay `/`-free.
+	checkZoneName := func(name string) error {
 		if strings.Contains(name, "/") {
 			return fmt.Errorf(
-				"%s name %q must not contain '/'; '/' is reserved for "+
-					"address prefixes and for the internal zone-local "+
-					"address-book namespace — rename the object", kind, name)
+				"security-zone name %q must not contain '/'; '/' is reserved "+
+					"for the internal zone-local address-book namespace — "+
+					"rename the zone", name)
 		}
 		return nil
 	}
@@ -6779,7 +6856,7 @@ func validateAddressBookEntryNamesStrict(cfg *Config) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			if err := checkName(kind, n); err != nil {
+			if err := checkEntryName(kind, n); err != nil {
 				return err
 			}
 		}
@@ -6796,7 +6873,7 @@ func validateAddressBookEntryNamesStrict(cfg *Config) error {
 	}
 	sort.Strings(zoneNames)
 	for _, z := range zoneNames {
-		if err := checkName("security-zone", z); err != nil {
+		if err := checkZoneName(z); err != nil {
 			return err
 		}
 		zone := cfg.Security.Zones[z]

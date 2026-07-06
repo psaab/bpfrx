@@ -616,6 +616,65 @@ not read it, so the value is currently unsupported and discarded — an arity
 gate there would assert validation on a no-op feature (tag it only if/when
 `AddressSet.Description` is wired).
 
+## Per-subtree closed-world keyword validation (#4313)
+
+The scalar-arity gate (#3332, above) is a token-level fix: it catches an
+extra token trailing a MODELED leaf. It does not touch the deeper default of
+the whole schema — **the config schema is OPT-IN at the KEYWORD level**. When
+the generic walker (`walkSchemaNode`, `schema_walk.go`) resolves a keyword and
+finds no schema child (`resolveSchemaChild` returns nil, no exact child and no
+wildcard), it returns nil and moves on — an unmodeled keyword is not the gate's
+concern, reporting is left to the compiler. But the compiler has no schema case
+for a keyword the schema does not model either, so such a leaf commits clean
+and is then silently DROPPED. The parity campaigns have repeatedly closed one
+of these per subtree (each "silently dropped … added a schema child + compiler
+case" entry in the changelog below), but the *default* remained silent-accept.
+
+A **blanket** flip of that default is infeasible: several subtrees are
+deliberately lenient — they accept-with-advisory rather than reject, so that a
+not-yet-modeled or peer-only Junos knob survives a load / sync instead of
+failing the whole snapshot (#1960/#3307/#3318 lenient-warn; the #2078/#4231
+accept-with-advisory knobs). Rejecting every unmodeled keyword tree-wide would
+break those on purpose-lenient paths and false-reject valid-but-not-yet-modeled
+Junos configs (the #4191 strand-preflight false-reject class).
+
+The remedy is therefore a **per-subtree closed-world flag**, landed as a
+dormant MECHANISM in PR-A:
+
+- `schemaNode.closedWorld bool` (`schema.go`). Default false = today's opt-in,
+  silent-accept behaviour. When true on a container node, an unmodeled child
+  keyword anywhere under that subtree is REJECTED at strict commit instead of
+  silently dropped.
+- The walker threads a `closed` parameter (`walkSchemaChildren` /
+  `walkSchemaNode` / `walkInstanceChildren`). The top-level call passes
+  `closed=false`; descending into a resolved container folds in that node's
+  flag (`childClosed := closed || childSchema.closedWorld`), so once a subtree
+  opts in, every level below it inherits closed-world enforcement.
+- The single behavioural branch is at the keyword-resolution gate: when
+  `closed` is true AND the keyword is unmodeled (`childSchema == nil`), the
+  walker returns a `typedLeafErrorf` reject ("unknown configuration keyword
+  … under closed-world subtree"), mirroring the existing modifier-level
+  unknown-keyword rejects. When `closed` is false — the state for EVERY
+  production subtree today — behaviour is byte-identical to pre-#4313
+  (return nil, silent-accept).
+
+**No production subtree sets `closedWorld` in PR-A.** The mechanism is dormant:
+every existing config validates identically, so PR-A carries zero false-reject
+risk. It is white-box tested with a SYNTHETIC subtree
+(`schema_walk_internal_test.go`, `TestClosedWorld_*`): an unmodeled keyword
+under a `closedWorld:true` node is rejected; the same shape under a default
+(open-world) node is still silently accepted; a modeled keyword under the
+closed node passes; and closed-world inherits into modeled descendant
+containers.
+
+**Deferred, per-subtree flips (PR-B..N).** Turning `closedWorld` on for a real
+subtree (candidates: `security ipsec`, `security nat … then`, `snmp community`,
+`protocols {ospf,bgp} interface`, `interfaces … family`) is only safe once that
+subtree is LEAF-COMPLETE — every valid Junos keyword under it is modeled —
+otherwise the flip false-rejects a valid config. Each flip is its own follow-up
+gated on a Junos-leaf completeness audit for that subtree, tracked on #4313. Do
+NOT set `closedWorld` on a subtree without that audit.
+
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 
 `from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above
@@ -3255,18 +3314,37 @@ zone-locally to that qualified name. A token NOT defined in the policy's zone
 book is left unchanged so it resolves against the global book; when a name
 exists in BOTH, the zone-local value WINS.
 
-**Collision-proof synthetic namespace:** the lexer permits `/` in an identifier
-token (it is needed for IP-literal VALUES like `10.0.0.0/24`), so without a
-guard an operator could name a global address `zone-local/trust/web-server` and
-have it silently clobbered by the fold. `validateAddressBookEntryNamesStrict`
-(run BEFORE the fold, on the pristine global book) hard-rejects `/` in any
-address-book entry NAME (global or zone-local `address`/`address-set`) and any
-security-zone NAME at commit — matching Junos object-naming rules — so no
-operator name can contain `/` and none can equal a synthetic `zone-local/...`
-name. Only the NAME is checked, never the address VALUE/prefix. Strict on
-commit / commit-check; the tolerant load / peer-sync path (`lenientAddressBookNames`)
-downgrades to a warning (#1960 no-brick), backstopped by the fold's
-no-clobber guard (it skips a global-book key that already exists).
+**Collision-proof synthetic namespace (#3061, narrowed in #4340):** real vSRX
+configs almost universally name an address object after its prefix —
+`net_10.0.0.0/8`, `net4_sfmix_72.52.96.201/32`, `net_2001:559:8585:200::/64` —
+so the NAME legitimately contains `/` (the lexer already permits `/` in an
+identifier, needed for the CIDR VALUE too). `/` in a name is a display
+identifier, never a structural token: the whole downstream resolution path
+(`policyMatchNamedAddressRefs`, `resolveUserspaceAddressBookEntry`,
+`classifyPolicyAddresses`, the wire snapshot) keys objects by the FULL name via
+direct map lookups, so a `/`-bearing name resolves correctly end to end.
+`validateAddressBookEntryNamesStrict` (run BEFORE the fold, on the pristine
+global book) therefore enforces only the two invariants the synthetic
+`zone-local/<zone>/<name>` key actually needs:
+
+1. **No operator entry name may begin with the reserved `zone-local/` prefix**
+   (global or zone-local `address`/`address-set`). Otherwise a global address
+   named `zone-local/trust/web-server` would collide with the synthetic name
+   the fold mints for a zone-local `web-server` in zone `trust`, and the fold's
+   no-clobber guard would silently drop the zone-local entry. Reserving only
+   the PREFIX — not every `/` — keeps `/` free elsewhere in a name.
+2. **No security-zone NAME may contain `/`.** The zone is the `/`-free first
+   segment after the prefix; `ZoneLocalUnqualify` splits zone from name on the
+   FIRST `/`, so a `/`-free zone keeps the split unambiguous even when the
+   address name that follows contains `/` (`zone-local/trust/net_10.0.0.0/8`
+   → zone `trust`, name `net_10.0.0.0/8`). Zones never carry a prefix-in-name
+   convention, so this costs nothing real.
+
+Only the NAME is checked, never the address VALUE/prefix. Strict on commit /
+commit-check; the tolerant load / peer-sync path (`lenientAddressBookNames`)
+downgrades the reserved-prefix / zone-slash reject to a warning (#1960
+no-brick), backstopped by the fold's no-clobber guard (it skips a global-book
+key that already exists).
 
 After this pass the whole downstream resolution path
 (wire snapshot, `nameToID`, `classifyPolicyAddresses`, the strict/warn
@@ -3283,11 +3361,17 @@ scoped to security-policy match addresses. Regression coverage:
 (`TestZoneLocalAddressBookResolves` — fail-on-revert resolution guard,
 `TestZoneLocalAddressBookScoping` — precedence + cross-zone isolation) and
 `pkg/config/addressbook_name_slash_3061_test.go`
-(`TestAddressBookGlobalNameSlashRejected`,
-`TestAddressBookZoneLocalNameSlashRejected`,
+(`TestAddressBookReservedPrefixNameRejected`,
+`TestAddressBookZoneLocalReservedPrefixRejected`,
 `TestSecurityZoneNameSlashRejected` — collision-safety fail-on-revert guards,
 `TestAddressBookNameSlashNormalConfigUnaffected` — prefix-value anti-over-reject,
-`TestAddressBookNameSlashLenientDowngrades` — tolerant-path warning).
+`TestAddressBookReservedPrefixLenientDowngrades` — tolerant-path warning) and
+`pkg/config/addressbook_name_slash_4340_test.go`
+(`TestAddressBookSlashNameCommits` — prefix-named objects commit + resolve,
+`TestAddressBookSlashNameZoneLocalFoldRoundTrips` — fold + unqualify round-trip
+of a `/`-bearing zone-local name) plus
+`pkg/dataplane/userspace/addressbook_slash_name_4340_test.go`
+(`TestPolicySlashNameResolvesToPrefix` — end-to-end dataplane resolution).
 
 **Operator display (#3358).** The synthetic `zone-local/<zone>/<name>` key is an
 INTERNAL identity, never an operator-facing string. The display surfaces that
@@ -4314,55 +4398,82 @@ gaps lived under that opacity:
   commit. A custom application term accepts only `protocol` / `source-port` /
   `destination-port` / `inactivity-timeout` / `timeout` / `icmp-type` /
   `icmp-code` / `alg`.
-- **#3353 — unsupported per-application `alg`.** The `alg` leaf was a raw
-  `args:1` string with no validator, so a typo (`alg ftpp`) committed cleanly
-  and the operator believed an ALG was pinned when none existed (a silent no-op
-  on a security knob). `validateApplicationSpecsStrict` now validates the name
-  against `supportedApplicationALGs` (`compiler_applications.go`) — the SSOT
-  set `dns`/`ftp`/`sip`/`tftp`, MIRRORING the global `security alg <proto>`
-  control (`algDisableFlags`, `pkg/dataplane/userspace/flow.go`). The same gate
-  covers the top-level `app.ALG` and the inline-term `alg` (the term app carries
-  it). The match is case-insensitive.
+- **#3353 → #4337 — per-application `alg` accept-with-advisory (relaxed from a
+  hard reject).** The `alg` leaf was a raw `args:1` string with no validator, so
+  a typo (`alg ftpp`) committed cleanly and the operator believed an ALG was
+  pinned when none existed. #3353 first made an unsupported name (outside the
+  SSOT set `dns`/`ftp`/`sip`/`tftp`) a hard commit error. **#4337 relaxes that
+  to an accepted-but-inert advisory**: a per-application ALG is NOT carried into
+  the userspace dataplane snapshot at all (the only ALG signal on the wire is
+  the *global* `alg_disable_flags` bitfield, `userspace-dp` `snapshot.rs`), so
+  even a KNOWN name is informational today — hard-rejecting an UNKNOWN one
+  blocked real vSRX drop-in configs that tag applications with ALGs xpf does not
+  implement (e.g. `alg ssh`) for a knob with no functional effect. The unknown
+  name now commits, and `ValidateConfig` (`compiler_validate_warn.go`) emits an
+  advisory naming the unenforced alg — `application <a>: alg "<name>" accepted
+  but not enforced …` — mirroring the global `security alg` accepted-but-inert
+  advisory (#4232). A KNOWN name (case-insensitive, via
+  `supportedApplicationALGs` in `compiler_applications.go`) commits silently and
+  keeps its (informational) behavior. This covers both the top-level `app.ALG`
+  and the inline-term `alg` (the term app carries it).
 
-  **#3353 is VALIDATION only — enforcement is deferred.** A per-application ALG
-  is recorded on `Application.ALG` but is NOT carried into the userspace
-  dataplane snapshot: the only ALG signal on the wire is the *global*
-  `alg_disable_flags` bitfield (`userspace-dp` `snapshot.rs`), with no
-  per-application ALG / custom-port pin. Wiring per-application ALG (e.g. `alg
-  ftp destination-port 2121`) through to enforcement needs a new snapshot field
-  plus Rust session-metadata handling — a genuine dataplane fork that is the
+  **Enforcement remains deferred.** Wiring per-application ALG (e.g. `alg ftp
+  destination-port 2121`) through to enforcement needs a new snapshot field plus
+  Rust session-metadata handling — a genuine dataplane fork that is the
   per-application slice of the broader ALG parity tracked under **#2008**, and
-  is deliberately not built here. Until then this gate makes an unsupported
-  name an operator-visible commit error instead of a silent no-op.
+  is deliberately not built here.
 
-**Scope — ALL user-defined applications, referenced or not.** These two checks
-live in a SEPARATE pass, `validateApplicationSyntaxStrict`, that iterates every
-entry in `cfg.Applications.Applications`, NOT the reference-scoped
+**Scope — ALL user-defined applications, referenced or not.** The unknown
+term-leaf hard reject (#3352) lives in a SEPARATE pass,
+`validateApplicationSyntaxStrict`, that iterates every entry in
+`cfg.Applications.Applications`, NOT the reference-scoped
 `applicationsToValidateStrict` subset that `validateApplicationSpecsStrict` uses
 for its port / protocol / icmp / timeout checks. The reference scope is correct
 for those SEMANTIC checks (an unreferenced malformed-port app cannot break a
 live policy decision, so it stays a warning so an operator iterating on a
 not-yet-wired application library is not blocked). But an unknown term statement
-and an unsupported `alg` are SYNTACTIC / enum violations — the config names a
-statement or an ALG that does not exist — which Junos rejects at commit
-regardless of policy wiring; deferring them until reference would let a typo'd
-term-leaf silently widen a term, or a bogus `alg` silently no-op, from the
-moment the app is defined. `cfg.Applications.Applications` holds ONLY
-user-defined applications (and the per-term apps they generate); PREDEFINED
-junos-* apps (`junos-rtsp`, `junos-h323`, ...) live in the separate
-`PredefinedApplications` table and are never in this map, so the `alg` check
-never false-rejects a predefined app that legitimately carries an
-out-of-supported-set ALG.
+is a SYNTACTIC violation — the config names a statement that does not exist —
+which Junos rejects at commit regardless of policy wiring; deferring it until
+reference would let a typo'd term-leaf silently widen a term from the moment the
+app is defined. The per-application `alg` advisory (#4337) likewise applies to
+every entry (`ValidateConfig` iterates all user apps). `cfg.Applications.
+Applications` holds ONLY user-defined applications (and the per-term apps they
+generate); PREDEFINED junos-* apps (`junos-rtsp`, `junos-h323`, ...) live in the
+separate `PredefinedApplications` table and are never in this map, so neither
+the term-leaf gate nor the `alg` advisory ever touches a predefined app that
+legitimately carries an out-of-supported-set ALG.
 
-Both checks are STRICT on the commit / commit-check path and downgrade to a
-`cfg.Warnings` entry on the tolerant load / HA peer-sync path
+The #3352 term-leaf gate is STRICT on the commit / commit-check path and
+downgrades to a `cfg.Warnings` entry on the tolerant load / HA peer-sync path
 (`lenientApplicationSpecs`, #1960 no-brick), the same discipline as the #3320 /
-#3348 application gates. Regression coverage:
+#3348 application gates; the #4337 alg check is always an advisory (never a
+commit error). Regression coverage:
 `pkg/config/compiler_application_term_alg_3352_3353_test.go` (unknown term leaf
 rejected referenced AND unreferenced, well-formed term keeps its port
-constraint, unknown alg rejected top-level + inline-term + unreferenced,
-supported alg names accepted on both paths, predefined-app reference not
-rejected).
+constraint, unknown alg accepted-with-advisory top-level + inline-term +
+unreferenced, supported alg names accepted on both paths, predefined-app
+reference not rejected).
+
+### #4336 — application `source-port` / `destination-port` `0-N` range floor
+
+Junos accepts `0` as the FLOOR of an application port range. Real vSRX
+multi-term application defs routinely split a port space as `0-N` /
+`N+1-65535` (e.g. FaceTime `term 0_41640 { source-port 0-41640; }`). xpf
+hard-rejected the low half with `source-port: invalid port 0: must be
+1-65535` — a pure drop-in blocker. `resolveAppPort` (`compiler_applications.go`,
+the single canonicalization chokepoint for BOTH direct-match and inline-term
+ports) now normalizes a range floor of `0` to `1`. Port 0 never appears on the
+wire, so `0-N` matches identically to `1-N`; normalizing at this one point keeps
+the config, `validatePortSpec`, the `userspacePortSpecRepresentable` #2124
+capability gate, and the Rust `parse_port_spec` all in agreement (the latter two
+both reject a raw `0` floor, so accepting `0-N` WITHOUT normalizing would create
+a commit-succeeds / apply-fails split). A bare single port `0` (no hyphen) stays
+invalid, matching Junos, and an out-of-range / non-numeric endpoint still
+hard-rejects on the referenced (strict) path. Regression coverage:
+`pkg/config/compiler_application_port_range_zero_4336_test.go` (source-port,
+destination-port, and inline-term `0-N` normalized to `1-N`; normal `1-N`
+unchanged; garbage still rejected) plus the `FaceTime-0_41640` assertion in
+`TestMultiTermApplication`.
 
 ### #3366 — application EITHER direct OR term-based; conflicting duplicate term leaf
 
@@ -4476,6 +4587,24 @@ at ANY position, so it lives OUTSIDE `setSchema` entirely. The parser
 modifier never appears in the node's identity, the `setSchema` walk, the
 flat-set token grouping, and the value-slot `?` completion are all
 unaffected — they continue to see the node's real keyword.
+
+**Inline `inactive:` (mid-statement, #4335).** Junos also collapses a
+deactivated *sub-statement* onto its parent statement's line, e.g. a
+destination-NAT pool address with a deactivated port:
+`address 2001:db8::7aef/128 inactive: port 32400;`. Here `inactive:`
+deactivates the `port 32400` modifier, not the address. Because `:` is an
+identifier character the lexer tokenizes `inactive:` as one identifier, so
+an inline marker lands mid-`Keys` rather than leading. A node carries a
+single `Inactive` flag for its whole identity and cannot mark only part of
+a flat leaf inactive, so `parseStatement` drops the inline marker and every
+token it governs (the remainder of that statement) from the active `Keys` —
+consistent with the doctrine that a deactivated statement behaves as if it
+were absent. The parent statement (the address) stays active; the governed
+sub-statement (the port) is simply absent for compilation, exactly as a
+deactivated leaf would be. Before this fix the marker leaked mid-`Keys` and
+the DNAT-pool compiler read the literal `inactive:` token as the pool
+address, hard-rejecting a valid drop-in vSRX config
+(`inline_inactive_4335_test.go`).
 
 **Strip-before-validate / strip-before-compile contract.** A deactivated
 statement must be excluded from BOTH the typed-leaf gate and the compiler,

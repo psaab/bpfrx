@@ -28,7 +28,7 @@ func runMultiValueTail(t *testing.T, leafKeys []string) error {
 		"destination-port": leafSchema,
 	}}
 	node := &Node{Keys: leafKeys, IsLeaf: true}
-	return walkSchemaNode(node, parent, nil, nil, []*Node{node})
+	return walkSchemaNode(node, parent, nil, nil, []*Node{node}, false)
 }
 
 func TestWalker_MultiValueTail_AcceptsRange(t *testing.T) {
@@ -92,5 +92,90 @@ func TestWalker_MultiValueTail_RejectsDanglingSeparator(t *testing.T) {
 		if !strings.Contains(err.Error(), "missing value") {
 			t.Fatalf("error should describe missing value for %v: %v", keys, err)
 		}
+	}
+}
+
+// --- #4313 closed-world mechanism white-box tests ---
+//
+// PR-A lands the per-subtree closed-world MECHANISM only; no production
+// schemaNode sets closedWorld yet, so these synthetic subtrees are the
+// sole coverage. Build an OPEN-WORLD root with two container children —
+// one flagged closedWorld, one left default — each modeling a single
+// child keyword, and drive the generic walker from the top-level open
+// entry (closed=false) exactly as SchemaValidate does. This exercises the
+// closed-world inheritance fold (walkSchemaNode's childClosed) end to end.
+
+func runClosedWorldWalk(t *testing.T, top *Node) error {
+	t.Helper()
+	root := &schemaNode{children: map[string]*schemaNode{
+		// closedsub opts in: unmodeled children are rejected. Its modeled
+		// child container `sub` does NOT set the flag — it relies on
+		// inheritance to stay closed.
+		"closedsub": {
+			closedWorld: true,
+			children: map[string]*schemaNode{
+				"known": {},
+				"sub":   {children: map[string]*schemaNode{"deep": {}}},
+			},
+		},
+		// opensub keeps the default (open-world): unmodeled children are
+		// silently accepted, matching every production subtree in PR-A.
+		"opensub": {
+			children: map[string]*schemaNode{"known": {}},
+		},
+	}}
+	return walkSchemaChildren([]*Node{top}, root, nil, nil, false)
+}
+
+func TestClosedWorld_RejectsUnmodeledUnderClosedSubtree(t *testing.T) {
+	// The ONE behavioural change: an unmodeled keyword under a closedWorld
+	// subtree is rejected instead of silently dropped. RED on revert of the
+	// gate (returns nil, silent-accept).
+	top := &Node{Keys: []string{"closedsub"}, Children: []*Node{{Keys: []string{"bogus"}}}}
+	err := runClosedWorldWalk(t, top)
+	if err == nil {
+		t.Fatal("expected rejection of unmodeled keyword under closed-world subtree")
+	}
+	if !strings.Contains(err.Error(), "bogus") || !strings.Contains(err.Error(), "closed-world") {
+		t.Fatalf("error should name the keyword and closed-world: %v", err)
+	}
+}
+
+func TestClosedWorld_AcceptsModeledUnderClosedSubtree(t *testing.T) {
+	// Only UNMODELED keywords are rejected — a modeled leaf under the same
+	// closed-world subtree still validates.
+	top := &Node{Keys: []string{"closedsub"}, Children: []*Node{{Keys: []string{"known"}}}}
+	if err := runClosedWorldWalk(t, top); err != nil {
+		t.Fatalf("modeled keyword under closed-world subtree must be accepted: %v", err)
+	}
+}
+
+func TestClosedWorld_SilentlyAcceptsUnmodeledUnderOpenSubtree(t *testing.T) {
+	// The default (closedWorld=false) subtree keeps pre-#4313 behaviour: an
+	// unmodeled keyword is silently accepted (returns nil). Same input shape
+	// as the closed subtree above, opposite disposition, decided solely by
+	// the closedWorld flag — this is the RED-on-revert discriminator and the
+	// proof that no open-world (i.e. every production) subtree is affected.
+	top := &Node{Keys: []string{"opensub"}, Children: []*Node{{Keys: []string{"bogus"}}}}
+	if err := runClosedWorldWalk(t, top); err != nil {
+		t.Fatalf("unmodeled keyword under open-world subtree must be silently accepted: %v", err)
+	}
+}
+
+func TestClosedWorld_InheritsToDescendants(t *testing.T) {
+	// closedWorld is set on `closedsub`; its modeled child container `sub`
+	// does NOT set it. Closed-world is inherited down every level, so an
+	// unmodeled grandchild is still rejected while the modeled one passes.
+	reject := &Node{Keys: []string{"closedsub"}, Children: []*Node{
+		{Keys: []string{"sub"}, Children: []*Node{{Keys: []string{"nope"}}}},
+	}}
+	if err := runClosedWorldWalk(t, reject); err == nil {
+		t.Fatal("closed-world must inherit into modeled descendant containers")
+	}
+	accept := &Node{Keys: []string{"closedsub"}, Children: []*Node{
+		{Keys: []string{"sub"}, Children: []*Node{{Keys: []string{"deep"}}}},
+	}}
+	if err := runClosedWorldWalk(t, accept); err != nil {
+		t.Fatalf("modeled grandchild under inherited closed-world must pass: %v", err)
 	}
 }

@@ -920,18 +920,19 @@ type compileOpts struct {
 	// later-sorting instance so the two never actually share a table. Same
 	// doctrine as lenientZoneIDCollision; mirrors the #3075 / #1873 id gates.
 	lenientRoutingInstanceTableIDCollision bool
-	// lenientAddressBookNames (#3061) downgrades the address-book / zone name
-	// `/`-character gate (validateAddressBookEntryNamesStrict) from a hard
-	// compile error to a cfg.Warnings entry. The strict commit / commit-check
-	// path hard-rejects a `/` in any address-book entry name (global or
-	// zone-local address / address-set) or any security-zone name — matching
-	// Junos object-naming rules and making the synthetic `zone-local/<zone>/
-	// <name>` internal name (resolveZoneLocalAddressBooks) collision-proof. The
-	// tolerant load / peer-sync paths downgrade to a warning so an already-
-	// persisted config an older binary accepted (before this gate existed) still
-	// BOOTS (#1960 no-brick); the fold's no-clobber guard keeps such a config
-	// from silently overwriting an operator entry. Same doctrine as
-	// lenientZoneCount.
+	// lenientAddressBookNames (#3061, narrowed in #4340) downgrades the
+	// address-book / zone name gate (validateAddressBookEntryNamesStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects only an address-book entry name that begins
+	// with the reserved `zone-local/` prefix (global or zone-local address /
+	// address-set) or a security-zone name that contains `/` — the two invariants
+	// that keep the synthetic `zone-local/<zone>/<name>` internal name
+	// (resolveZoneLocalAddressBooks) collision-proof. A `/` elsewhere in an entry
+	// name (net_10.0.0.0/8, the #4340 prefix-in-name convention) is accepted. The
+	// tolerant load / peer-sync paths downgrade the reject to a warning so an
+	// already-persisted config an older binary accepted still BOOTS (#1960
+	// no-brick); the fold's no-clobber guard keeps such a config from silently
+	// overwriting an operator entry. Same doctrine as lenientZoneCount.
 	lenientAddressBookNames bool
 	// lenientZoneInterfaceMembership (#3072) downgrades the zone-interface
 	// membership gate (validateZoneInterfaceMembershipStrict) from a hard
@@ -1448,6 +1449,17 @@ type compileOpts struct {
 	// threshold, so the mis-arrived 0 no longer over-fires. Same doctrine as
 	// lenientEventAttributesMatch (its attributes-match sibling).
 	lenientEventWithinTrigger bool
+
+	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
+	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
+	// check-config`) into compileExpanded so it can be stamped onto the
+	// compiled ClusterConfig.NodeID BEFORE any NodeID-dependent derivation
+	// runs. Only the node-aware entry (compileConfigForNodeWithOpts) sets
+	// nodeAware; the standalone CompileConfig path leaves it false so
+	// single-node compiles are unchanged. See the stamp in compileExpanded
+	// for the full rationale and guards.
+	nodeAware   bool
+	stampNodeID int
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -1848,10 +1860,19 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, fmt.Errorf("apply-groups: %w", err)
 	}
 
+	// #4329: thread the runtime cluster node identity into compileExpanded so
+	// it can stamp ClusterConfig.NodeID for a leaf-less flat vSRX config
+	// BEFORE any NodeID-dependent derivation runs (reth member resolution AND
+	// the compile-time fabric-member / FabricInterface auto-detect). See the
+	// stamp block in compileExpanded for the full rationale and guards.
+	opts.nodeAware = true
+	opts.stampNodeID = nodeID
+
 	cfg, err := compileExpanded(tree, opts)
 	if err != nil {
 		return nil, err
 	}
+
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
@@ -2369,6 +2390,48 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #4329: stamp the compiled cluster node identity from the runtime
+	// node-id (/etc/xpf/node-id, or the `-node-id` flag on `xpfd
+	// check-config`) when the config carries a chassis-cluster stanza but no
+	// explicit `chassis cluster node` leaf. A canonical vSRX chassis-cluster
+	// config encodes node ownership in the FPC slot (ge-0/0/N=node0,
+	// ge-7/0/N=node1) and runs the SAME flat config on both nodes with no
+	// `node` leaf. Without this stamp, Cluster.NodeID sits at its zero default
+	// on BOTH nodes, so every NodeID-dependent derivation resolves to the
+	// node-0 member on node 1 — reth breaks on the secondary (RethToPhysical
+	// reads NodeID at runtime), AND the compile-time fabric-member /
+	// FabricInterface auto-detect below (SlotToNodeID(member) == cc.NodeID)
+	// binds fab0/fab1 to the node-0 member. Stamping makes the compiled
+	// identity reflect the node the config is compiled FOR, so BOTH reth and
+	// fabric resolve to the LOCAL member on each node and the flat vSRX form
+	// is a drop-in.
+	//
+	// This MUST run after the child loop (Cluster + interfaces are populated)
+	// and BEFORE every NodeID-dependent derivation that follows: the fabric
+	// fixup below and validateDeviceMapStrict later in this function both read
+	// cc.NodeID.
+	//
+	// Guards (all load-bearing):
+	//   - opts.nodeAware && stampNodeID >= 0: only the node-aware entry
+	//     (compileConfigForNodeWithOpts) sets these. The standalone
+	//     CompileConfig path leaves nodeAware false, so single-node compiles
+	//     are unchanged; a negative node-id (defensive) never stamps.
+	//   - Cluster != nil: never fabricate a cluster stanza. A config-less HA
+	//     node (node-id present but empty/no-cluster config — the EMPTY-config
+	//     takeover in pkg/daemon/daemon.go) must keep Cluster == nil so the
+	//     daemon's `haMode` / `Cluster != nil` gates do not flip on a config
+	//     that has no cluster. A real reth/fabric config always carries a
+	//     `chassis cluster` stanza, so this never suppresses a genuine fix.
+	//   - !NodeIDSet: an explicit `chassis cluster node <id>` leaf is the
+	//     operator's SSOT and must win — never clobber it. crossCheckNodeID
+	//     (pkg/configstore) already rejects a leaf that disagrees with the
+	//     runtime node-id, and the GROUPS form (groups node0/node1 each carry
+	//     an explicit `node` leaf) is left bit-identical.
+	if opts.nodeAware && opts.stampNodeID >= 0 &&
+		cfg.Chassis.Cluster != nil && !cfg.Chassis.Cluster.NodeIDSet {
+		cfg.Chassis.Cluster.NodeID = opts.stampNodeID
+	}
+
 	// #3870: resolve the BGP local-AS from `routing-options
 	// autonomous-system` when `protocols bgp local-as` was omitted. Runs
 	// after the child loop so both routing-options and protocols/
@@ -2473,17 +2536,18 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
-	// #3061 — reject `/` in operator-typed address-book entry names and
-	// security-zone names BEFORE folding zone-local books, so the synthetic
-	// zone-local/<zone>/<name> internal names minted by
-	// resolveZoneLocalAddressBooks are collision-proof (an operator name can no
-	// longer contain `/` and so can never equal a synthetic name). This MUST
-	// run on the pristine global book — i.e. before the fold injects the
-	// `/`-bearing synthetic names — so it is placed here rather than in the
-	// post-fold accumulator. Strict on commit / commit-check (hard-reject);
-	// tolerant load / peer-sync downgrade to a warning (#1960 no-brick — a `/`
-	// name was unusual but accepted before this gate existed; the fold's
-	// no-clobber guard keeps it from silently overwriting an operator entry).
+	// #3061 (narrowed in #4340) — enforce the two naming invariants that keep
+	// the synthetic zone-local/<zone>/<name> internal names minted by
+	// resolveZoneLocalAddressBooks collision-proof, BEFORE folding zone-local
+	// books: an operator address-book entry name may not begin with the reserved
+	// `zone-local/` prefix, and a security-zone name may not contain `/`. A `/`
+	// elsewhere in an entry name (net_10.0.0.0/8) is permitted — the
+	// prefix-in-name convention real vSRX configs use (#4340). This MUST run on
+	// the pristine global book — i.e. before the fold injects the `/`-bearing
+	// synthetic names — so it is placed here rather than in the post-fold
+	// accumulator. Strict on commit / commit-check (hard-reject); tolerant load /
+	// peer-sync downgrade to a warning (#1960 no-brick; the fold's no-clobber
+	// guard keeps it from silently overwriting an operator entry).
 	if err := validateAddressBookEntryNamesStrict(cfg); err != nil {
 		if opts.lenientAddressBookNames {
 			cfg.Warnings = append(cfg.Warnings,

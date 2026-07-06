@@ -126,7 +126,18 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		})
 	}
 
+	// #4328: a bondless reth has no kernel netdev of its own — resolve it to
+	// its local physical member for link state / MAC / counters, while the
+	// logical name stays reth<N> and its addresses come from config. A reth
+	// member is not zoned, so it never surfaces through the zone walk above —
+	// render its aenet aggregation directly when asked for by name.
+	rethMaps := cfg.RethShowMaps()
 	if len(logicals) == 0 && filterName != "" {
+		if rethName, ok := rethMaps.LookupMember(filterName); ok {
+			var mb strings.Builder
+			writeRethMemberSummary(&mb, cfg, baseIfName(filterName), rethName)
+			return &pb.ShowInterfacesDetailResponse{Output: mb.String()}, nil
+		}
 		return &pb.ShowInterfacesDetailResponse{Output: fmt.Sprintf("interface %s not found in configuration\n", filterName)}, nil
 	}
 
@@ -145,23 +156,36 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 	for _, physName := range physOrder {
 		group := physGroups[physName]
 
-		iface, ifErr := net.InterfaceByName(physName)
-		if ifErr != nil {
+		_, rethMember, isReth := rethMaps.LookupReth(physName)
+		// A config/zone-ref name is Junos-form ("ge-0/0/2") or an alias, while
+		// the kernel netdev is "ge-0-0-2" — resolve to the kernel ifname before
+		// the lookup so a valid non-reth interface does not render "Not present"
+		// (mirrors GetInterfaces, #3460 / #4328 Copilot follow-up). A reth is
+		// resolved to its local physical member instead.
+		kernelLookup := cfg.ResolveKernelIfName(physName)
+		if isReth {
+			kernelLookup = config.LinuxIfName(rethMember)
+		}
+
+		iface, ifErr := net.InterfaceByName(kernelLookup)
+		if ifErr != nil && !isReth {
 			fmt.Fprintf(&buf, "Physical interface: %s, Not present\n\n", physName)
 			continue
 		}
 
-		// Determine link state
+		// Determine link state (best-effort from the resolved kernel device).
 		linkUp := "Down"
 		enabled := "Enabled"
-		if iface.Flags&net.FlagUp != 0 {
-			linkUp = "Up"
-		}
-		if iface.Flags&net.FlagUp == 0 {
-			enabled = "Disabled"
+		if iface != nil {
+			if iface.Flags&net.FlagUp != 0 {
+				linkUp = "Up"
+			}
+			if iface.Flags&net.FlagUp == 0 {
+				enabled = "Disabled"
+			}
 		}
 		// Try /sys/class/net for operstate
-		if data, err := os.ReadFile("/sys/class/net/" + physName + "/operstate"); err == nil {
+		if data, err := os.ReadFile("/sys/class/net/" + kernelLookup + "/operstate"); err == nil {
 			state := strings.TrimSpace(string(data))
 			if state == "up" {
 				linkUp = "Up"
@@ -171,6 +195,9 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		}
 
 		fmt.Fprintf(&buf, "Physical interface: %s, %s, Physical link is %s\n", physName, enabled, linkUp)
+		if isReth {
+			fmt.Fprintf(&buf, "  Redundant-ethernet: aggregate over member %s\n", rethMember)
+		}
 
 		// Show interface description and configured speed/duplex from config
 		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
@@ -186,10 +213,13 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		}
 
 		// Link-level details
-		mtu := iface.MTU
+		mtu := 0
+		if iface != nil {
+			mtu = iface.MTU
+		}
 		linkType := "Ethernet"
 		var linkExtras []string
-		if raw, err := os.ReadFile("/sys/class/net/" + physName + "/speed"); err == nil {
+		if raw, err := os.ReadFile("/sys/class/net/" + kernelLookup + "/speed"); err == nil {
 			var mbps int
 			if _, err := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &mbps); err == nil && mbps > 0 {
 				if mbps >= 1000 {
@@ -199,7 +229,7 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 				}
 			}
 		}
-		if raw, err := os.ReadFile("/sys/class/net/" + physName + "/duplex"); err == nil {
+		if raw, err := os.ReadFile("/sys/class/net/" + kernelLookup + "/duplex"); err == nil {
 			d := strings.TrimSpace(string(raw))
 			if d == "full" {
 				linkExtras = append(linkExtras, "Link-mode: Full-duplex")
@@ -213,7 +243,7 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		}
 		fmt.Fprintf(&buf, "  Link-level type: %s, MTU: %d%s\n", linkType, mtu, speedStr)
 
-		if len(iface.HardwareAddr) > 0 {
+		if iface != nil && len(iface.HardwareAddr) > 0 {
 			fmt.Fprintf(&buf, "  Current address: %s, Hardware address: %s\n", iface.HardwareAddr, iface.HardwareAddr)
 		}
 
@@ -234,10 +264,10 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		}
 
 		// Kernel link statistics via /sys/class/net
-		s.writeKernelStats(&buf, physName)
+		s.writeKernelStats(&buf, kernelLookup)
 
 		// BPF traffic counters
-		if s.dp != nil && s.dp.IsLoaded() {
+		if s.dp != nil && s.dp.IsLoaded() && iface != nil {
 			if ctrs, err := s.dp.ReadInterfaceCounters(iface.Index); err == nil && (ctrs.RxPackets > 0 || ctrs.TxPackets > 0) {
 				fmt.Fprintln(&buf, "  BPF statistics:")
 				fmt.Fprintf(&buf, "    Input:  %d packets, %d bytes\n", ctrs.RxPackets, ctrs.RxBytes)
@@ -317,45 +347,63 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 				}
 			}
 
-			// Addresses grouped by protocol
-			liface, _ := net.InterfaceByName(lookupName)
-			if liface == nil {
-				liface = iface
-			}
-			if liface != nil {
-				addrs, err := liface.Addrs()
-				if err == nil && len(addrs) > 0 {
-					var v4Addrs, v6Addrs []string
-					for _, addr := range addrs {
-						a := addr.String()
-						ip, _, err := net.ParseCIDR(a)
-						if err != nil {
+			// Addresses grouped by protocol. For a reth aggregate the addresses
+			// live on the physical member's VLAN sub-interface, not on "reth0",
+			// so read them from config (#4328). Normal interfaces read live
+			// addresses from the kernel.
+			var v4Addrs, v6Addrs []string
+			if isReth {
+				if unit != nil {
+					for _, addr := range unit.Addresses {
+						ip, _, perr := net.ParseCIDR(addr)
+						if perr != nil {
 							continue
 						}
 						if ip.To4() != nil {
-							v4Addrs = append(v4Addrs, a)
+							v4Addrs = append(v4Addrs, addr)
 						} else {
-							v6Addrs = append(v6Addrs, a)
+							v6Addrs = append(v6Addrs, addr)
 						}
 					}
-					if len(v4Addrs) > 0 {
-						fmt.Fprintf(&buf, "    Protocol inet, MTU: %d\n", mtu)
-						for _, a := range v4Addrs {
-							fmt.Fprintln(&buf, "      Addresses, Flags: Is-Preferred Is-Primary")
-							fmt.Fprintf(&buf, "        Local: %s\n", a)
-						}
-					}
-					if len(v6Addrs) > 0 {
-						fmt.Fprintf(&buf, "    Protocol inet6, MTU: %d\n", mtu)
-						for _, a := range v6Addrs {
-							fl := "Is-Preferred Is-Primary"
-							if strings.HasPrefix(a, "fe80:") {
-								fl = "Is-Preferred"
+				}
+			} else {
+				liface, _ := net.InterfaceByName(lookupName)
+				if liface == nil {
+					liface = iface
+				}
+				if liface != nil {
+					if addrs, err := liface.Addrs(); err == nil {
+						for _, addr := range addrs {
+							a := addr.String()
+							ip, _, err := net.ParseCIDR(a)
+							if err != nil {
+								continue
 							}
-							fmt.Fprintf(&buf, "      Addresses, Flags: %s\n", fl)
-							fmt.Fprintf(&buf, "        Local: %s\n", a)
+							if ip.To4() != nil {
+								v4Addrs = append(v4Addrs, a)
+							} else {
+								v6Addrs = append(v6Addrs, a)
+							}
 						}
 					}
+				}
+			}
+			if len(v4Addrs) > 0 {
+				fmt.Fprintf(&buf, "    Protocol inet, MTU: %d\n", mtu)
+				for _, a := range v4Addrs {
+					fmt.Fprintln(&buf, "      Addresses, Flags: Is-Preferred Is-Primary")
+					fmt.Fprintf(&buf, "        Local: %s\n", a)
+				}
+			}
+			if len(v6Addrs) > 0 {
+				fmt.Fprintf(&buf, "    Protocol inet6, MTU: %d\n", mtu)
+				for _, a := range v6Addrs {
+					fl := "Is-Preferred Is-Primary"
+					if strings.HasPrefix(a, "fe80:") {
+						fl = "Is-Preferred"
+					}
+					fmt.Fprintf(&buf, "      Addresses, Flags: %s\n", fl)
+					fmt.Fprintf(&buf, "        Local: %s\n", a)
 				}
 			}
 		}
@@ -378,14 +426,11 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 		}
 	}
 
-	// Build RETH mappings
-	physToReth := make(map[string]string) // physical member → reth parent
-	rethToPhys := cfg.RethToPhysical()    // reth → physical member
-	for _, ifCfg := range cfg.Interfaces.Interfaces {
-		if ifCfg.RedundantParent != "" {
-			physToReth[ifCfg.Name] = ifCfg.RedundantParent
-		}
-	}
+	// Build RETH mappings (shared resolver, #4328 — the same maps back the
+	// summary/detail/extensive paths so they can never drift from terse again).
+	rethMaps := cfg.RethShowMaps()
+	physToReth := rethMaps.PhysToReth // physical member → reth parent
+	rethToPhys := rethMaps.RethToPhys // reth → physical member
 
 	// Collect all configured interfaces with units
 	type ifUnit struct {
@@ -754,4 +799,137 @@ func (s *Server) writeKernelStats(buf *strings.Builder, ifaceName string) {
 	if rxDrop > 0 || txDrop > 0 {
 		fmt.Fprintf(buf, "  Drops          : %d input, %d output\n", rxDrop, txDrop)
 	}
+}
+
+// --- #4328: shared reth rendering helpers for the gRPC text surfaces ---
+
+// baseIfName strips a dotted unit suffix ("reth0.50" -> "reth0").
+func baseIfName(name string) string {
+	if i := strings.IndexByte(name, '.'); i >= 0 {
+		return name[:i]
+	}
+	return name
+}
+
+// rethMemberKernelState returns admin/link ("up"/"down") for a reth's physical
+// member, best-effort from the kernel (down when the device is absent — a
+// peer-owned member or a test host), mirroring the terse handler (#4328).
+func rethMemberKernelState(member string) (admin, link string) {
+	admin, link = "up", "up"
+	kernelIf := config.LinuxIfName(member)
+	iface, err := net.InterfaceByName(kernelIf)
+	if err != nil {
+		return "up", "down"
+	}
+	if iface.Flags&net.FlagUp == 0 {
+		admin = "down"
+	}
+	if data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate"); err == nil {
+		if strings.TrimSpace(string(data)) != "up" {
+			link = "down"
+		}
+	}
+	return admin, link
+}
+
+// writeRethMemberSummary renders `show interfaces <member>` for a physical reth
+// member (not zoned, so absent from the zone-driven walk): it names the reth
+// parent and lists the aggregated logical units (aenet --> reth<N>.<unit>) (#4328).
+func writeRethMemberSummary(buf *strings.Builder, cfg *config.Config, member, reth string) {
+	admin, link := rethMemberKernelState(member)
+	enabled := "Enabled"
+	if admin == "down" {
+		enabled = "Disabled"
+	}
+	linkUp := "Up"
+	if link == "down" {
+		linkUp = "Down"
+	}
+	fmt.Fprintf(buf, "Physical interface: %s, %s, Physical link is %s\n", member, enabled, linkUp)
+	if ifc, ok := cfg.Interfaces.Interfaces[member]; ok && ifc.Description != "" {
+		fmt.Fprintf(buf, "  Description: %s\n", ifc.Description)
+	}
+	fmt.Fprintf(buf, "  Redundant-ethernet: member of %s\n", reth)
+	for _, ru := range cfg.RethShowUnits(reth) {
+		fmt.Fprintf(buf, "  Logical interface %s.%d", member, ru.Unit)
+		if ru.VlanID > 0 {
+			fmt.Fprintf(buf, " VLAN-Tag [ 0x8100.%d ]", ru.VlanID)
+		}
+		fmt.Fprintln(buf)
+		fmt.Fprintf(buf, "    aenet --> %s.%d\n", reth, ru.Unit)
+	}
+	fmt.Fprintln(buf)
+}
+
+// writeRethDetail renders `show interfaces ... detail` for bondless reth
+// aggregates (no kernel netdev) and, when the filter names a reth member whose
+// kernel device is absent, a synthetic member block. alreadyFound reports
+// whether the netlink walk already emitted the filtered interface. Returns true
+// when anything was rendered (#4328).
+func writeRethDetail(buf *strings.Builder, cfg *config.Config, maps config.RethShowMaps, filterName string, alreadyFound bool) bool {
+	ifZone := make(map[string]string)
+	for _, z := range cfg.Security.Zones {
+		if z == nil {
+			continue
+		}
+		for _, ifName := range z.Interfaces {
+			ifZone[ifName] = z.Name
+		}
+	}
+
+	rendered := false
+	reths := make([]string, 0, len(maps.RethToPhys))
+	for reth := range maps.RethToPhys {
+		reths = append(reths, reth)
+	}
+	sort.Strings(reths)
+	for _, reth := range reths {
+		if filterName != "" && baseIfName(filterName) != reth {
+			continue
+		}
+		member := maps.RethToPhys[reth]
+		admin, link := rethMemberKernelState(member)
+		adminStr := "Enabled"
+		if admin == "down" {
+			adminStr = "Disabled"
+		}
+		linkStr := "Up"
+		if link == "down" {
+			linkStr = "Down"
+		}
+		fmt.Fprintf(buf, "Physical interface: %s, %s, Physical link is %s\n", reth, adminStr, linkStr)
+		if ifc, ok := cfg.Interfaces.Interfaces[reth]; ok && ifc.Description != "" {
+			fmt.Fprintf(buf, "  Description: %s\n", ifc.Description)
+		}
+		fmt.Fprintf(buf, "  Redundant-ethernet: aggregate over member %s\n", member)
+		for _, ru := range cfg.RethShowUnits(reth) {
+			fmt.Fprintf(buf, "  Logical interface %s.%d", reth, ru.Unit)
+			if ru.VlanID > 0 {
+				fmt.Fprintf(buf, " VLAN-Tag [ 0x8100.%d ]", ru.VlanID)
+			}
+			fmt.Fprintln(buf)
+			if zone, ok := ifZone[fmt.Sprintf("%s.%d", reth, ru.Unit)]; ok {
+				fmt.Fprintf(buf, "    Security zone: %s\n", zone)
+			}
+			if len(ru.V4Addrs) > 0 || len(ru.V6Addrs) > 0 {
+				fmt.Fprintln(buf, "    Addresses:")
+				for _, a := range ru.V4Addrs {
+					fmt.Fprintf(buf, "      %s\n", a)
+				}
+				for _, a := range ru.V6Addrs {
+					fmt.Fprintf(buf, "      %s\n", a)
+				}
+			}
+		}
+		fmt.Fprintln(buf)
+		rendered = true
+	}
+
+	if !alreadyFound && !rendered && filterName != "" {
+		if reth, ok := maps.LookupMember(filterName); ok {
+			writeRethMemberSummary(buf, cfg, baseIfName(filterName), reth)
+			rendered = true
+		}
+	}
+	return rendered
 }

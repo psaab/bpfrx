@@ -66,30 +66,37 @@ func TestApplicationTerm_ValidLeaves_Accepted(t *testing.T) {
 	}
 }
 
-// #3353 core fail-on-revert: an unknown per-application `alg` name (top-level)
-// must be rejected at commit. Revert the strict-gate ALG check and `alg ftpp`
-// commits cleanly, so this assertion goes RED.
-func TestApplicationALG_UnknownName_TopLevel_Rejected(t *testing.T) {
+// #4337 core fail-on-revert: an unknown per-application `alg` name (top-level)
+// is NO LONGER hard-rejected — it commits with an accepted-but-not-enforced
+// advisory naming the alg (the per-application ALG is not carried to the
+// dataplane, so rejecting a name for a knob with no effect blocked real vSRX
+// drop-in configs). Restore the #3353 strict reject and CompileConfig errors,
+// so both the no-error and the advisory assertions go RED.
+func TestApplicationALG_UnknownName_TopLevel_AcceptedWithAdvisory(t *testing.T) {
 	for _, bad := range []string{"ftpp", "ssh", "h323", "bogus"} {
 		t.Run(bad, func(t *testing.T) {
 			tree := flatTreeFromSets(t, refApp("bad", "protocol tcp", "alg "+bad)...)
-			if _, err := CompileConfig(tree); err == nil {
-				t.Fatalf("expected commit to REJECT unknown alg %q", bad)
-			} else if !strings.Contains(err.Error(), "unknown alg") {
-				t.Fatalf("error should mention the unknown alg, got: %v", err)
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("expected commit to ACCEPT unknown alg %q (accept-with-advisory, #4337), got: %v", bad, err)
+			}
+			if !hasWarningContaining(cfg.Warnings, `alg "`+bad+`" accepted but not enforced`) {
+				t.Fatalf("expected an accepted-but-not-enforced advisory naming alg %q, got warnings: %v", bad, cfg.Warnings)
 			}
 		})
 	}
 }
 
-// #3353: an unknown `alg` inside an inline term must also be rejected — the term
-// app carries the ALG and the strict gate validates it the same way.
-func TestApplicationALG_UnknownName_InlineTerm_Rejected(t *testing.T) {
+// #4337: an unknown `alg` inside an inline term is likewise accepted with the
+// advisory — the term app carries the ALG and the warn pass names it.
+func TestApplicationALG_UnknownName_InlineTerm_AcceptedWithAdvisory(t *testing.T) {
 	tree := flatTreeFromSets(t, refApp("badterm", "term t protocol tcp alg ftpp")...)
-	if _, err := CompileConfig(tree); err == nil {
-		t.Fatalf("expected commit to REJECT unknown inline-term alg")
-	} else if !strings.Contains(err.Error(), "unknown alg") {
-		t.Fatalf("error should mention the unknown alg, got: %v", err)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("expected commit to ACCEPT unknown inline-term alg (accept-with-advisory, #4337), got: %v", err)
+	}
+	if !hasWarningContaining(cfg.Warnings, `alg "ftpp" accepted but not enforced`) {
+		t.Fatalf("expected an accepted-but-not-enforced advisory naming alg ftpp, got warnings: %v", cfg.Warnings)
 	}
 }
 
@@ -154,20 +161,24 @@ func TestApplicationTerm_UnknownLeaf_Unreferenced_Rejected(t *testing.T) {
 	}
 }
 
-// #3353 scope fail-on-revert: an UNREFERENCED user application with an
-// unsupported `alg` must be rejected at commit (top-level and inline-term).
-func TestApplicationALG_UnknownName_Unreferenced_Rejected(t *testing.T) {
+// #4337 scope: an UNREFERENCED user application with an unsupported `alg`
+// commits with the advisory too (top-level and inline-term). The advisory
+// (ValidateConfig) iterates every user app, referenced or not.
+func TestApplicationALG_UnknownName_Unreferenced_AcceptedWithAdvisory(t *testing.T) {
 	cases := [][]string{
 		{"protocol tcp", "alg ftpp"},
 		{"term t protocol tcp alg h323"},
 	}
+	wantAlg := []string{"ftpp", "h323"}
 	for i, props := range cases {
 		t.Run(strings.Join(props, "_"), func(t *testing.T) {
 			tree := flatTreeFromSets(t, unrefAppOnly("lonely", props...)...)
-			if _, err := CompileConfig(tree); err == nil {
-				t.Fatalf("case %d: expected commit to REJECT unknown alg on an UNREFERENCED app", i)
-			} else if !strings.Contains(err.Error(), "unknown alg") {
-				t.Fatalf("case %d: error should mention the unknown alg, got: %v", i, err)
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("case %d: expected commit to ACCEPT unknown alg on an UNREFERENCED app (#4337), got: %v", i, err)
+			}
+			if !hasWarningContaining(cfg.Warnings, `alg "`+wantAlg[i]+`" accepted but not enforced`) {
+				t.Fatalf("case %d: expected advisory naming alg %q, got warnings: %v", i, wantAlg[i], cfg.Warnings)
 			}
 		})
 	}

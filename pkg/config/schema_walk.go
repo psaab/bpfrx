@@ -102,7 +102,10 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 		}
 	}
 	vc := &walkContext{cfg: cfg, refs: refs}
-	return walkSchemaChildren(tree.Children, setSchema, nil, vc)
+	// closed=false: the top-level walk is open-world. The per-subtree
+	// closed-world flag (#4313) is inherited from schemaNode.closedWorld as
+	// the walker descends; no production subtree sets it today.
+	return walkSchemaChildren(tree.Children, setSchema, nil, vc, false)
 }
 
 // walkContext carries the per-walk validation inputs: the (always-nil in
@@ -263,7 +266,7 @@ func collectSchemaRefs(tree *ConfigTree) *schemaRefs {
 // modifier-only sibling (e.g. flat-set `transmit-rate exact` next to
 // `transmit-rate 1g`) can be recognized as valid only when a sibling
 // supplies the value.
-func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, vc *walkContext) error {
+func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, vc *walkContext, closed bool) error {
 	if parent == nil {
 		return nil
 	}
@@ -271,7 +274,7 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, vc *wa
 		if node == nil || len(node.Keys) == 0 {
 			continue
 		}
-		if err := walkSchemaNode(node, parent, path, vc, nodes); err != nil {
+		if err := walkSchemaNode(node, parent, path, vc, nodes, closed); err != nil {
 			return err
 		}
 	}
@@ -289,14 +292,28 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, vc *wa
 //   - path:     consumed keyword path for error context.
 //   - siblings: the AST nodes at this level (for cross-sibling
 //     modifier-only recognition).
-func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkContext, siblings []*Node) error {
+//   - closed:   closed-world enforcement flag (#4313). When true, an
+//     unmodeled child keyword is REJECTED instead of silently accepted.
+//     Inherited from any ancestor subtree whose schemaNode.closedWorld is
+//     set; false (open-world) everywhere in production today.
+func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkContext, siblings []*Node, closed bool) error {
 	keyword := node.Keys[0]
 
 	// Resolve the schema child for this keyword. Exact match first, then
-	// wildcard (instance-name slot). Unknown keywords are not our concern —
-	// the gate is opt-in; leave reporting to the compiler.
+	// wildcard (instance-name slot).
 	childSchema := resolveSchemaChild(parent, keyword)
 	if childSchema == nil {
+		// Closed-world subtree (#4313): an unmodeled keyword here is operator
+		// garbage that would commit clean and be silently dropped. Reject it,
+		// mirroring the modifier-level unknown-keyword rejects below. Only a
+		// subtree that opted in (schemaNode.closedWorld, inherited via closed)
+		// reaches this branch; no production subtree does so today.
+		if closed {
+			return typedLeafErrorf(path, "unknown configuration keyword %q under closed-world subtree", keyword)
+		}
+		// Open-world (the default for every production subtree): unknown
+		// keywords are not our concern — the gate is opt-in; leave reporting
+		// to the compiler. Behaviour here is byte-identical to pre-#4313.
 		return nil
 	}
 
@@ -400,17 +417,22 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// declares, the missing instance-name args are supplied by nested AST
 	// children: peel those name levels (the compiler's namedInstances does
 	// the same) and validate each instance's children at the child schema.
+	// Inherit closed-world enforcement into this container's descent (#4313):
+	// a subtree that opts in (childSchema.closedWorld) closes every level
+	// below it, and an already-closed ancestor keeps it closed.
+	childClosed := closed || childSchema.closedWorld
+
 	missingArgs := declaredKeyTokens - consumed
 	if missingArgs > 0 && !childSchema.compoundKey {
 		for _, c := range node.Children {
-			if err := walkInstanceChildren(c, childSchema, missingArgs, newPath, vc); err != nil {
+			if err := walkInstanceChildren(c, childSchema, missingArgs, newPath, vc, childClosed); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	return walkSchemaChildren(node.Children, descendSchema, newPath, vc)
+	return walkSchemaChildren(node.Children, descendSchema, newPath, vc, childClosed)
 }
 
 // walkInstanceChildren peels the missing instance-name level(s) off a
@@ -420,7 +442,7 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 // Keys; the leaves are the node's CHILDREN. Any extra tokens packed into the
 // instance node's Keys beyond the name are ignored (the compiler does not
 // compile them; see walkSchemaNode's container comment, Codex r7).
-func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int, path []string, vc *walkContext) error {
+func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int, path []string, vc *walkContext, closed bool) error {
 	if node == nil || len(node.Keys) == 0 {
 		return nil
 	}
@@ -440,9 +462,11 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	}
 	newPath := append(append([]string(nil), path...), node.Keys[:consume]...)
 	if stillMissing := remaining - consume; stillMissing > 0 {
-		// This node supplied only part of the name; keep peeling.
+		// This node supplied only part of the name; keep peeling. closed is
+		// inherited unchanged: containerSchema.closedWorld was already folded
+		// into it by the caller in walkSchemaNode (#4313).
 		for _, c := range node.Children {
-			if err := walkInstanceChildren(c, containerSchema, stillMissing, newPath, vc); err != nil {
+			if err := walkInstanceChildren(c, containerSchema, stillMissing, newPath, vc, closed); err != nil {
 				return err
 			}
 		}
@@ -450,7 +474,7 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	}
 	// Name fully consumed. The instance's leaves are its block children;
 	// any leftover Keys past the name are not compiled and are ignored.
-	return walkSchemaChildren(node.Children, containerSchema, newPath, vc)
+	return walkSchemaChildren(node.Children, containerSchema, newPath, vc, closed)
 }
 
 // validateModifierChild validates one AST child of a typed leaf (e.g.
