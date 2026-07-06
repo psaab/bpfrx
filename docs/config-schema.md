@@ -3314,18 +3314,37 @@ zone-locally to that qualified name. A token NOT defined in the policy's zone
 book is left unchanged so it resolves against the global book; when a name
 exists in BOTH, the zone-local value WINS.
 
-**Collision-proof synthetic namespace:** the lexer permits `/` in an identifier
-token (it is needed for IP-literal VALUES like `10.0.0.0/24`), so without a
-guard an operator could name a global address `zone-local/trust/web-server` and
-have it silently clobbered by the fold. `validateAddressBookEntryNamesStrict`
-(run BEFORE the fold, on the pristine global book) hard-rejects `/` in any
-address-book entry NAME (global or zone-local `address`/`address-set`) and any
-security-zone NAME at commit — matching Junos object-naming rules — so no
-operator name can contain `/` and none can equal a synthetic `zone-local/...`
-name. Only the NAME is checked, never the address VALUE/prefix. Strict on
-commit / commit-check; the tolerant load / peer-sync path (`lenientAddressBookNames`)
-downgrades to a warning (#1960 no-brick), backstopped by the fold's
-no-clobber guard (it skips a global-book key that already exists).
+**Collision-proof synthetic namespace (#3061, narrowed in #4340):** real vSRX
+configs almost universally name an address object after its prefix —
+`net_10.0.0.0/8`, `net4_sfmix_72.52.96.201/32`, `net_2001:559:8585:200::/64` —
+so the NAME legitimately contains `/` (the lexer already permits `/` in an
+identifier, needed for the CIDR VALUE too). `/` in a name is a display
+identifier, never a structural token: the whole downstream resolution path
+(`policyMatchNamedAddressRefs`, `resolveUserspaceAddressBookEntry`,
+`classifyPolicyAddresses`, the wire snapshot) keys objects by the FULL name via
+direct map lookups, so a `/`-bearing name resolves correctly end to end.
+`validateAddressBookEntryNamesStrict` (run BEFORE the fold, on the pristine
+global book) therefore enforces only the two invariants the synthetic
+`zone-local/<zone>/<name>` key actually needs:
+
+1. **No operator entry name may begin with the reserved `zone-local/` prefix**
+   (global or zone-local `address`/`address-set`). Otherwise a global address
+   named `zone-local/trust/web-server` would collide with the synthetic name
+   the fold mints for a zone-local `web-server` in zone `trust`, and the fold's
+   no-clobber guard would silently drop the zone-local entry. Reserving only
+   the PREFIX — not every `/` — keeps `/` free elsewhere in a name.
+2. **No security-zone NAME may contain `/`.** The zone is the `/`-free first
+   segment after the prefix; `ZoneLocalUnqualify` splits zone from name on the
+   FIRST `/`, so a `/`-free zone keeps the split unambiguous even when the
+   address name that follows contains `/` (`zone-local/trust/net_10.0.0.0/8`
+   → zone `trust`, name `net_10.0.0.0/8`). Zones never carry a prefix-in-name
+   convention, so this costs nothing real.
+
+Only the NAME is checked, never the address VALUE/prefix. Strict on commit /
+commit-check; the tolerant load / peer-sync path (`lenientAddressBookNames`)
+downgrades the reserved-prefix / zone-slash reject to a warning (#1960
+no-brick), backstopped by the fold's no-clobber guard (it skips a global-book
+key that already exists).
 
 After this pass the whole downstream resolution path
 (wire snapshot, `nameToID`, `classifyPolicyAddresses`, the strict/warn
@@ -3342,11 +3361,17 @@ scoped to security-policy match addresses. Regression coverage:
 (`TestZoneLocalAddressBookResolves` — fail-on-revert resolution guard,
 `TestZoneLocalAddressBookScoping` — precedence + cross-zone isolation) and
 `pkg/config/addressbook_name_slash_3061_test.go`
-(`TestAddressBookGlobalNameSlashRejected`,
-`TestAddressBookZoneLocalNameSlashRejected`,
+(`TestAddressBookReservedPrefixNameRejected`,
+`TestAddressBookZoneLocalReservedPrefixRejected`,
 `TestSecurityZoneNameSlashRejected` — collision-safety fail-on-revert guards,
 `TestAddressBookNameSlashNormalConfigUnaffected` — prefix-value anti-over-reject,
-`TestAddressBookNameSlashLenientDowngrades` — tolerant-path warning).
+`TestAddressBookReservedPrefixLenientDowngrades` — tolerant-path warning) and
+`pkg/config/addressbook_name_slash_4340_test.go`
+(`TestAddressBookSlashNameCommits` — prefix-named objects commit + resolve,
+`TestAddressBookSlashNameZoneLocalFoldRoundTrips` — fold + unqualify round-trip
+of a `/`-bearing zone-local name) plus
+`pkg/dataplane/userspace/addressbook_slash_name_4340_test.go`
+(`TestPolicySlashNameResolvesToPrefix` — end-to-end dataplane resolution).
 
 **Operator display (#3358).** The synthetic `zone-local/<zone>/<name>` key is an
 INTERNAL identity, never an operator-facing string. The display surfaces that

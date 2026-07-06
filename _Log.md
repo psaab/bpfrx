@@ -1,3 +1,40 @@
+## 2026-07-06 — #4340 allow "/" in address-object names (vSRX prefix-in-name drop-in blocker)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Real vSRX configs name address objects after their prefix
+  (`net_10.0.0.0/8`, `net4_sfmix_72.52.96.201/32`,
+  `net_2001:559:8585:200::/64`) — the near-universal convention. xpf
+  HARD-REJECTED every such name ("address-book entry name … must not
+  contain '/'"), so a mechanical drop-in was impossible (194 objects +
+  every policy reference would need lockstep renaming). DIAGNOSIS: `/`
+  was reserved by `validateAddressBookEntryNamesStrict` (#3061,
+  `compiler_validate_strict.go`) purely to keep the zone-local fold's
+  synthetic `zone-local/<zone>/<name>` internal key collision-proof —
+  NOT because any consumer treats the object NAME as a path. Every
+  resolver (policyMatchNamedAddressRefs, resolveUserspaceAddressBookEntry,
+  classifyPolicyAddresses, the wire snapshot) keys objects by the FULL
+  name via direct map lookups, so a `/`-bearing name resolves end to end
+  unchanged. FIX: narrow the reservation from "any `/`" to the two
+  invariants the synthetic key actually needs — (1) an operator
+  address-book entry name may not BEGIN with the reserved `zone-local/`
+  prefix (collision guard), (2) a security-zone NAME may not contain `/`
+  (it is the `/`-free first segment `ZoneLocalUnqualify` splits on). `/`
+  is now permitted freely elsewhere in an entry name. ZoneLocalUnqualify
+  already splits on the FIRST `/` only, so a `/`-bearing zone-local name
+  round-trips (`zone-local/trust/net_10.0.0.0/8` → zone trust, name
+  net_10.0.0.0/8). RED-on-revert proven: with the old any-`/` reject,
+  `TestAddressBookSlashNameCommits` /
+  `TestAddressBookSlashNameZoneLocalFoldRoundTrips` fail with the exact
+  "must not contain '/'" error; the userspace resolution test passes on
+  both revisions (confirming no consumer depended on the ban). Full
+  pkg/config + pkg/dataplane/userspace + policymatch + grpcapi + api +
+  cli suites, gofmt, vet, go build ./... clean.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_security_addressbook.go, pkg/config/compiler.go,
+  pkg/config/addressbook_name_slash_3061_test.go,
+  pkg/config/addressbook_name_slash_4340_test.go,
+  pkg/dataplane/userspace/addressbook_slash_name_4340_test.go,
+  docs/config-schema.md, _Log.md
 ## 2026-07-06 — #4335: parser prunes an INLINE `inactive:` token (drop-in blocker)
 
 - **Timestamp**: 2026-07-06
