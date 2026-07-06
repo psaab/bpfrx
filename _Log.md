@@ -37129,3 +37129,37 @@ top.
   pkg/config/compiler_validate_strict.go,
   pkg/config/parser_class_of_service_test.go,
   userspace-dp/src/afxdp/types/cos.rs, _Log.md
+
+- **Timestamp**: 2026-07-06
+  **Action**: #3618 — per-zone `reject`-reply rate-limit buckets
+  (userspace-dp). Replaced the SINGLE process-global Reject `TokenBucket`
+  with ONE bucket per configured ingress (from) zone so a rejected-flow
+  flood in one zone can no longer drain a shared bucket and starve
+  legitimate reject-generation (TCP RST / ICMP-unreachable) in another
+  zone. New `ForwardingState::reject_buckets: FastMap<u16,
+  Arc<TokenBucket>>` built in `populate_zones` from the same validated
+  zone set as `zone_id_to_name` (config-bounded, not attacker-growable);
+  held behind `Arc` so the shared atomics survive
+  `ForwardingState::clone()` (fabric refresh re-stores a clone at runtime
+  cadence — a plain-value clone would reset the limiter). The reject call
+  site resolves the from-zone from the LOGICAL ingress ifindex via
+  `ifindex_to_zone_id` and gates on the new
+  `icmp_ratelimit::allow_generated_reject(forwarding, from_zone_id)`; an
+  unzoned/unknown zone falls back to a process-global
+  `REJECT_FALLBACK_BUCKET` (never fail-open). TimeExceeded / PacketTooBig
+  keep their single global bucket. The aggregate
+  `reject_rate_limited_total` metric is now a dedicated single atomic
+  (`REJECT_RATE_LIMITED_TOTAL`) bumped on every per-zone deny, so the
+  coordinator status / Prometheus wire format is UNCHANGED. Added 5 tests
+  (headline per-zone isolation, end-to-end call-site isolation, fallback
+  for unknown/unzoned, aggregate-sums-across-zones, reason isolation) —
+  all RED on a revert to a single shared bucket (verified). Full cargo
+  serial suite green. Docs: new docs/generated-reply-rate-limit.md +
+  userspace-dp README reject-limiter paragraph + icmp_ratelimit.rs module
+  header.
+  **File(s)**: userspace-dp/src/afxdp/icmp_ratelimit.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/zones.rs,
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+  userspace-dp/src/afxdp/README.md, docs/generated-reply-rate-limit.md,
+  _Log.md

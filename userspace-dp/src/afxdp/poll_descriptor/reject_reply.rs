@@ -19,7 +19,7 @@ use super::worker::WorkerTxPipeline;
 use super::*;
 use crate::afxdp::event_emit::emit_policy_deny_event;
 use crate::afxdp::icmp::build_reject_icmp_unreachable;
-use crate::afxdp::icmp_ratelimit::{GeneratedErrorReason, allow_generated_error};
+use crate::afxdp::icmp_ratelimit::allow_generated_reject;
 use crate::event_stream::EventStreamWorkerHandle;
 use crate::nat::NatDecision;
 use crate::policy::PolicyAction;
@@ -222,22 +222,23 @@ fn enqueue_reject_reply(
     counters: &mut BatchCounters,
     source: RejectReplySource,
 ) -> bool {
-    // #3656: determine reply-build FEASIBILITY before consuming the shared
-    // REJECT_BUCKET token OR counting a TX-frame-budget drop. A frame that can
+    // #3656: determine reply-build FEASIBILITY before consuming the reject
+    // rate-limit token OR counting a TX-frame-budget drop. A frame that can
     // NEVER produce a reply — an inbound TCP RST, an inbound ICMP/ICMPv6 error,
     // a non-first fragment, an L2 group/broadcast frame, an unparseable frame,
     // or an ingress without a primary of the inbound family — is a PLAIN drop.
     // Building the reply first (a pure, side-effect-free reflection of the
-    // inbound frame) means such a frame consumes NEITHER the shared per-reason
-    // rate-limit token (H11: a flood of unreplyable frames must not drain the
-    // REJECT_BUCKET and starve legitimate rejects — a cheap DoS against active
-    // reject behavior) NOR a budget-drop counter (H12: an impossible reply
-    // must not be mis-attributed as TX queue pressure and hide the true attack
-    // shape). The token / budget are consumed only once `Some(bytes)` proves an
-    // actual reply exists. This is the residual of #3615, which reordered the
-    // event emit + per-source counter split but left the bucket/budget consume
-    // AHEAD of the build. Orthogonal to #3618 (per-zone bucket design) — the
-    // shared bucket is unchanged; only the CONSUMPTION ORDERING moves. The
+    // inbound frame) means such a frame consumes NEITHER the reject rate-limit
+    // token (H11: a flood of unreplyable frames must not drain the reject
+    // bucket and starve legitimate rejects — a cheap DoS against active reject
+    // behavior) NOR a budget-drop counter (H12: an impossible reply must not be
+    // mis-attributed as TX queue pressure and hide the true attack shape). The
+    // token / budget are consumed only once `Some(bytes)` proves an actual
+    // reply exists. This is the residual of #3615, which reordered the event
+    // emit + per-source counter split but left the bucket/budget consume AHEAD
+    // of the build. #3618 made the rate-limit token PER INGRESS ZONE (resolved
+    // below, at the gate), so H11 now protects each zone's bucket independently;
+    // the CONSUMPTION ORDERING (feasibility before consume) is unchanged. The
     // extra build under budget/rate pressure is on the already-cold reject
     // exception path.
     // #3976: resolve the LOGICAL ingress unit ifindex ONCE, up here, so both
@@ -294,33 +295,52 @@ fn enqueue_reject_reply(
         return false;
     }
 
-    // #2472: per-reason token-bucket rate limit on the LOCALLY-GENERATED
+    // #2472/#3618: per-ZONE token-bucket rate limit on the LOCALLY-GENERATED
     // reject reply (TCP RST or ICMP/ICMPv6 unreachable). The SYN-cookie
     // TX-frame budget gate above is a queue-protection gate (it keeps the
     // reply ring from starving transit TX), NOT a per-reason rate cap — under
     // a sustained rejected-flow flood it refills as fast as TX drains. The
     // token bucket bounds the generated-error RATE so a flood of rejected
-    // flows cannot be amplified into unbounded RST/ICMP backscatter. Both
-    // policy and filter reject share this `Reject` bucket (a single emit
-    // path, per the RejectReplySource doc comment). #3656: the token is
+    // flows cannot be amplified into unbounded RST/ICMP backscatter.
+    //
+    // #3618: the bucket is now PER INGRESS (from) ZONE, not a single global
+    // one. `from_zone_id` is resolved from the LOGICAL ingress unit ifindex
+    // (the same SSOT the #3976 reply build + #3035 output-classify key off —
+    // so a VLAN sub-interface keys its OWN zone's bucket, and `ifindex_to_zone_id`
+    // also maps the physical parent so a non-VLAN port resolves identically).
+    // Before #3618 a rejected-flow flood ingressing one zone drained the single
+    // shared bucket and starved legitimate reject-generation in a DIFFERENT
+    // zone; per-zone buckets remove that cross-zone starvation. An unzoned /
+    // unknown ingress interface (id 0) falls back to the shared
+    // REJECT_FALLBACK_BUCKET (never fail-open). Both policy and filter reject
+    // still share the SAME per-zone bucket for a given ingress zone (a single
+    // emit path, per the RejectReplySource doc comment). #3656: the token is
     // consumed ONLY for a buildable reply (feasibility is proven above), so a
-    // flood of unreplyable frames can no longer drain the shared bucket and
+    // flood of unreplyable frames can no longer drain the zone's bucket and
     // starve legitimate rejects (H11). On bucket-empty we fail-closed to the
-    // silent drop the caller already performs and bump the observable `Reject`
-    // rate-limited counter (inside `allow_generated_error`).
-    if !allow_generated_error(GeneratedErrorReason::Reject) {
+    // silent drop the caller already performs and bump the observable aggregate
+    // `Reject` rate-limited counter (inside `allow_generated_reject`), which
+    // stays a SINGLE atomic so the coordinator status / Prometheus metric is
+    // unchanged.
+    let from_zone_id = forwarding
+        .ifindex_to_zone_id
+        .get(&logical_ingress_ifindex)
+        .copied()
+        .unwrap_or(0);
+    if !allow_generated_reject(forwarding, from_zone_id) {
         counters.touched = true;
         // #3661: attribute the rate-limit drop to the reply's SOURCE so a
         // firewall-filter `then reject` starvation is not conflated with a
         // policy `then reject` starvation under a rejected-flow flood. Both
-        // sources still share the single global-per-reason REJECT_BUCKET; the
-        // aggregate `reject_rate_limited_total` (bumped inside
-        // `allow_generated_error`) stays source-NEUTRAL for back-compat, and
-        // these two per-source per-binding counters sum to it exactly (the
-        // Reject bucket has this ONE consume site — #3656 proved the token is
-        // consumed only for a buildable reply, so an unreplyable frame reaches
-        // neither counter). Mirrors the #3615 budget-drop / output-filter
-        // source split a few lines below.
+        // sources still share the SAME per-zone reject bucket for a given
+        // ingress zone (#3618); the aggregate `reject_rate_limited_total`
+        // (bumped inside `allow_generated_reject`) stays source-NEUTRAL for
+        // back-compat and is a single atomic summed across all zones, and these
+        // two per-source per-binding counters sum to it exactly (the reject
+        // bucket has this ONE consume site — #3656 proved the token is consumed
+        // only for a buildable reply, so an unreplyable frame reaches neither
+        // counter). Mirrors the #3615 budget-drop / output-filter source split
+        // a few lines below.
         match source {
             RejectReplySource::Policy => counters.policy_reject_rate_limit_drops += 1,
             RejectReplySource::Filter => counters.filter_reject_rate_limit_drops += 1,
@@ -564,7 +584,9 @@ mod tests {
         frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]);
         frame.extend_from_slice(&0x0800u16.to_be_bytes());
         let l3 = frame.len();
-        frame.extend_from_slice(&[0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_ICMP, 0, 0]);
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_ICMP, 0, 0,
+        ]);
         frame.extend_from_slice(&client.octets());
         frame.extend_from_slice(&server.octets());
         let _ = l3; // inbound IP csum not validated by the builders
@@ -610,7 +632,8 @@ mod tests {
             }],
             "",
             "",
-        ).expect("filter state compiles");
+        )
+        .expect("filter state compiles");
         let mut forwarding = ForwardingState {
             filter_state,
             tx_selection_enabled_v4: true,
@@ -643,7 +666,10 @@ mod tests {
             &flow,
             &mut counters,
         );
-        assert!(!sent, "reject reply dropped by egress output filter must not enqueue");
+        assert!(
+            !sent,
+            "reject reply dropped by egress output filter must not enqueue"
+        );
         assert_eq!(counters.policy_reject_sent, 0);
         assert_eq!(counters.policy_reject_output_filter_drops, 1);
         assert_eq!(counters.generated_reply_classify_parse_errors, 0);
@@ -773,7 +799,10 @@ mod tests {
             &flow,
             &mut counters,
         );
-        assert!(sent, "filter non-TCP reject must enqueue an ICMP unreachable");
+        assert!(
+            sent,
+            "filter non-TCP reject must enqueue an ICMP unreachable"
+        );
         assert_eq!(counters.filter_reject_sent, 1);
         assert_eq!(counters.policy_reject_sent, 0);
         let req = pipeline
@@ -781,7 +810,11 @@ mod tests {
             .pop_front()
             .expect("filter reject ICMP request");
         // ICMP unreachable: type 3 at the L4 offset of the reply.
-        assert_eq!(req.bytes[14 + 20], 3, "ICMP type must be Destination Unreachable");
+        assert_eq!(
+            req.bytes[14 + 20],
+            3,
+            "ICMP type must be Destination Unreachable"
+        );
     }
 
     /// #3615 (L04) fail-on-revert: a FILTER `then reject` reply suppressed by
@@ -803,7 +836,10 @@ mod tests {
             &flow,
             &mut counters,
         );
-        assert!(!sent, "filter reject must fail-closed under budget exhaustion");
+        assert!(
+            !sent,
+            "filter reject must fail-closed under budget exhaustion"
+        );
         assert_eq!(
             counters.filter_reject_reply_budget_drops, 1,
             "filter-source budget drop must bump the filter counter"
@@ -914,7 +950,10 @@ mod tests {
             &flow,
             &mut counters,
         );
-        assert!(!sent, "filter reject discarded by egress output filter must not enqueue");
+        assert!(
+            !sent,
+            "filter reject discarded by egress output filter must not enqueue"
+        );
         assert_eq!(
             counters.filter_reject_output_filter_drops, 1,
             "filter-source output-filter drop must bump the filter counter"
@@ -2039,5 +2078,97 @@ mod tests {
             event.action, RT_FLOW_ACTION_REJECT,
             "an enqueued reject must log the truthful REJECT"
         );
+    }
+
+    /// #3618 call-site fail-on-revert (end-to-end): with per-(from-)zone Reject
+    /// buckets, a rejected-flow flood that drains ZONE A's bucket must NOT stop
+    /// ZONE B from emitting its reject through `enqueue_policy_reject_reply`.
+    /// The bucket is selected by resolving the ingress ifindex → zone via
+    /// `ifindex_to_zone_id`, so this exercises the full wiring (ingress ifindex
+    /// → from-zone → per-zone bucket). On the single-global-bucket revert,
+    /// draining zone A empties the one shared bucket and zone B fails closed →
+    /// RED.
+    #[test]
+    fn per_zone_reject_isolation_at_call_site_3618() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        use crate::afxdp::icmp_ratelimit::TokenBucket;
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, allow_generated_reject_at, global_bucket_test_lock,
+            reset_bucket_for_test,
+        };
+        use crate::afxdp::types::FastMap;
+        use std::sync::Arc;
+
+        let _g = global_bucket_test_lock();
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+
+        let zone_a = 4_321u16;
+        let zone_b = 8_765u16;
+        let ifidx_a = 5i32; // ingress interface in zone A (the flooded zone)
+        let ifidx_b = 6i32; // ingress interface in zone B (a quiet zone)
+
+        // Ingress-ifindex → from-zone map + fresh per-zone Reject buckets.
+        let mut ifindex_to_zone_id: FastMap<i32, u16> = FastMap::default();
+        ifindex_to_zone_id.insert(ifidx_a, zone_a);
+        ifindex_to_zone_id.insert(ifidx_b, zone_b);
+        let mut reject_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+        reject_buckets.insert(zone_a, Arc::new(TokenBucket::new()));
+        reject_buckets.insert(zone_b, Arc::new(TokenBucket::new()));
+        let forwarding = ForwardingState {
+            ifindex_to_zone_id,
+            reject_buckets,
+            ..ForwardingState::default()
+        };
+
+        // Drain zone A's bucket. The enqueue call samples the REAL (small)
+        // monotonic clock, so pin zone A's refill epoch to the far future and
+        // drain it there: the smaller call-site `now` yields zero refill and
+        // the bucket stays empty across the call (mirrors the #2472 tests).
+        let far_future = u64::MAX / 2;
+        while allow_generated_reject_at(&forwarding, zone_a, far_future, 1000, 1000) {}
+
+        let (frame, meta, flow) = tcp_v4_syn();
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let mut counters = BatchCounters::default();
+
+        // Zone A (ingress ifindex 5): its own flood drained the bucket →
+        // fail-closed.
+        let sent_a = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            ifidx_a,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(
+            !sent_a,
+            "zone A reject must fail-closed under its own rejected-flow flood"
+        );
+        assert_eq!(counters.policy_reject_sent, 0);
+        assert!(pipeline.pending_tx_local.is_empty());
+
+        // Zone B (ingress ifindex 6): untouched bucket → still emits its RST.
+        let sent_b = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            ifidx_b,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(
+            sent_b,
+            "zone B reject must NOT be starved by zone A's flood (per-zone isolation)"
+        );
+        assert_eq!(counters.policy_reject_sent, 1);
+        assert_eq!(pipeline.pending_tx_local.len(), 1);
+
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
     }
 }

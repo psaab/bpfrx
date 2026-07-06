@@ -558,9 +558,15 @@ sync.
   (filter); the parse-error leg `generated_reply_classify_parse_errors`
   stays source-neutral (shared by every generated-reply type). The
   rate-limit split (#3661) attributes an empty-bucket drop to the reply's
-  source at the consume site — the shared per-reason `REJECT_BUCKET` is
-  unchanged, so `policy`+`filter` sum to the source-neutral aggregate
-  `reject_rate_limited_total`.
+  source at the consume site. #3618 made the reject rate-limit bucket PER
+  INGRESS (from) ZONE — one `TokenBucket` per configured zone in
+  `ForwardingState::reject_buckets`, resolved from the ingress interface's
+  zone, with a process-global `REJECT_FALLBACK_BUCKET` for an unzoned/unknown
+  zone — so a rejected-flow flood in one zone no longer starves reject
+  generation in another. The observable aggregate `reject_rate_limited_total`
+  stays a SINGLE atomic bumped on any per-zone deny, so the metric is unchanged
+  and `policy`+`filter` still sum to it. See
+  `docs/generated-reply-rate-limit.md`.
   DSCP-matched input/output filters
   are intentionally not flow-cached because DSCP is packet metadata, not
   part of the session cache key; session hits re-evaluate DSCP-sensitive
