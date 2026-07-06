@@ -226,6 +226,16 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			// #3408: surface a per-policy counter read failure as a warning
 			// AFTER all reads rather than rendering a clean "0" hits column.
 			var readErr error
+			// #4344: read the whole policy set from ONE snapshot (O(P+C), one
+			// brief dataplane lock) via the #3965 bulk reader instead of a
+			// per-policy ReadPolicyCounters loop. Built only when the dataplane
+			// is loaded; falls back to the per-policy read for dataplanes
+			// without the bulk snapshot (test fakes / retired eBPF), so the
+			// displayed hits are identical. cfg is the config walked below.
+			var readPolicy func(uint32) (dataplane.CounterValue, error)
+			if c.dp != nil && c.dp.IsLoaded() {
+				readPolicy = dpuserspace.NewPolicyCounterReader(c.dp, cfg, c.dp.ReadPolicyCounters)
+			}
 			// Brief tabular summary
 			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 				"From", "To", "Name", "Action", "Hits")
@@ -263,8 +273,8 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					// the counter is unavailable or the knob is off);
 					// overwrite only on a successful gated read.
 					hits := "0"
-					if (statsEnabled || pol.Count) && c.dp != nil && c.dp.IsLoaded() {
-						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+					if (statsEnabled || pol.Count) && readPolicy != nil {
+						if counters, err := readPolicy(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						} else if readErr == nil {
 							readErr = err
@@ -299,8 +309,8 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					// Default to "0" for the same cross-surface
 					// consistency reason as the zone-pair branch above.
 					hits := "0"
-					if (statsEnabled || pol.Count) && c.dp != nil && c.dp.IsLoaded() {
-						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+					if (statsEnabled || pol.Count) && readPolicy != nil {
+						if counters, err := readPolicy(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						} else if readErr == nil {
 							readErr = err
