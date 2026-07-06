@@ -368,6 +368,7 @@ pub(super) fn stage_screen_check(
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
+    now_ns: u64,
     now_secs: u64,
     screen: &mut ScreenState,
     counters: &mut BatchCounters,
@@ -499,6 +500,7 @@ pub(super) fn stage_screen_check(
             zone_name,
             &screen_pkt,
             addrs_known,
+            now_ns,
             now_secs,
             skip_rate_flood,
         );
@@ -572,8 +574,14 @@ pub(super) fn stage_screen_check(
             return StageOutcome::RecycleAndContinue;
         }
     };
-    let verdict = screen
-        .check_packet_with_zone_id_opts(zone_name, zone_id, &screen_pkt, now_secs, skip_rate_flood);
+    let verdict = screen.check_packet_with_zone_id_opts(
+        zone_name,
+        zone_id,
+        &screen_pkt,
+        now_ns,
+        now_secs,
+        skip_rate_flood,
+    );
     // #3315: drain a pending SYN-flood alarm (alarm-threshold crossed below
     // attack-threshold). Like scan-table-pressure this is a log-only PERMIT
     // alarm — it does NOT drop and is rate-limited to ≤1/sec/zone in the screen
@@ -677,6 +685,7 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
+    now_ns: u64,
     now_secs: u64,
     screen: &mut ScreenState,
     counters: &mut BatchCounters,
@@ -756,8 +765,13 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
             return StageOutcome::RecycleAndContinue;
         }
     };
-    match screen.validate_syn_cookie_ack_on_session_miss(zone_name, zone_id, &screen_pkt, now_secs)
-    {
+    match screen.validate_syn_cookie_ack_on_session_miss(
+        zone_name,
+        zone_id,
+        &screen_pkt,
+        now_ns,
+        now_secs,
+    ) {
         SynCookieAckVerdict::NotApplicable => StageOutcome::Continue(SynCookieAckOutcome::Pass),
         SynCookieAckVerdict::Validated => {
             counters.touched = true;
@@ -840,6 +854,10 @@ mod tests {
     use crate::test_zone_ids::TEST_LAN_ZONE_ID;
 
     const TEST_NOW_SECS: u64 = 128;
+    /// #3607: monotonic-ns companion of `TEST_NOW_SECS` for the token-bucket
+    /// screen paths (`stage_screen_check` / the standby-ACK stage now take a
+    /// `now_ns` before `now_secs`).
+    const TEST_NOW_NS: u64 = TEST_NOW_SECS * 1_000_000_000;
     const TCP_FLAG_ACK: u8 = 0x10;
 
     fn tcp_v4_frame(
@@ -1123,6 +1141,7 @@ mod tests {
                 &invalid_ack_frame,
                 invalid_ack_meta,
                 None,
+                TEST_NOW_NS,
                 TEST_NOW_SECS,
                 &mut screen,
                 &mut invalid_counters,
@@ -1177,6 +1196,7 @@ mod tests {
                 &ack_frame,
                 ack_meta,
                 None,
+                TEST_NOW_NS,
                 TEST_NOW_SECS,
                 &mut screen,
                 &mut counters,
@@ -1289,6 +1309,7 @@ mod tests {
                 &frame,
                 meta,
                 None,
+                TEST_NOW_NS,
                 TEST_NOW_SECS,
                 &mut screen,
                 &mut counters,
@@ -1389,6 +1410,7 @@ mod tests {
                     &ack_frame,
                     ack_meta,
                     None,
+                    TEST_NOW_NS,
                     TEST_NOW_SECS,
                     &mut cookie_screen,
                     &mut counters,
@@ -2286,6 +2308,7 @@ mod tests {
             &frame,
             meta,
             None,
+            TEST_NOW_NS,
             TEST_NOW_SECS,
             &mut screen,
             &mut counters,
@@ -2322,6 +2345,7 @@ mod tests {
             &frame_untagged,
             meta_untagged,
             None,
+            TEST_NOW_NS,
             TEST_NOW_SECS,
             &mut screen2,
             &mut counters2,
@@ -2483,6 +2507,7 @@ mod tests {
             frame,
             meta,
             None,
+            TEST_NOW_NS,
             TEST_NOW_SECS,
             screen,
             &mut counters,

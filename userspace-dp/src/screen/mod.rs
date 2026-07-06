@@ -151,7 +151,7 @@ use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
 // builds flag bytes with the named bits, so keep them test-visible.
 #[cfg(test)]
 use packet::{TCP_FIN, TCP_URG};
-use rate::RateCounter;
+use rate::{RateCounter, TokenBucket};
 use scan::{IpSweepTracker, PortScanTracker};
 use syn_rate::SynRateSketch;
 #[cfg(not(test))]
@@ -165,9 +165,24 @@ pub(crate) struct ScreenState {
     // SECONDARY zone-saturation ceiling (checked at `SECONDARY_FLOOD_CEILING_MULT
     // × threshold`) above the PRIMARY per-destination sketches below; Junos
     // measures the ICMP/UDP flood rate per destination, not per zone.
-    icmp_counters: FxHashMap<String, RateCounter>,
-    udp_counters: FxHashMap<String, RateCounter>,
+    // #3607: the ICMP/UDP per-zone flood aggregates are SHAPERS ("admitted"
+    // just means "not dropped"), so they use a monotonic-ns `TokenBucket` that
+    // admits a sustained-at-threshold stream correctly. The `syn_counters`
+    // aggregate below stays a `RateCounter`: it is count-all and its
+    // "admission" activates SYN cookies / drives the alarm, where the
+    // sustained-at-threshold over-throttle is deliberate (see rate.rs).
+    icmp_counters: FxHashMap<String, TokenBucket>,
+    udp_counters: FxHashMap<String, TokenBucket>,
     syn_counters: FxHashMap<String, RateCounter>,
+    /// #3607: per-zone SYN-flood aggregate DROP shaper used ONLY when
+    /// `syn-cookie` is OFF. With no cookie to bypass, a sustained-at-threshold
+    /// legitimate SYN stream must be admitted, so the drop authority is this
+    /// token bucket (capacity = refill = `syn_flood_threshold`) rather than the
+    /// count-all `syn_counters`. It is the SOLE drop gate on every initial SYN
+    /// in the cookie-OFF case, so there is no double-quota with the aggregate
+    /// (which still counts, but only to drive the alarm). Unused while
+    /// `syn-cookie` is ON.
+    syn_off_attack_buckets: FxHashMap<String, TokenBucket>,
     /// #4112: per-zone per-DESTINATION-IP ICMP flood sketch (Junos `icmp flood
     /// threshold` is per destination). Present (Some) only for zones whose
     /// `icmp_flood_threshold > 0`; reuses the #3315 count-min `SynRateSketch`
@@ -179,7 +194,12 @@ pub(crate) struct ScreenState {
     /// `increment_ip_port`. PRIMARY cap — checked before the per-zone aggregate.
     udp_dst_sketch: FxHashMap<String, SynRateSketch>,
     syn_cookie_active_until_secs: FxHashMap<String, u64>,
-    syn_cookie_standby_ack_counters: FxHashMap<String, RateCounter>,
+    /// #3607: the standby SYN-cookie ACK validation budget is a validate-budget
+    /// shaper ("admitted" = "spend a SipHash on a plausible returning ACK"; a
+    /// bogus ACK still fails the crypto check), so it uses a `TokenBucket` and
+    /// no longer suppresses legitimate returning clients parked at the budget
+    /// rate after a failover.
+    syn_cookie_standby_ack_counters: FxHashMap<String, TokenBucket>,
     syn_cookie_codec: Option<SynCookieCodec>,
     syn_cookie_validated: SynCookieValidatedCache,
     /// #2446: per-zone SYN-cookie profile generation. Bumped in
@@ -286,6 +306,14 @@ const MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC: u32 = 1;
 /// it is derived from the single configured per-destination threshold.
 const SECONDARY_FLOOD_CEILING_MULT: u32 = 8;
 
+/// Nanoseconds per second. Used by the second-granularity convenience wrappers
+/// (`check_packet` / `check_packet_with_zone_id` / `check_flowless_screens`) to
+/// derive a monotonic-ns value for the token-bucket consumers from `now_secs`.
+/// The production dataplane path threads the real batch-cached `loop_now_ns`
+/// through the `_opts` variants instead (#3607), so the token buckets get
+/// sub-second resolution where the #2937 micro-burst bound matters.
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+
 impl ScreenState {
     pub fn new() -> Self {
         Self {
@@ -293,6 +321,7 @@ impl ScreenState {
             icmp_counters: FxHashMap::default(),
             udp_counters: FxHashMap::default(),
             syn_counters: FxHashMap::default(),
+            syn_off_attack_buckets: FxHashMap::default(),
             icmp_dst_sketch: FxHashMap::default(),
             udp_dst_sketch: FxHashMap::default(),
             syn_cookie_active_until_secs: FxHashMap::default(),
@@ -373,6 +402,8 @@ impl ScreenState {
         self.icmp_counters.retain(|k, _| profiles.contains_key(k));
         self.udp_counters.retain(|k, _| profiles.contains_key(k));
         self.syn_counters.retain(|k, _| profiles.contains_key(k));
+        self.syn_off_attack_buckets
+            .retain(|k, _| profiles.contains_key(k));
         // #4112: drop the per-destination ICMP/UDP flood sketches for zones that
         // lost the corresponding threshold (memory tracks live config), mirroring
         // the #3315 SYN sketches below.
@@ -395,6 +426,7 @@ impl ScreenState {
             self.icmp_counters.entry(zone.clone()).or_default();
             self.udp_counters.entry(zone.clone()).or_default();
             self.syn_counters.entry(zone.clone()).or_default();
+            self.syn_off_attack_buckets.entry(zone.clone()).or_default();
             // #4112: allocate the per-destination ICMP/UDP flood sketches ONCE
             // per zone that configures the threshold (`or_insert_with` preserves
             // in-flight counters across an unrelated profile edit; the
@@ -595,14 +627,11 @@ impl ScreenState {
         self.syn_cookie_full_epoch_override = Some(full_epoch);
     }
 
-    fn standby_syn_cookie_ack_validation_limited(&mut self, zone: &str, now_secs: u64) -> bool {
+    fn standby_syn_cookie_ack_validation_limited(&mut self, zone: &str, now_ns: u64) -> bool {
         self.syn_cookie_standby_ack_counters
             .get_mut(zone)
-            .map(|counter| {
-                counter.increment(
-                    now_secs,
-                    SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC,
-                )
+            .map(|bucket| {
+                bucket.admit_is_over(now_ns, SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC)
             })
             .unwrap_or(true)
     }
@@ -621,18 +650,23 @@ impl ScreenState {
         zone: &str,
         dst_ip: &IpAddr,
         threshold: u32,
+        now_ns: u64,
         now_secs: u64,
     ) -> bool {
-        // (1) per-DESTINATION cap — PRIMARY (Junos parity).
+        // (1) per-DESTINATION cap — PRIMARY (Junos parity). Still the #3315
+        // count-min `RateCounter` sketch (deferred from the #3607 migration —
+        // see the plan §5b); keyed on `now_secs`.
         if let Some(sketch) = self.icmp_dst_sketch.get_mut(zone)
             && sketch.increment(dst_ip, now_secs, threshold)
         {
             return true;
         }
-        // (2) per-zone aggregate — SECONDARY ceiling.
-        if let Some(counter) = self.icmp_counters.get_mut(zone) {
-            return counter.increment(
-                now_secs,
+        // (2) per-zone aggregate — SECONDARY ceiling. #3607: a `TokenBucket`
+        // shaper (`now_ns`) so a sustained-at-ceiling zone is admitted rather
+        // than throttled to ~0 after the first second.
+        if let Some(bucket) = self.icmp_counters.get_mut(zone) {
+            return bucket.admit_is_over(
+                now_ns,
                 threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT),
             );
         }
@@ -650,18 +684,21 @@ impl ScreenState {
         dst_ip: &IpAddr,
         dst_port: u16,
         threshold: u32,
+        now_ns: u64,
         now_secs: u64,
     ) -> bool {
-        // (1) per-DESTINATION (IP + PORT) cap — PRIMARY (Junos parity).
+        // (1) per-DESTINATION (IP + PORT) cap — PRIMARY (Junos parity). Still
+        // the #3315 `RateCounter` sketch (deferred, `now_secs`).
         if let Some(sketch) = self.udp_dst_sketch.get_mut(zone)
             && sketch.increment_ip_port(dst_ip, dst_port, now_secs, threshold)
         {
             return true;
         }
-        // (2) per-zone aggregate — SECONDARY ceiling.
-        if let Some(counter) = self.udp_counters.get_mut(zone) {
-            return counter.increment(
-                now_secs,
+        // (2) per-zone aggregate — SECONDARY ceiling. #3607: `TokenBucket`
+        // shaper (`now_ns`).
+        if let Some(bucket) = self.udp_counters.get_mut(zone) {
+            return bucket.admit_is_over(
+                now_ns,
                 threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT),
             );
         }
@@ -696,7 +733,12 @@ impl ScreenState {
         pkt: &ScreenPacketInfo,
         now_secs: u64,
     ) -> ScreenVerdict {
-        self.check_packet_with_zone_id_opts(zone, zone_id, pkt, now_secs, false)
+        // Second-granularity convenience wrapper (tests / non-cookie callers):
+        // derive a monotonic-ns value for the #3607 token-bucket consumers.
+        // The production path calls `check_packet_with_zone_id_opts` directly
+        // with the real batch `loop_now_ns`.
+        let now_ns = now_secs.saturating_mul(NANOS_PER_SEC);
+        self.check_packet_with_zone_id_opts(zone, zone_id, pkt, now_ns, now_secs, false)
     }
 
     /// As `check_packet_with_zone_id`, but `skip_rate_flood` suppresses the
@@ -716,6 +758,7 @@ impl ScreenState {
         zone: &str,
         zone_id: u16,
         pkt: &ScreenPacketInfo,
+        now_ns: u64,
         now_secs: u64,
         skip_rate_flood: bool,
     ) -> ScreenVerdict {
@@ -814,7 +857,7 @@ impl ScreenState {
         // (SECONDARY). Junos measures this rate per destination IP (#4112 F18).
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_secs)
+            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns, now_secs)
         {
             return ScreenVerdict::Drop("icmp-flood");
         }
@@ -829,6 +872,7 @@ impl ScreenState {
                 &pkt.dst_ip,
                 pkt.dst_port,
                 udp_flood_threshold,
+                now_ns,
                 now_secs,
             )
         {
@@ -909,8 +953,22 @@ impl ScreenState {
                         self.syn_flood_dst_drops = self.syn_flood_dst_drops.wrapping_add(1);
                         return ScreenVerdict::Drop("syn-flood");
                     }
-                    if over_attack {
-                        if syn_cookie {
+                    // (3) aggregate over-attack verdict.
+                    //   - `syn-cookie` ON: the MEASURED count-all `over_attack`
+                    //     mints a SYN-cookie challenge / activates cookies
+                    //     (UNCHANGED). Admitting a sustained-at-threshold stream
+                    //     here would let `threshold` spoofed SYNs/s bypass the
+                    //     cookie AND the per-source cap — the round-1 BLOCKER —
+                    //     so the count-all latch is deliberately retained.
+                    //   - `syn-cookie` OFF (#3607): there is no cookie to bypass,
+                    //     so a sustained-at-threshold legit SYN stream MUST be
+                    //     admitted. The per-zone `TokenBucket` is the SOLE drop
+                    //     authority, consulted on EVERY initial SYN and decoupled
+                    //     from the measured `over_attack`. One gate ⇒ no
+                    //     double-quota; the cold-start-full burst is bounded to
+                    //     capacity = `threshold`, preserving #2937.
+                    if syn_cookie {
+                        if over_attack {
                             // In `alarm-without-drop` (audit) mode do NOT mark
                             // the zone SYN-cookie-active. The challenge minted
                             // below is converted to a log-only alarm + Pass by
@@ -954,14 +1012,23 @@ impl ScreenState {
                                 peer_mss: pkt.tcp_mss,
                             });
                         }
+                    } else if let Some(bucket) = self.syn_off_attack_buckets.get_mut(zone)
+                        && bucket.admit_is_over(now_ns, syn_flood_threshold)
+                    {
                         return ScreenVerdict::Drop("syn-flood");
                     }
-                    // Alarm-threshold crossed but below attack (we returned
-                    // above otherwise): raise a log-only alarm at most once per
-                    // second per zone. The verdict is unaffected — the packet
-                    // continues to the per-IP checks and (if clean) forwards.
+                    // Alarm-threshold crossed but below attack: raise a log-only
+                    // alarm at most once per second per zone. The verdict is
+                    // unaffected — the packet continues to the per-IP checks and
+                    // (if clean) forwards. #3607: the cookie-OFF token bucket may
+                    // ADMIT a SYN whose MEASURED arrival rate is over-attack, so
+                    // gate the alarm EXPLICITLY on the measured `!over_attack`
+                    // (previously implied by the cookie-OFF over-attack early
+                    // return) so `syn-flood-alarm` still fires only in the
+                    // warning band between alarm- and attack-threshold (AGY r4).
                     if syn_alarm_threshold > 0
                         && over_alarm
+                        && !over_attack
                         && let Some(last) = self.syn_alarm_last_emit_sec.get_mut(zone)
                         && *last != now_secs
                     {
@@ -1067,7 +1134,9 @@ impl ScreenState {
         addrs_known: bool,
         now_secs: u64,
     ) -> ScreenVerdict {
-        self.check_flowless_screens_opts(zone, pkt, addrs_known, now_secs, false)
+        // Second-granularity convenience wrapper; see `check_packet_with_zone_id`.
+        let now_ns = now_secs.saturating_mul(NANOS_PER_SEC);
+        self.check_flowless_screens_opts(zone, pkt, addrs_known, now_ns, now_secs, false)
     }
 
     /// As `check_flowless_screens`, but `skip_rate_flood` suppresses the
@@ -1082,6 +1151,7 @@ impl ScreenState {
         zone: &str,
         pkt: &ScreenPacketInfo,
         addrs_known: bool,
+        now_ns: u64,
         now_secs: u64,
         skip_rate_flood: bool,
     ) -> ScreenVerdict {
@@ -1137,7 +1207,7 @@ impl ScreenState {
         // fragment-based flood from evading the per-destination cap.
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_secs)
+            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns, now_secs)
         {
             return ScreenVerdict::Drop("icmp-flood");
         }
@@ -1152,6 +1222,7 @@ impl ScreenState {
                 &pkt.dst_ip,
                 pkt.dst_port,
                 udp_flood_threshold,
+                now_ns,
                 now_secs,
             )
         {
@@ -1289,6 +1360,7 @@ impl ScreenState {
         zone: &str,
         zone_id: u16,
         pkt: &ScreenPacketInfo,
+        now_ns: u64,
         now_secs: u64,
     ) -> SynCookieAckVerdict {
         let Some(profile) = self.profiles.get(zone) else {
@@ -1326,7 +1398,7 @@ impl ScreenState {
             if !SynCookieCodec::wire_epoch_matches_validation_window(current_epoch, cookie_isn) {
                 return SynCookieAckVerdict::NotApplicable;
             }
-            if self.standby_syn_cookie_ack_validation_limited(zone, now_secs) {
+            if self.standby_syn_cookie_ack_validation_limited(zone, now_ns) {
                 return SynCookieAckVerdict::NotApplicable;
             }
         }
@@ -1356,12 +1428,26 @@ impl ScreenState {
         self.syn_cookie_active_until_secs.len()
     }
 
+    /// #3607: whole tokens still available in a zone's standby SYN-cookie ACK
+    /// validation budget. Test seam replacing the old `RateCounter::count`
+    /// accessor: `0` means the budget is fully spent for this instant.
     #[cfg(test)]
-    fn syn_cookie_standby_ack_count(&self, zone: &str) -> u32 {
+    fn syn_cookie_standby_ack_available(&self, zone: &str) -> u64 {
         self.syn_cookie_standby_ack_counters
             .get(zone)
-            .map(|counter| counter.count)
+            .map(|bucket| bucket.available_tokens())
             .unwrap_or(0)
+    }
+
+    /// #3607: true if a zone's standby SYN-cookie ACK budget bucket has never
+    /// been charged — i.e. the validate path rejected the ACK BEFORE reaching
+    /// the standby limiter, so no SipHash budget was spent. Test seam.
+    #[cfg(test)]
+    fn syn_cookie_standby_ack_untouched(&self, zone: &str) -> bool {
+        self.syn_cookie_standby_ack_counters
+            .get(zone)
+            .map(|bucket| bucket.is_cold())
+            .unwrap_or(true)
     }
 
     /// Returns true if any zone has session limits, port scan, or IP sweep enabled.

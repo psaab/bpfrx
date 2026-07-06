@@ -6,6 +6,14 @@
 use super::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// #3607: nanoseconds per second. The `_opts` / `validate_*` screen entry
+/// points now take a monotonic `now_ns` before `now_secs`; these tests pass
+/// `<secs> * NS` so the token-bucket consumers see second-granular time
+/// (equivalent to the pre-#3607 per-second semantics) except where a test
+/// explicitly drives sub-second `now_ns` to exercise the refill / micro-burst
+/// behaviour.
+const NS: u64 = 1_000_000_000;
+
 fn default_profile() -> ScreenProfile {
     ScreenProfile {
         land: true,
@@ -2178,6 +2186,77 @@ fn syn_flood_disabled_passes() {
     }
 }
 
+/// #3607 (M09) RED-ON-REVERT: with `syn-cookie` OFF, a legitimate SYN stream
+/// parked at EXACTLY `syn_flood_threshold`/second stays ADMITTED — the
+/// cookie-OFF token bucket refills at the configured rate. Reverting the
+/// migration (the count-all `RateCounter` aggregate as the drop authority)
+/// throttles the stream to ~0 after the first second, so this is RED on the
+/// pre-#3607 code. Events are paced at the real monotonic rate via `now_ns`.
+#[test]
+fn syn_flood_cookie_off_sustained_at_threshold_admitted() {
+    const THRESHOLD: u32 = 100;
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = THRESHOLD; // syn_cookie stays false (default)
+    let mut state = make_state("trust", profile);
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    let interval_ns = NS / THRESHOLD as u64; // exactly threshold events/second
+    let mut now_ns = 9 * NS;
+    let total = THRESHOLD * 15; // 15 seconds sustained at threshold
+    let mut admitted = 0u32;
+    for _ in 0..total {
+        let now_secs = now_ns / NS;
+        if state.check_packet_with_zone_id_opts("trust", 3, &pkt, now_ns, now_secs, false)
+            == ScreenVerdict::Pass
+        {
+            admitted += 1;
+        }
+        now_ns += interval_ns;
+    }
+    assert!(
+        admitted as f64 >= 0.99 * total as f64,
+        "cookie-OFF sustained-at-threshold must stay admitted (#3607): {admitted}/{total}"
+    );
+}
+
+/// #3607 (Codex round-4) cookie-OFF single-gate micro-burst bound: on a fresh
+/// zone an INSTANTANEOUS burst admits AT MOST `threshold` (the bucket
+/// capacity), NOT ~2x. Proves the token bucket is the SOLE drop authority when
+/// `syn-cookie` is OFF — there is no "aggregate admits T + full bucket admits
+/// another T" double-quota, and #2937's anti-micro-burst property holds.
+#[test]
+fn syn_flood_cookie_off_microburst_bounded_to_threshold() {
+    const THRESHOLD: u32 = 50;
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = THRESHOLD;
+    let mut state = make_state("trust", profile);
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    let now_ns = 5 * NS;
+    let mut admitted = 0u32;
+    for _ in 0..(THRESHOLD * 3) {
+        if state.check_packet_with_zone_id_opts("trust", 3, &pkt, now_ns, 5, false)
+            == ScreenVerdict::Pass
+        {
+            admitted += 1;
+        }
+    }
+    assert_eq!(
+        admitted, THRESHOLD,
+        "cookie-OFF instantaneous burst bounded to capacity (no double-quota)"
+    );
+}
+
 // ================================================================
 // SYN-flood sub-thresholds (#3315): source / destination / alarm
 // ================================================================
@@ -3004,7 +3083,7 @@ fn syn_cookie_ack_validation_marks_next_syn_bypass_without_session_creation() {
     ack.tcp_seq = 2;
     ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
     assert_eq!(
-        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Validated
     );
     assert_eq!(state.syn_cookie_validated_len(), 1);
@@ -3061,7 +3140,7 @@ fn syn_cookie_validated_syn_bypasses_flood_gate_and_passes() {
     ack.tcp_flags = TCP_ACK;
     ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
     assert_eq!(
-        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Validated
     );
 
@@ -3107,7 +3186,7 @@ fn syn_cookie_invalid_ack_does_not_validate_client() {
     ack.tcp_seq = 2;
     ack.tcp_ack = 0xdead_beefu32;
     assert_eq!(
-        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Invalid
     );
     assert_eq!(state.syn_cookie_validated_len(), 0);
@@ -3164,7 +3243,7 @@ fn syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10() {
          by the consumer)"
     );
     assert_eq!(
-        astate.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        astate.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::NotApplicable,
         "alarm-without-drop must FORWARD the returning session-miss ACK, not \
          drop it as Invalid"
@@ -3188,7 +3267,7 @@ fn syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10() {
         ScreenVerdict::SynCookieChallenge(_)
     ));
     assert_eq!(
-        nstate.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        nstate.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Invalid,
         "non-audit syn-cookie flow must still drop the invalid ACK (unchanged)"
     );
@@ -3220,7 +3299,7 @@ fn syn_cookie_ack_validates_on_peer_without_local_active_window() {
     ack.tcp_ack = cookie_isn.wrapping_add(1);
 
     assert_eq!(
-        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Validated,
         "HA backup must accept a peer-minted cookie without a local flood window"
     );
@@ -3253,7 +3332,7 @@ fn syn_cookie_ack_validates_on_peer_one_epoch_behind_active() {
     ack.tcp_ack = active_cookie.wrapping_add(1);
 
     assert_eq!(
-        standby.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        standby.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Validated,
         "standby one epoch behind must accept cookies minted by the former active"
     );
@@ -3281,7 +3360,7 @@ fn syn_cookie_invalid_ack_without_active_window_remains_not_applicable() {
     ack.tcp_ack = 0xdead_beefu32;
 
     assert_eq!(
-        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::NotApplicable,
         "inactive peers only consume ACKs that validate against the shared key"
     );
@@ -3310,13 +3389,12 @@ fn syn_cookie_standby_ack_prefilter_skips_implausible_epoch_bits() {
     ack.tcp_ack = implausible_cookie.wrapping_add(1);
 
     assert_eq!(
-        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::NotApplicable,
         "inactive peers should reject ACKs outside the epoch window before MAC work"
     );
-    assert_eq!(
-        peer.syn_cookie_standby_ack_count("trust"),
-        0,
+    assert!(
+        peer.syn_cookie_standby_ack_untouched("trust"),
         "wire-epoch prefilter must not spend standby validation budget"
     );
 }
@@ -3344,16 +3422,19 @@ fn syn_cookie_standby_ack_validation_is_rate_limited() {
     bad_ack.tcp_ack =
         (((41u32 & SYN_COOKIE_EPOCH_MASK) << SYN_COOKIE_EPOCH_SHIFT) | 0x1234).wrapping_add(1);
 
+    // #3607: the standby budget is now a monotonic-ns TOKEN BUCKET. Drain the
+    // whole budget at ONE instant — a bogus-but-plausible ACK still spends a
+    // SipHash (then fails the crypto check → NotApplicable), so every event
+    // consumes a token.
+    let base_ns = 128 * NS;
     for _ in 0..SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC {
         assert_eq!(
-            peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &bad_ack, 128),
+            peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &bad_ack, base_ns, 128),
             SynCookieAckVerdict::NotApplicable
         );
     }
-    assert_eq!(
-        peer.syn_cookie_standby_ack_count("trust"),
-        SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC
-    );
+    // The instantaneous budget is fully spent.
+    assert_eq!(peer.syn_cookie_standby_ack_available("trust"), 0);
 
     let valid_cookie =
         syn_cookie_codec().mint_isn(SynCookieTuple::from_packet(&syn), 7, 41, syn.tcp_mss);
@@ -3362,32 +3443,33 @@ fn syn_cookie_standby_ack_validation_is_rate_limited() {
     valid_ack.tcp_seq = 3;
     valid_ack.tcp_ack = valid_cookie.wrapping_add(1);
 
+    // A valid ACK at the same instant is still capped (budget exhausted): the
+    // standby guard refuses to spend more SipHash beyond the per-second budget.
     assert_eq!(
-        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, 128),
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, base_ns, 128),
         SynCookieAckVerdict::NotApplicable,
-        "standby validation budget should cap SipHash work for the current second"
+        "standby validation budget should cap SipHash work at this instant"
     );
     assert_eq!(peer.syn_cookie_validated_len(), 0);
 
-    // #2937: the standby budget is a SLIDING 1-second window, not a fixed
-    // wall-second one. The immediately following second (129) must NOT
-    // hand out a fresh full budget — the prior second's saturated tally
-    // still counts, so the attacker cannot double its plausible-ACK
-    // allowance by straddling the boundary. A valid ACK at 129 stays
-    // capped.
+    // #2937 RETAINED: a sub-millisecond straddle (+1us) accrues a negligible
+    // refill, so the attacker cannot double its plausible-ACK allowance by
+    // bursting across a boundary — the valid ACK stays capped.
     assert_eq!(
-        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, 129),
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, base_ns + 1_000, 128),
         SynCookieAckVerdict::NotApplicable,
-        "boundary crossing must not reset the standby validation budget"
+        "a sub-ms micro-burst must not refill the standby budget"
     );
     assert_eq!(peer.syn_cookie_validated_len(), 0);
 
-    // After a full empty second (130 saw no traffic from 129), second 131
-    // observes prev_count == 0 and the budget is available again.
+    // #3607: after a full second the bucket refills at its configured rate, so
+    // a legitimate returning client (e.g. right after a failover) is NO LONGER
+    // suppressed — the old sliding window kept it capped until a fully idle
+    // second. The valid ACK now validates.
     assert_eq!(
-        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, 131),
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, base_ns + NS, 129),
         SynCookieAckVerdict::Validated,
-        "the standby guard recovers after a full quiet second"
+        "the standby budget refills at its configured rate (#3607)"
     );
     assert_eq!(peer.syn_cookie_validated_len(), 1);
 }
@@ -3420,7 +3502,7 @@ fn syn_cookie_ack_fin_is_invalid_while_cookie_mode_is_active() {
     ack_fin.tcp_flags = TCP_ACK | TCP_FIN;
     ack_fin.tcp_ack = challenge.cookie_isn.wrapping_add(1);
     assert_eq!(
-        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack_fin, 128),
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack_fin, 128 * NS, 128),
         SynCookieAckVerdict::Invalid
     );
     assert_eq!(state.syn_cookie_validated_len(), 0);
@@ -3500,7 +3582,7 @@ fn syn_cookie_invalid_ack_flood_does_not_grow_validated_cache() {
         ack.src_port = 30000 + offset;
         ack.tcp_ack = 0xdead_0000u32.wrapping_add(offset as u32);
         assert_eq!(
-            state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+            state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
             SynCookieAckVerdict::Invalid
         );
     }
@@ -3535,7 +3617,7 @@ fn syn_cookie_master_key_rotation_clears_validated_cache() {
     ack.tcp_flags = TCP_ACK;
     ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
     assert_eq!(
-        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Validated
     );
     assert_eq!(state.syn_cookie_validated_len(), 1);
@@ -3570,7 +3652,7 @@ fn install_validated_syn_cookie_entry(state: &mut ScreenState, zone: &str, zone_
     ack.tcp_flags = TCP_ACK;
     ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
     assert_eq!(
-        state.validate_syn_cookie_ack_on_session_miss(zone, zone_id, &ack, 128),
+        state.validate_syn_cookie_ack_on_session_miss(zone, zone_id, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Validated
     );
     assert_eq!(state.syn_cookie_validated_len(), 1);
@@ -3811,7 +3893,7 @@ fn syn_cookie_ack_validation_accepts_previous_epoch_after_rotation() {
     ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
     state.set_syn_cookie_full_epoch_for_test(2);
     assert_eq!(
-        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
         SynCookieAckVerdict::Validated,
         "ACK after the epoch tick must validate against the previous full epoch"
     );
@@ -4875,7 +4957,7 @@ fn fabric_skip_does_not_count_icmp_flood_4155() {
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
     for i in 0..8 {
         assert_eq!(
-            state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, true),
+            state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100 * NS, 100, true),
             ScreenVerdict::Pass,
             "fabric-redirected ICMP #{i} must not be re-counted on the owner"
         );
@@ -4893,7 +4975,7 @@ fn fabric_skip_does_not_count_udp_flood_4155() {
         let mut pkt = udp_pkt(src, dst);
         pkt.dst_ip = dst;
         assert_eq!(
-            state.check_packet_with_zone_id_opts("trust", 3, &pkt, 100, true),
+            state.check_packet_with_zone_id_opts("trust", 3, &pkt, 100 * NS, 100, true),
             ScreenVerdict::Pass,
             "fabric-redirected UDP #{i} must not be re-counted on the owner"
         );
@@ -4912,7 +4994,7 @@ fn fabric_skip_does_not_count_syn_flood_4155() {
     for i in 0..8 {
         let pkt = tcp_pkt(src, dst, 1234 + i, 80, TCP_SYN);
         assert_eq!(
-            state.check_packet_with_zone_id_opts("trust", 3, &pkt, 100, true),
+            state.check_packet_with_zone_id_opts("trust", 3, &pkt, 100 * NS, 100, true),
             ScreenVerdict::Pass,
             "fabric-redirected SYN #{i} must not be re-counted (no syn-flood, no cookie)"
         );
@@ -4927,7 +5009,7 @@ fn fabric_skip_still_runs_stateless_land_4155() {
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     let pkt = tcp_pkt(src, src, 80, 80, TCP_SYN);
     assert_eq!(
-        state.check_packet_with_zone_id_opts("trust", 3, &pkt, 1, true),
+        state.check_packet_with_zone_id_opts("trust", 3, &pkt, NS, 1, true),
         ScreenVerdict::Drop("land-attack"),
         "stateless LAND must still fire on fabric traffic"
     );
@@ -4942,7 +5024,14 @@ fn fabric_skip_flowless_does_not_count_icmp_flood_4155() {
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
     for i in 0..8 {
         assert_eq!(
-            state.check_flowless_screens_opts("trust", &flowless_icmp_pkt(src, dst), true, 100, true),
+            state.check_flowless_screens_opts(
+                "trust",
+                &flowless_icmp_pkt(src, dst),
+                true,
+                100 * NS,
+                100,
+                true,
+            ),
             ScreenVerdict::Pass,
             "fabric-redirected flowless ICMP #{i} must not be re-counted"
         );
@@ -4963,7 +5052,7 @@ fn fabric_skip_flowless_still_runs_teardrop_4155() {
     pkt.ip_frag_off = 0x0001; // offset 1 unit (non-first)
     pkt.ip_total_len = 24; // 20-byte header + 4-byte payload (< 8) → teardrop
     assert_eq!(
-        state.check_flowless_screens_opts("trust", &pkt, true, 1, true),
+        state.check_flowless_screens_opts("trust", &pkt, true, NS, 1, true),
         ScreenVerdict::Drop("teardrop"),
         "stateless teardrop must still fire on fabric flowless traffic"
     );
@@ -4983,26 +5072,26 @@ fn fabric_skip_leaves_direct_ingress_counting_intact_4155() {
     // 5 fabric packets — none may count.
     for _ in 0..5 {
         assert_eq!(
-            state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, true),
+            state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100 * NS, 100, true),
             ScreenVerdict::Pass
         );
     }
     // Direct ingress: 3 pass (threshold 3), 4th drops. If fabric packets had
     // polluted the counter the drop would come EARLY (RED-on-revert of scope).
     assert_eq!(
-        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100 * NS, 100, false),
         ScreenVerdict::Pass
     );
     assert_eq!(
-        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100 * NS, 100, false),
         ScreenVerdict::Pass
     );
     assert_eq!(
-        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100 * NS, 100, false),
         ScreenVerdict::Pass
     );
     assert_eq!(
-        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100, false),
+        state.check_packet_with_zone_id_opts("trust", 3, &icmp_pkt(src, dst, 84), 100 * NS, 100, false),
         ScreenVerdict::Drop("icmp-flood"),
         "direct ingress reaches the flood threshold at the correct count"
     );
