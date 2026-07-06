@@ -36061,3 +36061,33 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md,
   docs/userspace-dataplane-architecture.md,
   docs/research/3616-ipsec-host-inbound/*.md (materialized + status stamp).
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A — first authenticated cluster control channel + config
+  foundation for the PSK/HMAC program (F1-stronger + F23). Config: added the
+  `set chassis cluster authentication-key <key>` leaf (schema_chassis.go),
+  `ClusterConfig.ControlLinkAuthKey config.Secret` (types_chassis.go), and the
+  Secret compile (compiler_system.go). Redaction is inherited free — the
+  `authentication-key` keyword is already in ast_redact.go's secret set
+  (##SECRET-DATA## in raw-AST renders) and the Secret type redacts JSON/YAML/
+  String(). Heartbeat/election channel authed: MarshalHeartbeatAuth appends a
+  52-byte trailer (magic XPFA + session + monotonic counter + HMAC-SHA256 over
+  the whole frame) after the version trailer (additive, legacy-parseable). The
+  receiver rejects a forged/tampered/replayed heartbeat BEFORE lastSeen refresh
+  or handlePeerHeartbeat. Dual-accept (heartbeatAuthDecision) mirrors the #4126
+  VRRP-checksum migration: no key → accept all; key + present → enforce HMAC +
+  anti-replay; key + absent + peer-never-authed → accept; key + absent +
+  peerAuthSeen (sticky, set only by a verified frame) → reject (downgrade).
+  Anti-replay (heartbeatAuthReplay) is strict within a session and re-anchors on
+  a new random session id, so a reboot/restart (test-failover) is never a false
+  replay. Key plumbed via Manager.UpdateConfig → controlLinkAuthKey(); raw
+  bytes, never logged; fetched fresh each send/recv so a commit takes effect
+  without a heartbeat restart. RED-on-revert proven: neutering
+  heartbeatAuthDecision to always-accept turns bad-hmac / replay / downgrade /
+  forged-frame assertions RED. go test ./pkg/config/... ./pkg/cluster/... green
+  (incl. -race); go build ./..., gofmt, go vet clean. Follow-up channels
+  (session-sync frames, fabric gRPC) reuse the same ControlLinkAuthKey.
+- **File(s)**: pkg/config/schema_chassis.go, pkg/config/types_chassis.go,
+  pkg/config/compiler_system.go, pkg/config/compiler_cluster_authkey_4107_test.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/manager.go, pkg/cluster/group_state.go,
+  pkg/cluster/heartbeat_auth_test.go, pkg/cluster/README.md, _Log.md

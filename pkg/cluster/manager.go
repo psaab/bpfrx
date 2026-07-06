@@ -160,11 +160,17 @@ type Manager struct {
 
 	// Heartbeat config.
 	controlInterface string
-	hbInterval       time.Duration
-	hbThreshold      int
-	hbLocalAddr      string // last StartHeartbeat localAddr (for restart)
-	hbPeerAddr       string // last StartHeartbeat peerAddr (for restart)
-	hbVRFDevice      string // last StartHeartbeat vrfDevice (for restart)
+	// controlAuthKey is the #4107 shared PSK authenticating cluster
+	// control-channel messages (chassis cluster authentication-key). Empty =
+	// no auth (legacy dual-accept). Raw key bytes; NEVER logged. Replaced (not
+	// mutated in place) under m.mu on config apply; read via
+	// controlLinkAuthKey().
+	controlAuthKey []byte
+	hbInterval     time.Duration
+	hbThreshold    int
+	hbLocalAddr    string // last StartHeartbeat localAddr (for restart)
+	hbPeerAddr     string // last StartHeartbeat peerAddr (for restart)
+	hbVRFDevice    string // last StartHeartbeat vrfDevice (for restart)
 
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
@@ -299,6 +305,16 @@ func (m *Manager) NodeID() int { return m.nodeID }
 
 // ClusterID returns the cluster ID.
 func (m *Manager) ClusterID() int { return m.clusterID }
+
+// controlLinkAuthKey returns the configured cluster control-channel PSK (raw
+// bytes), or nil when no key is configured. The value is a secret and must
+// never be logged. The slice is only ever replaced (never mutated in place),
+// so returning the header under RLock is race-free for the read-only HMAC use.
+func (m *Manager) controlLinkAuthKey() []byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.controlAuthKey
+}
 
 // Events returns the event channel for state change notifications.
 func (m *Manager) Events() <-chan ClusterEvent { return m.eventCh }

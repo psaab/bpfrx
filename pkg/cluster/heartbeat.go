@@ -1,6 +1,10 @@
 package cluster
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -50,6 +54,22 @@ const (
 
 	// DefaultHeartbeatThreshold is the default missed heartbeat count before peer is lost.
 	DefaultHeartbeatThreshold = 5
+
+	// heartbeatAuthMagic marks the optional #4107 PSK/HMAC auth trailer.
+	// Distinct from heartbeatMagic ("BPFX") so a reader can unambiguously
+	// detect a trailer at the tail of a frame. The trailer is appended AFTER
+	// the optional version trailer; UnmarshalHeartbeat ignores any bytes past
+	// the version section, so a signed frame is wire-compatible with a legacy
+	// or not-yet-keyed peer (dual-accept during a rolling upgrade).
+	heartbeatAuthMagic = "XPFA"
+
+	// heartbeatAuthMACSize is the HMAC-SHA256 digest length.
+	heartbeatAuthMACSize = 32
+
+	// heartbeatAuthTrailerSize = magic(4) + session(8) + counter(8) + HMAC(32).
+	// session+counter are the anti-replay nonce: a random per-sender-process
+	// session id plus a monotonic per-session counter.
+	heartbeatAuthTrailerSize = 4 + 8 + 8 + heartbeatAuthMACSize
 )
 
 // HeartbeatPacket is the wire format for cluster heartbeats.
@@ -289,6 +309,170 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 	return pkt, nil
 }
 
+// --- #4107 control-channel authentication (heartbeat/election) -------------
+//
+// The cluster heartbeat drives election: handlePeerHeartbeat rebuilds peer RG
+// state directly from the packet and runs runElection(), so a forged cleartext
+// heartbeat can force the local node PRIMARY or demote the peer. When a shared
+// PSK (chassis cluster authentication-key) is configured, the sender appends an
+// HMAC-SHA256 trailer over the whole frame plus an anti-replay nonce, and the
+// receiver rejects a heartbeat that fails (or, once both nodes are keyed, lacks)
+// authentication BEFORE it can refresh peer liveness or drive election.
+//
+// Dual-accept (rolling upgrade): a node without a key emits and accepts legacy
+// frames; a keyed node accepts an unauthenticated frame until it has observed
+// the peer authenticate (proving both nodes hold the key), after which an
+// unauthenticated frame is a downgrade attack and is rejected. This mirrors the
+// #4126 VRRP-checksum dual-accept migration: accept both wire forms during the
+// upgrade window, enforce once both sides speak the new form.
+
+// MarshalHeartbeatAuth encodes a heartbeat and, when authKey is non-empty,
+// appends the PSK/HMAC auth trailer so the receiver can reject a forged or
+// tampered heartbeat. session is a per-sender-process random value and counter
+// is a per-session monotonic send counter; together they are the anti-replay
+// nonce (a new session re-anchors the receiver after a restart/reboot; a
+// strictly increasing counter rejects intra-session replays). When authKey is
+// empty the output is byte-identical to MarshalHeartbeat — a node without a key
+// emits legacy frames (dual-accept). The key is never logged.
+func MarshalHeartbeatAuth(pkt *HeartbeatPacket, authKey []byte, session, counter uint64) []byte {
+	body := MarshalHeartbeat(pkt)
+	if len(authKey) == 0 {
+		return body
+	}
+	if len(body)+heartbeatAuthTrailerSize > maxHeartbeatSize {
+		// No room for the trailer within the UDP frame cap. Emit the legacy
+		// frame rather than a corrupt one; at real heartbeat sizes (a handful
+		// of RGs + monitors) this branch is never taken.
+		return body
+	}
+	trailer := make([]byte, heartbeatAuthTrailerSize)
+	copy(trailer[0:4], heartbeatAuthMagic)
+	binary.LittleEndian.PutUint64(trailer[4:12], session)
+	binary.LittleEndian.PutUint64(trailer[12:20], counter)
+	// Sign the body PLUS magic+session+counter (everything but the digest), so
+	// the nonce and the whole packet are bound by the MAC.
+	mac := hmac.New(sha256.New, authKey)
+	mac.Write(body)
+	mac.Write(trailer[:20])
+	copy(trailer[20:], mac.Sum(nil))
+
+	out := make([]byte, 0, len(body)+heartbeatAuthTrailerSize)
+	out = append(out, body...)
+	out = append(out, trailer...)
+	return out
+}
+
+// heartbeatAuthTrailer locates the auth trailer at the tail of a raw heartbeat
+// frame and returns its nonce. present is false when the frame carries no
+// trailer (a legacy / not-yet-keyed peer).
+func heartbeatAuthTrailer(data []byte) (session, counter uint64, present bool) {
+	if len(data) < heartbeatAuthTrailerSize {
+		return 0, 0, false
+	}
+	start := len(data) - heartbeatAuthTrailerSize
+	if !bytes.Equal(data[start:start+4], []byte(heartbeatAuthMagic)) {
+		return 0, 0, false
+	}
+	session = binary.LittleEndian.Uint64(data[start+4 : start+12])
+	counter = binary.LittleEndian.Uint64(data[start+12 : start+20])
+	return session, counter, true
+}
+
+// verifyHeartbeatMAC recomputes the HMAC over the signed span (everything but
+// the trailing 32-byte digest) and compares it in constant time. It presumes a
+// trailer is present (heartbeatAuthTrailer returned present) and authKey is
+// non-empty; it returns false otherwise.
+func verifyHeartbeatMAC(data, authKey []byte) bool {
+	if len(authKey) == 0 || len(data) < heartbeatAuthTrailerSize {
+		return false
+	}
+	signed := data[:len(data)-heartbeatAuthMACSize]
+	got := data[len(data)-heartbeatAuthMACSize:]
+	mac := hmac.New(sha256.New, authKey)
+	mac.Write(signed)
+	return hmac.Equal(got, mac.Sum(nil))
+}
+
+// heartbeatAuthReplay tracks per-peer anti-replay state for authenticated
+// heartbeats. A sender advertises a random per-process session id and a
+// monotonic per-session counter (MarshalHeartbeatAuth). The receiver accepts a
+// strictly increasing counter within a session and RE-ANCHORS on a new session
+// id — a sender restart/reboot picks a fresh random session, so a genuine
+// reboot (a routine HA event) is never mistaken for a replay and failover is
+// never wedged. Touched only from the single readLoop goroutine.
+type heartbeatAuthReplay struct {
+	session uint64
+	counter uint64
+	seen    bool
+}
+
+// admit reports whether (session, counter) is fresh (not a replay) and, when
+// fresh, advances the watermark. Callers must invoke admit only after the MAC
+// has verified — an unauthenticated caller must never mutate replay state.
+func (a *heartbeatAuthReplay) admit(session, counter uint64) bool {
+	if !a.seen || session != a.session {
+		a.session = session
+		a.counter = counter
+		a.seen = true
+		return true
+	}
+	if counter > a.counter {
+		a.counter = counter
+		return true
+	}
+	return false
+}
+
+// heartbeatAuthDecision applies the #4107 dual-accept policy for one received
+// heartbeat and returns whether to accept it (and, when rejected, a short
+// reason for logging — never the key or packet bytes).
+//
+//	keyConfigured — the local ControlLinkAuthKey is set (we can verify).
+//	present       — the frame carried an auth trailer.
+//	macOK         — the trailer's HMAC verified (only meaningful when present).
+//	nonceFresh    — the nonce passed anti-replay (only meaningful when macOK).
+//	peerAuthSeen  — we have previously accepted an authenticated heartbeat from
+//	                the peer (sticky: proves the peer holds the key, so both
+//	                nodes are keyed and an unauthenticated frame is now forged).
+//
+// Policy:
+//   - No local key: dual-accept everything — this node cannot verify and may be
+//     the not-yet-upgraded / not-yet-keyed side of a rolling upgrade.
+//   - Local key + auth trailer: enforce — reject a bad HMAC or a replayed nonce.
+//   - Local key + no trailer + peer never authenticated: dual-accept — the peer
+//     has not started signing yet (rolling upgrade / key not yet synced).
+//   - Local key + no trailer + peer HAS authenticated: reject — a downgrade to
+//     cleartext once both nodes are keyed is an attack.
+func heartbeatAuthDecision(keyConfigured, present, macOK, nonceFresh, peerAuthSeen bool) (bool, string) {
+	if !keyConfigured {
+		return true, ""
+	}
+	if present {
+		if !macOK {
+			return false, "hmac verification failed"
+		}
+		if !nonceFresh {
+			return false, "stale nonce (replay)"
+		}
+		return true, ""
+	}
+	if peerAuthSeen {
+		return false, "missing auth trailer (enforced: peer previously authenticated)"
+	}
+	return true, ""
+}
+
+// randomSessionID returns a random 64-bit anti-replay session id. On the
+// (practically impossible) crypto/rand failure it falls back to the monotonic
+// clock, which is still process-unique for the receiver's re-anchor logic.
+func randomSessionID() uint64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return uint64(MonotonicNanos())
+	}
+	return binary.LittleEndian.Uint64(b[:])
+}
+
 // PeerGroupState holds the last-known state of a peer's redundancy group.
 type PeerGroupState struct {
 	GroupID  int
@@ -307,6 +491,12 @@ type heartbeatSender struct {
 	wg         sync.WaitGroup
 	sent       atomic.Uint64
 	sendErrors atomic.Uint64
+
+	// #4107 anti-replay: a random per-process session id plus a monotonic
+	// per-session counter. A new sender (StartHeartbeat/RestartHeartbeat)
+	// re-seeds authSession so the receiver re-anchors after a restart/reboot.
+	authSession uint64
+	authCounter atomic.Uint64
 }
 
 // heartbeatReceiver listens for peer heartbeat packets.
@@ -321,15 +511,20 @@ type heartbeatReceiver struct {
 	received   atomic.Uint64
 	recvErrors atomic.Uint64
 	startedAt  time.Time // when receiver started (for initial peer-lost detection)
+
+	// #4107 control-channel auth state. Touched only from readLoop.
+	authReplay   heartbeatAuthReplay // per-peer anti-replay watermark
+	peerAuthSeen bool                // sticky: peer has sent a valid authed HB
 }
 
 func newHeartbeatSender(mgr *Manager, conn *net.UDPConn, peerAddr *net.UDPAddr, interval time.Duration) *heartbeatSender {
 	return &heartbeatSender{
-		mgr:      mgr,
-		conn:     conn,
-		peerAddr: peerAddr,
-		interval: interval,
-		stopCh:   make(chan struct{}),
+		mgr:         mgr,
+		conn:        conn,
+		peerAddr:    peerAddr,
+		interval:    interval,
+		stopCh:      make(chan struct{}),
+		authSession: randomSessionID(),
 	}
 }
 
@@ -355,7 +550,15 @@ func (s *heartbeatSender) run() {
 
 func (s *heartbeatSender) send() {
 	pkt := s.mgr.buildHeartbeat()
-	data := MarshalHeartbeat(pkt)
+	// #4107: sign the frame when a control-channel PSK is configured. The key
+	// is fetched fresh each tick so a commit that sets/clears it takes effect
+	// without a heartbeat restart. Never logged.
+	var data []byte
+	if key := s.mgr.controlLinkAuthKey(); len(key) > 0 {
+		data = MarshalHeartbeatAuth(pkt, key, s.authSession, s.authCounter.Add(1))
+	} else {
+		data = MarshalHeartbeat(pkt)
+	}
 	if _, err := s.conn.WriteToUDP(data, s.peerAddr); err != nil {
 		s.sendErrors.Add(1)
 		slog.Debug("cluster: heartbeat send failed", "err", err)
@@ -436,6 +639,29 @@ func (r *heartbeatReceiver) readLoop() {
 		// Ignore our own heartbeats (shouldn't happen with unicast, but be safe).
 		if int(pkt.NodeID) == r.mgr.NodeID() {
 			continue
+		}
+
+		// #4107 control-channel authentication. When a PSK is configured the
+		// heartbeat/election channel is HMAC-authenticated; a forged or
+		// replayed heartbeat is rejected HERE, before it can refresh peer
+		// liveness (lastSeen) or drive election (handlePeerHeartbeat).
+		// Dual-accept keeps a mixed-version / not-yet-keyed cluster from
+		// splitting — see heartbeatAuthDecision. The key is never logged.
+		key := r.mgr.controlLinkAuthKey()
+		session, counter, present := heartbeatAuthTrailer(buf[:n])
+		macOK := present && len(key) > 0 && verifyHeartbeatMAC(buf[:n], key)
+		nonceFresh := macOK && r.authReplay.admit(session, counter)
+		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthSeen)
+		if !accept {
+			r.recvErrors.Add(1)
+			slog.Warn("cluster: heartbeat auth rejected",
+				"reason", reason, "peer_node", pkt.NodeID)
+			continue
+		}
+		if macOK {
+			// The peer proved it holds the key — from now on an
+			// unauthenticated frame from it is a downgrade attack.
+			r.peerAuthSeen = true
 		}
 
 		r.received.Add(1)

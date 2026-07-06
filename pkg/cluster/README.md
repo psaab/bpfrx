@@ -22,7 +22,11 @@ locating any symbol below is now a matter of opening the named file.
   `handlePeerNeverSeen`, `HeartbeatStats`,
   `vrfListenConfig` — `heartbeat_manager.go`.
 - `HeartbeatPacket`, `MarshalHeartbeat`,
-  `UnmarshalHeartbeat`, sender/receiver goroutine types — `heartbeat.go`.
+  `UnmarshalHeartbeat`, the #4107 control-channel auth
+  (`MarshalHeartbeatAuth`, `heartbeatAuthTrailer`,
+  `verifyHeartbeatMAC`, `heartbeatAuthReplay`,
+  `heartbeatAuthDecision`), sender/receiver goroutine types —
+  `heartbeat.go`. See "Control-channel authentication" below.
 - Single-RG manual failover and transfer-commit protocol
   (`ManualFailover`, `ForceSecondary`, `ResetFailover`,
   `RequestPeerFailover`, `commitRequestedPeerFailover`,
@@ -104,6 +108,67 @@ The primary consumer of the `Manager.Events()` channel is
 `pkg/daemon/daemon_ha.go`, which fans events out (HA sync, status
 publish, etc.). `pkg/cluster/reth.go::HandleStateChange` is a
 state-handler method, not the event-channel consumer.
+
+## Control-channel authentication (#4107, PR-A)
+
+The cluster heartbeat drives election: `handlePeerHeartbeat` rebuilds
+peer redundancy-group state directly from the packet and runs
+`runElection()`, so a forged cleartext heartbeat can force the local
+node PRIMARY or demote the peer (Weight=0 → local claims PRIMARY;
+higher priority → local forced SECONDARY). The heartbeat is UDP on the
+shared control VLAN, so any host that can reach the peer's control IP
+could inject one.
+
+**Fix (first authed channel).** When a shared PSK is configured
+(`set chassis cluster authentication-key <key>` → `config.Secret`
+`ClusterConfig.ControlLinkAuthKey`, plumbed into the `Manager` by
+`UpdateConfig` and read via `controlLinkAuthKey()`), the sender appends
+an HMAC-SHA256 auth trailer to the heartbeat frame and the receiver
+rejects a forged/tampered/replayed heartbeat **before** it can refresh
+peer liveness (`lastSeen`) or drive election.
+
+- **Wire.** `MarshalHeartbeatAuth` appends a fixed 52-byte trailer
+  AFTER the optional version trailer: `magic "XPFA"(4) + session(8) +
+  counter(8) + HMAC-SHA256(32)`. The HMAC covers the whole frame plus
+  the magic/session/counter (everything but the digest). Because
+  `UnmarshalHeartbeat` already ignores bytes past the version section,
+  a signed frame stays wire-parseable by a legacy / not-yet-keyed peer
+  — the same additive-trailer discipline as the version trailer.
+- **Anti-replay.** `session` is a random per-sender-process id and
+  `counter` a monotonic per-session counter. `heartbeatAuthReplay.admit`
+  accepts a strictly increasing counter within a session and RE-ANCHORS
+  on a new session id, so a sender restart/reboot (a routine HA event —
+  `make test-failover` reboots a node) is never mistaken for a replay.
+  Intra-session replays are rejected. Cross-session stale replay is a
+  bounded residual (a captured old frame carries stale state that the
+  next genuine heartbeat overwrites within one interval); tightening it
+  belongs to the follow-up channels.
+- **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
+  the #4126 VRRP-checksum dual-accept migration:
+  - No local key → accept everything (this node cannot verify; may be
+    the not-yet-keyed side of an upgrade). No regression.
+  - Local key + auth trailer → enforce: reject a bad HMAC or a replayed
+    nonce.
+  - Local key + no trailer + peer has NOT yet authenticated → accept
+    (the peer has not started signing; key not yet synced).
+  - Local key + no trailer + peer HAS authenticated (sticky
+    `peerAuthSeen`, set only by a verified frame) → reject: a downgrade
+    to cleartext once both nodes are keyed is an attack.
+
+  Enforcement therefore engages only once BOTH nodes carry the key and
+  are observed signing — a mixed-version / mid-key-rollout cluster never
+  splits.
+- **Secret hygiene.** The key is `config.Secret`, redacted on every
+  JSON/YAML/`String()` path and masked as `##SECRET-DATA##` in raw-AST
+  renders (`authentication-key` is already in `ast_redact.go`'s secret
+  set). It is stored as raw bytes on the `Manager`, never logged; the
+  auth-reject log line carries only a reason string and the peer node id.
+
+**Scope.** PR-A authenticates the heartbeat/election channel only — the
+most acute F23 vector. The session-sync frames (`sync_conn.go`) and the
+fabric gRPC listener (`pkg/grpcapi`) remain follow-up channels of the
+same PSK program (#4107); the config foundation and the shared
+`ControlLinkAuthKey` land here so those channels reuse it.
 
 ## DHCP-server lease sync (#2239)
 
