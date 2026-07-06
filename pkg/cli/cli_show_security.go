@@ -430,6 +430,15 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		// #3285: host-bound traffic — no transit global/default fallback.
 		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", fromZone)
 		fmt.Printf("  %s\n", policymatch.HostInboundShowLine)
+		// #3627 B1a: name the admitting host-inbound-traffic token (or report
+		// deny / global-accept / indeterminate) so the operator sees WHICH
+		// system-service/protocol governs local delivery for this tuple, not just
+		// that host-inbound-traffic governs it.
+		if res.HostInbound != nil {
+			if line := res.HostInbound.Describe(); line != "" {
+				fmt.Printf("  host-inbound-traffic (zone %s): %s\n", fromZone, line)
+			}
+		}
 		return nil
 	}
 	if !res.Matched {

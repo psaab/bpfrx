@@ -36657,3 +36657,39 @@ top.
   pkg/grpcapi/server_show_security_text.go,
   pkg/grpcapi/testdata/server_show_golden.json,
   docs/feature-gaps.md, docs/syn-cookie-flood-protection.md, _Log.md
+- **Timestamp**: 2026-07-06
+- **Action**: #3627 B1a — structured host-inbound token→tuple SSOT +
+  match-policies admitting-token report. Extracted the single structured
+  SSOT `config.HostInboundServiceMatch` / `HostInboundProtocolMatch`
+  (`[]config.L4Match{Proto, Ports []PortRange, ICMPType *uint8, Reject}`,
+  family-scoped, `all` expansion, ident-reset Reject marker, gre→proto
+  47) in `pkg/config/host_inbound_tokens.go`. Refactored the pkg/daemon
+  nft builder (`hostInboundServiceMatches` / `hostInboundProtocolMatches`
+  / `hostInboundAllowsAll`) to RENDER (`renderHostInboundMatches`) from
+  the SSOT instead of a parallel hard-coded switch — proven
+  BYTE-IDENTICAL to the pre-#3627 output for every token × family by
+  `TestHostInboundNftRenderGoldenByteIdentical` (frozen golden). Added
+  the host-inbound classifier `dataplane/userspace.ClassifyHostInbound`
+  (reads the SAME SSOT + mirrors the #3171 global ICMP/ND/ESP-AH
+  accepts) returning a presence-safe `HostInboundAdmission{Status,
+  Token, Kind}` (token-admit / global-accept / denied / indeterminate /
+  not-computed). Wired it into `policymatch.Match` (host path only) as
+  `Result.HostInbound` and surfaced the admitting token on the local CLI
+  `show security match-policies` host-inbound branch. RED-on-revert
+  verified (ssh 22→2222 turned the daemon golden, the config tuple test,
+  and the policymatch token test all RED). REST/gRPC structured
+  `host_inbound` fields (+ proto message) and a per-tuple Rust parity
+  test are deferred follow-ups (this PR is Go-only, no codegen/cargo);
+  the existing set-level parity guards still hold. `go test`
+  pkg/config + pkg/daemon + pkg/dataplane/userspace + pkg/policymatch +
+  pkg/cli green; gofmt, go build ./... clean.
+- **File(s)**: pkg/config/host_inbound_tokens.go,
+  pkg/config/host_inbound_match_3627_test.go,
+  pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_ssot_render_3627_test.go,
+  pkg/dataplane/userspace/host_inbound_classify.go,
+  pkg/dataplane/userspace/host_inbound_classify_3627_test.go,
+  pkg/policymatch/policymatch.go,
+  pkg/policymatch/host_inbound_token_3627_test.go,
+  pkg/cli/cli_show_security.go, pkg/daemon/README.md,
+  pkg/policymatch/README.md, docs/host-inbound-service-matrix.md, _Log.md

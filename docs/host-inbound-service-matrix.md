@@ -12,25 +12,38 @@ issue #3619).
 Host-inbound admission is enforced (and validated) in three independent places
 that MUST agree on the token set:
 
-1. **Go SSOT — recognized-token allowlist + address family.** The set of
-   meaningful tokens and their address-family scoping. Commit-time validation
-   hard-rejects any token outside it (#3200).
+1. **Go SSOT — recognized-token allowlist + address family + structured
+   token→tuple table.** The set of meaningful tokens, their address-family
+   scoping, and (since #3627 B1a) their structured `(proto, ports, icmp-type)`
+   tuples. Commit-time validation hard-rejects any token outside it (#3200).
    - `config.KnownHostInboundSystemServices` — `pkg/config/host_inbound_tokens.go`
    - `config.KnownHostInboundProtocols` — same file
    - `config.HostInboundServiceFamily` / `config.HostInboundProtocolFamily` —
      family scoping (`ip` = IPv4-only, `ip6` = IPv6-only, absent = dual)
    - `config.HostInboundL2Protocols` / `config.HostInboundAllExpansionProtocols()`
      — `protocols all` expansion minus L2/non-IP tokens
-   - The Go SSOT declares the token allowlist and family, **not** the port
-     numbers. The port sets live on the two enforcement surfaces below, which are
-     hand-mirrors of each other.
+   - `config.HostInboundServiceMatch` / `config.HostInboundProtocolMatch`
+     (`[]config.L4Match{Proto, Ports, ICMPType, Reject}`) — the STRUCTURED
+     token→tuple SSOT added in #3627 B1a. The nft kernel mirror (surface 2) now
+     RENDERS its match fragments from this table rather than carrying a parallel
+     hard-coded copy, and the `request security match-policies` host-inbound
+     classifier (surface 4) MATCHES queries against it. Before #3627 the Go SSOT
+     declared only the token allowlist and family, and the port sets lived only
+     on surfaces 2 and 3 as hand-mirrors; now surface 2 is a render of this
+     table, and surface 3 (Rust) remains a hand-mirror pending the deferred
+     per-tuple parity test.
 
 2. **nft kernel mirror — PRIMARY enforcement.** Host-bound traffic to a
    firewall interface IP / VRRP VIP is shunted to the kernel by the XDP shim
    before it reaches userspace-dp, so the nftables `inet xpf_hostinbound` chain
-   carries ~100% of real host-inbound traffic.
-   - `hostInboundServiceMatches` — `pkg/daemon/daemon_nft.go` (services)
-   - `hostInboundProtocolMatches` — same file (protocols)
+   carries ~100% of real host-inbound traffic. Since #3627 B1a the per-token
+   match fragments are RENDERED from the surface-1 structured SSOT
+   (`renderHostInboundMatches`), byte-identical to the pre-#3627 strings
+   (`TestHostInboundNftRenderGoldenByteIdentical`).
+   - `hostInboundServiceMatches` — `pkg/daemon/daemon_nft.go` (services; renders
+     `config.HostInboundServiceMatch`)
+   - `hostInboundProtocolMatches` — same file (protocols; renders
+     `config.HostInboundProtocolMatch`)
    - `hostInboundServiceAction` — same file (ident-reset reject verdict)
    - global always-accepts — `buildHostInboundFilterPayload`, same file
 
@@ -42,6 +55,15 @@ that MUST agree on the token set:
      `userspace-dp/src/afxdp/forwarding/host_inbound.rs`
    - `is_icmp_host_inbound_global_accept` — same file (global ICMP/ND accepts)
 
+4. **match-policies host-inbound classifier — DIAGNOSTIC (not enforcement).**
+   The `request security match-policies` simulator names WHICH host-inbound token
+   admits a queried host-bound tuple (#3627 B1a). It does not enforce; it reads
+   the surface-1 structured SSOT and mirrors the surface-2 global accepts so its
+   report cannot drift from what the kernel opens.
+   - `ClassifyHostInbound` / `hostInboundGlobalAccept` —
+     `pkg/dataplane/userspace/host_inbound_classify.go`
+   - wired into `pkg/policymatch` as `Result.HostInbound`
+
 **Drift guards.** The token *sets* are pinned in lockstep by
 `config.TestHostInboundRustClassifierMatchesGoSSOT` (`pkg/config/host_inbound_rust_parity_test.go`,
 #3486 — parses the Rust source and asserts its match arms equal the Go SSOT) and
@@ -49,7 +71,15 @@ that MUST agree on the token set:
 #3200 — asserts the nft matcher's domain equals the SSOT). The *port sets* for
 deliberately-narrow tokens (sip, tftp, traceroute, bfd, the #3341 routing
 protocols) are additionally pinned by fail-on-revert assertions in
-`pkg/daemon/host_inbound_parity_test.go` so an accidental widen turns RED.
+`pkg/daemon/host_inbound_parity_test.go` so an accidental widen turns RED. Since
+#3627 B1a the nft match fragments are RENDERED from surface 1 and pinned
+byte-identical by `TestHostInboundNftRenderGoldenByteIdentical`
+(`pkg/daemon/host_inbound_ssot_render_3627_test.go`); the structured tuples
+themselves are pinned by `config.TestHostInboundServiceMatchTuples` /
+`TestHostInboundProtocolMatchTuples`. A per-tuple parity test between the Rust
+classifier (surface 3) and the structured SSOT (surface 1) is a deferred
+follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
+`TestHostInboundRustClassifierMatchesGoSSOT`.
 
 ## system-services matrix
 
