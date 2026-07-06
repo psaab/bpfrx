@@ -138,6 +138,29 @@ pub(in crate::afxdp) struct ForwardingState {
     /// (from) zone is present here is answered with a TCP RST toward the
     /// source instead of a silent drop. Absent zone ⇒ tcp-rst off.
     pub(in crate::afxdp) zone_tcp_rst: FastMap<u16, bool>,
+    /// #3618: per-(from-)zone rate-limit buckets for locally-generated `reject`
+    /// replies (policy `then reject`, firewall-filter / lo0 `then reject`, and
+    /// a zone `tcp-rst` deny). One GCRA `TokenBucket` per CONFIGURED zone id,
+    /// built in `populate_zones` from the SAME validated zone set as
+    /// `zone_id_to_name` (cardinality = configured zones, Go-capped ≤ 65533 —
+    /// not attacker-growable). Before #3618 a SINGLE process-global bucket
+    /// rate-limited every reject, so a rejected-flow flood ingressing one zone
+    /// drained it and starved legitimate reject-generation in a DIFFERENT zone;
+    /// per-zone buckets remove that cross-zone starvation while keeping each
+    /// ingress path capped at the same rate.
+    ///
+    /// Keyed by the ingress interface's configured zone id
+    /// (`ifindex_to_zone_id`); an unzoned (id 0) or unknown from-zone falls back
+    /// to the process-global `REJECT_FALLBACK_BUCKET` at the gate (never
+    /// fail-open). Held as `Arc<TokenBucket>` so the shared atomics survive
+    /// `ForwardingState::clone()` — the coordinator re-stores a clone of the
+    /// forwarding state at runtime cadence (fabric refresh), and a plain-value
+    /// clone would snapshot stale coordinator-side atomics and effectively reset
+    /// the limiter every refresh. A genuine config rebuild re-runs
+    /// `populate_zones` and installs fresh buckets (reset-on-commit, accepted
+    /// for a diagnostic limiter). See `docs/generated-reply-rate-limit.md`.
+    pub(in crate::afxdp) reject_buckets:
+        FastMap<u16, std::sync::Arc<crate::afxdp::icmp_ratelimit::TokenBucket>>,
     pub(in crate::afxdp) egress: FastMap<i32, EgressInterface>,
     pub(in crate::afxdp) ingress_logical_ifindex: FastMap<(i32, u16), i32>,
     pub(in crate::afxdp) fabrics: Vec<FabricLink>,
@@ -391,6 +414,19 @@ impl ForwardingState {
         self.zone_tcp_rst.get(&zone_id).copied().unwrap_or(false)
     }
 
+    /// #3618: the per-zone `reject` rate-limit bucket for ingress (from) zone
+    /// `from_zone_id`, or `None` if the zone is unconfigured / unknown (the
+    /// gate then falls back to the shared `REJECT_FALLBACK_BUCKET`). Returns a
+    /// plain `&TokenBucket` (deref of the held `Arc`) so the limiter gate treats
+    /// a per-zone bucket and the `&'static` fallback uniformly. Used by
+    /// `icmp_ratelimit::allow_generated_reject*`.
+    pub(in crate::afxdp) fn reject_bucket(
+        &self,
+        from_zone_id: u16,
+    ) -> Option<&crate::afxdp::icmp_ratelimit::TokenBucket> {
+        self.reject_buckets.get(&from_zone_id).map(|b| b.as_ref())
+    }
+
     /// #2851/#3182: true iff `ip` is one of the router's OWN configured
     /// interface IPs — i.e. an address this firewall must never learn from a
     /// link-local advertisement. The dynamic
@@ -420,12 +456,8 @@ impl ForwardingState {
     #[inline]
     pub(in crate::afxdp) fn owns_configured_ip(&self, ip: IpAddr) -> bool {
         match ip {
-            IpAddr::V4(v4) => {
-                self.configured_iface_v4.contains(&v4) || self.local_v4.contains(&v4)
-            }
-            IpAddr::V6(v6) => {
-                self.configured_iface_v6.contains(&v6) || self.local_v6.contains(&v6)
-            }
+            IpAddr::V4(v4) => self.configured_iface_v4.contains(&v4) || self.local_v4.contains(&v4),
+            IpAddr::V6(v6) => self.configured_iface_v6.contains(&v6) || self.local_v6.contains(&v6),
         }
     }
 }
