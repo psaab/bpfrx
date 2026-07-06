@@ -1,3 +1,34 @@
+## 2026-07-06 — #4228 Gap 2: resolve CoS transmit-rate / shaping-rate percent
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4320 accepted `transmit-rate percent`/`shaping-rate percent` but
+  left them ACCEPTED-BUT-INERT. This resolves the percent to an absolute rate,
+  mirroring the buffer-size percent precedent exactly (same `ceil` rounding,
+  same clamp). `transmit-rate percent` resolves PER INTERFACE in the Rust
+  `forwarding_build::cos` builder against the bound interface's
+  `cos_shaping_rate_bytes_per_sec` (a named scheduler maps onto interfaces of
+  different rates, so the percent is carried on the shared snapshot and
+  materialized per interface via `cos_effective_transmit_rate_bytes` /
+  `cos_percent_rate_bytes`). `shaping-rate percent` resolves in the Go compiler
+  (`resolveCoSTrafficControlProfiles`) against the interface's configured line
+  rate (`speed`/`bandwidth`) and folds into the unit root shaper. New Go field
+  `CoSSchedulerSnapshot.TransmitRatePercent` (+ Rust `transmit_rate_percent`,
+  serde default, mirrors `buffer_size_percent`) carries the scheduler percent.
+  Advisories reworded: percent now resolves; only `remainder`, an unbound
+  percent scheduler, and a shaping-rate percent on a speed-less interface remain
+  inert (per-binding / per-scheduler advisories flag exactly those).
+- **File(s)**: userspace-dp/src/protocol/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs (field literals),
+  pkg/config/compiler_class_of_service.go (resolveCoSTrafficControlProfiles +
+  coSInterfaceLineRateBytes + resolveCoSPercentRateBytes +
+  cosSchedulersWithShapedBinding), pkg/config/compiler_validate_warn.go
+  (advisories), pkg/config/schema_validate_cos_rate_percent_4228_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/cos.go,
+  docs/cos-traffic-shaping.md.
+
 ## 2026-07-06 — #4070 follow-up: exclude token-packed multi-leaves from the union
 
 - **Timestamp**: 2026-07-06

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -674,7 +675,7 @@ func resolveCoSTrafficControlProfiles(cfg *Config) {
 		return
 	}
 	cos := cfg.ClassOfService
-	resolve := func(unit *CoSInterfaceUnit) {
+	resolve := func(unit *CoSInterfaceUnit, ifaceLineRateBytes uint64) {
 		if unit == nil || unit.OutputTrafficControlProfile == "" {
 			return
 		}
@@ -683,7 +684,20 @@ func resolveCoSTrafficControlProfiles(cfg *Config) {
 			return
 		}
 		if unit.ShapingRateBytes == 0 {
-			unit.ShapingRateBytes = tcp.ShapingRateBytes
+			// #4228 Gap 2: fold the profile shaping-rate into the unit root
+			// shaper. An absolute profile rate carries directly; a `percent
+			// <n>` form resolves against the bound interface's configured line
+			// rate (Junos resolves shaping-rate percent against the interface
+			// speed). Resolution is per-BINDING — the same profile bound to
+			// interfaces of different speeds folds a different absolute rate
+			// onto each unit. When the interface has no configured speed we
+			// cannot resolve the percent, so the unit is left unshaped and the
+			// ValidateConfig advisory (compiler_validate_warn.go) surfaces it.
+			if tcp.ShapingRateBytes > 0 {
+				unit.ShapingRateBytes = tcp.ShapingRateBytes
+			} else if resolved := resolveCoSPercentRateBytes(ifaceLineRateBytes, tcp.ShapingRatePercent); resolved > 0 {
+				unit.ShapingRateBytes = resolved
+			}
 		}
 		if unit.SchedulerMap == "" {
 			unit.SchedulerMap = tcp.SchedulerMap
@@ -693,11 +707,100 @@ func resolveCoSTrafficControlProfiles(cfg *Config) {
 		if iface == nil {
 			continue
 		}
-		resolve(iface.Level)
+		lineRate := coSInterfaceLineRateBytes(cfg, iface.Name)
+		resolve(iface.Level, lineRate)
 		for _, unit := range iface.Units {
-			resolve(unit)
+			resolve(unit, lineRate)
 		}
 	}
+}
+
+// cosSchedulersWithShapedBinding returns the set of scheduler names that are
+// bound — via a scheduler-map applied to an interface unit with a non-zero
+// root shaping-rate — to at least one shaped interface. A `transmit-rate
+// percent <n>` on such a scheduler RESOLVES: forwarding_build/cos.rs computes
+// the absolute byte/sec rate against the interface's shaping-rate. A scheduler
+// NOT in this set has no shaping base, so its percent stays inert; the
+// ValidateConfig advisory flags exactly that residual. Must run AFTER
+// resolveCoSTrafficControlProfiles so unit.ShapingRateBytes reflects a folded
+// traffic-control-profile shaping-rate (including a resolved shaping-rate
+// percent).
+func cosSchedulersWithShapedBinding(cos *ClassOfServiceConfig) map[string]bool {
+	resolved := make(map[string]bool)
+	if cos == nil {
+		return resolved
+	}
+	markUnit := func(unit *CoSInterfaceUnit) {
+		if unit == nil || unit.SchedulerMap == "" || unit.ShapingRateBytes == 0 {
+			return
+		}
+		sm := cos.SchedulerMaps[unit.SchedulerMap]
+		if sm == nil {
+			return
+		}
+		for _, entry := range sm.Entries {
+			if entry != nil && entry.Scheduler != "" {
+				resolved[entry.Scheduler] = true
+			}
+		}
+	}
+	for _, iface := range cos.Interfaces {
+		if iface == nil {
+			continue
+		}
+		markUnit(iface.Level)
+		for _, unit := range iface.Units {
+			markUnit(unit)
+		}
+	}
+	return resolved
+}
+
+// coSInterfaceLineRateBytes returns the configured line rate of a physical
+// interface in bytes/sec, or 0 when unknown. It is the base against which a
+// `shaping-rate percent <n>` traffic-control-profile resolves (Junos resolves
+// shaping-rate percent against the interface speed). An explicit `bandwidth`
+// (already bits/sec) wins over the `speed` string; "auto"/"" (or an
+// unparseable value) yields 0, which leaves the percent inert with a commit
+// advisory rather than fabricating a rate.
+func coSInterfaceLineRateBytes(cfg *Config, ifaceName string) uint64 {
+	if cfg == nil || ifaceName == "" {
+		return 0
+	}
+	iface := cfg.Interfaces.Interfaces[ifaceName]
+	if iface == nil {
+		return 0
+	}
+	if iface.Bandwidth > 0 {
+		return iface.Bandwidth / 8
+	}
+	speed := strings.ToLower(strings.TrimSpace(iface.Speed))
+	if speed == "" || speed == "auto" {
+		return 0
+	}
+	return parseBandwidthLimit(speed)
+}
+
+// resolveCoSPercentRateBytes resolves a Junos CoS `percent <n>` rate against a
+// base rate in bytes/sec. It mirrors the Rust `cos_percent_buffer_bytes` /
+// `cos_percent_rate_bytes` resolution EXACTLY — same (0,100] domain guard,
+// same `math.Ceil` rounding, same clamp to [1, MaxUint64] — so a
+// shaping-rate/transmit-rate percent rounds identically on the Go and Rust
+// sides. Returns 0 when the base is unknown (0) or the percent is out of
+// range; the caller then leaves the knob inert.
+func resolveCoSPercentRateBytes(baseBytesPerSec uint64, percent float64) uint64 {
+	if baseBytesPerSec == 0 || math.IsNaN(percent) || math.IsInf(percent, 0) ||
+		percent <= 0 || percent > 100 {
+		return 0
+	}
+	scaled := math.Ceil(float64(baseBytesPerSec) * percent / 100.0)
+	if scaled < 1 {
+		return 1
+	}
+	if scaled > float64(^uint64(0)) {
+		return ^uint64(0)
+	}
+	return uint64(scaled)
 }
 
 func collectCoSFairnessRSSExpectation(queueNode *Node) (string, error) {

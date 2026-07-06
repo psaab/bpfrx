@@ -86,6 +86,17 @@ pub(crate) struct CoSSchedulerSnapshot {
     pub name: String,
     #[serde(rename = "transmit_rate_bytes", default)]
     pub transmit_rate_bytes: u64,
+    /// #4228 Gap 2: the Junos `transmit-rate percent <n>` share (0,100].
+    /// Legacy snapshots carry only `transmit_rate_bytes`; this defaults to
+    /// 0.0. Resolved PER-INTERFACE in `forwarding_build::cos` against the
+    /// bound interface's `cos_shaping_rate_bytes_per_sec` (a named scheduler
+    /// can map onto interfaces of different shaping rates, so the absolute
+    /// rate is materialized per interface, not stored on the shared
+    /// scheduler). An absolute `transmit_rate_bytes` wins when both are
+    /// present; the Go strict validator rejects that combination on commit,
+    /// so a well-formed snapshot never sets both.
+    #[serde(rename = "transmit_rate_percent", default)]
+    pub transmit_rate_percent: f64,
     #[serde(rename = "transmit_rate_exact", default)]
     pub transmit_rate_exact: bool,
     #[serde(default)]
