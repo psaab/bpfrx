@@ -912,7 +912,6 @@ func ValidateConfig(cfg *Config) []string {
 
 	if cos := cfg.ClassOfService; cos != nil {
 		warnedClassifierLossPriority := false
-		warnedRewriteLossPriority := false
 		warnedPriorityLowMinShare := false
 		// #4315 (fable-167 F-2): a traffic-control-profile's guaranteed-rate
 		// and delay-buffer-rate are typed + stored so garbage is rejected at
@@ -1070,7 +1069,7 @@ func ValidateConfig(cfg *Config) []string {
 						classifier.Name, entry.ForwardingClass))
 				}
 				if entry.LossPriority != "" && !warnedClassifierLossPriority {
-					warnings = append(warnings, "class-of-service dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
+					warnings = append(warnings, "class-of-service dscp/802.1p classifier loss-priority now drives egress dscp rewrite-rule selection (#3995) but is not yet enforced for drop-precedence / WRED buffer management")
 					warnedClassifierLossPriority = true
 				}
 			}
@@ -1089,7 +1088,7 @@ func ValidateConfig(cfg *Config) []string {
 						classifier.Name, entry.ForwardingClass))
 				}
 				if entry.LossPriority != "" && !warnedClassifierLossPriority {
-					warnings = append(warnings, "class-of-service dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
+					warnings = append(warnings, "class-of-service dscp/802.1p classifier loss-priority now drives egress dscp rewrite-rule selection (#3995) but is not yet enforced for drop-precedence / WRED buffer management")
 					warnedClassifierLossPriority = true
 				}
 			}
@@ -1107,10 +1106,9 @@ func ValidateConfig(cfg *Config) []string {
 						"class-of-service dscp rewrite-rule %q references undefined forwarding-class %q",
 						rewriteRule.Name, entry.ForwardingClass))
 				}
-				if entry.LossPriority != "" && !warnedRewriteLossPriority {
-					warnings = append(warnings, "class-of-service dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
-					warnedRewriteLossPriority = true
-				}
+				// #3995: the userspace dataplane now keys the egress DSCP
+				// rewrite on (forwarding-class, loss-priority), so a
+				// rewrite-rule loss-priority is ENFORCED — no warning.
 			}
 		}
 		// #4220 / #4219: priority-low-min-share (#1614 A2) is typed and

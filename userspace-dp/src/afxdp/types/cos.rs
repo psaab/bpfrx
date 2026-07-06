@@ -19,6 +19,11 @@ pub(in crate::afxdp) struct CoSState {
     pub(in crate::afxdp) dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
     pub(in crate::afxdp) ieee8021_classifiers: FastMap<String, CoSIEEE8021ClassifierConfig>,
     pub(in crate::afxdp) dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
+    /// #3995: per-egress-interface loss-priority classification + rewrite
+    /// tables, keyed by ifindex. Absent for interfaces with no CoS classifier /
+    /// rewrite-rule. Resolved at TX classification to key the DSCP rewrite on
+    /// `(forwarding-class, loss-priority)` instead of forwarding-class alone.
+    pub(in crate::afxdp) lp_rewrite: FastMap<i32, CoSLossPriorityRewrite>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -58,19 +63,60 @@ pub(in crate::afxdp) struct CoSInterfaceConfig {
     pub(in crate::afxdp) priority_low_min_share_bytes: u64,
 }
 
+/// Number of Junos loss-priority levels: low, medium-low, medium-high, high.
+/// Indexed 0..=3 by `cos_loss_priority_index` in `forwarding_build/cos.rs`
+/// (low=0 .. high=3). The classifier assigns one per code-point; the rewrite
+/// rule keys on (forwarding-class, loss-priority).
+pub(in crate::afxdp) const COS_LOSS_PRIORITY_LEVELS: u8 = 4;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::afxdp) struct CoSDSCPClassifierConfig {
     pub(in crate::afxdp) queue_by_dscp: FastMap<u8, u8>,
+    /// #3995: behavior-aggregate loss-priority assigned per DSCP code-point
+    /// (index 0=low .. 3=high). Parallel to `queue_by_dscp` — the same
+    /// classifier entry that maps a DSCP to a forwarding-class (→ queue) also
+    /// maps it to a loss-priority, which the egress rewrite-rule keys on.
+    pub(in crate::afxdp) lp_by_dscp: FastMap<u8, u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::afxdp) struct CoSIEEE8021ClassifierConfig {
     pub(in crate::afxdp) queue_by_pcp: FastMap<u8, u8>,
+    /// #3995: loss-priority assigned per 802.1p code-point (index 0=low ..
+    /// 3=high). Parallel to `queue_by_pcp`.
+    pub(in crate::afxdp) lp_by_pcp: FastMap<u8, u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::afxdp) struct CoSDSCPRewriteRuleConfig {
-    pub(in crate::afxdp) dscp_by_forwarding_class: FastMap<String, u8>,
+    /// #3995: egress DSCP rewrite keyed on `(forwarding_class, loss_priority)`.
+    /// Junos rewrite-rules match a (forwarding-class, loss-priority) pair to a
+    /// code-point, so a rule that rewrites `voice low` and `voice high` to
+    /// different DSCPs must NOT collapse to forwarding-class only (the pre-fix
+    /// `.or_insert` on a `FastMap<String, u8>` silently dropped every entry but
+    /// the first). A rule with no explicit loss-priority is a wildcard: it
+    /// fills all four loss-priority slots (backward-compat).
+    pub(in crate::afxdp) dscp_by_fc_lp: FastMap<(String, u8), u8>,
+}
+
+/// #3995: per-egress-interface loss-priority classification + rewrite tables,
+/// stored on `CoSState::lp_rewrite` keyed by ifindex. Resolved at CoS TX
+/// classification time (`tx/cos_classify.rs`) to select the correct
+/// `(forwarding-class, loss-priority)` rewrite for THIS flow, then cached
+/// per-flow exactly like the pre-existing filter DSCP rewrite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) struct CoSLossPriorityRewrite {
+    /// Flattened DSCP → loss-priority (0..3) for the egress interface's DSCP
+    /// classifier. `u8::MAX` = the code-point is unclassified (resolves to the
+    /// Junos default loss-priority LOW).
+    pub(in crate::afxdp) dscp_lp_by_dscp: [u8; 64],
+    /// Flattened 802.1p PCP → loss-priority (0..3). `u8::MAX` = unclassified.
+    pub(in crate::afxdp) ieee8021_lp_by_pcp: [u8; 8],
+    /// `(queue_id, loss_priority)` → egress DSCP code-point. Populated for the
+    /// interface's materialized queues from the interface's rewrite-rule. The
+    /// full loss-priority matrix (not just LOW) so a differentiated rule is
+    /// applied per-flow.
+    pub(in crate::afxdp) dscp_rewrite_by_queue_lp: FastMap<(u8, u8), u8>,
 }
 
 /// #1746: operator-selectable equal-flow target policy. Decides the
@@ -227,6 +273,15 @@ pub(in crate::afxdp) struct CoSQueueConfig {
     pub(in crate::afxdp) equal_flow_target_policy: EqualFlowTargetPolicy,
     pub(in crate::afxdp) surplus_weight: u32,
     pub(in crate::afxdp) buffer_bytes: u64,
+    /// #3995: loss-priority-INDEPENDENT egress DSCP rewrite applied at drain as
+    /// a fallback. `Some` ONLY when the forwarding-class rewrites EVERY
+    /// loss-priority to the SAME code-point (a single-value / wildcard rule),
+    /// so applying it regardless of a packet's loss-priority is always correct.
+    /// Loss-priority-DIFFERENTIATED rewrites resolve per-flow at CoS TX
+    /// classification via `CoSLossPriorityRewrite.dscp_rewrite_by_queue_lp` and
+    /// are cached in the flow's `dscp_rewrite`; this stays `None` for them so
+    /// the drain fallback never misapplies one loss-priority's code-point to a
+    /// packet of another (the #3995 collapse bug).
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
     /// #1614 A3: per-queue CoDel target in nanoseconds. WIRE
     /// SURFACE ONLY in PR #1618 — dequeue-time sojourn check

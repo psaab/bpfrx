@@ -1078,11 +1078,15 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 	if !strings.Contains(warnings, `dscp rewrite-rule "edge-rewrite" references undefined forwarding-class "missing-class"`) {
 		t.Fatalf("expected undefined dscp rewrite-rule forwarding-class warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced") {
+	// #3995: classifier loss-priority now drives egress rewrite selection but
+	// still warns about the remaining drop-precedence / WRED gap.
+	if !strings.Contains(warnings, "classifier loss-priority now drives egress dscp rewrite-rule selection") {
 		t.Fatalf("expected classifier loss-priority warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced") {
-		t.Fatalf("expected rewrite-rule loss-priority warning, got: %s", warnings)
+	// #3995: rewrite-rule loss-priority is now ENFORCED, so its old
+	// accepted-but-inert warning must NOT appear.
+	if strings.Contains(warnings, "dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced") {
+		t.Fatalf("did not expect the stale rewrite-rule loss-priority warning, got: %s", warnings)
 	}
 	if strings.Contains(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane") {
 		t.Fatalf("unexpected dataplane warning for default userspace path: %s", warnings)
