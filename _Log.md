@@ -36138,3 +36138,29 @@ top.
   union.
 - **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_auth_test.go,
   pkg/cluster/README.md, _Log.md
+- **Action**: #2387 Track A.1 + A.3 (PR-A) — add a commit-time WARNING when two
+  DISTINCT routing-instances carry overlapping L3 address space, and document
+  the not-session-isolated limitation. The userspace-dp session/flow identity is
+  the bare 5-tuple (userspace-dp/src/session/key.rs) with no VRF discriminator,
+  so overlapping-address flows in different routing-instances collide in the
+  conntrack map — LIVE under PBR `then routing-instance` (the established-session
+  fast path runs before the PBR table override, so a second colliding flow
+  inherits the first's cached egress / NAT / policy). New validator
+  validateVRFOverlap mirrors validateScreenScanSweepThresholds: deterministic
+  []string, sorted RI names / filter names / prefixes. Builds RI -> prefix set
+  from BOTH native RI membership (ri.Interfaces -> unit Addresses) AND PBR
+  `then routing-instance` filter terms (source/dest match prefixes), then
+  compares every distinct RI pair for net/netip Prefix.Overlaps. WARNING, never a
+  reject — overlapping-subnet multi-tenant PBR VRF is a legitimate working
+  design. Wired into the compiler.go warnings aggregation next to
+  validateScreenScanSweepThresholds. A.3: forwarding/README.md records the
+  single-forwarding-domain / not-session-isolated limitation + the #3096
+  NAT-scope-vs-session-cache coherence contract. The VRF-aware session key
+  (Track B — SessionKey widening + FlowCacheLookup + reverse-key transforms + HA
+  wire bump) is the deferred real fix; #2387 stays open for it. RED-on-revert
+  proven (removing the validateVRFOverlap call -> 0 warnings -> positive tests
+  FAIL; restored -> GREEN). Full pkg/config suite, gofmt, vet, go build ./... all
+  clean.
+- **File(s)**: pkg/config/compiler_validate_vrf_overlap.go,
+  pkg/config/compiler_validate_vrf_overlap_2387_test.go, pkg/config/compiler.go,
+  userspace-dp/src/afxdp/forwarding/README.md, _Log.md

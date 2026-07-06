@@ -4132,6 +4132,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// using these leaves commits and the operator is told what is/ isn't honoured.
 	cfg.Warnings = append(cfg.Warnings, validateScreenSynFloodSubThresholds(cfg)...)
 
+	// #2387 (Track A.1): warn when two DISTINCT routing-instances carry
+	// overlapping L3 address space. The userspace-dp session/flow identity is the
+	// bare 5-tuple with no VRF discriminator, so overlapping-address flows in
+	// different routing-instances collide in the conntrack map — LIVE under PBR
+	// `then routing-instance` (the established-session fast path runs before the
+	// PBR table override, so a second colliding flow inherits the first's cached
+	// egress / NAT / policy). A WARNING, never a reject: overlapping-subnet
+	// multi-tenant VRF via PBR is a legitimate working design; the config still
+	// commits, the operator is told it is not session-isolated. The VRF-aware
+	// session key is the deferred real fix (Track B — SessionKey widening + HA
+	// wire bump).
+	cfg.Warnings = append(cfg.Warnings, validateVRFOverlap(cfg)...)
+
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
 	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then
 	// hardened it to REJECT a non-host mask — so a misconfigured non-host

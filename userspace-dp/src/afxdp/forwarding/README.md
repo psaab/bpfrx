@@ -183,6 +183,56 @@ next-hops, preference 0). The wire specimen lives in
       skipped-with-visibility, NOT fail-closed-whole-snapshot. See
       `docs/fabric-cross-chassis-fwd.md`.
 
+## Session identity is NOT VRF-aware — single forwarding domain (#2387)
+
+The FIB route model above is table-scoped for route + local-delivery
+*selection*, but the session/flow *identity* is not. This is a known
+limitation, tracked by #2387.
+
+- **`SessionKey` is the bare 5-tuple** (`session/key.rs`) — no
+  routing-instance / VRF / zone / ingress-ifindex discriminator. The
+  conntrack table and the shared synced / NAT / forward-wire session maps
+  (`afxdp/coordinator/session_manager.rs`) are all keyed by it alone, so
+  two flows with identical 5-tuples on any two interfaces share one
+  conntrack entry.
+- **PBR `then routing-instance` is the ONLY per-VRF forwarding path.** An
+  interface's native `routing_instance` selects only the connected-route
+  table NAME (#2388 above) — it does NOT scope a transit packet's
+  destination-FIB lookup. Only a PBR interface filter's
+  `ingress_route_table_override` (`forwarding/mod.rs`, sole caller in
+  `poll_descriptor/mod.rs`) actually steers a transit packet to a per-VRF
+  table. In default (non-PBR) mode the destination FIB is the global
+  `inet.0`/`inet6.0` and local-delivery uses the global `local_v[46]` sets,
+  so overlapping-address multi-VRF does not forward correctly there at all.
+- **PBR per-VRF forwarding is NOT session-isolated.** Because the identity
+  is the bare 5-tuple, the established-session fast path
+  (`resolve_flow_session_decision`) runs BEFORE the PBR table override, so
+  a second flow with the same 5-tuple in a different routing-instance hits
+  the first flow's conntrack session and inherits its cached egress / NAT /
+  policy decision — wrong-VRF forwarding. This is reachable only with
+  overlapping L3 address space + PBR + simultaneous identical 5-tuples (a
+  niche multi-tenant config), but it is real, not purely latent.
+- **#3096 NAT-scope-vs-session-cache coherence contract.** #3096 made NAT
+  rule *selection* routing-instance-aware at session CREATE
+  (`ifindex_to_routing_instance` + `NatScopeCtx`). But the established fast
+  path returns the cached hit's decision by the bare 5-tuple WITHOUT
+  re-running the scope gate, so a colliding second flow reuses the first
+  flow's NAT/policy/forwarding decision — defeating #3096's scoping for that
+  flow. The invariant the real fix must restore: **a cached fast-path
+  decision is only reused for a flow in the same scope it was admitted
+  under.**
+- **Interim mitigation + deferred real fix.** The Go compiler emits a
+  commit WARNING (`validateVRFOverlap`, `pkg/config`) when two distinct
+  routing-instances carry overlapping L3 address space, so the operator is
+  told the topology is not session-isolated (the config still commits — an
+  overlapping-subnet PBR VRF is a legitimate working design). The real fix
+  (Track B) adds a **symmetric routing-domain id** to `SessionKey` +
+  `FlowCacheLookup` + the reverse-key transforms, plus the HA session-sync
+  wire bump — the discriminator MUST be the routing-domain id (symmetric
+  across forward/reply), NOT zone or ingress-ifindex (asymmetric → breaks
+  conntrack reverse matching). See
+  `docs/research/2387-vrf-flow-identity/plan.md`.
+
 ## Where it sits
 
 - Reads the live snapshot Arcs (FIB, NAT, neighbor table) supplied
