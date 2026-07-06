@@ -65,6 +65,43 @@
   pkg/cli/cli_show_interfaces_reth_4328_test.go (new),
   pkg/grpcapi/server_show_interfaces_reth_4328_test.go (new),
   docs/junos-cli-reference.md
+## 2026-07-06 — #4336 + #4337: application vSRX drop-in parity (0-N port floor, unknown per-app alg)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed two OPEN vSRX drop-in blockers in application
+  definitions (fable-review-170 B-6/B-7).
+  - **#4336** — a `source-port`/`destination-port` `0-N` range was
+    hard-rejected (`invalid port 0: must be 1-65535`). Junos accepts 0 as
+    the range FLOOR (multi-term app defs split port space `0-N` /
+    `N+1-65535`, e.g. FaceTime `source-port 0-41640`). Fixed in
+    `resolveAppPort` (the single canonicalization chokepoint for BOTH
+    direct-match and inline-term ports): normalize a floor of 0 to 1. Port
+    0 never appears on the wire so `0-N` ≡ `1-N`; normalizing at this one
+    point keeps `validatePortSpec`, the `userspacePortSpecRepresentable`
+    #2124 gate, and Rust `parse_port_spec` all in agreement (the latter two
+    reject a raw 0 floor, so merely relaxing the validator would have
+    created a commit-succeeds / apply-fails split). A bare single port 0
+    stays invalid.
+  - **#4337** — an unknown per-application `alg <name>` (outside
+    dns/ftp/sip/tftp) was HARD-rejected at commit though the
+    per-application ALG is not carried to the dataplane at all (only the
+    global `alg_disable_flags` bitfield is on the wire), so xpf rejected an
+    ALG it does not even enforce. Relaxed the #3353 strict reject to an
+    accepted-but-inert advisory in `ValidateConfig`
+    (`application <a>: alg "<name>" accepted but not enforced …`, mirroring
+    the global #4232 advisory). Known names still commit silently;
+    enforcement deferred to the per-application ALG slice of #2008.
+  - RED-on-revert proven for both (Edit-revert, not git): #4336 → the exact
+    issue error `invalid port 0: must be 1-65535`; #4337 → re-instating the
+    strict reject fails the accept-with-advisory assertions. Full
+    `go test ./pkg/config/...` green, `go vet`, `go build ./...`, gofmt all
+    clean. No Rust/cargo change.
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_application_port_range_zero_4336_test.go,
+  pkg/config/compiler_application_term_alg_3352_3353_test.go,
+  pkg/config/parser_ast_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-07-06 — #4282 part (a): lock CoS-submit owner TX accounting (tx_packets/tx_bytes)
 
