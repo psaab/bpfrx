@@ -36099,6 +36099,36 @@ top.
   docs/research/3616-ipsec-host-inbound/*.md (materialized + status stamp).
 
 - **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A — first authenticated cluster control channel + config
+  foundation for the PSK/HMAC program (F1-stronger + F23). Config: added the
+  `set chassis cluster authentication-key <key>` leaf (schema_chassis.go),
+  `ClusterConfig.ControlLinkAuthKey config.Secret` (types_chassis.go), and the
+  Secret compile (compiler_system.go). Redaction is inherited free — the
+  `authentication-key` keyword is already in ast_redact.go's secret set
+  (##SECRET-DATA## in raw-AST renders) and the Secret type redacts JSON/YAML/
+  String(). Heartbeat/election channel authed: MarshalHeartbeatAuth appends a
+  52-byte trailer (magic XPFA + session + monotonic counter + HMAC-SHA256 over
+  the whole frame) after the version trailer (additive, legacy-parseable). The
+  receiver rejects a forged/tampered/replayed heartbeat BEFORE lastSeen refresh
+  or handlePeerHeartbeat. Dual-accept (heartbeatAuthDecision) mirrors the #4126
+  VRRP-checksum migration: no key → accept all; key + present → enforce HMAC +
+  anti-replay; key + absent + peer-never-authed → accept; key + absent +
+  peerAuthSeen (sticky, set only by a verified frame) → reject (downgrade).
+  Anti-replay (heartbeatAuthReplay) is strict within a session and re-anchors on
+  a new random session id, so a reboot/restart (test-failover) is never a false
+  replay. Key plumbed via Manager.UpdateConfig → controlLinkAuthKey(); raw
+  bytes, never logged; fetched fresh each send/recv so a commit takes effect
+  without a heartbeat restart. RED-on-revert proven: neutering
+  heartbeatAuthDecision to always-accept turns bad-hmac / replay / downgrade /
+  forged-frame assertions RED. go test ./pkg/config/... ./pkg/cluster/... green
+  (incl. -race); go build ./..., gofmt, go vet clean. Follow-up channels
+  (session-sync frames, fabric gRPC) reuse the same ControlLinkAuthKey.
+- **File(s)**: pkg/config/schema_chassis.go, pkg/config/types_chassis.go,
+  pkg/config/compiler_system.go, pkg/config/compiler_cluster_authkey_4107_test.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/manager.go, pkg/cluster/group_state.go,
+  pkg/cluster/heartbeat_auth_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
 - **Action**: #4070 PR-A — fix the mixed-shape apply-groups leaf-list
   DUPLICATE-NODE bug (CASE-D). A leaf-list can be expressed as a COLLAPSED
   leaf (`name-server 1.1.1.1 2.2.2.2`, Keys[0]=="name-server") or a BLOCK
@@ -36123,6 +36153,27 @@ top.
   pkg/config/apply_groups_leaflist_test.go
 
 - **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A hardening fold (hostile-review) — close the
+  silent-downgrade-to-unsigned edge. MarshalHeartbeatAuth previously fell back
+  to emitting an UNSIGNED frame when body+52 > maxHeartbeatSize (an extreme
+  ~monitor-heavy config), which an ENFORCING peer would reject → dual-primary.
+  Fix: extracted marshalHeartbeatBody(pkt, tailReserve) from MarshalHeartbeat
+  (MarshalHeartbeat is now a tailReserve=0 wrapper, byte-identical); when a key
+  is configured MarshalHeartbeatAuth reserves heartbeatAuthTrailerSize up front
+  so the best-effort monitor section is truncated to make room while the
+  election-critical header/RG groups are always kept — the signed frame ALWAYS
+  fits its HMAC. Invariant: once a key is configured a heartbeat is NEVER
+  emitted unsigned. The residual overflow guard is unreachable at the
+  uint8-bounded RG count and fails LOUD (slog.Error) instead of emitting
+  cleartext. Added TestMarshalHeartbeatAuth_NeverUnsignedWhenKeyed (300 long-name
+  monitors overflow the cap → frame still SIGNED + verifies, groups survive,
+  monitors truncated). RED-on-revert proven: dropping the reserve re-introduces
+  the unsigned-fallback → test fails "emitted UNSIGNED under frame overflow".
+  go test ./pkg/config/... ./pkg/cluster/... green (incl. -race); go build,
+  gofmt, vet clean. Also merged origin/master (#4070/#4325 advanced); _Log.md
+  union.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/README.md, _Log.md
 - **Action**: #2387 Track A.1 + A.3 (PR-A) — add a commit-time WARNING when two
   DISTINCT routing-instances carry overlapping L3 address space, and document
   the not-session-isolated limitation. The userspace-dp session/flow identity is
@@ -36149,3 +36200,118 @@ top.
 - **File(s)**: pkg/config/compiler_validate_vrf_overlap.go,
   pkg/config/compiler_validate_vrf_overlap_2387_test.go, pkg/config/compiler.go,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+
+## 2026-07-06 — #4329 flat vSRX reth mis-resolves node identity on secondary
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix #4329 — a canonical vSRX chassis-cluster config (both
+  `ge-0/0/0` and `ge-7/0/0` carrying `redundant-parent reth0`, NO groups, NO
+  `chassis cluster node` leaf) silently mis-bound EVERY reth to the node-0
+  physical member on node 1 (wrong VIP placement, wrong HA-group interfaces).
+  Root cause: `Config.RethToPhysical()` scores members by
+  `SlotToNodeID(name) == Cluster.NodeID`, but `Cluster.NodeID` is populated
+  ONLY from the config leaf `chassis cluster node <id>` (guarded NodeIDSet).
+  The leaf-less flat vSRX form left `Cluster.NodeID` at its `0` default on BOTH
+  nodes, and `CompileConfigForNode(tree, nodeID)` used `nodeID` only for the
+  `${node}` group-expansion var, never the compiled cluster identity — so on
+  node 1 both members scored by the node-0 fallback and the alphabetical
+  tiebreak picked `ge-0/0/0` on both nodes. Fix: in
+  `compileConfigForNodeWithOpts` (pkg/config/compiler.go), after
+  `compileExpanded`, STAMP `cfg.Chassis.Cluster.NodeID = nodeID` guarded by
+  `nodeID >= 0 && cfg.Chassis.Cluster != nil && !cfg.Chassis.Cluster.NodeIDSet`.
+  Guard rationale: (1) `nodeID >= 0` — standalone compile routes through
+  `CompileConfig` (nodeID -1) and never reaches this path, so single-node
+  resolution is unchanged; (2) `Cluster != nil` — never fabricate a cluster
+  stanza, so a config-less HA node (node-id present, empty config — the
+  EMPTY-config takeover in pkg/daemon/daemon.go) keeps `Cluster == nil` and the
+  daemon's `haMode` / ~30 `Cluster != nil` gates do not flip on an empty
+  config (a real reth config always carries a `chassis cluster` stanza, so this
+  never suppresses a genuine fix); (3) `!NodeIDSet` — an explicit `chassis
+  cluster node <id>` leaf is the operator SSOT and must win, so the GROUPS form
+  (loss cluster: `groups node0/node1` each carry an explicit `node` leaf) is
+  bit-identical and `test-failover` is unaffected. RethToPhysical's alphabetical
+  tiebreak is left as-is: with the stamp the local member scores strictly higher
+  (2 vs 0), so the tiebreak is never reached for the 2-member case and never
+  decides between two nodes' members. RED-on-revert proven: reverting the stamp
+  makes node-1 bind `ge-0/0/0` (the exact bug); the explicit-leaf / groups /
+  standalone tests correctly stay GREEN on revert (not falsely coupled). Full
+  `go test ./pkg/config/...` + `./pkg/configstore/...` green, gofmt, go vet,
+  `go build ./...` all clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go,
+  docs/ha-cluster-test-plan.md, _Log.md
+
+## 2026-07-06 — #4329 fold: relocate NodeID stamp before fabric derivation
+
+- **Timestamp**: 2026-07-06
+- **Action**: Copilot review of PR #4331 found a REAL incompleteness in the
+  first stamp placement. The stamp ran in `compileConfigForNodeWithOpts` AFTER
+  `compileExpanded` returned, but `compileExpanded` ALREADY derives two
+  NodeID-dependent COMPILE-TIME fabric fields under the stale default NodeID=0
+  (compiler.go fabric fixup, `SlotToNodeID(member) == cc.NodeID`):
+  `InterfaceConfig.LocalFabricMember` (which fab member is local to this node)
+  and the auto-detected `Cluster.FabricInterface` / `Fabric1Interface`. So the
+  first fix corrected reth resolution (RethToPhysical reads NodeID at runtime,
+  after the stamp) but left the fabric fields WRONG on node 1 for a leaf-less
+  flat config — the same class of bug, still present for fabric. Fix: thread
+  the node identity into `compileExpanded` via two new `compileOpts` fields
+  (`nodeAware bool`, `stampNodeID int`), set only by the node-aware entry
+  `compileConfigForNodeWithOpts`, and MOVE the stamp INSIDE `compileExpanded`
+  to run immediately after the top-level child loop (Cluster + interfaces
+  populated) and BEFORE every NodeID-dependent derivation: the fabric fixup
+  AND `validateDeviceMapStrict` (compiler.go, called later, also reads
+  cc.NodeID). Same three guards preserved:
+  `opts.nodeAware && opts.stampNodeID >= 0 && Cluster != nil && !NodeIDSet`
+  (standalone `CompileConfig` leaves nodeAware false → unchanged; never
+  fabricate Cluster → daemon.go EMPTY-config haMode reasoning holds; explicit
+  `chassis cluster node` leaf wins → GROUPS form bit-identical). RethToPhysical
+  and its alphabetical tiebreak are still unchanged (stamp now sets NodeID
+  during compile, so the runtime read still sees the correct value). Added
+  fabric regression test (canonical vSRX fab0=FPC-0 member / fab1=FPC-7 member,
+  NO node leaf): node 0 → fab0.LocalFabricMember=ge-0/0/1 + FabricInterface
+  fab0; node 1 → fab1.LocalFabricMember=ge-7/0/1 + FabricInterface fab1. RED on
+  revert PROVEN for BOTH reth (node 1 → ge-0/0/0) and fabric (node 1 fab1
+  LocalFabricMember empty, FabricInterface picks fab0); the reth/fabric GROUPS
+  forms + explicit-leaf + standalone tests correctly stay GREEN on revert (not
+  falsely coupled). GROUPS form confirmed unaffected (loss cluster carries an
+  explicit `node` leaf per group → NodeIDSet true → stamp skipped → no
+  test-failover impact). Full `go test ./pkg/config/...` +
+  `./pkg/configstore/...` green, gofmt, go vet, `go build ./...` clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4313 PR-A — land the per-subtree closed-world validation
+  MECHANISM in the schema walker (mechanism only; no production subtree
+  flipped). The config schema is opt-in at the KEYWORD level: when
+  walkSchemaNode resolves a keyword to a nil schema child it returns nil
+  and the unmodeled leaf commits clean, then is silently dropped (the
+  compiler has no case for it either). A BLANKET closed-world flip is
+  infeasible — it breaks the deliberately-lenient accept-with-advisory
+  paths (#1960/#3307/#3318, #2078/#4231) and false-rejects
+  valid-but-not-yet-modeled Junos (#4191 strand-preflight class). PR-A
+  adds an additive `closedWorld bool` to schemaNode (schema.go): default
+  false = byte-identical legacy behaviour; true rejects an unmodeled child
+  keyword under that subtree at strict commit. The walker now threads a
+  `closed` param down walkSchemaChildren / walkSchemaNode /
+  walkInstanceChildren; the top-level call passes closed=false, and each
+  container descent folds in the node's flag
+  (childClosed := closed || childSchema.closedWorld), so the flag inherits
+  to every descendant level. The ONE behavioural branch is at the
+  keyword-resolution gate (childSchema == nil): closed=true → typedLeafErrorf
+  reject mirroring the modifier-level unknown-keyword rejects; closed=false
+  (every production subtree today) → return nil, unchanged. NO production
+  schemaNode sets closedWorld — the mechanism is dormant, so every existing
+  config validates identically (zero false-reject risk). The per-subtree
+  production flips (security ipsec / security nat then / snmp community /
+  protocols {ospf,bgp} interface / interfaces family) are deferred PR-B..N,
+  each gated on a Junos-leaf completeness audit for that subtree; #4313
+  stays open for them. White-box tested with a SYNTHETIC closedWorld
+  subtree (schema_walk_internal_test.go, TestClosedWorld_*): unmodeled →
+  rejected under closed / silently accepted under open (RED-on-revert
+  discriminator proven by disabling the gate: the two rejection tests fail,
+  the open/modeled tests stay green); modeled → accepted; closed-world
+  inherits to descendants. Full pkg/config suite (-count=1), gofmt, vet,
+  go build ./... all clean.
+- **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go,
+  pkg/config/schema_walk_internal_test.go, docs/config-schema.md, _Log.md
