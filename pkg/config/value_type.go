@@ -36,6 +36,12 @@ const (
 	ValueByteSizeOrPercent
 	// ValuePercent is a percent value in the range [0, 100] (no suffix).
 	ValuePercent
+	// ValueRateOrPercent is a CoS scheduler/shaper rate expressed EITHER as a
+	// bandwidth with k/m/g suffix (10m), or the Junos keyword forms
+	// `percent <n>` / `remainder`. The heterogeneous tail is validated by the
+	// leaf's tailValidator, not a single-token validator; this type only
+	// drives the `?` completion placeholder. #4228 Gap 2.
+	ValueRateOrPercent
 	// ValueInteger is a bare integer. Range is enforced by the leaf's
 	// Validator (callers use ValidateInteger(min,max) to bound it).
 	ValueInteger
@@ -99,6 +105,8 @@ func (v ValueType) Placeholder() string {
 		return "<bytes|percent>"
 	case ValuePercent:
 		return "<percent>"
+	case ValueRateOrPercent:
+		return "<rate|percent|remainder>"
 	case ValueInteger:
 		return "<integer>"
 	case ValueIdentifier:

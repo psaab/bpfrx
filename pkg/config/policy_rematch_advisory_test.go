@@ -5,34 +5,35 @@ import (
 	"testing"
 )
 
-// #4233: `security policies policy-rematch [extensive]` was absent from
-// setSchema and from compilePolicies' child handling, so it committed clean
-// and was silently dropped — an operator who set it believed in-progress
-// sessions would be re-evaluated on a policy change. Per the #2078 / #2008 H13
-// accepted-with-advisory doctrine the knob is now recorded and commit emits an
-// advisory. #4234 then shipped the Junos-DEFAULT deletion-clear (a deleted
-// policy's sessions are dropped at commit), so the advisory now reports PARTIAL
-// enforcement: the deleted-policy half is enforced; only the MODIFIED-policy
-// re-evaluation stays accepted-only. These tests pin that the leaf compiles (no
-// silent drop) AND that the advisory fires. RED on revert: without the
-// compiler/schema/warn wiring the advisory is never emitted.
+// #4233 recorded `security policies policy-rematch [extensive]` on
+// SecurityConfig with an accepted-only advisory. #4234 then shipped the
+// enforcement in two steps: first the Junos-DEFAULT deletion-clear (a deleted
+// policy's sessions dropped at commit, independent of the knob), then the
+// modified-policy re-evaluation gated on `policy-rematch` (a surviving policy
+// whose match/action changed has its live sessions cleared,
+// clearSessionsForModifiedPolicies). With the core enforced, the BARE knob no
+// longer warns; only `extensive` — Junos re-evaluates sessions of UNCHANGED
+// policies when a referenced object changes, which xpf does not do — keeps an
+// advisory. These tests pin that contract. RED on revert: the bare-knob case
+// flips back to expecting an advisory, and the extensive advisory loses its
+// wording.
 
-// findPolicyRematchAdvisory returns the single #4233 policy-rematch advisory,
-// or "" if none was emitted.
-func findPolicyRematchAdvisory(cfg *Config) string {
+// findPolicyRematchExtensiveAdvisory returns the #4234 policy-rematch extensive
+// advisory, or "" if none was emitted.
+func findPolicyRematchExtensiveAdvisory(cfg *Config) string {
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "security policies policy-rematch") &&
+		if strings.Contains(w, "security policies policy-rematch extensive") &&
 			strings.Contains(w, "partially enforced") &&
-			strings.Contains(w, "#4233") {
+			strings.Contains(w, "#4234") {
 			return w
 		}
 	}
 	return ""
 }
 
-// The bare knob must compile (recorded on SecurityConfig, not dropped) AND
-// emit the accepted-only advisory naming the enforcement follow-up.
-func TestPolicyRematchAdvisory_Bare(t *testing.T) {
+// The bare knob must compile (recorded on SecurityConfig, not dropped) AND —
+// now that the modified-policy re-eval core ships — emit NO advisory.
+func TestPolicyRematchAdvisory_BareEnforcedNoWarn(t *testing.T) {
 	cfg := compileSetLines(t, []string{
 		"set security policies policy-rematch",
 	})
@@ -42,20 +43,15 @@ func TestPolicyRematchAdvisory_Bare(t *testing.T) {
 	if cfg.Security.PolicyRematchExtensive {
 		t.Fatal("bare policy-rematch wrongly set the extensive sub-mode")
 	}
-	adv := findPolicyRematchAdvisory(cfg)
-	if adv == "" {
-		t.Fatalf("policy-rematch did not emit the #4233 advisory; warnings=%v", cfg.Warnings)
-	}
-	if !strings.Contains(adv, "#4234") {
-		t.Fatalf("advisory does not reference the enforcement issue #4234: %q", adv)
-	}
-	// A bare knob must NOT claim the extensive sub-mode.
-	if strings.Contains(adv, "extensive") {
-		t.Fatalf("bare policy-rematch advisory wrongly names extensive: %q", adv)
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "policy-rematch") {
+			t.Fatalf("bare policy-rematch (core enforced) must not warn; got: %q", w)
+		}
 	}
 }
 
-// The extensive sub-mode compiles onto the flag AND is named in the advisory.
+// The extensive sub-mode compiles onto the flag AND still warns: only the
+// unchanged-policy-object re-eval remains unenforced.
 func TestPolicyRematchAdvisory_Extensive(t *testing.T) {
 	cfg := compileSetLines(t, []string{
 		"set security policies policy-rematch extensive",
@@ -66,9 +62,9 @@ func TestPolicyRematchAdvisory_Extensive(t *testing.T) {
 	if !cfg.Security.PolicyRematchExtensive {
 		t.Fatal("policy-rematch extensive did not set Security.PolicyRematchExtensive")
 	}
-	adv := findPolicyRematchAdvisory(cfg)
+	adv := findPolicyRematchExtensiveAdvisory(cfg)
 	if adv == "" {
-		t.Fatalf("policy-rematch extensive did not emit the #4233 advisory; warnings=%v", cfg.Warnings)
+		t.Fatalf("policy-rematch extensive did not emit the #4234 advisory; warnings=%v", cfg.Warnings)
 	}
 	if !strings.Contains(adv, "extensive") {
 		t.Fatalf("extensive advisory does not name the extensive sub-mode: %q", adv)
@@ -83,7 +79,7 @@ func TestPolicyRematchAdvisory_AbsentNoWarn(t *testing.T) {
 	if cfg.Security.PolicyRematch {
 		t.Fatal("PolicyRematch set with no policy-rematch stanza")
 	}
-	if adv := findPolicyRematchAdvisory(cfg); adv != "" {
+	if adv := findPolicyRematchExtensiveAdvisory(cfg); adv != "" {
 		t.Fatalf("unexpected policy-rematch advisory with no stanza: %q", adv)
 	}
 }

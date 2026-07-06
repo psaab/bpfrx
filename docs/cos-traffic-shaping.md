@@ -196,6 +196,30 @@ These invariants define the design:
   surplus-phase participation while keeping its per-queue rate as a
   guarantee floor.
 
+#### `transmit-rate` / `shaping-rate` value forms (#4228 Gap 2)
+
+`transmit-rate` accepts three mutually-exclusive Junos value forms, each
+optionally followed by `exact`:
+
+- an **absolute bandwidth** — `transmit-rate 3g` (enforced);
+- **`percent <n>`** — `transmit-rate percent 30` (a share of the bound
+  interface's rate); and
+- **`remainder`** — `transmit-rate remainder` (a share of the leftover
+  bandwidth).
+
+`shaping-rate` (traffic-control-profiles) accepts an absolute bandwidth or
+`shaping-rate percent <n>`. These forms are accepted so imported vSRX
+configs commit unchanged (the percent form is the most common Junos
+scheduler idiom). **The percent / remainder forms are currently
+ACCEPTED-BUT-INERT:** the userspace dataplane consumes an absolute byte/sec
+rate, and xpf does not yet resolve a percent/remainder against the bound
+interface's rate — a scheduler can be mapped onto interfaces of different
+speeds, so resolution is a multi-pass follow-up. A commit advisory
+(`ValidateConfig`) surfaces the inertness; a queue with only a percent/
+remainder `transmit-rate` gets no explicit rate until resolution lands, and
+a `shaping-rate percent` leaves the unit unshaped. The commit gate still
+rejects garbage (`transmit-rate percent 150`, `transmit-rate asd`).
+
 ### First-Pass Fairness Boundary
 
 This design is intentionally honest about what it does and does not solve.

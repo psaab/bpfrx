@@ -260,6 +260,25 @@ func PolicyIDsByStableKey(cfg *config.Config) map[string]uint32 {
 	return out
 }
 
+// PoliciesByStableKey maps the same stable policy key PolicyIDsByStableKey uses
+// (StablePolicyRuleID: "<from>-><to>/<name>", globals keyed junos-global) to the
+// compiled *config.Policy behind it. It exists so a caller can diff two configs
+// by key and, for a policy present in BOTH, compare its match/action to detect a
+// MODIFICATION — the commit-time modified-policy re-evaluation (#4234
+// policy-rematch) uses this alongside PolicyIDsByStableKey (which supplies the
+// OLD numeric ID that a modified policy's still-live sessions carry). A policy
+// expanded into multiple rule slots (application-set expansion) maps its key to
+// the same *config.Policy on every slot, so last-write-wins stores the one
+// policy object — exactly what a match/action comparison needs.
+func PoliciesByStableKey(cfg *config.Config) map[string]*config.Policy {
+	out := make(map[string]*config.Policy)
+	_ = walkPolicyRuleSlots(cfg, func(slot policyRuleSlot) error {
+		out[stablePolicyRuleID(slot.FromZone, slot.ToZone, slot.Policy.Name)] = slot.Policy
+		return nil
+	})
+	return out
+}
+
 // walkPolicyRuleSlots invokes fn for every configured policy in config order,
 // assigning each policy its slot in the runtime policy-ID namespace. It is the
 // SHARED contract behind both the snapshot builder (the ID-WRITE side, #3145)

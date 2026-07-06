@@ -73,15 +73,28 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 		// and the SchemaValidate commit-check gate read one tree. The
 		// `exact` child predates #1319 and is unchanged — adding fields
 		// to transmit-rate does not alter SetPath grouping.
+		// #4228 Gap 2: transmit-rate accepts an absolute bandwidth (10m), the
+		// Junos `percent <n>` form (share of the bound interface's rate), or
+		// `remainder` (leftover bandwidth), each optionally `exact`. The
+		// heterogeneous tail is validated as a unit (tailValidator) because the
+		// first token is EITHER a value or a keyword — the standard typed-leaf
+		// path cannot express that. percent/remainder compile to a stored
+		// percent/flag that the dataplane does not yet resolve to an absolute
+		// rate (commit advisory, compiler_validate_warn.go). valueType drives
+		// `?` completion only; validator MUST stay nil so the tail path owns
+		// acceptance. percent/remainder are also declared as children purely so
+		// `set ... transmit-rate ?` surfaces them.
 		"transmit-rate": {
-			desc:          "Transmit rate in bits per second (e.g. 100k, 10m, 1g)",
+			desc:          "Transmit rate: a bandwidth (100k, 10m, 1g), `percent <n>`, or `remainder`",
 			args:          1,
-			valueType:     ValueRate,
-			valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps",
-			valueExamples: []string{"100k", "10m", "1g", "10g"},
-			validator:     ValidateRate,
+			valueType:     ValueRateOrPercent,
+			valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g), `percent <n>`, or `remainder`",
+			valueExamples: []string{"100k", "10m", "1g", "10g", "percent", "remainder"},
+			tailValidator: ValidateCoSTransmitRateTail,
 			children: map[string]*schemaNode{
-				"exact": {desc: "Cap the queue at the configured rate (no surplus borrowing unless surplus-sharing is set)", children: nil},
+				"exact":     {desc: "Cap the queue at the configured rate (no surplus borrowing unless surplus-sharing is set)", children: nil},
+				"percent":   {desc: "Transmit rate as a percent of the bound interface's rate (accepted for Junos compatibility; NOT yet resolved to an absolute rate by the dataplane)", args: 1, placeholder: "<percent>", children: nil},
+				"remainder": {desc: "Share of the leftover bandwidth (accepted for Junos compatibility; NOT yet resolved to an absolute rate by the dataplane)", children: nil},
 			},
 		},
 		"priority": {
@@ -156,14 +169,23 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 	// are typed (garbage rejected at commit) but currently INERT — no
 	// per-unit dataplane consumer — and carry a commit advisory.
 	"traffic-control-profiles": {desc: "Hierarchical traffic-shaping profiles bound to an interface via output-traffic-control-profile", args: 1, multi: true, placeholder: "<profile-name>", children: map[string]*schemaNode{
+		// #4228 Gap 2: shaping-rate accepts an absolute bandwidth (10m) or the
+		// Junos `percent <n>` form (share of the bound interface's speed). The
+		// absolute form is enforced as the root shaper on the bound unit; the
+		// percent form is accepted for vSRX-config import parity but is inert
+		// until the dataplane can resolve it against the interface speed
+		// (commit advisory). Whole-tail validated; children stay nil so
+		// re-setting shaping-rate REPLACES (single-valued) rather than
+		// appending, and the `percent 90` container groups its value as a
+		// child that gatherLeafTailTokens flattens.
 		"shaping-rate": {
-			desc:          "Peak shaping rate in bits per second (k/m/g suffix) — enforced as the root shaper on the bound unit",
+			desc:          "Peak shaping rate: a bandwidth (k/m/g) or `percent <n>` — enforced as the root shaper on the bound unit (percent accepted-but-inert)",
 			args:          1,
-			placeholder:   "<rate>",
-			valueType:     ValueRate,
-			valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps",
-			valueExamples: []string{"10m", "1g", "10g"},
-			validator:     ValidateRate,
+			placeholder:   "<rate|percent>",
+			valueType:     ValueRateOrPercent,
+			valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or `percent <n>`",
+			valueExamples: []string{"10m", "1g", "10g", "percent"},
+			tailValidator: ValidateCoSShapingRateTail,
 			children:      nil,
 		},
 		"guaranteed-rate": {
