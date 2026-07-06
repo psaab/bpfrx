@@ -74,6 +74,8 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			HsRxDropsIndexExhausted:   10,
 			HsRxDropsReplayedInit:     45,
 			HsRxCookieUnsupported:     11,
+			// #4094 PR-B initiator cookie-replies consumed (50, off-ladder).
+			HsRxCookieConsumed:        50,
 			// #4094 PR-A responder cookie mechanism (46.. continuing).
 			HsCookieRepliesSent:       46,
 			HsRxUnderLoadNoMac2:       47,
@@ -165,6 +167,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=cookie_reply_budget,tunnel=wg0":           49,
 		"xpf_userspace_wg_cookie_replies_total,event=sent,tunnel=wg0":                               46,
 		"xpf_userspace_wg_cookie_replies_total,event=mac2_ok,tunnel=wg0":                            48,
+		"xpf_userspace_wg_cookie_replies_total,event=consumed,tunnel=wg0":                           50,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=unknown_type,tunnel=wg0":                  12,
 		"xpf_userspace_wg_transport_packets_total,direction=encap,tunnel=wg0":                       26,
 		"xpf_userspace_wg_transport_packets_total,direction=decap,tunnel=wg0":                       15,
@@ -290,10 +293,10 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 	// 2x expired, #1888) + 4 send kinds + 1 confirmed (per-peer, #1434;
 	// one peer here) + 3 rekey reasons + 2 keepalive-sent kinds +
 	// 1 sessions-expired + 1 attempts-aborted; +2 hs reasons #4094
-	// (under_load_no_mac2 + cookie_reply_budget) + 2 cookie-reply events
-	// #4094 (sent + mac2_ok) = 50.
-	if count != 50 {
-		t.Errorf("emitted %d series for a zeroed tunnel, want 50 (zeros are real signals)", count)
+	// (under_load_no_mac2 + cookie_reply_budget) + 3 cookie-reply events
+	// #4094 (sent + mac2_ok [PR-A] + consumed [PR-B]) = 51.
+	if count != 51 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 51 (zeros are real signals)", count)
 	}
 }
 

@@ -911,6 +911,7 @@ impl super::Coordinator {
                 hs_rx_drops_index_exhausted: c.hs_rx_drops_index_exhausted.load(Ordering::Relaxed),
                 hs_rx_drops_replayed_init: c.hs_rx_drops_replayed_init.load(Ordering::Relaxed),
                 hs_rx_cookie_unsupported: c.hs_rx_cookie_unsupported.load(Ordering::Relaxed),
+                hs_rx_cookie_consumed: c.hs_rx_cookie_consumed.load(Ordering::Relaxed),
                 hs_cookie_replies_sent: c.hs_cookie_replies_sent.load(Ordering::Relaxed),
                 hs_rx_under_load_no_mac2: c.hs_rx_under_load_no_mac2.load(Ordering::Relaxed),
                 hs_rx_under_load_mac2_ok: c.hs_rx_under_load_mac2_ok.load(Ordering::Relaxed),

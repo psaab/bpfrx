@@ -1696,6 +1696,9 @@ type WgTunnelStatus struct {
 	// that peer. Distinct from the transport DecapDropsReplay window.
 	HsRxDropsReplayedInit uint64 `json:"hs_rx_drops_replayed_init,omitempty"`
 	HsRxCookieUnsupported uint64 `json:"hs_rx_cookie_unsupported,omitempty"`
+	// #4094 PR-B initiator-side cookie-replies successfully consumed
+	// (decrypted + stored, arming a valid MAC2 on the next initiation).
+	HsRxCookieConsumed uint64 `json:"hs_rx_cookie_consumed,omitempty"`
 	// #4094 PR-A responder cookie-reply / MAC2 under-load DoS mitigation:
 	// cookie replies emitted, under-load initiations dropped for a
 	// missing/bad MAC2 (challenged instead of handshaked), under-load

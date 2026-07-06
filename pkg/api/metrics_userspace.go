@@ -181,9 +181,12 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 		}
 
 		// #4094 PR-A responder cookie mechanism working signals: challenges
-		// issued and primed peers that completed under load.
+		// issued and primed peers that completed under load. #4094 PR-B adds
+		// the initiator half — cookie-replies we consumed to arm a valid
+		// MAC2 on our next initiation.
 		counter(c.wgCookieRepliesTotal, t.HsCookieRepliesSent, t.Tunnel, "sent")
 		counter(c.wgCookieRepliesTotal, t.HsRxUnderLoadMac2Ok, t.Tunnel, "mac2_ok")
+		counter(c.wgCookieRepliesTotal, t.HsRxCookieConsumed, t.Tunnel, "consumed")
 
 		counter(c.wgTransportPacketsTotal, t.EncapPackets, t.Tunnel, "encap")
 		counter(c.wgTransportPacketsTotal, t.DecapPackets, t.Tunnel, "decap")
