@@ -6775,25 +6775,44 @@ func validateHostInboundStanzaStrict(zone, ifName string, hib *HostInboundTraffi
 	return nil
 }
 
-// validateAddressBookEntryNamesStrict (#3061) hard-rejects a `/` character in
-// any address-book entry NAME — a global `address`/`address-set` name, a
-// zone-local `address`/`address-set` name — or any security-zone NAME. Junos
-// object-naming rules disallow `/` in such identifiers, but the xpf lexer
-// permits `/` in an identifier token (it is needed for IP-literal values like
-// 10.0.0.0/24), and no other validator rejected it.
+// validateAddressBookEntryNamesStrict (#3061, relaxed in #4340) enforces the
+// two naming invariants the zone-local address-book fold
+// (resolveZoneLocalAddressBooks) depends on, while otherwise PERMITTING the
+// prefix-in-name convention every real vSRX config uses: an address object is
+// almost universally named after its prefix — net_10.0.0.0/8,
+// net4_sfmix_72.52.96.201/32, net_2001:559:8585:200::/64. The `/` in such a
+// name is only a display identifier, never a structural token; the whole
+// downstream resolution path (policyMatchNamedAddressRefs,
+// resolveUserspaceAddressBookEntry, the wire snapshot) keys address objects by
+// the FULL name string via direct map lookups, so a `/` in the name resolves
+// correctly end to end.
 //
-// This is load-bearing for the zone-local address-book fold
-// (resolveZoneLocalAddressBooks): the fold mints synthetic global names of the
-// form zone-local/<zone>/<name>. If an operator could type a name containing
-// `/` (e.g. a global address literally named zone-local/trust/web-server),
-// that name could collide with a synthetic name and be silently clobbered by
-// the fold — wrong policy address resolution with no commit error. Rejecting
-// `/` in every operator-typed name makes the synthetic `zone-local/...`
-// namespace collision-proof.
+// The fold mints synthetic global names of the form zone-local/<zone>/<name>.
+// Only two invariants keep that namespace collision-proof and unambiguously
+// reversible (ZoneLocalUnqualify) — and neither needs a blanket `/` ban:
+//
+//  1. No operator-typed address-book ENTRY name (global or zone-local
+//     address / address-set) may begin with the reserved "zone-local/"
+//     prefix. If it could, a global address literally named
+//     zone-local/trust/web-server would collide with the synthetic name the
+//     fold mints for a zone-local `web-server` in zone trust, and the fold's
+//     no-clobber guard would silently drop the zone-local entry (wrong
+//     address resolution, no commit error — the #3061 hazard). Reserving only
+//     this PREFIX, not every `/`, lets `/` appear freely elsewhere in a name.
+//
+//  2. No security-zone NAME may contain `/`. The zone is the FIRST segment
+//     after the reserved prefix, and ZoneLocalUnqualify splits zone from name
+//     on the first `/`; a `/`-free zone keeps that split unambiguous even
+//     when the address NAME that follows contains `/`
+//     (zone-local/trust/net_10.0.0.0/8 unqualifies to zone=trust,
+//     name=net_10.0.0.0/8 because strings.Cut stops at the first `/`). Zones
+//     never carry a prefix-in-name convention, so this costs nothing real.
 //
 // IMPORTANT: only the NAME token is checked, never an address VALUE/prefix —
-// `address web-server 10.0.0.0/24` is fine (the name is web-server; the
-// 10.0.0.0/24 prefix is the value, not validated here).
+// `address web-server 10.0.0.0/24` has always been fine (the name is
+// web-server; the 10.0.0.0/24 prefix is the value). After #4340
+// `address net_10.0.0.0/8 10.0.0.0/8` is ALSO fine: the `/` in the NAME is
+// permitted, matching the prefix-in-name convention.
 //
 // MUST run on the PRISTINE global book, i.e. BEFORE resolveZoneLocalAddressBooks
 // injects the `/`-bearing synthetic names; the caller enforces that ordering.
@@ -6801,12 +6820,26 @@ func validateAddressBookEntryNamesStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
-	checkName := func(kind, name string) error {
+	// checkEntryName reserves ONLY the synthetic zone-local/ prefix on an
+	// operator-typed address-book entry name (#4340); any other `/` is allowed.
+	checkEntryName := func(kind, name string) error {
+		if strings.HasPrefix(name, zoneLocalNamePrefix) {
+			return fmt.Errorf(
+				"%s name %q must not begin with the reserved %q prefix; that "+
+					"namespace is reserved for the internal zone-local "+
+					"address book — rename the object", kind, name, zoneLocalNamePrefix)
+		}
+		return nil
+	}
+	// checkZoneName keeps the full `/` ban on a security-zone name: the zone is
+	// the unambiguous first segment of the synthetic zone-local/<zone>/<name>
+	// key, so it must stay `/`-free.
+	checkZoneName := func(name string) error {
 		if strings.Contains(name, "/") {
 			return fmt.Errorf(
-				"%s name %q must not contain '/'; '/' is reserved for "+
-					"address prefixes and for the internal zone-local "+
-					"address-book namespace — rename the object", kind, name)
+				"security-zone name %q must not contain '/'; '/' is reserved "+
+					"for the internal zone-local address-book namespace — "+
+					"rename the zone", name)
 		}
 		return nil
 	}
@@ -6823,7 +6856,7 @@ func validateAddressBookEntryNamesStrict(cfg *Config) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			if err := checkName(kind, n); err != nil {
+			if err := checkEntryName(kind, n); err != nil {
 				return err
 			}
 		}
@@ -6840,7 +6873,7 @@ func validateAddressBookEntryNamesStrict(cfg *Config) error {
 	}
 	sort.Strings(zoneNames)
 	for _, z := range zoneNames {
-		if err := checkName("security-zone", z); err != nil {
+		if err := checkZoneName(z); err != nil {
 			return err
 		}
 		zone := cfg.Security.Zones[z]

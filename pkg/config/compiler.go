@@ -920,18 +920,19 @@ type compileOpts struct {
 	// later-sorting instance so the two never actually share a table. Same
 	// doctrine as lenientZoneIDCollision; mirrors the #3075 / #1873 id gates.
 	lenientRoutingInstanceTableIDCollision bool
-	// lenientAddressBookNames (#3061) downgrades the address-book / zone name
-	// `/`-character gate (validateAddressBookEntryNamesStrict) from a hard
-	// compile error to a cfg.Warnings entry. The strict commit / commit-check
-	// path hard-rejects a `/` in any address-book entry name (global or
-	// zone-local address / address-set) or any security-zone name — matching
-	// Junos object-naming rules and making the synthetic `zone-local/<zone>/
-	// <name>` internal name (resolveZoneLocalAddressBooks) collision-proof. The
-	// tolerant load / peer-sync paths downgrade to a warning so an already-
-	// persisted config an older binary accepted (before this gate existed) still
-	// BOOTS (#1960 no-brick); the fold's no-clobber guard keeps such a config
-	// from silently overwriting an operator entry. Same doctrine as
-	// lenientZoneCount.
+	// lenientAddressBookNames (#3061, narrowed in #4340) downgrades the
+	// address-book / zone name gate (validateAddressBookEntryNamesStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects only an address-book entry name that begins
+	// with the reserved `zone-local/` prefix (global or zone-local address /
+	// address-set) or a security-zone name that contains `/` — the two invariants
+	// that keep the synthetic `zone-local/<zone>/<name>` internal name
+	// (resolveZoneLocalAddressBooks) collision-proof. A `/` elsewhere in an entry
+	// name (net_10.0.0.0/8, the #4340 prefix-in-name convention) is accepted. The
+	// tolerant load / peer-sync paths downgrade the reject to a warning so an
+	// already-persisted config an older binary accepted still BOOTS (#1960
+	// no-brick); the fold's no-clobber guard keeps such a config from silently
+	// overwriting an operator entry. Same doctrine as lenientZoneCount.
 	lenientAddressBookNames bool
 	// lenientZoneInterfaceMembership (#3072) downgrades the zone-interface
 	// membership gate (validateZoneInterfaceMembershipStrict) from a hard
@@ -2535,17 +2536,18 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
-	// #3061 — reject `/` in operator-typed address-book entry names and
-	// security-zone names BEFORE folding zone-local books, so the synthetic
-	// zone-local/<zone>/<name> internal names minted by
-	// resolveZoneLocalAddressBooks are collision-proof (an operator name can no
-	// longer contain `/` and so can never equal a synthetic name). This MUST
-	// run on the pristine global book — i.e. before the fold injects the
-	// `/`-bearing synthetic names — so it is placed here rather than in the
-	// post-fold accumulator. Strict on commit / commit-check (hard-reject);
-	// tolerant load / peer-sync downgrade to a warning (#1960 no-brick — a `/`
-	// name was unusual but accepted before this gate existed; the fold's
-	// no-clobber guard keeps it from silently overwriting an operator entry).
+	// #3061 (narrowed in #4340) — enforce the two naming invariants that keep
+	// the synthetic zone-local/<zone>/<name> internal names minted by
+	// resolveZoneLocalAddressBooks collision-proof, BEFORE folding zone-local
+	// books: an operator address-book entry name may not begin with the reserved
+	// `zone-local/` prefix, and a security-zone name may not contain `/`. A `/`
+	// elsewhere in an entry name (net_10.0.0.0/8) is permitted — the
+	// prefix-in-name convention real vSRX configs use (#4340). This MUST run on
+	// the pristine global book — i.e. before the fold injects the `/`-bearing
+	// synthetic names — so it is placed here rather than in the post-fold
+	// accumulator. Strict on commit / commit-check (hard-reject); tolerant load /
+	// peer-sync downgrade to a warning (#1960 no-brick; the fold's no-clobber
+	// guard keeps it from silently overwriting an operator entry).
 	if err := validateAddressBookEntryNamesStrict(cfg); err != nil {
 		if opts.lenientAddressBookNames {
 			cfg.Warnings = append(cfg.Warnings,
