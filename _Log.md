@@ -1,3 +1,46 @@
+## 2026-07-05 — #3607: screen flood token bucket (Option B) — fix RateCounter sustained-at-threshold over-throttle
+
+- **Timestamp**: 2026-07-05
+- **Action**: Implemented the converged Option B plan for #3607. Added a
+  monotonic-ns fixed-point `TokenBucket` primitive to
+  `userspace-dp/src/screen/rate.rs` (16 B: `tokens_q` u64 + `last_refill_ns`
+  u64; `ONE = 1e9` scale so `refill_q = elapsed_ns * threshold` with no
+  per-packet divide; `saturating_sub` clock delta capped at 1 s;
+  `saturating_add` before `.min(capacity)`; cold-start FULL;
+  `admit_is_over` returns true==over, same polarity as
+  `RateCounter::increment`). Migrated the shaper / validate-budget consumers
+  in `screen/mod.rs` to it: the ICMP/UDP flood per-zone aggregates
+  (`icmp_counters` / `udp_counters`), the standby SYN-cookie ACK validation
+  budget (`syn_cookie_standby_ack_counters`), and a NEW per-zone
+  `syn_off_attack_buckets` that is the SOLE drop authority for the SYN-flood
+  aggregate DROP path when `syn-cookie` is OFF (consulted on every initial
+  SYN, decoupled from the measured `over_attack`; alarm now explicitly gated
+  on `!over_attack`). The count-all `syn_counters` `RateCounter` (cookie
+  activation + alarm), the #3315 sketch, and the missing-profile warn
+  dampener are UNCHANGED. Threaded the batch-cached `loop_now_ns` from
+  `stage_screen_check` / the standby-ACK stage (poll_stages.rs) —
+  poll_descriptor already had `now_ns` in scope — into the screen `_opts`
+  variants + `validate_syn_cookie_ack_on_session_miss`; the
+  second-granularity convenience wrappers derive `now_secs * 1e9`. Corrected
+  the false module doc claim (L10) in rate.rs; updated
+  docs/syn-cookie-flood-protection.md + docs/feature-coverage.md; brought the
+  plan doc onto the branch and marked it IMPLEMENTED.
+- **Validation**: full `cargo test --release` green — 3673 passed / 0 failed
+  / 2 ignored (pre-existing). `cargo build --release` clean. RED-on-revert
+  verified: reverting the cookie-OFF branch to the old count-all drop makes
+  `syn_flood_cookie_off_sustained_at_threshold_admitted` admit 100/1500
+  (one window) vs ≥99% with the bucket. New tests: TokenBucket unit tests
+  (sustained-admit, cold-start, burst-bound/#2937, recovery, clock-underflow,
+  high-threshold-gap overflow, RateCounter contrast), cookie-OFF sustained +
+  microburst consumer tests, adapted standby ACK rate-limit test to
+  token-bucket refill semantics.
+- **File(s)**: userspace-dp/src/screen/rate.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  docs/syn-cookie-flood-protection.md, docs/feature-coverage.md,
+  docs/research/3607-screen-rate/plan.md, _Log.md
+
 ## 2026-07-06 — config/daemon: PR #4320 Copilot review folds (4 edges)
 
 - **Timestamp**: 2026-07-06
