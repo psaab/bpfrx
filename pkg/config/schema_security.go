@@ -436,6 +436,14 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 						"destination-port":         {desc: "Destination port to match", args: 1, multi: true, placeholder: "<port>", children: nil},
 						"application":              {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
 					}},
+					// #4313: NOT closed-world (unlike the destination-NAT then
+					// below). Junos permits `then source-nat pool <name>
+					// persistent-nat { ... }` at the rule level, which xpf models
+					// per-pool (`security nat source pool <name> persistent-nat`,
+					// ~line 360) rather than under the rule-then pool. Flipping
+					// closedWorld here would inherit down to the `pool` leaf and
+					// false-reject that valid Junos config (#4191 class). Deferred
+					// until the rule-level persistent-nat leaves are modeled.
 					"then": {desc: "Source NAT action", children: map[string]*schemaNode{
 						"source-nat": {desc: "Source NAT translation", children: map[string]*schemaNode{
 							"interface": {desc: "Translate to the egress interface address", children: nil},
@@ -473,7 +481,37 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 						"protocol":                 {desc: "IP protocol to match", args: 1, multi: true, placeholder: "<protocol>", children: nil},
 						"application":              {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
 					}},
-					"then": {desc: "Destination NAT action", children: map[string]*schemaNode{
+					// #4313 PR-B — FIRST production closed-world subtree flip.
+					// The destination-NAT rule then-action is LEAF-COMPLETE: the
+					// Junos grammar under a DNAT rule `then` is exactly
+					// `destination-nat { off | pool <pool-name> }` — there is no
+					// persistent-nat (a source-NAT-only feature), no other action
+					// keyword, and the pool reference is a terminal name with no
+					// sub-block. Every valid keyword at every level below `then`
+					// is modeled here (then→destination-nat; destination-nat→
+					// off|pool; off/pool→leaf), and the compiler
+					// (compileNATDestination, compiler_nat.go) reads only these
+					// same keywords — so closing this subtree cannot false-reject
+					// any valid config (the #4191 class the umbrella warns about).
+					// closedWorld is inherited down every descendant level by
+					// walkSchemaNode's childClosed fold, so an unmodeled keyword
+					// anywhere under `then` (a typo like `poool`, or garbage
+					// trailing a valid action) is REJECTED at strict operator
+					// commit instead of committing clean and being silently
+					// dropped by the compiler (the #4313 silent-inert bug). The
+					// tolerant Load/SyncApply path downgrades the reject to a
+					// warning (#1960, configstore compileTreeLenient), so a
+					// stored or peer-synced config is not bricked.
+					//
+					// NOT flipped (yet): the SOURCE-NAT rule then-action above is
+					// deliberately left open-world because Junos permits
+					// `then source-nat pool <name> persistent-nat { ... }` at the
+					// rule level, which xpf instead models per-pool (`security nat
+					// source pool <name> persistent-nat`, ~line 360). Closing the
+					// source-NAT then would false-reject that valid Junos config;
+					// it is a follow-up once the rule-level persistent-nat leaves
+					// are modeled (or an accept-with-advisory decision is made).
+					"then": {desc: "Destination NAT action", closedWorld: true, children: map[string]*schemaNode{
 						"destination-nat": {desc: "Destination NAT translation", children: map[string]*schemaNode{
 							"off":  {desc: "Disable destination NAT for matching traffic (no-translate exemption)", children: nil},
 							"pool": {desc: "Translate using a destination NAT pool", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: nil},
