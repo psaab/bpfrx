@@ -1,3 +1,65 @@
+## 2026-07-06 — #4107 F1 fold: arm the fabric downgrade-guard off the heartbeat (post-restart window)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Hostile-review fold on PR #4357. The fabric downgrade-guard
+  (`fabricPeerAuthSeen`) armed ONLY when the peer proxied an on-demand fabric
+  RPC (operator show/clear/failover). Unlike the heartbeat — which arms its own
+  `peerAuthSeen` within ~200ms because heartbeats flow continuously — nothing
+  periodically dials the fabric listener, so after EVERY restart of a keyed node
+  there was a window (until the next cross-node command) where the fabric
+  GRACE-ACCEPTED tokenless calls (incl. `ClearSessions` / cross-node failover)
+  from any on-segment host. Fix: arm fabric enforcement off the heartbeat too.
+  Converted `heartbeatReceiver.peerAuthSeen` bool → `atomic.Bool` (now read
+  cross-goroutine), added `heartbeatReceiver.peerAuthenticated()` +
+  `Manager.HeartbeatPeerAuthSeen()` (reads `m.hbReceiver` under `m.mu`, nil →
+  false). In `checkFabricAuth` the tokenless-reject gate now fires when EITHER
+  the fabric sticky flag OR `HeartbeatPeerAuthSeen()` is armed, so enforcement
+  engages within ~one heartbeat interval of the peer coming up. Dual-accept
+  preserved: a not-yet-keyed peer signs neither channel, so the rolling-upgrade
+  grace still holds. No-key path unchanged. Documented residual #2 (clock skew
+  >30s exceeds the ±1-window tolerance → cross-node fabric RPCs fail
+  `Unauthenticated`; an operational NTP fault). New RED-on-revert test
+  (`TestFabricAuthUnary_HeartbeatArmsDowngradeGuard`: tokenless rejected when
+  heartbeat-armed even with fabric sticky NOT armed; grace holds when not armed)
+  + cluster accessor test (`TestManagerHeartbeatPeerAuthSeen`). `-race` clean on
+  both packages.
+- **File(s)**: `pkg/cluster/heartbeat.go`, `pkg/cluster/peer_state.go`,
+  `pkg/cluster/heartbeat_auth_test.go`, `pkg/grpcapi/fabric_auth.go`,
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_fabric_auth_4107_test.go`,
+  `docs/architecture.md`, `pkg/cluster/README.md`, `_Log.md`
+
+## 2026-07-06 — #4107 F1: authenticate the cluster fabric gRPC listener with the control-link PSK
+
+- **Timestamp**: 2026-07-06
+- **Action**: Closed the HIGH F1 hole. The network-exposed fabric gRPC
+  listener (`RunFabricListener`, bound on the sync/fabric IP) had a
+  fail-closed method allowlist (#4122) but NO authentication — any host on
+  the shared control segment could invoke the allowlisted read/monitor/
+  `ClearSessions`/cross-node-failover RPCs with no credential. Added a PSK
+  auth interceptor pair (`fabricAuthUnaryInterceptor` /
+  `fabricAuthStreamInterceptor` in new `pkg/grpcapi/fabric_auth.go`) chained
+  BEFORE the allowlist. It reuses the #4326 control-link PSK
+  (`Manager.ControlLinkAuthKey()`, new exported accessor). The caller carries
+  a time-windowed HMAC bearer token — `HMAC-SHA256(PSK, domain‖window)`,
+  30 s window with ±1 skew tolerance, hex in the `xpf-fabric-auth` metadata
+  header, verified constant-time (`hmac.Equal`). The local node attaches it
+  on every `dialPeer` RPC via `fabricAuthCreds` (per-RPC, insecure-transport
+  OK). Dual-accept mirrors `cluster.heartbeatAuthDecision`
+  (`fabricAuthDecision`): no local key → accept; valid token → accept +
+  set sticky `fabricPeerAuthSeen`; present-but-invalid → `Unauthenticated`;
+  tokenless before peer ever authed → grace accept (key rollout);
+  tokenless after peer authed → reject (downgrade attack). The loopback
+  (127.0.0.1) listener is UNCHANGED. RED-on-revert tests in
+  `server_fabric_auth_4107_test.go` (verified: invalid-token, downgrade, and
+  stream cases go RED with the auth check disabled). F23 (session-sync stream
+  HMAC) deferred as a documented follow-up — it needs a connection-setup
+  capability handshake (a stream can't use the heartbeat's transparent
+  trailer) and must pass `make test-failover`; it is LOW severity.
+- **File(s)**: `pkg/grpcapi/fabric_auth.go` (new),
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_diag.go`,
+  `pkg/grpcapi/server_fabric_auth_4107_test.go` (new),
+  `pkg/cluster/manager.go`, `docs/architecture.md`,
+  `pkg/cluster/README.md`, `_Log.md`
 ## 2026-07-06 — #4094 PR-B: WireGuard INITIATOR-side cookie-reply consume
 
 - **Timestamp**: 2026-07-06
@@ -137,6 +199,7 @@
   accepts inner-vlan-id with nil error, lenient emits no warning); single-tag
   negative passes with and without the gate; `go build ./...`, `go vet
   ./pkg/config/`, gofmt on modified files all clean.
+
 ## 2026-07-06 — #4348: gate the `inactive:` marker on TokenIdentifier not TokenString
 
 - **Timestamp**: 2026-07-06

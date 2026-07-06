@@ -538,9 +538,22 @@ type heartbeatReceiver struct {
 	recvErrors atomic.Uint64
 	startedAt  time.Time // when receiver started (for initial peer-lost detection)
 
-	// #4107 control-channel auth state. Touched only from readLoop.
+	// #4107 control-channel auth state. authReplay is touched only from
+	// readLoop. peerAuthSeen is written from readLoop but READ cross-goroutine
+	// (Manager.HeartbeatPeerAuthSeen, consumed by the gRPC fabric listener to
+	// arm its downgrade-guard off the fast-arming heartbeat instead of the
+	// lazily-arming on-demand fabric RPCs), so it is an atomic.
 	authReplay   heartbeatAuthReplay // per-peer anti-replay watermark
-	peerAuthSeen bool                // sticky: peer has sent a valid authed HB
+	peerAuthSeen atomic.Bool         // sticky: peer has sent a valid authed HB
+}
+
+// peerAuthenticated reports whether the peer has ever sent a valid
+// HMAC-authenticated heartbeat (sticky). It proves the peer holds the
+// control-link PSK and is signing — the arming signal the gRPC fabric
+// listener reuses so its downgrade-guard engages within ~one heartbeat
+// interval of the peer coming up, not on the next on-demand fabric RPC.
+func (r *heartbeatReceiver) peerAuthenticated() bool {
+	return r.peerAuthSeen.Load()
 }
 
 func newHeartbeatSender(mgr *Manager, conn *net.UDPConn, peerAddr *net.UDPAddr, interval time.Duration) *heartbeatSender {
@@ -677,7 +690,7 @@ func (r *heartbeatReceiver) readLoop() {
 		session, counter, present := heartbeatAuthTrailer(buf[:n])
 		macOK := present && len(key) > 0 && verifyHeartbeatMAC(buf[:n], key)
 		nonceFresh := macOK && r.authReplay.admit(session, counter)
-		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthSeen)
+		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthSeen.Load())
 		if !accept {
 			r.recvErrors.Add(1)
 			slog.Warn("cluster: heartbeat auth rejected",
@@ -686,8 +699,10 @@ func (r *heartbeatReceiver) readLoop() {
 		}
 		if macOK {
 			// The peer proved it holds the key — from now on an
-			// unauthenticated frame from it is a downgrade attack.
-			r.peerAuthSeen = true
+			// unauthenticated frame from it is a downgrade attack. This also
+			// arms the gRPC fabric listener's downgrade-guard (via
+			// Manager.HeartbeatPeerAuthSeen).
+			r.peerAuthSeen.Store(true)
 		}
 
 		r.received.Add(1)

@@ -173,11 +173,52 @@ peer liveness (`lastSeen`) or drive election.
   set). It is stored as raw bytes on the `Manager`, never logged; the
   auth-reject log line carries only a reason string and the peer node id.
 
-**Scope.** PR-A authenticates the heartbeat/election channel only — the
-most acute F23 vector. The session-sync frames (`sync_conn.go`) and the
-fabric gRPC listener (`pkg/grpcapi`) remain follow-up channels of the
-same PSK program (#4107); the config foundation and the shared
-`ControlLinkAuthKey` land here so those channels reuse it.
+**Scope.** PR-A authenticates the heartbeat/election channel. PR-B (this
+work) extends the SAME PSK to the **fabric gRPC listener**
+(`pkg/grpcapi/fabric_auth.go`): the `Manager.ControlLinkAuthKey()`
+accessor exposes the raw key to `pkg/grpcapi`, which HMAC-authenticates
+every peer-proxied RPC with a time-windowed bearer token on top of the
+#4122 allowlist (see `docs/architecture.md` "Cluster fabric gRPC
+listener" and the F1 half of #4107). The fabric path reuses this
+package's dual-accept posture (`fabricAuthDecision` mirrors
+`heartbeatAuthDecision`).
+
+The fabric downgrade-guard arms off the heartbeat, not just the fabric
+channel. This package exposes `Manager.HeartbeatPeerAuthSeen()` — true
+once the receiver accepts a valid authed heartbeat from the peer (the
+sticky `heartbeatReceiver.peerAuthSeen`, now an `atomic.Bool` because it
+is read cross-goroutine). The gRPC interceptor rejects a tokenless fabric
+call when EITHER a prior valid fabric token OR the heartbeat has armed
+enforcement. Rationale: nothing periodically dials the fabric listener,
+so arming only off an on-demand fabric RPC would leave a window after
+EVERY restart of a keyed node — until the next cross-node command — where
+any on-segment host could drive tokenless `ClearSessions` / cross-node
+failover. Heartbeats flow every ~200ms, so arming off them closes that
+window to one interval. Dual-accept is preserved: a not-yet-keyed peer
+signs neither channel, so neither source arms during a rolling upgrade.
+Two residuals are accepted, not bugs: (1) the ~1-window token replay
+horizon (removed only by mTLS with per-node certs, deferred with #4047);
+(2) a wall-clock skew > the ±1-window tolerance (~60–90s) fails cross-node
+fabric RPCs `Unauthenticated` until corrected — a > 30s inter-node skew is
+an operational NTP fault (NTP is already a cluster prerequisite for
+heartbeat clock-sync and session-timestamp rebasing).
+
+**Remaining follow-up (F23).** The **session-sync stream** frames
+(`sync.go` / `sync_conn.go` / `sync_protocol.go`) are still
+unauthenticated cleartext. Unlike the UDP heartbeat (where an appended
+trailer is transparently ignored by a legacy reader that parses from the
+front), the session-sync stream frames by a length-prefixed header, so a
+legacy peer would mis-frame a trailing HMAC as the next header — a
+stream-safe dual-accept needs an auth **capability handshake at
+connection setup** (negotiate signing before the first data frame) rather
+than a per-frame trailer, and it touches every `writeMsg` /
+`encode*Message` / `writeFull` site plus per-connection replay state and
+MUST pass `make test-failover` (it is the path that keeps TCP alive
+across failover). It is filed as the F23 follow-up on #4107 and is LOW
+severity (matches Juniper's own unauthenticated direct-cable control-link
+posture; the acute HIGH lever — the full-service fabric gRPC surface — is
+closed by PR-B). The shared `ControlLinkAuthKey` and dual-accept helpers
+land here so F23 reuses them.
 
 ## DHCP-server lease sync (#2239)
 

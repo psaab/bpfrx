@@ -26,6 +26,27 @@ func (m *Manager) peerHeartbeatFreshLocked() bool {
 	return false
 }
 
+// HeartbeatPeerAuthSeen reports whether the heartbeat receiver has ever
+// accepted a valid HMAC-authenticated heartbeat from the peer (#4107). It is
+// the fast-arming signal the gRPC fabric listener reuses to enforce its PSK
+// downgrade-guard: heartbeats flow continuously (~200ms), so this arms within
+// one interval of a keyed peer coming up — closing the post-restart window
+// where nothing had yet dialed the fabric listener on-demand to arm its own
+// sticky flag. Returns false when no heartbeat receiver is wired (standalone /
+// heartbeat not started) or the peer has not authenticated, so a node with no
+// PSK, or a rolling upgrade where the peer is not yet signing, keeps the
+// dual-accept grace. Reads m.hbReceiver under the manager lock (it may be
+// swapped by RestartHeartbeat); the flag itself is an atomic.
+func (m *Manager) HeartbeatPeerAuthSeen() bool {
+	m.mu.RLock()
+	r := m.hbReceiver
+	m.mu.RUnlock()
+	if r == nil {
+		return false
+	}
+	return r.peerAuthenticated()
+}
+
 // PeerNodeID returns the peer's node ID (valid only when PeerAlive is true).
 func (m *Manager) PeerNodeID() int {
 	m.mu.RLock()
