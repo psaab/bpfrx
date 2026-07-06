@@ -27,8 +27,8 @@ import "testing"
 // single well-formed hierarchical string, the same pattern as
 // TestApplyGroupsMergeDoesNotOverride / TestApplyGroupsHierarchical.
 
-// countNameServers returns the number of distinct "name-server" nodes under
-// the top-level "system" node after group expansion, plus a shape summary.
+// systemNameServerNodes returns the distinct "name-server" nodes under the
+// top-level "system" node after group expansion.
 func systemNameServerNodes(t *testing.T, tree *ConfigTree) []*Node {
 	t.Helper()
 	sys := tree.FindChild("system")
@@ -255,7 +255,15 @@ interfaces {
 	if err := tree.ExpandGroups(); err != nil {
 		t.Fatalf("ExpandGroups: %v", err)
 	}
-	unit := tree.FindChild("interfaces").FindChild("eth0").FindChild("unit")
+	ifaces := tree.FindChild("interfaces")
+	if ifaces == nil {
+		t.Fatal("no interfaces node after expansion")
+	}
+	eth0 := ifaces.FindChild("eth0")
+	if eth0 == nil {
+		t.Fatal("no interfaces eth0 node after expansion")
+	}
+	unit := eth0.FindChild("unit")
 	if unit == nil {
 		t.Fatal("no interfaces eth0 unit 0 after expansion")
 	}
