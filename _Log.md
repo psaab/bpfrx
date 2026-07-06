@@ -36164,3 +36164,39 @@ top.
 - **File(s)**: pkg/config/compiler_validate_vrf_overlap.go,
   pkg/config/compiler_validate_vrf_overlap_2387_test.go, pkg/config/compiler.go,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4313 PR-A — land the per-subtree closed-world validation
+  MECHANISM in the schema walker (mechanism only; no production subtree
+  flipped). The config schema is opt-in at the KEYWORD level: when
+  walkSchemaNode resolves a keyword to a nil schema child it returns nil
+  and the unmodeled leaf commits clean, then is silently dropped (the
+  compiler has no case for it either). A BLANKET closed-world flip is
+  infeasible — it breaks the deliberately-lenient accept-with-advisory
+  paths (#1960/#3307/#3318, #2078/#4231) and false-rejects
+  valid-but-not-yet-modeled Junos (#4191 strand-preflight class). PR-A
+  adds an additive `closedWorld bool` to schemaNode (schema.go): default
+  false = byte-identical legacy behaviour; true rejects an unmodeled child
+  keyword under that subtree at strict commit. The walker now threads a
+  `closed` param down walkSchemaChildren / walkSchemaNode /
+  walkInstanceChildren; the top-level call passes closed=false, and each
+  container descent folds in the node's flag
+  (childClosed := closed || childSchema.closedWorld), so the flag inherits
+  to every descendant level. The ONE behavioural branch is at the
+  keyword-resolution gate (childSchema == nil): closed=true → typedLeafErrorf
+  reject mirroring the modifier-level unknown-keyword rejects; closed=false
+  (every production subtree today) → return nil, unchanged. NO production
+  schemaNode sets closedWorld — the mechanism is dormant, so every existing
+  config validates identically (zero false-reject risk). The per-subtree
+  production flips (security ipsec / security nat then / snmp community /
+  protocols {ospf,bgp} interface / interfaces family) are deferred PR-B..N,
+  each gated on a Junos-leaf completeness audit for that subtree; #4313
+  stays open for them. White-box tested with a SYNTHETIC closedWorld
+  subtree (schema_walk_internal_test.go, TestClosedWorld_*): unmodeled →
+  rejected under closed / silently accepted under open (RED-on-revert
+  discriminator proven by disabling the gate: the two rejection tests fail,
+  the open/modeled tests stay green); modeled → accepted; closed-world
+  inherits to descendants. Full pkg/config suite (-count=1), gofmt, vet,
+  go build ./... all clean.
+- **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go,
+  pkg/config/schema_walk_internal_test.go, docs/config-schema.md, _Log.md

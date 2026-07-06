@@ -616,6 +616,65 @@ not read it, so the value is currently unsupported and discarded — an arity
 gate there would assert validation on a no-op feature (tag it only if/when
 `AddressSet.Description` is wired).
 
+## Per-subtree closed-world keyword validation (#4313)
+
+The scalar-arity gate (#3332, above) is a token-level fix: it catches an
+extra token trailing a MODELED leaf. It does not touch the deeper default of
+the whole schema — **the config schema is OPT-IN at the KEYWORD level**. When
+the generic walker (`walkSchemaNode`, `schema_walk.go`) resolves a keyword and
+finds no schema child (`resolveSchemaChild` returns nil, no exact child and no
+wildcard), it returns nil and moves on — an unmodeled keyword is not the gate's
+concern, reporting is left to the compiler. But the compiler has no schema case
+for a keyword the schema does not model either, so such a leaf commits clean
+and is then silently DROPPED. The parity campaigns have repeatedly closed one
+of these per subtree (each "silently dropped … added a schema child + compiler
+case" entry in the changelog below), but the *default* remained silent-accept.
+
+A **blanket** flip of that default is infeasible: several subtrees are
+deliberately lenient — they accept-with-advisory rather than reject, so that a
+not-yet-modeled or peer-only Junos knob survives a load / sync instead of
+failing the whole snapshot (#1960/#3307/#3318 lenient-warn; the #2078/#4231
+accept-with-advisory knobs). Rejecting every unmodeled keyword tree-wide would
+break those on purpose-lenient paths and false-reject valid-but-not-yet-modeled
+Junos configs (the #4191 strand-preflight false-reject class).
+
+The remedy is therefore a **per-subtree closed-world flag**, landed as a
+dormant MECHANISM in PR-A:
+
+- `schemaNode.closedWorld bool` (`schema.go`). Default false = today's opt-in,
+  silent-accept behaviour. When true on a container node, an unmodeled child
+  keyword anywhere under that subtree is REJECTED at strict commit instead of
+  silently dropped.
+- The walker threads a `closed` parameter (`walkSchemaChildren` /
+  `walkSchemaNode` / `walkInstanceChildren`). The top-level call passes
+  `closed=false`; descending into a resolved container folds in that node's
+  flag (`childClosed := closed || childSchema.closedWorld`), so once a subtree
+  opts in, every level below it inherits closed-world enforcement.
+- The single behavioural branch is at the keyword-resolution gate: when
+  `closed` is true AND the keyword is unmodeled (`childSchema == nil`), the
+  walker returns a `typedLeafErrorf` reject ("unknown configuration keyword
+  … under closed-world subtree"), mirroring the existing modifier-level
+  unknown-keyword rejects. When `closed` is false — the state for EVERY
+  production subtree today — behaviour is byte-identical to pre-#4313
+  (return nil, silent-accept).
+
+**No production subtree sets `closedWorld` in PR-A.** The mechanism is dormant:
+every existing config validates identically, so PR-A carries zero false-reject
+risk. It is white-box tested with a SYNTHETIC subtree
+(`schema_walk_internal_test.go`, `TestClosedWorld_*`): an unmodeled keyword
+under a `closedWorld:true` node is rejected; the same shape under a default
+(open-world) node is still silently accepted; a modeled keyword under the
+closed node passes; and closed-world inherits into modeled descendant
+containers.
+
+**Deferred, per-subtree flips (PR-B..N).** Turning `closedWorld` on for a real
+subtree (candidates: `security ipsec`, `security nat … then`, `snmp community`,
+`protocols {ospf,bgp} interface`, `interfaces … family`) is only safe once that
+subtree is LEAF-COMPLETE — every valid Junos keyword under it is modeled —
+otherwise the flip false-rejects a valid config. Each flip is its own follow-up
+gated on a Junos-leaf completeness audit for that subtree, tracked on #4313. Do
+NOT set `closedWorld` on a subtree without that audit.
+
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 
 `from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above
