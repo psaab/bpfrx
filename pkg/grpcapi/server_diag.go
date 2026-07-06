@@ -658,7 +658,14 @@ func (s *Server) dialPeer() (*grpc.ClientConn, error) {
 		return nil, status.Error(codes.Unavailable, "cluster peer address not available")
 	}
 
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	// #4107: authenticate every RPC we dial on the peer's fabric listener with
+	// the control-link PSK. GetRequestMetadata is read per RPC, so the token
+	// rotates with the auth window and a not-yet-keyed node dials tokenless
+	// (dual-accept). This covers the GetStatus health probe below too.
+	dialOpts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithPerRPCCredentials(fabricAuthCreds{keyFn: s.fabricAuthKey}),
+	}
 	if s.fabricVRFDevice != "" {
 		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			dialer := &net.Dialer{

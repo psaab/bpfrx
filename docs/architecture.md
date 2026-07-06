@@ -141,9 +141,28 @@ editing cmdtree.
   action (`isFabricSafeSystemAction`): only the two proxied cross-node
   forms (`cluster-failover-data:node<N>`, `cluster-failover:<rg>:node<N>`)
   pass; `zeroize`/`reboot`/`halt`/`power-off` are denied on the fabric.
-  The interceptors are installed on the fabric listener only; the loopback
-  listener keeps the full service. (Peer-identity auth — PSK/HMAC/mTLS — is
-  the deferred half of #4107.)
+  On top of the allowlist, the fabric listener also **authenticates** the
+  caller with the control-link PSK (#4107, `fabricAuthUnaryInterceptor` /
+  `fabricAuthStreamInterceptor` in `pkg/grpcapi/fabric_auth.go`, chained
+  BEFORE the allowlist). When `set chassis cluster authentication-key <key>`
+  is configured, every peer-proxied RPC must carry a time-windowed HMAC
+  bearer token (`HMAC-SHA256(PSK, domain‖window)`, 30 s window ±1 for skew)
+  in the `xpf-fabric-auth` metadata header, verified constant-time; the
+  local node attaches it on `dialPeer` via `fabricAuthCreds`. This closes
+  the gap where any host on the shared control segment could invoke the
+  allowlisted read/monitor/`ClearSessions`/cross-node-failover RPCs with no
+  credential. Dual-accept (mirroring the heartbeat, `fabricAuthDecision`):
+  a node with no key configured accepts everything; once a valid token is
+  seen the peer must keep signing (a tokenless call is then a downgrade
+  attack and is rejected `Unauthenticated`); a tokenless call before the
+  peer has ever authenticated is allowed as a key-rollout grace. The
+  interceptors are installed on the fabric listener only; the loopback
+  listener keeps the full service. The **same PSK** authenticates the
+  heartbeat (#4326); it shares the `chassis cluster authentication-key`
+  leaf and reuses the dual-accept posture. The stronger residuals —
+  removing the ~1-window replay horizon (mTLS with per-node certs) and
+  HMAC-authenticating the session-sync stream (#4107 F23) — remain deferred
+  (see `pkg/cluster/README.md`).
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
   - **Off-loopback bind requires api-auth (#4047).** The REST/config API

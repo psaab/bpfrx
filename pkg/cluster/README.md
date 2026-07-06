@@ -173,11 +173,32 @@ peer liveness (`lastSeen`) or drive election.
   set). It is stored as raw bytes on the `Manager`, never logged; the
   auth-reject log line carries only a reason string and the peer node id.
 
-**Scope.** PR-A authenticates the heartbeat/election channel only — the
-most acute F23 vector. The session-sync frames (`sync_conn.go`) and the
-fabric gRPC listener (`pkg/grpcapi`) remain follow-up channels of the
-same PSK program (#4107); the config foundation and the shared
-`ControlLinkAuthKey` land here so those channels reuse it.
+**Scope.** PR-A authenticates the heartbeat/election channel. PR-B (this
+work) extends the SAME PSK to the **fabric gRPC listener**
+(`pkg/grpcapi/fabric_auth.go`): the `Manager.ControlLinkAuthKey()`
+accessor exposes the raw key to `pkg/grpcapi`, which HMAC-authenticates
+every peer-proxied RPC with a time-windowed bearer token on top of the
+#4122 allowlist (see `docs/architecture.md` "Cluster fabric gRPC
+listener" and the F1 half of #4107). The fabric path reuses this
+package's dual-accept posture (`fabricAuthDecision` mirrors
+`heartbeatAuthDecision`).
+
+**Remaining follow-up (F23).** The **session-sync stream** frames
+(`sync.go` / `sync_conn.go` / `sync_protocol.go`) are still
+unauthenticated cleartext. Unlike the UDP heartbeat (where an appended
+trailer is transparently ignored by a legacy reader that parses from the
+front), the session-sync stream frames by a length-prefixed header, so a
+legacy peer would mis-frame a trailing HMAC as the next header — a
+stream-safe dual-accept needs an auth **capability handshake at
+connection setup** (negotiate signing before the first data frame) rather
+than a per-frame trailer, and it touches every `writeMsg` /
+`encode*Message` / `writeFull` site plus per-connection replay state and
+MUST pass `make test-failover` (it is the path that keeps TCP alive
+across failover). It is filed as the F23 follow-up on #4107 and is LOW
+severity (matches Juniper's own unauthenticated direct-cable control-link
+posture; the acute HIGH lever — the full-service fabric gRPC surface — is
+closed by PR-B). The shared `ControlLinkAuthKey` and dual-accept helpers
+land here so F23 reuses them.
 
 ## DHCP-server lease sync (#2239)
 

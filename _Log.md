@@ -1,3 +1,36 @@
+## 2026-07-06 — #4107 F1: authenticate the cluster fabric gRPC listener with the control-link PSK
+
+- **Timestamp**: 2026-07-06
+- **Action**: Closed the HIGH F1 hole. The network-exposed fabric gRPC
+  listener (`RunFabricListener`, bound on the sync/fabric IP) had a
+  fail-closed method allowlist (#4122) but NO authentication — any host on
+  the shared control segment could invoke the allowlisted read/monitor/
+  `ClearSessions`/cross-node-failover RPCs with no credential. Added a PSK
+  auth interceptor pair (`fabricAuthUnaryInterceptor` /
+  `fabricAuthStreamInterceptor` in new `pkg/grpcapi/fabric_auth.go`) chained
+  BEFORE the allowlist. It reuses the #4326 control-link PSK
+  (`Manager.ControlLinkAuthKey()`, new exported accessor). The caller carries
+  a time-windowed HMAC bearer token — `HMAC-SHA256(PSK, domain‖window)`,
+  30 s window with ±1 skew tolerance, hex in the `xpf-fabric-auth` metadata
+  header, verified constant-time (`hmac.Equal`). The local node attaches it
+  on every `dialPeer` RPC via `fabricAuthCreds` (per-RPC, insecure-transport
+  OK). Dual-accept mirrors `cluster.heartbeatAuthDecision`
+  (`fabricAuthDecision`): no local key → accept; valid token → accept +
+  set sticky `fabricPeerAuthSeen`; present-but-invalid → `Unauthenticated`;
+  tokenless before peer ever authed → grace accept (key rollout);
+  tokenless after peer authed → reject (downgrade attack). The loopback
+  (127.0.0.1) listener is UNCHANGED. RED-on-revert tests in
+  `server_fabric_auth_4107_test.go` (verified: invalid-token, downgrade, and
+  stream cases go RED with the auth check disabled). F23 (session-sync stream
+  HMAC) deferred as a documented follow-up — it needs a connection-setup
+  capability handshake (a stream can't use the heartbeat's transparent
+  trailer) and must pass `make test-failover`; it is LOW severity.
+- **File(s)**: `pkg/grpcapi/fabric_auth.go` (new),
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_diag.go`,
+  `pkg/grpcapi/server_fabric_auth_4107_test.go` (new),
+  `pkg/cluster/manager.go`, `docs/architecture.md`,
+  `pkg/cluster/README.md`, `_Log.md`
+
 ## 2026-07-06 — #4348: gate the `inactive:` marker on TokenIdentifier not TokenString
 
 - **Timestamp**: 2026-07-06

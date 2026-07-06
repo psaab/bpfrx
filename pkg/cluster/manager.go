@@ -316,6 +316,17 @@ func (m *Manager) controlLinkAuthKey() []byte {
 	return m.controlAuthKey
 }
 
+// ControlLinkAuthKey exposes the #4107 cluster control-channel PSK to
+// in-process callers that authenticate a DIFFERENT control surface with the
+// same shared secret — specifically the gRPC fabric listener (pkg/grpcapi),
+// which HMAC-authenticates peer-proxied RPCs so the network-exposed fabric IP
+// is not an unauthenticated management channel. Returns nil when no key is
+// configured (legacy / dual-accept). The returned slice is a secret, must not
+// be mutated, and must never be logged.
+func (m *Manager) ControlLinkAuthKey() []byte {
+	return m.controlLinkAuthKey()
+}
+
 // Events returns the event channel for state change notifications.
 func (m *Manager) Events() <-chan ClusterEvent { return m.eventCh }
 
