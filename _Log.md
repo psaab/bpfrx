@@ -35810,3 +35810,30 @@ top.
 - **File(s)**: pkg/config/compiler_firewall.go, pkg/config/compiler.go,
   pkg/config/compiler_firewall_family_any_match_4296_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4047 (fable-161 F-155) web-management REST-auth gate. The
+  REST/config API (pkg/api) serves the mutating config endpoints with NO
+  auth middleware unless `system services web-management api-auth` is set;
+  binding it off-loopback (`web-management http|https interface <mgmt-if>`)
+  without api-auth exposes set/commit/rollback/system-action to the network.
+  Part A (pkg/config): validateWebManagementAuthStrict in compiler.go
+  (alongside validateDeviceMapStrict) hard-rejects an off-loopback bind
+  (HTTPInterface/HTTPSInterface non-empty) without api-auth at strict commit;
+  new lenientWebManagementAuth flag downgrades to a warning on load/peer-sync
+  (#1960 no-brick). Part B (pkg/daemon): daemon_run.go runtime clamp — when
+  the resolved bind is non-loopback AND apiCfg.Auth == nil, clamp to
+  127.0.0.1 + WARN (hostIsLoopback helper in daemon_cluster_bind.go), so a
+  leniently-loaded vulnerable config boots on loopback instead of exposed.
+  Updated two existing parse fixtures (TestSystemConfigWebManagementEnhanced,
+  TestSystemConfigSetSyntax) to carry api-auth (they bound interfaces without
+  auth). Part C (/metrics) was already done via #4162.
+- **Validation**: web_management_auth_4047_test.go — strict reject of HTTP +
+  HTTPS off-loopback no-auth, off-loopback+user / +api-key commits, loopback
+  no-auth commits, absent commits, lenient warn. Proven RED under gate-neuter
+  (accepted / no warning). go test ./pkg/config/... ./pkg/daemon/...
+  ./pkg/api/... green; go build ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/web_management_auth_4047_test.go,
+  pkg/config/parser_system_test.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_cluster_bind.go, docs/architecture.md, _Log.md

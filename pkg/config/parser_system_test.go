@@ -542,6 +542,11 @@ system {
                 system-generated-certificate;
                 interface fxp0.0;
             }
+            api-auth {
+                user admin {
+                    password s3cret;
+                }
+            }
         }
     }
 }
@@ -724,7 +729,7 @@ system {
 }
 
 func TestSystemConfigSetSyntax(t *testing.T) {
-	cmds := []string{"set system root-authentication encrypted-password \"$6$abcsalt$hashhash\"", "set system root-authentication ssh-ed25519 \"ssh-ed25519 AAAA\"", "set system master-password pseudorandom-function juniper-prf1", "set system license autoupdate url https://example.com/keys", "set system processes utmd disable", "set system services web-management https system-generated-certificate", "set system services web-management https interface fxp0.0", "set system syslog user * any emergency", "set system syslog host 10.0.0.1 any any", "set system syslog host 10.0.0.1 daemon info"}
+	cmds := []string{"set system root-authentication encrypted-password \"$6$abcsalt$hashhash\"", "set system root-authentication ssh-ed25519 \"ssh-ed25519 AAAA\"", "set system master-password pseudorandom-function juniper-prf1", "set system license autoupdate url https://example.com/keys", "set system processes utmd disable", "set system services web-management https system-generated-certificate", "set system services web-management https interface fxp0.0", "set system services web-management api-auth api-key tok-abc-123", "set system syslog user * any emergency", "set system syslog host 10.0.0.1 any any", "set system syslog host 10.0.0.1 daemon info"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)

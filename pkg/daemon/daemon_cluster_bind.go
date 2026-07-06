@@ -50,6 +50,24 @@ func resolveInterfaceAddr(ifname, fallback string) string {
 	return fallback
 }
 
+// hostIsLoopback reports whether a bind host string is a loopback address. An
+// empty or unparseable host is treated as loopback (safe — do NOT clamp on
+// uncertainty and break a legitimate bind); resolveInterfaceAddr always returns
+// a literal IP (or the loopback fallback), so in practice host is a parseable
+// IP. Used by the #4047 part-B runtime clamp (daemon_run.go) to decide whether a
+// no-auth web-management bind is network-reachable and must be pulled back to
+// loopback.
+func hostIsLoopback(host string) bool {
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true
+	}
+	return ip.IsLoopback()
+}
+
 func parseLiteralIP(addr string) net.IP {
 	if addr == "" {
 		return nil

@@ -1368,6 +1368,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 				apiCfg.Auth = authCfg
 				slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))
 			}
+			// #4047 part B: runtime fail-safe clamp. The commit gate
+			// (validateWebManagementAuthStrict, pkg/config) rejects a NEW
+			// web-management config that binds the unauthenticated REST/config API
+			// off-loopback without api-auth, but an ALREADY-PERSISTED such config
+			// is lenient-loaded (warn, no brick — #1960) and would still bind
+			// non-loopback UNAUTHENTICATED after upgrade, exposing the mutating
+			// config endpoints (set / commit / rollback / system action) to the
+			// network. When the resolved bind is non-loopback AND no api-auth is
+			// configured (apiCfg.Auth == nil), clamp it back to loopback and WARN:
+			// the daemon still boots, the web API stays reachable on 127.0.0.1, and
+			// the console/SSH remain the lifeline (device-map §9.6 posture) until
+			// the operator adds api-auth (which restores the non-loopback bind).
+			if apiCfg.Auth == nil {
+				if host, port, err := net.SplitHostPort(apiCfg.Addr); err == nil && !hostIsLoopback(host) {
+					slog.Warn("web-management HTTP bind is non-loopback without api-auth; clamping to loopback (add `set system services web-management api-auth` to bind off-loopback) — #4047",
+						"requested", apiCfg.Addr)
+					apiCfg.Addr = net.JoinHostPort("127.0.0.1", port)
+				}
+				if apiCfg.TLS {
+					if host, port, err := net.SplitHostPort(apiCfg.HTTPSAddr); err == nil && !hostIsLoopback(host) {
+						slog.Warn("web-management HTTPS bind is non-loopback without api-auth; clamping to loopback — #4047",
+							"requested", apiCfg.HTTPSAddr)
+						apiCfg.HTTPSAddr = net.JoinHostPort("127.0.0.1", port)
+					}
+				}
+			}
 		}
 		srv := api.NewServer(apiCfg)
 		wg.Add(1)
