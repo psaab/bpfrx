@@ -139,6 +139,12 @@ pub(crate) enum CookieError {
     /// XChaCha20-Poly1305 sealing failed (structurally impossible for a
     /// 16-byte plaintext; folded rather than panicked).
     Crypto,
+    /// The OS CSPRNG (`getrandom`) failed, so no secure cookie secret or
+    /// nonce is available (#4094 BUG-2). The caller MUST fail closed — drop
+    /// the initiation with NO reply rather than ship a predictable secret /
+    /// nonce. Never returned on Linux (getrandom does not fail there);
+    /// defense-in-depth.
+    RandUnavailable,
 }
 
 /// Keyed-BLAKE2s with 16-byte output — the WG `MAC()` primitive. `key` may
@@ -206,23 +212,37 @@ struct SecretState {
     current: Zeroizing<[u8; 32]>,
     previous: Zeroizing<[u8; 32]>,
     has_previous: bool,
-    /// Monotonic ns the `current` secret was generated. 0 = never
-    /// initialized (lazy: the first observer stamps it without rotating,
-    /// so a large monotonic clock does not force an immediate rotation).
-    generated_at_ns: u64,
+    /// Monotonic ns the `current` secret was generated. `None` = not yet
+    /// stamped (lazy: the first observer stamps it without rotating, so a
+    /// large monotonic clock does not force an immediate rotation).
+    /// Tracked as `Option`, NOT a 0 sentinel: a legitimate `now_ns == 0`
+    /// (very early CLOCK_MONOTONIC, or a failed clock read) is a valid
+    /// window start, not "uninitialized" (#4094 Copilot BUG-1).
+    generated_at_ns: Option<u64>,
+    /// True iff `current` was filled from the OS CSPRNG. FALSE means
+    /// `getrandom` failed and we hold NO usable secret — the cookie
+    /// mechanism fails CLOSED (`secrets()` returns `None`, under-load
+    /// initiations are dropped) rather than ever using a predictable
+    /// secret an attacker could reproduce (#4094 Copilot BUG-2). Never
+    /// false on Linux (getrandom does not fail); defense-in-depth.
+    secure: bool,
 }
 
 /// Fixed-window inbound-initiation rate gate plus a sticky under-load
-/// grace window.
+/// grace window. `window_start_ns` is an `Option`, NOT a 0 sentinel: a
+/// legitimate `now_ns == 0` must count as a real window start or the gate
+/// would reset every call and NEVER trip — disabling the mitigation
+/// exactly when needed (#4094 Copilot BUG-1).
 struct LoadState {
-    window_start_ns: u64,
+    window_start_ns: Option<u64>,
     count: u64,
     under_load_until_ns: u64,
 }
 
-/// Fixed-window cookie-reply emission budget.
+/// Fixed-window cookie-reply emission budget. `window_start_ns` is an
+/// `Option` for the same #4094 BUG-1 reason as [`LoadState`].
 struct BudgetState {
-    window_start_ns: u64,
+    window_start_ns: Option<u64>,
     emitted: u64,
 }
 
@@ -236,30 +256,65 @@ pub(crate) struct CookieChecker {
     secret: Mutex<SecretState>,
     load: Mutex<LoadState>,
     budget: Mutex<BudgetState>,
+    /// Test hook: when true, [`Self::draw_random`] simulates a `getrandom`
+    /// failure so the #4094 BUG-2 fail-closed path is exercisable without
+    /// mocking the OS CSPRNG. Compiled out of release builds.
+    #[cfg(test)]
+    rng_fail: std::sync::atomic::AtomicBool,
 }
 
 impl CookieChecker {
     pub(crate) fn new(our_static_pub: &[u8; WG_KEY_LEN]) -> Self {
         let mut current = [0u8; 32];
-        fill_random(&mut current);
+        // FAIL CLOSED on a getrandom failure — never seed the cookie secret
+        // from a predictable source (#4094 Copilot BUG-2). `secure == false`
+        // disables the mechanism (`secrets()` returns None → under-load
+        // initiations drop) until secure randomness becomes available.
+        let secure = fill_random(&mut current);
+        if !secure {
+            // One-time, only on a broken OS CSPRNG (never on Linux). The
+            // whole system is in a catastrophic state (snow's ephemeral
+            // keys need the same RNG); surface it loudly.
+            eprintln!(
+                "xpf-wg: SECURITY: getrandom failed generating the WireGuard \
+                 cookie secret; the under-load cookie DoS mitigation is \
+                 fail-closed (under-load initiations will be DROPPED) until \
+                 secure randomness is available — the OS CSPRNG is broken"
+            );
+        }
         Self {
             enc_key: cookie_encryption_key(our_static_pub),
             secret: Mutex::new(SecretState {
                 current: Zeroizing::new(current),
                 previous: Zeroizing::new([0u8; 32]),
                 has_previous: false,
-                generated_at_ns: 0,
+                generated_at_ns: None,
+                secure,
             }),
             load: Mutex::new(LoadState {
-                window_start_ns: 0,
+                window_start_ns: None,
                 count: 0,
                 under_load_until_ns: 0,
             }),
             budget: Mutex::new(BudgetState {
-                window_start_ns: 0,
+                window_start_ns: None,
                 emitted: 0,
             }),
+            #[cfg(test)]
+            rng_fail: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Draw secure random bytes. The single choke point through which the
+    /// secret rotation and the cookie-reply nonce acquire randomness, so a
+    /// getrandom failure is handled identically (fail closed) at every
+    /// site. In tests `rng_fail` can force a simulated failure.
+    fn draw_random(&self, buf: &mut [u8]) -> bool {
+        #[cfg(test)]
+        if self.rng_fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        fill_random(buf)
     }
 
     /// Record one inbound initiation arrival at `now_ns` and return whether
@@ -268,10 +323,12 @@ impl CookieChecker {
     /// [`UNDER_LOAD_GRACE_NS`].
     pub(crate) fn note_initiation(&self, now_ns: u64) -> bool {
         let mut s = self.load.lock().unwrap();
-        if s.window_start_ns == 0
-            || now_ns.saturating_sub(s.window_start_ns) >= UNDER_LOAD_WINDOW_NS
-        {
-            s.window_start_ns = now_ns;
+        let new_window = match s.window_start_ns {
+            None => true,
+            Some(start) => now_ns.saturating_sub(start) >= UNDER_LOAD_WINDOW_NS,
+        };
+        if new_window {
+            s.window_start_ns = Some(now_ns);
             s.count = 1;
         } else {
             s.count = s.count.saturating_add(1);
@@ -286,10 +343,12 @@ impl CookieChecker {
     /// (and reserves one slot). Fixed-window budget mirroring the load gate.
     pub(crate) fn reply_budget_available(&self, now_ns: u64) -> bool {
         let mut b = self.budget.lock().unwrap();
-        if b.window_start_ns == 0
-            || now_ns.saturating_sub(b.window_start_ns) >= UNDER_LOAD_WINDOW_NS
-        {
-            b.window_start_ns = now_ns;
+        let new_window = match b.window_start_ns {
+            None => true,
+            Some(start) => now_ns.saturating_sub(start) >= UNDER_LOAD_WINDOW_NS,
+        };
+        if new_window {
+            b.window_start_ns = Some(now_ns);
             b.emitted = 0;
         }
         if b.emitted >= COOKIE_REPLY_BUDGET_PER_WINDOW {
@@ -300,31 +359,61 @@ impl CookieChecker {
     }
 
     /// Rotate the secret if `current` is older than one rotation window,
-    /// then return `(current, previous_if_still_valid)`. Lazy first-use
-    /// init stamps `generated_at_ns` without rotating. A gap of two or more
-    /// full windows starts fresh with no previous (bounds any secret's
-    /// validity to `< 2 * COOKIE_ROTATION_TIME_NS`).
-    fn secrets(&self, now_ns: u64) -> ([u8; 32], Option<[u8; 32]>) {
+    /// then return `Some((current, previous_if_still_valid))`. Lazy
+    /// first-use init stamps `generated_at_ns` without rotating. A gap of
+    /// two or more full windows starts fresh with no previous (bounds any
+    /// secret's validity to `< 2 * COOKIE_ROTATION_TIME_NS`).
+    ///
+    /// Returns `None` when NO secure secret is available (#4094 BUG-2 fail-
+    /// closed): a getrandom failure at construction leaves `secure == false`
+    /// and this NEVER substitutes a predictable secret — it retries the OS
+    /// CSPRNG (lazy recovery) and, if that still fails, returns `None` so
+    /// the caller (verify/build) fails closed. Every rotation likewise
+    /// keeps the existing secure secret rather than rotating to a
+    /// predictable one if getrandom fails mid-flight.
+    fn secrets(&self, now_ns: u64) -> Option<([u8; 32], Option<[u8; 32]>)> {
         let mut s = self.secret.lock().unwrap();
-        if s.generated_at_ns == 0 {
-            s.generated_at_ns = now_ns;
-        } else {
-            let gap = now_ns.saturating_sub(s.generated_at_ns);
-            if gap >= 2 * COOKIE_ROTATION_TIME_NS {
-                // Both slots would be stale; discard the previous.
-                let mut fresh = [0u8; 32];
-                fill_random(&mut fresh);
+        if !s.secure {
+            // Lazy re-acquire — getrandom may have been transiently
+            // unavailable at construction. NEVER seed from a weak source.
+            let mut fresh = [0u8; 32];
+            if self.draw_random(&mut fresh) {
                 *s.current = fresh;
                 *s.previous = [0u8; 32];
                 s.has_previous = false;
-                s.generated_at_ns = now_ns;
-            } else if gap >= COOKIE_ROTATION_TIME_NS {
-                *s.previous = *s.current;
-                let mut fresh = [0u8; 32];
-                fill_random(&mut fresh);
-                *s.current = fresh;
-                s.has_previous = true;
-                s.generated_at_ns = now_ns;
+                s.generated_at_ns = Some(now_ns);
+                s.secure = true;
+            } else {
+                return None; // fail closed: still no secure secret
+            }
+        } else {
+            match s.generated_at_ns {
+                None => s.generated_at_ns = Some(now_ns),
+                Some(gen_at) => {
+                    let gap = now_ns.saturating_sub(gen_at);
+                    if gap >= 2 * COOKIE_ROTATION_TIME_NS {
+                        // Both slots would be stale; discard the previous —
+                        // but only if we can draw a fresh SECURE secret.
+                        let mut fresh = [0u8; 32];
+                        if self.draw_random(&mut fresh) {
+                            *s.current = fresh;
+                            *s.previous = [0u8; 32];
+                            s.has_previous = false;
+                            s.generated_at_ns = Some(now_ns);
+                        }
+                        // else: keep the existing secure secret, skip the
+                        // rotation this call (retried next call).
+                    } else if gap >= COOKIE_ROTATION_TIME_NS {
+                        let mut fresh = [0u8; 32];
+                        if self.draw_random(&mut fresh) {
+                            *s.previous = *s.current;
+                            *s.current = fresh;
+                            s.has_previous = true;
+                            s.generated_at_ns = Some(now_ns);
+                        }
+                        // else: keep current secure secret, skip rotation.
+                    }
+                }
             }
         }
         let prev = if s.has_previous {
@@ -332,7 +421,7 @@ impl CookieChecker {
         } else {
             None
         };
-        (*s.current, prev)
+        Some((*s.current, prev))
     }
 
     /// Verify the MAC2 carried in an inbound type-1 initiation `msg`
@@ -347,7 +436,11 @@ impl CookieChecker {
         let got = &msg[M1_MAC2..WG_MSG_INIT_LEN];
         let (src, n) = endpoint_cookie_bytes(from);
         let src = &src[..n];
-        let (cur, prev) = self.secrets(now_ns);
+        // Fail closed if no secure secret (#4094 BUG-2): without it we
+        // cannot recompute the cookie, so we cannot honestly validate MAC2.
+        let Some((cur, prev)) = self.secrets(now_ns) else {
+            return false;
+        };
         let cookie_cur = keyed_blake2s_128(&cur, src);
         let expect_cur = keyed_blake2s_128(&cookie_cur, &msg[..M1_MAC2]);
         if macs_equal(&expect_cur, got) {
@@ -383,11 +476,18 @@ impl CookieChecker {
             return Err(CookieError::WrongInitLength);
         }
         let (src, n) = endpoint_cookie_bytes(from);
-        let (cur, _) = self.secrets(now_ns);
+        // Fail closed on a broken CSPRNG (#4094 BUG-2): no secure secret ->
+        // no cookie (a predictable cookie would let a spoofed source forge a
+        // valid MAC2 and defeat the whole mitigation).
+        let (cur, _) = self.secrets(now_ns).ok_or(CookieError::RandUnavailable)?;
         let cookie = keyed_blake2s_128(&cur, &src[..n]);
 
+        // A predictable XChaCha nonce is also unacceptable — fail closed
+        // rather than send a weak-nonce reply.
         let mut nonce = [0u8; WG_COOKIE_NONCE_LEN];
-        fill_random(&mut nonce);
+        if !self.draw_random(&mut nonce) {
+            return Err(CookieError::RandUnavailable);
+        }
 
         // AEAD associated data = the triggering initiation's MAC1.
         let aad = &init_msg[M1_MAC1..M1_MAC2];
@@ -449,30 +549,42 @@ impl CookieChecker {
     #[cfg(test)]
     pub(crate) fn cookie_for_test(&self, from: SocketAddr, now_ns: u64) -> [u8; WG_COOKIE_LEN] {
         let (src, n) = endpoint_cookie_bytes(from);
-        let (cur, _) = self.secrets(now_ns);
+        let (cur, _) = self
+            .secrets(now_ns)
+            .expect("test CookieChecker always has a secure secret");
         keyed_blake2s_128(&cur, &src[..n])
+    }
+
+    /// Test hook: simulate a persistent `getrandom` failure (BUG-2 fail-
+    /// closed path) without mocking the OS CSPRNG. Sets `rng_fail` so every
+    /// `draw_random` fails AND drops the currently-held secret, so the
+    /// checker cannot lazily recover a secure secret while the flag is set.
+    #[cfg(test)]
+    pub(crate) fn set_rng_fail_for_test(&self, fail: bool) {
+        self.rng_fail
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+        if fail {
+            let mut s = self.secret.lock().unwrap();
+            s.secure = false;
+            *s.current = [0u8; 32];
+            *s.previous = [0u8; 32];
+            s.has_previous = false;
+            s.generated_at_ns = None;
+        }
     }
 }
 
-/// Fill `buf` with OS randomness; fall back to a time-seeded xorshift only
-/// if `getrandom` fails (never expected on Linux). A weak fallback secret
-/// still binds a cookie to a source for the window — degraded, not broken.
-fn fill_random(buf: &mut [u8]) {
-    if getrandom::getrandom(buf).is_ok() {
-        return;
-    }
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15)
-        | 1;
-    for b in buf.iter_mut() {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        *b = (seed >> 24) as u8;
-    }
+/// Fill `buf` from the OS CSPRNG. Returns `true` on success, `false` if
+/// `getrandom` fails. There is DELIBERATELY no weak-PRNG fallback (#4094
+/// BUG-2): for the cookie secret `Rm` and the reply nonce, unpredictability
+/// IS the mitigation — a time-seeded or otherwise predictable value would
+/// let an attacker compute valid cookies/MAC2 for spoofed sources and
+/// defeat the whole under-load gate. On failure the caller fails closed
+/// (drops, no reply) rather than using weak randomness. `getrandom` does
+/// not fail on Linux; this is defense-in-depth.
+#[must_use]
+fn fill_random(buf: &mut [u8]) -> bool {
+    getrandom::getrandom(buf).is_ok()
 }
 
 /// Stamp `mac2` (keyed-BLAKE2s-128 over `msg[0..132]` with `cookie` as the
@@ -645,5 +757,133 @@ mod tests {
         );
         // A new window refills.
         assert!(cc.reply_budget_available(base + UNDER_LOAD_WINDOW_NS));
+    }
+
+    /// #4094 Copilot BUG-1: `now_ns == 0` is a LEGITIMATE timestamp (very
+    /// early CLOCK_MONOTONIC, or a failed clock read that returns 0), not
+    /// "uninitialized". With the old `window_start_ns == 0` sentinel the
+    /// load window reset on every call → `count` never accumulated → the
+    /// under-load gate NEVER tripped, disabling the mitigation exactly when
+    /// it matters. With `Option`, the first call at t=0 arms the window and
+    /// the gate trips as the flood accumulates. RED on the 0-sentinel.
+    #[test]
+    fn load_gate_trips_at_now_zero() {
+        let our_pub = [0x77u8; 32];
+        let cc = CookieChecker::new(&our_pub);
+        // Every call at now_ns == 0 (clock stuck/early). The count must
+        // accumulate across calls, not reset.
+        let mut under = false;
+        for _ in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 2) {
+            under = cc.note_initiation(0);
+        }
+        assert!(
+            under,
+            "the under-load gate must trip even when now_ns is 0 \
+             (0 is a valid window start, not 'uninitialized')"
+        );
+    }
+
+    /// #4094 BUG-1 companion: the reply budget also must not reset every
+    /// call at now_ns == 0 (else it would grant unlimited replies).
+    #[test]
+    fn reply_budget_caps_at_now_zero() {
+        let our_pub = [0x78u8; 32];
+        let cc = CookieChecker::new(&our_pub);
+        let mut granted = 0u64;
+        for _ in 0..(COOKIE_REPLY_BUDGET_PER_WINDOW + 10) {
+            if cc.reply_budget_available(0) {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, COOKIE_REPLY_BUDGET_PER_WINDOW,
+            "the budget must cap per window even at now_ns == 0"
+        );
+    }
+
+    /// #4094 BUG-1 companion: secret rotation must treat now_ns == 0 as a
+    /// real generation time, not "uninitialized" (else it would re-stamp
+    /// every call and the rotation clock would never advance). A cookie
+    /// minted at t=0 still validates one window later.
+    #[test]
+    fn secret_rotation_from_now_zero() {
+        let our_pub = [0x79u8; 32];
+        let cc = CookieChecker::new(&our_pub);
+        let peer = src(51820);
+        let cookie0 = cc.cookie_for_test(peer, 0);
+        let mut init = valid_mac1_init(&our_pub, 3);
+        stamp_initiation_mac2(&mut init, &cookie0);
+        assert!(
+            cc.verify_initiation_mac2(&init, peer, 0),
+            "t=0 mint validates at t=0"
+        );
+        // 130 s later: current rotates, t=0 secret becomes previous → still
+        // valid. If t=0 were treated as "uninitialized", generated_at would
+        // keep re-stamping to `now` and the rotation would never fire.
+        let t1 = 130 * 1_000_000_000;
+        assert!(
+            cc.verify_initiation_mac2(&init, peer, t1),
+            "t=0-minted cookie still validates one rotation later"
+        );
+    }
+
+    /// #4094 Copilot BUG-2: a `getrandom` failure must FAIL CLOSED, never
+    /// fall back to a predictable secret/nonce. With the CSPRNG simulated as
+    /// unavailable: no secret is produced (`verify` cannot validate, `build`
+    /// refuses to emit a reply), and once randomness returns the mechanism
+    /// recovers. RED on the old time-seeded xorshift fallback (which would
+    /// have produced a usable-but-predictable secret and a successful
+    /// reply).
+    #[test]
+    fn getrandom_failure_fails_closed_no_weak_secret() {
+        let our_pub = [0x7Au8; 32];
+        let cc = CookieChecker::new(&our_pub);
+        let peer = src(51820);
+        let now = 10_000_000_000;
+
+        // Mint a cookie + MAC2 while randomness is healthy.
+        let cookie = cc.cookie_for_test(peer, now);
+        let mut init = valid_mac1_init(&our_pub, 9);
+        stamp_initiation_mac2(&mut init, &cookie);
+        assert!(cc.verify_initiation_mac2(&init, peer, now));
+
+        // Simulate a persistent getrandom failure.
+        cc.set_rng_fail_for_test(true);
+
+        // No secure secret → cannot verify (fail closed, NOT accept).
+        assert!(
+            !cc.verify_initiation_mac2(&init, peer, now),
+            "with no secure secret, MAC2 verification must fail closed"
+        );
+        // Cannot build a cookie reply → RandUnavailable, NOT a weak-nonce
+        // reply.
+        let mut out = [0u8; 128];
+        assert_eq!(
+            cc.build_cookie_reply(&init, peer, now, &mut out),
+            Err(CookieError::RandUnavailable),
+            "with no secure randomness, no cookie reply is emitted"
+        );
+
+        // Randomness returns → the mechanism recovers (lazy re-acquire).
+        cc.set_rng_fail_for_test(false);
+        let cookie2 = cc.cookie_for_test(peer, now);
+        let mut init2 = valid_mac1_init(&our_pub, 10);
+        stamp_initiation_mac2(&mut init2, &cookie2);
+        assert!(
+            cc.verify_initiation_mac2(&init2, peer, now),
+            "the mechanism recovers once secure randomness is available"
+        );
+    }
+
+    /// `fill_random` reports success and yields non-constant output for a
+    /// healthy CSPRNG (and there is no weak-PRNG fallback path).
+    #[test]
+    fn fill_random_reports_success_and_fills() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        assert!(fill_random(&mut a));
+        assert!(fill_random(&mut b));
+        assert_ne!(a, [0u8; 32], "a healthy CSPRNG does not yield all-zero");
+        assert_ne!(a, b, "two draws differ");
     }
 }

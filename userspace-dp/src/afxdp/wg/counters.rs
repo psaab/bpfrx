@@ -89,10 +89,12 @@ pub(crate) struct WgCounters {
     /// were allowed through to the handshake (the cookie mechanism working
     /// end-to-end — a primed peer completing under load).
     pub(crate) hs_rx_under_load_mac2_ok: AtomicU64,
-    /// #4094 PR-A: under-load initiations dropped WITHOUT a cookie reply
-    /// because the per-window cookie-reply emission budget was exhausted
-    /// (item 6 storm bound). Non-zero means the generated-reply budget is
-    /// clamping a heavy valid-MAC1 flood.
+    /// #4094 PR-A: under-load initiations dropped WITHOUT a cookie reply.
+    /// Primarily the per-window cookie-reply emission budget being exhausted
+    /// (item 6 storm bound) — non-zero means the generated-reply budget is
+    /// clamping a heavy valid-MAC1 flood. Also covers the fail-closed drop
+    /// when the OS CSPRNG is unavailable for the secret/nonce (BUG-2;
+    /// impossible on Linux, so effectively budget-only in practice).
     pub(crate) hs_cookie_reply_budget_drops: AtomicU64,
     /// Type byte ∉ {1,2,3,4}. Zero-length UDP datagrams never reach
     /// type dispatch (consumed by the `Ok(_) => break` recv arm in

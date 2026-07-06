@@ -1168,3 +1168,55 @@ fn classify_initiation_bad_mac1_under_load_no_reflection() {
         "no cookie reply is emitted for a bad-MAC1 initiation"
     );
 }
+
+/// #4094 Copilot BUG-2 (engine level): if the OS CSPRNG is unavailable the
+/// under-load gate must FAIL CLOSED — drop the initiation with NO cookie
+/// reply — rather than ship a predictable cookie (which a spoofed source
+/// could reproduce to forge a valid MAC2 and defeat the mitigation) or
+/// process the flood. A valid-MAC1, no-MAC2 initiation under load with
+/// randomness broken must yield Drop, not SendCookie and not Process.
+#[test]
+fn classify_initiation_fails_closed_without_secure_randomness() {
+    use crate::afxdp::wg::cookie::INITIATIONS_UNDER_LOAD_THRESHOLD;
+    use std::net::SocketAddr;
+
+    let (engine, _our_pub, init) = under_load_fixture();
+    let now = 30_000_000_000u64;
+    engine.set_mock_now_ns(now);
+    let from: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+    let mut out = [0u8; 256];
+
+    // Go under load with healthy randomness.
+    for _ in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
+        engine.classify_initiation(&init, from, &mut out, now);
+    }
+    // Simulate a persistent getrandom failure.
+    engine.cookie.set_rng_fail_for_test(true);
+
+    let replies_before = engine
+        .counters()
+        .hs_cookie_replies_sent
+        .load(Ordering::Relaxed);
+    let action = engine.classify_initiation(&init, from, &mut out, now);
+    assert_eq!(
+        action,
+        InitiationAction::Drop,
+        "no secure randomness → fail closed (Drop), never SendCookie or Process"
+    );
+    assert_eq!(
+        engine
+            .counters()
+            .hs_cookie_replies_sent
+            .load(Ordering::Relaxed),
+        replies_before,
+        "no cookie reply (weak or otherwise) is emitted without secure randomness"
+    );
+    assert!(
+        engine
+            .counters()
+            .hs_cookie_reply_budget_drops
+            .load(Ordering::Relaxed)
+            >= 1,
+        "the fail-closed drop is counted"
+    );
+}

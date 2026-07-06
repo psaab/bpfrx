@@ -619,11 +619,19 @@ impl WgEngine {
                 WgCounters::bump(&self.counters.hs_rx_under_load_no_mac2);
                 InitiationAction::SendCookie(len)
             }
-            // A build failure (buffer / length) means we can't challenge;
-            // drop without a reply. `out` is >= WG_MSG_RESPONSE_LEN (92) at
-            // the sole caller, and the init length is already type-gated, so
-            // this arm is defensive.
-            Err(_) => InitiationAction::Drop,
+            // A build failure means we can't challenge → drop with NO reply
+            // (fail-closed). Reached by (a) the impossible-on-Linux
+            // CookieError::RandUnavailable — a getrandom failure for the
+            // secret or nonce, where shipping a predictable cookie would
+            // DEFEAT the mitigation (#4094 BUG-2), so dropping is the safe
+            // choice; or (b) a defensive buffer/length error (`out` is
+            // >= WG_MSG_RESPONSE_LEN 92 at the sole caller and the init
+            // length is type-gated, so (b) is unreachable). Counted with the
+            // budget-drop family: "under load, dropped without a cookie".
+            Err(_) => {
+                WgCounters::bump(&self.counters.hs_cookie_reply_budget_drops);
+                InitiationAction::Drop
+            }
         }
     }
 
