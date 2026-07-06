@@ -1,3 +1,38 @@
+## 2026-07-06 — #2354: QinQ inner-vlan-id honest-posture gate
+
+- **Timestamp**: 2026-07-06
+- **Action**: Added the #2354 honest-posture reject gate for QinQ /
+  stacked-VLAN inner tags, extending the #2008 H9/H10 doctrine in
+  `validateUnsupportedInterfaceStanzasAST`. `interfaces <if> unit <n>
+  inner-vlan-id <x>` is PARSED into `Unit.InnerVlanID` but has ZERO
+  dataplane consumers: the AF_XDP shim's parse_l2 unwinds exactly ONE
+  VLAN tag, so a double-tagged frame keeps eth_proto=0x8100 → dispatch
+  `_` arm → `pass_non_ip_l2_direct` = XDP_PASS to the kernel, never
+  firewalled. A committed inner-vlan-id is therefore a false promise of
+  firewalled stacked-VLAN transit. The gate HARD-REJECTS it at commit /
+  commit-check (lenient=false), naming the interface/unit path, and
+  WARNS (does not fail, does not prune — it is a no-op) on the tolerant
+  load / peer-sync path (#1960 fail-closed-on-load class). Keyed strictly
+  on `inner-vlan-id`: single 802.1Q / 802.1ad tagging via `vlan-id` and
+  `flexible-vlan-tagging` WITHOUT an inner tag stay ACCEPTED (correct per
+  #2346 — Junos-parity single-tag transit). This resolves the
+  honest-posture half of #2354; the multi-layer QinQ feature build
+  (two-tag parse/deliver/serialize + networkd stacked netdev + inner-tag
+  zone binding) stays plan-deferred pending operator demand (4-PR
+  decomposition recorded in the issue).
+- **File(s)**: pkg/config/compiler_interfaces_unsupported.go (gate +
+  doc), pkg/config/compiler_interfaces_unsupported_test.go (strict-reject
+  flat+hier, lenient-warn, single-tag negative), pkg/config/schema_interfaces.go
+  (inner-vlan-id leaf desc: honest signal at `?`-completion),
+  pkg/config/parser_services_test.go (two flexible-vlan-tagging tests
+  switched to CompileConfigLenient — strict path now rejects inner-vlan-id),
+  docs/feature-gaps.md (QinQ entry: honest-posture gate documented).
+- **Validation**: `go test ./pkg/config/...` green; RED-on-revert confirmed
+  (removing the gate → the three reject/warn tests fail: strict compile
+  accepts inner-vlan-id with nil error, lenient emits no warning); single-tag
+  negative passes with and without the gate; `go build ./...`, `go vet
+  ./pkg/config/`, gofmt on modified files all clean.
+
 ## 2026-07-06 — #4342 / #4343: session-invalidation residuals (default-policy + scheduler)
 
 - **Timestamp**: 2026-07-06
