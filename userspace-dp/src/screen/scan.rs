@@ -1,6 +1,12 @@
 //! Port-scan + IP-sweep windowed trackers used by the advanced screen
 //! checks. Each tracks a per-`(zone_id, source-IP)` unique-set over a
-//! 10-second detection window.
+//! configurable per-zone MICROSECOND detection window (the Junos
+//! `threshold` value); detection fires when the distinct-destination count
+//! reaches the FIXED Junos `SCAN_DETECT_COUNT` (10) within that window
+//! (#4114). Before #4114 xpf had these swapped — a configurable COUNT over a
+//! hard-coded 10-second window — so a copied Junos `threshold 5000` (meant as
+//! 5000 microseconds) was misread as a count and clamped to never-fire, while
+//! the default-armed sweep false-dropped normal browsing.
 //!
 //! #2209 — per-zone + bounded:
 //!
@@ -30,7 +36,7 @@
 //!   (bumping `skipped_pressure`). That is fail-safe for forwarding but a
 //!   DETECTION-DoS: a high-cardinality spoofed flood fills the table and a
 //!   subsequently-arriving REAL scanner is never tracked — and so never
-//!   detected — until `WINDOW_SECS` expiry, which the attacker can defer
+//!   detected — until the detection window expires, which the attacker can defer
 //!   indefinitely by keeping its 4096 sources fresh. The new-source path now
 //!   makes BOUNDED room instead of skipping: it scans a FIXED PREFIX of the
 //!   source table (`iter().take(EVICT_SCAN_LIMIT)` — the budget counts EVERY
@@ -74,20 +80,12 @@ const MAX_SOURCES_PER_ZONE: usize = 4096;
 /// whose unique fan-out is large; the bounded set can hold at most
 /// `MAX_UNIQUE_PER_SOURCE` entries.
 ///
-/// **Fail-CLOSED clamp (#2227 MAJOR-1).** The operator-configured
-/// threshold is unbounded (`strconv.Atoi`, no clamp), so it can legitimately
-/// exceed this cap (e.g. `port-scan threshold 5000`). The detection compares
-/// `set.len() > threshold`, but `len()` can never exceed `MAX_UNIQUE_PER_SOURCE`.
-/// If the comparison used the raw threshold, a threshold `>= MAX_UNIQUE_PER_SOURCE`
-/// could NEVER be crossed and the scanner would NEVER be dropped — a silent
-/// fail-OPEN. To preserve the fail-closed contract, [`check_unique`] clamps the
-/// EFFECTIVE comparison threshold to `MAX_UNIQUE_PER_SOURCE - 1`, so a source
-/// that fills the bounded set ALWAYS crosses it and is dropped (detection fires
-/// AT THE CAP rather than never). The clamp is counted in `threshold_clamped`
-/// so it is visible. The Go control plane mirrors this maximum
-/// (`pkg/config/compiler_security.go` `maxScanSweepThreshold`) and emits a
-/// commit-time WARNING when an operator threshold exceeds it — the two
-/// constants MUST stay in sync.
+/// This is purely a MEMORY bound. Detection fires at the fixed
+/// [`SCAN_DETECT_COUNT`] (10), which is far below this cap, so the verdict is
+/// never gated by it. #4114 removed the pre-existing configurable-COUNT
+/// semantics (and its `MAX_UNIQUE_PER_SOURCE - 1` fail-closed clamp): the
+/// detection count is now a fixed Junos constant well under this cap, and the
+/// configurable `threshold` is the detection WINDOW in microseconds instead.
 const MAX_UNIQUE_PER_SOURCE: usize = 1024;
 
 /// Maximum expired entries removed per `cleanup` call. Bounds the
@@ -108,8 +106,26 @@ const CLEANUP_BUDGET: usize = 256;
 /// back to skip-on-full (still bounded, never fail-open).
 const EVICT_SCAN_LIMIT: usize = 64;
 
-/// 10-second detection window shared by both trackers.
-const WINDOW_SECS: u64 = 10;
+/// Fixed Junos scan/sweep detection COUNT (#4114). A source that touches this
+/// many DISTINCT destinations (ports for port-scan, IPs for ip-sweep) within
+/// the configurable per-zone detection window is flagged. Junos hard-codes
+/// this at 10 and makes only the WINDOW configurable (the `threshold` value,
+/// in microseconds); the pre-#4114 xpf shape had it backwards (configurable
+/// count over a fixed 10-second window).
+///
+/// SSOT: mirrors the Go `scanSweepDetectCount` in
+/// `pkg/config/compiler_security_screen.go`. The two MUST stay in sync.
+pub(super) const SCAN_DETECT_COUNT: usize = 10;
+
+/// Conservative upper bound (microseconds) on any configurable detection
+/// window, used ONLY by the periodic, zone-agnostic [`ScanCore::cleanup`] to
+/// decide an entry is dead weight. It equals the Junos maximum `threshold`
+/// (1_000_000 us = 1s); an entry untouched for longer than this is expired
+/// under every in-range per-zone window, so cleanup can reclaim it without
+/// knowing each entry's per-zone window. The inline window reset in
+/// [`ScanCore::check`] and the eviction path use the exact per-zone
+/// `window_micros`; this constant is only the cleanup floor.
+const CLEANUP_WINDOW_MICROS: u64 = 1_000_000;
 
 /// Compile-time guard: the eviction sample must be smaller than the per-zone
 /// source cap, otherwise the "sample a prefix" bound would be meaningless
@@ -117,19 +133,16 @@ const WINDOW_SECS: u64 = 10;
 /// new-source path can always find a victim under a single-zone flood.
 const _: () = assert!(EVICT_SCAN_LIMIT > 0 && EVICT_SCAN_LIMIT < MAX_SOURCES_PER_ZONE);
 
+/// Compile-time guard: the fixed detection count must sit strictly below the
+/// per-source memory cap so a scanning source can always reach it before the
+/// bounded set saturates (otherwise detection could never fire) (#4114).
+const _: () = assert!(SCAN_DETECT_COUNT > 0 && SCAN_DETECT_COUNT < MAX_UNIQUE_PER_SOURCE);
+
 /// Test-only accessor for the per-zone source cap, used by the
 /// `ScreenState`-level bounded-state test in `screen/tests.rs`.
 #[cfg(test)]
 pub(super) fn max_sources_per_zone_for_test() -> usize {
     MAX_SOURCES_PER_ZONE
-}
-
-/// Test-only accessor for the per-source unique-entry cap, used by the
-/// `ScreenState`-level fail-closed clamp test in `screen/tests.rs` (#2227
-/// MAJOR-1). The supported maximum operator threshold is this value minus 1.
-#[cfg(test)]
-pub(super) fn max_unique_per_source_for_test() -> usize {
-    MAX_UNIQUE_PER_SOURCE
 }
 
 /// Test-only accessor for the bounded eviction sample limit (#2234), used by
@@ -167,12 +180,6 @@ struct ScanCore<T: std::hash::Hash + Eq> {
     /// (#2234): a brand-new source displaced an expired-or-stalest existing
     /// source so a fresh real scanner stays trackable. Pure observability.
     evicted_pressure: u64,
-    /// Count of checks whose operator threshold exceeded the supported
-    /// maximum (`MAX_UNIQUE_PER_SOURCE - 1`) and was clamped to it
-    /// (fail-closed clamp, #2227 MAJOR-1). Pure observability — surfaces an
-    /// operator misconfiguration (threshold the bounded set can never reach
-    /// un-clamped) without changing the (clamped) verdict.
-    threshold_clamped: u64,
     /// Next `evicted_pressure` value at which a `scan-table-pressure` screen
     /// event should be surfaced. Grows geometrically (see
     /// [`ScanCore::take_pressure_event`]) so the operator alarm fires at a
@@ -187,7 +194,6 @@ impl<T: std::hash::Hash + Eq> Default for ScanCore<T> {
             per_zone_count: FxHashMap::default(),
             skipped_pressure: 0,
             evicted_pressure: 0,
-            threshold_clamped: 0,
             // First eviction surfaces an event; thereafter the bar doubles.
             pressure_event_at: 1,
         }
@@ -195,8 +201,14 @@ impl<T: std::hash::Hash + Eq> Default for ScanCore<T> {
 }
 
 impl<T: std::hash::Hash + Eq> ScanCore<T> {
-    /// Bounded windowed-unique check. `entry_val` is the per-(zone_id,
-    /// src_ip) unique entry (dst port or dst IP).
+    /// Bounded windowed-unique check (#4114 Junos semantics). `entry_val` is
+    /// the per-(zone_id, src_ip) unique entry (dst port or dst IP). Detection
+    /// fires when the distinct-entry count reaches the FIXED
+    /// [`SCAN_DETECT_COUNT`] (10) within `window_micros` — the per-zone
+    /// configurable Junos `threshold` expressed as a MICROSECOND TIME WINDOW.
+    /// `now_micros` is a monotonic microsecond clock. A `window_micros` of 0
+    /// means the check is disabled (the caller gates on `threshold > 0`, but
+    /// this guards defensively too).
     ///
     /// Bounds (fail-safe, never fail-OPEN):
     /// - a brand-new source key for a zone already holding
@@ -209,43 +221,23 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     ///   `skipped_pressure`, returns `false`) — still bounded, never
     ///   fail-open;
     /// - a new unique entry for a source whose set already holds
-    ///   `MAX_UNIQUE_PER_SOURCE` entries is SKIPPED, but the threshold is
-    ///   still evaluated against the current (capped) set size;
-    /// - the EFFECTIVE comparison threshold is CLAMPED to
-    ///   `MAX_UNIQUE_PER_SOURCE - 1` (#2227 MAJOR-1). The set can hold at
-    ///   most `MAX_UNIQUE_PER_SOURCE` entries, so an operator threshold
-    ///   `>= MAX_UNIQUE_PER_SOURCE` could otherwise NEVER be crossed by
-    ///   `len() > threshold` — a silent fail-OPEN where the scanner is never
-    ///   dropped. Clamping guarantees a source that fills the bounded set
-    ///   ALWAYS crosses the effective threshold: detection fires AT THE CAP
-    ///   rather than never. The clamp is counted in `threshold_clamped` and
-    ///   the Go control plane warns at commit time when a threshold exceeds
-    ///   the supported maximum.
+    ///   `MAX_UNIQUE_PER_SOURCE` entries is SKIPPED, but the fixed detection
+    ///   count is still evaluated against the current (capped) set size. The
+    ///   count (10) sits well below the cap (1024), so the memory bound never
+    ///   gates the verdict (#4114 removed the pre-existing configurable-count
+    ///   fail-closed clamp — there is no operator count to exceed the cap).
     #[inline]
     fn check(
         &mut self,
         zone_id: u16,
         src_ip: IpAddr,
         entry_val: T,
-        now_secs: u64,
-        threshold: u32,
+        now_micros: u64,
+        window_micros: u64,
     ) -> bool {
-        if threshold == 0 {
+        if window_micros == 0 {
             return false;
         }
-        // Fail-closed clamp: the bounded set tops out at
-        // MAX_UNIQUE_PER_SOURCE, so the comparison `len() > effective` can
-        // only ever fire if `effective <= MAX_UNIQUE_PER_SOURCE - 1`. A
-        // larger operator threshold is clamped here (and counted) so
-        // detection fires at the cap instead of never. MAX_UNIQUE_PER_SOURCE
-        // fits a u32, so the cast and subtraction are safe.
-        let max_effective = (MAX_UNIQUE_PER_SOURCE - 1) as u32;
-        let effective_threshold = if threshold > max_effective {
-            self.threshold_clamped += 1;
-            max_effective
-        } else {
-            threshold
-        };
         let key: ScanKey = (zone_id, src_ip);
         let exists = self.per_src.contains_key(&key);
         // Per-zone source-count bound. A brand-new source for a zone at the
@@ -253,7 +245,7 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
         // hard skip-on-full cliff. An existing key is always allowed through
         // (it is bounded on the inner axis below).
         if !exists && self.zone_count(zone_id) >= MAX_SOURCES_PER_ZONE {
-            if !self.evict_stalest_in_zone(zone_id, now_secs) {
+            if !self.evict_stalest_in_zone(zone_id, now_micros, window_micros) {
                 // No same-zone victim within the bounded sample (pathological
                 // many-zone interleave). Preserve the fail-safe: skip, never
                 // fail-open. Cost is still O(EVICT_SCAN_LIMIT).
@@ -265,17 +257,18 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
         let entry = self
             .per_src
             .entry(key)
-            .or_insert_with(|| (now_secs, FxHashSet::default()));
+            .or_insert_with(|| (now_micros, FxHashSet::default()));
         if newly_inserted {
             *self.per_zone_count.entry(zone_id).or_insert(0) += 1;
         }
-        // Reset window if expired.
-        if now_secs.saturating_sub(entry.0) >= WINDOW_SECS {
-            entry.0 = now_secs;
+        // Reset the window if the configured microsecond window has elapsed
+        // since it opened.
+        if now_micros.saturating_sub(entry.0) >= window_micros {
+            entry.0 = now_micros;
             entry.1.clear();
         }
         // Per-source unique-entry bound: once the set is full, skip new
-        // entries (counting pressure) but still evaluate the threshold.
+        // entries (counting pressure) but still evaluate the detection count.
         if entry.1.len() >= MAX_UNIQUE_PER_SOURCE {
             if !entry.1.contains(&entry_val) {
                 self.skipped_pressure += 1;
@@ -283,7 +276,9 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
         } else {
             entry.1.insert(entry_val);
         }
-        entry.1.len() as u32 > effective_threshold
+        // Junos verdict: fire once the source has touched SCAN_DETECT_COUNT
+        // distinct destinations within the window.
+        entry.1.len() >= SCAN_DETECT_COUNT
     }
 
     /// O(1) per-zone source count (maintained incrementally).
@@ -310,7 +305,7 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     /// Returns `true` if a victim was evicted (count decremented,
     /// `evicted_pressure` bumped), `false` otherwise.
     #[inline]
-    fn evict_stalest_in_zone(&mut self, zone_id: u16, now_secs: u64) -> bool {
+    fn evict_stalest_in_zone(&mut self, zone_id: u16, now_micros: u64, window_micros: u64) -> bool {
         let mut stalest_key: Option<ScanKey> = None;
         let mut stalest_start = u64::MAX;
         let mut expired_victim: Option<ScanKey> = None;
@@ -320,7 +315,7 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
                 continue; // not a candidate, but still counts against the bound
             }
             // An expired-or-empty window is dead weight — evict it first.
-            if now_secs.saturating_sub(*start) >= WINDOW_SECS || set.is_empty() {
+            if now_micros.saturating_sub(*start) >= window_micros || set.is_empty() {
                 expired_victim = Some(*k);
                 break;
             }
@@ -349,15 +344,23 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     /// subsequent ticks. The walk itself is bounded only by the
     /// `MAX_SOURCES_PER_ZONE` cap on the table. The per-zone count is
     /// decremented for each removed key so the eviction cap test stays exact.
+    ///
+    /// `now_micros` is the monotonic microsecond clock. This periodic sweep is
+    /// zone-agnostic (it has no single per-zone `window_micros`), so it uses
+    /// the conservative [`CLEANUP_WINDOW_MICROS`] floor: an entry untouched for
+    /// longer than the Junos maximum window is dead under every in-range
+    /// per-zone window. The exact per-zone window still governs the inline
+    /// reset/verdict in [`ScanCore::check`]; cleanup only reclaims memory.
     #[inline]
-    fn cleanup(&mut self, now_secs: u64) {
+    fn cleanup(&mut self, now_micros: u64) {
         let mut removed = 0usize;
         let per_zone_count = &mut self.per_zone_count;
         self.per_src.retain(|key, (start, set)| {
             if removed >= CLEANUP_BUDGET {
                 return true; // budget exhausted — keep the rest for next tick
             }
-            let expired = now_secs.saturating_sub(*start) >= WINDOW_SECS || set.is_empty();
+            let expired =
+                now_micros.saturating_sub(*start) >= CLEANUP_WINDOW_MICROS || set.is_empty();
             if expired {
                 removed += 1;
                 if let Some(c) = per_zone_count.get_mut(&key.0) {
@@ -406,22 +409,26 @@ pub(super) struct PortScanTracker {
 }
 
 impl PortScanTracker {
-    /// Check if `(zone_id, src_ip)` has exceeded the port scan threshold.
-    /// Returns true if exceeded. Bounded + fail-safe (see [`ScanCore::check`]).
+    /// Check if `(zone_id, src_ip)` reached the fixed port-scan detection
+    /// count within `window_micros`. Returns true if flagged. Bounded +
+    /// fail-safe (see [`ScanCore::check`]). `window_micros` is the per-zone
+    /// Junos `threshold` (a microsecond time window, #4114).
     pub(super) fn check(
         &mut self,
         zone_id: u16,
         src_ip: IpAddr,
         dst_port: u16,
-        now_secs: u64,
-        threshold: u32,
+        now_micros: u64,
+        window_micros: u64,
     ) -> bool {
-        self.core.check(zone_id, src_ip, dst_port, now_secs, threshold)
+        self.core
+            .check(zone_id, src_ip, dst_port, now_micros, window_micros)
     }
 
-    /// Remove expired entries (budgeted periodic cleanup).
-    pub(super) fn cleanup(&mut self, now_secs: u64) {
-        self.core.cleanup(now_secs);
+    /// Remove expired entries (budgeted periodic cleanup). `now_micros` is a
+    /// monotonic microsecond clock.
+    pub(super) fn cleanup(&mut self, now_micros: u64) {
+        self.core.cleanup(now_micros);
     }
 
     /// Records skipped due to a per-source unique-entry cap or a failed
@@ -434,12 +441,6 @@ impl PortScanTracker {
     /// observability.
     pub(super) fn evicted_pressure(&self) -> u64 {
         self.core.evicted_pressure
-    }
-
-    /// Checks whose operator threshold was clamped to the supported maximum
-    /// (`MAX_UNIQUE_PER_SOURCE - 1`). Pure observability (#2227 MAJOR-1).
-    pub(super) fn threshold_clamped(&self) -> u64 {
-        self.core.threshold_clamped
     }
 
     /// Rare (logarithmic) pressure-event transition for the operator alarm
@@ -462,22 +463,26 @@ pub(super) struct IpSweepTracker {
 }
 
 impl IpSweepTracker {
-    /// Check if `(zone_id, src_ip)` has exceeded the IP sweep threshold.
-    /// Returns true if exceeded. Bounded + fail-safe (see [`ScanCore::check`]).
+    /// Check if `(zone_id, src_ip)` reached the fixed IP-sweep detection count
+    /// within `window_micros`. Returns true if flagged. Bounded + fail-safe
+    /// (see [`ScanCore::check`]). `window_micros` is the per-zone Junos
+    /// `threshold` (a microsecond time window, #4114).
     pub(super) fn check(
         &mut self,
         zone_id: u16,
         src_ip: IpAddr,
         dst_ip: IpAddr,
-        now_secs: u64,
-        threshold: u32,
+        now_micros: u64,
+        window_micros: u64,
     ) -> bool {
-        self.core.check(zone_id, src_ip, dst_ip, now_secs, threshold)
+        self.core
+            .check(zone_id, src_ip, dst_ip, now_micros, window_micros)
     }
 
-    /// Remove expired entries (budgeted periodic cleanup).
-    pub(super) fn cleanup(&mut self, now_secs: u64) {
-        self.core.cleanup(now_secs);
+    /// Remove expired entries (budgeted periodic cleanup). `now_micros` is a
+    /// monotonic microsecond clock.
+    pub(super) fn cleanup(&mut self, now_micros: u64) {
+        self.core.cleanup(now_micros);
     }
 
     /// Records skipped due to a per-source unique-entry cap or a failed
@@ -490,12 +495,6 @@ impl IpSweepTracker {
     /// observability.
     pub(super) fn evicted_pressure(&self) -> u64 {
         self.core.evicted_pressure
-    }
-
-    /// Checks whose operator threshold was clamped to the supported maximum
-    /// (`MAX_UNIQUE_PER_SOURCE - 1`). Pure observability (#2227 MAJOR-1).
-    pub(super) fn threshold_clamped(&self) -> u64 {
-        self.core.threshold_clamped
     }
 
     /// Rare (logarithmic) pressure-event transition for the operator alarm
@@ -519,43 +518,51 @@ mod scan_tests {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, a))
     }
 
+    /// Junos default window (microseconds) used across the windowing tests.
+    const W: u64 = 5_000;
+
     #[test]
     fn port_scan_keyed_per_zone_no_cross_count() {
         let mut t = PortScanTracker::default();
         let src = v4(1);
-        // Threshold 2: zone 1 sees 3 ports → would trip if global.
-        assert!(!t.check(1, src, 80, 100, 2));
-        assert!(!t.check(1, src, 443, 100, 2));
-        // Zone 2 from the SAME src, only 1 port — must NOT inherit zone 1's
-        // history. A global tracker would already be at 2 here and trip on
-        // the next port.
-        assert!(!t.check(2, src, 22, 100, 2));
-        assert!(!t.check(2, src, 23, 100, 2));
-        // Zone 2's third unique port crosses ITS own threshold.
-        assert!(t.check(2, src, 24, 100, 2));
-        // Zone 1's third unique port crosses zone 1's threshold,
+        // Zone 1: the first SCAN_DETECT_COUNT-1 distinct ports do not fire.
+        // A GLOBAL tracker would carry this count into zone 2 below.
+        for p in 0..(SCAN_DETECT_COUNT as u16 - 1) {
+            assert!(!t.check(1, src, 8000 + p, 100, W));
+        }
+        // Zone 2 from the SAME src starts fresh — the same distinct-port count
+        // does NOT trip (per-zone keying, #2209).
+        for p in 0..(SCAN_DETECT_COUNT as u16 - 1) {
+            assert!(!t.check(2, src, 9000 + p, 100, W));
+        }
+        // Zone 2's SCAN_DETECT_COUNT-th distinct port crosses ITS own count.
+        assert!(t.check(2, src, 9999, 100, W));
+        // Zone 1's SCAN_DETECT_COUNT-th distinct port crosses zone 1's count,
         // independent of zone 2.
-        assert!(t.check(1, src, 8080, 100, 2));
+        assert!(t.check(1, src, 8999, 100, W));
     }
 
     #[test]
     fn ip_sweep_keyed_per_zone_no_cross_count() {
         let mut t = IpSweepTracker::default();
         let src = v4(1);
-        assert!(!t.check(1, src, v4(10), 100, 2));
-        assert!(!t.check(1, src, v4(11), 100, 2));
+        for i in 0..(SCAN_DETECT_COUNT as u8 - 1) {
+            assert!(!t.check(1, src, v4(10 + i), 100, W));
+        }
         // Zone 2 starts fresh for the same src.
-        assert!(!t.check(2, src, v4(20), 100, 2));
-        assert!(!t.check(2, src, v4(21), 100, 2));
-        assert!(t.check(2, src, v4(22), 100, 2));
-        assert!(t.check(1, src, v4(12), 100, 2));
+        for i in 0..(SCAN_DETECT_COUNT as u8 - 1) {
+            assert!(!t.check(2, src, v4(100 + i), 100, W));
+        }
+        assert!(t.check(2, src, v4(200), 100, W));
+        assert!(t.check(1, src, v4(50), 100, W));
     }
 
     #[test]
     fn source_table_bounded_and_not_fail_open() {
         let mut t = IpSweepTracker::default();
-        // Fill zone 0 to the source cap with distinct sources (threshold
-        // high enough that none trips, so nothing is evicted by detection).
+        // Fill zone 0 to the source cap with distinct sources, one dst each
+        // (well under SCAN_DETECT_COUNT, so none trips and nothing is evicted
+        // by detection). A wide in-range window keeps every entry live.
         for i in 0..MAX_SOURCES_PER_ZONE {
             let src = IpAddr::V4(Ipv4Addr::from((0x0a00_0000u32) + i as u32));
             assert!(!t.check(0, src, v4(1), 100, 1_000_000));
@@ -567,10 +574,11 @@ mod scan_tests {
         // stalest-eviction (not skipped), so a fresh real scanner is always
         // trackable — and must NOT fail-open (returns false = no drop). The
         // table must STAY bounded at the cap (eviction made room, the table
-        // never grows).
+        // never grows). A window of 0 disables the check (early return, no
+        // admit); a real window admits via eviction.
         let overflow_src = IpAddr::V4(Ipv4Addr::from(0x0b00_0000u32));
         assert!(!t.check(0, overflow_src, v4(1), 100, 0));
-        assert!(!t.check(0, overflow_src, v4(2), 100, 1));
+        assert!(!t.check(0, overflow_src, v4(2), 100, 1_000_000));
         assert_eq!(
             t.tracked_sources(),
             MAX_SOURCES_PER_ZONE,
@@ -582,82 +590,63 @@ mod scan_tests {
         );
     }
 
+    /// #4114 fail-on-revert (WINDOW semantics, fast scan): SCAN_DETECT_COUNT
+    /// distinct destinations reached WITHIN the microsecond window fire
+    /// detection on the SCAN_DETECT_COUNT-th. The count is FIXED (10), not the
+    /// configurable knob — the configurable knob is the window.
     #[test]
-    fn threshold_above_cap_still_fires_fail_closed() {
-        // #2227 MAJOR-1 fail-on-revert: an IP-sweep at a threshold ABOVE the
-        // per-source unique cap (e.g. 3000, which parses/validates fine on
-        // the Go side) must STILL fire detection. Pre-fix the comparison was
-        // `len() as u32 > threshold`, but `len()` tops out at
-        // MAX_UNIQUE_PER_SOURCE (1024) < 3000, so the scanner was NEVER
-        // dropped — a silent fail-OPEN. The clamp makes the bounded set's
-        // worst case (full = MAX_UNIQUE_PER_SOURCE) always cross the effective
-        // threshold (MAX_UNIQUE_PER_SOURCE - 1).
+    fn detects_fixed_count_within_window() {
         let mut t = IpSweepTracker::default();
         let src = v4(1);
-        let threshold: u32 = 3000;
-        assert!(
-            threshold as usize > MAX_UNIQUE_PER_SOURCE,
-            "test premise: threshold must exceed the per-source cap"
-        );
-        // Sweep more distinct destinations than the cap. The set saturates at
-        // MAX_UNIQUE_PER_SOURCE; once it does, the effective (clamped)
-        // threshold is crossed and the check returns a drop.
-        let mut fired = false;
-        for i in 0..(MAX_UNIQUE_PER_SOURCE + 50) {
-            let dst = IpAddr::V4(Ipv4Addr::from(0x0e00_0000u32 + i as u32));
-            if t.check(0, src, dst, 100, threshold) {
-                fired = true;
-                break;
-            }
+        let now = 1_000_000u64;
+        // The first SCAN_DETECT_COUNT-1 distinct dests within the window do
+        // not fire.
+        for i in 0..(SCAN_DETECT_COUNT as u32 - 1) {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0e00_0000u32 + i));
+            assert!(!t.check(0, src, dst, now, W));
         }
+        // The SCAN_DETECT_COUNT-th distinct dest within the SAME window fires.
+        let dst = IpAddr::V4(Ipv4Addr::from(
+            0x0e00_0000u32 + (SCAN_DETECT_COUNT as u32 - 1),
+        ));
         assert!(
-            fired,
-            "IP-sweep with threshold {threshold} (> cap {MAX_UNIQUE_PER_SOURCE}) must fire \
-             detection — pre-fix it NEVER fired (silent fail-open)"
-        );
-        assert!(
-            t.threshold_clamped() >= 1,
-            "an over-cap threshold must be recorded as clamped, got {}",
-            t.threshold_clamped()
+            t.check(0, src, dst, now, W),
+            "{SCAN_DETECT_COUNT} distinct dests within the window must fire"
         );
     }
 
+    /// #4114 fail-on-revert (WINDOW semantics, slow probe): the SAME
+    /// SCAN_DETECT_COUNT distinct destinations spread so each lands MORE than
+    /// `window_micros` after the previous never fire — every probe opens a
+    /// fresh window and the distinct count resets to 1. Under the pre-#4114
+    /// count-over-fixed-window misinterpretation these same distinct dests
+    /// would have accumulated a count of 10 and tripped (that is what goes RED
+    /// on revert). A configurable µs window means a slow scan is not a scan.
     #[test]
-    fn threshold_at_cap_minus_one_is_max_unclamped() {
-        // Boundary: a threshold of exactly MAX_UNIQUE_PER_SOURCE - 1 is the
-        // largest value that is NOT clamped. The (MAX_UNIQUE_PER_SOURCE)th
-        // unique entry crosses it. (We cannot drive 1023 distinct entries
-        // cheaply here without a large loop; assert the no-clamp accounting
-        // on a single representative check.)
-        let mut t = PortScanTracker::default();
+    fn no_detect_when_dests_spread_beyond_window() {
+        let mut t = IpSweepTracker::default();
         let src = v4(1);
-        let at_max = (MAX_UNIQUE_PER_SOURCE - 1) as u32;
-        // One SYN at the boundary threshold: not clamped, not yet crossed.
-        assert!(!t.check(0, src, 80, 100, at_max));
-        assert_eq!(
-            t.threshold_clamped(),
-            0,
-            "threshold == MAX_UNIQUE_PER_SOURCE-1 must NOT be clamped"
-        );
-        // One above the boundary IS clamped.
-        let mut t2 = PortScanTracker::default();
-        assert!(!t2.check(0, src, 80, 100, at_max + 1));
-        assert_eq!(
-            t2.threshold_clamped(),
-            1,
-            "threshold == MAX_UNIQUE_PER_SOURCE must be clamped"
-        );
+        let mut now = 1_000_000u64;
+        for i in 0..(SCAN_DETECT_COUNT as u32 + 5) {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0f00_0000u32 + i));
+            assert!(
+                !t.check(0, src, dst, now, W),
+                "a probe spread beyond the window must never fire (window resets)"
+            );
+            now += W + 1; // the next probe opens a brand-new window
+        }
     }
 
     #[test]
     fn per_source_unique_entries_bounded() {
         let mut t = IpSweepTracker::default();
         let src = v4(1);
-        // High threshold so detection never evicts; flood unique dst IPs
-        // past the per-source cap.
+        // A single wide window (nothing resets); flood unique dst IPs past the
+        // per-source memory cap. Detection fires early (ignored) but the set
+        // is still bounded at MAX_UNIQUE_PER_SOURCE.
         for i in 0..(MAX_UNIQUE_PER_SOURCE + 100) {
             let dst = IpAddr::V4(Ipv4Addr::from(0x0c00_0000u32 + i as u32));
-            t.check(7, src, dst, 100, u32::MAX);
+            t.check(7, src, dst, 100, 1_000_000);
         }
         // The inner set is capped; the surplus is recorded as pressure.
         assert_eq!(t.tracked_sources(), 1);
@@ -672,11 +661,15 @@ mod scan_tests {
     fn window_expiry_resets_per_key() {
         let mut t = PortScanTracker::default();
         let src = v4(1);
-        assert!(!t.check(3, src, 80, 100, 2));
-        assert!(!t.check(3, src, 443, 100, 2));
-        assert!(t.check(3, src, 22, 100, 2));
-        // After the window elapses the set resets and the count restarts.
-        assert!(!t.check(3, src, 8080, 100 + WINDOW_SECS, 2));
+        let now = 1_000u64;
+        // SCAN_DETECT_COUNT distinct ports within the window fire on the last.
+        for p in 0..(SCAN_DETECT_COUNT as u16 - 1) {
+            assert!(!t.check(3, src, 8000 + p, now, W));
+        }
+        assert!(t.check(3, src, 8999, now, W));
+        // After the window elapses the set resets and the count restarts, so a
+        // single new port does not fire.
+        assert!(!t.check(3, src, 7000, now + W, W));
     }
 
     #[test]
@@ -690,9 +683,9 @@ mod scan_tests {
             t.check(0, src, v4(1), 0, 1_000_000);
         }
         assert_eq!(t.tracked_sources(), seed);
-        // Far past the window — all are expired, but one sweep removes only
-        // up to the budget.
-        t.cleanup(1_000);
+        // Far past the cleanup window — all are expired, but one sweep removes
+        // only up to the budget.
+        t.cleanup(2 * CLEANUP_WINDOW_MICROS);
         assert_eq!(t.tracked_sources(), seed - CLEANUP_BUDGET);
     }
 
@@ -706,8 +699,7 @@ mod scan_tests {
     #[test]
     fn fresh_scanner_tracked_and_detected_after_saturation() {
         let mut t = IpSweepTracker::default();
-        // Fill zone 0 to the cap with spoofed sources at an OLD window so the
-        // stalest-eviction has clear victims. High threshold so none of them
+        // Fill zone 0 to the cap with spoofed sources, one dst each so none
         // trips (the flood is high-cardinality, low-per-source fan-out).
         let flood_t = 0u64;
         for i in 0..MAX_SOURCES_PER_ZONE {
@@ -715,16 +707,15 @@ mod scan_tests {
             assert!(!t.check(0, src, v4(1), flood_t, 1_000_000));
         }
         assert_eq!(t.tracked_sources(), MAX_SOURCES_PER_ZONE);
-        // A real scanner arrives later, sweeping many destinations with a low
-        // threshold. Even though the table is full, it must be admitted by
-        // eviction and cross its threshold.
+        // A real scanner arrives later, sweeping SCAN_DETECT_COUNT+ distinct
+        // destinations within its window. Even though the table is full, it
+        // must be admitted by eviction and cross the fixed detection count.
         let scanner = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        let threshold = 5u32;
         let now = flood_t + 1; // still inside the flood's window
         let mut fired = false;
-        for d in 0..(threshold + 3) {
+        for d in 0..(SCAN_DETECT_COUNT as u32 + 3) {
             let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, d as u8));
-            if t.check(0, scanner, dst, now, threshold) {
+            if t.check(0, scanner, dst, now, 1_000_000) {
                 fired = true;
                 break;
             }
@@ -773,11 +764,11 @@ mod scan_tests {
         }
         *core.per_zone_count.entry(9).or_insert(0) = core.per_src.len() as u32;
         let before = core.per_src.len();
-        // `now` close to the stalest start so NOTHING is expired (force the
-        // stalest-not-expired branch).
+        // `now` close to the stalest start so NOTHING is expired within a wide
+        // window (force the stalest-not-expired branch).
         let now = 105u64;
         assert!(
-            core.evict_stalest_in_zone(9, now),
+            core.evict_stalest_in_zone(9, now, 1_000_000),
             "a same-zone victim must be found"
         );
         assert_eq!(core.per_src.len(), before - 1, "exactly one evicted");
@@ -805,9 +796,10 @@ mod scan_tests {
             core.per_src.insert((9, s), (1_000, set));
         }
         *core.per_zone_count.entry(9).or_insert(0) = core.per_src.len() as u32;
-        // now far past the expired window but inside the fresh entries'.
-        let now = 1_000 + WINDOW_SECS - 1;
-        assert!(core.evict_stalest_in_zone(9, now));
+        // now far past the expired entry's window but inside the fresh
+        // entries' (window = 100us here).
+        let now = 1_050u64;
+        assert!(core.evict_stalest_in_zone(9, now, 100));
         assert!(
             !core.per_src.contains_key(&(9, expired_src)),
             "the EXPIRED entry must be reclaimed first"
@@ -862,7 +854,7 @@ mod scan_tests {
         }
         assert_eq!(core.zone_count(5), 10);
         // Age everything out; cleanup removes them and the count follows.
-        core.cleanup(1_000);
+        core.cleanup(2 * CLEANUP_WINDOW_MICROS);
         assert_eq!(core.zone_count(5), 0, "count decremented on cleanup");
         assert_eq!(core.per_src.len(), 0);
     }

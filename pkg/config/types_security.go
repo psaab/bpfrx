@@ -886,7 +886,7 @@ type ICMPScreen struct {
 type IPScreen struct {
 	SourceRouteOption bool
 	TearDrop          bool
-	IPSweepThreshold  int // unique destination IPs per source (0 = disabled)
+	IPSweepThreshold  int // #4114 Junos detection WINDOW in microseconds (fixed count 10); 0 = disabled
 }
 
 // TCPScreen configures TCP screening.
@@ -898,7 +898,7 @@ type TCPScreen struct {
 	SynFin            bool
 	NoFlag            bool
 	FinNoAck          bool
-	PortScanThreshold int // TCP SYN count per source IP (0 = disabled)
+	PortScanThreshold int // #4114 Junos detection WINDOW in microseconds (fixed count 10); 0 = disabled
 }
 
 // UDPScreen configures UDP screening.

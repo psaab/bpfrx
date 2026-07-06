@@ -103,8 +103,8 @@ pub(crate) struct ScreenProfile {
     pub syn_flood_src_threshold: u32,
     pub session_limit_src: u32, // max sessions per source IP, 0 = disabled
     pub session_limit_dst: u32, // max sessions per destination IP, 0 = disabled
-    pub port_scan_threshold: u32, // unique dst ports per src IP within window, 0 = disabled
-    pub ip_sweep_threshold: u32, // unique dst IPs per src IP within window, 0 = disabled
+    pub port_scan_threshold: u32, // #4114 Junos: detection WINDOW in microseconds (fixed count 10), 0 = disabled
+    pub ip_sweep_threshold: u32, // #4114 Junos: detection WINDOW in microseconds (fixed count 10), 0 = disabled
     /// Junos profile-wide `alarm-without-drop` audit/log-only mode. When true,
     /// the consumer of a `ScreenVerdict::Drop` (and the flow-path
     /// `SynCookieChallenge`) for this zone raises a log-only ALARM event

@@ -915,24 +915,22 @@ pre-session screen stage.
   (`screen/scan.rs`). This mirrors the #2134/#2177 session-limit
   skip-on-full discipline.
 
-- **#2227 MAJOR-1 (fail-CLOSED on over-cap thresholds).** The
-  unique-entry set tops out at `MAX_UNIQUE_PER_SOURCE` (1024), but the
-  operator threshold is unbounded (`strconv.Atoi`, no clamp — e.g.
-  `port-scan threshold 5000`). The detection compares
-  `set.len() > threshold`, and `len()` can never exceed the cap, so an
-  un-clamped threshold `>= MAX_UNIQUE_PER_SOURCE` could NEVER be crossed:
-  the scanner would never be dropped (silent fail-OPEN). The dataplane
-  therefore CLAMPS the effective comparison threshold to
-  `MAX_UNIQUE_PER_SOURCE - 1`, so a source that fills the bounded set
-  always crosses it — **detection fires AT THE CAP rather than never**.
-  Each clamp is counted in `scan_sweep_threshold_clamped`. The config
-  value is preserved unchanged (operator intent is kept); the Go control
-  plane (`pkg/config/compiler_security.go`, constant
-  `maxScanSweepThreshold` kept in sync with the Rust `MAX_UNIQUE_PER_SOURCE`)
-  emits a commit-time WARNING when a port-scan/ip-sweep threshold exceeds
-  the supported maximum, telling the operator it will be clamped. The
-  effective contract is: scan/sweep detection NEVER silently fail-opens for
-  any parseable config — at worst it detects at the cap.
+- **#4114 (Junos µs-window semantics).** The port-scan / ip-sweep
+  `threshold` is a Junos MICROSECOND detection WINDOW, and the detection
+  COUNT is the fixed `SCAN_DETECT_COUNT` (10) in `screen/scan.rs`. The
+  tracker resets its per-`(zone, src)` distinct-destination set each
+  `window_micros` and fires once the set reaches 10. `MAX_UNIQUE_PER_SOURCE`
+  (1024) is now purely a MEMORY bound — the fixed count sits well under it,
+  so the verdict is never gated by the cap. This replaced the buggy
+  pre-#4114 shape (a configurable COUNT over a hard-coded 10-second window
+  plus a `MAX_UNIQUE_PER_SOURCE - 1` fail-closed clamp): a copied Junos
+  `threshold 5000` was misread as a count and clamped to never-fire, while
+  the default-armed sweep false-dropped normal browsing. The Go control
+  plane (`pkg/config/compiler_security_screen.go`) defaults the window to
+  5000 us (Junos default) and emits a commit-time ADVISORY
+  (`validateScreenScanSweepWindows`) when a value falls outside the Junos
+  [1000, 1000000] us range — the count->window migration net, never a hard
+  reject (no-brick). `SCAN_DETECT_COUNT` mirrors the Go `scanSweepDetectCount`.
 
 - **Perf (#2209).** The per-packet `check_packet_with_zone_id` no longer
   clones the whole `ScreenProfile` per screened packet — it borrows it and

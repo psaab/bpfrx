@@ -478,11 +478,11 @@ func (s *Server) showScreenIDSOption(req *pb.ShowTextRequest, cfg *config.Config
 				fmt.Fprintf(buf, "  ICMP fragment (icmp-fragment)               enabled\n")
 			}
 			if profile.TCP.PortScanThreshold > 0 {
-				fmt.Fprintf(buf, "  TCP port scan (port-scan)                   %d\n",
+				fmt.Fprintf(buf, "  TCP port scan window (port-scan)            %d us\n",
 					profile.TCP.PortScanThreshold)
 			}
 			if profile.IP.IPSweepThreshold > 0 {
-				fmt.Fprintf(buf, "  IP sweep (ip-sweep)                         %d\n",
+				fmt.Fprintf(buf, "  IP sweep window (ip-sweep)                  %d us\n",
 					profile.IP.IPSweepThreshold)
 			}
 			if profile.LimitSession.SourceIPBased > 0 {
@@ -706,14 +706,14 @@ func (s *Server) showScreenIDSOptionDetail(req *pb.ShowTextRequest, cfg *config.
 			// canonical config.ScreenCheck* inventory name.
 			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "ICMP fragment (icmp-fragment)", enabledS(profile.ICMP.Fragment), "disabled")
 			if profile.TCP.PortScanThreshold > 0 {
-				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "TCP port scan (port-scan)", profile.TCP.PortScanThreshold, "disabled")
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP port scan window (port-scan)", fmt.Sprintf("%d us", profile.TCP.PortScanThreshold), "disabled")
 			} else {
-				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP port scan (port-scan)", "disabled", "disabled")
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP port scan window (port-scan)", "disabled", "disabled")
 			}
 			if profile.IP.IPSweepThreshold > 0 {
-				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "IP sweep (ip-sweep)", profile.IP.IPSweepThreshold, "disabled")
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "IP sweep window (ip-sweep)", fmt.Sprintf("%d us", profile.IP.IPSweepThreshold), "disabled")
 			} else {
-				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "IP sweep (ip-sweep)", "disabled", "disabled")
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "IP sweep window (ip-sweep)", "disabled", "disabled")
 			}
 			if profile.LimitSession.SourceIPBased > 0 {
 				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "Session limit source (limit-session-source)", profile.LimitSession.SourceIPBased, "disabled")

@@ -57,15 +57,17 @@ off (threshold 0).
 | `tcp port-scan`     | 10      | Junos flags a port scan at 10 distinct destination ports |
 | `ip ip-sweep`       | 10      | Junos flags an address sweep at 10 distinct destination addresses |
 
-Note on the scan/sweep defaults: Junos expresses the port-scan / ip-sweep
-`threshold` as a time window (default 5000 microseconds) within which 10 distinct
-ports / addresses trigger detection. This engine instead interprets the
-threshold as a DISTINCT-DESTINATION COUNT over a fixed 10-second window
-(`WINDOW_SECS` in `scan.rs`, comparison `len() > threshold`), so the default
-uses Junos's distinct-destination detection count (10) rather than its 5000-
-microsecond time-window value. Feeding 5000 here would be read as a count and
-clamped to the dataplane cap (1023, `maxScanSweepThreshold`) — effectively never
-firing.
+Note on the scan/sweep defaults (#4114): Junos expresses the port-scan /
+ip-sweep `threshold` as a MICROSECOND time WINDOW (default 5000) within which
+10 distinct ports / addresses trigger detection. xpf now matches this: the
+`threshold` is the detection window in microseconds and the detection COUNT is
+the fixed `SCAN_DETECT_COUNT` (10) in `scan.rs`. The default is 5000 (the Junos
+default window). Before #4114 xpf had these swapped — a configurable COUNT over
+a hard-coded 10-second window — so a copied Junos `threshold 5000` was misread
+as a count and clamped to never-fire, while the default-armed sweep false-
+dropped normal browsing. The compiler emits a commit-time advisory
+(`validateScreenScanSweepWindows`) when a value falls outside the Junos
+[1000, 1000000] microsecond range, catching count-shaped legacy values.
 
 ### ICMP / UDP flood are measured PER DESTINATION (#4112)
 
