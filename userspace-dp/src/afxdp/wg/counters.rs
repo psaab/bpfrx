@@ -25,12 +25,15 @@
 //! sites stay one-liners and a future error-variant addition fails
 //! compilation here rather than silently going uncounted.
 //!
-//! Per-peer TAI64N anti-replay rejects ARE counted now
+//! Per-peer TAI64N anti-replay rejects ARE counted
 //! (`hs_rx_drops_replayed_init`, #4092 — the responder rejects an
 //! initiation whose TAI64N is `<=` the greatest already accepted from
-//! that peer). Still reserved with NO increment site today (do not
-//! invent counters for them): under-load rate-limit rejects and
-//! cookie/MAC2 (S7), deferred to the remaining responder hardening.
+//! that peer). The responder cookie-reply / MAC2 under-load path is now
+//! counted too (#4094 PR-A): `hs_cookie_replies_sent`,
+//! `hs_rx_under_load_no_mac2`, `hs_rx_under_load_mac2_ok`, and
+//! `hs_cookie_reply_budget_drops`. The remaining reserved-with-no-site
+//! counter is `hs_rx_cookie_unsupported` — an INBOUND type-3 drop, still
+//! deferred to the initiator-side cookie-reply consume (PR-B).
 
 use super::engine::{DecapError, EncapError};
 use super::handshake::FramingError;
@@ -67,8 +70,32 @@ pub(crate) struct WgCounters {
     /// the transport-record `decap_drops_replay` window; this is the
     /// HANDSHAKE anti-replay gate.
     pub(crate) hs_rx_drops_replayed_init: AtomicU64,
-    /// Type-3 (cookie) datagrams — S7 placeholder, dropped today.
+    /// Inbound type-3 (cookie-reply) datagrams dropped. In PR-A the
+    /// RESPONDER cookie path is live, but the INITIATOR-side consume of an
+    /// inbound cookie-reply (parse + re-initiate with a real MAC2) is PR-B,
+    /// so a received type-3 is still dropped here. Renamed intent, same
+    /// wire name for compatibility.
     pub(crate) hs_rx_cookie_unsupported: AtomicU64,
+    /// #4094 PR-A: WG type-3 CookieReply messages the RESPONDER emitted —
+    /// one per under-load, valid-MAC1, missing/bad-MAC2 initiation that was
+    /// challenged instead of handshaked.
+    pub(crate) hs_cookie_replies_sent: AtomicU64,
+    /// #4094 PR-A: under-load initiations DROPPED for a missing/bad MAC2
+    /// (a cookie challenge was issued in reply). The DoS-mitigation hit
+    /// count — these are the forged/unprimed initiations the responder
+    /// refused to spend a Noise handshake on.
+    pub(crate) hs_rx_under_load_no_mac2: AtomicU64,
+    /// #4094 PR-A: under-load initiations that carried a VALID MAC2 and
+    /// were allowed through to the handshake (the cookie mechanism working
+    /// end-to-end — a primed peer completing under load).
+    pub(crate) hs_rx_under_load_mac2_ok: AtomicU64,
+    /// #4094 PR-A: under-load initiations dropped WITHOUT a cookie reply.
+    /// Primarily the per-window cookie-reply emission budget being exhausted
+    /// (item 6 storm bound) — non-zero means the generated-reply budget is
+    /// clamping a heavy valid-MAC1 flood. Also covers the fail-closed drop
+    /// when the OS CSPRNG is unavailable for the secret/nonce (BUG-2;
+    /// impossible on Linux, so effectively budget-only in practice).
+    pub(crate) hs_cookie_reply_budget_drops: AtomicU64,
     /// Type byte ∉ {1,2,3,4}. Zero-length UDP datagrams never reach
     /// type dispatch (consumed by the `Ok(_) => break` recv arm in
     /// wg_control), so runts are deliberately NOT counted here.

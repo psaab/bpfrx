@@ -365,8 +365,15 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			PolicyID:        dataplane.DefaultPolicySentinelID,
 			RuleID:          dataplane.DefaultPolicyName,
 		}
-		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
-			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+		// #4344 (M02): the default-policy row now reads through the SAME #3965
+		// bulk reader as the configured rows above (readPolicy), instead of a
+		// standalone per-policy s.dp.ReadPolicyCounters call that took a second
+		// dataplane snapshot for a single sentinel handle. readPolicy != nil
+		// implies the dataplane is loaded (built above under that guard); the
+		// bulk snapshot already includes the DefaultPolicySentinelID handle
+		// (ReadAllPolicyCounters puts it), so the value is identical.
+		if statsEnabled && readPolicy != nil {
+			if ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
 				defRule.HitPackets = ctrs.Packets
 				defRule.HitBytes = ctrs.Bytes
 			} else if readErr == nil {

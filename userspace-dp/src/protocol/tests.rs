@@ -1979,6 +1979,12 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         // field must be nonzero for the wire-invariant populated pin).
         hs_rx_drops_replayed_init: 45,
         hs_rx_cookie_unsupported: 11,
+        // #4094 PR-A responder cookie / MAC2 under-load accounting
+        // (46.. off-ladder, mirror of the Go-side series-set values).
+        hs_cookie_replies_sent: 46,
+        hs_rx_under_load_no_mac2: 47,
+        hs_rx_under_load_mac2_ok: 48,
+        hs_cookie_reply_budget_drops: 49,
         rx_unknown_type: 12,
         hs_send_errors: 13,
         hs_requests_armed: 14,
@@ -2037,6 +2043,8 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(wire_row["sessions_expired"], 38);
     assert_eq!(wire_row["rekeys_initiated_age"], 39);
     assert_eq!(wire_row["keepalives_tx_persistent"], 43);
+    assert_eq!(wire_row["hs_cookie_replies_sent"], 46);
+    assert_eq!(wire_row["hs_rx_under_load_no_mac2"], 47);
     let back: ProcessStatus =
         serde_json::from_value(value).expect("deserialize ProcessStatus");
     assert_eq!(back.wg_tunnels.len(), 1);
@@ -2054,6 +2062,8 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(b.rekeys_initiated_keepalive_no_session, 41);
     assert_eq!(b.keepalives_tx_passive, 42);
     assert_eq!(b.pending_aborted_attempt_window, 44);
+    assert_eq!(b.hs_rx_under_load_mac2_ok, 48);
+    assert_eq!(b.hs_cookie_reply_budget_drops, 49);
 
     // EMPTY-INVARIANT: a ProcessStatus with no WG tunnels serializes
     // with NO `wg_tunnels` key at all — non-WG deployments stay

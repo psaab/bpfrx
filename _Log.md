@@ -38,6 +38,85 @@
   gofmt, `go vet` clean. HA-touching (new delete-sync triggers) → parent runs
   test-failover before merge; delete-sync path is the proven #2468 shared core.
 
+## 2026-07-06 — #4344 migrate remaining policy-counter display surfaces to the bulk reader (H05/M02/M07)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Some policy-counter DISPLAY surfaces still called
+  `dp.ReadPolicyCounters` per-policy in a loop despite the #3965 bulk
+  reader (`dpuserspace.NewPolicyCounterReader`) existing — O(policies)
+  latency, each read rebuilding the ruleID->counter index and rescanning
+  the config under the dataplane policy mutex. Migrated every remaining
+  surface onto the shared reader, mirroring the `pkg/api/security.go:161`
+  reference: build `readPolicy := dpuserspace.NewPolicyCounterReader(dp,
+  cfg, dp.ReadPolicyCounters)` ONCE per render (guarded by
+  `dp.IsLoaded()`), then replace each in-loop `dp.ReadPolicyCounters(h)`
+  with `readPolicy(h)`. Surfaces migrated: CLI `showPoliciesHitCount`
+  (zone-pair + global + default-policy sentinel rows) and the `policies
+  brief` view; gRPC `showPoliciesHitCount`, `showPoliciesDetail`, and
+  structured `GetPolicies` (zone-pair + global + default rows). M02: the
+  REST `GET /api/v1/security/policies` default-policy row had bypassed the
+  reader with a standalone `s.dp.ReadPolicyCounters(sentinel)` call even
+  though the configured rows used it — routed it through the same
+  `readPolicy`. The bulk snapshot already includes the sentinel handle
+  (`ReadAllPolicyCounters` puts `DefaultPolicySentinelID`), so values are
+  identical. NO interface change (reader falls back to the per-policy read
+  for dataplanes without the bulk snapshot — test fakes / retired eBPF —
+  so existing fakes exercise the unchanged path). Value identity is pinned
+  by the existing `TestReadAllPolicyCountersMatchesPerPolicy`. Added
+  per-surface canary tests: a fake dp implementing BOTH the bulk map (with
+  authoritative values) and a poisoned per-policy fallback proves each
+  surface renders the bulk value AND never invokes the fallback
+  (`perPolicyCalls == 0`). Added an L08 static canary per package that
+  fails if a display-surface source file makes a direct `.ReadPolicyCounters(`
+  call. Docs: pkg/api/README.md + pkg/grpcapi/README.md note the completed
+  migration. `go build ./...`, gofmt, vet, and the full pkg/cli + pkg/api +
+  pkg/grpcapi suites clean.
+- **File(s)**: pkg/cli/cli_show_security.go,
+  pkg/cli/cli_show_security_dispatch.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_zones.go, pkg/api/security.go,
+  pkg/cli/cli_show_policies_bulk_reader_test.go,
+  pkg/grpcapi/policies_bulk_reader_test.go,
+  pkg/api/policies_bulk_reader_test.go, pkg/api/README.md,
+  pkg/grpcapi/README.md, _Log.md
+
+## 2026-07-06 — #4340 allow "/" in address-object names (vSRX prefix-in-name drop-in blocker)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Real vSRX configs name address objects after their prefix
+  (`net_10.0.0.0/8`, `net4_sfmix_72.52.96.201/32`,
+  `net_2001:559:8585:200::/64`) — the near-universal convention. xpf
+  HARD-REJECTED every such name ("address-book entry name … must not
+  contain '/'"), so a mechanical drop-in was impossible (194 objects +
+  every policy reference would need lockstep renaming). DIAGNOSIS: `/`
+  was reserved by `validateAddressBookEntryNamesStrict` (#3061,
+  `compiler_validate_strict.go`) purely to keep the zone-local fold's
+  synthetic `zone-local/<zone>/<name>` internal key collision-proof —
+  NOT because any consumer treats the object NAME as a path. Every
+  resolver (policyMatchNamedAddressRefs, resolveUserspaceAddressBookEntry,
+  classifyPolicyAddresses, the wire snapshot) keys objects by the FULL
+  name via direct map lookups, so a `/`-bearing name resolves end to end
+  unchanged. FIX: narrow the reservation from "any `/`" to the two
+  invariants the synthetic key actually needs — (1) an operator
+  address-book entry name may not BEGIN with the reserved `zone-local/`
+  prefix (collision guard), (2) a security-zone NAME may not contain `/`
+  (it is the `/`-free first segment `ZoneLocalUnqualify` splits on). `/`
+  is now permitted freely elsewhere in an entry name. ZoneLocalUnqualify
+  already splits on the FIRST `/` only, so a `/`-bearing zone-local name
+  round-trips (`zone-local/trust/net_10.0.0.0/8` → zone trust, name
+  net_10.0.0.0/8). RED-on-revert proven: with the old any-`/` reject,
+  `TestAddressBookSlashNameCommits` /
+  `TestAddressBookSlashNameZoneLocalFoldRoundTrips` fail with the exact
+  "must not contain '/'" error; the userspace resolution test passes on
+  both revisions (confirming no consumer depended on the ban). Full
+  pkg/config + pkg/dataplane/userspace + policymatch + grpcapi + api +
+  cli suites, gofmt, vet, go build ./... clean.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_security_addressbook.go, pkg/config/compiler.go,
+  pkg/config/addressbook_name_slash_3061_test.go,
+  pkg/config/addressbook_name_slash_4340_test.go,
+  pkg/dataplane/userspace/addressbook_slash_name_4340_test.go,
+  docs/config-schema.md, _Log.md
 ## 2026-07-06 — #4335: parser prunes an INLINE `inactive:` token (drop-in blocker)
 
 - **Timestamp**: 2026-07-06
@@ -36235,6 +36314,52 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md,
   docs/userspace-dataplane-architecture.md,
   docs/research/3616-ipsec-host-inbound/*.md (materialized + status stamp).
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4094 PR-A — WireGuard responder cookie-reply / MAC2 under-load
+  DoS mitigation (whitepaper §5.4.7). MAC1 keys on the responder's static
+  PUBLIC key and does not bind an initiation to its source, so a valid-MAC1
+  flood (attacker knows our pubkey) forced one Noise handshake per forged
+  datagram — a CPU-exhaustion DoS. Added `wg/cookie.rs` `CookieChecker`: a
+  per-tunnel rotating secret `Rm` (`COOKIE_ROTATION_TIME_NS` 120 s, one-window
+  previous-secret carry), a fixed-window inbound-initiation load gate
+  (`INITIATIONS_UNDER_LOAD_THRESHOLD` 25/window + 1 s sticky grace), MAC2
+  verification (`keyed-BLAKE2s-128(cookie, msg[0..132])`, cookie =
+  `keyed-BLAKE2s-128(Rm, src_ip||src_port)` over the REAL datagram source),
+  and a type-3 CookieReply builder (cookie XChaCha20-Poly1305-sealed under
+  `BLAKE2s-256("cookie--"||our_pub)`, random 24-byte nonce, initiation MAC1 as
+  AAD, budget-capped at `COOKIE_REPLY_BUDGET_PER_WINDOW` 40/window). New
+  `WgEngine::classify_initiation` gates `dispatch_inbound`'s WG_TYPE_INITIATION
+  arm BEFORE the Noise handshake: not-under-load → process (unchanged); under
+  load + valid MAC2 → process; under load + valid MAC1 + no MAC2 → send cookie
+  + drop; bad-MAC1/malformed → cheap consume-path drop with NO reply (no
+  reflection). Added `chacha20poly1305` (0.10, default-features=false) as a
+  direct dep (already transitive via snow; XChaCha is a new primitive vs snow's
+  12-byte-nonce ChaChaPoly). Counters `hs_cookie_replies_sent` /
+  `hs_rx_under_load_no_mac2` / `hs_rx_under_load_mac2_ok` /
+  `hs_cookie_reply_budget_drops` end-to-end (Rust WgCounters → status snapshot →
+  Go WgTunnelStatus → Prometheus `xpf_userspace_wg_cookie_replies_total{event}`
+  + two new `..._rx_drops_total{reason}` rows). Initiator-side CookieReply
+  consume (parse + re-initiate with a real MAC2) is deferred to PR-B; inbound
+  type-3 stays drop-only (`hs_rx_cookie_unsupported`). RED-on-revert:
+  `classify_initiation_under_load_requires_mac2` (verified — reverting the gate
+  makes it Process and the test fails). Validation: FULL `cargo test --release`
+  3687 passed / 0 failed (incl. 8 new tests); `cargo build --release` clean;
+  Go `go build ./pkg/...` + `go test ./pkg/api ./pkg/dataplane/userspace` green.
+- **File(s)**: userspace-dp/Cargo.toml,
+  userspace-dp/src/afxdp/wg/cookie.rs (new),
+  userspace-dp/src/afxdp/wg/mod.rs,
+  userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs,
+  userspace-dp/src/afxdp/wg/counters.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_userspace.go, pkg/api/metrics_wireguard_test.go,
+  docs/wireguard-interop.md, docs/wg-interop-runbook.md
 
 - **Timestamp**: 2026-07-06
 - **Action**: #4107 PR-A — first authenticated cluster control channel + config

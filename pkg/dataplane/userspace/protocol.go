@@ -1696,9 +1696,18 @@ type WgTunnelStatus struct {
 	// that peer. Distinct from the transport DecapDropsReplay window.
 	HsRxDropsReplayedInit uint64 `json:"hs_rx_drops_replayed_init,omitempty"`
 	HsRxCookieUnsupported uint64 `json:"hs_rx_cookie_unsupported,omitempty"`
-	RxUnknownType         uint64 `json:"rx_unknown_type,omitempty"`
-	HsSendErrors          uint64 `json:"hs_send_errors,omitempty"`
-	HsRequestsArmed       uint64 `json:"hs_requests_armed,omitempty"`
+	// #4094 PR-A responder cookie-reply / MAC2 under-load DoS mitigation:
+	// cookie replies emitted, under-load initiations dropped for a
+	// missing/bad MAC2 (challenged instead of handshaked), under-load
+	// initiations that carried a valid MAC2 and proceeded, and cookie
+	// replies suppressed by the per-window emission budget.
+	HsCookieRepliesSent      uint64 `json:"hs_cookie_replies_sent,omitempty"`
+	HsRxUnderLoadNoMac2      uint64 `json:"hs_rx_under_load_no_mac2,omitempty"`
+	HsRxUnderLoadMac2Ok      uint64 `json:"hs_rx_under_load_mac2_ok,omitempty"`
+	HsCookieReplyBudgetDrops uint64 `json:"hs_cookie_reply_budget_drops,omitempty"`
+	RxUnknownType            uint64 `json:"rx_unknown_type,omitempty"`
+	HsSendErrors             uint64 `json:"hs_send_errors,omitempty"`
+	HsRequestsArmed          uint64 `json:"hs_requests_armed,omitempty"`
 
 	DecapPackets              uint64 `json:"decap_packets,omitempty"`
 	DecapBytes                uint64 `json:"decap_bytes,omitempty"`

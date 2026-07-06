@@ -531,17 +531,21 @@ type xpfCollector struct {
 	wgHandshakeInitiationBuildFailuresTotal *prometheus.Desc
 	wgHandshakeRxDropsTotal                 *prometheus.Desc
 	wgHandshakeRequestsArmedTotal           *prometheus.Desc
-	wgTransportPacketsTotal                 *prometheus.Desc
-	wgTransportBytesTotal                   *prometheus.Desc
-	wgKeepalivesReceivedTotal               *prometheus.Desc
-	wgTransportDropsTotal                   *prometheus.Desc
-	wgSendErrorsTotal                       *prometheus.Desc
-	wgSessionConfirmed                      *prometheus.Desc
-	wgLastHandshakeTimeSeconds              *prometheus.Desc
-	wgRekeysInitiatedTotal                  *prometheus.Desc
-	wgKeepalivesSentTotal                   *prometheus.Desc
-	wgSessionsExpiredTotal                  *prometheus.Desc
-	wgHandshakeAttemptsAbortedTotal         *prometheus.Desc
+	// #4094 PR-A responder cookie-reply / MAC2 under-load mechanism
+	// "working" signals: event=sent (cookie challenges emitted),
+	// event=mac2_ok (primed peers that completed a handshake under load).
+	wgCookieRepliesTotal            *prometheus.Desc
+	wgTransportPacketsTotal         *prometheus.Desc
+	wgTransportBytesTotal           *prometheus.Desc
+	wgKeepalivesReceivedTotal       *prometheus.Desc
+	wgTransportDropsTotal           *prometheus.Desc
+	wgSendErrorsTotal               *prometheus.Desc
+	wgSessionConfirmed              *prometheus.Desc
+	wgLastHandshakeTimeSeconds      *prometheus.Desc
+	wgRekeysInitiatedTotal          *prometheus.Desc
+	wgKeepalivesSentTotal           *prometheus.Desc
+	wgSessionsExpiredTotal          *prometheus.Desc
+	wgHandshakeAttemptsAbortedTotal *prometheus.Desc
 
 	// #2464: per-collector NetFlow v9 / IPFIX write-health. A flow-export
 	// collector that goes unreachable used to be invisible (every failed
@@ -828,6 +832,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.wgHandshakeInitiationBuildFailuresTotal
 	ch <- c.wgHandshakeRxDropsTotal
 	ch <- c.wgHandshakeRequestsArmedTotal
+	ch <- c.wgCookieRepliesTotal
 	ch <- c.wgTransportPacketsTotal
 	ch <- c.wgTransportBytesTotal
 	ch <- c.wgKeepalivesReceivedTotal

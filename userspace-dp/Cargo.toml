@@ -45,6 +45,19 @@ getrandom = "0.2"
 # so the WG private key is wiped on engine drop. Cost: zero — just a
 # Drop impl on a 32-byte field.
 zeroize = "1.8"
+# WireGuard cookie-reply / MAC2 under-load DoS mitigation (#4094, PR-A).
+# The type-3 CookieReply encrypts the source-bound cookie with
+# XChaCha20-Poly1305 (24-byte nonce) keyed on
+# BLAKE2s-256("cookie--"||responder_static_pub) with the initiation's
+# MAC1 as AEAD associated data (WG whitepaper §5.4.7). snow uses only
+# the ChaChaPoly (12-byte nonce) transport AEAD, so XChaCha is a NEW
+# primitive the cookie path needs. Already transitive via snow at the
+# exact locked version (cargo tree: chacha20poly1305 0.10.1) — promoting
+# it to a direct dep changes no resolved version, only visibility.
+# `default-features = false` keeps this a subset of what snow already
+# enables: XChaCha20Poly1305 + the in-place AeadInPlace/KeyInit traits
+# are compiled unconditionally, so no extra features are unioned in.
+chacha20poly1305 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 cc = "1.2"
