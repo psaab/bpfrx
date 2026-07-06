@@ -740,6 +740,19 @@ pub(crate) struct WgTunnelStatus {
     pub hs_rx_drops_replayed_init: u64,
     #[serde(rename = "hs_rx_cookie_unsupported", default)]
     pub hs_rx_cookie_unsupported: u64,
+    /// #4094 PR-A responder cookie-reply / MAC2 under-load DoS-mitigation
+    /// accounting: cookie replies emitted, under-load initiations dropped
+    /// for a missing/bad MAC2 (challenged), under-load initiations that
+    /// carried a valid MAC2 and proceeded, and cookie replies suppressed by
+    /// the per-window emission budget.
+    #[serde(rename = "hs_cookie_replies_sent", default)]
+    pub hs_cookie_replies_sent: u64,
+    #[serde(rename = "hs_rx_under_load_no_mac2", default)]
+    pub hs_rx_under_load_no_mac2: u64,
+    #[serde(rename = "hs_rx_under_load_mac2_ok", default)]
+    pub hs_rx_under_load_mac2_ok: u64,
+    #[serde(rename = "hs_cookie_reply_budget_drops", default)]
+    pub hs_cookie_reply_budget_drops: u64,
     #[serde(rename = "rx_unknown_type", default)]
     pub rx_unknown_type: u64,
     #[serde(rename = "hs_send_errors", default)]

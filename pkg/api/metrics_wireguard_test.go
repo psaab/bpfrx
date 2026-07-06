@@ -27,6 +27,8 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			"xpf_userspace_wg_handshake_initiation_build_failures_total", "t", []string{"tunnel"}, nil),
 		wgHandshakeRxDropsTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_rx_drops_total", "t", []string{"tunnel", "reason"}, nil),
+		wgCookieRepliesTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_cookie_replies_total", "t", []string{"tunnel", "event"}, nil),
 		wgHandshakeRequestsArmedTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_requests_armed_total", "t", []string{"tunnel"}, nil),
 		wgTransportPacketsTotal: prometheus.NewDesc(
@@ -72,6 +74,11 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			HsRxDropsIndexExhausted:   10,
 			HsRxDropsReplayedInit:     45,
 			HsRxCookieUnsupported:     11,
+			// #4094 PR-A responder cookie mechanism (46.. continuing).
+			HsCookieRepliesSent:       46,
+			HsRxUnderLoadNoMac2:       47,
+			HsRxUnderLoadMac2Ok:       48,
+			HsCookieReplyBudgetDrops:  49,
 			RxUnknownType:             12,
 			HsSendErrors:              13,
 			HsRequestsArmed:           14,
@@ -154,6 +161,10 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=index_exhausted,tunnel=wg0":               10,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=replayed_init,tunnel=wg0":                 45,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=cookie_unsupported,tunnel=wg0":            11,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=under_load_no_mac2,tunnel=wg0":            47,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=cookie_reply_budget,tunnel=wg0":           49,
+		"xpf_userspace_wg_cookie_replies_total,event=sent,tunnel=wg0":                               46,
+		"xpf_userspace_wg_cookie_replies_total,event=mac2_ok,tunnel=wg0":                            48,
 		"xpf_userspace_wg_handshake_rx_drops_total,reason=unknown_type,tunnel=wg0":                  12,
 		"xpf_userspace_wg_transport_packets_total,direction=encap,tunnel=wg0":                       26,
 		"xpf_userspace_wg_transport_packets_total,direction=decap,tunnel=wg0":                       15,
@@ -228,6 +239,8 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 			"xpf_userspace_wg_handshake_initiation_build_failures_total", "t", []string{"tunnel"}, nil),
 		wgHandshakeRxDropsTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_rx_drops_total", "t", []string{"tunnel", "reason"}, nil),
+		wgCookieRepliesTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_cookie_replies_total", "t", []string{"tunnel", "event"}, nil),
 		wgHandshakeRequestsArmedTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_requests_armed_total", "t", []string{"tunnel"}, nil),
 		wgTransportPacketsTotal: prometheus.NewDesc(
@@ -276,9 +289,11 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 	// #4092) + 2 pkts + 2 bytes + 1 keepalive + 15 drop reasons (incl.
 	// 2x expired, #1888) + 4 send kinds + 1 confirmed (per-peer, #1434;
 	// one peer here) + 3 rekey reasons + 2 keepalive-sent kinds +
-	// 1 sessions-expired + 1 attempts-aborted = 46.
-	if count != 46 {
-		t.Errorf("emitted %d series for a zeroed tunnel, want 46 (zeros are real signals)", count)
+	// 1 sessions-expired + 1 attempts-aborted; +2 hs reasons #4094
+	// (under_load_no_mac2 + cookie_reply_budget) + 2 cookie-reply events
+	// #4094 (sent + mac2_ok) = 50.
+	if count != 50 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 50 (zeros are real signals)", count)
 	}
 }
 

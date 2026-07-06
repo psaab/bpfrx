@@ -1751,8 +1751,13 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		wgHandshakeRxDropsTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_rx_drops_total",
-			"Inbound WireGuard handshake-path datagrams dropped, by reason (mac1_mismatch | malformed | crypto | unknown_peer | stale_response | index_exhausted | cookie_unsupported | unknown_type). mac1_mismatch is the wrong-key-peer signature (#1865).",
+			"Inbound WireGuard handshake-path datagrams dropped, by reason (mac1_mismatch | malformed | crypto | unknown_peer | stale_response | index_exhausted | cookie_unsupported | under_load_no_mac2 | cookie_reply_budget | unknown_type). mac1_mismatch is the wrong-key-peer signature; under_load_no_mac2 is the #4094 responder under-load DoS mitigation refusing a forged/unprimed initiation and issuing a cookie challenge; cookie_reply_budget is that same path when the per-window cookie-reply budget clamps (#1865, #4094).",
 			[]string{"tunnel", "reason"}, nil,
+		),
+		wgCookieRepliesTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_cookie_replies_total",
+			"WireGuard responder cookie mechanism (#4094 PR-A) by event: sent = type-3 CookieReply challenges emitted under load to valid-MAC1 initiations lacking a valid MAC2; mac2_ok = under-load initiations that carried a valid MAC2 (a primed peer) and were allowed through to the Noise handshake.",
+			[]string{"tunnel", "event"}, nil,
 		),
 		wgHandshakeRequestsArmedTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_requests_armed_total",
