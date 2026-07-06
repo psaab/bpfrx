@@ -37038,3 +37038,32 @@ top.
   pkg/config/compiler_validate_warn.go,
   pkg/config/parser_class_of_service_test.go,
   docs/cos-traffic-shaping.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+  **Action**: #3995 review follow-up (PR #4366 Copilot findings). FIX 1
+  (real): an unrecognized CoS loss-priority value (operator typo like
+  `medum-low`) was threaded raw to the dataplane and silently mapped to
+  the SAFE default (LOW for the classifier, wildcard for the rewrite) —
+  wrong QoS, silently. Added a commit-time validator
+  `validateClassOfServiceLossPriorityStrict` (pkg/config/
+  compiler_validate_strict.go) covering all three loss-priority read
+  sites (dscp classifier, ieee-802.1 classifier, dscp rewrite-rule),
+  sorted-deterministic, rejecting a non-empty value not in
+  {low, medium-low, medium-high, high} and naming the rule/class + bad
+  value + valid set. Wired lenient-gated at the strict phase
+  (compiler.go) via a new `lenientCoSLossPriority` option (reject on
+  commit/commit-check; warn on tolerant load / peer-sync so an already-
+  persisted or peer-synced config still boots, #1960 no-brick). Empty
+  loss-priority is skipped (the legitimate wildcard/default placeholder).
+  Test `TestCoSLossPriorityTypoRejectedStrict` (rewrite-rule + dscp-
+  classifier subcases): strict rejects `medum-low` naming the valid set,
+  lenient warns + still compiles, `medium-low` accepted on both paths.
+  FIX 2 (doc): corrected the `CoSState::lp_rewrite` doc comment — it is
+  present for every interface passing the useful-CoS gate (empty tables
+  when no classifier/rewrite-rule), not absent. Merged origin/master
+  (#4313/#3627 etc). go test ./pkg/config/... green; cargo build
+  --release clean (doc-only Rust touch). gofmt clean.
+  **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/parser_class_of_service_test.go,
+  userspace-dp/src/afxdp/types/cos.rs, _Log.md

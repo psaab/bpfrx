@@ -20,9 +20,13 @@ pub(in crate::afxdp) struct CoSState {
     pub(in crate::afxdp) ieee8021_classifiers: FastMap<String, CoSIEEE8021ClassifierConfig>,
     pub(in crate::afxdp) dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
     /// #3995: per-egress-interface loss-priority classification + rewrite
-    /// tables, keyed by ifindex. Absent for interfaces with no CoS classifier /
-    /// rewrite-rule. Resolved at TX classification to key the DSCP rewrite on
-    /// `(forwarding-class, loss-priority)` instead of forwarding-class alone.
+    /// tables, keyed by ifindex. `build_cos_state` inserts one entry for every
+    /// interface that passes the useful-CoS gate (`build_cos_iface_config`), so
+    /// it is present for the SAME interface set as `interfaces`; the tables are
+    /// empty (no loss-priority classification, no rewrite entries) when the
+    /// interface has no classifier / rewrite-rule. Resolved at TX
+    /// classification to key the DSCP rewrite on `(forwarding-class,
+    /// loss-priority)` instead of forwarding-class alone.
     pub(in crate::afxdp) lp_rewrite: FastMap<i32, CoSLossPriorityRewrite>,
 }
 
