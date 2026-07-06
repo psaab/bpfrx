@@ -1072,9 +1072,16 @@ fn classify_initiation_under_load_requires_mac2() {
         "under threshold, a normal initiation must proceed with no cookie"
     );
 
-    // Drive the arrival rate past the threshold within the same 1 s window.
-    for _ in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
-        engine.classify_initiation(&init, from, &mut out, now);
+    // Drive the arrival rate past the threshold within the same 1 s window,
+    // each arrival from a DISTINCT source so the #4332 per-source reply bucket
+    // is not the limiting factor here — this test isolates the MAC2 requirement
+    // (a single source's own budget is covered by the cookie.rs unit tests and
+    // `classify_initiation_per_source_budget_isolation`). `from` itself is not
+    // used in the flood, so its per-source bucket stays full for the assertions
+    // below.
+    for i in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
+        let s: SocketAddr = format!("192.0.2.{}:51820", (i % 250) + 1).parse().unwrap();
+        engine.classify_initiation(&init, s, &mut out, now);
     }
 
     // Under load, an initiation with NO valid MAC2 is cookie-challenged and
@@ -1125,6 +1132,48 @@ fn classify_initiation_under_load_requires_mac2() {
         "the primed initiation counted as an under-load MAC2 pass"
     );
     assert!(c.hs_rx_under_load_no_mac2.load(Ordering::Relaxed) >= 2);
+}
+
+/// #4332 RED-on-revert: the cookie-reply budget is isolated PER SOURCE, so a
+/// valid-MAC1 flood from ONE source cannot drain the GLOBAL per-window budget
+/// away from a legit peer at a DIFFERENT source. Source A floods far past
+/// `COOKIE_REPLY_BUDGET_PER_WINDOW`; without the per-source layer A would
+/// consume every global cookie-reply slot and B's FIRST challenge would be
+/// budget-suppressed (Drop). With the per-source bucket A is throttled after
+/// its own burst — consuming only a handful of the global slots — so B still
+/// gets its cookie challenge. Reverting the `source_reply_allowed` gate in
+/// `classify_initiation` makes B's assertion fail (the shared budget is drained
+/// by A's flood).
+#[test]
+fn classify_initiation_per_source_budget_isolation() {
+    use crate::afxdp::wg::cookie::{COOKIE_REPLY_BUDGET_PER_WINDOW, INITIATIONS_UNDER_LOAD_THRESHOLD};
+    use std::net::SocketAddr;
+
+    let (engine, _our_pub, init) = under_load_fixture();
+    let now = 10_000_000_000u64; // frozen: A's bucket never refills mid-flood
+    engine.set_mock_now_ns(now);
+    let mut out = [0u8; 256];
+
+    let flood: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+    let legit: SocketAddr = "198.51.100.7:51820".parse().unwrap();
+
+    // Trip under-load, then flood source A well past the GLOBAL budget. The
+    // first INITIATIONS_UNDER_LOAD_THRESHOLD arrivals just build load (Process);
+    // the remainder are valid-MAC1 / no-MAC2 under-load challenges. On revert
+    // these would consume every one of COOKIE_REPLY_BUDGET_PER_WINDOW slots.
+    let shots = INITIATIONS_UNDER_LOAD_THRESHOLD + COOKIE_REPLY_BUDGET_PER_WINDOW + 20;
+    for _ in 0..shots {
+        engine.classify_initiation(&init, flood, &mut out, now);
+    }
+
+    // A legit peer at a DIFFERENT source is still challenged — its first cookie
+    // is NOT starved by A's flood (the #4332 per-source isolation).
+    let action = engine.classify_initiation(&init, legit, &mut out, now);
+    assert!(
+        matches!(action, InitiationAction::SendCookie(_)),
+        "a legit source must still be cookie-challenged despite a flood from \
+         another source (per-source budget isolation), got {action:?}"
+    );
 }
 
 /// A bad-MAC1 initiation under load is NOT reflected: it returns `Process`

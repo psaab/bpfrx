@@ -167,6 +167,78 @@ func TestH10MACLenientWarns(t *testing.T) {
 	), "#2008 H10")
 }
 
+// --- #2354: QinQ / stacked-VLAN inner tag (inner-vlan-id) ---
+
+func TestQinQInnerVlanIDFlatRejected(t *testing.T) {
+	// Non-tautological baseline: the SAME unit with single-tag
+	// flexible-vlan-tagging + vlan-id (no inner tag) compiles clean.
+	assertCommitAccepts(t, flatTreeFromSets(t,
+		"set interfaces ge-0/0/0 flexible-vlan-tagging",
+		"set interfaces ge-0/0/0 unit 0 vlan-id 100",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+	))
+	// Adding inner-vlan-id (QinQ) hard-rejects at commit.
+	assertCommitRejects(t, flatTreeFromSets(t,
+		"set interfaces ge-0/0/0 flexible-vlan-tagging",
+		"set interfaces ge-0/0/0 unit 0 vlan-id 100",
+		"set interfaces ge-0/0/0 unit 0 inner-vlan-id 200",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+	), "#2354")
+}
+
+func TestQinQInnerVlanIDHierarchicalRejected(t *testing.T) {
+	assertCommitRejects(t, hierTree(t, `interfaces {
+    ge-0/0/0 {
+        flexible-vlan-tagging;
+        unit 0 {
+            vlan-id 100;
+            inner-vlan-id 200;
+            family inet {
+                address 10.0.1.1/24;
+            }
+        }
+    }
+}`), "#2354")
+}
+
+func TestQinQInnerVlanIDLenientWarns(t *testing.T) {
+	assertLenientWarns(t, flatTreeFromSets(t,
+		"set interfaces ge-0/0/0 unit 0 inner-vlan-id 200",
+	), "#2354")
+}
+
+// TestQinQGateDoesNotMatchSingleTag is the load-bearing negative: a
+// single 802.1Q unit — flexible-vlan-tagging + vlan-id but NO
+// inner-vlan-id — is CORRECT (#2346) and must stay accepted with no
+// #2354 warning. The gate keys on inner-vlan-id, not flexible-vlan-
+// tagging, so single-tag transit is never falsely rejected.
+func TestQinQGateDoesNotMatchSingleTag(t *testing.T) {
+	cfg := assertCommitAccepts(t, flatTreeFromSets(t,
+		"set interfaces ge-0/0/0 flexible-vlan-tagging",
+		"set interfaces ge-0/0/0 unit 0 vlan-id 100",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+	))
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#2354") {
+			t.Fatalf("single-tag flexible-vlan-tagging must not trip #2354, got %q", w)
+		}
+	}
+	// Also assert the lenient path stays quiet for single-tag config.
+	lenient, err := CompileConfigLenient(flatTreeFromSets(t,
+		"set interfaces ge-0/0/0 flexible-vlan-tagging",
+		"set interfaces ge-0/0/0 unit 0 vlan-id 100",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+	))
+	if err != nil {
+		t.Fatalf("lenient single-tag compile failed: %v", err)
+	}
+	for _, w := range lenient.Warnings {
+		if strings.Contains(w, "#2354") {
+			t.Fatalf("single-tag flexible-vlan-tagging must not warn #2354 on lenient path, got %q", w)
+		}
+	}
+}
+
 // --- #2008 H1 inactive: deactivated stanza must NOT be rejected ---
 
 func TestH9H10InactiveStanzaCompilesClean(t *testing.T) {

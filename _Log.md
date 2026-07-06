@@ -61,6 +61,99 @@
   `pkg/cluster/manager.go`, `docs/architecture.md`,
   `pkg/cluster/README.md`, `_Log.md`
 
+## 2026-07-06 — #4332: WireGuard per-SOURCE cookie-reply token bucket
+
+- **Timestamp**: 2026-07-06
+- **Action**: Followed up #4094/#4330. The responder cookie-reply budget
+  (`COOKIE_REPLY_BUDGET_PER_WINDOW`, 40) is GLOBAL per tunnel, so a determined
+  valid-MAC1 flood from ONE source could drain the shared budget and
+  budget-suppress a legit peer's first cookie challenge from a DIFFERENT source.
+  Added a per-SOURCE token bucket (`CookieChecker::source_reply_allowed`,
+  mirroring wireguard-go `device/ratelimiter.go`): `SOURCE_REPLIES_PER_SEC` 20/s
+  sustained, `SOURCE_REPLY_BURST` 5 burst, `PACKET_COST_NS`/`MAX_TOKENS_NS`
+  accrued-time credit. Layered BEFORE the global budget in
+  `classify_initiation` (both gates must pass), so a flood from one source
+  throttles only its own bucket. The `HashMap<IpAddr, SourceBucket>` table is
+  GC-swept every `SOURCE_GC_INTERVAL_NS` (1 s; idle buckets dropped) and
+  hard-capped at `SOURCE_TABLE_MAX` (2048): a NEW source over the cap is DENIED
+  (fail closed, no reply), never inserted — bounding the map against the
+  spoofed-source-IP amplification vector this hardening could otherwise
+  introduce. Refill obeys the #4330/#4321 monotonic-clock discipline: a
+  backwards `now_ns` credits nothing (`saturating_sub`) and never lowers the
+  bucket's `last_ns` high-water mark (`.max(now_ns)`). Per-source throttle drops
+  and the full-table fail-closed are counted under the existing
+  `hs_cookie_reply_budget_drops` family (no new control-protocol field). Tests:
+  engine-level `classify_initiation_per_source_budget_isolation` (RED on revert —
+  A's flood drains the global budget from B) plus cookie.rs unit tests for burst,
+  isolation, table-cap fail-closed, GC reclaim, and the backwards-clock guard.
+- **File(s)**: userspace-dp/src/afxdp/wg/cookie.rs (constants, `SourceBucket`/
+  `SourceTable`, `CookieChecker.per_source`, `source_reply_allowed`, test hooks +
+  5 unit tests), userspace-dp/src/afxdp/wg/engine.rs (`classify_initiation`
+  per-source gate), userspace-dp/src/afxdp/wg/engine_tests.rs (isolation test),
+  userspace-dp/src/afxdp/wg/counters.rs + userspace-dp/src/protocol/control.rs
+  (counter doc), docs/wireguard-interop.md.
+## 2026-07-06 — #4313 PR-B: first production closed-world subtree flip (destination-NAT then)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Flipped `closedWorld: true` on the destination-NAT rule
+  then-action container (`security nat destination rule-set <rs> rule <r>
+  then`), the FIRST production subtree to opt in to the #4334 (#4313 PR-A)
+  closed-world mechanism. Leaf-completeness verified first: the Junos DNAT
+  then-action is exactly `destination-nat { off | pool <name> }` — every
+  keyword at every level below `then` is modeled and the compiler
+  (`compileNATDestination`) reads only these, so closing carries no
+  false-reject risk. An unmodeled keyword (typo like `poool`, or garbage)
+  is now REJECTED at strict commit (`SchemaValidate`) instead of committing
+  clean and being silently dropped; the tolerant Load/SyncApply path
+  downgrades to a warning (#1960), so stored/peer-synced configs are not
+  bricked. The sibling SOURCE-NAT then was deliberately NOT flipped: Junos
+  permits `then source-nat pool <name> persistent-nat { … }` at the rule
+  level (xpf models persistent-nat per-pool), so closing it would
+  false-reject a valid Junos config (#4191 class) — deferred as a follow-up.
+- **File(s)**: `pkg/config/schema_security.go` (flip + deferral comment on
+  source-NAT then), `pkg/config/schema_closedworld_nat_then_4313_test.go`
+  (new — RED-on-revert reject tests + valid-keyword + source-NAT-still-open
+  guard), `docs/config-schema.md` (#4313 section: first production flip +
+  remaining subtrees).
+- **Validation**: `go test ./pkg/config/...` and `./pkg/configstore/...`
+  green; RED-on-revert confirmed (reject tests FAIL without the flag);
+  `go build ./...`, `gofmt -l`, `go vet ./pkg/config/` clean.
+
+## 2026-07-06 — #2354: QinQ inner-vlan-id honest-posture gate
+
+- **Timestamp**: 2026-07-06
+- **Action**: Added the #2354 honest-posture reject gate for QinQ /
+  stacked-VLAN inner tags, extending the #2008 H9/H10 doctrine in
+  `validateUnsupportedInterfaceStanzasAST`. `interfaces <if> unit <n>
+  inner-vlan-id <x>` is PARSED into `Unit.InnerVlanID` but has ZERO
+  dataplane consumers: the AF_XDP shim's parse_l2 unwinds exactly ONE
+  VLAN tag, so a double-tagged frame keeps eth_proto=0x8100 → dispatch
+  `_` arm → `pass_non_ip_l2_direct` = XDP_PASS to the kernel, never
+  firewalled. A committed inner-vlan-id is therefore a false promise of
+  firewalled stacked-VLAN transit. The gate HARD-REJECTS it at commit /
+  commit-check (lenient=false), naming the interface/unit path, and
+  WARNS (does not fail, does not prune — it is a no-op) on the tolerant
+  load / peer-sync path (#1960 fail-closed-on-load class). Keyed strictly
+  on `inner-vlan-id`: single 802.1Q / 802.1ad tagging via `vlan-id` and
+  `flexible-vlan-tagging` WITHOUT an inner tag stay ACCEPTED (correct per
+  #2346 — Junos-parity single-tag transit). This resolves the
+  honest-posture half of #2354; the multi-layer QinQ feature build
+  (two-tag parse/deliver/serialize + networkd stacked netdev + inner-tag
+  zone binding) stays plan-deferred pending operator demand (4-PR
+  decomposition recorded in the issue).
+- **File(s)**: pkg/config/compiler_interfaces_unsupported.go (gate +
+  doc), pkg/config/compiler_interfaces_unsupported_test.go (strict-reject
+  flat+hier, lenient-warn, single-tag negative), pkg/config/schema_interfaces.go
+  (inner-vlan-id leaf desc: honest signal at `?`-completion),
+  pkg/config/parser_services_test.go (two flexible-vlan-tagging tests
+  switched to CompileConfigLenient — strict path now rejects inner-vlan-id),
+  docs/feature-gaps.md (QinQ entry: honest-posture gate documented).
+- **Validation**: `go test ./pkg/config/...` green; RED-on-revert confirmed
+  (removing the gate → the three reject/warn tests fail: strict compile
+  accepts inner-vlan-id with nil error, lenient emits no warning); single-tag
+  negative passes with and without the gate; `go build ./...`, `go vet
+  ./pkg/config/`, gofmt on modified files all clean.
+
 ## 2026-07-06 — #4348: gate the `inactive:` marker on TokenIdentifier not TokenString
 
 - **Timestamp**: 2026-07-06
