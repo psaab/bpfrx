@@ -36061,3 +36061,49 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md,
   docs/userspace-dataplane-architecture.md,
   docs/research/3616-ipsec-host-inbound/*.md (materialized + status stamp).
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4094 PR-A — WireGuard responder cookie-reply / MAC2 under-load
+  DoS mitigation (whitepaper §5.4.7). MAC1 keys on the responder's static
+  PUBLIC key and does not bind an initiation to its source, so a valid-MAC1
+  flood (attacker knows our pubkey) forced one Noise handshake per forged
+  datagram — a CPU-exhaustion DoS. Added `wg/cookie.rs` `CookieChecker`: a
+  per-tunnel rotating secret `Rm` (`COOKIE_ROTATION_TIME_NS` 120 s, one-window
+  previous-secret carry), a fixed-window inbound-initiation load gate
+  (`INITIATIONS_UNDER_LOAD_THRESHOLD` 25/window + 1 s sticky grace), MAC2
+  verification (`keyed-BLAKE2s-128(cookie, msg[0..132])`, cookie =
+  `keyed-BLAKE2s-128(Rm, src_ip||src_port)` over the REAL datagram source),
+  and a type-3 CookieReply builder (cookie XChaCha20-Poly1305-sealed under
+  `BLAKE2s-256("cookie--"||our_pub)`, random 24-byte nonce, initiation MAC1 as
+  AAD, budget-capped at `COOKIE_REPLY_BUDGET_PER_WINDOW` 40/window). New
+  `WgEngine::classify_initiation` gates `dispatch_inbound`'s WG_TYPE_INITIATION
+  arm BEFORE the Noise handshake: not-under-load → process (unchanged); under
+  load + valid MAC2 → process; under load + valid MAC1 + no MAC2 → send cookie
+  + drop; bad-MAC1/malformed → cheap consume-path drop with NO reply (no
+  reflection). Added `chacha20poly1305` (0.10, default-features=false) as a
+  direct dep (already transitive via snow; XChaCha is a new primitive vs snow's
+  12-byte-nonce ChaChaPoly). Counters `hs_cookie_replies_sent` /
+  `hs_rx_under_load_no_mac2` / `hs_rx_under_load_mac2_ok` /
+  `hs_cookie_reply_budget_drops` end-to-end (Rust WgCounters → status snapshot →
+  Go WgTunnelStatus → Prometheus `xpf_userspace_wg_cookie_replies_total{event}`
+  + two new `..._rx_drops_total{reason}` rows). Initiator-side CookieReply
+  consume (parse + re-initiate with a real MAC2) is deferred to PR-B; inbound
+  type-3 stays drop-only (`hs_rx_cookie_unsupported`). RED-on-revert:
+  `classify_initiation_under_load_requires_mac2` (verified — reverting the gate
+  makes it Process and the test fails). Validation: FULL `cargo test --release`
+  3687 passed / 0 failed (incl. 8 new tests); `cargo build --release` clean;
+  Go `go build ./pkg/...` + `go test ./pkg/api ./pkg/dataplane/userspace` green.
+- **File(s)**: userspace-dp/Cargo.toml,
+  userspace-dp/src/afxdp/wg/cookie.rs (new),
+  userspace-dp/src/afxdp/wg/mod.rs,
+  userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs,
+  userspace-dp/src/afxdp/wg/counters.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_userspace.go, pkg/api/metrics_wireguard_test.go,
+  docs/wireguard-interop.md, docs/wg-interop-runbook.md
