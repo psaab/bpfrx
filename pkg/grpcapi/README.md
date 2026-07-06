@@ -153,6 +153,30 @@ contract.
   positive match, and both scheduler fields are omitted for a non-scheduled
   policy. The REST `MatchPoliciesResult` carries the same
   `description`/`scheduler_name`/`scheduler_active` JSON fields.
+- #3627 B1a: a `to-zone junos-host` query also carries the structured
+  `host_inbound` message (proto field 21, `HostInboundAdmission`) — WHICH
+  host-inbound-traffic system-service / protocol token admits the host-bound
+  tuple, or that the box denies / globally accepts / cannot classify it. It is
+  populated from the shared `policymatch.Result.HostInbound`
+  (`dataplane/userspace.HostInboundAdmission`), the SAME classifier the local
+  CLI `show security match-policies` host-inbound line renders (the merged
+  #4352) and the REST `host_inbound` JSON object carries, so the three surfaces
+  cannot drift (#3375). Fields: `status`
+  (`HOST_INBOUND_ADMISSION_STATUS_{TOKEN_ADMIT,GLOBAL_ACCEPT,DENIED,INDETERMINATE}`;
+  the `NOT_COMPUTED` zero value is rendered as an omitted message), `token` and
+  `kind` (`system-services` / `protocols`, set only for `TOKEN_ADMIT`), and
+  `description` (the one-line CLI explanation so a client renders the same
+  sentence without re-deriving it). `hostInboundStatusToProto` maps the Go
+  classifier enum to the proto enum explicitly, so a future reordering of either
+  fails to compile rather than mislabel a verdict. The classifier reads the same
+  structured token->tuple SSOT the kernel-nft builder renders from
+  (`config.HostInboundServiceMatch` / `HostInboundProtocolMatch`), so a reported
+  token can never claim a port the box does not open. Present ONLY for a
+  host-bound query — on both the `host_inbound_unmatched` verdict and a matched
+  `to-zone junos-host` policy (the host-inbound gate is a separate admission
+  stage); OMITTED for every transit / global / default / content-rejected
+  verdict. It is additional context and never changes `matched` /
+  `host_inbound_unmatched`.
 - #3685 M04: the gRPC-text `test policy` renderer (`server_show_firewall.go`,
   the remote `cli` backend) prints the policy ID, the global match scope, and
   the description for a GLOBAL match, mirroring `show security match-policies`.
