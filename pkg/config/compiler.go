@@ -4179,15 +4179,13 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, vaWarnings...)
 
-	// #2227 MAJOR-1: port-scan / ip-sweep threshold clamp warning. The AF_XDP
-	// dataplane bounds its per-(zone,source) unique-destination set at
-	// MAX_UNIQUE_PER_SOURCE and clamps the effective detection threshold to
-	// maxScanSweepThreshold (= MAX_UNIQUE_PER_SOURCE - 1) so an over-cap
-	// threshold detects at the cap (fail-closed) instead of never (the
-	// pre-fix silent fail-OPEN). A configured threshold above the maximum is
-	// preserved unchanged but warned about here — clamp-warn, never reject, so
-	// existing/peer-synced configs keep booting on both compile paths.
-	cfg.Warnings = append(cfg.Warnings, validateScreenScanSweepThresholds(cfg)...)
+	// #4114: port-scan / ip-sweep detection-window advisory. The `threshold`
+	// is a Junos MICROSECOND detection WINDOW (the detection count is a fixed
+	// constant); a value outside the Junos [1000, 1000000] us range is
+	// preserved unchanged but advised here — never rejected, so existing /
+	// peer-synced configs (including pre-#4114 count-shaped values) keep
+	// booting on both compile paths. This is the count->window migration net.
+	cfg.Warnings = append(cfg.Warnings, validateScreenScanSweepWindows(cfg)...)
 
 	// #3315: SYN-flood sub-threshold advisories. `timeout` parses but is not yet
 	// enforced (maps to the half-open session window, a tracked follow-up) and an

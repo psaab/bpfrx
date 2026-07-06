@@ -7,19 +7,21 @@ import (
 	"strconv"
 )
 
-// maxScanSweepThreshold is the largest port-scan / ip-sweep threshold the
-// AF_XDP dataplane can actually enforce. The dataplane tracks at most
-// MAX_UNIQUE_PER_SOURCE (1024) unique destinations/ports per (zone, source)
-// within the detection window and bounds memory at that cap, so the effective
-// comparison threshold is clamped to MAX_UNIQUE_PER_SOURCE - 1 (fail-closed:
-// a saturated set always crosses it — see
-// userspace-dp/src/screen/scan.rs `check_unique`). A configured threshold
-// above this value is preserved unchanged in the typed config but is clamped
-// to this maximum at runtime; we warn the operator at commit time.
+// #4114: the port-scan / ip-sweep `threshold` is a Junos MICROSECOND
+// detection WINDOW (not a distinct-destination count). The detection COUNT is
+// a fixed constant (scanSweepDetectCount, 10). Junos accepts a window in the
+// range [1000, 1000000] us (default 5000). xpf preserves any operator value
+// (no clamp — a window is a time, not a bounded count) and emits a commit-time
+// ADVISORY when the value falls outside the Junos range so a count-shaped
+// legacy value (e.g. a pre-#4114 `threshold 10`) is flagged for re-check.
 //
-// MUST stay in sync with the Rust constant MAX_UNIQUE_PER_SOURCE in
-// userspace-dp/src/screen/scan.rs (= maxScanSweepThreshold + 1).
-const maxScanSweepThreshold = 1023
+// scanSweepDetectCount MUST stay in sync with the Rust SCAN_DETECT_COUNT in
+// userspace-dp/src/screen/scan.rs.
+const (
+	minScanSweepWindowMicros = 1_000
+	maxScanSweepWindowMicros = 1_000_000
+	scanSweepDetectCount     = 10
+)
 
 // defaultSynFloodAttackThreshold is the Junos SRX default attack-threshold
 // (SYN segments per second) applied when a syn-flood screen is enabled
@@ -44,17 +46,15 @@ const (
 	defaultUDPFloodThreshold = 1000
 
 	// defaultPortScanThreshold / defaultIPSweepThreshold supply a default for
-	// `tcp port-scan` / `ip ip-sweep` when enabled without a threshold. Junos
-	// flags a port scan / address sweep when one source reaches 10 distinct
-	// destination ports / addresses within a 5000-microsecond window. This
-	// engine interprets the threshold as a DISTINCT-DESTINATION COUNT over a
-	// fixed 10-second window (WINDOW_SECS in scan.rs, `len() > threshold`), so
-	// the default uses Junos's distinct-destination detection count (10), NOT
-	// its 5000-microsecond time-window value — feeding 5000 here would be read
-	// as a count and clamped to the dataplane cap (1023), effectively never
-	// firing.
-	defaultPortScanThreshold = 10
-	defaultIPSweepThreshold  = 10
+	// `tcp port-scan` / `ip ip-sweep` when enabled without a threshold. #4114:
+	// the `threshold` is the Junos detection WINDOW in MICROSECONDS (the
+	// detection COUNT is the fixed scanSweepDetectCount = 10). Junos flags a
+	// port scan / address sweep when one source reaches 10 distinct
+	// destination ports / addresses within this window; its default window is
+	// 5000 us. The dataplane resets its per-source distinct-destination set
+	// each window and fires at the fixed count (SCAN_DETECT_COUNT in scan.rs).
+	defaultPortScanThreshold = 5000
+	defaultIPSweepThreshold  = 5000
 )
 
 // synFloodSrcAttackRatioAdvisoryThreshold is the attack-threshold /
@@ -108,16 +108,17 @@ func validateScreenSynFloodSubThresholds(cfg *Config) []string {
 	return warnings
 }
 
-// validateScreenScanSweepThresholds emits a WARNING (never a hard reject) for
-// any screen profile whose port-scan or ip-sweep threshold exceeds
-// maxScanSweepThreshold. The dataplane clamps the effective threshold to that
-// maximum (fail-closed), so a larger configured value detects AT THE CAP
-// rather than as configured. We preserve the operator's configured value (no
-// mutation, no rejection — existing configs keep booting) and tell them it is
-// clamped. Clamp-warn applies on BOTH the strict and lenient compile paths:
-// the value is valid and parseable, it just exceeds what the dataplane can
-// enforce.
-func validateScreenScanSweepThresholds(cfg *Config) []string {
+// validateScreenScanSweepWindows emits a WARNING (never a hard reject) for any
+// screen profile whose port-scan or ip-sweep `threshold` — a Junos MICROSECOND
+// detection WINDOW (#4114) — falls outside the Junos range
+// [minScanSweepWindowMicros, maxScanSweepWindowMicros]. We preserve the
+// operator's configured value (no mutation, no rejection — existing configs
+// keep booting on BOTH the strict and lenient compile paths) and advise a
+// re-check. This is the migration safety net for the pre-#4114 count->window
+// semantic flip: a small count-shaped legacy value (e.g. `threshold 10`) now
+// reads as a 10 us window (an extremely tight, near-never-firing window), so
+// the advisory tells the operator their old count is now a time.
+func validateScreenScanSweepWindows(cfg *Config) []string {
 	var warnings []string
 	// Deterministic order so the warning set is stable across runs.
 	names := make([]string, 0, len(cfg.Security.Screen))
@@ -125,24 +126,28 @@ func validateScreenScanSweepThresholds(cfg *Config) []string {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	warnWindow := func(name, path string, val int) string {
+		return fmt.Sprintf(
+			"security screen ids-option %s %s %d is outside the Junos detection-window "+
+				"range [%d, %d] microseconds; #4114 reads this value as a MICROSECOND "+
+				"time window (detection count is a fixed %d), not a count — a small "+
+				"count-shaped value now arms an extremely tight window. Re-check the "+
+				"intended window.",
+			name, path, val, minScanSweepWindowMicros, maxScanSweepWindowMicros, scanSweepDetectCount)
+	}
+	outOfRange := func(v int) bool {
+		return v > 0 && (v < minScanSweepWindowMicros || v > maxScanSweepWindowMicros)
+	}
 	for _, name := range names {
 		sp := cfg.Security.Screen[name]
 		if sp == nil {
 			continue
 		}
-		if sp.TCP.PortScanThreshold > maxScanSweepThreshold {
-			warnings = append(warnings, fmt.Sprintf(
-				"security screen ids-option %s tcp port-scan threshold %d exceeds the "+
-					"dataplane maximum (%d) and will be clamped to %d at runtime "+
-					"(detection fires at the cap, not at the configured value)",
-				name, sp.TCP.PortScanThreshold, maxScanSweepThreshold, maxScanSweepThreshold))
+		if outOfRange(sp.TCP.PortScanThreshold) {
+			warnings = append(warnings, warnWindow(name, "tcp port-scan threshold", sp.TCP.PortScanThreshold))
 		}
-		if sp.IP.IPSweepThreshold > maxScanSweepThreshold {
-			warnings = append(warnings, fmt.Sprintf(
-				"security screen ids-option %s ip ip-sweep threshold %d exceeds the "+
-					"dataplane maximum (%d) and will be clamped to %d at runtime "+
-					"(detection fires at the cap, not at the configured value)",
-				name, sp.IP.IPSweepThreshold, maxScanSweepThreshold, maxScanSweepThreshold))
+		if outOfRange(sp.IP.IPSweepThreshold) {
+			warnings = append(warnings, warnWindow(name, "ip ip-sweep threshold", sp.IP.IPSweepThreshold))
 		}
 	}
 	return warnings
@@ -175,10 +180,10 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			// must reject it at commit rather than let it wrap silently. int64(n)
 			// keeps the comparison portable: on a 32-bit `int` platform an
 			// over-2^32 literal already fails Atoi (err != nil), so this only
-			// adds a real bound on 64-bit. The dataplane-meaningful ceilings are
-			// tighter still (e.g. maxScanSweepThreshold clamps port-scan/ip-sweep
-			// downstream), but math.MaxUint32 is the required floor that prevents
-			// the wrap.
+			// adds a real bound on 64-bit. Dataplane-meaningful ranges are
+			// narrower still (e.g. the port-scan/ip-sweep microsecond WINDOW is
+			// advised to the Junos [1000, 1000000] range downstream, #4114), but
+			// math.MaxUint32 is the required floor that prevents the wrap.
 			if err != nil || n < 1 || int64(n) > math.MaxUint32 {
 				profile.BadNumeric = append(profile.BadNumeric,
 					ScreenBadNumeric{Path: path, Value: val})
@@ -315,7 +320,7 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 						}
 					}
 					// ip-sweep enabled without an explicit threshold: arm at the
-					// Junos distinct-address detection count (10) so the
+					// Junos default detection WINDOW (5000 us, #4114) so the
 					// dataplane `>0` gate fires rather than skipping the check
 					// (#3230).
 					if profile.IP.IPSweepThreshold <= 0 {
@@ -407,7 +412,7 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 						}
 					}
 					// port-scan enabled without an explicit threshold: arm at
-					// the Junos distinct-port detection count (10) so the
+					// the Junos default detection WINDOW (5000 us, #4114) so the
 					// dataplane `>0` gate fires rather than skipping the check
 					// (#3230).
 					if profile.TCP.PortScanThreshold <= 0 {

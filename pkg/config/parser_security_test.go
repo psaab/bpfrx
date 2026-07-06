@@ -1407,73 +1407,62 @@ func TestScreenCompilation(t *testing.T) {
 	if screen.UDP.FloodThreshold != 1000 {
 		t.Errorf("udp flood threshold: got %d, want 1000", screen.UDP.FloodThreshold)
 	}
-	// #2227: the configured values are PRESERVED unchanged in the typed config
-	// (operator intent is kept; the dataplane clamps the effective comparison
-	// at runtime). Both 5000 and 3000 exceed the dataplane maximum (1023), so
-	// the compile emits a clamp WARNING for each — but never a hard reject and
-	// never a mutation of the stored value.
+	// #4114: `threshold` is now a Junos MICROSECOND detection WINDOW. 5000 and
+	// 3000 are both IN the Junos range [1000, 1000000], so they are preserved
+	// unchanged AND emit NO advisory.
 	if screen.TCP.PortScanThreshold != 5000 {
-		t.Errorf("tcp port-scan threshold: got %d, want 5000 (preserved, not clamped in typed config)", screen.TCP.PortScanThreshold)
+		t.Errorf("tcp port-scan threshold: got %d, want 5000 (us window, preserved)", screen.TCP.PortScanThreshold)
 	}
 	if screen.IP.IPSweepThreshold != 3000 {
-		t.Errorf("ip ip-sweep threshold: got %d, want 3000 (preserved, not clamped in typed config)", screen.IP.IPSweepThreshold)
+		t.Errorf("ip ip-sweep threshold: got %d, want 3000 (us window, preserved)", screen.IP.IPSweepThreshold)
 	}
-	var sawPortScanWarn, sawIPSweepWarn bool
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "port-scan threshold 5000") && strings.Contains(w, "clamped to 1023") {
-			sawPortScanWarn = true
+		if strings.Contains(w, "port-scan threshold") || strings.Contains(w, "ip-sweep threshold") {
+			t.Errorf("in-range windows (5000, 3000) must NOT warn; got %q", w)
 		}
-		if strings.Contains(w, "ip-sweep threshold 3000") && strings.Contains(w, "clamped to 1023") {
-			sawIPSweepWarn = true
-		}
-	}
-	if !sawPortScanWarn {
-		t.Errorf("expected a port-scan clamp warning (threshold 5000 > 1023); warnings=%v", cfg.Warnings)
-	}
-	if !sawIPSweepWarn {
-		t.Errorf("expected an ip-sweep clamp warning (threshold 3000 > 1023); warnings=%v", cfg.Warnings)
 	}
 }
 
-// TestScreenScanSweepThresholdClampWarning is the #2227 MAJOR-1 fail-on-revert
-// for the Go-side commit-time clamp warning. A port-scan / ip-sweep threshold
-// ABOVE the dataplane maximum (maxScanSweepThreshold = 1023) must compile
-// successfully (no hard reject — existing configs keep booting), preserve the
-// configured value, AND emit a warning that the value is clamped at runtime. A
-// threshold AT or BELOW the maximum must emit NO warning.
-func TestScreenScanSweepThresholdClampWarning(t *testing.T) {
+// TestScreenScanSweepWindowAdvisory is the #4114 fail-on-revert for the Go-side
+// commit-time detection-WINDOW advisory. The port-scan / ip-sweep `threshold`
+// is now a MICROSECOND detection window (the detection count is fixed). A value
+// OUTSIDE the Junos range [1000, 1000000] must compile successfully (no hard
+// reject — existing/legacy configs keep booting), preserve the configured
+// value, AND emit an advisory to re-check the window. A value IN range must
+// emit NO advisory. This is the count->window migration safety net.
+func TestScreenScanSweepWindowAdvisory(t *testing.T) {
 	cases := []struct {
 		name       string
 		setCmds    []string
-		wantWarnRE string // empty = expect no clamp warning
+		wantWarnRE string // empty = expect no window advisory
 	}{
 		{
-			name: "port-scan above max warns",
+			name: "count-shaped small value warns (below Junos min)",
+			setCmds: []string{
+				"set security screen ids-option s tcp port-scan threshold 10",
+			},
+			wantWarnRE: `tcp port-scan threshold 10 is outside the Junos detection-window range \[1000, 1000000\] microseconds`,
+		},
+		{
+			name: "ip-sweep above Junos max warns",
+			setCmds: []string{
+				"set security screen ids-option s ip ip-sweep threshold 2000000",
+			},
+			wantWarnRE: `ip ip-sweep threshold 2000000 is outside the Junos detection-window range \[1000, 1000000\] microseconds`,
+		},
+		{
+			name: "window at Junos default does not warn",
 			setCmds: []string{
 				"set security screen ids-option s tcp port-scan threshold 5000",
-			},
-			wantWarnRE: `port-scan threshold 5000 exceeds the dataplane maximum \(1023\).*clamped to 1023`,
-		},
-		{
-			name: "ip-sweep above max warns",
-			setCmds: []string{
-				"set security screen ids-option s ip ip-sweep threshold 3000",
-			},
-			wantWarnRE: `ip-sweep threshold 3000 exceeds the dataplane maximum \(1023\).*clamped to 1023`,
-		},
-		{
-			name: "threshold at max does not warn",
-			setCmds: []string{
-				"set security screen ids-option s tcp port-scan threshold 1023",
-				"set security screen ids-option s ip ip-sweep threshold 1023",
+				"set security screen ids-option s ip ip-sweep threshold 5000",
 			},
 			wantWarnRE: "",
 		},
 		{
-			name: "threshold below max does not warn",
+			name: "windows at the range boundaries do not warn",
 			setCmds: []string{
-				"set security screen ids-option s tcp port-scan threshold 100",
-				"set security screen ids-option s ip ip-sweep threshold 50",
+				"set security screen ids-option s tcp port-scan threshold 1000",
+				"set security screen ids-option s ip ip-sweep threshold 1000000",
 			},
 			wantWarnRE: "",
 		},
@@ -1492,21 +1481,21 @@ func TestScreenScanSweepThresholdClampWarning(t *testing.T) {
 			}
 			cfg, err := CompileConfig(tree)
 			if err != nil {
-				t.Fatalf("compile error (clamp must NOT hard-reject): %v", err)
+				t.Fatalf("compile error (advisory must NOT hard-reject): %v", err)
 			}
 			var matched bool
 			for _, w := range cfg.Warnings {
 				if strings.Contains(w, "port-scan threshold") || strings.Contains(w, "ip-sweep threshold") {
 					matched = true
 					if tc.wantWarnRE == "" {
-						t.Errorf("unexpected clamp warning: %q", w)
+						t.Errorf("unexpected window advisory: %q", w)
 					} else if ok, _ := regexp.MatchString(tc.wantWarnRE, w); !ok {
 						t.Errorf("warning %q does not match %q", w, tc.wantWarnRE)
 					}
 				}
 			}
 			if tc.wantWarnRE != "" && !matched {
-				t.Errorf("expected a clamp warning matching %q; warnings=%v", tc.wantWarnRE, cfg.Warnings)
+				t.Errorf("expected a window advisory matching %q; warnings=%v", tc.wantWarnRE, cfg.Warnings)
 			}
 		})
 	}

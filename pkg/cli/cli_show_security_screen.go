@@ -176,10 +176,10 @@ func (c *CLI) showScreenIdsOption(name string) error {
 		fmt.Printf("  %-45s %s\n", "ICMP fragment (icmp-fragment)", "enabled")
 	}
 	if profile.TCP.PortScanThreshold > 0 {
-		fmt.Printf("  %-45s %d\n", "TCP port scan (port-scan)", profile.TCP.PortScanThreshold)
+		fmt.Printf("  %-45s %d us\n", "TCP port scan window (port-scan)", profile.TCP.PortScanThreshold)
 	}
 	if profile.IP.IPSweepThreshold > 0 {
-		fmt.Printf("  %-45s %d\n", "IP sweep (ip-sweep)", profile.IP.IPSweepThreshold)
+		fmt.Printf("  %-45s %d us\n", "IP sweep window (ip-sweep)", profile.IP.IPSweepThreshold)
 	}
 	if profile.LimitSession.SourceIPBased > 0 {
 		fmt.Printf("  %-45s %d\n", "Session limit source (limit-session-source)", profile.LimitSession.SourceIPBased)
@@ -301,14 +301,14 @@ func (c *CLI) showScreenIdsOptionDetail(name string) error {
 	fmt.Printf("  %-45s %-12s %s\n", "ICMP fragment (icmp-fragment)",
 		enabledStr(profile.ICMP.Fragment), "disabled")
 	if profile.TCP.PortScanThreshold > 0 {
-		fmt.Printf("  %-45s %-12d %s\n", "TCP port scan (port-scan)", profile.TCP.PortScanThreshold, "disabled")
+		fmt.Printf("  %-45s %-12s %s\n", "TCP port scan window (port-scan)", fmt.Sprintf("%d us", profile.TCP.PortScanThreshold), "disabled")
 	} else {
-		fmt.Printf("  %-45s %-12s %s\n", "TCP port scan (port-scan)", "disabled", "disabled")
+		fmt.Printf("  %-45s %-12s %s\n", "TCP port scan window (port-scan)", "disabled", "disabled")
 	}
 	if profile.IP.IPSweepThreshold > 0 {
-		fmt.Printf("  %-45s %-12d %s\n", "IP sweep (ip-sweep)", profile.IP.IPSweepThreshold, "disabled")
+		fmt.Printf("  %-45s %-12s %s\n", "IP sweep window (ip-sweep)", fmt.Sprintf("%d us", profile.IP.IPSweepThreshold), "disabled")
 	} else {
-		fmt.Printf("  %-45s %-12s %s\n", "IP sweep (ip-sweep)", "disabled", "disabled")
+		fmt.Printf("  %-45s %-12s %s\n", "IP sweep window (ip-sweep)", "disabled", "disabled")
 	}
 	if profile.LimitSession.SourceIPBased > 0 {
 		fmt.Printf("  %-45s %-12d %s\n", "Session limit source (limit-session-source)", profile.LimitSession.SourceIPBased, "disabled")
