@@ -67,6 +67,9 @@ pub(crate) struct ScreenProfileSnapshot {
     pub session_limit_src: u32,
     #[serde(rename = "session_limit_dst", default)]
     pub session_limit_dst: u32,
+    /// #4114 Junos: the port-scan/ip-sweep `threshold` is a MICROSECOND
+    /// detection WINDOW (not a count); the detection count is the fixed
+    /// `SCAN_DETECT_COUNT` (10) in `screen/scan.rs`. 0 = disabled.
     #[serde(rename = "port_scan_threshold", default)]
     pub port_scan_threshold: u32,
     #[serde(rename = "ip_sweep_threshold", default)]

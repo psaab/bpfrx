@@ -1800,7 +1800,8 @@ pub(super) fn poll_binding_process_descriptor(
                                 from_zone,
                                 from_zone_id,
                                 &screen_pkt,
-                                now_secs,
+                                // #4114: scan/sweep windows are microseconds.
+                                now_ns / 1_000,
                             )
                         })
                         // #2134: per-IP session-limit enforcement at the

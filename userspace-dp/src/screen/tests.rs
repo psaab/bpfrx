@@ -3993,30 +3993,36 @@ fn extract_info_from_ipv4_frame() {
 // `screen::scan::scan_tests` and `scan_sweep_per_zone_no_cross_count`.
 const ZID: u16 = 7;
 
+/// Junos default scan/sweep detection WINDOW (microseconds) for these tests
+/// (#4114). The detection COUNT is the fixed `super::scan::SCAN_DETECT_COUNT`.
+const SWEEP_W: u32 = 5_000;
+
 #[test]
 fn port_scan_detected() {
     let mut profile = ScreenProfile::default();
-    profile.port_scan_threshold = 3;
+    profile.port_scan_threshold = SWEEP_W; // microsecond window (#4114)
     let mut state = make_state("trust", profile);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let detect = super::scan::SCAN_DETECT_COUNT as u16;
+    let now = 1_000_000u64;
 
-    // First 3 unique ports pass
-    for port in [80, 443, 8080] {
-        let pkt = tcp_pkt(src, dst, 1234, port, TCP_SYN);
+    // The first SCAN_DETECT_COUNT-1 unique ports within the window pass.
+    for p in 0..(detect - 1) {
+        let pkt = tcp_pkt(src, dst, 1234, 8000 + p, TCP_SYN);
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
             None,
             "port {} should pass",
-            port,
+            8000 + p,
         );
     }
 
-    // 4th unique port triggers port scan
-    let pkt = tcp_pkt(src, dst, 1234, 22, TCP_SYN);
+    // The SCAN_DETECT_COUNT-th unique port within the window triggers port scan.
+    let pkt = tcp_pkt(src, dst, 1234, 8999, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
         Some("port-scan")
     );
 }
@@ -4024,35 +4030,33 @@ fn port_scan_detected() {
 #[test]
 fn port_scan_resets_on_window_expiry() {
     let mut profile = ScreenProfile::default();
-    profile.port_scan_threshold = 2;
+    profile.port_scan_threshold = SWEEP_W;
     let mut state = make_state("trust", profile);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let detect = super::scan::SCAN_DETECT_COUNT as u16;
+    let now = 1_000_000u64;
 
-    // Fill up in window at time=100
-    let pkt1 = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
-    let pkt2 = tcp_pkt(src, dst, 1234, 443, TCP_SYN);
+    // Fill the window: the first SCAN_DETECT_COUNT-1 ports pass, the next fires.
+    for p in 0..(detect - 1) {
+        let pkt = tcp_pkt(src, dst, 1234, 8000 + p, TCP_SYN);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
+            None
+        );
+    }
+    let pkt_fire = tcp_pkt(src, dst, 1234, 8999, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt1, 100),
-        None
-    );
-    assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt2, 100),
-        None
-    );
-
-    // 3rd port triggers at time=100
-    let pkt3 = tcp_pkt(src, dst, 1234, 22, TCP_SYN);
-    assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt3, 100),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt_fire, now),
         Some("port-scan")
     );
 
-    // After window expires (default 10s), should pass again
-    let pkt4 = tcp_pkt(src, dst, 1234, 8080, TCP_SYN);
+    // After the microsecond window expires the count resets and a single new
+    // port passes again.
+    let pkt_after = tcp_pkt(src, dst, 1234, 7000, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt4, 111),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt_after, now + u64::from(SWEEP_W) + 1),
         None
     );
 }
@@ -4060,20 +4064,20 @@ fn port_scan_resets_on_window_expiry() {
 #[test]
 fn port_scan_only_on_syn() {
     let mut profile = ScreenProfile::default();
-    profile.port_scan_threshold = 1;
+    profile.port_scan_threshold = SWEEP_W;
     let mut state = make_state("trust", profile);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
 
-    // ACK packets (a session-miss ACK still reaches the hook, but
-    // port-scan is SYN-only) should not trigger port scan. (IP-sweep on a
-    // miss ACK is a separate, intended count — threshold is 0 here so it
-    // never fires.)
-    for port in [80, 443, 8080, 22] {
+    // ACK packets (a session-miss ACK still reaches the hook, but port-scan is
+    // SYN-only) never trigger port scan, no matter how many distinct ports.
+    // (IP-sweep on a miss ACK is a separate, intended count — its window is 0
+    // here so it never fires.)
+    for port in 1000..1000 + super::scan::SCAN_DETECT_COUNT as u16 + 2 {
         let pkt = tcp_pkt(src, dst, 1234, port, TCP_ACK);
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 1_000_000),
             None
         );
     }
@@ -4086,26 +4090,28 @@ fn port_scan_only_on_syn() {
 #[test]
 fn ip_sweep_detected() {
     let mut profile = ScreenProfile::default();
-    profile.ip_sweep_threshold = 3;
+    profile.ip_sweep_threshold = SWEEP_W;
     let mut state = make_state("trust", profile);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let detect = super::scan::SCAN_DETECT_COUNT as u32;
+    let now = 1_000_000u64;
 
-    // First 3 unique destinations pass
-    for i in 1..=3u8 {
-        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
+    // The first SCAN_DETECT_COUNT-1 unique destinations within the window pass.
+    for i in 0..(detect - 1) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_0200u32 + i)); // 10.0.2.x
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
             None
         );
     }
 
-    // 4th unique destination triggers IP sweep
-    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 4));
+    // The SCAN_DETECT_COUNT-th unique destination triggers IP sweep.
+    let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_02ffu32));
     let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
         Some("ip-sweep")
     );
 }
@@ -4113,34 +4119,37 @@ fn ip_sweep_detected() {
 #[test]
 fn ip_sweep_resets_on_window_expiry() {
     let mut profile = ScreenProfile::default();
-    profile.ip_sweep_threshold = 2;
+    profile.ip_sweep_threshold = SWEEP_W;
     let mut state = make_state("trust", profile);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let detect = super::scan::SCAN_DETECT_COUNT as u32;
+    let now = 1_000_000u64;
 
-    // Fill up window at time=100
-    for i in 1..=2u8 {
-        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
+    // Fill the window: the first SCAN_DETECT_COUNT-1 destinations pass.
+    for i in 0..(detect - 1) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_0200u32 + i));
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
             None
         );
     }
 
-    // 3rd triggers
-    let dst3 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 3));
-    let pkt3 = tcp_pkt(src, dst3, 1234, 80, TCP_SYN);
+    // The SCAN_DETECT_COUNT-th triggers.
+    let dst_fire = IpAddr::V4(Ipv4Addr::from(0x0a00_02ffu32));
+    let pkt_fire = tcp_pkt(src, dst_fire, 1234, 80, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt3, 100),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt_fire, now),
         Some("ip-sweep")
     );
 
-    // After window expires (default 10s), passes again
-    let dst4 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 4));
-    let pkt4 = tcp_pkt(src, dst4, 1234, 80, TCP_SYN);
+    // After the microsecond window expires the count resets and a single new
+    // destination passes again.
+    let dst_after = IpAddr::V4(Ipv4Addr::from(0x0a00_0300u32));
+    let pkt_after = tcp_pkt(src, dst_after, 1234, 80, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt4, 111),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt_after, now + u64::from(SWEEP_W) + 1),
         None
     );
 }
@@ -4148,27 +4157,29 @@ fn ip_sweep_resets_on_window_expiry() {
 #[test]
 fn ip_sweep_works_with_udp() {
     let mut profile = ScreenProfile::default();
-    profile.ip_sweep_threshold = 2;
+    profile.ip_sweep_threshold = SWEEP_W;
     let mut state = make_state("trust", profile);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let detect = super::scan::SCAN_DETECT_COUNT as u32;
+    let now = 1_000_000u64;
 
-    for i in 1..=2u8 {
-        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
+    for i in 0..(detect - 1) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_0200u32 + i));
         let mut pkt = udp_pkt(src, dst);
         pkt.dst_ip = dst;
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
             None
         );
     }
 
-    // 3rd triggers
-    let dst3 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 3));
-    let mut pkt3 = udp_pkt(src, dst3);
-    pkt3.dst_ip = dst3;
+    // The SCAN_DETECT_COUNT-th triggers.
+    let dst_fire = IpAddr::V4(Ipv4Addr::from(0x0a00_02ffu32));
+    let mut pkt_fire = udp_pkt(src, dst_fire);
+    pkt_fire.dst_ip = dst_fire;
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt3, 100),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt_fire, now),
         Some("ip-sweep")
     );
 }
@@ -4187,11 +4198,13 @@ fn ip_sweep_works_with_udp() {
 #[test]
 fn established_traffic_does_not_count_toward_sweep_via_check_packet() {
     let mut profile = ScreenProfile::default();
-    profile.ip_sweep_threshold = 2;
-    profile.port_scan_threshold = 2;
+    profile.ip_sweep_threshold = SWEEP_W;
+    profile.port_scan_threshold = SWEEP_W;
     let mut state = make_state("trust", profile);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let detect = super::scan::SCAN_DETECT_COUNT as u32;
+    let now = 1_000_000u64;
     // A high-fan-out established client: ACKs to many destinations on many
     // ports. None of these are SYNs; in production they would be session
     // hits. `check_packet` must pass every one — sweep is NOT evaluated
@@ -4206,19 +4219,20 @@ fn established_traffic_does_not_count_toward_sweep_via_check_packet() {
             i
         );
     }
-    // And a genuine new-flow sweep still fires on the miss hook.
-    for i in 1..=2u8 {
-        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 3, i));
+    // And a genuine new-flow sweep still fires on the miss hook: the first
+    // SCAN_DETECT_COUNT-1 distinct destinations pass, the next fires.
+    for i in 0..(detect - 1) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_0300u32 + i)); // 10.0.3.x
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
             None
         );
     }
-    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 3, 3));
+    let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_03ffu32));
     let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, now),
         Some("ip-sweep")
     );
 }
@@ -4231,38 +4245,40 @@ fn scan_sweep_per_zone_no_cross_count() {
     let mut state = ScreenState::new();
     let mut profiles = FxHashMap::default();
     let mut a = ScreenProfile::default();
-    a.ip_sweep_threshold = 2;
+    a.ip_sweep_threshold = SWEEP_W;
     let mut b = ScreenProfile::default();
-    b.ip_sweep_threshold = 2;
+    b.ip_sweep_threshold = SWEEP_W;
     profiles.insert("zoneA".to_string(), a);
     profiles.insert("zoneB".to_string(), b);
     state.update_profiles(profiles);
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    // Source sweeps zoneA: two unique dsts (no drop yet).
-    for i in 1..=2u8 {
-        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
+    let detect = super::scan::SCAN_DETECT_COUNT as u32;
+    let now = 1_000_000u64;
+    // Source sweeps zoneA: SCAN_DETECT_COUNT-1 unique dsts (no drop yet).
+    for i in 0..(detect - 1) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_0200u32 + i));
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("zoneA", 1, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("zoneA", 1, &pkt, now),
             None
         );
     }
-    // Same source in zoneB starts fresh — two unique dsts still pass.
-    for i in 1..=2u8 {
-        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 9, i));
+    // Same source in zoneB starts fresh — the same count still passes.
+    for i in 0..(detect - 1) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_0900u32 + i));
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
         assert_eq!(
-            state.scan_sweep_drop_on_new_flow("zoneB", 2, &pkt, 100),
+            state.scan_sweep_drop_on_new_flow("zoneB", 2, &pkt, now),
             None,
             "zoneB must not inherit zoneA's sweep history for the same source",
         );
     }
-    // zoneB's 3rd unique dst crosses zoneB's own threshold.
-    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 9, 3));
+    // zoneB's SCAN_DETECT_COUNT-th unique dst crosses zoneB's own count.
+    let dst = IpAddr::V4(Ipv4Addr::from(0x0a00_09ffu32));
     let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
     assert_eq!(
-        state.scan_sweep_drop_on_new_flow("zoneB", 2, &pkt, 100),
+        state.scan_sweep_drop_on_new_flow("zoneB", 2, &pkt, now),
         Some("ip-sweep")
     );
 }
@@ -4328,7 +4344,10 @@ fn screen_profile_is_not_copy_so_per_packet_copies_stay_auditable() {
 #[test]
 fn scan_sweep_state_bounded_and_records_pressure() {
     let mut profile = ScreenProfile::default();
-    profile.ip_sweep_threshold = 1_000_000; // never trips by detection
+    // A wide in-range window; each source touches one dst (count 1 < the fixed
+    // detection count) so detection never trips — this exercises the memory
+    // bound, not the verdict.
+    profile.ip_sweep_threshold = 1_000_000;
     let mut state = make_state("trust", profile);
 
     assert_eq!(state.scan_sweep_skipped_pressure(), 0);
@@ -4370,12 +4389,14 @@ fn scan_sweep_state_bounded_and_records_pressure() {
 #[test]
 fn fresh_scanner_detected_after_source_flood_at_screen_state() {
     let mut profile = ScreenProfile::default();
-    profile.port_scan_threshold = 5; // low: a real scan trips quickly
+    // A wide in-range window; a real fast scan of SCAN_DETECT_COUNT distinct
+    // ports within it trips.
+    profile.port_scan_threshold = 1_000_000;
     let mut state = make_state("trust", profile);
     let cap = super::scan::max_sources_per_zone_for_test();
 
     // Saturate the trust zone with a spoofed-source flood (one SYN each, so
-    // none individually trips the port-scan threshold).
+    // none individually reaches the detection count).
     let flood_now = 1_000u64;
     let dst = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
     for i in 0..cap {
@@ -4387,11 +4408,12 @@ fn fresh_scanner_detected_after_source_flood_at_screen_state() {
         );
     }
 
-    // A real scanner shows up afterward, hitting many ports on one target.
+    // A real scanner shows up afterward, hitting SCAN_DETECT_COUNT+ ports on
+    // one target within the window.
     let scanner = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
     let target = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
     let mut fired = false;
-    for port in 1000u16..1010 {
+    for port in 1000u16..1000 + super::scan::SCAN_DETECT_COUNT as u16 + 2 {
         let pkt = tcp_pkt(scanner, target, 1234, port, TCP_SYN);
         if state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, flood_now + 1) == Some("port-scan")
         {
@@ -4416,7 +4438,9 @@ fn fresh_scanner_detected_after_source_flood_at_screen_state() {
 #[test]
 fn scan_table_pressure_event_fires_rarely_under_flood() {
     let mut profile = ScreenProfile::default();
-    profile.ip_sweep_threshold = 1_000_000; // never trips by detection
+    // Wide in-range window, one dst per source → detection never trips; this
+    // exercises the source-table eviction alarm, not the verdict.
+    profile.ip_sweep_threshold = 1_000_000;
     let mut state = make_state("trust", profile);
     let cap = super::scan::max_sources_per_zone_for_test();
 
@@ -4444,48 +4468,13 @@ fn scan_table_pressure_event_fires_rarely_under_flood() {
     assert!(state.scan_sweep_evicted_pressure() >= 2_000);
 }
 
-/// #2227 MAJOR-1 fail-on-revert (at the production `ScreenState` hook): an
-/// IP-sweep configured with a threshold ABOVE the per-source unique cap
-/// (3000 — a value `pkg/config` parses and stores unchanged) must STILL fire
-/// detection. Pre-fix the dataplane compared `set.len() > threshold` and
-/// `len()` could never exceed `MAX_UNIQUE_PER_SOURCE` (1024 < 3000), so the
-/// scanner was NEVER dropped (silent fail-OPEN). The fail-closed clamp makes a
-/// saturated set always cross the effective threshold, and the clamp is
-/// recorded for observability.
-#[test]
-fn ip_sweep_above_unique_cap_still_fires_at_screen_state() {
-    let mut profile = ScreenProfile::default();
-    // 3000 mirrors parser_security_test.go's TestScreenCompilation and exceeds
-    // MAX_UNIQUE_PER_SOURCE — the exact case the reviewer reproduced.
-    profile.ip_sweep_threshold = 3000;
-    let mut state = make_state("trust", profile);
-    let cap = super::scan::max_unique_per_source_for_test();
-    assert!(
-        3000 > cap,
-        "test premise: configured threshold (3000) must exceed the cap ({cap})"
-    );
-
-    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    let mut fired = false;
-    // Sweep more distinct destinations than the cap from the same source.
-    for i in 0..(cap + 50) {
-        let dst = IpAddr::V4(Ipv4Addr::from(0xac10_0000u32 + i as u32)); // 172.16.x.x
-        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
-        if state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100) == Some("ip-sweep") {
-            fired = true;
-            break;
-        }
-    }
-    assert!(
-        fired,
-        "ip-sweep threshold 3000 (> cap {cap}) must fire — pre-fix it NEVER fired (fail-open)"
-    );
-    assert!(
-        state.scan_sweep_threshold_clamped() >= 1,
-        "an over-cap threshold must be recorded as clamped, got {}",
-        state.scan_sweep_threshold_clamped()
-    );
-}
+// #4114: the pre-existing #2227 "over-cap threshold still fires (fail-closed
+// clamp)" test was removed here — the configurable COUNT and its
+// MAX_UNIQUE_PER_SOURCE clamp no longer exist. The detection count is now the
+// fixed SCAN_DETECT_COUNT (10, well under the memory cap) and the configurable
+// `threshold` is the microsecond detection WINDOW. The window vs count
+// semantics are covered by `screen::scan::scan_tests::detects_fixed_count_within_window`
+// and `no_detect_when_dests_spread_beyond_window`.
 
 // ================================================================
 // #3082 — lenient/HA-sync missing-screen-profile runtime signal

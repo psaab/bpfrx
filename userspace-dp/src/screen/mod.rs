@@ -1253,56 +1253,68 @@ impl ScreenState {
         zone: &str,
         zone_id: u16,
         pkt: &ScreenPacketInfo,
-        now_secs: u64,
+        now_micros: u64,
     ) -> Option<&'static str> {
         let Some(profile) = self.profiles.get(zone) else {
             return None;
         };
-        let port_scan_threshold = profile.port_scan_threshold;
-        let ip_sweep_threshold = profile.ip_sweep_threshold;
+        // #4114: the Junos `threshold` is a MICROSECOND detection WINDOW (not a
+        // count). The detection COUNT is the fixed `SCAN_DETECT_COUNT` in
+        // `scan.rs`. `port_scan_threshold`/`ip_sweep_threshold` carry that
+        // per-zone window (u32 us); 0 = the check is disabled.
+        let port_scan_window = u64::from(profile.port_scan_threshold);
+        let ip_sweep_window = u64::from(profile.ip_sweep_threshold);
         // `profile` borrow ends here (NLL).
-        if port_scan_threshold == 0 && ip_sweep_threshold == 0 {
+        if port_scan_window == 0 && ip_sweep_window == 0 {
             // Still tick the cleanup so a config with the feature briefly
             // enabled-then-disabled cannot strand tracker state.
-            self.maybe_cleanup_trackers(now_secs);
+            self.maybe_cleanup_trackers(now_micros);
             return None;
         }
 
-        // Port scan: count unique dst ports per (zone, src) on initial SYN.
-        if port_scan_threshold > 0
+        // Port scan: count unique dst ports per (zone, src) on initial SYN
+        // within the configured microsecond window.
+        if port_scan_window > 0
             && pkt.protocol == PROTO_TCP
             && is_initial_syn(pkt.tcp_flags)
-            && self
-                .port_scan
-                .check(zone_id, pkt.src_ip, pkt.dst_port, now_secs, port_scan_threshold)
+            && self.port_scan.check(
+                zone_id,
+                pkt.src_ip,
+                pkt.dst_port,
+                now_micros,
+                port_scan_window,
+            )
         {
-            self.maybe_cleanup_trackers(now_secs);
+            self.maybe_cleanup_trackers(now_micros);
             return Some("port-scan");
         }
 
         // IP sweep: count unique dst IPs per (zone, src) for the new flow
-        // (any protocol). Because this only runs on a session MISS, an
-        // established flow's packets never count.
-        if ip_sweep_threshold > 0
+        // (any protocol) within the configured microsecond window. Because
+        // this only runs on a session MISS, an established flow's packets
+        // never count.
+        if ip_sweep_window > 0
             && self
                 .ip_sweep
-                .check(zone_id, pkt.src_ip, pkt.dst_ip, now_secs, ip_sweep_threshold)
+                .check(zone_id, pkt.src_ip, pkt.dst_ip, now_micros, ip_sweep_window)
         {
-            self.maybe_cleanup_trackers(now_secs);
+            self.maybe_cleanup_trackers(now_micros);
             return Some("ip-sweep");
         }
 
-        self.maybe_cleanup_trackers(now_secs);
+        self.maybe_cleanup_trackers(now_micros);
         None
     }
 
     /// Periodic (>=30s) budgeted cleanup of the scan/sweep trackers. Driven
     /// from the new-flow hook so it is co-located with the only site that
-    /// mutates the trackers.
-    fn maybe_cleanup_trackers(&mut self, now_secs: u64) {
+    /// mutates the trackers. `now_micros` is a monotonic microsecond clock;
+    /// the 30s throttle derives seconds from it (#4114).
+    fn maybe_cleanup_trackers(&mut self, now_micros: u64) {
+        let now_secs = now_micros / 1_000_000;
         if now_secs.saturating_sub(self.last_cleanup_secs) >= 30 {
-            self.port_scan.cleanup(now_secs);
-            self.ip_sweep.cleanup(now_secs);
+            self.port_scan.cleanup(now_micros);
+            self.ip_sweep.cleanup(now_micros);
             self.last_cleanup_secs = now_secs;
         }
     }
@@ -1313,18 +1325,6 @@ impl ScreenState {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn scan_sweep_skipped_pressure(&self) -> u64 {
         self.port_scan.skipped_pressure() + self.ip_sweep.skipped_pressure()
-    }
-
-    /// #2227 MAJOR-1: total scan/sweep checks whose operator threshold
-    /// exceeded the supported maximum (`MAX_UNIQUE_PER_SOURCE - 1`) and was
-    /// clamped to it (fail-closed clamp — detection fires AT THE CAP rather
-    /// than never). Pure observability; surfaces an operator misconfiguration
-    /// (a threshold the bounded set could never reach un-clamped). The Go
-    /// control plane also warns at commit time when a threshold exceeds the
-    /// supported maximum.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn scan_sweep_threshold_clamped(&self) -> u64 {
-        self.port_scan.threshold_clamped() + self.ip_sweep.threshold_clamped()
     }
 
     /// #2234: total stalest-evictions on the scan/sweep source-saturation
