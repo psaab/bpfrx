@@ -740,6 +740,10 @@ pub(crate) struct WgTunnelStatus {
     pub hs_rx_drops_replayed_init: u64,
     #[serde(rename = "hs_rx_cookie_unsupported", default)]
     pub hs_rx_cookie_unsupported: u64,
+    /// #4094 PR-B initiator-side cookie-replies successfully consumed
+    /// (decrypted + stored, arming a valid MAC2 on the next initiation).
+    #[serde(rename = "hs_rx_cookie_consumed", default)]
+    pub hs_rx_cookie_consumed: u64,
     /// #4094 PR-A responder cookie-reply / MAC2 under-load DoS-mitigation
     /// accounting: cookie replies emitted, under-load initiations dropped
     /// for a missing/bad MAC2 (challenged), under-load initiations that

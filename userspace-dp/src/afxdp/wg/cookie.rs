@@ -630,23 +630,27 @@ impl CookieChecker {
         Ok(WG_MSG_COOKIE_LEN)
     }
 
-    // --- test-only mirrors of the PR-B initiator decrypt + secret peek ---
+    // --- initiator-side cookie-reply decrypt (#4094 PR-B) + test peek ---
 
-    /// Decrypt a type-3 CookieReply the way the xpf-as-initiator half
-    /// (PR-B) will: recover the 16-byte cookie with the responder's
-    /// public-key-derived AEAD key, the reply's nonce, and the AAD MAC1 of
-    /// the initiation that triggered it. `#[cfg(test)]` reference until
-    /// PR-B wires it into the initiator path.
-    #[cfg(test)]
+    /// Decrypt a type-3 CookieReply as the xpf-as-initiator half (#4094
+    /// PR-B): recover the 16-byte cookie with the RESPONDER's public-key-
+    /// derived AEAD key (`BLAKE2s-256("cookie--" || responder_static_pub)`),
+    /// the reply's carried nonce, and the AAD MAC1 of the initiation that
+    /// triggered it. From the initiator's view `responder_static_pub` is the
+    /// PEER's static public key (the responder we are handshaking toward);
+    /// the responder-side round-trip test passes its own public key, which
+    /// is the same value from its own perspective. Returns `None` on a
+    /// malformed reply or an AEAD authentication failure (wrong key / wrong
+    /// AAD / tampered ciphertext) — fail closed, no panic, cookie ignored.
     pub(crate) fn decrypt_cookie_reply(
         reply: &[u8],
-        our_static_pub: &[u8; WG_KEY_LEN],
+        responder_static_pub: &[u8; WG_KEY_LEN],
         aad_mac1: &[u8],
     ) -> Option<[u8; WG_COOKIE_LEN]> {
         if reply.len() != WG_MSG_COOKIE_LEN || reply[0] != WG_TYPE_COOKIE {
             return None;
         }
-        let key = cookie_encryption_key(our_static_pub);
+        let key = cookie_encryption_key(responder_static_pub);
         let nonce = &reply[M3_NONCE..M3_COOKIE];
         let mut buf = [0u8; WG_COOKIE_LEN];
         buf.copy_from_slice(&reply[M3_COOKIE..M3_COOKIE + WG_COOKIE_LEN]);
@@ -705,6 +709,124 @@ impl CookieChecker {
     #[cfg(test)]
     pub(crate) fn source_contains_for_test(&self, ip: IpAddr) -> bool {
         self.per_source.lock().unwrap().buckets.contains_key(&ip)
+    }
+}
+
+/// Initiator-side per-peer cookie state (#4094 PR-B) — the counterpart to
+/// the responder's [`CookieChecker`]. Mirrors wireguard-go
+/// `CookieGenerator`'s `mac2` sub-struct: the last cookie we decrypted from
+/// a responder's cookie-reply (used to stamp MAC2 on our RETRIED
+/// handshake-initiations until it ages past [`COOKIE_ROTATION_TIME_NS`])
+/// plus the MAC1 of our most recently sent initiation (the XChaCha20-
+/// Poly1305 AAD needed to decrypt an incoming cookie-reply).
+///
+/// One per peer, held in the [`super::WgEngine`] under a mutex and consulted
+/// only on the slow control-thread path (`create_initiation` on send,
+/// `consume_cookie_reply` on receive). SECRET-adjacent: the cookie authorizes
+/// our initiations under load, so it is never logged.
+pub(crate) struct InitiatorCookie {
+    /// MAC1 of the last initiation we sent to this peer — the AEAD
+    /// associated data for decrypting a cookie-reply. `None` until we have
+    /// sent at least one initiation (a cookie-reply arriving before we ever
+    /// sent an initiation cannot be attributed, so it is dropped).
+    last_mac1: Option<[u8; WG_MAC_LEN]>,
+    /// The last cookie decrypted from a cookie-reply and the monotonic-ns
+    /// time we stored it. `None` until a reply is consumed. Expiry is
+    /// evaluated lazily at stamp time (a cookie older than
+    /// [`COOKIE_ROTATION_TIME_NS`] yields a zero MAC2), not on a timer.
+    cookie: Option<([u8; WG_COOKIE_LEN], u64)>,
+}
+
+impl InitiatorCookie {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_mac1: None,
+            cookie: None,
+        }
+    }
+
+    /// Called on EVERY outbound initiation we send to this peer, AFTER
+    /// [`super::handshake::build_initiation`] has written MAC1 and zeroed
+    /// MAC2. Two effects, mirroring wireguard-go `CookieGenerator::AddMacs`:
+    ///
+    /// 1. Record the message's MAC1 (`msg[116..132]`) as [`Self::last_mac1`]
+    ///    so a subsequent cookie-reply — whose AEAD AAD is exactly this
+    ///    MAC1 — can be decrypted.
+    /// 2. If we hold a cookie that has NOT aged past
+    ///    [`COOKIE_ROTATION_TIME_NS`], stamp
+    ///    `mac2 = keyed-BLAKE2s-128(cookie, msg[0..132])` into the MAC2 slot
+    ///    (`msg[132..148]`). Otherwise leave MAC2 zero — the spec-correct
+    ///    value when we have no valid cookie (a first, un-challenged
+    ///    initiation, or one whose cookie has expired).
+    ///
+    /// Returns `true` iff a non-zero MAC2 was stamped. A too-short `msg`
+    /// (never happens at the sole caller, which passes the 148-byte framed
+    /// message) is a no-op returning `false`.
+    pub(crate) fn add_macs(&mut self, msg: &mut [u8], now_ns: u64) -> bool {
+        if msg.len() < WG_MSG_INIT_LEN {
+            return false;
+        }
+        let mut mac1 = [0u8; WG_MAC_LEN];
+        mac1.copy_from_slice(&msg[M1_MAC1..M1_MAC2]);
+        self.last_mac1 = Some(mac1);
+
+        // A cookie is fresh iff strictly younger than one rotation window.
+        // `saturating_sub` makes a backwards monotonic clock read as
+        // zero-elapsed (still fresh) rather than a huge age — conservative,
+        // and the cookie is our own so this weakens nothing.
+        match self.cookie {
+            Some((cookie, set_ns)) if now_ns.saturating_sub(set_ns) < COOKIE_ROTATION_TIME_NS => {
+                let mac2 = keyed_blake2s_128(&cookie, &msg[..M1_MAC2]);
+                msg[M1_MAC2..WG_MSG_INIT_LEN].copy_from_slice(&mac2);
+                true
+            }
+            _ => {
+                // No cookie, or expired: keep MAC2 zero (build_initiation
+                // already zeroed it; re-zero defensively in case a stale
+                // MAC2 was left by a caller that reused the buffer).
+                msg[M1_MAC2..WG_MSG_INIT_LEN].fill(0);
+                false
+            }
+        }
+    }
+
+    /// Consume an inbound type-3 cookie-reply from this peer. Decrypts the
+    /// sealed cookie with the responder's public-key-derived key and OUR
+    /// stored [`Self::last_mac1`] as the AEAD AAD; on success stores the
+    /// cookie + `now_ns` so the next [`Self::add_macs`] stamps a valid MAC2.
+    ///
+    /// Fails closed (`false`, cookie state untouched) when we never sent an
+    /// initiation (`last_mac1` unset — nothing to attribute the reply to) or
+    /// when decryption fails (wrong key / wrong AAD / tampered ciphertext).
+    pub(crate) fn consume_reply(
+        &mut self,
+        reply: &[u8],
+        responder_static_pub: &[u8; WG_KEY_LEN],
+        now_ns: u64,
+    ) -> bool {
+        let Some(aad_mac1) = self.last_mac1 else {
+            return false;
+        };
+        match CookieChecker::decrypt_cookie_reply(reply, responder_static_pub, &aad_mac1) {
+            Some(cookie) => {
+                self.cookie = Some((cookie, now_ns));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// #4094 PR-B test hook: whether a (non-expired-agnostic) cookie is
+    /// currently stored.
+    #[cfg(test)]
+    pub(crate) fn has_cookie_for_test(&self) -> bool {
+        self.cookie.is_some()
+    }
+}
+
+impl Default for InitiatorCookie {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1170,5 +1292,144 @@ mod tests {
             !cc.source_reply_allowed(s, t_hi),
             "the forward jump after a backwards step is not replayed into an over-credit"
         );
+    }
+
+    // ===================================================================
+    // #4094 PR-B initiator-side cookie-reply consume + MAC2 stamping.
+    // ===================================================================
+
+    /// Full cookie handshake round-trip across BOTH halves: the responder
+    /// (PR-A [`CookieChecker`]) issues a cookie-reply; the initiator (PR-B
+    /// [`InitiatorCookie`]) consumes it and stamps a MAC2 on its RETRIED
+    /// initiation that the responder's [`CookieChecker::verify_initiation_mac2`]
+    /// accepts. RED on revert: without the consume+stamp the retried MAC2
+    /// stays zero and the responder rejects it (re-challenging forever — the
+    /// handshake never completes under load).
+    #[test]
+    fn initiator_cookie_roundtrip_stamps_accepted_mac2() {
+        let responder_pub = [0x91u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let now = 10_000_000_000u64;
+        let from = src(51820); // the initiator's source as the responder sees it
+
+        // 1. Initiator sends its FIRST initiation (MAC2 zero) and records its
+        //    MAC1 via add_macs.
+        let mut ic = InitiatorCookie::new();
+        let mut first = valid_mac1_init(&responder_pub, 0x1111);
+        assert!(
+            !ic.add_macs(&mut first, now),
+            "no cookie yet → MAC2 stays zero"
+        );
+        assert_eq!(&first[M1_MAC2..], &[0u8; 16]);
+
+        // 2. Responder issues a cookie-reply for that initiation from `from`.
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, now, &mut reply).unwrap();
+
+        // 3. Initiator consumes the reply → stores the cookie.
+        assert!(ic.consume_reply(&reply, &responder_pub, now));
+        assert!(ic.has_cookie_for_test());
+
+        // 4. Initiator retries — add_macs now stamps a NON-ZERO MAC2.
+        let mut retry = valid_mac1_init(&responder_pub, 0x2222);
+        assert!(ic.add_macs(&mut retry, now), "a fresh cookie stamps MAC2");
+        assert_ne!(&retry[M1_MAC2..], &[0u8; 16]);
+
+        // 5. The responder's MAC2 verifier accepts the retried initiation
+        //    from the SAME source (RED on revert: zero MAC2 is rejected).
+        assert!(
+            cc.verify_initiation_mac2(&retry, from, now),
+            "responder must accept the initiator's cookie-derived MAC2"
+        );
+        // A DIFFERENT source is still rejected — the cookie binds the source.
+        assert!(
+            !cc.verify_initiation_mac2(&retry, src(51821), now),
+            "a cookie-derived MAC2 must not verify from a different source"
+        );
+    }
+
+    /// A cookie-reply that fails AEAD authentication (tampered ciphertext or
+    /// wrong responder key) is DROPPED: no cookie is stored, no panic, and a
+    /// subsequent retry still carries a zero MAC2 (fail-closed).
+    #[test]
+    fn initiator_drops_undecryptable_cookie_reply() {
+        let responder_pub = [0x92u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let now = 10_000_000_000u64;
+        let from = src(51820);
+
+        let mut ic = InitiatorCookie::new();
+        let mut first = valid_mac1_init(&responder_pub, 7);
+        ic.add_macs(&mut first, now);
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, now, &mut reply).unwrap();
+
+        // (a) Tampered ciphertext → AEAD tag mismatch → not consumed.
+        let mut tampered = reply;
+        tampered[M3_COOKIE] ^= 0xFF;
+        assert!(!ic.consume_reply(&tampered, &responder_pub, now));
+        assert!(!ic.has_cookie_for_test());
+
+        // (b) Wrong responder key → wrong AEAD key → not consumed.
+        let wrong_pub = [0x93u8; 32];
+        assert!(!ic.consume_reply(&reply, &wrong_pub, now));
+        assert!(!ic.has_cookie_for_test());
+
+        // Sanity: the untampered reply with the RIGHT key DOES consume — the
+        // failures above were the tamper/key, not a broken reply. (`last_mac1`
+        // is still the first initiation's MAC1 — we have not sent another —
+        // so the AAD still matches.)
+        assert!(ic.consume_reply(&reply, &responder_pub, now));
+        assert!(ic.has_cookie_for_test());
+    }
+
+    /// An EXPIRED cookie (older than [`COOKIE_ROTATION_TIME_NS`], 120 s) is
+    /// NOT used: add_macs leaves MAC2 zero rather than stamping a stale
+    /// cookie. Just inside the window it is still stamped.
+    #[test]
+    fn initiator_expired_cookie_yields_zero_mac2() {
+        let responder_pub = [0x94u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let t0 = 10_000_000_000u64;
+        let from = src(51820);
+
+        let mut ic = InitiatorCookie::new();
+        let mut first = valid_mac1_init(&responder_pub, 1);
+        ic.add_macs(&mut first, t0);
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, t0, &mut reply).unwrap();
+        assert!(ic.consume_reply(&reply, &responder_pub, t0));
+
+        // Just within the TTL → MAC2 stamped.
+        let mut in_window = valid_mac1_init(&responder_pub, 2);
+        assert!(ic.add_macs(&mut in_window, t0 + COOKIE_ROTATION_TIME_NS - 1));
+        assert_ne!(&in_window[M1_MAC2..], &[0u8; 16]);
+
+        // Past the TTL (> 120 s) → MAC2 zero (a stale cookie is not used).
+        let mut expired = valid_mac1_init(&responder_pub, 3);
+        assert!(!ic.add_macs(&mut expired, t0 + COOKIE_ROTATION_TIME_NS + 1));
+        assert_eq!(&expired[M1_MAC2..], &[0u8; 16]);
+    }
+
+    /// A cookie-reply that arrives before the initiator ever sent an
+    /// initiation (no stored MAC1 to use as the AEAD AAD) is ignored — the
+    /// reply cannot be attributed, so it is dropped fail-closed.
+    #[test]
+    fn initiator_ignores_cookie_reply_before_any_initiation() {
+        let responder_pub = [0x95u8; 32];
+        let cc = CookieChecker::new(&responder_pub);
+        let now = 10_000_000_000u64;
+        let from = src(51820);
+
+        let first = valid_mac1_init(&responder_pub, 9);
+        let mut reply = [0u8; WG_MSG_COOKIE_LEN];
+        cc.build_cookie_reply(&first, from, now, &mut reply).unwrap();
+
+        let mut ic = InitiatorCookie::new();
+        assert!(
+            !ic.consume_reply(&reply, &responder_pub, now),
+            "a reply with no prior sent initiation cannot be attributed"
+        );
+        assert!(!ic.has_cookie_for_test());
     }
 }

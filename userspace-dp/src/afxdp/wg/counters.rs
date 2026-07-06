@@ -31,9 +31,11 @@
 //! that peer). The responder cookie-reply / MAC2 under-load path is now
 //! counted too (#4094 PR-A): `hs_cookie_replies_sent`,
 //! `hs_rx_under_load_no_mac2`, `hs_rx_under_load_mac2_ok`, and
-//! `hs_cookie_reply_budget_drops`. The remaining reserved-with-no-site
-//! counter is `hs_rx_cookie_unsupported` — an INBOUND type-3 drop, still
-//! deferred to the initiator-side cookie-reply consume (PR-B).
+//! `hs_cookie_reply_budget_drops`. The initiator-side cookie-reply CONSUME
+//! (#4094 PR-B) is now counted: `hs_rx_cookie_consumed` (a cookie-reply we
+//! decrypted and stored, arming a valid MAC2 on our next initiation) and
+//! `hs_rx_cookie_unsupported` (now a real site: a cookie-reply we could not
+//! attribute to an in-flight initiation or could not decrypt).
 
 use super::engine::{DecapError, EncapError};
 use super::handshake::FramingError;
@@ -70,12 +72,21 @@ pub(crate) struct WgCounters {
     /// the transport-record `decap_drops_replay` window; this is the
     /// HANDSHAKE anti-replay gate.
     pub(crate) hs_rx_drops_replayed_init: AtomicU64,
-    /// Inbound type-3 (cookie-reply) datagrams dropped. In PR-A the
-    /// RESPONDER cookie path is live, but the INITIATOR-side consume of an
-    /// inbound cookie-reply (parse + re-initiate with a real MAC2) is PR-B,
-    /// so a received type-3 is still dropped here. Renamed intent, same
-    /// wire name for compatibility.
+    /// Inbound type-3 (cookie-reply) datagrams DROPPED by the initiator
+    /// (#4094 PR-B): a reply we could not attribute to an in-flight
+    /// initiation (`receiver_index` matched no pending handshake) or could
+    /// not decrypt (wrong key / bad AAD / tampered). Successful consumes are
+    /// counted separately as `hs_rx_cookie_consumed`. Same wire name as the
+    /// former S7 placeholder for Go-side compatibility; the meaning is now a
+    /// real drop-by-reason rather than "unsupported".
     pub(crate) hs_rx_cookie_unsupported: AtomicU64,
+    /// #4094 PR-B: inbound type-3 cookie-replies successfully CONSUMED by the
+    /// initiator — decrypted with the responder's public-key-derived key and
+    /// our last-sent MAC1 as AAD, and stored so the NEXT initiation to that
+    /// peer carries a valid MAC2. The initiator half of the under-load DoS
+    /// mitigation working end-to-end (pairs with the responder's
+    /// `hs_cookie_replies_sent` / `hs_rx_under_load_mac2_ok`).
+    pub(crate) hs_rx_cookie_consumed: AtomicU64,
     /// #4094 PR-A: WG type-3 CookieReply messages the RESPONDER emitted —
     /// one per under-load, valid-MAC1, missing/bad-MAC2 initiation that was
     /// challenged instead of handshaked.
