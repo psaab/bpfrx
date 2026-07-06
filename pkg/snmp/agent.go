@@ -572,7 +572,12 @@ func (a *Agent) handleV2cPacket(rest []byte, srcIP net.IP) []byte {
 	// Verify community string and resolve its authorization level.
 	comm := a.getCommunity(string(community))
 	if comm == nil {
-		slog.Debug("SNMP: invalid community", "community", string(community))
+		// SECURITY (#4302): do NOT log the community string — it is the v2c
+		// shared secret (SNMPCommunity.Name, redacted everywhere else). Log
+		// only the source; known_community=false marks the unknown-community
+		// drop, symmetric with the source-denied known_community=true log
+		// below (#4289).
+		slog.Debug("SNMP: invalid community", "src", srcIP, "known_community", false)
 		return nil
 	}
 
@@ -607,7 +612,7 @@ func (a *Agent) handleV2cPacket(rest []byte, srcIP net.IP) []byte {
 	case pduGetBulkRequest:
 		return a.handleGetBulk(community, pduBody)
 	case pduSetRequest:
-		return a.handleSet(community, comm, pduBody)
+		return a.handleSet(community, comm, srcIP, pduBody)
 	default:
 		slog.Debug("SNMP: unsupported PDU type", "type", pduTag)
 		return nil
@@ -650,7 +655,7 @@ func (a *Agent) SETAuthorized(community string) bool {
 // itself is refused per-varbind with notWritable. No served object is
 // mutable, so a successful SET is never produced here — but the read-only vs
 // read-write distinction is enforced and observable in the error-status.
-func (a *Agent) handleSet(community []byte, comm *config.SNMPCommunity, pduBody []byte) []byte {
+func (a *Agent) handleSet(community []byte, comm *config.SNMPCommunity, srcIP net.IP, pduBody []byte) []byte {
 	requestID, _, _, oids, err := decodePDUFields(pduBody)
 	if err != nil {
 		slog.Debug("SNMP: failed to decode SET PDU", "err", err)
@@ -666,8 +671,12 @@ func (a *Agent) handleSet(community []byte, comm *config.SNMPCommunity, pduBody 
 
 	if !communityCanWrite(comm) {
 		// Read-only (or unspecified) community: deny write access.
+		// SECURITY (#4302): do NOT log the community string — it is the v2c
+		// shared secret. Log the source and the (non-secret) authorization
+		// level so the denial is correlatable without exposing the secret,
+		// matching the #4289 pattern.
 		slog.Debug("SNMP: SET denied, community not authorized read-write",
-			"community", string(community), "authorization", comm.Authorization)
+			"src", srcIP, "authorization", comm.Authorization)
 		errIdx := 0
 		if len(oids) > 0 {
 			errIdx = 1

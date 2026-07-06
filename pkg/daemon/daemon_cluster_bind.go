@@ -50,6 +50,52 @@ func resolveInterfaceAddr(ifname, fallback string) string {
 	return fallback
 }
 
+// hostIsLoopback reports whether a bind host string is a loopback address. An
+// empty or unparseable host is treated as loopback (safe — do NOT clamp on
+// uncertainty and break a legitimate bind); resolveInterfaceAddr always returns
+// a literal IP (or the loopback fallback), so in practice host is a parseable
+// IP. Used by the #4047 part-B runtime clamp (daemon_run.go) to decide whether a
+// no-auth web-management bind is network-reachable and must be pulled back to
+// loopback.
+func hostIsLoopback(host string) bool {
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true
+	}
+	return ip.IsLoopback()
+}
+
+// clampBindToLoopback is the pure decision for the #4047 part-B runtime
+// fail-safe clamp. Given a resolved REST bind ("host:port", IPv6 host bracketed)
+// and whether api-auth is configured, it returns the effective bind address and
+// whether it was clamped. A bind is clamped ONLY when it is BOTH off-loopback
+// AND unauthenticated — that is the exact case where the unauthenticated
+// mutating config endpoints would otherwise be reachable from the network. The
+// clamp targets a loopback of the SAME address family (::1 for an IPv6 bind,
+// 127.0.0.1 for IPv4) and preserves the port. An authenticated bind, a loopback
+// bind, or an unparseable address is returned unchanged (do not clamp on
+// uncertainty and break a legitimate bind — resolveInterfaceAddr yields a
+// literal IP, so an unparseable host is not expected in practice).
+func clampBindToLoopback(addr string, hasAuth bool) (string, bool) {
+	if hasAuth {
+		return addr, false
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || hostIsLoopback(host) {
+		return addr, false
+	}
+	loopback := "127.0.0.1"
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		// An IPv6 (non-v4-mapped) address clamps to the IPv6 loopback so the
+		// bind stays same-family (a v6 daemon is reachable on ::1, not 127.0.0.1).
+		loopback = "::1"
+	}
+	return net.JoinHostPort(loopback, port), true
+}
+
 func parseLiteralIP(addr string) net.IP {
 	if addr == "" {
 		return nil

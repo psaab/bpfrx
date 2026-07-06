@@ -35795,3 +35795,99 @@ top.
   gofmt + vet clean.
 - **File(s)**: pkg/cli/cli_request_policies_check.go,
   pkg/cli/cli_request_policies_check_test.go, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4302 (follow-up to #4289 S-3) SNMP v2c community secret-leak
+  scrub. Two pre-existing debug log lines in pkg/snmp/agent.go echoed the
+  v2c community string (the shared secret): the invalid-community drop in
+  handleV2cPacket (`slog.Debug("SNMP: invalid community", "community",
+  string(community))`) and the read-only SET denial in handleSet. Scrubbed
+  both to log the request SOURCE instead of the secret, matching the #4289
+  source-denied log. handleSet now takes srcIP (threaded from
+  handleV2cPacket) so the denial is correlatable by source; the invalid-
+  community line logs `known_community=false`. The community value is only
+  used to echo back in the response varbind (buildResponse), never logged.
+- **Validation**: new agent_secret_log_4302_test.go captures Debug-level
+  slog output and asserts the community secret is ABSENT and the source IP
+  present for both paths; proven RED under revert (old lines leaked
+  s3cr3t-unknown-community / s3cr3t-readonly-community into the record).
+  go test ./pkg/snmp/ green; go build ./pkg/snmp/ clean.
+- **File(s)**: pkg/snmp/agent.go, pkg/snmp/agent_secret_log_4302_test.go,
+  _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4296 (fable-167 F-1 residual) firewall family-any specific-match
+  gate. #4287 dual-compiles a `family any` filter into BOTH FiltersInet and
+  FiltersInet6; a family-specific match under `family any` (a v4/v6
+  source/destination-address literal or a per-family icmp-type/icmp-code) was
+  dual-compiled VERBATIM, so the copy in the wrong pool never matches — the
+  v6 term falls through to the implicit ACCEPT (imperfect v6 under-block).
+  Added validateFirewallFilterFamilyAnyMatchesAST in compiler_firewall.go
+  (mirrors validateFirewallFilterFamilyCollisionsAST's strict-reject /
+  lenient-warn #1960/#3261 split), invoked in compiler.go right after the
+  collision gate; new lenientFirewallFilterFamilyAnyMatches flag set on both
+  lenient paths. Flagged leaves: source-address, destination-address,
+  icmp-type, icmp-code (next-header + prefix-lists deliberately excluded).
+  Gate fires BEFORE validateFilterAddressLiteralsStrict (#3433) so the address
+  case gets the clearer family-any message; icmp-type/icmp-code is the genuine
+  new coverage (#3433 does not check icmp).
+- **Validation**: compiler_firewall_family_any_match_4296_test.go — strict
+  reject of v4 source-address + symbolic icmp-type, lenient warn, family-
+  agnostic protocol under family any commits into both pools, single-family
+  address literals not flagged. Proven RED under gate-neuter: icmp-type went
+  nil (no other gate catches it); source-address error text reverted to the
+  #3433 message. go test ./pkg/config/... green; go build ./... clean.
+- **File(s)**: pkg/config/compiler_firewall.go, pkg/config/compiler.go,
+  pkg/config/compiler_firewall_family_any_match_4296_test.go,
+  docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4047 (fable-161 F-155) web-management REST-auth gate. The
+  REST/config API (pkg/api) serves the mutating config endpoints with NO
+  auth middleware unless `system services web-management api-auth` is set;
+  binding it off-loopback (`web-management http|https interface <mgmt-if>`)
+  without api-auth exposes set/commit/rollback/system-action to the network.
+  Part A (pkg/config): validateWebManagementAuthStrict in compiler.go
+  (alongside validateDeviceMapStrict) hard-rejects an off-loopback bind
+  (HTTPInterface/HTTPSInterface non-empty) without api-auth at strict commit;
+  new lenientWebManagementAuth flag downgrades to a warning on load/peer-sync
+  (#1960 no-brick). Part B (pkg/daemon): daemon_run.go runtime clamp — when
+  the resolved bind is non-loopback AND apiCfg.Auth == nil, clamp to
+  127.0.0.1 + WARN (hostIsLoopback helper in daemon_cluster_bind.go), so a
+  leniently-loaded vulnerable config boots on loopback instead of exposed.
+  Updated two existing parse fixtures (TestSystemConfigWebManagementEnhanced,
+  TestSystemConfigSetSyntax) to carry api-auth (they bound interfaces without
+  auth). Part C (/metrics) was already done via #4162.
+- **Validation**: web_management_auth_4047_test.go — strict reject of HTTP +
+  HTTPS off-loopback no-auth, off-loopback+user / +api-key commits, loopback
+  no-auth commits, absent commits, lenient warn. Proven RED under gate-neuter
+  (accepted / no warning). go test ./pkg/config/... ./pkg/daemon/...
+  ./pkg/api/... green; go build ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/web_management_auth_4047_test.go,
+  pkg/config/parser_system_test.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_cluster_bind.go, docs/architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4047 review fold (PR #4319 MERGE-READY, 2 non-blocking items).
+  (1) IPv6 bind fix: daemon_run.go built the REST bind by string-concat
+  (`bindIP + ":8080"` / `httpsBindIP + ":8443"`), broken for an IPv6
+  interface address (no brackets -> net.SplitHostPort + net.Listen fail ->
+  the part-B clamp no-ops and the listener blackholes for an IPv6-only mgmt
+  interface). Changed both to net.JoinHostPort. (2) Part-B clamp refactored
+  into a pure testable helper clampBindToLoopback(addr, hasAuth) ->
+  (effectiveAddr, clamped) in daemon_cluster_bind.go, called from BOTH the
+  HTTP and HTTPS bind sites; clamps a non-loopback + no-auth bind to a
+  SAME-FAMILY loopback (::1 for IPv6, 127.0.0.1 for IPv4, port preserved).
+  Added web_management_clamp_4047_test.go: hostIsLoopback table (v4/v6
+  loopback + 127/8 + routable + wildcard + empty/unparseable-as-safe) and
+  clampBindToLoopback decision table (off-loopback+no-auth clamps same-family
+  incl [2001:db8::1]:8080 -> [::1]:8080; off-loopback+auth NOT clamped;
+  loopback untouched; wildcard 0.0.0.0 clamps; unparseable untouched).
+  Updated architecture.md part-B note (same-family loopback + JoinHostPort).
+  Merged origin/master (#4318 docs; _Log.md auto-merged, no conflict).
+- **Validation**: go test ./pkg/config/... ./pkg/snmp/... ./pkg/daemon/...
+  green (incl new clamp/hostIsLoopback tests); go build ./... clean; gofmt +
+  vet clean.
+- **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/daemon_cluster_bind.go,
+  pkg/daemon/web_management_clamp_4047_test.go, docs/architecture.md, _Log.md
