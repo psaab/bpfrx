@@ -1,3 +1,33 @@
+## 2026-07-06 — docs: drive-to-zero doc slices #4056 (config-store secrets-at-rest threat model) + #4080 (VRRP accept-data no-op)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Drove two converged PLAN-READY doc-only slices to fixes.
+  (#4056) Replaced the "Follow-up (design, not shipped here)" pointer note
+  in pkg/configstore/README.md with an explicit secrets-at-rest threat
+  model: 0600 file + 0700 dir defend non-root local users + casual
+  leakage but NOT root compromise or physical disk theft; at-rest
+  encryption of the text copies is intentionally not done because the
+  unattended-boot appliance must keep the decryption key on-box next to
+  the ciphertext (master.key is a plain random 0600 file, no TPM/HSM
+  substrate) — theater vs the root/disk threat, so a real feature needs
+  a TPM/HSM-sealed key (deferred, #4056). Also documented that
+  transfer-on-commit scp's cleartext secrets off-box (the honest residual
+  to control). (#4080) Added a Gotchas note to pkg/vrrp/README.md that
+  accept-data is accepted for Junos compatibility but is a no-op under
+  xpf's VIP-as-real-address model: addVIPs installs each VIP as a real
+  kernel address via netlink.AddrAdd, so the master always accepts VIP
+  traffic (RFC 5798 Accept_Mode=on); accept-data=off is a deferred
+  dataplane+control-plane redesign. accept-data is ALREADY accepted at
+  commit (schema_interfaces.go / compiler_interfaces.go, covered by
+  existing tests) — no schema-accept needed, doc-only.
+- **Validation**: verified every claim against HEAD (3bc0d54ba) — perms
+  code (store_commit/store_persist/db/crypto 0600, dirs 0700), master.key
+  = io.ReadFull(rand.Reader) no TPM, transfer-on-commit scpArchiveTransfer
+  StrictHostKeyChecking=no, addVIPs netlink.AddrAdd, AcceptData compiled
+  but never read outside tests. go test ./pkg/config/... ./pkg/vrrp/...
+  green; go build ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/configstore/README.md, pkg/vrrp/README.md, _Log.md
+
 ## 2026-07-05 — system: fable-167 PR #4311 review fixes (S-2 priv-esc + deny-commands advisory + S-4 sshd -t gate)
 
 - **Timestamp**: 2026-07-05
