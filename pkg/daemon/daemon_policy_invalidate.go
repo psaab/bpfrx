@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -130,16 +131,95 @@ func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) 
 // dropped by the NEW policy — so a tightened (permit→deny, narrowed-match)
 // policy takes effect on live traffic instead of lingering until idle timeout.
 //
+// A surviving policy whose SCHEDULER binding effectively flipped active→inactive
+// is treated as a verdict change too (#4343): policyRuleInactive (userspace-dp
+// policies.go) is FAIL-CLOSED, so an inactive-scheduled policy is skipped in the
+// rule chain — its live sessions must re-enter evaluation exactly like a
+// permit→deny action change. The old/new per-scheduler active-state maps are
+// evaluated at commit time from each config's schedulers via the same helper the
+// apply transaction uses (policySchedulerActiveStateForApplyLocked); the caller
+// holds d.applySem so d.scheduler cannot race.
+//
 // The `extensive` sub-case (Junos re-evaluates sessions of UNCHANGED policies
 // when a referenced address-book / application object changes) is deliberately
 // NOT implemented here — this clears only the policies whose own match/action
 // text changed. `policy-rematch extensive` stays tracked as a follow-up
 // (compiler_validate_warn.go advisory).
 func (d *Daemon) clearSessionsForModifiedPolicies(oldCfg, newCfg *config.Config) {
+	now := time.Now()
+	oldSched := d.policySchedulerActiveStateForApplyLocked(oldCfg, now)
+	newSched := d.policySchedulerActiveStateForApplyLocked(newCfg, now)
 	d.clearSessionsForPolicyIDs(
-		changedPolicyRuntimeIDs(oldCfg, newCfg),
+		changedPolicyRuntimeIDs(oldCfg, newCfg, oldSched, newSched),
 		dataplane.DeleteReasonPolicyModified,
 		"modified (policy-rematch)",
+	)
+}
+
+// defaultPolicyChanged reports whether the implicit default-policy changed in a
+// way that must invalidate live default-PERMIT sessions, and whether the clear
+// is UNCONDITIONAL (a verdict change) or gated on `policy-rematch` (a log-only
+// flip). The implicit default-policy is the catch-all a flow hits when it
+// matches no configured zone-pair / global / wildcard rule; a default-PERMIT
+// verdict installs a session stamped DefaultPolicySentinelID (0xFFFFFFFF), which
+// the named-policy invalidators never touch because they diff only
+// PolicyIDsByStableKey (configured policies, never emitting the sentinel). So a
+// `default-policy permit-all` -> `deny-all` (or reject) commit otherwise leaves
+// the existing default-permit flows forwarding until idle timeout — the #4342
+// stale-intent gap.
+//
+//   - An ACTION change (permit<->deny/reject) is a verdict change: clear
+//     UNCONDITIONALLY, mirroring the always-on deletion-clear. A tightening
+//     (permit->deny) must drop the now-should-be-denied sessions; the reverse
+//     (deny->permit) installs nothing to sweep, so the clear is a harmless no-op
+//     there (no session carries the sentinel under a default-deny).
+//   - A LOG-only flip (action unchanged, session-init/session-close toggled) is
+//     re-evaluation, not a verdict change: gate it on `policy-rematch` so a live
+//     default-permit session re-installs under the new logging intent only when
+//     the operator opted into rematch, matching the modified-policy half's
+//     posture. Without policy-rematch the flip applies to new sessions only.
+func defaultPolicyChanged(oldCfg, newCfg *config.Config) (changed, unconditional bool) {
+	if oldCfg == nil || newCfg == nil {
+		return false, false
+	}
+	if oldCfg.Security.DefaultPolicy != newCfg.Security.DefaultPolicy {
+		return true, true
+	}
+	if oldCfg.Security.DefaultPolicyLogSessionInit != newCfg.Security.DefaultPolicyLogSessionInit ||
+		oldCfg.Security.DefaultPolicyLogSessionClose != newCfg.Security.DefaultPolicyLogSessionClose {
+		return true, false
+	}
+	return false, false
+}
+
+// clearSessionsForDefaultPolicyChange invalidates, at commit time, every live
+// default-PERMIT session (policy_id == DefaultPolicySentinelID) when the
+// implicit default-policy's verdict or logging intent changed (#4342). It reuses
+// the shared clearSessionsForPolicyIDs core, so the drop is companion-aware and
+// HA-delete-synced to the standby exactly like the named-policy clears.
+//
+// The overloaded-id-0 fail-safe that deletedPolicyRuntimeIDs / changedPolicy-
+// RuntimeIDs apply does NOT apply here: the target id is the 0xFFFFFFFF sentinel,
+// which by construction can never alias policy_id 0 (host-inbound / fabric /
+// tunnel / synced sessions and old HA peers all carry 0, never 0xFFFFFFFF — see
+// DefaultPolicySentinelID). Sweeping the sentinel is therefore safe and precise.
+//
+// Caller must hold d.applySem (all commit/sync/rollback call sites do).
+func (d *Daemon) clearSessionsForDefaultPolicyChange(oldCfg, newCfg *config.Config) {
+	changed, unconditional := defaultPolicyChanged(oldCfg, newCfg)
+	if !changed {
+		return
+	}
+	if !unconditional && (newCfg == nil || !newCfg.Security.PolicyRematch) {
+		// Log-only flip without policy-rematch: leave live default-permit
+		// sessions to log per their install-time intent (Junos re-evaluates
+		// in-progress sessions only under policy-rematch).
+		return
+	}
+	d.clearSessionsForPolicyIDs(
+		map[uint32]struct{}{dataplane.DefaultPolicySentinelID: {}},
+		dataplane.DeleteReasonDefaultPolicyChanged,
+		"default-policy changed",
 	)
 }
 
@@ -277,9 +357,15 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 // wire-value reason documented there (host-inbound / fabric / tunnel / synced
 // sessions and old HA peers all carry 0).
 //
+// oldSched / newSched are the per-scheduler active-state maps under the old and
+// new configs, evaluated at the same commit-time instant (nil when a config has
+// no schedulers). They drive the #4343 scheduler active->inactive verdict-change
+// detection (policySchedulerBecameInactive); pass nil/nil to consider only
+// match/action changes.
+//
 // Returns nil when oldCfg is nil (boot), policy-rematch is unset, or nothing
 // changed.
-func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} {
+func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config, oldSched, newSched map[string]bool) map[uint32]struct{} {
 	if oldCfg == nil || newCfg == nil || !newCfg.Security.PolicyRematch {
 		return nil
 	}
@@ -306,7 +392,8 @@ func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 		if oldPol == nil || newPol == nil {
 			continue
 		}
-		if !policyMatchOrActionChanged(oldPol, newPol) {
+		if !policyMatchOrActionChanged(oldPol, newPol) &&
+			!policySchedulerBecameInactive(oldPol, newPol, oldSched, newSched) {
 			continue
 		}
 		if changed == nil {
@@ -317,6 +404,28 @@ func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 	return changed
 }
 
+// policySchedulerBecameInactive reports whether a surviving policy's EFFECTIVE
+// enforcement state flipped from active to inactive across the commit — the
+// scheduler-binding analogue of an action tightening (#4343). policyRuleInactive
+// (userspace-dp policies.go, exported as PolicyInactive) is FAIL-CLOSED: a policy
+// bound to an inactive-or-undefined scheduler is stamped Inactive and its rule is
+// SKIPPED in the chain, so an active->inactive flip is a verdict change for a
+// live session — its next packet no longer matches this policy and re-enters
+// evaluation (falling through to a later rule or the default-policy). This covers
+// both a scheduler-name BINDING change (unscheduled->scheduled-and-inactive, or
+// active-scheduler->inactive-scheduler) and a same-binding scheduler whose active
+// WINDOW the commit redefined out from under the current instant.
+//
+// The inactive->active direction is intentionally NOT a clear trigger: while the
+// policy was inactive it admitted no sessions, so none carry its policy_id — a
+// sweep would be a pure no-op. Only the tightening direction (active->inactive)
+// has live sessions to re-evaluate.
+func policySchedulerBecameInactive(oldPol, newPol *config.Policy, oldSched, newSched map[string]bool) bool {
+	wasActive := !dpuserspace.PolicyInactive(oldPol.SchedulerName, oldSched)
+	nowInactive := dpuserspace.PolicyInactive(newPol.SchedulerName, newSched)
+	return wasActive && nowInactive
+}
+
 // policyMatchOrActionChanged reports whether two same-identity policies differ
 // in a way that changes the verdict for an in-progress session: the terminal
 // ACTION (permit/deny/reject) or any MATCH predicate (source/destination
@@ -324,8 +433,12 @@ func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 // from/to zone scope). Address and application lists are compared as SETS so a
 // pure reordering — which does not change what the policy matches — does not
 // trigger a needless session clear. Non-verdict attributes (description, count,
-// log, scheduler-name) are intentionally ignored: they do not affect whether a
-// live session should still be permitted.
+// log) are intentionally ignored: they do not affect whether a live session
+// should still be permitted. scheduler-name is NOT ignored — it gates
+// fail-closed enforcement (policyRuleInactive), so a scheduler active->inactive
+// transition is handled separately by policySchedulerBecameInactive (#4343),
+// which needs the runtime scheduler active-state and so cannot be decided from
+// the two Policy structs alone.
 func policyMatchOrActionChanged(oldPol, newPol *config.Policy) bool {
 	if oldPol.Action != newPol.Action {
 		return true

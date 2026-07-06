@@ -273,6 +273,11 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 	// sessions of a surviving policy whose match/action changed so the tightened
 	// policy re-evaluates live traffic (no-op unless policy-rematch is set).
 	d.clearSessionsForModifiedPolicies(oldActive, compiled)
+	// #4342 default-policy re-eval: a change to the implicit default-policy
+	// (permit<->deny/reject, always on; or a session-log flip under policy-
+	// rematch) must drop the existing default-PERMIT sessions (sentinel id) so
+	// they stop forwarding with stale intent.
+	d.clearSessionsForDefaultPolicyChange(oldActive, compiled)
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
 	// standby has to receive the committed config or the nodes diverge.
@@ -346,6 +351,7 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		}
 		d.clearSessionsForDeletedPolicies(oldActive, compiled)
 		d.clearSessionsForModifiedPolicies(oldActive, compiled)
+		d.clearSessionsForDefaultPolicyChange(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict
 		// commit can only validate ITS OWN hardware (R-8), so a synced
@@ -493,6 +499,7 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	}
 	d.clearSessionsForDeletedPolicies(oldActive, prevCfg)
 	d.clearSessionsForModifiedPolicies(oldActive, prevCfg)
+	d.clearSessionsForDefaultPolicyChange(oldActive, prevCfg)
 	// #3868: RE-SYNC the rolled-back config (C1) to the cluster peer. The
 	// standby already received the unconfirmed config (C2) via config-sync
 	// SyncApply, which arms NO confirm timer, so it holds C2 as its PERMANENT

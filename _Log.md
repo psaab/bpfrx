@@ -1,3 +1,43 @@
+## 2026-07-06 — #4342 / #4343: session-invalidation residuals (default-policy + scheduler)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Extended the #4234 commit-time session-invalidation with the two
+  codex-164 residuals. **#4342 (default-policy):** default-PERMIT flows install a
+  session stamped `DefaultPolicySentinelID` (0xFFFFFFFF), which the #4234 named-
+  policy invalidators never emit (they diff only `PolicyIDsByStableKey`), so a
+  `default-policy permit-all`→`deny`/`reject` (or a session-log flip) left those
+  flows forwarding with stale intent. Added `defaultPolicyChanged(old,new)` +
+  `clearSessionsForDefaultPolicyChange` — feeds `{DefaultPolicySentinelID}` into
+  the shared `clearSessionsForPolicyIDs` core with a new `DeleteReason`
+  (`DeleteReasonDefaultPolicyChanged`). An action change clears UNCONDITIONALLY
+  (like the deletion-clear); a log-only flip gates on `policy-rematch`. The id-0
+  fail-safe does NOT apply — the sentinel cannot alias `policy_id 0`. **#4343
+  (scheduler):** `policyRuleInactive` is FAIL-CLOSED, so a scheduler
+  active→inactive transition IS an enforcement predicate. Threaded old/new
+  per-scheduler active-state (via `policySchedulerActiveStateForApplyLocked`)
+  into `changedPolicyRuntimeIDs`; a surviving policy whose scheduler-name binding
+  or active window flips it active→inactive is now a verdict change
+  (`policySchedulerBecameInactive`), cleared under `policy-rematch`. Both wire
+  into the same three apply call sites (`applyAndSyncCommitted`, `syncAndApply`,
+  commit-confirmed rollback) under `d.applySem`, reusing the #2468 HA delete-sync
+  (`QueueDeleteV4/V6`) and companion-aware `DeleteBatchKnownV4/V6`.
+- **File(s)**: pkg/daemon/daemon_policy_invalidate.go (defaultPolicyChanged,
+  clearSessionsForDefaultPolicyChange, policySchedulerBecameInactive,
+  changedPolicyRuntimeIDs 4-arg, clearSessionsForModifiedPolicies scheduler
+  threading, policyMatchOrActionChanged doc-fix), pkg/daemon/daemon_apply.go
+  (3 call sites), pkg/dataplane/session_store.go (DeleteReasonDefaultPolicyChanged),
+  pkg/daemon/daemon_policy_default_4342_test.go (new, RED-on-revert),
+  pkg/daemon/daemon_policy_scheduler_4343_test.go (new, RED-on-revert),
+  pkg/daemon/daemon_policy_modified_4234_test.go (4-arg call sites),
+  docs/feature-gaps.md (policy-rematch support matrix).
+- **Validation**: `go test ./pkg/daemon/... ./pkg/dataplane/...` green;
+  RED-on-revert proven for BOTH (neutralizing `policySchedulerBecameInactive`
+  fails the #4343 tests; neutralizing `defaultPolicyChanged` fails the #4342
+  action/log-flip tests while the id-0-not-swept + named-spare assertions stay
+  green on revert, confirming the sentinel sweep is precise). `go build ./...`,
+  gofmt, `go vet` clean. HA-touching (new delete-sync triggers) → parent runs
+  test-failover before merge; delete-sync path is the proven #2468 shared core.
+
 ## 2026-07-06 — #4344 migrate remaining policy-counter display surfaces to the bulk reader (H05/M02/M07)
 
 - **Timestamp**: 2026-07-06
