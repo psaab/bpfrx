@@ -152,6 +152,20 @@ func normalizeHAProtocolVersion(version uint16) uint16 {
 // metadata. If monitors would cause the packet to exceed the limit, the monitor
 // section is truncated and the version field is preserved.
 func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
+	return marshalHeartbeatBody(pkt, 0)
+}
+
+// marshalHeartbeatBody encodes the heartbeat wire body, keeping tailReserve
+// bytes free at the tail of the frame for a trailer the caller appends (the
+// #4107 auth trailer). tailReserve==0 is the plain legacy encoding, byte-for-
+// byte what MarshalHeartbeat always produced. The election-critical header +
+// RG groups are always written and the SOFTWARE version is reserved next; only
+// the best-effort monitor section is truncated to fit within
+// maxHeartbeatSize-tailReserve. Because the reserve is honored WHILE building
+// the body, a keyed frame ALWAYS has room for its HMAC — a heartbeat is never
+// silently downgraded to unsigned (the #4107 invariant; see
+// MarshalHeartbeatAuth).
+func marshalHeartbeatBody(pkt *HeartbeatPacket, tailReserve int) []byte {
 	buf := make([]byte, maxHeartbeatSize)
 	copy(buf[0:4], heartbeatMagic)
 	buf[4] = heartbeatVersion
@@ -176,7 +190,7 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		if len(version) > maxHeartbeatSoftwareVersionSize {
 			version = version[:maxHeartbeatSoftwareVersionSize]
 		}
-		if off+heartbeatVersionTrailerSize+len(version) <= maxHeartbeatSize {
+		if off+heartbeatVersionTrailerSize+len(version) <= maxHeartbeatSize-tailReserve {
 			versionReserve = heartbeatVersionTrailerSize + len(version)
 		} else {
 			version = nil
@@ -191,7 +205,7 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 	for _, mon := range pkt.Monitors {
 		nameBytes := []byte(mon.Interface)
 		entrySize := 4 + len(nameBytes) // RGID + Flags + Weight + NameLen + name
-		if off+entrySize > maxHeartbeatSize-versionReserve {
+		if off+entrySize > maxHeartbeatSize-versionReserve-tailReserve {
 			break
 		}
 		buf[off] = mon.RGID
@@ -208,7 +222,7 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		numMon++
 	}
 	buf[monCountOff] = uint8(numMon)
-	if off+versionReserve <= maxHeartbeatSize {
+	if off+versionReserve+tailReserve <= maxHeartbeatSize {
 		buf[off] = uint8(len(version))
 		off++
 		if len(version) > 0 {
@@ -334,16 +348,28 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 // strictly increasing counter rejects intra-session replays). When authKey is
 // empty the output is byte-identical to MarshalHeartbeat — a node without a key
 // emits legacy frames (dual-accept). The key is never logged.
+//
+// INVARIANT: once a key is configured, the returned frame is ALWAYS signed. The
+// trailer space is reserved WHILE building the body (marshalHeartbeatBody drops
+// best-effort monitor entries to make room), so a heartbeat is never silently
+// downgraded to unsigned — a silent downgrade would make an ENFORCING peer
+// reject every frame and split the cluster (dual-primary). At realistic RG +
+// monitor counts the reserve never even bites; the belt-and-suspenders guard
+// below is unreachable and fails LOUD rather than emitting cleartext.
 func MarshalHeartbeatAuth(pkt *HeartbeatPacket, authKey []byte, session, counter uint64) []byte {
-	body := MarshalHeartbeat(pkt)
 	if len(authKey) == 0 {
-		return body
+		return marshalHeartbeatBody(pkt, 0)
 	}
+	// Reserve the trailer up front so the signed frame is guaranteed to fit.
+	body := marshalHeartbeatBody(pkt, heartbeatAuthTrailerSize)
 	if len(body)+heartbeatAuthTrailerSize > maxHeartbeatSize {
-		// No room for the trailer within the UDP frame cap. Emit the legacy
-		// frame rather than a corrupt one; at real heartbeat sizes (a handful
-		// of RGs + monitors) this branch is never taken.
-		return body
+		// Unreachable: the RG group count is uint8-bounded and monitors were
+		// already truncated to leave the reserve. Guard so a future change can
+		// never SILENTLY downgrade a keyed heartbeat to unsigned (which an
+		// enforcing peer rejects → split-brain). Fail loud and still sign
+		// rather than emit an unsigned frame.
+		slog.Error("cluster: keyed heartbeat exceeds frame cap after monitor truncation; signing anyway to preserve the auth invariant",
+			"body_bytes", len(body), "cap", maxHeartbeatSize)
 	}
 	trailer := make([]byte, heartbeatAuthTrailerSize)
 	copy(trailer[0:4], heartbeatAuthMagic)

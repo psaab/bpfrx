@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -65,6 +66,62 @@ func TestMarshalHeartbeatAuth_NoKeyIsLegacy(t *testing.T) {
 	}
 	if _, _, present := heartbeatAuthTrailer(authed); present {
 		t.Error("legacy frame must not carry an auth trailer")
+	}
+}
+
+// TestMarshalHeartbeatAuth_NeverUnsignedWhenKeyed is the #4107 invariant: a
+// config large enough to overflow the frame (many interface monitors) STILL
+// yields a SIGNED frame when a key is configured — the best-effort monitor
+// section is truncated to make room, but the HMAC is always present and
+// verifies, and the election-critical RG groups survive. RED on revert:
+// dropping the trailer reserve (marshalHeartbeatBody tailReserve) lets the body
+// fill to the cap so MarshalHeartbeatAuth would emit an UNSIGNED frame
+// (present==false) that an enforcing peer rejects -> dual-primary split.
+func TestMarshalHeartbeatAuth_NeverUnsignedWhenKeyed(t *testing.T) {
+	key := []byte("cluster-shared-secret")
+	pkt := &HeartbeatPacket{
+		NodeID:            1,
+		ClusterID:         42,
+		SoftwareVersion:   "xpf-overflow-version-string",
+		HAProtocolVersion: CurrentHAProtocolVersion,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+			{GroupID: 1, Priority: 150, Weight: 100, State: uint8(StateSecondary)},
+		},
+	}
+	// Enough monitors with long names to blow well past the 1472-byte cap so
+	// the monitor section MUST be truncated to fit the trailer.
+	for i := 0; i < 300; i++ {
+		pkt.Monitors = append(pkt.Monitors, HeartbeatMonitor{
+			RGID:      uint8(i % 2),
+			Weight:    10,
+			Up:        true,
+			Interface: fmt.Sprintf("monitor-interface-name-%04d", i),
+		})
+	}
+
+	data := MarshalHeartbeatAuth(pkt, key, 0xabc, 1)
+
+	if len(data) > maxHeartbeatSize {
+		t.Fatalf("signed frame exceeds cap: %d > %d", len(data), maxHeartbeatSize)
+	}
+	if _, _, present := heartbeatAuthTrailer(data); !present {
+		t.Fatal("keyed heartbeat emitted UNSIGNED under frame overflow — an enforcing peer would reject every frame (dual-primary)")
+	}
+	if !verifyHeartbeatMAC(data, key) {
+		t.Error("overflow-truncated signed frame failed HMAC verification")
+	}
+	got, err := UnmarshalHeartbeat(data)
+	if err != nil {
+		t.Fatalf("unmarshal truncated signed frame: %v", err)
+	}
+	if len(got.Groups) != 2 {
+		t.Errorf("election-critical groups dropped under truncation: got %d, want 2", len(got.Groups))
+	}
+	// Monitors WERE truncated — that is how room for the HMAC was made.
+	if len(got.Monitors) >= len(pkt.Monitors) {
+		t.Errorf("expected monitor truncation to make room for the trailer, got %d of %d",
+			len(got.Monitors), len(pkt.Monitors))
 	}
 }
 

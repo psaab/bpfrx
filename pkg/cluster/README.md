@@ -134,6 +134,15 @@ peer liveness (`lastSeen`) or drive election.
   `UnmarshalHeartbeat` already ignores bytes past the version section,
   a signed frame stays wire-parseable by a legacy / not-yet-keyed peer
   — the same additive-trailer discipline as the version trailer.
+  **Never-unsigned-when-keyed invariant:** `MarshalHeartbeatAuth`
+  reserves the 52-byte trailer up front via
+  `marshalHeartbeatBody(pkt, heartbeatAuthTrailerSize)`, which truncates
+  the best-effort monitor section (never the election-critical header /
+  RG groups) to make room. So once a key is configured a heartbeat is
+  ALWAYS signed — never silently downgraded to unsigned, which an
+  enforcing peer would reject and split the cluster (dual-primary). The
+  overflow guard is unreachable at the uint8-bounded RG count and fails
+  LOUD (`slog.Error`) rather than emitting cleartext.
 - **Anti-replay.** `session` is a random per-sender-process id and
   `counter` a monotonic per-session counter. `heartbeatAuthReplay.admit`
   accepts a strictly increasing counter within a session and RE-ANCHORS

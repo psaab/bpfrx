@@ -36115,3 +36115,26 @@ top.
   gofmt, vet, and `go build ./...` all clean.
 - **File(s)**: pkg/config/ast_groups.go,
   pkg/config/apply_groups_leaflist_test.go
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A hardening fold (hostile-review) — close the
+  silent-downgrade-to-unsigned edge. MarshalHeartbeatAuth previously fell back
+  to emitting an UNSIGNED frame when body+52 > maxHeartbeatSize (an extreme
+  ~monitor-heavy config), which an ENFORCING peer would reject → dual-primary.
+  Fix: extracted marshalHeartbeatBody(pkt, tailReserve) from MarshalHeartbeat
+  (MarshalHeartbeat is now a tailReserve=0 wrapper, byte-identical); when a key
+  is configured MarshalHeartbeatAuth reserves heartbeatAuthTrailerSize up front
+  so the best-effort monitor section is truncated to make room while the
+  election-critical header/RG groups are always kept — the signed frame ALWAYS
+  fits its HMAC. Invariant: once a key is configured a heartbeat is NEVER
+  emitted unsigned. The residual overflow guard is unreachable at the
+  uint8-bounded RG count and fails LOUD (slog.Error) instead of emitting
+  cleartext. Added TestMarshalHeartbeatAuth_NeverUnsignedWhenKeyed (300 long-name
+  monitors overflow the cap → frame still SIGNED + verifies, groups survive,
+  monitors truncated). RED-on-revert proven: dropping the reserve re-introduces
+  the unsigned-fallback → test fails "emitted UNSIGNED under frame overflow".
+  go test ./pkg/config/... ./pkg/cluster/... green (incl. -race); go build,
+  gofmt, vet clean. Also merged origin/master (#4070/#4325 advanced); _Log.md
+  union.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/README.md, _Log.md
