@@ -1,3 +1,37 @@
+## 2026-07-06 — #4090: survivor-fabric cold-start bulk sync re-drive
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed the #4090 dual-fabric cold-start gap. The full session
+  BulkSync streams over a SINGLE fabric connection (`BulkSync` /
+  `sendBulkMarkers` pin `getActiveConn()` once, no per-message failover). If
+  that connection dropped mid-cold-start while the OTHER fabric stayed up, the
+  bulk was stranded — the per-message send loop only fails over the
+  steady-state delta stream, and `handleNewConnection`'s `wasDisconnected` gate
+  needs BOTH conns nil to re-fire, so the standby cold-started with an
+  incomplete session table. `handleDisconnect` now, after clearing the dropped
+  conn and computing `connected`, schedules a re-drive of `doBulkSync()` over
+  the survivor when `connected && !bulkEverCompleted`. The re-drive runs on a
+  `wg`-tracked GOROUTINE (not inline: `handleDisconnect` holds `s.mu` and
+  `doBulkSync → getActiveConn` re-locks it — inline would self-deadlock),
+  guarded by a `bulkRedriveInFlight` atomic.Bool CAS (one re-drive at a time,
+  reset when done, so a survivor that ALSO flaps cannot cause a re-drive
+  storm), and resets `pendingBulkAckEpoch=0` before the re-run so its fresh
+  epoch supersedes the stranded one (#3912). Receiver needs no change — a fresh
+  `BulkStart` resets `bulkInProgress`/`bulkRecvV4`/`bulkRecvV6` and `BulkEnd`
+  runs `reconcileStaleSessions`, so the re-driven bulk cleanly re-primes.
+- **File(s)**: `pkg/cluster/sync.go` (new `bulkRedriveInFlight` field),
+  `pkg/cluster/sync_conn.go` (`handleDisconnect` survivor re-drive branch),
+  `pkg/cluster/sync_test.go` (new `readSyncFrame` helper +
+  `TestBulkSyncRedriveOnSurvivorFabric` RED-on-revert + no-deadlock,
+  `TestBulkSyncNoRedriveWhenAlreadyCompleted`,
+  `TestBulkSyncRedriveInFlightGuard`), `docs/sync-protocol.md` (new
+  "Survivor-fabric cold-start bulk re-drive (#4090)" subsection).
+- **Validation**: `go test ./pkg/cluster/ -race` green; RED-on-revert
+  confirmed (neutralizing the CAS branch fails the re-drive + guard tests);
+  `go build ./...`, `go vet ./pkg/cluster/...`, `gofmt -l` clean. HA
+  session-sync change — parent runs `test-failover` before merge (a mid-bulk
+  fabric flap during failover is the target scenario).
+
 ## 2026-07-06 — #4313 PR-B: first production closed-world subtree flip (destination-NAT then)
 
 - **Timestamp**: 2026-07-06

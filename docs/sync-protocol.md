@@ -400,6 +400,47 @@ ordering".
 
 Both forward and reverse entries are sent during bulk sync. The receiver calls `SetSessionV4/V6` to install each session directly into the BPF map.
 
+#### Survivor-fabric cold-start bulk re-drive (#4090)
+
+The cold-start bulk streams over a **single** fabric connection: `BulkSync`
+(and the event-stream override's `sendBulkMarkers`) capture
+`getActiveConn()` once and pin every session + `BulkStart`/`BulkEnd` marker to
+that connection with no per-message failover. On a dual-fabric cluster both
+`conn0` and `conn1` are established concurrently, and the cold-start bulk is
+triggered exactly once — gated on `wasDisconnected` (BOTH conns nil) AND
+`!bulkEverCompleted` in `handleNewConnection`. If the pinned fabric dropped
+mid-bulk while the *other* fabric stayed up, the bulk was stranded: the
+per-message send loop only fails over the steady-state delta stream, not the
+one-shot bulk, and `handleNewConnection`'s `wasDisconnected` gate cannot
+re-fire while a survivor is up. The standby cold-started with an incomplete
+session table until BOTH fabrics happened to drop together.
+
+`handleDisconnect` now closes that gap. After clearing the dropped conn and
+computing `connected := conn0 != nil || conn1 != nil`, when a survivor is still
+up AND `!bulkEverCompleted.Load()` (the cold-start bulk never completed), it
+schedules a single re-drive of `doBulkSync()` over the survivor:
+
+- **Goroutine, not inline.** `handleDisconnect` holds `s.mu`, and
+  `doBulkSync → BulkSync/sendBulkMarkers → getActiveConn` re-locks `s.mu`; an
+  inline call would self-deadlock. The re-drive runs on a `wg`-tracked
+  goroutine that takes no lock across the `handleDisconnect` boundary.
+- **CAS in-flight guard.** `bulkRedriveInFlight` (an `atomic.Bool`,
+  compare-and-swap `false→true`) bounds re-drives to one at a time and is reset
+  when the goroutine returns, so a survivor that *also* flaps (its own write
+  failure re-entering `handleDisconnect`) cannot start a storm of re-drives.
+- **Stranded epoch reset.** The goroutine stores `pendingBulkAckEpoch = 0`
+  before the re-run so the fresh bulk's epoch supersedes the stranded one (a
+  latched phantom pending epoch would block manual failover, #3912).
+- **Receiver unchanged.** A fresh `BulkStart` resets the receiver's
+  `bulkInProgress`/`bulkRecvV4`/`bulkRecvV6` (and `resetRecvGen`, #2198 F2), and
+  `BulkEnd` runs `reconcileStaleSessions`, so the re-driven bulk cleanly
+  re-primes the standby.
+
+Once any bulk exchange completes (`bulkEverCompleted` set on a received
+`BulkEnd`/`BulkAck`), the gate closes: steady-state incremental sync already
+fails over via the send loop, so no re-drive is needed and a normal
+post-cold-start single-fabric drop does not re-bulk.
+
 ### 2. Periodic Sync Sweep (1s interval, new sessions)
 
 `StartSyncSweep()` launches a goroutine with a 1-second ticker:
