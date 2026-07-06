@@ -563,28 +563,26 @@ func ValidateConfig(cfg *Config) []string {
 
 	// #4233/#4234: `security policies policy-rematch [extensive]` is typed and
 	// recorded (compiler_security_policy.go). The Junos-DEFAULT deletion-clear
-	// now ships (#4234): a session admitted by a policy that a commit DELETES is
+	// ships (#4234): a session admitted by a policy that a commit DELETES is
 	// invalidated immediately at commit (daemon_apply.go →
-	// clearSessionsForDeletedPolicies), independent of this knob. What
-	// policy-rematch additionally promises — re-evaluating an in-progress session
-	// against a MODIFIED (not deleted) policy set — is still accepted-only: xpf
-	// does not re-classify live sessions, so a session admitted by a policy whose
-	// match/action later changed keeps forwarding until its idle timeout. Warn so
-	// the operator is not silently misled into believing modified-policy
-	// re-evaluation is active. Mirrors the #2078 / #2008 H13 accepted-only
-	// doctrine; the modified-policy re-eval half stays tracked in #4234.
-	if cfg.Security.PolicyRematch {
-		knob := "policy-rematch"
-		if cfg.Security.PolicyRematchExtensive {
-			knob = "policy-rematch extensive"
-		}
-		warnings = append(warnings, fmt.Sprintf(
-			"security policies %s configured but only partially enforced — a "+
-				"DELETED policy's sessions are now dropped at commit (Junos "+
-				"default, #4234), but xpf does not yet re-evaluate an in-progress "+
-				"session against a MODIFIED policy; such a session keeps forwarding "+
-				"until its idle timeout (#4233; modified-policy re-eval tracked in "+
-				"#4234)", knob))
+	// clearSessionsForDeletedPolicies), independent of this knob. The
+	// modified-policy re-evaluation ALSO now ships when policy-rematch is set
+	// (clearSessionsForModifiedPolicies): a session admitted by a policy whose
+	// MATCH or ACTION later changed is dropped at commit so the tightened policy
+	// re-evaluates live traffic. What remains unenforced is `extensive`: Junos
+	// re-evaluates even sessions of an UNCHANGED policy when a referenced
+	// address-book / application object changes; xpf clears only the policies
+	// whose own match/action text changed. Warn on `extensive` so an operator is
+	// not misled; a plain `policy-rematch` needs no advisory now that its core is
+	// enforced. The `extensive` gap stays tracked in #4234.
+	if cfg.Security.PolicyRematchExtensive {
+		warnings = append(warnings,
+			"security policies policy-rematch extensive configured but only "+
+				"partially enforced — xpf re-evaluates live sessions of a policy "+
+				"whose own match/action changed, but does NOT re-evaluate sessions "+
+				"of an UNCHANGED policy when a referenced address-book / application "+
+				"object changes (the `extensive` case); those sessions keep "+
+				"forwarding until idle timeout (#4234)")
 	}
 
 	// #4231 (fable-167 P-3): five `security flow` knobs are now typed +
@@ -918,6 +916,16 @@ func ValidateConfig(cfg *Config) []string {
 					"class-of-service traffic-control-profiles guaranteed-rate / delay-buffer-rate are accepted for compatibility but inert: the userspace dataplane enforces only the profile's shaping-rate and scheduler-map on the bound unit (#4315), so those values have no runtime effect")
 				warnedTCPInert = true
 			}
+			// #4228 Gap 2: shaping-rate percent is typed + stored but inert —
+			// the dataplane folds an ABSOLUTE shaping-rate into the bound unit's
+			// root shaper, and xpf does not yet resolve a percent against the
+			// interface speed, so a percent-only shaping-rate leaves the unit
+			// unshaped. Warn per profile so the operator is not misled.
+			if tcp.ShapingRatePercent > 0 {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service traffic-control-profiles %q shaping-rate percent is accepted for Junos compatibility but inert: the userspace dataplane enforces an absolute shaping-rate and xpf does not yet resolve the percent against the bound interface's speed, so the unit is left unshaped (#4228 Gap 2)",
+					tcp.Name))
+			}
 		}
 		// #4316 (fable-167 F-3b): inet-precedence classifiers/rewrite and exp
 		// rewrite are accepted for Junos compatibility but INERT — the
@@ -990,6 +998,23 @@ func ValidateConfig(cfg *Config) []string {
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q codel-target is accepted for compatibility but inert: the userspace dataplane has no CoDel AQM (#1829 Phase 2 not shipped), so the configured target has no runtime effect",
 					sched.Name))
+			}
+			// #4228 Gap 2: transmit-rate percent/remainder is typed + stored
+			// (so garbage is rejected at commit) but currently inert — the
+			// userspace dataplane consumes an absolute byte/sec transmit-rate,
+			// and xpf does not yet resolve the percent/remainder against the
+			// bound interface's rate (that resolution is multi-pass: a scheduler
+			// can be mapped onto interfaces of different speeds). Warn so an
+			// operator is not misled into believing the queue got an explicit
+			// rate. Mirrors the accepted-but-inert doctrine.
+			if sched.TransmitRatePercent > 0 || sched.TransmitRateRemainder {
+				form := "percent"
+				if sched.TransmitRateRemainder {
+					form = "remainder"
+				}
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service scheduler %q transmit-rate %s is accepted for Junos compatibility but inert: the userspace dataplane consumes an absolute byte/sec rate and xpf does not yet resolve the percent/remainder against the bound interface's rate, so the queue gets no explicit transmit-rate (#4228 Gap 2)",
+					sched.Name, form))
 			}
 		}
 		for _, schedMap := range cos.SchedulerMaps {

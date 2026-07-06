@@ -49,8 +49,15 @@ type ClassOfServiceConfig struct {
 // or delay-buffer reservation in the userspace shaper (the #1614 A1
 // guarantee-rate is a proportional FRACTION, a distinct mechanism).
 type CoSTrafficControlProfile struct {
-	Name                 string
-	ShapingRateBytes     uint64 // bytes/sec; 0 = unset
+	Name             string
+	ShapingRateBytes uint64 // bytes/sec; 0 = unset
+	// ShapingRatePercent (#4228 Gap 2) carries the Junos `shaping-rate percent
+	// <n>` form: a share (0,100] of the bound interface's speed. Accepted for
+	// vSRX-config import parity but ACCEPTED-BUT-INERT — the dataplane folds an
+	// absolute ShapingRateBytes into the bound unit's root shaper and xpf does
+	// not yet resolve the percent against the interface speed (commit
+	// advisory). Mutually exclusive with ShapingRateBytes.
+	ShapingRatePercent   float64
 	GuaranteedRateBytes  uint64 // bytes/sec; 0 = unset (accepted-but-inert)
 	DelayBufferRateBytes uint64 // bytes/sec; 0 = unset (accepted-but-inert)
 	SchedulerMap         string
@@ -106,7 +113,19 @@ type CoSScheduler struct {
 	Name              string
 	TransmitRateBytes uint64
 	TransmitRateExact bool
-	Priority          string
+	// TransmitRatePercent (#4228 Gap 2) carries the Junos `transmit-rate
+	// percent <n>` form: a share (0,100] of the bound interface's rate. It is
+	// accepted for vSRX-config import parity but ACCEPTED-BUT-INERT — the
+	// userspace dataplane consumes an absolute byte/sec TransmitRateBytes, and
+	// xpf does not yet resolve the percent against the interface's shaping-rate
+	// (a commit advisory surfaces this). Mutually exclusive with
+	// TransmitRateBytes and TransmitRateRemainder (validateClassOfServiceStrict).
+	TransmitRatePercent float64
+	// TransmitRateRemainder (#4228 Gap 2) carries the Junos `transmit-rate
+	// remainder` form (a share of the leftover bandwidth). Same accepted-but-
+	// inert status as TransmitRatePercent.
+	TransmitRateRemainder bool
+	Priority              string
 	// BufferSizeBytes preserves the legacy explicit byte-size path.
 	BufferSizeBytes uint64
 	// BufferSizePercent is the Junos percent form. A value > 0 means

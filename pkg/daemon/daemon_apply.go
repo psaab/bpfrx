@@ -269,6 +269,10 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 	// linger until idle timeout. Runs under d.applySem (the caller holds it),
 	// after the dataplane apply so the new policy set is already live.
 	d.clearSessionsForDeletedPolicies(oldActive, compiled)
+	// #4234 modified-policy re-eval: when `policy-rematch` is set, also drop
+	// sessions of a surviving policy whose match/action changed so the tightened
+	// policy re-evaluates live traffic (no-op unless policy-rematch is set).
+	d.clearSessionsForModifiedPolicies(oldActive, compiled)
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
 	// standby has to receive the committed config or the nodes diverge.
@@ -341,6 +345,7 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 			return nil, err
 		}
 		d.clearSessionsForDeletedPolicies(oldActive, compiled)
+		d.clearSessionsForModifiedPolicies(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict
 		// commit can only validate ITS OWN hardware (R-8), so a synced
@@ -487,6 +492,7 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
 	}
 	d.clearSessionsForDeletedPolicies(oldActive, prevCfg)
+	d.clearSessionsForModifiedPolicies(oldActive, prevCfg)
 	// #3868: RE-SYNC the rolled-back config (C1) to the cluster peer. The
 	// standby already received the unconfirmed config (C2) via config-sync
 	// SyncApply, which arms NO confirm timer, so it holds C2 as its PERMANENT

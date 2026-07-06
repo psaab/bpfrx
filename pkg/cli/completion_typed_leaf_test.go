@@ -44,20 +44,20 @@ func hasCand(cands []completionCandidate, name string) bool {
 
 // Symptom-1 demonstration: `set class-of-service schedulers be
 // transmit-rate ?` (trailing space → empty partial at the value slot)
-// must surface the <rate> placeholder and example values through the live
-// CLI completer. On master this returns nothing for the value slot.
+// must surface the rate-or-percent placeholder and example values through the
+// live CLI completer. The percent/remainder forms landed in #4228 Gap 2.
 func TestCompleteConfig_TransmitRate_ShowsRatePlaceholderAndExamples(t *testing.T) {
 	c := newTypedLeafCLI(t)
 	cands := c.completeConfigWithDesc(
 		[]string{"set", "class-of-service", "schedulers", "be", "transmit-rate"},
 		"",
 	)
-	if !hasCand(cands, "<rate>") {
-		t.Fatalf("expected <rate> placeholder at value slot, got %v", candNames(cands))
+	if !hasCand(cands, "<rate|percent|remainder>") {
+		t.Fatalf("expected <rate|percent|remainder> placeholder at value slot, got %v", candNames(cands))
 	}
-	for _, ex := range []string{"100k", "10m", "1g", "10g"} {
+	for _, ex := range []string{"100k", "10m", "1g", "10g", "percent", "remainder"} {
 		if !hasCand(cands, ex) {
-			t.Fatalf("expected rate example %q, got %v", ex, candNames(cands))
+			t.Fatalf("expected transmit-rate example %q, got %v", ex, candNames(cands))
 		}
 	}
 }

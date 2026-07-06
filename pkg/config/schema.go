@@ -84,6 +84,22 @@ type schemaNode struct {
 	// typed leaf sets EITHER validator OR treeValidator, never both.
 	treeValidator treeLeafValidator
 
+	// tailValidator, when non-nil, validates the ENTIRE value/modifier tail
+	// of a leaf as a unit instead of token-by-token (#4228 Gap 2). It exists
+	// for irregular Junos grammars whose tail is heterogeneous and cannot be
+	// checked by the standard typed-leaf path — CoS `transmit-rate (rate |
+	// percent <n> | remainder) [exact]` and `shaping-rate (rate | percent
+	// <n>)`, where the first token is EITHER a value (10m) or a keyword
+	// (percent/remainder). walkSchemaNode dispatches such a leaf to
+	// validateTailLeaf, which gathers every tail token (Keys[1:] plus any
+	// hierarchical child-leaf tokens, since flat-set groups `percent 90` as a
+	// container + child) and hands the flattened slice — with the same-keyword
+	// sibling tails, so a split-set modifier-only line (`transmit-rate exact`
+	// beside `transmit-rate 1g`) is still accepted — to this function.
+	// valueType/valueExamples may still be set for `?` completion; validator
+	// MUST be nil so the tail path owns acceptance.
+	tailValidator leafTailValidator
+
 	// Typed KEY slot (#1319 PR 3). A named-instance CONTAINER (args > 0
 	// with a children map, e.g. `family inet address <cidr> { primary; }`)
 	// carries its value in the IDENTITY token, not in a leaf value slot —

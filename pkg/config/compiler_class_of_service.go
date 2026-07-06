@@ -254,9 +254,15 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 		for _, child := range inst.node.Children {
 			switch child.Name() {
 			case "transmit-rate":
-				rate, exact := parseCoSTransmitRate(child)
+				rate, percent, remainder, exact := parseCoSTransmitRate(child)
 				if rate > 0 {
 					sched.TransmitRateBytes = rate
+				}
+				if percent > 0 {
+					sched.TransmitRatePercent = percent
+				}
+				if remainder {
+					sched.TransmitRateRemainder = true
 				}
 				sched.TransmitRateExact = sched.TransmitRateExact || exact
 			case "priority":
@@ -300,9 +306,21 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	// are captured but currently inert (see CoSTrafficControlProfile).
 	for _, inst := range namedInstances(node.FindChildren("traffic-control-profiles")) {
 		tcp := &CoSTrafficControlProfile{Name: inst.name}
-		if shapingNode := inst.node.FindChild("shaping-rate"); shapingNode != nil {
-			if v := nodeVal(shapingNode); v != "" {
-				tcp.ShapingRateBytes = parseBandwidthLimit(v)
+		// #4228 Gap 2: shaping-rate is an absolute bandwidth OR `percent <n>`.
+		// Iterate ALL shaping-rate statements (not just FindChild's first): the
+		// flat-set percent form (`shaping-rate percent 90`) lands as a SEPARATE
+		// sibling node from an absolute `shaping-rate 1g`, so reading only the
+		// first would be order-dependent AND would silently ignore a conflicting
+		// second statement. Accumulating both fields lets
+		// validateClassOfServiceStrict catch the bytes+percent conflict (mirrors
+		// the transmit-rate per-child accumulation). Copilot #4320.
+		for _, shapingNode := range inst.node.FindChildren("shaping-rate") {
+			rate, percent := parseCoSShapingRate(shapingNode)
+			if rate > 0 {
+				tcp.ShapingRateBytes = rate
+			}
+			if percent > 0 {
+				tcp.ShapingRatePercent = percent
 			}
 		}
 		if grNode := inst.node.FindChild("guaranteed-rate"); grNode != nil {
@@ -729,22 +747,56 @@ func collectCoSFairnessRSSExpectation(queueNode *Node) (string, error) {
 	return expr, nil
 }
 
-func parseCoSTransmitRate(node *Node) (uint64, bool) {
-	var rate uint64
-	exact := false
-	for _, key := range node.Keys[1:] {
-		if key == "exact" {
+// parseCoSTransmitRate reads a scheduler `transmit-rate` leaf. It returns the
+// absolute byte/sec rate (0 when the operator used percent/remainder or no
+// rate), the Junos `percent <n>` share (0 when unused), the `remainder` flag,
+// and the `exact` modifier. #4228 Gap 2 added percent/remainder; the tail
+// tokens are gathered identically to the schema tailValidator
+// (gatherLeafTailTokens) so validation and compilation never drift.
+func parseCoSTransmitRate(node *Node) (rateBytes uint64, percent float64, remainder bool, exact bool) {
+	toks := gatherLeafTailTokens(node)
+	for i := 0; i < len(toks); i++ {
+		switch toks[i] {
+		case "exact":
 			exact = true
+		case "remainder":
+			remainder = true
+		case "percent":
+			if i+1 < len(toks) {
+				if v, err := strconv.ParseFloat(toks[i+1], 64); err == nil {
+					percent = v
+				}
+				i++
+			}
+		default:
+			if parsed := parseBandwidthLimit(toks[i]); parsed > 0 {
+				rateBytes = parsed
+			}
+		}
+	}
+	return rateBytes, percent, remainder, exact
+}
+
+// parseCoSShapingRate reads a `shaping-rate` leaf (traffic-control-profiles),
+// returning the absolute byte/sec rate (0 when percent/no-rate) and the Junos
+// `percent <n>` share (0 when unused). #4228 Gap 2.
+func parseCoSShapingRate(node *Node) (rateBytes uint64, percent float64) {
+	toks := gatherLeafTailTokens(node)
+	for i := 0; i < len(toks); i++ {
+		if toks[i] == "percent" {
+			if i+1 < len(toks) {
+				if v, err := strconv.ParseFloat(toks[i+1], 64); err == nil {
+					percent = v
+				}
+				i++
+			}
 			continue
 		}
-		if parsed := parseBandwidthLimit(key); parsed > 0 {
-			rate = parsed
+		if parsed := parseBandwidthLimit(toks[i]); parsed > 0 {
+			rateBytes = parsed
 		}
 	}
-	if node.FindChild("exact") != nil {
-		exact = true
-	}
-	return rate, exact
+	return rateBytes, percent
 }
 
 func collectCoSDSCPCodePoints(node *Node) ([]uint8, error) {

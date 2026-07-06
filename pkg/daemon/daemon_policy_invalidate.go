@@ -110,11 +110,52 @@ func deletedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 // Caller must hold d.applySem (all commit/sync/rollback call sites do), so this
 // cannot race a concurrent apply that would reprogram the policy-ID namespace.
 func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) {
-	if d.dp == nil {
-		return
-	}
-	deleted := deletedPolicyRuntimeIDs(oldCfg, newCfg)
-	if len(deleted) == 0 {
+	d.clearSessionsForPolicyIDs(
+		deletedPolicyRuntimeIDs(oldCfg, newCfg),
+		dataplane.DeleteReasonPolicyDeleted,
+		"deleted",
+	)
+}
+
+// clearSessionsForModifiedPolicies invalidates, at commit time, every live
+// session admitted by a policy that survives the commit (same zones+name) but
+// whose MATCH or ACTION changed — the Junos `security policies policy-rematch`
+// behavior of re-evaluating in-progress sessions against the changed policy set
+// (#4234 modified-policy half). It is gated on `policy-rematch` being set in the
+// committed config (changedPolicyRuntimeIDs returns nil otherwise) and, like the
+// deletion-clear, is bounded to sessions whose stored policy_id matches a
+// changed policy; an unchanged policy's sessions are never touched.
+//
+// A cleared session's next packet re-enters policy evaluation and is admitted or
+// dropped by the NEW policy — so a tightened (permit→deny, narrowed-match)
+// policy takes effect on live traffic instead of lingering until idle timeout.
+//
+// The `extensive` sub-case (Junos re-evaluates sessions of UNCHANGED policies
+// when a referenced address-book / application object changes) is deliberately
+// NOT implemented here — this clears only the policies whose own match/action
+// text changed. `policy-rematch extensive` stays tracked as a follow-up
+// (compiler_validate_warn.go advisory).
+func (d *Daemon) clearSessionsForModifiedPolicies(oldCfg, newCfg *config.Config) {
+	d.clearSessionsForPolicyIDs(
+		changedPolicyRuntimeIDs(oldCfg, newCfg),
+		dataplane.DeleteReasonPolicyModified,
+		"modified (policy-rematch)",
+	)
+}
+
+// clearSessionsForPolicyIDs is the shared core behind the deletion-clear
+// (#4234) and the modified-policy re-eval: it drops every live session whose
+// stored policy_id is in ids, using the same companion-aware delete + HA
+// delete-sync propagation the GC and cluster-stale reconcile use. ids is the
+// set of OLD numeric policy IDs the target sessions carry; an empty set is a
+// no-op (a commit with no matching policy change pays no session-table scan).
+// reason is the documentary delete label; what labels the change class in the
+// summary log line.
+//
+// Caller must hold d.applySem (all commit/sync/rollback call sites do), so this
+// cannot race a concurrent apply that would reprogram the policy-ID namespace.
+func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason dataplane.DeleteReason, what string) {
+	if d.dp == nil || len(ids) == 0 {
 		return
 	}
 
@@ -132,27 +173,42 @@ func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) 
 	// reverse + DNAT companions. A reverse entry carries the SAME policy_id as
 	// its forward, so including it would double-delete the same session and, for
 	// a NAT'd flow, target the translated tuple instead of the install key.
+	//
+	// Capture the enumerate error: a failed iteration yields a partial (or empty)
+	// entry set, so clearing what we gathered would silently leave should-be-
+	// cleared sessions forwarding while logging an apparently-clean invalidation.
+	// Surface it loudly and suppress the success line so the partial clear is
+	// observable, not masked (Copilot #4320).
 	var v4Entries []dataplane.SessionEntryV4
-	_ = store.ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	v4EnumErr := store.ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if _, hit := deleted[val.PolicyID]; hit {
+		if _, hit := ids[val.PolicyID]; hit {
 			v4Entries = append(v4Entries, dataplane.SessionEntryV4{Key: key, Value: val})
 		}
 		return true
 	})
 
 	var v6Entries []dataplane.SessionEntryV6
-	_ = store.ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	v6EnumErr := store.ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if _, hit := deleted[val.PolicyID]; hit {
+		if _, hit := ids[val.PolicyID]; hit {
 			v6Entries = append(v6Entries, dataplane.SessionEntryV6{Key: key, Value: val})
 		}
 		return true
 	})
+	if v4EnumErr != nil || v6EnumErr != nil {
+		slog.Error("policy session invalidation: session-table enumerate failed; clear is PARTIAL — some sessions of changed policies may keep forwarding",
+			"change", what, "reason", reason, "policies", len(ids),
+			"v4_err", v4EnumErr, "v6_err", v6EnumErr,
+			"v4_matched", len(v4Entries), "v6_matched", len(v6Entries))
+		// Fall through to clear what we DID enumerate — a partial clear is
+		// strictly better than none — but the error log above ensures the
+		// partial state is visible and the success line below is skipped.
+	}
 
 	if len(v4Entries) == 0 && len(v6Entries) == 0 {
 		return
@@ -160,9 +216,9 @@ func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) 
 
 	v4Cleared := 0
 	if len(v4Entries) > 0 {
-		if n, err := store.DeleteBatchKnownV4(v4Entries, dataplane.DeleteReasonPolicyDeleted); err != nil {
-			slog.Warn("policy-delete session invalidation: v4 clear failed",
-				"deleted_policies", len(deleted), "matched", len(v4Entries), "err", err)
+		if n, err := store.DeleteBatchKnownV4(v4Entries, reason); err != nil {
+			slog.Warn("policy session invalidation: v4 clear failed",
+				"reason", reason, "policies", len(ids), "matched", len(v4Entries), "err", err)
 		} else {
 			v4Cleared = n
 		}
@@ -175,9 +231,9 @@ func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) 
 
 	v6Cleared := 0
 	if len(v6Entries) > 0 {
-		if n, err := store.DeleteBatchKnownV6(v6Entries, dataplane.DeleteReasonPolicyDeleted); err != nil {
-			slog.Warn("policy-delete session invalidation: v6 clear failed",
-				"deleted_policies", len(deleted), "matched", len(v6Entries), "err", err)
+		if n, err := store.DeleteBatchKnownV6(v6Entries, reason); err != nil {
+			slog.Warn("policy session invalidation: v6 clear failed",
+				"reason", reason, "policies", len(ids), "matched", len(v6Entries), "err", err)
 		} else {
 			v6Cleared = n
 		}
@@ -189,10 +245,124 @@ func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) 
 	}
 
 	// One-time state transition, not a per-session/per-tick event — slog.Info is
-	// the right level (project logging rules).
-	slog.Info("cleared sessions of deleted policies at commit",
-		"deleted_policies", len(deleted),
-		"v4_cleared", v4Cleared,
-		"v6_cleared", v6Cleared,
-		"ha_sync", syncPeer)
+	// the right level (project logging rules). Suppress the success line when the
+	// enumerate failed: the counts describe only what we managed to gather, so an
+	// Info "cleared" line would misreport a partial clear as complete (the Error
+	// line above already recorded it).
+	if v4EnumErr == nil && v6EnumErr == nil {
+		slog.Info("cleared sessions of changed policies at commit",
+			"change", what,
+			"policies", len(ids),
+			"v4_cleared", v4Cleared,
+			"v6_cleared", v6Cleared,
+			"ha_sync", syncPeer)
+	}
+}
+
+// changedPolicyRuntimeIDs returns the OLD numeric runtime IDs of policies that
+// survive the commit (present in BOTH oldCfg and newCfg by stable key) but whose
+// MATCH or ACTION changed — the set the modified-policy re-evaluation clears.
+//
+// It is GATED on `security policies policy-rematch` in the committed (new)
+// config: Junos re-evaluates in-progress sessions against a modified policy only
+// when policy-rematch is set. Without it, a modified policy's sessions keep
+// forwarding until idle timeout (the historical xpf behavior), which the commit
+// advisory documents.
+//
+// Only MODIFIED survivors are reported: a DELETED policy (absent from newCfg) is
+// the deletion-clear's job (deletedPolicyRuntimeIDs) and is skipped here; an
+// UNCHANGED policy keeps forwarding. The OLD numeric ID is used because live
+// sessions were stamped under the old config and carry it (identical rationale
+// to deletedPolicyRuntimeIDs). policy_id 0 is excluded for the same overloaded-
+// wire-value reason documented there (host-inbound / fabric / tunnel / synced
+// sessions and old HA peers all carry 0).
+//
+// Returns nil when oldCfg is nil (boot), policy-rematch is unset, or nothing
+// changed.
+func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} {
+	if oldCfg == nil || newCfg == nil || !newCfg.Security.PolicyRematch {
+		return nil
+	}
+	oldIDs := dpuserspace.PolicyIDsByStableKey(oldCfg)
+	if len(oldIDs) == 0 {
+		return nil
+	}
+	newIDs := dpuserspace.PolicyIDsByStableKey(newCfg)
+	oldPolicies := dpuserspace.PoliciesByStableKey(oldCfg)
+	newPolicies := dpuserspace.PoliciesByStableKey(newCfg)
+
+	var changed map[uint32]struct{}
+	for key, id := range oldIDs {
+		if id == 0 {
+			// Overloaded wire value — never sweep policy_id==0 sessions.
+			continue
+		}
+		if _, stillPresent := newIDs[key]; !stillPresent {
+			// Deleted — handled by the deletion-clear, not here.
+			continue
+		}
+		oldPol := oldPolicies[key]
+		newPol := newPolicies[key]
+		if oldPol == nil || newPol == nil {
+			continue
+		}
+		if !policyMatchOrActionChanged(oldPol, newPol) {
+			continue
+		}
+		if changed == nil {
+			changed = make(map[uint32]struct{})
+		}
+		changed[id] = struct{}{}
+	}
+	return changed
+}
+
+// policyMatchOrActionChanged reports whether two same-identity policies differ
+// in a way that changes the verdict for an in-progress session: the terminal
+// ACTION (permit/deny/reject) or any MATCH predicate (source/destination
+// addresses, applications, the address-excluded senses, or a global policy's
+// from/to zone scope). Address and application lists are compared as SETS so a
+// pure reordering — which does not change what the policy matches — does not
+// trigger a needless session clear. Non-verdict attributes (description, count,
+// log, scheduler-name) are intentionally ignored: they do not affect whether a
+// live session should still be permitted.
+func policyMatchOrActionChanged(oldPol, newPol *config.Policy) bool {
+	if oldPol.Action != newPol.Action {
+		return true
+	}
+	om, nm := oldPol.Match, newPol.Match
+	if om.SourceAddressExcluded != nm.SourceAddressExcluded ||
+		om.DestinationAddressExcluded != nm.DestinationAddressExcluded ||
+		om.FromZone != nm.FromZone ||
+		om.ToZone != nm.ToZone {
+		return true
+	}
+	return !sameStringSet(om.SourceAddresses, nm.SourceAddresses) ||
+		!sameStringSet(om.DestinationAddresses, nm.DestinationAddresses) ||
+		!sameStringSet(om.Applications, nm.Applications)
+}
+
+// sameStringSet reports whether two string slices contain the same elements
+// irrespective of order or duplicates.
+func sameStringSet(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	sa := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		sa[v] = struct{}{}
+	}
+	sb := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		sb[v] = struct{}{}
+	}
+	if len(sa) != len(sb) {
+		return false
+	}
+	for k := range sa {
+		if _, ok := sb[k]; !ok {
+			return false
+		}
+	}
+	return true
 }

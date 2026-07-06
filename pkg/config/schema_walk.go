@@ -137,6 +137,13 @@ func (vc *walkContext) collectedRefs() *schemaRefs {
 // same commit validate atomically.
 type treeLeafValidator func(raw string, refs *schemaRefs) error
 
+// leafTailValidator validates the whole value/modifier tail of a leaf as a
+// unit (#4228 Gap 2). tokens are the flattened tail of the leaf node;
+// siblingTails are the flattened tails of the same-keyword sibling nodes at
+// the same level (so a modifier-only split-set line can look across to a
+// sibling that supplies the value). See schemaNode.tailValidator.
+type leafTailValidator func(tokens []string, siblingTails [][]string) error
+
 // checkValue returns the per-token validation function for a typed
 // leaf: the scalar validator when set, else the tree-based
 // cross-reference validator bound to the walk's collected refs. A typed
@@ -291,6 +298,14 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	childSchema := resolveSchemaChild(parent, keyword)
 	if childSchema == nil {
 		return nil
+	}
+
+	// Whole-tail leaf (#4228 Gap 2): an irregular grammar (CoS transmit-rate /
+	// shaping-rate) whose heterogeneous value/modifier tail is validated as a
+	// unit rather than token-by-token. Takes precedence over the generic
+	// typed-leaf / container paths.
+	if childSchema.tailValidator != nil {
+		return validateTailLeaf(node, childSchema, path, siblings)
 	}
 
 	if childSchema.isTypedLeaf() && (childSchema.validator != nil || childSchema.treeValidator != nil) {
@@ -663,6 +678,58 @@ func validateMultiValueLeaf(node *Node, leafSchema *schemaNode, parentPath []str
 		return typedLeafErrorf(path, "missing value")
 	}
 	return nil
+}
+
+// validateTailLeaf validates a whole-tail leaf (#4228 Gap 2) — a leaf whose
+// schema carries a tailValidator. It gathers the leaf's flattened value/
+// modifier tail and the flattened tails of its same-keyword siblings, then
+// hands them to the leaf's tailValidator. Any returned error is scoped to the
+// leaf's config path so commit-check output reads the same as the other
+// typed-leaf errors.
+func validateTailLeaf(node *Node, leafSchema *schemaNode, parentPath []string, siblings []*Node) error {
+	leafName := node.Keys[0]
+	path := append(append([]string(nil), parentPath...), leafName)
+	tokens := gatherLeafTailTokens(node)
+	var siblingTails [][]string
+	for _, s := range siblings {
+		if s == nil || s == node || len(s.Keys) == 0 || s.Keys[0] != leafName {
+			continue
+		}
+		siblingTails = append(siblingTails, gatherLeafTailTokens(s))
+	}
+	if err := leafSchema.tailValidator(tokens, siblingTails); err != nil {
+		return fmt.Errorf("%s: %v", strings.Join(path, " "), err)
+	}
+	return nil
+}
+
+// gatherLeafTailTokens returns every value/modifier token belonging to a leaf
+// node, normalizing the two AST shapes a flat-set vs hierarchical parse can
+// produce for the same statement. The hierarchical parser packs
+// `transmit-rate percent 50 exact;` onto ONE node's Keys
+// (["transmit-rate","percent","50","exact"]); flat-set SetPath groups it as a
+// container Keys=["transmit-rate","percent"] with a child leaf ["50","exact"].
+// Collecting node.Keys[1:] plus every descendant leaf's Keys yields the same
+// flattened tail (["percent","50","exact"]) for both. Shared by the walker's
+// validateTailLeaf and the compiler's parseCoSTransmitRate / parseCoSShapingRate
+// so validation and compilation read an identical token stream.
+func gatherLeafTailTokens(node *Node) []string {
+	if node == nil {
+		return nil
+	}
+	tokens := append([]string(nil), node.Keys[1:]...)
+	var walk func(children []*Node)
+	walk = func(children []*Node) {
+		for _, c := range children {
+			if c == nil {
+				continue
+			}
+			tokens = append(tokens, c.Keys...)
+			walk(c.Children)
+		}
+	}
+	walk(node.Children)
+	return tokens
 }
 
 // siblingSuppliesTypedValue reports whether any sibling node with the same
