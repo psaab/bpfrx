@@ -214,19 +214,87 @@ func TestCoSShapingRateBytesAndPercentConflict_Rejected(t *testing.T) {
 	}
 }
 
-// Advisory: a percent transmit-rate is accepted but flagged inert.
-func TestCoSTransmitRatePercent_EmitsInertAdvisory(t *testing.T) {
+// Advisory: a percent transmit-rate on a scheduler that is NOT bound (via a
+// scheduler-map) to an interface with a root shaping-rate has no base to
+// resolve against, so it stays inert and ValidateConfig flags it. #4228 Gap 2
+// made the percent resolve when bound to a shaped interface (see
+// TestCoSTransmitRatePercent_ResolvesAgainstInterfaceShapingRate in the Rust
+// forwarding_build suite); this covers the unbound residual.
+func TestCoSTransmitRatePercent_UnboundEmitsNoEffectAdvisory(t *testing.T) {
 	cfg := mustCompileSet4228(t,
 		"set class-of-service schedulers be transmit-rate percent 50",
 	)
 	warnings := config.ValidateConfig(cfg)
 	found := false
 	for _, w := range warnings {
-		if strings.Contains(w, "transmit-rate percent") && strings.Contains(w, "inert") {
+		if strings.Contains(w, "transmit-rate percent") && strings.Contains(w, "no base to resolve") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected an accepted-but-inert advisory for transmit-rate percent, got: %v", warnings)
+		t.Fatalf("expected a no-effect advisory for an unbound transmit-rate percent, got: %v", warnings)
+	}
+}
+
+// #4228 Gap 2: a percent transmit-rate on a scheduler that IS bound via a
+// scheduler-map to a shaped interface RESOLVES — the Go control plane must NOT
+// emit the unbound no-effect advisory for it. FAIL-ON-REVERT: with the
+// resolution reverted the scheduler is never in the resolved set and the
+// advisory fires unconditionally, so this assertion flips.
+func TestCoSTransmitRatePercent_BoundToShapedInterface_NoAdvisory(t *testing.T) {
+	cfg := mustCompileSet4228(t,
+		"set class-of-service schedulers be transmit-rate percent 50",
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service scheduler-maps m1 forwarding-class best-effort scheduler be",
+		"set class-of-service interfaces ge-0/0/2 unit 0 shaping-rate 100m",
+		"set class-of-service interfaces ge-0/0/2 unit 0 scheduler-map m1",
+	)
+	warnings := config.ValidateConfig(cfg)
+	for _, w := range warnings {
+		if strings.Contains(w, "transmit-rate percent") && strings.Contains(w, "no base to resolve") {
+			t.Fatalf("bound-to-shaped-interface percent must not emit the no-effect advisory, got: %q", w)
+		}
+	}
+}
+
+// #4228 Gap 2 (shaping-rate percent, Go resolution): a `shaping-rate percent`
+// traffic-control-profile bound to an interface with a configured speed
+// resolves to an absolute per-unit root shaper rate. FAIL-ON-REVERT: without
+// the resolveCoSTrafficControlProfiles percent branch the unit stays unshaped
+// (ShapingRateBytes == 0).
+func TestCoSShapingRatePercent_ResolvesAgainstInterfaceSpeed(t *testing.T) {
+	cfg := mustCompileSet4228(t,
+		"set interfaces ge-0/0/2 speed 10g",
+		"set class-of-service traffic-control-profiles p1 shaping-rate percent 90",
+		"set class-of-service interfaces ge-0/0/2 unit 0 output-traffic-control-profile p1",
+	)
+	unit := cfg.ClassOfService.Interfaces["ge-0/0/2"].Units[0]
+	// 10g bits/s / 8 = 1_250_000_000 bytes/s; 90% = 1_125_000_000.
+	if unit.ShapingRateBytes != 1_125_000_000 {
+		t.Fatalf("ShapingRateBytes = %d, want 1125000000 (90%% of 10g line rate)", unit.ShapingRateBytes)
+	}
+}
+
+// #4228 Gap 2: a shaping-rate percent bound to an interface with NO configured
+// speed cannot resolve, so the unit is left unshaped and a per-binding advisory
+// flags it.
+func TestCoSShapingRatePercent_NoInterfaceSpeed_EmitsNoEffectAdvisory(t *testing.T) {
+	cfg := mustCompileSet4228(t,
+		"set class-of-service traffic-control-profiles p1 shaping-rate percent 90",
+		"set class-of-service interfaces ge-0/0/2 unit 0 output-traffic-control-profile p1",
+	)
+	unit := cfg.ClassOfService.Interfaces["ge-0/0/2"].Units[0]
+	if unit.ShapingRateBytes != 0 {
+		t.Fatalf("ShapingRateBytes = %d, want 0 (no interface speed to resolve percent against)", unit.ShapingRateBytes)
+	}
+	warnings := config.ValidateConfig(cfg)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "shaping-rate percent") && strings.Contains(w, "no configured speed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a no-effect advisory for an unresolvable shaping-rate percent, got: %v", warnings)
 	}
 }

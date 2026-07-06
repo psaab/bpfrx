@@ -174,6 +174,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 3_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -186,6 +187,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 7_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: true,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -258,6 +260,7 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 3_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
@@ -296,6 +299,118 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
     );
 }
 
+// #4228 Gap 2: a `transmit-rate percent <n>` scheduler resolves to an absolute
+// byte/sec rate against the bound interface's shaping-rate — the SAME
+// interface-shaping base family buffer-size percent uses. RED on revert: with
+// the percent left inert the queue takes `explicit_transmit_rate_bytes = None`,
+// so its rate collapses to the whole interface shaping-rate (10_000_000, not
+// 0.5x) and `guarantee_enabled` stays false.
+#[test]
+fn build_cos_state_resolves_transmit_rate_percent_against_interface_shaping_rate() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![CoSSchedulerSnapshot {
+                name: "be-sched".into(),
+                transmit_rate_bytes: 0,
+                transmit_rate_percent: 50.0,
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 0,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            }],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: "be-sched".into(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+    assert_eq!(
+        iface.queues[0].transmit_rate_bytes, 5_000_000,
+        "transmit-rate percent 50 must resolve to 50% of the 10_000_000 B/s interface shaping-rate"
+    );
+    assert!(
+        iface.queues[0].guarantee_enabled,
+        "a resolved percent transmit-rate must enable the queue guarantee (no longer inert)"
+    );
+}
+
+// #4228 Gap 2: a percent transmit-rate on an interface with NO root
+// shaping-rate (transparent root) has no base to resolve against; it stays
+// inert — no fabricated guarantee — matching the buffer-size None->default path.
+#[test]
+fn build_cos_state_transmit_rate_percent_no_shaping_rate_stays_inert() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 0,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![CoSSchedulerSnapshot {
+                name: "be-sched".into(),
+                transmit_rate_bytes: 0,
+                transmit_rate_percent: 50.0,
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 0,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            }],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: "be-sched".into(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+    assert!(
+        !iface.queues[0].guarantee_enabled,
+        "a percent with no interface shaping-rate has no base and must not fabricate a guarantee"
+    );
+}
+
 #[test]
 fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
     let snapshot = ConfigSnapshot {
@@ -314,6 +429,7 @@ fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 3_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -379,6 +495,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                 CoSSchedulerSnapshot {
                     name: "iperf-a".into(),
                     transmit_rate_bytes: 1_000_000_000 / 8,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: true,
                     priority: "low".into(),
                     buffer_size_bytes: 128 * 1024,
@@ -391,6 +508,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                 CoSSchedulerSnapshot {
                     name: "iperf-b".into(),
                     transmit_rate_bytes: 10_000_000_000 / 8,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: true,
                     priority: "low".into(),
                     buffer_size_bytes: 128 * 1024,
@@ -451,6 +569,7 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
     let make_sched = |name: &str, enforcement: bool, policy: &str| CoSSchedulerSnapshot {
         name: name.into(),
         transmit_rate_bytes: 1_000_000_000 / 8,
+        transmit_rate_percent: 0.0,
         transmit_rate_exact: true,
         priority: "low".into(),
         buffer_size_bytes: 128 * 1024,
@@ -573,6 +692,7 @@ fn build_cos_state_fails_closed_on_unknown_equal_flow_target_policy() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "s-bad".into(),
                 transmit_rate_bytes: 1_000_000_000 / 8,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: true,
                 priority: "low".into(),
                 buffer_size_bytes: 128 * 1024,
@@ -636,6 +756,7 @@ fn build_cos_state_fails_closed_on_unknown_scheduler_priority() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "s-bad".into(),
                 transmit_rate_bytes: 1_000_000_000 / 8,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: true,
                 priority: "hgh".into(),
                 buffer_size_bytes: 128 * 1024,
@@ -724,6 +845,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 100_000_000 / 8,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: true,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
@@ -786,6 +908,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 0,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
@@ -837,6 +960,7 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 0,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
@@ -986,6 +1110,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                 CoSSchedulerSnapshot {
                     name: "be".into(),
                     transmit_rate_bytes: 1_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 0,
@@ -998,6 +1123,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                 CoSSchedulerSnapshot {
                     name: "voice".into(),
                     transmit_rate_bytes: 2_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "high".into(),
                     buffer_size_bytes: 0,
@@ -1918,6 +2044,7 @@ fn build_forwarding_state_enables_tx_selection_when_cos_interfaces_exist() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 10_000_000,
+                transmit_rate_percent: 0.0,
                 ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -3161,6 +3288,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "no-rate".into(),
                 transmit_rate_bytes: 0, // <- fallback chains to 0
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
@@ -3220,6 +3348,7 @@ fn build_cos_state_no_rate_exact_surplus_equal_flow_is_residual_only() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "no-rate-exact".into(),
                 transmit_rate_bytes: 0,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: true,
                 priority: "high".into(),
                 buffer_size_bytes: 0,
@@ -4643,6 +4772,7 @@ fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be".into(),
                 transmit_rate_bytes: 1_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 0,

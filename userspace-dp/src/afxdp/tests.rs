@@ -7966,6 +7966,7 @@ fn txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778() {
             CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 4_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -7978,6 +7979,7 @@ fn txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778() {
             CoSSchedulerSnapshot {
                 name: "ef-sched".into(),
                 transmit_rate_bytes: 6_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "strict-high".into(),
                 buffer_size_bytes: 64_000,

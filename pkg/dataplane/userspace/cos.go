@@ -166,6 +166,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 			snap.Schedulers = append(snap.Schedulers, CoSSchedulerSnapshot{
 				Name:                  sched.Name,
 				TransmitRateBytes:     sched.TransmitRateBytes,
+				TransmitRatePercent:   sched.TransmitRatePercent,
 				TransmitRateExact:     sched.TransmitRateExact,
 				Priority:              sched.Priority,
 				BufferSizeBytes:       sched.BufferSizeBytes,

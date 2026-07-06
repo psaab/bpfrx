@@ -1221,6 +1221,7 @@ fn cos_scheduler_snapshot_surplus_sharing_round_trip_true() {
     let snap = CoSSchedulerSnapshot {
         name: "iperf-a".into(),
         transmit_rate_bytes: 125_000_000,
+        transmit_rate_percent: 0.0,
         transmit_rate_exact: true,
         priority: "low".into(),
         buffer_size_bytes: 65_536,
@@ -1240,6 +1241,7 @@ fn cos_scheduler_snapshot_equal_flow_enforcement_round_trip_true() {
     let snap = CoSSchedulerSnapshot {
         name: "iperf-a".into(),
         transmit_rate_bytes: 125_000_000,
+        transmit_rate_percent: 0.0,
         transmit_rate_exact: true,
         priority: "low".into(),
         buffer_size_bytes: 65_536,
@@ -1263,6 +1265,7 @@ fn cos_scheduler_snapshot_equal_flow_target_policy_round_trip() {
     let snap = CoSSchedulerSnapshot {
         name: "iperf-a".into(),
         transmit_rate_bytes: 125_000_000,
+        transmit_rate_percent: 0.0,
         transmit_rate_exact: true,
         priority: "low".into(),
         buffer_size_bytes: 65_536,
@@ -1287,6 +1290,7 @@ fn cos_scheduler_snapshot_buffer_size_percent_round_trip() {
     let snap = CoSSchedulerSnapshot {
         name: "percent-sched".into(),
         transmit_rate_bytes: 125_000_000,
+        transmit_rate_percent: 0.0,
         transmit_rate_exact: true,
         priority: "low".into(),
         buffer_size_bytes: 0,
